@@ -19,9 +19,24 @@
   - 引入 `WorkspaceServices`、`CwdServiceRegistry`、`CwdScopedServices { workspace_id, cwd, generation }`。
   - 每个 `SessionRuntime` / run pin 自己的 service generation；focused session 只影响 UI 和默认命令路由，不作为服务 scope 锚点。
 
-## 当前分支修订
+- `2550094 docs(runtime): use resource manager snapshots`
+  - 将 `ResourceLoader` 升级为 `ResourceManager` 子系统，并重命名相关 ADR / module 文档。
+  - 新增 ADR 0010，接受 per-cwd resource snapshot 作为多 session MVP 的资源隔离方案。
+  - 用 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 取代 `CwdScopedServices` / generation pinning 作为 MVP 核心模型。
+  - 明确 reload / ensure / recompose / capture_turn 的线性化边界，running turn 继续使用旧 snapshot，future turn 捕获新 snapshot。
+  - 明确 skill body、prompt templates、context files、自定义/追加系统提示词等模型可见资源必须 snapshot 化。
 
-分支：`design/runtime-resource-snapshot-mode`
+- `fda22a6 docs(prompt): clarify resource prompt boundary`
+  - 明确 `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 是唯一编排者。
+  - `ResourceManager` 只产出 captured prompt materials，`Prompt` 只做纯 system prompt 渲染。
+  - 补充 `PromptMaterials` 与最终 system prompt 的简短示例。
+  - 更新 glossary 和模块总览中的 `提示词素材` / `系统提示词构建器` 边界。
+
+## 当前 dev 修订
+
+分支：`dev`
+
+`design/runtime-resource-snapshot-mode` 已 fast-forward 合并到 `dev`，并已推送到 `origin/dev`。当前文档基线以 `ResourceManager` 级联 immutable snapshots 为准。
 
 本轮讨论进一步收敛了 MiniCore MVP 的目标：UI 和 `AgentRuntime` 是一体进程，不支持 UI detach 后 runtime daemon 继续运行；只要求一个 UI 下多个 session 可以同时各自运行。基于这个约束，BR-003 的服务 scope 设计从 `CwdScopedServices` 修订为 per-cwd resource snapshot 模式。
 
@@ -37,6 +52,8 @@
 - `ReloadResources { workspace_id, cwd }` 为目标 cwd 构建新的 `CwdResourceSnapshot`；成功后原子替换 current pointer；running run 继续使用旧 `TurnState` / 旧 `TurnResourceSnapshot`，下一轮 user turn 使用新 snapshot。
 - provider settings、auth、custom provider 和 `ModelGateway` 都是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth/provider endpoint。
 - 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 reload / startup ensure。
+- `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中提取 prompt materials，再合并 active tools / tool snippets / cwd / 日期等会话态，调用 `prompt::build_system_prompt(...)`。
+- `Prompt` 是纯系统提示词构建模块，不读取文件、不读 `ResourceSnapshotStore`、不触发 reload；`ResourceManager` 不构造最终 system prompt，只发布结构化资源素材。
 
 修订后的模型：
 
@@ -276,17 +293,21 @@ switchSession
 
 ## 当前架构分叉
 
-### 路线 A：当前已落文档的单进程方案 B
+### 路线 A：当前已落文档的单进程 resource snapshot 模式
 
 ```text
 AgentRuntime process
-  ├─ LoadedSessionRuntimes
-  │   ├─ SessionRuntime A
-  │   ├─ SessionRuntime B
-  │   └─ SessionRuntime C
-  └─ CwdServiceRegistry
-      ├─ CwdScopedServices(repo-a, gen-1)
-      └─ CwdScopedServices(repo-b, gen-1)
+  └─ WorkspaceServices
+      ├─ LoadedSessionRuntimes
+      │   ├─ SessionRuntime A { cwd = repo-a }
+      │   ├─ SessionRuntime B { cwd = repo-a }
+      │   └─ SessionRuntime C { cwd = repo-b }
+      ├─ ResourceManager
+      │   └─ ResourceSnapshotStore
+      │       ├─ current runtime -> RuntimeResourceSnapshot
+      │       ├─ (workspace_id, repo-a) -> CwdResourceSnapshot
+      │       └─ (workspace_id, repo-b) -> CwdResourceSnapshot
+      └─ shared ModelGateway / settings / auth / provider registry
 ```
 
 优点：
@@ -294,12 +315,12 @@ AgentRuntime process
 - 实现较轻。
 - 不需要 IPC。
 - 适合嵌入式 runtime repo。
-- 当前文档已经收敛到此方向。
+- 当前文档已经收敛到此方向，并已合并进 `dev`。
 
 缺点：
 
 - 需要仔细避免共享状态污染。
-- 需要 `CwdScopedServices` / generation pinning。
+- 需要严格维护 resource snapshot capture / reload / recompose 的线性化边界。
 - crash boundary 较弱。
 - 与 Claude Code 的 supervisor/background UX 不完全一致。
 
@@ -387,7 +408,7 @@ ProcessSessionRuntimeHost
 6. Auth / trust / permissions 是放在 supervisor，还是 worker 内部解析？
 7. ModelGateway 是 worker 内部直接调用 provider，还是通过 supervisor 的 `AuthBroker` / `ModelGatewayProxy`？
 8. 如果采用 supervisor，多 session 状态如何进入 `RuntimeSnapshot`？是否重开 BR-002？
-9. 当前已提交的 `WorkspaceServices` / `CwdScopedServices` 是否保留为单进程实现细节，还是改写为 future worker-local services？
+9. 如果未来引入 worker process，当前 `WorkspaceServices` / `ResourceManager` / `ResourceSnapshotStore` 哪些保留为 supervisor shared service，哪些下沉为 worker-local service？
 
 ## 当前建议结论
 
