@@ -53,7 +53,7 @@ ModelGateway ──────────────────────�
 
 `Skills` 是平级技能文件能力模块，对应未来的 `skills.rs`。它提供 `SkillMetadata` / `SkillResource` / `SkillCatalog` 数据结构，以及给定目录后的发现、解析、校验和格式化 helper；它不拥有资源生命周期或 overlay。显式技能调用的正文展开和 message 构造由 `SessionRuntime` 基于 captured `TurnResourceSnapshot` 负责。
 
-`Prompt` 是纯系统提示词构建模块，对应未来的 `prompt.rs`。它消费 captured `TurnResourceSnapshot` 的 prompt materials 和会话持有的 active tools / snippets，输出最终 system prompt。
+`Prompt` 是纯系统提示词构建模块，对应未来的 `prompt.rs`。它消费 `SessionRuntime` 从 captured `TurnResourceSnapshot` 提取的 prompt materials，以及会话持有的 active tools / snippets，输出最终 system prompt；它不直接调用 `ResourceManager`，`ResourceManager` 也不调用 `Prompt`。
 
 `Tools` 是平级工具能力模块，对应未来的 `tools.rs` / `tools/`。它提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper；工具状态和工具治理由 `SessionRuntime` 持有。
 

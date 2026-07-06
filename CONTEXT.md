@@ -197,8 +197,8 @@ _避免_：界面快照、事件日志、会话条目、实时文件视图
 _避免_：资源正文、提示词素材、完整运行时资源
 
 **提示词素材**：
-`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 提供给系统提示词构建器的输入素材，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终系统提示词。
-_避免_：完整 prompt、用户消息、工具描述
+`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 提供给系统提示词构建器的结构化输入，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终 system prompt；`Prompt` 不能主动读取 `ResourceManager` 或 `ResourceSnapshotStore`，只能消费 `SessionRuntime` 传入的素材。
+_避免_：完整 prompt、用户消息、工具描述、实时资源查询
 
 **CommandSurface**：
 Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令面，负责命令目录、`/...` 文本解析、执行规划、运行时命令映射和命令呈现语义。它不是 UI 输入框，也不是 `agent_runtime_protocol::Command` enum 本身。
@@ -237,8 +237,8 @@ _避免_：前端回调、UI 组件实例、运行时状态修改
 _避免_：模型消息、会话条目、事件消息
 
 **系统提示词构建器**：
-纯构建能力，消费提示词素材、活跃工具集合、工具提示片段、当前日期和工作区路径，生成一次 Agent 运行使用的最终系统提示词。
-_避免_：ResourceManager、会话历史、工具执行
+纯构建能力，消费提示词素材、活跃工具集合、工具提示片段、当前日期和工作区路径，生成一次 Agent 运行使用的最终 system prompt。它由 `SessionRuntime` 调用，不调用 `ResourceManager`，也不读取文件或触发 reload。
+_避免_：ResourceManager、会话历史、工具执行、资源生命周期 owner
 
 **界面适配器**：
 很薄的集成层，将 Ratatui、Tauri/Vue 或 CLI 这类具体界面技术翻译成 Agent 运行时命令与事件。它通常属于下游应用仓库；MiniCore 只定义协议和可复用 runtime 行为。

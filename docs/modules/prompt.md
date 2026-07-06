@@ -20,6 +20,23 @@ prompt.rs
 
 `ResourceManager` 管素材生命周期和 snapshot capture，`Prompt` 管拼装规则，`SessionRuntime` 决定何时重建。
 
+`ResourceManager` 和 `Prompt` 不直接互相调用。二者之间的唯一编排者是 `SessionRuntime`：
+
+```text
+ResourceManager.capture_turn(...)
+  → TurnResourceSnapshot
+
+SessionRuntime
+  → 从 TurnResourceSnapshot.cwd.resolved 取 PromptMaterials
+  → 合并 active tools / tool snippets / cwd / date 等会话态
+  → 调用 prompt::build_system_prompt(...)
+
+Prompt
+  → 返回最终 system prompt 字符串
+```
+
+因此 `Prompt` 不能调用 `ResourceManager.current_cwd(...)`、不能读 `ResourceSnapshotStore`、不能读文件，也不能触发 reload。`ResourceManager` 也不能调用 `prompt::build_system_prompt(...)`；它只发布结构化资源和 prompt materials。
+
 ## Interface
 
 ```rust
@@ -37,6 +54,93 @@ pub fn build_system_prompt(request: PromptRequest<'_>) -> String;
 ```
 
 `build_system_prompt()` 应该是确定性的纯函数。测试可以直接传入 fake resources 和 active tools 验证输出。
+
+## PromptMaterials 示例
+
+一次 turn 捕获到的资源可能投影为：
+
+```rust
+PromptMaterials {
+    custom_system_prompt: None,
+    append_system_prompts: [
+        TextResource {
+            content: "回答要简洁，优先给可执行步骤。",
+            source: "~/.minicore/prompts/append.md",
+        },
+    ],
+    context_files: [
+        ContextFileResource {
+            path: "/repo/AGENTS.md",
+            content: "本项目使用 Rust。提交前运行 cargo test。",
+        },
+    ],
+    skills: SkillCatalog {
+        skills: [
+            SkillResource {
+                metadata: SkillMetadata {
+                    name: "code-review",
+                    description: "审查代码变更并指出风险。",
+                    file_path: "/repo/.minicore/skills/code-review/SKILL.md",
+                    disable_model_invocation: false,
+                },
+                body: "...完整 skill 正文...",
+            },
+        ],
+    },
+}
+```
+
+`SessionRuntime` 再补上会话态和工具态：
+
+```rust
+PromptRequest {
+    cwd: "/repo",
+    current_date: "2026-07-06",
+    prompt_materials,
+    active_tool_names: ["read", "bash"],
+    tool_snippets: {
+        "read": "Read file contents.",
+        "bash": "Execute shell commands.",
+    },
+    tool_guidelines: ["修改文件前先读取相关上下文。"],
+}
+```
+
+`prompt::build_system_prompt(...)` 可能生成：
+
+```text
+You are MiniCore, a coding agent runtime.
+
+Guidelines:
+- 修改文件前先读取相关上下文。
+- 回答要简洁，优先给可执行步骤。
+
+Project context:
+
+<project_instructions path="/repo/AGENTS.md">
+本项目使用 Rust。提交前运行 cargo test。
+</project_instructions>
+
+Available tools:
+- read: Read file contents.
+- bash: Execute shell commands.
+
+The following skills provide specialized instructions for specific tasks.
+Use the read tool to load a skill's file when the task matches its description.
+
+<available_skills>
+  <skill>
+    <name>code-review</name>
+    <description>审查代码变更并指出风险。</description>
+    <location>/repo/.minicore/skills/code-review/SKILL.md</location>
+  </skill>
+</available_skills>
+
+Current date: 2026-07-06
+Current working directory: /repo
+```
+
+注意：skill body 不默认进入 system prompt；这里只展示 skill 摘要。显式 `InvokeSkill` 时，`SessionRuntime` 才从 captured `TurnResourceSnapshot` 读取 `SkillResource.body` 并作为 user message 注入。
 
 ## pi 对齐规则
 
