@@ -584,6 +584,29 @@ pub struct PromptMaterials<'a> {
 }
 ```
 
+`PromptMaterials` 是 `CwdResourceSnapshot.resolved` 的只读投影，不是最终 system prompt 字符串。`ResourceManager` 负责保证这些素材来自同一版 captured snapshot；`Prompt` 负责把它们渲染到 system prompt；`SessionRuntime` 负责把资源素材与 active tools、tool snippets、cwd、日期等会话态合并成 `PromptRequest`。
+
+调用方向必须保持单向：
+
+```text
+SessionRuntime
+  → ResourceManager.capture_turn(...)
+  → TurnResourceSnapshot.cwd.resolved.prompt_materials()
+  → prompt::build_system_prompt(PromptRequest { ... })
+```
+
+不允许：
+
+```text
+Prompt
+  → ResourceManager.current_cwd(...)
+
+ResourceManager
+  → prompt::build_system_prompt(...)
+```
+
+这样可以保证 running turn 的 system prompt 只使用本 turn 已捕获的资源链，不会因为 reload 后的 current pointer 改变而混用新旧资源。
+
 `PromptTemplates` 不默认进入每次 system prompt。它们是显式调用资源，只有 `InvokePromptTemplate` 时才展开为 user message。
 
 ## 技能
