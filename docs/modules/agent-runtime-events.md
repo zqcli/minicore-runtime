@@ -174,7 +174,7 @@ SessionRuntime event sink
 
 ### RuntimeSnapshot 水位
 
-`agent_runtime_protocol::RuntimeSnapshot.last_event_sequence` 是 UI 看到的权威状态水位：
+`agent_runtime_protocol::RuntimeSnapshot.last_event_sequence` 是 UI 在同一 host 生命周期内看到的权威状态水位：
 
 ```text
 RuntimeSnapshot contains state reduced through sequence = N
@@ -182,7 +182,7 @@ event stream contains events N+1, N+2, ...
 UI ignores events <= N
 ```
 
-如果 UI 发现事件断号，说明内存 ring buffer 不足或订阅断线过久：
+如果 UI reducer/subscriber 发现事件断号，说明内存 ring buffer 不足或同一 host 生命周期内的订阅中断过久：
 
 ```text
 expected sequence = N + 1
@@ -193,6 +193,8 @@ received sequence > N + 1
 ```
 
 session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot` 或新事件恢复。关闭窗口后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 active session。
+
+MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继续运行再被重连的故障模型。UI host 和 runtime 同生命周期；因此 reconnect contract 只覆盖同一程序上下文内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。`RuntimeSnapshot` 不需要为非 active/background session 提供完整恢复投影；若未来支持独立 runtime server、多窗口共享 runtime 或 daemon 模式，再引入 all-loaded-session snapshot 或 scoped event cursor。
 
 ## Command Ack
 
@@ -921,7 +923,7 @@ Required
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
-审批状态不能由 UI 私有保存为权威状态；UI 重连后从 `RuntimeSnapshot.active_session` 的 pending tool calls 恢复。
+审批状态不能由 UI 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从 `RuntimeSnapshot.active_session` 的 pending tool calls 恢复。
 
 ### 14. Queue Lifecycle
 
@@ -1119,7 +1121,7 @@ UI 只看 hook 影响后的事实，例如 tool denied、message replaced、comp
 
 ### 23. Reconnect Lifecycle
 
-Reconnect 是 UI adapter 的消费流程。
+Reconnect 是 UI adapter 在同一 host 生命周期内的消费流程。它不是 UI 进程失败后重新连接仍在后台运行的独立 runtime daemon。
 
 ```text
 Connected(sequence=N)
@@ -1138,7 +1140,7 @@ Expected K, received K+n
   → drop buffered assumptions
 ```
 
-这也是为什么 RuntimeSnapshot 必须包含 UI 渲染所需的权威状态，而不是只包含 session messages。
+这也是为什么 RuntimeSnapshot 必须包含当前 adapter 视图所需的权威状态，而不是只包含 session messages。MVP 只承诺 active session / 当前视图的恢复语义；非 active/background session 的完整运行态不属于 UI reconnect contract。
 
 ## Submit Prompt Lifecycle
 
@@ -1297,7 +1299,7 @@ reduce events with sequence > snapshot.last_event_sequence
 fn subscribe_after(sequence: u64) -> agent_runtime_protocol::EventStream;
 ```
 
-MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 agent_runtime_protocol::Event log。断线较久时 UI 重新请求 RuntimeSnapshot，而不是要求 runtime replay 所有旧事件。
+MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 agent_runtime_protocol::Event log。同一 host 生命周期内的订阅中断较久时，UI 重新请求 RuntimeSnapshot，而不是要求 runtime replay 所有旧事件。这里不承诺 UI 进程失败后重连仍在后台运行的 runtime。
 
 ## AgentRuntimeProtocol Reference
 
@@ -1317,4 +1319,4 @@ MVP event lifecycle tests 应覆盖：
 - slash command view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
 - slash command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过结构化 command 或新的 `ExecuteSlashCommand` 完成设置。
 - slash command semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
-- reconnect：RuntimeSnapshot sequence 后的事件可正确 reduce。
+- resync：RuntimeSnapshot sequence 后的事件可正确 reduce。

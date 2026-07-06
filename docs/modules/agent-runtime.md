@@ -34,6 +34,8 @@ pub trait AgentRuntime {
 
 `OpenWorkspace` 只建立 workspace 绑定的运行时服务和会话目录，不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 可以等用户输入 `/resume` 再列出当前 workspace 的会话，GUI 可以单独调用 `ListSessions` 渲染 sidebar。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
 
+MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生命周期，不作为独立 daemon/server 存活。`subscribe()` / `snapshot()` 的 reconnect 语义用于同一程序上下文内的 late subscribe、reducer/subscriber 重建和 sequence gap recovery；不支持 UI adapter 失败但 runtime 继续运行、随后由新 UI 连接并恢复所有后台 session 的模式。
+
 ## 运行时服务
 
 运行时服务是绑定到有效工作区的后端依赖集合。典型内容：
