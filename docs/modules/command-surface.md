@@ -44,7 +44,7 @@ UI Adapter
 
 AgentRuntime
   ├─ owns CommandSurfaceService
-  ├─ exposes slash command catalog in Snapshot / events
+  ├─ exposes slash command catalog in RuntimeSnapshot / events
   ├─ dispatches resolved command to SessionManager / SessionRuntime / ResourceLoader
   └─ publishes command presentation events
 
@@ -87,7 +87,7 @@ pub enum SlashCommandSource {
 - `Extension`：后续由 extension registry 提供 metadata 和 handler，不能绕过 runtime policy。
 - `ModelServiceTier`：后续可像 Codex 一样在 `/model` 附近暴露动态 service tier shortcuts。
 
-UI-local command 只属于 UI adapter，例如 TUI 的 copy scrollback、quit、theme 或 hotkeys。它可以参与本地 autocomplete overlay，但不属于 `agent_runtime_protocol::Snapshot.slash_commands`，不能进入 `AgentRuntime` 执行，也不能 shadow runtime command。
+UI-local command 只属于 UI adapter，例如 TUI 的 copy scrollback、quit、theme 或 hotkeys。它可以参与本地 autocomplete overlay，但不属于 `agent_runtime_protocol::RuntimeSnapshot.command_surface.slash_commands`，不能进入 `AgentRuntime` 执行，也不能 shadow runtime command。
 
 ## Catalog
 
@@ -293,7 +293,7 @@ pub struct CommandOutput {
   → CommandOutput(title = "Resources reloaded", body = "8 skills, 3 templates, 1 warning.")
 ```
 
-`CommandOutput` 不是 assistant message，也不进入模型上下文。它可以作为 message panel item 展示；如果产品需要重连或重启后恢复这些 UI 输出，应优先通过 `Snapshot.message_panel_items` 或 UI-only presentation log 设计恢复，不能进入 `TurnState.messages`。
+`CommandOutput` 不是 assistant message，也不进入模型上下文。它可以作为 message panel item 展示；如果产品需要重连或重启后恢复这些 UI 输出，应优先通过后续 UI-only presentation log 或 runtime read model 设计恢复，不能进入 `TurnState.messages`。
 
 ### UI Interaction Request
 
@@ -350,7 +350,7 @@ MVP 可以让 interaction 的选择结果重新生成 slash command，例如 `/m
 | `/model` | 打开 model picker | `SetModel` | `SessionRuntime` model state | picker；设置后 message |
 | `/thinking` | 打开 thinking picker | `SetThinkingLevel` | `SessionRuntime` thinking state | picker；设置后 message |
 | `/new` | 新建并聚焦会话 | 后续支持 name | `AgentRuntime` → `SessionManager` | session events + summary message |
-| `/sessions` 或 `/resume` | 打开 session picker | 后续支持 filter | `SessionManager` + UI picker | picker；选择后 session events |
+| `/sessions` 或 `/resume` | 打开当前 workspace 的 session picker | 后续支持 `--all` / filter | `SessionManager.list_sessions(CurrentWorkspace)` + UI picker | picker；选择后 session events |
 | `/tools` | 展示工具摘要 | mutation 后置 | `SessionRuntime` tool state | message 或 readonly multi-select |
 
 第一阶段暂缓：`/tools +read -bash`、`/permissions`、`/login`、`/logout`、`/export`、`/tree`、`/fork`、extension commands、MCP resource commands 和 UI-local theme/keymap。它们涉及工具风险、凭据流程、复杂 session tree 或 extension policy，适合在核心闭环稳定后加入。
@@ -394,10 +394,10 @@ ResourceLoader.reload()
 ExecuteSlashCommand { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode }
 ```
 
-Snapshot 包含：
+RuntimeSnapshot 包含：
 
 ```rust
-slash_commands: Vec<SlashCommandSummary>
+command_surface: CommandSurfaceSnapshot { slash_commands: Vec<SlashCommandSummary> }
 ```
 
 事件包含：
@@ -408,7 +408,7 @@ CommandPresentationEvent::OutputAppended { ... } // wire: command_output_appende
 CommandPresentationEvent::InteractionRequested { ... } // wire: command_interaction_requested
 ```
 
-`GetSlashCommandCatalog`、`CompleteSlashCommandArgs`、`SubmitCommandInteraction` 和 `command_interaction_resolved` 可以后置。MVP 可以只把 `slash_commands` 放进 snapshot，让 UI 本地 fuzzy filter；interaction 选择结果可以重新提交 `ExecuteSlashCommand`，例如 `/model {item.id}`。参数 completion、复杂 form 和 runtime-tracked pending interaction 等待基础 interaction 模型稳定后再实现。
+`GetSlashCommandCatalog`、`CompleteSlashCommandArgs`、`SubmitCommandInteraction` 和 `command_interaction_resolved` 可以后置。MVP 可以只把 `slash_commands` 放进 `RuntimeSnapshot.command_surface`，让 UI 本地 fuzzy filter；interaction 选择结果可以重新提交 `ExecuteSlashCommand`，例如 `/model {item.id}`。参数 completion、复杂 form 和 runtime-tracked pending interaction 等待基础 interaction 模型稳定后再实现。
 
 不推荐给每次 slash command 都发 `slash_command_started/finished`。真正业务事件仍用已有事件表达，例如 `compaction_started`、`resources_changed`、`session_model_changed`、`skill_invoked`、`prompt_template_invoked`、`usage_updated`。用户可见说明由 `CommandPresentationEvent` 表达。
 
@@ -444,7 +444,7 @@ ExecuteSlashCommand
 
 UI adapter 只负责 presentation 渲染：
 
-- 根据 `Snapshot.slash_commands` 或 `slash_commands_changed` 渲染 autocomplete / command palette。
+- 根据 `RuntimeSnapshot.command_surface.slash_commands` 或 `slash_commands_changed` 渲染 autocomplete / command palette。
 - TUI slash input 和 GUI command palette 默认提交 `ExecuteSlashCommand`；runtime-provided picker/menu/form 选择结果默认使用 `UiInteractionSubmit`。专用设置控件如果直接提交结构化 command，必须复用同一后端校验、事件和 command presentation 规则。
 - 消费 `command_output_appended`，在 message panel 追加 `CommandOutput`。
 - 消费 `command_interaction_requested`，用本端能力渲染 picker、menu、form 或 detail view；`/usage` 这类只展示信息的 popup 可由 `CommandOutput` 的 presentation hint 渲染。

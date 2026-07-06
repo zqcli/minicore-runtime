@@ -44,7 +44,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [模块总览](modules/README.md)：整体模块关系、Rig / Runtime / 下游 UI 宿主的边界。
 - [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、运行时服务、会话替换和工作区生命周期。
 - [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、队列、Hook、turn state 和 post-run 流程。
-- [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::Snapshot` 和下游 adapter 调用方式。
+- [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
 - [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
 - [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
 - [ResourceLoader](modules/resource-loader.md)：资源来源聚合、刷新和资源诊断。

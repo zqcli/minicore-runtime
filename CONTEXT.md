@@ -25,7 +25,7 @@ _避免_：前端运行时、浏览器应用
 _避免_：WebView SDK、前端 Agent
 
 **AgentRuntimeProtocol**：
-界面适配器与 Agent 运行时之间的稳定通信协议，由 `agent_runtime_protocol::Command`、`Event`、`EventMsg`、`Snapshot` 和 `CommandAck` 等协议类型组成。
+界面适配器与 Agent 运行时之间的稳定通信协议，由 `agent_runtime_protocol::Command`、`Event`、`EventMsg`、`RuntimeSnapshot` 和 `CommandAck` 等协议类型组成。
 _避免_：运行时桥接、直接导入 SDK、UI 回调
 
 **AgentRuntimeEvents**：
@@ -45,8 +45,12 @@ _避免_：通用聊天
 _避免_：模型客户端、API wrapper
 
 **Agent 运行时（`AgentRuntime`）**：
-与 UI 无关的 MiniCore 后端门面，供下游 CLI、TUI 和 GUI 宿主通过协议接入；它接收运行时命令、发布运行时事件、生成快照，并管理工作区、会话目录和会话运行时。
+与 UI 无关的 MiniCore 后端门面，供下游 CLI、TUI 和 GUI 宿主通过协议接入；它接收运行时命令、发布运行时事件、生成 `RuntimeSnapshot`，并管理工作区、会话目录和会话运行时。
 _避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
+
+**RuntimeSnapshot**：
+Agent 运行时在某个事件水位上的当前状态读模型，用于界面初始加载、窗口恢复和事件流重连。它由运行时从内存状态、设置、资源摘要和会话目录投影生成，不是 UI store，不是会话文件，也不单独持久化。打开工作区后默认可以没有 active session。
+_避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
 **运行时服务**：
 绑定到有效工作区的后端依赖集合，例如凭据、设置、模型注册表、模型调用网关、资源加载器和会话管理器。切换到不同工作区的会话时需要重新创建。
@@ -79,6 +83,10 @@ _避免_：loading 状态、按钮状态
 **会话**：
 一次工作上下文的持久记录，包含消息、模型变化、思考等级变化、活跃工具变化、压缩摘要、标签、名称和当前叶子位置。
 _避免_：聊天记录、日志文件
+
+**SessionIndex / 会话目录**：
+`SessionManager` 维护的会话轻量清单或索引，用于 `/resume`、GUI sidebar 和 `ListSessions`。它可以从 session 文件 header、metadata 或本地 index/cache 重建，包含 session id、workspace、名称、更新时间、预览和轻量统计；它不是 `RuntimeSnapshot`，也不包含完整消息、运行中状态或 UI 状态。
+_避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、事件日志
 
 **会话条目**：
 会话中的一条不可变追加记录。条目通过 `id` 和 `parentId` 连接成树，类型包括 message、model_change、active_tools_change、compaction、branch_summary、label、session_info 和 leaf。

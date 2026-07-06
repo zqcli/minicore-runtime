@@ -229,7 +229,7 @@ DriveRequest
 ModelCallRequest
 DriverEvent
 agent_runtime_protocol::Event
-Snapshot
+RuntimeSnapshot
 SessionEntry / JSONL
 RuntimeHookContext
 diagnostics 明文
@@ -336,7 +336,7 @@ SessionHandle.build_session_context()
   → SessionRuntime initializes ModelState
   → invalid selection falls back through ProviderRegistry default/fallback policy
   → diagnostics records fallback reason
-  → Snapshot exposes model_fallback_message if needed
+  → RuntimeSnapshot exposes model_fallback_message if needed
 ```
 
 `ModelChange` 中保存的是 MiniCore `provider_id` / `model_id`，不是 Rig provider type，也不是 provider API model name。
@@ -442,7 +442,7 @@ Driver
 SessionRuntime
   → usage_updated
   → run_finished { usage }
-  → Snapshot.session_stats / context_usage
+  → RuntimeSnapshot.active_session.session_stats / context_usage
 ```
 
 `ModelCallUsage.raw_provider_usage` 如果保留，只能作为 internal redacted diagnostic，不进入 `AgentRuntimeProtocol`，不进 session JSONL，不进 hook context。

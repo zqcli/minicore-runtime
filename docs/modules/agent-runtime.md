@@ -12,7 +12,7 @@ use crate::agent_runtime_protocol as protocol;
 pub trait AgentRuntime {
     async fn dispatch(&self, command: protocol::Command) -> Result<protocol::CommandAck, RuntimeError>;
     fn subscribe(&self) -> protocol::EventStream;
-    async fn snapshot(&self, session_id: SessionId) -> Result<protocol::Snapshot, RuntimeError>;
+    async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
 ```
 
@@ -21,7 +21,7 @@ pub trait AgentRuntime {
 ## 核心职责
 
 - 处理下游 CLI/TUI/GUI adapter 发来的 `agent_runtime_protocol::Command`。
-- 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::Snapshot`。
+- 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::RuntimeSnapshot`。
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
 - 基于有效 cwd 创建和重建运行时服务：凭据、设置、模型注册表、模型调用网关、资源加载器、会话管理器和诊断集合。
@@ -31,6 +31,8 @@ pub trait AgentRuntime {
 - 在 session 切换、new、fork、import 前后执行受控的 teardown、invalidate、rebind 和 startup 流程。
 - 管理跨会话共享的 provider/model catalog、模型调用网关、凭据、全局设置、项目信任和资源刷新入口。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
+
+`OpenWorkspace` 只建立 workspace 绑定的运行时服务和会话目录，不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 可以等用户输入 `/resume` 再列出当前 workspace 的会话，GUI 可以单独调用 `ListSessions` 渲染 sidebar。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
 
 ## 运行时服务
 

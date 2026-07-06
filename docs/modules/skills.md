@@ -110,7 +110,7 @@ pub struct SkillCatalog {
 }
 ```
 
-`SkillDocument` 可以作为显式调用或 `GetSkill` 的临时值，但不应放进 `agent_runtime_protocol::Snapshot`：
+`SkillDocument` 可以作为显式调用或 `GetSkill` 的临时值，但不应放进 `agent_runtime_protocol::RuntimeSnapshot`：
 
 ```rust
 pub struct SkillDocument {

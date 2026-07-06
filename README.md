@@ -9,7 +9,7 @@ MiniCore 不是 CLI/GUI 产品仓库。下游宿主应通过下面的运行时�
 ```text
 AgentRuntime.dispatch(agent_runtime_protocol::Command)
 AgentRuntime.subscribe() -> agent_runtime_protocol::EventStream
-AgentRuntime.snapshot(session_id) -> agent_runtime_protocol::Snapshot
+AgentRuntime.snapshot() -> agent_runtime_protocol::RuntimeSnapshot
 ```
 
 架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)。

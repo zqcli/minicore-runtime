@@ -100,7 +100,7 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 | `src/ids.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | `WorkspaceId`、`SessionId`、`RunId`、`CommandId`、`ToolCallId` 等稳定 ID。 |
 | `src/error.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntime](agent-runtime.md) | `RuntimeError`、`SessionError`、`DriverError` 等错误边界。 |
 | `src/messages.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[SessionManager / SessionStorage](session-manager.md)、[Driver](driver.md) | `MessageRecord`、message content、tool call/result message 公共类型。 |
-| `src/agent_runtime_protocol.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `Command`、`CommandAck`、`Event`、`EventMsg`、`Snapshot`、UI view 类型。 |
+| `src/agent_runtime_protocol.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `Command`、`CommandAck`、`Event`、`EventMsg`、`RuntimeSnapshot`、UI view 类型。 |
 | `src/agent_runtime_events.rs` | [AgentRuntimeEvents](agent-runtime-events.md) | 事件构造、sequence、生命周期断言和 event bus helper；不重新定义协议 enum。 |
 | `src/session_manager.rs` | [SessionManager / SessionStorage](session-manager.md) | 会话生命周期、loaded runtime map、focus/open/fork/delete。 |
 | `src/session_storage.rs` | [SessionManager / SessionStorage](session-manager.md) | `SessionHandle`、`SessionStorage` trait、entry/context 重建公共类型。 |
@@ -140,7 +140,7 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 
 | 概念 | 权威文档 | 其他文档只能做什么 |
 | --- | --- | --- |
-| AgentRuntimeProtocol 类型：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::Snapshot` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | 引用类型，不复制完整 enum。 |
+| AgentRuntimeProtocol 类型：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | 引用类型，不复制完整 enum。 |
 | 事件顺序、生命周期、所有权、重连和保存点 | [AgentRuntimeEvents](agent-runtime-events.md) | 描述本模块会触发哪些事件，不重新定义事件协议。 |
 | 运行时门面、工作区服务、事件通道 | [AgentRuntime](agent-runtime.md) | 只说明如何被调用或被拥有。 |
 | 单会话运行编排、phase、queue、hooks、当前 run | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
