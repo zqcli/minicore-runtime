@@ -1,0 +1,362 @@
+# System Blueprint Review Issues — Round 2
+
+日期：2026-07-06
+
+来源：对 `README.md`、`CONTEXT.md`、`docs/architecture.md`、`docs/implementation-roadmap.md`、`docs/modules/*.md`、`docs/adr/*.md`、`docs/review/*.md` 的第二轮全量交叉审阅。本轮只记录第一轮（BR-001 ~ BR-022）未覆盖的新问题，编号从 BR-023 起延续。
+
+约定：与第一轮相同，本文只记录待处理问题，不代表已经决定修改方案。后续逐条处理时，应回到对应 source of truth 文档中做设计取舍。
+
+## 总体判断
+
+文档体系的整体质量高：权威归属表、事件所有权矩阵、必测项、"不应承担"段落、ADR 和第一轮自审都是好的实践；Rig sans-IO 主路径、hook typed result、单终态 `run_finished`、`CommandAck` 只表接收、Usage 与 ContextUsage 分离、append-only session tree 等核心决策合理且有外部经验支撑。
+
+本轮发现的问题集中在三类：
+
+1. **协议表面有真实缺口**：查询命令没有响应通道（BR-023）、abort 持久化语义未定义（BR-024）、若干命令/事件字段与既定语义冲突（BR-027、BR-030、BR-031、BR-032）。
+2. **安全边界有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）、tool sandbox（BR-037）。
+3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
+
+## 高风险
+
+### BR-023：查询型协议命令没有已定义的响应通道
+
+状态：Open
+
+问题：`AgentRuntime` trait 只有 `dispatch() -> CommandAck`、`subscribe()`、`snapshot()` 三个方法。`ListSessions` 被放进 `Command` enum，协议文档明确要求"不能把 session list 塞进 `CommandAck`"，并要求"通过明确 response event 或 interaction 返回列表"——但 `EventMsg` 全集中不存在任何承载 session 列表的事件（`SessionEvent` 只有 Created/Opened/Closed/... 等生命周期事实）。`GetSkill`、`GetPromptTemplate`、`GetContextFile`、`GetEffectivePrompt`、`GetSessionStats`、`GetContextUsage`、`GetSlashCommandCatalog`、`CompleteSlashCommandArgs` 等后续查询命令同样悬空，文档原文承认"实现时可以把它们做成 request/response 形式的 protocol query，或做成 dispatch() 后产生明确 response event 的命令"——即协议核心形态（是否存在第四个 `query()` 方法）尚未决定，但 trait 已作为"稳定协议"写进 README 和多个模块文档。
+
+`ListSessions` 不是可推迟的后续命令：BR-001 的解决方案让 `/resume` 和 GUI sidebar 都依赖它，roadmap 阶段 2 就要求 workspace-scoped `ListSessions` 可验证。这是 MVP 主路径上的协议漏洞。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：公共 Interface 只有 dispatch/subscribe/snapshot；`ListSessions` 段要求"必须通过明确 response event 或 interaction 返回列表"。
+- `docs/modules/agent-runtime-protocol.md`：`EventMsg` 定义中没有 session list / query response 事件族。
+- `docs/modules/agent-runtime-protocol.md`：后续命令段"实现时可以把它们做成 request/response 形式的 protocol query，或……"。
+- `docs/implementation-roadmap.md`：阶段 2 可验证产物包含 workspace-scoped `ListSessions`。
+
+风险：与 BR-001 同构的"协议形态未收敛但已固化"问题。下游 adapter、SDK transport、测试 harness 会围绕错误的调用形态实现，后续加 `query()` 方法或 response event 族都是协议级返工。
+
+待处理方向：三选一并写入 AgentRuntimeProtocol 权威文档：(a) trait 增加 `query(Query) -> QueryResult` 第四方法，把所有读取型命令从 `Command` enum 移出；(b) 定义 `EventMsg::QueryResponse` 事件族并规定 correlation 规则；(c) MVP 把 `ListSessions` 降级为 snapshot/`SessionCatalogSummary` 的扩展。当前文档在三者之间摇摆。
+
+### BR-024：run 中断（abort/失败/宿主关闭）后的持久化语义未定义，可能在会话历史中留下 unresolved tool call
+
+状态：Open
+
+问题：两个相互纠缠的缺口。
+
+其一，abort 时 partial 输出是否持久化没有定义：`DriveResult::Aborted { messages }` 把已产生消息交回 `SessionRuntime`，但 Abort Lifecycle 事件序列（`run_finished { aborted }` → `session_phase_changed(idle)` → `session_settled`）中没有 `persistence_save_point`，也没有任何文字说明这些 messages 写不写 session。不写则 UI 已渲染的内容重开后消失；写则引出其二。
+
+其二，工具执行中途中断（abort、executor 崩溃、宿主进程关闭时有 pending approval）后，包含 tool call 的 assistant message 可能已持久化而对应 tool result 永远不会出现。`build_session_context()` 的重建规则（session-manager.md）没有任何 orphan tool call / unresolved tool call 的清理或修补规则；文档中唯一处理协议安全序列的地方是 compaction cut point。下次在该会话 `SubmitPrompt` 时，重建出的上下文含悬空 tool call，Anthropic/OpenAI 协议都会直接拒绝请求，会话文件从此"带毒"，用户无法自救。
+
+pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error/aborted tool result 再落盘；本项目文档引用了 Pydantic AI"移除未解决 tool calls"的经验，但只应用于压缩场景。
+
+证据：
+
+- `docs/modules/driver.md`：`DriveResult::Aborted { messages }`。
+- `docs/modules/agent-runtime-events.md`：Abort Lifecycle 无 save point，`message_assistant_finished?` 注释仅提 abort/error message；Tool Call Lifecycle 中 tool result message 在 `tool_call_finished` 之后才追加。
+- `docs/modules/session-manager.md`：上下文构建规则无 orphan tool call 处理。
+- `docs/modules/compaction.md`：协议安全约束（"不能留下 orphan tool result 或 unresolved tool call"）只出现在压缩边界。
+- `docs/modules/agent-runtime-protocol.md`：`SessionSnapshot` 恢复语义为 Idle + `current_run = None`，messages 来自持久化事实重建。
+
+风险：数据级损坏——不是一次 run 失败，而是会话历史永久无法继续；在 roadmap 阶段 10/11（tools/approval）叠加 abort 时必然暴露。
+
+待处理方向：在 SessionManager/SessionStorage 权威文档中定义两条规则之一或组合：(a) 写入侧补偿——run 以非 completed 终态结束时，`SessionRuntime` 为所有无 result 的 tool call 追加合成 error tool result，再 flush save point；(b) 读取侧防御——`build_session_context()` 对 unresolved tool call 做确定性修补（补 synthetic result 或降级为文本），并写明该规则同样适用于 crash 后遗留的历史。同时明确 Abort Lifecycle 是否包含 save point。
+
+### BR-025：custom provider / AuthRef 与 project trust 的边界未定义，存在凭据外泄链
+
+状态：Open
+
+问题：`ProviderRegistry` 会"合并 settings 中的 custom provider"；`CustomProviderConfig` 携带任意 `base_url` 和 `AuthRef`；`AuthRef::Env { var }` 允许指向任意环境变量。`SettingsView` 是 `CwdScopedServices` 成员（按 cwd 解析），暗示存在项目级 settings，但没有任何文档定义 settings 的分层（user/project）及 custom provider 声明允许的来源。`ResourceLoader` 的 trust gate 明确只覆盖 prompt、skill、context、extension 资源，不覆盖 provider/settings；ModelGateway 的"Grilling 结论"和"必测项"也没有任何 trust 相关条目。
+
+若项目级 settings 可以声明 custom provider，攻击链为：不受信任的项目仓库携带 settings，声明 `provider_id = "x"`、`base_url = attacker`、`auth_ref = Env("ANTHROPIC_API_KEY")`，并把默认模型指向它（默认模型同样来自 settings）；用户打开该项目后一次普通对话即把真实 API key 发送到攻击者服务器。auth redaction 规则（secret 不进 event/snapshot/log）防不住这条链，因为泄漏发生在合法的 provider HTTP 请求本身。
+
+证据：
+
+- `docs/modules/model-gateway.md`：ProviderRegistry 职责含"合并……settings 中的 custom provider"；`AuthRef::Env { var: String }`；`CustomProviderConfig { base_url, auth_ref }`。
+- `docs/modules/agent-runtime.md`：`CwdScopedServices` 包含 `SettingsView` / `ProjectTrustView` / `AuthView`，per-cwd 解析。
+- `docs/modules/resource-loader.md`：项目信任一节，trust gate 范围不含 settings/provider。
+- `docs/modules/model-gateway.md`：必测项无 trust/来源约束项。
+
+风险：真实安全漏洞类别（凭据外泄），而且是"设计上没说"而不是"实现可能写错"——按当前文档实现出来的系统天然带这条链。
+
+待处理方向：在 ModelGateway 权威文档中显式规定：custom provider / AuthRef / 默认模型覆盖只能来自用户级或显式受信任的 settings 来源；项目级 settings 声明 provider 必须在 project trusted 且用户显式确认后生效；`AuthRef::Env` 建议加白名单或仅允许用户级配置引用。ModelGateway 必测项补充对应用例。
+
+### BR-026：三份架构图互相矛盾，模块总览仍是 BR-003 收敛前的旧结构
+
+状态：Open
+
+问题：`docs/modules/README.md` 的分层图把 `ResourceLoader` 画成 `AgentRuntime` 直属顶层服务、把 `ModelGateway` 画在 `SessionRuntime` 之下，图中完全没有 `WorkspaceServices` / `CwdServiceRegistry` / `CwdScopedServices`——这是 BR-003 收敛（commit `eac94c1`）之前的结构。`docs/architecture.md` 的图把 `CommandSurface`、`RuntimeHooks` 画成与 `WorkspaceServices` 平行的顶层分支；而 `docs/modules/agent-runtime.md` 的服务图把 `CommandSurfaceService`、`RuntimeHookRegistry` 放在 `WorkspaceServices` 内部。三份图两两不一致。
+
+证据：
+
+- `docs/modules/README.md` 分层图（ResourceLoader/CommandSurface/RuntimeHooks/SessionManager 四分支，ModelGateway 挂 SessionRuntime）。
+- `docs/architecture.md` 分层图（WorkspaceServices 与 CommandSurface/RuntimeHooks 并列）。
+- `docs/modules/agent-runtime.md` 运行时服务图（CommandSurfaceService/RuntimeHookRegistry 在 WorkspaceServices 内）。
+
+风险：模块总览是新读者入口，与已收敛设计冲突会直接传播错误心智模型；也说明"权威归属"机制对图示没有生效。
+
+待处理方向：以 `agent-runtime.md` 的服务图为准更新另外两图；规定架构图只在一处维护（或其余文档仅链接）。
+
+## 中风险
+
+### BR-027：`AbortRun { run_id }` 是唯一以 run_id 路由的命令，存在无法取消的竞态窗口
+
+状态：Open
+
+问题：`AbortRun` 需要 `run_id`，但 UI 只能从 `run_started` 事件获得 run_id；`SubmitPrompt` 的 `CommandAck` 不携带 run_id。从 dispatch 到 `run_started` 之间（preflight、`BeforeAgentStart` hook、模型首包等待）UI 无法取消。同类命令 `WaitForIdle`、`Compact`、`AbortCompaction`、`AbortRetry` 都以 session_id 路由，仅 `AbortRun` 不对称。pi 的 `abort()` 是 session 级。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：`AbortRun { run_id: RunId }`；`CommandAck { command_id, accepted, reason }` 无 run_id。
+- `docs/modules/agent-runtime-events.md`：run_id 由 `SessionRuntime` 在 `run_started` 才对外可见。
+
+风险：用户在最需要取消的阶段（卡在启动/慢首包）无法取消；UI 需要为"取消"按钮做特殊等待逻辑。
+
+待处理方向：改为 `AbortRun { session_id, run_id: Option<RunId> }`（None = 当前 run），或提供 session 级 `AbortCurrentRun`。
+
+### BR-028：运行输入存在双入口（`SubmitPrompt.delivery` vs `Steer`/`FollowUp`/`NextTurn`），且 `DeliveryMode`、`QueueKind`、`QueueMode` 未定义
+
+状态：Open
+
+问题：`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate`、`ExecuteSlashCommand` 都携带 `delivery: DeliveryMode`，同时又存在独立的 `Steer` / `FollowUp` / `NextTurn` 命令。若 `DeliveryMode` 覆盖 steer/follow-up/next-turn，则两套入口语义重叠，phase guard、queue hook（`QueueBeforeEnqueue`）和事件（`queue_updated`）需要对两条路径保持一致，容易漂移；若不覆盖，`DeliveryMode` 的取值就无从知晓——该 enum 与 `QueueKind`、`QueueMode` 在全部文档中都没有定义（仅 session-runtime.md 提到队列模式"支持 all 和 one-at-a-time"）。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：MVP Command 列表同时含 `SubmitPrompt { delivery }` 与 `Steer`/`FollowUp`/`NextTurn`；`SetQueueMode { queue: QueueKind, mode: QueueMode }`。
+- 全仓库无 `DeliveryMode` / `QueueKind` / `QueueMode` 定义。
+
+风险：入口语义二义，实现时两条路径的队列/phase/hook 行为分叉。
+
+待处理方向：定义 `DeliveryMode` 并明确与三个队列命令的关系（推荐：保留 delivery 作为唯一入口、删除独立命令，或反之）。
+
+### BR-029：`SessionPhase` 是 phase guard 的核心，但没有权威完整定义；`branch_summary` 是幽灵 phase
+
+状态：Open
+
+问题：`SessionPhase` 用于"拒绝不合法命令和保护会话写入顺序"，但 CONTEXT.md 用"例如 idle、turn、compaction、branch_summary 和 retry"的开放式措辞，协议文档没有 `enum SessionPhase` 定义（尽管 roadmap 阶段 0 要求它可编译可序列化），事件文档的 phase lifecycle 图只覆盖 Idle/Turn/Compaction/Retry 且不完整（无完整转换矩阵）。`branch_summary` phase 只在 CONTEXT.md 出现过一次，所有模块文档从未提及它何时进入/退出。
+
+证据：
+
+- `CONTEXT.md` 会话阶段词条（"例如……"）。
+- `docs/modules/agent-runtime-protocol.md`：`SessionSnapshot.phase: SessionPhase` 有引用无定义。
+- `docs/modules/agent-runtime-events.md`：Session Phase Lifecycle 三段式示意，无 branch_summary。
+
+风险：每个命令的 phase policy（哪些 phase 拒绝哪些命令）是运行时正确性的地基，没有完整状态转换表就无法写 phase guard 测试。
+
+待处理方向：在 AgentRuntimeProtocol 或 SessionRuntime 文档中给出封闭的 `SessionPhase` enum 与完整转换表；决定 branch_summary 是否为 MVP phase。
+
+### BR-030：`WaitForIdle` 作为协议命令在 ack-only 模型下语义不成立
+
+状态：Open
+
+问题：`dispatch()` 返回的 `CommandAck` 被明确定义为"只表示命令是否被接收，不是执行结果"。那么 `WaitForIdle` 的"等待完成"无法通过任何已定义机制表达：没有 wait 完成事件，若靠 dispatch 阻塞到 idle 才返回 ack 则违反 ack 语义并阻塞 transport。UI 想知道 idle 直接监听 `session_settled` / `session_phase_changed` 即可，该命令在协议层没有存在价值——pi 的 `waitForIdle()` 是进程内 async 方法，不应原样搬进 wire 协议。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：`WaitForIdle { session_id }`；`CommandAck` 语义段。
+- `docs/modules/agent-runtime-events.md`：Command Lifecycle 明确 ack 只是接收确认。
+
+风险：实现者被迫发明私有语义（阻塞 ack 或私有事件），协议一致性破坏。
+
+待处理方向：从公开协议移除，保留为 runtime 内部 API；或定义显式完成事件并说明与 `session_settled` 的关系。
+
+### BR-031：abort 后"归还队列文本给编辑器"没有协议载体
+
+状态：Open
+
+问题：session-runtime.md 要求"在 `AbortRun` 时返回被清空的 steering 与 follow-up 消息，供 UI 恢复到编辑器"，但 `CommandAck` 不携带数据，`queue_updated` 只发送清空后的完整队列快照（不含"被移除的消息"）。按现有协议，UI 只能靠本地缓存上一次 `queue_updated` 来恢复文本——这与"UI 权威输入只有 snapshot/event"的原则冲突。
+
+证据：
+
+- `docs/modules/session-runtime.md`：队列语义段。
+- `docs/modules/agent-runtime-events.md`：Abort Lifecycle 中 `queue_updated?` 仅为快照；`QueueEvent::Updated` 无 removed 字段。
+
+风险：pi 的这条产品体验在协议化后静默丢失，或以 UI 私有状态实现。
+
+待处理方向：`queue_updated` 增加 `returned_to_editor` / removed 明细，或定义 abort 专属事件字段；或明确放弃该行为。
+
+### BR-032：`skill_invoked` / `prompt_template_invoked` 的 `run_id` 必填与队列 delivery 冲突
+
+状态：Open
+
+问题：`SkillEvent::Invoked { session_id, run_id: RunId, skill_name }` 的 run_id 非 Option，但 `InvokeSkill` 支持 `delivery` 入队（follow-up/next-turn）：入队时刻不存在 run。事件要么在入队时发（无 run_id 可填），要么延迟到实际展开进 run 时发（则"invoked"与命令 ack 之间存在长时间静默，且事件时点在任何文档中未写明）。`PromptTemplateEvent::Invoked` 同。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：`SkillEvent` / `PromptTemplateEvent` 定义；`InvokeSkill { delivery }`。
+
+风险：事件时点二义，UI 无法可靠反馈"技能已受理"。
+
+待处理方向：`run_id` 改 Option 并定义发布时点；或拆成 accepted/expanded 两个事件。
+
+### BR-033：`EventMsg` 内层路由字段的有无不一致
+
+状态：Open
+
+问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、PersistenceEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 CommandPresentation 的 command_id 解释了"内层重复是为了脱离事件上下文渲染"，没有给出统一规则。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：`EventMsg` 各族定义对比。
+
+风险：UI reducer 对不同事件族要走两套取 id 逻辑；序列化后内外字段不一致时无仲裁规则。
+
+待处理方向：定一条规则（全部依赖外层，或全部内层冗余）并统一各族定义。
+
+### BR-034：`focused` 与 `active` 术语直接冲突，协议字段使用了术语表明令避免的词
+
+状态：Open
+
+问题：CONTEXT.md "聚焦会话（focused session）"词条明确 _避免_："active session"；事件也叫 `session_focus_changed`、字段 `focused_session_id`。但 `RuntimeSnapshot` 的字段是 `active_session_id` / `active_session`，其注释"runtime-visible 的当前默认会话目标"与 focused session 定义完全同义；CONTEXT.md 自己的 RuntimeSnapshot 词条也写"默认可以没有 active session"。同一概念在协议和术语表中使用互相禁止的两个名字。
+
+证据：
+
+- `CONTEXT.md`：聚焦会话词条 avoid 列表 vs RuntimeSnapshot 词条。
+- `docs/modules/agent-runtime-protocol.md`：`RuntimeSnapshot.active_session_id` 注释。
+
+风险：低成本但高频的认知摩擦；如果 active_session 实际是"focused 且 loaded 的投影"这类微妙差异，现在的文档也没有说清。
+
+待处理方向：统一为一个词（建议协议字段改 `focused_session`），或在 CONTEXT.md 显式定义两者差异。
+
+### BR-035：`RuntimeHookRegistry` 归属表述漂移；workspace 级 registry 与 per-cwd trust 的交互未定义
+
+状态：Open
+
+问题：runtime-hooks.md 说 `AgentRuntime` 拥有 registry、`SessionRuntime` 持有"session-scoped view"；但 session-runtime.md 的内部结构图和 agent-runtime-events.md 的 ownership matrix 都把 `RuntimeHookRegistry` 直接列为 SessionRuntime 持有状态，无 view 字样。更深一层：registry 在 `WorkspaceServices`（workspace 级单例），而 hook 的 capability gate 依赖 `TrustLevel`，trust 却是 `CwdScopedServices` 的 per-cwd 状态（`ProjectTrustView`）——`HookSource::WorkspaceTrusted` 的 hook 在多 cwd 场景下按哪个 cwd 的 trust 判定，未定义。
+
+证据：
+
+- `docs/modules/runtime-hooks.md`：Registry And Ownership。
+- `docs/modules/session-runtime.md`：内部结构图。
+- `docs/modules/agent-runtime-events.md`：Ownership Matrix。
+- `docs/modules/agent-runtime.md`：`RuntimeHookRegistry` 在 WorkspaceServices，`ProjectTrustView` 在 CwdScopedServices。
+
+风险：hook 权限判定在多 session/多 cwd 下不确定；文档漂移会延续到实现。
+
+待处理方向：统一表述为 registry + per-session view；规定 hook trust 按调用时 session pin 的 generation 中的 `ProjectTrustView` 判定。
+
+### BR-036：多 workspace 语义不闭合
+
+状态：Open
+
+问题：协议表面广泛携带 workspace 维度（`ReloadResources { workspace_id }`、`SessionListScope::AllWorkspaces / Workspace{id}`、`EventScope::Workspace`、registry key 含 workspace_id、`NewSession { workspace_id }`），但 `RuntimeSnapshot.workspace` 是单个 Option、Workspace Lifecycle 状态机是单 workspace 的（NoWorkspace → Open → …），`OpenWorkspace` 被第二次调用是替换、并存还是拒绝没有任何说明。roadmap 把多 workspace 列为后续增强，但协议已经按多 workspace 形状铺开。
+
+证据：
+
+- `docs/modules/agent-runtime-protocol.md`：Command/scope 定义 vs `RuntimeSnapshot` 单 workspace 字段。
+- `docs/modules/agent-runtime-events.md`：Workspace Lifecycle。
+
+风险：与 BR-001 同类的"形态先行"：实现者不知道该按单还是多 workspace 实现路由与 registry。
+
+待处理方向：明确 MVP 单 workspace（`OpenWorkspace` 重复调用 = teardown 后替换或拒绝），workspace_id 仅作前向兼容字段；多 workspace 升级路径另立文档。
+
+### BR-037：tool sandbox 被定位为真正的安全边界，但没有任何 source of truth
+
+状态：Open
+
+问题：文档多处依赖 sandbox：`ToolPolicyInput.sandbox: ToolSandboxView`、`CwdScopedServices` 含 `ToolSandboxRoot`、hook 规则"rewrite 后必须重新 sandbox check"、tools.md 明言"UI 审批只是 ToolPolicy 的输入，不是安全边界"（言下之意 sandbox 才是）、roadmap 阶段 15 要求 bash 的 cwd/sandbox 可观察。但 `ToolSandboxView` / `ToolSandboxRoot` 从未被定义，sandbox 的模型（路径边界？只读/读写域？进程/网络限制？平台差异？）在全部 16 个模块文档中没有一节描述，CONTEXT.md 也无词条。
+
+证据：
+
+- `docs/modules/tools.md`、`docs/modules/agent-runtime.md`、`docs/modules/runtime-hooks.md`、`docs/implementation-roadmap.md` 中的引用点。
+
+风险：mutation/bash 阶段（roadmap 14/15）的核心安全语义完全靠实现时即兴决定；"重新 sandbox check"无从测试。
+
+待处理方向：新增 sandbox 设计文档（或并入 Tools 权威文档）：定义 ToolSandboxView 结构、路径归一化与逃逸规则、bash 的执行约束边界，并加入必测项。
+
+## 低风险 / 一致性
+
+### BR-038：failure → retry 的 phase 抖动，两处 lifecycle 描述不一致
+
+状态：Open
+
+问题：Failure Lifecycle 规定失败后 `session_phase_changed { idle }` → `session_settled or retry_auto_started`，即 retry 前 phase 必经 idle（UI 会闪现空闲态）；而 Session Phase Lifecycle 图画的是 `Idle -- session_phase_changed(retry) --> Retry -- run_started --> Turn`。retry 期间 phase 究竟是 idle、retry 还是 turn，两图拼不出一致答案。
+
+证据：`docs/modules/agent-runtime-events.md` Failure Lifecycle vs Session Phase Lifecycle。
+
+待处理方向：给出 failed → retry 的完整 phase/事件时序，消除 idle 抖动或明确接受它。
+
+### BR-039：协议字段使用 `usize`
+
+状态：Open
+
+问题：`ListSessions { limit: usize }`、`SessionEvent::Settled { next_turn_count: usize }` 使用平台相关宽度类型；协议其余部分统一 u32/u64。wire 协议类型应固定宽度（参考 Codex 用 i64）。
+
+证据：`docs/modules/agent-runtime-protocol.md`。
+
+待处理方向：统一为 u32/u64。
+
+### BR-040：`ToolPolicy` 声明为纯判断器，却要构造需要 I/O 的 `ToolApprovalPreview`
+
+状态：Open
+
+问题：tools.md 说 "ToolPolicy constructs it（ToolApprovalPreview）"，而 `FileEdit { diff }` / `Patch { diff_preview }` 类 preview 需要读取目标文件计算 diff——与"ToolPolicy 是纯策略判断器"的定位矛盾。
+
+证据：`docs/modules/tools.md` 数据结构草案注释与 ToolPolicy 定位段。
+
+待处理方向：preview 构造移到 ToolGateway 准备阶段；policy 只返回 `RequireApproval { reason }`。
+
+### BR-041：`GetContextFile { path }` 未定义校验边界
+
+状态：Open
+
+问题：该命令以任意 `PathBuf` 为参数，文档只说"读取必须经过 AgentRuntime / ResourceLoader"，未规定 path 必须命中当前资源快照中已登记的 context file。不加约束就是一条 UI 任意读文件通道。
+
+证据：`docs/modules/agent-runtime-protocol.md` 后续命令段。
+
+待处理方向：规定只接受当前 `RuntimeResources.context_files` 中登记的路径（按 canonical path 匹配），并写入必测项。
+
+### BR-042：`SessionEntry::Leaf` 条目与 `SessionStorage::set_leaf_id()` 双机制关系未定义
+
+状态：Open
+
+问题：JSONL 规则用 `leaf` entry 记录当前叶子（"追加普通条目后，当前叶子默认变为该条目"），trait 又有独立的 `set_leaf_id()` 方法。set_leaf_id 是否等价于追加 Leaf entry、Leaf entry 自身是否在树上（有无 parent_id）、`get_path_to_root` 如何跳过它，均未说明；InMemory 与 JSONL 两实现极易在此分叉。
+
+证据：`docs/modules/session-manager.md` Interface 与 JSONL 持久化段。
+
+待处理方向：在 storage contract 中明确两者关系，并纳入 conformance tests。
+
+### BR-043：`CwdScopedServices` generation 的回收策略未定义
+
+状态：Open
+
+问题：reload 会为同一 cwd 产生新 generation，旧 generation 被后台 session pin 住；文档定义了 SessionRuntime 的卸载条件，但没有定义 generation 本身的回收（引用计数？最后一个 pin 释放后丢弃？），长会话 + 频繁 reload 会累积服务实例（含 ModelGateway、ResourceLoader 全套）。
+
+证据：`docs/modules/agent-runtime.md` 运行时服务段。
+
+待处理方向：补充 generation 生命周期（建议 pin 计数归零即 drop）。
+
+### BR-044：`EventStream` 的订阅语义未定义
+
+状态：Open
+
+问题：`subscribe()` 的多订阅者语义（新订阅者从何处开始）、慢消费者/背压策略（lag 时是丢事件产生 sequence gap 还是阻塞发布者）、ring buffer 容量与 gap recovery 的关系都未定义，而 sequence gap recovery 恰恰依赖这些行为。
+
+证据：`docs/modules/agent-runtime-protocol.md`（EventStream 仅出现类型名）；`docs/modules/agent-runtime-events.md` RuntimeSnapshot 水位段提及 ring buffer。
+
+待处理方向：在 AgentRuntimeEvents 中定义订阅起点、lag 策略与 gap 的产生条件。
+
+### BR-045：CONTEXT.md 会话条目类型列表滞后
+
+状态：Open
+
+问题：CONTEXT.md "会话条目"词条列出 message、model_change、active_tools_change、compaction、branch_summary、label、session_info、leaf，缺 session-manager.md 已定义的 thinking_level_change、custom、custom_message、usage。与 BR-017/BR-018 同类（术语表滞后）。
+
+证据：`CONTEXT.md` 会话条目词条 vs `docs/modules/session-manager.md` 追加式条目段。
+
+待处理方向：同步词条，或改为开放式措辞并链接权威文档。
+
+### BR-046：`UiInteractionSubmit::ExecuteSlashCommandTemplate` 的占位符语法未定义
+
+状态：Open
+
+问题：MVP 依赖 picker 选择后按模板重新提交 slash command（示例 `/model {item.id}`），但模板占位符语法（可用变量、转义规则）没有定义，TUI/GUI 各自实现必然分叉。
+
+证据：`docs/modules/agent-runtime-protocol.md` interaction 段示例。
+
+待处理方向：定义最小占位符集（如 `{item.id}`）与转义规则。
+
+## 过程性观察（不编号）
+
+1. **字段级设计先行于 Rig 验证。** roadmap 正确地把 Rig spike 排在阶段 4，但 `DriveEntry::Resume { serialized_run }`、`DriveResult::Paused`、usage extraction、cancellation 等大量字段级类型已按未验证的 Rig sans-IO 假设写死。command-surface.md 有"类型片段是设计草图"的免责声明，其他文档（尤其 protocol.md）没有——建议统一标注哪些类型是承诺、哪些是草图，并在 spike 前冻结字段级细节的进一步扩张。
+2. **重复边界声明是已被证实的漂移温床。** 例如"hook 不能发 event / 读写 storage / 执行工具 / 读凭据"在 ≥6 个文档中整段复制；本轮 BR-026/BR-034/BR-035 与第一轮 BR-010/BR-012/BR-022 的漂移多发生在复制文本上。建议机械执行权威归属表：非权威文档一句话 + 链接，禁止复制列表和图。
+3. **协议表面积与 MVP 范围不匹配。** 20+ "后续命令"已给出字段级定义（fork/import/export/tree/interaction submit/cycle 等），与 BR-001 的教训同构。建议后续命令只保留名字与一句话意图，字段定义等实现临近时再补。
