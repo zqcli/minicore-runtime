@@ -1,15 +1,15 @@
 # MiniCore Agent Runtime
 
-本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它借鉴 pi coding-agent 的 `AgentSessionRuntime` / `AgentSession` 生产路径，把模型调用、会话、资源、工具、斜杠命令、事件、RuntimeHooks 和持久化编排收敛在 UI 无关的 runtime 中；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
+本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它借鉴 pi coding-agent 的 `AgentSessionRuntime` / `AgentSession` 生产路径，把模型调用、会话、资源、工具、`CommandSurface`、事件、RuntimeHooks 和持久化编排收敛在 UI 无关的 runtime 中；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
 
 ## 语言
 
 **MiniCore**：
-面向桌面、终端和 CLI/GUI 宿主的轻量级原生 Agent harness runtime core。它承载模型调用、会话、资源、工具、斜杠命令和运行时事件；具体 CLI、TUI、GUI 产品在下游仓库实现。
+面向桌面、终端和 CLI/GUI 宿主的轻量级原生 Agent harness runtime core。它承载模型调用、会话、资源、工具、`CommandSurface` 和运行时事件；具体 CLI、TUI、GUI 产品在下游仓库实现。
 _避免_：旧项目代号、pi coding-agent 分支、WebView Agent SDK、下游产品仓库
 
 **Harness 能力**：
-围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、斜杠命令、RuntimeHooks 和 UI 协议。它是 MiniCore runtime 的职责，不是 pi-agent-core `AgentHarness` 这个具体历史类。
+围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、`CommandSurface`、RuntimeHooks 和 UI 协议。它是 MiniCore runtime 的职责，不是 pi-agent-core `AgentHarness` 这个具体历史类。
 _避免_：UI 应用、单纯模型客户端、Rig 高阶 runner
 
 **下游终端用户应用**：
@@ -163,6 +163,10 @@ _避免_：完整 prompt、用户消息、工具描述
 **资源加载器**：
 Agent 运行时中的内部服务，负责运行时资源的来源聚合、信任校验、加载刷新、资源快照、提示词素材和诊断信息。它持有技能目录生命周期，但调用平级技能模块完成技能文件处理。
 _避免_：文件扫描脚本、UI 资源管理器、系统提示词构建器、协议类型集合
+
+**CommandSurface**：
+Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令面，负责命令目录、`/...` 文本解析、执行规划、运行时命令映射和命令呈现语义。它不是 UI 输入框，也不是 `agent_runtime_protocol::Command` enum 本身。
+_避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop
 
 **斜杠命令**：
 用户以 `/` 开头输入的运行时命令入口，例如 `/compact`、`/reload`、`/skill:name` 或 `/{template}`。它是命令入口语法，不是 Agent 消息类型，也不是工具调用。

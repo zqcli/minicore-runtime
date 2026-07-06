@@ -26,7 +26,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                  MiniCore AgentRuntime
        ┌────────────────────┬────────────────────┬────────────────────┐
        ▼                    ▼                    ▼                    ▼
- ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
+ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
                                                                   │
                                                          LoadedSessionRuntimes
                                                                   │
@@ -48,7 +48,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
 - [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
 - [ResourceLoader](modules/resource-loader.md)：资源来源聚合、刷新和资源诊断。
-- [SlashCommands](modules/slash-commands.md)：跨 UI 的斜杠命令目录、Parse / Plan / Execute / Present 四阶段、运行时命令映射和 command presentation。
+- [CommandSurface](modules/command-surface.md)：跨 UI 的斜杠命令目录、Parse / Plan / Execute / Present 四阶段、运行时命令映射和 command presentation。
 - [RuntimeHooks](modules/runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
 - [Skills](modules/skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](modules/prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
@@ -67,7 +67,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面。
 - `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。
 - `SessionRuntime` 是单个会话的产品级编排层。
-- `SlashCommands` 属于运行时命令入口：下游 UI 可以渲染 autocomplete / command palette / picker / popup，但不拥有 `/...` 的权威解析、执行映射或用户可见结果语义。
+- `CommandSurface` 属于运行时命令入口：下游 UI 可以渲染 autocomplete / command palette / picker / popup，但不拥有 `/...` 的权威解析、执行映射或用户可见结果语义。
 - `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
@@ -102,7 +102,7 @@ AgentSessionRuntime
 - [ADR 0003：AgentRuntimeEvents 使用 EventMsg、配对生命周期和单 run 终态](adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)
 - [ADR 0004：SessionManager 拥有已加载会话运行时](adr/0004-session-manager-owns-loaded-session-runtimes.md)
 - [ADR 0005：ResourceLoader 是运行时内部资源服务](adr/0005-resource-loader-is-runtime-internal.md)
-- [ADR 0006：SlashCommands 是跨 UI 的运行时命令入口](adr/0006-slash-commands-are-runtime-command-surface.md)
-- [ADR 0007：Slash command 使用 CommandPresentation 呈现用户可见结果](adr/0007-slash-command-uses-command-presentation.md)
+- [ADR 0006：CommandSurface 是跨 UI 的运行时命令入口](adr/0006-command-surface-is-runtime-command-surface.md)
+- [ADR 0007：CommandSurface 使用 CommandPresentation 呈现用户可见结果](adr/0007-command-surface-uses-command-presentation.md)
 - [ADR 0008：RuntimeHooks 是内部安全点扩展缝，不是协议事件或 UI 插件 API](adr/0008-runtime-hooks-are-internal-safe-point-seams.md)
 - [ADR 0009：ModelGateway 包装 Rig providers](adr/0009-model-gateway-wraps-rig-providers.md)

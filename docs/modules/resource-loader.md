@@ -265,7 +265,7 @@ pub struct TextResource {
 
 Prompt templates 是可显式调用资源，不默认进入 system prompt。
 
-Prompt templates 也会被 [SlashCommands](slash-commands.md) 投影成 `/{template}` 命令摘要；名称冲突和可用性由 `SlashCommands` 决定。
+Prompt templates 也会被 [CommandSurface](command-surface.md) 投影成 `/{template}` 命令摘要；名称冲突和可用性由 `CommandSurface` 决定。
 
 `ResourceLoader` 负责：
 
@@ -291,7 +291,7 @@ ResourceLoader.reload()
 
 显式 `InvokeSkill` 的正文读取和 `<skill>` message 构造属于 `SessionRuntime`，对齐 pi `AgentSession._expandSkillCommand()`。
 
-`ResourceLoader` 只提供技能 metadata 给 [SlashCommands](slash-commands.md) 生成 `/skill:{name}` 命令摘要；它不解析用户输入，也不展开技能正文。
+`ResourceLoader` 只提供技能 metadata 给 [CommandSurface](command-surface.md) 生成 `/skill:{name}` 命令摘要；它不解析用户输入，也不展开技能正文。
 
 ## Extension / Package Resource Discovery
 

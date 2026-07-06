@@ -1,6 +1,6 @@
-# SlashCommands
+# CommandSurface
 
-`SlashCommands` 是 MiniCore 运行时提供给下游 CLI、TUI 和 GUI 宿主的统一命令入口、解析、执行映射和呈现协调模块。它把用户输入的 `/...` 文本、command palette 选择、技能命令和提示模板命令，经过 `Parse → Plan → Execute → Present` 四个阶段，转换成已有 `agent_runtime_protocol::Command`、受控 query、模型可见用户输入，或 UI 可渲染的交互请求 / 命令输出。
+`CommandSurface` 是 MiniCore 运行时提供给下游 CLI、TUI 和 GUI 宿主的统一命令入口、解析、执行映射和呈现协调模块。它把用户输入的 `/...` 文本、command palette 选择、技能命令和提示模板命令，经过 `Parse → Plan → Execute → Present` 四个阶段，转换成已有 `agent_runtime_protocol::Command`、受控 query、模型可见用户输入，或 UI 可渲染的交互请求 / 命令输出。
 
 它不是 Agent loop，不是工具调用，也不是 UI 本地快捷键系统。它的核心价值是让下游 CLI、TUI 和 GUI 共享同一套命令目录、可用性规则、资源命令投影、执行映射和用户可见结果表达，避免每个产品仓库各自实现一份 `/compact`、`/skill:name`、`/model`、`/usage` 解析和展示逻辑。
 
@@ -43,12 +43,12 @@ UI Adapter
   └─ submits ExecuteSlashCommand or runtime-provided interaction submit action
 
 AgentRuntime
-  ├─ owns SlashCommandService
+  ├─ owns CommandSurfaceService
   ├─ exposes slash command catalog in Snapshot / events
   ├─ dispatches resolved command to SessionManager / SessionRuntime / ResourceLoader
   └─ publishes command presentation events
 
-SlashCommandService
+CommandSurfaceService
   ├─ builds SlashCommandCatalog from builtins + resources + extensions
   ├─ parses raw "/..." text
   ├─ plans execution: protocol command / runtime query / prompt input / interaction
@@ -65,7 +65,7 @@ SessionRuntime
   └─ owns run/compaction/config events for a session
 ```
 
-`SlashCommandService` 可以作为 `AgentRuntime` 内部 service，而不是顶层架构层。文档上单独说明，是因为它定义了跨 UI 的 command surface、解析规则、执行映射和用户可见呈现语义。
+`CommandSurfaceService` 可以作为 `AgentRuntime` 内部 service，而不是顶层架构层。文档上单独说明，是因为它定义了跨 UI 的 command surface、解析规则、执行映射和用户可见呈现语义。
 
 ## Command Sources
 
@@ -136,7 +136,7 @@ Catalog 是 UI 展示与 autocomplete / command palette 的输入，不是执行
 
 ## 四阶段模型
 
-Slash command 采用四阶段模型：
+CommandSurface 采用四阶段模型：
 
 ```text
 Parse
@@ -219,7 +219,7 @@ Plan 阶段可以把用户级错误转换成 `Rejected(CommandPresentation)`，�
 
 ### 3. Execute
 
-Execute 把 plan 交给对应后端承接者。`SlashCommandService` 不直接拥有这些状态机。
+Execute 把 plan 交给对应后端承接者。`CommandSurfaceService` 不直接拥有这些状态机。
 
 | Plan 类型 | 承接者 | 示例 |
 | --- | --- | --- |
@@ -384,7 +384,7 @@ ResourceLoader.reload()
   → slash_commands_changed?   // 当 catalog 内容或可用性变化时
 ```
 
-`SlashCommands` 只读取资源摘要和 metadata，不读取技能正文。技能正文读取仍发生在 `SessionRuntime::invoke_skill`。
+`CommandSurface` 只读取资源摘要和 metadata，不读取技能正文。技能正文读取仍发生在 `SessionRuntime::invoke_skill`。
 
 ### AgentRuntimeProtocol
 
@@ -418,10 +418,10 @@ CommandPresentationEvent::InteractionRequested { ... } // wire: command_interact
 
 ```text
 ExecuteSlashCommand
-  → SlashCommandService.parse
-  → SlashCommandService.plan
+  → CommandSurfaceService.parse
+  → CommandSurfaceService.plan
   → execute plan through backend owner
-  → SlashCommandService.present backend outcome
+  → CommandSurfaceService.present backend outcome
   → AgentRuntime publishes CommandPresentationEvent
 ```
 
