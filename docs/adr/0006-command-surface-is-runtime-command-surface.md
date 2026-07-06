@@ -1,0 +1,5 @@
+# CommandSurface 是跨 UI 的运行时命令入口
+
+我们需要 slash command 能力，但把它设计为 `AgentRuntime` 持有的跨下游宿主 command surface，而不是 Ratatui 私有语法糖。`CommandSurface` 维护 builtins、skills、prompt templates 和后续 extension commands 的目录与解析规则，并把 `/...` invocation 映射成已有 `agent_runtime_protocol::Command`、受控查询、模型可见用户消息或 `CommandPresentation`；真正执行仍由 `AgentRuntime`、`SessionRuntime`、`ResourceLoader`、`Compaction`、`Tools` 等模块负责。
+
+这个决定参考 pi 和 Codex：pi 把 builtins、prompt templates、extension commands 和 `/skill:name` 合成 autocomplete，并在 session 层展开技能/模板；Codex 把 slash command 建模为带可用性和 inline-args 规则的 enum，再由 dispatch 层映射到 app events、用户消息、popup 或 runtime actions。MiniCore 会被下游 CLI、TUI 和 GUI 复用，如果让各宿主自己解析 `/compact`、`/skill:name` 或 `/{template}`，名称冲突、资源 revision、运行中可用性、结果呈现和权限边界会漂移。用户可见结果的呈现边界见 [ADR 0007](0007-command-surface-uses-command-presentation.md)。

@@ -251,7 +251,7 @@ Hook 只能返回 catalog/presentation patch；不能直接打开 UI，不能直
 | `InputReceived` | Transform / Gate | transform / handled / reject |
 | `InputBeforeSubmit` | Transform / Gate | prompt-like input 进入 session 前最后校验 |
 
-`SubmitPrompt` 不默认解析 slash。`ExecuteSlashCommand` 仍走 `SlashCommands`。Input hook 不能绕过 phase guard。
+`SubmitPrompt` 不默认解析 slash。`ExecuteSlashCommand` 仍走 `CommandSurface`。Input hook 不能绕过 phase guard。
 
 ### Session Lifecycle
 

@@ -25,7 +25,7 @@ pub trait AgentRuntime {
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
 - 基于有效 cwd 创建和重建运行时服务：凭据、设置、模型注册表、模型调用网关、资源加载器、会话管理器和诊断集合。
-- 持有 `SlashCommandService`，把 runtime builtins、资源命令和后续扩展命令投影成跨 UI 的 command catalog，并按 Parse / Plan / Execute / Present 四阶段处理 `ExecuteSlashCommand`。
+- 持有 `CommandSurfaceService`，把 runtime builtins、资源命令和后续扩展命令投影成跨 UI 的 command catalog，并按 Parse / Plan / Execute / Present 四阶段处理 `ExecuteSlashCommand`。
 - 持有 `RuntimeHookRegistry` 作为内部 runtime service，在资源、slash command、prompt、context、tool、compaction、persistence 和 presentation 等安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command presentation events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 message panel 输出、picker、popup、menu、form 或 detail view 请求。
 - 在 session 切换、new、fork、import 前后执行受控的 teardown、invalidate、rebind 和 startup 流程。
@@ -43,7 +43,7 @@ RuntimeServices
   ├─ ProviderRegistry
   ├─ ModelGateway
   ├─ ResourceLoader
-  ├─ SlashCommandService
+  ├─ CommandSurfaceService
   ├─ RuntimeHookRegistry
   ├─ SessionManager
   ├─ ProjectTrustStore
@@ -94,10 +94,10 @@ RuntimeServices
 
 ```text
 ExecuteSlashCommand
-  → SlashCommandService.parse
-  → SlashCommandService.plan
+  → CommandSurfaceService.parse
+  → CommandSurfaceService.plan
   → AgentRuntime executes plan through backend owner
-  → SlashCommandService.present outcome
+  → CommandSurfaceService.present outcome
   → command_output_appended / command_interaction_requested
 ```
 

@@ -102,7 +102,7 @@ pub enum Command {
 
 `RuntimeResources` 不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceLoader` 的 source info、project trust、diagnostics 和 atomic reload 语义。
 
-`ExecuteSlashCommand` 只提交原始 `/...` invocation；Parse / Plan / Execute / Present 由运行时的 [SlashCommands](slash-commands.md) 模块和 `AgentRuntime` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteSlashCommand` 或 runtime-provided interaction submit action；专用设置控件可以直接提交结构化 command，但必须复用同一后端校验、事件和 command presentation 规则。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
+`ExecuteSlashCommand` 只提交原始 `/...` invocation；Parse / Plan / Execute / Present 由运行时的 [CommandSurface](command-surface.md) 模块和 `AgentRuntime` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteSlashCommand` 或 runtime-provided interaction submit action；专用设置控件可以直接提交结构化 command，但必须复用同一后端校验、事件和 command presentation 规则。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
 
 后续命令：
 

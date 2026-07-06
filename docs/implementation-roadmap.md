@@ -21,7 +21,7 @@ Minimal protocol / event / session spine
 - `InMemorySessionStorage` 先作为 storage contract 和测试底座；JSONL 在 entry、leaf、save point 语义稳定后实现。
 - `Driver` 不能拖到最后才验证。先用 fake driver 跑通纵切，再用隔离 spike 验证 Rig `AgentRun / AgentRunStep` 是否满足设计假设。
 - `ToolGateway` 在 read-only tool 切片出现；`ToolApprovalBroker` 等到 mutation tool 前后再做完整闭环。
-- `SlashCommands`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程。
+- `CommandSurface`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程。
 
 ## 先决设计点
 
@@ -44,7 +44,7 @@ Minimal protocol / event / session spine
 | 5. Text-only Driver integration | 用真实 `Driver.drive_run()` 替换 fake driver，先只接模型文本流 | `src/driver.rs`、`src/driver/rig.rs`、`src/model_gateway.rs`、`src/model_gateway/rig.rs`、`src/session_runtime.rs` | 真 Driver 只传 `ModelSelection`；`ModelGateway` mock/fake provider 产生 assistant started/delta/finished；普通 provider failure 归约为 `DriveResult::Failed` 和唯一 `run_finished`。 |
 | 6. JSONL storage | 在 storage contract 稳定后实现文件持久化 | `src/session_storage/jsonl.rs`、`src/session_manager.rs` | InMemory 和 JSONL 通过同一组 conformance tests；重开后 snapshot/context 一致。 |
 | 7. Resources / Skills / Prompt | 接入资源刷新、skill、prompt template、纯 prompt builder | `src/resource_loader.rs`、`src/skills.rs`、`src/prompt_templates.rs`、`src/prompt.rs` | `ReloadResources -> resources_changed`；`InvokeSkill` / prompt template 展开为 user message；资源变化只影响 future turn。 |
-| 8. SlashCommands skeleton | 建立跨 UI command catalog、parse/plan/present，但不要求所有后端命令完整 | `src/slash_commands.rs` | `/help`、`/reload`、`/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
+| 8. CommandSurface skeleton | 建立跨 UI command catalog、parse/plan/present，但不要求所有后端命令完整 | `src/command_surface.rs` | `/help`、`/reload`、`/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
 | 9. ModelGateway 和 UsageStats | 收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage | `src/provider_registry.rs`、`src/model_gateway.rs`、`src/auth_store.rs`、`src/usage_stats.rs` | `SetModel -> ModelState -> ModelCallRequest -> ModelGateway` 可测；mock/provider usage 变成 `usage_updated`；snapshot 包含 provider/model view、`session_stats` 和 `context_usage`；后续 compaction 能复用 context usage。 |
 | 10. Read-only Tools | 实现工具定义、registry、active set、最小 policy、gateway 和只读工具 | `src/tools.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/policy.rs`、`src/tools/gateway.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool -> ToolGateway -> tool result -> Rig continuation` 跑通；tool error 作为 error tool result 回填。 |
 | 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、pending approval snapshot/reconnect 行为稳定；approval 后 args 冻结。 |
@@ -135,9 +135,9 @@ Mutation / process tools:
 
 `ToolGateway` 要在第一个工具切片就出现，因为它是真正连接 `DriverHost::invoke_tool` 和产品级工具治理的 seam。`ToolApprovalBroker` 不必在 read-only tools 阶段做满；它应在 mutation tools 前完成，因为 approval 后 args 冻结、reject-as-error-tool-result、preview 和 pending approval reconnect 都是高风险行为。
 
-## SlashCommands 顺序
+## CommandSurface 顺序
 
-`SlashCommands` 是 runtime-owned command surface，但不是底层执行通道。它应在 resources/skills/prompt template 之后出现，因为 command catalog 需要 resource projection。
+`CommandSurface` 是 runtime-owned command surface，但不是底层执行通道。它应在 resources/skills/prompt template 之后出现，因为 command catalog 需要 resource projection。
 
 MVP 不要求所有 slash command 都完整可执行：
 

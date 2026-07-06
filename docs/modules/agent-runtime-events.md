@@ -234,7 +234,7 @@ session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `ToolGateway` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
 | `ResourceLoader` | 不直接发 UI event | 返回资源结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 消费资源 revision 并在后续 turn 重建 prompt。 |
-| `SlashCommands` | 不直接发 UI event | 返回 command catalog、parse/plan 结果和 command presentation；`AgentRuntime` 发布 `slash_commands_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 protocol command。 |
+| `CommandSurface` | 不直接发 UI event | 返回 command catalog、parse/plan 结果和 command presentation；`AgentRuntime` 发布 `slash_commands_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 protocol command。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
 | `RuntimeHooks` | 不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
 
@@ -256,7 +256,7 @@ session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 
 | `ToolGateway` | 单次 tool invocation 的治理上下文、policy evaluation、approval wait、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 registry/policy/approval/executor/hook；返回 `ToolInvocationResult` |
 | `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `ToolGateway` 调用 |
 | `ResourceLoader` | `RuntimeResources`、`PromptMaterials`、`SkillCatalog`、resource diagnostics、revision candidate | 不发布 UI event；返回 reload result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 消费新 revision |
-| `SlashCommands` | `SlashCommandCatalog` projection、name conflict diagnostics、phase policy、raw invocation parse result、execution plan、presentation plan | 不发布 UI event；返回 catalog、plan 或 `CommandPresentation` | `AgentRuntime` 发布 `slash_commands_changed` 和 command presentation events；`SessionRuntime` 执行 session-scoped command |
+| `CommandSurface` | `SlashCommandCatalog` projection、name conflict diagnostics、phase policy、raw invocation parse result、execution plan、presentation plan | 不发布 UI event；返回 catalog、plan 或 `CommandPresentation` | `AgentRuntime` 发布 `slash_commands_changed` 和 command presentation events；`SessionRuntime` 执行 session-scoped command |
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceLoader` / `SessionRuntime` 调用 |
 | `Prompt` | 无生命周期状态；纯构建输入到输出 | 不发布事件 | 被 `SessionRuntime` 调用 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
@@ -284,7 +284,7 @@ RuntimeServices
   ├─ ProviderRegistry
   ├─ ModelGateway
   ├─ ResourceLoader
-  ├─ SlashCommandService
+  ├─ CommandSurfaceService
   ├─ RuntimeHookRegistry
   ├─ SessionManager
   └─ RuntimeDiagnostics

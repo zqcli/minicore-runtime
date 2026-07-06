@@ -16,7 +16,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                     AgentRuntime
       ┌────────────────────┬────────────────────┬────────────────────┐
       ▼                    ▼                    ▼                    ▼
-ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
+ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
                                                                   ┌──────┴──────┐
                                                                   ▼             ▼
                                                         LoadedSessionRuntimes  SessionHandle
@@ -43,7 +43,7 @@ ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
 
 `ResourceLoader` 是运行时内部资源服务，负责资源来源聚合、信任校验、原子刷新、当前资源快照、提示词素材和诊断。它拥有当前 `SkillCatalog` 的生命周期，但不构造最终 system prompt，也不是 `AgentRuntimeProtocol` 的数据存储。
 
-`SlashCommands` 是跨 UI 的命令目录、解析、执行映射和呈现协调模块。它把 `/compact`、`/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令经过 Parse / Plan / Execute / Present 四阶段映射到已有 `agent_runtime_protocol::Command`、受控查询、prompt-like 输入或 `CommandPresentation`，但不直接执行工具或 Agent loop。
+`CommandSurface` 是跨 UI 的命令目录、解析、执行映射和呈现协调模块。它把 `/compact`、`/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令经过 Parse / Plan / Execute / Present 四阶段映射到已有 `agent_runtime_protocol::Command`、受控查询、prompt-like 输入或 `CommandPresentation`，但不直接执行工具或 Agent loop。
 
 `RuntimeHooks` 是内部扩展点系统。它在 runtime 安全点开放 typed decision / patch / replacement，让内置策略、测试 harness、可信 package 或后续 extension 影响资源、prompt、context、tools、compaction 和 command presentation；hook 不直接发布 UI event，不直接读写 session storage，也不直接执行工具。
 
@@ -69,7 +69,7 @@ ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
 - [AgentRuntimeEvents](agent-runtime-events.md)：事件命名、`agent_runtime_protocol::Event` / `agent_runtime_protocol::EventMsg`、生命周期、顺序约束、保存点和重连语义。
 - [SessionManager / SessionStorage](session-manager.md)：会话生命周期、已加载会话运行时、session tree、JSONL、会话管理与存储接口。
 - [ResourceLoader](resource-loader.md)：资源来源聚合、刷新和诊断。
-- [SlashCommands](slash-commands.md)：斜杠命令目录、四阶段解析/规划/执行/呈现、来源合并、可用性规则和执行映射。
+- [CommandSurface](command-surface.md)：斜杠命令目录、四阶段解析/规划/执行/呈现、来源合并、可用性规则和执行映射。
 - [RuntimeHooks](runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
 - [Skills](skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
@@ -91,7 +91,7 @@ ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
 | `src/agent_runtime.rs` | [AgentRuntime](agent-runtime.md) | UI 无关运行时门面、工作区服务和命令路由。 |
 | `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | workspace-bound runtime services 聚合与重建。 |
 | `src/auth_store.rs` | [AgentRuntime](agent-runtime.md)、[RuntimeHooks](runtime-hooks.md) | 凭据读取边界；不暴露 secret material 给 UI 或 hook。 |
-| `src/settings_store.rs` | [AgentRuntime](agent-runtime.md)、[SlashCommands](slash-commands.md) | runtime/session 设置读取与更新边界。 |
+| `src/settings_store.rs` | [AgentRuntime](agent-runtime.md)、[CommandSurface](command-surface.md) | runtime/session 设置读取与更新边界。 |
 | `src/provider_registry.rs` | [ModelGateway](model-gateway.md)、[AgentRuntime](agent-runtime.md) | provider/model catalog、custom provider 配置和模型能力摘要；不持有凭据或 provider client。 |
 | `src/model_gateway.rs` | [ModelGateway](model-gateway.md)、[Driver](driver.md)、[SessionRuntime](session-runtime.md)、[Compaction](compaction.md)、[UsageStats](usage-stats.md) | provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类入口。 |
 | `src/model_gateway/rig.rs` | [ModelGateway](model-gateway.md) | 私有 Rig provider adapter；唯一允许接触 `rig::providers::*` 的 provider/client 实现细节位置。 |
@@ -108,8 +108,8 @@ ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionStorage](session-manager.md) | JSONL session 文件存储。 |
 | `src/session_runtime.rs` | [SessionRuntime](session-runtime.md) | 单会话 phase、queue、run 编排、事件归约和 save point。 |
 | `src/resource_loader.rs` | [ResourceLoader](resource-loader.md) | 资源来源、刷新、diagnostics、prompt materials。 |
-| `src/prompt_templates.rs` | [ResourceLoader](resource-loader.md)、[SlashCommands](slash-commands.md) | prompt template metadata、解析和显式调用 helper。 |
-| `src/slash_commands.rs` | [SlashCommands](slash-commands.md) | slash catalog、parse/plan/execute/present 协调。 |
+| `src/prompt_templates.rs` | [ResourceLoader](resource-loader.md)、[CommandSurface](command-surface.md) | prompt template metadata、解析和显式调用 helper。 |
+| `src/command_surface.rs` | [CommandSurface](command-surface.md) | slash catalog、parse/plan/execute/present 协调。 |
 | `src/runtime_hooks.rs` | [RuntimeHooks](runtime-hooks.md) | hook registry、capability、typed decision/result。 |
 | `src/skills.rs` | [Skills](skills.md) | skill metadata、catalog、frontmatter、format helper。 |
 | `src/prompt.rs` | [Prompt](prompt.md) | 最终 system prompt 纯构建模块。 |
@@ -146,7 +146,7 @@ ResourceLoader      SlashCommands        RuntimeHooks          SessionManager
 | 单会话运行编排、phase、queue、hooks、当前 run | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
 | 会话生命周期、已加载会话运行时、session tree、JSONL、上下文重建 | [SessionManager / SessionStorage](session-manager.md) | 只说明何时读写会话，不重复存储规则。 |
 | 资源生命周期、source info、diagnostics、prompt materials | [ResourceLoader](resource-loader.md) | 只说明资源输入或输出，不扫描资源。 |
-| 斜杠命令目录、四阶段模型、解析优先级、phase policy、source projection 和 command presentation 规则 | [SlashCommands](slash-commands.md) | 只说明某个命令会映射到什么运行时能力，不重复解析和呈现规则。 |
+| 斜杠命令目录、四阶段模型、解析优先级、phase policy、source projection 和 command presentation 规则 | [CommandSurface](command-surface.md) | 只说明某个命令会映射到什么运行时能力，不重复解析和呈现规则。 |
 | hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |
 | 技能 metadata、catalog、frontmatter、format helper | [Skills](skills.md) | 只说明如何调用 helper，不拥有技能生命周期。 |
 | 最终 system prompt 拼装规则 | [Prompt](prompt.md) | 只说明何时重建，不拼装 prompt。 |

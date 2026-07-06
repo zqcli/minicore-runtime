@@ -39,7 +39,7 @@ SessionRuntime
 
 `SessionRuntime` 是产品编排层，不应把 Rig 类型泄漏给 UI，也不应把工具执行交给 UI。
 
-`SessionRuntime` 不解析 raw `/...` 字符串。Slash command 在 `AgentRuntime` / `SlashCommandService` 中完成 Parse / Plan；只有解析后的 session-scoped 结构化命令或 prompt-like input 才进入 `SessionRuntime`。`/status`、`/usage` 这类 query command 通常只读取 snapshot/view；`/model`、`/thinking` 更新会话状态；`/skill:{name}` 和 `/{template}` 才会构造 user message 并可能启动 Agent run。
+`SessionRuntime` 不解析 raw `/...` 字符串。Slash command 在 `AgentRuntime` / `CommandSurfaceService` 中完成 Parse / Plan；只有解析后的 session-scoped 结构化命令或 prompt-like input 才进入 `SessionRuntime`。`/status`、`/usage` 这类 query command 通常只读取 snapshot/view；`/model`、`/thinking` 更新会话状态；`/skill:{name}` 和 `/{template}` 才会构造 user message 并可能启动 Agent run。
 
 ## 对齐 pi 的能力
 
@@ -50,7 +50,7 @@ SessionRuntime
 | `prompt(text, options)` | `SubmitPrompt` |
 | `_expandSkillCommand` | `InvokeSkill` |
 | `promptTemplates` / `expandPromptTemplate` | `InvokePromptTemplate` |
-| slash command expansion | `ExecuteSlashCommand` 经 `SlashCommands` 解析、规划和呈现协调后进入 `InvokeSkill` / `InvokePromptTemplate` / `Compact` / `SetModel` 等结构化命令 |
+| slash command expansion | `ExecuteSlashCommand` 经 `CommandSurface` 解析、规划和呈现协调后进入 `InvokeSkill` / `InvokePromptTemplate` / `Compact` / `SetModel` 等结构化命令 |
 | `steer(text)` / `followUp(text)` | `Steer` / `FollowUp` |
 | `sendCustomMessage(...)` | `AppendMessage` / `NextTurn` 的内部基础能力 |
 | `sendUserMessage(...)` | extension/runtime 触发用户消息 |
@@ -85,7 +85,7 @@ Driver executes drive_run
 `InvokeSkill` 流程：
 
 1. 从 `ResourceState` 读取当前 `SkillCatalog`。
-2. 处理结构化 `InvokeSkill`，按 `skill_name` 查找 `SkillMetadata`；不存在时返回结构化错误。raw `/skill:name` 的解析已经在 `SlashCommandService` 完成。
+2. 处理结构化 `InvokeSkill`，按 `skill_name` 查找 `SkillMetadata`；不存在时返回结构化错误。raw `/skill:name` 的解析已经在 `CommandSurfaceService` 完成。
 3. `SessionRuntime` 读取 `metadata.file_path`，并调用 `skills::strip_skill_frontmatter()` 剥离 frontmatter。
 4. `SessionRuntime` 调用 `skills::format_skill_block(metadata, body)` 构造 `<skill>` 块，并追加 `additional_instructions`。
 5. `SessionRuntime` 构造新的 user message，使其进入本次 turn 或按 `delivery` 入队。
