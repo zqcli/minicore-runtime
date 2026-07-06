@@ -27,7 +27,7 @@ Minimal protocol / event / session spine
 
 正式实现前先定清楚这些容易返工的点：
 
-1. `RuntimeSnapshot` scope：MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不接受 `session_id`，也不单独持久化。打开 workspace 后默认不聚焦旧 session；`RuntimeSnapshot.active_session` 可以为空。会话清单由 `SessionIndex` / `ListSessions` 提供，TUI `/resume` 默认按当前 workspace 筛选，GUI sidebar 复用同一 query。未来如需多 tab、多 session detail 或大规模分页，再拆 `WorkspaceSnapshot` / `SessionSnapshot`。
+1. `RuntimeSnapshot` scope：MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不接受 `session_id`，也不单独持久化。打开 workspace 后默认不聚焦旧 session；`RuntimeSnapshot.active_session` 可以为空。会话清单由 `SessionIndex` / `ListSessions` 提供，TUI `/resume` 默认按当前 workspace 筛选，GUI sidebar 复用同一 query。MVP 中 UI host 和 `AgentRuntime` 同进程、同生命周期，不支持 UI 断线但 runtime daemon 继续后台运行再被重连；`last_event_sequence` 只用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。未来如需多 tab、多 session detail、独立 runtime server、多窗口共享 runtime 或大规模分页，再拆 `WorkspaceSnapshot` / `SessionSnapshot` 或 scoped event cursor。
 2. `RuntimeServices` scope：明确服务绑定到 workspace、cwd、focused session 还是 loaded session，避免多 session/background run 时重建全局服务污染其他会话。
 3. `ModelGateway` seam：它负责 provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类，是 `Driver`、`Compaction`、`UsageStats` 的共享依赖；正式实现前以 [ModelGateway](modules/model-gateway.md) 为 source of truth。
 4. 失败事件顺序：失败 assistant message、diagnostic、`persistence_save_point` 和 `run_finished { status: failed }` 的顺序必须统一。`persistence_save_point` 是 durable barrier，不能让 UI 在 terminal event 后仍处于不可恢复状态。
@@ -47,12 +47,12 @@ Minimal protocol / event / session spine
 | 8. CommandSurface skeleton | 建立跨 UI command catalog、parse/plan/present，但不要求所有后端命令完整 | `src/command_surface.rs` | `/help`、`/reload`、`/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
 | 9. ModelGateway 和 UsageStats | 收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage | `src/provider_registry.rs`、`src/model_gateway.rs`、`src/auth_store.rs`、`src/usage_stats.rs` | `SetModel -> ModelState -> ModelCallRequest -> ModelGateway` 可测；mock/provider usage 变成 `usage_updated`；RuntimeSnapshot 包含 provider/model view，`active_session` 包含 `session_stats` 和 `context_usage`；后续 compaction 能复用 context usage。 |
 | 10. Read-only Tools | 实现工具定义、registry、active set、最小 policy、gateway 和只读工具 | `src/tools.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/policy.rs`、`src/tools/gateway.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool -> ToolGateway -> tool result -> Rig continuation` 跑通；tool error 作为 error tool result 回填。 |
-| 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、pending approval RuntimeSnapshot/reconnect 行为稳定；approval 后 args 冻结。 |
+| 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、active session pending approval RuntimeSnapshot/resync 行为稳定；approval 后 args 冻结。 |
 | 12. RuntimeHooks MVP | 只接入已有 owner 流程上的安全点 | `src/runtime_hooks.rs`、`src/agent_runtime.rs`、`src/session_runtime.rs` | `ResourcesDiscover`、`BeforeAgentStart`、`PromptBuilt`、`ToolBeforePolicy`、`AfterSavePoint`、`CommandOutputBuild` 可测；hook 不发 UI event、不读写 storage、不执行 tool、不碰 credentials。 |
 | 13. Compaction | 实现手动压缩、summary message、context rebuild；再做 threshold 和 overflow recovery | `src/compaction.rs`、`src/session_runtime.rs`、`src/session_storage.rs` | `/compact` 从 disabled 变可执行；`SessionEntry::Compaction` 重建上下文；overflow recovery 不污染重试上下文。 |
 | 14. Mutation tools | 在 approval、policy、event、storage 都稳定后接文件修改工具 | `src/tools/builtin/{write,edit,apply_patch}.rs`、`src/tools/policy.rs`、`src/tools/approval.rs` | approval preview、diff stats、mutation queue、reject-as-error-tool-result、rewrite 后重新 schema validate / sandbox / policy。 |
 | 15. Bash | 最后接最高风险进程工具 | `src/tools/builtin/bash.rs` | timeout、cancel、cwd/sandbox、stdout/stderr streaming、输出截断和 approval 都可观察、可恢复。 |
-| 16. Protocol harness / example adapter | 验证下游 CLI/TUI/GUI 能只靠协议接入 | `examples/`、`tests/` | fake adapter/reducer 测试 submit、tool、approval、reload、compaction、RuntimeSnapshot/reconnect 的事件生命周期。 |
+| 16. Protocol harness / example adapter | 验证下游 CLI/TUI/GUI 能只靠协议接入 | `examples/`、`tests/` | fake adapter/reducer 测试 submit、tool、approval、reload、compaction、RuntimeSnapshot/resync 的事件生命周期。 |
 
 ## 首个开发切片
 
@@ -82,7 +82,7 @@ AgentRuntime.dispatch(SubmitPrompt)
 - assistant delta 必须位于 `message_assistant_started` / `message_assistant_finished` 之间。
 - `persistence_save_point` 必须发生在可恢复写入之后。
 - `session_settled` 只在 phase 回到 `idle` 且不会立即 retry/compaction/follow-up 时出现。
-- `RuntimeSnapshot` 是重连后的权威当前状态，而不是事件流的替代品；它不落盘，关闭窗口后由 runtime 在下次启动时重新投影。
+- `RuntimeSnapshot` 是同一 host 生命周期内订阅/状态重建后的权威当前状态，而不是事件流的替代品；它不落盘，关闭窗口后由 runtime 在下次启动时重新投影。
 
 ## Driver/Rig 验证策略
 
@@ -133,7 +133,7 @@ Mutation / process tools:
   → bash
 ```
 
-`ToolGateway` 要在第一个工具切片就出现，因为它是真正连接 `DriverHost::invoke_tool` 和产品级工具治理的 seam。`ToolApprovalBroker` 不必在 read-only tools 阶段做满；它应在 mutation tools 前完成，因为 approval 后 args 冻结、reject-as-error-tool-result、preview 和 pending approval reconnect 都是高风险行为。
+`ToolGateway` 要在第一个工具切片就出现，因为它是真正连接 `DriverHost::invoke_tool` 和产品级工具治理的 seam。`ToolApprovalBroker` 不必在 read-only tools 阶段做满；它应在 mutation tools 前完成，因为 approval 后 args 冻结、reject-as-error-tool-result、preview 和同一 host 生命周期内的 pending approval resync 都是高风险行为。
 
 ## CommandSurface 顺序
 
@@ -197,7 +197,7 @@ MVP 只接入已经存在的安全点：
 
 - protocol serde / compatibility：命令、事件、快照、工具审批 preview。
 - event lifecycle：run 单终态、assistant/tool started-delta-finished 配对、terminal event 和 save point 顺序。
-- RuntimeSnapshot/reconnect：sequence gap、pending approval、running session、no active session、multi-session focus/background run。
+- RuntimeSnapshot/resync：sequence gap、active session pending approval、active session running、no active session；multi-session focus/background run 不进入 MVP UI reconnect contract，除非未来引入独立 runtime server、多窗口共享 runtime 或 scoped event cursor。
 - storage conformance：InMemory 和 JSONL 对 entry append、leaf、path-to-root、compaction projection 行为一致。
 - Driver / ModelGateway seam：Rig `CallModel`、`CallTools`、`Done`、tool result threading、provider/tool error-as-result、`ModelSelection` 传递、auth redaction、custom provider base URL、usage/error normalization 和 cancellation。
 - tool governance：active tool membership、schema validation、rewrite 后重新 schema validate / sandbox / policy、approval 后 args 冻结。

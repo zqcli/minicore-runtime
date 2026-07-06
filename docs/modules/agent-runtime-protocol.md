@@ -611,9 +611,11 @@ pub struct CompactionResultView {
 
 ## RuntimeSnapshot
 
-`snapshot()` 用于 UI 初始加载、窗口恢复和事件流重连。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
+`snapshot()` 用于 UI 初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
 
 MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped：打开 workspace 后默认不聚焦任何 session，`active_session` 为空。TUI 可在用户执行 `/resume` 时再通过 `ListSessions` 获取当前 workspace 的会话清单；GUI 如果需要 sidebar，也应通过 `ListSessions` 或会话目录 query 获取清单，而不是要求 `RuntimeSnapshot` 默认携带完整 `Vec<SessionSummary>`。
+
+MVP 的 UI host 和 `AgentRuntime` 运行在同一个程序上下文、同一个生命周期内；MiniCore runtime 不是独立 daemon/server，不承诺 UI adapter 失败或断线后 runtime 继续运行再被重新连接。`last_event_sequence` 的 reconnect 语义用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。它不要求 `RuntimeSnapshot` 覆盖所有非 active/background session 的完整运行态；如果未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，需要重新设计 all-loaded-session snapshot 或 scoped event cursor。
 
 ```rust
 pub struct RuntimeSnapshot {
@@ -740,7 +742,7 @@ pub enum SlashCommandPhasePolicy {
 
 ## Downstream Adapter 调用方式
 
-MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：连接 runtime，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI 如果需要 sidebar，应单独调用 `ListSessions`。
+MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI 如果需要 sidebar，应单独调用 `ListSessions`。
 
 Ratatui：
 

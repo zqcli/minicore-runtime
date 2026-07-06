@@ -39,21 +39,21 @@
 
 ### BR-002：全局事件 sequence 与单 session snapshot 组合可能导致后台 session 状态丢失
 
-状态：Partially Resolved
+状态：Resolved
 
-处理记录：`snapshot(session_id)` 已改为 `snapshot() -> RuntimeSnapshot`，避免单 session snapshot 携带全局水位。MVP 产品语义不要求窗口重开后恢复后台 run；打开 workspace 默认无 active session，用户通过 `/resume` 或 GUI sidebar 显式打开旧 session。
+处理记录：`snapshot(session_id)` 已改为 `snapshot() -> RuntimeSnapshot`，避免单 session snapshot 携带全局水位。进一步明确 MVP 运行时生命周期约束：UI host 和 `AgentRuntime` 在同一个程序上下文、同一个生命周期中运行，不支持 UI adapter 失败/断线但 runtime daemon 继续后台运行再被重连的模式。因此 `RuntimeSnapshot.last_event_sequence` 的 reconnect 语义只覆盖同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery；不承诺恢复非 active/background session 在 UI 断线期间的完整可视状态。若未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，再重新打开该问题，设计 all-loaded-session snapshot 或 scoped event cursor。
 
-问题：事件 sequence 是 runtime 全局单调递增，Snapshot 带 `last_event_sequence`，但公开接口是 `snapshot(session_id)`。多 session 同时 loaded、失焦 session 后台运行时，如果 UI 只拿某个 session 的 snapshot 并跳过 `<= last_event_sequence` 的事件，其他 session 在该水位前的状态可能不可恢复。
+问题：原风险成立于 runtime 独立存活、UI 可断线重连的架构假设：事件 sequence 是 runtime 全局单调递增，Snapshot 带 `last_event_sequence`，而 snapshot 只覆盖某个 session 或 active session。多 session 同时 loaded、失焦 session 后台运行时，如果 UI 只拿某个 session 的 snapshot 并跳过 `<= last_event_sequence` 的事件，其他 session 在该水位前的状态可能不可恢复。MVP 不采用这个故障模型。
 
-证据：
+原证据：
 
 - `docs/modules/agent-runtime-events.md`：`Snapshot.last_event_sequence` 是 UI 看到的权威状态水位。
 - `docs/modules/session-manager.md`：focused session 不表示唯一 loaded session，也不表示唯一 running session；失去 focus 的 session 可以继续后台 run。
-- `docs/modules/agent-runtime-protocol.md`：Snapshot 当前偏向单 session view，同时携带全局/工作区字段。
+- `docs/modules/agent-runtime-protocol.md`：原 Snapshot 草案偏向单 session view，同时携带全局/工作区字段。
 
-风险：重连后 pending run、tool activity、approval、queue 等跨 session 状态可能丢失或无法正确 reduce。
+风险：如果未来改为独立 runtime server、多窗口共享 runtime 或 daemon 模式，重连后 pending run、tool activity、approval、queue 等跨 session 状态可能丢失或无法正确 reduce。
 
-待处理方向：和 BR-001 一起处理。可能需要 workspace snapshot 覆盖所有 loaded session 的恢复态，或让 sequence cursor 具备 scope 语义。
+待处理方向：已按 MVP 生命周期约束关闭。未来只有在引入独立 runtime 生命周期时才需要重新设计：其一，让 `RuntimeSnapshot` 覆盖所有 loaded/running session 的最小恢复态；其二，让 event sequence cursor 具备 scope 语义，避免用全局水位跳过未被 snapshot 覆盖的 session 事件。
 
 ### BR-003：RuntimeServices 作用域与多 session/background run 存在冲突
 
@@ -76,15 +76,15 @@
 
 状态：Open
 
-问题：事件文档要求审批状态不能由 UI 私有保存，重连后应从 snapshot 的 pending tool calls 恢复。但 `Snapshot` 字段列表没有显式 `pending_tool_approvals`、`pending_tool_calls` 或等价权威字段。
+问题：事件文档要求审批状态不能由 UI 私有保存，同一 host 生命周期内的订阅/状态重建后应从 snapshot 的 pending tool calls 恢复。但 `Snapshot` 字段列表没有显式 `pending_tool_approvals`、`pending_tool_calls` 或等价权威字段。
 
 证据：
 
-- `docs/modules/agent-runtime-events.md`：审批状态不能由 UI 私有保存为权威状态；UI 重连后从 snapshot 的 pending tool calls 恢复。
+- `docs/modules/agent-runtime-events.md`：审批状态不能由 UI 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后从 snapshot 的 pending tool calls 恢复。
 - `docs/modules/agent-runtime-protocol.md`：Snapshot 字段列表包含 `current_run`、tools、queues 等，但没有明确 pending approval 字段。
 - `docs/modules/agent-runtime-protocol.md`：`DecideToolApproval` 需要 `session_id`、`run_id`、`call_id` 匹配 pending tool call。
 
-风险：UI 断线重连后无法可靠恢复审批弹窗，也无法安全发出 approval decision。
+风险：同一 host 生命周期内的订阅/状态重建后无法可靠恢复审批弹窗，也无法安全发出 approval decision。
 
 待处理方向：决定 pending approval 放在 `RunView`、`Snapshot.pending_tool_approvals`，还是 tool-call state projection 中。
 
