@@ -25,11 +25,12 @@ system-prompt.ts
 
 ```text
 AgentRuntime
-  └─ owns workspace-bound RuntimeServices
-       └─ ResourceLoader
-            ├─ owns RuntimeResources lifecycle
-            ├─ calls skills.rs / prompt_templates.rs / context loader
-            └─ exposes PromptMaterials
+  └─ owns CwdServiceRegistry
+       └─ CwdScopedServices { workspace_id, cwd, generation }
+            └─ ResourceLoader
+                 ├─ owns RuntimeResources lifecycle for this generation
+                 ├─ calls skills.rs / prompt_templates.rs / context loader
+                 └─ exposes PromptMaterials
 
 SessionRuntime
   ├─ reads ResourceLoader current resources

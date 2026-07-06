@@ -53,12 +53,20 @@ Agent 运行时在某个事件水位上的当前状态读模型，用于界面�
 _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
 **运行时服务**：
-绑定到有效工作区的后端依赖集合，例如凭据、设置、模型注册表、模型调用网关、资源加载器和会话管理器。切换到不同工作区的会话时需要重新创建。
-_避免_：全局单例、UI 服务
+`AgentRuntime` 内部的后端依赖集合总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 按 scope 拆成 `WorkspaceServices` 和 `CwdScopedServices`：前者随 workspace host 生命周期存在，后者按 `(workspace_id, cwd, generation)` 创建或复用，并由 `SessionRuntime` / run pin 住。
+_避免_：全局单例、UI 服务、当前 focused session 的可变大包
 
-**会话替换**：
-用一个新的会话运行时替换当前会话运行时的过程，包括关闭旧会话、释放订阅、重建运行时服务、打开新会话并通知界面适配器重新绑定。
-_避免_：页面切换、聊天切换
+**WorkspaceServices**：
+绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、`CommandSurfaceService`、`RuntimeHookRegistry` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
+_避免_：cwd 服务、单会话运行态、工具执行上下文
+
+**CwdScopedServices**：
+绑定到某个 workspace 内具体 cwd 和 generation 的运行时服务视图，例如 settings/trust/auth 解析视图、`ResourceLoader`、provider/model catalog view、`ModelGateway` 和工具 sandbox root。每个已加载 `SessionRuntime` 必须 pin 一个 `CwdScopedServices` generation；后台 session/run 不会因为 focused session 切换而换底座。
+_避免_：workspace 全局服务、focused session 状态、UI cwd
+
+**会话切换 / 聚焦**：
+改变 UI 或默认命令目标指向的会话。它不表示旧会话被关闭，也不表示旧会话的后台 run 被中止；只有显式 `CloseSession`、idle unload、workspace teardown 或 shutdown policy 才卸载 `SessionRuntime`。
+_避免_：页面切换、替换运行时服务、关闭旧会话
 
 **会话运行时（`SessionRuntime`）**：
 单个会话的产品级 Agent 编排对象，参考 pi coding-agent 的 `AgentSession`；它管理会话阶段、当前运行、中止、等待空闲、队列、模型状态、资源、工具、工具策略、会话写入和 `Driver`。
@@ -125,12 +133,12 @@ _避免_：当前上下文窗口、压缩摘要大小、UI 计数器
 _避免_：文件工具、会话管理 UI、Agent loop
 
 **已加载会话运行时（`LoadedSessionRuntimes`）**：
-会话管理器内部维护的运行中会话表，记录当前已加载的 `SessionRuntime` 和聚焦会话。它是运行时对象索引，不是持久化会话目录。
+会话管理器内部维护的运行中会话表，记录当前已加载的 `SessionRuntime` 和聚焦会话。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval，并 pin 自己的 `CwdScopedServices` generation。
 _避免_：会话存储、会话目录、独立会话运行时注册表
 
 **聚焦会话（focused session）**：
-当前 UI 或默认命令目标指向的会话。它可以是多个已加载会话中的一个，不等同于正在运行的会话。
-_避免_：active session、running session、loaded session
+当前 UI 或默认命令目标指向的会话。它可以是多个已加载会话中的一个，不等同于正在运行的会话，也不是运行时服务的 scope 锚点。
+_避免_：active session、running session、loaded session、service scope
 
 **会话存储（`SessionStorage`）**：
 单个会话的底层条目存储，负责保存追加式会话条目、当前叶子和会话元数据。它不决定 Agent 如何运行，也不直接服务 UI。

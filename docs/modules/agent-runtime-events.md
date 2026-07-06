@@ -251,8 +251,8 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | 层级 | 持有/管理的状态 | 负责发布或归约的 UI wire events | 只消费/返回，不拥有的事件 |
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
-| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`RuntimeServices`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、resource state view、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
+| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、`CwdServiceRegistry`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、resource state view、pinned `CwdScopedServices` generation、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `ToolGateway` | 单次 tool invocation 的治理上下文、policy evaluation、approval wait、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 registry/policy/approval/executor/hook；返回 `ToolInvocationResult` |
@@ -280,16 +280,19 @@ EventBus
   ├─ optional ring buffer
   └─ last emitted timestamp/id metadata
 
-RuntimeServices
-  ├─ AuthStore
-  ├─ SettingsStore
-  ├─ ProviderRegistry
-  ├─ ModelGateway
-  ├─ ResourceLoader
+WorkspaceServices
+  ├─ SessionManager / SessionIndex
   ├─ CommandSurfaceService
   ├─ RuntimeHookRegistry
-  ├─ SessionManager
   └─ RuntimeDiagnostics
+
+CwdServiceRegistry
+  ├─ key: (workspace_id, cwd, generation)
+  └─ CwdScopedServices
+      ├─ SettingsView / ProjectTrustView / AuthView
+      ├─ ProviderRegistryView / ModelGateway
+      ├─ ResourceLoader
+      └─ tool sandbox inputs
 ```
 
 负责发布的 wire events：
@@ -1270,16 +1273,16 @@ UI dispatch(ReloadResources)
 ```text
 UI dispatch(OpenSession or FocusSession)
   → open existing runtime or SessionManager.open_and_load(...)
-  → rebuild RuntimeServices if cwd changed
+  → resolve/pin CwdScopedServices { workspace_id, cwd, generation } if newly loaded
   → session_opened { session_id }?             // only if it was not already loaded
   → session_focus_changed { previous_session_id, focused_session_id: session_id }
   → session_phase_changed { phase: idle }
-  → resources_changed?                         // if workspace resources changed
+  → resources_changed?                         // if this cwd generation changed
   → queue_updated                               // active session queue projection
   → session_settled
 ```
 
-多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
+多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session，也不应改写旧 session pinned 的 `CwdScopedServices` generation。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
 
 `session_opened` 或 `session_focus_changed` 之后 UI 应重新请求或接收 `agent_runtime_protocol::RuntimeSnapshot`。事件流负责增量变化，snapshot 负责权威恢复。`OpenWorkspace` 本身不自动恢复旧 session；此时 `RuntimeSnapshot.active_session = None`。TUI 的 `/resume` 和 GUI sidebar 通过 `ListSessions` 查询 `SessionManager` 的轻量会话目录。
 

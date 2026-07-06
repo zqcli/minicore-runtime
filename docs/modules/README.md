@@ -33,11 +33,11 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 
 ## 模块职责
 
-`AgentRuntime` 是 MiniCore 的 UI 无关运行时门面。它管理工作区、运行时服务和事件通道，并向下游宿主暴露 `dispatch`、`subscribe`、`snapshot`。
+`AgentRuntime` 是 MiniCore 的 UI 无关运行时门面。它管理工作区、`WorkspaceServices`、`CwdServiceRegistry`、事件通道和命令路由，并向下游宿主暴露 `dispatch`、`subscribe`、`snapshot`。
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；`LoadedSessionRuntimes` 只是已加载 `SessionRuntime` 的 map，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、Hook、pending session writes 和事件归约。
+`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、Hook、pending session writes 和事件归约，并 pin 自己的 `CwdScopedServices` generation，使后台 run 不受 focused session 切换影响。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、保存点、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
@@ -89,7 +89,7 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 | --- | --- | --- |
 | `src/lib.rs` | [MiniCore 架构](../architecture.md)、[模块总览](README.md) | crate root、模块声明和必要 re-export。 |
 | `src/agent_runtime.rs` | [AgentRuntime](agent-runtime.md) | UI 无关运行时门面、工作区服务和命令路由。 |
-| `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | workspace-bound runtime services 聚合与重建。 |
+| `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `WorkspaceServices`、`CwdServiceRegistry`、`CwdScopedServices` 和 service generation pinning。 |
 | `src/auth_store.rs` | [AgentRuntime](agent-runtime.md)、[RuntimeHooks](runtime-hooks.md) | 凭据读取边界；不暴露 secret material 给 UI 或 hook。 |
 | `src/settings_store.rs` | [AgentRuntime](agent-runtime.md)、[CommandSurface](command-surface.md) | runtime/session 设置读取与更新边界。 |
 | `src/provider_registry.rs` | [ModelGateway](model-gateway.md)、[AgentRuntime](agent-runtime.md) | provider/model catalog、custom provider 配置和模型能力摘要；不持有凭据或 provider client。 |

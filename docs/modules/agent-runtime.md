@@ -24,12 +24,12 @@ pub trait AgentRuntime {
 - 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::RuntimeSnapshot`。
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
-- 基于有效 cwd 创建和重建运行时服务：凭据、设置、模型注册表、模型调用网关、资源加载器、会话管理器和诊断集合。
+- 管理 `WorkspaceServices` 和 `CwdServiceRegistry`，为每个已加载 `SessionRuntime` 解析并 pin 对应的 `CwdScopedServices` generation。
 - 持有 `CommandSurfaceService`，把 runtime builtins、资源命令和后续扩展命令投影成跨 UI 的 command catalog，并按 Parse / Plan / Execute / Present 四阶段处理 `ExecuteSlashCommand`。
 - 持有 `RuntimeHookRegistry` 作为内部 runtime service，在资源、slash command、prompt、context、tool、compaction、persistence 和 presentation 等安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command presentation events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 message panel 输出、picker、popup、menu、form 或 detail view 请求。
-- 在 session 切换、new、fork、import 前后执行受控的 teardown、invalidate、rebind 和 startup 流程。
-- 管理跨会话共享的 provider/model catalog、模型调用网关、凭据、全局设置、项目信任和资源刷新入口。
+- 在 session open、focus、new、fork、import、close 前后执行受控的 open/load/focus/unload 流程；focus 切换不隐式关闭旧 `SessionRuntime`。
+- 管理跨会话共享的 workspace host 状态，以及按 cwd/generation 隔离的 provider/model、模型调用网关、凭据、设置、项目信任和资源刷新入口。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
 
 `OpenWorkspace` 只建立 workspace 绑定的运行时服务和会话目录，不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 可以等用户输入 `/resume` 再列出当前 workspace 的会话，GUI 可以单独调用 `ListSessions` 渲染 sidebar。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
@@ -38,51 +38,57 @@ MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生
 
 ## 运行时服务
 
-运行时服务是绑定到有效工作区的后端依赖集合。典型内容：
+`RuntimeServices` 是内部总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 采用支持多 session 后台运行的方案 B：`AgentRuntime` 拥有 workspace host 级服务，并维护按 cwd/generation 分桶的服务注册表；每个 `SessionRuntime` 在创建时 pin 一个服务 generation，后续 run 继续使用自己的 generation，直到显式 reload/safe point 或 session unload。
 
 ```text
-RuntimeServices
-  ├─ AuthStore
-  ├─ SettingsStore
-  ├─ ProviderRegistry
-  ├─ ModelGateway
-  ├─ ResourceLoader
-  ├─ CommandSurfaceService
-  ├─ RuntimeHookRegistry
-  ├─ SessionManager
-  ├─ ProjectTrustStore
-  └─ RuntimeDiagnostics
+AgentRuntime
+  ├─ WorkspaceServices
+  │   ├─ EventBus
+  │   ├─ SessionManager / SessionIndex
+  │   ├─ CommandSurfaceService
+  │   ├─ RuntimeHookRegistry
+  │   └─ RuntimeDiagnostics
+  │
+  └─ CwdServiceRegistry
+      ├─ key: (workspace_id, cwd, generation)
+      └─ CwdScopedServices
+          ├─ SettingsView
+          ├─ ProjectTrustView
+          ├─ AuthView
+          ├─ ProviderRegistryView
+          ├─ ModelGateway
+          ├─ ResourceLoader
+          └─ ToolSandboxRoot / ToolGateway inputs
 ```
 
-当用户打开、导入或恢复到不同 cwd 的会话时，`AgentRuntime` 必须重新创建这些服务，避免旧 cwd 的资源、设置、信任状态或凭据解析泄漏到新会话。
+打开、导入或恢复到不同 cwd 的会话时，`AgentRuntime` 不重建全局服务，也不迁移正在后台运行的旧 session。它会为目标 session resolve 或创建新的 `CwdScopedServices` generation，然后通过 `SessionRuntimeFactory` 把该 generation 交给新的 `SessionRuntime`。旧 `SessionRuntime` 继续持有旧 generation；只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才释放。
 
-`ProviderRegistry` 是 provider/model catalog；`AuthStore` 是凭据解析边界；`ModelGateway` 是唯一真实模型调用入口。三者都属于 `RuntimeServices`，由 `SessionRuntime` 通过引用使用，但不由 `Driver` 持有。完整 provider/model/auth 生命周期见 [ModelGateway](model-gateway.md)。
+`ProviderRegistryView` 是 provider/model catalog 的 cwd-scoped 投影；`AuthView` 是凭据解析边界；`ModelGateway` 是该 generation 内唯一真实模型调用入口。完整 provider/model/auth 生命周期见 [ModelGateway](model-gateway.md)。
 
-## 会话替换生命周期
+资源 reload 也按 cwd/generation 处理：成功 reload 会为对应 cwd 产生新的 service generation。未来 run 使用新 generation；已经 running 的 run 默认继续使用启动时 pin 的 generation，除非进入明确 safe point 并由 `SessionRuntime` 决定切换。
 
-会话替换不是 UI 页面切换，而是运行时所有权迁移。建议顺序：
+## 会话打开和聚焦生命周期
 
-1. 校验目标会话和工作区。
-2. 触发 `SessionBeforeSwitch` / `SessionBeforeFork` 类运行时 Hook。
-3. shutdown 旧会话运行时。
-4. 执行同步 invalidate 回调，让下游 adapter 清理旧订阅和旧上下文。
-5. dispose 旧 `SessionRuntime`。
-6. 必要时重建 cwd 绑定运行时服务。
-7. 通过 `SessionManager` 创建并加载新 `SessionRuntime`。
-8. 加载会话上下文、资源、模型和活跃工具。
-9. 通知下游 adapter 重新绑定事件订阅和状态。
-10. 发出 `session_opened` / `session_focus_changed` / `diagnostics_runtime_changed` / `resources_changed` 等事件。
+打开或聚焦会话不是 UI 页面切换，也不是运行时服务替换。建议顺序：
+
+1. 校验目标会话、workspace 和 cwd。
+2. 通过 `CwdServiceRegistry` resolve 或创建 `(workspace_id, cwd, generation)`。
+3. 若目标会话未 loaded，通过 `SessionManager` 创建 `SessionHandle` 并加载新的 `SessionRuntime`，让它 pin 住该 generation。
+4. 若目标会话已 loaded，只更新 focused session，不重建它持有的 service generation。
+5. 发出 `session_opened`（仅首次 loaded）和 `session_focus_changed`。
+6. 需要时发出该 generation 对应的 `resources_changed` / diagnostics events。
+7. 后续 session-scoped 命令路由到对应 `SessionRuntime`；后台 running session 不因失去 focus 被关闭或中止。
 
 ## 对齐 pi 的能力
 
 | pi `AgentSessionRuntime` / services | 本项目能力 |
 | --- | --- |
-| `createAgentSessionServices(options)` | 创建 cwd 绑定运行时服务 |
-| `createAgentSessionFromServices(options)` | 从服务创建 `SessionRuntime` |
+| `createAgentSessionServices(options)` | `CwdServiceRegistry.resolve(workspace_id, cwd)` 创建或复用 cwd 绑定 service generation |
+| `createAgentSessionFromServices(options)` | 从 pinned `CwdScopedServices` generation 创建 `SessionRuntime` |
 | `createAgentSessionRuntime(factory, options)` | 创建初始 `AgentRuntime` 状态 |
 | `setRebindSession(callback)` | 下游 adapter 重新绑定回调 |
 | `setBeforeSessionInvalidate(callback)` | teardown 前同步 adapter 清理点 |
-| `switchSession(sessionPath, options)` | `OpenSession` 触发的会话替换流程 |
+| `switchSession(sessionPath, options)` | `OpenSession` / `FocusSession` 触发的 open/load/focus 流程；不隐式关闭旧会话 |
 | `newSession(options)` | `NewSession` |
 | `fork(entryId, options)` | `ForkSession` |
 | `importFromJsonl(inputPath, cwdOverride)` | `ImportSession` |
@@ -90,7 +96,7 @@ RuntimeServices
 
 ## 安全边界
 
-`AgentRuntime` 集中持有凭据、项目信任、工作区沙箱和运行时服务入口。下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
+`AgentRuntime` 集中持有 workspace host、cwd-scoped service registry 和运行时服务入口。凭据、项目信任、资源和工具沙箱都通过 pinned `CwdScopedServices` generation 进入对应 `SessionRuntime` / run；下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
 
 ## Slash Command Route
 
