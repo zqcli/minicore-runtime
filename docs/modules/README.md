@@ -16,40 +16,44 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                     AgentRuntime
       ┌────────────────────┬────────────────────┬────────────────────┐
       ▼                    ▼                    ▼                    ▼
-ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
-                                                                  ┌──────┴──────┐
-                                                                  ▼             ▼
-                                                        LoadedSessionRuntimes  SessionHandle
-                                                                  │             │
-                                                                  ▼             ▼
+WorkspaceServices   CommandSurface        RuntimeHooks          SessionManager
+      │                                                           ┌──────┴──────┐
+      ├─ ResourceManager                                  LoadedSessionRuntimes  SessionHandle
+      │   ├─ ResourceSnapshotStore
+      │   └─ ResourceOverlayPolicy
+      ├─ ProviderRegistry / AuthStore                              │             │
+      └─ ModelGateway                                              ▼             ▼
                                                             SessionRuntime  SessionStorage
-                                      ┌──────────────────┼───────────────┬─────────────┬─────────────┬─────────────┬─────────────┐
-                                      ▼                  ▼               ▼             ▼             ▼             ▼             ▼
-                                   Skills          Prompt         Tools      Compaction    Driver   ModelGateway  UsageStats
-                                                                                                │        │
-                                                                                                ▼        ▼
-                                                                                               Rig   Rig providers
+                                                                  │
+                                      ┌──────────────────┬────────┼────────┬─────────────┬─────────────┐
+                                      ▼                  ▼        ▼        ▼             ▼             ▼
+                                   Skills             Prompt    Tools  Compaction     Driver      UsageStats
+                                                                                         │
+                                                                                         ▼
+                                                                                        Rig
+
+ModelGateway ───────────────────────────────────────────────────────────────────────▶ Rig providers
 ```
 
 ## 模块职责
 
-`AgentRuntime` 是 MiniCore 的 UI 无关运行时门面。它管理工作区、`WorkspaceServices`、`CwdServiceRegistry`、事件通道和命令路由，并向下游宿主暴露 `dispatch`、`subscribe`、`snapshot`。
+`AgentRuntime` 是 MiniCore 的 UI 无关运行时门面。它管理工作区、`WorkspaceServices`、`ResourceManager`、事件通道和命令路由，并向下游宿主暴露 `dispatch`、`subscribe`、`snapshot`。
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；`LoadedSessionRuntimes` 只是已加载 `SessionRuntime` 的 map，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、Hook、pending session writes 和事件归约，并 pin 自己的 `CwdScopedServices` generation，使后台 run 不受 focused session 切换影响。
+`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、Hook、pending session writes 和事件归约。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、保存点、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
-`ResourceLoader` 是运行时内部资源服务，负责资源来源聚合、信任校验、原子刷新、当前资源快照、提示词素材和诊断。它拥有当前 `SkillCatalog` 的生命周期，但不构造最终 system prompt，也不是 `AgentRuntimeProtocol` 的数据存储。
+`ResourceManager` 是运行时内部资源子系统，负责资源来源聚合、信任校验、原子刷新候选、级联 snapshot、cwd-over-runtime overlay policy、提示词素材和诊断。它维护 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` capture，并预留 `StepResourceSnapshot`；在 skill 层面它决定 roots、trust、分层、overlay 和 current snapshot，但不解析 frontmatter、不拼 `<skill>` 消息。
 
 `CommandSurface` 是跨 UI 的命令目录、解析、执行映射和呈现协调模块。它把 `/compact`、`/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令经过 Parse / Plan / Execute / Present 四阶段映射到已有 `agent_runtime_protocol::Command`、受控查询、prompt-like 输入或 `CommandPresentation`，但不直接执行工具或 Agent loop。
 
-`RuntimeHooks` 是内部扩展点系统。它在 runtime 安全点开放 typed decision / patch / replacement，让内置策略、测试 harness、可信 package 或后续 extension 影响资源、prompt、context、tools、compaction 和 command presentation；hook 不直接发布 UI event，不直接读写 session storage，也不直接执行工具。
+`RuntimeHooks` 是内部扩展点系统。它在 runtime 安全点开放 typed decision / patch / replacement，让内置策略、测试 harness、可信 package 或后续 extension 影响 prompt、context、tools、compaction 和 command presentation；当前设计不定义资源 discovery / reload hook。hook 不直接发布 UI event，不直接读写 session storage，也不直接执行工具。
 
-`Skills` 是平级技能文件能力模块，对应未来的 `skills.rs`。它提供技能 metadata、catalog、发现、解析、校验和格式化 helper；显式技能调用的正文读取和 message 构造由 `SessionRuntime` 负责。
+`Skills` 是平级技能文件能力模块，对应未来的 `skills.rs`。它提供 `SkillMetadata` / `SkillResource` / `SkillCatalog` 数据结构，以及给定目录后的发现、解析、校验和格式化 helper；它不拥有资源生命周期或 overlay。显式技能调用的正文展开和 message 构造由 `SessionRuntime` 基于 captured `TurnResourceSnapshot` 负责。
 
-`Prompt` 是纯系统提示词构建模块，对应未来的 `prompt.rs`。它消费 `ResourceLoader` 的 prompt materials 和会话持有的 active tools / snippets，输出最终 system prompt。
+`Prompt` 是纯系统提示词构建模块，对应未来的 `prompt.rs`。它消费 captured `TurnResourceSnapshot` 的 prompt materials 和会话持有的 active tools / snippets，输出最终 system prompt。
 
 `Tools` 是平级工具能力模块，对应未来的 `tools.rs` / `tools/`。它提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper；工具状态和工具治理由 `SessionRuntime` 持有。
 
@@ -68,7 +72,7 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 - [AgentRuntimeProtocol](agent-runtime-protocol.md)：命令、事件、快照和下游 adapter 协议。
 - [AgentRuntimeEvents](agent-runtime-events.md)：事件命名、`agent_runtime_protocol::Event` / `agent_runtime_protocol::EventMsg`、生命周期、顺序约束、保存点和重连语义。
 - [SessionManager / SessionStorage](session-manager.md)：会话生命周期、已加载会话运行时、session tree、JSONL、会话管理与存储接口。
-- [ResourceLoader](resource-loader.md)：资源来源聚合、刷新和诊断。
+- [ResourceManager](resource-manager.md)：资源来源聚合、级联 snapshot、cwd overlay policy、刷新和诊断。
 - [CommandSurface](command-surface.md)：斜杠命令目录、四阶段解析/规划/执行/呈现、来源合并、可用性规则和执行映射。
 - [RuntimeHooks](runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
 - [Skills](skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
@@ -89,14 +93,14 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 | --- | --- | --- |
 | `src/lib.rs` | [MiniCore 架构](../architecture.md)、[模块总览](README.md) | crate root、模块声明和必要 re-export。 |
 | `src/agent_runtime.rs` | [AgentRuntime](agent-runtime.md) | UI 无关运行时门面、工作区服务和命令路由。 |
-| `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `WorkspaceServices`、`CwdServiceRegistry`、`CwdScopedServices` 和 service generation pinning。 |
+| `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `WorkspaceServices`、共享 settings/provider/auth/model gateway wiring。 |
 | `src/auth_store.rs` | [AgentRuntime](agent-runtime.md)、[RuntimeHooks](runtime-hooks.md) | 凭据读取边界；不暴露 secret material 给 UI 或 hook。 |
 | `src/settings_store.rs` | [AgentRuntime](agent-runtime.md)、[CommandSurface](command-surface.md) | runtime/session 设置读取与更新边界。 |
 | `src/provider_registry.rs` | [ModelGateway](model-gateway.md)、[AgentRuntime](agent-runtime.md) | provider/model catalog、custom provider 配置和模型能力摘要；不持有凭据或 provider client。 |
 | `src/model_gateway.rs` | [ModelGateway](model-gateway.md)、[Driver](driver.md)、[SessionRuntime](session-runtime.md)、[Compaction](compaction.md)、[UsageStats](usage-stats.md) | provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类入口。 |
 | `src/model_gateway/rig.rs` | [ModelGateway](model-gateway.md) | 私有 Rig provider adapter；唯一允许接触 `rig::providers::*` 的 provider/client 实现细节位置。 |
-| `src/project_trust.rs` | [ResourceLoader](resource-loader.md)、[RuntimeHooks](runtime-hooks.md) | workspace trust 判断、记忆和资源加载 gate。 |
-| `src/runtime_diagnostics.rs` | [AgentRuntimeEvents](agent-runtime-events.md)、[ResourceLoader](resource-loader.md)、[RuntimeHooks](runtime-hooks.md) | runtime/resource/hook diagnostics 聚合与协议投影。 |
+| `src/project_trust.rs` | [ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | workspace trust 判断、记忆和资源加载 gate。 |
+| `src/runtime_diagnostics.rs` | [AgentRuntimeEvents](agent-runtime-events.md)、[ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | runtime/resource/hook diagnostics 聚合与协议投影。 |
 | `src/ids.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | `WorkspaceId`、`SessionId`、`RunId`、`CommandId`、`ToolCallId` 等稳定 ID。 |
 | `src/error.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntime](agent-runtime.md) | `RuntimeError`、`SessionError`、`DriverError` 等错误边界。 |
 | `src/messages.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[SessionManager / SessionStorage](session-manager.md)、[Driver](driver.md) | `MessageRecord`、message content、tool call/result message 公共类型。 |
@@ -107,8 +111,8 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionStorage](session-manager.md) | JSONL session 文件存储。 |
 | `src/session_runtime.rs` | [SessionRuntime](session-runtime.md) | 单会话 phase、queue、run 编排、事件归约和 save point。 |
-| `src/resource_loader.rs` | [ResourceLoader](resource-loader.md) | 资源来源、刷新、diagnostics、prompt materials。 |
-| `src/prompt_templates.rs` | [ResourceLoader](resource-loader.md)、[CommandSurface](command-surface.md) | prompt template metadata、解析和显式调用 helper。 |
+| `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、reload/recompose、diagnostics、prompt materials。 |
+| `src/prompt_templates.rs` | [ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata、解析和显式调用 helper。 |
 | `src/command_surface.rs` | [CommandSurface](command-surface.md) | slash catalog、parse/plan/execute/present 协调。 |
 | `src/runtime_hooks.rs` | [RuntimeHooks](runtime-hooks.md) | hook registry、capability、typed decision/result。 |
 | `src/skills.rs` | [Skills](skills.md) | skill metadata、catalog、frontmatter、format helper。 |
@@ -145,7 +149,7 @@ ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
 | 运行时门面、工作区服务、事件通道 | [AgentRuntime](agent-runtime.md) | 只说明如何被调用或被拥有。 |
 | 单会话运行编排、phase、queue、hooks、当前 run | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
 | 会话生命周期、已加载会话运行时、session tree、JSONL、上下文重建 | [SessionManager / SessionStorage](session-manager.md) | 只说明何时读写会话，不重复存储规则。 |
-| 资源生命周期、source info、diagnostics、prompt materials | [ResourceLoader](resource-loader.md) | 只说明资源输入或输出，不扫描资源。 |
+| 资源生命周期、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、cwd overlay policy、source info、diagnostics、prompt materials | [ResourceManager](resource-manager.md) | 只说明资源输入或输出，不扫描资源。 |
 | 斜杠命令目录、四阶段模型、解析优先级、phase policy、source projection 和 command presentation 规则 | [CommandSurface](command-surface.md) | 只说明某个命令会映射到什么运行时能力，不重复解析和呈现规则。 |
 | hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |
 | 技能 metadata、catalog、frontmatter、format helper | [Skills](skills.md) | 只说明如何调用 helper，不拥有技能生命周期。 |

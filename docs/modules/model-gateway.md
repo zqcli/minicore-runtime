@@ -30,11 +30,11 @@ SessionRuntime::ModelState
 ## 模块归属
 
 ```text
-CwdScopedServices { workspace_id, cwd, generation }
-  ├─ SettingsView
-  ├─ AuthView
-  ├─ ProviderRegistryView
-  └─ ModelGateway
+WorkspaceServices
+  ├─ SettingsStore / user-global EffectiveSettings
+  ├─ ProviderRegistry / user-global provider catalog
+  ├─ AuthStore / user-global credentials boundary
+  └─ ModelGateway / shared model invocation boundary
 
 SessionRuntime
   ├─ ModelState                 // session-scoped model selection
@@ -47,7 +47,7 @@ ModelGateway internals
   └─ rig_provider_adapter       // private Rig provider/client usage
 ```
 
-`ModelGateway` 是 workspace/cwd-bound runtime service。切换到不同工作区、cwd 或服务 generation 时必须重建，避免旧 settings、custom provider、OAuth token、env override 或 trust 状态泄漏到新会话。
+`ModelGateway` 是 runtime-global 的模型调用边界，不随 session focus、cwd 或 resource reload 重建。provider settings、custom provider 声明和 auth 都来自 user-global/runtime-global 配置；项目级 settings 不允许声明 custom provider、覆盖 base URL 或引用 credentials。不同 session 通过自己的 `ModelState` 选择 `ModelSelection`，但 provider/auth 解析使用同一个 user-global `ProviderRegistry` 和 `AuthStore`。
 
 ## 不应承担
 
@@ -156,7 +156,7 @@ pub struct ModelCapabilities {
 
 它负责：
 
-- 合并 Rig 支持的内置 provider、settings 中的 custom provider 和后续可信扩展声明。
+- 合并 Rig 支持的内置 provider、user-global settings 中的 custom provider 和后续 user-trusted extension 声明。
 - 校验 `ProviderSpec` / `ModelSpec`，包括 `provider_id`、`model_id`、`protocol`、`base_url`、`api_model_name` 和 capabilities。
 - 提供 `resolve(ModelSelection) -> ResolvedModelSpec`。
 - 提供 `list_providers()` / `list_models()` 的协议投影数据。
@@ -190,6 +190,8 @@ pub struct CustomModelConfig {
 ```
 
 不要用“只要填了 base_url 就自动猜 OpenAI-compatible”。显式 `ProviderProtocol` 让 provider request、tool schema、usage extraction 和错误分类都能有确定映射。
+
+custom provider 是 user-global 能力。项目级资源、项目级 settings 或未信任工作区不能声明 custom provider，也不能把默认模型指向项目提供的 base URL。这避免打开项目后把用户凭据发送到项目控制的 provider endpoint。
 
 ## AuthStore
 
@@ -321,11 +323,11 @@ pub enum ModelCallErrorKind {
 ### Startup
 
 ```text
-AgentRuntime resolves CwdScopedServices { workspace_id, cwd, generation }
-  → SettingsView loads provider/model settings
-  → ProviderRegistryView builds builtin + custom catalog for this scope
-  → AuthView prepares env/keychain/oauth/runtime overrides
-  → ModelGateway is created inside the pinned service generation
+AgentRuntime initializes WorkspaceServices
+  → SettingsStore loads user-global provider/model settings
+  → ProviderRegistry builds builtin + user-global custom catalog
+  → AuthStore prepares env/keychain/oauth/runtime overrides
+  → ModelGateway is created as shared runtime-global invocation boundary
 ```
 
 ### Session restore
@@ -362,15 +364,16 @@ Command::SetModel { provider_id, model_id }
 ```text
 SubmitPrompt
   → SessionRuntime appends user message
-  → ResourceLoader + Prompt build prompt materials
-  → SessionRuntime builds TurnState { model: ActiveModel, ... }
+  → ResourceManager.capture_turn(workspace_id, cwd, turn_id)
+  → Prompt builds system prompt from TurnResourceSnapshot.cwd.resolved + active tools
+  → SessionRuntime builds TurnState { model: ActiveModel, resources, ... }
   → Driver.drive_run(...)
   → AgentRunStep::CallModel
   → Driver builds ModelCallRequest { model: ModelSelection, ... }
   → DriverHost::call_model
   → ModelGateway.call_model
-      → ProviderRegistry.resolve(selection)
-      → AuthStore.resolve(auth_ref)
+      → user-global ProviderRegistry.resolve(selection)
+      → user-global AuthStore.resolve(auth_ref)
       → BeforeModelCall hook
       → private Rig provider adapter builds provider request/client
       → optional privileged redacted provider payload hook
@@ -458,7 +461,7 @@ explicit InvokeSkill
   → SessionRuntime formats skill body as user message
 
 available skill summaries
-  → ResourceLoader.prompt_materials
+  → TurnResourceSnapshot.cwd.resolved.prompt_materials
   → prompt::build_system_prompt(...)
 ```
 
@@ -523,6 +526,7 @@ ProviderRegistry
 - `SetModel`：phase guard、session entry、`session_model_changed`、snapshot 当前模型一致。
 - auth redaction：snapshot/event/session entry/diagnostics/hook context 不含 API key、OAuth token、authorization header。
 - custom provider：OpenAI-compatible / Anthropic-compatible 的 `base_url + api_model_name + auth_ref` 能传到 Rig adapter。
+- custom provider 来源：项目级资源/settings 不能注册 custom provider、覆盖 base URL 或引用新的 `AuthRef`；只有 user-global 配置或后续 user-trusted extension 可以声明 custom provider。
 - submit flow：`TurnState.model.selection -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失。
 - error taxonomy：auth missing、rate limit、context overflow、cancelled 不靠字符串解析给上层。
 - usage：多次 `model -> tools -> model` 的 `ModelCallUsage` 聚合成一次 run `UsageSummary`，不重复计数。

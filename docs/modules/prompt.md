@@ -5,7 +5,7 @@
 ## 输入边界
 
 ```text
-ResourceLoader
+TurnResourceSnapshot.cwd.resolved
   → PromptMaterials: custom system prompt, append system prompts, context files, SkillCatalog
 
 SessionRuntime tool state
@@ -18,7 +18,7 @@ prompt.rs
   → final system prompt string
 ```
 
-`ResourceLoader` 管素材生命周期，`Prompt` 管拼装规则，`SessionRuntime` 决定何时重建。
+`ResourceManager` 管素材生命周期和 snapshot capture，`Prompt` 管拼装规则，`SessionRuntime` 决定何时重建。
 
 ## Interface
 
@@ -84,7 +84,7 @@ Project-specific instructions and guidelines:
 `SessionRuntime` 在以下时机重建 system prompt：
 
 - 新会话启动。
-- `ReloadResources` 后资源 revision 改变。
+- 下一次 user turn 捕获到新的 current `TurnResourceSnapshot` / `CwdResourceSnapshot` revision。
 - active tools 改变。
 - 工具 prompt snippets / guidelines 改变。
 - custom runtime hook 替换 system prompt。

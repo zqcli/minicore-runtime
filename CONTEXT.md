@@ -53,16 +53,40 @@ Agent 运行时在某个事件水位上的当前状态读模型，用于界面�
 _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
 **运行时服务**：
-`AgentRuntime` 内部的后端依赖集合总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 按 scope 拆成 `WorkspaceServices` 和 `CwdScopedServices`：前者随 workspace host 生命周期存在，后者按 `(workspace_id, cwd, generation)` 创建或复用，并由 `SessionRuntime` / run pin 住。
-_避免_：全局单例、UI 服务、当前 focused session 的可变大包
+`AgentRuntime` 内部的后端依赖集合总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 将服务保留在 `WorkspaceServices` 中；模型可见资源由 `ResourceManager` 管理级联不可变快照；会话和 run 捕获快照引用，而不是 pin 一整套 cwd 绑定服务。
+_避免_：当前 focused session 的可变大包、每 session 服务容器、UI 服务
 
 **WorkspaceServices**：
-绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、`CommandSurfaceService`、`RuntimeHookRegistry` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
-_避免_：cwd 服务、单会话运行态、工具执行上下文
+绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、`CommandSurfaceService`、`RuntimeHookRegistry`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
+_避免_：单会话运行态、focused session 服务、UI 服务
 
-**CwdScopedServices**：
-绑定到某个 workspace 内具体 cwd 和 generation 的运行时服务视图，例如 settings/trust/auth 解析视图、`ResourceLoader`、provider/model catalog view、`ModelGateway` 和工具 sandbox root。每个已加载 `SessionRuntime` 必须 pin 一个 `CwdScopedServices` generation；后台 session/run 不会因为 focused session 切换而换底座。
-_避免_：workspace 全局服务、focused session 状态、UI cwd
+**ResourceManager**：
+运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、ensure/reload/recompose 和 turn capture。初始化由 `OpenWorkspace -> ensure_runtime_snapshot`、`OpenSession/NewSession -> ensure_cwd_snapshot`、`start_user_turn -> capture_turn` 三道调用保证；它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
+_避免_：UI 资源 store、系统提示词构建器、会话运行时、实时读文件入口
+
+**ResourceSnapshotStore**：
+`ResourceManager` 内部的 current-pointer 存储，保存当前 `RuntimeResourceSnapshot` 以及每个 `(workspace_id, cwd)` 的当前 `CwdResourceSnapshot`。`replace_runtime` / `replace_cwd` 是资源更新对后续 turn 生效的线性化点：它们只原子替换 current pointer，不修改旧 snapshot；已经 running 的 run 继续使用启动时捕获的旧 snapshot，后续 user turn 通过 `capture_turn` 读取新 current pointer。
+_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、focused session resources
+
+**运行时资源快照（`RuntimeResourceSnapshot`）**：
+一次 user-global/runtime-global 资源解析结果，包含 builtin/user-global/runtime 级技能、提示模板、上下文默认值、自定义/追加系统提示词、source info、diagnostics 和 revision。它不包含 cwd-local 项目资源，也不包含 provider/auth/model gateway 状态。
+_避免_：provider settings、凭据、cwd 项目资源、UI state
+
+**cwd 资源快照（`CwdResourceSnapshot`）**：
+某个 `(workspace_id, cwd)` 在一次成功资源加载/合成后的不可变资源集合。它持有构建时使用的 `Arc<RuntimeResourceSnapshot>`，并包含 cwd-local layer 与 overlay 后的 `resolved` effective view。多个 session 可以共享同一 cwd 的当前快照；不同 cwd 有各自快照。
+_避免_：单纯 cwd 增量、全局当前资源、session 私有资源服务、UI 快照
+
+**turn 资源快照（`TurnResourceSnapshot`）**：
+一次 user turn/run 的资源输入，只持有 `Arc<CwdResourceSnapshot>`，不额外 pin runtime snapshot。它进入 `TurnState` 后保证 running turn 不受资源 reload 或 focused session 切换影响。
+_避免_：实时资源查询、mutable prompt context、同时 pin runtime/cwd 的双来源快照
+
+**资源覆盖策略（`ResourceOverlayPolicy`）**：
+由 `ResourceManager` 集中实现的 deterministic overlay 规则。MVP 中 policy 可编码在代码内：runtime/global 资源提供候选，cwd/project 资源可按稳定 `ResourceKey { kind, namespace?, name }` 覆盖同 key 候选；selected 与 shadowed 都保留给 diagnostics。
+_避免_：调用点临时合并、按文件路径碰撞、用户可随意声明 provider 覆盖
+
+**资源更新边界**：
+资源内容进入模型可见 current snapshot 的边界。MVP 中只有 startup/session/turn 的 `ensure_*` 兜底、显式 `ReloadResources` / `reload_runtime`、以及 runtime revision 变化时的 `recompose_cwd` 可以发布新 snapshot；`resources_changed` 只是通知事件，`capture_turn` 只是读取边界，不扫描文件、不自动 reload。
+_避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源
 
 **会话切换 / 聚焦**：
 改变 UI 或默认命令目标指向的会话。它不表示旧会话被关闭，也不表示旧会话的后台 run 被中止；只有显式 `CloseSession`、idle unload、workspace teardown 或 shutdown policy 才卸载 `SessionRuntime`。
@@ -77,7 +101,7 @@ _避免_：会话管理器、UI 会话状态
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
-`RuntimeHooks` 模块管理的内部安全点干预能力，用于在资源发现、prompt/context、模型请求、provider payload、工具治理、压缩、保存点和命令呈现等流程中返回 typed decision / patch / replacement。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
+`RuntimeHooks` 模块管理的内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和命令呈现等流程中返回 typed decision / patch / replacement。当前设计不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
 _避免_：UI 回调、协议事件、插件系统、任意 runtime 后门
 
 **运行时 Hook 注册表（`RuntimeHookRegistry`）**：
@@ -133,7 +157,7 @@ _避免_：当前上下文窗口、压缩摘要大小、UI 计数器
 _避免_：文件工具、会话管理 UI、Agent loop
 
 **已加载会话运行时（`LoadedSessionRuntimes`）**：
-会话管理器内部维护的运行中会话表，记录当前已加载的 `SessionRuntime` 和聚焦会话。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval，并 pin 自己的 `CwdScopedServices` generation。
+会话管理器内部维护的运行中会话表，记录当前已加载的 `SessionRuntime` 和聚焦会话。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval 和固定 workspace cwd。
 _避免_：会话存储、会话目录、独立会话运行时注册表
 
 **聚焦会话（focused session）**：
@@ -145,40 +169,36 @@ _避免_：active session、running session、loaded session、service scope
 _避免_：会话管理器、会话运行时、聊天状态
 
 **技能**：
-可加载的 Markdown 指令包，包含稳定名称、简短描述、来源路径和可按需读取的正文。技能可以出现在模型可见摘要列表中，也可以由用户显式调用并作为普通用户消息进入一次 Agent 运行。
-_避免_：提示词片段、插件、工具
+可加载的 Markdown 指令包，包含稳定名称、简短描述、来源路径和正文。模型可见 selected skill 必须以 `SkillResource` 形式进入 resource snapshot，或被 snapshot pin 到不可变正文引用；显式调用时从 captured `TurnResourceSnapshot` 读取正文并作为普通用户消息进入一次 Agent 运行。
+_避免_：提示词片段、插件、工具、运行时按文件路径实时读取正文
 
 **技能模块**：
-与资源加载器、会话运行时平级的 `skills.rs` 模块，提供技能 metadata、技能目录数据结构、发现、校验、frontmatter 处理和格式化 helper。它不拥有资源刷新生命周期，也不构造会话消息。
-_避免_：独立技能加载服务、UI 技能解析、工具注册、技能生命周期管理
+与 `ResourceManager`、会话运行时平级的 `skills.rs` 模块，提供 `SkillMetadata` / `SkillResource` / `SkillCatalog` 数据结构，以及给定目录后的发现、校验、frontmatter 处理和格式化 helper。它不决定 skill roots，不拥有 reload/ensure/recompose 生命周期，不执行 overlay，也不构造会话消息。
+_避免_：独立技能加载服务、UI 技能解析、工具注册、技能生命周期管理、资源 scope owner
 
 **技能目录**：
-当前运行时已经加载的技能元数据集合，包含技能摘要、来源、诊断和名称碰撞结果；默认不包含所有技能正文。
-_避免_：技能全文缓存、命令列表
+技能资源集合的数据结构，可由 `skills.rs` 创建，但 current catalog 的生命周期由 `ResourceManager` 的 `RuntimeResourceSnapshot`、`CwdResourceSnapshot.local`、`CwdResourceSnapshot.resolved` 和 `TurnResourceSnapshot` 持有。对 selected skills，catalog 必须能提供稳定正文或不可变正文引用。
+_避免_：独立生命周期 owner、命令列表、直接读当前磁盘文件
 
 **技能调用**：
-用户显式要求使用某个技能的行为。会话运行时读取技能正文，把它格式化为 `<skill>` 块，并将它作为普通用户消息交给 Agent 运行。
-_避免_：系统提示词注入、工具调用
+用户显式要求使用某个技能的行为。`SessionRuntime` 从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 selected `SkillResource.body`，调用 `skills.rs` helper 格式化 `<skill>` 块，并将它作为普通用户消息交给 Agent 运行。
+_避免_：系统提示词注入、工具调用、按 `metadata.file_path` 重新读文件
 
 **运行时资源**：
 由运行时统一管理、可影响未来 Agent 运行的模型资源，包括技能目录、提示模板、上下文文件、自定义系统提示词和追加系统提示词。
 _避免_：UI 文件、会话消息、工具结果
 
 **资源快照**：
-资源加载器在一次成功刷新后持有的当前运行时资源集合，带有 revision、来源信息、诊断和必要正文。它是运行时内部状态，不是 UI 快照，也不是会话历史。
-_避免_：界面快照、事件日志、会话条目
+`ResourceManager` 在一次成功加载/合成后发布的不可变模型资源视图，具体分为 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` 和预留的 `StepResourceSnapshot`。旧 snapshot 永不原地修改；reload 只替换 current pointer，running turn 继续使用已捕获引用。
+_避免_：界面快照、事件日志、会话条目、实时文件视图
 
 **资源摘要**：
-资源快照投影给界面适配器的安全视图，只包含展示、来源、revision 和诊断等信息，不包含技能正文、上下文文件正文或完整系统提示词。
+资源快照投影给界面适配器的安全视图，只包含展示、来源、revision、覆盖关系和诊断等信息，不包含技能正文、上下文文件正文或完整系统提示词。
 _避免_：资源正文、提示词素材、完整运行时资源
 
 **提示词素材**：
-资源加载器提供给系统提示词构建器的输入素材，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终系统提示词。
+`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 提供给系统提示词构建器的输入素材，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终系统提示词。
 _避免_：完整 prompt、用户消息、工具描述
-
-**资源加载器**：
-Agent 运行时中的内部服务，负责运行时资源的来源聚合、信任校验、加载刷新、资源快照、提示词素材和诊断信息。它持有技能目录生命周期，但调用平级技能模块完成技能文件处理。
-_避免_：文件扫描脚本、UI 资源管理器、系统提示词构建器、协议类型集合
 
 **CommandSurface**：
 Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令面，负责命令目录、`/...` 文本解析、执行规划、运行时命令映射和命令呈现语义。它不是 UI 输入框，也不是 `agent_runtime_protocol::Command` enum 本身。
@@ -218,7 +238,7 @@ _避免_：模型消息、会话条目、事件消息
 
 **系统提示词构建器**：
 纯构建能力，消费提示词素材、活跃工具集合、工具提示片段、当前日期和工作区路径，生成一次 Agent 运行使用的最终系统提示词。
-_避免_：资源加载器、会话历史、工具执行
+_避免_：ResourceManager、会话历史、工具执行
 
 **界面适配器**：
 很薄的集成层，将 Ratatui、Tauri/Vue 或 CLI 这类具体界面技术翻译成 Agent 运行时命令与事件。它通常属于下游应用仓库；MiniCore 只定义协议和可复用 runtime 行为。
@@ -233,7 +253,7 @@ _避免_：响应、请求、chat completion
 _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行
 
 **工具模块**：
-与技能模块、资源加载器、系统提示词构建器平级的 `tools.rs` / `tools/` 模块，提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper。它不拥有会话工具状态。
+与技能模块、`ResourceManager`、系统提示词构建器平级的 `tools.rs` / `tools/` 模块，提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper。它不拥有会话工具状态。
 _避免_：工具运行时、UI 工具层、Rig ToolServer 替代品
 
 **工具定义**：

@@ -1,6 +1,6 @@
 # SessionRuntime
 
-`SessionRuntime` 是单个会话的产品级 Agent 编排对象，对齐 pi coding-agent 的 `AgentSession`。它拥有会话状态、队列、资源、工具、模型状态、运行生命周期和事件归约，并在创建时 pin 一个 `CwdScopedServices` generation，使后台 run 不受 focused session 切换影响。
+`SessionRuntime` 是单个会话的产品级 Agent 编排对象，对齐 pi coding-agent 的 `AgentSession`。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
 
 ## 核心职责
 
@@ -10,10 +10,10 @@
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`；运行中输入必须进入队列，不能绕过当前 run 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
-- 服务 scope：持有 `CwdScopedServices` generation；run 启动时继续 pin 当前 generation，resource reload 或 cwd 变化只影响后续 safe point / future run，不会改写正在运行的后台 run。
+- 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
 - 工具与系统提示词：维护工具定义注册表、活跃工具集合、工具提示片段、工具执行策略，并在工具/资源变化后调用 `prompt.rs` 重建 system prompt。
-- 资源与扩展：引用 `ResourceLoader` 结果，支持 reload、运行时 Hook 绑定、extension command/resource/tool 后续接入。
+- 资源与扩展：在 user turn 启动时引用当前 `TurnResourceSnapshot`；该 snapshot pin 住 `CwdResourceSnapshot`，而 cwd snapshot pin 住对应 `RuntimeResourceSnapshot`。reload 后 future turn 使用新资源，运行中的 turn 不被 patch。
 - 压缩与重试：支持手动压缩、自动压缩、context overflow 恢复、自动重试、取消压缩和取消重试。
 - 会话树：支持 set session name、navigate tree、branch summary、fork selector 所需 user message 列表。
 - shell 能力：后置支持 bash/shell 执行、输出流、结果记录、取消和 pending shell message flush；MVP 默认不开启。
@@ -23,15 +23,15 @@
 
 ```text
 SessionRuntime
-  ├─ CwdScopedServicesRef { workspace_id, cwd, generation }
-  ├─ ExecutionEnv
+  ├─ WorkspaceId / cwd
+  ├─ ResourceManager handle
   ├─ SessionHandle
   ├─ SessionPhase
   ├─ CurrentRun
   ├─ PendingSessionWrites
   ├─ CurrentRunUsage / SessionUsageStats / ContextUsage
   ├─ ModelState
-  ├─ ResourceState
+  ├─ ResourceState { last_seen_revision }
   ├─ CompactionState
   ├─ ToolRegistry / ActiveToolSet / ToolGateway
   ├─ QueueState
@@ -40,6 +40,8 @@ SessionRuntime
 ```
 
 `SessionRuntime` 是产品编排层，不应把 Rig 类型泄漏给 UI，也不应把工具执行交给 UI。
+
+`SessionRuntime` 不持有跨 turn 的 current resource cache。它可以记录 `ResourceState { last_seen_revision }` 供 UI、diagnostics 或 prompt rebuild 判断使用，但不能用它代替 `ResourceManager.capture_turn(...)`。每次 user turn 真正启动时都必须重新 capture，当 reload 已经完成 `ResourceSnapshotStore::replace_cwd(...)` 后，下一次 capture 自然会读取到新的 current `CwdResourceSnapshot`。
 
 `SessionRuntime` 不解析 raw `/...` 字符串。Slash command 在 `AgentRuntime` / `CommandSurfaceService` 中完成 Parse / Plan；只有解析后的 session-scoped 结构化命令或 prompt-like input 才进入 `SessionRuntime`。`/status`、`/usage` 这类 query command 通常只读取 snapshot/view；`/model`、`/thinking` 更新会话状态；`/skill:{name}` 和 `/{template}` 才会构造 user message 并可能启动 Agent run。
 
@@ -70,7 +72,7 @@ SessionRuntime
 | `navigateTree()` | `NavigateSessionTree` |
 | `getSessionStats()` / `getContextUsage()` | snapshot stats/context usage |
 | `exportToHtml()` / `exportToJsonl()` | `ExportSession` |
-| `reload()` | `ReloadResources` / cwd-scoped service generation reload |
+| `reload()` | `ReloadResources` / per-cwd `CwdResourceSnapshot` reload |
 | `bindExtensions()` / `extensionRunner` | 后续扩展运行时与 `RuntimeHookRegistry` |
 
 ## Skill Invocation
@@ -78,36 +80,40 @@ SessionRuntime
 `SessionRuntime` 负责把显式技能调用变成一次普通 Agent 输入，但不负责扫描技能文件。边界如下：
 
 ```text
-ResourceLoader owns current SkillCatalog
+ResourceManager owns resolved SkillCatalog in CwdResourceSnapshot
 skills.rs provides metadata/frontmatter/format helpers
-SessionRuntime reads skill body and creates user message
+SessionRuntime reads captured TurnResourceSnapshot, reads skill body/content from resolved resource, and creates user message
 Driver executes drive_run
 ```
 
 `InvokeSkill` 流程：
 
-1. 从 `ResourceState` 读取当前 `SkillCatalog`。
+1. 在真正进入 user turn 时，调用 `ResourceManager.capture_turn(session_id, turn_id, workspace_id, cwd)`，取得 `TurnResourceSnapshot`，并从 `turn.resources.cwd.resolved.skills` 取得当前 cwd 的 effective `SkillCatalog`。
 2. 处理结构化 `InvokeSkill`，按 `skill_name` 查找 `SkillMetadata`；不存在时返回结构化错误。raw `/skill:name` 的解析已经在 `CommandSurfaceService` 完成。
-3. `SessionRuntime` 读取 `metadata.file_path`，并调用 `skills::strip_skill_frontmatter()` 剥离 frontmatter。
+3. `SessionRuntime` 从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 selected `SkillResource.body`；不能绕过 snapshot 重新读取 `metadata.file_path`。
 4. `SessionRuntime` 调用 `skills::format_skill_block(metadata, body)` 构造 `<skill>` 块，并追加 `additional_instructions`。
 5. `SessionRuntime` 构造新的 user message，使其进入本次 turn 或按 `delivery` 入队。
 6. 后续执行路径与普通 `SubmitPrompt` 一致：`BeforeAgentStart` Hook、`Driver`、事件归约和 session writes。
 
 这意味着资源 reload 只影响未来调用和未来 system prompt。已经展开并写入 session 的技能调用是一条历史 user message，不应被新版本技能改写。
 
+如果 `InvokeSkill` / `InvokePromptTemplate` 在 session 正在 running 时进入队列，队列里应保存结构化 intent，而不是立即展开正文。等到下一轮 user turn 真正启动时，再 capture 当时 current cwd 的 `TurnResourceSnapshot` 展开技能或提示模板；这保证 future turn 使用 reload 后的新资源。
+
 ## System Prompt Rebuild
 
 `SessionRuntime` 负责决定何时重建 system prompt，但不直接加载资源文件。流程对齐 pi `AgentSession._rebuildSystemPrompt()`：
 
 ```text
-ResourceLoader.prompt_materials()
+TurnResourceSnapshot.cwd.resolved.prompt_materials()
 SessionRuntime tool state: active tools + snippets + guidelines
 SessionRuntime cwd/date/model state
   → prompt::build_system_prompt(...)
   → update next TurnState
 ```
 
-重建触发点包括资源 reload、active tools 改变、工具 prompt snippet/guideline 改变、会话启动和 hook 明确替换 system prompt。运行中的 turn 使用启动时的 `TurnState`，资源变化只影响未来 turn。
+重建触发点包括 user turn 启动、active tools 改变、工具 prompt snippet/guideline 改变、会话启动和 hook 明确替换 system prompt。资源 reload 不会主动改写 running turn；下一次 user turn capture 新的 `TurnResourceSnapshot` 后重建 system prompt。运行中的 turn 使用启动时的 `TurnState`，资源变化只影响未来 turn。
+
+MVP 中 Rig step 不再调用 `ResourceManager`。`Driver` 在 `CallModel` / `CallTools` / `Done` 期间只能使用 `TurnState.resources`、已构建的 `system_prompt` 和会话工具状态；不能在 step 中读取 `ResourceManager.current_runtime()` 或 `current_cwd()`。未来如果启用 `StepResourceSnapshot`，也应由 `SessionRuntime` / `DriverHost` 基于当前 `TurnState.resources` 创建轻量 parent wrapper，而不是重新捕获上层资源。
 
 ## Model State And Selection
 
@@ -150,8 +156,9 @@ pub struct ActiveModel {
 
 ```rust
 pub struct TurnState {
+    pub resource_revision: ResourceRevision,
+    pub resources: Arc<TurnResourceSnapshot>,
     pub messages: Vec<MessageRecord>,
-    pub resources: RuntimeResources,
     pub stream_options: StreamOptions,
     pub session_id: SessionId,
     pub system_prompt: String,
@@ -163,7 +170,7 @@ pub struct TurnState {
 }
 ```
 
-运行中如果用户切换模型、资源或活跃工具，`SessionRuntime` 可以先记入 `pendingSessionWrites`，然后在 `DriverHost::before_next_model_call` 安全点重新构建或 patch turn state。`Driver` 只能把 `turn_state.model.selection` 复制进 `ModelCallRequest`；provider 解析和 auth 注入必须发生在 `ModelGateway`。
+运行中如果用户切换模型或活跃工具，`SessionRuntime` 可以先记入 `pendingSessionWrites`，然后在 `DriverHost::before_next_model_call` 安全点重新构建或 patch future turn state。资源 reload 不 patch 当前 `TurnState`；当前 run 继续使用启动时捕获的 `resources` 和 `system_prompt`。`Driver` 只能把 `turn_state.model.selection` 复制进 `ModelCallRequest`；provider 解析和 auth 注入必须发生在 `ModelGateway`。
 
 ## Usage And Context Usage
 

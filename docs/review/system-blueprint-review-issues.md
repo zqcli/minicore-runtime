@@ -59,7 +59,7 @@
 
 状态：Resolved
 
-处理记录：已收敛到方案 B，明确支持多 session/background run。`AgentRuntime` 拥有 `WorkspaceServices` 和 `CwdServiceRegistry`；`CwdScopedServices` 按 `(workspace_id, cwd, generation)` 创建或复用。每个已加载 `SessionRuntime` / run pin 自己的 service generation，focused session 只影响 UI 和默认命令路由，不作为服务 scope 锚点。
+处理记录：已收敛到单 UI/runtime 进程内多 session 运行模式。最新修订不再引入 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning；`AgentRuntime` 拥有 `WorkspaceServices`，其中共享 `ResourceManager` 管理 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 级联不可变资源快照。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时捕获 `TurnResourceSnapshot` 并构建 `TurnState`。provider settings、auth、custom provider 和 `ModelGateway` 均为 user-global/runtime-global；focused session 只影响 UI 和默认命令路由，不作为资源或服务 scope 锚点。
 
 问题：原文档一方面说 `RuntimeServices` 绑定有效工作区，另一方面说打开/导入/恢复到不同 cwd 的会话时必须重建这些服务；同时 `SessionManager` 允许多个 loaded session 和后台 run。旧 session 应持有旧 services、被 shutdown，还是迁移到新 services，此前不清楚。
 
@@ -70,9 +70,9 @@
 - `docs/modules/session-manager.md`：多 session 同时运行时，失去 focus 的 session 可以继续执行后台 run。
 - `docs/implementation-roadmap.md`：先决设计点要求明确服务绑定到 workspace、cwd、focused session 还是 loaded session。
 
-风险：如果实现偏离该约束，资源、设置、信任、凭据、ModelGateway、ProviderRegistry 仍可能在后台 session 和 focused session 之间互相污染；也可能导致后台 run 被隐式中断。
+风险：如果实现偏离该约束，资源快照仍可能在后台 session 和 focused session 之间互相污染；也可能导致后台 run 被隐式中断。provider/settings/auth 不再是 cwd-scoped 风险点，因为当前产品约束为 user-global，并禁止项目级 custom provider 覆盖。
 
-待处理方向：已处理。后续实现必须验证：打开两个不同 cwd 的 session，后台 running session 继续使用旧 `CwdScopedServices` generation；focus 切换、resource reload、close/unload 不污染其他 loaded session。
+待处理方向：已处理。后续实现必须验证：打开两个不同 cwd 的 session，`ResourceManager` 为每个 cwd 保存 current `CwdResourceSnapshot`；后台 running session 继续使用 run 启动时捕获进 `TurnState` 的旧 `TurnResourceSnapshot`；focus 切换、resource reload、close/unload 不污染其他 loaded session。
 
 ### BR-004：pending tool approval 要求从 Snapshot 恢复，但 Snapshot 没有显式字段
 
@@ -144,15 +144,15 @@
 
 状态：Open
 
-问题：`DriveRequest` 携带完整 `TurnState`，而 `TurnState` 包含 `RuntimeResources`、tool state、context usage 等会话/资源编排信息。Driver 文档又要求 Driver 不拥有 resource loading、skill expansion、prompt template expansion、system prompt building、active tools 等职责。
+问题：`DriveRequest` 携带完整 `TurnState`，而 `TurnState` 包含 captured `TurnResourceSnapshot`、tool state、context usage 等会话/资源编排信息。Driver 文档又要求 Driver 不拥有 resource loading、skill expansion、prompt template expansion、system prompt building、active tools 等职责。
 
 证据：
 
 - `docs/modules/driver.md`：`DriveRequest { turn_state: TurnState }`。
-- `docs/modules/session-runtime.md`：`TurnState` 包含 `resources: RuntimeResources`。
+- `docs/modules/session-runtime.md`：`TurnState` 包含 `resources: Arc<TurnResourceSnapshot>`。
 - `docs/modules/driver.md`：Driver 不负责资源加载、skill/template 展开、system prompt 构建、active tools 管理。
 
-风险：Rig adapter seam 变浅，后续实现容易误用 `RuntimeResources`，把会话编排逻辑带进 Driver。
+风险：Rig adapter seam 变浅，后续实现容易误用 `TurnResourceSnapshot`，把会话编排逻辑带进 Driver。
 
 待处理方向：考虑传入 `DriverTurnState` / `ModelRunInput` 这类更窄的投影，只包含 Driver 构造 model/tool step 所需字段。
 
@@ -255,21 +255,23 @@
 
 待处理方向：明确 `/compact` 默认 `IdleOnly`，或把 abort 行为做成显式确认/单独命令。
 
-### BR-015：ResourceLoader 原子快照与技能正文晚读文件不一致
+### BR-015：ResourceManager 原子快照与技能正文晚读文件不一致
 
-状态：Open
+状态：Resolved
 
-问题：ResourceLoader 负责资源快照、trust gate、atomic reload；但 skills catalog 默认只保存 metadata，显式调用时 SessionRuntime 再读取 `metadata.file_path`。这意味着 catalog revision 和最终注入模型的技能正文未必来自同一原子快照。
+问题：ResourceManager 负责资源快照、trust gate、atomic reload；但 skills catalog 默认只保存 metadata，显式调用时 SessionRuntime 再读取 `metadata.file_path`。这意味着 catalog revision 和最终注入模型的技能正文未必来自同一原子快照。
 
 证据：
 
-- `docs/modules/resource-loader.md`：ResourceLoader 拥有资源快照、trust gate、atomic reload。
+- `docs/modules/resource-manager.md`：ResourceManager 拥有资源快照、trust gate、atomic reload。
 - `docs/modules/skills.md`：SkillCatalog 默认只保存 metadata，不缓存正文。
 - `docs/modules/session-runtime.md`：处理 `InvokeSkill` 时读取技能正文并构造 user message。
 
 风险：reload 后到调用前文件可被修改或替换；历史记录中的 resource revision 不能完全证明注入正文内容。
 
-待处理方向：决定是否在 ResourceLoader snapshot 中缓存技能正文摘要/内容，或在 invoke 时记录 content hash/source mtime 并重新校验 trust/revision。
+处理记录：已在 `docs/modules/resource-manager.md` 和 `docs/modules/skills.md` 中规定：进入 `CwdResourceSnapshot.resolved` 的 selected skill 应保存 stable body content，或保存 content hash + immutable loaded content reference；`SessionRuntime` 显式调用技能时从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 `SkillResource.body`，不能绕过 snapshot 重新读文件。
+
+补充处理：已明确 `skills.rs` 和 `ResourceManager` 的边界。`skills.rs` 负责 `SkillMetadata` / `SkillResource` / `SkillCatalog` 类型、给定目录后的发现、frontmatter 解析、校验和格式化 helper；`ResourceManager` 负责 skill roots、trust gate、runtime/cwd 分层、cwd-over-runtime overlay、reload/ensure/recompose 生命周期和 current snapshot 发布。
 
 ## 低风险 / 术语与一致性
 
@@ -277,18 +279,18 @@
 
 状态：Open
 
-问题：实现规划已有 `src/prompt_templates.rs`，但没有对应模块文档。Prompt template 的职责散落在 ResourceLoader、CommandSurface、SessionRuntime 中。
+问题：实现规划已有 `src/prompt_templates.rs`，但没有对应模块文档。Prompt template 的职责散落在 ResourceManager、CommandSurface、SessionRuntime 中。
 
 证据：
 
 - `docs/modules/README.md`：文件规划包含 `src/prompt_templates.rs`。
-- `docs/modules/resource-loader.md`：描述 prompt template metadata 和资源投影。
+- `docs/modules/resource-manager.md`：描述 prompt template metadata 和资源投影。
 - `docs/modules/command-surface.md`：描述 `/{template}` 命令投影。
 - `docs/modules/session-runtime.md`：描述 `InvokePromptTemplate` 展开为 user message。
 
 风险：catalog 生命周期、参数替换、详情查询、正文读取归属可能漂移。
 
-待处理方向：考虑新增 `docs/modules/prompt-templates.md`，或明确它只是 ResourceLoader 子能力而非独立模块。
+待处理方向：考虑新增 `docs/modules/prompt-templates.md`，或明确它只是 ResourceManager 子能力而非独立模块。
 
 ### BR-017：`TurnState` 是核心类型但 CONTEXT.md 没有术语定义
 

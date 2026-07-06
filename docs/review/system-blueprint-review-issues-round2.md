@@ -13,7 +13,7 @@
 本轮发现的问题集中在三类：
 
 1. **协议表面有真实缺口**：查询命令没有响应通道（BR-023）、abort 持久化语义未定义（BR-024）、若干命令/事件字段与既定语义冲突（BR-027、BR-030、BR-031、BR-032）。
-2. **安全边界有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）、tool sandbox（BR-037）。
+2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已在当前分支通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）仍 open。
 3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
 ## 高风险
@@ -63,9 +63,11 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-025：custom provider / AuthRef 与 project trust 的边界未定义，存在凭据外泄链
 
-状态：Open
+状态：Resolved
 
-问题：`ProviderRegistry` 会"合并 settings 中的 custom provider"；`CustomProviderConfig` 携带任意 `base_url` 和 `AuthRef`；`AuthRef::Env { var }` 允许指向任意环境变量。`SettingsView` 是 `CwdScopedServices` 成员（按 cwd 解析），暗示存在项目级 settings，但没有任何文档定义 settings 的分层（user/project）及 custom provider 声明允许的来源。`ResourceLoader` 的 trust gate 明确只覆盖 prompt、skill、context、extension 资源，不覆盖 provider/settings；ModelGateway 的"Grilling 结论"和"必测项"也没有任何 trust 相关条目。
+处理记录：当前分支已决策 provider settings、auth、custom provider 和 `ModelGateway` 都是 user-global/runtime-global；项目级 settings 不允许声明 custom provider、覆盖 base URL 或引用 credentials。`ProviderRegistry` 只合并 built-in provider、user-global settings 中的 custom provider 和后续 user-trusted extension 声明。
+
+问题：`ProviderRegistry` 会"合并 settings 中的 custom provider"；`CustomProviderConfig` 携带任意 `base_url` 和 `AuthRef`；`AuthRef::Env { var }` 允许指向任意环境变量。`SettingsView` 是 `CwdScopedServices` 成员（按 cwd 解析），暗示存在项目级 settings，但没有任何文档定义 settings 的分层（user/project）及 custom provider 声明允许的来源。`ResourceManager` 的 trust gate 明确只覆盖 prompt、skill、context、extension 资源，不覆盖 provider/settings；ModelGateway 的"Grilling 结论"和"必测项"也没有任何 trust 相关条目。
 
 若项目级 settings 可以声明 custom provider，攻击链为：不受信任的项目仓库携带 settings，声明 `provider_id = "x"`、`base_url = attacker`、`auth_ref = Env("ANTHROPIC_API_KEY")`，并把默认模型指向它（默认模型同样来自 settings）；用户打开该项目后一次普通对话即把真实 API key 发送到攻击者服务器。auth redaction 规则（secret 不进 event/snapshot/log）防不住这条链，因为泄漏发生在合法的 provider HTTP 请求本身。
 
@@ -73,28 +75,30 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 - `docs/modules/model-gateway.md`：ProviderRegistry 职责含"合并……settings 中的 custom provider"；`AuthRef::Env { var: String }`；`CustomProviderConfig { base_url, auth_ref }`。
 - `docs/modules/agent-runtime.md`：`CwdScopedServices` 包含 `SettingsView` / `ProjectTrustView` / `AuthView`，per-cwd 解析。
-- `docs/modules/resource-loader.md`：项目信任一节，trust gate 范围不含 settings/provider。
+- `docs/modules/resource-manager.md`：项目信任一节，trust gate 范围不含 settings/provider。
 - `docs/modules/model-gateway.md`：必测项无 trust/来源约束项。
 
 风险：真实安全漏洞类别（凭据外泄），而且是"设计上没说"而不是"实现可能写错"——按当前文档实现出来的系统天然带这条链。
 
-待处理方向：在 ModelGateway 权威文档中显式规定：custom provider / AuthRef / 默认模型覆盖只能来自用户级或显式受信任的 settings 来源；项目级 settings 声明 provider 必须在 project trusted 且用户显式确认后生效；`AuthRef::Env` 建议加白名单或仅允许用户级配置引用。ModelGateway 必测项补充对应用例。
+待处理方向：已处理。后续实现必须验证：项目资源或项目 settings 不能注册 custom provider，不能覆盖 provider base URL，也不能让项目选择新的 `AuthRef::Env`；custom provider 只能来自 user-global 配置或后续 user-trusted extension。
 
 ### BR-026：三份架构图互相矛盾，模块总览仍是 BR-003 收敛前的旧结构
 
-状态：Open
+状态：Resolved
 
-问题：`docs/modules/README.md` 的分层图把 `ResourceLoader` 画成 `AgentRuntime` 直属顶层服务、把 `ModelGateway` 画在 `SessionRuntime` 之下，图中完全没有 `WorkspaceServices` / `CwdServiceRegistry` / `CwdScopedServices`——这是 BR-003 收敛（commit `eac94c1`）之前的结构。`docs/architecture.md` 的图把 `CommandSurface`、`RuntimeHooks` 画成与 `WorkspaceServices` 平行的顶层分支；而 `docs/modules/agent-runtime.md` 的服务图把 `CommandSurfaceService`、`RuntimeHookRegistry` 放在 `WorkspaceServices` 内部。三份图两两不一致。
+处理记录：当前分支已按新 resource snapshot 模式同步 `docs/architecture.md`、`docs/modules/README.md` 和 `docs/modules/agent-runtime.md` 的架构图：`WorkspaceServices` 持有 `ResourceSnapshotStore`、共享 `ResourceManager`、user-global provider/auth 和 shared `ModelGateway`；不再展示 `CwdServiceRegistry` / `CwdScopedServices`。
+
+问题：`docs/modules/README.md` 的分层图把 `ResourceManager` 画成 `AgentRuntime` 直属顶层服务、把 `ModelGateway` 画在 `SessionRuntime` 之下，图中完全没有 `WorkspaceServices` / `CwdServiceRegistry` / `CwdScopedServices`——这是 BR-003 收敛（commit `eac94c1`）之前的结构。`docs/architecture.md` 的图把 `CommandSurface`、`RuntimeHooks` 画成与 `WorkspaceServices` 平行的顶层分支；而 `docs/modules/agent-runtime.md` 的服务图把 `CommandSurfaceService`、`RuntimeHookRegistry` 放在 `WorkspaceServices` 内部。三份图两两不一致。
 
 证据：
 
-- `docs/modules/README.md` 分层图（ResourceLoader/CommandSurface/RuntimeHooks/SessionManager 四分支，ModelGateway 挂 SessionRuntime）。
+- `docs/modules/README.md` 分层图（ResourceManager/CommandSurface/RuntimeHooks/SessionManager 四分支，ModelGateway 挂 SessionRuntime）。
 - `docs/architecture.md` 分层图（WorkspaceServices 与 CommandSurface/RuntimeHooks 并列）。
 - `docs/modules/agent-runtime.md` 运行时服务图（CommandSurfaceService/RuntimeHookRegistry 在 WorkspaceServices 内）。
 
 风险：模块总览是新读者入口，与已收敛设计冲突会直接传播错误心智模型；也说明"权威归属"机制对图示没有生效。
 
-待处理方向：以 `agent-runtime.md` 的服务图为准更新另外两图；规定架构图只在一处维护（或其余文档仅链接）。
+待处理方向：已处理。后续仍建议让 `agent-runtime.md` 成为 runtime service shape 的 source of truth，其他图只保留摘要。
 
 ## 中风险
 
@@ -221,18 +225,18 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 状态：Open
 
-问题：runtime-hooks.md 说 `AgentRuntime` 拥有 registry、`SessionRuntime` 持有"session-scoped view"；但 session-runtime.md 的内部结构图和 agent-runtime-events.md 的 ownership matrix 都把 `RuntimeHookRegistry` 直接列为 SessionRuntime 持有状态，无 view 字样。更深一层：registry 在 `WorkspaceServices`（workspace 级单例），而 hook 的 capability gate 依赖 `TrustLevel`，trust 却是 `CwdScopedServices` 的 per-cwd 状态（`ProjectTrustView`）——`HookSource::WorkspaceTrusted` 的 hook 在多 cwd 场景下按哪个 cwd 的 trust 判定，未定义。
+问题：runtime-hooks.md 说 `AgentRuntime` 拥有 registry、`SessionRuntime` 持有"session-scoped view"；但 session-runtime.md 的内部结构图和 agent-runtime-events.md 的 ownership matrix 都把 `RuntimeHookRegistry` 直接列为 SessionRuntime 持有状态，无 view 字样。更深一层：registry 在 `WorkspaceServices`（workspace 级单例），而 hook 的 capability gate 依赖 `TrustLevel`。当前分支移除了 `CwdScopedServices`，因此 hook trust 应按调用时 session fixed cwd / resource load trust input 判定，但该规则仍未写成 source of truth。
 
 证据：
 
 - `docs/modules/runtime-hooks.md`：Registry And Ownership。
 - `docs/modules/session-runtime.md`：内部结构图。
 - `docs/modules/agent-runtime-events.md`：Ownership Matrix。
-- `docs/modules/agent-runtime.md`：`RuntimeHookRegistry` 在 WorkspaceServices，`ProjectTrustView` 在 CwdScopedServices。
+- `docs/modules/agent-runtime.md`：`RuntimeHookRegistry` 在 WorkspaceServices，resource trust 现在由 per-cwd resource loading 输入表达。
 
 风险：hook 权限判定在多 session/多 cwd 下不确定；文档漂移会延续到实现。
 
-待处理方向：统一表述为 registry + per-session view；规定 hook trust 按调用时 session pin 的 generation 中的 `ProjectTrustView` 判定。
+待处理方向：统一表述为 registry + per-session view；规定 hook trust 按调用时 session fixed cwd 和该 cwd resource load trust input 判定。
 
 ### BR-036：多 workspace 语义不闭合
 
@@ -297,13 +301,15 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-041：`GetContextFile { path }` 未定义校验边界
 
-状态：Open
+状态：Resolved
 
-问题：该命令以任意 `PathBuf` 为参数，文档只说"读取必须经过 AgentRuntime / ResourceLoader"，未规定 path 必须命中当前资源快照中已登记的 context file。不加约束就是一条 UI 任意读文件通道。
+处理记录：已在 `docs/modules/agent-runtime-protocol.md` 中规定：`GetContextFile` 的 path 必须命中当前 cwd `CwdResourceSnapshot` 已登记的 context file canonical path；读取必须经过 `AgentRuntime` / `ResourceManager`，不能由 UI adapter 直接读文件。
+
+问题：该命令以任意 `PathBuf` 为参数，文档只说"读取必须经过 AgentRuntime / ResourceManager"，未规定 path 必须命中当前资源快照中已登记的 context file。不加约束就是一条 UI 任意读文件通道。
 
 证据：`docs/modules/agent-runtime-protocol.md` 后续命令段。
 
-待处理方向：规定只接受当前 `RuntimeResources.context_files` 中登记的路径（按 canonical path 匹配），并写入必测项。
+待处理方向：已处理。实现时需加入 canonical path 匹配测试。
 
 ### BR-042：`SessionEntry::Leaf` 条目与 `SessionStorage::set_leaf_id()` 双机制关系未定义
 
@@ -317,13 +323,15 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-043：`CwdScopedServices` generation 的回收策略未定义
 
-状态：Open
+状态：Resolved
 
-问题：reload 会为同一 cwd 产生新 generation，旧 generation 被后台 session pin 住；文档定义了 SessionRuntime 的卸载条件，但没有定义 generation 本身的回收（引用计数？最后一个 pin 释放后丢弃？），长会话 + 频繁 reload 会累积服务实例（含 ModelGateway、ResourceLoader 全套）。
+处理记录：当前分支移除了 `CwdScopedServices` / service generation pinning。reload 不再创建一整套 cwd-scoped service generation，而是为目标 `(workspace_id, cwd)` 生成新的 immutable `CwdResourceSnapshot` 并原子替换 `ResourceSnapshotStore` 的 current cwd pointer。旧 snapshot 只由正在 running 的 `TurnResourceSnapshot` / `CurrentRun` 持有，引用计数归零后自然释放。
+
+问题：reload 会为同一 cwd 产生新 generation，旧 generation 被后台 session pin 住；文档定义了 SessionRuntime 的卸载条件，但没有定义 generation 本身的回收（引用计数？最后一个 pin 释放后丢弃？），长会话 + 频繁 reload 会累积服务实例（含 ModelGateway、ResourceManager 全套）。
 
 证据：`docs/modules/agent-runtime.md` 运行时服务段。
 
-待处理方向：补充 generation 生命周期（建议 pin 计数归零即 drop）。
+待处理方向：已处理。实现上需要验证旧 `CwdResourceSnapshot` / `TurnResourceSnapshot` 在 running run 持有期间可用，run 结束后不再被 current store 引用即可释放。
 
 ### BR-044：`EventStream` 的订阅语义未定义
 

@@ -41,7 +41,7 @@ pi 的扩展系统提供了很多可借鉴的 hook 面：
 - `context`：每次模型调用前可替换 AgentMessage context。
 - `before_provider_request` / `after_provider_response`：模型请求前后 hook；raw provider payload patch 必须 privileged 且脱敏，MVP 可以不开放。
 - `tool_call` / `tool_result`：工具执行前阻止或改写结果。
-- `resources_discover`：扩展资源路径发现。
+- `resources_discover`：pi 中用于扩展资源路径发现；MiniCore 当前设计不采用资源发现 hook，资源更新统一走 `ResourceManager` ensure/reload/recompose pipeline。
 - `session_before_switch` / `session_before_fork` / `session_before_compact` / `session_before_tree`：会话级 gate 和 provider hook。
 - `message_end`、`agent_start/end`、`turn_start/end`、`tool_execution_start/update/end`：agent lifecycle observer / transform。
 
@@ -162,7 +162,7 @@ pub struct RuntimeHookContext {
 - raw `SessionStorage` / JSONL handle。
 - `ToolExecutor` handle。
 - model credentials / `AuthStore` secret material。
-- raw `ResourceLoader` scanner bypass。
+- raw `ResourceManager` scanner bypass。
 - Rig `AgentRun` object。
 
 ## Typed Results
@@ -223,15 +223,9 @@ pub enum BeforeCompactDecision {
 | `WorkspaceClosing` | Observer | cleanup |
 | `RuntimeDiagnosticsChanged` | Observer | telemetry / log |
 
-### Resources
+### 资源
 
-| Hook | 类型 | 能力 |
-| --- | --- | --- |
-| `ResourcesDiscover` | Provider | 声明额外 skill / prompt template / context file paths |
-| `ResourcesBeforeReload` | Observer / Gate | reload 前校验 |
-| `ResourcesReloaded` | Observer | 观察 revision 和 diagnostics |
-
-`ResourcesDiscover` 只能声明资源路径或来源。读取、trust、diagnostics、resource revision 和 atomic reload 仍由 `ResourceLoader` 负责。Hook 不得直接提交完整 `RuntimeResources`。
+当前设计不定义资源 discovery / reload hook，也不预留资源回调接口形状。资源来源由 [ResourceManager](resource-manager.md) 的内置 resolver、trust gate 和 overlay policy 管理；显式 reload / startup ensure 进入 `ResourceManager` reload/recompose pipeline。未来如果确实需要 extension/package 资源声明，应另起 ADR 重新定义安全边界。
 
 ### Slash Commands And Presentation
 
@@ -281,7 +275,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 - 企业 policy / coding style：优先 `PromptBuilt` append。
 - 完整替换 system prompt：需要 privileged `ReplacePrompt` capability。
 - RAG / memory / issue context：优先 `ContextProjection`，但必须保证 protocol-safe，没有 orphan tool result 或 unresolved tool call。
-- resource-driven prompt material：优先 `ResourcesDiscover` + `ResourceLoader`，而不是 hook 直接读文件。
+- resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 snapshot 注入资源。
 
 ### Run Safe Points
 
@@ -422,7 +416,7 @@ pub enum HookErrorPolicy {
 - `ToolExecutor` direct handle。
 - `ModelGateway` raw credentials。
 - `AuthStore` secret material。
-- `ResourceLoader` raw file scanner bypass。
+- `ResourceManager` raw file scanner bypass。
 - Rig `AgentRun` object。
 - `DriverEvent` direct stream。
 - `ToolGateway` 未归一化内部进度。
@@ -434,7 +428,6 @@ MVP 只需要内部 hook seam，不需要开放完整外部 plugin 系统。
 
 建议 MVP hook points：
 
-- `ResourcesDiscover`
 - `BeforeAgentStart`
 - `PromptBuilt`
 - `ContextProjection`
@@ -446,7 +439,6 @@ MVP 只需要内部 hook seam，不需要开放完整外部 plugin 系统。
 
 第二阶段开放 trusted package / extension hooks：
 
-- resource discovery
 - slash command registration
 - command presentation patch
 - observer hooks

@@ -19,6 +19,50 @@
   - 引入 `WorkspaceServices`、`CwdServiceRegistry`、`CwdScopedServices { workspace_id, cwd, generation }`。
   - 每个 `SessionRuntime` / run pin 自己的 service generation；focused session 只影响 UI 和默认命令路由，不作为服务 scope 锚点。
 
+## 当前分支修订
+
+分支：`design/runtime-resource-snapshot-mode`
+
+本轮讨论进一步收敛了 MiniCore MVP 的目标：UI 和 `AgentRuntime` 是一体进程，不支持 UI detach 后 runtime daemon 继续运行；只要求一个 UI 下多个 session 可以同时各自运行。基于这个约束，BR-003 的服务 scope 设计从 `CwdScopedServices` 修订为 per-cwd resource snapshot 模式。
+
+最新结论：
+
+- 保留 `WorkspaceServices`，作为 event bus、session manager、command surface、hooks、diagnostics、`ResourceManager`、settings/provider/auth/model gateway 的共享容器。
+- 删除 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning 作为 MVP 核心概念。
+- 将 `ResourceManager` 定义为运行时内部资源子系统，持有 `ResourceSnapshotStore`、内置 resolver、trust gate、diagnostics、reload/recompose pipeline 和 `ResourceOverlayPolicy`。
+- 资源快照分层为 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot`；MVP 实现前三层，`StepResourceSnapshot` 只定义类型。
+- `CwdResourceSnapshot` 持有构建时的 `Arc<RuntimeResourceSnapshot>`，并包含 cwd-local layer 与 overlay 后的 `resolved` effective view。cwd/project 资源可按 `ResourceKey { kind, namespace?, name }` 覆盖 runtime/global 同 key 资源。
+- 每个 `SessionRuntime` 固定一个 workspace cwd；多个 session 可以共享同一个 cwd 的 current `CwdResourceSnapshot`。
+- 每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获 `TurnResourceSnapshot`，并用它构建 `TurnState`。
+- `ReloadResources { workspace_id, cwd }` 为目标 cwd 构建新的 `CwdResourceSnapshot`；成功后原子替换 current pointer；running run 继续使用旧 `TurnState` / 旧 `TurnResourceSnapshot`，下一轮 user turn 使用新 snapshot。
+- provider settings、auth、custom provider 和 `ModelGateway` 都是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth/provider endpoint。
+- 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 reload / startup ensure。
+
+修订后的模型：
+
+```text
+AgentRuntime
+  └─ WorkspaceServices
+      ├─ EventBus
+      ├─ SessionManager / SessionIndex
+      ├─ CommandSurfaceService
+      ├─ RuntimeHookRegistry
+      ├─ RuntimeDiagnostics
+      ├─ ResourceManager
+      │   ├─ ResourceSnapshotStore
+      │   │   ├─ current runtime -> RuntimeResourceSnapshot rev-r
+      │   │   ├─ (workspace_id, repo-a) -> CwdResourceSnapshot rev-a -> rev-r
+      │   │   └─ (workspace_id, repo-b) -> CwdResourceSnapshot rev-b -> rev-r
+      │   └─ ResourceOverlayPolicy
+      ├─ user-global ProviderRegistry / AuthStore
+      └─ shared ModelGateway
+
+LoadedSessionRuntimes
+  ├─ SessionRuntime A { cwd = repo-a } -> run captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-a)
+  ├─ SessionRuntime B { cwd = repo-a } -> next run captures current CwdSnapshot(repo-a)
+  └─ SessionRuntime C { cwd = repo-b } -> run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-b)
+```
+
 ## 已关闭问题
 
 ### BR-001
@@ -48,9 +92,9 @@
 
 ### BR-003
 
-已关闭，当前文档按单进程方案 B 收敛。
+已关闭，当前分支按单进程 resource snapshot 模式修订。
 
-当前语义：
+历史语义（`eac94c1`）：
 
 ```text
 AgentRuntime
@@ -68,7 +112,7 @@ AgentRuntime
           ├─ AuthView
           ├─ ProviderRegistryView
           ├─ ModelGateway
-          ├─ ResourceLoader
+          ├─ ResourceManager
           └─ ToolSandboxRoot / ToolGateway inputs
 
 LoadedSessionRuntimes
@@ -78,6 +122,8 @@ LoadedSessionRuntimes
 ```
 
 这个方案解决的是：多个 `SessionRuntime` 虽然天然隔离 messages / phase / queue / current_run，但不天然隔离 resources / settings / auth / trust / tool cwd / sandbox。`CwdScopedServices` 用于把这些 cwd-sensitive 依赖固定到 session/run。
+
+最新修订：在当前产品约束下，resources 是唯一需要 cwd 维度快照化的运行输入；settings/auth/provider/model gateway 均为 user-global/runtime-global。`CwdScopedServices` 过重，已被 `ResourceManager` + 级联 immutable snapshots + run-time `TurnResourceSnapshot` capture 取代。多 session 隔离重点变为：session state 独立、session cwd 固定、`CwdResourceSnapshot.resolved` 提供 cwd effective resource view、run 启动时捕获 `TurnResourceSnapshot`、reload 只影响 future turn、工具副作用另由 tool policy/sandbox/mutation strategy 处理。
 
 ## 当前新讨论方向
 
@@ -110,7 +156,7 @@ AgentRuntime Supervisor Process
 SessionWorker Process A
   ├─ SessionRuntime A
   ├─ SessionHandle / SessionStorage
-  ├─ ResourceLoader A
+  ├─ ResourceManager A
   ├─ Prompt builder A
   ├─ ModelGateway client A
   ├─ ToolGateway A
@@ -313,11 +359,13 @@ ProcessSessionRuntimeHost
 
 ## 对现有设计的影响
 
-如果继续单进程方案 B：
+如果继续当前单进程 resource snapshot 模式：
 
-- `WorkspaceServices` / `CwdServiceRegistry` / `CwdScopedServices` 仍然合理。
+- `WorkspaceServices` 仍然合理。
+- `CwdServiceRegistry` / `CwdScopedServices` 不再作为 MVP 核心概念。
+- `ResourceSnapshotStore` 按 cwd 保存 current immutable resource snapshot。
 - `BR-002` 保持关闭。
-- `BR-003` 保持关闭。
+- `BR-003` 保持关闭，但处理记录以当前分支修订为准。
 
 如果改为 Claude-like supervisor：
 
@@ -343,8 +391,8 @@ ProcessSessionRuntimeHost
 
 ## 当前建议结论
 
-短期建议：保留当前已提交的单进程方案 B 作为 MiniCore MVP 文档基线。
+短期建议：以当前分支的单进程 resource snapshot 模式作为 MiniCore MVP 文档基线。
 
-中期建议：在正式实现前，把 `SessionRuntime` 的宿主抽象成 `SessionRuntimeHost`，为未来进程隔离留 seam。
+中期建议：先实现 `WorkspaceServices + ResourceSnapshotStore + LoadedSessionRuntimes` 的纵切，验证同一 UI 下多个 session 同时 running、reload 只影响 future turn、run 使用启动时捕获的 resource snapshot。
 
-长期如果要模仿 Claude Code：让 `AgentRuntime` 演进为 supervisor，管理多个 `SessionWorker` process、worktree、event multiplexing、approval routing 和 attach/detach。届时需要重新处理 UI reconnect / RuntimeSnapshot 范围问题。
+长期如果要模仿 Claude Code：让 `AgentRuntime` 演进为 supervisor，管理多个 `SessionWorker` process、worktree、event multiplexing、approval routing 和 attach/detach。届时需要重新处理 UI reconnect / RuntimeSnapshot 范围问题，并重新评估是否需要 worker-local services。

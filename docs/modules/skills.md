@@ -1,6 +1,6 @@
 # Skills
 
-`skills.rs` 是和 `resource_loader.rs`、`session_runtime.rs` 平级的技能文件能力模块。它不拥有资源生命周期，也不拥有会话运行生命周期；它提供技能元数据、技能目录数据结构，以及发现、解析、校验和格式化辅助函数。
+`skills.rs` 是和 `resource_manager.rs`、`session_runtime.rs` 平级的技能文件能力模块。它不拥有资源生命周期，也不拥有会话运行生命周期；它提供技能元数据、技能目录数据结构，以及发现、解析、校验和格式化辅助函数。
 
 技能不是工具，也不是插件代码。技能是 Markdown 指令包：它可以告诉模型“遇到某类任务时应采用什么流程”，但真正的本地副作用仍然只能通过 `SessionRuntime` 持有的工具策略、审批、工作区沙箱和 `ToolGateway` 发生。
 
@@ -12,7 +12,7 @@
 src/
   agent_runtime.rs
   session_runtime.rs
-  resource_loader.rs
+  resource_manager.rs
   skills.rs
   tools.rs
   driver.rs
@@ -21,17 +21,50 @@ src/
 职责边界：
 
 ```text
-ResourceLoader
-  owns: 技能来源聚合、reload、extend resources、当前 SkillCatalog、diagnostics、`resources_changed`
+ResourceManager
+  owns: 技能来源 roots、trust gate、runtime/cwd 分层、reload/recompose、overlay、current snapshot、diagnostics
 
 skills.rs
-  provides: SkillMetadata / SkillCatalog，以及技能发现、metadata 解析、校验、去重、prompt 格式化 helper
+  provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
 
 SessionRuntime
-  owns: /skill:name 或 InvokeSkill 的展开、技能正文读取、<skill> 块构造、user message 构造、入队或启动 run
+  owns: /skill:name 或 InvokeSkill 的展开、从 captured TurnResourceSnapshot 取正文、<skill> 块构造、user message 构造、入队或启动 run
 ```
 
-`skills.rs` 可以被 `ResourceLoader` 和 `SessionRuntime` 同时调用，但它本身不是 runtime service。
+`skills.rs` 可以被 `ResourceManager` 和 `SessionRuntime` 同时调用，但它本身不是 runtime service。模型可见技能的生命周期和 cwd-over-runtime overlay 由 `ResourceManager` 负责。
+
+## 与 ResourceManager 的边界
+
+`skills.rs` 和 `ResourceManager` 会共享 skill 数据结构，但不能共同拥有同一段生命周期。推荐边界是：
+
+| 能力 | `skills.rs` | `ResourceManager` |
+| --- | --- | --- |
+| 定义 `SkillMetadata` / `SkillResource` / `SkillCatalog` | 是 | 使用这些类型 |
+| 在给定目录中发现 `SKILL.md` | 是，作为纯 helper | 决定给哪些目录调用 helper |
+| 解析 frontmatter、校验 name/description | 是 | 不做格式细节 |
+| 剥离 frontmatter、格式化 `<available_skills>` / `<skill>` | 是 | 不拼消息、不拼最终 prompt |
+| 决定 builtin / user-global / cwd/project skill roots | 否 | 是 |
+| project trust gate | 否 | 是 |
+| runtime/global 与 cwd/project 分层 | 否 | 是 |
+| cwd 覆盖 runtime 的 overlay | 否 | 是 |
+| reload / ensure / recompose 生命周期 | 否 | 是 |
+| 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
+| `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
+| `/skill:name` raw input 解析 | 否 | 否，属于 `CommandSurface` |
+| `InvokeSkill` 构造 user message | 否，提供格式化 helper | 否，属于 `SessionRuntime` |
+
+一句话：`skills.rs` 负责“skill 长什么样、如何解析、如何格式化”；`ResourceManager` 负责“skill 从哪里来、何时加载、如何分层覆盖、哪一版对当前 turn 可见”。
+
+`SkillCatalog` 作为数据结构可以定义在 `skills.rs`，但 current catalog 的生命周期 owner 是 snapshot：
+
+```text
+RuntimeResourceSnapshot.skills
+CwdResourceSnapshot.local.skills
+CwdResourceSnapshot.resolved.skills
+TurnResourceSnapshot.cwd.resolved.skills
+```
+
+因此 `skills.rs` 可以创建 catalog，`ResourceManager` 决定 catalog 何时创建、如何 overlay、何时发布。
 
 ## 来自 pi coding-agent 的源码经验
 
@@ -60,7 +93,7 @@ AgentSession._expandSkillCommand()
 
 ## 技能发现和 metadata 加载
 
-`ResourceLoader.reload()` 负责决定来源，`skills.rs` 负责把给定路径转换成 `SkillCatalog`。
+`ResourceManager.reload_cwd()` / `ensure_cwd_snapshot()` 负责决定来源，`skills.rs` 负责把给定路径转换成 skill candidate / catalog 数据。
 
 pi coding-agent 的发现规则值得保留：
 
@@ -84,7 +117,7 @@ pi coding-agent 的发现规则值得保留：
 
 ## 数据结构
 
-生产路径应跟随 pi coding-agent：catalog 默认只保存 metadata，不保存所有技能正文。
+pi coding-agent 的 catalog 默认只保存 metadata，并在显式调用时按路径读取正文。MiniCore 的 `ResourceManager` snapshot 需要更强的原子性：进入 `CwdResourceSnapshot.resolved` 的 selected skill 应保存 stable body content，或保存 content hash + immutable loaded content reference。这样 running turn 不会在 reload 或文件修改后读到与 captured catalog 不一致的正文。
 
 ```rust
 pub struct SkillMetadata {
@@ -96,6 +129,12 @@ pub struct SkillMetadata {
     pub disable_model_invocation: bool,
 }
 
+pub struct SkillResource {
+    pub metadata: SkillMetadata,
+    pub body: Arc<str>,
+    pub content_hash: ContentHash,
+}
+
 pub struct SkillSummary {
     pub name: SkillName,
     pub description: String,
@@ -105,7 +144,7 @@ pub struct SkillSummary {
 }
 
 pub struct SkillCatalog {
-    pub skills: Vec<SkillMetadata>,
+    pub skills: Vec<SkillResource>,
     pub diagnostics: Vec<ResourceDiagnostic>,
 }
 ```
@@ -132,7 +171,7 @@ pub fn format_available_skills(catalog: &SkillCatalog, active_tools: &[ToolName]
 pub fn format_skill_block(metadata: &SkillMetadata, body: &str) -> String;
 ```
 
-显式调用时，`SessionRuntime` 可以直接读取 `metadata.file_path`，再调用 `strip_skill_frontmatter()` 和 `format_skill_block()`。这样 message 构造保持在会话编排层，`skills.rs` 只提供纯辅助能力。
+显式调用时，`SessionRuntime` 应从 captured `TurnResourceSnapshot.cwd.resolved.skills` 取得 `SkillResource.body`，再调用 `format_skill_block()`。这样 message 构造保持在会话编排层，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
 
 ## 模型可见技能摘要
 
@@ -165,10 +204,8 @@ When a skill file references a relative path, resolve it against the skill direc
 
 ```text
 InvokeSkill 或 /skill:name
-  → SessionRuntime 从 ResourceState 取得当前 SkillCatalog
-  → 查找 SkillMetadata
-  → SessionRuntime 读取 metadata.file_path
-  → skills::strip_skill_frontmatter(markdown)
+  → SessionRuntime capture TurnResourceSnapshot
+  → 从 turn.cwd.resolved.skills 查找 selected SkillResource
   → skills::format_skill_block(metadata, body)
   → 追加 additional instructions
   → MessageRecord::user(...)
@@ -194,9 +231,9 @@ References are relative to /abs/path.
 一次显式技能调用进入 Agent 运行时后，应按这个顺序处理：
 
 1. `SessionRuntime` 从当前 session leaf 重建已有上下文消息。
-2. `SessionRuntime` 从 `ResourceState` 读取当前 `SkillCatalog`。
+2. `SessionRuntime` capture `TurnResourceSnapshot`。
 3. `SessionRuntime` 解析 `/skill:name` 或处理结构化 `InvokeSkill`。
-4. `SessionRuntime` 读取技能正文，调用 `skills.rs` helper 剥离 frontmatter 和格式化 `<skill>` 块。
+4. `SessionRuntime` 从 `turn.cwd.resolved.skills` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块。
 5. 格式化后的内容作为新的 user message 进入本次 `DriveEntry::Prompt` 或进入队列。
 6. `SessionRuntime` 基于 active tools、context files 和可见技能摘要重建 system prompt。
 7. `BeforeAgentStart` Hook 可以追加 custom messages 或替换 system prompt。
@@ -214,24 +251,26 @@ References are relative to /abs/path.
 
 ```text
 App / workspace open
-  → ResourceLoader.reload()
-  → ResourceLoader resolves skill sources
+  → ResourceManager.ensure_runtime_snapshot()
+  → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest)
+  → ResourceManager resolves skill sources
   → skills::load_skill_catalog(inputs)
-  → ResourceLoader stores SkillCatalog + diagnostics
-  → AgentRuntime publishes `resources_changed` and updates snapshot state
+  → ResourceManager overlays runtime/global and cwd/project skill candidates
+  → ResourceManager publishes CwdResourceSnapshot { resolved.skills, diagnostics, ... }
+  → AgentRuntime publishes `resources_changed`
   → SessionRuntime rebuilds system prompt on next turn
 
 InvokeSkill
-  → SessionRuntime reads current SkillCatalog
-  → SessionRuntime reads skill file
-  → skills::strip_skill_frontmatter()
+  → SessionRuntime captures TurnResourceSnapshot
+  → SessionRuntime reads SkillResource from turn.cwd.resolved.skills
   → skills::format_skill_block()
   → SessionRuntime creates user message
   → Driver drive_run
   → SessionRuntime persists messages through SessionHandle
 
 ReloadResources
-  → ResourceLoader replaces SkillCatalog
+  → ResourceManager builds a new CwdResourceSnapshot for target cwd
+  → ResourceManager atomically replaces ResourceSnapshotStore current cwd pointer
   → AgentRuntime publishes diagnostics and `resources_changed`
   → future turns use new catalog
   → existing persisted messages remain unchanged
@@ -242,24 +281,16 @@ ReloadResources
 `SkillCatalog` 是数据结构，不是生命周期 owner。它至少需要支持：
 
 - `list()`：返回 `SkillSummary`。
-- `get(name)`：返回 metadata 或结构化 not found。
+- `get(name)`：返回 selected `SkillResource` 或结构化 not found。
 - `visible(active_tools)`：返回可进入 system prompt 的技能摘要。
 - `diagnostics()`：返回加载、校验、碰撞和路径错误。
 
-名称碰撞处理应确定且可诊断。不要依赖文件系统遍历顺序。产品必须定义来源优先级；MVP 建议：
-
-1. 用户显式配置路径。
-2. 用户级技能。
-3. 应用内置技能。
-4. 已信任工作区技能。
-5. 后续扩展或包资源按声明顺序追加。
-
-这个默认顺序让项目内技能不能静默覆盖用户级或内置技能。若未来允许 workspace skill 覆盖 builtin skill，必须在项目可信后才允许，并产生可见诊断。无论谁获胜，都不能绕过工具策略。
+名称碰撞处理应确定且可诊断。不要依赖文件系统遍历顺序。产品必须定义来源优先级；MVP 统一使用 [ResourceManager](resource-manager.md) 的 `ResourceOverlayPolicy`。runtime/global 候选先进入 `RuntimeResourceSnapshot`，cwd/project 候选在 `CwdResourceSnapshot` 构建时覆盖 same-key runtime/global 候选；被覆盖技能保留在 `shadowed` 中供 diagnostics/UI 展示。无论谁获胜，都不能绕过工具策略。
 
 ## 设计约束
 
 - 不要把技能当工具。技能只是 prompt resource；工具才有副作用。
-- 不要把技能全文塞进 snapshot。否则大文件、私有路径和指令内容会泄漏给 UI 状态层。
+- 不要把技能全文塞进 `RuntimeSnapshot` 或资源摘要事件。`CwdResourceSnapshot` 可以为原子性保存 selected skill body，但 UI 默认只能看到 summary/detail query 的受控结果。
 - 不要让 UI 拼 `<skill>` 块。否则相对路径规则、frontmatter 剥离、队列语义和 session persistence 会分叉。
 - 不要把模型可见技能列表和显式技能调用混为一谈。前者只是摘要，后者注入全文。
 - 不要在没有 `read` 工具时把技能列表暴露给模型。模型无法按摘要中的指令加载技能文件。
