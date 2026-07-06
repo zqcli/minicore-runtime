@@ -26,23 +26,25 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                  MiniCore AgentRuntime
        ┌────────────────────┬────────────────────┬────────────────────┐
        ▼                    ▼                    ▼                    ▼
- ResourceLoader      CommandSurface        RuntimeHooks          SessionManager
-                                                                  │
-                                                         LoadedSessionRuntimes
-                                                                  │
-                                                           SessionRuntime
-                                                       ┌──────────┴──────────┐
-                                                       ▼                     ▼
-                                                    Driver              ModelGateway
-                                                       │                     │
-                                                       ▼                     ▼
-                                                Rig AgentRun          Rig providers
+ WorkspaceServices     CwdServiceRegistry   CommandSurface      RuntimeHooks
+       │                    │
+       │                    └── CwdScopedServices { cwd, generation }
+       │                               ├─ ResourceLoader
+       │                               └─ ModelGateway
+       ▼
+ SessionManager
+       │
+ LoadedSessionRuntimes
+       │
+ SessionRuntime ── pins CwdScopedServices generation
+       ├─ Driver ───────────────▶ Rig AgentRun
+       └─ ToolGateway / Prompt ─▶ pinned cwd resources
 ```
 
 ## 文档地图
 
 - [模块总览](modules/README.md)：整体模块关系、Rig / Runtime / 下游 UI 宿主的边界。
-- [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、运行时服务、会话替换和工作区生命周期。
+- [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、`WorkspaceServices` / `CwdScopedServices`、会话打开/聚焦和工作区生命周期。
 - [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、队列、Hook、turn state 和 post-run 流程。
 - [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
 - [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
@@ -65,7 +67,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - 下游 CLI/TUI/GUI 不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面。
-- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。
+- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。多个 `SessionRuntime` 可以同时 loaded/running，并各自 pin `CwdScopedServices` generation。
 - `SessionRuntime` 是单个会话的产品级编排层。
 - `CommandSurface` 属于运行时命令入口：下游 UI 可以渲染 autocomplete / command palette / picker / popup，但不拥有 `/...` 的权威解析、执行映射或用户可见结果语义。
 - `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。

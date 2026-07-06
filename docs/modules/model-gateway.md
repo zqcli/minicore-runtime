@@ -30,10 +30,10 @@ SessionRuntime::ModelState
 ## 模块归属
 
 ```text
-RuntimeServices
-  ├─ SettingsStore
-  ├─ AuthStore
-  ├─ ProviderRegistry
+CwdScopedServices { workspace_id, cwd, generation }
+  ├─ SettingsView
+  ├─ AuthView
+  ├─ ProviderRegistryView
   └─ ModelGateway
 
 SessionRuntime
@@ -321,11 +321,11 @@ pub enum ModelCallErrorKind {
 ### Startup
 
 ```text
-AgentRuntime opens workspace/cwd
-  → SettingsStore loads provider/model settings
-  → ProviderRegistry builds builtin + custom catalog
-  → AuthStore prepares env/keychain/oauth/runtime overrides
-  → ModelGateway is created as RuntimeServices member
+AgentRuntime resolves CwdScopedServices { workspace_id, cwd, generation }
+  → SettingsView loads provider/model settings
+  → ProviderRegistryView builds builtin + custom catalog for this scope
+  → AuthView prepares env/keychain/oauth/runtime overrides
+  → ModelGateway is created inside the pinned service generation
 ```
 
 ### Session restore

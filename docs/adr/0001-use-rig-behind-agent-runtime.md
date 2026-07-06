@@ -4,7 +4,7 @@
 
 我们不会复制 pi-agent-core 的 `AgentHarness` 作为一个独立架构层。pi coding-agent 的生产路径更接近 `AgentSessionRuntime -> AgentSession -> Agent -> agent-loop`：`AgentSessionRuntime` 负责会话替换和 cwd 绑定服务，`AgentSession` 承担产品级编排能力，底层 `Agent` 和 `agent-loop` 负责运行。这个经验说明，本项目也应该把产品级编排能力放进单个会话的 `SessionRuntime`，而不是暴露或实现一个独立的通用编排层。
 
-`AgentRuntime` 是下游 CLI、TUI 和 GUI 共用的稳定门面，负责命令、事件、快照、工作区、会话目录、运行时服务重建和会话替换。`SessionRuntime` 是单个会话的产品级编排层，负责阶段控制、turn state、pending session writes、steering/follow-up/next-turn 队列、prompt/skill/prompt-template 调用、模型与思考等级切换、工具与活跃工具切换、资源更新、stream options、abort/waitForIdle、事件映射和内部运行时 Hook。Rig 负责核心 agent loop，`SessionRuntime` 和 `Driver` 负责把它产品化为可被下游宿主稳定调用和观察的后端能力。
+`AgentRuntime` 是下游 CLI、TUI 和 GUI 共用的稳定门面，负责命令、事件、快照、工作区、会话目录、`WorkspaceServices` 和 `CwdServiceRegistry`。`SessionRuntime` 是单个会话的产品级编排层，负责阶段控制、turn state、pending session writes、steering/follow-up/next-turn 队列、prompt/skill/prompt-template 调用、模型与思考等级切换、工具与活跃工具切换、资源更新、stream options、abort/waitForIdle、事件映射和内部运行时 Hook；每个已加载 `SessionRuntime` pin 自己的 `CwdScopedServices` generation，支持多 session 后台运行且不被 focused session 切换污染。Rig 负责核心 agent loop，`SessionRuntime` 和 `Driver` 负责把它产品化为可被下游宿主稳定调用和观察的后端能力。
 
 工具能力同样遵循这个边界：Rig 负责工具调用的协议级状态机，例如模型何时请求工具、工具结果如何回填以及之后是否继续模型调用。我们不使用 Rig 高阶 runner 自动执行工具；主路径采用 Rig `AgentRun / AgentRunStep` 的 sans-IO 驱动方式。`Driver` 在 `CallTools` step 调用 `DriverHost::invoke_tool`，host 实现再进入 `SessionRuntime` 内部的 `ToolGateway`，最后把结果喂回 `AgentRun::tool_results(...)`。工具定义、内置工具、外部工具适配和 executor helper 属于平级 `Tools` 模块；工具注册表、活跃工具集合、系统提示词工具说明、工具策略、审批、沙箱、Hook、结果归一化和会话持久化由 `SessionRuntime` 持有和调度。
 

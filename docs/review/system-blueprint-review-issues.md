@@ -57,20 +57,22 @@
 
 ### BR-003：RuntimeServices 作用域与多 session/background run 存在冲突
 
-状态：Open
+状态：Resolved
 
-问题：文档一方面说 `RuntimeServices` 绑定有效工作区，另一方面说打开/导入/恢复到不同 cwd 的会话时必须重建这些服务；同时 `SessionManager` 允许多个 loaded session 和后台 run。旧 session 应持有旧 services、被 shutdown，还是迁移到新 services，目前不清楚。
+处理记录：已收敛到方案 B，明确支持多 session/background run。`AgentRuntime` 拥有 `WorkspaceServices` 和 `CwdServiceRegistry`；`CwdScopedServices` 按 `(workspace_id, cwd, generation)` 创建或复用。每个已加载 `SessionRuntime` / run pin 自己的 service generation，focused session 只影响 UI 和默认命令路由，不作为服务 scope 锚点。
 
-证据：
+问题：原文档一方面说 `RuntimeServices` 绑定有效工作区，另一方面说打开/导入/恢复到不同 cwd 的会话时必须重建这些服务；同时 `SessionManager` 允许多个 loaded session 和后台 run。旧 session 应持有旧 services、被 shutdown，还是迁移到新 services，此前不清楚。
+
+原证据：
 
 - `CONTEXT.md`：Runtime services 是绑定到有效工作区的后端依赖集合。
 - `docs/modules/agent-runtime.md`：运行时服务绑定有效工作区；不同 cwd 会话切换时必须重新创建服务。
 - `docs/modules/session-manager.md`：多 session 同时运行时，失去 focus 的 session 可以继续执行后台 run。
 - `docs/implementation-roadmap.md`：先决设计点要求明确服务绑定到 workspace、cwd、focused session 还是 loaded session。
 
-风险：资源、设置、信任、凭据、ModelGateway、ProviderRegistry 可能在后台 session 和 focused session 之间互相污染；也可能导致后台 run 被隐式中断。
+风险：如果实现偏离该约束，资源、设置、信任、凭据、ModelGateway、ProviderRegistry 仍可能在后台 session 和 focused session 之间互相污染；也可能导致后台 run 被隐式中断。
 
-待处理方向：明确 workspace、cwd、session、focused session 的关系；给 `RuntimeServices` 增加 generation/scope 语义或改为 per-workspace/per-cwd/per-session 结构。
+待处理方向：已处理。后续实现必须验证：打开两个不同 cwd 的 session，后台 running session 继续使用旧 `CwdScopedServices` generation；focus 切换、resource reload、close/unload 不污染其他 loaded session。
 
 ### BR-004：pending tool approval 要求从 Snapshot 恢复，但 Snapshot 没有显式字段
 

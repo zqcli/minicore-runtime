@@ -1,6 +1,6 @@
 # SessionRuntime
 
-`SessionRuntime` 是单个会话的产品级 Agent 编排对象，对齐 pi coding-agent 的 `AgentSession`。它拥有会话状态、队列、资源、工具、模型状态、运行生命周期和事件归约。
+`SessionRuntime` 是单个会话的产品级 Agent 编排对象，对齐 pi coding-agent 的 `AgentSession`。它拥有会话状态、队列、资源、工具、模型状态、运行生命周期和事件归约，并在创建时 pin 一个 `CwdScopedServices` generation，使后台 run 不受 focused session 切换影响。
 
 ## 核心职责
 
@@ -10,6 +10,7 @@
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`；运行中输入必须进入队列，不能绕过当前 run 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
+- 服务 scope：持有 `CwdScopedServices` generation；run 启动时继续 pin 当前 generation，resource reload 或 cwd 变化只影响后续 safe point / future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
 - 工具与系统提示词：维护工具定义注册表、活跃工具集合、工具提示片段、工具执行策略，并在工具/资源变化后调用 `prompt.rs` 重建 system prompt。
 - 资源与扩展：引用 `ResourceLoader` 结果，支持 reload、运行时 Hook 绑定、extension command/resource/tool 后续接入。
@@ -22,6 +23,7 @@
 
 ```text
 SessionRuntime
+  ├─ CwdScopedServicesRef { workspace_id, cwd, generation }
   ├─ ExecutionEnv
   ├─ SessionHandle
   ├─ SessionPhase
@@ -68,7 +70,7 @@ SessionRuntime
 | `navigateTree()` | `NavigateSessionTree` |
 | `getSessionStats()` / `getContextUsage()` | snapshot stats/context usage |
 | `exportToHtml()` / `exportToJsonl()` | `ExportSession` |
-| `reload()` | `ReloadResources` / service-level reload |
+| `reload()` | `ReloadResources` / cwd-scoped service generation reload |
 | `bindExtensions()` / `extensionRunner` | 后续扩展运行时与 `RuntimeHookRegistry` |
 
 ## Skill Invocation

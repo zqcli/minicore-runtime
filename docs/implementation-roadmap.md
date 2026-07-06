@@ -28,7 +28,7 @@ Minimal protocol / event / session spine
 正式实现前先定清楚这些容易返工的点：
 
 1. `RuntimeSnapshot` scope：MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不接受 `session_id`，也不单独持久化。打开 workspace 后默认不聚焦旧 session；`RuntimeSnapshot.active_session` 可以为空。会话清单由 `SessionIndex` / `ListSessions` 提供，TUI `/resume` 默认按当前 workspace 筛选，GUI sidebar 复用同一 query。MVP 中 UI host 和 `AgentRuntime` 同进程、同生命周期，不支持 UI 断线但 runtime daemon 继续后台运行再被重连；`last_event_sequence` 只用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。未来如需多 tab、多 session detail、独立 runtime server、多窗口共享 runtime 或大规模分页，再拆 `WorkspaceSnapshot` / `SessionSnapshot` 或 scoped event cursor。
-2. `RuntimeServices` scope：明确服务绑定到 workspace、cwd、focused session 还是 loaded session，避免多 session/background run 时重建全局服务污染其他会话。
+2. `RuntimeServices` scope：采用方案 B 支持多 session/background run。`AgentRuntime` 持有 `WorkspaceServices` 和 `CwdServiceRegistry`；`CwdScopedServices` 按 `(workspace_id, cwd, generation)` 创建或复用，并由每个 `SessionRuntime` / run pin 住。Focused session 只影响 UI 和默认命令路由，不能作为服务 scope 锚点。
 3. `ModelGateway` seam：它负责 provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类，是 `Driver`、`Compaction`、`UsageStats` 的共享依赖；正式实现前以 [ModelGateway](modules/model-gateway.md) 为 source of truth。
 4. 失败事件顺序：失败 assistant message、diagnostic、`persistence_save_point` 和 `run_finished { status: failed }` 的顺序必须统一。`persistence_save_point` 是 durable barrier，不能让 UI 在 terminal event 后仍处于不可恢复状态。
 
@@ -37,9 +37,9 @@ Minimal protocol / event / session spine
 | 阶段 | 目标 | 主要文件 | 可验证产物 |
 | --- | --- | --- | --- |
 | 0. Crate skeleton 和基础类型 | 建立最小 crate、ID、error、message、协议子集 | `src/lib.rs`、`src/ids.rs`、`src/error.rs`、`src/messages.rs`、`src/agent_runtime_protocol.rs` | `Command` / `Event` / `RuntimeSnapshot` / `MessageRecord` / `SessionPhase` 可编译、可序列化。 |
-| 1. EventBus 和最小 AgentRuntime | 建立 `dispatch`、`subscribe`、`snapshot()`、event sequence、水位和 command ack | `src/agent_runtime.rs`、`src/agent_runtime_events.rs` | event sequence 单调递增；`RuntimeSnapshot` 带 `last_event_sequence`；`OpenWorkspace` 后 `active_session = None`；无法路由命令能 rejected。 |
-| 2. InMemory session spine | 实现 `SessionStorage` trait、`SessionHandle`、内存 storage、最小 `SessionManager` 和轻量 `SessionIndex` | `src/session_storage.rs`、`src/session_storage/memory.rs`、`src/session_manager.rs` | create/open/list、workspace-scoped `ListSessions`、append message、leaf/path-to-root、context rebuild 通过同一组 storage contract tests。 |
-| 3. First vertical slice with fake driver | `NewSession` / `OpenSession` 后 `SubmitPrompt` 跑通：phase guard、user message、fake assistant stream、save point、RuntimeSnapshot | `src/session_runtime.rs`、`src/driver.rs` | `OpenSession -> RuntimeSnapshot.active_session(idle)`；`SubmitPrompt -> message_user_appended -> run_started -> assistant delta -> persistence_save_point -> run_finished -> session_settled` 顺序稳定。 |
+| 1. EventBus 和最小 AgentRuntime | 建立 `dispatch`、`subscribe`、`snapshot()`、event sequence、水位、command ack、`WorkspaceServices` 和 `CwdServiceRegistry` 骨架 | `src/agent_runtime.rs`、`src/agent_runtime_events.rs`、`src/runtime_services.rs` | event sequence 单调递增；`RuntimeSnapshot` 带 `last_event_sequence`；`OpenWorkspace` 后 `active_session = None`；无法路由命令能 rejected；同一 workspace 下不同 cwd 可 resolve 不同 service generation。 |
+| 2. InMemory session spine | 实现 `SessionStorage` trait、`SessionHandle`、内存 storage、最小 `SessionManager`、轻量 `SessionIndex` 和 loaded runtime pinning | `src/session_storage.rs`、`src/session_storage/memory.rs`、`src/session_manager.rs` | create/open/list、workspace-scoped `ListSessions`、append message、leaf/path-to-root、context rebuild 通过同一组 storage contract tests；loaded runtime 记录 pinned service generation，focus 切换不改写。 |
+| 3. First vertical slice with fake driver | `NewSession` / `OpenSession` 后 `SubmitPrompt` 跑通：phase guard、user message、fake assistant stream、save point、RuntimeSnapshot | `src/session_runtime.rs`、`src/driver.rs` | `OpenSession -> RuntimeSnapshot.active_session(idle)`；两个 loaded sessions 可各自持有 `SessionRuntime` 和 service generation；focus B 不中止 running A；`SubmitPrompt -> message_user_appended -> run_started -> assistant delta -> persistence_save_point -> run_finished -> session_settled` 顺序稳定。 |
 | 4. Rig Driver seam spike | 隔离验证 Rig sans-IO step，不掺 session persistence | `src/driver.rs`、`src/driver/rig.rs` | 证明 `CallModel -> Done`；再证明 `CallTools -> tool_results -> Done`；若 Rig API 不符，返工范围限制在 driver seam。 |
 | 5. Text-only Driver integration | 用真实 `Driver.drive_run()` 替换 fake driver，先只接模型文本流 | `src/driver.rs`、`src/driver/rig.rs`、`src/model_gateway.rs`、`src/model_gateway/rig.rs`、`src/session_runtime.rs` | 真 Driver 只传 `ModelSelection`；`ModelGateway` mock/fake provider 产生 assistant started/delta/finished；普通 provider failure 归约为 `DriveResult::Failed` 和唯一 `run_finished`。 |
 | 6. JSONL storage | 在 storage contract 稳定后实现文件持久化 | `src/session_storage/jsonl.rs`、`src/session_manager.rs` | InMemory 和 JSONL 通过同一组 conformance tests；重开后 RuntimeSnapshot/context 一致。 |
@@ -197,7 +197,8 @@ MVP 只接入已经存在的安全点：
 
 - protocol serde / compatibility：命令、事件、快照、工具审批 preview。
 - event lifecycle：run 单终态、assistant/tool started-delta-finished 配对、terminal event 和 save point 顺序。
-- RuntimeSnapshot/resync：sequence gap、active session pending approval、active session running、no active session；multi-session focus/background run 不进入 MVP UI reconnect contract，除非未来引入独立 runtime server、多窗口共享 runtime 或 scoped event cursor。
+- RuntimeSnapshot/resync：sequence gap、active session pending approval、active session running、no active session；多 session focus/background run 的运行时正确性通过 `SessionRuntime` 独立 phase 和 pinned service generation 测试，UI reconnect contract 仍只覆盖同一 host 生命周期内当前视图。
+- RuntimeServices scope：打开两个不同 cwd 的 session，后台 running session 继续使用旧 `CwdScopedServices` generation；focus 切换、resource reload、close/unload 不污染其他 loaded session。
 - storage conformance：InMemory 和 JSONL 对 entry append、leaf、path-to-root、compaction projection 行为一致。
 - Driver / ModelGateway seam：Rig `CallModel`、`CallTools`、`Done`、tool result threading、provider/tool error-as-result、`ModelSelection` 传递、auth redaction、custom provider base URL、usage/error normalization 和 cancellation。
 - tool governance：active tool membership、schema validation、rewrite 后重新 schema validate / sandbox / policy、approval 后 args 冻结。
