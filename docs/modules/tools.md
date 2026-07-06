@@ -1,6 +1,6 @@
 # Tools
 
-`tools.rs` / `tools/` 是和 `skills.rs`、`resource_loader.rs`、`prompt.rs` 平级的工具能力模块。它提供工具定义、工具注册、工具策略、审批代理、工具网关、内置工具、外部工具适配、schema、prompt metadata 和 executor helper；它本身不是独立运行时。
+`tools.rs` / `tools/` 是和 `skills.rs`、`resource_manager.rs`、`prompt.rs` 平级的工具能力模块。它提供工具定义、工具注册、工具策略、审批代理、工具网关、内置工具、外部工具适配、schema、prompt metadata 和 executor helper；它本身不是独立运行时。
 
 工具有真实副作用，因此工具状态和工具治理不能像技能那样只停留在 catalog 层。本项目采用：
 
@@ -100,7 +100,7 @@ pi-agent-core agent-loop
 
 | 能力 | 平级模块 | 状态 owner | 调用路径 |
 | --- | --- | --- | --- |
-| Skills | `skills.rs` | `ResourceLoader` 持有 `SkillCatalog` | `SessionRuntime` 展开成 user message |
+| Skills | `skills.rs` | `ResourceManager` 的 `CwdResourceSnapshot.resolved` 持有 effective `SkillCatalog` | `SessionRuntime` 从 captured `TurnResourceSnapshot` 展开成 user message |
 | Tools | `tools.rs` / `tools/` | `SessionRuntime` 持有 `ToolRegistry` / `ActiveToolSet` | `Driver -> DriverHost::invoke_tool -> ToolGateway -> ToolExecutor` |
 
 相同点：二者都是平级能力模块，不应命名成独立 runtime。
@@ -156,7 +156,7 @@ SessionRuntime
        └─ AgentRunStep::CallTools -> DriverHost::invoke_tool(...) -> ToolGateway.invoke(...)
 ```
 
-`ToolGateway` 只通过 `SessionRuntime` 的 `DriverHost::invoke_tool` 实现被使用。UI、`ResourceLoader`、`Prompt` 和 `SessionStorage` 都不直接执行工具。`ToolGateway` 可以接收 `SessionRuntime` 传入的工具更新 sink 上报进度，但不能绕过 `SessionRuntime` 自行发布 UI event。
+`ToolGateway` 只通过 `SessionRuntime` 的 `DriverHost::invoke_tool` 实现被使用。UI、`ResourceManager`、`Prompt` 和 `SessionStorage` 都不直接执行工具。`ToolGateway` 可以接收 `SessionRuntime` 传入的工具更新 sink 上报进度，但不能绕过 `SessionRuntime` 自行发布 UI event。
 
 `ToolGateway` 消费：
 
@@ -399,4 +399,4 @@ MVP 默认只启用只读工具：
 - 不要让 `ToolGateway` 独立拥有状态；状态归 `SessionRuntime`，gateway 只是执行门面。
 - 不要让外部工具绕过 registry/policy/approval。所有工具来源必须归一化成 `RegisteredTool`。
 - 不要让 UI 执行工具。UI 只能发送审批决策。
-- 不要把 tool snippets/guidelines 放进 `ResourceLoader`。工具提示素材来自 session-owned active tools。
+- 不要把 tool snippets/guidelines 放进 `ResourceManager`。工具提示素材来自 session-owned active tools。

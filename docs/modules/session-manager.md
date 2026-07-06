@@ -13,7 +13,7 @@
 - `SessionHandle` 是单会话领域对象，暴露追加条目、构建上下文、移动当前叶子、读取标签和会话名等行为。文档和实现中应优先使用 `SessionHandle`，避免把它简称为容易和完整会话概念混淆的 `Session`。
 - `SessionStorage` 是单会话底层存储 interface，负责 entry、leaf 和 metadata 的读写。
 
-`AgentRuntime` 对 UI 暴露会话命令和快照，但内部通过 `SessionManager` 打开会话、创建 `SessionHandle`、加载 `SessionRuntime`、切换 focused session。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不决定服务 scope；`AgentRuntime` 提供的 factory 会按 session metadata 中的 workspace/cwd 解析 `CwdScopedServices` generation，并让新 `SessionRuntime` pin 住它。
+`AgentRuntime` 对 UI 暴露会话命令和快照，但内部通过 `SessionManager` 打开会话、创建 `SessionHandle`、加载 `SessionRuntime`、切换 focused session。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`。
 
 `SessionIndex` 是 `SessionManager` 的轻量会话目录，不是 `RuntimeSnapshot`。它用于 `/resume`、GUI sidebar 和 `ListSessions`，可以由 JSONL header、session metadata、本地 index/cache 或数据库投影维护。它只包含 session id、workspace/cwd、名称、时间、预览、轻量模型/思考等级/usage 摘要和诊断，不包含完整 messages、当前 run、pending approval、队列或 UI 状态。打开窗口时不需要为了生成 `RuntimeSnapshot` 重建所有 session；只有用户执行 `OpenSession` 或创建新会话时才加载对应 `SessionRuntime` 并重建完整 session projection。
 
@@ -49,7 +49,7 @@ pub trait SessionStorage {
 
 `SessionListFilter` 必须支持按 workspace scope 查询。TUI 的 `/resume` 默认列出当前 workspace 的会话；GUI sidebar 也应通过 `ListSessions(CurrentWorkspace)` 或显式 workspace scope 读取清单。`/resume --all`、全局 recent view 或跨 workspace 搜索可以作为后续增强，但默认不应把所有工作区的 session 混在一起。
 
-运行时加载使用 factory，factory 由 `AgentRuntime` 提供并持有 `WorkspaceServices` / `CwdServiceRegistry`。`SessionManager` 只把 `SessionHandle` 交给 factory；factory 读取 handle metadata 的 workspace/cwd，resolve 或创建 `CwdScopedServices` generation，并把 pinned generation 注入新 `SessionRuntime`。这样 `SessionManager` 不直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 构造细节，也不会把 focused session 的当前服务误传给后台 session：
+运行时加载使用 factory，factory 由 `AgentRuntime` 提供并持有 `WorkspaceServices`。`SessionManager` 只把 `SessionHandle` 交给 factory；factory 读取 handle metadata 的 workspace/cwd，确保 `ResourceManager` 已有该 cwd 的 current `CwdResourceSnapshot`，并把 fixed workspace/cwd 与共享 runtime services 注入新 `SessionRuntime`。这样 `SessionManager` 不直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 构造细节，也不会把 focused session 的当前 cwd 或资源快照误传给后台 session：
 
 ```rust
 pub trait SessionRuntimeFactory {
@@ -62,7 +62,7 @@ pub struct LoadedSessionRuntimes {
 }
 ```
 
-`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`insert`、`replace`、`set_focused`、`close`、`shutdown_all` 和可选的 idle unload。不要在这里追加 message、构建上下文、执行工具、调用模型或发布 UI event，也不要根据 focus 切换改写已加载 runtime 持有的 service generation。
+`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`insert`、`replace`、`set_focused`、`close`、`shutdown_all` 和可选的 idle unload。不要在这里追加 message、构建上下文、执行工具、调用模型或发布 UI event，也不要根据 focus 切换改写已加载 runtime 的 workspace/cwd、phase、queue 或 current run。
 
 `SessionHandle` 是 `SessionRuntime` 的主要消费对象：
 

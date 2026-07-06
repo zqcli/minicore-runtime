@@ -50,7 +50,7 @@ UI / wire:
 // 不推荐
 SessionRuntimeRunStarted
 ToolGatewayToolCallStarted
-ResourceLoaderResourcesChanged
+ResourceManagerResourcesChanged
 ```
 
 推荐事件名表达公开生命周期族，而不是实现归属：
@@ -155,7 +155,7 @@ agent_runtime_protocol::EventMsg
 | persistence save point | 必填 | 必填 | 可空 | 导致写入的命令 id 或 run command id |
 | settled | 必填 | 必填 | `None` | 通常可空 |
 
-自动行为不一定有 `command_id`：例如 threshold auto-compaction、auto-retry、资源 watcher 触发 reload。此时 `agent_runtime_protocol::Event` 依赖 `workspace_id` / `session_id` / `run_id` 关联上下文。
+自动行为不一定有 `command_id`：例如 threshold auto-compaction、auto-retry。此时 `agent_runtime_protocol::Event` 依赖 `workspace_id` / `session_id` / `run_id` 关联上下文。MVP 的资源更新通过显式 reload / startup ensure 进入 `ResourceManager`，不设计文件监听器或热更新事件源。
 
 ### agent_runtime_protocol::Event 生成点
 
@@ -170,7 +170,7 @@ SessionRuntime event sink
   AgentRuntime event bus assigns event_id + sequence + timestamp
 ```
 
-`Driver`、`ToolGateway`、`ResourceLoader`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
+`Driver`、`ToolGateway`、`ResourceManager`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
 
 ### RuntimeSnapshot 水位
 
@@ -235,7 +235,7 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `ToolGateway` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
-| `ResourceLoader` | 不直接发 UI event | 返回资源结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 消费资源 revision 并在后续 turn 重建 prompt。 |
+| `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 `TurnResourceSnapshot` 并重建 prompt。 |
 | `CommandSurface` | 不直接发 UI event | 返回 command catalog、parse/plan 结果和 command presentation；`AgentRuntime` 发布 `slash_commands_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 protocol command。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
 | `RuntimeHooks` | 不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
@@ -251,15 +251,15 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | 层级 | 持有/管理的状态 | 负责发布或归约的 UI wire events | 只消费/返回，不拥有的事件 |
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
-| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、`CwdServiceRegistry`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、resource state view、pinned `CwdScopedServices` generation、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
+| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `ToolGateway` | 单次 tool invocation 的治理上下文、policy evaluation、approval wait、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 registry/policy/approval/executor/hook；返回 `ToolInvocationResult` |
 | `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `ToolGateway` 调用 |
-| `ResourceLoader` | `RuntimeResources`、`PromptMaterials`、`SkillCatalog`、resource diagnostics、revision candidate | 不发布 UI event；返回 reload result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 消费新 revision |
+| `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
 | `CommandSurface` | `SlashCommandCatalog` projection、name conflict diagnostics、phase policy、raw invocation parse result、execution plan、presentation plan | 不发布 UI event；返回 catalog、plan 或 `CommandPresentation` | `AgentRuntime` 发布 `slash_commands_changed` 和 command presentation events；`SessionRuntime` 执行 session-scoped command |
-| `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceLoader` / `SessionRuntime` 调用 |
+| `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
 | `Prompt` | 无生命周期状态；纯构建输入到输出 | 不发布事件 | 被 `SessionRuntime` 调用 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
 | `SessionHandle` | 单会话领域操作 facade、上下文重建结果 | 不发布 UI event；返回 entry id/context | `SessionRuntime` 根据返回结果发 `message_*`、`persistence_save_point` 等 |
@@ -284,15 +284,14 @@ WorkspaceServices
   ├─ SessionManager / SessionIndex
   ├─ CommandSurfaceService
   ├─ RuntimeHookRegistry
-  └─ RuntimeDiagnostics
-
-CwdServiceRegistry
-  ├─ key: (workspace_id, cwd, generation)
-  └─ CwdScopedServices
-      ├─ SettingsView / ProjectTrustView / AuthView
-      ├─ ProviderRegistryView / ModelGateway
-      ├─ ResourceLoader
-      └─ tool sandbox inputs
+  ├─ RuntimeDiagnostics
+  ├─ ResourceManager
+  │   ├─ ResourceSnapshotStore
+  │   │   ├─ current runtime -> RuntimeResourceSnapshot
+  │   │   └─ key: (workspace_id, cwd) -> CwdResourceSnapshot
+  │   └─ ResourceOverlayPolicy
+  ├─ ProviderRegistry / AuthStore
+  └─ ModelGateway
 ```
 
 负责发布的 wire events：
@@ -401,7 +400,7 @@ ToolGateway progress/update
 ModelGateway stream result
 SessionHandle append/build_context result
 RuntimeHooks typed result
-ResourceLoader resource snapshot
+ResourceManager captured TurnResourceSnapshot
 ```
 
 不持有：
@@ -487,20 +486,20 @@ run terminal status
 tool result message persistence
 ```
 
-### ResourceLoader Ownership
+### ResourceManager Ownership
 
-`ResourceLoader` 拥有资源加载结果，不拥有 UI 事件通道。
+`ResourceManager` 拥有资源 current pointers 和 reload/recompose pipeline，但不拥有 UI 事件通道。
 
 持有状态：
 
 ```text
-RuntimeResources
-PromptMaterials
-SkillCatalog
-PromptTemplate catalog
-Context file summaries
+ResourceSnapshotStore
+  ├─ current runtime -> Arc<RuntimeResourceSnapshot>
+  └─ (workspace_id, cwd) -> Arc<CwdResourceSnapshot>
+ResourceOverlayPolicy
+ResourceResolver / loaders
 Resource diagnostics
-ResourceRevision candidate/current
+Reload/capture result types
 ```
 
 相关 UI wire events 由 `AgentRuntime` 或 `SessionRuntime` 发：
@@ -1021,10 +1020,10 @@ StatsStable
 
 ### 18. Resource Reload Lifecycle
 
-Resource reload 是 workspace 级生命周期。
+Resource reload 是 workspace/cwd 级生命周期。
 
 ```text
-Stable(revision=N)
+Stable(cwd, revision=N)
   -- resources_reload_started --> Reloading
       ├─ Commit(revision=N+1)
       └─ KeepOldRevisionWithDiagnostics(revision=N)
@@ -1037,7 +1036,7 @@ Stable(revision=N)
 - `resources_changed`
 - `slash_commands_changed`，如果 skills、prompt templates、extension commands 或 builtin availability 因 reload 改变
 
-`resources_changed` 必须携带当前有效 revision。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
+`resources_changed` 必须携带当前有效 `workspace_id`、`cwd` 和 revision。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
 
 `slash_commands_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command_surface` 或该事件中的 catalog 为准。
 
@@ -1256,33 +1255,70 @@ UI dispatch(Compact) or auto threshold/overflow
 
 ## Resource Reload Lifecycle
 
+资源 snapshot 的创建和替换发生在 `ResourceManager` 方法内部；事件只负责通知已经发生的事实。初始化路径也遵循这个规则：
+
+```text
+UI dispatch(OpenWorkspace)
+  → WorkspaceServices::new(...)
+  → ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)
+      └─ missing: build RuntimeResourceSnapshot and replace_runtime(...)
+  → workspace_opened / RuntimeSnapshot { active_session: None }
+
+UI dispatch(OpenSession or NewSession)
+  → SessionManager.open_handle(...) / create_handle(...)
+  → read fixed { workspace_id, cwd } from session metadata
+  → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest { reason: SessionOpen, ... })
+      ├─ missing: load cwd-local resources, overlay, replace_cwd(...)
+      └─ stale runtime revision: recompose_cwd(...), replace_cwd(...)
+  → create SessionRuntime { workspace_id, cwd, services }
+  → session_opened / session_focus_changed
+```
+
+`ensure_*` 必须幂等。并发 open session、first turn 或 reload 只能通过 `ResourceSnapshotStore.replace_*` 发布完整的新 snapshot，不能让 UI 事件成为状态更新来源。
+
 ```text
 UI dispatch(ReloadResources)
-  → resources_reload_started { workspace_id }
-  → ResourceLoader.reload()
-      ├─ success: atomically replace RuntimeResources
-      └─ failure: keep old RuntimeResources, collect diagnostics
-  → resources_changed { revision, summaries, diagnostics }
+  → resources_reload_started { workspace_id, cwd }
+  → ResourceManager.reload_cwd(CwdResourceRequest { workspace_id, cwd, ... })
+      ├─ success: build CwdResourceSnapshot { runtime, local, resolved }
+      │          and ResourceSnapshotStore.replace_cwd(workspace_id, cwd, snapshot)
+      └─ failure: keep old CwdResourceSnapshot for cwd, collect diagnostics
+  → resources_changed { workspace_id, cwd, runtime_revision, cwd_revision, summaries, diagnostics }
   → diagnostics_runtime_changed?               // only for runtime-level diagnostics
 ```
 
 `resources_changed` 只传摘要，不传技能全文、context file 正文或完整 system prompt。UI 如果要详情，通过运行时命令读取。
+
+`ResourceSnapshotStore.replace_cwd(...)` 是资源 reload 对后续 turn 生效的原子发布点。runtime 不把新 snapshot 推送到每个 idle `SessionRuntime`；下一次 `SubmitPrompt` / `InvokeSkill` / `InvokePromptTemplate` 真正启动 user turn 时，`SessionRuntime` 会调用 `ResourceManager.capture_turn(...)`，从 store 读取当前已发布的 `CwdResourceSnapshot` 并放入 `TurnState.resources`。
+
+```text
+ReloadResources 完成 replace_cwd(C2)
+  → resources_changed { cwd_revision: C2.revision }
+
+下一次 SubmitPrompt
+  → SessionRuntime::start_user_turn(...)
+  → ResourceManager.capture_turn(...)
+  → ResourceSnapshotStore.current_cwd(...) == C2
+  → TurnState.resources = TurnResourceSnapshot { cwd: Arc<C2> }
+```
+
+如果 submit 在 `replace_cwd` 之前已经开始 capture，它可以合法使用旧 snapshot；如果 submit 在 `replace_cwd` 之后才开始 capture，就必须看到新 snapshot。旧 snapshot 不会被原地修改，正在运行的 turn 继续使用自己已经捕获的 `TurnResourceSnapshot`。
 
 ## Session Open And Focus Lifecycle
 
 ```text
 UI dispatch(OpenSession or FocusSession)
   → open existing runtime or SessionManager.open_and_load(...)
-  → resolve/pin CwdScopedServices { workspace_id, cwd, generation } if newly loaded
+  → ensure ResourceManager has current CwdResourceSnapshot for session { workspace_id, cwd } if newly loaded
   → session_opened { session_id }?             // only if it was not already loaded
   → session_focus_changed { previous_session_id, focused_session_id: session_id }
   → session_phase_changed { phase: idle }
-  → resources_changed?                         // if this cwd generation changed
+  → resources_changed?                         // if this cwd snapshot changed
   → queue_updated                               // active session queue projection
   → session_settled
 ```
 
-多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session，也不应改写旧 session pinned 的 `CwdScopedServices` generation。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
+多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session，也不应改写旧 session 的 fixed cwd、phase、queue、current run 或已经捕获到 `TurnState` 的 `TurnResourceSnapshot`。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
 
 `session_opened` 或 `session_focus_changed` 之后 UI 应重新请求或接收 `agent_runtime_protocol::RuntimeSnapshot`。事件流负责增量变化，snapshot 负责权威恢复。`OpenWorkspace` 本身不自动恢复旧 session；此时 `RuntimeSnapshot.active_session = None`。TUI 的 `/resume` 和 GUI sidebar 通过 `ListSessions` 查询 `SessionManager` 的轻量会话目录。
 

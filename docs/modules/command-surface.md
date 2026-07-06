@@ -28,11 +28,11 @@ Claude Code 的公开行为也说明，slash command 不只用于聊天输入：
 - MiniCore 有多个下游宿主。Ratatui 需要 `/...` 输入，Tauri/Vue 需要 command palette、picker 和配置搜索，CLI 也可以提供命令式入口；它们应该消费同一个 command catalog。
 - 已有能力天然需要文本命令入口：`Compact`、`ReloadResources`、`InvokeSkill`、`InvokePromptTemplate`、`SetModel`、`SetThinkingLevel`、`FocusSession`、`NavigateSessionTree`。
 - 后续所有 runtime-owned UI 配置项都应有 slash command 版本，例如 model、thinking level、stream options、auto compaction、active tools、permissions 和 provider/service tier。
-- skills 和 prompt templates 来自 `ResourceLoader`，UI 不应该读取或解析资源文件。
+- skills 和 prompt templates 来自 `ResourceManager`，UI 不应该读取或解析资源文件。
 - command 可用性依赖 runtime 状态：session 是否 loaded、run 是否进行中、是否 focused、资源 revision、项目是否 trusted、工具/模型能力。
 - 后续 extension/package/MCP command 需要统一名称冲突、source info、diagnostics 和权限边界。
 
-但 slash command 不应该成为新的底层执行通道。它只解析、规划和呈现用户命令；真正执行仍由 `AgentRuntime`、`SessionManager`、`SessionRuntime`、`ResourceLoader`、`Compaction`、`Tools`、`UsageStats` 等模块承接。
+但 slash command 不应该成为新的底层执行通道。它只解析、规划和呈现用户命令；真正执行仍由 `AgentRuntime`、`SessionManager`、`SessionRuntime`、`ResourceManager`、`Compaction`、`Tools`、`UsageStats` 等模块承接。
 
 ## 模块定位
 
@@ -45,7 +45,7 @@ UI Adapter
 AgentRuntime
   ├─ owns CommandSurfaceService
   ├─ exposes slash command catalog in RuntimeSnapshot / events
-  ├─ dispatches resolved command to SessionManager / SessionRuntime / ResourceLoader
+  ├─ dispatches resolved command to SessionManager / SessionRuntime / ResourceManager
   └─ publishes command presentation events
 
 CommandSurfaceService
@@ -55,7 +55,7 @@ CommandSurfaceService
   ├─ normalizes backend outcome into CommandPresentation
   └─ never executes tools, calls model, writes session, or reads resource bodies directly
 
-ResourceLoader
+ResourceManager
   └─ owns SkillCatalog / PromptTemplateCatalog used by command projection
 
 SessionRuntime
@@ -82,8 +82,8 @@ pub enum SlashCommandSource {
 来源职责：
 
 - `Builtin`：由 runtime 定义，例如 `/compact`、`/reload`、`/new`、`/status`、`/usage`、`/model`。
-- `Skill`：由 `ResourceLoader.skills` 投影，推荐稳定形式为 `/skill:{name}`。
-- `PromptTemplate`：由 `ResourceLoader.prompt_templates` 投影，推荐形式为 `/{template_name}`；冲突时可退回 `/prompt:{name}`。
+- `Skill`：由 `ResourceManager.skills` 投影，推荐稳定形式为 `/skill:{name}`。
+- `PromptTemplate`：由 `ResourceManager.prompt_templates` 投影，推荐形式为 `/{template_name}`；冲突时可退回 `/prompt:{name}`。
 - `Extension`：后续由 extension registry 提供 metadata 和 handler，不能绕过 runtime policy。
 - `ModelServiceTier`：后续可像 Codex 一样在 `/model` 附近暴露动态 service tier shortcuts。
 
@@ -343,9 +343,9 @@ MVP 可以让 interaction 的选择结果重新生成 slash command，例如 `/m
 | `/help [command]` | 展示命令目录 | 展示单个命令帮助 | `SlashCommandCatalog` query | message panel |
 | `/status` | 展示 session/runtime/model/resource/usage 摘要 | 后续支持 `detail` | `AgentRuntime.snapshot` / session view | message panel |
 | `/usage` | 展示 usage 摘要 | 后续支持 `detail` | `UsageStats` / snapshot views | message panel，GUI 可 popup |
-| `/reload` | 刷新资源 | 无 | `AgentRuntime` → `ResourceLoader` | lifecycle events + reload summary message |
+| `/reload` | 刷新资源 | 无 | `AgentRuntime` → `ResourceManager` | lifecycle events + reload summary message |
 | `/compact [instructions]` | 手动压缩 | 压缩时附加说明 | `SessionRuntime` → `Compaction` | started/final command output + compaction events |
-| `/skill:{name} [args]` | 调用技能 | 附加说明 | `SessionRuntime` + `Skills` + `ResourceLoader` metadata | 可选 invoked message + run events |
+| `/skill:{name} [args]` | 调用技能 | 附加说明 | `SessionRuntime` + `Skills` + `ResourceManager` metadata | 可选 invoked message + run events |
 | `/{template} [args]` | 展开 prompt template | 模板参数 | `SessionRuntime` + prompt template catalog | 可选 expanded message + run events |
 | `/model` | 打开 model picker | `SetModel` | `SessionRuntime` model state | picker；设置后 message |
 | `/thinking` | 打开 thinking picker | `SetThinkingLevel` | `SessionRuntime` thinking state | picker；设置后 message |
@@ -371,20 +371,22 @@ MVP 可以让 interaction 的选择结果重新生成 slash command，例如 `/m
 
 ## 与现有流程结合
 
-### ResourceLoader
+### ResourceManager
 
-`ResourceLoader` 仍然拥有技能和提示模板生命周期。资源 reload 后：
+`ResourceManager` 仍然负责加载技能和提示模板候选、执行 cwd-over-runtime overlay，并在 `CwdResourceSnapshot.resolved` 中提供 effective metadata。资源 reload 后：
 
 ```text
-ResourceLoader.reload()
-  → RuntimeResources revision changed
-  → AgentRuntime rebuilds SlashCommandCatalog projection
+ResourceManager.reload_cwd(CwdResourceRequest { cwd, ... })
+  → build CwdResourceSnapshot { runtime, local, resolved }
+  → ResourceSnapshotStore.replace_cwd(cwd, snapshot)
+  → cwd resource revision changed
+  → AgentRuntime rebuilds SlashCommandCatalog projection from resolved summaries
   → runtime snapshot state updated
   → resources_changed
   → slash_commands_changed?   // 当 catalog 内容或可用性变化时
 ```
 
-`CommandSurface` 只读取资源摘要和 metadata，不读取技能正文。技能正文读取仍发生在 `SessionRuntime::invoke_skill`。
+`CommandSurface` 只读取资源摘要和 metadata，不读取技能正文。技能正文读取仍发生在 `SessionRuntime::invoke_skill`，但必须来自 captured `TurnResourceSnapshot`，不能绕过 snapshot 重新读文件。
 
 ### AgentRuntimeProtocol
 

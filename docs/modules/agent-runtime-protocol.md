@@ -93,7 +93,7 @@ pub enum Command {
     SetActiveTools { session_id: SessionId, tool_names: Vec<String> },
     SetQueueMode { session_id: SessionId, queue: QueueKind, mode: QueueMode },
     SetStreamOptions { session_id: SessionId, options: StreamOptions },
-    ReloadResources { workspace_id: WorkspaceId },
+    ReloadResources { workspace_id: WorkspaceId, cwd: PathBuf },
     Compact { session_id: SessionId, instructions: Option<String> },
     ExecuteSlashCommand { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode },
 }
@@ -116,7 +116,7 @@ pub struct SessionListFilter {
 pub struct PageCursor(pub String);
 ```
 
-`RuntimeResources` 不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceLoader` 的 source info、project trust、diagnostics 和 atomic reload 语义。
+`RuntimeResourceSnapshot`、`CwdResourceSnapshot` 或 `TurnResourceSnapshot` 都不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources { workspace_id, cwd }`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceManager` 的 source info、project trust、overlay policy、diagnostics 和 atomic publish 语义。
 
 `ExecuteSlashCommand` 只提交原始 `/...` invocation；Parse / Plan / Execute / Present 由运行时的 [CommandSurface](command-surface.md) 模块和 `AgentRuntime` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteSlashCommand` 或 runtime-provided interaction submit action；专用设置控件可以直接提交结构化 command，但必须复用同一后端校验、事件和 command presentation 规则。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
 
@@ -129,10 +129,10 @@ SetSessionName { session_id: SessionId, name: String }
 DeleteSession { session_id: SessionId }
 CloseSession { session_id: SessionId }
 ImportSession { workspace_id: WorkspaceId, input_path: PathBuf, cwd_override: Option<PathBuf> }
-ListSkills { workspace_id: WorkspaceId }
-GetSkill { workspace_id: WorkspaceId, skill_name: String }
-GetPromptTemplate { workspace_id: WorkspaceId, template_name: String }
-GetContextFile { workspace_id: WorkspaceId, path: PathBuf }
+ListSkills { workspace_id: WorkspaceId, cwd: PathBuf }
+GetSkill { workspace_id: WorkspaceId, cwd: PathBuf, skill_name: String }
+GetPromptTemplate { workspace_id: WorkspaceId, cwd: PathBuf, template_name: String }
+GetContextFile { workspace_id: WorkspaceId, cwd: PathBuf, path: PathBuf }
 GetEffectivePrompt { session_id: SessionId }
 CompleteSlashCommandArgs { session_id: Option<SessionId>, command_name: String, prefix: String }
 GetSlashCommandCatalog { session_id: Option<SessionId> }
@@ -149,7 +149,7 @@ GetSessionStats { session_id: SessionId }
 GetContextUsage { session_id: SessionId }
 ```
 
-`GetSkill`、`GetPromptTemplate`、`GetContextFile` 和 `GetEffectivePrompt` 是后续资源详情查询，不是会话运行命令，也不应改变 resource revision。实现时可以把它们做成 request/response 形式的 protocol query，或做成 `dispatch()` 后产生明确 response event 的命令；无论采用哪种 transport，读取都必须经过 `AgentRuntime` / `ResourceLoader`，不能让 UI adapter 直接读文件。`GetEffectivePrompt` 可能包含工具状态和项目上下文，默认应作为 debug/privileged query，而不是普通 snapshot 字段。
+`GetSkill`、`GetPromptTemplate`、`GetContextFile` 和 `GetEffectivePrompt` 是后续资源详情查询，不是会话运行命令，也不应改变 resource revision。实现时可以把它们做成 request/response 形式的 protocol query，或做成 `dispatch()` 后产生明确 response event 的命令；无论采用哪种 transport，读取都必须经过 `AgentRuntime` / `ResourceManager`，不能让 UI adapter 直接读文件。`GetSkill` / `GetPromptTemplate` 读取 current `CwdResourceSnapshot.resolved`，`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 context file canonical path。`GetEffectivePrompt` 可能包含工具状态和项目上下文，默认应作为 debug/privileged query，而不是普通 snapshot 字段。
 
 `DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`ToolApprovalBroker` 必须确认 `session_id`、`run_id`、`call_id` 仍匹配当前 pending tool call。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
 
@@ -264,8 +264,8 @@ pub enum UsageEvent {
 }
 
 pub enum ResourcesEvent {
-    ReloadStarted { workspace_id: WorkspaceId },
-    Changed { workspace_id: WorkspaceId, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
+    ReloadStarted { workspace_id: WorkspaceId, cwd: PathBuf },
+    Changed { workspace_id: WorkspaceId, cwd: PathBuf, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
 }
 
 pub enum SlashCommandEvent {
@@ -663,6 +663,8 @@ pub struct SessionCatalogSummary {
 pub struct SessionCatalogRevision(pub u64);
 
 pub struct ResourceSnapshotSummary {
+    pub workspace_id: Option<WorkspaceId>,
+    pub cwd: Option<PathBuf>,
     pub revision: Option<ResourceRevision>,
     pub skills: Vec<SkillSummary>,
     pub prompt_templates: Vec<PromptTemplateSummary>,
@@ -678,6 +680,8 @@ pub struct CommandSurfaceSnapshot {
 ```
 
 `active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+
+`RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 
 `SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `ListSessions`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
 
