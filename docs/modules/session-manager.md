@@ -8,12 +8,14 @@
 
 ## 核心模型
 
-- `SessionManager` 是工作区内会话生命周期 facade，负责 persistent session catalog、loaded runtime map、focused session、create/open/list/delete/fork/focus/close，并隐藏内存存储与 JSONL 文件存储的差异。
+- `SessionManager` 是工作区内会话生命周期 facade，负责 persistent session catalog / `SessionIndex`、loaded runtime map、focused session、create/open/list/delete/fork/focus/close，并隐藏内存存储与 JSONL 文件存储的差异。
 - `LoadedSessionRuntimes` 是 `SessionManager` 内部的 live runtime map，负责登记、查找、替换、关闭已加载的 `SessionRuntime`；它不是独立架构模块，也不读写 session entries。
 - `SessionHandle` 是单会话领域对象，暴露追加条目、构建上下文、移动当前叶子、读取标签和会话名等行为。文档和实现中应优先使用 `SessionHandle`，避免把它简称为容易和完整会话概念混淆的 `Session`。
 - `SessionStorage` 是单会话底层存储 interface，负责 entry、leaf 和 metadata 的读写。
 
 `AgentRuntime` 对 UI 暴露会话命令和快照，但内部通过 `SessionManager` 打开会话、创建 `SessionHandle`、加载 `SessionRuntime`、切换 focused session。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。
+
+`SessionIndex` 是 `SessionManager` 的轻量会话目录，不是 `RuntimeSnapshot`。它用于 `/resume`、GUI sidebar 和 `ListSessions`，可以由 JSONL header、session metadata、本地 index/cache 或数据库投影维护。它只包含 session id、workspace/cwd、名称、时间、预览、轻量模型/思考等级/usage 摘要和诊断，不包含完整 messages、当前 run、pending approval、队列或 UI 状态。打开窗口时不需要为了生成 `RuntimeSnapshot` 重建所有 session；只有用户执行 `OpenSession` 或创建新会话时才加载对应 `SessionRuntime` 并重建完整 session projection。
 
 ## Interface
 
@@ -44,6 +46,8 @@ pub trait SessionStorage {
     async fn get_path_to_root(&self, leaf_id: Option<EntryId>) -> Result<Vec<SessionEntry>, SessionError>;
 }
 ```
+
+`SessionListFilter` 必须支持按 workspace scope 查询。TUI 的 `/resume` 默认列出当前 workspace 的会话；GUI sidebar 也应通过 `ListSessions(CurrentWorkspace)` 或显式 workspace scope 读取清单。`/resume --all`、全局 recent view 或跨 workspace 搜索可以作为后续增强，但默认不应把所有工作区的 session 混在一起。
 
 运行时加载使用 factory，factory 由 `AgentRuntime` 提供并捕获当前 `RuntimeServices`，避免 `SessionManager` 直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 的构造细节：
 

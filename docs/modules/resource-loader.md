@@ -330,7 +330,7 @@ resources changed OR active tools changed OR tool prompt snippets changed
 
 这保持了 pi 的模式：`ResourceLoader` 提供素材，`AgentSession` 提供会话态，`system-prompt.ts` 做纯拼装。
 
-## AgentRuntimeEvents And Snapshot
+## AgentRuntimeEvents And RuntimeSnapshot
 
 资源重载事件遵循 `resources_reload_started` → `resources_changed`，生命周期顺序以 [AgentRuntimeEvents](agent-runtime-events.md) 为准。`resources_changed` 表示新 revision 已经原子替换；失败 reload 应保留旧 revision，并通过 diagnostics 告知 UI。
 
@@ -349,7 +349,7 @@ resources_changed {
 }
 ```
 
-`agent_runtime_protocol::Snapshot` 也只放 summary 和 diagnostics。UI 需要预览详情时应走命令：
+`agent_runtime_protocol::RuntimeSnapshot.resources` 也只放 summary 和 diagnostics。UI 需要预览详情时应走命令：
 
 - `GetSkill`。
 - `GetPromptTemplate`。

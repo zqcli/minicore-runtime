@@ -46,7 +46,7 @@ SessionRuntime
 | pi `AgentSession` 方法/属性 | 本项目能力 |
 | --- | --- |
 | `subscribe(listener)` / `dispose()` | `agent_runtime_protocol::Event` 订阅和会话运行时释放 |
-| `state` / `messages` / `isStreaming` | `agent_runtime_protocol::Snapshot.messages`、`current_run`、`SessionPhase` |
+| `state` / `messages` / `isStreaming` | `agent_runtime_protocol::RuntimeSnapshot.active_session.messages`、`current_run`、`SessionPhase` |
 | `prompt(text, options)` | `SubmitPrompt` |
 | `_expandSkillCommand` | `InvokeSkill` |
 | `promptTemplates` / `expandPromptTemplate` | `InvokePromptTemplate` |
@@ -180,7 +180,7 @@ SessionRuntime
   → updates SessionUsageStats
   → computes ContextUsage from projected TurnState
   → emits usage_updated
-  → includes usage in run_finished and agent_runtime_protocol::Snapshot
+  → includes usage in run_finished and agent_runtime_protocol::RuntimeSnapshot.active_session
 ```
 
 `UsageSummary` 是一次 run 内所有模型调用的消耗汇总，不是最后一次模型调用。一次 run 如果经历 `model -> tools -> model -> tools -> model`，`run_finished { usage }` 必须覆盖这几次模型调用。
@@ -189,7 +189,7 @@ SessionRuntime
 
 压缩只改变 `ContextUsageView.current_tokens`，不减少 `SessionStatsView.total_usage`。会话累计消耗是历史账本；当前上下文占用是窗口状态。
 
-`usage_updated` 是实时 UI 事件，不代表 stats 已经持久化。可恢复边界仍然由 `persistence_save_point` 表达。UI 重连时以 `agent_runtime_protocol::Snapshot.session_stats` 和 `agent_runtime_protocol::Snapshot.context_usage` 为权威恢复显示。
+`usage_updated` 是实时 UI 事件，不代表 stats 已经持久化。可恢复边界仍然由 `persistence_save_point` 表达。UI 重连时以 `agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage` 为权威恢复显示。
 
 ## RuntimeHooks
 

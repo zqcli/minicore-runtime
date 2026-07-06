@@ -478,7 +478,7 @@ pub enum ContextVisibility {
 
 压缩后的重试不要使用 `DriveEntry::Resume`。应使用重建后的 session context 启动新的 `DriveEntry::Continue`。
 
-## AgentRuntimeEvents And Snapshot
+## AgentRuntimeEvents And RuntimeSnapshot
 
 压缩相关事件沿用 `AgentRuntimeProtocol`，生命周期顺序以 [AgentRuntimeEvents](agent-runtime-events.md) 为准：
 

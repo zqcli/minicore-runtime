@@ -172,12 +172,12 @@ SessionRuntime event sink
 
 `Driver`、`ToolGateway`、`ResourceLoader`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
 
-### Snapshot 水位
+### RuntimeSnapshot 水位
 
-`agent_runtime_protocol::Snapshot.last_event_sequence` 是 UI 看到的权威状态水位：
+`agent_runtime_protocol::RuntimeSnapshot.last_event_sequence` 是 UI 看到的权威状态水位：
 
 ```text
-snapshot contains state reduced through sequence = N
+RuntimeSnapshot contains state reduced through sequence = N
 event stream contains events N+1, N+2, ...
 UI ignores events <= N
 ```
@@ -188,11 +188,11 @@ UI ignores events <= N
 expected sequence = N + 1
 received sequence > N + 1
   → discard local incremental assumptions
-  → request fresh snapshot
+  → request fresh RuntimeSnapshot
   → continue from new snapshot.last_event_sequence
 ```
 
-session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 snapshot 或新事件恢复。
+session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot` 或新事件恢复。关闭窗口后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 active session。
 
 ## Command Ack
 
@@ -207,7 +207,7 @@ session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 
 
 ## Event Families
 
-| Family | Wire event type 示例 | 生命周期 | 是否可由 snapshot 重建 |
+| Family | Wire event type 示例 | 生命周期 | 是否可由 RuntimeSnapshot 重建 |
 | --- | --- | --- | --- |
 | session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_focus_changed`、`session_tree_changed` | 离散事实 | 是 |
 | run lifecycle | `run_started`、`run_finished` | started -> terminal | 是，当前 run 只能部分重建 |
@@ -238,7 +238,7 @@ session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
 | `RuntimeHooks` | 不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
 
-这比“每个模块都能 emit”更深：事件 routing、顺序、持久化和 snapshot 归约集中在 `AgentRuntime` / `SessionRuntime`，UI 不需要知道内部模块图。
+这比“每个模块都能 emit”更深：事件 routing、顺序、持久化和 RuntimeSnapshot 投影集中在 `AgentRuntime` / `SessionRuntime`，UI 不需要知道内部模块图。
 
 ## Event And State Ownership
 
@@ -248,9 +248,9 @@ session JSONL 不是 runtime event log。不能要求 UI 通过 session entries 
 
 | 层级 | 持有/管理的状态 | 负责发布或归约的 UI wire events | 只消费/返回，不拥有的事件 |
 | --- | --- | --- | --- |
-| UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::Snapshot` |
+| UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`RuntimeServices`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、resource state view、compaction/retry state、pending session writes、snapshot reducer state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、resource state view、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `ToolGateway` | 单次 tool invocation 的治理上下文、policy evaluation、approval wait、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 registry/policy/approval/executor/hook；返回 `ToolInvocationResult` |
@@ -347,7 +347,7 @@ ToolRegistry / ActiveToolSet / ToolGateway
 CompactionState
 RetryState
 RuntimeHookRegistry
-Snapshot reducer state
+RuntimeSnapshot projection state
 SessionHandle
 ```
 
@@ -600,7 +600,7 @@ run terminal status
 UI 的权威输入只有：
 
 ```text
-agent_runtime_protocol::Snapshot
+agent_runtime_protocol::RuntimeSnapshot
 agent_runtime_protocol::Event stream
 CommandAck
 ```
@@ -616,11 +616,11 @@ CommandAck
 7. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry，且没有同步马上要启动的 continuation 时发出。
 8. `diagnostics_error` 不替代 terminal event。run 内失败需要 `diagnostics_error` + `run_finished { status: failed }`；abort 需要 `run_finished { status: aborted }`。
 9. `resources_changed` 表示新 resource revision 已经原子替换；失败 reload 不应污染旧 revision。
-10. UI reducer 必须能从任意 `agent_runtime_protocol::Snapshot` 加之后续事件恢复一致状态。
+10. UI reducer 必须能从任意 `agent_runtime_protocol::RuntimeSnapshot` 加之后续事件恢复一致状态。
 
 ## Lifecycle State Machines
 
-下面列出不同层级的状态机。它们不是都要暴露成 enum；只有 UI 需要稳定观察的状态才进入 `agent_runtime_protocol::Event` 或 `agent_runtime_protocol::Snapshot`。
+下面列出不同层级的状态机。它们不是都要暴露成 enum；只有 UI 需要稳定观察的状态才进入 `agent_runtime_protocol::Event` 或 `agent_runtime_protocol::RuntimeSnapshot`。
 
 ### 1. Command Lifecycle
 
@@ -732,7 +732,7 @@ PersistedSession
 - `session_deleted`
 - `session_imported`
 
-`session_opened` 表示运行时已创建 `SessionRuntime` 并可 snapshot；不表示当前正在跑 agent。
+`session_opened` 表示运行时已创建 `SessionRuntime` 并可进入 `RuntimeSnapshot.active_session`；不表示当前正在跑 agent。
 
 多 session 同时 loaded 时，打开新 session 不要求关闭旧 session。`session_closed` 只表示 runtime 从 `LoadedSessionRuntimes` 卸载，不表示从 catalog 删除。
 
@@ -921,7 +921,7 @@ Required
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
-审批状态不能由 UI 私有保存为权威状态；UI 重连后从 snapshot 的 pending tool calls 恢复。
+审批状态不能由 UI 私有保存为权威状态；UI 重连后从 `RuntimeSnapshot.active_session` 的 pending tool calls 恢复。
 
 ### 14. Queue Lifecycle
 
@@ -1034,7 +1034,7 @@ Stable(revision=N)
 
 `resources_changed` 必须携带当前有效 revision。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
 
-`slash_commands_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 snapshot 或该事件中的 catalog 为准。
+`slash_commands_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command_surface` 或该事件中的 catalog 为准。
 
 ### 19. Persistence Lifecycle
 
@@ -1125,7 +1125,7 @@ Reconnect 是 UI adapter 的消费流程。
 Connected(sequence=N)
   → Disconnected
   → Resubscribe
-  → Snapshot(last_event_sequence=M)
+  → RuntimeSnapshot(last_event_sequence=M)
   → Apply events with sequence > M
   → Connected
 ```
@@ -1134,11 +1134,11 @@ Connected(sequence=N)
 
 ```text
 Expected K, received K+n
-  → request fresh snapshot
+  → request fresh RuntimeSnapshot
   → drop buffered assumptions
 ```
 
-这也是为什么 snapshot 必须包含 UI 渲染所需的权威状态，而不是只包含 session messages。
+这也是为什么 RuntimeSnapshot 必须包含 UI 渲染所需的权威状态，而不是只包含 session messages。
 
 ## Submit Prompt Lifecycle
 
@@ -1273,21 +1273,21 @@ UI dispatch(OpenSession or FocusSession)
   → session_focus_changed { previous_session_id, focused_session_id: session_id }
   → session_phase_changed { phase: idle }
   → resources_changed?                         // if workspace resources changed
-  → queue_updated                               // snapshot of focused session queues
+  → queue_updated                               // active session queue projection
   → session_settled
 ```
 
 多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
 
-`session_opened` 或 `session_focus_changed` 之后 UI 应重新请求或接收 `agent_runtime_protocol::Snapshot`。事件流负责增量变化，snapshot 负责权威恢复。
+`session_opened` 或 `session_focus_changed` 之后 UI 应重新请求或接收 `agent_runtime_protocol::RuntimeSnapshot`。事件流负责增量变化，snapshot 负责权威恢复。`OpenWorkspace` 本身不自动恢复旧 session；此时 `RuntimeSnapshot.active_session = None`。TUI 的 `/resume` 和 GUI sidebar 通过 `ListSessions` 查询 `SessionManager` 的轻量会话目录。
 
-## Snapshot And Reconnect
+## RuntimeSnapshot And Reconnect
 
 推荐订阅流程：
 
 ```text
 subscribe() -> agent_runtime_protocol::EventStream
-snapshot(session_id) -> Snapshot { last_event_sequence }
+snapshot() -> RuntimeSnapshot { last_event_sequence }
 reduce events with sequence > snapshot.last_event_sequence
 ```
 
@@ -1297,7 +1297,7 @@ reduce events with sequence > snapshot.last_event_sequence
 fn subscribe_after(sequence: u64) -> agent_runtime_protocol::EventStream;
 ```
 
-MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 agent_runtime_protocol::Event log。断线较久时 UI 重新 snapshot，而不是要求 runtime replay 所有旧事件。
+MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 agent_runtime_protocol::Event log。断线较久时 UI 重新请求 RuntimeSnapshot，而不是要求 runtime replay 所有旧事件。
 
 ## AgentRuntimeProtocol Reference
 
@@ -1317,4 +1317,4 @@ MVP event lifecycle tests 应覆盖：
 - slash command view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
 - slash command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过结构化 command 或新的 `ExecuteSlashCommand` 完成设置。
 - slash command semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
-- reconnect：snapshot sequence 后的事件可正确 reduce。
+- reconnect：RuntimeSnapshot sequence 后的事件可正确 reduce。

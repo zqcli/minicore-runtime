@@ -11,7 +11,7 @@ Usage / Cost Tokens != Context Usage
 - `Usage` 表示模型调用真实消耗，用于展示本次 run、会话累计和后续成本估算。
 - `ContextUsage` 表示下一次模型请求会占用多少上下文窗口，用于上下文进度条、预检和压缩触发。
 
-UI 不应自己从消息估算 token。UI 只消费 `usage_updated`、`run_finished { usage }`、`agent_runtime_protocol::Snapshot.session_stats` 和 `agent_runtime_protocol::Snapshot.context_usage`。
+UI 不应自己从消息估算 token。UI 只消费 `usage_updated`、`run_finished { usage }`、`agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage`。
 
 ## 参考经验
 
@@ -220,7 +220,7 @@ SessionHandle / SessionStorage
   do not calculate realtime stats.
 
 UI
-  renders usage views from agent_runtime_protocol::Event / agent_runtime_protocol::Snapshot;
+  renders usage views from agent_runtime_protocol::Event / agent_runtime_protocol::RuntimeSnapshot;
   does not calculate authoritative token usage.
 ```
 
@@ -264,7 +264,7 @@ pub enum UsagePurpose {
 
 这样 UI 后续可以区分正常回答、压缩摘要、retry 和后台任务的 token 消耗。
 
-## AgentRuntimeEvents And Snapshot
+## AgentRuntimeEvents And RuntimeSnapshot
 
 `usage_updated` 是实时 UI 更新事件，生命周期顺序以 [AgentRuntimeEvents](agent-runtime-events.md) 为准；它不代表持久化完成。可恢复边界仍然看 `persistence_save_point`。
 
@@ -285,7 +285,7 @@ resources/tools/system prompt changed
   → usage_updated { context_usage estimated with new prompt materials }
 ```
 
-`agent_runtime_protocol::Snapshot` 应包含 `session_stats: Option<SessionStatsView>` 和 `context_usage: Option<ContextUsageView>`。完整结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
+`agent_runtime_protocol::RuntimeSnapshot.active_session` 应包含 `session_stats: Option<SessionStatsView>` 和 `context_usage: Option<ContextUsageView>`。完整结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
 
 UI 重连后应以 snapshot 为权威恢复 usage 面板，而不是要求 runtime 重放所有历史 `usage_updated`。
 

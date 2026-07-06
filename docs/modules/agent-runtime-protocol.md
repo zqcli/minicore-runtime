@@ -4,7 +4,7 @@
 
 事件命名、顺序、持久化屏障、重连和各场景生命周期详见 [AgentRuntimeEvents](agent-runtime-events.md)。本文件只保留 UI 需要依赖的协议类型。
 
-Rust 模块名建议使用 `agent_runtime_protocol`。模块内类型保持短名：`Command`、`CommandAck`、`Event`、`EventMsg`、`Snapshot`、`EventStream`；跨模块引用时使用完整路径，例如 `agent_runtime_protocol::Command`。如果未来需要在 crate root 或 SDK 中 re-export，可以提供 `AgentRuntimeCommand`、`AgentRuntimeEvent` 等别名，但它们不是新的领域概念。
+Rust 模块名建议使用 `agent_runtime_protocol`。模块内类型保持短名：`Command`、`CommandAck`、`Event`、`EventMsg`、`RuntimeSnapshot`、`EventStream`；跨模块引用时使用完整路径，例如 `agent_runtime_protocol::Command`。如果未来需要在 crate root 或 SDK 中 re-export，可以提供 `AgentRuntimeCommand`、`AgentRuntimeEvent` 等别名，但它们不是新的领域概念。
 
 ## 公共 Interface
 
@@ -14,7 +14,7 @@ use crate::agent_runtime_protocol as protocol;
 pub trait AgentRuntime {
     async fn dispatch(&self, command: protocol::Command) -> Result<protocol::CommandAck, RuntimeError>;
     fn subscribe(&self) -> protocol::EventStream;
-    async fn snapshot(&self, session_id: SessionId) -> Result<protocol::Snapshot, RuntimeError>;
+    async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
 ```
 
@@ -75,7 +75,7 @@ pub enum Command {
     NewSession { workspace_id: WorkspaceId },
     OpenSession { session_id: SessionId },
     FocusSession { session_id: SessionId },
-    ListSessions { workspace_id: WorkspaceId },
+    ListSessions { scope: SessionListScope, filter: Option<SessionListFilter>, cursor: Option<PageCursor>, limit: usize },
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: DeliveryMode },
     InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: DeliveryMode },
     InvokePromptTemplate { session_id: SessionId, template_name: String, args: Vec<String>, delivery: DeliveryMode },
@@ -96,8 +96,24 @@ pub enum Command {
     ReloadResources { workspace_id: WorkspaceId },
     Compact { session_id: SessionId, instructions: Option<String> },
     ExecuteSlashCommand { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode },
-    GetSnapshot { session_id: SessionId },
 }
+```
+
+`ListSessions` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`；GUI sidebar 也应通过同一查询分页/过滤读取当前 workspace 的 session 清单，而不是直接读取本地 index 文件。`ListSessions` 是读取型 protocol query：SDK / JSON-RPC transport 可以把它实现为 request/response；如果某个 transport 只能走 `dispatch(Command)`，也必须通过明确 response event 或 interaction 返回列表，不能把 session list 塞进 `CommandAck`。
+
+```rust
+pub enum SessionListScope {
+    CurrentWorkspace,
+    Workspace { workspace_id: WorkspaceId },
+    AllWorkspaces,
+    Recent,
+}
+
+pub struct SessionListFilter {
+    pub query: Option<String>,
+}
+
+pub struct PageCursor(pub String);
 ```
 
 `RuntimeResources` 不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceLoader` 的 source info、project trust、diagnostics 和 atomic reload 语义。
@@ -593,26 +609,38 @@ pub struct CompactionResultView {
 
 完整压缩摘要属于 session entry 内容，默认不进入快照的大列表预览。UI 展开压缩块时应通过运行时命令读取对应 session entry，而不是直接读 JSONL 文件。
 
-## Snapshot
+## RuntimeSnapshot
 
-`snapshot()` 用于 UI 初始加载、窗口恢复和事件流重连。快照应包含 UI 渲染所需的权威状态，但不暴露不必要的敏感内容。
+`snapshot()` 用于 UI 初始加载、窗口恢复和事件流重连。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
+
+MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped：打开 workspace 后默认不聚焦任何 session，`active_session` 为空。TUI 可在用户执行 `/resume` 时再通过 `ListSessions` 获取当前 workspace 的会话清单；GUI 如果需要 sidebar，也应通过 `ListSessions` 或会话目录 query 获取清单，而不是要求 `RuntimeSnapshot` 默认携带完整 `Vec<SessionSummary>`。
 
 ```rust
-pub struct Snapshot {
+pub struct RuntimeSnapshot {
     pub last_event_sequence: u64,
+
     pub workspace: Option<WorkspaceSummary>,
-    pub focused_session_id: Option<SessionId>,
-    pub session: Option<SessionSummary>,
-    pub sessions: Vec<SessionSummary>,
+    pub active_session_id: Option<SessionId>,
+    pub active_session: Option<SessionSnapshot>,
+    pub session_catalog: Option<SessionCatalogSummary>,
+
     pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
     pub model_fallback_message: Option<String>,
+
+    pub providers: Vec<ProviderSummary>,
+    pub models: Vec<ModelSummary>,
+
+    pub resources: ResourceSnapshotSummary,
+    pub command_surface: CommandSurfaceSnapshot,
+}
+
+pub struct SessionSnapshot {
+    pub session: SessionSummary,
     pub session_tree: Option<SessionTreeView>,
     pub messages: Vec<MessageView>,
     pub phase: SessionPhase,
     pub current_run: Option<RunView>,
     pub model: Option<ModelSummary>,
-    pub providers: Vec<ProviderSummary>,
-    pub models: Vec<ModelSummary>,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
     pub retry_attempt: u32,
@@ -620,21 +648,36 @@ pub struct Snapshot {
     pub auto_compaction_enabled: bool,
     pub active_tools: Vec<ToolSummary>,
     pub tools: Vec<ToolSummary>,
-    pub resource_revision: Option<ResourceRevision>,
+    pub queues: QueueSnapshot,
+    pub session_stats: Option<SessionStatsView>,
+    pub context_usage: Option<ContextUsageView>,
+}
+
+pub struct SessionCatalogSummary {
+    pub revision: SessionCatalogRevision,
+    pub total_count: u64,
+}
+
+pub struct SessionCatalogRevision(pub u64);
+
+pub struct ResourceSnapshotSummary {
+    pub revision: Option<ResourceRevision>,
     pub skills: Vec<SkillSummary>,
     pub prompt_templates: Vec<PromptTemplateSummary>,
     pub context_files: Vec<ContextFileSummary>,
     pub system_prompt: Option<TextResourceSummary>,
     pub append_system_prompts: Vec<TextResourceSummary>,
-    pub resource_diagnostics: Vec<ResourceDiagnostic>,
+    pub diagnostics: Vec<ResourceDiagnostic>,
+}
+
+pub struct CommandSurfaceSnapshot {
     pub slash_commands: Vec<SlashCommandSummary>,
-    pub queues: QueueSnapshot,
-    pub session_stats: Option<SessionStatsView>,
-    pub context_usage: Option<ContextUsageView>,
 }
 ```
 
-`focused_session_id` 是 runtime-visible 的当前默认会话目标。`session_stats` 是会话累计模型调用消耗；`context_usage` 是当前会话投影到下一次模型请求时的上下文窗口占用。UI 的 usage 面板应以这些 snapshot 字段和后续 `session_focus_changed` / `usage_updated` 为权威，不应自行从消息内容估算 token。
+`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+
+`SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `ListSessions`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
 
 资源摘要类型只暴露来源和展示信息，不暴露大文本正文：
 
@@ -693,11 +736,11 @@ pub enum SlashCommandPhasePolicy {
 }
 ```
 
-技能全文、context file 正文和完整 system prompt 默认不进入快照。UI 如果需要预览技能详情，应通过 `GetSkill` 命令请求；后续可增加 `GetPromptTemplate`、`GetContextFile` 或 `GetEffectivePrompt`。
+技能全文、context file 正文和完整 system prompt 默认不进入 `RuntimeSnapshot`。UI 如果需要预览技能详情，应通过 `GetSkill` 命令请求；后续可增加 `GetPromptTemplate`、`GetContextFile` 或 `GetEffectivePrompt`。
 
 ## Downstream Adapter 调用方式
 
-MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。
+MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：连接 runtime，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI 如果需要 sidebar，应单独调用 `ListSessions`。
 
 Ratatui：
 

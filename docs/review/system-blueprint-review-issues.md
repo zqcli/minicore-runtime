@@ -12,13 +12,16 @@
 
 - `Open`：待分析或待处理。
 - `Resolved`：已经处理并验证。
+- `Partially Resolved`：核心方向已收敛，但仍有后续场景或配套问题需要处理。
 - `Won't Fix`：确认接受现状或暂不处理。
 
 ## 高风险
 
 ### BR-001：Snapshot 作用域尚未收敛，但已作为公开接口固化
 
-状态：Open
+状态：Resolved
+
+处理记录：已决策为 MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不再使用 `snapshot(session_id)`；`RuntimeSnapshot` 不单独持久化，打开 workspace 后默认 `active_session = None`。会话清单改由 `SessionIndex` / `ListSessions` 提供。
 
 问题：`snapshot(session_id)` 已经写入公开 runtime interface，但路线图同时指出 Snapshot scope 尚未决定。当前 Snapshot 又包含 workspace/session catalog、focused session、resources、slash commands、session state 等混合范围字段。
 
@@ -32,11 +35,13 @@
 
 风险：早期协议、事件重连、adapter reducer 和下游接入会围绕错误粒度实现；后续拆分 Snapshot 会造成协议级返工。
 
-待处理方向：先决定 Snapshot 是 workspace-scoped、session-scoped、还是拆成两类；再更新 protocol、event reconnect 和 `/status` 查询语义。
+待处理方向：已收敛。后续如果 GUI 多 tab、多 session detail 或大规模分页需求明确，再评估拆分 `WorkspaceSnapshot` / `SessionSnapshot`。
 
 ### BR-002：全局事件 sequence 与单 session snapshot 组合可能导致后台 session 状态丢失
 
-状态：Open
+状态：Partially Resolved
+
+处理记录：`snapshot(session_id)` 已改为 `snapshot() -> RuntimeSnapshot`，避免单 session snapshot 携带全局水位。MVP 产品语义不要求窗口重开后恢复后台 run；打开 workspace 默认无 active session，用户通过 `/resume` 或 GUI sidebar 显式打开旧 session。
 
 问题：事件 sequence 是 runtime 全局单调递增，Snapshot 带 `last_event_sequence`，但公开接口是 `snapshot(session_id)`。多 session 同时 loaded、失焦 session 后台运行时，如果 UI 只拿某个 session 的 snapshot 并跳过 `<= last_event_sequence` 的事件，其他 session 在该水位前的状态可能不可恢复。
 
