@@ -417,3 +417,205 @@ ProcessSessionRuntimeHost
 中期建议：先实现 `WorkspaceServices + ResourceSnapshotStore + LoadedSessionRuntimes` 的纵切，验证同一 UI 下多个 session 同时 running、reload 只影响 future turn、run 使用启动时捕获的 resource snapshot。
 
 长期如果要模仿 Claude Code：让 `AgentRuntime` 演进为 supervisor，管理多个 `SessionWorker` process、worktree、event multiplexing、approval routing 和 attach/detach。届时需要重新处理 UI reconnect / RuntimeSnapshot 范围问题，并重新评估是否需要 worker-local services。
+
+## Tool 子系统待收敛讨论
+
+日期：2026-07-07
+
+背景：本轮已先将 pending tool approval 的恢复语义落入正式文档：active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，`ToolApprovalBroker` 继续持有冻结的 `prepared_args`。下列内容是后续 tool 子系统优化方向，尚未写入正式模块规范。
+
+### Approval request lifecycle
+
+建议在现有 `session_id + run_id + call_id` 之外新增稳定 `ApprovalRequestId`，让 UI、日志、去重和 stale response 处理更明确。
+
+`PendingToolApprovalView` 后续可扩展为：
+
+```rust
+pub struct PendingToolApprovalView {
+    pub approval_id: ApprovalRequestId,
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    pub risk: ToolRisk,
+    pub reason: String,
+    pub preview: ToolApprovalPreview,
+    pub created_at: Timestamp,
+}
+```
+
+`DecideToolApproval` 后续可同时携带 `approval_id` 与三元组，broker 必须校验它们仍匹配同一个 pending approval。批准后只能执行 broker 内部冻结的 `prepared_args`。
+
+### Duplicate / stale decision handling
+
+重复审批必须有明确语义，避免 UI 双击、快捷键重复触发或旧 snapshot 里的按钮导致工具重复执行。
+
+建议定义 outcome：
+
+```rust
+pub enum ApprovalDecisionOutcome {
+    Accepted,
+    AlreadyResolved { original_decision: ToolApprovalDecision },
+    StaleRun,
+    StaleCall,
+    NotFound,
+}
+```
+
+约束：
+
+- 同一个 `approval_id` 只能 resolve 一次。
+- approve 已处理后再次 approve，不得再次执行工具。
+- approve 后再 reject，应返回 stale/already-resolved。
+- run aborted / finished 后到达的 decision 应返回 stale。
+- session close / broker cleanup 后到达的 decision 应返回 not found 或 stale。
+
+### Approval modes and remembered grants
+
+需要同时支持：每次询问、一次性审批后后续免询问、完全无审批模式。
+
+建议新增：
+
+```rust
+pub enum ToolApprovalMode {
+    AskEveryTime,
+    UseRememberedGrants,
+    AutoAllow { max_risk: ToolRisk },
+    AutoDeny { reason: String },
+}
+
+pub enum ToolApprovalDecision {
+    ApproveOnce,
+    ApproveGrant { scope: ApprovalGrantScope, ttl: Option<Duration> },
+    Reject { reason: Option<String> },
+}
+
+pub enum ApprovalGrantScope {
+    SameCallFingerprint,
+    SameToolInRun,
+    SameToolInSession,
+    SameToolInWorkspace,
+}
+```
+
+建议新增 `ToolApprovalGrantStore`，不要把长期授权塞进 `ToolApprovalBroker`。职责划分：
+
+```text
+ToolApprovalBroker
+  管 pending approval、冻结 prepared_args、等待用户回答
+
+ToolApprovalGrantStore
+  管 approve once / same call fingerprint / same run / same session / same workspace
+```
+
+grant key 至少应包含：
+
+```rust
+pub struct ApprovalGrantKey {
+    pub tool_name: ToolName,
+    pub cwd: PathBuf,
+    pub risk: ToolRisk,
+    pub args_fingerprint: Option<String>,
+    pub sandbox_profile: Option<String>,
+}
+```
+
+`SameCallFingerprint` 必须使用 canonical args hash，避免批准一个低风险参数后放行同工具的高风险参数。
+
+### AutoAllow constraints
+
+完全无审批模式只跳过 UI approval，不跳过工具治理。
+
+仍必须执行：
+
+- active tool check。
+- schema validate。
+- workspace trust / sandbox path check。
+- enterprise hard deny。
+- mutation queue / resource conflict check。
+- audit log / diagnostics。
+
+`AutoAllow { max_risk }` 开启时，UI snapshot 或 diagnostics 应能显示当前处于无审批模式，尤其是 `bash`、`write`、`edit`、`apply-patch` 这类高风险工具。
+
+### Tool batch scheduler
+
+建议新增 `ToolBatchScheduler`，统一处理并行、串行、mutation exclusive 和 chain 顺序。
+
+```rust
+pub struct ToolBatchItem {
+    pub call_index: usize,
+    pub invocation: ToolInvocation,
+    pub execution_mode: ToolExecutionMode,
+}
+
+pub enum ToolExecutionMode {
+    ParallelSafe,
+    OrderedByCallIndex,
+    MutatingExclusive { resource_key: ResourceKey },
+    ChainStep { chain_key: ChainKey },
+}
+```
+
+建议默认策略：
+
+- `read` / `grep` / `find` / `ls`：`ParallelSafe`。
+- `write` / `edit` / `apply-patch`：`MutatingExclusive`。
+- `bash`：默认 `OrderedByCallIndex` 或按 cwd/resource 进入 `MutatingExclusive`。
+- chain 工具：同一个 `chain_key` 内严格串行，不同 `chain_key` 可并行。
+
+### Execution order and LLM feedback order
+
+工具可以并行执行，但回填给 Rig / LLM 的结果必须稳定有序。
+
+示例：
+
+```text
+LLM 返回顺序:
+  call[0] read
+  call[1] grep
+  call[2] edit
+
+执行完成顺序:
+  grep -> read -> edit
+
+回填给 Rig / LLM:
+  result[0] read
+  result[1] grep
+  result[2] edit
+```
+
+建议在 `ToolInvocation` / `ToolInvocationResult` 或 driver-local batch item 中保留 `call_index`，最终：
+
+```rust
+results.sort_by_key(|r| r.call_index);
+AgentRun::tool_results(results);
+```
+
+UI 事件可以按实时完成顺序展示；session message 与回填给 LLM 的 tool result 顺序应按 `call_index` 或 provider/Rig 要求固定。
+
+### Approval and scheduler interaction
+
+审批等待需要纳入调度器，而不是 executor 前的临时分支。
+
+建议规则：
+
+- `ParallelSafe`：可并行请求 approval，也可并行执行。
+- `MutatingExclusive`：按 `call_index` 请求 approval；批准并执行完成后再处理下一个 mutation。
+- `ChainStep`：同 chain 前一步 approved + finished 后，才进入后一步 approval / policy / executor。
+
+这样可以避免用户批准一个 preview 后，前面的 mutation 已经改变文件，导致 preview 与实际执行环境不一致。
+
+### Review invariants
+
+后续 review tool 子系统时重点检查：
+
+- 任意 `ToolExecutor.execute(...)` 之前必须完成 schema、policy、approval/grant。
+- UI 永远不能修改 `prepared_args`。
+- `approval_id` 只能 resolve 一次。
+- resolved / aborted / finished / session close 后 pending 必须清理。
+- grant 必须有 scope、fingerprint、ttl 或 revoke 入口。
+- 并行执行允许乱序完成，回填 LLM 必须按 `call_index` 稳定排序。
+- mutation 和同 chain 工具必须串行。
+- `AutoAllow` 仍受 hard deny、sandbox、audit 约束。
+
+当前建议：保留 `ToolGateway + ToolPolicy + ToolApprovalBroker + RuntimeSnapshot projection` 主架构，后续新增 `ApprovalRequestId`、`ToolApprovalGrantStore` 和 `ToolBatchScheduler` 三个小模块来吸收 Codex request lifecycle 与并发调度经验。
