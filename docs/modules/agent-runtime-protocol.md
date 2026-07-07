@@ -158,7 +158,20 @@ pub enum ToolApprovalDecision {
     Approve,
     Reject { reason: Option<String> },
 }
+
+pub struct PendingToolApprovalView {
+    pub session_id: SessionId,
+    pub run_id: RunId,
+    pub call_id: ToolCallId,
+    pub tool_name: String,
+    pub risk: ToolRisk,
+    pub reason: String,
+    pub preview: ToolApprovalPreview,
+    pub created_at: Timestamp,
+}
 ```
+
+`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，用于 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。它只暴露审批弹窗、命令面板或 TUI 行内确认需要的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。UI 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { session_id, run_id, call_id, decision }`。
 
 `OpenSession` 会在需要时加载 `SessionRuntime`，并通常使它成为 focused session；`FocusSession` 只改变 runtime-visible focus，不要求重新加载已打开会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
 
@@ -655,6 +668,11 @@ pub struct SessionSnapshot {
     pub context_usage: Option<ContextUsageView>,
 }
 
+pub struct RunView {
+    pub run_id: RunId,
+    pub pending_tool_approvals: Vec<PendingToolApprovalView>,
+}
+
 pub struct SessionCatalogSummary {
     pub revision: SessionCatalogRevision,
     pub total_count: u64,
@@ -679,7 +697,9 @@ pub struct CommandSurfaceSnapshot {
 }
 ```
 
-`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+
+`RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `call_id` 回答。
 
 `RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 

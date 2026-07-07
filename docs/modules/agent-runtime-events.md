@@ -192,7 +192,7 @@ received sequence > N + 1
   → continue from new snapshot.last_event_sequence
 ```
 
-session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot` 或新事件恢复。关闭窗口后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 active session。
+session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot` 或新事件恢复。active session 当前 run 的 approval waiting 状态投影在 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。关闭窗口后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 active session。
 
 MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继续运行再被重连的故障模型。UI host 和 runtime 同生命周期；因此 reconnect contract 只覆盖同一程序上下文内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。`RuntimeSnapshot` 不需要为非 active/background session 提供完整恢复投影；若未来支持独立 runtime server、多窗口共享 runtime 或 daemon 模式，再引入 all-loaded-session snapshot 或 scoped event cursor。
 
@@ -925,7 +925,7 @@ Required
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
-审批状态不能由 UI 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从 `RuntimeSnapshot.active_session` 的 pending tool calls 恢复。
+审批状态不能由 UI 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件，pending approval 是 `ToolApprovalBroker` 持有的当前运行状态；snapshot 只暴露 UI-safe view，不暴露冻结的 prepared args。
 
 ### 14. Queue Lifecycle
 
@@ -1197,7 +1197,7 @@ UI dispatch(DecideToolApproval)
   └─ rejected  → tool_call_finished { is_error: true } → message_tool_result_appended
 ```
 
-审批请求是运行时事件，不是 UI callback。UI 只能通过 `DecideToolApproval` 回答，不能直接调用 tool executor，也不能替换工具参数。
+审批请求是运行时事件，不是 UI callback。UI 只能通过 `DecideToolApproval` 回答，不能直接调用 tool executor，也不能替换工具参数。同一 host 生命周期内如果 UI adapter、subscriber 或 reducer 重建，当前仍未解决的审批必须从 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 重新渲染。
 
 ## Abort Lifecycle
 
