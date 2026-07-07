@@ -211,6 +211,8 @@ pub struct PendingToolApproval {
 }
 ```
 
+`PendingToolApproval` 是运行时内部状态。`ToolApprovalBroker` 应把它投影为 `agent_runtime_protocol::PendingToolApprovalView`，放入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，供同一 host 生命周期内的 UI 初始加载、late subscribe、订阅重建和 sequence gap recovery 恢复审批界面。该 view 只能包含 `session_id`、`run_id`、`call_id`、tool 名称、risk、reason、preview 和创建时间等 UI-safe 字段；`prepared_args` 仍由 broker 冻结保存，不能进入 snapshot，也不能由 UI 修改。
+
 Approval 之后不允许再改 args；如果 hook 或 policy 在审批前 rewrite args，必须重新 schema validate、重新 sandbox check，并重新执行 `ToolPolicy.evaluate(...)`。
 
 ## 工具加载

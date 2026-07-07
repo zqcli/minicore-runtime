@@ -49,7 +49,7 @@ _避免_：模型客户端、API wrapper
 _避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
 
 **RuntimeSnapshot**：
-Agent 运行时在某个事件水位上的当前状态读模型，用于界面初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。它由运行时从内存状态、设置、资源摘要和会话目录投影生成，不是 UI store，不是会话文件，也不单独持久化。打开工作区后默认可以没有 active session。MVP 不支持 UI adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
+Agent 运行时在某个事件水位上的当前状态读模型，用于界面初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。它由运行时从内存状态、设置、资源摘要和会话目录投影生成，不是 UI store，不是会话文件，也不单独持久化。active session 当前 run 的待审批工具调用通过 `current_run.pending_tool_approvals` 投影给 UI。打开工作区后默认可以没有 active session。MVP 不支持 UI adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
 _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
 **运行时服务**：
@@ -275,6 +275,10 @@ _避免_：审批弹窗、工具执行器、UI 权限系统
 **工具审批代理（`ToolApprovalBroker`）**：
 工具模块中的 pending approval 状态机，由会话运行时持有实例。它保存等待用户确认的工具调用，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::Command::DecideToolApproval`。
 _避免_：UI 回调、策略判断器、工具执行器
+
+**待审批工具调用（`PendingToolApproval`）**：
+`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批界面和构造 `DecideToolApproval`。
+_避免_：审批弹窗本身、工具执行结果、会话条目、可由 UI 修改的工具参数
 
 **工具审批决定（`agent_runtime_protocol::ToolApprovalDecision`）**：
 下游 UI 对某个 pending tool approval 的协议回答，只能批准或拒绝，不能替换工具参数，也不能直接执行工具。
