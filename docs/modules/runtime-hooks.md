@@ -313,6 +313,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 关键规则：
 
 - `RewriteArgs` 后必须重新 schema validate。
+- `RewriteArgs` 后必须重新 canonicalize path、重新构造 preview、重新走 sandbox check。
 - `RewriteArgs` 后必须重新走 `ToolPolicy`。
 - approval 之后不允许再改 args。
 - hook 不能直接调用 `ToolExecutor`。
@@ -419,7 +420,7 @@ pub enum HookErrorPolicy {
 - `ResourceManager` raw file scanner bypass。
 - Rig `AgentRun` object。
 - `DriverEvent` direct stream。
-- `ToolGateway` 未归一化内部进度。
+- `Tools` 未归一化内部进度。
 - `persistence_save_point` 伪造。
 
 ## MVP 和演进

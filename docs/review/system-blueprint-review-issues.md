@@ -78,13 +78,13 @@
 
 状态：Resolved
 
-处理记录：已决策将 active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。协议新增 `PendingToolApprovalView`，只包含 `session_id`、`run_id`、`call_id`、tool 名称、risk、reason、preview 和创建时间等 UI-safe 字段；冻结的 `prepared_args` 仍由 `ToolApprovalBroker` 内部保存，不进入 snapshot，也不能由 UI 修改。`DecideToolApproval` 继续通过 `session_id`、`run_id`、`call_id` 匹配 broker 中的 pending approval。
+处理记录：已决策将 active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。协议新增 `PendingToolApprovalView`，只包含 `approval_id`、`session_id`、`run_id`、`call_index`、`call_id`、tool 名称、risk、reason、preview 和创建时间等 UI-safe 字段；冻结的 `prepared_args` 仍由 `ToolApprovalBroker` 内部保存，不进入 snapshot，也不能由 UI 修改。`DecideToolApproval` 通过 `approval_id` 与 `session_id`、`run_id`、`call_id` 匹配 broker 中的 pending approval；重复或过期 decision 归约为 `ApprovalDecisionOutcome`，不能重复执行。
 
 原问题：事件文档要求审批状态不能由 UI 私有保存，同一 host 生命周期内的订阅/状态重建后应从 snapshot 的 pending tool calls 恢复；此前 `RuntimeSnapshot` 字段列表只有 `current_run`、tools、queues 等，没有明确 pending approval 字段。
 
 决策结果：pending approval 放在 `RunView`，字段名为 `pending_tool_approvals`。它是 tool-call waiting state 的 UI-safe projection，作用域限定为 active session 的当前 run。
 
-风险：已通过 `RunView.pending_tool_approvals` 处理。同一 host 生命周期内的订阅/状态重建后，UI 可以从 snapshot 恢复审批弹窗，并使用对应 `call_id` 安全发出 approval decision。
+风险：已通过 `RunView.pending_tool_approvals` 处理。同一 host 生命周期内的订阅/状态重建后，UI 可以从 snapshot 恢复审批弹窗，并使用对应 `approval_id` 与 `call_id` 安全发出 approval decision。
 
 待处理方向：已处理。后续实现需验证：`tool_call_approval_requested` 后 snapshot 包含 pending approval；approve/reject、abort、run finished 或 session close 后 snapshot 不再包含该 approval；`prepared_args` 不出现在 snapshot / event / log 中。
 

@@ -12,7 +12,7 @@
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
 - 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
-- 工具与系统提示词：维护工具定义注册表、活跃工具集合、工具提示片段、工具执行策略，并在工具/资源变化后调用 `prompt.rs` 重建 system prompt。
+- 工具与系统提示词：持有 session-scoped `Tools` 子系统，由它维护工具定义注册表、活跃工具集合、工具提示片段、工具执行策略、审批、grant、执行协调和 executor；在工具/资源变化后调用 `prompt.rs` 重建 system prompt。
 - 资源与扩展：在 user turn 启动时引用当前 `TurnResourceSnapshot`；该 snapshot pin 住 `CwdResourceSnapshot`，而 cwd snapshot pin 住对应 `RuntimeResourceSnapshot`。reload 后 future turn 使用新资源，运行中的 turn 不被 patch。
 - 压缩与重试：支持手动压缩、自动压缩、context overflow 恢复、自动重试、取消压缩和取消重试。
 - 会话树：支持 set session name、navigate tree、branch summary、fork selector 所需 user message 列表。
@@ -33,7 +33,7 @@ SessionRuntime
   ├─ ModelState
   ├─ ResourceState { last_seen_revision }
   ├─ CompactionState
-  ├─ ToolRegistry / ActiveToolSet / ToolGateway
+  ├─ Tools
   ├─ QueueState
   ├─ RuntimeHookRegistry
   └─ Driver
@@ -105,7 +105,7 @@ Driver executes drive_run
 
 ```text
 TurnResourceSnapshot.cwd.resolved.prompt_materials()
-SessionRuntime tool state: active tools + snippets + guidelines
+SessionRuntime Tools: active tools + snippets + guidelines + provider schemas
 SessionRuntime cwd/date/model state
   → prompt::build_system_prompt(...)
   → update next TurnState
@@ -171,6 +171,19 @@ pub struct TurnState {
 ```
 
 运行中如果用户切换模型或活跃工具，`SessionRuntime` 可以先记入 `pendingSessionWrites`，然后在 `DriverHost::before_next_model_call` 安全点重新构建或 patch future turn state。资源 reload 不 patch 当前 `TurnState`；当前 run 继续使用启动时捕获的 `resources` 和 `system_prompt`。`Driver` 只能把 `turn_state.model.selection` 复制进 `ModelCallRequest`；provider 解析和 auth 注入必须发生在 `ModelGateway`。
+
+## Driver / Tools Coordination
+
+工具调用不由 `Driver` 直接执行。`SessionRuntime` 自己实现 `DriverHost`，或创建 per-run `SessionDriverHost` wrapper，实现下面的 seam：
+
+```text
+DriverHost::invoke_tool_batch(request, updates, cancel)
+  → SessionRuntime attaches ToolRunContext { session_id, run_id, cwd, turn resources, abort signal }
+  → Tools::invoke_batch(request, context, updates, cancel)
+  → ToolBatchResult
+```
+
+`Tools` 返回内部工具结果和 update；`SessionRuntime` 负责归约 UI event、session writes、pending approval snapshot projection 和 save point。`Driver` 只把 `ToolBatchResult` 映射回 Rig tool results，并继续推进 `AgentRun`。
 
 ## Usage And Context Usage
 
@@ -267,7 +280,7 @@ Rig 的 `AgentRun` 不一定暴露与 pi `runAgentLoop` 完全相同的运行中
 3. 触发 `BeforeAgentStart` / `PromptBuilt` Hook。
 4. 将 prompt、skill 调用或提示模板展开结果作为 `DriveEntry::Prompt` 交给 `Driver.drive_run()`。
 5. 在模型调用前触发 `ContextProjection`、`BeforeModelCall` 和 provider payload Hook。
-6. 工具调用通过 `SessionRuntime` 内部的 `ToolGateway` 治理和执行，再由 `Driver` 回填 Rig。
+6. 工具调用通过 `SessionRuntime` 内部的 `Tools` 子系统治理和执行，再由 `Driver` 回填 Rig。
 7. 每个 run 的可恢复边界 flush `pendingSessionWrites`，发出 `persistence_save_point`。
 8. 下一次模型调用前进入 `before_next_model_call` 安全点。
 9. 运行结束时发出唯一终态 `run_finished { status }`；若不会立即进入 retry、compaction 或 queued continuation，再切回 `idle` 并发出 `session_settled`。

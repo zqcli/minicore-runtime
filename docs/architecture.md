@@ -8,7 +8,7 @@ MiniCore 的设计借鉴 pi coding-agent 的实际生产路径：`AgentSessionRu
 
 MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 必须保持为实现细节。下游 CLI、TUI 和 GUI 宿主只通过运行时命令、运行时事件和运行时快照交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。
 
-MiniCore 不重新实现 Rig 的核心 Agent loop。Rig 负责 `AgentRun` / `AgentRunStep` 的状态机推进；MiniCore 通过 `Driver` 适配 Rig，把工具调用委托给运行时工具网关，并把底层活动映射成产品事件。
+MiniCore 不重新实现 Rig 的核心 Agent loop。Rig 负责 `AgentRun` / `AgentRunStep` 的状态机推进；MiniCore 通过 `Driver` 适配 Rig，在 `CallTools` 时经 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，再由 session-scoped `Tools` 子系统执行工具治理，并把底层活动映射成产品事件。
 
 MiniCore 也不重新实现 provider HTTP clients。真实模型调用通过 `ModelGateway` 复用 Rig provider system；MiniCore 在该边界内治理 provider/model 解析、凭据、custom base URL、hook、fallback、usage 和错误分类。
 
@@ -42,7 +42,8 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
        │
  SessionRuntime ── fixed workspace cwd; run captures TurnResourceSnapshot into TurnState
        ├─ Driver ───────────────▶ Rig AgentRun
-       └─ ToolGateway / Prompt ─▶ captured cwd snapshot resolved view
+       ├─ Tools ────────────────▶ tool registry / policy / approval / executors
+       └─ Prompt ───────────────▶ captured cwd snapshot resolved view + tool prompt catalog
 ```
 
 ## 文档地图
@@ -60,7 +61,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [Prompt](modules/prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
 - [Driver](modules/driver.md)：Rig `AgentRun` / `CallModel` / `CallTools` 的适配职责。
 - [ModelGateway](modules/model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
-- [Tools](modules/tools.md)：`tools.rs` / `tools/` 平级模块，提供工具定义、内置工具、外部工具适配和执行 helper。
+- [Tools](modules/tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
 - [Compaction](modules/compaction.md)：`compaction.rs` 平级模块，提供上下文压缩准备、摘要 prompt、压缩摘要消息和自动压缩语义。
 - [UsageStats](modules/usage-stats.md)：token 消耗、run/session stats、context usage 和 UI 展示口径。
 - [实现路线图](implementation-roadmap.md)：MVP 到后续增强的开发顺序和设计约束。
@@ -78,7 +79,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
-- 工具注册、活跃工具、审批、沙箱和真实副作用执行由 `SessionRuntime` 持有并通过 `ToolGateway` 统一治理；`Tools` 模块只提供工具定义和执行 helper。
+- 工具注册、活跃工具、审批、授权记忆、沙箱、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；`SessionRuntime` 负责协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`。
 - 上下文压缩由 `SessionRuntime` 编排，`Compaction` 模块提供准备、摘要 prompt 和压缩摘要消息 helper；`Driver` 不执行压缩。
 - 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。
 
@@ -114,3 +115,4 @@ AgentSessionRuntime
 - [ADR 0008：RuntimeHooks 是内部安全点扩展缝，不是协议事件或 UI 插件 API](adr/0008-runtime-hooks-are-internal-safe-point-seams.md)
 - [ADR 0009：ModelGateway 包装 Rig providers](adr/0009-model-gateway-wraps-rig-providers.md)
 - [ADR 0010：多 session runtime 使用级联资源快照](adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md)
+- [ADR 0011：Tools 是 SessionRuntime 内部的 Session-Scoped 子系统](adr/0011-tools-are-session-scoped-subsystem.md)

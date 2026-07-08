@@ -249,48 +249,53 @@ _避免_：重复后端、UI 专属 Agent
 _避免_：响应、请求、chat completion
 
 **Driver（Rig 适配器）**：
-会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时调用会话运行时内部的工具网关。
+会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。
 _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行
 
-**工具模块**：
-与技能模块、`ResourceManager`、系统提示词构建器平级的 `tools.rs` / `tools/` 模块，提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper。它不拥有会话工具状态。
-_避免_：工具运行时、UI 工具层、Rig ToolServer 替代品
+**Tools 子系统 / 工具模块**：
+`SessionRuntime` 内部的 session-scoped `tools.rs` / `tools/` 子系统，封装工具定义、注册表、活跃工具、工具提示素材、策略、审批、授权记忆、执行协调、沙箱、mutation lock 和 executor implementations。`SessionRuntime` 负责协调 `Driver` 与 `Tools`，`Driver` 不直接依赖 `Tools`。
+_避免_：工具运行时、ToolRuntime、全局工具服务、UI 工具层、Rig ToolServer 替代品、平级 helper-only 模块
 
 **工具定义**：
 描述一个可被模型调用的工具能力，包括稳定名称、模型可见描述、参数结构、风险等级和展示元数据。
 _避免_：工具函数、按钮动作
 
+
 **工具注册表**：
-会话运行时维护的工具目录，记录内置工具和自定义工具的定义、来源、风险和执行入口。
+`Tools` 子系统内部的工具目录，记录内置工具和自定义工具的定义、来源、风险和执行入口。
 _避免_：Rig tools、UI 工具列表
 
 **活跃工具集合**：
-当前会话实际暴露给模型的工具子集。它影响模型请求中的工具 schema 和系统提示词中的工具说明。
+`Tools` 子系统内部维护、当前会话实际暴露给模型的工具子集。它影响模型请求中的工具 schema 和系统提示词中的工具说明。
 _避免_：所有工具、工具开关 UI
 
 **工具策略（`ToolPolicy`）**：
-工具模块中的策略判断器，由会话运行时持有实例。它根据工具定义、参数、工作区信任、沙箱结果、用户设置和 hook 结果决定允许、拒绝、要求审批、改写参数或中止运行。
-_避免_：审批弹窗、工具执行器、UI 权限系统
+`Tools` 子系统内部的纯策略判断器。它根据工具定义、prepared invocation、工作区信任、沙箱结果、用户设置、grant 和 hook 结果决定允许、拒绝、要求审批、改写参数、强制串行或中止运行；它不等待 UI、不执行工具、不构造需要 I/O 的 preview。
+_避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 
 **工具审批代理（`ToolApprovalBroker`）**：
-工具模块中的 pending approval 状态机，由会话运行时持有实例。它保存等待用户确认的工具调用，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::Command::DecideToolApproval`。
-_避免_：UI 回调、策略判断器、工具执行器
+`Tools` 子系统内部的 pending approval 状态机。它保存等待用户确认的工具调用，冻结 prepared args，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::Command::DecideToolApproval`。
+_避免_：UI 回调、策略判断器、长期授权存储、工具执行器
 
 **待审批工具调用（`PendingToolApproval`）**：
-`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批界面和构造 `DecideToolApproval`。
+`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含 `ApprovalRequestId`、冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批界面和构造 `DecideToolApproval`。
 _避免_：审批弹窗本身、工具执行结果、会话条目、可由 UI 修改的工具参数
 
 **工具审批决定（`agent_runtime_protocol::ToolApprovalDecision`）**：
-下游 UI 对某个 pending tool approval 的协议回答，只能批准或拒绝，不能替换工具参数，也不能直接执行工具。
+下游 UI 对某个 pending tool approval 的协议回答，可以 `ApproveOnce`、`ApproveGrant` 或 `Reject`；它不能替换工具参数，也不能直接执行工具。grant 只记录免批规则，不跳过 schema validation、hard deny、sandbox、mutation queue 或 audit。
 _避免_：工具策略决定、工具参数、用户命令结果
 
-**工具网关**：
-会话运行时内部的工具执行门面，由 `Driver` 在 Rig `CallTools` step 中调用。它消费工具注册表、活跃工具集合、工具策略、审批、Hook 和工具执行器，并把结果归一化后交回 `Driver`。
-_避免_：工具实现、Rig tool call、独立运行时
+**工具执行协调器（`ToolExecutionCoordinator`）**：
+`Tools` 子系统内部的 batch 执行协调器。它执行已经声明的 parallel/sequential、approval wait、grant、并发限制和 mutation lock 约束，并按 LLM source `call_index` 稳定回填结果；它不根据工具名自行发明执行策略。
+_避免_：独立 scheduler、LLM 策略解释器、工具执行器
+
+**工具沙箱视图（`ToolSandboxView`）**：
+`Tools` 子系统在 executor 前使用的安全边界 source of truth，描述 cwd、read roots、write roots、denied roots、process/network/env policy 和 sandbox verdict。UI approval 不能替代 sandbox；hook 改写参数后必须重新 schema validate、canonicalize、sandbox check 和 policy evaluate。
+_避免_：审批弹窗、路径字符串前缀检查、executor 自行放宽权限
 
 **工具执行器**：
-执行某个具体工具副作用的组件，例如读取文件、搜索文本、修改文件或运行命令。
-_避免_：工具策略、工具注册
+`Tools` 子系统内部执行某个具体工具副作用的组件，例如读取文件、搜索文本、修改文件或运行命令。executor 不能绕过 registry、active tool check、policy、approval、sandbox 和 mutation lock。
+_避免_：工具策略、工具注册、UI 执行器
 
 **模型调用网关**：
 运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、provider Hook、fallback、流式结果、usage 归一化和错误分类。`Driver` 只通过 `call_model` seam 请求它。

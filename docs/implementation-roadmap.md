@@ -20,7 +20,7 @@ Minimal protocol / event / session spine
 - `SessionRuntime` 尽早成为单会话事实 owner；`AgentRuntime` 保持薄门面；`Driver` 只驱动 Rig step。
 - `InMemorySessionStorage` 先作为 storage contract 和测试底座；JSONL 在 entry、leaf、save point 语义稳定后实现。
 - `Driver` 不能拖到最后才验证。先用 fake driver 跑通纵切，再用隔离 spike 验证 Rig `AgentRun / AgentRunStep` 是否满足设计假设。
-- `ToolGateway` 在 read-only tool 切片出现；`ToolApprovalBroker` 等到 mutation tool 前后再做完整闭环。
+- `Tools` 子系统在 read-only tool 切片出现；`ToolApprovalBroker`、`ToolApprovalGrantStore`、approval modes 和完整 sandbox/mutation 约束等到 mutation tool 前后再做完整闭环。
 - `CommandSurface`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程。
 
 ## 先决设计点
@@ -46,7 +46,7 @@ Minimal protocol / event / session spine
 | 7. Resources / Skills / Prompt | 接入 `ResourceManager` 级联 snapshot、cwd overlay policy、skill、prompt template、纯 prompt builder | `src/resource_manager.rs`、`src/skills.rs`、`src/prompt_templates.rs`、`src/prompt.rs` | `ReloadResources(cwd) -> build CwdResourceSnapshot -> replace_cwd -> resources_changed`；replace 后开始的下一轮 `capture_turn` 必须拿到新 snapshot；replace 前已经开始 capture 的 turn 合法使用旧 snapshot；`InvokeSkill` / prompt template 在真正进入 user turn 时用 captured `TurnResourceSnapshot` 展开为 user message；资源变化只影响 future turn。 |
 | 8. CommandSurface skeleton | 建立跨 UI command catalog、parse/plan/present，但不要求所有后端命令完整 | `src/command_surface.rs` | `/help`、`/reload`、`/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
 | 9. ModelGateway 和 UsageStats | 收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage | `src/provider_registry.rs`、`src/model_gateway.rs`、`src/auth_store.rs`、`src/usage_stats.rs` | `SetModel -> ModelState -> ModelCallRequest -> ModelGateway` 可测；mock/provider usage 变成 `usage_updated`；RuntimeSnapshot 包含 provider/model view，`active_session` 包含 `session_stats` 和 `context_usage`；后续 compaction 能复用 context usage。 |
-| 10. Read-only Tools | 实现工具定义、registry、active set、最小 policy、gateway 和只读工具 | `src/tools.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/policy.rs`、`src/tools/gateway.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool -> ToolGateway -> tool result -> Rig continuation` 跑通；tool error 作为 error tool result 回填。 |
+| 10. Read-only Tools | 实现 session-scoped `Tools` 子系统、工具定义、registry、active set、prompt catalog、最小 policy、planner/coordinator/executor 和只读工具 | `src/tools.rs`、`src/tools/subsystem.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/active.rs`、`src/tools/prompt.rs`、`src/tools/policy.rs`、`src/tools/planner.rs`、`src/tools/coordinator.rs`、`src/tools/executor.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool_batch -> SessionRuntime -> Tools::invoke_batch -> tool results -> Rig continuation` 跑通；tool error 作为 error tool result 回填；结果按 `call_index` 稳定回填。 |
 | 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、active session pending approval RuntimeSnapshot/resync 行为稳定；approval 后 args 冻结。 |
 | 12. RuntimeHooks MVP | 只接入已有 owner 流程上的安全点；不把资源发现 callback 纳入 MVP | `src/runtime_hooks.rs`、`src/agent_runtime.rs`、`src/session_runtime.rs` | `BeforeAgentStart`、`PromptBuilt`、`ToolBeforePolicy`、`AfterSavePoint`、`CommandOutputBuild` 可测；hook 不发 UI event、不读写 storage、不执行 tool、不碰 credentials。 |
 | 13. Compaction | 实现手动压缩、summary message、context rebuild；再做 threshold 和 overflow recovery | `src/compaction.rs`、`src/session_runtime.rs`、`src/session_storage.rs` | `/compact` 从 disabled 变可执行；`SessionEntry::Compaction` 重建上下文；overflow recovery 不污染重试上下文。 |
@@ -118,22 +118,27 @@ SessionStorage trait
 
 ```text
 Read-only tools:
-  ToolDefinition / ToolRegistry / ActiveToolSet
-  → minimal ToolPolicy
-  → ToolGateway
+  Tools subsystem
+  → ToolDefinition / ToolRegistry / ActiveToolSet / ToolPromptCatalog
+  → minimal ToolPolicy / ToolInvocationPlanner / ToolExecutionCoordinator
   → read / grep / find / ls
 
 Approval:
   ToolApprovalBroker
-  → DecideToolApproval protocol
+  → ApprovalRequestId / DecideToolApproval protocol
   → pending approval recovery
 
+Grants and modes:
+  ToolApprovalGrantStore
+  → AskEveryTime / UseRememberedGrants / AutoAllow / AutoDeny
+
 Mutation / process tools:
-  write / edit / apply-patch
+  sandbox + mutation lock
+  → write / edit / apply-patch
   → bash
 ```
 
-`ToolGateway` 要在第一个工具切片就出现，因为它是真正连接 `DriverHost::invoke_tool` 和产品级工具治理的 seam。`ToolApprovalBroker` 不必在 read-only tools 阶段做满；它应在 mutation tools 前完成，因为 approval 后 args 冻结、reject-as-error-tool-result、preview 和同一 host 生命周期内的 pending approval resync 都是高风险行为。
+`Tools` 要在第一个工具切片就出现，因为它是真正连接 `DriverHost::invoke_tool_batch` 和产品级工具治理的 session-scoped 子系统。`ToolApprovalBroker` 不必在 read-only tools 阶段做满；它应在 mutation tools 前完成，因为 approval 后 args 冻结、reject-as-error-tool-result、preview、同一 host 生命周期内的 pending approval resync、duplicate/stale decision 和 grant scope 都是高风险行为。
 
 ## CommandSurface 顺序
 

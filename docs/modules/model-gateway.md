@@ -60,7 +60,7 @@ ModelGateway internals
 - 把 raw provider payload、provider response 或 credentials 放进 snapshot/event/session JSONL。
 - 让 hook 获得 `AuthStore` secret material。
 
-这些职责分别属于 `Driver`、`ToolGateway`、`Prompt` / `Skills` / `CommandSurface`、`SessionRuntime`、`AgentRuntimeProtocol` 和 `RuntimeHooks`。
+这些职责分别属于 `Driver`、`Tools`、`Prompt` / `Skills` / `CommandSurface`、`SessionRuntime`、`AgentRuntimeProtocol` 和 `RuntimeHooks`。
 
 ## 核心类型
 
@@ -388,8 +388,9 @@ SubmitPrompt
 
 ```text
 Rig CallTools
-  → DriverHost::invoke_tool
-  → ToolGateway policy / approval / executor
+  → DriverHost::invoke_tool_batch
+  → SessionRuntime
+  → Tools policy / approval / grants / executor
   → Driver feeds tool_results back to Rig
   → next Rig CallModel
   → Driver builds a new ModelCallRequest with the same or patched ModelSelection

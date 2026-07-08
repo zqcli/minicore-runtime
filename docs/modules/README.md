@@ -55,7 +55,7 @@ ModelGateway ──────────────────────�
 
 `Prompt` 是纯系统提示词构建模块，对应未来的 `prompt.rs`。它消费 `SessionRuntime` 从 captured `TurnResourceSnapshot` 提取的 prompt materials，以及会话持有的 active tools / snippets，输出最终 system prompt；它不直接调用 `ResourceManager`，`ResourceManager` 也不调用 `Prompt`。
 
-`Tools` 是平级工具能力模块，对应未来的 `tools.rs` / `tools/`。它提供工具定义、内置工具、外部工具适配、schema、prompt metadata 和 executor helper；工具状态和工具治理由 `SessionRuntime` 持有。
+`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；`SessionRuntime` 协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`，`Driver` 不直接依赖 `Tools`。
 
 `Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point 选择、summary prompt 构建、摘要消息格式化和压缩结果类型；压缩流程、模型调用、Hook、事件和 session 写入由 `SessionRuntime` 编排。
 
@@ -63,7 +63,7 @@ ModelGateway ──────────────────────�
 
 `ModelGateway` 是模型调用治理模块。它复用 Rig provider/client 能力，但在 MiniCore 内负责 provider/model 解析、凭据解析、custom base URL、provider hook、fallback、usage 归一化和错误分类。
 
-`Driver` 只负责适配 Rig。Rig 决定 `CallModel`、`CallTools` 和 `Done`；`Driver` 把这些 step 接到产品运行时的 provider、tool gateway、event 和 abort 语义。
+`Driver` 只负责适配 Rig。Rig 决定 `CallModel`、`CallTools` 和 `Done`；`Driver` 把这些 step 接到产品运行时的 provider、`Tools`、event 和 abort 语义。
 
 ## 文档索引
 
@@ -77,13 +77,13 @@ ModelGateway ──────────────────────�
 - [RuntimeHooks](runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
 - [Skills](skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
-- [Tools](tools.md)：`tools.rs` / `tools/` 平级模块，提供工具定义、内置工具、外部工具适配和执行 helper。
+- [Tools](tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
 - [Compaction](compaction.md)：`compaction.rs` 平级模块，提供压缩准备、摘要 prompt、上下文重建规则和压缩结果类型。
 - [UsageStats](usage-stats.md)：token 消耗、run/session stats、context usage、provider usage 归一化和 UI 展示口径。
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)。
+实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)。
 
 ## Rust 文件规划
 
@@ -119,11 +119,19 @@ ModelGateway ──────────────────────�
 | `src/prompt.rs` | [Prompt](prompt.md) | 最终 system prompt 纯构建模块。 |
 | `src/tools.rs` | [Tools](tools.md) | tools public module 和常用类型 re-export。 |
 | `src/tools/definition.rs` | [Tools](tools.md) | `ToolDefinition`、schema、risk、display metadata。 |
-| `src/tools/registry.rs` | [Tools](tools.md) | `ToolRegistry`、`ActiveToolSet`、`ToolPromptCatalog`。 |
-| `src/tools/policy.rs` | [Tools](tools.md) | `ToolPolicy`、policy input/decision/config。 |
-| `src/tools/approval.rs` | [Tools](tools.md)、[AgentRuntimeProtocol](agent-runtime-protocol.md) | `ToolApprovalBroker`、pending approval 状态机。 |
-| `src/tools/gateway.rs` | [Tools](tools.md)、[Driver](driver.md) | `ToolGateway`、tool invocation/result 归一化。 |
-| `src/tools/providers.rs` | [Tools](tools.md) | built-in / external tool provider adapter。 |
+| `src/tools/subsystem.rs` | [Tools](tools.md) | `Tools` session-scoped 子系统主结构和深接口。 |
+| `src/tools/registry.rs` | [Tools](tools.md) | `ToolRegistry`、`RegisteredTool`、工具来源和冲突。 |
+| `src/tools/active.rs` | [Tools](tools.md) | `ActiveToolSet`、active tool selection。 |
+| `src/tools/prompt.rs` | [Tools](tools.md)、[Prompt](prompt.md) | `ToolPromptCatalog`、provider schemas、snippets/guidelines projection。 |
+| `src/tools/policy.rs` | [Tools](tools.md) | `ToolPolicy`、policy input/decision/config；保持纯判断。 |
+| `src/tools/approval.rs` | [Tools](tools.md)、[AgentRuntimeProtocol](agent-runtime-protocol.md) | `ToolApprovalBroker`、`ApprovalRequestId`、pending approval 状态机。 |
+| `src/tools/grants.rs` | [Tools](tools.md) | `ToolApprovalGrantStore`、approval modes、remembered grants。 |
+| `src/tools/planner.rs` | [Tools](tools.md) | schema validate、args canonicalize、sandbox check、approval preview、prepared invocation。 |
+| `src/tools/coordinator.rs` | [Tools](tools.md)、[Driver](driver.md) | batch execution coordination、parallel/sequential、approval wait、按 `call_index` 稳定回填。 |
+| `src/tools/executor.rs` | [Tools](tools.md) | `ToolExecutor` trait、executor registry、result/error 归一化。 |
+| `src/tools/events.rs` | [Tools](tools.md)、[AgentRuntimeEvents](agent-runtime-events.md) | 工具内部 update 类型和 sink adapter。 |
+| `src/tools/sandbox.rs` | [Tools](tools.md) | `ToolSandboxView`、路径/进程/网络边界和 check result。 |
+| `src/tools/mutation.rs` | [Tools](tools.md) | `ToolMutationKey`、file/resource mutation queue。 |
 | `src/tools/builtin/mod.rs` | [Tools](tools.md) | 内置工具集合声明。 |
 | `src/tools/builtin/read.rs` | [Tools](tools.md) | `read` 工具。 |
 | `src/tools/builtin/grep.rs` | [Tools](tools.md) | `grep` 工具。 |
@@ -154,7 +162,7 @@ ModelGateway ──────────────────────�
 | hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |
 | 技能 metadata、catalog、frontmatter、format helper | [Skills](skills.md) | 只说明如何调用 helper，不拥有技能生命周期。 |
 | 最终 system prompt 拼装规则 | [Prompt](prompt.md) | 只说明何时重建，不拼装 prompt。 |
-| 工具定义、registry/helper 类型、执行 facade 形态 | [Tools](tools.md) | 只说明工具状态由 `SessionRuntime` 持有。 |
+| session-scoped 工具子系统、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks、executors | [Tools](tools.md) | 只说明 `SessionRuntime` 如何协调 `Driver` 与 `Tools`，不复制工具治理 pipeline。 |
 | provider/model/auth 调用边界、`ModelSelection`、`ProviderRegistry`、`ModelGateway`、custom provider、Rig provider adapter | [ModelGateway](model-gateway.md) | 只说明本模块如何选择模型或发起模型调用，不重复 provider/auth 解析规则。 |
 | Rig `AgentRun` step 驱动和 host seam | [Driver](driver.md) | 只说明如何进入 driver，不拥有 Rig 协议。 |
 | 压缩算法、cut point、summary prompt、summary message | [Compaction](compaction.md) | 只说明压缩流程，不重复摘要 prompt 和 projection 规则。 |
