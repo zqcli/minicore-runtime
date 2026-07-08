@@ -13,7 +13,7 @@
 本轮发现的问题集中在三类：
 
 1. **协议表面有真实缺口**：查询命令没有响应通道（BR-023）、abort 持久化语义未定义（BR-024）、若干命令/事件字段与既定语义冲突（BR-027、BR-030、BR-031、BR-032）。
-2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已在当前分支通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）仍 open。
+2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）已通过 `Tools` 权威文档补齐 source of truth。
 3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
 ## 高风险
@@ -255,7 +255,7 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-037：tool sandbox 被定位为真正的安全边界，但没有任何 source of truth
 
-状态：Open
+状态：Resolved
 
 问题：文档多处依赖 sandbox：`ToolPolicyInput.sandbox: ToolSandboxView`、`CwdScopedServices` 含 `ToolSandboxRoot`、hook 规则"rewrite 后必须重新 sandbox check"、tools.md 明言"UI 审批只是 ToolPolicy 的输入，不是安全边界"（言下之意 sandbox 才是）、roadmap 阶段 15 要求 bash 的 cwd/sandbox 可观察。但 `ToolSandboxView` / `ToolSandboxRoot` 从未被定义，sandbox 的模型（路径边界？只读/读写域？进程/网络限制？平台差异？）在全部 16 个模块文档中没有一节描述，CONTEXT.md 也无词条。
 
@@ -265,7 +265,7 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 风险：mutation/bash 阶段（roadmap 14/15）的核心安全语义完全靠实现时即兴决定；"重新 sandbox check"无从测试。
 
-待处理方向：新增 sandbox 设计文档（或并入 Tools 权威文档）：定义 ToolSandboxView 结构、路径归一化与逃逸规则、bash 的执行约束边界，并加入必测项。
+处理记录：已在 `docs/modules/tools.md` 的 "Sandbox Source Of Truth" 小节定义 `ToolSandboxView`、process/network/env policy、sandbox verdict、path canonicalization、symlink/父目录校验、denied roots 优先级、bash cwd/network 边界，以及 hook rewrite 后必须重新 validate/canonicalize/sandbox/policy 的规则；`CONTEXT.md` 也补充了 `ToolSandboxView` 术语。
 
 ## 低风险 / 一致性
 
@@ -281,23 +281,23 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-039：协议字段使用 `usize`
 
-状态：Open
+状态：Resolved
 
 问题：`ListSessions { limit: usize }`、`SessionEvent::Settled { next_turn_count: usize }` 使用平台相关宽度类型；协议其余部分统一 u32/u64。wire 协议类型应固定宽度（参考 Codex 用 i64）。
 
 证据：`docs/modules/agent-runtime-protocol.md`。
 
-待处理方向：统一为 u32/u64。
+处理记录：已将 `docs/modules/agent-runtime-protocol.md` 中公开协议的 `ListSessions.limit` 改为 `u32`，`SessionEvent::Settled.next_turn_count` 改为 `u64`，`ToolApprovalPreview::FileEdit.replacements` 改为 `u32`。内部实现文档若使用数组索引，可以在模块内部转换，但 wire 协议不再暴露裸 `usize`。
 
 ### BR-040：`ToolPolicy` 声明为纯判断器，却要构造需要 I/O 的 `ToolApprovalPreview`
 
-状态：Open
+状态：Resolved
 
 问题：tools.md 说 "ToolPolicy constructs it（ToolApprovalPreview）"，而 `FileEdit { diff }` / `Patch { diff_preview }` 类 preview 需要读取目标文件计算 diff——与"ToolPolicy 是纯策略判断器"的定位矛盾。
 
 证据：`docs/modules/tools.md` 数据结构草案注释与 ToolPolicy 定位段。
 
-待处理方向：preview 构造移到 ToolGateway 准备阶段；policy 只返回 `RequireApproval { reason }`。
+处理记录：已在 `docs/modules/tools.md` 中明确 `ToolPolicy` 是纯判断器，不等待 UI、不执行工具、不构造需要 I/O 的 preview；diff preview、patch preview、bash command preview、path canonicalization 和 sandbox check 都由 `ToolInvocationPlanner` 在 policy 前准备，policy 只返回 `RequireApproval { reason }` 等 decision。
 
 ### BR-041：`GetContextFile { path }` 未定义校验边界
 

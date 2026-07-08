@@ -468,7 +468,7 @@ slash invocation 本身不是模型可见 session entry。只有产生模型可�
 slash command 不能成为绕过策略的后门：
 
 - 不允许 UI 通过 slash command 直接读本地文件；资源正文读取必须经过 runtime。
-- 不允许 slash command 直接执行工具；工具仍走 `ToolGateway`、approval 和 sandbox。
+- 不允许 slash command 直接执行工具；工具仍走 `SessionRuntime` 持有的 `Tools` 子系统、approval 和 sandbox。
 - 不允许 extension slash command 绕过 `RuntimeHookRegistry` / extension policy。
 - 运行中命令必须遵守 phase policy 和 queue semantics。
 - catalog 中显示 command 不代表执行时一定成功；dispatch 必须重新校验。

@@ -548,4 +548,4 @@ pub enum BeforeCompactDecision {
 - 修改 system prompt。
 - 扫描 skills、resources 或 prompt templates。
 
-这些职责分别属于 `Driver`、`ToolGateway`、ModelGateway、`SessionHandle` / `SessionStorage`、`SessionRuntime`、`Prompt` 和 `ResourceManager`。
+这些职责分别属于 `Driver`、`Tools`、ModelGateway、`SessionHandle` / `SessionStorage`、`SessionRuntime`、`Prompt` 和 `ResourceManager`。

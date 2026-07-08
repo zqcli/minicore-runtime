@@ -130,7 +130,7 @@ AgentRuntime
           ├─ ProviderRegistryView
           ├─ ModelGateway
           ├─ ResourceManager
-          └─ ToolSandboxRoot / ToolGateway inputs
+          └─ ToolSandboxRoot / Tools inputs
 
 LoadedSessionRuntimes
   ├─ SessionRuntime A -> pins CwdScopedServices(repo-a, gen-1)
@@ -176,7 +176,7 @@ SessionWorker Process A
   ├─ ResourceManager A
   ├─ Prompt builder A
   ├─ ModelGateway client A
-  ├─ ToolGateway A
+  ├─ Tools A
   ├─ Driver A
   └─ cwd / worktree A
 ```
@@ -418,11 +418,11 @@ ProcessSessionRuntimeHost
 
 长期如果要模仿 Claude Code：让 `AgentRuntime` 演进为 supervisor，管理多个 `SessionWorker` process、worktree、event multiplexing、approval routing 和 attach/detach。届时需要重新处理 UI reconnect / RuntimeSnapshot 范围问题，并重新评估是否需要 worker-local services。
 
-## Tool 子系统待收敛讨论
+## Tool 子系统设计收敛记录
 
 日期：2026-07-07
 
-背景：本轮已先将 pending tool approval 的恢复语义落入正式文档：active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，`ToolApprovalBroker` 继续持有冻结的 `prepared_args`。下列内容是后续 tool 子系统优化方向，尚未写入正式模块规范。
+背景：pending tool approval 的恢复语义已落入正式文档：active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，`ToolApprovalBroker` 继续持有冻结的 `prepared_args`。下列内容已进一步收敛到 `docs/modules/tools.md`、`docs/modules/driver.md`、`docs/modules/session-runtime.md` 和 `docs/modules/agent-runtime-protocol.md`。
 
 ### Approval request lifecycle
 
@@ -435,6 +435,7 @@ pub struct PendingToolApprovalView {
     pub approval_id: ApprovalRequestId,
     pub session_id: SessionId,
     pub run_id: RunId,
+    pub call_index: ToolCallIndex,
     pub call_id: ToolCallId,
     pub tool_name: String,
     pub risk: ToolRisk,
@@ -539,11 +540,11 @@ pub struct ApprovalGrantKey {
 
 ### Tool batch scheduler
 
-建议新增 `ToolBatchScheduler`，统一处理并行、串行、mutation exclusive 和 chain 顺序。
+建议新增 `ToolExecutionCoordinator`，统一执行已声明的并行、串行、mutation exclusive 和 chain 顺序约束；它不根据工具名自行发明策略。
 
 ```rust
 pub struct ToolBatchItem {
-    pub call_index: usize,
+    pub call_index: ToolCallIndex,
     pub invocation: ToolInvocation,
     pub execution_mode: ToolExecutionMode,
 }
@@ -618,4 +619,16 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - mutation 和同 chain 工具必须串行。
 - `AutoAllow` 仍受 hard deny、sandbox、audit 约束。
 
-当前建议：保留 `ToolGateway + ToolPolicy + ToolApprovalBroker + RuntimeSnapshot projection` 主架构，后续新增 `ApprovalRequestId`、`ToolApprovalGrantStore` 和 `ToolBatchScheduler` 三个小模块来吸收 Codex request lifecycle 与并发调度经验。
+当前建议：统一采用 session-scoped `Tools` 子系统，由 `SessionRuntime` 协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`。`Tools` 内部封装 `ToolPolicy`、`ToolApprovalBroker`、RuntimeSnapshot projection、`ApprovalRequestId`、`ToolApprovalGrantStore` 和 `ToolExecutionCoordinator`，以吸收 Codex/pi request lifecycle 与并发调度经验。
+
+## Tools 子系统文档落地
+
+本轮已将口头设计正式落入模块文档：
+
+- `Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，不是独立 runtime，也不是 UI 工具层。
+- `SessionRuntime` 协调 `Driver` 和 `Tools`；`Driver` 只通过 `DriverHost::invoke_tool_batch(...)` 请求工具批量结果，不直接依赖 `Tools`。
+- `Tools::invoke_batch(...)` 是工具治理和执行的主入口，内部包含 registry、active tools、prompt catalog、policy、approval、grants、planner、coordinator、executors、sandbox 和 mutation queue。
+- 新增 ADR 0011 固化该决策：`Tools` 是 `SessionRuntime` 内部的 session-scoped 子系统，文档和实现不再使用 gateway 作为架构术语。
+- 本地执行策略不由 LLM tool call 决定；provider parallel 参数只影响模型是否一次返回多个 tool calls。MiniCore 默认 parallel；session config 或任一 tool definition 要求 sequential 时整批串行；并发执行可乱序完成，但结果必须按 `ToolCallIndex` 稳定回填。
+- `ToolPolicy` 保持纯判断器；preview 构造、path canonicalization、sandbox check 和 schema validation 由 `ToolInvocationPlanner` 负责。
+- pending approval 使用 `ApprovalRequestId` 去重和防 stale；长期免批使用 `ToolApprovalGrantStore`，与 `ToolApprovalBroker` 分离。

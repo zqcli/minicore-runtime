@@ -104,7 +104,7 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 
 ## 安全边界
 
-`AgentRuntime` 集中持有 workspace host、资源快照存储和运行时服务入口。凭据和 provider catalog 是 user-global/runtime-global；项目资源只能通过 `ResourceManager` 受 trust gate、source info 和 overlay policy 约束后进入 cwd 的 `CwdResourceSnapshot.resolved`；工具执行仍由 `SessionRuntime` / `ToolGateway` 结合 cwd 和 sandbox view 治理。下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
+`AgentRuntime` 集中持有 workspace host、资源快照存储和运行时服务入口。凭据和 provider catalog 是 user-global/runtime-global；项目资源只能通过 `ResourceManager` 受 trust gate、source info 和 overlay policy 约束后进入 cwd 的 `CwdResourceSnapshot.resolved`；工具执行仍由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统结合 cwd 和 sandbox view 治理。下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
 
 ## Slash Command Route
 

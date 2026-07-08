@@ -16,7 +16,7 @@ It does not own model providers, tools, resources, queues, UI, or session persis
 ```text
 AgentRun::next_step()
   ├─ CallModel: Driver 调 host.call_model(...)，再 AgentRun::model_response(...)
-  ├─ CallTools: Driver 调 host.invoke_tool(...)，再 AgentRun::tool_results(...)
+  ├─ CallTools: Driver 调 host.invoke_tool_batch(...)，再 AgentRun::tool_results(...)
   └─ Done: Driver 返回 DriveResult 给 SessionRuntime
 ```
 
@@ -93,7 +93,7 @@ Driver
 SessionRuntime
   → owns queues, phase, hooks, persistence, tool state, model state
 
-Tools / ToolGateway
+Tools
   → owns tool governance and execution
 
 ModelGateway behind DriverHost::call_model
@@ -108,7 +108,7 @@ ModelGateway behind DriverHost::call_model
 pub async fn drive_run(
     &self,
     request: DriveRequest,
-    host: &dyn DriverHost,
+    host: &mut dyn DriverHost,
     cancel: CancellationToken,
 ) -> DriveResult;
 ```
@@ -148,7 +148,7 @@ MVP 可以暂不产生 `Paused`，但不要把接口设计死成只能 completed
 
 ## Host Interface
 
-`DriverHost` 是 `Driver` 与 `SessionRuntime` 之间的 seam。它让 driver 不直接持有 provider、tool gateway、queue 或 persistence。
+`DriverHost` 是 `Driver` 与 `SessionRuntime` 之间的 seam。它让 driver 不直接持有 provider、`Tools`、queue 或 persistence。
 
 ```rust
 #[async_trait]
@@ -161,11 +161,12 @@ pub trait DriverHost {
         sink: ModelStreamSink,
     ) -> Result<ModelCallResult, RuntimeError>;
 
-    async fn invoke_tool(
-        &self,
-        invocation: ToolInvocation,
+    async fn invoke_tool_batch(
+        &mut self,
+        request: ToolBatchRequest,
         sink: ToolUpdateSink,
-    ) -> Result<ToolInvocationResult, RuntimeError>;
+        cancel: CancellationToken,
+    ) -> Result<ToolBatchResult, RuntimeError>;
 
     async fn before_next_model_call(
         &self,
@@ -182,7 +183,7 @@ pub trait DriverHost {
 命名意图：
 
 - `call_model`：真实 provider 调用不属于 `Driver`。
-- `invoke_tool`：工具执行不属于 `Driver`；host 内部走 `ToolGateway`。
+- `invoke_tool_batch`：工具执行不属于 `Driver`；host 内部由 `SessionRuntime` 转发给 session-scoped `Tools` 子系统。
 - `before_next_model_call`：比 `prepare_next_turn` 更准确，避免 Rig turn、user turn 和 session turn 混淆。
 - `before_run_finish`：比 `drain_follow_up` 更深，允许 `SessionRuntime` 决定 finish、continue with follow-up、pause、retry 或 abort。
 
@@ -239,7 +240,7 @@ fn feed_model_response_to_rig(...)
 
 ```rust
 fn map_pending_tool_call(...)
-async fn invoke_tool_gateway(...)
+async fn invoke_tools(...)
 fn map_tool_result_for_rig(...)
 fn feed_tool_results_to_rig(...)
 ```
@@ -281,11 +282,11 @@ AgentRunStep::CallModel { prompt, history, turn }
 
 ```text
 AgentRunStep::CallTools { calls }
-  → for each PendingToolCall:
-      → map_pending_tool_call(...)
-      → host.invoke_tool(invocation, ToolUpdateSink)
-          → SessionRuntime ToolGateway handles registry/policy/approval/hooks/executor
-      → map_tool_result_for_rig(...)
+  → map PendingToolCall[] -> ToolBatchRequest { calls: ToolInvocation { call_index, ... } }
+  → host.invoke_tool_batch(request, ToolUpdateSink)
+      → SessionRuntime forwards to Tools::invoke_batch(...)
+      → Tools handles registry/active/policy/approval/grants/sandbox/coordinator/executor
+  → map ToolBatchResult -> Rig tool results
   → AgentRun::tool_results(results)
 ```
 
@@ -336,7 +337,7 @@ MVP 可以只实现 `Continue` / `Finish` / `ContinueWithMessages`，但函数�
 
 - provider error：返回 `DriveResult::Failed`，由 `SessionRuntime` 决定是否写失败 assistant message、auto retry 或 compaction recovery。
 - tool error：优先转换为 error tool result 并喂回 Rig，除非是 abort。
-- cancellation：`cancel` 必须传播到 `host.call_model`、`host.invoke_tool`、approval wait 和 stream sink。
+- cancellation：`cancel` 必须传播到 `host.call_model`、`host.invoke_tool_batch`、approval wait 和 stream sink。
 - out-of-protocol Rig error：返回 `DriveResult::Failed`，并附带当前已归约 messages。
 - stream prematurely ended：构造结构化 driver error，不让 UI 卡在 running 状态。
 

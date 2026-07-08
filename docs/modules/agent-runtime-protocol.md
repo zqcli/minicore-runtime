@@ -75,7 +75,7 @@ pub enum Command {
     NewSession { workspace_id: WorkspaceId },
     OpenSession { session_id: SessionId },
     FocusSession { session_id: SessionId },
-    ListSessions { scope: SessionListScope, filter: Option<SessionListFilter>, cursor: Option<PageCursor>, limit: usize },
+    ListSessions { scope: SessionListScope, filter: Option<SessionListFilter>, cursor: Option<PageCursor>, limit: u32 },
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: DeliveryMode },
     InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: DeliveryMode },
     InvokePromptTemplate { session_id: SessionId, template_name: String, args: Vec<String>, delivery: DeliveryMode },
@@ -86,7 +86,7 @@ pub enum Command {
     AppendMessage { session_id: SessionId, message: MessageRecord, trigger_turn: bool },
     AbortRun { run_id: RunId },
     WaitForIdle { session_id: SessionId },
-    DecideToolApproval { session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
+    DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
     SetModel { session_id: SessionId, provider_id: String, model_id: String },
     SetThinkingLevel { session_id: SessionId, level: ThinkingLevel },
     SetTools { session_id: SessionId, tools: Vec<ToolConfig>, active_tool_names: Option<Vec<String>> },
@@ -137,7 +137,8 @@ GetEffectivePrompt { session_id: SessionId }
 CompleteSlashCommandArgs { session_id: Option<SessionId>, command_name: String, prefix: String }
 GetSlashCommandCatalog { session_id: Option<SessionId> }
 SubmitCommandInteraction { interaction_id: InteractionId, selection: InteractionSelection, form_values: serde_json::Value }
-SetToolPolicy { policy: ToolPolicyConfig }
+SetToolPolicy { session_id: SessionId, policy: ToolPolicyConfig }
+SetToolApprovalMode { session_id: SessionId, mode: ToolApprovalMode }
 ExportSession { session_id: SessionId, format: ExportFormat }
 NavigateSessionTree { session_id: SessionId, target_entry_id: EntryId }
 ForkSession { session_id: SessionId, from_entry_id: EntryId }
@@ -151,17 +152,36 @@ GetContextUsage { session_id: SessionId }
 
 `GetSkill`、`GetPromptTemplate`、`GetContextFile` 和 `GetEffectivePrompt` 是后续资源详情查询，不是会话运行命令，也不应改变 resource revision。实现时可以把它们做成 request/response 形式的 protocol query，或做成 `dispatch()` 后产生明确 response event 的命令；无论采用哪种 transport，读取都必须经过 `AgentRuntime` / `ResourceManager`，不能让 UI adapter 直接读文件。`GetSkill` / `GetPromptTemplate` 读取 current `CwdResourceSnapshot.resolved`，`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 context file canonical path。`GetEffectivePrompt` 可能包含工具状态和项目上下文，默认应作为 debug/privileged query，而不是普通 snapshot 字段。
 
-`DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`ToolApprovalBroker` 必须确认 `session_id`、`run_id`、`call_id` 仍匹配当前 pending tool call。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
+`DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`ToolApprovalBroker` 必须确认 `approval_id` 与 `session_id`、`run_id`、`call_id` 仍匹配同一个 pending approval。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
 
 ```rust
+pub enum ToolApprovalMode {
+    AskEveryTime,
+    UseRememberedGrants,
+    AutoAllow { max_risk: ToolRisk },
+    AutoDeny { reason: String },
+}
+
 pub enum ToolApprovalDecision {
-    Approve,
+    ApproveOnce,
+    ApproveGrant { scope: ApprovalGrantScope, ttl: Option<Duration> },
     Reject { reason: Option<String> },
 }
 
+pub enum ApprovalGrantScope {
+    SameCallFingerprint,
+    SameToolInRun,
+    SameToolInSession,
+    SameToolInWorkspace,
+}
+
+pub struct ToolCallIndex(pub u32);
+
 pub struct PendingToolApprovalView {
+    pub approval_id: ApprovalRequestId,
     pub session_id: SessionId,
     pub run_id: RunId,
+    pub call_index: ToolCallIndex,
     pub call_id: ToolCallId,
     pub tool_name: String,
     pub risk: ToolRisk,
@@ -171,7 +191,7 @@ pub struct PendingToolApprovalView {
 }
 ```
 
-`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，用于 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。它只暴露审批弹窗、命令面板或 TUI 行内确认需要的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。UI 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { session_id, run_id, call_id, decision }`。
+`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，用于 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。它只暴露审批弹窗、命令面板或 TUI 行内确认需要的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。UI 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
 
 `OpenSession` 会在需要时加载 `SessionRuntime`，并通常使它成为 focused session；`FocusSession` 只改变 runtime-visible focus，不要求重新加载已打开会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
 
@@ -215,7 +235,7 @@ pub enum SessionEvent {
     ToolsChanged { session_id: SessionId, tool_names: Vec<String>, active_tool_names: Vec<String> },
     ActiveToolsChanged { session_id: SessionId, tool_names: Vec<String> },
     StreamOptionsChanged { session_id: SessionId, options: StreamOptions },
-    Settled { session_id: SessionId, next_turn_count: usize },
+    Settled { session_id: SessionId, next_turn_count: u64 },
 }
 
 pub enum RunEvent {
@@ -232,17 +252,17 @@ pub enum MessageEvent {
 }
 
 pub enum ToolCallEvent {
-    Proposed { call_id: ToolCallId, name: String, args: serde_json::Value, risk: ToolRisk, requires_approval: bool },
-    ApprovalRequested { call_id: ToolCallId, name: String, risk: ToolRisk, reason: String, preview: ToolApprovalPreview },
-    Started { call_id: ToolCallId },
-    OutputDelta { call_id: ToolCallId, delta: String },
-    Finished { call_id: ToolCallId, result: ToolResultView, is_error: bool },
+    Proposed { call_index: ToolCallIndex, call_id: ToolCallId, name: String, args: serde_json::Value, risk: ToolRisk, requires_approval: bool },
+    ApprovalRequested { approval_id: ApprovalRequestId, call_index: ToolCallIndex, call_id: ToolCallId, name: String, risk: ToolRisk, reason: String, preview: ToolApprovalPreview },
+    Started { call_index: ToolCallIndex, call_id: ToolCallId },
+    OutputDelta { call_index: ToolCallIndex, call_id: ToolCallId, delta: String },
+    Finished { call_index: ToolCallIndex, call_id: ToolCallId, result: ToolResultView, is_error: bool },
 }
 
 pub enum ToolApprovalPreview {
     Read { path: PathBuf },
     FileWrite { path: PathBuf, creates: bool, overwrites: bool, bytes: u64, diff_preview: Option<String> },
-    FileEdit { path: PathBuf, replacements: usize, diff: String },
+    FileEdit { path: PathBuf, replacements: u32, diff: String },
     Patch { files: Vec<PatchFilePreview>, additions: u64, deletions: u64, diff_preview: Option<String> },
     Bash { command: String, cwd: PathBuf, timeout: Option<u64>, risk_notes: Vec<String> },
 }
@@ -699,7 +719,7 @@ pub struct CommandSurfaceSnapshot {
 
 `active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
 
-`RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `call_id` 回答。
+`RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `approval_id` 与 `call_id` 回答。
 
 `RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 

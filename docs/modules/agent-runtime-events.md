@@ -15,7 +15,7 @@
 2. `agent_runtime_protocol::Event.msg` 使用分组 enum，例如 `agent_runtime_protocol::EventMsg::Run(RunEvent::Started)`。
 3. UI/wire 事件类型使用 flat `snake_case`，例如 `run_started`、`tool_call_output_delta`。
 4. 所有 UI 事件都携带顺序号、时间、workspace/session/run/command correlation；这些 metadata 属于 `agent_runtime_protocol::Event` 外层记录。
-5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`ToolGateway` update、`RuntimeHooks` typed result 不能直接泄漏给 UI。
+5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、`RuntimeHooks` typed result 不能直接泄漏给 UI。
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
 7. 流式 delta 不是持久化事实；`persistence_save_point` 才是“此前相关 session writes 已经落盘”的 durable barrier。
 8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry，并且 phase 已经回到 `idle`。
@@ -49,7 +49,7 @@ UI / wire:
 ```text
 // 不推荐
 SessionRuntimeRunStarted
-ToolGatewayToolCallStarted
+ToolsToolCallStarted
 ResourceManagerResourcesChanged
 ```
 
@@ -170,7 +170,7 @@ SessionRuntime event sink
   AgentRuntime event bus assigns event_id + sequence + timestamp
 ```
 
-`Driver`、`ToolGateway`、`ResourceManager`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
+`Driver`、`Tools`、`ResourceManager`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
 
 ### RuntimeSnapshot 水位
 
@@ -234,7 +234,7 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、message persistence、compaction、retry、save point。 |
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
-| `ToolGateway` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
+| `Tools` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
 | `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 `TurnResourceSnapshot` 并重建 prompt。 |
 | `CommandSurface` | 不直接发 UI event | 返回 command catalog、parse/plan 结果和 command presentation；`AgentRuntime` 发布 `slash_commands_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 protocol command。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
@@ -252,11 +252,11 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、tool state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`ToolGateway` progress、`SessionHandle` 写入结果、hook 结果 |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle` 写入结果、hook 结果 |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
-| `ToolGateway` | 单次 tool invocation 的治理上下文、policy evaluation、approval wait、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 registry/policy/approval/executor/hook；返回 `ToolInvocationResult` |
-| `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `ToolGateway` 调用 |
+| `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor/hook；返回 `ToolBatchResult` |
+| `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `Tools` 调用 |
 | `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
 | `CommandSurface` | `SlashCommandCatalog` projection、name conflict diagnostics、phase policy、raw invocation parse result、execution plan、presentation plan | 不发布 UI event；返回 catalog、plan 或 `CommandPresentation` | `AgentRuntime` 发布 `slash_commands_changed` 和 command presentation events；`SessionRuntime` 执行 session-scoped command |
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
@@ -347,7 +347,7 @@ PendingSessionWrites
 QueueState
 ModelState
 ResourceState view
-ToolRegistry / ActiveToolSet / ToolGateway
+Tools / ToolRegistry / ActiveToolSet
 CompactionState
 RetryState
 RuntimeHookRegistry
@@ -396,7 +396,7 @@ diagnostics_error
 
 ```text
 DriverEvent
-ToolGateway progress/update
+Tools progress/update
 ModelGateway stream result
 SessionHandle append/build_context result
 RuntimeHooks typed result
@@ -450,14 +450,21 @@ DriverEvent::RunFinished
 
 这些事件不直接进入 UI。`SessionRuntime` 决定哪些转换成 `agent_runtime_protocol::Event`，何时写 session，何时发 `persistence_save_point` 和 `run_finished`。
 
-### ToolGateway Ownership
+### Tools Ownership
 
-`ToolGateway` 拥有一次 tool invocation 的治理过程，但不拥有会话级工具状态。
+`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，拥有工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination 和 executor implementations。它不直接发布 UI event，也不写 session storage；所有工具内部 update 都通过 `SessionRuntime` 传入的 sink 归约。
 
-持有临时状态：
+持有状态：
 
 ```text
-ToolInvocation
+ToolRegistry lifecycle
+ActiveToolSet lifecycle
+ToolPromptCatalog
+ToolPolicy
+ToolApprovalBroker / pending approvals
+ToolApprovalGrantStore / approval modes
+ToolExecutionCoordinator
+ToolExecutorRegistry
 prepared arguments
 schema validation result
 policy decision
@@ -479,11 +486,10 @@ tool_call_finished
 不持有：
 
 ```text
-ToolRegistry lifecycle
-ActiveToolSet lifecycle
 session phase
 run terminal status
 tool result message persistence
+UI event metadata / sequence
 ```
 
 ### ResourceManager Ownership
