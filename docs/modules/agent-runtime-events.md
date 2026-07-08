@@ -39,6 +39,8 @@ UI / wire:
 | Rust 内部事件 | Wire event type |
 | --- | --- |
 | `agent_runtime_protocol::EventMsg::Run(RunEvent::Started)` | `run_started` |
+| `agent_runtime_protocol::EventMsg::Run(RunEvent::Suspended)` | `run_suspended` |
+| `agent_runtime_protocol::EventMsg::Run(RunEvent::Resumed)` | `run_resumed` |
 | `agent_runtime_protocol::EventMsg::Run(RunEvent::Finished)` | `run_finished` |
 | `agent_runtime_protocol::EventMsg::Message(MessageEvent::AssistantTextDelta)` | `message_assistant_text_delta` |
 | `agent_runtime_protocol::EventMsg::ToolCall(ToolCallEvent::ApprovalRequested)` | `tool_call_approval_requested` |
@@ -69,6 +71,8 @@ owner module 通过文档表格说明，不进入 wire event type。
 | 词 | 用途 | 示例 |
 | --- | --- | --- |
 | `started` | 生命周期开始 | `run_started`、`tool_call_started` |
+| `suspended` | 可恢复暂停，不是终态 | `run_suspended` |
+| `resumed` | 从可恢复暂停继续 | `run_resumed` |
 | `finished` | 生命周期终态，可携带 status | `run_finished`、`compaction_finished` |
 | `delta` | 流式增量 | `message_assistant_text_delta`、`tool_call_output_delta` |
 | `changed` | 配置、资源或名称变更 | `session_model_changed`、`resources_changed` |
@@ -76,7 +80,7 @@ owner module 通过文档表格说明，不进入 wire event type。
 | `appended` | transcript/session view 追加 | `message_user_appended`、`command_output_appended` |
 | `requested` | 等待外部动作 | `tool_call_approval_requested`、`command_interaction_requested` |
 
-本项目统一使用 `started/finished`，不混用 `begin/end/complete`。`finished` 可以覆盖 `completed`、`failed`、`aborted`、`paused` 等终态，具体结果放在对应 event msg 的 `status` 字段。
+本项目统一使用 `started/finished`，不混用 `begin/end/complete`。`finished` 只覆盖 `completed`、`failed`、`aborted` 等终态，具体结果放在对应 event msg 的 `status` 字段。可恢复暂停使用 `run_suspended` / `run_resumed`，不能表达为 `run_finished { status: paused }`。
 
 ## Event And EventMsg
 
@@ -212,7 +216,7 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | Family | Wire event type 示例 | 生命周期 | 是否可由 RuntimeSnapshot 重建 |
 | --- | --- | --- | --- |
 | session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_focus_changed`、`session_tree_changed` | 离散事实 | 是 |
-| run lifecycle | `run_started`、`run_finished` | started -> terminal | 是，当前 run 只能部分重建 |
+| run lifecycle | `run_started`、`run_suspended`、`run_resumed`、`run_finished` | started -> suspended/resumed* -> terminal | 是，当前 run 只能部分重建 |
 | message lifecycle | `message_user_appended`、`message_assistant_started`、`message_assistant_text_delta`、`message_assistant_finished`、`message_tool_result_appended` | appended 或 started -> delta* -> finished | finished 后是，delta 不是 |
 | tool call lifecycle | `tool_call_proposed`、`tool_call_approval_requested`、`tool_call_started`、`tool_call_output_delta`、`tool_call_finished` | proposed -> approval? -> started -> delta* -> finished | finished 后是，delta 不是 |
 | queue lifecycle | `queue_updated` | 每次队列变化发完整队列摘要 | 是 |
@@ -368,6 +372,8 @@ session_active_tools_changed
 session_stream_options_changed
 session_settled
 run_started
+run_suspended
+run_resumed
 run_finished
 message_user_appended
 message_assistant_started
@@ -619,14 +625,15 @@ CommandAck
 
 1. 同一个 `AgentRuntime` 的 `sequence` 必须严格单调递增。
 2. 同一个 `run_id` 只能有一个 `run_started`，并且必须有且只有一个 terminal `run_finished`。
-3. `message_assistant_text_delta` 必须发生在对应 `message_assistant_started` 和 `message_assistant_finished` 之间。
-4. `tool_call_output_delta` 必须发生在对应 `tool_call_started` 和 `tool_call_finished` 之间。
-5. `tool_call_approval_requested` 只能发生在 `tool_call_proposed` 之后、`tool_call_started` 之前。
-6. `persistence_save_point` 只能在相关 session writes 成功后发出。
-7. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry，且没有同步马上要启动的 continuation 时发出。
-8. `diagnostics_error` 不替代 terminal event。run 内失败需要 `diagnostics_error` + `run_finished { status: failed }`；abort 需要 `run_finished { status: aborted }`。
-9. `resources_changed` 表示新 resource revision 已经原子替换；失败 reload 不应污染旧 revision。
-10. UI reducer 必须能从任意 `agent_runtime_protocol::RuntimeSnapshot` 加之后续事件恢复一致状态。
+3. `run_suspended` / `run_resumed` 只能发生在 `run_started` 之后、terminal `run_finished` 之前；它们不是终态，不能替代 `run_finished`。
+4. `message_assistant_text_delta` 必须发生在对应 `message_assistant_started` 和 `message_assistant_finished` 之间。
+5. `tool_call_output_delta` 必须发生在对应 `tool_call_started` 和 `tool_call_finished` 之间。
+6. `tool_call_approval_requested` 只能发生在 `tool_call_proposed` 之后、`tool_call_started` 之前。
+7. `persistence_save_point` 只能在相关 session writes 成功后发出。
+8. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry，且没有同步马上要启动的 continuation 时发出。
+9. `diagnostics_error` 不替代 terminal event。run 内失败需要 `diagnostics_error` + `run_finished { status: failed }`；abort 需要 `run_finished { status: aborted }`。
+10. `resources_changed` 表示新 resource revision 已经原子替换；失败 reload 不应污染旧 revision。
+11. UI reducer 必须能从任意 `agent_runtime_protocol::RuntimeSnapshot` 加之后续事件恢复一致状态。
 
 ## Lifecycle State Machines
 
@@ -801,16 +808,23 @@ Pending
       ├─ ModelCalling
       ├─ ToolCalling
       ├─ WaitingApproval
+      ├─ Suspended
       └─ Finishing
-  -- run_finished(status) --> Finished(completed | failed | aborted | paused)
+  -- run_suspended(resume_id, reason) --> Suspended
+  -- run_resumed(resume_id) --> Running
+  -- run_finished(status) --> Finished(completed | failed | aborted)
 ```
 
-UI 只需要两个 run lifecycle event：
+UI 需要的 run lifecycle event：
 
 - `run_started`
+- `run_suspended { resume_id, reason }`
+- `run_resumed { resume_id }`
 - `run_finished { status }`
 
-中间状态通过 message/tool/approval 事件体现，不额外暴露 `run_model_calling` 或 `run_waiting_tool`，避免状态重复。
+`run_suspended` 是可恢复暂停，不是终态。它表示 `Driver` / `SessionRuntime` 已在协议安全 checkpoint 停住，并持有 resume state；恢复后继续同一个未完成 run 的 continuation。`run_finished` 仍是唯一 terminal run event，不存在 `run_finished { status: paused }`。
+
+普通中间状态通过 message/tool/approval 事件体现，不额外暴露 `run_model_calling` 或 `run_waiting_tool`，避免状态重复。`WaitingApproval` 可以只通过 `tool_call_approval_requested` 和 `RunView.pending_tool_approvals` 表达；只有需要挂起并等待显式 resume 时，才进入 `CurrentRunState::Suspended`。
 
 ### 9. Model Call Lifecycle
 

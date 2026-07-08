@@ -248,6 +248,14 @@ _避免_：重复后端、UI 专属 Agent
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
 
+**当前运行状态（`CurrentRunState`）**：
+`RuntimeSnapshot.active_session.current_run` 中描述当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
+_避免_：RunTerminalStatus、SessionPhase、工具调用状态
+
+**可恢复暂停（`Suspended`）**：
+当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending、safe point 用户暂停或 host shutdown checkpoint。它不能表达为 `run_finished { status: paused }`。
+_避免_：focus 切换、terminal finished、普通 waiting approval、模型 streaming 中途暂停
+
 **Driver（Rig 适配器）**：
 会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。
 _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行

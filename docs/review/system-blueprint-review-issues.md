@@ -90,19 +90,23 @@
 
 ### BR-005：`RunTerminalStatus::Paused` 与 run 单终态/暂停语义冲突
 
-状态：Open
+状态：Resolved
 
-问题：协议把 `Paused` 放入 `RunTerminalStatus`，但 Driver 把 `DriveResult::Paused` 作为未来可序列化暂停路径。Paused 到底是终态、可恢复中间态，还是 run lifecycle 的另一类状态，目前不清楚。
+处理记录：已决策 `paused` 不再是 run terminal status。`RunTerminalStatus` 只包含 `Completed`、`Failed`、`Aborted`；可恢复暂停表达为 current run 的 `CurrentRunState::Suspended { resume_id, reason }`，并通过 `RunEvent::Suspended` / `RunEvent::Resumed` 暴露。`DriveResult` 中对应结果改为 `Suspended { reason: SuspendReason, serialized_run }`，由 `SessionRuntime` 分配 `ResumeId` 并持有 resume state。`run_finished` 仍是唯一终态事件，不存在 `run_finished { status: paused }`。
 
-证据：
+原问题：协议把 `Paused` 放入 `RunTerminalStatus`，但 Driver 把 `DriveResult::Paused` 作为未来可序列化暂停路径。Paused 到底是终态、可恢复中间态，还是 run lifecycle 的另一类状态，此前不清楚。
+
+原证据：
 
 - `docs/modules/agent-runtime-protocol.md`：`RunTerminalStatus { Completed, Failed, Aborted, Paused }`。
 - `docs/modules/driver.md`：`DriveResult::Paused { reason, serialized_run }`；MVP 可以暂不产生 `Paused`，但不要把接口设计死成只能 completed/failed。
 - `docs/adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md`：一次 run 只有一个终态事件 `run_finished { status }`。
 
-风险：UI reducer、session phase、run resume、持久化屏障会混淆 paused 和 terminal finished。
+原风险：UI reducer、session phase、run resume、持久化屏障会混淆 paused 和 terminal finished。
 
-待处理方向：明确 paused 是 terminal status 还是独立 lifecycle event/state；如果是可恢复暂停，可能不应叫 terminal status。
+决策结果：paused/suspended 是可恢复 checkpoint 状态，不是终态。典型 checkpoint 包括 tool result 已产生但尚未回填给 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停、host shutdown checkpoint。普通 focus 切换不是暂停；MVP pending approval 可以作为 current run 的 waiting substate 表达，不必进入 suspended，除非需要挂起并等待显式 resume。
+
+待处理方向：已处理。后续实现需验证：`run_suspended` 后 `RuntimeSnapshot.active_session.current_run.state` 为 `Suspended`；`run_resumed` 后回到 `Running` 或 `WaitingApproval`；最终仍必须且只能产生一个 `run_finished { status: Completed | Failed | Aborted }`。
 
 ### BR-006：CommandPresentation 可携带完整 Command，可能突破 presentation 边界
 
