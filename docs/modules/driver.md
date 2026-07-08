@@ -153,12 +153,13 @@ MVP 可以暂不产生 `Paused`，但不要把接口设计死成只能 completed
 ```rust
 #[async_trait]
 pub trait DriverHost {
-    async fn emit_driver_event(&self, event: DriverEvent) -> Result<(), RuntimeError>;
+    async fn emit_driver_event(&mut self, event: DriverEvent) -> Result<(), RuntimeError>;
 
     async fn call_model(
-        &self,
+        &mut self,
         request: ModelCallRequest,
         sink: ModelStreamSink,
+        cancel: CancellationToken,
     ) -> Result<ModelCallResult, RuntimeError>;
 
     async fn invoke_tool_batch(
@@ -169,12 +170,12 @@ pub trait DriverHost {
     ) -> Result<ToolBatchResult, RuntimeError>;
 
     async fn before_next_model_call(
-        &self,
+        &mut self,
         checkpoint: TurnCheckpoint,
     ) -> Result<NextModelCallDecision, RuntimeError>;
 
     async fn before_run_finish(
-        &self,
+        &mut self,
         checkpoint: FinishCheckpoint,
     ) -> Result<FinishDecision, RuntimeError>;
 }
@@ -186,6 +187,98 @@ pub trait DriverHost {
 - `invoke_tool_batch`：工具执行不属于 `Driver`；host 内部由 `SessionRuntime` 转发给 session-scoped `Tools` 子系统。
 - `before_next_model_call`：比 `prepare_next_turn` 更准确，避免 Rig turn、user turn 和 session turn 混淆。
 - `before_run_finish`：比 `drain_follow_up` 更深，允许 `SessionRuntime` 决定 finish、continue with follow-up、pause、retry 或 abort。
+
+## SessionDriverHost Wrapper
+
+`DriverHost` 不是一个需要长期保存的运行时对象。它是 `Driver` 访问外部世界的 trait seam：`Driver` 推进 Rig，遇到模型调用、工具调用或 safe point 时通过 host 回到 `SessionRuntime`。
+
+最小实现可以直接让 `SessionRuntime` 实现 `DriverHost`：
+
+```rust
+impl SessionRuntime {
+    pub async fn start_run(
+        &mut self,
+        request: DriveRequest,
+        cancel: CancellationToken,
+    ) -> DriveResult {
+        let driver = Driver::new();
+        driver.drive_run(request, self, cancel).await
+    }
+}
+
+#[async_trait]
+impl DriverHost for SessionRuntime {
+    async fn call_model(
+        &mut self,
+        request: ModelCallRequest,
+        sink: ModelStreamSink,
+        cancel: CancellationToken,
+    ) -> Result<ModelCallResult, RuntimeError> {
+        self.services.model_gateway.call_model(request, sink, cancel).await
+    }
+
+    async fn invoke_tool_batch(
+        &mut self,
+        request: ToolBatchRequest,
+        sink: ToolUpdateSink,
+        cancel: CancellationToken,
+    ) -> Result<ToolBatchResult, RuntimeError> {
+        let context = self.build_tool_run_context();
+        Ok(self.tools.invoke_batch(request, context, sink, cancel).await)
+    }
+}
+```
+
+真实实现更推荐 per-run `SessionDriverHost` wrapper：
+
+```rust
+impl SessionRuntime {
+    pub async fn start_run(
+        &mut self,
+        request: DriveRequest,
+        cancel: CancellationToken,
+    ) -> DriveResult {
+        let run_id = request.run_id;
+        let turn_resources = request.turn_state.resources.clone();
+
+        let mut host = SessionDriverHost {
+            session_id: self.session_id,
+            run_id,
+            cwd: self.cwd.clone(),
+            turn_resources,
+            tools: &mut self.tools,
+            model_gateway: &self.services.model_gateway,
+            event_sink: &mut self.event_sink,
+            queues: &mut self.queues,
+            current_run: &mut self.current_run,
+        };
+
+        let driver = Driver::new();
+        driver.drive_run(request, &mut host, cancel).await
+    }
+}
+
+pub struct SessionDriverHost<'a> {
+    session_id: SessionId,
+    run_id: RunId,
+    cwd: PathBuf,
+    turn_resources: Arc<TurnResourceSnapshot>,
+    tools: &'a mut Tools,
+    model_gateway: &'a ModelGateway,
+    event_sink: &'a mut SessionEventSink,
+    queues: &'a mut QueueState,
+    current_run: &'a mut Option<CurrentRun>,
+}
+```
+
+选择 wrapper 的原因：
+
+- 它把 `Driver` 需要的能力从 `SessionRuntime` 中“切一小片”出来，避免 host 方法随手访问整个会话对象。
+- 它让 run-scoped context（`run_id`、turn resources、event correlation、checkpoint context）只在一次 `drive_run()` 期间存活，run 结束后自然 drop。
+- 它避免 `self.driver.drive_run(..., self, ...)` 这类自借用写法带来的 Rust borrow checker 压力；`Driver` 应保持轻量，可以在 run start 时临时创建或 clone。
+- 它使 `Driver` 更容易单测：测试可以传入 fake host，而不需要构造完整 `SessionRuntime`。
+
+无论采用直接实现还是 wrapper，实现约束相同：`Driver` 不执行工具、不读凭据、不写 session；`DriverHost` 只把请求转回 `SessionRuntime` 拥有的 `ModelGateway`、`Tools`、queue 和事件归约能力。
 
 ## Driver Events
 
@@ -267,7 +360,7 @@ reload_tools           // 工具生命周期不属于 driver
 ```text
 AgentRunStep::CallModel { prompt, history, turn }
   → build_model_call_request(prompt, history, turn, turn_state)
-  → host.call_model(request, ModelStreamSink)
+  → host.call_model(request, ModelStreamSink, cancel)
       → provider/model gateway handles credentials, hooks, payload, fallback
       → ModelStreamSink emits model/assistant deltas as DriverEvent
   → assemble_model_turn(ModelCallResult)

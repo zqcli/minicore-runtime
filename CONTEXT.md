@@ -252,6 +252,14 @@ _避免_：响应、请求、chat completion
 会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。
 _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行
 
+**DriverHost**：
+`Driver` 访问外部世界的 trait seam，定义 `call_model`、`invoke_tool_batch`、`before_next_model_call`、`before_run_finish` 等回调。它不是长期运行时对象，也不拥有 session 状态；它只是让无状态/浅状态的 `Driver` 回到 `SessionRuntime` 所拥有的模型、工具、队列和事件能力。
+_避免_：Driver 实例、工具执行器、SessionRuntime 本体、全局服务
+
+**SessionDriverHost**：
+一次 `drive_run()` 期间临时创建的 `DriverHost` wrapper，借用 `SessionRuntime` 中本次 run 需要的一小片能力，例如 `Tools`、`ModelGateway`、event sink、queue state 和 `CurrentRun`，并携带从 `TurnState` clone 出来的 turn resources。直接 `impl DriverHost for SessionRuntime` 是合法简化版，但 wrapper 更能收窄访问面、隔离 run-scoped context，并避免 Rust 自借用压力。
+_避免_：长期子系统、session 状态 owner、独立 runtime
+
 **Tools 子系统 / 工具模块**：
 `SessionRuntime` 内部的 session-scoped `tools.rs` / `tools/` 子系统，封装工具定义、注册表、活跃工具、工具提示素材、策略、审批、授权记忆、执行协调、沙箱、mutation lock 和 executor implementations。`SessionRuntime` 负责协调 `Driver` 与 `Tools`，`Driver` 不直接依赖 `Tools`。
 _避免_：工具运行时、ToolRuntime、全局工具服务、UI 工具层、Rig ToolServer 替代品、平级 helper-only 模块

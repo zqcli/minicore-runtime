@@ -174,7 +174,47 @@ pub struct TurnState {
 
 ## Driver / Tools Coordination
 
-工具调用不由 `Driver` 直接执行。`SessionRuntime` 自己实现 `DriverHost`，或创建 per-run `SessionDriverHost` wrapper，实现下面的 seam：
+`SessionRuntime` 长期存活并持有 session 状态；`Driver` 基本无状态，只负责推进 Rig `AgentRun`；`DriverHost` 是一次 run 期间让 `Driver` 回调外部能力的 trait seam。
+
+代码形态可以简化为：
+
+```rust
+pub struct SessionRuntime {
+    session_id: SessionId,
+    cwd: PathBuf,
+    tools: Tools,
+    services: Arc<WorkspaceServices>,
+    event_sink: SessionEventSink,
+    queues: QueueState,
+    current_run: Option<CurrentRun>,
+}
+```
+
+`Tools` 是 session-owned 子系统，因为它持有 active tools、pending approvals、approval mode、grants、sandbox/mutation state 等会话中间状态。`Driver` 只是执行协作者；它可以在 run start 时临时创建或 clone，不应该携带 session identity。
+
+工具调用不由 `Driver` 直接执行。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper：
+
+```rust
+let run_id = request.run_id;
+let turn_resources = request.turn_state.resources.clone();
+
+let mut host = SessionDriverHost {
+    session_id: self.session_id,
+    run_id,
+    cwd: self.cwd.clone(),
+    turn_resources,
+    tools: &mut self.tools,
+    model_gateway: &self.services.model_gateway,
+    event_sink: &mut self.event_sink,
+    queues: &mut self.queues,
+    current_run: &mut self.current_run,
+};
+
+let driver = Driver::new();
+driver.drive_run(request, &mut host, cancel).await
+```
+
+该 wrapper 实现下面的 seam：
 
 ```text
 DriverHost::invoke_tool_batch(request, updates, cancel)
@@ -184,6 +224,13 @@ DriverHost::invoke_tool_batch(request, updates, cancel)
 ```
 
 `Tools` 返回内部工具结果和 update；`SessionRuntime` 负责归约 UI event、session writes、pending approval snapshot projection 和 save point。`Driver` 只把 `ToolBatchResult` 映射回 Rig tool results，并继续推进 `AgentRun`。
+
+选择 `SessionDriverHost` 而不是只写 `impl DriverHost for SessionRuntime` 的缘由：
+
+- 直接实现是合法的最小版本，但 wrapper 可以限制 `DriverHost` 方法只能访问本次 run 需要的字段，避免把整个 `SessionRuntime` 暴露给 driver seam。
+- wrapper 将 `run_id`、turn resources、event correlation、checkpoint context 等 run-scoped 数据与 session-scoped state 分离。
+- wrapper 避免 `self.driver.drive_run(..., self, ...)` 这类 Rust 自借用形态；`Driver` 越无状态，这个边界越简单。
+- wrapper 让 `Driver` 单测只需要 fake host，不需要构造真实 session runtime、tools、storage 和 event bus。
 
 ## Usage And Context Usage
 
