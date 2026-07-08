@@ -240,6 +240,8 @@ pub enum SessionEvent {
 
 pub enum RunEvent {
     Started { run_id: RunId, session_id: SessionId },
+    Suspended { run_id: RunId, resume_id: ResumeId, reason: SuspendReason },
+    Resumed { run_id: RunId, resume_id: ResumeId },
     Finished { run_id: RunId, status: RunTerminalStatus, usage: Option<UsageSummary> },
 }
 
@@ -343,7 +345,23 @@ pub enum RunTerminalStatus {
     Completed,
     Failed,
     Aborted,
-    Paused,
+}
+
+pub enum CurrentRunState {
+    Running,
+    WaitingApproval,
+    Suspended { resume_id: ResumeId, reason: SuspendReason },
+}
+
+pub struct ResumeId(pub String);
+
+pub enum SuspendReason {
+    WaitingToolApproval,
+    WaitingUserInteraction,
+    ExternalJobPending,
+    UserSuspendedAtSafePoint,
+    HostShutdownCheckpoint,
+    AfterToolResultCheckpoint,
 }
 
 pub enum EventScope {
@@ -588,6 +606,8 @@ UI/wire event type 映射：
 | `SessionEvent::StreamOptionsChanged` | `session_stream_options_changed` |
 | `SessionEvent::Settled` | `session_settled` |
 | `RunEvent::Started` | `run_started` |
+| `RunEvent::Suspended` | `run_suspended` |
+| `RunEvent::Resumed` | `run_resumed` |
 | `RunEvent::Finished` | `run_finished` |
 | `MessageEvent::UserAppended` | `message_user_appended` |
 | `MessageEvent::AssistantStarted` | `message_assistant_started` |
@@ -618,7 +638,7 @@ UI/wire event type 映射：
 | `DiagnosticsEvent::Warning` | `diagnostics_warning` |
 | `DiagnosticsEvent::Error` | `diagnostics_error` |
 
-事件是实时下游界面更新的唯一来源。CLI、Ratatui 和 Tauri/Vue 宿主都应把同一条事件流 reduce 成各自的 UI 状态。`run_finished` 是唯一 run terminal event；不要同时发 `run_aborted` 这类第二终态。
+事件是实时下游界面更新的唯一来源。CLI、Ratatui 和 Tauri/Vue 宿主都应把同一条事件流 reduce 成各自的 UI 状态。`run_finished` 是唯一 run terminal event；不要同时发 `run_aborted` 这类第二终态。`run_suspended` / `run_resumed` 是 current run 的可恢复中间态事件，不是终态。
 
 `command_interaction_resolved` 是后续可选事件。MVP 中 picker/menu/form 的选择结果可以直接触发新的 `ExecuteSlashCommand`，不要求 runtime 跟踪 pending interaction；只有实现 `SubmitCommandInteraction` 或需要审计 interaction 关闭/提交时，才需要发布 resolved 事件。
 
@@ -690,6 +710,7 @@ pub struct SessionSnapshot {
 
 pub struct RunView {
     pub run_id: RunId,
+    pub state: CurrentRunState,
     pub pending_tool_approvals: Vec<PendingToolApprovalView>,
 }
 
@@ -717,9 +738,11 @@ pub struct CommandSurfaceSnapshot {
 }
 ```
 
-`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session，恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session；MVP 恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动，未来若实现持久化 resume state，才可以用 `CurrentRunState::Suspended` 恢复未完成 run。model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。`RunView.state` 表示 current run 的当前执行状态；`Suspended` 是可恢复暂停状态，不是 terminal status。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
 
 `RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `approval_id` 与 `call_id` 回答。
+
+`CurrentRunState::Suspended` 表示 `Driver` 已在可恢复 checkpoint 停住，运行时持有 resume state，恢复时应继续同一个未完成 run 的协议 continuation。例如工具结果已经生成但尚未回填给 Rig / provider 时，可以 suspend 并在 resume 后按正式 tool result 协议继续。它不能通过 `run_finished { status: paused }` 表达；`run_finished` 只用于 completed / failed / aborted 这三类终态。
 
 `RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 

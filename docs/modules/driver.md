@@ -133,18 +133,18 @@ pub enum DriveEntry {
 }
 ```
 
-MVP 可以先不实现 `Resume`，但类型上保留方向。Rig `AgentRun` 是 serializable，后续 approval pending、长工具或进程恢复会需要 pause/resume seam。
+MVP 可以先不实现 `Resume`，但类型上保留方向。Rig `AgentRun` 是 serializable，后续 approval pending、长工具或进程恢复会需要 suspend/resume seam。
 
 ```rust
 pub enum DriveResult {
     Completed { messages: Vec<MessageRecord>, usage: UsageSummary },
     Aborted { messages: Vec<MessageRecord> },
     Failed { error: DriverError, messages: Vec<MessageRecord> },
-    Paused { reason: PauseReason, serialized_run: SerializedAgentRun },
+    Suspended { reason: SuspendReason, serialized_run: SerializedAgentRun },
 }
 ```
 
-MVP 可以暂不产生 `Paused`，但不要把接口设计死成只能 completed/failed。
+MVP 可以暂不产生 `Suspended`，但不要把接口设计死成只能 completed/failed/aborted。`Suspended` 不是 terminal result；它表示 `Driver` 已经在可恢复 checkpoint 停住，并把继续同一个未完成 AgentRun 所需的 `serialized_run` 交回 `SessionRuntime`。`SessionRuntime` 为它分配 `ResumeId`，投影为 `CurrentRunState::Suspended { resume_id, reason }`，并发出 `run_suspended`，而不是 `run_finished { status: paused }`。
 
 ## Host Interface
 
@@ -186,7 +186,7 @@ pub trait DriverHost {
 - `call_model`：真实 provider 调用不属于 `Driver`。
 - `invoke_tool_batch`：工具执行不属于 `Driver`；host 内部由 `SessionRuntime` 转发给 session-scoped `Tools` 子系统。
 - `before_next_model_call`：比 `prepare_next_turn` 更准确，避免 Rig turn、user turn 和 session turn 混淆。
-- `before_run_finish`：比 `drain_follow_up` 更深，允许 `SessionRuntime` 决定 finish、continue with follow-up、pause、retry 或 abort。
+- `before_run_finish`：比 `drain_follow_up` 更深，允许 `SessionRuntime` 决定 finish、continue with follow-up、suspend、retry 或 abort。
 
 ## SessionDriverHost Wrapper
 
@@ -284,7 +284,7 @@ pub struct SessionDriverHost<'a> {
 
 `DriverEvent` 是 driver 内部事件，不是 UI 直接消费的 `agent_runtime_protocol::Event`。`SessionRuntime` 订阅并归约这些事件，再写 session、发 UI event、更新 snapshot。
 
-driver 的 `RunFinished { result }` 只表示 Rig drive 已经结束；UI 侧唯一 run terminal event 是 `run_finished { status, ... }`，由 `SessionRuntime` 在完成必要的持久化、错误归类和后续队列判断后发出。
+driver 的 `RunFinished { result }` 只表示 Rig drive 已经结束；UI 侧唯一 run terminal event 是 `run_finished { status, ... }`，由 `SessionRuntime` 在完成必要的持久化、错误归类和后续队列判断后发出。`DriveResult::Suspended` 不应归约为 `run_finished`；它由 `SessionRuntime` 分配 `ResumeId`、保存 resume state，并发出非终态 `run_suspended`。
 
 ```rust
 pub enum DriverEvent {
@@ -401,7 +401,7 @@ before_next_model_call
 
 before_run_finish
   在 Rig 即将 Done 时触发。
-  SessionRuntime 可决定结束、注入 follow-up 继续运行、暂停、retry 或 abort。
+  SessionRuntime 可决定结束、注入 follow-up 继续运行、suspend、retry 或 abort。
 ```
 
 建议类型：
@@ -412,7 +412,7 @@ pub enum NextModelCallDecision {
     PatchTurnState(TurnStatePatch),
     InjectMessages(Vec<MessageRecord>),
     Abort { reason: String },
-    Pause { reason: PauseReason },
+    Suspend { reason: SuspendReason },
 }
 
 pub enum FinishDecision {
@@ -420,7 +420,7 @@ pub enum FinishDecision {
     ContinueWithMessages(Vec<MessageRecord>),
     Retry { reason: RetryReason },
     Abort { reason: String },
-    Pause { reason: PauseReason },
+    Suspend { reason: SuspendReason },
 }
 ```
 

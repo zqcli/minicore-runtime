@@ -365,6 +365,6 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ## 过程性观察（不编号）
 
-1. **字段级设计先行于 Rig 验证。** roadmap 正确地把 Rig spike 排在阶段 4，但 `DriveEntry::Resume { serialized_run }`、`DriveResult::Paused`、usage extraction、cancellation 等大量字段级类型已按未验证的 Rig sans-IO 假设写死。command-surface.md 有"类型片段是设计草图"的免责声明，其他文档（尤其 protocol.md）没有——建议统一标注哪些类型是承诺、哪些是草图，并在 spike 前冻结字段级细节的进一步扩张。
+1. **字段级设计先行于 Rig 验证。** roadmap 正确地把 Rig spike 排在阶段 4，但 `DriveEntry::Resume { serialized_run }`、`DriveResult::Suspended`、usage extraction、cancellation 等大量字段级类型已按未验证的 Rig sans-IO 假设写死。command-surface.md 有"类型片段是设计草图"的免责声明，其他文档（尤其 protocol.md）没有——建议统一标注哪些类型是承诺、哪些是草图，并在 spike 前冻结字段级细节的进一步扩张。
 2. **重复边界声明是已被证实的漂移温床。** 例如"hook 不能发 event / 读写 storage / 执行工具 / 读凭据"在 ≥6 个文档中整段复制；本轮 BR-026/BR-034/BR-035 与第一轮 BR-010/BR-012/BR-022 的漂移多发生在复制文本上。建议机械执行权威归属表：非权威文档一句话 + 链接，禁止复制列表和图。
 3. **协议表面积与 MVP 范围不匹配。** 20+ "后续命令"已给出字段级定义（fork/import/export/tree/interaction submit/cycle 等），与 BR-001 的教训同构。建议后续命令只保留名字与一句话意图，字段定义等实现临近时再补。

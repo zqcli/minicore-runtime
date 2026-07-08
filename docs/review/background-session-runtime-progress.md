@@ -633,3 +633,17 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - 本地执行策略不由 LLM tool call 决定；provider parallel 参数只影响模型是否一次返回多个 tool calls。MiniCore 默认 parallel；session config 或任一 tool definition 要求 sequential 时整批串行；并发执行可乱序完成，但结果必须按 `ToolCallIndex` 稳定回填。
 - `ToolPolicy` 保持纯判断器；preview 构造、path canonicalization、sandbox check 和 schema validation 由 `ToolInvocationPlanner` 负责。
 - pending approval 使用 `ApprovalRequestId` 去重和防 stale；长期免批使用 `ToolApprovalGrantStore`，与 `ToolApprovalBroker` 分离。
+
+## BR-005 暂停语义收敛进展
+
+本轮 grilling 已确认：`paused` 不应表示 run terminal status，而应表示 current run 在可恢复 checkpoint 上 `Suspended`，等待后续 resume 继续同一个未完成的 AgentRun / tool-result continuation。
+
+设计方向：
+
+- `RunTerminalStatus` 只保留 `Completed`、`Failed`、`Aborted`。
+- 新增 `CurrentRunState::{Running, WaitingApproval, Suspended { resume_id, reason }}`。
+- 新增 `RunEvent::Suspended` / `RunEvent::Resumed`，并保留 `RunEvent::Finished` 作为唯一终态事件。
+- 典型 suspend checkpoint 包括：tool result 已产生但尚未回填 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停、host shutdown checkpoint。
+- 普通 focus 切换不是暂停；pending approval 在 MVP 中是 current run 的 waiting substate，不等同于跨生命周期 suspend。
+
+已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`driver.md`、`adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-005 已标记为 Resolved。
