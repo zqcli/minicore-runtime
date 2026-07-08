@@ -627,6 +627,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 - `Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，不是独立 runtime，也不是 UI 工具层。
 - `SessionRuntime` 协调 `Driver` 和 `Tools`；`Driver` 只通过 `DriverHost::invoke_tool_batch(...)` 请求工具批量结果，不直接依赖 `Tools`。
+- 代码层面确认：直接 `impl DriverHost for SessionRuntime` 是合法简化版；真实实现更推荐 per-run `SessionDriverHost` wrapper，因为它收窄访问面、承载 run-scoped context、避免 `self.driver + &mut self` 自借用压力，并让 `Driver` 更容易用 fake host 单测。
 - `Tools::invoke_batch(...)` 是工具治理和执行的主入口，内部包含 registry、active tools、prompt catalog、policy、approval、grants、planner、coordinator、executors、sandbox 和 mutation queue。
 - 新增 ADR 0011 固化该决策：`Tools` 是 `SessionRuntime` 内部的 session-scoped 子系统，文档和实现不再使用 gateway 作为架构术语。
 - 本地执行策略不由 LLM tool call 决定；provider parallel 参数只影响模型是否一次返回多个 tool calls。MiniCore 默认 parallel；session config 或任一 tool definition 要求 sequential 时整批串行；并发执行可乱序完成，但结果必须按 `ToolCallIndex` 稳定回填。

@@ -36,6 +36,19 @@ Rig AgentRunStep::CallTools
 
 `Driver` 不直接依赖 `Tools`。`DriverHost` 是 trait/interface seam，不是 `Driver` 的实例。`SessionRuntime` 可以直接实现 `DriverHost`，也可以创建 per-run `SessionDriverHost` wrapper 来实现。
 
+推荐真实实现使用 per-run `SessionDriverHost` wrapper：
+
+```text
+SessionRuntime::start_run
+  -> build DriveRequest / TurnState
+  -> clone turn_resources from DriveRequest.turn_state
+  -> create SessionDriverHost { tools: &mut self.tools, turn_resources, model_gateway, event_sink, queues, current_run, ... }
+  -> let driver = Driver::new()
+  -> driver.drive_run(request, &mut host, cancel)
+```
+
+直接 `impl DriverHost for SessionRuntime` 是合法的最小实现；`SessionDriverHost` 不是额外 runtime，也不拥有 session state。它只是一次 `drive_run()` 期间把 `SessionRuntime` 的一小片能力借给 `Driver` 的 adapter。
+
 `Tools` 不直接发布 UI event，不写 session storage，不调用 `ModelGateway`，不读取 `ResourceManager`，不构建最终 system prompt。所有工具内部 update 通过 `ToolUpdateSink` 返回，由 `SessionRuntime` 归约成 `agent_runtime_protocol::EventMsg::ToolCall(...)`、snapshot projection 和 session writes。
 
 ## 理由
@@ -45,6 +58,13 @@ Rig AgentRunStep::CallTools
 模型 API 通常只控制模型是否可以一次返回多个 tool calls，例如 OpenAI / Mistral 的 `parallel_tool_calls`、Anthropic 的 `disable_parallel_tool_use`；它们不提供每个 tool call 的宿主本地执行策略。pi 的实践也把模型返回多个 calls 与本地执行策略分开：默认 parallel，session config 或任一 tool definition sequential 时整批串行，并用 file mutation queue 保护同文件写入。
 
 因此 MiniCore 把 provider capability、LLM source order 和本地 execution policy 分开：`ModelGateway` 负责 provider 请求能力，`Driver` 负责 Rig step 驱动，`SessionRuntime` 注入 session/run/cwd/turn context，`Tools` 负责工具治理和执行。
+
+`SessionDriverHost` 的取舍来自代码层面的 grilling：
+
+- 如果直接写 `self.driver.drive_run(request, self, cancel).await`，容易同时借用 `self.driver` 和 `&mut self`，给 Rust borrow checker 制造自借用压力。让 `Driver` 保持无状态或浅状态，并在 run start 时临时创建或 clone 一个 driver，再调用 `driver.drive_run(request, &mut host, cancel)`，可以避开这个形态。
+- 如果直接 `impl DriverHost for SessionRuntime`，host 方法可以访问整个会话对象，长期会让 safe point、工具调用和模型调用逻辑随手耦合到不相关状态。wrapper 明确只暴露本次 run 需要的字段。
+- `run_id`、turn resources、event correlation、checkpoint context 等是 run-scoped 数据，不应被迫成为 `SessionRuntime` 的长期字段。wrapper run 结束即 drop，生命周期更准确。
+- `Driver` 单测可以使用 fake host，不需要构造真实 `SessionRuntime`、`Tools`、storage 或 event bus。
 
 ## 后果
 

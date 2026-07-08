@@ -58,7 +58,7 @@ LLM returns tool calls
   -> AgentRun::tool_results(...)
 ```
 
-`Driver` 不直接依赖 `Tools`，也不直接执行工具。它只知道 `DriverHost` 能返回一批 tool results。`SessionRuntime` 实现 `DriverHost` 或创建 per-run `SessionDriverHost` wrapper，把 `ToolBatchRequest` 补上 session/run/cwd/turn context 后交给自己的 `Tools`。
+`Driver` 不直接依赖 `Tools`，也不直接执行工具。它只知道 `DriverHost` 能返回一批 tool results。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper，把 `ToolBatchRequest` 补上 session/run/cwd/turn context 后交给自己的 `Tools`。
 
 `Tools` 可以通过 `ToolUpdateSink` 返回内部工具更新，例如 proposed、approval requested、started、output delta、finished；这些不是 UI event。`SessionRuntime` 负责把它们归约为 `agent_runtime_protocol::EventMsg::ToolCall(...)`、session writes、snapshot projection 和 save point。
 
