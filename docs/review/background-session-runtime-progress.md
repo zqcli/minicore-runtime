@@ -666,3 +666,13 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 设计收敛为：提前实现最小稳定 `ModelGateway` spine，而不是把阶段 9 的全部能力提前。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，固定 `ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 的 text-only driver 只能走 `DriverHost::call_model -> ModelGateway.call_model(...)`，不允许 `Driver` / `SessionDriverHost` match provider、直读 env 或构造 Rig provider client。阶段 9 只在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
 
 已同步完成：`implementation-roadmap.md`、`model-gateway.md`、ADR 0014、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-009 已标记为 Resolved。
+
+## BR-010 Hook owner 和实现顺序收敛进展
+
+本轮 grilling 已确认：BR-010 的问题不是缺少某个 hook，而是 `SessionRuntime` 与 `ModelGateway` 同时声明模型/provider hook owner，导致 provider payload、安全能力、错误策略和 diagnostics 归属不清。
+
+设计收敛为：hook owner 遵循 runtime 边界，谁拥有安全点业务不变量，谁调用 hook、应用 typed result、重新校验并记录 diagnostics。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点；`Tools` 拥有工具治理安全点；`ModelGateway` 拥有 model/provider 边界安全点；`CommandManager` / session `Command` 拥有 command catalog/resolve/output 安全点。`Driver` 不调用 hook，`RuntimeHookRegistry` 只保存 handler 和策略。
+
+实现顺序也同步收敛：当前 MVP 不实现 hook system，也不在 roadmap 中设置 `RuntimeHooks MVP` 阶段。后期第一批 hook 才考虑接入已经稳定的 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSavePoint` 和 `CommandOutputBuild`。provider hooks 后期仍由 `ModelGateway` 拥有，raw provider payload patch 默认不开放。
+
+已同步完成：`runtime-hooks.md`、`session-runtime.md`、`model-gateway.md`、`driver.md`、`implementation-roadmap.md`、`agent-runtime.md`、`architecture.md`、`modules/README.md`、ADR 0008、ADR 0015、`CONTEXT.md`、`system-blueprint-review-issues.md` 和 `system-blueprint-review-issues-round2.md` 已按该语义更新，BR-010 已标记为 Resolved。由于同一 owner 分层同时固定了 future registry / session-scoped view / fixed cwd trust 判定，BR-035 也已标记为 Resolved。

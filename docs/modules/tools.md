@@ -241,7 +241,7 @@ pub struct ToolInvocationResult {
 
 ## ToolPolicy / Planner / Approval
 
-`ToolPolicy` 是纯策略判断器。它不等待 UI，不执行工具，也不发布事件；它只根据工具定义、prepared invocation、workspace trust、sandbox 结果、用户设置和 hook overlay 返回 `ToolPolicyDecision`。
+`ToolPolicy` 是纯策略判断器。它不等待 UI，不执行工具，也不发布事件；它只根据工具定义、prepared invocation、workspace trust、sandbox 结果、用户设置返回 `ToolPolicyDecision`。后期启用 hook system 时，`Tools` 可以把 hook overlay 归一化进 policy input。
 
 ```rust
 pub struct ToolPolicyInput {
@@ -249,7 +249,7 @@ pub struct ToolPolicyInput {
     pub invocation: PreparedToolInvocation,
     pub workspace_trust: TrustLevel,
     pub sandbox: ToolSandboxView,
-    pub hook_requirement: Option<ToolApprovalRequirement>,
+    pub hook_requirement: Option<ToolApprovalRequirement>, // future RuntimeHooks overlay
     pub grant: Option<ApprovalGrantMatch>,
 }
 
@@ -357,7 +357,7 @@ MiniCore 的本地执行语义对齐 pi：
 - provider request option：是否允许模型一次返回多个 tool calls。
 - `ToolDefinition.execution_mode`。
 - session config / approval mode。
-- `ToolPolicy` / sandbox / hook 的降级结果。
+- `ToolPolicy` / sandbox 的降级结果；后期可加入 hook 降级结果。
 - executor-local locks，例如 file mutation queue。
 
 后续若需要细粒度 mutation lock，可扩展：
@@ -413,7 +413,7 @@ pub enum ToolSandboxVerdict {
 - 不存在的待创建文件必须 canonicalize 它最近存在的父目录，并校验目标路径不会通过 symlink 跳出 `write_roots`。
 - 路径比较必须使用平台语义；大小写不敏感文件系统不能只用字节前缀判断。
 - bash 的 `cwd` 必须落在允许的 workspace cwd 内；bash 默认不能访问 network，除非 `NetworkSandboxPolicy` 明确允许。
-- hook `RewriteArgs` 后必须重新 schema validate、重新 canonicalize、重新 sandbox check、重新 policy evaluate。
+- 后期 hook `RewriteArgs` 后必须重新 schema validate、重新 canonicalize、重新 sandbox check、重新 policy evaluate。
 
 executor 不能自行扩大 sandbox。executor-local 检查只能比 `ToolSandboxView` 更严格，不能更宽松。
 
@@ -432,7 +432,7 @@ Rig AgentRunStep::CallTools { calls }
           → schema validate
           → sandbox/trust check
           → build approval preview if needed
-          → RuntimeHookRegistry.invoke(ToolBeforePolicy)
+          → future RuntimeHookRegistry.invoke(ToolBeforePolicy)
           → ToolPolicy.evaluate(...)
           → grant lookup / approval mode
           → ToolApprovalBroker waits if required
@@ -441,8 +441,8 @@ Rig AgentRunStep::CallTools { calls }
           → SessionRuntime sink receives tool_call_started / output_delta / finished
           → ToolExecutor.execute(ctx, updates, cancel)
           → normalize output into ToolInvocationResult
-          → RuntimeHookRegistry.invoke(ToolAfterExecute)
-          → RuntimeHookRegistry.invoke(ToolResultBeforeAppend)
+          → future RuntimeHookRegistry.invoke(ToolAfterExecute)
+          → future RuntimeHookRegistry.invoke(ToolResultBeforeAppend)
       → sort ToolInvocationResult by call_index
       → return ToolBatchResult
   → Driver maps ToolBatchResult -> Rig tool result content

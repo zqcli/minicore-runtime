@@ -7,7 +7,7 @@
 - 状态访问：messages、current run、model、thinking level、system prompt、active tools、all tools、resources、queues、session id、session name、session file、retry attempt、context usage 和 session stats。
 - 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；在 message/save point 上追加 session entries；通过 `AgentRuntime` event bus 向 UI 发布 `agent_runtime_protocol::Event`。
 - command 入口：持有 session-scoped `command: Command`，为当前 session 构造 `CommandContext` / `SessionCommandHost`，并调用共享无状态 `CommandManager` 处理 `ExecuteCommandText` / `ExecuteCatalogCommand`。
-- prompt 入口：处理 `SubmitPrompt`，执行输入预检、模型/凭据校验、图片策略、skill 展开、prompt template 展开和 `BeforeAgentStart` Hook。
+- prompt 入口：处理 `SubmitPrompt`，执行输入预检、模型/凭据校验、图片策略、skill 展开和 prompt template 展开；后期可在该安全点接入 `BeforeAgentStart` Hook。
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`；运行中输入必须进入队列，不能绕过当前 run 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
@@ -37,7 +37,7 @@ SessionRuntime
   ├─ Command
   ├─ Tools
   ├─ QueueState
-  ├─ RuntimeHookRegistry
+  ├─ RuntimeHookRegistry        // future hook service view
   └─ Driver
 ```
 
@@ -95,7 +95,7 @@ Driver executes drive_run
 3. `SessionRuntime` 从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 selected `SkillResource.body`；不能绕过 snapshot 重新读取 `metadata.file_path`。
 4. `SessionRuntime` 调用 `skills::format_skill_block(metadata, body)` 构造 `<skill>` 块，并追加 `additional_instructions`。
 5. `SessionRuntime` 构造新的 user message，使其进入本次 turn 或按 `delivery` 入队。
-6. 后续执行路径与普通 `SubmitPrompt` 一致：`BeforeAgentStart` Hook、`Driver`、事件归约和 session writes。
+6. 后续执行路径与普通 `SubmitPrompt` 一致：`Driver`、事件归约和 session writes；后期可在 run 启动安全点接入 `BeforeAgentStart` Hook。
 
 这意味着资源 reload 只影响未来调用和未来 system prompt。已经展开并写入 session 的技能调用是一条历史 user message，不应被新版本技能改写。
 
@@ -113,7 +113,7 @@ SessionRuntime cwd/date/model state
   → update next TurnState
 ```
 
-重建触发点包括 user turn 启动、active tools 改变、工具 prompt snippet/guideline 改变、会话启动和 hook 明确替换 system prompt。资源 reload 不会主动改写 running turn；下一次 user turn capture 新的 `TurnResourceSnapshot` 后重建 system prompt。运行中的 turn 使用启动时的 `TurnState`，资源变化只影响未来 turn。
+重建触发点包括 user turn 启动、active tools 改变、工具 prompt snippet/guideline 改变和会话启动；后期 hook 可明确替换 system prompt。资源 reload 不会主动改写 running turn；下一次 user turn capture 新的 `TurnResourceSnapshot` 后重建 system prompt。运行中的 turn 使用启动时的 `TurnState`，资源变化只影响未来 turn。
 
 MVP 中 Rig step 不再调用 `ResourceManager`。资源在 user turn 启动时捕获进 `TurnState`，但完整 `TurnState` 不跨过 `Driver` seam。`SessionRuntime` 只把 `DriverTurnInput` 这种窄投影放进 `DriveRequest`；`TurnState.resources` 留在 `SessionRuntime` / `SessionDriverHost` 中，用于工具运行上下文、safe point 决策和未来 `StepResourceSnapshot` parent。`Driver` 不能在 step 中读取 `ResourceManager.current_runtime()`、`current_cwd()` 或 `TurnResourceSnapshot`。未来如果启用 `StepResourceSnapshot`，也应由 `SessionRuntime` / `DriverHost` 基于当前 `TurnState.resources` 创建轻量 parent wrapper，而不是重新捕获上层资源。
 
@@ -301,19 +301,19 @@ SessionRuntime
 
 ## RuntimeHooks
 
-Hook 的边界、capability、typed result 和完整安全点见 [RuntimeHooks](runtime-hooks.md)。`SessionRuntime` 只负责在自己拥有的会话状态机安全点调用 hook，并把 hook 结果应用到会话事实上；它不把 hook 暴露给 UI，也不让 hook 直接发布 `agent_runtime_protocol::Event`。
+Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](runtime-hooks.md)。当前 MVP 不实现 hook system；后期启用时，`SessionRuntime` 只负责在自己拥有的会话状态机安全点调用 hook，并把 hook 结果应用到会话事实上。它不把 hook 暴露给 UI，也不让 hook 直接发布 `agent_runtime_protocol::Event`。
 
-会话运行时最重要的 hook 点：
+后期由 `SessionRuntime` 拥有的 hook 点：
 
 - `BeforeAgentStart`：启动 run 前追加 custom message、patch stream options 或 patch system prompt。
 - `PromptBuilt`：`prompt.rs` 生成最终 system prompt 后追加或 privileged replace。
 - `ContextProjection`：每次模型调用前调整模型可见 messages；结果必须满足 provider protocol，不得留下 orphan tool call/result。
-- `BeforeModelCall` / `BeforeProviderPayload` / `AfterProviderResponse`：模型调用前后观察或受控改写模型请求；`BeforeProviderPayload` 是 privileged hook，MVP 可以禁用 raw payload patch；任何 hook 都不得暴露凭据。
-- `ToolBeforePolicy` / `ToolBeforeExecute` / `ToolAfterExecute` / `ToolResultBeforeAppend`：工具策略、审批、结果归一化和 tool-result message 写入前的受控干预。
+- `BeforeNextModelCall` / `BeforeRunFinish`：run 级安全点，用于处理队列、暂停、follow-up、future `DriverTurnInput` patch 或 run 结束决策。
+- `ToolResultBeforeAppend`：tool-result message 写入前的受控干预；工具治理链路内部 hook 由 `Tools` 拥有。
 - `SessionBeforeCompact`：压缩前取消、追加说明或提供完整 `CompactionResult`。
 - `AfterSavePoint`：保存点后做 observer 型同步、索引、备份或 telemetry。
 
-`SessionRuntime` 应按 hook point 的 error policy 处理失败：observer hook 失败进入 diagnostics；工具 policy hook 失败默认 fail closed；context / provider payload 变换失败不得产生半写入 session entry。
+模型/provider 边界 hook 不属于 `SessionRuntime`：`BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 和 `ProviderUsageNormalized` 由 `ModelGateway` 在 `call_model(...)` 内拥有。`Driver` 不调用 hook。`SessionRuntime` 应按自己 hook point 的 error policy 处理失败：observer hook 失败进入 diagnostics；context 变换失败不得产生半写入 session entry。
 
 ## Compaction Orchestration
 
@@ -325,8 +325,8 @@ Hook 的边界、capability、typed result 和完整安全点见 [RuntimeHooks](
 2. 若当前 phase 不是 `idle`，先 abort 当前 run 并 wait-for-idle；随后切换到 `SessionPhase::Compaction`。
 3. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
 4. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
-5. 触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。
-6. 如果 Hook 未提供结果，则构造 summary request，并通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
+5. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
+6. 如果未提供 hook result，则构造 summary request，并通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
 7. 追加 `SessionEntry::Compaction`，再调用 `SessionHandle` 的上下文构建能力重建 messages。
 8. 发出 `compaction_finished` 和 `persistence_save_point`，随后 phase 回到 `idle` 并发出 `session_settled`；如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
 
@@ -363,9 +363,9 @@ Rig 的 `AgentRun` 不一定暴露与 pi `runAgentLoop` 完全相同的运行中
 
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
 2. 构建 `TurnState`。
-3. 触发 `BeforeAgentStart` / `PromptBuilt` Hook。
+3. 后期启用 hook system 时，可触发 `BeforeAgentStart` / `PromptBuilt` Hook。当前 MVP 直接进入下一步。
 4. 将 prompt、skill 调用或提示模板展开结果作为 `DriveEntry::Prompt`，并把 `TurnState` 投影成 `DriverTurnInput` 后交给 `Driver.drive_run()`。
-5. 在模型调用前触发 `ContextProjection`、`BeforeModelCall` 和 provider payload Hook。
+5. 下一次模型调用前进入 `SessionRuntime` run safe point；后期启用 hook 时这里只能触发 `ContextProjection` / `BeforeNextModelCall` 这类 run 级 hook。`BeforeModelCall` 和 provider payload hook 属于 `ModelGateway.call_model(...)`。
 6. 工具调用通过 `SessionRuntime` 内部的 `Tools` 子系统治理和执行，再由 `Driver` 回填 Rig。
 7. 每个 run 的可恢复边界 flush `pendingSessionWrites`，发出 `persistence_save_point`。
 8. 下一次模型调用前进入 `before_next_model_call` 安全点。

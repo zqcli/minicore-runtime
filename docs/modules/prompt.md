@@ -191,6 +191,6 @@ Project-specific instructions and guidelines:
 - 下一次 user turn 捕获到新的 current `TurnResourceSnapshot` / `CwdResourceSnapshot` revision。
 - active tools 改变。
 - 工具 prompt snippets / guidelines 改变。
-- custom runtime hook 替换 system prompt。
+- 后期 custom runtime hook 替换 system prompt。
 
 重建结果进入下一次 `TurnState`。运行中的 turn 不应因为资源 reload 被中途改写，除非后续显式设计 restart/abort 行为。

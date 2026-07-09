@@ -29,7 +29,7 @@ SessionRuntime
 
 - 压缩改变的是 session projection，不是 Rig 协议状态机。
 - 压缩要读取会话树、选择 `first_kept_entry_id`、追加 session entry、重建上下文并发 UI 事件。
-- 压缩要走模型凭据、provider hook、summary prompt、abort、auto retry 和 runtime hook，这些都属于 `SessionRuntime` 和 ModelGateway。
+- 压缩要走模型凭据、summary prompt、abort 和 auto retry，这些属于 `SessionRuntime` 和 `ModelGateway`。后期启用 hook system 时，压缩 hook 仍由 `SessionRuntime` 在压缩安全点调用。
 - Rig `AgentRun` 可序列化，但序列化状态包含已累积的 conversation。压缩后继续 resume 旧 `AgentRun` 不能减少下一次 model input；压缩后应从重建后的 session context 启动新的 `DriveEntry::Continue`。
 
 ## 来自 pi 的生产经验
@@ -52,7 +52,7 @@ agent-loop / Agent
 
 关键行为：
 
-- `AgentSession.compact()` 会 abort 当前 agent，发 `compaction_start`，读取 `SessionManager.getBranch()`，调用 `prepareCompaction()`，允许 extension 在 `session_before_compact` hook 中取消或提供摘要，然后 `appendCompaction()`，最后 `buildSessionContext()` 并写回 agent state。
+- `AgentSession.compact()` 会 abort 当前 agent，发 `compaction_start`，读取 `SessionManager.getBranch()`，调用 `prepareCompaction()`，后期可允许 extension 在 `session_before_compact` hook 中取消或提供摘要，然后 `appendCompaction()`，最后 `buildSessionContext()` 并写回 agent state。
 - `_checkCompaction()` 在 agent run 结束后或提交新 prompt 前检查 threshold 和 overflow。
 - `_runAutoCompaction()` 处理自动压缩、context overflow recovery、`willRetry` 和事件。
 - `core/compaction` 的职责是纯压缩逻辑与摘要生成；源码注释明确说 session manager handles I/O, after compaction session is reloaded。
@@ -421,13 +421,13 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → emit `session_phase_changed` + `compaction_started { reason: manual }`
   → path = SessionStorage.get_path_to_root(current_leaf)
   → preparation = compaction::prepare_compaction(path, settings)
-  → RuntimeHookRegistry.invoke(SessionBeforeCompact)
-  → hook may cancel, patch instructions, or provide CompactionResult
+  → future RuntimeHookRegistry.invoke(SessionBeforeCompact)
+  → future hook may cancel, patch instructions, or provide CompactionResult
   → otherwise ModelGateway summarizes using compaction summary requests
   → append SessionEntry::Compaction
   → rebuild SessionContext
   → update SessionRuntime message projection / next TurnState basis
-  → RuntimeHookRegistry.invoke(SessionCompact)
+  → future RuntimeHookRegistry.invoke(SessionCompact)
   → emit `compaction_finished`
   → phase = idle
 ```
@@ -512,7 +512,7 @@ pub struct CompactionResultView {
 
 ## Hooks
 
-压缩相关 hook 的完整边界见 [RuntimeHooks](runtime-hooks.md)。`SessionRuntime` 在压缩模型调用前触发 `SessionBeforeCompact`，在压缩条目写入后触发 `SessionCompact` observer；hook 不直接写 session entry，也不直接发布 `compaction_finished`。
+压缩相关 hook 是后期能力，完整边界见 [RuntimeHooks](runtime-hooks.md)。启用后，`SessionRuntime` 在压缩模型调用前触发 `SessionBeforeCompact`，在压缩条目写入后触发 `SessionCompact` observer；hook 不直接写 session entry，也不直接发布 `compaction_finished`。
 
 `SessionBeforeCompact` 的结果应保持 typed：
 

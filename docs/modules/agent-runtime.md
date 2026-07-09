@@ -27,7 +27,7 @@ pub trait AgentRuntime {
 - 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、无状态 `CommandManager` 和运行时诊断。
 - 通过 `ResourceManager` 维护级联资源快照：current `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、run 启动时捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
 - 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve 和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。
-- 持有 `RuntimeHookRegistry` 作为内部 runtime service，在资源、command、prompt、context、tool、compaction、persistence 和 UI-safe result 等安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
+- 后期持有 `RuntimeHookRegistry` 作为内部 runtime service；当前 MVP 不实现 hook registry / hook invocation。启用后只在明确 owner 的安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command result events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 display-neutral 输出或交互请求；runtime 不定义具体 picker、popup、menu、form 或 widget 组件。
 - 在 session open、focus、new、fork、import、close 前后执行受控的 open/load/focus/unload 流程；focus 切换不隐式关闭旧 `SessionRuntime`。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
@@ -46,7 +46,7 @@ AgentRuntime
       ├─ EventBus
       ├─ SessionManager / SessionIndex
       ├─ CommandManager
-      ├─ RuntimeHookRegistry
+      ├─ RuntimeHookRegistry / future hook service
       ├─ RuntimeDiagnostics
       ├─ ResourceManager
       │   ├─ ResourceSnapshotStore

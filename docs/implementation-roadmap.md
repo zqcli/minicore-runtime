@@ -1,8 +1,8 @@
 # 实现路线图
 
-实现路线图按可验证闭环推进。MiniCore 不应先平铺所有模块空壳，也不应纯粹 Driver-first；更合理的路径是 **spine-first + early Driver/Rig seam validation**：先打通最小协议、事件、会话、存储和 fake driver 纵切，再尽早验证 Rig sans-IO seam，随后把 JSONL、资源、工具、usage、hook、compaction、mutation 和 bash 逐层接到已经稳定的主脊柱上。
+实现路线图按可验证闭环推进。MiniCore 不应先平铺所有模块空壳，也不应纯粹 Driver-first；更合理的路径是 **spine-first + early Driver/Rig seam validation**：先打通最小协议、事件、会话、存储和 fake driver 纵切，再尽早验证 Rig sans-IO seam，随后把 JSONL、资源、工具、usage、compaction、mutation 和 bash 逐层接到已经稳定的主脊柱上；hook system 作为后期扩展点另行接入。
 
-完整 CLI/TUI/GUI 产品不在本仓库实现；本仓库只提供可嵌入 runtime core、协议、session、resources、tools、events、hooks、compaction 和 driver orchestration。
+完整 CLI/TUI/GUI 产品不在本仓库实现；本仓库只提供可嵌入 runtime core、协议、session、resources、tools、events、compaction 和 driver orchestration；hooks 是后期 runtime extension 能力。
 
 ## 路线原则
 
@@ -11,7 +11,8 @@ Minimal protocol / event / session spine
   → InMemory storage vertical slice
   → fake driver SubmitPrompt loop
   → early Rig Driver seam spike
-  → JSONL / resources / tools / usage / hooks / compaction / mutation / bash
+  → JSONL / resources / tools / usage / compaction / mutation / bash
+  → future hooks / extension runtime
 ```
 
 核心原则：
@@ -22,7 +23,7 @@ Minimal protocol / event / session spine
 - `Driver` 不能拖到最后才验证。先用 fake driver 跑通纵切，再用隔离 spike 验证 Rig `AgentRun / AgentRunStep` 是否满足设计假设。
 - `ModelGateway` 的稳定 seam 必须早于真实 `Driver` 集成出现。阶段 5 不能写临时 provider/auth/usage 路径；应先有最小 `ModelGateway` spine，再让 `DriverHost::call_model(...)` 只走这条 seam。
 - `Tools` 子系统在 read-only tool 切片出现；`ToolApprovalBroker`、`ToolApprovalGrantStore`、approval modes 和完整 sandbox/mutation 约束等到 mutation tool 前后再做完整闭环。
-- `CommandSurface`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程；`CommandSurface` 的实现形态是共享无状态 `CommandManager` + session-scoped `Command`。
+- `CommandSurface` 和 `Compaction` 是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程；`CommandSurface` 的实现形态是共享无状态 `CommandManager` + session-scoped `Command`。`RuntimeHooks` 是后期扩展点系统，当前 MVP 不实现 hook registry / hook invocation，只在设计上固定 owner 分层。
 
 ## 先决设计点
 
@@ -30,7 +31,7 @@ Minimal protocol / event / session spine
 
 1. `RuntimeSnapshot` scope：MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不接受 `session_id`，也不单独持久化。打开 workspace 后默认不聚焦旧 session；`RuntimeSnapshot.active_session` 可以为空。会话清单由 `SessionIndex` / `ListSessions` 提供，TUI `/resume` 默认按当前 workspace 筛选，GUI sidebar 复用同一 query。MVP 中 UI host 和 `AgentRuntime` 同进程、同生命周期，不支持 UI 断线但 runtime daemon 继续后台运行再被重连；`last_event_sequence` 只用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。未来如需多 tab、多 session detail、独立 runtime server、多窗口共享 runtime 或大规模分页，再拆 `WorkspaceSnapshot` / `SessionSnapshot` 或 scoped event cursor。
 2. `RuntimeServices` scope：采用单 UI/runtime 进程内多 session 运行模式。`AgentRuntime` 持有 `WorkspaceServices`，其中包含共享 `ResourceManager`、user-global settings/provider/auth 和 runtime-global `ModelGateway`；不引入 `CwdScopedServices` 或 service generation registry。`ResourceManager` 管理级联不可变资源快照：`RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot`。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获 `TurnResourceSnapshot` 并构建 `TurnState`。Focused session 只影响 UI 和默认命令路由，不能作为资源或服务 scope 锚点。
-3. `ModelGateway` seam：它负责 provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类，是 `Driver`、`Compaction`、`UsageStats` 的共享依赖。正式实现前以 [ModelGateway](modules/model-gateway.md) 为 source of truth；实现顺序上先落稳定最小 spine，再扩展 custom provider、完整 auth、fallback 和 usage/context usage。
+3. `ModelGateway` seam：它负责 provider 调用、凭据解析、fallback、usage 归一化和错误分类，是 `Driver`、`Compaction`、`UsageStats` 的共享依赖。后期 provider hook 的 owner 也在该边界内。正式实现前以 [ModelGateway](modules/model-gateway.md) 为 source of truth；实现顺序上先落稳定最小 spine，再扩展 custom provider、完整 auth、fallback 和 usage/context usage。
 4. 失败事件顺序：失败 assistant message、diagnostic、`persistence_save_point` 和 `run_finished { status: failed }` 的顺序必须统一。`persistence_save_point` 是 durable barrier，不能让 UI 在 terminal event 后仍处于不可恢复状态。
 
 ## MVP 阶段
@@ -49,11 +50,10 @@ Minimal protocol / event / session spine
 | 9. ModelGateway 扩展和 UsageStats | 在既有 `ModelGateway` spine 上补齐 custom provider、完整 auth 来源、fallback chain、usage 归一化和 context usage | `src/provider_registry.rs`、`src/model_gateway.rs`、`src/auth_store.rs`、`src/usage_stats.rs` | `SetModel -> ModelState -> DriverTurnInput -> ModelCallRequest -> ModelGateway` 可测；custom provider/base URL/auth_ref 走同一 seam；provider usage 变成 `usage_updated`；RuntimeSnapshot 包含 provider/model view，`active_session` 包含 `session_stats` 和 `context_usage`；后续 compaction 能复用 context usage。 |
 | 10. Read-only Tools | 实现 session-scoped `Tools` 子系统、工具定义、registry、active set、prompt catalog、最小 policy、planner/coordinator/executor 和只读工具 | `src/tools.rs`、`src/tools/subsystem.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/active.rs`、`src/tools/prompt.rs`、`src/tools/policy.rs`、`src/tools/planner.rs`、`src/tools/coordinator.rs`、`src/tools/executor.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool_batch -> SessionRuntime -> Tools::invoke_batch -> tool results -> Rig continuation` 跑通；tool error 作为 error tool result 回填；结果按 `call_index` 稳定回填。 |
 | 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、active session pending approval RuntimeSnapshot/resync 行为稳定；approval 后 args 冻结。 |
-| 12. RuntimeHooks MVP | 只接入已有 owner 流程上的安全点；不把资源发现 callback 纳入 MVP | `src/runtime_hooks.rs`、`src/agent_runtime.rs`、`src/session_runtime.rs` | `BeforeAgentStart`、`PromptBuilt`、`ToolBeforePolicy`、`AfterSavePoint`、`CommandOutputBuild` 可测；hook 不发 UI event、不读写 storage、不执行 tool、不碰 credentials。 |
-| 13. Compaction | 实现手动压缩、summary message、context rebuild；再做 threshold 和 overflow recovery | `src/compaction.rs`、`src/session_runtime.rs`、`src/session_storage.rs` | `/compact` 从 disabled 变可执行；`SessionEntry::Compaction` 重建上下文；overflow recovery 不污染重试上下文。 |
-| 14. Mutation tools | 在 approval、policy、event、storage 都稳定后接文件修改工具 | `src/tools/builtin/{write,edit,apply_patch}.rs`、`src/tools/policy.rs`、`src/tools/approval.rs` | approval preview、diff stats、mutation queue、reject-as-error-tool-result、rewrite 后重新 schema validate / sandbox / policy。 |
-| 15. Bash | 最后接最高风险进程工具 | `src/tools/builtin/bash.rs` | timeout、cancel、cwd/sandbox、stdout/stderr streaming、输出截断和 approval 都可观察、可恢复。 |
-| 16. Protocol harness / example adapter | 验证下游 CLI/TUI/GUI 能只靠协议接入 | `examples/`、`tests/` | fake adapter/reducer 测试 submit、tool、approval、reload、compaction、RuntimeSnapshot/resync 的事件生命周期。 |
+| 12. Compaction | 实现手动压缩、summary message、context rebuild；再做 threshold 和 overflow recovery | `src/compaction.rs`、`src/session_runtime.rs`、`src/session_storage.rs` | `/compact` 从 disabled 变可执行；`SessionEntry::Compaction` 重建上下文；overflow recovery 不污染重试上下文。 |
+| 13. Mutation tools | 在 approval、policy、event、storage 都稳定后接文件修改工具 | `src/tools/builtin/{write,edit,apply_patch}.rs`、`src/tools/policy.rs`、`src/tools/approval.rs` | approval preview、diff stats、mutation queue、reject-as-error-tool-result、rewrite 后重新 schema validate / sandbox / policy。 |
+| 14. Bash | 最后接最高风险进程工具 | `src/tools/builtin/bash.rs` | timeout、cancel、cwd/sandbox、stdout/stderr streaming、输出截断和 approval 都可观察、可恢复。 |
+| 15. Protocol harness / example adapter | 验证下游 CLI/TUI/GUI 能只靠协议接入 | `examples/`、`tests/` | fake adapter/reducer 测试 submit、tool、approval、reload、compaction、RuntimeSnapshot/resync 的事件生命周期。 |
 
 ## 首个开发切片
 
@@ -154,19 +154,21 @@ MVP 不要求所有 command 都完整可执行：
 - `/usage`、`/model`、`/thinking` 在 `UsageStats`、model state、provider registry 完成后再启用完整行为。
 - extension executable commands、project-local command handlers、complex form、runtime-tracked `SubmitInteraction` 和 runtime-owned action ids 放到后续增强。
 
-## RuntimeHooks 顺序
+## RuntimeHooks 后期顺序
 
-`RuntimeHooks` 不应作为早期大模块平铺。Hook 的价值来自真实 owner 流程中的安全点；没有 owner 流程时，hook 只是过早抽象。
+`RuntimeHooks` 不放入当前 MVP 阶段。Hook 的价值来自真实 owner 流程中的安全点；没有 owner 流程时，hook 只是过早抽象。当前阶段只固定 owner 分层和禁止边界，实际 `RuntimeHookRegistry`、hook invocation、capability gate 和 extension runtime 都作为后期需求。
 
-MVP 只接入已经存在的安全点：
+后期第一批只接入已经存在且测试稳定的 owner 安全点：
 
-- Resource discovery hook/callback 不属于 MVP；资源来源先由 `ResourceManager` 内置 resolver 管理。
+- Resource discovery hook/callback 不属于后期第一批 hook；资源来源先由 `ResourceManager` 内置 resolver 管理。
 - `BeforeAgentStart` / `PromptBuilt`：run 启动和 system prompt 构建后 patch。
+- `ContextProjection`：模型可见上下文 projection 后 patch；必须保持协议安全。
 - `ToolBeforePolicy` / `ToolAfterExecute`：工具治理链路内的 typed decision。
+- `SessionBeforeCompact`：压缩前 gate / patch instructions / provide result。
 - `AfterSavePoint`：保存点后 observer。
 - `CommandOutputBuild`：UI-safe command output patch。
 
-后续 privileged hook，例如 raw provider payload patch、context replacement、tool args rewrite、compaction result provider，应等对应 owner 流程和测试稳定后再开放。
+后续 privileged hook，例如 raw provider payload patch、context replacement、tool args rewrite、system prompt replacement 和 before-session-write 类能力，应等对应 owner 流程和测试稳定后再开放。
 
 ## Compaction 顺序
 
@@ -175,8 +177,8 @@ MVP 只接入已经存在的安全点：
 推荐推进：
 
 1. 手动 `Compact { instructions }`。
-2. `SessionBeforeCompact` hook。
-3. summary model call 通过 `ModelGateway`，不是 `Driver.drive_run()`。
+2. summary model call 通过 `ModelGateway`，不是 `Driver.drive_run()`。
+3. 后期再接 `SessionBeforeCompact` hook。
 4. 追加 `SessionEntry::Compaction`。
 5. `SessionHandle.build_session_context()` 重建为 summary message + kept messages。
 6. `compaction_finished`、`persistence_save_point`、后续 `session_settled` 或 retry continuation。
@@ -200,7 +202,7 @@ MVP 只接入已经存在的安全点：
 - 工具执行只能发生在 Agent 运行时内。
 - 下游渲染器不能拥有凭据或工作区访问权。
 - 运行时方法应返回确认或快照，而不是助手文本。
-- 助手输出、技能调用、提示模板调用、会话保存、队列变化、运行时 Hook 影响和工具活动必须始终能通过运行时事件观察到。
+- 助手输出、技能调用、提示模板调用、会话保存、队列变化、工具活动以及后期运行时 Hook 影响必须始终能通过运行时事件观察到。
 
 ## 必测项
 
@@ -212,5 +214,5 @@ MVP 只接入已经存在的安全点：
 - Driver / ModelGateway seam：Rig `CallModel`、`CallTools`、`Done`、tool result threading、provider/tool error-as-result、`ModelSelection` 传递、auth redaction、custom provider base URL、usage/error normalization 和 cancellation。
 - tool governance：active tool membership、schema validation、rewrite 后重新 schema validate / sandbox / policy、approval 后 args 冻结。
 - resource reload：atomic reload/recompose、diagnostics、runtime/cwd resource revision、future-turn-only prompt rebuild。
-- hooks：hook 不直接发布 `agent_runtime_protocol::Event`，不直接读写 storage，不直接执行 tool，不接触 credentials。
+- future hooks：后期启用 hook system 时，hook 不直接发布 `agent_runtime_protocol::Event`，不直接读写 storage，不直接执行 tool，不接触 credentials。
 - compaction：protocol-safe cut point、orphan tool call/result 检查、summary message projection、overflow recovery 不把 transient error 放进 retry context。
