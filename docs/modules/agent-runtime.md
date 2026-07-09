@@ -10,25 +10,25 @@
 use crate::agent_runtime_protocol as protocol;
 
 pub trait AgentRuntime {
-    async fn dispatch(&self, command: protocol::Command) -> Result<protocol::CommandAck, RuntimeError>;
+    async fn dispatch(&self, command: protocol::AgentCommand) -> Result<protocol::CommandAck, RuntimeError>;
     fn subscribe(&self) -> protocol::EventStream;
     async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
 ```
 
-下游 CLI/TUI/GUI 不应该直接调用更细的方法。会话打开、资源刷新、模型切换、工具审批等都通过 `agent_runtime_protocol::Command` 表达。
+下游 CLI/TUI/GUI 不应该直接调用更细的方法。会话打开、资源刷新、模型切换、工具审批等都通过 `agent_runtime_protocol::AgentCommand` 表达。
 
 ## 核心职责
 
-- 处理下游 CLI/TUI/GUI adapter 发来的 `agent_runtime_protocol::Command`。
+- 处理下游 CLI/TUI/GUI adapter 发来的 `agent_runtime_protocol::AgentCommand`。
 - 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::RuntimeSnapshot`。
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
-- 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、命令面和运行时诊断。
+- 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、无状态 `CommandManager` 和运行时诊断。
 - 通过 `ResourceManager` 维护级联资源快照：current `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、run 启动时捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
-- 持有 `CommandSurfaceService`，把 runtime builtins、资源命令和后续扩展命令投影成跨 UI 的 command catalog，并按 Parse / Plan / Execute / Present 四阶段处理 `ExecuteSlashCommand`。
-- 持有 `RuntimeHookRegistry` 作为内部 runtime service，在资源、slash command、prompt、context、tool、compaction、persistence 和 presentation 等安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
-- 发布 command presentation events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 message panel 输出、picker、popup、menu、form 或 detail view 请求。
+- 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve 和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。
+- 持有 `RuntimeHookRegistry` 作为内部 runtime service，在资源、command、prompt、context、tool、compaction、persistence 和 UI-safe result 等安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
+- 发布 command result events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 display-neutral 输出或交互请求；runtime 不定义具体 picker、popup、menu、form 或 widget 组件。
 - 在 session open、focus、new、fork、import、close 前后执行受控的 open/load/focus/unload 流程；focus 切换不隐式关闭旧 `SessionRuntime`。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
 
@@ -45,7 +45,7 @@ AgentRuntime
   └─ WorkspaceServices
       ├─ EventBus
       ├─ SessionManager / SessionIndex
-      ├─ CommandSurfaceService
+      ├─ CommandManager
       ├─ RuntimeHookRegistry
       ├─ RuntimeDiagnostics
       ├─ ResourceManager
@@ -61,11 +61,11 @@ AgentRuntime
       └─ ModelGateway / shared model invocation boundary
 
 LoadedSessionRuntimes
-  ├─ SessionRuntime A { workspace_id, cwd: repo-a }
+  ├─ SessionRuntime A { workspace_id, cwd: repo-a, command: Command }
   │   └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-10)
-  ├─ SessionRuntime B { workspace_id, cwd: repo-a }
+  ├─ SessionRuntime B { workspace_id, cwd: repo-a, command: Command }
   │   └─ next run captures current CwdSnapshot(repo-a)
-  └─ SessionRuntime C { workspace_id, cwd: repo-b }
+  └─ SessionRuntime C { workspace_id, cwd: repo-b, command: Command }
       └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-4)
 ```
 
@@ -106,19 +106,20 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 
 `AgentRuntime` 集中持有 workspace host、资源快照存储和运行时服务入口。凭据和 provider catalog 是 user-global/runtime-global；项目资源只能通过 `ResourceManager` 受 trust gate、source info 和 overlay policy 约束后进入 cwd 的 `CwdResourceSnapshot.resolved`；工具执行仍由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统结合 cwd 和 sandbox view 治理。下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
 
-## Slash Command Route
+## Command Route
 
-`ExecuteSlashCommand` 是 runtime control route 的一种入口，不是 Agent loop 的子步骤：
+`ExecuteCommandText` 是 runtime command text 入口，`/...` slash input 只是其中一种语法。它不是 Agent loop 的子步骤：
 
 ```text
-ExecuteSlashCommand
-  → CommandSurfaceService.parse
-  → CommandSurfaceService.plan
-  → AgentRuntime executes plan through backend owner
-  → CommandSurfaceService.present outcome
-  → command_output_appended / command_interaction_requested
+ExecuteCommandText / ExecuteCatalogCommand
+  → AgentRuntime routes target session
+  → SessionRuntime.command builds CommandContext + SessionCommandHost
+  → CommandManager materialize current catalog
+  → parse / resolve_for_execution
+  → trusted CommandHandler executes through SessionCommandHost
+  → business events and/or command output events
 ```
 
-只有当解析结果是 prompt-like input，例如 `/skill:{name}` 或 `/{template}`，才会进入 `SessionRuntime` 的普通 prompt/run pipeline。`/status`、`/usage`、`/model`、`/thinking`、`/reload` 等命令不会直接进入 `Driver`；它们更新 runtime/session state，执行 query，或请求 UI 打开交互控件。
+只有当 resolved command 是 prompt-like input，例如 `/skill code-review ...`、兼容 `/skill:code-review ...` 或 `/{template}`，才会进入 `SessionRuntime` 的普通 prompt/run pipeline。`/status`、`/usage`、`/model`、`/thinking`、`/reload` 等命令不会直接进入 `Driver`；它们更新 runtime/session state、执行受控 query，或返回 display-neutral command result。
 
-`AgentRuntime` 负责把同一个 `command_id` 贯穿到业务事件和 `CommandPresentationEvent` 中。`CommandAck` 只说明 `ExecuteSlashCommand` 是否被接收；slash command 的用户可见结果通过 `command_output_appended` 或 `command_interaction_requested` 返回。
+`AgentRuntime` 负责把同一个 `command_id` 贯穿到业务事件和 command output events 中。`CommandAck` 只说明 `ExecuteCommandText` / `ExecuteCatalogCommand` 是否被接收；命令的用户可见结果通过 command output 或业务事件返回。

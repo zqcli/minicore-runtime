@@ -51,7 +51,7 @@ MiniCore 吸收这些 hook 点，但边界更严格：
 - 不允许 hook 直接 mutate session storage。
 - 不允许 hook 直接执行 tool 或读 credential。
 - 不允许工具参数原地改写后跳过校验；任何 args rewrite 必须重新 schema validate 和重新走 policy。
-- 不把 TUI/GUI UI primitive 放进 core hook context；用户交互应通过 `CommandPresentation` 或下游 adapter 能力表达。
+- 不把 TUI/GUI UI primitive 放进 core hook context；用户交互应通过 UI-safe command result / command output 或下游 adapter 能力表达，不能通过 hook 注入完整 `AgentCommand`。
 
 ## Hook 类型
 
@@ -71,7 +71,7 @@ pub enum HookKind {
 | `Transform` | 是 | 改写 input、context、system prompt、provider payload、tool result |
 | `Gate` | 是 | deny tool、cancel compaction、cancel session switch/delete |
 | `Provider` | 是 | 提供 resource paths、compaction result、branch summary |
-| `Registrar` | 是 | 注册 tools、slash command metadata 或 extension capabilities；provider/model 注册默认走 `ProviderRegistry` / settings |
+| `Registrar` | 是 | 注册 tools、command metadata 或 extension capabilities；provider/model 注册默认走 `ProviderRegistry` / settings |
 
 Hook 能改变行为，但只能通过明确 hook point 的 typed result 改变。不要给 hook 一个万能 `ctx` 去随意调用 runtime internals。
 
@@ -80,7 +80,7 @@ Hook 能改变行为，但只能通过明确 hook point 的 typed result 改变�
 ```text
 AgentRuntime
   ├─ owns RuntimeHookRegistry as runtime service
-  ├─ invokes workspace/resource/slash/presentation hooks
+  ├─ invokes workspace/resource/command/output hooks
   └─ emits official runtime events after applying results
 
 SessionRuntime
@@ -111,7 +111,7 @@ pub enum HookCapability {
     DiscoverResources,
     RegisterCommand,
     RegisterTool,
-    PatchPresentation,
+    PatchCommandOutput,
     PatchPrompt,
     ReplacePrompt,
     TransformContext,
@@ -191,7 +191,7 @@ pub enum HookPatch<T> {
 pub enum InputHookDecision {
     Continue,
     Transform { input: UserInput },
-    Handled { presentation: Option<CommandPresentation> },
+    Handled { output: Option<CommandOutput> },
     Reject { reason: String },
 }
 
@@ -227,16 +227,15 @@ pub enum BeforeCompactDecision {
 
 当前设计不定义资源 discovery / reload hook，也不预留资源回调接口形状。资源来源由 [ResourceManager](resource-manager.md) 的内置 resolver、trust gate 和 overlay policy 管理；显式 reload / startup ensure 进入 `ResourceManager` reload/recompose pipeline。未来如果确实需要 extension/package 资源声明，应另起 ADR 重新定义安全边界。
 
-### Slash Commands And Presentation
+### Commands And Output
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `SlashCommandCatalogBuild` | Registrar | 注册 extension command metadata / argument hints |
-| `SlashCommandBeforePlan` | Gate / Transform | 调整 availability 或拒绝 invocation |
-| `CommandOutputBuild` | Transform | patch `/status`、`/usage`、parse error 等输出 |
-| `InteractionRequestBuild` | Transform | patch picker/menu/form/detail view 语义 |
+| `CommandCatalogBuild` | Registrar | 注册 extension command metadata / argument hints；MVP 不允许 project-local manifest 注册可执行 handler |
+| `CommandBeforeResolve` | Gate / Transform | 调整 availability 或拒绝 invocation；不能绕过 `resolve_for_execution` |
+| `CommandOutputBuild` | Transform | patch `/status`、`/usage`、parse error 等 UI-safe 输出 |
 
-Hook 只能返回 catalog/presentation patch；不能直接打开 UI，不能直接发 `command_output_appended`。
+Hook 只能返回 catalog/output patch；不能直接打开 UI，不能直接发 `command_output_appended`，不能制造 `AgentCommand`、handler id 或 executable action payload。所有动态 metadata 必须经过 UI-safe redaction。
 
 ### Input
 
@@ -245,7 +244,7 @@ Hook 只能返回 catalog/presentation patch；不能直接打开 UI，不能直
 | `InputReceived` | Transform / Gate | transform / handled / reject |
 | `InputBeforeSubmit` | Transform / Gate | prompt-like input 进入 session 前最后校验 |
 
-`SubmitPrompt` 不默认解析 slash。`ExecuteSlashCommand` 仍走 `CommandSurface`。Input hook 不能绕过 phase guard。
+`SubmitPrompt` 不默认解析 slash。`ExecuteCommandText` / `ExecuteCatalogCommand` 仍走 `CommandManager.resolve_for_execution`。Input hook 不能绕过 phase guard。
 
 ### Session Lifecycle
 
@@ -397,7 +396,7 @@ pub enum HookErrorPolicy {
 | Hook 类型 | 默认错误策略 |
 | --- | --- |
 | Observer | ignore + diagnostics |
-| Presentation patch | keep original + diagnostics |
+| Command output patch | keep original + diagnostics |
 | Input transform | reject command 或 continue，按 source/capability 配置 |
 | Tool before policy | deny tool |
 | Tool after result | keep original result + diagnostics |
@@ -440,8 +439,8 @@ MVP 只需要内部 hook seam，不需要开放完整外部 plugin 系统。
 
 第二阶段开放 trusted package / extension hooks：
 
-- slash command registration
-- command presentation patch
+- command pack / candidate provider registration
+- command output patch
 - observer hooks
 - tool registration
 

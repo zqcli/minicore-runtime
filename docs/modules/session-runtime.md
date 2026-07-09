@@ -6,6 +6,7 @@
 
 - 状态访问：messages、current run、model、thinking level、system prompt、active tools、all tools、resources、queues、session id、session name、session file、retry attempt、context usage 和 session stats。
 - 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；在 message/save point 上追加 session entries；通过 `AgentRuntime` event bus 向 UI 发布 `agent_runtime_protocol::Event`。
+- command 入口：持有 session-scoped `command: Command`，为当前 session 构造 `CommandContext` / `SessionCommandHost`，并调用共享无状态 `CommandManager` 处理 `ExecuteCommandText` / `ExecuteCatalogCommand`。
 - prompt 入口：处理 `SubmitPrompt`，执行输入预检、模型/凭据校验、图片策略、skill 展开、prompt template 展开和 `BeforeAgentStart` Hook。
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`；运行中输入必须进入队列，不能绕过当前 run 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
@@ -33,6 +34,7 @@ SessionRuntime
   ├─ ModelState
   ├─ ResourceState { last_seen_revision }
   ├─ CompactionState
+  ├─ Command
   ├─ Tools
   ├─ QueueState
   ├─ RuntimeHookRegistry
@@ -43,7 +45,7 @@ SessionRuntime
 
 `SessionRuntime` 不持有跨 turn 的 current resource cache。它可以记录 `ResourceState { last_seen_revision }` 供 UI、diagnostics 或 prompt rebuild 判断使用，但不能用它代替 `ResourceManager.capture_turn(...)`。每次 user turn 真正启动时都必须重新 capture，当 reload 已经完成 `ResourceSnapshotStore::replace_cwd(...)` 后，下一次 capture 自然会读取到新的 current `CwdResourceSnapshot`。
 
-`SessionRuntime` 不解析 raw `/...` 字符串。Slash command 在 `AgentRuntime` / `CommandSurfaceService` 中完成 Parse / Plan；只有解析后的 session-scoped 结构化命令或 prompt-like input 才进入 `SessionRuntime`。`/status`、`/usage` 这类 query command 通常只读取 snapshot/view；`/model`、`/thinking` 更新会话状态；`/skill:{name}` 和 `/{template}` 才会构造 user message 并可能启动 Agent run。
+`SessionRuntime` 持有 session-scoped `Command` facade，但不持有 catalog cache。`Command` 每次请求都基于当前 session 的 cwd、resource summary、model、tools、run state 和 settings 构造 `CommandContext`，再调用共享 `CommandManager` materialize/parse/suggest/resolve。只有 resolved 后的 session-scoped 结构化命令或 prompt-like input 才进入 `SessionRuntime` 具体能力。`/status`、`/usage` 这类 query command 通常只读取 snapshot/view；`/model`、`/thinking` 更新会话状态；`/skill code-review`、兼容 `/skill:code-review` 和 `/{template}` 才会构造 user message 并可能启动 Agent run。
 
 ## 对齐 pi 的能力
 
@@ -54,9 +56,9 @@ SessionRuntime
 | `prompt(text, options)` | `SubmitPrompt` |
 | `_expandSkillCommand` | `InvokeSkill` |
 | `promptTemplates` / `expandPromptTemplate` | `InvokePromptTemplate` |
-| slash command expansion | `ExecuteSlashCommand` 经 `CommandSurface` 解析、规划和呈现协调后进入 `InvokeSkill` / `InvokePromptTemplate` / `Compact` / `SetModel` 等结构化命令 |
+| command text / slash command expansion | `ExecuteCommandText` 经 `SessionRuntime.command` + `CommandManager` materialize/parse/resolve 后进入 `InvokeSkill` / `InvokePromptTemplate` / `Compact` / `SetModel` 等结构化命令 |
 | `steer(text)` / `followUp(text)` | `Steer` / `FollowUp` |
-| `sendCustomMessage(...)` | `AppendMessage` / `NextTurn` 的内部基础能力 |
+| `sendCustomMessage(...)` | crate-private `InternalAgentCommand::AppendMessage` / `NextTurn` 的内部基础能力 |
 | `sendUserMessage(...)` | extension/runtime 触发用户消息 |
 | `clearQueue()` / `pendingMessageCount` | `ClearQueue` / `queue_updated` / snapshot queues |
 | `abort()` | `AbortRun` + wait-for-idle |
@@ -89,7 +91,7 @@ Driver executes drive_run
 `InvokeSkill` 流程：
 
 1. 在真正进入 user turn 时，调用 `ResourceManager.capture_turn(session_id, turn_id, workspace_id, cwd)`，取得 `TurnResourceSnapshot`，并从 `turn.resources.cwd.resolved.skills` 取得当前 cwd 的 effective `SkillCatalog`。
-2. 处理结构化 `InvokeSkill`，按 `skill_name` 查找 `SkillMetadata`；不存在时返回结构化错误。raw `/skill:name` 的解析已经在 `CommandSurfaceService` 完成。
+2. 处理结构化 `InvokeSkill`，按 `skill_name` / `ResourceKey` 查找 `SkillMetadata`；不存在时返回结构化错误。raw `/skill name` 或兼容 `/skill:name` 的解析已经在 `CommandManager.resolve_for_execution` 完成。
 3. `SessionRuntime` 从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 selected `SkillResource.body`；不能绕过 snapshot 重新读取 `metadata.file_path`。
 4. `SessionRuntime` 调用 `skills::format_skill_block(metadata, body)` 构造 `<skill>` 块，并追加 `additional_instructions`。
 5. `SessionRuntime` 构造新的 user message，使其进入本次 turn 或按 `delivery` 入队。
@@ -282,7 +284,7 @@ Hook 的边界、capability、typed result 和完整安全点见 [RuntimeHooks](
 
 手动压缩流程：
 
-1. 收到 `agent_runtime_protocol::Command::Compact { instructions }`。
+1. 收到 `agent_runtime_protocol::AgentCommand::Compact { instructions }`。
 2. 若当前 phase 不是 `idle`，先 abort 当前 run 并 wait-for-idle；随后切换到 `SessionPhase::Compaction`。
 3. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
 4. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。

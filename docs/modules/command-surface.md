@@ -1,489 +1,481 @@
 # CommandSurface
 
-`CommandSurface` 是 MiniCore 运行时提供给下游 CLI、TUI 和 GUI 宿主的统一命令入口、解析、执行映射和呈现协调模块。它把用户输入的 `/...` 文本、command palette 选择、技能命令和提示模板命令，经过 `Parse → Plan → Execute → Present` 四个阶段，转换成已有 `agent_runtime_protocol::Command`、受控 query、模型可见用户输入，或 UI 可渲染的交互请求 / 命令输出。
+`CommandSurface` 是 MiniCore 对“用户命令能力”的领域总称，不是一个有状态服务名。它覆盖 TUI 的 `/...` 输入、GUI command palette、菜单点击和快捷入口，但这些入口最终都必须回到 runtime core 做统一解析、校验和执行。
 
-它不是 Agent loop，不是工具调用，也不是 UI 本地快捷键系统。它的核心价值是让下游 CLI、TUI 和 GUI 共享同一套命令目录、可用性规则、资源命令投影、执行映射和用户可见结果表达，避免每个产品仓库各自实现一份 `/compact`、`/skill:name`、`/model`、`/usage` 解析和展示逻辑。
+最新设计把实现拆成两层：
+
+- `CommandManager`：`WorkspaceServices` 持有的共享、无状态命令管理器。它只持有只读的 command packs、candidate providers 和 handler registry，并在每次请求时临时 materialize 当前 session 的 command catalog。
+- `Command`：`SessionRuntime` 持有的 session-scoped 命令入口。它不缓存 catalog，只负责从当前 session 组装 `CommandContext` / `SessionCommandHost`，再调用共享 `CommandManager`。
+
+`slash command` 只是 command text 的一种输入语法，不再是核心领域名。协议层原来的 `agent_runtime_protocol::Command` 改名为 `agent_runtime_protocol::AgentCommand`，避免和 `command::Command` 子系统混淆。
 
 ## 参考经验
 
-pi coding-agent 的 slash command 面由几类来源合成：
+pi coding-agent 把 builtins、extension commands、prompt templates 和 skills 合成当前 session 的 command/autocomplete 面：extension command 由 `pi.registerCommand(name, { description, getArgumentCompletions, handler })` 注册，skills 以 `/skill:name` 暴露，prompt templates 以 `/{template}` 暴露。它的经验是：命令定义和 handler 应该分离，技能/模板必须注册进命令入口，而不是由 UI 读文件。
 
-- built-in commands：`/model`、`/compact`、`/reload`、`/resume`、`/tree`、`/login`、`/quit` 等，主要在 interactive mode 中处理。
-- prompt templates：文件模板以 `/{template_name} args` 形式进入 autocomplete，并在 `AgentSession.prompt()` 中展开。
-- skills：可选地注册为 `/skill:{name}`，由 `AgentSession._expandSkillCommand()` 读取技能正文并构造 `<skill>` 用户消息。
-- extension commands：由 `pi.registerCommand()` 注册，先于技能和模板执行；扩展命令自己管理交互，不能像普通用户消息一样随意排队。
+Codex 的 slash command 主要位于 TUI/app 层：`SlashCommand` enum、过滤、popup、输入解析和 dispatch 都绑定具体 UI。它的经验是：命令定义、可用性、输入解析和 dispatch 需要集中；但 MiniCore 不能把 popup、picker、form 或 widget 模型放进 runtime core，因为 MiniCore 同时服务 TUI 和 GUI。
 
-pi 的关键经验是：slash command 是用户输入入口，但真正执行仍落回 session/runtime 能力。技能和模板不是 UI 展开；UI 只提供 autocomplete 和提交入口。
-
-Codex 的 TUI 把 slash command 明确建模为 `SlashCommand` enum，并为每个命令定义 description、inline args、是否可在任务运行中使用、是否可在 side conversation 中使用。Composer 负责识别 `/...`，dispatch 层再把命令转换成 app events、用户消息、compact 请求、model popup、status 输出或其他 runtime action。Codex 的关键经验是：slash command catalog、dispatch 规则和用户可见反馈必须集中，否则 popup、解析、队列和执行状态会漂移。
-
-Claude Code 的公开行为也说明，slash command 不只用于聊天输入：模型、权限、配置、memory、compact、init、MCP 等都可以通过 `/...` 触发。对本项目的启发是：后续所有 runtime-owned UI 配置项都应有 slash command 版本，但这些命令仍必须回到 runtime/core 承接者执行，不能让 UI 直接修改配置文件、资源或会话状态。
-
-## 推荐结论
-
-本项目需要 slash command 能力，但它应该是 runtime-owned command surface，而不是 TUI-only 语法糖。
-
-理由：
-
-- MiniCore 有多个下游宿主。Ratatui 需要 `/...` 输入，Tauri/Vue 需要 command palette、picker 和配置搜索，CLI 也可以提供命令式入口；它们应该消费同一个 command catalog。
-- 已有能力天然需要文本命令入口：`Compact`、`ReloadResources`、`InvokeSkill`、`InvokePromptTemplate`、`SetModel`、`SetThinkingLevel`、`FocusSession`、`NavigateSessionTree`。
-- 后续所有 runtime-owned UI 配置项都应有 slash command 版本，例如 model、thinking level、stream options、auto compaction、active tools、permissions 和 provider/service tier。
-- skills 和 prompt templates 来自 `ResourceManager`，UI 不应该读取或解析资源文件。
-- command 可用性依赖 runtime 状态：session 是否 loaded、run 是否进行中、是否 focused、资源 revision、项目是否 trusted、工具/模型能力。
-- 后续 extension/package/MCP command 需要统一名称冲突、source info、diagnostics 和权限边界。
-
-但 slash command 不应该成为新的底层执行通道。它只解析、规划和呈现用户命令；真正执行仍由 `AgentRuntime`、`SessionManager`、`SessionRuntime`、`ResourceManager`、`Compaction`、`Tools`、`UsageStats` 等模块承接。
+MiniCore 采用折中方案：runtime core 统一 command metadata、动态节点、解析、suggest、执行前 resolve 和 handler binding；UI 只渲染 catalog / suggestions / result，不能携带完整 runtime mutation command。
 
 ## 模块定位
 
 ```text
-UI Adapter
-  ├─ renders command palette / slash autocomplete
-  ├─ renders command presentation: message / popup / picker / menu / form
-  └─ submits ExecuteSlashCommand or runtime-provided interaction submit action
-
 AgentRuntime
-  ├─ owns CommandSurfaceService
-  ├─ exposes slash command catalog in RuntimeSnapshot / events
-  ├─ dispatches resolved command to SessionManager / SessionRuntime / ResourceManager
-  └─ publishes command presentation events
-
-CommandSurfaceService
-  ├─ builds SlashCommandCatalog from builtins + resources + extensions
-  ├─ parses raw "/..." text
-  ├─ plans execution: protocol command / runtime query / prompt input / interaction
-  ├─ normalizes backend outcome into CommandPresentation
-  └─ never executes tools, calls model, writes session, or reads resource bodies directly
-
-ResourceManager
-  └─ owns SkillCatalog / PromptTemplateCatalog used by command projection
-
-SessionRuntime
-  ├─ executes session-scoped commands
-  ├─ expands skill/template invocations into user messages
-  ├─ applies queue/phase policy
-  └─ owns run/compaction/config events for a session
+  └─ WorkspaceServices
+      ├─ ResourceManager
+      ├─ ModelGateway / ModelRegistry
+      ├─ CommandManager                       // shared, stateless
+      │   ├─ CommandPackStore                 // builtin nested JSON packs
+      │   ├─ CandidateProviderRegistry        // dynamic candidate providers
+      │   ├─ CommandHandlerRegistry           // trusted handler registry
+      │   ├─ ManifestMaterializer             // manifest + context -> transient catalog
+      │   ├─ Parser                           // command text -> tokens/path/args
+      │   ├─ Suggester                        // command/path/arg suggestions
+      │   └─ Resolver                         // resolve + validate + authorize
+      └─ SessionManager
+          ├─ SessionRuntime A
+          │   ├─ command: Command             // session-scoped facade
+          │   ├─ Tools
+          │   └─ Driver
+          └─ SessionRuntime B
+              ├─ command: Command
+              ├─ Tools
+              └─ Driver
 ```
 
-`CommandSurfaceService` 可以作为 `AgentRuntime` 内部 service，而不是顶层架构层。文档上单独说明，是因为它定义了跨 UI 的 command surface、解析规则、执行映射和用户可见呈现语义。
+`CommandManager` 是无状态管理器：它不持有 current catalog、当前 resource snapshot、当前模型列表、UI 菜单状态或 pending action。`Command` 是 session-scoped facade：它属于 `SessionRuntime`，但不拥有 catalog cache；它每次调用时构造只读 `CommandContext` 和受控 `SessionCommandHost`。
 
-## Command Sources
+## 核心职责
 
-```rust
-pub enum SlashCommandSource {
-    Builtin,
-    Skill,
-    PromptTemplate,
-    Extension,
-    ModelServiceTier,
-}
-```
+`CommandManager` 负责：
 
-来源职责：
+- 加载/持有只读 command packs。
+- 将 nested JSON manifest 和动态候选 materialize 成临时 `MaterializedCommandCatalog`。
+- 解析 command text，例如 `/model thinking high`。
+- 为 UI 生成 command/path/argument suggestions。
+- 在执行前 `resolve_for_execution`：重新解析、校验参数、校验 phase/trust/capability、绑定可信 handler。
+- 调用 `CommandHandler`，但只通过 `SessionCommandHost` 访问 runtime 能力。
 
-- `Builtin`：由 runtime 定义，例如 `/compact`、`/reload`、`/new`、`/status`、`/usage`、`/model`。
-- `Skill`：由 `ResourceManager.skills` 投影，推荐稳定形式为 `/skill:{name}`。
-- `PromptTemplate`：由 `ResourceManager.prompt_templates` 投影，推荐形式为 `/{template_name}`；冲突时可退回 `/prompt:{name}`。
-- `Extension`：后续由 extension registry 提供 metadata 和 handler，不能绕过 runtime policy。
-- `ModelServiceTier`：后续可像 Codex 一样在 `/model` 附近暴露动态 service tier shortcuts。
+`CommandManager` 不负责：
 
-UI-local command 只属于 UI adapter，例如 TUI 的 copy scrollback、quit、theme 或 hotkeys。它可以参与本地 autocomplete overlay，但不属于 `agent_runtime_protocol::RuntimeSnapshot.command_surface.slash_commands`，不能进入 `AgentRuntime` 执行，也不能 shadow runtime command。
+- 不读文件、不读 skill body、不展开 prompt template body。
+- 不调用模型、不执行工具、不写 session storage。
+- 不缓存 UI selection 或 pending interaction。
+- 不把 command result 渲染成 TUI/Vue 组件。
+- 不把 UI-visible metadata 转换成完整 `AgentCommand` payload。
 
-## Catalog
+`SessionRuntime.command: Command` 负责：
 
-```rust
-pub struct SlashCommandSummary {
-    pub name: String,
-    pub aliases: Vec<String>,
-    pub description: Option<String>,
-    pub source: SlashCommandSource,
-    pub source_info: Option<ResourceSourceInfo>,
-    pub argument_hint: Option<String>,
-    pub presentation_hint: Option<CommandPresentationHint>,
-    pub availability: SlashCommandAvailability,
-    pub phase_policy: SlashCommandPhasePolicy,
-}
+- 选择目标 session、cwd、model、tools、run state、resource summary 等 session-scoped view。
+- 构造 `CommandContext`。
+- 构造窄接口 `SessionCommandHost`。
+- 将 `ExecuteCommandText` / `ExecuteCatalogCommand` 交给 `CommandManager`。
 
-pub enum CommandPresentationHint {
-    MessagePanel,
-    Popup,
-    Picker,
-    Menu,
-    Form,
-    DetailView,
-}
+## Command Tree
 
-pub enum SlashCommandAvailability {
-    Available,
-    Disabled { reason: String },
-    Hidden,
-}
-
-pub enum SlashCommandPhasePolicy {
-    IdleOnly,
-    AllowedDuringRun,
-    QueueAsSteer,
-    QueueAsFollowUp,
-    ImmediateRuntimeAction,
-}
-```
-
-Catalog 是 UI 展示与 autocomplete / command palette 的输入，不是执行授权。真正执行仍要在 `dispatch()` 时重新校验 session、phase、trust、权限、资源 revision 和参数。本文中的 Rust 类型片段是设计草图；协议类型以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为权威。
-
-`presentation_hint` 是语义提示，不是 UI 样式指令。Runtime 可以表达 `/model` 更适合 picker、`/usage` 更适合 popup 或 message panel；下游 CLI、Ratatui 和 Tauri/Vue 各自决定具体渲染方式。
-
-后续如果需要让 GUI 为配置项生成表单，可以在 catalog 中补充结构化 `argument_schema`；MVP 只保留 `argument_hint` 和少量内置 command 的 presentation plan。
-
-## 四阶段模型
-
-CommandSurface 采用四阶段模型：
+不要把命令建模成“一个 command 加一个 subcommand”。MiniCore 使用递归 command tree：
 
 ```text
-Parse
-  → Plan
-    → Execute
-      → Present
+CommandNode
+  ├─ CommandSegment
+  ├─ CommandPath
+  ├─ children
+  ├─ args
+  └─ handler
 ```
 
-### 1. Parse
+`CommandPath` 可以任意深度：
 
-Parse 只负责把 raw `/...` 文本解析成 invocation，不执行业务逻辑。
-
-```rust
-pub struct ParsedSlashCommand {
-    pub raw: String,
-    pub name: String,
-    pub args_raw: String,
-}
-
-pub struct SlashCommandInvocation {
-    pub command_id: CommandId,
-    pub session_id: Option<SessionId>,
-    pub delivery: DeliveryMode,
-    pub parsed: ParsedSlashCommand,
-}
+```text
+/model thinking high
+/model provider openai gpt-5
+/skill code-review 修复这个 bug
+/tools enable bash
 ```
 
-`ParsedSlashCommand` 是纯文本解析结果；`SlashCommandInvocation` 是 `AgentRuntime.dispatch()` 附加 command id、目标 session 和 delivery 后形成的运行时输入。
+其中：
+
+- `children` / dynamic children 表示“还在选择哪个命令节点”。
+- `args` 表示“最终命令节点已经选定后的执行输入”。
+- `bindings` 记录动态节点选择出的结构化值，例如 `skill_key`、`provider_id`、`model_id`、`thinking_level`。
+
+这避免了二级菜单限制，也避免把有限集合的动态候选误塞成自由文本参数。
+
+## Manifest Format
+
+外部 command pack 使用多层 JSON，便于作者直观看到命令树；加载后由 `CommandManager` 临时 normalize 成 flat/indexed catalog。
+
+推荐 schema 关键词：
+
+- `nodeType`：节点语义，取值为 `group`、`action`、`groupAction`、`choice`。
+- `children`：静态子节点或动态子节点声明。
+- `dynamic`：说明这一批 children 由 provider 生成。
+- `provider`：动态候选来源 id。
+- `params`：传给 provider 的少量声明式参数。
+- `bind`：candidate 字段到 invocation binding 的映射。
+- `nodeTemplate`：把 provider candidate 投影成 `CommandNode` 的规则；不是 UI 模板。
+- `args`：最终命令节点的执行参数。
+- `handler`：可信 handler id 声明，执行时必须由 registry 重新校验。
+
+避免使用模糊的 `kind`；也不要把 `subcommand` 作为协议/类型核心名。
 
 示例：
 
-```text
-/model
-  → name = "model", args_raw = ""
-
-/model openai/gpt-5
-  → name = "model", args_raw = "openai/gpt-5"
-
-/skill:tdd add tests
-  → name = "skill:tdd", args_raw = "add tests"
-```
-
-普通 `SubmitPrompt` 不应默认把所有 `/...` 当命令，否则用户无法发送以 `/` 开头的普通文本。推荐做法：UI adapter 发现输入首字符为 `/` 时发送 `ExecuteSlashCommand`；如果用户想发送普通文本，可使用转义，例如 `//literal` 或选择 “send as prompt”。
-
-### 2. Plan
-
-Plan 根据命令定义、参数和当前 runtime state 生成执行计划。
-
-```rust
-pub enum SlashCommandPlan {
-    ProtocolCommand(agent_runtime_protocol::Command),
-    RuntimeQuery(RuntimeQueryPlan),
-    PromptInput(PromptInputPlan),
-    Interaction(InteractionPlan),
-    PresentOnly(CommandPresentation),
-    Rejected(CommandPresentation),
+```json
+{
+  "schema": "minicore.command.v1",
+  "source": { "scope": "builtin", "name": "core" },
+  "commands": [
+    {
+      "id": "builtin.model",
+      "segment": "model",
+      "title": "Model",
+      "description": "Model operations",
+      "nodeType": "group",
+      "children": [
+        {
+          "id": "builtin.model.current",
+          "segment": "current",
+          "title": "Current model",
+          "nodeType": "action",
+          "handler": "builtin.model.current"
+        },
+        {
+          "id": "builtin.model.thinking",
+          "segment": "thinking",
+          "title": "Thinking level",
+          "nodeType": "group",
+          "children": [
+            {
+              "dynamic": {
+                "provider": "models.current.thinking_levels",
+                "bind": { "thinking_level": "id" },
+                "nodeTemplate": {
+                  "id": "builtin.model.thinking.{id}",
+                  "segment": "{id}",
+                  "title": "{title}",
+                  "description": "{description}",
+                  "nodeType": "choice",
+                  "handler": "builtin.model.set_thinking_level"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "builtin.skill",
+      "segment": "skill",
+      "title": "Skills",
+      "description": "Invoke a skill",
+      "nodeType": "group",
+      "children": [
+        {
+          "dynamic": {
+            "provider": "resources.skills",
+            "bind": {
+              "skill_key": "resource_key",
+              "skill_name": "name"
+            },
+            "nodeTemplate": {
+              "id": "resource.skill.{resource_key}",
+              "segment": "{name}",
+              "title": "{title}",
+              "description": "{description}",
+              "nodeType": "choice",
+              "handler": "builtin.skill.invoke",
+              "args": [
+                { "name": "instruction", "argType": "tailText", "required": false }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
 }
 ```
 
-同一个命令可以因参数不同走不同计划：
+上面的 `models.current.thinking_levels` 说明 builtin command 也可以是动态命令。思考等级来自当前 session 的模型定义，而不是固定写死在 manifest 中。
 
-```text
-/model
-  → Interaction(ModelPicker)
+## Dynamic Candidate Providers
 
-/model openai/gpt-5
-  → ProtocolCommand(SetModel)
-
-/thinking
-  → Interaction(ThinkingLevelPicker)
-
-/thinking high
-  → ProtocolCommand(SetThinkingLevel)
-
-/status
-  → RuntimeQuery(StatusSnapshot)
-```
-
-Plan 阶段可以把用户级错误转换成 `Rejected(CommandPresentation)`，例如 unknown command、参数非法、当前 phase 不允许执行。这样 UI 可以把错误以 message panel item 展示给用户，而不是只得到一个无法渲染的 ack reason。
-
-### 3. Execute
-
-Execute 把 plan 交给对应后端承接者。`CommandSurfaceService` 不直接拥有这些状态机。
-
-| Plan 类型 | 承接者 | 示例 |
-| --- | --- | --- |
-| `ProtocolCommand` | `AgentRuntime` 路由到对应 module | `/reload`、`/new`、`/model openai/gpt-5` |
-| `RuntimeQuery` | `AgentRuntime` / `SessionRuntime` snapshot 或 view provider | `/status`、`/usage`、`/help` |
-| `PromptInput` | `SessionRuntime` | `/skill:tdd ...`、`/{template} ...` |
-| `Interaction` | `AgentRuntime` 发布 interaction request，UI 承接展示 | `/model`、`/thinking`、`/sessions` |
-| `PresentOnly` | `AgentRuntime` 发布 command output | `/help` 或 parse warning |
-
-没有 slash command 时，后端能力仍通过普通 UI 操作触发：点击 reload 按钮触发 `ReloadResources`，模型选择器触发 `SetModel`，skill picker 触发 `InvokeSkill`。通过 slash command 触发时，后端事实、事件和状态变化应保持一致；差别只在入口 metadata 和用户可见 command presentation。
-
-### 4. Present
-
-Present 把 parse/plan/execute/query 的结果转换成 UI 可消费的语义展示请求。
+动态命令不由 JSON 直接读取文件或设置。JSON 只声明 provider id；真正数据来源由可信 provider 实现，并通过 `CommandContext` 读取 UI-safe summary。
 
 ```rust
-pub enum CommandPresentation {
-    Message(CommandOutput),
-    Interaction(UiInteractionRequest),
-    Both { message: Option<CommandOutput>, interaction: Option<UiInteractionRequest> },
-    None,
+pub trait CommandCandidateProvider {
+    fn id(&self) -> CommandCandidateProviderId;
+
+    fn list(
+        &self,
+        request: CandidateRequest,
+        ctx: &CommandContext,
+    ) -> CandidateResult;
 }
 ```
 
-`CommandPresentation` 不描述像素、CSS、终端布局或 Vue 组件名。它只描述“应该展示什么语义”：一条 message panel 输出、一个可弹窗展示的输出、一个 picker、一个 menu、一个 form，或组合结果。具体展示由下游 CLI/TUI/GUI adapter 决定。`Popup` 是 `CommandOutput` 的展示目标提示；需要用户选择或提交时才使用 `UiInteractionRequest`。
+内置 provider 示例：
 
-## CommandAck 边界
+- `resources.skills`：从当前 session cwd 的 resolved resource summary 生成 skill command nodes；只读 skill metadata，不读 skill body。
+- `resources.prompt_templates`：从 prompt template metadata 生成 template command nodes；不展开模板正文。
+- `models.current.thinking_levels`：从当前 `ModelSelection` 和 model definition 读取可用 thinking levels。
+- `models.providers`：生成 provider 节点。
+- `models.models_by_provider`：根据已有 `bindings.provider_id` 生成对应 model 节点。
+- `tools.available` / `tools.active`：从 session `Tools` summary 生成工具相关命令节点。
+- `sessions.recent`：从 `SessionIndex` summary 生成 session 选择节点。
 
-`CommandAck` 是 UI 调用 `AgentRuntime.dispatch(...)` 后的协议层接收确认，不是 slash command 的执行结果。
+Provider 输出必须经过 UI-safe validation/redaction。Catalog、suggestion 和 command result 中禁止包含：skill body、prompt template body、context file content、凭据、auth ref 细节、raw provider payload、handler internal key、完整 `AgentCommand` payload 或敏感绝对路径。
+
+## Materialization
+
+每次 `catalog`、`children`、`suggest` 或 `execute` 都基于当前 `CommandContext` 临时 materialize：
 
 ```text
-UI dispatch ExecuteSlashCommand("/status")
-  ← CommandAck { accepted: true, command_id }
-  → command_output_appended { command_id, output: Status }
+CommandContext
+  + nested command packs
+  + dynamic candidate providers
+  → MaterializedCommandCatalog
 ```
 
-推荐边界：
-
-- transport/runtime 级无法接收，例如 runtime 已关闭、workspace 不存在、目标 session id 无效，可以返回 `CommandAck { accepted: false }` 或 `RuntimeError`。
-- slash 输入层或业务语义错误，例如 unknown command、参数非法、当前 phase 不允许，优先返回 `CommandAck { accepted: true }`，再发 `command_output_appended { severity: Error }`。这样 TUI 和 GUI 都能在 message 面板中显示一致错误。
-- 后端异步成功/失败仍通过原有业务事件表达，例如 `resources_changed`、`session_model_changed`、`run_finished`、`compaction_finished`。Command output 只是把这些结果解释成用户可读文本或交互请求。
-
-不应把 `/status` 的结果、`/usage` 的统计或 `/model` 的候选列表塞进 `CommandAck`，否则 `CommandAck` 会混淆“已接收”和“已执行/已查询”。
-
-## Presentation Model
-
-### Command Output
-
-`CommandOutput` 是可以显示到 message panel 的 UI-visible、non-model-visible 输出。它适合 `/help`、`/status`、`/usage`、`/reload` 结果、`/model` 设置完成提示、解析错误和长任务阶段提示。
+临时 catalog 可使用 flat/indexed 结构：
 
 ```rust
-pub struct CommandOutput {
-    pub title: String,
-    pub body: Option<String>,
-    pub severity: CommandOutputSeverity,
-    pub blocks: Vec<CommandOutputBlock>,
-    pub actions: Vec<CommandOutputAction>,
+pub struct MaterializedCommandCatalog {
+    pub revision: CommandCatalogRevision,
+    pub roots: Vec<CommandNodeId>,
+    pub nodes: HashMap<CommandNodeId, CommandNode>,
+    pub by_path: HashMap<CommandPath, CommandNodeId>,
+    pub children_by_parent: HashMap<Option<CommandNodeId>, Vec<CommandNodeId>>,
+    pub diagnostics: Vec<CommandDiagnostic>,
 }
 ```
 
-示例：
+`CommandCatalogRevision` 不要求由 `CommandManager` 存储。它可以由输入 revision 计算：command pack revision、cwd resource revision、runtime resource revision、model registry revision、current model revision、tools revision、settings revision、feature flags revision 和 run state revision。
+
+UI 选择旧 catalog item 后执行时，runtime 必须基于当前 context 重新 materialize 并 resolve；如果节点消失或 binding 不再有效，返回 `CommandExpired` / `CatalogStale` 类错误，而不是执行旧 UI selection 携带的动作。
+
+## Parse / Suggest / Resolve
+
+`parse` 负责 command text 的 tokenization 和 path/args 切分，不执行业务逻辑：
 
 ```text
-/status
-  → CommandOutput(title = "Status", blocks = session/model/resources/usage summary)
-
-/model openai/gpt-5
-  → CommandOutput(title = "Model set", body = "Model set to openai/gpt-5. Takes effect on the next model call.")
-
-/reload
-  → CommandOutput(title = "Resources reloaded", body = "8 skills, 3 templates, 1 warning.")
+/model provider openai gpt-5
+  → tokens = ["model", "provider", "openai", "gpt-5"]
 ```
 
-`CommandOutput` 不是 assistant message，也不进入模型上下文。它可以作为 message panel item 展示；如果产品需要重连或重启后恢复这些 UI 输出，应优先通过后续 UI-only presentation log 或 runtime read model 设计恢复，不能进入 `TurnState.messages`。
+随后 resolver 基于 materialized catalog 做递归 path match：优先 static child，必要时匹配 dynamic child，并记录 bindings。无法继续匹配时，剩余 token 交给最终 node 的 args parser。
 
-### UI Interaction Request
+`suggest` 根据 input/cursor 返回候选，不是 UI renderer：
 
-`UiInteractionRequest` 表示 runtime 请求 UI 展示一个需要用户选择或提交的交互控件，例如 picker、multi-select、menu、form 或 detail view。
+```text
+/                         -> root commands
+/model                    -> current / thinking / provider
+/model thinking           -> 当前模型支持的 thinking levels
+/model provider openai    -> openai 下的 models
+/skill                    -> 当前 cwd 的 skills
+```
+
+`resolve_for_execution` 是所有入口执行前的强制步骤。它必须检查：
+
+- command node 仍存在且 catalog revision 可兼容。
+- dynamic bindings 仍能在当前 context 下重解析。
+- args 合法。
+- 当前 session、cwd、run phase、trust、feature flag 和 capability 允许执行。
+- handler binding 来自可信 registry，且 source 允许绑定该 handler。
+
+不要把这一步叫复杂 `planner`。这里的本质是 resolve + validate + authorize + bind handler。
+
+## Execution Interface
+
+协议层使用 `agent_runtime_protocol::AgentCommand` 作为外部运行时命令枚举；command 子系统使用 `command::Command` 作为 session-scoped facade。
+
+推荐外部入口：
 
 ```rust
-pub struct UiInteractionRequest {
-    pub interaction_id: InteractionId,
-    pub command_id: CommandId,
-    pub session_id: Option<SessionId>,
-    pub title: String,
-    pub kind: UiInteractionKind,
-    pub items: Vec<UiInteractionItem>,
-    pub initial_selection: Option<String>,
-    pub allow_search: bool,
-    pub allow_multi_select: bool,
-    pub submit: UiInteractionSubmit,
+pub enum AgentCommand {
+    SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
+    ExecuteCommandText { session_id: Option<SessionId>, raw: String, delivery: PromptDelivery },
+    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs },
+    DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
+    AbortRun { run_id: RunId },
+    ResumeRun { session_id: SessionId, resume_id: ResumeId },
+    ReloadResources { workspace_id: WorkspaceId, cwd: PathBuf },
+    SetModel { session_id: SessionId, provider_id: String, model_id: String },
+    SetThinkingLevel { session_id: SessionId, level: ThinkingLevel },
+    SetActiveTools { session_id: SessionId, tool_names: Vec<String> },
 }
 ```
 
-示例：
+`ExecuteCommandText` 覆盖 TUI slash input 和 GUI command palette 的文本入口。`ExecuteCatalogCommand` 覆盖 GUI/TUI 从 catalog 选择某个节点后的结构化执行入口。它只能携带 command selection、catalog revision、bindings 和 args，不能携带完整 runtime mutation command。
 
-```text
-/model
-  → command_interaction_requested(ModelPicker)
-  → TUI 用 ↑/↓ + Enter 选择
-  → GUI 用 modal/list/search 选择
-  → selection dispatches ExecuteSlashCommand("/model provider/model")
-
-/thinking
-  → command_interaction_requested(ThinkingLevelPicker)
-  → selection dispatches ExecuteSlashCommand("/thinking high")
-
-/sessions
-  → command_interaction_requested(SessionPicker)
-  → selection dispatches OpenSession / FocusSession
-```
-
-MVP 可以让 interaction 的选择结果重新生成 slash command，例如 `/model anthropic/claude-sonnet-4`。后续复杂表单可以增加 `SubmitCommandInteraction { interaction_id, values }`，避免 UI 拼复杂字符串。
-
-## 第一阶段推荐命令
-
-第一阶段目标是验证 catalog、parse、plan、execute、present、后端承接者和 message panel / picker 的完整闭环，不需要复刻 pi 或 Codex 的完整命令集。
-
-| Slash | 无参数行为 | 有参数行为 | 承接者 | Presentation |
-| --- | --- | --- | --- | --- |
-| `/help [command]` | 展示命令目录 | 展示单个命令帮助 | `SlashCommandCatalog` query | message panel |
-| `/status` | 展示 session/runtime/model/resource/usage 摘要 | 后续支持 `detail` | `AgentRuntime.snapshot` / session view | message panel |
-| `/usage` | 展示 usage 摘要 | 后续支持 `detail` | `UsageStats` / snapshot views | message panel，GUI 可 popup |
-| `/reload` | 刷新资源 | 无 | `AgentRuntime` → `ResourceManager` | lifecycle events + reload summary message |
-| `/compact [instructions]` | 手动压缩 | 压缩时附加说明 | `SessionRuntime` → `Compaction` | started/final command output + compaction events |
-| `/skill:{name} [args]` | 调用技能 | 附加说明 | `SessionRuntime` + `Skills` + `ResourceManager` metadata | 可选 invoked message + run events |
-| `/{template} [args]` | 展开 prompt template | 模板参数 | `SessionRuntime` + prompt template catalog | 可选 expanded message + run events |
-| `/model` | 打开 model picker | `SetModel` | `SessionRuntime` model state | picker；设置后 message |
-| `/thinking` | 打开 thinking picker | `SetThinkingLevel` | `SessionRuntime` thinking state | picker；设置后 message |
-| `/new` | 新建并聚焦会话 | 后续支持 name | `AgentRuntime` → `SessionManager` | session events + summary message |
-| `/sessions` 或 `/resume` | 打开当前 workspace 的 session picker | 后续支持 `--all` / filter | `SessionManager.list_sessions(CurrentWorkspace)` + UI picker | picker；选择后 session events |
-| `/tools` | 展示工具摘要 | mutation 后置 | `SessionRuntime` tool state | message 或 readonly multi-select |
-
-第一阶段暂缓：`/tools +read -bash`、`/permissions`、`/login`、`/logout`、`/export`、`/tree`、`/fork`、extension commands、MCP resource commands 和 UI-local theme/keymap。它们涉及工具风险、凭据流程、复杂 session tree 或 extension policy，适合在核心闭环稳定后加入。
-
-`/compact` 的 protocol command 可以随第一阶段定义，但在 `Compaction` 后端尚未实现前，catalog 必须把它标记为 `Disabled { reason }`，不能接受后静默失败。等 [Compaction](compaction.md) 模块落地后，它再成为可执行 command。
-
-## Resolution Priority
-
-名称冲突必须确定性处理：
-
-1. Builtin commands 最高优先级。
-2. Extension commands 不能 shadow builtins；冲突进入 diagnostics。
-3. Prompt templates 不能 shadow builtins 或 extension commands；冲突时在 catalog 中标记 disabled，或只允许 `/prompt:{name}`。
-4. Skills 默认只通过 `/skill:{name}` 暴露，避免和 builtins/templates 冲突。
-5. UI-local commands 不进入 runtime catalog，且不能 shadow runtime commands；UI adapter 合并本地 overlay catalog 时必须做本地冲突检查。
-
-这样可以避免 `/model` 同时是内置模型选择和项目 prompt template 时出现不可预测行为。
-
-## 与现有流程结合
-
-### ResourceManager
-
-`ResourceManager` 仍然负责加载技能和提示模板候选、执行 cwd-over-runtime overlay，并在 `CwdResourceSnapshot.resolved` 中提供 effective metadata。资源 reload 后：
-
-```text
-ResourceManager.reload_cwd(CwdResourceRequest { cwd, ... })
-  → build CwdResourceSnapshot { runtime, local, resolved }
-  → ResourceSnapshotStore.replace_cwd(cwd, snapshot)
-  → cwd resource revision changed
-  → AgentRuntime rebuilds SlashCommandCatalog projection from resolved summaries
-  → runtime snapshot state updated
-  → resources_changed
-  → slash_commands_changed?   // 当 catalog 内容或可用性变化时
-```
-
-`CommandSurface` 只读取资源摘要和 metadata，不读取技能正文。技能正文读取仍发生在 `SessionRuntime::invoke_skill`，但必须来自 captured `TurnResourceSnapshot`，不能绕过 snapshot 重新读文件。
-
-### AgentRuntimeProtocol
-
-协议入口：
+高权限 mutation 不属于公开 `AgentCommand`：
 
 ```rust
-ExecuteSlashCommand { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode }
+pub(crate) enum InternalAgentCommand {
+    AppendMessage { session_id: SessionId, message: MessageRecord, trigger_turn: bool },
+    SetToolDefinitions { session_id: SessionId, tools: Vec<ToolConfig> },
+    MutateSessionHistory(...),
+}
 ```
 
-RuntimeSnapshot 包含：
+这类能力只能由内部受控代码路径或测试 harness 使用，不能出现在 UI-visible catalog、command output action、event metadata 或快照中。
 
-```rust
-command_surface: CommandSurfaceSnapshot { slash_commands: Vec<SlashCommandSummary> }
-```
+## Command Handlers
 
-事件包含：
+handler 逻辑放在 `src/command/handlers/`。`src/command/handler.rs` 只放 trait 和 registry。
 
-```rust
-SlashCommandEvent::CatalogChanged { ... }       // wire: slash_commands_changed
-CommandPresentationEvent::OutputAppended { ... } // wire: command_output_appended
-CommandPresentationEvent::InteractionRequested { ... } // wire: command_interaction_requested
-```
-
-`GetSlashCommandCatalog`、`CompleteSlashCommandArgs`、`SubmitCommandInteraction` 和 `command_interaction_resolved` 可以后置。MVP 可以只把 `slash_commands` 放进 `RuntimeSnapshot.command_surface`，让 UI 本地 fuzzy filter；interaction 选择结果可以重新提交 `ExecuteSlashCommand`，例如 `/model {item.id}`。参数 completion、复杂 form 和 runtime-tracked pending interaction 等待基础 interaction 模型稳定后再实现。
-
-不推荐给每次 slash command 都发 `slash_command_started/finished`。真正业务事件仍用已有事件表达，例如 `compaction_started`、`resources_changed`、`session_model_changed`、`skill_invoked`、`prompt_template_invoked`、`usage_updated`。用户可见说明由 `CommandPresentationEvent` 表达。
-
-### AgentRuntime
-
-`AgentRuntime` 是 `ExecuteSlashCommand` 的入口路由者：
+推荐代码结构：
 
 ```text
-ExecuteSlashCommand
-  → CommandSurfaceService.parse
-  → CommandSurfaceService.plan
-  → execute plan through backend owner
-  → CommandSurfaceService.present backend outcome
-  → AgentRuntime publishes CommandPresentationEvent
+src/
+  command.rs
+  command/
+    mod.rs
+    manager.rs          // CommandManager，无状态
+    session.rs          // pub struct Command，SessionRuntime 持有的 facade
+    manifest.rs         // nested JSON schema / load
+    definition.rs       // CommandNodeSpec / nodeType / args / dynamic
+    materialize.rs      // manifest + CommandContext -> transient catalog
+    provider.rs         // CommandCandidateProvider trait + registry
+    parse.rs            // command text parser
+    suggest.rs          // command/path/arg suggestions
+    resolve.rs          // resolve_for_execution
+    handler.rs          // CommandHandler trait + registry
+    host.rs             // SessionCommandHost trait
+    result.rs           // CommandResult / CommandError
+    handlers/
+      mod.rs
+      help.rs
+      status.rs
+      session.rs
+      model.rs
+      thinking.rs
+      resources.rs
+      skills.rs
+      prompt_templates.rs
+      tools.rs
 ```
 
-它负责把 `command_id` 贯穿到业务事件和 command presentation events 中，让 UI 可以把用户输入、后端事实和展示结果关联起来。
+`CommandHandler` 通过窄 host 操作 runtime：
 
-### SessionRuntime
+```rust
+#[async_trait]
+pub trait CommandHandler {
+    async fn execute(
+        &self,
+        invocation: ResolvedCommandInvocation,
+        host: &mut dyn SessionCommandHost,
+    ) -> CommandResult;
+}
+```
 
-`SessionRuntime` 负责 session-scoped slash command 的最终执行：
+`SessionCommandHost` 包含 `submit_prompt`、`invoke_skill`、`invoke_prompt_template`、`reload_resources`、`set_model`、`set_thinking_level`、`set_active_tools`、`abort_run`、`resume_run`、`new_session`、`switch_session` 等受控方法。Handler 不拿完整 `SessionRuntime`，避免形成超宽接口。
 
-- `/skill:name args`：读取当前 `SkillCatalog` metadata，读取正文，构造 `<skill>` user message，然后按 `delivery` 启动 run 或入队。
-- `/{template} args`：查当前 `PromptTemplateCatalog`，替换参数，构造 user message。
-- `/compact`：进入 compaction 流程，不走 Driver 的普通 run。
-- `/model`：更新 model state，发 `session_model_changed`，必要时重建 next `TurnState`。
-- `/thinking`：更新 thinking state，发 `session_thinking_level_changed`，影响下一次 turn 或安全点后的模型调用。
-- 运行中命令：根据 `SlashCommandPhasePolicy` 决定立即执行、拒绝并输出错误 message、排队为 steer/follow-up，或等待 safe point。
+## Skill And Prompt Template Commands
 
-`SessionRuntime` 不解析 raw `/...` 字符串；它只处理结构化 command、prompt input 或 session action。
+Skill 必须注册进 command catalog。它不是普通 arg completion。
 
-### UI Adapter
+```text
+/skill code-review 修复这个 bug
+```
 
-UI adapter 只负责 presentation 渲染：
+解析结果：
 
-- 根据 `RuntimeSnapshot.command_surface.slash_commands` 或 `slash_commands_changed` 渲染 autocomplete / command palette。
-- TUI slash input 和 GUI command palette 默认提交 `ExecuteSlashCommand`；runtime-provided picker/menu/form 选择结果默认使用 `UiInteractionSubmit`。专用设置控件如果直接提交结构化 command，必须复用同一后端校验、事件和 command presentation 规则。
-- 消费 `command_output_appended`，在 message panel 追加 `CommandOutput`。
-- 消费 `command_interaction_requested`，用本端能力渲染 picker、menu、form 或 detail view；`/usage` 这类只展示信息的 popup 可由 `CommandOutput` 的 presentation hint 渲染。
-- 对 interaction selection，MVP 可以重新提交 `ExecuteSlashCommand`，例如从 model picker 选择后提交 `/model provider/model`。
-- UI-local command 可以在 adapter 内处理，但不能 shadow runtime command，也不能读取资源正文、执行工具或修改 runtime-owned settings。
+```text
+path = ["skill", "code-review"]
+bindings.skill_key = ResourceKey(...)
+bindings.skill_name = "code-review"
+args.instruction = "修复这个 bug"
+handler = "builtin.skill.invoke"
+```
 
-### Persistence
+Catalog 只使用 skill metadata：name、title、description、`ResourceKey`、source info、resource revision/content hash 摘要。真正执行时：
 
-slash invocation 本身不是模型可见 session entry。只有产生模型可见输入或会话状态变化的结果才持久化：
+```text
+builtin.skill.invoke
+  -> SessionCommandHost.invoke_skill(...)
+  -> SessionRuntime.start_user_turn
+  -> ResourceManager.capture_turn(...)
+  -> 从 captured TurnResourceSnapshot 读取 selected SkillResource.body
+```
 
-- `/skill:name args` 产生一条 user message，可在 metadata 中记录 `PromptInputSource::SlashSkill { raw, resource_revision }`。
-- `/{template} args` 产生一条 user message，可记录 template name 和 resource revision。
-- `/compact` 产生 compaction session entry 和 save point。
-- `/model`、`/tools` 等配置变化按 session metadata 或 settings persistence 规则处理。
-- `/status`、`/usage`、`/help` 产生 `CommandOutput`，默认不进入模型上下文。若要跨重启恢复 message panel，应通过 UI-only presentation log 或 snapshot projection 设计，不能进入 `TurnState.messages`。
+Prompt template 也可以通过 dynamic provider 进入 command tree，例如 `/template <name>` 或兼容 `/{template}` alias。Template body 和参数替换只在 `SessionRuntime` 执行阶段发生，不在 catalog/materialization 阶段发生。
+
+可选兼容：支持 pi 风格 `/skill:name` alias，但 canonical path 推荐 `/skill name`。Alias 解析后必须归一化为相同 `CommandPath` 和 binding。
+
+## UI Boundary
+
+UI adapter 负责渲染，不负责授权或执行：
+
+- 根据 `CommandCatalogView` / `CommandSuggestion` 渲染 slash autocomplete、command palette、嵌套菜单或 GUI picker。
+- 提交 `AgentCommand::ExecuteCommandText` 或 `AgentCommand::ExecuteCatalogCommand`。
+- 消费 display-neutral `CommandResultView` / command output event，自行显示到 message panel、toast、modal 或页面。
+- UI-local command 可以作为 adapter 本地 overlay，但不能 shadow runtime command，也不能进入 `AgentRuntime` 执行。
+
+Runtime core 不输出 TUI/Vue widget，不输出 popup layout，不输出 button callback，不输出完整 `AgentCommand` action。若未来需要 runtime-owned command action，也必须是 opaque action id，并由 runtime 重新校验，不允许 UI-visible object 携带完整 mutation command。
+
+## Protocol Events And Snapshot
+
+协议快照只暴露 command catalog summary，不代表执行授权：
+
+```rust
+pub struct CommandSnapshot {
+    pub revision: CommandCatalogRevision,
+    pub commands: Vec<CommandNodeSummary>,
+    pub diagnostics: Vec<CommandDiagnostic>,
+}
+```
+
+Catalog change 可以发：
+
+```rust
+CommandCatalogEvent::Changed {
+    workspace_id: WorkspaceId,
+    session_id: SessionId,
+    revision: CommandCatalogRevision,
+    commands: Vec<CommandNodeSummary>,
+}
+```
+
+`CommandAck` 只表示 `AgentRuntime.dispatch(AgentCommand)` 是否接收了协议命令。Unknown command、参数非法、phase 不允许等用户级错误，优先返回 accepted，然后通过 command result/output 事件展示；transport/runtime 级无法接收才 rejected。
+
+不推荐给每次 command 发 `command_started/finished`。真正业务事实仍使用对应事件：`resources_changed`、`session_model_changed`、`skill_invoked`、`prompt_template_invoked`、`run_finished`、`tool_call_*`。Command output 只是用户可见解释，不替代业务事件。
 
 ## 安全边界
 
-slash command 不能成为绕过策略的后门：
+- Command catalog 是 UI-safe metadata，不是授权。
+- UI selection 不是授权；执行时必须重新 materialize 和 resolve。
+- UI-visible metadata 不得携带完整 `AgentCommand` 或 internal handler key。
+- `nodeTemplate` 是 candidate 到 `CommandNode` 的投影，不是 UI 模板，也不能读文件或执行代码。
+- Dynamic provider 只能从 `CommandContext` 的安全 view 读取摘要。
+- Project-local manifest MVP 不允许注册可执行 handler；未来若允许，必须经过 project trust、package/source identity、capability 和 handler registry 校验。
+- Builtin handler binding 只能由 builtin pack 使用；manifest 不能自由引用任意高权限 handler。
+- Skill body、prompt template body、context file content 和完整 system prompt 不进入 command catalog。
+- 工具 mutation、会话历史 mutation 和 tool definition mutation 不属于公开 command catalog。
 
-- 不允许 UI 通过 slash command 直接读本地文件；资源正文读取必须经过 runtime。
-- 不允许 slash command 直接执行工具；工具仍走 `SessionRuntime` 持有的 `Tools` 子系统、approval 和 sandbox。
-- 不允许 extension slash command 绕过 `RuntimeHookRegistry` / extension policy。
-- 运行中命令必须遵守 phase policy 和 queue semantics。
-- catalog 中显示 command 不代表执行时一定成功；dispatch 必须重新校验。
-- `CommandPresentation` 是语义展示请求，不是 UI 私有回调；UI 不能通过它修改 runtime state。
+## MVP 命令范围
+
+第一阶段建议只覆盖：
+
+- `/help`：展示 command catalog / 单个 command help。
+- `/status`：展示当前 session/runtime 摘要。
+- `/reload`：调用 `ReloadResources`。
+- `/skill <name> [instruction]`，兼容 `/skill:name [instruction]`：执行 skill invocation。
+- `/template <name> ...` 或 `/{template}` alias：执行 prompt template invocation。
+- `/model current`、`/model provider <provider> <model>` 或动态 path：读取/设置模型。
+- `/model thinking <level>`：设置当前模型支持的 thinking level。
+- `/tools list`：只读展示工具摘要；mutation 后置。
+
+暂缓 extension executable commands、project-local command handlers、复杂 form schema、generic runtime interaction submit、runtime-owned action ids、tool/permission mutation command 和 catalog hooks。
 
 ## 测试重点
 
-- builtin/template/skill/extension 名称冲突的优先级。
-- resource reload 后 catalog revision、snapshot 更新和 `slash_commands_changed`。
-- `/help`、`/status`、`/usage` 产生 `command_output_appended`，而不是把结果塞进 `CommandAck`。
-- `/model`、`/thinking` 无参数产生 `command_interaction_requested`，选择后重新进入同一 `ExecuteSlashCommand` 路线。
-- `/model provider/model` 和 UI model picker 选择后的后端事件一致。
-- `/skill:name args` 展开为 user message，旧 message 不受后续 resource reload 改写。
-- `/{template} args` 参数替换和缺参行为。
-- 运行中 `/compact`、`/skill`、普通 prompt 的 phase policy 和用户可见错误输出。
-- UI-local command 不能通过 `AgentRuntime` 执行，也不能 shadow runtime command。
-- `SubmitPrompt` 发送 `/literal` 与 `ExecuteSlashCommand` 解析命令的边界。
-- `CommandPresentation` 不进入模型上下文，不被 `Driver` 或 tools 消费。
+- nested JSON materialize 成 flat catalog 的 parent/children/path index。
+- 动态 provider 生成 builtin 动态节点，例如 thinking levels。
+- Skill 作为 dynamic command node 注册进 catalog，不读取 skill body。
+- `/skill name args` 与 `/skill:name args` 归一到同一 invocation。
+- `ExecuteCommandText` 与 `ExecuteCatalogCommand` 最终都走 `resolve_for_execution`。
+- stale catalog selection 被拒绝或重解析，不执行旧 UI payload。
+- UI-visible catalog/result 不包含完整 `AgentCommand`、handler key、resource body 或 secret。
+- 高权限 `InternalAgentCommand` 不出现在公开协议、快照、事件或 command output 中。

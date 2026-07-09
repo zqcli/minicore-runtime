@@ -110,37 +110,23 @@
 
 ### BR-006：CommandPresentation 可携带完整 Command，可能突破 presentation 边界
 
-状态：Open
+状态：Resolved
 
-问题：`CommandAction::DispatchCommand(Command)` 和 `UiInteractionSubmit::DispatchCommandTemplate` 允许 UI-visible presentation 携带完整 runtime command。但 CommandSurface 安全边界又说 `CommandPresentation` 是语义展示请求，UI 不能通过它修改 runtime state。若 hook/extension 可 patch presentation，可能间接制造高权限结构化命令。
+原问题：`CommandAction::DispatchCommand(Command)` 和 `UiInteractionSubmit::DispatchCommandTemplate` 允许 UI-visible presentation 携带完整 runtime command。但 CommandSurface 安全边界又说 `CommandPresentation` 是语义展示请求，UI 不能通过它修改 runtime state。若 hook/extension 可 patch presentation，可能间接制造高权限结构化命令。
 
-证据：
+决策结果：协议层把公开命令枚举改名为 `agent_runtime_protocol::AgentCommand`，并移除 UI-visible presentation 携带完整 command/template 的设计。UI 选择 command catalog item 时只能提交 `ExecuteCommandText` 或 `ExecuteCatalogCommand`；runtime 必须基于当前 session context 重新 materialize catalog，并执行 `resolve_for_execution` 校验 selection、bindings、args、phase、trust、capability 和 handler binding。Command output action 如未来保留，也只能使用 runtime-owned opaque action id。
 
-- `docs/modules/agent-runtime-protocol.md`：`CommandAction::DispatchCommand(Command)`。
-- `docs/modules/agent-runtime-protocol.md`：`UiInteractionSubmit::DispatchCommandTemplate`。
-- `docs/modules/command-surface.md`：`CommandPresentation` 是语义展示请求，不是 UI 私有回调；UI 不能通过它修改 runtime state。
-- `docs/modules/runtime-hooks.md`：`CommandOutputBuild`、`InteractionRequestBuild` 可 patch presentation 语义。
-
-风险：presentation layer 可能成为绕过 CommandSurface parse/plan/phase policy 的后门。
-
-待处理方向：限制 presentation action 的 command 白名单；或让 action 只携带 opaque action id / typed safe action，由 runtime 再次解析和授权。
+后续实现需验证：catalog/output/interaction metadata 中不能序列化完整 `AgentCommand`、internal handler key、resource body 或 credentials；hook patch 后必须经过 UI-safe redaction。
 
 ### BR-007：公开协议暴露过宽的内部 mutation command
 
-状态：Open
+状态：Resolved
 
-问题：MVP `Command` 包含 `AppendMessage`、`SetTools` 等高权限 mutation 能力，但架构边界要求 UI 不拥有 session messages authority、tools authority。这些命令更像 internal/privileged API。
+原问题：MVP `Command` 包含 `AppendMessage`、`SetTools` 等高权限 mutation 能力，但架构边界要求 UI 不拥有 session messages authority、tools authority。这些命令更像 internal/privileged API。
 
-证据：
+决策结果：公开协议枚举改名为 `AgentCommand`，只表达下游 UI/CLI 可提交的用户意图；`AppendMessage`、工具定义替换、会话历史改写等能力移入 `InternalAgentCommand` / 内部 API，不进入公开协议、快照、事件或 command catalog。公开工具相关命令只允许 `SetActiveTools { tool_names }` 这类基于 registry allowlist 的安全意图。
 
-- `docs/modules/agent-runtime-protocol.md`：`AppendMessage { session_id, message, trigger_turn }`。
-- `docs/modules/agent-runtime-protocol.md`：`SetTools { session_id, tools, active_tool_names }`。
-- `docs/architecture.md`：工具注册、活跃工具、审批、沙箱和真实副作用执行由 runtime 统一治理。
-- `docs/modules/agent-runtime-events.md`：UI 不应持有权威会话状态或工具状态。
-
-风险：下游 adapter 可以直接注入消息、工具配置或绕过资源/tool provider 归一化。
-
-待处理方向：区分 public protocol command 与 privileged/internal command；给高权限命令加 capability、feature gate 或移动到内部 API。
+后续实现需验证：公开 transport / SDK 不能构造内部 mutation；测试 harness 如需内部能力必须走 crate-private API 或显式 privileged feature。
 
 ### BR-008：Driver seam 可能过宽，`TurnState` 把资源状态泄漏给 Driver
 
@@ -210,19 +196,13 @@
 
 ### BR-012：CommandSurface 与 CommandSurfaceService 命名层级仍需决定
 
-状态：Open
+状态：Resolved
 
-问题：模块名是 `CommandSurface`，文件规划是 `src/command_surface.rs`，但 AgentRuntime 服务列表使用 `CommandSurfaceService`。这可能只是实现类型名，但目前没有明确说明。
+原问题：模块名是 `CommandSurface`，文件规划是 `src/command_surface.rs`，但 AgentRuntime 服务列表使用 `CommandSurfaceService`。这可能只是实现类型名，但目前没有明确说明。
 
-证据：
+决策结果：`CommandSurface` 保留为领域总称，不作为主 struct 名。实现类型拆为共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` facade；文件规划改为 `src/command.rs` 与 `src/command/` 子模块。协议命令枚举改名为 `AgentCommand`，避免与 `command::Command` 混淆。
 
-- `docs/modules/command-surface.md`：模块为 `CommandSurface`，内部示例为 `CommandSurfaceService`。
-- `docs/modules/agent-runtime.md`：`AgentRuntime` 持有 `CommandSurfaceService`。
-- `docs/modules/README.md`：Rust 文件规划只有 `src/command_surface.rs`。
-
-风险：实现时 struct、module、trait 命名可能继续漂移。
-
-待处理方向：决定 public module 名、主 struct 名和 service 聚合里的字段名。例如模块 `command_surface`，主类型 `CommandSurface` 或 `CommandSurfaceService` 二选一。
+后续实现需验证：不再引入有状态 `CommandSurfaceService`；`CommandManager` 不缓存 catalog 或 UI state。
 
 ### BR-013：Compaction 与 ModelGateway 请求类型重复
 
@@ -327,18 +307,13 @@
 
 ### BR-019：CommandSurface catalog revision 在模块文档中不够显式
 
-状态：Open
+状态：Resolved
 
-问题：协议定义 `SlashCommandCatalogRevision` 和 `SlashCommandEvent::CatalogChanged`，但 CommandSurface 的 catalog 设计段落主要展示 `SlashCommandSummary`，revision 语义不够突出。
+原问题：协议定义 `SlashCommandCatalogRevision` 和 `SlashCommandEvent::CatalogChanged`，但 CommandSurface 的 catalog 设计段落主要展示 `SlashCommandSummary`，revision 语义不够突出。
 
-证据：
+决策结果：命令目录改为 `CommandSnapshot { revision, commands, diagnostics }` / `CommandCatalogRevision`，由 `CommandManager` 基于 command pack revision、resource revision、model/tools/settings/feature/run-state revision 等输入现算。UI 通过 `ExecuteCatalogCommand { selection.catalog_revision, ... }` 回传 selection，runtime 重新 materialize 并校验 stale/expired/binding invalid。
 
-- `docs/modules/agent-runtime-protocol.md`：定义 `SlashCommandCatalogRevision`。
-- `docs/modules/command-surface.md`：Catalog 段落没有把 revision 放在 catalog 类型草图中。
-
-风险：实现时可能只做 Vec 比较，忽略 catalog revision、资源 revision 和 availability 变化的关系。
-
-待处理方向：在 CommandSurface 文档中显式补充 catalog revision owner 和更新条件。
+后续实现需验证：catalog revision 变化会触发 `command_catalog_changed`；旧 UI selection 不能绕过当前 catalog 重新校验。
 
 ### BR-020：首个 fake-driver 纵切事件验收写法不一致
 

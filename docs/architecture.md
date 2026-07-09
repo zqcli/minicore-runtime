@@ -24,23 +24,22 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                          │
                          ▼
                  MiniCore AgentRuntime
-       ┌────────────────────┬────────────────────┬────────────────────┐
-       ▼                    ▼                    ▼                    ▼
- WorkspaceServices     CommandSurface      RuntimeHooks      ResourceManager
-       │                                                        │
-       ├── user-global ProviderRegistry / AuthStore             │
-       ├── shared ModelGateway                                  │
-       ▼                                                        │
- SessionManager ◀───────────────────────────────────────────────┘
-       │                                                        │
-       │                                                        ▼
-       │                                             ResourceSnapshotStore
-       │                                                ├── current runtime -> RuntimeResourceSnapshot
-       │                                                └── (workspace_id, cwd) -> CwdResourceSnapshot
+                         │
+                         ▼
+                 WorkspaceServices
+       ┌──────────────┬──────────────┬──────────────┬──────────────┐
+       ▼              ▼              ▼              ▼              ▼
+ SessionManager  ResourceManager  CommandManager RuntimeHooks  ModelGateway
+       │              │                                           │
+       │              ├── ResourceSnapshotStore                   └──▶ Rig providers
+       │              │     ├── current runtime -> RuntimeResourceSnapshot
+       │              │     └── (workspace_id, cwd) -> CwdResourceSnapshot
+       │              └── ResourceOverlayPolicy
        │
  LoadedSessionRuntimes
        │
  SessionRuntime ── fixed workspace cwd; run captures TurnResourceSnapshot into TurnState
+       ├─ Command ──────────────▶ CommandManager materialize / parse / resolve
        ├─ Driver ───────────────▶ Rig AgentRun
        ├─ Tools ────────────────▶ tool registry / policy / approval / executors
        └─ Prompt ───────────────▶ captured cwd snapshot resolved view + tool prompt catalog
@@ -51,11 +50,11 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [模块总览](modules/README.md)：整体模块关系、Rig / Runtime / 下游 UI 宿主的边界。
 - [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、`WorkspaceServices` / `ResourceSnapshotStore`、会话打开/聚焦和工作区生命周期。
 - [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、队列、Hook、turn state 和 post-run 流程。
-- [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::Command`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
+- [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::AgentCommand`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
 - [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
 - [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
 - [ResourceManager](modules/resource-manager.md)：资源来源聚合、刷新和资源诊断。
-- [CommandSurface](modules/command-surface.md)：跨 UI 的斜杠命令目录、Parse / Plan / Execute / Present 四阶段、运行时命令映射和 command presentation。
+- [CommandSurface](modules/command-surface.md)：跨 UI 的用户命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry 和执行前 resolve。
 - [RuntimeHooks](modules/runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
 - [Skills](modules/skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](modules/prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
@@ -75,7 +74,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。多个 `SessionRuntime` 可以同时 loaded/running；每个 runtime 固定自己的 workspace cwd，每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
 - `SessionRuntime` 是单个会话的产品级编排层。
-- `CommandSurface` 属于运行时命令入口：下游 UI 可以渲染 autocomplete / command palette / picker / popup，但不拥有 `/...` 的权威解析、执行映射或用户可见结果语义。
+- `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
 - `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
@@ -111,7 +110,8 @@ AgentSessionRuntime
 - [ADR 0004：SessionManager 拥有已加载会话运行时](adr/0004-session-manager-owns-loaded-session-runtimes.md)
 - [ADR 0005：ResourceManager 是运行时内部资源服务](adr/0005-resource-manager-is-runtime-internal.md)
 - [ADR 0006：CommandSurface 是跨 UI 的运行时命令入口](adr/0006-command-surface-is-runtime-command-surface.md)
-- [ADR 0007：CommandSurface 使用 CommandPresentation 呈现用户可见结果](adr/0007-command-surface-uses-command-presentation.md)
+- [ADR 0007：CommandSurface 使用 UI-safe 命令结果表达用户可见反馈](adr/0007-command-surface-uses-command-presentation.md)
+- [ADR 0012：命令体系使用无状态 CommandManager 和 session-scoped Command](adr/0012-command-manager-is-stateless-session-command-facade.md)
 - [ADR 0008：RuntimeHooks 是内部安全点扩展缝，不是协议事件或 UI 插件 API](adr/0008-runtime-hooks-are-internal-safe-point-seams.md)
 - [ADR 0009：ModelGateway 包装 Rig providers](adr/0009-model-gateway-wraps-rig-providers.md)
 - [ADR 0010：多 session runtime 使用级联资源快照](adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md)

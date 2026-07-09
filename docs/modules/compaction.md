@@ -413,7 +413,7 @@ MessageRecord::CompactionSummary(m) => ModelMessage::User {
 ## 手动压缩流程
 
 ```text
-agent_runtime_protocol::Command::Compact { instructions }
+agent_runtime_protocol::AgentCommand::Compact { instructions }
   → AgentRuntime.dispatch
   → SessionRuntime checks phase
   → abort current run and wait for idle

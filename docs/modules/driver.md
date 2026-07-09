@@ -444,7 +444,7 @@ MVP 可以只实现 `Continue` / `Finish` / `ContinueWithMessages`，但函数�
 - 自己等待 UI approval。
 - 自己读取资源或构建 system prompt。
 - 自己执行 compaction 或摘要模型调用。
-- 自己展开 `/skill:name` 或 prompt template。
+- 自己展开 `/skill <name>`、兼容 `/skill:name` 或 prompt template。
 - 自己保存 session entry。
 - 自己管理 active tools 或 queues。
 - 暴露 Rig 类型给 UI adapter。

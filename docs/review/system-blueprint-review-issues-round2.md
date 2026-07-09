@@ -121,11 +121,11 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 状态：Open
 
-问题：`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate`、`ExecuteSlashCommand` 都携带 `delivery: DeliveryMode`，同时又存在独立的 `Steer` / `FollowUp` / `NextTurn` 命令。若 `DeliveryMode` 覆盖 steer/follow-up/next-turn，则两套入口语义重叠，phase guard、queue hook（`QueueBeforeEnqueue`）和事件（`queue_updated`）需要对两条路径保持一致，容易漂移；若不覆盖，`DeliveryMode` 的取值就无从知晓——该 enum 与 `QueueKind`、`QueueMode` 在全部文档中都没有定义（仅 session-runtime.md 提到队列模式"支持 all 和 one-at-a-time"）。
+问题：`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate`、`ExecuteCommandText` 都携带 `delivery: DeliveryMode`，同时又存在独立的 `Steer` / `FollowUp` / `NextTurn` 命令。若 `DeliveryMode` 覆盖 steer/follow-up/next-turn，则两套入口语义重叠，phase guard、queue hook（`QueueBeforeEnqueue`）和事件（`queue_updated`）需要对两条路径保持一致，容易漂移；若不覆盖，`DeliveryMode` 的取值就无从知晓——该 enum 与 `QueueKind`、`QueueMode` 在全部文档中都没有定义（仅 session-runtime.md 提到队列模式"支持 all 和 one-at-a-time"）。
 
 证据：
 
-- `docs/modules/agent-runtime-protocol.md`：MVP Command 列表同时含 `SubmitPrompt { delivery }` 与 `Steer`/`FollowUp`/`NextTurn`；`SetQueueMode { queue: QueueKind, mode: QueueMode }`。
+- `docs/modules/agent-runtime-protocol.md`：MVP `AgentCommand` 列表同时含 `SubmitPrompt { delivery }` 与 `Steer`/`FollowUp`/`NextTurn`；`SetQueueMode { queue: QueueKind, mode: QueueMode }`。
 - 全仓库无 `DeliveryMode` / `QueueKind` / `QueueMode` 定义。
 
 风险：入口语义二义，实现时两条路径的队列/phase/hook 行为分叉。
@@ -196,7 +196,7 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 状态：Open
 
-问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、PersistenceEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 CommandPresentation 的 command_id 解释了"内层重复是为了脱离事件上下文渲染"，没有给出统一规则。
+问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、PersistenceEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 `CommandResultEvent` / `UiInteractionRequest` 的 command_id 解释了“内层重复是为了脱离事件上下文渲染”，没有给出统一规则。
 
 证据：
 
@@ -355,13 +355,11 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-046：`UiInteractionSubmit::ExecuteSlashCommandTemplate` 的占位符语法未定义
 
-状态：Open
+状态：Resolved
 
-问题：MVP 依赖 picker 选择后按模板重新提交 slash command（示例 `/model {item.id}`），但模板占位符语法（可用变量、转义规则）没有定义，TUI/GUI 各自实现必然分叉。
+原问题：MVP 依赖 picker 选择后按模板重新提交 slash command（示例 `/model {item.id}`），但模板占位符语法（可用变量、转义规则）没有定义，TUI/GUI 各自实现必然分叉。
 
-证据：`docs/modules/agent-runtime-protocol.md` interaction 段示例。
-
-待处理方向：定义最小占位符集（如 `{item.id}`）与转义规则。
+决策结果：移除 template submit 通道。UI 选择 command catalog item 后提交 `ExecuteCatalogCommand { selection, args }`；若确实是文本入口，则提交明确的 `ExecuteCommandText { raw }`。runtime 收到后重新 materialize catalog 并执行 `resolve_for_execution`，不需要 UI 实现占位符模板语言。
 
 ## 过程性观察（不编号）
 

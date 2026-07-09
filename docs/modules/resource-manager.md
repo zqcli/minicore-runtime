@@ -647,13 +647,13 @@ reload_cwd(workspace_id, cwd)
 
 - 自己解析 skill frontmatter。
 - 自己拼 `<skill>` block。
-- 解析 raw `/skill:name`。
+- 解析 raw `/skill <name>` 或兼容 `/skill:name`。
 - 构造 user message。
 - 执行 Agent turn。
 
 显式 `InvokeSkill` 的正文读取和 `<skill>` message 构造属于 `SessionRuntime`。为了保证旧 turn 可复现，snapshot 必须保存 selected skill body content，或保存 content hash + immutable loaded content reference；不能让旧 turn 在运行中重新读取已被 reload 覆盖的文件内容。
 
-`ResourceManager` 提供技能 metadata 给 [CommandSurface](command-surface.md) 生成 `/skill:{name}` 命令摘要；它不解析 raw user input，也不展开技能正文。
+`ResourceManager` 提供技能 metadata 给 [CommandSurface](command-surface.md) 的 `resources.skills` dynamic provider，用于生成 `/skill <name>` 和兼容 `/skill:{name}` 的 command nodes；它不解析 raw user input，也不展开技能正文。
 
 ## 提示模板
 
@@ -722,7 +722,7 @@ MVP 实现：
 `ResourceManager` 不应：
 
 - 构造最终 system prompt。
-- 展开 `/skill:name` 或 prompt template 为 user message。
+- 展开 `/skill <name>`、兼容 `/skill:name` 或 prompt template 为 user message。
 - 执行工具、审批工具或读取模型凭据。
 - 拥有 session history 或 session persistence。
 - 让 UI 直接读取本地资源文件。

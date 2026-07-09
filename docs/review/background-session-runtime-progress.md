@@ -54,6 +54,9 @@
 - 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 reload / startup ensure。
 - `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中提取 prompt materials，再合并 active tools / tool snippets / cwd / 日期等会话态，调用 `prompt::build_system_prompt(...)`。
 - `Prompt` 是纯系统提示词构建模块，不读取文件、不读 `ResourceSnapshotStore`、不触发 reload；`ResourceManager` 不构造最终 system prompt，只发布结构化资源素材。
+- Command 体系收敛为共享无状态 `CommandManager` + `SessionRuntime` 持有的 session-scoped `Command` facade；`CommandSurface` 只保留为领域总称。
+- command manifest 使用多层 JSON，运行时临时 materialize 成 flat catalog；动态命令节点通过 provider + `nodeTemplate` 生成，skill、prompt template、model thinking levels、tools 等都可作为 dynamic command nodes。
+- 协议层 `agent_runtime_protocol::Command` 改名为 `agent_runtime_protocol::AgentCommand`；`Command` 短名留给 command 子系统。UI 只能提交 `ExecuteCommandText` 或 `ExecuteCatalogCommand`，不能通过 command result/output 携带完整 runtime mutation command。
 
 修订后的模型：
 
@@ -62,7 +65,7 @@ AgentRuntime
   └─ WorkspaceServices
       ├─ EventBus
       ├─ SessionManager / SessionIndex
-      ├─ CommandSurfaceService
+      ├─ CommandManager
       ├─ RuntimeHookRegistry
       ├─ RuntimeDiagnostics
       ├─ ResourceManager

@@ -21,7 +21,7 @@ Minimal protocol / event / session spine
 - `InMemorySessionStorage` 先作为 storage contract 和测试底座；JSONL 在 entry、leaf、save point 语义稳定后实现。
 - `Driver` 不能拖到最后才验证。先用 fake driver 跑通纵切，再用隔离 spike 验证 Rig `AgentRun / AgentRunStep` 是否满足设计假设。
 - `Tools` 子系统在 read-only tool 切片出现；`ToolApprovalBroker`、`ToolApprovalGrantStore`、approval modes 和完整 sandbox/mutation 约束等到 mutation tool 前后再做完整闭环。
-- `CommandSurface`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程。
+- `CommandSurface`、`RuntimeHooks`、`Compaction` 都是 runtime spine 上的扩展能力，不应早于它们依赖的 owner 流程；`CommandSurface` 的实现形态是共享无状态 `CommandManager` + session-scoped `Command`。
 
 ## 先决设计点
 
@@ -36,7 +36,7 @@ Minimal protocol / event / session spine
 
 | 阶段 | 目标 | 主要文件 | 可验证产物 |
 | --- | --- | --- | --- |
-| 0. Crate skeleton 和基础类型 | 建立最小 crate、ID、error、message、协议子集 | `src/lib.rs`、`src/ids.rs`、`src/error.rs`、`src/messages.rs`、`src/agent_runtime_protocol.rs` | `Command` / `Event` / `RuntimeSnapshot` / `MessageRecord` / `SessionPhase` 可编译、可序列化。 |
+| 0. Crate skeleton 和基础类型 | 建立最小 crate、ID、error、message、协议子集 | `src/lib.rs`、`src/ids.rs`、`src/error.rs`、`src/messages.rs`、`src/agent_runtime_protocol.rs` | `AgentCommand` / `Event` / `RuntimeSnapshot` / `MessageRecord` / `SessionPhase` 可编译、可序列化。 |
 | 1. EventBus 和最小 AgentRuntime | 建立 `dispatch`、`subscribe`、`snapshot()`、event sequence、水位、command ack、`WorkspaceServices` 和 `ResourceManager` / `ResourceSnapshotStore` 骨架 | `src/agent_runtime.rs`、`src/agent_runtime_events.rs`、`src/runtime_services.rs`、`src/resource_manager.rs` | event sequence 单调递增；`RuntimeSnapshot` 带 `last_event_sequence`；`OpenWorkspace -> ensure_runtime_snapshot` 后 `active_session = None`；无法路由命令能 rejected；`replace_runtime` / `replace_cwd` 原子替换 current pointer。 |
 | 2. InMemory session spine | 实现 `SessionStorage` trait、`SessionHandle`、内存 storage、最小 `SessionManager`、轻量 `SessionIndex` 和 loaded runtime lifecycle | `src/session_storage.rs`、`src/session_storage/memory.rs`、`src/session_manager.rs` | create/open/list、workspace-scoped `ListSessions`、append message、leaf/path-to-root、context rebuild 通过同一组 storage contract tests；loaded runtime 记录 fixed workspace cwd，focus 切换不改写。 |
 | 3. First vertical slice with fake driver | `NewSession` / `OpenSession` 后 `SubmitPrompt` 跑通：phase guard、user message、run-time `TurnResourceSnapshot` capture、fake assistant stream、save point、RuntimeSnapshot | `src/session_runtime.rs`、`src/driver.rs` | `OpenSession -> ensure_cwd_snapshot -> RuntimeSnapshot.active_session(idle)`；两个 loaded sessions 可各自持有 `SessionRuntime` 和 fixed cwd；focus B 不中止 running A；`SubmitPrompt -> capture_turn -> message_user_appended -> run_started -> assistant delta -> persistence_save_point -> run_finished -> session_settled` 顺序稳定；`capture_turn` 在缺失 cwd snapshot 时能兜底 ensure。 |
@@ -44,7 +44,7 @@ Minimal protocol / event / session spine
 | 5. Text-only Driver integration | 用真实 `Driver.drive_run()` 替换 fake driver，先只接模型文本流，并用 per-run `SessionDriverHost` wrapper 连接 `SessionRuntime` 与 `DriverHost` | `src/driver.rs`、`src/driver/rig.rs`、`src/model_gateway.rs`、`src/model_gateway/rig.rs`、`src/session_runtime.rs` | 真 Driver 只传 `ModelSelection`；`ModelGateway` mock/fake provider 产生 assistant started/delta/finished；普通 provider failure 归约为 `DriveResult::Failed` 和唯一 `run_finished`；`Driver` 不长期持有 session state。 |
 | 6. JSONL storage | 在 storage contract 稳定后实现文件持久化 | `src/session_storage/jsonl.rs`、`src/session_manager.rs` | InMemory 和 JSONL 通过同一组 conformance tests；重开后 RuntimeSnapshot/context 一致。 |
 | 7. Resources / Skills / Prompt | 接入 `ResourceManager` 级联 snapshot、cwd overlay policy、skill、prompt template、纯 prompt builder | `src/resource_manager.rs`、`src/skills.rs`、`src/prompt_templates.rs`、`src/prompt.rs` | `ReloadResources(cwd) -> build CwdResourceSnapshot -> replace_cwd -> resources_changed`；replace 后开始的下一轮 `capture_turn` 必须拿到新 snapshot；replace 前已经开始 capture 的 turn 合法使用旧 snapshot；`InvokeSkill` / prompt template 在真正进入 user turn 时用 captured `TurnResourceSnapshot` 展开为 user message；资源变化只影响 future turn。 |
-| 8. CommandSurface skeleton | 建立跨 UI command catalog、parse/plan/present，但不要求所有后端命令完整 | `src/command_surface.rs` | `/help`、`/reload`、`/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
+| 8. CommandSurface skeleton | 建立跨 UI command catalog、nested JSON manifest、dynamic providers、parse/suggest/resolve 和 session-scoped execution facade，但不要求所有后端命令完整 | `src/command.rs`、`src/command/manager.rs`、`src/command/session.rs`、`src/command/handlers/` | `/help`、`/reload`、`/skill <name>`、兼容 `/skill:{name}`、`/{template}` 可用；`/compact` 在 compaction 后端完成前为 disabled；`/usage`、`/model`、`/thinking` 随后端能力逐步启用。 |
 | 9. ModelGateway 和 UsageStats | 收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage | `src/provider_registry.rs`、`src/model_gateway.rs`、`src/auth_store.rs`、`src/usage_stats.rs` | `SetModel -> ModelState -> ModelCallRequest -> ModelGateway` 可测；mock/provider usage 变成 `usage_updated`；RuntimeSnapshot 包含 provider/model view，`active_session` 包含 `session_stats` 和 `context_usage`；后续 compaction 能复用 context usage。 |
 | 10. Read-only Tools | 实现 session-scoped `Tools` 子系统、工具定义、registry、active set、prompt catalog、最小 policy、planner/coordinator/executor 和只读工具 | `src/tools.rs`、`src/tools/subsystem.rs`、`src/tools/definition.rs`、`src/tools/registry.rs`、`src/tools/active.rs`、`src/tools/prompt.rs`、`src/tools/policy.rs`、`src/tools/planner.rs`、`src/tools/coordinator.rs`、`src/tools/executor.rs`、`src/tools/builtin/{read,grep,find,ls}.rs` | Rig `CallTools -> DriverHost::invoke_tool_batch -> SessionRuntime -> Tools::invoke_batch -> tool results -> Rig continuation` 跑通；tool error 作为 error tool result 回填；结果按 `call_index` 稳定回填。 |
 | 11. Tool approval | 实现 pending approval 状态机和协议决定 | `src/tools/approval.rs`、`src/agent_runtime_protocol.rs`、`src/session_runtime.rs` | `tool_call_approval_requested`、`DecideToolApproval`、approve/reject、active session pending approval RuntimeSnapshot/resync 行为稳定；approval 后 args 冻结。 |
@@ -142,13 +142,16 @@ Mutation / process tools:
 
 ## CommandSurface 顺序
 
-`CommandSurface` 是 runtime-owned command surface，但不是底层执行通道。它应在 resources/skills/prompt template 之后出现，因为 command catalog 需要 resource projection。
+`CommandSurface` 是 runtime-owned 用户命令面，但不是底层执行通道。它应在 resources/skills/prompt template 之后出现，因为 command catalog 需要 resource metadata projection。实现上先落共享无状态 `CommandManager`，再让每个 `SessionRuntime` 持有 session-scoped `Command` facade。
 
-MVP 不要求所有 slash command 都完整可执行：
+MVP 不要求所有 command 都完整可执行：
 
-- 先实现 `/help`、`/reload`、`/skill:{name}`、`/{template}` 和基础 command presentation。
+- 先实现 builtin nested JSON command pack、临时 materialized catalog 和 `ExecuteCommandText` / `ExecuteCatalogCommand` 的 parse/suggest/resolve 框架。
+- 先实现 `/help`、`/reload`、`/skill <name>`、兼容 `/skill:{name}`、`/{template}` 和基础 UI-safe command output。
+- 先把 skill / prompt template 作为 dynamic command nodes 注册进 catalog，但正文展开仍只在 `SessionRuntime` 的 captured turn snapshot 中发生。
 - `/compact` 在 `Compaction` 后端完成前只进入 catalog，状态为 disabled。
 - `/usage`、`/model`、`/thinking` 在 `UsageStats`、model state、provider registry 完成后再启用完整行为。
+- extension executable commands、project-local command handlers、complex form、runtime-tracked `SubmitInteraction` 和 runtime-owned action ids 放到后续增强。
 
 ## RuntimeHooks 顺序
 
@@ -160,7 +163,7 @@ MVP 只接入已经存在的安全点：
 - `BeforeAgentStart` / `PromptBuilt`：run 启动和 system prompt 构建后 patch。
 - `ToolBeforePolicy` / `ToolAfterExecute`：工具治理链路内的 typed decision。
 - `AfterSavePoint`：保存点后 observer。
-- `CommandOutputBuild`：command presentation patch。
+- `CommandOutputBuild`：UI-safe command output patch。
 
 后续 privileged hook，例如 raw provider payload patch、context replacement、tool args rewrite、compaction result provider，应等对应 owner 流程和测试稳定后再开放。
 
