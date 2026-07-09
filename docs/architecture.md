@@ -40,7 +40,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
        │
  SessionRuntime ── fixed workspace cwd; run captures TurnResourceSnapshot into TurnState
        ├─ Command ──────────────▶ CommandManager materialize / parse / resolve
-       ├─ Driver ───────────────▶ Rig AgentRun
+       ├─ DriverTurnInput ──────▶ Driver ──▶ Rig AgentRun
        ├─ Tools ────────────────▶ tool registry / policy / approval / executors
        └─ Prompt ───────────────▶ captured cwd snapshot resolved view + tool prompt catalog
 ```
@@ -73,7 +73,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面。
 - `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。多个 `SessionRuntime` 可以同时 loaded/running；每个 runtime 固定自己的 workspace cwd，每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
-- `SessionRuntime` 是单个会话的产品级编排层。
+- `SessionRuntime` 是单个会话的产品级编排层。它拥有完整 `TurnState`，并只把窄的 `DriverTurnInput` 投影给 `Driver`。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
 - `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
@@ -116,3 +116,4 @@ AgentSessionRuntime
 - [ADR 0009：ModelGateway 包装 Rig providers](adr/0009-model-gateway-wraps-rig-providers.md)
 - [ADR 0010：多 session runtime 使用级联资源快照](adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md)
 - [ADR 0011：Tools 是 SessionRuntime 内部的 Session-Scoped 子系统](adr/0011-tools-are-session-scoped-subsystem.md)
+- [ADR 0013：Driver 接收 DriverTurnInput 而不是完整 TurnState](adr/0013-driver-receives-driver-turn-input.md)

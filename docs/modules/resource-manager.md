@@ -147,13 +147,15 @@ manual ReloadResources
 user turn start
   → capture_turn(session_id, turn_id, workspace_id, cwd)
   → TurnState.resources = Arc<TurnResourceSnapshot>
+  → SessionRuntime projects DriverTurnInput for Driver
 
 Rig AgentRun steps in the same turn
-  → read TurnState.resources
+  → Driver uses DriverTurnInput only
+  → SessionDriverHost / Tools read TurnState.resources when building ToolRunContext
   → do not call ResourceManager for model-visible static resources
 ```
 
-也就是说，MVP 中 `Driver` / `AgentRunStep` 不直接调用 `ResourceManager`。资源在 user turn 启动时被捕获进 `TurnState`，后续 `CallModel`、`CallTools` 和 `Done` 都使用这份稳定输入。这样 reload、focus 切换或其他 session 的资源变化不会污染当前 running turn。
+也就是说，MVP 中 `Driver` / `AgentRunStep` 不直接调用 `ResourceManager`，也不直接接收 `TurnResourceSnapshot`。资源在 user turn 启动时被捕获进 `TurnState`，但跨到 `Driver` 的只有 `DriverTurnInput` 窄投影；需要资源/cwd 的工具运行上下文由 `SessionDriverHost` 从 `TurnState.resources` 构造。这样 reload、focus 切换或其他 session 的资源变化不会污染当前 running turn，同时不把资源编排状态泄漏给 `Driver`。
 
 `capture_turn(...)` 不负责发现文件变化，也不负责把磁盘上的新内容自动变成模型可见资源。MVP 中，模型可见资源只有在显式 `ReloadResources`、`reload_runtime()` 或首次 `ensure_*_snapshot()` 成功后，才会发布新的 current snapshot。下一次 user turn 会捕获当时的 current snapshot：如果此前没有 reload，捕获到的仍是同一个 revision；如果 reload 已成功发布新 snapshot，捕获到的就是新 revision。
 
@@ -332,7 +334,8 @@ UI / CommandSurface
   → 构建 TurnResourceSnapshot T2 { cwd: Arc<C2> }
   → TurnState.resources = Arc<T2>
   → prompt::build_system_prompt(T2.cwd.resolved.prompt_materials(), ...)
-  → Driver::drive_run(...)
+  → project DriverTurnInput
+  → Driver::drive_run(DriveRequest { turn: DriverTurnInput, ... })
 ```
 
 因此实现必须满足这些不变量：

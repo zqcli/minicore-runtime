@@ -40,8 +40,9 @@ Rig AgentRunStep::CallTools
 
 ```text
 SessionRuntime::start_run
-  -> build DriveRequest / TurnState
-  -> clone turn_resources from DriveRequest.turn_state
+  -> build TurnState
+  -> project DriverTurnInput into DriveRequest
+  -> clone turn_resources from TurnState.resources into SessionDriverHost
   -> create SessionDriverHost { tools: &mut self.tools, turn_resources, model_gateway, event_sink, queues, current_run, ... }
   -> let driver = Driver::new()
   -> driver.drive_run(request, &mut host, cancel)
@@ -63,7 +64,7 @@ SessionRuntime::start_run
 
 - 如果直接写 `self.driver.drive_run(request, self, cancel).await`，容易同时借用 `self.driver` 和 `&mut self`，给 Rust borrow checker 制造自借用压力。让 `Driver` 保持无状态或浅状态，并在 run start 时临时创建或 clone 一个 driver，再调用 `driver.drive_run(request, &mut host, cancel)`，可以避开这个形态。
 - 如果直接 `impl DriverHost for SessionRuntime`，host 方法可以访问整个会话对象，长期会让 safe point、工具调用和模型调用逻辑随手耦合到不相关状态。wrapper 明确只暴露本次 run 需要的字段。
-- `run_id`、turn resources、event correlation、checkpoint context 等是 run-scoped 数据，不应被迫成为 `SessionRuntime` 的长期字段。wrapper run 结束即 drop，生命周期更准确。
+- `run_id`、turn resources、event correlation、checkpoint context 等是 run-scoped 数据，不应被迫成为 `SessionRuntime` 的长期字段。`DriveRequest` 只携带 `DriverTurnInput`，turn resources 留在 wrapper 中，wrapper run 结束即 drop，生命周期更准确。
 - `Driver` 单测可以使用 fake host，不需要构造真实 `SessionRuntime`、`Tools`、storage 或 event bus。
 
 ## 后果

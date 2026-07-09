@@ -428,7 +428,7 @@ UI rendering state
 ```text
 Rig AgentRun local variable
 current AgentRunStep
-DriveRequest
+DriveRequest { turn: DriverTurnInput }
 DriveLimits
 driver-local usage/message accumulation
 cancel token observation
