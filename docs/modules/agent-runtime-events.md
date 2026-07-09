@@ -15,7 +15,7 @@
 2. `agent_runtime_protocol::Event.msg` 使用分组 enum，例如 `agent_runtime_protocol::EventMsg::Run(RunEvent::Started)`。
 3. UI/wire 事件类型使用 flat `snake_case`，例如 `run_started`、`tool_call_output_delta`。
 4. 所有 UI 事件都携带顺序号、时间、workspace/session/run/command correlation；这些 metadata 属于 `agent_runtime_protocol::Event` 外层记录。
-5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、`RuntimeHooks` typed result 不能直接泄漏给 UI。
+5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、后期 `RuntimeHooks` typed result 不能直接泄漏给 UI。
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
 7. 流式 delta 不是持久化事实；`persistence_save_point` 才是“此前相关 session writes 已经落盘”的 durable barrier。
 8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry，并且 phase 已经回到 `idle`。
@@ -174,7 +174,7 @@ SessionRuntime event sink
   AgentRuntime event bus assigns event_id + sequence + timestamp
 ```
 
-`Driver`、`Tools`、`ResourceManager`、`Compaction`、`RuntimeHooks` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。它们返回内部事件或 typed result，由 `SessionRuntime` / `AgentRuntime` 归约。
+`Driver`、`Tools`、`ResourceManager`、`Compaction` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。后期 `RuntimeHooks` 只返回 typed result。它们的结果由 `SessionRuntime` / `AgentRuntime` 归约。
 
 ### RuntimeSnapshot 水位
 
@@ -242,7 +242,7 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 `TurnResourceSnapshot` 并重建 prompt。 |
 | `CommandSurface` / `CommandManager` | 不直接发 UI event | 返回 command catalog、parse/suggest/resolve 结果和 UI-safe command output；`AgentRuntime` 发布 `command_catalog_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 `AgentCommand` / session command handler。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
-| `RuntimeHooks` | 不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
+| `RuntimeHooks` | 后期能力；不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
 
 这比“每个模块都能 emit”更深：事件 routing、顺序、持久化和 RuntimeSnapshot 投影集中在 `AgentRuntime` / `SessionRuntime`，UI 不需要知道内部模块图。
 
@@ -256,10 +256,10 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle` 写入结果、hook 结果 |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle` 写入结果；后期消费自己拥有安全点的 hook result |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
-| `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
-| `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor/hook；返回 `ToolBatchResult` |
+| `ModelGateway` | provider/model selection execution context、credentials resolution、future provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
+| `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor；后期消费工具治理 hook；返回 `ToolBatchResult` |
 | `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `Tools` 调用 |
 | `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
 | `CommandSurface` / `CommandManager` | command catalog materialization、name conflict diagnostics、phase policy、command text parse result、suggestion、execution resolve | 不发布 UI event；返回 catalog、suggestion、resolved invocation 或 UI-safe command result | `AgentRuntime` 发布 `command_catalog_changed` 和 command output events；`SessionRuntime.command` 执行 session-scoped command |
@@ -269,7 +269,7 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | `SessionHandle` | 单会话领域操作 facade、上下文重建结果 | 不发布 UI event；返回 entry id/context | `SessionRuntime` 根据返回结果发 `message_*`、`persistence_save_point` 等 |
 | `SessionStorage` | 单会话 metadata、append-only entries、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用 |
 | `SessionManager` | persistent session catalog、`LoadedSessionRuntimes`、focused session、create/open/list/delete/fork/focus/close、storage adapter | 通常不直接发事件；由 `AgentRuntime` 发 session lifecycle 事件 | 被 `AgentRuntime` 调用；创建/关闭/查找 `SessionRuntimeHandle`，但不拥有单会话运行状态机 |
-| `RuntimeHookRegistry` | 内部 hook handler 集合和 hook 执行结果 | 默认不发布 UI event | hook 影响后的事实由 `SessionRuntime` 归约成事件 |
+| `RuntimeHookRegistry` | 后期内部 hook handler 集合和 hook 执行结果 | 默认不发布 UI event | hook 影响后的事实由对应 owner 应用，再由 `SessionRuntime` / `AgentRuntime` 归约成事件 |
 
 ### AgentRuntime Ownership
 
@@ -287,7 +287,7 @@ EventBus
 WorkspaceServices
   ├─ SessionManager / SessionIndex
   ├─ CommandManager
-  ├─ RuntimeHookRegistry
+  ├─ RuntimeHookRegistry / future hook service
   ├─ RuntimeDiagnostics
   ├─ ResourceManager
   │   ├─ ResourceSnapshotStore
@@ -354,7 +354,7 @@ ResourceState view
 Tools / ToolRegistry / ActiveToolSet
 CompactionState
 RetryState
-RuntimeHookRegistry
+RuntimeHookRegistry / future hook service
 RuntimeSnapshot projection state
 SessionHandle
 ```
@@ -405,7 +405,7 @@ DriverEvent
 Tools progress/update
 ModelGateway stream result
 SessionHandle append/build_context result
-RuntimeHooks typed result
+future RuntimeHooks typed result
 ResourceManager captured TurnResourceSnapshot
 ```
 
@@ -859,7 +859,8 @@ User message 通常不是流式对象。
 
 ```text
 AcceptedByCommand
-  → Expanded(skill/template/hooks)
+  → Expanded(skill/template)
+  → future hook expansion/patch if hook system is enabled
   -- message_user_appended --> AppendedToSession
   -- persistence_save_point --> DurableAtSavePoint
   → IncludedInRunContext
@@ -972,7 +973,8 @@ Compaction 是 session context projection，不是普通 run。
 ```text
 Requested
   -- session_phase_changed(compaction) --> PreparingCutPoint
-  -- compaction_started --> SessionBeforeCompact hook
+  -- compaction_started --> PreparingSummary
+  → future SessionBeforeCompact hook if hook system is enabled
   → Summarizing
   → AppendingCompactionEntry
   → RebuildingSessionContext
@@ -1126,7 +1128,7 @@ NoDiagnostics
 
 ### 22. Hook Lifecycle
 
-Hook 是内部生命周期，默认不进 `AgentRuntimeProtocol`。完整规则见 [RuntimeHooks](runtime-hooks.md)。
+Hook 是后期内部生命周期，默认不进 `AgentRuntimeProtocol`。当前 MVP 不实现 hook system；完整规则见 [RuntimeHooks](runtime-hooks.md)。
 
 ```text
 NotRunning
@@ -1137,10 +1139,10 @@ NotRunning
 
 内部输入/输出：
 
-- `RuntimeHookRegistry.invoke(HookPoint)`
+- future `RuntimeHookRegistry.invoke(HookPoint)`
 - hook typed decision / patch / replacement
 
-UI 只看 hook 影响后的事实，例如 tool denied、message replaced、compaction cancelled 或 diagnostics changed。后续如果要展示 hook 运行详情，应设计独立 `hook_started/hook_finished`，不要复用内部 hook point 或 typed result。
+UI 只看后期 hook 影响后的事实，例如 tool denied、message replaced、compaction cancelled 或 diagnostics changed。后续如果要展示 hook 运行详情，应设计独立 `hook_started/hook_finished`，不要复用内部 hook point 或 typed result。
 
 ### 23. Reconnect Lifecycle
 
@@ -1263,7 +1265,7 @@ session_settled or retry_auto_started
 UI dispatch(Compact) or auto threshold/overflow
   → session_phase_changed { phase: compaction }
   → compaction_started { reason }
-  → RuntimeHookRegistry.invoke(SessionBeforeCompact) // internal only
+  → future RuntimeHookRegistry.invoke(SessionBeforeCompact) // internal only
   → summary model call                         // not a normal assistant message
   → SessionHandle.append_compaction
   → compaction_finished { result, aborted: false, will_retry }

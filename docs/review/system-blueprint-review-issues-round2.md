@@ -223,9 +223,9 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-035：`RuntimeHookRegistry` 归属表述漂移；workspace 级 registry 与 per-cwd trust 的交互未定义
 
-状态：Open
+状态：Resolved
 
-问题：runtime-hooks.md 说 `AgentRuntime` 拥有 registry、`SessionRuntime` 持有"session-scoped view"；但 session-runtime.md 的内部结构图和 agent-runtime-events.md 的 ownership matrix 都把 `RuntimeHookRegistry` 直接列为 SessionRuntime 持有状态，无 view 字样。更深一层：registry 在 `WorkspaceServices`（workspace 级单例），而 hook 的 capability gate 依赖 `TrustLevel`。当前分支移除了 `CwdScopedServices`，因此 hook trust 应按调用时 session fixed cwd / resource load trust input 判定，但该规则仍未写成 source of truth。
+原问题：runtime-hooks.md 说 `AgentRuntime` 拥有 registry、`SessionRuntime` 持有"session-scoped view"；但 session-runtime.md 的内部结构图和 agent-runtime-events.md 的 ownership matrix 都把 `RuntimeHookRegistry` 直接列为 SessionRuntime 持有状态，无 view 字样。更深一层：registry 在 `WorkspaceServices`（workspace 级单例），而 hook 的 capability gate 依赖 `TrustLevel`。当前分支移除了 `CwdScopedServices`，因此 hook trust 应按调用时 session fixed cwd / resource load trust input 判定，但该规则仍未写成 source of truth。
 
 证据：
 
@@ -234,9 +234,9 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 - `docs/modules/agent-runtime-events.md`：Ownership Matrix。
 - `docs/modules/agent-runtime.md`：`RuntimeHookRegistry` 在 WorkspaceServices，resource trust 现在由 per-cwd resource loading 输入表达。
 
-风险：hook 权限判定在多 session/多 cwd 下不确定；文档漂移会延续到实现。
+处理结果：已决策当前 MVP 不实现 hook system，`RuntimeHookRegistry` 是后期 workspace/runtime service；`SessionRuntime` 只持有 future session-scoped registry view。hook owner 固定为拥有对应安全点业务不变量的模块，`RuntimeHookRegistry` 不拥有业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能使用 focused session 或全局默认 cwd。相关图和 ownership matrix 已同步改为 future hook service / future typed result。
 
-待处理方向：统一表述为 registry + per-session view；规定 hook trust 按调用时 session fixed cwd 和该 cwd resource load trust input 判定。
+剩余风险：等实际实现 hook system 时，还需要为每个 hook point 补具体 typed result、timeout、failure policy 和 conformance tests。
 
 ### BR-036：多 workspace 语义不闭合
 

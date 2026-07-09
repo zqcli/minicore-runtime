@@ -118,7 +118,7 @@ pub struct StepResourceSnapshot {
 }
 ```
 
-MVP 的 prompt 构建、skill 展开、tool registry 和 hooks 都只读取 `TurnResourceSnapshot`。
+MVP 的 prompt 构建、skill 展开和 tool registry 都只读取 `TurnResourceSnapshot`；后期 hook system 若读取资源摘要，也必须通过 captured snapshot。
 
 后续如果启用 step 级 snapshot，它也不应该重新获取或重新合成 runtime/cwd/turn 级资源。`StepResourceSnapshot` 只持有 `Arc<TurnResourceSnapshot>` 作为 parent；向上访问 runtime/cwd 资源只是普通引用解链：
 
@@ -708,7 +708,7 @@ MVP 实现：
 后续再加：
 
 - package manager resource sources。
-- extension/package 资源声明能力；需要另起 ADR 定义，不沿用当前 MVP hook。
+- extension/package 资源声明能力；需要另起 ADR 定义，不沿用后期 `RuntimeHooks` 的通用 hook seam。
 - theme catalog 或 UI-only resource plane。
 - MCP resources/prompts bridge。
 - step-level dynamic resource capture。

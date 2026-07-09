@@ -4,6 +4,8 @@
 
 它不是 `AgentRuntimeProtocol`，不是 UI plugin API，也不是事件流。Hook 不能直接发布 `agent_runtime_protocol::Event`，不能直接读写 session storage，不能直接执行工具，不能直接读取凭据。Hook 只能返回 typed decision / patch / replacement；最终状态变化和 UI 可见事件仍由拥有对应状态机的 `AgentRuntime` 或 `SessionRuntime` 归约。
 
+当前 MVP 不实现 hook system，也不把 `RuntimeHookRegistry` 放进当前开发阶段。本文定义的是后期能力的边界和 owner 规则，用来防止后续扩展点绕过已经收敛的 runtime、model、tool、command 和 persistence owner。
+
 ## Hook And Event
 
 ```text
@@ -79,17 +81,31 @@ Hook 能改变行为，但只能通过明确 hook point 的 typed result 改变�
 
 ```text
 AgentRuntime
-  ├─ owns RuntimeHookRegistry as runtime service
-  ├─ invokes workspace/resource/command/output hooks
+  ├─ owns RuntimeHookRegistry as a future runtime service
+  ├─ invokes only workspace/runtime lifecycle hooks
   └─ emits official runtime events after applying results
 
+Command / CommandManager
+  ├─ invokes command catalog / resolve / UI-safe output hooks
+  └─ never manufactures AgentCommand payloads from hook output
+
 SessionRuntime
-  ├─ holds session-scoped RuntimeHookRegistry view
-  ├─ invokes run/prompt/model/tool/queue/compaction/persistence hooks
+  ├─ holds future session-scoped RuntimeHookRegistry view
+  ├─ invokes run / prompt / context / queue / compaction / persistence hooks
   └─ emits official session/run/tool/message events after applying results
+
+Tools
+  ├─ invokes tool governance hooks inside Tools::invoke_batch(...)
+  └─ revalidates schema / sandbox / policy after any hook rewrite
+
+ModelGateway
+  ├─ invokes model/provider boundary hooks inside call_model(...)
+  └─ keeps credentials, raw provider payload and provider SDK errors inside the gateway
 ```
 
 `RuntimeHookRegistry` 可以保存 handler 集合、capability metadata、source info、timeout 策略和 error policy。它不拥有业务状态机，也不拥有 event metadata。
+
+Owner 规则：谁拥有该安全点的不变量，谁调用 hook、应用 typed result、重新校验并负责 diagnostics。`Driver` 不调用 hook；它只把 Rig safe point 交还给 `DriverHost` / `SessionRuntime`。`RuntimeHookRegistry` 不拥有任何业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能用 focused session 或全局默认 cwd。
 
 Hook source 建议分级：
 
@@ -289,16 +305,20 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 
 ### Model / Provider
 
+这些 hook 的 owner 是 `ModelGateway`。`SessionRuntime` 只在进入 `DriverHost::call_model(...)` 前拥有 run safe point；一旦形成 `ModelCallRequest` 并进入 `ModelGateway.call_model(...)`，provider-neutral request patch、provider payload patch、provider response observer 和 usage normalization observer 都必须留在 `ModelGateway` 内。当前 MVP 不实现这些 hook；后期若先开放，也应先开放 provider-neutral `BeforeModelCall`，继续禁用 raw provider payload patch。
+
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
 | `BeforeModelCall` | Transform | patch model options、stream options、thinking level |
-| `BeforeProviderPayload` | Transform | privileged redacted provider payload patch；MVP 可禁用 |
+| `BeforeProviderPayload` | Transform | privileged redacted provider payload patch；当前 MVP 不开放 |
 | `AfterProviderResponse` | Observer | status / allowlisted headers |
 | `ProviderUsageNormalized` | Observer | telemetry |
 
-不要暴露 API key、OAuth token、authorization header、credential store 或 raw provider response。`BeforeProviderPayload` 应是 privileged hook；如果私有 Rig adapter 无法提供稳定且脱敏的 payload 形态，就只开放 `BeforeModelCall` 这类 provider-neutral hook。
+不要暴露 API key、OAuth token、authorization header、credential store 或 raw provider response。`BeforeProviderPayload` 应是 privileged hook；如果私有 Rig adapter 无法提供稳定且脱敏的 payload 形态，就不能开放 raw provider payload patch。
 
 ### Tools
+
+这些 hook 的 owner 是 `Tools`，但 UI-visible event、session write 和 snapshot projection 仍由 `SessionRuntime` 归约。
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
@@ -422,11 +442,11 @@ pub enum HookErrorPolicy {
 - `Tools` 未归一化内部进度。
 - `persistence_save_point` 伪造。
 
-## MVP 和演进
+## 后期需求和演进
 
-MVP 只需要内部 hook seam，不需要开放完整外部 plugin 系统。
+当前 MVP 不实现 hook system。核心流程应先通过直接 owner 逻辑和测试稳定下来：`SessionRuntime` 直接编排 run/prompt/compaction/persistence，`Tools` 直接治理工具，`ModelGateway` 直接治理 provider 调用，`Command` / `CommandManager` 直接处理 command output。
 
-建议 MVP hook points：
+后期第一批 hook points 应只接入已经稳定的 owner 流程：
 
 - `BeforeAgentStart`
 - `PromptBuilt`
@@ -437,14 +457,14 @@ MVP 只需要内部 hook seam，不需要开放完整外部 plugin 系统。
 - `AfterSavePoint`
 - `CommandOutputBuild`
 
-第二阶段开放 trusted package / extension hooks：
+再后续开放 trusted package / extension hooks：
 
 - command pack / candidate provider registration
 - command output patch
 - observer hooks
 - tool registration
 
-第三阶段才开放 privileged hooks：
+最后才开放 privileged hooks：
 
 - raw provider payload patch（仅在可以保证 redacted 且 adapter shape 稳定后）
 - context replacement

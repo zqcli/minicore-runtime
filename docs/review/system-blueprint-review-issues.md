@@ -164,19 +164,19 @@
 
 ### BR-010：模型调用 hook owner 不一致
 
-状态：Open
+状态：Resolved
 
-问题：`SessionRuntime` 文档描述 `BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 等模型调用前后 hook；`ModelGateway` 文档也把这些 hook 放入 `call_model` 流程。双 owner 会让 hook context、capability、错误策略和 diagnostics 归属不清。
+原问题：`SessionRuntime` 文档描述 `BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 等模型调用前后 hook；`ModelGateway` 文档也把这些 hook 放入 `call_model` 流程。双 owner 会让 hook context、capability、错误策略和 diagnostics 归属不清。
 
-证据：
+原证据：
 
 - `docs/modules/session-runtime.md`：列出模型调用前后 hook，并说 `SessionRuntime` 按 error policy 处理失败。
 - `docs/modules/model-gateway.md`：SubmitPrompt flow 中 `ModelGateway.call_model` 执行 `BeforeModelCall`、provider payload hook、`AfterProviderResponse` / `ProviderUsageNormalized`。
 - `docs/modules/runtime-hooks.md`：同时存在 run safe point hooks 和 provider hooks。
 
-风险：hook 执行顺序、失败回滚、权限边界、diagnostics 可能出现双重处理或遗漏。
+决策结果：hook owner 固定为“谁拥有安全点业务不变量，谁调用 hook、应用 typed result、重新校验并记录 diagnostics”。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点；`Tools` 拥有工具治理安全点；`ModelGateway` 拥有 model/provider 边界安全点；`CommandManager` / session `Command` 拥有 command catalog/resolve/output 安全点。`Driver` 不调用 hook，`RuntimeHookRegistry` 只保存 handler 和策略，不拥有业务流程。
 
-待处理方向：明确 provider-neutral hook 与 provider-payload hook 的 owner；例如 `SessionRuntime` 负责 run safe point，`ModelGateway` 负责 provider boundary。
+实现顺序也已收敛：当前 MVP 不实现 hook system，不新增 `RuntimeHookRegistry` / hook invocation 阶段；只在文档中固定 owner 分层和禁止边界。后期第一批 hook 仅接入已稳定 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSavePoint`、`CommandOutputBuild`。`BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 和 `ProviderUsageNormalized` 即使后期开放，也由 `ModelGateway.call_model(...)` 拥有；raw provider payload patch 默认不开放。
 
 ### BR-011：`UsagePurpose` 与 `ModelCallPurpose` 同值异名
 

@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它借鉴 pi coding-agent 的 `AgentSessionRuntime` / `AgentSession` 生产路径，把模型调用、会话、资源、工具、`CommandSurface`、事件、RuntimeHooks 和持久化编排收敛在 UI 无关的 runtime 中；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
+本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它借鉴 pi coding-agent 的 `AgentSessionRuntime` / `AgentSession` 生产路径，把模型调用、会话、资源、工具、`CommandSurface`、事件和持久化编排收敛在 UI 无关的 runtime 中；后期 RuntimeHooks 作为内部扩展点接入；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
 
 ## 语言
 
@@ -9,7 +9,7 @@
 _避免_：旧项目代号、pi coding-agent 分支、WebView Agent SDK、下游产品仓库
 
 **Harness 能力**：
-围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、`CommandSurface`、RuntimeHooks 和 UI 协议。它是 MiniCore runtime 的职责，不是 pi-agent-core `AgentHarness` 这个具体历史类。
+围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、`CommandSurface` 和 UI 协议；后期包括 RuntimeHooks。它是 MiniCore runtime 的职责，不是 pi-agent-core `AgentHarness` 这个具体历史类。
 _避免_：UI 应用、单纯模型客户端、Rig 高阶 runner
 
 **下游终端用户应用**：
@@ -57,7 +57,7 @@ _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文
 _避免_：当前 focused session 的可变大包、每 session 服务容器、UI 服务
 
 **WorkspaceServices**：
-绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`RuntimeHookRegistry`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
+绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。后期启用 hook system 时，`RuntimeHookRegistry` 也作为 workspace/runtime service 加入。它不随 session focus 切换而重建。
 _避免_：单会话运行态、focused session 服务、UI 服务、有状态 CommandSurfaceService
 
 **ResourceManager**：
@@ -101,11 +101,15 @@ _避免_：会话管理器、UI 会话状态
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
-`RuntimeHooks` 模块管理的内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前设计不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
-_避免_：UI 回调、协议事件、插件系统、任意 runtime 后门
+`RuntimeHooks` 模块规划的后期内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前 MVP 不实现 hook system，也不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
+_避免_：UI 回调、协议事件、插件系统、任意 runtime 后门、当前阶段必做模块
+
+**Hook owner**：
+拥有某个安全点业务不变量的模块。Hook owner 负责调用 hook、应用 typed result、重新校验并记录 diagnostics；`RuntimeHookRegistry` 只保存 handler，不拥有业务流程。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点，`Tools` 拥有工具治理安全点，`ModelGateway` 拥有 model/provider 边界安全点，`CommandManager` / `Command` 拥有 command catalog/resolve/output 安全点。
+_避免_：Hook 注册表、Driver、UI adapter、任意调用方
 
 **运行时 Hook 注册表（`RuntimeHookRegistry`）**：
-保存 hook handler、source、capability、timeout、cancellation 和 failure policy 的内部运行时服务。它不拥有业务状态机，也不拥有 event metadata；`AgentRuntime` / `SessionRuntime` 调用它，并应用 typed result。
+后期保存 hook handler、source、capability、timeout、cancellation 和 failure policy 的内部运行时服务。它不拥有业务状态机，也不拥有 event metadata；hook owner 调用它，并应用 typed result。
 _避免_：事件总线、插件管理器、工具执行器、会话存储
 
 **会话阶段（`SessionPhase`）**：
@@ -310,7 +314,7 @@ _避免_：Rig tools、UI 工具列表
 _避免_：所有工具、工具开关 UI
 
 **工具策略（`ToolPolicy`）**：
-`Tools` 子系统内部的纯策略判断器。它根据工具定义、prepared invocation、工作区信任、沙箱结果、用户设置、grant 和 hook 结果决定允许、拒绝、要求审批、改写参数、强制串行或中止运行；它不等待 UI、不执行工具、不构造需要 I/O 的 preview。
+`Tools` 子系统内部的纯策略判断器。它根据工具定义、prepared invocation、工作区信任、沙箱结果、用户设置和 grant 决定允许、拒绝、要求审批、改写参数、强制串行或中止运行；后期启用 hook system 时可以叠加 hook 结果。它不等待 UI、不执行工具、不构造需要 I/O 的 preview。
 _避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 
 **工具审批代理（`ToolApprovalBroker`）**：
@@ -330,7 +334,7 @@ _避免_：工具策略决定、工具参数、用户命令结果
 _避免_：独立 scheduler、LLM 策略解释器、工具执行器
 
 **工具沙箱视图（`ToolSandboxView`）**：
-`Tools` 子系统在 executor 前使用的安全边界 source of truth，描述 cwd、read roots、write roots、denied roots、process/network/env policy 和 sandbox verdict。UI approval 不能替代 sandbox；hook 改写参数后必须重新 schema validate、canonicalize、sandbox check 和 policy evaluate。
+`Tools` 子系统在 executor 前使用的安全边界 source of truth，描述 cwd、read roots、write roots、denied roots、process/network/env policy 和 sandbox verdict。UI approval 不能替代 sandbox；后期 hook 改写参数后必须重新 schema validate、canonicalize、sandbox check 和 policy evaluate。
 _避免_：审批弹窗、路径字符串前缀检查、executor 自行放宽权限
 
 **工具执行器**：
@@ -338,7 +342,7 @@ _避免_：审批弹窗、路径字符串前缀检查、executor 自行放宽权
 _避免_：工具策略、工具注册、UI 执行器
 
 **模型调用网关**：
-运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、provider Hook、fallback、流式结果、usage 归一化和错误分类。`Driver` 只通过 `call_model` seam 请求它；真实 driver 集成前必须先有最小稳定 spine。
+运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、fallback、流式结果、usage 归一化和错误分类。后期 provider Hook 的 owner 也在该边界内。`Driver` 只通过 `call_model` seam 请求它；真实 driver 集成前必须先有最小稳定 spine。
 _避免_：Driver、模型客户端、系统提示词构建器、provider registry、临时 provider 路径
 
 **ModelGateway spine**：

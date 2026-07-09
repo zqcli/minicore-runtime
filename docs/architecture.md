@@ -10,7 +10,7 @@ MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 必须保持为实现细节
 
 MiniCore 不重新实现 Rig 的核心 Agent loop。Rig 负责 `AgentRun` / `AgentRunStep` 的状态机推进；MiniCore 通过 `Driver` 适配 Rig，在 `CallTools` 时经 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，再由 session-scoped `Tools` 子系统执行工具治理，并把底层活动映射成产品事件。
 
-MiniCore 也不重新实现 provider HTTP clients。真实模型调用通过 `ModelGateway` 复用 Rig provider system；MiniCore 在该边界内治理 provider/model 解析、凭据、custom base URL、hook、fallback、usage 和错误分类。`ModelGateway` 的最小稳定 spine 必须早于真实 `Driver` 集成，避免阶段 5 写临时 provider/auth 路径。
+MiniCore 也不重新实现 provider HTTP clients。真实模型调用通过 `ModelGateway` 复用 Rig provider system；MiniCore 在该边界内治理 provider/model 解析、凭据、custom base URL、fallback、usage 和错误分类；后期 provider hook 也归该边界所有。`ModelGateway` 的最小稳定 spine 必须早于真实 `Driver` 集成，避免阶段 5 写临时 provider/auth 路径。
 
 ## 分层
 
@@ -29,7 +29,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                  WorkspaceServices
        ┌──────────────┬──────────────┬──────────────┬──────────────┐
        ▼              ▼              ▼              ▼              ▼
- SessionManager  ResourceManager  CommandManager RuntimeHooks  ModelGateway
+ SessionManager  ResourceManager  CommandManager Future RuntimeHooks  ModelGateway
        │              │                                           │
        │              ├── ResourceSnapshotStore                   └──▶ Rig providers
        │              │     ├── current runtime -> RuntimeResourceSnapshot
@@ -49,13 +49,13 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 
 - [模块总览](modules/README.md)：整体模块关系、Rig / Runtime / 下游 UI 宿主的边界。
 - [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、`WorkspaceServices` / `ResourceSnapshotStore`、会话打开/聚焦和工作区生命周期。
-- [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、队列、Hook、turn state 和 post-run 流程。
+- [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、队列、turn state 和 post-run 流程；后期在其拥有的安全点接入 Hook。
 - [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::AgentCommand`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
 - [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
 - [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
 - [ResourceManager](modules/resource-manager.md)：资源来源聚合、刷新和资源诊断。
 - [CommandSurface](modules/command-surface.md)：跨 UI 的用户命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry 和执行前 resolve。
-- [RuntimeHooks](modules/runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
+- [RuntimeHooks](modules/runtime-hooks.md)：后期内部 hook seam、hook/event 边界、capability、typed result、owner 分层和安全点。
 - [Skills](modules/skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](modules/prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
 - [Driver](modules/driver.md)：Rig `AgentRun` / `CallModel` / `CallTools` 的适配职责。
@@ -75,7 +75,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
 - `SessionRuntime` 是单个会话的产品级编排层。它拥有完整 `TurnState`，并只把窄的 `DriverTurnInput` 投影给 `Driver`。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
-- `RuntimeHooks` 是 MiniCore 内部扩展点系统。Hook 可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
+- `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
 - 工具注册、活跃工具、审批、授权记忆、沙箱、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；`SessionRuntime` 负责协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`。
@@ -118,3 +118,4 @@ AgentSessionRuntime
 - [ADR 0011：Tools 是 SessionRuntime 内部的 Session-Scoped 子系统](adr/0011-tools-are-session-scoped-subsystem.md)
 - [ADR 0013：Driver 接收 DriverTurnInput 而不是完整 TurnState](adr/0013-driver-receives-driver-turn-input.md)
 - [ADR 0014：ModelGateway spine 先于真实 Driver 集成](adr/0014-model-gateway-spine-precedes-driver-integration.md)
+- [ADR 0015：Hook owner 遵循 runtime 边界](adr/0015-hook-owners-follow-runtime-boundaries.md)

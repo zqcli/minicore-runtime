@@ -19,7 +19,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                  WorkspaceServices
       ┌──────────────┬──────────────┬──────────────┬──────────────┐
       ▼              ▼              ▼              ▼              ▼
-SessionManager  ResourceManager  CommandManager RuntimeHooks  ModelGateway
+SessionManager  ResourceManager  CommandManager Future RuntimeHooks  ModelGateway
       │              │                                           │
       │              ├─ ResourceSnapshotStore                    │
       │              └─ ResourceOverlayPolicy                    │
@@ -44,7 +44,7 @@ SessionRuntime  SessionStorage
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；`LoadedSessionRuntimes` 只是已加载 `SessionRuntime` 的 map，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、Hook、pending session writes 和事件归约。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
+`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、pending session writes 和事件归约；后期只在自己拥有的安全点接入 Hook。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、保存点、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
@@ -52,7 +52,7 @@ SessionRuntime  SessionStorage
 
 `CommandSurface` 是跨 UI 的用户命令领域面；实现上拆为共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` facade。它把 `/compact`、`/skill name`、兼容 `/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令通过 nested JSON command tree、dynamic providers、parse/suggest/resolve 和 trusted handlers 映射到 `agent_runtime_protocol::AgentCommand`、受控 query 或 prompt-like 输入，但不直接执行工具或 Agent loop。
 
-`RuntimeHooks` 是内部扩展点系统。它在 runtime 安全点开放 typed decision / patch / replacement，让内置策略、测试 harness、可信 package 或后续 extension 影响 prompt、context、tools、compaction 和 UI-safe command result；当前设计不定义资源 discovery / reload hook。hook 不直接发布 UI event，不直接读写 session storage，也不直接执行工具。
+`RuntimeHooks` 是后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；文档只固定 hook/event 边界、capability、typed result 和 owner 分层。后期启用时，它在 runtime 安全点开放 typed decision / patch / replacement，让内置策略、测试 harness、可信 package 或 extension 影响 prompt、context、tools、compaction 和 UI-safe command result；当前设计不定义资源 discovery / reload hook。hook 不直接发布 UI event，不直接读写 session storage，也不直接执行工具。
 
 `Skills` 是平级技能文件能力模块，对应未来的 `skills.rs`。它提供 `SkillMetadata` / `SkillResource` / `SkillCatalog` 数据结构，以及给定目录后的发现、解析、校验和格式化 helper；它不拥有资源生命周期或 overlay。显式技能调用的正文展开和 message 构造由 `SessionRuntime` 基于 captured `TurnResourceSnapshot` 负责。
 
@@ -60,11 +60,11 @@ SessionRuntime  SessionStorage
 
 `Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；`SessionRuntime` 协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`，`Driver` 不直接依赖 `Tools`。
 
-`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point 选择、summary prompt 构建、摘要消息格式化和压缩结果类型；压缩流程、模型调用、Hook、事件和 session 写入由 `SessionRuntime` 编排。
+`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point 选择、summary prompt 构建、摘要消息格式化和压缩结果类型；压缩流程、模型调用、事件和 session 写入由 `SessionRuntime` 编排，后期压缩 Hook 也由 `SessionRuntime` 在对应安全点接入。
 
 `UsageStats` 是 token 消耗和上下文占用统计模块。它区分模型调用消耗、run 汇总、会话累计 stats 和当前 context usage；provider usage 归一化、本地估算、UI view 口径和压缩阈值计算都在这里统一说明。
 
-`ModelGateway` 是模型调用治理模块。它复用 Rig provider/client 能力，但在 MiniCore 内负责 provider/model 解析、凭据解析、custom base URL、provider hook、fallback、usage 归一化和错误分类。实现顺序上先提供最小稳定 spine，供真实 `Driver` 集成复用；完整 custom provider、fallback 和 usage/context usage 后续扩展。
+`ModelGateway` 是模型调用治理模块。它复用 Rig provider/client 能力，但在 MiniCore 内负责 provider/model 解析、凭据解析、custom base URL、fallback、usage 归一化和错误分类。后期 provider hook 的 owner 也是 `ModelGateway`。实现顺序上先提供最小稳定 spine，供真实 `Driver` 集成复用；完整 custom provider、fallback 和 usage/context usage 后续扩展。
 
 `Driver` 只负责适配 Rig。Rig 决定 `CallModel`、`CallTools` 和 `Done`；`Driver` 把这些 step 接到产品运行时的 provider、`Tools`、event 和 abort 语义。
 
@@ -77,7 +77,7 @@ SessionRuntime  SessionStorage
 - [SessionManager / SessionStorage](session-manager.md)：会话生命周期、已加载会话运行时、session tree、JSONL、会话管理与存储接口。
 - [ResourceManager](resource-manager.md)：资源来源聚合、级联 snapshot、cwd overlay policy、刷新和诊断。
 - [CommandSurface](command-surface.md)：命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry、执行前 resolve 和 UI 安全边界。
-- [RuntimeHooks](runtime-hooks.md)：内部 hook seam、hook/event 边界、capability、typed result 和安全点。
+- [RuntimeHooks](runtime-hooks.md)：后期内部 hook seam、hook/event 边界、capability、typed result、owner 分层和安全点。
 - [Skills](skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
 - [Prompt](prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
 - [Tools](tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
@@ -86,7 +86,7 @@ SessionRuntime  SessionStorage
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)。
+实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)，hook owner 分层和延期实现记录在 [ADR 0015](../adr/0015-hook-owners-follow-runtime-boundaries.md)。
 
 ## Rust 文件规划
 
@@ -97,13 +97,13 @@ SessionRuntime  SessionStorage
 | `src/lib.rs` | [MiniCore 架构](../architecture.md)、[模块总览](README.md) | crate root、模块声明和必要 re-export。 |
 | `src/agent_runtime.rs` | [AgentRuntime](agent-runtime.md) | UI 无关运行时门面、工作区服务和命令路由。 |
 | `src/runtime_services.rs` | [AgentRuntime](agent-runtime.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `WorkspaceServices`、共享 settings/provider/auth/model gateway wiring。 |
-| `src/auth_store.rs` | [AgentRuntime](agent-runtime.md)、[RuntimeHooks](runtime-hooks.md) | 凭据读取边界；不暴露 secret material 给 UI 或 hook。 |
+| `src/auth_store.rs` | [AgentRuntime](agent-runtime.md)、[RuntimeHooks](runtime-hooks.md) | 凭据读取边界；不暴露 secret material 给 UI 或后期 hook。 |
 | `src/settings_store.rs` | [AgentRuntime](agent-runtime.md)、[CommandSurface](command-surface.md) | runtime/session 设置读取与命令动态候选输入边界。 |
 | `src/provider_registry.rs` | [ModelGateway](model-gateway.md)、[AgentRuntime](agent-runtime.md) | provider/model catalog、custom provider 配置和模型能力摘要；不持有凭据或 provider client。 |
-| `src/model_gateway.rs` | [ModelGateway](model-gateway.md)、[Driver](driver.md)、[SessionRuntime](session-runtime.md)、[Compaction](compaction.md)、[UsageStats](usage-stats.md) | provider 调用、凭据解析、payload hook、fallback、usage 归一化和错误分类入口。 |
+| `src/model_gateway.rs` | [ModelGateway](model-gateway.md)、[Driver](driver.md)、[SessionRuntime](session-runtime.md)、[Compaction](compaction.md)、[UsageStats](usage-stats.md) | provider 调用、凭据解析、fallback、usage 归一化和错误分类入口；后期 provider hook owner。 |
 | `src/model_gateway/rig.rs` | [ModelGateway](model-gateway.md) | 私有 Rig provider adapter；唯一允许接触 `rig::providers::*` 的 provider/client 实现细节位置。 |
-| `src/project_trust.rs` | [ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | workspace trust 判断、记忆和资源加载 gate。 |
-| `src/runtime_diagnostics.rs` | [AgentRuntimeEvents](agent-runtime-events.md)、[ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | runtime/resource/hook diagnostics 聚合与协议投影。 |
+| `src/project_trust.rs` | [ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | workspace trust 判断、记忆和资源加载 gate；后期 hook capability 可读取 trust summary。 |
+| `src/runtime_diagnostics.rs` | [AgentRuntimeEvents](agent-runtime-events.md)、[ResourceManager](resource-manager.md)、[RuntimeHooks](runtime-hooks.md) | runtime/resource diagnostics 聚合与协议投影；后期包含 hook diagnostics。 |
 | `src/ids.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | `WorkspaceId`、`SessionId`、`RunId`、`CommandId`、`ToolCallId` 等稳定 ID。 |
 | `src/error.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntime](agent-runtime.md) | `RuntimeError`、`SessionError`、`DriverError` 等错误边界。 |
 | `src/messages.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[SessionManager / SessionStorage](session-manager.md)、[Driver](driver.md) | `MessageRecord`、message content、tool call/result message 公共类型。 |
@@ -130,7 +130,7 @@ SessionRuntime  SessionStorage
 | `src/command/host.rs` | [CommandSurface](command-surface.md)、[SessionRuntime](session-runtime.md) | `SessionCommandHost` 窄接口。 |
 | `src/command/result.rs` | [CommandSurface](command-surface.md) | `CommandResult` / `CommandError` / UI-safe result view。 |
 | `src/command/handlers/` | [CommandSurface](command-surface.md) | builtin command handler 实现：help、status、model、thinking、resources、skills、prompt templates、tools。 |
-| `src/runtime_hooks.rs` | [RuntimeHooks](runtime-hooks.md) | hook registry、capability、typed decision/result。 |
+| `src/runtime_hooks.rs` | [RuntimeHooks](runtime-hooks.md) | 后期 hook registry、capability、typed decision/result；不在当前 MVP 阶段实现。 |
 | `src/skills.rs` | [Skills](skills.md) | skill metadata、catalog、frontmatter、format helper。 |
 | `src/prompt.rs` | [Prompt](prompt.md) | 最终 system prompt 纯构建模块。 |
 | `src/tools.rs` | [Tools](tools.md) | tools public module 和常用类型 re-export。 |
@@ -171,11 +171,11 @@ SessionRuntime  SessionStorage
 | AgentRuntimeProtocol 类型：`agent_runtime_protocol::AgentCommand`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` | [AgentRuntimeProtocol](agent-runtime-protocol.md) | 引用类型，不复制完整 enum。 |
 | 事件顺序、生命周期、所有权、重连和保存点 | [AgentRuntimeEvents](agent-runtime-events.md) | 描述本模块会触发哪些事件，不重新定义事件协议。 |
 | 运行时门面、工作区服务、事件通道 | [AgentRuntime](agent-runtime.md) | 只说明如何被调用或被拥有。 |
-| 单会话运行编排、phase、queue、hooks、当前 run | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
+| 单会话运行编排、phase、queue、当前 run、后期 run safe-point hooks | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
 | 会话生命周期、已加载会话运行时、session tree、JSONL、上下文重建 | [SessionManager / SessionStorage](session-manager.md) | 只说明何时读写会话，不重复存储规则。 |
 | 资源生命周期、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、cwd overlay policy、source info、diagnostics、prompt materials | [ResourceManager](resource-manager.md) | 只说明资源输入或输出，不扫描资源。 |
 | 命令领域面、`CommandManager` / `Command` 命名、nested JSON manifest、dynamic provider、handler registry、command catalog/suggestion/result 和 UI 安全边界 | [CommandSurface](command-surface.md) | 只说明某个命令会映射到什么运行时能力，不重复解析、resolve 和结果规则。 |
-| hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |
+| 后期 hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |
 | 技能 metadata、catalog、frontmatter、format helper | [Skills](skills.md) | 只说明如何调用 helper，不拥有技能生命周期。 |
 | 最终 system prompt 拼装规则 | [Prompt](prompt.md) | 只说明何时重建，不拼装 prompt。 |
 | session-scoped 工具子系统、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks、executors | [Tools](tools.md) | 只说明 `SessionRuntime` 如何协调 `Driver` 与 `Tools`，不复制工具治理 pipeline。 |

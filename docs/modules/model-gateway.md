@@ -11,7 +11,7 @@ Rig owns provider protocol implementation.
 
 ## 设计决定
 
-MiniCore 不重新实现 OpenAI、Anthropic、Gemini 或 OpenAI-compatible / Anthropic-compatible HTTP client。provider protocol、stream parsing、provider-specific request/response shape 尽量复用 Rig；MiniCore 在 Rig 外包一层 `ModelGateway`，集中处理 provider/model 选择、凭据解析、custom base URL、hook、fallback、usage 归一化、错误分类和 cancellation。
+MiniCore 不重新实现 OpenAI、Anthropic、Gemini 或 OpenAI-compatible / Anthropic-compatible HTTP client。provider protocol、stream parsing、provider-specific request/response shape 尽量复用 Rig；MiniCore 在 Rig 外包一层 `ModelGateway`，集中处理 provider/model 选择、凭据解析、custom base URL、fallback、usage 归一化、错误分类和 cancellation。Provider hook 是后期 `RuntimeHooks` 能力；它的 owner 仍是 `ModelGateway`，不属于 `SessionRuntime` 或 `Driver`。
 
 ```text
 SessionRuntime::ModelState
@@ -45,7 +45,7 @@ SessionRuntime::ModelState
 - keychain / OAuth / runtime override 等完整 auth 来源。
 - fallback chain、model invalid fallback diagnostics 和 provider-specific retry refinement。
 - provider-specific usage extraction、`UsageStats`、`ContextUsageView` 和成本/上下文窗口展示。
-- privileged raw provider payload hook；在 redacted、adapter shape 稳定前可以禁用。
+- 为后期 provider hook 预留 redacted summary seam；raw provider payload patch 不进入当前 MVP，只有在 adapter shape 稳定且可脱敏后才开放。
 
 禁止的临时路径：阶段 5 不允许让 `Driver`、`SessionDriverHost` 或 `SessionRuntime` 直接读取环境变量、构造 Rig provider client、解析 provider error 字符串、保存 provider API model name 为执行身份，或把 raw provider payload / raw usage 塞进 event、snapshot 或 session JSONL。为了跑通 text-only driver，也必须走 `ModelGateway` spine。
 
@@ -398,12 +398,12 @@ SubmitPrompt
   → ModelGateway.call_model
       → user-global ProviderRegistry.resolve(selection)
       → user-global AuthStore.resolve(auth_ref)
-      → BeforeModelCall hook
+      → future BeforeModelCall hook
       → private Rig provider adapter builds provider request/client
-      → optional privileged redacted provider payload hook
+      → future optional privileged redacted provider payload hook
       → provider streaming
       → usage normalization
-      → AfterProviderResponse / ProviderUsageNormalized hooks
+      → future AfterProviderResponse / ProviderUsageNormalized hooks
   → Driver feeds ModelCallResult back into Rig AgentRun
   → SessionRuntime persists messages and emits usage/run events
 ```
@@ -436,7 +436,7 @@ SessionRuntime compaction flow
 
 ## Hooks
 
-模型调用相关 hook 的 owner 是 `ModelGateway` 和 `SessionRuntime`，不是 `Driver`。
+模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `DriverHost::call_model(...)` 前的 run safe point，例如 `BeforeNextModelCall`、`ContextProjection`、队列处理和 future `DriverTurnInput` patch。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
 
 推荐阶段：
 
@@ -454,7 +454,7 @@ ProviderUsageNormalized
   observer; receives ModelCallUsage / source / purpose
 ```
 
-`BeforeProviderPayload` 是最高风险 hook。除非 Rig adapter 能提供不含 auth headers 的安全 payload，并且 MiniCore 愿意把该 payload shape 作为受控内部扩展契约，否则 MVP 应只开放 `BeforeModelCall`，把 raw provider payload patch 延后。
+`BeforeProviderPayload` 是最高风险 hook。除非 Rig adapter 能提供不含 auth headers 的安全 payload，并且 MiniCore 愿意把该 payload shape 作为受控内部扩展契约，否则不得开放 raw provider payload patch。后期若先接入模型 hook，也应先接 provider-neutral `BeforeModelCall`。
 
 Hook 不能读取 `AuthStore`，不能看到 authorization header，不能保存 raw provider response，不能绕过 provider capability validation。
 

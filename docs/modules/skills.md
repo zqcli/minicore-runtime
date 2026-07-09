@@ -236,7 +236,7 @@ References are relative to /abs/path.
 4. `SessionRuntime` 从 `turn.cwd.resolved.skills` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块。
 5. 格式化后的内容作为新的 user message 进入本次 `DriveEntry::Prompt` 或进入队列。
 6. `SessionRuntime` 基于 active tools、context files 和可见技能摘要重建 system prompt。
-7. `BeforeAgentStart` Hook 可以追加 custom messages 或替换 system prompt。
+7. 后期 `BeforeAgentStart` Hook 可以追加 custom messages 或替换 system prompt。
 8. `SessionRuntime` 从 `TurnState` 投影 `DriverTurnInput`，`Driver` 使用该窄输入创建 Rig run。
 9. user message、assistant message 和 tool result 都通过 `SessionRuntime` 写入 session。
 
