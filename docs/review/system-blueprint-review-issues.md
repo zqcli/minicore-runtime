@@ -130,19 +130,19 @@
 
 ### BR-008：Driver seam 可能过宽，`TurnState` 把资源状态泄漏给 Driver
 
-状态：Open
+状态：Resolved
 
-问题：`DriveRequest` 携带完整 `TurnState`，而 `TurnState` 包含 captured `TurnResourceSnapshot`、tool state、context usage 等会话/资源编排信息。Driver 文档又要求 Driver 不拥有 resource loading、skill expansion、prompt template expansion、system prompt building、active tools 等职责。
+原问题：`DriveRequest` 携带完整 `TurnState`，而 `TurnState` 包含 captured `TurnResourceSnapshot`、tool state、context usage 等会话/资源编排信息。Driver 文档又要求 Driver 不拥有 resource loading、skill expansion、prompt template expansion、system prompt building、active tools 等职责。
 
-证据：
+原证据：
 
 - `docs/modules/driver.md`：`DriveRequest { turn_state: TurnState }`。
 - `docs/modules/session-runtime.md`：`TurnState` 包含 `resources: Arc<TurnResourceSnapshot>`。
 - `docs/modules/driver.md`：Driver 不负责资源加载、skill/template 展开、system prompt 构建、active tools 管理。
 
-风险：Rig adapter seam 变浅，后续实现容易误用 `TurnResourceSnapshot`，把会话编排逻辑带进 Driver。
+决策结果：`TurnState` 保留为 `SessionRuntime` 内部 run snapshot，不再作为 `DriveRequest` 输入。`SessionRuntime` 在 run 启动时从 `TurnState` 投影 `DriverTurnInput`，只携带 `model`、`system_prompt`、`active_tool_schemas`、`thinking_level` 和 `stream_options`；`TurnResourceSnapshot`、resource revision、context usage、queue/storage 和工具治理状态都不进入 `DriverTurnInput`。turn resources 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。
 
-待处理方向：考虑传入 `DriverTurnState` / `ModelRunInput` 这类更窄的投影，只包含 Driver 构造 model/tool step 所需字段。
+后续实现需验证：`DriveRequest` 不能引用 `TurnState` 或 `TurnResourceSnapshot`；`Driver` 单测只需构造 `DriverTurnInput` 和 fake `DriverHost`；工具执行需要资源/cwd 时必须经 `SessionDriverHost -> Tools::invoke_batch(...)`。
 
 ## 中风险
 
@@ -276,19 +276,19 @@
 
 ### BR-017：`TurnState` 是核心类型但 CONTEXT.md 没有术语定义
 
-状态：Open
+状态：Resolved
 
-问题：`TurnState` 在 SessionRuntime、Driver、ModelGateway、Compaction 多处引用，但 CONTEXT.md 没有独立术语。
+原问题：`TurnState` 在 SessionRuntime、Driver、ModelGateway、Compaction 多处引用，但 CONTEXT.md 没有独立术语。
 
-证据：
+原证据：
 
 - `docs/modules/session-runtime.md`：定义 `TurnState`。
 - `docs/modules/driver.md`、`docs/modules/model-gateway.md`、`docs/modules/compaction.md`：多处引用 `TurnState`。
 - `CONTEXT.md`：只有 `ActiveModel` 提到可以进入 `TurnState`，没有完整词条。
 
-风险：核心概念没有 glossary anchor，后续容易被理解成 prompt、context projection 或 driver request 的混合物。
+决策结果：`CONTEXT.md` 已新增 `TurnState` 和 `DriverTurnInput` 词条，明确 `TurnState` 是 `SessionRuntime` 内部稳定 run snapshot，不跨过 `Driver` seam；`DriverTurnInput` 是投影给 `Driver` 的窄输入。
 
-待处理方向：在 CONTEXT.md 增加 `TurnState` 术语。
+后续实现需验证：文档和代码不再把 `TurnState` 当作 driver request、公开协议快照或 ResourceManager current view。
 
 ### BR-018：`ModelCallRequest` 的 CONTEXT.md 描述遗漏 thinking level
 

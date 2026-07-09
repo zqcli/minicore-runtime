@@ -122,8 +122,16 @@ pub struct DriveRequest {
     pub run_id: RunId,
     pub session_id: SessionId,
     pub entry: DriveEntry,
-    pub turn_state: TurnState,
+    pub turn: DriverTurnInput,
     pub limits: DriveLimits,
+}
+
+pub struct DriverTurnInput {
+    pub model: ModelSelection,
+    pub system_prompt: String,
+    pub active_tool_schemas: Vec<ToolSchema>,
+    pub thinking_level: ThinkingLevel,
+    pub stream_options: StreamOptions,
 }
 
 pub enum DriveEntry {
@@ -132,6 +140,10 @@ pub enum DriveEntry {
     Resume { serialized_run: SerializedAgentRun },
 }
 ```
+
+`DriverTurnInput` 是 `TurnState` 的窄投影，不是新的状态 owner。它只包含 `Driver` 构造 `ModelCallRequest` 和初始化/继续 Rig `AgentRun` 所需的模型可见输入与模型调用选项。它不能包含 `Arc<TurnResourceSnapshot>`、`ResourceRevision`、`ContextUsageView`、session storage、queue state、`Tools` 内部状态、executor handle、policy/approval state 或 `ResourceManager` handle。
+
+`SessionRuntime` 仍然拥有完整 `TurnState`。run 启动时它从 `TurnState` 投影出 `DriverTurnInput` 放进 `DriveRequest`，同时把 `TurnState.resources` 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。这样 `Driver` 的主输入 seam 不会泄漏资源 snapshot。
 
 MVP 可以先不实现 `Resume`，但类型上保留方向。Rig `AgentRun` 是 serializable，后续 approval pending、长工具或进程恢复会需要 suspend/resume seam。
 
@@ -229,17 +241,27 @@ impl DriverHost for SessionRuntime {
 }
 ```
 
+直接实现是合法的最小版本，但它仍必须从 `SessionRuntime` / `CurrentRun` 自己拥有的 `TurnState` 构造工具上下文，不能要求 `DriveRequest` 携带 resources。
+
 真实实现更推荐 per-run `SessionDriverHost` wrapper：
 
 ```rust
 impl SessionRuntime {
     pub async fn start_run(
         &mut self,
-        request: DriveRequest,
+        turn_state: TurnState,
+        entry: DriveEntry,
         cancel: CancellationToken,
     ) -> DriveResult {
-        let run_id = request.run_id;
-        let turn_resources = request.turn_state.resources.clone();
+        let run_id = self.allocate_run_id();
+        let turn_resources = turn_state.resources.clone();
+        let request = DriveRequest {
+            run_id,
+            session_id: self.session_id,
+            entry,
+            turn: turn_state.driver_turn_input(),
+            limits: self.drive_limits(),
+        };
 
         let mut host = SessionDriverHost {
             session_id: self.session_id,
@@ -323,7 +345,7 @@ fn handle_done_step(...)
 模型侧：
 
 ```rust
-fn build_model_call_request(...)
+fn build_model_call_request(prompt, history, rig_turn, driver_turn_input)
 async fn call_model_gateway(...)
 fn assemble_model_turn(...)
 fn feed_model_response_to_rig(...)
@@ -359,7 +381,7 @@ reload_tools           // 工具生命周期不属于 driver
 
 ```text
 AgentRunStep::CallModel { prompt, history, turn }
-  → build_model_call_request(prompt, history, turn, turn_state)
+  → build_model_call_request(prompt, history, turn, request.turn)
   → host.call_model(request, ModelStreamSink, cancel)
       → provider/model gateway handles credentials, hooks, payload, fallback
       → ModelStreamSink emits model/assistant deltas as DriverEvent
@@ -369,7 +391,7 @@ AgentRunStep::CallModel { prompt, history, turn }
 
 `Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。provider request/payload hooks 也应在 `host.call_model(...)` 后面的 model gateway 中执行，driver 只传递必要上下文。
 
-`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能从 `TurnState.model.selection` 复制 `ModelSelection { provider_id, model_id }`，并填入 messages、system prompt、active tool schemas、thinking level 和 stream options；它不能解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
+`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能从 `DriverTurnInput` 复制 `ModelSelection { provider_id, model_id }`、system prompt、active tool schemas、thinking level 和 stream options，并结合 Rig step 提供的 prompt/history 生成 provider-neutral request；它不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
 
 ## CallTools Step
 
@@ -397,7 +419,7 @@ AgentRunStep::CallTools { calls }
 ```text
 before_next_model_call
   在一次 model response 和 tool results 已经回填后、下一次 CallModel 前触发。
-  SessionRuntime 可决定注入 steering messages、patch TurnState、切换模型/思考等级/active tools，或继续原样运行。
+  SessionRuntime 可决定注入 steering messages、patch future DriverTurnInput、切换模型/思考等级/active tools，或继续原样运行。
 
 before_run_finish
   在 Rig 即将 Done 时触发。
@@ -409,10 +431,18 @@ before_run_finish
 ```rust
 pub enum NextModelCallDecision {
     Continue,
-    PatchTurnState(TurnStatePatch),
+    PatchDriverTurnInput(DriverTurnInputPatch),
     InjectMessages(Vec<MessageRecord>),
     Abort { reason: String },
     Suspend { reason: SuspendReason },
+}
+
+pub struct DriverTurnInputPatch {
+    pub model: Option<ModelSelection>,
+    pub system_prompt: Option<String>,
+    pub active_tool_schemas: Option<Vec<ToolSchema>>,
+    pub thinking_level: Option<ThinkingLevel>,
+    pub stream_options: Option<StreamOptions>,
 }
 
 pub enum FinishDecision {
@@ -424,7 +454,7 @@ pub enum FinishDecision {
 }
 ```
 
-MVP 可以只实现 `Continue` / `Finish` / `ContinueWithMessages`，但函数名和 enum 应给后续扩展留下空间。
+`DriverTurnInputPatch` 只能 patch `DriverTurnInput` 已有字段，不能新增 resources、context usage、queue/storage 或 tool governance state。MVP 可以只实现 `Continue` / `Finish` / `ContinueWithMessages`，但函数名和 enum 应给后续扩展留下空间。
 
 ## Error And Abort Semantics
 

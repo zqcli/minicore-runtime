@@ -267,7 +267,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 | `BeforeAgentStart` | Transform | append custom message、patch stream options、patch system prompt |
 | `PromptBuilt` | Transform | append 或 privileged replace system prompt |
 | `ContextProjection` | Transform | replace model-visible messages |
-| `AfterTurnStateBuild` | Observer | inspect stable turn state summary |
+| `AfterTurnStateBuild` | Observer | inspect stable turn state summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
 
 提示词注入应该走这些 hook，而不是让 UI 或下游代码直接拼 system prompt。
 

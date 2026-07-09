@@ -650,3 +650,11 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - 普通 focus 切换不是暂停；pending approval 在 MVP 中是 current run 的 waiting substate，不等同于跨生命周期 suspend。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`driver.md`、`adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-005 已标记为 Resolved。
+
+## BR-008 Driver 输入 seam 收敛进展
+
+本轮 grilling 已确认：BR-008 的核心不是 `DriverHost` / `SessionDriverHost` 是否存在，而是 `DriveRequest` 不应携带完整 `TurnState`。`DriverHost` 限制的是 driver 回调外部能力时能访问什么；`DriveRequest` 限制的是 driver 一开始被喂进来什么。只要 `DriveRequest { turn_state: TurnState }` 存在，`Driver` 就仍可见 `TurnResourceSnapshot`、resource revision、context usage 和工具治理状态，seam 仍然过宽。
+
+设计收敛为：`SessionRuntime` 继续拥有完整 `TurnState`，run 启动时只投影 `DriverTurnInput` 放进 `DriveRequest`。`DriverTurnInput` 只包含 `model`、`system_prompt`、`active_tool_schemas`、`thinking_level` 和 `stream_options`；不包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态。turn resources 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。
+
+已同步完成：`driver.md`、`session-runtime.md`、`model-gateway.md`、`resource-manager.md`、`skills.md`、ADR 0011、ADR 0013、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-008 已标记为 Resolved。由于 `CONTEXT.md` 同时新增了 `TurnState` 词条，BR-017 也已标记为 Resolved。

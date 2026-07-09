@@ -227,6 +227,7 @@ secret 不得出现在：
 ```text
 Command
 TurnState
+DriverTurnInput
 DriveRequest
 ModelCallRequest
 DriverEvent
@@ -258,7 +259,7 @@ pub struct ModelCallRequest {
     pub model: ModelSelection,
     pub messages: Vec<MessageRecord>,
     pub system_prompt: Option<String>,
-    pub tools: Vec<ToolDefinitionView>,
+    pub tools: Vec<ToolSchema>,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
 }
@@ -346,7 +347,7 @@ SessionHandle.build_session_context()
 ### SetModel
 
 ```text
-Command::SetModel { provider_id, model_id }
+AgentCommand::SetModel { provider_id, model_id }
   → AgentRuntime routes to SessionRuntime
   → SessionRuntime checks phase policy
   → ProviderRegistry.resolve(ModelSelection)
@@ -367,6 +368,7 @@ SubmitPrompt
   → ResourceManager.capture_turn(workspace_id, cwd, turn_id)
   → Prompt builds system prompt from TurnResourceSnapshot.cwd.resolved + active tools
   → SessionRuntime builds TurnState { model: ActiveModel, resources, ... }
+  → SessionRuntime projects DriverTurnInput { model, system_prompt, active_tool_schemas, thinking_level, stream_options }
   → Driver.drive_run(...)
   → AgentRunStep::CallModel
   → Driver builds ModelCallRequest { model: ModelSelection, ... }
@@ -475,7 +477,7 @@ system prompt snippets/guidelines
 provider tool schemas in ModelCallRequest.tools
 ```
 
-`ModelGateway` 可以把 `ToolDefinitionView` 转成 provider/Rig 需要的 tool schema，但不能执行工具。若模型不支持 tools，`SessionRuntime` / `ActiveToolSet` 应根据 `ModelCapabilities.supports_tools` 过滤或禁用 active tools，并给 UI 诊断。
+`ModelGateway` 可以把 `ToolSchema` 转成 provider/Rig 需要的 provider-specific tool schema，但不能执行工具。若模型不支持 tools，`SessionRuntime` / `ActiveToolSet` 应根据 `ModelCapabilities.supports_tools` 过滤或禁用 active tools，并给 UI 诊断。
 
 ## Custom Provider Examples
 
@@ -528,7 +530,7 @@ ProviderRegistry
 - auth redaction：snapshot/event/session entry/diagnostics/hook context 不含 API key、OAuth token、authorization header。
 - custom provider：OpenAI-compatible / Anthropic-compatible 的 `base_url + api_model_name + auth_ref` 能传到 Rig adapter。
 - custom provider 来源：项目级资源/settings 不能注册 custom provider、覆盖 base URL 或引用新的 `AuthRef`；只有 user-global 配置或后续 user-trusted extension 可以声明 custom provider。
-- submit flow：`TurnState.model.selection -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失。
+- submit flow：`TurnState.model.selection -> DriverTurnInput.model -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失。
 - error taxonomy：auth missing、rate limit、context overflow、cancelled 不靠字符串解析给上层。
 - usage：多次 `model -> tools -> model` 的 `ModelCallUsage` 聚合成一次 run `UsageSummary`，不重复计数。
 - compaction：`ModelCallPurpose::CompactionSummary` 无 tools，usage 归入 compaction purpose。

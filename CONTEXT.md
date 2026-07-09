@@ -272,17 +272,25 @@ _避免_：RunTerminalStatus、SessionPhase、工具调用状态
 当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending、safe point 用户暂停或 host shutdown checkpoint。它不能表达为 `run_finished { status: paused }`。
 _避免_：focus 切换、terminal finished、普通 waiting approval、模型 streaming 中途暂停
 
+**TurnState**：
+`SessionRuntime` 在一次 user turn / run 启动时构建的内部稳定快照，pin 住资源、system prompt、模型状态、工具视图、消息投影和 context usage。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
+_避免_：Driver 输入、ResourceManager current view、公开协议快照
+
+**DriverTurnInput**：
+`TurnState` 投影给 `Driver` 的窄输入，只包含推进 Rig 和构造 `ModelCallRequest` 所需的模型可见输入，例如 model selection、system prompt、active tool schemas、thinking level 和 stream options。它不能包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态。
+_避免_：TurnState、ToolRunContext、ModelCallRequest、SessionRuntime 状态
+
 **Driver（Rig 适配器）**：
 会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。
-_避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行
+_避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行、TurnState owner
 
 **DriverHost**：
 `Driver` 访问外部世界的 trait seam，定义 `call_model`、`invoke_tool_batch`、`before_next_model_call`、`before_run_finish` 等回调。它不是长期运行时对象，也不拥有 session 状态；它只是让无状态/浅状态的 `Driver` 回到 `SessionRuntime` 所拥有的模型、工具、队列和事件能力。
 _避免_：Driver 实例、工具执行器、SessionRuntime 本体、全局服务
 
 **SessionDriverHost**：
-一次 `drive_run()` 期间临时创建的 `DriverHost` wrapper，借用 `SessionRuntime` 中本次 run 需要的一小片能力，例如 `Tools`、`ModelGateway`、event sink、queue state 和 `CurrentRun`，并携带从 `TurnState` clone 出来的 turn resources。直接 `impl DriverHost for SessionRuntime` 是合法简化版，但 wrapper 更能收窄访问面、隔离 run-scoped context，并避免 Rust 自借用压力。
-_避免_：长期子系统、session 状态 owner、独立 runtime
+一次 `drive_run()` 期间临时创建的 `DriverHost` wrapper，借用 `SessionRuntime` 中本次 run 需要的一小片能力，例如 `Tools`、`ModelGateway`、event sink、queue state 和 `CurrentRun`，并持有留在 host 侧的 turn resources。直接 `impl DriverHost for SessionRuntime` 是合法简化版，但 wrapper 更能收窄访问面、隔离 run-scoped context，并避免 Rust 自借用压力。
+_避免_：长期子系统、session 状态 owner、独立 runtime、DriverTurnInput
 
 **Tools 子系统 / 工具模块**：
 `SessionRuntime` 内部的 session-scoped `tools.rs` / `tools/` 子系统，封装工具定义、注册表、活跃工具、工具提示素材、策略、审批、授权记忆、执行协调、沙箱、mutation lock 和 executor implementations。`SessionRuntime` 负责协调 `Driver` 与 `Tools`，`Driver` 不直接依赖 `Tools`。

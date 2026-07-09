@@ -86,7 +86,7 @@ SessionRuntime  SessionStorage
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)。
+实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)。
 
 ## Rust 文件规划
 
@@ -113,7 +113,7 @@ SessionRuntime  SessionStorage
 | `src/session_storage.rs` | [SessionManager / SessionStorage](session-manager.md) | `SessionHandle`、`SessionStorage` trait、entry/context 重建公共类型。 |
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionStorage](session-manager.md) | JSONL session 文件存储。 |
-| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | 单会话 phase、queue、run 编排、事件归约、save point，以及 per-run `SessionDriverHost` wrapper。 |
+| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | 单会话 phase、queue、run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、save point，以及 per-run `SessionDriverHost` wrapper。 |
 | `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、reload/recompose、diagnostics、prompt materials。 |
 | `src/prompt_templates.rs` | [ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata、解析和显式调用 helper；命令层只消费 metadata。 |
 | `src/command.rs` | [CommandSurface](command-surface.md) | command public module 和常用类型 re-export。 |
@@ -159,7 +159,7 @@ SessionRuntime  SessionStorage
 | `src/tools/builtin/bash.rs` | [Tools](tools.md) | `bash` 工具。 |
 | `src/compaction.rs` | [Compaction](compaction.md) | 压缩准备、cut point、summary prompt 和结果类型。 |
 | `src/usage_stats.rs` | [UsageStats](usage-stats.md) | provider usage 归一化、run/session/context usage helper。 |
-| `src/driver.rs` | [Driver](driver.md) | Driver trait/host seam、drive request/result、Rig step 映射主入口。 |
+| `src/driver.rs` | [Driver](driver.md) | `DriverTurnInput`、`DriverHost` seam、drive request/result、Rig step 映射主入口。 |
 | `src/driver/rig.rs` | [Driver](driver.md) | 当前 Rig sans-IO adapter 实现细节。 |
 
 ## 权威归属
@@ -180,7 +180,7 @@ SessionRuntime  SessionStorage
 | 最终 system prompt 拼装规则 | [Prompt](prompt.md) | 只说明何时重建，不拼装 prompt。 |
 | session-scoped 工具子系统、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks、executors | [Tools](tools.md) | 只说明 `SessionRuntime` 如何协调 `Driver` 与 `Tools`，不复制工具治理 pipeline。 |
 | provider/model/auth 调用边界、`ModelSelection`、`ProviderRegistry`、`ModelGateway`、custom provider、Rig provider adapter | [ModelGateway](model-gateway.md) | 只说明本模块如何选择模型或发起模型调用，不重复 provider/auth 解析规则。 |
-| Rig `AgentRun` step 驱动、`DriverHost` trait seam、`SessionDriverHost` wrapper 代码形态 | [Driver](driver.md) | 只说明如何进入 driver，不拥有 Rig 协议；具体 session 编排仍看 [SessionRuntime](session-runtime.md)。 |
+| Rig `AgentRun` step 驱动、`DriverTurnInput`、`DriverHost` trait seam、`SessionDriverHost` wrapper 代码形态 | [Driver](driver.md) | 只说明如何进入 driver，不拥有 Rig 协议；具体 session 编排仍看 [SessionRuntime](session-runtime.md)。 |
 | 压缩算法、cut point、summary prompt、summary message | [Compaction](compaction.md) | 只说明压缩流程，不重复摘要 prompt 和 projection 规则。 |
 | token 消耗、run/session stats、context usage | [UsageStats](usage-stats.md) | 只引用 usage view，不重新定义估算和累计规则。 |
 

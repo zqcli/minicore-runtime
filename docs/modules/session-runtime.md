@@ -115,7 +115,7 @@ SessionRuntime cwd/date/model state
 
 重建触发点包括 user turn 启动、active tools 改变、工具 prompt snippet/guideline 改变、会话启动和 hook 明确替换 system prompt。资源 reload 不会主动改写 running turn；下一次 user turn capture 新的 `TurnResourceSnapshot` 后重建 system prompt。运行中的 turn 使用启动时的 `TurnState`，资源变化只影响未来 turn。
 
-MVP 中 Rig step 不再调用 `ResourceManager`。`Driver` 在 `CallModel` / `CallTools` / `Done` 期间只能使用 `TurnState.resources`、已构建的 `system_prompt` 和会话工具状态；不能在 step 中读取 `ResourceManager.current_runtime()` 或 `current_cwd()`。未来如果启用 `StepResourceSnapshot`，也应由 `SessionRuntime` / `DriverHost` 基于当前 `TurnState.resources` 创建轻量 parent wrapper，而不是重新捕获上层资源。
+MVP 中 Rig step 不再调用 `ResourceManager`。资源在 user turn 启动时捕获进 `TurnState`，但完整 `TurnState` 不跨过 `Driver` seam。`SessionRuntime` 只把 `DriverTurnInput` 这种窄投影放进 `DriveRequest`；`TurnState.resources` 留在 `SessionRuntime` / `SessionDriverHost` 中，用于工具运行上下文、safe point 决策和未来 `StepResourceSnapshot` parent。`Driver` 不能在 step 中读取 `ResourceManager.current_runtime()`、`current_cwd()` 或 `TurnResourceSnapshot`。未来如果启用 `StepResourceSnapshot`，也应由 `SessionRuntime` / `DriverHost` 基于当前 `TurnState.resources` 创建轻量 parent wrapper，而不是重新捕获上层资源。
 
 ## Model State And Selection
 
@@ -148,7 +148,7 @@ pub struct ActiveModel {
 3. `SetModel` / `CycleModel` 只更新 `ModelSelection`，写入 `SessionEntry::ModelChange`，并发 `session_model_changed`；它们不构造 provider client，也不读取 credentials。
 4. `SetThinkingLevel` / `CycleThinkingLevel` 会按当前 `ModelCapabilities` 裁剪；不支持 thinking 的模型应降级为 `ThinkingLevel::Off` 或返回结构化错误。
 5. 每次启动 run 前，`SessionRuntime` 从 `ModelState` 和 `ProviderRegistry` 构造 `ActiveModel`，放进 `TurnState`。
-6. 运行中切换模型可以先被 phase guard 拒绝；完整版本可在 `before_next_model_call` 安全点 patch future `TurnState`，但不能替换已经发出的 provider request。
+6. 运行中切换模型可以先被 phase guard 拒绝；完整版本可在 `before_next_model_call` 安全点由 `SessionRuntime` 更新会话事实并 patch future `DriverTurnInput`，但不能替换已经发出的 provider request。
 
 `ModelSummary` 是 UI/snapshot view，不是执行路径身份。执行路径必须使用 `ModelSelection { provider_id, model_id }`，避免把显示名、provider API model name 或 Rig 类型写进 session。
 
@@ -172,7 +172,35 @@ pub struct TurnState {
 }
 ```
 
-运行中如果用户切换模型或活跃工具，`SessionRuntime` 可以先记入 `pendingSessionWrites`，然后在 `DriverHost::before_next_model_call` 安全点重新构建或 patch future turn state。资源 reload 不 patch 当前 `TurnState`；当前 run 继续使用启动时捕获的 `resources` 和 `system_prompt`。`Driver` 只能把 `turn_state.model.selection` 复制进 `ModelCallRequest`；provider 解析和 auth 注入必须发生在 `ModelGateway`。
+`TurnState` 是 `SessionRuntime` 的内部 run snapshot。它 pin 住资源、system prompt、模型状态、工具视图和 context usage，以保证 running run 不受 reload 或 focus 切换影响；它不是 `Driver` 的输入类型。
+
+`SessionRuntime` 在启动 `Driver` 前投影出更窄的输入：
+
+```rust
+pub struct DriverTurnInput {
+    pub model: ModelSelection,
+    pub system_prompt: String,
+    pub active_tool_schemas: Vec<ToolSchema>,
+    pub thinking_level: ThinkingLevel,
+    pub stream_options: StreamOptions,
+}
+
+impl TurnState {
+    pub fn driver_turn_input(&self) -> DriverTurnInput {
+        DriverTurnInput {
+            model: self.model.selection.clone(),
+            system_prompt: self.system_prompt.clone(),
+            active_tool_schemas: self.active_tool_schemas(),
+            thinking_level: self.thinking_level,
+            stream_options: self.stream_options.clone(),
+        }
+    }
+}
+```
+
+`DriverTurnInput` 不能包含 `Arc<TurnResourceSnapshot>`、`ResourceRevision`、`ContextUsageView`、全量 tools registry、executor handle、approval/policy state、queue state 或 storage handle。它只是给 `Driver` 构造 `ModelCallRequest` 和推进 Rig `AgentRun` 的模型可见输入投影。
+
+运行中如果用户切换模型或活跃工具，`SessionRuntime` 可以先记入 `pendingSessionWrites`，然后在 `DriverHost::before_next_model_call` 安全点重新构建或 patch future `DriverTurnInput`。资源 reload 不 patch 当前 `TurnState`；当前 run 继续使用启动时捕获的 `resources` 和 `system_prompt`。`Driver` 只能把 `DriverTurnInput.model` 复制进 `ModelCallRequest`；provider 解析和 auth 注入必须发生在 `ModelGateway`。
 
 ## Driver / Tools Coordination
 
@@ -197,8 +225,16 @@ pub struct SessionRuntime {
 工具调用不由 `Driver` 直接执行。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper：
 
 ```rust
-let run_id = request.run_id;
-let turn_resources = request.turn_state.resources.clone();
+let run_id = self.allocate_run_id();
+let turn_resources = turn_state.resources.clone();
+
+let request = DriveRequest {
+    run_id,
+    session_id: self.session_id,
+    entry,
+    turn: turn_state.driver_turn_input(),
+    limits: self.drive_limits(),
+};
 
 let mut host = SessionDriverHost {
     session_id: self.session_id,
@@ -231,6 +267,7 @@ DriverHost::invoke_tool_batch(request, updates, cancel)
 
 - 直接实现是合法的最小版本，但 wrapper 可以限制 `DriverHost` 方法只能访问本次 run 需要的字段，避免把整个 `SessionRuntime` 暴露给 driver seam。
 - wrapper 将 `run_id`、turn resources、event correlation、checkpoint context 等 run-scoped 数据与 session-scoped state 分离。
+- `DriveRequest` 只带 `DriverTurnInput`，而 `SessionDriverHost` 持有 turn resources；这同时收窄了 driver 主输入和 host 回调上下文。
 - wrapper 避免 `self.driver.drive_run(..., self, ...)` 这类 Rust 自借用形态；`Driver` 越无状态，这个边界越简单。
 - wrapper 让 `Driver` 单测只需要 fake host，不需要构造真实 session runtime、tools、storage 和 event bus。
 
@@ -327,7 +364,7 @@ Rig 的 `AgentRun` 不一定暴露与 pi `runAgentLoop` 完全相同的运行中
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
 2. 构建 `TurnState`。
 3. 触发 `BeforeAgentStart` / `PromptBuilt` Hook。
-4. 将 prompt、skill 调用或提示模板展开结果作为 `DriveEntry::Prompt` 交给 `Driver.drive_run()`。
+4. 将 prompt、skill 调用或提示模板展开结果作为 `DriveEntry::Prompt`，并把 `TurnState` 投影成 `DriverTurnInput` 后交给 `Driver.drive_run()`。
 5. 在模型调用前触发 `ContextProjection`、`BeforeModelCall` 和 provider payload Hook。
 6. 工具调用通过 `SessionRuntime` 内部的 `Tools` 子系统治理和执行，再由 `Driver` 回填 Rig。
 7. 每个 run 的可恢复边界 flush `pendingSessionWrites`，发出 `persistence_save_point`。
