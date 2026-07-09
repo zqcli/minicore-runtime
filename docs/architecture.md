@@ -10,7 +10,7 @@ MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 必须保持为实现细节
 
 MiniCore 不重新实现 Rig 的核心 Agent loop。Rig 负责 `AgentRun` / `AgentRunStep` 的状态机推进；MiniCore 通过 `Driver` 适配 Rig，在 `CallTools` 时经 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，再由 session-scoped `Tools` 子系统执行工具治理，并把底层活动映射成产品事件。
 
-MiniCore 也不重新实现 provider HTTP clients。真实模型调用通过 `ModelGateway` 复用 Rig provider system；MiniCore 在该边界内治理 provider/model 解析、凭据、custom base URL、hook、fallback、usage 和错误分类。
+MiniCore 也不重新实现 provider HTTP clients。真实模型调用通过 `ModelGateway` 复用 Rig provider system；MiniCore 在该边界内治理 provider/model 解析、凭据、custom base URL、hook、fallback、usage 和错误分类。`ModelGateway` 的最小稳定 spine 必须早于真实 `Driver` 集成，避免阶段 5 写临时 provider/auth 路径。
 
 ## 分层
 
@@ -117,3 +117,4 @@ AgentSessionRuntime
 - [ADR 0010：多 session runtime 使用级联资源快照](adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md)
 - [ADR 0011：Tools 是 SessionRuntime 内部的 Session-Scoped 子系统](adr/0011-tools-are-session-scoped-subsystem.md)
 - [ADR 0013：Driver 接收 DriverTurnInput 而不是完整 TurnState](adr/0013-driver-receives-driver-turn-input.md)
+- [ADR 0014：ModelGateway spine 先于真实 Driver 集成](adr/0014-model-gateway-spine-precedes-driver-integration.md)

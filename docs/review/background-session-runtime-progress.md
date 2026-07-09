@@ -658,3 +658,11 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 设计收敛为：`SessionRuntime` 继续拥有完整 `TurnState`，run 启动时只投影 `DriverTurnInput` 放进 `DriveRequest`。`DriverTurnInput` 只包含 `model`、`system_prompt`、`active_tool_schemas`、`thinking_level` 和 `stream_options`；不包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态。turn resources 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。
 
 已同步完成：`driver.md`、`session-runtime.md`、`model-gateway.md`、`resource-manager.md`、`skills.md`、ADR 0011、ADR 0013、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-008 已标记为 Resolved。由于 `CONTEXT.md` 同时新增了 `TurnState` 词条，BR-017 也已标记为 Resolved。
+
+## BR-009 ModelGateway 实现顺序收敛进展
+
+本轮 grilling 已确认：BR-009 的风险来自阶段 5 需要真实 `DriverHost::call_model(...)`，但阶段 9 才准备完整 `ModelGateway`。如果阶段 5 为了跑通 text-only driver 写临时 provider/auth/usage/error 路径，阶段 9 会被迫拆掉重写。
+
+设计收敛为：提前实现最小稳定 `ModelGateway` spine，而不是把阶段 9 的全部能力提前。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，固定 `ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 的 text-only driver 只能走 `DriverHost::call_model -> ModelGateway.call_model(...)`，不允许 `Driver` / `SessionDriverHost` match provider、直读 env 或构造 Rig provider client。阶段 9 只在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
+
+已同步完成：`implementation-roadmap.md`、`model-gateway.md`、ADR 0014、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-009 已标记为 Resolved。
