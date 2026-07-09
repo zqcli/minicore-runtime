@@ -64,7 +64,7 @@ SessionRuntime  SessionStorage
 
 `UsageStats` 是 token 消耗和上下文占用统计模块。它区分模型调用消耗、run 汇总、会话累计 stats 和当前 context usage；provider usage 归一化、本地估算、UI view 口径和压缩阈值计算都在这里统一说明。
 
-`ModelGateway` 是模型调用治理模块。它复用 Rig provider/client 能力，但在 MiniCore 内负责 provider/model 解析、凭据解析、custom base URL、provider hook、fallback、usage 归一化和错误分类。
+`ModelGateway` 是模型调用治理模块。它复用 Rig provider/client 能力，但在 MiniCore 内负责 provider/model 解析、凭据解析、custom base URL、provider hook、fallback、usage 归一化和错误分类。实现顺序上先提供最小稳定 spine，供真实 `Driver` 集成复用；完整 custom provider、fallback 和 usage/context usage 后续扩展。
 
 `Driver` 只负责适配 Rig。Rig 决定 `CallModel`、`CallTools` 和 `Done`；`Driver` 把这些 step 接到产品运行时的 provider、`Tools`、event 和 abort 语义。
 
@@ -86,7 +86,7 @@ SessionRuntime  SessionStorage
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)。
+实现路线不属于代码模块，放在 [实现路线图](../implementation-roadmap.md)。事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界的关键取舍记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界的关键取舍记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)。
 
 ## Rust 文件规划
 

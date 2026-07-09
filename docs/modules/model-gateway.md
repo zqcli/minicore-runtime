@@ -27,6 +27,28 @@ SessionRuntime::ModelState
 
 这不是把 Rig provider API 透传给上层。除私有 adapter，例如 `model_gateway/rig.rs`，其他模块不应导入 `rig::providers::*`。
 
+## 实现分期
+
+`ModelGateway` 是 `Driver` 的早期依赖，不能等到 usage/context usage 阶段才稳定。实现顺序采用“两层”策略：先落最小稳定 spine，再补完整 provider 能力。
+
+阶段 4/5 前必须稳定的 `ModelGateway` spine：
+
+- provider-neutral 类型：`ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` 的字段和 redaction 规则。
+- `ModelGateway.call_model(request, sink, cancel)` 主 seam。
+- 最小 `ProviderRegistry.resolve(ModelSelection)`：可以只支持 builtin fake/minimal provider 和最小 capability projection，但调用方必须通过 registry，不允许在 `Driver` / `SessionDriverHost` 中 match provider id。
+- 最小 `AuthStore.resolve(AuthRef)`：可以使用测试 secret 或受控 env resolver，但 secret material 只能出现在 `AuthStore` / `ModelGateway` 内部。
+- fake/minimal provider adapter 或私有 Rig adapter：用于证明 text streaming、cancellation、error mapping 和 `ModelStreamSink` 形状。
+
+阶段 9 才补齐的扩展能力：
+
+- user-global custom provider 配置、`ProviderProtocol`、custom `base_url`、`api_model_name` 和完整 capability validation。
+- keychain / OAuth / runtime override 等完整 auth 来源。
+- fallback chain、model invalid fallback diagnostics 和 provider-specific retry refinement。
+- provider-specific usage extraction、`UsageStats`、`ContextUsageView` 和成本/上下文窗口展示。
+- privileged raw provider payload hook；在 redacted、adapter shape 稳定前可以禁用。
+
+禁止的临时路径：阶段 5 不允许让 `Driver`、`SessionDriverHost` 或 `SessionRuntime` 直接读取环境变量、构造 Rig provider client、解析 provider error 字符串、保存 provider API model name 为执行身份，或把 raw provider payload / raw usage 塞进 event、snapshot 或 session JSONL。为了跑通 text-only driver，也必须走 `ModelGateway` spine。
+
 ## 模块归属
 
 ```text
@@ -515,6 +537,7 @@ ProviderRegistry
 
 需要被测试和持续追问的边界：
 
+- 阶段 5 的 text-only driver 是否已经只通过 `ModelGateway.call_model(...)`，没有临时 provider/auth 路径。
 - Rig provider API 是否支持 custom `base_url`、headers、streaming、usage extraction、tool schema 和 cancellation。
 - `Driver` 是否真的不 import provider registry/auth，也不解析 provider errors。
 - `BeforeProviderPayload` 是否能做到 redacted；做不到就不开。
@@ -525,7 +548,9 @@ ProviderRegistry
 
 ## 必测项
 
+- early spine：`DriverHost::call_model -> ModelGateway.call_model(ModelCallRequest)` 是阶段 5 唯一模型调用路径；`Driver` / `SessionDriverHost` 不 match provider id、不读 env、不构造 Rig provider client。
 - `ProviderRegistry.resolve(ModelSelection)`：builtin/custom、invalid provider、invalid model、capability projection。
+- minimal provider registry：阶段 4/5 可只支持 fake/minimal provider，但仍必须走 `ProviderRegistry` / `AuthStore` seam。
 - `SetModel`：phase guard、session entry、`session_model_changed`、snapshot 当前模型一致。
 - auth redaction：snapshot/event/session entry/diagnostics/hook context 不含 API key、OAuth token、authorization header。
 - custom provider：OpenAI-compatible / Anthropic-compatible 的 `base_url + api_model_name + auth_ref` 能传到 Rig adapter。

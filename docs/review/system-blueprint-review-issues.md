@@ -148,19 +148,19 @@
 
 ### BR-009：ModelGateway 实现顺序可能导致阶段 5 与阶段 9 返工
 
-状态：Open
+状态：Resolved
 
-问题：阶段 5 已接入真实 Driver、`model_gateway.rs` 和 `model_gateway/rig.rs`，但阶段 9 才收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage。ModelGateway 文档又把 provider/model/auth/fallback/usage/error/cancellation 都定义为调用边界职责。
+原问题：阶段 5 已接入真实 Driver、`model_gateway.rs` 和 `model_gateway/rig.rs`，但阶段 9 才收拢 provider/model/auth 生命周期、custom provider、usage 归一化和 context usage。ModelGateway 文档又把 provider/model/auth/fallback/usage/error/cancellation 都定义为调用边界职责。
 
-证据：
+原证据：
 
 - `docs/implementation-roadmap.md`：阶段 5 Text-only Driver integration 包含 `model_gateway.rs`、`model_gateway/rig.rs`。
 - `docs/implementation-roadmap.md`：阶段 9 才做 ModelGateway 和 UsageStats 的完整收拢。
 - `docs/modules/model-gateway.md`：ModelGateway 负责 provider/model 解析、凭据解析、custom base URL、fallback、usage、错误分类。
 
-风险：阶段 5 为了跑通真实 driver 可能先做临时 gateway，阶段 9 再重构 auth、fallback、usage 和错误语义。
+决策结果：实现顺序改为先落 `ModelGateway` 最小稳定 spine，再进行 text-only `Driver` integration。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，必须固定 `ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 只能通过 `DriverHost::call_model -> ModelGateway.call_model(...)` 调模型，不能在 `Driver` / `SessionDriverHost` 中 match provider、直读 env 或构造 Rig provider client。阶段 9 改为在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
 
-待处理方向：阶段 5 明确只允许 fake/minimal ModelGateway adapter，或提前定义 stable ModelGateway seam 与测试替身。
+后续实现需验证：阶段 5 的 fake/minimal provider adapter 也必须走 `ProviderRegistry` / `AuthStore` / `ModelGateway` seam；阶段 9 只能扩展 seam，不能替换模型调用路径；provider/auth/raw usage/error 字符串不能泄漏到 `Driver`、event、snapshot 或 session JSONL。
 
 ### BR-010：模型调用 hook owner 不一致
 

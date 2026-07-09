@@ -338,8 +338,12 @@ _避免_：审批弹窗、路径字符串前缀检查、executor 自行放宽权
 _避免_：工具策略、工具注册、UI 执行器
 
 **模型调用网关**：
-运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、provider Hook、fallback、流式结果、usage 归一化和错误分类。`Driver` 只通过 `call_model` seam 请求它。
-_避免_：Driver、模型客户端、系统提示词构建器、provider registry
+运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、provider Hook、fallback、流式结果、usage 归一化和错误分类。`Driver` 只通过 `call_model` seam 请求它；真实 driver 集成前必须先有最小稳定 spine。
+_避免_：Driver、模型客户端、系统提示词构建器、provider registry、临时 provider 路径
+
+**ModelGateway spine**：
+真实 driver 集成前必须稳定的最小模型调用骨架，包括 `ModelCallRequest` / `ModelCallResult` / `ModelCallErrorKind`、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。它不是完整 custom provider、fallback 或 usage/context usage 实现。
+_避免_：临时 gateway、Driver 直接调用 provider
 
 **模型选择（`ModelSelection`）**：
 一次会话或模型调用使用的稳定模型身份，由 `provider_id` 和 `model_id` 组成。它不等同于 provider API 中的真实模型名，也不包含凭据或 base URL。
