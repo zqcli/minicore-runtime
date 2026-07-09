@@ -55,7 +55,7 @@ ModelGateway internals
 
 - 执行 Agent loop 或推进 Rig `AgentRun`。
 - 执行工具、审批工具或读取工具结果。
-- 构建 system prompt、展开 skill 或解析 slash command。
+- 构建 system prompt、展开 skill 或解析 command text。
 - 读写 `SessionStorage` 或发布 `agent_runtime_protocol::Event`。
 - 把 raw provider payload、provider response 或 credentials 放进 snapshot/event/session JSONL。
 - 让 hook 获得 `AuthStore` secret material。

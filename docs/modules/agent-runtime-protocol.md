@@ -4,7 +4,7 @@
 
 事件命名、顺序、持久化屏障、重连和各场景生命周期详见 [AgentRuntimeEvents](agent-runtime-events.md)。本文件只保留 UI 需要依赖的协议类型。
 
-Rust 模块名建议使用 `agent_runtime_protocol`。模块内类型保持短名：`Command`、`CommandAck`、`Event`、`EventMsg`、`RuntimeSnapshot`、`EventStream`；跨模块引用时使用完整路径，例如 `agent_runtime_protocol::Command`。如果未来需要在 crate root 或 SDK 中 re-export，可以提供 `AgentRuntimeCommand`、`AgentRuntimeEvent` 等别名，但它们不是新的领域概念。
+Rust 模块名建议使用 `agent_runtime_protocol`。模块内对外命令枚举使用 `AgentCommand`，表示“下游 adapter 发给 `AgentRuntime` 的协议级用户意图”。`Command` 这个短名留给 [CommandSurface](command-surface.md) 中的 session-scoped `command::Command` 子系统入口。跨模块引用时使用完整路径，例如 `agent_runtime_protocol::AgentCommand`。
 
 ## 公共 Interface
 
@@ -12,7 +12,7 @@ Rust 模块名建议使用 `agent_runtime_protocol`。模块内类型保持短�
 use crate::agent_runtime_protocol as protocol;
 
 pub trait AgentRuntime {
-    async fn dispatch(&self, command: protocol::Command) -> Result<protocol::CommandAck, RuntimeError>;
+    async fn dispatch(&self, command: protocol::AgentCommand) -> Result<protocol::CommandAck, RuntimeError>;
     fn subscribe(&self) -> protocol::EventStream;
     async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
@@ -41,7 +41,7 @@ pub struct CommandAck {
 }
 ```
 
-`CommandAck` 只表示 `dispatch()` 是否接收了这条协议命令，不是执行结果。对 `ExecuteSlashCommand` 也是如此：`/status` 的状态内容、`/usage` 的统计、`/model` 的 picker 或设置完成提示，都应通过后续 `CommandPresentationEvent` 或业务事件返回，而不是塞进 `CommandAck`。
+`CommandAck` 只表示 `dispatch()` 是否接收了这条协议命令，不是执行结果。对 `ExecuteCommandText` 也是如此：`/status` 的状态内容、`/usage` 的统计、`/model` 的候选或设置完成提示，都应通过后续 command output / business event 返回，而不是塞进 `CommandAck`。
 
 推荐边界：transport/runtime 级无法接收时返回 rejected，例如 runtime 已关闭、workspace 不存在或目标 session id 无效；slash 输入层的用户错误，例如 unknown command、参数非法或当前 phase 不允许，优先返回 accepted，然后发 `command_output_appended { severity: Error }`，让 TUI 和 GUI 在 message 面板中展示一致错误。
 
@@ -65,12 +65,12 @@ pub struct CommandAck {
 
 也就是说，稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 字段只负责 routing、ordering、correlation 和 reconnect cursor。
 
-## Command
+## AgentCommand
 
 MVP 命令：
 
 ```rust
-pub enum Command {
+pub enum AgentCommand {
     OpenWorkspace { path: PathBuf },
     NewSession { workspace_id: WorkspaceId },
     OpenSession { session_id: SessionId },
@@ -83,23 +83,35 @@ pub enum Command {
     FollowUp { session_id: SessionId, input: UserInput },
     NextTurn { session_id: SessionId, input: UserInput },
     ClearQueue { session_id: SessionId },
-    AppendMessage { session_id: SessionId, message: MessageRecord, trigger_turn: bool },
     AbortRun { run_id: RunId },
+    ResumeRun { session_id: SessionId, resume_id: ResumeId },
     WaitForIdle { session_id: SessionId },
     DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
     SetModel { session_id: SessionId, provider_id: String, model_id: String },
     SetThinkingLevel { session_id: SessionId, level: ThinkingLevel },
-    SetTools { session_id: SessionId, tools: Vec<ToolConfig>, active_tool_names: Option<Vec<String>> },
     SetActiveTools { session_id: SessionId, tool_names: Vec<String> },
     SetQueueMode { session_id: SessionId, queue: QueueKind, mode: QueueMode },
     SetStreamOptions { session_id: SessionId, options: StreamOptions },
     ReloadResources { workspace_id: WorkspaceId, cwd: PathBuf },
     Compact { session_id: SessionId, instructions: Option<String> },
-    ExecuteSlashCommand { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode },
+    ExecuteCommandText { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode },
+    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs },
 }
 ```
 
-`ListSessions` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`；GUI sidebar 也应通过同一查询分页/过滤读取当前 workspace 的 session 清单，而不是直接读取本地 index 文件。`ListSessions` 是读取型 protocol query：SDK / JSON-RPC transport 可以把它实现为 request/response；如果某个 transport 只能走 `dispatch(Command)`，也必须通过明确 response event 或 interaction 返回列表，不能把 session list 塞进 `CommandAck`。
+`AgentCommand` 是公开协议命令，只表达下游 UI/CLI 可以提交的用户意图。高权限内部 mutation 不属于公开协议，例如直接追加会话消息、替换工具定义、改写会话历史或注入调试状态。它们应放入内部 API：
+
+```rust
+pub(crate) enum InternalAgentCommand {
+    AppendMessage { session_id: SessionId, message: MessageRecord, trigger_turn: bool },
+    SetToolDefinitions { session_id: SessionId, tools: Vec<ToolConfig> },
+    MutateSessionHistory { session_id: SessionId, operation: HistoryMutation },
+}
+```
+
+`InternalAgentCommand` 不能出现在 `RuntimeSnapshot`、`EventMsg`、command catalog、command output action 或 UI-visible interaction 中。
+
+`ListSessions` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`；GUI sidebar 也应通过同一查询分页/过滤读取当前 workspace 的 session 清单，而不是直接读取本地 index 文件。`ListSessions` 是读取型 protocol query：SDK / JSON-RPC transport 可以把它实现为 request/response；如果某个 transport 只能走 `dispatch(AgentCommand)`，也必须通过明确 response event 或 interaction 返回列表，不能把 session list 塞进 `CommandAck`。
 
 ```rust
 pub enum SessionListScope {
@@ -118,7 +130,9 @@ pub struct PageCursor(pub String);
 
 `RuntimeResourceSnapshot`、`CwdResourceSnapshot` 或 `TurnResourceSnapshot` 都不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources { workspace_id, cwd }`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceManager` 的 source info、project trust、overlay policy、diagnostics 和 atomic publish 语义。
 
-`ExecuteSlashCommand` 只提交原始 `/...` invocation；Parse / Plan / Execute / Present 由运行时的 [CommandSurface](command-surface.md) 模块和 `AgentRuntime` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteSlashCommand` 或 runtime-provided interaction submit action；专用设置控件可以直接提交结构化 command，但必须复用同一后端校验、事件和 command presentation 规则。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
+`ExecuteCommandText` 只提交原始命令文本；`/...` slash command 是这种文本入口的常见语法。Parse / materialize / suggest / resolve / execute 由 [CommandSurface](command-surface.md) 中的 `CommandManager` 与目标 `SessionRuntime.command` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteCommandText`，GUI/TUI 从 catalog 选择某个节点时可以走 `ExecuteCatalogCommand`。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
+
+`ExecuteCatalogCommand` 只能携带 `CommandSelection`、catalog revision、dynamic bindings 和 `CommandArgs`，不能携带完整 `AgentCommand` payload 或 handler id。运行时收到后必须基于当前 session context 重新 materialize catalog，并执行 `resolve_for_execution`：command 仍存在、selection 未过期、bindings 仍有效、args 合法、phase/trust/capability 允许、handler binding 可信，然后才调用 handler。
 
 后续命令：
 
@@ -134,9 +148,9 @@ GetSkill { workspace_id: WorkspaceId, cwd: PathBuf, skill_name: String }
 GetPromptTemplate { workspace_id: WorkspaceId, cwd: PathBuf, template_name: String }
 GetContextFile { workspace_id: WorkspaceId, cwd: PathBuf, path: PathBuf }
 GetEffectivePrompt { session_id: SessionId }
-CompleteSlashCommandArgs { session_id: Option<SessionId>, command_name: String, prefix: String }
-GetSlashCommandCatalog { session_id: Option<SessionId> }
-SubmitCommandInteraction { interaction_id: InteractionId, selection: InteractionSelection, form_values: serde_json::Value }
+SuggestCommand { session_id: SessionId, input: String, cursor: usize }
+GetCommandCatalog { session_id: SessionId }
+SubmitInteraction { interaction_id: InteractionId, selection: InteractionSelection, form_values: serde_json::Value }
 SetToolPolicy { session_id: SessionId, policy: ToolPolicyConfig }
 SetToolApprovalMode { session_id: SessionId, mode: ToolApprovalMode }
 ExportSession { session_id: SessionId, format: ExportFormat }
@@ -210,8 +224,8 @@ pub enum EventMsg {
     Queue(QueueEvent),
     Usage(UsageEvent),
     Resources(ResourcesEvent),
-    SlashCommand(SlashCommandEvent),
-    CommandPresentation(CommandPresentationEvent),
+    CommandCatalog(CommandCatalogEvent),
+    CommandResult(CommandResultEvent),
     Skill(SkillEvent),
     PromptTemplate(PromptTemplateEvent),
     Compaction(CompactionEvent),
@@ -303,11 +317,11 @@ pub enum ResourcesEvent {
     Changed { workspace_id: WorkspaceId, cwd: PathBuf, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
 }
 
-pub enum SlashCommandEvent {
-    CatalogChanged { workspace_id: WorkspaceId, session_id: Option<SessionId>, revision: SlashCommandCatalogRevision, commands: Vec<SlashCommandSummary> },
+pub enum CommandCatalogEvent {
+    Changed { workspace_id: WorkspaceId, session_id: SessionId, revision: CommandCatalogRevision, commands: Vec<CommandNodeSummary> },
 }
 
-pub enum CommandPresentationEvent {
+pub enum CommandResultEvent {
     OutputAppended { command_id: CommandId, session_id: Option<SessionId>, output_id: CommandOutputId, output: CommandOutput },
     InteractionRequested { command_id: CommandId, session_id: Option<SessionId>, interaction_id: InteractionId, request: UiInteractionRequest },
     InteractionResolved { interaction_id: InteractionId, resolution: InteractionResolution },
@@ -374,9 +388,9 @@ pub enum EventScope {
 }
 ```
 
-命令呈现类型用于把 `/status`、`/usage`、`/model`、`/help` 这类用户命令的结果表达成 UI 可渲染的语义对象。它们不是模型消息，不进入 `TurnState.messages`，也不替代业务事件；业务事实仍由 `session_model_changed`、`resources_changed`、`usage_updated`、`run_finished` 等事件表达。
+命令结果类型用于把 `/status`、`/usage`、`/model`、`/help` 这类用户命令的结果表达成 UI-safe、display-neutral 的语义对象。它们不是模型消息，不进入 `TurnState.messages`，也不替代业务事件；业务事实仍由 `session_model_changed`、`resources_changed`、`usage_updated`、`run_finished` 等事件表达。
 
-如果 `CommandPresentationEvent` 或 `UiInteractionRequest` 中携带 `command_id`，它必须与外层 `agent_runtime_protocol::Event.command_id` 一致。外层 `Event` 仍是 routing、ordering 和 correlation 的权威位置；内层字段只是为了 UI 组件在脱离事件上下文渲染时仍能关联原始命令。
+如果 `CommandResultEvent` 或 `UiInteractionRequest` 中携带 `command_id`，它必须与外层 `agent_runtime_protocol::Event.command_id` 一致。外层 `Event` 仍是 routing、ordering 和 correlation 的权威位置；内层字段只是为了 UI 组件在脱离事件上下文渲染时仍能关联原始命令。
 
 ```rust
 pub struct CommandOutput {
@@ -384,7 +398,7 @@ pub struct CommandOutput {
     pub body: Option<String>,
     pub severity: CommandOutputSeverity,
     pub blocks: Vec<CommandOutputBlock>,
-    pub actions: Vec<CommandOutputAction>,
+    pub actions: Vec<CommandOutputActionRef>,
 }
 
 pub enum CommandOutputSeverity {
@@ -407,36 +421,30 @@ pub struct KeyValueRow {
     pub value: String,
 }
 
-pub struct CommandOutputAction {
+pub struct CommandOutputActionRef {
     pub label: String,
-    pub command: Option<CommandAction>,
+    pub action_id: Option<CommandActionId>,
+    pub risk: CommandActionRisk,
 }
 
-pub enum CommandAction {
-    ExecuteSlashCommand { raw: String },
-    DispatchCommand(Command),
-    OpenInteraction { interaction_id: InteractionId },
+pub enum CommandActionRisk {
+    DisplayOnly,
+    ReparseCommandText,
+    RuntimeOwnedAction,
 }
+
+pub struct CommandActionId(pub String);
 
 pub struct UiInteractionRequest {
     pub interaction_id: InteractionId,
     pub command_id: CommandId,
     pub session_id: Option<SessionId>,
     pub title: String,
-    pub kind: UiInteractionKind,
     pub items: Vec<UiInteractionItem>,
     pub initial_selection: Option<String>,
     pub allow_search: bool,
     pub allow_multi_select: bool,
-    pub submit: UiInteractionSubmit,
-}
-
-pub enum UiInteractionKind {
-    Picker,
-    MultiSelect,
-    Menu,
-    Form,
-    DetailView,
+    pub submit: InteractionSubmitPolicy,
 }
 
 pub struct UiInteractionItem {
@@ -447,19 +455,29 @@ pub struct UiInteractionItem {
     pub disabled: bool,
     pub disabled_reason: Option<String>,
     pub children: Vec<UiInteractionItem>,
-    pub metadata: serde_json::Value,
+    pub command_ref: Option<CommandNodeRef>,
 }
 
-pub struct CommandTemplate {
-    pub command_name: String,
-    pub args_template: serde_json::Value,
-}
-
-pub enum UiInteractionSubmit {
-    ExecuteSlashCommandTemplate { template: String },
-    DispatchCommandTemplate { command: CommandTemplate },
+pub enum InteractionSubmitPolicy {
     SubmitInteraction { interaction_id: InteractionId },
+    ExecuteCatalogCommand { selection: CommandSelection },
+    DisplayOnly,
 }
+
+pub struct CommandSelection {
+    pub command_key: CommandKey,
+    pub catalog_revision: CommandCatalogRevision,
+    pub bindings: BTreeMap<String, String>,
+}
+
+pub struct CommandArgs(pub serde_json::Value);
+
+pub struct CommandNodeRef {
+    pub command_key: CommandKey,
+    pub path: Vec<String>,
+}
+
+pub struct CommandKey(pub String);
 
 pub enum InteractionSelection {
     Single { item_id: String },
@@ -477,7 +495,7 @@ pub struct CommandOutputId(pub String);
 pub struct InteractionId(pub String);
 ```
 
-`UiInteractionRequest` 是语义请求，不是 UI 组件 API。TUI 可以把 `Picker` 渲染成终端浮层和键盘上下选择；Tauri/Vue 可以渲染成 modal、command palette 或带搜索的列表。`Popup` 是 command output 的展示目标提示，不代表必须等待用户提交的 interaction。MVP 中，交互选择可以通过 `ExecuteSlashCommandTemplate` 重新提交 slash command，例如 model picker 选中后提交 `/model {item.id}`；复杂表单再使用后续的 `SubmitCommandInteraction`。`InteractionResolved` 只在 runtime 跟踪 pending interaction 或实现 `SubmitCommandInteraction` 后需要发布。
+`UiInteractionRequest` 是 display-neutral 语义请求，不是 UI 组件 API。TUI 可以把候选渲染成终端浮层和键盘上下选择；Tauri/Vue 可以渲染成 modal、command palette 或带搜索的列表。它不能携带完整 `AgentCommand`，也不能携带自由命令模板或 runtime-provided raw command text。交互选择必须回到 runtime 重新执行 `ExecuteCatalogCommand` 或 runtime-tracked `SubmitInteraction`，并再次 materialize/resolve/authorize。用户主动在命令输入框键入的文本仍走 `ExecuteCommandText`。`InteractionResolved` 只在 runtime 跟踪 pending interaction 或实现 `SubmitInteraction` 后需要发布。
 
 usage 和 context usage 的完整语义见 [UsageStats](usage-stats.md)。协议层只定义 UI 需要消费的 view：
 
@@ -623,10 +641,10 @@ UI/wire event type 映射：
 | `UsageEvent::Updated` | `usage_updated` |
 | `ResourcesEvent::ReloadStarted` | `resources_reload_started` |
 | `ResourcesEvent::Changed` | `resources_changed` |
-| `SlashCommandEvent::CatalogChanged` | `slash_commands_changed` |
-| `CommandPresentationEvent::OutputAppended` | `command_output_appended` |
-| `CommandPresentationEvent::InteractionRequested` | `command_interaction_requested` |
-| `CommandPresentationEvent::InteractionResolved` | `command_interaction_resolved` |
+| `CommandCatalogEvent::Changed` | `command_catalog_changed` |
+| `CommandResultEvent::OutputAppended` | `command_output_appended` |
+| `CommandResultEvent::InteractionRequested` | `command_interaction_requested` |
+| `CommandResultEvent::InteractionResolved` | `command_interaction_resolved` |
 | `SkillEvent::Invoked` | `skill_invoked` |
 | `PromptTemplateEvent::Invoked` | `prompt_template_invoked` |
 | `CompactionEvent::Started` | `compaction_started` |
@@ -640,7 +658,7 @@ UI/wire event type 映射：
 
 事件是实时下游界面更新的唯一来源。CLI、Ratatui 和 Tauri/Vue 宿主都应把同一条事件流 reduce 成各自的 UI 状态。`run_finished` 是唯一 run terminal event；不要同时发 `run_aborted` 这类第二终态。`run_suspended` / `run_resumed` 是 current run 的可恢复中间态事件，不是终态。
 
-`command_interaction_resolved` 是后续可选事件。MVP 中 picker/menu/form 的选择结果可以直接触发新的 `ExecuteSlashCommand`，不要求 runtime 跟踪 pending interaction；只有实现 `SubmitCommandInteraction` 或需要审计 interaction 关闭/提交时，才需要发布 resolved 事件。
+`command_interaction_resolved` 是后续可选事件。MVP 中候选选择结果可以直接触发新的 `ExecuteCatalogCommand`，不要求 runtime 跟踪 pending interaction；只有实现 `SubmitInteraction` 或需要审计 interaction 关闭/提交时，才需要发布 resolved 事件。用户主动键入命令文本仍可走 `ExecuteCommandText`，但 interaction request 本身不能携带 raw command text。
 
 压缩相关 view 类型只暴露 UI 需要的信息：
 
@@ -686,7 +704,7 @@ pub struct RuntimeSnapshot {
     pub models: Vec<ModelSummary>,
 
     pub resources: ResourceSnapshotSummary,
-    pub command_surface: CommandSurfaceSnapshot,
+    pub command: CommandSnapshot,
 }
 
 pub struct SessionSnapshot {
@@ -733,8 +751,10 @@ pub struct ResourceSnapshotSummary {
     pub diagnostics: Vec<ResourceDiagnostic>,
 }
 
-pub struct CommandSurfaceSnapshot {
-    pub slash_commands: Vec<SlashCommandSummary>,
+pub struct CommandSnapshot {
+    pub revision: CommandCatalogRevision,
+    pub commands: Vec<CommandNodeSummary>,
+    pub diagnostics: Vec<CommandDiagnostic>,
 }
 ```
 
@@ -756,52 +776,54 @@ pub struct TextResourceSummary { pub source: ResourceSourceInfo, pub kind: TextR
 pub struct ResourceRevision(pub u64);
 ```
 
-斜杠命令摘要只暴露 autocomplete / command palette 需要的信息，不代表执行授权：
+命令摘要只暴露 autocomplete / command palette / 嵌套菜单需要的信息，不代表执行授权：
 
 ```rust
-pub struct SlashCommandSummary {
-    pub name: String,
-    pub aliases: Vec<String>,
+pub struct CommandNodeSummary {
+    pub command_key: CommandKey,
+    pub parent: Option<CommandKey>,
+    pub segment: String,
+    pub path: Vec<String>,
+    pub title: String,
     pub description: Option<String>,
-    pub source: SlashCommandSource,
+    pub source: CommandSource,
     pub source_info: Option<ResourceSourceInfo>,
-    pub argument_hint: Option<String>,
-    pub presentation_hint: Option<CommandPresentationHint>,
-    pub availability: SlashCommandAvailability,
-    pub phase_policy: SlashCommandPhasePolicy,
+    pub args_hint: Option<String>,
+    pub availability: CommandAvailability,
+    pub phase_policy: CommandPhasePolicy,
+    pub descriptor_fingerprint: String,
 }
 
-pub enum CommandPresentationHint {
-    MessagePanel,
-    Popup,
-    Picker,
-    Menu,
-    Form,
-    DetailView,
-}
+pub struct CommandCatalogRevision(pub u64);
 
-pub struct SlashCommandCatalogRevision(pub u64);
-
-pub enum SlashCommandSource {
+pub enum CommandSource {
     Builtin,
     Skill,
     PromptTemplate,
+    Model,
+    Tool,
+    Session,
     Extension,
-    ModelServiceTier,
 }
 
-pub enum SlashCommandAvailability {
+pub enum CommandAvailability {
     Available,
     Disabled { reason: String },
     Hidden,
 }
 
-pub enum SlashCommandPhasePolicy {
+pub enum CommandPhasePolicy {
     IdleOnly,
     AllowedDuringRun,
     QueueAsSteer,
     QueueAsFollowUp,
     ImmediateRuntimeAction,
+}
+
+pub struct CommandDiagnostic {
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub source: Option<ResourceSourceInfo>,
 }
 ```
 
@@ -815,7 +837,7 @@ Ratatui：
 
 ```text
 keyboard/input event
-  → agent_runtime_protocol::Command
+  → agent_runtime_protocol::AgentCommand
   → AgentRuntime.dispatch
 agent_runtime_protocol::Event stream
   → app state reducer

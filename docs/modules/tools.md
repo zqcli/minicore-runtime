@@ -265,7 +265,7 @@ pub enum ToolPolicyDecision {
 
 `ToolApprovalPreview` 不由 `ToolPolicy` 构造。diff preview、patch preview、bash command preview 等可能需要 I/O 或 path canonicalization，应由 `ToolInvocationPlanner` 在 policy 前准备；policy 只决定是否需要 approval 和原因。
 
-`ToolApprovalBroker` 只管理当前 pending approval：冻结 `prepared_args`，触发 `tool_call_approval_requested`，等待 `agent_runtime_protocol::Command::DecideToolApproval`。长期授权归 `ToolApprovalGrantStore`。
+`ToolApprovalBroker` 只管理当前 pending approval：冻结 `prepared_args`，触发 `tool_call_approval_requested`，等待 `agent_runtime_protocol::AgentCommand::DecideToolApproval`。长期授权归 `ToolApprovalGrantStore`。
 
 ```rust
 pub struct PendingToolApproval {

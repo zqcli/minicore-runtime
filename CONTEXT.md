@@ -25,8 +25,8 @@ _避免_：前端运行时、浏览器应用
 _避免_：WebView SDK、前端 Agent
 
 **AgentRuntimeProtocol**：
-界面适配器与 Agent 运行时之间的稳定通信协议，由 `agent_runtime_protocol::Command`、`Event`、`EventMsg`、`RuntimeSnapshot` 和 `CommandAck` 等协议类型组成。
-_避免_：运行时桥接、直接导入 SDK、UI 回调
+界面适配器与 Agent 运行时之间的稳定通信协议，由 `agent_runtime_protocol::AgentCommand`、`Event`、`EventMsg`、`RuntimeSnapshot` 和 `CommandAck` 等协议类型组成。`AgentCommand` 表示 UI/host 提交给 `AgentRuntime` 的协议级用户意图，不是 command 子系统本身。
+_避免_：运行时桥接、直接导入 SDK、UI 回调、command 子系统
 
 **AgentRuntimeEvents**：
 描述 `agent_runtime_protocol::Event` 的命名、顺序、所有权、重连和生命周期规则。它不是事件类型定义本身，也不是会话持久化日志。
@@ -57,8 +57,8 @@ _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文
 _避免_：当前 focused session 的可变大包、每 session 服务容器、UI 服务
 
 **WorkspaceServices**：
-绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、`CommandSurfaceService`、`RuntimeHookRegistry`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
-_避免_：单会话运行态、focused session 服务、UI 服务
+绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`RuntimeHookRegistry`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。它不随 session focus 切换而重建。
+_避免_：单会话运行态、focused session 服务、UI 服务、有状态 CommandSurfaceService
 
 **ResourceManager**：
 运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、ensure/reload/recompose 和 turn capture。初始化由 `OpenWorkspace -> ensure_runtime_snapshot`、`OpenSession/NewSession -> ensure_cwd_snapshot`、`start_user_turn -> capture_turn` 三道调用保证；它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
@@ -101,7 +101,7 @@ _避免_：会话管理器、UI 会话状态
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
-`RuntimeHooks` 模块管理的内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和命令呈现等流程中返回 typed decision / patch / replacement。当前设计不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
+`RuntimeHooks` 模块管理的内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前设计不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
 _避免_：UI 回调、协议事件、插件系统、任意 runtime 后门
 
 **运行时 Hook 注册表（`RuntimeHookRegistry`）**：
@@ -201,36 +201,52 @@ _避免_：资源正文、提示词素材、完整运行时资源
 _避免_：完整 prompt、用户消息、工具描述、实时资源查询
 
 **CommandSurface**：
-Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令面，负责命令目录、`/...` 文本解析、执行规划、运行时命令映射和命令呈现语义。它不是 UI 输入框，也不是 `agent_runtime_protocol::Command` enum 本身。
-_避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop
+Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令领域面。它不是一个有状态 service 名；实现上由共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` 共同组成。
+_避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop、有状态 CommandSurfaceService
 
-**斜杠命令**：
-用户以 `/` 开头输入的运行时命令入口，例如 `/compact`、`/reload`、`/skill:name` 或 `/{template}`。它是命令入口语法，不是 Agent 消息类型，也不是工具调用。
-_避免_：聊天消息、工具命令、UI 快捷键
+**AgentCommand**：
+`agent_runtime_protocol::AgentCommand`，下游 adapter 提交给 `AgentRuntime` 的公开协议命令枚举，例如 `SubmitPrompt`、`ExecuteCommandText`、`ExecuteCatalogCommand`、`DecideToolApproval`、`ReloadResources`。它表达用户意图，不代表 command tree 节点，也不应包含高权限内部 mutation。
+_避免_：command::Command、UI action payload、内部调试 API
 
-**斜杠命令目录**：
-运行时提供给界面适配器的命令摘要集合，包含命令名、来源、说明、参数提示和当前可用性。它用于 autocomplete 和 command palette，不等同于执行授权。
-_避免_：命令执行器、工具注册表、资源目录
+**CommandManager**：
+`WorkspaceServices` 持有的共享、无状态命令管理器。它持有只读 command packs、candidate provider registry 和 handler registry；每次调用时基于传入 `CommandContext` 临时 materialize command catalog，并执行 parse、suggest、`resolve_for_execution`。
+_避免_：SessionRuntime 子系统、catalog cache、UI 菜单状态、执行工具或模型的 service
 
-**斜杠命令解析器**：
-把 `/...` 文本解析成已有运行时命令、技能调用、提示模板调用或受控查询的运行时能力。解析器必须遵守会话阶段、资源 revision、信任和权限边界。
-_避免_：UI 输入框逻辑、Agent loop、shell parser
+**Command（session-scoped）**：
+`SessionRuntime` 持有的命令入口 facade。它不缓存 catalog，只负责从当前 session 组装 `CommandContext` 和 `SessionCommandHost`，再调用共享 `CommandManager`。
+_避免_：agent_runtime_protocol::AgentCommand、全局命令服务、UI command palette
 
-**斜杠命令执行计划**：
-斜杠命令解析后形成的意图归类，说明这次命令应进入运行时命令、受控查询、模型可见输入、界面交互请求还是用户可见错误。
-_避免_：执行结果、UI 组件、Agent run
+**CommandNode / CommandPath**：
+命令树中的节点与路径。`CommandPath` 可以任意深度，例如 `/model thinking high`、`/model provider openai gpt-5`、`/skill code-review ...`。有限集合和动态候选应作为 command nodes，而不是被塞进普通 args。
+_避免_：固定二级 subcommand、自由文本参数、UI 菜单项本身
 
-**命令呈现**：
-运行时把用户命令的结果或下一步交互需要表达成界面可渲染语义的过程。它可以产生命令输出、选择器、弹窗、菜单或表单，但不等同于后端业务事实本身。
-_避免_：CommandAck、业务事件、前端组件实现
+**Command Manifest**：
+多层 JSON command pack，使用 `nodeType`、`children`、`dynamic`、`provider`、`bind`、`nodeTemplate`、`args` 和 `handler` 描述命令树骨架与动态节点投影规则。它是命令定义格式，不是 UI schema，也不能读文件或执行代码。
+_避免_：平铺 parent 配置、前端菜单配置、插件脚本
+
+**Command Candidate Provider**：
+把当前 session 的安全摘要投影成动态 command candidates 的可信 provider，例如 `resources.skills`、`resources.prompt_templates`、`models.current.thinking_levels`、`tools.available`。Provider 只能读取 `CommandContext` 中的 UI-safe view，不读取技能正文、模板正文、凭据或 raw provider payload。
+_避免_：资源 loader、文件扫描器、UI autocomplete 函数、任意查询执行器
+
+**命令文本**：
+用户或 UI 提交给 `ExecuteCommandText` 的文本形式命令。`/...` slash command 是命令文本的一种常见语法；同一 command 也可以来自 `ExecuteCatalogCommand` 的结构化 catalog selection。
+_避免_：普通用户 prompt、shell 命令、Agent 消息类型
+
+**命令目录**：
+运行时基于当前 session context 临时 materialize 给界面适配器的命令摘要集合，包含 command key、path、来源、说明、参数提示和当前可用性。它用于 autocomplete、command palette 和嵌套菜单，不等同于执行授权。
+_避免_：命令执行器、工具注册表、资源目录、持久化 catalog
+
+**命令解析 / resolve**：
+`CommandManager` 将命令文本或 catalog selection 解析成 command node、dynamic bindings 和 args，并在执行前重新校验 command 是否仍存在、参数是否合法、phase/trust/capability 是否允许、handler binding 是否可信。
+_避免_：UI 输入框逻辑、Agent loop、shell parser、一次性 planner
 
 **命令输出**：
-由用户命令产生的界面可见说明，例如 `/status` 摘要、`/usage` 统计、`/model` 设置完成提示或解析错误。它可以显示在消息面板中，但不是模型可见消息。
-_避免_：助手消息、工具结果、会话条目
+由用户命令产生的界面可见说明，例如 `/status` 摘要、`/usage` 统计、`/model` 设置完成提示或解析错误。它可以显示在消息面板中，但不是模型可见消息，也不能携带完整 `AgentCommand`。
+_避免_：助手消息、工具结果、会话条目、UI action command
 
 **命令交互请求**：
-运行时要求界面展示一个交互控件的语义请求，例如模型选择器、思考等级选择器、会话选择器、弹窗、菜单或表单。具体如何渲染由界面适配器决定。
-_避免_：前端回调、UI 组件实例、运行时状态修改
+运行时要求界面展示候选或收集输入的 display-neutral 请求。具体如何渲染成 picker、菜单、modal 或表单由界面适配器决定；提交时必须回到 runtime 的 `ExecuteCatalogCommand`、`ExecuteCommandText` 或 runtime-tracked interaction，不得携带完整 mutation command。
+_避免_：前端回调、UI 组件实例、运行时状态修改、Command payload
 
 **消息面板项**：
 界面消息面板中展示的一项内容，可以是用户消息、助手消息、工具活动、运行时通知或命令输出。并非所有消息面板项都会进入模型上下文。
@@ -290,7 +306,7 @@ _避免_：所有工具、工具开关 UI
 _避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 
 **工具审批代理（`ToolApprovalBroker`）**：
-`Tools` 子系统内部的 pending approval 状态机。它保存等待用户确认的工具调用，冻结 prepared args，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::Command::DecideToolApproval`。
+`Tools` 子系统内部的 pending approval 状态机。它保存等待用户确认的工具调用，冻结 prepared args，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::AgentCommand::DecideToolApproval`。
 _避免_：UI 回调、策略判断器、长期授权存储、工具执行器
 
 **待审批工具调用（`PendingToolApproval`）**：

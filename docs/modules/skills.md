@@ -28,7 +28,7 @@ skills.rs
   provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
 
 SessionRuntime
-  owns: /skill:name 或 InvokeSkill 的展开、从 captured TurnResourceSnapshot 取正文、<skill> 块构造、user message 构造、入队或启动 run
+  owns: /skill <name>、兼容 /skill:name 或 InvokeSkill 的展开、从 captured TurnResourceSnapshot 取正文、<skill> 块构造、user message 构造、入队或启动 run
 ```
 
 `skills.rs` 可以被 `ResourceManager` 和 `SessionRuntime` 同时调用，但它本身不是 runtime service。模型可见技能的生命周期和 cwd-over-runtime overlay 由 `ResourceManager` 负责。
@@ -50,7 +50,7 @@ SessionRuntime
 | reload / ensure / recompose 生命周期 | 否 | 是 |
 | 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
 | `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
-| `/skill:name` raw input 解析 | 否 | 否，属于 `CommandSurface` |
+| `/skill <name>` / `/skill:name` command text 解析 | 否 | 否，属于 `CommandManager.resolve_for_execution` |
 | `InvokeSkill` 构造 user message | 否，提供格式化 helper | 否，属于 `SessionRuntime` |
 
 一句话：`skills.rs` 负责“skill 长什么样、如何解析、如何格式化”；`ResourceManager` 负责“skill 从哪里来、何时加载、如何分层覆盖、哪一版对当前 turn 可见”。
@@ -203,7 +203,7 @@ When a skill file references a relative path, resolve it against the skill direc
 显式调用属于 `SessionRuntime`：
 
 ```text
-InvokeSkill 或 /skill:name
+InvokeSkill、/skill <name> 或兼容 /skill:name
   → SessionRuntime capture TurnResourceSnapshot
   → 从 turn.cwd.resolved.skills 查找 selected SkillResource
   → skills::format_skill_block(metadata, body)
@@ -232,7 +232,7 @@ References are relative to /abs/path.
 
 1. `SessionRuntime` 从当前 session leaf 重建已有上下文消息。
 2. `SessionRuntime` capture `TurnResourceSnapshot`。
-3. `SessionRuntime` 解析 `/skill:name` 或处理结构化 `InvokeSkill`。
+3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `InvokeSkill`；`SessionRuntime` 处理该结构化 intent。
 4. `SessionRuntime` 从 `turn.cwd.resolved.skills` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块。
 5. 格式化后的内容作为新的 user message 进入本次 `DriveEntry::Prompt` 或进入队列。
 6. `SessionRuntime` 基于 active tools、context files 和可见技能摘要重建 system prompt。

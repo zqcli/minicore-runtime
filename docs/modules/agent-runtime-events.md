@@ -19,7 +19,7 @@
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
 7. 流式 delta 不是持久化事实；`persistence_save_point` 才是“此前相关 session writes 已经落盘”的 durable barrier。
 8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry，并且 phase 已经回到 `idle`。
-9. 同步命令接收用 `CommandAck` 表达；异步执行结果和用户可见命令呈现用 `agent_runtime_protocol::Event` 表达。
+9. 同步命令接收用 `CommandAck` 表达；异步执行结果和用户可见命令结果用 `agent_runtime_protocol::Event` 表达。
 10. `session_focus_changed` 是 runtime-visible event，表示默认会话目标改变；它不表示 session loaded、running 或 closed。
 
 ## Naming Convention
@@ -155,7 +155,7 @@ agent_runtime_protocol::EventMsg
 | assistant message stream | 必填 | 必填 | 必填 | 启动 run 的命令 id |
 | tool call | 必填 | 必填 | 必填 | 启动 run 的命令 id；审批响应另有自己的 command id |
 | compaction | 必填 | 必填 | 可空 | 手动 compact 命令 id；自动压缩可空 |
-| command presentation | 可空或相关 workspace | 可空或目标 session | 通常 `None` | 触发展示的命令 id |
+| command result | 可空或相关 workspace | 可空或目标 session | 通常 `None` | 触发输出或交互请求的命令 id |
 | persistence save point | 必填 | 必填 | 可空 | 导致写入的命令 id 或 run command id |
 | settled | 必填 | 必填 | `None` | 通常可空 |
 
@@ -202,12 +202,12 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 
 ## Command Ack
 
-`agent_runtime_protocol::CommandAck` 只说明命令是否被运行时接收，不返回助手文本，也不返回 slash command 的查询或展示结果。事件文档只解释它和异步事件的关系，结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
+`agent_runtime_protocol::CommandAck` 只说明命令是否被运行时接收，不返回助手文本，也不返回 command text 的查询或展示结果。事件文档只解释它和异步事件的关系，结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
 
 原则：
 
 - runtime 无法接收或无法路由的命令，例如 runtime 已关闭、workspace 不存在、目标 session id 无效，返回 `CommandAck { accepted: false }` 或 `RuntimeError`。
-- 对 `ExecuteSlashCommand`，unknown command、参数非法、phase 不允许这类用户级错误，优先返回 `CommandAck { accepted: true }`，再发 `command_output_appended { severity: Error }`，让下游 CLI/TUI/GUI 的 message panel 或等价输出呈现一致。
+- 对 `ExecuteCommandText` / `ExecuteCatalogCommand`，unknown command、参数非法、phase 不允许这类用户级错误，优先返回 `CommandAck { accepted: true }`，再发 `command_output_appended { severity: Error }`，让下游 CLI/TUI/GUI 的 message panel 或等价输出呈现一致。
 - 已接受命令的后续成功、失败、审批、流式输出，都通过 `agent_runtime_protocol::Event`。
 - UI 不应把 `CommandAck` 当成最终状态，只能当成“命令进入运行时”的确认。
 
@@ -222,8 +222,8 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 | queue lifecycle | `queue_updated` | 每次队列变化发完整队列摘要 | 是 |
 | usage lifecycle | `usage_updated` | 模型调用、run 结束、压缩或 prompt material 改变后替换 usage/context view | 是 |
 | resource lifecycle | `resources_reload_started`、`resources_changed` | reload started -> committed revision | 是 |
-| slash command catalog | `slash_commands_changed` | catalog revision changed | 是 |
-| command presentation | `command_output_appended`、`command_interaction_requested`、`command_interaction_resolved` | 用户命令产生 message panel / popup 输出、picker/menu/form 请求或交互结果 | 部分；取决于是否持久化 UI-only panel item |
+| command catalog | `command_catalog_changed` | catalog revision changed | 是 |
+| command result | `command_output_appended`、`command_interaction_requested`、`command_interaction_resolved` | 用户命令产生 UI-safe 输出、display-neutral interaction 请求或交互结果 | 部分；取决于是否持久化 UI-only panel item |
 | compaction lifecycle | `compaction_started`、`compaction_finished` | started -> finished | 是 |
 | retry lifecycle | `retry_auto_started`、`retry_auto_finished` | started -> finished | 是 |
 | diagnostics | `diagnostics_runtime_changed`、`diagnostics_error`、`diagnostics_warning` | 离散或替换式 | 部分 |
@@ -234,13 +234,13 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 
 | Source | 可以发 UI `agent_runtime_protocol::Event` 吗 | 说明 |
 | --- | --- | --- |
-| `AgentRuntime` | 可以 | workspace、session open/close/focus/list/delete、runtime diagnostics、resource reload 入口、slash command catalog 和 command presentation。 |
+| `AgentRuntime` | 可以 | workspace、session open/close/focus/list/delete、runtime diagnostics、resource reload 入口、command catalog 和 command result。 |
 | `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、message persistence、compaction、retry、save point。 |
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `Tools` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
 | `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 `TurnResourceSnapshot` 并重建 prompt。 |
-| `CommandSurface` | 不直接发 UI event | 返回 command catalog、parse/plan 结果和 command presentation；`AgentRuntime` 发布 `slash_commands_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 protocol command。 |
+| `CommandSurface` / `CommandManager` | 不直接发 UI event | 返回 command catalog、parse/suggest/resolve 结果和 UI-safe command output；`AgentRuntime` 发布 `command_catalog_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 `AgentCommand` / session command handler。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
 | `RuntimeHooks` | 不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
 
@@ -254,15 +254,15 @@ MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继
 
 | 层级 | 持有/管理的状态 | 负责发布或归约的 UI wire events | 只消费/返回，不拥有的事件 |
 | --- | --- | --- | --- |
-| UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::Command` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
-| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command presentation dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`slash_commands_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
+| UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
+| `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
 | `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle` 写入结果、hook 结果 |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor/hook；返回 `ToolBatchResult` |
 | `ToolExecutor` | 单个工具执行过程和底层副作用句柄 | 不发布 UI event；只返回 result 和 progress chunk | 被 `Tools` 调用 |
 | `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
-| `CommandSurface` | `SlashCommandCatalog` projection、name conflict diagnostics、phase policy、raw invocation parse result、execution plan、presentation plan | 不发布 UI event；返回 catalog、plan 或 `CommandPresentation` | `AgentRuntime` 发布 `slash_commands_changed` 和 command presentation events；`SessionRuntime` 执行 session-scoped command |
+| `CommandSurface` / `CommandManager` | command catalog materialization、name conflict diagnostics、phase policy、command text parse result、suggestion、execution resolve | 不发布 UI event；返回 catalog、suggestion、resolved invocation 或 UI-safe command result | `AgentRuntime` 发布 `command_catalog_changed` 和 command output events；`SessionRuntime.command` 执行 session-scoped command |
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
 | `Prompt` | 无生命周期状态；纯构建输入到输出 | 不发布事件 | 被 `SessionRuntime` 调用 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
@@ -286,7 +286,7 @@ EventBus
 
 WorkspaceServices
   ├─ SessionManager / SessionIndex
-  ├─ CommandSurfaceService
+  ├─ CommandManager
   ├─ RuntimeHookRegistry
   ├─ RuntimeDiagnostics
   ├─ ResourceManager
@@ -310,7 +310,7 @@ session_focus_changed
 diagnostics_runtime_changed
 resources_reload_started
 resources_changed
-slash_commands_changed
+command_catalog_changed
 command_output_appended
 command_interaction_requested
 command_interaction_resolved
@@ -653,33 +653,34 @@ Created in UI
 事件/返回值：
 
 - `CommandAck { accepted: true }`：命令已进入运行时，后续看事件。
-- `CommandAck { accepted: false }`：运行时无法接收或路由该命令，或结构化命令在 preflight 中被同步拒绝。对 `ExecuteSlashCommand` 的用户级错误，优先用 `command_output_appended { severity: Error }` 呈现。
+- `CommandAck { accepted: false }`：运行时无法接收或路由该命令，或结构化命令在 preflight 中被同步拒绝。对 `ExecuteCommandText` / `ExecuteCatalogCommand` 的用户级错误，优先用 `command_output_appended { severity: Error }` 呈现。
 - `RuntimeError`：transport、runtime fatal 或命令无法被解释。
 
 不推荐给每个命令都发 `command_started/command_finished`，因为多数命令的业务状态已有更深事件表达，例如 `run_started`、`resources_reload_started`、`session_opened`。
 
-### 2. Slash Command Lifecycle
+### 2. Command Text Lifecycle
 
-Slash command 是 `agent_runtime_protocol::Command::ExecuteSlashCommand` 的业务处理过程。它使用四阶段模型，但不把每个阶段都暴露成 UI lifecycle event：
+Command text 是 `agent_runtime_protocol::AgentCommand::ExecuteCommandText` 的业务处理过程；`/...` slash command 只是常见文本语法。它使用 materialize / parse / resolve / handler 模型，但不把每个阶段都暴露成 UI lifecycle event：
 
 ```text
-Accepted ExecuteSlashCommand
-  → Parse raw "/..."
-  → Plan as protocol command / runtime query / prompt input / interaction / rejection
-  → Execute through backend owner
-  → Present as command output or interaction request
+Accepted ExecuteCommandText
+  → materialize current catalog
+  → parse raw text such as "/..."
+  → resolve as trusted handler / protocol intent / runtime query / prompt input / rejection
+  → execute through backend owner
+  → emit command output or display-neutral interaction request
 ```
 
 对应事件：
 
-- `slash_commands_changed`：catalog projection 变化，不表示某个 slash invocation 正在执行。
+- `command_catalog_changed`：catalog projection 变化，不表示某个 command invocation 正在执行。
 - `command_output_appended`：用户命令产生一条 message panel 输出，例如 `/status`、`/usage`、解析错误或 `/model` 设置完成提示。
-- `command_interaction_requested`：用户命令请求 UI 打开 picker、popup、menu、form 或 detail view，例如 `/model`、`/thinking`、`/sessions`。
-- `command_interaction_resolved`：后续事件。只有 runtime 跟踪 pending interaction 或实现 `SubmitCommandInteraction` 时，才需要在 UI 关闭或提交某个 interaction 后发布。
+- `command_interaction_requested`：用户命令请求 UI 展示 display-neutral 候选或收集输入，例如 `/model`、`/thinking`、`/sessions`。runtime 不指定具体 picker、popup、menu、form 或 detail view 组件。
+- `command_interaction_resolved`：后续事件。只有 runtime 跟踪 pending interaction 或实现 `SubmitInteraction` 时，才需要在 UI 关闭或提交某个 interaction 后发布。
 
-不推荐新增 `slash_command_started` / `slash_command_finished`。真正业务状态仍由更深事件表达：`/reload` 产生 `resources_reload_started` / `resources_changed`，`/compact` 产生 `compaction_started` / `compaction_finished`，`/skill:name` 产生 `skill_invoked` / `message_user_appended` / `run_started` / `run_finished`。
+不推荐新增 `command_started` / `command_finished`。真正业务状态仍由更深事件表达：`/reload` 产生 `resources_reload_started` / `resources_changed`，`/compact` 产生 `compaction_started` / `compaction_finished`，`/skill <name>`（兼容 `/skill:name`）产生 `skill_invoked` / `message_user_appended` / `run_started` / `run_finished`。
 
-`CommandPresentationEvent` 是用户可见表达，不是业务事实的唯一来源。UI reducer 应同时消费业务事件更新状态，并消费 command presentation events 更新 message panel 或打开交互控件。
+`CommandResultEvent` 是用户命令结果的 UI-safe 表达，不是业务事实的唯一来源。UI reducer 应同时消费业务事件更新状态，并消费 command result events 更新 message panel 或打开交互控件。
 
 ### 3. Runtime Lifecycle
 
@@ -932,15 +933,15 @@ NotRequired
 
 Required
   -- tool_call_approval_requested --> WaitingUserDecision
-      ├─ approved by agent_runtime_protocol::Command::DecideToolApproval
-      ├─ rejected by agent_runtime_protocol::Command::DecideToolApproval
+      ├─ approved by agent_runtime_protocol::AgentCommand::DecideToolApproval
+      ├─ rejected by agent_runtime_protocol::AgentCommand::DecideToolApproval
       └─ cancelled by abort
 ```
 
 对应事件/命令：
 
 - `tool_call_approval_requested`
-- `agent_runtime_protocol::Command::DecideToolApproval`
+- `agent_runtime_protocol::AgentCommand::DecideToolApproval`
 - approved 后进入 `tool_call_started`
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
@@ -1054,11 +1055,11 @@ Stable(cwd, revision=N)
 
 - `resources_reload_started`
 - `resources_changed`
-- `slash_commands_changed`，如果 skills、prompt templates、extension commands 或 builtin availability 因 reload 改变
+- `command_catalog_changed`，如果 skills、prompt templates、extension commands 或 builtin availability 因 reload 改变
 
 `resources_changed` 必须携带当前有效 `workspace_id`、`cwd` 和 revision。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
 
-`slash_commands_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command_surface` 或该事件中的 catalog 为准。
+`command_catalog_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command` 或该事件中的 catalog 为准。
 
 ### 19. Persistence Lifecycle
 
@@ -1375,7 +1376,7 @@ MVP event lifecycle tests 应覆盖：
 - abort run：只有一个 terminal `run_finished { status: aborted }`。
 - compaction：phase、`compaction_started` / `compaction_finished`、save point、settled 顺序。
 - resource reload failure：旧 revision 不变，diagnostics 更新。
-- slash command view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
-- slash command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过结构化 command 或新的 `ExecuteSlashCommand` 完成设置。
-- slash command semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
+- command text view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
+- command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过 `ExecuteCatalogCommand`、runtime-tracked `SubmitInteraction` 或明确结构化 `AgentCommand` 完成设置；不依赖 interaction request 携带 raw command text。
+- command text semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
 - resync：RuntimeSnapshot sequence 后的事件可正确 reduce。
