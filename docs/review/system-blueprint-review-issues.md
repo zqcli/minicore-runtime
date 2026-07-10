@@ -222,9 +222,9 @@
 
 ### BR-014：手动 `/compact` 运行中行为和 phase policy 冲突
 
-状态：Open
+状态：Resolved
 
-问题：CommandSurface 有 `IdleOnly`、`QueueAsSteer`、`ImmediateRuntimeAction` 等 phase policy，但 Compaction/SessionRuntime 文档描述手动 compact 在非 idle 时会 abort 当前 run 并 wait for idle。这使 `/compact` 隐含了“中止当前任务”的高风险行为。
+原问题：CommandSurface 有 `IdleOnly`、`QueueAsSteer`、`ImmediateRuntimeAction` 等 phase policy，但 Compaction/SessionRuntime 文档描述手动 compact 在非 idle 时会 abort 当前 run 并 wait for idle。这使 `/compact` 隐含了“中止当前任务”的高风险行为。
 
 证据：
 
@@ -233,9 +233,9 @@
 - `docs/modules/compaction.md`：手动压缩流程包含 `abort current run and wait for idle`。
 - `docs/modules/session-runtime.md`：手动 compact 流程在非 idle 时先 abort 当前 run。
 
-风险：用户触发 `/compact` 可能丢失未完成输出、pending tool 或队列语义不明确。
+决策结果：手动 `/compact` / `AgentCommand::Compact` 使用 `CommandPhasePolicy::DeferUntilPostRun`，绝不隐式 abort。session idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，`SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 继续运行。pending action 通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露，不进入模型上下文或 follow-up/next-turn message queue。
 
-待处理方向：明确 `/compact` 默认 `IdleOnly`，或把 abort 行为做成显式确认/单独命令。
+执行顺序固定为：当前 work terminal facts + save point → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ follow-up / next-turn → `session_settled`。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
 
 ### BR-015：ResourceManager 原子快照与技能正文晚读文件不一致
 

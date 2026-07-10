@@ -52,7 +52,7 @@ agent-loop / Agent
 
 关键行为：
 
-- `AgentSession.compact()` 会 abort 当前 agent，发 `compaction_start`，读取 `SessionManager.getBranch()`，调用 `prepareCompaction()`，后期可允许 extension 在 `session_before_compact` hook 中取消或提供摘要，然后 `appendCompaction()`，最后 `buildSessionContext()` 并写回 agent state。
+- pi 的 `AgentSession.compact()` 会 abort 当前 agent，发 `compaction_start`，读取 `SessionManager.getBranch()`，调用 `prepareCompaction()`，允许 extension 在 `session_before_compact` hook 中取消或提供摘要，然后 `appendCompaction()`，最后 `buildSessionContext()` 并写回 agent state。MiniCore 只借鉴压缩准备和上下文重建，不沿用进程内 API 的隐式 abort：公开 `Compact` 在 running 时必须 defer 到 post-run safe point。
 - `_checkCompaction()` 在 agent run 结束后或提交新 prompt 前检查 threshold 和 overflow。
 - `_runAutoCompaction()` 处理自动压缩、context overflow recovery、`willRetry` 和事件。
 - `core/compaction` 的职责是纯压缩逻辑与摘要生成；源码注释明确说 session manager handles I/O, after compaction session is reloaded。
@@ -416,7 +416,12 @@ MessageRecord::CompactionSummary(m) => ModelMessage::User {
 agent_runtime_protocol::AgentCommand::Compact { instructions }
   → AgentRuntime.dispatch
   → SessionRuntime checks phase
-  → abort current run and wait for idle
+  → if idle: start manual compaction now
+  → if active work: store PendingSessionAction::Compact
+      → emit queue_updated { pending_actions: [compact] }
+      → current work continues unchanged
+      → after terminal facts + save point + required retry chain
+      → remove pending action and emit queue_updated
   → phase = compaction
   → emit `session_phase_changed` + `compaction_started { reason: manual }`
   → path = SessionStorage.get_path_to_root(current_leaf)
@@ -433,6 +438,10 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → emit `compaction_finished`
   → phase = idle
 ```
+
+手动 `Compact` 使用 `CommandPhasePolicy::DeferUntilPostRun`。它绝不隐式 abort 当前 run，也不清理 pending approval、resume state 或消息队列。pending compact 是 `SessionRuntime` 持有的结构化 action，不是 follow-up/next-turn message；执行优先级高于普通 queued continuation。
+
+同一 session 同时只允许一个 pending manual compact。重复请求返回 `CompactAlreadyQueued`，保留第一次请求的 instructions；已处于 compaction phase 时返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会清除 pending compact。普通 run failure 如果不再 retry，仍会执行已经排队的 compact。
 
 如果没有可压缩内容，返回结构化错误：`AlreadyCompacted` 或 `NothingToCompact`。
 
@@ -451,6 +460,8 @@ Driver returns DriveResult::Completed
 ```
 
 threshold 压缩成功后不自动重跑刚完成的回答；如果 follow-up/steering/next-turn queue 有消息，压缩后再启动 `DriveEntry::Continue` 或下一次 prompt。
+
+如果 post-run safe point 已有 pending manual compact，先执行 manual compact，并跳过同一 safe point 的 threshold auto compaction，避免连续生成两次摘要。context overflow recovery / immediate retry chain 优先于 pending manual compact；等当前 work chain 稳定结束后再执行用户排队的压缩。
 
 ## Overflow Recovery
 
@@ -494,7 +505,7 @@ session_phase_changed { phase: idle }
 session_settled { session_id, next_turn_count }
 ```
 
-推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → `compaction_finished` → `usage_updated` → `persistence_save_point` → `session_phase_changed(idle)` → `session_settled`。如果 `will_retry = true`，压缩后可以直接启动后续 `run_started`，不先发 `session_settled`。
+立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → `compaction_finished` → `usage_updated` → `persistence_save_point` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true`，压缩后可以直接启动后续 `run_started`，不先发 `session_settled`。
 
 压缩后的 `usage_updated` 主要更新 `ContextUsageView`，不减少 `SessionStatsView.total_usage`。
 

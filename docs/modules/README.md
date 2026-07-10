@@ -44,7 +44,7 @@ SessionRuntime  SessionStorage
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；`LoadedSessionRuntimes` 只是已加载 `SessionRuntime` 的 map，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、队列、资源、模型状态、工具状态、pending session writes 和事件归约；后期只在自己拥有的安全点接入 Hook。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
+`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具状态、pending session writes 和事件归约；后期只在自己拥有的安全点接入 Hook。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、保存点、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
@@ -113,7 +113,7 @@ SessionRuntime  SessionStorage
 | `src/session_storage.rs` | [SessionManager / SessionStorage](session-manager.md) | `SessionHandle`、`SessionStorage` trait、entry/context 重建公共类型。 |
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionStorage](session-manager.md) | JSONL session 文件存储。 |
-| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | 单会话 phase、queue、run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、save point，以及 per-run `SessionDriverHost` wrapper。 |
+| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | 单会话 phase、message queues、`PendingSessionAction`、run/post-run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、save point，以及 per-run `SessionDriverHost` wrapper。 |
 | `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、reload/recompose、diagnostics、prompt materials。 |
 | `src/prompt_templates.rs` | [ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata、解析和显式调用 helper；命令层只消费 metadata。 |
 | `src/command.rs` | [CommandSurface](command-surface.md) | command public module 和常用类型 re-export。 |

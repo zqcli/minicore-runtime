@@ -8,7 +8,7 @@
 - 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；在 message/save point 上追加 session entries；通过 `AgentRuntime` event bus 向 UI 发布 `agent_runtime_protocol::Event`。
 - command 入口：持有 session-scoped `command: Command`，为当前 session 构造 `CommandContext` / `SessionCommandHost`，并调用共享无状态 `CommandManager` 处理 `ExecuteCommandText` / `ExecuteCatalogCommand`。
 - prompt 入口：处理 `SubmitPrompt`，执行输入预检、模型/凭据校验、图片策略、skill 展开和 prompt template 展开；后期可在该安全点接入 `BeforeAgentStart` Hook。
-- 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`；运行中输入必须进入队列，不能绕过当前 run 的顺序。
+- 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`，并持有结构化 `PendingSessionAction`；运行中输入或 deferred session action 不能绕过当前 work 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
 - 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
@@ -37,6 +37,7 @@ SessionRuntime
   ├─ Command
   ├─ Tools
   ├─ QueueState
+  ├─ PendingSessionActions
   ├─ RuntimeHookRegistry        // future hook service view
   └─ Driver
 ```
@@ -322,13 +323,14 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 手动压缩流程：
 
 1. 收到 `agent_runtime_protocol::AgentCommand::Compact { instructions }`。
-2. 若当前 phase 不是 `idle`，先 abort 当前 run 并 wait-for-idle；随后切换到 `SessionPhase::Compaction`。
-3. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
-4. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
-5. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
-6. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
-7. 追加 `SessionEntry::Compaction`，再调用 `SessionHandle` 的上下文构建能力重建 messages。
-8. 发出 `compaction_finished` 和 `persistence_save_point`，随后 phase 回到 `idle` 并发出 `session_settled`；如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
+2. 若 session 已 `idle`，立即进入第 4 步。若存在 active run、waiting approval、suspended run 或立即 retry chain，则保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，发 `queue_updated`，不 abort、不改 phase、不清理任何 message queue。
+3. 当前 work terminal event 和相关 save point 完成后，如果没有立即 retry / overflow recovery，先移除 pending compact 并发 `queue_updated`，再切换到 `SessionPhase::Compaction`；该动作优先于 follow-up / next-turn continuation。若 `AbortRun`、`ClearQueue`、session close 或 shutdown 发生，则移除 pending compact，不启动压缩。重复 `Compact` 返回 `CompactAlreadyQueued`；已处于 compaction phase 返回 `CompactionAlreadyRunning`。
+4. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
+5. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
+6. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
+7. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
+8. 追加 `SessionEntry::Compaction`，再调用 `SessionHandle` 的上下文构建能力重建 messages。
+9. 发出 `compaction_finished` 和 `persistence_save_point`，随后 phase 回到 `idle`；如果还有 follow-up / next-turn，则继续对应 work，否则发出 `session_settled`。如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
 
 自动压缩流程：
 
@@ -354,8 +356,20 @@ overflow recovery 流程：
 - `steerQueue`：运行中注入，尽量在当前工具批次完成后、下一次模型调用前进入上下文。
 - `followUpQueue`：当前 Agent 运行本来要结束时再注入，作为后续用户输入继续执行。
 - `nextTurnQueue`：无论当前是否运行，都排到下一次用户 turn 前，与下一次显式 prompt 一起进入上下文。
+- `PendingSessionActions`：保存不进入模型上下文的结构化 post-run action。当前只支持一个 pending manual compact；它在当前 work chain 稳定结束后、follow-up / next-turn 之前执行。
 
-队列模式支持 `all` 和 `one-at-a-time`。运行时应在队列变化时发出 `queue_updated`，并在 `AbortRun` 时返回被清空的 steering 与 follow-up 消息，供 UI 恢复到编辑器。
+队列模式支持 `all` 和 `one-at-a-time`。运行时应在消息队列或 pending action 变化时发出完整 `queue_updated`。`AbortRun` / `ClearQueue` 清除 pending manual compact；pending action 不作为文本返回编辑器，因为它不是 `QueuedMessage`。
+
+post-run arbitration 顺序固定为：
+
+```text
+terminal run facts + persistence save point
+  → required overflow recovery / immediate retry chain
+  → pending manual compact
+  → threshold auto compaction（若 manual compact 已执行则跳过重复压缩）
+  → follow-up / next-turn continuation
+  → session_settled
+```
 
 Rig 的 `AgentRun` 不一定暴露与 pi `runAgentLoop` 完全相同的运行中注入点，因此实现可以分阶段：MVP 把运行中输入降级为 follow-up；完整实现中由 `Driver` 在 `before_next_model_call` 安全点让 `SessionRuntime` 检查 steering 队列。
 
@@ -369,6 +383,6 @@ Rig 的 `AgentRun` 不一定暴露与 pi `runAgentLoop` 完全相同的运行中
 6. 工具调用通过 `SessionRuntime` 内部的 `Tools` 子系统治理和执行，再由 `Driver` 回填 Rig。
 7. 每个 run 的可恢复边界 flush `pendingSessionWrites`，发出 `persistence_save_point`。
 8. 下一次模型调用前进入 `before_next_model_call` 安全点。
-9. 运行结束时发出唯一终态 `run_finished { status }`；若不会立即进入 retry、compaction 或 queued continuation，再切回 `idle` 并发出 `session_settled`。
+9. 运行结束时发出唯一终态 `run_finished { status }`；按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued continuation。只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 
 如果运行失败，`SessionRuntime` 应构造失败 assistant message或 diagnostic entry，写入会话并发出 `diagnostics_error` + `run_finished { status: failed }`，避免 UI 卡在运行态。

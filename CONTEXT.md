@@ -268,6 +268,10 @@ _避免_：重复后端、UI 专属 Agent
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
 
+**待执行会话动作（`PendingSessionAction`）**：
+`SessionRuntime` 在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。当前 work 完成并落 save point 后，pending action 在 follow-up/next-turn 之前执行。
+_避免_：AgentCommand payload、QueuedMessage、PendingSessionWrites、CommandManager pending action
+
 **当前运行状态（`CurrentRunState`）**：
 `RuntimeSnapshot.active_session.current_run` 中描述当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
 _避免_：RunTerminalStatus、SessionPhase、工具调用状态
