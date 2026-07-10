@@ -326,7 +326,7 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 3. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
 4. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
 5. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
-6. 如果未提供 hook result，则构造 summary request，并通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
+6. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
 7. 追加 `SessionEntry::Compaction`，再调用 `SessionHandle` 的上下文构建能力重建 messages。
 8. 发出 `compaction_finished` 和 `persistence_save_point`，随后 phase 回到 `idle` 并发出 `session_settled`；如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
 

@@ -663,7 +663,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 本轮 grilling 已确认：BR-009 的风险来自阶段 5 需要真实 `DriverHost::call_model(...)`，但阶段 9 才准备完整 `ModelGateway`。如果阶段 5 为了跑通 text-only driver 写临时 provider/auth/usage/error 路径，阶段 9 会被迫拆掉重写。
 
-设计收敛为：提前实现最小稳定 `ModelGateway` spine，而不是把阶段 9 的全部能力提前。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，固定 `ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 的 text-only driver 只能走 `DriverHost::call_model -> ModelGateway.call_model(...)`，不允许 `Driver` / `SessionDriverHost` match provider、直读 env 或构造 Rig provider client。阶段 9 只在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
+设计收敛为：提前实现最小稳定 `ModelGateway` spine，而不是把阶段 9 的全部能力提前。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，固定 `ModelSelection`、`ModelCallPurpose`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 的 text-only driver 只能走 `DriverHost::call_model -> ModelGateway.call_model(...)`，不允许 `Driver` / `SessionDriverHost` match provider、直读 env 或构造 Rig provider client。阶段 9 只在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
 
 已同步完成：`implementation-roadmap.md`、`model-gateway.md`、ADR 0014、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-009 已标记为 Resolved。
 
@@ -676,3 +676,11 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 实现顺序也同步收敛：当前 MVP 不实现 hook system，也不在 roadmap 中设置 `RuntimeHooks MVP` 阶段。后期第一批 hook 才考虑接入已经稳定的 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSavePoint` 和 `CommandOutputBuild`。provider hooks 后期仍由 `ModelGateway` 拥有，raw provider payload patch 默认不开放。
 
 已同步完成：`runtime-hooks.md`、`session-runtime.md`、`model-gateway.md`、`driver.md`、`implementation-roadmap.md`、`agent-runtime.md`、`architecture.md`、`modules/README.md`、ADR 0008、ADR 0015、`CONTEXT.md`、`system-blueprint-review-issues.md` 和 `system-blueprint-review-issues-round2.md` 已按该语义更新，BR-010 已标记为 Resolved。由于同一 owner 分层同时固定了 future registry / session-scoped view / fixed cwd trust 判定，BR-035 也已标记为 Resolved。
+
+## BR-011 / BR-013 模型调用 purpose 与压缩请求边界收敛进展
+
+本轮 grilling 已确认：`UsagePurpose` 与 `ModelCallPurpose` 表达的是同一模型调用事实，不应存在转换层；并且 `Retry` / `Background` 属于 attempt、run control 或调度状态，不是调用业务目的。设计收敛为只保留 `ModelCallPurpose { AgentRun, CompactionSummary }`，并固定 `ModelCallRequest.purpose -> ModelCallUsage.purpose -> future SessionEntry::Usage.purpose` 原样传播。provider fallback/retry 使用 `ModelCallAttempt`，session/run retry 使用 `RetryReason` / `DriveEntry::Retry` / future call lineage；后台 session 的正常调用仍是 `AgentRun`。
+
+同时确认 `SummaryModelRequest` 造成了 Compaction 与 ModelGateway 的第二套请求边界。该类型改为纯 `CompactionSummaryMaterial { system_prompt, messages, max_output_tokens }`：`Compaction` 只生成摘要内容和输出预算，`SessionRuntime` 选择摘要模型、thinking/stream policy、分配 correlation id，并构造唯一 `ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }`；`ModelGateway` 继续负责 provider/auth/fallback/usage/error/cancellation。
+
+已同步完成：`model-gateway.md`、`usage-stats.md`、`session-manager.md`、`compaction.md`、`implementation-roadmap.md`、`modules/README.md`、ADR 0014、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-011 与 BR-013 已标记为 Resolved。

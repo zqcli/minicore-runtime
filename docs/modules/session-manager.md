@@ -103,7 +103,7 @@ Compaction { summary: String, first_kept_entry_id: EntryId, tokens_before: u64, 
 BranchSummary { from_id: EntryId, summary: String }
 Custom { custom_type: String, data: serde_json::Value }
 CustomMessage { custom_type: String, content: MessageContent, display: bool }
-Usage { run_id: Option<RunId>, model_call_id: ModelCallId, purpose: UsagePurpose, provider_id: String, model_id: String, usage: TokenUsage, source: UsageSource }
+Usage { run_id: Option<RunId>, model_call_id: ModelCallId, purpose: ModelCallPurpose, provider_id: String, model_id: String, usage: TokenUsage, source: UsageSource }
 Label { target_id: EntryId, label: Option<String> }
 ```
 
