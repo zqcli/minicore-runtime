@@ -158,7 +158,7 @@
 - `docs/implementation-roadmap.md`：阶段 9 才做 ModelGateway 和 UsageStats 的完整收拢。
 - `docs/modules/model-gateway.md`：ModelGateway 负责 provider/model 解析、凭据解析、custom base URL、fallback、usage、错误分类。
 
-决策结果：实现顺序改为先落 `ModelGateway` 最小稳定 spine，再进行 text-only `Driver` integration。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，必须固定 `ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 只能通过 `DriverHost::call_model -> ModelGateway.call_model(...)` 调模型，不能在 `Driver` / `SessionDriverHost` 中 match provider、直读 env 或构造 Rig provider client。阶段 9 改为在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
+决策结果：实现顺序改为先落 `ModelGateway` 最小稳定 spine，再进行 text-only `Driver` integration。阶段 4 改为 `Rig Driver + ModelGateway seam spike`，必须固定 `ModelSelection`、`ModelCallPurpose`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` shape、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。阶段 5 只能通过 `DriverHost::call_model -> ModelGateway.call_model(...)` 调模型，不能在 `Driver` / `SessionDriverHost` 中 match provider、直读 env 或构造 Rig provider client。阶段 9 改为在既有 spine 上扩展 custom provider、完整 auth、fallback、usage normalization 和 context usage。
 
 后续实现需验证：阶段 5 的 fake/minimal provider adapter 也必须走 `ProviderRegistry` / `AuthStore` / `ModelGateway` seam；阶段 9 只能扩展 seam，不能替换模型调用路径；provider/auth/raw usage/error 字符串不能泄漏到 `Driver`、event、snapshot 或 session JSONL。
 
@@ -180,9 +180,9 @@
 
 ### BR-011：`UsagePurpose` 与 `ModelCallPurpose` 同值异名
 
-状态：Open
+状态：Resolved
 
-问题：`UsagePurpose` 和 `ModelCallPurpose` 的枚举值基本相同，但分别出现在 usage stats 和 model gateway 文档中，没有说明是否故意区分。
+原问题：`UsagePurpose` 和 `ModelCallPurpose` 的枚举值基本相同，但分别出现在 usage stats 和 model gateway 文档中，没有说明是否故意区分。
 
 证据：
 
@@ -190,9 +190,9 @@
 - `docs/modules/model-gateway.md`：`ModelCallPurpose { AgentRun, CompactionSummary, Retry, Background }`。
 - `docs/modules/session-manager.md`：`SessionEntry::Usage` 使用 `UsagePurpose`。
 
-风险：同一模型调用目的在执行、usage、持久化中有两套名称，容易映射漂移。
+决策结果：删除 `UsagePurpose`，只保留 `ModelCallPurpose` 作为模型调用业务目的的权威类型。固定传播链为 `ModelCallRequest.purpose -> ModelCallUsage.purpose -> future SessionEntry::Usage.purpose`，usage/persistence 层不得重新分类。当前变体收敛为 `AgentRun` 和 `CompactionSummary`；未来模型任务使用明确业务变体。
 
-待处理方向：合并为一个权威名称，或明确两者边界和转换规则。
+同时明确 `Retry` / `Background` 不是 purpose：provider fallback/retry 由 `ModelCallAttempt` 表达，session/run retry 由 `RetryReason` / `DriveEntry::Retry` / future call lineage 表达；session 因 focus 切换在后台运行时仍是 `AgentRun`。run-level `UsageSummary` 只聚合该 run 的 `AgentRun` 调用，独立 `CompactionSummary` usage 只进入 session 累计统计。
 
 ### BR-012：CommandSurface 与 CommandSurfaceService 命名层级仍需决定
 
@@ -206,9 +206,9 @@
 
 ### BR-013：Compaction 与 ModelGateway 请求类型重复
 
-状态：Open
+状态：Resolved
 
-问题：`compaction::build_summary_request()` 返回 `SummaryModelRequest`，并说这是给 ModelGateway 的请求；ModelGateway 的实际执行入口又是 `ModelCallRequest`。两者关于 model、tools、thinking、stream options、max tokens 的责任分配不完全清晰。
+原问题：`compaction::build_summary_request()` 返回 `SummaryModelRequest`，并说这是给 ModelGateway 的请求；ModelGateway 的实际执行入口又是 `ModelCallRequest`。两者关于 model、tools、thinking、stream options、max tokens 的责任分配不完全清晰。
 
 证据：
 
@@ -216,9 +216,9 @@
 - `docs/modules/model-gateway.md`：`ModelCallRequest` 是 Driver / Compaction 给 ModelGateway 的 provider-neutral 请求。
 - `docs/modules/model-gateway.md`：Compaction flow 把 summary request 转为 `ModelCallRequest { purpose: CompactionSummary, tools: [] }`。
 
-风险：SessionRuntime、Compaction、ModelGateway 谁负责选择摘要模型和填充调用选项会变模糊。
+决策结果：删除 `SummaryModelRequest`，改为纯中间值 `CompactionSummaryMaterial { system_prompt, messages, max_output_tokens }`。`Compaction` 只负责 cut point、summary instructions/prompt、模型可见摘要输入和输出预算；不选择 provider/model，不决定 thinking/stream policy，不分配 call/run id，也不构造 `ModelCallRequest`。
 
-待处理方向：让 Compaction 只生成 summary prompt/materials，由 SessionRuntime/ModelGateway 构造 `ModelCallRequest`；或让 `SummaryModelRequest` 明确只是中间 DSL。
+唯一模型请求由 `SessionRuntime` 构造：它选择摘要模型和调用策略，并生成 `ModelCallRequest { purpose: ModelCallPurpose::CompactionSummary, tools: [], max_output_tokens: Some(material.max_output_tokens), ... }`；`ModelGateway` 只负责 provider/auth/fallback/usage/error/cancellation。后续实现需验证 `Compaction` public API 中不再出现 `ModelCallRequest`、`ModelSelection`、thinking/stream policy 或 `SummaryModelRequest`。
 
 ### BR-014：手动 `/compact` 运行中行为和 phase policy 冲突
 

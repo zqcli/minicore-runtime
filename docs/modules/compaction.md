@@ -90,6 +90,7 @@ pub struct CompactionSettings {
     pub reserve_tokens: u64,
     pub keep_recent_tokens: u64,
     pub summary_input_token_limit: Option<u64>,
+    pub summary_max_output_tokens: u64,
 }
 
 pub enum CompactionReason {
@@ -129,14 +130,14 @@ pub fn prepare_compaction(
     settings: &CompactionSettings,
 ) -> Result<Option<CompactionPreparation>, CompactionError>;
 
-pub fn build_summary_request(
+pub fn build_summary_material(
     preparation: &CompactionPreparation,
     instructions: Option<&str>,
-) -> SummaryModelRequest;
+) -> CompactionSummaryMaterial;
 
-pub fn build_turn_prefix_summary_request(
+pub fn build_turn_prefix_summary_material(
     preparation: &CompactionPreparation,
-) -> Option<SummaryModelRequest>;
+) -> Option<CompactionSummaryMaterial>;
 
 pub fn finish_compaction(
     preparation: CompactionPreparation,
@@ -147,20 +148,19 @@ pub fn finish_compaction(
 pub fn compaction_summary_to_message(entry: &CompactionEntry) -> MessageRecord;
 ```
 
-`SummaryModelRequest` 是给 ModelGateway 的请求，不是 Rig run：
+`CompactionSummaryMaterial` 是 `Compaction` 产出的摘要内容和输出预算，不是给 `ModelGateway` 的请求，也不是 Rig run：
 
 ```rust
-pub struct SummaryModelRequest {
-    pub purpose: ModelCallPurpose,
+pub struct CompactionSummaryMaterial {
     pub system_prompt: String,
     pub messages: Vec<MessageRecord>,
-    pub max_tokens: u64,
-    pub thinking_level: Option<ThinkingLevel>,
-    pub model: Option<ModelSelection>,
+    pub max_output_tokens: u64,
 }
 ```
 
-`purpose` 固定为 `ModelCallPurpose::CompactionSummary`。如果 `model` 为空，`SessionRuntime` 使用当前 `ModelState` 或 settings 中的摘要模型选择；最终仍由 [ModelGateway](model-gateway.md) 解析 provider、auth、fallback、usage 和错误分类。
+`Compaction` 只拥有 cut point、summary instructions、summary system prompt、模型可见摘要输入和 `summary_max_output_tokens`。它不选择 provider/model，不决定 thinking/stream policy，不分配 `ModelCallId` / `RunId`，也不构造 `ModelCallRequest`。
+
+`SessionRuntime` 收到 material 后，使用当前 `ModelState` 或 user-global settings 中的摘要模型选择，决定 thinking/stream policy，分配 correlation id，并构造唯一请求：`ModelCallRequest { purpose: ModelCallPurpose::CompactionSummary, tools: [], max_output_tokens: Some(material.max_output_tokens), ... }`。最终仍由 [ModelGateway](model-gateway.md) 解析 provider、auth、fallback、usage 和错误分类。
 
 `estimate_context_tokens()` 是 `ContextUsage` fallback helper，不是成本统计。它应遵循 [UsageStats](usage-stats.md) 的规则：优先使用最近一次有效 assistant provider usage，再估算后续消息；没有 provider usage 时才估算完整模型可见上下文。
 
@@ -179,7 +179,7 @@ should_compact(context_usage.current_tokens, context_usage.context_window, setti
 pub trait CompactionSummarizer {
     async fn summarize(
         &self,
-        request: SummaryModelRequest,
+        material: CompactionSummaryMaterial,
         cancel: CancellationToken,
     ) -> Result<String, CompactionError>;
 }
@@ -208,7 +208,7 @@ MVP 可以先只允许切在 user/custom/bash turn boundary。完整版本再支
 
 ## 摘要 Prompt
 
-摘要调用不应复用 Agent run 的 system prompt，也不应暴露工具。它是一次普通模型 completion，请求由 ModelGateway 执行，转换为 `ModelCallRequest { purpose: CompactionSummary, tools: [] }`。
+摘要调用不应复用 Agent run 的 system prompt，也不应暴露工具。`Compaction` 先构建 `CompactionSummaryMaterial`；`SessionRuntime` 再将它转换为 `ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }`，并交给 `ModelGateway` 执行。
 
 系统提示词：
 
@@ -423,7 +423,9 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → preparation = compaction::prepare_compaction(path, settings)
   → future RuntimeHookRegistry.invoke(SessionBeforeCompact)
   → future hook may cancel, patch instructions, or provide CompactionResult
-  → otherwise ModelGateway summarizes using compaction summary requests
+  → material = compaction::build_summary_material(preparation, instructions)
+  → SessionRuntime constructs ModelCallRequest { purpose: CompactionSummary, tools: [] }
+  → ModelGateway summarizes material
   → append SessionEntry::Compaction
   → rebuild SessionContext
   → update SessionRuntime message projection / next TurnState basis
@@ -541,6 +543,7 @@ pub enum BeforeCompactDecision {
 `Compaction` 模块不应：
 
 - 调用 Rig `AgentRun`。
+- 构造 `ModelCallRequest` 或选择模型调用策略。
 - 执行工具或读取工作区文件。
 - 持有 provider registry、API key 或 fallback policy。
 - 追加 session entry 或移动 leaf。
@@ -548,4 +551,4 @@ pub enum BeforeCompactDecision {
 - 修改 system prompt。
 - 扫描 skills、resources 或 prompt templates。
 
-这些职责分别属于 `Driver`、`Tools`、ModelGateway、`SessionHandle` / `SessionStorage`、`SessionRuntime`、`Prompt` 和 `ResourceManager`。
+这些职责分别属于 `Driver`、`SessionRuntime`、`Tools`、`ModelGateway`、`SessionHandle` / `SessionStorage`、`SessionRuntime`、`Prompt` 和 `ResourceManager`。

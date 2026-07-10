@@ -391,7 +391,7 @@ AgentRunStep::CallModel { prompt, history, turn }
 
 `Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
 
-`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能从 `DriverTurnInput` 复制 `ModelSelection { provider_id, model_id }`、system prompt、active tool schemas、thinking level 和 stream options，并结合 Rig step 提供的 prompt/history 生成 provider-neutral request；它不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
+`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能从 `DriverTurnInput` 复制 `ModelSelection { provider_id, model_id }`、system prompt、active tool schemas、thinking level 和 stream options，并结合 Rig step 提供的 prompt/history 生成 provider-neutral request；Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认为空并交给模型默认值。它不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
 
 ## CallTools Step
 

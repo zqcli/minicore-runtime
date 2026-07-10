@@ -89,7 +89,7 @@ pub struct ModelCallUsage {
     pub run_id: Option<RunId>,
     pub provider_id: String,
     pub model_id: String,
-    pub purpose: UsagePurpose,
+    pub purpose: ModelCallPurpose,
     pub usage: TokenUsage,
     pub source: UsageSource,
     pub raw_provider_usage: Option<serde_json::Value>,
@@ -110,7 +110,7 @@ pub struct ModelUsageSummary {
 }
 ```
 
-`ModelCallUsage` 是单次模型调用事实；`UsageSummary` 是一次 run 内所有模型调用的聚合。`raw_provider_usage` 只允许作为内部 redacted diagnostic，默认不进入 `AgentRuntimeProtocol`、`SessionEntry`、hook context 或日志明文。
+`ModelCallUsage` 是单次模型调用事实；`UsageSummary` 是一次 run 内所有模型调用的聚合。`ModelCallUsage.purpose` 必须直接复制 `ModelCallRequest.purpose`，不能在 usage 层重新判断或转换。`raw_provider_usage` 只允许作为内部 redacted diagnostic，默认不进入 `AgentRuntimeProtocol`、`SessionEntry`、hook context 或日志明文。
 
 `cache_write_tokens` 保留给 Anthropic / OpenAI prompt caching 之类 provider 差异；UI MVP 可以不展示，但 stats 层不要丢。
 
@@ -226,6 +226,8 @@ UI
 
 `UsageSummary` for a run is the sum of all model calls in that run, not just the last model call. If a run contains multiple model/tool/model cycles, `run_finished { usage }` must include all model calls in that run.
 
+run-level `UsageSummary` 只聚合关联到该 run 的 `ModelCallPurpose::AgentRun` 调用。独立 compaction phase 产生的 `CompactionSummary` usage 进入 `SessionUsageStats`，但不能回填到刚结束或即将重试的 Agent run aggregate。provider fallback/retry 若在同一个逻辑 model call 内发生，由 `ModelCallAttempt` 记录；任何 provider 明确报告的消耗仍使用原始 purpose 记账。
+
 `DriverEvent::ModelCallFinished` 应携带 `Option<ModelCallUsage>`。`run_finished { usage }` 和 `DriveResult::Completed { usage }` 才携带 run-level `UsageSummary`，避免多次模型调用重复计数或丢失 per-call provider/model/source。
 
 ## Session Persistence
@@ -245,7 +247,7 @@ pub enum SessionEntry {
         base: EntryBase,
         run_id: Option<RunId>,
         model_call_id: ModelCallId,
-        purpose: UsagePurpose,
+        purpose: ModelCallPurpose,
         provider_id: String,
         model_id: String,
         usage: TokenUsage,
@@ -253,16 +255,11 @@ pub enum SessionEntry {
     },
     // ...
 }
-
-pub enum UsagePurpose {
-    AgentRun,
-    CompactionSummary,
-    Retry,
-    Background,
-}
 ```
 
-这样 UI 后续可以区分正常回答、压缩摘要、retry 和后台任务的 token 消耗。
+`ModelCallPurpose` 的权威定义在 [ModelGateway](model-gateway.md)。usage/persistence 不定义 `UsagePurpose`，也不把 retry 或 session 是否 focused 当成业务目的：Agent run 的 provider retry、overflow recovery 后重跑和后台 session 继续执行仍归 `AgentRun`；压缩摘要及其重试仍归 `CompactionSummary`。未来新增 branch summary、session title 等模型任务时，应增加明确 purpose 变体。
+
+这样 UI 后续可以区分正常回答和压缩摘要等真实业务目的，同时不会因为 retry/fallback/focus 状态改变统计分类。
 
 ## AgentRuntimeEvents And RuntimeSnapshot
 

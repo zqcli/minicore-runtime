@@ -346,7 +346,7 @@ _避免_：工具策略、工具注册、UI 执行器
 _避免_：Driver、模型客户端、系统提示词构建器、provider registry、临时 provider 路径
 
 **ModelGateway spine**：
-真实 driver 集成前必须稳定的最小模型调用骨架，包括 `ModelCallRequest` / `ModelCallResult` / `ModelCallErrorKind`、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。它不是完整 custom provider、fallback 或 usage/context usage 实现。
+真实 driver 集成前必须稳定的最小模型调用骨架，包括 `ModelCallPurpose`、`ModelCallRequest` / `ModelCallResult` / `ModelCallErrorKind` / `ModelCallUsage`、`ModelGateway.call_model(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。它不是完整 custom provider、fallback 或 usage/context usage 实现。
 _避免_：临时 gateway、Driver 直接调用 provider
 
 **模型选择（`ModelSelection`）**：
@@ -369,9 +369,17 @@ _避免_：AuthStore、ModelGateway、provider client pool
 运行时服务中的凭据解析边界，负责根据受控引用解析 API key、OAuth token 或运行时 override。它只向模型调用网关内部提供 secret material。
 _避免_：ProviderRegistry、UI 设置对象、环境变量直读器
 
+**模型调用目的（`ModelCallPurpose`）**：
+一次模型调用的稳定业务意图，例如 `AgentRun` 或 `CompactionSummary`。它从 `ModelCallRequest` 原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；retry/fallback、session 是否 focused、调用是否在后台执行都不是 purpose。
+_避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
+
 **模型调用请求（`ModelCallRequest`）**：
-`Driver`、压缩流程或后台任务交给模型调用网关的 provider-neutral 请求，包含模型选择、消息、系统提示词、工具 schema、调用目的和流式选项。它不包含凭据、auth header、Rig provider 类型或 raw provider payload。
-_避免_：provider HTTP request、Rig provider request、会话消息
+`Driver` 或 `SessionRuntime` 交给模型调用网关的唯一 provider-neutral 请求，包含模型选择、消息、系统提示词、工具 schema、输出限制、调用目的和流式选项。它不包含凭据、auth header、Rig provider 类型或 raw provider payload。
+_避免_：provider HTTP request、Rig provider request、会话消息、SummaryModelRequest
+
+**压缩摘要材料（`CompactionSummaryMaterial`）**：
+`Compaction` 根据压缩准备结果生成的摘要 system prompt、模型可见消息和最大输出 token 预算。它不是模型调用请求，不包含模型选择、thinking/stream policy、call/run id 或工具 schema；`SessionRuntime` 用它构造 `ModelCallPurpose::CompactionSummary` 的 `ModelCallRequest`。
+_避免_：SummaryModelRequest、ModelCallRequest、压缩结果、系统提示词状态
 
 **驱动安全点**：
 `Driver` 在 Rig 状态机推进到某些边界时交还控制权给会话运行时的点，例如 `before_next_model_call` 和 `before_run_finish`。会话运行时可在此处理队列、patch turn state、暂停、重试或结束。

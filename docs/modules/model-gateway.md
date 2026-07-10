@@ -33,7 +33,7 @@ SessionRuntime::ModelState
 
 阶段 4/5 前必须稳定的 `ModelGateway` spine：
 
-- provider-neutral 类型：`ModelSelection`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` 的字段和 redaction 规则。
+- provider-neutral 类型：`ModelSelection`、`ModelCallPurpose`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` 的字段、purpose 传播和 redaction 规则。
 - `ModelGateway.call_model(request, sink, cancel)` 主 seam。
 - 最小 `ProviderRegistry.resolve(ModelSelection)`：可以只支持 builtin fake/minimal provider 和最小 capability projection，但调用方必须通过 registry，不允许在 `Driver` / `SessionDriverHost` 中 match provider id。
 - 最小 `AuthStore.resolve(AuthRef)`：可以使用测试 secret 或受控 env resolver，但 secret material 只能出现在 `AuthStore` / `ModelGateway` 内部。
@@ -263,14 +263,12 @@ logs
 
 ## ModelCallRequest
 
-`ModelCallRequest` 是 `Driver` / `Compaction` 给 `ModelGateway` 的 provider-neutral 请求。它携带模型选择、消息、工具 schema 和调用目的，但不携带 credentials、raw headers、Rig provider 类型或 raw provider payload。
+`ModelCallRequest` 是 `Driver` / `SessionRuntime` 给 `ModelGateway` 的唯一 provider-neutral 请求。它携带模型选择、消息、工具 schema、输出限制和调用目的，但不携带 credentials、raw headers、Rig provider 类型或 raw provider payload。`Compaction` 不构造第二套模型请求；它只产出 `CompactionSummaryMaterial`，由 `SessionRuntime` 补齐调用策略后构造本类型。
 
 ```rust
 pub enum ModelCallPurpose {
     AgentRun,
     CompactionSummary,
-    Retry,
-    Background,
 }
 
 pub struct ModelCallRequest {
@@ -284,10 +282,17 @@ pub struct ModelCallRequest {
     pub tools: Vec<ToolSchema>,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
+    pub max_output_tokens: Option<u64>,
 }
 ```
 
-`AgentRun` 请求通常带 `tools` 和完整 system prompt。`CompactionSummary` 请求不带 tools，不复用 Agent run system prompt，只使用 compaction summary prompt。
+`ModelCallPurpose` 是模型调用业务目的的唯一权威类型，并原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；不存在第二套 `UsagePurpose`，也不允许在 usage/persistence 层重新分类。
+
+`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason`、`DriveEntry::Retry` 或 future call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 session 因 focus 切换而在后台继续运行时，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
+
+`AgentRun` 请求通常带 `tools` 和完整 system prompt，`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求不带 tools，不复用 Agent run system prompt，只使用 compaction summary prompt，并把 `CompactionSummaryMaterial.max_output_tokens` 写入请求。
+
+`max_output_tokens` 表示调用方期望的输出上限，不是 provider 已验证值。`ModelGateway` 在 provider capability validation 时必须保证它大于 0，并按 `ModelCapabilities.max_output_tokens` 拒绝或确定性裁剪；最终生效值可进入 redacted attempt/diagnostic summary，但不能由 `Compaction` 直接读取 provider capability。
 
 ## ModelCallResult
 
@@ -426,8 +431,10 @@ Rig CallTools
 
 ```text
 SessionRuntime compaction flow
-  → compaction::build_summary_request(...)
-  → ModelCallRequest { purpose: CompactionSummary, tools: [], system_prompt: summary prompt }
+  → compaction::build_summary_material(...)
+  → CompactionSummaryMaterial { system_prompt, messages, max_output_tokens }
+  → SessionRuntime selects summary model / thinking / stream policy
+  → ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }
   → ModelGateway.call_model
   → CompactionResult
 ```
@@ -544,6 +551,8 @@ ProviderRegistry
 - `ModelSummary` 是否只在 protocol/snapshot 中出现，执行路径是否只用 `ModelSelection`。
 - `ModelCallUsage` 和 run-level `UsageSummary` 是否不会重复计数。
 - compaction summary 是否使用 `ModelCallPurpose::CompactionSummary`，且不带 tools、不复用 Agent run system prompt。
+- `ModelCallRequest.purpose` 是否原样进入 `ModelCallUsage` / future `SessionEntry::Usage`，没有 `UsagePurpose` 转换层。
+- provider fallback、session retry 和后台 session 运行是否都不会把 purpose 改写为 `Retry` / `Background`。
 - session restore 中失效模型是否有明确 fallback / diagnostics / snapshot 展示，而不是静默换模型。
 
 ## 必测项
@@ -558,4 +567,5 @@ ProviderRegistry
 - submit flow：`TurnState.model.selection -> DriverTurnInput.model -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失。
 - error taxonomy：auth missing、rate limit、context overflow、cancelled 不靠字符串解析给上层。
 - usage：多次 `model -> tools -> model` 的 `ModelCallUsage` 聚合成一次 run `UsageSummary`，不重复计数。
-- compaction：`ModelCallPurpose::CompactionSummary` 无 tools，usage 归入 compaction purpose。
+- purpose：`AgentRun` / `CompactionSummary` 从 request 到 usage/persistence 原样传播；retry/fallback 只改变 attempt/lineage metadata。
+- compaction：`CompactionSummaryMaterial` 由 `SessionRuntime` 转成 `ModelCallPurpose::CompactionSummary` 请求，无 tools，带明确 `max_output_tokens`，usage 归入 compaction purpose。
