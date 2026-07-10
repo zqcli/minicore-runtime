@@ -255,6 +255,8 @@ pub struct MaterializedCommandCatalog {
 
 UI 选择旧 catalog item 后执行时，runtime 必须基于当前 context 重新 materialize 并 resolve；如果节点消失或 binding 不再有效，返回 `CommandExpired` / `CatalogStale` 类错误，而不是执行旧 UI selection 携带的动作。
 
+`CommandPhasePolicy::DeferUntilPostRun` 表示：idle 时立即执行；存在 active work 时 resolve 为结构化 deferred action，由 `SessionRuntime` 保存并在 post-run safe point 执行。`CommandManager` 不保存 pending action，也不把它转换成 follow-up message。`/compact` 在 Compaction 后端启用后使用该 policy，因此 running 时 catalog 使用 `availability = Available` + `phase_policy = DeferUntilPostRun`，而不是 disabled 或隐式 abort。
+
 ## Parse / Suggest / Resolve
 
 `parse` 负责 command text 的 tokenization 和 path/args 切分，不执行业务逻辑：
@@ -466,6 +468,7 @@ CommandCatalogEvent::Changed {
 - `/model current`、`/model provider <provider> <model>` 或动态 path：读取/设置模型。
 - `/model thinking <level>`：设置当前模型支持的 thinking level。
 - `/tools list`：只读展示工具摘要；mutation 后置。
+- `/compact [instructions]`：Compaction 后端启用后使用 `DeferUntilPostRun`；idle 时立即压缩，running 时排为唯一 pending manual compact。
 
 暂缓 extension executable commands、project-local command handlers、复杂 form schema、generic runtime interaction submit、runtime-owned action ids、tool/permission mutation command 和 catalog hooks。
 
@@ -477,5 +480,7 @@ CommandCatalogEvent::Changed {
 - `/skill name args` 与 `/skill:name args` 归一到同一 invocation。
 - `ExecuteCommandText` 与 `ExecuteCatalogCommand` 最终都走 `resolve_for_execution`。
 - stale catalog selection 被拒绝或重解析，不执行旧 UI payload。
+- `/compact` 在 idle 时立即进入 handler，在 active work 时 resolve 为 `DeferUntilPostRun`，不能隐式调用 `AbortRun` 或转换成 follow-up message。
+- pending compact 已存在或 compaction 已开始时，重复执行分别返回 `CompactAlreadyQueued` / `CompactionAlreadyRunning`。
 - UI-visible catalog/result 不包含完整 `AgentCommand`、handler key、resource body 或 secret。
 - 高权限 `InternalAgentCommand` 不出现在公开协议、快照、事件或 command output 中。

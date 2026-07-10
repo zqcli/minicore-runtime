@@ -18,7 +18,7 @@
 5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、后期 `RuntimeHooks` typed result 不能直接泄漏给 UI。
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
 7. 流式 delta 不是持久化事实；`persistence_save_point` 才是“此前相关 session writes 已经落盘”的 durable barrier。
-8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry，并且 phase 已经回到 `idle`。
+8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry、pending session action 或 queued continuation，并且 phase 已经回到 `idle`。
 9. 同步命令接收用 `CommandAck` 表达；异步执行结果和用户可见命令结果用 `agent_runtime_protocol::Event` 表达。
 10. `session_focus_changed` 是 runtime-visible event，表示默认会话目标改变；它不表示 session loaded、running 或 closed。
 
@@ -630,7 +630,7 @@ CommandAck
 5. `tool_call_output_delta` 必须发生在对应 `tool_call_started` 和 `tool_call_finished` 之间。
 6. `tool_call_approval_requested` 只能发生在 `tool_call_proposed` 之后、`tool_call_started` 之前。
 7. `persistence_save_point` 只能在相关 session writes 成功后发出。
-8. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry，且没有同步马上要启动的 continuation 时发出。
+8. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry、pending session action，且没有同步马上要启动的 continuation 时发出。
 9. `diagnostics_error` 不替代 terminal event。run 内失败需要 `diagnostics_error` + `run_finished { status: failed }`；abort 需要 `run_finished { status: aborted }`。
 10. `resources_changed` 表示新 resource revision 已经原子替换；失败 reload 不应污染旧 revision。
 11. UI reducer 必须能从任意 `agent_runtime_protocol::RuntimeSnapshot` 加之后续事件恢复一致状态。
@@ -951,7 +951,7 @@ Required
 
 ### 14. Queue Lifecycle
 
-队列是 session runtime 状态，不是持久化 transcript。
+消息队列和 pending session actions 都是 session runtime 状态，不是持久化 transcript。`PendingSessionAction::Compact` 是结构化 post-run action，不是模型可见消息。
 
 ```text
 Empty
@@ -962,7 +962,7 @@ Empty
 
 对应事件：
 
-- `queue_updated { follow_up, steering, next_turn }`
+- `queue_updated { follow_up, steering, next_turn, pending_actions }`
 
 `queue_updated` 每次发送完整队列摘要，而不是 delta。这样 UI reducer 不需要理解运行时 drain 细节。
 
@@ -971,7 +971,7 @@ Empty
 Compaction 是 session context projection，不是普通 run。
 
 ```text
-Requested
+Requested while idle
   -- session_phase_changed(compaction) --> PreparingCutPoint
   -- compaction_started --> PreparingSummary
   → future SessionBeforeCompact hook if hook system is enabled
@@ -981,6 +981,13 @@ Requested
   -- compaction_finished --> Finished(aborted? failed? will_retry?)
   -- persistence_save_point --> DurableAtSavePoint
   → session_settled or run_started
+
+Requested while active work
+  -- queue_updated(pending compact) --> Deferred
+  → current work terminal facts + persistence save point
+  → required retry / overflow recovery chain completes
+  -- queue_updated(remove pending compact) --> Dispatching
+  -- session_phase_changed(compaction) --> PreparingCutPoint
 ```
 
 对应事件：
@@ -1190,7 +1197,7 @@ SessionRuntime
   → session_settled
 ```
 
-如果 follow-up / steering / next-turn 导致继续运行，`run_finished` 后不应立即 `session_settled`；应先发 `queue_updated`，再启动下一次 `run_started` 或在安全点继续。
+如果 immediate retry、pending manual compact、follow-up / steering / next-turn 导致继续工作，`run_finished` 后不应立即 `session_settled`；应先发对应 `queue_updated` / lifecycle event，再启动 compaction、下一次 `run_started` 或在安全点继续。
 
 ## Tool Lifecycle
 
@@ -1232,7 +1239,7 @@ SessionRuntime / Driver cancellation
   → message_assistant_finished?         // only if there is an abort/error message to close
   → run_finished { status: aborted }
   → session_phase_changed { phase: idle }
-  → queue_updated?                      // if abort returns queued text to editor or clears queues
+  → queue_updated                       // clears pending compact; may also return/clear message queues
   → session_settled
 ```
 
@@ -1262,7 +1269,14 @@ session_settled or retry_auto_started
 ## Compaction Lifecycle
 
 ```text
-UI dispatch(Compact) or auto threshold/overflow
+UI dispatch(Compact) while active work
+  → queue_updated { pending_actions: [Compact] }
+  → current work continues
+  → run terminal facts + persistence_save_point
+  → required immediate retry / overflow recovery chain, if any
+  → queue_updated { pending_actions: [] }
+
+UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overflow
   → session_phase_changed { phase: compaction }
   → compaction_started { reason }
   → future RuntimeHookRegistry.invoke(SessionBeforeCompact) // internal only

@@ -111,6 +111,17 @@ pub(crate) enum InternalAgentCommand {
 
 `InternalAgentCommand` 不能出现在 `RuntimeSnapshot`、`EventMsg`、command catalog、command output action 或 UI-visible interaction 中。
 
+`Compact { session_id, instructions }` 的 phase policy 是 `DeferUntilPostRun`：
+
+- session 已 `idle` 时立即进入 manual compaction。
+- session 有 active run、等待 tool approval、处于 suspended run 或正在自动 retry chain 时，不中止当前 work；`SessionRuntime` 保存一个结构化 `PendingSessionAction::Compact`，并通过 `queue_updated` / `QueueSnapshot.pending_actions` 暴露。
+- pending compact 在当前 work 的 terminal event 和相关 `persistence_save_point` 完成后、follow-up / next-turn continuation 之前执行；如果还有立即 retry / overflow recovery，则等该 work chain 稳定结束后再执行。
+- 已有 pending compact 时重复提交不追加第二个压缩动作，返回 `CompactAlreadyQueued` 类 command output，保留原 instructions。
+- session 已在 compaction phase 时返回 `CompactionAlreadyRunning`；不会排队第二次 compaction。
+- `AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会移除 pending compact，并发出更新后的 `queue_updated`；普通 run failure 在不再 retry 时仍执行用户已经排队的 compact。
+
+`Compact` 不能隐式调用 `AbortRun`，也不能清理 tool approval、resume state 或消息队列。`PendingSessionActionView` 是 UI-safe 当前状态投影，不是新的可执行命令载体；真正执行仍使用 `SessionRuntime` 内部保存的结构化 action。
+
 `ListSessions` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`；GUI sidebar 也应通过同一查询分页/过滤读取当前 workspace 的 session 清单，而不是直接读取本地 index 文件。`ListSessions` 是读取型 protocol query：SDK / JSON-RPC transport 可以把它实现为 request/response；如果某个 transport 只能走 `dispatch(AgentCommand)`，也必须通过明确 response event 或 interaction 返回列表，不能把 session list 塞进 `CommandAck`。
 
 ```rust
@@ -299,7 +310,26 @@ pub enum PatchFileAction {
 }
 
 pub enum QueueEvent {
-    Updated { follow_up: Vec<QueuedMessageView>, steering: Vec<QueuedMessageView>, next_turn: Vec<QueuedMessageView> },
+    Updated {
+        follow_up: Vec<QueuedMessageView>,
+        steering: Vec<QueuedMessageView>,
+        next_turn: Vec<QueuedMessageView>,
+        pending_actions: Vec<PendingSessionActionView>,
+    },
+}
+
+pub struct QueueSnapshot {
+    pub follow_up: Vec<QueuedMessageView>,
+    pub steering: Vec<QueuedMessageView>,
+    pub next_turn: Vec<QueuedMessageView>,
+    pub pending_actions: Vec<PendingSessionActionView>,
+}
+
+pub enum PendingSessionActionView {
+    Compact {
+        command_id: CommandId,
+        instructions: Option<String>,
+    },
 }
 
 pub enum UsageEvent {
@@ -817,6 +847,7 @@ pub enum CommandPhasePolicy {
     AllowedDuringRun,
     QueueAsSteer,
     QueueAsFollowUp,
+    DeferUntilPostRun,
     ImmediateRuntimeAction,
 }
 

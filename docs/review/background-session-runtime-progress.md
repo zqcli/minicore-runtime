@@ -684,3 +684,11 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 同时确认 `SummaryModelRequest` 造成了 Compaction 与 ModelGateway 的第二套请求边界。该类型改为纯 `CompactionSummaryMaterial { system_prompt, messages, max_output_tokens }`：`Compaction` 只生成摘要内容和输出预算，`SessionRuntime` 选择摘要模型、thinking/stream policy、分配 correlation id，并构造唯一 `ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }`；`ModelGateway` 继续负责 provider/auth/fallback/usage/error/cancellation。
 
 已同步完成：`model-gateway.md`、`usage-stats.md`、`session-manager.md`、`compaction.md`、`implementation-roadmap.md`、`modules/README.md`、ADR 0014、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-011 与 BR-013 已标记为 Resolved。
+
+## BR-014 Running compact 延后执行语义收敛进展
+
+本轮确认：手动 `/compact` 不能隐式 abort 当前 run，但 running 时也不必直接拒绝。设计收敛为新增 `CommandPhasePolicy::DeferUntilPostRun`：idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，由 `SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 不受影响。
+
+pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal facts 和 save point 完成后，在 follow-up/next-turn 之前执行。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
+
+已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`command-surface.md`、`session-runtime.md`、`compaction.md`、`implementation-roadmap.md`、`architecture.md`、`modules/README.md`、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-014 已标记为 Resolved。
