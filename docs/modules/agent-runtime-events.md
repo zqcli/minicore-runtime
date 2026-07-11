@@ -20,7 +20,7 @@
 5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、后期 `RuntimeHooks` typed result 不能直接泄漏给 UI。
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
 7. 流式 delta、pending approval 和执行中的 tool round 不是持久化事实；需要恢复的领域事实只能在对应 `SessionWriter.commit(...)` 成功后发布。
-8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry、pending session action 或 queued continuation，并且 phase 已经回到 `idle`。
+8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry、pending session action 或马上启动的 steering/follow-up continuation，并且 phase 已经回到 `idle`；`NextTurn` queue 可以保留。
 9. 同步命令接收用 `CommandAck` 表达；只读 typed 查询由 `AgentRuntime.query()` 直接返回 `QueryResponse`；异步执行结果和用户可见命令结果用 `agent_runtime_protocol::Event` 表达。
 10. `session_focus_changed` 是 runtime-visible event，表示默认会话目标改变；它不表示 session loaded、running 或 closed。
 
@@ -240,7 +240,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | compaction lifecycle | `compaction_started`、`compaction_finished` | started -> finished | 是 |
 | retry lifecycle | `retry_auto_started`、`retry_auto_finished` | started -> finished | 是 |
 | diagnostics | `diagnostics_runtime_changed`、`diagnostics_error`、`diagnostics_warning` | 离散或替换式 | 部分 |
-| idle lifecycle | `session_settled` | terminal convenience event | 是 |
+| idle lifecycle | `session_settled` | idle state fact | 是 |
 
 ## Event Sources
 
@@ -448,7 +448,6 @@ cancel token observation
 内部事件：
 
 ```rust
-DriverEvent::RunStarted
 DriverEvent::ModelCallStarted
 DriverEvent::ModelTextDelta
 DriverEvent::ModelCallFinished { usage: Option<ModelCallUsage> }
@@ -460,7 +459,7 @@ DriverEvent::BeforeRunFinish
 DriverEvent::RunFinished
 ```
 
-工具 lifecycle 不重复包装成 `DriverEvent`。`Tools` / `ToolUpdateSink` 只提供 proposed、approval requested、started、output delta 和 result-ready 等内部更新；`result-ready` 仍可能被 `ToolResultBeforeCommit` 改写，不能直接发布为 UI `tool_call_finished`。这些内部输入都不直接进入 UI。`SessionRuntime` 决定哪些转换成 `agent_runtime_protocol::Event`，何时组装稳定 batch、何时 commit，以及何时发 `run_finished`。
+`run_started` 也不包装成 `DriverEvent`；`SessionRuntime` 在建立 `CurrentRun`、调用 Driver 前直接发布。工具 lifecycle 不重复包装成 `DriverEvent`。`Tools` / `ToolUpdateSink` 只提供 proposed、approval requested、started、output delta 和 result-ready 等内部更新；`result-ready` 仍可能被 `ToolResultBeforeCommit` 改写，不能直接发布为 UI `tool_call_finished`。这些内部输入都不直接进入 UI。`SessionRuntime` 决定哪些转换成 `agent_runtime_protocol::Event`，何时组装稳定 batch、何时 commit，以及何时发 `run_finished`。
 
 ### Tools Ownership
 
@@ -804,7 +803,9 @@ Focused(session_id)
 - `session_phase_changed`
 - `session_settled` 只能在 phase 回到 `idle` 且不会立即继续时发出。
 
-`run_started` 不替代 `session_phase_changed(turn)`：phase 是产品级互斥状态，run 是一次 Rig drive / agent 工作单元。
+`session_settled` 是状态事实，不是某个 wait command 的完成回执。公开协议没有 `WaitForIdle` / `wait_finished`；UI reducer 直接消费该事件。CLI/RPC/test helper 只应覆盖“先订阅再 dispatch”或调用方已经维护该 session reducer 的场景；它不提供对任意 background session 的通用 late join。active session 可用 snapshot/reducer 当前状态避免丢失已发生的 settled；非 active session 的 late observation 取决于调用方既有 reducer 覆盖，完整订阅起点和 gap 语义留给 BR-044。
+
+`run_started` 不替代 `session_phase_changed(turn)`：phase 是产品级互斥状态，run 是一次 Rig drive / agent 工作单元。反过来也一样：`CommandAck` 或 `session_phase_changed(turn)` 不表示公开 run 已开始，UI 不能据此要求一个尚不存在的 `RunId` 或显示 run-level Stop。`Turn + current_run = None` 仅表示有界 admission/finalization；所有可能长时间等待的 model/provider/tool/approval 工作都必须在 `run_started` 后发生。
 
 `WaitingApproval` 和 `Suspended` 属于 `CurrentRunState`，发生时 SessionPhase 仍为 `Turn`。`BranchSummary` 是 session entry 和 future model-call purpose，不是 MVP SessionPhase。session close/unload 直接销毁 `SessionRuntime`，不增加 `Closed` phase。
 
@@ -829,6 +830,8 @@ UI 需要的 run lifecycle event：
 - `run_suspended { resume_id, reason }`
 - `run_resumed { resume_id }`
 - `run_finished { status }`
+
+UI 只在收到 `run_started` 或 snapshot 中存在 `current_run.run_id` 后发送 `AbortRun { run_id }`。如果 adapter 希望支持用户在 run id 到达前按下 Ctrl-C，只能按 originating `command_id` 保存 UI-local pending abort intent；随后收到 matching `run_started` 时立即发送普通 abort，若先收到 command rejection、`session_phase_changed(idle)`、`session_settled` 或 session close 则清除 intent。该 local intent 不是 runtime command、queue 或 snapshot 状态。
 
 `run_suspended` 是可恢复暂停，不是终态。它表示 `Driver` / `SessionRuntime` 已在协议安全 checkpoint 停住，并持有 resume state；恢复后继续同一个未完成 run 的 continuation。`run_finished` 仍是唯一 terminal run event，不存在 `run_finished { status: paused }`。
 
@@ -875,7 +878,7 @@ AcceptedByCommand
 
 对应事件：
 
-- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 并绑定到 run；事件先于对应 user message append。
+- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 且对应 `UserInput` commit 成功后发布，并先于 `message_user_appended`。idle/future-turn admission 尚未公开 run，事件使用 `run_id = None`；active Steer 使用 `Some(current_run_id)`。
 - `message_user_appended`
 
 FollowUp/NextTurn 入队时只发 `queue_updated`，不提前发 invoked；active Steer 在 active run safe point 展开后发 invoked。`message_user_appended` 只在 `UserInput` batch commit 成功后发布，因此它同时表示 UI 可以渲染消息、下次恢复也会包含该输入。
@@ -969,9 +972,11 @@ Empty
 
 - `queue_updated { follow_up, steering, next_turn, pending_actions }`
 
-`queue_updated` 每次发送完整队列摘要，而不是 delta。这样 UI reducer 不需要理解运行时 drain 细节。
+`queue_updated` 每次发送完整队列摘要，而不是 delta。通常只在 queue/pending state 实际变化时发布；`OpenSession` / `FocusSession` 后可以额外发布一次 active-session queue projection，作为 UI reducer 切换 session 时的明确 rebase。这样 UI reducer 不需要理解运行时 drain 细节。
 
 普通 prompt、skill、prompt template 和 prompt-producing slash command 都通过 `PromptDelivery` 进入相同队列入口。`Steer` 在最早 `before_next_model_call` 安全点消费，`FollowUp` 在当前 work 和 pending session action 完成后消费，`NextTurn` 只在下一次显式用户 turn 合并。`CommandRunPolicy::Immediate` 的 `/status` 等命令不改队列，直接追加 command output；`QueueAfterRun` 的 `/compact` 只更新 `pending_actions`。
+
+`AbortRun` 在进入 idle 前清除尚未消费的 steering/follow-up 和 pending actions，保留 `NextTurn`；只有状态实际变化时才发 `queue_updated`。`ClearQueue` 清除 steering、follow-up、next-turn 和 pending actions；若清理造成状态变化，则发布四者均为空的完整 `queue_updated`。两条路径都不携带 removed items 或 editor action。
 
 ### 15. Compaction Lifecycle
 
@@ -1248,6 +1253,8 @@ all calls resolved
 
 ## Abort Lifecycle
 
+本 lifecycle 的前置条件是目标 `run_id` 已通过 `run_started` 公开且仍为 current run；prompt admission/finalization 不进入 run abort lifecycle。
+
 ```text
 UI dispatch(AbortRun)
   ← CommandAck
@@ -1257,12 +1264,14 @@ SessionRuntime / Driver cancellation
   → discard remaining uncommitted partial assistant / approval / incomplete tool round
   → message_assistant_finished          // iff still started; closes UI lifecycle, not persisted
   → run_finished { status: aborted }
+  → queue_updated?                      // iff steering/follow-up/pending actions changed; next-turn preserved
   → session_phase_changed { phase: idle }
-  → queue_updated                       // clears pending compact; may also return/clear message queues
   → session_settled
 ```
 
 不要同时发 `run_aborted` 和 `run_finished`。推荐一个 terminal event：`run_finished { status: aborted }`，避免 UI reducer 处理双终态。若 abort 到达前 `AssistantFinal` commit 已进入 writer 并成功，则 commit admission ordering 判定 completed 已获胜，随后 abort 应得到 no-active-run / too-late 结果，不能把同一 run 改发 aborted；若获胜的是 `ToolRound` commit，则保留该完整 round、阻止下一模型调用，再以 aborted 收尾。
+
+abort 只清除仍未消费的 steering/follow-up 和 pending actions；`NextTurn` 不属于当前自动 work chain，因此保留。已经完成 `UserInput` commit 的 active steer 是 durable message，不得删除。`queue_updated` 仍只发布清理后的完整 snapshot，不携带 `returned_to_editor` 或 removed delta；editor restore 是具体 adapter 基于 UI-local submission history 实现的可选体验，不是 runtime event 或重连保证。显式 `ClearQueue` 才清除包括 `NextTurn` 在内的全部 queue state。
 
 ## Failure Lifecycle
 
@@ -1404,12 +1413,16 @@ MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 a
 MVP event lifecycle tests 应覆盖：
 
 - submit prompt text-only：`UserInput` / `AssistantFinal` commit 成功后才发布对应 message/run 事件，并验证 `session_settled` 顺序。
+- skill/template invocation：idle/future-turn 在 `UserInput` commit 后发布 `run_id = None` 的 invoked，再发 `message_user_appended`；active Steer 使用 `Some(current_run_id)`；展开或 commit 失败不发 invoked。
 - user input commit failure：不发布 `message_user_appended` / `run_started`，不调用模型，phase 回到 idle 并产生 command/runtime diagnostic。
 - assistant streaming：delta 必须在 `message_assistant_started` / `message_assistant_finished` 之间。
 - tool success：`tool_call_proposed` / `tool_call_started` / `tool_call_finished`；`ToolRound` commit 后先发布 tool-call assistant 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`。
 - tool round commit failure：以非持久化 `message_assistant_finished` 关闭已 started lifecycle，不发布 `message_tool_result_appended`，不进入下一模型调用，当前 run 以 failed terminal 收尾。
 - tool denied / approval rejected：产生 error tool result，与同 batch 其他 results 一起 commit 完整 `ToolRound` 后才发布 appended events，不产生 run failure。
-- abort run：只有一个 terminal `run_finished { status: aborted }`；started assistant 必须 finished，uncommitted partial/approval/tool round 不进入 session。
+- settled observation：没有 `WaitForIdle` command 或 wait-completed event；UI 通过 snapshot + `session_settled`，测试 event probe 必须先订阅再触发动作。任意 session 的 late-subscribe/gap 行为在 BR-044 关闭后再定义。
+- pre-run admission：`CommandAck` / `session_phase_changed(turn)` 不产生 run-level abort target；在任何 provider/model/tool/approval wait 前必须先发布 `run_started`。
+- abort run：只有一个 terminal `run_finished { status: aborted }`；started assistant 必须 finished，uncommitted partial/approval/tool round 不进入 session；若清理造成 queue state 变化，清除 steering/follow-up/pending actions、保留 `NextTurn` 的 `queue_updated` 必须先于 idle/settled。
+- clear queue：若 accepted command 实际清除了 queue/pending state，则发布 steering/follow-up/next-turn/pending actions 全为空的完整 `queue_updated`；空队列 no-op 不发冗余更新，也不发布 removed delta 或 editor action。
 - abort/commit race：in-flight `ToolRound` commit 先完成并保留 round，但不进入下一模型；in-flight `AssistantFinal` commit 成功时 completed 获胜，同一 run 不得再发 aborted。
 - final assistant commit failure：关闭已 started 的 assistant lifecycle，发 diagnostics + `run_finished { failed }`，不得发 completed。
 - session mutation commit failure：model/thinking/tools/name 等 runtime-visible state 不替换，也不发布 corresponding changed event。

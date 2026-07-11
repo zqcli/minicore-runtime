@@ -196,7 +196,6 @@ pub enum AgentCommand {
     ClearQueue { session_id: SessionId },
     AbortRun { run_id: RunId },
     ResumeRun { session_id: SessionId, resume_id: ResumeId },
-    WaitForIdle { session_id: SessionId },
     DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
     SetModel { session_id: SessionId, provider_id: String, model_id: String },
     SetThinkingLevel { session_id: SessionId, level: ThinkingLevel },
@@ -307,6 +306,16 @@ CycleThinkingLevel { session_id: SessionId }
 SetAutoCompaction { session_id: SessionId, enabled: bool }
 SetAutoRetry { session_id: SessionId, enabled: bool }
 ```
+
+`AbortRun { run_id }` 只取消已经通过 `run_started` 公开的 Agent run。`RunId` 在同一 runtime host 内全局唯一，`AgentRuntime` 可以通过 loaded runtimes 的 current-run lookup 路由到 owner `SessionRuntime`；terminal/stale id 返回 `NoActiveRun` / `StaleRun`，不会取消后来启动的 run。协议不把 `CommandAck` 扩展为 run-id 分配结果，也不引入 `AbortRun { session_id, run_id: Option<RunId> }`。
+
+`AbortRun` 停止当前自动 work chain：它清除尚未消费的 steering/follow-up queue 和 `PendingSessionAction`，保留不会自动启动 run 的 `NextTurn` queue；若清理造成 queue state 变化，则发布清理后的完整 `queue_updated`。已经在 safe point 完成 `UserInput` commit 的 steer 已属于 durable history，不能因 abort 删除或退回 queue。`ClearQueue` 则显式清除 steering、follow-up、next-turn 和 pending actions 全部当前 queue state。
+
+runtime 不实现“abort 后归还队列文本给编辑器”：`CommandAck`、`QueueEvent` 和 snapshot 都不携带 `returned_to_editor`、removed delta 或 editor action。queue 保存的是结构化 prompt intent，不保证保留 raw slash text、原始编辑器文本、光标或 undo state；这些属于 UI-local draft。具体 adapter 可以基于本地 submission history 与 reducer state 提供同一 host 内的 best-effort restore，但该体验不是 core protocol 或 reconnect guarantee。
+
+公开 `AgentCommand` 不包含 `WaitForIdle`，core 也不提供稳定的 `wait_until_settled()` API。等待未来状态既不是 mutation command，也不是立即返回的 query；UI 通过 `RuntimeSnapshot` 和 `session_settled` / `run_finished` 更新 reducer，一次性 CLI、RPC client 和测试如需 imperative await，只能在各自 adapter/test-support 层基于 EventStream 提供 `collect_until(...)` / `wait_for_event(...)` 薄 helper，并采用 subscribe-before-dispatch 或已有 reducer state；这不是任意 background session 的通用 late join，完整订阅/gap 语义属于 BR-044。runtime 内部需要“空闲后执行”的动作必须使用 phase guard、`CommandRunPolicy::QueueAfterRun` 或 typed `PendingSessionAction`，不能通过 wait-then-act 制造竞态。未来只有出现独立 runtime server 的明确需求时，才在 transport/SDK 层评估绑定具体 `RunId` 的 `run/join`，不重新引入 session-level idle command。
+
+`SessionPhase::Turn + current_run = None` 只允许出现在有界的 admission/preflight 和 post-run finalization 窗口。UI 只有在收到 `run_started` 或 snapshot 出现 `current_run.run_id` 后才提供 run-level abort；`CommandAck` 和单独的 `session_phase_changed(turn)` 都不表示 run 已经开始。模型/provider/tool/approval 等可能长时间等待的工作必须发生在 `run_started` 之后；session-level auto retry delay 属于独立 `RetryBackoff` phase，并由 `AbortRetry` 取消，不属于本规则。这里的“有界”表示 admission 只有有限步骤、没有无界 lifecycle/external wait，不是硬实时延迟保证；required session commit 仍遵守 writer 的不可中断与故障契约。UI 若要支持用户在 run id 到达前按下 Ctrl-C，可以只在 adapter 本地按 originating `command_id` 暂存 abort intent，收到 matching `run_started` 后立即发送普通 `AbortRun { run_id }`；若先收到 rejection、`session_phase_changed(idle)`、`session_settled` 或 session close，则清除该本地 intent。
 
 `NavigateSessionTree.target_entry_id` 和 `ForkSession.from_entry_id` 必须是 storage/query 暴露的 committed stable batch boundary。多-entry `ToolRound` 的 assistant message 或中间 tool result 不是合法目标；runtime 返回结构化 invalid target，不能投影或复制半个 stable batch。
 
@@ -494,15 +503,17 @@ pub enum CommandResultEvent {
 }
 
 pub enum SkillEvent {
-    Invoked { session_id: SessionId, run_id: RunId, skill_name: String },
+    Invoked { session_id: SessionId, run_id: Option<RunId>, skill_name: String },
 }
 
 pub enum PromptTemplateEvent {
-    Invoked { session_id: SessionId, run_id: RunId, template_name: String },
+    Invoked { session_id: SessionId, run_id: Option<RunId>, template_name: String },
 }
 ```
 
-`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开并绑定到某个 run 时发布，因此 `run_id` 必填。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。active Steer 在 active run 安全点展开后发 invoked，再追加对应 user message。展开失败则发 command/runtime diagnostic，不制造 invoked 事件。
+`QueueEvent::Updated` 始终是替换式完整状态，不附加 consumed/removed delta。abort 后 `steering`、`follow_up` 和 `pending_actions` 为空，`next_turn` 保留原值；`ClearQueue` 实际造成状态变化时，更新后的四者均为空；空队列 no-op 不要求冗余事件。UI 是否把本地保存的原始输入重新放回 editor 是 adapter policy，不是 queue event 的领域语义。
+
+`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开后发布。idle/future-turn admission 在 `UserInput` commit 成功后、`message_user_appended` 前发布，此时公开 run 尚未开始，`run_id = None`；active Steer 在 current run safe point 展开时使用 `run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。展开或 commit 失败不制造 invoked 事件。
 
 ```rust
 pub enum CompactionEvent {

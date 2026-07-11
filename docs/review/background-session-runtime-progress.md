@@ -689,7 +689,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 本轮确认：手动 `/compact` 不能隐式 abort 当前 run，但 running 时也不必直接拒绝。该语义现统一命名为 `CommandRunPolicy::QueueAfterRun`：idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，由 `SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 不受影响。早期 `CommandPhasePolicy::DeferUntilPostRun` 名称已由 ADR 0016 替换。
 
-pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal handling（required stable commit if any）和 terminal facts 完成后，在 follow-up/next-turn 之前执行。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
+pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal handling（required stable commit if any）和 terminal facts 完成后，在 queued steering continuation / follow-up continuation 之前执行；`NextTurn` 不自动启动并可保留到 settled 后的下一次显式 prompt。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`command-surface.md`、`session-runtime.md`、`compaction.md`、`implementation-roadmap.md`、`architecture.md`、`modules/README.md`、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-014 已标记为 Resolved。
 
@@ -726,3 +726,9 @@ BR-022 随后完成术语纯度清理。本轮仅提升文档表达，不改变�
 BR-023 通过 ADR 0018 关闭。`AgentRuntime` 现在明确提供 Command、Query、Event 和 Snapshot 四种能力；新增按 runtime/session/settings/resources/command surface/models/usage/diagnostics 分组的可扩展 `RuntimeQuery` 框架。query 只读并直接返回 `QueryResponse`，不经过 `CommandAck` 或 event stream；GUI sidebar、settings、资源详情和 usage 等程序化读取使用 Query，`/status` / `/usage` 等用户命令继续使用 command output。
 
 BR-024 通过 ADR 0019 关闭。所有 session mutation 统一走 `SessionWriter.commit(SessionWriteBatch)`，成功返回是可信写入结果；不引入 `SessionRevision`。writer 只接受 `UserInput`、完整 `ToolRound`、`AssistantFinal`、`Compaction`、独立 `SessionMutation` 和 `TreeMutation` 等稳定单元。公共 `persistence_save_point` 删除，commit 成功后才发布对应领域事件；running 中的 partial assistant、pending approval 和 incomplete tool round 不落盘，abort/failure/crash 只保留最后 committed batches。
+
+BR-027 按 run identity 边界关闭。`RunId` 只标识已经通过 `run_started` 公开的一次 `Driver::drive_run()`，在 runtime host 内全局唯一；`AbortRun { run_id }` 保持不变，由 loaded runtime current-run lookup 路由。`Turn + current_run = None` 是不可取消的有界 admission/finalization 窗口，模型/provider/tool/approval 等长等待必须发生在 `run_started` 后。UI 只在拿到 run id 后展示 run-level abort，也可以在 adapter 本地暂存提前的 Ctrl-C intent。
+
+BR-030 删除公开 `WaitForIdle`，且不新增 core `wait_until_settled()`。`session_settled` 是 observer 消费的领域事实；UI 使用 snapshot/event reducer，CLI/RPC/test 如需等待则在 adapter/test-support 层用 subscribe-before-dispatch 或已有 reducer state 提供 helper，不承诺任意 background session late join。runtime 内部需要 idle 后执行的动作继续使用 phase guard、`QueueAfterRun` 和 typed pending action；未来若出现独立 server 的明确需求，只评估绑定具体 RunId 的 transport-level join。
+
+BR-031 明确放弃 runtime 层“abort 后归还队列文本给编辑器”的行为。`AbortRun` 清除尚未消费的 steering/follow-up 和 pending action、保留 `NextTurn`，并在 queue state 实际变化时只发布清理后的完整 `queue_updated`；已经 commit 的 steer 保留在 durable history。`ClearQueue` 才清除全部 queue state。runtime 不增加 `returned_to_editor`、removed delta 或 editor action，具体 UI 可用本地 submission history 和 undo state 实现 best-effort restore，该体验不属于 core 或 reconnect contract。

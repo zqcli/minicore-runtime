@@ -12,7 +12,7 @@
 
 本轮发现的问题集中在三类：
 
-1. **协议表面仍有真实缺口**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort/crash 持久化语义（BR-024）已通过统一 stable batch writer 关闭；部分命令/事件字段仍与既定语义冲突（BR-027、BR-030、BR-031）。
+1. **协议表面的真实缺口已逐步关闭**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort/crash 持久化语义（BR-024）已通过统一 stable batch writer 关闭；abort queue 与 editor ownership 冲突（BR-031）已通过明确 UI-local restore 边界关闭。
 2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）已通过 `Tools` 权威文档补齐 source of truth。
 3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
@@ -83,18 +83,13 @@ streaming delta、partial assistant、pending approval、执行中的 tool round
 
 ### BR-027：`AbortRun { run_id }` 是唯一以 run_id 路由的命令，存在无法取消的竞态窗口
 
-状态：Open
+状态：Resolved
 
-问题：`AbortRun` 需要 `run_id`，但 UI 只能从 `run_started` 事件获得 run_id；`SubmitPrompt` 的 `CommandAck` 不携带 run_id。从 dispatch 到 `run_started` 之间（preflight、`BeforeAgentStart` hook、模型首包等待）UI 无法取消。同类命令 `WaitForIdle`、`Compact`、`AbortCompaction`、`AbortRetry` 都以 session_id 路由，仅 `AbortRun` 不对称。pi 的 `abort()` 是 session 级。
+处理记录：保留 `AbortRun { run_id: RunId }`，不引入 `AbortRun { session_id, run_id: Option<RunId> }` 或 session 级 current-run abort。`RunId` 被正式定义为一次已经公开启动的 `Driver::drive_run()` / Agent loop 的 runtime-host-global opaque id；它在建立 `CurrentRun`、即将调用 Driver 并发布 `run_started` 时分配，不是 prompt admission、`CommandId`、user turn 或 pending work id。`AgentRuntime` 通过 `LoadedSessionRuntimes.find_current_run(run_id)` 路由已经 started 且尚未 terminal 的 run，这个 lookup 不是 durable registry。
 
-证据：
+`CommandAck` 和 `session_phase_changed(turn)` 不表示 run 已开始。`Turn + current_run = None` 是不可通过 `AbortRun` 取消的有界 admission/preflight 或 post-run finalization 窗口；其中只允许有限步骤的 validation、captured prompt assembly、required session commit 和有界 hook；bounded 不表示硬实时 deadline，writer 仍遵守不可中断与故障契约。模型/provider/tool/approval 等可能长时间等待的 run work 必须在 `run_started` 之后发生；session-level retry delay 仍属于独立 `RetryBackoff` phase。因此“慢模型首包没有 run id”不成立。
 
-- `docs/modules/agent-runtime-protocol.md`：`AbortRun { run_id: RunId }`；`CommandAck { command_id, accepted, reason }` 无 run_id。
-- `docs/modules/agent-runtime-events.md`：run_id 由 `SessionRuntime` 在 `run_started` 才对外可见。
-
-风险：用户在最需要取消的阶段（卡在启动/慢首包）无法取消；UI 需要为"取消"按钮做特殊等待逻辑。
-
-待处理方向：改为 `AbortRun { session_id, run_id: Option<RunId> }`（None = 当前 run），或提供 session 级 `AbortCurrentRun`。
+UI 只有在收到 `run_started` 或 snapshot 中存在 `current_run.run_id` 后才展示 run-level Stop 并发送 `AbortRun`。adapter 如需支持用户提前按 Ctrl-C，可以仅在 UI 本地按 originating `command_id` 暂存 abort intent；收到 matching `run_started` 后立即发送普通 `AbortRun { run_id }`，若先收到 rejection、`session_phase_changed(idle)`、`session_settled` 或 session close 则清除。该 intent 不进入 runtime command、queue、event 或 snapshot。
 
 ### BR-028：运行输入存在双入口（`SubmitPrompt.delivery` vs `Steer`/`FollowUp`/`NextTurn`），且 `DeliveryMode`、`QueueKind`、`QueueMode` 未定义
 
@@ -125,22 +120,17 @@ slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfte
 
 ### BR-030：`WaitForIdle` 作为协议命令在 ack-only 模型下语义不成立
 
-状态：Open
+状态：Resolved
 
-问题：`dispatch()` 返回的 `CommandAck` 被明确定义为"只表示命令是否被接收，不是执行结果"。那么 `WaitForIdle` 的"等待完成"无法通过任何已定义机制表达：没有 wait 完成事件，若靠 dispatch 阻塞到 idle 才返回 ack 则违反 ack 语义并阻塞 transport。UI 想知道 idle 直接监听 `session_settled` / `session_phase_changed` 即可，该命令在协议层没有存在价值——pi 的 `waitForIdle()` 是进程内 async 方法，不应原样搬进 wire 协议。
+处理记录：从公开 `AgentCommand` 删除 `WaitForIdle { session_id }`，不新增 `wait_finished` event，也不在 `AgentRuntime` / `SessionRuntimeHandle` 增加稳定 `wait_until_settled()`。等待未来状态不是 mutation command，也不是立即返回的 query；`CommandAck` 继续只表达接收，`session_settled` 继续表达 session 已进入 Idle 且没有马上继续的 run/compaction/retry/pending action 或 steering/follow-up continuation；`NextTurn` queue 可以保留。
 
-证据：
+UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settled`。一次性 CLI、RPC client 和测试如需 imperative await，在 adapter/test-support 层先订阅再 dispatch，或使用调用方已有的 session reducer，并提供 `collect_until(...)` / `wait_for_event(...)` 薄 helper；这些 helper 不是 core 稳定 API，也不承诺任意 background session 的 late join。订阅起点、lag 和 gap recovery 留给 BR-044。runtime 内部顺序执行继续使用 phase guard、`CommandRunPolicy::QueueAfterRun` 和 typed `PendingSessionAction`，不采用容易产生 TOCTOU race 的 wait-then-act。
 
-- `docs/modules/agent-runtime-protocol.md`：`WaitForIdle { session_id }`；`CommandAck` 语义段。
-- `docs/modules/agent-runtime-events.md`：Command Lifecycle 明确 ack 只是接收确认。
-
-风险：实现者被迫发明私有语义（阻塞 ack 或私有事件），协议一致性破坏。
-
-待处理方向：从公开协议移除，保留为 runtime 内部 API；或定义显式完成事件并说明与 `session_settled` 的关系。
+同类项目验证了这个边界：pi core 有进程内 Promise，RPC client 的 `waitForIdle()` 只是等待 `agent_settled` 的客户端 helper，并非 RPC command；Codex 使用 `turn/completed` 与 thread idle status；OpenCode 使用同步 prompt 或 async prompt + session status/idle event；ACP v2/Goose 使用 accepted response + running/idle update；LangGraph 的 `/runs/wait` / run join 绑定具体 run 且属于 server SDK request，不是 session mutation。MiniCore 当前不是独立 server，只有未来出现明确 remote run-join 需求时才在 transport/SDK 层另行设计。
 
 ### BR-031：abort 后"归还队列文本给编辑器"没有协议载体
 
-状态：Open
+状态：Resolved
 
 问题：session-runtime.md 要求"在 `AbortRun` 时返回被清空的 steering 与 follow-up 消息，供 UI 恢复到编辑器"，但 `CommandAck` 不携带数据，`queue_updated` 只发送清空后的完整队列快照（不含"被移除的消息"）。按现有协议，UI 只能靠本地缓存上一次 `queue_updated` 来恢复文本——这与"UI 权威输入只有 snapshot/event"的原则冲突。
 
@@ -151,13 +141,15 @@ slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfte
 
 风险：pi 的这条产品体验在协议化后静默丢失，或以 UI 私有状态实现。
 
-待处理方向：`queue_updated` 增加 `returned_to_editor` / removed 明细，或定义 abort 专属事件字段；或明确放弃该行为。
+处理记录：明确放弃 core 层“abort 后归还队列文本给编辑器”的行为。editor draft、光标、submission history 和 undo state 属于 UI adapter；runtime queue 保存结构化 prompt intent，不保证保留 raw slash text，也不能可靠重建原始编辑器内容。因此 `CommandAck`、`QueueEvent` 和 snapshot 不增加 `returned_to_editor`、removed delta 或 abort 专属 UI 字段。
+
+`AbortRun` 清除尚未消费的 steering/follow-up 和 pending session actions，保留不会自动启动 run 的 `NextTurn`；若 queue state 实际变化，则发布完整 `queue_updated` snapshot。已经在 safe point 完成 `UserInput` commit 的 steer 已属于 durable history，不可因 abort 删除。显式 `ClearQueue` 才清除 steering、follow-up、next-turn 和 pending actions 全部 queue state。具体 UI 可以基于本地 submission history 与 reducer state 提供同一 host 内的 best-effort restore，但它不是 core protocol、session storage 或 reconnect guarantee。
 
 ### BR-032：`skill_invoked` / `prompt_template_invoked` 的 `run_id` 必填与队列 delivery 冲突
 
 状态：Resolved
 
-处理记录：invoked 事件固定为“目标 `PromptTurn.resolve_intent()` 已实际展开结构化 intent，并已绑定到某个 run”的事实，因此 `run_id` 保持必填。FollowUp/NextTurn 入队时只通过 `CommandAck` 和 `queue_updated` 表达受理，不提前发 invoked；目标 future run 启动并展开后才发 invoked。active Steer 在 active run safe point 展开后发 invoked，再追加对应 user message。展开失败不发 invoked，只产生结构化 command/runtime diagnostic。
+处理记录：BR-027 明确 `RunId` 只在 `run_started` 边界分配后，本项决策同步修正为 optional run association。invoked 事件表示目标 `PromptTurn.resolve_intent()` 已实际展开且对应 durable input commit 成功，不再声称 idle admission 已绑定公开 run：idle/future-turn 使用 `run_id = None`，active Steer 使用 `Some(current_run_id)`。FollowUp/NextTurn 入队时仍只通过 `CommandAck` 和 `queue_updated` 表达受理，不提前发 invoked；展开或 commit 失败不发 invoked。
 
 ### BR-033：`EventMsg` 内层路由字段的有无不一致
 

@@ -204,9 +204,21 @@ pub trait DriverHost {
 impl SessionRuntime {
     pub async fn start_run(
         &mut self,
-        request: DriveRequest,
+        turn_state: TurnState,
+        entry: DriveEntry,
         cancel: CancellationToken,
     ) -> DriveResult {
+        let run_id = self.allocate_run_id();
+        let request = DriveRequest {
+            run_id,
+            session_id: self.session_id,
+            entry,
+            turn: turn_state.driver_turn_input(),
+            limits: self.drive_limits(),
+        };
+        self.current_run = Some(CurrentRun::starting(run_id, turn_state));
+        self.publish_run_started(run_id).await;
+
         let driver = Driver::new();
         driver.drive_run(request, self, cancel).await
     }
@@ -281,6 +293,9 @@ impl SessionRuntime {
     ) -> DriveResult {
         let run_id = self.allocate_run_id();
         let turn_resources = turn_state.resources.clone();
+        self.current_run = Some(CurrentRun::starting(run_id, turn_state.clone()));
+        self.publish_run_started(run_id).await;
+
         let request = DriveRequest {
             run_id,
             session_id: self.session_id,
@@ -334,13 +349,12 @@ wrapper 的 `invoke_tool_batch(...)` 必须和 direct impl 执行同一事务：
 
 ## Driver Events
 
-`DriverEvent` 是 driver 内部事件，不是 UI 直接消费的 `agent_runtime_protocol::Event`。`SessionRuntime` 订阅并归约这些事件，组装并提交稳定 session batches，再发 UI event、更新 snapshot。
+`DriverEvent` 是 driver 内部事件，不是 UI 直接消费的 `agent_runtime_protocol::Event`。`run_started` 不来自 DriverEvent：`SessionRuntime` 在建立 `CurrentRun` 后、调用 `drive_run()` 前直接发布它，保证任何 model/provider/tool wait 都已有公开 RunId。`SessionRuntime` 订阅并归约这些事件，组装并提交稳定 session batches，再发 UI event、更新 snapshot。
 
 driver 的 `RunFinished { result }` 只表示 Rig drive 已经结束；UI 侧唯一 run terminal event 是 `run_finished { status, ... }`，由 `SessionRuntime` 在完成必要的 stable batch commit、错误归类和后续队列判断后发出。`DriveResult::Suspended` 不应归约为 `run_finished`；它由 `SessionRuntime` 分配 `ResumeId`、仅在同一 host 生命周期的内存中保存 resume state，并发出非终态 `run_suspended`。
 
 ```rust
 pub enum DriverEvent {
-    RunStarted { run_id: RunId, session_id: SessionId },
     ModelCallStarted { run_id: RunId, turn: usize },
     ModelTextDelta { message_id: MessageId, delta: String },
     ModelCallFinished { run_id: RunId, turn: usize, usage: Option<ModelCallUsage> },

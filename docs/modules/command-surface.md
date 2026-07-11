@@ -310,6 +310,7 @@ pub enum AgentCommand {
     ExecuteCommandText { session_id: Option<SessionId>, raw: String, prompt_delivery: PromptDelivery },
     ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs, prompt_delivery: PromptDelivery },
     DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
+    ClearQueue { session_id: SessionId },
     AbortRun { run_id: RunId },
     ResumeRun { session_id: SessionId, resume_id: ResumeId },
     ReloadResources { workspace_id: WorkspaceId, cwd: PathBuf },
@@ -318,6 +319,8 @@ pub enum AgentCommand {
     SetActiveTools { session_id: SessionId, tool_names: Vec<String> },
 }
 ```
+
+`AbortRun { run_id }` 只针对已经由 `run_started` 公开、尚未 terminal 的 host-global run；command surface 不为 preflight 创建 synthetic run id，也不把 UI-local pending abort intent 送入 runtime。abort 清理 runtime-owned steering/follow-up 和 pending action、保留 `NextTurn`，但不返回 editor text 或 UI action；编辑器恢复只能由具体 adapter 使用本地 draft/history 实现。
 
 `ExecuteCommandText` 覆盖 TUI slash input 和 GUI command palette 的文本入口。`ExecuteCatalogCommand` 覆盖 GUI/TUI 从 catalog 选择某个节点后的结构化执行入口。它只能携带 command selection、catalog revision、bindings、args 和 prompt-producing command 使用的 `prompt_delivery`，不能携带完整 runtime mutation command。
 

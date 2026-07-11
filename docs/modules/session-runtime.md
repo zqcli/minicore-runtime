@@ -7,10 +7,10 @@
 - 状态访问：messages、current run、model、thinking level、system prompt、active tools、all tools、resources、queues、session id、session name、session file、retry attempt、context usage 和 session stats。
 - 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；把稳定事实组装为 `SessionWriteBatch` 并统一调用 `SessionHandle.commit(...)`，成功后再通过 `AgentRuntime` event bus 发布对应领域事件。
 - command 入口：持有 session-scoped `command: Command`，为当前 session 构造 `CommandContext` / `SessionCommandHost`，并调用共享无状态 `CommandManager` 处理 `ExecuteCommandText` / `ExecuteCatalogCommand`。
-- prompt 入口：处理 `SubmitPrompt` 和其他结构化 `PromptIntent`，执行输入预检、模型/凭据校验、附件策略和 `PromptDelivery` admission；目标 turn 由 `PromptTurn.resolve_intent()` 统一展开 skill/template。
+- prompt 入口：处理 `SubmitPrompt` 和其他结构化 `PromptIntent`，执行输入预检、模型 catalog/capability 与 cached redacted auth-availability 校验、附件策略和 `PromptDelivery` admission；真实 `AuthStore.resolve(...)` / provider client 构造只能在 `run_started` 后进入 `ModelGateway`；目标 turn 由 `PromptTurn.resolve_intent()` 统一展开 skill/template。
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`，并持有结构化 `PendingSessionAction`；运行中输入或 deferred session action 不能绕过当前 work 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message；只接受完整 draft，通过 `SessionMutation` 或 `UserInput` batch 提交后决定是否触发 turn。
-- 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
+- 运行生命周期：启动 run、continue、post-run arbitration、失败消息构造、abort、phase 切换和 `session_settled` 状态归约。
 - 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
 - 工具与提示词配置：持有 session-scoped `Tools` 子系统；在 turn start 汇合 captured `PromptResourceView`、tool/model/agent/environment/policy views 创建 immutable `PromptTurn`。active tools 或模型可见 profile 在安全点变化时，使用同一 captured resources 重建并整体替换 `PromptCallProfile`。
@@ -58,7 +58,11 @@ SessionRuntime
 | `Compaction` | `None` | 只推进当前 compaction；prompt intent 可以排队但不能启动 Agent run |
 | `RetryBackoff` | `None` | 等待/取消 Agent run retry；prompt intent 可以排队但不能绕过既定 work chain |
 
+`Turn + current_run = None` 是不可通过 `AbortRun` 取消的有界 admission/preflight 或 post-run finalization 窗口。进入 provider/model/tool/approval 等可能长时间等待的 run work 前，`SessionRuntime` 必须先分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`。session-level auto retry delay 属于独立 `RetryBackoff` phase，并由 `AbortRetry` 取消，不属于该 run-start 规则。admission 中只允许 bounded in-memory validation、captured prompt assembly 和 required session commit；这里的 bounded 表示有限步骤且没有无界 lifecycle/external wait，不是硬实时延迟保证，writer commit 仍遵守不可中断与故障契约。未来 hook 若位于该窗口，也必须有界并由自身 timeout/error policy 收尾，不能把它变成隐藏的长任务。
+
 phase guard 还必须结合 `CurrentRunState` 和 command policy：`DecideToolApproval` 只在 `Turn + WaitingApproval` 合法，`ResumeRun` 只在 `Turn + Suspended` 合法；`AbortCompaction` 只在 `Compaction` 合法，`AbortRetry` 只在 `RetryBackoff` 合法。`Compact` 在 `Idle` 立即进入 `Compaction`，在 `Turn` / `RetryBackoff` 保存唯一 pending action，在 `Compaction` 返回 `CompactionAlreadyRunning`。
+
+`SessionRuntime` 不实现 `wait_until_settled()` 来驱动内部顺序。要求 idle 的 command 通过 phase guard 原子检查；active work 后执行的动作保存为 typed pending action，并由 post-run arbitration 调度。这样避免 `wait → 其他 work 抢先启动 → act` 的 TOCTOU race。
 
 `Turn` 可以包含连续多个 run；只要 immediate retry/continuation、pending action 或 overflow recovery 将立即继续，就不经过 `Idle`，也不发送 `session_settled`。完整转换矩阵见 [AgentRuntimeEvents](agent-runtime-events.md)。`BranchSummary` 不属于 MVP phase；未来若实现独立摘要模型任务，应定义明确 `ModelCallPurpose` 和 lifecycle，而不是预留幽灵 phase。
 
@@ -102,7 +106,7 @@ Product / agent / environment / policy views
   → PromptTurn { PromptCallProfile, contribution stamps, fingerprint }
 ```
 
-创建时机包括新 user turn、follow-up/next-turn continuation 和 overflow recovery 后的新 continuation。普通 resource reload 不 patch active `PromptTurn`。
+创建时机包括新 user turn、follow-up continuation、显式新 prompt 消费 `NextTurn` queue，以及 overflow recovery 后的新 continuation。`NextTurn` 自身不会自动启动 continuation。普通 resource reload 不 patch active `PromptTurn`。
 
 如果运行中合法切换模型可见工具、agent profile 或其他会影响 system prompt 的 profile，`SessionRuntime` 在 `before_next_model_call` 安全点使用 active turn 的同一个 `PromptResourceView` 重新执行 `begin_turn()`，并整体替换 `PromptCallProfile`。不能分别 patch system prompt 和 active tool schemas。
 
@@ -216,6 +220,8 @@ pub struct SessionRuntime {
 ```rust
 let run_id = self.allocate_run_id();
 let turn_resources = turn_state.resources.clone();
+self.current_run = Some(CurrentRun::starting(run_id, turn_state.clone()));
+self.event_sink.publish_run_started(self.session_id, run_id).await?;
 
 let request = DriveRequest {
     run_id,
@@ -241,6 +247,8 @@ let mut host = SessionDriverHost {
 let driver = Driver::new();
 driver.drive_run(request, &mut host, cancel).await
 ```
+
+`allocate_run_id()` 只在 runtime 已完成 admission、即将建立 `CurrentRun` 并调用 `drive_run()` 时执行；它使用 runtime-global id generator。`run_started` 必须在任何 provider/model/tool/approval wait 之前发布。preflight 不预分配 RunId，也不制造没有 `run_started` 的幽灵 run。
 
 该 wrapper 实现下面的 seam：
 
@@ -361,7 +369,9 @@ SessionRuntime.admit_prompt_intent(intent, PromptDelivery)
 
 不存在独立的 `Steer` / `FollowUp` / `NextTurn` protocol command。普通 prompt、skill、prompt template 和 prompt-producing slash command 都必须经过同一个 admission path，因此 phase guard、queue event、resource capture 和后期 hook 不会分叉。slash command 只能把已经 resolve 的结构化 prompt intent 交给该入口，不能把 raw slash text 放入消息队列。
 
-`QueueMode::All` / `OneAtATime` 只控制 steering/follow-up 每个安全点消费全部还是一条。运行时应在消息队列或 pending action 变化时发出完整 `queue_updated`。`AbortRun` / `ClearQueue` 清除 pending manual compact；pending action 不作为文本返回编辑器，因为它不是 `QueuedMessage`。
+`QueueMode::All` / `OneAtATime` 只控制 steering/follow-up 每个安全点消费全部还是一条。运行时应在消息队列或 pending action 变化时发出完整 `queue_updated`。`AbortRun` 清除尚未消费的 steering/follow-up 和 pending manual compact，保留 `NextTurn`；`ClearQueue` 清除 steering/follow-up/next-turn 和 pending action 全部 queue state。已经完成 `UserInput` commit 的 steer 不再属于 queue，abort 不能从 durable history 删除它。
+
+`SessionRuntime` 不持有 editor draft，也不返回 `returned_to_editor` 或 removed queue delta。queue 中的结构化 intent 不保证保留 raw slash text，不能被 runtime 解释为可恢复的编辑器文本；具体 adapter 如需恢复体验，只能使用自己的 submission history、editor undo state 和 event reducer 做 best-effort local restore。该行为不进入 runtime protocol、snapshot、session storage 或 reconnect contract。pending action 也不作为文本返回编辑器，因为它不是 `QueuedMessage`。
 
 post-run arbitration 顺序固定为：
 
@@ -391,7 +401,7 @@ pub struct NextModelCallPlan {
 }
 ```
 
-`persistent_messages` 是已由 active `PromptTurn.resolve_intent()` 展开的 steer，必须进入 Rig/run history；`prompt_profile` 只能是用 active captured resources 重建后的完整 profile；`current_call_context` 只影响下一次调用。context owner 的获取失败也必须作为 `Unavailable` 保留，不能通过缺项吞掉 required failure。`SessionRuntime` 不直接构造最终 messages，它把 plan 返回给 Driver，由 Driver 调用 Prompt 的 final projection seam。
+`persistent_messages` 是 active `PromptTurn.resolve_intent()` 展开的 steer，但只有完成 safe-point transaction 后才能放入 plan：消费结构化 steering intent → 展开最终 user message → commit `SessionWriteBatch::user_input(...)` → 若为 skill/template 则发布 `skill_invoked` / `prompt_template_invoked { run_id: Some(current_run_id) }` → 发布 `message_user_appended` → 加入 `persistent_messages`。commit 失败时当前 run 进入 failed terminal path，不能让 Driver/Rig 使用仅存在内存的 steer。`prompt_profile` 只能是用 active captured resources 重建后的完整 profile；`current_call_context` 只影响下一次调用。context owner 的获取失败也必须作为 `Unavailable` 保留，不能通过缺项吞掉 required failure。`SessionRuntime` 不直接构造最终 messages，它把 plan 返回给 Driver，由 Driver 调用 Prompt 的 final projection seam。
 
 ## Command Run Policy
 
@@ -409,14 +419,14 @@ resolved command
 ## 运行流程
 
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
-2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`。
-3. 将 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后发布 `message_user_appended`，再构建不含重复 current input 的 durable history baseline。
-4. 构建 `TurnState { resources, prompt_turn, messages, model, tools, ... }`；后期可触发 `BeforeAgentStart` / `PromptBuilt`，应用结果后重新校验 profile。
-5. 将 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }` 后交给 `Driver.drive_run()`。
+2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
+3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
+4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布 `skill_invoked` / `prompt_template_invoked { run_id: None }`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
+5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 `DriveRequest` 后调用 `Driver.drive_run()`。
 6. 每次下一模型调用前进入 run safe point；`SessionRuntime` 消费 steer、应用合法 profile 变化、收集 typed context materials，并返回 `NextModelCallPlan`。
-7. `Driver` 应用 persistent messages/profile 后调用 `Prompt::project_model_call(...)`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
+7. `Driver` 应用已 committed persistent messages/profile 后调用 `Prompt::project_model_call(...)`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
 8. 工具调用通过 `Tools` 子系统治理和执行；`Tools` 返回最终 normalized results 后，`SessionRuntime` 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`。随后把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，`SessionRuntime` 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`；随后 host 才把结果返回 Driver，Driver 回填 Rig 并允许下一模型调用。
-9. 正常最终 assistant message 组装为 `AssistantFinal` batch；commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
+9. 正常最终 assistant message 组装为 `AssistantFinal` batch；commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 
 稳定 batch 的数量由实际会话事实决定，不按 run 固定。正常 text-only `Completed` run 至少提交 `UserInput` 和 `AssistantFinal` 两个 batch。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result round 都必须先提交一个 `ToolRound` batch；并行结果按 `call_index` 归约后共享该 batch。streaming delta、tool output delta、queue state、partial assistant、pending approval 和执行中的 tool round 不进入 writer。
 
