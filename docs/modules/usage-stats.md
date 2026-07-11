@@ -26,23 +26,7 @@ else:
 
 有效 assistant usage 必须来自非 `aborted`、非 `error` 的 assistant message，且 token 数大于 0。本地估算使用保守字符启发式：文本约 `chars / 4`，图片按固定大块估算，tool call 使用工具名加 JSON 参数长度，tool result/bash/summary 使用内容长度估算。
 
-provider-neutral usage view 拆成：
-
-```rust
-pub struct TokenUsage {
-    pub input_tokens: i64,
-    pub cached_input_tokens: i64,
-    pub output_tokens: i64,
-    pub reasoning_output_tokens: i64,
-    pub total_tokens: i64,
-}
-
-pub struct TokenUsageInfo {
-    pub total_token_usage: TokenUsage,
-    pub last_token_usage: TokenUsage,
-    pub model_context_window: Option<i64>,
-}
-```
+provider-neutral usage 使用本文“数据结构”小节和 `AgentRuntimeProtocol` 共同定义的唯一 `TokenUsage`：所有字段为 `u64`，并保留 `cached_input_tokens`、`cache_write_tokens`、`reasoning_output_tokens`。不再维护另一份 `i64 TokenUsageInfo` shape。
 
 Codex 还把 `token_count` 作为事件推给 UI，并用 `non_cached_input + output` 作为更适合展示的 blended total，同时把 cached input 和 reasoning output 单独展示。
 
@@ -95,6 +79,16 @@ pub struct ModelCallUsage {
     pub raw_provider_usage: Option<serde_json::Value>,
 }
 
+pub struct PersistedModelCallUsage {
+    pub call_id: ModelCallId,
+    pub run_id: Option<RunId>,
+    pub provider_id: String,
+    pub model_id: String,
+    pub purpose: ModelCallPurpose,
+    pub usage: TokenUsage,
+    pub source: UsageSource,
+}
+
 pub struct UsageSummary {
     pub model_calls: u32,
     pub total: TokenUsage,
@@ -110,7 +104,7 @@ pub struct ModelUsageSummary {
 }
 ```
 
-`ModelCallUsage` 是单次模型调用事实；`UsageSummary` 是一次 run 内所有模型调用的聚合。`ModelCallUsage.purpose` 必须直接复制 `ModelCallRequest.purpose`，不能在 usage 层重新判断或转换。`raw_provider_usage` 只允许作为内部 redacted diagnostic，默认不进入 `AgentRuntimeProtocol`、`SessionEntry`、hook context 或日志明文。
+`ModelCallUsage` 是当前 host 内的单次模型调用事实；`PersistedModelCallUsage` 是唯一允许进入 `SessionEntryDraft` / JSONL 的 durable shape；`UsageSummary` 是一次 run 内所有模型调用的聚合。`ModelCallUsage.purpose` 必须直接复制 `ModelCallRequest.purpose`，不能在 usage 层重新判断或转换。组装 stable batch 前，`SessionRuntime` 必须显式调用等价的 `ModelCallUsage::to_persisted()`，该转换不包含 `raw_provider_usage`；writer 也必须拒绝任何携带 raw provider payload 的 draft。`raw_provider_usage` 只允许作为内部 redacted diagnostic，默认不进入 `AgentRuntimeProtocol`、`SessionEntry`、hook context 或日志明文。
 
 `cache_write_tokens` 保留给 Anthropic / OpenAI prompt caching 之类 provider 差异；UI MVP 可以不展示，但 stats 层不要丢。
 
@@ -216,8 +210,8 @@ SessionRuntime
   emits usage_updated and includes final usage in run_finished.
 
 SessionHandle / SessionStorage
-  persist recoverable usage facts or assistant aggregate usage;
-  do not calculate realtime stats.
+  persist recoverable per-model-call usage with committed assistant/compaction facts;
+  do not calculate realtime stats or persist the same run aggregate on every message.
 
 UI
   renders usage views from agent_runtime_protocol::Event / agent_runtime_protocol::RuntimeSnapshot;
@@ -232,26 +226,24 @@ run-level `UsageSummary` 只聚合关联到该 run 的 `ModelCallPurpose::AgentR
 
 ## Session Persistence
 
-MVP 可以把 run-level aggregate usage 存在 assistant message 或 run result 附近：
+MVP 把每次模型调用的 usage 跟随对应 stable fact 提交，而不是把整段 run aggregate 重复写进每条 assistant message：
 
 ```text
-AssistantMessage.usage = UsageSummary for the run or assistant turn
-RunFinished.usage = same aggregate view for UI
+ToolRound.assistant.usage = PersistedModelCallUsage for that tool-call response
+AssistantFinal.message.usage = PersistedModelCallUsage for the final response
+Compaction.result.usage = PersistedModelCallUsage for the compaction summary call
+RunFinished.usage = UsageSummary aggregated for current-host UI only
 ```
 
-中期建议增加专门 session entry：
+恢复 `SessionUsageStats` 时按唯一 `call_id` 汇总 committed facts，不能把 `RunFinished.usage` 再次计入。provider 已产生 usage 但对应 assistant/tool round 尚未 commit 时，当前 host 可以发 `usage_updated`；crash 后该 in-flight usage 不保证恢复，因此 MiniCore usage 不是 provider billing ledger。
+
+中期可以增加专门 session entry，以更精确保存失败调用或不伴随 assistant message 的 usage：
 
 ```rust
 pub enum SessionEntry {
     Usage {
         base: EntryBase,
-        run_id: Option<RunId>,
-        model_call_id: ModelCallId,
-        purpose: ModelCallPurpose,
-        provider_id: String,
-        model_id: String,
-        usage: TokenUsage,
-        source: UsageSource,
+        fact: PersistedModelCallUsage,
     },
     // ...
 }
@@ -263,7 +255,7 @@ pub enum SessionEntry {
 
 ## AgentRuntimeEvents And RuntimeSnapshot
 
-`usage_updated` 是实时 UI 更新事件，生命周期顺序以 [AgentRuntimeEvents](agent-runtime-events.md) 为准；它不代表持久化完成。可恢复边界仍然看 `persistence_save_point`。
+`usage_updated` 是实时 UI 更新事件，生命周期顺序以 [AgentRuntimeEvents](agent-runtime-events.md) 为准；它可以包含当前 host 尚未提交的运行中统计。需要跨进程恢复的 usage facts 必须写入相关稳定 session batch，并在正常 `run_finished` 或 `compaction_finished` 前 commit。
 
 推荐发送时机：
 
@@ -271,9 +263,9 @@ pub enum SessionEntry {
 model call finished
   → usage_updated { run_usage, session_stats?, context_usage? }
 
-run finished
-  → run_finished { usage: final run usage }
+final stable batch committed
   → usage_updated { run_usage, session_stats, context_usage }
+  → run_finished { usage: final run usage }
 
 compaction finished
   → usage_updated { context_usage after compaction }

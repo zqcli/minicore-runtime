@@ -53,8 +53,8 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、`WorkspaceServices` / `ResourceSnapshotStore`、会话打开/聚焦和工作区生命周期。
 - [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、`PromptDelivery` admission、消息队列、`CommandRunPolicy::QueueAfterRun` 产生的结构化 pending session actions、turn state 和 post-run 流程；后期在其拥有的安全点接入 Hook。
 - [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::AgentCommand`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
-- [AgentRuntimeEvents](modules/agent-runtime-events.md)：`agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
-- [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
+- [AgentRuntimeEvents](modules/agent-runtime-events.md)：`agent_runtime_protocol::Event { ..., msg }`、事件生命周期、commit 后领域事实、重连和跨模块事件顺序。
+- [SessionManager / SessionWriter / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、统一 stable batch writer、追加式 session tree、一行一 batch 的 JSONL adapter 和上下文重建。
 - [ResourceManager](modules/resource-manager.md)：资源来源聚合、刷新和资源诊断。
 - [CommandSurface](modules/command-surface.md)：跨 UI 的用户命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry 和执行前 resolve。
 - [RuntimeHooks](modules/runtime-hooks.md)：后期内部 hook seam、hook/event 边界、capability、typed result、owner 分层和安全点。
@@ -73,7 +73,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - 下游 CLI/TUI/GUI 不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面；其 interface 分为 `dispatch`、`query`、`subscribe` 和 `snapshot`，mutation/异步工作、只读数据、运行变化和恢复读模型不能混用通道。
-- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。多个 `SessionRuntime` 可以同时 loaded/running；每个 runtime 固定自己的 workspace cwd，每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
+- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。所有 session mutation 通过 `SessionWriter.commit(SessionWriteBatch)`，只提交协议完整的稳定单元；多个 `SessionRuntime` 可以同时 loaded/running，每个 runtime 固定自己的 workspace cwd，并在每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
 - `SessionRuntime` 是单个会话的产品级编排层和 Prompt Pull Master。它捕获资源并创建 `PromptTurn`，拥有完整 `TurnState`，只把包含原子 `PromptCallProfile` 的窄 `DriverTurnInput` 投影给 `Driver`。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
@@ -104,3 +104,4 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [ADR 0016：命令运行策略与提示词交付方式分离](adr/0016-separate-command-run-policy-from-prompt-delivery.md)
 - [ADR 0017：Prompt 使用不可变 turn 组装而不是长期 Manager](adr/0017-prompt-uses-immutable-turn-assembly.md)
 - [ADR 0018：AgentRuntime 分离 Command、Query、Event 和 Snapshot](adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)
+- [ADR 0019：会话写入使用统一可信的 batch writer](adr/0019-session-writes-use-one-trusted-batch-writer.md)

@@ -55,7 +55,7 @@ Rig 拥有：
 - compaction、summary prompt、context trimming、session context reconstruction。
 - steering/follow-up/next-turn queue storage。
 - session usage stats、context usage、成本展示口径。
-- session file writes、save point、session tree。
+- session writer、stable batch commit、session tree。
 - UI command/event transport。
 
 ## Rig 工具执行能力
@@ -103,7 +103,7 @@ pub async fn drive_run(
 
 不要暴露 `run_prompt()` / `continue_run()` 两个顶层方法。它们容易和 Rig 自身 prompt API、session continuation、queued follow-up 混淆。统一使用 `drive_run()`，通过 `DriveEntry` 表达进入本次 run 的方式。
 
-`drive_run()` 不再返回 `Result<DriveResult, DriverError>`。普通 provider/tool/protocol 失败应归约为 `DriveResult::Failed`，这样 `SessionRuntime` 仍能拿到已产生的 messages 做持久化、失败消息构造和 UI 收尾。
+`drive_run()` 不再返回 `Result<DriveResult, DriverError>`。普通 provider/tool/protocol 失败应归约为 `DriveResult::Failed`，让 `SessionRuntime` 统一完成 diagnostics、UI lifecycle 收尾和 run terminal event；失败或 abort 时的 partial output 不进入 session writer。
 
 ```rust
 pub struct DriveRequest {
@@ -136,20 +136,27 @@ MVP 可以先不实现 `Resume`，但类型上保留方向。Rig `AgentRun` 是 
 
 ```rust
 pub enum DriveResult {
-    Completed { messages: Vec<MessageRecord>, usage: UsageSummary },
-    Aborted { messages: Vec<MessageRecord> },
-    Failed { error: DriverError, messages: Vec<MessageRecord> },
+    Completed { final_message: MessageRecord, usage: UsageSummary },
+    Aborted,
+    Failed { error: DriverError },
     Suspended { reason: SuspendReason, serialized_run: SerializedAgentRun },
 }
 ```
 
-MVP 可以暂不产生 `Suspended`，但不要把接口设计死成只能 completed/failed/aborted。`Suspended` 不是 terminal result；它表示 `Driver` 已经在可恢复 checkpoint 停住，并把继续同一个未完成 AgentRun 所需的 `serialized_run` 交回 `SessionRuntime`。`SessionRuntime` 为它分配 `ResumeId`，投影为 `CurrentRunState::Suspended { resume_id, reason }`，并发出 `run_suspended`，而不是 `run_finished { status: paused }`。
+完整 tool rounds 已经在 `DriverHost::invoke_tool_batch(...)` 返回前由 `SessionRuntime` 提交，不需要再次出现在 `DriveResult`。`final_message` 是 run 正常完成后唯一尚待提交的最终稳定 assistant message；一次 assistant lifecycle 对应一个 message id。streaming 中断形成的 partial assistant 通过 `DriverEvent` / `CurrentRun` draft 关闭 UI lifecycle，不作为 `DriveResult` 的可持久化 message 返回。
+
+MVP 可以暂不产生 `Suspended`，但不要把接口设计死成只能 completed/failed/aborted。`Suspended` 不是 terminal result；它表示 `Driver` 已经在可恢复 checkpoint 停住，并把继续同一个未完成 AgentRun 所需的 `serialized_run` 交回 `SessionRuntime`。`SessionRuntime` 为它分配 `ResumeId`，只在当前 host 内存投影为 `CurrentRunState::Suspended { resume_id, reason }`，并发出 `run_suspended`，而不是 `run_finished { status: paused }`。
 
 ## Host Interface
 
 `DriverHost` 是 `Driver` 与 `SessionRuntime` 之间的 seam。它让 driver 不直接持有 provider、`Tools`、queue 或 persistence。
 
 ```rust
+pub enum ToolBatchHostError {
+    Cancelled,
+    Failed { error: RuntimeError },
+}
+
 #[async_trait]
 pub trait DriverHost {
     async fn emit_driver_event(&mut self, event: DriverEvent) -> Result<(), RuntimeError>;
@@ -159,14 +166,14 @@ pub trait DriverHost {
         request: ModelCallRequest,
         sink: ModelStreamSink,
         cancel: CancellationToken,
-    ) -> Result<ModelCallResult, RuntimeError>;
+    ) -> Result<ModelCallResult, ModelCallError>;
 
     async fn invoke_tool_batch(
         &mut self,
         request: ToolBatchRequest,
         sink: ToolUpdateSink,
         cancel: CancellationToken,
-    ) -> Result<ToolBatchResult, RuntimeError>;
+    ) -> Result<ToolBatchResult, ToolBatchHostError>;
 
     async fn before_next_model_call(
         &mut self,
@@ -212,7 +219,7 @@ impl DriverHost for SessionRuntime {
         request: ModelCallRequest,
         sink: ModelStreamSink,
         cancel: CancellationToken,
-    ) -> Result<ModelCallResult, RuntimeError> {
+    ) -> Result<ModelCallResult, ModelCallError> {
         self.services.model_gateway.call_model(request, sink, cancel).await
     }
 
@@ -221,9 +228,41 @@ impl DriverHost for SessionRuntime {
         request: ToolBatchRequest,
         sink: ToolUpdateSink,
         cancel: CancellationToken,
-    ) -> Result<ToolBatchResult, RuntimeError> {
+    ) -> Result<ToolBatchResult, ToolBatchHostError> {
+        let assistant = self.current_run
+            .pending_tool_call_message(&request)
+            .map_err(|error| ToolBatchHostError::Failed { error })?
+            .clone();
         let context = self.build_tool_run_context();
-        Ok(self.tools.invoke_batch(request, context, sink, cancel).await)
+        let mut result = match self.tools.invoke_batch(request, context, sink, cancel.clone()).await {
+            Ok(result) => result,
+            Err(ToolBatchError::Cancelled) => return Err(ToolBatchHostError::Cancelled),
+            Err(ToolBatchError::Failed { error }) => {
+                return Err(ToolBatchHostError::Failed { error: error.into() });
+            }
+        };
+        if cancel.is_cancelled() {
+            return Err(ToolBatchHostError::Cancelled); // commit admission point
+        }
+        self.apply_tool_result_before_commit(&mut result)
+            .await
+            .map_err(|error| ToolBatchHostError::Failed { error })?;
+        self.validate_and_publish_tool_call_finished(&result)
+            .await
+            .map_err(|error| ToolBatchHostError::Failed { error })?;
+        let ordered_results = result.to_message_records_in_call_index_order();
+        let committed = self.session
+            .commit(SessionWriteBatch::tool_round(
+                assistant.clone(),
+                ordered_results.clone(),
+            ))
+            .await
+            .map_err(|error| ToolBatchHostError::Failed { error: error.into() })?;
+        self.current_run.mark_tool_round_committed(assistant.message_id());
+        self.publish_committed_tool_round(assistant, ordered_results, committed)
+            .await
+            .map_err(|error| ToolBatchHostError::Failed { error })?;
+        Ok(result)
     }
 }
 ```
@@ -256,6 +295,7 @@ impl SessionRuntime {
             cwd: self.cwd.clone(),
             turn_resources,
             tools: &mut self.tools,
+            session: &self.session,
             model_gateway: &self.services.model_gateway,
             event_sink: &mut self.event_sink,
             queues: &mut self.queues,
@@ -273,6 +313,7 @@ pub struct SessionDriverHost<'a> {
     cwd: PathBuf,
     turn_resources: Arc<TurnResourceSnapshot>,
     tools: &'a mut Tools,
+    session: &'a SessionHandle,
     model_gateway: &'a ModelGateway,
     event_sink: &'a mut SessionEventSink,
     queues: &'a mut QueueState,
@@ -287,13 +328,15 @@ pub struct SessionDriverHost<'a> {
 - 它避免 `self.driver.drive_run(..., self, ...)` 这类自借用写法带来的 Rust borrow checker 压力；`Driver` 应保持轻量，可以在 run start 时临时创建或 clone。
 - 它使 `Driver` 更容易单测：测试可以传入 fake host，而不需要构造完整 `SessionRuntime`。
 
-无论采用直接实现还是 wrapper，实现约束相同：`Driver` 不执行工具、不读凭据、不写 session；`DriverHost` 只把请求转回 `SessionRuntime` 拥有的 `ModelGateway`、`Tools`、queue 和事件归约能力。
+无论采用直接实现还是 wrapper，实现约束相同：`Driver` 不执行工具、不读凭据、不写 session；`DriverHost` 只把请求转回 `SessionRuntime` 拥有的 `ModelGateway`、`Tools`、queue、`SessionWriter` commit 和事件归约能力。
+
+wrapper 的 `invoke_tool_batch(...)` 必须和 direct impl 执行同一事务：先从 `CurrentRun` 借用/clone 完整 pending assistant tool-call message，但在 commit 成功前不移除它；调用 `Tools::invoke_batch(...)`，按 `call_index` 生成全部 tool-result drafts，在 commit admission point 再检查 run cancellation。若 abort/failed 先发生，terminal handler 仍能从 `CurrentRun` 关闭 assistant lifecycle 并丢弃未提交 unit；若允许提交，则应用 `ToolResultBeforeCommit`、重新校验并发布最终 `tool_call_finished`，再调用 `session.commit(SessionWriteBatch::tool_round(...))`。commit 成功后才把 pending round 标记为 committed，发布该 assistant message 的 `message_assistant_finished` 和有序 `message_tool_result_appended*`，最后把同一个 post-hook `ToolBatchResult` 返回给 Driver；Rig/provider、公开 finished event 与 committed message 必须看到同一最终值。`ToolBatchHostError` 必须原样保留 cancellation discriminant；Driver 把 `Cancelled` 归约为 aborted，把 `Failed` 归约为 failed，二者都不构造 partial `ToolRound`。任何示例或 fake host 如果省略 commit，只能用于纯 Driver 单测，不能作为生产 adapter。
 
 ## Driver Events
 
-`DriverEvent` 是 driver 内部事件，不是 UI 直接消费的 `agent_runtime_protocol::Event`。`SessionRuntime` 订阅并归约这些事件，再写 session、发 UI event、更新 snapshot。
+`DriverEvent` 是 driver 内部事件，不是 UI 直接消费的 `agent_runtime_protocol::Event`。`SessionRuntime` 订阅并归约这些事件，组装并提交稳定 session batches，再发 UI event、更新 snapshot。
 
-driver 的 `RunFinished { result }` 只表示 Rig drive 已经结束；UI 侧唯一 run terminal event 是 `run_finished { status, ... }`，由 `SessionRuntime` 在完成必要的持久化、错误归类和后续队列判断后发出。`DriveResult::Suspended` 不应归约为 `run_finished`；它由 `SessionRuntime` 分配 `ResumeId`、保存 resume state，并发出非终态 `run_suspended`。
+driver 的 `RunFinished { result }` 只表示 Rig drive 已经结束；UI 侧唯一 run terminal event 是 `run_finished { status, ... }`，由 `SessionRuntime` 在完成必要的 stable batch commit、错误归类和后续队列判断后发出。`DriveResult::Suspended` 不应归约为 `run_finished`；它由 `SessionRuntime` 分配 `ResumeId`、仅在同一 host 生命周期的内存中保存 resume state，并发出非终态 `run_suspended`。
 
 ```rust
 pub enum DriverEvent {
@@ -304,18 +347,13 @@ pub enum DriverEvent {
     AssistantMessageStarted { message_id: MessageId },
     AssistantMessageDelta { message_id: MessageId, delta: MessageDelta },
     AssistantMessageFinished { message: MessageRecord },
-    ToolBatchStarted { calls: Vec<ToolCallView> },
-    ToolCallStarted { call: ToolCallView },
-    ToolCallDelta { call_id: ToolCallId, delta: String },
-    ToolCallFinished { call_id: ToolCallId, result: ToolResultView, is_error: bool },
-    ToolBatchFinished { results: Vec<ToolResultView> },
     BeforeNextModelCall { checkpoint: TurnCheckpoint },
     BeforeRunFinish { checkpoint: FinishCheckpoint },
     RunFinished { result: DriveResultSummary },
 }
 ```
 
-事件命名避免使用 `MessageStarted` 这类太泛的名字，尽量说明 assistant/model/tool 来源。
+工具 proposed/approval/started/output/result-ready updates 来自 `Tools` / `ToolUpdateSink`，不重复包装成 `DriverEvent`；最终公开 `tool_call_finished` 由 `SessionRuntime` 在 `ToolResultBeforeCommit` 后发布。事件命名避免使用 `MessageStarted` 这类太泛的名字，尽量说明 assistant/model/tool 来源。`DriverEvent::AssistantMessageFinished` 只表示 provider/Rig 已形成完整 assistant draft，不能被直接转发为公共 `message_assistant_finished`：tool-call assistant 必须等对应 `ToolRound` commit，final assistant 必须等 `AssistantFinal` commit；abort/failure 才以非持久化 finished 关闭已 started lifecycle。
 
 ## Step Handlers
 
@@ -381,7 +419,7 @@ AgentRunStep::CallModel { prompt, history, turn }
   → AgentRun::model_response(model_turn)
 ```
 
-`Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
+`Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。`DriverHost::call_model(...)` 必须保留 typed `ModelCallError`：`kind == Cancelled` 归约为 `DriveResult::Aborted`，其他 kind 按 overflow/retry/failure policy 处理，不能先擦成 generic `RuntimeError`。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
 
 `ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能把 Rig step 的 prompt/history、当前 `PromptCallProfile` 和 safe-point context materials 交给 Prompt，得到已校验的 `ModelInputProjection`；随后从 projection 复制 system prompt/messages/tools/output contract，并从 `DriverTurnInput` 复制 `ModelSelection`、thinking level 和 stream options。Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认由 output contract 或模型设置决定。Driver 不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
 
@@ -393,6 +431,7 @@ AgentRunStep::CallTools { calls }
   → host.invoke_tool_batch(request, ToolUpdateSink)
       → SessionRuntime forwards to Tools::invoke_batch(...)
       → Tools handles registry/active/policy/approval/grants/sandbox/coordinator/executor
+      → SessionRuntime commits one complete ToolRound batch
   → map ToolBatchResult -> Rig tool results
   → AgentRun::tool_results(results)
 ```
@@ -403,6 +442,7 @@ AgentRunStep::CallTools { calls }
 - tool result 的 call id 必须匹配 pending call。
 - 结果可以按执行完成顺序返回，但 feed back 前要满足 Rig/provider 对 tool result message 的要求。
 - 非 abort 的工具错误应作为 error tool result 回填，而不是让 run 非正常崩溃。
+- host 只有在完整 assistant tool-call/result round 通过 `SessionWriter.commit(...)` 成功后才能返回；commit 失败归约为 `DriveResult::Failed`，不得进入下一次 `CallModel`。
 
 ## Safe Points
 
@@ -451,10 +491,10 @@ pub enum FinishDecision {
 
 ## Error And Abort Semantics
 
-- provider error：返回 `DriveResult::Failed`，由 `SessionRuntime` 决定是否写失败 assistant message、auto retry 或 compaction recovery。
+- provider error：返回 `DriveResult::Failed`，由 `SessionRuntime` 决定 auto retry、compaction recovery 和 diagnostics；未完成 assistant draft 不持久化。
 - tool error：优先转换为 error tool result 并喂回 Rig，除非是 abort。
 - cancellation：`cancel` 必须传播到 `host.call_model`、`host.invoke_tool_batch`、approval wait 和 stream sink。
-- out-of-protocol Rig error：返回 `DriveResult::Failed`，并附带当前已归约 messages。
+- out-of-protocol Rig error：返回 `DriveResult::Failed`；此前已 committed 的稳定 rounds 保留，当前未提交单元丢弃。
 - stream prematurely ended：构造结构化 driver error，不让 UI 卡在 running 状态。
 
 ## 不应承担

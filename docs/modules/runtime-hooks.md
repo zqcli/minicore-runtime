@@ -27,9 +27,11 @@ ToolBeforePolicy hook
   → returns Deny { reason }
 
 SessionRuntime
-  → applies denial
+  → applies denial and records final error tool result
   → emits tool_call_finished { is_error: true }
-  → emits message_tool_result_appended
+  → after all calls resolve: commit complete ToolRound batch
+  → emits message_assistant_finished for the tool-call assistant
+  → emits ordered message_tool_result_appended*
 ```
 
 Hook 影响最终会发生什么；event 告诉下游最终发生了什么。下游 UI/CLI 不应直接消费 hook，也不应注册能绕过策略、沙箱、凭据或会话持久化的 hook。
@@ -315,13 +317,13 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 | `BeforeModelCall` | Transform | patch model options、stream options、thinking level |
 | `BeforeProviderPayload` | Transform | privileged redacted provider payload patch；当前 MVP 不开放 |
 | `AfterProviderResponse` | Observer | status / allowlisted headers |
-| `ProviderUsageNormalized` | Observer | telemetry |
+| `ProviderUsageNormalized` | Observer | telemetry；context 只能携带 sanitized `PersistedModelCallUsage`，不得包含 `raw_provider_usage` |
 
 不要暴露 API key、OAuth token、authorization header、credential store 或 raw provider response。`BeforeProviderPayload` 应是 privileged hook；如果私有 Rig adapter 无法提供稳定且脱敏的 payload 形态，就不能开放 raw provider payload patch。
 
 ### Tools
 
-这些 hook 的 owner 是 `Tools`，但 UI-visible event、session write 和 snapshot projection 仍由 `SessionRuntime` 归约。
+以下执行治理 hooks 的 owner 是 `Tools`，但 UI-visible event、session write 和 snapshot projection 仍由 `SessionRuntime` 归约。
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
@@ -330,7 +332,8 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 | `ToolBeforeExecute` | Gate / Observer | final deny / observe |
 | `ToolOutputChunk` | Observer | progress telemetry |
 | `ToolAfterExecute` | Transform | patch/redact normalized result |
-| `ToolResultBeforeAppend` | Transform | patch tool result message draft |
+
+`ToolResultBeforeCommit` 不属于 `Tools`。它是 `SessionRuntime`-owned transform：在公开 `tool_call_finished` 与完整 `ToolRound` batch 组装前 patch 单个 result draft，之后必须重新校验 call id/order/redaction。
 
 关键规则：
 
@@ -340,6 +343,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 - approval 之后不允许再改 args。
 - hook 不能直接调用 `ToolExecutor`。
 - tool hook failure 默认 fail closed：before-policy 出错应 deny tool 或 fail command，取决于 hook 点。
+- `tool_call_finished` 必须使用 `ToolAfterExecute` / `ToolResultBeforeCommit` 后的最终 normalized result；不能先发布旧 result 再让 hook 改写 committed tool message。
 
 ### Queue
 
@@ -358,7 +362,7 @@ Hook 不能直接 mutate queue；返回 decision，由 `SessionRuntime` 应用�
 | `SessionBeforeCompact` | Gate / Provider / Transform | cancel、patch instructions、provide result |
 | `CompactionPromptBuilt` | Transform | privileged prompt patch |
 | `CompactionResultProduced` | Observer / Transform | inspect or patch result |
-| `SessionCompact` | Observer | observe final compaction entry |
+| `SessionCompact` | Observer | `compaction_finished` 发布后 observe final compaction entry；失败只进 diagnostics |
 
 压缩摘要是 session context projection，不是 system prompt。Hook 不能留下 orphan tool call/result，不能污染 overflow retry context。
 
@@ -366,9 +370,9 @@ Hook 不能直接 mutate queue；返回 decision，由 `SessionRuntime` 应用�
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `AfterSavePoint` | Observer | sync、index、backup、telemetry |
+| `AfterSessionCommit` | Observer | stable batch commit 后的 backup、telemetry、可重建 cache sync；不拥有 required SessionIndex/current projection，也不发布公共 persistence event |
 
-MVP 不建议开放 `BeforeSessionWrite`。session write 是一致性边界，外部 hook 不应改 entry id、parent id、leaf 或 raw JSONL。
+MVP 不建议开放 `BeforeSessionWrite`。session write 是一致性边界，外部 hook 不应改 entry id、parent id、leaf 或 raw JSONL。commit 成功后必须先应用 runtime-owned required projections 并发布对应领域事件；`AfterSessionCommit` observer 失败只记 diagnostics，不能回滚事实或阻塞事件。
 
 ### Usage And Diagnostics
 
@@ -443,7 +447,7 @@ pub enum HookErrorPolicy {
 - Rig `AgentRun` object。
 - `DriverEvent` direct stream。
 - `Tools` 未归一化内部进度。
-- `persistence_save_point` 伪造。
+- `SessionWriter.commit(...)` 结果或 committed domain event 伪造。
 
 ## 后期需求和演进
 
@@ -457,7 +461,7 @@ pub enum HookErrorPolicy {
 - `ToolBeforePolicy`
 - `ToolAfterExecute`
 - `SessionBeforeCompact`
-- `AfterSavePoint`
+- `AfterSessionCommit`
 - `CommandOutputBuild`
 
 再后续开放 trusted package / extension hooks：

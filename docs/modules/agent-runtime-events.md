@@ -19,7 +19,7 @@
 4. 所有 UI 事件都携带顺序号、时间、workspace/session/run/command correlation；这些 metadata 属于 `agent_runtime_protocol::Event` 外层记录。
 5. `SessionRuntime` 是把内部事件归约成 UI 事件的中心；`DriverEvent`、`Tools` update、后期 `RuntimeHooks` typed result 不能直接泄漏给 UI。
 6. 长生命周期对象必须有明确 started/delta/finished 配对，例如 assistant message、tool call、run、compaction、resource reload。
-7. 流式 delta 不是持久化事实；`persistence_save_point` 才是“此前相关 session writes 已经落盘”的 durable barrier。
+7. 流式 delta、pending approval 和执行中的 tool round 不是持久化事实；需要恢复的领域事实只能在对应 `SessionWriter.commit(...)` 成功后发布。
 8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry、pending session action 或 queued continuation，并且 phase 已经回到 `idle`。
 9. 同步命令接收用 `CommandAck` 表达；只读 typed 查询由 `AgentRuntime.query()` 直接返回 `QueryResponse`；异步执行结果和用户可见命令结果用 `agent_runtime_protocol::Event` 表达。
 10. `session_focus_changed` 是 runtime-visible event，表示默认会话目标改变；它不表示 session loaded、running 或 closed。
@@ -46,7 +46,6 @@ UI / wire:
 | `agent_runtime_protocol::EventMsg::Run(RunEvent::Finished)` | `run_finished` |
 | `agent_runtime_protocol::EventMsg::Message(MessageEvent::AssistantTextDelta)` | `message_assistant_text_delta` |
 | `agent_runtime_protocol::EventMsg::ToolCall(ToolCallEvent::ApprovalRequested)` | `tool_call_approval_requested` |
-| `agent_runtime_protocol::EventMsg::Persistence(PersistenceEvent::SavePoint)` | `persistence_save_point` |
 
 不推荐把内部 module 名写进事件名：
 
@@ -158,7 +157,6 @@ wire 形态固定为外层事件 + 内层消息：
 | tool call | 必填 | 必填 | 必填 | 启动 run 的命令 id；审批响应另有自己的 command id |
 | compaction | 必填 | 必填 | 可空 | 手动 compact 命令 id；自动压缩可空 |
 | command result | 可空或相关 workspace | 可空或目标 session | 通常 `None` | 触发输出或交互请求的命令 id |
-| persistence save point | 必填 | 必填 | 可空 | 导致写入的命令 id 或 run command id |
 | settled | 必填 | 必填 | `None` | 通常可空 |
 
 自动行为不一定有 `command_id`：例如 threshold auto-compaction、auto-retry。此时 `agent_runtime_protocol::Event` 依赖 `workspace_id` / `session_id` / `run_id` 关联上下文。MVP 的资源更新通过显式 reload / startup ensure 进入 `ResourceManager`，不设计文件监听器或热更新事件源。
@@ -232,8 +230,8 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | --- | --- | --- | --- |
 | session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_focus_changed`、`session_tree_changed` | 离散事实 | 是 |
 | run lifecycle | `run_started`、`run_suspended`、`run_resumed`、`run_finished` | started -> suspended/resumed* -> terminal | 是，当前 run 只能部分重建 |
-| message lifecycle | `message_user_appended`、`message_assistant_started`、`message_assistant_text_delta`、`message_assistant_finished`、`message_tool_result_appended` | appended 或 started -> delta* -> finished | finished 后是，delta 不是 |
-| tool call lifecycle | `tool_call_proposed`、`tool_call_approval_requested`、`tool_call_started`、`tool_call_output_delta`、`tool_call_finished` | proposed -> approval? -> started -> delta* -> finished | finished 后是，delta 不是 |
+| message lifecycle | `message_user_appended`、`message_assistant_started`、`message_assistant_text_delta`、`message_assistant_finished`、`message_tool_result_appended` | appended 或 started -> delta* -> finished | committed message 可重建；active partial 只在当前 host/current run 中可见 |
+| tool call lifecycle | `tool_call_proposed`、`tool_call_approval_requested`、`tool_call_started`、`tool_call_output_delta`、`tool_call_finished` | proposed -> approval? -> started -> delta* -> finished | active tool state 可从 current run 重建；重启后只保留 committed `ToolRound` facts |
 | queue lifecycle | `queue_updated` | 每次队列变化发完整队列摘要 | 是 |
 | usage lifecycle | `usage_updated` | 模型调用、run 结束、压缩或 prompt material 改变后替换 usage/context view | 是 |
 | resource lifecycle | `resources_reload_started`、`resources_changed` | reload started -> committed revision | 是 |
@@ -242,7 +240,6 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | compaction lifecycle | `compaction_started`、`compaction_finished` | started -> finished | 是 |
 | retry lifecycle | `retry_auto_started`、`retry_auto_finished` | started -> finished | 是 |
 | diagnostics | `diagnostics_runtime_changed`、`diagnostics_error`、`diagnostics_warning` | 离散或替换式 | 部分 |
-| persistence | `persistence_save_point` | durable barrier | 是 |
 | idle lifecycle | `session_settled` | terminal convenience event | 是 |
 
 ## Event Sources
@@ -250,7 +247,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | Source | 可以发 UI `agent_runtime_protocol::Event` 吗 | 说明 |
 | --- | --- | --- |
 | `AgentRuntime` | 可以 | workspace、session open/close/focus/delete、runtime diagnostics、resource reload 入口、command catalog 和 command result；query result 直接返回，不发布事件。 |
-| `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、message persistence、compaction、retry、save point。 |
+| `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、稳定 message batch commit、compaction 和 retry。 |
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `Tools` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
@@ -271,7 +268,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending session writes、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`persistence_save_point`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle` 写入结果；后期消费自己拥有安全点的 hook result |
+| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、future provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor；后期消费工具治理 hook；返回 `ToolBatchResult` |
@@ -281,8 +278,8 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
 | `Prompt` | 无运行生命周期状态；纯创建 `PromptTurn`、展开 intent、生成 `ModelInputProjection` | 不发布事件 | 被 `SessionRuntime` / Driver projection path 调用；事件由 SessionRuntime 归约 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
-| `SessionHandle` | 单会话领域操作 facade、上下文重建结果 | 不发布 UI event；返回 entry id/context | `SessionRuntime` 根据返回结果发 `message_*`、`persistence_save_point` 等 |
-| `SessionStorage` | 单会话 metadata、append-only entries、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用 |
+| `SessionHandle` | 单会话领域操作 facade、统一 batch commit、上下文重建结果 | 不发布 UI event；返回 `CommittedSessionBatch` / context | `SessionRuntime` 根据 commit 结果发布对应 `message_*`、`session_*`、`compaction_*` 等领域事实 |
+| `SessionStorage` / `SessionWriter` | 单会话 metadata、committed batches、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用；隐藏 memory/JSONL adapter 写入细节 |
 | `SessionManager` | persistent session catalog、`LoadedSessionRuntimes`、focused session、create/open/list/delete/fork/focus/close、storage adapter | 通常不直接发事件；由 `AgentRuntime` 发 session lifecycle 事件 | 被 `AgentRuntime` 调用；创建/关闭/查找 `SessionRuntimeHandle`，但不拥有单会话运行状态机 |
 | `RuntimeHookRegistry` | 后期内部 hook handler 集合和 hook 执行结果 | 默认不发布 UI event | hook 影响后的事实由对应 owner 应用，再由 `SessionRuntime` / `AgentRuntime` 归约成事件 |
 
@@ -349,7 +346,7 @@ current run internals
 pending tool approval
 assistant streaming buffer
 session phase
-pending session writes
+pending stable batch drafts
 Rig AgentRun
 ```
 
@@ -362,7 +359,7 @@ Rig AgentRun
 ```text
 SessionPhase
 CurrentRun
-PendingSessionWrites
+pending stable batch drafts
 QueueState
 ModelState
 ResourceState view
@@ -402,7 +399,6 @@ tool_call_output_delta
 tool_call_finished
 queue_updated
 usage_updated
-persistence_save_point
 skill_invoked
 prompt_template_invoked
 compaction_started
@@ -419,7 +415,7 @@ diagnostics_error
 DriverEvent
 Tools progress/update
 ModelGateway stream result
-SessionHandle append/build_context result
+SessionHandle commit/build_context result
 future RuntimeHooks typed result
 ResourceManager captured TurnResourceSnapshot
 ```
@@ -459,17 +455,12 @@ DriverEvent::ModelCallFinished { usage: Option<ModelCallUsage> }
 DriverEvent::AssistantMessageStarted
 DriverEvent::AssistantMessageDelta
 DriverEvent::AssistantMessageFinished
-DriverEvent::ToolBatchStarted
-DriverEvent::ToolCallStarted
-DriverEvent::ToolCallDelta
-DriverEvent::ToolCallFinished
-DriverEvent::ToolBatchFinished
 DriverEvent::BeforeNextModelCall
 DriverEvent::BeforeRunFinish
 DriverEvent::RunFinished
 ```
 
-这些事件不直接进入 UI。`SessionRuntime` 决定哪些转换成 `agent_runtime_protocol::Event`，何时写 session，何时发 `persistence_save_point` 和 `run_finished`。
+工具 lifecycle 不重复包装成 `DriverEvent`。`Tools` / `ToolUpdateSink` 只提供 proposed、approval requested、started、output delta 和 result-ready 等内部更新；`result-ready` 仍可能被 `ToolResultBeforeCommit` 改写，不能直接发布为 UI `tool_call_finished`。这些内部输入都不直接进入 UI。`SessionRuntime` 决定哪些转换成 `agent_runtime_protocol::Event`，何时组装稳定 batch、何时 commit，以及何时发 `run_finished`。
 
 ### Tools Ownership
 
@@ -565,7 +556,7 @@ session_focus_changed
 session_tree_changed
 ```
 
-`SessionManager` 不能把 `LoadedSessionRuntimes` 扩展成 Agent loop owner：phase、queue、current run、tool state、usage stats、compaction/retry 和 save point 仍属于 `SessionRuntime`。
+`SessionManager` 不能把 `LoadedSessionRuntimes` 扩展成 Agent loop owner：phase、queue、current run、tool state、usage stats、compaction/retry 和稳定 batch 提交时机仍属于 `SessionRuntime`。
 
 ### SessionHandle / SessionStorage Ownership
 
@@ -574,11 +565,7 @@ session_tree_changed
 `SessionHandle` 持有/提供：
 
 ```text
-append_message
-append_compaction
-append_model_change
-append_active_tools_change
-move_to
+commit(SessionWriteBatch)
 build_session_context
 ```
 
@@ -586,18 +573,19 @@ build_session_context
 
 ```text
 SessionMetadata
-SessionEntry[]
-current leaf id
-entry id index / path-to-root reconstruction support
+Committed SessionWriteBatch[] / SessionEntry[]
+current leaf id + stable batch-boundary index
+path-to-root and grouped get_committed_batches_to_leaf reconstruction support
 ```
 
 相关 UI wire events 由 `SessionRuntime` 发：
 
 ```text
 message_user_appended
+message_assistant_finished // for committed ToolRound / AssistantFinal
 message_tool_result_appended
-session_tree_changed
-persistence_save_point
+session_name_changed / session_tree_changed
+session_model_changed / session_thinking_level_changed / session_active_tools_changed
 compaction_finished
 ```
 
@@ -634,6 +622,7 @@ UI 的权威输入只有：
 agent_runtime_protocol::RuntimeSnapshot
 agent_runtime_protocol::Event stream
 CommandAck
+QueryResponse
 ```
 
 ## Global Ordering Rules
@@ -644,7 +633,7 @@ CommandAck
 4. `message_assistant_text_delta` 必须发生在对应 `message_assistant_started` 和 `message_assistant_finished` 之间。
 5. `tool_call_output_delta` 必须发生在对应 `tool_call_started` 和 `tool_call_finished` 之间。
 6. `tool_call_approval_requested` 只能发生在 `tool_call_proposed` 之后、`tool_call_started` 之前。
-7. `persistence_save_point` 只能在相关 session writes 成功后发出。
+7. `message_user_appended`、正常稳定 assistant message 的 `message_assistant_finished`、`message_tool_result_appended`、需要恢复的 session mutation event、成功 `compaction_finished { result: Some(...) }` 和正常 `run_finished { completed }` 只能在对应稳定 batch commit 成功后发出。
 8. `session_settled` 只能在 phase 为 `idle`，当前没有 active run/compaction/retry、pending session action，且没有同步马上要启动的 continuation 时发出。
 9. `diagnostics_error` 不替代 terminal event。run 内失败需要 `diagnostics_error` + `run_finished { status: failed }`；abort 需要 `run_finished { status: aborted }`。
 10. `resources_changed` 表示新 resource revision 已经原子替换；失败 reload 不应污染旧 revision。
@@ -798,7 +787,7 @@ Focused(session_id)
 | --- | --- | --- |
 | `Idle` | `Turn` | idle prompt/follow-up 开始产品级工作 |
 | `Idle` | `Compaction` | manual/auto compaction 立即开始 |
-| `Turn` | `Idle` | terminal facts、save point 和 post-run arbitration 完成，且没有立即 continuation |
+| `Turn` | `Idle` | terminal handling（required stable commit if any）、terminal facts 和 post-run arbitration 完成，且没有立即 continuation |
 | `Turn` | `RetryBackoff` | Agent run 失败且已安排带等待窗口的自动重试 |
 | `Turn` | `Compaction` | post-run manual/auto compaction 或 overflow recovery 开始 |
 | `RetryBackoff` | `Turn` | backoff 结束并启动 retry run |
@@ -879,8 +868,8 @@ User message 通常不是流式对象。
 AcceptedByCommand
   → Expanded(skill/template)
   → future hook expansion/patch if hook system is enabled
+  → SessionWriter.commit(SessionWriteBatch::user_input(...))
   -- message_user_appended --> AppendedToSession
-  -- persistence_save_point --> DurableAtSavePoint
   → IncludedInRunContext
 ```
 
@@ -888,9 +877,8 @@ AcceptedByCommand
 
 - `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 并绑定到 run；事件先于对应 user message append。
 - `message_user_appended`
-- `persistence_save_point`
 
-FollowUp/NextTurn 入队时只发 `queue_updated`，不提前发 invoked；active Steer 在 active run safe point 展开后发 invoked。`message_user_appended` 表示 UI 可以渲染消息；`persistence_save_point` 表示它已经进入可恢复边界。
+FollowUp/NextTurn 入队时只发 `queue_updated`，不提前发 invoked；active Steer 在 active run safe point 展开后发 invoked。`message_user_appended` 只在 `UserInput` batch commit 成功后发布，因此它同时表示 UI 可以渲染消息、下次恢复也会包含该输入。
 
 ### 11. Assistant Message Lifecycle
 
@@ -900,9 +888,9 @@ Assistant message 是流式对象。
 NotStarted
   -- message_assistant_started --> Started
   -- message_assistant_text_delta* --> StreamingText
+  ├─ final response: SessionWriter.commit(SessionWriteBatch::assistant_final(...))
+  └─ tool-call response: collect all tool results, then SessionWriter.commit(SessionWriteBatch::tool_round(...))
   -- message_assistant_finished --> Finished
-  → AppendedToSession
-  -- persistence_save_point --> DurableAtSavePoint
 ```
 
 对应事件：
@@ -910,9 +898,8 @@ NotStarted
 - `message_assistant_started`
 - `message_assistant_text_delta*`
 - `message_assistant_finished`
-- `persistence_save_point`
 
-每条 assistant message 必须恰好有一个 `message_assistant_started` 和一个 `message_assistant_finished`；三类事件使用同一个 `message_id`，所有 delta 只能出现在 started/finished 之间，finished 后的最终文本必须等于有序 delta 拼接结果。`message_assistant_finished` 关闭 UI 流式块，但不等于已经落盘；落盘边界看后续 `persistence_save_point`。
+每条 assistant message 必须恰好有一个 `message_assistant_started` 和一个 `message_assistant_finished`；三类事件使用同一个 `message_id`，所有 delta 只能出现在 started/finished 之间，finished 后的最终文本必须等于有序 delta 拼接结果。正常 final assistant 在 `AssistantFinal` commit 成功后发布 finished；包含 tool calls 的 assistant message 在对应完整 `ToolRound` commit 成功后发布 finished，并先于该 batch 的 `message_tool_result_appended*`。abort/failure 为关闭 UI lifecycle 也必须发布 finished，但未完成 partial 不持久化，重启后不会恢复。
 
 ### 12. Tool Call Lifecycle
 
@@ -927,8 +914,9 @@ Proposed
   -- tool_call_started --> Started
   -- tool_call_output_delta* --> OutputStreaming
   -- tool_call_finished --> Finished(success | error)
-  -- message_tool_result_appended --> ToolResultMessageAppended
-  -- persistence_save_point --> DurableAtSavePoint
+  → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+  -- message_assistant_finished --> AssistantToolCallMessageFinished
+  -- message_tool_result_appended* --> ToolResultMessagesAppended
 ```
 
 对应事件：
@@ -939,9 +927,8 @@ Proposed
 - `tool_call_output_delta*`
 - `tool_call_finished`
 - `message_tool_result_appended`
-- `persistence_save_point`
 
-policy denied、approval rejected、schema invalid、unknown tool 都走 `tool_call_finished { is_error: true }`，并生成 error tool result message；不直接让 run failed。
+policy denied、approval rejected、schema invalid、unknown tool 都走 `tool_call_finished { is_error: true }`，并生成 error tool result message；不直接让 run failed。全部 calls 都产生 actual/error result 后，assistant tool-call message 与 results 作为一个 `ToolRound` commit；commit 成功后先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 为每条 result 发布 `message_tool_result_appended`。
 
 ### 13. Approval Lifecycle
 
@@ -996,15 +983,14 @@ Requested while idle
   -- compaction_started --> PreparingSummary
   → future SessionBeforeCompact hook if hook system is enabled
   → Summarizing
-  → AppendingCompactionEntry
+  → SessionWriter.commit(SessionWriteBatch::compaction(...))
   → RebuildingSessionContext
   -- compaction_finished --> Finished(aborted? failed? will_retry?)
-  -- persistence_save_point --> DurableAtSavePoint
   → session_settled or run_started
 
 Requested while active work
   -- queue_updated(pending compact) --> Deferred
-  → current work terminal facts + persistence save point
+  → current work terminal handling（required stable commit if any）+ terminal facts
   → required retry / overflow recovery chain completes
   -- queue_updated(remove pending compact) --> Dispatching
   -- session_phase_changed(compaction) --> PreparingCutPoint
@@ -1015,7 +1001,6 @@ Requested while active work
 - `session_phase_changed { phase: compaction }`
 - `compaction_started`
 - `compaction_finished`
-- `persistence_save_point`
 - `session_phase_changed { phase: idle }`
 - `session_settled` 或紧接 `run_started`
 
@@ -1054,9 +1039,10 @@ StatsStable
   -- model_call_finished --> RunUsageUpdated
   -- usage_updated --> StatsStable
 
-StatsStable
-  -- run_finished --> RunUsageFinalized
-  -- usage_updated --> StatsStable
+RunCompleting
+  -- final stable batch committed --> FinalUsageReady
+  -- usage_updated --> FinalUsagePublished
+  -- run_finished --> StatsStable
 
 StatsStable
   -- compaction_finished/resources_changed/session_tools_changed --> ContextUsageRecomputed
@@ -1068,7 +1054,7 @@ StatsStable
 - `usage_updated`
 - `run_finished { usage }`
 
-`usage_updated` 可以在模型调用结束、run 结束、压缩结束、资源或工具变更后发出。它表示 UI usage/context view 已更新；如果对应 usage facts 需要恢复，仍必须等待 `persistence_save_point`。`SessionStatsView.total_usage` 是累计模型调用消耗，压缩不会让它下降；`ContextUsageView.current_tokens` 是下一次模型请求的上下文窗口占用，压缩后通常会下降。
+`usage_updated` 可以在模型调用结束、run 结束、压缩结束、资源或工具变更后发出。它表示当前 host 的 UI usage/context view 已更新；需要跨进程恢复的 usage facts 必须包含在相关稳定 session batch 中，并在正常 `run_finished` 或 `compaction_finished` 前 commit。`SessionStatsView.total_usage` 是累计模型调用消耗，压缩不会让它下降；`ContextUsageView.current_tokens` 是下一次模型请求的上下文窗口占用，压缩后通常会下降。
 
 ### 18. Resource Reload Lifecycle
 
@@ -1092,28 +1078,20 @@ Stable(cwd, revision=N)
 
 `command_catalog_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command` 或该事件中的 catalog 为准。
 
-### 19. Persistence Lifecycle
+### 19. Session Commit Semantics
 
-Persistence lifecycle 描述 session writes，而不是文件系统细节。
+Session commit 是内部写入 seam，不是公共事件 lifecycle。所有 mutation 通过 `SessionHandle.commit(SessionWriteBatch)`：
 
 ```text
-Clean
-  → PendingSessionWrites
-  → Flushing
-  -- persistence_save_point --> Clean
+Stable facts assembled in memory
+  → SessionWriter.commit(batch)
+      ├─ Ok  → publish corresponding domain events / continue work
+      └─ Err → do not expose batch as committed; fail current mutation or run
 ```
 
-对应事件：
+正常 text-only run 至少提交两个稳定 batch：current user input 必须在 `run_started` 前 commit，最终 assistant message 必须在正常 `run_finished { completed }` 前 commit。包含工具时，每个将被下一模型调用消费的完整 tool round 都必须先把 assistant tool-call message 与全部 tool-result messages 作为一个 `ToolRound` commit；并行结果按 `call_index` 归约后共享该 batch。
 
-- `persistence_save_point { had_pending_mutations }`
-
-`persistence_save_point` 是 UI 可以信任的 durable barrier。不要让 UI 根据 `message_assistant_finished` 推断已保存。
-
-save point 按“可独立恢复的 session write batch”产生，不与 run 一一对应，也没有每个 run 固定数量。某个 `persistence_save_point` 覆盖同一 session 中、该事件 sequence 之前已经由 `SessionRuntime` 成功提交的相关 writes；流式 delta、tool output delta 和 queue update 不是 session writes。
-
-正常 text-only run 至少有两个 batch：current user input 在 `run_started` 前提交并形成 user-message save point；最终 assistant/run result 在 `run_finished` 前提交并形成 run-result save point。包含工具时，每个已经完成、将被下一次模型调用消费的 tool round，都必须先把 assistant tool-call messages 与对应 tool-result messages 提交并跨过 save point。并行 tool calls 可以在全部结果按 `call_index` 归约后共享一个 batch。
-
-正常 `Completed` run 的 `run_finished` 不能早于最终 run-result save point。compaction、配置变化和其他独立 session mutations 可以产生额外 save point。`Aborted` / `Failed` 时 partial messages、synthetic tool results、终态与 barrier 顺序及 orphan protocol repair 由 BR-024 单独定义，不能从正常成功路径推断。
+streaming delta、tool output delta、queue update、partial assistant、pending approval 和执行中的 tool round 不是 session writes。abort/failure/shutdown 只保留此前成功 committed 的 batches，当前不完整单元直接丢弃。公共协议不发布通用 save-point event；后期内部 `AfterSessionCommit` observer 可以用于可重建 cache、backup、telemetry 和测试。
 
 ### 20. Session Tree Lifecycle
 
@@ -1137,9 +1115,8 @@ LeafStable
 - `session_tree_changed`
 - `session_created`
 - `session_opened`
-- `persistence_save_point`，如果 leaf move 以 append entry 记录。
 
-导航 session tree 不能删除历史，只移动当前 leaf。
+导航 session tree 不能删除历史，只移动当前 leaf。`session_tree_changed` 只能在 `TreeMutation` batch commit 成功后发布。
 
 ### 21. Diagnostics Lifecycle
 
@@ -1211,15 +1188,21 @@ UI
 
 SessionRuntime
   → session_phase_changed { phase: turn }
+  → SessionWriter.commit(SessionWriteBatch::user_input(...))
   → message_user_appended
-  → persistence_save_point              // user message durable
   → run_started
   → message_assistant_started
   → message_assistant_text_delta*
-  → tool_call_*                         // optional, see tool lifecycle
-  → message_assistant_finished
+  → [for each tool-call response]
+      → tool_call_*
+      → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+      → message_assistant_finished      // finishes the tool-call assistant message
+      → message_tool_result_appended*
+      → message_assistant_started       // next model response
+      → message_assistant_text_delta*
+  → SessionWriter.commit(SessionWriteBatch::assistant_final(...))
+  → message_assistant_finished          // finishes the final assistant message
   → usage_updated                       // optional, when provider usage exists
-  → persistence_save_point              // assistant/tool results durable
   → run_finished { status: completed }
   → session_phase_changed { phase: idle }
   → session_settled
@@ -1236,7 +1219,9 @@ Driver receives CallTools
   → tool_call_started
   → tool_call_output_delta*
   → tool_call_finished { result, is_error }
-  → message_tool_result_appended
+  → SessionWriter.commit(SessionWriteBatch::tool_round(...)) // assistant tool calls + all results
+  → message_assistant_finished          // assistant tool-call message; same committed batch
+  → message_tool_result_appended*       // one per result, ordered by call_index
 ```
 
 推荐理由：
@@ -1252,7 +1237,11 @@ tool_call_proposed { requires_approval: true }
 tool_call_approval_requested
 UI dispatch(DecideToolApproval)
   ├─ approved  → tool_call_started → ... → tool_call_finished
-  └─ rejected  → tool_call_finished { is_error: true } → message_tool_result_appended
+  └─ rejected  → record error result → tool_call_finished { is_error: true }
+all calls resolved
+  → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+  → message_assistant_finished
+  → message_tool_result_appended*
 ```
 
 审批请求是运行时事件，不是 UI callback。UI 只能通过 `DecideToolApproval` 回答，不能直接调用 tool executor，也不能替换工具参数。同一 host 生命周期内如果 UI adapter、subscriber 或 reducer 重建，当前仍未解决的审批必须从 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 重新渲染。
@@ -1264,14 +1253,16 @@ UI dispatch(AbortRun)
   ← CommandAck
 SessionRuntime / Driver cancellation
   → queued tool/model updates stop
-  → message_assistant_finished?         // only if there is an abort/error message to close
+  → if a stable commit already started: await its Ok/Err and apply commit-won facts
+  → discard remaining uncommitted partial assistant / approval / incomplete tool round
+  → message_assistant_finished          // iff still started; closes UI lifecycle, not persisted
   → run_finished { status: aborted }
   → session_phase_changed { phase: idle }
   → queue_updated                       // clears pending compact; may also return/clear message queues
   → session_settled
 ```
 
-不要同时发 `run_aborted` 和 `run_finished`。推荐一个 terminal event：`run_finished { status: aborted }`，避免 UI reducer 处理双终态。
+不要同时发 `run_aborted` 和 `run_finished`。推荐一个 terminal event：`run_finished { status: aborted }`，避免 UI reducer 处理双终态。若 abort 到达前 `AssistantFinal` commit 已进入 writer 并成功，则 commit admission ordering 判定 completed 已获胜，随后 abort 应得到 no-active-run / too-late 结果，不能把同一 run 改发 aborted；若获胜的是 `ToolRound` commit，则保留该完整 round、阻止下一模型调用，再以 aborted 收尾。
 
 ## Failure Lifecycle
 
@@ -1279,11 +1270,11 @@ Provider 或 protocol 失败：
 
 ```text
 run_started
-message_assistant_started?              // if failure is represented as assistant error message
-message_assistant_finished?             // persisted as UI/model-visible or UI-only according to ContextVisibility
+message_assistant_started?              // if provider streaming had started
+discard uncommitted partial assistant / incomplete tool round
+message_assistant_finished?             // required iff started; not persisted
 diagnostics_error { scope: run, recoverable }
 run_finished { status: failed }
-persistence_save_point?                 // only if failure message/diagnostic was persisted
 session_phase_changed { phase: idle }
 session_settled or retry_auto_started
 ```
@@ -1292,7 +1283,7 @@ session_settled or retry_auto_started
 
 - 同步 preflight 失败不启动 run，直接拒绝 command 或发 `diagnostics_error { scope: command }`。
 - 可重试 provider 失败可以进入 `retry_auto_started`，但仍要关闭当前 run。
-- context overflow recovery 不应把 transient overflow assistant error 放入下一次 retry prompt；如果持久化，必须是 `UiOnly` 或 diagnostic/custom entry。
+- context overflow recovery 不把 transient overflow assistant error 写入 session；它只通过 diagnostics 呈现，并从最后 committed context 启动 recovery。
 
 ## Compaction Lifecycle
 
@@ -1300,7 +1291,7 @@ session_settled or retry_auto_started
 UI dispatch(Compact) while active work
   → queue_updated { pending_actions: [Compact] }
   → current work continues
-  → run terminal facts + persistence_save_point
+  → run terminal handling（required stable commit if any）+ terminal facts
   → required immediate retry / overflow recovery chain, if any
   → queue_updated { pending_actions: [] }
 
@@ -1309,9 +1300,8 @@ UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overfl
   → compaction_started { reason }
   → future RuntimeHookRegistry.invoke(SessionBeforeCompact) // internal only
   → summary model call                         // not a normal assistant message
-  → SessionHandle.append_compaction
+  → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → compaction_finished { result, aborted: false, will_retry }
-  → persistence_save_point
   → session_phase_changed { phase: idle }
   → session_settled or run_started             // overflow retry may continue immediately
 ```
@@ -1413,12 +1403,17 @@ MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 a
 
 MVP event lifecycle tests 应覆盖：
 
-- submit prompt text-only：事件顺序、`persistence_save_point`、`session_settled`。
+- submit prompt text-only：`UserInput` / `AssistantFinal` commit 成功后才发布对应 message/run 事件，并验证 `session_settled` 顺序。
+- user input commit failure：不发布 `message_user_appended` / `run_started`，不调用模型，phase 回到 idle 并产生 command/runtime diagnostic。
 - assistant streaming：delta 必须在 `message_assistant_started` / `message_assistant_finished` 之间。
-- tool success：`tool_call_proposed` / `tool_call_started` / `tool_call_finished` + `message_tool_result_appended`。
-- tool denied：产生 error tool result，不产生 run failure。
-- abort run：只有一个 terminal `run_finished { status: aborted }`。
-- compaction：phase、`compaction_started` / `compaction_finished`、save point、settled 顺序。
+- tool success：`tool_call_proposed` / `tool_call_started` / `tool_call_finished`；`ToolRound` commit 后先发布 tool-call assistant 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`。
+- tool round commit failure：以非持久化 `message_assistant_finished` 关闭已 started lifecycle，不发布 `message_tool_result_appended`，不进入下一模型调用，当前 run 以 failed terminal 收尾。
+- tool denied / approval rejected：产生 error tool result，与同 batch 其他 results 一起 commit 完整 `ToolRound` 后才发布 appended events，不产生 run failure。
+- abort run：只有一个 terminal `run_finished { status: aborted }`；started assistant 必须 finished，uncommitted partial/approval/tool round 不进入 session。
+- abort/commit race：in-flight `ToolRound` commit 先完成并保留 round，但不进入下一模型；in-flight `AssistantFinal` commit 成功时 completed 获胜，同一 run 不得再发 aborted。
+- final assistant commit failure：关闭已 started 的 assistant lifecycle，发 diagnostics + `run_finished { failed }`，不得发 completed。
+- session mutation commit failure：model/thinking/tools/name 等 runtime-visible state 不替换，也不发布 corresponding changed event。
+- compaction：`Compaction` batch commit、phase、`compaction_started` / `compaction_finished` 和 settled 顺序。
 - resource reload failure：旧 revision 不变，diagnostics 更新。
 - command text view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
 - command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过 `ExecuteCatalogCommand`、runtime-tracked `SubmitInteraction` 或明确结构化 `AgentCommand` 完成设置；不依赖 interaction request 携带 raw command text。

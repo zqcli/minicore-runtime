@@ -18,7 +18,7 @@ SessionRuntime
   → reads current root-to-leaf SessionEntry path
   → compaction.rs prepares cut point and summary prompts
   → ModelGateway generates summary
-  → SessionHandle appends SessionEntry::Compaction
+  → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → SessionHandle rebuilds context from SessionStorage as summary + kept messages
   → SessionRuntime may start Driver again with DriveEntry::Continue
 ```
@@ -28,7 +28,7 @@ SessionRuntime
 原因：
 
 - 压缩改变的是 session projection，不是 Rig 协议状态机。
-- 压缩要读取会话树、选择 `first_kept_entry_id`、追加 session entry、重建上下文并发 UI 事件。
+- 压缩要读取会话树、选择 `first_kept_entry_id`、提交 stable compaction batch、重建上下文并发 UI 事件。
 - 压缩要走模型凭据、summary prompt、abort 和 auto retry，这些属于 `SessionRuntime` 和 `ModelGateway`。后期启用 hook system 时，压缩 hook 仍由 `SessionRuntime` 在压缩安全点调用。
 - Rig `AgentRun` 可序列化，但序列化状态包含已累积的 conversation。压缩后继续 resume 旧 `AgentRun` 不能减少下一次 model input；压缩后应从重建后的 session context 启动新的 `DriveEntry::Continue`。
 
@@ -36,7 +36,7 @@ SessionRuntime
 
 - `Compaction` 只负责 token estimate、cut point、summary instructions/material 和结果类型。
 - `SessionRuntime` 负责 manual/auto orchestration、phase、abort、模型调用、事件和 post-run 顺序。
-- `SessionHandle` / `SessionStorage` 负责追加 compaction entry 和重建 root-to-leaf context。
+- `SessionHandle` / `SessionWriter` / `SessionStorage` 负责提交 compaction batch 和重建 root-to-leaf context。
 - `Driver` / Rig Agent loop 不拥有压缩；overflow recovery 后从重建上下文启动新的 continuation。
 - running 时提交的 `Compact` defer 到 post-run safe point，不隐式 abort active run。
 
@@ -98,8 +98,11 @@ pub struct CompactionResult {
     pub tokens_before: u64,
     pub estimated_tokens_after: Option<u64>,
     pub details: CompactionDetails,
+    pub usage: Option<PersistedModelCallUsage>,
 }
 ```
+
+`CompactionResult.usage` 使用 durable `PersistedModelCallUsage`。`ModelGateway` 返回的 runtime `ModelCallUsage` 必须由 `SessionRuntime` 去除 `raw_provider_usage` 后再放入 result；hook-provided summary 没有模型调用时为 `None`。
 
 推荐函数：
 
@@ -303,7 +306,7 @@ path/c.rs
 
 上下文重建的权威规则在 [SessionManager / SessionStorage](session-manager.md)；本节只说明 `Compaction` 产出的摘要如何成为模型可见消息，以及为什么它不是 system prompt。
 
-压缩不是删除旧 entry，而是追加一条 `SessionEntry::Compaction`。上下文重建负责把 append-only history 投影成模型可见 messages。
+压缩不是删除旧 entry，而是通过 `Compaction` batch 提交一条 `SessionEntry::Compaction`。上下文重建负责把 append-only history 投影成模型可见 messages。
 
 ```rust
 pub enum SessionEntry {
@@ -315,6 +318,7 @@ pub enum SessionEntry {
         tokens_before: u64,
         estimated_tokens_after: Option<u64>,
         details: CompactionDetails,
+        usage: Option<PersistedModelCallUsage>,
         from_hook: bool,
     },
     // ...
@@ -402,7 +406,7 @@ history before current input
   → append protected current input for ModelInputProjection
 ```
 
-如果 current input 已先作为 session entry 持久化，`SessionRuntime` 仍必须按 entry id 把它从本次 compaction candidate 中排除，并作为 `ModelCallProjectionInput.current_input` 单独传递。consumed Steer 同理：只有进入 Rig/run history 后才成为后续 durable history。
+如果 current input 已通过 `UserInput` batch 提交，`SessionRuntime` 仍必须按 committed entry id 把它从本次 compaction candidate 中排除，并作为 `ModelCallProjectionInput.current_input` 单独传递。consumed Steer 同理：只有进入 Rig/run history 后才成为后续 durable history。
 
 RAG、memory、IDE diagnostics 等 `CurrentCall` context 不进入 compaction source；`CurrentRun` context 是否摘要必须由其 owner 显式升级为 durable entry，不能由 Compaction 猜测。
 
@@ -416,7 +420,7 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → if active work: store PendingSessionAction::Compact
       → emit queue_updated { pending_actions: [compact] }
       → current work continues unchanged
-      → after terminal facts + save point + required retry chain
+      → after terminal handling (required stable commit if any) + terminal facts + required retry chain
       → remove pending action and emit queue_updated
   → phase = compaction
   → emit `session_phase_changed` + `compaction_started { reason: manual }`
@@ -427,11 +431,11 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → material = compaction::build_summary_material(preparation, instructions)
   → SessionRuntime constructs ModelCallRequest { purpose: CompactionSummary, tools: [] }
   → ModelGateway summarizes material
-  → append SessionEntry::Compaction
+  → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → rebuild SessionContext
   → update SessionRuntime message projection / next TurnState basis
-  → future RuntimeHookRegistry.invoke(SessionCompact)
   → emit `compaction_finished`
+  → future RuntimeHookRegistry.invoke(SessionCompact) // observer; failure only diagnostics
   → phase = idle
 ```
 
@@ -449,7 +453,7 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
 
 ```text
 Driver returns DriveResult::Completed
-  → SessionRuntime persists assistant/tool messages
+  → SessionRuntime has committed the final AssistantFinal batch
   → compute ContextUsage from projected session context
   → should_compact(context_usage.current_tokens, context_window, settings)
   → run_auto_compaction(reason = Threshold, will_retry = false)
@@ -464,26 +468,17 @@ threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steer
 context overflow 是压缩和 retry 的交界点。
 
 ```text
-Driver returns DriveResult::Failed { error: ContextOverflow, messages }
+Driver returns DriveResult::Failed { error: ContextOverflow }
   → SessionRuntime verifies error belongs to current model
   → if overflow recovery has not been attempted:
-       persist UI-visible failure if desired, but exclude it from retry context
+       emit diagnostics only; do not persist the transient partial/error message
        run_auto_compaction(reason = Overflow, will_retry = true)
        start a new drive_run with DriveEntry::Continue { reason: ContextOverflowRecovery }
   → else:
        emit `compaction_finished` with recovery failure and stop
 ```
 
-因为本项目使用 append-only session storage，不能依赖从临时内存消息数组中移除错误消息来改变持久化历史。若要把 overflow assistant error 保存在 session 里，必须显式标记它不参与模型上下文：
-
-```rust
-pub enum ContextVisibility {
-    ModelVisible,
-    UiOnly,
-}
-```
-
-或把 overflow failure 保存成 diagnostic/custom entry，而不是普通 assistant message。不要把 transient overflow error 留在重试 prompt 中。
+transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状态都不进入 `SessionWriter`，因此 retry 只从最后 committed context 重建，不需要从 durable history 删除失败消息。
 
 压缩后的重试不要使用 `DriveEntry::Resume`。应使用重建后的 session context 启动新的 `DriveEntry::Continue`。
 
@@ -494,14 +489,14 @@ pub enum ContextVisibility {
 ```text
 session_phase_changed { phase: compaction }
 compaction_started { session_id, reason }
+SessionHandle.commit(SessionWriteBatch::compaction(...)) // internal, no public persistence event
 compaction_finished { session_id, result, aborted, will_retry }
 usage_updated { context_usage }
-persistence_save_point { had_pending_mutations }
 session_phase_changed { phase: idle }
 session_settled { session_id, next_turn_count }
 ```
 
-立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → `compaction_finished` → `usage_updated` → `persistence_save_point` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true`，压缩后可以直接启动后续 `run_started`，不先发 `session_settled`。
+立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true`，压缩后可以直接启动后续 `run_started`，不先发 `session_settled`。
 
 压缩后的 `usage_updated` 主要更新 `ContextUsageView`，不减少 `SessionStatsView.total_usage`。
 
@@ -521,7 +516,7 @@ pub struct CompactionResultView {
 
 ## Hooks
 
-压缩相关 hook 是后期能力，完整边界见 [RuntimeHooks](runtime-hooks.md)。启用后，`SessionRuntime` 在压缩模型调用前触发 `SessionBeforeCompact`，在压缩条目写入后触发 `SessionCompact` observer；hook 不直接写 session entry，也不直接发布 `compaction_finished`。
+压缩相关 hook 是后期能力，完整边界见 [RuntimeHooks](runtime-hooks.md)。启用后，`SessionRuntime` 在压缩模型调用前触发 `SessionBeforeCompact`，在压缩条目 commit、projection 更新和 `compaction_finished` 发布后触发 `SessionCompact` observer；hook 不直接写 session entry，也不直接发布 `compaction_finished`。
 
 `SessionBeforeCompact` 的结果应保持 typed：
 
@@ -542,7 +537,7 @@ pub enum BeforeCompactDecision {
 - 如果让 `Driver` 自动压缩，driver 会被迫理解 session tree、持久化、hooks 和 retry；这会把一个深模块变浅。
 - 如果压缩后 resume 旧 `AgentRun`，上下文不会真的变小；必须从重建后的 session context 重新 continue。
 - 如果 cut point 允许落在 tool result 上，会生成 provider 不接受的 orphan tool result；cut point 必须协议安全。
-- 如果 overflow error 作为普通 assistant message 保存并参与重试，模型会看到一次无意义失败；append-only 存储需要显式 `UiOnly` 或 diagnostic entry。
+- 如果 overflow error 被误写入 session 并参与重试，模型会看到一次无意义失败；transient overflow diagnostics 和 partial assistant 不得进入 writer。
 - 如果 summary generation 不限制输入，大型工具输出会让压缩本身 overflow；必须序列化并截断 tool results，后续支持 chunked summary。
 
 ## 不应承担
@@ -553,7 +548,7 @@ pub enum BeforeCompactDecision {
 - 构造 `ModelCallRequest` 或选择模型调用策略。
 - 执行工具或读取工作区文件。
 - 持有 provider registry、API key 或 fallback policy。
-- 追加 session entry 或移动 leaf。
+- 绕过 `SessionWriter` 直接追加 session entry 或移动 leaf。
 - 发送 UI event。
 - 修改 system prompt。
 - 扫描 skills、resources 或 prompt templates。

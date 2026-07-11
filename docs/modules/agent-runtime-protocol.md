@@ -2,7 +2,7 @@
 
 `AgentRuntimeProtocol` 是下游 CLI/TUI/GUI adapter 与 `AgentRuntime` 之间的稳定通信协议模块，包含命令、领域分组查询、事件、快照和共享视图类型。下游宿主只应依赖这个协议，不依赖 Rig、工具实现或 session 文件。
 
-事件命名、顺序、持久化屏障、重连和各场景生命周期详见 [AgentRuntimeEvents](agent-runtime-events.md)。本文件只保留 UI 需要依赖的协议类型。
+事件命名、顺序、commit 后领域事实、重连和各场景生命周期详见 [AgentRuntimeEvents](agent-runtime-events.md)。本文件只保留 UI 需要依赖的协议类型。
 
 Rust 模块名建议使用 `agent_runtime_protocol`。模块内对外命令枚举使用 `AgentCommand`，表示“下游 adapter 发给 `AgentRuntime` 的协议级用户意图”。`Command` 这个短名留给 [CommandSurface](command-surface.md) 中的 session-scoped `command::Command` 子系统入口。跨模块引用时使用完整路径，例如 `agent_runtime_protocol::AgentCommand`。
 
@@ -19,7 +19,7 @@ pub trait AgentRuntime {
 }
 ```
 
-`dispatch()` 接收 mutation 或异步工作，`query()` 直接返回只读结果，`subscribe()` 传递运行变化，`snapshot()` 提供带事件水位的恢复读模型。助手输出、工具活动、保存状态、资源变化和错误都通过 `agent_runtime_protocol::Event` 传递；query response 不进入事件流。
+`dispatch()` 接收 mutation 或异步工作，`query()` 直接返回只读结果，`subscribe()` 传递运行变化，`snapshot()` 提供带事件水位的恢复读模型。助手输出、工具活动、已提交会话事实、资源变化和错误都通过 `agent_runtime_protocol::Event` 传递；query response 不进入事件流。
 
 `agent_runtime_protocol::EventStream` 传输完整的 `agent_runtime_protocol::Event`。外层事件记录负责顺序、路由、关联和重连水位，`msg` 负责业务事实。
 
@@ -256,7 +256,7 @@ pub(crate) enum InternalAgentCommand {
 
 - session 已 `idle` 时立即进入 manual compaction。
 - session 有 active run、等待 tool approval、处于 suspended run 或正在自动 retry chain 时，不中止当前 work；`SessionRuntime` 保存一个结构化 `PendingSessionAction::Compact`，并通过 `queue_updated` / `QueueSnapshot.pending_actions` 暴露。
-- pending compact 在当前 work 的 terminal event 和相关 `persistence_save_point` 完成后、queued steering continuation / follow-up 之前执行；如果还有立即 retry / overflow recovery，则等该 work chain 稳定结束后再执行。`NextTurn` 不会自动启动 continuation。
+- pending compact 在当前 work 的 terminal handling 完成后（正常完成包含 required stable batch commit；abort/failure 可以没有新 batch）且 terminal event 已发布后、queued steering continuation / follow-up 之前执行；如果还有立即 retry / overflow recovery，则等该 work chain 稳定结束后再执行。`NextTurn` 不会自动启动 continuation。
 - 已有 pending compact 时重复提交不追加第二个压缩动作，返回 `CompactAlreadyQueued` 类 command output，保留原 instructions。
 - session 已在 compaction phase 时返回 `CompactionAlreadyRunning`；不会排队第二次 compaction。
 - `AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会移除 pending compact，并发出更新后的 `queue_updated`；普通 run failure 在不再 retry 时仍执行用户已经排队的 compact。
@@ -307,6 +307,8 @@ CycleThinkingLevel { session_id: SessionId }
 SetAutoCompaction { session_id: SessionId, enabled: bool }
 SetAutoRetry { session_id: SessionId, enabled: bool }
 ```
+
+`NavigateSessionTree.target_entry_id` 和 `ForkSession.from_entry_id` 必须是 storage/query 暴露的 committed stable batch boundary。多-entry `ToolRound` 的 assistant message 或中间 tool result 不是合法目标；runtime 返回结构化 invalid target，不能投影或复制半个 stable batch。
 
 `PatchSettings` 是后续配置 mutation 框架：UI 先通过 `SettingsQuery::GetEffective/GetSchema` 读取 effective values、source/provenance、editable constraints 和 revision，在本地维护未提交草稿，再用 expected revision 提交 patch。冲突返回 stale revision；成功后的 effective change 通过对应业务事件更新 UI cache。API key、OAuth token 和 auth header 不得进入普通 `SettingsPatch`，必须走专门的 secure credential seam。
 
@@ -376,7 +378,6 @@ pub enum EventMsg {
     PromptTemplate(PromptTemplateEvent),
     Compaction(CompactionEvent),
     Retry(RetryEvent),
-    Persistence(PersistenceEvent),
     Diagnostics(DiagnosticsEvent),
 }
 
@@ -514,10 +515,6 @@ pub enum RetryEvent {
     AutoFinished { session_id: SessionId, success: bool, attempt: u32, final_error: Option<String> },
 }
 
-pub enum PersistenceEvent {
-    SavePoint { session_id: SessionId, had_pending_mutations: bool },
-}
-
 pub enum DiagnosticsEvent {
     RuntimeChanged { diagnostics: Vec<RuntimeDiagnostic> },
     Warning { scope: EventScope, message: String },
@@ -550,7 +547,6 @@ pub enum SuspendReason {
     WaitingUserInteraction,
     ExternalJobPending,
     UserSuspendedAtSafePoint,
-    HostShutdownCheckpoint,
     AfterToolResultCheckpoint,
 }
 
@@ -827,12 +823,13 @@ UI/wire event type 映射：
 | `CompactionEvent::Finished` | `compaction_finished` |
 | `RetryEvent::AutoStarted` | `retry_auto_started` |
 | `RetryEvent::AutoFinished` | `retry_auto_finished` |
-| `PersistenceEvent::SavePoint` | `persistence_save_point` |
 | `DiagnosticsEvent::RuntimeChanged` | `diagnostics_runtime_changed` |
 | `DiagnosticsEvent::Warning` | `diagnostics_warning` |
 | `DiagnosticsEvent::Error` | `diagnostics_error` |
 
 事件是实时下游界面更新的唯一来源。CLI、Ratatui 和 Tauri/Vue 宿主都应把同一条事件流 reduce 成各自的 UI 状态。`run_finished` 是唯一 run terminal event；不要同时发 `run_aborted` 这类第二终态。`run_suspended` / `run_resumed` 是 current run 的可恢复中间态事件，不是终态。
+
+公共协议不定义 persistence/save-point event。session mutation 统一由内部 `SessionWriter.commit(SessionWriteBatch)` 提交；`message_user_appended`、正常稳定 assistant message 的 `message_assistant_finished`、`message_tool_result_appended`、需要恢复的 session mutation event、成功 `compaction_finished { result: Some(...) }` 和正常 `run_finished { completed }` 只能在对应 batch commit 成功后发布。streaming delta、approval wait、tool progress 和 abort/failure 时用于关闭 UI lifecycle 的 partial assistant events 可以只存在当前 host，不承诺重启恢复。
 
 `command_interaction_resolved` 是后续可选事件。MVP 中候选选择结果可以直接触发新的 `ExecuteCatalogCommand`，不要求 runtime 跟踪 pending interaction；只有实现 `SubmitInteraction` 或需要审计 interaction 关闭/提交时，才需要发布 resolved 事件。用户主动键入命令文本仍可走 `ExecuteCommandText`，但 interaction request 本身不能携带 raw command text。
 
@@ -934,11 +931,13 @@ pub struct CommandSnapshot {
 }
 ```
 
-`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session；MVP 恢复旧会话时默认以 `SessionPhase::Idle`、`current_run = None` 和空队列启动，未来若实现持久化 resume state，才可以用 `CurrentRunState::Suspended` 恢复未完成 run。model、thinking level、messages、usage stats 等来自 `SessionStorage` 的持久化事实重建。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。`RunView.state` 表示 current run 的当前执行状态；`Suspended` 是可恢复暂停状态，不是 terminal status。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+`SessionTreeView` 可以展示 batch 内消息节点，但只有 committed stable batch boundary 才能标记为 navigable/forkable；UI 不能把 `ToolRound` interior entry 直接填入 `NavigateSessionTree` / `ForkSession`。
+
+`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session；MVP 恢复旧会话时固定以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；`CurrentRunState::Suspended` 只表示同一 host 生命周期内的内存 checkpoint，不用于跨进程恢复未完成 run。model、thinking level、messages、usage stats 等只从 `SessionStorage` 的 committed stable batches 重建；中断时未提交的 partial assistant、pending approval 和 incomplete tool round 不会出现。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。`RunView.state` 表示 current run 的当前执行状态；`Suspended` 是可恢复暂停状态，不是 terminal status。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
 
 `RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `approval_id` 与 `call_id` 回答。
 
-`CurrentRunState::Suspended` 表示 `Driver` 已在可恢复 checkpoint 停住，运行时持有 resume state，恢复时应继续同一个未完成 run 的协议 continuation。例如工具结果已经生成但尚未回填给 Rig / provider 时，可以 suspend 并在 resume 后按正式 tool result 协议继续。它不能通过 `run_finished { status: paused }` 表达；`run_finished` 只用于 completed / failed / aborted 这三类终态。
+`CurrentRunState::Suspended` 表示 `Driver` 已在同一 host 生命周期内的可恢复 checkpoint 停住，运行时仅在内存持有 resume state，恢复时应继续同一个未完成 run 的协议 continuation。例如工具结果已经生成但尚未回填给 Rig / provider 时，可以 suspend 并在 resume 后按正式 tool result 协议继续。它不能通过 `run_finished { status: paused }` 表达；`run_finished` 只用于 completed / failed / aborted 这三类终态。
 
 `RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 

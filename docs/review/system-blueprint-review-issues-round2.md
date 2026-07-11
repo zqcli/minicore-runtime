@@ -12,7 +12,7 @@
 
 本轮发现的问题集中在三类：
 
-1. **协议表面仍有真实缺口**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort 持久化语义仍未定义（BR-024），部分命令/事件字段仍与既定语义冲突（BR-027、BR-030、BR-031）。
+1. **协议表面仍有真实缺口**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort/crash 持久化语义（BR-024）已通过统一 stable batch writer 关闭；部分命令/事件字段仍与既定语义冲突（BR-027、BR-030、BR-031）。
 2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）已通过 `Tools` 权威文档补齐 source of truth。
 3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
@@ -30,27 +30,15 @@ query 不分配 `CommandId`、不产生 `CommandAck`、不发布 query-response 
 
 ### BR-024：run 中断（abort/失败/宿主关闭）后的持久化语义未定义，可能在会话历史中留下 unresolved tool call
 
-状态：Open
+状态：Resolved
 
-问题：两个相互纠缠的缺口。
+处理记录：按 ADR 0019，所有 session mutation 统一通过 `SessionWriter.commit(SessionWriteBatch)`。writer 只接受协议完整、可以独立恢复的稳定单元；成功返回是可信写入结果，失败 batch 不得进入恢复投影。MVP 不引入 `SessionRevision`，`CommittedSessionBatch` 只返回 entry ids 与 current leaf。
 
-其一，abort 时 partial 输出是否持久化没有定义：`DriveResult::Aborted { messages }` 把已产生消息交回 `SessionRuntime`，但 Abort Lifecycle 事件序列（`run_finished { aborted }` → `session_phase_changed(idle)` → `session_settled`）中没有 `persistence_save_point`，也没有任何文字说明这些 messages 写不写 session。不写则 UI 已渲染的内容重开后消失；写则引出其二。
+`UserInput`、完整 `ToolRound`、`AssistantFinal`、`Compaction`、独立 `SessionMutation` 和 `TreeMutation` 分批提交。assistant tool-call message 不能单独持久化；它必须和该 round 的全部 actual/error tool results 作为一个 `ToolRound` commit。DriverHost 只有在 commit 成功后才把 tool results 返回 Driver 并允许下一模型调用，因此 committed history 不会产生 unresolved tool call。
 
-其二，工具执行中途中断（abort、executor 崩溃、宿主进程关闭时有 pending approval）后，包含 tool call 的 assistant message 可能已持久化而对应 tool result 永远不会出现。`build_session_context()` 的重建规则（session-manager.md）没有任何 orphan tool call / unresolved tool call 的清理或修补规则；文档中唯一处理协议安全序列的地方是 compaction cut point。下次在该会话 `SubmitPrompt` 时，重建出的上下文含悬空 tool call，Anthropic/OpenAI 协议都会直接拒绝请求，会话文件从此"带毒"，用户无法自救。
+streaming delta、partial assistant、pending approval、执行中的 tool round 和其他 `CurrentRun` 状态只存在内存。abort、failure、session close 或 host shutdown 保留此前 committed batches，丢弃当前 incomplete unit；started assistant 仍发布 finished 关闭 UI lifecycle，但 partial 不落盘。stable commit 一旦开始不接收 run cancellation，graceful abort/close/shutdown 等待其确定结果后再完成 terminal handling。hard crash 后只恢复最后一个完整 committed batch，不恢复旧 run、不补 synthetic result，也不做语义 repair。JSONL adapter 一行编码一个 batch，只允许忽略或截断末尾不完整行；中间损坏或违反 tool protocol 的 committed batch fail closed。
 
-pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error/aborted tool result 再落盘；本项目文档引用了 Pydantic AI"移除未解决 tool calls"的经验，但只应用于压缩场景。
-
-证据：
-
-- `docs/modules/driver.md`：`DriveResult::Aborted { messages }`。
-- `docs/modules/agent-runtime-events.md`：Abort Lifecycle 无 save point，`message_assistant_finished?` 注释仅提 abort/error message；Tool Call Lifecycle 中 tool result message 在 `tool_call_finished` 之后才追加。
-- `docs/modules/session-manager.md`：上下文构建规则无 orphan tool call 处理。
-- `docs/modules/compaction.md`：协议安全约束（"不能留下 orphan tool result 或 unresolved tool call"）只出现在压缩边界。
-- `docs/modules/agent-runtime-protocol.md`：`SessionSnapshot` 恢复语义为 Idle + `current_run = None`，messages 来自持久化事实重建。
-
-风险：数据级损坏——不是一次 run 失败，而是会话历史永久无法继续；在 roadmap 阶段 10/11（tools/approval）叠加 abort 时必然暴露。
-
-待处理方向：在 SessionManager/SessionStorage 权威文档中定义两条规则之一或组合：(a) 写入侧补偿——run 以非 completed 终态结束时，`SessionRuntime` 为所有无 result 的 tool call 追加合成 error tool result，再 flush save point；(b) 读取侧防御——`build_session_context()` 对 unresolved tool call 做确定性修补（补 synthetic result 或降级为文本），并写明该规则同样适用于 crash 后遗留的历史。同时明确 Abort Lifecycle 是否包含 save point。
+该方案接受工具已经产生外部副作用、但对应 running batch 尚未 commit 时 workspace 与 session history 可能不一致；MiniCore 不承诺 tool exactly-once 或文件系统与 session storage 的跨系统原子事务。公共 `persistence_save_point` 同时删除，需要恢复的领域事件在 commit 成功后发布。
 
 ### BR-025：custom provider / AuthRef 与 project trust 的边界未定义，存在凭据外泄链
 
@@ -175,7 +163,7 @@ slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfte
 
 状态：Open
 
-问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、PersistenceEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 `CommandResultEvent` / `UiInteractionRequest` 的 command_id 解释了“内层重复是为了脱离事件上下文渲染”，没有给出统一规则。
+问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 `CommandResultEvent` / `UiInteractionRequest` 的 command_id 解释了“内层重复是为了脱离事件上下文渲染”，没有给出统一规则。
 
 证据：
 
@@ -292,13 +280,9 @@ slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfte
 
 ### BR-042：`SessionEntry::Leaf` 条目与 `SessionStorage::set_leaf_id()` 双机制关系未定义
 
-状态：Open
+状态：Resolved
 
-问题：JSONL 规则用 `leaf` entry 记录当前叶子（"追加普通条目后，当前叶子默认变为该条目"），trait 又有独立的 `set_leaf_id()` 方法。set_leaf_id 是否等价于追加 Leaf entry、Leaf entry 自身是否在树上（有无 parent_id）、`get_path_to_root` 如何跳过它，均未说明；InMemory 与 JSONL 两实现极易在此分叉。
-
-证据：`docs/modules/session-manager.md` Interface 与 JSONL 持久化段。
-
-待处理方向：在 storage contract 中明确两者关系，并纳入 conformance tests。
+处理记录：ADR 0019 的 batch writer 同时移除了 `SessionStorage::set_leaf_id()` 和 `SessionEntry::Leaf`。每个 committed `session_batch` 携带唯一 `BatchLeafUpdate`：所有追加 entries 的 batch（包括 metadata-only `SessionMutation`）使用 `AdvanceToLastEntry`，只有不追加 entry 的导航使用 `MoveTo(target)`。target 必须是 committed append batch 的最后一个 entry；`ToolRound` interior entry 会被拒绝，避免恢复半个 stable batch。writer 在同一 commit 内原子处理 entries 与 logical current leaf；`get_path_to_root()` 只遍历领域 entries，不存在 marker entry 跳过规则。InMemory 和 JSONL adapters 必须复用该 contract。
 
 ### BR-043：`CwdScopedServices` generation 的回收策略未定义
 
@@ -324,13 +308,9 @@ slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfte
 
 ### BR-045：CONTEXT.md 会话条目类型列表滞后
 
-状态：Open
+状态：Resolved
 
-问题：CONTEXT.md "会话条目"词条列出 message、model_change、active_tools_change、compaction、branch_summary、label、session_info、leaf，缺 session-manager.md 已定义的 thinking_level_change、custom、custom_message、usage。与 BR-017/BR-018 同类（术语表滞后）。
-
-证据：`CONTEXT.md` 会话条目词条 vs `docs/modules/session-manager.md` 追加式条目段。
-
-待处理方向：同步词条，或改为开放式措辞并链接权威文档。
+处理记录：CONTEXT.md 已同步当前 entry families，并明确完整集合以 SessionManager 文档为准；`leaf` 不再是 entry，current leaf 由 committed batch 的 `BatchLeafUpdate` 维护。
 
 ### BR-046：`UiInteractionSubmit::ExecuteSlashCommandTemplate` 的占位符语法未定义
 

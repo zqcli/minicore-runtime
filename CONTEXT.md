@@ -101,11 +101,11 @@ _避免_：会话管理器、UI 会话状态
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
-`RuntimeHooks` 模块规划的后期内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、保存点和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前 MVP 不实现 hook system，也不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
+`RuntimeHooks` 模块规划的后期内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、session commit observer 和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前 MVP 不实现 hook system，也不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
 _避免_：UI 回调、协议事件、插件系统、任意 runtime 后门、当前阶段必做模块
 
 **Hook owner**：
-拥有某个安全点业务不变量的模块。Hook owner 负责调用 hook、应用 typed result、重新校验并记录 diagnostics；`RuntimeHookRegistry` 只保存 handler，不拥有业务流程。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点，`Tools` 拥有工具治理安全点，`ModelGateway` 拥有 model/provider 边界安全点，`CommandManager` / `Command` 拥有 command catalog/resolve/output 安全点。
+拥有某个安全点业务不变量的模块。Hook owner 负责调用 hook、应用 typed result、重新校验并记录 diagnostics；`RuntimeHookRegistry` 只保存 handler，不拥有业务流程。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/session commit observer 安全点，`Tools` 拥有工具治理安全点，`ModelGateway` 拥有 model/provider 边界安全点，`CommandManager` / `Command` 拥有 command catalog/resolve/output 安全点。
 _避免_：Hook 注册表、Driver、UI adapter、任意调用方
 
 **运行时 Hook 注册表（`RuntimeHookRegistry`）**：
@@ -125,11 +125,11 @@ _避免_：聊天记录、日志文件
 _避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、事件日志
 
 **会话条目**：
-会话中的一条不可变追加记录。条目通过 `id` 和 `parentId` 连接成树，类型包括 message、model_change、active_tools_change、compaction、branch_summary、label、session_info 和 leaf。
+会话中的一条不可变追加记录。条目通过 `id` 和 `parentId` 连接成树；当前类型包括 message、model_change、active_tools_change、thinking_level_change、compaction、branch_summary、label、session_info、custom、custom_message 和 usage，完整集合以 SessionManager 文档为准。current leaf 由 committed batch 的 `BatchLeafUpdate` 维护，不是独立 entry 类型。
 _避免_：消息、数据库行
 
 **会话树**：
-由会话条目的父子关系形成的历史树。当前对话上下文由根到当前叶子的一条路径构建，而不是由文件中所有条目线性构建。
+由会话条目的父子关系形成的历史树。当前对话上下文由根到当前叶子的一条路径构建，而不是由文件中所有条目线性构建；可导航 leaf 必须是 committed stable batch boundary，不能落在多-entry `ToolRound` 内部。
 _避免_：消息数组、历史列表
 
 **上下文压缩**：
@@ -169,7 +169,7 @@ _避免_：会话存储、会话目录、独立会话运行时注册表
 _避免_：active session、running session、loaded session、service scope
 
 **会话存储（`SessionStorage`）**：
-单个会话的底层条目存储，负责保存追加式会话条目、当前叶子和会话元数据。它不决定 Agent 如何运行，也不直接服务 UI。
+单个会话的底层 committed batch 存储，也是 `SessionWriter` 的 adapter；负责按 batch grouping 读取稳定会话条目、当前叶子和会话元数据，并隐藏 memory/JSONL 实现。它不决定 Agent 如何运行，也不直接服务 UI。
 _避免_：会话管理器、会话运行时、聊天状态
 
 **技能**：
@@ -318,14 +318,14 @@ _避免_：响应、请求、chat completion
 
 **待执行会话动作（`PendingSessionAction`）**：
 `SessionRuntime` 接受 `CommandRunPolicy::QueueAfterRun` 后保存、并在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。
-_避免_：AgentCommand payload、QueuedMessage、PendingSessionWrites、CommandManager pending action
+_避免_：AgentCommand payload、QueuedMessage、writer 内部 batch draft、CommandManager pending action
 
 **当前运行状态（`CurrentRunState`）**：
 `RuntimeSnapshot.active_session.current_run` 中描述当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
 _避免_：RunTerminalStatus、SessionPhase、工具调用状态
 
 **可恢复暂停（`Suspended`）**：
-当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending、safe point 用户暂停或 host shutdown checkpoint。它不能表达为 `run_finished { status: paused }`。
+当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending 或 safe point 用户暂停。MVP resume state 只在同一 host 生命周期内存活；host shutdown 后不恢复 running run。它不能表达为 `run_finished { status: paused }`。
 _避免_：focus 切换、terminal finished、普通 waiting approval、模型 streaming 中途暂停
 
 **TurnState**：
@@ -446,11 +446,11 @@ _避免_：UI 动作、后端 API 调用
 _避免_：回调、前端状态修改、会话日志
 
 **事件消息（`agent_runtime_protocol::EventMsg`）**：
-运行时事件中的业务事实部分，例如 run started、tool call output delta 或 persistence save point。外层 `agent_runtime_protocol::Event` 负责顺序、路由、关联和重连水位。
+运行时事件中的业务事实部分，例如 run started、tool call output delta 或 message tool result appended。外层 `agent_runtime_protocol::Event` 负责顺序、路由、关联和重连水位。
 _避免_：chat message、UI 显示文案、前端状态对象
 
 **事件族**：
-按公开生命周期对象划分的一组事件，例如 session、run、message、tool call、resources、compaction、retry、persistence 和 diagnostics。事件族用于命名和 reducer 分发，不等同于内部 Rust module。
+按公开生命周期对象划分的一组事件，例如 session、run、message、tool call、resources、compaction、retry 和 diagnostics。事件族用于命名和 reducer 分发，不等同于内部 Rust module。
 _避免_：文件名、模块名、UI 分组
 
 **事件类型名**：
@@ -458,16 +458,20 @@ UI/wire 层识别事件种类的稳定名称，使用 flat `snake_case`，例如
 _避免_：Rust enum variant、内部模块路径、显示文案
 
 **事件生命周期**：
-一个运行时动作从接收命令到进入终态期间应产生的事件顺序，例如开始、增量、完成、保存点和空闲通知。
+一个运行时动作从接收命令到进入终态期间应产生的事件顺序，例如开始、增量、完成、提交后的领域事实和空闲通知。
 _避免_：UI 动画流程、内部函数调用顺序
 
 **事件状态机**：
 描述某类运行时对象可处于哪些状态、哪些事件能推动状态转换，以及哪些状态是终态。它用于约束 UI reducer 和运行时测试。
 _避免_：前端 store、流程图、内部实现步骤
 
-**保存点（`SavePoint` / `persistence_save_point`）**：
-运行时确认会话相关写入已经形成可恢复边界的事件。Rust 内部概念可叫 `SavePoint`，UI/wire 事件名使用 `persistence_save_point`。它说明界面此前看到的相关消息或配置变化已经可以从会话快照中恢复。
-_避免_：自动保存按钮、文件系统 flush 细节
+**会话写入器（`SessionWriter`）**：
+所有会话 mutation 共用的可信写入 seam。它只接受协议完整、可以独立恢复的 `SessionWriteBatch`；`commit()` 成功返回表示整个 batch 已按 storage adapter 契约写入，失败则该 batch 不得进入恢复投影。公共协议不暴露单独的 save-point event。
+_避免_：事件发布器、逐条 append helper、UI 保存状态、通用数据库事务管理器
+
+**会话写入批次（`SessionWriteBatch`）**：
+一次原子提交的稳定 session entries，例如 user input、完整 tool-call/result round、最终 assistant message、compaction、独立 session mutation 或 tree mutation。streaming delta、partial assistant、pending approval 和执行中的 tool round 不属于 write batch。
+_避免_：CurrentRun snapshot、事件批次、模型请求 batch、SessionRevision
 
 **模型提供方客户端**：
 用于调用一个或多个模型提供方 API 的底层库。它可能支持流式输出和 function-call payload，但它本身不提供完整 Agent loop、本地编程工具、会话模型或权限边界。

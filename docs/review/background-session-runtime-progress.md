@@ -646,7 +646,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - `RunTerminalStatus` 只保留 `Completed`、`Failed`、`Aborted`。
 - 新增 `CurrentRunState::{Running, WaitingApproval, Suspended { resume_id, reason }}`。
 - 新增 `RunEvent::Suspended` / `RunEvent::Resumed`，并保留 `RunEvent::Finished` 作为唯一终态事件。
-- 典型 suspend checkpoint 包括：tool result 已产生但尚未回填 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停、host shutdown checkpoint。
+- 典型 suspend checkpoint 包括：tool result 已产生但尚未回填 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停。ADR 0019 后 resume state 只在同一 host 生命周期内存活，host shutdown 不恢复 running run。
 - 普通 focus 切换不是暂停；pending approval 在 MVP 中是 current run 的 waiting substate，不等同于跨生命周期 suspend。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`driver.md`、`adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-005 已标记为 Resolved。
@@ -673,7 +673,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 设计收敛为：hook owner 遵循 runtime 边界，谁拥有安全点业务不变量，谁调用 hook、应用 typed result、重新校验并记录 diagnostics。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点；`Tools` 拥有工具治理安全点；`ModelGateway` 拥有 model/provider 边界安全点；`CommandManager` / session `Command` 拥有 command catalog/resolve/output 安全点。`Driver` 不调用 hook，`RuntimeHookRegistry` 只保存 handler 和策略。
 
-实现顺序也同步收敛：当前 MVP 不实现 hook system，也不在 roadmap 中设置 `RuntimeHooks MVP` 阶段。后期第一批 hook 才考虑接入已经稳定的 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSavePoint` 和 `CommandOutputBuild`。provider hooks 后期仍由 `ModelGateway` 拥有，raw provider payload patch 默认不开放。
+实现顺序也同步收敛：当前 MVP 不实现 hook system，也不在 roadmap 中设置 `RuntimeHooks MVP` 阶段。后期第一批 hook 才考虑接入已经稳定的 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSessionCommit` 和 `CommandOutputBuild`。provider hooks 后期仍由 `ModelGateway` 拥有，raw provider payload patch 默认不开放。
 
 已同步完成：`runtime-hooks.md`、`session-runtime.md`、`model-gateway.md`、`driver.md`、`implementation-roadmap.md`、`agent-runtime.md`、`architecture.md`、`modules/README.md`、ADR 0008、ADR 0015、`CONTEXT.md`、`system-blueprint-review-issues.md` 和 `system-blueprint-review-issues-round2.md` 已按该语义更新，BR-010 已标记为 Resolved。由于同一 owner 分层同时固定了 future registry / session-scoped view / fixed cwd trust 判定，BR-035 也已标记为 Resolved。
 
@@ -689,7 +689,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 本轮确认：手动 `/compact` 不能隐式 abort 当前 run，但 running 时也不必直接拒绝。该语义现统一命名为 `CommandRunPolicy::QueueAfterRun`：idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，由 `SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 不受影响。早期 `CommandPhasePolicy::DeferUntilPostRun` 名称已由 ADR 0016 替换。
 
-pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal facts 和 save point 完成后，在 follow-up/next-turn 之前执行。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
+pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal handling（required stable commit if any）和 terminal facts 完成后，在 follow-up/next-turn 之前执行。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`command-surface.md`、`session-runtime.md`、`compaction.md`、`implementation-roadmap.md`、`architecture.md`、`modules/README.md`、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-014 已标记为 Resolved。
 
@@ -719,8 +719,10 @@ slash/catalog command 自身使用正交的 `CommandRunPolicy { Immediate, IdleO
 
 新增 `docs/modules/prompt-templates.md` 关闭 BR-016；新增 ADR 0017 记录 immutable turn assembly 与拒绝长期 Manager 的取舍。旧 `fda22a6` 中“Prompt 是纯 system prompt builder”的边界已被本轮设计深化：纯计算和不反向读取 ResourceManager 的原则保留，但 Prompt 的职责扩展为完整的 intent/system/context/model-input 组装 seam。
 
-后续清理删除了已明显滞后的集中式 `docs/implementation-roadmap.md`。实现顺序不再作为行为事实来源；各模块文档、AgentRuntimeProtocol、AgentRuntimeEvents 和 ADR 是长期权威。BR-020 的 assistant lifecycle 由事件文档固定；BR-021 将 `persistence_save_point` 收敛为按可恢复 write batch 产生的 durable barrier，text-only run 至少包含 user-message 与 final run-result 两个 save point，tool round 可增加额外 barrier。abort/failure 的补偿和 orphan tool protocol repair 仍留给 BR-024。
+后续清理删除了已明显滞后的集中式 `docs/implementation-roadmap.md`。实现顺序不再作为行为事实来源；各模块文档、AgentRuntimeProtocol、AgentRuntimeEvents 和 ADR 是长期权威。BR-020 的 assistant lifecycle 由事件文档固定；BR-021 最初把 `persistence_save_point` 收敛为 write-batch barrier，随后由 ADR 0019 进一步简化为统一 `SessionWriter.commit(...)`：公共 save-point event 删除，稳定领域事实在 commit 成功后发布。text-only run 提交 `UserInput` 与 `AssistantFinal`，完整 tool round 单独提交。BR-024 通过 stable-unit policy 关闭：partial assistant、pending approval 和 incomplete tool round 不持久化，abort/failure/crash 只恢复此前 committed batches，不做 synthetic repair。
 
 BR-022 随后完成术语纯度清理。本轮仅提升文档表达，不改变架构：当前流程全部改用 MiniCore 自身术语解释；pi、Codex、LangChain 等只保留为明确标注的设计参考对象，不构成兼容承诺。外部历史类名和私有调用链已从架构入口与模块现行流程删除；ADR 继续保存必要的历史取舍。
 
 BR-023 通过 ADR 0018 关闭。`AgentRuntime` 现在明确提供 Command、Query、Event 和 Snapshot 四种能力；新增按 runtime/session/settings/resources/command surface/models/usage/diagnostics 分组的可扩展 `RuntimeQuery` 框架。query 只读并直接返回 `QueryResponse`，不经过 `CommandAck` 或 event stream；GUI sidebar、settings、资源详情和 usage 等程序化读取使用 Query，`/status` / `/usage` 等用户命令继续使用 command output。
+
+BR-024 通过 ADR 0019 关闭。所有 session mutation 统一走 `SessionWriter.commit(SessionWriteBatch)`，成功返回是可信写入结果；不引入 `SessionRevision`。writer 只接受 `UserInput`、完整 `ToolRound`、`AssistantFinal`、`Compaction`、独立 `SessionMutation` 和 `TreeMutation` 等稳定单元。公共 `persistence_save_point` 删除，commit 成功后才发布对应领域事件；running 中的 partial assistant、pending approval 和 incomplete tool round 不落盘，abort/failure/crash 只保留最后 committed batches。

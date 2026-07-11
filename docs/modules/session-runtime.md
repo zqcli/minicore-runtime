@@ -5,11 +5,11 @@
 ## 核心职责
 
 - 状态访问：messages、current run、model、thinking level、system prompt、active tools、all tools、resources、queues、session id、session name、session file、retry attempt、context usage 和 session stats。
-- 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；在 message/save point 上追加 session entries；通过 `AgentRuntime` event bus 向 UI 发布 `agent_runtime_protocol::Event`。
+- 事件与持久化：订阅 `Driver` events，归约 streaming state、pending tool calls 和 error state；把稳定事实组装为 `SessionWriteBatch` 并统一调用 `SessionHandle.commit(...)`，成功后再通过 `AgentRuntime` event bus 发布对应领域事件。
 - command 入口：持有 session-scoped `command: Command`，为当前 session 构造 `CommandContext` / `SessionCommandHost`，并调用共享无状态 `CommandManager` 处理 `ExecuteCommandText` / `ExecuteCatalogCommand`。
 - prompt 入口：处理 `SubmitPrompt` 和其他结构化 `PromptIntent`，执行输入预检、模型/凭据校验、附件策略和 `PromptDelivery` admission；目标 turn 由 `PromptTurn.resolve_intent()` 统一展开 skill/template。
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`，并持有结构化 `PendingSessionAction`；运行中输入或 deferred session action 不能绕过当前 work 的顺序。
-- 自定义消息入口：为后续 extension/runtime command 支持 custom message，允许“只写入会话”或“写入后触发 turn”。
+- 自定义消息入口：为后续 extension/runtime command 支持 custom message；只接受完整 draft，通过 `SessionMutation` 或 `UserInput` batch 提交后决定是否触发 turn。
 - 运行生命周期：启动 run、continue、post-run 处理、失败消息构造、abort、wait-for-idle、phase 切换和 settled 事件。
 - 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
@@ -29,7 +29,6 @@ SessionRuntime
   ├─ SessionHandle
   ├─ SessionPhase
   ├─ CurrentRun { PromptTurn / current-run context }
-  ├─ PendingSessionWrites
   ├─ CurrentRunUsage / SessionUsageStats / ContextUsage
   ├─ ModelState
   ├─ ResourceState { last_seen_revision }
@@ -137,8 +136,8 @@ pub struct ActiveModel {
 
 1. 会话创建时，从 settings/default model 初始化 `ModelState.selected`。
 2. 会话恢复时，从 root-to-leaf path 上最新 `SessionEntry::ModelChange { provider_id, model_id }` 恢复选择；如果 provider/model 已失效，通过 `ProviderRegistry` fallback，并记录 diagnostics / `model_fallback_message`。
-3. `SetModel` / `CycleModel` 只更新 `ModelSelection`，写入 `SessionEntry::ModelChange`，并发 `session_model_changed`；它们不构造 provider client，也不读取 credentials。
-4. `SetThinkingLevel` / `CycleThinkingLevel` 会按当前 `ModelCapabilities` 裁剪；不支持 thinking 的模型应降级为 `ThinkingLevel::Off` 或返回结构化错误。
+3. `SetModel` / `CycleModel` 先计算并校验 next `ModelSelection`，提交 `SessionWriteBatch::session_mutation([ModelChangeDraft(next)])`；只有 commit 成功后才替换 `ModelState.selected` 并发 `session_model_changed`；它们不构造 provider client，也不读取 credentials。
+4. `SetThinkingLevel` / `CycleThinkingLevel` 会按当前 `ModelCapabilities` 裁剪；不支持 thinking 的模型应降级为 `ThinkingLevel::Off` 或返回结构化错误。thinking level、active tools、session name 和其他需要恢复的 session mutation 都遵循同一顺序：计算 next state → commit `SessionMutation` batch → 替换 runtime-visible state → 发布 changed event。
 5. 每次启动 run 前，`SessionRuntime` 从 `ModelState` 和 `ProviderRegistry` 构造 `ActiveModel`，放进 `TurnState`。
 6. 运行中切换模型可以先被 phase guard 拒绝；完整版本可在 `before_next_model_call` 安全点由 `SessionRuntime` 更新会话事实，并原子替换 future model/options 与必要的 `PromptCallProfile`，但不能替换已经发出的 provider request。
 
@@ -232,6 +231,7 @@ let mut host = SessionDriverHost {
     cwd: self.cwd.clone(),
     turn_resources,
     tools: &mut self.tools,
+    session: &self.session,
     model_gateway: &self.services.model_gateway,
     event_sink: &mut self.event_sink,
     queues: &mut self.queues,
@@ -248,10 +248,13 @@ driver.drive_run(request, &mut host, cancel).await
 DriverHost::invoke_tool_batch(request, updates, cancel)
   → SessionRuntime attaches ToolRunContext { session_id, run_id, cwd, turn resources, abort signal }
   → Tools::invoke_batch(request, context, updates, cancel)
-  → ToolBatchResult
+  → Ok(ToolBatchResult) | Err(Cancelled | Failed)
+  → only Ok: SessionHandle.commit(SessionWriteBatch::tool_round(...))
+  → publish message_assistant_finished + ordered message_tool_result_appended*
+  → return ToolBatchResult only after commit succeeds
 ```
 
-`Tools` 返回内部工具结果和 update；`SessionRuntime` 负责归约 UI event、session writes、pending approval snapshot projection 和 save point。`Driver` 只把 `ToolBatchResult` 映射回 Rig tool results，并继续推进 `AgentRun`。
+`Tools` 返回内部工具结果和 update；`SessionRuntime` 负责归约 UI event、pending approval snapshot projection，并把完整 assistant tool-call message 与全部 tool results 组装为一个 `ToolRound` batch。只有 `SessionHandle.commit(...)` 成功后，host 才把 `ToolBatchResult` 返回给 Driver；Driver 随后映射为 Rig tool results 并继续推进 `AgentRun`。
 
 选择 `SessionDriverHost` 而不是只写 `impl DriverHost for SessionRuntime` 的缘由：
 
@@ -287,7 +290,7 @@ SessionRuntime
 
 压缩只改变 `ContextUsageView.current_tokens`，不减少 `SessionStatsView.total_usage`。会话累计消耗是历史账本；当前上下文占用是窗口状态。
 
-`usage_updated` 是实时 UI 事件，不代表 stats 已经持久化。可恢复边界仍然由 `persistence_save_point` 表达。UI 重连时以 `agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage` 为权威恢复显示。
+`usage_updated` 是实时 UI 事件，可以包含尚未形成稳定 session batch 的当前 host 内存统计。需要跨进程恢复的最终 usage 必须包含在对应 `AssistantFinal`、`ToolRound` 或其他稳定 batch 中，并在 `run_finished` 前提交。UI 重连时以 `agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage` 为权威恢复显示。
 
 ## RuntimeHooks
 
@@ -299,9 +302,9 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 - `PromptBuilt`：`PromptTurn` 形成 profile 后追加或 privileged replace system section；应用后必须重建并重新 fingerprint `PromptCallProfile`。
 - `ContextProjection`：为 `CurrentRun` / `CurrentCall` 返回显式 `ContextMaterialContribution::Available/Unavailable`，或在 privileged capability 下替换模型可见 messages；最终必须回到 Prompt 校验。
 - `BeforeNextModelCall` / `BeforeRunFinish`：run 级安全点，用于处理队列、暂停、follow-up、组合式 `NextModelCallPlan` 或 run 结束决策。
-- `ToolResultBeforeAppend`：tool-result message 写入前的受控干预；工具治理链路内部 hook 由 `Tools` 拥有。
+- `ToolResultBeforeCommit`：`Tools` 返回结果后、公开 `tool_call_finished` 和 `ToolRound` batch 组装前，对 tool-result draft 做受控干预；应用后必须重新校验 call id/order/redaction，公开 finished event 与 committed result 必须使用同一最终值。工具执行链路内部的 `ToolAfterExecute` 由 `Tools` 拥有。
 - `SessionBeforeCompact`：压缩前取消、追加说明或提供完整 `CompactionResult`。
-- `AfterSavePoint`：保存点后做 observer 型同步、索引、备份或 telemetry。
+- `AfterSessionCommit`：稳定 batch commit 后做 observer 型备份、telemetry 或可重建 cache 同步；它是内部 hook，不产生公共 persistence event，也不能承担 `SessionIndex` / current leaf / message projection 的权威更新。
 
 模型/provider 边界 hook 不属于 `SessionRuntime`：`BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 和 `ProviderUsageNormalized` 由 `ModelGateway` 在 `call_model(...)` 内拥有。`Driver` 不调用 hook。`SessionRuntime` 应按自己 hook point 的 error policy 处理失败：observer hook 失败进入 diagnostics；context 变换失败不得产生半写入 session entry。
 
@@ -313,17 +316,17 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 
 1. 收到 `agent_runtime_protocol::AgentCommand::Compact { instructions }`。
 2. 若 session 已 `idle`，立即进入第 4 步。若存在 active run、waiting approval、suspended run 或立即 retry chain，则保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，发 `queue_updated`，不 abort、不改 phase、不清理任何 message queue。
-3. 当前 work terminal event 和相关 save point 完成后，如果没有立即 retry / overflow recovery，先移除 pending compact 并发 `queue_updated`，再切换到 `SessionPhase::Compaction`；该动作优先于 queued steering continuation / follow-up。若 `AbortRun`、`ClearQueue`、session close 或 shutdown 发生，则移除 pending compact，不启动压缩。重复 `Compact` 返回 `CompactAlreadyQueued`；已处于 compaction phase 返回 `CompactionAlreadyRunning`。
+3. 当前 work 的 terminal handling 已完成（正常完成包含 required stable batch commit；abort/failure 可以没有新 batch）且 terminal event 已发布后，如果没有立即 retry / overflow recovery，先移除 pending compact 并发 `queue_updated`，再切换到 `SessionPhase::Compaction`；该动作优先于 queued steering continuation / follow-up。若 `AbortRun`、`ClearQueue`、session close 或 shutdown 发生，则移除 pending compact，不启动压缩。重复 `Compact` 返回 `CompactAlreadyQueued`；已处于 compaction phase 返回 `CompactionAlreadyRunning`。
 4. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
 5. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
 6. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
 7. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
-8. 追加 `SessionEntry::Compaction`，再调用 `SessionHandle` 的上下文构建能力重建 messages。
-9. 发出 `compaction_finished` 和 `persistence_save_point`，随后 phase 回到 `idle`；如果还有 queued steering continuation / follow-up，则继续对应 work，否则发出 `session_settled`。`NextTurn` 可以在 settled 状态保留。如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
+8. 构造 `SessionWriteBatch::compaction(...)`，通过 `SessionHandle.commit(batch)` 原子提交 compaction entry 与 leaf update，再调用上下文构建能力重建 messages。
+9. commit 成功后发出 `compaction_finished`，随后 phase 回到 `idle`；如果还有 queued steering continuation / follow-up，则继续对应 work，否则发出 `session_settled`。`NextTurn` 可以在 settled 状态保留。如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
 
 自动压缩流程：
 
-1. `Driver` 返回 `DriveResult::Completed` 后，`SessionRuntime` 写入消息并 flush save point。
+1. `Driver` 返回 `DriveResult::Completed` 后，`SessionRuntime` 提交最终 `AssistantFinal` batch；`run_finished` 只能在 commit 成功后发布。
 2. 从最新 assistant usage 或估算值计算 context usage。
 3. 如果 `compaction::should_compact(...)` 为 true，执行 `run_auto_compaction(reason = Threshold, will_retry = false)`。
 4. threshold 压缩完成后不重跑刚完成的回答；如果队列里还有 queued steering continuation / follow-up，再从重建后的上下文继续。`NextTurn` 等下一次显式 prompt。
@@ -332,7 +335,7 @@ overflow recovery 流程：
 
 1. `DriveResult::Failed` 中的错误被识别为当前模型的 context overflow。
 2. 如果本轮尚未尝试过 overflow recovery，执行 `run_auto_compaction(reason = Overflow, will_retry = true)`。
-3. transient overflow failure 如果要持久化，必须标记为 `ContextVisibility::UiOnly` 或写成 diagnostic/custom entry，不能进入重试上下文。
+3. transient overflow failure 只进入 diagnostics，不写入 session；partial assistant 和旧 run 的未完成状态也不进入重试上下文。
 4. 压缩成功后，用重建后的 session context 启动新的 `DriveEntry::Continue { reason: ContextOverflowRecovery }`。
 5. 不使用 `DriveEntry::Resume` 恢复旧 `AgentRun`，因为旧 serialized run 内含压缩前 history。
 
@@ -363,7 +366,7 @@ SessionRuntime.admit_prompt_intent(intent, PromptDelivery)
 post-run arbitration 顺序固定为：
 
 ```text
-terminal run facts + persistence save point
+terminal handling（required stable commit if any）+ terminal run facts
   → required overflow recovery / immediate retry chain
   → pending manual compact
   → threshold auto compaction（若 manual compact 已执行则跳过重复压缩）
@@ -407,16 +410,18 @@ resolved command
 
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
 2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`。
-3. 将 resolved current input 写入 session，形成 user-message `persistence_save_point`；构建不含重复 current input 的 durable history baseline。
+3. 将 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后发布 `message_user_appended`，再构建不含重复 current input 的 durable history baseline。
 4. 构建 `TurnState { resources, prompt_turn, messages, model, tools, ... }`；后期可触发 `BeforeAgentStart` / `PromptBuilt`，应用结果后重新校验 profile。
 5. 将 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }` 后交给 `Driver.drive_run()`。
 6. 每次下一模型调用前进入 run safe point；`SessionRuntime` 消费 steer、应用合法 profile 变化、收集 typed context materials，并返回 `NextModelCallPlan`。
 7. `Driver` 应用 persistent messages/profile 后调用 `Prompt::project_model_call(...)`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
-8. 工具调用通过 `Tools` 子系统治理和执行，再由 Driver 回填 Rig；所有已进入历史的 tool call 最终必须有 tool result。
-9. run result 写入完成后 flush run-result save point，发出唯一终态 `run_finished { status }`；按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued continuation。只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
+8. 工具调用通过 `Tools` 子系统治理和执行；`Tools` 返回最终 normalized results 后，`SessionRuntime` 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`。随后把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，`SessionRuntime` 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`；随后 host 才把结果返回 Driver，Driver 回填 Rig 并允许下一模型调用。
+9. 正常最终 assistant message 组装为 `AssistantFinal` batch；commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 
-save point 的数量由可恢复写入批次决定，不按 run 固定。正常 text-only `Completed` run 至少包含 user-message 和 final run-result 两个 save point；前者必须早于 `run_started`，后者必须早于 `run_finished { status: completed }`。若一次 run 有多个 tool rounds，每个即将进入下一次模型调用上下文的完整 tool-call/result batch 都必须先通过 `SessionHandle` 提交并形成 save point。并行工具结果可以归约成一个 batch；流式 delta 和 queue state 不触发 session save point。
+稳定 batch 的数量由实际会话事实决定，不按 run 固定。正常 text-only `Completed` run 至少提交 `UserInput` 和 `AssistantFinal` 两个 batch。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result round 都必须先提交一个 `ToolRound` batch；并行结果按 `call_index` 归约后共享该 batch。streaming delta、tool output delta、queue state、partial assistant、pending approval 和执行中的 tool round 不进入 writer。
 
-外层 event sequence 定义 barrier 覆盖范围：某个 `persistence_save_point` 确认同一 session 在它之前已提交的相关 writes 可恢复。`SessionRuntime` 是 batch/flush 时机和事件发布的唯一 owner；`Driver`、`Tools`、`SessionHandle` 和 storage adapter 都不能自行发布该事件。abort/failure 的补偿写入与 unresolved tool protocol 修复继续由 BR-024 定义。
+`SessionRuntime` 是 batch 组装、commit 时机和 commit 后领域事件发布的唯一 owner。固定顺序是 `commit → 由对应 owner 应用 CommittedSessionBatch 到 runtime projection / required SessionIndex projection → 发布领域事件 → 调用可选 AfterSessionCommit observers`；observer 失败只进入 diagnostics，不能把已 committed 事实改判为失败或阻止领域事件。`Driver`、`Tools`、hook 和 UI adapter 都不能直接写 session。`commit()` 返回错误时，当前 run 进入 failed terminal path；不得继续下一模型调用，也不得把仅存在内存的 batch 当成 durable history。
 
-如果运行失败，`SessionRuntime` 应构造失败 assistant message或 diagnostic entry，写入会话并发出 `diagnostics_error` + `run_finished { status: failed }`，避免 UI 卡在运行态。
+abort、failure、session close 或 host shutdown 只保留已经成功 committed 的稳定单元。当前 partial assistant、waiting approval 或 incomplete tool round 被丢弃；如果已发布 `message_assistant_started`，仍要发布一次 `message_assistant_finished` 关闭 UI lifecycle，但该 partial 不进入 session。失败路径发出 `diagnostics_error` + `run_finished { status: failed }`，abort 路径发出 `run_finished { status: aborted }`；MVP 不生成 synthetic tool result，也不恢复中断中的 run。
+
+`SessionRuntime` 不把 run cancellation token 传给 `SessionWriter`。同一 session 的 actor/command ordering 决定竞态边界：若 abort/close/shutdown 在调用 `commit()` 前先被观察到，完整但尚未提交的 unit 仍可丢弃；若 `commit()` 已开始，则 writer 获胜并必须得到确定结果。此后 abort/close/graceful shutdown 先阻止后续模型或工具工作，再等待该 commit 得到确定结果：成功 batch 保留，失败 batch 不进入投影。若 final assistant 已成功 commit，则该 run 已跨过 completed terminal boundary，随后到达的 `AbortRun` 应观察为没有可 abort 的 active run；若完整 `ToolRound` 已 commit 但下一模型调用尚未开始，abort 可以保留该 round 并以 aborted 结束当前 run。

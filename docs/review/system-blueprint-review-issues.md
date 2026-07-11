@@ -104,7 +104,7 @@
 
 原风险：UI reducer、session phase、run resume、持久化屏障会混淆 paused 和 terminal finished。
 
-决策结果：paused/suspended 是可恢复 checkpoint 状态，不是终态。典型 checkpoint 包括 tool result 已产生但尚未回填给 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停、host shutdown checkpoint。普通 focus 切换不是暂停；MVP pending approval 可以作为 current run 的 waiting substate 表达，不必进入 suspended，除非需要挂起并等待显式 resume。
+决策结果：paused/suspended 是同一 host 生命周期内可恢复的 checkpoint 状态，不是终态。典型 checkpoint 包括 tool result 已产生但尚未回填给 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停。ADR 0019 明确 host shutdown 不恢复 running run。普通 focus 切换不是暂停；MVP pending approval 可以作为 current run 的 waiting substate 表达，不必进入 suspended，除非需要挂起并等待显式 resume。
 
 待处理方向：已处理。后续实现需验证：`run_suspended` 后 `RuntimeSnapshot.active_session.current_run.state` 为 `Suspended`；`run_resumed` 后回到 `Running` 或 `WaitingApproval`；最终仍必须且只能产生一个 `run_finished { status: Completed | Failed | Aborted }`。
 
@@ -176,7 +176,7 @@
 
 决策结果：hook owner 固定为“谁拥有安全点业务不变量，谁调用 hook、应用 typed result、重新校验并记录 diagnostics”。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/persistence 安全点；`Tools` 拥有工具治理安全点；`ModelGateway` 拥有 model/provider 边界安全点；`CommandManager` / session `Command` 拥有 command catalog/resolve/output 安全点。`Driver` 不调用 hook，`RuntimeHookRegistry` 只保存 handler 和策略，不拥有业务流程。
 
-实现顺序也已收敛：当前 MVP 不实现 hook system，不新增 `RuntimeHookRegistry` / hook invocation 阶段；只在文档中固定 owner 分层和禁止边界。后期第一批 hook 仅接入已稳定 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSavePoint`、`CommandOutputBuild`。`BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 和 `ProviderUsageNormalized` 即使后期开放，也由 `ModelGateway.call_model(...)` 拥有；raw provider payload patch 默认不开放。
+实现顺序也已收敛：当前 MVP 不实现 hook system，不新增 `RuntimeHookRegistry` / hook invocation 阶段；只在文档中固定 owner 分层和禁止边界。后期第一批 hook 仅接入已稳定 owner 流程，例如 `BeforeAgentStart`、`PromptBuilt`、`ContextProjection`、`ToolBeforePolicy`、`ToolAfterExecute`、`SessionBeforeCompact`、`AfterSessionCommit`、`CommandOutputBuild`。`BeforeModelCall`、`BeforeProviderPayload`、`AfterProviderResponse` 和 `ProviderUsageNormalized` 即使后期开放，也由 `ModelGateway.call_model(...)` 拥有；raw provider payload patch 默认不开放。
 
 ### BR-011：`UsagePurpose` 与 `ModelCallPurpose` 同值异名
 
@@ -235,7 +235,7 @@
 
 决策结果：手动 `/compact` / `AgentCommand::Compact` 使用 `CommandRunPolicy::QueueAfterRun`，绝不隐式 abort。session idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，`SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 继续运行。pending action 通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露，不进入模型上下文或 follow-up/next-turn message queue。早期名称 `CommandPhasePolicy::DeferUntilPostRun` 已由 ADR 0016 收窄并替换。
 
-执行顺序固定为：当前 work terminal facts + save point → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ follow-up / next-turn → `session_settled`。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
+执行顺序固定为：当前 work terminal handling（required stable commit if any）+ terminal facts → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ follow-up / next-turn → `session_settled`。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
 
 ### BR-015：ResourceManager 原子快照与技能正文晚读文件不一致
 
@@ -309,13 +309,13 @@ snapshot 规则与 BR-015 对齐：active Steer 使用 active template/skill rev
 
 处理记录：旧集中式开发路线图已删除，assistant lifecycle 不再由阶段表重复描述。权威事件文档固定 `message_assistant_started -> message_assistant_text_delta* -> message_assistant_finished` 生命周期：started/finished 各恰好一次，三者 `message_id` 一致，delta 只能出现在 started/finished 之间，最终 RuntimeSnapshot assistant message 等于 delta 拼接结果。user/run-result 持久化边界由 BR-021 单独处理。
 
-### BR-021：persistence_save_point 数量与语义在文档中表达不完全一致
+### BR-021：持久化提交边界的数量与语义在文档中表达不完全一致
 
 状态：Resolved
 
-处理记录：save point 已定义为“可独立恢复的 session write batch”完成后的 durable barrier，数量不与 run 一一对应。正常 text-only `Completed` run 至少有两个：user-message save point 必须早于 `run_started`，final run-result save point 必须早于 `run_finished { status: completed }`。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result batch 必须先提交并形成 save point；并行结果可以按 `call_index` 归约后共享一个 batch。
+处理记录：ADR 0019 保留“可独立恢复的 stable session write batch”作为内部提交边界，但删除公共 `persistence_save_point`。正常 text-only `Completed` run 至少提交 `UserInput` 与 `AssistantFinal` 两个 batches；前者早于 `run_started`，后者早于 `run_finished { status: completed }`。每个将被下一模型调用消费的完整 assistant tool-call/result round 作为一个 `ToolRound` 提交；并行结果按 `call_index` 归约后共享该 batch。
 
-外层 event sequence 是覆盖水位：save point 确认同一 session 在该 sequence 前已由 `SessionRuntime` 提交的相关 writes 可恢复。流式 delta、tool output delta 和 queue state 不属于 session writes。`SessionRuntime` 是唯一 save-point event owner；abort/failure partial output、synthetic tool result 和 orphan protocol repair 继续由 BR-024 单独处理。
+所有写入统一经过 `SessionWriter.commit(...)`。成功返回后才发布对应领域事件，失败 batch 不进入恢复投影。流式 delta、tool output delta、queue state 和其他 running 中间态不属于 session writes；abort/failure/crash 语义由 BR-024 的 stable-unit policy 关闭。
 
 ### BR-022：旧 pi 概念引用较多，可能影响术语纯度
 
