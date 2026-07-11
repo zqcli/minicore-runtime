@@ -104,7 +104,7 @@ pub use subsystem::Tools;
 pub use definition::{ToolDefinition, ToolExecutionMode, ToolName, ToolRisk, ToolSchema};
 pub use registry::{RegisteredTool, ToolRegistry};
 pub use active::ActiveToolSet;
-pub use prompt::ToolPromptCatalog;
+pub use prompt::{ToolPromptCatalog, ToolPromptView, ToolProfileFingerprint};
 pub use policy::{ToolPolicy, ToolPolicyConfig, ToolPolicyDecision, ToolPolicyInput};
 pub use approval::{ApprovalDecisionOutcome, PendingToolApproval, ToolApprovalBroker};
 pub use grants::{ApprovalGrantScope, ToolApprovalGrantStore, ToolApprovalMode};
@@ -117,11 +117,11 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 | --- | --- | --- |
 | `tools.rs` | 顶层 public module 和常用类型 re-export | 具体执行逻辑 |
 | `tools/mod.rs` | 子模块声明和内部 re-export | 业务逻辑 |
-| `tools/subsystem.rs` | 定义 `Tools` 主结构；提供 `invoke_batch`、`set_active_tools`、`pending_approval_views`、`decide_approval`、`prompt_catalog` 等深接口 | 不直接发布 UI event，不写 session storage |
+| `tools/subsystem.rs` | 定义 `Tools` 主结构；提供 `invoke_batch`、`set_active_tools`、`prompt_view`、`pending_approval_views`、`decide_approval` 等深接口 | 不直接发布 UI event，不写 session storage |
 | `tools/definition.rs` | 定义 `ToolDefinition`、`ToolName`、`ToolSchema`、`ToolRisk`、`ToolExecutionMode`、`ToolSource`、prompt metadata | 不保存当前注册表 |
 | `tools/registry.rs` | 管理 `ToolRegistry`、`RegisteredTool`、工具冲突、source info、executor 绑定 | 不判断是否 active，不做审批 |
 | `tools/active.rs` | 管理 `ActiveToolSet`，决定当前 session 哪些工具暴露给模型 | 不注册工具，不执行工具 |
-| `tools/prompt.rs` | 从 active tools 生成 provider tool schemas、prompt snippets、prompt guidelines | 不构建完整 system prompt |
+| `tools/prompt.rs` | 从同一 active-set revision 原子投影 `ToolPromptView`：names、schemas、snippets、guidelines、fingerprint | 不构建完整 system prompt，不执行工具 |
 | `tools/policy.rs` | 纯策略判断：allow、deny、require approval、rewrite args、force sequential、abort | 不等待 UI，不执行工具，不做 I/O preview |
 | `tools/approval.rs` | 管 `ToolApprovalBroker`、`PendingToolApproval`、`ApprovalRequestId`、pending approval lifecycle、duplicate/stale decision handling | 不保存长期授权，不执行工具 |
 | `tools/grants.rs` | 管 `ToolApprovalGrantStore`，支持 approve once、same call fingerprint、same tool in run/session/workspace、ttl/revoke | 不管理当前 pending approval |
@@ -167,7 +167,7 @@ impl Tools {
     ) -> ToolBatchResult;
 
     pub fn set_active_tools(&mut self, names: &[ToolName]) -> ToolSetChange;
-    pub fn active_tool_schemas(&self) -> Vec<ToolSchema>;
+    pub fn prompt_view(&self) -> ToolPromptView;
     pub fn prompt_catalog(&self) -> &ToolPromptCatalog;
     pub fn pending_approval_views(&self) -> Vec<agent_runtime_protocol::PendingToolApprovalView>;
     pub fn decide_approval(&mut self, command: ToolApprovalDecisionCommand) -> ApprovalDecisionOutcome;
@@ -177,6 +177,20 @@ impl Tools {
 ```
 
 `SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令，并调用 `Tools` 的对应接口。
+
+`ToolPromptView` 必须一次性投影同一个 active-set revision：
+
+```rust
+pub struct ToolPromptView {
+    pub active_names: Arc<[ToolName]>,
+    pub schemas: Arc<[ToolSchema]>,
+    pub snippets: Arc<[(ToolName, String)]>,
+    pub guidelines: Arc<[String]>,
+    pub fingerprint: ToolProfileFingerprint,
+}
+```
+
+`prompt::begin_turn()` 只消费该 view，不能分别调用 `active_tool_schemas()`、`active_names()` 和 `prompt_catalog()` 后临时合并，否则并发或 safe-point 更新可能产生 system prompt/tool schema split-brain。
 
 ## 数据结构草案
 
@@ -331,7 +345,7 @@ pub struct ApprovalGrantKey {
 
 主流模型 API 通常只控制“模型能否一次吐多个 tool calls”，例如 OpenAI / Mistral 的 `parallel_tool_calls`、Anthropic 的 `disable_parallel_tool_use`。LLM tool call 对象通常只表达 call id、tool name、arguments 和 source order；它不可靠地表达本地执行策略。
 
-外部实现参考：
+外部实现可以提供并发与顺序治理的设计参考，但不构成兼容承诺。例如：
 
 - pi `pi-agent-core` 默认 `toolExecution = "parallel"`。
 - pi 在 `config.toolExecution === "sequential"` 或 batch 中任一 tool definition `executionMode === "sequential"` 时整批串行。
@@ -342,7 +356,7 @@ pub struct ApprovalGrantKey {
 
 因此 MiniCore 把 provider request capability、LLM source order 和本地 execution policy 分开处理：ModelGateway 负责告诉 provider 是否允许模型一次返回多个 calls；`Tools` 负责本地批量工具调用的治理和执行。
 
-MiniCore 的本地执行语义对齐 pi：
+MiniCore 的本地执行语义由以下规则独立定义：
 
 ```text
 默认 Parallel。
@@ -453,16 +467,16 @@ Rig AgentRunStep::CallTools { calls }
 
 ## LLM 如何知道工具
 
-保留 pi 的双通道：
+模型通过两个原子一致的通道获知工具：
 
 1. Provider tool schema：active tools 的 `name`、`description`、`input_schema` 进入模型请求。
 2. System prompt：active tools 的 `prompt_snippet` 和 `prompt_guidelines` 进入 `Available tools` 与 `Guidelines`。
 
-`Prompt` 消费的是 `Tools.prompt_catalog()` 和 active tool names，不消费 `Tools::invoke_batch` 或 executor state。`ResourceManager` 不拥有工具 snippets/guidelines；工具提示素材来自 session-owned `Tools`。
+`Prompt` 消费的是单次 `Tools.prompt_view()`，不消费 `Tools::invoke_batch`、approval/policy、sandbox 或 executor state。`ResourceManager` 不拥有工具 schemas/snippets/guidelines；工具提示素材来自 session-owned `Tools`。`PromptCallProfile` 把该 view 产生的 system sections 与 provider schemas 原子绑定。
 
 ## 内置工具命名
 
-内置工具应对齐 pi 的稳定名称：
+MiniCore 的 canonical 内置工具名固定为：
 
 - 只读：`read`、`grep`、`find`、`ls`。
 - 文件变更：`write`、`edit`。

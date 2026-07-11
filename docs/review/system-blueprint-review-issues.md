@@ -4,7 +4,7 @@
 
 来源：本轮由多个 subagent 对 MiniCore 系统蓝图进行只读审阅后合并整理。
 
-范围：`README.md`、`CONTEXT.md`、`docs/architecture.md`、`docs/implementation-roadmap.md`、`docs/modules/*.md`、`docs/adr/*.md`。
+审阅时范围：`README.md`、`CONTEXT.md`、`docs/architecture.md`、当时存在但后续已删除的 `docs/implementation-roadmap.md`、`docs/modules/*.md`、`docs/adr/*.md`。路线图相关证据保留为历史审阅记录，不再是现行行为权威。
 
 约定：本文只记录待处理问题，不代表已经决定修改方案。后续逐条处理时，应回到对应 source of truth 文档中做设计取舍。
 
@@ -140,7 +140,7 @@
 - `docs/modules/session-runtime.md`：`TurnState` 包含 `resources: Arc<TurnResourceSnapshot>`。
 - `docs/modules/driver.md`：Driver 不负责资源加载、skill/template 展开、system prompt 构建、active tools 管理。
 
-决策结果：`TurnState` 保留为 `SessionRuntime` 内部 run snapshot，不再作为 `DriveRequest` 输入。`SessionRuntime` 在 run 启动时从 `TurnState` 投影 `DriverTurnInput`，只携带 `model`、`system_prompt`、`active_tool_schemas`、`thinking_level` 和 `stream_options`；`TurnResourceSnapshot`、resource revision、context usage、queue/storage 和工具治理状态都不进入 `DriverTurnInput`。turn resources 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。
+决策结果：`TurnState` 保留为 `SessionRuntime` 内部 run snapshot，不再作为 `DriveRequest` 输入。Prompt 设计进一步收敛后，`DriverTurnInput` 只携带 `model`、原子 `PromptCallProfile`、`thinking_level` 和 `stream_options`；system prompt 与 active tool schemas 不再作为可独立 patch 的字段。`TurnResourceSnapshot`、`PromptTurn`、resource revision、context usage、queue/storage 和工具治理状态都不进入 `DriverTurnInput`。turn resources 留在 per-run `SessionDriverHost` 中，用于工具上下文、active PromptTurn rebuild 和 future `StepResourceSnapshot` parent。
 
 后续实现需验证：`DriveRequest` 不能引用 `TurnState` 或 `TurnResourceSnapshot`；`Driver` 单测只需构造 `DriverTurnInput` 和 fake `DriverHost`；工具执行需要资源/cwd 时必须经 `SessionDriverHost -> Tools::invoke_batch(...)`。
 
@@ -233,7 +233,7 @@
 - `docs/modules/compaction.md`：手动压缩流程包含 `abort current run and wait for idle`。
 - `docs/modules/session-runtime.md`：手动 compact 流程在非 idle 时先 abort 当前 run。
 
-决策结果：手动 `/compact` / `AgentCommand::Compact` 使用 `CommandPhasePolicy::DeferUntilPostRun`，绝不隐式 abort。session idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，`SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 继续运行。pending action 通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露，不进入模型上下文或 follow-up/next-turn message queue。
+决策结果：手动 `/compact` / `AgentCommand::Compact` 使用 `CommandRunPolicy::QueueAfterRun`，绝不隐式 abort。session idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，`SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 继续运行。pending action 通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露，不进入模型上下文或 follow-up/next-turn message queue。早期名称 `CommandPhasePolicy::DeferUntilPostRun` 已由 ADR 0016 收窄并替换。
 
 执行顺序固定为：当前 work terminal facts + save point → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ follow-up / next-turn → `session_settled`。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
 
@@ -251,28 +251,25 @@
 
 风险：reload 后到调用前文件可被修改或替换；历史记录中的 resource revision 不能完全证明注入正文内容。
 
-处理记录：已在 `docs/modules/resource-manager.md` 和 `docs/modules/skills.md` 中规定：进入 `CwdResourceSnapshot.resolved` 的 selected skill 应保存 stable body content，或保存 content hash + immutable loaded content reference；`SessionRuntime` 显式调用技能时从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 `SkillResource.body`，不能绕过 snapshot 重新读文件。
+处理记录：已在 `docs/modules/resource-manager.md` 和 `docs/modules/skills.md` 中规定：进入 `CwdResourceSnapshot.resolved` 的 selected skill 应保存 stable body content，或保存 content hash + immutable loaded content reference；目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 读取 `SkillResource.body`，不能绕过 snapshot 重新读文件。
 
-补充处理：已明确 `skills.rs` 和 `ResourceManager` 的边界。`skills.rs` 负责 `SkillMetadata` / `SkillResource` / `SkillCatalog` 类型、给定目录后的发现、frontmatter 解析、校验和格式化 helper；`ResourceManager` 负责 skill roots、trust gate、runtime/cwd 分层、cwd-over-runtime overlay、reload/ensure/recompose 生命周期和 current snapshot 发布。
+补充处理：已明确 `skills.rs`、`ResourceManager` 和 Prompt 的边界。`skills.rs` 负责类型、发现、frontmatter、校验和格式 helper；`ResourceManager` 负责 roots、trust、overlay、snapshot 和 canonical resource identity；目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 查询正文并组装普通 user message。
+
+`PromptDelivery` 规则也已固定：active `Steer` 必须使用 `CurrentRun.prompt_turn` 的 active snapshot；idle、`FollowUp` 和 `NextTurn` 在目标 future turn capture 后展开。active snapshot 缺少 skill 时返回 `SkillUnavailableInTurnSnapshot`，不能读取 current 新 revision、重新读 `metadata.file_path` 或静默降级成 FollowUp。
 
 ## 低风险 / 术语与一致性
 
 ### BR-016：Prompt template 没有独立 source of truth
 
-状态：Open
+状态：Resolved
 
 问题：实现规划已有 `src/prompt_templates.rs`，但没有对应模块文档。Prompt template 的职责散落在 ResourceManager、CommandSurface、SessionRuntime 中。
 
-证据：
+处理记录：新增 `docs/modules/prompt-templates.md` 作为类型、frontmatter、参数语法和纯展开 helper 的 source of truth。`prompt_templates.rs` 是与 `skills.rs` 平级的纯模块，不是 service；`ResourceManager` 拥有 roots、trust、overlay、snapshot、immutable body 和 diagnostics；`CommandManager` 只消费 metadata；目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 展开正文与 required skills。
 
-- `docs/modules/README.md`：文件规划包含 `src/prompt_templates.rs`。
-- `docs/modules/resource-manager.md`：描述 prompt template metadata 和资源投影。
-- `docs/modules/command-surface.md`：描述 `/{template}` 命令投影。
-- `docs/modules/session-runtime.md`：描述 `InvokePromptTemplate` 展开为 user message。
+参数语法采用 pi-compatible 单次替换：`$N`、`$@` / `$ARGUMENTS`、`${N:-default}`、`${@:N}`、`${@:N:L}`，参数支持单双引号分组且不递归替换。禁止 shell/env/file interpolation、template include、展开后重解析 slash command。canonical command 为 `/template <name>`；`/{name}` 仅在无命令冲突时 materialize。
 
-风险：catalog 生命周期、参数替换、详情查询、正文读取归属可能漂移。
-
-待处理方向：考虑新增 `docs/modules/prompt-templates.md`，或明确它只是 ResourceManager 子能力而非独立模块。
+snapshot 规则与 BR-015 对齐：active Steer 使用 active template/skill revision；FollowUp/NextTurn 使用 future revision；队列只保存 `template_key + args + additional_instructions`，不保存 raw slash text 或提前展开正文。
 
 ### BR-017：`TurnState` 是核心类型但 CONTEXT.md 没有术语定义
 
@@ -292,18 +289,9 @@
 
 ### BR-018：`ModelCallRequest` 的 CONTEXT.md 描述遗漏 thinking level
 
-状态：Open
+状态：Resolved
 
-问题：CONTEXT.md 对 `ModelCallRequest` 的描述包含模型选择、消息、system prompt、tools、purpose、stream options，但实际 ModelGateway 定义还有 `thinking_level`。
-
-证据：
-
-- `CONTEXT.md`：`ModelCallRequest` 术语描述。
-- `docs/modules/model-gateway.md`：`ModelCallRequest` 定义包含 `thinking_level: ThinkingLevel`。
-
-风险：术语表与协议/模块文档不完全一致。
-
-待处理方向：补充 thinking level，或明确 thinking level 属于 model options。
+处理记录：`CONTEXT.md` 的 `ModelCallRequest` 词条已补充 thinking level，并明确 Agent run 请求必须先来自已校验的 `ModelInputProjection`。`docs/modules/model-gateway.md` 同时加入可选 `OutputContract`，用于 JSON schema、response format 等 provider-neutral 调用契约；provider-specific mapping 仍由 `ModelGateway` 负责。
 
 ### BR-019：CommandSurface catalog revision 在模块文档中不够显式
 
@@ -317,46 +305,24 @@
 
 ### BR-020：首个 fake-driver 纵切事件验收写法不一致
 
-状态：Open
+状态：Resolved
 
-问题：阶段 3 表格只写 `assistant delta`，后文首个开发切片要求 `message_assistant_started`、`message_assistant_text_delta*`、`message_assistant_finished`。
-
-证据：
-
-- `docs/implementation-roadmap.md`：阶段 3 可验证产物写 `assistant delta`。
-- `docs/implementation-roadmap.md`：首个开发切片列出 started/delta/finished 完整序列。
-
-风险：执行路线图时，早期测试可能漏掉 assistant lifecycle 配对。
-
-待处理方向：统一阶段 3 验收文本，明确必须覆盖 assistant started/delta/finished。
+处理记录：旧集中式开发路线图已删除，assistant lifecycle 不再由阶段表重复描述。权威事件文档固定 `message_assistant_started -> message_assistant_text_delta* -> message_assistant_finished` 生命周期：started/finished 各恰好一次，三者 `message_id` 一致，delta 只能出现在 started/finished 之间，最终 RuntimeSnapshot assistant message 等于 delta 拼接结果。user/run-result 持久化边界由 BR-021 单独处理。
 
 ### BR-021：persistence_save_point 数量与语义在文档中表达不完全一致
 
-状态：Open
+状态：Resolved
 
-问题：AgentRuntimeEvents 的 Submit Prompt lifecycle 中 user message durable 和 assistant/tool results durable 各有一个 save point；SessionRuntime 文档只概括为“每个 run 的可恢复边界 flush pendingSessionWrites，发出 persistence_save_point”。
+处理记录：save point 已定义为“可独立恢复的 session write batch”完成后的 durable barrier，数量不与 run 一一对应。正常 text-only `Completed` run 至少有两个：user-message save point 必须早于 `run_started`，final run-result save point 必须早于 `run_finished { status: completed }`。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result batch 必须先提交并形成 save point；并行结果可以按 `call_index` 归约后共享一个 batch。
 
-证据：
-
-- `docs/modules/agent-runtime-events.md`：Submit Prompt lifecycle 明确两个 `persistence_save_point`。
-- `docs/modules/session-runtime.md`：运行流程只笼统描述每个 run 的可恢复边界。
-
-风险：实现者可能以为每个 run 只有一个 save point，导致 user message append 的恢复边界不清晰。
-
-待处理方向：在 SessionRuntime 文档中明确 user message save point 与 run result save point 的关系。
+外层 event sequence 是覆盖水位：save point 确认同一 session 在该 sequence 前已由 `SessionRuntime` 提交的相关 writes 可恢复。流式 delta、tool output delta 和 queue state 不属于 session writes。`SessionRuntime` 是唯一 save-point event owner；abort/failure partial output、synthetic tool result 和 orphan protocol repair 继续由 BR-024 单独处理。
 
 ### BR-022：旧 pi 概念引用较多，可能影响术语纯度
 
-状态：Open
+状态：Resolved
 
-问题：`ExtensionRunner`、`AgentHarness` 等 pi 历史概念在多个文档中出现。部分是合理映射，但重复引用可能让读者误以为 MiniCore 也有对应模块。
+处理记录：完成纯文档语言治理，没有改变任何 owner、interface、状态机、协议或兼容行为。`CONTEXT.md`、架构入口和模块正文现在使用 MiniCore 自身的 `AgentRuntime`、`SessionManager`、`SessionRuntime`、`Driver`、`ResourceManager`、`Prompt`、`Tools` 等术语解释当前系统；删除了 `AgentSessionRuntime`、`AgentSession.*`、`DefaultResourceLoader`、`ExtensionRunner`、`runAgentLoop`、`steerQueue` / `followUpQueue` 等历史实现名在现行流程中的映射和调用链。
 
-证据：
+pi、Codex、LangChain 等仍可出现在明确标注的设计参考段落和 ADR 中，但只用于说明可借鉴的设计思路，不构成类型、API、文件格式、事件顺序或行为兼容承诺。真实兼容要求必须由 MiniCore 文档显式声明；本轮把 `pi-compatible` / “对齐 pi”一类模糊措辞改为 MiniCore 独立定义的语法、工具名和执行规则。Rig `AgentRun` / `AgentRunStep` 是当前真实依赖类型，不属于历史术语清理范围。
 
-- `docs/architecture.md`：pi 经验映射包含 `ExtensionRunner`、`AgentHarness`。
-- `docs/modules/runtime-hooks.md`：引用 pi coding-agent `ExtensionRunner` 经验。
-- `CONTEXT.md`：明确避免把 MiniCore runtime 称为 `AgentHarness`。
-
-风险：低。主要是阅读噪音和命名漂移风险。
-
-待处理方向：保留 ADR/经验映射中的必要引用，减少模块文档中的历史名词。
+后续文档验收规则：非 ADR/review 文档中的外部项目引用必须位于参考语境，当前运行流程和领域定义不得依赖读者先理解外部项目内部类型。

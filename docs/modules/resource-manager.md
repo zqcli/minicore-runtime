@@ -2,26 +2,11 @@
 
 `ResourceManager` 是 MiniCore 的内部资源子系统。它负责加载、组合、缓存和发布模型可见资源的不可变 snapshot；它不是 UI 协议层，不执行 Agent turn，不执行工具，也不构造最终 system prompt。
 
-当前设计参考 Codex 的 `TurnContext` / `StepContext` 分层：资源不是在每次使用时实时读文件，也不是回调修改旧 snapshot，而是在明确的加载 / reload 点生成新的 snapshot revision。运行中的 turn 只使用启动时捕获的 snapshot；reload 只影响后续 turn。
+资源不是在每次使用时实时读文件，也不是回调修改旧 snapshot，而是在明确的加载 / reload 点生成新的 snapshot revision。运行中的 turn 只使用启动时捕获的 snapshot；reload 只影响后续 turn。Codex 的 turn/step context 和 pi coding-agent 的资源加载路径是设计参考对象，但不构成兼容承诺。
 
 ## 设计定位
 
-pi coding-agent 的生产路径是：
-
-```text
-DefaultResourceLoader
-  拥有: 资源生命周期、来源解析、诊断、当前已加载资源
-
-AgentSession._rebuildSystemPrompt()
-  读取: resourceLoader.getPrompt(), getAppendPrompt(), getSkills(), getAgentsFiles()
-  追加: 活跃工具、工具提示片段、工具指导规则
-  调用: buildSystemPrompt(...)
-
-system-prompt.ts
-  构建: 最终 system prompt 字符串
-```
-
-Codex 的生产路径更强调请求边界：session 初始化和 turn 创建时捕获 config / skills / instructions 等稳定输入，采样请求前再捕获 step 级动态状态。MiniCore 采用这两个方向的交集：`ResourceManager` 统一负责资源生命周期，`SessionRuntime` 在 turn 启动时捕获资源 snapshot，MVP 预留 step snapshot 类型但不启用 step 级资源刷新。
+`ResourceManager` 统一负责资源生命周期、来源解析、trust、overlay、diagnostics 和 immutable snapshot 发布；`SessionRuntime` 在 turn 启动时捕获资源，Prompt 只消费 captured `PromptResourceView`。MVP 预留 step snapshot 类型，但不启用 step 级资源刷新。
 
 ```text
 AgentRuntime
@@ -36,11 +21,15 @@ AgentRuntime
 SessionRuntime
   ├─ 固定 { workspace_id, cwd }
   ├─ user turn 启动时捕获 TurnResourceSnapshot
-  ├─ 基于已捕获 snapshot 展开 InvokeSkill / InvokePromptTemplate
-  └─ 使用已捕获资源 + 活跃工具调用 prompt.rs
+  ├─ 从 captured snapshot 创建 PromptResourceView
+  └─ 汇合 tool/model/agent/environment/policy views 调用 prompt::begin_turn(...)
+
+Prompt
+  ├─ PromptTurn.resolve_intent(...) 展开 skill / prompt template
+  └─ project_model_call(...) 生成最终 ModelInputProjection
 ```
 
-`ResourceManager` 是“资源如何加载、分层、覆盖和发布”的单一事实来源；`SessionRuntime` 是“什么时候使用资源”的编排者；`prompt.rs` 是最终 system prompt 的纯构建器。
+`ResourceManager` 是“资源如何加载、分层、覆盖、标识和发布”的单一事实来源；`SessionRuntime` 是“什么时候捕获并组装”的 Pull Master；`Prompt` 负责解释 captured resources、展开结构化 intent 和生成最终模型输入。三者不能反向调用。
 
 ## 资源 Snapshot 分层
 
@@ -105,9 +94,28 @@ pub struct TurnResourceSnapshot {
 
 MVP 如果没有 turn-local resource filtering，`TurnResourceView` 可以为空或等同于 `cwd.resolved`；仍建议保留 wrapper，方便后续承载 session-local skill/tool visibility、turn diagnostics、rendered prompt inputs 和 step parent pointer。
 
+### 提示词资源视图（PromptResourceView）
+
+`PromptResourceView` 是从 captured `TurnResourceSnapshot` 产生的只读窄投影，不是新的 snapshot 层或 catalog owner：
+
+```rust
+pub struct PromptResourceView {
+    snapshot: Arc<TurnResourceSnapshot>,
+}
+
+impl PromptResourceView {
+    pub fn materials(&self) -> PromptMaterials<'_>;
+    pub fn skill(&self, key: &ResourceKey) -> Option<&SkillResource>;
+    pub fn template(&self, key: &ResourceKey) -> Option<&PromptTemplateResource>;
+    pub fn revision(&self) -> ResourceRevision;
+}
+```
+
+它必须复用本模块权威的 `ResourceKey`、`ResourceSourceInfo`、`ContentHash` 和 `ResourceRevision`，不能在 Prompt 侧再定义 `PromptResourceKey` / `PromptResourceRegistry`。`PromptResourceView` 只 pin 住 captured snapshot；它没有 current pointer、reload、ensure、recompose 或 overlay 能力。
+
 ### 步骤资源快照（StepResourceSnapshot）
 
-`StepResourceSnapshot` 预留给未来 Codex-like 每次模型采样前捕获动态资源：MCP runtime snapshot、environment/capability roots、dynamic tool inventory 或 world-state patch。
+`StepResourceSnapshot` 预留给未来每次模型采样前捕获动态资源：MCP runtime snapshot、environment/capability roots、dynamic tool inventory 或 world-state patch。
 
 MVP 中定义类型但不执行、不使用：
 
@@ -147,7 +155,8 @@ manual ReloadResources
 user turn start
   → capture_turn(session_id, turn_id, workspace_id, cwd)
   → TurnState.resources = Arc<TurnResourceSnapshot>
-  → SessionRuntime projects DriverTurnInput for Driver
+  → TurnState.prompt_turn = prompt::begin_turn(PromptResourceView + typed session views)
+  → SessionRuntime projects DriverTurnInput { model, prompt profile, options }
 
 Rig AgentRun steps in the same turn
   → Driver uses DriverTurnInput only
@@ -159,7 +168,7 @@ Rig AgentRun steps in the same turn
 
 `capture_turn(...)` 不负责发现文件变化，也不负责把磁盘上的新内容自动变成模型可见资源。MVP 中，模型可见资源只有在显式 `ReloadResources`、`reload_runtime()` 或首次 `ensure_*_snapshot()` 成功后，才会发布新的 current snapshot。下一次 user turn 会捕获当时的 current snapshot：如果此前没有 reload，捕获到的仍是同一个 revision；如果 reload 已成功发布新 snapshot，捕获到的就是新 revision。
 
-因此 `reload` 是资源更新的写入边界，`capture_turn` 是资源使用的读取边界。保留 `capture_turn` 的必要性不在于自动刷新，而在于冻结一次 turn 的输入：同一个 running turn 内的 system prompt、skill 展开、prompt template 展开和 resource diagnostics 必须来自同一版 snapshot，不能因为 turn 运行中发生 reload 或 focus 切换而混用新旧资源。
+因此 `reload` 是资源更新的写入边界，`capture_turn` 是资源使用的读取边界。保留 `capture_turn` 的必要性不在于自动刷新，而在于冻结一次 turn 的输入：同一个 running turn 内的 system prompt、skill 展开、prompt template 展开和 resource diagnostics 必须经同一个 `PromptResourceView` 来自同一版 snapshot，不能因为 turn 运行中发生 reload 或 focus 切换而混用新旧资源。
 
 不是所有层都在 turn 开始时才创建或冻结。`RuntimeResourceSnapshot` 和 `CwdResourceSnapshot` 可以在 workspace startup、session open、首次使用某 cwd 或显式 reload 时创建并发布；它们一经发布就是不可变对象。turn 开始时冻结的是 `TurnResourceSnapshot`：它读取当时 current `CwdResourceSnapshot`，而该 cwd snapshot 已经 pin 住它构建时使用的 runtime snapshot。也就是说，turn capture 冻结“本 turn 使用哪条 snapshot 链”，但不负责重新创建所有上层 snapshot。
 
@@ -246,7 +255,7 @@ CwdResourceSnapshot C7.resolved:
 
 ```text
 AgentRuntimeProtocol
-  拥有: UI command/event/snapshot schema、routing ids、summary/detail query surface
+  拥有: UI command/query/event/snapshot schema、routing ids、query routing 与 response envelope
   不负责: 文件发现、skill 解析、project trust 判定、resource content 缓存
 
 ResourceManager
@@ -333,8 +342,9 @@ UI / CommandSurface
   → 返回 Arc<CwdResourceSnapshot C2>
   → 构建 TurnResourceSnapshot T2 { cwd: Arc<C2> }
   → TurnState.resources = Arc<T2>
-  → prompt::build_system_prompt(T2.cwd.resolved.prompt_materials(), ...)
-  → project DriverTurnInput
+  → prompt::begin_turn(T2.prompt_view() + typed session views)
+  → TurnState.prompt_turn = Arc<PromptTurn>
+  → project DriverTurnInput { prompt: PromptCallProfile, ... }
   → Driver::drive_run(DriveRequest { turn: DriverTurnInput, ... })
 ```
 
@@ -576,7 +586,7 @@ context file content 进入 snapshot；reload 只影响后续 turn，不改写�
 
 ## 提示词素材
 
-`ResourceManager` 只提供 prompt materials；最终拼装属于 [Prompt](prompt.md)。
+`ResourceManager` 只提供 prompt materials 和 selected resource catalog；最终 system prompt、结构化 intent 展开和 model-input projection 属于 [Prompt](prompt.md)。
 
 ```rust
 pub struct PromptMaterials<'a> {
@@ -587,15 +597,15 @@ pub struct PromptMaterials<'a> {
 }
 ```
 
-`PromptMaterials` 是 `CwdResourceSnapshot.resolved` 的只读投影，不是最终 system prompt 字符串。`ResourceManager` 负责保证这些素材来自同一版 captured snapshot；`Prompt` 负责把它们渲染到 system prompt；`SessionRuntime` 负责把资源素材与 active tools、tool snippets、cwd、日期等会话态合并成 `PromptRequest`。
+`PromptMaterials` 是 `CwdResourceSnapshot.resolved` 的只读投影，不是最终 system prompt 字符串。`ResourceManager` 负责保证这些素材和 selected skill/template body 来自同一版 captured snapshot；`SessionRuntime` 负责汇合 `PromptResourceView`、tools、model、agent、environment 和 policy views；`Prompt` 负责生成 immutable `PromptTurn`。
 
 调用方向必须保持单向：
 
 ```text
 SessionRuntime
   → ResourceManager.capture_turn(...)
-  → TurnResourceSnapshot.cwd.resolved.prompt_materials()
-  → prompt::build_system_prompt(PromptRequest { ... })
+  → TurnResourceSnapshot.prompt_view()
+  → prompt::begin_turn(TurnPromptInputs { resources, tools, model, ... })
 ```
 
 不允许：
@@ -605,12 +615,12 @@ Prompt
   → ResourceManager.current_cwd(...)
 
 ResourceManager
-  → prompt::build_system_prompt(...)
+  → prompt::begin_turn(...)
 ```
 
-这样可以保证 running turn 的 system prompt 只使用本 turn 已捕获的资源链，不会因为 reload 后的 current pointer 改变而混用新旧资源。
+这样可以保证 running turn 的 system prompt、显式 skill/template 展开和 contribution fingerprint 只使用本 turn 已捕获的资源链，不会因为 reload 后的 current pointer 改变而混用新旧资源。
 
-`PromptTemplates` 不默认进入每次 system prompt。它们是显式调用资源，只有 `InvokePromptTemplate` 时才展开为 user message。
+`PromptTemplates` 不默认进入每次 system prompt。它们是显式调用资源，只有目标 turn 的 `PromptTurn.resolve_intent(...)` 处理 `PromptTemplateInvocation` 时才展开为 user message；完整类型和语法见 [PromptTemplates](prompt-templates.md)。
 
 ## 技能
 
@@ -654,13 +664,19 @@ reload_cwd(workspace_id, cwd)
 - 构造 user message。
 - 执行 Agent turn。
 
-显式 `InvokeSkill` 的正文读取和 `<skill>` message 构造属于 `SessionRuntime`。为了保证旧 turn 可复现，snapshot 必须保存 selected skill body content，或保存 content hash + immutable loaded content reference；不能让旧 turn 在运行中重新读取已被 reload 覆盖的文件内容。
+显式 `InvokeSkill` 的 delivery 时机属于 `SessionRuntime`，正文查询和 `<skill>` message 组装属于目标 `PromptTurn.resolve_intent(...)`。为了保证旧 turn 可复现，snapshot 必须保存 selected skill body content，或保存 content hash + immutable loaded content reference；Prompt 不能让旧 turn 在运行中重新读取已被 reload 覆盖的文件内容。
 
 `ResourceManager` 提供技能 metadata 给 [CommandSurface](command-surface.md) 的 `resources.skills` dynamic provider，用于生成 `/skill <name>` 和兼容 `/skill:{name}` 的 command nodes；它不解析 raw user input，也不展开技能正文。
 
 ## 提示模板
 
-prompt templates 是可显式调用资源，不默认进入 system prompt。`ResourceManager` 负责加载、source info、name conflict diagnostics 和 cwd-over-runtime overlay。`SessionRuntime` 负责 `InvokePromptTemplate`：查询已捕获的 turn snapshot、替换参数、构造 user message、入队或运行。
+prompt templates 是可显式调用资源，不默认进入 system prompt。`ResourceManager` 负责加载、source info、name conflict diagnostics、cwd-over-runtime overlay 和 immutable body；[PromptTemplates](prompt-templates.md) 提供解析/展开 helper；`PromptTurn.resolve_intent(...)` 查询 captured catalog、解析 required skills、替换参数并构造 `ResolvedPromptInput`。`SessionRuntime` 只负责 admission、delivery 和 run 编排。
+
+## 静态资源与动态 Context
+
+项目文件、ancestor context files、skills、prompt templates、自定义/追加 system prompt 和 future package/MCP static resources 必须先进入本模块的 trust/overlay/snapshot pipeline。RAG、memory、IDE diagnostics、实时 issue 状态等调用期结果可以由其 owner 作为 `ContextMaterialContribution` 进入 Prompt，但不能把已由 ResourceManager 管理的静态文件再读一遍并重复注入。
+
+如果静态资源在 reload 时暂时不可用，ResourceManager 决定 reload 失败、diagnostic 或是否保持旧 current pointer；Prompt 只消费已经成功 captured 的 snapshot，不能自行回退到磁盘或另一个 revision。
 
 ## 扩展 / 包资源发现边界
 
@@ -687,10 +703,10 @@ resources_changed {
 
 `RuntimeSnapshot.resources` 表示当前 active/focused cwd 的 `CwdResourceSnapshot.resolved` 摘要；没有 active session 时可以为空摘要。完整 per-cwd catalog 属于 `ResourceManager` 内部状态，不默认放入 runtime snapshot。UI 需要详情时走受控 query：
 
-- `GetSkill { workspace_id, cwd, skill_name }`。
-- `GetPromptTemplate { workspace_id, cwd, template_name }`。
-- `GetContextFile { workspace_id, cwd, path }`，必须命中当前 snapshot 登记的 context file。
-- `GetEffectivePrompt { session_id }`，debug/privileged query。
+- `ResourceQuery::GetSkill { workspace_id, cwd, skill_name }`。
+- `ResourceQuery::GetPromptTemplate { workspace_id, cwd, template_name }`。
+- `ResourceQuery::GetContextFile { workspace_id, cwd, path }`，必须命中当前 snapshot 登记的 context file。
+- `ResourceQuery::GetEffectivePrompt { session_id }`，debug/privileged query。
 
 ## 最小可行范围（MVP）
 
@@ -716,7 +732,7 @@ MVP 实现：
 ## 外部项目对照
 
 - Codex 把 protocol crate 与 core runtime 分开，并在 turn/step 边界捕获稳定输入。MiniCore 的 `TurnResourceSnapshot` / `StepResourceSnapshot` 采用同样边界，但把更宽的 product resources 收敛在 `ResourceManager`。
-- pi 的 `DefaultResourceLoader` 不拼最终 system prompt，只提供 prompt construction 的资源输入。MiniCore 保留这个边界，但把单层 mutable loader 升级为多层不可变 snapshot 子系统。
+- 参考实现表明资源生命周期与最终 prompt 组装应分离。MiniCore 通过 `ResourceManager -> PromptResourceView -> PromptTurn` 固定该 seam，并使用多层不可变 snapshot 保证 turn 隔离。
 - Rig 的 `AgentBuilder` 接收 `preamble()`、`context()`、tools 和 dynamic context；`loaders` 只是文件读取工具。因此 MiniCore 需要在 Rig 之上保留产品级 `ResourceManager`。
 - MCP 把 prompts 和 resources 建模成 server-managed catalog，并支持 list/get/read。MiniCore 的 summary/detail 分离可以与此对齐，但 MVP 不做实时 listChanged。
 

@@ -34,26 +34,28 @@ SessionRuntime
 
 Hook 影响最终会发生什么；event 告诉下游最终发生了什么。下游 UI/CLI 不应直接消费 hook，也不应注册能绕过策略、沙箱、凭据或会话持久化的 hook。
 
-## Pi 经验
+## Hook 面
 
-pi 的扩展系统提供了很多可借鉴的 hook 面：
+以下 hook 面来自 MiniCore 当前 owner 分层和安全点需求：
 
 - `input`：用户输入到达后、进入 agent 前可 transform 或 handled。
 - `before_agent_start`：用户 prompt 展开后、agent loop 启动前可追加 custom message 或替换 system prompt。
 - `context`：每次模型调用前可替换 AgentMessage context。
 - `before_provider_request` / `after_provider_response`：模型请求前后 hook；raw provider payload patch 必须 privileged 且脱敏，MVP 可以不开放。
 - `tool_call` / `tool_result`：工具执行前阻止或改写结果。
-- `resources_discover`：pi 中用于扩展资源路径发现；MiniCore 当前设计不采用资源发现 hook，资源更新统一走 `ResourceManager` ensure/reload/recompose pipeline。
+- resource discovery 不作为 hook；资源更新统一走 `ResourceManager` ensure/reload/recompose pipeline。
 - `session_before_switch` / `session_before_fork` / `session_before_compact` / `session_before_tree`：会话级 gate 和 provider hook。
 - `message_end`、`agent_start/end`、`turn_start/end`、`tool_execution_start/update/end`：agent lifecycle observer / transform。
 
-MiniCore 吸收这些 hook 点，但边界更严格：
+这些 hook 点必须遵守统一边界：
 
 - 不允许 hook 直接发布 UI event。
 - 不允许 hook 直接 mutate session storage。
 - 不允许 hook 直接执行 tool 或读 credential。
 - 不允许工具参数原地改写后跳过校验；任何 args rewrite 必须重新 schema validate 和重新走 policy。
 - 不把 TUI/GUI UI primitive 放进 core hook context；用户交互应通过 UI-safe command result / command output 或下游 adapter 能力表达，不能通过 hook 注入完整 `AgentCommand`。
+
+pi coding-agent、Codex 和其他 Agent runtime 的扩展机制可以作为覆盖面参考，但 MiniCore 不承诺兼容其 hook 名称、payload、执行顺序或插件接口；本文件定义的 typed result、owner 和 failure policy 才是权威契约。
 
 ## Hook 类型
 
@@ -260,7 +262,7 @@ Hook 只能返回 catalog/output patch；不能直接打开 UI，不能直接发
 | `InputReceived` | Transform / Gate | transform / handled / reject |
 | `InputBeforeSubmit` | Transform / Gate | prompt-like input 进入 session 前最后校验 |
 
-`SubmitPrompt` 不默认解析 slash。`ExecuteCommandText` / `ExecuteCatalogCommand` 仍走 `CommandManager.resolve_for_execution`。Input hook 不能绕过 phase guard。
+`SubmitPrompt` 不默认解析 slash。`ExecuteCommandText` / `ExecuteCatalogCommand` 仍走 `CommandManager.resolve_for_execution`。Input hook 不能绕过 `CommandRunPolicy`、`PromptDelivery` admission 或 session phase guard。
 
 ### Session Lifecycle
 
@@ -280,28 +282,29 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `BeforeAgentStart` | Transform | append custom message、patch stream options、patch system prompt |
-| `PromptBuilt` | Transform | append 或 privileged replace system prompt |
-| `ContextProjection` | Transform | replace model-visible messages |
-| `AfterTurnStateBuild` | Observer | inspect stable turn state summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
+| `BeforeAgentStart` | Transform | transform/gate structured current input、patch stream options |
+| `PromptBuilt` | Transform | append system section 或 privileged replace；应用后重建 `PromptCallProfile` |
+| `ContextProjection` | Transform / Provider | 返回 `CurrentRun` / `CurrentCall` 的 `ContextMaterialContribution::Available/Unavailable`；privileged capability 才可 replace messages |
+| `AfterTurnStateBuild` | Observer | inspect stable turn state / PromptTurn summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
 
-提示词注入应该走这些 hook，而不是让 UI 或下游代码直接拼 system prompt。
+提示词注入应该返回 typed result，由 `SessionRuntime` 应用后交给 Prompt 最终组装，而不是让 UI、hook 或下游代码直接提交 system/messages。
 
-- 企业 policy / coding style：优先 `PromptBuilt` append。
-- 完整替换 system prompt：需要 privileged `ReplacePrompt` capability。
-- RAG / memory / issue context：优先 `ContextProjection`，但必须保证 protocol-safe，没有 orphan tool result 或 unresolved tool call。
-- resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 snapshot 注入资源。
+- 企业 policy / coding style：优先作为 required policy view 或 `PromptBuilt` append；system replacement 需要 privileged `ReplacePrompt` capability。
+- `PromptBuilt` 变化后必须重建 contribution stamps、fingerprint 和完整 `PromptCallProfile`，不能只改字符串。
+- RAG / memory / issue context：成功时返回带 source、content hash、persistence 和 requirement 的 `ContextMaterial`；失败时返回同 key/source/requirement 的 `Unavailable`，不能省略失败项。`Required` 失败由 Prompt fail closed，`Optional` 失败进入 projection diagnostics。
+- privileged message replacement 仍必须经过 `PromptTurn.project_model_call()`，保证没有 orphan tool result、unresolved tool call 或 current-input loss。
+- resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 captured `PromptResourceView` 注入资源。
 
 ### Run Safe Points
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
 | `RunBeforeStart` | Gate / Observer | cancel 或 observe |
-| `BeforeNextModelCall` | Transform / Gate | patch context/model/thinking、drain queue、pause/finish |
+| `BeforeNextModelCall` | Transform / Gate | 形成组合式 `NextModelCallPlan`：drain queue、profile/model options、typed context、pause/finish |
 | `BeforeRunFinish` | Gate / Transform | decide finish/pause/follow-up |
 | `RunFinished` | Observer | telemetry / diagnostics |
 
-这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部。
+这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部；它只消费 `NextModelCallPlan`，再调用 Prompt 生成最终 `ModelInputProjection`。
 
 ### Model / Provider
 
@@ -450,7 +453,7 @@ pub enum HookErrorPolicy {
 
 - `BeforeAgentStart`
 - `PromptBuilt`
-- `ContextProjection`
+- `ContextProjection`（优先 typed `ContextMaterialContribution`）
 - `ToolBeforePolicy`
 - `ToolAfterExecute`
 - `SessionBeforeCompact`

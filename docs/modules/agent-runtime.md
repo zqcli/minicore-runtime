@@ -11,28 +11,30 @@ use crate::agent_runtime_protocol as protocol;
 
 pub trait AgentRuntime {
     async fn dispatch(&self, command: protocol::AgentCommand) -> Result<protocol::CommandAck, RuntimeError>;
+    async fn query(&self, query: protocol::RuntimeQuery) -> Result<protocol::QueryResponse, protocol::QueryError>;
     fn subscribe(&self) -> protocol::EventStream;
     async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
 ```
 
-下游 CLI/TUI/GUI 不应该直接调用更细的方法。会话打开、资源刷新、模型切换、工具审批等都通过 `agent_runtime_protocol::AgentCommand` 表达。
+下游 CLI/TUI/GUI 不应该直接调用更细的方法。会话打开、资源刷新、模型切换、工具审批等 mutation/异步工作通过 `AgentCommand` 表达；session list、settings、资源详情、command catalog、model catalog、usage 和 diagnostics 等只读数据通过按领域分组的 `RuntimeQuery` 表达。
 
 ## 核心职责
 
 - 处理下游 CLI/TUI/GUI adapter 发来的 `agent_runtime_protocol::AgentCommand`。
+- 路由 `RuntimeQuery` 到 `SessionManager`、settings、`ResourceManager`、`CommandManager`、model/usage/diagnostics owner，并直接返回 `QueryResponse`；query 不发布业务事件。
 - 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::RuntimeSnapshot`。
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
 - 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、无状态 `CommandManager` 和运行时诊断。
 - 通过 `ResourceManager` 维护级联资源快照：current `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、run 启动时捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
-- 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve 和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。
+- 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve、`CommandRunPolicy` 校验和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。prompt-producing 结果再由目标 `SessionRuntime` 按 `PromptDelivery` 统一 admission。
 - 后期持有 `RuntimeHookRegistry` 作为内部 runtime service；当前 MVP 不实现 hook registry / hook invocation。启用后只在明确 owner 的安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command result events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 display-neutral 输出或交互请求；runtime 不定义具体 picker、popup、menu、form 或 widget 组件。
 - 在 session open、focus、new、fork、import、close 前后执行受控的 open/load/focus/unload 流程；focus 切换不隐式关闭旧 `SessionRuntime`。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
 
-`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 可以等用户输入 `/resume` 再列出当前 workspace 的会话，GUI 可以单独调用 `ListSessions` 渲染 sidebar。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
+`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 的 `/resume` handler 可以读取 session index 并生成 interaction，GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
 
 MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生命周期，不作为独立 daemon/server 存活。`subscribe()` / `snapshot()` 的 reconnect 语义用于同一程序上下文内的 late subscribe、reducer/subscriber 重建和 sequence gap recovery；不支持 UI adapter 失败但 runtime 继续运行、随后由新 UI 连接并恢复所有后台 session 的模式。
 
@@ -87,21 +89,6 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 6. 需要时发出该 cwd 对应的 `resources_changed` / diagnostics events。
 7. 后续 session-scoped 命令路由到对应 `SessionRuntime`；后台 running session 不因失去 focus 被关闭或中止。
 
-## 对齐 pi 的能力
-
-| pi `AgentSessionRuntime` / services | 本项目能力 |
-| --- | --- |
-| `createAgentSessionServices(options)` | `WorkspaceServices` 提供共享 services；`ResourceManager.capture_turn(...)` 在 turn 启动时提供 captured resource snapshot。 |
-| `createAgentSessionFromServices(options)` | 从 `SessionHandle` metadata 创建固定 `workspace_id` / `cwd` 的 `SessionRuntime`。 |
-| `createAgentSessionRuntime(factory, options)` | 创建初始 `AgentRuntime` 状态。 |
-| `setRebindSession(callback)` | 下游 adapter 重新绑定回调。 |
-| `setBeforeSessionInvalidate(callback)` | teardown 前同步 adapter 清理点。 |
-| `switchSession(sessionPath, options)` | `OpenSession` / `FocusSession` 触发的 open/load/focus 流程；不隐式关闭旧会话。 |
-| `newSession(options)` | `NewSession`。 |
-| `fork(entryId, options)` | `ForkSession`。 |
-| `importFromJsonl(inputPath, cwdOverride)` | `ImportSession`。 |
-| `dispose()` | `CloseSession` / runtime shutdown。 |
-
 ## 安全边界
 
 `AgentRuntime` 集中持有 workspace host、资源快照存储和运行时服务入口。凭据和 provider catalog 是 user-global/runtime-global；项目资源只能通过 `ResourceManager` 受 trust gate、source info 和 overlay policy 约束后进入 cwd 的 `CwdResourceSnapshot.resolved`；工具执行仍由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统结合 cwd 和 sandbox view 治理。下游 UI/CLI 只能发送命令和消费事件，不能直接读取本地资源、拼接技能内容、执行工具或写 session 文件。
@@ -122,4 +109,4 @@ ExecuteCommandText / ExecuteCatalogCommand
 
 只有当 resolved command 是 prompt-like input，例如 `/skill code-review ...`、兼容 `/skill:code-review ...` 或 `/{template}`，才会进入 `SessionRuntime` 的普通 prompt/run pipeline。`/status`、`/usage`、`/model`、`/thinking`、`/reload` 等命令不会直接进入 `Driver`；它们更新 runtime/session state、执行受控 query，或返回 display-neutral command result。
 
-`AgentRuntime` 负责把同一个 `command_id` 贯穿到业务事件和 command output events 中。`CommandAck` 只说明 `ExecuteCommandText` / `ExecuteCatalogCommand` 是否被接收；命令的用户可见结果通过 command output 或业务事件返回。
+`AgentRuntime` 负责把同一个 `command_id` 贯穿到业务事件和 command output events 中。`CommandAck` 只说明 `ExecuteCommandText` / `ExecuteCatalogCommand` 是否被接收；命令的用户可见结果通过 command output 或业务事件返回。`RuntimeQuery` 不分配 `CommandId`，结果直接返回调用方；query 引用的事实后续变化时由正常业务事件更新或使 UI cache 失效。

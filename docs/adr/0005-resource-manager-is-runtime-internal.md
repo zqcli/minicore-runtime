@@ -6,4 +6,4 @@
 
 这个决定参考 Codex 的 protocol/core 分层：protocol 负责提交、事件和 schema，执行环境、项目上下文和资源状态留在 core runtime 中。MiniCore 有更宽的 pi-like 产品资源面，包括 skills、prompt templates、context files、custom system prompt 和 append system prompt，因此资源来源解析和提示词素材生命周期需要一个独立子系统承载。extension/package/MCP resource discovery 不属于当前决策范围；如果后续引入，应通过新的 ADR 单独定义安全边界。
 
-ADR 0010 进一步细化了这个模块边界：`ResourceManager` 拥有 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` capture、预留的 `StepResourceSnapshot` 类型、`ResourceSnapshotStore` 和 `ResourceOverlayPolicy`。`SessionRuntime` 消费已捕获的 snapshot；`Prompt` 构建最终 system prompt；UI 和 protocol 只能看到摘要或受控 detail query 结果。
+ADR 0010 进一步细化了这个模块边界：`ResourceManager` 拥有 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` capture、预留的 `StepResourceSnapshot` 类型、`ResourceSnapshotStore` 和 `ResourceOverlayPolicy`。ADR 0017 再明确：`SessionRuntime` 从 captured snapshot 取得 `PromptResourceView`，`Prompt` 负责 intent/system/context 的确定性组装，但复用 ResourceManager canonical resource identity，不拥有 reload、overlay 或 catalog lifecycle；UI 和 protocol 只能看到摘要或受控 detail query 结果。

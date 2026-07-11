@@ -1,6 +1,6 @@
 # AgentRuntimeProtocol
 
-`AgentRuntimeProtocol` 是下游 CLI/TUI/GUI adapter 与 `AgentRuntime` 之间的稳定通信协议模块，包含命令、事件、快照和共享视图类型。下游宿主只应依赖这个协议，不依赖 Rig、工具实现或 session 文件。
+`AgentRuntimeProtocol` 是下游 CLI/TUI/GUI adapter 与 `AgentRuntime` 之间的稳定通信协议模块，包含命令、领域分组查询、事件、快照和共享视图类型。下游宿主只应依赖这个协议，不依赖 Rig、工具实现或 session 文件。
 
 事件命名、顺序、持久化屏障、重连和各场景生命周期详见 [AgentRuntimeEvents](agent-runtime-events.md)。本文件只保留 UI 需要依赖的协议类型。
 
@@ -13,14 +13,15 @@ use crate::agent_runtime_protocol as protocol;
 
 pub trait AgentRuntime {
     async fn dispatch(&self, command: protocol::AgentCommand) -> Result<protocol::CommandAck, RuntimeError>;
+    async fn query(&self, query: protocol::RuntimeQuery) -> Result<protocol::QueryResponse, protocol::QueryError>;
     fn subscribe(&self) -> protocol::EventStream;
     async fn snapshot(&self) -> Result<protocol::RuntimeSnapshot, RuntimeError>;
 }
 ```
 
-运行时方法返回确认或快照，不直接返回助手文本。助手输出、工具活动、保存状态、资源变化和错误都通过 `agent_runtime_protocol::Event` 传递。
+`dispatch()` 接收 mutation 或异步工作，`query()` 直接返回只读结果，`subscribe()` 传递运行变化，`snapshot()` 提供带事件水位的恢复读模型。助手输出、工具活动、保存状态、资源变化和错误都通过 `agent_runtime_protocol::Event` 传递；query response 不进入事件流。
 
-`agent_runtime_protocol::EventStream` 传输完整的 `agent_runtime_protocol::Event`。它借鉴 Codex 的 `Event { id, msg }` 形态：外层事件记录负责顺序、路由、关联和重连水位，`msg` 负责业务事实。
+`agent_runtime_protocol::EventStream` 传输完整的 `agent_runtime_protocol::Event`。外层事件记录负责顺序、路由、关联和重连水位，`msg` 负责业务事实。
 
 ```rust
 pub struct Event {
@@ -47,7 +48,7 @@ pub struct CommandAck {
 
 `agent_runtime_protocol::EventMsg` 使用分组 enum；UI/wire 层序列化为 flat `snake_case` event type，例如 `run_started`、`tool_call_output_delta`。
 
-推荐 wire 形态保持 Codex-like 外层事件 + 内层消息：
+wire 形态固定为外层事件 + 内层消息：
 
 ```json
 {
@@ -65,6 +66,120 @@ pub struct CommandAck {
 
 也就是说，稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 字段只负责 routing、ordering、correlation 和 reconnect cursor。
 
+## RuntimeQuery
+
+`RuntimeQuery` 是所有跨 UI/runtime seam 的只读业务查询入口。它按 owner 领域分组，避免形成平铺的巨型 enum：
+
+```rust
+pub enum RuntimeQuery {
+    Runtime(RuntimeReadQuery),
+    Session(SessionQuery),
+    Settings(SettingsQuery),
+    Resources(ResourceQuery),
+    CommandSurface(CommandSurfaceQuery),
+    Models(ModelQuery),
+    Usage(UsageQuery),
+    Diagnostics(DiagnosticsQuery),
+}
+
+pub enum SessionQuery {
+    List {
+        scope: SessionListScope,
+        filter: Option<SessionListFilter>,
+        cursor: Option<PageCursor>,
+        limit: u32,
+    },
+    GetSummary { session_id: SessionId },
+    // future: Messages、Tree、Branches
+}
+
+pub enum SettingsQuery {
+    GetEffective { session_id: Option<SessionId> },
+    GetSchema { section: Option<String> },
+    ListProfiles,
+}
+
+pub enum ResourceQuery {
+    ListSkills { workspace_id: WorkspaceId, cwd: PathBuf },
+    GetSkill { workspace_id: WorkspaceId, cwd: PathBuf, skill_name: String },
+    GetPromptTemplate { workspace_id: WorkspaceId, cwd: PathBuf, template_name: String },
+    GetContextFile { workspace_id: WorkspaceId, cwd: PathBuf, path: PathBuf },
+    GetEffectivePrompt { session_id: SessionId },
+}
+
+pub enum CommandSurfaceQuery {
+    GetCatalog { session_id: SessionId },
+    Suggest { session_id: SessionId, input: String, cursor: u32 },
+}
+
+pub enum ModelQuery {
+    ListProviders,
+    ListModels { provider_id: Option<String>, include_hidden: bool },
+}
+
+pub enum UsageQuery {
+    GetSessionStats { session_id: SessionId },
+    GetContextUsage { session_id: SessionId },
+}
+
+pub enum RuntimeReadQuery {
+    GetCapabilities,
+}
+
+pub enum DiagnosticsQuery {
+    ListRuntime,
+    ListResources { workspace_id: WorkspaceId, cwd: Option<PathBuf> },
+}
+```
+
+每个领域 result type 可以后续持续补充，但外层 envelope 固定：
+
+```rust
+pub struct QueryResponse {
+    pub as_of_sequence: u64,
+    pub revision: Option<QueryRevision>,
+    pub data: QueryResult,
+}
+
+pub enum QueryResult {
+    Runtime(RuntimeReadResult),
+    Session(SessionQueryResult),
+    Settings(SettingsQueryResult),
+    Resources(ResourceQueryResult),
+    CommandSurface(CommandSurfaceQueryResult),
+    Models(ModelQueryResult),
+    Usage(UsageQueryResult),
+    Diagnostics(DiagnosticsQueryResult),
+}
+
+pub struct QueryError {
+    pub kind: QueryErrorKind,
+    pub message: String,
+}
+
+pub enum QueryErrorKind {
+    NotFound,
+    InvalidArgument,
+    Unauthorized,
+    StaleRevision,
+    Unavailable,
+}
+```
+
+query 的不变量：
+
+- 只读，不改变 session/resource/settings/catalog revision。
+- 不创建 turn、不启动 run、不消费 queue、不发布 `agent_runtime_protocol::Event`。
+- 读取持久化 session catalog/detail 时不加载完整 `SessionRuntime`。
+- 大列表必须分页，cursor opaque 且绑定有效 filters；正文/detail 有大小、trust、path 和 privilege 限制。
+- `as_of_sequence` 必须与 owner 的 read projection 在同一同步边界捕获：任何 sequence `<= as_of_sequence` 的相关已发布 mutation 都必须反映在 result 中；更晚变化必须使用更大的 sequence 或领域 revision。不能先读旧数据、再随手读取新 event counter，造成 UI 丢失 invalidation。
+- 领域 revision 用于分页 cursor、cache 和 stale 判断；同一 query/result group 必须匹配，不能返回另一领域的 result variant。
+- query response 不产生 `CommandAck` 或 `CommandId`。JSON-RPC/Tauri request id 属于 transport，不进入领域协议。
+
+配置遵循 read/query、draft/UI、write/command、change/event 的分工：`SettingsQuery` 返回 effective values、schema、source/provenance 和 editable constraints；UI 持有未提交草稿；配置写入使用 `AgentCommand` 和 expected revision；凭据查询只能返回 redacted status，不能返回 API key、OAuth token 或 auth header。
+
+Rust core 保持统一 `query(RuntimeQuery)` seam；生成给 JSON-RPC/TypeScript SDK 的 adapter 可以暴露 `session/list`、`settings/read`、`usage/session/read` 等方法，并映射回对应领域 query。
+
 ## AgentCommand
 
 MVP 命令：
@@ -75,13 +190,9 @@ pub enum AgentCommand {
     NewSession { workspace_id: WorkspaceId },
     OpenSession { session_id: SessionId },
     FocusSession { session_id: SessionId },
-    ListSessions { scope: SessionListScope, filter: Option<SessionListFilter>, cursor: Option<PageCursor>, limit: u32 },
-    SubmitPrompt { session_id: SessionId, input: UserInput, delivery: DeliveryMode },
-    InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: DeliveryMode },
-    InvokePromptTemplate { session_id: SessionId, template_name: String, args: Vec<String>, delivery: DeliveryMode },
-    Steer { session_id: SessionId, input: UserInput },
-    FollowUp { session_id: SessionId, input: UserInput },
-    NextTurn { session_id: SessionId, input: UserInput },
+    SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
+    InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: PromptDelivery },
+    InvokePromptTemplate { session_id: SessionId, template_name: String, args: Vec<String>, delivery: PromptDelivery },
     ClearQueue { session_id: SessionId },
     AbortRun { run_id: RunId },
     ResumeRun { session_id: SessionId, resume_id: ResumeId },
@@ -94,10 +205,40 @@ pub enum AgentCommand {
     SetStreamOptions { session_id: SessionId, options: StreamOptions },
     ReloadResources { workspace_id: WorkspaceId, cwd: PathBuf },
     Compact { session_id: SessionId, instructions: Option<String> },
-    ExecuteCommandText { session_id: Option<SessionId>, raw: String, delivery: DeliveryMode },
-    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs },
+    ExecuteCommandText { session_id: Option<SessionId>, raw: String, prompt_delivery: PromptDelivery },
+    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs, prompt_delivery: PromptDelivery },
 }
 ```
+
+模型可见输入只使用一个交付入口：
+
+```rust
+pub enum PromptDelivery {
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
+pub enum QueueKind {
+    Steering,
+    FollowUp,
+}
+
+pub enum QueueMode {
+    All,
+    OneAtATime,
+}
+```
+
+- `Steer`：session idle 时立即启动 run；有 active run 时进入 steering queue，在最早可用的 `before_next_model_call` 安全点注入。若当前 work 暂时没有模型调用安全点，例如 compaction 或 suspended run，则保持排队，直到恢复后的最早模型调用或 post-work continuation。
+- `FollowUp`：不修改 active run；当前 work chain、必要 retry/recovery 和 pending session action 完成后，作为后续用户输入启动新 run。session idle 时可立即启动。
+- `NextTurn`：不自动启动 run；与下一次显式提交的用户 prompt 一起进入上下文。
+
+`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate` 和 prompt-producing slash command 最终都必须归一到这套 `PromptDelivery`。runtime 内部先把它们转换成结构化 `PromptIntent`；queue 保存 resource key/args/附件引用，不保存 raw slash text 或 skill/template body。active `Steer` 由 active `PromptTurn` 展开，`FollowUp` / `NextTurn` 在目标 future turn capture 后展开。`PromptIntent`、`PromptTurn`、`PromptCallProfile` 和 `ModelInputProjection` 都是 runtime 内部类型，不进入公开 wire protocol。
+
+公开协议不再保留独立 `Steer` / `FollowUp` / `NextTurn` 命令，避免两条入口产生不同的 phase guard、queue event 或 hook 行为。`SetQueueMode` 只配置 steering/follow-up 每次安全点消费全部消息还是一条；它不改变 delivery 类型，也不适用于 `NextTurn` 或 `PendingSessionAction`。
+
+推荐 adapter 映射：普通 Enter 使用 `Steer`，显式 follow-up 快捷键或发送模式使用 `FollowUp`，扩展/自动化需要“随下一次用户输入附带”时使用 `NextTurn`。slash command 仍先 resolve；delivery 不能把 `/status` 变成队列消息，也不能把 `/compact` 变成 steer。
 
 `AgentCommand` 是公开协议命令，只表达下游 UI/CLI 可以提交的用户意图。高权限内部 mutation 不属于公开协议，例如直接追加会话消息、替换工具定义、改写会话历史或注入调试状态。它们应放入内部 API：
 
@@ -111,18 +252,18 @@ pub(crate) enum InternalAgentCommand {
 
 `InternalAgentCommand` 不能出现在 `RuntimeSnapshot`、`EventMsg`、command catalog、command output action 或 UI-visible interaction 中。
 
-`Compact { session_id, instructions }` 的 phase policy 是 `DeferUntilPostRun`：
+`Compact { session_id, instructions }` 的 command run policy 是 `QueueAfterRun`：
 
 - session 已 `idle` 时立即进入 manual compaction。
 - session 有 active run、等待 tool approval、处于 suspended run 或正在自动 retry chain 时，不中止当前 work；`SessionRuntime` 保存一个结构化 `PendingSessionAction::Compact`，并通过 `queue_updated` / `QueueSnapshot.pending_actions` 暴露。
-- pending compact 在当前 work 的 terminal event 和相关 `persistence_save_point` 完成后、follow-up / next-turn continuation 之前执行；如果还有立即 retry / overflow recovery，则等该 work chain 稳定结束后再执行。
+- pending compact 在当前 work 的 terminal event 和相关 `persistence_save_point` 完成后、queued steering continuation / follow-up 之前执行；如果还有立即 retry / overflow recovery，则等该 work chain 稳定结束后再执行。`NextTurn` 不会自动启动 continuation。
 - 已有 pending compact 时重复提交不追加第二个压缩动作，返回 `CompactAlreadyQueued` 类 command output，保留原 instructions。
 - session 已在 compaction phase 时返回 `CompactionAlreadyRunning`；不会排队第二次 compaction。
 - `AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会移除 pending compact，并发出更新后的 `queue_updated`；普通 run failure 在不再 retry 时仍执行用户已经排队的 compact。
 
 `Compact` 不能隐式调用 `AbortRun`，也不能清理 tool approval、resume state 或消息队列。`PendingSessionActionView` 是 UI-safe 当前状态投影，不是新的可执行命令载体；真正执行仍使用 `SessionRuntime` 内部保存的结构化 action。
 
-`ListSessions` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`；GUI sidebar 也应通过同一查询分页/过滤读取当前 workspace 的 session 清单，而不是直接读取本地 index 文件。`ListSessions` 是读取型 protocol query：SDK / JSON-RPC transport 可以把它实现为 request/response；如果某个 transport 只能走 `dispatch(AgentCommand)`，也必须通过明确 response event 或 interaction 返回列表，不能把 session list 塞进 `CommandAck`。
+`SessionQuery::List` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` handler 可以调用同一个内部 `SessionManager.list_sessions(...)` 并生成 command interaction；GUI sidebar 则通过 `RuntimeQuery::Session(SessionQuery::List { ... })` 直接取得 typed page，不能读取本地 index 文件。
 
 ```rust
 pub enum SessionListScope {
@@ -139,11 +280,11 @@ pub struct SessionListFilter {
 pub struct PageCursor(pub String);
 ```
 
-`RuntimeResourceSnapshot`、`CwdResourceSnapshot` 或 `TurnResourceSnapshot` 都不应作为公开 UI command 的输入。公开协议只允许 UI 请求 `ReloadResources { workspace_id, cwd }`、消费 `resources_changed` 摘要，或通过 `GetSkill` / `GetPromptTemplate` 这类 detail command 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceManager` 的 source info、project trust、overlay policy、diagnostics 和 atomic publish 语义。
+`RuntimeResourceSnapshot`、`CwdResourceSnapshot` 或 `TurnResourceSnapshot` 都不应作为公开 UI command/query 的输入。公开协议只允许 UI 通过 command 请求 `ReloadResources`、消费 `resources_changed` 摘要，或通过 `ResourceQuery` 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceManager` 的 source info、project trust、overlay policy、diagnostics 和 atomic publish 语义。
 
-`ExecuteCommandText` 只提交原始命令文本；`/...` slash command 是这种文本入口的常见语法。Parse / materialize / suggest / resolve / execute 由 [CommandSurface](command-surface.md) 中的 `CommandManager` 与目标 `SessionRuntime.command` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteCommandText`，GUI/TUI 从 catalog 选择某个节点时可以走 `ExecuteCatalogCommand`。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
+`ExecuteCommandText` 只提交原始命令文本；`/...` slash command 是这种文本入口的常见语法。Parse / materialize / suggest / resolve / execute 由 [CommandSurface](command-surface.md) 中的 `CommandManager` 与目标 `SessionRuntime.command` 协调完成。下游 TUI slash input 和 GUI command palette 默认都应走 `ExecuteCommandText`，GUI/TUI 从 catalog 选择某个节点时可以走 `ExecuteCatalogCommand`。两者携带的 `prompt_delivery` 只在命令产生 prompt intent 时生效，例如 `/skill` 或 prompt template；`/status`、`/compact` 等非 prompt command 忽略它并按自己的 `CommandRunPolicy` 执行。普通 `SubmitPrompt` 不应默认解析 slash command，避免用户无法发送以 `/` 开头的普通文本。
 
-`ExecuteCatalogCommand` 只能携带 `CommandSelection`、catalog revision、dynamic bindings 和 `CommandArgs`，不能携带完整 `AgentCommand` payload 或 handler id。运行时收到后必须基于当前 session context 重新 materialize catalog，并执行 `resolve_for_execution`：command 仍存在、selection 未过期、bindings 仍有效、args 合法、phase/trust/capability 允许、handler binding 可信，然后才调用 handler。
+`ExecuteCatalogCommand` 只能携带 `CommandSelection`、catalog revision、dynamic bindings、`CommandArgs` 和 prompt-producing command 使用的 `prompt_delivery`，不能携带完整 `AgentCommand` payload 或 handler id。运行时收到后必须基于当前 session context 重新 materialize catalog，并执行 `resolve_for_execution`：command 仍存在、selection 未过期、bindings 仍有效、args 合法、run policy/trust/capability 允许、handler binding 可信，然后才调用 handler。
 
 后续命令：
 
@@ -154,16 +295,10 @@ SetSessionName { session_id: SessionId, name: String }
 DeleteSession { session_id: SessionId }
 CloseSession { session_id: SessionId }
 ImportSession { workspace_id: WorkspaceId, input_path: PathBuf, cwd_override: Option<PathBuf> }
-ListSkills { workspace_id: WorkspaceId, cwd: PathBuf }
-GetSkill { workspace_id: WorkspaceId, cwd: PathBuf, skill_name: String }
-GetPromptTemplate { workspace_id: WorkspaceId, cwd: PathBuf, template_name: String }
-GetContextFile { workspace_id: WorkspaceId, cwd: PathBuf, path: PathBuf }
-GetEffectivePrompt { session_id: SessionId }
-SuggestCommand { session_id: SessionId, input: String, cursor: usize }
-GetCommandCatalog { session_id: SessionId }
 SubmitInteraction { interaction_id: InteractionId, selection: InteractionSelection, form_values: serde_json::Value }
 SetToolPolicy { session_id: SessionId, policy: ToolPolicyConfig }
 SetToolApprovalMode { session_id: SessionId, mode: ToolApprovalMode }
+PatchSettings { target: SettingsTarget, expected_revision: SettingsRevision, patch: SettingsPatch }
 ExportSession { session_id: SessionId, format: ExportFormat }
 NavigateSessionTree { session_id: SessionId, target_entry_id: EntryId }
 ForkSession { session_id: SessionId, from_entry_id: EntryId }
@@ -171,11 +306,11 @@ CycleModel { session_id: SessionId, direction: CycleDirection }
 CycleThinkingLevel { session_id: SessionId }
 SetAutoCompaction { session_id: SessionId, enabled: bool }
 SetAutoRetry { session_id: SessionId, enabled: bool }
-GetSessionStats { session_id: SessionId }
-GetContextUsage { session_id: SessionId }
 ```
 
-`GetSkill`、`GetPromptTemplate`、`GetContextFile` 和 `GetEffectivePrompt` 是后续资源详情查询，不是会话运行命令，也不应改变 resource revision。实现时可以把它们做成 request/response 形式的 protocol query，或做成 `dispatch()` 后产生明确 response event 的命令；无论采用哪种 transport，读取都必须经过 `AgentRuntime` / `ResourceManager`，不能让 UI adapter 直接读文件。`GetSkill` / `GetPromptTemplate` 读取 current `CwdResourceSnapshot.resolved`，`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 context file canonical path。`GetEffectivePrompt` 可能包含工具状态和项目上下文，默认应作为 debug/privileged query，而不是普通 snapshot 字段。
+`PatchSettings` 是后续配置 mutation 框架：UI 先通过 `SettingsQuery::GetEffective/GetSchema` 读取 effective values、source/provenance、editable constraints 和 revision，在本地维护未提交草稿，再用 expected revision 提交 patch。冲突返回 stale revision；成功后的 effective change 通过对应业务事件更新 UI cache。API key、OAuth token 和 auth header 不得进入普通 `SettingsPatch`，必须走专门的 secure credential seam。
+
+`ResourceQuery` 读取 current `CwdResourceSnapshot.resolved`，不能让 UI adapter 直接读文件。`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 canonical path。active run 的 `GetEffectivePrompt` 读取 active `PromptTurn` 的 redacted profile/provenance；idle preview 如后续支持，必须显式标记为 preview，并且不创建 turn、消费 queue 或改变资源 revision。完整正文默认属于 debug/privileged query，不进入普通 snapshot。
 
 `DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`ToolApprovalBroker` 必须确认 `approval_id` 与 `session_id`、`run_id`、`call_id` 仍匹配同一个 pending approval。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
 
@@ -364,7 +499,11 @@ pub enum SkillEvent {
 pub enum PromptTemplateEvent {
     Invoked { session_id: SessionId, run_id: RunId, template_name: String },
 }
+```
 
+`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开并绑定到某个 run 时发布，因此 `run_id` 必填。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。active Steer 在 active run 安全点展开后发 invoked，再追加对应 user message。展开失败则发 command/runtime diagnostic，不制造 invoked 事件。
+
+```rust
 pub enum CompactionEvent {
     Started { session_id: SessionId, reason: CompactionReason },
     Finished { session_id: SessionId, result: Option<CompactionResultView>, aborted: bool, will_retry: bool },
@@ -383,6 +522,13 @@ pub enum DiagnosticsEvent {
     RuntimeChanged { diagnostics: Vec<RuntimeDiagnostic> },
     Warning { scope: EventScope, message: String },
     Error { scope: EventScope, message: String, recoverable: bool },
+}
+
+pub enum SessionPhase {
+    Idle,
+    Turn,
+    Compaction,
+    RetryBackoff,
 }
 
 pub enum RunTerminalStatus {
@@ -490,7 +636,7 @@ pub struct UiInteractionItem {
 
 pub enum InteractionSubmitPolicy {
     SubmitInteraction { interaction_id: InteractionId },
-    ExecuteCatalogCommand { selection: CommandSelection },
+    ExecuteCatalogCommand { selection: CommandSelection, args: CommandArgs, prompt_delivery: PromptDelivery },
     DisplayOnly,
 }
 
@@ -714,7 +860,7 @@ pub struct CompactionResultView {
 
 `snapshot()` 用于 UI 初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
 
-MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped：打开 workspace 后默认不聚焦任何 session，`active_session` 为空。TUI 可在用户执行 `/resume` 时再通过 `ListSessions` 获取当前 workspace 的会话清单；GUI 如果需要 sidebar，也应通过 `ListSessions` 或会话目录 query 获取清单，而不是要求 `RuntimeSnapshot` 默认携带完整 `Vec<SessionSummary>`。
+MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped：打开 workspace 后默认不聚焦任何 session，`active_session` 为空。TUI 可在用户执行 `/resume` 时由 command handler 读取 session index 并产生 interaction；GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`，而不是要求 `RuntimeSnapshot` 默认携带完整 `Vec<SessionSummary>`。
 
 MVP 的 UI host 和 `AgentRuntime` 运行在同一个程序上下文、同一个生命周期内；MiniCore runtime 不是独立 daemon/server，不承诺 UI adapter 失败或断线后 runtime 继续运行再被重新连接。`last_event_sequence` 的 reconnect 语义用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。它不要求 `RuntimeSnapshot` 覆盖所有非 active/background session 的完整运行态；如果未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，需要重新设计 all-loaded-session snapshot 或 scoped event cursor。
 
@@ -796,7 +942,7 @@ pub struct CommandSnapshot {
 
 `RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
 
-`SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `ListSessions`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
+`SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `SessionQuery::List`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一底层 `SessionManager.list_sessions(...)` 查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
 
 资源摘要类型只暴露来源和展示信息，不暴露大文本正文：
 
@@ -820,7 +966,7 @@ pub struct CommandNodeSummary {
     pub source_info: Option<ResourceSourceInfo>,
     pub args_hint: Option<String>,
     pub availability: CommandAvailability,
-    pub phase_policy: CommandPhasePolicy,
+    pub run_policy: CommandRunPolicy,
     pub descriptor_fingerprint: String,
 }
 
@@ -842,13 +988,10 @@ pub enum CommandAvailability {
     Hidden,
 }
 
-pub enum CommandPhasePolicy {
+pub enum CommandRunPolicy {
     IdleOnly,
-    AllowedDuringRun,
-    QueueAsSteer,
-    QueueAsFollowUp,
-    DeferUntilPostRun,
-    ImmediateRuntimeAction,
+    Immediate,
+    QueueAfterRun,
 }
 
 pub struct CommandDiagnostic {
@@ -858,11 +1001,11 @@ pub struct CommandDiagnostic {
 }
 ```
 
-技能全文、context file 正文和完整 system prompt 默认不进入 `RuntimeSnapshot`。UI 如果需要预览技能详情，应通过 `GetSkill` 命令请求；后续可增加 `GetPromptTemplate`、`GetContextFile` 或 `GetEffectivePrompt`。
+技能全文、context file 正文和完整 system prompt 默认不进入 `RuntimeSnapshot`。UI 如果需要预览详情，应使用 `ResourceQuery::GetSkill`、`GetPromptTemplate`、`GetContextFile` 或 privileged `GetEffectivePrompt`。
 
 ## Downstream Adapter 调用方式
 
-MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI 如果需要 sidebar，应单独调用 `ListSessions`。
+MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
 
 Ratatui：
 
@@ -870,6 +1013,9 @@ Ratatui：
 keyboard/input event
   → agent_runtime_protocol::AgentCommand
   → AgentRuntime.dispatch
+picker/sidebar/detail read
+  → agent_runtime_protocol::RuntimeQuery
+  → AgentRuntime.query
 agent_runtime_protocol::Event stream
   → app state reducer
   → terminal render
@@ -878,12 +1024,17 @@ agent_runtime_protocol::Event stream
 Tauri：
 
 ```text
-Vue invoke("submit_prompt"、"invoke_skill"、"open_session" 或 "list_sessions")
+Vue invoke("submit_prompt"、"invoke_skill"、"open_session")
   → Tauri command
   → AgentRuntime.dispatch
+Vue invoke("list_sessions"、"read_settings"、"read_usage")
+  → Tauri query adapter
+  → AgentRuntime.query
 agent_runtime_protocol::Event stream
   → app.emit("runtime-event", event)
   → Vue store reducer
 ```
+
+JSON-RPC adapter 可以把 `dispatch`、`query`、`snapshot` 映射为 request/response method，把 `subscribe` 映射为持久连接上的 server notifications。transport request id 只关联一次调用；`CommandId`、event sequence 和领域 revision 保持独立。
 
 任何下游适配器都不应直接调用模型提供方、执行工具、读取工作区文件、解析技能文件、读写会话文件，或持有权威会话状态。

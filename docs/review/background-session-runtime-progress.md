@@ -52,8 +52,8 @@
 - `ReloadResources { workspace_id, cwd }` 为目标 cwd 构建新的 `CwdResourceSnapshot`；成功后原子替换 current pointer；running run 继续使用旧 `TurnState` / 旧 `TurnResourceSnapshot`，下一轮 user turn 使用新 snapshot。
 - provider settings、auth、custom provider 和 `ModelGateway` 都是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth/provider endpoint。
 - 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 reload / startup ensure。
-- `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中提取 prompt materials，再合并 active tools / tool snippets / cwd / 日期等会话态，调用 `prompt::build_system_prompt(...)`。
-- `Prompt` 是纯系统提示词构建模块，不读取文件、不读 `ResourceSnapshotStore`、不触发 reload；`ResourceManager` 不构造最终 system prompt，只发布结构化资源素材。
+- `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中取得 `PromptResourceView`，再汇合 tool/model/agent/environment/policy views 调用 `prompt::begin_turn(...)`。
+- `Prompt` 是无状态组装深模块，不读取文件、不读 `ResourceSnapshotStore`、不触发 reload；`ResourceManager` 不构造最终 prompt，只发布 captured resource view。Prompt 生成 immutable `PromptTurn`，并负责 intent 展开与 final model-input projection。
 - Command 体系收敛为共享无状态 `CommandManager` + `SessionRuntime` 持有的 session-scoped `Command` facade；`CommandSurface` 只保留为领域总称。
 - command manifest 使用多层 JSON，运行时临时 materialize 成 flat catalog；动态命令节点通过 provider + `nodeTemplate` 生成，skill、prompt template、model thinking levels、tools 等都可作为 dynamic command nodes。
 - 协议层 `agent_runtime_protocol::Command` 改名为 `agent_runtime_protocol::AgentCommand`；`Command` 短名留给 command 子系统。UI 只能提交 `ExecuteCommandText` 或 `ExecuteCatalogCommand`，不能通过 command result/output 携带完整 runtime mutation command。
@@ -96,7 +96,7 @@ LoadedSessionRuntimes
 - 不是 UI store。
 - 不是 session index。
 - 打开 workspace 后默认 `active_session = None`。
-- `/resume` / GUI sidebar 通过 `ListSessions` 查询 `SessionIndex`。
+- `/resume` handler 与 GUI sidebar 复用 `SessionManager.list_sessions(...)`；GUI/SDK 入口使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
 
 ### BR-002
 
@@ -655,7 +655,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 本轮 grilling 已确认：BR-008 的核心不是 `DriverHost` / `SessionDriverHost` 是否存在，而是 `DriveRequest` 不应携带完整 `TurnState`。`DriverHost` 限制的是 driver 回调外部能力时能访问什么；`DriveRequest` 限制的是 driver 一开始被喂进来什么。只要 `DriveRequest { turn_state: TurnState }` 存在，`Driver` 就仍可见 `TurnResourceSnapshot`、resource revision、context usage 和工具治理状态，seam 仍然过宽。
 
-设计收敛为：`SessionRuntime` 继续拥有完整 `TurnState`，run 启动时只投影 `DriverTurnInput` 放进 `DriveRequest`。`DriverTurnInput` 只包含 `model`、`system_prompt`、`active_tool_schemas`、`thinking_level` 和 `stream_options`；不包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态。turn resources 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。
+设计收敛为：`SessionRuntime` 继续拥有完整 `TurnState`，run 启动时只投影 `DriverTurnInput` 放进 `DriveRequest`。ADR 0017 进一步把该类型收窄为 `model`、原子 `PromptCallProfile`、`thinking_level` 和 `stream_options`；system prompt 与 active tool schemas 不再独立 patch。`TurnResourceSnapshot`、完整 `PromptTurn`、resource revision、context usage、queue/storage 或工具治理状态不跨 seam；turn resources 留在 per-run `SessionDriverHost` 中。
 
 已同步完成：`driver.md`、`session-runtime.md`、`model-gateway.md`、`resource-manager.md`、`skills.md`、ADR 0011、ADR 0013、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-008 已标记为 Resolved。由于 `CONTEXT.md` 同时新增了 `TurnState` 词条，BR-017 也已标记为 Resolved。
 
@@ -687,8 +687,40 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 ## BR-014 Running compact 延后执行语义收敛进展
 
-本轮确认：手动 `/compact` 不能隐式 abort 当前 run，但 running 时也不必直接拒绝。设计收敛为新增 `CommandPhasePolicy::DeferUntilPostRun`：idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，由 `SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 不受影响。
+本轮确认：手动 `/compact` 不能隐式 abort 当前 run，但 running 时也不必直接拒绝。该语义现统一命名为 `CommandRunPolicy::QueueAfterRun`：idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，由 `SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 不受影响。早期 `CommandPhasePolicy::DeferUntilPostRun` 名称已由 ADR 0016 替换。
 
 pending compact 是结构化 post-run action，不是 follow-up/next-turn message，不进入模型上下文。它通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露；当前 work chain terminal facts 和 save point 完成后，在 follow-up/next-turn 之前执行。required overflow recovery / immediate retry 优先，manual compact 优先于 threshold auto compaction；manual 已执行时跳过重复 auto compaction。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`command-surface.md`、`session-runtime.md`、`compaction.md`、`implementation-roadmap.md`、`architecture.md`、`modules/README.md`、`CONTEXT.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-014 已标记为 Resolved。
+
+## BR-028 Prompt delivery 与 command run policy 收敛进展
+
+本轮参考 pi 与 Codex 的运行中输入分流后确认：不建立通用 `InputSchedule` 服务。模型可见输入统一使用 `PromptDelivery { Steer, FollowUp, NextTurn }`，删除独立 `Steer` / `FollowUp` / `NextTurn` protocol command；普通 prompt、skill、prompt template 和 prompt-producing slash command 全部归一到 `SessionRuntime.admit_prompt_intent(...)`。
+
+slash/catalog command 自身使用正交的 `CommandRunPolicy { Immediate, IdleOnly, QueueAfterRun }`。`/status` 等 query 在 active work 中立即执行并异步输出到 message panel；`/compact` 映射为 typed `PendingSessionAction::Compact`；`/skill` 等 prompt-producing command 先 resolve 成结构化 prompt intent，再按调用方的 `PromptDelivery` 调度。raw slash text 不进入消息队列或 pending action。
+
+已同步完成：`CONTEXT.md`、ADR 0016、`agent-runtime-protocol.md`、`agent-runtime-events.md`、`agent-runtime.md`、`command-surface.md`、`session-runtime.md`、`compaction.md`、`runtime-hooks.md`、`architecture.md`、`modules/README.md`、`implementation-roadmap.md` 和 round2 review issue。BR-028 已标记为 Resolved。
+
+## Prompt 子系统收敛进展
+
+本轮在 BR-015 / BR-016 和 PromptDelivery 基础上继续 grilling，确认旧的“`prompt.rs` 只返回 system prompt 字符串、SessionRuntime 手工展开 skill/template、Driver 分别接收 system prompt/tool schemas”会把最终模型输入组装分散到多个 owner。设计已收敛为无状态 Prompt 深模块，而不是 workspace-global `PromptManager` 或长期 `ContextManager`。
+
+当前结论：
+
+- `SessionRuntime` 是 Pull Master：在目标 delivery boundary 捕获 `TurnResourceSnapshot`，汇合 tool/model/agent/environment/policy views，调用 `prompt::begin_turn(...)` 创建 immutable `PromptTurn`。
+- `PromptResourceView` 是 captured snapshot 的只读窄投影，复用 ResourceManager canonical `ResourceKey`、source info、content hash 和 revision；Prompt 不建立第二套 registry、overlay 或 reload 逻辑。
+- `PromptTurn.resolve_intent()` 是 skill/template 正文进入 user message 的唯一组装入口。active Steer 使用 active `PromptTurn`；FollowUp、NextTurn 和 idle submission 使用 future `PromptTurn`。
+- system prompt 与 active tool schemas 绑定为原子 `PromptCallProfile`，跨 Driver seam 只能整体替换；`DriverTurnInput` 不再暴露两个独立 patch 字段。
+- 每次模型调用区分 durable history、protected current input、CurrentRun context 和 CurrentCall context；最终统一生成 `ModelInputProjection`，并校验 tool call/result、required contribution、dedup、budget、persistence 和 fingerprint。
+- Compaction 只重建 durable history；current input late-bind 到压缩后的 history，不能在首次调用前被摘要。
+- 动态 RAG/memory/IDE context 使用带 source、content hash、persistence 和 requirement 的 typed `ContextMaterial`。项目文件、skills/templates 仍必须经 ResourceManager snapshot。
+- `before_next_model_call` 返回组合式 `NextModelCallPlan`，可同时处理 persistent steer、完整 prompt profile、model options、CurrentRun/CurrentCall context 和 abort/suspend 控制。
+- 当前不实现 Prompt cache、Context graph 或 ContextManager。未来只有出现多个异步 context provider、跨 call working set、动态 token budget 和后台 distillation 后，才考虑不拥有 durable history 的 session-scoped `ContextWorkspace`。
+
+新增 `docs/modules/prompt-templates.md` 关闭 BR-016；新增 ADR 0017 记录 immutable turn assembly 与拒绝长期 Manager 的取舍。旧 `fda22a6` 中“Prompt 是纯 system prompt builder”的边界已被本轮设计深化：纯计算和不反向读取 ResourceManager 的原则保留，但 Prompt 的职责扩展为完整的 intent/system/context/model-input 组装 seam。
+
+后续清理删除了已明显滞后的集中式 `docs/implementation-roadmap.md`。实现顺序不再作为行为事实来源；各模块文档、AgentRuntimeProtocol、AgentRuntimeEvents 和 ADR 是长期权威。BR-020 的 assistant lifecycle 由事件文档固定；BR-021 将 `persistence_save_point` 收敛为按可恢复 write batch 产生的 durable barrier，text-only run 至少包含 user-message 与 final run-result 两个 save point，tool round 可增加额外 barrier。abort/failure 的补偿和 orphan tool protocol repair 仍留给 BR-024。
+
+BR-022 随后完成术语纯度清理。本轮仅提升文档表达，不改变架构：当前流程全部改用 MiniCore 自身术语解释；pi、Codex、LangChain 等只保留为明确标注的设计参考对象，不构成兼容承诺。外部历史类名和私有调用链已从架构入口与模块现行流程删除；ADR 继续保存必要的历史取舍。
+
+BR-023 通过 ADR 0018 关闭。`AgentRuntime` 现在明确提供 Command、Query、Event 和 Snapshot 四种能力；新增按 runtime/session/settings/resources/command surface/models/usage/diagnostics 分组的可扩展 `RuntimeQuery` 框架。query 只读并直接返回 `QueryResponse`，不经过 `CommandAck` 或 event stream；GUI sidebar、settings、资源详情和 usage 等程序化读取使用 Query，`/status` / `/usage` 等用户命令继续使用 command output。

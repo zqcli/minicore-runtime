@@ -32,33 +32,15 @@ SessionRuntime
 - 压缩要走模型凭据、summary prompt、abort 和 auto retry，这些属于 `SessionRuntime` 和 `ModelGateway`。后期启用 hook system 时，压缩 hook 仍由 `SessionRuntime` 在压缩安全点调用。
 - Rig `AgentRun` 可序列化，但序列化状态包含已累积的 conversation。压缩后继续 resume 旧 `AgentRun` 不能减少下一次 model input；压缩后应从重建后的 session context 启动新的 `DriveEntry::Continue`。
 
-## 来自 pi 的生产经验
+## 设计原则
 
-pi 的压缩路径是：
+- `Compaction` 只负责 token estimate、cut point、summary instructions/material 和结果类型。
+- `SessionRuntime` 负责 manual/auto orchestration、phase、abort、模型调用、事件和 post-run 顺序。
+- `SessionHandle` / `SessionStorage` 负责追加 compaction entry 和重建 root-to-leaf context。
+- `Driver` / Rig Agent loop 不拥有压缩；overflow recovery 后从重建上下文启动新的 continuation。
+- running 时提交的 `Compact` defer 到 post-run safe point，不隐式 abort active run。
 
-```text
-AgentSession
-  owns manual/auto compaction orchestration
-
-core/compaction
-  owns token estimate, cut point, summary prompt, summary generation helpers
-
-SessionManager
-  owns appendCompaction + buildSessionContext
-
-agent-loop / Agent
-  does not own compaction
-```
-
-关键行为：
-
-- pi 的 `AgentSession.compact()` 会 abort 当前 agent，发 `compaction_start`，读取 `SessionManager.getBranch()`，调用 `prepareCompaction()`，允许 extension 在 `session_before_compact` hook 中取消或提供摘要，然后 `appendCompaction()`，最后 `buildSessionContext()` 并写回 agent state。MiniCore 只借鉴压缩准备和上下文重建，不沿用进程内 API 的隐式 abort：公开 `Compact` 在 running 时必须 defer 到 post-run safe point。
-- `_checkCompaction()` 在 agent run 结束后或提交新 prompt 前检查 threshold 和 overflow。
-- `_runAutoCompaction()` 处理自动压缩、context overflow recovery、`willRetry` 和事件。
-- `core/compaction` 的职责是纯压缩逻辑与摘要生成；源码注释明确说 session manager handles I/O, after compaction session is reloaded。
-- `SessionManager.buildSessionContext()` 消费最新 compaction entry，把摘要消息放在重建上下文最前面，然后接上被保留的旧消息和压缩后的新消息。
-
-pi 的模型可见压缩消息不是 system prompt，而是一个 user-role summary message：
+pi coding-agent、LangChain 等实现可以作为摘要格式和 cut-point 行为的参考对象，但不构成 API、事件顺序或隐式 abort 行为的兼容承诺。MiniCore 的模型可见压缩消息固定为 user-role summary message：
 
 ```text
 The conversation history before this point was compacted into the following summary:
@@ -68,7 +50,7 @@ The conversation history before this point was compacted into the following summ
 </summary>
 ```
 
-本项目沿用这个方向。
+该摘要替代 durable history 的较早部分，不进入 system prompt。
 
 ## 其他项目参考
 
@@ -363,14 +345,14 @@ entry 101..end  normal messages after compaction
 模型实际看到：
 
 ```text
-system: {prompt::build_system_prompt(...)}
+system: {PromptTurn.profile.system_prompt}
 user:   The conversation history before this point was compacted into the following summary:
         <summary>...</summary>
 ...     kept messages from first_kept_entry_id onward
 ...     messages after compaction
 ```
 
-压缩摘要进入 `TurnState.messages`，不进入 `TurnState.system_prompt`。
+压缩摘要进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。
 
 推荐内部消息类型：
 
@@ -405,10 +387,24 @@ MessageRecord::CompactionSummary(m) => ModelMessage::User {
 
 理由：
 
-- user-role summary 最接近 pi 和 LangChain 的做法。
-- 它是 conversation history 的替代物，不是长期行为规则，因此不应进入 system prompt。
-- system prompt 仍由 `prompt.rs` 每次重建，避免 Pydantic AI 提到的 system prompt round-trip 问题。
+- user-role summary 明确表达它是 conversation history 的替代物，而不是长期行为规则，因此不应进入 system prompt。
+- system prompt 仍由目标 turn 的 `PromptTurn` 从 captured resources 和 typed views 构建，避免 Pydantic AI 提到的 system prompt round-trip 问题。
 - UI 可以把 `CompactionSummaryMessage` 渲染为折叠块，但模型看到的是明确标签包裹的摘要。
+
+## Current Input 保护
+
+Prompt 子系统把 durable history、current/protected input 与 transient context 分开。Compaction 只对 durable session path 选择 cut point；刚被接收、即将触发本次 Agent run 的 current input 必须 late-bind 到压缩后的 history 之后，不能在同一启动边界被摘要或截断。
+
+```text
+history before current input
+  → compact if needed
+  → rebuild summary + retained suffix
+  → append protected current input for ModelInputProjection
+```
+
+如果 current input 已先作为 session entry 持久化，`SessionRuntime` 仍必须按 entry id 把它从本次 compaction candidate 中排除，并作为 `ModelCallProjectionInput.current_input` 单独传递。consumed Steer 同理：只有进入 Rig/run history 后才成为后续 durable history。
+
+RAG、memory、IDE diagnostics 等 `CurrentCall` context 不进入 compaction source；`CurrentRun` context 是否摘要必须由其 owner 显式升级为 durable entry，不能由 Compaction 猜测。
 
 ## 手动压缩流程
 
@@ -439,7 +435,7 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → phase = idle
 ```
 
-手动 `Compact` 使用 `CommandPhasePolicy::DeferUntilPostRun`。它绝不隐式 abort 当前 run，也不清理 pending approval、resume state 或消息队列。pending compact 是 `SessionRuntime` 持有的结构化 action，不是 follow-up/next-turn message；执行优先级高于普通 queued continuation。
+手动 `Compact` 使用 `CommandRunPolicy::QueueAfterRun`。它绝不隐式 abort 当前 run，也不清理 pending approval、resume state 或消息队列。pending compact 是 `SessionRuntime` 持有的结构化 action，不是 follow-up/next-turn message；执行优先级高于普通 queued continuation。
 
 同一 session 同时只允许一个 pending manual compact。重复请求返回 `CompactAlreadyQueued`，保留第一次请求的 instructions；已处于 compaction phase 时返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会清除 pending compact。普通 run failure 如果不再 retry，仍会执行已经排队的 compact。
 
@@ -459,7 +455,7 @@ Driver returns DriveResult::Completed
   → run_auto_compaction(reason = Threshold, will_retry = false)
 ```
 
-threshold 压缩成功后不自动重跑刚完成的回答；如果 follow-up/steering/next-turn queue 有消息，压缩后再启动 `DriveEntry::Continue` 或下一次 prompt。
+threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steering continuation / follow-up 有消息，压缩后再启动 `DriveEntry::Continue` 或下一次 prompt。next-turn queue 保留到下一次显式 prompt，不自动启动 run。
 
 如果 post-run safe point 已有 pending manual compact，先执行 manual compact，并跳过同一 safe point 的 threshold auto compaction，避免连续生成两次摘要。context overflow recovery / immediate retry chain 优先于 pending manual compact；等当前 work chain 稳定结束后再执行用户排队的压缩。
 
@@ -478,7 +474,7 @@ Driver returns DriveResult::Failed { error: ContextOverflow, messages }
        emit `compaction_finished` with recovery failure and stop
 ```
 
-因为本项目使用 append-only session storage，不能像 pi 那样只从 mutable `agent.state.messages` 中移除错误消息。若要把 overflow assistant error 保存在 session 里，必须显式标记它不参与模型上下文：
+因为本项目使用 append-only session storage，不能依赖从临时内存消息数组中移除错误消息来改变持久化历史。若要把 overflow assistant error 保存在 session 里，必须显式标记它不参与模型上下文：
 
 ```rust
 pub enum ContextVisibility {
