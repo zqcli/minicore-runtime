@@ -29,8 +29,9 @@ Rig AgentRunStep::CallTools
   -> DriverHost::invoke_tool_batch(...)
   -> SessionRuntime / SessionDriverHost
   -> Tools::invoke_batch(...)
-  -> ToolBatchResult
-  -> Driver
+  -> Result<ToolBatchResult, ToolBatchError>
+  -> SessionRuntime commits complete ToolRound
+  -> Driver receives committed ToolBatchResult or typed ToolBatchHostError
   -> AgentRun::tool_results(...)
 ```
 
@@ -50,7 +51,7 @@ SessionRuntime::start_run
 
 直接 `impl DriverHost for SessionRuntime` 是合法的最小实现；`SessionDriverHost` 不是额外 runtime，也不拥有 session state。它只是一次 `drive_run()` 期间把 `SessionRuntime` 的一小片能力借给 `Driver` 的 adapter。
 
-`Tools` 不直接发布 UI event，不写 session storage，不调用 `ModelGateway`，不读取 `ResourceManager`，不构建最终 system prompt。所有工具内部 update 通过 `ToolUpdateSink` 返回，由 `SessionRuntime` 归约成 `agent_runtime_protocol::EventMsg::ToolCall(...)`、snapshot projection 和 session writes。
+`Tools` 不直接发布 UI event，不写 session storage，不调用 `ModelGateway`，不读取 `ResourceManager`，不构建最终 system prompt。所有工具内部 update 通过 `ToolUpdateSink` 返回，由 `SessionRuntime` 归约成 `agent_runtime_protocol::EventMsg::ToolCall(...)`、snapshot projection，并在完整 round 结束后组装 `SessionWritePurpose::ToolRound` batch。
 
 ## 理由
 
@@ -72,7 +73,7 @@ SessionRuntime::start_run
 正面后果：
 
 - `Driver` 更深，只依赖 `DriverHost` seam，不持有 provider、tools、queue 或 persistence。
-- `SessionRuntime` 是唯一能把工具 update 归约为 UI event 和 session writes 的 owner。
+- `SessionRuntime` 是唯一能把工具 update 归约为 UI event，并通过 `SessionWriter` 提交完整 tool round 的 owner。
 - pending approval 可以通过 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 恢复，同时冻结的 `prepared_args` 不进入 snapshot/event/log。
 - 批量工具调用可以通过 `ToolCallIndex` 稳定回填，parallel 执行可乱序完成但对模型结果顺序稳定。
 - `ToolPolicy` 可保持纯判断器；preview、canonicalization、sandbox check 由 planner 负责。

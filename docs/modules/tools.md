@@ -53,14 +53,15 @@ LLM returns tool calls
   -> SessionRuntime / SessionDriverHost
   -> Tools::invoke_batch(...)
   -> ToolExecutor
-  -> ToolBatchResult
-  -> Driver
+  -> Result<ToolBatchResult, ToolBatchError>
+  -> SessionRuntime commits complete Ok result as ToolRound
+  -> only committed ToolBatchResult returns to Driver
   -> AgentRun::tool_results(...)
 ```
 
 `Driver` 不直接依赖 `Tools`，也不直接执行工具。它只知道 `DriverHost` 能返回一批 tool results。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper，把 `ToolBatchRequest` 补上 session/run/cwd/turn context 后交给自己的 `Tools`。
 
-`Tools` 可以通过 `ToolUpdateSink` 返回内部工具更新，例如 proposed、approval requested、started、output delta、finished；这些不是 UI event。`SessionRuntime` 负责把它们归约为 `agent_runtime_protocol::EventMsg::ToolCall(...)`、session writes、snapshot projection 和 save point。
+`Tools` 可以通过 `ToolUpdateSink` 返回内部工具更新，例如 proposed、approval requested、started、output delta 和 result-ready；这些不是 UI event。result-ready 是 `ToolAfterExecute` 后的候选值，仍需由 `SessionRuntime` 应用 `ToolResultBeforeCommit` 并重新校验；只有最终值才能发布为 `tool_call_finished` 并进入 `ToolRound`。
 
 ## 模块结构
 
@@ -164,7 +165,7 @@ impl Tools {
         context: ToolRunContext,
         sink: ToolUpdateSink,
         cancel: CancellationToken,
-    ) -> ToolBatchResult;
+    ) -> Result<ToolBatchResult, ToolBatchError>;
 
     pub fn set_active_tools(&mut self, names: &[ToolName]) -> ToolSetChange;
     pub fn prompt_view(&self) -> ToolPromptView;
@@ -174,7 +175,14 @@ impl Tools {
     pub fn set_approval_mode(&mut self, mode: ToolApprovalMode);
     pub fn approval_mode(&self) -> ToolApprovalMode;
 }
+
+pub enum ToolBatchError {
+    Cancelled,
+    Failed { error: ToolSubsystemError },
+}
 ```
+
+`Ok(ToolBatchResult)` 只表示每个 requested call 都已有按 `call_index` 排列的 actual/error result，可以进入 `ToolRound` commit。unknown tool、policy denied、approval rejected、schema invalid 和普通 executor failure 都归约为 `Ok` 中的 error result；abort/cancel 返回 `Err(ToolBatchError::Cancelled)`，infra/hook invariant failure 返回 `Failed`。`Err` 路径中的已完成单项结果只可用于当前 host diagnostics/progress，不能拼成 partial `ToolRound`。
 
 `SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令，并调用 `Tools` 的对应接口。
 
@@ -452,18 +460,21 @@ Rig AgentRunStep::CallTools { calls }
           → ToolApprovalBroker waits if required
           → approval 后冻结 prepared_args
       → ToolExecutionCoordinator executes allowed prepared invocations
-          → SessionRuntime sink receives tool_call_started / output_delta / finished
+          → SessionRuntime sink receives tool_call_started / output_delta
           → ToolExecutor.execute(ctx, updates, cancel)
           → normalize output into ToolInvocationResult
           → future RuntimeHookRegistry.invoke(ToolAfterExecute)
-          → future RuntimeHookRegistry.invoke(ToolResultBeforeAppend)
       → sort ToolInvocationResult by call_index
-      → return ToolBatchResult
+      → return Ok(ToolBatchResult) only when every call has a result
+      → return Err(Cancelled | Failed) for incomplete batch
+  → SessionRuntime may invoke ToolResultBeforeCommit on result drafts
+  → SessionRuntime revalidates call ids/order/redaction and emits tool_call_finished
+  → SessionRuntime commits complete ToolRound batch
   → Driver maps ToolBatchResult -> Rig tool result content
   → AgentRun::tool_results(results)
 ```
 
-错误原则：除 abort/cancel 外，未知工具、未启用工具、schema invalid、policy denied、approval rejected、executor failed 都应变成 error tool result，而不是让 run 崩溃。任何已经进入会话历史的 assistant tool call，最终都必须有对应 tool result，避免下次 provider 请求出现 unresolved tool call。
+错误原则：除 abort/cancel 外，未知工具、未启用工具、schema invalid、policy denied、approval rejected、executor failed 都应变成 error tool result，而不是让 run 崩溃。assistant tool-call message 与整批实际/error tool results 只有在全部结果归约完成后才作为一个 `ToolRound` 写入会话，因此 committed history 不会出现 unresolved tool call。
 
 ## LLM 如何知道工具
 
@@ -519,8 +530,8 @@ UI 本地化只能改变 `label`，不能改变 LLM 可调用的 canonical tool 
 | MCP / extension tools 后续扩展 | `registry.rs` / `executor.rs` | 注册为 `RegisteredTool` 后走同一路径 |
 | tool progress / output streaming | `events.rs` + `ToolUpdateSink` | Tools 不直接发 UI event |
 | 工具错误不崩 run | `executor.rs` / `coordinator.rs` | 非 abort 转 error tool result |
-| abort/cancel 传播 | `invoke_batch(..., cancel)` | approval wait 和 executor 都要响应 cancel |
-| unresolved tool call 避免会话带毒 | `coordinator.rs` + session persistence | 每个已持久化 tool call 最终必须有 tool result |
+| abort/cancel 传播 | `invoke_batch(..., cancel)` | approval wait 和 executor 都要响应 cancel；未完成 batch 不持久化 |
+| unresolved tool call 避免会话带毒 | `coordinator.rs` + `SessionWriter` | 完整 assistant tool-call/result round 作为一个 batch 提交；incomplete round 不持久化 |
 | provider parallel tool calls 兼容 | `ModelGateway` 控制，`Tools` 处理 batch | 模型是否吐多个 calls 与本地执行分离 |
 
 ## MVP 策略

@@ -1,0 +1,7 @@
+# 会话写入使用统一可信的 batch writer
+
+MiniCore 中已创建会话的所有领域 mutation 都通过 `SessionWriter.commit(SessionWriteBatch)` 完成。session header 只由 storage factory 在 `SessionHandle` 暴露前原子初始化，不是第二条运行时写入通道。成功返回表示整个 batch 已按 storage adapter 的进程崩溃恢复契约写入，失败表示该 batch 不得出现在恢复投影中；`SessionRuntime`、`Driver`、`Tools` 和 command handler 都不能绕过这个 seam 直接追加 entry。
+
+持久化只接收协议完整、可以独立恢复的稳定单元：user input、完整 assistant tool-call 与其全部 tool results、最终 assistant message、compaction、独立 session mutation 和 tree mutation。tree mutation 只能移动到 committed append batch 的边界，不能把多-entry tool round 切成 partial history。streaming delta、partial assistant、pending approval、执行中的 tool round 和其他 `CurrentRun` 状态只保留在内存；abort、failure 或 host crash 后恢复最后一个成功提交的 batch，不补 synthetic tool result，也不恢复中断中的 run。同一 session 的 actor ordering 决定 abort 与 commit 的先后；commit 一旦开始不接受 run cancellation；graceful abort/close/shutdown 等待其得到确定结果，强制退出则按 crash recovery 处理。
+
+公共协议不再发布 `persistence_save_point`。需要持久化的领域事实在 `commit()` 成功、runtime-owned required projections 应用后才发布对应事件；后期备份、telemetry 和可重建 cache 可以消费内部 `AfterSessionCommit` observer。observer 失败不能回滚已提交事实或阻止领域事件。MVP 不引入 `SessionRevision`：`CommittedSessionBatch` 返回 entry ids 与 current leaf 即可。JSONL adapter 必须一行编码一个完整 batch，加载时只忽略因进程中断造成的末尾不完整行；该契约不承诺断电级 durability，也不承诺工具副作用与 session 文件的 exactly-once 原子性。

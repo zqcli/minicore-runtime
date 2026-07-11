@@ -331,6 +331,12 @@ pub struct ProviderResponseSummary {
 错误分类使用 MiniCore taxonomy，禁止上层解析 provider 字符串：
 
 ```rust
+pub struct ModelCallError {
+    pub kind: ModelCallErrorKind,
+    pub message: String, // redacted, provider-neutral
+    pub retry_after: Option<Duration>,
+}
+
 pub enum ModelCallErrorKind {
     AuthMissing,
     AuthInvalid,
@@ -345,7 +351,7 @@ pub enum ModelCallErrorKind {
 }
 ```
 
-`SessionRuntime` 根据 `ModelCallErrorKind::ContextOverflow` 触发 overflow compaction recovery；根据 transient 分类决定 retry。它不解析 Rig/provider error 文本。
+`ModelGateway.call_model(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`SessionRuntime` 根据 `ModelCallErrorKind::ContextOverflow` 触发 overflow compaction recovery；根据 transient 分类决定 retry。它不解析 Rig/provider error 文本。
 
 ## 调用生命周期
 
@@ -380,13 +386,13 @@ AgentCommand::SetModel { provider_id, model_id }
   → SessionRuntime checks CommandRunPolicy / session phase guard
   → ProviderRegistry.resolve(ModelSelection)
   → clamp thinking/options against ModelCapabilities
+  → batch = SessionWriteBatch::session_mutation([ModelChangeDraft(selection)])
+  → SessionHandle.commit(batch)
   → ModelState.selected = selection
-  → SessionHandle.append_model_change(provider_id, model_id)
   → emit session_model_changed
-  → persistence_save_point
 ```
 
-如果当前 run 正在进行，MVP 可以拒绝切换；完整版本可写入 pending session writes，并在 `before_next_model_call` 安全点 patch future model call。运行中的 provider request 不被中途替换。
+如果当前 run 正在进行，MVP 可以拒绝切换；完整版本可保存 typed pending session mutation，并在 `before_next_model_call` 安全点先 commit 对应 `SessionMutation` batch，再 patch future model call。运行中的 provider request 不被中途替换。
 
 ### SubmitPrompt
 
@@ -461,7 +467,7 @@ AfterProviderResponse
   observer; status code, request id, allowlisted headers only
 
 ProviderUsageNormalized
-  observer; receives ModelCallUsage / source / purpose
+  observer; receives sanitized `PersistedModelCallUsage`; no `raw_provider_usage`
 ```
 
 `BeforeProviderPayload` 是最高风险 hook。除非 Rig adapter 能提供不含 auth headers 的安全 payload，并且 MiniCore 愿意把该 payload shape 作为受控内部扩展契约，否则不得开放 raw provider payload patch。后期若先接入模型 hook，也应先接 provider-neutral `BeforeModelCall`。
@@ -483,7 +489,7 @@ SessionRuntime
   → RuntimeSnapshot.active_session.session_stats / context_usage
 ```
 
-`ModelCallUsage.raw_provider_usage` 如果保留，只能作为 internal redacted diagnostic，不进入 `AgentRuntimeProtocol`，不进 session JSONL，不进 hook context。
+`ModelCallUsage.raw_provider_usage` 如果保留，只能作为 internal redacted diagnostic，不进入 `AgentRuntimeProtocol`，不进 session JSONL，不进 hook context。写入 stable batch 前必须转换为 [UsageStats](usage-stats.md) 定义的 `PersistedModelCallUsage`；writer 不接受 runtime `ModelCallUsage` 的 raw shape。
 
 `ModelGateway` 不发布 UI event。模型文本 delta 通过 `ModelStreamSink` 进入 `DriverEvent`，再由 `SessionRuntime` 归约为 `message_assistant_*` 和 `usage_updated`。
 
