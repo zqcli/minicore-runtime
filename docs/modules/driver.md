@@ -67,21 +67,9 @@ Rig 拥有：
 
 本项目选择第二种。原因是桌面 Agent 需要工具审批、工作区沙箱、运行时事件、pending approval、abort、session writes、mutation queue 和暂停恢复。若直接交给 Rig 高阶 runner 自动执行工具，这些产品级控制会被迫塞进 Rig tool wrapper，边界会变浅。
 
-## 来自 pi agent-loop 的等价经验
+## Run 编排职责
 
-pi `agent-loop` 的产品路径可以抽象成：
-
-```text
-runAgentLoop / runAgentLoopContinue
-  → call model through streamFn
-  → detect tool calls
-  → execute tools through product tool definitions and future hooks
-  → append tool results
-  → call prepareNextTurn safe point
-  → drain steering/follow-up queues at safe points
-```
-
-本项目中这些职责拆为：
+MiniCore 将底层 Agent 状态推进、I/O 适配和产品级状态分开：
 
 ```text
 Rig AgentRun
@@ -128,8 +116,7 @@ pub struct DriveRequest {
 
 pub struct DriverTurnInput {
     pub model: ModelSelection,
-    pub system_prompt: String,
-    pub active_tool_schemas: Vec<ToolSchema>,
+    pub prompt: PromptCallProfile,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
 }
@@ -141,7 +128,7 @@ pub enum DriveEntry {
 }
 ```
 
-`DriverTurnInput` 是 `TurnState` 的窄投影，不是新的状态 owner。它只包含 `Driver` 构造 `ModelCallRequest` 和初始化/继续 Rig `AgentRun` 所需的模型可见输入与模型调用选项。它不能包含 `Arc<TurnResourceSnapshot>`、`ResourceRevision`、`ContextUsageView`、session storage、queue state、`Tools` 内部状态、executor handle、policy/approval state 或 `ResourceManager` handle。
+`DriverTurnInput` 是 `TurnState` 的窄投影，不是新的状态 owner。它只包含 `Driver` 推进 Rig、生成最终 `ModelInputProjection` 和构造 `ModelCallRequest` 所需的模型选择、原子 `PromptCallProfile` 与模型调用选项。它不能包含 `PromptTurn`、`Arc<TurnResourceSnapshot>`、`ResourceRevision`、`ContextUsageView`、session storage、queue state、`Tools` 内部状态、executor handle、policy/approval state 或 `ResourceManager` handle。
 
 `SessionRuntime` 仍然拥有完整 `TurnState`。run 启动时它从 `TurnState` 投影出 `DriverTurnInput` 放进 `DriveRequest`，同时把 `TurnState.resources` 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。这样 `Driver` 的主输入 seam 不会泄漏资源 snapshot。
 
@@ -184,7 +171,7 @@ pub trait DriverHost {
     async fn before_next_model_call(
         &mut self,
         checkpoint: TurnCheckpoint,
-    ) -> Result<NextModelCallDecision, RuntimeError>;
+    ) -> Result<NextModelCallPlan, RuntimeError>;
 
     async fn before_run_finish(
         &mut self,
@@ -345,7 +332,9 @@ fn handle_done_step(...)
 模型侧：
 
 ```rust
-fn build_model_call_request(prompt, history, rig_turn, driver_turn_input)
+fn apply_next_model_call_plan(...)
+fn project_model_input(prompt, history, profile, context_materials)
+fn build_model_call_request(projection, model_options)
 async fn call_model_gateway(...)
 fn assemble_model_turn(...)
 fn feed_model_response_to_rig(...)
@@ -381,7 +370,10 @@ reload_tools           // 工具生命周期不属于 driver
 
 ```text
 AgentRunStep::CallModel { prompt, history, turn }
-  → build_model_call_request(prompt, history, turn, request.turn)
+  → apply current NextModelCallPlan
+  → prompt::project_model_call(history, prompt, DriverTurnInput.prompt, context materials)
+  → validate ModelInputProjection
+  → build_model_call_request(projection, request.turn model/options)
   → host.call_model(request, ModelStreamSink, cancel)
       → provider/model gateway handles credentials, future hooks, payload, fallback
       → ModelStreamSink emits model/assistant deltas as DriverEvent
@@ -391,7 +383,7 @@ AgentRunStep::CallModel { prompt, history, turn }
 
 `Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
 
-`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能从 `DriverTurnInput` 复制 `ModelSelection { provider_id, model_id }`、system prompt、active tool schemas、thinking level 和 stream options，并结合 Rig step 提供的 prompt/history 生成 provider-neutral request；Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认为空并交给模型默认值。它不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
+`ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 只能把 Rig step 的 prompt/history、当前 `PromptCallProfile` 和 safe-point context materials 交给 Prompt，得到已校验的 `ModelInputProjection`；随后从 projection 复制 system prompt/messages/tools/output contract，并从 `DriverTurnInput` 复制 `ModelSelection`、thinking level 和 stream options。Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认由 output contract 或模型设置决定。Driver 不能读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 request。完整请求结构见 [ModelGateway](model-gateway.md)。
 
 ## CallTools Step
 
@@ -419,7 +411,7 @@ AgentRunStep::CallTools { calls }
 ```text
 before_next_model_call
   在一次 model response 和 tool results 已经回填后、下一次 CallModel 前触发。
-  SessionRuntime 可决定注入 steering messages、patch future DriverTurnInput、切换模型/思考等级/active tools，或继续原样运行。
+  SessionRuntime 返回组合式 NextModelCallPlan，可同时注入 steering messages、整体替换 PromptCallProfile、patch model options、提供 typed context materials，或 abort/suspend。
 
 before_run_finish
   在 Rig 即将 Done 时触发。
@@ -429,20 +421,21 @@ before_run_finish
 建议类型：
 
 ```rust
-pub enum NextModelCallDecision {
-    Continue,
-    PatchDriverTurnInput(DriverTurnInputPatch),
-    InjectMessages(Vec<MessageRecord>),
-    Abort { reason: String },
-    Suspend { reason: SuspendReason },
-}
-
-pub struct DriverTurnInputPatch {
-    pub model: Option<ModelSelection>,
-    pub system_prompt: Option<String>,
-    pub active_tool_schemas: Option<Vec<ToolSchema>>,
+pub struct NextModelCallPlan {
+    pub control: NextModelCallControl,
+    pub persistent_messages: Vec<MessageRecord>,
+    pub prompt_profile: Option<PromptCallProfile>,
+    pub model_patch: Option<ModelSelection>,
     pub thinking_level: Option<ThinkingLevel>,
     pub stream_options: Option<StreamOptions>,
+    pub current_run_context: Vec<ContextMaterialContribution>,
+    pub current_call_context: Vec<ContextMaterialContribution>,
+}
+
+pub enum NextModelCallControl {
+    Continue,
+    Abort { reason: String },
+    Suspend { reason: SuspendReason },
 }
 
 pub enum FinishDecision {
@@ -454,7 +447,7 @@ pub enum FinishDecision {
 }
 ```
 
-`DriverTurnInputPatch` 只能 patch `DriverTurnInput` 已有字段，不能新增 resources、context usage、queue/storage 或 tool governance state。MVP 可以只实现 `Continue` / `Finish` / `ContinueWithMessages`，但函数名和 enum 应给后续扩展留下空间。
+`NextModelCallPlan` 是一次 safe-point transaction：Driver 先应用 persistent messages，再整体替换可选 `PromptCallProfile` 和 model options，最后把 current-run/current-call materials 交给 Prompt projection。plan 不能携带 resources、context provider handle、queue/storage 或 tool governance state；system prompt 与 tool schemas 不允许作为两个独立 patch 字段。MVP 可以先让 context vectors 为空，但不应退回互斥 decision enum。
 
 ## Error And Abort Semantics
 

@@ -1,19 +1,19 @@
 # MiniCore Agent Runtime
 
-本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它借鉴 pi coding-agent 的 `AgentSessionRuntime` / `AgentSession` 生产路径，把模型调用、会话、资源、工具、`CommandSurface`、事件和持久化编排收敛在 UI 无关的 runtime 中；后期 RuntimeHooks 作为内部扩展点接入；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
+本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它把模型调用、会话、资源、工具、`CommandSurface`、事件和持久化编排收敛在 UI 无关的 runtime 中；后期 RuntimeHooks 作为内部扩展点接入；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
 
 ## 语言
 
 **MiniCore**：
 面向桌面、终端和 CLI/GUI 宿主的轻量级原生 Agent harness runtime core。它承载模型调用、会话、资源、工具、`CommandSurface` 和运行时事件；具体 CLI、TUI、GUI 产品在下游仓库实现。
-_避免_：旧项目代号、pi coding-agent 分支、WebView Agent SDK、下游产品仓库
+_避免_：旧项目代号、外部参考项目分支、WebView Agent SDK、下游产品仓库
 
 **Harness 能力**：
-围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、`CommandSurface` 和 UI 协议；后期包括 RuntimeHooks。它是 MiniCore runtime 的职责，不是 pi-agent-core `AgentHarness` 这个具体历史类。
-_避免_：UI 应用、单纯模型客户端、Rig 高阶 runner
+围绕底层 Agent SDK 提供产品级编排的运行时能力，包括会话阶段、队列、资源加载、工具治理、审批、持久化、事件、上下文压缩、`CommandSurface` 和 UI 协议；后期包括 RuntimeHooks。它是 MiniCore runtime 的职责，不是一个独立的通用 `AgentHarness` 架构层。
+_避免_：UI 应用、单纯模型客户端、Rig 高阶 runner、独立 AgentHarness 模块
 
 **下游终端用户应用**：
-基于 MiniCore 构建的 CLI、TUI 或 GUI 产品仓库，面向普通用户安装使用；用户不应被要求预装 pi、Node.js 或开发工具链。
+基于 MiniCore 构建的 CLI、TUI 或 GUI 产品仓库，面向普通用户安装使用；用户不应被要求预装外部 Agent CLI、Node.js 或开发工具链。
 _避免_：MiniCore core runtime、本地演示、测试 harness
 
 **渲染器**：
@@ -25,7 +25,7 @@ _避免_：前端运行时、浏览器应用
 _避免_：WebView SDK、前端 Agent
 
 **AgentRuntimeProtocol**：
-界面适配器与 Agent 运行时之间的稳定通信协议，由 `agent_runtime_protocol::AgentCommand`、`Event`、`EventMsg`、`RuntimeSnapshot` 和 `CommandAck` 等协议类型组成。`AgentCommand` 表示 UI/host 提交给 `AgentRuntime` 的协议级用户意图，不是 command 子系统本身。
+界面适配器与 Agent 运行时之间的稳定通信协议，由 `AgentCommand` / `CommandAck`、`RuntimeQuery` / `QueryResponse`、`Event` / `EventMsg` 和 `RuntimeSnapshot` 等协议类型组成。Command 表达 mutation 或异步工作，Query 表达只读 typed request/response，Event 表达运行变化，Snapshot 表达带事件水位的恢复读模型。
 _避免_：运行时桥接、直接导入 SDK、UI 回调、command 子系统
 
 **AgentRuntimeEvents**：
@@ -45,7 +45,7 @@ _避免_：通用聊天
 _避免_：模型客户端、API wrapper
 
 **Agent 运行时（`AgentRuntime`）**：
-与 UI 无关的 MiniCore 后端门面，供下游 CLI、TUI 和 GUI 宿主通过协议接入；它接收运行时命令、发布运行时事件、生成 `RuntimeSnapshot`，并管理工作区、会话目录和会话运行时。
+与 UI 无关的 MiniCore 后端门面，供下游 CLI、TUI 和 GUI 宿主通过协议接入；它通过 `dispatch` 接收 mutation/异步工作，通过 `query` 返回只读业务数据，通过 `subscribe` 发布运行变化，通过 `snapshot` 生成恢复读模型，并管理工作区、会话目录和会话运行时。
 _避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
 
 **RuntimeSnapshot**：
@@ -93,11 +93,11 @@ _避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、t
 _避免_：页面切换、替换运行时服务、关闭旧会话
 
 **会话运行时（`SessionRuntime`）**：
-单个会话的产品级 Agent 编排对象，参考 pi coding-agent 的 `AgentSession`；它管理会话阶段、当前运行、中止、等待空闲、队列、模型状态、资源、工具、工具策略、会话写入和 `Driver`。
+单个会话的产品级 Agent 编排对象；它管理会话阶段、当前运行、中止、等待空闲、队列、模型状态、资源、工具、工具策略、会话写入和 `Driver`。
 _避免_：会话管理器、UI 会话状态
 
 **产品级编排能力**：
-从 pi-agent-core 的通用编排对象和 pi coding-agent `AgentSession` 中抽取出的职责，例如阶段、队列、资源、工具、会话写入、中止和事件。它是一组属于会话运行时的能力，不是独立模块。
+围绕一次会话运行所需的阶段、队列、资源、工具、会话写入、中止和事件等职责。它是一组属于会话运行时的能力，不是独立模块。
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
@@ -113,15 +113,15 @@ _避免_：Hook 注册表、Driver、UI adapter、任意调用方
 _避免_：事件总线、插件管理器、工具执行器、会话存储
 
 **会话阶段（`SessionPhase`）**：
-会话运行时当前互斥状态，例如 `idle`、`turn`、`compaction`、`branch_summary` 和 `retry`。阶段用于拒绝不合法命令和保护会话写入顺序。
-_避免_：loading 状态、按钮状态
+会话运行时当前互斥工作状态，封闭为 `Idle`、`Turn`、`Compaction` 和 `RetryBackoff`。`Turn` 可以覆盖 prompt preflight、一个或多个连续 Agent runs、审批等待、可恢复暂停、持久化和 post-run arbitration；它不等于单个 `RunId`。`RetryBackoff` 只表示 Agent run 自动重试前的调度等待，不表示 provider retry 或 compaction 内部重试。
+_避免_：CurrentRunState、branch summary、模型调用状态、loading 状态、按钮状态
 
 **会话**：
 一次工作上下文的持久记录，包含消息、模型变化、思考等级变化、活跃工具变化、压缩摘要、标签、名称和当前叶子位置。
 _避免_：聊天记录、日志文件
 
 **SessionIndex / 会话目录**：
-`SessionManager` 维护的会话轻量清单或索引，用于 `/resume`、GUI sidebar 和 `ListSessions`。它可以从 session 文件 header、metadata 或本地 index/cache 重建，包含 session id、workspace、名称、更新时间、预览和轻量统计；它不是 `RuntimeSnapshot`，也不包含完整消息、运行中状态或 UI 状态。
+`SessionManager` 维护的会话轻量清单或索引，用于 `/resume` 和 `SessionQuery::List`。它可以从 session 文件 header、metadata 或本地 index/cache 重建，包含 session id、workspace、名称、更新时间、预览和轻量统计；它不是 `RuntimeSnapshot`，也不包含完整消息、运行中状态或 UI 状态。
 _避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、事件日志
 
 **会话条目**：
@@ -185,7 +185,7 @@ _避免_：独立技能加载服务、UI 技能解析、工具注册、技能生
 _避免_：独立生命周期 owner、命令列表、直接读当前磁盘文件
 
 **技能调用**：
-用户显式要求使用某个技能的行为。`SessionRuntime` 从 captured `TurnResourceSnapshot.cwd.resolved.skills` 读取 selected `SkillResource.body`，调用 `skills.rs` helper 格式化 `<skill>` 块，并将它作为普通用户消息交给 Agent 运行。
+用户显式要求使用某个技能的结构化提示词意图。目标 turn 的 `PromptTurn` 从 captured `PromptResourceView` 读取 selected `SkillResource.body`，调用 `skills.rs` helper 格式化 `<skill>` 块，并将它作为普通用户消息交给 Agent 运行。
 _避免_：系统提示词注入、工具调用、按 `metadata.file_path` 重新读文件
 
 **运行时资源**：
@@ -201,8 +201,44 @@ _避免_：界面快照、事件日志、会话条目、实时文件视图
 _避免_：资源正文、提示词素材、完整运行时资源
 
 **提示词素材**：
-`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 提供给系统提示词构建器的结构化输入，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终 system prompt；`Prompt` 不能主动读取 `ResourceManager` 或 `ResourceSnapshotStore`，只能消费 `SessionRuntime` 传入的素材。
+`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 投影给 Prompt 的结构化资源输入，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终 system prompt，也不包含工具、agent profile、动态上下文或模型调用契约。
 _避免_：完整 prompt、用户消息、工具描述、实时资源查询
+
+**提示词意图（`PromptIntent`）**：
+尚未展开成模型消息的结构化用户输入，可以引用普通文本、技能、提示模板或它们的组合。队列保存 intent 的稳定资源 key、参数和附件引用，不保存 raw slash command text 或提前展开的资源正文。
+_避免_：用户消息、命令文本、已展开 prompt、PendingSessionAction
+
+**Prompt 子系统**：
+无状态的提示词组装深模块，负责从已捕获和已授权的 typed views 构建 `PromptTurn`、展开 `PromptIntent`，并在模型调用前生成协议安全的 `ModelInputProjection`。它不拥有资源生命周期、会话历史、队列、动态 context provider、工具执行或模型调用。
+_避免_：系统提示词构建器、PromptManager、ContextManager、ResourceManager
+
+**提示词资源视图（`PromptResourceView`）**：
+`ResourceManager` 从 captured `TurnResourceSnapshot` 提供给 `PromptTurn` 的只读窄投影，暴露 prompt materials 与 selected skill/template catalog，并沿用 canonical resource key、source info、content hash 和 revision。它只 pin snapshot，不支持 reload、recompose 或 current-pointer 查询。
+_避免_：资源目录副本、PromptResourceRegistry、实时资源查询
+
+**Prompt turn（`PromptTurn`）**：
+一次 user turn/run 使用的不可变提示词组装值，pin 住 `PromptResourceView`，并包含同版 `PromptCallProfile`、贡献来源和 fingerprint。active Steer 使用当前 `PromptTurn`；FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PromptTurn`。
+_避免_：TurnState、长期 PromptManager、资源快照 owner、会话上下文
+
+**提示词调用配置（`PromptCallProfile`）**：
+一次 Agent 模型调用使用的原子提示词基线，把最终 system prompt、active tool schemas、贡献来源和 fingerprint 绑定在一起。切换模型可见工具或相关 profile 时必须整体替换，不能分别 patch system prompt 与 schemas。
+_避免_：DriverTurnInput、ModelCallRequest、ToolPromptCatalog、provider payload
+
+**上下文素材（`ContextMaterial`）**：
+由 RAG、memory、IDE、issue lookup 或后期 hook 等动态来源成功提供的 typed 模型上下文，带稳定来源、content hash、`Durable | CurrentRun | CurrentCall` 生命周期和 required/optional 要求。项目文件、技能和提示模板不能绕过 `ResourceManager` 伪装成动态素材。
+_避免_：资源快照、无来源字符串、会话历史、系统提示词
+
+**上下文素材贡献（`ContextMaterialContribution`）**：
+一次动态 context 获取的显式结果：`Available(ContextMaterial)` 或带 key/source/persistence/requirement/diagnostic 的 `Unavailable`。required source 失败必须保留为 `Unavailable` 并阻止模型调用；optional 失败进入 projection diagnostics。禁止通过 vector 缺项表达获取失败。
+_避免_：Option<ContextMaterial>、静默跳过、provider future、原始 I/O error
+
+**模型输入投影（`ModelInputProjection`）**：
+Prompt 在一次模型调用前生成的最终 provider-neutral 模型可见输入，包含同一 `PromptCallProfile` 的 system prompt 与 tools、协议安全 messages、output contract、贡献来源和 fingerprint。它区分 durable history、受保护 current input 与 transient context，并且是构造 `ModelCallRequest` 前的唯一组装结果。
+_避免_：ModelCallRequest、provider payload、TurnState、session messages
+
+**输出契约（`OutputContract`）**：
+一次模型调用对输出结构的 provider-neutral 要求，例如 JSON schema、response format 或 required tool choice。它与 prompt text 一起进入 `ModelInputProjection`，但不能靠普通文本替代；真实 provider 映射由 `ModelGateway` 完成。
+_避免_：system prompt、provider payload、显示格式、max output tokens
 
 **CommandSurface**：
 Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令领域面。它不是一个有状态 service 名；实现上由共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` 共同组成。
@@ -211,6 +247,14 @@ _避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop、有�
 **AgentCommand**：
 `agent_runtime_protocol::AgentCommand`，下游 adapter 提交给 `AgentRuntime` 的公开协议命令枚举，例如 `SubmitPrompt`、`ExecuteCommandText`、`ExecuteCatalogCommand`、`DecideToolApproval`、`ReloadResources`。它表达用户意图，不代表 command tree 节点，也不应包含高权限内部 mutation。
 _避免_：command::Command、UI action payload、内部调试 API
+
+**运行时查询（`RuntimeQuery`）**：
+下游 adapter 通过 `AgentRuntime.query(...)` 提交的只读 typed 查询总线，按 runtime、session、settings、resources、command surface、models、usage 和 diagnostics 领域分组。它不创建 turn、不启动 run、不消费 queue、不改变 revision，也不通过事件流广播结果。
+_避免_：AgentCommand、CommandOutput、RuntimeSnapshot、UI 本地 selector、后台 job
+
+**查询响应（`QueryResponse`）**：
+`RuntimeQuery` 的直接 request/response 结果，包含 `as_of_sequence`、可选领域 revision 和 typed `QueryResult`。它不是业务事件，不分配 `CommandId`，transport request id 也不进入领域模型。
+_避免_：CommandAck、EventMsg、RuntimeSnapshot、JSON-RPC envelope
 
 **CommandManager**：
 `WorkspaceServices` 持有的共享、无状态命令管理器。它持有只读 command packs、candidate provider registry 和 handler registry；每次调用时基于传入 `CommandContext` 临时 materialize command catalog，并执行 parse、suggest、`resolve_for_execution`。
@@ -236,6 +280,14 @@ _避免_：资源 loader、文件扫描器、UI autocomplete 函数、任意查�
 用户或 UI 提交给 `ExecuteCommandText` 的文本形式命令。`/...` slash command 是命令文本的一种常见语法；同一 command 也可以来自 `ExecuteCatalogCommand` 的结构化 catalog selection。
 _避免_：普通用户 prompt、shell 命令、Agent 消息类型
 
+**提示词交付方式（`PromptDelivery`）**：
+模型可见输入相对当前 Agent 运行的交付位置：`Steer` 在最早可用的下一次模型调用前注入，`FollowUp` 等当前 work 完成后启动后续运行，`NextTurn` 等下一次显式用户 turn 时合并。它不决定 slash command handler 何时运行。
+_避免_：DeliveryMode、InputSchedule、CommandRunPolicy、PendingSessionAction
+
+**命令运行策略（`CommandRunPolicy`）**：
+slash/catalog command 相对 active work 的执行策略：`Immediate` 立即执行，`IdleOnly` 在 active work 时拒绝，`QueueAfterRun` 在 idle 时立即执行、在 active work 时保存为结构化待执行会话动作。它不表示 steer、follow-up 或模型消息队列。
+_避免_：CommandPhasePolicy、DeferUntilPostRun、PromptDelivery、通用任务调度器
+
 **命令目录**：
 运行时基于当前 session context 临时 materialize 给界面适配器的命令摘要集合，包含 command key、path、来源、说明、参数提示和当前可用性。它用于 autocomplete、command palette 和嵌套菜单，不等同于执行授权。
 _避免_：命令执行器、工具注册表、资源目录、持久化 catalog
@@ -256,10 +308,6 @@ _避免_：前端回调、UI 组件实例、运行时状态修改、Command payl
 界面消息面板中展示的一项内容，可以是用户消息、助手消息、工具活动、运行时通知或命令输出。并非所有消息面板项都会进入模型上下文。
 _避免_：模型消息、会话条目、事件消息
 
-**系统提示词构建器**：
-纯构建能力，消费提示词素材、活跃工具集合、工具提示片段、当前日期和工作区路径，生成一次 Agent 运行使用的最终 system prompt。它由 `SessionRuntime` 调用，不调用 `ResourceManager`，也不读取文件或触发 reload。
-_避免_：ResourceManager、会话历史、工具执行、资源生命周期 owner
-
 **界面适配器**：
 很薄的集成层，将 Ratatui、Tauri/Vue 或 CLI 这类具体界面技术翻译成 Agent 运行时命令与事件。它通常属于下游应用仓库；MiniCore 只定义协议和可复用 runtime 行为。
 _避免_：重复后端、UI 专属 Agent
@@ -269,7 +317,7 @@ _避免_：重复后端、UI 专属 Agent
 _避免_：响应、请求、chat completion
 
 **待执行会话动作（`PendingSessionAction`）**：
-`SessionRuntime` 在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。当前 work 完成并落 save point 后，pending action 在 follow-up/next-turn 之前执行。
+`SessionRuntime` 接受 `CommandRunPolicy::QueueAfterRun` 后保存、并在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。
 _避免_：AgentCommand payload、QueuedMessage、PendingSessionWrites、CommandManager pending action
 
 **当前运行状态（`CurrentRunState`）**：
@@ -281,11 +329,11 @@ _避免_：RunTerminalStatus、SessionPhase、工具调用状态
 _避免_：focus 切换、terminal finished、普通 waiting approval、模型 streaming 中途暂停
 
 **TurnState**：
-`SessionRuntime` 在一次 user turn / run 启动时构建的内部稳定快照，pin 住资源、system prompt、模型状态、工具视图、消息投影和 context usage。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
+`SessionRuntime` 在一次 user turn / run 启动时构建的内部稳定快照，pin 住资源、`PromptTurn`、模型状态、工具视图、消息基线和 context usage。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
 _避免_：Driver 输入、ResourceManager current view、公开协议快照
 
 **DriverTurnInput**：
-`TurnState` 投影给 `Driver` 的窄输入，只包含推进 Rig 和构造 `ModelCallRequest` 所需的模型可见输入，例如 model selection、system prompt、active tool schemas、thinking level 和 stream options。它不能包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态。
+`TurnState` 投影给 `Driver` 的窄输入，只包含 model selection、原子 `PromptCallProfile`、thinking level 和 stream options。它不能包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态；system prompt 与 active tool schemas 不能作为两个独立可 patch 字段跨过 seam。
 _避免_：TurnState、ToolRunContext、ModelCallRequest、SessionRuntime 状态
 
 **Driver（Rig 适配器）**：
@@ -378,7 +426,7 @@ _避免_：ProviderRegistry、UI 设置对象、环境变量直读器
 _避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
 
 **模型调用请求（`ModelCallRequest`）**：
-`Driver` 或 `SessionRuntime` 交给模型调用网关的唯一 provider-neutral 请求，包含模型选择、消息、系统提示词、工具 schema、输出限制、调用目的和流式选项。它不包含凭据、auth header、Rig provider 类型或 raw provider payload。
+`Driver` 或 `SessionRuntime` 交给模型调用网关的唯一 provider-neutral 请求，包含模型选择、消息、系统提示词、工具 schema、thinking level、可选 output contract、输出限制、调用目的和流式选项。Agent run 请求必须先来自已校验的 `ModelInputProjection`；它不包含凭据、auth header、Rig provider 类型或 raw provider payload。
 _避免_：provider HTTP request、Rig provider request、会话消息、SummaryModelRequest
 
 **压缩摘要材料（`CompactionSummaryMaterial`）**：

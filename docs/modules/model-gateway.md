@@ -282,6 +282,7 @@ pub struct ModelCallRequest {
     pub tools: Vec<ToolSchema>,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
+    pub output_contract: Option<OutputContract>,
     pub max_output_tokens: Option<u64>,
 }
 ```
@@ -290,7 +291,7 @@ pub struct ModelCallRequest {
 
 `Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason`、`DriveEntry::Retry` 或 future call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 session 因 focus 切换而在后台继续运行时，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
 
-`AgentRun` 请求通常带 `tools` 和完整 system prompt，`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求不带 tools，不复用 Agent run system prompt，只使用 compaction summary prompt，并把 `CompactionSummaryMaterial.max_output_tokens` 写入请求。
+`AgentRun` 请求必须来自已校验的 `ModelInputProjection`，通常带 `tools`、完整 system prompt 和可选 `OutputContract`；`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求不带 tools/output contract，不复用 Agent run system prompt，只使用 compaction summary prompt，并把 `CompactionSummaryMaterial.max_output_tokens` 写入请求。
 
 `max_output_tokens` 表示调用方期望的输出上限，不是 provider 已验证值。`ModelGateway` 在 provider capability validation 时必须保证它大于 0，并按 `ModelCapabilities.max_output_tokens` 拒绝或确定性裁剪；最终生效值可进入 redacted attempt/diagnostic summary，但不能由 `Compaction` 直接读取 provider capability。
 
@@ -376,7 +377,7 @@ SessionHandle.build_session_context()
 ```text
 AgentCommand::SetModel { provider_id, model_id }
   → AgentRuntime routes to SessionRuntime
-  → SessionRuntime checks phase policy
+  → SessionRuntime checks CommandRunPolicy / session phase guard
   → ProviderRegistry.resolve(ModelSelection)
   → clamp thinking/options against ModelCapabilities
   → ModelState.selected = selection
@@ -390,15 +391,17 @@ AgentCommand::SetModel { provider_id, model_id }
 ### SubmitPrompt
 
 ```text
-SubmitPrompt
-  → SessionRuntime appends user message
-  → ResourceManager.capture_turn(workspace_id, cwd, turn_id)
-  → Prompt builds system prompt from TurnResourceSnapshot.cwd.resolved + active tools
-  → SessionRuntime builds TurnState { model: ActiveModel, resources, ... }
-  → SessionRuntime projects DriverTurnInput { model, system_prompt, active_tool_schemas, thinking_level, stream_options }
+SubmitPrompt / prompt-like intent
+  → SessionRuntime captures TurnResourceSnapshot and creates PromptTurn
+  → PromptTurn.resolve_intent(...) returns ResolvedPromptInput
+  → SessionRuntime persists current input and builds TurnState
+  → SessionRuntime projects DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }
   → Driver.drive_run(...)
   → AgentRunStep::CallModel
-  → Driver builds ModelCallRequest { model: ModelSelection, ... }
+  → Driver applies NextModelCallPlan
+  → Prompt projects durable history + protected current input + transient context
+  → ModelInputProjection validation succeeds
+  → Driver builds ModelCallRequest { model: ModelSelection, projection fields, ... }
   → DriverHost::call_model
   → ModelGateway.call_model
       → user-global ProviderRegistry.resolve(selection)
@@ -425,7 +428,7 @@ Rig CallTools
   → Driver builds a new ModelCallRequest with the same or patched ModelSelection
 ```
 
-工具 schema 进入 `ModelCallRequest.tools`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
+工具 schema 与 system prompt 必须来自同一个 `PromptCallProfile` / `ModelInputProjection` 后再进入 `ModelCallRequest`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
 
 ### Compaction summary
 
@@ -443,7 +446,7 @@ SessionRuntime compaction flow
 
 ## Hooks
 
-模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `DriverHost::call_model(...)` 前的 run safe point，例如 `BeforeNextModelCall`、`ContextProjection`、队列处理和 future `DriverTurnInput` patch。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
+模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `DriverHost::call_model(...)` 前的 run safe point，例如 `BeforeNextModelCall`、typed context collection、队列处理和 `PromptCallProfile` rebuild；Prompt 拥有最终 provider-neutral model-input projection 与协议校验。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
 
 推荐阶段：
 
@@ -489,12 +492,12 @@ SessionRuntime
 技能有两个路径：
 
 ```text
-explicit InvokeSkill
-  → SessionRuntime formats skill body as user message
+explicit SkillPromptIntent
+  → target PromptTurn.resolve_intent() formats captured skill body as user message
 
 available skill summaries
-  → TurnResourceSnapshot.cwd.resolved.prompt_materials
-  → prompt::build_system_prompt(...)
+  → PromptResourceView.materials
+  → prompt::begin_turn(...) builds PromptCallProfile
 ```
 
 技能不直接选择 provider/model，也不接触 auth。

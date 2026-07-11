@@ -13,9 +13,9 @@ Usage / Cost Tokens != Context Usage
 
 UI 不应自己从消息估算 token。UI 只消费 `usage_updated`、`run_finished { usage }`、`agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage`。
 
-## 参考经验
+## Context Usage 估算
 
-pi-agent-core 的压缩逻辑优先使用 provider 返回的 assistant usage；如果找不到有效 usage，才用本地字符估算。它的上下文估算是：
+MiniCore 优先使用 provider 返回的有效 assistant usage；如果找不到有效 usage，才使用本地字符估算：
 
 ```text
 if last valid assistant usage exists:
@@ -24,9 +24,9 @@ else:
   context_tokens = estimate(all messages)
 ```
 
-有效 assistant usage 必须来自非 `aborted`、非 `error` 的 assistant message，且 token 数大于 0。pi 的本地估算使用保守字符启发式：文本约 `chars / 4`，图片按固定大块估算，tool call 使用工具名加 JSON 参数长度，tool result/bash/summary 使用内容长度估算。
+有效 assistant usage 必须来自非 `aborted`、非 `error` 的 assistant message，且 token 数大于 0。本地估算使用保守字符启发式：文本约 `chars / 4`，图片按固定大块估算，tool call 使用工具名加 JSON 参数长度，tool result/bash/summary 使用内容长度估算。
 
-Codex 的协议把 usage 拆成：
+provider-neutral usage view 拆成：
 
 ```rust
 pub struct TokenUsage {
@@ -175,7 +175,7 @@ pub struct ContextUsageView {
 
 ## 本地估算
 
-MVP 可以采用 pi 的保守字符启发式：
+MVP 使用以下保守字符启发式：
 
 ```text
 text: chars / 4
@@ -284,7 +284,7 @@ resources/tools/system prompt changed
 
 `agent_runtime_protocol::RuntimeSnapshot.active_session` 应包含 `session_stats: Option<SessionStatsView>` 和 `context_usage: Option<ContextUsageView>`。完整结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
 
-UI 重连后应以 snapshot 为权威恢复 usage 面板，而不是要求 runtime 重放所有历史 `usage_updated`。
+UI 重连后应以 snapshot 为权威恢复 active session usage 面板，而不是要求 runtime 重放所有历史 `usage_updated`。查看非 active session 或按需打开详细统计时，使用 `RuntimeQuery::Usage(UsageQuery::GetSessionStats | GetContextUsage)`；query 返回完整 view，运行中的后续变化继续由 `usage_updated` 替换 UI cache。UI 不应轮询 query 来模拟实时 usage stream。
 
 ## UI 展示建议
 

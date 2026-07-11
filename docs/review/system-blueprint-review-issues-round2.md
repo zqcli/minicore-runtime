@@ -2,7 +2,7 @@
 
 日期：2026-07-06
 
-来源：对 `README.md`、`CONTEXT.md`、`docs/architecture.md`、`docs/implementation-roadmap.md`、`docs/modules/*.md`、`docs/adr/*.md`、`docs/review/*.md` 的第二轮全量交叉审阅。本轮只记录第一轮（BR-001 ~ BR-022）未覆盖的新问题，编号从 BR-023 起延续。
+来源：对 `README.md`、`CONTEXT.md`、`docs/architecture.md`、当时存在但后续已删除的 `docs/implementation-roadmap.md`、`docs/modules/*.md`、`docs/adr/*.md`、`docs/review/*.md` 的第二轮全量交叉审阅。本轮只记录第一轮（BR-001 ~ BR-022）未覆盖的新问题，编号从 BR-023 起延续；路线图相关证据仅保留为历史记录。
 
 约定：与第一轮相同，本文只记录待处理问题，不代表已经决定修改方案。后续逐条处理时，应回到对应 source of truth 文档中做设计取舍。
 
@@ -12,7 +12,7 @@
 
 本轮发现的问题集中在三类：
 
-1. **协议表面有真实缺口**：查询命令没有响应通道（BR-023）、abort 持久化语义未定义（BR-024）、若干命令/事件字段与既定语义冲突（BR-027、BR-030、BR-031、BR-032）。
+1. **协议表面仍有真实缺口**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort 持久化语义仍未定义（BR-024），部分命令/事件字段仍与既定语义冲突（BR-027、BR-030、BR-031）。
 2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）已通过 `Tools` 权威文档补齐 source of truth。
 3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
@@ -20,22 +20,13 @@
 
 ### BR-023：查询型协议命令没有已定义的响应通道
 
-状态：Open
+状态：Resolved
 
-问题：`AgentRuntime` trait 只有 `dispatch() -> CommandAck`、`subscribe()`、`snapshot()` 三个方法。`ListSessions` 被放进 `Command` enum，协议文档明确要求"不能把 session list 塞进 `CommandAck`"，并要求"通过明确 response event 或 interaction 返回列表"——但 `EventMsg` 全集中不存在任何承载 session 列表的事件（`SessionEvent` 只有 Created/Opened/Closed/... 等生命周期事实）。`GetSkill`、`GetPromptTemplate`、`GetContextFile`、`GetEffectivePrompt`、`GetSessionStats`、`GetContextUsage`、`GetSlashCommandCatalog`、`CompleteSlashCommandArgs` 等后续查询命令同样悬空，文档原文承认"实现时可以把它们做成 request/response 形式的 protocol query，或做成 dispatch() 后产生明确 response event 的命令"——即协议核心形态（是否存在第四个 `query()` 方法）尚未决定，但 trait 已作为"稳定协议"写进 README 和多个模块文档。
+决策结果：按 ADR 0018，`AgentRuntime` 稳定 interface 分为四种能力：`dispatch(AgentCommand) -> CommandAck`、`query(RuntimeQuery) -> QueryResponse`、`subscribe() -> EventStream` 和 `snapshot() -> RuntimeSnapshot`。Command 用于 mutation/异步工作，Query 用于只读 typed request/response，Event 用于运行变化，Snapshot 用于带事件水位的 UI 初始化与恢复。
 
-`ListSessions` 不是可推迟的后续命令：BR-001 的解决方案让 `/resume` 和 GUI sidebar 都依赖它，roadmap 阶段 2 就要求 workspace-scoped `ListSessions` 可验证。这是 MVP 主路径上的协议漏洞。
+`RuntimeQuery` 按 runtime、session、settings、resources、command surface、models、usage 和 diagnostics 领域分组；当前只固定框架和关键 variants，后续子查询在对应领域 enum 中扩展，不再次改变 AgentRuntime interface。`ListSessions`、资源详情、command catalog/suggestion、usage/context usage 和 settings read 已从 `AgentCommand` 语义中移出。
 
-证据：
-
-- `docs/modules/agent-runtime-protocol.md`：公共 Interface 只有 dispatch/subscribe/snapshot；`ListSessions` 段要求"必须通过明确 response event 或 interaction 返回列表"。
-- `docs/modules/agent-runtime-protocol.md`：`EventMsg` 定义中没有 session list / query response 事件族。
-- `docs/modules/agent-runtime-protocol.md`：后续命令段"实现时可以把它们做成 request/response 形式的 protocol query，或……"。
-- `docs/implementation-roadmap.md`：阶段 2 可验证产物包含 workspace-scoped `ListSessions`。
-
-风险：与 BR-001 同构的"协议形态未收敛但已固化"问题。下游 adapter、SDK transport、测试 harness 会围绕错误的调用形态实现，后续加 `query()` 方法或 response event 族都是协议级返工。
-
-待处理方向：三选一并写入 AgentRuntimeProtocol 权威文档：(a) trait 增加 `query(Query) -> QueryResult` 第四方法，把所有读取型命令从 `Command` enum 移出；(b) 定义 `EventMsg::QueryResponse` 事件族并规定 correlation 规则；(c) MVP 把 `ListSessions` 降级为 snapshot/`SessionCatalogSummary` 的扩展。当前文档在三者之间摇摆。
+query 不分配 `CommandId`、不产生 `CommandAck`、不发布 query-response event、不增加 event sequence，也不为了目录/detail 读取加载完整 `SessionRuntime`。`QueryResponse.as_of_sequence` 只说明结果生成时的 runtime 水位；可选领域 revision 用于 cache/stale 判断。JSON-RPC/Tauri/stdio adapter 可以暴露 method-per-query 的 typed transport 方法，但内部统一映射到 `RuntimeQuery`。
 
 ### BR-024：run 中断（abort/失败/宿主关闭）后的持久化语义未定义，可能在会话历史中留下 unresolved tool call
 
@@ -119,9 +110,9 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-028：运行输入存在双入口（`SubmitPrompt.delivery` vs `Steer`/`FollowUp`/`NextTurn`），且 `DeliveryMode`、`QueueKind`、`QueueMode` 未定义
 
-状态：Open
+状态：Resolved
 
-问题：`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate`、`ExecuteCommandText` 都携带 `delivery: DeliveryMode`，同时又存在独立的 `Steer` / `FollowUp` / `NextTurn` 命令。若 `DeliveryMode` 覆盖 steer/follow-up/next-turn，则两套入口语义重叠，phase guard、queue hook（`QueueBeforeEnqueue`）和事件（`queue_updated`）需要对两条路径保持一致，容易漂移；若不覆盖，`DeliveryMode` 的取值就无从知晓——该 enum 与 `QueueKind`、`QueueMode` 在全部文档中都没有定义（仅 session-runtime.md 提到队列模式"支持 all 和 one-at-a-time"）。
+原问题：`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate`、`ExecuteCommandText` 都携带 `delivery: DeliveryMode`，同时又存在独立的 `Steer` / `FollowUp` / `NextTurn` 命令，导致 phase guard、queue event 和 hook 行为存在双入口漂移风险。
 
 证据：
 
@@ -130,23 +121,19 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 风险：入口语义二义，实现时两条路径的队列/phase/hook 行为分叉。
 
-待处理方向：定义 `DeliveryMode` 并明确与三个队列命令的关系（推荐：保留 delivery 作为唯一入口、删除独立命令，或反之）。
+决策结果：按 ADR 0016 删除独立 `Steer` / `FollowUp` / `NextTurn` protocol command，将 `DeliveryMode` 收窄并改名为 `PromptDelivery { Steer, FollowUp, NextTurn }`。`SubmitPrompt`、skill、prompt template 和 prompt-producing slash command 都归一到 `SessionRuntime.admit_prompt_intent(...)`；`ExecuteCommandText` / `ExecuteCatalogCommand` 携带的 `prompt_delivery` 只在 command 产生模型可见 prompt intent 时生效。
+
+slash command 自身另使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfterRun }`。`/status` 可在 active work 中立即输出到 message panel；`/compact` 在 active work 中映射为 typed `PendingSessionAction::Compact`；两者都不进入消息队列。`QueueKind { Steering, FollowUp }` 和 `QueueMode { All, OneAtATime }` 已在协议中定义，`NextTurn` 与 pending session action 不受 queue mode 控制。
 
 ### BR-029：`SessionPhase` 是 phase guard 的核心，但没有权威完整定义；`branch_summary` 是幽灵 phase
 
-状态：Open
+状态：Resolved
 
-问题：`SessionPhase` 用于"拒绝不合法命令和保护会话写入顺序"，但 CONTEXT.md 用"例如 idle、turn、compaction、branch_summary 和 retry"的开放式措辞，协议文档没有 `enum SessionPhase` 定义（尽管 roadmap 阶段 0 要求它可编译可序列化），事件文档的 phase lifecycle 图只覆盖 Idle/Turn/Compaction/Retry 且不完整（无完整转换矩阵）。`branch_summary` phase 只在 CONTEXT.md 出现过一次，所有模块文档从未提及它何时进入/退出。
+决策结果：`SessionPhase` 封闭为 `Idle | Turn | Compaction | RetryBackoff`。`Turn` 是产品级工作窗口，可以包含 prompt preflight、连续多个 Agent runs、approval wait、可恢复 suspend、持久化和 post-run arbitration；它不等于单个 `RunId`。`RetryBackoff` 只表示 Agent run 自动重试前的调度等待，provider fallback/retry 和 compaction summary 内部 retry 不改变 phase。
 
-证据：
+`WaitingApproval` / `Suspended` 继续属于 `CurrentRunState`，发生时 phase 仍为 `Turn`。`BranchSummary` 保留为 session entry，并在未来真正实现独立摘要模型任务时增加明确 `ModelCallPurpose`；MVP 不定义 `SessionPhase::BranchSummary`。
 
-- `CONTEXT.md` 会话阶段词条（"例如……"）。
-- `docs/modules/agent-runtime-protocol.md`：`SessionSnapshot.phase: SessionPhase` 有引用无定义。
-- `docs/modules/agent-runtime-events.md`：Session Phase Lifecycle 三段式示意，无 branch_summary。
-
-风险：每个命令的 phase policy（哪些 phase 拒绝哪些命令）是运行时正确性的地基，没有完整状态转换表就无法写 phase guard 测试。
-
-待处理方向：在 AgentRuntimeProtocol 或 SessionRuntime 文档中给出封闭的 `SessionPhase` enum 与完整转换表；决定 branch_summary 是否为 MVP phase。
+已在协议文档增加可序列化 enum，在 SessionRuntime 增加 phase/command guard 规则，在 AgentRuntimeEvents 增加完整转换矩阵。只有进入 `Idle` 且不会立即 continuation 时才发布 `session_settled`；同 phase 的 `Turn -> Turn` continuation 不产生虚假 phase-changed 事件。
 
 ### BR-030：`WaitForIdle` 作为协议命令在 ack-only 模型下语义不成立
 
@@ -180,17 +167,9 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 ### BR-032：`skill_invoked` / `prompt_template_invoked` 的 `run_id` 必填与队列 delivery 冲突
 
-状态：Open
+状态：Resolved
 
-问题：`SkillEvent::Invoked { session_id, run_id: RunId, skill_name }` 的 run_id 非 Option，但 `InvokeSkill` 支持 `delivery` 入队（follow-up/next-turn）：入队时刻不存在 run。事件要么在入队时发（无 run_id 可填），要么延迟到实际展开进 run 时发（则"invoked"与命令 ack 之间存在长时间静默，且事件时点在任何文档中未写明）。`PromptTemplateEvent::Invoked` 同。
-
-证据：
-
-- `docs/modules/agent-runtime-protocol.md`：`SkillEvent` / `PromptTemplateEvent` 定义；`InvokeSkill { delivery }`。
-
-风险：事件时点二义，UI 无法可靠反馈"技能已受理"。
-
-待处理方向：`run_id` 改 Option 并定义发布时点；或拆成 accepted/expanded 两个事件。
+处理记录：invoked 事件固定为“目标 `PromptTurn.resolve_intent()` 已实际展开结构化 intent，并已绑定到某个 run”的事实，因此 `run_id` 保持必填。FollowUp/NextTurn 入队时只通过 `CommandAck` 和 `queue_updated` 表达受理，不提前发 invoked；目标 future run 启动并展开后才发 invoked。active Steer 在 active run safe point 展开后发 invoked，再追加对应 user message。展开失败不发 invoked，只产生结构化 command/runtime diagnostic。
 
 ### BR-033：`EventMsg` 内层路由字段的有无不一致
 
@@ -283,11 +262,11 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 状态：Resolved
 
-问题：`ListSessions { limit: usize }`、`SessionEvent::Settled { next_turn_count: usize }` 使用平台相关宽度类型；协议其余部分统一 u32/u64。wire 协议类型应固定宽度（参考 Codex 用 i64）。
+问题：原 `ListSessions { limit: usize }`、`SessionEvent::Settled { next_turn_count: usize }` 使用平台相关宽度类型；协议其余部分统一 u32/u64。wire 协议类型应固定宽度（参考 Codex 用 i64）。
 
 证据：`docs/modules/agent-runtime-protocol.md`。
 
-处理记录：已将 `docs/modules/agent-runtime-protocol.md` 中公开协议的 `ListSessions.limit` 改为 `u32`，`SessionEvent::Settled.next_turn_count` 改为 `u64`，`ToolApprovalPreview::FileEdit.replacements` 改为 `u32`。内部实现文档若使用数组索引，可以在模块内部转换，但 wire 协议不再暴露裸 `usize`。
+处理记录：已将公开协议中现归属 `SessionQuery::List` 的 `limit` 改为 `u32`，`SessionEvent::Settled.next_turn_count` 改为 `u64`，`ToolApprovalPreview::FileEdit.replacements` 改为 `u32`。内部实现文档若使用数组索引，可以在模块内部转换，但 wire 协议不再暴露裸 `usize`。
 
 ### BR-040：`ToolPolicy` 声明为纯判断器，却要构造需要 I/O 的 `ToolApprovalPreview`
 
@@ -303,7 +282,7 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 状态：Resolved
 
-处理记录：已在 `docs/modules/agent-runtime-protocol.md` 中规定：`GetContextFile` 的 path 必须命中当前 cwd `CwdResourceSnapshot` 已登记的 context file canonical path；读取必须经过 `AgentRuntime` / `ResourceManager`，不能由 UI adapter 直接读文件。
+处理记录：已在 `docs/modules/agent-runtime-protocol.md` 中规定：`ResourceQuery::GetContextFile` 的 path 必须命中当前 cwd `CwdResourceSnapshot` 已登记的 context file canonical path；读取必须经过 `AgentRuntime` / `ResourceManager`，不能由 UI adapter 直接读文件。
 
 问题：该命令以任意 `PathBuf` 为参数，文档只说"读取必须经过 AgentRuntime / ResourceManager"，未规定 path 必须命中当前资源快照中已登记的 context file。不加约束就是一条 UI 任意读文件通道。
 
@@ -359,7 +338,7 @@ pi / Claude Code 的通行做法是 abort 时为未完成 tool call 合成 error
 
 原问题：MVP 依赖 picker 选择后按模板重新提交 slash command（示例 `/model {item.id}`），但模板占位符语法（可用变量、转义规则）没有定义，TUI/GUI 各自实现必然分叉。
 
-决策结果：移除 template submit 通道。UI 选择 command catalog item 后提交 `ExecuteCatalogCommand { selection, args }`；若确实是文本入口，则提交明确的 `ExecuteCommandText { raw }`。runtime 收到后重新 materialize catalog 并执行 `resolve_for_execution`，不需要 UI 实现占位符模板语言。
+决策结果：移除 template submit 通道。UI 选择 command catalog item 后提交 `ExecuteCatalogCommand { selection, args, prompt_delivery }`；若确实是文本入口，则提交明确的 `ExecuteCommandText { raw, prompt_delivery }`。runtime 收到后重新 materialize catalog 并执行 `resolve_for_execution`，不需要 UI 实现占位符模板语言。`prompt_delivery` 只在节点产生 prompt intent 时生效。
 
 ## 过程性观察（不编号）
 

@@ -4,7 +4,7 @@
 
 会话属于 Agent Runtime，不属于 UI。UI 只能通过运行时命令打开、列出、fork、导航或删除会话，不能直接读写会话文件。
 
-设计参考 pi coding-agent `SessionManager`、`AgentSessionRuntime` 的会话替换经验，以及 Codex `ThreadManager` + `ThreadStore` + `LiveThread` 的分工。本项目采用广义 `SessionManager`：它同时协调持久化会话目录和已加载会话运行时；底层单会话存储仍叫 `SessionStorage`。
+本项目采用广义 `SessionManager`：它同时协调持久化会话目录和已加载会话运行时；底层单会话存储仍叫 `SessionStorage`。pi coding-agent 和 Codex 的会话/线程管理可以作为参考对象，但不构成类型、文件格式或生命周期兼容承诺。
 
 ## 核心模型
 
@@ -15,7 +15,7 @@
 
 `AgentRuntime` 对 UI 暴露会话命令和快照，但内部通过 `SessionManager` 打开会话、创建 `SessionHandle`、加载 `SessionRuntime`、切换 focused session。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`。
 
-`SessionIndex` 是 `SessionManager` 的轻量会话目录，不是 `RuntimeSnapshot`。它用于 `/resume`、GUI sidebar 和 `ListSessions`，可以由 JSONL header、session metadata、本地 index/cache 或数据库投影维护。它只包含 session id、workspace/cwd、名称、时间、预览、轻量模型/思考等级/usage 摘要和诊断，不包含完整 messages、当前 run、pending approval、队列或 UI 状态。打开窗口时不需要为了生成 `RuntimeSnapshot` 重建所有 session；只有用户执行 `OpenSession` 或创建新会话时才加载对应 `SessionRuntime` 并重建完整 session projection。
+`SessionIndex` 是 `SessionManager` 的轻量会话目录，不是 `RuntimeSnapshot`。它用于 `/resume` 和 `SessionQuery::List`，可以由 JSONL header、session metadata、本地 index/cache 或数据库投影维护。它只包含 session id、workspace/cwd、名称、时间、预览、轻量模型/思考等级/usage 摘要和诊断，不包含完整 messages、当前 run、pending approval、队列或 UI 状态。打开窗口时不需要为了生成 `RuntimeSnapshot` 重建所有 session；只有用户执行 `OpenSession` 或创建新会话时才加载对应 `SessionRuntime` 并重建完整 session projection。
 
 ## Interface
 
@@ -47,7 +47,7 @@ pub trait SessionStorage {
 }
 ```
 
-`SessionListFilter` 必须支持按 workspace scope 查询。TUI 的 `/resume` 默认列出当前 workspace 的会话；GUI sidebar 也应通过 `ListSessions(CurrentWorkspace)` 或显式 workspace scope 读取清单。`/resume --all`、全局 recent view 或跨 workspace 搜索可以作为后续增强，但默认不应把所有工作区的 session 混在一起。
+`SessionListFilter` 必须支持按 workspace scope 查询。TUI 的 `/resume` 默认列出当前 workspace 的会话；GUI sidebar 通过 `RuntimeQuery::Session(SessionQuery::List { scope: CurrentWorkspace, ... })` 或显式 workspace scope 读取清单。`/resume --all`、全局 recent view 或跨 workspace 搜索可以作为后续增强，但默认不应把所有工作区的 session 混在一起。
 
 运行时加载使用 factory，factory 由 `AgentRuntime` 提供并持有 `WorkspaceServices`。`SessionManager` 只把 `SessionHandle` 交给 factory；factory 读取 handle metadata 的 workspace/cwd，确保 `ResourceManager` 已有该 cwd 的 current `CwdResourceSnapshot`，并把 fixed workspace/cwd 与共享 runtime services 注入新 `SessionRuntime`。这样 `SessionManager` 不直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 构造细节，也不会把 focused session 的当前 cwd 或资源快照误传给后台 session：
 
@@ -111,7 +111,7 @@ Label { target_id: EntryId, label: Option<String> }
 
 ## 上下文构建
 
-上下文构建参考 pi 的 `buildSessionContext(pathEntries)`：
+上下文构建遵循以下权威规则：
 
 - 只使用当前叶子从根到叶子的路径构建上下文。
 - `model_change` 和 assistant message 可恢复当前模型。
@@ -148,7 +148,7 @@ entry 101..end  normal messages after compaction
 模型实际上下文为：
 
 ```text
-system: prompt::build_system_prompt(...)
+system: PromptTurn.profile.system_prompt
 user:   The conversation history before this point was compacted into the following summary:
         <summary>
         ...
@@ -165,7 +165,7 @@ user:   The conversation history before this point was compacted into the follow
 
 ## JSONL 持久化
 
-JSONL 存储参考 pi `JsonlSessionStorage`：
+JSONL 存储格式：
 
 - 第一行是 session header，包含 `type: "session"`、版本号、session id、创建时间、cwd 和可选父会话路径。
 - 后续每行是一条 session entry。
@@ -185,7 +185,7 @@ MVP 可以同时提供两种持久化实现：
 - `NewSession` 创建新会话并发出 `session_created` / `session_opened`。
 - `OpenSession` 打开已有会话，必要时加载 `SessionRuntime`，并通常发出 `session_focus_changed`。
 - `FocusSession` 切换 runtime-visible focused session；如果目标未 loaded，可以拒绝，也可以按产品策略先执行 open-and-load。
-- `ListSessions` 返回工作区下的会话元数据。
+- `SessionQuery::List` 通过 `AgentRuntime.query()` 返回工作区下的会话元数据；底层复用 `SessionManager.list_sessions(...)`。
 - `DeleteSession` 删除未被当前运行占用的会话。
 - `SetSessionName` 追加 `session_info` 条目，而不是修改 header。
 - `ForkSession` 复制源会话中目标路径上的条目到新会话。
@@ -222,32 +222,4 @@ AppShutdown
 
 Focused session 是 runtime-visible state。它只表示 UI 或默认命令目标，不表示唯一 loaded session，也不表示唯一 running session。多 session 同时运行时，失去 focus 的 session 可以继续执行后台 run。
 
-## 与 pi 的对应
-
-```text
-pi coding-agent SessionManager
-  ≈ 本项目 SessionManager + SessionHandle + SessionStorage
-
-pi coding-agent AgentSessionRuntime session replacement
-  ≈ 本项目 AgentRuntime + SessionManager loaded runtime lifecycle
-
-Codex ThreadManager
-  ≈ 本项目 SessionManager 的 persistent catalog + LoadedSessionRuntimes 协调
-
-Codex ThreadStore
-  ≈ 本项目 SessionStorage / 持久化 adapter
-
-Codex LiveThread
-  ≈ 本项目 SessionHandle 的 active persistence handle 部分
-
-pi-agent-core SessionRepo
-  ≈ 本项目 SessionManager
-
-pi-agent-core Session
-  ≈ 本项目 SessionHandle
-
-pi-agent-core SessionStorage
-  ≈ 本项目 SessionStorage
-```
-
-本项目保留 pi 的 `SessionManager` 命名，并吸收 Codex `ThreadManager` 协调 live threads 与 store 的经验；但底层 storage seam 和单会话运行编排仍拆开，便于测试、替换 JSONL / memory 实现，并避免 `SessionManager` 变成 Agent loop。
+`SessionManager`、`SessionHandle`、`SessionStorage` 和 `LoadedSessionRuntimes` 的含义只由本文件定义。底层 storage seam 与单会话运行编排保持分离，以便测试和替换 JSONL / memory adapter，并避免 `SessionManager` 变成 Agent loop owner。

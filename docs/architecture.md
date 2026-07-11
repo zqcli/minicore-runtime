@@ -2,11 +2,11 @@
 
 本文档是 MiniCore 原生 Agent harness runtime core 的总入口。MiniCore 本仓库提供可嵌入的运行时核心、协议、会话、资源、工具、事件和 harness 编排能力；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。详细能力已经按可实现的编程模块拆到 `docs/modules/`，避免把所有设计挤在一个长文档里。
 
-MiniCore 的设计借鉴 pi coding-agent 的实际生产路径：`AgentSessionRuntime` 负责会话切换与宿主生命周期，`AgentSession` 负责单个会话的产品级 Agent 编排，底层 `Agent` / `agent-loop` 负责模型和工具循环。MiniCore 不复制 pi-agent-core 的 `AgentHarness` 作为主架构层，而是把产品级编排能力放入 `SessionRuntime`。
+MiniCore 以明确 owner 和窄 seam 组织产品级 Agent 编排：`AgentRuntime` 是 UI 无关门面，`SessionManager` 管理会话生命周期，`SessionRuntime` 编排单个会话，`Driver` 适配底层 Agent SDK。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
 
 ## 设计定位
 
-MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 必须保持为实现细节。下游 CLI、TUI 和 GUI 宿主只通过运行时命令、运行时事件和运行时快照交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。
+MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 必须保持为实现细节。下游 CLI、TUI 和 GUI 宿主只通过运行时 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。
 
 MiniCore 不重新实现 Rig 的核心 Agent loop。Rig 负责 `AgentRun` / `AgentRunStep` 的状态机推进；MiniCore 通过 `Driver` 适配 Rig，在 `CallTools` 时经 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，再由 session-scoped `Tools` 子系统执行工具治理，并把底层活动映射成产品事件。
 
@@ -42,65 +42,47 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
        ├─ Command ──────────────▶ CommandManager materialize / parse / resolve
        ├─ DriverTurnInput ──────▶ Driver ──▶ Rig AgentRun
        ├─ Tools ────────────────▶ tool registry / policy / approval / executors
-       └─ Prompt ───────────────▶ captured cwd snapshot resolved view + tool prompt catalog
+       └─ PromptTurn ───────────▶ captured PromptResourceView + atomic PromptCallProfile
+                                      │
+                                      └─▶ ModelInputProjection before each model call
 ```
 
 ## 文档地图
 
 - [模块总览](modules/README.md)：整体模块关系、Rig / Runtime / 下游 UI 宿主的边界。
 - [AgentRuntime](modules/agent-runtime.md)：UI 无关的运行时门面、`WorkspaceServices` / `ResourceSnapshotStore`、会话打开/聚焦和工作区生命周期。
-- [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、消息队列、结构化 pending session actions、turn state 和 post-run 流程；后期在其拥有的安全点接入 Hook。
+- [SessionRuntime](modules/session-runtime.md)：单会话产品级编排、阶段、`PromptDelivery` admission、消息队列、`CommandRunPolicy::QueueAfterRun` 产生的结构化 pending session actions、turn state 和 post-run 流程；后期在其拥有的安全点接入 Hook。
 - [AgentRuntimeProtocol](modules/agent-runtime-protocol.md)：`agent_runtime_protocol::AgentCommand`、`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、`agent_runtime_protocol::RuntimeSnapshot` 和下游 adapter 调用方式。
-- [AgentRuntimeEvents](modules/agent-runtime-events.md)：Codex-like `agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
+- [AgentRuntimeEvents](modules/agent-runtime-events.md)：`agent_runtime_protocol::Event { ..., msg }`、事件生命周期、保存点、重连和跨模块事件顺序。
 - [SessionManager / SessionStorage](modules/session-manager.md)：会话生命周期、已加载会话运行时、追加式 session tree、JSONL 存储、会话管理与存储接口、上下文重建。
 - [ResourceManager](modules/resource-manager.md)：资源来源聚合、刷新和资源诊断。
 - [CommandSurface](modules/command-surface.md)：跨 UI 的用户命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry 和执行前 resolve。
 - [RuntimeHooks](modules/runtime-hooks.md)：后期内部 hook seam、hook/event 边界、capability、typed result、owner 分层和安全点。
 - [Skills](modules/skills.md)：`skills.rs` 平级模块，提供技能 metadata、catalog、发现、解析、校验和格式化 helper。
-- [Prompt](modules/prompt.md)：`prompt.rs` 纯构建模块，拼装最终 system prompt。
+- [PromptTemplates](modules/prompt-templates.md)：`prompt_templates.rs` 平级模块，定义模板资源、参数语法和单次展开 helper。
+- [Prompt](modules/prompt.md)：`prompt.rs` / `prompt/` 无状态提示词组装子系统，定义 immutable `PromptTurn`、原子 `PromptCallProfile` 和最终 `ModelInputProjection`。
 - [Driver](modules/driver.md)：Rig `AgentRun` / `CallModel` / `CallTools` 的适配职责。
 - [ModelGateway](modules/model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Tools](modules/tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
 - [Compaction](modules/compaction.md)：`compaction.rs` 平级模块，提供上下文压缩准备、摘要 prompt、压缩摘要消息和自动压缩语义。
 - [UsageStats](modules/usage-stats.md)：token 消耗、run/session stats、context usage 和 UI 展示口径。
-- [实现路线图](implementation-roadmap.md)：MVP 到后续增强的开发顺序和设计约束。
 
 ## 核心边界
 
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型。
 - 下游 CLI/TUI/GUI 不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
-- `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面。
+- `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面；其 interface 分为 `dispatch`、`query`、`subscribe` 和 `snapshot`，mutation/异步工作、只读数据、运行变化和恢复读模型不能混用通道。
 - `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 是它的内部 live runtime map，不作为独立架构层。多个 `SessionRuntime` 可以同时 loaded/running；每个 runtime 固定自己的 workspace cwd，每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
-- `SessionRuntime` 是单个会话的产品级编排层。它拥有完整 `TurnState`，并只把窄的 `DriverTurnInput` 投影给 `Driver`。
+- `SessionRuntime` 是单个会话的产品级编排层和 Prompt Pull Master。它捕获资源并创建 `PromptTurn`，拥有完整 `TurnState`，只把包含原子 `PromptCallProfile` 的窄 `DriverTurnInput` 投影给 `Driver`。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
 - `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
 - 工具注册、活跃工具、审批、授权记忆、沙箱、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；`SessionRuntime` 负责协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`。
 - 上下文压缩由 `SessionRuntime` 编排，`Compaction` 模块提供准备、摘要 prompt 和压缩摘要消息 helper；`Driver` 不执行压缩。
-- 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。
-
-## pi 经验映射
-
-```text
-AgentSessionRuntime
-  └─ AgentSession
-       └─ pi-agent-core Agent
-            └─ runAgentLoop / runAgentLoopContinue
-```
-
-| pi coding-agent 生产路径 | MiniCore 概念 |
-| --- | --- |
-| `AgentSessionRuntime` | `AgentRuntime` + `SessionManager` 的会话打开、替换、fork、import 和服务重建能力 |
-| `AgentSession` | `SessionRuntime` |
-| `pi-agent-core Agent` | `Driver` 周边的运行状态、abort、waitForIdle、queue reducer |
-| `runAgentLoop` | Rig 的 `AgentRun` / `AgentRunStep` / `drive_agent` |
-| `DefaultResourceLoader` | `ResourceManager` |
-| `SessionManager` | `SessionManager` / `SessionHandle` / `SessionStorage` |
-| `ExtensionRunner` | 后续 `RuntimeHooks` / 扩展运行时 |
-| extension event hooks | `RuntimeHooks` 内部 hook seam，后续由可信 extension/package 注册 |
+- 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。资源身份、overlay 和 snapshot 归 `ResourceManager`；结构化 intent 展开和最终模型输入组装归 Prompt。
 
 ## 相关决策
 
@@ -119,3 +101,6 @@ AgentSessionRuntime
 - [ADR 0013：Driver 接收 DriverTurnInput 而不是完整 TurnState](adr/0013-driver-receives-driver-turn-input.md)
 - [ADR 0014：ModelGateway spine 先于真实 Driver 集成](adr/0014-model-gateway-spine-precedes-driver-integration.md)
 - [ADR 0015：Hook owner 遵循 runtime 边界](adr/0015-hook-owners-follow-runtime-boundaries.md)
+- [ADR 0016：命令运行策略与提示词交付方式分离](adr/0016-separate-command-run-policy-from-prompt-delivery.md)
+- [ADR 0017：Prompt 使用不可变 turn 组装而不是长期 Manager](adr/0017-prompt-uses-immutable-turn-assembly.md)
+- [ADR 0018：AgentRuntime 分离 Command、Query、Event 和 Snapshot](adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)

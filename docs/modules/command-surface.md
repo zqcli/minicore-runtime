@@ -11,9 +11,11 @@
 
 ## 参考经验
 
-pi coding-agent 把 builtins、extension commands、prompt templates 和 skills 合成当前 session 的 command/autocomplete 面：extension command 由 `pi.registerCommand(name, { description, getArgumentCompletions, handler })` 注册，skills 以 `/skill:name` 暴露，prompt templates 以 `/{template}` 暴露。它的经验是：命令定义和 handler 应该分离，技能/模板必须注册进命令入口，而不是由 UI 读文件。
+pi coding-agent 的 command/autocomplete 面表明 builtins、extension commands、prompt templates 和 skills 可以共享一个动态目录；可提炼的经验是命令定义与 handler 分离，技能/模板进入运行时命令入口，而不是由 UI 读文件。
 
-Codex 的 slash command 主要位于 TUI/app 层：`SlashCommand` enum、过滤、popup、输入解析和 dispatch 都绑定具体 UI。它的经验是：命令定义、可用性、输入解析和 dispatch 需要集中；但 MiniCore 不能把 popup、picker、form 或 widget 模型放进 runtime core，因为 MiniCore 同时服务 TUI 和 GUI。
+Codex 的命令实现可以作为“集中定义可用性、解析和 dispatch”的参考，但 MiniCore 不能把 popup、picker、form 或 widget 模型放进 runtime core，因为 MiniCore 同时服务 TUI 和 GUI。
+
+这些项目只作为设计参考；MiniCore 不兼容其注册 API、命令 enum、UI 组件或 dispatch 路径。
 
 MiniCore 采用折中方案：runtime core 统一 command metadata、动态节点、解析、suggest、执行前 resolve 和 handler binding；UI 只渲染 catalog / suggestions / result，不能携带完整 runtime mutation command。
 
@@ -255,7 +257,15 @@ pub struct MaterializedCommandCatalog {
 
 UI 选择旧 catalog item 后执行时，runtime 必须基于当前 context 重新 materialize 并 resolve；如果节点消失或 binding 不再有效，返回 `CommandExpired` / `CatalogStale` 类错误，而不是执行旧 UI selection 携带的动作。
 
-`CommandPhasePolicy::DeferUntilPostRun` 表示：idle 时立即执行；存在 active work 时 resolve 为结构化 deferred action，由 `SessionRuntime` 保存并在 post-run safe point 执行。`CommandManager` 不保存 pending action，也不把它转换成 follow-up message。`/compact` 在 Compaction 后端启用后使用该 policy，因此 running 时 catalog 使用 `availability = Available` + `phase_policy = DeferUntilPostRun`，而不是 disabled 或隐式 abort。
+`CommandRunPolicy` 只控制 command handler 相对 active work 的执行时机：
+
+- `Immediate`：立即执行，例如 `/status`、`/usage`、`/help`；结果通过 command output 异步追加到 message panel，不进入模型上下文。
+- `IdleOnly`：active work 中拒绝，适用于无法安全并发且不应隐式排队的命令。
+- `QueueAfterRun`：idle 时立即执行；active work 中 resolve 为 typed `PendingSessionAction`，由 `SessionRuntime` 在 post-run safe point 执行。
+
+`CommandManager` 不保存 pending action，也不把 command 转换成 follow-up message。使用 `QueueAfterRun` 的 command 必须提供受控的 typed action 映射，不能保存 raw slash text 或延后重放 handler。`/compact` 使用该 policy，因此 running 时 catalog 使用 `availability = Available` + `run_policy = QueueAfterRun`，而不是 disabled 或隐式 abort。
+
+`PromptDelivery` 是另一条正交轴，只适用于 command 产生的模型可见 prompt intent。`/skill`、prompt template 等 command 先立即完成 resolve，生成结构化 prompt intent，再由 `SessionRuntime` 按调用方选择的 `Steer` / `FollowUp` / `NextTurn` 调度。`/status` 和 `/compact` 忽略 `prompt_delivery`。
 
 ## Parse / Suggest / Resolve
 
@@ -297,8 +307,8 @@ UI 选择旧 catalog item 后执行时，runtime 必须基于当前 context 重�
 ```rust
 pub enum AgentCommand {
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
-    ExecuteCommandText { session_id: Option<SessionId>, raw: String, delivery: PromptDelivery },
-    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs },
+    ExecuteCommandText { session_id: Option<SessionId>, raw: String, prompt_delivery: PromptDelivery },
+    ExecuteCatalogCommand { session_id: SessionId, selection: CommandSelection, args: CommandArgs, prompt_delivery: PromptDelivery },
     DecideToolApproval { approval_id: ApprovalRequestId, session_id: SessionId, run_id: RunId, call_id: ToolCallId, decision: ToolApprovalDecision },
     AbortRun { run_id: RunId },
     ResumeRun { session_id: SessionId, resume_id: ResumeId },
@@ -309,7 +319,7 @@ pub enum AgentCommand {
 }
 ```
 
-`ExecuteCommandText` 覆盖 TUI slash input 和 GUI command palette 的文本入口。`ExecuteCatalogCommand` 覆盖 GUI/TUI 从 catalog 选择某个节点后的结构化执行入口。它只能携带 command selection、catalog revision、bindings 和 args，不能携带完整 runtime mutation command。
+`ExecuteCommandText` 覆盖 TUI slash input 和 GUI command palette 的文本入口。`ExecuteCatalogCommand` 覆盖 GUI/TUI 从 catalog 选择某个节点后的结构化执行入口。它只能携带 command selection、catalog revision、bindings、args 和 prompt-producing command 使用的 `prompt_delivery`，不能携带完整 runtime mutation command。
 
 高权限 mutation 不属于公开 `AgentCommand`：
 
@@ -372,7 +382,7 @@ pub trait CommandHandler {
 }
 ```
 
-`SessionCommandHost` 包含 `submit_prompt`、`invoke_skill`、`invoke_prompt_template`、`reload_resources`、`set_model`、`set_thinking_level`、`set_active_tools`、`abort_run`、`resume_run`、`new_session`、`switch_session` 等受控方法。Handler 不拿完整 `SessionRuntime`，避免形成超宽接口。
+`SessionCommandHost` 包含 `submit_prompt_intent(intent, delivery)`、`queue_session_action(action)`、`reload_resources`、`set_model`、`set_thinking_level`、`set_active_tools`、`abort_run`、`resume_run`、`new_session`、`switch_session` 等受控方法。Handler 不拿完整 `SessionRuntime`，避免形成超宽接口。prompt-producing handler 只能提交结构化 intent，`QueueAfterRun` handler 只能提交该节点声明允许的 typed session action。
 
 ## Skill And Prompt Template Commands
 
@@ -396,15 +406,15 @@ Catalog 只使用 skill metadata：name、title、description、`ResourceKey`、
 
 ```text
 builtin.skill.invoke
-  -> SessionCommandHost.invoke_skill(...)
-  -> SessionRuntime.start_user_turn
-  -> ResourceManager.capture_turn(...)
-  -> 从 captured TurnResourceSnapshot 读取 selected SkillResource.body
+  -> SessionCommandHost.admit_prompt_intent(SkillPromptIntent, delivery)
+  -> SessionRuntime chooses active/future delivery boundary
+  -> target PromptTurn.resolve_intent(...)
+  -> 从 captured PromptResourceView 读取 selected SkillResource.body
 ```
 
-Prompt template 也可以通过 dynamic provider 进入 command tree，例如 `/template <name>` 或兼容 `/{template}` alias。Template body 和参数替换只在 `SessionRuntime` 执行阶段发生，不在 catalog/materialization 阶段发生。
+Prompt template 也可以通过 dynamic provider 进入 command tree。canonical path 是 `/template <name>`；仅在不与 builtin/root command 或其他 alias 冲突时 materialize `/{template}` alias。Template body、required skills 和参数替换只在目标 `PromptTurn.resolve_intent(...)` 发生，不在 catalog/materialization 阶段发生；完整规则见 [PromptTemplates](prompt-templates.md)。
 
-可选兼容：支持 pi 风格 `/skill:name` alias，但 canonical path 推荐 `/skill name`。Alias 解析后必须归一化为相同 `CommandPath` 和 binding。
+可选 colon alias：支持 `/skill:name`，但 canonical path 是 `/skill name`。Alias 解析后必须归一化为相同 `CommandPath` 和 binding；这不是对任何外部命令系统的兼容承诺。
 
 ## UI Boundary
 
@@ -412,6 +422,7 @@ UI adapter 负责渲染，不负责授权或执行：
 
 - 根据 `CommandCatalogView` / `CommandSuggestion` 渲染 slash autocomplete、command palette、嵌套菜单或 GUI picker。
 - 提交 `AgentCommand::ExecuteCommandText` 或 `AgentCommand::ExecuteCatalogCommand`。
+- 普通 Enter 默认携带 `PromptDelivery::Steer`：idle 时立即开始，running 时尝试注入当前 run；显式 follow-up 快捷键或 UI mode 使用 `PromptDelivery::FollowUp`。该 delivery 对 prompt-producing command 生效，但不能覆盖节点的 `CommandRunPolicy`。
 - 消费 display-neutral `CommandResultView` / command output event，自行显示到 message panel、toast、modal 或页面。
 - UI-local command 可以作为 adapter 本地 overlay，但不能 shadow runtime command，也不能进入 `AgentRuntime` 执行。
 
@@ -442,6 +453,8 @@ CommandCatalogEvent::Changed {
 
 `CommandAck` 只表示 `AgentRuntime.dispatch(AgentCommand)` 是否接收了协议命令。Unknown command、参数非法、phase 不允许等用户级错误，优先返回 accepted，然后通过 command result/output 事件展示；transport/runtime 级无法接收才 rejected。
 
+程序化 UI 读取不经过 CommandSurface：GUI sidebar、settings page、资源详情、command catalog/suggestions 和 usage detail 使用 `AgentRuntime.query(RuntimeQuery)` 直接取得 typed result。面向用户的 `/status`、`/usage`、`/help` 仍是 command text，结果通过 command output 展示。`/resume` handler 可以调用同一个 `SessionManager.list_sessions(...)` 并生成 picker interaction，但 GUI sidebar 使用 `SessionQuery::List`；两者不能因此合并 Command 和 Query seam。
+
 不推荐给每次 command 发 `command_started/finished`。真正业务事实仍使用对应事件：`resources_changed`、`session_model_changed`、`skill_invoked`、`prompt_template_invoked`、`run_finished`、`tool_call_*`。Command output 只是用户可见解释，不替代业务事件。
 
 ## 安全边界
@@ -468,7 +481,7 @@ CommandCatalogEvent::Changed {
 - `/model current`、`/model provider <provider> <model>` 或动态 path：读取/设置模型。
 - `/model thinking <level>`：设置当前模型支持的 thinking level。
 - `/tools list`：只读展示工具摘要；mutation 后置。
-- `/compact [instructions]`：Compaction 后端启用后使用 `DeferUntilPostRun`；idle 时立即压缩，running 时排为唯一 pending manual compact。
+- `/compact [instructions]`：Compaction 后端启用后使用 `QueueAfterRun`；idle 时立即压缩，running 时排为唯一 pending manual compact。
 
 暂缓 extension executable commands、project-local command handlers、复杂 form schema、generic runtime interaction submit、runtime-owned action ids、tool/permission mutation command 和 catalog hooks。
 
@@ -480,7 +493,12 @@ CommandCatalogEvent::Changed {
 - `/skill name args` 与 `/skill:name args` 归一到同一 invocation。
 - `ExecuteCommandText` 与 `ExecuteCatalogCommand` 最终都走 `resolve_for_execution`。
 - stale catalog selection 被拒绝或重解析，不执行旧 UI payload。
-- `/compact` 在 idle 时立即进入 handler，在 active work 时 resolve 为 `DeferUntilPostRun`，不能隐式调用 `AbortRun` 或转换成 follow-up message。
+- `PromptDelivery` 是 prompt-producing 输入的唯一交付入口；不再存在独立 `Steer` / `FollowUp` / `NextTurn` protocol command。
+- `/status` 在 active work 中按 `Immediate` 执行，command output 可立即显示且不进入模型上下文。
+- prompt-producing slash command 在 active work 中按 `prompt_delivery` 进入 steer/follow-up/next-turn，不把 raw slash text 入队。
+- `/compact` 在 idle 时立即进入 handler，在 active work 时 resolve 为 `QueueAfterRun`，不能隐式调用 `AbortRun` 或转换成 follow-up message。
+- `/skill review` + `Steer` 在下一模型调用前注入结构化 skill prompt intent；相同命令 + `FollowUp` 等当前 work 后再启动，不重复 parse raw slash text。
+- runtime 尚不支持运行中注入时，`Steer` 返回明确 capability/phase error，不能静默变成 `FollowUp`。
 - pending compact 已存在或 compaction 已开始时，重复执行分别返回 `CompactAlreadyQueued` / `CompactionAlreadyRunning`。
 - UI-visible catalog/result 不包含完整 `AgentCommand`、handler key、resource body 或 secret。
 - 高权限 `InternalAgentCommand` 不出现在公开协议、快照、事件或 command output 中。

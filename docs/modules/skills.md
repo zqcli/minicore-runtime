@@ -27,11 +27,14 @@ ResourceManager
 skills.rs
   provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
 
+PromptTurn
+  owns: 结构化 SkillPromptIntent 展开、从 captured PromptResourceView 取正文、<skill> 块构造和 ResolvedPromptInput 生成
+
 SessionRuntime
-  owns: /skill <name>、兼容 /skill:name 或 InvokeSkill 的展开、从 captured TurnResourceSnapshot 取正文、<skill> 块构造、user message 构造、入队或启动 run
+  owns: /skill intent admission、PromptDelivery、目标 turn capture、入队或启动 run
 ```
 
-`skills.rs` 可以被 `ResourceManager` 和 `SessionRuntime` 同时调用，但它本身不是 runtime service。模型可见技能的生命周期和 cwd-over-runtime overlay 由 `ResourceManager` 负责。
+`skills.rs` 可以被 `ResourceManager` 和 `Prompt` 同时调用，但它本身不是 runtime service。模型可见技能的生命周期和 cwd-over-runtime overlay 由 `ResourceManager` 负责。
 
 ## 与 ResourceManager 的边界
 
@@ -51,7 +54,7 @@ SessionRuntime
 | 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
 | `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
 | `/skill <name>` / `/skill:name` command text 解析 | 否 | 否，属于 `CommandManager.resolve_for_execution` |
-| `InvokeSkill` 构造 user message | 否，提供格式化 helper | 否，属于 `SessionRuntime` |
+| `InvokeSkill` 构造 user message | 否，提供格式化 helper | 否，属于 `PromptTurn.resolve_intent()` |
 
 一句话：`skills.rs` 负责“skill 长什么样、如何解析、如何格式化”；`ResourceManager` 负责“skill 从哪里来、何时加载、如何分层覆盖、哪一版对当前 turn 可见”。
 
@@ -66,36 +69,17 @@ TurnResourceSnapshot.cwd.resolved.skills
 
 因此 `skills.rs` 可以创建 catalog，`ResourceManager` 决定 catalog 何时创建、如何 overlay、何时发布。
 
-## 来自 pi coding-agent 的源码经验
+## 设计原则
 
-pi coding-agent 的生产路径是：
+`skills.rs` 只提供给定输入后的发现、metadata/frontmatter 解析、校验、去重、诊断和格式化 helper。资源 roots、trust、overlay、snapshot 和 reload 归 `ResourceManager`；显式调用的 delivery 归 `SessionRuntime`；skill body 到普通 user message 的组装归 `PromptTurn.resolve_intent()`。
 
-```text
-DefaultResourceLoader
-  └─ 调用 skills.ts 加载技能 metadata，并持有当前 skills 状态
-
-AgentSession._expandSkillCommand()
-  └─ 解析 /skill:name
-  └─ 从 resourceLoader.getSkills() 查 metadata
-  └─ readFileSync(skill.filePath)
-  └─ stripFrontmatter(content)
-  └─ 构造 <skill>...</skill>
-  └─ 作为普通 user message 进入 prompt / steer / followUp
-```
-
-`skills.ts` 不是完整的技能管理器。它主要提供：
-
-- `loadSkills()` / `loadSkillsFromDir()`：给定路径后的发现、读取 metadata、校验、去重和诊断。
-- `formatSkillsForPrompt()`：生成模型可见的 `<available_skills>` 摘要。
-- 技能 metadata 类型和相关解析能力。
-
-`AgentSession` 才负责显式技能调用的读取正文和 message 构造。这一点本项目应保留。
+pi coding-agent 的技能加载和显式注入路径可以作为参考对象，但不构成 MiniCore 的类型、文件布局或行为兼容承诺。MiniCore 的权威 interface 和不变量只由本文件及 ResourceManager/Prompt 文档定义。
 
 ## 技能发现和 metadata 加载
 
 `ResourceManager.reload_cwd()` / `ensure_cwd_snapshot()` 负责决定来源，`skills.rs` 负责把给定路径转换成 skill candidate / catalog 数据。
 
-pi coding-agent 的发现规则值得保留：
+MVP 技能发现规则：
 
 - 若目录包含 `SKILL.md`，该目录就是一个技能根，并且不再向下递归。
 - 若目录不包含 `SKILL.md`，递归子目录寻找 `SKILL.md`。
@@ -117,7 +101,7 @@ pi coding-agent 的发现规则值得保留：
 
 ## 数据结构
 
-pi coding-agent 的 catalog 默认只保存 metadata，并在显式调用时按路径读取正文。MiniCore 的 `ResourceManager` snapshot 需要更强的原子性：进入 `CwdResourceSnapshot.resolved` 的 selected skill 应保存 stable body content，或保存 content hash + immutable loaded content reference。这样 running turn 不会在 reload 或文件修改后读到与 captured catalog 不一致的正文。
+MiniCore 的 `ResourceManager` snapshot 要求 selected skill 保存 stable body content，或保存 content hash + immutable loaded content reference。这样 running turn 不会在 reload 或文件修改后读到与 captured catalog 不一致的正文。
 
 ```rust
 pub struct SkillMetadata {
@@ -149,7 +133,7 @@ pub struct SkillCatalog {
 }
 ```
 
-`SkillDocument` 可以作为显式调用或 `GetSkill` 的临时值，但不应放进 `agent_runtime_protocol::RuntimeSnapshot`：
+`SkillDocument` 可以作为显式调用或 `ResourceQuery::GetSkill` 的临时值，但不应放进 `agent_runtime_protocol::RuntimeSnapshot`：
 
 ```rust
 pub struct SkillDocument {
@@ -171,11 +155,11 @@ pub fn format_available_skills(catalog: &SkillCatalog, active_tools: &[ToolName]
 pub fn format_skill_block(metadata: &SkillMetadata, body: &str) -> String;
 ```
 
-显式调用时，`SessionRuntime` 应从 captured `TurnResourceSnapshot.cwd.resolved.skills` 取得 `SkillResource.body`，再调用 `format_skill_block()`。这样 message 构造保持在会话编排层，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
+显式调用时，目标 `PromptTurn` 应从 captured `PromptResourceView` 取得 `SkillResource.body`，再调用 `format_skill_block()`。这样 message 构造集中在 Prompt 组装 seam，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
 
 ## 模型可见技能摘要
 
-pi 的 `formatSkillsForPrompt()` 会生成：
+模型可见技能摘要采用以下稳定结构：
 
 ```text
 The following skills provide specialized instructions for specific tasks.
@@ -191,28 +175,28 @@ When a skill file references a relative path, resolve it against the skill direc
 </available_skills>
 ```
 
-本项目应保留这个模式，但要遵守两个约束：
+该结构必须遵守两个约束：
 
 - 只列出 `disable_model_invocation == false` 的技能。
 - 只有 active tools 中包含 `read` 时，才把可见技能列表放进 system prompt。
 
-原因是 pi 的模型可见技能摘要要求模型“用 read 工具加载技能文件”。如果当前会话没有 `read`，把技能位置暴露给模型会形成不可执行的承诺。用户显式 `InvokeSkill` 不受这个限制，因为 `SessionRuntime` 会直接展开正文。
+摘要会指示模型通过 `read` 加载技能文件；如果当前会话没有 `read`，把技能位置暴露给模型会形成不可执行的承诺。用户显式 `InvokeSkill` 不受这个限制，因为目标 `PromptTurn` 会直接展开 captured 正文。
 
 ## 显式技能调用
 
-显式调用属于 `SessionRuntime`：
+显式调用的 delivery 属于 `SessionRuntime`，组装属于 `PromptTurn`：
 
 ```text
 InvokeSkill、/skill <name> 或兼容 /skill:name
-  → SessionRuntime capture TurnResourceSnapshot
-  → 从 turn.cwd.resolved.skills 查找 selected SkillResource
+  → CommandManager resolves SkillPromptIntent
+  → SessionRuntime admits intent by PromptDelivery
+  → target turn captures TurnResourceSnapshot and creates PromptTurn
+  → PromptTurn.resolve_intent(...) finds selected SkillResource
   → skills::format_skill_block(metadata, body)
-  → 追加 additional instructions
-  → MessageRecord::user(...)
-  → 按 delivery 立即运行或入队
+  → ResolvedPromptInput / MessageRecord::user(...)
 ```
 
-调用格式对齐 pi：
+显式 skill block 使用以下稳定格式：
 
 ```text
 <skill name="skill-name" location="/abs/path/SKILL.md">
@@ -232,10 +216,10 @@ References are relative to /abs/path.
 
 1. `SessionRuntime` 从当前 session leaf 重建已有上下文消息。
 2. `SessionRuntime` capture `TurnResourceSnapshot`。
-3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `InvokeSkill`；`SessionRuntime` 处理该结构化 intent。
-4. `SessionRuntime` 从 `turn.cwd.resolved.skills` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块。
+3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `SkillPromptIntent`；`SessionRuntime` 只决定 delivery。
+4. 目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块。
 5. 格式化后的内容作为新的 user message 进入本次 `DriveEntry::Prompt` 或进入队列。
-6. `SessionRuntime` 基于 active tools、context files 和可见技能摘要重建 system prompt。
+6. `prompt::begin_turn(...)` 已基于 active tools、context files 和可见技能摘要构建同版 `PromptCallProfile`。
 7. 后期 `BeforeAgentStart` Hook 可以追加 custom messages 或替换 system prompt。
 8. `SessionRuntime` 从 `TurnState` 投影 `DriverTurnInput`，`Driver` 使用该窄输入创建 Rig run。
 9. user message、assistant message 和 tool result 都通过 `SessionRuntime` 写入 session。
@@ -262,9 +246,10 @@ App / workspace open
 
 InvokeSkill
   → SessionRuntime captures TurnResourceSnapshot
-  → SessionRuntime reads SkillResource from turn.cwd.resolved.skills
+  → SessionRuntime creates PromptTurn from captured PromptResourceView
+  → PromptTurn.resolve_intent reads SkillResource
   → skills::format_skill_block()
-  → SessionRuntime creates user message
+  → PromptTurn returns ResolvedPromptInput
   → Driver drive_run
   → SessionRuntime persists messages through SessionHandle
 
@@ -292,6 +277,7 @@ ReloadResources
 - 不要把技能当工具。技能只是 prompt resource；工具才有副作用。
 - 不要把技能全文塞进 `RuntimeSnapshot` 或资源摘要事件。`CwdResourceSnapshot` 可以为原子性保存 selected skill body，但 UI 默认只能看到 summary/detail query 的受控结果。
 - 不要让 UI 拼 `<skill>` 块。否则相对路径规则、frontmatter 剥离、队列语义和 session persistence 会分叉。
+- 不要让 `SessionRuntime`、CommandManager 或 Driver 各自实现一套 skill message 拼装；统一调用 `PromptTurn.resolve_intent()`。
 - 不要把模型可见技能列表和显式技能调用混为一谈。前者只是摘要，后者注入全文。
 - 不要在没有 `read` 工具时把技能列表暴露给模型。模型无法按摘要中的指令加载技能文件。
 - 不要让资源 reload 改写历史。已经持久化的 skill invocation 是一次历史 user message。
