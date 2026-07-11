@@ -439,7 +439,7 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → phase = idle
 ```
 
-手动 `Compact` 使用 `CommandRunPolicy::QueueAfterRun`。它绝不隐式 abort 当前 run，也不清理 pending approval、resume state 或消息队列。pending compact 是 `SessionRuntime` 持有的结构化 action，不是 follow-up/next-turn message；执行优先级高于普通 queued continuation。
+手动 `Compact` 使用 `CommandRunPolicy::QueueAfterRun`。它绝不隐式 abort 当前 run，也不清理 pending approval、resume state 或消息队列。pending compact 是 `SessionRuntime` 持有的结构化 action，不是 follow-up/next-turn message；执行优先级高于 queued steering/follow-up continuation；`NextTurn` 不会自动启动。
 
 同一 session 同时只允许一个 pending manual compact。重复请求返回 `CompactAlreadyQueued`，保留第一次请求的 instructions；已处于 compaction phase 时返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 runtime shutdown 会清除 pending compact。普通 run failure 如果不再 retry，仍会执行已经排队的 compact。
 
@@ -496,7 +496,7 @@ session_phase_changed { phase: idle }
 session_settled { session_id, next_turn_count }
 ```
 
-立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true`，压缩后可以直接启动后续 `run_started`，不先发 `session_settled`。
+立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true` 或压缩后将立即启动 queued steering/follow-up continuation，则直接进入后续 `run_started`，不先发 `session_settled`。`NextTurn` queue 可以保留且不阻止 settled。
 
 压缩后的 `usage_updated` 主要更新 `ContextUsageView`，不减少 `SessionStatsView.total_usage`。
 

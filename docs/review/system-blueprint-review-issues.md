@@ -235,7 +235,7 @@
 
 决策结果：手动 `/compact` / `AgentCommand::Compact` 使用 `CommandRunPolicy::QueueAfterRun`，绝不隐式 abort。session idle 时立即执行；存在 active run、waiting approval、suspended run 或立即 retry chain 时，`SessionRuntime` 保存唯一 `PendingSessionAction::Compact { command_id, instructions }`，当前 work 继续运行。pending action 通过 `queue_updated.pending_actions` 和 `QueueSnapshot.pending_actions` 暴露，不进入模型上下文或 follow-up/next-turn message queue。早期名称 `CommandPhasePolicy::DeferUntilPostRun` 已由 ADR 0016 收窄并替换。
 
-执行顺序固定为：当前 work terminal handling（required stable commit if any）+ terminal facts → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ follow-up / next-turn → `session_settled`。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
+执行顺序固定为：当前 work terminal handling（required stable commit if any）+ terminal facts → required overflow recovery / immediate retry chain → pending manual compact → threshold auto compaction（manual 已执行则跳过）→ queued steering continuation → follow-up continuation → `session_settled`；`NextTurn` queue 可以保持非空，不会自动启动或阻止 settled。重复 compact 返回 `CompactAlreadyQueued`；已在 compaction phase 返回 `CompactionAlreadyRunning`。`AbortRun`、`ClearQueue`、session close 或 shutdown 清除 pending compact。后续实现需验证 running compact 不改变 current run、pending approval、resume state、message queues 或 session leaf。
 
 ### BR-015：ResourceManager 原子快照与技能正文晚读文件不一致
 

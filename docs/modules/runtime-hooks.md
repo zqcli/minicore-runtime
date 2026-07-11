@@ -289,6 +289,8 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 | `ContextProjection` | Transform / Provider | 返回 `CurrentRun` / `CurrentCall` 的 `ContextMaterialContribution::Available/Unavailable`；privileged capability 才可 replace messages |
 | `AfterTurnStateBuild` | Observer | inspect stable turn state / PromptTurn summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
 
+`BeforeAgentStart` / `PromptBuilt` 位于 `run_started` 前的 bounded admission 窗口，只能执行有限的内存 transform/gate，并必须由自身 timeout/error policy 收尾；它们不能等待 provider/model/tool、用户交互、external job、网络服务或未限定时长的 extension work。需要这些长等待的能力必须移到 `run_started` 后、由明确 owner 和 cancellation lifecycle 管理。
+
 提示词注入应该返回 typed result，由 `SessionRuntime` 应用后交给 Prompt 最终组装，而不是让 UI、hook 或下游代码直接提交 system/messages。
 
 - 企业 policy / coding style：优先作为 required policy view 或 `PromptBuilt` append；system replacement 需要 privileged `ReplacePrompt` capability。
@@ -301,12 +303,12 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `RunBeforeStart` | Gate / Observer | cancel 或 observe |
+| `RunBeforeStart` | Gate / Observer | final validated `RunStartPlan`（不含 RunId）的 bounded cancel/observe；发生在 RunId 分配和 `DriveRequest` 构造前 |
 | `BeforeNextModelCall` | Transform / Gate | 形成组合式 `NextModelCallPlan`：drain queue、profile/model options、typed context、pause/finish |
 | `BeforeRunFinish` | Gate / Transform | decide finish/pause/follow-up |
 | `RunFinished` | Observer | telemetry / diagnostics |
 
-这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部；它只消费 `NextModelCallPlan`，再调用 Prompt 生成最终 `ModelInputProjection`。
+`RunStartPlan` 是 `SessionRuntime` 内部的 pre-drive view，只包含最终 entry、`DriverTurnInput`、limits 和 redacted correlation context，不是 `DriveRequest`，也不预分配 `RunId`。`RunBeforeStart` 与 `BeforeAgentStart` / `PromptBuilt` 受同一个 bounded admission 约束：只能做有限内存 gate/observe，不得等待 provider/model/tool、用户交互、external job、网络或无界 extension work。它若 cancel，则不分配/公开 RunId，也不发布 `run_started`。这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部；它只消费 `NextModelCallPlan`，再调用 Prompt 生成最终 `ModelInputProjection`。
 
 ### Model / Provider
 

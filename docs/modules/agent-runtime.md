@@ -107,6 +107,10 @@ ExecuteCommandText / ExecuteCatalogCommand
   → business events and/or command output events
 ```
 
+`AbortRun { run_id }` 是有意保留的 run-scoped 路由例外。`RunId` 在 runtime host 内全局唯一；`AgentRuntime` 通过 `LoadedSessionRuntimes` 的 current-run lookup 找到 owner `SessionRuntime`，不要求 UI 在命令中重复 session id。该 lookup 只覆盖已经发布 `run_started` 且尚未 terminal 的 current run，不创建可持久化 run registry，也不能取消 `Turn + current_run = None` 的 admission/finalization 窗口。
+
 只有当 resolved command 是 prompt-like input，例如 `/skill code-review ...`、兼容 `/skill:code-review ...` 或 `/{template}`，才会进入 `SessionRuntime` 的普通 prompt/run pipeline。`/status`、`/usage`、`/model`、`/thinking`、`/reload` 等命令不会直接进入 `Driver`；它们更新 runtime/session state、执行受控 query，或返回 display-neutral command result。
+
+`AgentRuntime` 不提供 `WaitForIdle` command 或稳定 `wait_until_settled()` 方法。它只发布 `run_finished` / `session_settled` 和 snapshot state；具体 CLI/RPC/test harness 如需 imperative await，应在 runtime 外围基于 EventStream 实现，不能把 waiter 注册或完成回执塞回 core event model。
 
 `AgentRuntime` 负责把同一个 `command_id` 贯穿到业务事件和 command output events 中。`CommandAck` 只说明 `ExecuteCommandText` / `ExecuteCatalogCommand` 是否被接收；命令的用户可见结果通过 command output 或业务事件返回。`RuntimeQuery` 不分配 `CommandId`，结果直接返回调用方；query 引用的事实后续变化时由正常业务事件更新或使 UI cache 失效。

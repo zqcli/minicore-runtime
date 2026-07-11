@@ -116,6 +116,10 @@ _避免_：事件总线、插件管理器、工具执行器、会话存储
 会话运行时当前互斥工作状态，封闭为 `Idle`、`Turn`、`Compaction` 和 `RetryBackoff`。`Turn` 可以覆盖 prompt preflight、一个或多个连续 Agent runs、审批等待、可恢复暂停、持久化和 post-run arbitration；它不等于单个 `RunId`。`RetryBackoff` 只表示 Agent run 自动重试前的调度等待，不表示 provider retry 或 compaction 内部重试。
 _避免_：CurrentRunState、branch summary、模型调用状态、loading 状态、按钮状态
 
+**会话已稳定（`session_settled`）**：
+会话处于 `Idle`，且没有 active run、compaction、retry、pending session action 或马上启动的 continuation；`NextTurn` queue 可以保留。它是 runtime 发布给 observer 的状态事实，不是 command、阻塞式 wait API 或“所有队列为空”的同义词。
+_避免_：WaitForIdle、run finished、queue empty、同步屏障
+
 **会话**：
 一次工作上下文的持久记录，包含消息、模型变化、思考等级变化、活跃工具变化、压缩摘要、标签、名称和当前叶子位置。
 _避免_：聊天记录、日志文件
@@ -312,9 +316,17 @@ _避免_：模型消息、会话条目、事件消息
 很薄的集成层，将 Ratatui、Tauri/Vue 或 CLI 这类具体界面技术翻译成 Agent 运行时命令与事件。它通常属于下游应用仓库；MiniCore 只定义协议和可复用 runtime 行为。
 _避免_：重复后端、UI 专属 Agent
 
+**编辑器草稿**：
+界面适配器持有的尚未提交文本、光标、selection、输入历史和 undo state。runtime 只拥有已经受理的结构化 prompt intent 与 queue 状态，不保存原始 slash text，也不负责在 abort 后把 queue item 还原到编辑器。具体 UI 可以基于本地 submission history 提供 best-effort restore，但它不是 core protocol、snapshot 或跨重连保证。
+_避免_：QueuedMessage、PromptIntent、durable user message、runtime event payload
+
 **Agent 运行**：
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
+
+**运行标识（`RunId`）**：
+一次已经公开启动的 `Driver::drive_run()` / Agent loop 执行实例的 runtime-host-global opaque id。它在 runtime 准备创建 `CurrentRun`、调用 Driver 并发布 `run_started` 时分配，同一 run 内的模型调用、工具轮次、审批、suspend/resume 和 terminal event 共享该 id；新的 retry/continuation `drive_run()` 使用新 id。`RunId` 不是 prompt admission、`CommandId`、user turn、session revision 或跨进程 resume token，不能用于取消尚未公开启动的 work。
+_避免_：命令 id、模型调用 id、工具调用 id、会话 entry id、持久化 revision
 
 **待执行会话动作（`PendingSessionAction`）**：
 `SessionRuntime` 接受 `CommandRunPolicy::QueueAfterRun` 后保存、并在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。

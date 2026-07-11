@@ -153,7 +153,7 @@ pub struct LoadedSessionRuntimes {
 }
 ```
 
-`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`insert`、`replace`、`set_focused`、`close`、`shutdown_all` 和可选的 idle unload。不要在这里追加 message、构建上下文、执行工具、调用模型或发布 UI event，也不要根据 focus 切换改写已加载 runtime 的 workspace/cwd、phase、queue 或 current run。
+`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`find_current_run(run_id)`、`insert`、`replace`、`set_focused`、`close`、`shutdown_all` 和可选的 idle unload。`find_current_run` 只扫描/索引当前 host 中已经发布 `run_started` 且尚未 terminal 的 run，用于路由 `AbortRun { run_id }`；它不是 durable run registry。不要在这里追加 message、构建上下文、执行工具、调用模型或发布 UI event，也不要根据 focus 切换改写已加载 runtime 的 workspace/cwd、phase、queue 或 current run。
 
 `SessionHandle` 是 `SessionRuntime` 的主要消费对象：
 

@@ -399,8 +399,11 @@ AgentCommand::SetModel { provider_id, model_id }
 ```text
 SubmitPrompt / prompt-like intent
   → SessionRuntime captures TurnResourceSnapshot and creates PromptTurn
-  → PromptTurn.resolve_intent(...) returns ResolvedPromptInput
-  → SessionRuntime persists current input and builds TurnState
+  → PromptTurn.resolve_intent(...) returns preliminary ResolvedPromptInput
+  → SessionRuntime applies bounded BeforeAgentStart / PromptBuilt / RunBeforeStart and revalidates
+  → SessionRuntime commits final UserInput and publishes invocation/message events
+  → SessionRuntime builds final TurnState
+  → allocate RunId + establish CurrentRun + publish run_started
   → SessionRuntime projects DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }
   → Driver.drive_run(...)
   → AgentRunStep::CallModel
