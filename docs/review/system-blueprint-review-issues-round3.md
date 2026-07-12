@@ -24,10 +24,10 @@
 
 1. **原唯一架构缺口已关闭**：BR-047 已通过 ADR 0021 定义 per-session actor、显式 `SessionRuntimeHandle`、run-scoped `RunTask`、私有 `RunLink` 和 owned `SessionDriverHost`，approval/abort/queue command 不再被完整 run 阻塞。
 2. **少量硬矛盾与死表面**：`project_model_call` receiver 矛盾已按 BR-048 关闭；仍待处理的是 `ResumeRun` 作为 MVP 中没有产生源的死命令，以及若干被引用但未定义的 MVP 载荷类型（BR-052）。
-3. **前两轮遗留的 Open/观察未执行**：BR-036（多 workspace）仍 Open，本轮确认它是 `AgentRuntime` / `SessionManager` bootstrap 的开发阻塞，建议开工前用一页 ADR 关闭；round2 过程性观察 #1/#3 的协议裁边至今未做（BR-058）。
+3. **前两轮遗留项**：BR-036 已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭为单实例薄边界容器；round2 过程性观察 #1/#3 的协议裁边仍待处理（BR-058）。
 4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）、sandbox 只有校验规范无 enforcement 方案（BR-050）。
 
-这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-047 所需 ADR 已完成；BR-036 仍建议用一页 ADR 关闭，其余多为文档级定稿。
+这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-036、BR-047 和 BR-048 的前置设计均已完成，其余多为文档级定稿。
 
 ## 高风险
 
@@ -131,7 +131,7 @@
 
 风险：实现第一周就会碰到的实际空洞；`ResumeRun` 留在 MVP 会误导验收范围。
 
-待处理方向：定义 `UserInput` / `StreamOptions` / `ThinkingLevel`；把 `ResumeRun` 移入"后续命令"；写明 `NewSession` 的 cwd 来源（workspace root、显式参数还是 settings 默认）。
+待处理方向：定义 `UserInput` / `StreamOptions` / `ThinkingLevel`；把 `ResumeRun` 移入"后续命令"。（cwd 来源已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭；其余仍 Open。）
 
 ## 中风险
 
@@ -227,18 +227,13 @@
 
 ### BR-059：`SessionListFilter` 双形状，`SessionManager` 方法名漂移
 
-状态：Open
+状态：Partially Resolved
 
-问题：`SessionListFilter` 有两种形状——`agent-runtime-protocol.md` 定义 `SessionListFilter { query: Option<String> }` 且 scope 独立为 `SessionListScope`；`session-manager.md` 却要求它支持按 workspace scope 查询，而 `SessionManager.list(filter)` 签名没有 scope 参数。方法名也漂移：trait 定义 `list` / `open` / `create`，而 `session-manager.md` 正文与事件文档分别写 `list_sessions(...)` / `open_handle(...)` / `create_handle(...)`。
+处理记录：ADR 0022 集成时已统一 catalog list seam：协议 `scope/filter/cursor/limit` 一一映射到 `SessionManager.list(SessionListRequest)`，scope 不再塞入 `SessionListFilter`；`Recent` 明确为显式跨 workspace 全局查询。剩余问题只限旧 review/示例中的 `open_handle` / `create_handle` 等方法名漂移。
 
-证据：
+原风险：同名类型两种形状会导致 workspace catalog 过滤实现分叉。
 
-- `docs/modules/agent-runtime-protocol.md`：`SessionListFilter { query }` + 独立 `SessionListScope`。
-- `docs/modules/session-manager.md`：filter 支持 workspace scope 的表述；方法名多写法并存。
-
-风险：同名类型两种形状；trait 签名与散文不一致。
-
-待处理方向：统一 `SessionListFilter` 形状与 `SessionManager.list` 签名（scope 放 filter 还是独立参数二选一）；统一方法命名。
+待处理方向：后续机械统一遗留方法名，不再改 list 请求形状。
 
 ### BR-060：`message_assistant_finished` 双语义不可从事件区分，`usage_updated` 非强制且无 only-on-change
 
@@ -315,7 +310,7 @@
 
 风险：Windows canonical 前缀会污染 `ResourceKey` 比较；嵌入式场景下 JSONL 双进程行为未定。
 
-待处理方向：统一 Windows `\\?\` 前缀的处理规则；补一句 JSONL 单写入者/跨进程打开的声明（可容忍即显式声明可容忍）。
+待处理方向：补一句 JSONL 单写入者/跨进程打开的声明。workspace root 的 canonical identity 已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) D2 定型；`ResourceKey` / skill 展示比较规则和 JSONL 并发仍 Open。
 
 ### BR-065：skill 复现边界未写明，若干命名/措辞双轨
 

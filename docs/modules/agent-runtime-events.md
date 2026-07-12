@@ -149,6 +149,8 @@ UI reducer 必须消费完整 `Event`。组件若需要在 dispatch stack 外保
 
 | 事件层级 | `workspace_id` | `session_id` | `run_id` | `command_id` |
 | --- | --- | --- | --- | --- |
+| workspace opened | 新 workspace id 必填 | `None` | `None` | originating open command id |
+| workspace open failed | `None` | `None` | `None` | originating open command id |
 | diagnostics | 按最细可归属 owner；可空 | 按最细可归属 owner；可空 | 按最细可归属 owner；可空 | 相关命令 id 或 `None` |
 | workspace resources | 必填 | `None` | `None` | reload 命令 id 或 `None` |
 | session create/open/import/delete/close | 必填 | 目标 session 必填 | `None` | 触发命令 id 或 `None` |
@@ -235,6 +237,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 
 | Family | Wire event type 示例 | 生命周期 | 是否可由 RuntimeSnapshot 重建 |
 | --- | --- | --- | --- |
+| workspace lifecycle | `workspace_opened`、`workspace_open_failed` | opening -> opened/failed | opened 可由 snapshot 重建；failed 是 command-scoped fact |
 | session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_tree_changed` | 离散事实 | 是 |
 | run lifecycle | `run_started`、`run_suspended`、`run_resumed`、`run_finished` | started -> suspended/resumed* -> terminal | 是，当前 run 只能部分重建 |
 | message lifecycle | `message_user_appended`、`message_assistant_started`、`message_assistant_text_delta`、`message_assistant_finished`、`message_tool_result_appended` | appended 或 started -> delta* -> finished | committed message 可重建；active partial 只在当前 host/current run 中可见 |
@@ -714,23 +717,39 @@ MVP 可以不暴露 `runtime_lifecycle_changed`，因为 UI 通常通过 workspa
 
 ### 4. Workspace Lifecycle
 
+MVP 单 workspace 实例（[ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)）：
+
 ```text
 NoWorkspace
-  → Opening
-  → Open
-  → ReloadingResources
-  → Open
-  → Closing
-  → NoWorkspace
+  → Opening                       (首次 OpenWorkspace)
+  ├─ workspace_opened → Open
+  └─ workspace_open_failed → NoWorkspace
+Open
+  → ReloadingResources → Open     (ReloadResources)
 ```
+
+`Opening` 中再次收到 `OpenWorkspace`：canonical root 相同则 accepted 并共享 in-flight initialization，异 root 拒绝 `WorkspaceOpening`。`Open` 中同 root 幂等 accepted，不重新加载；异 root 拒绝 `WorkspaceAlreadyOpen`。runtime 不提供 `CloseWorkspace`；从 `Open` 回到 `NoWorkspace` 只发生在 host shutdown / 重建实例的 teardown 路径。
 
 对应事件：
 
+- `workspace_opened`
+- `workspace_open_failed`
 - `resources_reload_started`
 - `resources_changed`
 - `diagnostics_runtime_changed`
 
-资源 reload 失败不应进入 `NoWorkspace`，而是保持旧 revision，并通过 diagnostics 表达失败。
+首次初始化失败必须丢弃 partial services 并回到 `NoWorkspace`。资源 reload 失败不应进入 `NoWorkspace`，而是保持旧 revision，并通过 diagnostics 表达失败。
+
+必测项：
+
+- `Opening` 期间同 root command 共享初始化且只发布一个 `workspace_opened`；异 root 拒绝；初始化失败只发布一个 `workspace_open_failed`。
+- `Open` 中同 canonical root 重复 `OpenWorkspace` 幂等，不重载资源；异 root 拒绝 `WorkspaceAlreadyOpen`。
+- `WorkspaceIdV1` golden vectors：同一 canonical root 跨进程稳定，规范路径变体按 ADR 0022 归一，id/root collision fail closed。
+- `NewSession` workspace mismatch、cwd root/subdir/越界/symlink escape 分支全部覆盖。
+- `OpenSession` 在 resource load 前复验 persisted id/version/root/cwd，错误 metadata 不得创建 runtime。
+- `ReloadResources` / `ResourceQuery` 的 `workspace_id` 不匹配当前 workspace 拒绝 `WorkspaceMismatch`。
+- `workspace_opened` 以及所有 session/run 级事件外层 `workspace_id` 必填且等于当前 workspace；`workspace_open_failed` 是 command/runtime-scoped，外层 `workspace_id = None`。
+- `SessionQuery::List { scope: CurrentWorkspace }` 在重启后命中上次同 root 创建的历史会话。
 
 ### 5. Session Catalog And Loaded Runtime Lifecycle
 
@@ -1327,14 +1346,17 @@ UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overfl
 
 ```text
 UI dispatch(OpenWorkspace)
-  → WorkspaceServices::new(...)
+  → AgentRuntime canonicalizes root and derives WorkspaceIdV1
+  → enter Opening; CommandAck confirms admission only
+  → WorkspaceServices::new(validated workspace)
   → ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)
       └─ missing: build RuntimeResourceSnapshot and replace_runtime(...)
+  → workspace_opened { workspace }
   → RuntimeSnapshot { workspace: Some(...), loaded_sessions: [] }
 
 UI dispatch(OpenSession or NewSession)
   → SessionManager.open_handle(...) / create_handle(...)
-  → read fixed { workspace_id, cwd } from session metadata
+  → AgentRuntime validates fixed { workspace_id, workspace_root, cwd }
   → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest { reason: SessionOpen, ... })
       ├─ missing: load cwd-local resources, overlay, replace_cwd(...)
       └─ stale runtime revision: recompose_cwd(...), replace_cwd(...)
@@ -1342,7 +1364,7 @@ UI dispatch(OpenSession or NewSession)
   → session_opened
 ```
 
-MVP 没有公开 `workspace_opened` 事件；`OpenWorkspace` 的接收由 `CommandAck` 表达，打开后的 workspace state 由 snapshot 恢复。后期 hook point `WorkspaceOpened` 也不等于公开 wire event。
+若 canonicalization、service construction 或初始 runtime resource snapshot 失败，runtime 丢弃 partial services、回到 `NoWorkspace` 并发布 `workspace_open_failed`；不能留下 `workspace = Some(...)` 的半开状态。后期 hook point `WorkspaceOpened` 与公开完成事件是不同概念。
 
 `ensure_*` 必须幂等。并发 open session、first turn 或 reload 只能通过 `ResourceSnapshotStore.replace_*` 发布完整的新 snapshot，不能让 UI 事件成为状态更新来源。
 
@@ -1443,6 +1465,8 @@ MVP event lifecycle tests 应覆盖：
 - command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过 `ExecuteCatalogCommand`、runtime-tracked `SubmitInteraction` 或明确结构化 `AgentCommand` 完成设置；不依赖 interaction request 携带 raw command text。
 - command text semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
 - explicit session routing：core 没有 `FocusSession` / focus event；session-scoped command 缺少 `SessionId` 时返回 `SessionRequired`，不能回退到唯一 loaded 或最近 opened session。
+- workspace lifecycle：首次 open success/failure、Opening 同根合并/异根拒绝、Open 同根幂等/异根拒绝，且 adapter 只在 `workspace_opened` 后请求 snapshot。
+- workspace boundary：`WorkspaceIdV1` golden vectors 和 collision fail-closed；New/OpenSession、ReloadResources、ResourceQuery 的 id/root/cwd 校验在任何 resource load/runtime spawn 前发生。
 - multi-session snapshot：两个或更多 loaded sessions 同时推进 work 时，projection barrier 产生同一水位的 `loaded_sessions`；客户端 selection 不改变 coverage，close/open 与 sequence 不得形成跨水位拼接。
 - handle snapshot barrier：snapshot builder 冻结 loaded handle membership，flush 每个 actor 的 accepted progress/control effects，再读取 all-loaded projection 和 `last_event_sequence`；禁止逐 handle 无保护拼接。
 - abort run routing：`RunOwnerIndex` 在 `run_started` 前登记并在 terminal boundary 清除；stale index 命中时目标 actor 二次校验拒绝，不能 abort 后来的 run。
