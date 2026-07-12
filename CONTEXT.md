@@ -32,9 +32,9 @@ _避免_：运行时桥接、直接导入 SDK、UI 回调、command 子系统
 描述 `agent_runtime_protocol::Event` 的命名、顺序、所有权、重连和生命周期规则。它不是事件类型定义本身，也不是会话持久化日志。
 _避免_：协议类型集合、会话日志、UI 状态管理
 
-**工作区**：
-用户选定的本地项目目录，用来限定助手的文件与命令访问范围。
-_避免_：当前文件夹、项目路径
+**工作区（Workspace）**：
+一次 runtime 生命周期内打开的项目上下文容器，由 `OpenWorkspace { path }` 的 canonical root path 定义身份（`WorkspaceId` 从该路径确定性派生，跨进程稳定）。它界定 session cwd 的合法域（root 及其之下）、充当持久化会话目录的分组维度，并投影 `WorkspaceSummary` 供 UI 展示。MVP 单实例、单根；`AgentRuntime` 是它的持有者，重复 `OpenWorkspace` 同根幂等、异根拒绝。它不承载 project trust（per-cwd）、项目资源 scope（per-cwd）、provider/auth/settings（user-global）或运行时服务生命周期。详见 [ADR 0021](docs/adr/0021-workspace-is-single-instance-thin-boundary.md)。
+_避免_：VS Code 式多根容器、多 workspace 并存、trust 边界、资源 scope owner、UI 当前项目状态、隔离单元
 
 **编程能力**：
 助手通过 read、edit、write、search、list 或 shell execution 等工具检查或修改工作区的行为。

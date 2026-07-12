@@ -24,10 +24,10 @@
 
 1. **一个真正的架构缺口**：session 内并发/借用模型未定义，按现有草图 approval 会死锁（BR-047）。这是唯一需要新 ADR 的结构性问题，也是第一条真实纵切就会撞上的问题。
 2. **少量硬矛盾与死表面**：`project_model_call` 的 receiver 三方不一致（BR-048）、`ResumeRun` 是 MVP 里没有产生源的死命令、若干 MVP 载荷类型被引用而未定义（BR-052）。
-3. **前两轮遗留的 Open/观察未执行**：BR-036（多 workspace）仍 Open，本轮确认它是 `AgentRuntime` / `SessionManager` bootstrap 的开发阻塞，建议开工前用一页 ADR 关闭；round2 过程性观察 #1/#3 的协议裁边至今未做（BR-058）。
+3. **前两轮遗留项**：BR-036（多 workspace）本轮已由 [ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md) 关闭为单实例薄边界容器；round2 过程性观察 #1/#3 的协议裁边至今未做（BR-058）。
 4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）、sandbox 只有校验规范无 enforcement 方案（BR-050）。
 
-这些都不动摇模块边界，返工风险局限在个别文件的接口形状。除 BR-047 需要新 ADR、BR-036 需要一页 ADR 外，其余多为文档级定稿，合计约 3~5 天。
+这些都不动摇模块边界，返工风险局限在个别文件的接口形状。除 BR-047 需要新 ADR 外（BR-036 已由 ADR 0021 关闭），其余多为文档级定稿，合计约 3~5 天。
 
 ## 高风险
 
@@ -123,7 +123,7 @@
 
 风险：实现第一周就会碰到的实际空洞；`ResumeRun` 留在 MVP 会误导验收范围。
 
-待处理方向：定义 `UserInput` / `StreamOptions` / `ThinkingLevel`；把 `ResumeRun` 移入"后续命令"；写明 `NewSession` 的 cwd 来源（workspace root、显式参数还是 settings 默认）。
+待处理方向：定义 `UserInput` / `StreamOptions` / `ThinkingLevel`；把 `ResumeRun` 移入"后续命令"；写明 `NewSession` 的 cwd 来源（workspace root、显式参数还是 settings 默认）。（(c) 项 cwd 来源已由 [ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md) 关闭：`NewSession` 增加 `cwd: Option<PathBuf>`，`None` → workspace root，显式 cwd 须在 root 之下；`UserInput` / `StreamOptions` / `ThinkingLevel` 定义与 `ResumeRun` 移出仍 Open。）
 
 ## 中风险
 
@@ -307,7 +307,7 @@
 
 风险：Windows canonical 前缀会污染 `ResourceKey` 比较；嵌入式场景下 JSONL 双进程行为未定。
 
-待处理方向：统一 Windows `\\?\` 前缀的处理规则；补一句 JSONL 单写入者/跨进程打开的声明（可容忍即显式声明可容忍）。
+待处理方向：统一 Windows `\\?\` 前缀的处理规则；补一句 JSONL 单写入者/跨进程打开的声明（可容忍即显式声明可容忍）。（workspace root 的 canonical 规范化已由 [ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md) D2 统一为 canonical root path；`ResourceKey` / skill 路径的展示比较规则和 JSONL 并发仍 Open，应复用同一套规范化。）
 
 ### BR-065：skill 复现边界未写明，若干命名/措辞双轨
 

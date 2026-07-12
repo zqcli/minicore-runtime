@@ -36,11 +36,13 @@ pub trait AgentRuntime {
 
 `OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认加载任何旧 session。刚打开 host 时 `RuntimeSnapshot.loaded_sessions` 为空；持久化 session list 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。`OpenSession` / `NewSession` 成功后，`AgentRuntime` 通过 `SessionManager` 创建或加载 `SessionRuntime`，并把该会话的初始 idle 状态加入后续 `RuntimeSnapshot.loaded_sessions`。
 
+按 [ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md)，workspace 是单实例薄边界容器：`AgentRuntime` 是它的持有者，同一 runtime 生命周期内只 `Open` 一个 workspace。`WorkspaceId` 从 canonical root path 确定性派生（跨进程/重启稳定），workspace 只承载 root 边界、session 归属分组和 `WorkspaceSummary` 投影，不承载 project trust（per-cwd）、资源 scope（per-cwd）、provider/auth/settings（user-global）。`Open` 状态下重复 `OpenWorkspace`：同一 canonical root 幂等成功，不 teardown、不重载资源、不影响 loaded sessions；不同 root 拒绝 `WorkspaceAlreadyOpen`。runtime 不提供 `CloseWorkspace`；"换项目"由 host 丢弃并重建整个 `AgentRuntime` 实例完成（与 UI/runtime 同生命周期一致）。session cwd 必须位于 workspace root 之下，边界校验见 [AgentRuntimeProtocol](agent-runtime-protocol.md) 的工作区命令语义。
+
 MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生命周期，不作为独立 daemon/server 存活。`subscribe()` / `snapshot()` 的 reconnect 语义用于同一程序上下文内的 late subscribe、reducer/subscriber 重建和 sequence gap recovery；不支持 UI adapter 失败但 runtime 继续运行、随后由新 UI 连接并恢复所有后台 session 的模式。
 
 ## 运行时服务
 
-`RuntimeServices` 是内部总称，不随任何客户端 selection 改变。MVP 支持一个 host/runtime 进程内多个 `SessionRuntime` 同时 loaded 并推进 work，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。
+`RuntimeServices` 是内部总称，不随任何客户端 selection 改变。MVP 支持一个 host/runtime 进程内多个 `SessionRuntime` 同时 loaded 并推进 work，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。MVP 中 workspace 生命周期 == runtime 生命周期，`WorkspaceServices` 名实相符；未来若出现单 runtime 多 workspace（当前非目标）或 supervisor 拆分，需先把它拆为 runtime-level 与 workspace-level 两层，MVP 不预建该拆分。
 
 ```text
 AgentRuntime
@@ -53,8 +55,8 @@ AgentRuntime
       ├─ ResourceManager
       │   ├─ ResourceSnapshotStore
       │   │   ├─ current runtime -> Arc<RuntimeResourceSnapshot rev-r>
-      │   │   ├─ key: (workspace_id, cwd) -> Arc<CwdResourceSnapshot rev-a -> rev-r>
-      │   │   └─ key: (workspace_id, cwd) -> Arc<CwdResourceSnapshot rev-b -> rev-r>
+      │   │   ├─ key: (workspace_id, <root>) -> Arc<CwdResourceSnapshot rev-a -> rev-r>
+      │   │   └─ key: (workspace_id, <root>/api) -> Arc<CwdResourceSnapshot rev-b -> rev-r>
       │   ├─ ResourceResolver / loaders
       │   └─ ResourceOverlayPolicy
       ├─ SettingsStore / user-global EffectiveSettings
@@ -63,13 +65,15 @@ AgentRuntime
       └─ ModelGateway / shared model invocation boundary
 
 LoadedSessionRuntimes
-  ├─ SessionRuntime A { workspace_id, cwd: repo-a, command: Command }
-  │   └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-10)
-  ├─ SessionRuntime B { workspace_id, cwd: repo-a, command: Command }
-  │   └─ next run captures current CwdSnapshot(repo-a)
-  └─ SessionRuntime C { workspace_id, cwd: repo-b, command: Command }
-      └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-4)
+  ├─ SessionRuntime A { workspace_id, cwd: <root>, command: Command }
+  │   └─ current run captures TurnResourceSnapshot -> CwdSnapshot(<root>, rev-10)
+  ├─ SessionRuntime B { workspace_id, cwd: <root>, command: Command }
+  │   └─ next run captures current CwdSnapshot(<root>)
+  └─ SessionRuntime C { workspace_id, cwd: <root>/api, command: Command }
+      └─ current run captures TurnResourceSnapshot -> CwdSnapshot(<root>/api, rev-4)
 ```
+
+示例中三个 session 同属一个 workspace（同一 root）：A、B 共享 root 这个 cwd 与其 `CwdResourceSnapshot`，C 在 root 下的子目录 `api`，各自 per-cwd 资源。所有 session cwd 都必须位于 workspace root 之下（[ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md) D3）；跨仓库多目录属于 additional roots 演进，MVP 不支持。
 
 Provider settings、auth 和 custom providers 是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth。`ModelSelection` 属于 session state；`ModelGateway` 每次调用通过 user-global `ProviderRegistry` 和 `AuthStore` 解析 provider/auth，不随 cwd 或客户端 selected session 重建。
 
