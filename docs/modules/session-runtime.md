@@ -66,6 +66,8 @@ phase guard 还必须结合 `CurrentRunState` 和 command policy：`DecideToolAp
 
 `Turn` 可以包含连续多个 run；只要 immediate retry/continuation、pending action 或 overflow recovery 将立即继续，就不经过 `Idle`，也不发送 `session_settled`。完整转换矩阵见 [AgentRuntimeEvents](agent-runtime-events.md)。`BranchSummary` 不属于 MVP phase；未来若实现独立摘要模型任务，应定义明确 `ModelCallPurpose` 和 lifecycle，而不是预留幽灵 phase。
 
+自动重试按 attempt 配对。当前 run 先发布唯一 `run_finished { failed }`，再由 post-run arbitration 从 `Turn` 直接切换到 `RetryBackoff` 并发布 `retry_auto_started { attempt }`；backoff 结束后切回 `Turn`，建立新的 `CurrentRun` 并发布 `run_started`。该 retry run terminal 后先发布 `run_finished`，再发布同 attempt 的 `retry_auto_finished { status: Succeeded | Failed | Aborted }`。失败且仍有下一 attempt 时直接再次进入 `RetryBackoff`，不能经过 `Idle`；只有 retry chain、overflow recovery、pending action 和立即 continuation 都不会继续时，才切回 `Idle` 并发布 `session_settled`。context overflow 使用 `Turn → Compaction → Turn` 的独立 recovery，不进入 `RetryBackoff`；provider 内部 fallback/retry 也不改变 session phase。
+
 ## Prompt Admission And Turn Assembly
 
 `SessionRuntime` 负责何时接收、排队和启动 prompt-like work，但不再手工拼 skill/template/system prompt。边界如下：
@@ -330,7 +332,7 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 6. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
 7. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
 8. 构造 `SessionWriteBatch::compaction(...)`，通过 `SessionHandle.commit(batch)` 原子提交 compaction entry 与 leaf update，再调用上下文构建能力重建 messages。
-9. commit 成功后发出 `compaction_finished`，随后 phase 回到 `idle`；如果还有 queued steering continuation / follow-up，则继续对应 work，否则发出 `session_settled`。`NextTurn` 可以在 settled 状态保留。如果是 overflow recovery 且需要立即重试，则不先发 `session_settled`，直接启动后续 run。
+9. commit 成功后发出 `compaction_finished`，再由 post-compaction arbitration选择下一 phase：overflow recovery 或 queued steering/follow-up 将立即继续时切换到 `Turn` 并发布 `run_started`；需要延迟 retry 时进入 `RetryBackoff`；只有没有立即工作时才回到 `Idle` 并发布 `session_settled`。`NextTurn` 可以在 settled 状态保留，任何 immediate continuation 都不能先经过 `Idle`。
 
 自动压缩流程：
 

@@ -771,7 +771,7 @@ PersistedSession
 | `Idle` | `Turn` | idle prompt/follow-up 开始产品级工作 |
 | `Idle` | `Compaction` | manual/auto compaction 立即开始 |
 | `Turn` | `Idle` | terminal handling（required stable commit if any）、terminal facts 和 post-run arbitration 完成，且没有立即 continuation |
-| `Turn` | `RetryBackoff` | Agent run 失败且已安排带等待窗口的自动重试 |
+| `Turn` | `RetryBackoff` | Agent run 失败且已安排自动重试；`delay_ms` 可以为 0 |
 | `Turn` | `Compaction` | post-run manual/auto compaction 或 overflow recovery 开始 |
 | `RetryBackoff` | `Turn` | backoff 结束并启动 retry run |
 | `RetryBackoff` | `Idle` | retry 被取消、禁用或不再继续 |
@@ -975,7 +975,9 @@ Requested while idle
   → SessionWriter.commit(SessionWriteBatch::compaction(...))
   → RebuildingSessionContext
   -- compaction_finished --> Finished(aborted? failed? will_retry?)
-  → session_settled or run_started
+  ├─ immediate retry/continuation → session_phase_changed(turn) → run_started
+  ├─ delayed retry → session_phase_changed(retry_backoff) → retry_auto_started
+  └─ no immediate work → session_phase_changed(idle) → session_settled
 
 Requested while active work
   -- queue_updated(pending compact) --> Deferred
@@ -990,24 +992,24 @@ Requested while active work
 - `session_phase_changed { phase: compaction }`
 - `compaction_started`
 - `compaction_finished`
-- `session_phase_changed { phase: idle }`
-- `session_settled` 或紧接 `run_started`
+- `session_phase_changed { phase: turn | retry_backoff | idle }`
+- 只有进入 `idle` 时才发布 `session_settled`；进入 `turn` 时紧接 `run_started`
 
 摘要模型调用不发 `message_assistant_started`，因为它不是用户会话里的 assistant 回复。
 
 ### 15. Auto Retry Lifecycle
 
-Auto retry 是 run failure 后的恢复流程。
+Auto retry 是 run failure 后的恢复流程。每个 `retry_auto_started { attempt }` 表示一个确定的 retry attempt，必须恰好由同 attempt 的 `retry_auto_finished` 关闭；不能像 pi 的宽松事件流那样让多个 start 共用一个最终 end。`attempt` 从 1 开始，表示原始失败后的第几次自动重试，`max_attempts` 表示允许的最大自动重试次数。
 
 ```text
-Turn
+failed run terminal facts
   -- session_phase_changed(retry_backoff) --> RetryBackoff
-  -- retry_auto_started --> ScheduledBackoff
-  → RetryStarting
+  -- retry_auto_started(attempt=N) --> ScheduledBackoff
+  → retry delay elapses
   -- session_phase_changed(turn) --> Turn
-  -- run_started --> Running
-  -- run_finished --> RunTerminal
-  -- retry_auto_finished --> RetryFinished(success | failed | aborted)
+  -- run_started --> RunningRetryAttempt
+  -- run_finished --> RetryRunTerminal
+  -- retry_auto_finished(attempt=N, status) --> RetryAttemptFinished
 ```
 
 对应事件：
@@ -1017,7 +1019,9 @@ Turn
 - `run_finished`
 - `retry_auto_finished`
 
-如果 retry 会马上启动新 run，前一个 failed run 后不应发 `session_settled`，否则 UI 会短暂误判为空闲。
+`retry_auto_finished.status` 使用 `Succeeded | Failed | Aborted`，不能用 `success: bool` 把 failed 与 aborted 合并。若 attempt 失败且仍可继续，顺序是 `run_finished(failed)` → `retry_auto_finished(failed, attempt=N)` → `session_phase_changed(retry_backoff)` → `retry_auto_started(attempt=N+1)`；中间不进入 `Idle`。若 backoff 被 `AbortRetry` 取消，顺序是 `retry_auto_finished(aborted)` → 最终 post-run arbitration → `session_phase_changed(idle)` / `session_settled`，或直接进入另一个待执行 workflow。
+
+即使 `delay_ms = 0`，也保留 `Turn → RetryBackoff → Turn` 的 phase 事实；两个 phase event 可以紧邻，但不能伪造 `Idle`。`retry_auto_started` 之后即使 retry admission 在 `run_started` 前失败，也必须发布 matching `retry_auto_finished(failed)`。如果 retry 会马上启动新 run，前一个 failed run 后不应发 `session_settled`，否则 UI 会短暂误判为空闲。
 
 ### 16. Usage And Context Usage Lifecycle
 
@@ -1268,17 +1272,22 @@ run_started
 message_assistant_started?              // if provider streaming had started
 discard uncommitted partial assistant / incomplete tool round
 message_assistant_finished?             // required iff started; not persisted
-diagnostics_error { recoverable }              // run coordinate comes from outer Event
+diagnostics_error { recoverable }        // run coordinate comes from outer Event
 run_finished { status: failed }
-session_phase_changed { phase: idle }
-session_settled or retry_auto_started
+post-run arbitration
+  ├─ retry scheduled    → session_phase_changed(retry_backoff) → retry_auto_started
+  ├─ overflow recovery  → session_phase_changed(compaction) → compaction_started
+  ├─ pending compaction → session_phase_changed(compaction) → compaction_started
+  ├─ immediate continuation → remain Turn → run_started
+  └─ no immediate work  → session_phase_changed(idle) → session_settled
 ```
 
 原则：
 
 - 同步 preflight 失败不启动 run，直接拒绝 command 或发外层携带 `command_id` 的 `diagnostics_error`。
-- 可重试 provider 失败可以进入 `retry_auto_started`，但仍要关闭当前 run。
-- context overflow recovery 不把 transient overflow assistant error 写入 session；它只通过 diagnostics 呈现，并从最后 committed context 启动 recovery。
+- 可重试 Agent run 失败必须先关闭当前 run，再直接从 `Turn` 进入 `RetryBackoff`；不能为了发布 retry event 先经过 `Idle`。
+- context overflow recovery 不把 transient overflow assistant error 写入 session；它只通过 diagnostics 呈现，并从最后 committed context 启动 recovery。该分支使用 `Turn → Compaction → Turn` 和 `compaction_finished { will_retry: true }`，不发布 session-level `retry_auto_started`。
+- provider fallback/retry 属于同一个 model call/run 的内部 attempt，不改变 `SessionPhase`，也不发布 session-level retry event。
 
 ## Compaction Lifecycle
 
@@ -1297,8 +1306,15 @@ UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overfl
   → summary model call                         // not a normal assistant message
   → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → compaction_finished { result, aborted: false, will_retry }
-  → session_phase_changed { phase: idle }
-  → session_settled or run_started             // overflow retry may continue immediately
+  ├─ overflow retry / immediate continuation
+  │    → session_phase_changed { phase: turn }
+  │    → run_started
+  ├─ scheduled auto retry
+  │    → session_phase_changed { phase: retry_backoff }
+  │    → retry_auto_started
+  └─ no immediate work
+       → session_phase_changed { phase: idle }
+       → session_settled
 ```
 
 压缩摘要是 session context projection，不是 system prompt。`compaction_finished` 可以给 UI 摘要预览，但完整摘要默认通过 session entry detail 读取。

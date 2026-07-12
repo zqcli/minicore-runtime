@@ -236,13 +236,15 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 ### BR-038：failure → retry 的 phase 抖动，两处 lifecycle 描述不一致
 
-状态：Open
+状态：Resolved
 
-问题：Failure Lifecycle 规定失败后 `session_phase_changed { idle }` → `session_settled or retry_auto_started`，即 retry 前 phase 必经 idle（UI 会闪现空闲态）；而 Session Phase Lifecycle 图画的是 `Idle -- session_phase_changed(retry) --> Retry -- run_started --> Turn`。retry 期间 phase 究竟是 idle、retry 还是 turn，两图拼不出一致答案。
+问题：Failure Lifecycle 规定失败后 `session_phase_changed { idle }` → `session_settled or retry_auto_started`，即 retry 前 phase 必经 idle（UI 会闪现空闲态）；而 Session Phase Lifecycle 规定的是 `Turn → RetryBackoff → Turn`。retry 期间 phase 究竟是 idle、retry backoff 还是 turn，两处描述此前拼不出一致答案。
 
 证据：`docs/modules/agent-runtime-events.md` Failure Lifecycle vs Session Phase Lifecycle。
 
-待处理方向：给出 failed → retry 的完整 phase/事件时序，消除 idle 抖动或明确接受它。
+处理记录：以 `SessionPhase` 转换矩阵为权威，删除 Failure Lifecycle 中失败后无条件 `session_phase_changed(idle)` 的旧顺序。run failure 先完成 diagnostics 和唯一 `run_finished(failed)`，再由 post-run arbitration 直接选择 `RetryBackoff`、overflow/manual `Compaction`、同 `Turn` continuation 或最终 `Idle`；只有没有立即后续工作时才进入 `Idle` 并发布 `session_settled`。因此 scheduled retry 固定为 `Turn → RetryBackoff → Turn`，包括 `delay_ms = 0`，不会产生虚假 idle 闪烁。
+
+每个 `retry_auto_started { attempt }` 现在必须由同 attempt 的 `retry_auto_finished` 恰好关闭。协议把无法区分失败与取消的 `success: bool` 替换为 `RetryTerminalStatus::{Succeeded, Failed, Aborted}`，并把 `final_error` 收窄为 attempt-local `error`。attempt 再次失败且仍可继续时，先发布 `run_finished(failed)` 和 `retry_auto_finished(failed)`，再进入下一次 `RetryBackoff` / `retry_auto_started`；backoff 取消发布 `retry_auto_finished(aborted)` 后才进入最终 arbitration。context overflow 继续走 `Turn → Compaction → Turn` 和 `compaction_finished { will_retry: true }`，provider 内部 fallback/retry 不改变 session phase，也不发布 session-level retry event。
 
 ### BR-039：协议字段使用 `usize`
 
@@ -296,13 +298,15 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 ### BR-044：`EventStream` 的订阅语义未定义
 
-状态：Open
+状态：Deferred
 
 问题：`subscribe()` 的多订阅者语义（新订阅者从何处开始）、慢消费者/背压策略（lag 时是丢事件产生 sequence gap 还是阻塞发布者）、ring buffer 容量与 gap recovery 的关系都未定义，而 sequence gap recovery 恰恰依赖这些行为。
 
 证据：`docs/modules/agent-runtime-protocol.md`（EventStream 仅出现类型名）；`docs/modules/agent-runtime-events.md` RuntimeSnapshot 水位段提及 ring buffer。
 
-待处理方向：在 AgentRuntimeEvents 中定义订阅起点、lag 策略与 gap 的产生条件。
+延期记录：MiniCore MVP 固定为一个 UI 对应一个同进程、同生命周期的 `AgentRuntime`，不支持多个 UI 共享 runtime，也不支持 UI 断线后重新连接仍在后台运行的 runtime。adapter 应建立一个与 runtime 同生命周期的长期 event pump，并在接受 command 前开始消费事件；在这个约束下，多订阅者隔离、ring replay 和 active-run gap recovery 都属于低概率 corner case，不作为 MVP 实现或验收范围。
+
+后期只有在出现独立 daemon/server、UI 可断线重连、多个 adapter 共享 runtime，或性能测试证明大型 tool output / 多 session streaming 会导致真实 subscriber lag 时，才重新打开本项并定义 bounded channel、delta batching、lag signal、snapshot completeness 与 cursor recovery。
 
 ### BR-045：CONTEXT.md 会话条目类型列表滞后
 

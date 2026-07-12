@@ -492,11 +492,15 @@ compaction_started { reason }                  // session coordinate is on outer
 SessionHandle.commit(SessionWriteBatch::compaction(...)) // internal, no public persistence event
 compaction_finished { result, aborted, will_retry }
 usage_updated { context_usage }
-session_phase_changed { phase: idle }
-session_settled { next_turn_count }
+if immediate retry/continuation:
+  session_phase_changed { phase: turn }
+  run_started
+else:
+  session_phase_changed { phase: idle }
+  session_settled { next_turn_count }
 ```
 
-立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true` 或压缩后将立即启动 queued steering/follow-up continuation，则直接进入后续 `run_started`，不先发 `session_settled`。`NextTurn` queue 可以保留且不阻止 settled。
+立即执行且没有后续工作时，推荐顺序是 `session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true` 或压缩后将立即启动 queued steering/follow-up continuation，则必须改为 `compaction_finished` → `usage_updated` → `session_phase_changed(turn)` → `run_started`，不能经过 `Idle` 或先发 `session_settled`。需要等待 retry delay 时进入 `RetryBackoff`。`NextTurn` queue 可以保留且不阻止 settled。
 
 压缩后的 `usage_updated` 主要更新 `ContextUsageView`，不减少 `SessionStatsView.total_usage`。
 
