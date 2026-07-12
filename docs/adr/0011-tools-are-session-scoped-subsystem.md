@@ -74,7 +74,7 @@ SessionRuntime::start_run
 
 - `Driver` 更深，只依赖 `DriverHost` seam，不持有 provider、tools、queue 或 persistence。
 - `SessionRuntime` 是唯一能把工具 update 归约为 UI event，并通过 `SessionWriter` 提交完整 tool round 的 owner。
-- pending approval 可以通过 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 恢复，同时冻结的 `prepared_args` 不进入 snapshot/event/log。
+- 每个 loaded session 的 pending approval 可以通过对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 恢复，同时冻结的 `prepared_args` 不进入 snapshot/event/log。
 - 批量工具调用可以通过 `ToolCallIndex` 稳定回填，parallel 执行可乱序完成但对模型结果顺序稳定。
 - `ToolPolicy` 可保持纯判断器；preview、canonicalization、sandbox check 由 planner 负责。
 - approval mode 和 remembered grants 与 pending approval 分离，避免把长期授权塞进当前等待态。

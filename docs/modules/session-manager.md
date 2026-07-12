@@ -1,6 +1,6 @@
 # SessionManager / SessionWriter / SessionStorage
 
-这个文档描述工作区内会话生命周期、会话持久化与会话树模块，而不是 `SessionRuntime` 的运行编排本身。它之所以独立存在，是因为会话管理有自己的可测试 interface：创建/打开/列出/删除/fork 会话、加载/关闭运行中会话、提交稳定 batch、读取当前 leaf、从 root 到 leaf 重建上下文。
+这个文档描述工作区内会话生命周期、会话持久化与会话树模块，而不是 `SessionRuntime` 的运行编排本身。它之所以独立存在，是因为会话管理有自己的可测试 interface：创建/打开/列出/删除/fork 会话、加载/关闭会话运行时、提交稳定 batch、读取当前 leaf、从 root 到 leaf 重建上下文。
 
 会话属于 Agent Runtime，不属于 UI。UI 通过运行时 command 执行 open/fork/navigation/delete 等 mutation，通过 `RuntimeQuery` 列出或读取会话；不能直接读写会话文件。
 
@@ -8,13 +8,15 @@
 
 ## 核心模型
 
-- `SessionManager` 是工作区内会话生命周期 facade，负责 persistent session catalog / `SessionIndex`、loaded runtime map、focused session、create/open/list/delete/fork/focus/close，并隐藏内存存储与 JSONL 文件存储的差异。
-- `LoadedSessionRuntimes` 是 `SessionManager` 内部的 live runtime map，负责登记、查找、聚焦、关闭已加载的 `SessionRuntime`；它不是独立架构模块，也不读写 session entries。多个 `SessionRuntime` 可以同时 loaded/running，失去 focus 的 runtime 不会被隐式关闭。
+- `SessionManager` 是工作区内会话生命周期 facade，负责 persistent session catalog / `SessionIndex`、loaded runtime map、create/open/list/delete/fork/close，并隐藏内存存储与 JSONL 文件存储的差异。
+- `LoadedSessionRuntimes` 是 `SessionManager` 内部的 live runtime map，负责登记、查找和关闭已加载的 `SessionRuntime`；它不是独立架构模块，也不读写 session entries。多个 `SessionRuntime` 可以同时 loaded，并各自独立处于 idle、turn、compaction 或 retry phase。
 - `SessionHandle` 是单会话领域对象，暴露稳定 batch commit、构建上下文、读取当前叶子、标签和会话名等行为。文档和实现中应优先使用 `SessionHandle`，避免把它简称为容易和完整会话概念混淆的 `Session`。
 - `SessionWriter` 是所有会话 mutation 共用的唯一写入 seam。它接受 `SessionWriteBatch`，成功返回表示整个 batch 已按 adapter 契约写入，失败则该 batch 不得进入恢复投影。
 - `SessionStorage` 是单会话底层存储 interface，也是 `SessionWriter` 的 adapter；它负责读取 committed batches、leaf 和 metadata，并隐藏内存存储与 JSONL 存储的差异。
 
-`AgentRuntime` 对 UI 暴露会话命令和快照，但内部通过 `SessionManager` 打开会话、创建 `SessionHandle`、加载 `SessionRuntime`、切换 focused session。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`。
+`AgentRuntime` 对 adapter 暴露会话命令和快照，但内部只通过 `SessionManager` 打开会话、创建 `SessionHandle` 和加载 `SessionRuntime`。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不保存客户端 selected session，也不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`。
+
+session 的状态分层而不是压成一个 `active` / `running` boolean：persistent catalog membership 表示会话是否存在；`LoadedSessionRuntimes` 表示 runtime residency；loaded runtime 的工作状态由 `SessionPhase::{Idle, Turn, Compaction, RetryBackoff}`、optional `CurrentRunState` 和派生的 `session_settled` 表达。run failed/aborted 不会把 session 变成 terminal session，compaction/retry 也不能被一个 `is_running` 准确表示。
 
 `SessionIndex` 是 `SessionManager` 的轻量会话目录，不是 `RuntimeSnapshot`。它用于 `/resume` 和 `SessionQuery::List`，可以由 JSONL header、session metadata、本地 index/cache 或数据库投影维护。它只包含 session id、workspace/cwd、名称、时间、预览、轻量模型/思考等级/usage 摘要和诊断，不包含完整 messages、当前 run、pending approval、队列或 UI 状态。打开窗口时不需要为了生成 `RuntimeSnapshot` 重建所有 session；只有用户执行 `OpenSession` 或创建新会话时才加载对应 `SessionRuntime` 并重建完整 session projection。
 
@@ -31,11 +33,10 @@ pub trait SessionManager {
 
     async fn load_runtime(&self, handle: SessionHandle, factory: &dyn SessionRuntimeFactory) -> Result<SessionRuntimeHandle, SessionError>;
     async fn open_and_load(&self, metadata: SessionMetadata, factory: &dyn SessionRuntimeFactory) -> Result<SessionRuntimeHandle, SessionError>;
-    async fn focus_session(&self, session_id: SessionId, policy: FocusSessionPolicy, factory: &dyn SessionRuntimeFactory) -> Result<SessionRuntimeHandle, SessionError>;
     async fn close_runtime(&self, session_id: SessionId, policy: ShutdownPolicy) -> Result<(), SessionError>;
     async fn shutdown_all_runtimes(&self, policy: ShutdownPolicy) -> Result<ShutdownReport, SessionError>;
     fn get_runtime(&self, session_id: SessionId) -> Option<SessionRuntimeHandle>;
-    fn focused_runtime(&self) -> Option<SessionRuntimeHandle>;
+    fn list_loaded_runtimes(&self) -> Vec<SessionRuntimeHandle>;
 }
 
 #[async_trait]
@@ -140,7 +141,7 @@ SessionWriteBatch::tree_move(target_entry_id)
 
 `SessionListFilter` 必须支持按 workspace scope 查询。TUI 的 `/resume` 默认列出当前 workspace 的会话；GUI sidebar 通过 `RuntimeQuery::Session(SessionQuery::List { scope: CurrentWorkspace, ... })` 或显式 workspace scope 读取清单。`/resume --all`、全局 recent view 或跨 workspace 搜索可以作为后续增强，但默认不应把所有工作区的 session 混在一起。
 
-运行时加载使用 factory，factory 由 `AgentRuntime` 提供并持有 `WorkspaceServices`。`SessionManager` 只把 `SessionHandle` 交给 factory；factory 读取 handle metadata 的 workspace/cwd，确保 `ResourceManager` 已有该 cwd 的 current `CwdResourceSnapshot`，并把 fixed workspace/cwd 与共享 runtime services 注入新 `SessionRuntime`。这样 `SessionManager` 不直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 构造细节，也不会把 focused session 的当前 cwd 或资源快照误传给后台 session：
+运行时加载使用 factory，factory 由 `AgentRuntime` 提供并持有 `WorkspaceServices`。`SessionManager` 只把 `SessionHandle` 交给 factory；factory 读取 handle metadata 的 workspace/cwd，确保 `ResourceManager` 已有该 cwd 的 current `CwdResourceSnapshot`，并把 fixed workspace/cwd 与共享 runtime services 注入新 `SessionRuntime`。这样 `SessionManager` 不直接依赖 Rig、工具、资源、凭据或 `SessionRuntime` 构造细节，也不会把某个 adapter 选中 session 的 cwd 或资源快照误传给其他 session：
 
 ```rust
 pub trait SessionRuntimeFactory {
@@ -148,12 +149,11 @@ pub trait SessionRuntimeFactory {
 }
 
 pub struct LoadedSessionRuntimes {
-    focused_session_id: Option<SessionId>,
     runtimes: HashMap<SessionId, SessionRuntimeHandle>,
 }
 ```
 
-`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`find_current_run(run_id)`、`insert`、`replace`、`set_focused`、`close`、`shutdown_all` 和可选的 idle unload。`find_current_run` 只扫描/索引当前 host 中已经发布 `run_started` 且尚未 terminal 的 run，用于路由 `AbortRun { run_id }`；它不是 durable run registry。不要在这里追加 message、构建上下文、执行工具、调用模型或发布 UI event，也不要根据 focus 切换改写已加载 runtime 的 workspace/cwd、phase、queue 或 current run。
+`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`list`、`find_current_run(run_id)`、`insert`、`replace`、`close`、`shutdown_all` 和可选的 idle unload。`find_current_run` 只扫描/索引当前 host 中已经发布 `run_started` 且尚未 terminal 的 run，用于路由 `AbortRun { run_id }`；它不是 durable run registry。不要在这里追加 message、构建上下文、执行工具、调用模型、保存 adapter selection 或发布 UI event。
 
 `SessionHandle` 是 `SessionRuntime` 的主要消费对象：
 
@@ -301,8 +301,7 @@ MVP 可以同时提供两种持久化实现：
 ## 会话命令行为
 
 - `NewSession` 创建新会话并发出 `session_created` / `session_opened`。
-- `OpenSession` 打开已有会话，必要时加载 `SessionRuntime`，并通常发出 `session_focus_changed`。
-- `FocusSession` 切换 runtime-visible focused session；如果目标未 loaded，可以拒绝，也可以按产品策略先执行 open-and-load。
+- `OpenSession` 打开已有会话，必要时加载 `SessionRuntime` 并发出 `session_opened`；目标已 loaded 时是幂等 no-op，不改变任何客户端选择。
 - `SessionQuery::List` 通过 `AgentRuntime.query()` 返回工作区下的会话元数据；底层复用 `SessionManager.list_sessions(...)`。
 - `DeleteSession` 删除未被当前运行占用的会话。
 - `SetSessionName` 通过 `SessionMutation` batch 提交 `session_info` draft，而不是修改 header。
@@ -321,8 +320,8 @@ MVP 可以同时提供两种持久化实现：
 OpenSession
   → SessionManager.open(metadata) -> SessionHandle
   → SessionManager.load_runtime(handle, factory) -> SessionRuntimeHandle
-  → LoadedSessionRuntimes.set_focused(session_id)
-  → AgentRuntime publishes session_opened? and session_focus_changed
+  → LoadedSessionRuntimes.insert(session_id, runtime)
+  → AgentRuntime publishes session_opened if newly loaded
 
 SubmitPrompt
   → AgentRuntime asks SessionManager.get_runtime(session_id)
@@ -343,12 +342,14 @@ AppShutdown
 
 `SessionManager` 可以协调 live runtime 生命周期，但不能拥有 `SessionRuntime` 内部状态机。`SessionRuntime` 仍然拥有 phase、queue、current run、tool state、usage stats、compaction/retry state 和稳定 batch 的提交时机。
 
-Focused session 是 runtime-visible state。它只表示 UI 或默认命令目标，不表示唯一 loaded session，也不表示唯一 running session。多 session 同时运行时，失去 focus 的 session 可以继续执行后台 run。
+根据 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，客户端选择哪个 session 属于 adapter-local state，不进入 `SessionManager`。所有 session-scoped runtime command 必须显式携带 `SessionId`；同一 host 中多个 loaded session 可以同时推进各自 work，打开或关闭一个 session 不改变其他 runtime 的 phase、queue、current run 或 cwd，也不替客户端选择 fallback session；adapter 收到 matching `session_closed` 后自行更新本地 selection。
 
 `SessionManager`、`SessionHandle`、`SessionWriter`、`SessionStorage` 和 `LoadedSessionRuntimes` 的含义只由本文件定义。底层 storage seam 与单会话运行编排保持分离，以便测试和替换 JSONL / memory adapter，并避免 `SessionManager` 变成 Agent loop owner。
 
 ## 必测项
 
+- 同时 load 两个 session 时 `LoadedSessionRuntimes.list()` 返回二者，任一 session 的 phase/current run 变化不影响另一个；不存在 focused/current pointer。
+- 重复 `OpenSession` 是幂等 no-op；关闭一个 loaded runtime 只移除目标 session，客户端 selection 不参与 lifecycle。
 - `commit(SessionWriteBatch::user_input(...))` 成功后，message、entry ids、parent links 和 leaf 一起可恢复。
 - `commit(SessionWriteBatch::tool_round(...))` 只接受完整 assistant tool calls 与全部 matching results，并保持 `call_index` 顺序。
 - writer 返回错误时，失败 batch 不出现在 `get_entries()`、path-to-root 或 `build_session_context()` 中。

@@ -1,6 +1,6 @@
 # SessionRuntime
 
-`SessionRuntime` 是单个会话的产品级 Agent 编排对象。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使后台 run 不受 focused session 切换或资源 reload 影响。
+`SessionRuntime` 是单个会话的产品级 Agent 编排对象。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使该 run 不受客户端 session selection 变化或资源 reload 影响。
 
 ## 核心职责
 
@@ -167,7 +167,7 @@ pub struct TurnState {
 }
 ```
 
-`TurnState` 是 `SessionRuntime` 的内部 run snapshot。它 pin 住 resources、immutable `PromptTurn`、模型状态、工具视图、消息基线和 context usage，以保证 running run 不受 reload 或 focus 切换影响；它不是 `Driver` 的输入类型。
+`TurnState` 是 `SessionRuntime` 的内部 run snapshot。它 pin 住 resources、immutable `PromptTurn`、模型状态、工具视图、消息基线和 context usage，以保证 running run 不受 reload 或客户端 session selection 变化影响；它不是 `Driver` 的输入类型。
 
 `SessionRuntime` 在启动 `Driver` 前投影出更窄的输入：
 
@@ -289,7 +289,7 @@ SessionRuntime
   → updates SessionUsageStats
   → computes ContextUsage from latest ModelInputProjection
   → emits usage_updated
-  → includes usage in run_finished and agent_runtime_protocol::RuntimeSnapshot.active_session
+  → includes usage in run_finished and matching agent_runtime_protocol::RuntimeSnapshot.loaded_sessions[*]
 ```
 
 `UsageSummary` 是一次 run 内所有模型调用的消耗汇总，不是最后一次模型调用。一次 run 如果经历 `model -> tools -> model -> tools -> model`，`run_finished { usage }` 必须覆盖这几次模型调用。
@@ -298,7 +298,7 @@ SessionRuntime
 
 压缩只改变 `ContextUsageView.current_tokens`，不减少 `SessionStatsView.total_usage`。会话累计消耗是历史账本；当前上下文占用是窗口状态。
 
-`usage_updated` 是实时 UI 事件，可以包含尚未形成稳定 session batch 的当前 host 内存统计。需要跨进程恢复的最终 usage 必须包含在对应 `AssistantFinal`、`ToolRound` 或其他稳定 batch 中，并在 `run_finished` 前提交。UI 重连时以 `agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage` 为权威恢复显示。
+`usage_updated` 是实时 UI 事件，可以包含尚未形成稳定 session batch 的当前 host 内存统计。需要跨进程恢复的最终 usage 必须包含在对应 `AssistantFinal`、`ToolRound` 或其他稳定 batch 中，并在 `run_finished` 前提交。adapter reducer 重建时以对应 `agent_runtime_protocol::RuntimeSnapshot.loaded_sessions[*].session_stats` 和 `context_usage` 为权威恢复。
 
 ## RuntimeHooks
 
@@ -401,7 +401,7 @@ pub struct NextModelCallPlan {
 }
 ```
 
-`persistent_messages` 是 active `PromptTurn.resolve_intent()` 展开的 steer，但只有完成 safe-point transaction 后才能放入 plan：消费结构化 steering intent → 展开最终 user message → commit `SessionWriteBatch::user_input(...)` → 若为 skill/template 则发布 `skill_invoked` / `prompt_template_invoked { run_id: Some(current_run_id) }` → 发布 `message_user_appended` → 加入 `persistent_messages`。commit 失败时当前 run 进入 failed terminal path，不能让 Driver/Rig 使用仅存在内存的 steer。`prompt_profile` 只能是用 active captured resources 重建后的完整 profile；`current_call_context` 只影响下一次调用。context owner 的获取失败也必须作为 `Unavailable` 保留，不能通过缺项吞掉 required failure。`SessionRuntime` 不直接构造最终 messages，它把 plan 返回给 Driver，由 Driver 调用 Prompt 的 final projection seam。
+`persistent_messages` 是 active `PromptTurn.resolve_intent()` 展开的 steer，但只有完成 safe-point transaction 后才能放入 plan：消费结构化 steering intent → 展开最终 user message → commit `SessionWriteBatch::user_input(...)` → 若为 skill/template 则发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked` / `prompt_template_invoked` → 发布 `message_user_appended` → 加入 `persistent_messages`。commit 失败时当前 run 进入 failed terminal path，不能让 Driver/Rig 使用仅存在内存的 steer。`prompt_profile` 只能是用 active captured resources 重建后的完整 profile；`current_call_context` 只影响下一次调用。context owner 的获取失败也必须作为 `Unavailable` 保留，不能通过缺项吞掉 required failure。`SessionRuntime` 不直接构造最终 messages，它把 plan 返回给 Driver，由 Driver 调用 Prompt 的 final projection seam。
 
 ## Command Run Policy
 
@@ -421,7 +421,7 @@ resolved command
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
 2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
 3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
-4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布 `skill_invoked` / `prompt_template_invoked { run_id: None }`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
+4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布外层 `Event.run_id = None` 的 `skill_invoked` / `prompt_template_invoked`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
 5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 `DriveRequest` 后调用 `Driver.drive_run()`。
 6. 每次下一模型调用前进入 run safe point；`SessionRuntime` 消费 steer、应用合法 profile 变化、收集 typed context materials，并返回 `NextModelCallPlan`。
 7. `Driver` 应用已 committed persistent messages/profile 后调用 `Prompt::project_model_call(...)`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。

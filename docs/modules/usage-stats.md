@@ -11,7 +11,7 @@ Usage / Cost Tokens != Context Usage
 - `Usage` 表示模型调用真实消耗，用于展示本次 run、会话累计和后续成本估算。
 - `ContextUsage` 表示下一次模型请求会占用多少上下文窗口，用于上下文进度条、预检和压缩触发。
 
-UI 不应自己从消息估算 token。UI 只消费 `usage_updated`、`run_finished { usage }`、`agent_runtime_protocol::RuntimeSnapshot.active_session.session_stats` 和 `agent_runtime_protocol::RuntimeSnapshot.active_session.context_usage`。
+adapter 不应自己从消息估算 token。它只消费 `usage_updated`、`run_finished { usage }`，以及对应 `agent_runtime_protocol::RuntimeSnapshot.loaded_sessions[*].session_stats` / `context_usage`。
 
 ## Context Usage 估算
 
@@ -249,9 +249,9 @@ pub enum SessionEntry {
 }
 ```
 
-`ModelCallPurpose` 的权威定义在 [ModelGateway](model-gateway.md)。usage/persistence 不定义 `UsagePurpose`，也不把 retry 或 session 是否 focused 当成业务目的：Agent run 的 provider retry、overflow recovery 后重跑和后台 session 继续执行仍归 `AgentRun`；压缩摘要及其重试仍归 `CompactionSummary`。未来新增 branch summary、session title 等模型任务时，应增加明确 purpose 变体。
+`ModelCallPurpose` 的权威定义在 [ModelGateway](model-gateway.md)。usage/persistence 不定义 `UsagePurpose`，也不把 retry 或客户端是否选中该 session 当成业务目的：Agent run 的 provider retry、overflow recovery 后重跑和后台 session 继续执行仍归 `AgentRun`；压缩摘要及其重试仍归 `CompactionSummary`。未来新增 branch summary、session title 等模型任务时，应增加明确 purpose 变体。
 
-这样 UI 后续可以区分正常回答和压缩摘要等真实业务目的，同时不会因为 retry/fallback/focus 状态改变统计分类。
+这样 UI 后续可以区分正常回答和压缩摘要等真实业务目的，同时不会因为 retry/fallback/客户端 selection 改变统计分类。
 
 ## AgentRuntimeEvents And RuntimeSnapshot
 
@@ -274,9 +274,9 @@ resources/tools/system prompt changed
   → usage_updated { context_usage estimated with new prompt materials }
 ```
 
-`agent_runtime_protocol::RuntimeSnapshot.active_session` 应包含 `session_stats: Option<SessionStatsView>` 和 `context_usage: Option<ContextUsageView>`。完整结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
+每个 `agent_runtime_protocol::RuntimeSnapshot.loaded_sessions[*]` 都应包含 `session_stats: Option<SessionStatsView>` 和 `context_usage: Option<ContextUsageView>`。完整结构定义以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为准。
 
-UI 重连后应以 snapshot 为权威恢复 active session usage 面板，而不是要求 runtime 重放所有历史 `usage_updated`。查看非 active session 或按需打开详细统计时，使用 `RuntimeQuery::Usage(UsageQuery::GetSessionStats | GetContextUsage)`；query 返回完整 view，运行中的后续变化继续由 `usage_updated` 替换 UI cache。UI 不应轮询 query 来模拟实时 usage stream。
+adapter reducer 重建后应以 snapshot 为权威恢复全部 loaded session 的 usage view，而不是要求 runtime 重放所有历史 `usage_updated`。查看未加载 session 或按需读取详细统计时，使用 `RuntimeQuery::Usage(UsageQuery::GetSessionStats | GetContextUsage)`；query 返回完整 view，loaded session 的后续变化继续由 `usage_updated` 替换 cache。adapter 不应轮询 query 来模拟实时 usage stream。
 
 ## UI 展示建议
 

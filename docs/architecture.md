@@ -105,3 +105,4 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [ADR 0017：Prompt 使用不可变 turn 组装而不是长期 Manager](adr/0017-prompt-uses-immutable-turn-assembly.md)
 - [ADR 0018：AgentRuntime 分离 Command、Query、Event 和 Snapshot](adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)
 - [ADR 0019：会话写入使用统一可信的 batch writer](adr/0019-session-writes-use-one-trusted-batch-writer.md)
+- [ADR 0020：AgentRuntime 不拥有当前会话](adr/0020-agent-runtime-has-no-current-session.md)

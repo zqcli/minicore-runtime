@@ -57,14 +57,12 @@ wire 形态固定为外层事件 + 内层消息：
   "session_id": "ses_...",
   "run_id": "run_...",
   "msg": {
-    "type": "run_started",
-    "run_id": "run_...",
-    "session_id": "ses_..."
+    "type": "run_started"
   }
 }
 ```
 
-也就是说，稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 字段只负责 routing、ordering、correlation 和 reconnect cursor。
+也就是说，稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 字段是 `workspace_id`、`session_id`、`run_id` 和 `command_id` 的唯一权威位置，负责 routing、ordering、correlation 和 reconnect cursor。`EventMsg` 不重复这些通用坐标；它只保留 message/call/approval/interaction 等局部对象 identity、transition operands 和实际业务数据。
 
 ## RuntimeQuery
 
@@ -108,8 +106,8 @@ pub enum ResourceQuery {
 }
 
 pub enum CommandSurfaceQuery {
-    GetCatalog { session_id: SessionId },
-    Suggest { session_id: SessionId, input: String, cursor: u32 },
+    GetCatalog { session_id: Option<SessionId> },
+    Suggest { session_id: Option<SessionId>, input: String, cursor: u32 },
 }
 
 pub enum ModelQuery {
@@ -189,7 +187,6 @@ pub enum AgentCommand {
     OpenWorkspace { path: PathBuf },
     NewSession { workspace_id: WorkspaceId },
     OpenSession { session_id: SessionId },
-    FocusSession { session_id: SessionId },
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
     InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: PromptDelivery },
     InvokePromptTemplate { session_id: SessionId, template_name: String, args: Vec<String>, delivery: PromptDelivery },
@@ -362,9 +359,11 @@ pub struct PendingToolApprovalView {
 }
 ```
 
-`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，用于 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。它只暴露审批弹窗、命令面板或 TUI 行内确认需要的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。UI 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
+`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。它只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
 
-`OpenSession` 会在需要时加载 `SessionRuntime`，并通常使它成为 focused session；`FocusSession` 只改变 runtime-visible focus，不要求重新加载已打开会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
+`OpenSession` 只保证目标 `SessionRuntime` 已加载，不建立 runtime-global 当前会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
+
+根据 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，core 不提供 `FocusSession`、selected/current session 或 sessionless fallback routing。所有 session-scoped command 必须显式携带 `SessionId`。`ExecuteCommandText.session_id = None` 只允许解析和执行 runtime/workspace-scoped command；若解析结果需要 session context，则返回 `SessionRequired` 类 command output，不能从最近打开、唯一 loaded 或 adapter 当前显示的 session 推断目标。客户端可以本地维护 selected session，并在 dispatch 前填入 `session_id`；该状态不进入 core command、event 或 snapshot。`NewSession` 产生的 session id 通过带 originating `command_id` 的 `session_created` / `session_opened` 外层 `Event.session_id` 返回，adapter 可以据此更新自己的 selection。
 
 `SetModel.provider_id` 和 `SetModel.model_id` 是 MiniCore 稳定 ID，对应 `ModelSelection { provider_id, model_id }`。它们不是 provider API model name，不是 Rig provider type，也不能携带 base URL、API key、OAuth token 或 auth header。模型执行、custom provider 解析和 auth 注入只发生在 [ModelGateway](model-gateway.md)。
 
@@ -391,28 +390,27 @@ pub enum EventMsg {
 }
 
 pub enum SessionEvent {
-    Created { session_id: SessionId, workspace_id: WorkspaceId },
-    Opened { session_id: SessionId },
-    Closed { session_id: SessionId },
-    Imported { session_id: SessionId, workspace_id: WorkspaceId },
-    Deleted { session_id: SessionId },
-    FocusChanged { previous_session_id: Option<SessionId>, focused_session_id: Option<SessionId> },
-    NameChanged { session_id: SessionId, name: Option<String> },
-    TreeChanged { session_id: SessionId, old_leaf_id: Option<EntryId>, new_leaf_id: Option<EntryId> },
-    PhaseChanged { session_id: SessionId, phase: SessionPhase },
-    ModelChanged { session_id: SessionId, provider_id: String, model_id: String },
-    ThinkingLevelChanged { session_id: SessionId, level: ThinkingLevel },
-    ToolsChanged { session_id: SessionId, tool_names: Vec<String>, active_tool_names: Vec<String> },
-    ActiveToolsChanged { session_id: SessionId, tool_names: Vec<String> },
-    StreamOptionsChanged { session_id: SessionId, options: StreamOptions },
-    Settled { session_id: SessionId, next_turn_count: u64 },
+    Created,
+    Opened,
+    Closed,
+    Imported,
+    Deleted,
+    NameChanged { name: Option<String> },
+    TreeChanged { old_leaf_id: Option<EntryId>, new_leaf_id: Option<EntryId> },
+    PhaseChanged { phase: SessionPhase },
+    ModelChanged { provider_id: String, model_id: String },
+    ThinkingLevelChanged { level: ThinkingLevel },
+    ToolsChanged { tool_names: Vec<String>, active_tool_names: Vec<String> },
+    ActiveToolsChanged { tool_names: Vec<String> },
+    StreamOptionsChanged { options: StreamOptions },
+    Settled { next_turn_count: u64 },
 }
 
 pub enum RunEvent {
-    Started { run_id: RunId, session_id: SessionId },
-    Suspended { run_id: RunId, resume_id: ResumeId, reason: SuspendReason },
-    Resumed { run_id: RunId, resume_id: ResumeId },
-    Finished { run_id: RunId, status: RunTerminalStatus, usage: Option<UsageSummary> },
+    Started,
+    Suspended { resume_id: ResumeId, reason: SuspendReason },
+    Resumed { resume_id: ResumeId },
+    Finished { status: RunTerminalStatus, usage: Option<UsageSummary> },
 }
 
 pub enum MessageEvent {
@@ -472,15 +470,13 @@ pub struct QueueSnapshot {
 
 pub enum PendingSessionActionView {
     Compact {
-        command_id: CommandId,
+        origin_command_id: CommandId,
         instructions: Option<String>,
     },
 }
 
 pub enum UsageEvent {
     Updated {
-        session_id: SessionId,
-        run_id: Option<RunId>,
         run_usage: Option<UsageSummary>,
         session_stats: Option<SessionStatsView>,
         context_usage: Option<ContextUsageView>,
@@ -488,48 +484,48 @@ pub enum UsageEvent {
 }
 
 pub enum ResourcesEvent {
-    ReloadStarted { workspace_id: WorkspaceId, cwd: PathBuf },
-    Changed { workspace_id: WorkspaceId, cwd: PathBuf, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
+    ReloadStarted { cwd: PathBuf },
+    Changed { cwd: PathBuf, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
 }
 
 pub enum CommandCatalogEvent {
-    Changed { workspace_id: WorkspaceId, session_id: SessionId, revision: CommandCatalogRevision, commands: Vec<CommandNodeSummary> },
+    Changed { revision: CommandCatalogRevision, commands: Vec<CommandNodeSummary> },
 }
 
 pub enum CommandResultEvent {
-    OutputAppended { command_id: CommandId, session_id: Option<SessionId>, output_id: CommandOutputId, output: CommandOutput },
-    InteractionRequested { command_id: CommandId, session_id: Option<SessionId>, interaction_id: InteractionId, request: UiInteractionRequest },
+    OutputAppended { output_id: CommandOutputId, output: CommandOutput },
+    InteractionRequested { interaction_id: InteractionId, request: UiInteractionRequest },
     InteractionResolved { interaction_id: InteractionId, resolution: InteractionResolution },
 }
 
 pub enum SkillEvent {
-    Invoked { session_id: SessionId, run_id: Option<RunId>, skill_name: String },
+    Invoked { skill_name: String },
 }
 
 pub enum PromptTemplateEvent {
-    Invoked { session_id: SessionId, run_id: Option<RunId>, template_name: String },
+    Invoked { template_name: String },
 }
 ```
 
 `QueueEvent::Updated` 始终是替换式完整状态，不附加 consumed/removed delta。abort 后 `steering`、`follow_up` 和 `pending_actions` 为空，`next_turn` 保留原值；`ClearQueue` 实际造成状态变化时，更新后的四者均为空；空队列 no-op 不要求冗余事件。UI 是否把本地保存的原始输入重新放回 editor 是 adapter policy，不是 queue event 的领域语义。
 
-`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开后发布。idle/future-turn admission 在 `UserInput` commit 成功后、`message_user_appended` 前发布，此时公开 run 尚未开始，`run_id = None`；active Steer 在 current run safe point 展开时使用 `run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。展开或 commit 失败不制造 invoked 事件。
+`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开后发布。idle/future-turn admission 在 `UserInput` commit 成功后、`message_user_appended` 前发布，此时公开 run 尚未开始，外层 `Event.run_id = None`；active Steer 在 current run safe point 展开时使用外层 `Event.run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。展开或 commit 失败不制造 invoked 事件。
 
 ```rust
 pub enum CompactionEvent {
-    Started { session_id: SessionId, reason: CompactionReason },
-    Finished { session_id: SessionId, result: Option<CompactionResultView>, aborted: bool, will_retry: bool },
+    Started { reason: CompactionReason },
+    Finished { result: Option<CompactionResultView>, aborted: bool, will_retry: bool },
 }
 
 pub enum RetryEvent {
-    AutoStarted { session_id: SessionId, attempt: u32, max_attempts: u32, delay_ms: u64, error_message: String },
-    AutoFinished { session_id: SessionId, success: bool, attempt: u32, final_error: Option<String> },
+    AutoStarted { attempt: u32, max_attempts: u32, delay_ms: u64, error_message: String },
+    AutoFinished { success: bool, attempt: u32, final_error: Option<String> },
 }
 
 pub enum DiagnosticsEvent {
     RuntimeChanged { diagnostics: Vec<RuntimeDiagnostic> },
-    Warning { scope: EventScope, message: String },
-    Error { scope: EventScope, message: String, recoverable: bool },
+    Warning { subject: Option<DiagnosticSubject>, message: String },
+    Error { subject: Option<DiagnosticSubject>, message: String, recoverable: bool },
 }
 
 pub enum SessionPhase {
@@ -561,19 +557,18 @@ pub enum SuspendReason {
     AfterToolResultCheckpoint,
 }
 
-pub enum EventScope {
-    Runtime,
-    Workspace { workspace_id: WorkspaceId },
-    Session { session_id: SessionId },
-    Run { run_id: RunId },
+pub enum DiagnosticSubject {
     ToolCall { call_id: ToolCallId },
-    ResourceReload { workspace_id: WorkspaceId },
+    ResourcePath { path: PathBuf },
+    Model { provider_id: String, model_id: String },
 }
 ```
 
+diagnostics 的 runtime/workspace/session/run/command 归属同样只读取外层 `Event`；`DiagnosticSubject` 只描述 envelope 没有专用坐标的更细业务对象，不能重新引入第二套路由 scope。
+
 命令结果类型用于把 `/status`、`/usage`、`/model`、`/help` 这类用户命令的结果表达成 UI-safe、display-neutral 的语义对象。它们不是模型消息，不进入 `TurnState.messages`，也不替代业务事件；业务事实仍由 `session_model_changed`、`resources_changed`、`usage_updated`、`run_finished` 等事件表达。
 
-如果 `CommandResultEvent` 或 `UiInteractionRequest` 中携带 `command_id`，它必须与外层 `agent_runtime_protocol::Event.command_id` 一致。外层 `Event` 仍是 routing、ordering 和 correlation 的权威位置；内层字段只是为了 UI 组件在脱离事件上下文渲染时仍能关联原始命令。
+`CommandResultEvent` 和 `UiInteractionRequest` 不重复外层 `command_id` / `session_id`。如果 UI 组件需要脱离 event dispatch stack 保存 command output 或 interaction request，adapter 应保存包含 event metadata 与 payload 的本地 view，而不是把裸 `EventMsg` 当成完整事件。若未来某个 payload 需要关联“另一个命令”，必须使用角色明确的 `origin_command_id` 等字段，不能复用通用 `command_id` 制造第二个权威来源。
 
 ```rust
 pub struct CommandOutput {
@@ -620,8 +615,6 @@ pub struct CommandActionId(pub String);
 
 pub struct UiInteractionRequest {
     pub interaction_id: InteractionId,
-    pub command_id: CommandId,
-    pub session_id: Option<SessionId>,
     pub title: String,
     pub items: Vec<UiInteractionItem>,
     pub initial_selection: Option<String>,
@@ -796,7 +789,6 @@ UI/wire event type 映射：
 | `SessionEvent::Closed` | `session_closed` |
 | `SessionEvent::Imported` | `session_imported` |
 | `SessionEvent::Deleted` | `session_deleted` |
-| `SessionEvent::FocusChanged` | `session_focus_changed` |
 | `SessionEvent::NameChanged` | `session_name_changed` |
 | `SessionEvent::TreeChanged` | `session_tree_changed` |
 | `SessionEvent::PhaseChanged` | `session_phase_changed` |
@@ -868,17 +860,16 @@ pub struct CompactionResultView {
 
 `snapshot()` 用于 UI 初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
 
-MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped：打开 workspace 后默认不聚焦任何 session，`active_session` 为空。TUI 可在用户执行 `/resume` 时由 command handler 读取 session index 并产生 interaction；GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`，而不是要求 `RuntimeSnapshot` 默认携带完整 `Vec<SessionSummary>`。
+MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped，并在同一个 `last_event_sequence` 水位原子投影全部 loaded sessions。`AgentRuntime` 必须通过 event-bus/projection barrier 生成它：loaded runtime membership、各 `SessionSnapshot` 和 `last_event_sequence` 必须对应同一逻辑水位，不能先逐个读取 session、再无保护地读取一个更晚的 sequence。打开 workspace 后默认不加载旧 session，因此 `loaded_sessions` 为空；持久化 catalog 中未加载的 session 继续通过 `SessionQuery::List` 读取，不会为了生成 snapshot 全部重建。
 
-MVP 的 UI host 和 `AgentRuntime` 运行在同一个程序上下文、同一个生命周期内；MiniCore runtime 不是独立 daemon/server，不承诺 UI adapter 失败或断线后 runtime 继续运行再被重新连接。`last_event_sequence` 的 reconnect 语义用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。它不要求 `RuntimeSnapshot` 覆盖所有非 active/background session 的完整运行态；如果未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，需要重新设计 all-loaded-session snapshot 或 scoped event cursor。
+MVP 的 adapter host 和 `AgentRuntime` 运行在同一个程序上下文、同一个生命周期内；MiniCore runtime 不是独立 daemon/server，不承诺 adapter 失败或断线后 runtime 继续运行再被重新连接。`last_event_sequence` 的 reconnect 语义用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。由于 event sequence 是 runtime-global，snapshot 必须覆盖所有会在该水位前发布事件的 loaded sessions；BR-044 负责进一步定义 subscription start、ring buffer lag 和 gap recovery。未来若采用 session-scoped subscription/cursor，才可以把 all-loaded snapshot 拆成 scoped snapshots。
 
 ```rust
 pub struct RuntimeSnapshot {
     pub last_event_sequence: u64,
 
     pub workspace: Option<WorkspaceSummary>,
-    pub active_session_id: Option<SessionId>,
-    pub active_session: Option<SessionSnapshot>,
+    pub loaded_sessions: Vec<SessionSnapshot>,
     pub session_catalog: Option<SessionCatalogSummary>,
 
     pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
@@ -886,9 +877,7 @@ pub struct RuntimeSnapshot {
 
     pub providers: Vec<ProviderSummary>,
     pub models: Vec<ModelSummary>,
-
-    pub resources: ResourceSnapshotSummary,
-    pub command: CommandSnapshot,
+    pub runtime_command: CommandSnapshot,
 }
 
 pub struct SessionSnapshot {
@@ -908,6 +897,8 @@ pub struct SessionSnapshot {
     pub queues: QueueSnapshot,
     pub session_stats: Option<SessionStatsView>,
     pub context_usage: Option<ContextUsageView>,
+    pub resources: ResourceSnapshotSummary,
+    pub command: CommandSnapshot,
 }
 
 pub struct RunView {
@@ -924,9 +915,9 @@ pub struct SessionCatalogSummary {
 pub struct SessionCatalogRevision(pub u64);
 
 pub struct ResourceSnapshotSummary {
-    pub workspace_id: Option<WorkspaceId>,
-    pub cwd: Option<PathBuf>,
-    pub revision: Option<ResourceRevision>,
+    pub workspace_id: WorkspaceId,
+    pub cwd: PathBuf,
+    pub revision: ResourceRevision,
     pub skills: Vec<SkillSummary>,
     pub prompt_templates: Vec<PromptTemplateSummary>,
     pub context_files: Vec<ContextFileSummary>,
@@ -944,13 +935,19 @@ pub struct CommandSnapshot {
 
 `SessionTreeView` 可以展示 batch 内消息节点，但只有 committed stable batch boundary 才能标记为 navigable/forkable；UI 不能把 `ToolRound` interior entry 直接填入 `NavigateSessionTree` / `ForkSession`。
 
-`active_session_id` 是 runtime-visible 的当前默认会话目标；窗口刚打开且用户尚未选择 session 时为 `None`。`SessionSnapshot` 只描述已打开的 active session；MVP 恢复旧会话时固定以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；`CurrentRunState::Suspended` 只表示同一 host 生命周期内的内存 checkpoint，不用于跨进程恢复未完成 run。model、thinking level、messages、usage stats 等只从 `SessionStorage` 的 committed stable batches 重建；中断时未提交的 partial assistant、pending approval 和 incomplete tool round 不会出现。当前 host 生命周期内如果 active session 正在运行且有工具审批等待态，`RunView.pending_tool_approvals` 是恢复审批 UI 和后续 `DecideToolApproval` 的权威来源。`RunView.state` 表示 current run 的当前执行状态；`Suspended` 是可恢复暂停状态，不是 terminal status。UI 的 usage 面板应以 `SessionSnapshot.session_stats`、`SessionSnapshot.context_usage` 和后续 `usage_updated` 为权威，不应自行从消息内容估算 token。
+`loaded_sessions` 只包含当前驻留在 `LoadedSessionRuntimes` 中的 runtime，并按 `SessionSnapshot.session.session_id` 稳定排序；它不是 persistent session list。`OpenSession` / `NewSession` 成功加载 runtime 后加入，`CloseSession` / idle unload 后移除。MVP 从 storage 打开旧会话时以 `SessionPhase::Idle`、`current_run = None` 和空队列启动；`CurrentRunState::Suspended` 只表示同一 host 生命周期内的内存 checkpoint，不用于跨进程恢复未完成 run。model、thinking level、messages、usage stats 等只从 `SessionStorage` 的 committed stable batches 重建；中断时未提交的 partial assistant、pending approval 和 incomplete tool round 不会出现。
 
-`RunView.pending_tool_approvals` 只覆盖 active session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 UI 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，UI 应逐个用对应 `approval_id` 与 `call_id` 回答。
+每个 `SessionSnapshot` 独立投影自己的 phase、current run、queues、usage、当前 cwd resource summary 和 session-scoped command catalog。多个 session 使用同一 cwd 时允许摘要重复，换取单次 snapshot 的原子可恢复性。当前 host 生命周期内任一 loaded session 如果正在运行且有工具审批等待态，其 `RunView.pending_tool_approvals` 都是恢复审批客户端和后续 `DecideToolApproval` 的权威来源。`RunView.state` 表示 current run 的当前执行状态；`Suspended` 是可恢复暂停状态，不是 terminal status。
+
+`RunView.pending_tool_approvals` 只覆盖所属 session 当前 run 的未决审批；审批 resolved、run abort、run finished 或 session close 后必须从该列表移除。该列表为空表示当前 run 没有需要 adapter 回答的工具审批。多个并行工具调用同时等待审批时，列表可包含多个 `PendingToolApprovalView`，adapter 应逐个用对应 `approval_id` 与 `call_id` 回答。
 
 `CurrentRunState::Suspended` 表示 `Driver` 已在同一 host 生命周期内的可恢复 checkpoint 停住，运行时仅在内存持有 resume state，恢复时应继续同一个未完成 run 的协议 continuation。例如工具结果已经生成但尚未回填给 Rig / provider 时，可以 suspend 并在 resume 后按正式 tool result 协议继续。它不能通过 `run_finished { status: paused }` 表达；`run_finished` 只用于 completed / failed / aborted 这三类终态。
 
-`RuntimeSnapshot.resources` 是当前 active/focused cwd 的资源摘要；没有 active session 时可以为空摘要。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不默认放入 runtime snapshot。GUI 如果需要展示多个 cwd 的资源状态，应通过后续明确 query，而不是要求 `RuntimeSnapshot` 携带所有 cwd 的完整资源摘要。
+`SessionSnapshot.resources` 是该 loaded session 固定 cwd 的 current effective resource 摘要，用于后续 turn；已经 running 的 run 仍可能使用启动时捕获的旧 `TurnResourceSnapshot`。完整 per-cwd resource catalog 属于 `ResourceSnapshotStore` 内部状态，不额外作为 runtime-global“当前资源”放入 snapshot。需要未加载 cwd 或资源正文时使用受控 `ResourceQuery`。
+
+`SessionSnapshot.command` 是该 loaded session 当前 command context 的 catalog projection。runtime/workspace-scoped command discovery 仍可通过 query 或 runtime-level command output 提供；不存在依赖“当前 session”的单例 `RuntimeSnapshot.command`。
+
+`RuntimeSnapshot.runtime_command` 只包含不需要 session context 的 runtime/workspace-scoped command。`CommandSurfaceQuery::{GetCatalog, Suggest} { session_id: None }` 读取同一 projection；`Some(session_id)` 读取该 loaded session 的完整 catalog。`None` 不能偷偷选择唯一 loaded session，session-scoped candidate/command 必须缺席或返回 `SessionRequired`。
 
 `SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `SessionQuery::List`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一底层 `SessionManager.list_sessions(...)` 查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
 
@@ -1015,7 +1012,7 @@ pub struct CommandDiagnostic {
 
 ## Downstream Adapter 调用方式
 
-MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。UI 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。TUI 可以保持 `active_session = None` 并等待用户 `/resume`；GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
+MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 或 SDK 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。adapter 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。adapter 自己维护 selected session；core 只维护 `loaded_sessions`，完整持久化清单使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
 
 Ratatui：
 

@@ -4,7 +4,7 @@
 
 最新设计把实现拆成两层：
 
-- `CommandManager`：`WorkspaceServices` 持有的共享、无状态命令管理器。它只持有只读的 command packs、candidate providers 和 handler registry，并在每次请求时临时 materialize 当前 session 的 command catalog。
+- `CommandManager`：`WorkspaceServices` 持有的共享、无状态命令管理器。它只持有只读的 command packs、candidate providers 和 handler registry，并在每次请求时按 explicit optional `SessionId` 临时 materialize runtime/workspace catalog 或目标 session catalog。
 - `Command`：`SessionRuntime` 持有的 session-scoped 命令入口。它不缓存 catalog，只负责从当前 session 组装 `CommandContext` / `SessionCommandHost`，再调用共享 `CommandManager`。
 
 `slash command` 只是 command text 的一种输入语法，不再是核心领域名。协议层原来的 `agent_runtime_protocol::Command` 改名为 `agent_runtime_protocol::AgentCommand`，避免和 `command::Command` 子系统混淆。
@@ -324,6 +324,8 @@ pub enum AgentCommand {
 
 `ExecuteCommandText` 覆盖 TUI slash input 和 GUI command palette 的文本入口。`ExecuteCatalogCommand` 覆盖 GUI/TUI 从 catalog 选择某个节点后的结构化执行入口。它只能携带 command selection、catalog revision、bindings、args 和 prompt-producing command 使用的 `prompt_delivery`，不能携带完整 runtime mutation command。
 
+core 不维护 focused/current session。`ExecuteCommandText.session_id = None` 只能 resolve runtime/workspace-scoped command；若目标 command 需要 session context，返回 `SessionRequired`，不能从唯一 loaded、最近 opened 或 adapter selection 推断。`ExecuteCatalogCommand` 始终显式携带 `SessionId`。
+
 高权限 mutation 不属于公开 `AgentCommand`：
 
 ```rust
@@ -443,16 +445,18 @@ pub struct CommandSnapshot {
 }
 ```
 
+`RuntimeSnapshot.runtime_command` 投影不需要 session context 的 runtime/workspace command；每个 loaded `SessionSnapshot.command` 投影该 session 的完整 catalog。`CommandSurfaceQuery::GetCatalog/Suggest { session_id: None }` 只访问 runtime projection，`Some(session_id)` 才 materialize session catalog，不存在默认 session fallback。
+
 Catalog change 可以发：
 
 ```rust
 CommandCatalogEvent::Changed {
-    workspace_id: WorkspaceId,
-    session_id: SessionId,
     revision: CommandCatalogRevision,
     commands: Vec<CommandNodeSummary>,
 }
 ```
+
+对应 workspace/session 坐标只存在于外层 `agent_runtime_protocol::Event`；runtime catalog 的 `Event.session_id = None`，session catalog 填目标 session id，payload 不重复 routing fields。
 
 `CommandAck` 只表示 `AgentRuntime.dispatch(AgentCommand)` 是否接收了协议命令。Unknown command、参数非法、phase 不允许等用户级错误，优先返回 accepted，然后通过 command result/output 事件展示；transport/runtime 级无法接收才 rejected。
 

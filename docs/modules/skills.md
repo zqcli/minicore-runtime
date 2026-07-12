@@ -220,8 +220,8 @@ References are relative to /abs/path.
 4. delivery 到达目标边界时选择 PromptTurn：active Steer 使用 `CurrentRun.prompt_turn`；idle submission、FollowUp 和 NextTurn 在 future turn capture resources 并创建新 `PromptTurn`。所有 steering/follow-up/next-turn queues 都只保存未展开的结构化 `SkillPromptIntent`。
 5. 目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块，得到目标边界的 `ResolvedPromptInput`；已展开技能正文绝不放回队列。
 6. new-run 路径中，`prompt::begin_turn(...)` 已基于 active tools、context files 和可见技能摘要构建同版 `PromptCallProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
-7. new-run 路径先提交 `UserInput` batch；成功后发布 `skill_invoked { run_id: None }`、`message_user_appended`，再分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
-8. active Steer 路径在 current run safe point 提交 `UserInput` batch；成功后发布 `skill_invoked { run_id: Some(current_run_id) }`、`message_user_appended`，再把同一个 committed message 放入 `NextModelCallPlan.persistent_messages`，不创建新 RunId。
+7. new-run 路径先提交 `UserInput` batch；成功后发布外层 `Event.run_id = None` 的 `skill_invoked`、`message_user_appended`，再分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
+8. active Steer 路径在 current run safe point 提交 `UserInput` batch；成功后发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked`、`message_user_appended`，再把同一个 committed message 放入 `NextModelCallPlan.persistent_messages`，不创建新 RunId。
 9. 后续完整 tool rounds 和 final assistant 继续由 `SessionRuntime` 通过 session writer 提交。
 
 这意味着：
@@ -251,7 +251,7 @@ InvokeSkill (new-run delivery)
   → skills::format_skill_block()
   → bounded pre-run hooks + revalidation
   → SessionRuntime commits UserInput through SessionHandle
-  → publish skill_invoked { run_id: None }
+  → publish skill_invoked with outer Event.run_id = None
   → publish message_user_appended
   → allocate RunId + establish CurrentRun + publish run_started
   → Driver drive_run
@@ -260,7 +260,7 @@ InvokeSkill (new-run delivery)
 InvokeSkill (active Steer)
   → resolve with CurrentRun.prompt_turn
   → commit UserInput through SessionHandle
-  → publish skill_invoked { run_id: Some(current_run_id) }
+  → publish skill_invoked with outer Event.run_id = Some(current_run_id)
   → publish message_user_appended
   → add committed message to NextModelCallPlan.persistent_messages
 

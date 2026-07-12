@@ -164,11 +164,11 @@ Rig AgentRun steps in the same turn
   → do not call ResourceManager for model-visible static resources
 ```
 
-也就是说，MVP 中 `Driver` / `AgentRunStep` 不直接调用 `ResourceManager`，也不直接接收 `TurnResourceSnapshot`。资源在 user turn 启动时被捕获进 `TurnState`，但跨到 `Driver` 的只有 `DriverTurnInput` 窄投影；需要资源/cwd 的工具运行上下文由 `SessionDriverHost` 从 `TurnState.resources` 构造。这样 reload、focus 切换或其他 session 的资源变化不会污染当前 running turn，同时不把资源编排状态泄漏给 `Driver`。
+也就是说，MVP 中 `Driver` / `AgentRunStep` 不直接调用 `ResourceManager`，也不直接接收 `TurnResourceSnapshot`。资源在 user turn 启动时被捕获进 `TurnState`，但跨到 `Driver` 的只有 `DriverTurnInput` 窄投影；需要资源/cwd 的工具运行上下文由 `SessionDriverHost` 从 `TurnState.resources` 构造。这样 reload、客户端 session selection 变化或其他 session 的资源变化不会污染当前 running turn，同时不把资源编排状态泄漏给 `Driver`。
 
 `capture_turn(...)` 不负责发现文件变化，也不负责把磁盘上的新内容自动变成模型可见资源。MVP 中，模型可见资源只有在显式 `ReloadResources`、`reload_runtime()` 或首次 `ensure_*_snapshot()` 成功后，才会发布新的 current snapshot。下一次 user turn 会捕获当时的 current snapshot：如果此前没有 reload，捕获到的仍是同一个 revision；如果 reload 已成功发布新 snapshot，捕获到的就是新 revision。
 
-因此 `reload` 是资源更新的写入边界，`capture_turn` 是资源使用的读取边界。保留 `capture_turn` 的必要性不在于自动刷新，而在于冻结一次 turn 的输入：同一个 running turn 内的 system prompt、skill 展开、prompt template 展开和 resource diagnostics 必须经同一个 `PromptResourceView` 来自同一版 snapshot，不能因为 turn 运行中发生 reload 或 focus 切换而混用新旧资源。
+因此 `reload` 是资源更新的写入边界，`capture_turn` 是资源使用的读取边界。保留 `capture_turn` 的必要性不在于自动刷新，而在于冻结一次 turn 的输入：同一个 running turn 内的 system prompt、skill 展开、prompt template 展开和 resource diagnostics 必须经同一个 `PromptResourceView` 来自同一版 snapshot，不能因为 turn 运行中发生 reload 或客户端 selection 变化而混用新旧资源。
 
 不是所有层都在 turn 开始时才创建或冻结。`RuntimeResourceSnapshot` 和 `CwdResourceSnapshot` 可以在 workspace startup、session open、首次使用某 cwd 或显式 reload 时创建并发布；它们一经发布就是不可变对象。turn 开始时冻结的是 `TurnResourceSnapshot`：它读取当时 current `CwdResourceSnapshot`，而该 cwd snapshot 已经 pin 住它构建时使用的 runtime snapshot。也就是说，turn capture 冻结“本 turn 使用哪条 snapshot 链”，但不负责重新创建所有上层 snapshot。
 
@@ -263,7 +263,7 @@ ResourceManager
   不负责: 直接接受 UI command、发布 UI event、把协议结构作为存储模型暴露
 ```
 
-公开协议可以暴露 `ReloadResources`、`resources_changed` 摘要、`RuntimeSnapshot.resources` 摘要，以及后续受控 detail query。公开协议不能接受完整 `ResourceSnapshot` 作为输入，也不能让 UI adapter 直接读本地资源文件。
+公开协议可以暴露 `ReloadResources`、`resources_changed` 摘要、每个 loaded `SessionSnapshot.resources` 摘要，以及后续受控 detail query。公开协议不能接受完整 `ResourceSnapshot` 作为输入，也不能让 UI adapter 直接读本地资源文件。
 
 ## 资源更新
 
@@ -328,7 +328,7 @@ UI / CommandSurface
   → ResourceManager::reload_cwd(CwdResourceRequest { workspace_id, cwd })
   → ResourceManager 构建 CwdResourceSnapshot C2
   → ResourceSnapshotStore::replace_cwd(workspace_id, cwd, Arc<C2>)
-  → AgentRuntime 发出 resources_changed { cwd_revision: C2.revision }
+  → AgentRuntime 发出 resources_changed { revision: C2.revision }，workspace coordinate 在外层 Event
 
 下一轮对话：
 
@@ -385,11 +385,12 @@ impl AgentRuntime {
             .await?;
 
         self.workspace_services = Some(services);
-        self.emit(EventMsg::WorkspaceOpened { ... });
         Ok(())
     }
 }
 ```
+
+MVP 协议没有 `WorkspaceEvent::Opened` / `workspace_opened`。`OpenWorkspace` 的命令接收由 `CommandAck` 表达，打开后的 workspace state 从 `RuntimeSnapshot` 读取；初始化过程中只有实际资源事实通过 `resources_*` 事件发布。内部 `RuntimeHooks::WorkspaceOpened` 即使后期实现，也不是同名公开事件。
 
 第二道保证是打开 / 新建 session 时初始化该 session 固定 cwd 的 snapshot：
 
@@ -471,7 +472,10 @@ impl ResourceManager {
 ```rust
 impl AgentRuntime {
     async fn handle_reload_resources(&self, workspace_id: WorkspaceId, cwd: PathBuf) -> Result<()> {
-        self.emit(EventMsg::ResourcesReloadStarted { workspace_id, cwd: cwd.clone() });
+        self.emit_workspace(
+            workspace_id,
+            EventMsg::Resources(ResourcesEvent::ReloadStarted { cwd: cwd.clone() }),
+        );
 
         let result = self.services.resource_manager.reload_cwd(CwdResourceRequest {
             workspace_id,
@@ -479,14 +483,19 @@ impl AgentRuntime {
             reason: CwdResourceReason::ExplicitReload,
         }).await?;
 
-        self.emit(EventMsg::ResourcesChanged {
+        self.emit_workspace(
             workspace_id,
-            cwd: result.cwd,
-            runtime_revision: result.runtime_revision,
-            cwd_revision: result.cwd_revision,
-            summaries: result.summaries,
-            diagnostics: result.diagnostics,
-        });
+            EventMsg::Resources(ResourcesEvent::Changed {
+                cwd: result.cwd.expect("cwd reload result"),
+                revision: result.cwd_revision.expect("cwd reload revision"),
+                skills: result.summaries.skills,
+                prompt_templates: result.summaries.prompt_templates,
+                context_files: result.summaries.context_files,
+                system_prompt: result.summaries.system_prompt,
+                append_system_prompts: result.summaries.append_system_prompts,
+                diagnostics: result.diagnostics,
+            }),
+        );
 
         Ok(())
     }
@@ -654,7 +663,7 @@ reload_cwd(workspace_id, cwd)
 - 附加 `ResourceSourceInfo`、`ResourceKey { kind: Skill, ... }` 和 `content_hash`。
 - 执行 `ResourceOverlayPolicy`，记录 selected / shadowed。
 - 将 selected skill catalog 放入 `CwdResourceSnapshot.resolved.skills`。
-- 为 `RuntimeSnapshot.resources`、`resources_changed` 和 `CommandSurface` 提供 `SkillSummary`。
+- 为 loaded `SessionSnapshot.resources`、`resources_changed` 和 `CommandSurface` 提供 `SkillSummary`。
 
 `ResourceManager` 不应：
 
@@ -690,18 +699,20 @@ prompt templates 是可显式调用资源，不默认进入 system prompt。`Res
 
 ```text
 resources_changed {
-    workspace_id: WorkspaceId,
-    cwd: Option<PathBuf>,
-    runtime_revision: ResourceRevision,
-    cwd_revision: Option<ResourceRevision>,
+    cwd: PathBuf,
+    revision: ResourceRevision,
     skills: Vec<SkillSummary>,
     prompt_templates: Vec<PromptTemplateSummary>,
     context_files: Vec<ContextFileSummary>,
+    system_prompt: Option<TextResourceSummary>,
+    append_system_prompts: Vec<TextResourceSummary>,
     diagnostics: Vec<ResourceDiagnostic>,
 }
 ```
 
-`RuntimeSnapshot.resources` 表示当前 active/focused cwd 的 `CwdResourceSnapshot.resolved` 摘要；没有 active session 时可以为空摘要。完整 per-cwd catalog 属于 `ResourceManager` 内部状态，不默认放入 runtime snapshot。UI 需要详情时走受控 query：
+对应 `workspace_id` 只存在于外层 `Event`。公开 `revision` 是这次 cwd effective resource view 的 `CwdResourceSnapshot.revision`；`runtime_revision` / `cwd_revision` 仍可保留在 `ResourceReloadResult` 内部，用于 ResourceManager 判断重组和失效，不重复暴露到 msg。
+
+每个 `SessionSnapshot.resources` 表示该 loaded session 固定 cwd 的 current `CwdResourceSnapshot.resolved` 摘要；同一 cwd 的多个 loaded session 可以重复该摘要。完整 per-cwd catalog 属于 `ResourceManager` 内部状态，不额外放入 runtime-global snapshot 字段。adapter 需要未加载 cwd 或正文详情时走受控 query：
 
 - `ResourceQuery::GetSkill { workspace_id, cwd, skill_name }`。
 - `ResourceQuery::GetPromptTemplate { workspace_id, cwd, template_name }`。
