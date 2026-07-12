@@ -28,23 +28,23 @@ SessionManager  ResourceManager  CommandManager Future RuntimeHooks  ModelGatewa
 LoadedSessionRuntimes  SessionHandle                       Rig providers
       │             │
       ▼             ▼
-SessionRuntime  SessionStorage
+SessionRuntimeHandle   SessionStorage
       │
-      ┌──────────────┬──────────────┬────────┬─────────────┬─────────────┬─────────────┐
-      ▼              ▼              ▼        ▼             ▼             ▼             ▼
-   Command         Skills         Prompt    Tools      Compaction     Driver      UsageStats
-                                                                                         │
-                                                                                         ▼
-                                                                                        Rig
+      ▼
+SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── Driver ── Rig AgentRun
+      │
+      ┌──────────────┬──────────────┬────────┬─────────────┬─────────────┐
+      ▼              ▼              ▼        ▼             ▼             ▼
+   Command         Skills         Prompt    Tools      Compaction     UsageStats
 ```
 
 ## 模块职责
 
 `AgentRuntime` 是 MiniCore 的 UI 无关运行时门面。它管理工作区、`WorkspaceServices`、`ResourceManager`、事件通道、命令和查询路由，并向下游宿主暴露 `dispatch`、`query`、`subscribe`、`snapshot`。
 
-`SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；`LoadedSessionRuntimes` 只是已加载 `SessionRuntime` 的 map，不作为独立架构层。
+`SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；factory 为每个 loaded session 启动 actor，`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层。它管理阶段、当前 run、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具状态、pending stable batch drafts 和事件归约；后期只在自己拥有的安全点接入 Hook。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，使任一 run 不受客户端 session selection 变化或资源 reload 影响。
+`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` / Rig `AgentRun`，通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、commit 后领域事实、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
@@ -58,9 +58,9 @@ SessionRuntime  SessionStorage
 
 `PromptTemplates` 是平级纯模板能力模块，对应未来的 `prompt_templates.rs`。它定义 template metadata/resource/catalog/invocation、frontmatter、参数解析和单次替换规则；ResourceManager 拥有生命周期，CommandManager 只消费 metadata，目标 `PromptTurn` 执行正文展开。
 
-`Prompt` 是无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView` 与 tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`；immutable `PromptTurn` 负责 intent 展开，并在每次模型调用前把 durable history、protected current input 和 typed transient context 投影为协议安全的 `ModelInputProjection`。它不是长期 `PromptManager` / `ContextManager`。
+`Prompt` 是无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView` 与 tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`；immutable `PromptTurn` pin resources、展开 intent 并提供原子 `PromptCallProfile`。每次模型调用前，Driver 把该 profile 与 durable history、protected current input、typed transient context 交给纯 `prompt::project_model_call(...)`，得到协议安全的 `ModelInputProjection`。它不是长期 `PromptManager` / `ContextManager`。
 
-`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；`SessionRuntime` 协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`，`Driver` 不直接依赖 `Tools`。
+`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...)` 与 run-only `ToolBatchInvoker.invoke_batch(...)` 进入工具管线，`Driver` 不直接依赖 `Tools`，stable commit、审批 control 和公共事件仍由 `SessionRuntime` actor 拥有。
 
 `Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point 选择、`CompactionSummaryMaterial` 构建、摘要消息格式化和压缩结果类型；它不构造 `ModelCallRequest`。压缩流程、模型调用、事件和 session 写入由 `SessionRuntime` 编排，后期压缩 Hook 也由 `SessionRuntime` 在对应安全点接入。
 
@@ -89,7 +89,7 @@ SessionRuntime  SessionStorage
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)，hook owner 分层和延期实现记录在 [ADR 0015](../adr/0015-hook-owners-follow-runtime-boundaries.md)，command run policy 与 prompt delivery 的分离记录在 [ADR 0016](../adr/0016-separate-command-run-policy-from-prompt-delivery.md)，Prompt 的 immutable turn assembly 决策记录在 [ADR 0017](../adr/0017-prompt-uses-immutable-turn-assembly.md)，Command/Query/Event/Snapshot 分离记录在 [ADR 0018](../adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)，统一 session batch writer 记录在 [ADR 0019](../adr/0019-session-writes-use-one-trusted-batch-writer.md)，headless runtime 不拥有 current session 的决策记录在 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)。行为与接口以各模块文档、协议文档、事件文档和 ADR 为权威，不再维护容易滞后的集中式开发路线图。
+事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)，hook owner 分层和延期实现记录在 [ADR 0015](../adr/0015-hook-owners-follow-runtime-boundaries.md)，command run policy 与 prompt delivery 的分离记录在 [ADR 0016](../adr/0016-separate-command-run-policy-from-prompt-delivery.md)，Prompt 的 immutable turn assembly 决策记录在 [ADR 0017](../adr/0017-prompt-uses-immutable-turn-assembly.md)，Command/Query/Event/Snapshot 分离记录在 [ADR 0018](../adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)，统一 session batch writer 记录在 [ADR 0019](../adr/0019-session-writes-use-one-trusted-batch-writer.md)，headless runtime 不拥有 current session 的决策记录在 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，per-session actor 与 run 执行分离记录在 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)。行为与接口以各模块文档、协议文档、事件文档和 ADR 为权威，不再维护容易滞后的集中式开发路线图。
 
 ## Rust 文件规划
 
@@ -116,7 +116,7 @@ SessionRuntime  SessionStorage
 | `src/session_storage.rs` | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | `SessionHandle`、`SessionWriter` / `SessionStorage` traits、stable batch 和 context 重建公共类型。 |
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | 一行一个 committed batch 的 JSONL session adapter。 |
-| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | 单会话 phase、message queues、`PendingSessionAction`、run/post-run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、稳定 batch commit，以及 per-run `SessionDriverHost` wrapper。 |
+| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | `SessionRuntimeHandle`、per-session actor loop、phase/queues/`PendingSessionAction`、run/post-run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、稳定 batch commit、`RunTask` / `RunLink` 与 owned `SessionDriverHost`。 |
 | `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、reload/recompose、diagnostics、prompt materials。 |
 | `src/prompt_templates.rs` | [PromptTemplates](prompt-templates.md)、[ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata/resource/catalog/invocation、frontmatter、参数解析和单次展开 helper；不拥有资源生命周期。 |
 | `src/command.rs` | [CommandSurface](command-surface.md) | command public module 和常用类型 re-export。 |

@@ -9,8 +9,8 @@ Driver
   consumes: DriverHost::invoke_tool_batch when Rig AgentRunStep::CallTools appears
 
 SessionRuntime
-  owns: Driver, Tools, run/session state, event归约, persistence, queues
-  coordinates: DriverHost implementation -> Tools::invoke_batch(...)
+  owns: Tools lifecycle/control, run/session state, event归约, persistence, queues
+  creates: run-only ToolBatchInvoker from committed tool/profile baseline
 
 Tools
   owns: ToolRegistry, ActiveToolSet, ToolPromptCatalog, ToolPolicy,
@@ -32,8 +32,8 @@ Driver
   owns: 推进 AgentRun、调用 DriverHost seam、把 CallTools 转成 ToolBatchRequest、把结果喂回 AgentRun::tool_results(...)
 
 SessionRuntime / SessionDriverHost
-  owns: 当前 session/run/cwd/turn context、event sink、phase、queues、pending writes
-  delegates: Tools::invoke_batch(...)
+  SessionRuntime actor owns: phase、queues、pending writes、CurrentRun projection、public event reduction
+  SessionDriverHost owns: run identity/context、ToolBatchInvoker、RunLink、progress sink、cancellation
 
 Tools
   owns: 产品级工具治理和真实执行入口
@@ -51,7 +51,7 @@ LLM returns tool calls
   -> Driver
   -> DriverHost::invoke_tool_batch(ToolBatchRequest)
   -> SessionRuntime / SessionDriverHost
-  -> Tools::invoke_batch(...)
+  -> ToolBatchInvoker.invoke_batch(...)
   -> ToolExecutor
   -> Result<ToolBatchResult, ToolBatchError>
   -> SessionRuntime commits complete Ok result as ToolRound
@@ -59,7 +59,7 @@ LLM returns tool calls
   -> AgentRun::tool_results(...)
 ```
 
-`Driver` 不直接依赖 `Tools`，也不直接执行工具。它只知道 `DriverHost` 能返回一批 tool results。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper，把 `ToolBatchRequest` 补上 session/run/cwd/turn context 后交给自己的 `Tools`。
+`Driver` 不直接依赖 `Tools`，也不直接执行工具。它只知道 `DriverHost` 能返回一批 tool results。按 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，生产实现必须使用 run-scoped owned `SessionDriverHost`；`SessionRuntime` actor 不直接实现 `DriverHost`，也不把 phase、queues、pending writes、event sink 或 `&mut Tools` 借给完整 run future。host 把 `ToolBatchRequest` 补上 session/run/cwd/turn context 后交给 run-only `ToolBatchInvoker`。
 
 `Tools` 可以通过 `ToolUpdateSink` 返回内部工具更新，例如 proposed、approval requested、started、output delta 和 result-ready；这些不是 UI event。result-ready 是 `ToolAfterExecute` 后的候选值，仍需由 `SessionRuntime` 应用 `ToolResultBeforeCommit` 并重新校验；只有最终值才能发布为 `tool_call_finished` 并进入 `ToolRound`。
 
@@ -118,13 +118,13 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 | --- | --- | --- |
 | `tools.rs` | 顶层 public module 和常用类型 re-export | 具体执行逻辑 |
 | `tools/mod.rs` | 子模块声明和内部 re-export | 业务逻辑 |
-| `tools/subsystem.rs` | 定义 `Tools` 主结构；提供 `invoke_batch`、`set_active_tools`、`prompt_view`、`pending_approval_views`、`decide_approval` 等深接口 | 不直接发布 UI event，不写 session storage |
+| `tools/subsystem.rs` | 定义 actor-owned `Tools` control facade；提供 `tool_batch_invoker`、`set_active_tools`、`prompt_view`、`decide_approval` 等深接口 | 不直接发布 UI event，不写 session storage |
 | `tools/definition.rs` | 定义 `ToolDefinition`、`ToolName`、`ToolSchema`、`ToolRisk`、`ToolExecutionMode`、`ToolSource`、prompt metadata | 不保存当前注册表 |
 | `tools/registry.rs` | 管理 `ToolRegistry`、`RegisteredTool`、工具冲突、source info、executor 绑定 | 不判断是否 active，不做审批 |
 | `tools/active.rs` | 管理 `ActiveToolSet`，决定当前 session 哪些工具暴露给模型 | 不注册工具，不执行工具 |
 | `tools/prompt.rs` | 从同一 active-set revision 原子投影 `ToolPromptView`：names、schemas、snippets、guidelines、fingerprint | 不构建完整 system prompt，不执行工具 |
 | `tools/policy.rs` | 纯策略判断：allow、deny、require approval、rewrite args、force sequential、abort | 不等待 UI，不执行工具，不做 I/O preview |
-| `tools/approval.rs` | 管 `ToolApprovalBroker`、`PendingToolApproval`、`ApprovalRequestId`、pending approval lifecycle、duplicate/stale decision handling | 不保存长期授权，不执行工具 |
+| `tools/approval.rs` | 管 `ToolApprovalBroker`、`PendingToolApproval`、`ApprovalRequestId`、waiter lifecycle、duplicate/stale decision handling；UI-safe pending projection 由 actor `CurrentRun` 持有 | 不保存长期授权，不执行工具，不直接构造 snapshot |
 | `tools/grants.rs` | 管 `ToolApprovalGrantStore`，支持 approve once、same call fingerprint、same tool in run/session/workspace、ttl/revoke | 不管理当前 pending approval |
 | `tools/planner.rs` | 把 LLM tool call 规划成 `PreparedToolInvocation`：schema validate、args canonicalize、risk classify、sandbox check、preview build、execution mode resolve | 不真正执行工具 |
 | `tools/coordinator.rs` | 执行已声明约束：parallel/sequential、approval wait、grant lookup、并发限制、按 `call_index` 稳定回填 | 不发明策略，不做具体工具副作用 |
@@ -143,7 +143,7 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 
 ## Public Interface
 
-`Tools` 对 `SessionRuntime` 暴露少量深接口：
+`Tools` 对 owner actor 暴露少量 control interface，并为 active `RunTask` 创建权限更窄的 `ToolBatchInvoker`。每个 loaded `SessionRuntime` 仍创建和销毁自己的 Tools state，不存在 workspace-global Tools service，也不存在一个同时拥有 invoke/admin/decision 权限的宽 handle。
 
 ```rust
 pub struct Tools {
@@ -151,29 +151,37 @@ pub struct Tools {
     active: ActiveToolSet,
     prompt_catalog: ToolPromptCatalog,
     policy: ToolPolicy,
-    approvals: ToolApprovalBroker,
-    grants: ToolApprovalGrantStore,
-    planner: ToolInvocationPlanner,
-    coordinator: ToolExecutionCoordinator,
-    executors: ToolExecutorRegistry,
+    approvals: Arc<ToolApprovalBroker>,
+    grants: Arc<ToolApprovalGrantStore>,
+    execution: Arc<ToolExecutionKernel>,
 }
 
 impl Tools {
+    pub fn tool_batch_invoker(&self) -> ToolBatchInvoker;
+    pub fn set_active_tools(&mut self, names: &[ToolName]) -> Result<ToolSetChange, ToolSubsystemError>;
+    pub fn prompt_view(&self) -> ToolPromptView;
+    pub fn prompt_catalog(&self) -> &ToolPromptCatalog;
+    pub fn decide_approval(&self, command: ToolApprovalDecisionCommand) -> ApprovalDecisionOutcome;
+    pub fn set_approval_mode(&mut self, mode: ToolApprovalMode);
+    pub fn approval_mode(&self) -> ToolApprovalMode;
+}
+
+#[derive(Clone)]
+pub struct ToolBatchInvoker {
+    profile: Arc<ToolExecutionProfile>,
+    approvals: Arc<ToolApprovalBroker>,
+    grants: Arc<ToolApprovalGrantStore>,
+    execution: Arc<ToolExecutionKernel>,
+}
+
+impl ToolBatchInvoker {
     pub async fn invoke_batch(
-        &mut self,
+        &self,
         request: ToolBatchRequest,
         context: ToolRunContext,
         sink: ToolUpdateSink,
         cancel: CancellationToken,
     ) -> Result<ToolBatchResult, ToolBatchError>;
-
-    pub fn set_active_tools(&mut self, names: &[ToolName]) -> ToolSetChange;
-    pub fn prompt_view(&self) -> ToolPromptView;
-    pub fn prompt_catalog(&self) -> &ToolPromptCatalog;
-    pub fn pending_approval_views(&self) -> Vec<agent_runtime_protocol::PendingToolApprovalView>;
-    pub fn decide_approval(&mut self, command: ToolApprovalDecisionCommand) -> ApprovalDecisionOutcome;
-    pub fn set_approval_mode(&mut self, mode: ToolApprovalMode);
-    pub fn approval_mode(&self) -> ToolApprovalMode;
 }
 
 pub enum ToolBatchError {
@@ -184,7 +192,20 @@ pub enum ToolBatchError {
 
 `Ok(ToolBatchResult)` 只表示每个 requested call 都已有按 `call_index` 排列的 actual/error result，可以进入 `ToolRound` commit。unknown tool、policy denied、approval rejected、schema invalid 和普通 executor failure 都归约为 `Ok` 中的 error result；abort/cancel 返回 `Err(ToolBatchError::Cancelled)`，infra/hook invariant failure 返回 `Failed`。`Err` 路径中的已完成单项结果只可用于当前 host diagnostics/progress，不能拼成 partial `ToolRound`。
 
-`SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令，并调用 `Tools` 的对应接口。
+`ToolExecutionProfile` 是 invoker 创建时捕获的 immutable baseline，至少绑定 registry/executor bindings、active tool set、policy config、sandbox profile 和 prompt/tool profile fingerprint；grants 与 pending approvals 通过专用短锁 store/broker 访问，不把整个 `Tools` 放进 mutex。`ToolExecutionKernel` 封装 planner/coordinator/executor registry 和 mutation locks，可以被 invocation task 安全共享，但不能修改 actor-owned active/profile state。
+
+`SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令。模型可见 active-tool change 仍必须遵循“计算/校验 next state → session mutation commit → 应用 Tools state → 发布 changed event → 原子替换 `PromptCallProfile` 与 future `ToolBatchInvoker`”。MVP 在 `Turn` 中直接拒绝这类 mutation；后续支持 safe-point apply 时必须把两个 replacement 放进同一 actor transaction。
+
+并发实现必须满足 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)：
+
+- `ToolBatchInvoker.invoke_batch(...)` 等待 approval 或 executor 时，actor-owned `Tools::decide_approval(...)`、pending projection 和 cancellation 必须仍可到达。
+- 等待 decision 的 future 不得持有会阻止 reply path 的 mutex guard。
+- `ToolApprovalBroker` 只在短临界区内登记/移除 `approval_id -> oneshot sender`；锁释放后 batch future 才等待 receiver。
+- RunTask 只持有 `ToolBatchInvoker`，不能 set active tools、改变 approval mode、读取 pending projection或提交 approval decision。
+- pending approval 必须先在 broker 登记 waiter，再通过 control-class `ToolUpdateSink::approval_pending(...)` 请求 actor；actor 更新 `CurrentRun` projection、发布 request event 并回复 ack 后，batch future 才进入 decision wait。actor reject/closed 时 invoker 必须移除 waiter 并失败，不能留下不可见 pending。resolved、abort、run terminal 或 session close 后从 projection 移除；duplicate/stale reply 不能重复执行工具。
+- `ToolUpdateSink` 只提交内部 update；公共事件和 `RuntimeSnapshot` projection 仍由 `SessionRuntime` actor 归约。
+
+`RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 的 UI-safe source of truth 是 actor 的 `CurrentRun` projection。`ToolApprovalBroker` 保存冻结 args 和 waiter，是执行侧 source of truth；它不再提供另一套供 snapshot 直接读取的公开 view。pending update 必须先成功交给 actor 更新 projection，再发布 `tool_call_approval_requested` 并开始等待 decision，避免 event 已发而 snapshot 缺项。
 
 `ToolPromptView` 必须一次性投影同一个 active-set revision：
 
@@ -287,7 +308,7 @@ pub enum ToolPolicyDecision {
 
 `ToolApprovalPreview` 不由 `ToolPolicy` 构造。diff preview、patch preview、bash command preview 等可能需要 I/O 或 path canonicalization，应由 `ToolInvocationPlanner` 在 policy 前准备；policy 只决定是否需要 approval 和原因。
 
-`ToolApprovalBroker` 只管理当前 pending approval：冻结 `prepared_args`，触发 `tool_call_approval_requested`，等待 `agent_runtime_protocol::AgentCommand::DecideToolApproval`。长期授权归 `ToolApprovalGrantStore`。
+`ToolApprovalBroker` 只管理当前 pending execution waiter：保存已经 finalized/frozen 的 `prepared_args`，等待 actor 处理 `agent_runtime_protocol::AgentCommand::DecideToolApproval` 后 resolve。它不发布 `tool_call_approval_requested`，也不拥有 UI-safe snapshot projection；request event 与 `CurrentRun.pending_tool_approvals` 都由 `SessionRuntime` actor 在 ack pending registration 时产生。长期授权归 `ToolApprovalGrantStore`。
 
 ```rust
 pub struct PendingToolApproval {
@@ -439,14 +460,14 @@ pub enum ToolSandboxVerdict {
 
 executor 不能自行扩大 sandbox。executor-local 检查只能比 `ToolSandboxView` 更严格，不能更宽松。
 
-## Tools::invoke_batch 流程
+## Tool Batch Invocation 流程
 
 ```text
 Rig AgentRunStep::CallTools { calls }
   → Driver maps PendingToolCall -> ToolBatchRequest { calls: ToolInvocation { call_index, ... } }
   → DriverHost::invoke_tool_batch(request)
   → SessionRuntime / SessionDriverHost attaches ToolRunContext
-  → Tools::invoke_batch(request, context, sink, cancel)
+  → ToolBatchInvoker.invoke_batch(request, context, sink, cancel)
       → for each call in call_index order:
           → registry lookup
           → active tool check
@@ -457,8 +478,8 @@ Rig AgentRunStep::CallTools { calls }
           → future RuntimeHookRegistry.invoke(ToolBeforePolicy)
           → ToolPolicy.evaluate(...)
           → grant lookup / approval mode
+          → apply allowed rewrites、重新 schema/sandbox 校验并 finalized/freeze prepared_args + preview
           → ToolApprovalBroker waits if required
-          → approval 后冻结 prepared_args
       → ToolExecutionCoordinator executes allowed prepared invocations
           → SessionRuntime sink receives tool_call_started / output_delta
           → ToolExecutor.execute(ctx, updates, cancel)
@@ -483,7 +504,7 @@ Rig AgentRunStep::CallTools { calls }
 1. Provider tool schema：active tools 的 `name`、`description`、`input_schema` 进入模型请求。
 2. System prompt：active tools 的 `prompt_snippet` 和 `prompt_guidelines` 进入 `Available tools` 与 `Guidelines`。
 
-`Prompt` 消费的是单次 `Tools.prompt_view()`，不消费 `Tools::invoke_batch`、approval/policy、sandbox 或 executor state。`ResourceManager` 不拥有工具 schemas/snippets/guidelines；工具提示素材来自 session-owned `Tools`。`PromptCallProfile` 把该 view 产生的 system sections 与 provider schemas 原子绑定。
+`Prompt` 消费的是单次 `Tools.prompt_view()`，不消费 `ToolBatchInvoker.invoke_batch`、approval/policy、sandbox 或 executor state。`ResourceManager` 不拥有工具 schemas/snippets/guidelines；工具提示素材来自 session-owned `Tools`。`PromptCallProfile` 把该 view 产生的 system sections 与 provider schemas 原子绑定。
 
 ## 内置工具命名
 
@@ -500,7 +521,7 @@ UI 本地化只能改变 `label`，不能改变 LLM 可调用的 canonical tool 
 
 | 能力 | 设计位置 | 说明 |
 | --- | --- | --- |
-| LLM 返回 tool call 后可执行 | `Driver -> DriverHost -> SessionRuntime -> Tools::invoke_batch` | Driver 不直接执行工具 |
+| LLM 返回 tool call 后可执行 | `Driver -> DriverHost -> ToolBatchInvoker.invoke_batch -> SessionRuntime commit` | Driver 不直接执行工具 |
 | Driver 不直接依赖 Tools | `DriverHost` | Driver 只调用 host seam |
 | SessionRuntime 协调 Driver 和 Tools | `SessionRuntime` / `SessionDriverHost` | 注入 session/run/cwd/turn context |
 | Tools 封装完整工具行为 | `tools/subsystem.rs` | registry、active、policy、approval、grant、executor 都在 Tools 内部 |
@@ -509,7 +530,7 @@ UI 本地化只能改变 `label`，不能改变 LLM 可调用的 canonical tool 
 | 结果按 LLM 原始顺序回填 | `call_index` + `coordinator.rs` | tool result 回填前按 `call_index` 排序 |
 | 批量 tool calls | `ToolBatchRequest` / `invoke_batch` | 一次处理 Rig `CallTools { calls }` |
 | 工具批准能力 | `approval.rs` | pending approval 状态机 |
-| UI 从 snapshot 恢复 pending approval | `pending_approval_views()` | 只暴露 UI-safe view |
+| UI 从 snapshot 恢复 pending approval | `CurrentRun.pending_tool_approvals` actor projection | 不直接读取 broker waiter/冻结 args |
 | approval 后参数冻结 | `PendingToolApproval.prepared_args` | UI 不能修改 args |
 | duplicate/stale approval 处理 | `ApprovalRequestId` + `ApprovalDecisionOutcome` | 防止双击重复执行 |
 | session 无需授权模式 | `ToolApprovalMode::AutoAllow` | session-scoped，仍受 hard deny/sandbox/audit 约束 |

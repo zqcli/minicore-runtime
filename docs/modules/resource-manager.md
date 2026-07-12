@@ -26,7 +26,7 @@ SessionRuntime
 
 Prompt
   ├─ PromptTurn.resolve_intent(...) 展开 skill / prompt template
-  └─ project_model_call(...) 生成最终 ModelInputProjection
+  └─ prompt::project_model_call(profile + call-time lanes) 生成最终 ModelInputProjection
 ```
 
 `ResourceManager` 是“资源如何加载、分层、覆盖、标识和发布”的单一事实来源；`SessionRuntime` 是“什么时候捕获并组装”的 Pull Master；`Prompt` 负责解释 captured resources、展开结构化 intent 和生成最终模型输入。三者不能反向调用。

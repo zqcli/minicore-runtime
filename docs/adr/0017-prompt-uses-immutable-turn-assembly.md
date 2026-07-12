@@ -6,7 +6,7 @@ Accepted
 
 ## 决策
 
-MiniCore 将 `Prompt` 从单一 system prompt builder 提升为无状态深模块：`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView`、tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`，得到 immutable `PromptTurn`；`PromptTurn` 负责结构化 skill/template intent 展开和每次模型调用前的协议安全 projection。system prompt 与 active tool schemas 绑定为原子 `PromptCallProfile`，resource identity 继续复用 `ResourceManager` 的 canonical key/hash/source 类型。
+MiniCore 将 `Prompt` 从单一 system prompt builder 提升为无状态深模块：`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView`、tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`，得到 immutable `PromptTurn`；`PromptTurn` 负责 pin captured resources、结构化 skill/template intent 展开并提供原子 `PromptCallProfile`。每次模型调用前的协议安全 projection 由纯 `prompt::project_model_call(ModelCallProjectionInput { profile, call-time lanes })` 完成；它不以 `PromptTurn` 为 receiver，也不需要 `PromptResourceView`。system prompt 与 active tool schemas 继续绑定在同一个 profile 中，resource identity 继续复用 `ResourceManager` 的 canonical key/hash/source 类型。本 receiver 勘误关闭 BR-048，不改变 Prompt 的无状态定位。
 
 ## 影响
 
