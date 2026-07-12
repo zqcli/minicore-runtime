@@ -71,16 +71,16 @@ AgentRuntime
       ├─ ResourceManager
       │   ├─ ResourceSnapshotStore
       │   │   ├─ current runtime -> RuntimeResourceSnapshot rev-r
-      │   │   ├─ (workspace_id, repo-a) -> CwdResourceSnapshot rev-a -> rev-r
-      │   │   └─ (workspace_id, repo-b) -> CwdResourceSnapshot rev-b -> rev-r
+      │   │   ├─ (workspace_id, <root>) -> CwdResourceSnapshot rev-a -> rev-r
+      │   │   └─ (workspace_id, <root>/api) -> CwdResourceSnapshot rev-b -> rev-r
       │   └─ ResourceOverlayPolicy
       ├─ user-global ProviderRegistry / AuthStore
       └─ shared ModelGateway
 
 LoadedSessionRuntimes
-  ├─ SessionRuntime A { cwd = repo-a } -> run captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-a)
-  ├─ SessionRuntime B { cwd = repo-a } -> next run captures current CwdSnapshot(repo-a)
-  └─ SessionRuntime C { cwd = repo-b } -> run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-b)
+  ├─ Handle A -> SessionRuntime actor A { cwd = <root> } -> RunTask captures CwdSnapshot(<root>, rev-a)
+  ├─ Handle B -> SessionRuntime actor B { cwd = <root> } -> next RunTask captures current CwdSnapshot(<root>)
+  └─ Handle C -> SessionRuntime actor C { cwd = <root>/api } -> RunTask captures CwdSnapshot(<root>/api, rev-b)
 ```
 
 ## 已关闭问题
@@ -296,20 +296,22 @@ switchSession
 
 ## 当前架构分叉
 
-### 路线 A：当前已落文档的单进程 resource snapshot 模式
+### 路线 A：单进程 resource snapshot 模式（已由 ADR 0022 收窄）
+
+下图是讨论期形态；其中单 workspace 跨 `repo-a` / `repo-b` 的示例已被 ADR 0022 否决。当前 MVP 应读作同一 canonical root 及其子目录：
 
 ```text
 AgentRuntime process
-  └─ WorkspaceServices
+  └─ WorkspaceServices { root = <root> }
       ├─ LoadedSessionRuntimes
-      │   ├─ SessionRuntime A { cwd = repo-a }
-      │   ├─ SessionRuntime B { cwd = repo-a }
-      │   └─ SessionRuntime C { cwd = repo-b }
+      │   ├─ Handle A -> SessionRuntime actor A { cwd = <root> }
+      │   ├─ Handle B -> SessionRuntime actor B { cwd = <root> }
+      │   └─ Handle C -> SessionRuntime actor C { cwd = <root>/api }
       ├─ ResourceManager
       │   └─ ResourceSnapshotStore
       │       ├─ current runtime -> RuntimeResourceSnapshot
-      │       ├─ (workspace_id, repo-a) -> CwdResourceSnapshot
-      │       └─ (workspace_id, repo-b) -> CwdResourceSnapshot
+      │       ├─ (workspace_id, <root>) -> CwdResourceSnapshot
+      │       └─ (workspace_id, <root>/api) -> CwdResourceSnapshot
       └─ shared ModelGateway / settings / auth / provider registry
 ```
 

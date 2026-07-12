@@ -377,7 +377,8 @@ SubmitPrompt 在 replace_cwd 之后才开始 capture
 ```rust
 impl AgentRuntime {
     async fn open_workspace(&mut self, req: OpenWorkspaceRequest) -> Result<()> {
-        let services = WorkspaceServices::new(req.workspace_id, req.agent_dir, req.settings).await?;
+        let workspace = ValidatedWorkspace::from_open_path(req.path)?;
+        let services = WorkspaceServices::new(workspace.clone(), req.agent_dir, req.settings).await?;
 
         services
             .resource_manager
@@ -385,12 +386,13 @@ impl AgentRuntime {
             .await?;
 
         self.workspace_services = Some(services);
+        self.publish_workspace_opened(workspace.summary());
         Ok(())
     }
 }
 ```
 
-MVP 协议没有 `WorkspaceEvent::Opened` / `workspace_opened`。`OpenWorkspace` 的命令接收由 `CommandAck` 表达，打开后的 workspace state 从 `RuntimeSnapshot` 读取；初始化过程中只有实际资源事实通过 `resources_*` 事件发布。内部 `RuntimeHooks::WorkspaceOpened` 即使后期实现，也不是同名公开事件。
+`ValidatedWorkspace::from_open_path` 由 `AgentRuntime` workspace lifecycle 调用，完成 canonical root、`WorkspaceIdV1` 派生和 single-instance guard；`ResourceManager` 不接收 adapter 提供的 workspace id。任一步失败时 partial services 不发布，runtime 回到 `NoWorkspace` 并发布 `workspace_open_failed`。
 
 第二道保证是打开 / 新建 session 时初始化该 session 固定 cwd 的 snapshot：
 
@@ -398,22 +400,21 @@ MVP 协议没有 `WorkspaceEvent::Opened` / `workspace_opened`。`OpenWorkspace`
 impl AgentRuntime {
     async fn open_session(&self, req: OpenSessionRequest) -> Result<()> {
         let handle = self.session_manager.open_handle(req.session_id).await?;
-        let workspace_id = handle.workspace_id();
-        let cwd = handle.cwd();
+        let scope = self.workspace.validate_session_metadata(handle.metadata())?;
 
         self.services
             .resource_manager
             .ensure_cwd_snapshot(CwdResourceRequest {
-                workspace_id,
-                cwd: cwd.clone(),
+                workspace_id: scope.workspace_id,
+                cwd: scope.cwd.clone(),
                 reason: CwdResourceReason::SessionOpen,
             })
             .await?;
 
         let runtime = SessionRuntime::new(SessionRuntimeInit {
             session_id: handle.session_id(),
-            workspace_id,
-            cwd,
+            workspace_id: scope.workspace_id,
+            cwd: scope.cwd,
             handle,
             services: self.services.clone(),
         });
@@ -472,19 +473,20 @@ impl ResourceManager {
 ```rust
 impl AgentRuntime {
     async fn handle_reload_resources(&self, workspace_id: WorkspaceId, cwd: PathBuf) -> Result<()> {
+        let scope = self.workspace.validate_existing_cwd(workspace_id, cwd)?;
         self.emit_workspace(
-            workspace_id,
-            EventMsg::Resources(ResourcesEvent::ReloadStarted { cwd: cwd.clone() }),
+            scope.workspace_id,
+            EventMsg::Resources(ResourcesEvent::ReloadStarted { cwd: scope.cwd.clone() }),
         );
 
         let result = self.services.resource_manager.reload_cwd(CwdResourceRequest {
-            workspace_id,
-            cwd,
+            workspace_id: scope.workspace_id,
+            cwd: scope.cwd,
             reason: CwdResourceReason::ExplicitReload,
         }).await?;
 
         self.emit_workspace(
-            workspace_id,
+            scope.workspace_id,
             EventMsg::Resources(ResourcesEvent::Changed {
                 cwd: result.cwd.expect("cwd reload result"),
                 revision: result.cwd_revision.expect("cwd reload revision"),

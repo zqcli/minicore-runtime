@@ -24,9 +24,9 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
                          │
                          ▼
                  MiniCore AgentRuntime
-                         │
-                         ▼
-                 WorkspaceServices
+                  ┌──────┴──────┐
+                  ▼             ▼
+               EventBus  WorkspaceServices
        ┌──────────────┬──────────────┬──────────────┬──────────────┐
        ▼              ▼              ▼              ▼              ▼
  SessionManager  ResourceManager  CommandManager Future RuntimeHooks  ModelGateway
@@ -109,3 +109,4 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [ADR 0019：会话写入使用统一可信的 batch writer](adr/0019-session-writes-use-one-trusted-batch-writer.md)
 - [ADR 0020：AgentRuntime 不拥有当前会话](adr/0020-agent-runtime-has-no-current-session.md)
 - [ADR 0021：SessionRuntime 分离 actor 控制面与 run 执行](adr/0021-session-runtime-separates-actor-control-from-run-execution.md)
+- [ADR 0022：Workspace 是单实例薄边界容器](adr/0022-workspace-is-single-instance-thin-boundary.md)

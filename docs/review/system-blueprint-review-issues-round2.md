@@ -205,7 +205,9 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 ### BR-036：多 workspace 语义不闭合
 
-状态：Open
+状态：Resolved
+
+处理记录：由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭。决策为 MVP 单 workspace 实例、薄边界容器：`WorkspaceIdV1` 从 canonical root path 按版本化算法确定性派生；`OpenWorkspace` 通过 `Opening` 和完成事件表达 readiness，同根幂等、异根拒绝；session cwd 必须位于 workspace root 之下，`NewSession` / `OpenSession` 都复验 workspace id/root/cwd；已铺开的 workspace 坐标保留并定死校验语义，补齐 `WorkspaceSummary`。workspace 不承载 project trust、资源 scope、provider/auth/settings 或服务生命周期；多 workspace = 多 runtime 实例。设计推导见 [docs/design/workspace-model.md](../design/workspace-model.md)。
 
 问题：协议表面广泛携带 workspace 维度（`ReloadResources { workspace_id }`、`SessionListScope::AllWorkspaces / Workspace{id}`、外层 `Event.workspace_id`、registry key 含 workspace_id、`NewSession { workspace_id }`），但 `RuntimeSnapshot.workspace` 是单个 Option、Workspace Lifecycle 状态机是单 workspace 的（NoWorkspace → Open → …），`OpenWorkspace` 被第二次调用是替换、并存还是拒绝没有任何说明。roadmap 把多 workspace 列为后续增强，但协议已经按多 workspace 形状铺开。
 
@@ -216,7 +218,7 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 风险：与 BR-001 同类的"形态先行"：实现者不知道该按单还是多 workspace 实现路由与 registry。
 
-待处理方向：明确 MVP 单 workspace（`OpenWorkspace` 重复调用 = teardown 后替换或拒绝），workspace_id 仅作前向兼容字段；多 workspace 升级路径另立文档。
+待处理方向：已处理。文档修订见 ADR 0022、`agent-runtime-protocol.md`、`agent-runtime.md`、`agent-runtime-events.md`、`session-manager.md` 和 `CONTEXT.md`。后续实现需验证 ADR 0022 的必测项。
 
 ### BR-037：tool sandbox 被定位为真正的安全边界，但没有任何 source of truth
 

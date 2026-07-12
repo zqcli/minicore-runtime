@@ -158,6 +158,7 @@ pub struct QueryError {
 pub enum QueryErrorKind {
     NotFound,
     InvalidArgument,
+    WorkspaceMismatch,
     Unauthorized,
     StaleRevision,
     Unavailable,
@@ -185,7 +186,7 @@ MVP 命令：
 ```rust
 pub enum AgentCommand {
     OpenWorkspace { path: PathBuf },
-    NewSession { workspace_id: WorkspaceId },
+    NewSession { workspace_id: WorkspaceId, cwd: Option<PathBuf> },
     OpenSession { session_id: SessionId },
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
     InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: PromptDelivery },
@@ -259,7 +260,7 @@ pub(crate) enum InternalAgentCommand {
 
 `Compact` 不能隐式调用 `AbortRun`，也不能清理 tool approval、resume state 或消息队列。`PendingSessionActionView` 是 UI-safe 当前状态投影，不是新的可执行命令载体；真正执行仍使用 `SessionRuntime` 内部保存的结构化 action。
 
-`SessionQuery::List` 返回 `SessionManager` 维护的轻量会话目录，不会加载所有 session runtime，也不会重建完整消息上下文。TUI 的 `/resume` handler 可以调用同一个内部 `SessionManager.list_sessions(...)` 并生成 command interaction；GUI sidebar 则通过 `RuntimeQuery::Session(SessionQuery::List { ... })` 直接取得 typed page，不能读取本地 index 文件。
+`SessionQuery::List` 一一映射到内部 `SessionManager.list(SessionListRequest { scope, filter, cursor, limit })`，返回轻量会话目录，不加载 session runtime，也不重建完整消息上下文。TUI `/resume` 和 GUI sidebar 复用同一 seam，不能读取本地 index 文件。
 
 ```rust
 pub enum SessionListScope {
@@ -275,6 +276,8 @@ pub struct SessionListFilter {
 
 pub struct PageCursor(pub String);
 ```
+
+`Recent` 是显式的跨 workspace 全局最近列表；`CurrentWorkspace` 才是 `/resume` 和 sidebar 默认。scope 不塞进 `SessionListFilter`，避免 manager/protocol 双形状。
 
 `RuntimeResourceSnapshot`、`CwdResourceSnapshot` 或 `TurnResourceSnapshot` 都不应作为公开 UI command/query 的输入。公开协议只允许 UI 通过 command 请求 `ReloadResources`、消费 `resources_changed` 摘要，或通过 `ResourceQuery` 读取受控详情。测试、bootstrap 或后续 SDK 如果确实需要注入资源，应走内部 API 或显式标注为 privileged command，不能绕过 `ResourceManager` 的 source info、project trust、overlay policy、diagnostics 和 atomic publish 语义。
 
@@ -359,11 +362,24 @@ pub struct PendingToolApprovalView {
 }
 ```
 
+`ApprovalGrantScope::SameToolInWorkspace` 是后续保留值，MVP 收到该 scope 必须拒绝 `UnsupportedGrantScope`；不能把它解释成跨 cwd trust/sandbox 的授权。
+
 `PendingToolApprovalView` 是 `SessionRuntime` actor 从 control-class approval-pending update 归约出的 UI-safe projection，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。`ToolApprovalBroker` 只保存冻结 execution record 与 waiter，不是另一个 UI projection owner。该 view 只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
 
 `OpenSession` 只保证目标 `SessionRuntime` 已加载，不建立 runtime-global 当前会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
 
+工作区命令语义按 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)（workspace 是单实例薄边界容器）：
+
+- `OpenWorkspace { path }` 在 `NoWorkspace` 时 accepted 并进入 `Opening`；Ack 不是完成结果。成功后发布 `workspace_opened { workspace }` 并进入 `Open`，失败后发布 `workspace_open_failed { requested_path, error }` 并回到 `NoWorkspace`。`Opening` 中同 canonical root 的重复 command accepted 并共享初始化，异 root 拒绝 `WorkspaceOpening`；`Open` 中同 root 幂等 accepted，异 root 拒绝 `WorkspaceAlreadyOpen`。runtime 不提供 `CloseWorkspace`；"换项目"由 host 重建实例完成。
+- `WorkspaceId` 使用 ADR 0022 D2 的规范 `WorkspaceIdV1`（完整 SHA-256、lowercase base32、`ws1_` 前缀）；adapter 不得自行计算。session metadata 必须持久化算法版本和 canonical root；id/root 冲突返回 `WorkspaceIdCollision`。
+- `NewSession { workspace_id, cwd }`：`workspace_id` 必须等于当前 open workspace，否则拒绝 `WorkspaceMismatch`；`cwd = None` 使用 root，显式 path canonicalize 后必须位于 root 之下，否则拒绝 `CwdOutsideWorkspace`。
+- `OpenSession` 在任何 resource ensure/runtime spawn 前复验 persisted workspace id/root/cwd；跨 workspace 返回 `SessionOutsideWorkspace`，id/root metadata 不一致返回 `SessionWorkspaceCorrupt`，cwd 越界返回 `CwdOutsideWorkspace`。
+- `ReloadResources` 与 `ResourceQuery::*` 携带的 `workspace_id` 必须匹配当前 workspace，否则返回 `WorkspaceMismatch`；`cwd` 必须是 root 之下已有 snapshot 或 loaded session 的 cwd。
+- `SessionListScope::{AllWorkspaces, Workspace}` 是纯 catalog 查询（不加载 runtime），供浏览与未来导入；`CurrentWorkspace` 依赖 `WorkspaceId` 的路径派生稳定性，在重启后仍能命中同一 root 创建的历史会话。
+
 根据 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，core 不提供 `FocusSession`、selected/current session 或 sessionless fallback routing。所有 session-scoped command 必须显式携带 `SessionId`。`ExecuteCommandText.session_id = None` 只允许解析和执行 runtime/workspace-scoped command；若解析结果需要 session context，则返回 `SessionRequired` 类 command output，不能从最近打开、唯一 loaded 或 adapter 当前显示的 session 推断目标。客户端可以本地维护 selected session，并在 dispatch 前填入 `session_id`；该状态不进入 core command、event 或 snapshot。`NewSession` 产生的 session id 通过带 originating `command_id` 的 `session_created` / `session_opened` 外层 `Event.session_id` 返回，adapter 可以据此更新自己的 selection。
+
+上述 PascalCase 名称是 `CommandAck.reason` 的稳定 machine-readable reason code，不是可本地化展示文案；adapter 不得匹配任意自然语言。query mismatch 使用 typed `QueryErrorKind::WorkspaceMismatch`。后续若 `CommandAck` 升级为 typed rejection payload，这些 code 原样迁移。
 
 `SetModel.provider_id` 和 `SetModel.model_id` 是 MiniCore 稳定 ID，对应 `ModelSelection { provider_id, model_id }`。它们不是 provider API model name，不是 Rig provider type，也不能携带 base URL、API key、OAuth token 或 auth header。模型执行、custom provider 解析和 auth 注入只发生在 [ModelGateway](model-gateway.md)。
 
@@ -373,6 +389,7 @@ pub struct PendingToolApprovalView {
 
 ```rust
 pub enum EventMsg {
+    Workspace(WorkspaceEvent),
     Session(SessionEvent),
     Run(RunEvent),
     Message(MessageEvent),
@@ -387,6 +404,11 @@ pub enum EventMsg {
     Compaction(CompactionEvent),
     Retry(RetryEvent),
     Diagnostics(DiagnosticsEvent),
+}
+
+pub enum WorkspaceEvent {
+    Opened { workspace: WorkspaceSummary },
+    OpenFailed { requested_path: PathBuf, error: String },
 }
 
 pub enum SessionEvent {
@@ -790,6 +812,8 @@ UI/wire event type 映射：
 
 | Rust 内部事件 | Wire event type |
 | --- | --- |
+| `WorkspaceEvent::Opened` | `workspace_opened` |
+| `WorkspaceEvent::OpenFailed` | `workspace_open_failed` |
 | `SessionEvent::Created` | `session_created` |
 | `SessionEvent::Opened` | `session_opened` |
 | `SessionEvent::Closed` | `session_closed` |
@@ -913,6 +937,12 @@ pub struct RunView {
     pub pending_tool_approvals: Vec<PendingToolApprovalView>,
 }
 
+pub struct WorkspaceSummary {
+    pub workspace_id: WorkspaceId,
+    pub root_path: PathBuf, // canonical root path
+    pub display_name: String,
+}
+
 pub struct SessionCatalogSummary {
     pub revision: SessionCatalogRevision,
     pub total_count: u64,
@@ -955,7 +985,7 @@ pub struct CommandSnapshot {
 
 `RuntimeSnapshot.runtime_command` 只包含不需要 session context 的 runtime/workspace-scoped command。`CommandSurfaceQuery::{GetCatalog, Suggest} { session_id: None }` 读取同一 projection；`Some(session_id)` 读取该 loaded session 的完整 catalog。`None` 不能偷偷选择唯一 loaded session，session-scoped candidate/command 必须缺席或返回 `SessionRequired`。
 
-`SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `SessionQuery::List`；TUI 的 `/resume` 默认使用 `SessionListScope::CurrentWorkspace`，GUI sidebar 也复用同一底层 `SessionManager.list_sessions(...)` 查询。`SessionIndex` / session catalog 可以作为 `SessionManager` 的本地轻量索引或缓存，但它不是 `RuntimeSnapshot`，也不由 UI 直接读取。
+`SessionCatalogSummary` 只说明会话目录 revision 和数量，不是会话清单本身。完整会话列表走 `SessionQuery::List`；TUI `/resume` 与 GUI sidebar 默认使用 `CurrentWorkspace`，并复用 `SessionManager.list(SessionListRequest)`。`SessionIndex` / session catalog 可以作为本地轻量索引或缓存，但不是 `RuntimeSnapshot`，也不由 UI 直接读取。
 
 资源摘要类型只暴露来源和展示信息，不暴露大文本正文：
 
@@ -1018,7 +1048,7 @@ pub struct CommandDiagnostic {
 
 ## Downstream Adapter 调用方式
 
-MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 或 SDK 产品仓库可以按下面方式接入。推荐启动顺序是：在宿主进程内创建或取得 `AgentRuntime`，完成 initialize/handshake，订阅事件流，`dispatch(OpenWorkspace { path })`，再调用 `snapshot()` 取得 `RuntimeSnapshot`。adapter 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接一个可独立存活的 runtime daemon。adapter 自己维护 selected session；core 只维护 `loaded_sessions`，完整持久化清单使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
+MiniCore 本仓库只定义 protocol 和 runtime 行为；CLI、TUI、GUI 或 SDK 产品仓库可以按下面方式接入。推荐启动顺序是：创建 `AgentRuntime`，完成 initialize/handshake，先订阅事件流，再 `dispatch(OpenWorkspace { path })`；收到 matching `workspace_opened` 后调用 `snapshot()`，若收到 `workspace_open_failed` 则展示失败并保持未打开状态。adapter 只 reduce `sequence > RuntimeSnapshot.last_event_sequence` 的后续事件。这里的“连接”和“重连”是同一 host 生命周期内的 adapter/subscriber 关系，不是连接独立 daemon。adapter 自己维护 selected session；core 只维护 `loaded_sessions`，完整持久化清单使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
 
 Ratatui：
 

@@ -284,13 +284,13 @@ pub struct ToolInvocationResult {
 
 ## ToolPolicy / Planner / Approval
 
-`ToolPolicy` 是纯策略判断器。它不等待 UI，不执行工具，也不发布事件；它只根据工具定义、prepared invocation、workspace trust、sandbox 结果、用户设置返回 `ToolPolicyDecision`。后期启用 hook system 时，`Tools` 可以把 hook overlay 归一化进 policy input。
+`ToolPolicy` 是纯策略判断器。它不等待 UI，不执行工具，也不发布事件；它只根据工具定义、prepared invocation、当前 session cwd 的 project trust、sandbox 结果和用户设置返回 `ToolPolicyDecision`。后期启用 hook system 时，`Tools` 可以把 hook overlay 归一化进 policy input。
 
 ```rust
 pub struct ToolPolicyInput {
     pub tool: ToolDefinition,
     pub invocation: PreparedToolInvocation,
-    pub workspace_trust: TrustLevel,
+    pub cwd_trust: TrustLevel,
     pub sandbox: ToolSandboxView,
     pub hook_requirement: Option<ToolApprovalRequirement>, // future RuntimeHooks overlay
     pub grant: Option<ApprovalGrantMatch>,
@@ -368,7 +368,7 @@ pub struct ApprovalGrantKey {
 }
 ```
 
-`SameCallFingerprint` 必须使用 canonical args hash，避免批准一个低风险参数后放行同工具的高风险参数。`AutoAllow { max_risk }` 只跳过 UI approval，不跳过 active tool check、schema validate、trust/sandbox、hard deny、mutation queue、audit log 和 diagnostics。
+`SameCallFingerprint` 必须使用 canonical args hash，避免批准一个低风险参数后放行同工具的高风险参数。`SameToolInWorkspace` 在 MVP 不得由 UI 或 policy 签发：当前 grant key 含 cwd/sandbox，它不能诚实表达跨 cwd workspace grant；移除 cwd 又会跨越 per-cwd trust/sandbox。该 scope 保留为后续类型占位，待单独 ADR 定型。`AutoAllow { max_risk }` 只跳过 UI approval，不跳过 active tool check、schema validate、trust/sandbox、hard deny、mutation queue、audit log 和 diagnostics。
 
 ## 执行语义
 
