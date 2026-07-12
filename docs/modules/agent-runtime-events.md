@@ -712,15 +712,16 @@ MVP 可以不暴露 `runtime_lifecycle_changed`，因为 UI 通常通过 workspa
 
 ### 4. Workspace Lifecycle
 
+MVP 单 workspace 实例（[ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md)）：
+
 ```text
 NoWorkspace
-  → Opening
+  → Opening                       (首次 OpenWorkspace)
   → Open
-  → ReloadingResources
-  → Open
-  → Closing
-  → NoWorkspace
+  → ReloadingResources → Open     (ReloadResources)
 ```
+
+`Open` 状态下再次收到 `OpenWorkspace`：canonical root 相同则幂等停留 `Open`（不重新 `Opening`、不重载资源、不影响 loaded sessions）；不同则拒绝 `WorkspaceAlreadyOpen`，停留 `Open`。runtime 不提供 `CloseWorkspace`；从 `Open` 回到 `NoWorkspace` 只发生在 host shutdown / 重建 `AgentRuntime` 实例的 teardown 路径，不由用户命令触发。
 
 对应事件：
 
@@ -729,6 +730,16 @@ NoWorkspace
 - `diagnostics_runtime_changed`
 
 资源 reload 失败不应进入 `NoWorkspace`，而是保持旧 revision，并通过 diagnostics 表达失败。
+
+必测项：
+
+- 同一 canonical root 重复 `OpenWorkspace` 幂等：不重载资源、不影响 loaded sessions；不同 root 拒绝 `WorkspaceAlreadyOpen`。
+- `WorkspaceId` 稳定性：同一 root 两次进程启动得到同一 id；大小写变体、尾分隔符、Windows `\\?\` 前缀、相对/绝对路径变体归一到同一 id。
+- `NewSession` cwd 边界：`None` → root；root 下子目录接受；root 外或经 symlink 逃逸到 root 外拒绝 `CwdOutsideWorkspace`。
+- `OpenSession` 非当前 workspace 的 session 拒绝 `SessionOutsideWorkspace`。
+- `ReloadResources` / `ResourceQuery` 的 `workspace_id` 不匹配当前 workspace 拒绝 `WorkspaceMismatch`。
+- workspace/session/run 级事件外层 `workspace_id` 必填且等于当前 workspace。
+- `SessionQuery::List { scope: CurrentWorkspace }` 在重启后命中上次同 root 创建的历史会话。
 
 ### 5. Session Catalog And Loaded Runtime Lifecycle
 

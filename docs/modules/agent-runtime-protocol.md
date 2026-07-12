@@ -185,7 +185,7 @@ MVP 命令：
 ```rust
 pub enum AgentCommand {
     OpenWorkspace { path: PathBuf },
-    NewSession { workspace_id: WorkspaceId },
+    NewSession { workspace_id: WorkspaceId, cwd: Option<PathBuf> },
     OpenSession { session_id: SessionId },
     SubmitPrompt { session_id: SessionId, input: UserInput, delivery: PromptDelivery },
     InvokeSkill { session_id: SessionId, skill_name: String, additional_instructions: Option<String>, delivery: PromptDelivery },
@@ -362,6 +362,15 @@ pub struct PendingToolApprovalView {
 `PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。它只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
 
 `OpenSession` 只保证目标 `SessionRuntime` 已加载，不建立 runtime-global 当前会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
+
+工作区命令语义按 [ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md)（workspace 是单实例薄边界容器）：
+
+- `OpenWorkspace { path }` 只在 `NoWorkspace` 状态创建 workspace。`Open` 状态下重复调用：canonical path 与当前 root 相同则幂等成功（不 teardown、不重载资源、不影响 loaded sessions）；不同则 `CommandAck.accepted = false`，reason `WorkspaceAlreadyOpen`。`path` canonicalize 失败或不是目录时拒绝。runtime 不提供 `CloseWorkspace`；"换项目"由 host 重建 `AgentRuntime` 实例完成。
+- `WorkspaceId` 从 canonical root path 确定性派生，跨进程/重启稳定；它是 opaque 类型，adapter 不得自行计算。
+- `NewSession { workspace_id, cwd }`：`cwd = None` 时 session cwd 为 workspace root；`cwd = Some(path)` 经 canonicalize 后必须等于 root 或位于 root 之下（symlink 逃逸判定在 canonicalize 之后），否则拒绝 `CwdOutsideWorkspace`。跨仓库多目录 MVP 不支持，属于 additional roots 演进。
+- `OpenSession` 目标 session 的 `workspace_id` 必须等于当前 workspace，否则拒绝 `SessionOutsideWorkspace`；跨项目 resume 由 host 重建 runtime 指向那个 root 完成。
+- `ReloadResources` 与 `ResourceQuery::*` 携带的 `workspace_id` 必须匹配当前 workspace，否则返回 `WorkspaceMismatch`；`cwd` 必须是 root 之下已有 snapshot 或 loaded session 的 cwd。
+- `SessionListScope::{AllWorkspaces, Workspace}` 是纯 catalog 查询（不加载 runtime），供浏览与未来导入；`CurrentWorkspace` 依赖 `WorkspaceId` 的路径派生稳定性，在重启后仍能命中同一 root 创建的历史会话。
 
 根据 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，core 不提供 `FocusSession`、selected/current session 或 sessionless fallback routing。所有 session-scoped command 必须显式携带 `SessionId`。`ExecuteCommandText.session_id = None` 只允许解析和执行 runtime/workspace-scoped command；若解析结果需要 session context，则返回 `SessionRequired` 类 command output，不能从最近打开、唯一 loaded 或 adapter 当前显示的 session 推断目标。客户端可以本地维护 selected session，并在 dispatch 前填入 `session_id`；该状态不进入 core command、event 或 snapshot。`NewSession` 产生的 session id 通过带 originating `command_id` 的 `session_created` / `session_opened` 外层 `Event.session_id` 返回，adapter 可以据此更新自己的 selection。
 
@@ -911,6 +920,12 @@ pub struct RunView {
     pub run_id: RunId,
     pub state: CurrentRunState,
     pub pending_tool_approvals: Vec<PendingToolApprovalView>,
+}
+
+pub struct WorkspaceSummary {
+    pub workspace_id: WorkspaceId,
+    pub root_path: PathBuf,
+    pub display_name: String,
 }
 
 pub struct SessionCatalogSummary {

@@ -106,3 +106,4 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - [ADR 0018：AgentRuntime 分离 Command、Query、Event 和 Snapshot](adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)
 - [ADR 0019：会话写入使用统一可信的 batch writer](adr/0019-session-writes-use-one-trusted-batch-writer.md)
 - [ADR 0020：AgentRuntime 不拥有当前会话](adr/0020-agent-runtime-has-no-current-session.md)
+- [ADR 0021：Workspace 是单实例薄边界容器](adr/0021-workspace-is-single-instance-thin-boundary.md)

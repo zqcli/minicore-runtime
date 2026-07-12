@@ -284,7 +284,7 @@ user:   The conversation history before this point was compacted into the follow
 
 JSONL 存储格式：
 
-- 第一行是 session header，包含 `type: "session"`、版本号、session id、创建时间、cwd 和可选父会话路径。header 属于 storage 初始化：`SessionManager.create(...)` 通过 adapter factory 以临时文件 + atomic rename 创建完整 header，成功后才返回 `SessionHandle` / 发布 `session_created`；handle 存在后的所有领域 mutation 都必须走 `SessionWriter.commit(...)`。
+- 第一行是 session header，包含 `type: "session"`、版本号、session id、创建时间、workspace id、canonical workspace root、cwd 和可选父会话路径。header 属于 storage 初始化：`SessionManager.create(...)` 通过 adapter factory 以临时文件 + atomic rename 创建完整 header，成功后才返回 `SessionHandle` / 发布 `session_created`；handle 存在后的所有领域 mutation 都必须走 `SessionWriter.commit(...)`。
 - 后续每行是一个完整 `session_batch`，包含 purpose、entries 和 leaf update；一个 `ToolRound` 不得跨多行。`SessionIndex` 若单独落盘只能作为可重建 catalog/cache，不得成为绕过 writer 的第二份 transcript source of truth。
 - writer 接收 `SessionEntryDraft`s，先在内存中生成全部 entry ids、timestamps、parent links 和最终 leaf，再把整个 batch 序列化为一次 append payload；记录 append 前文件长度，OS 接受包含结尾换行的完整 record payload 后才返回 `CommittedSessionBatch`。写入返回错误时先 truncate 回原长度；truncate 失败则 storage 进入不可读写的 fatal state，后续 open 必须 fail closed 直到显式修复。JSONL MVP 不用 `fsync` 声称断电级 durability。
 - loader 只接受以换行终止且可完整解析/校验的 records；即使尾部 JSON 本身可解析，只要没有结尾换行也视为未完成 tail。进程在 batch 写入中崩溃时，只允许忽略或截断这个末尾 tail；再次 append 前必须先把文件物理截断到最后一个完整换行，无法截断时 storage 只读/报错。中间行损坏、重复 entry id、非法 parentId 或不完整 committed tool round 都是结构化 corruption error。
@@ -300,13 +300,26 @@ MVP 可以同时提供两种持久化实现：
 
 ## 会话命令行为
 
-- `NewSession` 创建新会话并发出 `session_created` / `session_opened`。
+- `NewSession { workspace_id, cwd }` 创建新会话并发出 `session_created` / `session_opened`。`cwd = None` 时会话 cwd 为 workspace root；`cwd = Some(path)` 经 canonicalize 后必须等于 root 或位于 root 之下，否则拒绝 `CwdOutsideWorkspace`（[ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md)）。
 - `OpenSession` 打开已有会话，必要时加载 `SessionRuntime` 并发出 `session_opened`；目标已 loaded 时是幂等 no-op，不改变任何客户端选择。
 - `SessionQuery::List` 通过 `AgentRuntime.query()` 返回工作区下的会话元数据；底层复用 `SessionManager.list_sessions(...)`。
 - `DeleteSession` 删除未被当前运行占用的会话。
 - `SetSessionName` 通过 `SessionMutation` batch 提交 `session_info` draft，而不是修改 header。
 - `ForkSession` 通过 `get_committed_batches_to_leaf(...)` 读取源会话目标路径上的完整 `StoredSessionBatch` records，先验证 `Compaction.first_kept_entry_id`、`BranchSummary.from_id`、`Label.target_id` 和其他 entry references 都位于 selection 中且只向后引用，再按源 batch 顺序通过 staging target writer replay。每次 commit 返回 `entry_ids` 后，fork 按源 batch entry 顺序增量扩展 `old_entry_id -> new_entry_id` 映射，下一批 draft 只使用已建立的映射重写 references。任何 reference 若超出可复制 closure 或形成 forward/dangling reference，必须返回结构化 `ForkReferenceOutsideSelection` / corruption error，不能保留 source id。全部 replay 成功后才 atomic publish target file、更新 `SessionIndex` 并发布 `session_created`；失败或 crash 留下的 staging target 不得出现在 session list。
 - `NavigateSessionTree` 通过 `TreeMutation` batch 提交 leaf move，而不是删除历史。协议仍携带 `EntryId`，但 query/tree view 只应暴露可导航 batch-boundary ids；writer 对 interior/nonexistent target 返回 `InvalidLeafTarget`。
+
+会话身份在创建时固定绑定 workspace 与 cwd（[ADR 0021](../adr/0021-workspace-is-single-instance-thin-boundary.md)）。`CreateSession` 的核心身份字段：
+
+```rust
+pub struct CreateSession {
+    pub workspace_id: WorkspaceId,
+    pub workspace_root: PathBuf,   // canonical root path
+    pub cwd: PathBuf,              // canonicalized，必须在 workspace_root 之下（NewSession.cwd = None 时为 root）
+    pub name: Option<String>,
+}
+```
+
+`workspace_id` 由 `AgentRuntime` 从当前 workspace canonical root path 确定性派生（ADR 0021 D2），adapter 不自行计算。session metadata 除名称、时间、预览和轻量摘要（见上文 `SessionIndex`）外，必须持久化 `workspace_id`、canonical `workspace_root` 和固定 `cwd`：`workspace_root` 冗余存储供诊断与 id 算法演进时重算，`cwd` 在 session 生命周期内固定。`SessionListScope::CurrentWorkspace` 依赖该稳定 `workspace_id`，重启后仍能把历史会话归到当前 workspace。
 
 运行中产生的稳定消息和配置变化必须由 `SessionRuntime` 组装为 `SessionWriteBatch`，再通过 `SessionHandle.commit(...)` 写入。`Driver` 只产出持久化前事件和 message records；对应领域事件只能在 commit 成功后发布。
 
