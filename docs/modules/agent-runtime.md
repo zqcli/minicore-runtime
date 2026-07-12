@@ -31,16 +31,16 @@ pub trait AgentRuntime {
 - 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve、`CommandRunPolicy` 校验和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。prompt-producing 结果再由目标 `SessionRuntime` 按 `PromptDelivery` 统一 admission。
 - 后期持有 `RuntimeHookRegistry` 作为内部 runtime service；当前 MVP 不实现 hook registry / hook invocation。启用后只在明确 owner 的安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command result events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 display-neutral 输出或交互请求；runtime 不定义具体 picker、popup、menu、form 或 widget 组件。
-- 在 session open、focus、new、fork、import、close 前后执行受控的 open/load/focus/unload 流程；focus 切换不隐式关闭旧 `SessionRuntime`。
+- 在 session open、new、fork、import、close 前后执行受控的 open/load/unload 流程；core 不保存客户端 selected session。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
 
-`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认聚焦或恢复任何旧 session。刚打开窗口时 `RuntimeSnapshot.active_session_id = None`、`RuntimeSnapshot.active_session = None`；TUI 的 `/resume` handler 可以读取 session index 并生成 interaction，GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。只有 `OpenSession` / `NewSession` 成功后，`AgentRuntime` 才通过 `SessionManager` 创建或加载 `SessionRuntime`，并在后续 `RuntimeSnapshot.active_session` 中投影该会话的初始 idle 状态。
+`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认加载任何旧 session。刚打开 host 时 `RuntimeSnapshot.loaded_sessions` 为空；持久化 session list 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。`OpenSession` / `NewSession` 成功后，`AgentRuntime` 通过 `SessionManager` 创建或加载 `SessionRuntime`，并把该会话的初始 idle 状态加入后续 `RuntimeSnapshot.loaded_sessions`。
 
 MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生命周期，不作为独立 daemon/server 存活。`subscribe()` / `snapshot()` 的 reconnect 语义用于同一程序上下文内的 late subscribe、reducer/subscriber 重建和 sequence gap recovery；不支持 UI adapter 失败但 runtime 继续运行、随后由新 UI 连接并恢复所有后台 session 的模式。
 
 ## 运行时服务
 
-`RuntimeServices` 是内部总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 支持一个 UI/runtime 进程内多个 `SessionRuntime` 同时 loaded/running，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。
+`RuntimeServices` 是内部总称，不随任何客户端 selection 改变。MVP 支持一个 host/runtime 进程内多个 `SessionRuntime` 同时 loaded 并推进 work，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。
 
 ```text
 AgentRuntime
@@ -71,23 +71,23 @@ LoadedSessionRuntimes
       └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-4)
 ```
 
-Provider settings、auth 和 custom providers 是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth。`ModelSelection` 属于 session state；`ModelGateway` 每次调用通过 user-global `ProviderRegistry` 和 `AuthStore` 解析 provider/auth，不随 cwd 或 focused session 重建。
+Provider settings、auth 和 custom providers 是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth。`ModelSelection` 属于 session state；`ModelGateway` 每次调用通过 user-global `ProviderRegistry` 和 `AuthStore` 解析 provider/auth，不随 cwd 或客户端 selected session 重建。
 
 每个 session 只能有一个 workspace cwd。多个不同 session 可以对应同一个 cwd，并共享该 cwd 的 current `CwdResourceSnapshot`；不同 cwd 拥有独立 `CwdResourceSnapshot`。`CwdResourceSnapshot` 持有构建它时的 `Arc<RuntimeResourceSnapshot>`，并通过 `ResourceOverlayPolicy` 产出 cwd 下的 resolved resource view。cwd/project 资源可以覆盖 same-key runtime/global 资源，例如同名 project skill 覆盖 user-global skill。
 
 资源 reload 按 cwd 处理：成功 reload 会加载一份新的 `CwdResourceSnapshot`，然后在 `ResourceSnapshotStore` 中原子替换目标 `(workspace_id, cwd)` 的 current pointer。已经 running 的 run 不被中途改写，因为它已经用旧 `TurnResourceSnapshot` 构建了 `TurnState`；idle session 和后续 user turn 会 capture 新 snapshot。reload 失败必须保留旧 snapshot 并发布 diagnostics。runtime/global 资源 reload 发布新的 `RuntimeResourceSnapshot`；future turn capture 时如果发现 cwd snapshot 指向旧 runtime revision，则由 `ResourceManager` 懒惰 recompute cwd snapshot。
 
-## 会话打开和聚焦生命周期
+## 会话加载生命周期
 
-打开或聚焦会话不是 UI 页面切换，也不是运行时服务替换。建议顺序：
+打开会话表示确保对应 `SessionRuntime` 已 loaded，不表示客户端选择或运行时服务替换。建议顺序：
 
 1. 校验目标会话、workspace 和 cwd；每个 session metadata 中的 cwd 在该 session 生命周期内固定。
 2. 调用 `ResourceManager.ensure_cwd_snapshot(CwdResourceRequest { workspace_id, cwd, reason: SessionOpen })`，确保目标 `(workspace_id, cwd)` 存在 current `CwdResourceSnapshot`；不存在时加载 runtime snapshot、cwd-local layer，并通过 overlay policy 构建初始快照。
 3. 若目标会话未 loaded，通过 `SessionManager` 创建 `SessionHandle` 并加载新的 `SessionRuntime`，让它记录自己的 `workspace_id` 和 `cwd`。
-4. 若目标会话已 loaded，只更新 focused session，不改写其 cwd、phase、queue、current run 或正在 running 的 `TurnState`。
-5. 发出 `session_opened`（仅首次 loaded）和 `session_focus_changed`。
+4. 若目标会话已 loaded，作为幂等 no-op 返回，不改写其 cwd、phase、queue、current run 或正在运行的 `TurnState`。
+5. 首次 loaded 时发出 `session_opened`。
 6. 需要时发出该 cwd 对应的 `resources_changed` / diagnostics events。
-7. 后续 session-scoped 命令路由到对应 `SessionRuntime`；后台 running session 不因失去 focus 被关闭或中止。
+7. 后续 session-scoped 命令按显式 `SessionId` 路由到对应 `SessionRuntime`；其他 loaded session 不受影响。
 
 ## 安全边界
 
@@ -99,6 +99,7 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 
 ```text
 ExecuteCommandText / ExecuteCatalogCommand
+  → require explicit session_id for session-scoped resolution
   → AgentRuntime routes target session
   → SessionRuntime.command builds CommandContext + SessionCommandHost
   → CommandManager materialize current catalog
@@ -106,6 +107,8 @@ ExecuteCommandText / ExecuteCatalogCommand
   → trusted CommandHandler executes through SessionCommandHost
   → business events and/or command output events
 ```
+
+`ExecuteCommandText.session_id = None` 只允许 runtime/workspace-scoped command。若 parse/resolve 后发现命令需要 session context，返回 `SessionRequired` 类 command output；不能从唯一 loaded、最近 opened 或 adapter 本地 selection 推断目标。`ExecuteCatalogCommand` 和其他 session-scoped commands 始终显式携带 `SessionId`。
 
 `AbortRun { run_id }` 是有意保留的 run-scoped 路由例外。`RunId` 在 runtime host 内全局唯一；`AgentRuntime` 通过 `LoadedSessionRuntimes` 的 current-run lookup 找到 owner `SessionRuntime`，不要求 UI 在命令中重复 session id。该 lookup 只覆盖已经发布 `run_started` 且尚未 terminal 的 current run，不创建可持久化 run registry，也不能取消 `Turn + current_run = None` 的 admission/finalization 窗口。
 

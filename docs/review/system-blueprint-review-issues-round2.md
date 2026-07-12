@@ -12,9 +12,9 @@
 
 本轮发现的问题集中在三类：
 
-1. **协议表面的真实缺口已逐步关闭**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort/crash 持久化语义（BR-024）已通过统一 stable batch writer 关闭；abort queue 与 editor ownership 冲突（BR-031）已通过明确 UI-local restore 边界关闭。
+1. **协议表面的真实缺口已逐步关闭**：查询响应通道（BR-023）已通过独立 RuntimeQuery 关闭；abort/crash 持久化语义（BR-024）已通过统一 stable batch writer 关闭；abort queue 与 editor ownership 冲突（BR-031）已通过明确 UI-local restore 边界关闭；事件内外坐标重复（BR-033）已通过 outer-envelope-only route 规则关闭。
 2. **安全边界原有两处没有 source of truth**：custom provider 与 project trust 的关系（BR-025）已通过 user-global provider/auth 决策关闭；tool sandbox（BR-037）已通过 `Tools` 权威文档补齐 source of truth。
-3. **文档间漂移已经发生**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）、术语表与协议字段直接冲突（BR-034）。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
+3. **文档间漂移已经发生并逐步关闭**：三份架构图互相矛盾（BR-026）、hook registry 归属漂移（BR-035）和 session selector 术语冲突（BR-034）均已回到 owner 文档收敛。这印证了第一轮 BR-022 的担忧——重复声明是漂移温床。
 
 ## 高风险
 
@@ -149,11 +149,11 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 状态：Resolved
 
-处理记录：BR-027 明确 `RunId` 只在 `run_started` 边界分配后，本项决策同步修正为 optional run association。invoked 事件表示目标 `PromptTurn.resolve_intent()` 已实际展开且对应 durable input commit 成功，不再声称 idle admission 已绑定公开 run：idle/future-turn 使用 `run_id = None`，active Steer 使用 `Some(current_run_id)`。FollowUp/NextTurn 入队时仍只通过 `CommandAck` 和 `queue_updated` 表达受理，不提前发 invoked；展开或 commit 失败不发 invoked。
+处理记录：BR-027 明确 `RunId` 只在 `run_started` 边界分配后，本项决策同步修正为 optional run association。invoked 事件表示目标 `PromptTurn.resolve_intent()` 已实际展开且对应 durable input commit 成功，不再声称 idle admission 已绑定公开 run：idle/future-turn 使用外层 `Event.run_id = None`，active Steer 使用外层 `Event.run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时仍只通过 `CommandAck` 和 `queue_updated` 表达受理，不提前发 invoked；展开或 commit 失败不发 invoked。
 
 ### BR-033：`EventMsg` 内层路由字段的有无不一致
 
-状态：Open
+状态：Resolved
 
 问题：外层 `Event` 是路由权威，但部分事件族在 msg 内重复携带路由 id（SessionEvent、RunEvent、UsageEvent、CompactionEvent、RetryEvent、SkillEvent 带 session_id/run_id），另一部分完全不带（MessageEvent 只有 message_id、ToolCallEvent 只有 call_id、QueueEvent 什么都没有）。协议文档只对 `CommandResultEvent` / `UiInteractionRequest` 的 command_id 解释了“内层重复是为了脱离事件上下文渲染”，没有给出统一规则。
 
@@ -163,13 +163,15 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 风险：UI reducer 对不同事件族要走两套取 id 逻辑；序列化后内外字段不一致时无仲裁规则。
 
-待处理方向：定一条规则（全部依赖外层，或全部内层冗余）并统一各族定义。
+处理记录：外层 `Event` 被固定为 `workspace_id`、`session_id`、`run_id` 和 `command_id` 的唯一权威位置；`SessionEvent`、`RunEvent`、`UsageEvent`、`ResourcesEvent`、`CommandCatalogEvent`、`CommandResultEvent`、`SkillEvent`、`PromptTemplateEvent`、`CompactionEvent` 和 `RetryEvent` 已删除仅用于路由/关联的重复字段。message/call/approval/interaction/output/resume 等局部对象 identity 和 tree old/new leaf 等 transition operands 继续留在 msg。BR-034 随后删除了 core focus selector，因此不再存在 `FocusChanged` 例外。
+
+`DiagnosticsEvent` 不再使用重复 runtime/workspace/session/run route 的 `EventScope`；归属读取外层 `Event`，payload 只可用 `DiagnosticSubject` 表达 tool call、resource path 或 model 等 envelope 未单列的细粒度对象。`CommandResultEvent` / `UiInteractionRequest` 同样不重复 command/session 坐标；需要脱离 dispatch stack 保存 payload 的 UI adapter 必须构造包含 event metadata 与 payload 的本地 view，不能把裸 `EventMsg` 当完整事件。内部 publisher 使用按 runtime/workspace/session/run routing profile 分类的 constructor，拒绝缺失 required coordinates；公开 wire 暂不引入额外 `EventRoute` enum。
 
 ### BR-034：`focused` 与 `active` 术语直接冲突，协议字段使用了术语表明令避免的词
 
-状态：Open
+状态：Resolved
 
-问题：CONTEXT.md "聚焦会话（focused session）"词条明确 _避免_："active session"；事件也叫 `session_focus_changed`、字段 `focused_session_id`。但 `RuntimeSnapshot` 的字段是 `active_session_id` / `active_session`，其注释"runtime-visible 的当前默认会话目标"与 focused session 定义完全同义；CONTEXT.md 自己的 RuntimeSnapshot 词条也写"默认可以没有 active session"。同一概念在协议和术语表中使用互相禁止的两个名字。
+问题：CONTEXT.md "聚焦会话（focused session）"词条明确 _避免_："active session"，事件也叫 `session_focus_changed`；BR-033 后 transition operands 已使用中性的 `source_session_id` / `target_session_id`。但 `RuntimeSnapshot` 的字段仍是 `active_session_id` / `active_session`，其注释"runtime-visible 的当前默认会话目标"与 focused session 定义完全同义；CONTEXT.md 自己的 RuntimeSnapshot 词条也写"默认可以没有 active session"。同一概念在 snapshot 和术语表中仍使用互相禁止的两个名字。
 
 证据：
 
@@ -178,7 +180,11 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 风险：低成本但高频的认知摩擦；如果 active_session 实际是"focused 且 loaded 的投影"这类微妙差异，现在的文档也没有说清。
 
-待处理方向：统一为一个词（建议协议字段改 `focused_session`），或在 CONTEXT.md 显式定义两者差异。
+处理记录：本项没有采用简单 rename。MiniCore 是不包含 UI selection 的 headless、多 session runtime；多个 session 可以同时 loaded 并推进 work，因此 runtime-global focused/current/active session 不是领域事实。参考 Codex app-server 的显式 `thread_id` 请求与 per-thread status、OpenCode 的 `/:sessionID` 路由和 all-session status map、ACP 的 per-session `running/requires_action/idle` 更新，core 删除 `FocusSession`、`SessionEvent::FocusChanged`、`SessionManager.focus_session/focused_runtime` 和 `LoadedSessionRuntimes.focused_session_id`。客户端 selected session 只存在于 adapter，本地选择后在 dispatch 前填入显式 `SessionId`。
+
+`active session` 也不保留为 selector 或独立 boolean。后端真实状态固定为 persistent catalog membership、loaded runtime residency、`SessionPhase::{Idle, Turn, Compaction, RetryBackoff}`、optional `CurrentRunState` 和派生的 settled fact；run failure 不把 session 变成 terminal session。`ExecuteCommandText.session_id = None` 只允许 runtime/workspace-scoped command，session-scoped resolve 必须返回 `SessionRequired`，不能从唯一 loaded 或最近 opened session 推断目标。
+
+由于 EventStream sequence 是 runtime-global，`RuntimeSnapshot` 同时从单 `active_session` projection 改为同一水位下的 `loaded_sessions: Vec<SessionSnapshot>`，并删除重复 `active_session_id`。原先依赖当前 session 的 resources/command projection 移入每个 `SessionSnapshot`；persistent 但未 loaded 的 session 仍通过 `SessionQuery::List` 读取。BR-044 继续负责订阅起点、lag 和 gap recovery；未来只有采用 session-scoped cursor 后才考虑拆分 scoped snapshot。
 
 ### BR-035：`RuntimeHookRegistry` 归属表述漂移；workspace 级 registry 与 per-cwd trust 的交互未定义
 
@@ -193,7 +199,7 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 - `docs/modules/agent-runtime-events.md`：Ownership Matrix。
 - `docs/modules/agent-runtime.md`：`RuntimeHookRegistry` 在 WorkspaceServices，resource trust 现在由 per-cwd resource loading 输入表达。
 
-处理结果：已决策当前 MVP 不实现 hook system，`RuntimeHookRegistry` 是后期 workspace/runtime service；`SessionRuntime` 只持有 future session-scoped registry view。hook owner 固定为拥有对应安全点业务不变量的模块，`RuntimeHookRegistry` 不拥有业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能使用 focused session 或全局默认 cwd。相关图和 ownership matrix 已同步改为 future hook service / future typed result。
+处理结果：已决策当前 MVP 不实现 hook system，`RuntimeHookRegistry` 是后期 workspace/runtime service；`SessionRuntime` 只持有 future session-scoped registry view。hook owner 固定为拥有对应安全点业务不变量的模块，`RuntimeHookRegistry` 不拥有业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能使用客户端 selected session 或全局默认 cwd。相关图和 ownership matrix 已同步改为 future hook service / future typed result。
 
 剩余风险：等实际实现 hook system 时，还需要为每个 hook point 补具体 typed result、timeout、failure policy 和 conformance tests。
 
@@ -201,11 +207,11 @@ UI 通过 snapshot + EventStream reducer 观察 `run_finished` / `session_settle
 
 状态：Open
 
-问题：协议表面广泛携带 workspace 维度（`ReloadResources { workspace_id }`、`SessionListScope::AllWorkspaces / Workspace{id}`、`EventScope::Workspace`、registry key 含 workspace_id、`NewSession { workspace_id }`），但 `RuntimeSnapshot.workspace` 是单个 Option、Workspace Lifecycle 状态机是单 workspace 的（NoWorkspace → Open → …），`OpenWorkspace` 被第二次调用是替换、并存还是拒绝没有任何说明。roadmap 把多 workspace 列为后续增强，但协议已经按多 workspace 形状铺开。
+问题：协议表面广泛携带 workspace 维度（`ReloadResources { workspace_id }`、`SessionListScope::AllWorkspaces / Workspace{id}`、外层 `Event.workspace_id`、registry key 含 workspace_id、`NewSession { workspace_id }`），但 `RuntimeSnapshot.workspace` 是单个 Option、Workspace Lifecycle 状态机是单 workspace 的（NoWorkspace → Open → …），`OpenWorkspace` 被第二次调用是替换、并存还是拒绝没有任何说明。roadmap 把多 workspace 列为后续增强，但协议已经按多 workspace 形状铺开。
 
 证据：
 
-- `docs/modules/agent-runtime-protocol.md`：Command/scope 定义 vs `RuntimeSnapshot` 单 workspace 字段。
+- `docs/modules/agent-runtime-protocol.md`：Command、query scope 和外层 Event workspace coordinate vs `RuntimeSnapshot` 单 workspace 字段。
 - `docs/modules/agent-runtime-events.md`：Workspace Lifecycle。
 
 风险：与 BR-001 同类的"形态先行"：实现者不知道该按单还是多 workspace 实现路由与 registry。

@@ -307,7 +307,7 @@ pub enum ApprovalDecisionOutcome {
 }
 ```
 
-`PendingToolApprovalView` 是 UI-safe projection，进入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。它不能包含 `prepared_args`、executor handle、sandbox internals 或 hook-private context。
+`PendingToolApprovalView` 是 UI-safe projection，进入所属 loaded session 的 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals`。它不能包含 `prepared_args`、executor handle、sandbox internals 或 hook-private context。
 
 ## Approval Modes And Grants
 

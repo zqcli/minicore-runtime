@@ -22,7 +22,7 @@
 7. 流式 delta、pending approval 和执行中的 tool round 不是持久化事实；需要恢复的领域事实只能在对应 `SessionWriter.commit(...)` 成功后发布。
 8. `session_settled` 表示 UI 可认为该 session 当前没有立即继续的 run/compaction/retry、pending session action 或马上启动的 steering/follow-up continuation，并且 phase 已经回到 `idle`；`NextTurn` queue 可以保留。
 9. 同步命令接收用 `CommandAck` 表达；只读 typed 查询由 `AgentRuntime.query()` 直接返回 `QueryResponse`；异步执行结果和用户可见命令结果用 `agent_runtime_protocol::Event` 表达。
-10. `session_focus_changed` 是 runtime-visible event，表示默认会话目标改变；它不表示 session loaded、running 或 closed。
+10. core 不发布 session focus/selection event；adapter 选择哪个 session 属于客户端本地状态，session-scoped command 必须显式携带 `SessionId`。
 
 ## Naming Convention
 
@@ -116,14 +116,12 @@ wire 形态固定为外层事件 + 内层消息：
   "session_id": "ses_...",
   "run_id": "run_...",
   "msg": {
-    "type": "run_started",
-    "run_id": "run_...",
-    "session_id": "ses_..."
+    "type": "run_started"
   }
 }
 ```
 
-稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 字段只负责 routing、ordering、correlation 和 reconnect cursor。
+稳定 event type 位于 `msg.type`；外层 `agent_runtime_protocol::Event` 是 `workspace_id`、`session_id`、`run_id` 和 `command_id` 的唯一权威位置。`EventMsg` 不重复这些通用坐标，只保留局部对象 identity、transition operands 和业务数据。
 
 字段规则：
 
@@ -143,21 +141,28 @@ wire 形态固定为外层事件 + 内层消息：
 - `sequence` 是本地顺序号，适合 UI 重连和 reducer 顺序检查。
 - `event_id` 是唯一标识，适合跨日志、telemetry 和测试定位。
 
+`message_id`、`call_id`、`approval_id`、`interaction_id`、`output_id` 和 `resume_id` 是 payload 所描述对象的局部 identity，不属于 envelope route，继续放在 `EventMsg`。tree old/new leaf 等字段是 transition operands，也继续保留。禁止在 msg 中使用未限定角色的 `workspace_id` / `session_id` / `run_id` / `command_id` 复制外层坐标；若未来事实需要指向另一个实体，应使用 `source_session_id`、`origin_command_id` 等角色明确的字段。
+
+UI reducer 必须消费完整 `Event`。组件若需要在 dispatch stack 外保存 payload，由 adapter 创建包含 event metadata 的本地 view；裸 `EventMsg` 不是可独立路由、排序或关联的完整事件。
+
 ### Routing Profiles
 
 | 事件层级 | `workspace_id` | `session_id` | `run_id` | `command_id` |
 | --- | --- | --- | --- | --- |
-| runtime diagnostics | `None` 或相关 workspace | `None` | `None` | 可空 |
-| workspace resources | 必填 | `None` | `None` | reload 命令 id |
-| session list/create/delete | 必填 | 目标 session 可填 | `None` | 触发命令 id |
-| open session | 必填 | 新 session 必填 | `None` | 触发命令 id |
-| session phase/queue/config | 必填 | 必填 | 通常 `None` | 触发命令 id 或 `None` |
-| run lifecycle | 必填 | 必填 | 必填 | 启动 run 的命令 id |
-| assistant message stream | 必填 | 必填 | 必填 | 启动 run 的命令 id |
-| tool call | 必填 | 必填 | 必填 | 启动 run 的命令 id；审批响应另有自己的 command id |
+| diagnostics | 按最细可归属 owner；可空 | 按最细可归属 owner；可空 | 按最细可归属 owner；可空 | 相关命令 id 或 `None` |
+| workspace resources | 必填 | `None` | `None` | reload 命令 id 或 `None` |
+| session create/open/import/delete/close | 必填 | 目标 session 必填 | `None` | 触发命令 id 或 `None` |
+| session phase/queue/config/settled | 必填 | 必填 | 通常 `None` | 触发命令 id 或 `None` |
+| command catalog | 必填 | runtime catalog 为 `None`，session catalog 为必填 | `None` | 导致 catalog 变化的命令 id 或 `None` |
+| user message appended | 必填 | 必填 | new-run admission 为 `None`，active Steer 为 current run | originating command id |
+| skill/template invoked | 必填 | 必填 | idle/future-turn 为 `None`，active Steer 为 current run | originating command id |
+| run lifecycle | 必填 | 必填 | 必填 | 启动 run 的 originating command id |
+| assistant message stream | 必填 | 必填 | 必填 | 启动 run 的 originating command id |
+| tool call | 必填 | 必填 | 必填 | 启动 run 的 originating command id；审批响应另有 command id |
+| usage | 必填 | 必填 | 与具体 run 相关时填写，否则 `None` | 相关命令 id 或 `None` |
 | compaction | 必填 | 必填 | 可空 | 手动 compact 命令 id；自动压缩可空 |
-| command result | 可空或相关 workspace | 可空或目标 session | 通常 `None` | 触发输出或交互请求的命令 id |
-| settled | 必填 | 必填 | `None` | 通常可空 |
+| retry | 必填 | 必填 | `None` | retry 源命令 id 或 `None` |
+| command result | 可空或相关 workspace | 可空或目标 session | `None` | 触发输出或交互请求的命令 id 必填 |
 
 自动行为不一定有 `command_id`：例如 threshold auto-compaction、auto-retry。此时 `agent_runtime_protocol::Event` 依赖 `workspace_id` / `session_id` / `run_id` 关联上下文。MVP 的资源更新通过显式 reload / startup ensure 进入 `ResourceManager`，不设计文件监听器或热更新事件源。
 
@@ -174,11 +179,13 @@ SessionRuntime event sink
   AgentRuntime event bus assigns event_id + sequence + timestamp
 ```
 
+内部 publisher 不应暴露 `publish(msg, workspace_id?, session_id?, run_id?, command_id?)` 这类可自由组合的入口。实现应提供按 routing profile 分类的 draft/constructor，例如 `runtime(...)`、`workspace(...)`、`session(...)` 和 `run(...)`；constructor 校验 required coordinates，再由 event bus 统一分配 event id、sequence 和 timestamp。公开 wire 暂时保持 flat optional coordinates，不为本项额外引入公开 `EventRoute` enum。
+
 `Driver`、`Tools`、`ResourceManager`、`Compaction` 不直接生成 UI 可见的 `agent_runtime_protocol::Event`。后期 `RuntimeHooks` 只返回 typed result。它们的结果由 `SessionRuntime` / `AgentRuntime` 归约。
 
 ### RuntimeSnapshot 水位
 
-`agent_runtime_protocol::RuntimeSnapshot.last_event_sequence` 是 UI 在同一 host 生命周期内看到的权威状态水位：
+`agent_runtime_protocol::RuntimeSnapshot.last_event_sequence` 是 adapter 在同一 host 生命周期内看到的权威状态水位。snapshot builder 必须通过 event-bus/projection barrier 让 loaded runtime membership、全部 `SessionSnapshot` 与该 sequence 对应同一逻辑时刻，不能拼接彼此跨水位的 session views：
 
 ```text
 RuntimeSnapshot contains state reduced through sequence = N
@@ -196,9 +203,9 @@ received sequence > N + 1
   → continue from new snapshot.last_event_sequence
 ```
 
-session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 UI 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot` 或新事件恢复。active session 当前 run 的 approval waiting 状态投影在 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。关闭窗口后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 active session。
+session JSONL 不是 runtime event log，`RuntimeSnapshot` 也不是单独持久化的文件。不能要求 adapter 通过 session entries 重放 `message_assistant_text_delta`、`tool_call_output_delta` 或 approval waiting 状态；这些瞬时状态必须从 runtime 内存投影出的 `RuntimeSnapshot.loaded_sessions[*]` 或新事件恢复。关闭 host 后，下一次打开 workspace 时重新生成 `RuntimeSnapshot`，默认没有 loaded session。
 
-MVP 不支持 UI adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继续运行再被重连的故障模型。UI host 和 runtime 同生命周期；因此 reconnect contract 只覆盖同一程序上下文内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。`RuntimeSnapshot` 不需要为非 active/background session 提供完整恢复投影；若未来支持独立 runtime server、多窗口共享 runtime 或 daemon 模式，再引入 all-loaded-session snapshot 或 scoped event cursor。
+MVP 不支持 adapter 失败/断线但 `AgentRuntime` 作为独立 daemon 继续运行再被重连的故障模型。adapter host 和 runtime 同生命周期；因此 reconnect contract 只覆盖同一程序上下文内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。由于 event sequence 是 runtime-global，`RuntimeSnapshot` 在同一水位覆盖全部 loaded sessions；若未来使用 session-scoped subscription/cursor，再评估 scoped snapshot。
 
 ## Command Ack
 
@@ -228,7 +235,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 
 | Family | Wire event type 示例 | 生命周期 | 是否可由 RuntimeSnapshot 重建 |
 | --- | --- | --- | --- |
-| session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_focus_changed`、`session_tree_changed` | 离散事实 | 是 |
+| session lifecycle | `session_created`、`session_opened`、`session_closed`、`session_tree_changed` | 离散事实 | 是 |
 | run lifecycle | `run_started`、`run_suspended`、`run_resumed`、`run_finished` | started -> suspended/resumed* -> terminal | 是，当前 run 只能部分重建 |
 | message lifecycle | `message_user_appended`、`message_assistant_started`、`message_assistant_text_delta`、`message_assistant_finished`、`message_tool_result_appended` | appended 或 started -> delta* -> finished | committed message 可重建；active partial 只在当前 host/current run 中可见 |
 | tool call lifecycle | `tool_call_proposed`、`tool_call_approval_requested`、`tool_call_started`、`tool_call_output_delta`、`tool_call_finished` | proposed -> approval? -> started -> delta* -> finished | active tool state 可从 current run 重建；重启后只保留 committed `ToolRound` facts |
@@ -246,7 +253,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 
 | Source | 可以发 UI `agent_runtime_protocol::Event` 吗 | 说明 |
 | --- | --- | --- |
-| `AgentRuntime` | 可以 | workspace、session open/close/focus/delete、runtime diagnostics、resource reload 入口、command catalog 和 command result；query result 直接返回，不发布事件。 |
+| `AgentRuntime` | 可以 | workspace、session open/close/delete、runtime diagnostics、resource reload 入口、command catalog 和 command result；query result 直接返回，不发布事件。 |
 | `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、稳定 message batch commit、compaction 和 retry。 |
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
@@ -280,7 +287,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
 | `SessionHandle` | 单会话领域操作 facade、统一 batch commit、上下文重建结果 | 不发布 UI event；返回 `CommittedSessionBatch` / context | `SessionRuntime` 根据 commit 结果发布对应 `message_*`、`session_*`、`compaction_*` 等领域事实 |
 | `SessionStorage` / `SessionWriter` | 单会话 metadata、committed batches、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用；隐藏 memory/JSONL adapter 写入细节 |
-| `SessionManager` | persistent session catalog、`LoadedSessionRuntimes`、focused session、create/open/list/delete/fork/focus/close、storage adapter | 通常不直接发事件；由 `AgentRuntime` 发 session lifecycle 事件 | 被 `AgentRuntime` 调用；创建/关闭/查找 `SessionRuntimeHandle`，但不拥有单会话运行状态机 |
+| `SessionManager` | persistent session catalog、`LoadedSessionRuntimes`、create/open/list/delete/fork/close、storage adapter | 通常不直接发事件；由 `AgentRuntime` 发 session lifecycle 事件 | 被 `AgentRuntime` 调用；创建/关闭/查找 `SessionRuntimeHandle`，但不拥有单会话运行状态机或客户端 selection |
 | `RuntimeHookRegistry` | 后期内部 hook handler 集合和 hook 执行结果 | 默认不发布 UI event | hook 影响后的事实由对应 owner 应用，再由 `SessionRuntime` / `AgentRuntime` 归约成事件 |
 
 ### AgentRuntime Ownership
@@ -318,7 +325,6 @@ session_opened
 session_closed
 session_imported
 session_deleted
-session_focus_changed
 diagnostics_runtime_changed
 resources_reload_started
 resources_changed
@@ -539,8 +545,8 @@ Persistent session catalog
 
 LoadedSessionRuntimes
   ├─ loaded SessionRuntimeHandle map
-  ├─ focused session id
-  ├─ open/close/focus runtime lifecycle
+  ├─ loaded session ids
+  ├─ open/close runtime lifecycle
   └─ shutdown_all / optional idle unload
 ```
 
@@ -551,7 +557,6 @@ session_created
 session_opened
 session_closed
 session_deleted
-session_focus_changed
 session_tree_changed
 ```
 
@@ -700,7 +705,7 @@ Uninitialized
 对应事件：
 
 - `diagnostics_runtime_changed`：runtime 级诊断变化。
-- `diagnostics_error { scope: Runtime }`：不可归属到具体 session 的错误。
+- 外层 `Event.session_id = None` / `run_id = None` 的 `diagnostics_error`：不可归属到具体 session/run 的错误。
 - `session_opened` / `resources_changed`：通常标志 runtime 已经完成某个 workspace/session 的可用切换。
 
 MVP 可以不暴露 `runtime_lifecycle_changed`，因为 UI 通常通过 workspace/session/resource 事件感知可用性。
@@ -753,32 +758,11 @@ PersistedSession
 - `session_deleted`
 - `session_imported`
 
-`session_opened` 表示运行时已创建 `SessionRuntime` 并可进入 `RuntimeSnapshot.active_session`；不表示当前正在跑 agent。
+`session_opened` 表示运行时已创建 `SessionRuntime` 并加入 `RuntimeSnapshot.loaded_sessions`；不表示当前正在执行 Agent run。
 
-多 session 同时 loaded 时，打开新 session 不要求关闭旧 session。`session_closed` 只表示 runtime 从 `LoadedSessionRuntimes` 卸载，不表示从 catalog 删除。
+多 session 同时 loaded 时，打开新 session 不要求关闭旧 session。`session_closed` 只表示 runtime 从 `LoadedSessionRuntimes` 和后续 `RuntimeSnapshot.loaded_sessions` 卸载，不表示从 catalog 删除。客户端选择属于 adapter-local state，不产生 core event；若被选择的 session 收到 `session_closed`，adapter 自行清除或选择 fallback，runtime 不代选。
 
-### 6. Session Focus Lifecycle
-
-Focused session 是 UI 或默认命令的当前目标。它是 runtime-visible state，和 loaded/running 不同。
-
-```text
-NoFocusedSession
-  -- session_focus_changed(None -> session_id) --> Focused(session_id)
-
-Focused(old_session_id)
-  -- session_focus_changed(old_session_id -> new_session_id) --> Focused(new_session_id)
-
-Focused(session_id)
-  -- session_focus_changed(session_id -> None) --> NoFocusedSession
-```
-
-对应事件：
-
-- `session_focus_changed`
-
-`session_opened` 通常可以紧跟 `session_focus_changed`，但二者语义不同：前者表示 runtime loaded，后者表示默认目标改变。后台 running session 失去 focus 时不应被关闭或中止。
-
-### 7. Session Phase Lifecycle
+### 6. Session Phase Lifecycle
 
 `SessionPhase` 是单个 `SessionRuntime` 的互斥工作状态。
 
@@ -803,13 +787,13 @@ Focused(session_id)
 - `session_phase_changed`
 - `session_settled` 只能在 phase 回到 `idle` 且不会立即继续时发出。
 
-`session_settled` 是状态事实，不是某个 wait command 的完成回执。公开协议没有 `WaitForIdle` / `wait_finished`；UI reducer 直接消费该事件。CLI/RPC/test helper 只应覆盖“先订阅再 dispatch”或调用方已经维护该 session reducer 的场景；它不提供对任意 background session 的通用 late join。active session 可用 snapshot/reducer 当前状态避免丢失已发生的 settled；非 active session 的 late observation 取决于调用方既有 reducer 覆盖，完整订阅起点和 gap 语义留给 BR-044。
+`session_settled` 是状态事实，不是某个 wait command 的完成回执。公开协议没有 `WaitForIdle` / `wait_finished`；adapter reducer 直接消费该事件。CLI/RPC/test helper 只应覆盖“先订阅再 dispatch”或调用方已经维护该 session reducer 的场景。`RuntimeSnapshot.loaded_sessions` 可以恢复任一 loaded session 的当前 phase/queue/run state，但订阅起点、事件是否已经发生和 gap 语义仍留给 BR-044。
 
 `run_started` 不替代 `session_phase_changed(turn)`：phase 是产品级互斥状态，run 是一次 Rig drive / agent 工作单元。反过来也一样：`CommandAck` 或 `session_phase_changed(turn)` 不表示公开 run 已开始，UI 不能据此要求一个尚不存在的 `RunId` 或显示 run-level Stop。`Turn + current_run = None` 仅表示有界 admission/finalization；所有可能长时间等待的 model/provider/tool/approval 工作都必须在 `run_started` 后发生。
 
 `WaitingApproval` 和 `Suspended` 属于 `CurrentRunState`，发生时 SessionPhase 仍为 `Turn`。`BranchSummary` 是 session entry 和 future model-call purpose，不是 MVP SessionPhase。session close/unload 直接销毁 `SessionRuntime`，不增加 `Closed` phase。
 
-### 8. Run Lifecycle
+### 7. Run Lifecycle
 
 ```text
 Pending
@@ -837,7 +821,7 @@ UI 只在收到 `run_started` 或 snapshot 中存在 `current_run.run_id` 后发
 
 普通中间状态通过 message/tool/approval 事件体现，不额外暴露 `run_model_calling` 或 `run_waiting_tool`，避免状态重复。`WaitingApproval` 可以只通过 `tool_call_approval_requested` 和 `RunView.pending_tool_approvals` 表达；只有需要挂起并等待显式 resume 时，才进入 `CurrentRunState::Suspended`。
 
-### 9. Model Call Lifecycle
+### 8. Model Call Lifecycle
 
 Model call 是 `Driver` 内部生命周期，不直接暴露给 UI。
 
@@ -863,7 +847,7 @@ UI 事件：
 
 不把 provider payload、credentials、raw response 作为 UI event。
 
-### 10. User Message Lifecycle
+### 9. User Message Lifecycle
 
 User message 通常不是流式对象。
 
@@ -878,12 +862,12 @@ AcceptedByCommand
 
 对应事件：
 
-- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 且对应 `UserInput` commit 成功后发布，并先于 `message_user_appended`。idle/future-turn admission 尚未公开 run，事件使用 `run_id = None`；active Steer 使用 `Some(current_run_id)`。
+- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 且对应 `UserInput` commit 成功后发布，并先于 `message_user_appended`。idle/future-turn admission 尚未公开 run，外层 `Event.run_id = None`；active Steer 的外层 `Event.run_id = Some(current_run_id)`。
 - `message_user_appended`
 
 FollowUp/NextTurn 入队时只发 `queue_updated`，不提前发 invoked；active Steer 在 active run safe point 展开后发 invoked。`message_user_appended` 只在 `UserInput` batch commit 成功后发布，因此它同时表示 UI 可以渲染消息、下次恢复也会包含该输入。
 
-### 11. Assistant Message Lifecycle
+### 10. Assistant Message Lifecycle
 
 Assistant message 是流式对象。
 
@@ -904,7 +888,7 @@ NotStarted
 
 每条 assistant message 必须恰好有一个 `message_assistant_started` 和一个 `message_assistant_finished`；三类事件使用同一个 `message_id`，所有 delta 只能出现在 started/finished 之间，finished 后的最终文本必须等于有序 delta 拼接结果。正常 final assistant 在 `AssistantFinal` commit 成功后发布 finished；包含 tool calls 的 assistant message 在对应完整 `ToolRound` commit 成功后发布 finished，并先于该 batch 的 `message_tool_result_appended*`。abort/failure 为关闭 UI lifecycle 也必须发布 finished，但未完成 partial 不持久化，重启后不会恢复。
 
-### 12. Tool Call Lifecycle
+### 11. Tool Call Lifecycle
 
 Tool call 是模型请求的产品侧执行对象。
 
@@ -933,7 +917,7 @@ Proposed
 
 policy denied、approval rejected、schema invalid、unknown tool 都走 `tool_call_finished { is_error: true }`，并生成 error tool result message；不直接让 run failed。全部 calls 都产生 actual/error result 后，assistant tool-call message 与 results 作为一个 `ToolRound` commit；commit 成功后先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 为每条 result 发布 `message_tool_result_appended`。
 
-### 13. Approval Lifecycle
+### 12. Approval Lifecycle
 
 Approval 是 tool call 的子状态，不是 UI callback。
 
@@ -955,9 +939,9 @@ Required
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
-审批状态不能由 UI 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件，pending approval 是 `ToolApprovalBroker` 持有的当前运行状态；snapshot 只暴露 UI-safe view，不暴露冻结的 prepared args。
+审批状态不能由 adapter 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件，pending approval 是 `ToolApprovalBroker` 持有的当前运行状态；snapshot 只暴露 UI-safe view，不暴露冻结的 prepared args。
 
-### 14. Queue Lifecycle
+### 13. Queue Lifecycle
 
 消息队列和 pending session actions 都是 session runtime 状态，不是持久化 transcript。`PendingSessionAction::Compact` 是结构化 post-run action，不是模型可见消息。
 
@@ -972,13 +956,13 @@ Empty
 
 - `queue_updated { follow_up, steering, next_turn, pending_actions }`
 
-`queue_updated` 每次发送完整队列摘要，而不是 delta。通常只在 queue/pending state 实际变化时发布；`OpenSession` / `FocusSession` 后可以额外发布一次 active-session queue projection，作为 UI reducer 切换 session 时的明确 rebase。这样 UI reducer 不需要理解运行时 drain 细节。
+`queue_updated` 每次发送完整队列摘要，而不是 delta，且只在 queue/pending state 实际变化时发布。新加载 session 的初始 queue 由 `RuntimeSnapshot.loaded_sessions` 投影，不为了客户端切换视图制造额外事件。这样 adapter reducer 不需要理解运行时 drain 细节。
 
 普通 prompt、skill、prompt template 和 prompt-producing slash command 都通过 `PromptDelivery` 进入相同队列入口。`Steer` 在最早 `before_next_model_call` 安全点消费，`FollowUp` 在当前 work 和 pending session action 完成后消费，`NextTurn` 只在下一次显式用户 turn 合并。`CommandRunPolicy::Immediate` 的 `/status` 等命令不改队列，直接追加 command output；`QueueAfterRun` 的 `/compact` 只更新 `pending_actions`。
 
 `AbortRun` 在进入 idle 前清除尚未消费的 steering/follow-up 和 pending actions，保留 `NextTurn`；只有状态实际变化时才发 `queue_updated`。`ClearQueue` 清除 steering、follow-up、next-turn 和 pending actions；若清理造成状态变化，则发布四者均为空的完整 `queue_updated`。两条路径都不携带 removed items 或 editor action。
 
-### 15. Compaction Lifecycle
+### 14. Compaction Lifecycle
 
 Compaction 是 session context projection，不是普通 run。
 
@@ -1011,7 +995,7 @@ Requested while active work
 
 摘要模型调用不发 `message_assistant_started`，因为它不是用户会话里的 assistant 回复。
 
-### 16. Auto Retry Lifecycle
+### 15. Auto Retry Lifecycle
 
 Auto retry 是 run failure 后的恢复流程。
 
@@ -1035,7 +1019,7 @@ Turn
 
 如果 retry 会马上启动新 run，前一个 failed run 后不应发 `session_settled`，否则 UI 会短暂误判为空闲。
 
-### 17. Usage And Context Usage Lifecycle
+### 16. Usage And Context Usage Lifecycle
 
 Usage lifecycle 描述模型调用消耗、run 汇总、会话累计 stats 和当前上下文占用 view 的更新。它不是持久化屏障，也不是成本账单。
 
@@ -1061,7 +1045,7 @@ StatsStable
 
 `usage_updated` 可以在模型调用结束、run 结束、压缩结束、资源或工具变更后发出。它表示当前 host 的 UI usage/context view 已更新；需要跨进程恢复的 usage facts 必须包含在相关稳定 session batch 中，并在正常 `run_finished` 或 `compaction_finished` 前 commit。`SessionStatsView.total_usage` 是累计模型调用消耗，压缩不会让它下降；`ContextUsageView.current_tokens` 是下一次模型请求的上下文窗口占用，压缩后通常会下降。
 
-### 18. Resource Reload Lifecycle
+### 17. Resource Reload Lifecycle
 
 Resource reload 是 workspace/cwd 级生命周期。
 
@@ -1079,11 +1063,13 @@ Stable(cwd, revision=N)
 - `resources_changed`
 - `command_catalog_changed`，如果 skills、prompt templates、extension commands 或 builtin availability 因 reload 改变
 
-`resources_changed` 必须携带当前有效 `workspace_id`、`cwd` 和 revision。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
+`resources_changed` 的外层 `Event.workspace_id` 必须是当前有效 workspace，payload 携带 `cwd` 和 revision。adapter reducer 用 `(workspace_id, cwd)` 更新所有 matching loaded `SessionSnapshot.resources`；同一 cwd 的多个 session 会看到同一 current effective summary。失败 reload 也可以发 `resources_changed`，但 revision 仍是旧值，diagnostics 描述失败。
 
-`command_catalog_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。UI autocomplete / command palette 应以最新 `RuntimeSnapshot.command` 或该事件中的 catalog 为准。
+如果 reload 改变 session-scoped catalog，`AgentRuntime` 为每个受影响的 loaded session 发布各自带 `Event.session_id` 的 `command_catalog_changed`；不能只更新某个客户端选中的 session。
 
-### 19. Session Commit Semantics
+`command_catalog_changed` 不是资源持久化屏障；它只是 command catalog projection 的替换式更新。外层 `Event.session_id = None` 时更新 `RuntimeSnapshot.runtime_command` 对应的 runtime/workspace catalog；`Some(session_id)` 时更新对应 loaded `SessionSnapshot.command`。adapter autocomplete / command palette 应按同一 scope reduce，不能把 runtime catalog 当成某个默认 session catalog。
+
+### 18. Session Commit Semantics
 
 Session commit 是内部写入 seam，不是公共事件 lifecycle。所有 mutation 通过 `SessionHandle.commit(SessionWriteBatch)`：
 
@@ -1098,7 +1084,7 @@ Stable facts assembled in memory
 
 streaming delta、tool output delta、queue update、partial assistant、pending approval 和执行中的 tool round 不是 session writes。abort/failure/shutdown 只保留此前成功 committed 的 batches，当前不完整单元直接丢弃。公共协议不发布通用 save-point event；后期内部 `AfterSessionCommit` observer 可以用于可重建 cache、backup、telemetry 和测试。
 
-### 20. Session Tree Lifecycle
+### 19. Session Tree Lifecycle
 
 Session tree 代表当前 leaf 和分支视图。
 
@@ -1123,7 +1109,7 @@ LeafStable
 
 导航 session tree 不能删除历史，只移动当前 leaf。`session_tree_changed` 只能在 `TreeMutation` batch commit 成功后发布。
 
-### 21. Diagnostics Lifecycle
+### 20. Diagnostics Lifecycle
 
 Diagnostics 通常是替换式状态。
 
@@ -1141,9 +1127,9 @@ NoDiagnostics
 - `diagnostics_warning`
 - `diagnostics_error`
 
-`diagnostics_error` 是一次事实通知；`diagnostics_runtime_changed` 是当前诊断集合的权威替换。
+`diagnostics_error` 是一次事实通知；`diagnostics_runtime_changed` 是当前诊断集合的权威替换。runtime/workspace/session/run/command 归属只读取外层 `Event`；payload 的 optional `DiagnosticSubject` 仅用于 tool call、resource path 或 model 等更细对象，不得形成第二套路由 scope。
 
-### 22. Hook Lifecycle
+### 21. Hook Lifecycle
 
 Hook 是后期内部生命周期，默认不进 `AgentRuntimeProtocol`。当前 MVP 不实现 hook system；完整规则见 [RuntimeHooks](runtime-hooks.md)。
 
@@ -1161,7 +1147,7 @@ NotRunning
 
 UI 只看后期 hook 影响后的事实，例如 tool denied、message replaced、compaction cancelled 或 diagnostics changed。后续如果要展示 hook 运行详情，应设计独立 `hook_started/hook_finished`，不要复用内部 hook point 或 typed result。
 
-### 23. Reconnect Lifecycle
+### 22. Reconnect Lifecycle
 
 Reconnect 是 UI adapter 在同一 host 生命周期内的消费流程。它不是 UI 进程失败后重新连接仍在后台运行的独立 runtime daemon。
 
@@ -1182,7 +1168,7 @@ Expected K, received K+n
   → drop buffered assumptions
 ```
 
-这也是为什么 RuntimeSnapshot 必须包含当前 adapter 视图所需的权威状态，而不是只包含 session messages。MVP 只承诺 active session / 当前视图的恢复语义；非 active/background session 的完整运行态不属于 UI reconnect contract。
+这也是为什么 RuntimeSnapshot 必须在同一个 `last_event_sequence` 水位包含全部 loaded sessions 的权威运行态，而不是只包含某个客户端当前显示的 session。客户端 selected session 不影响 snapshot coverage。
 
 ## Submit Prompt Lifecycle
 
@@ -1249,7 +1235,7 @@ all calls resolved
   → message_tool_result_appended*
 ```
 
-审批请求是运行时事件，不是 UI callback。UI 只能通过 `DecideToolApproval` 回答，不能直接调用 tool executor，也不能替换工具参数。同一 host 生命周期内如果 UI adapter、subscriber 或 reducer 重建，当前仍未解决的审批必须从 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals` 重新渲染。
+审批请求是运行时事件，不是 UI callback。adapter 只能通过 `DecideToolApproval` 回答，不能直接调用 tool executor，也不能替换工具参数。同一 host 生命周期内如果 adapter、subscriber 或 reducer 重建，当前仍未解决的审批必须从对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 重新投影。
 
 ## Abort Lifecycle
 
@@ -1282,7 +1268,7 @@ run_started
 message_assistant_started?              // if provider streaming had started
 discard uncommitted partial assistant / incomplete tool round
 message_assistant_finished?             // required iff started; not persisted
-diagnostics_error { scope: run, recoverable }
+diagnostics_error { recoverable }              // run coordinate comes from outer Event
 run_finished { status: failed }
 session_phase_changed { phase: idle }
 session_settled or retry_auto_started
@@ -1290,7 +1276,7 @@ session_settled or retry_auto_started
 
 原则：
 
-- 同步 preflight 失败不启动 run，直接拒绝 command 或发 `diagnostics_error { scope: command }`。
+- 同步 preflight 失败不启动 run，直接拒绝 command 或发外层携带 `command_id` 的 `diagnostics_error`。
 - 可重试 provider 失败可以进入 `retry_auto_started`，但仍要关闭当前 run。
 - context overflow recovery 不把 transient overflow assistant error 写入 session；它只通过 diagnostics 呈现，并从最后 committed context 启动 recovery。
 
@@ -1326,7 +1312,7 @@ UI dispatch(OpenWorkspace)
   → WorkspaceServices::new(...)
   → ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)
       └─ missing: build RuntimeResourceSnapshot and replace_runtime(...)
-  → workspace_opened / RuntimeSnapshot { active_session: None }
+  → RuntimeSnapshot { workspace: Some(...), loaded_sessions: [] }
 
 UI dispatch(OpenSession or NewSession)
   → SessionManager.open_handle(...) / create_handle(...)
@@ -1335,19 +1321,22 @@ UI dispatch(OpenSession or NewSession)
       ├─ missing: load cwd-local resources, overlay, replace_cwd(...)
       └─ stale runtime revision: recompose_cwd(...), replace_cwd(...)
   → create SessionRuntime { workspace_id, cwd, services }
-  → session_opened / session_focus_changed
+  → session_opened
 ```
+
+MVP 没有公开 `workspace_opened` 事件；`OpenWorkspace` 的接收由 `CommandAck` 表达，打开后的 workspace state 由 snapshot 恢复。后期 hook point `WorkspaceOpened` 也不等于公开 wire event。
 
 `ensure_*` 必须幂等。并发 open session、first turn 或 reload 只能通过 `ResourceSnapshotStore.replace_*` 发布完整的新 snapshot，不能让 UI 事件成为状态更新来源。
 
 ```text
 UI dispatch(ReloadResources)
-  → resources_reload_started { workspace_id, cwd }
+  → resources_reload_started { cwd }           // workspace coordinate is on outer Event
   → ResourceManager.reload_cwd(CwdResourceRequest { workspace_id, cwd, ... })
       ├─ success: build CwdResourceSnapshot { runtime, local, resolved }
       │          and ResourceSnapshotStore.replace_cwd(workspace_id, cwd, snapshot)
       └─ failure: keep old CwdResourceSnapshot for cwd, collect diagnostics
-  → resources_changed { workspace_id, cwd, runtime_revision, cwd_revision, summaries, diagnostics }
+  → resources_changed { cwd, revision, skills, prompt_templates, context_files,
+                        system_prompt, append_system_prompts, diagnostics }
   → diagnostics_runtime_changed?               // only for runtime-level diagnostics
 ```
 
@@ -1357,7 +1346,7 @@ UI dispatch(ReloadResources)
 
 ```text
 ReloadResources 完成 replace_cwd(C2)
-  → resources_changed { cwd_revision: C2.revision }
+  → resources_changed { revision: C2.revision }
 
 下一次 SubmitPrompt
   → SessionRuntime::start_user_turn(...)
@@ -1368,23 +1357,21 @@ ReloadResources 完成 replace_cwd(C2)
 
 如果 submit 在 `replace_cwd` 之前已经开始 capture，它可以合法使用旧 snapshot；如果 submit 在 `replace_cwd` 之后才开始 capture，就必须看到新 snapshot。旧 snapshot 不会被原地修改，正在运行的 turn 继续使用自己已经捕获的 `TurnResourceSnapshot`。
 
-## Session Open And Focus Lifecycle
+## Session Open Lifecycle
 
 ```text
-UI dispatch(OpenSession or FocusSession)
+adapter dispatch(OpenSession)
   → open existing runtime or SessionManager.open_and_load(...)
   → ensure ResourceManager has current CwdResourceSnapshot for session { workspace_id, cwd } if newly loaded
-  → session_opened { session_id }?             // only if it was not already loaded
-  → session_focus_changed { previous_session_id, focused_session_id: session_id }
-  → session_phase_changed { phase: idle }
+  → session_opened?                            // outer Event.session_id identifies it; only if newly loaded
+  → session_phase_changed { phase: idle }?     // only for newly loaded runtime projection
   → resources_changed?                         // if this cwd snapshot changed
-  → queue_updated                               // active session queue projection
-  → session_settled
+  → session_settled?                           // if newly loaded runtime is settled
 ```
 
-多 session 同时 loaded 时，聚焦新 session 不应自动关闭旧 session，也不应改写旧 session 的 fixed cwd、phase、queue、current run 或已经捕获到 `TurnState` 的 `TurnResourceSnapshot`。只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
+多 session 同时 loaded 时，打开新 session 不应自动关闭或改写其他 session 的 fixed cwd、phase、queue、current run 或已经捕获到 `TurnState` 的 `TurnResourceSnapshot`。目标已 loaded 时 `OpenSession` 是幂等 no-op；只有显式 `CloseSession`、workspace teardown、idle unload 或 shutdown policy 才发 `session_closed`。
 
-`session_opened` 或 `session_focus_changed` 之后 UI 应重新请求或接收 `agent_runtime_protocol::RuntimeSnapshot`。事件流负责增量变化，snapshot 负责权威恢复。`OpenWorkspace` 本身不自动恢复旧 session；此时 `RuntimeSnapshot.active_session = None`。TUI 的 `/resume` handler 可以读取同一个 `SessionManager` 目录并产生 interaction；GUI sidebar 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
+`session_opened` 之后 adapter 可以重新请求 `agent_runtime_protocol::RuntimeSnapshot` 取得完整 `SessionSnapshot`。事件流负责增量变化，snapshot 负责权威恢复。`OpenWorkspace` 本身不自动恢复旧 session，因此 `RuntimeSnapshot.loaded_sessions` 为空；持久化 session list 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。adapter 选择显示哪个 session 是本地状态。
 
 ## RuntimeSnapshot And Reconnect
 
@@ -1406,14 +1393,14 @@ MVP 可以只保留内存 ring buffer；session JSONL 是会话历史，不是 a
 
 ## AgentRuntimeProtocol Reference
 
-`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、各事件族 enum、`RunTerminalStatus`、`EventScope` 和完整 wire event type 映射以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为权威定义。本文件只解释生命周期、顺序、所有权和场景约束，避免同一份协议类型在两个文档中漂移。
+`agent_runtime_protocol::Event`、`agent_runtime_protocol::EventMsg`、各事件族 enum、`RunTerminalStatus`、`DiagnosticSubject` 和完整 wire event type 映射以 [AgentRuntimeProtocol](agent-runtime-protocol.md) 为权威定义。本文件只解释生命周期、顺序、所有权和场景约束，避免同一份协议类型在两个文档中漂移。
 
 ## Test Matrix
 
 MVP event lifecycle tests 应覆盖：
 
 - submit prompt text-only：`UserInput` / `AssistantFinal` commit 成功后才发布对应 message/run 事件，并验证 `session_settled` 顺序。
-- skill/template invocation：idle/future-turn 在 `UserInput` commit 后发布 `run_id = None` 的 invoked，再发 `message_user_appended`；active Steer 使用 `Some(current_run_id)`；展开或 commit 失败不发 invoked。
+- skill/template invocation：idle/future-turn 在 `UserInput` commit 后发布外层 `Event.run_id = None` 的 invoked，再发 `message_user_appended`；active Steer 使用外层 `Event.run_id = Some(current_run_id)`；invoked payload 不含 `run_id`，展开或 commit 失败不发 invoked。
 - user input commit failure：不发布 `message_user_appended` / `run_started`，不调用模型，phase 回到 idle 并产生 command/runtime diagnostic。
 - assistant streaming：delta 必须在 `message_assistant_started` / `message_assistant_finished` 之间。
 - tool success：`tool_call_proposed` / `tool_call_started` / `tool_call_finished`；`ToolRound` commit 后先发布 tool-call assistant 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`。
@@ -1429,6 +1416,9 @@ MVP event lifecycle tests 应覆盖：
 - compaction：`Compaction` batch commit、phase、`compaction_started` / `compaction_finished` 和 settled 顺序。
 - resource reload failure：旧 revision 不变，diagnostics 更新。
 - command text view：`/status`、`/usage` 产生 `command_output_appended`，不把结果放入 `CommandAck`。
+- event envelope：所有 reducer 只从外层读取 workspace/session/run/command coordinates；msg schema 不重复通用坐标，tree old/new leaf 等 transition operands 保留；按 routing profile 分类的内部 constructor 拒绝缺失 required coordinate。
 - command interaction：`/model`、`/thinking` 产生 `command_interaction_requested`，选择后通过 `ExecuteCatalogCommand`、runtime-tracked `SubmitInteraction` 或明确结构化 `AgentCommand` 完成设置；不依赖 interaction request 携带 raw command text。
 - command text semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
+- explicit session routing：core 没有 `FocusSession` / focus event；session-scoped command 缺少 `SessionId` 时返回 `SessionRequired`，不能回退到唯一 loaded 或最近 opened session。
+- multi-session snapshot：两个或更多 loaded sessions 同时推进 work 时，projection barrier 产生同一水位的 `loaded_sessions`；客户端 selection 不改变 coverage，close/open 与 sequence 不得形成跨水位拼接。
 - resync：RuntimeSnapshot sequence 后的事件可正确 reduce。

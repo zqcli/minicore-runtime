@@ -488,12 +488,12 @@ transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状�
 
 ```text
 session_phase_changed { phase: compaction }
-compaction_started { session_id, reason }
+compaction_started { reason }                  // session coordinate is on outer Event
 SessionHandle.commit(SessionWriteBatch::compaction(...)) // internal, no public persistence event
-compaction_finished { session_id, result, aborted, will_retry }
+compaction_finished { result, aborted, will_retry }
 usage_updated { context_usage }
 session_phase_changed { phase: idle }
-session_settled { session_id, next_turn_count }
+session_settled { next_turn_count }
 ```
 
 立即执行时推荐顺序：`session_phase_changed(compaction)` → `compaction_started` → internal `SessionHandle.commit(SessionWriteBatch::compaction(...))` → `compaction_finished` → `usage_updated` → `session_phase_changed(idle)` → `session_settled`。running 时提交的 manual compact 先发 `queue_updated(pending compact)`；当前 work chain 结束后发 `queue_updated(remove pending compact)`，再进入上述 compaction 顺序。如果 `will_retry = true` 或压缩后将立即启动 queued steering/follow-up continuation，则直接进入后续 `run_started`，不先发 `session_settled`。`NextTurn` queue 可以保留且不阻止 settled。

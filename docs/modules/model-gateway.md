@@ -69,7 +69,7 @@ ModelGateway internals
   └─ rig_provider_adapter       // private Rig provider/client usage
 ```
 
-`ModelGateway` 是 runtime-global 的模型调用边界，不随 session focus、cwd 或 resource reload 重建。provider settings、custom provider 声明和 auth 都来自 user-global/runtime-global 配置；项目级 settings 不允许声明 custom provider、覆盖 base URL 或引用 credentials。不同 session 通过自己的 `ModelState` 选择 `ModelSelection`，但 provider/auth 解析使用同一个 user-global `ProviderRegistry` 和 `AuthStore`。
+`ModelGateway` 是 runtime-global 的模型调用边界，不随客户端 session selection、cwd 或 resource reload 重建。provider settings、custom provider 声明和 auth 都来自 user-global/runtime-global 配置；项目级 settings 不允许声明 custom provider、覆盖 base URL 或引用 credentials。不同 session 通过自己的 `ModelState` 选择 `ModelSelection`，但 provider/auth 解析使用同一个 user-global `ProviderRegistry` 和 `AuthStore`。
 
 ## 不应承担
 
@@ -289,7 +289,7 @@ pub struct ModelCallRequest {
 
 `ModelCallPurpose` 是模型调用业务目的的唯一权威类型，并原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；不存在第二套 `UsagePurpose`，也不允许在 usage/persistence 层重新分类。
 
-`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason`、`DriveEntry::Retry` 或 future call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 session 因 focus 切换而在后台继续运行时，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
+`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason`、`DriveEntry::Retry` 或 future call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 loaded session 在客户端未显示时继续运行，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
 
 `AgentRun` 请求必须来自已校验的 `ModelInputProjection`，通常带 `tools`、完整 system prompt 和可选 `OutputContract`；`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求不带 tools/output contract，不复用 Agent run system prompt，只使用 compaction summary prompt，并把 `CompactionSummaryMaterial.max_output_tokens` 写入请求。
 
@@ -489,7 +489,7 @@ Driver
 SessionRuntime
   → usage_updated
   → run_finished { usage }
-  → RuntimeSnapshot.active_session.session_stats / context_usage
+  → matching RuntimeSnapshot.loaded_sessions[*].session_stats / context_usage
 ```
 
 `ModelCallUsage.raw_provider_usage` 如果保留，只能作为 internal redacted diagnostic，不进入 `AgentRuntimeProtocol`，不进 session JSONL，不进 hook context。写入 stable batch 前必须转换为 [UsageStats](usage-stats.md) 定义的 `PersistedModelCallUsage`；writer 不接受 runtime `ModelCallUsage` 的 raw shape。

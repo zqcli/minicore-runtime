@@ -109,7 +109,7 @@ ModelGateway
 
 `RuntimeHookRegistry` 可以保存 handler 集合、capability metadata、source info、timeout 策略和 error policy。它不拥有业务状态机，也不拥有 event metadata。
 
-Owner 规则：谁拥有该安全点的不变量，谁调用 hook、应用 typed result、重新校验并负责 diagnostics。`Driver` 不调用 hook；它只把 Rig safe point 交还给 `DriverHost` / `SessionRuntime`。`RuntimeHookRegistry` 不拥有任何业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能用 focused session 或全局默认 cwd。
+Owner 规则：谁拥有该安全点的不变量，谁调用 hook、应用 typed result、重新校验并负责 diagnostics。`Driver` 不调用 hook；它只把 Rig safe point 交还给 `DriverHost` / `SessionRuntime`。`RuntimeHookRegistry` 不拥有任何业务流程。后期 trust / capability gate 必须由 hook owner 在调用时按当前上下文计算；session-scoped hook 使用该 `SessionRuntime` 的 fixed workspace/cwd 和对应 resource trust summary，不能使用客户端 selected session 或任何全局默认 cwd。
 
 Hook source 建议分级：
 

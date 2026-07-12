@@ -49,16 +49,16 @@ _避免_：模型客户端、API wrapper
 _避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
 
 **RuntimeSnapshot**：
-Agent 运行时在某个事件水位上的当前状态读模型，用于界面初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。它由运行时从内存状态、设置、资源摘要和会话目录投影生成，不是 UI store，不是会话文件，也不单独持久化。active session 当前 run 的待审批工具调用通过 `current_run.pending_tool_approvals` 投影给 UI。打开工作区后默认可以没有 active session。MVP 不支持 UI adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
+Agent 运行时在某个事件水位上的当前状态读模型，用于 adapter 初始化和同一 host 生命周期内的事件流重连/订阅重建。它在同一水位原子覆盖全部 loaded `SessionRuntime`，包括各自 current run 的 pending approvals；它不是 UI store、会话文件或持久化快照。打开工作区后默认 `loaded_sessions` 为空。MVP 不支持 adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
 _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
 **运行时服务**：
-`AgentRuntime` 内部的后端依赖集合总称，不是一套会随 focused session 改变而整体替换的全局单例。MVP 将服务保留在 `WorkspaceServices` 中；模型可见资源由 `ResourceManager` 管理级联不可变快照；会话和 run 捕获快照引用，而不是 pin 一整套 cwd 绑定服务。
-_避免_：当前 focused session 的可变大包、每 session 服务容器、UI 服务
+`AgentRuntime` 内部的后端依赖集合总称，不随任何客户端 selected session 改变。MVP 将服务保留在 `WorkspaceServices` 中；模型可见资源由 `ResourceManager` 管理级联不可变快照；会话和 run 捕获快照引用，而不是 pin 一整套 cwd 绑定服务。
+_避免_：客户端当前选择的可变大包、每 session 服务容器、UI 服务
 
 **WorkspaceServices**：
-绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。后期启用 hook system 时，`RuntimeHookRegistry` 也作为 workspace/runtime service 加入。它不随 session focus 切换而重建。
-_避免_：单会话运行态、focused session 服务、UI 服务、有状态 CommandSurfaceService
+绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。后期启用 hook system 时，`RuntimeHookRegistry` 也作为 workspace/runtime service 加入。它不随客户端 session selection 改变而重建。
+_避免_：单会话运行态、selected-session 服务、UI 服务、有状态 CommandSurfaceService
 
 **ResourceManager**：
 运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、ensure/reload/recompose 和 turn capture。初始化由 `OpenWorkspace -> ensure_runtime_snapshot`、`OpenSession/NewSession -> ensure_cwd_snapshot`、`start_user_turn -> capture_turn` 三道调用保证；它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
@@ -66,7 +66,7 @@ _避免_：UI 资源 store、系统提示词构建器、会话运行时、实时
 
 **ResourceSnapshotStore**：
 `ResourceManager` 内部的 current-pointer 存储，保存当前 `RuntimeResourceSnapshot` 以及每个 `(workspace_id, cwd)` 的当前 `CwdResourceSnapshot`。`replace_runtime` / `replace_cwd` 是资源更新对后续 turn 生效的线性化点：它们只原子替换 current pointer，不修改旧 snapshot；已经 running 的 run 继续使用启动时捕获的旧 snapshot，后续 user turn 通过 `capture_turn` 读取新 current pointer。
-_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、focused session resources
+_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、客户端 selected-session resources
 
 **运行时资源快照（`RuntimeResourceSnapshot`）**：
 一次 user-global/runtime-global 资源解析结果，包含 builtin/user-global/runtime 级技能、提示模板、上下文默认值、自定义/追加系统提示词、source info、diagnostics 和 revision。它不包含 cwd-local 项目资源，也不包含 provider/auth/model gateway 状态。
@@ -77,7 +77,7 @@ _避免_：provider settings、凭据、cwd 项目资源、UI state
 _避免_：单纯 cwd 增量、全局当前资源、session 私有资源服务、UI 快照
 
 **turn 资源快照（`TurnResourceSnapshot`）**：
-一次 user turn/run 的资源输入，只持有 `Arc<CwdResourceSnapshot>`，不额外 pin runtime snapshot。它进入 `TurnState` 后保证 running turn 不受资源 reload 或 focused session 切换影响。
+一次 user turn/run 的资源输入，只持有 `Arc<CwdResourceSnapshot>`，不额外 pin runtime snapshot。它进入 `TurnState` 后保证 running turn 不受资源 reload 或客户端 session selection 变化影响。
 _避免_：实时资源查询、mutable prompt context、同时 pin runtime/cwd 的双来源快照
 
 **资源覆盖策略（`ResourceOverlayPolicy`）**：
@@ -87,10 +87,6 @@ _避免_：调用点临时合并、按文件路径碰撞、用户可随意声明
 **资源更新边界**：
 资源内容进入模型可见 current snapshot 的边界。MVP 中只有 startup/session/turn 的 `ensure_*` 兜底、显式 `ReloadResources` / `reload_runtime`、以及 runtime revision 变化时的 `recompose_cwd` 可以发布新 snapshot；`resources_changed` 只是通知事件，`capture_turn` 只是读取边界，不扫描文件、不自动 reload。
 _避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源
-
-**会话切换 / 聚焦**：
-改变 UI 或默认命令目标指向的会话。它不表示旧会话被关闭，也不表示旧会话的后台 run 被中止；只有显式 `CloseSession`、idle unload、workspace teardown 或 shutdown policy 才卸载 `SessionRuntime`。
-_避免_：页面切换、替换运行时服务、关闭旧会话
 
 **会话运行时（`SessionRuntime`）**：
 单个会话的产品级 Agent 编排对象；它管理会话阶段、当前运行、中止、等待空闲、队列、模型状态、资源、工具、工具策略、会话写入和 `Driver`。
@@ -165,12 +161,8 @@ _避免_：当前上下文窗口、压缩摘要大小、UI 计数器
 _避免_：文件工具、会话管理 UI、Agent loop
 
 **已加载会话运行时（`LoadedSessionRuntimes`）**：
-会话管理器内部维护的运行中会话表，记录当前已加载的 `SessionRuntime` 和聚焦会话。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval 和固定 workspace cwd。
-_避免_：会话存储、会话目录、独立会话运行时注册表
-
-**聚焦会话（focused session）**：
-当前 UI 或默认命令目标指向的会话。它可以是多个已加载会话中的一个，不等同于正在运行的会话，也不是运行时服务的 scope 锚点。
-_避免_：active session、running session、loaded session、service scope
+会话管理器内部维护的 live runtime 表，记录当前已加载的 `SessionRuntime`。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval 和固定 workspace cwd。它不保存客户端 selected/current session，多个 runtime 可以同时推进 work。
+_避免_：会话存储、会话目录、独立会话运行时注册表、UI selection store
 
 **会话存储（`SessionStorage`）**：
 单个会话的底层 committed batch 存储，也是 `SessionWriter` 的 adapter；负责按 batch grouping 读取稳定会话条目、当前叶子和会话元数据，并隐藏 memory/JSONL 实现。它不决定 Agent 如何运行，也不直接服务 UI。
@@ -333,12 +325,12 @@ _避免_：命令 id、模型调用 id、工具调用 id、会话 entry id、持
 _避免_：AgentCommand payload、QueuedMessage、writer 内部 batch draft、CommandManager pending action
 
 **当前运行状态（`CurrentRunState`）**：
-`RuntimeSnapshot.active_session.current_run` 中描述当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
+`RuntimeSnapshot.loaded_sessions[*].current_run` 中描述对应 session 当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
 _避免_：RunTerminalStatus、SessionPhase、工具调用状态
 
 **可恢复暂停（`Suspended`）**：
 当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending 或 safe point 用户暂停。MVP resume state 只在同一 host 生命周期内存活；host shutdown 后不恢复 running run。它不能表达为 `run_finished { status: paused }`。
-_避免_：focus 切换、terminal finished、普通 waiting approval、模型 streaming 中途暂停
+_避免_：客户端 session selection、terminal finished、普通 waiting approval、模型 streaming 中途暂停
 
 **TurnState**：
 `SessionRuntime` 在一次 user turn / run 启动时构建的内部稳定快照，pin 住资源、`PromptTurn`、模型状态、工具视图、消息基线和 context usage。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
@@ -386,7 +378,7 @@ _避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 _避免_：UI 回调、策略判断器、长期授权存储、工具执行器
 
 **待审批工具调用（`PendingToolApproval`）**：
-`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含 `ApprovalRequestId`、冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批界面和构造 `DecideToolApproval`。
+`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含 `ApprovalRequestId`、冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批 adapter 状态和构造 `DecideToolApproval`。
 _避免_：审批弹窗本身、工具执行结果、会话条目、可由 UI 修改的工具参数
 
 **工具审批决定（`agent_runtime_protocol::ToolApprovalDecision`）**：
@@ -434,7 +426,7 @@ _避免_：AuthStore、ModelGateway、provider client pool
 _避免_：ProviderRegistry、UI 设置对象、环境变量直读器
 
 **模型调用目的（`ModelCallPurpose`）**：
-一次模型调用的稳定业务意图，例如 `AgentRun` 或 `CompactionSummary`。它从 `ModelCallRequest` 原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；retry/fallback、session 是否 focused、调用是否在后台执行都不是 purpose。
+一次模型调用的稳定业务意图，例如 `AgentRun` 或 `CompactionSummary`。它从 `ModelCallRequest` 原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；retry/fallback、客户端是否选中该 session、调用是否在后台执行都不是 purpose。
 _避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
 
 **模型调用请求（`ModelCallRequest`）**：
@@ -458,7 +450,7 @@ _避免_：UI 动作、后端 API 调用
 _避免_：回调、前端状态修改、会话日志
 
 **事件消息（`agent_runtime_protocol::EventMsg`）**：
-运行时事件中的业务事实部分，例如 run started、tool call output delta 或 message tool result appended。外层 `agent_runtime_protocol::Event` 负责顺序、路由、关联和重连水位。
+运行时事件中的业务事实部分，例如 run started、tool call output delta 或 message tool result appended。外层 `agent_runtime_protocol::Event` 是 workspace/session/run/command 坐标以及顺序、关联和重连水位的唯一权威位置；`EventMsg` 不重复这些通用坐标，只保留 message/call/interaction 等局部对象 identity、transition operands 和业务数据。裸 `EventMsg` 不是可独立路由的完整事件。
 _避免_：chat message、UI 显示文案、前端状态对象
 
 **事件族**：

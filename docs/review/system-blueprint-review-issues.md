@@ -21,9 +21,9 @@
 
 状态：Resolved
 
-处理记录：已决策为 MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不再使用 `snapshot(session_id)`；`RuntimeSnapshot` 不单独持久化，打开 workspace 后默认 `active_session = None`。会话清单改由 `SessionIndex` / `ListSessions` 提供。
+处理记录：已决策为 MVP 使用 workspace/runtime-scoped `snapshot() -> RuntimeSnapshot`，不再使用 `snapshot(session_id)`；`RuntimeSnapshot` 不单独持久化，打开 workspace 后默认 `loaded_sessions = []`，并在同一 event 水位原子覆盖全部 loaded runtimes。持久化会话清单由 `SessionIndex` / `SessionQuery::List` 提供。
 
-问题：`snapshot(session_id)` 已经写入公开 runtime interface，但路线图同时指出 Snapshot scope 尚未决定。当前 Snapshot 又包含 workspace/session catalog、focused session、resources、slash commands、session state 等混合范围字段。
+问题：`snapshot(session_id)` 已经写入公开 runtime interface，但路线图同时指出 Snapshot scope 尚未决定。当前 Snapshot 又包含 workspace/session catalog、session runtime projection、resources、slash commands、session state 等混合范围字段。
 
 证据：
 
@@ -31,7 +31,7 @@
 - `docs/modules/agent-runtime.md`：公开 trait 使用 `snapshot(&self, session_id: SessionId)`
 - `docs/modules/agent-runtime-protocol.md`：公开 trait 使用 `snapshot(&self, session_id: SessionId)`
 - `docs/implementation-roadmap.md`：先决设计点要求先决定 `SnapshotScope`、`snapshot(workspace_id, session_id?)`，或拆分 workspace/session snapshot。
-- `docs/modules/agent-runtime-protocol.md`：`Snapshot` 字段包含 workspace、focused session、sessions catalog、session view、resources、command catalog 等。
+- `docs/modules/agent-runtime-protocol.md`：`Snapshot` 字段包含 workspace、loaded sessions、session catalog，以及每个 loaded session 的 resources/command projection。
 
 风险：早期协议、事件重连、adapter reducer 和下游接入会围绕错误粒度实现；后续拆分 Snapshot 会造成协议级返工。
 
@@ -41,25 +41,25 @@
 
 状态：Resolved
 
-处理记录：`snapshot(session_id)` 已改为 `snapshot() -> RuntimeSnapshot`，避免单 session snapshot 携带全局水位。进一步明确 MVP 运行时生命周期约束：UI host 和 `AgentRuntime` 在同一个程序上下文、同一个生命周期中运行，不支持 UI adapter 失败/断线但 runtime daemon 继续后台运行再被重连的模式。因此 `RuntimeSnapshot.last_event_sequence` 的 reconnect 语义只覆盖同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery；不承诺恢复非 active/background session 在 UI 断线期间的完整可视状态。若未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，再重新打开该问题，设计 all-loaded-session snapshot 或 scoped event cursor。
+处理记录：`snapshot(session_id)` 已改为 `snapshot() -> RuntimeSnapshot`，避免单 session snapshot 携带全局水位。BR-034 进一步删除 core session selector，并要求 `RuntimeSnapshot.last_event_sequence` 对应的 snapshot 原子覆盖全部 loaded sessions，因此同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery不再遗漏其他 loaded runtime。若未来引入独立 runtime server、多窗口共享 runtime 或 daemon 模式，可在 BR-044 的基础上增加 session-scoped subscription/cursor 和 scoped snapshot。
 
-问题：原风险成立于 runtime 独立存活、UI 可断线重连的架构假设：事件 sequence 是 runtime 全局单调递增，Snapshot 带 `last_event_sequence`，而 snapshot 只覆盖某个 session 或 active session。多 session 同时 loaded、失焦 session 后台运行时，如果 UI 只拿某个 session 的 snapshot 并跳过 `<= last_event_sequence` 的事件，其他 session 在该水位前的状态可能不可恢复。MVP 不采用这个故障模型。
+问题：事件 sequence 是 runtime 全局单调递增，Snapshot 带 `last_event_sequence`；如果 snapshot 只覆盖某个客户端当前显示的 session，其他 loaded session 在该水位前的状态可能不可恢复。
 
 原证据：
 
 - `docs/modules/agent-runtime-events.md`：`Snapshot.last_event_sequence` 是 UI 看到的权威状态水位。
-- `docs/modules/session-manager.md`：focused session 不表示唯一 loaded session，也不表示唯一 running session；失去 focus 的 session 可以继续后台 run。
+- `docs/modules/session-manager.md`：多个 loaded session 可以同时推进各自 work，客户端 selection 不进入 core。
 - `docs/modules/agent-runtime-protocol.md`：原 Snapshot 草案偏向单 session view，同时携带全局/工作区字段。
 
 风险：如果未来改为独立 runtime server、多窗口共享 runtime 或 daemon 模式，重连后 pending run、tool activity、approval、queue 等跨 session 状态可能丢失或无法正确 reduce。
 
-待处理方向：已按 MVP 生命周期约束关闭。未来只有在引入独立 runtime 生命周期时才需要重新设计：其一，让 `RuntimeSnapshot` 覆盖所有 loaded/running session 的最小恢复态；其二，让 event sequence cursor 具备 scope 语义，避免用全局水位跳过未被 snapshot 覆盖的 session 事件。
+待处理方向：已通过 all-loaded snapshot 关闭。未来只有在引入 scoped event cursor 时才考虑拆分 session-scoped snapshot；任何 scoped cursor 都必须与覆盖同一 scope 的 snapshot 水位配对。
 
 ### BR-003：RuntimeServices 作用域与多 session/background run 存在冲突
 
 状态：Resolved
 
-处理记录：已收敛到单 UI/runtime 进程内多 session 运行模式。最新修订不再引入 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning；`AgentRuntime` 拥有 `WorkspaceServices`，其中共享 `ResourceManager` 管理 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 级联不可变资源快照。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时捕获 `TurnResourceSnapshot` 并构建 `TurnState`。provider settings、auth、custom provider 和 `ModelGateway` 均为 user-global/runtime-global；focused session 只影响 UI 和默认命令路由，不作为资源或服务 scope 锚点。
+处理记录：已收敛到单 host/runtime 进程内多 session 运行模式。最新修订不再引入 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning；`AgentRuntime` 拥有 `WorkspaceServices`，其中共享 `ResourceManager` 管理 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 级联不可变资源快照。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时捕获 `TurnResourceSnapshot` 并构建 `TurnState`。provider settings、auth、custom provider 和 `ModelGateway` 均为 user-global/runtime-global；客户端 selected session 不进入 core 或服务 scope。
 
 问题：原文档一方面说 `RuntimeServices` 绑定有效工作区，另一方面说打开/导入/恢复到不同 cwd 的会话时必须重建这些服务；同时 `SessionManager` 允许多个 loaded session 和后台 run。旧 session 应持有旧 services、被 shutdown，还是迁移到新 services，此前不清楚。
 
@@ -67,22 +67,22 @@
 
 - `CONTEXT.md`：Runtime services 是绑定到有效工作区的后端依赖集合。
 - `docs/modules/agent-runtime.md`：运行时服务绑定有效工作区；不同 cwd 会话切换时必须重新创建服务。
-- `docs/modules/session-manager.md`：多 session 同时运行时，失去 focus 的 session 可以继续执行后台 run。
+- `docs/modules/session-manager.md`：多个 loaded session 可以同时推进 work。
 - `docs/implementation-roadmap.md`：先决设计点要求明确服务绑定到 workspace、cwd、focused session 还是 loaded session。
 
-风险：如果实现偏离该约束，资源快照仍可能在后台 session 和 focused session 之间互相污染；也可能导致后台 run 被隐式中断。provider/settings/auth 不再是 cwd-scoped 风险点，因为当前产品约束为 user-global，并禁止项目级 custom provider 覆盖。
+风险：如果实现偏离该约束，资源快照仍可能在不同 loaded session 之间互相污染；也可能导致一个 session 的 lifecycle 误伤其他 runtime。provider/settings/auth 不再是 cwd-scoped 风险点，因为当前产品约束为 user-global，并禁止项目级 custom provider 覆盖。
 
-待处理方向：已处理。后续实现必须验证：打开两个不同 cwd 的 session，`ResourceManager` 为每个 cwd 保存 current `CwdResourceSnapshot`；后台 running session 继续使用 run 启动时捕获进 `TurnState` 的旧 `TurnResourceSnapshot`；focus 切换、resource reload、close/unload 不污染其他 loaded session。
+待处理方向：已处理。后续实现必须验证：打开两个不同 cwd 的 session，`ResourceManager` 为每个 cwd 保存 current `CwdResourceSnapshot`；每个 running run 继续使用启动时捕获进 `TurnState` 的旧 `TurnResourceSnapshot`；客户端 selection、resource reload、close/unload 不污染其他 loaded session。
 
 ### BR-004：pending tool approval 从 RuntimeSnapshot 恢复
 
 状态：Resolved
 
-处理记录：已决策将 active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`。协议新增 `PendingToolApprovalView`，只包含 `approval_id`、`session_id`、`run_id`、`call_index`、`call_id`、tool 名称、risk、reason、preview 和创建时间等 UI-safe 字段；冻结的 `prepared_args` 仍由 `ToolApprovalBroker` 内部保存，不进入 snapshot，也不能由 UI 修改。`DecideToolApproval` 通过 `approval_id` 与 `session_id`、`run_id`、`call_id` 匹配 broker 中的 pending approval；重复或过期 decision 归约为 `ApprovalDecisionOutcome`，不能重复执行。
+处理记录：已决策将每个 loaded session 当前 run 的待审批工具调用投影到对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals`。协议新增 `PendingToolApprovalView`，只包含 `approval_id`、`session_id`、`run_id`、`call_index`、`call_id`、tool 名称、risk、reason、preview 和创建时间等 UI-safe 字段；冻结的 `prepared_args` 仍由 `ToolApprovalBroker` 内部保存，不进入 snapshot，也不能由 adapter 修改。`DecideToolApproval` 通过 `approval_id` 与 `session_id`、`run_id`、`call_id` 匹配 broker 中的 pending approval；重复或过期 decision 归约为 `ApprovalDecisionOutcome`，不能重复执行。
 
 原问题：事件文档要求审批状态不能由 UI 私有保存，同一 host 生命周期内的订阅/状态重建后应从 snapshot 的 pending tool calls 恢复；此前 `RuntimeSnapshot` 字段列表只有 `current_run`、tools、queues 等，没有明确 pending approval 字段。
 
-决策结果：pending approval 放在 `RunView`，字段名为 `pending_tool_approvals`。它是 tool-call waiting state 的 UI-safe projection，作用域限定为 active session 的当前 run。
+决策结果：pending approval 放在每个 loaded `SessionSnapshot.current_run` 的 `RunView.pending_tool_approvals` 中，是 tool-call waiting state 的 UI-safe projection。
 
 风险：已通过 `RunView.pending_tool_approvals` 处理。同一 host 生命周期内的订阅/状态重建后，UI 可以从 snapshot 恢复审批弹窗，并使用对应 `approval_id` 与 `call_id` 安全发出 approval decision。
 
@@ -104,9 +104,9 @@
 
 原风险：UI reducer、session phase、run resume、持久化屏障会混淆 paused 和 terminal finished。
 
-决策结果：paused/suspended 是同一 host 生命周期内可恢复的 checkpoint 状态，不是终态。典型 checkpoint 包括 tool result 已产生但尚未回填给 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停。ADR 0019 明确 host shutdown 不恢复 running run。普通 focus 切换不是暂停；MVP pending approval 可以作为 current run 的 waiting substate 表达，不必进入 suspended，除非需要挂起并等待显式 resume。
+决策结果：paused/suspended 是同一 host 生命周期内可恢复的 checkpoint 状态，不是终态。典型 checkpoint 包括 tool result 已产生但尚未回填给 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停。ADR 0019 明确 host shutdown 不恢复 running run。客户端 session selection 变化不是暂停；MVP pending approval 可以作为 current run 的 waiting substate 表达，不必进入 suspended，除非需要挂起并等待显式 resume。
 
-待处理方向：已处理。后续实现需验证：`run_suspended` 后 `RuntimeSnapshot.active_session.current_run.state` 为 `Suspended`；`run_resumed` 后回到 `Running` 或 `WaitingApproval`；最终仍必须且只能产生一个 `run_finished { status: Completed | Failed | Aborted }`。
+待处理方向：已处理。后续实现需验证：`run_suspended` 后对应 `RuntimeSnapshot.loaded_sessions[*].current_run.state` 为 `Suspended`；`run_resumed` 后回到 `Running` 或 `WaitingApproval`；最终仍必须且只能产生一个 `run_finished { status: Completed | Failed | Aborted }`。
 
 ### BR-006：CommandPresentation 可携带完整 Command，可能突破 presentation 边界
 
@@ -192,7 +192,7 @@
 
 决策结果：删除 `UsagePurpose`，只保留 `ModelCallPurpose` 作为模型调用业务目的的权威类型。固定传播链为 `ModelCallRequest.purpose -> ModelCallUsage.purpose -> future SessionEntry::Usage.purpose`，usage/persistence 层不得重新分类。当前变体收敛为 `AgentRun` 和 `CompactionSummary`；未来模型任务使用明确业务变体。
 
-同时明确 `Retry` / `Background` 不是 purpose：provider fallback/retry 由 `ModelCallAttempt` 表达，session/run retry 由 `RetryReason` / `DriveEntry::Retry` / future call lineage 表达；session 因 focus 切换在后台运行时仍是 `AgentRun`。run-level `UsageSummary` 只聚合该 run 的 `AgentRun` 调用，独立 `CompactionSummary` usage 只进入 session 累计统计。
+同时明确 `Retry` / `Background` 不是 purpose：provider fallback/retry 由 `ModelCallAttempt` 表达，session/run retry 由 `RetryReason` / `DriveEntry::Retry` / future call lineage 表达；session 在客户端未显示时继续运行仍是 `AgentRun`。run-level `UsageSummary` 只聚合该 run 的 `AgentRun` 调用，独立 `CompactionSummary` usage 只进入 session 累计统计。
 
 ### BR-012：CommandSurface 与 CommandSurfaceService 命名层级仍需决定
 

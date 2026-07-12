@@ -17,7 +17,7 @@
   - 关闭 `BR-003`。
   - 将当前文档收敛为方案 B：一套 `AgentRuntime` 支持多个 `SessionRuntime` 同时 loaded/running。
   - 引入 `WorkspaceServices`、`CwdServiceRegistry`、`CwdScopedServices { workspace_id, cwd, generation }`。
-  - 每个 `SessionRuntime` / run pin 自己的 service generation；focused session 只影响 UI 和默认命令路由，不作为服务 scope 锚点。
+  - 每个 `SessionRuntime` / run pin 自己的 service generation；当时仍保留默认 session 路由，该 selector 后由 BR-034 从 core 删除。
 
 - `2550094 docs(runtime): use resource manager snapshots`
   - 将 `ResourceLoader` 升级为 `ResourceManager` 子系统，并重命名相关 ADR / module 文档。
@@ -95,7 +95,7 @@ LoadedSessionRuntimes
 - 不落盘。
 - 不是 UI store。
 - 不是 session index。
-- 打开 workspace 后默认 `active_session = None`。
+- 打开 workspace 后默认 `loaded_sessions = []`；BR-034 后 snapshot 在同一水位覆盖所有 loaded runtimes。
 - `/resume` handler 与 GUI sidebar 复用 `SessionManager.list_sessions(...)`；GUI/SDK 入口使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。
 
 ### BR-002
@@ -425,7 +425,7 @@ ProcessSessionRuntimeHost
 
 日期：2026-07-07
 
-背景：pending tool approval 的恢复语义已落入正式文档：active session 当前 run 的待审批工具调用投影到 `RuntimeSnapshot.active_session.current_run.pending_tool_approvals`，`ToolApprovalBroker` 继续持有冻结的 `prepared_args`。下列内容已进一步收敛到 `docs/modules/tools.md`、`docs/modules/driver.md`、`docs/modules/session-runtime.md` 和 `docs/modules/agent-runtime-protocol.md`。
+背景：pending tool approval 的恢复语义已落入正式文档：每个 loaded session 当前 run 的待审批工具调用投影到对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals`，`ToolApprovalBroker` 继续持有冻结的 `prepared_args`。下列内容已进一步收敛到 `docs/modules/tools.md`、`docs/modules/driver.md`、`docs/modules/session-runtime.md` 和 `docs/modules/agent-runtime-protocol.md`。
 
 ### Approval request lifecycle
 
@@ -647,7 +647,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - 新增 `CurrentRunState::{Running, WaitingApproval, Suspended { resume_id, reason }}`。
 - 新增 `RunEvent::Suspended` / `RunEvent::Resumed`，并保留 `RunEvent::Finished` 作为唯一终态事件。
 - 典型 suspend checkpoint 包括：tool result 已产生但尚未回填 Rig / provider、等待用户交互、external job pending、用户在 safe point 主动暂停。ADR 0019 后 resume state 只在同一 host 生命周期内存活，host shutdown 不恢复 running run。
-- 普通 focus 切换不是暂停；pending approval 在 MVP 中是 current run 的 waiting substate，不等同于跨生命周期 suspend。
+- 客户端 session selection 变化不是暂停；pending approval 在 MVP 中是 current run 的 waiting substate，不等同于跨生命周期 suspend。
 
 已同步完成：`agent-runtime-protocol.md`、`agent-runtime-events.md`、`driver.md`、`adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md` 和 `system-blueprint-review-issues.md` 已按该语义更新，BR-005 已标记为 Resolved。
 
@@ -732,3 +732,7 @@ BR-027 按 run identity 边界关闭。`RunId` 只标识已经通过 `run_starte
 BR-030 删除公开 `WaitForIdle`，且不新增 core `wait_until_settled()`。`session_settled` 是 observer 消费的领域事实；UI 使用 snapshot/event reducer，CLI/RPC/test 如需等待则在 adapter/test-support 层用 subscribe-before-dispatch 或已有 reducer state 提供 helper，不承诺任意 background session late join。runtime 内部需要 idle 后执行的动作继续使用 phase guard、`QueueAfterRun` 和 typed pending action；未来若出现独立 server 的明确需求，只评估绑定具体 RunId 的 transport-level join。
 
 BR-031 明确放弃 runtime 层“abort 后归还队列文本给编辑器”的行为。`AbortRun` 清除尚未消费的 steering/follow-up 和 pending action、保留 `NextTurn`，并在 queue state 实际变化时只发布清理后的完整 `queue_updated`；已经 commit 的 steer 保留在 durable history。`ClearQueue` 才清除全部 queue state。runtime 不增加 `returned_to_editor`、removed delta 或 editor action，具体 UI 可用本地 submission history 和 undo state 实现 best-effort restore，该体验不属于 core 或 reconnect contract。
+
+BR-033 统一事件坐标所有权：`workspace_id`、`session_id`、`run_id`、`command_id` 只由外层 `Event` 权威携带，所有 `EventMsg` 删除仅用于 routing/correlation 的副本；局部对象 identity 和 tree transition operands 保留。diagnostics 的 runtime/workspace/session/run 归属也改读外层，`DiagnosticSubject` 只表达 tool call、resource path 或 model 等细粒度对象。adapter 必须消费完整 `Event`，脱离 dispatch stack 的组件构造包含 event metadata 与 payload 的本地 view；内部 publisher 使用 routing-profile constructor 阻止非法坐标组合。
+
+BR-034 删除 core 的 focused/current/active session selector。`FocusSession`、`session_focus_changed` 和 `LoadedSessionRuntimes.focused_session_id` 不再存在；所有 session-scoped command 显式携带 `SessionId`，客户端 selected session 只属于 adapter。后端状态只保留 persistent catalog、loaded residency、`SessionPhase`、optional `CurrentRunState` 和 settled fact。`RuntimeSnapshot` 改为同一全局 event 水位下的 `loaded_sessions: Vec<SessionSnapshot>`，resources 和 command catalog 进入各自 session projection；未 loaded session 继续通过 query 读取。
