@@ -519,7 +519,13 @@ pub enum CompactionEvent {
 
 pub enum RetryEvent {
     AutoStarted { attempt: u32, max_attempts: u32, delay_ms: u64, error_message: String },
-    AutoFinished { success: bool, attempt: u32, final_error: Option<String> },
+    AutoFinished { status: RetryTerminalStatus, attempt: u32, error: Option<String> },
+}
+
+pub enum RetryTerminalStatus {
+    Succeeded,
+    Failed,
+    Aborted,
 }
 
 pub enum DiagnosticsEvent {
