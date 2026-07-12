@@ -148,12 +148,40 @@ pub trait SessionRuntimeFactory {
     async fn spawn(&self, handle: SessionHandle) -> Result<SessionRuntimeHandle, RuntimeError>;
 }
 
+#[derive(Clone)]
+pub struct SessionRuntimeHandle {
+    session_id: SessionId,
+    command_tx: mpsc::Sender<SessionRuntimeMsg>,
+}
+
+impl SessionRuntimeHandle {
+    pub async fn dispatch(&self, command: SessionCommand) -> Result<CommandAck, RuntimeError>;
+    pub async fn snapshot_at(&self, barrier: &RuntimeProjectionBarrier) -> Result<SessionSnapshot, RuntimeError>;
+    pub async fn shutdown(&self, policy: ShutdownPolicy) -> Result<ShutdownReport, RuntimeError>;
+}
+
+pub(crate) enum SessionRuntimeMsg {
+    Command { command: SessionCommand, reply: oneshot::Sender<Result<CommandAck, RuntimeError>> },
+    Snapshot { barrier: RuntimeProjectionBarrier, reply: oneshot::Sender<Result<SessionSnapshot, RuntimeError>> },
+    Shutdown { policy: ShutdownPolicy, reply: oneshot::Sender<Result<ShutdownReport, RuntimeError>> },
+    RunControl(RunControlRequest),
+}
+
 pub struct LoadedSessionRuntimes {
     runtimes: HashMap<SessionId, SessionRuntimeHandle>,
+    run_owners: RunOwnerIndex,
 }
 ```
 
-`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`list`、`find_current_run(run_id)`、`insert`、`replace`、`close`、`shutdown_all` 和可选的 idle unload。`find_current_run` 只扫描/索引当前 host 中已经发布 `run_started` 且尚未 terminal 的 run，用于路由 `AbortRun { run_id }`；它不是 durable run registry。不要在这里追加 message、构建上下文、执行工具、调用模型、保存 adapter selection 或发布 UI event。
+`SessionRuntimeFactory::spawn(...)` 的权威含义是：创建 per-session mailbox，构造并启动一个 `SessionRuntime` actor loop，返回绑定该 mailbox 的显式可克隆 handle。Handle 不是 `Arc<Mutex<SessionRuntime>>`，不暴露 mutable fields，也不等于 executor `JoinHandle`；actor task 的 panic/退出监控由 factory/`SessionManager` 生命周期实现内部持有。`dispatch()` 只等待命令被 actor 接收并完成同步 guard/admission，不等待 Agent run terminal；最终工作结果由 event/snapshot 表达。
+
+`SessionManager` 可以提供 `dispatch_to_loaded(session_id, command)` 之类的转发 facade，但内部仍通过目标 `SessionRuntimeHandle` 发送，不在 manager 中实现 phase、queue、approval、commit 或 terminal 业务。显式 handle 允许 snapshot builder、shutdown coordinator 和测试直接联系一个已绑定 session，同时所有调用仍汇入该 session 的唯一 actor owner。
+
+`snapshot_at(...)` 不是可随意调用的独立读接口。`RuntimeProjectionBarrier` 由 `AgentRuntime` event bus/projection barrier 创建：它先冻结 loaded membership，并向所有 session/global event publisher 投递 barrier marker。actor 处理 marker 时 flush 其前已接受的 progress/control effect、捕获 `SessionSnapshot`，然后进入 parked 状态，不再发布事件或处理后续 mutation；所有 publisher parked 后 coordinator 才读取当前 `last_event_sequence = N`，把 projections 与 N 组装后统一 release。这样“后读取 sequence”是安全的，因为 projection window 内已没有 publisher 前进；调用方不能逐个无保护调用 handle snapshot 再拼一个较新的 sequence。
+
+`RunOwnerIndex` 是 `LoadedSessionRuntimes` 内部的非权威 routing projection，只保存 `RunId -> SessionId`。factory 向每个 actor 注入内部 run-route publisher；actor 建立 `CurrentRun` 后先登记 route，再发布 `run_started`，terminal boundary 清除 route。`find_current_run(run_id)` 用 index 找到候选 handle，但目标 actor仍必须校验 `run_id == current_run.run_id`；stale index/late command 返回 `StaleRun` / `NoActiveRun`，不能修改后来 run。该 index 不进入 storage/snapshot，不拥有 run state，也不替代 actor 的 `CurrentRun`。
+
+`LoadedSessionRuntimes` 只允许做 live runtime lifecycle：`get`、`list`、`find_current_run(run_id)`、`insert`、`replace`、`close`、`shutdown_all` 和可选的 idle unload。`find_current_run` 只查询上述非权威 `RunOwnerIndex`，用于路由 `AbortRun { run_id }`；它不是 durable run registry，actor validation 才是最终授权。不要在这里追加 message、构建上下文、执行工具、调用模型、保存 adapter selection 或发布 UI event。
 
 `SessionHandle` 是 `SessionRuntime` 的主要消费对象：
 
@@ -329,9 +357,10 @@ SubmitPrompt
 
 CloseSession
   → SessionManager.close_runtime(session_id, policy)
-  → runtime stops new command/work admission and clears deferred queues
-  → runtime cancels provider/tool/approval work, but not an in-flight SessionWriter.commit(...)
-  → await terminal handling and the in-flight commit result according to ShutdownPolicy
+  → SessionRuntimeHandle.shutdown(policy)
+  → actor stops new command/work admission and clears deferred queues
+  → actor cancels active RunTask/provider/tool/approval work, but not an in-flight SessionWriter.commit(...)
+  → await actor terminal handling and the in-flight commit result according to ShutdownPolicy
   → LoadedSessionRuntimes.remove(session_id)
 
 AppShutdown
@@ -349,6 +378,11 @@ AppShutdown
 ## 必测项
 
 - 同时 load 两个 session 时 `LoadedSessionRuntimes.list()` 返回二者，任一 session 的 phase/current run 变化不影响另一个；不存在 focused/current pointer。
+- `SessionRuntimeFactory::spawn` 为每个 loaded session 启动独立 actor 并返回可克隆 handle；session A 的 model/tool/approval wait 不阻塞 session B handle 的 dispatch/snapshot。
+- `SessionRuntimeHandle.dispatch(SubmitPrompt)` 在 actor 完成 admission 后返回，不等待 run terminal；actor mailbox 关闭时返回结构化 runtime-closed error。
+- handle 不允许取得 `&mut SessionRuntime` 或持有覆盖 run 的 mutex guard；所有 command/snapshot/shutdown 都通过 mailbox。
+- `RunOwnerIndex` 在 `run_started` 前可路由、terminal boundary 后不可路由；故意注入 stale index 时 actor 二次校验必须拒绝，不能 abort 后来的 run。
+- 两个 active session actor 同时产生 progress/event 时，`RuntimeProjectionBarrier` flush 每个 actor 并生成同一 `last_event_sequence` 水位的 all-loaded snapshot。
 - 重复 `OpenSession` 是幂等 no-op；关闭一个 loaded runtime 只移除目标 session，客户端 selection 不参与 lifecycle。
 - `commit(SessionWriteBatch::user_input(...))` 成功后，message、entry ids、parent links 和 leaf 一起可恢复。
 - `commit(SessionWriteBatch::tool_round(...))` 只接受完整 assistant tool calls 与全部 matching results，并保持 `call_index` 顺序。

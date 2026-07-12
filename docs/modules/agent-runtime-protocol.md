@@ -320,7 +320,7 @@ runtime 不实现“abort 后归还队列文本给编辑器”：`CommandAck`、
 
 `ResourceQuery` 读取 current `CwdResourceSnapshot.resolved`，不能让 UI adapter 直接读文件。`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 canonical path。active run 的 `GetEffectivePrompt` 读取 active `PromptTurn` 的 redacted profile/provenance；idle preview 如后续支持，必须显式标记为 preview，并且不创建 turn、消费 queue 或改变资源 revision。完整正文默认属于 debug/privileged query，不进入普通 snapshot。
 
-`DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`ToolApprovalBroker` 必须确认 `approval_id` 与 `session_id`、`run_id`、`call_id` 仍匹配同一个 pending approval。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
+`DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`SessionRuntime` actor 先确认 `approval_id` 与 `session_id`、`run_id`、`call_id` 匹配 `CurrentRun` projection，再让 `ToolApprovalBroker` resolve 同一个内部 waiter。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
 
 ```rust
 pub enum ToolApprovalMode {
@@ -359,7 +359,7 @@ pub struct PendingToolApprovalView {
 }
 ```
 
-`PendingToolApprovalView` 是 `ToolApprovalBroker` 当前等待态的 UI-safe 投影，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。它只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
+`PendingToolApprovalView` 是 `SessionRuntime` actor 从 control-class approval-pending update 归约出的 UI-safe projection，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。`ToolApprovalBroker` 只保存冻结 execution record 与 waiter，不是另一个 UI projection owner。该 view 只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。
 
 `OpenSession` 只保证目标 `SessionRuntime` 已加载，不建立 runtime-global 当前会话。`SubmitPrompt`、`InvokeSkill` 和 `InvokePromptTemplate` 只确认请求已接受。是否产生输出要看后续事件。
 
@@ -866,7 +866,7 @@ pub struct CompactionResultView {
 
 `snapshot()` 用于 UI 初始加载、窗口恢复和同一 host 生命周期内的事件流重连/订阅重建。`RuntimeSnapshot` 是运行时当前状态的权威读模型，不是 UI store，不是会话持久化文件，也不在本地单独落盘。关闭窗口后 snapshot 消失；下次打开时由 `AgentRuntime` 从当前内存状态、settings、resources 和 `SessionManager` 的会话目录重新投影生成。
 
-MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped，并在同一个 `last_event_sequence` 水位原子投影全部 loaded sessions。`AgentRuntime` 必须通过 event-bus/projection barrier 生成它：loaded runtime membership、各 `SessionSnapshot` 和 `last_event_sequence` 必须对应同一逻辑水位，不能先逐个读取 session、再无保护地读取一个更晚的 sequence。打开 workspace 后默认不加载旧 session，因此 `loaded_sessions` 为空；持久化 catalog 中未加载的 session 继续通过 `SessionQuery::List` 读取，不会为了生成 snapshot 全部重建。
+MVP 的 `RuntimeSnapshot` 是 workspace/runtime-scoped，并在同一个 `last_event_sequence` 水位原子投影全部 loaded sessions。`AgentRuntime` 必须通过 event-bus/projection barrier 生成它：barrier 冻结 loaded `SessionRuntimeHandle` membership，向所有 runtime/global event publisher 放入 barrier marker；每个 actor flush marker 之前已接受的 progress/control effect、捕获 projection 后进入 parked 状态，不再发布事件或处理后续 mutation，直到 barrier release。全部 publisher parked 后 coordinator 才读取当前 `last_event_sequence = N`，并把已捕获 projections 与 N 组装为 snapshot；随后统一 release。不能先逐个无保护读取 session、再随手读取一个更晚的 sequence。打开 workspace 后默认不加载旧 session，因此 `loaded_sessions` 为空；持久化 catalog 中未加载的 session 继续通过 `SessionQuery::List` 读取，不会为了生成 snapshot 全部重建。
 
 MVP 的 adapter host 和 `AgentRuntime` 运行在同一个程序上下文、同一个生命周期内；MiniCore runtime 不是独立 daemon/server，不承诺 adapter 失败或断线后 runtime 继续运行再被重新连接。`last_event_sequence` 的 reconnect 语义用于同一 host 生命周期内的初始化、late subscribe、reducer/subscriber 重建和 sequence gap recovery。由于 event sequence 是 runtime-global，snapshot 必须覆盖所有会在该水位前发布事件的 loaded sessions；BR-044 负责进一步定义 subscription start、ring buffer lag 和 gap recovery。未来若采用 session-scoped subscription/cursor，才可以把 all-loaded snapshot 拆成 scoped snapshots。
 

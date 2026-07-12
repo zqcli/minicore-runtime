@@ -1,6 +1,6 @@
 # SessionRuntime
 
-`SessionRuntime` 是单个会话的产品级 Agent 编排对象。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使该 run 不受客户端 session selection 变化或资源 reload 影响。
+`SessionRuntime` 是单个会话的产品级 Agent 编排对象和 per-session actor。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约，并通过 mailbox 在 active run 飞行期间继续处理 approval、abort、prompt delivery、pending action、snapshot 和 shutdown。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使该 run 不受客户端 session selection 变化或资源 reload 影响。
 
 ## 核心职责
 
@@ -13,7 +13,7 @@
 - 运行生命周期：启动 run、continue、post-run arbitration、失败消息构造、abort、phase 切换和 `session_settled` 状态归约。
 - 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
-- 工具与提示词配置：持有 session-scoped `Tools` 子系统；在 turn start 汇合 captured `PromptResourceView`、tool/model/agent/environment/policy views 创建 immutable `PromptTurn`。active tools 或模型可见 profile 在安全点变化时，使用同一 captured resources 重建并整体替换 `PromptCallProfile`。
+- 工具与提示词配置：持有 session-scoped `Tools` 子系统；在 turn start 汇合 captured `PromptResourceView`、tool/model/agent/environment/policy views 创建 immutable `PromptTurn`。MVP 在 `Turn` 中拒绝 active tools/模型可见 profile mutation；full version 若在安全点支持变化，必须使用同一 captured resources 重建并整体替换 `PromptCallProfile` 与 `ToolBatchInvoker`。
 - 资源与扩展：在 user turn 启动时引用当前 `TurnResourceSnapshot`；该 snapshot pin 住 `CwdResourceSnapshot`，而 cwd snapshot pin 住对应 `RuntimeResourceSnapshot`。reload 后 future turn 使用新资源，运行中的 turn 不被 patch。
 - 压缩与重试：支持手动压缩、自动压缩、context overflow 恢复、自动重试、取消压缩和取消重试。
 - 会话树：支持 set session name、navigate tree、branch summary、fork selector 所需 user message 列表。
@@ -23,12 +23,13 @@
 ## 内部结构
 
 ```text
-SessionRuntime
+SessionRuntime actor
+  ├─ command/run-effect mailbox
   ├─ WorkspaceId / cwd
   ├─ ResourceManager handle
   ├─ SessionHandle
   ├─ SessionPhase
-  ├─ CurrentRun { PromptTurn / current-run context }
+  ├─ CurrentRun { PromptTurn / current-run context / RunTaskHandle }
   ├─ CurrentRunUsage / SessionUsageStats / ContextUsage
   ├─ ModelState
   ├─ ResourceState { last_seen_revision }
@@ -37,11 +38,20 @@ SessionRuntime
   ├─ Tools
   ├─ QueueState
   ├─ PendingSessionActions
-  ├─ RuntimeHookRegistry        // future hook service view
-  └─ Driver
+  └─ RuntimeHookRegistry        // future hook service view
+
+RunTask                         // one per publicly started run
+  ├─ Driver / Rig AgentRun
+  ├─ DriverTurnInput / run-local usage / limits
+  ├─ owned SessionDriverHost
+  └─ CancellationToken / RunLink
 ```
 
 `SessionRuntime` 是产品编排层，不应把 Rig 类型泄漏给 UI，也不应把工具执行交给 UI。
+
+`SessionRuntimeHandle` 是 `AgentRuntime` / `SessionManager` 联系 actor 的显式可克隆入口。它只发送 command、snapshot/read projection 和 shutdown request，不保存权威 session 状态，也不把 `&mut SessionRuntime` 或 `Arc<Mutex<SessionRuntime>>` 暴露给调用方。`dispatch()` 只等待 actor 对命令的接收/同步 guard 结果，不等待一次 Agent run terminal；最终状态仍通过 event/snapshot 观察。
+
+`CurrentRun` 持有 actor-owned parent `CancellationToken` 和 attached `RunTaskHandle { run_id, join/completion }`；task 只得到 child token。`AbortRun` / shutdown 先 cancel parent，再按 terminal/commit 规则等待 completion；drop/replace `CurrentRun` 前必须确认旧 task 已结束或进入强制 crash policy，不能只丢 join handle 让 model/tool work 在后台继续。
 
 `SessionRuntime` 不持有跨 turn 的 current resource cache。它可以记录 `ResourceState { last_seen_revision }` 供 UI 或 diagnostics 使用，但不能用它代替 `ResourceManager.capture_turn(...)`。每次 user turn 真正启动时都必须重新 capture，当 reload 已经完成 `ResourceSnapshotStore::replace_cwd(...)` 后，下一次 capture 自然会读取到新的 current `CwdResourceSnapshot`；active run 继续使用 `CurrentRun.prompt_turn` pin 住的旧 snapshot。
 
@@ -112,7 +122,7 @@ Product / agent / environment / policy views
 
 如果运行中合法切换模型可见工具、agent profile 或其他会影响 system prompt 的 profile，`SessionRuntime` 在 `before_next_model_call` 安全点使用 active turn 的同一个 `PromptResourceView` 重新执行 `begin_turn()`，并整体替换 `PromptCallProfile`。不能分别 patch system prompt 和 active tool schemas。
 
-MVP 中 Rig step 不调用 `ResourceManager`。完整 resources 和 `PromptTurn` 留在 `TurnState` / `SessionDriverHost`；跨到 `Driver` 的只有窄 `DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }`。未来 `StepResourceSnapshot` 也必须以 active `TurnResourceSnapshot` 为 parent，不能读取 ResourceManager current pointer。
+MVP 中 Rig step 不调用 `ResourceManager`。完整 `PromptTurn` 只由 actor 的 `TurnState` / `CurrentRun` pin 住；run-scoped `SessionDriverHost` 只保留工具上下文需要的 captured turn resources，跨到 `Driver` 主输入的只有窄 `DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }`。未来 `StepResourceSnapshot` 也必须以 active `TurnResourceSnapshot` 为 parent，不能读取 ResourceManager current pointer。
 
 ## Model State And Selection
 
@@ -195,11 +205,11 @@ impl TurnState {
 
 `DriverTurnInput` 不能包含 `Arc<TurnResourceSnapshot>`、`PromptTurn`、`ResourceRevision`、`ContextUsageView`、全量 tools registry、executor handle、approval/policy state、queue state 或 storage handle。`PromptCallProfile` 是窄的模型可见基线，不允许 Driver 访问 resource catalogs。
 
-运行中如果用户切换模型或活跃工具，`SessionRuntime` 先记录待应用事实，在 `DriverHost::before_next_model_call` 安全点使用 active captured resources 创建新的 immutable `PromptTurn`，并在同一临界区替换 `CurrentRun.prompt_turn`，通过组合式 `NextModelCallPlan.prompt_profile` 整体替换 future profile。旧 `PromptTurn` 不原地修改。资源 reload 不 patch 当前 `TurnState`；当前 run 的新旧 PromptTurn 都继续引用启动时捕获的 resources。provider 解析和 auth 注入仍只发生在 `ModelGateway`。
+MVP 在 `Turn` 中拒绝模型、thinking、stream options 或 active-tools 切换，避免 `PromptCallProfile` 与 `ToolBatchInvoker` baseline 分裂。后续 full version 若允许运行中切换，`SessionRuntime` 必须先记录待应用事实，在 `DriverHost::before_next_model_call` 安全点使用 active captured resources 创建新的 immutable `PromptTurn`，并在同一 actor transaction 中整体替换 `CurrentRun.prompt_turn`、`NextModelCallPlan.prompt_profile` 与 future `ToolBatchInvoker`。旧 `PromptTurn` 不原地修改。资源 reload 不 patch 当前 `TurnState`；当前 run 的新旧 PromptTurn 都继续引用启动时捕获的 resources。provider 解析和 auth 注入仍只发生在 `ModelGateway`。
 
 ## Driver / Tools Coordination
 
-`SessionRuntime` 长期存活并持有 session 状态；`Driver` 基本无状态，只负责推进 Rig `AgentRun`；`DriverHost` 是一次 run 期间让 `Driver` 回调外部能力的 trait seam。
+并发模型以 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md) 为权威。`SessionRuntime` actor 长期存活并持有 session 权威状态；每次公开启动的 run 由短期 `RunTask` 推进；`Driver` 基本无状态，只负责推进 Rig `AgentRun`；`DriverHost` 是 `RunTask` 内让 `Driver` 请求外部能力的 trait seam。
 
 代码形态可以简化为：
 
@@ -212,12 +222,15 @@ pub struct SessionRuntime {
     event_sink: SessionEventSink,
     queues: QueueState,
     current_run: Option<CurrentRun>,
+    inbox: mpsc::Receiver<SessionRuntimeMsg>,
 }
 ```
 
-`Tools` 是 session-owned 子系统，因为它持有 active tools、pending approvals、approval mode、grants、sandbox/mutation state 等会话中间状态。`Driver` 只是执行协作者；它可以在 run start 时临时创建或 clone，不应该携带 session identity。
+Actor loop 必须持续消费两类有序 control message：上层经 `SessionRuntimeHandle` 提交的 session command，以及 active `RunTask` 经私有 `RunLink` 提交的 safe-point、tool-round commit candidate 和 terminal effect。provider/model/tool/approval 等无界等待不允许发生在 actor loop 内；`SessionWriter.commit(...)` 是唯一允许 actor 等待确定结果的不可取消稳定写入临界区。
 
-工具调用不由 `Driver` 直接执行。`SessionRuntime` 可以直接实现 `DriverHost`，但真实实现更推荐创建 per-run `SessionDriverHost` wrapper：
+`Tools` 仍是 session-owned 子系统，因为它持有 active tools、pending approvals、approval mode、grants、sandbox/mutation state 等会话中间状态；actor 保留 control/admin/decision 能力，run path 只得到绑定 committed tool/profile baseline 的 `ToolBatchInvoker`，不能把 `&mut Tools` 借给覆盖整个 run 的 future。`Driver` 只是执行协作者，不携带长期 session identity 或权威状态。
+
+run 启动时的代码形态：
 
 ```rust
 let run_id = self.allocate_run_id();
@@ -233,46 +246,86 @@ let request = DriveRequest {
     limits: self.drive_limits(),
 };
 
-let mut host = SessionDriverHost {
+let (run_link, actor_endpoint) = RunLink::pair(run_id);
+self.attach_run_endpoint(actor_endpoint);
+
+let host = SessionDriverHost {
     session_id: self.session_id,
     run_id,
     cwd: self.cwd.clone(),
     turn_resources,
-    tools: &mut self.tools,
-    session: &self.session,
-    model_gateway: &self.services.model_gateway,
-    event_sink: &mut self.event_sink,
-    queues: &mut self.queues,
-    current_run: &mut self.current_run,
+    run_link,
+    tools: self.tools.tool_batch_invoker(),
+    model_gateway: Arc::clone(&self.services.model_gateway),
+    progress: RunProgressSink::new(run_id),
+    cancel: self.current_run.as_ref().unwrap().cancel.child_token(),
 };
 
-let driver = Driver::new();
-driver.drive_run(request, &mut host, cancel).await
+let task = RunTask::spawn(request, host);
+self.current_run.as_mut().unwrap().attach_task(task);
 ```
 
 `allocate_run_id()` 只在 runtime 已完成 admission、即将建立 `CurrentRun` 并调用 `drive_run()` 时执行；它使用 runtime-global id generator。`run_started` 必须在任何 provider/model/tool/approval wait 之前发布。preflight 不预分配 RunId，也不制造没有 `run_started` 的幽灵 run。
 
-该 wrapper 实现下面的 seam：
+`RunTask` 内部拥有 `Driver` / Rig `AgentRun` 和 mutable `SessionDriverHost`，因此 `DriverHost` trait 的 `&mut self` receiver 可以保留；禁止的是 host 内长期借用 actor-owned mutable state。Rig/driver future 若不是 `Send`，实现可以使用 local task 或 runtime-local executor，但仍必须与 actor mailbox 并发推进。
+
+该 wrapper 实现下面的工具 seam：
 
 ```text
 DriverHost::invoke_tool_batch(request, updates, cancel)
-  → SessionRuntime attaches ToolRunContext { session_id, run_id, cwd, turn resources, abort signal }
-  → Tools::invoke_batch(request, context, updates, cancel)
+  → SessionDriverHost attaches ToolRunContext { session_id, run_id, cwd, turn resources, abort signal }
+  → ToolBatchInvoker.invoke_batch(request, context, updates, cancel)
   → Ok(ToolBatchResult) | Err(Cancelled | Failed)
-  → only Ok: SessionHandle.commit(SessionWriteBatch::tool_round(...))
-  → publish message_assistant_finished + ordered message_tool_result_appended*
-  → return ToolBatchResult only after commit succeeds
+  → only Ok: RunLink.commit_tool_round(candidate)
+  → SessionRuntime actor applies final hook/validation and commit admission
+  → actor commits SessionWriteBatch::tool_round(...)
+  → actor publishes message_assistant_finished + ordered message_tool_result_appended*
+  → actor replies committed; host returns ToolBatchResult to Driver
 ```
 
-`Tools` 返回内部工具结果和 update；`SessionRuntime` 负责归约 UI event、pending approval snapshot projection，并把完整 assistant tool-call message 与全部 tool results 组装为一个 `ToolRound` batch。只有 `SessionHandle.commit(...)` 成功后，host 才把 `ToolBatchResult` 返回给 Driver；Driver 随后映射为 Rig tool results 并继续推进 `AgentRun`。
+`Tools` 返回内部工具结果和 update；update 经 `RunProgressSink` / control effect 由 actor 归约为 UI event 和 pending approval snapshot projection。`SessionRuntime` actor 从 `CurrentRun` 取出完整 assistant tool-call draft，把它与全部结果组装为一个 `ToolRound` batch；actor 可以应用 `ToolResultBeforeCommit` 并得到不同于 candidate 的最终 result。只有 `SessionHandle.commit(...)` 成功并把该最终 `ToolBatchResult` 回复 `RunTask` 后，host 才返回 Driver；Rig、公开 finished event 与 committed message 必须看到同一最终值。
 
-选择 `SessionDriverHost` 而不是只写 `impl DriverHost for SessionRuntime` 的缘由：
+生产实现选择 owned `SessionDriverHost` + `RunLink`，而不是 `impl DriverHost for SessionRuntime` 或 borrowed wrapper，原因是：
 
-- 直接实现是合法的最小版本，但 wrapper 可以限制 `DriverHost` 方法只能访问本次 run 需要的字段，避免把整个 `SessionRuntime` 暴露给 driver seam。
+- actor 必须在 run 飞行期间继续处理 `DecideToolApproval`、`AbortRun`、queues、pending actions、snapshot 和 shutdown；内联 `await drive_run()` 会阻塞 mailbox。
+- owned wrapper 限制 `DriverHost` 只能访问本次 run 需要的 handles/context，避免把整个 `SessionRuntime` 暴露给 driver seam。
 - wrapper 将 `run_id`、turn resources、event correlation、checkpoint context 等 run-scoped 数据与 session-scoped state 分离。
 - `DriveRequest` 只带 `DriverTurnInput`，而 `SessionDriverHost` 持有 turn resources；这同时收窄了 driver 主输入和 host 回调上下文。
-- wrapper 避免 `self.driver.drive_run(..., self, ...)` 这类 Rust 自借用形态；`Driver` 越无状态，这个边界越简单。
+- `RunLink` 把 safe-point、commit 和 terminal control 收敛到 actor 的单一线性化点；`RunTask` 不能提交任意 session command。
 - wrapper 让 `Driver` 单测只需要 fake host，不需要构造真实 session runtime、tools、storage 和 event bus。
+
+运行中 command 路径固定为：
+
+```text
+DecideToolApproval
+  → SessionRuntimeHandle → actor validates phase/run/call/approval
+  → actor-owned Tools.decide_approval(...) wakes the pending batch waiter
+
+AbortRun
+  → actor clears required queues/pending actions
+  → actor cancels active RunTask token
+  → terminal effect returns through RunLink
+
+Steer / FollowUp / NextTurn
+  → actor mutates the corresponding queue and publishes full queue snapshot
+  → only Steer is consumed by a later before_next_model_call request
+
+Compact while Turn
+  → actor stores one typed PendingSessionAction::Compact
+  → RunTask continues unaffected until terminal arbitration
+
+ClearQueue while Turn
+  → actor clears steering/follow-up/next-turn/pending actions
+  → actor publishes the full replacement queue snapshot
+
+SetModel / SetThinkingLevel / SetStreamOptions / SetActiveTools while Turn (MVP)
+  → actor returns the documented phase/command output rejection promptly
+  → no state or PromptCallProfile/ToolBatchInvoker changes occur mid-run
+```
+
+`before_next_model_call` 是 actor transaction：`RunTask` 发送 checkpoint 并等待 reply；actor 消费 steering intent、使用 active `PromptTurn` 展开、commit `UserInput`、发布 invoked/message facts，再把 committed messages 和完整 profile/context plan 返回。commit 失败时回复 failure 并让当前 run 进入 failed terminal path；Driver/Rig 不能看到仅存在内存的 steer。
+
+高频 model/tool delta 通过独立 bounded/coalesced `RunProgressSink` 到达 actor；lifecycle/control effect 走优先的 `RunLink` control lane，并携带已提交 progress watermark。`run_finished`、message/tool finished、snapshot barrier 或 actor shutdown 前必须先归约到对应 watermark，不能出现 finished-before-delta 或 `last_event_sequence` 已覆盖事件而 snapshot projection 尚未更新。
 
 ## Usage And Context Usage
 
@@ -349,7 +402,7 @@ overflow recovery 流程：
 4. 压缩成功后，用重建后的 session context 启动新的 `DriveEntry::Continue { reason: ContextOverflowRecovery }`。
 5. 不使用 `DriveEntry::Resume` 恢复旧 `AgentRun`，因为旧 serialized run 内含压缩前 history。
 
-压缩摘要消息进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。启动新 prompt 时应把压缩后的 durable history 与受保护 current input 分开交给 `PromptTurn.project_model_call()`；当前输入不能在同一启动边界上被摘要。
+压缩摘要消息进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。启动新 prompt 时，Driver 应把当前完整 `PromptCallProfile`、压缩后的 durable history 与受保护 current input 分开交给 `prompt::project_model_call(...)`；当前输入不能在同一启动边界上被摘要。
 
 ## 队列语义
 
@@ -391,7 +444,7 @@ Rig 的 `AgentRun` 是否提供运行中注入点必须通过 Driver seam 验证
 
 ## Next Model Call Plan
 
-同一个安全点可能同时发生 steer、active tools/model profile 更新、RAG/memory context 和控制决策，因此返回组合式 plan，而不是互斥 enum：
+同一个安全点可能同时发生 steer、RAG/memory context 和控制决策；full version 还可能加入 active tools/model profile 更新，因此返回组合式 plan，而不是互斥 enum：
 
 ```rust
 pub struct NextModelCallPlan {
@@ -424,11 +477,11 @@ resolved command
 2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
 3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
 4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布外层 `Event.run_id = None` 的 `skill_invoked` / `prompt_template_invoked`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
-5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 `DriveRequest` 后调用 `Driver.drive_run()`。
-6. 每次下一模型调用前进入 run safe point；`SessionRuntime` 消费 steer、应用合法 profile 变化、收集 typed context materials，并返回 `NextModelCallPlan`。
-7. `Driver` 应用已 committed persistent messages/profile 后调用 `Prompt::project_model_call(...)`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
-8. 工具调用通过 `Tools` 子系统治理和执行；`Tools` 返回最终 normalized results 后，`SessionRuntime` 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`。随后把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，`SessionRuntime` 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`；随后 host 才把结果返回 Driver，Driver 回填 Rig 并允许下一模型调用。
-9. 正常最终 assistant message 组装为 `AssistantFinal` batch；commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
+5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 owned `SessionDriverHost` 与 `DriveRequest`，启动短期 `RunTask` 后立即回到 actor mailbox loop。`RunTask` 内部调用 `Driver.drive_run()`。
+6. 每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。
+7. `Driver` 应用已 committed persistent messages 和完整 replacement profile 后，调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
+8. 工具调用通过 run-only `ToolBatchInvoker` 治理和执行；invoker 返回 normalized candidate 后，`RunTask` 通过 `RunLink` 提交完整 tool-round candidate。`SessionRuntime` actor 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`，把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，actor 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`，然后把 actor-finalized `ToolBatchResult` 回复 host；Driver 才回填 Rig 并允许下一模型调用。
+9. `RunTask` 返回正常 final assistant draft 后，通过 `RunLink` 提交 terminal effect；`SessionRuntime` actor 将消息组装为 `AssistantFinal` batch。commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 
 稳定 batch 的数量由实际会话事实决定，不按 run 固定。正常 text-only `Completed` run 至少提交 `UserInput` 和 `AssistantFinal` 两个 batch。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result round 都必须先提交一个 `ToolRound` batch；并行结果按 `call_index` 归约后共享该 batch。streaming delta、tool output delta、queue state、partial assistant、pending approval 和执行中的 tool round 不进入 writer。
 
@@ -436,4 +489,4 @@ resolved command
 
 abort、failure、session close 或 host shutdown 只保留已经成功 committed 的稳定单元。当前 partial assistant、waiting approval 或 incomplete tool round 被丢弃；如果已发布 `message_assistant_started`，仍要发布一次 `message_assistant_finished` 关闭 UI lifecycle，但该 partial 不进入 session。失败路径发出 `diagnostics_error` + `run_finished { status: failed }`，abort 路径发出 `run_finished { status: aborted }`；MVP 不生成 synthetic tool result，也不恢复中断中的 run。
 
-`SessionRuntime` 不把 run cancellation token 传给 `SessionWriter`。同一 session 的 actor/command ordering 决定竞态边界：若 abort/close/shutdown 在调用 `commit()` 前先被观察到，完整但尚未提交的 unit 仍可丢弃；若 `commit()` 已开始，则 writer 获胜并必须得到确定结果。此后 abort/close/graceful shutdown 先阻止后续模型或工具工作，再等待该 commit 得到确定结果：成功 batch 保留，失败 batch 不进入投影。若 final assistant 已成功 commit，则该 run 已跨过 completed terminal boundary，随后到达的 `AbortRun` 应观察为没有可 abort 的 active run；若完整 `ToolRound` 已 commit 但下一模型调用尚未开始，abort 可以保留该 round 并以 aborted 结束当前 run。
+`SessionRuntime` 不把 run cancellation token 传给 `SessionWriter`。同一 session 的 actor control ordering 决定竞态边界：若 actor 在 commit admission 前先观察到 abort/close/shutdown，完整但尚未提交的 candidate 仍可丢弃；若 actor 已调用 `commit()`，writer 获胜并必须得到确定结果。此后 actor 先阻止 RunTask 启动后续模型或工具工作，再等待该 commit 得到 `Ok` / `Err`：成功 batch 保留，失败 batch 不进入投影。若 final assistant 已成功 commit，则该 run 已跨过 completed terminal boundary，随后到达的 `AbortRun` 应观察为没有可 abort 的 active run；若完整 `ToolRound` 已 commit 但下一模型调用尚未开始，abort 可以保留该 round并以 aborted 结束当前 run。

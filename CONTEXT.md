@@ -89,8 +89,12 @@ _避免_：调用点临时合并、按文件路径碰撞、用户可随意声明
 _避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源
 
 **会话运行时（`SessionRuntime`）**：
-单个会话的产品级 Agent 编排对象；它管理会话阶段、当前运行、中止、等待空闲、队列、模型状态、资源、工具、工具策略、会话写入和 `Driver`。
+单个会话的产品级 Agent 编排对象；每个 loaded runtime 以 per-session actor 模式持有权威状态并持续处理 mailbox，管理会话阶段、当前运行、队列、模型状态、资源、工具、会话写入和 post-run arbitration。
 _避免_：会话管理器、UI 会话状态
+
+**会话运行时句柄（`SessionRuntimeHandle`）**：
+上层联系某个 loaded `SessionRuntime` 的显式可克隆句柄，用于提交 session command、请求一致 snapshot/read projection 和发起 graceful shutdown；它不保存权威 session 状态，也不直接等待或执行 Agent run。
+_避免_：`Arc<Mutex<SessionRuntime>>`、SessionRuntime 本体、RunTask handle、客户端 selected session
 
 **产品级编排能力**：
 围绕一次会话运行所需的阶段、队列、资源、工具、会话写入、中止和事件等职责。它是一组属于会话运行时的能力，不是独立模块。
@@ -205,7 +209,7 @@ _避免_：完整 prompt、用户消息、工具描述、实时资源查询
 _避免_：用户消息、命令文本、已展开 prompt、PendingSessionAction
 
 **Prompt 子系统**：
-无状态的提示词组装深模块，负责从已捕获和已授权的 typed views 构建 `PromptTurn`、展开 `PromptIntent`，并在模型调用前生成协议安全的 `ModelInputProjection`。它不拥有资源生命周期、会话历史、队列、动态 context provider、工具执行或模型调用。
+无状态的提示词组装深模块，负责从已捕获和已授权的 typed views 构建 `PromptTurn`、展开 `PromptIntent`，并通过以 `PromptCallProfile` 和 call-time lanes 为输入的纯投影生成协议安全的 `ModelInputProjection`。它不拥有资源生命周期、会话历史、队列、动态 context provider、工具执行或模型调用。
 _避免_：系统提示词构建器、PromptManager、ContextManager、ResourceManager
 
 **提示词资源视图（`PromptResourceView`）**：
@@ -213,11 +217,11 @@ _避免_：系统提示词构建器、PromptManager、ContextManager、ResourceM
 _避免_：资源目录副本、PromptResourceRegistry、实时资源查询
 
 **Prompt turn（`PromptTurn`）**：
-一次 user turn/run 使用的不可变提示词组装值，pin 住 `PromptResourceView`，并包含同版 `PromptCallProfile`、贡献来源和 fingerprint。active Steer 使用当前 `PromptTurn`；FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PromptTurn`。
+一次 user turn/run 使用的不可变提示词组装值，pin 住 `PromptResourceView`，用于展开 resource-backed `PromptIntent`，并提供同版 `PromptCallProfile`、贡献来源和 fingerprint。它不是 Driver 最终 model-call projection 的 receiver；active Steer 使用当前 `PromptTurn`，FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PromptTurn`。
 _避免_：TurnState、长期 PromptManager、资源快照 owner、会话上下文
 
 **提示词调用配置（`PromptCallProfile`）**：
-一次 Agent 模型调用使用的原子提示词基线，把最终 system prompt、active tool schemas、贡献来源和 fingerprint 绑定在一起。切换模型可见工具或相关 profile 时必须整体替换，不能分别 patch system prompt 与 schemas。
+一次 Agent 模型调用使用的原子提示词基线，把最终 system prompt、active tool schemas、贡献来源和 fingerprint 绑定在一起。它是 Driver 调用 Prompt 纯 model-call projection 时所需的静态 baseline；切换模型可见工具或相关 profile 时必须整体替换，不能分别 patch system prompt 与 schemas。
 _避免_：DriverTurnInput、ModelCallRequest、ToolPromptCatalog、provider payload
 
 **上下文素材（`ContextMaterial`）**：
@@ -316,6 +320,10 @@ _避免_：QueuedMessage、PromptIntent、durable user message、runtime event p
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
 
+**RunTask**：
+`SessionRuntime` 为一次已经公开启动的 Agent 运行创建的短期执行任务，拥有 `Driver`、Rig `AgentRun`、run-local usage/limits 和 cancellation；它不拥有 session phase、queues、writer、公共事件或 terminal arbitration。
+_避免_：SessionRuntime actor、长期后台 session、RunId、DriverHost
+
 **运行标识（`RunId`）**：
 一次已经公开启动的 `Driver::drive_run()` / Agent loop 执行实例的 runtime-host-global opaque id。它在 runtime 准备创建 `CurrentRun`、调用 Driver 并发布 `run_started` 时分配，同一 run 内的模型调用、工具轮次、审批、suspend/resume 和 terminal event 共享该 id；新的 retry/continuation `drive_run()` 使用新 id。`RunId` 不是 prompt admission、`CommandId`、user turn、session revision 或跨进程 resume token，不能用于取消尚未公开启动的 work。
 _避免_：命令 id、模型调用 id、工具调用 id、会话 entry id、持久化 revision
@@ -349,7 +357,7 @@ _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具�
 _避免_：Driver 实例、工具执行器、SessionRuntime 本体、全局服务
 
 **SessionDriverHost**：
-一次 `drive_run()` 期间临时创建的 `DriverHost` wrapper，借用 `SessionRuntime` 中本次 run 需要的一小片能力，例如 `Tools`、`ModelGateway`、event sink、queue state 和 `CurrentRun`，并持有留在 host 侧的 turn resources。直接 `impl DriverHost for SessionRuntime` 是合法简化版，但 wrapper 更能收窄访问面、隔离 run-scoped context，并避免 Rust 自借用压力。
+一次 `drive_run()` 期间由 `RunTask` 持有的 owned `DriverHost` wrapper，保存 run identity、turn resources、`ModelGateway` / `Tools` handle、cancellation 和回到 owner actor 的窄联系 seam；它不借用 `SessionRuntime` 的 mutable state。
 _避免_：长期子系统、session 状态 owner、独立 runtime、DriverTurnInput
 
 **Tools 子系统 / 工具模块**：

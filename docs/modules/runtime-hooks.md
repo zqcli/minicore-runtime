@@ -99,7 +99,7 @@ SessionRuntime
   └─ emits official session/run/tool/message events after applying results
 
 Tools
-  ├─ invokes tool governance hooks inside Tools::invoke_batch(...)
+  ├─ invokes tool governance hooks inside ToolBatchInvoker.invoke_batch(...)
   └─ revalidates schema / sandbox / policy after any hook rewrite
 
 ModelGateway
@@ -296,7 +296,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 - 企业 policy / coding style：优先作为 required policy view 或 `PromptBuilt` append；system replacement 需要 privileged `ReplacePrompt` capability。
 - `PromptBuilt` 变化后必须重建 contribution stamps、fingerprint 和完整 `PromptCallProfile`，不能只改字符串。
 - RAG / memory / issue context：成功时返回带 source、content hash、persistence 和 requirement 的 `ContextMaterial`；失败时返回同 key/source/requirement 的 `Unavailable`，不能省略失败项。`Required` 失败由 Prompt fail closed，`Optional` 失败进入 projection diagnostics。
-- privileged message replacement 仍必须经过 `PromptTurn.project_model_call()`，保证没有 orphan tool result、unresolved tool call 或 current-input loss。
+- privileged message replacement 仍必须经过 `prompt::project_model_call(ModelCallProjectionInput { profile, ... })`，保证没有 orphan tool result、unresolved tool call 或 current-input loss。
 - resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 captured `PromptResourceView` 注入资源。
 
 ### Run Safe Points

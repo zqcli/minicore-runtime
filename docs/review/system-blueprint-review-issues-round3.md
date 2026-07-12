@@ -2,7 +2,7 @@
 
 日期：2026-07-12
 
-来源：进入实现阶段前的第三轮可实现性审阅。本轮由多个 subagent 分层全文精读执行层（`driver.md` / `model-gateway.md` / `tools.md`）、资源与提示词层（`prompt.md` / `resource-manager.md` / `skills.md` / `prompt-templates.md` / `compaction.md`）、会话/事件/命令/持久化层（`session-manager.md` / `agent-runtime-events.md` / `agent-runtime-protocol.md` / `command-surface.md` / `usage-stats.md` / `runtime-hooks.md`），交叉核对全部 20 个 ADR、`CONTEXT.md`、`architecture.md` 与前两轮 review，并首次核对了 Rig 上游源码（rig-core 0.39.0 / 0.40.0）以验证蓝图押注的 sans-IO `AgentRun` 假设。本轮只记录前两轮（BR-001 ~ BR-046）未覆盖的新问题，编号从 BR-047 起延续。
+来源：进入实现阶段前的第三轮可实现性审阅。本轮由多个 subagent 分层全文精读执行层（`driver.md` / `model-gateway.md` / `tools.md`）、资源与提示词层（`prompt.md` / `resource-manager.md` / `skills.md` / `prompt-templates.md` / `compaction.md`）、会话/事件/命令/持久化层（`session-manager.md` / `agent-runtime-events.md` / `agent-runtime-protocol.md` / `command-surface.md` / `usage-stats.md` / `runtime-hooks.md`），交叉核对当时全部 20 个 ADR、`CONTEXT.md`、`architecture.md` 与前两轮 review，并首次核对了 Rig 上游源码（rig-core 0.39.0 / 0.40.0）以验证蓝图押注的 sans-IO `AgentRun` 假设。本轮只记录前两轮（BR-001 ~ BR-046）未覆盖的新问题，编号从 BR-047 起延续；关闭 BR-047 时新增 ADR 0021。
 
 约定：与前两轮相同，本文只记录待处理问题，不代表已经决定修改方案。后续逐条处理时，应回到对应 source of truth 文档中做设计取舍。
 
@@ -22,46 +22,54 @@
 
 本轮结论是"可以开工，但有前置"。前置项集中在四类：
 
-1. **一个真正的架构缺口**：session 内并发/借用模型未定义，按现有草图 approval 会死锁（BR-047）。这是唯一需要新 ADR 的结构性问题，也是第一条真实纵切就会撞上的问题。
-2. **少量硬矛盾与死表面**：`project_model_call` 的 receiver 三方不一致（BR-048）、`ResumeRun` 是 MVP 里没有产生源的死命令、若干 MVP 载荷类型被引用而未定义（BR-052）。
+1. **原唯一架构缺口已关闭**：BR-047 已通过 ADR 0021 定义 per-session actor、显式 `SessionRuntimeHandle`、run-scoped `RunTask`、私有 `RunLink` 和 owned `SessionDriverHost`，approval/abort/queue command 不再被完整 run 阻塞。
+2. **少量硬矛盾与死表面**：`project_model_call` receiver 矛盾已按 BR-048 关闭；仍待处理的是 `ResumeRun` 作为 MVP 中没有产生源的死命令，以及若干被引用但未定义的 MVP 载荷类型（BR-052）。
 3. **前两轮遗留的 Open/观察未执行**：BR-036（多 workspace）仍 Open，本轮确认它是 `AgentRuntime` / `SessionManager` bootstrap 的开发阻塞，建议开工前用一页 ADR 关闭；round2 过程性观察 #1/#3 的协议裁边至今未做（BR-058）。
 4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）、sandbox 只有校验规范无 enforcement 方案（BR-050）。
 
-这些都不动摇模块边界，返工风险局限在个别文件的接口形状。除 BR-047 需要新 ADR、BR-036 需要一页 ADR 外，其余多为文档级定稿，合计约 3~5 天。
+这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-047 所需 ADR 已完成；BR-036 仍建议用一页 ADR 关闭，其余多为文档级定稿。
 
 ## 高风险
 
 ### BR-047：Session 内并发/借用模型未定义，按现有草图 run 飞行中的命令投递会死锁
 
-状态：Open
+状态：Resolved
 
-问题：`session-runtime.md` 的 `SessionDriverHost` 草图持有 `tools: &mut Tools`、`queues: &mut QueueState`、`current_run: &mut Option<CurrentRun>`，其独占借用生命周期覆盖整个 `drive_run().await`。同时文档要求多个命令在 run 飞行中触碰这些被独占借用的状态：`DecideToolApproval` 在 `Turn + WaitingApproval` 时合法、`Steer` 在 run 中入 steering queue、`Compact` / `SetModel` 在 run 中存 pending action。`session-manager.md` 提到"同一 session 的 actor ordering"和 `SessionRuntimeFactory::spawn -> SessionRuntimeHandle`，暗示 per-session actor，但没有定义 actor 循环与 `drive_run` 的关系。若 actor 循环内联 `await drive_run`，mailbox 在整个 run 期间不被消费，形成三方死锁：`ToolApprovalBroker` 等 decision → decision 命令等 actor 循环消费 mailbox → actor 循环等 `invoke_tool_batch` 返回。
+处理记录：新增 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，明确每个 loaded session 由一个持续运行的 `SessionRuntime` actor 持有权威 mutable state，`SessionRuntimeFactory::spawn(...)` 返回显式可克隆 `SessionRuntimeHandle`；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` / Rig `AgentRun` 和 owned `SessionDriverHost`。生产 host 不再借用 `&mut Tools` / queues / `CurrentRun`，而是持有 run-only `ToolBatchInvoker`、`ModelGateway` handle、cancellation、progress sink 和私有 `RunLink`；actor 保留 tool admin/approval capability。外部 command 与 run safe-point/tool-round/terminal effect 在 actor 处线性化；approval wait 不得持有阻止 decision path 的锁；abort 与 commit 继续按 ADR 0019 的 commit-admission 规则裁决。
 
-证据：
+验证结果：`DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown 在 active `RunTask` 等待 model/tool/approval 时仍可由 actor 处理；旧 `SessionDriverHost<'a>` mutable-borrow 草图已从 `session-runtime.md`、`driver.md` 和 ADR 0011 移除，并在事件 Test Matrix 中增加 actor responsiveness、approval wakeup、safe-point transaction、run identity fencing 和 control/progress ordering 场景。
+
+原问题：`session-runtime.md` 的旧 `SessionDriverHost` 草图持有 `tools: &mut Tools`、`queues: &mut QueueState`、`current_run: &mut Option<CurrentRun>`，其独占借用生命周期覆盖整个 `drive_run().await`。同时文档要求多个命令在 run 飞行中触碰这些被独占借用的状态：`DecideToolApproval` 在 `Turn + WaitingApproval` 时合法、`Steer` 在 run 中入 steering queue、`Compact` / `SetModel` 在 run 中存 pending action。`session-manager.md` 当时只提到"同一 session 的 actor ordering"和 `SessionRuntimeFactory::spawn -> SessionRuntimeHandle`，没有定义 actor 循环与 `drive_run` 的关系。若 actor 循环内联 `await drive_run`，mailbox 在整个 run 期间不被消费，形成三方死锁：`ToolApprovalBroker` 等 decision → decision 命令等 actor 循环消费 mailbox → actor 循环等 `invoke_tool_batch` 返回。
+
+原证据：
 
 - `docs/modules/session-runtime.md`：`SessionDriverHost` 构造代码持有 `&mut self.tools` / `&mut self.queues` / `&mut self.current_run`，随后 `driver.drive_run(request, &mut host, cancel).await`。
 - `docs/modules/session-runtime.md`：Session Phase 表允许 `DecideToolApproval` 只在 `Turn + WaitingApproval` 合法；队列语义要求 active run 期间入 steering/follow-up queue。
 - `docs/adr/0011-tools-are-session-scoped-subsystem.md`：以 borrow-checker 动机论证 `Tools` 内嵌，但未回答 run 在飞时 decision/steer 命令如何到达 broker/queue。
 
-风险：这是"不先补设计就无法写出第一版 `SessionRuntime`"的缺口。approval、steer、running-compact 三条产品必需路径全部依赖它；每种解法（broker 内置 channel、host 持 sender 而非 `&mut`、actor 在 step 边界交错处理 mailbox）都会改动 ADR 0011 画下的借用草图。
+原风险：这是"不先补设计就无法写出第一版 `SessionRuntime`"的缺口。approval、steer、running-compact 三条产品必需路径全部依赖它；每种解法（broker 内置 channel、host 持 sender 而非 `&mut`、actor 在 step 边界交错处理 mailbox）都会改动 ADR 0011 画下的借用草图。
 
-待处理方向：补一篇并发模型 ADR，定义 per-session actor 循环、`drive_run` 在飞时命令如何到达 broker/queue、`&mut` 草图改为何种通道拓扑，以及 `DecideToolApproval` / `Steer` / `Compact` 在 run 期间的投递路径。这是阶段 3 text-only 纵切的前置。
+决策结果：采用显式 `SessionRuntimeHandle` + per-session actor + run-scoped `RunTask`。`SessionManager` 只管理 handle/lifecycle，不处理单 session phase/queue/approval 业务；`RunTask` 只推进一次 run，并通过比 Handle 更窄的 `RunLink` 请求 owner actor 执行 safe-point、stable commit 和 terminal arbitration。未采用全局/整对象 mutex、只修 approval channel 或 actor 内联等待 `drive_run()`。
 
 ### BR-048：`project_model_call` 的 receiver 在三处文档互相矛盾，Driver 拿不到方法接收者
 
-状态：Open
+状态：Resolved
 
-问题：Prompt 的最终投影入口 `project_model_call` 在三处有三种不相容的形态。`prompt.md` facade 把它定义为 `PromptTurn::project_model_call(&self, ModelCallProjectionInput)`，profile 来自 `self.profile`；`driver.md` 的 CallModel step 写成自由函数 `prompt::project_model_call(history, prompt, DriverTurnInput.prompt, context materials)`；`session-runtime.md` 散文又说"由 `Driver` 调用 Prompt 的 final projection seam / `Prompt::project_model_call(...)`"。而 `driver.md` 与 ADR 0013 明令 `DriverTurnInput` 不得携带 `PromptTurn`。三者合起来无解：Driver 是调用者，却拿不到 `PromptTurn` 这个 receiver。
+处理记录：采用以 `PromptCallProfile` 和 call-time lanes 为输入的纯 `prompt::project_model_call(ModelCallProjectionInput { profile, ... })`。`PromptTurn` 只负责 pin captured resources、展开 resource-backed `PromptIntent` 并提供原子 profile；Driver 从 `DriverTurnInput` 持有 owned/Arc-backed profile，在 safe point 后整体替换 active profile，再调用 Prompt projection。ADR 0017 已补充 receiver 勘误，ADR 0013 明确该调用不会把 `PromptTurn` 或 resources 扩大进 Driver seam。
 
-证据：
+验证结果：`prompt.md` facade、`driver.md` CallModel flow、`session-runtime.md` run flow、`model-gateway.md`、`runtime-hooks.md`、`resource-manager.md`、模块总览和 glossary 已统一；当前权威文档中不再存在 `PromptTurn.project_model_call(...)` 或 `Prompt::project_model_call(...)`。projection interface 继续使用 MiniCore-owned provider-neutral types，不提前冻结 BR-049 尚待验证的 Rig 字段形状。
+
+原问题：Prompt 的最终投影入口 `project_model_call` 在三处有三种不相容的形态。`prompt.md` facade 把它定义为 `PromptTurn::project_model_call(&self, ModelCallProjectionInput)`，profile 来自 `self.profile`；`driver.md` 的 CallModel step 写成自由函数 `prompt::project_model_call(history, prompt, DriverTurnInput.prompt, context materials)`；`session-runtime.md` 散文又说"由 `Driver` 调用 Prompt 的 final projection seam / `Prompt::project_model_call(...)`"。而 `driver.md` 与 ADR 0013 明令 `DriverTurnInput` 不得携带 `PromptTurn`。三者合起来无解：Driver 是调用者，却拿不到 `PromptTurn` 这个 receiver。
+
+原证据：
 
 - `docs/modules/prompt.md`：facade 定义 `PromptTurn::project_model_call(&self, ...)`。
 - `docs/modules/driver.md`：CallModel step 描述为自由函数调用 + `DriverTurnInput` 不含 `PromptTurn` 的禁令。
 - `docs/modules/session-runtime.md`：运行流程第 7 步 "Driver ... 调用 `Prompt::project_model_call(...)`"。
 
-风险：唯一一处"不改文档就无法写代码"的硬矛盾，同时阻塞 `prompt/projection.rs` 和 `driver.rs`。
+原风险：唯一一处"不改文档就无法写代码"的硬矛盾，同时阻塞 `prompt/projection.rs` 和 `driver.rs`。
 
-待处理方向：二选一（建议前者）：(a) 把 projection 改为以 `&PromptCallProfile` 为输入的自由函数或 `PromptCallProfile` 方法，同步更新 `prompt.md` facade，"system prompt 与 tool schemas 同 profile"的校验退化为单参数自洽；(b) 增加 `DriverHost` 方法把 projection 路由回持有 `PromptTurn` 的 `SessionRuntime`。可作为 ADR 0017 的勘误补充。
+决策结果：选择自由函数而不是 `PromptCallProfile` 方法，因为 profile 是 projection 的原子静态 baseline，但 durable/current/context/output-contract lanes 是同级 call-time 输入；算法 owner 仍是无状态 Prompt 模块。未选择把 `PromptTurn` 放进 `DriverTurnInput`，也未增加 `DriverHost` / `RunLink` projection callback，避免资源 seam 扩大、host-local mirror/stale lease 和无必要 mailbox round trip。
 
 ### BR-049：Rig 版本未 pin，且大量字段级类型先于 spike 冻结在未验证的 Rig 形状上
 

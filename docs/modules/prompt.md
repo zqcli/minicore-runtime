@@ -2,7 +2,7 @@
 
 `Prompt` 是 MiniCore 的无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。它把已经由各 owner 捕获、校验或解析的输入确定性地组装成一次 turn 的 `PromptTurn`，并在每次模型调用前生成协议安全的 `ModelInputProjection`。
 
-`Prompt` 不是 workspace-global `PromptManager`，也不是长期持有会话历史的 `ContextManager`。`SessionRuntime` 仍是 Pull Master：它决定何时捕获资源、读取会话上下文、消费队列、收集动态上下文并调用 Prompt；Prompt 只负责解释、排序、展开、投影和校验。
+`Prompt` 不是 workspace-global `PromptManager`，也不是长期持有会话历史的 `ContextManager`。`SessionRuntime` 仍是 Pull Master：它决定何时捕获资源、读取会话上下文、消费队列和收集动态上下文，并调用 Prompt 的 turn assembly / intent seam；Driver 消费 actor 返回的 profile/context plan，并调用 Prompt 的纯 model-call projection seam。Prompt 只负责解释、排序、展开、投影和校验。
 
 一句话边界：
 
@@ -64,20 +64,21 @@ pub fn begin_turn(
     input: TurnPromptInputs<'_>,
 ) -> Result<PromptTurn, PromptError>;
 
+pub fn project_model_call(
+    input: ModelCallProjectionInput<'_>,
+) -> Result<ModelInputProjection, PromptError>;
+
 impl PromptTurn {
+    pub fn profile(&self) -> &PromptCallProfile;
+
     pub fn resolve_intent(
         &self,
         intent: &PromptIntent,
     ) -> Result<ResolvedPromptInput, PromptError>;
-
-    pub fn project_model_call(
-        &self,
-        input: ModelCallProjectionInput<'_>,
-    ) -> Result<ModelInputProjection, PromptError>;
 }
 ```
 
-内部可以继续调用平级的 `skills.rs` 和 `prompt_templates.rs` helper，但这些内部 helper 不成为调用方必须学习的新 seam。
+`PromptTurn` 负责 pin captured resources、展开 resource-backed intent 并提供原子 `PromptCallProfile`；最终模型调用投影是 Prompt 模块的纯函数，因为其最小充分输入是 profile 加四类 call-time lanes，而不是完整 `PromptTurn`。内部可以继续调用平级的 `skills.rs` 和 `prompt_templates.rs` helper，但这些内部 helper 不成为调用方必须学习的新 seam。
 
 ## Owner 分层
 
@@ -336,6 +337,7 @@ transient context
 
 ```rust
 pub struct ModelCallProjectionInput<'a> {
+    pub profile: &'a PromptCallProfile,
     pub durable_history: &'a [MessageRecord],
     pub current_input: &'a [MessageRecord],
     pub current_run_context: &'a [ContextMaterialContribution],
@@ -370,7 +372,7 @@ pub struct ModelInputProjection {
 }
 ```
 
-`Driver` 使用 Rig step 给出的 provider-neutral prompt/history、当前 `PromptCallProfile` 和 `NextModelCallPlan` 中的 context materials 调用 `project_model_call()`，通过校验后才构造 `ModelCallRequest`。
+`Driver` 使用 Rig step 给出的 provider-neutral prompt/history、当前 `PromptCallProfile` 和 `NextModelCallPlan` 中的 context materials 调用 `prompt::project_model_call(ModelCallProjectionInput { profile, ... })`，通过校验后才构造 `ModelCallRequest`。Driver 可以 clone、整体替换和借用 profile，但不能为了调用 projection 获得 `PromptTurn`、`PromptResourceView` 或 `TurnResourceSnapshot`，也不能绕过 projection 直接把 profile 字段拼成 provider request。
 
 ## 最终校验
 
@@ -379,7 +381,7 @@ pub struct ModelInputProjection {
 - 不存在 orphan tool result。
 - 不存在被非法截断的 unresolved tool call。
 - current input 未被遗漏、摘要或放到 tool call/result 中间。
-- system prompt 和 tool schemas 来自同一个 `PromptCallProfile`。
+- system prompt 和 tool schemas 必须同时来自 `input.profile`，不能从不同 revision 分别传入。
 - source key 唯一，section 与 contribution 排序确定。
 - 同一静态资源没有通过 resource material 和 transient material 重复注入。
 - `CurrentCall` context 不被标记为待持久化。
@@ -426,8 +428,8 @@ Prompt
 当前 MVP 不实现 hooks。后期启用时：
 
 - hook owner 获取动态材料并返回 typed `ContextMaterialContribution` 或受控 profile patch。
-- `SessionRuntime` 应用 hook result，再调用 Prompt 做最终投影和重新校验。
-- privileged context replacement 也必须回到 `project_model_call()`，不能直接提交 provider request。
+- `SessionRuntime` 在 owner safe point 应用 hook result，并把完整 profile/context plan 回复 Driver；Driver 随后调用 `prompt::project_model_call(...)` 做最终投影和重新校验。
+- privileged context replacement 也必须回到 `prompt::project_model_call(...)`，不能直接提交 provider request。
 - resource-driven material 仍必须来自 captured `PromptResourceView`。
 
 Prompt 不持有 `RuntimeHookRegistry`，也不异步调用 hook。
@@ -441,7 +443,7 @@ Prompt 不持有 `RuntimeHookRegistry`，也不异步调用 hook。
 ```text
 ContextWorkspace.prepare_call(...)
   → ContextMaterialContribution[]
-  → PromptTurn.project_model_call(...)
+  → prompt::project_model_call(ModelCallProjectionInput { profile, ... })
 ```
 
 即使引入 `ContextWorkspace`，它也不拥有 durable session history，不替代 Prompt。
@@ -461,6 +463,8 @@ ContextWorkspace.prepare_call(...)
 - FollowUp / NextTurn 在 future `PromptTurn` 中解析 rev-2。
 - active snapshot 缺少 skill/template 时明确失败，不重新读磁盘。
 - active tools 改变时 system prompt 与 tool schemas 原子替换。
+- Driver 只用 `PromptCallProfile` 即可完成 projection，不需要构造或持有 `PromptTurn` / resource snapshot。
+- safe-point 返回 replacement profile 后，下一次 projection 同时使用新 system prompt、tool schemas、contribution stamps 和 fingerprint。
 - compaction summary + retained suffix + current prompt 顺序稳定，current prompt 不被摘要。
 - tool call/result 完整性校验覆盖 abort/retry/compaction 后上下文。
 - `CurrentCall` context 不进入 session storage。

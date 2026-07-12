@@ -25,7 +25,7 @@ pub trait AgentRuntime {
 - 路由 `RuntimeQuery` 到 `SessionManager`、settings、`ResourceManager`、`CommandManager`、model/usage/diagnostics owner，并直接返回 `QueryResponse`；query 不发布业务事件。
 - 发布所有 `agent_runtime_protocol::Event`，维护单调递增的 event sequence，并为后加入的订阅者生成带 `last_event_sequence` 的 `agent_runtime_protocol::RuntimeSnapshot`。
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
-- 通过 `SessionManager` 取得或加载 `SessionRuntime`，再把 session-scoped 命令路由给对应 `SessionRuntime`。
+- 通过 `SessionManager` 取得或加载显式 `SessionRuntimeHandle`，再把 session-scoped 命令发送给对应 per-session actor；不直接借用或锁住 `SessionRuntime`。
 - 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、无状态 `CommandManager` 和运行时诊断。
 - 通过 `ResourceManager` 维护级联资源快照：current `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、run 启动时捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
 - 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve、`CommandRunPolicy` 校验和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。prompt-producing 结果再由目标 `SessionRuntime` 按 `PromptDelivery` 统一 admission。
@@ -63,12 +63,12 @@ AgentRuntime
       └─ ModelGateway / shared model invocation boundary
 
 LoadedSessionRuntimes
-  ├─ SessionRuntime A { workspace_id, cwd: repo-a, command: Command }
-  │   └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-10)
-  ├─ SessionRuntime B { workspace_id, cwd: repo-a, command: Command }
-  │   └─ next run captures current CwdSnapshot(repo-a)
-  └─ SessionRuntime C { workspace_id, cwd: repo-b, command: Command }
-      └─ current run captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-4)
+  ├─ Handle A -> SessionRuntime actor A { workspace_id, cwd: repo-a, command: Command }
+  │   └─ RunTask A captures TurnResourceSnapshot -> CwdSnapshot(repo-a, rev-10)
+  ├─ Handle B -> SessionRuntime actor B { workspace_id, cwd: repo-a, command: Command }
+  │   └─ next RunTask captures current CwdSnapshot(repo-a)
+  └─ Handle C -> SessionRuntime actor C { workspace_id, cwd: repo-b, command: Command }
+      └─ RunTask C captures TurnResourceSnapshot -> CwdSnapshot(repo-b, rev-4)
 ```
 
 Provider settings、auth 和 custom providers 是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth。`ModelSelection` 属于 session state；`ModelGateway` 每次调用通过 user-global `ProviderRegistry` 和 `AuthStore` 解析 provider/auth，不随 cwd 或客户端 selected session 重建。
@@ -83,11 +83,11 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 
 1. 校验目标会话、workspace 和 cwd；每个 session metadata 中的 cwd 在该 session 生命周期内固定。
 2. 调用 `ResourceManager.ensure_cwd_snapshot(CwdResourceRequest { workspace_id, cwd, reason: SessionOpen })`，确保目标 `(workspace_id, cwd)` 存在 current `CwdResourceSnapshot`；不存在时加载 runtime snapshot、cwd-local layer，并通过 overlay policy 构建初始快照。
-3. 若目标会话未 loaded，通过 `SessionManager` 创建 `SessionHandle` 并加载新的 `SessionRuntime`，让它记录自己的 `workspace_id` 和 `cwd`。
+3. 若目标会话未 loaded，通过 `SessionManager` 创建 `SessionHandle`，由 `SessionRuntimeFactory::spawn(...)` 启动新的 per-session actor，并把显式 `SessionRuntimeHandle` 放入 `LoadedSessionRuntimes`；actor 记录自己的 `workspace_id` 和 `cwd`。
 4. 若目标会话已 loaded，作为幂等 no-op 返回，不改写其 cwd、phase、queue、current run 或正在运行的 `TurnState`。
 5. 首次 loaded 时发出 `session_opened`。
 6. 需要时发出该 cwd 对应的 `resources_changed` / diagnostics events。
-7. 后续 session-scoped 命令按显式 `SessionId` 路由到对应 `SessionRuntime`；其他 loaded session 不受影响。
+7. 后续 session-scoped 命令按显式 `SessionId` 路由到对应 `SessionRuntimeHandle`，再进入目标 actor mailbox；其他 loaded session 不受影响。
 
 ## 安全边界
 
@@ -100,7 +100,8 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 ```text
 ExecuteCommandText / ExecuteCatalogCommand
   → require explicit session_id for session-scoped resolution
-  → AgentRuntime routes target session
+  → AgentRuntime / SessionManager resolve target SessionRuntimeHandle
+  → Handle dispatches into target SessionRuntime actor
   → SessionRuntime.command builds CommandContext + SessionCommandHost
   → CommandManager materialize current catalog
   → parse / resolve_for_execution
@@ -110,7 +111,7 @@ ExecuteCommandText / ExecuteCatalogCommand
 
 `ExecuteCommandText.session_id = None` 只允许 runtime/workspace-scoped command。若 parse/resolve 后发现命令需要 session context，返回 `SessionRequired` 类 command output；不能从唯一 loaded、最近 opened 或 adapter 本地 selection 推断目标。`ExecuteCatalogCommand` 和其他 session-scoped commands 始终显式携带 `SessionId`。
 
-`AbortRun { run_id }` 是有意保留的 run-scoped 路由例外。`RunId` 在 runtime host 内全局唯一；`AgentRuntime` 通过 `LoadedSessionRuntimes` 的 current-run lookup 找到 owner `SessionRuntime`，不要求 UI 在命令中重复 session id。该 lookup 只覆盖已经发布 `run_started` 且尚未 terminal 的 current run，不创建可持久化 run registry，也不能取消 `Turn + current_run = None` 的 admission/finalization 窗口。
+`AbortRun { run_id }` 是有意保留的 run-scoped 路由例外。`RunId` 在 runtime host 内全局唯一；`AgentRuntime` 通过 `LoadedSessionRuntimes` 的非权威 `RunOwnerIndex` 找到候选 `SessionRuntimeHandle`，再把 abort 发送给对应 actor，由 actor 对 `CurrentRun.run_id` 做最终校验，不要求 UI 在命令中重复 session id。route 在 `run_started` 前登记、terminal boundary 清除；stale cache/late command 返回 `StaleRun` / `NoActiveRun`，不能取消后来 run，也不能取消 `Turn + current_run = None` 的 admission/finalization 窗口。
 
 只有当 resolved command 是 prompt-like input，例如 `/skill code-review ...`、兼容 `/skill:code-review ...` 或 `/{template}`，才会进入 `SessionRuntime` 的普通 prompt/run pipeline。`/status`、`/usage`、`/model`、`/thinking`、`/reload` 等命令不会直接进入 `Driver`；它们更新 runtime/session state、执行受控 query，或返回 display-neutral command result。
 

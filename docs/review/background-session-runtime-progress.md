@@ -622,7 +622,7 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 - mutation 和同 chain 工具必须串行。
 - `AutoAllow` 仍受 hard deny、sandbox、audit 约束。
 
-当前建议：统一采用 session-scoped `Tools` 子系统，由 `SessionRuntime` 协调 `DriverHost::invoke_tool_batch(...)` 与 `Tools::invoke_batch(...)`。`Tools` 内部封装 `ToolPolicy`、`ToolApprovalBroker`、RuntimeSnapshot projection、`ApprovalRequestId`、`ToolApprovalGrantStore` 和 `ToolExecutionCoordinator`，以吸收 Codex/pi request lifecycle 与并发调度经验。
+当前建议：统一采用 session-scoped `Tools` 子系统，由 `SessionRuntime` actor 保留 tool control/approval ownership 和 RuntimeSnapshot pending projection，active `RunTask` 经 `DriverHost::invoke_tool_batch(...)` 与 run-only `ToolBatchInvoker.invoke_batch(...)` 执行工具。`Tools` 内部封装 `ToolPolicy`、只持冻结 record/waiter 的 `ToolApprovalBroker`、`ApprovalRequestId`、`ToolApprovalGrantStore` 和 `ToolExecutionCoordinator`，以吸收 Codex/pi request lifecycle 与并发调度经验。
 
 ## Tools 子系统文档落地
 
@@ -630,8 +630,8 @@ UI 事件可以按实时完成顺序展示；session message 与回填给 LLM �
 
 - `Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，不是独立 runtime，也不是 UI 工具层。
 - `SessionRuntime` 协调 `Driver` 和 `Tools`；`Driver` 只通过 `DriverHost::invoke_tool_batch(...)` 请求工具批量结果，不直接依赖 `Tools`。
-- 代码层面确认：直接 `impl DriverHost for SessionRuntime` 是合法简化版；真实实现更推荐 per-run `SessionDriverHost` wrapper，因为它收窄访问面、承载 run-scoped context、避免 `self.driver + &mut self` 自借用压力，并让 `Driver` 更容易用 fake host 单测。
-- `Tools::invoke_batch(...)` 是工具治理和执行的主入口，内部包含 registry、active tools、prompt catalog、policy、approval、grants、planner、coordinator、executors、sandbox 和 mutation queue。
+- 历史记录：当时曾把直接 `impl DriverHost for SessionRuntime` 视为合法简化版。该结论已由 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md) 修订：生产实现必须使用 per-session actor + run-scoped `RunTask` + owned `SessionDriverHost`，不能让完整 `drive_run().await` 长期借用或锁住 actor state；fake host 仍可用于纯 Driver 单测。
+- `ToolBatchInvoker.invoke_batch(...)` 是 active run 的工具治理和执行入口；actor-owned `Tools` 负责 registry/active/prompt/control/approval，invoker 只携带 immutable execution profile、approval broker 和 execution kernel。
 - 新增 ADR 0011 固化该决策：`Tools` 是 `SessionRuntime` 内部的 session-scoped 子系统，文档和实现不再使用 gateway 作为架构术语。
 - 本地执行策略不由 LLM tool call 决定；provider parallel 参数只影响模型是否一次返回多个 tool calls。MiniCore 默认 parallel；session config 或任一 tool definition 要求 sequential 时整批串行；并发执行可乱序完成，但结果必须按 `ToolCallIndex` 稳定回填。
 - `ToolPolicy` 保持纯判断器；preview 构造、path canonicalization、sandbox check 和 schema validation 由 `ToolInvocationPlanner` 负责。

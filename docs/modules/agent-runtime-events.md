@@ -255,6 +255,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | --- | --- | --- |
 | `AgentRuntime` | 可以 | workspace、session open/close/delete、runtime diagnostics、resource reload 入口、command catalog 和 command result；query result 直接返回，不发布事件。 |
 | `SessionRuntime` | 可以 | 单会话 phase、run、queue、usage/context usage、稳定 message batch commit、compaction 和 retry。 |
+| `RunTask` | 不直接发 UI event | 只推进一次 Driver/Rig run，并经私有 `RunLink` 把 update、safe-point、commit candidate 和 terminal effect 交给 owner `SessionRuntime` actor。 |
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `Tools` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
@@ -275,7 +276,8 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` | `SessionPhase`、current run、queues、model state、`Tools` state、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 消费 `DriverEvent`、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
+| `SessionRuntime` actor | `SessionPhase`、current run projection、queues、model state、session-scoped `Tools` lifecycle、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 通过 mailbox 消费上层 command、`RunTask` control effect、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
+| `RunTask` | 单次 `Driver` / Rig `AgentRun`、run-local usage/limits、owned `SessionDriverHost`、cancellation | 不发布 UI event；经 `RunLink` 上报内部 effect | 消费 `DriverHost` model/tool/safe-point 结果，不拥有 session phase、queues、writer 或 terminal arbitration |
 | `Driver` | Rig `AgentRun` 推进中的临时 protocol state、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果 |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、future provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor；后期消费工具治理 hook；返回 `ToolBatchResult` |
@@ -283,7 +285,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
 | `CommandSurface` / `CommandManager` | command catalog materialization、name conflict diagnostics、`CommandRunPolicy`、command text parse result、suggestion、execution resolve | 不发布 UI event；返回 catalog、suggestion、resolved invocation 或 UI-safe command result | `AgentRuntime` 发布 `command_catalog_changed` 和 command output events；`SessionRuntime.command` 执行 session-scoped command |
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
-| `Prompt` | 无运行生命周期状态；纯创建 `PromptTurn`、展开 intent、生成 `ModelInputProjection` | 不发布事件 | 被 `SessionRuntime` / Driver projection path 调用；事件由 SessionRuntime 归约 |
+| `Prompt` | 无运行生命周期状态；纯创建 `PromptTurn`、展开 intent，并由 `prompt::project_model_call(profile + call-time lanes)` 生成 `ModelInputProjection` | 不发布事件 | `SessionRuntime` 调用 turn/intent seam，Driver 调用纯 projection seam；事件由 SessionRuntime 归约 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
 | `SessionHandle` | 单会话领域操作 facade、统一 batch commit、上下文重建结果 | 不发布 UI event；返回 `CommittedSessionBatch` / context | `SessionRuntime` 根据 commit 结果发布对应 `message_*`、`session_*`、`compaction_*` 等领域事实 |
 | `SessionStorage` / `SessionWriter` | 单会话 metadata、committed batches、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用；隐藏 memory/JSONL adapter 写入细节 |
@@ -939,7 +941,7 @@ Required
 - rejected 后进入 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
-审批状态不能由 adapter 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件，pending approval 是 `ToolApprovalBroker` 持有的当前运行状态；snapshot 只暴露 UI-safe view，不暴露冻结的 prepared args。
+审批状态不能由 adapter 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件；pending approval 的 UI-safe current state 由 `SessionRuntime` actor 的 `CurrentRun` projection 持有，`ToolApprovalBroker` 只持冻结 execution record 与 waiter。snapshot 不暴露 prepared args。
 
 ### 13. Queue Lifecycle
 
@@ -1424,6 +1426,11 @@ MVP event lifecycle tests 应覆盖：
 - tool denied / approval rejected：产生 error tool result，与同 batch 其他 results 一起 commit 完整 `ToolRound` 后才发布 appended events，不产生 run failure。
 - settled observation：没有 `WaitForIdle` command 或 wait-completed event；UI 通过 snapshot + `session_settled`，测试 event probe 必须先订阅再触发动作。任意 session 的 late-subscribe/gap 行为在 BR-044 关闭后再定义。
 - pre-run admission：`CommandAck` / `session_phase_changed(turn)` 不产生 run-level abort target；在任何 provider/model/tool/approval wait 前必须先发布 `run_started`。
+- actor responsiveness：active `RunTask` 正在等待 model/tool/approval 时，目标 `SessionRuntimeHandle` 仍能处理 `DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown；禁止 actor 内联等待完整 `drive_run()`。
+- approval wakeup：tool batch 登记 pending approval 并发布 request 后，actor 处理 matching decision，Tools waiter 被唤醒且 executor 恰好执行一次；duplicate/stale/abort-after-request 不重复执行。
+- safe-point transaction：active Steer 经 actor drain/expand/`UserInput` commit/领域事件后才回复 `NextModelCallPlan`；commit failure 时 RunTask/Rig 不得到该 message。
+- run identity fencing：旧 RunTask 在新 run 启动后发送的 late delta、safe-point、tool-round candidate 或 terminal effect 被识别为 stale，不能污染新 `CurrentRun`。
+- control/progress ordering：高频 progress lane 不饿死 approval/abort；terminal event 和 snapshot barrier 前已接受的 delta/update 必须完成归约，不能 finished-before-delta 或产生水位撕裂。
 - abort run：只有一个 terminal `run_finished { status: aborted }`；started assistant 必须 finished，uncommitted partial/approval/tool round 不进入 session；若清理造成 queue state 变化，清除 steering/follow-up/pending actions、保留 `NextTurn` 的 `queue_updated` 必须先于 idle/settled。
 - clear queue：若 accepted command 实际清除了 queue/pending state，则发布 steering/follow-up/next-turn/pending actions 全为空的完整 `queue_updated`；空队列 no-op 不发冗余更新，也不发布 removed delta 或 editor action。
 - abort/commit race：in-flight `ToolRound` commit 先完成并保留 round，但不进入下一模型；in-flight `AssistantFinal` commit 成功时 completed 获胜，同一 run 不得再发 aborted。
@@ -1437,4 +1444,6 @@ MVP event lifecycle tests 应覆盖：
 - command text semantic error：unknown command 或 phase 不允许时，`CommandAck` 可 accepted，并通过 error severity 的 `command_output_appended` 告知用户。
 - explicit session routing：core 没有 `FocusSession` / focus event；session-scoped command 缺少 `SessionId` 时返回 `SessionRequired`，不能回退到唯一 loaded 或最近 opened session。
 - multi-session snapshot：两个或更多 loaded sessions 同时推进 work 时，projection barrier 产生同一水位的 `loaded_sessions`；客户端 selection 不改变 coverage，close/open 与 sequence 不得形成跨水位拼接。
+- handle snapshot barrier：snapshot builder 冻结 loaded handle membership，flush 每个 actor 的 accepted progress/control effects，再读取 all-loaded projection 和 `last_event_sequence`；禁止逐 handle 无保护拼接。
+- abort run routing：`RunOwnerIndex` 在 `run_started` 前登记并在 terminal boundary 清除；stale index 命中时目标 actor 二次校验拒绝，不能 abort 后来的 run。
 - resync：RuntimeSnapshot sequence 后的事件可正确 reduce。

@@ -28,28 +28,28 @@ Rig AgentRunStep::CallTools
   -> Driver
   -> DriverHost::invoke_tool_batch(...)
   -> SessionRuntime / SessionDriverHost
-  -> Tools::invoke_batch(...)
+  -> ToolBatchInvoker.invoke_batch(...)
   -> Result<ToolBatchResult, ToolBatchError>
   -> SessionRuntime commits complete ToolRound
   -> Driver receives committed ToolBatchResult or typed ToolBatchHostError
   -> AgentRun::tool_results(...)
 ```
 
-`Driver` 不直接依赖 `Tools`。`DriverHost` 是 trait/interface seam，不是 `Driver` 的实例。`SessionRuntime` 可以直接实现 `DriverHost`，也可以创建 per-run `SessionDriverHost` wrapper 来实现。
+`Driver` 不直接依赖 `Tools`。`DriverHost` 是 trait/interface seam，不是 `Driver` 的实例。按 ADR 0021，生产 `SessionRuntime` actor 不直接实现 `DriverHost`；它为每次 run 创建 owned `SessionDriverHost`，并只向 RunTask 提供 run-only `ToolBatchInvoker`。
 
-推荐真实实现使用 per-run `SessionDriverHost` wrapper：
+按 [ADR 0021](0021-session-runtime-separates-actor-control-from-run-execution.md)，生产实现使用由短期 `RunTask` 持有的 owned `SessionDriverHost` wrapper；本 ADR 原先长期借用 `&mut Tools` / queues / `CurrentRun` 的草图已被修订：
 
 ```text
-SessionRuntime::start_run
+SessionRuntime actor::start_run
   -> build TurnState
   -> project DriverTurnInput into DriveRequest
-  -> clone turn_resources from TurnState.resources into SessionDriverHost
-  -> create SessionDriverHost { tools: &mut self.tools, turn_resources, model_gateway, event_sink, queues, current_run, ... }
-  -> let driver = Driver::new()
-  -> driver.drive_run(request, &mut host, cancel)
+  -> establish CurrentRun + publish run_started
+  -> create SessionDriverHost { ToolBatchInvoker, RunLink, progress sink, turn_resources, ModelGateway handle, cancel, ... }
+  -> spawn run-scoped RunTask { Driver, DriveRequest, SessionDriverHost }
+  -> actor returns to mailbox loop
 ```
 
-直接 `impl DriverHost for SessionRuntime` 是合法的最小实现；`SessionDriverHost` 不是额外 runtime，也不拥有 session state。它只是一次 `drive_run()` 期间把 `SessionRuntime` 的一小片能力借给 `Driver` 的 adapter。
+`SessionDriverHost` 不是额外 runtime，也不拥有 session state。它只保存 run-scoped context 和窄 capabilities；safe-point、完整 tool-round commit 和 terminal effect 通过私有 `RunLink` 回到 owner actor。`Tools` 仍由该 `SessionRuntime` 生命周期拥有；actor 保留 admin/decision 能力，active RunTask 只通过 immutable-profile `ToolBatchInvoker` 执行 batch，不能跨整个 `drive_run().await` 借用 `&mut Tools`。
 
 `Tools` 不直接发布 UI event，不写 session storage，不调用 `ModelGateway`，不读取 `ResourceManager`，不构建最终 system prompt。所有工具内部 update 通过 `ToolUpdateSink` 返回，由 `SessionRuntime` 归约成 `agent_runtime_protocol::EventMsg::ToolCall(...)`、snapshot projection，并在完整 round 结束后组装 `SessionWritePurpose::ToolRound` batch。
 
@@ -63,8 +63,8 @@ SessionRuntime::start_run
 
 `SessionDriverHost` 的取舍来自代码层面的 grilling：
 
-- 如果直接写 `self.driver.drive_run(request, self, cancel).await`，容易同时借用 `self.driver` 和 `&mut self`，给 Rust borrow checker 制造自借用压力。让 `Driver` 保持无状态或浅状态，并在 run start 时临时创建或 clone 一个 driver，再调用 `driver.drive_run(request, &mut host, cancel)`，可以避开这个形态。
-- 如果直接 `impl DriverHost for SessionRuntime`，host 方法可以访问整个会话对象，长期会让 safe point、工具调用和模型调用逻辑随手耦合到不相关状态。wrapper 明确只暴露本次 run 需要的字段。
+- 如果直接写 `self.driver.drive_run(request, self, cancel).await` 或让 wrapper 长期借用 actor fields，除了自借用压力，还会让 per-session mailbox 在完整 run 期间无法处理 approval/abort/queue command。
+- 如果直接 `impl DriverHost for SessionRuntime`，host 方法可以访问整个会话对象，并迫使 actor owner 与耗时 run future 共享 mutable access。owned wrapper 明确只暴露本次 run 需要的 handles/context。
 - `run_id`、turn resources、event correlation、checkpoint context 等是 run-scoped 数据，不应被迫成为 `SessionRuntime` 的长期字段。`DriveRequest` 只携带 `DriverTurnInput`，turn resources 留在 wrapper 中，wrapper run 结束即 drop，生命周期更准确。
 - `Driver` 单测可以使用 fake host，不需要构造真实 `SessionRuntime`、`Tools`、storage 或 event bus。
 
@@ -83,6 +83,7 @@ SessionRuntime::start_run
 
 - `Tools` 不能被设计成全局服务；不同 session 的 active tools、approval mode、pending approvals 和 grants 默认隔离。
 - `DriverHost::invoke_tool_batch(...)` 的 host 实现必须注入足够的 `ToolRunContext`，否则 `Tools` 不应自行读取外部 runtime state。
+- `ToolBatchInvoker.invoke_batch(...)` 等待 approval 时，`SessionRuntime` actor 必须仍能通过 actor-owned `Tools::decide_approval(...)` 唤醒 broker；内部实现不得持锁等待 decision。
 - 所有外部工具来源必须注册为 `RegisteredTool` 后走同一路径，不能绕过 registry/policy/approval/sandbox。
 - 当前架构术语、模块名和文件规划统一使用 `Tools`，不再把 gateway 作为工具子系统名称。
 

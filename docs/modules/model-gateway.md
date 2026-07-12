@@ -408,7 +408,7 @@ SubmitPrompt / prompt-like intent
   → Driver.drive_run(...)
   → AgentRunStep::CallModel
   → Driver applies NextModelCallPlan
-  → Prompt projects durable history + protected current input + transient context
+  → Driver calls prompt::project_model_call(PromptCallProfile + durable history + protected current input + transient context)
   → ModelInputProjection validation succeeds
   → Driver builds ModelCallRequest { model: ModelSelection, projection fields, ... }
   → DriverHost::call_model
