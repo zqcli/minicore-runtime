@@ -23,9 +23,9 @@
 本轮结论是"可以开工，但有前置"。前置项集中在四类：
 
 1. **原唯一架构缺口已关闭**：BR-047 已通过 ADR 0021 定义 per-session actor、显式 `SessionRuntimeHandle`、run-scoped `RunTask`、私有 `RunLink` 和 owned `SessionDriverHost`，approval/abort/queue command 不再被完整 run 阻塞。
-2. **少量硬矛盾与死表面**：`project_model_call` receiver 矛盾已按 BR-048 关闭；仍待处理的是 `ResumeRun` 作为 MVP 中没有产生源的死命令，以及若干被引用但未定义的 MVP 载荷类型（BR-052）。
+2. **命令契约复核已排期**：`project_model_call` receiver 矛盾已按 BR-048 关闭；BR-052 的 cwd 空洞已由 ADR 0022 关闭，未定义载荷和不可达 `ResumeRun` 已延后到开发前与 BR-051 联合执行的 protocol contract / command reachability review。
 3. **前两轮遗留项**：BR-036 已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭为单实例薄边界容器；round2 过程性观察 #1/#3 的协议裁边仍待处理（BR-058）。
-4. **实现前统一复核的契约与算法空洞**：跨模块 seam 类型的字段、方法集与不变量已按 BR-051 延后到其余 review issue 完成后的开发前 contract closure review；确定性承诺仍缺 canonical 算法（BR-063）。通用 shell 的 OS enforcement 已按 BR-050 移出 MVP，并成为后续启用 `bash` 的硬 gate。
+4. **实现前统一复核的契约与算法空洞**：跨模块 seam 类型及公开 command payload / reachability 已按 BR-051、BR-052 延后到其余 review issue 完成后的开发前 contract closure review；确定性承诺仍缺 canonical 算法（BR-063）。通用 shell 的 OS enforcement 已按 BR-050 移出 MVP，并成为后续启用 `bash` 的硬 gate。
 
 这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-036、BR-047 和 BR-048 的前置设计均已完成，其余多为文档级定稿。
 
@@ -112,26 +112,31 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 风险：这些空洞不改变当前已确定的模块 ownership、调用方向和生命周期边界，但若带入实现阶段，各模块会分别发明字段、错误和行为约束，导致 conformance test 无法围绕同一契约编写；其中 `ToolBatchResult` 会直接阻塞 tool 纵切。
 
-决策结果：先完成当前 review 清单中的其余 issue，再在任何生产代码纵切开始前执行一次全仓 interface contract closure review。该复核按 driver/model、tools、resources、compaction/dynamic-context 分组，不要求现在一次性冻结所有未来字段；每个被引用类型必须明确归属 owner，并得到“定义、删除/合并、或带明确阶段转入后续 issue”三种结果之一。
+决策结果：先完成当前 review 清单中的其余 issue，再在任何生产代码纵切开始前执行一次全仓 interface contract closure review。该复核按 protocol/command、driver/model、tools、resources、compaction/dynamic-context 分组，并与 BR-052 的 command payload / reachability 复核联合执行；不要求现在一次性冻结所有未来字段。每个被引用类型必须明确归属 owner，并得到“定义、删除/合并、或带明确阶段转入后续 issue”三种结果之一。
 
 开发前验收至少覆盖：公开字段和方法集、生产者/消费者、排序与唯一性等数据不变量、cancel/partial-result 语义、typed error taxonomy、持久化/事件投影边界，以及跨模块类型不得泄漏 Rig/provider 私有类型。`ToolBatchResult` 需同时闭合 `invoke_tool_batch` 返回、`ToolRound` 原子 commit、公开事件归约和 Rig tool-result 回填；sink 类型需明确 progress/control lane、backpressure、ack 和关闭行为。
 
-重新打开条件：其余 review issue 全部处理完并准备进入开发；开始规划任何 text-only、resource 或 tool 纵切；或实现中首次需要上述任一未定义类型。关闭前应通过全仓引用清单确认不存在无 owner 的跨模块类型，并为进入首批实现的契约给出可直接编写 conformance test 的定义。
+重新打开条件：其余 review issue 全部处理完并准备进入开发；开始规划任何 protocol、text-only、resource 或 tool 纵切；或实现中首次需要上述任一未定义类型。关闭前应通过全仓引用清单确认不存在无 owner 的跨模块类型，并为进入首批实现的契约给出可直接编写 conformance test 的定义。
 
-### BR-052：MVP 命令表存在缺定义载荷类型、死表面和 cwd 来源空洞
+### BR-052：MVP command payload 与可达性在开发前统一闭合
 
-状态：Open
+状态：Deferred
 
-问题：三个问题集中在 MVP `AgentCommand` 表面：(a) `SubmitPrompt.input: UserInput`、`SetStreamOptions.options: StreamOptions`、`SetThinkingLevel.level: ThinkingLevel` 三个载荷类型出现在 MVP 命令签名里，但全仓无任何定义；(b) `ResumeRun { session_id, resume_id }` 列在 MVP 命令中，但 MVP 没有任何能产生 suspension 的源——`SuspendReason::UserSuspendedAtSafePoint` 没有对应 suspend 命令，能触发 pause 的 `BeforeNextModelCall` hook 是后期能力，因此 `ResumeRun` 是 MVP 表里的死表面；(c) `NewSession { workspace_id }` 没有 cwd 参数，新会话的固定 cwd 如何确定在被引用文档中不可知。
+原始问题：三个问题集中在 MVP `AgentCommand` 表面：(a) `SubmitPrompt.input: UserInput`、`SetStreamOptions.options: StreamOptions`、`SetThinkingLevel.level: ThinkingLevel` 三个载荷类型出现在 MVP 命令签名里，但全仓无任何定义；(b) `ResumeRun { session_id, resume_id }` 列在 MVP 命令中，但 MVP 没有任何能产生 suspension 的源——`SuspendReason::UserSuspendedAtSafePoint` 没有对应 suspend 命令，能触发 pause 的 `BeforeNextModelCall` hook 是后期能力，因此 `ResumeRun` 是 MVP 表里的死表面；(c) `NewSession { workspace_id }` 没有 cwd 参数，新会话的固定 cwd 如何确定在被引用文档中不可知。
 
-证据：
+当前状态与证据：
 
-- `docs/modules/agent-runtime-protocol.md`：MVP `AgentCommand` 列表含 `SubmitPrompt { input: UserInput, ... }`、`SetStreamOptions { options: StreamOptions }`、`SetThinkingLevel { level: ThinkingLevel }`、`ResumeRun { session_id, resume_id }`、`NewSession { workspace_id }`。
-- 全仓无 `UserInput` / `StreamOptions` / `ThinkingLevel` 的类型定义；无 `NewSession` cwd 来源说明。
+- `NewSession` cwd 来源已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭：公开命令为 `NewSession { workspace_id, cwd: Option<PathBuf> }`，`None` 使用 workspace root，显式 cwd canonicalize 后必须位于 root 内。
+- `docs/modules/agent-runtime-protocol.md`：MVP `AgentCommand` 仍含 `SubmitPrompt { input: UserInput, ... }`、`SetStreamOptions { options: StreamOptions }`、`SetThinkingLevel { level: ThinkingLevel }` 和 `ResumeRun { session_id, resume_id }`。
+- 全仓仍无 `UserInput` / `StreamOptions` / `ThinkingLevel` 的字段定义；MVP 仍无 suspension 产生源。
 
-风险：实现第一周就会碰到的实际空洞；`ResumeRun` 留在 MVP 会误导验收范围。
+风险：这些缺口不改变 `AgentCommand -> AgentRuntime -> SessionRuntime` 的调用方向，但若带入开发，adapter、protocol、session state、持久化和 ModelGateway 会分别发明 payload 与生命周期语义；不可达的 `ResumeRun` 还会把 post-MVP suspend/resume 状态机误列为 MVP 验收范围。
 
-待处理方向：定义 `UserInput` / `StreamOptions` / `ThinkingLevel`；把 `ResumeRun` 移入"后续命令"。（cwd 来源已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭；其余仍 Open。）
+决策结果：先完成其余 review issue，再与 BR-051 的全仓 interface contract closure review 联合处理。`UserInput`、`StreamOptions`、`ThinkingLevel` 作为 `agent_runtime_protocol` owned、provider-neutral 的公开 payload 定型；复核必须同时明确 wire 形状、默认值、持久化/恢复边界、future-run 或 safe-point 生效规则、capability clamp 和 provider mapping owner。`UserInput` 的完成条件与 BR-055 的 canonical `ResolvedPromptInput.parts -> Vec<MessageRecord>` 折叠规则联动，确保 durable input 与模型可见输入来自同一结果。
+
+`ResumeRun` 纳入 MVP command reachability review，默认方案是移入“后续命令”，并把对应 phase guard、suspend/resume event 和 Driver resume seam 明确标为 post-MVP reserved；不为了保留该命令而凭空增加 `SuspendRun`。每个保留在 MVP 的公开 command 必须存在至少一条文档内可构造的合法状态路径。
+
+重新打开条件：其余 review issue 全部处理完并准备进入开发；开始实现 protocol/adapter、session settings、prompt input 或 run lifecycle；或首次需要上述任一 payload。关闭前必须完成三类 payload 契约、`ResumeRun` 的保留/移出决定及全协议 MVP command reachability 检查，并确认 ADR 0022 的 cwd 语义在 protocol、SessionManager 和持久化 metadata 中一致。
 
 ## 中风险
 
