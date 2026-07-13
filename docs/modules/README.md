@@ -62,7 +62,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 
 `Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...)` 与 run-only `ToolBatchInvoker.invoke_batch(...)` 进入工具管线，`Driver` 不直接依赖 `Tools`，stable commit、审批 control 和公共事件仍由 `SessionRuntime` actor 拥有。
 
-`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point 选择、`CompactionSummaryMaterial` 构建、摘要消息格式化和压缩结果类型；它不构造 `ModelCallRequest`。压缩流程、模型调用、事件和 session 写入由 `SessionRuntime` 编排，后期压缩 Hook 也由 `SessionRuntime` 在对应安全点接入。
+`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point、provider-neutral preparation、`CompactionMethod` plan、`CompactionSummaryMaterial` 和结果校验；它不构造 `ModelCallRequest`。MVP 使用 portable `SummaryModel`，后期可按当前模型 capability 使用 `ProviderNative`。压缩流程、外部调用、事件和 session 写入由 `SessionRuntime` 编排，后期压缩 Hook 也由 `SessionRuntime` 在对应安全点接入。
 
 `UsageStats` 是 token 消耗和上下文占用统计模块。它区分模型调用消耗、run 汇总、会话累计 stats 和当前 context usage；provider usage 归一化、本地估算、UI view 口径和压缩阈值计算都在这里统一说明。
 
@@ -166,7 +166,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 | `src/tools/builtin/edit.rs` | [Tools](tools.md) | `edit` 工具。 |
 | `src/tools/builtin/apply_patch.rs` | [Tools](tools.md) | `apply-patch` 工具。 |
 | `src/tools/builtin/bash.rs` | [Tools](tools.md) | post-MVP reserved；enforcement gate 满足后才实现/启用 `bash`。 |
-| `src/compaction.rs` | [Compaction](compaction.md) | 压缩准备、cut point、`CompactionSummaryMaterial` 和结果类型；不构造 `ModelCallRequest`。 |
+| `src/compaction.rs` | [Compaction](compaction.md) | 压缩准备、cut point、method plan、`CompactionSummaryMaterial` 和结果校验；不构造 `ModelCallRequest`。 |
 | `src/usage_stats.rs` | [UsageStats](usage-stats.md) | provider usage 归一化、run/session/context usage helper；消费 `ModelCallPurpose`，不定义 `UsagePurpose`。 |
 | `src/driver.rs` | [Driver](driver.md) | `DriverTurnInput`、`DriverHost` seam、drive request/result、Rig step 映射主入口。 |
 | `src/driver/rig.rs` | [Driver](driver.md) | 当前 Rig sans-IO adapter 实现细节。 |

@@ -380,6 +380,8 @@ AgentRunStep::CallModel { prompt, history, turn }
         output_contract: active_output_contract.as_ref(), // MVP Agent run 为 None
     })
   → validate ModelInputProjection
+      → ContextLimitExceeded: do not call ModelGateway; return DriveResult::Failed
+        { DriverError::ContextLimitExceeded { source: PromptProjection, ... } }
   → build_model_call_request(projection, request.turn model/options)
   → host.call_model(request, ModelStreamSink, cancel)
       → provider/model gateway handles credentials, future hooks, payload, fallback
@@ -388,7 +390,7 @@ AgentRunStep::CallModel { prompt, history, turn }
   → AgentRun::model_response(model_turn)
 ```
 
-`Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。`DriverHost::call_model(...)` 必须保留 typed `ModelCallError`：`kind == Cancelled` 归约为 `DriveResult::Aborted`，其他 kind 按 overflow/retry/failure policy 处理，不能先擦成 generic `RuntimeError`。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
+`Driver` 可以构造 `ModelCallRequest`，但不直接持有 provider registry 或 credentials。`DriverHost::call_model(...)` 必须保留 typed `ModelCallError`：`kind == Cancelled` 归约为 `DriveResult::Aborted`，`kind == ContextOverflow` 归约为 `DriverError::ContextLimitExceeded { source: Provider, ... }`，其他 kind 按 retry/failure policy 处理，不能先擦成 generic `RuntimeError`。本地 `PromptError::ContextLimitExceeded` 归约到同一个 recovery class，但保留 `PromptProjection` 来源和估算值；两者都使用 `DriveResult::Failed`，不新增平行 terminal variant。后期如果启用 provider request/payload hooks，也只能在 `host.call_model(...)` 后面的 `ModelGateway` 中执行；driver 只传递必要上下文。
 
 `ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 初始化 run-local `active_prompt_profile = request.turn.prompt.clone()` 和 MVP `active_output_contract: Option<OutputContract> = None`；safe point 若返回 replacement profile，只能整体替换该值。每次 CallModel 时，Driver 把 Rig step 的 prompt/history、`&active_prompt_profile` 和 safe-point context materials 交给 `prompt::project_model_call(...)`，得到已校验的 `ModelInputProjection`；随后从 projection 复制 system prompt/messages/tools/output contract，并从 `DriverTurnInput` 复制 `ModelSelection`、thinking level 和 stream options。Driver 不能直接从 profile 拼请求、读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 Prompt interface 或 request。Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认由 output contract 或模型设置决定。完整请求结构见 [ModelGateway](model-gateway.md)。
 
@@ -462,7 +464,8 @@ pub enum FinishDecision {
 
 ## Error And Abort Semantics
 
-- provider error：返回 `DriveResult::Failed`，由 `SessionRuntime` 决定 auto retry、compaction recovery 和 diagnostics；未完成 assistant draft 不持久化。
+- prompt projection / provider context limit：统一返回 `DriveResult::Failed { DriverError::ContextLimitExceeded { source, ... } }`，由 `SessionRuntime` 执行一次有界 compaction recovery；来源保留为 `PromptProjection` 或 `Provider`，未完成 assistant draft 不持久化。
+- 其他 provider error：返回 `DriveResult::Failed`，由 `SessionRuntime` 决定 auto retry 和 diagnostics；未完成 assistant draft 不持久化。
 - tool error：优先转换为 error tool result 并喂回 Rig，除非是 abort。
 - cancellation：`cancel` 必须传播到 `host.call_model`、`host.invoke_tool_batch`、approval wait 和 stream sink。
 - out-of-protocol Rig error：返回 `DriveResult::Failed`；此前已 committed 的稳定 rounds 保留，当前未提交单元丢弃。

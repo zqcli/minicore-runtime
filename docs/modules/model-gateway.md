@@ -167,10 +167,13 @@ pub struct ModelCapabilities {
     pub supports_thinking: bool,
     pub supports_prompt_cache: bool,
     pub reports_usage: bool,
+    pub compaction: CompactionCapabilities,
 }
 ```
 
 能力用于裁剪 thinking level、过滤 active tools、估算 context usage、决定 compaction / overflow 策略和生成 UI 可用性说明。能力缺失时必须保守处理，不应靠 provider 名称猜测。
+
+`CompactionCapabilities` 描述当前 model/provider 可执行的 provider-neutral method 集，例如 `SummaryModel`、后期 `ProviderNative` 和确定性 reduction fallback，以及 native method 是否接受 custom instructions、结果是否 model-bound、输入上限等。能力由 `ProviderRegistry` / provider adapter 声明，用户配置只表达 `Auto`、native preferred、portable preferred 或 strict preference；`SessionRuntime` 在每次压缩前根据当前 `ModelSelection`、trigger 和 capability 解析 effective plan，不能通过 `gpt*` / `claude*` 名称分支。
 
 ## ProviderRegistry
 
@@ -351,7 +354,7 @@ pub enum ModelCallErrorKind {
 }
 ```
 
-`ModelGateway.call_model(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`SessionRuntime` 根据 `ModelCallErrorKind::ContextOverflow` 触发 overflow compaction recovery；根据 transient 分类决定 retry。它不解析 Rig/provider error 文本。
+`ModelGateway.call_model(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`Driver` 将 `ModelCallErrorKind::ContextOverflow` 映射为 provider-source `DriverError::ContextLimitExceeded`；`SessionRuntime` 根据该 recovery class 触发 overflow compaction recovery，并根据其他 transient 分类决定 retry。任何上层都不解析 Rig/provider error 文本。
 
 ## 调用生命周期
 
@@ -439,19 +442,19 @@ Rig CallTools
 
 工具 schema 与 system prompt 必须来自同一个 `PromptCallProfile` / `ModelInputProjection` 后再进入 `ModelCallRequest`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
 
-### Compaction summary
+### Compaction execution
 
 ```text
 SessionRuntime compaction flow
-  → compaction::build_summary_material(...)
-  → CompactionSummaryMaterial { system_prompt, messages, max_output_tokens }
-  → SessionRuntime selects summary model / thinking / stream policy
-  → ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }
-  → ModelGateway.call_model
+  → compaction::prepare_compaction(...)
+  → query current model CompactionCapabilities
+  → resolve CompactionMethod plan from trigger + user preference + capabilities
+  → SummaryModel: build CompactionSummaryMaterial and call ModelGateway.call_model
+  → post-MVP ProviderNative: provider adapter calls its dedicated compact endpoint
   → CompactionResult
 ```
 
-压缩摘要调用使用同一套 auth、usage、error、cancellation 和 hook redaction 规则，但不进入 `Driver.drive_run()`。
+MVP baseline 使用 `SummaryModel`：调用使用同一套 auth、usage、error、cancellation 和 hook redaction 规则，但不进入 `Driver.drive_run()`。后期 `ProviderNative` 只由声明该 capability 的 adapter 执行；例如 GPT 专用 compact endpoint 可返回需要后续请求原样回传的加密、model-bound context artifact。该 artifact 只持久化一次并由同 provider adapter 注入后续 model request，不进入普通 `MessageRecord`、公共 event 或 UI snapshot；模型/provider 不兼容时必须从仍保留的原始 durable entries 重新压缩。artifact envelope、兼容 key 和 provider payload 的具体字段留待 ProviderNative integration design 定型。
 
 ## Hooks
 

@@ -366,7 +366,7 @@ Hook 不能直接 mutate queue；返回 decision，由 `SessionRuntime` 应用�
 | `CompactionResultProduced` | Observer / Transform | inspect or patch result |
 | `SessionCompact` | Observer | `compaction_finished` 发布后 observe final compaction entry；失败只进 diagnostics |
 
-压缩摘要是 session context projection，不是 system prompt。Hook 不能留下 orphan tool call/result，不能污染 overflow retry context。
+MVP 压缩摘要是 session context projection，不是 system prompt。Hook 不能留下 orphan tool call/result，不能污染 context-limit recovery context；后期 ProviderNative opaque payload 也不能暴露给普通 hook，只有显式 privileged provider-bound hook 才可处理其 redacted metadata。
 
 ### Persistence
 

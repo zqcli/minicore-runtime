@@ -311,11 +311,11 @@ user:   The conversation history before this point was compacted into the follow
 ...     messages after compaction
 ```
 
-`CompactionSummaryMessage` 是模型可见历史消息，不是 system prompt。UI 可以把它渲染成折叠的 `[compaction]` 消息；模型转换时应把它转成 user-role text message。
+`CompactionSummaryMessage` 是 MVP `SummaryModel` method 的模型可见历史消息，不是 system prompt。UI 可以把它渲染成折叠的 `[compaction]` 消息；模型转换时应把它转成 user-role text message。后期 `ProviderNative` model-bound replacement 使用独立 opaque envelope，不伪装成 `MessageRecord`；原始 entries 仍保留，具体 storage shape 在该 method 开工时定型。
 
 如果 `first_kept_entry_id` 在当前 path 上找不到，`build_session_context` 应返回结构化诊断并退化为 `CompactionSummaryMessage + entries after compaction`，不要静默把整段旧历史重新放回上下文。
 
-普通 assistant overflow error 和 partial assistant 只通过当前 host diagnostics / streaming lifecycle 展示，不进入 `SessionWriter`。overflow recovery 从最后 committed context 重建，不能把运行中临时 messages 当成 durable history。
+`DriverError::ContextLimitExceeded` 对应的 transient error 和 partial assistant 只通过当前 host diagnostics / streaming lifecycle 展示，不进入 `SessionWriter`。context-limit recovery 从最后 committed context 重建，不能把运行中临时 messages 当成 durable history。
 
 ## JSONL 持久化
 

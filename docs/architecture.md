@@ -83,7 +83,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
 - 工具注册、活跃工具、审批、授权记忆、路径授权、sandbox enforcement capability、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...) -> ToolBatchInvoker.invoke_batch(...)` 进入工具管线，stable commit、审批 control 和公共事件仍回到 owner actor。MVP 不启用通用 `bash`；请求的子进程限制无法由 OS-native/external backend 强制时必须 fail closed。
-- 上下文压缩由 `SessionRuntime` 编排，`Compaction` 模块提供准备、摘要 prompt 和压缩摘要消息 helper；`Driver` 不执行压缩。
+- 上下文压缩由 `SessionRuntime` 编排；`Compaction` 模块提供 context estimate、cut point、provider-neutral preparation、method plan 和结果校验。MVP 使用 portable `SummaryModel`，后期可按 `ModelGateway` 暴露的模型 capability 使用 `ProviderNative`；`Driver` 只归约 context-limit source，不执行压缩。
 - 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。资源身份、overlay 和 snapshot 归 `ResourceManager`；结构化 intent 展开和最终模型输入组装归 Prompt。
 
 ## 相关决策
