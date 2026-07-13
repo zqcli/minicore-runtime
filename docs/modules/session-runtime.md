@@ -41,7 +41,7 @@ SessionRuntime actor
   └─ RuntimeHookRegistry        // future hook service view
 
 RunTask                         // one per publicly started run
-  ├─ Driver / Rig AgentRun
+  ├─ Driver / Rig AgentRun segment(s)
   ├─ DriverTurnInput / run-local usage / limits
   ├─ owned SessionDriverHost
   └─ CancellationToken / RunLink
@@ -99,7 +99,7 @@ SessionRuntime at target delivery boundary
 规则：
 
 1. idle submission、`FollowUp` 和 `NextTurn` 在目标 future turn 启动时 capture current resources，再创建新 `PromptTurn`。
-2. active `Steer` 在 `before_next_model_call` 使用 `CurrentRun.prompt_turn` 展开，因此继续使用 active turn snapshot。
+2. active `Steer` 在完整 assistant/tool turn 后的 `before_next_model_call`，或 Rig segment 原本将结束时的 `before_run_finish`，使用 `CurrentRun.prompt_turn` 展开，因此继续使用 active turn snapshot。
 3. queue 只保存结构化 `PromptIntent` 的 resource key、args、additional instructions 和附件引用；不保存 raw slash text 或提前展开正文。
 4. `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 查询 selected `SkillResource` / `PromptTemplateResource`，调用 `skills.rs` / `prompt_templates.rs` helper，并返回 `ResolvedPromptInput`。
 5. active snapshot 缺少目标资源时返回 `SkillUnavailableInTurnSnapshot` / `PromptTemplateUnavailableInTurnSnapshot`；不能重新读取文件、使用 current 新 revision 或静默改变 delivery。
@@ -209,7 +209,7 @@ MVP 在 `Turn` 中拒绝模型、thinking、stream options 或 active-tools 切�
 
 ## Driver / Tools Coordination
 
-并发模型以 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md) 为权威。`SessionRuntime` actor 长期存活并持有 session 权威状态；每次公开启动的 run 由短期 `RunTask` 推进；`Driver` 基本无状态，只负责推进 Rig `AgentRun`；`DriverHost` 是 `RunTask` 内让 `Driver` 请求外部能力的 trait seam。
+并发模型以 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md) 为权威。`SessionRuntime` actor 长期存活并持有 session 权威状态；每次公开启动的 run 由短期 `RunTask` 推进；`Driver` 基本无状态，通常推进一个 Rig `AgentRun`，active Steer 时可顺序 rollover segment；`DriverHost` 是 `RunTask` 内让 `Driver` 请求外部能力的 trait seam。
 
 代码形态可以简化为：
 
@@ -267,7 +267,7 @@ self.current_run.as_mut().unwrap().attach_task(task);
 
 `allocate_run_id()` 只在 runtime 已完成 admission、即将建立 `CurrentRun` 并调用 `drive_run()` 时执行；它使用 runtime-global id generator。`run_started` 必须在任何 provider/model/tool/approval wait 之前发布。preflight 不预分配 RunId，也不制造没有 `run_started` 的幽灵 run。
 
-`RunTask` 内部拥有 `Driver` / Rig `AgentRun` 和 mutable `SessionDriverHost`，因此 `DriverHost` trait 的 `&mut self` receiver 可以保留；禁止的是 host 内长期借用 actor-owned mutable state。Rig/driver future 若不是 `Send`，实现可以使用 local task 或 runtime-local executor，但仍必须与 actor mailbox 并发推进。
+`RunTask` 内部拥有 `Driver` 和 mutable `SessionDriverHost`，Driver 私有持有当前 Rig `AgentRun` segment，因此 `DriverHost` trait 的 `&mut self` receiver 可以保留；禁止的是 host 内长期借用 actor-owned mutable state。Rig/driver future 若不是 `Send`，实现可以使用 local task 或 runtime-local executor，但仍必须与 actor mailbox 并发推进。
 
 该 wrapper 实现下面的工具 seam：
 
@@ -308,7 +308,7 @@ AbortRun
 
 Steer / FollowUp / NextTurn
   → actor mutates the corresponding queue and publishes full queue snapshot
-  → only Steer is consumed by a later before_next_model_call request
+  → Steer is consumed after the current assistant/tool turn at before_next_model_call, or at before_run_finish when the Rig segment would otherwise end
 
 Compact while Turn
   → actor stores one typed PendingSessionAction::Compact
@@ -323,7 +323,7 @@ SetModel / SetThinkingLevel / SetStreamOptions / SetActiveTools while Turn (MVP)
   → no state or PromptCallProfile/ToolBatchInvoker changes occur mid-run
 ```
 
-`before_next_model_call` 是 actor transaction：`RunTask` 发送 checkpoint 并等待 reply；actor 消费 steering intent、使用 active `PromptTurn` 展开、commit `UserInput`、发布 invoked/message facts，再把 committed messages 和完整 profile/context plan 返回。commit 失败时回复 failure 并让当前 run 进入 failed terminal path；Driver/Rig 不能看到仅存在内存的 steer。
+`before_next_model_call` 是 actor transaction：它发生在当前 assistant response 及其完整工具批次结束后、下一次模型调用前。`RunTask` 发送 checkpoint 并等待 reply；actor 消费 steering intent、使用 active `PromptTurn` 展开、commit `UserInput`、发布 invoked/message facts，再把 committed messages 和完整 profile/context plan 返回。commit 失败时回复 failure 并让当前 run 进入 failed terminal path；Driver/Rig 不能看到仅存在内存的 steer。若 Rig segment 在无工具的 assistant turn 后原本将结束，`before_run_finish` 以相同 commit 规则最后检查一次 Steer；成功消费时返回 `ContinueWithSteering`，由 Driver 在同一 `RunId` 下 rollover 到新的 Rig segment。
 
 高频 model/tool delta 通过独立 bounded/coalesced `RunProgressSink` 到达 actor；lifecycle/control effect 走优先的 `RunLink` control lane，并携带已提交 progress watermark。`run_finished`、message/tool finished、snapshot barrier 或 actor shutdown 前必须先归约到对应 watermark，不能出现 finished-before-delta 或 `last_event_sequence` 已覆盖事件而 snapshot projection 尚未更新。
 
@@ -408,7 +408,7 @@ overflow recovery 流程：
 
 目标队列能力使用 MiniCore 自己的 `PromptDelivery`、`QueueKind` 和 `QueueMode` 表达：
 
-- steering queue：`PromptDelivery::Steer` 的模型可见输入；在 active run 的最早 `before_next_model_call` 安全点注入。session idle 时直接启动 run；compaction、suspended 等暂时无安全点的状态保留队列，不能静默改写成 follow-up。
+- steering queue：`PromptDelivery::Steer` 的模型可见输入；在当前 assistant response 及其完整工具批次结束后的最早 `before_next_model_call` 安全点注入；若 Rig segment 原本将结束，则在 `before_run_finish` 消费并 rollover。session idle 时直接启动 run；compaction、suspended 等暂时无安全点的状态保留队列，不能静默改写成 follow-up。
 - follow-up queue：`PromptDelivery::FollowUp` 的模型可见输入；不修改 active run，在当前 work chain、必要 retry/recovery 和 pending session action 完成后启动后续运行。session idle 时直接启动。
 - `nextTurnQueue`：无论当前是否运行，都排到下一次用户 turn 前，与下一次显式 prompt 一起进入上下文。
 - `PendingSessionActions`：`CommandRunPolicy::QueueAfterRun` 产生的不进入模型上下文的结构化 post-run action。当前只支持一个 pending manual compact；它在当前 work chain 稳定结束后、queued steering continuation / follow-up 之前执行。
@@ -440,7 +440,7 @@ terminal handling（required stable commit if any）+ terminal run facts
   → session_settled（next-turn queue 可以保持非空）
 ```
 
-Rig 的 `AgentRun` 是否提供运行中注入点必须通过 Driver seam 验证；未实现 `before_next_model_call` 注入能力时，runtime 必须把 `Steer` 标记为不可用或返回 `SteerUnavailable`，不能静默降级为 follow-up。完整实现由 `Driver` 在 `before_next_model_call` 安全点让 `SessionRuntime` 检查 steering 队列。
+Steer 不要求在 provider streaming、模型请求或工具执行中途修改 Rig。完整实现由 `Driver` 在两个协议安全点让 `SessionRuntime` 检查 steering queue：完整 assistant/tool turn 后的 `before_next_model_call`，以及 Rig segment 原本将结束时的 `before_run_finish`。Rig 没有公开 history append 时，Driver 使用已 committed history 和 steer 创建同一 `RunId` 下的新 Rig segment；该 rollover 不能重置 run-level usage、limits、cancellation 或事件关联，也不能静默降级为 follow-up。
 
 ## Next Model Call Plan
 
@@ -478,8 +478,8 @@ resolved command
 3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
 4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布外层 `Event.run_id = None` 的 `skill_invoked` / `prompt_template_invoked`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
 5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 owned `SessionDriverHost` 与 `DriveRequest`，启动短期 `RunTask` 后立即回到 actor mailbox loop。`RunTask` 内部调用 `Driver.drive_run()`。
-6. 每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。
-7. `Driver` 应用已 committed persistent messages 和完整 replacement profile 后，调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
+6. 当前 assistant response 及其完整工具批次结束后、每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。Rig segment 原本将结束时，`before_run_finish` 再执行一次 steering check。
+7. `Driver` 对已 committed persistent messages 执行 Rig segment rollover，应用完整 replacement profile 后调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。同一公开 run 的多个 Rig segment 沿用原 `RunId` 和外层预算。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
 8. 工具调用通过 run-only `ToolBatchInvoker` 治理和执行；invoker 返回 normalized candidate 后，`RunTask` 通过 `RunLink` 提交完整 tool-round candidate。`SessionRuntime` actor 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`，把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，actor 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`，然后把 actor-finalized `ToolBatchResult` 回复 host；Driver 才回填 Rig 并允许下一模型调用。
 9. `RunTask` 返回正常 final assistant draft 后，通过 `RunLink` 提交 terminal effect；`SessionRuntime` actor 将消息组装为 `AssistantFinal` batch。commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 

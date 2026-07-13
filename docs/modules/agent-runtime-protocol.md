@@ -227,7 +227,7 @@ pub enum QueueMode {
 }
 ```
 
-- `Steer`：session idle 时立即启动 run；有 active run 时进入 steering queue，在最早可用的 `before_next_model_call` 安全点注入。若当前 work 暂时没有模型调用安全点，例如 compaction 或 suspended run，则保持排队，直到恢复后的最早模型调用或 post-work continuation。
+- `Steer`：session idle 时立即启动 run；有 active run 时进入 steering queue，在当前 assistant response 及其完整工具批次结束后、下一次 LLM 调用前注入。若当前 Rig segment 原本将结束，则在 `before_run_finish` 消费并在同一公开 `RunId` 下继续；compaction 或 suspended run 暂时没有安全点时保持排队，直到恢复后的最早模型调用或 post-work continuation。
 - `FollowUp`：不修改 active run；当前 work chain、必要 retry/recovery 和 pending session action 完成后，作为后续用户输入启动新 run。session idle 时可立即启动。
 - `NextTurn`：不自动启动 run；与下一次显式提交的用户 prompt 一起进入上下文。
 

@@ -38,7 +38,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
        │
  LoadedSessionRuntimes
        │
- SessionRuntimeHandle ──▶ SessionRuntime actor ──▶ run-scoped RunTask ──▶ Driver ──▶ Rig AgentRun
+ SessionRuntimeHandle ──▶ SessionRuntime actor ──▶ run-scoped RunTask ──▶ Driver ──▶ Rig AgentRun segment(s)
                                │
                                ├─ fixed workspace cwd; run captures TurnResourceSnapshot into TurnState
                                ├─ Command ───────▶ CommandManager materialize / parse / resolve
@@ -77,7 +77,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面；其 interface 分为 `dispatch`、`query`、`subscribe` 和 `snapshot`，mutation/异步工作、只读数据、运行变化和恢复读模型不能混用通道。
 - `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，由 factory 为每个 loaded session 启动独立 actor。所有 session mutation 通过 `SessionWriter.commit(SessionWriteBatch)`，只提交协议完整的稳定单元；多个 `SessionRuntime` actor 可以同时推进 work，每个 runtime 固定自己的 workspace cwd，并在每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
 - `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
-- `SessionRuntime` 是单个会话的产品级编排层、per-session actor 和 Prompt Pull Master。它持续处理 command 与 run control effect，拥有 phase、queues、`CurrentRun` projection、commit 和公共事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` / Rig `AgentRun`，只接收包含原子 `PromptCallProfile` 的窄 `DriverTurnInput`，并通过私有 `RunLink` 回到 owner actor。
+- `SessionRuntime` 是单个会话的产品级编排层、per-session actor 和 Prompt Pull Master。它持续处理 command 与 run control effect，拥有 phase、queues、`CurrentRun` projection、commit 和公共事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 Rig segment。Driver 只接收包含原子 `PromptCallProfile` 的窄 `DriverTurnInput`，并通过私有 `RunLink` 回到 owner actor。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
 - `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。

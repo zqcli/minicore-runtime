@@ -404,7 +404,7 @@ pub struct NextModelCallPlan {
 }
 ```
 
-同一安全点可以同时消费 steer、更新模型/工具 profile、追加 transient context 并继续运行。`persistent_messages` 必须先进入 Rig/run history；`current_call_context` 只参与本次 `ModelInputProjection`。
+同一安全点可以同时消费 steer、更新模型/工具 profile、追加 transient context 并继续运行。该安全点发生在当前 assistant response 及其完整工具批次结束后、下一次 LLM 调用前；`persistent_messages` 必须先进入 durable run history，Driver 可通过同一 `RunId` 下的 Rig segment rollover 承载它们。`current_call_context` 只参与本次 `ModelInputProjection`。
 
 ## 与 Compaction 的关系
 

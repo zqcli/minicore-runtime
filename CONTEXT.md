@@ -321,11 +321,11 @@ _避免_：QueuedMessage、PromptIntent、durable user message、runtime event p
 _避免_：响应、请求、chat completion
 
 **RunTask**：
-`SessionRuntime` 为一次已经公开启动的 Agent 运行创建的短期执行任务，拥有 `Driver`、Rig `AgentRun`、run-local usage/limits 和 cancellation；它不拥有 session phase、queues、writer、公共事件或 terminal arbitration。
+`SessionRuntime` 为一次已经公开启动的 Agent 运行创建的短期执行任务，拥有 `Driver`、run-local usage/limits 和 cancellation；Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序推进多个 Rig segment。RunTask 不拥有 session phase、queues、writer、公共事件或 terminal arbitration。
 _避免_：SessionRuntime actor、长期后台 session、RunId、DriverHost
 
 **运行标识（`RunId`）**：
-一次已经公开启动的 `Driver::drive_run()` / Agent loop 执行实例的 runtime-host-global opaque id。它在 runtime 准备创建 `CurrentRun`、调用 Driver 并发布 `run_started` 时分配，同一 run 内的模型调用、工具轮次、审批、suspend/resume 和 terminal event 共享该 id；新的 retry/continuation `drive_run()` 使用新 id。`RunId` 不是 prompt admission、`CommandId`、user turn、session revision 或跨进程 resume token，不能用于取消尚未公开启动的 work。
+一次已经公开启动的 `Driver::drive_run()` / Agent loop 执行实例的 runtime-host-global opaque id。它在 runtime 准备创建 `CurrentRun`、调用 Driver 并发布 `run_started` 时分配，同一 run 内的模型调用、工具轮次、审批、suspend/resume、Steer 触发的 Rig segment rollover 和 terminal event 共享该 id；新的 retry、FollowUp 或其他 post-run continuation `drive_run()` 使用新 id。`RunId` 不绑定单个 Rig `AgentRun` 对象，也不是 prompt admission、`CommandId`、user turn、session revision 或跨进程 resume token，不能用于取消尚未公开启动的 work。
 _避免_：命令 id、模型调用 id、工具调用 id、会话 entry id、持久化 revision
 
 **待执行会话动作（`PendingSessionAction`）**：
@@ -349,7 +349,7 @@ _避免_：Driver 输入、ResourceManager current view、公开协议快照
 _避免_：TurnState、ToolRunContext、ModelCallRequest、SessionRuntime 状态
 
 **Driver（Rig 适配器）**：
-会话运行时中的 Rig 适配器，负责推进 Rig `AgentRun`，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。
+会话运行时中的 Rig 适配器，负责推进一个或多个顺序 Rig `AgentRun` segment，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理。Steer rollover 是 Driver 私有实现，不改变公开 `RunId`。
 _避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行、TurnState owner
 
 **DriverHost**：
@@ -446,7 +446,7 @@ _避免_：provider HTTP request、Rig provider request、会话消息、Summary
 _避免_：SummaryModelRequest、ModelCallRequest、压缩结果、系统提示词状态
 
 **驱动安全点**：
-`Driver` 在 Rig 状态机推进到某些边界时交还控制权给会话运行时的点，例如 `before_next_model_call` 和 `before_run_finish`。会话运行时可在此处理队列、patch turn state、暂停、重试或结束。
+`Driver` 在 Rig 状态机推进到某些边界时交还控制权给会话运行时的点。`before_next_model_call` 位于当前 assistant response 及其完整工具批次结束后、下一次 LLM 调用前；`before_run_finish` 位于 Rig segment 原本将结束时。会话运行时可在此处理 Steer、patch turn state、暂停、重试或结束；FollowUp 在公开 run 结束后的 post-run arbitration 中启动新 run。
 _避免_：prepare next turn、UI 回调、工具 Hook
 
 **运行时命令**：
