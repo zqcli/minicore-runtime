@@ -45,7 +45,7 @@ Hook 影响最终会发生什么；event 告诉下游最终发生了什么。下
 - `context`：每次模型调用前可替换 AgentMessage context。
 - `before_provider_request` / `after_provider_response`：模型请求前后 hook；raw provider payload patch 必须 privileged 且脱敏，MVP 可以不开放。
 - `tool_call` / `tool_result`：工具执行前阻止或改写结果。
-- resource discovery 不作为 hook；资源更新统一走 `ResourceManager` ensure/reload/recompose pipeline。
+- resource discovery 不作为 hook；runtime 资源在 `OpenWorkspace` 初始化一次，cwd 资源更新统一走 `ResourceManager.ensure_cwd_snapshot(...)` / `reload_cwd(...)`。
 - `session_before_switch` / `session_before_fork` / `session_before_compact` / `session_before_tree`：会话级 gate 和 provider hook。
 - `message_end`、`agent_start/end`、`turn_start/end`、`tool_execution_start/update/end`：agent lifecycle observer / transform。
 
@@ -245,7 +245,7 @@ pub enum BeforeCompactDecision {
 
 ### 资源
 
-当前设计不定义资源 discovery / reload hook，也不预留资源回调接口形状。资源来源由 [ResourceManager](resource-manager.md) 的内置 resolver、trust gate 和 overlay policy 管理；显式 reload / startup ensure 进入 `ResourceManager` reload/recompose pipeline。未来如果确实需要 extension/package 资源声明，应另起 ADR 重新定义安全边界。
+当前设计不定义资源 discovery / reload hook，也不预留资源回调接口形状。资源来源由 [ResourceManager](resource-manager.md) 的内置 resolver、trust gate 和 overlay policy 管理；runtime 在 `OpenWorkspace` 初始化一次，显式 cwd reload / session-open ensure 进入 `ResourceManager` 的 cwd pipeline。未来如果确实需要 extension/package 资源声明，应另起 ADR 重新定义安全边界。
 
 ### Commands And Output
 

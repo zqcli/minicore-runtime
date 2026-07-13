@@ -32,7 +32,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
  SessionManager  ResourceManager  CommandManager Future RuntimeHooks  ModelGateway
        │              │                                           │
        │              ├── ResourceSnapshotStore                   └──▶ Rig providers
-       │              │     ├── current runtime -> RuntimeResourceSnapshot
+       │              │     ├── runtime -> RuntimeResourceSnapshot (OpenWorkspace 初始化一次)
        │              │     └── (workspace_id, cwd) -> CwdResourceSnapshot
        │              └── ResourceOverlayPolicy
        │
@@ -40,7 +40,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
        │
  SessionRuntimeHandle ──▶ SessionRuntime actor ──▶ run-scoped RunTask ──▶ Driver ──▶ Rig AgentRun segment(s)
                                │
-                               ├─ fixed workspace cwd; run captures TurnResourceSnapshot into TurnState
+                               ├─ fixed workspace cwd; user turn / work chain captures TurnResourceSnapshot into TurnState
                                ├─ Command ───────▶ CommandManager materialize / parse / resolve
                                ├─ Tools ─────────▶ tool registry / policy / approval / executors
                                └─ PromptTurn ────▶ captured PromptResourceView + atomic PromptCallProfile
@@ -75,14 +75,14 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - 下游 CLI/TUI/GUI 不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - `AgentRuntime` 是下游 CLI/TUI/GUI 共用的稳定 runtime 门面；其 interface 分为 `dispatch`、`query`、`subscribe` 和 `snapshot`，mutation/异步工作、只读数据、运行变化和恢复读模型不能混用通道。
-- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，由 factory 为每个 loaded session 启动独立 actor。所有 session mutation 通过 `SessionWriter.commit(SessionWriteBatch)`，只提交协议完整的稳定单元；多个 `SessionRuntime` actor 可以同时推进 work，每个 runtime 固定自己的 workspace cwd，并在每次 run 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`。
-- `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 被 `TurnResourceSnapshot` pin 住，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view。
+- `SessionManager` 协调持久化会话和已加载会话运行时；`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，由 factory 为每个 loaded session 启动独立 actor。所有 session mutation 通过 `SessionWriter.commit(SessionWriteBatch)`，只提交协议完整的稳定单元；多个 `SessionRuntime` actor 可以同时推进 work，每个 runtime 固定自己的 workspace cwd，并在新的显式 user turn / work chain 捕获该 cwd 当前 `TurnResourceSnapshot` 进 `TurnState`；automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用 captured snapshot。
+- `ResourceManager` 维护级联资源快照：`RuntimeResourceSnapshot` 在 `OpenWorkspace` 初始化一次并被 `CwdResourceSnapshot` pin 住，`CwdResourceSnapshot` 是 store current snapshot 并被 `TurnResourceSnapshot` pin 住，`TurnResourceSnapshot` 不进入 store，MVP 只预留 `StepResourceSnapshot` 类型。cwd snapshot 通过内置 `ResourceOverlayPolicy` 把 cwd/project 资源覆盖到 runtime/global 资源之上，产出该 cwd 下的 resolved view；cwd reload 的 `replace_cwd` 是唯一资源 current-pointer 替换线性化点。
 - `SessionRuntime` 是单个会话的产品级编排层、per-session actor 和 Prompt Pull Master。它持续处理 command 与 run control effect，拥有 phase、queues、`CurrentRun` projection、commit 和公共事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 Rig segment。Driver 只接收包含原子 `PromptCallProfile` 的窄 `DriverTurnInput`，并通过私有 `RunLink` 回到 owner actor。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager` 无状态共享；每个 `SessionRuntime` 通过 session-scoped `Command` 提供当前 session 的 command view。
 - `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
-- 工具注册、活跃工具、审批、授权记忆、路径授权、sandbox enforcement capability、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...) -> ToolBatchInvoker.invoke_batch(...)` 进入工具管线，stable commit、审批 control 和公共事件仍回到 owner actor。MVP 不启用通用 `bash`；请求的子进程限制无法由 OS-native/external backend 强制时必须 fail closed。
+- 工具注册、活跃工具、审批、授权记忆、路径授权、sandbox enforcement capability、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；新的 work chain 通过 `capture_profile_baseline()` 原子绑定模型可见 `ToolPromptView` 与 run-only `ToolBatchInvoker`，active `RunTask` 再通过 `DriverHost::invoke_tool_batch(...) -> ToolBatchInvoker.invoke_batch(...)` 进入工具管线。stable commit、审批 control 和公共事件仍回到 owner actor。MVP 不启用通用 `bash`；请求的子进程限制无法由 OS-native/external backend 强制时必须 fail closed。
 - 上下文压缩由 `SessionRuntime` 编排；`Compaction` 模块提供 context estimate、cut point、provider-neutral preparation、method plan 和结果校验。MVP 使用 portable `SummaryModel`，后期可按 `ModelGateway` 暴露的模型 capability 使用 `ProviderNative`；`Driver` 只归约 context-limit source，不执行压缩。
 - 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。资源身份、overlay 和 snapshot 归 `ResourceManager`；结构化 intent 展开和最终模型输入组装归 Prompt。
 

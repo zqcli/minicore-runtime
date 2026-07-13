@@ -44,15 +44,15 @@
 
 - 保留 `WorkspaceServices`，作为 event bus、session manager、command surface、hooks、diagnostics、`ResourceManager`、settings/provider/auth/model gateway 的共享容器。
 - 删除 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning 作为 MVP 核心概念。
-- 将 `ResourceManager` 定义为运行时内部资源子系统，持有 `ResourceSnapshotStore`、内置 resolver、trust gate、diagnostics、reload/recompose pipeline 和 `ResourceOverlayPolicy`。
-- 资源快照分层为 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot`；MVP 实现前三层，`StepResourceSnapshot` 只定义类型。
+- 将 `ResourceManager` 定义为运行时内部资源子系统，持有 `ResourceSnapshotStore`、内置 resolver、trust gate、diagnostics、cwd reload pipeline 和 `ResourceOverlayPolicy`；runtime 资源与 `AgentRuntime` 生命周期绑定，`OpenWorkspace` 初始化一次。
+- 资源快照分层为 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot`；Runtime/Cwd 是 store current snapshots，Turn/Step 不进入 store；MVP 实现前三层，`StepResourceSnapshot` 只定义类型。
 - `CwdResourceSnapshot` 持有构建时的 `Arc<RuntimeResourceSnapshot>`，并包含 cwd-local layer 与 overlay 后的 `resolved` effective view。cwd/project 资源可按 `ResourceKey { kind, namespace?, name }` 覆盖 runtime/global 同 key 资源。
 - 每个 `SessionRuntime` 固定一个 workspace cwd；多个 session 可以共享同一个 cwd 的 current `CwdResourceSnapshot`。
-- 每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获 `TurnResourceSnapshot`，并用它构建 `TurnState`。
-- `ReloadResources { workspace_id, cwd }` 为目标 cwd 构建新的 `CwdResourceSnapshot`；成功后原子替换 current pointer；running run 继续使用旧 `TurnState` / 旧 `TurnResourceSnapshot`，下一轮 user turn 使用新 snapshot。
+- 新的显式 user turn / work chain 通过 `ResourceManager.capture_turn(...)` 捕获 `TurnResourceSnapshot`，并用它构建 `TurnState`；automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用该 snapshot。
+- `ReloadResources { workspace_id, cwd }` 为目标 cwd 构建新的 `CwdResourceSnapshot`；成功后通过 `replace_cwd` 原子替换 current pointer；running run 继续使用旧 `TurnState` / 旧 `TurnResourceSnapshot`，下一轮新的显式 user turn 使用新 snapshot。
 - provider settings、auth、custom provider 和 `ModelGateway` 都是 user-global/runtime-global；项目级 settings 不允许声明 custom provider 或覆盖 auth/provider endpoint。
-- 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 reload / startup ensure。
-- `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中取得 `PromptResourceView`，再汇合 tool/model/agent/environment/policy views 调用 `prompt::begin_turn(...)`。
+- 当前设计暂不考虑热更新、文件监听器或资源发现回调接口；资源更新走显式 cwd reload / startup ensure。全局资源变化通过重建 `AgentRuntime` 生效。
+- `ResourceManager` 和 `Prompt` 不直接互调；`SessionRuntime` 在 user turn 启动时捕获 `TurnResourceSnapshot`，从中取得 `PromptResourceView`，再与 `ToolPromptView` 调用 `prompt::assemble_turn(PromptTurnSpec { resources, tools })`。
 - `Prompt` 是无状态组装深模块，不读取文件、不读 `ResourceSnapshotStore`、不触发 reload；`ResourceManager` 不构造最终 prompt，只发布 captured resource view。Prompt 生成 immutable `PromptTurn`，并负责 intent 展开与 final model-input projection。
 - Command 体系收敛为共享无状态 `CommandManager` + `SessionRuntime` 持有的 session-scoped `Command` facade；`CommandSurface` 只保留为领域总称。
 - command manifest 使用多层 JSON，运行时临时 materialize 成 flat catalog；动态命令节点通过 provider + `nodeTemplate` 生成，skill、prompt template、model thinking levels、tools 等都可作为 dynamic command nodes。
@@ -79,7 +79,7 @@ AgentRuntime
 
 LoadedSessionRuntimes
   ├─ Handle A -> SessionRuntime actor A { cwd = <root> } -> RunTask captures CwdSnapshot(<root>, rev-a)
-  ├─ Handle B -> SessionRuntime actor B { cwd = <root> } -> next RunTask captures current CwdSnapshot(<root>)
+  ├─ Handle B -> SessionRuntime actor B { cwd = <root> } -> next new work chain captures current CwdSnapshot(<root>)
   └─ Handle C -> SessionRuntime actor C { cwd = <root>/api } -> RunTask captures CwdSnapshot(<root>/api, rev-b)
 ```
 
@@ -143,7 +143,7 @@ LoadedSessionRuntimes
 
 这个方案解决的是：多个 `SessionRuntime` 虽然天然隔离 messages / phase / queue / current_run，但不天然隔离 resources / settings / auth / trust / tool cwd / sandbox。`CwdScopedServices` 用于把这些 cwd-sensitive 依赖固定到 session/run。
 
-最新修订：在当前产品约束下，resources 是唯一需要 cwd 维度快照化的运行输入；settings/auth/provider/model gateway 均为 user-global/runtime-global。`CwdScopedServices` 过重，已被 `ResourceManager` + 级联 immutable snapshots + run-time `TurnResourceSnapshot` capture 取代。多 session 隔离重点变为：session state 独立、session cwd 固定、`CwdResourceSnapshot.resolved` 提供 cwd effective resource view、run 启动时捕获 `TurnResourceSnapshot`、reload 只影响 future turn、工具副作用另由 tool policy/sandbox/mutation strategy 处理。
+最新修订：在当前产品约束下，resources 是唯一需要 cwd 维度快照化的运行输入；settings/auth/provider/model gateway 均为 user-global/runtime-global。`CwdScopedServices` 过重，已被 `ResourceManager` + 级联 immutable snapshots + user-turn/work-chain `TurnResourceSnapshot` capture 取代。多 session 隔离重点变为：session state 独立、session cwd 固定、`CwdResourceSnapshot.resolved` 提供 cwd effective resource view、新的显式 user turn / work chain 启动时捕获 `TurnResourceSnapshot`、reload 只影响 future work chain、工具副作用另由 tool policy/sandbox/mutation strategy 处理。
 
 ## 当前新讨论方向
 
@@ -709,8 +709,8 @@ slash/catalog command 自身使用正交的 `CommandRunPolicy { Immediate, IdleO
 
 当前结论：
 
-- `SessionRuntime` 是 Pull Master：在目标 delivery boundary 捕获 `TurnResourceSnapshot`，汇合 tool/model/agent/environment/policy views，调用 `prompt::begin_turn(...)` 创建 immutable `PromptTurn`。
-- `PromptResourceView` 是 captured snapshot 的只读窄投影，复用 ResourceManager canonical `ResourceKey`、source info、content hash 和 revision；Prompt 不建立第二套 registry、overlay 或 reload 逻辑。
+- `SessionRuntime` 是 Pull Master：在新的显式 user turn / work chain boundary 捕获 `TurnResourceSnapshot`，取得 `PromptResourceView` 与独立 `ToolPromptView`，调用 `prompt::assemble_turn(PromptTurnSpec { resources, tools })` 创建 immutable `PromptTurn`。
+- `PromptResourceView` 是所有非工具稳定 Prompt 输入的唯一 seam，复用 ResourceManager canonical `ResourceKey`、source info、content hash、cwd revision 和 fingerprint；Prompt 不建立第二套 registry、overlay 或 reload 逻辑。
 - `PromptTurn.resolve_intent()` 是 skill/template 正文进入 user message 的唯一组装入口。active Steer 使用 active `PromptTurn`；FollowUp、NextTurn 和 idle submission 使用 future `PromptTurn`。
 - system prompt 与 active tool schemas 绑定为原子 `PromptCallProfile`，跨 Driver seam 只能整体替换；`DriverTurnInput` 不再暴露两个独立 patch 字段。
 - 每次模型调用区分 durable history、protected current input、CurrentRun context 和 CurrentCall context；最终统一生成 `ModelInputProjection`，并校验 tool call/result、required contribution、dedup、budget、persistence 和 fingerprint。
@@ -770,17 +770,20 @@ BR-034 删除 core 的 focused/current/active session selector。`FocusSession`�
   - pre-run threshold gate 只在 bounded admission 内同步判断；命中后先切换 `Turn → Compaction` 再执行 summary model / future ProviderNative 外部工作，压缩完成后才首次分配 Agent `RunId`。
   - MVP compaction method 仍为 portable `SummaryModel`。后期 `ProviderNative` 可调用 GPT 类专用 compact endpoint；model-bound 加密 artifact 只持久化一次，由同 provider adapter 注入后续请求，不进入普通 message/event/snapshot，具体 envelope/compatibility fields 延后到 ProviderNative integration design。
 
-### BR-054 当前分析暂停点
+### BR-054 / ResourceManager 最终决策
 
-BR-054 尚未修改任何权威设计文档，状态仍为 `Open`。当前分析确认 `TurnPromptInputs` 通常由四类材料组成：ResourceManager 捕获的静态资源、session-scoped tool/model/profile/policy 投影、turn 环境事实，以及每次 CallModel late-bind 的 durable history/current input/dynamic context。最后一类继续属于 `ModelCallProjectionInput`，不应提前塞入 turn prompt baseline。
+本段保留上方历史分析的上下文，但旧暂停点已 superseded。BR-054、BR-057 和 BR-062 已在权威文档中关闭，最终决策如下：
 
-用户提出“既然 ResourceManager 已有 runtime/cwd/turn/step snapshots，是否可由它统一提供全部 Prompt 材料”。当前推荐论证如下，但尚未形成最终决策：
+- runtime 与 UI/`AgentRuntime` 生命周期绑定。`RuntimeResourceSnapshot` 在 `OpenWorkspace` 初始化一次；MVP 无 runtime reload、runtime current-pointer 替换、runtime-version drift 或 lazy cwd recompose。全局资源变化通过重建 `AgentRuntime` 生效。
+- cwd reload 保留；`ResourceSnapshotStore::replace_cwd(...)` 是唯一资源 current-pointer 替换线性化点。`capture_turn` 与 `replace_cwd` 按读取 current pointer 的时点线性化。
+- 保留 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot`。Runtime/Cwd 是 store current snapshots；Turn/Step 不进入 store。
+- Resource 定义扩展为：对模型运行有影响、在所属 scope 内稳定、可冻结为 immutable projection 的输入。原始 owner/mutation owner 不变；ResourceManager 只冻结 owner-produced prompt-safe projections，绝不反向读取 `ModelState`、`Tools`、`AuthStore`、`SettingsStore` 或 provider owner handles。
+- `TurnResourceSnapshot` 直接字段为 `session_id`、`user_turn_id`（不是 `RunId`）、`Arc<CwdResourceSnapshot>`、behavior、model、environment、policy、fingerprint；不再引入额外 turn view wrapper 或 turn prompt snapshot 类型。
+- Runtime scope 放 product/user-global defaults；Cwd scope 放 project/cwd/trust/catalog overlay；Turn scope 放 behavior/model/environment/policy。Environment MVP 只含 workspace root、fixed cwd、platform、date/time/timezone、interaction capabilities，不含 VCS I/O。Step MVP reserved。
+- `PromptResourceView` 是所有非工具稳定 Prompt 输入的唯一 seam，暴露 materials/behavior/model/environment/policy/skill/template/fingerprint；`ToolPromptView` 保持 Tools 独立。Prompt 入口为 `prompt::assemble_turn(PromptTurnSpec { resources, tools }) -> PromptTurn`。
+- 新显式 user turn / work chain capture 一次 `TurnResourceSnapshot`。automatic retry、overflow compaction recovery、active Steer、同 `RunId` Rig segment rollover复用；FollowUp、NextTurn、new idle prompt 新 capture。Resource reload 只影响新的显式 user turn / work chain。
+- MVP `Turn` 中继续拒绝 model/thinking/stream/active-tools/profile mutation。后期 safe-point mutation 必须通过 `StepResourceSnapshot` 或明确 step override，并原子替换 `PromptCallProfile` 与 future `ToolBatchInvoker`，fingerprint 一致。
+- `capture_turn` 在稳态只读 current cwd pointer 并冻结传入 typed projections；`OpenWorkspace/OpenSession/NewSession` 保证 ensure，不再存在 turn capture 兜底读盘或 lazy recomposition。
+- Runtime 不使用递增 revision；`CwdResourceRevision` 用于 reload；`TurnResourceFingerprint` 组合 cwd revision + behavior/model/environment/policy versions。具体 canonical 算法仍归 BR-063。
 
-- 不建议把 selected model、active tools、agent profile、effective policy 和 environment 全部放进现有 `ResourceManager` snapshots。`CwdResourceSnapshot` 可被同 cwd 多 session 共享，而这些状态是 session-specific；其 mutation 也不应复用 `replace_runtime` / `replace_cwd` 的资源发布线性化点。
-- 不建议让 Prompt 在组装时分别读取各 owner 的 current state，否则同一 turn 可能混用不同时间点的 resource/tool/model/policy，破坏 immutable turn assembly。
-- 当前首选方案是由 `SessionRuntime` 在 turn boundary 组装一个新的 turn-scoped `TurnPromptSnapshot`。它以 `Arc<TurnResourceSnapshot>` 为资源父级，再冻结 `PromptBaselineView`、`ToolPromptView`、`ModelPromptView` 和精简 `EnvironmentPromptView`；`TurnPromptInputs` 只是该 snapshot 的只读窄投影。
-- `ResourceManager` 继续拥有资源定义、overlay、revision 和 current snapshot；`SessionRuntime` 拥有跨 owner capture/assembly；Prompt 只做确定性解释和 projection。多 session 同 cwd 只共享资源父链，不共享 `TurnPromptSnapshot`。
-- resource reload 只影响 future turn。后期 safe-point 合法切换 tools/model/profile 时，复用原 `TurnResourceSnapshot`，重新创建 prompt snapshot / `PromptTurn` 并原子替换 future `PromptCallProfile`；不制造新的 `ResourceRevision`。
-- MVP 建议从 `EnvironmentPromptView` 删除 VCS I/O，只保留 workspace root、fixed cwd、platform 和可测试 clock 产生的日期。后期 VCS 信息可使用独立 context provider 或后台缓存 snapshot 注入，Prompt 和 ResourceManager 都不直接执行 Git。
-
-下一步先由用户确认 BR-054 最终 snapshot seam：保留现有多 owner typed views，还是收敛为 `TurnPromptSnapshot` + `TurnPromptInputs` projection。确认后再同步 `prompt.md`、`session-runtime.md`、`resource-manager.md`、ADR 0017、架构总览和 BR-054 状态。其余 Open issues 继续按编号处理；全部 review issues 完成后重新打开 BR-051/BR-052，执行开发前全仓类型和 command contract review。
+旧分析中关于 `TurnPromptSnapshot` / 多 owner prompt views / runtime reload 的建议均为历史记录，不代表现行设计。
