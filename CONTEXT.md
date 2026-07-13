@@ -61,32 +61,32 @@ _避免_：客户端当前选择的可变大包、每 session 服务容器、UI 
 _避免_：单会话运行态、selected-session 服务、UI 服务、有状态 CommandSurfaceService
 
 **ResourceManager**：
-运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、ensure/reload/recompose 和 turn capture。初始化由 `OpenWorkspace -> ensure_runtime_snapshot`、`OpenSession/NewSession -> ensure_cwd_snapshot`、`start_user_turn -> capture_turn` 三道调用保证；它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
-_避免_：UI 资源 store、系统提示词构建器、会话运行时、实时读文件入口
+运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、cwd reload 和 turn capture。runtime 与 UI/`AgentRuntime` 生命周期绑定，`OpenWorkspace` 初始化一次 `RuntimeResourceSnapshot`；MVP 没有 runtime reload。`OpenSession/NewSession` 保证目标 cwd snapshot 存在；`start_user_turn -> capture_turn` 在稳态只读取 current cwd pointer 并冻结 typed owner projections。它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
+_避免_：UI 资源 store、系统提示词构建器、会话运行时、实时读文件入口、runtime reload 管理器
 
 **ResourceSnapshotStore**：
-`ResourceManager` 内部的 current-pointer 存储，保存当前 `RuntimeResourceSnapshot` 以及每个 `(workspace_id, cwd)` 的当前 `CwdResourceSnapshot`。`replace_runtime` / `replace_cwd` 是资源更新对后续 turn 生效的线性化点：它们只原子替换 current pointer，不修改旧 snapshot；已经 running 的 run 继续使用启动时捕获的旧 snapshot，后续 user turn 通过 `capture_turn` 读取新 current pointer。
-_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、客户端 selected-session resources
+`ResourceManager` 内部的 current-pointer 存储，保存 runtime 生命周期内初始化一次的 `RuntimeResourceSnapshot`，以及每个 `(workspace_id, cwd)` 的当前 `CwdResourceSnapshot`。MVP 中 `replace_cwd` 是唯一资源 current-pointer 替换线性化点：它只原子替换 cwd current pointer，不修改旧 snapshot；已经 running 的 run 继续使用启动时捕获的旧 snapshot，后续新显式 user turn / work chain 通过 `capture_turn` 读取新 current cwd pointer。
+_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、客户端 selected-session resources、runtime current-pointer 替换
 
 **运行时资源快照（`RuntimeResourceSnapshot`）**：
-一次 user-global/runtime-global 资源解析结果，包含 builtin/user-global/runtime 级技能、提示模板、上下文默认值、自定义/追加系统提示词、source info、diagnostics 和 revision。它不包含 cwd-local 项目资源，也不包含 provider/auth/model gateway 状态。
-_避免_：provider settings、凭据、cwd 项目资源、UI state
+一次 product/user-global defaults 解析结果，在 `OpenWorkspace` 初始化一次并与 `AgentRuntime` / UI host 生命周期绑定。它包含 builtin/user-global/runtime 级技能、提示模板、上下文默认值、自定义/追加系统提示词、source info 和 diagnostics。它不包含 cwd-local 项目资源，也不包含 provider/auth/model gateway 状态；MVP 不使用递增 runtime 级 revision。
+_避免_：provider settings、凭据、cwd 项目资源、UI state、runtime reload revision
 
 **cwd 资源快照（`CwdResourceSnapshot`）**：
 某个 `(workspace_id, cwd)` 在一次成功资源加载/合成后的不可变资源集合。它持有构建时使用的 `Arc<RuntimeResourceSnapshot>`，并包含 cwd-local layer 与 overlay 后的 `resolved` effective view。多个 session 可以共享同一 cwd 的当前快照；不同 cwd 有各自快照。
 _避免_：单纯 cwd 增量、全局当前资源、session 私有资源服务、UI 快照
 
 **turn 资源快照（`TurnResourceSnapshot`）**：
-一次 user turn/run 的资源输入，只持有 `Arc<CwdResourceSnapshot>`，不额外 pin runtime snapshot。它进入 `TurnState` 后保证 running turn 不受资源 reload 或客户端 session selection 变化影响。
-_避免_：实时资源查询、mutable prompt context、同时 pin runtime/cwd 的双来源快照
+一次 user turn / work chain 的稳定资源输入，包含 `session_id`、`user_turn_id`（不是 `RunId`）、`Arc<CwdResourceSnapshot>`、behavior、model、environment、policy 和 fingerprint。它进入 `TurnState` 后保证 automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用同一 captured 输入；FollowUp、NextTurn 和新 idle prompt 会新 capture。
+_避免_：实时资源查询、mutable prompt context、RunId 等同 user turn、同时 pin runtime/cwd 的双来源快照
 
 **资源覆盖策略（`ResourceOverlayPolicy`）**：
 由 `ResourceManager` 集中实现的 deterministic overlay 规则。MVP 中 policy 可编码在代码内：runtime/global 资源提供候选，cwd/project 资源可按稳定 `ResourceKey { kind, namespace?, name }` 覆盖同 key 候选；selected 与 shadowed 都保留给 diagnostics。
 _避免_：调用点临时合并、按文件路径碰撞、用户可随意声明 provider 覆盖
 
 **资源更新边界**：
-资源内容进入模型可见 current snapshot 的边界。MVP 中只有 startup/session/turn 的 `ensure_*` 兜底、显式 `ReloadResources` / `reload_runtime`、以及 runtime revision 变化时的 `recompose_cwd` 可以发布新 snapshot；`resources_changed` 只是通知事件，`capture_turn` 只是读取边界，不扫描文件、不自动 reload。
-_避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源
+资源内容进入模型可见 current snapshot 的边界。MVP 中 runtime snapshot 只在 `OpenWorkspace` 初始化一次；cwd snapshot 由 `OpenSession/NewSession` ensure 或显式 `ReloadResources` 构建，并只通过 `replace_cwd` 发布。`resources_changed` 只是通知事件；`capture_turn` 只是读取 current cwd pointer 并冻结传入 typed projections，不扫描文件、不自动 reload。
+_避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源、runtime reload
 
 **会话运行时（`SessionRuntime`）**：
 单个会话的产品级 Agent 编排对象；每个 loaded runtime 以 per-session actor 模式持有权威状态并持续处理 mailbox，管理会话阶段、当前运行、队列、模型状态、资源、工具、会话写入和 post-run arbitration。
@@ -213,15 +213,19 @@ _避免_：用户消息、命令文本、已展开 prompt、PendingSessionAction
 _避免_：系统提示词构建器、PromptManager、ContextManager、ResourceManager
 
 **提示词资源视图（`PromptResourceView`）**：
-`ResourceManager` 从 captured `TurnResourceSnapshot` 提供给 `PromptTurn` 的只读窄投影，暴露 prompt materials 与 selected skill/template catalog，并沿用 canonical resource key、source info、content hash 和 revision。它只 pin snapshot，不支持 reload、recompose 或 current-pointer 查询。
-_避免_：资源目录副本、PromptResourceRegistry、实时资源查询
+`ResourceManager` 从 captured `TurnResourceSnapshot` 提供给 `PromptTurn` 的只读窄投影，是所有非工具稳定 Prompt 输入的唯一 seam，暴露 materials、behavior、model、environment、policy、skill/template catalog 和 fingerprint，并沿用 canonical resource key、source info、content hash 和 cwd revision。它只 pin snapshot，不支持 reload 或 current-pointer 查询；工具提示素材继续由 `ToolPromptView` 独立提供。
+_避免_：资源目录副本、PromptResourceRegistry、实时资源查询、工具 owner handle
+
+**工具 profile 基线（`ToolProfileBaseline`）**：
+session-scoped `Tools` 在新的 user turn / work chain 边界通过 `capture_profile_baseline()` 原子捕获的不可变组合，包含同一 `ToolProfileFingerprint` 的 `ToolPromptView`、`ToolBatchInvoker` 和 fingerprint。Prompt 只消费其中的 prompt view，执行路径只消费其中的 invoker；automatic retry 和 overflow recovery 复用同一 baseline，不能分别调用 getter 拼装。
+_避免_：工具运行快照、独立 prompt/invoker getter、ResourceManager-owned tool view
 
 **Prompt turn（`PromptTurn`）**：
-一次 user turn/run 使用的不可变提示词组装值，pin 住 `PromptResourceView`，用于展开 resource-backed `PromptIntent`，并提供同版 `PromptCallProfile`、贡献来源和 fingerprint。它不是 Driver 最终 model-call projection 的 receiver；active Steer 使用当前 `PromptTurn`，FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PromptTurn`。
+一次 user turn / work chain 使用的不可变提示词组装值，由 `prompt::assemble_turn(PromptTurnSpec { resources: PromptResourceView, tools: ToolPromptView })` 创建，pin 住 `PromptResourceView`，用于展开 resource-backed `PromptIntent`，并提供同版 `PromptCallProfile`、贡献来源和 fingerprint。它不是 Driver 最终 model-call projection 的 receiver；active Steer 使用当前 `PromptTurn`，FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PromptTurn`。
 _避免_：TurnState、长期 PromptManager、资源快照 owner、会话上下文
 
 **提示词调用配置（`PromptCallProfile`）**：
-一次 Agent 模型调用使用的原子提示词基线，把最终 system prompt、active tool schemas、贡献来源和 fingerprint 绑定在一起。它是 Driver 调用 Prompt 纯 model-call projection 时所需的静态 baseline；切换模型可见工具或相关 profile 时必须整体替换，不能分别 patch system prompt 与 schemas。
+一次 Agent 模型调用使用的原子提示词基线，把最终 system prompt、active tool schemas、`ToolProfileFingerprint`、贡献来源和 fingerprint 绑定在一起。它是 Driver 调用 Prompt 纯 model-call projection 时所需的静态 baseline；切换模型可见工具或相关 profile 时必须整体替换，并与 replacement `ToolBatchInvoker.fingerprint()` 相等，不能分别 patch system prompt、schemas 与执行 invoker。
 _避免_：DriverTurnInput、ModelCallRequest、ToolPromptCatalog、provider payload
 
 **上下文素材（`ContextMaterial`）**：
@@ -341,7 +345,7 @@ _避免_：RunTerminalStatus、SessionPhase、工具调用状态
 _避免_：客户端 session selection、terminal finished、普通 waiting approval、模型 streaming 中途暂停
 
 **TurnState**：
-`SessionRuntime` 在一次 user turn / run 启动时构建的内部稳定快照，pin 住资源、`PromptTurn`、模型状态、工具视图、消息基线和 context usage。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
+`SessionRuntime` 在一次新的显式 user turn / work chain 启动时构建的内部稳定快照，pin 住资源、`PromptTurn`、模型状态、工具基线、消息基线和 context usage。automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用该状态中的 captured resources。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`。
 _避免_：Driver 输入、ResourceManager current view、公开协议快照
 
 **DriverTurnInput**：

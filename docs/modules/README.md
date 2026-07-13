@@ -44,11 +44,11 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；factory 为每个 loaded session 启动 actor，`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment，并通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`。
+`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment，并通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；新的显式 user turn / work chain 从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`，retry/recovery/active Steer/同 RunId rollover 复用该 snapshot。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、commit 后领域事实、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
-`ResourceManager` 是运行时内部资源子系统，负责资源来源聚合、信任校验、原子刷新候选、级联 snapshot、cwd-over-runtime overlay policy、提示词素材和诊断。它维护 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` capture，并预留 `StepResourceSnapshot`；在 skill 层面它决定 roots、trust、分层、overlay 和 current snapshot，但不解析 frontmatter、不拼 `<skill>` 消息。
+`ResourceManager` 是运行时内部资源子系统，负责资源来源聚合、信任校验、原子刷新候选、级联 snapshot、cwd-over-runtime overlay policy、提示词素材和诊断。它维护 `OpenWorkspace` 初始化一次的 `RuntimeResourceSnapshot`、store current 的 `CwdResourceSnapshot`、不进入 store 的 `TurnResourceSnapshot` capture，并预留 `StepResourceSnapshot`；在 skill 层面它决定 roots、trust、分层、overlay 和 current snapshot，但不解析 frontmatter、不拼 `<skill>` 消息。
 
 `CommandSurface` 是跨 UI 的用户命令领域面；实现上拆为共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` facade。它把 `/compact`、`/skill name`、兼容 `/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令通过 nested JSON command tree、dynamic providers、parse/suggest/resolve 和 trusted handlers 映射到 `agent_runtime_protocol::AgentCommand`、受控 query 或 prompt-like 输入，但不直接执行工具或 Agent loop。
 
@@ -58,9 +58,9 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 
 `PromptTemplates` 是平级纯模板能力模块，对应未来的 `prompt_templates.rs`。它定义 template metadata/resource/catalog/invocation、frontmatter、参数解析和单次替换规则；ResourceManager 拥有生命周期，CommandManager 只消费 metadata，目标 `PromptTurn` 执行正文展开。
 
-`Prompt` 是无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView` 与 tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`；immutable `PromptTurn` pin resources、展开 intent 并提供原子 `PromptCallProfile`。每次模型调用前，Driver 把该 profile 与 durable history、protected current input、typed transient context 交给纯 `prompt::project_model_call(...)`，得到协议安全的 `ModelInputProjection`。它不是长期 `PromptManager` / `ContextManager`。
+`Prompt` 是无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView` 与独立 `ToolPromptView` 交给 `prompt::assemble_turn(PromptTurnSpec { resources, tools })`；immutable `PromptTurn` pin resources、展开 intent 并提供原子 `PromptCallProfile`。每次模型调用前，Driver 把该 profile 与 durable history、protected current input、typed transient context 交给纯 `prompt::project_model_call(...)`，得到协议安全的 `ModelInputProjection`。它不是长期 `PromptManager` / `ContextManager`。
 
-`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...)` 与 run-only `ToolBatchInvoker.invoke_batch(...)` 进入工具管线，`Driver` 不直接依赖 `Tools`，stable commit、审批 control 和公共事件仍由 `SessionRuntime` actor 拥有。
+`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；新的 work chain 通过 `capture_profile_baseline()` 原子获得同 fingerprint 的 `ToolPromptView` 与 run-only `ToolBatchInvoker`，active `RunTask` 再经 `DriverHost::invoke_tool_batch(...)` / `ToolBatchInvoker.invoke_batch(...)` 进入工具管线。`Driver` 不直接依赖 `Tools`，stable commit、审批 control 和公共事件仍由 `SessionRuntime` actor 拥有。
 
 `Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point、provider-neutral preparation、`CompactionMethod` plan、`CompactionSummaryMaterial` 和结果校验；它不构造 `ModelCallRequest`。MVP 使用 portable `SummaryModel`，后期可按当前模型 capability 使用 `ProviderNative`。压缩流程、外部调用、事件和 session 写入由 `SessionRuntime` 编排，后期压缩 Hook 也由 `SessionRuntime` 在对应安全点接入。
 
@@ -117,7 +117,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
 | `src/session_storage/jsonl.rs` | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | 一行一个 committed batch 的 JSONL session adapter。 |
 | `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | `SessionRuntimeHandle`、per-session actor loop、phase/queues/`PendingSessionAction`、run/post-run 编排、`TurnState -> DriverTurnInput` 投影、事件归约、稳定 batch commit、`RunTask` / `RunLink` 与 owned `SessionDriverHost`。 |
-| `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、reload/recompose、diagnostics、prompt materials。 |
+| `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、cwd reload、diagnostics、prompt materials。 |
 | `src/prompt_templates.rs` | [PromptTemplates](prompt-templates.md)、[ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata/resource/catalog/invocation、frontmatter、参数解析和单次展开 helper；不拥有资源生命周期。 |
 | `src/command.rs` | [CommandSurface](command-surface.md) | command public module 和常用类型 re-export。 |
 | `src/command/manager.rs` | [CommandSurface](command-surface.md) | `CommandManager`：共享无状态 materialize / parse / suggest / resolve 管理器。 |
@@ -135,8 +135,8 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 | `src/command/handlers/` | [CommandSurface](command-surface.md) | builtin command handler 实现：help、status、model、thinking、resources、skills、prompt templates、tools。 |
 | `src/runtime_hooks.rs` | [RuntimeHooks](runtime-hooks.md) | 后期 hook registry、capability、typed decision/result；不在当前 MVP 阶段实现。 |
 | `src/skills.rs` | [Skills](skills.md) | skill metadata、catalog、frontmatter、format helper。 |
-| `src/prompt.rs` | [Prompt](prompt.md) | Prompt public facade、`begin_turn()`、常用类型 re-export。 |
-| `src/prompt/turn.rs` | [Prompt](prompt.md) | `PromptTurn`、`PromptCallProfile`、typed turn views 和 fingerprint。 |
+| `src/prompt.rs` | [Prompt](prompt.md) | Prompt public facade、`assemble_turn()`、常用类型 re-export。 |
+| `src/prompt/turn.rs` | [Prompt](prompt.md) | `PromptTurn`、`PromptTurnSpec`、`PromptCallProfile` 和 fingerprint。 |
 | `src/prompt/system.rs` | [Prompt](prompt.md) | 确定性 system prompt section rendering。 |
 | `src/prompt/intent.rs` | [Prompt](prompt.md)、[Skills](skills.md)、[PromptTemplates](prompt-templates.md) | `PromptIntent -> ResolvedPromptInput`，组合 skill/template/attachments。 |
 | `src/prompt/projection.rs` | [Prompt](prompt.md)、[Driver](driver.md) | durable/current/transient lanes -> `ModelInputProjection`。 |

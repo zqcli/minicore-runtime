@@ -509,7 +509,7 @@ pub enum UsageEvent {
 
 pub enum ResourcesEvent {
     ReloadStarted { cwd: PathBuf },
-    Changed { cwd: PathBuf, revision: ResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
+    Changed { cwd: PathBuf, revision: CwdResourceRevision, skills: Vec<SkillSummary>, prompt_templates: Vec<PromptTemplateSummary>, context_files: Vec<ContextFileSummary>, system_prompt: Option<TextResourceSummary>, append_system_prompts: Vec<TextResourceSummary>, diagnostics: Vec<ResourceDiagnostic> },
 }
 
 pub enum CommandCatalogEvent {
@@ -955,7 +955,7 @@ pub struct SessionCatalogRevision(pub u64);
 pub struct ResourceSnapshotSummary {
     pub workspace_id: WorkspaceId,
     pub cwd: PathBuf,
-    pub revision: ResourceRevision,
+    pub revision: CwdResourceRevision,
     pub skills: Vec<SkillSummary>,
     pub prompt_templates: Vec<PromptTemplateSummary>,
     pub context_files: Vec<ContextFileSummary>,
@@ -994,7 +994,7 @@ pub struct CommandSnapshot {
 ```rust
 pub struct ContextFileSummary { pub path: PathBuf, pub source: ResourceSourceInfo }
 pub struct TextResourceSummary { pub source: ResourceSourceInfo, pub kind: TextResourceKind }
-pub struct ResourceRevision(pub u64);
+pub struct CwdResourceRevision(pub u64);
 ```
 
 命令摘要只暴露 autocomplete / command palette / 嵌套菜单需要的信息，不代表执行授权：

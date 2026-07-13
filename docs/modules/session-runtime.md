@@ -1,6 +1,6 @@
 # SessionRuntime
 
-`SessionRuntime` 是单个会话的产品级 Agent 编排对象和 per-session actor。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约，并通过 mailbox 在 active run 飞行期间继续处理 approval、abort、prompt delivery、pending action、snapshot 和 shutdown。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使该 run 不受客户端 session selection 变化或资源 reload 影响。
+`SessionRuntime` 是单个会话的产品级 Agent 编排对象和 per-session actor。它拥有会话状态、队列、工具、模型状态、运行生命周期和事件归约，并通过 mailbox 在 active run 飞行期间继续处理 approval、abort、prompt delivery、pending action、snapshot 和 shutdown。每个 `SessionRuntime` 固定一个 workspace cwd；新的显式 user turn / work chain 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`，并把它放入本次 `TurnState`，使该 work chain 不受客户端 session selection 变化或资源 reload 影响。
 
 ## 核心职责
 
@@ -11,10 +11,10 @@
 - 队列入口：支持 `Steer`、`FollowUp`、`NextTurn`、`ClearQueue`，并持有结构化 `PendingSessionAction`；运行中输入或 deferred session action 不能绕过当前 work 的顺序。
 - 自定义消息入口：为后续 extension/runtime command 支持 custom message；只接受完整 draft，通过 `SessionMutation` 或 `UserInput` batch 提交后决定是否触发 turn。
 - 运行生命周期：启动 run、continue、post-run arbitration、失败消息构造、abort、phase 切换和 `session_settled` 状态归约。
-- 运行输入 scope：持有固定 `workspace_id` / `cwd`；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future run，不会改写正在运行的后台 run。
+- 运行输入 scope：持有固定 `workspace_id` / `cwd`；新的显式 user turn / work chain 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`，resource reload 只影响 future work chain，不会改写正在运行的后台 run。
 - 模型与思考等级：支持 set/cycle model、模型认证检查、恢复失败 fallback、set/cycle thinking level、能力裁剪和持久化。
-- 工具与提示词配置：持有 session-scoped `Tools` 子系统；在 turn start 汇合 captured `PromptResourceView`、tool/model/agent/environment/policy views 创建 immutable `PromptTurn`。MVP 在 `Turn` 中拒绝 active tools/模型可见 profile mutation；full version 若在安全点支持变化，必须使用同一 captured resources 重建并整体替换 `PromptCallProfile` 与 `ToolBatchInvoker`。
-- 资源与扩展：在 user turn 启动时引用当前 `TurnResourceSnapshot`；该 snapshot pin 住 `CwdResourceSnapshot`，而 cwd snapshot pin 住对应 `RuntimeResourceSnapshot`。reload 后 future turn 使用新资源，运行中的 turn 不被 patch。
+- 工具与提示词配置：持有 session-scoped `Tools` 子系统；新的 work chain 调用 `capture_profile_baseline()` 原子获得 `ToolProfileBaseline`，再汇合 captured `PromptResourceView` 与其中的 `ToolPromptView`，调用 `prompt::assemble_turn(...)` 创建 immutable `PromptTurn`。MVP 在 `Turn` 中拒绝 model、thinking、stream options、active tools 和 profile mutation；full version 若在安全点支持变化，必须通过 `StepResourceSnapshot` 或明确 step override 原子替换 `ToolProfileBaseline` 及其对应的 `PromptCallProfile` / future `ToolBatchInvoker`。
+- 资源与扩展：在新的显式 user turn / work chain 启动时引用当前 `TurnResourceSnapshot`；该 snapshot pin 住 `CwdResourceSnapshot`，而 cwd snapshot pin 住对应 `RuntimeResourceSnapshot`。cwd reload 后 future work chain 使用新资源，运行中的 turn 不被 patch；runtime/global 资源变化通过重建 `AgentRuntime` 生效。
 - 压缩与重试：支持手动压缩、自动压缩、context overflow 恢复、自动重试、取消压缩和取消重试。
 - 会话树：支持 set session name、navigate tree、branch summary、fork selector 所需 user message 列表。
 - shell 能力：后置支持 bash/shell 执行、输出流、结果记录、取消和 pending shell message flush；MVP 默认不开启。
@@ -32,7 +32,7 @@ SessionRuntime actor
   ├─ CurrentRun { PromptTurn / current-run context / RunTaskHandle }
   ├─ CurrentRunUsage / SessionUsageStats / ContextUsage
   ├─ ModelState
-  ├─ ResourceState { last_seen_revision }
+  ├─ ResourceState { last_seen_cwd_revision }
   ├─ CompactionState
   ├─ Command
   ├─ Tools
@@ -53,7 +53,7 @@ RunTask                         // one per publicly started run
 
 `CurrentRun` 持有 actor-owned parent `CancellationToken` 和 attached `RunTaskHandle { run_id, join/completion }`；task 只得到 child token。`AbortRun` / shutdown 先 cancel parent，再按 terminal/commit 规则等待 completion；drop/replace `CurrentRun` 前必须确认旧 task 已结束或进入强制 crash policy，不能只丢 join handle 让 model/tool work 在后台继续。
 
-`SessionRuntime` 不持有跨 turn 的 current resource cache。它可以记录 `ResourceState { last_seen_revision }` 供 UI 或 diagnostics 使用，但不能用它代替 `ResourceManager.capture_turn(...)`。每次 user turn 真正启动时都必须重新 capture，当 reload 已经完成 `ResourceSnapshotStore::replace_cwd(...)` 后，下一次 capture 自然会读取到新的 current `CwdResourceSnapshot`；active run 继续使用 `CurrentRun.prompt_turn` pin 住的旧 snapshot。
+`SessionRuntime` 不持有跨 turn 的 current resource cache。它可以记录 `ResourceState { last_seen_cwd_revision }` 供 UI 或 diagnostics 使用，但不能用它代替 `ResourceManager.capture_turn(...)`。新的显式 user turn / work chain 启动时必须 capture；automatic retry、overflow compaction recovery、active Steer 和同 `RunId` Rig segment rollover 复用当前 captured snapshot。cwd reload 完成 `ResourceSnapshotStore::replace_cwd(...)` 后，下一次新 work chain 自然会读取到新的 current `CwdResourceSnapshot`；active run 继续使用 `CurrentRun.prompt_turn` pin 住的旧 snapshot。
 
 `SessionRuntime` 持有 session-scoped `Command` facade，但不持有 catalog cache。`Command` 每次请求都基于当前 session 的 cwd、resource summary、model、tools、run state 和 settings 构造 `CommandContext`，再调用共享 `CommandManager` materialize/parse/suggest/resolve。只有 resolved 后的 session-scoped 结构化命令或 prompt intent 才进入 `SessionRuntime`。`CommandRunPolicy` 决定 handler 立即执行、active work 中拒绝或保存为 typed pending action；`PromptDelivery` 决定模型可见输入进入 steer/follow-up/next-turn。两者不能互相转换。
 
@@ -89,8 +89,8 @@ CommandManager / protocol
 
 SessionRuntime at target delivery boundary
   → ResourceManager.capture_turn(...)
-  → PromptResourceView + tool/model/agent/environment/policy views
-  → prompt::begin_turn(...)
+  → PromptResourceView + ToolPromptView
+  → prompt::assemble_turn(PromptTurnSpec { resources, tools })
   → PromptTurn.resolve_intent(intent)
   → ResolvedPromptInput
   → persist current user input / start Driver
@@ -110,17 +110,16 @@ SessionRuntime at target delivery boundary
 `SessionRuntime` 是 Prompt 的 Pull Master：
 
 ```text
-TurnResourceSnapshot.prompt_view()
-Tools.prompt_view()
-ModelState.prompt_view()
-Product / agent / environment / policy views
-  → prompt::begin_turn(TurnPromptInputs { ... })
+TurnResourceSnapshot.prompt_resource_view()
+Tools.capture_profile_baseline() -> ToolProfileBaseline { prompt, invoker, fingerprint }
+  → prompt::assemble_turn(PromptTurnSpec { resources, tools: prompt.clone() })
   → PromptTurn { PromptCallProfile, contribution stamps, fingerprint }
+  → TurnState.tool_baseline = ToolProfileBaseline
 ```
 
-创建时机包括新 user turn、follow-up continuation、显式新 prompt 消费 `NextTurn` queue，以及 overflow recovery 后的新 continuation。`NextTurn` 自身不会自动启动 continuation。普通 resource reload 不 patch active `PromptTurn`。
+创建时机包括新 idle prompt、follow-up continuation，以及显式新 prompt 消费 `NextTurn` queue。`NextTurn` 自身不会自动启动 continuation。automatic retry、overflow compaction recovery、active Steer 和同 `RunId` segment rollover 复用原 `PromptTurn` / captured resources。普通 resource reload 不 patch active `PromptTurn`。
 
-如果运行中合法切换模型可见工具、agent profile 或其他会影响 system prompt 的 profile，`SessionRuntime` 在 `before_next_model_call` 安全点使用 active turn 的同一个 `PromptResourceView` 重新执行 `begin_turn()`，并整体替换 `PromptCallProfile`。不能分别 patch system prompt 和 active tool schemas。
+MVP 中运行时不允许切换模型可见工具、model、thinking、stream options 或其他会影响 profile 的设置。full version 若在安全点合法切换，`SessionRuntime` 必须通过 `StepResourceSnapshot` 或明确 step override 创建新的 immutable `PromptTurn`，并在同一 actor transaction 中整体替换 `PromptCallProfile` 与 future `ToolBatchInvoker`。不能分别 patch system prompt 和 active tool schemas。
 
 MVP 中 Rig step 不调用 `ResourceManager`。完整 `PromptTurn` 只由 actor 的 `TurnState` / `CurrentRun` pin 住；run-scoped `SessionDriverHost` 只保留工具上下文需要的 captured turn resources，跨到 `Driver` 主输入的只有窄 `DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }`。未来 `StepResourceSnapshot` 也必须以 active `TurnResourceSnapshot` 为 parent，不能读取 ResourceManager current pointer。
 
@@ -154,18 +153,18 @@ pub struct ActiveModel {
 2. 会话恢复时，从 root-to-leaf path 上最新 `SessionEntry::ModelChange { provider_id, model_id }` 恢复选择；如果 provider/model 已失效，通过 `ProviderRegistry` fallback，并记录 diagnostics / `model_fallback_message`。
 3. `SetModel` / `CycleModel` 先计算并校验 next `ModelSelection`，提交 `SessionWriteBatch::session_mutation([ModelChangeDraft(next)])`；只有 commit 成功后才替换 `ModelState.selected` 并发 `session_model_changed`；它们不构造 provider client，也不读取 credentials。
 4. `SetThinkingLevel` / `CycleThinkingLevel` 会按当前 `ModelCapabilities` 裁剪；不支持 thinking 的模型应降级为 `ThinkingLevel::Off` 或返回结构化错误。thinking level、active tools、session name 和其他需要恢复的 session mutation 都遵循同一顺序：计算 next state → commit `SessionMutation` batch → 替换 runtime-visible state → 发布 changed event。
-5. 每次启动 run 前，`SessionRuntime` 从 `ModelState` 和 `ProviderRegistry` 构造 `ActiveModel`，放进 `TurnState`。
+5. 每个新的显式 user turn / work chain 启动时，`SessionRuntime` 从 `ModelState` 和 `ProviderRegistry` 构造一次 `ActiveModel`，将其 prompt-safe projection 冻结进 `TurnResourceSnapshot`，并把执行视图放进 `TurnState`；automatic retry 和 overflow recovery 复用该 model baseline。
 6. 运行中切换模型可以先被 phase guard 拒绝；完整版本可在 `before_next_model_call` 安全点由 `SessionRuntime` 更新会话事实，并原子替换 future model/options 与必要的 `PromptCallProfile`，但不能替换已经发出的 provider request。
 
 `ModelSummary` 是 UI/snapshot view，不是执行路径身份。执行路径必须使用 `ModelSelection { provider_id, model_id }`，避免把显示名、provider API model name 或 Rig 类型写进 session。
 
 ## TurnState
 
-每次启动模型 turn 前，`SessionRuntime` 创建一次稳定快照：
+新的显式 user turn / work chain 启动时，`SessionRuntime` 创建一次稳定 `TurnState`；automatic retry、overflow recovery、active Steer 和同 `RunId` rollover 复用其中 captured resources：
 
 ```rust
 pub struct TurnState {
-    pub resource_revision: ResourceRevision,
+    pub cwd_revision: CwdResourceRevision,
     pub resources: Arc<TurnResourceSnapshot>,
     pub prompt_turn: Arc<PromptTurn>,
     pub messages: Vec<MessageRecord>,
@@ -173,6 +172,7 @@ pub struct TurnState {
     pub session_id: SessionId,
     pub model: ActiveModel,
     pub thinking_level: ThinkingLevel,
+    pub tool_baseline: ToolProfileBaseline,
     pub tools: Vec<ToolDefinitionView>,
     pub active_tools: Vec<ToolDefinitionView>,
     pub context_usage: Option<ContextUsageView>,
@@ -203,9 +203,9 @@ impl TurnState {
 }
 ```
 
-`DriverTurnInput` 不能包含 `Arc<TurnResourceSnapshot>`、`PromptTurn`、`ResourceRevision`、`ContextUsageView`、全量 tools registry、executor handle、approval/policy state、queue state 或 storage handle。`PromptCallProfile` 是窄的模型可见基线，不允许 Driver 访问 resource catalogs。
+`DriverTurnInput` 不能包含 `Arc<TurnResourceSnapshot>`、`PromptTurn`、`CwdResourceRevision`、`ContextUsageView`、全量 tools registry、executor handle、approval/policy state、queue state 或 storage handle。`PromptCallProfile` 是窄的模型可见基线，不允许 Driver 访问 resource catalogs。
 
-MVP 在 `Turn` 中拒绝模型、thinking、stream options 或 active-tools 切换，避免 `PromptCallProfile` 与 `ToolBatchInvoker` baseline 分裂。后续 full version 若允许运行中切换，`SessionRuntime` 必须先记录待应用事实，在 `DriverHost::before_next_model_call` 安全点使用 active captured resources 创建新的 immutable `PromptTurn`，并在同一 actor transaction 中整体替换 `CurrentRun.prompt_turn`、`NextModelCallPlan.prompt_profile` 与 future `ToolBatchInvoker`。旧 `PromptTurn` 不原地修改。资源 reload 不 patch 当前 `TurnState`；当前 run 的新旧 PromptTurn 都继续引用启动时捕获的 resources。provider 解析和 auth 注入仍只发生在 `ModelGateway`。
+MVP 在 `Turn` 中拒绝模型、thinking、stream options 或 active-tools 切换，避免 `PromptCallProfile` 与 `ToolBatchInvoker` baseline 分裂。后续 full version 若允许运行中切换，`SessionRuntime` 必须先记录待应用事实，在 `DriverHost::before_next_model_call` 安全点以 active captured resources 为 parent 创建 step override，并捕获完整 replacement `ToolProfileBaseline`；actor 在同一 transaction 中替换 `CurrentRun.prompt_turn` / tool baseline，并通过私有 `RunLink` reply 同时返回 `NextModelCallPlan.prompt_profile` 与 replacement invoker。`SessionDriverHost` 校验 fingerprint 后替换 host-owned invoker，再把 plan 交给 Driver。旧 `PromptTurn` 不原地修改。资源 reload 不 patch 当前 `TurnState`；当前 run 的新旧 PromptTurn 都继续引用启动时捕获的 resources。provider 解析和 auth 注入仍只发生在 `ModelGateway`。
 
 ## Driver / Tools Coordination
 
@@ -249,13 +249,22 @@ let request = DriveRequest {
 let (run_link, actor_endpoint) = RunLink::pair(run_id);
 self.attach_run_endpoint(actor_endpoint);
 
+debug_assert_eq!(
+    turn_state.tool_baseline.prompt.fingerprint,
+    turn_state.tool_baseline.fingerprint,
+);
+debug_assert_eq!(
+    turn_state.prompt_turn.profile().tool_profile_fingerprint,
+    *turn_state.tool_baseline.invoker.fingerprint(),
+);
+
 let host = SessionDriverHost {
     session_id: self.session_id,
     run_id,
     cwd: self.cwd.clone(),
     turn_resources,
     run_link,
-    tools: self.tools.tool_batch_invoker(),
+    tools: turn_state.tool_baseline.invoker.clone(),
     model_gateway: Arc::clone(&self.services.model_gateway),
     progress: RunProgressSink::new(run_id),
     cancel: self.current_run.as_ref().unwrap().cancel.child_token(),
@@ -453,7 +462,14 @@ pub struct NextModelCallPlan {
     pub current_run_context: Vec<ContextMaterialContribution>,
     pub current_call_context: Vec<ContextMaterialContribution>,
 }
+
+struct RunSafePointReply {
+    plan: NextModelCallPlan,
+    replacement_tool_invoker: Option<ToolBatchInvoker>,
+}
 ```
+
+`RunSafePointReply` 是 actor 到当前 `SessionDriverHost` 的私有 reply，不跨 Driver seam。full version 中 actor 只有在同一 safe-point transaction 已构造并保存 replacement `ToolProfileBaseline` 时，才同时令 `plan.prompt_profile = Some(...)` 并返回 replacement invoker；两项必须同时出现或同时缺席。host 校验 `invoker.fingerprint() == replacement_profile.tool_profile_fingerprint` 后先替换自己的 invoker，再向 Driver 返回 `plan`。MVP 中 replacement 字段始终为 `None`。
 
 `persistent_messages` 是 active `PromptTurn.resolve_intent()` 展开的 steer，但只有完成 safe-point transaction 后才能放入 plan：消费结构化 steering intent → 展开最终 user message → commit `SessionWriteBatch::user_input(...)` → 若为 skill/template 则发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked` / `prompt_template_invoked` → 发布 `message_user_appended` → 加入 `persistent_messages`。commit 失败时当前 run 进入 failed terminal path，不能让 Driver/Rig 使用仅存在内存的 steer。`prompt_profile` 只能是用 active captured resources 重建后的完整 profile；`current_call_context` 只影响下一次调用。context owner 的获取失败也必须作为 `Unavailable` 保留，不能通过缺项吞掉 required failure。`SessionRuntime` 不直接构造最终 messages，它把 plan 返回给 Driver，由 Driver 调用 Prompt 的 final projection seam。
 
@@ -473,10 +489,10 @@ resolved command
 ## 运行流程
 
 1. 校验当前 `SessionPhase` 是否允许启动运行，并切换为 `turn`。
-2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
+2. capture `TurnResourceSnapshot`，调用 `Tools.capture_profile_baseline()` 得到同 fingerprint 的 `ToolPromptView` / `ToolBatchInvoker`，使用其中的 prompt view 创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
 3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
 4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布外层 `Event.run_id = None` 的 `skill_invoked` / `prompt_template_invoked`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
-5. 在分配 `RunId` 前执行同步、best-effort pre-run context threshold gate。若命中，按 committed entry id 保护本次 current input，从 `Turn + current_run = None` 显式切换到 `Compaction` phase并调用统一 compaction orchestration；完成后切回 `Turn`、重建 `TurnState` 并只重新检查一次。仍超限或无可压缩历史时返回 typed error，不建立 `CurrentRun`。该 gate 只是 admission optimization，唯一权威的 call-size 判定仍是 Driver 每次调用 `prompt::project_model_call(...)` 的最终 projection validation。
+5. 在分配 `RunId` 前执行同步、best-effort pre-run context threshold gate。若命中，按 committed entry id 保护本次 current input，从 `Turn + current_run = None` 显式切换到 `Compaction` phase并调用统一 compaction orchestration；完成后切回 `Turn`，只重建 durable messages/context usage 等受 compaction 影响的 `TurnState` 字段，继续复用原 `TurnResourceSnapshot`、`PromptTurn` 和 `ToolProfileBaseline`，并只重新检查一次。仍超限或无可压缩历史时返回 typed error，不建立 `CurrentRun`。该 gate 只是 admission optimization，唯一权威的 call-size 判定仍是 Driver 每次调用 `prompt::project_model_call(...)` 的最终 projection validation。
 6. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 owned `SessionDriverHost` 与 `DriveRequest`，启动短期 `RunTask` 后立即回到 actor mailbox loop。`RunTask` 内部调用 `Driver.drive_run()`。
 7. 当前 assistant response 及其完整工具批次结束后、每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。Rig segment 原本将结束时，`before_run_finish` 再执行一次 steering check。
 8. `Driver` 对已 committed persistent messages 执行 Rig segment rollover，应用完整 replacement profile 后调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。本地 projection context limit 或 provider `ContextOverflow` 都归约为带来源的 `DriverError::ContextLimitExceeded`。同一公开 run 的多个 Rig segment 沿用原 `RunId` 和外层预算。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。

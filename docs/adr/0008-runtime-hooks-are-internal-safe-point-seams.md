@@ -1,6 +1,6 @@
 # RuntimeHooks 是内部安全点扩展缝，不是协议事件或 UI 插件 API
 
-MiniCore 需要 hook seam，因为它是 Agent harness runtime core，而不是单一产品后端。prompt/context 注入、工具策略、压缩、session commit observer 和命令呈现都需要可测试、可扩展的干预点；如果没有 hook，下游产品只能 fork runtime，或绕过 `AgentRuntime` / `SessionRuntime` 直接操作工具、凭据和会话文件。当前设计不把资源 discovery/reload 做成 hook seam，资源更新必须经过 `ResourceManager` 的 ensure/reload/recompose pipeline。
+MiniCore 需要 hook seam，因为它是 Agent harness runtime core，而不是单一产品后端。prompt/context 注入、工具策略、压缩、session commit observer 和命令呈现都需要可测试、可扩展的干预点；如果没有 hook，下游产品只能 fork runtime，或绕过 `AgentRuntime` / `SessionRuntime` 直接操作工具、凭据和会话文件。当前设计不把资源 discovery/reload 做成 hook seam：runtime 资源由 `ResourceManager` 在 `OpenWorkspace` 初始化一次，cwd 资源更新必须经过 `ensure_cwd_snapshot(...)` / `reload_cwd(...)` pipeline。
 
 我们决定把 `RuntimeHooks` 设计成后期内部安全点扩展系统。当前 MVP 不实现 hook registry / hook invocation。Hook handler 只能在明确 hook point 上运行，只能返回 typed decision / patch / replacement，例如 cancel、deny、patch system prompt、transform context、rewrite tool args、provide compaction result 或 patch command presentation。最终状态变化由拥有对应安全点不变量的模块应用，例如 `SessionRuntime`、`Tools`、`ModelGateway` 或 `CommandManager` / `Command`；UI 可见事实仍由 `AgentRuntime` / `SessionRuntime` 归约成 `agent_runtime_protocol::Event`。
 

@@ -14,26 +14,30 @@ TurnResourceSnapshot
 StepResourceSnapshot
 ```
 
-`RuntimeResourceSnapshot` 捕获 user-global / runtime-global 资源。`CwdResourceSnapshot` 捕获固定 `(workspace_id, cwd)` 下的资源视图，并持有构建它时使用的 `Arc<RuntimeResourceSnapshot>`。`TurnResourceSnapshot` 只持有 `Arc<CwdResourceSnapshot>`，不再单独持有 runtime 资源，因为 cwd snapshot 已经传递性地 pin 住了对应 runtime snapshot。`StepResourceSnapshot` 只作为未来每次模型采样前捕获动态资源的类型边界；MVP 定义类型但不执行、不使用。
+`RuntimeResourceSnapshot` 捕获 product / user-global defaults。它在 `OpenWorkspace` 初始化一次，并与 UI host / `AgentRuntime` 生命周期绑定；MVP 不支持 runtime reload，也不使用递增 runtime 级 revision。全局资源变化通过重建 `AgentRuntime` 生效。
+
+`CwdResourceSnapshot` 捕获固定 `(workspace_id, cwd)` 下的 project/cwd/trust/catalog overlay 视图，并持有构建它时使用的 `Arc<RuntimeResourceSnapshot>`。`CwdResourceRevision` 只用于 cwd reload 与 UI 摘要失效。
+
+`TurnResourceSnapshot` 是一次 user turn / work chain 的稳定输入，包含 `session_id`、`user_turn_id`（不是 `RunId`）、`Arc<CwdResourceSnapshot>`、behavior、model、environment、policy 和 fingerprint。`StepResourceSnapshot` 只作为未来每次模型采样前捕获动态资源的类型边界；MVP 定义类型但不执行、不使用。
 
 如果未来启用 `StepResourceSnapshot`，它也只应持有 `Arc<TurnResourceSnapshot>` 作为 parent，并附加 step-scoped 动态输入；它不能在每个 step 重新加载或重新合成 runtime/cwd/turn 级资源，也不能读取 `ResourceManager` 的最新 current pointer 来替换 running turn 已捕获的资源。
 
 `CwdResourceSnapshot` 不是单纯的 cwd-local 增量。它包含由 `ResourceOverlayPolicy` 生成的 resolved effective resource view。cwd/project 资源可以按稳定 `ResourceKey { kind, namespace?, name }` 覆盖同 key 的 runtime/global 资源，例如项目内同名 skill 覆盖 user-global skill。MVP 中 overlay policy 编码在代码内，不暴露为 settings 或配置文件；后续如果需要调整 precedence，只应修改集中的 policy 实现。
 
-每个 `SessionRuntime` 固定一个 workspace cwd。user turn 启动时，`SessionRuntime` 调用 `ResourceManager.capture_turn(...)` 取得 `TurnResourceSnapshot` 并存入 `TurnState`。running turn 不再读取 `ResourceManager.current_*()`。`ReloadResources { workspace_id, cwd }` 会构建新的 `CwdResourceSnapshot`，并只为后续 turn 原子替换当前指针；running turn 持有的旧 snapshot 通过 `Arc` 继续有效。runtime/global 资源 reload 会发布新的 `RuntimeResourceSnapshot`；后续 turn capture 时如果发现 cwd snapshot 指向旧 runtime revision，则由 `ResourceManager` 懒惰 recompute cwd snapshot。
+每个 `SessionRuntime` 固定一个 workspace cwd。新的显式 user turn / work chain 启动时，`SessionRuntime` 调用 `ResourceManager.capture_turn(...)` 取得 `TurnResourceSnapshot` 并存入 `TurnState`。running turn 不再读取 `ResourceManager.current_*()`。`ReloadResources { workspace_id, cwd }` 会构建新的 `CwdResourceSnapshot`，并只通过 `ResourceSnapshotStore::replace_cwd(...)` 为后续 turn 原子替换当前 cwd pointer；running turn 持有的旧 snapshot 通过 `Arc` 继续有效。
 
-`capture_turn(...)` 不自动发现资源变化。MVP 中显式 reload / startup ensure 是资源更新的写入边界；turn capture 是资源使用的读取边界。下一个 turn 会使用当时的 current snapshot：如果此前没有 reload，它仍会使用旧 revision；如果 reload 已成功发布新 snapshot，它会使用新 revision。
+`capture_turn(...)` 不自动发现资源变化，也不兜底读盘。MVP 中 `OpenWorkspace` 保证 runtime snapshot 已初始化；`OpenSession` / `NewSession` 保证目标 cwd snapshot 已存在；turn capture 在稳态只读取 current cwd pointer，并冻结调用方传入的 typed owner projections。下一个新的显式 user turn 会使用读取 current pointer 时看到的 snapshot：如果此前没有 cwd reload，它仍会使用旧 cwd revision；如果 reload 已成功发布新 snapshot，它会使用新 cwd revision。
 
-reload 对后续 turn 生效的线性化点是 `ResourceSnapshotStore::replace_cwd(...)` 或 `replace_runtime(...)`。`SessionRuntime` 不跨 turn 缓存 `TurnResourceSnapshot`，也不等待 `ResourceManager` 主动推送新资源；每个 user turn 启动时都重新调用 `capture_turn(...)`，从 store 读取当时 current pointer。若 `SubmitPrompt` 在 replace 之前已经开始 capture，它可以使用旧 snapshot；若在 replace 之后开始 capture，它必须看到新 snapshot。
+cwd reload 对后续 turn 生效的唯一线性化点是 `ResourceSnapshotStore::replace_cwd(...)`。`SessionRuntime` 不跨 turn 缓存 `TurnResourceSnapshot`，也不等待 `ResourceManager` 主动推送新资源。若 `SubmitPrompt` 在 `replace_cwd` 之前已经读取 current pointer，它可以使用旧 snapshot；若在 `replace_cwd` 之后读取 current pointer，它必须看到新 snapshot。
 
-并不是所有层都在 turn 开始时才创建。`RuntimeResourceSnapshot` 和 `CwdResourceSnapshot` 可以在 startup ensure、session open、首次使用 cwd 或显式 reload 时创建并发布；turn 开始时只创建 `TurnResourceSnapshot`，用来 pin 住当时 current cwd snapshot 链。打开 UI 后如果某个 cwd 还没有 current snapshot，第一次 turn 的 ensure 可以从当时磁盘状态加载资源；如果 current snapshot 已经在 turn 前创建，单纯修改磁盘文件不会改变它，必须 reload 后第一次 turn 才能捕获新 revision。
+并不是所有层都在 turn 开始时才创建。`RuntimeResourceSnapshot` 在 `OpenWorkspace` 创建；`CwdResourceSnapshot` 可以在 session open、new session、首次受控 ensure 或显式 reload 时创建并发布；turn 开始时只创建 `TurnResourceSnapshot`，用来 pin 住当时 current cwd snapshot 链和 typed turn projections。打开 UI 后如果某个 cwd 还没有 current snapshot，`OpenSession` / `NewSession` 的 ensure 必须先创建它；单纯修改磁盘文件不会改变 current snapshot，必须 cwd reload 后新的显式 user turn 才能捕获新 revision。
 
-初始化保证有三道防线：`OpenWorkspace` 必须调用 `ensure_runtime_snapshot(...)`；`OpenSession` / `NewSession` 必须调用 `ensure_cwd_snapshot(...)`；`capture_turn(...)` 必须在 turn 启动时兜底执行 `ensure_runtime_snapshot(...)`、缺失 cwd snapshot 时执行 `ensure_cwd_snapshot(...)`，以及 runtime revision 变化时执行 `recompose_cwd(...)`。`ensure_*` 必须幂等，reload 的线性化点必须是 `ResourceSnapshotStore::replace_*`。
+`TurnResourceFingerprint` 组合 cwd revision + behavior/model/environment/policy versions。具体 canonical 算法归 BR-063 定义。
 
-例如当前 snapshot 中 `skill-a` 的正文是 v1，用户在本地把 `SKILL.md` 改成 v2 但没有执行 reload，那么后续 turn 调用 `skill-a` 仍使用 v1。只有 reload 成功发布新 snapshot 后，后续 turn 才会使用 v2。
+user turn / work chain capture 规则：automatic retry、overflow compaction recovery、active Steer、同 `RunId` Rig segment rollover 复用原 `TurnResourceSnapshot`；`FollowUp`、`NextTurn` 和新 idle prompt 创建新的 `TurnResourceSnapshot`。
 
 skill 子系统与 `ResourceManager` 的边界也按此决策收敛：`skills.rs` 定义和解析 `SkillMetadata` / `SkillResource` / `SkillCatalog`，但 current skill catalog 的生命周期、runtime/cwd 分层、overlay 和发布都归 `ResourceManager`；显式 `InvokeSkill` 只能从 captured `TurnResourceSnapshot` 读取 selected `SkillResource.body`。
 
 provider settings、auth、custom providers 和 `ModelGateway` 仍是 user-global/runtime-global 服务，不是 project-scoped resources。因此 `CwdScopedServices`、`CwdServiceRegistry` 和 service generation pinning 不属于 MVP runtime shape。隔离来自固定 session cwd、不可变级联资源快照、turn-time capture 和 deterministic overlay policy。
 
-当前决策也明确不考虑热更新、文件监听器或资源回调接口。所有会影响模型行为的资源更新都必须通过 `ResourceManager` 的显式 reload / recompose pipeline 生成新 snapshot；旧 snapshot 不能被原地修改。若未来 MiniCore 支持 daemon-style detach/attach、project-scoped providers、per-session process workers 或另一套资源更新机制，应重新审视本 ADR，但仍必须保持旧 snapshot 不可变。
+当前决策也明确不考虑热更新、文件监听器或资源回调接口。所有会影响模型行为的 cwd 资源更新都必须通过 `ResourceManager` 的显式 cwd reload 生成新 snapshot；旧 snapshot 不能被原地修改。若未来 MiniCore 支持 daemon-style detach/attach、project-scoped providers、per-session process workers 或另一套资源更新机制，应重新审视本 ADR，但仍必须保持旧 snapshot 不可变。

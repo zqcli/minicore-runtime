@@ -22,7 +22,7 @@ src/
 
 ```text
 ResourceManager
-  owns: 技能来源 roots、trust gate、runtime/cwd 分层、reload/recompose、overlay、current snapshot、diagnostics
+  owns: 技能来源 roots、trust gate、runtime/cwd 分层、cwd reload、overlay、current snapshot、diagnostics
 
 skills.rs
   provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
@@ -50,7 +50,7 @@ SessionRuntime
 | project trust gate | 否 | 是 |
 | runtime/global 与 cwd/project 分层 | 否 | 是 |
 | cwd 覆盖 runtime 的 overlay | 否 | 是 |
-| reload / ensure / recompose 生命周期 | 否 | 是 |
+| runtime-once / cwd ensure / cwd reload 生命周期 | 否 | 是 |
 | 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
 | `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
 | `/skill <name>` / `/skill:name` command text 解析 | 否 | 否，属于 `CommandManager.resolve_for_execution` |
@@ -219,7 +219,7 @@ References are relative to /abs/path.
 3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `SkillPromptIntent`；`SessionRuntime` 只决定 delivery。
 4. delivery 到达目标边界时选择 PromptTurn：active Steer 使用 `CurrentRun.prompt_turn`；idle submission、FollowUp 和 NextTurn 在 future turn capture resources 并创建新 `PromptTurn`。所有 steering/follow-up/next-turn queues 都只保存未展开的结构化 `SkillPromptIntent`。
 5. 目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块，得到目标边界的 `ResolvedPromptInput`；已展开技能正文绝不放回队列。
-6. new-run 路径中，`prompt::begin_turn(...)` 已基于 active tools、context files 和可见技能摘要构建同版 `PromptCallProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
+6. new-run 路径中，`prompt::assemble_turn(...)` 已基于 captured `PromptResourceView` 与 `ToolPromptView` 构建同版 `PromptCallProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
 7. new-run 路径先提交 `UserInput` batch；成功后发布外层 `Event.run_id = None` 的 `skill_invoked`、`message_user_appended`，再分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
 8. active Steer 路径在 current run safe point 提交 `UserInput` batch；成功后发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked`、`message_user_appended`，再把同一个 committed message 放入 `NextModelCallPlan.persistent_messages`，不创建新 RunId。
 9. 后续完整 tool rounds 和 final assistant 继续由 `SessionRuntime` 通过 session writer 提交。
@@ -235,14 +235,15 @@ References are relative to /abs/path.
 
 ```text
 App / workspace open
-  → ResourceManager.ensure_runtime_snapshot()
+  → ResourceManager.ensure_runtime_snapshot_once()
   → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest)
   → ResourceManager resolves skill sources
   → skills::load_skill_catalog(inputs)
   → ResourceManager overlays runtime/global and cwd/project skill candidates
   → ResourceManager publishes CwdResourceSnapshot { resolved.skills, diagnostics, ... }
   → AgentRuntime publishes `resources_changed`
-  → SessionRuntime rebuilds system prompt on next turn
+  → next new user turn / work chain captures the new cwd snapshot
+  → SessionRuntime creates a new `PromptTurn` / `PromptCallProfile`
 
 InvokeSkill (new-run delivery)
   → SessionRuntime captures TurnResourceSnapshot

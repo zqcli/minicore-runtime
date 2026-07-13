@@ -6,8 +6,27 @@ Accepted
 
 ## 决策
 
-MiniCore 将 `Prompt` 从单一 system prompt builder 提升为无状态深模块：`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView`、tool/model/agent/environment/policy views 交给 `prompt::begin_turn(...)`，得到 immutable `PromptTurn`；`PromptTurn` 负责 pin captured resources、结构化 skill/template intent 展开并提供原子 `PromptCallProfile`。每次模型调用前的协议安全 projection 由纯 `prompt::project_model_call(ModelCallProjectionInput { profile, call-time lanes })` 完成；它不以 `PromptTurn` 为 receiver，也不需要 `PromptResourceView`。system prompt 与 active tool schemas 继续绑定在同一个 profile 中，resource identity 继续复用 `ResourceManager` 的 canonical key/hash/source 类型。本 receiver 勘误关闭 BR-048，不改变 Prompt 的无状态定位。
+MiniCore 将 `Prompt` 从单一 system prompt builder 提升为无状态深模块：`SessionRuntime` 作为 Pull Master，在目标 user-turn boundary 获取 captured `PromptResourceView` 和独立 `ToolPromptView`，并调用：
+
+```rust
+prompt::assemble_turn(PromptTurnSpec {
+    resources: PromptResourceView,
+    tools: ToolPromptView,
+})
+```
+
+得到 immutable `PromptTurn`。`PromptTurn` 负责 pin captured resources、结构化 skill/template intent 展开并提供原子 `PromptCallProfile`。
+
+`PromptResourceView` 是所有非工具稳定 Prompt 输入的唯一 seam，暴露 materials、behavior、model、environment、policy、skill/template catalog 和 fingerprint。`ToolPromptView` 保持 Tools 独立；session-scoped `Tools` 通过 `capture_profile_baseline()` 原子产出同 fingerprint 的 `ToolProfileBaseline { prompt, invoker, fingerprint }`，Prompt 只消费其中的 active tool schemas/snippets/guidelines view，执行路径使用同一 baseline 的 invoker。
+
+每次模型调用前的协议安全 projection 由纯 `prompt::project_model_call(ModelCallProjectionInput { profile, call-time lanes })` 完成；它不以 `PromptTurn` 为 receiver，也不需要 `PromptResourceView`。system prompt 与 active tool schemas 继续绑定在同一个 `PromptCallProfile` 中，resource identity 继续复用 `ResourceManager` 的 canonical key/hash/source 类型。
+
+MVP 在 active `Turn` 中拒绝 model、thinking、stream options、active tools 和 profile mutation。后续 full version 若允许 safe-point mutation，必须通过 `StepResourceSnapshot` 或明确 step override，并在同一 actor transaction 中原子替换 `PromptCallProfile` 与 future `ToolBatchInvoker`，保持 fingerprint 一致；不能分别 patch system prompt 与 tool schemas。
 
 ## 影响
 
-不创建 workspace-global `PromptManager` 或长期 `ContextManager`：resources、history、queues、tools、model 和 provider 已有明确 owner，新增 manager 会复制状态与失效协议。动态 RAG/memory/IDE context 由对应 owner 收集成显式 `ContextMaterialContribution::Available/Unavailable`，再交给 Prompt 最终排序和校验；required 获取失败不能以缺项表达。只有未来出现多个异步 context provider、跨 call working set、动态 token budget 和后台 distillation 后，才考虑不拥有 durable history 的 session-scoped `ContextWorkspace`。
+不创建 workspace-global `PromptManager` 或长期 `ContextManager`：resources、history、queues、tools、model 和 provider 已有明确 owner，新增 manager 会复制状态与失效协议。
+
+动态 RAG/memory/IDE context 由对应 owner 收集成显式 `ContextMaterialContribution::Available/Unavailable`，再交给 Prompt 最终排序和校验；required 获取失败不能以缺项表达。
+
+只有未来出现多个异步 context provider、跨 call working set、动态 token budget 和后台 distillation 后，才考虑不拥有 durable history 的 session-scoped `ContextWorkspace`。

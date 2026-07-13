@@ -509,7 +509,7 @@ explicit SkillPromptIntent
 
 available skill summaries
   → PromptResourceView.materials
-  → prompt::begin_turn(...) builds PromptCallProfile
+  → prompt::assemble_turn(...) builds PromptCallProfile
 ```
 
 技能不直接选择 provider/model，也不接触 auth。

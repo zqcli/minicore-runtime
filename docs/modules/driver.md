@@ -130,7 +130,7 @@ pub enum DriveEntry {
 }
 ```
 
-`DriverTurnInput` 是 `TurnState` 的窄投影，不是新的状态 owner。它只包含 `Driver` 推进 Rig、生成最终 `ModelInputProjection` 和构造 `ModelCallRequest` 所需的模型选择、原子 `PromptCallProfile` 与模型调用选项。它不能包含 `PromptTurn`、`Arc<TurnResourceSnapshot>`、`ResourceRevision`、`ContextUsageView`、session storage、queue state、`Tools` 内部状态、executor handle、policy/approval state 或 `ResourceManager` handle。
+`DriverTurnInput` 是 `TurnState` 的窄投影，不是新的状态 owner。它只包含 `Driver` 推进 Rig、生成最终 `ModelInputProjection` 和构造 `ModelCallRequest` 所需的模型选择、原子 `PromptCallProfile` 与模型调用选项。它不能包含 `PromptTurn`、`Arc<TurnResourceSnapshot>`、`CwdResourceRevision`、`ContextUsageView`、session storage、queue state、`Tools` 内部状态、executor handle、policy/approval state 或 `ResourceManager` handle。
 
 `SessionRuntime` 仍然拥有完整 `TurnState`。run 启动时它从 `TurnState` 投影出 `DriverTurnInput` 放进 `DriveRequest`，同时把 `TurnState.resources` 留在 per-run `SessionDriverHost` 中，用于构造 `ToolRunContext`、safe point 决策和未来 `StepResourceSnapshot` parent。这样 `Driver` 的主输入 seam 不会泄漏资源 snapshot。
 
@@ -230,6 +230,8 @@ pub struct SessionDriverHost {
     cancel: CancellationToken,
 }
 ```
+
+MVP 中 `tools` 在整个 work chain 内固定。后续若启用 safe-point tool/profile mutation，actor 的私有 `RunLink` reply 可以同时携带 `NextModelCallPlan` 和 replacement `ToolBatchInvoker`；`SessionDriverHost::before_next_model_call(&mut self, ...)` 必须先校验 `invoker.fingerprint() == replacement_profile.tool_profile_fingerprint`，再原子替换自己的 `tools` 字段，最后只把不含 tool governance state 的 plan 返回 `Driver`。
 
 `RunLink` 是 `RunTask` 回到 owner actor 的私有窄 seam，不是 `SessionRuntimeHandle`：
 
@@ -460,7 +462,7 @@ pub enum FinishDecision {
 }
 ```
 
-`NextModelCallPlan` 是一次 safe-point transaction：Driver 先应用 persistent messages，再整体替换可选 `PromptCallProfile` 和 model options，最后把 current-run/current-call materials 交给 Prompt projection。由于 Rig 0.40.0 没有公开的 mid-run history append，已 committed 的 `persistent_messages` 通过 `full_history() + steering prompt` 创建下一 Rig segment；`FinishDecision::ContinueWithSteering` 在原 segment 即将 Done 时使用同一 rollover。plan 不能携带 resources、context provider handle、queue/storage 或 tool governance state；system prompt 与 tool schemas 不允许作为两个独立 patch 字段。MVP 可以先让 context vectors 为空，但不应退回互斥 decision enum。
+`NextModelCallPlan` 是一次 safe-point transaction：Driver 先应用 persistent messages，再整体替换可选 `PromptCallProfile` 和 model options，最后把 current-run/current-call materials 交给 Prompt projection。由于 Rig 0.40.0 没有公开的 mid-run history append，已 committed 的 `persistent_messages` 通过 `full_history() + steering prompt` 创建下一 Rig segment；`FinishDecision::ContinueWithSteering` 在原 segment 即将 Done 时使用同一 rollover。plan 不能携带 resources、context provider handle、queue/storage 或 tool governance state；system prompt 与 tool schemas 不允许作为两个独立 patch 字段。future replacement invoker 通过 `RunLink` 的私有 host reply 与 plan 同时返回，由 `SessionDriverHost` 在把 plan 交给 Driver 前校验 `invoker.fingerprint() == prompt_profile.tool_profile_fingerprint` 并完成本地替换。MVP 可以先让 context vectors 为空，但不应退回互斥 decision enum。
 
 ## Error And Abort Semantics
 

@@ -59,7 +59,7 @@
 
 状态：Resolved
 
-处理记录：已收敛到单 host/runtime 进程内多 session 运行模式。最新修订不再引入 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning；`AgentRuntime` 拥有 `WorkspaceServices`，其中共享 `ResourceManager` 管理 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 级联不可变资源快照。每个 `SessionRuntime` 固定一个 workspace cwd；每次 run 启动时捕获 `TurnResourceSnapshot` 并构建 `TurnState`。provider settings、auth、custom provider 和 `ModelGateway` 均为 user-global/runtime-global；客户端 selected session 不进入 core 或服务 scope。
+处理记录：已收敛到单 host/runtime 进程内多 session 运行模式。最新修订不再引入 `CwdServiceRegistry` / `CwdScopedServices` / service generation pinning；`AgentRuntime` 拥有 `WorkspaceServices`，其中共享 `ResourceManager` 管理 `RuntimeResourceSnapshot -> CwdResourceSnapshot -> TurnResourceSnapshot -> StepResourceSnapshot` 级联不可变资源快照。每个 `SessionRuntime` 固定一个 workspace cwd；新的显式 user turn / work chain 捕获 `TurnResourceSnapshot` 并构建 `TurnState`，automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用 captured snapshot。provider settings、auth、custom provider 和 `ModelGateway` 均为 user-global/runtime-global；客户端 selected session 不进入 core 或服务 scope。
 
 问题：原文档一方面说 `RuntimeServices` 绑定有效工作区，另一方面说打开/导入/恢复到不同 cwd 的会话时必须重建这些服务；同时 `SessionManager` 允许多个 loaded session 和后台 run。旧 session 应持有旧 services、被 shutdown，还是迁移到新 services，此前不清楚。
 

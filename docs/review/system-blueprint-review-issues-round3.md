@@ -108,7 +108,7 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 证据（被 struct 字段/签名引用但无定义）：
 
 - 执行层：`ToolBatchResult`、`DriveResultSummary`、`TurnCheckpoint`、`FinishCheckpoint`、`DriveLimits`、`DriverError`、`ToolSubsystemError`、`ToolApprovalRequest`、`PreparedToolInvocation`、`ApprovalGrantMatch`、`ModelStreamSink` / `ToolUpdateSink` 方法集。
-- 资源层：`CwdResourceLayer`、`ResolvedCwdResourceView`、`TurnResourceView`、`CompactionFileOps`、`CompactionDetails`、`SkillLoadInputs` / `SkillLoadReport`、`PromptTemplateLoadInputs`、`ContextMaterialKey` / `ContextSource`。
+- 资源层：`CwdResourceLayer`、`ResolvedCwdResourceView`、`CompactionFileOps`、`CompactionDetails`、`SkillLoadInputs` / `SkillLoadReport`、`PromptTemplateLoadInputs`、`ContextMaterialKey` / `ContextSource`。
 
 风险：这些空洞不改变当前已确定的模块 ownership、调用方向和生命周期边界，但若带入实现阶段，各模块会分别发明字段、错误和行为约束，导致 conformance test 无法围绕同一契约编写；其中 `ToolBatchResult` 会直接阻塞 tool 纵切。
 
@@ -163,17 +163,21 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 ### BR-054：五个 prompt 输入 view 无 owner，`EnvironmentPromptView` 隐含 I/O 职责
 
-状态：Open
+状态：Resolved
 
-问题：`TurnPromptInputs` 的 7 个 view 里，`ToolPromptView`（`tools.md`）和 `PromptResourceView`（`resource-manager.md`）有 owner，而 `ProductPromptView` / `AgentPromptView` / `EnvironmentPromptView` / `PolicyPromptView` / `ModelPromptView` 五个类型全仓库只在 `prompt.md` 出现一次，没有任何模块定义谁构造、字段是什么、何时刷新。尤其 `EnvironmentPromptView` 含"VCS 摘要"，这需要 I/O，而 Prompt 禁止 I/O，`session-runtime.md` 也没认领这项采集。
+处理记录：已按确认后的 ResourceManager / Prompt 架构重写 `resource-manager.md`、`prompt.md`、`session-runtime.md`、ADR 0010、ADR 0017 和总览文档。当前结论是：`PromptResourceView` 是所有非工具稳定 Prompt 输入的唯一 seam，暴露 materials、behavior、model、environment、policy、skill/template 和 fingerprint；`ToolPromptView` 保持 Tools 独立。Prompt 入口收敛为 `prompt::assemble_turn(PromptTurnSpec { resources: PromptResourceView, tools: ToolPromptView }) -> PromptTurn`。旧的多 owner prompt view 方案、turn prompt wrapper 方案和 VCS-in-environment 方案均被 superseded。
 
-证据：
+现行 `TurnResourceSnapshot` 直接包含 `session_id`、`user_turn_id`（不是 `RunId`）、`Arc<CwdResourceSnapshot>`、behavior、model、environment、policy 和 fingerprint。MVP `environment` 只包含 workspace root、fixed cwd、platform、date/time/timezone 和 interaction capabilities，不包含 VCS I/O。ResourceManager 只冻结 owner-produced prompt-safe projections，不反向读取 `ModelState`、`Tools`、`AuthStore` 或 settings owner handles。
 
-- `docs/modules/prompt.md`：`begin_turn(TurnPromptInputs { ... })` 列出七个 view，五个无外部 owner。
+原问题：`TurnPromptInputs` 的 7 个 view 里，`ToolPromptView`（`tools.md`）和 `PromptResourceView`（`resource-manager.md`）有 owner，而 `ProductPromptView` / `AgentPromptView` / `EnvironmentPromptView` / `PolicyPromptView` / `ModelPromptView` 五个类型全仓库只在 `prompt.md` 出现一次，没有任何模块定义谁构造、字段是什么、何时刷新。尤其 `EnvironmentPromptView` 含"VCS 摘要"，这需要 I/O，而 Prompt 禁止 I/O，`session-runtime.md` 也没认领这项采集。
 
-风险：五个类型会被各模块自行发明；`EnvironmentPromptView` 的 VCS 采集是隐藏的 I/O owner 缺口。
+原证据：
 
-待处理方向：为五个 view 指派 owner 或合并（建议把 Product/Agent/Policy 合成一个由 `SessionRuntime` 从 settings 构造的 defaults view）；`EnvironmentPromptView` 的 VCS 摘要指定由 `SessionRuntime` 在 turn start 采集，或 MVP 直接砍掉。
+- `docs/modules/prompt.md` 曾列出 `begin_turn(TurnPromptInputs { ... })` 和七个 view，五个无外部 owner。
+
+原风险：五个类型会被各模块自行发明；`EnvironmentPromptView` 的 VCS 采集是隐藏的 I/O owner 缺口。
+
+关闭理由：现行权威文档不再定义五个无 owner view，也不再允许 Prompt 或 ResourceManager 执行 VCS I/O。后续 safe-point profile mutation 必须通过 step snapshot 或明确 step override 原子替换 profile 与 future tool invoker。
 
 ### BR-055：`ResolvedPromptInput.parts` 与 `messages` 的折叠关系未定义
 
@@ -206,18 +210,20 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 ### BR-057：`reload_runtime` / `recompose_cwd` 在 MVP 实际不可达，且 recompose 后 revision 不通知 UI
 
-状态：Open
+状态：Resolved
 
-问题：`resource-manager.md` 的 trait 定义 `reload_runtime()`，`recompose_cwd` 整套懒重组机制围绕 runtime revision 变化设计。但公开协议只有 cwd 级 `ReloadResources { workspace_id, cwd }`，MVP 中没有任何路径能改变 runtime revision，整条 lazy recompose 分支实际不可达。此外，懒 recompose 经 `replace_cwd` 发布新 `CwdResourceSnapshot.revision`，但 `resources_changed` 只在显式 reload 流程定义，UI 对 recompose 后的 revision 永远不知情。
+处理记录：最终决策是不补 runtime 级 reload。runtime 与 UI/`AgentRuntime` 生命周期绑定，`RuntimeResourceSnapshot` 在 `OpenWorkspace` 初始化一次，MVP 不使用递增 runtime 级 revision；全局资源变化通过重建 `AgentRuntime` 生效。cwd reload 保留，`ResourceSnapshotStore::replace_cwd(...)` 是唯一资源 current-pointer 替换线性化点。旧 runtime reload、runtime current-pointer 替换、runtime-version drift 和 lazy cwd recompose 语义均从权威文档删除。
 
-证据：
+原问题：`resource-manager.md` 的 trait 定义 `reload_runtime()`，`recompose_cwd` 整套懒重组机制围绕 runtime revision 变化设计。但公开协议只有 cwd 级 `ReloadResources { workspace_id, cwd }`，MVP 中没有任何路径能改变 runtime revision，整条 lazy recompose 分支实际不可达。此外，懒 recompose 经 `replace_cwd` 发布新 `CwdResourceSnapshot.revision`，但 `resources_changed` 只在显式 reload 流程定义，UI 对 recompose 后的 revision 永远不知情。
 
-- `docs/modules/resource-manager.md`：`reload_runtime()`、`recompose_cwd`、`ResourceReloadResult { scope, runtime_revision }`。
-- `docs/modules/agent-runtime-protocol.md`：只有 `ReloadResources { workspace_id, cwd }`，无 runtime 级 reload 命令。
+原证据：
 
-风险：死路径会被当作 MVP 验收范围实现；recompose 后 UI 资源摘要与实际 revision 漂移。
+- `docs/modules/resource-manager.md` 曾包含 `reload_runtime()`、`recompose_cwd`、`ResourceReloadResult { scope, runtime_revision }`。
+- `docs/modules/agent-runtime-protocol.md` 只有 cwd 级 `ReloadResources { workspace_id, cwd }`，无 runtime 级 reload 命令。
 
-待处理方向：要么补 runtime 级 reload 命令，要么把 `reload_runtime` / `recompose_cwd` 显式标注为 post-MVP；同时规定 recompose 是否发 `resources_changed`（或声明 recompose 不 bump 公开 revision）。
+原风险：死路径会被当作 MVP 验收范围实现；recompose 后 UI 资源摘要与实际 revision 漂移。
+
+关闭理由：现行 MVP 只有 cwd reload 会发布新 `CwdResourceSnapshot` 和 `resources_changed`；不存在 recompose 后是否通知 UI 的状态分支。
 
 ### BR-058：round2 过程性观察 #1/#3 的协议裁边至今未执行
 
@@ -279,34 +285,36 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 ### BR-062：`capture_turn` 不变量措辞与兜底读盘冲突，职责重复声明
 
-状态：Open
+状态：Resolved
 
-问题：`resource-manager.md` 的不变量清单写"`capture_turn(...)` 只读取当前指针；不读磁盘、不自动 reload"，但同文档 `capture_turn` 实现在 miss 时调用 `ensure_cwd_snapshot`（首次 turn 会读盘）、在 revision 漂移时调用 `recompose_cwd`（发布新指针）。ADR 0010 的"三道防线"说明意图是"steady-state 不读盘"，但不变量的字面表述会被直接写成错误测试。runtime revision 陈旧检查的 owner 也在两处重复声明（`capture_turn` 伪代码内 vs `ensure_cwd_snapshot` 内部）。
+处理记录：最终决策是去掉 turn capture 兜底读盘和 stale-runtime 分支，而不是只给旧不变量补限定语。`OpenWorkspace` 保证 runtime snapshot 初始化一次；`OpenSession` / `NewSession` 保证目标 cwd snapshot 存在；`capture_turn(...)` 在稳态只读取 current cwd pointer，并冻结传入 typed projections。capture 与 `replace_cwd` 按读取 current pointer 的时点线性化。
 
-证据：
+原问题：`resource-manager.md` 的不变量清单写"`capture_turn(...)` 只读取当前指针；不读磁盘、不自动 reload"，但同文档 `capture_turn` 实现在 miss 时调用 `ensure_cwd_snapshot`（首次 turn 会读盘）、在 revision 漂移时调用 `recompose_cwd`（发布新指针）。ADR 0010 的"三道防线"说明意图是"steady-state 不读盘"，但不变量的字面表述会被直接写成错误测试。runtime revision 陈旧检查的 owner 也在两处重复声明（`capture_turn` 伪代码内 vs `ensure_cwd_snapshot` 内部）。
 
-- `docs/modules/resource-manager.md`：不变量清单 vs `capture_turn` 伪代码 vs `ensure_cwd_snapshot` 职责。
-- `docs/adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md`：三道防线。
+原证据：
 
-风险：不变量字面表述会写坏测试；职责重复是漂移温床。
+- `docs/modules/resource-manager.md` 曾同时描述不变量、`capture_turn` 伪代码与 `ensure_cwd_snapshot` 职责。
+- `docs/adr/0010-use-per-cwd-resource-snapshots-for-multi-session-runtime.md` 曾描述三道防线。
 
-待处理方向：给不变量加"steady-state"限定语；把 stale-runtime-revision 检查的 owner 收敛到一处表述。
+原风险：不变量字面表述会写坏测试；职责重复是漂移温床。
+
+关闭理由：现行权威文档中 capture 不读盘、不自动 reload、不发布新 snapshot，也不处理 runtime-version drift；缺失 cwd snapshot 是 lifecycle ensure 的错误。
 
 ### BR-063：确定性承诺缺少 canonical 算法，`baseline_tokens` 为魔数
 
 状态：Open
 
-问题：多处"相同输入得到相同结果"的硬承诺缺少算法定义：fingerprint 三胞胎（`PromptFingerprint` / `PromptProfileFingerprint` / `ModelInputFingerprint`）的 canonical 序列化算法未定；overlay"稳定排序"的 collation key（按 canonical path？声明顺序？）未定；`ResourceRevision(u64)` 的作用域（全局单调？per-cwd？）未定；token 估算方法未定；`ContextUsageView.baseline_tokens = 12_000` 是魔数。
+问题：多处"相同输入得到相同结果"的硬承诺缺少算法定义：fingerprint 类型群（`TurnResourceFingerprint` / `PromptFingerprint` / `PromptProfileFingerprint` / `ModelInputFingerprint`）的 canonical 序列化算法未定；overlay"稳定排序"的 collation key（按 canonical path？声明顺序？）未定；`CwdResourceRevision(u64)` 的生成与持久范围未定；token 估算方法未定；`ContextUsageView.baseline_tokens = 12_000` 是魔数。
 
 证据：
 
 - `docs/modules/prompt.md`：fingerprint 类型群，无 canonical 算法。
-- `docs/modules/resource-manager.md`：overlay 稳定排序无 collation 定义；`ResourceRevision` 作用域未声明。
+- `docs/modules/resource-manager.md`：overlay 稳定排序无 collation 定义；`CwdResourceRevision` 的生成与持久范围、`TurnResourceFingerprint` canonical 输入未声明。
 - `docs/modules/usage-stats.md`：`baseline_tokens = 12_000`。
 
 风险：fingerprint 是最容易各写各的地方；魔数无来源说明。
 
-待处理方向：钉死 fingerprint canonical 序列化、collation key、`ResourceRevision` 作用域、token 估算方法；给 `baseline_tokens` 加来源说明或设为可配置。
+待处理方向：钉死 fingerprint canonical 序列化、collation key、`CwdResourceRevision` 生成/持久范围、token 估算方法；给 `baseline_tokens` 加来源说明或设为可配置。
 
 ### BR-064：Windows 平台细节与 JSONL 并发未声明
 

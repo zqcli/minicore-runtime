@@ -279,7 +279,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | --- | --- | --- | --- |
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
-| `SessionRuntime` actor | `SessionPhase`、current run projection、queues、model state、session-scoped `Tools` lifecycle、fixed workspace cwd、run-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 通过 mailbox 消费上层 command、`RunTask` control effect、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
+| `SessionRuntime` actor | `SessionPhase`、current run projection、queues、model state、session-scoped `Tools` lifecycle、fixed workspace cwd、user-turn/work-chain-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 通过 mailbox 消费上层 command、`RunTask` control effect、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
 | `RunTask` | 单次公开 `Driver::drive_run()`、run-local usage/limits、owned `SessionDriverHost`、cancellation | 不发布 UI event；经 `RunLink` 上报内部 effect | 消费 `DriverHost` model/tool/safe-point 结果，不拥有 session phase、queues、writer 或 terminal arbitration |
 | `Driver` | 当前 Rig `AgentRun` segment、Steer rollover、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果；同一公开 run 可顺序推进多个 Rig segment |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、future provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
@@ -516,7 +516,7 @@ UI event metadata / sequence
 
 ### ResourceManager Ownership
 
-`ResourceManager` 拥有资源 current pointers 和 reload/recompose pipeline，但不拥有 UI 事件通道。
+`ResourceManager` 拥有资源 current pointers 和 cwd reload pipeline，但不拥有 UI 事件通道。
 
 持有状态：
 
@@ -1350,8 +1350,8 @@ UI dispatch(OpenWorkspace)
   → AgentRuntime canonicalizes root and derives WorkspaceIdV1
   → enter Opening; CommandAck confirms admission only
   → WorkspaceServices::new(validated workspace)
-  → ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)
-      └─ missing: build RuntimeResourceSnapshot and replace_runtime(...)
+  → ResourceManager.ensure_runtime_snapshot_once(ResourceInitReason::WorkspaceOpen)
+      └─ build or return the one RuntimeResourceSnapshot for this AgentRuntime lifecycle
   → workspace_opened { workspace }
   → RuntimeSnapshot { workspace: Some(...), loaded_sessions: [] }
 
@@ -1359,15 +1359,14 @@ UI dispatch(OpenSession or NewSession)
   → SessionManager.open_handle(...) / create_handle(...)
   → AgentRuntime validates fixed { workspace_id, workspace_root, cwd }
   → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest { reason: SessionOpen, ... })
-      ├─ missing: load cwd-local resources, overlay, replace_cwd(...)
-      └─ stale runtime revision: recompose_cwd(...), replace_cwd(...)
+      └─ if missing: load cwd-local resources, overlay, replace_cwd(...)
   → create SessionRuntime { workspace_id, cwd, services }
   → session_opened
 ```
 
 若 canonicalization、service construction 或初始 runtime resource snapshot 失败，runtime 丢弃 partial services、回到 `NoWorkspace` 并发布 `workspace_open_failed`；不能留下 `workspace = Some(...)` 的半开状态。后期 hook point `WorkspaceOpened` 与公开完成事件是不同概念。
 
-`ensure_*` 必须幂等。并发 open session、first turn 或 reload 只能通过 `ResourceSnapshotStore.replace_*` 发布完整的新 snapshot，不能让 UI 事件成为状态更新来源。
+`ensure_*` 必须幂等。并发 open session 或 cwd reload 只能通过 `ResourceSnapshotStore.replace_cwd` 发布完整的新 cwd snapshot，不能让 UI 事件成为状态更新来源。
 
 ```text
 UI dispatch(ReloadResources)
@@ -1383,7 +1382,7 @@ UI dispatch(ReloadResources)
 
 `resources_changed` 只传摘要，不传技能全文、context file 正文或完整 system prompt。UI 如果要详情，通过运行时命令读取。
 
-`ResourceSnapshotStore.replace_cwd(...)` 是资源 reload 对后续 turn 生效的原子发布点。runtime 不把新 snapshot 推送到每个 idle `SessionRuntime`；下一次 `SubmitPrompt` / `InvokeSkill` / `InvokePromptTemplate` 真正启动 user turn 时，`SessionRuntime` 调用 `ResourceManager.capture_turn(...)`，把 current `CwdResourceSnapshot` 放入 `TurnState.resources`，并从同一 snapshot 创建新的 `PromptTurn`。active run 的 Steer 继续使用 `CurrentRun.prompt_turn`。
+`ResourceSnapshotStore.replace_cwd(...)` 是资源 reload 对后续 turn 生效的原子发布点，也是 MVP 唯一资源 current-pointer 替换线性化点。runtime 不把新 snapshot 推送到每个 idle `SessionRuntime`；下一次 `SubmitPrompt` / `InvokeSkill` / `InvokePromptTemplate` 真正启动新的显式 user turn / work chain 时，`SessionRuntime` 调用 `ResourceManager.capture_turn(...)`，把 current `CwdResourceSnapshot` 放入 `TurnState.resources`，并从同一 snapshot 创建新的 `PromptTurn`。active run 的 Steer、automatic retry、overflow recovery 和同 `RunId` segment rollover 继续使用 `CurrentRun.prompt_turn`。
 
 ```text
 ReloadResources 完成 replace_cwd(C2)

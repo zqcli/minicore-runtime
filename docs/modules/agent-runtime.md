@@ -27,14 +27,14 @@ pub trait AgentRuntime {
 - 管理工作区，并把会话列表、打开、创建、删除、fork、import 和已加载会话运行时交给 `SessionManager` 协调。
 - 通过 `SessionManager` 取得或加载显式 `SessionRuntimeHandle`，再把 session-scoped 命令发送给对应 per-session actor；不直接借用或锁住 `SessionRuntime`。
 - 管理 `WorkspaceServices`，其中包含 `ResourceManager`、user-global settings/provider/auth、共享 `ModelGateway`、事件通道、无状态 `CommandManager` 和运行时诊断。
-- 通过 `ResourceManager` 维护级联资源快照：current `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、run 启动时捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
+- 通过 `ResourceManager` 维护级联资源快照：`OpenWorkspace` 初始化一次的 `RuntimeResourceSnapshot`、每 `(workspace_id, cwd)` 的 current `CwdResourceSnapshot`、新的显式 user turn / work chain 捕获进 `TurnState` 的 `TurnResourceSnapshot`，以及 MVP 只预留的 `StepResourceSnapshot`。
 - 持有共享、无状态 `CommandManager`，并把 `ExecuteCommandText` / `ExecuteCatalogCommand` 路由到目标 `SessionRuntime.command`。`CommandManager` 负责 materialize catalog、parse、suggest、resolve、`CommandRunPolicy` 校验和 handler registry；session-scoped `Command` 负责构造当前 session 的 `CommandContext` / `SessionCommandHost`。prompt-producing 结果再由目标 `SessionRuntime` 按 `PromptDelivery` 统一 admission。
 - 后期持有 `RuntimeHookRegistry` 作为内部 runtime service；当前 MVP 不实现 hook registry / hook invocation。启用后只在明确 owner 的安全点调用 hook，并把 hook 结果交给拥有状态机的模块应用。
 - 发布 command result events，把 `/status`、`/usage`、`/model`、`/help` 等命令的用户可见结果表达为 display-neutral 输出或交互请求；runtime 不定义具体 picker、popup、menu、form 或 widget 组件。
 - 在 session open、new、fork、import、close 前后执行受控的 open/load/unload 流程；core 不保存客户端 selected session。
 - 保证下游 UI/CLI 不直接接触 Rig、工具实现、凭据、技能文件、会话文件或内部 driver/tool/hook event。
 
-`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认加载任何旧 session。刚打开 host 时 `RuntimeSnapshot.loaded_sessions` 为空；持久化 session list 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。`OpenSession` / `NewSession` 成功后，`AgentRuntime` 通过 `SessionManager` 创建或加载 `SessionRuntime`，并把该会话的初始 idle 状态加入后续 `RuntimeSnapshot.loaded_sessions`。
+`OpenWorkspace` 建立 workspace 绑定的运行时服务和会话目录，并调用 `ResourceManager.ensure_runtime_snapshot_once(ResourceInitReason::WorkspaceOpen)` 初始化 runtime 级资源快照；它不默认加载任何旧 session。刚打开 host 时 `RuntimeSnapshot.loaded_sessions` 为空；持久化 session list 使用 `RuntimeQuery::Session(SessionQuery::List { ... })`。`OpenSession` / `NewSession` 成功后，`AgentRuntime` 通过 `SessionManager` 创建或加载 `SessionRuntime`，并把该会话的初始 idle 状态加入后续 `RuntimeSnapshot.loaded_sessions`。
 
 按 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)，workspace 是单实例薄边界容器：`AgentRuntime` 是它的持有者，同一 runtime 生命周期内只 `Open` 一个 workspace。`WorkspaceIdV1` 从 canonical root path 按版本化算法确定性派生，workspace 只承载 root 边界、session 归属分组和 `WorkspaceSummary` 投影，不承载 project trust（per-cwd）、资源 scope（per-cwd）、provider/auth/settings（user-global）。首次 `OpenWorkspace` 异步进入 `Opening`，以 `workspace_opened` / `workspace_open_failed` 表达完成；`Open` 状态下同 root 幂等、异 root 拒绝 `WorkspaceAlreadyOpen`。runtime 不提供 `CloseWorkspace`；"换项目"由 host 丢弃并重建整个 `AgentRuntime` 实例完成。session cwd 必须位于 workspace root 之下，边界校验见 [AgentRuntimeProtocol](agent-runtime-protocol.md)。
 
@@ -42,7 +42,7 @@ MVP 的 `AgentRuntime` 嵌入在 CLI/TUI/GUI host 进程内，和 UI host 同生
 
 ## 运行时服务
 
-`RuntimeServices` 是内部总称，不随任何客户端 selection 改变。MVP 支持一个 host/runtime 进程内多个 `SessionRuntime` 同时 loaded 并推进 work，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；run 启动时捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。MVP 中 workspace 生命周期 == runtime 生命周期，`WorkspaceServices` 名实相符；未来若出现单 runtime 多 workspace（当前非目标）或 supervisor 拆分，需先把它拆为 runtime-level 与 workspace-level 两层，MVP 不预建该拆分。
+`RuntimeServices` 是内部总称，不随任何客户端 selection 改变。MVP 支持一个 host/runtime 进程内多个 `SessionRuntime` 同时 loaded 并推进 work，但不使用 per-cwd 服务容器。`WorkspaceServices` 持有共享运行时服务；`ResourceManager` 按 runtime/cwd/turn/step 分层维护不可变资源快照；session 固定自己的 workspace cwd；新的显式 user turn / work chain 捕获当前 cwd 的 `TurnResourceSnapshot` 并构建 `TurnState`。MVP 中 workspace 生命周期 == runtime 生命周期，runtime 级资源变化通过重建 `AgentRuntime` 生效；未来若出现单 runtime 多 workspace（当前非目标）或 supervisor 拆分，需先把它拆为 runtime-level 与 workspace-level 两层，MVP 不预建该拆分。
 
 ```text
 AgentRuntime
@@ -54,9 +54,9 @@ AgentRuntime
       ├─ RuntimeDiagnostics
       ├─ ResourceManager
       │   ├─ ResourceSnapshotStore
-      │   │   ├─ current runtime -> Arc<RuntimeResourceSnapshot rev-r>
-      │   │   ├─ key: (workspace_id, <root>) -> Arc<CwdResourceSnapshot rev-a -> rev-r>
-      │   │   └─ key: (workspace_id, <root>/api) -> Arc<CwdResourceSnapshot rev-b -> rev-r>
+      │   │   ├─ runtime -> Arc<RuntimeResourceSnapshot>      // initialized once
+      │   │   ├─ key: (workspace_id, <root>) -> Arc<CwdResourceSnapshot rev-a>
+      │   │   └─ key: (workspace_id, <root>/api) -> Arc<CwdResourceSnapshot rev-b>
       │   ├─ ResourceResolver / loaders
       │   └─ ResourceOverlayPolicy
       ├─ SettingsStore / user-global EffectiveSettings
@@ -66,11 +66,11 @@ AgentRuntime
 
 LoadedSessionRuntimes
   ├─ Handle A -> SessionRuntime actor A { workspace_id, cwd: <root>, command: Command }
-  │   └─ RunTask A captures TurnResourceSnapshot -> CwdSnapshot(<root>, rev-10)
+  │   └─ Work chain A captures TurnResourceSnapshot -> CwdSnapshot(<root>, rev-10)
   ├─ Handle B -> SessionRuntime actor B { workspace_id, cwd: <root>, command: Command }
-  │   └─ next RunTask captures current CwdSnapshot(<root>)
+  │   └─ next new work chain captures current CwdSnapshot(<root>)
   └─ Handle C -> SessionRuntime actor C { workspace_id, cwd: <root>/api, command: Command }
-      └─ RunTask C captures TurnResourceSnapshot -> CwdSnapshot(<root>/api, rev-4)
+      └─ Work chain C captures TurnResourceSnapshot -> CwdSnapshot(<root>/api, rev-4)
 ```
 
 示例中三个 session 同属一个 workspace（同一 root）：A、B 共享 root 这个 cwd 与其 `CwdResourceSnapshot`，C 在 root 下的子目录 `api`，各自 per-cwd 资源。所有 session cwd 都必须位于 workspace root 之下（[ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) D3）；跨仓库多目录属于 additional roots 演进，MVP 不支持。
@@ -79,7 +79,7 @@ Provider settings、auth 和 custom providers 是 user-global/runtime-global；�
 
 每个 session 只能有一个 workspace cwd。多个不同 session 可以对应同一个 cwd，并共享该 cwd 的 current `CwdResourceSnapshot`；不同 cwd 拥有独立 `CwdResourceSnapshot`。`CwdResourceSnapshot` 持有构建它时的 `Arc<RuntimeResourceSnapshot>`，并通过 `ResourceOverlayPolicy` 产出 cwd 下的 resolved resource view。cwd/project 资源可以覆盖 same-key runtime/global 资源，例如同名 project skill 覆盖 user-global skill。
 
-资源 reload 按 cwd 处理：成功 reload 会加载一份新的 `CwdResourceSnapshot`，然后在 `ResourceSnapshotStore` 中原子替换目标 `(workspace_id, cwd)` 的 current pointer。已经 running 的 run 不被中途改写，因为它已经用旧 `TurnResourceSnapshot` 构建了 `TurnState`；idle session 和后续 user turn 会 capture 新 snapshot。reload 失败必须保留旧 snapshot 并发布 diagnostics。runtime/global 资源 reload 发布新的 `RuntimeResourceSnapshot`；future turn capture 时如果发现 cwd snapshot 指向旧 runtime revision，则由 `ResourceManager` 懒惰 recompute cwd snapshot。
+资源 reload 按 cwd 处理：成功 reload 会加载一份新的 `CwdResourceSnapshot`，然后在 `ResourceSnapshotStore` 中通过 `replace_cwd` 原子替换目标 `(workspace_id, cwd)` 的 current pointer。已经 running 的 run 不被中途改写，因为它已经用旧 `TurnResourceSnapshot` 构建了 `TurnState`；后续新的显式 user turn / work chain 会 capture 新 snapshot。reload 失败必须保留旧 snapshot 并发布 diagnostics。MVP 没有 runtime/global 资源 reload；全局资源变化通过重建 `AgentRuntime` 生效。
 
 ## 会话加载生命周期
 
