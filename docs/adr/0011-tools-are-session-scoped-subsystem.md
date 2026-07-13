@@ -53,6 +53,8 @@ SessionRuntime actor::start_run
 
 `Tools` 不直接发布 UI event，不写 session storage，不调用 `ModelGateway`，不读取 `ResourceManager`，不构建最终 system prompt。所有工具内部 update 通过 `ToolUpdateSink` 返回，由 `SessionRuntime` 归约成 `agent_runtime_protocol::EventMsg::ToolCall(...)`、snapshot projection，并在完整 round 结束后组装 `SessionWritePurpose::ToolRound` batch。
 
+工具安全语义分为两层：MiniCore 进程内 builtin executor 负责可测试的 path authorization 和安全文件操作；通用子进程的 filesystem/network/process-tree 限制必须由 OS-native 或 external sandbox adapter 强制。MVP 不启用 `bash`。后续请求 `Sandboxed` shell 时，effective backend capabilities 不满足策略必须 fail closed；显式 `FullAccessWithApproval` 只是无隔离的高风险执行模式，approval 不得被描述为 sandbox，也不能把缺失 enforcement 的请求静默降级到该模式。
+
 ## 理由
 
 这种边界保留 Rig 的协议级状态机优势，同时让 MiniCore 掌握工具副作用的产品控制权。

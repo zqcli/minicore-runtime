@@ -155,7 +155,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 | `src/tools/coordinator.rs` | [Tools](tools.md)、[Driver](driver.md) | batch execution coordination、parallel/sequential、approval wait、按 `call_index` 稳定回填。 |
 | `src/tools/executor.rs` | [Tools](tools.md) | `ToolExecutor` trait、executor registry、result/error 归一化。 |
 | `src/tools/events.rs` | [Tools](tools.md)、[AgentRuntimeEvents](agent-runtime-events.md) | 工具内部 update 类型和 sink adapter。 |
-| `src/tools/sandbox.rs` | [Tools](tools.md) | `ToolSandboxView`、路径/进程/网络边界和 check result。 |
+| `src/tools/sandbox.rs` | [Tools](tools.md) | `ToolSandboxView`、进程内路径授权、shell/network 请求策略、effective enforcement capabilities 和 check result。 |
 | `src/tools/mutation.rs` | [Tools](tools.md) | `ToolMutationKey`、file/resource mutation queue。 |
 | `src/tools/builtin/mod.rs` | [Tools](tools.md) | 内置工具集合声明。 |
 | `src/tools/builtin/read.rs` | [Tools](tools.md) | `read` 工具。 |
@@ -165,7 +165,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 | `src/tools/builtin/write.rs` | [Tools](tools.md) | `write` 工具。 |
 | `src/tools/builtin/edit.rs` | [Tools](tools.md) | `edit` 工具。 |
 | `src/tools/builtin/apply_patch.rs` | [Tools](tools.md) | `apply-patch` 工具。 |
-| `src/tools/builtin/bash.rs` | [Tools](tools.md) | `bash` 工具。 |
+| `src/tools/builtin/bash.rs` | [Tools](tools.md) | post-MVP reserved；enforcement gate 满足后才实现/启用 `bash`。 |
 | `src/compaction.rs` | [Compaction](compaction.md) | 压缩准备、cut point、`CompactionSummaryMaterial` 和结果类型；不构造 `ModelCallRequest`。 |
 | `src/usage_stats.rs` | [UsageStats](usage-stats.md) | provider usage 归一化、run/session/context usage helper；消费 `ModelCallPurpose`，不定义 `UsagePurpose`。 |
 | `src/driver.rs` | [Driver](driver.md) | `DriverTurnInput`、`DriverHost` seam、drive request/result、Rig step 映射主入口。 |

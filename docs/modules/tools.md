@@ -130,7 +130,7 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 | `tools/coordinator.rs` | 执行已声明约束：parallel/sequential、approval wait、grant lookup、并发限制、按 `call_index` 稳定回填 | 不发明策略，不做具体工具副作用 |
 | `tools/executor.rs` | 定义 `ToolExecutor` trait、`ToolExecutorRegistry`、`ToolInvocationResult`、错误归一化 | 不做 registry/policy/approval |
 | `tools/events.rs` | 定义工具内部事件/更新类型，转换为 `ToolUpdateSink` 可消费的数据 | 不直接发 `agent_runtime_protocol::Event` |
-| `tools/sandbox.rs` | 定义 `ToolSandboxView`、路径边界、读写域、进程/网络能力描述、sandbox check 结果 | 不做 UI approval |
+| `tools/sandbox.rs` | 定义 `ToolSandboxView`、进程内路径授权、请求的 shell/network policy、effective enforcement capability 和 check 结果 | 不做 UI approval，不实现平台 backend |
 | `tools/mutation.rs` | 定义 mutation lock、file mutation queue、`ToolMutationKey`，保证同文件或同资源 mutation 串行 | 不决定模型是否可调用工具 |
 | `tools/builtin/read.rs` | `read` 工具定义和 executor | 不做全局 registry |
 | `tools/builtin/grep.rs` | `grep` 工具定义和 executor | 不做全局 registry |
@@ -139,7 +139,7 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 | `tools/builtin/write.rs` | `write` 工具定义和 executor；使用 mutation queue | 不绕过 policy/approval |
 | `tools/builtin/edit.rs` | `edit` 工具定义和 executor；精确替换；使用 mutation queue | 不绕过 policy/approval |
 | `tools/builtin/apply_patch.rs` | `apply-patch` 工具定义和 executor；patch 解析/应用；使用 mutation queue | 不绕过 policy/approval |
-| `tools/builtin/bash.rs` | `bash` 工具定义和 executor；timeout、stdout/stderr streaming、cancel、cwd/sandbox | 不直接使用 provider/auth |
+| `tools/builtin/bash.rs` | post-MVP reserved：`bash` 工具定义和 executor；只有 enforcement gate 满足后才实现/启用 | 不直接使用 provider/auth，不提供 best-effort sandbox |
 
 ## Public Interface
 
@@ -417,7 +417,7 @@ pub enum ToolExecutionMode {
 
 ## Sandbox Source Of Truth
 
-`ToolSandboxView` 是工具安全边界的 source of truth。UI approval 只能表达用户意愿，不能替代 sandbox。所有工具在 executor 前必须拿到 planner 计算出的 sandbox verdict。
+`ToolSandboxView` 是工具路径授权和请求执行约束的 source of truth。它必须诚实区分 MiniCore 进程内可保证的 path authorization，以及只有 OS-native/external backend 才能强制的 process/network enforcement。UI approval 只能表达用户意愿，不能替代 enforcement。所有工具在 executor 前必须拿到 planner 计算出的 verdict；请求的限制超出 effective capabilities 时必须 fail closed。
 
 ```rust
 pub struct ToolSandboxView {
@@ -425,20 +425,36 @@ pub struct ToolSandboxView {
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
     pub denied_roots: Vec<PathBuf>,
-    pub process: ProcessSandboxPolicy,
-    pub network: NetworkSandboxPolicy,
+    pub shell: ShellExecutionPolicy,
+    pub network: NetworkAccessPolicy,
+    pub enforcement: SandboxEnforcement,
     pub env: EnvSandboxPolicy,
 }
 
-pub enum ProcessSandboxPolicy {
+pub enum ShellExecutionPolicy {
     Disabled,
-    AllowListed { commands: Vec<String> },
-    WorkspaceShell { timeout: Duration },
+    Sandboxed { timeout: Duration },          // post-MVP reserved
+    FullAccessWithApproval { timeout: Duration }, // post-MVP reserved
 }
 
-pub enum NetworkSandboxPolicy {
-    Disabled,
-    AllowListed { hosts: Vec<String> },
+pub enum NetworkAccessPolicy {
+    DenyAll,
+    ProxyAllowList { hosts: Vec<String> },
+    Unrestricted,
+}
+
+pub enum SandboxEnforcement {
+    InProcessBuiltin,
+    OsNative { backend: String, capabilities: SandboxCapabilities },
+    External { backend_id: String, capabilities: SandboxCapabilities },
+    Unavailable,
+}
+
+pub struct SandboxCapabilities {
+    pub filesystem_roots: bool,
+    pub process_tree: bool,
+    pub deny_network: bool,
+    pub proxy_allowlist: bool,
 }
 
 pub enum ToolSandboxVerdict {
@@ -455,10 +471,16 @@ pub enum ToolSandboxVerdict {
 - path 必须落在 `read_roots` 才能读取，落在 `write_roots` 才能写入；`denied_roots` 优先级最高。
 - 不存在的待创建文件必须 canonicalize 它最近存在的父目录，并校验目标路径不会通过 symlink 跳出 `write_roots`。
 - 路径比较必须使用平台语义；大小写不敏感文件系统不能只用字节前缀判断。
-- bash 的 `cwd` 必须落在允许的 workspace cwd 内；bash 默认不能访问 network，除非 `NetworkSandboxPolicy` 明确允许。
+- 内置文件工具必须在打开/创建目标时继续使用平台安全的 no-follow 或 handle-relative 机制，并在必要时重新校验实际 handle 对应路径；临时文件必须在允许目录内创建后再原子 rename，避免 check/use 之间的明显逃逸。
 - 后期 hook `RewriteArgs` 后必须重新 schema validate、重新 canonicalize、重新 sandbox check、重新 policy evaluate。
 
-executor 不能自行扩大 sandbox。executor-local 检查只能比 `ToolSandboxView` 更严格，不能更宽松。
+执行规则：
+
+- MVP `ShellExecutionPolicy::Disabled`，`bash` 不进入 active tools。
+- `Sandboxed` 要求 backend 至少覆盖请求涉及的 filesystem roots、完整 process tree 和 network policy；任一 capability 缺失都返回 typed `SandboxUnavailable` / denied tool result，不能降级执行。
+- `ProxyAllowList` 只有在 backend 能禁止 direct network 且流量必须经过受控 proxy 时才可满足；单纯检查 hostname、清理 proxy 环境变量或屏蔽常见网络命令不算 enforcement。
+- `FullAccessWithApproval` 使用当前用户权限执行，明确没有 sandbox guarantee；它必须通过显式高风险 approval，不能被展示为 sandbox，也不能由普通 remembered grant 隐式开启。
+- executor 不能自行扩大授权或 enforcement。executor-local 检查只能比 `ToolSandboxView` 更严格，不能更宽松。
 
 ## Tool Batch Invocation 流程
 
@@ -543,10 +565,10 @@ UI 本地化只能改变 `label`，不能改变 LLM 可调用的 canonical tool 
 | active tool check | `active.rs` + `planner.rs` | 未启用工具返回 error tool result |
 | schema validation | `planner.rs` | executor 前完成 |
 | preview 构造 | `planner.rs` | 不放在纯 `ToolPolicy` |
-| sandbox source of truth | `sandbox.rs` | 定义路径、读写域、进程/网络边界 |
+| sandbox source of truth | `sandbox.rs` | 定义路径授权、shell/network 请求策略和 effective enforcement capability |
 | 文件 mutation 串行 | `mutation.rs` + builtin mutation tools | 同文件/同资源 lock |
 | read/grep/find/ls 可并行 | `ToolExecutionMode::Parallel` | 默认 parallel |
-| bash 可限制顺序/沙箱/timeout/cancel | `builtin/bash.rs` + `sandbox.rs` | bash 默认可按 policy 降级 sequential |
+| bash 可限制顺序/timeout/cancel | `builtin/bash.rs` + `sandbox.rs` | MVP 默认禁用；后续只有 enforcement capabilities 满足策略时才能启用 |
 | executor 实现包含在 Tools | `tools/builtin/*` | builtin executors 在 Tools 子系统内 |
 | MCP / extension tools 后续扩展 | `registry.rs` / `executor.rs` | 注册为 `RegisteredTool` 后走同一路径 |
 | tool progress / output streaming | `events.rs` + `ToolUpdateSink` | Tools 不直接发 UI event |
@@ -564,14 +586,17 @@ MVP 默认只启用只读工具：
 - `find`
 - `ls`
 
-后续再启用高风险工具：
+路径安全、审批、abort 和 mutation queue 完成后可独立启用文件变更工具：
 
 - `write`
 - `edit`
 - `apply-patch`
+
+通用进程执行延后：
+
 - `bash`
 
-高风险工具必须接入审批、工作区沙箱、abort signal 和 mutation queue。UI 审批只是 `ToolPolicy` 的输入，不是安全边界。
+canonical 内置工具名只定义稳定身份，不表示该工具默认 active。文件变更工具必须接入进程内路径授权、安全文件打开、审批、abort signal 和 mutation queue。`bash` 在 MVP 不 active；后续 `Sandboxed` 模式必须由满足策略的 OS-native/external backend 强制，能力不足 fail closed。显式 `FullAccessWithApproval` 没有隔离保证，UI 必须清楚展示风险。
 
 ## 设计约束
 

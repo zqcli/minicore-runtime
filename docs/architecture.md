@@ -82,7 +82,7 @@ CLI Adapter       Ratatui Adapter     Tauri/Vue Adapter
 - `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
 - `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
 - `ModelGateway` 是真实模型调用边界；`Driver` 只传 `ModelSelection`，不解析 provider、凭据、base URL 或 raw payload。
-- 工具注册、活跃工具、审批、授权记忆、沙箱、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...) -> ToolBatchInvoker.invoke_batch(...)` 进入工具管线，stable commit、审批 control 和公共事件仍回到 owner actor。
+- 工具注册、活跃工具、审批、授权记忆、路径授权、sandbox enforcement capability、mutation lock 和真实副作用执行由 `SessionRuntime` 持有的 session-scoped `Tools` 子系统统一治理；active `RunTask` 通过 `DriverHost::invoke_tool_batch(...) -> ToolBatchInvoker.invoke_batch(...)` 进入工具管线，stable commit、审批 control 和公共事件仍回到 owner actor。MVP 不启用通用 `bash`；请求的子进程限制无法由 OS-native/external backend 强制时必须 fail closed。
 - 上下文压缩由 `SessionRuntime` 编排，`Compaction` 模块提供准备、摘要 prompt 和压缩摘要消息 helper；`Driver` 不执行压缩。
 - 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。资源身份、overlay 和 snapshot 归 `ResourceManager`；结构化 intent 展开和最终模型输入组装归 Prompt。
 
