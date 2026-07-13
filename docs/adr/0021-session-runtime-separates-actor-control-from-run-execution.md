@@ -13,7 +13,7 @@
 
 `SessionRuntime` actor 是单 session 的唯一权威 mutable-state owner，持有 `SessionPhase`、`CurrentRun` projection、queues、pending session actions、model/options、session-scoped `Tools` 生命周期、stable batch admission、post-run arbitration 和公共事件归约。它可以在一次不可取消的 `SessionWriter.commit(...)` 临界区内等待确定结果，但不能在 mailbox loop 内等待 provider call、工具执行、approval decision 或完整 `Driver::drive_run()`。
 
-每次已经公开启动的 Agent run 由一个短期 `RunTask` 推进。`RunTask` 拥有 `Driver`、Rig `AgentRun`、run-local usage/limits、cancellation token 和 owned `SessionDriverHost`；同一 session 的 MVP 同时最多有一个 active `RunTask`。`RunTask` 不拥有 session phase、queues、pending actions、session writer、公共 event sequence 或 terminal arbitration。
+每次已经公开启动的 Agent run 由一个短期 `RunTask` 推进。`RunTask` 拥有 `Driver`、run-local usage/limits、cancellation token 和 owned `SessionDriverHost`；Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment。同一 session 的 MVP 同时最多有一个 active `RunTask`。`RunTask` 不拥有 session phase、queues、pending actions、session writer、公共 event sequence 或 terminal arbitration。
 
 生产实现的 `SessionDriverHost` 不携带指向 actor state 的长期 `&mut` 引用。它持有 immutable run identity/context、`ModelGateway` handle、绑定本次 immutable tool/profile baseline 的 run-only `ToolBatchInvoker`、cancellation token，以及一个私有窄 `RunLink`。`RunLink` 只允许 `RunTask` 向 owner actor 提交 lifecycle update、safe-point request、完整 tool-round commit candidate 和 terminal result，并通过 request/reply 得到 `NextModelCallPlan`、`FinishDecision` 或 actor 最终提交的 `ToolBatchResult`；它不是公开 `SessionRuntimeHandle`，不能提交任意 session command。
 

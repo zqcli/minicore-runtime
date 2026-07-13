@@ -504,8 +504,8 @@ CommandCatalogEvent::Changed {
 - `/status` 在 active work 中按 `Immediate` 执行，command output 可立即显示且不进入模型上下文。
 - prompt-producing slash command 在 active work 中按 `prompt_delivery` 进入 steer/follow-up/next-turn，不把 raw slash text 入队。
 - `/compact` 在 idle 时立即进入 handler，在 active work 时 resolve 为 `QueueAfterRun`，不能隐式调用 `AbortRun` 或转换成 follow-up message。
-- `/skill review` + `Steer` 在下一模型调用前注入结构化 skill prompt intent；相同命令 + `FollowUp` 等当前 work 后再启动，不重复 parse raw slash text。
-- runtime 尚不支持运行中注入时，`Steer` 返回明确 capability/phase error，不能静默变成 `FollowUp`。
+- `/skill review` + `Steer` 在完整 assistant/tool turn 后、下一模型调用前注入结构化 skill prompt intent；若 Rig segment 原本将结束，则在 `before_run_finish` 通过同一 `RunId` 的 segment rollover 继续。相同命令 + `FollowUp` 等当前 work 后再启动，不重复 parse raw slash text。
+- compaction、suspended 等暂时没有 Steer 安全点时保持 steering queue；不能返回成功后静默变成 `FollowUp`。
 - pending compact 已存在或 compaction 已开始时，重复执行分别返回 `CompactAlreadyQueued` / `CompactionAlreadyRunning`。
 - UI-visible catalog/result 不包含完整 `AgentCommand`、handler key、resource body 或 secret。
 - 高权限 `InternalAgentCommand` 不出现在公开协议、快照、事件或 command output 中。

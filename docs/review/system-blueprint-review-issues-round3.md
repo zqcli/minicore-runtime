@@ -18,7 +18,7 @@
 
 蓝图已达到可以进入实现的成熟度：四表面分离（ADR 0018）、单可信 batch writer（ADR 0019）、单终态 `run_finished`（ADR 0003）、无 current session（ADR 0020）、级联不可变资源快照（ADR 0010）、`CommandRunPolicy` 与 `PromptDelivery` 正交（ADR 0016）、ModelGateway spine 先行（ADR 0014）构成了自洽且互相咬合的不变量体系。持久化与事件生命周期两个最难闭合的层面已具备 conformance-test-first 的开发条件。
 
-一个重要的外部验证：蓝图整体押注的 Rig sans-IO `AgentRun` / `AgentRunStep` 路径**在上游真实存在**（rig-core 0.39.0，2026-06-19，PR #1899），`CallModel` / `CallTools` / `Done`、`tool_results()`、可序列化 `AgentRun` 与 `driver.md` 伪代码逐字段吻合，存在性风险解除。但 0.40.0（2026-07-10）已围绕该 API 做了一轮 breaking change，且蓝图从未 pin 版本——细节形状风险仍在（BR-049）。
+一个重要的外部验证：蓝图整体押注的 Rig sans-IO `AgentRun` / `AgentRunStep` 路径**在上游真实存在**（rig-core 0.39.0，2026-06-19，PR #1899），`CallModel` / `CallTools` / `Done`、`tool_results()`、可序列化 `AgentRun` 与 `driver.md` 伪代码逐字段吻合，存在性风险解除。后续对 rig-core 0.40.0、Pi、Codex、OpenClaw 和 Attractor 的核对进一步确认 Steer/FollowUp 的交付边界可以落在 Rig step 之间；当前没有发现阻止 MiniCore 采用 Rig 的架构级障碍。版本 pin 和字段映射转为真实 Driver integration spike 的延期验收项（BR-049）。
 
 本轮结论是"可以开工，但有前置"。前置项集中在四类：
 
@@ -35,7 +35,7 @@
 
 状态：Resolved
 
-处理记录：新增 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，明确每个 loaded session 由一个持续运行的 `SessionRuntime` actor 持有权威 mutable state，`SessionRuntimeFactory::spawn(...)` 返回显式可克隆 `SessionRuntimeHandle`；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` / Rig `AgentRun` 和 owned `SessionDriverHost`。生产 host 不再借用 `&mut Tools` / queues / `CurrentRun`，而是持有 run-only `ToolBatchInvoker`、`ModelGateway` handle、cancellation、progress sink 和私有 `RunLink`；actor 保留 tool admin/approval capability。外部 command 与 run safe-point/tool-round/terminal effect 在 actor 处线性化；approval wait 不得持有阻止 decision path 的锁；abort 与 commit 继续按 ADR 0019 的 commit-admission 规则裁决。
+处理记录：新增 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，明确每个 loaded session 由一个持续运行的 `SessionRuntime` actor 持有权威 mutable state，`SessionRuntimeFactory::spawn(...)` 返回显式可克隆 `SessionRuntimeHandle`；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` 和 owned `SessionDriverHost`，Driver 私有持有当前 Rig `AgentRun` segment。生产 host 不再借用 `&mut Tools` / queues / `CurrentRun`，而是持有 run-only `ToolBatchInvoker`、`ModelGateway` handle、cancellation、progress sink 和私有 `RunLink`；actor 保留 tool admin/approval capability。外部 command 与 run safe-point/tool-round/terminal effect 在 actor 处线性化；approval wait 不得持有阻止 decision path 的锁；abort 与 commit 继续按 ADR 0019 的 commit-admission 规则裁决。
 
 验证结果：`DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown 在 active `RunTask` 等待 model/tool/approval 时仍可由 actor 处理；旧 `SessionDriverHost<'a>` mutable-borrow 草图已从 `session-runtime.md`、`driver.md` 和 ADR 0011 移除，并在事件 Test Matrix 中增加 actor responsiveness、approval wakeup、safe-point transaction、run identity fencing 和 control/progress ordering 场景。
 
@@ -57,7 +57,7 @@
 
 处理记录：采用以 `PromptCallProfile` 和 call-time lanes 为输入的纯 `prompt::project_model_call(ModelCallProjectionInput { profile, ... })`。`PromptTurn` 只负责 pin captured resources、展开 resource-backed `PromptIntent` 并提供原子 profile；Driver 从 `DriverTurnInput` 持有 owned/Arc-backed profile，在 safe point 后整体替换 active profile，再调用 Prompt projection。ADR 0017 已补充 receiver 勘误，ADR 0013 明确该调用不会把 `PromptTurn` 或 resources 扩大进 Driver seam。
 
-验证结果：`prompt.md` facade、`driver.md` CallModel flow、`session-runtime.md` run flow、`model-gateway.md`、`runtime-hooks.md`、`resource-manager.md`、模块总览和 glossary 已统一；当前权威文档中不再存在 `PromptTurn.project_model_call(...)` 或 `Prompt::project_model_call(...)`。projection interface 继续使用 MiniCore-owned provider-neutral types，不提前冻结 BR-049 尚待验证的 Rig 字段形状。
+验证结果：`prompt.md` facade、`driver.md` CallModel flow、`session-runtime.md` run flow、`model-gateway.md`、`runtime-hooks.md`、`resource-manager.md`、模块总览和 glossary 已统一；当前权威文档中不再存在 `PromptTurn.project_model_call(...)` 或 `Prompt::project_model_call(...)`。projection interface 继续使用 MiniCore-owned provider-neutral types，不提前冻结 BR-049 延后到 Driver integration spike 才验证的 Rig 字段形状。
 
 原问题：Prompt 的最终投影入口 `project_model_call` 在三处有三种不相容的形态。`prompt.md` facade 把它定义为 `PromptTurn::project_model_call(&self, ModelCallProjectionInput)`，profile 来自 `self.profile`；`driver.md` 的 CallModel step 写成自由函数 `prompt::project_model_call(history, prompt, DriverTurnInput.prompt, context materials)`；`session-runtime.md` 散文又说"由 `Driver` 调用 Prompt 的 final projection seam / `Prompt::project_model_call(...)`"。而 `driver.md` 与 ADR 0013 明令 `DriverTurnInput` 不得携带 `PromptTurn`。三者合起来无解：Driver 是调用者，却拿不到 `PromptTurn` 这个 receiver。
 
@@ -71,22 +71,19 @@
 
 决策结果：选择自由函数而不是 `PromptCallProfile` 方法，因为 profile 是 projection 的原子静态 baseline，但 durable/current/context/output-contract lanes 是同级 call-time 输入；算法 owner 仍是无状态 Prompt 模块。未选择把 `PromptTurn` 放进 `DriverTurnInput`，也未增加 `DriverHost` / `RunLink` projection callback，避免资源 seam 扩大、host-local mirror/stale lease 和无必要 mailbox round trip。
 
-### BR-049：Rig 版本未 pin，且大量字段级类型先于 spike 冻结在未验证的 Rig 形状上
+### BR-049：Rig 版本与字段级映射需要在真实 Driver spike 中定型
 
-状态：Open
+状态：Deferred
 
-问题：Driver 设计的字段级细节建立在 Rig sans-IO API 的具体形状上，但蓝图从未 pin rig-core 版本。上游 0.39.0 落地该 API 后，0.40.0（两天前）已围绕它做了一轮 breaking change（hook system v2、`AgentRunner`、structured tool-execution results、builder 改名），Unreleased 还有 `PromptError` non-exhaustive 等破坏性变更。同时 `driver.md` 对 Rig 真实协议分支建模偏浅：上游存在而文档未覆盖的有 `ModelTurnOutcome::NeedsResolution(InvalidToolCallContext)`（需选恢复策略并调 `resolve_invalid_tool_call`）、`PendingToolCall.preresolved_result`（有值时须绕过工具执行直接回填，与全治理管线的关系未定义）、构造 `ModelTurn` 需要 rig `Usage` 与 `executable/allowed_tool_names`（要求 `ModelCallResult` 的 usage 归一化**可逆**回 rig 类型，而当前 `ModelCallResult` 无承载字段）。此外 `NextModelCallPlan.persistent_messages`（steering）和 `FinishDecision::ContinueWithMessages` 都要往进行中的 run 注入消息，但 `AgentRun` 公开 API 只有构造期 `with_history`，没有 mid-run append 入口——这是"承诺契约"里唯一在上游找不到直接支撑的点。
+处理记录：进一步核对 rig-core 0.40.0 源码及 Pi、Codex、OpenClaw、Attractor 的公开实现/契约后，确认 Steer 的通用语义是“当前 assistant turn 的模型输出及完整工具批次结束后、下一次 LLM 调用前交付”，FollowUp 则在当前 work 原本将结束时交付。MiniCore 不要求在 provider streaming、模型请求或工具执行中途修改 Rig 状态。
 
-证据：
+Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协议安全点；若当前 assistant turn 没有工具并使 Rig 即将 `Done`，`before_run_finish` 仍可先检查 steering queue。Rig 0.40.0 没有公开的 mid-run history append 方法，但这不构成架构障碍：Driver 可以把一次公开的 MiniCore run 实现为同一 `RunId` 下一个或多个顺序 Rig `AgentRun` segment，在已 committed 的 Steer 安全点使用旧 segment 的 `full_history()` 和 steering message 创建新 segment。segment rollover 是 Driver 私有实现细节；run-level usage、turn/重试预算、cancellation 和事件关联必须在 Driver 外层连续累计。FollowUp 继续遵循 MiniCore 现有语义，在当前 work chain 完成后启动新的公开 run。
 
-- `docs/modules/driver.md`：`feed_model_response_to_rig` / `feed_tool_results_to_rig` 等伪代码假设的 Rig 形状；未出现 `ModelTurnOutcome::NeedsResolution` / `preresolved_result` 处理路径。
-- `docs/modules/model-gateway.md`：`ModelCallResult` 无回传 rig `Usage` / tool-name 集合的字段。
-- `docs/modules/session-runtime.md`：`NextModelCallPlan.persistent_messages`；Rig 无 mid-run history append 入口（上游核对）。
-- round2 过程性观察 #1 已预警"字段级设计先行于 Rig 验证"。
+验证结论：当前没有发现阻止 MiniCore 采用 Rig sans-IO Agent loop 的架构级障碍；`NextModelCallPlan.persistent_messages` 可以通过 segment rollover 落地，不需要 fork Rig 或要求上游提供 token/tool 执行中的即时注入。原先“steering 可能在 spike 中证伪并连锁推翻接口”的风险解除。
 
-风险：Rig 每次升级都是隐形返工；steering 注入若在 spike 中证伪，`persistent_messages` / `ContinueWithMessages` 一线类型连锁返工。
+延期事项：真实 Driver integration spike 开始时，按 ADR 0014 的“spine 先行”顺序完成并固化 Rig 映射矩阵：`MessageRecord ⇄ rig::Message/AssistantContent/UserContent`、`ModelCallResult → ModelTurn`、`TokenUsage ⇄ rig::Usage`、`ModelTurnOutcome::NeedsResolution`、`PendingToolCall.preresolved_result`、effective executable/allowed tool names，以及 Steer segment rollover。创建 `Cargo.toml` 时精确 pin 经 spike 验证的 rig-core 版本并提交 lockfile；在此之前继续冻结无测试支撑的 Rig 字段级扩张。
 
-待处理方向：按 ADR 0014 的"spine 先行"顺序，把阶段 2 spike 的验收产物固化为一份"Rig 映射矩阵"文档（`MessageRecord ⇄ rig::Message/AssistantContent/UserContent`、`ModelCallResult → ModelTurn`、`TokenUsage ⇄ rig Usage`、`ModelTurnOutcome` / `preresolved_result` 处理、steering 注入策略）；pin rig-core 精确版本；矩阵产出前冻结 driver/model-gateway 的字段级扩张。`Steer` 不可用时必须返回 `SteerUnavailable`（已在 `session-runtime.md` 规定），该保险在 spike 结论前保留。
+重新打开条件：segment rollover 无法保持协议 history 或 run-level budget/usage 语义；Rig 类型无法通过 MiniCore-owned provider-neutral 类型无损映射；同版本、同 host 生命周期内的 suspend/resume 无法满足要求；或 Rig 升级产生无法局限在 `driver/rig.rs` / `model_gateway/rig.rs` 的接口变化。
 
 ### BR-050：tool sandbox 只有进程内校验规范，缺 OS 级 enforcement 方案
 

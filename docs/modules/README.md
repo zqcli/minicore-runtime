@@ -31,7 +31,7 @@ LoadedSessionRuntimes  SessionHandle                       Rig providers
 SessionRuntimeHandle   SessionStorage
       │
       ▼
-SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── Driver ── Rig AgentRun
+SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── Driver ── Rig AgentRun segment(s)
       │
       ┌──────────────┬──────────────┬────────┬─────────────┬─────────────┐
       ▼              ▼              ▼        ▼             ▼             ▼
@@ -44,7 +44,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；factory 为每个 loaded session 启动 actor，`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver` / Rig `AgentRun`，通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`。
+`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment，并通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；每次 run 启动时从 `ResourceManager` 捕获 `TurnResourceSnapshot` 进 `TurnState`。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、commit 后领域事实、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 

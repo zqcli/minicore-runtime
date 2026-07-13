@@ -1,6 +1,6 @@
 # Driver
 
-`Driver` 是 `SessionRuntime` 内部的 Rig sans-IO 适配器。它只负责把 Rig `AgentRunStep` 转换成产品运行时可执行的 I/O 请求，并把 I/O 结果喂回 Rig。
+`Driver` 是 `SessionRuntime` 内部的 Rig sans-IO 适配器。它只负责把 Rig `AgentRunStep` 转换成产品运行时可执行的 I/O 请求，并把 I/O 结果喂回 Rig。一次公开的 MiniCore run 通常推进一个 Rig `AgentRun`；active Steer 需要 continuation 时，可以在同一 `RunId` 下顺序推进多个 Rig `AgentRun` segment。
 
 一句话边界：
 
@@ -76,7 +76,7 @@ Rig AgentRun
   → owns protocol state machine
 
 Driver
-  → drives steps and maps I/O
+  → drives one or more sequential Rig AgentRun segments and maps I/O
 
 SessionRuntime
   → owns queues, phase, persistence, tool state, model state, future run safe-point hooks
@@ -104,6 +104,8 @@ pub async fn drive_run(
 不要暴露 `run_prompt()` / `continue_run()` 两个顶层方法。它们容易和 Rig 自身 prompt API、session continuation、queued follow-up 混淆。统一使用 `drive_run()`，通过 `DriveEntry` 表达进入本次 run 的方式。
 
 `drive_run()` 不再返回 `Result<DriveResult, DriverError>`。普通 provider/tool/protocol 失败应归约为 `DriveResult::Failed`，让 `SessionRuntime` 统一完成 diagnostics、UI lifecycle 收尾和 run terminal event；失败或 abort 时的 partial output 不进入 session writer。
+
+`RunId` 绑定一次公开的 `drive_run()`，不绑定某个具体 Rig `AgentRun` 对象。Steer 在已完成 assistant/tool turn 的安全点被 commit 后，Driver 可以用当前 segment 的 `full_history()` 和 steering message 创建下一个 Rig segment；该 rollover 不重新分配 `RunId`，也不重置 run-level usage、limits、cancellation 或事件 correlation。Rig segment 只属于 `driver/rig.rs` 私有实现，不进入 `DriveRequest`、协议、snapshot 或 session storage。
 
 ```rust
 pub struct DriveRequest {
@@ -192,7 +194,7 @@ pub trait DriverHost {
 - `call_model`：真实 provider 调用不属于 `Driver`。
 - `invoke_tool_batch`：工具执行不属于 `Driver`；host 内部由 `SessionRuntime` 转发给 session-scoped `Tools` 子系统。
 - `before_next_model_call`：比 `prepare_next_turn` 更准确，避免 Rig turn、user turn 和 session turn 混淆。
-- `before_run_finish`：比 `drain_follow_up` 更深，允许 `SessionRuntime` 决定 finish、continue with follow-up、suspend、retry 或 abort。
+- `before_run_finish`：Rig segment 原本将结束时的最后安全点，允许 `SessionRuntime` 决定 finish、用已 committed Steer rollover、suspend、retry 或 abort；FollowUp 由 `SessionRuntime` 在公开 run 结束后的 post-run arbitration 中启动新 run。
 
 ## SessionDriverHost Wrapper
 
@@ -390,7 +392,7 @@ AgentRunStep::CallModel { prompt, history, turn }
 
 `ModelCallRequest` 必须是 MiniCore-owned provider-neutral 类型。`Driver` 初始化 run-local `active_prompt_profile = request.turn.prompt.clone()` 和 MVP `active_output_contract: Option<OutputContract> = None`；safe point 若返回 replacement profile，只能整体替换该值。每次 CallModel 时，Driver 把 Rig step 的 prompt/history、`&active_prompt_profile` 和 safe-point context materials 交给 `prompt::project_model_call(...)`，得到已校验的 `ModelInputProjection`；随后从 projection 复制 system prompt/messages/tools/output contract，并从 `DriverTurnInput` 复制 `ModelSelection`、thinking level 和 stream options。Driver 不能直接从 profile 拼请求、读取 `TurnState.resources`、解析 `ProviderRegistry`、读取 `AuthStore`、构造 provider client、持有 base URL，也不能把 `rig::providers::*` 类型放进 Prompt interface 或 request。Agent loop 路径固定使用 `ModelCallPurpose::AgentRun`，`max_output_tokens` 默认由 output contract 或模型设置决定。完整请求结构见 [ModelGateway](model-gateway.md)。
 
-MVP Agent run 的 `active_output_contract` 固定为 `None`；`ModelCallProjectionInput.output_contract` 先保留 provider-neutral 能力，供后续结构化输出或 required-tool-choice 场景使用。未来若启用，它必须来自 MiniCore-owned typed call policy / drive entry，而不是从 `PromptTurn`、provider payload 或未验证的 Rig 字段侧取；Rig 到该类型的具体映射由 BR-049 spike 决定。
+MVP Agent run 的 `active_output_contract` 固定为 `None`；`ModelCallProjectionInput.output_contract` 先保留 provider-neutral 能力，供后续结构化输出或 required-tool-choice 场景使用。未来若启用，它必须来自 MiniCore-owned typed call policy / drive entry，而不是从 `PromptTurn`、provider payload 或未验证的 Rig 字段侧取；Rig 到该类型的具体映射由后续 Driver integration spike 决定。
 
 ## CallTools Step
 
@@ -419,12 +421,12 @@ AgentRunStep::CallTools { calls }
 
 ```text
 before_next_model_call
-  在一次 model response 和 tool results 已经回填后、下一次 CallModel 前触发。
+  在当前 assistant turn 的 model response 和完整 tool batch 已经结束、tool results 已回填后、下一次 CallModel 前触发。
   SessionRuntime 返回组合式 NextModelCallPlan，可同时注入 steering messages、整体替换 PromptCallProfile、patch model options、提供 typed context materials，或 abort/suspend。
 
 before_run_finish
-  在 Rig 即将 Done 时触发。
-  SessionRuntime 可决定结束、注入 follow-up 继续运行、suspend、retry 或 abort。
+  在 Rig segment 即将 Done 时触发。
+  SessionRuntime 可决定结束、消费刚到达的 Steer 并 rollover、suspend、retry 或 abort。
 ```
 
 建议类型：
@@ -449,14 +451,14 @@ pub enum NextModelCallControl {
 
 pub enum FinishDecision {
     Finish,
-    ContinueWithMessages(Vec<MessageRecord>),
+    ContinueWithSteering(Vec<MessageRecord>),
     Retry { reason: RetryReason },
     Abort { reason: String },
     Suspend { reason: SuspendReason },
 }
 ```
 
-`NextModelCallPlan` 是一次 safe-point transaction：Driver 先应用 persistent messages，再整体替换可选 `PromptCallProfile` 和 model options，最后把 current-run/current-call materials 交给 Prompt projection。plan 不能携带 resources、context provider handle、queue/storage 或 tool governance state；system prompt 与 tool schemas 不允许作为两个独立 patch 字段。MVP 可以先让 context vectors 为空，但不应退回互斥 decision enum。
+`NextModelCallPlan` 是一次 safe-point transaction：Driver 先应用 persistent messages，再整体替换可选 `PromptCallProfile` 和 model options，最后把 current-run/current-call materials 交给 Prompt projection。由于 Rig 0.40.0 没有公开的 mid-run history append，已 committed 的 `persistent_messages` 通过 `full_history() + steering prompt` 创建下一 Rig segment；`FinishDecision::ContinueWithSteering` 在原 segment 即将 Done 时使用同一 rollover。plan 不能携带 resources、context provider handle、queue/storage 或 tool governance state；system prompt 与 tool schemas 不允许作为两个独立 patch 字段。MVP 可以先让 context vectors 为空，但不应退回互斥 decision enum。
 
 ## Error And Abort Semantics
 
