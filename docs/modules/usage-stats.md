@@ -9,7 +9,7 @@ Usage / Cost Tokens != Context Usage
 ```
 
 - `Usage` 表示模型调用真实消耗，用于展示本次 run、会话累计和后续成本估算。
-- `ContextUsage` 表示下一次模型请求会占用多少上下文窗口，用于上下文进度条、预检和压缩触发。
+- `ContextUsage` 表示下一次模型请求会占用多少上下文窗口，用于上下文进度条、pre-run threshold gate 和压缩触发；最终 call projection validation 仍负责权威拒绝。
 
 adapter 不应自己从消息估算 token。它只消费 `usage_updated`、`run_finished { usage }`，以及对应 `agent_runtime_protocol::RuntimeSnapshot.loaded_sessions[*].session_stats` / `context_usage`。
 
@@ -185,7 +185,7 @@ compaction summary / branch summary: summary chars / 4
 - context usage 预览。
 - compaction threshold。
 - provider usage 不可用时的 fallback。
-- 提交前的 overflow 风险提示。
+- run 启动前的 context-limit 风险提示。
 
 估算不用于：
 
@@ -320,4 +320,4 @@ current_tokens >= context_window - reserve_tokens: should compact
 - 不要因为 compaction 降低 session cumulative usage。
 - 不要把本地估算当成账单权威。
 - 不要让 `Driver` 拥有 session stats；它只聚合当前 drive 的 usage facts。
-- 不要把 context overflow failure 作为模型可见 assistant message 参与 retry usage/context 计算。
+- 不要把 `DriverError::ContextLimitExceeded` 的 transient failure/partial assistant 作为模型可见消息参与 recovery usage/context 计算；`PromptProjection` source 没有 model-call usage，`Provider` source 保留实际 attempt/usage。

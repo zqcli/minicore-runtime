@@ -1,6 +1,6 @@
 # Compaction
 
-`Compaction` 是会话级上下文压缩能力。它把当前会话路径上的旧历史摘要成一条模型可见的压缩摘要消息，并保留最近上下文，使后续 Agent 运行在较小上下文中继续。
+`Compaction` 是会话级上下文压缩能力。MVP baseline 把当前会话路径上的旧历史摘要成一条 provider-neutral、模型可见的压缩摘要消息，并保留最近上下文；后期也可按当前模型 capability 使用 provider-native compact endpoint 生成 model-bound context replacement，使后续 Agent 运行在较小上下文中继续。
 
 一句话边界：
 
@@ -16,10 +16,11 @@ It does not drive Rig AgentRun, execute tools, scan resources, or write UI state
 ```text
 SessionRuntime
   → reads current root-to-leaf SessionEntry path
-  → compaction.rs prepares cut point and summary prompts
-  → ModelGateway generates summary
+  → compaction.rs prepares cut point and provider-neutral source
+  → resolves CompactionMethod from trigger, user preference and model capabilities
+  → ModelGateway generates portable summary or invokes a supported native compact endpoint
   → SessionHandle.commit(SessionWriteBatch::compaction(...))
-  → SessionHandle rebuilds context from SessionStorage as summary + kept messages
+  → SessionHandle rebuilds compatible context replacement + kept messages
   → SessionRuntime may start Driver again with DriveEntry::Continue
 ```
 
@@ -34,13 +35,13 @@ SessionRuntime
 
 ## 设计原则
 
-- `Compaction` 只负责 token estimate、cut point、summary instructions/material 和结果类型。
+- `Compaction` 只负责 token estimate、cut point、provider-neutral preparation、method plan rules、summary instructions/material 和结果校验。
 - `SessionRuntime` 负责 manual/auto orchestration、phase、abort、模型调用、事件和 post-run 顺序。
 - `SessionHandle` / `SessionWriter` / `SessionStorage` 负责提交 compaction batch 和重建 root-to-leaf context。
 - `Driver` / Rig Agent loop 不拥有压缩；overflow recovery 后从重建上下文启动新的 continuation。
 - running 时提交的 `Compact` defer 到 post-run safe point，不隐式 abort active run。
 
-pi coding-agent、LangChain 等实现可以作为摘要格式和 cut-point 行为的参考对象，但不构成 API、事件顺序或隐式 abort 行为的兼容承诺。MiniCore 的模型可见压缩消息固定为 user-role summary message：
+pi coding-agent、LangChain 等实现可以作为摘要格式和 cut-point 行为的参考对象，但不构成 API、事件顺序或隐式 abort 行为的兼容承诺。MVP `SummaryModel` 的模型可见压缩消息固定为 user-role summary message：
 
 ```text
 The conversation history before this point was compacted into the following summary:
@@ -75,6 +76,12 @@ pub struct CompactionSettings {
     pub summary_max_output_tokens: u64,
 }
 
+pub enum CompactionMethod {
+    SummaryModel,
+    ProviderNative,         // post-MVP reserved
+    DeterministicReduction, // bounded fallback
+}
+
 pub enum CompactionReason {
     Manual,
     Threshold,
@@ -103,6 +110,8 @@ pub struct CompactionResult {
 ```
 
 `CompactionResult.usage` 使用 durable `PersistedModelCallUsage`。`ModelGateway` 返回的 runtime `ModelCallUsage` 必须由 `SessionRuntime` 去除 `raw_provider_usage` 后再放入 result；hook-provided summary 没有模型调用时为 `None`。
+
+当前 `CompactionResult { summary, ... }` 是 `SummaryModel` baseline。后期 `ProviderNative` 若返回 GPT 类加密 context item，需要把 replacement 扩展为 portable summary 或 model-bound opaque artifact；上层只保存 opaque envelope 和 compatibility metadata，不解析或记录 payload。原始 session entries 继续保留，以便模型切换、artifact 拒绝或 capability 变化时重新压缩。具体 replacement enum 和 wire/storage 字段不属于 BR-053，留待 ProviderNative 开工时定型。
 
 推荐函数：
 
@@ -410,6 +419,12 @@ history before current input
 
 RAG、memory、IDE diagnostics 等 `CurrentCall` context 不进入 compaction source；`CurrentRun` context 是否摘要必须由其 owner 显式升级为 durable entry，不能由 Compaction 猜测。
 
+## Run 前阈值压缩
+
+`SessionRuntime` 在最终 `UserInput` batch commit 后、分配 `RunId` 前做同步、best-effort threshold gate。它使用 durable history、受保护 current input、prompt/tool baseline 的 `ContextUsage` 估算；若超过阈值，立即从 `Turn + current_run = None` 切换到独立 `Compaction` phase并发布 compaction lifecycle，再排除本次 committed input执行压缩。压缩后切回 `Turn`，重建 `TurnState` 并重新检查一次；通过后才分配 `RunId` 和发布 `run_started`。没有可压缩历史、protected input 本身过大或压缩后仍超限时返回 typed unrecoverable context-limit error，不启动幽灵 run。
+
+该 gate 用于提前避免常见超限，不替代 `Driver` 每次 CallModel 前的最终 `prompt::project_model_call(...)` 校验。tool results、Steer 或 transient context 可能让 run 内后续 call 才超限，此时走下面的 overflow recovery。
+
 ## 手动压缩流程
 
 ```text
@@ -445,7 +460,7 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
 
 如果没有可压缩内容，返回结构化错误：`AlreadyCompacted` 或 `NothingToCompact`。
 
-`AbortCompaction` 只取消 summary model call 和 hook wait，不修改已写入的 session entry。
+`AbortCompaction` 只取消当前 summary model call、后期 ProviderNative endpoint wait 和 hook wait，不修改已写入的 session entry。
 
 ## 自动压缩流程
 
@@ -468,19 +483,23 @@ threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steer
 context overflow 是压缩和 retry 的交界点。
 
 ```text
-Driver returns DriveResult::Failed { error: ContextOverflow }
-  → SessionRuntime verifies error belongs to current model
-  → if overflow recovery has not been attempted:
+Driver returns DriveResult::Failed
+  { error: DriverError::ContextLimitExceeded { source: PromptProjection | Provider, ... } }
+  → SessionRuntime verifies the error belongs to the current model/work chain
+  → if overflow recovery has not been attempted in this work chain:
        emit diagnostics only; do not persist the transient partial/error message
        run_auto_compaction(reason = Overflow, will_retry = true)
-       start a new drive_run with DriveEntry::Continue { reason: ContextOverflowRecovery }
+       rebuild context and start a new RunId with
+       DriveEntry::Continue { reason: ContextOverflowRecovery }
   → else:
-       emit `compaction_finished` with recovery failure and stop
+       stop with typed ContextStillTooLargeAfterCompaction
 ```
 
-transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状态都不进入 `SessionWriter`，因此 retry 只从最后 committed context 重建，不需要从 durable history 删除失败消息。
+`PromptProjection` 表示本地最终投影已超限且没有调用 provider/产生 model-call usage；`Provider` 表示 provider 已拒绝请求并可能带 attempt/usage。两者共享 recovery policy，但 diagnostics 和 usage source 不合并。transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状态都不进入 `SessionWriter`，因此 retry 只从最后 committed context 重建，不需要从 durable history 删除失败消息。
 
 压缩后的重试不要使用 `DriveEntry::Resume`。应使用重建后的 session context 启动新的 `DriveEntry::Continue`。
+
+overflow recovery budget 跨它创建的新 `RunId` 保留，整个 work chain 最多自动 compact-and-continue 一次。若 preparation 返回 `NothingToCompact`、protected current input 已占满有效窗口，或 recovery 后再次收到任一来源的 context limit，必须 fail closed，不能形成 compact/run 循环。
 
 ## AgentRuntimeEvents And RuntimeSnapshot
 

@@ -68,7 +68,7 @@ RunTask                         // one per publicly started run
 | `Compaction` | `None` | 只推进当前 compaction；prompt intent 可以排队但不能启动 Agent run |
 | `RetryBackoff` | `None` | 等待/取消 Agent run retry；prompt intent 可以排队但不能绕过既定 work chain |
 
-`Turn + current_run = None` 是不可通过 `AbortRun` 取消的有界 admission/preflight 或 post-run finalization 窗口。进入 provider/model/tool/approval 等可能长时间等待的 run work 前，`SessionRuntime` 必须先分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`。session-level auto retry delay 属于独立 `RetryBackoff` phase，并由 `AbortRetry` 取消，不属于该 run-start 规则。admission 中只允许 bounded in-memory validation、captured prompt assembly 和 required session commit；这里的 bounded 表示有限步骤且没有无界 lifecycle/external wait，不是硬实时延迟保证，writer commit 仍遵守不可中断与故障契约。未来 hook 若位于该窗口，也必须有界并由自身 timeout/error policy 收尾，不能把它变成隐藏的长任务。
+`Turn + current_run = None` 是不可通过 `AbortRun` 取消的有界 admission/preflight 或 post-run finalization 窗口。进入 provider/model/tool/approval 等可能长时间等待的 Agent run work 前，`SessionRuntime` 必须先分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`。admission 中只允许 bounded in-memory validation、captured prompt assembly、required session commit 和同步 threshold 判定；如果 pre-run gate 命中，actor 必须立即离开该窗口并显式切换到 `SessionPhase::Compaction`，随后才允许 summary model / ProviderNative 外部等待。该 session-scoped compaction 有自己的 phase/event/cancel lifecycle，不创建 Agent `RunId`。session-level auto retry delay同样属于独立 `RetryBackoff` phase，并由 `AbortRetry` 取消。这里的 bounded 表示有限步骤且没有无界 lifecycle/external wait，不是硬实时延迟保证，writer commit 仍遵守不可中断与故障契约。未来 hook 若位于 admission 窗口，也必须有界并由自身 timeout/error policy 收尾，不能把它变成隐藏的长任务。
 
 phase guard 还必须结合 `CurrentRunState` 和 command policy：`DecideToolApproval` 只在 `Turn + WaitingApproval` 合法，`ResumeRun` 只在 `Turn + Suspended` 合法；`AbortCompaction` 只在 `Compaction` 合法，`AbortRetry` 只在 `RetryBackoff` 合法。`Compact` 在 `Idle` 立即进入 `Compaction`，在 `Turn` / `RetryBackoff` 保存唯一 pending action，在 `Compaction` 返回 `CompactionAlreadyRunning`。
 
@@ -373,7 +373,7 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 
 ## Compaction Orchestration
 
-压缩由 `SessionRuntime` 编排，算法和 prompt helper 放在平级 [Compaction](compaction.md) 模块。`Driver` 不执行压缩，只把 usage、完成消息和 provider error 归约给 `SessionRuntime`。
+压缩由 `SessionRuntime` 编排，算法和 prompt helper 放在平级 [Compaction](compaction.md) 模块。`Driver` 不执行压缩，只把 usage、完成消息、Prompt projection/provider context-limit source 和 run result 归约给 `SessionRuntime`。
 
 手动压缩流程：
 
@@ -383,26 +383,25 @@ Hook 的边界、capability、typed result 和安全点规划见 [RuntimeHooks](
 4. 读取当前 leaf 的 root-to-leaf `SessionEntry` path。
 5. 调用 `compaction::prepare_compaction(path, settings)`，得到 `CompactionPreparation`。
 6. 后期启用 hook system 时，触发 `RuntimeHookRegistry.invoke(SessionBeforeCompact)`；Hook 可以取消、patch instructions 或提供完整 `CompactionResult`。当前 MVP 直接进入下一步。
-7. 如果未提供 hook result，则让 `Compaction` 构造 `CompactionSummaryMaterial`；`SessionRuntime` 选择摘要模型和调用选项，构造 `ModelCallPurpose::CompactionSummary` 的唯一 `ModelCallRequest`，再通过 ModelGateway 调用摘要模型；这不是 `Driver.drive_run()`。
+7. 如果未提供 hook result，则查询当前模型的 `CompactionCapabilities`，由 trigger、用户 preference 和 capability 解析 `CompactionMethod` plan。MVP `SummaryModel` 构造 `CompactionSummaryMaterial` 和 `ModelCallPurpose::CompactionSummary` 请求；后期 `ProviderNative` 由 ModelGateway adapter 调用专用 compact endpoint。两者都不进入 `Driver.drive_run()`。
 8. 构造 `SessionWriteBatch::compaction(...)`，通过 `SessionHandle.commit(batch)` 原子提交 compaction entry 与 leaf update，再调用上下文构建能力重建 messages。
-9. commit 成功后发出 `compaction_finished`，再由 post-compaction arbitration选择下一 phase：overflow recovery 或 queued steering/follow-up 将立即继续时切换到 `Turn` 并发布 `run_started`；需要延迟 retry 时进入 `RetryBackoff`；只有没有立即工作时才回到 `Idle` 并发布 `session_settled`。`NextTurn` 可以在 settled 状态保留，任何 immediate continuation 都不能先经过 `Idle`。
+9. commit 成功后发出 `compaction_finished`，再由 post-compaction arbitration选择下一 phase：pre-run gate 完成后切回 `Turn` 并首次分配 Agent `RunId`；overflow recovery 或 queued steering/follow-up 将立即继续时切换到 `Turn`，分配新的 public `RunId` 并发布 `run_started`；需要延迟 retry 时进入 `RetryBackoff`；只有没有立即工作时才回到 `Idle` 并发布 `session_settled`。只有 active Steer 的 Rig segment rollover 复用原 `RunId`，所有 post-compaction continuation 都是新 run。`NextTurn` 可以在 settled 状态保留，任何 immediate continuation 都不能先经过 `Idle`。
 
-自动压缩流程：
+run 前与自动压缩流程：
 
-1. `Driver` 返回 `DriveResult::Completed` 后，`SessionRuntime` 提交最终 `AssistantFinal` batch；`run_finished` 只能在 commit 成功后发布。
-2. 从最新 assistant usage 或估算值计算 context usage。
-3. 如果 `compaction::should_compact(...)` 为 true，执行 `run_auto_compaction(reason = Threshold, will_retry = false)`。
-4. threshold 压缩完成后不重跑刚完成的回答；如果队列里还有 queued steering continuation / follow-up，再从重建后的上下文继续。`NextTurn` 等下一次显式 prompt。
+1. pre-run：最终 `UserInput` commit 后、分配 `RunId` 前，以当前模型 capability 和 context estimate 同步执行 threshold gate；命中后切换 `Turn → Compaction`，保护 current input、执行压缩，再切回 `Turn` 重建并复验一次，通过后才首次发布 `run_started`。
+2. post-run：`Driver` 返回 `DriveResult::Completed` 后，`SessionRuntime` 提交最终 `AssistantFinal` batch并发布 `run_finished`，再从最新 assistant usage 或估算值计算 context usage。
+3. post-run 达到阈值时执行 `run_auto_compaction(reason = Threshold, will_retry = false)`；不重跑刚完成的回答。如果队列里还有 queued steering continuation / follow-up，再从重建后的上下文继续。`NextTurn` 等下一次显式 prompt。
 
 overflow recovery 流程：
 
-1. `DriveResult::Failed` 中的错误被识别为当前模型的 context overflow。
-2. 如果本轮尚未尝试过 overflow recovery，执行 `run_auto_compaction(reason = Overflow, will_retry = true)`。
-3. transient overflow failure 只进入 diagnostics，不写入 session；partial assistant 和旧 run 的未完成状态也不进入重试上下文。
-4. 压缩成功后，用重建后的 session context 启动新的 `DriveEntry::Continue { reason: ContextOverflowRecovery }`。
-5. 不使用 `DriveEntry::Resume` 恢复旧 `AgentRun`，因为旧 serialized run 内含压缩前 history。
+1. 当前 run 必须先发布 `run_finished { status: failed }`；随后其 `DriveResult::Failed` 被识别为当前模型/work chain 的 `DriverError::ContextLimitExceeded`，来源可以是 `PromptProjection` 或 `Provider`，再进入 `Compaction` phase并发布 `compaction_started { reason: overflow }`。
+2. 如果整个 work chain 尚未尝试 overflow recovery，记录该 budget 并执行 `run_auto_compaction(reason = Overflow, will_retry = true)`。
+3. transient overflow failure 只进入 diagnostics，不写入 session；PromptProjection source 不产生 model-call usage，provider source 保留已有 attempt/usage；partial assistant 和旧 run 的未完成状态不进入重试上下文。
+4. 压缩成功后必须先发布 `compaction_finished { will_retry: true }`，再用重建后的 session context 和新 `RunId` 启动 `DriveEntry::Continue { reason: ContextOverflowRecovery }`。
+5. recovery 后再次超限、没有可压缩内容或 protected current input 本身过大时，返回 typed unrecoverable error；不进行第二次自动 compact。也不使用 `DriveEntry::Resume` 恢复旧 `AgentRun`，因为旧 serialized run 内含压缩前 history。
 
-压缩摘要消息进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。启动新 prompt 时，Driver 应把当前完整 `PromptCallProfile`、压缩后的 durable history 与受保护 current input 分开交给 `prompt::project_model_call(...)`；当前输入不能在同一启动边界上被摘要。
+MVP `SummaryModel` 的压缩摘要消息进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。后期 `ProviderNative` replacement 通过 provider-neutral handle 与普通 messages 分离，只有 `ModelGateway` adapter 能读取 opaque payload。启动新 prompt 时，Driver 应把当前完整 `PromptCallProfile`、兼容的压缩后 durable context 与受保护 current input 分开交给最终 projection；当前输入不能在同一启动边界上被摘要。
 
 ## 队列语义
 
@@ -477,11 +476,12 @@ resolved command
 2. capture `TurnResourceSnapshot`，创建 `PromptTurn`，再让它展开目标 `PromptIntent`，得到 preliminary `ResolvedPromptInput` / `PromptCallProfile`。
 3. 构建 preliminary `TurnState`，执行后期 bounded `BeforeAgentStart` / `PromptBuilt` 和最终 `RunBeforeStart(RunStartPlan)`；应用 typed result 后重新校验 current input、profile 和 limits。任何 current-input transform 都必须在持久化前完成。
 4. 将最终 resolved current input 组装为 `SessionWriteBatch::user_input(...)` 并调用 `SessionHandle.commit(batch)`；成功后，如果 intent 是 skill/template invocation，先发布外层 `Event.run_id = None` 的 `skill_invoked` / `prompt_template_invoked`，再发布 `message_user_appended`；普通 prompt 直接发布 message event。随后构建不含重复 current input 的 durable history baseline 和最终 `TurnState`。
-5. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 owned `SessionDriverHost` 与 `DriveRequest`，启动短期 `RunTask` 后立即回到 actor mailbox loop。`RunTask` 内部调用 `Driver.drive_run()`。
-6. 当前 assistant response 及其完整工具批次结束后、每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。Rig segment 原本将结束时，`before_run_finish` 再执行一次 steering check。
-7. `Driver` 对已 committed persistent messages 执行 Rig segment rollover，应用完整 replacement profile 后调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。同一公开 run 的多个 Rig segment 沿用原 `RunId` 和外层预算。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
-8. 工具调用通过 run-only `ToolBatchInvoker` 治理和执行；invoker 返回 normalized candidate 后，`RunTask` 通过 `RunLink` 提交完整 tool-round candidate。`SessionRuntime` actor 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`，把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，actor 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`，然后把 actor-finalized `ToolBatchResult` 回复 host；Driver 才回填 Rig 并允许下一模型调用。
-9. `RunTask` 返回正常 final assistant draft 后，通过 `RunLink` 提交 terminal effect；`SessionRuntime` actor 将消息组装为 `AssistantFinal` batch。commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
+5. 在分配 `RunId` 前执行同步、best-effort pre-run context threshold gate。若命中，按 committed entry id 保护本次 current input，从 `Turn + current_run = None` 显式切换到 `Compaction` phase并调用统一 compaction orchestration；完成后切回 `Turn`、重建 `TurnState` 并只重新检查一次。仍超限或无可压缩历史时返回 typed error，不建立 `CurrentRun`。该 gate 只是 admission optimization，唯一权威的 call-size 判定仍是 Driver 每次调用 `prompt::project_model_call(...)` 的最终 projection validation。
+6. 分配 host-global `RunId`、建立 `CurrentRun` 并发布 `run_started`；再将最终 `ResolvedPromptInput` 作为 `DriveEntry::Prompt`，把 `TurnState` 投影成 `DriverTurnInput { model, prompt, options }`，构造 owned `SessionDriverHost` 与 `DriveRequest`，启动短期 `RunTask` 后立即回到 actor mailbox loop。`RunTask` 内部调用 `Driver.drive_run()`。
+7. 当前 assistant response 及其完整工具批次结束后、每次下一模型调用前，`RunTask` 通过 `RunLink` 请求 actor safe point；`SessionRuntime` actor 消费 steer、应用合法 profile 变化、收集 typed context materials，并回复 `NextModelCallPlan`。Rig segment 原本将结束时，`before_run_finish` 再执行一次 steering check。
+8. `Driver` 对已 committed persistent messages 执行 Rig segment rollover，应用完整 replacement profile 后调用 `prompt::project_model_call(ModelCallProjectionInput { profile: &active_prompt_profile, ... })`，得到唯一 `ModelInputProjection`，再构造 `ModelCallRequest`。本地 projection context limit 或 provider `ContextOverflow` 都归约为带来源的 `DriverError::ContextLimitExceeded`。同一公开 run 的多个 Rig segment 沿用原 `RunId` 和外层预算。Driver 不持有 `PromptTurn` 或 resources；`BeforeModelCall` 和 provider payload hook 仍属于 `ModelGateway.call_model(...)`。
+9. 工具调用通过 run-only `ToolBatchInvoker` 治理和执行；invoker 返回 normalized candidate 后，`RunTask` 通过 `RunLink` 提交完整 tool-round candidate。`SessionRuntime` actor 应用后期 `ToolResultBeforeCommit`（MVP 不启用）并重新校验，再发布最终 `tool_call_finished`，把完整 assistant tool-call message 与全部 tool results 按 `call_index` 组装为一个 `ToolRound` batch。commit 成功后，actor 先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`，然后把 actor-finalized `ToolBatchResult` 回复 host；Driver 才回填 Rig 并允许下一模型调用。
+10. `RunTask` 返回正常 final assistant draft 后，通过 `RunLink` 提交 terminal effect；`SessionRuntime` actor 将消息组装为 `AssistantFinal` batch。commit 成功后发出 `message_assistant_finished`、最终 `usage_updated`，再发唯一终态 `run_finished { status: completed }`。随后按 post-run arbitration 处理 retry、pending manual compact、auto compaction 和 queued steering/follow-up continuation；只有这些动作都不会立即开始时，才切回 `idle` 并发出 `session_settled`。
 
 稳定 batch 的数量由实际会话事实决定，不按 run 固定。正常 text-only `Completed` run 至少提交 `UserInput` 和 `AssistantFinal` 两个 batch。包含工具时，每个将被下一次模型调用消费的完整 tool-call/result round 都必须先提交一个 `ToolRound` batch；并行结果按 `call_index` 归约后共享该 batch。streaming delta、tool output delta、queue state、partial assistant、pending approval 和执行中的 tool round 不进入 writer。
 

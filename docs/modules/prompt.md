@@ -386,7 +386,9 @@ pub struct ModelInputProjection {
 - 同一静态资源没有通过 resource material 和 transient material 重复注入。
 - `CurrentCall` context 不被标记为待持久化。
 - required contribution 缺失时失败。
-- 输入总大小和估算 token 不超过配置的预检上限；需要压缩时返回结构化 outcome，由 `SessionRuntime` 编排 compaction，而不是 Prompt 自己压缩。
+- 输入总大小和估算 token 不超过配置的最终投影上限；超限时返回结构化 `PromptError::ContextLimitExceeded { estimated_input_tokens, effective_limit }`，Prompt 不调用 provider，也不自己压缩。
+
+这里是每次 `AgentRunStep::CallModel` 前的 call-projection validation，不是 `SubmitPrompt` admission。它覆盖首次调用、tool result 后续调用和 Steer rollover；因此可能发生在 `run_started` 之后。`Driver` 必须把该 outcome 映射为 `DriveResult::Failed { error: DriverError::ContextLimitExceeded { source: PromptProjection, ... } }`，让 `SessionRuntime` 在当前 run terminal handling 后编排 overflow compaction recovery。它不能把本地估算伪装成 `ModelCallErrorKind::ContextOverflow`，也不能在 validation 失败后继续调用 `ModelGateway`。
 
 相同输入必须得到相同 fingerprint。fingerprint 用于 diagnostics、`ResourceQuery::GetEffectivePrompt`、测试和后续 provider prompt cache 分段判断，不是 secret-bearing payload。
 

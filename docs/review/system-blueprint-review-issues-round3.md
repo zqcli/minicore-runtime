@@ -142,7 +142,7 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 ### BR-053：Prompt 预检超限到 SessionRuntime compaction 的信号路径未定义
 
-状态：Open
+状态：Resolved
 
 问题：`prompt.md` 校验条目说"估算 token 超预检上限时返回结构化 outcome，由 `SessionRuntime` 编排 compaction"。但该校验发生在 Driver 的 CallModel step 内，而 `compaction.md` 的 overflow recovery 只挂在 `DriveResult::Failed { error: ContextOverflow }`（provider 侧错误）上。Prompt 侧预检失败如何变成 `SessionRuntime` 可编排的信号——映射为同一 `ContextOverflow` kind？新增 `DriveResult` 变体？——没有任何文档回答。
 
@@ -153,7 +153,13 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 风险：首个大 prompt（巨型 skill 正文或粘贴）会直接踩中这条未定义路径。
 
-待处理方向：定义 Prompt preflight 超限 → SessionRuntime 的信号（复用 `ContextOverflow` kind 或新增显式 `DriveResult` / preflight outcome 变体），并在 `driver.md` / `compaction.md` / `prompt.md` 三处对齐。
+决策结果：`prompt::project_model_call(...)` 的限制检查定性为每次 CallModel 前的最终 projection validation，而非 `SubmitPrompt` admission。它返回结构化 `PromptError::ContextLimitExceeded`；`Driver` 将其与 provider `ModelCallErrorKind::ContextOverflow` 归一为 `DriveResult::Failed { DriverError::ContextLimitExceeded { source, ... } }`，但保留 `PromptProjection` / `Provider` 来源、usage 和 diagnostics 差异，不新增平行 `DriveResult` terminal variant，也不在本地超限后调用 provider。
+
+`SessionRuntime` 在当前 run terminal handling 后拥有唯一恢复路径：整个 work chain 最多执行一次 `reason = Overflow` compaction，随后从 committed、重建后的 context 使用新 `RunId` 和 `DriveEntry::Continue { reason: ContextOverflowRecovery }` 继续；再次超限、无可压缩历史或 protected current input 本身过大时 fail closed。另在最终 UserInput commit 后、分配 RunId 前增加 best-effort threshold gate，以提前处理常见大上下文；它只复验一次，不替代 Driver 对 tool result / Steer / transient context 后续 CallModel 的最终校验。正常 completed run 的 post-run threshold compaction仍不重跑已完成回答。
+
+压缩执行方法由当前模型 `CompactionCapabilities`、trigger 和用户 preference 解析。MVP baseline 保持 `SummaryModel` 和 portable summary；后期 `ProviderNative` 可用于 GPT 类专用 compact endpoint。若端点返回需后续原样回传的加密 model-bound artifact，它只持久化一次并由同 provider adapter 注入后续请求，不作为普通 message/event；模型不兼容时从保留的原始 durable entries 重新压缩。artifact envelope、compatibility key 和 provider payload 细节延后到 ProviderNative integration design。
+
+关闭理由：Prompt → Driver → SessionRuntime 的 typed signal、run terminal、单次 recovery budget、current-input protection、pre/post-run 场景和 provider-native 扩展边界已对齐；剩余字段形状纳入 BR-051 的开发前 interface contract closure review，不再构成独立架构空洞。
 
 ### BR-054：五个 prompt 输入 view 无 owner，`EnvironmentPromptView` 隐含 I/O 职责
 

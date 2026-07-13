@@ -153,7 +153,7 @@ _避免_：任意 token 截断、显示分页、文件切片
 _避免_：上下文占用、费用账单、消息长度
 
 **上下文占用**：
-当前会话投影到下一次模型请求时预计占用的上下文窗口大小。它用于上下文进度条、压缩触发和 overflow 预检，不等同于历史累计消耗。
+当前会话投影到下一次模型请求时预计占用的上下文窗口大小。它用于上下文进度条、pre-run threshold gate 和压缩触发；每次模型调用的权威大小判断仍由最终 call projection validation 完成。它不等同于历史累计消耗。
 _避免_：会话总 token、账单消耗、消息数量
 
 **会话消耗统计**：
@@ -444,6 +444,14 @@ _避免_：provider HTTP request、Rig provider request、会话消息、Summary
 **压缩摘要材料（`CompactionSummaryMaterial`）**：
 `Compaction` 根据压缩准备结果生成的摘要 system prompt、模型可见消息和最大输出 token 预算。它不是模型调用请求，不包含模型选择、thinking/stream policy、call/run id 或工具 schema；`SessionRuntime` 用它构造 `ModelCallPurpose::CompactionSummary` 的 `ModelCallRequest`。
 _避免_：SummaryModelRequest、ModelCallRequest、压缩结果、系统提示词状态
+
+**压缩方法（`CompactionMethod`）**：
+一次压缩的 provider-neutral 执行方式。MVP 使用 `SummaryModel`；后期可由模型 capability 提供 `ProviderNative` 专用端点，或使用有界 deterministic reduction fallback。用户配置表达 preference，`SessionRuntime` 按当前模型 capability 和 trigger 解析计划，不按模型名称硬编码。
+_避免_：GPT 压缩、Claude 压缩、provider endpoint 名、UI handler
+
+**上下文限制错误（`DriverError::ContextLimitExceeded`）**：
+当前 Agent run 的下一次模型调用无法进入有效上下文窗口的 typed recovery class。`PromptProjection` 表示本地最终投影拒绝、未调用 provider；`Provider` 表示 provider 返回 context overflow。两者由 `SessionRuntime` 在当前 run failed terminal 后共享一次 work-chain compaction recovery，但保留 diagnostics 和 usage 来源差异。
+_避免_：普通 retry error、Prompt admission rejection、模型可见 assistant message
 
 **驱动安全点**：
 `Driver` 在 Rig 状态机推进到某些边界时交还控制权给会话运行时的点。`before_next_model_call` 位于当前 assistant response 及其完整工具批次结束后、下一次 LLM 调用前；`before_run_finish` 位于 Rig segment 原本将结束时。会话运行时可在此处理 Steer、patch turn state、暂停、重试或结束；FollowUp 在公开 run 结束后的 post-run arbitration 中启动新 run。

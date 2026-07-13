@@ -793,7 +793,7 @@ PersistedSession
 | `Idle` | `Compaction` | manual/auto compaction 立即开始 |
 | `Turn` | `Idle` | terminal handling（required stable commit if any）、terminal facts 和 post-run arbitration 完成，且没有立即 continuation |
 | `Turn` | `RetryBackoff` | Agent run 失败且已安排自动重试；`delay_ms` 可以为 0 |
-| `Turn` | `Compaction` | post-run manual/auto compaction 或 overflow recovery 开始 |
+| `Turn` | `Compaction` | pre-run threshold gate 命中、post-run manual/auto compaction 或 context-limit recovery 开始 |
 | `RetryBackoff` | `Turn` | backoff 结束并启动 retry run |
 | `RetryBackoff` | `Idle` | retry 被取消、禁用或不再继续 |
 | `RetryBackoff` | `Compaction` | retry 前必须先完成 overflow recovery |
@@ -1297,7 +1297,7 @@ diagnostics_error { recoverable }        // run coordinate comes from outer Even
 run_finished { status: failed }
 post-run arbitration
   ├─ retry scheduled    → session_phase_changed(retry_backoff) → retry_auto_started
-  ├─ overflow recovery  → session_phase_changed(compaction) → compaction_started
+  ├─ context-limit recovery → session_phase_changed(compaction) → compaction_started
   ├─ pending compaction → session_phase_changed(compaction) → compaction_started
   ├─ immediate continuation → remain Turn → run_started
   └─ no immediate work  → session_phase_changed(idle) → session_settled
@@ -1305,9 +1305,9 @@ post-run arbitration
 
 原则：
 
-- 同步 preflight 失败不启动 run，直接拒绝 command 或发外层携带 `command_id` 的 `diagnostics_error`。
+- 同步 SubmitPrompt admission 失败不启动 run，直接拒绝 command 或发外层携带 `command_id` 的 `diagnostics_error`。pre-run threshold gate 命中不属于失败：它从 `Turn + current_run = None` 切换到独立 `Compaction` lifecycle，压缩成功后才首次分配 `RunId`。
 - 可重试 Agent run 失败必须先关闭当前 run，再直接从 `Turn` 进入 `RetryBackoff`；不能为了发布 retry event 先经过 `Idle`。
-- context overflow recovery 不把 transient overflow assistant error 写入 session；它只通过 diagnostics 呈现，并从最后 committed context 启动 recovery。该分支使用 `Turn → Compaction → Turn` 和 `compaction_finished { will_retry: true }`，不发布 session-level `retry_auto_started`。
+- `DriverError::ContextLimitExceeded` recovery 不把 transient partial/error 写入 session；`PromptProjection` / `Provider` 来源只通过 diagnostics 与 usage 区分，并从最后 committed context 启动 recovery。顺序固定为 `run_finished { failed } → session_phase_changed(compaction) → compaction_started → compaction_finished { will_retry: true } → session_phase_changed(turn) → run_started(new RunId)`，不发布 session-level `retry_auto_started`。整个 work chain 只允许一次该 recovery。
 - provider fallback/retry 属于同一个 model call/run 的内部 attempt，不改变 `SessionPhase`，也不发布 session-level retry event。
 
 ## Compaction Lifecycle
@@ -1320,16 +1320,17 @@ UI dispatch(Compact) while active work
   → required immediate retry / overflow recovery chain, if any
   → queue_updated { pending_actions: [] }
 
-UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overflow
+UI dispatch(Compact) while idle, drain pending Compact, pre-run threshold, post-run threshold, or context-limit recovery
   → session_phase_changed { phase: compaction }
   → compaction_started { reason }
   → future RuntimeHookRegistry.invoke(SessionBeforeCompact) // internal only
-  → summary model call                         // not a normal assistant message
+  → resolve CompactionMethod from current model capabilities
+  → SummaryModel call, or post-MVP ProviderNative endpoint // not a normal assistant message
   → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → compaction_finished { result, aborted: false, will_retry }
-  ├─ overflow retry / immediate continuation
+  ├─ pre-run start / overflow recovery / immediate continuation
   │    → session_phase_changed { phase: turn }
-  │    → run_started
+  │    → allocate a new RunId → run_started
   ├─ scheduled auto retry
   │    → session_phase_changed { phase: retry_backoff }
   │    → retry_auto_started
@@ -1338,7 +1339,7 @@ UI dispatch(Compact) while idle, drain pending Compact, or auto threshold/overfl
        → session_settled
 ```
 
-压缩摘要是 session context projection，不是 system prompt。`compaction_finished` 可以给 UI 摘要预览，但完整摘要默认通过 session entry detail 读取。
+MVP portable 压缩摘要是 session context projection，不是 system prompt。`compaction_finished` 可以给 UI 摘要预览，但完整摘要默认通过 session entry detail 读取。后期 ProviderNative opaque artifact 不进入普通 message/event/snapshot；事件只暴露 method、兼容性和 UI-safe diagnostics。
 
 ## Resource Reload Lifecycle
 
@@ -1447,7 +1448,7 @@ MVP event lifecycle tests 应覆盖：
 - tool round commit failure：以非持久化 `message_assistant_finished` 关闭已 started lifecycle，不发布 `message_tool_result_appended`，不进入下一模型调用，当前 run 以 failed terminal 收尾。
 - tool denied / approval rejected：产生 error tool result，与同 batch 其他 results 一起 commit 完整 `ToolRound` 后才发布 appended events，不产生 run failure。
 - settled observation：没有 `WaitForIdle` command 或 wait-completed event；UI 通过 snapshot + `session_settled`，测试 event probe 必须先订阅再触发动作。任意 session 的 late-subscribe/gap 行为在 BR-044 关闭后再定义。
-- pre-run admission：`CommandAck` / `session_phase_changed(turn)` 不产生 run-level abort target；在任何 provider/model/tool/approval wait 前必须先发布 `run_started`。
+- pre-run admission：`CommandAck` / `session_phase_changed(turn)` 不产生 run-level abort target；任何 Agent run 的 provider/model/tool/approval wait 前必须先发布 `run_started`。threshold gate 命中时先切换到独立 `Compaction` lifecycle，该 session-scoped 外部工作没有 Agent `RunId`；压缩成功后才首次发布 `run_started`。
 - actor responsiveness：active `RunTask` 正在等待 model/tool/approval 时，目标 `SessionRuntimeHandle` 仍能处理 `DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown；禁止 actor 内联等待完整 `drive_run()`。
 - approval wakeup：tool batch 登记 pending approval 并发布 request 后，actor 处理 matching decision，Tools waiter 被唤醒且 executor 恰好执行一次；duplicate/stale/abort-after-request 不重复执行。
 - safe-point transaction：active Steer 经 actor drain/expand/`UserInput` commit/领域事件后才回复 `NextModelCallPlan`；commit failure 时 RunTask/Rig 不得到该 message。
