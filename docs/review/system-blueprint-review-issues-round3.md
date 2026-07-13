@@ -25,7 +25,7 @@
 1. **原唯一架构缺口已关闭**：BR-047 已通过 ADR 0021 定义 per-session actor、显式 `SessionRuntimeHandle`、run-scoped `RunTask`、私有 `RunLink` 和 owned `SessionDriverHost`，approval/abort/queue command 不再被完整 run 阻塞。
 2. **少量硬矛盾与死表面**：`project_model_call` receiver 矛盾已按 BR-048 关闭；仍待处理的是 `ResumeRun` 作为 MVP 中没有产生源的死命令，以及若干被引用但未定义的 MVP 载荷类型（BR-052）。
 3. **前两轮遗留项**：BR-036 已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭为单实例薄边界容器；round2 过程性观察 #1/#3 的协议裁边仍待处理（BR-058）。
-4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）。通用 shell 的 OS enforcement 已按 BR-050 移出 MVP，并成为后续启用 `bash` 的硬 gate。
+4. **实现前统一复核的契约与算法空洞**：跨模块 seam 类型的字段、方法集与不变量已按 BR-051 延后到其余 review issue 完成后的开发前 contract closure review；确定性承诺仍缺 canonical 算法（BR-063）。通用 shell 的 OS enforcement 已按 BR-050 移出 MVP，并成为后续启用 `bash` 的硬 gate。
 
 这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-036、BR-047 和 BR-048 的前置设计均已完成，其余多为文档级定稿。
 
@@ -99,9 +99,9 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 重新打开条件：开始实现 `bash` 或任何可启动任意子进程的 external executor；产品要求无审批自动执行 shell；需要把 workspace-only filesystem、network deny 或 host allowlist 声明为对子进程的强保证；或已有 OS-native/external backend 可进入 conformance test。关闭前必须验证限制传播到完整进程树、策略不足 fail closed、sandbox denial 可观察，以及无隔离模式不会被 UI/文档标记为 sandbox。
 
-### BR-051：约 15 个跨模块 seam 类型被反复引用却从未定义
+### BR-051：跨模块 seam 类型在开发前统一闭合
 
-状态：Open
+状态：Deferred
 
 问题：多个模块文档以类型为契约展开，但这些类型全仓无定义，实现时各模块会自行发明形状。最关键的是 `ToolBatchResult`——它被引用约 20 次，同时是 commit 事务、Rig 回填和事件归约三方共享的值，形状不定则三处对接无从写起。
 
@@ -110,9 +110,13 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 - 执行层：`ToolBatchResult`、`DriveResultSummary`、`TurnCheckpoint`、`FinishCheckpoint`、`DriveLimits`、`DriverError`、`ToolSubsystemError`、`ToolApprovalRequest`、`PreparedToolInvocation`、`ApprovalGrantMatch`、`ModelStreamSink` / `ToolUpdateSink` 方法集。
 - 资源层：`CwdResourceLayer`、`ResolvedCwdResourceView`、`TurnResourceView`、`CompactionFileOps`、`CompactionDetails`、`SkillLoadInputs` / `SkillLoadReport`、`PromptTemplateLoadInputs`、`ContextMaterialKey` / `ContextSource`。
 
-风险：机械工作，但不闭合就无法按文档写单测；`ToolBatchResult` 未定型会阻塞 tool 纵切。
+风险：这些空洞不改变当前已确定的模块 ownership、调用方向和生命周期边界，但若带入实现阶段，各模块会分别发明字段、错误和行为约束，导致 conformance test 无法围绕同一契约编写；其中 `ToolBatchResult` 会直接阻塞 tool 纵切。
 
-待处理方向：在第一个纵切前给出这些类型的字段形状；`ToolBatchResult` 优先（它决定 `invoke_tool_batch` 的返回、`ToolRound` batch 组装和 `message_tool_result_appended` 归约三方对接）。其余可随对应模块开工时定型。
+决策结果：先完成当前 review 清单中的其余 issue，再在任何生产代码纵切开始前执行一次全仓 interface contract closure review。该复核按 driver/model、tools、resources、compaction/dynamic-context 分组，不要求现在一次性冻结所有未来字段；每个被引用类型必须明确归属 owner，并得到“定义、删除/合并、或带明确阶段转入后续 issue”三种结果之一。
+
+开发前验收至少覆盖：公开字段和方法集、生产者/消费者、排序与唯一性等数据不变量、cancel/partial-result 语义、typed error taxonomy、持久化/事件投影边界，以及跨模块类型不得泄漏 Rig/provider 私有类型。`ToolBatchResult` 需同时闭合 `invoke_tool_batch` 返回、`ToolRound` 原子 commit、公开事件归约和 Rig tool-result 回填；sink 类型需明确 progress/control lane、backpressure、ack 和关闭行为。
+
+重新打开条件：其余 review issue 全部处理完并准备进入开发；开始规划任何 text-only、resource 或 tool 纵切；或实现中首次需要上述任一未定义类型。关闭前应通过全仓引用清单确认不存在无 owner 的跨模块类型，并为进入首批实现的契约给出可直接编写 conformance test 的定义。
 
 ### BR-052：MVP 命令表存在缺定义载荷类型、死表面和 cwd 来源空洞
 
