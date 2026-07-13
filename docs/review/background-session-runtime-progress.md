@@ -738,3 +738,49 @@ BR-031 明确放弃 runtime 层“abort 后归还队列文本给编辑器”的�
 BR-033 统一事件坐标所有权：`workspace_id`、`session_id`、`run_id`、`command_id` 只由外层 `Event` 权威携带，所有 `EventMsg` 删除仅用于 routing/correlation 的副本；局部对象 identity 和 tree transition operands 保留。diagnostics 的 runtime/workspace/session/run 归属也改读外层，`DiagnosticSubject` 只表达 tool call、resource path 或 model 等细粒度对象。adapter 必须消费完整 `Event`，脱离 dispatch stack 的组件构造包含 event metadata 与 payload 的本地 view；内部 publisher 使用 routing-profile constructor 阻止非法坐标组合。
 
 BR-034 删除 core 的 focused/current/active session selector。`FocusSession`、`session_focus_changed` 和 `LoadedSessionRuntimes.focused_session_id` 不再存在；所有 session-scoped command 显式携带 `SessionId`，客户端 selected session 只属于 adapter。后端状态只保留 persistent catalog、loaded residency、`SessionPhase`、optional `CurrentRunState` 和 settled fact。`RuntimeSnapshot` 改为同一全局 event 水位下的 `loaded_sessions: Vec<SessionSnapshot>`，resources 和 command catalog 进入各自 session projection；未 loaded session 继续通过 query 读取。
+
+## 2026-07-13 Round3 Follow-up
+
+本阶段继续处理 `docs/review/system-blueprint-review-issues-round3.md` 中的 Open issues。已完成并提交以下决策：
+
+- `71fabce docs(review): defer BR-049 after Rig steer validation`
+  - 核对 Rig 0.40.0、Pi、Codex、OpenClaw 和 Attractor 后，确认 Rig `AgentRun` / `AgentRunStep` 没有阻止 MiniCore 落地的架构级障碍。
+  - Steer 在完整 assistant/tool turn 后、下一次模型调用前交付；Rig 不支持公开 mid-run history append 时，同一 MiniCore `RunId` 可以顺序 rollover 多个私有 Rig segment。
+  - FollowUp 仍在当前 work chain 完成后启动新公开 run。版本 pin、usage/tool-name 映射、`NeedsResolution`、`preresolved_result` 和 conformance tests 延后到真实 Driver integration spike。
+
+- `b982104 docs(review): defer BR-050 and gate shell sandbox`
+  - MVP 只承诺 MiniCore builtin executor 的进程内 path authorization；路径 canonicalization、symlink/父目录检查和 denied roots 不能冒充通用子进程 sandbox。
+  - `read/grep/find/ls` 可按内置只读工具实现推进；`write/edit/apply-patch` 在安全文件操作、审批、abort 和 mutation queue 闭合后可单独启用。
+  - 通用 `bash` 在 MVP disabled。后续 `Sandboxed` shell 必须由满足请求 policy 的 OS-native/external backend 强制，能力不足返回 `SandboxUnavailable` 并 fail closed；`FullAccessWithApproval` 明确没有 sandbox guarantee。
+
+- `bcfd109 docs(review): defer BR-051 to pre-development contract review`
+  - 跨模块 seam 的调用方向和 ownership 已基本确定，但约 15 个字段形状、sink 方法集、typed error 和行为不变量仍未闭合。
+  - 先完成其余 review issues；任何生产代码纵切开始前重新打开，按 protocol/command、driver/model、tools、resources、compaction/dynamic-context 分组执行全仓 interface contract closure review。
+  - 每个被引用类型必须得到“定义、删除/合并、或转入带明确 owner/阶段的后续 issue”之一，Rig/provider 私有类型不得泄漏到上层。
+
+- `65c28d5 docs(review): defer BR-052 to protocol contract review`
+  - `UserInput`、`StreamOptions`、`ThinkingLevel` 与 BR-051 联合进入开发前 protocol contract review；需统一明确 wire 形状、默认值、持久化/恢复边界、生效时机、capability clamp 和 provider mapping owner。
+  - `ResumeRun` 纳入 MVP command reachability review，默认移入 post-MVP，不为保留死表面凭空增加 `SuspendRun`。
+  - `NewSession { workspace_id, cwd: Option<PathBuf> }` 及 cwd canonical/root containment 已由 ADR 0022 关闭。
+
+- `b8444bf docs(review): close BR-053 context-limit recovery path`
+  - 每次 CallModel 前的 `prompt::project_model_call(...)` 是最终 projection validation；本地超限返回 `PromptError::ContextLimitExceeded`，不调用 provider。
+  - Driver 将本地 `PromptProjection` 和 provider `ContextOverflow` 归一为 `DriverError::ContextLimitExceeded { source, ... }`，继续使用 `DriveResult::Failed`，保留 diagnostics/usage 来源差异。
+  - `SessionRuntime` 在当前 run 先发布 `run_finished { failed }` 后进入独立 `Compaction` phase；整个 work chain 最多一次 overflow compact-and-continue，成功后用新 `RunId` 和 `DriveEntry::Continue { reason: ContextOverflowRecovery }` 继续，再次超限或无可压缩内容时 fail closed。
+  - pre-run threshold gate 只在 bounded admission 内同步判断；命中后先切换 `Turn → Compaction` 再执行 summary model / future ProviderNative 外部工作，压缩完成后才首次分配 Agent `RunId`。
+  - MVP compaction method 仍为 portable `SummaryModel`。后期 `ProviderNative` 可调用 GPT 类专用 compact endpoint；model-bound 加密 artifact 只持久化一次，由同 provider adapter 注入后续请求，不进入普通 message/event/snapshot，具体 envelope/compatibility fields 延后到 ProviderNative integration design。
+
+### BR-054 当前分析暂停点
+
+BR-054 尚未修改任何权威设计文档，状态仍为 `Open`。当前分析确认 `TurnPromptInputs` 通常由四类材料组成：ResourceManager 捕获的静态资源、session-scoped tool/model/profile/policy 投影、turn 环境事实，以及每次 CallModel late-bind 的 durable history/current input/dynamic context。最后一类继续属于 `ModelCallProjectionInput`，不应提前塞入 turn prompt baseline。
+
+用户提出“既然 ResourceManager 已有 runtime/cwd/turn/step snapshots，是否可由它统一提供全部 Prompt 材料”。当前推荐论证如下，但尚未形成最终决策：
+
+- 不建议把 selected model、active tools、agent profile、effective policy 和 environment 全部放进现有 `ResourceManager` snapshots。`CwdResourceSnapshot` 可被同 cwd 多 session 共享，而这些状态是 session-specific；其 mutation 也不应复用 `replace_runtime` / `replace_cwd` 的资源发布线性化点。
+- 不建议让 Prompt 在组装时分别读取各 owner 的 current state，否则同一 turn 可能混用不同时间点的 resource/tool/model/policy，破坏 immutable turn assembly。
+- 当前首选方案是由 `SessionRuntime` 在 turn boundary 组装一个新的 turn-scoped `TurnPromptSnapshot`。它以 `Arc<TurnResourceSnapshot>` 为资源父级，再冻结 `PromptBaselineView`、`ToolPromptView`、`ModelPromptView` 和精简 `EnvironmentPromptView`；`TurnPromptInputs` 只是该 snapshot 的只读窄投影。
+- `ResourceManager` 继续拥有资源定义、overlay、revision 和 current snapshot；`SessionRuntime` 拥有跨 owner capture/assembly；Prompt 只做确定性解释和 projection。多 session 同 cwd 只共享资源父链，不共享 `TurnPromptSnapshot`。
+- resource reload 只影响 future turn。后期 safe-point 合法切换 tools/model/profile 时，复用原 `TurnResourceSnapshot`，重新创建 prompt snapshot / `PromptTurn` 并原子替换 future `PromptCallProfile`；不制造新的 `ResourceRevision`。
+- MVP 建议从 `EnvironmentPromptView` 删除 VCS I/O，只保留 workspace root、fixed cwd、platform 和可测试 clock 产生的日期。后期 VCS 信息可使用独立 context provider 或后台缓存 snapshot 注入，Prompt 和 ResourceManager 都不直接执行 Git。
+
+下一步先由用户确认 BR-054 最终 snapshot seam：保留现有多 owner typed views，还是收敛为 `TurnPromptSnapshot` + `TurnPromptInputs` projection。确认后再同步 `prompt.md`、`session-runtime.md`、`resource-manager.md`、ADR 0017、架构总览和 BR-054 状态。其余 Open issues 继续按编号处理；全部 review issues 完成后重新打开 BR-051/BR-052，执行开发前全仓类型和 command contract review。
