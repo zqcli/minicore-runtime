@@ -787,3 +787,936 @@ BR-034 删除 core 的 focused/current/active session selector。`FocusSession`�
 - Runtime 不使用递增 revision；`CwdResourceRevision` 用于 reload；`TurnResourceFingerprint` 组合 cwd revision + behavior/model/environment/policy versions。具体 canonical 算法仍归 BR-063。
 
 旧分析中关于 `TurnPromptSnapshot` / 多 owner prompt views / runtime reload 的建议均为历史记录，不代表现行设计。
+
+### BR-055 延伸调研：消息构建流程审计与 Transcript-First 重设计建议
+
+本节记录 2026-07-13 对 MiniCore 整套消息构建流程的重新审计。它由 BR-055 的 `ResolvedPromptInput.parts/messages` 问题触发，但调研范围已扩展到 `SessionStorage -> SessionRuntime -> Prompt -> Driver/Rig -> ModelGateway -> provider` 的完整链路。
+
+本节是工作进度和推荐方案，不是已接受 ADR。现行权威文档仍以 `prompt.md`、`session-runtime.md`、`driver.md`、`session-manager.md` 和 `model-gateway.md` 为准；若采纳推荐方案，需要新增 ADR 并同步修订这些文档，不能只关闭 BR-055。
+
+#### 1. 调研问题与结论修正
+
+最初 BR-055 把问题表述为：`ResolvedPromptInput.parts` 如何折叠成 `messages` 未定义，可能导致持久化内容与模型可见输入分叉。
+
+调研确认：
+
+- `parts` 和 `messages` 可以是不同表示层，它们不需要结构相等。
+- `ResolvedPromptInput.messages` 不是历史消息。`resolve_intent()` 只接收当前 `PromptIntent`，没有 history 参数；历史由 `SessionHandle.build_session_context()` 单独构建。
+- 当前最合理的语义是：
+  - `parts`：当前 intent 解析后的有序、typed、resource-resolved input IR。
+  - `messages`：同一当前输入 lower 后的 current user message(s)。
+  - `contribution_stamps`：当前输入的 provenance/fingerprint contribution，不是另一组模型消息。
+- BR-055 的核心仍成立，但应改写为：
+
+> `ResolvedPromptInput` current-input 的 canonical lowering、cardinality、layout 与 exact-reuse contract 未定义。
+
+准确的不变量不是“整个 UserInput batch 等于完整模型输入”，因为完整模型输入还包含 system prompt、history、tools 和 transient context；准确表述应为：
+
+```text
+成功 committed 的 current user message
+  == 首次模型调用中对应的 current input message
+  == active Steer commit 后交给下一 segment 的同一 message
+```
+
+相等表示 role、content、content-part 顺序和模型可见正文相同；storage 生成的 entry id、parent id 和 timestamp 不属于该内容相等关系。
+
+#### 2. Lowering 的含义
+
+`lowering` 是本次分析使用的设计术语，不是仓库当前已定义的方法名。它指把语义丰富、MiniCore-specific 的高层表示转换为更通用、更接近执行层的表示：
+
+```text
+PromptIntent
+  -> resolved PromptInputPart[]
+  -> canonical session user message
+  -> provider-neutral model message
+  -> provider wire DTO
+```
+
+例如：
+
+```text
+PromptInputPart::SkillBlock { metadata, full_body }
+PromptInputPart::Text("重点检查并发")
+  ->
+MessageRecord::User(
+  "<skill ...>\n...full body...\n</skill>\n\n重点检查并发"
+)
+```
+
+这不是压缩或丢失信息。真正的 modality，例如 image/file，可以继续作为 typed content part；provider 不理解的 `SkillBlock`、`SelectedCode`、`ResourceBlock` 则应在 Prompt implementation 内稳定渲染为 text 或其它明确的 model-facing part。
+
+#### 3. MiniCore 当前消息类型的实际语义
+
+当前 `ResolvedPromptInput` 草图：
+
+```rust
+pub struct ResolvedPromptInput {
+    pub parts: Vec<PromptInputPart>,
+    pub messages: Vec<MessageRecord>,
+    pub contribution_stamps: Arc<[PromptContributionStamp]>,
+}
+
+pub enum PromptInputPart {
+    Text(String),
+    Image(ImageAttachment),
+    File(FileAttachment),
+    SelectedCode(SelectedCode),
+    SkillBlock(ResolvedSkillBlock),
+    ResourceBlock(ResolvedResourceBlock),
+}
+```
+
+真实场景映射：
+
+| `PromptInputPart` | 场景 | 预期内容 |
+| --- | --- | --- |
+| `Text` | 普通输入、additional instructions、template 渲染文本 | 用户正文 |
+| `Image` | 截图、设计稿、报错图片 | immutable/durable image content or reference、media type、hash |
+| `File` | PDF、日志、源文件附件 | immutable/durable file content or reference、name、media type、hash |
+| `SelectedCode` | IDE 选中代码 | path、range、language、实际 code、hash |
+| `SkillBlock` | 显式 `/skill` / `InvokeSkill` | captured skill metadata、完整正文、content hash |
+| `ResourceBlock` | 显式 resource/context/template expansion | resource key、source、展开正文、content hash |
+
+这里的 parts 应当是已经解析、已经 pin 住正文的输入，不应保存稍后重新读文件的可变 path/reference。
+
+当前 `MessageRecord` 草图：
+
+```rust
+pub enum MessageRecord {
+    User(UserMessage),
+    Assistant(AssistantMessage),
+    ToolResult(ToolResultMessage),
+    Custom(CustomMessage),
+    BranchSummary(BranchSummaryMessage),
+    CompactionSummary(CompactionSummaryMessage),
+}
+```
+
+它是 MiniCore session-domain canonical record，用于持久化、恢复、UI projection、compaction 和运行时上下文。它不是任何 provider 直接接受的标准协议。
+
+当前设计中需要区分四个 messages 概念：
+
+| 位置 | 语义 |
+| --- | --- |
+| `ResolvedPromptInput.messages` | 当前 intent lower 后的 current user message(s) |
+| `SessionContext.messages` | 从 committed session path 重建出的 effective durable history |
+| `TurnState.messages` | 当前 work chain pin 住的 history baseline |
+| `ModelInputProjection.messages` | history/current/transient 最终排列后的模型可见序列 |
+
+字段都叫 `messages`，但生命周期和 owner 不同，已经构成明显的认知负担。
+
+#### 4. 当前历史 owner 与构建流程
+
+MiniCore 没有 Codex 风格的长期 `ContextManager`。当前 durable history 的 owner 是：
+
+```text
+SessionStorage       // committed session tree / batches
+SessionWriter        // trusted mutation seam
+SessionHandle        // domain facade
+```
+
+主要接口：
+
+```rust
+impl SessionHandle {
+    pub async fn commit(
+        &self,
+        batch: SessionWriteBatch,
+    ) -> Result<CommittedSessionBatch, SessionWriteError>;
+
+    pub async fn build_session_context(
+        &self,
+    ) -> Result<SessionContext, SessionError>;
+}
+```
+
+`build_session_context()`：
+
+- 只读取成功 committed 的 stable batches。
+- 沿 current leaf 的 root-to-leaf path 构建。
+- 保留完整 user/assistant/tool-call/tool-result 协议关系。
+- 应用最新 compaction，输出 summary + retained suffix + messages after compaction。
+- 遇到不完整 committed tool round 或非法 path 时 fail closed。
+
+当前预期调用链：
+
+```text
+SessionStorage
+  -> SessionHandle.build_session_context()
+  -> SessionContext.messages
+  -> TurnState.messages
+  -> Driver/Rig history
+  -> Prompt final projection
+```
+
+但是 `TurnState.messages -> Driver/Rig history` 这一步目前没有被接口闭合。
+
+#### 5. 当前消息构建流程审计
+
+当前 user input 从 UI 到 provider 大致经过：
+
+```text
+UI draft
+  -> UserInput / command
+  -> PromptIntent
+  -> ResolvedPromptInput.parts
+  -> ResolvedPromptInput.messages
+  -> SessionWriteBatch::UserInput / SessionEntry::Message
+  -> protected current_input lane
+  -> DriveEntry::Prompt.messages
+  -> Rig prompt/history
+  -> ModelCallProjectionInput.current_input
+  -> ModelInputProjection.messages
+  -> ModelCallRequest.messages
+  -> provider DTO
+```
+
+约有 10 至 11 个表示层。
+
+当前 durable history 大致经过：
+
+```text
+SessionEntry / StoredSessionBatch
+  -> SessionContext.messages
+  -> TurnState.messages
+  -> Rig history
+  -> ModelCallProjectionInput.durable_history
+  -> ModelInputProjection.messages
+  -> ModelCallRequest.messages
+  -> provider DTO
+```
+
+转换多本身不是错误；真正的问题是多个中间表示都看起来像 source of truth，且部分转换没有唯一 owner。
+
+#### 6. 严重问题清单
+
+##### P0：历史 seed 没有进入 Driver
+
+当前：
+
+```rust
+pub struct TurnState {
+    pub messages: Vec<MessageRecord>,
+    // ...
+}
+
+pub struct DriveRequest {
+    pub entry: DriveEntry,
+    pub turn: DriverTurnInput,
+    // no history
+}
+
+pub enum DriveEntry {
+    Prompt { messages: Vec<MessageRecord> },
+    Continue { reason: ContinueReason },
+    Resume { serialized_run: SerializedAgentRun },
+}
+```
+
+调用流程把 `DriveEntry::Prompt.messages` 当 current input 使用；`DriverTurnInput` 只含 model/profile/options；`SessionDriverHost` 只含 resources/tools/gateway/link。`TurnState.messages` 没有实际跨到 Driver。
+
+Driver 文档随后假定 Rig 产生：
+
+```text
+AgentRunStep::CallModel { prompt, history, turn }
+```
+
+但初始 `history` 如何 seed 到 Rig 未定义。实现者可能：
+
+- 漏掉历史；
+- 让 Driver 反向读取 SessionStorage；
+- 把 current input 同时放进 history 和 prompt，造成重复；
+- 把完整 `TurnState` 扩大进 Driver seam。
+
+##### P0：`parts/messages` 双表示没有 canonical lowering contract
+
+当前未定义：
+
+- 谁是 source of truth；
+- 一个 intent 产生一条还是多条 user message；
+- part 顺序、separator、empty text、adjacent text merge；
+- `SkillBlock` / `SelectedCode` / `ResourceBlock` 如何渲染；
+- image/file 与 text 是否处于同一 user message；
+- hook 修改 current input 后如何重新 canonicalize；
+- commit 与首次模型调用是否复用同一个 lower 结果。
+
+`SessionWriteBatch::user_input(message)` 明确是 one user message，而 `ResolvedPromptInput.messages` 是 `Vec<MessageRecord>`，cardinality 也未对齐。
+
+##### P0：Rig history 与 committed history 双轨
+
+`SessionStorage` 是 durable truth；Rig `AgentRun` 也持有 prompt/history/full_history 作为 protocol working state。当前已规定 tool round commit 成功后才能把 results 喂回 Rig，这是正确的，但还应钉死：
+
+```text
+Rig history 不是 durable source of truth。
+模型返回的未提交 assistant draft 可以先推进 Rig 到 CallTools / Done，这是协议状态机正常工作所必需的。
+完整 ToolRound commit 成功前，tool results 不得喂回 Rig，也不得发生下一次模型调用。
+未提交 assistant/tool draft 不得成为 retry、compaction recovery 或新 run 的 history seed。
+commit failure 后当前 run 必须终止，不能继续使用 Rig 内存状态。
+compaction/recovery 后必须从 SessionStorage 重建，不 resume 旧 Rig history。
+```
+
+##### P1：current input lane 生命周期过长
+
+当前 user input 先 commit，再为了 pre-run compaction protection 被从 durable history 排除，并作为 `current_input` late-bind。这在 Driver 启动前是有价值的。
+
+但当前设计把 `durable_history/current_input` 区分继续带到每一次模型调用。调研认为这超出实际需要：
+
+- pre-run gate 完成并创建 Rig segment 后，current input 已经是 live transcript 尾部的普通 user message。
+- 工具后续 call 应看到 `history + current user + assistant tool call + tool results` 的一个有序 transcript。
+- active Steer commit 后成为新的 transcript tail，而不是长期维持第二条 current lane。
+
+##### P1：`MessageRecord` 泄漏到 ModelGateway
+
+当前：
+
+```rust
+pub struct ModelInputProjection {
+    pub messages: Arc<[MessageRecord]>,
+    // ...
+}
+
+pub struct ModelCallRequest {
+    pub messages: Vec<MessageRecord>,
+    // ...
+}
+```
+
+`MessageRecord` 含 `Custom`、`BranchSummary`、`CompactionSummary` 等 session-domain 语义。若直接交给 `ModelGateway`，每个 provider adapter 都可能重复决定这些 variant 是否进入模型、使用什么 wrapper 和 role。
+
+应增加 provider-neutral、model-facing 的窄类型，例如 `ModelMessage`，并由 Prompt final projection 统一执行：
+
+```text
+MessageRecord
+  -> ModelMessage
+  -> OpenAI / Anthropic / Gemini DTO
+```
+
+`ModelGateway` 只负责最后一步 provider encoding，不负责理解 MiniCore session/display 语义。
+
+##### P1：`ModelInputProjection` 与 `ModelCallRequest` 重复
+
+两者都保存 system/messages/tools/output contract，Driver 机械复制。若没有结构约束，validated projection 可能在复制时丢字段或被改写。
+
+候选收敛方向：
+
+```rust
+pub struct ModelCallRequest {
+    pub input: ModelInputProjection,
+    pub model: ModelSelection,
+    pub purpose: ModelCallPurpose,
+    pub thinking_level: ThinkingLevel,
+    pub stream_options: StreamOptions,
+    // correlation / limits
+}
+```
+
+##### P2：MVP 预建过多 future context/hook 契约
+
+当前已经设计：
+
+- `CurrentRun` / `CurrentCall` / `Durable` context scopes；
+- required/optional unavailable contribution；
+- `PromptBuilt`、`ContextProjection`、`BeforeNextModelCall`、`BeforeRunFinish`、`BeforeModelCall`、`BeforeProviderPayload` 等多个 future safe points；
+- contribution stamps 在多个层次重复携带。
+
+但 MVP 不实现 RuntimeHooks，也没有 RAG/memory/context producer。建议只保留 safe-point owner 与禁止事项，删除 MVP interface 中没有真实 producer 的字段级 patch contract。
+
+#### 7. 同类项目对照
+
+##### Codex
+
+Codex 的 `ContextManager` 是 live model-visible history owner：
+
+```rust
+pub(crate) struct ContextManager {
+    items: Vec<ResponseItem>,
+    // ...
+}
+
+pub(crate) fn for_prompt(
+    mut self,
+    input_modalities: &[InputModality],
+) -> Vec<ResponseItem> {
+    self.normalize_history(input_modalities);
+    self.items
+}
+```
+
+每次 sampling 前：
+
+```rust
+sess.clone_history()
+    .await
+    .for_prompt(&turn_context.model_info.input_modalities)
+```
+
+用户输入、assistant output、function call 和 function output 都先记录到 history；下一次 sampling 使用完整 normalized effective history。normalization 负责补/删孤立工具项、处理 modality；compaction 直接替换 live history projection。base instructions 和 tools 独立于 history。
+
+启发：模型调用前只有一个 effective transcript owner；current prompt 只在进入 history前是增量，不作为整个 run 的长期平行 history lane。
+
+##### Gemini CLI
+
+Gemini CLI 使用 `AgentChatHistory` 作为 strong owner，当前 request 是 `PartListUnion`，转换成 `{ role: user, parts }` 后追加/late-bind 到 history。每次 API 调用发送：
+
+```text
+curated/managed previous Content[]
+  + current user Content
+```
+
+context management 开启时使用 `apiHistoryOverride`，它仍然是一次完整的 effective `Content[]`，只不过已经由 history graph 做过 summary/dedupe/masking。工具协议严格保持：
+
+```text
+model(functionCall)
+  -> user(functionResponse)
+```
+
+IDE context injection 会在 pending functionCall 时暂停，避免切断 call/response adjacency。
+
+启发：current request 可在 history management 阶段 late-bind，但进入模型调用后仍是一个完整 ordered transcript；工具 pair 是 layout 的硬不变量。
+
+##### pi coding-agent / pi-agent-core
+
+pi 使用 `Agent.state.messages` 作为 live transcript：
+
+```text
+runAgentLoop(prompts, context)
+  -> currentContext.messages = context.messages + prompts
+```
+
+每次模型调用：
+
+```text
+context.messages
+  -> transformContext
+  -> convertToLlm
+  -> { systemPrompt, messages, tools }
+  -> provider
+```
+
+assistant tool call 和 tool results 追加到同一 `currentContext.messages`；下一模型调用再次转换完整 context。`convertToLlm` 是 session-domain/custom messages 到 model-compatible messages 的唯一 seam，例如：
+
+- `compactionSummary` -> user-role summary text；
+- `branchSummary` -> user-role summary text；
+- `bashExecution` -> user text or excluded；
+- `custom` -> user message；
+- standard user/assistant/toolResult pass through。
+
+compaction 后通过 session projection 重建并整体替换 `agent.state.messages`。
+
+启发：一个 live transcript + 一个 model conversion seam，认知成本显著低于多条长期 lane。
+
+##### Claude Code / Anthropic
+
+Claude Code 内部请求组装未公开，不应声称具体实现细节。公开文档确认：
+
+- 每个 session 把消息、tool use/result 持久化为本地 JSONL；
+- context window 包含 conversation history、file/command outputs、CLAUDE.md、skills 和 system instructions；
+- 接近窗口上限时先清理旧工具输出，再 summarize conversation；
+- compaction 后继续使用 summary + retained useful context。
+
+Anthropic provider wire 使用自己的 Messages/tool-use blocks；这再次说明 runtime canonical message 与 provider DTO 必须分层。
+
+##### Provider cache / continuation
+
+prompt cache、Anthropic `cache_control`、OpenAI/Codex `previous_response_id`、sticky WebSocket 等只是传输/计费优化，不应改变 runtime 的逻辑上下文模型。
+
+pi 的 Codex adapter 只有在“当前完整 input 是上一轮 request + response baseline 的严格前缀延伸”时，才发送 `previous_response_id + delta`；条件不满足就回退完整 input。这说明正确方向是：
+
+```text
+runtime 先构造完整逻辑上下文
+provider adapter 再选择 full payload 或等价 continuation/delta
+```
+
+#### 8. 调研过的替代方案
+
+##### 方案 A：actor-owned single effective conversation
+
+引入 `EffectiveConversation`，由 `SessionRuntime` actor 持有唯一 live transcript；每次模型调用通过 actor/RunLink 投影 request。删除长期 current lane、`TurnState.messages`、Driver profile/history ownership，甚至可以把 Prompt 能力合并进 Conversation deep module。
+
+优点：
+
+- 概念最简单；
+- current input、Steer、tool round commit 后直接进入同一 transcript；
+- model request 只有一个投影来源。
+
+主要风险：
+
+- Rig `AgentRun` 仍持有 protocol history，形成 actor transcript 与 Rig working state 双份 live state；
+- 每次 call 回 actor 准备完整 request，扩大高频 RunLink 路径；
+- 若完全忽略 Rig history，必须先验证 Rig sans-IO API 能安全工作；
+- 方案中过度删除 `PromptTurn` / `ToolProfileBaseline` 会损失已经闭合的资源/工具 fingerprint 不变量。
+
+结论：方向有价值，但全量采用风险过高，必须先做 Rig spike。
+
+##### 方案 B：保留 lanes，修复 seed 和类型
+
+保留 `durable_history/current_input/transient_context`，新增 `AgentRunSeed { durable_history, current_input }`，明确 current input entry IDs，增加 `ModelMessage`，其余 Prompt/Driver/SessionRuntime 分工基本不变。
+
+优点：
+
+- 迁移风险低；
+- current input pre-run protection 明确；
+- 容易适配 Rig 的 `{ history, prompt }` 接口。
+
+缺点：
+
+- 大部分现有认知复杂度仍然存在；
+- current input 在整个 run 中继续作为长期 lane；
+- Rig rollover、Steer、tool continuation 仍需维护 lane 迁移规则。
+
+结论：适合作为保守 fallback，不是首选终局。
+
+##### 方案 C：每次 CallModel 从 committed storage projection
+
+只认 SessionStorage 为权威；每次 Driver CallModel 前通过 RunLink 获取 `ConversationSnapshot`，不让 `TurnState` 保存 messages。
+
+优点：
+
+- durable source of truth 最强；
+- compaction/Steer/retry 后天然读取最新 committed context；
+- 避免 actor 手工同步 `TurnState.messages`。
+
+缺点：
+
+- 每次 model call 增加 mailbox round trip；
+- JSONL 全量 rebuild 不可接受，必须引入 cache/watermark/delta；
+- `ConversationCache` 本身重新引入复杂状态；
+- Driver/Rig working history 仍需与 snapshot 对齐。
+
+结论：一致性强但实现成本过高，不符合当前 MVP。
+
+#### 9. 推荐方案：Transcript-First、run-scoped live projection
+
+综合三个方案，推荐采用中间路线：
+
+> SessionStorage 是 durable truth；一次 `DriveRequest` 接收完整 `ConversationSeed`；Driver/Rig 持有 run-scoped live transcript projection；只有 commit 成功的 exact delta 才能推进该 live transcript；每次模型调用从同一个 transcript 做 model-facing projection。
+
+目标架构：
+
+```text
+SessionStorage / SessionWriter
+  -> SessionHandle.build_session_context()
+  -> ConversationSeed
+  -> Driver private Rig adapter / run-scoped transcript
+  -> prompt::project_model_call(conversation + transient overlay)
+  -> ModelInputProjection<ModelMessage>
+  -> ModelGateway
+  -> provider DTO
+```
+
+这保留 MiniCore 比 Codex/Gemini/pi 更强的 stable commit 不变量，同时采用它们“一个 live effective transcript”的核心模式。
+
+#### 10. 推荐核心类型
+
+##### Canonical session message
+
+保留 `MessageRecord` 作为 session-domain canonical record。它服务 storage/UI/compaction/resume，不直接作为 provider wire。
+
+##### Current input resolution
+
+建议删除公开 `parts + messages` 双状态，收敛为：
+
+```rust
+pub struct ResolvedPromptInput {
+    user_message: UserMessage,
+    contribution_stamps: Arc<[PromptContributionStamp]>,
+    fingerprint: PromptInputFingerprint,
+}
+```
+
+`PromptInputPart` 可以作为 Prompt implementation 内部 IR；若需要 debug/query，可暴露只读 projection，不让调用方重新 fold。
+
+MVP 一个 `PromptIntent` 固定产生一条 user message，与 `SessionWriteBatch::user_input(message)` 对齐。若未来需要一个 submission 产生多条 user message，必须另行定义 batch grouping、event grouping 和 compaction protection，不能仅因字段是 `Vec` 就默认允许。
+
+##### Conversation seed
+
+```rust
+pub struct ConversationSeed {
+    pub messages: Arc<[MessageRecord]>,
+    pub fingerprint: ConversationFingerprint,
+}
+```
+
+seed 是已经应用 compaction、已经包含本次 committed user input 一次、协议完整的有序 transcript。
+
+##### Drive request
+
+```rust
+pub struct DriveRequest {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub conversation: ConversationSeed,
+    pub turn: DriverTurnInput,
+    pub limits: DriveLimits,
+}
+```
+
+`DriverTurnInput` 继续保持窄接口，只含 model/profile/options；conversation 独立于它，避免回退成 `DriveRequest { turn_state }`。
+
+`DriveEntry::Prompt { messages }` 可删除或仅保留 entering mode，不再承担历史/current message 容器职责。
+
+##### Provider-neutral model message
+
+```rust
+pub enum ModelMessage {
+    User {
+        parts: Arc<[ModelContentPart]>,
+    },
+    Assistant {
+        text: Arc<str>,
+        tool_calls: Arc<[ModelToolCall]>,
+    },
+    ToolResult {
+        call_id: ToolCallId,
+        parts: Arc<[ModelContentPart]>,
+        is_error: bool,
+    },
+}
+
+pub enum ModelContentPart {
+    Text(Arc<str>),
+    Image(ModelImage),
+    File(ModelFile),
+}
+```
+
+Prompt final projection 统一处理：
+
+- `CompactionSummary` -> `ModelMessage::User(Text(summary wrapper))`；
+- `BranchSummary` -> model-visible user summary or excluded by explicit policy；
+- `Custom` -> include/exclude and role mapping；
+- `User` / `Assistant` / `ToolResult` -> validated model messages；
+- tool call/result pairing and order；
+- unsupported session-only messages -> diagnostic/error, not provider-specific guess。
+
+##### Model call projection
+
+推荐删除长期 current lane：
+
+```rust
+pub struct ModelCallProjectionInput<'a> {
+    pub profile: &'a PromptCallProfile,
+    pub conversation: &'a [MessageRecord],
+    pub transient_context: &'a [ContextMaterialContribution],
+    pub output_contract: Option<&'a OutputContract>,
+}
+
+pub struct ModelInputProjection {
+    pub system_prompt: Arc<str>,
+    pub messages: Arc<[ModelMessage]>,
+    pub tools: Arc<[ToolSchema]>,
+    pub output_contract: Option<OutputContract>,
+    pub diagnostics: Arc<[PromptDiagnostic]>,
+    pub contribution_stamps: Arc<[PromptContributionStamp]>,
+    pub fingerprint: ModelInputFingerprint,
+}
+```
+
+`CurrentRun` / `CurrentCall` context vectors可合并成一个 `transient_context`，scope 放在 item 内部。MVP 没有 producer 时保持空，不扩大外部 seam。
+
+##### ModelCallRequest
+
+建议直接持有 projection：
+
+```rust
+pub struct ModelCallRequest {
+    pub session_id: SessionId,
+    pub run_id: Option<RunId>,
+    pub call_id: ModelCallId,
+    pub purpose: ModelCallPurpose,
+    pub model: ModelSelection,
+    pub input: ModelInputProjection,
+    pub thinking_level: ThinkingLevel,
+    pub stream_options: StreamOptions,
+    pub max_output_tokens: Option<u64>,
+}
+```
+
+这样 Driver 不再复制/重组 validated system/messages/tools/output contract。
+
+#### 11. 推荐主流程
+
+##### 新 user turn / work chain
+
+```text
+1. SessionRuntime admits PromptIntent.
+2. capture TurnResourceSnapshot.
+3. Tools.capture_profile_baseline().
+4. prompt::assemble_turn() -> PromptTurn / PromptCallProfile.
+5. PromptTurn.resolve_intent() -> canonical UserMessage.
+6. bounded pre-commit transform/revalidation if enabled.
+7. SessionWriter.commit(UserInput).
+8. commit success -> publish invoked/message facts.
+9. mark committed input EntryId as protected for pre-run compaction.
+10. run pre-run threshold gate.
+11. if compacted, rebuild SessionContext.
+12. build final ConversationSeed containing current input exactly once.
+13. allocate RunId, establish CurrentRun, publish run_started.
+14. start Driver with ConversationSeed + DriverTurnInput + ToolBatchInvoker host.
+```
+
+current input protection 只存在于 Driver 启动前：
+
+```text
+commit U
+  -> pre-run compaction excludes U by EntryId
+  -> rebuild context includes U once
+  -> ConversationSeed
+```
+
+Driver 启动后，U 是 live transcript 尾部的普通 user message，不再维护长期 `current_input` lane。
+
+##### 每次模型调用
+
+```text
+Rig AgentRunStep::CallModel
+  -> private rig adapter exposes current ordered transcript
+  -> prompt::project_model_call(profile, conversation, transient overlay)
+  -> ModelInputProjection<ModelMessage>
+  -> ModelCallRequest { input: projection, model/options/purpose }
+  -> SessionDriverHost.call_model()
+  -> ModelGateway
+  -> provider adapter
+  -> normalized ModelCallResult
+  -> Driver feeds result to Rig
+```
+
+如果 Rig API 必须区分 `{ history, prompt }`，该拆分仅存在于 `driver/rig.rs` 私有 adapter。MiniCore 外部 interface 只认 ordered `ConversationSeed`。
+
+##### Tool round
+
+```text
+Rig CallTools
+  -> DriverHost.invoke_tool_batch
+  -> ToolBatchInvoker policy/approval/execution
+  -> complete ToolRoundCandidate
+  -> RunLink.commit_tool_round
+  -> actor validates active run / abort ordering
+  -> SessionWriter.commit(ToolRound)
+  -> commit success returns exact committed assistant/tool-result delta
+  -> publish committed message/tool facts
+  -> Driver feeds finalized results to Rig
+  -> Rig live transcript advances
+  -> next CallModel
+```
+
+必须保证：
+
+- commit 完成前 `invoke_tool_batch()` 不返回；
+- commit 失败后不调用 `AgentRun::tool_results()`；
+- abort-before-commit-admission 丢弃 candidate；
+- commit 开始后 writer 获胜，成功 round 保留，但 actor 可以阻止下一 model call 并以 aborted 收尾。
+
+当前 `CommittedSessionBatch` 只返回 entry IDs。为了让 Driver 使用 writer-finalized exact delta，建议扩展为返回 committed entries，或让 actor 用原 draft + returned IDs 生成不可再变的 `CommittedConversationDelta`：
+
+```rust
+pub struct CommittedConversationDelta {
+    pub entries: Arc<[SessionEntry]>,
+    pub leaf_id: EntryId,
+}
+```
+
+##### Active Steer
+
+```text
+safe point
+  -> actor consumes structured Steer intent
+  -> active PromptTurn resolves canonical UserMessage
+  -> commit UserInput
+  -> commit success returns exact committed user delta
+  -> append/rollover same RunId Rig segment
+  -> next model call uses transcript ending in Steer message
+```
+
+不再返回语义含混的 `persistent_messages`；建议改名为 `committed_conversation_delta` 或 `rollover_input`。
+
+##### FollowUp / NextTurn
+
+- FollowUp 在当前 work chain 和必要 retry/recovery/pending action 完成后，创建新的 work chain、资源 capture、ConversationSeed 和新 `RunId`。
+- NextTurn 继续只保存未展开 `PromptIntent`，由下一次显式 prompt boundary 统一解析；具体是合并为一个 Composite intent 还是按顺序 commit 多个 user messages，需要单独钉死，不应由 `Vec<MessageRecord>` 偶然决定。
+
+##### Overflow recovery / compaction
+
+```text
+current run fails with ContextLimitExceeded
+  -> run_finished(failed)
+  -> Compaction phase
+  -> compact committed session path
+  -> preserve current work-chain required suffix by EntryId
+  -> commit Compaction batch
+  -> build_session_context()
+  -> new ConversationSeed
+  -> new RunId / DriveEntry::Continue mode
+```
+
+不 resume 旧 Rig serialized history。old Driver/Rig live transcript 在 run terminal 后丢弃；新 run 从 committed storage rebuild。
+
+#### 12. Source-of-truth 与 owner 规则
+
+推荐最终规则：
+
+```text
+SessionStorage owns what happened.
+Prompt owns what the model sees.
+Driver/Rig owns only the current run protocol projection.
+ModelGateway owns provider invocation and encoding.
+```
+
+详细解释：
+
+- `SessionStorage` / `SessionWriter`：唯一 durable truth。
+- `ConversationSeed`：从 durable truth 构建的一次 run 初始只读投影，不可回写 storage。
+- Rig history：run-scoped protocol working state，不是 durable truth。
+- `PromptTurn`：pin stable resources/profile，并解析当前 intent；不拥有 history。
+- `ModelInputProjection`：一次 call 唯一 model-visible truth。
+- `ModelGateway`：只接收 provider-neutral model input，映射 provider DTO、auth、cache、fallback、usage/error。
+- Provider cache/continuation：wire optimization，不反向成为 runtime history owner。
+
+#### 13. 必须保留的现有设计
+
+推荐方案不是把现有架构全部推倒。以下复杂度有真实不变量，应保留：
+
+- `TurnResourceSnapshot`：work-chain stable resource inputs。
+- immutable `PromptTurn` / `PromptCallProfile`：稳定 system prompt 和 tool schemas。
+- `ToolProfileBaseline`：`ToolPromptView`、`ToolBatchInvoker`、fingerprint 同版。
+- `SessionRuntime actor + RunTask + RunLink`：model/tool wait 时 mailbox 仍可响应。
+- `SessionWriter` stable batches：UserInput、ToolRound、AssistantFinal、Compaction 原子提交。
+- commit-before-next-call：工具副作用结果必须先稳定提交。
+- `Driver` 作为 Rig sans-IO adapter。
+- `ModelGateway` provider/auth/error/usage seam。
+- compaction 不在 Driver/Rig 内执行，recovery 从 committed context 重建。
+
+#### 14. 建议删除或修改的现有设计
+
+| 当前设计 | 建议 |
+| --- | --- |
+| `ResolvedPromptInput { parts, messages }` | 改为 canonical single `UserMessage`；parts 降为 Prompt internal IR |
+| `TurnState.messages` | 删除，或至少不再作为第二份 live history；run 初始历史进入 `ConversationSeed` |
+| `DriveEntry::Prompt { messages }` | 删除消息容器职责；entry 只表示 start/continue/resume mode |
+| 长期 `durable_history/current_input` lanes | current protection 收敛到 pre-run EntryId policy；Driver 只看 ordered conversation |
+| `current_run_context/current_call_context` 两个 vectors | 合并成 single transient overlay，scope 置于 item |
+| `ModelInputProjection.messages: MessageRecord[]` | 改为 `ModelMessage[]` |
+| `ModelCallRequest` 再复制 projection fields | 改为持有 `ModelInputProjection` |
+| `persistent_messages` | 改为 exact committed delta / rollover input |
+| 多层重复 contribution stamps | 主要保留在 `PromptCallProfile` 与 `ModelInputProjection`；其它按需派生 |
+| MVP future hook 完整 payload | 只保留 safe-point owner/禁止事项，字段形状延后 |
+
+`TurnState` 如果继续存在，应只 pin resources/profile/model/tool baseline/limits/overflow budget，不再保存可与 Rig/storage 竞争的 history copy。
+
+#### 15. 最终不变量
+
+1. 一个 committed session fact 只有 `SessionStorage` 是 durable owner。
+2. 一个 `PromptIntent` 在 MVP 解析为一条 canonical user message。
+3. skill/template/resource 正文在 resolve 时展开；历史恢复不重新读取资源。
+4. current input 在 pre-run compaction 中按 committed `EntryId` 保护。
+5. `ConversationSeed` 包含 current input 恰好一次。
+6. Driver/Rig 只能由 committed seed/delta 推进；未 commit draft 不进入下一 model call。
+7. 完整 assistant tool-call + matching tool results 作为一个 `ToolRound` commit。
+8. tool round commit 成功后才能调用 `AgentRun::tool_results()`。
+9. active Steer commit 成功后才能 rollover/append。
+10. Rig history 是 working state；commit failure、compaction 或 recovery 后不得作为新 run source。
+11. `ModelInputProjection` 是唯一 model-visible projection；`ModelGateway` 不重新判断 session message visibility。
+12. `ModelGateway` 只消费 `ModelMessage`，provider adapter 再生成 OpenAI/Anthropic/Gemini DTO。
+13. system prompt 和 tool schemas 继续来自同一 `PromptCallProfile` / fingerprint。
+14. transient context 不进入 storage，且不能插入 unresolved tool call/result 中间。
+15. provider cache/continuation 必须与完整逻辑 input 等价；条件不满足时回退 full request。
+
+#### 16. 实施顺序与 blocker
+
+##### Step 1：Rig integration spike（首要 blocker）
+
+必须验证 Rig 0.40.0：
+
+- 如何用完整历史创建初始 `AgentRun`；
+- 是否必须公开区分 history/prompt；
+- `AgentRunStep::CallModel { prompt, history }` 的精确语义；
+- tool call/result 后 `full_history()` 是否包含 MiniCore 需要的全部 provider-neutral内容；
+- segment rollover 如何从 committed Steer 创建；
+- 是否能把 ordered `ConversationSeed` 只在私有 adapter 内拆成 Rig 所需形状。
+
+在完成 spike 前，不应接受删除 Prompt lanes 的 ADR。
+
+##### Step 2：闭合 history seed
+
+先引入 `ConversationSeed` / `InitialDriveContext`，保证 durable history 和 current input 能明确进入 Driver。即使最终仍采用保守 lane 方案，这一步也是 P0 必须修复。
+
+##### Step 3：简化 current input
+
+- `ResolvedPromptInput` 改为 canonical `UserMessage`。
+- commit 后只保留 protected `EntryId` 用于 pre-run compaction。
+- pre-run gate 后 seed 包含该消息一次。
+
+##### Step 4：提交 delta
+
+让 `UserInput`、`ToolRound`、Steer commit 返回或构造 exact committed conversation delta；Driver 只消费 committed delta。
+
+##### Step 5：引入 `ModelMessage`
+
+把 `MessageRecord -> ModelMessage` 的唯一转换放进 Prompt final projection；更新 `ModelInputProjection` 和 `ModelCallRequest`。
+
+##### Step 6：收窄 call projection
+
+将 `durable_history/current_input` 改为 ordered conversation + transient overlay；更新 compaction/current protection 文档。
+
+##### Step 7：裁剪 future surface
+
+删除 MVP 无 producer 的 context/hook/stamp 字段级契约；只保留明确 owner 和未来重新设计要求。
+
+##### Step 8：新增 ADR 并同步权威文档
+
+如果 spike 支持推荐方案，新增例如：
+
+```text
+ADR 0023: Driver Starts From One Committed Conversation Seed
+```
+
+需要同步：
+
+- `CONTEXT.md`
+- `docs/architecture.md`
+- `docs/modules/README.md`
+- `docs/modules/prompt.md`
+- `docs/modules/session-runtime.md`
+- `docs/modules/driver.md`
+- `docs/modules/session-manager.md`
+- `docs/modules/model-gateway.md`
+- `docs/modules/compaction.md`
+- `docs/modules/tools.md`
+- ADR 0013、0017、0019、0021 的 amendment/supersede 关系
+- Round 3 BR-055 及可能新增的 history-seed issue
+
+#### 17. 测试建议
+
+- 同一 `PromptIntent` 产生确定性 canonical user message/fingerprint。
+- skill/template reload 后，已 committed message 不变化。
+- pre-run compaction 不摘要当前 committed input。
+- ConversationSeed 中 current input 只出现一次。
+- 初始 Driver/Rig call 能看到完整历史 + current input。
+- tool round writer 阻塞时，下一 model call 不发生。
+- tool round commit error 后 Rig 不调用 `tool_results()`，run failed terminal。
+- commit success 后下一 call 精确包含 committed assistant tool calls/results。
+- active Steer commit 失败不进入 Rig；成功后同 `RunId` rollover 且仅出现一次。
+- compaction/overflow recovery 丢弃旧 Rig transcript，从 storage seed 新 run。
+- `MessageRecord::CompactionSummary` 在 Prompt projection 中稳定转成 model user summary。
+- ModelGateway provider adapters 收到相同 `ModelMessage` 逻辑，分别映射 OpenAI/Anthropic/Gemini tool protocol。
+- provider continuation prefix 条件不满足时回退 full request。
+- transient context 不持久化、不切开 tool pair、不重复静态 resource。
+
+#### 18. 当前暂停点与推荐下一步
+
+当前没有修改权威架构文档，也没有关闭 BR-055。已形成的推荐是：
+
+```text
+优先做 Rig history-seed / rollover spike
+  -> 若可行，采用 Transcript-First + ConversationSeed
+  -> 若 Rig 强制暴露长期 history/prompt lanes，则采用保守 AgentRunSeed 方案
+```
+
+无论最终选择哪条路线，下列结论已足够确定：
+
+- `ResolvedPromptInput.messages` 不是历史。
+- current `parts/messages` 关系需要 canonical contract。
+- history seed seam 当前缺失，属于 P0。
+- `MessageRecord` 不应直接成为 provider-facing request message。
+- committed session history 是 durable truth；Rig history 只能是 run-scoped working state。
+- 当前消息流程应显著简化，不能原样进入生产实现。
