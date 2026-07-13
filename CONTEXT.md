@@ -398,8 +398,8 @@ _避免_：工具策略决定、工具参数、用户命令结果
 _避免_：独立 scheduler、LLM 策略解释器、工具执行器
 
 **工具沙箱视图（`ToolSandboxView`）**：
-`Tools` 子系统在 executor 前使用的安全边界 source of truth，描述 cwd、read roots、write roots、denied roots、process/network/env policy 和 sandbox verdict。UI approval 不能替代 sandbox；后期 hook 改写参数后必须重新 schema validate、canonicalize、sandbox check 和 policy evaluate。
-_避免_：审批弹窗、路径字符串前缀检查、executor 自行放宽权限
+`Tools` 子系统在 executor 前使用的路径授权与执行约束 source of truth，描述 cwd、read/write/denied roots、shell/network/env policy 和 effective enforcement capability。MVP 只承诺 MiniCore 内置工具的进程内路径边界，并保持通用 shell / `bash` disabled；通用子进程请求的 filesystem/network 限制只有在 OS-native/external backend capabilities 满足时才能标记为 enforced，否则 fail closed。UI approval 不能替代 enforcement；`FullAccessWithApproval` 明确没有 sandbox guarantee。后期 hook 改写参数后必须重新 schema validate、canonicalize、sandbox check 和 policy evaluate。
+_避免_：审批弹窗、路径字符串前缀检查、把 best-effort/full-access 称为 sandbox、executor 自行放宽权限
 
 **工具执行器**：
 `Tools` 子系统内部执行某个具体工具副作用的组件，例如读取文件、搜索文本、修改文件或运行命令。executor 不能绕过 registry、active tool check、policy、approval、sandbox 和 mutation lock。

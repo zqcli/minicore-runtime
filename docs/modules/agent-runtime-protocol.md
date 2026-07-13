@@ -362,6 +362,8 @@ pub struct PendingToolApprovalView {
 }
 ```
 
+`ToolApprovalMode` 只控制用户意愿门控，不声明 sandbox enforcement。`AutoAllow` 仍不能绕过 path authorization、hard deny 或 effective enforcement capability check；通用 shell 的 `FullAccessWithApproval` 若后续开放，必须作为明确的高风险 tool policy/availability 选择呈现，不能使用普通 remembered grant 隐式开启，也不能在 UI 中标记为 sandboxed。
+
 `ApprovalGrantScope::SameToolInWorkspace` 是后续保留值，MVP 收到该 scope 必须拒绝 `UnsupportedGrantScope`；不能把它解释成跨 cwd trust/sandbox 的授权。
 
 `PendingToolApprovalView` 是 `SessionRuntime` actor 从 control-class approval-pending update 归约出的 UI-safe projection，放在对应 loaded `SessionSnapshot.current_run.pending_tool_approvals`。`ToolApprovalBroker` 只保存冻结 execution record 与 waiter，不是另一个 UI projection owner。该 view 只暴露审批客户端、命令面板或其他 adapter 回答审批所需的信息，不包含冻结的 `prepared_args`、executor handle、sandbox internals 或 hook-private context。adapter 对该 view 的唯一状态修改入口仍是 `DecideToolApproval { approval_id, session_id, run_id, call_id, decision }`。重复或过期 decision 必须归约为 `ApprovalDecisionOutcome::{AlreadyResolved, StaleRun, StaleCall, NotFound}`，不能导致重复执行。

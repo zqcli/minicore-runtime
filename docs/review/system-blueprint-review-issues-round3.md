@@ -25,7 +25,7 @@
 1. **原唯一架构缺口已关闭**：BR-047 已通过 ADR 0021 定义 per-session actor、显式 `SessionRuntimeHandle`、run-scoped `RunTask`、私有 `RunLink` 和 owned `SessionDriverHost`，approval/abort/queue command 不再被完整 run 阻塞。
 2. **少量硬矛盾与死表面**：`project_model_call` receiver 矛盾已按 BR-048 关闭；仍待处理的是 `ResumeRun` 作为 MVP 中没有产生源的死命令，以及若干被引用但未定义的 MVP 载荷类型（BR-052）。
 3. **前两轮遗留项**：BR-036 已由 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md) 关闭为单实例薄边界容器；round2 过程性观察 #1/#3 的协议裁边仍待处理（BR-058）。
-4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）、sandbox 只有校验规范无 enforcement 方案（BR-050）。
+4. **实现前需定型的类型与算法空洞**：约 15 个 seam 类型零定义（BR-051）、确定性承诺缺 canonical 算法（BR-063）。通用 shell 的 OS enforcement 已按 BR-050 移出 MVP，并成为后续启用 `bash` 的硬 gate。
 
 这些都不动摇模块边界，返工风险局限在个别文件的接口形状。BR-036、BR-047 和 BR-048 的前置设计均已完成，其余多为文档级定稿。
 
@@ -85,20 +85,19 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 重新打开条件：segment rollover 无法保持协议 history 或 run-level budget/usage 语义；Rig 类型无法通过 MiniCore-owned provider-neutral 类型无损映射；同版本、同 host 生命周期内的 suspend/resume 无法满足要求；或 Rig 升级产生无法局限在 `driver/rig.rs` / `model_gateway/rig.rs` 的接口变化。
 
-### BR-050：tool sandbox 只有进程内校验规范，缺 OS 级 enforcement 方案
+### BR-050：通用 shell 的 OS 级 sandbox enforcement 延后实现
 
-状态：Open
+状态：Deferred
 
-问题：BR-037 已为 `ToolSandboxView` 补齐 path canonicalization、symlink/父目录校验、denied roots 优先级、verdict 等"校验器"层的 source of truth，这部分闭合到可测。但 `NetworkSandboxPolicy` / `ProcessSandboxPolicy` 对 `bash` 的**落地机制**（纯进程内检查？Job Object / AppContainer / seccomp？）未定义。MVP 只读工具不受影响，但进入 `bash` / `write` 阶段时，"限制网络/进程"到底靠什么强制执行是空白。
+处理记录：BR-037 已为 `ToolSandboxView` 补齐 path canonicalization、symlink/父目录校验、denied roots 优先级和 verdict，这些规则可以为 MiniCore 进程内实现的 `read` / `grep` / `find` / `ls` 提供可测试的路径授权，并允许 `write` / `edit` / `apply-patch` 在安全文件打开、路径重校验、审批、abort 和 mutation queue 完成后独立启用。它们不需要先启动任意子进程。
 
-证据：
+`bash` 的风险不同：入口命令、cwd、环境变量和审批检查无法约束子进程及其后代实际访问的文件、网络、凭据和其他进程。命令名 allowlist 可以被 shell、脚本解释器或子进程绕过；hostname allowlist 若没有强制代理和 direct-network deny 也不能形成可靠保证。UI approval 只表达用户意愿，不能替代 OS enforcement。
 
-- `docs/modules/tools.md`：Sandbox Source Of Truth 小节定义了校验规则，但 process/network policy 只描述判定，未描述 enforcement。
-- 本仓库在 Windows/OneDrive 路径下开发，bash 网络限制的平台落地不是假想问题。
+决策结果：MiniCore MVP 不启用 `bash`，也不承诺通用子进程的 OS 级隔离。`ToolSandboxView` 明确区分进程内 path authorization、请求的 shell/network policy 和 effective enforcement capability。请求 `Sandboxed`、`DenyAll` 或 proxy host allowlist 时，当前 OS-native/external backend 的 capability 必须满足策略，否则 fail closed 并返回 typed `SandboxUnavailable` / policy-denied tool result，不能静默以普通用户权限执行。显式 `FullAccessWithApproval` 是无隔离的高权限执行模式，必须逐次清楚展示风险，不能称为 sandbox，也不能由普通 remembered grant 隐式获得。
 
-风险：mutation/bash 阶段的核心安全语义靠实现时即兴决定；"限制网络后 bash 仍能联网"这类失败无从测试。
+平台实现延后到真正启用 shell 时选择：Linux 可评估 bubblewrap/Landlock/seccomp，macOS 可评估 Seatbelt，Windows 可评估 restricted token/ACL/专用 sandbox user/firewall 或 WSL2/external sandbox。具体 backend 不提前冻结进 MiniCore protocol；实现状态和 capabilities 由 Tools 内部 adapter 探测并投影安全摘要。
 
-待处理方向：不阻塞 MVP 只读工具与文本纵切；在 roadmap 上占位，进入 `bash` / `write` / `edit` / `apply-patch` 阶段前补一篇 enforcement 设计（明确进程内 best-effort 还是 OS 级隔离、平台差异、可观测点）。
+重新打开条件：开始实现 `bash` 或任何可启动任意子进程的 external executor；产品要求无审批自动执行 shell；需要把 workspace-only filesystem、network deny 或 host allowlist 声明为对子进程的强保证；或已有 OS-native/external backend 可进入 conformance test。关闭前必须验证限制传播到完整进程树、策略不足 fail closed、sandbox denial 可观察，以及无隔离模式不会被 UI/文档标记为 sandbox。
 
 ### BR-051：约 15 个跨模块 seam 类型被反复引用却从未定义
 
