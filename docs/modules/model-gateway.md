@@ -16,8 +16,8 @@ MiniCore 不重新实现 OpenAI、Anthropic、Gemini 或 OpenAI-compatible / Ant
 ```text
 SessionRuntime::ModelState
   → TurnState.model: ActiveModel
-  → Driver builds ModelCallRequest { model: ModelSelection, ... }
-  → DriverHost::call_model(...)
+  → Driver builds ModelCallRequest { model: ModelSelection, input: AssembledModelContext, ... }
+  → ModelGateway.generate_model_turn(...)
   → ModelGateway
       → ProviderRegistry.resolve(ModelSelection)
       → AuthStore.resolve(auth_ref)
@@ -34,7 +34,7 @@ SessionRuntime::ModelState
 阶段 4/5 前必须稳定的 `ModelGateway` spine：
 
 - provider-neutral 类型：`ModelSelection`、`ModelCallPurpose`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` 的字段、purpose 传播和 redaction 规则。
-- `ModelGateway.call_model(request, sink, cancel)` 主 seam。
+- `ModelGateway.generate_model_turn(request, sink, cancel)` 主 seam。
 - 最小 `ProviderRegistry.resolve(ModelSelection)`：可以只支持 builtin fake/minimal provider 和最小 capability projection，但调用方必须通过 registry，不允许在 `Driver` / `SessionDriverHost` 中 match provider id。
 - 最小 `AuthStore.resolve(AuthRef)`：可以使用测试 secret 或受控 env resolver，但 secret material 只能出现在 `AuthStore` / `ModelGateway` 内部。
 - fake/minimal provider adapter 或私有 Rig adapter：用于证明 text streaming、cancellation、error mapping 和 `ModelStreamSink` 形状。
@@ -60,10 +60,10 @@ WorkspaceServices
 
 SessionRuntime
   ├─ ModelState                 // session-scoped model selection
-  └─ DriverHost::call_model     // delegates to ModelGateway
+  └─ SessionDriverHost          // delegates model requests to ModelGateway
 
 Driver
-  └─ copies ModelSelection into ModelCallRequest only
+  └─ copies ModelSelection and AssembledModelContext into ModelCallRequest only
 
 ModelGateway internals
   └─ rig_provider_adapter       // private Rig provider/client usage
@@ -253,7 +253,7 @@ secret 不得出现在：
 Command
 TurnState
 DriverTurnInput
-DriveRequest
+ConversationDriveRequest
 ModelCallRequest
 DriverEvent
 agent_runtime_protocol::Event
@@ -266,7 +266,9 @@ logs
 
 ## ModelCallRequest
 
-`ModelCallRequest` 是 `Driver` / `SessionRuntime` 给 `ModelGateway` 的唯一 provider-neutral 请求。它携带模型选择、消息、工具 schema、输出限制和调用目的，但不携带 credentials、raw headers、Rig provider 类型或 raw provider payload。`Compaction` 不构造第二套模型请求；它只产出 `CompactionSummaryMaterial`，由 `SessionRuntime` 补齐调用策略后构造本类型。
+`ModelCallRequest` 是 `Driver` / `SessionRuntime` 给 `ModelGateway` 的唯一 provider-neutral 请求。它携带模型选择、已由 Prompt 组装并校验的 `AssembledModelContext`、输出限制和调用目的，但不携带 credentials、raw headers、Rig provider 类型或 raw provider payload。`Compaction` 不构造第二套模型上下文；它只产出 cut/protection/directive，由 `Prompt.assemble_model_context(...)` 组装 `CompactionSummary` 用的 `AssembledModelContext`，再由 `SessionRuntime` 补齐调用策略后构造本类型。
+
+Prompt 是 `AgentRun` 和 `CompactionSummary` 的唯一模型上下文组装 seam：`Prompt.prepare_message_turn(...) -> PreparedMessageTurn -> ModelContextProfile` 固定 system/tool/profile 基线，`Prompt.assemble_model_context(...) -> AssembledModelContext` 固定 provider-neutral model messages、tool schemas、output contract、diagnostics 和 fingerprint。`ModelGateway` 只编码 `AssembledModelContext` 并调用 provider；它不读取 session storage、不判断 `MessageRecord` 可见性、不把 `Custom` / `BranchSummary` / `CompactionSummary` 等 session-domain variant 重新映射成模型消息。
 
 ```rust
 pub enum ModelCallPurpose {
@@ -280,21 +282,35 @@ pub struct ModelCallRequest {
     pub call_id: ModelCallId,
     pub purpose: ModelCallPurpose,
     pub model: ModelSelection,
-    pub messages: Vec<MessageRecord>,
-    pub system_prompt: Option<String>,
-    pub tools: Vec<ToolSchema>,
+    pub input: AssembledModelContext,
     pub thinking_level: ThinkingLevel,
     pub stream_options: StreamOptions,
-    pub output_contract: Option<OutputContract>,
     pub max_output_tokens: Option<u64>,
+}
+```
+
+`AssembledModelContext` 是 Prompt 的输出，不是 provider DTO；其完整字段只由 [Prompt](prompt.md) 定义。ModelGateway 只依赖其中已经组装完成的 system prompt、`ModelMessage[]`、tool schemas、output contract、diagnostics 和 fingerprint，并从 `ModelCallRequest.purpose` 读取唯一调用目的；不能在本模块复制另一套可见性、排序或 purpose 规则。
+
+`ModelMessage` / `ModelTurn` 是 MiniCore-owned provider-neutral model types；session-domain `MessageRecord` 只能在 Prompt 的 `assemble_model_context()` 中转换成它们：
+
+```rust
+pub enum ModelMessage {
+    User { content: Vec<ModelContentPart> },
+    Assistant { content: Vec<ModelContentPart>, tool_calls: Vec<ModelToolCall> },
+    ToolResult { call_id: ToolCallId, content: Vec<ModelContentPart>, is_error: bool },
+}
+
+pub struct ModelTurn {
+    pub assistant: ModelMessage,
+    pub finish_reason: ModelFinishReason,
 }
 ```
 
 `ModelCallPurpose` 是模型调用业务目的的唯一权威类型，并原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；不存在第二套 `UsagePurpose`，也不允许在 usage/persistence 层重新分类。
 
-`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason`、`DriveEntry::Retry` 或 future call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 loaded session 在客户端未显示时继续运行，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
+`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason` 或 call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 loaded session 在客户端未显示时继续运行，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
 
-`AgentRun` 请求必须来自已校验的 `ModelInputProjection`，通常带 `tools`、完整 system prompt 和可选 `OutputContract`；`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求不带 tools/output contract，不复用 Agent run system prompt，只使用 compaction summary prompt，并把 `CompactionSummaryMaterial.max_output_tokens` 写入请求。
+`AgentRun` 请求必须来自已校验的 `AssembledModelContext`，通常带 `tools`、完整 system prompt 和可选 `OutputContract`；`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求同样来自 Prompt 组装的 `AssembledModelContext`：属于 active/pre-run work chain 时复用同一 `ModelContextProfile` 和尽可能长的稳定 conversation prefix，只追加 typed compaction directive；standalone compaction 则通过 `prepare_message_turn()` 生成确定性 profile。调用策略禁用 tool execution，并把 directive 的输出预算写入请求；ModelGateway 不另建一条 summary prompt 路径。
 
 `max_output_tokens` 表示调用方期望的输出上限，不是 provider 已验证值。`ModelGateway` 在 provider capability validation 时必须保证它大于 0，并按 `ModelCapabilities.max_output_tokens` 拒绝或确定性裁剪；最终生效值可进入 redacted attempt/diagnostic summary，但不能由 `Compaction` 直接读取 provider capability。
 
@@ -305,7 +321,7 @@ pub struct ModelCallResult {
     pub call_id: ModelCallId,
     pub actual_model: ModelSelection,
     pub finish_reason: ModelFinishReason,
-    pub message: MessageRecord,
+    pub turn: ModelTurn,
     pub usage: Option<ModelCallUsage>,
     pub attempts: Vec<ModelCallAttempt>,
     pub response_summary: ProviderResponseSummary,
@@ -354,7 +370,7 @@ pub enum ModelCallErrorKind {
 }
 ```
 
-`ModelGateway.call_model(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`Driver` 将 `ModelCallErrorKind::ContextOverflow` 映射为 provider-source `DriverError::ContextLimitExceeded`；`SessionRuntime` 根据该 recovery class 触发 overflow compaction recovery，并根据其他 transient 分类决定 retry。任何上层都不解析 Rig/provider error 文本。
+`ModelGateway.generate_model_turn(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`Driver` 将 `ModelCallErrorKind::ContextOverflow` 映射为 provider-source `DriverError::ContextLimitExceeded`；`SessionRuntime` 根据该 recovery class 触发 overflow compaction recovery，并根据其他 transient 分类决定 retry。任何上层都不解析 Rig/provider error 文本。
 
 ## 调用生命周期
 
@@ -371,7 +387,7 @@ AgentRuntime initializes WorkspaceServices
 ### Session restore
 
 ```text
-SessionHandle.build_session_context()
+SessionHandle.load_committed_conversation()
   → replays latest ModelChange { provider_id, model_id }
   → SessionRuntime initializes ModelState
   → invalid selection falls back through ProviderRegistry default/fallback policy
@@ -395,27 +411,27 @@ AgentCommand::SetModel { provider_id, model_id }
   → emit session_model_changed
 ```
 
-如果当前 run 正在进行，MVP 可以拒绝切换；完整版本可保存 typed pending session mutation，并在 `before_next_model_call` 安全点先 commit 对应 `SessionMutation` batch，再 patch future model call。运行中的 provider request 不被中途替换。
+如果当前 run 正在进行，MVP 可以拒绝切换；完整版本可保存 typed pending session mutation，并在 `commit_pending_messages` 安全点先 commit 对应 `SessionMutation` batch，再 patch future model call。运行中的 provider request 不被中途替换。
 
 ### SubmitPrompt
 
 ```text
 SubmitPrompt / prompt-like intent
-  → SessionRuntime captures TurnResourceSnapshot and creates PromptTurn
-  → PromptTurn.resolve_intent(...) returns preliminary ResolvedPromptInput
+  → SessionRuntime calls ResourceManager.capture_turn_resources(...) and Tools.capture_turn_tools(...)
+  → Prompt.prepare_message_turn(...) returns PreparedMessageTurn
+  → PreparedMessageTurn.compose_user_message(intent) returns CanonicalUserMessage
   → SessionRuntime applies bounded BeforeAgentStart / PromptBuilt / RunBeforeStart and revalidates
   → SessionRuntime commits final UserInput and publishes invocation/message events
-  → SessionRuntime builds final TurnState
+  → SessionRuntime rebuilds CommittedConversationState and ConversationSeed
   → allocate RunId + establish CurrentRun + publish run_started
-  → SessionRuntime projects DriverTurnInput { model, prompt: PromptCallProfile, thinking_level, stream_options }
-  → Driver.drive_run(...)
+  → SessionRuntime projects DriverTurnInput { model, context_profile: ModelContextProfile, thinking_level, stream_options }
+  → Driver.drive_conversation(ConversationSeed, DriverTurnInput, ...)
   → AgentRunStep::CallModel
-  → Driver applies NextModelCallPlan
-  → Driver calls prompt::project_model_call(PromptCallProfile + durable history + protected current input + transient context)
-  → ModelInputProjection validation succeeds
-  → Driver builds ModelCallRequest { model: ModelSelection, projection fields, ... }
-  → DriverHost::call_model
-  → ModelGateway.call_model
+  → Driver applies NextConversationStep
+  → Driver calls Prompt.assemble_model_context(ModelContextProfile + committed conversation + transient context)
+  → AssembledModelContext validation succeeds
+  → Driver builds ModelCallRequest { model: ModelSelection, input: AssembledModelContext, ... }
+  → ModelGateway.generate_model_turn
       → user-global ProviderRegistry.resolve(selection)
       → user-global AuthStore.resolve(auth_ref)
       → future BeforeModelCall hook
@@ -432,7 +448,7 @@ SubmitPrompt / prompt-like intent
 
 ```text
 Rig CallTools
-  → DriverHost::invoke_tool_batch
+  → DriverHost::execute_and_commit_tool_round
   → SessionRuntime
   → Tools policy / approval / grants / executor
   → Driver feeds tool_results back to Rig
@@ -440,7 +456,7 @@ Rig CallTools
   → Driver builds a new ModelCallRequest with the same or patched ModelSelection
 ```
 
-工具 schema 与 system prompt 必须来自同一个 `PromptCallProfile` / `ModelInputProjection` 后再进入 `ModelCallRequest`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
+工具 schema 与 system prompt 必须来自同一个 `ModelContextProfile` / `AssembledModelContext` 后再进入 `ModelCallRequest`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
 
 ### Compaction execution
 
@@ -449,16 +465,16 @@ SessionRuntime compaction flow
   → compaction::prepare_compaction(...)
   → query current model CompactionCapabilities
   → resolve CompactionMethod plan from trigger + user preference + capabilities
-  → SummaryModel: build CompactionSummaryMaterial and call ModelGateway.call_model
+  → SummaryModel: Prompt.assemble_model_context(...) builds compaction summary context and SessionRuntime calls ModelGateway.generate_model_turn
   → post-MVP ProviderNative: provider adapter calls its dedicated compact endpoint
   → CompactionResult
 ```
 
-MVP baseline 使用 `SummaryModel`：调用使用同一套 auth、usage、error、cancellation 和 hook redaction 规则，但不进入 `Driver.drive_run()`。后期 `ProviderNative` 只由声明该 capability 的 adapter 执行；例如 GPT 专用 compact endpoint 可返回需要后续请求原样回传的加密、model-bound context artifact。该 artifact 只持久化一次并由同 provider adapter 注入后续 model request，不进入普通 `MessageRecord`、公共 event 或 UI snapshot；模型/provider 不兼容时必须从仍保留的原始 durable entries 重新压缩。artifact envelope、兼容 key 和 provider payload 的具体字段留待 ProviderNative integration design 定型。
+MVP baseline 使用 `SummaryModel`：调用使用同一套 auth、usage、error、cancellation 和 hook redaction 规则，但不进入 `Driver.drive_conversation(...)`。后期 `ProviderNative` 只由声明该 capability 的 adapter 执行；例如 GPT 专用 compact endpoint 可返回需要后续请求原样回传的加密、model-bound context artifact。该 artifact 只持久化一次并由同 provider adapter 注入后续 model request，不进入普通 `MessageRecord`、公共 event 或 UI snapshot；模型/provider 不兼容时必须从仍保留的原始 durable entries 重新压缩。artifact envelope、兼容 key 和 provider payload 的具体字段留待 ProviderNative integration design 定型。
 
 ## Hooks
 
-模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `DriverHost::call_model(...)` 前的 run safe point，例如 `BeforeNextModelCall`、typed context collection、队列处理和 `PromptCallProfile` rebuild；Prompt 拥有最终 provider-neutral model-input projection 与协议校验。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
+模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `ModelGateway.generate_model_turn(...)` 前的 run safe point，例如 `BeforeNextModelCall`、typed context collection、队列处理和 `ModelContextProfile` rebuild；Prompt 拥有最终 provider-neutral `AssembledModelContext` 与协议校验。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
 
 推荐阶段：
 
@@ -482,13 +498,13 @@ Hook 不能读取 `AuthStore`，不能看到 authorization header，不能保存
 
 ## Usage And Events
 
-`ModelGateway` 输出单次模型调用的 `ModelCallUsage`。`Driver` 可以在一次 `drive_run()` 内聚合多次模型调用，最终返回 run-level `UsageSummary`；`SessionRuntime` 更新 `CurrentRunUsage`、`SessionUsageStats` 和 `ContextUsageView`。
+`ModelGateway` 输出单次模型调用的 `ModelCallUsage`。`Driver` 可以在一次 `drive_conversation()` 内聚合多次模型调用，最终返回 run-level `UsageSummary`；`SessionRuntime` 更新 `CurrentRunUsage`、`SessionUsageStats` 和 `ContextUsageView`。
 
 ```text
 ModelGateway
   → ModelCallUsage
 Driver
-  → current drive_run UsageSummary
+  → current drive_conversation UsageSummary
 SessionRuntime
   → usage_updated
   → run_finished { usage }
@@ -505,11 +521,11 @@ SessionRuntime
 
 ```text
 explicit SkillPromptIntent
-  → target PromptTurn.resolve_intent() formats captured skill body as user message
+  → target PreparedMessageTurn / compose_user_message(...) formats captured skill body as CanonicalUserMessage
 
 available skill summaries
   → PromptResourceView.materials
-  → prompt::assemble_turn(...) builds PromptCallProfile
+  → Prompt.prepare_message_turn(...) builds ModelContextProfile
 ```
 
 技能不直接选择 provider/model，也不接触 auth。
@@ -518,7 +534,7 @@ available skill summaries
 
 ```text
 system prompt snippets/guidelines
-provider tool schemas in ModelCallRequest.tools
+provider tool schemas in ModelCallRequest.input.tools
 ```
 
 `ModelGateway` 可以把 `ToolSchema` 转成 provider/Rig 需要的 provider-specific tool schema，但不能执行工具。若模型不支持 tools，`SessionRuntime` / `ActiveToolSet` 应根据 `ModelCapabilities.supports_tools` 过滤或禁用 active tools，并给 UI 诊断。
@@ -559,28 +575,29 @@ ProviderRegistry
 
 需要被测试和持续追问的边界：
 
-- 阶段 5 的 text-only driver 是否已经只通过 `ModelGateway.call_model(...)`，没有临时 provider/auth 路径。
+- 阶段 5 的 text-only driver 是否已经只通过 `ModelGateway.generate_model_turn(...)`，没有临时 provider/auth 路径。
 - Rig provider API 是否支持 custom `base_url`、headers、streaming、usage extraction、tool schema 和 cancellation。
 - `Driver` 是否真的不 import provider registry/auth，也不解析 provider errors。
 - `BeforeProviderPayload` 是否能做到 redacted；做不到就不开。
+- `ModelGateway` 是否只把 `AssembledModelContext` 编码成 provider DTO，而不重新判断 session message visibility。
 - `ModelSummary` 是否只在 protocol/snapshot 中出现，执行路径是否只用 `ModelSelection`。
 - `ModelCallUsage` 和 run-level `UsageSummary` 是否不会重复计数。
-- compaction summary 是否使用 `ModelCallPurpose::CompactionSummary`，且不带 tools、不复用 Agent run system prompt。
+- compaction summary 是否使用 `ModelCallPurpose::CompactionSummary`，复用 active work chain 的稳定 profile/prefix，并通过 call policy 禁用 tool execution。
 - `ModelCallRequest.purpose` 是否原样进入 `ModelCallUsage` / future `SessionEntry::Usage`，没有 `UsagePurpose` 转换层。
 - provider fallback、session retry 和后台 session 运行是否都不会把 purpose 改写为 `Retry` / `Background`。
 - session restore 中失效模型是否有明确 fallback / diagnostics / snapshot 展示，而不是静默换模型。
 
 ## 必测项
 
-- early spine：`DriverHost::call_model -> ModelGateway.call_model(ModelCallRequest)` 是阶段 5 唯一模型调用路径；`Driver` / `SessionDriverHost` 不 match provider id、不读 env、不构造 Rig provider client。
+- early spine：`Driver/SessionDriverHost -> ModelGateway.generate_model_turn(ModelCallRequest)` 是阶段 5 唯一模型调用路径；`Driver` / `SessionDriverHost` 不 match provider id、不读 env、不构造 Rig provider client。
 - `ProviderRegistry.resolve(ModelSelection)`：builtin/custom、invalid provider、invalid model、capability projection。
 - minimal provider registry：阶段 4/5 可只支持 fake/minimal provider，但仍必须走 `ProviderRegistry` / `AuthStore` seam。
 - `SetModel`：phase guard、session entry、`session_model_changed`、snapshot 当前模型一致。
 - auth redaction：snapshot/event/session entry/diagnostics/hook context 不含 API key、OAuth token、authorization header。
 - custom provider：OpenAI-compatible / Anthropic-compatible 的 `base_url + api_model_name + auth_ref` 能传到 Rig adapter。
 - custom provider 来源：项目级资源/settings 不能注册 custom provider、覆盖 base URL 或引用新的 `AuthRef`；只有 user-global 配置或后续 user-trusted extension 可以声明 custom provider。
-- submit flow：`TurnState.model.selection -> DriverTurnInput.model -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失。
+- submit flow：`TurnState.model.selection -> DriverTurnInput.model -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失，`ConversationSeed -> AssembledModelContext -> ModelCallRequest.input` 不被 ModelGateway 重新裁剪。
 - error taxonomy：auth missing、rate limit、context overflow、cancelled 不靠字符串解析给上层。
 - usage：多次 `model -> tools -> model` 的 `ModelCallUsage` 聚合成一次 run `UsageSummary`，不重复计数。
 - purpose：`AgentRun` / `CompactionSummary` 从 request 到 usage/persistence 原样传播；retry/fallback 只改变 attempt/lineage metadata。
-- compaction：`CompactionSummaryMaterial` 由 `SessionRuntime` 转成 `ModelCallPurpose::CompactionSummary` 请求，无 tools，带明确 `max_output_tokens`，usage 归入 compaction purpose。
+- compaction：Compaction directive 由 Prompt 转成 `ModelCallPurpose::CompactionSummary` 的 `AssembledModelContext`，复用稳定 profile/prefix，以 `OutputContract::NoToolCalls` 禁止工具执行，带明确 `max_output_tokens`，usage 归入 compaction purpose。

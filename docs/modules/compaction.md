@@ -1,12 +1,12 @@
 # Compaction
 
-`Compaction` 是会话级上下文压缩能力。MVP baseline 把当前会话路径上的旧历史摘要成一条 provider-neutral、模型可见的压缩摘要消息，并保留最近上下文；后期也可按当前模型 capability 使用 provider-native compact endpoint 生成 model-bound context replacement，使后续 Agent 运行在较小上下文中继续。
+`Compaction` 是会话级上下文压缩能力。MVP baseline 把当前会话路径上的旧历史摘要成一条 provider-neutral、模型可见的压缩摘要消息，并保留最近上下文；后期也可按当前模型 capability 使用 provider-native compact endpoint 生成 model-bound context replacement，使后续 Agent 运行在较小上下文中继续。按 Transcript-First 决策，`Compaction` 只产出 cut/protection/directive；模型上下文组装仍由 Prompt 完成，压缩 commit 后必须从 committed session path 重建新的 `ConversationSeed`。
 
 一句话边界：
 
 ```text
-Compaction transforms session context.
-It does not drive Rig AgentRun, execute tools, scan resources, or write UI state.
+Compaction computes cut/protection/directive for session context.
+It does not assemble model context, drive Rig AgentRun, execute tools, scan resources, or write UI state.
 ```
 
 ## 设计决定
@@ -16,29 +16,31 @@ It does not drive Rig AgentRun, execute tools, scan resources, or write UI state
 ```text
 SessionRuntime
   → reads current root-to-leaf SessionEntry path
-  → compaction.rs prepares cut point and provider-neutral source
+  → compaction.rs prepares cut point, protected EntryIds and summary directive
   → resolves CompactionMethod from trigger, user preference and model capabilities
+  → Prompt assembles the CompactionSummary model context
   → ModelGateway generates portable summary or invokes a supported native compact endpoint
   → SessionHandle.commit(SessionWriteBatch::compaction(...))
   → SessionHandle rebuilds compatible context replacement + kept messages
-  → SessionRuntime may start Driver again with DriveEntry::Continue
+  → SessionRuntime rebuilds ConversationSeed from committed storage
+  → SessionRuntime may start Driver.drive_conversation(...) again with continue mode
 ```
 
-`Driver` 只提供压缩决策所需事实：完成消息、模型调用 usage、provider error、context overflow error 和 run result。压缩触发使用 [UsageStats](usage-stats.md) 中定义的 `ContextUsage`，不是会话累计 token 消耗。压缩不是 Rig `AgentRun` 的 step，也不应该被塞进 `before_next_model_call` 的 driver 实现里。
+`Driver` 只提供压缩决策所需事实：完成消息、模型调用 usage、provider error、context overflow error 和 run result。压缩触发使用 [UsageStats](usage-stats.md) 中定义的 `ContextUsage`，不是会话累计 token 消耗。压缩不是 Rig `AgentRun` 的 step，也不应该被塞进 `commit_pending_messages` 的 driver 实现里。
 
 原因：
 
 - 压缩改变的是 session projection，不是 Rig 协议状态机。
 - 压缩要读取会话树、选择 `first_kept_entry_id`、提交 stable compaction batch、重建上下文并发 UI 事件。
 - 压缩要走模型凭据、summary prompt、abort 和 auto retry，这些属于 `SessionRuntime` 和 `ModelGateway`。后期启用 hook system 时，压缩 hook 仍由 `SessionRuntime` 在压缩安全点调用。
-- Rig `AgentRun` 可序列化，但序列化状态包含已累积的 conversation。压缩后继续 resume 旧 `AgentRun` 不能减少下一次 model input；压缩后应从重建后的 session context 启动新的 `DriveEntry::Continue`。
+- Rig `AgentRun` 可序列化，但序列化状态包含已累积的 conversation。压缩后继续 resume 旧 `AgentRun` 不能减少下一次 model input；压缩后应从重建后的 `ConversationSeed` 启动新的 continuation。
 
 ## 设计原则
 
-- `Compaction` 只负责 token estimate、cut point、provider-neutral preparation、method plan rules、summary instructions/material 和结果校验。
+- `Compaction` 只负责 token estimate、cut point、protected `EntryId` 集合、provider-neutral source selection、method plan rules、summary directive 和结果校验。
 - `SessionRuntime` 负责 manual/auto orchestration、phase、abort、模型调用、事件和 post-run 顺序。
 - `SessionHandle` / `SessionWriter` / `SessionStorage` 负责提交 compaction batch 和重建 root-to-leaf context。
-- `Driver` / Rig Agent loop 不拥有压缩；overflow recovery 后从重建上下文启动新的 continuation。
+- `Driver` / Rig Agent loop 不拥有压缩；overflow recovery 后从重建出的 `ConversationSeed` 启动新的 continuation。
 - running 时提交的 `Compact` defer 到 post-run safe point，不隐式 abort active run。
 
 pi coding-agent、LangChain 等实现可以作为摘要格式和 cut-point 行为的参考对象，但不构成 API、事件顺序或隐式 abort 行为的兼容承诺。MVP `SummaryModel` 的模型可见压缩消息固定为 user-role summary message：
@@ -51,7 +53,7 @@ The conversation history before this point was compacted into the following summ
 </summary>
 ```
 
-该摘要替代 durable history 的较早部分，不进入 system prompt。
+该摘要替代 ordered committed conversation 的较早部分，不进入 system prompt。
 
 ## 其他项目参考
 
@@ -90,6 +92,7 @@ pub enum CompactionReason {
 
 pub struct CompactionPreparation {
     pub first_kept_entry_id: EntryId,
+    pub protected_entry_ids: Vec<EntryId>,
     pub messages_to_summarize: Vec<MessageRecord>,
     pub turn_prefix_messages: Vec<MessageRecord>,
     pub is_split_turn: bool,
@@ -109,6 +112,8 @@ pub struct CompactionResult {
 }
 ```
 
+`protected_entry_ids` 是硬不变量：这些 entry 不进入 `messages_to_summarize`，也不能被 split-turn prefix summary 吞掉。典型来源包括刚提交、即将启动本次 run 的 `CanonicalUserMessage` entry，以及 overflow recovery 中必须保留的 committed suffix。
+
 `CompactionResult.usage` 使用 durable `PersistedModelCallUsage`。`ModelGateway` 返回的 runtime `ModelCallUsage` 必须由 `SessionRuntime` 去除 `raw_provider_usage` 后再放入 result；hook-provided summary 没有模型调用时为 `None`。
 
 当前 `CompactionResult { summary, ... }` 是 `SummaryModel` baseline。后期 `ProviderNative` 若返回 GPT 类加密 context item，需要把 replacement 扩展为 portable summary 或 model-bound opaque artifact；上层只保存 opaque envelope 和 compatibility metadata，不解析或记录 payload。原始 session entries 继续保留，以便模型切换、artifact 拒绝或 capability 变化时重新压缩。具体 replacement enum 和 wire/storage 字段不属于 BR-053，留待 ProviderNative 开工时定型。
@@ -124,14 +129,14 @@ pub fn prepare_compaction(
     settings: &CompactionSettings,
 ) -> Result<Option<CompactionPreparation>, CompactionError>;
 
-pub fn build_summary_material(
+pub fn build_summary_directive(
     preparation: &CompactionPreparation,
     instructions: Option<&str>,
-) -> CompactionSummaryMaterial;
+) -> CompactionSummaryDirective;
 
-pub fn build_turn_prefix_summary_material(
+pub fn build_turn_prefix_summary_directive(
     preparation: &CompactionPreparation,
-) -> Option<CompactionSummaryMaterial>;
+) -> Option<CompactionSummaryDirective>;
 
 pub fn finish_compaction(
     preparation: CompactionPreparation,
@@ -142,19 +147,19 @@ pub fn finish_compaction(
 pub fn compaction_summary_to_message(entry: &CompactionEntry) -> MessageRecord;
 ```
 
-`CompactionSummaryMaterial` 是 `Compaction` 产出的摘要内容和输出预算，不是给 `ModelGateway` 的请求，也不是 Rig run：
+`CompactionSummaryDirective` 是 `Compaction` 产出的摘要指令、目标消息和输出预算，不是给 `ModelGateway` 的请求，也不是 Rig run，也不是最终 `AssembledModelContext`：
 
 ```rust
-pub struct CompactionSummaryMaterial {
-    pub system_prompt: String,
+pub struct CompactionSummaryDirective {
     pub messages: Vec<MessageRecord>,
+    pub instruction: String,
     pub max_output_tokens: u64,
 }
 ```
 
-`Compaction` 只拥有 cut point、summary instructions、summary system prompt、模型可见摘要输入和 `summary_max_output_tokens`。它不选择 provider/model，不决定 thinking/stream policy，不分配 `ModelCallId` / `RunId`，也不构造 `ModelCallRequest`。
+`Compaction` 只拥有 cut point、protected entry set、summary instruction、摘要目标输入和 `summary_max_output_tokens`。它不选择 provider/model，不决定 thinking/stream policy，不分配 `ModelCallId` / `RunId`，不调用 `Prompt.assemble_model_context(...)`，也不构造 `ModelCallRequest`。
 
-`SessionRuntime` 收到 material 后，使用当前 `ModelState` 或 user-global settings 中的摘要模型选择，决定 thinking/stream policy，分配 correlation id，并构造唯一请求：`ModelCallRequest { purpose: ModelCallPurpose::CompactionSummary, tools: [], max_output_tokens: Some(material.max_output_tokens), ... }`。最终仍由 [ModelGateway](model-gateway.md) 解析 provider、auth、fallback、usage 和错误分类。
+`SessionRuntime` 收到 directive 后，使用当前 `ModelState` 或 user-global settings 中的摘要模型选择，决定 thinking/stream policy，分配 correlation id，并把 directive 交给 Prompt 的唯一模型上下文组装 seam：active/pre-run work chain 复用当前 `ModelContextProfile` 和稳定 conversation prefix；standalone compaction 先通过 `prepare_message_turn()` 产生确定性 profile。`Prompt.assemble_model_context(profile, directive.messages + directive.instruction, purpose = CompactionSummary) -> AssembledModelContext`，随后构造唯一请求：`ModelCallRequest { purpose: ModelCallPurpose::CompactionSummary, input: assembled_context, max_output_tokens: Some(directive.max_output_tokens), ... }`。调用策略禁用 tool execution；最终仍由 [ModelGateway](model-gateway.md) 解析 provider、auth、fallback、usage 和错误分类。
 
 `estimate_context_tokens()` 是 `ContextUsage` fallback helper，不是成本统计。它应遵循 [UsageStats](usage-stats.md) 的规则：优先使用最近一次有效 assistant provider usage，再估算后续消息；没有 provider usage 时才估算完整模型可见上下文。
 
@@ -173,7 +178,7 @@ should_compact(context_usage.current_tokens, context_usage.context_window, setti
 pub trait CompactionSummarizer {
     async fn summarize(
         &self,
-        material: CompactionSummaryMaterial,
+        directive: CompactionSummaryDirective,
         cancel: CancellationToken,
     ) -> Result<String, CompactionError>;
 }
@@ -191,20 +196,20 @@ pub trait CompactionSummarizer {
    - `previous_summary = prev.summary`。
    - `boundary_start` 是上一条 `first_kept_entry_id` 在 path 中的位置；如果找不到，退化为上一条 compaction 之后。
 4. 如果不存在上一条 compaction：`boundary_start = 0`。
-5. 用 `session::build_session_context(path)` 得到当前模型上下文，并按 `ContextUsage` 规则估算 `tokens_before`。
+5. 用 `session::load_committed_conversation(path)` 得到当前 committed conversation，并按 `ContextUsage` 规则估算 `tokens_before`。
 6. 从 path 尾部向前累计估算 token，选择能保留约 `keep_recent_tokens` 的 cut point。
 7. cut point 必须是协议安全点：不能从 tool result 开始保留，也不能制造 orphan tool result 或 unresolved tool call。
 8. 如果 cut point 落在一个用户 turn 中间，记录 `turn_prefix_messages`，并设置 `is_split_turn = true`。
-9. 收集 `messages_to_summarize`，排除旧 compaction entry 本身，但保留 branch summary、custom message 和 context-visible runtime message。
+9. 收集 `messages_to_summarize`，排除旧 compaction entry 本身和所有 `protected_entry_ids`，但保留 branch summary、custom message 和 context-visible runtime message。
 10. 从被摘要消息中提取文件操作，用于 summary 尾部的 `<read-files>` / `<modified-files>`。
 
 MVP 可以先只允许切在 user/custom/bash turn boundary。完整版本再支持 split turn。
 
-## 摘要 Prompt
+## 摘要指令与 Profile 复用
 
-摘要调用不应复用 Agent run 的 system prompt，也不应暴露工具。`Compaction` 先构建 `CompactionSummaryMaterial`；`SessionRuntime` 再将它转换为 `ModelCallRequest { purpose: CompactionSummary, tools: [], max_output_tokens: Some(...) }`，并交给 `ModelGateway` 执行。
+摘要调用复用 active/pre-run work chain 的 `ModelContextProfile` 和尽可能长的稳定 conversation prefix；standalone compaction 通过 `prepare_message_turn()` 生成确定性 profile。`Compaction` 只构建 `CompactionSummaryDirective`，Prompt 把 directive instruction 作为最后一条 typed user message 追加，并用 `OutputContract::NoToolCalls` 禁止工具调用。这样 system/tool/profile 前缀保持稳定，但摘要调用不会执行工具；provider adapter 无法表达该 contract 时必须返回 `UnsupportedCapability`，不能静默放开工具。
 
-系统提示词：
+摘要 instruction：
 
 ```text
 You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
@@ -215,11 +220,7 @@ Do NOT continue the conversation. Do NOT respond to any questions in the convers
 初次摘要 user prompt：
 
 ```text
-<conversation>
-{serialized_conversation}
-</conversation>
-
-The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+The preceding messages are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
 Use this EXACT format:
 
@@ -303,9 +304,9 @@ path/c.rs
 </modified-files>
 ```
 
-序列化规则：
+摘要目标选择规则：
 
-- user/custom/bash/branch summary 转成可读文本。
+- user/custom/bash/branch summary 由 Prompt 的 `MessageRecord -> ModelMessage` seam 转成协议安全内容。
 - assistant text、thinking 摘要、tool calls 保留关键内容。
 - tool result 必须截断，默认保留开头并标记被截断字符数。
 - image 内容只保留占位描述和来源摘要，不把二进制或大 base64 放入摘要 prompt。
@@ -334,7 +335,7 @@ pub enum SessionEntry {
 }
 ```
 
-`SessionHandle.build_session_context()` / `session::build_session_context(path)` 规则：
+`SessionHandle.load_committed_conversation()` / `session::load_committed_conversation(path)` 规则：
 
 ```text
 if no compaction on path:
@@ -358,14 +359,14 @@ entry 101..end  normal messages after compaction
 模型实际看到：
 
 ```text
-system: {PromptTurn.profile.system_prompt}
+system: {ModelContextProfile.system_prompt}
 user:   The conversation history before this point was compacted into the following summary:
         <summary>...</summary>
 ...     kept messages from first_kept_entry_id onward
 ...     messages after compaction
 ```
 
-压缩摘要进入 `TurnState.messages` / durable history，不进入 `PromptCallProfile.system_prompt`。
+压缩摘要进入 committed conversation / 后续 `ConversationSeed`，不进入 `ModelContextProfile` 的长期 system prompt。
 
 推荐内部消息类型：
 
@@ -387,43 +388,35 @@ pub struct CompactionSummaryMessage {
 }
 ```
 
-转换为 Rig/provider message 时：
-
-```rust
-MessageRecord::CompactionSummary(m) => ModelMessage::User {
-    content: format!(
-        "The conversation history before this point was compacted into the following summary:\n\n<summary>\n{}\n</summary>",
-        m.summary,
-    ),
-}
-```
+转换为 model-visible message 时，`Prompt.assemble_model_context(...)` 必须把 `MessageRecord::CompactionSummary` 映射为一条 `ModelMessage::User`，其 `content` 是一个 `ModelContentPart::Text`，文本使用下面的稳定包裹格式：`The conversation history before this point was compacted into the following summary:\n\n<summary>...</summary>`。Compaction 文档只规定语义和文本模板，不定义第二套 `ModelMessage` 类型或 provider mapping。
 
 理由：
 
 - user-role summary 明确表达它是 conversation history 的替代物，而不是长期行为规则，因此不应进入 system prompt。
-- system prompt 仍由目标 turn 的 `PromptTurn` 从 captured resources 和 typed views 构建，避免 Pydantic AI 提到的 system prompt round-trip 问题。
+- system prompt 仍由目标 turn 的 `ModelContextProfile` 从 captured resources 和 typed views 构建，避免 Pydantic AI 提到的 system prompt round-trip 问题。
 - UI 可以把 `CompactionSummaryMessage` 渲染为折叠块，但模型看到的是明确标签包裹的摘要。
 
-## Current Input 保护
+## Current User 保护
 
-Prompt 子系统把 durable history、current/protected input 与 transient context 分开。Compaction 只对 durable session path 选择 cut point；刚被接收、即将触发本次 Agent run 的 current input 必须 late-bind 到压缩后的 history 之后，不能在同一启动边界被摘要或截断。
+Transcript-First 不保留 durable history / current input 双 lane。刚被接收、即将触发本次 Agent run 的 canonical user message 已经位于 committed session path 中；Compaction 通过其 committed `EntryId` 将它排除在 summary target 之外，压缩 commit 后再从 committed state 构造一条 ordered `ConversationSeed`。
 
 ```text
-history before current input
+committed conversation before protected user
   → compact if needed
   → rebuild summary + retained suffix
-  → append protected current input for ModelInputProjection
+  → retain protected user at its committed position
+  → build ConversationSeed in which it appears exactly once
 ```
 
-如果 current input 已通过 `UserInput` batch 提交，`SessionRuntime` 仍必须按 committed entry id 把它从本次 compaction candidate 中排除，并作为 `ModelCallProjectionInput.current_input` 单独传递。consumed Steer 同理：只有进入 Rig/run history 后才成为后续 durable history。
+如果 canonical user message 已通过 `UserInput` batch 提交，`SessionRuntime` 必须按 committed entry id 把它从本次 compaction candidate 中排除；它不通过第二个参数或 lane 再次传递。已提交的 Steer 同理：它通过 `CommittedConversationDelta` 成为 ordered conversation 的普通 user message，后续 compaction 再按目标 cut/protection 规则处理。
 
 RAG、memory、IDE diagnostics 等 `CurrentCall` context 不进入 compaction source；`CurrentRun` context 是否摘要必须由其 owner 显式升级为 durable entry，不能由 Compaction 猜测。
 
 ## Run 前阈值压缩
 
-`SessionRuntime` 在最终 `UserInput` batch commit 后、分配 `RunId` 前做同步、best-effort threshold gate。它使用 durable history、受保护 current input、prompt/tool baseline 的 `ContextUsage` 估算；若超过阈值，立即从 `Turn + current_run = None` 切换到独立 `Compaction` phase并发布 compaction lifecycle，再排除本次 committed input执行压缩。压缩后切回 `Turn`，重建 `TurnState` 并重新检查一次；通过后才分配 `RunId` 和发布 `run_started`。没有可压缩历史、protected input 本身过大或压缩后仍超限时返回 typed unrecoverable context-limit error，不启动幽灵 run。
+`SessionRuntime` 在最终 `UserInput` batch commit 后、分配 `RunId` 前做同步、best-effort threshold gate。它使用 ordered committed conversation、protected entry set 和 prompt/tool baseline 的 `ContextUsage` 估算；若超过阈值，立即从 `Turn + current_run = None` 切换到独立 `Compaction` phase并发布 compaction lifecycle，再排除本次 committed user entry 执行压缩。压缩后切回 `Turn`，重建 committed conversation / `ConversationSeed` 并重新检查一次；通过后才分配 `RunId` 和发布 `run_started`。没有可压缩历史、protected user 本身过大或压缩后仍超限时返回 typed unrecoverable context-limit error，不启动幽灵 run。
 
-该 gate 用于提前避免常见超限，不替代 `Driver` 每次 CallModel 前的最终 `prompt::project_model_call(...)` 校验。tool results、Steer 或 transient context 可能让 run 内后续 call 才超限，此时走下面的 overflow recovery。
+该 gate 用于提前避免常见超限，不替代 `Driver` 每次 CallModel 前的最终 `Prompt.assemble_model_context(...)` 校验。tool results、Steer 或 transient context 可能让 run 内后续 call 才超限，此时走下面的 overflow recovery。
 
 ## 手动压缩流程
 
@@ -443,12 +436,13 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
   → preparation = compaction::prepare_compaction(path, settings)
   → future RuntimeHookRegistry.invoke(SessionBeforeCompact)
   → future hook may cancel, patch instructions, or provide CompactionResult
-  → material = compaction::build_summary_material(preparation, instructions)
-  → SessionRuntime constructs ModelCallRequest { purpose: CompactionSummary, tools: [] }
-  → ModelGateway summarizes material
+  → directive = compaction::build_summary_directive(preparation, instructions)
+  → Prompt.assemble_model_context(...) reuses stable profile/prefix and applies OutputContract::NoToolCalls
+  → SessionRuntime constructs ModelCallRequest { purpose: CompactionSummary, input }
+  → ModelGateway.generate_model_turn summarizes directive input
   → SessionHandle.commit(SessionWriteBatch::compaction(...))
-  → rebuild SessionContext
-  → update SessionRuntime message projection / next TurnState basis
+  → reload/apply committed conversation and build ConversationSeed
+  → update SessionRuntime committed conversation projection / next TurnState basis
   → emit `compaction_finished`
   → future RuntimeHookRegistry.invoke(SessionCompact) // observer; failure only diagnostics
   → phase = idle
@@ -467,14 +461,14 @@ agent_runtime_protocol::AgentCommand::Compact { instructions }
 `SessionRuntime` 在 run 完成后执行 post-run 检查：
 
 ```text
-Driver returns DriveResult::Completed
+Driver returns ConversationRunResult::Completed
   → SessionRuntime has committed the final AssistantFinal batch
   → compute ContextUsage from projected session context
   → should_compact(context_usage.current_tokens, context_window, settings)
   → run_auto_compaction(reason = Threshold, will_retry = false)
 ```
 
-threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steering continuation / follow-up 有消息，压缩后再启动 `DriveEntry::Continue` 或下一次 prompt。next-turn queue 保留到下一次显式 prompt，不自动启动 run。
+threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steering continuation / follow-up 有消息，压缩后从最新 committed state 构造新的 `ConversationSeed` 并启动 continuation 或下一次 prompt。next-turn queue 保留到下一次显式 prompt，不自动启动 run。
 
 如果 post-run safe point 已有 pending manual compact，先执行 manual compact，并跳过同一 safe point 的 threshold auto compaction，避免连续生成两次摘要。context overflow recovery / immediate retry chain 优先于 pending manual compact；等当前 work chain 稳定结束后再执行用户排队的压缩。
 
@@ -483,21 +477,21 @@ threshold 压缩成功后不自动重跑刚完成的回答；如果 queued steer
 context overflow 是压缩和 retry 的交界点。
 
 ```text
-Driver returns DriveResult::Failed
-  { error: DriverError::ContextLimitExceeded { source: PromptProjection | Provider, ... } }
+Driver returns ConversationRunResult::Failed
+  { error: DriverError::ContextLimitExceeded { source: PromptAssembly | Provider, ... } }
   → SessionRuntime verifies the error belongs to the current model/work chain
   → if overflow recovery has not been attempted in this work chain:
        emit diagnostics only; do not persist the transient partial/error message
        run_auto_compaction(reason = Overflow, will_retry = true)
-       rebuild context and start a new RunId with
-       DriveEntry::Continue { reason: ContextOverflowRecovery }
+       rebuild committed conversation and start a new RunId with
+       ConversationSeed + continuation reason ContextOverflowRecovery
   → else:
        stop with typed ContextStillTooLargeAfterCompaction
 ```
 
-`PromptProjection` 表示本地最终投影已超限且没有调用 provider/产生 model-call usage；`Provider` 表示 provider 已拒绝请求并可能带 attempt/usage。两者共享 recovery policy，但 diagnostics 和 usage source 不合并。transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状态都不进入 `SessionWriter`，因此 retry 只从最后 committed context 重建，不需要从 durable history 删除失败消息。
+`PromptAssembly` 表示本地最终模型上下文组装已超限且没有调用 provider/产生 model-call usage；`Provider` 表示 provider 已拒绝请求并可能带 attempt/usage。两者共享 recovery policy，但 diagnostics 和 usage source 不合并。transient overflow error、partial assistant 和旧 `AgentRun` 的未完成状态都不进入 `SessionWriter`，因此 retry 只从最后 committed conversation 重建，不需要删除任何 committed message。
 
-压缩后的重试不要使用 `DriveEntry::Resume`。应使用重建后的 session context 启动新的 `DriveEntry::Continue`。
+压缩后的重试不要 resume 旧 Rig segment。应使用重建后的 `ConversationSeed` 启动新的 continuation。
 
 overflow recovery budget 跨它创建的新 `RunId` 保留，整个 work chain 最多自动 compact-and-continue 一次。若 preparation 返回 `NothingToCompact`、protected current input 已占满有效窗口，或 recovery 后再次收到任一来源的 context limit，必须 fail closed，不能形成 compact/run 循环。
 

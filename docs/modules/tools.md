@@ -6,7 +6,7 @@
 
 ```text
 Driver
-  consumes: DriverHost::invoke_tool_batch when Rig AgentRunStep::CallTools appears
+  consumes: DriverHost::execute_and_commit_tool_round when Rig AgentRunStep::CallTools appears
 
 SessionRuntime
   owns: Tools lifecycle/control, run/session state, event归约, persistence, queues
@@ -22,7 +22,7 @@ Tools
 
 ## 设计决定
 
-本项目不把工具执行交给 Rig 高阶 runner。我们使用 Rig 的 `AgentRun / AgentRunStep` sans-IO 路径，并在 `CallTools` step 中由 `Driver` 通过 `DriverHost::invoke_tool_batch(...)` 回到 `SessionRuntime`，再进入 `Tools`：
+本项目不把工具执行交给 Rig 高阶 runner。我们使用 Rig 的 `AgentRun / AgentRunStep` sans-IO 路径，并在 `CallTools` step 中由 `Driver` 通过 `DriverHost::execute_and_commit_tool_round(...)` 回到 `SessionRuntime`，再进入 `Tools`：
 
 ```text
 Rig AgentRun
@@ -49,7 +49,7 @@ Tools
 LLM returns tool calls
   -> Rig AgentRunStep::CallTools { calls }
   -> Driver
-  -> DriverHost::invoke_tool_batch(ToolBatchRequest)
+  -> DriverHost::execute_and_commit_tool_round(ToolBatchRequest)
   -> SessionRuntime / SessionDriverHost
   -> ToolBatchInvoker.invoke_batch(...)
   -> ToolExecutor
@@ -118,7 +118,7 @@ pub use executor::{ToolExecutor, ToolExecutorRegistry, ToolInvocationResult};
 | --- | --- | --- |
 | `tools.rs` | 顶层 public module 和常用类型 re-export | 具体执行逻辑 |
 | `tools/mod.rs` | 子模块声明和内部 re-export | 业务逻辑 |
-| `tools/subsystem.rs` | 定义 actor-owned `Tools` control facade；提供原子 `capture_profile_baseline`、`set_active_tools`、`decide_approval` 等深接口 | 不直接发布 UI event，不写 session storage，不分别公开 prompt/invoker baseline getter |
+| `tools/subsystem.rs` | 定义 actor-owned `Tools` control facade；提供原子 `capture_turn_tools`、`set_active_tools`、`decide_approval` 等深接口 | 不直接发布 UI event，不写 session storage，不分别公开 prompt-view/executor baseline getter |
 | `tools/definition.rs` | 定义 `ToolDefinition`、`ToolName`、`ToolSchema`、`ToolRisk`、`ToolExecutionMode`、`ToolSource`、prompt metadata | 不保存当前注册表 |
 | `tools/registry.rs` | 管理 `ToolRegistry`、`RegisteredTool`、工具冲突、source info、executor 绑定 | 不判断是否 active，不做审批 |
 | `tools/active.rs` | 管理 `ActiveToolSet`，决定当前 session 哪些工具暴露给模型 | 不注册工具，不执行工具 |
@@ -157,7 +157,7 @@ pub struct Tools {
 }
 
 impl Tools {
-    pub fn capture_profile_baseline(&self) -> ToolProfileBaseline;
+    pub fn capture_turn_tools(&self) -> TurnToolProfile;
     pub fn set_active_tools(&mut self, names: &[ToolName]) -> Result<ToolSetChange, ToolSubsystemError>;
     pub fn prompt_catalog(&self) -> &ToolPromptCatalog;
     pub fn decide_approval(&self, command: ToolApprovalDecisionCommand) -> ApprovalDecisionOutcome;
@@ -166,9 +166,9 @@ impl Tools {
 }
 
 #[derive(Clone)]
-pub struct ToolProfileBaseline {
-    pub prompt: ToolPromptView,
-    pub invoker: ToolBatchInvoker,
+pub struct TurnToolProfile {
+    pub prompt_view: ToolPromptView,
+    pub executor: ToolBatchInvoker,
     pub fingerprint: ToolProfileFingerprint,
 }
 
@@ -202,9 +202,9 @@ pub enum ToolBatchError {
 
 `ToolExecutionProfile` 是 invoker 创建时捕获的 immutable baseline，至少绑定 registry/executor bindings、active tool set、policy config、sandbox profile 和 prompt/tool profile fingerprint；grants 与 pending approvals 通过专用短锁 store/broker 访问，不把整个 `Tools` 放进 mutex。`ToolExecutionKernel` 封装 planner/coordinator/executor registry 和 mutation locks，可以被 invocation task 安全共享，但不能修改 actor-owned active/profile state。
 
-`Tools.capture_profile_baseline()` 必须在一次无 await 的 owner 操作中，从同一个 committed active-set / policy / sandbox revision 同时构造 `ToolPromptView` 与 `ToolBatchInvoker`。`ToolProfileBaseline.prompt.fingerprint`、`*ToolProfileBaseline.invoker.fingerprint()` 和 `ToolProfileBaseline.fingerprint` 必须相等。新的 work chain 捕获一次并在 automatic retry / overflow recovery 中复用；后期 safe-point replacement 也不能分别调用两个 getter 拼装 baseline。
+`Tools.capture_turn_tools()` 必须在一次无 await 的 owner 操作中，从同一个 committed active-set / policy / sandbox revision 同时构造 `ToolPromptView` 与 `ToolBatchInvoker`，返回 `TurnToolProfile`。`TurnToolProfile.prompt_view.fingerprint`、`*TurnToolProfile.executor.fingerprint()` 和 `TurnToolProfile.fingerprint` 必须相等。新的 work chain 捕获一次并在 automatic retry / overflow recovery 中复用；后期 safe-point replacement 也不能分别调用两个 getter 拼装 baseline。
 
-`SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令。模型可见 active-tool change 仍必须遵循“计算/校验 next state → session mutation commit → 应用 Tools state → 发布 changed event → 捕获新的 `ToolProfileBaseline` → 原子替换对应的 `PromptCallProfile` 与 future `ToolBatchInvoker`”。MVP 在 `Turn` 中直接拒绝这类 mutation；后续支持 safe-point apply 时必须把完整 baseline replacement 放进同一 actor transaction。
+`SessionRuntime` 仍是 lifecycle owner：它创建、保存和销毁每个 session 的 `Tools` 实例；它处理 `SetActiveTools`、`SetToolPolicy`、`DecideToolApproval` 等协议命令。模型可见 active-tool change 仍必须遵循“计算/校验 next state → session mutation commit → 应用 Tools state → 发布 changed event → 捕获新的 `TurnToolProfile` → 原子替换对应的 `ModelContextProfile` 与 future `ToolBatchInvoker`”。MVP 在 `Turn` 中直接拒绝这类 mutation；后续支持 safe-point apply 时必须把完整 profile replacement 放进同一 actor transaction。
 
 并发实现必须满足 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)：
 
@@ -217,7 +217,7 @@ pub enum ToolBatchError {
 
 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 的 UI-safe source of truth 是 actor 的 `CurrentRun` projection。`ToolApprovalBroker` 保存冻结 args 和 waiter，是执行侧 source of truth；它不再提供另一套供 snapshot 直接读取的公开 view。pending update 必须先成功交给 actor 更新 projection，再发布 `tool_call_approval_requested` 并开始等待 decision，避免 event 已发而 snapshot 缺项。
 
-`ToolPromptView` 必须由 `ToolProfileBaseline` 一次性投影同一个 active-set revision：
+`ToolPromptView` 必须由 `TurnToolProfile` 一次性投影同一个 active-set revision：
 
 ```rust
 pub struct ToolPromptView {
@@ -229,7 +229,7 @@ pub struct ToolPromptView {
 }
 ```
 
-`prompt::assemble_turn(PromptTurnSpec { resources, tools })` 只消费该 view 作为工具输入，不能分别调用 `active_tool_schemas()`、`active_names()` 和 `prompt_catalog()` 后临时合并，否则并发或 safe-point 更新可能产生 system prompt/tool schema split-brain。
+`Prompt.prepare_message_turn(...)` 只消费该 view 作为工具输入，不能分别调用 `active_tool_schemas()`、`active_names()` 和 `prompt_catalog()` 后临时合并，否则并发或 safe-point 更新可能产生 system prompt/tool schema split-brain。
 
 ## 数据结构草案
 
@@ -497,7 +497,7 @@ pub enum ToolSandboxVerdict {
 ```text
 Rig AgentRunStep::CallTools { calls }
   → Driver maps PendingToolCall -> ToolBatchRequest { calls: ToolInvocation { call_index, ... } }
-  → DriverHost::invoke_tool_batch(request)
+  → DriverHost::execute_and_commit_tool_round(request)
   → SessionRuntime / SessionDriverHost attaches ToolRunContext
   → ToolBatchInvoker.invoke_batch(request, context, sink, cancel)
       → for each call in call_index order:
@@ -521,8 +521,10 @@ Rig AgentRunStep::CallTools { calls }
       → return Ok(ToolBatchResult) only when every call has a result
       → return Err(Cancelled | Failed) for incomplete batch
   → SessionRuntime may invoke ToolResultBeforeCommit on result drafts
-  → SessionRuntime revalidates call ids/order/redaction and emits tool_call_finished
+  → SessionRuntime revalidates call ids/order/redaction
   → SessionRuntime commits complete ToolRound batch
+  → SessionRuntime applies CommittedConversationDelta
+  → SessionRuntime emits final tool_call_finished and message events from the committed values
   → Driver maps ToolBatchResult -> Rig tool result content
   → AgentRun::tool_results(results)
 ```
@@ -536,7 +538,9 @@ Rig AgentRunStep::CallTools { calls }
 1. Provider tool schema：active tools 的 `name`、`description`、`input_schema` 进入模型请求。
 2. System prompt：active tools 的 `prompt_snippet` 和 `prompt_guidelines` 进入 `Available tools` 与 `Guidelines`。
 
-`Prompt` 消费的是新的 work chain 调用 `Tools.capture_profile_baseline()` 返回的 `ToolProfileBaseline.prompt`，不消费 `ToolBatchInvoker.invoke_batch`、approval/policy、sandbox 或 executor state。`ResourceManager` 不拥有工具 schemas/snippets/guidelines；工具提示素材来自 session-owned `Tools`。`PromptCallProfile` 把该 prompt view 产生的 system sections 与 provider schemas 原子绑定，active run 则使用同一 baseline 中的 invoker。
+`Prompt` 消费的是新的 work chain 调用 `Tools.capture_turn_tools()` 返回的 `TurnToolProfile.prompt_view`，不消费 `ToolBatchInvoker.invoke_batch`、approval/policy、sandbox 或 executor state。`ResourceManager` 不拥有工具 schemas/snippets/guidelines；工具提示素材来自 session-owned `Tools`。`ModelContextProfile` 把该 prompt view 产生的 system sections 与 provider schemas 原子绑定，active run 则使用同一 `TurnToolProfile` 中的 executor。
+
+工具 prompt view 与 executor 的 fingerprint 是同一个不变量，而不是两个可独立刷新的缓存：如果 `TurnToolProfile.prompt_view.fingerprint != TurnToolProfile.executor.fingerprint()`，该 profile 必须被视为构造失败，不能创建 `PreparedMessageTurn`、`SessionDriverHost` 或启动该 work chain。
 
 ## 内置工具命名
 
@@ -612,7 +616,7 @@ canonical 内置工具名只定义稳定身份，不表示该工具默认 active
 
 - 不要把工具执行交给 Rig 高阶 runner；那会削弱审批、事件、暂停恢复和 session persistence 的控制。
 - 不要把 `Tools` 命名成 `ToolRuntime`；runtime 在本项目中表示拥有生命周期和调度权的运行单元。
-- 不要让 `Driver` 直接依赖 `Tools`；`Driver` 只通过 `DriverHost::invoke_tool_batch(...)` 请求工具结果。
+- 不要让 `Driver` 直接依赖 `Tools`；`Driver` 只通过 `DriverHost::execute_and_commit_tool_round(...)` 请求已经完成治理、执行和 stable commit 的工具轮结果。
 - 不要让 `Tools` 直接发布 UI event 或写 session storage；所有 UI event 和持久化仍由 `SessionRuntime` 归约。
 - 不要让外部工具绕过 registry/policy/approval。所有工具来源必须归一化成 `RegisteredTool`。
 - 不要让 UI 执行工具。UI 只能发送审批决策。

@@ -9,6 +9,17 @@
 
 `slash command` 只是 command text 的一种输入语法，不再是核心领域名。协议层原来的 `agent_runtime_protocol::Command` 改名为 `agent_runtime_protocol::AgentCommand`，避免和 `command::Command` 子系统混淆。
 
+对 message pipeline，session-scoped facade 提供语义化归一入口：
+
+```text
+CommandSurface.parse_message_intent(raw submission, CommandContext)
+  → 普通文本/附件：PromptIntent::Text / Composite
+  → prompt-producing slash/catalog command：parse + resolve_for_execution + trusted handler binding
+  → PromptIntent::Skill / Template / Composite
+```
+
+该名称不增加第二个 parser；实现仍复用 `CommandManager` 的 parse、`resolve_for_execution` 和可信 handler。非 prompt command 返回 command result，不伪装成 `PromptIntent`；未识别或非法 slash 返回结构化 command error，不静默当普通模型输入。
+
 ## 参考经验
 
 pi coding-agent 的 command/autocomplete 面表明 builtins、extension commands、prompt templates 和 skills 可以共享一个动态目录；可提炼的经验是命令定义与 handler 分离，技能/模板进入运行时命令入口，而不是由 UI 读文件。
@@ -411,13 +422,13 @@ Catalog 只使用 skill metadata：name、title、description、`ResourceKey`、
 
 ```text
 builtin.skill.invoke
-  -> SessionCommandHost.admit_prompt_intent(SkillPromptIntent, delivery)
+  -> SessionCommandHost.admit_prompt_intent(PromptIntent::Skill, delivery)
   -> SessionRuntime chooses active/future delivery boundary
-  -> target PromptTurn.resolve_intent(...)
+  -> target PreparedMessageTurn.compose_user_message(...)
   -> 从 captured PromptResourceView 读取 selected SkillResource.body
 ```
 
-Prompt template 也可以通过 dynamic provider 进入 command tree。canonical path 是 `/template <name>`；仅在不与 builtin/root command 或其他 alias 冲突时 materialize `/{template}` alias。Template body、required skills 和参数替换只在目标 `PromptTurn.resolve_intent(...)` 发生，不在 catalog/materialization 阶段发生；完整规则见 [PromptTemplates](prompt-templates.md)。
+Prompt template 也可以通过 dynamic provider 进入 command tree。canonical path 是 `/template <name>`；仅在不与 builtin/root command 或其他 alias 冲突时 materialize `/{template}` alias。Template body、required skills 和参数替换只在目标 `PreparedMessageTurn.compose_user_message(...)` 发生，不在 catalog/materialization 阶段发生；完整规则见 [PromptTemplates](prompt-templates.md)。
 
 可选 colon alias：支持 `/skill:name`，但 canonical path 是 `/skill name`。Alias 解析后必须归一化为相同 `CommandPath` 和 binding；这不是对任何外部命令系统的兼容承诺。
 

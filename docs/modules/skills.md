@@ -27,8 +27,8 @@ ResourceManager
 skills.rs
   provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
 
-PromptTurn
-  owns: 结构化 SkillPromptIntent 展开、从 captured PromptResourceView 取正文、<skill> 块构造和 ResolvedPromptInput 生成
+PreparedMessageTurn
+  owns: 结构化 PromptIntent::Skill 展开、从 captured PromptResourceView 取正文、<skill> 块构造和 CanonicalUserMessage 生成
 
 SessionRuntime
   owns: /skill intent admission、PromptDelivery、目标 turn capture、入队或启动 run
@@ -54,7 +54,7 @@ SessionRuntime
 | 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
 | `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
 | `/skill <name>` / `/skill:name` command text 解析 | 否 | 否，属于 `CommandManager.resolve_for_execution` |
-| `InvokeSkill` 构造 user message | 否，提供格式化 helper | 否，属于 `PromptTurn.resolve_intent()` |
+| skill intent 构造 user message | 否，提供格式化 helper | 否，属于 `PreparedMessageTurn.compose_user_message()` |
 
 一句话：`skills.rs` 负责“skill 长什么样、如何解析、如何格式化”；`ResourceManager` 负责“skill 从哪里来、何时加载、如何分层覆盖、哪一版对当前 turn 可见”。
 
@@ -71,7 +71,7 @@ TurnResourceSnapshot.cwd.resolved.skills
 
 ## 设计原则
 
-`skills.rs` 只提供给定输入后的发现、metadata/frontmatter 解析、校验、去重、诊断和格式化 helper。资源 roots、trust、overlay、snapshot 和 reload 归 `ResourceManager`；显式调用的 delivery 归 `SessionRuntime`；skill body 到普通 user message 的组装归 `PromptTurn.resolve_intent()`。
+`skills.rs` 只提供给定输入后的发现、metadata/frontmatter 解析、校验、去重、诊断和格式化 helper。资源 roots、trust、overlay、snapshot 和 reload 归 `ResourceManager`；显式调用的 delivery 归 `SessionRuntime`；skill body 到普通 user message 的组装归 `PreparedMessageTurn.compose_user_message()`。
 
 pi coding-agent 的技能加载和显式注入路径可以作为参考对象，但不构成 MiniCore 的类型、文件布局或行为兼容承诺。MiniCore 的权威 interface 和不变量只由本文件及 ResourceManager/Prompt 文档定义。
 
@@ -155,7 +155,7 @@ pub fn format_available_skills(catalog: &SkillCatalog, active_tools: &[ToolName]
 pub fn format_skill_block(metadata: &SkillMetadata, body: &str) -> String;
 ```
 
-显式调用时，目标 `PromptTurn` 应从 captured `PromptResourceView` 取得 `SkillResource.body`，再调用 `format_skill_block()`。这样 message 构造集中在 Prompt 组装 seam，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
+显式调用时，目标 `PreparedMessageTurn` 应从 captured `PromptResourceView` 取得 `SkillResource.body`，再调用 `format_skill_block()`。该 view pin 住对应 `TurnResourceSnapshot`，因此 message 构造集中在 Prompt 组装 seam，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
 
 ## 模型可见技能摘要
 
@@ -180,20 +180,20 @@ When a skill file references a relative path, resolve it against the skill direc
 - 只列出 `disable_model_invocation == false` 的技能。
 - 只有 active tools 中包含 `read` 时，才把可见技能列表放进 system prompt。
 
-摘要会指示模型通过 `read` 加载技能文件；如果当前会话没有 `read`，把技能位置暴露给模型会形成不可执行的承诺。用户显式 `InvokeSkill` 不受这个限制，因为目标 `PromptTurn` 会直接展开 captured 正文。
+摘要会指示模型通过 `read` 加载技能文件；如果当前会话没有 `read`，把技能位置暴露给模型会形成不可执行的承诺。用户显式 skill intent 不受这个限制，因为目标 `PreparedMessageTurn` 会直接展开 captured 正文。
 
 ## 显式技能调用
 
-显式调用的 delivery 属于 `SessionRuntime`，组装属于 `PromptTurn`：
+显式调用的 delivery 属于 `SessionRuntime`，组装属于 `PreparedMessageTurn`：
 
 ```text
 InvokeSkill、/skill <name> 或兼容 /skill:name
-  → CommandManager resolves SkillPromptIntent
+  → CommandManager resolves PromptIntent::Skill
   → SessionRuntime admits intent by PromptDelivery
-  → target turn captures TurnResourceSnapshot and creates PromptTurn
-  → PromptTurn.resolve_intent(...) finds selected SkillResource
+  → target turn captures TurnResourceSnapshot / TurnToolProfile and creates PreparedMessageTurn
+  → PreparedMessageTurn.compose_user_message(...) finds selected SkillResource
   → skills::format_skill_block(metadata, body)
-  → ResolvedPromptInput / MessageRecord::user(...)
+  → CanonicalUserMessage / MessageRecord::user(...)
 ```
 
 显式 skill block 使用以下稳定格式：
@@ -214,14 +214,14 @@ References are relative to /abs/path.
 
 一次显式技能调用进入 Agent 运行时后，应按这个顺序处理：
 
-1. `SessionRuntime` 从当前 session leaf 重建已有上下文消息。
-2. `SessionRuntime` capture `TurnResourceSnapshot`。
-3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `SkillPromptIntent`；`SessionRuntime` 只决定 delivery。
-4. delivery 到达目标边界时选择 PromptTurn：active Steer 使用 `CurrentRun.prompt_turn`；idle submission、FollowUp 和 NextTurn 在 future turn capture resources 并创建新 `PromptTurn`。所有 steering/follow-up/next-turn queues 都只保存未展开的结构化 `SkillPromptIntent`。
-5. 目标 `PromptTurn.resolve_intent()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块，得到目标边界的 `ResolvedPromptInput`；已展开技能正文绝不放回队列。
-6. new-run 路径中，`prompt::assemble_turn(...)` 已基于 captured `PromptResourceView` 与 `ToolPromptView` 构建同版 `PromptCallProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
-7. new-run 路径先提交 `UserInput` batch；成功后发布外层 `Event.run_id = None` 的 `skill_invoked`、`message_user_appended`，再分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
-8. active Steer 路径在 current run safe point 提交 `UserInput` batch；成功后发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked`、`message_user_appended`，再把同一个 committed message 放入 `NextModelCallPlan.persistent_messages`，不创建新 RunId。
+1. `SessionRuntime` 已持有只由成功 commit 更新的 `CommittedConversationState`；session open/recovery 时才从 storage 重建。
+2. `SessionRuntime` 调用 `capture_turn_resources(...)` / `capture_turn_tools(...)` 捕获目标 work chain 输入。
+3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `PromptIntent::Skill`；`SessionRuntime` 只决定 delivery。
+4. delivery 到达目标边界时选择 `PreparedMessageTurn`：active Steer 使用 `CurrentRun.prepared_turn`；idle submission、FollowUp 和 NextTurn 在 future turn capture resources/tools 并创建新 `PreparedMessageTurn`。所有 steering/follow-up/next-turn queues 都只保存未展开的结构化 `PromptIntent`（key/args/attachments）。
+5. 目标 `PreparedMessageTurn.compose_user_message()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块，得到目标边界的一条 `CanonicalUserMessage`；已展开技能正文绝不放回队列。
+6. new-run 路径中，`Prompt.prepare_message_turn(...)` 已基于 captured `PromptResourceView` 与同一 `TurnToolProfile.prompt_view` 构建同版 `ModelContextProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
+7. new-run 路径先提交 `UserInput` batch；成功后应用 `CommittedConversationDelta`、发布外层 `Event.run_id = None` 的 `skill_invoked` / `message_user_appended`，再调用 `build_conversation_seed()`，分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
+8. active Steer 路径在 `commit_pending_messages` safe point 提交 `UserInput` batch；成功后应用并返回同一个 `CommittedConversationDelta`，发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked` / `message_user_appended`，Driver 再把 delta 应用到 `LiveConversation`，不创建新 RunId。
 9. 后续完整 tool rounds 和 final assistant 继续由 `SessionRuntime` 通过 session writer 提交。
 
 这意味着：
@@ -243,27 +243,28 @@ App / workspace open
   → ResourceManager publishes CwdResourceSnapshot { resolved.skills, diagnostics, ... }
   → AgentRuntime publishes `resources_changed`
   → next new user turn / work chain captures the new cwd snapshot
-  → SessionRuntime creates a new `PromptTurn` / `PromptCallProfile`
+  → SessionRuntime creates a new `PreparedMessageTurn` / `ModelContextProfile`
 
 InvokeSkill (new-run delivery)
-  → SessionRuntime captures TurnResourceSnapshot
-  → SessionRuntime creates PromptTurn from captured PromptResourceView
-  → PromptTurn.resolve_intent reads SkillResource
+  → SessionRuntime captures TurnResourceSnapshot / TurnToolProfile
+  → SessionRuntime creates PreparedMessageTurn from captured PromptResourceView / ToolPromptView
+  → PreparedMessageTurn.compose_user_message reads SkillResource
   → skills::format_skill_block()
   → bounded pre-run hooks + revalidation
   → SessionRuntime commits UserInput through SessionHandle
   → publish skill_invoked with outer Event.run_id = None
   → publish message_user_appended
   → allocate RunId + establish CurrentRun + publish run_started
-  → Driver drive_run
+  → Driver.drive_conversation
   → SessionRuntime commits ToolRound / AssistantFinal through SessionHandle
 
 InvokeSkill (active Steer)
-  → resolve with CurrentRun.prompt_turn
+  → resolve with CurrentRun.prepared_turn
   → commit UserInput through SessionHandle
   → publish skill_invoked with outer Event.run_id = Some(current_run_id)
   → publish message_user_appended
-  → add committed message to NextModelCallPlan.persistent_messages
+  → return CommittedConversationDelta from commit_pending_messages
+  → Driver applies delta to LiveConversation
 
 ReloadResources
   → ResourceManager builds a new CwdResourceSnapshot for target cwd
@@ -289,7 +290,7 @@ ReloadResources
 - 不要把技能当工具。技能只是 prompt resource；工具才有副作用。
 - 不要把技能全文塞进 `RuntimeSnapshot` 或资源摘要事件。`CwdResourceSnapshot` 可以为原子性保存 selected skill body，但 UI 默认只能看到 summary/detail query 的受控结果。
 - 不要让 UI 拼 `<skill>` 块。否则相对路径规则、frontmatter 剥离、队列语义和 session persistence 会分叉。
-- 不要让 `SessionRuntime`、CommandManager 或 Driver 各自实现一套 skill message 拼装；统一调用 `PromptTurn.resolve_intent()`。
+- 不要让 `SessionRuntime`、CommandManager 或 Driver 各自实现一套 skill message 拼装；统一调用 `PreparedMessageTurn.compose_user_message()`。
 - 不要把模型可见技能列表和显式技能调用混为一谈。前者只是摘要，后者注入全文。
 - 不要在没有 `read` 工具时把技能列表暴露给模型。模型无法按摘要中的指令加载技能文件。
 - 不要让资源 reload 改写历史。已经持久化的 skill invocation 是一次历史 user message。

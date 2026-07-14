@@ -1738,3 +1738,20 @@ ADR 0023: Driver Starts From One Committed Conversation Seed
 - **阻塞未变**：Rig 0.40.0 spike → 通过后 ADR 0023 + 同步权威文档 + 关闭 BR-055。
 
 本节仅作进度索引；细节、矩阵、场景六阶段流与附录全文以 research 文档为准。
+
+## 2026-07-14 Accepted Decision Index: Transcript-First / ADR 0023
+
+本节是对上方 BR-055 历史研究正文的接受决策索引；历史研究正文保留原貌，不倒改其当时的“推荐 / blocker / 暂停点”表述。最新权威决策见 [ADR 0023: Driver Starts From One Committed Conversation Seed](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)。
+
+- **状态**：Accepted；BR-055 在 round3 review 中改为 Resolved / Closed。
+- **总名**：Transcript-First。
+- **Rig spike 范围**：BR-049 / Rig 0.40.0 spike 只验证 `driver/rig.rs` 与 `model_gateway/rig.rs` 的 private adapter mapping；MiniCore 自有 public seam 不再等待 spike 反向决定。
+- **Resource seam**：`ResourceManager.capture_turn_resources(...)`。
+- **Tools seam**：`Tools.capture_turn_tools(...) -> TurnToolProfile`；`TurnToolProfile.prompt_view` 与 `TurnToolProfile.executor` 必须同 fingerprint。
+- **Prompt seam**：`Prompt.prepare_message_turn(...) -> PreparedMessageTurn -> ModelContextProfile`；`compose_user_message(...) -> CanonicalUserMessage`；`assemble_model_context(...) -> AssembledModelContext`。
+- **Conversation seam**：`ConversationSeed`、`CommittedConversationState`、`CommittedConversationDelta`。
+- **Driver seam**：`Driver.drive_conversation(...)`，输入是 committed `ConversationSeed` + 窄 `DriverTurnInput`，不是完整 `TurnState`。
+- **Model seam**：`ModelGateway.generate_model_turn(...)`；`ModelGateway` 只编码/调用 provider，不判断 session message visibility。
+- **Commit seam names**：`execute_and_commit_tool_round`、`commit_pending_messages`、`commit_final_assistant_message`。
+- **Compaction invariant**：Compaction 只做 cut/protection/directive；protected `EntryId` 不进入摘要目标；compaction commit 后先应用 committed delta 更新 `CommittedConversationState`，只有 leaf/revision mismatch 或 recovery 时才 reload storage，再构造 `ConversationSeed`。
+- **Prompt ownership invariant**：Prompt 是 `AgentRun` 与 `CompactionSummary` 唯一模型上下文组装 seam；`AssembledModelContext` 是 model-visible truth。

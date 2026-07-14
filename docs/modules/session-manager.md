@@ -12,9 +12,9 @@
 - `LoadedSessionRuntimes` 是 `SessionManager` 内部的 live runtime map，负责登记、查找和关闭已加载的 `SessionRuntime`；它不是独立架构模块，也不读写 session entries。多个 `SessionRuntime` 可以同时 loaded，并各自独立处于 idle、turn、compaction 或 retry phase。
 - `SessionHandle` 是单会话领域对象，暴露稳定 batch commit、构建上下文、读取当前叶子、标签和会话名等行为。文档和实现中应优先使用 `SessionHandle`，避免把它简称为容易和完整会话概念混淆的 `Session`。
 - `SessionWriter` 是所有会话 mutation 共用的唯一写入 seam。它接受 `SessionWriteBatch`，成功返回表示整个 batch 已按 adapter 契约写入，失败则该 batch 不得进入恢复投影。
-- `SessionStorage` 是单会话底层存储 interface，也是 `SessionWriter` 的 adapter；它负责读取 committed batches、leaf 和 metadata，并隐藏内存存储与 JSONL 存储的差异。
+- `SessionStorage` 是单会话底层存储 interface，也是 `SessionWriter` 的 adapter；它负责读取 committed batches、leaf 和 metadata，并隐藏内存存储与 JSONL 存储的差异。它是 conversation 的 durable truth；`SessionRuntime` 的 `CommittedConversationState` 只是由成功 commit / recovery projection 更新的热视图。
 
-`AgentRuntime` 对 adapter 暴露会话命令和快照，但内部只通过 `SessionManager` 打开会话、创建 `SessionHandle` 和加载 `SessionRuntime`。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不保存客户端 selected session，也不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `ResourceManager.capture_turn(...)` 捕获当前 `TurnResourceSnapshot`。
+`AgentRuntime` 对 adapter 暴露会话命令和快照，但内部只通过 `SessionManager` 打开会话、创建 `SessionHandle` 和加载 `SessionRuntime`。运行中产生的消息、配置变化和压缩条目最终由 `SessionRuntime` 通过 `SessionHandle` 写入 `SessionStorage`。`SessionManager` 不保存客户端 selected session，也不加载资源、不决定模型/provider/auth；`AgentRuntime` 提供的 factory 会读取 session metadata 中的 workspace/cwd，创建固定 cwd 的 `SessionRuntime`，由该 runtime 在每次 user turn 启动时通过 `capture_turn_resources(...)` 捕获当前 `TurnResourceSnapshot`。
 
 session 的状态分层而不是压成一个 `active` / `running` boolean：persistent catalog membership 表示会话是否存在；`LoadedSessionRuntimes` 表示 runtime residency；loaded runtime 的工作状态由 `SessionPhase::{Idle, Turn, Compaction, RetryBackoff}`、optional `CurrentRunState` 和派生的 `session_settled` 表达。run failed/aborted 不会把 session 变成 terminal session，compaction/retry 也不能被一个 `is_running` 准确表示。
 
@@ -91,8 +91,19 @@ pub enum BatchLeafUpdate {
 }
 
 pub struct CommittedSessionBatch {
-    pub entry_ids: Vec<EntryId>,
+    pub entries: Arc<[SessionEntry]>,
     pub leaf_id: EntryId,
+}
+
+pub struct CommittedConversationDelta {
+    pub messages: Arc<[MessageRecord]>,
+    pub entry_ids: Arc<[EntryId]>,
+    pub leaf_id: EntryId,
+}
+
+pub struct CommittedMessageBatch {
+    pub batch: CommittedSessionBatch,
+    pub conversation_delta: CommittedConversationDelta,
 }
 
 pub struct StoredSessionBatch {
@@ -139,7 +150,7 @@ SessionWriteBatch::session_mutation(drafts)
 SessionWriteBatch::tree_move(target_entry_id)
 ```
 
-`commit()` 的结果是可信写入结果，不是 best effort notification：
+`commit()` 的结果是可信写入结果，不是 best effort notification。`CommittedSessionBatch.entries` 是 writer 最终分配 identity 后的完整 committed entries；message-purpose wrapper 从它确定性构造 `CommittedConversationDelta`，而不是让调用方根据 draft 猜测最终 delta：
 
 - `Ok(CommittedSessionBatch)`：整个 batch 和 leaf update 已按 adapter 的进程崩溃恢复契约提交，调用方可以发布对应领域事件或继续下一模型调用。
 - `Err(SessionWriteError)`：调用方不得依赖 batch 中的 entry；adapter 必须回滚/排除失败 payload。若无法确认或恢复写入尾部，则该 storage 必须进入不可读写的 fatal state，不能静默继续投影或再次 append。
@@ -199,7 +210,7 @@ pub struct SessionHandle { /* wraps Arc<dyn SessionStorage> */ }
 
 impl SessionHandle {
     pub async fn commit(&self, batch: SessionWriteBatch) -> Result<CommittedSessionBatch, SessionWriteError>;
-    pub async fn build_session_context(&self) -> Result<SessionContext, SessionError>;
+    pub async fn load_committed_conversation(&self) -> Result<CommittedConversationState, SessionError>;
 }
 ```
 
@@ -276,9 +287,27 @@ leaf move 不再使用 `SessionEntry::Leaf`。每个 committed `session_batch` �
 
 `ModelChange` 保存的是 MiniCore `provider_id` / `model_id`。它不得保存 Rig provider type、provider API `api_model_name`、base URL、auth ref 或 credentials；这些执行细节由 [ModelGateway](model-gateway.md) 在每次调用前解析。
 
+### Committed 热视图与 ConversationSeed
+
+`SessionRuntime` 在 session open / recovery 时调用 `SessionHandle.load_committed_conversation()` 从 storage 建立 `CommittedConversationState`；稳态运行不在每个 turn 重新扫描 JSONL。每次 `commit()` 成功后，runtime 只用该 commit 派生的 `CommittedConversationDelta` 调用 `apply_committed_messages(...)` 更新热视图，再从热视图调用 `build_conversation_seed()`：
+
+```text
+session open / recovery:
+  SessionStorage → load_committed_conversation → CommittedConversationState
+
+steady state:
+  SessionWriter.commit
+    → CommittedSessionBatch
+    → CommittedConversationDelta
+    → apply_committed_messages
+    → build_conversation_seed
+```
+
+内存热视图不是第二个 durable owner：它不能独立 append draft，leaf/revision 不匹配时必须 fail closed 并从 storage reload。`ConversationSeed` 使用 `Arc` / persistent sequence 复用 committed messages，不要求 commit 后重新读盘。
+
 ### 压缩后的消息组装
 
-压缩是 append-only projection，不删除旧 entry。`build_session_context(path)` 只看当前 leaf 的 root-to-leaf path，并使用 path 上最新的 `Compaction` entry：
+压缩是 append-only projection，不删除旧 entry。`load_committed_conversation(path)` 只看当前 leaf 的 root-to-leaf path，并使用 path 上最新的 `Compaction` entry：
 
 ```text
 if no compaction on path:
@@ -299,10 +328,10 @@ entry 100       compaction entry itself
 entry 101..end  normal messages after compaction
 ```
 
-模型实际上下文为：
+模型实际上下文由 `Prompt.assemble_model_context(...)` 每次 `CallModel` 从 `ModelContextProfile` + ordered committed conversation 组装：
 
 ```text
-system: PromptTurn.profile.system_prompt
+system: ModelContextProfile.system_prompt
 user:   The conversation history before this point was compacted into the following summary:
         <summary>
         ...
@@ -311,11 +340,13 @@ user:   The conversation history before this point was compacted into the follow
 ...     messages after compaction
 ```
 
+这里没有独立的历史/当前输入双 lane；启动 user turn 时，`SessionRuntime.build_conversation_seed(...)` 已保证 current user 在 committed conversation 中恰好一次。
+
 `CompactionSummaryMessage` 是 MVP `SummaryModel` method 的模型可见历史消息，不是 system prompt。UI 可以把它渲染成折叠的 `[compaction]` 消息；模型转换时应把它转成 user-role text message。后期 `ProviderNative` model-bound replacement 使用独立 opaque envelope，不伪装成 `MessageRecord`；原始 entries 仍保留，具体 storage shape 在该 method 开工时定型。
 
-如果 `first_kept_entry_id` 在当前 path 上找不到，`build_session_context` 应返回结构化诊断并退化为 `CompactionSummaryMessage + entries after compaction`，不要静默把整段旧历史重新放回上下文。
+如果 `first_kept_entry_id` 在当前 path 上找不到，`load_committed_conversation` 应返回结构化诊断并退化为 `CompactionSummaryMessage + entries after compaction`，不要静默把整段旧历史重新放回上下文。
 
-`DriverError::ContextLimitExceeded` 对应的 transient error 和 partial assistant 只通过当前 host diagnostics / streaming lifecycle 展示，不进入 `SessionWriter`。context-limit recovery 从最后 committed context 重建，不能把运行中临时 messages 当成 durable history。
+`DriverError::ContextLimitExceeded` 对应的 transient error 和 partial assistant 只通过当前 host diagnostics / streaming lifecycle 展示，不进入 `SessionWriter`。context-limit recovery 从最后 committed context 重建，不能把运行中临时 messages 当成 committed conversation。
 
 ## JSONL 持久化
 
@@ -342,7 +373,7 @@ MVP 可以同时提供两种持久化实现：
 - `SessionQuery::List` 通过 `AgentRuntime.query()` 返回 catalog page；底层映射到 `SessionManager.list(SessionListRequest { scope, filter, cursor, limit })`。
 - `DeleteSession` 删除未被当前运行占用的会话。
 - `SetSessionName` 通过 `SessionMutation` batch 提交 `session_info` draft，而不是修改 header。
-- `ForkSession` 通过 `get_committed_batches_to_leaf(...)` 读取源会话目标路径上的完整 `StoredSessionBatch` records，先验证 `Compaction.first_kept_entry_id`、`BranchSummary.from_id`、`Label.target_id` 和其他 entry references 都位于 selection 中且只向后引用，再按源 batch 顺序通过 staging target writer replay。每次 commit 返回 `entry_ids` 后，fork 按源 batch entry 顺序增量扩展 `old_entry_id -> new_entry_id` 映射，下一批 draft 只使用已建立的映射重写 references。任何 reference 若超出可复制 closure 或形成 forward/dangling reference，必须返回结构化 `ForkReferenceOutsideSelection` / corruption error，不能保留 source id。全部 replay 成功后才 atomic publish target file、更新 `SessionIndex` 并发布 `session_created`；失败或 crash 留下的 staging target 不得出现在 session list。
+- `ForkSession` 通过 `get_committed_batches_to_leaf(...)` 读取源会话目标路径上的完整 `StoredSessionBatch` records，先验证 `Compaction.first_kept_entry_id`、`BranchSummary.from_id`、`Label.target_id` 和其他 entry references 都位于 selection 中且只向后引用，再按源 batch 顺序通过 staging target writer replay。每次 commit 返回 `CommittedSessionBatch.entries` 后，fork 按源 batch entry 顺序增量扩展 `old_entry_id -> new_entry_id` 映射，下一批 draft 只使用已建立的映射重写 references。任何 reference 若超出可复制 closure 或形成 forward/dangling reference，必须返回结构化 `ForkReferenceOutsideSelection` / corruption error，不能保留 source id。全部 replay 成功后才 atomic publish target file、更新 `SessionIndex` 并发布 `session_created`；失败或 crash 留下的 staging target 不得出现在 session list。
 - `NavigateSessionTree` 通过 `TreeMutation` batch 提交 leaf move，而不是删除历史。协议仍携带 `EntryId`，但 query/tree view 只应暴露可导航 batch-boundary ids；writer 对 interior/nonexistent target 返回 `InvalidLeafTarget`。
 
 会话身份在创建时固定绑定 workspace 与 cwd（[ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)）。`CreateSession` 的核心身份字段：
@@ -409,13 +440,13 @@ AppShutdown
 - 重复 `OpenSession` 是幂等 no-op；关闭一个 loaded runtime 只移除目标 session，客户端 selection 不参与 lifecycle。
 - `commit(SessionWriteBatch::user_input(...))` 成功后，message、entry ids、parent links 和 leaf 一起可恢复。
 - `commit(SessionWriteBatch::tool_round(...))` 只接受完整 assistant tool calls 与全部 matching results，并保持 `call_index` 顺序。
-- writer 返回错误时，失败 batch 不出现在 `get_entries()`、path-to-root 或 `build_session_context()` 中。
+- writer 返回错误时，失败 batch 不出现在 `get_entries()`、path-to-root 或 `load_committed_conversation()` 中。
 - JSONL 在最后一个 batch 写到一半或只缺结尾换行时，重新加载忽略或截断尾 record，并恢复到上一个换行终止的完整 batch；再次 commit 前必须物理截断坏尾行，不能把新 JSON 接在残缺 payload 后。
 - JSONL 中间行损坏、重复 entry id、非法 parent link 或 committed incomplete tool round 返回结构化 corruption error，不静默修复。
 - InMemory adapter 对 batch entries 与 leaf update 原子可见。
 - tree move 只接受 committed append batch 的最后一个 entry；指向 `ToolRound` assistant/intermediate result 的 interior target 返回 `InvalidLeafTarget`。
 - fork 只通过 `get_committed_batches_to_leaf(...)` 复制 committed source path，保持原 batch grouping，并通过目标 writer 重新生成 entry ids / parent links。
-- fork 每 replay 一个 grouped batch，就按 source entries 与 `CommittedSessionBatch.entry_ids` 的同序对应增量扩展 id map；必须重写 compaction、branch summary、label 和其他 backward entry-id references，目标 session 不得保留 source entry id；任一 replay commit 失败时 staging target 不进入 session list，也不发布 `session_created`。
+- fork 每 replay 一个 grouped batch，就按 source entries 与 `CommittedSessionBatch.entries[*].id` 的同序对应增量扩展 id map；必须重写 compaction、branch summary、label 和其他 backward entry-id references，目标 session 不得保留 source entry id；任一 replay commit 失败时 staging target 不进入 session list，也不发布 `session_created`。
 - abort/failure/shutdown 不提交 partial assistant、pending approval 或 incomplete tool round。
 - abort/close/shutdown 与 in-flight stable commit 竞态：writer future 不被 run cancellation 半途取消；先得到 commit 结果，再完成 terminal handling，且不得启动后续模型调用。
 - tool executor 已产生副作用但 batch 未 commit 时，不自动重放工具；session 只恢复最后 committed context。

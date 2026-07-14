@@ -262,7 +262,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | `Driver` | 不直接发 UI event | 只发 `DriverEvent` 给 `SessionRuntime` 归约。 |
 | `ModelGateway` | 不直接发 UI event | 通过 `ModelStreamSink` / `DriverEvent` 上报模型流和 usage。 |
 | `Tools` | 不直接绕过 `SessionRuntime` | 可以使用 `SessionRuntime` 传入的工具更新 sink，但所有 UI 事件仍由会话运行时归约并拥有 correlation 和 phase。 |
-| `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 snapshot 并创建新 `PromptTurn`。 |
+| `ResourceManager` | 不直接发 UI event | 管理 `ResourceSnapshotStore`、返回 reload/capture 结果和诊断；`AgentRuntime` 发布 `resources_changed`，`SessionRuntime` 在后续 user turn 捕获新 snapshot 并创建新 `PreparedMessageTurn`。 |
 | `CommandSurface` / `CommandManager` | 不直接发 UI event | 返回 command catalog、parse/suggest/resolve 结果和 UI-safe command output；`AgentRuntime` 发布 `command_catalog_changed`、`command_output_appended`、`command_interaction_requested` 并执行映射后的 `AgentCommand` / session command handler。 |
 | `Compaction` | 不发 UI event | 只返回准备结果、摘要 prompt 和 result type；`SessionRuntime` 发事件。 |
 | `RuntimeHooks` | 后期能力；不直接发 UI event | Hook 只返回 typed decision / patch / replacement；Hook 错误进入 diagnostics 或 `diagnostics_error`。 |
@@ -280,7 +280,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | UI Adapter | UI 本地渲染状态、输入框草稿、滚动位置、选中面板、临时 optimistic affordance | 不发布 runtime event；只发 `agent_runtime_protocol::AgentCommand` | 消费 `agent_runtime_protocol::Event` 和 `agent_runtime_protocol::RuntimeSnapshot` |
 | `AgentRuntime` | event bus、`sequence`、subscription、workspace、`WorkspaceServices`、runtime diagnostics、command output dispatch | 生成所有 UI 可见 `agent_runtime_protocol::Event` metadata；发布 `session_*`、`resources_*`、`command_catalog_changed`、`command_output_appended`、`command_interaction_requested`、`diagnostics_runtime_changed` 等应用级事件 | 消费 `SessionRuntime` 提交的 `agent_runtime_protocol::EventMsg` 和 routing ids；调用 `SessionManager` 协调会话生命周期 |
 | `SessionRuntime` actor | `SessionPhase`、current run projection、queues、model state、session-scoped `Tools` lifecycle、fixed workspace cwd、user-turn/work-chain-captured `TurnResourceSnapshot`、compaction/retry state、pending stable batches、RuntimeSnapshot projection state | 发布/归约绝大多数 `run_*`、`message_*`、`tool_call_*`、`queue_updated`、`compaction_*`、`retry_*`、`session_settled` | 通过 mailbox 消费上层 command、`RunTask` control effect、`Tools` progress/update、`SessionHandle.commit(...)` 结果；后期消费自己拥有安全点的 hook result |
-| `RunTask` | 单次公开 `Driver::drive_run()`、run-local usage/limits、owned `SessionDriverHost`、cancellation | 不发布 UI event；经 `RunLink` 上报内部 effect | 消费 `DriverHost` model/tool/safe-point 结果，不拥有 session phase、queues、writer 或 terminal arbitration |
+| `RunTask` | 单次公开 `Driver::drive_conversation()`、run-local `LiveConversation`/usage/limits、owned `SessionDriverHost`、cancellation | 不发布 UI event；经 `RunLink` 上报内部 effect | 消费 `DriverHost` model/tool/safe-point 结果，不拥有 session phase、queues、writer 或 terminal arbitration |
 | `Driver` | 当前 Rig `AgentRun` segment、Steer rollover、step handling、driver-local counters/limits | 不发布 UI event；发内部 `DriverEvent` | 消费 `DriverHost` 的 model/tool/safe-point 结果；同一公开 run 可顺序推进多个 Rig segment |
 | `ModelGateway` | provider/model selection execution context、credentials resolution、future provider payload hooks、fallback/retry metadata、usage/error normalization | 不发布 UI event；通过 stream sink 返回 model delta/usage/failure | 被 `SessionRuntime` / `DriverHost` 调用；完整边界见 [ModelGateway](model-gateway.md) |
 | `Tools` | session-scoped 工具注册、active tools、prompt catalog、policy、approval、grants、sandbox、mutation locks、execution coordination、executor update forwarding | 通过 `SessionRuntime` event sink 归约为 `tool_call_*`；自身不拥有 UI event metadata | 消费 tool definitions/policy/approval/executor；后期消费工具治理 hook；返回 `ToolBatchResult` |
@@ -288,7 +288,7 @@ query 是只读 request/response，不分配 `CommandId`，不增加 event seque
 | `ResourceManager` | `ResourceSnapshotStore`、current `RuntimeResourceSnapshot`、current `CwdResourceSnapshot`s、overlay policy、resource diagnostics、reload/capture results | 不发布 UI event；返回 reload result / capture result | `AgentRuntime` 发布 `resources_reload_started` / `resources_changed`；`SessionRuntime` 在 future turn 捕获 `TurnResourceSnapshot` |
 | `CommandSurface` / `CommandManager` | command catalog materialization、name conflict diagnostics、`CommandRunPolicy`、command text parse result、suggestion、execution resolve | 不发布 UI event；返回 catalog、suggestion、resolved invocation 或 UI-safe command result | `AgentRuntime` 发布 `command_catalog_changed` 和 command output events；`SessionRuntime.command` 执行 session-scoped command |
 | `Skills` | 无生命周期状态；只提供 metadata/catalog parsing/format helpers | 不发布事件 | 被 `ResourceManager` / `SessionRuntime` 调用 |
-| `Prompt` | 无运行生命周期状态；纯创建 `PromptTurn`、展开 intent，并由 `prompt::project_model_call(profile + call-time lanes)` 生成 `ModelInputProjection` | 不发布事件 | `SessionRuntime` 调用 turn/intent seam，Driver 调用纯 projection seam；事件由 SessionRuntime 归约 |
+| `Prompt` | 无运行生命周期状态；纯创建 `PreparedMessageTurn`、展开 intent，并由 `Prompt.assemble_model_context(ModelContextProfile + LiveConversation + call-time context)` 生成 `AssembledModelContext` | 不发布事件 | `SessionRuntime` 调用 turn/intent seam，Driver 调用唯一模型上下文组装 seam；事件由 SessionRuntime 归约 |
 | `Compaction` | 无运行生命周期状态；只提供准备、cut point、summary prompt、result helper | 不发布事件 | `SessionRuntime` 持有 compaction lifecycle 并发 `compaction_*` |
 | `SessionHandle` | 单会话领域操作 facade、统一 batch commit、上下文重建结果 | 不发布 UI event；返回 `CommittedSessionBatch` / context | `SessionRuntime` 根据 commit 结果发布对应 `message_*`、`session_*`、`compaction_*` 等领域事实 |
 | `SessionStorage` / `SessionWriter` | 单会话 metadata、committed batches、leaf、path-to-root index | 不发布事件 | 被 `SessionHandle` 调用；隐藏 memory/JSONL adapter 写入细节 |
@@ -450,7 +450,8 @@ UI rendering state
 ```text
 Rig AgentRun local variable
 current AgentRunStep
-DriveRequest { turn: DriverTurnInput }
+ConversationDriveRequest { profile: ModelContextProfile, seed: ConversationSeed }
+LiveConversation
 DriveLimits
 driver-local usage/message accumulation
 cancel token observation
@@ -575,7 +576,7 @@ session_tree_changed
 
 ```text
 commit(SessionWriteBatch)
-build_session_context
+load_committed_conversation / apply_committed_messages
 ```
 
 `SessionStorage` 持有：
@@ -883,7 +884,7 @@ AcceptedByCommand
 
 对应事件：
 
-- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PromptTurn` 已实际展开 intent 且对应 `UserInput` commit 成功后发布，并先于 `message_user_appended`。idle/future-turn admission 尚未公开 run，外层 `Event.run_id = None`；active Steer 的外层 `Event.run_id = Some(current_run_id)`。
+- `skill_invoked` / `prompt_template_invoked`：仅当目标 `PreparedMessageTurn` 已实际展开 intent 且对应 `UserInput` commit 成功后发布，并先于 `message_user_appended`。idle/future-turn admission 尚未公开 run，外层 `Event.run_id = None`；active Steer 的外层 `Event.run_id = Some(current_run_id)`。
 - `message_user_appended`
 
 FollowUp/NextTurn 入队时只发 `queue_updated`，不提前发 invoked；active Steer 在 active run safe point 展开后发 invoked。`message_user_appended` 只在 `UserInput` batch commit 成功后发布，因此它同时表示 UI 可以渲染消息、下次恢复也会包含该输入。
@@ -921,8 +922,8 @@ Proposed
       └─ Rejected
   -- tool_call_started --> Started
   -- tool_call_output_delta* --> OutputStreaming
-  -- tool_call_finished --> Finished(success | error)
   → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+  -- tool_call_finished --> Finished(success | error)
   -- message_assistant_finished --> AssistantToolCallMessageFinished
   -- message_tool_result_appended* --> ToolResultMessagesAppended
 ```
@@ -936,7 +937,7 @@ Proposed
 - `tool_call_finished`
 - `message_tool_result_appended`
 
-policy denied、approval rejected、schema invalid、unknown tool 都走 `tool_call_finished { is_error: true }`，并生成 error tool result message；不直接让 run failed。全部 calls 都产生 actual/error result 后，assistant tool-call message 与 results 作为一个 `ToolRound` commit；commit 成功后先发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 为每条 result 发布 `message_tool_result_appended`。
+policy denied、approval rejected、schema invalid、unknown tool 都生成 error tool result draft；不直接让 run failed。全部 calls 都产生 actual/error result 后，assistant tool-call message 与 results 作为一个 `ToolRound` commit；commit 成功后先按 committed result 发布 `tool_call_finished { is_error }`，再发布该 assistant message 的 `message_assistant_finished`，再按 `call_index` 为每条 result 发布 `message_tool_result_appended`。
 
 ### 12. Approval Lifecycle
 
@@ -957,7 +958,7 @@ Required
 - `tool_call_approval_requested`
 - `agent_runtime_protocol::AgentCommand::DecideToolApproval`
 - approved 后进入 `tool_call_started`
-- rejected 后进入 `tool_call_finished { is_error: true }`
+- rejected 后生成 error result draft；完整 `ToolRound` commit 成功后发布 `tool_call_finished { is_error: true }`
 - abort 后 run 进入 `run_finished { status: aborted }`
 
 审批状态不能由 adapter 私有保存为权威状态；同一 host 生命周期内的订阅/状态重建后，从对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals` 恢复。`tool_call_approval_requested` 是一次事件；pending approval 的 UI-safe current state 由 `SessionRuntime` actor 的 `CurrentRun` projection 持有，`ToolApprovalBroker` 只持冻结 execution record 与 waiter。snapshot 不暴露 prepared args。
@@ -979,7 +980,7 @@ Empty
 
 `queue_updated` 每次发送完整队列摘要，而不是 delta，且只在 queue/pending state 实际变化时发布。新加载 session 的初始 queue 由 `RuntimeSnapshot.loaded_sessions` 投影，不为了客户端切换视图制造额外事件。这样 adapter reducer 不需要理解运行时 drain 细节。
 
-普通 prompt、skill、prompt template 和 prompt-producing slash command 都通过 `PromptDelivery` 进入相同队列入口。`Steer` 在当前 assistant response 及其完整工具批次结束后的 `before_next_model_call` 消费；若 Rig segment 原本将结束，则在 `before_run_finish` 消费并以同一 `run_id` rollover，且不重复发布 `run_started` / `run_finished`。`FollowUp` 在当前 work 和 pending session action 完成后消费，`NextTurn` 只在下一次显式用户 turn 合并。`CommandRunPolicy::Immediate` 的 `/status` 等命令不改队列，直接追加 command output；`QueueAfterRun` 的 `/compact` 只更新 `pending_actions`。
+普通 prompt、skill、prompt template 和 prompt-producing slash command 都通过 `PromptDelivery` 进入相同队列入口。`Steer` 在当前 assistant response 及其完整工具批次结束后的 `commit_pending_messages` 消费；若 Rig segment 原本将结束，则在 `before_run_finish` 消费并以同一 `run_id` rollover，且不重复发布 `run_started` / `run_finished`。`FollowUp` 在当前 work 和 pending session action 完成后消费，`NextTurn` 只在下一次显式用户 turn 合并。`CommandRunPolicy::Immediate` 的 `/status` 等命令不改队列，直接追加 command output；`QueueAfterRun` 的 `/compact` 只更新 `pending_actions`。
 
 `AbortRun` 在进入 idle 前清除尚未消费的 steering/follow-up 和 pending actions，保留 `NextTurn`；只有状态实际变化时才发 `queue_updated`。`ClearQueue` 清除 steering、follow-up、next-turn 和 pending actions；若清理造成状态变化，则发布四者均为空的完整 `queue_updated`。两条路径都不携带 removed items 或 editor action。
 
@@ -1101,11 +1102,12 @@ Session commit 是内部写入 seam，不是公共事件 lifecycle。所有 muta
 ```text
 Stable facts assembled in memory
   → SessionWriter.commit(batch)
-      ├─ Ok  → publish corresponding domain events / continue work
+      ├─ Ok  → apply_committed_messages(CommittedConversationDelta)
+      │       → publish corresponding domain events / continue work
       └─ Err → do not expose batch as committed; fail current mutation or run
 ```
 
-正常 text-only run 至少提交两个稳定 batch：current user input 必须在 `run_started` 前 commit，最终 assistant message 必须在正常 `run_finished { completed }` 前 commit。包含工具时，每个将被下一模型调用消费的完整 tool round 都必须先把 assistant tool-call message 与全部 tool-result messages 作为一个 `ToolRound` commit；并行结果按 `call_index` 归约后共享该 batch。
+正常 text-only run 至少提交两个稳定 batch：current user input 必须在 `run_started` 前 commit，并在 `build_conversation_seed(...)` 之前应用到 `CommittedConversationState`；最终 assistant message 必须由 `SessionRuntime.commit_final_assistant_message(...)` 在正常 `run_finished { completed }` 前 commit。包含工具时，每个将被下一模型调用消费的完整 tool round 都必须先把 assistant tool-call message 与全部 tool-result messages 作为一个 `ToolRound` commit；并行结果按 `call_index` 归约后共享该 batch。
 
 streaming delta、tool output delta、queue update、partial assistant、pending approval 和执行中的 tool round 不是 session writes。abort/failure/shutdown 只保留此前成功 committed 的 batches，当前不完整单元直接丢弃。公共协议不发布通用 save-point event；后期内部 `AfterSessionCommit` observer 可以用于可重建 cache、backup、telemetry 和测试。
 
@@ -1205,18 +1207,23 @@ UI
 SessionRuntime
   → session_phase_changed { phase: turn }
   → SessionWriter.commit(SessionWriteBatch::user_input(...))
+  → apply_committed_messages(CommittedConversationDelta)        // internal; no event
   → message_user_appended
+  → build_conversation_seed(...)                                // internal; no seed event
   → run_started
   → message_assistant_started
   → message_assistant_text_delta*
   → [for each tool-call response]
-      → tool_call_*
+      → tool_call_proposed / tool_call_approval_requested? / tool_call_started / tool_call_output_delta*
       → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+      → apply_committed_messages(CommittedConversationDelta)     // internal; no event
+      → tool_call_finished*              // final committed tool results
       → message_assistant_finished      // finishes the tool-call assistant message
       → message_tool_result_appended*
       → message_assistant_started       // next model response
       → message_assistant_text_delta*
   → SessionWriter.commit(SessionWriteBatch::assistant_final(...))
+  → apply_committed_messages(CommittedConversationDelta)         // internal; no event
   → message_assistant_finished          // finishes the final assistant message
   → usage_updated                       // optional, when provider usage exists
   → run_finished { status: completed }
@@ -1234,8 +1241,9 @@ Driver receives CallTools
   → tool_call_approval_requested?       // if policy asks user
   → tool_call_started
   → tool_call_output_delta*
-  → tool_call_finished { result, is_error }
   → SessionWriter.commit(SessionWriteBatch::tool_round(...)) // assistant tool calls + all results
+  → apply_committed_messages(CommittedConversationDelta)     // internal; no event
+  → tool_call_finished { result, is_error }                  // final committed result
   → message_assistant_finished          // assistant tool-call message; same committed batch
   → message_tool_result_appended*       // one per result, ordered by call_index
 ```
@@ -1252,10 +1260,11 @@ Driver receives CallTools
 tool_call_proposed { requires_approval: true }
 tool_call_approval_requested
 UI dispatch(DecideToolApproval)
-  ├─ approved  → tool_call_started → ... → tool_call_finished
-  └─ rejected  → record error result → tool_call_finished { is_error: true }
+  ├─ approved  → tool_call_started → ... → result draft
+  └─ rejected  → record error result draft
 all calls resolved
   → SessionWriter.commit(SessionWriteBatch::tool_round(...))
+  → tool_call_finished*                 // after commit, including rejected/error results
   → message_assistant_finished
   → message_tool_result_appended*
 ```
@@ -1307,7 +1316,7 @@ post-run arbitration
 
 - 同步 SubmitPrompt admission 失败不启动 run，直接拒绝 command 或发外层携带 `command_id` 的 `diagnostics_error`。pre-run threshold gate 命中不属于失败：它从 `Turn + current_run = None` 切换到独立 `Compaction` lifecycle，压缩成功后才首次分配 `RunId`。
 - 可重试 Agent run 失败必须先关闭当前 run，再直接从 `Turn` 进入 `RetryBackoff`；不能为了发布 retry event 先经过 `Idle`。
-- `DriverError::ContextLimitExceeded` recovery 不把 transient partial/error 写入 session；`PromptProjection` / `Provider` 来源只通过 diagnostics 与 usage 区分，并从最后 committed context 启动 recovery。顺序固定为 `run_finished { failed } → session_phase_changed(compaction) → compaction_started → compaction_finished { will_retry: true } → session_phase_changed(turn) → run_started(new RunId)`，不发布 session-level `retry_auto_started`。整个 work chain 只允许一次该 recovery。
+- `DriverError::ContextLimitExceeded` recovery 不把 transient partial/error 写入 session；`PromptAssembly` / `Provider` 来源只通过 diagnostics 与 usage 区分，并从最后 committed context 启动 recovery。顺序固定为 `run_finished { failed } → session_phase_changed(compaction) → compaction_started → compaction_finished { will_retry: true } → session_phase_changed(turn) → run_started(new RunId)`，不发布 session-level `retry_auto_started`。整个 work chain 只允许一次该 recovery。
 - provider fallback/retry 属于同一个 model call/run 的内部 attempt，不改变 `SessionPhase`，也不发布 session-level retry event。
 
 ## Compaction Lifecycle
@@ -1382,7 +1391,7 @@ UI dispatch(ReloadResources)
 
 `resources_changed` 只传摘要，不传技能全文、context file 正文或完整 system prompt。UI 如果要详情，通过运行时命令读取。
 
-`ResourceSnapshotStore.replace_cwd(...)` 是资源 reload 对后续 turn 生效的原子发布点，也是 MVP 唯一资源 current-pointer 替换线性化点。runtime 不把新 snapshot 推送到每个 idle `SessionRuntime`；下一次 `SubmitPrompt` / `InvokeSkill` / `InvokePromptTemplate` 真正启动新的显式 user turn / work chain 时，`SessionRuntime` 调用 `ResourceManager.capture_turn(...)`，把 current `CwdResourceSnapshot` 放入 `TurnState.resources`，并从同一 snapshot 创建新的 `PromptTurn`。active run 的 Steer、automatic retry、overflow recovery 和同 `RunId` segment rollover 继续使用 `CurrentRun.prompt_turn`。
+`ResourceSnapshotStore.replace_cwd(...)` 是资源 reload 对后续 turn 生效的原子发布点，也是 MVP 唯一资源 current-pointer 替换线性化点。runtime 不把新 snapshot 推送到每个 idle `SessionRuntime`；下一次 `SubmitPrompt` / `InvokeSkill` / `InvokePromptTemplate` 真正启动新的显式 user turn / work chain 时，`SessionRuntime` 调用 `capture_turn_resources(...)`，把 current `CwdResourceSnapshot` 放入 `TurnState.resources`，并从同一 snapshot 创建新的 `PreparedMessageTurn`。active run 的 Steer、automatic retry、overflow recovery 和同 `RunId` segment rollover 继续使用 `CurrentRun.prepared_turn`。
 
 ```text
 ReloadResources 完成 replace_cwd(C2)
@@ -1390,7 +1399,7 @@ ReloadResources 完成 replace_cwd(C2)
 
 下一次 SubmitPrompt
   → SessionRuntime::start_user_turn(...)
-  → ResourceManager.capture_turn(...)
+  → capture_turn_resources(...)
   → ResourceSnapshotStore.current_cwd(...) == C2
   → TurnState.resources = TurnResourceSnapshot { cwd: Arc<C2> }
 ```
@@ -1443,14 +1452,14 @@ MVP event lifecycle tests 应覆盖：
 - skill/template invocation：idle/future-turn 在 `UserInput` commit 后发布外层 `Event.run_id = None` 的 invoked，再发 `message_user_appended`；active Steer 使用外层 `Event.run_id = Some(current_run_id)`；invoked payload 不含 `run_id`，展开或 commit 失败不发 invoked。
 - user input commit failure：不发布 `message_user_appended` / `run_started`，不调用模型，phase 回到 idle 并产生 command/runtime diagnostic。
 - assistant streaming：delta 必须在 `message_assistant_started` / `message_assistant_finished` 之间。
-- tool success：`tool_call_proposed` / `tool_call_started` / `tool_call_finished`；`ToolRound` commit 后先发布 tool-call assistant 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`。
+- tool success：`tool_call_proposed` / `tool_call_started` / output delta 后，`ToolRound` commit 成功并应用 `CommittedConversationDelta`，再发布 `tool_call_finished`、tool-call assistant 的 `message_assistant_finished`，再按 `call_index` 发布 `message_tool_result_appended*`。
 - tool round commit failure：以非持久化 `message_assistant_finished` 关闭已 started lifecycle，不发布 `message_tool_result_appended`，不进入下一模型调用，当前 run 以 failed terminal 收尾。
 - tool denied / approval rejected：产生 error tool result，与同 batch 其他 results 一起 commit 完整 `ToolRound` 后才发布 appended events，不产生 run failure。
 - settled observation：没有 `WaitForIdle` command 或 wait-completed event；UI 通过 snapshot + `session_settled`，测试 event probe 必须先订阅再触发动作。任意 session 的 late-subscribe/gap 行为在 BR-044 关闭后再定义。
 - pre-run admission：`CommandAck` / `session_phase_changed(turn)` 不产生 run-level abort target；任何 Agent run 的 provider/model/tool/approval wait 前必须先发布 `run_started`。threshold gate 命中时先切换到独立 `Compaction` lifecycle，该 session-scoped 外部工作没有 Agent `RunId`；压缩成功后才首次发布 `run_started`。
-- actor responsiveness：active `RunTask` 正在等待 model/tool/approval 时，目标 `SessionRuntimeHandle` 仍能处理 `DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown；禁止 actor 内联等待完整 `drive_run()`。
+- actor responsiveness：active `RunTask` 正在等待 model/tool/approval 时，目标 `SessionRuntimeHandle` 仍能处理 `DecideToolApproval`、`AbortRun`、Steer/FollowUp/NextTurn admission、`ClearQueue`、pending `Compact`、snapshot 和 shutdown；禁止 actor 内联等待完整 `drive_conversation()`。
 - approval wakeup：tool batch 登记 pending approval 并发布 request 后，actor 处理 matching decision，Tools waiter 被唤醒且 executor 恰好执行一次；duplicate/stale/abort-after-request 不重复执行。
-- safe-point transaction：active Steer 经 actor drain/expand/`UserInput` commit/领域事件后才回复 `NextModelCallPlan`；commit failure 时 RunTask/Rig 不得到该 message。
+- safe-point transaction：active Steer 经 actor drain/expand/`UserInput` commit/领域事件后才回复 `NextConversationStep`；commit failure 时 RunTask/Rig 不得到该 message。
 - run identity fencing：旧 RunTask 在新 run 启动后发送的 late delta、safe-point、tool-round candidate 或 terminal effect 被识别为 stale，不能污染新 `CurrentRun`。
 - control/progress ordering：高频 progress lane 不饿死 approval/abort；terminal event 和 snapshot barrier 前已接受的 delta/update 必须完成归约，不能 finished-before-delta 或产生水位撕裂。
 - abort run：只有一个 terminal `run_finished { status: aborted }`；started assistant 必须 finished，uncommitted partial/approval/tool round 不进入 session；若清理造成 queue state 变化，清除 steering/follow-up/pending actions、保留 `NextTurn` 的 `queue_updated` 必须先于 idle/settled。
