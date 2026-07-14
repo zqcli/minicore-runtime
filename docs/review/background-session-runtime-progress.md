@@ -1720,3 +1720,21 @@ ADR 0023: Driver Starts From One Committed Conversation Seed
 - `MessageRecord` 不应直接成为 provider-facing request message。
 - committed session history 是 durable truth；Rig history 只能是 run-scoped working state。
 - 当前消息流程应显著简化，不能原样进入生产实现。
+
+### 2026-07-14 跨项目对照研究归档
+
+日期：2026-07-14  
+分支：`research/message-assembly-cross-project-study`  
+完整报告（含综合对照 + pi / Codex / Claude Code 三份 subagent 原始调研附录）：
+
+- [docs/research/message-assembly-cross-project-study.md](../research/message-assembly-cross-project-study.md)
+
+同日在 BR-055 Transcript-First 推荐之上，用同一复杂场景（长历史已压缩 + 项目 md + skill 带图 + 工具轮 + mid-run steering）对照 pi、Codex、Claude Code，结论摘要：
+
+- **三家共同收敛**验证目标方向：单一 live transcript；单一 session→provider 转换 seam；压缩摘要为 user 消息；steering 在工具轮边界注入；append-only 前缀稳定服务 prompt cache；**没有**贯穿整个 run 的 durable_history/current_input 双 lane。
+- **建议 MVP 吸收**：压缩摘要请求复用会话前缀（Claude Code）；system prompt 确定性纪律与 fingerprint 未变时 `PromptCallProfile` Arc 跨 turn 复用；Codex 式 continuation 严格前缀判据留给 ModelGateway。
+- **后期**：分级 snip/microcompact、compact 后 skill/文件恢复预算、skill 支持文件按需 Read。
+- **维持**：项目 md 进 Profile 层（本地单用户）；commit-before-rollover 最严 steering；避免 pi 双生产路径。
+- **阻塞未变**：Rig 0.40.0 spike → 通过后 ADR 0023 + 同步权威文档 + 关闭 BR-055。
+
+本节仅作进度索引；细节、矩阵、场景六阶段流与附录全文以 research 文档为准。
