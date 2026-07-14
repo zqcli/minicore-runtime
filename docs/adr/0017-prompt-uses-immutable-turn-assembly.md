@@ -30,3 +30,7 @@ MVP 在 active `Turn` 中拒绝 model、thinking、stream options、active tools
 动态 RAG/memory/IDE context 由对应 owner 收集成显式 `ContextMaterialContribution::Available/Unavailable`，再交给 Prompt 最终排序和校验；required 获取失败不能以缺项表达。
 
 只有未来出现多个异步 context provider、跨 call working set、动态 token budget 和后台 distillation 后，才考虑不拥有 durable history 的 session-scoped `ContextWorkspace`。
+
+## Amendment 2026-07-14 (ADR 0023)
+
+[ADR 0023](0023-driver-starts-from-one-committed-conversation-seed.md) 将本 ADR 中的历史命名修订为已接受的 public seam：`Prompt.prepare_message_turn(...) -> PreparedMessageTurn -> ModelContextProfile`，`compose_user_message(...) -> CanonicalUserMessage`，以及 `assemble_model_context(...) -> AssembledModelContext`。Prompt 仍是无状态深模块；变化是它现在也是 `AgentRun` 和 `CompactionSummary` 唯一的模型上下文组装 seam。旧文中的 `PromptTurn` / `PromptCallProfile` / `ModelInputProjection` 表述应按上述命名理解，不重写本 ADR 的历史决策正文。

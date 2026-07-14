@@ -231,7 +231,7 @@ pub enum QueueMode {
 - `FollowUp`：不修改 active run；当前 work chain、必要 retry/recovery 和 pending session action 完成后，作为后续用户输入启动新 run。session idle 时可立即启动。
 - `NextTurn`：不自动启动 run；与下一次显式提交的用户 prompt 一起进入上下文。
 
-`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate` 和 prompt-producing slash command 最终都必须归一到这套 `PromptDelivery`。runtime 内部先把它们转换成结构化 `PromptIntent`；queue 保存 resource key/args/附件引用，不保存 raw slash text 或 skill/template body。active `Steer` 由 active `PromptTurn` 展开，`FollowUp` / `NextTurn` 在目标 future turn capture 后展开。`PromptIntent`、`PromptTurn`、`PromptCallProfile` 和 `ModelInputProjection` 都是 runtime 内部类型，不进入公开 wire protocol。
+`SubmitPrompt`、`InvokeSkill`、`InvokePromptTemplate` 和 prompt-producing slash command 最终都必须归一到这套 `PromptDelivery`。runtime 内部先把它们转换成结构化 `PromptIntent`；queue 保存 resource key/args/附件引用，不保存 raw slash text 或 skill/template body。active `Steer` 由 active `PreparedMessageTurn` 展开，`FollowUp` / `NextTurn` 在目标 future turn 捕获资源和工具 profile 后展开。`PromptIntent`、`PreparedMessageTurn`、`CanonicalUserMessage`、`ModelContextProfile` 和 `AssembledModelContext` 都是 runtime 内部类型，不进入公开 wire protocol。
 
 公开协议不再保留独立 `Steer` / `FollowUp` / `NextTurn` 命令，避免两条入口产生不同的 phase guard、queue event 或 hook 行为。`SetQueueMode` 只配置 steering/follow-up 每次安全点消费全部消息还是一条；它不改变 delivery 类型，也不适用于 `NextTurn` 或 `PendingSessionAction`。
 
@@ -309,7 +309,7 @@ SetAutoRetry { session_id: SessionId, enabled: bool }
 
 `AbortRun { run_id }` 只取消已经通过 `run_started` 公开的 Agent run。`RunId` 在同一 runtime host 内全局唯一，`AgentRuntime` 可以通过 loaded runtimes 的 current-run lookup 路由到 owner `SessionRuntime`；terminal/stale id 返回 `NoActiveRun` / `StaleRun`，不会取消后来启动的 run。协议不把 `CommandAck` 扩展为 run-id 分配结果，也不引入 `AbortRun { session_id, run_id: Option<RunId> }`。
 
-`AbortRun` 停止当前自动 work chain：它清除尚未消费的 steering/follow-up queue 和 `PendingSessionAction`，保留不会自动启动 run 的 `NextTurn` queue；若清理造成 queue state 变化，则发布清理后的完整 `queue_updated`。已经在 safe point 完成 `UserInput` commit 的 steer 已属于 durable history，不能因 abort 删除或退回 queue。`ClearQueue` 则显式清除 steering、follow-up、next-turn 和 pending actions 全部当前 queue state。
+`AbortRun` 停止当前自动 work chain：它清除尚未消费的 steering/follow-up queue 和 `PendingSessionAction`，保留不会自动启动 run 的 `NextTurn` queue；若清理造成 queue state 变化，则发布清理后的完整 `queue_updated`。已经在 safe point 完成 `UserInput` commit 的 steer 已属于 committed conversation，不能因 abort 删除或退回 queue。`ClearQueue` 则显式清除 steering、follow-up、next-turn 和 pending actions 全部当前 queue state。
 
 runtime 不实现“abort 后归还队列文本给编辑器”：`CommandAck`、`QueueEvent` 和 snapshot 都不携带 `returned_to_editor`、removed delta 或 editor action。queue 保存的是结构化 prompt intent，不保证保留 raw slash text、原始编辑器文本、光标或 undo state；这些属于 UI-local draft。具体 adapter 可以基于本地 submission history 与 reducer state 提供同一 host 内的 best-effort restore，但该体验不是 core protocol 或 reconnect guarantee。
 
@@ -321,7 +321,7 @@ runtime 不实现“abort 后归还队列文本给编辑器”：`CommandAck`、
 
 `PatchSettings` 是后续配置 mutation 框架：UI 先通过 `SettingsQuery::GetEffective/GetSchema` 读取 effective values、source/provenance、editable constraints 和 revision，在本地维护未提交草稿，再用 expected revision 提交 patch。冲突返回 stale revision；成功后的 effective change 通过对应业务事件更新 UI cache。API key、OAuth token 和 auth header 不得进入普通 `SettingsPatch`，必须走专门的 secure credential seam。
 
-`ResourceQuery` 读取 current `CwdResourceSnapshot.resolved`，不能让 UI adapter 直接读文件。`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 canonical path。active run 的 `GetEffectivePrompt` 读取 active `PromptTurn` 的 redacted profile/provenance；idle preview 如后续支持，必须显式标记为 preview，并且不创建 turn、消费 queue 或改变资源 revision。完整正文默认属于 debug/privileged query，不进入普通 snapshot。
+`ResourceQuery` 读取 current `CwdResourceSnapshot.resolved`，不能让 UI adapter 直接读文件。`GetContextFile` 的 path 必须命中当前 cwd snapshot 已登记的 canonical path。active run 的 `GetEffectivePrompt` 读取 active `PreparedMessageTurn` / `ModelContextProfile` 的 redacted profile/provenance；idle preview 如后续支持，必须显式标记为 preview，并且不创建 turn、消费 queue 或改变资源 revision。完整正文默认属于 debug/privileged query，不进入普通 snapshot。
 
 `DecideToolApproval` 只回答已经由 `tool_call_approval_requested` 暴露出来的 pending approval。它不是通用工具执行命令，也不能携带新参数；`SessionRuntime` actor 先确认 `approval_id` 与 `session_id`、`run_id`、`call_id` 匹配 `CurrentRun` projection，再让 `ToolApprovalBroker` resolve 同一个内部 waiter。批准后执行的必须是审批请求中冻结的 prepared args；拒绝后产生 error tool result。
 
@@ -533,7 +533,7 @@ pub enum PromptTemplateEvent {
 
 `QueueEvent::Updated` 始终是替换式完整状态，不附加 consumed/removed delta。abort 后 `steering`、`follow_up` 和 `pending_actions` 为空，`next_turn` 保留原值；`ClearQueue` 实际造成状态变化时，更新后的四者均为空；空队列 no-op 不要求冗余事件。UI 是否把本地保存的原始输入重新放回 editor 是 adapter policy，不是 queue event 的领域语义。
 
-`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PromptTurn.resolve_intent()` 实际展开后发布。idle/future-turn admission 在 `UserInput` commit 成功后、`message_user_appended` 前发布，此时公开 run 尚未开始，外层 `Event.run_id = None`；active Steer 在 current run safe point 展开时使用外层 `Event.run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。展开或 commit 失败不制造 invoked 事件。
+`skill_invoked` / `prompt_template_invoked` 只在结构化 intent 被目标 `PreparedMessageTurn.compose_user_message()` 实际展开成 `CanonicalUserMessage` 后发布。idle/future-turn admission 在 `UserInput` commit 成功后、`message_user_appended` 前发布，此时公开 run 尚未开始，外层 `Event.run_id = None`；active Steer 在 current run safe point 展开时使用外层 `Event.run_id = Some(current_run_id)`。FollowUp/NextTurn 入队时不发 invoked；受理状态由 `CommandAck` 和完整 `queue_updated` 表达。展开或 commit 失败不制造 invoked 事件。
 
 ```rust
 pub enum CompactionEvent {

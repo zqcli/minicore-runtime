@@ -28,8 +28,9 @@ ToolBeforePolicy hook
 
 SessionRuntime
   → applies denial and records final error tool result
-  → emits tool_call_finished { is_error: true }
   → after all calls resolve: commit complete ToolRound batch
+  → applies CommittedConversationDelta
+  → emits tool_call_finished { is_error: true }
   → emits message_assistant_finished for the tool-call assistant
   → emits ordered message_tool_result_appended*
 ```
@@ -42,7 +43,7 @@ Hook 影响最终会发生什么；event 告诉下游最终发生了什么。下
 
 - `input`：用户输入到达后、进入 agent 前可 transform 或 handled。
 - `before_agent_start`：用户 prompt 展开后、agent loop 启动前可追加 custom message 或替换 system prompt。
-- `context`：每次模型调用前可替换 AgentMessage context。
+- `context`：每次模型调用前可提供 typed `ContextMaterialContribution` 或受控 replacement，最终仍由 Prompt 组装 `AssembledModelContext`。
 - `before_provider_request` / `after_provider_response`：模型请求前后 hook；raw provider payload patch 必须 privileged 且脱敏，MVP 可以不开放。
 - `tool_call` / `tool_result`：工具执行前阻止或改写结果。
 - resource discovery 不作为 hook；runtime 资源在 `OpenWorkspace` 初始化一次，cwd 资源更新统一走 `ResourceManager.ensure_cwd_snapshot(...)` / `reload_cwd(...)`。
@@ -103,7 +104,7 @@ Tools
   └─ revalidates schema / sandbox / policy after any hook rewrite
 
 ModelGateway
-  ├─ invokes model/provider boundary hooks inside call_model(...)
+  ├─ invokes model/provider boundary hooks inside generate_model_turn(...)
   └─ keeps credentials, raw provider payload and provider SDK errors inside the gateway
 ```
 
@@ -284,35 +285,35 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `BeforeAgentStart` | Transform | transform/gate structured current input、patch stream options |
-| `PromptBuilt` | Transform | append system section 或 privileged replace；应用后重建 `PromptCallProfile` |
+| `BeforeAgentStart` | Transform | transform/gate structured pending user intent or canonical user message、patch stream options |
+| `PromptBuilt` | Transform | append system section 或 privileged replace；应用后重建 `ModelContextProfile` |
 | `ContextProjection` | Transform / Provider | 返回 `CurrentRun` / `CurrentCall` 的 `ContextMaterialContribution::Available/Unavailable`；privileged capability 才可 replace messages |
-| `AfterTurnStateBuild` | Observer | inspect stable turn state / PromptTurn summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
+| `AfterTurnStateBuild` | Observer | inspect stable turn state / PreparedMessageTurn summary；不能把资源 snapshot 扩大进 `DriverTurnInput` |
 
 `BeforeAgentStart` / `PromptBuilt` 位于 `run_started` 前的 bounded admission 窗口，只能执行有限的内存 transform/gate，并必须由自身 timeout/error policy 收尾；它们不能等待 provider/model/tool、用户交互、external job、网络服务或未限定时长的 extension work。需要这些长等待的能力必须移到 `run_started` 后、由明确 owner 和 cancellation lifecycle 管理。
 
 提示词注入应该返回 typed result，由 `SessionRuntime` 应用后交给 Prompt 最终组装，而不是让 UI、hook 或下游代码直接提交 system/messages。
 
 - 企业 policy / coding style：优先作为 required policy view 或 `PromptBuilt` append；system replacement 需要 privileged `ReplacePrompt` capability。
-- `PromptBuilt` 变化后必须重建 contribution stamps、fingerprint 和完整 `PromptCallProfile`，不能只改字符串。
+- `PromptBuilt` 变化后必须重建 contribution stamps、fingerprint 和完整 `ModelContextProfile`，不能只改字符串。
 - RAG / memory / issue context：成功时返回带 source、content hash、persistence 和 requirement 的 `ContextMaterial`；失败时返回同 key/source/requirement 的 `Unavailable`，不能省略失败项。`Required` 失败由 Prompt fail closed，`Optional` 失败进入 projection diagnostics。
-- privileged message replacement 仍必须经过 `prompt::project_model_call(ModelCallProjectionInput { profile, ... })`，保证没有 orphan tool result、unresolved tool call 或 current-input loss。
-- resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 captured `PromptResourceView` 注入资源。
+- privileged message replacement 仍必须经过 `Prompt.assemble_model_context(AssembleModelContextInput { profile, committed_conversation, transient_context, purpose, ... })`，保证没有 orphan tool result、unresolved tool call 或新提交用户消息丢失。
+- resource-driven prompt material：由 `ResourceManager` 内置 resolver 提供；hook 不直接读文件，也不绕过 captured `TurnResourceSnapshot` 注入资源。
 
 ### Run Safe Points
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
-| `RunBeforeStart` | Gate / Observer | final validated `RunStartPlan`（不含 RunId）的 bounded cancel/observe；发生在 RunId 分配和 `DriveRequest` 构造前 |
-| `BeforeNextModelCall` | Transform / Gate | 形成组合式 `NextModelCallPlan`：drain queue、profile/model options、typed context、pause/finish |
+| `RunBeforeStart` | Gate / Observer | final validated `RunStartPlan`（不含 RunId）的 bounded cancel/observe；发生在 RunId 分配和 `ConversationDriveRequest` 构造前 |
+| `BeforeNextModelCall` | Transform / Gate | 参与形成组合式 `NextConversationStep`：drain queue、profile/model options、typed context、pause/finish |
 | `BeforeRunFinish` | Gate / Transform | decide finish/pause/follow-up |
 | `RunFinished` | Observer | telemetry / diagnostics |
 
-`RunStartPlan` 是 `SessionRuntime` 内部的 pre-drive view，只包含最终 entry、`DriverTurnInput`、limits 和 redacted correlation context，不是 `DriveRequest`，也不预分配 `RunId`。`RunBeforeStart` 与 `BeforeAgentStart` / `PromptBuilt` 受同一个 bounded admission 约束：只能做有限内存 gate/observe，不得等待 provider/model/tool、用户交互、external job、网络或无界 extension work。它若 cancel，则不分配/公开 RunId，也不发布 `run_started`。这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部；它只消费 `NextModelCallPlan`，再调用 Prompt 生成最终 `ModelInputProjection`。
+`RunStartPlan` 是 `SessionRuntime` 内部的 pre-drive view，只包含最终 entry、`DriverTurnInput`、limits 和 redacted correlation context，不是 `ConversationDriveRequest`，也不预分配 `RunId`。`RunBeforeStart` 与 `BeforeAgentStart` / `PromptBuilt` 受同一个 bounded admission 约束：只能做有限内存 gate/observe，不得等待 provider/model/tool、用户交互、external job、网络或无界 extension work。它若 cancel，则不分配/公开 RunId，也不发布 `run_started`。这些 hook 必须由 `SessionRuntime` 调用。`Driver` 不直接暴露 hook 给外部；它只消费 `NextConversationStep`，再调用 Prompt 生成最终 `AssembledModelContext`。
 
 ### Model / Provider
 
-这些 hook 的 owner 是 `ModelGateway`。`SessionRuntime` 只在进入 `DriverHost::call_model(...)` 前拥有 run safe point；一旦形成 `ModelCallRequest` 并进入 `ModelGateway.call_model(...)`，provider-neutral request patch、provider payload patch、provider response observer 和 usage normalization observer 都必须留在 `ModelGateway` 内。当前 MVP 不实现这些 hook；后期若先开放，也应先开放 provider-neutral `BeforeModelCall`，继续禁用 raw provider payload patch。
+这些 hook 的 owner 是 `ModelGateway`。`SessionRuntime` 只在进入 `DriverHost::generate_model_turn(...)` 前拥有 run safe point；一旦形成 `ModelCallRequest` 并进入 `ModelGateway.generate_model_turn(...)`，provider-neutral request patch、provider payload patch、provider response observer 和 usage normalization observer 都必须留在 `ModelGateway` 内。当前 MVP 不实现这些 hook；后期若先开放，也应先开放 provider-neutral `BeforeModelCall`，继续禁用 raw provider payload patch。
 
 | Hook | 类型 | 能力 |
 | --- | --- | --- |
@@ -345,7 +346,7 @@ Hook 不直接创建 session files，不直接 mutate `SessionStorage`。`Sessio
 - approval 之后不允许再改 args。
 - hook 不能直接调用 `ToolExecutor`。
 - tool hook failure 默认 fail closed：before-policy 出错应 deny tool 或 fail command，取决于 hook 点。
-- `tool_call_finished` 必须使用 `ToolAfterExecute` / `ToolResultBeforeCommit` 后的最终 normalized result；不能先发布旧 result 再让 hook 改写 committed tool message。
+- `tool_call_finished` 必须使用 `ToolAfterExecute` / `ToolResultBeforeCommit` 后、完整 `ToolRound` commit 成功并应用 `CommittedConversationDelta` 的最终 normalized result；不能在 commit 前发布，也不能先发布旧 result 再让 hook 改写 committed tool message。
 
 ### Queue
 

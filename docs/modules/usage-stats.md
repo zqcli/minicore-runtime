@@ -320,4 +320,4 @@ current_tokens >= context_window - reserve_tokens: should compact
 - 不要因为 compaction 降低 session cumulative usage。
 - 不要把本地估算当成账单权威。
 - 不要让 `Driver` 拥有 session stats；它只聚合当前 drive 的 usage facts。
-- 不要把 `DriverError::ContextLimitExceeded` 的 transient failure/partial assistant 作为模型可见消息参与 recovery usage/context 计算；`PromptProjection` source 没有 model-call usage，`Provider` source 保留实际 attempt/usage。
+- 不要把 `DriverError::ContextLimitExceeded` 的 transient failure/partial assistant 作为模型可见消息参与 recovery usage/context 计算；`PromptAssembly` source 没有 model-call usage，`Provider` source 保留实际 attempt/usage。

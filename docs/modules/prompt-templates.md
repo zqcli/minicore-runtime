@@ -14,11 +14,11 @@ prompt_templates.rs
 CommandManager
   consumes: metadata only，生成 /template <name> 和安全 alias
 
-PromptTurn
+PreparedMessageTurn
   consumes: captured PromptTemplateResource，按 PromptDelivery 对应的目标 snapshot 展开 intent
 ```
 
-`ResourceManager` 和 PromptTemplates 不直接构造 user message；`PromptTurn.resolve_intent()` 是模板正文进入模型输入的唯一组装入口。
+`ResourceManager` 和 PromptTemplates 不直接构造 user message；`PreparedMessageTurn.compose_user_message()` 是模板正文进入模型输入的唯一组装入口。
 
 ## 数据结构
 
@@ -43,7 +43,7 @@ pub struct PromptTemplateCatalog {
     pub diagnostics: Vec<ResourceDiagnostic>,
 }
 
-pub struct PromptTemplateInvocation {
+pub struct PromptTemplateIntent {
     pub template_key: ResourceKey,
     pub args: Vec<String>,
     pub additional_instructions: Option<String>,
@@ -72,7 +72,7 @@ frontmatter：
 
 - `description` 可选；缺省时使用正文第一条非空行的受限预览。
 - `argument-hint` 可选，只用于 command presentation。
-- `skills` 可选，声明结构化 skill dependencies；这些 skill 必须从同一个 captured `PromptResourceView` 解析。
+- `skills` 可选，声明结构化 skill dependencies；这些 skill 必须从同一个 captured `PromptResourceView` 解析，该 view pin 住目标 `TurnResourceSnapshot`。
 - name 必须满足稳定 command/resource name 规则。
 
 模板正文不是 system prompt，也不能声明 system-level override capability。
@@ -138,23 +138,23 @@ pub fn expand_template(
 队列保存：
 
 ```text
-template_key
+resource_key
 args
-additional_instructions
+attachments / immutable attachment references
 ```
 
-不保存 raw slash text，也不保存提前展开的 body。
+additional instructions 作为 args/metadata 的一部分保存；不保存 raw slash text，也不保存提前展开的 body。
 
 展开边界：
 
 ```text
 Steer
-  → active PromptTurn
+  → active PreparedMessageTurn
   → active TurnResourceSnapshot 中的 template + required skills
 
 FollowUp / NextTurn / idle submission
-  → target turn capture_turn(...)
-  → new PromptTurn
+  → target turn capture_turn_resources(...) + capture_turn_tools(...)
+  → new PreparedMessageTurn
   → future snapshot 中的 template + required skills
 ```
 
@@ -171,7 +171,7 @@ resolved skill blocks
   → attachments
 ```
 
-skill body 和 template body 必须来自同一个 `PromptResourceView`。这保证 reload 时不会出现 rev-1 template 搭配 rev-2 skill。
+skill body 和 template body 必须来自同一个 captured `TurnResourceSnapshot`。这保证 reload 时不会出现 rev-1 template 搭配 rev-2 skill。
 
 ## CommandSurface
 
@@ -189,7 +189,7 @@ canonical command 始终是：
 
 只有在不与 builtin/root command、skill alias 或其他 trusted command node 冲突时才 materialize。冲突产生 diagnostic，不能依赖加载顺序。
 
-CommandManager 只读取 `PromptTemplateMetadata`，不读取或展开正文。执行时重新 materialize catalog、resolve selection，再生成结构化 `PromptTemplateInvocation`。
+CommandManager 只读取 `PromptTemplateMetadata`，不读取或展开正文。执行时重新 materialize catalog、resolve selection，再生成结构化 `PromptIntent::Template(PromptTemplateIntent)`。
 
 ## Limits 与安全
 

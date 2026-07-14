@@ -41,3 +41,7 @@ abort 与 commit 的胜负也在 actor 处决定：actor 在 commit admission �
 - 未选择 `Arc<Mutex<SessionRuntime>>`：锁顺序和 lock-across-await 会把 BR-047 转换为运行时死锁，并让 snapshot/commit ordering 分散到多个调用者。
 - 未选择只给 `ToolApprovalBroker` 增加 channel：它只能修 approval，不能解决 steer、abort、clear queue、pending compact、snapshot 和 shutdown。
 - 未选择让 `SessionManager` 或 `Driver` 成为单 session 状态机 owner：前者只管理 runtime lifecycle，后者只适配 Rig。
+
+## Amendment 2026-07-14 (ADR 0023)
+
+[ADR 0023](0023-driver-starts-from-one-committed-conversation-seed.md) 将工具 capture 命名从 `Tools::capture_profile_baseline()` / `ToolProfileBaseline` 修订为 `Tools.capture_turn_tools(...) -> TurnToolProfile { prompt_view, executor, fingerprint }`。本 ADR 的并发与 owner 决策不变：actor 保留 tool admin/approval 能力，RunTask 只得到 run-only `ToolBatchInvoker` executor，并且 `prompt_view` 与 executor fingerprint 必须相同。该 amendment 只改 public seam 命名和 Transcript-First 输入连接，不重写历史决策。

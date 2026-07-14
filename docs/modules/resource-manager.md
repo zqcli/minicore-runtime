@@ -22,12 +22,12 @@ OpenSession / NewSession / explicit cwd reload
             └─ CwdResourceSnapshot      // project/cwd/trust/catalog overlay
 
 SessionRuntime target user-turn boundary
-  └─ ResourceManager.capture_turn(...)
+  └─ ResourceManager.capture_turn_resources(...)
        └─ TurnResourceSnapshot          // turn behavior/model/environment/policy projections
-            └─ PromptResourceView       // Prompt 的非工具稳定输入 seam
+            └─ Prompt.prepare_message_turn input
 ```
 
-`ResourceManager` 是“资源如何加载、分层、覆盖、标识和发布”的单一事实来源；`SessionRuntime` 是“什么时候从各 owner 生成 typed projection、请求冻结并启动 turn”的 Pull Master；`Prompt` 负责解释 captured prompt-safe views、展开结构化 intent 和生成最终模型输入。各 owner / `SessionRuntime` 只生成和校验 projection；`ResourceManager.capture_turn(...)` 只绑定 current cwd snapshot、冻结这些值并计算 fingerprint。三者不能反向调用。
+`ResourceManager` 是“资源如何加载、分层、覆盖、标识和发布”的单一事实来源；`SessionRuntime` 是“什么时候从各 owner 生成 typed projection、请求冻结并启动 turn”的 Pull Master；`Prompt` 负责解释 captured prompt-safe inputs、展开结构化 intent 和生成最终模型上下文。各 owner / `SessionRuntime` 只生成和校验 projection；`ResourceManager.capture_turn_resources(...)` 只绑定 current cwd snapshot、冻结这些值并计算 fingerprint。三者不能反向调用。
 
 ## Resource 定义
 
@@ -42,7 +42,7 @@ MiniCore 中的 `Resource` 定义为：
 这一定义允许 `TurnResourceSnapshot` 冻结 behavior/model/environment/policy 的模型可见 projection，但不把 `ModelState`、`Tools`、`AuthStore` 或 `SettingsStore` 的 owner 生命周期转交给 `ResourceManager`。例如：
 
 - `ModelState` 仍由 `SessionRuntime` 拥有；turn capture 只接收 `ActiveModelPromptProjection` / model version。
-- `Tools` 仍由 session-scoped `Tools` 子系统拥有；工具模型可见 schemas 通过独立 `ToolPromptView` 传给 Prompt，不进入 `PromptResourceView`。
+- `Tools` 仍由 session-scoped `Tools` 子系统拥有；`TurnToolProfile.prompt_view` 传给 Prompt，`TurnToolProfile.executor` 只传给 run path，二者都不进入 `TurnResourceSnapshot`。
 - provider/auth/settings 仍是 user-global/runtime-global service；ResourceManager 不读取 secret 或 settings owner handle。
 
 ## Snapshot 分层
@@ -134,18 +134,14 @@ pub struct StepResourceSnapshot {
 }
 ```
 
-后续如果支持 turn 内 safe-point mutation（例如模型可见 profile 或工具批处理 invoker 的合法替换），必须通过 `StepResourceSnapshot` 或明确 step override 记录，且在同一 actor transaction 中原子替换 `PromptCallProfile` 与 future `ToolBatchInvoker`，保持 fingerprint 一致。step capture 不能读取 `ResourceManager` current pointer，也不能重新加载 runtime/cwd 资源。
+后续如果支持 turn 内 safe-point mutation（例如模型可见 profile 或工具批处理 executor 的合法替换），必须通过 `StepResourceSnapshot` 或明确 step override 记录，且在同一 actor transaction 中原子替换 `ModelContextProfile` 与 future tool executor，保持 fingerprint 一致。step capture 不能读取 `ResourceManager` current pointer，也不能重新加载 runtime/cwd 资源。
 
-## PromptResourceView
+## Prompt 输入边界
 
-`PromptResourceView` 是所有非工具稳定 Prompt 输入的唯一 seam。它从 captured `TurnResourceSnapshot` 投影，不是新的 snapshot 层或 catalog owner。
+`TurnResourceSnapshot` 是所有非工具稳定 Prompt 输入的 captured resource owner value。Prompt 不直接接收完整 snapshot，而是接收它投影出的窄 `PromptResourceView`；两者都不允许读取 ResourceManager current pointer。
 
 ```rust
-pub struct PromptResourceView {
-    snapshot: Arc<TurnResourceSnapshot>,
-}
-
-impl PromptResourceView {
+impl TurnResourceSnapshot {
     pub fn materials(&self) -> PromptMaterials<'_>;
     pub fn behavior(&self) -> &BehaviorProjection;
     pub fn model(&self) -> &ModelPromptProjection;
@@ -154,32 +150,33 @@ impl PromptResourceView {
     pub fn skill(&self, key: &ResourceKey) -> Option<&SkillResource>;
     pub fn template(&self, key: &ResourceKey) -> Option<&PromptTemplateResource>;
     pub fn fingerprint(&self) -> &TurnResourceFingerprint;
+    pub fn prompt_view(&self) -> PromptResourceView;
 }
 ```
 
-`PromptResourceView` 复用本模块权威的 `ResourceKey`、`ResourceSourceInfo`、`ContentHash`、`CwdResourceRevision` 和 `TurnResourceFingerprint`。它只 pin captured snapshot；没有 current pointer、reload、ensure、overlay、owner handle 或 filesystem I/O 能力。
+`PromptResourceView` 只 pin `Arc<TurnResourceSnapshot>` 并暴露上述 prompt-safe getters；它不是第二个 snapshot layer、catalog owner 或可变缓存。`TurnResourceSnapshot` 复用本模块权威的 `ResourceKey`、`ResourceSourceInfo`、`ContentHash`、`CwdResourceRevision` 和 `TurnResourceFingerprint`。两者都没有 current pointer、reload、ensure、overlay、owner handle 或 filesystem I/O 能力。
 
-工具提示素材保持独立，由 session-scoped `Tools` 产出 `ToolPromptView`。Prompt 入口固定为：
+工具提示素材保持独立，由 session-scoped `Tools` 产出 `TurnToolProfile`。Prompt 入口固定为：
 
 ```rust
-pub fn assemble_turn(input: PromptTurnSpec) -> Result<PromptTurn, PromptError>;
+pub fn prepare_message_turn(input: PrepareMessageTurnInput) -> Result<PreparedMessageTurn, PromptError>;
 
-pub struct PromptTurnSpec {
+pub struct PrepareMessageTurnInput {
     pub resources: PromptResourceView,
     pub tools: ToolPromptView,
 }
 ```
 
-`ToolPromptView` 不进入 `PromptResourceView`，以保持 Tools 的 active set、approval、executor 和 future `ToolBatchInvoker` owner 独立。
+`TurnToolProfile` 不进入 `TurnResourceSnapshot`，也不整体进入 Prompt；`SessionRuntime` 只把其中的 `prompt_view` 放进 `PrepareMessageTurnInput`，把 `executor` 留给 `SessionDriverHost`。
 
 ## Capture 时机与 user-turn / work-chain 语义
 
-`TurnResourceSnapshot` 按 user turn / work chain capture 一次，而不是按每个 `RunId` capture：
+`TurnResourceSnapshot` 按 user turn / work chain 捕获一次，而不是按每个 `RunId` 捕获：
 
-- 新显式 user prompt、`FollowUp`、`NextTurn` 和新的 idle prompt：capture 新 `TurnResourceSnapshot`。
+- 新显式 user prompt、`FollowUp`、`NextTurn` 和新的 idle prompt：捕获新 `TurnResourceSnapshot`。
 - automatic retry：复用原 `TurnResourceSnapshot`。
 - context overflow compaction recovery：复用原 work chain 的 `TurnResourceSnapshot`。
-- active `Steer`：使用 active `CurrentRun.prompt_turn` / active `TurnResourceSnapshot`。
+- active `Steer`：使用 active `CurrentRun.prepared_turn` / active `TurnResourceSnapshot`。
 - 同一 `RunId` 下 Rig segment rollover：复用原 `TurnResourceSnapshot`。
 
 resource reload 只影响新的显式 user turn / work chain，不 patch active turn，也不改变已经展开并持久化的 skill/template invocation。
@@ -199,17 +196,20 @@ manual ReloadResources
   → AgentRuntime emits resources_changed summary
 
 new explicit user turn / work chain
-  → ResourceManager.capture_turn(request, typed owner projections)
-  → PromptResourceView + ToolPromptView
-  → prompt::assemble_turn(PromptTurnSpec { resources, tools })
-  → TurnState.prompt_turn / DriverTurnInput.prompt
+  → ResourceManager.capture_turn_resources(request, typed owner projections)
+  → turn_tools = Tools.capture_turn_tools(...)
+  → Prompt.prepare_message_turn(PrepareMessageTurnInput {
+        resources: turn_resources.prompt_view(),
+        tools: turn_tools.prompt_view.clone(),
+     })
+  → TurnState.prepared_turn / DriverTurnInput.context_profile
 ```
 
-`capture_turn(...)` 在稳态只读取 `ResourceSnapshotStore` 当前 cwd pointer，并冻结调用方传入的 typed projections。`OpenWorkspace`、`OpenSession` 和 `NewSession` 必须提前保证 runtime/cwd current snapshots 存在；capture 不是兜底读盘入口，也不是 lazy recompose 入口。
+`capture_turn_resources(...)` 在稳态只读取 `ResourceSnapshotStore` 当前 cwd pointer，并冻结调用方传入的 typed projections。`OpenWorkspace`、`OpenSession` 和 `NewSession` 必须提前保证 runtime/cwd current snapshots 存在；capture 不是兜底读盘入口，也不是 lazy recompose 入口。
 
 ```rust
 impl ResourceManager {
-    fn capture_turn(
+    fn capture_turn_resources(
         &self,
         req: TurnResourceCaptureRequest,
         projections: TurnResourceProjections,
@@ -233,13 +233,13 @@ impl ResourceManager {
 }
 ```
 
-`capture_turn` 是同步、无 I/O 的 actor 内操作；调用期间不能穿插会改变 behavior/model/environment/policy owner state 的 session command。它与 `replace_cwd` 按读取 current pointer 的时点线性化：
+`capture_turn_resources` 是同步、无 I/O 的 actor 内操作；调用期间不能穿插会改变 behavior/model/environment/policy owner state 的 session command。它与 `replace_cwd` 按读取 current pointer 的时点线性化：
 
 ```text
-capture 读取 current pointer 早于 replace_cwd(C2)
+resource capture 读取 current pointer 早于 replace_cwd(C2)
   → 合法使用旧 CwdResourceSnapshot
 
-capture 读取 current pointer 晚于 replace_cwd(C2)
+resource capture 读取 current pointer 晚于 replace_cwd(C2)
   → 必须使用 C2
 ```
 
@@ -355,7 +355,7 @@ pub trait ResourceManager {
         request: CwdResourceRequest,
     ) -> Result<CwdResourceReloadResult, ResourceError>;
 
-    fn capture_turn(
+    fn capture_turn_resources(
         &self,
         request: TurnResourceCaptureRequest,
         projections: TurnResourceProjections,
@@ -401,7 +401,7 @@ trust state 是构建 `CwdResourceSnapshot.local` 的输入，不是 `ModelGatew
 
 ## Prompt materials、技能与模板
 
-`ResourceManager` 只提供 prompt materials 和 selected resource catalog；最终 system prompt、结构化 intent 展开和 model-input projection 属于 [Prompt](prompt.md)。
+`ResourceManager` 只提供 prompt materials 和 selected resource catalog；最终 system prompt、结构化 intent 展开和 model context assembly 属于 [Prompt](prompt.md)。
 
 ```rust
 pub struct PromptMaterials<'a> {
@@ -413,9 +413,9 @@ pub struct PromptMaterials<'a> {
 }
 ```
 
-`PromptMaterials` 是 `CwdResourceSnapshot.resolved` 的只读投影，不是最终 system prompt 字符串。`ResourceManager` 保证这些素材和 selected skill/template body 来自同一版 captured snapshot；各 owner / `SessionRuntime` 在 turn boundary 生成 behavior/model/environment/policy projections，`ResourceManager.capture_turn(...)` 将它们与 current cwd snapshot 一起冻结；`Prompt` 负责生成 immutable `PromptTurn`。
+`PromptMaterials` 是 `CwdResourceSnapshot.resolved` 的只读投影，不是最终 system prompt 字符串。`ResourceManager` 保证这些素材和 selected skill/template body 来自同一版 captured snapshot；各 owner / `SessionRuntime` 在 turn boundary 生成 behavior/model/environment/policy projections，`ResourceManager.capture_turn_resources(...)` 将它们与 current cwd snapshot 一起冻结；`Prompt` 负责生成 immutable `PreparedMessageTurn` 和后续 `AssembledModelContext`。
 
-显式 `InvokeSkill` / prompt template invocation 的 delivery 时机属于 `SessionRuntime`，正文查询和消息组装属于目标 `PromptTurn.resolve_intent(...)`。为了保证旧 turn 可复现，snapshot 必须保存 selected body content，或保存 content hash + immutable loaded content reference；Prompt 不能让旧 turn 在运行中重新读取已被 reload 覆盖的文件内容。
+显式 skill / prompt template invocation 的 delivery 时机属于 `SessionRuntime`，正文查询和消息组装属于目标 `PreparedMessageTurn.compose_user_message(...)`。为了保证旧 turn 可复现，snapshot 必须保存 selected body content，或保存 content hash + immutable loaded content reference；Prompt 不能让旧 turn 在运行中重新读取已被 reload 覆盖的文件内容。
 
 ## 静态资源与动态 Context
 

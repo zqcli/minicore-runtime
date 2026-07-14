@@ -132,7 +132,7 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 风险：这些缺口不改变 `AgentCommand -> AgentRuntime -> SessionRuntime` 的调用方向，但若带入开发，adapter、protocol、session state、持久化和 ModelGateway 会分别发明 payload 与生命周期语义；不可达的 `ResumeRun` 还会把 post-MVP suspend/resume 状态机误列为 MVP 验收范围。
 
-决策结果：先完成其余 review issue，再与 BR-051 的全仓 interface contract closure review 联合处理。`UserInput`、`StreamOptions`、`ThinkingLevel` 作为 `agent_runtime_protocol` owned、provider-neutral 的公开 payload 定型；复核必须同时明确 wire 形状、默认值、持久化/恢复边界、future-run 或 safe-point 生效规则、capability clamp 和 provider mapping owner。`UserInput` 的完成条件与 BR-055 的 canonical `ResolvedPromptInput.parts -> Vec<MessageRecord>` 折叠规则联动，确保 durable input 与模型可见输入来自同一结果。
+决策结果：先完成其余 review issue，再与 BR-051 的全仓 interface contract closure review 联合处理。`UserInput`、`StreamOptions`、`ThinkingLevel` 作为 `agent_runtime_protocol` owned、provider-neutral 的公开 payload 定型；复核必须同时明确 wire 形状、默认值、持久化/恢复边界、future-run 或 safe-point 生效规则、capability clamp 和 provider mapping owner。`UserInput` 的完成条件与 BR-055 / ADR 0023 的 `compose_user_message(...) -> CanonicalUserMessage` 规则联动，确保 durable input 与模型可见输入来自同一 committed seed。
 
 `ResumeRun` 纳入 MVP command reachability review，默认方案是移入“后续命令”，并把对应 phase guard、suspend/resume event 和 Driver resume seam 明确标为 post-MVP reserved；不为了保留该命令而凭空增加 `SuspendRun`。每个保留在 MVP 的公开 command 必须存在至少一条文档内可构造的合法状态路径。
 
@@ -181,7 +181,11 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 ### BR-055：`ResolvedPromptInput.parts` 与 `messages` 的折叠关系未定义
 
-状态：Open
+状态：Resolved / Closed
+
+处理记录：新增 [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)，接受 Transcript-First 设计并固定 public seam 命名：`ResourceManager.capture_turn_resources`、`Tools.capture_turn_tools -> TurnToolProfile`、`Prompt.prepare_message_turn -> PreparedMessageTurn -> ModelContextProfile`、`compose_user_message -> CanonicalUserMessage`、`assemble_model_context -> AssembledModelContext`、`ConversationSeed`、`CommittedConversationState/Delta`、`Driver.drive_conversation`、`ModelGateway.generate_model_turn`、`execute_and_commit_tool_round`、`commit_pending_messages` 和 `commit_final_assistant_message`。
+
+关闭理由：MVP current input 不再暴露 `parts + messages` 双 source of truth；`compose_user_message(...)` 是 canonical lowering seam，一个 prompt-like intent 产出一条 `CanonicalUserMessage`。SessionRuntime 在 session open/recovery 时从 durable storage 建立 `CommittedConversationState`，稳态 commit 后只应用可信 delta，并从该热视图构造 `ConversationSeed`，其中 current input 恰好出现一次；Driver/Rig 只能从 committed seed/delta 推进；Prompt 是 AgentRun 与 CompactionSummary 的唯一 `AssembledModelContext` 组装 seam；ModelGateway 只编码/调用 provider，不判断 session message visibility。BR-049 Rig spike 仍 Deferred，但只验证 private adapter mapping，不再反向决定 MiniCore public seam。
 
 问题：`PromptTurn.resolve_intent()` 返回 `ResolvedPromptInput`，其 `parts` 如何折叠成 `MessageRecord`、折叠规则是什么，没有定义。这直接决定"持久化的 `UserInput` batch 内容 == 模型可见输入"这一不变量能否成立，而 `skills.md` 的 commit 流程依赖它。
 
@@ -192,7 +196,7 @@ Rig `AgentRun::tool_results(...)` 后已经到达下一次模型调用前的协�
 
 风险：折叠规则不定，持久化内容与模型可见输入可能分叉。
 
-待处理方向：定义 `parts -> Vec<MessageRecord>` 的折叠 owner 和规则，并声明它是 `UserInput` batch 与模型输入的共同来源。
+处理结果：旧“`parts -> Vec<MessageRecord>`”问题被 Transcript-First 命名取代；历史调研正文保留在 [background-session-runtime-progress](background-session-runtime-progress.md) 中，但本 issue 不再 Open。
 
 ### BR-056：retry attempt 跨 compaction 的配对未定义
 
