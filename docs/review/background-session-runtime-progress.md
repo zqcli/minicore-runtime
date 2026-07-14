@@ -1755,3 +1755,145 @@ ADR 0023: Driver Starts From One Committed Conversation Seed
 - **Commit seam names**：`execute_and_commit_tool_round`、`commit_pending_messages`、`commit_final_assistant_message`。
 - **Compaction invariant**：Compaction 只做 cut/protection/directive；protected `EntryId` 不进入摘要目标；compaction commit 后先应用 committed delta 更新 `CommittedConversationState`，只有 leaf/revision mismatch 或 recovery 时才 reload storage，再构造 `ConversationSeed`。
 - **Prompt ownership invariant**：Prompt 是 `AgentRun` 与 `CompactionSummary` 唯一模型上下文组装 seam；`AssembledModelContext` 是 model-visible truth。
+
+## 2026-07-14 Handoff Snapshot: Transcript-First 文档落地完成
+
+本节用于换机、上下文丢失或长时间中断后的快速恢复。它记录本轮已经提交的结果、当前仓库状态、不得重新打开的设计决定、仍待完成的工作以及建议恢复顺序。上方 BR-055 调研和跨项目研究保留的是决策过程；本节与 ADR 0023 记录当前结果。
+
+### Git 状态与提交基线
+
+- 工作分支：`research/message-assembly-cross-project-study`。
+- 远端分支：`origin/research/message-assembly-cross-project-study`。
+- 架构落地提交：`fe7f0d7 docs(architecture): adopt transcript-first message pipeline`。
+- 该提交的直接研究父提交：`f65aa09 docs(research): archive message assembly cross-project study`。
+- `fe7f0d7` 修改 25 个文档文件，新增 ADR 0023；本节所在的 progress 更新会作为后续独立提交记录。
+- 当前仓库仍是纯文档设计仓库，没有 `Cargo.toml`、`src/` 或可执行测试；不要把伪代码误认为已实现接口。
+
+换机后恢复命令：
+
+```bash
+git clone https://github.com/zqcli/minicore-runtime.git
+cd minicore-runtime
+git fetch origin
+git switch research/message-assembly-cross-project-study
+git pull --ff-only
+git status --short --branch
+git log -5 --oneline
+```
+
+### 本轮实际完成内容
+
+- 新增 Accepted [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)，MiniCore public message pipeline 不再等待 Rig spike 反向定型。
+- 更新 `CONTEXT.md`、`docs/architecture.md`、模块总览，以及 Prompt、SessionRuntime、Driver、SessionManager、ModelGateway、Compaction、Tools、ResourceManager、Skills、PromptTemplates、CommandSurface、Hooks、Events、Protocol、UsageStats 等权威文档。
+- 为 ADR 0013、0017、0019、0021 增加 amendment，使旧 ADR 的局部接口草图明确服从 ADR 0023。
+- 在 round3 review 中把 BR-055 改为 `Resolved / Closed`；旧 `ResolvedPromptInput.parts` 折叠问题由 `PromptIntent -> CanonicalUserMessage` 的单一 lowering seam 取代。
+- 历史 research/review 正文没有倒改。其中 `PromptTurn`、`PromptCallProfile`、`DriveRequest`、`PromptProjection` 等旧名若出现在历史调研语境中，不代表当前权威接口；不要做全仓无差别机械重命名。
+
+### 当前权威调用链
+
+```text
+RawSubmission
+→ CommandSurface.parse_message_intent()
+→ PromptIntent
+→ ResourceManager.capture_turn_resources()
+→ TurnResourceSnapshot.prompt_view()
+→ Tools.capture_turn_tools()
+→ TurnToolProfile { prompt_view, executor, fingerprint }
+→ Prompt.prepare_message_turn(PromptResourceView + ToolPromptView)
+→ PreparedMessageTurn
+→ PreparedMessageTurn.compose_user_message(PromptIntent)
+→ CanonicalUserMessage
+→ SessionRuntime.commit_user_message()
+→ CommittedConversationState.apply_committed_messages()
+→ CommittedConversationState.build_conversation_seed()
+→ Driver.drive_conversation(DriverTurnInput, ConversationSeed)
+→ Prompt.assemble_model_context()
+→ AssembledModelContext
+→ ModelGateway.generate_model_turn()
+```
+
+工具轮和运行中输入的增量路径：
+
+```text
+ModelTurn(tool calls)
+→ SessionDriverHost.execute_and_commit_tool_round()
+→ TurnToolProfile.executor / ToolBatchInvoker
+→ SessionWriter.commit(ToolRound)
+→ CommittedConversationDelta
+→ LiveConversation.apply_committed_messages()
+→ 下一次 Prompt.assemble_model_context()
+
+Steer
+→ SessionDriverHost.commit_pending_messages()
+→ SessionRuntime commit
+→ CommittedConversationDelta
+→ LiveConversation.apply_committed_messages()
+→ 下一次 Prompt.assemble_model_context()
+
+Final assistant candidate
+→ SessionRuntime.commit_final_assistant_message()
+→ commit/apply 成功
+→ 才允许发布 completed terminal
+```
+
+### 不得回退的核心不变量
+
+- `SessionStorage` 是 durable truth；`CommittedConversationState` 是只应用成功 commit 返回值的内存热投影，不是第二个 durable owner。
+- session open/recovery 时从 storage 建立 committed projection；稳态 turn 直接从热投影构造 `ConversationSeed`，不允许每个 turn 重扫 JSONL。
+- `ConversationSeed` 是一条有序 committed transcript，当前 canonical user message 恰好出现一次；不恢复长期 `durable_history/current_input/previous_input` 多 lane。
+- Driver 的 `LiveConversation` 只能从 `ConversationSeed` 初始化，并且只能应用 `CommittedConversationDelta`；draft user/tool/steer message 不得提前对模型可见。
+- user input、完整 ToolRound、Steer 和 final assistant 都遵循 commit-before-model-visible / commit-before-terminal。
+- resources、tools 和 `PreparedMessageTurn` 只在新的 user turn / work chain 边界捕获一次；tool rounds、automatic retry、overflow recovery、active Steer 和同一公开 `RunId` 的 Rig segment rollover 复用该 captured profile。
+- 同一 captured inputs 必须生成确定、稳定的 `ModelContextProfile`；conversation 本身会随成功提交的 ToolRound、Steer 和 assistant message 增长。
+- Prompt 是 `AgentRun` 与 `CompactionSummary` 唯一回答“本次模型实际看见什么”的模块；不存在第二条 provider message assembly 路径。
+- Prompt 只接收 `PromptResourceView` 与 `ToolPromptView`，不接收完整 `TurnResourceSnapshot`、`TurnToolProfile.executor`、Tools owner、storage 或 provider handle。
+- `TurnToolProfile.prompt_view`、`executor` 和 profile 中记录的 tool fingerprint 必须一致；工具 schema/guideline 与真实执行器不得来自不同版本。
+- `MessageRecord -> ModelMessage` 的唯一转换 owner 是 Prompt；`ModelGateway` 只接收 `ModelCallRequest { input: AssembledModelContext, ... }` 并负责 provider 编码、auth、调用、fallback、usage 与错误分类。
+- MiniCore 逻辑上每次都构造完整 `AssembledModelContext`；provider continuation 只能由 adapter 在严格前缀等价时优化，不能改变逻辑 transcript。
+- tool/message finished events 只能在完整稳定单元 commit 成功且 committed delta 已应用后发布；abort/failure 的 UI lifecycle close 语义必须与 durable commit 语义区分。
+
+### Compaction 当前结论
+
+- Compaction 只决定 cut point、protected `EntryId` 和 `CompactionSummaryDirective`，不拥有独立模型调用路径。
+- 当前启动边界刚提交的 canonical user message 受 protected `EntryId` 保护，不进入同一边界的摘要目标。
+- active/pre-run compaction 复用同一 work chain 的稳定 `ModelContextProfile` 和尽可能长的 conversation prefix；standalone compaction 通过 `prepare_message_turn()` 产生确定性 profile。
+- Prompt 把 directive instruction 作为最后一条 typed user message，并使用 `OutputContract::NoToolCalls`；provider 无法保证禁用工具时必须返回 capability error，不能静默执行工具。
+- compaction commit 成功后先应用 committed delta 或在必要时 reload committed projection，再构造新的 `ConversationSeed`；旧 run 的 transient overflow error、partial assistant 和未提交状态不进入重试上下文。
+- context-limit source 统一为 `PromptAssembly | Provider`，两者共享一次有界 recovery policy，但 diagnostics 和 usage 来源保持区分。
+
+### 验证与审查结果
+
+- `git diff --check` 已通过。
+- 当前权威文档的 Markdown 相对链接检查已通过，没有 broken links。
+- 对 `CONTEXT.md`、`docs/architecture.md` 和 `docs/modules/` 做过旧 message-pipeline 术语扫描；剩余 `ActiveModelPromptProjection` / `ModelPromptProjection` 是 ResourceManager 的合法模型资源投影类型，不是旧 `project_model_call` seam。
+- 两轮独立 reviewer 复核已完成。已修复完整 resource/tool profile 泄漏到 Prompt、ToolRound finished event 早于 commit、Compaction profile 策略冲突、`ModelCallPurpose` 重复、`MessageRecord` 泄漏到 gateway、`prepared_message_turn/system_profile/invoker` 命名残留，以及 `PromptAssembly` source 漂移。
+- 最终 reviewer 没有 blocking finding；最后三处纯术语 warning 已随后修复。
+- 因仓库没有实现代码，本轮没有代码测试；以上验证只能证明文档内部一致性，不能代替 Rig/provider integration test。
+
+### 仍未完成与不要混淆的事项
+
+- **BR-049 Deferred**：Rig 0.40.0 integration spike 仍未执行。它只验证 `driver/rig.rs` / `model_gateway/rig.rs` 私有映射：完整 history seed、Rig `{ history, prompt }` split、`full_history()`、`ModelTurn`、usage、tool names、`NeedsResolution`、`preresolved_result` 和 committed Steer segment rollover。
+- **BR-050 Deferred**：MVP 不启用通用 `bash`；未来启用 external executor 前必须先完成 OS enforcement capability gate。
+- **BR-051 / BR-052 Deferred**：进入任何生产纵切前必须做全仓 interface contract closure 与 MVP command payload/reachability review。重点是 `ToolBatchResult`、Driver errors/checkpoints/limits、sink 方法集、`UserInput`、`StreamOptions`、`ThinkingLevel` 和不可达的 `ResumeRun`。
+- **仍 Open 的文档问题**：BR-056 retry attempt 跨 compaction 配对、BR-058 future protocol surface 裁边、BR-060 assistant-finished/usage event test rule、BR-061 post-MVP hook 与 MVP tool event 分界、BR-063 fingerprint/revision/token canonical algorithm、BR-064 Windows path 与 JSONL 单写入者、BR-065 skill 附件复现边界与命名双轨。
+- **BR-059 Partially Resolved**：只剩旧 review/example 的 `open_handle/create_handle` 方法名机械统一；list request 形状已经定型，不应重开。
+- historical review 中把 Rig spike 写成“ADR 0023 的前置 blocker”的段落是当时研究暂停点，已被本节和 ADR 0023 修正：public seam 已接受，spike 仅能验证或局部调整 private adapter。
+
+### 建议下一步顺序
+
+1. 先处理 BR-056、BR-058、BR-059、BR-060、BR-061、BR-063、BR-064、BR-065，减少进入实现前仍可机械关闭的文档歧义。
+2. 联合执行 BR-051 / BR-052 contract closure review，为首批代码冻结 owner、字段、不变量、typed errors、cancel/partial semantics、protocol payload 和 command reachability。
+3. 做隔离的 Rig 0.40.0 integration spike。spike 可以先于生产纵切验证 private mapping，但不得创建第二套 MiniCore public message/history seam。
+4. spike 通过后精确 pin rig-core 版本并提交 lockfile，再按 ADR 0014 的 spine-first 顺序建立 `ModelGateway`、provider-neutral message 类型和 text-only Driver vertical slice。
+5. 以 commit gate 建立最小 conformance matrix：UserInput、ToolRound、Steer、Compaction、AssistantFinal、abort/failure、overflow recovery、segment rollover、session reopen/recovery。
+6. 首个纵切跑通后再扩展 tools/approval、dynamic context、provider continuation 和 post-MVP hooks；不要在 MVP spine 前实现完整 future surface。
+
+### 换机后优先阅读顺序
+
+1. 本节：当前 Git/状态/下一步。
+2. [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)：接受决策和 public invariants。
+3. [Architecture Message Pipeline](../architecture.md#message-pipeline)：端到端调用方向。
+4. [Prompt](../modules/prompt.md)、[SessionRuntime](../modules/session-runtime.md)、[Driver](../modules/driver.md)：核心 owner 与运行时交互。
+5. [SessionManager](../modules/session-manager.md)、[Tools](../modules/tools.md)、[ModelGateway](../modules/model-gateway.md)、[Compaction](../modules/compaction.md)：commit、execution、provider 与 recovery 细节。
+6. [Round3 Review Issues](system-blueprint-review-issues-round3.md)：当前 Open/Deferred issue，不要只读上方旧研究暂停点。
+7. [Cross-Project Study](../research/message-assembly-cross-project-study.md)：需要追溯 pi、Codex、Claude Code 对照依据时再读。
