@@ -1,28 +1,28 @@
-# Message Cycle Architecture
+# Message Cycle 架构设计
 
-Status: Target architecture under review; authoritative-doc migration not started  
-Date: 2026-07-15  
-Branch: `refactor/codex-style-message-cycle`  
-Base: `d2babbd docs(progress): archive message execution lifecycle research`
+状态：目标架构评审中；尚未开始迁移权威文档
+日期：2026-07-15
+分支：`refactor/codex-style-message-cycle`
+基线：`d2babbd docs(progress): archive message execution lifecycle research`
 
-## Purpose
+## 目的
 
-This is the first target architecture document under `docs/refactor/`. It starts with MiniCore's Message Cycle and will act as the anchor for adjacent Session, Item, Interaction, storage, Prompt, Driver, and protocol refactor documents as those areas are reviewed.
+这是 `docs/refactor/` 下第一份目标架构设计文档。重构将从 MiniCore 的 Message Cycle 开始；随着评审推进，再以本文为入口，逐步扩展 Session、Item、Interaction、Storage、Prompt、Driver 和 Protocol 等周边架构。
 
-This document defines and tracks the refactor of MiniCore's outer message execution lifecycle to the Codex App Server model. It is an architecture design document first and a migration tracker second.
+本文首先是一份目标架构设计，其次才是迁移追踪文档。它定义并追踪 MiniCore 外层消息执行生命周期向 Codex App Server 模型的重构。
 
-The target deliberately ignores the current `SessionPhase + CurrentRunState + RunEvent + MessageEvent + ToolCallEvent + RetryEvent + CompactionEvent` shape. The refactor may replace those interfaces rather than adapt them incrementally.
+目标设计不受当前 `SessionPhase + CurrentRunState + RunEvent + MessageEvent + ToolCallEvent + RetryEvent + CompactionEvent` 结构约束。重构可以直接替换这些 interface，而不是在旧结构上继续增加兼容层。
 
-Until the migration reaches the acceptance criteria at the end of this document:
+在本文末尾的验收标准全部满足之前：
 
-- existing ADRs, `CONTEXT.md`, and module documents still describe the current authoritative architecture;
-- this file describes the selected target architecture and migration strategy;
-- historical research/review text remains unchanged;
-- no partially migrated vocabulary should be treated as a stable public contract.
+- 现有 ADR、`CONTEXT.md` 和模块文档仍然描述当前权威架构；
+- 本文描述已经选定的目标架构和迁移策略；
+- 历史 research/review 正文保持不变；
+- 迁移到一半的术语不得被视为稳定公共契约。
 
-## Decision Summary
+## 决策摘要
 
-MiniCore will adopt the Codex outer lifecycle semantics, with one naming substitution:
+MiniCore 完整采用 Codex 的外层生命周期语义，只做一个命名替换：
 
 ```text
 Codex Thread → MiniCore Session
@@ -30,42 +30,42 @@ Codex Turn   → MiniCore Turn
 Codex Item   → MiniCore Item
 ```
 
-Approval and other user interactions use the Codex server-request model rather than an event-plus-command pair.
+Approval 和其他用户交互采用 Codex 的 server request 模型，不再使用“事件 + 普通命令”的配对模型。
 
-The common identity shared by all Sessions in one fork tree is named `TreeId`.
+一个 fork tree 中所有 Session 共享的根身份统一命名为 `TreeId`。
 
-The target hierarchy is:
+目标层级：
 
 ```text
 Tree
   └─ Session
       └─ Turn
           └─ Item
-              └─ optional server request
+              └─ 可选 server request
 ```
 
-## Target Vocabulary
+## 目标术语
 
-| Term | Meaning |
+| 术语 | 含义 |
 | --- | --- |
-| `TreeId` | Stable identity shared by the root Session and all Sessions forked from that root. It is the fork-tree identity that Codex exposes as `thread.sessionId`. |
-| `SessionId` | Identity of one concrete conversation branch. It corresponds to Codex `thread.id`, not Codex `thread.sessionId`. |
-| `Session` | Persistent conversation branch plus its optional loaded runtime state. Corresponds to Codex Thread. |
-| `TurnId` | Identity of one Turn inside one Session. |
-| `Turn` | One serialized execution lifecycle within a Session. Agent work, standalone compaction, and future review work can have different Turn types. |
-| `ItemId` | Identity of one user-visible input, output, tool operation, file change, reasoning block, plan, or compaction item inside a Turn. |
-| `Item` | A streamable unit of Turn input or output. Items have one started/completed lifecycle and optional typed deltas. |
-| `RequestId` | Correlation identity for one server-initiated request that requires a client response. |
-| `Interaction` | A request/response exchange that temporarily blocks or informs an Item, such as approval or user input. |
-| `EntryId` | Internal durable session-tree coordinate. It is not the public Item lifecycle identity. |
-| `ToolCallId` | Provider/tool-protocol identity used to pair one tool request and result. It can appear inside a ToolCall Item. |
+| `TreeId` | root Session 与从它 fork 出来的所有 Session 共享的稳定身份。对应 Codex 的 `thread.sessionId`。 |
+| `SessionId` | 一条具体 conversation branch 的身份。对应 Codex 的 `thread.id`，不是 Codex 的 `thread.sessionId`。 |
+| `Session` | 一条持久化 conversation branch，以及可选的 loaded runtime 状态。对应 Codex Thread。 |
+| `TurnId` | 一个 Session 中一次 Turn 的身份。 |
+| `Turn` | Session 内一次串行执行生命周期。Agent 工作、standalone compaction 和未来 review 可以使用不同的 Turn type。 |
+| `ItemId` | Turn 中一项用户可观察输入或输出的身份，例如消息、工具执行、文件修改、reasoning、plan 或 compaction。 |
+| `Item` | Turn 中可流式观察的一项输入或输出。每个 Item 只有一组 started/completed 生命周期，并可产生 typed delta。 |
+| `RequestId` | 一次 server-initiated request 的关联身份；该 request 必须由客户端响应或由 Runtime 清除。 |
+| `Interaction` | 临时阻塞或补充某个 Item 的 request/response 交互，例如 approval 或用户输入请求。 |
+| `EntryId` | Runtime 内部的持久化 session-tree 坐标，不是公共 Item 生命周期身份。 |
+| `ToolCallId` | provider/tool protocol 用来配对一次工具请求和结果的身份，可以出现在 ToolCall Item 内。 |
 
-Root and fork identity rules:
+root 与 fork 身份规则：
 
 ```text
 root Session:
   SessionId = S1
-  TreeId    = S1  // same underlying root identity, distinct typed role
+  TreeId    = S1  // 底层根身份相同，但类型角色不同
 
 forked Session:
   SessionId = S2
@@ -73,9 +73,9 @@ forked Session:
   forked_from_session_id = S1
 ```
 
-`TreeId` is not used for Turn routing, Item routing, approval decisions, current-session selection, or storage leaf navigation.
+`TreeId` 不用于 Turn 路由、Item 路由、approval 决策、current-session selection 或 storage leaf navigation。
 
-## Target State Model
+## 目标状态模型
 
 ### Session
 
@@ -95,26 +95,26 @@ pub enum SessionActiveFlag {
 }
 ```
 
-State meanings:
+状态含义：
 
-| State | Meaning | Owned runtime state |
+| 状态 | 含义 | 拥有的运行时状态 |
 | --- | --- | --- |
-| `NotLoaded` | Session exists in persistent storage/catalog but has no loaded runtime. | No active Turn, no pending server request, no runtime actor state. |
-| `Idle` | Session runtime is loaded and can start a Turn. | No `InProgress` Turn and no pending server request. |
-| `Active` | Session has exactly one `InProgress` Turn. | Current Turn, live Item projections, zero or more pending server requests, aggregate active flags. |
-| `SystemError` | Session runtime itself cannot safely continue. | Diagnostic/recovery information. Ordinary Turn failure does not produce this state. |
+| `NotLoaded` | Session 存在于持久化 storage/catalog，但没有 loaded runtime。 | 没有 active Turn、pending server request 或 runtime actor state。 |
+| `Idle` | Session runtime 已加载，可以启动 Turn。 | 没有 `InProgress` Turn，也没有 pending server request。 |
+| `Active` | Session 恰好有一个 `InProgress` Turn。 | current Turn、live Item projection、零到多个 pending server request 和 aggregate active flags。 |
+| `SystemError` | Session runtime 自身无法安全继续。 | diagnostics 和 recovery information。普通 Turn failure 不会产生该状态。 |
 
-`active_flags` is an aggregate projection:
+`active_flags` 是聚合投影：
 
 ```text
-WaitingOnApproval exists
-  iff at least one current pending request requires approval.
+存在至少一个 pending approval request
+  ↔ active_flags 包含 WaitingOnApproval
 
-WaitingOnUserInput exists
-  iff at least one current pending request requires user input.
+存在至少一个 pending user-input request
+  ↔ active_flags 包含 WaitingOnUserInput
 ```
 
-Retry, provider fallback, model calls, tool execution, and required compaction are not Session states or active flags.
+Retry、provider fallback、model call、tool execution 和 required compaction 都不是 Session 状态，也不是 active flag。
 
 ### Turn
 
@@ -127,41 +127,41 @@ pub enum TurnStatus {
 }
 ```
 
-Turn terminal states are immutable. Every started Turn reaches exactly one terminal state.
+Turn terminal state 不可修改。每个已经 started 的 Turn 必须恰好到达一个 terminal state。
 
-Target Turn types (`turnType` on the public protocol):
+目标 Turn type，公共协议字段使用 `turnType`：
 
 ```rust
 pub enum TurnType {
     Agent,
     Compaction,
-    Review, // reserved for later work
+    Review, // 为后续能力保留
 }
 ```
 
-| Turn type | Steerable | Meaning |
+| Turn type | 是否可 Steer | 含义 |
 | --- | --- | --- |
-| `Agent` | Yes while active | A user request and all agent work that follows, including Steer, internal retries, and required overflow recovery. |
-| `Compaction` | No | Standalone/manual session compaction. Required compaction during an Agent Turn is an Item in that Agent Turn, not a new Turn. |
-| `Review` | No by default | Future review workflow following the Codex non-steerable Turn model. |
+| `Agent` | Active 时可以 | 一次用户请求及其后续所有 Agent 工作，包括 Steer、内部 retry 和 required overflow recovery。 |
+| `Compaction` | 不可以 | Standalone/manual session compaction。Agent Turn 中的 required compaction 是该 Agent Turn 内的 Item，不创建新 Turn。 |
+| `Review` | 默认不可以 | 未来 review workflow，遵循 Codex non-steerable Turn 模型。 |
 
 ### Item
 
-Public Item lifecycle:
+公共 Item 生命周期：
 
 ```text
 item/started
-→ zero or more typed item deltas
-→ optional server request/response interaction
+→ 零到多个 typed item delta
+→ 可选 server request/response interaction
 → item/completed
 ```
 
-There is no separate generic `item/failed` notification. The final Item payload carried by `item/completed` contains the item-specific status.
+不定义通用 `item/failed` notification。`item/completed` 携带的最终 Item payload 包含 item-specific status。
 
-Initial Item kinds:
+初始 Item type：
 
 ```rust
-pub enum ItemKind {
+pub enum ItemType {
     UserMessage,
     AgentMessage,
     Reasoning,
@@ -173,19 +173,19 @@ pub enum ItemKind {
 }
 ```
 
-Indicative item-specific terminal statuses:
+Item-specific terminal status：
 
-| Item kind | Terminal payload status |
+| Item type | 最终 payload status |
 | --- | --- |
-| `UserMessage` | committed, failed, or cancelled |
-| `AgentMessage` | completed or cancelled |
-| `Reasoning` / `Plan` | completed or cancelled |
-| `CommandExecution` | completed, failed, declined, or cancelled |
-| `FileChange` | completed, failed, declined, or cancelled |
-| `ToolCall` | completed, failed, declined, or cancelled |
-| `ContextCompaction` | completed, failed, skipped, or cancelled |
+| `UserMessage` | committed、failed 或 cancelled |
+| `AgentMessage` | completed 或 cancelled |
+| `Reasoning` / `Plan` | completed 或 cancelled |
+| `CommandExecution` | completed、failed、declined 或 cancelled |
+| `FileChange` | completed、failed、declined 或 cancelled |
+| `ToolCall` | completed、failed、declined 或 cancelled |
+| `ContextCompaction` | completed、failed、skipped 或 cancelled |
 
-Typed delta families may remain item-specific, as in Codex:
+Typed delta family 可以像 Codex 一样保持 item-specific：
 
 ```text
 item/agentMessage/delta
@@ -195,22 +195,28 @@ item/fileChange/delta
 item/tool/outputDelta
 ```
 
-The common lifecycle remains `item/started` and `item/completed`.
+公共生命周期仍然只有 `item/started` 和 `item/completed`。
 
 ### Interaction
 
-Interaction is a bidirectional transport lifecycle, not a Turn or Item status enum:
+Interaction 是双向 transport lifecycle，不是 Turn 或 Item 的 status enum：
 
 ```text
 server request created
 → Pending
-→ optional client response
+→ 可选 client response
 → Resolved
 ```
 
-A request can resolve without a client response when its Turn is interrupted, its Item is cancelled, the Session closes, a timeout/auto-resolution fires, or a system error clears the waiter.
+以下情况可以在没有 client response 时直接 resolve request：
 
-Target request methods:
+- Turn 被 interrupt；
+- Item 被 cancel；
+- Session close；
+- timeout 或 auto-resolution；
+- system error 清除 waiter。
+
+目标 request method：
 
 ```text
 item/commandExecution/requestApproval
@@ -219,9 +225,9 @@ item/permissions/requestApproval
 item/tool/requestUserInput
 ```
 
-`item/permissions/requestApproval` is a request namespace attached to the existing Item that invoked the built-in permission request, normally a ToolCall/CommandExecution Item. It does not introduce a separate `Permissions` Item kind.
+`item/permissions/requestApproval` 是绑定到现有 Item 的 request namespace，通常绑定触发内置权限请求的 ToolCall/CommandExecution Item。它不会新增独立的 `Permissions` Item type。
 
-Each request carries:
+每个 request 携带：
 
 ```text
 RequestId
@@ -229,20 +235,20 @@ SessionId
 TurnId
 ItemId
 typed request payload
-available decisions, where applicable
+available decisions（如适用）
 ```
 
-Resolution is confirmed with:
+Request 关闭后发布：
 
 ```text
 serverRequest/resolved
 ```
 
-`resolved` means the waiter was closed. It does not mean the request was approved.
+`resolved` 只表示 waiter 已关闭，不表示 request 已被批准。
 
-## Target Public Protocol
+## 目标公共协议
 
-### Session Methods And Notifications
+### Session Method 与 Notification
 
 ```text
 session/start
@@ -261,9 +267,9 @@ session/status/changed
 session/closed
 ```
 
-The exact MVP subset will be selected during protocol migration. Method names above preserve Codex semantics after replacing Thread with Session.
+协议迁移时再确定 MVP 的精确子集。上述名称保持 Codex 语义，只把 Thread 替换为 Session。
 
-### Turn Methods And Notifications
+### Turn Method 与 Notification
 
 ```text
 turn/start
@@ -274,40 +280,40 @@ turn/started
 turn/completed
 ```
 
-Turn invariants:
+Turn 不变量：
 
-- only one Turn can be `InProgress` in one Session;
-- `turn/steer` targets the active steerable Agent Turn and returns the same `TurnId`;
-- `turn/interrupt` targets the active Turn;
-- `turn/completed` is emitted exactly once;
-- retry and required recovery do not create a new Turn;
-- terminal Turn status is `Completed | Interrupted | Failed`;
-- completed/failed/interrupted Turns are immutable history.
+- 一个 Session 同时最多有一个 `InProgress` Turn；
+- `turn/steer` 只能作用于 active、steerable 的 Agent Turn，并返回同一个 `TurnId`；
+- `turn/interrupt` 作用于 active Turn；
+- `turn/completed` 恰好发布一次；
+- retry 和 required recovery 不创建新 Turn；
+- terminal Turn status 只能是 `Completed | Interrupted | Failed`；
+- completed、failed、interrupted Turn 都是不可修改的历史事实。
 
-### Item Notifications
+### Item Notification
 
 ```text
 item/started
-item/<kind>/delta
+item/<type>/delta
 item/completed
 ```
 
-Every Item notification carries `SessionId`, `TurnId`, and `ItemId`.
+每个 Item notification 都携带 `SessionId`、`TurnId` 和 `ItemId`。
 
-### Server Requests
+### Server Request
 
 ```text
-item/<kind>/requestApproval
+item/<type>/requestApproval
 item/tool/requestUserInput
 client response keyed by RequestId
 serverRequest/resolved
 ```
 
-Server requests are not notifications and are not answered with an ordinary session mutation command.
+Server request 不是 notification，也不能通过普通 session mutation command 回答。
 
-## Complete Lifecycles
+## 完整生命周期
 
-### Session Load And Unload
+### Session Load 与 Unload
 
 ```text
 persistent Session exists
@@ -323,9 +329,9 @@ last subscriber removed + unload policy fires
 → session/closed
 ```
 
-`session/read` does not load the Session or subscribe the caller. A read-only result can report `NotLoaded`.
+`session/read` 不会加载 Session，也不会自动订阅 caller。Read-only result 可以报告 `NotLoaded`。
 
-### Normal Agent Turn
+### 正常 Agent Turn
 
 ```text
 Session: Idle
@@ -350,7 +356,7 @@ turn/start(input)
 → Session: Idle
 ```
 
-If user-input persistence fails after Turn admission:
+如果 Turn admission 后 user-input persistence 失败：
 
 ```text
 turn/started
@@ -372,12 +378,12 @@ turn/steer(T1, input)
 → validate T1 is current and steerable
 → accept input into the same Turn
 → item/started(UserMessage)
-→ persist user item at the valid model/tool boundary
+→ persist user item at a valid model/tool boundary
 → item/completed(UserMessage { committed })
 → continue T1
 ```
 
-Steer never silently becomes a future Turn. Invalid or non-steerable targets return a typed rejection.
+Steer 绝不能静默转换成 future Turn。目标无效或 Turn 不可 Steer 时返回 typed rejection。
 
 ### Command Approval
 
@@ -398,7 +404,7 @@ client response(A1, Accept | AcceptForSession | Decline | Cancel)
 
 Accept:
   execute command
-  → item deltas*
+  → item delta*
   → item/completed(I1 { completed | failed })
 
 AcceptForSession:
@@ -414,9 +420,13 @@ Cancel:
   → Turn becomes Interrupted
 ```
 
-The target follows Codex command/file approval semantics: `Decline` rejects the Item and allows the Turn to continue; `Cancel` rejects the Item and immediately interrupts the Turn. Other future request families must define their own typed decision semantics rather than inherit these outcomes implicitly.
+目标设计遵循 Codex command/file approval 语义：
 
-The runtime owns pending approval state, frozen execution data, validation, policy/cache mutation, execution, and status projection. The client owns only presentation and collection of the user's response.
+- `Decline` 拒绝当前 Item，但允许 Turn 继续；
+- `Cancel` 拒绝当前 Item，并立即 interrupt Turn；
+- 未来其他 request family 必须定义自己的 typed decision semantics，不能隐式继承这组行为。
+
+Runtime 拥有 pending approval state、frozen execution data、validation、policy/cache mutation、execution 和 status projection。客户端只负责展示并收集用户 response。
 
 ### User-Input Request
 
@@ -438,11 +448,11 @@ item/started(ToolCall)
 → optional approval request
 → execute tool
 → item/tool/outputDelta*
-→ persist the stable model-visible tool fact(s)
+→ persist stable model-visible tool facts
 → item/completed(ToolCall { completed | failed | declined | cancelled })
 ```
 
-MiniCore may keep a stricter internal stable-batch contract than Codex. That internal contract must not expand the public outer lifecycle.
+MiniCore 内部可以保留比 Codex 更严格的 stable-batch contract，但该内部契约不得扩大公共外层生命周期。
 
 ### Turn Interrupt
 
@@ -454,13 +464,13 @@ turn/interrupt(T1)
 → cancel active work
 → resolve/clear all pending requests in T1
 → serverRequest/resolved* for cleared requests
-→ complete/cancel any publicly started Item lifecycle as required
+→ complete/cancel publicly started Item lifecycle as required
 → Turn: Interrupted
 → turn/completed(T1)
 → Session: Idle
 ```
 
-Committed history remains committed. Partial/uncommitted work follows the internal storage recovery contract.
+已经 committed 的历史继续保留。Partial/uncommitted work 遵循内部 storage recovery contract。
 
 ### Turn Failure
 
@@ -474,9 +484,9 @@ Turn T1: InProgress
 → Session: Idle
 ```
 
-Ordinary Turn failure does not make the Session `SystemError`.
+普通 Turn failure 不会令 Session 进入 `SystemError`。
 
-### Required Compaction During Agent Turn
+### Agent Turn 内的 Required Compaction
 
 ```text
 Session: Active
@@ -486,20 +496,20 @@ Agent Turn T1: InProgress
 → compact/rebuild internal model context
 → item/completed(ContextCompaction { completed | failed | skipped })
 
-success:
+completed:
   continue T1
 
 skipped:
-  continue T1 only when compaction was optional or the rebuilt context already fits;
-  required recovery that remains over limit fails the Turn
+  optional compaction 或 rebuilt context 已经可容纳时继续 T1；
+  required recovery 后仍超限时令 Turn Failed
 
-required failure:
+failed:
   Turn T1 → Failed
   → turn/completed
   → Session: Idle
 ```
 
-No new Turn and no separate Session compaction phase are created.
+不会创建新 Turn，也不会创建独立 Session compaction phase。
 
 ### Standalone Manual Compaction
 
@@ -507,7 +517,10 @@ No new Turn and no separate Session compaction phase are created.
 Session: Idle
 
 session/compact/start
-→ create non-steerable Turn T2 { kind: Compaction, status: InProgress }
+→ create non-steerable Turn T2 {
+      turnType: Compaction,
+      status: InProgress
+   }
 → Session: Active
 → turn/started(T2)
 → item/started(ContextCompaction)
@@ -518,7 +531,7 @@ session/compact/start
 
 ### Retry
 
-Retry is an internal attempt inside one active Agent Turn:
+Retry 是 active Agent Turn 内部的一次 attempt：
 
 ```text
 Turn T1: InProgress
@@ -527,14 +540,14 @@ Turn T1: InProgress
 → T1 remains InProgress
 ```
 
-Retry does not create:
+Retry 不会创建：
 
-- a new Turn;
-- a new Session status;
-- a Session active flag;
-- a public retry lifecycle that competes with Turn lifecycle.
+- 新 Turn；
+- 新 Session status；
+- Session active flag；
+- 与 Turn lifecycle 竞争的公共 retry lifecycle。
 
-Retry diagnostics or progress may be exposed as item-specific progress or diagnostic notifications if a product surface requires it.
+如果产品界面确实需要，可以把 retry diagnostics/progress 投影成 item-specific progress 或 diagnostics notification。
 
 ### Session System Error
 
@@ -546,60 +559,61 @@ Session: NotLoaded | Idle | Active
 → Session: SystemError
 ```
 
-Recovery/reload semantics must be specified before `SystemError` is exposed as a stable public state.
+在 `SystemError` 成为稳定公共状态前，必须先定义 recovery/reload semantics。
 
-## Scheduling Semantics
+## 调度语义
 
-Full Codex outer-loop adoption removes MiniCore's current `Steer / FollowUp / NextTurn` core queue taxonomy from the target public contract.
+完整采用 Codex outer loop 后，MiniCore 当前 `Steer / FollowUp / NextTurn` core queue taxonomy 不再进入目标公共契约。
 
-Target behavior:
+目标行为：
 
-- `turn/start` starts a new Turn only when the Session can start one;
-- `turn/steer` modifies the current active steerable Turn;
-- `turn/interrupt` interrupts the current Turn;
-- a client that wants follow-up behavior waits for `turn/completed` and then calls `turn/start`;
-- a client may keep unsent drafts locally;
-- MiniCore core does not silently reinterpret start as steer, steer as follow-up, or follow-up as a local draft.
+- `turn/start` 只在 Session 可以启动新 Turn 时启动；
+- `turn/steer` 修改当前 active、steerable Turn；
+- `turn/interrupt` interrupt 当前 Turn；
+- 客户端若需要 follow-up 行为，应等待 `turn/completed`，再调用 `turn/start`；
+- 客户端可以在本地保存未发送草稿；
+- MiniCore core 不会把 start 静默解释为 steer，也不会把 steer 解释为 follow-up；
+- baseline 架构不提供 server-owned FollowUp/NextTurn queue。
 
-If server-side queued future Turns are later required, they must be designed as a deliberate extension with their own receipt/queue contract. They are not part of this refactor baseline.
+未来若确实需要 server-side queued future Turn，必须作为独立扩展设计自己的 receipt/queue contract，不属于本次重构 baseline。
 
-## Runtime Ownership
+## Runtime 职责
 
-| Concern | Owner |
+| 关注点 | Owner |
 | --- | --- |
-| Session status and active flags | Runtime Session owner |
-| Current Turn and terminal transition | Runtime Session owner |
+| Session status 和 active flags | Runtime Session owner |
+| Current Turn 和 terminal transition | Runtime Session owner |
 | Item lifecycle projection | Runtime Turn/Item projector |
 | Pending server request | Runtime interaction/request owner |
-| Approval policy and frozen execution data | Tools/policy owner behind the runtime request |
-| Client response presentation | Client/UI |
-| Response validation and application | Runtime |
+| Approval policy 和 frozen execution data | Runtime request 背后的 Tools/policy owner |
+| Client response 展示 | Client/UI |
+| Response validation 和 application | Runtime |
 | Durable transcript | Session storage owner |
 | Model-visible context assembly | Prompt owner |
 | Provider invocation | Model gateway owner |
 
-The client never mutates Session, Turn, Item, or request state directly. It sends methods or responses; the runtime validates them and publishes the resulting facts.
+客户端绝不能直接 mutate Session、Turn、Item 或 request state。客户端只能发送 method 或 response；Runtime 负责校验，并发布转换后的事实。
 
-## Current-To-Target Mapping
+## 当前模型到目标模型的映射
 
-| Current MiniCore | Target |
+| 当前 MiniCore | 目标模型 |
 | --- | --- |
 | `SessionPhase::Idle` | `SessionStatus::Idle` |
 | `SessionPhase::Turn` | `SessionStatus::Active` + current `Turn` |
-| `SessionPhase::Compaction` | Compaction Turn or ContextCompaction Item |
-| `SessionPhase::RetryBackoff` | Internal attempt inside active Turn |
-| `CurrentRunState` | Session active flags + current Turn/Item/request projections |
+| `SessionPhase::Compaction` | Compaction Turn 或 ContextCompaction Item |
+| `SessionPhase::RetryBackoff` | Active Turn 内部 attempt |
+| `CurrentRunState` | Session active flags + current Turn/Item/request projection |
 | `RunId` | `TurnId` |
 | `RunView` | `Turn` / `TurnView` |
 | `RunTerminalStatus` | `TurnStatus` |
 | `AbortRun` | `turn/interrupt` |
 | `SubmitPrompt` idle path | `turn/start` |
 | `SubmitPrompt { Steer }` | `turn/steer` |
-| FollowUp/NextTurn queues | Removed from baseline core contract |
+| FollowUp/NextTurn queues | 从 baseline core contract 删除 |
 | `RunEvent::Started/Finished` | `turn/started` / `turn/completed` |
 | `MessageEvent` | UserMessage/AgentMessage Item lifecycle |
 | `ToolCallEvent` | ToolCall/CommandExecution/FileChange Item lifecycle |
-| `RetryEvent` | Removed from baseline public lifecycle |
+| `RetryEvent` | 从 baseline public lifecycle 删除 |
 | `CompactionEvent` | ContextCompaction Item lifecycle |
 | `ApprovalRequested` event | Item-scoped server request |
 | `DecideToolApproval` command | Client response to `RequestId` |
@@ -608,9 +622,9 @@ The client never mutates Session, Turn, Item, or request state directly. It send
 | Codex `thread.id` equivalent | MiniCore `SessionId` |
 | Codex `thread.sessionId` equivalent | MiniCore `TreeId` |
 
-## Naming Migration
+## 命名迁移
 
-Expected renames include:
+预计需要执行以下重命名：
 
 ```text
 RunId                       → TurnId
@@ -622,7 +636,7 @@ run_finished                → turn_completed
 AbortRun                    → turn/interrupt
 ```
 
-The current model-call name `ModelTurn` conflicts with public Turn and must be removed or renamed:
+当前 model-call 名称 `ModelTurn` 会与公共 Turn 冲突，必须删除或重命名：
 
 ```text
 ModelTurn                   → ModelResponse
@@ -630,7 +644,7 @@ generate_model_turn         → generate_model_response
 ConversationRunResult       → TurnExecutionOutcome or DriverOutcome
 ```
 
-Private implementation terms may remain explicitly private:
+以下实现术语可以保留，但必须保持 private：
 
 ```text
 Turn attempt
@@ -640,224 +654,224 @@ segment_index
 execution_epoch
 ```
 
-## Removal Candidates
+## 删除候选
 
-The refactor should prefer deletion over compatibility layering. Candidates:
+重构应优先删除旧模型，而不是叠加 compatibility layer。候选项：
 
-- `SessionPhase::{Turn, Compaction, RetryBackoff}`;
-- `CurrentRunState::{Running, WaitingApproval, Suspended}` as the main public projection;
-- public `RunId`, `RunView`, and `RunEvent` vocabulary;
-- message-role-specific started/delta/finished event families;
-- tool-specific public lifecycle duplication where Item lifecycle suffices;
-- public retry lifecycle events;
-- independent automatic-compaction Session phase;
-- `ApprovalRequested` event plus `DecideToolApproval` command pairing;
-- runtime-owned FollowUp/NextTurn queue semantics;
-- public workflow types whose only purpose was coordinating the old phase model.
+- `SessionPhase::{Turn, Compaction, RetryBackoff}`；
+- 作为主要公共投影的 `CurrentRunState::{Running, WaitingApproval, Suspended}`；
+- 公共 `RunId`、`RunView` 和 `RunEvent` 术语；
+- 按 message role 复制的 started/delta/finished event family；
+- 可以被 Item lifecycle 覆盖的 tool-specific public lifecycle；
+- public retry lifecycle event；
+- 独立 automatic-compaction Session phase；
+- `ApprovalRequested` event + `DecideToolApproval` command 配对；
+- runtime-owned FollowUp/NextTurn queue semantics；
+- 仅用于协调旧 phase 模型的 public workflow type。
 
-Compatibility aliases should only be added when a concrete external adapter requires a staged migration. This docs-only repository currently has no production protocol consumer that justifies carrying both models.
+只有在存在真实外部 adapter、必须分阶段迁移时，才允许增加 compatibility alias。当前仓库仍是 docs-only，没有生产 protocol consumer 可以证明维护两套模型是合理的。
 
-## Internal Architecture Freedom
+## 内部架构自由度
 
-The target outer model does not pre-decide the final internal implementation.
+目标 outer model 不提前决定最终内部实现。
 
-The implementation may retain or replace:
+实现可以保留、替换或重构：
 
-- per-session actor ownership;
-- RunTask/TurnTask child execution;
-- Rig adapter internals;
-- Transcript-First storage;
-- batch writer semantics;
-- Prompt ownership;
-- tool execution and approval internals;
-- JSONL or future SQLite storage.
+- per-session actor ownership；
+- RunTask/TurnTask child execution；
+- Rig adapter internals；
+- Transcript-First storage；
+- batch writer semantics；
+- Prompt ownership；
+- tool execution 和 approval internals；
+- JSONL 或未来 SQLite storage。
 
-Internal modules must project exactly one target Session/Turn/Item/Interaction lifecycle and must not leak internal steps into the public interface.
+内部模块必须只投影一套目标 Session/Turn/Item/Interaction 生命周期，不得把内部步骤泄漏进公共 interface。
 
-## Migration Plan
+## 迁移计划
 
-### Phase 0: Contract Freeze
+### Phase 0：冻结旧契约扩张
 
-- Treat this file as the target source during review.
-- Do not add new fields to the old phase/run/event model unless required to document migration evidence.
-- Resolve all open questions listed below.
+- 评审期间以本文作为 target source。
+- 除非为了记录迁移证据，否则不再给旧 phase/run/event 模型增加字段。
+- 先解决本文列出的所有未决问题。
 
-### Phase 1: Domain And ADR Decision
+### Phase 1：Domain 与 ADR 决策
 
-- Add `TreeId`, Session, Turn, Item, and Interaction glossary definitions.
-- Create a new Accepted ADR for Codex-style outer lifecycle adoption.
-- Amend superseded ADRs, especially actor/run execution, prompt/history, and event protocol decisions.
+- 在 glossary 中增加 `TreeId`、Session、Turn、Item 和 Interaction 定义。
+- 新增 Accepted ADR，正式接受 Codex-style outer lifecycle。
+- 修订被 supersede 的 ADR，重点包括 actor/run execution、prompt/history 和 event protocol。
 
-### Phase 2: Protocol Shape
+### Phase 2：Protocol Shape
 
-- Define Session/Turn/Item/request public types.
-- Define method, notification, server-request, and response envelopes.
-- Define ordering and terminal invariants.
-- Define snapshot/read projections and pagination.
+- 定义 Session/Turn/Item/request 公共类型。
+- 定义 method、notification、server request 和 response envelope。
+- 定义 ordering 和 terminal invariants。
+- 定义 snapshot/read projection 和 pagination。
 
-### Phase 3: Session Projection
+### Phase 3：Session Projection
 
-- Replace `SessionPhase` with `SessionStatus`.
-- Replace `CurrentRun` with current Turn and pending request projections.
-- Make `NotLoaded` visible through session list/read without loading the runtime.
-- Define `SystemError` recovery behavior.
+- 用 `SessionStatus` 替换 `SessionPhase`。
+- 用 current Turn 和 pending request projection 替换 `CurrentRun`。
+- Session list/read 可以在不加载 runtime 的情况下展示 `NotLoaded`。
+- 定义 `SystemError` recovery behavior。
 
-### Phase 4: Turn Lifecycle
+### Phase 4：Turn Lifecycle
 
-- Replace public Run vocabulary with Turn vocabulary.
-- Make retry and required recovery internal to one Turn.
-- Model standalone compaction as a non-steerable Turn.
-- Remove server-side FollowUp/NextTurn baseline behavior.
+- 用 Turn 术语替换公共 Run 术语。
+- Retry 和 required recovery 保持在同一个 Turn 内。
+- Standalone compaction 建模为 non-steerable Turn。
+- 删除 baseline server-side FollowUp/NextTurn 行为。
 
-### Phase 5: Item Lifecycle
+### Phase 5：Item Lifecycle
 
-- Introduce `ItemId` and typed Item payloads.
-- Replace message/tool-specific public lifecycle events with Item lifecycle.
-- Define `ItemId ↔ EntryId` or `ItemId ↔ committed entries` persistence mapping.
-- Ensure public completed Item payloads can be rebuilt from persisted history where promised.
+- 引入 `ItemId` 和 typed Item payload。
+- 用 Item lifecycle 替换 message/tool-specific public lifecycle event。
+- 定义 `ItemId ↔ EntryId` 或 `ItemId ↔ committed entries` 持久化映射。
+- 在承诺可恢复的范围内，确保 completed Item payload 可以从持久化历史重建。
 
-### Phase 6: Interaction Lane
+### Phase 6：Interaction Lane
 
-- Introduce server-initiated requests and client responses.
-- Replace approval event/command pairing.
-- Add pending requests to Session snapshot/read projection.
-- Define duplicate, stale, timeout, interrupt, close, and reconnect behavior.
+- 引入 server-initiated request 和 client response。
+- 替换 approval event/command 配对。
+- 将 pending request 加入 Session snapshot/read projection。
+- 定义 duplicate、stale、timeout、interrupt、close 和 reconnect behavior。
 
-### Phase 7: Runtime Projection
+### Phase 7：Runtime Projection
 
-- Map internal model/tool/storage progress into the target lifecycle.
-- Preserve actor responsiveness while requests are pending.
-- Preserve stable commit and visibility guarantees internally without exposing commit phases.
+- 将内部 model/tool/storage progress 投影为目标生命周期。
+- Request pending 期间继续保持 actor responsiveness。
+- 内部保留 stable commit 和 visibility guarantees，但不暴露 commit phase。
 
-### Phase 8: Remove Old Model
+### Phase 8：删除旧模型
 
-- Delete superseded phase/run/message/tool/retry/compaction public types.
-- Remove compatibility prose from authoritative modules.
-- Keep historical ADR/research/review text with explicit amendments rather than rewriting history.
+- 删除被 supersede 的 phase/run/message/tool/retry/compaction 公共类型。
+- 删除权威模块中的 compatibility prose。
+- 历史 ADR/research/review 正文通过 amendment 保留，不倒改历史。
 
-### Phase 9: Verification And Handoff
+### Phase 9：验证与 Handoff
 
-- Run terminology and broken-link scans.
-- Build protocol/state/item/request conformance matrices.
-- Update progress/handoff documentation.
-- Only then begin or resume production implementation.
+- 执行 terminology 和 broken-link scan。
+- 建立 protocol/state/item/request conformance matrix。
+- 更新 progress/handoff 文档。
+- 完成后才开始或恢复生产实现。
 
 ## Conformance Matrix
 
 ### Session
 
-- persisted unread Session reports `NotLoaded` without loading runtime;
-- resume transitions `NotLoaded → Idle`;
-- one Session has at most one `InProgress` Turn;
-- Turn terminal returns Session to `Idle`;
-- ordinary Turn failure does not produce `SystemError`;
-- unload clears runtime-only requests and reports `NotLoaded`;
-- root and fork Sessions share one `TreeId` and have distinct `SessionId`s.
+- 已持久化但未加载的 Session 可以报告 `NotLoaded`，且不会因此加载 runtime；
+- resume 产生 `NotLoaded → Idle`；
+- 一个 Session 同时最多有一个 `InProgress` Turn；
+- Turn terminal 后 Session 回到 `Idle`；
+- 普通 Turn failure 不会产生 `SystemError`；
+- unload 清除 runtime-only request，并报告 `NotLoaded`；
+- root 与 fork Session 共享一个 `TreeId`，但拥有不同 `SessionId`。
 
 ### Turn
 
-- `turn/start` produces one `turn/started` and one terminal `turn/completed`;
-- `turn/steer` targets the same `TurnId`;
-- steer is rejected for non-steerable Turns;
-- `turn/interrupt` is idempotent/stale-safe;
-- retry does not change `TurnId`;
-- required compaction does not change `TurnId`;
-- standalone compaction creates a separate non-steerable Turn;
-- terminal Turn state is immutable.
+- `turn/start` 恰好产生一次 `turn/started` 和一次 terminal `turn/completed`；
+- `turn/steer` 继续使用同一个 `TurnId`；
+- non-steerable Turn 拒绝 steer；
+- `turn/interrupt` 必须 idempotent/stale-safe；
+- retry 不改变 `TurnId`；
+- required compaction 不改变 `TurnId`；
+- standalone compaction 创建独立 non-steerable Turn；
+- terminal Turn state 不可修改。
 
 ### Item
 
-- every `item/started` has exactly one `item/completed` or an explicitly documented Turn-terminal closure rule;
-- deltas only occur after started and before completed;
-- completed payload carries final item-specific status;
-- UserMessage/AgentMessage/ToolCall/Compaction item histories can be projected consistently after reload;
-- Item IDs are unique within their documented scope;
-- Item-to-storage mapping survives fork/replay according to the selected policy.
+- 每个 `item/started` 必须恰好对应一次 `item/completed`，或存在明确记录的 Turn-terminal closure rule；
+- delta 只能发生在 started 之后、completed 之前；
+- completed payload 携带最终 item-specific status；
+- UserMessage/AgentMessage/ToolCall/Compaction Item history 在 reload 后可以一致投影；
+- Item ID 在定义的 scope 内唯一；
+- Item-to-storage mapping 按选定策略支持 fork/replay。
 
 ### Interaction
 
-- request is registered before it is sent to the client;
-- Session active flag is present while matching requests are pending;
-- duplicate response does not execute twice;
-- stale Session/Turn/Item/request identity is rejected;
-- interrupt/close/system error clears pending requests;
-- every cleared request produces `serverRequest/resolved` where the connection contract permits;
-- `AcceptForSession` updates runtime-owned session policy/cache, not UI state;
-- client cannot replace frozen command/tool/file-change data in its response.
+- Request 必须先在 Runtime 登记，再发送给客户端；
+- 存在 matching pending request 时，Session 必须包含对应 active flag；
+- duplicate response 不得重复执行；
+- stale Session/Turn/Item/Request identity 必须被拒绝；
+- interrupt/close/system error 必须清除 pending request；
+- connection contract 允许时，每个被清除的 request 都发布 `serverRequest/resolved`；
+- `AcceptForSession` 更新 Runtime-owned session policy/cache，不修改 UI-owned state；
+- 客户端不得在 response 中替换 frozen command/tool/file-change data。
 
 ### Ordering
 
-- Turn starts before its first Item lifecycle;
-- Item completion precedes Turn completion;
-- pending server requests are resolved before Turn completion;
-- Session becomes Idle only after Turn completion;
-- terminal and status notifications do not refer to private attempt/segment identities;
-- committed facts are not reported as durable before the internal writer accepts them.
+- Turn 必须先于其第一个 Item lifecycle 开始；
+- Item completion 先于 Turn completion；
+- Pending server request 必须在 Turn completion 前 resolved；
+- Session 只有在 Turn completion 后才能进入 Idle；
+- terminal/status notification 不得引用 private attempt/segment identity；
+- 内部 writer 接受 stable fact 前，不得把它报告成 durable fact。
 
-## Open Decisions
+## 未决问题
 
-The outer model is selected. These details still require explicit review:
+Outer model 已经选定，以下细节仍需明确评审：
 
-1. Whether all `item/completed` durable-looking payloads are emitted only after stable storage commit, or whether a separate persistence projection is needed.
-2. Exact `ItemId ↔ EntryId` mapping for ToolCall Items that correspond to multiple stored messages/entries.
-3. Whether Item IDs are regenerated or preserved when a Session is forked into another Session in the same `TreeId`.
-4. Request resend/recovery behavior when a client connection is rebuilt while the same runtime remains alive.
-5. Whether `serverRequest/resolved` is guaranteed for requests cleared during abrupt transport loss.
-6. Exact `SystemError` entry and recovery transitions.
-7. Which Codex Item kinds are MVP and which remain reserved.
-8. Whether MiniCore exposes one generic `item/<kind>/delta` envelope or Codex-style item-specific delta method names.
-9. Whether session list/read and runtime snapshot share one Session view type or use separate summary/detail projections.
-10. How TreeId and SessionId are persisted in JSONL headers and regenerated during external import.
-11. Whether client-side follow-up scheduling is sufficient for all first-party adapters; server-side queued Turns require a separate future decision.
-12. Exact decision sets and timeout/auto-resolution semantics for permission requests and `requestUserInput` interactions.
+1. 所有看起来 durable 的 `item/completed` payload 是否必须等 stable storage commit 后才能发布，还是需要独立 persistence projection。
+2. 一个 ToolCall Item 对应多条 stored message/entry 时，`ItemId ↔ EntryId` 如何精确映射。
+3. 一个 Session fork 到同一 `TreeId` 下的另一个 Session 时，Item ID 是重新生成还是保留。
+4. 同一 Runtime 仍存活、client connection 重建时，pending request 如何 resend/recover。
+5. Request 因 abrupt transport loss 被清除时，是否保证发布 `serverRequest/resolved`。
+6. `SystemError` 的精确进入与恢复 transition。
+7. 哪些 Codex Item type 属于 MVP，哪些只保留名称。
+8. MiniCore 使用一个通用 `item/<type>/delta` envelope，还是使用 Codex-style item-specific delta method。
+9. Session list/read 与 Runtime snapshot 是否共用一个 Session view type，还是使用 summary/detail projection。
+10. `TreeId` 和 `SessionId` 如何进入 JSONL header，以及 external import 时如何生成。
+11. Client-side follow-up scheduling 是否足以满足所有 first-party adapter；server-side queued Turn 必须另行决策。
+12. Permission request 与 `requestUserInput` interaction 的精确 decision set、timeout 和 auto-resolution semantics。
 
-## Review Order
+## Review 顺序
 
-Continue review in this order:
+继续评审时按以下顺序推进：
 
-1. Session and Tree identity: `TreeId`, `SessionId`, fork/read/resume behavior.
-2. Turn admission and terminal ordering.
-3. Item kinds, item-specific statuses, and storage mapping.
-4. Server-request transport, pending request snapshot, and reconnect behavior.
-5. Compaction/retry projection into Turn/Item.
-6. Removal of current queues and phase model.
-7. Protocol migration and authoritative document update plan.
+1. Session 与 Tree identity：`TreeId`、`SessionId`、fork/read/resume behavior。
+2. Turn admission 和 terminal ordering。
+3. Item type、item-specific status 和 storage mapping。
+4. Server-request transport、pending request snapshot 和 reconnect behavior。
+5. Compaction/retry 如何投影进 Turn/Item。
+6. 删除当前 queue 和 phase 模型。
+7. Protocol migration 和权威文档更新计划。
 
-## Progress Checklist
+## 进度清单
 
-- [x] Create dedicated refactor branch.
-- [x] Select Codex outer lifecycle model.
-- [x] Rename Codex Thread concept to MiniCore Session.
-- [x] Select `TreeId` for fork-tree identity.
-- [x] Record target Session/Turn/Item/Interaction states.
-- [x] Record approval server-request ownership model.
-- [x] Record full target lifecycle scenarios.
-- [x] Record current-to-target mapping and removal candidates.
-- [x] Record migration phases and conformance matrix.
-- [ ] Resolve open decisions.
-- [ ] Create/accept lifecycle ADR.
-- [ ] Update `CONTEXT.md` glossary.
-- [ ] Update architecture and module authority documents.
-- [ ] Update protocol and event contracts.
-- [ ] Close/supersede affected review issues.
-- [ ] Complete Rig/provider impact review.
-- [ ] Add implementation and conformance tests.
-- [ ] Remove superseded public types and prose.
-- [ ] Update progress handoff after migration.
+- [x] 创建专用重构分支。
+- [x] 选择 Codex outer lifecycle model。
+- [x] 将 Codex Thread 概念重命名为 MiniCore Session。
+- [x] 选择 `TreeId` 作为 fork-tree identity。
+- [x] 记录目标 Session/Turn/Item/Interaction 状态。
+- [x] 记录 approval server-request ownership model。
+- [x] 记录完整目标生命周期场景。
+- [x] 记录当前到目标的映射和删除候选。
+- [x] 记录迁移阶段和 conformance matrix。
+- [ ] 解决未决问题。
+- [ ] 创建并接受 lifecycle ADR。
+- [ ] 更新 `CONTEXT.md` glossary。
+- [ ] 更新 architecture 和 module authority documents。
+- [ ] 更新 protocol 和 event contracts。
+- [ ] 关闭或 supersede 受影响的 review issue。
+- [ ] 完成 Rig/provider impact review。
+- [ ] 增加 implementation 和 conformance tests。
+- [ ] 删除被 supersede 的公共类型和文案。
+- [ ] 迁移完成后更新 progress handoff。
 
-## Acceptance Criteria
+## 验收标准
 
-The refactor is complete only when:
+重构只有在以下条件全部满足后才算完成：
 
-- `SessionStatus`, `TurnStatus`, Item lifecycle, and server-request lifecycle are the only public outer execution state model;
-- `TreeId` and `SessionId` have distinct, documented fork semantics;
-- no public `RunId`, `SessionPhase::Turn/Compaction/RetryBackoff`, or parallel retry workflow remains;
-- message/tool public progress uses Item lifecycle;
-- approval uses server request/client response/resolved semantics;
-- pending interactions are recoverable from the current runtime projection where promised;
-- required compaction and retry remain inside one Agent Turn;
-- standalone compaction is a non-steerable Turn;
-- no public or server-owned FollowUp/NextTurn queue contract remains in the baseline architecture;
-- current storage and Prompt invariants either map cleanly behind the new interface or are explicitly replaced by a new accepted decision;
-- authoritative docs, ADR amendments, review status, progress handoff, and tests agree with the target model;
-- historical documents remain available as historical context without being mistaken for the current contract.
+- `SessionStatus`、`TurnStatus`、Item lifecycle 和 server-request lifecycle 成为唯一公共外层执行状态模型；
+- `TreeId` 和 `SessionId` 具有不同且明确的 fork 语义；
+- 不再存在公共 `RunId`、`SessionPhase::Turn/Compaction/RetryBackoff` 或平行 retry workflow；
+- message/tool public progress 使用 Item lifecycle；
+- approval 使用 server request/client response/resolved semantics；
+- 在承诺范围内，可以从 current Runtime projection 恢复 pending interaction；
+- required compaction 和 retry 保持在同一个 Agent Turn 内；
+- standalone compaction 是 non-steerable Turn；
+- baseline 架构中不存在 public 或 server-owned FollowUp/NextTurn queue contract；
+- 当前 storage 和 Prompt invariant 要么能隐藏在新 interface 后面干净映射，要么被新的 Accepted decision 明确替换；
+- 权威文档、ADR amendment、review status、progress handoff 和 tests 与目标模型一致；
+- 历史文档继续可用作历史背景，但不会被误认为当前契约。
