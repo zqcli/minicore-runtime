@@ -1897,3 +1897,1041 @@ Final assistant candidate
 5. [SessionManager](../modules/session-manager.md)、[Tools](../modules/tools.md)、[ModelGateway](../modules/model-gateway.md)、[Compaction](../modules/compaction.md)：commit、execution、provider 与 recovery 细节。
 6. [Round3 Review Issues](system-blueprint-review-issues-round3.md)：当前 Open/Deferred issue，不要只读上方旧研究暂停点。
 7. [Cross-Project Study](../research/message-assembly-cross-project-study.md)：需要追溯 pi、Codex、Claude Code 对照依据时再读。
+
+## 2026-07-15 Handoff: Message Work Cycle / Scheduling / Identity Review
+
+日期：2026-07-15
+工作分支：`dev`
+进入本轮讨论前的基线提交：`3af8392 docs(progress): record transcript-first handoff state`
+仓库状态：纯文档设计仓库，仍没有 `Cargo.toml`、`src/` 或可运行生产测试。
+
+本节完整记录 2026-07-15 围绕 MiniCore 核心消息执行大循环的讨论过程、跨项目对照、被否定的方案、当前推荐方向、与现行权威文档的冲突，以及换设备后的恢复顺序。这里的内容除“Git 合并结果”和已经由 ADR 0023 接受的 Transcript-First 基线外，均属于**设计研究 / 推荐提案**；在新增或修订 ADR、同步 `CONTEXT.md` 和权威模块文档前，不得把本节中的新 ID / state-machine 方案称为 Accepted。
+
+### 1. Git 集成结果
+
+本轮开始时仓库位于 `research/message-assembly-cross-project-study`，该分支相对 `dev` 线性领先三个提交：
+
+```text
+f65aa09 docs(research): archive message assembly cross-project study
+fe7f0d7 docs(architecture): adopt transcript-first message pipeline
+3af8392 docs(progress): record transcript-first handoff state
+```
+
+已执行并成功完成：
+
+```bash
+git fetch origin --prune
+git switch dev
+git merge --ff-only research/message-assembly-cross-project-study
+git push origin dev
+```
+
+结果：
+
+- `dev` 与 `origin/dev` 已 fast-forward 到 `3af8392`。
+- `origin/HEAD` 也指向该 `dev` 基线。
+- `research/message-assembly-cross-project-study` 分支保留，没有删除。
+- 合并无冲突；合并后工作树干净。
+- 该三提交合计修改 26 个文档文件，新增 ADR 0023 和跨项目研究文档；约 `1604 insertions / 686 deletions`。
+
+### 2. 本轮讨论的起点与范围收缩
+
+讨论最初从“当前 MiniCore 消息方案与 pi / Codex 相比是否存在冗余”开始，随后逐步收缩和深化：
+
+1. 先审查 Transcript-First 消息材料 owner、Prompt、Conversation、Driver/Rig、ModelGateway 的分工。
+2. 再追问 `SessionRuntime`、`SessionStorage`、`CommittedConversationState` 的控制流和数据流是否被图示混淆。
+3. 明确 Prompt 应是所有模型可见材料的完整组装 owner，不能把完整组装责任泄漏给 Actor / Driver。
+4. 从 BR-056 retry attempt 跨 compaction 配对问题，扩展到 session message 执行过程中是否缺少统一 FIFO / arbitration 规则。
+5. 一度讨论“把 MiniCore 所有 flow 放进总体调度器”，后主动否定全局通用 Flow Engine 方向。
+6. 最终把范围严格收缩为 Coding Agent 最核心的**消息执行大循环**：
+
+```text
+用户提交一个或多个 prompt-like inputs
+  → canonical user message commit
+  → preflight / possible compaction
+  → one or more agent/model/tool loops
+  → approval / Steer / retry / overflow recovery
+  → final assistant commit
+  → terminal / maintenance / follow-up / settled
+```
+
+本节后续只讨论这个大循环，不处理 workspace lifecycle、session catalog lifecycle、resource reload、跨 session 全局调度器等其它架构 flow。
+
+### 3. 不重新打开的 Accepted 基线
+
+以下结论已经由 ADR 0023 和 2026-07-14 权威文档更新接受，本轮讨论没有推翻：
+
+- `SessionStorage` / trusted `SessionWriter` 是 durable truth。
+- `CommittedConversationState` 是只应用成功 commit 返回值的 session-scoped 热投影，不是第二个 durable owner。
+- `ConversationSeed` 是从 committed state 构造的一条 ordered transcript。
+- `Driver` / Rig 只能从 committed seed / committed delta 推进。
+- canonical user input、完整 `ToolRound`、active Steer 和 final assistant 都必须遵循 commit-before-model-visible / commit-before-terminal。
+- Prompt 是 `AgentRun` 与 `CompactionSummary` 唯一回答“模型实际看见什么”的组装 seam。
+- `MessageRecord -> ModelMessage` 的唯一 owner 是 Prompt。
+- `ModelGateway` 只接收完整 `AssembledModelContext`，并负责 provider encoding、auth、fallback、usage 和错误分类；它不重判 session message visibility。
+- Rig segment rollover 是 Driver 私有适配行为；Rig 类型不进入 public MiniCore seam。
+
+本轮可能修改的是外围 execution identity、retry/recovery lifecycle 和 message-run state machine，而不是 Transcript-First 消息事实模型。
+
+### 4. Prompt 职责的重新确认
+
+讨论中对 Prompt 的结论经历了一次修正。
+
+早期曾提出把 Prompt 降为 `Conversation` 内部实现；进一步核对权威 `prompt.md` 后确认该方向过度收缩。Prompt 具有独立、真实且足够深的职责，应该继续作为架构模块：
+
+```text
+ResourceManager / Tools / Session conversation / Context owners / OutputContract
+                                  ↓
+                               Prompt
+                                  ↓
+                      complete model-visible input
+```
+
+Prompt 当前与推荐职责分三段：
+
+| 阶段 | 责任 |
+| --- | --- |
+| `prepare_message_turn(...)` | 使用 captured `PromptResourceView + ToolPromptView` 构造 immutable `PreparedMessageTurn` 和原子 `ModelContextProfile` |
+| `compose_user_message(...)` | 将 Text / Skill / Template / Composite / attachments 确定性展开成一条 canonical user message |
+| `assemble_model_context(...)` | 将 profile、ordered committed/live conversation、transient context 和 output contract 组装、排序、校验成 `AssembledModelContext` |
+
+Prompt 不获取材料，不读文件，不执行 RAG / memory I/O，不拥有 history、queue、provider client 或 tool executor。材料 acquisition 与 model-visible assembly 必须分开：
+
+```text
+ResourceManager / Tools / SessionStorage / Context owners acquire facts.
+SessionRuntime decides when to capture and advance.
+Prompt owns everything the model sees.
+ModelGateway owns provider invocation.
+```
+
+当前权威设计已经按 ADR 0023 基本完成该收敛；后续 message-cycle 设计不能把 message composition 重新放回 scheduler / coordinator。
+
+### 5. BR-056 暴露的上层问题
+
+BR-056 的原始问题是：
+
+```text
+retry_auto_started(attempt=N)
+  → retry 前进入 Compaction
+  → Compaction failed / aborted
+  → matching retry_auto_finished(attempt=N, status=?) 未定义
+```
+
+表面上这是 retry event pairing 缺口；本轮判断它更像消息执行大循环缺少统一状态机后的组合爆炸症状。
+
+当前文档已经分别定义：
+
+- `SessionPhase::{Idle, Turn, Compaction, RetryBackoff}`；
+- optional `CurrentRunState::{Running, WaitingApproval, Suspended, ...}`；
+- steering / follow-up / next-turn queues；
+- `PendingSessionAction::Compact`；
+- `commit_pending_messages` / `before_run_finish` safe points；
+- post-run arbitration 固定优先级；
+- retry、compaction、abort、failure、approval 等 lifecycle；
+- commit / progress watermark / event ordering。
+
+但这些规则分散在 `session-runtime.md`、`agent-runtime-events.md`、`driver.md`、`compaction.md`、`tools.md` 和协议文档中，没有一处以闭合的形式定义：
+
+```text
+current execution state
+  + accepted user/control signal
+  + pending message/action state
+  + completed async fact
+  = exactly one legal next decision
+```
+
+由此可能出现的 edge cases 不只 BR-056：
+
+- tool-round commit 已成功、下一模型调用未开始时 Abort 到达；
+- pending manual compact、overflow recovery 和 follow-up 同时存在；
+- active Steer 在 model call、tool execution、approval、compaction、retry backoff 不同窗口到达；
+- compaction success 后应进入 Turn、RetryBackoff、FollowUp 或 Idle 的选择；
+- old RunTask late effect 在 recovery / continuation 已启动后到达；
+- retry admission 在 `run_started` 前失败；
+- future suspend/resume 与 queue drain / settled 判断交叉；
+- `session_settled` 被多个 handler 用负条件分别推导；
+- hook 加入后 safe-point decision 继续扩张。
+
+结论：BR-056 不宜只追加一句事件规则后关闭。至少应先给消息执行大循环建立统一状态/transition contract，再把 BR-056 作为其中一个场景关闭。
+
+### 6. 四种顺序必须分开
+
+讨论中明确了四种不同的 ordering domain，不能用“有 actor FIFO”一句话代替：
+
+| 顺序域 | 含义 | 当前状态 |
+| --- | --- | --- |
+| actor admission order | 多客户端 command / RunLink effect 在目标 `SessionRuntime` 的线性化顺序 | 有单 actor owner；并发 arrival 的 accepted sequence 尚未单独命名 |
+| queue order | steering / follow-up / next-turn 内部如何出队 | 有 `All / OneAtATime`；`OneAtATime` 未显式写 oldest-first / FIFO |
+| arbitration order | 不同 pending work / recovery / maintenance 谁先执行 | 有 prose priority；缺少统一 typed decision seam |
+| durable/event order | commit、apply delta、event、terminal 的顺序 | 定义较强，是现行设计优势 |
+
+当前 post-run arbitration prose 是：
+
+```text
+terminal handling + terminal facts
+  → required overflow recovery / immediate retry chain
+  → pending manual compact
+  → threshold auto compaction
+  → queued steering continuation
+  → follow-up continuation
+  → session_settled
+```
+
+它本质是 priority + eligibility arbitration，而不是全局 FIFO。
+
+### 7. 对“一个总体 Flow Scheduler”的论证结果
+
+本轮平行比较了三种方案。
+
+#### 7.1 方案 A：通用 Flow Engine
+
+设想将 Agent turn、Compaction、Retry、SessionMutation、ResourceReload、Approval 全部建模为通用 Flow，并统一提供：
+
+```text
+start(flow)
+signal(flow_id, signal)
+cancel(flow_id)
+snapshot(flow_scope)
+```
+
+优点：
+
+- timers、human waits、resume、cancel、checkpoint、snapshot 可以复用；
+- 所有 lifecycle 有统一 identity / terminal；
+- 未来 external jobs / hooks 可以接入。
+
+否决原因：
+
+- 容易成为横跨 `SessionRuntime`、Tools、ResourceManager、SessionStorage 的 god module；
+- 引入 `FlowStore` 后可能与 `SessionStorage` 形成双 durable truth；
+- 通用 state / signal / effect / checkpoint schema 会把 domain owner 泄漏到一个巨大 interface；
+- 当前仓库尚无生产实现，过早构建 workflow runtime 会显著延迟 MVP spine；
+- approval、retry timer、Prompt assembly、commit barrier 的语义差异很大，泛化收益尚未由真实重复证明。
+
+结论：MVP 不采用 universal Flow Engine。
+
+#### 7.2 方案 B：分层 Session Workflow Scheduler
+
+设想：
+
+```text
+AgentRuntime: route / global limits only
+SessionRuntime actor: SessionWorkflowScheduler
+Concrete flows: Turn / Compaction / RetryBackoff
+RunTask / Driver / Tools: child protocols
+```
+
+该方向长期可行，但不应立刻暴露通用 `SessionWorkflow` trait。建议先让 concrete state machine 落地，至少出现三个真实重复的 wait/resume/timer/cancel 实现后，再按 deletion test 决定是否抽取私有 interface。
+
+#### 7.3 方案 C：SessionRuntime 内部 pure reducer / statechart
+
+最适合当前 docs-only MVP 的方向：
+
+```rust
+reduce(SessionControlState, SessionSignal) -> Reduction {
+    new_state,
+    effects,
+}
+```
+
+pure reducer 只决定 legality 与 next effects；imperative shell 仍由现有 owner 执行：
+
+```text
+actor receives command / async fact
+  → reducer validates and chooses effects
+  → SessionRuntime executes Prompt / Tools / Writer / Driver / Compaction effects
+  → completion fact re-enters reducer
+```
+
+它集中 next-step policy，同时不抢走 Prompt、Tools、SessionWriter、Driver、ModelGateway 的 owner 职责。
+
+结论：当前推荐“pure control reducer + existing imperative owners”；后期可演化为 actor-local scheduler。
+
+### 8. 为什么通用 FIFO 也不成立
+
+同类项目都没有把所有用户和系统行为压成一个无类型 FIFO：
+
+- Abort / approval response 必须高优先级立即处理；
+- Steer 只能在完整 assistant/tool boundary 后成为 model-visible；
+- FollowUp 只能在当前 active execution terminal 后启动；
+- NextTurn 不会自己启动 work；
+- manual compact 是非模型消息的 pending session action；
+- required recovery 必须优先于普通 user continuation；
+- progress delta 必须与 control lane 分离，避免 streaming 填满 mailbox 后阻塞 approval / abort。
+
+因此推荐模型是：
+
+```text
+FIFO within each typed lane
+fixed precedence across eligible lanes
+immediate control path for abort / approval / clear / shutdown
+```
+
+当前 `QueueMode::OneAtATime` 应明确为 oldest-first；`QueueMode::All` 应按 actor accepted order 批量 drain。队列若将来支持单条移除、编辑或精确 receipt，才需要 `QueueItemId`；MVP 只有全量 snapshot / ClearQueue 时可以暂缓新增该 ID。
+
+### 9. 跨项目对照结论
+
+#### 9.1 pi
+
+本轮核对的本机安装包构建产物：`pi-agent-core/dist/agent-loop.js`。
+
+pi 使用一个非常直接的 nested loop：
+
+```text
+outer loop: follow-up messages after agent would stop
+inner loop: model → tools → steering → model
+```
+
+具体行为：
+
+- `steeringQueue` / `followUpQueue` 是两个独立 FIFO；
+- `one-at-a-time` 使用 `splice(0, 1)`，`all` 使用 `splice(0)`；
+- steering 在完整 assistant/tool turn 结束后、下一次 LLM 前 drain；
+- follow-up 在 agent 原本将结束时 drain；
+- queued messages 被追加到单一 live `currentContext.messages`；
+- `convertToLlm` 是 session/custom message 到 LLM message 的集中 seam。
+
+优点是循环结构简单、队列消费点直观。缺点是 durable commit、retry/compaction lifecycle、paired event 和 crash recovery 比 MiniCore 宽松；MiniCore 不能直接复制其 persistence/event 纪律。
+
+pi session identity 主要使用：
+
+```text
+Session UUID
+SessionEntry.id / parentId
+toolCallId
+```
+
+普通 `UserMessage` 本身没有独立 user-turn/work-chain id；session tree entry ID 是 durable message/branch coordinate。
+
+#### 9.2 OpenAI Codex
+
+官方 App Server 使用：
+
+```text
+Thread
+  → Turn
+      → Item
+```
+
+官方定义：
+
+- Thread：conversation container；
+- Turn：single user request and the agent work that follows；
+- Item：user input、agent output、command、file change、tool call 等单个输入/输出项。
+
+关键行为：
+
+- `turn/start` 创建 active Turn；
+- `turn/steer` 把用户输入追加到当前 active Turn，返回相同 `turnId`；
+- `turn/interrupt` 终止 active Turn；
+- review / manual compaction 等 non-steerable turn 明确拒绝 steer；
+- Item 有独立 ID；user message 是 `UserMessageItem`；
+- user/client-triggered mailbox work 优先于 extension automatic idle work；
+- bounded request ingress 满时显式返回 overloaded error。
+
+这支持一个更小的 MiniCore identity 模型：Session / public Run-or-Turn / Message-or-Item，而不需要公开 WorkChain / RigSegment 两层。
+
+参考：<https://developers.openai.com/codex/app-server>。
+
+#### 9.3 OpenClaw
+
+OpenClaw 使用：
+
+- per-session lane FIFO，保证同 session 同时一个 active run；
+- optional global lane 控制总并发；
+- `sessionId` / `runId` 作为主要执行身份；
+- queue modes：`steer | followup | collect | interrupt`；
+- queue options：debounce、cap、drop policy；
+- active Steer 在完整 tool-call batch 后、下一模型调用前注入；
+- `agent.wait(runId)` 等待该 run lifecycle end/error。
+
+OpenClaw 文档还展示了真实风险：Steer 无法注入时若静默降级为 FollowUp，会产生用户难以理解的行为和 edge-case issue。MiniCore 必须显式报告 admission / fallback disposition，不能静默改变用户 delivery。
+
+参考：
+
+- <https://docs.openclaw.ai/concepts/queue>
+- <https://docs.openclaw.ai/concepts/queue-steering>
+- <https://docs.openclaw.ai/concepts/agent-loop>
+
+#### 9.4 Claude Code 公开行为观察
+
+Claude Code 为闭源产品，只能参考公开 issue / stream-json 行为，不把其内部实现当成权威事实。公开问题反复显示：
+
+- 用户无法稳定知道新输入会在下一个 tool boundary、LLM pause 还是完整 turn 后消费；
+- interrupt、queued follow-up 和 non-destructive steer 边界容易混淆；
+- 缺少明确 delivery mode 会让长任务被意外打断或意外改变方向。
+
+这进一步支持 MiniCore 对 Steer / FollowUp / Interrupt 做显式 typed semantics，而不是让 adapter 或 runtime 自动猜测用户意图。
+
+### 10. 聚焦消息大循环后的定义
+
+讨论最终确认：Coding Agent 最重要的产品业务流程，是从用户输入到 agent execution terminal 的大循环。Rig 只拥有内部 `CallModel → CallTools → Done` 协议；MiniCore 的核心价值在外围：
+
+```text
+user-visible input admission
+  → stable transcript
+  → model/tool loop productization
+  → human intervention
+  → recovery
+  → durable terminal
+```
+
+如果该循环没有闭合的状态机，任何新增功能（approval、Steer、retry、compaction、suspend/resume、dynamic context、hooks、provider continuation）都会继续扩大状态交叉。
+
+### 11. 当前建议的 message-run 顶层状态机
+
+为避免在尚未接受 ID 方案前继续使用有争议的 `WorkChain` 名字，本节暂称该循环为 **Message Run / Agent Execution**。候选内部 coordinator 名称：`RunCoordinator` 或 `MessageRunCoordinator`；名称尚未定型。
+
+推荐顶层状态：
+
+```text
+Queued / Idle
+  → Admitting
+  → Preparing
+  → ComposingInput
+  → CommittingInput
+  → Preflight
+      ├─ NeedCompact → Recovering(PreRunCompaction) → Preflight
+      └─ Ready → StartingExecution
+  → Running
+      ├─ model/tool loops
+      ├─ active Steer
+      ├─ retry attempt(s)
+      └─ required overflow recovery
+  → Finalizing
+  → Terminal(Completed | Failed | Aborted)
+  → optional session maintenance / queued follow-up
+  → session_settled or next Run
+```
+
+现行 `SessionPhase` 可继续作为 UI/session workflow projection；内部 execution state 必须更细，避免用 `Turn + current_run = None` 表达所有 admission / preflight / finalization 短窗口。
+
+#### 11.1 节点职责
+
+| 节点 | 核心工作 | 交互 owner |
+| --- | --- | --- |
+| `Admitting` | 校验 phase、delivery、模型/capability、附件、queue disposition | SessionRuntime、CommandSurface、ProviderRegistry |
+| `Preparing` | 捕获 resources/tools/model，构建 immutable prompt/profile baseline | ResourceManager、Tools、Prompt |
+| `ComposingInput` | `PromptIntent -> CanonicalUserMessage` | Prompt、Skills、PromptTemplates |
+| `CommittingInput` | 提交 user message、应用 committed delta、发布 message fact | SessionWriter、CommittedConversationState、EventBus |
+| `Preflight` | 构造 seed、检查上下文和是否需要 pre-run compaction | Conversation state、UsageStats、Compaction |
+| `Recovering(PreRunCompaction)` | 保护 current committed entries、压缩旧历史、重建 seed | Compaction、Prompt、ModelGateway、Writer |
+| `StartingExecution` | 建立 public Run correlation、CurrentRun、RunTask | SessionRuntime、RunTask、Driver |
+| `Running` | 推进模型、工具、safe points、usage/limits/cancel | Driver、Rig、Prompt、ModelGateway、Tools |
+| `WaitingApproval` | 等待 typed approval decision；actor 继续消费 mailbox | Tools ApprovalBroker、SessionRuntime、Protocol/UI |
+| `CommittingToolRound` | 原子提交 assistant tool calls + complete results | Tools、Writer、Conversation、DriverHost |
+| `SafePoint` | 处理 Steer、abort、suspend、future context/profile changes | SessionRuntime queues、Prompt、RunLink |
+| `CommittingSteer` | 展开并提交 steer，返回 exact committed delta | Prompt、Writer、Conversation、Driver |
+| `RetryBackoff / RetryAttempt` | 等待 timer、启动下一 attempt、闭合 paired retry lifecycle | SessionRuntime timer、events |
+| `Recovering(Overflow)` | bounded compaction/rebuild 后继续当前 user-visible execution | Compaction、Prompt、ModelGateway、Writer |
+| `CommittingFinal` | final assistant commit、apply、finished/usage/terminal ordering | Writer、Conversation、EventBus、UsageStats |
+| `Finalizing` | 处理 failure/abort partial close、terminal classification | SessionRuntime、Driver result、events |
+| `PostRunArbitration` | optional maintenance、follow-up、settled | queues、PendingSessionActions、Compaction、UsageStats |
+
+#### 11.2 Running 内部子状态
+
+```text
+Starting
+  → CallingModel          // wait: provider/model call owned by RunTask/ModelGateway
+  → AssistantResult
+      ├─ tool calls
+      │    → ExecutingTools
+      │    → WaitingApproval?
+      │    → CommittingToolRound
+      │    → SafePoint
+      │    → CallingModel / Steer rollover
+      ├─ final
+      │    → CommittingFinal
+      │    → Completed candidate
+      └─ error
+           → Retry / OverflowRecovery / Failed candidate
+```
+
+该内部状态可以只存在于 coordinator / RunTask projection，不必全部进入 public `SessionPhase` 或 UI protocol。
+
+### 12. Wait Point 定义
+
+Wait Point 表示 execution 已到达合法暂停点，当前 owner 等待一个明确、typed 的 completion fact；它不等于 session idle，也不意味着线程/actor 被阻塞。
+
+| Wait point | 谁在等待 | actor 是否继续响应 | 完成 signal |
+| --- | --- | --- | --- |
+| model call | RunTask / ModelGateway future | 是 | model result / error / cancel |
+| tool execution | ToolBatchInvoker future | 是 | normalized tool result / cancel |
+| tool approval | ApprovalBroker waiter | 是 | approval decision / abort / close |
+| stable commit | SessionRuntime actor 在不可取消 writer 临界区 | mailbox 暂停该 commit 的确定结果；commit 是允许的 bounded owner wait | commit Ok / Err |
+| safe-point reply | Driver / RunTask | 是 | `NextConversationStep` / finish decision |
+| retry timer | retry state | 是 | timer elapsed / AbortRun（最新推荐；现行权威命令仍为 AbortRetry） / shutdown |
+| compaction model call | SessionRuntime-owned compaction task/future | 是 | summary result / error / AbortRun（run-correlated recovery）或 AbortCompaction（standalone compaction） |
+| future suspend/resume | no active execution future；serialized checkpoint in memory | 是 | ResumeRun / abort / close |
+
+人工参与的 wait 必须遵守：
+
+1. 先在 owner 内登记 waiter 和 actor snapshot projection。
+2. 再发布 approval / interaction request event。
+3. UI 只能通过 typed command + correlation ID 回复。
+4. 回复必须验证 session、run、call/approval、generation。
+5. duplicate / stale reply 返回 typed result，不能重复执行。
+6. abort / terminal / close 必须移除 waiter 并关闭 UI projection。
+
+MVP 不要求这些 wait 跨进程恢复；host restart 仍只从 committed session facts 恢复到 idle。
+
+### 13. Safe Point 的精确定义
+
+Safe Point 是 active agent execution 中允许 `SessionRuntime` 安全介入、同时不会破坏 provider/tool protocol 的边界。
+
+安全条件：
+
+- 当前 provider request 已结束；
+- 当前 assistant response 已完整形成；
+- 当前 assistant message 请求的工具批次已全部执行；
+- tool call / result 已完整配对；
+- 需要进入下一次模型调用的 `ToolRound` 已 commit；
+- progress 已归约到请求携带的 watermark；
+- 下一模型调用尚未开始。
+
+当前两个主要 safe point：
+
+| Safe point | 时机 | 用途 |
+| --- | --- | --- |
+| `commit_pending_messages` | 完整 assistant/tool round 后、下一次模型调用前 | drain + commit Steer、abort/suspend、transient context、future atomic profile/tool replacement |
+| `before_run_finish` | private Rig segment 原本将结束时 | 最后检查 Steer；有则 continuation/rollover，无则允许 finalization |
+
+不应在以下位置注入 Steer：provider streaming 中途、工具执行中途、assistant tool call 与 tool result 之间、stable commit 进行中。
+
+### 14. Hook 与状态机的关系
+
+Hook 只能挂在 owner 已定义的 safe point，并返回 typed decision / patch / replacement：
+
+```text
+BeforeExecutionStart
+BeforeModelCall
+BeforeToolExecution
+BeforeToolRoundCommit
+AtRunSafePoint
+BeforeCompaction
+AfterStableCommit
+AfterExecutionTerminal
+```
+
+Hook 不能：
+
+- 直接 mutate coordinator state；
+- 直接写 SessionStorage；
+- 直接发布 public event；
+- 绕过 Prompt 组装；
+- 绕过 Tools policy/approval；
+- 在 commit 后把已 committed fact 改判为失败。
+
+每个 hook point 必须预定义 error policy：`Fail | ContinueOriginal | DiagnosticsOnly`。MVP 仍不实现 Hook；这里只记录未来扩展不得破坏 state-machine closure。
+
+### 15. State 与 Terminal Outcome 必须区分
+
+不是所有节点都使用统一的 `Completed | Failed | Aborted`。`Admitting`、`Running`、`WaitingApproval` 等是 state；terminal outcome 属于各自 lifecycle，且应使用 domain-specific closed set：
+
+| 对象 | 中间状态 | terminal outcome |
+| --- | --- | --- |
+| public Agent execution | Admitting、Running、Recovering、Finalizing | `Completed | Failed | Aborted` |
+| Retry episode | Scheduled、Backoff、StartingAttempt、RunningAttempt | `Succeeded | Failed | Aborted` |
+| Compaction | Preparing、Summarizing、Committing、Rebuilding | `Succeeded | Skipped | Failed | Aborted` |
+| Tool call | Proposed、WaitingApproval、Executing、ResultReady | `Succeeded | ErrorResult | Rejected | Cancelled` |
+| Approval | Pending | `Approved | Rejected | Cancelled | Expired` |
+| Session commit | Prepared、InFlight | `Succeeded | Failed`；writer admission 后不允许 aborted |
+| Queue item | Queued、Eligible、Consuming | `Consumed | Cleared | Rejected | Expired`（仅在需要 per-item lifecycle 时） |
+| Model call | Preparing、Streaming | `Succeeded | Failed | Cancelled | ContextOverflow` |
+
+普通 tool executor error 通常变成 model-visible error tool result，不能直接等价为 public Run failed。required pre-run / overflow compaction failure 会导致 execution failed；optional post-run maintenance failure只产生 diagnostics，不改写已经完成的 assistant response。
+
+### 16. ID 讨论过程与 deletion test
+
+讨论中先提出：
+
+```text
+SessionId
+  → WorkChainId / UserTurnId
+      → UserMessageId(s)
+      → RunId(s)
+          → RigSegmentId(s)
+```
+
+用户随后指出：
+
+- conversation 本身不一定有稳定“目标”，`WorkChainId` 可能过度表达；
+- 一个 session 本来就包含很多 user messages；
+- `RunId` 可以直接表示完整 agent execution；
+- Rig segment 是私有实现，公开 ID 可能没有价值。
+
+本轮按 deletion test 重新判断每个 ID：删除该 ID 后，哪个真实 invariant、routing、event pairing、storage navigation 或 stale-effect fencing会失效？
+
+#### 16.1 `UserMessageId`
+
+结论：不新增 role-specific `UserMessageId`。
+
+MiniCore 已经有通用 `MessageId`：
+
+```rust
+UserAppended { message_id: MessageId, ... }
+AssistantStarted { message_id: MessageId }
+AssistantTextDelta { message_id: MessageId, ... }
+AssistantFinished { message_id: MessageId }
+ToolResultAppended { message_id: MessageId, ... }
+```
+
+需要通用 `MessageId` 的理由：
+
+- assistant streaming 在 commit 前就需要 started/delta/finished correlation；
+- UI list/reducer 需要稳定 key；
+- active Steer 可在同一 public run 中新增多条 user message；
+- reconnect 时 delta 必须归到正确 message；
+- tool result 也是独立 model/UI message。
+
+`UserMessageId` 只是在类型名中重复 role；role 已由 `MessageRecord::User` 表达。
+
+#### 16.2 `MessageId` 与 `EntryId`
+
+两者都保留，但职责不同：
+
+```text
+MessageId = logical message identity / streaming and UI correlation
+EntryId   = durable session-tree coordinate / navigation / fork / compaction protection
+```
+
+assistant streaming 在 commit 前已经存在 MessageId，此时 writer 还没有 committed EntryId。因此不能简单用 EntryId 替代所有 MessageId，除非 future design 提前预留 EntryId；当前没有必要改变 writer identity semantics。
+
+commit 后应建立明确 relation：
+
+```text
+MessageId ↔ committed EntryId
+```
+
+一个 stable batch 可以包含多个 message entries；tree/batch topology 继续使用 EntryId，message UI/protocol 继续使用 MessageId。
+
+#### 16.3 `RigSegmentId`
+
+结论：不增加 public / durable `RigSegmentId`。
+
+同一 public run 因 active Steer 可能私有创建多个 Rig `AgentRun` segment，但：
+
+- UI 不需要选择或取消单个 segment；
+- session storage 不恢复 segment；
+- event / approval / usage 仍绑定 public Run；
+- Driver 适配变化不应改变 public identity。
+
+内部如需 logs、tests 或 stale callback fencing，使用：
+
+```rust
+segment_index: u32
+// 或 private run_epoch: u32
+```
+
+该 ordinal 不进入 protocol、snapshot、storage 或 ADR public seam。
+
+#### 16.4 `WorkChainId / UserTurnId`
+
+这里形成两个可行方案。
+
+##### 方案 I：保留当前 attempt-level `RunId`，增加 `WorkChainId`
+
+当前权威文档定义：
+
+- 一个 `RunId` 绑定一次公开 `drive_conversation()`；
+- active Steer rollover 继续当前 RunId；
+- automatic retry 创建新 RunId；
+- overflow recovery 创建新 RunId；
+- FollowUp 创建新 RunId；
+- `TurnResourceSnapshot.user_turn_id` / `TurnState` 跨 retry/recovery 复用。
+
+在该定义下，确实需要某种 higher-level correlation，才能回答：
+
+- 多个 retry/recovery Run 是否共享同一 captured turn baseline；
+- overflow recovery budget 属于谁；
+- 同一 user-visible work 的 usage/diagnostics 如何聚合；
+- retry / compaction / run events 如何形成一条完整 trace。
+
+这就是保留 `UserTurnId` 或新增 `WorkChainId` 的主要理由。
+
+缺点：
+
+- public identity hierarchy 变成 Session → WorkChain → Run → Message；
+- “WorkChain” 含义容易被误解为具有稳定业务目标；
+- public UI / protocol 是否真的需要该 ID 尚未证明；
+- active Steer 在 same Run 内，retry 在 new Run，概念学习成本高。
+
+##### 方案 II：扩大 `RunId`，删除 public WorkChain/UserTurn ID（当前推荐）
+
+把 `RunId` 定义成一次 user-visible Agent execution lifecycle，而不是一次物理 `drive_conversation()` / Rig invocation：
+
+```text
+run_started(R)
+  → initial committed user message(s)
+  → model/tool loops
+  → active Steer message(s)
+  → automatic retry attempt(s)
+  → required overflow compaction/recovery
+  → final assistant commit or unrecoverable terminal
+run_finished(R) exactly once
+```
+
+Driver 内部可以：
+
+- 启动/丢弃多个 Rig `AgentRun`；
+- active Steer rollover segment；
+- retry 时重新 seed；
+- overflow recovery 后从 committed conversation rebuild；
+- 重建 RunTask 子执行 future。
+
+public `RunId` 不因此变化。
+
+该方案与 Codex `TurnId` 和 OpenClaw `runId` 更接近，也让 `AbortRun`、usage、UI status、retry/compaction recovery 自然聚合在一个 public execution 下。
+
+当前推荐方案 II，但它尚未 Accepted，并且是本轮最重要的开放决策。
+
+### 17. 当前推荐的最小 ID 模型
+
+如果接受“扩大 RunId”方案，推荐 public / durable identity：
+
+```text
+SessionId
+  ├─ EntryId                      // durable tree/storage coordinate
+  ├─ MessageId                    // logical user/assistant/tool-result identity
+  └─ RunId                        // one user-visible agent execution lifecycle
+       ├─ retry_attempt: u32      // internal ordinal
+       ├─ segment_index: u32      // Driver-private ordinal
+       ├─ ModelCallId
+       └─ ToolCallId
+```
+
+其它相关 ID 保持各自窄职责：
+
+| ID | 目的 |
+| --- | --- |
+| `CommandId` | dispatch / ack / command result correlation |
+| `ApprovalRequestId` | pending approval decision correlation |
+| `ResumeId` | same-host suspended run resume token |
+| `InteractionId` | typed user interaction response |
+| event `sequence` | event ordering / reconnect waterline |
+| optional future `QueueItemId` | 仅在支持单条 queue item 操作时引入 |
+
+不新增：
+
+- role-specific `UserMessageId`；
+- public `WorkChainId`；
+- public/durable `RigSegmentId`。
+
+### 18. 推荐 RunId 语义下的典型场景
+
+| 场景 | identity / lifecycle |
+| --- | --- |
+| idle 用户提交一条 prompt | 生成一个 MessageId；accepted execution 分配一个 RunId |
+| `QueueMode::All` 合并多条输入 | 每条 input 形成独立 MessageId；共同 seed 同一个 RunId |
+| active Steer | 新 MessageId；继续当前 RunId |
+| Steer 导致 Rig rollover | 当前 RunId；private `segment_index += 1` |
+| provider retry inside one model call | 当前 RunId；ModelGateway private attempt |
+| session auto retry | 当前 RunId；`retry_attempt += 1` |
+| overflow compaction recovery | 当前 RunId；进入 run-correlated recovery state，rebuild 后继续 |
+| FollowUp | 前一 Run terminal 后，follow-up messages 触发新 RunId |
+| NextTurn | queued 时没有 RunId；随下一次显式 execution 进入新 RunId |
+| standalone manual compact | session maintenance，没有 RunId |
+| post-run threshold compact | Run 已 completed；maintenance failure 不改写 Run terminal |
+| fork / navigate | 使用 EntryId，不使用 RunId / MessageId |
+
+Run 的定义不能简单写成“用户第 N 条消息和第 N+1 条消息之间”，因为 active Steer 会在一个 Run 内追加多条 user messages，FollowUp 可能在前一 Run terminal 前已经排队。权威定义应以 lifecycle 为准：
+
+```text
+run_started → exactly one run_finished
+```
+
+### 19. 推荐 RunId 方案如何重构 BR-056
+
+在扩大 RunId 的方案中：
+
+- public Run 只 start / finish 一次；
+- retry 是 Run 内部 `RetryEpisode`；
+- overflow compaction 是 Run 内部 `RecoveryEpisode`；
+- intermediate retry attempt failure 不发布 public `run_finished`；
+- 每个 retry attempt 自己严格配对 `retry_auto_started / retry_auto_finished`；
+- 最终 retry 成功、耗尽或被 abort 后，public Run 才得到唯一 terminal。
+
+推荐嵌套状态：
+
+```text
+Run::Recovering(
+  RetryEpisode {
+    attempt,
+    state: Backoff | PreflightCompaction | StartingAttempt | RunningAttempt,
+  }
+)
+```
+
+关键规则：
+
+1. 同一时刻最多一个 active recovery episode。
+2. retry 前 required compaction 属于该 retry episode；compaction fail/abort 必须关闭 matching retry attempt。
+3. running retry attempt 遇到 context overflow时，先关闭该 attempt 为 Failed，再按 bounded policy进入新的 OverflowRecovery episode；public Run 保持 active。
+4. public Run 在所有 recovery episode terminal 之后只关闭一次。
+
+该方案能从根本上减少 `run_finished → retry_started → compaction → run_started(new RunId)` 的交叉，但会修改现行事件和 phase 语义，必须通过 ADR 处理。
+
+### 20. 与当前权威文档的明确冲突
+
+今天的最新推荐尚未同步，且与当前权威文档存在以下冲突：
+
+| 当前权威规则 | 今天最新推荐 |
+| --- | --- |
+| `TurnResourceSnapshot` 携带独立 `user_turn_id` | 删除 public/role-heavy UserTurn identity；资源 capture 用 owned `TurnContext` / snapshot / fingerprint 表达 |
+| `RunId` 绑定一次公开 `drive_conversation()` | `RunId` 绑定一次 user-visible complete Agent execution |
+| automatic retry 使用新 `RunId` | retry attempt 保持同一 public RunId |
+| overflow recovery 使用新 `RunId` | required overflow recovery 保持同一 public RunId |
+| retry run 先 `run_finished(failed)` 再启动下一 run | intermediate attempt 不关闭 public Run；只关闭 retry attempt lifecycle |
+| `Compaction` phase 要求 `current_run = None` | run-correlated required recovery 期间可能没有 active RunTask，但仍保留 logical RunId / Run state |
+| `AbortRetry` / `AbortCompaction` 各自取消独立 workflow | run-correlated recovery 应可由 `AbortRun` 终止；standalone compaction 继续使用 `AbortCompaction` |
+
+这些冲突意味着不能直接在 progress 中把推荐写回权威文档。下一步必须先完成 identity/lifecycle decision review。
+
+### 21. 仍需钉死的问题
+
+1. 是否接受扩大 `RunId`，让 retry / required recovery 保持同一 public Run lifecycle？
+2. 如果保持当前 attempt-level RunId，是否正式保留 `UserTurnId`，还是新增更准确的 internal/public `WorkChainId`？
+3. RunId 是在 canonical user commit 前分配，还是 commit / preflight 后分配？
+4. 如果 pre-run compaction 属于完整 Run，是否应在 compaction external wait 前发布 `run_started`？
+5. required overflow compaction 的 events 是否携带 outer `run_id = Some(R)`，standalone compaction 是否 `None`？
+6. session auto retry event 名称是否继续使用 `retry_auto_started`，还是拆成 scheduled / attempt-started？
+7. `QueueMode::All` 消费多个 intents 时，是一个 stable batch 多条 MessageRecord，还是每条 message 一个 batch？
+8. `MessageId ↔ EntryId` relation 在 writer / MessageRecord / event payload 中如何固定？
+9. final assistant streaming MessageId 何时分配，commit 时如何映射 EntryId？
+10. active Steer 追加多条 user messages时，queue / commit / event 是否按一条一条 FIFO，或一次 composite message？
+11. post-run manual/threshold compaction 是否完全独立于 Run terminal，如何影响 `session_settled`？
+12. public snapshot 是否需要展示 retry attempt / recovery state，而不新增 WorkChain identity？
+
+### 22. 推荐 reducer / coordinator 最小 interface
+
+在 ID 决策完成后，推荐把 message-run next-step 逻辑收敛为 SessionRuntime 内部 pure control seam：
+
+```rust
+pub struct RunControlState {
+    pub run_id: Option<RunId>,
+    pub stage: RunStage,
+    pub retry: Option<RetryEpisode>,
+    pub recovery: Option<RecoveryEpisode>,
+    pub pending_approvals: PendingApprovalProjection,
+    pub terminal: Option<RunTerminalStatus>,
+}
+
+pub enum RunSignal {
+    PromptAdmitted,
+    UserCommitSucceeded(CommittedConversationDelta),
+    UserCommitFailed(CommitError),
+    PreflightReady,
+    PreflightNeedsCompaction,
+    ModelResult(ModelTurn),
+    ToolRoundCandidate(ToolRoundCandidate),
+    ToolRoundCommitted(CommittedToolRound),
+    SafePointReached(SafePointKind),
+    ApprovalDecided(ApprovalDecisionFact),
+    RetryTimerElapsed { attempt: u32 },
+    CompactionFinished(CompactionOutcome),
+    FinalAssistantCommitted(CommittedConversationDelta),
+    AbortRequested,
+    AsyncFailure(ExecutionError),
+}
+
+pub struct RunReduction {
+    pub new_state: RunControlState,
+    pub effects: Vec<RunEffect>,
+}
+
+pub enum RunEffect {
+    CommitUserMessage,
+    StartOrResumeDriver,
+    CommitToolRound,
+    ReplySafePoint,
+    StartCompaction,
+    ScheduleRetry,
+    CancelRunTask,
+    CommitFinalAssistant,
+    PublishEvent,
+    FinishRun,
+    StartFollowUp,
+    MarkSessionSettled,
+}
+```
+
+注意：该 interface 是当前讨论草图，不是已接受 Rust shape。它必须保持 control-only，不能包含完整 transcript、Prompt materials、Tools internals、provider DTO 或 writer handle。
+
+### 23. 状态机与事件的原则
+
+推荐固定执行顺序：
+
+```text
+signal received
+  → reducer validates transition
+  → owner executes typed effect
+  → required stable commit
+  → committed delta applied
+  → completion fact returns to reducer
+  → public domain event emitted
+  → reducer chooses next effect
+```
+
+事件是已发生事实的 projection，不能反向成为多个 owner 各自驱动 state 的隐藏 command。
+
+必须保持：
+
+- one public Run：恰好一个 `run_started` 和一个 `run_finished`；
+- one assistant message：恰好一个 started / finished；
+- one retry attempt：恰好一个 retry start / finish；
+- one compaction episode：恰好一个 compaction start / finish；
+- one approval request：恰好一个 terminal decision / cancel；
+- stable fact：commit + apply 成功后才发布 durable-visible event；
+- terminal event 前归约 progress through watermark；
+- stale / duplicate async fact 被明确拒绝，不得修改新状态。
+
+### 24. 推荐 conformance / scenario matrix
+
+identity 与 state-machine 决策接受后，应先写表驱动/属性测试，再实现 actor imperative shell。最小矩阵：
+
+#### 24.1 基本消息循环
+
+- one user text → one assistant final；
+- one user text → multiple model/tool rounds → final；
+- parallel tool calls 按 `call_index` 归约后一个 ToolRound commit；
+- tool ordinary error 作为 error result 继续；
+- model returns no tool call and no Steer → finalization。
+
+#### 24.2 Steer / queues
+
+- Steer during model call；
+- Steer during tool execution；
+- Steer during approval wait；
+- Steer at `before_run_finish`；
+- Steer during retry backoff；
+- Steer during overflow compaction；
+- queue mode `OneAtATime` oldest-first；
+- queue mode `All` preserves accepted order；
+- Steer commit failure does not reach Driver；
+- no silent Steer → FollowUp fallback。
+
+#### 24.3 Approval
+
+- approve once；
+- reject → error tool result；
+- duplicate decision；
+- stale approval id / old run id；
+- abort while waiting；
+- snapshot rebuild while waiting；
+- approval resolved before event consumer catches up。
+
+#### 24.4 Commit gates
+
+- user commit failure → no model call；
+- tool-round commit failure → no next model call；
+- steer commit failure → no rollover；
+- final commit failure → no completed run terminal；
+- abort before commit admission wins；
+- abort after ToolRound commit preserves round, blocks next model call, ends aborted；
+- abort after AssistantFinal commit observes completed / too-late。
+
+#### 24.5 Retry / BR-056
+
+- retry delay zero still has complete attempt lifecycle；
+- retry admission fails before actual model call；
+- retry backoff aborted；
+- retry preflight enters compaction and compaction succeeds；
+- retry preflight compaction fails；
+- retry preflight compaction aborted；
+- running retry attempt hits context overflow；
+- retry attempt succeeds after previous failure；
+- max retry exhausted；
+- no dangling retry start event。
+
+#### 24.6 Compaction / recovery
+
+- pre-run threshold compact success/failure；
+- local PromptAssembly overflow；
+- provider ContextOverflow；
+- overflow compact once then success；
+- second overflow fails closed；
+- NothingToCompact；
+- protected input too large；
+- pending manual compact + required recovery + follow-up ordering；
+- post-run optional compaction failure preserves completed Run。
+
+#### 24.7 Identity / stale effects
+
+- same Run active Steer creates new MessageId；
+- private segment rollover does not change public RunId；
+- old segment late callback fenced by private epoch；
+- old retry attempt timer after terminal ignored；
+- old RunTask terminal after new state started rejected；
+- MessageId streaming sequence maps to committed EntryId；
+- session branch/fork uses EntryId only；
+- FollowUp starts a new RunId；
+- NextTurn receives a RunId only when consumed。
+
+#### 24.8 Settled / continuation
+
+- no pending work → idle + settled；
+- NextTurn queue nonempty may still settled；
+- immediate FollowUp prevents settled；
+- pending manual compact prevents settled until terminal；
+- auto compact then FollowUp does not pass through transient Idle；
+- abort clears steering/follow-up/pending action but preserves NextTurn。
+
+属性不变量：
+
+```text
+no next model call without all required committed deltas
+no duplicate/lost committed user message
+no dangling paired lifecycle
+no more than one active recovery episode
+no session_settled while immediate continuation exists
+no stale async signal mutates current execution
+no public event refers to private Rig segment identity
+```
+
+### 25. 推荐下一步顺序（更新版）
+
+本节 supersede 上方“直接从 BR-056 开始补一句规则”的恢复建议，但不修改 Open/Deferred issue status。
+
+1. **先做 execution identity decision review**：在“current attempt-level RunId + WorkChainId”与“expanded logical RunId, no WorkChainId”之间正式选一个。当前推荐后者。
+2. 选择后新增 ADR（候选 ADR 0024）或修订现有 ADR 0021 / 0023，明确 SessionId / MessageId / EntryId / RunId / retry attempt / private segment ordinal。
+3. 建立 message-run statechart 和 typed transition matrix；明确 Run、Retry、Compaction、Approval、Commit、Queue 的 terminal sets。
+4. 再处理 BR-056，把 retry/compaction 配对作为状态机 scenario，而不是孤立补丁。
+5. 同步 `CONTEXT.md`、`session-runtime.md`、`agent-runtime-events.md`、`agent-runtime-protocol.md`、`driver.md`、`compaction.md`、`resource-manager.md`、`usage-stats.md`。
+6. 执行 BR-051 / BR-052 contract closure review，冻结首批代码 interface。
+7. 做 Rig 0.40.0 private adapter spike；不要让 spike 重新定义 public identity。
+8. 建立 reducer/statechart tests，再实现 SessionRuntime actor imperative shell。
+9. 首个纵切仍按 ADR 0014：ModelGateway spine → provider-neutral messages → text-only Driver → tools/approval/recovery。
+
+### 26. 换设备恢复入口
+
+恢复命令：
+
+```bash
+git clone https://github.com/zqcli/minicore-runtime.git
+cd minicore-runtime
+git switch dev
+git pull --ff-only
+git status --short --branch
+git log -8 --oneline
+```
+
+恢复后优先阅读：
+
+1. 本节 `2026-07-15 Handoff: Message Work Cycle / Scheduling / Identity Review`。
+2. 上一节 `2026-07-14 Handoff Snapshot: Transcript-First 文档落地完成`，确认 Accepted 基线。
+3. [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)，不要重新打开 message truth / Prompt owner 问题。
+4. [SessionRuntime](../modules/session-runtime.md) 的 phase、queue、run flow、compaction、post-run arbitration。
+5. [AgentRuntimeEvents](../modules/agent-runtime-events.md) 的 Run / Retry / Compaction / Approval / Abort lifecycle。
+6. [Driver](../modules/driver.md) 的 `RunId`、safe points 和 private Rig segment 规则。
+7. [Compaction](../modules/compaction.md) 的 pre-run / overflow / post-run 语义。
+8. [Round3 BR-056](system-blueprint-review-issues-round3.md#br-056retry-attempt-跨-compaction-的配对未定义)。
+9. [Cross-Project Study](../research/message-assembly-cross-project-study.md) 与本节新增的 Codex/OpenClaw links。
+
+### 27. 恢复时必须记住的状态标记
+
+- **Accepted**：Transcript-First / ADR 0023、Prompt 唯一 model-context assembly、commit-before-visible、actor/RunTask split。
+- **Current authoritative**：attempt-level `RunId`；retry / overflow recovery 创建新 RunId；独立 `user_turn_id` / TurnState capture boundary。
+- **Latest recommendation, not accepted**：扩大 `RunId` 为 one user-visible Agent execution；retry / required recovery 保持同一 RunId；删除 public WorkChain/UserTurn identity；不增加 `UserMessageId` / public RigSegmentId。
+- **Next design blocker**：execution identity 选择；未选定前不要单独关闭 BR-056，也不要机械改 `RunId` 文案。
+- **Implementation status**：仍无生产代码；不要把 reducer / coordinator 草图当成已冻结 Rust interface。
+- **Repository discipline**：历史研究正文保留，不做全仓机械重命名；新决策只更新权威章节和新增 ADR amendment。
