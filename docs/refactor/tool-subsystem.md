@@ -1,0 +1,862 @@
+# Tool 子系统架构设计
+
+状态：基础架构已确定；实现细节待补充
+日期：2026-07-16
+
+## 目的
+
+本文定义 MiniCore Tool 子系统的基础对象、所有权、模型披露、调用路由、参数准备、Hook、权限审批、Sandbox、并发执行和领域投影。
+
+本文以以下关系为基础：
+
+```text
+MiniCoreRuntime 初始化一个 Arc<ToolRuntime>
+Agent、Session 和 Turn 领域对象不持有 Tool 属性
+Turn 编排层在 Turn 已创建并进入执行阶段后、第一次模型调用前调用 ToolRuntime::for_turn(...)
+ToolRuntime::for_turn(...) 返回本 Turn 使用的不可变 ToolSet
+同一 Turn 内的全部 LLM → Tool → LLM 循环复用同一个 ToolSet
+ToolCall 和 ToolResult 表达为 Item
+Tool approval 表达为 Interaction
+```
+
+本阶段暂不设计：
+
+- Tool 注册配置的持久化格式；
+- 跨 Runtime 的 Tool 分发；
+- Turn 崩溃恢复时如何重建完全相同的 ToolSet；
+- ToolCall、ToolResult 和 approval 的 storage commit protocol；
+- 具体操作系统 Sandbox 实现；
+- MCP transport、插件协议和 provider tool-search adapter 的实现细节。
+
+## `for_turn` 的 Turn 边界
+
+早期讨论使用过 `ToolRuntime::begin_turn`。该名称容易暗示 Tool 子系统负责创建 Turn 或改变 Turn 状态，因此更正为：
+
+```rust
+ToolRuntime::for_turn(context) -> ToolSet
+```
+
+准确语义是：
+
+1. 领域 Turn 已由 Turn 编排层创建并进入执行阶段；
+2. Turn 编排层在第一次模型调用前构造 `ToolTurnContext`；
+3. Turn 编排层调用 `ToolRuntime::for_turn(context)`；
+4. ToolRuntime 原子捕获当前可用 Tool，并返回不可变 `ToolSet`；
+5. 同一 Turn 内后续所有模型调用和 ToolCall 执行复用该 ToolSet；
+6. Turn 到达 terminal status 后释放 ToolSet。
+
+因此：
+
+- `for_turn` 从 Turn 执行边界开始；
+- `for_turn` 是 `ToolRuntime` 的方法；
+- `for_turn` 不是 `Turn` 领域对象的方法；
+- ToolRuntime 不创建 Turn，也不修改 TurnStatus；
+- ToolSet 是执行期对象，不写入 Turn 领域对象。
+
+ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在该 Turn 内不改变。每次 ToolCall 的进度、terminal guard、approval waiter、cancellation 和资源锁属于执行状态，不改变 ToolSet 的有效工具快照。
+
+## 决策摘要
+
+已经确定：
+
+- 一个 MiniCoreRuntime 初始化并拥有一个 `Arc<ToolRuntime>`；
+- Agent、Session 和 Turn 不保存 Tool definitions、Tool overrides、active tools、executor 或 ToolSet；
+- Tool 注册时原子绑定模型定义和真实 executor；
+- `ToolRuntime` 是长生命周期深模块，隐藏注册表、策略、审批、Sandbox、Hook、锁和 Deferred index；
+- `ToolSet` 是某个 Turn 的不可变有效工具快照；
+- `ToolSet::specs()` 提供本 Turn 发给当前 provider 的模型可见工具投影；
+- `ToolSet::execute()` 执行模型返回的 ToolCall，并返回一一对应的 ToolResult；
+- 注册全集、模型披露集和已授权执行集是三个不同集合；
+- Tool exposure 使用 `Direct / Deferred / Hidden`；
+- 静态 Tool annotations 只用于模型提示和调度，不作为安全授权依据；
+- 权限判断基于规范化参数生成的动态 `ToolRequirements`；
+- PreToolUse 修改参数后必须重新校验并重新计算 ToolRequirements；
+- 参数在权限判断和审批前冻结，审批后不允许修改；
+- 所有直接、Deferred 和内部调用共享唯一执行链；
+- approval 只授予执行资格，Sandbox 继续执行强制限制；
+- 同批调用串行完成 preflight，再根据并发模式和资源锁执行；
+- ToolResult 按模型原始 ToolCall 顺序返回；
+- 每个 ToolCall 都必须得到成功、错误、拒绝或取消 ToolResult。
+
+## 对象关系
+
+```text
+MiniCoreRuntime
+└─ Arc<ToolRuntime>
+   ├─ ToolRegistry
+   ├─ ToolHooks
+   ├─ ToolExecutionGate
+   │  ├─ ToolPolicy
+   │  ├─ ToolGrantStore
+   │  ├─ ToolApprovalPort
+   │  └─ ToolSandbox
+   ├─ ToolResourceLocks
+   └─ DeferredToolIndex
+
+Turn execution orchestration
+└─ ToolRuntime::for_turn(ToolTurnContext)
+   └─ ToolSet
+      ├─ model-visible ToolSpec[]
+      ├─ immutable ToolName → Arc<dyn Tool> routes
+      ├─ DeferredToolIndex snapshot
+      └─ execute(ToolCall[]) → ToolResult[]
+```
+
+## 最小外部 interface
+
+Tool 子系统只向调用方暴露三个主要对象：`Tool`、`ToolRuntime` 和 `ToolSet`。
+
+```rust
+pub trait Tool: Send + Sync {
+    fn spec(&self) -> ToolSpec;
+
+    fn requirements(
+        &self,
+        arguments: &Value,
+        context: &ToolCallContext,
+    ) -> Result<ToolRequirements, ToolError>;
+
+    async fn execute(
+        &self,
+        invocation: ToolInvocation<'_>,
+    ) -> ToolResult;
+}
+
+pub struct ToolRuntime {
+    registry: ToolRegistry,
+    hooks: Arc<dyn ToolHooks>,
+    gate: ToolExecutionGate,
+    locks: ToolResourceLocks,
+}
+
+impl ToolRuntime {
+    pub fn new(config: ToolRuntimeConfig) -> Self;
+
+    pub fn register(
+        &self,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), ToolRegistrationError>;
+
+    pub fn for_turn(
+        &self,
+        context: ToolTurnContext,
+    ) -> ToolSet;
+}
+
+pub struct ToolSet;
+
+impl ToolSet {
+    pub fn specs(&self) -> &[ToolSpec];
+
+    pub async fn execute(
+        &self,
+        calls: Vec<ToolCall>,
+    ) -> Vec<ToolResult>;
+}
+```
+
+ToolRuntime 在 Runtime 初始化时一次性注入真实 seam：
+
+```rust
+pub struct ToolRuntimeConfig {
+    pub hooks: Arc<dyn ToolHooks>,
+    pub approval: Arc<dyn ToolApprovalPort>,
+    pub sandbox: Arc<dyn ToolSandbox>,
+    pub policy: ToolPolicyConfig,
+    pub deferred_result_limit: usize,
+}
+```
+
+无交互环境使用 fail-closed approval adapter，不使用 `None` 表示隐式允许。
+
+调用方不需要直接了解 ToolRegistry、ToolPolicy、approval、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
+
+## Tool 注册
+
+Tool 是定义和 executor 的原子注册单元：
+
+```text
+Arc<dyn Tool>
+├─ ToolSpec
+├─ ToolRequirements derivation
+└─ execute
+```
+
+ToolRegistry 使用 `ToolName` 作为 Runtime 内的规范 key：
+
+```rust
+pub struct ToolRegistry {
+    tools: RwLock<HashMap<ToolName, Arc<dyn Tool>>>,
+}
+```
+
+基础规则：
+
+- 同一个 ToolName 在一个 Registry snapshot 内只能绑定一个 Tool；
+- 重复注册返回 ToolRegistrationError，不能静默覆盖已有 executor；
+- ToolSpec 和 executor 不能分别注册；
+- `search_tools` 和 `invoke_tool` 是保留名称，普通 Tool 不能注册或覆盖；
+- ToolSet 创建时原子捕获 ToolSpec 和对应的 `Arc<dyn Tool>`；
+- ToolSet 创建后的新注册不影响该 ToolSet；
+- 后续 Turn 创建的新 ToolSet 可以看到新的 Registry 状态。
+
+Tool replace 和 unregister 留待插件生命周期确有需求时再增加专用 interface，不复用 register 的语义。
+
+当前使用 ToolName 作为运行时注册和调用 identity。持久化 Tool definition identity 或 versioning 留待确有 replay、migration 或审计需求时再定义。
+
+## ToolSpec 和 Exposure
+
+```rust
+pub struct ToolSpec {
+    pub name: ToolName,
+    pub description: String,
+    pub input_schema: JsonSchema,
+    pub output_schema: Option<JsonSchema>,
+    pub exposure: ToolExposure,
+    pub annotations: ToolAnnotations,
+}
+
+pub enum ToolExposure {
+    Direct,
+    Deferred,
+    Hidden,
+}
+```
+
+Exposure 语义：
+
+| Exposure | 模型披露 | 允许的调用来源 |
+| --- | --- | --- |
+| `Direct` | 直接进入 `ToolSet::specs()` | 模型直接 ToolCall |
+| `Deferred` | 只通过 Tool search 披露 | Deferred lookup 后的调用 |
+| `Hidden` | 不向模型披露 | Runtime 内部调用 |
+
+模型产生一个未披露 ToolName 不代表该调用有效。ToolSet 必须结合内部 `ToolCallSource` 校验 Exposure：
+
+```rust
+pub enum ToolCallSource {
+    ModelDirect,
+    Deferred,
+    Internal,
+}
+```
+
+`ToolCallSource` 是 ToolSet 内部路由状态，不从模型 arguments 或 function-call payload 反序列化。普通模型 ToolCall 标记为 `ModelDirect`；`invoke_tool` 展开后标记为 `Deferred`；Runtime 内部入口标记为 `Internal`。
+
+公开的 `ToolSet::execute(Vec<ToolCall>)` 将普通输入视为 ModelDirect，并识别保留的 `invoke_tool` envelope。provider 原生 deferred loading 由 provider adapter 规范化为同一个 `invoke_tool` envelope，再进入 ToolSet；Deferred 和 Internal 来源不能由普通调用方直接指定。
+
+基础约束：
+
+| ToolCallSource | Direct | Deferred | Hidden |
+| --- | --- | --- | --- |
+| `ModelDirect` | 允许 | 拒绝 | 拒绝 |
+| `Deferred` | 拒绝 | 允许 | 拒绝 |
+| `Internal` | 允许 | 允许 | 允许 |
+
+Internal 来源只能通过 ToolRuntime 私有入口创建，仍然经过参数校验、Hook、policy、approval 和 Sandbox。模型和普通外部调用方不能指定 Internal 来源。
+
+## ToolAnnotations 和 ToolRequirements
+
+ToolAnnotations 是静态提示：
+
+```rust
+pub struct ToolAnnotations {
+    pub read_only_hint: bool,
+    pub destructive_hint: bool,
+    pub idempotent_hint: bool,
+    pub open_world_hint: bool,
+    pub concurrency: ToolConcurrency,
+}
+
+pub enum ToolConcurrency {
+    Parallel,
+    Serial,
+}
+```
+
+这些字段帮助模型理解工具，并帮助 ToolSet 选择默认调度方式。它们不能单独授予文件、进程或网络权限。
+
+ToolRequirements 根据规范化后的具体参数动态生成：
+
+```rust
+pub struct ToolRequirements {
+    pub permissions: PermissionSet,
+    pub resources: Vec<ToolResourceAccess>,
+}
+
+pub struct ToolResourceAccess {
+    pub key: ToolResourceKey,
+    pub mode: ToolResourceMode,
+}
+
+pub enum ToolResourceMode {
+    Read,
+    Write,
+    Exclusive,
+}
+```
+
+PermissionSet 的最小形状：
+
+```rust
+pub struct PermissionSet {
+    pub filesystem: Vec<FilePermission>,
+    pub network: Vec<NetworkPermission>,
+    pub processes: Vec<ProcessPermission>,
+    pub environment: Vec<EnvironmentPermission>,
+}
+```
+
+空集合表示不请求对应权限。具体 path、network target、process 和 environment 表达留给后续细化，但 PermissionSet 必须支持确定性规范化、交集计算和 fingerprint。
+
+例如，同一个 Bash Tool 可以因为具体命令不同产生完全不同的 ToolRequirements。ToolPolicy、approval 和 Sandbox 都必须使用动态 requirements，不可信任静态 read-only hint。
+
+## ToolCall、Invocation 和 Result
+
+模型返回的原始调用：
+
+```rust
+pub struct ToolCall {
+    pub call_id: ToolCallId,
+    pub name: ToolName,
+    pub arguments: Value,
+}
+```
+
+ToolSet resolve 后生成私有路由值，携带可信调用来源和目标 executor：
+
+```rust
+struct ResolvedToolCall {
+    call: ToolCall,
+    source: ToolCallSource,
+    tool: Arc<dyn Tool>,
+}
+```
+
+每次调用使用的安全上下文：
+
+```rust
+pub struct ToolCallContext<'a> {
+    pub turn: &'a ToolTurnContext,
+    pub source: ToolCallSource,
+    pub tool_name: &'a ToolName,
+}
+```
+
+ToolCallContext 不包含可由模型覆盖的安全字段；conversation content 如需参与 Hook，只能以只读安全投影提供。
+
+传给 executor 的调用已经完成路由、参数规范化、Hook 和权限处理：
+
+```rust
+pub struct ToolInvocation<'a> {
+    pub call_id: &'a ToolCallId,
+    pub arguments: &'a Value,
+    pub context: &'a ToolCallContext,
+    pub updates: &'a dyn ToolUpdateSink,
+}
+```
+
+`ToolInvocation.arguments` 在 approval 后保持不可变。
+
+最终结果：
+
+```rust
+pub struct ToolResult {
+    pub call_id: ToolCallId,
+    pub content: ToolResultContent,
+    pub details: Option<Value>,
+    pub is_error: bool,
+}
+```
+
+ToolResult 既表达 executor 成功，也表达 unknown tool、schema error、Hook deny、policy deny、approval reject、Sandbox deny、timeout 和 cancellation。
+
+流式更新使用最小 interface：
+
+```rust
+pub trait ToolUpdateSink: Send + Sync {
+    fn emit(&self, update: ToolUpdate);
+}
+
+pub enum ToolUpdate {
+    Started { call_id: ToolCallId },
+    Progress { call_id: ToolCallId, message: String },
+    Output { call_id: ToolCallId, content: ToolResultContent },
+    Completed { call_id: ToolCallId },
+}
+```
+
+## ToolSet 构建
+
+Turn 编排层在第一次模型调用前执行：
+
+```rust
+let tool_set = runtime
+    .tools
+    .for_turn(tool_turn_context);
+```
+
+ToolRuntime 在 `for_turn()` 内完成：
+
+```text
+读取 Registry 的一致快照
+→ 根据 ToolTurnContext 过滤当前 Turn 可使用的工具
+→ 建立 ToolName → Arc<dyn Tool> routes
+→ 提取 Direct ToolSpec
+→ 建立 DeferredToolIndex snapshot
+→ 根据 provider 能力生成原生 deferred 投影，或注入 fallback search_tools / invoke_tool specs
+→ 返回不可变 ToolSet
+```
+
+ToolTurnContext 至少需要表达：
+
+```rust
+pub struct ToolTurnContext {
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub turn_id: TurnId,
+    pub workspace: WorkspaceContext,
+    pub provider: ProviderCapabilities,
+    pub execution_mode: ExecutionMode,
+    pub cancellation: CancellationToken,
+    pub updates: Arc<dyn ToolUpdateSink>,
+}
+```
+
+ToolTurnContext 是执行输入，不进入 Agent、Session 或 Turn 的持久领域字段。
+
+## Tool 组装给模型
+
+同一个 ToolSet 同时保存模型披露和执行路由，因此模型看到的 schema 与 ToolCall 实际解析到的 executor 来自同一快照：
+
+```rust
+let tool_set = runtime.tools.for_turn(context);
+
+let response = model.complete(ModelRequest {
+    messages,
+    tools: tool_set.specs().to_vec(),
+}).await?;
+```
+
+该关系是核心一致性约束：
+
+```text
+ToolSet.model-visible ToolSpec
+↔ 同一个 ToolSet 内的 executor route
+```
+
+## Deferred Tool
+
+大工具集使用渐进披露。provider 原生支持 deferred loading 时，provider adapter 可以将 Deferred ToolSpec 转换成原生 tool search 机制。
+
+provider 不支持时，ToolSet 向模型添加两个保留工具名：
+
+```text
+search_tools
+invoke_tool
+```
+
+命名规则：
+
+- 模型可见名称使用 `search_tools` 和 `invoke_tool`；
+- 不使用 `CallToolTool`、`InvokeToolTool` 等重复名称；
+- `search_tools` 查询当前 ToolSet 的 DeferredToolIndex；
+- `invoke_tool` 是 ToolSet 的保留路由调用，不作为普通目标 executor 嵌套执行；
+- `search_tools` 返回最多 N 个当前 ToolSet 内的完整 Deferred ToolSpec，N 由 ToolRuntime 配置确定。
+
+Fallback 流程：
+
+```text
+模型调用 search_tools(query)
+→ 只搜索当前 ToolSet 中允许的 Deferred tools
+→ 返回少量 ToolName、description 和 input schema
+
+模型调用 invoke_tool(name, arguments)
+→ ToolSet 校验 invoke envelope
+→ 将调用展开为 source = Deferred 的真实 ToolCall
+→ 校验目标 Exposure == Deferred
+→ 对真实目标执行一次完整 pipeline
+```
+
+`invoke_tool` 必须在参数校验、Hook、policy、approval 和 Sandbox 之前展开。这样 executor、approval UI、audit 和 PostToolUse 看到的都是实际目标 Tool，且不会产生双重审批、双重 Hook 或嵌套调度。
+
+`invoke_tool` 不能调用 Direct 或 Hidden Tool，防止模型借助代理入口绕过直接披露和内部可见性规则。
+
+目标不存在、目标不是 Deferred、envelope schema 无效时，ToolSet 返回统一的 error ToolResult，并记录精确内部 audit 原因。模型可见错误不泄漏 Hidden Tool 是否存在。
+
+## 参数准备和 Hook
+
+ToolCall 参数来自模型，必须视为不可信输入：
+
+```text
+原始 JSON
+→ route 和 Exposure 校验
+→ schema 校验
+→ 默认值和兼容字段处理
+→ 路径、枚举等确定性规范化
+→ PreToolUse
+→ 若参数改变则重新校验和规范化
+→ 参数冻结
+```
+
+Hook 使用固定锚点，不引入通用 middleware `next()` 链：
+
+```rust
+pub trait ToolHooks: Send + Sync {
+    async fn before(
+        &self,
+        call: &ToolCall,
+        context: &ToolCallContext,
+    ) -> BeforeToolUseDecision;
+
+    async fn after(
+        &self,
+        call: &ToolCall,
+        result: &mut ToolResult,
+        context: &ToolCallContext,
+    );
+}
+
+pub enum BeforeToolUseDecision {
+    Continue,
+    Rewrite(Value),
+    Deny(String),
+}
+```
+
+ToolRuntime 接收一个 ToolHooks adapter。需要多个 Hook 时由该 adapter 在内部按固定顺序组合，ToolSet 不暴露 middleware chain 或 `next()` 语义。
+
+基础规则：
+
+- PreToolUse Hook failure 默认 fail closed；
+- Hook 只能拒绝调用或重写 arguments，不能修改 call_id、ToolName 或 ToolCallSource；
+- Rewrite 后必须重新执行 schema 校验和规范化；
+- Rewrite 后必须重新生成 ToolRequirements；
+- policy 和 approval 只能看到最终冻结参数；
+- PostToolUse 可以脱敏、截断和格式化模型可见结果；
+- PostToolUse 发生时 executor 副作用已经发生，不能把它当成安全阻断点；
+- raw execution outcome 应先进入 audit/telemetry，再允许 PostToolUse 修改模型可见结果；
+- PostToolUse failure 不会重新执行 Tool；原始 outcome 保留在 audit，模型获得明确的 post-processing error；
+- ToolSet 内部按 call_id 保存局部 terminal guard；每个 ToolCall 的 PostToolUse 和 terminal lifecycle 只能执行一次。
+
+## Policy、Approval 和 Sandbox
+
+`ToolExecutionGate` 是内部深模块，对 ToolSet 隐藏权限决策、grant、approval 和 Sandbox 组合顺序：
+
+```text
+Frozen ToolCall + ToolRequirements
+→ hard deny rules
+→ existing ToolGrant lookup
+→ ToolPolicy
+→ 可选 ToolApprovalRequest
+→ ToolApprovalDecision
+→ Sandbox permissions
+→ execute
+```
+
+真实 seam：
+
+```rust
+pub trait ToolApprovalPort: Send + Sync {
+    async fn request(
+        &self,
+        request: ToolApprovalRequest,
+    ) -> ToolApprovalDecision;
+}
+
+pub trait ToolSandbox: Send + Sync {
+    async fn execute(
+        &self,
+        permissions: &PermissionSet,
+        tool: &dyn Tool,
+        invocation: ToolInvocation<'_>,
+    ) -> ToolResult;
+}
+```
+
+ToolApprovalPort 可以有 TUI、RPC、Web、headless reviewer 等 adapter。ToolSandbox 可以有不同操作系统或容器 adapter。这两个 seam 都存在真实的多实现需求。
+
+审批请求至少包含：
+
+```rust
+pub struct ToolApprovalRequest {
+    pub request_id: RequestId,
+    pub call_id: ToolCallId,
+    pub tool_name: ToolName,
+    pub arguments: Value,
+    pub requirements: ToolRequirements,
+    pub reason: String,
+    pub grant_suggestions: Vec<ToolGrantSuggestion>,
+}
+```
+
+审批决策：
+
+```rust
+pub enum ToolApprovalDecision {
+    AllowOnce,
+    AllowForTurn,
+    AllowForSession,
+    AllowWith {
+        permissions: PermissionSet,
+    },
+    Deny {
+        reason: String,
+    },
+}
+```
+
+基础不变量：
+
+- approval request 保存冻结参数和 ToolRequirements fingerprint；
+- approval adapter 不可扩大 ToolPolicy 已经限制的权限；
+- 最终 PermissionSet 是 ToolRequirements、ToolPolicy 上限、已有 grant 和 approval decision 的交集；
+- `AllowWith` 以 ToolPolicy 允许的 ToolRequirements 为上限，只能进一步收紧；交集无法满足执行要求时在 executor 前拒绝；
+- grant 使用明确 key 保存，不从一条 resolved Interaction 隐式推断；
+- 没有可用 approval adapter 时，Ask 决策 fail closed；
+- approval 通过后仍然执行 Sandbox；
+- Sandbox 执行失败不能静默回退到无 Sandbox 执行；
+- 是否允许经过新审批后进行 Sandbox escalation，留待具体工具策略决定。
+
+基础 grant key：
+
+```rust
+pub struct ToolGrantKey {
+    pub scope: ToolGrantScope,
+    pub tool_name: ToolName,
+    pub arguments_hash: ContentHash,
+    pub requirements_hash: ContentHash,
+    pub policy_revision: PolicyRevision,
+}
+
+pub enum ToolGrantScope {
+    Turn(TurnId),
+    Session(SessionId),
+}
+
+pub struct ToolGrantSuggestion {
+    pub scope: ToolGrantScope,
+    pub permissions: PermissionSet,
+    pub description: String,
+}
+
+pub struct PolicyRevision;
+```
+
+更宽泛的目录、命令或域名规则必须作为显式 ToolGrant rule 表达，不能通过忽略 arguments hash 自动扩大一次审批。
+
+## 批量调度和资源锁
+
+ToolSet 内部完成批量调度，不暴露独立 ToolScheduler 类。
+
+```text
+ToolCall[]
+→ 按原始顺序串行 preflight
+→ 收集允许执行的调用
+→ 根据 ToolConcurrency 和 ToolResourceAccess 调度
+→ 并发执行无冲突调用
+→ 按原始 call_index 返回 ToolResult[]
+```
+
+调度规则：
+
+- `Serial` Tool 默认按 ToolName 串行；跨 Tool 冲突由 ToolResourceAccess 统一处理；
+- `Parallel` Tool 只有在资源访问不冲突时并发执行；
+- 同一资源允许并发 Read，Write 或 Exclusive 与冲突访问串行；
+- 资源 key 来自规范化参数后的 ToolRequirements；
+- 参数名称猜测不能作为安全资源锁的唯一来源；
+- ToolCall event 可以按实际完成顺序流式发布；
+- ToolResult 返回模型时恢复为原始 ToolCall 顺序；
+- schema、Hook 或 policy 对单个调用的拒绝形成该调用的 ToolResult；
+- 用户显式拒绝或 Turn cancellation 停止后续 preflight，并为未执行调用生成取消结果；
+- 所有等待 approval、锁和 executor 的操作都响应 Turn cancellation。
+
+ToolResourceLocks 属于 ToolRuntime，用于协调同一 Runtime 内跨 Turn 的共享 workspace 和外部资源；单个 ToolSet 只持有它的共享引用。
+
+ToolResourceKey 必须包含足以区分 workspace 或外部资源实例的稳定前缀，避免不同 Session 的同名相对路径错误共享或绕过锁。
+
+## Tool 执行流程
+
+```text
+ToolSet::execute(ToolCall[])
+→ 按 ToolCallSource resolve
+→ 若为 invoke_tool，展开为真实 Deferred ToolCall
+→ Exposure 校验
+→ 参数 schema 校验和规范化
+→ PreToolUse
+→ 必要时重新校验和规范化
+→ 冻结参数
+→ Tool::requirements
+→ ToolExecutionGate: policy / grant / approval
+→ ToolResourceLocks
+→ ToolSandbox
+→ Tool::execute
+→ raw outcome audit
+→ PostToolUse
+→ ToolResult
+→ 按原始顺序返回
+```
+
+所有调用来源必须进入该唯一执行路径：
+
+```text
+Direct model call ────────┐
+Deferred invoke_tool ─────┼→ ToolSet::execute pipeline
+Internal runtime call ────┘
+```
+
+任何 Tool 都不能通过直接访问 executor 绕过 Hook、policy、approval 或 Sandbox。
+
+## LLM 循环
+
+Turn 执行编排层只创建一次 ToolSet：
+
+```rust
+let tool_set = runtime.tools.for_turn(tool_turn_context);
+
+loop {
+    let response = model.complete(ModelRequest {
+        messages: conversation.messages(),
+        tools: tool_set.specs().to_vec(),
+    }).await?;
+
+    conversation.push(response.assistant_message);
+
+    if response.tool_calls.is_empty() {
+        break;
+    }
+
+    let results = tool_set.execute(response.tool_calls).await;
+    conversation.extend(results.into_iter().map(ToolResult::into_tool_message));
+}
+```
+
+ToolSet 不决定 Turn 何时开始、完成、失败或中断。Turn 编排层负责模型循环和 Turn 状态，ToolSet 只负责本 Turn 的工具披露与执行。
+
+## Domain 投影
+
+Tool 子系统与领域对象的关系：
+
+```text
+模型返回 ToolCall
+→ 创建 ToolCall Item
+
+ToolExecutionGate 需要外部审批
+→ 创建 ToolApproval Interaction，归属于对应 ToolCall Item
+
+Tool 执行结束
+→ 创建 ToolResult Item
+```
+
+Tool 子系统返回 typed events 和 ToolResult，由 Turn 编排层完成 Item、Interaction 和 conversation 投影。
+
+Agent、Session 和 Turn 不持有：
+
+```text
+RuntimeTools
+AgentTools
+SessionTools
+TurnTools
+ToolSet
+ToolRegistry
+Tool executor
+active tool names
+Tool approval state
+Tool grants
+Tool locks
+```
+
+领域所有权：
+
+| 对象 | Owner |
+| --- | --- |
+| `Arc<ToolRuntime>` 生命周期 | MiniCoreRuntime |
+| Tool registration、Hook、policy、grant、Sandbox、locks | ToolRuntime 内部实现 |
+| 本 Turn 的有效工具快照 | Turn 执行期局部 ToolSet |
+| 模型调用循环 | Turn 编排层 |
+| ToolCall / ToolResult | Item |
+| Tool approval request/decision | Interaction |
+
+## 对象清单
+
+| 分类 | 对象 |
+| --- | --- |
+| 外部对象 | `Tool`、`ToolRuntime`、`ToolSet` |
+| 外部 seam | `ToolHooks`、`ToolApprovalPort`、`ToolSandbox`、`ToolUpdateSink` |
+| 私有实现 | `ToolRegistry`、`ToolExecutionGate`、`ToolPolicy`、`ToolGrantStore`、`ToolResourceLocks`、`DeferredToolIndex` |
+| 调用值类型 | `ToolCall`、`ResolvedToolCall`、`ToolCallSource`、`ToolInvocation`、`ToolResult`、`ToolUpdate` |
+| 定义与上下文 | `ToolRuntimeConfig`、`ToolPolicyConfig`、`ToolName`、`ToolSpec`、`ToolExposure`、`ToolAnnotations`、`ToolConcurrency`、`ToolTurnContext`、`ToolCallContext` |
+| 权限与资源 | `ToolRequirements`、`PermissionSet`、`FilePermission`、`NetworkPermission`、`ProcessPermission`、`EnvironmentPermission`、`ToolResourceAccess`、`ToolResourceKey`、`ToolResourceMode` |
+| 审批与授权 | `ToolApprovalRequest`、`ToolApprovalDecision`、`ToolGrantKey`、`ToolGrantScope`、`ToolGrantSuggestion`、`PolicyRevision`、`BeforeToolUseDecision` |
+| 保留模型路由 | `search_tools`、`invoke_tool` |
+| Domain 投影 | `Item::ToolCall`、`Item::ToolResult`、`Interaction::ToolApproval` |
+
+不建立以下独立对象：
+
+```text
+ToolSystem
+RuntimeTools / AgentTools / SessionTools / TurnTools
+RegisteredTool
+ToolView
+ToolRouter
+ToolRunner
+ToolScheduler
+ToolMiddlewareChain
+PreToolUsePipeline / PostToolUsePipeline
+公开 PreparedToolCall / ApprovedToolCall
+ToolResultBuilder
+CallToolTool / InvokeToolTool
+```
+
+这些职责已经由 ToolRuntime 和 ToolSet 两个深模块吸收，或作为局部实现状态存在。
+
+## 基础不变量
+
+- 一个 MiniCoreRuntime 初始化一个 ToolRuntime；
+- Agent、Session 和 Turn 领域对象不持有 Tool 属性；
+- Turn 编排层在 Turn 开始执行后、第一次模型调用前调用 `ToolRuntime::for_turn`；
+- 同一 Turn 的全部模型与 Tool 循环复用同一个不可变 ToolSet；
+- ToolSpec 和 executor 原子注册并被同一个 ToolSet 快照捕获；
+- 注册全集不等于模型披露集，模型披露集不等于已授权执行集；
+- ModelDirect、Deferred 和 Internal 调用遵守各自 Exposure；
+- `invoke_tool` 在完整 pipeline 前展开，并且只允许调用 Deferred Tool；
+- Hook 参数重写后重新校验并重新计算 requirements；
+- approval 绑定冻结参数和动态 requirements；
+- approval 不替代 Sandbox；
+- 每个调用最多执行一次 PostToolUse 和 terminal lifecycle；
+- 所有 ToolCall 都产生对应 ToolResult；
+- ToolResult 按原始 ToolCall 顺序返回模型；
+- ToolSet 不修改 Turn 状态，也不写回 Agent、Session 或 Turn。
+
+## 后续问题
+
+1. ToolName 的 namespace 和插件命名冲突规则。
+2. ToolSpec input/output schema 使用的具体 JSON Schema dialect。
+3. ToolTurnContext 与 Workspace、ProviderCapabilities 的最终字段。
+4. ToolPolicy rule、grant key 和持久化格式。
+5. ToolRequirements 的文件、网络、进程和资源表达能力。
+6. ToolSandbox 的 Windows、Linux、容器和远程执行 adapter。
+7. DeferredToolIndex 的搜索算法、排序和最大返回数量。
+8. provider 原生 deferred loading 与 fallback `search_tools / invoke_tool` 的 adapter 规则。
+9. ToolUpdate 的事件类型和流式输出背压。
+10. Turn recovery 时 ToolSet fingerprint、ToolSpec snapshot 和 executor version 的恢复规则。
+11. ToolCall、ToolResult 和 approval Interaction 的持久化 commit 边界。
+
+## 设计进度
+
+- [x] 确定 MiniCoreRuntime 初始化并拥有一个 `Arc<ToolRuntime>`。
+- [x] 确定 Agent、Session 和 Turn 领域对象不持有 Tool 属性。
+- [x] 将 `begin_turn` 更正为 `ToolRuntime::for_turn`。
+- [x] 确定 `for_turn` 在 Turn 执行开始后、第一次模型调用前由 Turn 编排层调用。
+- [x] 确定一个 Turn 的全部模型与 Tool 循环复用同一个不可变 ToolSet。
+- [x] 确定 Tool 定义和 executor 原子注册。
+- [x] 确定 Direct、Deferred 和 Hidden exposure。
+- [x] 确定静态 annotations 与动态 requirements 分离。
+- [x] 确定参数校验、Hook、policy、approval、Sandbox 和 executor 的唯一执行链。
+- [x] 确定 `search_tools / invoke_tool` 命名和 Deferred 防绕过规则。
+- [x] 确定串行 preflight、并发执行、资源锁和稳定结果顺序。
+- [x] 确定 ToolCall、ToolResult 和 approval 的领域投影。
+- [ ] 定义 ToolName namespace 和 schema dialect。
+- [ ] 定义 ToolPolicy、grant、PermissionSet 和 ToolRequirements 的最终字段。
+- [ ] 定义 ToolSandbox adapter 和 ToolUpdate event。
+- [ ] 定义 Turn recovery 和持久化 commit 语义。
