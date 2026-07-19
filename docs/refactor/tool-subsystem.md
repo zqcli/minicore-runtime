@@ -15,8 +15,8 @@ Agent、Session 和 Turn 领域对象不持有 Tool 属性
 Session execution 在 candidate Turn admission 期间、第一次模型调用前调用 ToolService::for_turn(...)
 ToolService::for_turn(...) 返回本 Turn 使用的不可变 ToolSet
 同一 Turn 内的全部 LLM → Tool → LLM 循环复用同一个 ToolSet
-ToolCall 和 ToolResult 表达为 Item
-Tool approval 表达为 Interaction
+ToolCall 和 ToolResult 表达为同一个 ToolInvocation Item
+Tool approval 表达为该 Item-owned durable Interaction
 ```
 
 本阶段暂不设计：
@@ -67,7 +67,7 @@ ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在
 - `ToolSet` 是某个 Turn 的不可变有效工具快照；
 - `ToolSet::prompt_view()` 提供给 PromptSet 的模型安全工具投影；
 - `ToolSet::fingerprint()` 标识 ToolSpec、Exposure、route、Workspace、policy 和 provider projection 的有效组合；
-- `ToolSet::execute()` 执行模型返回的 ToolCall，并返回一一对应的 ToolResult；
+- Session execution 为模型 ToolCall 分配 ItemId，`ToolSet::execute()` 接收 ToolExecutionRequest 并返回一一对应的 ToolExecutionOutcome；
 - 注册全集、模型披露集和已授权执行集是三个不同集合；
 - Tool exposure 使用 `Direct / Deferred / Hidden`；
 - 静态 Tool annotations 只用于模型提示和调度，不作为安全授权依据；
@@ -77,8 +77,8 @@ ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在
 - 所有直接、Deferred 和内部调用共享唯一执行链；
 - approval 只授予执行资格，Sandbox 继续执行强制限制；
 - 同批调用串行完成 preflight，再根据并发模式和资源锁执行；
-- ToolResult 按模型原始 ToolCall 顺序返回；
-- 每个 ToolCall 都必须得到成功、错误、拒绝或取消 ToolResult。
+- ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；
+- 正常、错误、拒绝和 confirmed cancellation 产生 truthful ToolResult；outcome unknown 返回 Abandoned，不生成 ToolResult。
 
 ## 对象关系
 
@@ -90,7 +90,6 @@ MiniCoreRuntime
    ├─ ToolExecutionGate
    │  ├─ ToolPolicy
    │  ├─ ToolGrantStore
-   │  ├─ ToolApprovalPort
    │  └─ ToolSandbox
    ├─ ToolResourceLocks
    └─ DeferredToolIndex
@@ -98,11 +97,12 @@ MiniCoreRuntime
 candidate Turn admission
 └─ ToolService::for_turn(ToolTurnContext)
    └─ ToolSet
+      ├─ Turn-scoped ToolInteractionPort
       ├─ ToolPromptView
       ├─ ToolSetFingerprint
       ├─ immutable ToolName → Arc<dyn Tool> routes
       ├─ DeferredToolIndex snapshot
-      └─ execute(ToolCall[]) → ToolResult[]
+      └─ execute(ToolExecutionRequest[]) → ToolExecutionOutcome[]
 ```
 
 ## 最小外部 interface
@@ -146,6 +146,22 @@ impl ToolService {
     ) -> ToolSet;
 }
 
+pub struct ToolExecutionRequest {
+    pub item_id: ItemId,
+    pub call: ToolCall,
+}
+
+pub enum ToolExecutionOutcome {
+    Completed {
+        item_id: ItemId,
+        result: ToolResult,
+    },
+    Abandoned {
+        item_id: ItemId,
+        reason: ToolAbandonReason,
+    },
+}
+
 pub struct ToolSet;
 
 impl ToolSet {
@@ -155,26 +171,27 @@ impl ToolSet {
 
     pub async fn execute(
         &self,
-        calls: Vec<ToolCall>,
-    ) -> Vec<ToolResult>;
+        requests: Vec<ToolExecutionRequest>,
+    ) -> Vec<ToolExecutionOutcome>;
 }
 ```
+
+`ToolExecutionOutcome::Completed` 只是 execution-local truthful result candidate；Session execution 只有在 atomic complete ToolRound batch 中才把对应 Item 投影为 `ToolInvocationState::Completed`。`Abandoned` 不进入 ToolRound。
 
 ToolService 在 Runtime 初始化时一次性注入真实 seam：
 
 ```rust
 pub struct ToolServiceConfig {
     pub hooks: Arc<dyn ToolHooks>,
-    pub approval: Arc<dyn ToolApprovalPort>,
     pub sandbox: Arc<dyn ToolSandbox>,
     pub policy: ToolPolicyConfig,
     pub deferred_result_limit: usize,
 }
 ```
 
-无交互环境使用 fail-closed approval adapter，不使用 `None` 表示隐式允许。
+Approval delivery 不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal interaction port；无交互环境由该 port durable resolve 为 fail-closed decision，不使用 `None` 表示隐式允许。
 
-调用方不需要直接了解 ToolRegistry、ToolPolicy、approval、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
+调用方不需要直接了解 ToolRegistry、ToolPolicy、Interaction persistence、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
 
 ## Tool 注册
 
@@ -248,7 +265,7 @@ pub enum ToolCallSource {
 
 `ToolCallSource` 是 ToolSet 内部路由状态，不从模型 arguments 或 function-call payload 反序列化。普通模型 ToolCall 标记为 `ModelDirect`；`invoke_tool` 展开后标记为 `Deferred`；Runtime 内部入口标记为 `Internal`。
 
-公开的 `ToolSet::execute(Vec<ToolCall>)` 将普通输入视为 ModelDirect，并识别保留的 `invoke_tool` envelope。provider 原生 deferred loading 由 provider adapter 规范化为同一个 `invoke_tool` envelope，再进入 ToolSet；Deferred 和 Internal 来源不能由普通调用方直接指定。
+公开的 `ToolSet::execute(Vec<ToolExecutionRequest>)` 将 request.call 视为 ModelDirect，并识别保留的 `invoke_tool` envelope。provider 原生 deferred loading 由 provider adapter 规范化为同一个 `invoke_tool` envelope，再进入 ToolSet；Deferred 和 Internal 来源不能由普通调用方直接指定。
 
 基础约束：
 
@@ -375,13 +392,20 @@ pub struct ToolInvocation<'a> {
 ```rust
 pub struct ToolResult {
     pub call_id: ToolCallId,
+    pub disposition: ToolResultDisposition,
     pub content: ToolResultContent,
     pub details: Option<Value>,
-    pub is_error: bool,
+}
+
+pub enum ToolResultDisposition {
+    Succeeded,
+    Failed,
+    Denied,
+    Cancelled,
 }
 ```
 
-ToolResult 既表达 executor 成功，也表达 unknown tool、schema error、Hook deny、policy deny、approval reject、Sandbox deny、timeout 和 cancellation。
+ToolResult 既表达 executor success，也表达 unknown tool、schema error、Hook deny、policy deny、approval reject、Sandbox deny、timeout 和 confirmed cancellation。provider adapter 可以从 disposition 派生 `is_error`。side-effect outcome unknown 时不构造 ToolResult；对应 ToolInvocation Item 进入 Abandoned。
 
 流式更新使用最小 interface：
 
@@ -432,12 +456,13 @@ pub struct ToolTurnContext {
     pub workspace: WorkspaceToolContext,
     pub provider: ProviderCapabilities,
     pub execution_mode: ExecutionMode,
+    interactions: Arc<dyn ToolInteractionPort>,
     pub cancellation: CancellationToken,
     pub updates: Arc<dyn ToolUpdateSink>,
 }
 ```
 
-ToolTurnContext 是执行输入，不进入 Agent、Session 或 Turn 的持久领域字段。它必须来自同一个 captured SessionDefinitionRevision，不能按 AgentId/SessionId 回查 mutable current heads；完整规则见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
+ToolTurnContext 是 crate-internal execution input；private `interactions` 字段只能由 Session execution 注入。它不进入 Agent、Session 或 Turn 的持久领域字段。它必须来自同一个 captured SessionDefinitionRevision，不能按 AgentId/SessionId 回查 mutable current heads；完整规则见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
 
 `WorkspaceToolContext` 由本 Turn pin 的 `WorkspaceSnapshot` 投影，包含 canonical cwd、`WorkspaceAccessView`、authorization lease 和 stable fingerprint。它是 filesystem capability ceiling：ToolRequirements、ToolPolicy、approval 和 grant 只能进一步收紧，不能扩大该 view。ToolService 不自行 canonicalize Workspace roots，也不从 trust 推断权限。完整规则见 [Workspace 子系统架构设计](workspace-subsystem.md)。
 
@@ -522,7 +547,7 @@ Fallback 流程：
 
 `invoke_tool` 不能调用 Direct 或 Hidden Tool，防止模型借助代理入口绕过直接披露和内部可见性规则。
 
-目标不存在、目标不是 Deferred、envelope schema 无效时，ToolSet 返回统一的 error ToolResult，并记录精确内部 audit 原因。模型可见错误不泄漏 Hidden Tool 是否存在。
+目标不存在、目标不是 Deferred、envelope schema 无效时，ToolSet 返回 `ToolExecutionOutcome::Completed`，其中包含统一的 failed ToolResult，并记录精确内部 audit 原因。模型可见错误不泄漏 Hidden Tool 是否存在。
 
 ## 参数准备和 Hook
 
@@ -599,11 +624,12 @@ Frozen ToolCall + ToolRequirements + WorkspaceAccessView
 真实 seam：
 
 ```rust
-pub trait ToolApprovalPort: Send + Sync {
-    async fn request(
+pub(crate) trait ToolInteractionPort: Send + Sync {
+    async fn request_approval(
         &self,
+        item_id: ItemId,
         request: ToolApprovalRequest,
-    ) -> ToolApprovalDecision;
+    ) -> Result<ToolApprovalDecision, ToolInteractionError>;
 }
 
 pub trait ToolSandbox: Send + Sync {
@@ -616,13 +642,14 @@ pub trait ToolSandbox: Send + Sync {
 }
 ```
 
-ToolApprovalPort 可以有 TUI、RPC、Web、headless reviewer 等 adapter。ToolSandbox 可以有不同操作系统或容器 adapter。这两个 seam 都存在真实的多实现需求。
+ToolInteractionPort 由 Session execution 提供，隐藏 `InteractionRequested commit → host delivery → InteractionResolved commit → waiter wake`。TUI、RPC 和 Web 是 future Runtime interface 的 transport，不直接成为 ToolService adapter。ToolSandbox 仍可以有不同操作系统或容器 adapter。
+
+ToolInteractionPort 是 crate-internal execution seam，不建立 InteractionService。其最终方法形状在 Session execution 阶段冻结，但 durable commit ordering 以 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md) 为权威。
 
 审批请求至少包含：
 
 ```rust
 pub struct ToolApprovalRequest {
-    pub request_id: RequestId,
     pub call_id: ToolCallId,
     pub tool_name: ToolName,
     pub arguments: Value,
@@ -651,13 +678,13 @@ pub enum ToolApprovalDecision {
 基础不变量：
 
 - approval request 保存冻结参数和 ToolRequirements fingerprint；
-- approval adapter 不可扩大 ToolPolicy 已经限制的权限；
+- ToolInteractionPort 返回的 approval decision 不可扩大 ToolPolicy 已经限制的权限；
 - WorkspaceAccessView 必须在 grant lookup 和 approval 前把所有文件 requirements 转换为 `AuthorizedWorkspacePath`；
 - 任一文件 requirement 不在 WorkspaceAccessView ceiling 内时，在 approval 和 executor 前拒绝；
 - 最终 PermissionSet 是 ToolRequirements、WorkspaceAccessView、ToolPolicy 上限、已有 grant 和 approval decision 的交集；
 - `AllowWith` 以 ToolPolicy 允许的 ToolRequirements 为上限，只能进一步收紧；交集无法满足执行要求时在 executor 前拒绝；
 - grant 使用明确 key 保存，不从一条 resolved Interaction 隐式推断；
-- 没有可用 approval adapter 时，Ask 决策 fail closed；
+- ToolInteractionPort unavailable 或 durable request/resolution 失败时，Ask 决策 fail closed且不执行 Tool；
 - approval 通过后仍然执行 Sandbox；
 - Sandbox 执行失败不能静默回退到无 Sandbox 执行；
 - 是否允许经过新审批后进行 Sandbox escalation，留待具体工具策略决定。
@@ -695,12 +722,13 @@ pub struct PolicyRevision;
 ToolSet 内部完成批量调度，不暴露独立 ToolScheduler 类。
 
 ```text
-ToolCall[]
+ToolExecutionRequest[]
+→ 全程保留 item_id + call
 → 按原始顺序串行 preflight
 → 收集允许执行的调用
 → 根据 ToolConcurrency 和 ToolResourceAccess 调度
 → 并发执行无冲突调用
-→ 按原始 call_index 返回 ToolResult[]
+→ 按原始 request/call_index 返回 ToolExecutionOutcome[]
 ```
 
 调度规则：
@@ -711,7 +739,7 @@ ToolCall[]
 - 资源 key 来自规范化参数后的 ToolRequirements；
 - 参数名称猜测不能作为安全资源锁的唯一来源；
 - ToolCall event 可以按实际完成顺序流式发布；
-- ToolResult 返回模型时恢复为原始 ToolCall 顺序；
+- ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；complete ToolRound 只消费 Completed results；
 - schema、Hook 或 policy 对单个调用的拒绝形成该调用的 ToolResult；
 - 用户显式拒绝或 Turn cancellation 停止后续 preflight，并为未执行调用生成取消结果；
 - 所有等待 approval、锁和 executor 的操作都响应 Turn cancellation。
@@ -723,7 +751,8 @@ ToolResourceLocks 属于 ToolService，用于协调同一 Runtime 内跨 Turn �
 ## Tool 执行流程
 
 ```text
-ToolSet::execute(ToolCall[])
+ToolSet::execute(ToolExecutionRequest[])
+→ 使用 request.item_id 绑定 ToolInvocation / Interaction
 → 按 ToolCallSource resolve
 → 若为 invoke_tool，展开为真实 Deferred ToolCall
 → Exposure 校验
@@ -739,8 +768,9 @@ ToolSet::execute(ToolCall[])
 → Tool::execute
 → raw outcome audit
 → PostToolUse
-→ ToolResult
-→ 按原始顺序返回
+→ ToolExecutionOutcome::Completed { ToolResult }
+   或 Abandoned { reason }
+→ 按原始 request 顺序返回
 ```
 
 所有调用来源必须进入该唯一执行路径：
@@ -772,12 +802,14 @@ loop {
         break;
     }
 
+    let requests = start_tool_invocation_items(output.tool_calls).await?;
     check_control_and_revocation_barrier()?;
-    let results = turn_context
+    let outcomes = turn_context
         .tool_set
-        .execute(output.tool_calls)
+        .execute(requests)
         .await;
 
+    let results = require_all_completed_or_terminalize(outcomes).await?;
     let delta = commit_complete_tool_round(output, results).await?;
     committed_conversation.apply(delta);
 }
@@ -791,16 +823,24 @@ Tool 子系统与领域对象的关系：
 
 ```text
 模型返回 ToolCall
-→ 创建 ToolCall Item
+→ Session execution 分配 ItemId
+→ durable ToolInvocation Item = Started
+→ ToolSet.execute(ToolExecutionRequest { item_id, call })
 
 ToolExecutionGate 需要外部审批
-→ 创建 ToolApproval Interaction，归属于对应 ToolCall Item
+→ ToolInteractionPort 创建 durable ToolApproval Interaction
+→ Interaction 归属于同一个 ToolInvocation Item
 
-Tool 执行结束
-→ 创建 ToolResult Item
+Tool 执行得到 truthful ToolResult
+→ complete ToolRound commit
+→ 同一个 ToolInvocation Item = Completed { result }
+
+side-effect outcome unknown
+→ ToolInvocation Item = Abandoned
+→ 不生成 ToolResult
 ```
 
-Tool 子系统返回 typed events 和 ToolResult，由 future Session execution owner 完成 Item、Interaction 和 conversation 投影。
+Tool 子系统返回 typed ToolExecutionOutcome；Session execution owner负责 ToolInvocation、Interaction、terminal arbitration 和 conversation projection。完整领域语义见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
 Agent、Session 和 Turn 不持有：
 
@@ -826,22 +866,23 @@ Tool locks
 | Tool registration、Hook、policy、grant、Sandbox、locks | ToolService 内部实现 |
 | 本 Turn 的有效工具快照 | TurnExecutionContext 内的 ToolSet |
 | 模型调用循环与 ToolRound commit | future Session execution owner |
-| ToolCall / ToolResult | Item |
-| Tool approval request/decision | Interaction |
+| ToolCall + ToolResult | 同一个 ToolInvocation Item |
+| Tool approval request/decision | ToolInvocation-owned Interaction |
 
 ## 对象清单
 
 | 分类 | 对象 |
 | --- | --- |
 | 外部对象 | `Tool`、`ToolService`、`ToolSet` |
-| 外部 seam | `ToolHooks`、`ToolApprovalPort`、`ToolSandbox`、`ToolUpdateSink` |
+| 外部 seam | `ToolHooks`、`ToolSandbox`、`ToolUpdateSink` |
+| crate-internal execution seam | `ToolInteractionPort` |
 | 私有实现 | `ToolRegistry`、`ToolExecutionGate`、`ToolPolicy`、`ToolGrantStore`、`ToolResourceLocks`、`DeferredToolIndex` |
-| 调用值类型 | `ToolCall`、`ResolvedToolCall`、`ToolCallSource`、`ToolInvocation`、`ToolResult`、`ToolUpdate` |
+| 调用值类型 | `ToolCall`、`ToolExecutionRequest`、`ToolExecutionOutcome`、`ResolvedToolCall`、`ToolCallSource`、`ToolInvocation`、`ToolResult`、`ToolResultDisposition`、`ToolUpdate` |
 | 定义与上下文 | `ToolServiceConfig`、`ToolPolicyConfig`、`ToolName`、`ToolSpec`、`ToolExposure`、`ToolAnnotations`、`ToolConcurrency`、`ToolTurnContext`、`ToolCallContext`、`ToolExecutionContext`、`ToolSetFingerprint`、`ToolPromptView` |
 | 权限与资源 | `ToolRequirements`、`PermissionSet`、`FilePermission`、`NetworkPermission`、`ProcessPermission`、`EnvironmentPermission`、`ToolResourceAccess`、`ToolResourceKey`、`ToolResourceMode` |
 | 审批与授权 | `ToolApprovalRequest`、`ToolApprovalDecision`、`ToolGrantKey`、`ToolGrantScope`、`ToolGrantSuggestion`、`PolicyRevision`、`BeforeToolUseDecision` |
 | 保留模型路由 | `search_tools`、`invoke_tool` |
-| Domain 投影 | `Item::ToolCall`、`Item::ToolResult`、`Interaction::ToolApproval` |
+| Domain 投影 | `ItemContent::ToolInvocation`、`InteractionRequest::ToolApproval` |
 
 不建立以下独立对象：
 
@@ -881,8 +922,9 @@ CallToolTool / InvokeToolTool
 - executor 只接收 narrow ToolExecutionContext，不能访问 WorkspaceAccessView 或重新授权未声明 path；
 - approval 不替代 Sandbox；
 - 每个调用最多执行一次 PostToolUse 和 terminal lifecycle；
-- 所有 ToolCall 都产生对应 ToolResult；
-- ToolResult 按原始 ToolCall 顺序返回模型；
+- 正常、denied、failed 和 confirmed-cancelled ToolCall 都产生 truthful ToolResult；
+- outcome-unknown ToolCall 不生成 ToolResult，对应 ToolInvocation 进入 Abandoned；
+- ToolExecutionOutcome 按原始 request 顺序返回；只有全部 Completed results 才能进入 complete ToolRound；
 - 完整 ToolRound commit 前 ToolResult 不进入下一次逻辑模型调用；
 - ToolSet 不修改 Turn 状态，也不写回 Agent、Session、Turn 或 conversation storage。
 
@@ -898,7 +940,7 @@ CallToolTool / InvokeToolTool
 8. provider 原生 deferred loading 与 fallback `search_tools / invoke_tool` 的 adapter 规则。
 9. ToolUpdate 的事件类型和流式输出背压。
 10. Tool route/executor implementation fingerprint 的稳定生成和 cold recovery 规则；缺失时 recovery 必须 fail closed。
-11. ToolCall、ToolResult 和 approval Interaction 的持久化 commit 边界。
+11. ToolInvocation operational facts、complete ToolRound 和 approval Interaction 的 SessionStorage record 形状。
 
 ## 设计进度
 
@@ -915,7 +957,10 @@ CallToolTool / InvokeToolTool
 - [x] 确定 WorkspaceAccessView 是所有文件 ToolRequirements 的硬上限，grant/approval 不能扩大。
 - [x] 确定 `search_tools / invoke_tool` 命名和 Deferred 防绕过规则。
 - [x] 确定串行 preflight、并发执行、资源锁和稳定结果顺序。
-- [x] 确定 ToolCall、ToolResult 和 approval 的领域投影。
+- [x] 确定 ToolCall、ToolResult 合并为同一个 ToolInvocation Item。
+- [x] 确定 Tool approval 是 ToolInvocation-owned durable Interaction。
+- [x] 确定 ToolInteractionPort 由 Session execution 提供并遵守 request/resolution commit ordering。
+- [x] 确定 outcome unknown 时 Abandoned，不生成 synthetic ToolResult。
 - [ ] 定义 ToolName namespace 和 schema dialect。
 - [ ] 定义 ToolPolicy、grant、PermissionSet 和 ToolRequirements 的最终字段。
 - [ ] 定义 ToolSandbox adapter 和 ToolUpdate event。

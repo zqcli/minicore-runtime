@@ -114,12 +114,8 @@ Turn 对象不持有 Skill：
 pub struct Turn {
     pub id: TurnId,
     pub session_id: SessionId,
-    pub status: TurnStatus,
-    pub model: TurnModel,
-    pub prompt_fingerprint: Option<PromptFingerprint>,
-    pub items: Vec<Item>,
     pub started_at: Timestamp,
-    pub completed_at: Option<Timestamp>,
+    pub status: TurnStatus,
 }
 ```
 

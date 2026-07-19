@@ -574,9 +574,15 @@ Turn durable status：
 ```rust
 pub enum TurnStatus {
     Running,
-    Completed,
-    Interrupted,
-    Failed,
+    Completed { completed_at: Timestamp },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruption,
+    },
+    Failed {
+        completed_at: Timestamp,
+        failure: TurnFailure,
+    },
 }
 ```
 
@@ -610,7 +616,8 @@ pub enum TurnExecutionPhase {
 TurnStatus = Running
 SessionExecutionState = Running
 TurnExecutionPhase = WaitingApproval
-InteractionStatus = Pending
+InteractionState = Pending
+ToolInvocationState = Started
 ```
 
 Approval：
@@ -622,7 +629,7 @@ Deny  → 产生 denied ToolResult
 → PreparingModel
 ```
 
-等待审批不是 Interrupted。
+等待审批不是 Interrupted。Interaction 和 parent ToolInvocation 的完整语义见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
 ### Steer
 
@@ -953,8 +960,8 @@ Runtime restart：
 5. 重建 committed conversation；
 6. 重新 resolve Workspace；
 7. 检测没有 terminal fact 的旧 Turn及其 pending Interaction；
-8. baseline 使用一个幂等 recovery batch 同时提交 `TurnInterrupted(HostRestart | RecoveryContextUnavailable)` 和所有 pending Interaction closure；
-9. 对已 terminal 但遗留 pending Interaction 的损坏状态执行同一 idempotent closure repair；
+8. baseline 使用一个幂等 recovery batch 同时提交 `TurnInterrupted(HostRestart | RecoveryContextUnavailable)`、所有 pending Interaction closure，以及 Started ToolInvocation 的 Completed(existing exact durable result)/Abandoned closure；
+9. 对已 terminal 但遗留 pending Interaction 或 Started Item 的损坏状态执行同一 idempotent closure repair；
 10. 进入 Ready、Unavailable 或返回 typed load error。
 
 禁止：
@@ -1085,7 +1092,7 @@ Agent release channel
 - fork 不复制 loaded execution state或 authorization capability；
 - host restart 后 loaded state 全部丢失，可由 durable truth 重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
-- recovery terminalization 与 pending Interaction closure 使用同一个幂等 batch。
+- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 使用同一个幂等 batch。
 
 ## Test Matrix
 
@@ -1129,8 +1136,8 @@ Agent release channel
 - Steer expected TurnId 与 final terminal commit race；
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；
-- recovery batch 原子 terminalize Turn 并持久关闭 pending Interaction；
-- 已 terminal Turn 遗留 pending Interaction 的幂等 repair；
+- recovery batch 原子 terminalize Turn、关闭 pending Interaction并 Completed/Abandoned Started ToolInvocation；
+- 已 terminal Turn 遗留 pending Interaction 或 Started Item 的幂等 repair；
 - missing exact revision fail closed；
 - Deleted identity 不复用；
 - Purge 不属于普通 lifecycle。
@@ -1163,6 +1170,6 @@ Agent release channel
 - [x] 定义 active/future Turn 和 lifecycle race。
 - [x] 定义 WaitingApproval、Steer 和 Interrupted 的关系。
 - [x] 定义 conservative crash recovery。
-- [ ] 完成 Turn/Item/Interaction 类型。
+- [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
 - [ ] 完成 Conversation/SessionStorage storage identity 和 commit contract。
 - [ ] 完成 Session execution owner 与公开 Runtime interface。

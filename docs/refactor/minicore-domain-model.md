@@ -86,7 +86,7 @@ Item            1 ── N Interaction
 - Definition 保存稳定定义和版本；
 - `MiniCoreRuntime` 启动时初始化一个 `Arc<PromptService>`；
 - Turn admission 先预留 candidate Turn identity，再创建执行期不可变 `PromptSet`；
-- Turn 领域对象不持有完整 PromptSet，只保留可选 Prompt fingerprint；
+- Turn 领域对象不持有 PromptSet 或 Prompt fingerprint；exact Prompt references 属于 start execution metadata；
 - PromptSet 负责 CanonicalUserMessage 和最终模型上下文组装；
 - `MiniCoreRuntime` 启动时初始化一个 `Arc<ToolService>`；
 - Agent、Session 和 Turn 领域对象不持有 Tool 属性；
@@ -104,10 +104,11 @@ Item            1 ── N Interaction
 - 同一个 PromptDefinition 可以在不同 Session 中具有不同的启用和可见状态；
 - SessionDefinition pin exact `AgentRevisionRef`；Agent current update 不自动改变既有 Session；
 - Turn 不持有 `AgentId`、`AgentRevisionRef`、SessionDefinition 或 Workspace；
-- Turn 从一条用户消息开始，到下一条用户消息开始之前结束；
+- Turn 从 initiating UserMessage start batch commit 开始，到 terminal batch commit 结束；
 - Steer 是 current Turn control input；FollowUp 在当前 Turn terminal 后开启新 Turn；
-- Item 是 Turn 内各类消息和可观察内容的统一概念；
-- Interaction 是 Item 执行期间产生的 request/response 交互。
+- Item 的最小集合是 UserMessage、AgentMessage、Reasoning 和 ToolInvocation；
+- ToolCall 与 ToolResult 属于同一个 ToolInvocation Item；
+- Interaction 是 Item-owned durable request/resolution，遵守 request-before-notify 和 resolution-before-resume。
 
 ## 领域关系
 
@@ -221,20 +222,18 @@ Model 的 identity、字段、状态和生命周期将在后续设计中单独�
 
 ### Turn
 
-Turn 表示由一条用户消息开启、在下一条用户消息开始前结束的过程。
+Turn 表示从 committed initiating UserMessage 到一个 terminal batch 的用户意图执行过程。
 
 ```rust
 pub struct Turn {
     pub id: TurnId,
     pub session_id: SessionId,
-    pub status: TurnStatus,
-    pub model: TurnModel,
-    pub prompt_fingerprint: Option<PromptFingerprint>,
-    pub items: Vec<Item>,
     pub started_at: Timestamp,
-    pub completed_at: Option<Timestamp>,
+    pub status: TurnStatus,
 }
 ```
+
+Turn 逻辑上拥有有序 Items，但 durable Turn head 不内联 `Vec<Item>`；Item 顺序由 SessionStorage projection 提供。
 
 Turn 不直接持有 Agent identity 或 Workspace。active/recovered Turn 通过 start batch 关联的 exact execution metadata 解析：
 
@@ -258,13 +257,9 @@ session_definition
 workspace
 ```
 
-Turn scope 的 Model 暂时使用不透明类型：
+Turn 使用的 exact Model、Prompt、Workspace、Tool、Skill 和 Agent/Session definition references 属于 start batch execution metadata，不重复保存在 Turn head。
 
-```rust
-pub struct TurnModel;
-```
-
-Turn 领域对象不持有 PromptSet 或完整 Prompt definitions。Session execution 在 admission 期间捕获 exact SessionDefinitionRevision 和 AgentRevisionRef，再创建执行期不可变 PromptSet。PromptSet 规范化 initiating UserMessage；只有 start batch 成功 commit 后领域 Turn 才正式开始。Turn 可以保存 Prompt fingerprint 用于一致性、diagnostics 或后续审计。完整规则见 [Prompt 子系统架构设计](prompt-subsystem.md)。
+Turn 领域对象不持有 PromptSet、Prompt fingerprint 或完整 Prompt definitions。Session execution 在 admission 期间捕获 exact SessionDefinitionRevision 和 AgentRevisionRef，再创建执行期不可变 PromptSet。PromptSet 规范化 initiating UserMessage；只有 start batch 成功 commit 后领域 Turn 才正式开始。Prompt fingerprint 属于 execution metadata。完整规则见 [Prompt 子系统架构设计](prompt-subsystem.md)。
 
 Turn 领域对象不持有 Tool、ToolSet、ToolSpec 或 executor。candidate admission 在第一次模型调用前通过 Runtime 的 `ToolService::for_turn(...)` 创建执行期 `ToolSet`。同一 Turn 内的全部 LLM → Tool → LLM 循环复用该 ToolSet，Turn terminal 后释放。`for_turn` 不创建 Turn，也不修改 TurnStatus。完整规则见 [Tool 子系统架构设计](tool-subsystem.md)。
 
@@ -308,40 +303,58 @@ Turn execution 包含并驱动 AgentLoop。`NeedModel / NeedTools / Finished` �
 
 ### Item
 
-Item 是 Turn 内各类消息和可观察内容的统一概念。
+Item 是 Turn 内稳定、可观察的语义值或长生命周期操作：
 
 ```rust
 pub struct Item {
     pub id: ItemId,
     pub turn_id: TurnId,
-    pub item_type: ItemType,
-    pub status: ItemStatus,
     pub content: ItemContent,
+}
+
+pub enum ItemContent {
+    UserMessage(UserMessageItem),
+    AgentMessage(AgentMessageItem),
+    Reasoning(ReasoningItem),
+    ToolInvocation(ToolInvocationItem),
 }
 ```
 
-以下对象属于 Item 的语义范围：
-
-```text
-UserMessage
-AgentMessage
-Reasoning
-ToolCall
-ToolResult
-```
-
-是否加入 Plan、FileChange、CommandExecution、Compaction 或其他 Item type，留待后续 Item 设计决定。
-
-`ItemType` 和 `ItemContent` 暂时保持不透明：
+`ItemType` 从 ItemContent discriminant 派生，不独立存储：
 
 ```rust
-pub struct ItemType;
-pub struct ItemContent;
+pub enum ItemType {
+    UserMessage,
+    AgentMessage,
+    Reasoning,
+    ToolInvocation,
+}
 ```
+
+ToolCall 和 ToolResult 属于同一个 ToolInvocation Item：
+
+```rust
+pub struct ToolInvocationItem {
+    pub call: ToolCall,
+    pub state: ToolInvocationState,
+}
+
+pub enum ToolInvocationState {
+    Started,
+    Completed { result: ToolResult },
+    Abandoned { reason: ToolAbandonReason },
+}
+```
+
+UserMessage、AgentMessage 和 Reasoning durable Item 创建时即完成。ToolInvocation 可以从 Started 进入 Completed 或 Abandoned。streaming delta、Tool progress、provider retry 和 execution phase 不是 Item。
+
+Plan、FileChange、CommandExecution 和 Compaction 当前不增加独立 Item variant：Command/FileChange 先作为 ToolInvocation details，Compaction 是 conversation/storage fact；只有出现真实独立 lifecycle 后才扩展。
+
+完整 Item、identity、ToolRound 和 recovery 规则见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
 ### Interaction
 
-Interaction 表示某个 Item 执行期间，由 Runtime 发起并等待外部回答的 request/response 交互。
+Interaction 表示某个 Item 执行期间，由 Runtime 发起并等待外部回答的 durable request/response：
 
 ```rust
 pub struct Interaction {
@@ -349,9 +362,25 @@ pub struct Interaction {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub item_id: ItemId,
-    pub status: InteractionStatus,
     pub request: InteractionRequest,
-    pub resolution: Option<InteractionResolution>,
+    pub state: InteractionState,
+}
+
+pub enum InteractionState {
+    Pending {
+        requested_at: Timestamp,
+        expires_at: Option<Timestamp>,
+    },
+    Resolved {
+        resolution: InteractionResolution,
+        resolution_key: IdempotencyKey,
+        resolved_at: Timestamp,
+    },
+}
+
+pub enum InteractionRequest {
+    ToolApproval(ToolApprovalRequest),
+    UserQuestion(UserQuestionRequest),
 }
 ```
 
@@ -361,7 +390,9 @@ Interaction 的归属关系固定为：
 Interaction → Item → Turn → Session → Agent
 ```
 
-Approval、用户补充输入和其他外部请求都可以在未来定义为 Interaction type。具体 request family、decision set、timeout、恢复和 transport 行为暂不决定。
+request 必须先 commit 再通知 host；resolution 必须携带 durable idempotency key，并先 commit 再唤醒 waiter或执行 Tool。expires_at 在同一 commit gate 校验；transport disconnect 不自动关闭 Pending Interaction，reconnect 使用相同 RequestId 重发。host restart baseline 在 recovery batch 中关闭 pending request并中断 Turn。
+
+结构化 Interaction response 不是 UserMessage，不开启新 Turn。完整 family、timeout、race 和 recovery 规则见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
 ## Definition
 
@@ -411,7 +442,7 @@ Prompt scope 和模型 role 是正交概念：Runtime、Agent、Session 表示�
 
 PromptService 可以加载 Prompt-specific source、解析 scope overrides、稳定排序并创建 PromptSet，但不拥有 Workspace 生命周期、conversation、Tool executor、Skill loader 或 provider。PromptService 只消费 `ToolPromptView` 和 `SkillCatalogView` 这类窄模型安全 view。
 
-Turn 领域对象不持有 PromptSet；完整 PromptSet 属于 Turn 执行上下文。Turn 可以保存可选 Prompt fingerprint。
+Turn 领域对象不持有 PromptSet；完整 PromptSet 属于 Turn 执行上下文。Prompt fingerprint 进入 Turn start execution metadata。
 
 PromptDefinition、PromptSourceAdapter、PromptTurnContext、PromptSet、PromptIntent、CanonicalUserMessage、PromptContribution、AssembledModelContext、fingerprint 和校验规则以 [Prompt 子系统架构设计](prompt-subsystem.md) 为权威。
 
@@ -429,7 +460,7 @@ candidate Turn admission
 └─ ToolService::for_turn(ToolTurnContext)
    └─ ToolSet
       ├─ prompt_view() → ToolPromptView
-      └─ execute(ToolCall[]) → ToolResult[]
+      └─ execute(ToolExecutionRequest[]) → ToolExecutionOutcome[]
 ```
 
 `ToolService::for_turn(...)` 从 Turn admission 的执行边界开始：Session execution 已预留 candidate Turn identity，但领域 Turn 尚未对外发布。该方法不创建领域 Turn，不改变 TurnStatus，也不属于 Turn 对象。返回的 ToolSet 只存在于执行期；若 start commit 失败，直接随 candidate Context 释放。
@@ -437,15 +468,14 @@ candidate Turn admission
 领域投影固定为：
 
 ```text
-ToolCall
-→ Item
-
-ToolResult
-→ Item
+ToolCall + ToolResult
+→ 同一个 ToolInvocation Item
 
 Tool approval request / decision
-→ Interaction，归属于对应 ToolCall Item
+→ Interaction，归属于对应 ToolInvocation Item
 ```
+
+ToolInvocation Started 可以作为 durable operational truth，但只有 Completed invocation 随完整 ToolRound commit 后才进入模型 conversation；outcome unknown 时进入 Abandoned，不构造 synthetic ToolResult。
 
 Tool 注册、ToolSpec、Direct/Deferred/Hidden 披露、参数校验、Hook、policy、approval、Sandbox、并发和稳定结果顺序以 [Tool 子系统架构设计](tool-subsystem.md) 为权威。
 
@@ -678,9 +708,17 @@ Starting failure → Idle
 ```rust
 pub enum TurnStatus {
     Running,
-    Completed,
-    Interrupted,
-    Failed,
+    Completed {
+        completed_at: Timestamp,
+    },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruption,
+    },
+    Failed {
+        completed_at: Timestamp,
+        failure: TurnFailure,
+    },
 }
 ```
 
@@ -704,28 +742,33 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-等待审批时 TurnStatus 仍为 Running，InteractionStatus 为 Pending。Steer 默认排队到 stable barrier，不把 Turn 变为 Interrupted。
+等待审批时 TurnStatus 仍为 Running，InteractionState 为 Pending，parent ToolInvocationState 为 Started。Steer 默认排队到 stable barrier，不把 Turn 变为 Interrupted。
 
 ### ItemStatus
+
+ItemStatus 是从 ItemContent 派生的 read projection，不独立保存：
 
 ```rust
 pub enum ItemStatus {
     Started,
     Completed,
+    Abandoned,
 }
 ```
 
-Item 的通用生命周期为：
-
 ```text
-Started
-→ 可选 typed delta
-→ Completed
+UserMessage / AgentMessage / Reasoning
+→ durable 创建时即 Completed
+
+ToolInvocation
+→ Started → Completed | Abandoned
 ```
 
-Item-specific success、failure、declined、cancelled 等结果是否进入 `ItemStatus`，还是进入 typed `ItemContent`，暂不决定。
+Completed 不等于业务成功；failed、denied 和 confirmed cancellation 都可以拥有 truthful ToolResult 并完成。Abandoned 表示没有可安全构造的 ToolResult，不能进入模型 conversation。
 
 ### InteractionStatus
+
+InteractionStatus 从 InteractionState 派生，不与 resolution 分开存储：
 
 ```rust
 pub enum InteractionStatus {
@@ -734,23 +777,21 @@ pub enum InteractionStatus {
 }
 ```
 
-基础生命周期：
-
 ```text
-Pending
-→ 可选外部 response
-→ Resolved
+Pending { request, timestamps }
+→ Resolved { typed resolution, resolved_at }
 ```
 
-`Resolved` 只表示 request 已关闭，不表示已批准、成功或执行完成。
+Resolved 只表示 request 已关闭，不表示已批准、成功或 Tool 已执行。
 
 ## Turn 边界
 
 Turn 的定义是：
 
 ```text
-从一条用户消息开始
-到下一条用户消息开始之前结束
+initiating UserMessage 所在 start batch 成功 commit
+→ Turn Running
+→ Completed / Interrupted / Failed terminal batch 成功 commit
 ```
 
 由此得到以下基础不变量：
@@ -799,7 +840,8 @@ SessionDefinition.agent: AgentRevisionRef
 Turn.id + Turn.session_id
 Item.id + Item.turn_id
 Interaction.request_id + session_id + turn_id + item_id
-TurnId + ToolCallId
+ToolInvocation Item: ItemId + ToolCallId correlation
+Interaction: RequestId + parent ItemId
 PromptId + DefinitionVersion
 SkillId + DefinitionVersion
 ```
@@ -808,11 +850,12 @@ SkillId + DefinitionVersion
 
 - fork tree identity；
 - storage entry identity；
-- ToolCallId 的生成方式、全局唯一范围和 provider call ID mapping；
+- ToolCallId 的生成方式、provider exact echo 和全局唯一范围；
 - ID 的生成方式；
 - ID 的全局唯一范围；
 - fork 时 ID 是否保留；
-- Item 与持久化记录的映射。
+- Item 与持久化记录的 exact mapping；
+- fork 时 ItemId、RequestId 和 ToolCallId 的保留/remap。
 
 ## 领域所有权
 
@@ -830,7 +873,7 @@ SkillId + DefinitionVersion
 | 当前 WorkspaceSnapshot | loaded Session execution state；Turn 执行上下文 pin 不可变引用 |
 | canonical roots / effective grants / Workspace views | WorkspaceResolver 解析和 WorkspaceSnapshot 投影 |
 | persisted trust / managed Workspace policy | WorkspaceAuthority adapter 或其后端 store |
-| TurnModel / optional PromptFingerprint | Turn |
+| Turn exact Model / Prompt / execution references | Turn start execution metadata |
 | Turn | Session |
 | Item | Turn |
 | Interaction | Item |
@@ -845,7 +888,7 @@ SkillId + DefinitionVersion
 - 哪个 actor 或 manager 持有 mutable state；
 - Definition content 是内联值还是 immutable content reference；
 - scope definitions 是新增定义、完整集合还是只保存引用；
-- Item 和 Interaction 是否持久化；
+- Item/Interaction 的 immutable storage record 和 projection 具体形状；
 - Runtime 是否允许多个 Agent 或 Session 同时 active。
 
 ## 最小代码骨架
@@ -902,20 +945,21 @@ pub struct SessionDefinition {
 pub struct Turn {
     pub id: TurnId,
     pub session_id: SessionId,
-    pub status: TurnStatus,
-    pub model: TurnModel,
-    pub prompt_fingerprint: Option<PromptFingerprint>,
-    pub items: Vec<Item>,
     pub started_at: Timestamp,
-    pub completed_at: Option<Timestamp>,
+    pub status: TurnStatus,
 }
 
 pub struct Item {
     pub id: ItemId,
     pub turn_id: TurnId,
-    pub item_type: ItemType,
-    pub status: ItemStatus,
     pub content: ItemContent,
+}
+
+pub enum ItemContent {
+    UserMessage(UserMessageItem),
+    AgentMessage(AgentMessageItem),
+    Reasoning(ReasoningItem),
+    ToolInvocation(ToolInvocationItem),
 }
 
 pub struct Interaction {
@@ -923,25 +967,21 @@ pub struct Interaction {
     pub session_id: SessionId,
     pub turn_id: TurnId,
     pub item_id: ItemId,
-    pub status: InteractionStatus,
     pub request: InteractionRequest,
-    pub resolution: Option<InteractionResolution>,
+    pub state: InteractionState,
 }
 ```
 
 ## 后续设计顺序
 
-1. PromptDefinition priority、content identity 和 source adapter 的完整规则。
-2. Runtime、Agent、Session scope Prompt definitions 与 overrides 的精确合并规则。
-3. PromptSet fingerprint、cache、失效和 Turn recovery 规则。
-4. 继续完善 SkillMetadata、Skill content identity 和 Injection 格式。
-5. Model 的最小类型。
-6. Turn、Item 和 Interaction 的完整类型与 terminal semantics。
-7. Session conversation、storage、commit batch 和 fork identity。
-8. Session execution owner、FollowUp 调度和并发状态机。
-9. ModelGateway 与 AgentLoop adapter。
-10. command、query、event、snapshot 和 transport protocol。
-11. retry、compaction、review 和 background work。
+1. Session conversation、storage、atomic batch、projection rebuild 和 fork identity。
+2. Session execution owner、FollowUp 调度和并发状态机。
+3. ModelGateway 与 AgentLoop adapter。
+4. compaction。
+5. command、query、event、snapshot 和 transport protocol。
+6. review、background work 和按需 Extension/Plugin。
+
+跨阶段 backlog：PromptDefinition priority/content identity、scope merge、Skill namespace/content identity 和 Model 最小类型；在对应消费方需要前闭合，不改变上述主路径顺序。
 
 ## 设计进度
 
@@ -960,7 +1000,7 @@ pub struct Interaction {
 - [x] 固化 Runtime 初始化 PromptService、Turn 执行期创建 PromptSet 的 Prompt 子系统关系。
 - [x] 确定 PromptService 只消费 ToolPromptView 和 SkillCatalogView，不主动调用 ToolService 或 SkillService。
 - [x] 确定 PromptSet 负责 CanonicalUserMessage、最终模型上下文和 MessageRecord → ModelMessage 转换。
-- [x] 确定 Turn 领域对象不持有 PromptSet，只保留可选 Prompt fingerprint。
+- [x] 确定 Turn 领域对象不持有 PromptSet 或 Prompt fingerprint；exact reference 属于 start execution metadata。
 - [x] 确定 Turn 不持有 Agent identity、revision 或 Workspace。
 - [x] 确定 SessionDefinition pin exact AgentRevisionRef，Agent update 不自动改变 Session。
 - [x] 定义 AgentDefinition、SessionDefinition 和 SessionDefinitionRevision。
@@ -968,7 +1008,7 @@ pub struct Interaction {
 - [x] 使用 Enabled/Disabled/Deleted 与 Open/Archived/Deleted。
 - [x] 定义 Session load/readiness/execution state 和 TurnExecutionPhase。
 - [x] 确定 WaitingApproval 和 Steer 不使 Turn 进入 Interrupted。
-- [x] 确定 Turn 从一条用户消息开始，到下一条用户消息开始前结束。
+- [x] 确定 Turn 从 initiating UserMessage start commit 开始，到 terminal batch commit 结束。
 - [x] 定义 Agent、Session、Turn、Item 和 Interaction 的基础状态。
 - [x] 固化 Runtime 初始化 SkillService、loaded Session execution 注入、Turn 按需使用的 Skill 子系统关系。
 - [x] 确定 Turn 对象不持有 Skill、Catalog、LoadedSkill 或 Skill snapshot。
@@ -980,10 +1020,16 @@ pub struct Interaction {
 - [x] 确定 TurnExecutionContext pin WorkspaceSnapshot、SkillCatalog、ToolSet、PromptSet 和 Model。
 - [x] 定义逻辑模型调用与 provider retry 边界，不增加 ModelStep 领域类型或独立 ID。
 - [x] 区分 Steer 与 FollowUp；FollowUp 开启下一 Turn。
+- [x] 定义最小 ItemContent：UserMessage、AgentMessage、Reasoning、ToolInvocation。
+- [x] 确定 ItemType/ItemStatus 从 ItemContent 派生，不独立保存。
+- [x] 合并 ToolCall/ToolResult 为同一个 ToolInvocation Item。
+- [x] 定义 ToolInvocation Started/Completed/Abandoned 和 outcome-unknown recovery。
+- [x] 定义 Interaction request/resolution、commit ordering、reconnect 和 timeout。
+- [x] 确定 terminal Turn 不保留 Pending Interaction 或 Started Item。
 - [ ] 定义 PromptDefinition 的完整字段和内容 identity。
 - [ ] 定义 scope 合并规则。
 - [ ] 定义 Model。
-- [ ] 定义 Item type 和 content。
-- [ ] 定义 Interaction family。
+- [x] 定义 Item type 和 content。
+- [x] 定义 Interaction family。
 - [ ] 定义 storage 和 protocol。
 - [ ] 定义 manager 和 execution ownership。

@@ -273,7 +273,7 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, cancellation, updates
+     provider: model.capabilities(), execution_mode, interactions, cancellation, updates
    }) → ToolSet
 
 SkillCatalog.prompt_view()
@@ -327,30 +327,34 @@ SkillCatalog.prompt_view()
 
 ### 阶段 4：Turn、Item 与 Interaction
 
-目标文档：
+目标文档：[Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
-```text
-docs/refactor/turn-item-interaction.md
-```
+状态：目标架构已确定。
 
-必须定义：
+已明确：
 
-- Turn 从 UserMessage 开始、到下一条 UserMessage 前结束；
-- Steer 作为 current Turn control input 的条件；
-- `ItemType` 和 `ItemContent` 的最小封闭集合；
-- UserMessage、AgentMessage、Reasoning、ToolCall、ToolResult 的 Item 表达；
-- Interaction request、resolution、timeout 和 cancellation；
-- Tool approval 与 ToolCall Item 的归属；
-- pending Interaction 的 reconnect/resend 和 abrupt transport loss；
-- `TurnStatus = Running | Completed | Interrupted | Failed`；
-- WaitingApproval 等 execution phase 与 InteractionStatus 的关系；
-- cancel、shutdown、Unavailable diagnostics 和 terminal semantics。
+- Turn 从 committed initiating UserMessage 开始，到 terminal batch 结束；
+- Steer 只作用于 expected Running Turn，FollowUp 开启下一 Turn；
+- `ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；
+- ItemType/ItemStatus 从 ItemContent 派生，不独立保存；
+- ToolCall 与 ToolResult 合并为同一个 ToolInvocation Item；
+- ToolInvocation `Started → Completed | Abandoned`；
+- outcome unknown 不生成 synthetic ToolResult；
+- Interaction request/resolution、timeout 和 cancellation family；
+- request-before-notify、resolution-before-resume/side-effect；
+- Tool approval 与 UserQuestion 归属于 parent Item；
+- pending Interaction reconnect/resend 和 abrupt transport loss；
+- `TurnStatus = Running | Completed | Interrupted | Failed` 与 typed terminal detail；
+- WaitingApproval、Steer、terminal cleanup 和 conservative recovery。
 
 完成门槛：
 
-- Item 与 transcript/storage entry 的关系可以被精确定义；
-- 每个 Interaction 可追溯到 Item、Turn 和 Session；
-- ToolCall、ToolResult 和 approval 不再使用并列、互不关联的 identity。
+- [x] Item 与 transcript/storage record 的关系可以被精确定义；
+- [x] 每个 Interaction 可追溯到 Item、Turn 和 Session；
+- [x] ToolCall、ToolResult 和 approval 使用同一个 ToolInvocation Item identity；
+- [x] terminal Turn 不保留 Pending Interaction 或 Started Item；
+- [x] streaming delta/progress 与 durable Item truth 分离；
+- [x] 不引入 ItemManager、InteractionService、ModelStep 或 ToolRound entity。
 
 ### 阶段 5：Conversation 与 SessionStorage
 
@@ -367,7 +371,7 @@ docs/refactor/conversation-storage.md
 - SessionStorage 的 interface 与 durable ownership；
 - UserInput、完整 ToolRound、Steer、Compaction 和 final AgentMessage 的 commit unit；
 - `ItemId`、storage entry identity 和 fork identity；
-- 一个 ToolCall Item 对多条持久化 entry 的映射；
+- 一个 ToolInvocation Item 对多条 immutable operational/conversation records 的映射；
 - `CommittedConversationState` 的 delta apply；
 - reload、repair、corruption 和 partial write；
 - fork、branch、current leaf 和 stable navigation boundary。
@@ -662,7 +666,9 @@ Runtime facade 是唯一外部入口
 - [x] Agent/Session revision 与 durable/runtime lifecycle 语义已确定；
 - [x] TurnExecutionContext 可以稳定绑定 AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 Model；
 - [x] Session load/reload/unload 与 fork lifecycle 有确定行为；
-- [ ] compaction 和 pending Interaction 的完整行为有确定定义；
+- [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
+- [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
+- [ ] compaction 的完整行为有确定定义；
 - [ ] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [ ] 新文档已进入正式架构目录；
@@ -676,7 +682,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 按照本文顺序，下一份目标设计文档是：
 
 ```text
-docs/refactor/turn-item-interaction.md
+docs/refactor/conversation-storage.md
 ```
 
-Agent/Session lifecycle 已确定为“exact AgentRevisionRef pin + immutable SessionDefinitionRevision + durable/runtime 状态分离”。下一阶段需要完成 Turn、Item、Interaction 的封闭类型、pending request 和 terminal semantics。在 Turn/Item/Interaction 与 storage 稳定前，不冻结 Session execution 的 actor/task 形状或公开 protocol。
+Turn/Item/Interaction 已确定为“operation-centric ToolInvocation Item + durable Interaction + terminal cleanup”。下一阶段需要定义单一 transcript、immutable storage records、atomic batch、Item/Entry identity 和 projection rebuild。在 Conversation/SessionStorage 稳定前，不冻结 Session execution 的 actor/task 形状或公开 protocol。
