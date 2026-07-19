@@ -143,12 +143,8 @@ Turn 领域对象不持有 PromptSet：
 pub struct Turn {
     pub id: TurnId,
     pub session_id: SessionId,
-    pub status: TurnStatus,
-    pub model: TurnModel,
-    pub prompt_fingerprint: Option<PromptFingerprint>,
-    pub items: Vec<Item>,
     pub started_at: Timestamp,
-    pub completed_at: Option<Timestamp>,
+    pub status: TurnStatus,
 }
 ```
 
@@ -156,7 +152,10 @@ pub struct Turn {
 
 ```text
 Turn domain
-→ identity、status、items、可选 prompt fingerprint
+→ identity、started_at、terminal-aware status
+
+Turn start execution metadata
+→ exact Prompt/Model/Workspace/Tool/Skill fingerprints and references
 
 TurnExecutionContext
 → PromptSet、ToolSet、pinned SkillCatalog 和 WorkspaceSnapshot 等执行期对象
