@@ -273,7 +273,7 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, interactions, cancellation, updates
+     provider: model.capabilities(), execution_mode, turn_port, cancellation, updates
    }) → ToolSet
 
 SkillCatalog.prompt_view()
@@ -358,31 +358,35 @@ SkillCatalog.prompt_view()
 
 ### 阶段 5：Conversation 与 SessionStorage
 
-目标文档：
+目标文档：[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
-```text
-docs/refactor/conversation-storage.md
-```
+状态：目标架构已确定。
 
-必须定义：
+已明确：
 
-- 单一有序 transcript；
-- committed batch 和 commit-before-visible；
-- SessionStorage 的 interface 与 durable ownership；
-- UserInput、完整 ToolRound、Steer、Compaction 和 final AgentMessage 的 commit unit；
-- `ItemId`、storage entry identity 和 fork identity；
-- 一个 ToolInvocation Item 对多条 immutable operational/conversation records 的映射；
-- `CommittedConversationState` 的 delta apply；
-- reload、repair、corruption 和 partial write；
-- fork、branch、current leaf 和 stable navigation boundary。
+- per-session append-only JSONL batch log；
+- `SessionWriter::commit(SessionWriteBatch)` 是唯一 runtime write seam；
+- SessionHeader 只由 create/fork staging 原子写入；
+- 一个物理 line 编码一个完整 StoredSessionBatch；
+- operational facts 与 conversation promotion facts 位于同一个 durable log；
+- TurnStart、Interaction、Tool barrier/outcome、complete ToolRound、Steer、Compaction 和 terminal commit units；
+- ItemId、ToolCallId、EntryId、LeafId 和 BatchId 分离；
+- `CommittedConversationState / View / Delta / Checkpoint`；
+- trusted all-projection apply、AdvanceOnly 和 mismatch reload；
+- parent_leaf branch tree、current leaf 和 stable checkpoint；
+- fork staging deep copy + target-local identity remap；
+- append-only compaction overlay；
+- partial tail、strict corruption、explicit repair 和 conservative recovery；
+- projection snapshot/session index 只是 rebuildable cache。
 
 完成门槛：
 
-- durable truth 只有 SessionStorage；
-- 任意模型调用只能从 committed transcript 构建 conversation；
-- 热内存 projection 可由存储和 commit delta 重建；
-- 不存在 current/previous input 等长期特殊消息 lane；
-- crash 后不会把半个 ToolRound 暴露给模型或 UI。
+- [x] durable truth 只有 SessionStorage；
+- [x] 任意模型调用只能从 committed transcript 构建 conversation；
+- [x] 热内存 projection 可由 storage replay 和 commit delta 重建；
+- [x] 不存在 current/previous input 等长期特殊消息 lane；
+- [x] crash 后不会把半个 ToolRound 提升为模型 transcript；UI 只看见 truthful Started/Outcome/Abandoned operational state，不把它伪装为 Completed round；
+- [x] 不引入 dual log、Branch entity、baseline SQLite 或 content-addressed DAG。
 
 ### 阶段 6：Session 执行子系统
 
@@ -401,7 +405,8 @@ docs/refactor/session-execution.md
 - Steer 作为 current Turn control input、FollowUp 作为下一 Turn submission；
 - retry、overflow recovery、cancellation 和 timeout；
 - pending Interaction 的等待与恢复；
-- commit、事件和状态变更的顺序；
+- ToolTurnPort 如何通过唯一 SessionWriter 实现 approval、execution-start 和 outcome barriers；
+- SessionWriteBatch construction、apply_committed、事件和状态变更的顺序；
 - Session actor、run task 或其他 execution owner 是否必要。
 
 只有在状态机和所有权明确后，才决定最终使用 manager、actor、task 或 registry 的具体形状。
@@ -411,7 +416,7 @@ docs/refactor/session-execution.md
 - 每个 mutation 只有一个执行 owner；
 - 同一 Turn 复用同一个 TurnExecutionContext、PromptSet、ToolSet 和 pinned SkillCatalog；
 - Session execution 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
-- commit、模型可见性和 UI 可见性顺序无歧义；
+- commit、all-projection apply、模型可见性、side effect 和 UI 可见性顺序无歧义；
 - abort/retry/recovery 不产生重复 terminal fact；
 - session execution 可以通过公开 interface 进行集成测试。
 
@@ -668,7 +673,8 @@ Runtime facade 是唯一外部入口
 - [x] Session load/reload/unload 与 fork lifecycle 有确定行为；
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
-- [ ] compaction 的完整行为有确定定义；
+- [x] Conversation/SessionStorage durable ownership、batch、branch、fork 和 recovery 已确定；
+- [ ] compaction orchestration 的完整行为有确定定义；
 - [ ] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [ ] 新文档已进入正式架构目录；
@@ -682,7 +688,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 按照本文顺序，下一份目标设计文档是：
 
 ```text
-docs/refactor/conversation-storage.md
+docs/refactor/session-execution.md
 ```
 
-Turn/Item/Interaction 已确定为“operation-centric ToolInvocation Item + durable Interaction + terminal cleanup”。下一阶段需要定义单一 transcript、immutable storage records、atomic batch、Item/Entry identity 和 projection rebuild。在 Conversation/SessionStorage 稳定前，不冻结 Session execution 的 actor/task 形状或公开 protocol。
+Conversation/SessionStorage 已确定为“one SessionWriter + one JSONL batch tree + rebuildable projections”。下一阶段需要定义 Session execution owner、batch construction、AgentLoop drive、FollowUp queue、commit gate 和 terminal arbitration；公开 protocol 仍留到 execution 与 ModelGateway 稳定后冻结。

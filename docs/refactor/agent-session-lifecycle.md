@@ -21,7 +21,7 @@
 
 - Agent/Session 的 manager、actor、registry 或 store 具体类型；
 - Runtime command、query、event 和 transport payload；
-- SessionStorage entry、fork identity remap 和 transaction 形状；
+- SessionStorage record/batch/fork remap 的重复定义；这些以 [Conversation 与 SessionStorage 架构设计](conversation-storage.md) 为权威；
 - loaded Session 使用 task、actor、thread 或其他 execution owner；
 - Agent definition 的 Tool/Skill/Model 等未来完整字段；
 - physical purge、retention 和 revision GC 策略。
@@ -809,7 +809,7 @@ CloneAgent
 
 - source 为 Open 或 Archived；
 - source 不为 Deleted；
-- source boundary 是 genesis 或一个已 terminalize Turn 之后的 committed stable checkpoint；
+- source boundary 是 genesis，或已 terminalize Turn 之后仍满足无 Running/Pending/Started projection 的 committed stable checkpoint；terminal 后的 validated compaction leaf 也可满足；
 - forked prefix 不包含 non-terminal Running Turn；
 - boundary 不包含 stream draft、pending approval、半个 ToolRound 或 outcome-unknown batch；
 - source SessionDefinition 和 exact AgentRevision 仍可读取；
@@ -851,7 +851,7 @@ Session-scoped Tool grant
 
 fork 使用 staging + atomic publication。child publication 必须在 Agent lifecycle gate 内最终检查 AgentStatus = Enabled，并与 Agent disable/delete 线性化；失败或 crash 的 staging target 不进入 Session catalog。
 
-conversation entry identity remap、parent/child storage reference 和 current leaf 在 Conversation/SessionStorage 阶段定义。
+Conversation/SessionStorage 使用 parent_leaf batch tree；fork deep-copy selected path，并 remap BatchId、EntryId、LeafId、TurnId、ItemId 和 RequestId，preserve ToolCallId 与 exact content/definition references。完整规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
 ## Turn Admission Basis
 
@@ -959,10 +959,10 @@ Runtime restart：
 4. 读取 exact AgentRevisionRef；
 5. 重建 committed conversation；
 6. 重新 resolve Workspace；
-7. 检测没有 terminal fact 的旧 Turn及其 pending Interaction；
-8. baseline 使用一个幂等 recovery batch 同时提交 `TurnInterrupted(HostRestart | RecoveryContextUnavailable)`、所有 pending Interaction closure，以及 Started ToolInvocation 的 Completed(existing exact durable result)/Abandoned closure；
-9. 对已 terminal 但遗留 pending Interaction 或 Started Item 的损坏状态执行同一 idempotent closure repair；
-10. 进入 Ready、Unavailable 或返回 typed load error。
+7. 检测没有 TurnTerminal record 的旧 Running Turn及其 pending/open state；
+8. baseline 使用一个幂等 Recovery batch 同时提交 `TurnTerminal(Interrupted { HostRestart | RecoveryContextUnavailable })`、所有 pending Interaction closure，以及 Started ToolInvocation 的 Completed(existing exact durable result)/Abandoned closure；
+9. 已有 TurnTerminal 但仍遗留 Pending Interaction 或 Started Item 属于 semantic corruption，read-write load fail closed并要求显式 repair，不能追加“修复 closure”掩盖历史；
+10. 进入 Ready、Unavailable 或返回 typed load/corruption error。
 
 禁止：
 
@@ -1088,7 +1088,7 @@ Agent release channel
 - Workspace restrictive update仍可 revoke active Turn；
 - WaitingApproval 时 Turn 仍是 Running；
 - Steer 不把 Turn 变成 Interrupted；
-- fork 只从 genesis 或 terminalized Turn 后的 committed stable boundary 创建新 Session；
+- fork 只从 genesis 或 terminalized Turn 后仍满足 closed projection 的 committed stable boundary 创建新 Session；
 - fork 不复制 loaded execution state或 authorization capability；
 - host restart 后 loaded state 全部丢失，可由 durable truth 重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
@@ -1137,7 +1137,7 @@ Agent release channel
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；
 - recovery batch 原子 terminalize Turn、关闭 pending Interaction并 Completed/Abandoned Started ToolInvocation；
-- 已 terminal Turn 遗留 pending Interaction 或 Started Item 的幂等 repair；
+- 已 terminal Turn 遗留 pending Interaction 或 Started Item 时 fail closed并进入 explicit repair；
 - missing exact revision fail closed；
 - Deleted identity 不复用；
 - Purge 不属于普通 lifecycle。
@@ -1146,14 +1146,13 @@ Agent release channel
 
 1. AgentDefinition 未来是否持有 Tool/Skill/Model constraints。
 2. Agent/Session immutable definition 的具体 persistence schema。
-3. operation id、CAS 和 atomic current-pointer 的 storage adapter 形状。
-4. Session fork 的 transcript identity remap 和 provenance 字段。
-5. Session list 如何投影 load/readiness/execution state。
-6. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
-7. physical purge、retention 和 revision reachability GC。
-8. 多进程同时操作同一个 Agent/Session store 的并发实现。
-9. Session execution actor/task/handle 的最终 interface。
-10. public command/query/event/snapshot lifecycle payload。
+3. Agent/Session entity head 的 operation id、CAS 和 durable store 形状。
+4. Session list 如何投影 load/readiness/execution state。
+5. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
+6. physical purge、retention 和 revision reachability GC。
+7. 多进程同时操作同一个 Agent/Session store 的并发实现。
+8. Session execution actor/task/handle 的最终 interface。
+9. public command/query/event/snapshot lifecycle payload。
 
 ## 设计进度
 
@@ -1171,5 +1170,5 @@ Agent release channel
 - [x] 定义 WaitingApproval、Steer 和 Interrupted 的关系。
 - [x] 定义 conservative crash recovery。
 - [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
-- [ ] 完成 Conversation/SessionStorage storage identity 和 commit contract。
+- [x] 完成 Session ledger identity、parent_leaf tree、fork remap 和 commit contract。
 - [ ] 完成 Session execution owner 与公开 Runtime interface。

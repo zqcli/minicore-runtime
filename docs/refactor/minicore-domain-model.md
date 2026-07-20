@@ -39,13 +39,13 @@ LoadState
 本阶段暂不设计：
 
 - Session、Turn 等其他模块的 manager、actor 或 execution owner 最终划分；
-- storage、JSONL、database、catalog 或 loaded-runtime registry；
+- 已定义 SessionStorage JSONL batch log 的 adapter 实现，以及 catalog/loaded-runtime registry；
 - Model 的内部结构；
 - Prompt source、cache、fingerprint 和内容组装的实现细节；
 - Tool 的注册、披露、执行、权限和 Sandbox 实现细节；
 - provider adapter、具体 retry/backoff、compaction 实现或公开协议 method；
 - Item type 的最终封闭集合；
-- fork tree 和持久化 identity mapping。
+- ID 的具体编码、全局范围和 physical retention/vacuum。
 
 ## 决策摘要
 
@@ -475,7 +475,7 @@ Tool approval request / decision
 → Interaction，归属于对应 ToolInvocation Item
 ```
 
-ToolInvocation Started 可以作为 durable operational truth，但只有 Completed invocation 随完整 ToolRound commit 后才进入模型 conversation；outcome unknown 时进入 Abandoned，不构造 synthetic ToolResult。
+ToolInvocation Started 可以作为 durable operational truth，但只有 Completed invocation 随完整 ToolRound commit 后才进入模型 conversation；executor/side-effect outcome unknown 时进入 Abandoned，不构造 synthetic ToolResult。
 
 Tool 注册、ToolSpec、Direct/Deferred/Hidden 披露、参数校验、Hook、policy、approval、Sandbox、并发和稳定结果顺序以 [Tool 子系统架构设计](tool-subsystem.md) 为权威。
 
@@ -821,6 +821,10 @@ AgentRevision
 AgentRevisionRef
 SessionId
 SessionDefinitionRevision
+BatchId
+EntryId
+LeafId
+IdempotencyKey
 TurnId
 ItemId
 RequestId
@@ -837,6 +841,7 @@ Agent.id
 AgentDefinition: AgentId + AgentRevision
 Session.id + Session.current_revision
 SessionDefinition.agent: AgentRevisionRef
+StoredSessionBatch: BatchId + parent LeafId + resulting LeafId（由最后 EntryId 生成）
 Turn.id + Turn.session_id
 Item.id + Item.turn_id
 Interaction.request_id + session_id + turn_id + item_id
@@ -846,16 +851,18 @@ PromptId + DefinitionVersion
 SkillId + DefinitionVersion
 ```
 
-本阶段不定义：
+已经固定：
 
-- fork tree identity；
-- storage entry identity；
-- ToolCallId 的生成方式、provider exact echo 和全局唯一范围；
-- ID 的生成方式；
-- ID 的全局唯一范围；
-- fork 时 ID 是否保留；
-- Item 与持久化记录的 exact mapping；
-- fork 时 ItemId、RequestId 和 ToolCallId 的保留/remap。
+- `parent_leaf: LeafId` 形成 Session 内 batch tree；LeafId 只能来自 batch-result EntryId，不建立 BranchId；
+- Item/Interaction/Tool operational facts 可以映射到多个 StoredRecord；
+- fork remap BatchId、EntryId、LeafId、TurnId、ItemId、RequestId 和 operation key；
+- fork preserve ToolCallId 与 exact content/definition semantics。
+
+仍未定义：
+
+- 各 ID 的具体编码和全局唯一范围；
+- ToolCallId 的 provider exact echo adapter；
+- physical retention/vacuum 后 EntryId 的长期可达性。
 
 ## 领域所有权
 
@@ -873,10 +880,11 @@ SkillId + DefinitionVersion
 | 当前 WorkspaceSnapshot | loaded Session execution state；Turn 执行上下文 pin 不可变引用 |
 | canonical roots / effective grants / Workspace views | WorkspaceResolver 解析和 WorkspaceSnapshot 投影 |
 | persisted trust / managed Workspace policy | WorkspaceAuthority adapter 或其后端 store |
-| Turn exact Model / Prompt / execution references | Turn start execution metadata |
+| Session ledger / BatchId / EntryId / LeafId / current leaf | SessionStorage |
+| Turn exact Model / Prompt / execution references | TurnStarted storage record |
 | Turn | Session |
-| Item | Turn |
-| Interaction | Item |
+| Item semantic ownership | Turn；durable projection 来自 SessionStorage |
+| Interaction semantic ownership | Item；durable projection 来自 SessionStorage |
 | Tool registration、execution policy 和 executor | ToolService |
 | 本 Turn 的有效 Tool snapshot | TurnExecutionContext 内的 ToolSet |
 | 本 Turn 的 Skill metadata snapshot | TurnExecutionContext 内的 pinned SkillCatalog |
@@ -888,7 +896,7 @@ SkillId + DefinitionVersion
 - 哪个 actor 或 manager 持有 mutable state；
 - Definition content 是内联值还是 immutable content reference；
 - scope definitions 是新增定义、完整集合还是只保存引用；
-- Item/Interaction 的 immutable storage record 和 projection 具体形状；
+- Session execution owner 如何构造 validated SessionWriteBatch；
 - Runtime 是否允许多个 Agent 或 Session 同时 active。
 
 ## 最小代码骨架
@@ -974,12 +982,11 @@ pub struct Interaction {
 
 ## 后续设计顺序
 
-1. Session conversation、storage、atomic batch、projection rebuild 和 fork identity。
-2. Session execution owner、FollowUp 调度和并发状态机。
-3. ModelGateway 与 AgentLoop adapter。
-4. compaction。
-5. command、query、event、snapshot 和 transport protocol。
-6. review、background work 和按需 Extension/Plugin。
+1. Session execution owner、FollowUp 调度和并发状态机。
+2. ModelGateway 与 AgentLoop adapter。
+3. compaction orchestration。
+4. command、query、event、snapshot 和 transport protocol。
+5. review、background work 和按需 Extension/Plugin。
 
 跨阶段 backlog：PromptDefinition priority/content identity、scope merge、Skill namespace/content identity 和 Model 最小类型；在对应消费方需要前闭合，不改变上述主路径顺序。
 
@@ -1026,10 +1033,15 @@ pub struct Interaction {
 - [x] 定义 ToolInvocation Started/Completed/Abandoned 和 outcome-unknown recovery。
 - [x] 定义 Interaction request/resolution、commit ordering、reconnect 和 timeout。
 - [x] 确定 terminal Turn 不保留 Pending Interaction 或 Started Item。
+- [x] 定义 SessionWriter 唯一写 seam、JSONL batch log、StoredRecord 和 commit receipt。
+- [x] 定义 CommittedConversationState/Delta/Checkpoint 和 trusted apply。
+- [x] 定义 parent_leaf branch tree、stable checkpoint 和 fork identity remap。
+- [x] 定义 partial tail、strict corruption 和 conservative recovery。
 - [ ] 定义 PromptDefinition 的完整字段和内容 identity。
 - [ ] 定义 scope 合并规则。
 - [ ] 定义 Model。
 - [x] 定义 Item type 和 content。
 - [x] 定义 Interaction family。
-- [ ] 定义 storage 和 protocol。
+- [x] 定义 Session conversation/storage identity、batch、projection 和 recovery。
+- [ ] 定义 public protocol。
 - [ ] 定义 manager 和 execution ownership。
