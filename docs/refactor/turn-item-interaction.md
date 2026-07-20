@@ -18,7 +18,7 @@
 
 本文不提前冻结：
 
-- SessionStorage entry、batch、index 或 transaction 具体类型；
+- 已定义 SessionStorage record/batch 在具体文件 adapter、index 和 Session execution 中的实现细节；
 - Session execution actor/task/handle 的形状；
 - Runtime command、query、event 和 snapshot payload；
 - provider-specific message、tool-call 和 reasoning encoding；
@@ -195,13 +195,13 @@ candidate admission
 terminal batch：
 
 ```text
-final AgentMessage + TurnCompleted
+TurnTerminal(Completed { final AgentMessage })
 
 或
 
 pending Interaction closure*
 + open ToolInvocation closure*
-+ TurnInterrupted / TurnFailed
++ TurnTerminal(Interrupted | Failed)
 ```
 
 一个 Turn 只能有一个 terminal fact。
@@ -453,14 +453,13 @@ one stable model output
 ```text
 parse stable ModelOutput
 → allocate ItemId for every ToolCall in source order
-→ durable ToolInvocation::Started records
+→ durable ToolInvocationStarted records
 → approval / execution / operational records
 → all exact ToolResult candidates known
 → atomic complete ToolRound commit：
-     conversation promotion
-     + ToolInvocation::Completed transitions
-→ apply Item/conversation projections
-→ apply committed conversation delta
+     ToolInvocationClosed(Completed)*
+     + ToolRoundPromoted
+→ storage-owned apply_committed 全量应用 Item/conversation projections
 → next logical model call
 ```
 
@@ -484,7 +483,7 @@ ModelStep
 ModelOutput entity
 ```
 
-future storage batch/idempotency key 只是 storage value，不具有独立 CRUD 或 lifecycle。
+SessionStorage batch/idempotency key 只是 private storage value，不具有独立 CRUD 或 lifecycle。
 
 ## Item Identity 与 Ordering
 
@@ -496,13 +495,13 @@ ToolCallId
 → provider/tool protocol correlation
 
 EntryId
-→ future SessionStorage record identity
+→ fixed StoredRecord.entry_id identity
 ```
 
 基础规则：
 
 - 三者不要求相等；
-- ItemId 在 Session/fork 中如何 remap 留给 storage 阶段；
+- fork remap child-local ItemId/EntryId/LeafId 等 identity，preserve ToolCallId；完整规则由 Conversation/SessionStorage 定义；
 - ToolCallId 必须按 provider contract 原样回显；
 - Interaction 归属于 ItemId，不归属于裸 ToolCallId；
 - 一个 ToolInvocation Item 可以对应多条 operational/conversation entries；
@@ -795,21 +794,19 @@ streaming delta
 
 ## Facts、Projection 与 Storage
 
-阶段 4 固定语义，不冻结 storage record enum。
-
-未来一个 ToolInvocation 可能由多条 immutable facts 投影：
+阶段 5 已固定 per-session JSONL batch log 和最小 StoredRecord family，完整定义见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。一个 ToolInvocation 由多条 immutable facts 投影：
 
 ```text
 ToolInvocationStarted
 InteractionRequested*
 InteractionResolved*
 ToolExecutionStarted?
-KnownToolOutcome?
-CompleteToolRoundCommitted?
-ToolInvocationAbandoned?
+ToolOutcomeKnown?
+ToolInvocationClosed?
+ToolRoundPromoted?
 ```
 
-这不意味着这些名称现在成为公开类型。
+这些是 SessionStorage private durable record，不进入 Runtime public protocol，也不形成独立 entity/CRUD。
 
 需要的 projection：
 
@@ -994,16 +991,12 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 
 ## 后续问题
 
-1. SessionStorage immutable record、batch 和 EntryId 形状。
-2. ToolInvocation lifecycle 如何映射到一个或多个 storage entries。
-3. complete ToolRound conversation entry 与 Item projection 的 exact mapping。
-4. fork 时 ItemId、RequestId 和 ToolCallId 的保留/remap。
-5. Runtime pending Interaction query/snapshot/event payload。
-6. Question option、secret answer 和 validation 的最终 wire schema。
-7. Tool approval timeout 的 product default。
-8. Reasoning summary retention、redaction 和 user visibility policy。
-9. Session execution 内 ToolInteractionPort/approval ingress 的最终 private interface。
-10. standalone compaction、review 和 background work 是否产生 Item。
+1. Runtime pending Interaction query/snapshot/event payload。
+2. Question option、secret answer 和 validation 的最终 wire schema。
+3. Tool approval timeout 的 product default。
+4. Reasoning summary retention、redaction 和 user visibility policy。
+5. Session execution 内 ToolTurnPort/approval ingress 的最终 implementation。
+6. standalone compaction、review 和 background work 是否产生 Item。
 
 ## 设计进度
 
@@ -1022,6 +1015,6 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - [x] 定义 WaitingApproval 与 Steer。
 - [x] 定义 terminal cleanup 和 conservative recovery。
 - [x] 区分 durable Item 与 transient observer delta。
-- [ ] 完成 Conversation/SessionStorage schema。
+- [x] 完成 JSONL batch log、StoredRecord、EntryId、promotion 和 fork identity schema。
 - [ ] 完成 Session execution owner 与 private interaction ingress。
 - [ ] 完成 public Runtime protocol projection。

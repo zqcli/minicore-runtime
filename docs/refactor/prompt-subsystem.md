@@ -25,7 +25,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Workspace、Agent 和 Session Prompt source 的具体文件格式；
 - Prompt template 的最终语法；
 - provider-specific role、cache-control 和 payload encoding；
-- conversation storage、compaction 和 Turn recovery；
+- compaction orchestration，以及 Prompt fingerprint/content reference 的 exact cold recovery；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现；
 - PromptSet fingerprint 的持久化和审计格式。
 
@@ -564,7 +564,7 @@ pub struct PromptAssemblyInput<'a> {
 }
 ```
 
-`CommittedConversationView` 只能由成功 commit 返回的 delta 或 SessionStorage recovery 构造。PromptSet assembly 不接收裸 `Vec<MessageRecord>`、任意 ToolPromptView 或任意 PromptContribution。
+`CommittedConversationView` 只能从已验证的 `CommittedConversationState::view()` 获得；State 只能由 SessionStorage replay 构造，或在成功应用 `SessionWriter::commit()` receipt 中的 trusted delta 后前进。其 checkpoint/fingerprint 和 apply 规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。PromptSet assembly 不接收裸 `Vec<MessageRecord>`、任意 ToolPromptView 或任意 PromptContribution。
 
 最终输出：
 
@@ -765,4 +765,5 @@ PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn �
 - [ ] 定义 PromptDefinition priority、content identity 和 source adapters。
 - [x] 定义 WorkspacePromptContext 的 owner、最小授权语义和 fingerprint；完整字段见 Workspace 子系统。
 - [ ] 定义 PromptIntent、UserMessageCompositionInput、PromptContribution stamp 和 output contract 的最终字段。
-- [ ] 定义 fingerprint、cache、失效和 Turn recovery 规则。
+- [x] 定义 committed conversation checkpoint、fingerprint apply 和 replay baseline。
+- [ ] 定义 PromptSet fingerprint、cache、失效和 exact cold recovery 规则。
