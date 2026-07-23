@@ -947,7 +947,7 @@ Authority-only restriction，例如 trust/policy store 降级、managed hard den
 如果撤权发生在 provider request 已发送之后，MiniCore 无法撤回 provider 已看到的内容。它能保证的是：
 
 - best-effort cancel in-flight request；
-- 基于已撤销上下文产生但尚未 commit 的 UserMessage、Steer contribution、模型结果或 ToolRound 不进入 conversation；
+- 基于已撤销上下文产生但尚未append的UserMessage、Steer contribution或模型结果直接丢弃；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`，随后中断active Turn；
 - 不开始下一次模型调用；
 - 已完成的外部副作用不伪装成已回滚。
 

@@ -128,13 +128,13 @@ _避免_：聊天记录、日志文件
 `SessionManager` 维护的会话轻量清单或索引，用于 `/resume` 和 `SessionQuery::List`。它可以从 session 文件 header、metadata 或本地 index/cache 重建，包含 session id、workspace、名称、更新时间、预览和轻量统计；它不是 `RuntimeSnapshot`，也不包含完整消息、运行中状态或 UI 状态。
 _避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、事件日志
 
-**会话条目**：
-会话中的一条不可变追加记录。条目通过 `id` 和 `parentId` 连接成树；当前类型包括 message、model_change、active_tools_change、thinking_level_change、compaction、branch_summary、label、session_info、custom、custom_message 和 usage，完整集合以 SessionManager 文档为准。current leaf 由 committed batch 的 `BatchLeafUpdate` 维护，不是独立 entry 类型。
-_避免_：消息、数据库行
+**会话条目（`StoredSessionEntry`）**：
+会话中的一条不可变追加记录。条目通过 `entry_id` 和 `parent_id` 连接成树，并带有 entry-scoped `operation_key`；顶层 body 固定为 `TurnContext`、`Message`、`Event` 或 `Compaction`。Message 使用 `user | assistant | tool` role；usage 和 finalized provider response metadata 随 assistant entry 保存。
+_避免_：业务 batch、公开 RuntimeEvent 副本、数据库行
 
 **会话树**：
-由会话条目的父子关系形成的历史树。当前对话上下文由根到当前叶子的一条路径构建，而不是由文件中所有条目线性构建；可导航 leaf 必须是 committed stable batch boundary，不能落在多-entry `ToolRound` 内部。
-_避免_：消息数组、历史列表
+由会话条目的父子关系形成的历史树。当前对话上下文由根到 current entry 的 selected path 投影，而不是由文件中所有条目线性构建。物理 entry 可独立 durable；assistant/tool sequence 只有在 `tool_round_completed` 后才作为完整 round 进入模型 conversation。
+_避免_：消息数组、历史列表、batch-result leaf
 
 **上下文压缩**：
 把会话较早历史替换为摘要，同时保留近期上下文的会话级能力。它用于控制模型上下文大小，并保持后续 Agent 运行能够继续理解已有目标、约束、进展和关键决定。
@@ -149,8 +149,8 @@ _避免_：系统提示词、助手回复、UI 折叠文本
 _避免_：任意 token 截断、显示分页、文件切片
 
 **模型调用消耗**：
-一次模型调用真实消耗的 token 分项，例如输入、缓存命中输入、输出和推理输出。它来自模型提供方或运行时估算，用于 run 与会话累计展示。
-_避免_：上下文占用、费用账单、消息长度
+一次finalized模型响应由provider返回的token分项，例如输入、缓存命中输入、输出和推理输出。它随assistant entry持久化；provider未返回的字段保持`None`。本地估算只属于可重建projection/diagnostics，不能伪装成provider usage fact。
+_避免_：上下文占用、费用账单、消息长度、本地估算事实
 
 **上下文占用**：
 当前会话投影到下一次模型请求时预计占用的上下文窗口大小。它用于上下文进度条、pre-run threshold gate 和压缩触发；每次模型调用的权威大小判断仍由最终 call projection validation 完成。它不等同于历史累计消耗。
@@ -169,8 +169,8 @@ _避免_：文件工具、会话管理 UI、Agent loop
 _避免_：会话存储、会话目录、独立会话运行时注册表、UI selection store
 
 **会话存储（`SessionStorage`）**：
-单个会话的底层 committed batch 存储，也是 `SessionWriter` 的 adapter；负责按 batch grouping 读取稳定会话条目、当前叶子和会话元数据，并隐藏 memory/JSONL 实现。它不决定 Agent 如何运行，也不直接服务 UI。
-_避免_：会话管理器、会话运行时、聊天状态
+单个会话的底层 by-entry ledger，也是 `SessionWriter` 的 adapter；负责读取 header/entries、重建 parent tree、校验 operation key与cross-entry references、生成 committed projections，并隐藏 memory/JSONL实现。它不决定Agent如何运行，也不直接服务UI。
+_避免_：会话管理器、会话运行时、聊天状态、第二 durable event log
 
 **技能**：
 可加载的 Markdown 指令包，包含稳定名称、简短描述、来源路径和正文。模型可见 selected skill 必须以 `SkillResource` 形式进入 resource snapshot，或被 snapshot pin 到不可变正文引用；显式调用时由目标 `PreparedMessageTurn` 从 captured `PromptResourceView` 读取正文并作为普通用户消息进入一次 Agent 运行。
@@ -348,21 +348,21 @@ _避免_：Driver 输入、ResourceManager current view、公开协议快照
 `TurnState` 投影给 `Driver` 的窄输入，只包含 model selection、原子 `ModelContextProfile`、thinking level 和 stream options。它不能包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态；system prompt 与 active tool schemas 不能作为两个独立可 patch 字段跨过 seam。
 _避免_：TurnState、ToolRunContext、ModelCallRequest、SessionRuntime 状态
 
-**Driver（Rig 适配器）**：
-会话运行时中的 Rig 适配器，负责推进一个或多个顺序 Rig `AgentRun` segment，适配 `CallModel` / `CallTools` / `Done`，将底层流式项映射为运行时事件，并在 `CallTools` 时通过 `DriverHost::execute_and_commit_tool_round(...)` 回到 `SessionRuntime`，由 session-scoped `Tools` 子系统执行工具治理与 stable commit。Steer rollover 是 Driver 私有实现，不改变公开 `RunId`。
-_避免_：自定义 Agent loop、工具注册表、UI loop、Rig 高阶工具执行、TurnState owner
+**Driver（AgentLoop 适配器）**：
+Turn execution内部的private协议适配层，负责在`NeedModel | NeedTools | Finished`之间推进底层SDK/Rig状态，并把稳定模型输出交回Session execution。它不拥有SessionWriter、conversation projection、Prompt assembly、Tool execution或terminal arbitration；Steer rollover是private adapter行为，不改变领域TurnId。
+_避免_：会话状态owner、工具注册表、UI loop、第二conversation
 
-**DriverHost**：
-`Driver` 访问外部世界的 trait seam，定义 `generate_model_turn`、`execute_and_commit_tool_round`、`commit_pending_messages`、`before_run_finish` 等回调。它不是长期运行时对象，也不拥有 session 状态；它只是让无状态/浅状态的 `Driver` 回到 `SessionRuntime` 所拥有的模型、工具、队列和事件能力。
-_避免_：Driver 实例、工具执行器、SessionRuntime 本体、全局服务
+**DriverHost（pre-refactor 名称）**：
+旧模块文档中让Driver回到SessionRuntime的trait seam。目标架构不冻结`execute_and_commit_tool_round`或`commit_pending_messages`等helper名称；阶段6只允许建立crate-private窄port，并且所有durable mutation仍由authoritative Session execution owner按`append → apply → gate`执行。
+_避免_：第二writer、长期状态owner、公开Runtime interface
 
 **SessionDriverHost**：
 一次 `drive_conversation()` 期间由 `RunTask` 持有的 owned `DriverHost` wrapper，保存 run identity、turn resources、`ModelGateway` / `Tools` handle、cancellation 和回到 owner actor 的窄联系 seam；它不借用 `SessionRuntime` 的 mutable state。
 _避免_：长期子系统、session 状态 owner、独立 runtime、DriverTurnInput
 
-**Tools 子系统 / 工具模块**：
-`SessionRuntime` 内部的 session-scoped `tools.rs` / `tools/` 子系统，封装工具定义、注册表、活跃工具、工具提示素材、策略、审批、授权记忆、执行协调、沙箱、mutation lock 和 executor implementations。`SessionRuntime` 负责协调 `Driver` 与 `Tools`，`Driver` 不直接依赖 `Tools`。
-_避免_：工具运行时、ToolRuntime、全局工具服务、UI 工具层、Rig ToolServer 替代品、平级 helper-only 模块
+**工具服务（`ToolService`）**：
+`MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、grant、资源锁、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet，Agent/Session/Turn领域对象不持有工具属性。
+_避免_：session-scoped工具配置副本、UI工具层、Rig ToolServer替代品、平级helper-only模块
 
 **工具定义**：
 描述一个可被模型调用的工具能力，包括稳定名称、模型可见描述、参数结构、风险等级和展示元数据。
@@ -434,7 +434,7 @@ _避免_：AuthStore、ModelGateway、provider client pool
 _避免_：ProviderRegistry、UI 设置对象、环境变量直读器
 
 **模型调用目的（`ModelCallPurpose`）**：
-一次模型调用的稳定业务意图，例如 `AgentRun` 或 `CompactionSummary`。它从 `ModelCallRequest` 原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；retry/fallback、客户端是否选中该 session、调用是否在后台执行都不是 purpose。
+一次模型调用的稳定业务意图，例如`AgentRun`或`CompactionSummary`。它从`ModelCallRequest`原样传播到response metadata；provider usage直接附着finalized assistant entry，不建立独立`SessionEntry::Usage`。retry/fallback、客户端是否选中该session、调用是否在后台执行都不是purpose。
 _避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
 
 **模型调用请求（`ModelCallRequest`）**：
@@ -454,8 +454,8 @@ _避免_：GPT 压缩、Claude 压缩、provider endpoint 名、UI handler
 _避免_：普通 retry error、Prompt admission rejection、模型可见 assistant message
 
 **驱动安全点**：
-`Driver` 在 Rig 状态机推进到某些边界时交还控制权给会话运行时的点。`commit_pending_messages` 位于当前 assistant response 及其完整工具批次结束后、下一次 LLM 调用前；`before_run_finish` 位于 Rig segment 原本将结束时。会话运行时可在此提交 Steer、替换完整 profile、暂停、重试或结束；FollowUp 在公开 run 结束后的 post-run arbitration 中启动新 run。
-_避免_：prepare next turn、UI 回调、工具 Hook
+AgentLoop在稳定模型输出、完整ToolRound conversation gate和candidate final之间把控制权交回Session execution的边界。Session execution只在对应entry成功`append → apply`后消费Steer、开始下一次模型调用或发布terminal；helper名称是private implementation detail。FollowUp在当前Turn terminal后的admission中启动新Turn。
+_避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 
 **运行时命令**：
 由 UI 发往 Agent 运行时的指令，例如提交 prompt、调用技能、中止、批准工具调用、切换模型或打开会话。
@@ -486,12 +486,12 @@ _避免_：UI 动画流程、内部函数调用顺序
 _避免_：前端 store、流程图、内部实现步骤
 
 **会话写入器（`SessionWriter`）**：
-所有会话 mutation 共用的可信写入 seam。它只接受协议完整、可以独立恢复的 `SessionWriteBatch`；`commit()` 成功返回表示整个 batch 已按 storage adapter 契约写入，失败则该 batch 不得进入恢复投影。公共协议不暴露单独的 save-point event。
-_避免_：事件发布器、逐条 append helper、UI 保存状态、通用数据库事务管理器
+所有会话ledger mutation共用的可信写入seam。它接受一个`SessionEntryDraft`，校验parent/operation key和body contract，分配storage-owned identity，append一条JSONL entry并返回`CommittedSessionEntry`。只有receipt被全部required projections应用后，领域事实才可通知host或进入模型conversation。
+_避免_：事件发布器、业务调度器、UI保存状态、通用数据库事务管理器
 
-**会话写入批次（`SessionWriteBatch`）**：
-一次原子提交的稳定 session entries，例如 user input、完整 tool-call/result round、最终 assistant message、compaction、独立 session mutation 或 tree mutation。streaming delta、partial assistant、pending approval 和执行中的 tool round 不属于 write batch。
-_避免_：CurrentRun snapshot、事件批次、模型请求 batch、SessionRevision
+**会话条目草稿（`SessionEntryDraft`）**：
+一次明确的entry append intent，包含expected parent、稳定operation key和typed body。相同operation key与相同normalized payload幂等返回原receipt；不同payload冲突。多个entries之间的业务完整性由Session execution的sequential `append → apply → gate`编排和cross-entry validation保证，不伪装成物理batch。
+_避免_：CurrentRun snapshot、事件批次、模型请求batch、`SessionWriteBatch`
 
 **模型提供方客户端**：
 用于调用一个或多个模型提供方 API 的底层库。它可能支持流式输出和 function-call payload，但它本身不提供完整 Agent loop、本地编程工具、会话模型或权限边界。

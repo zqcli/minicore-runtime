@@ -1,30 +1,30 @@
 # Conversation 与 SessionStorage 架构设计
 
-状态：目标架构已确定；Session execution、compaction 和公开 protocol integration 待后续阶段完成
+状态：目标架构已按 by-entry JSONL 修订；Session execution、compaction 和公开 protocol integration 待后续阶段完成
 日期：2026-07-16
 
 ## 目的
 
-本文定义 MiniCore conversation 与 SessionStorage 的 durable ownership、唯一写入 seam、atomic batch、JSONL 物理格式、projection、branch/fork、compaction、reload、corruption 和 recovery 语义。
+本文定义 MiniCore conversation 与 SessionStorage 的 durable ownership、逐 entry JSONL、唯一写入 seam、projection、branch/fork、compaction、reload、corruption 和 recovery 语义。
 
 本文重点解决：
 
-- SessionStorage 如何成为唯一 durable truth；
-- 哪些事实可以进入模型 conversation；
-- operational Tool/Interaction facts 如何先持久化而不污染模型上下文；
-- 一个 complete ToolRound 如何 all-or-none promotion；
-- 一个逻辑 commit 如何映射到物理 JSONL；
-- `EntryId`、`ItemId`、`ToolCallId` 和 fork identity 的关系；
-- hot conversation projection 如何只应用成功 commit delta；
-- branch、current leaf 和 stable checkpoint；
-- compaction 如何改变 projection 而不改写历史；
-- process crash、partial tail、corruption 和 commit outcome unknown 如何处理。
+- SessionStorage 如何成为 Session conversation/execution ledger 的唯一 durable truth；
+- 一个物理 JSONL entry 如何同时保持可检查、可分支和可恢复；
+- User、Assistant、Tool message、Reasoning、usage 和 durable event 如何分类；
+- 哪些已持久化内容可以进入模型 conversation；
+- ToolCall、ToolResult、Interaction 和 side-effect barrier 如何逐 entry 持久化；
+- complete ToolRound 如何在没有物理 batch 的前提下 all-or-none 进入模型 conversation；
+- entry-level operation idempotency 和 append acknowledgement unknown 如何处理；
+- hot projection 如何只应用成功 append receipt；
+- branch、fork、compaction、partial tail、corruption 和 process-crash recovery。
 
 本文不提前冻结：
 
 - Session execution actor/task/mailbox 的具体实现；
 - Runtime command、query、event 和 snapshot payload；
-- compaction summary prompt、token budget 和 provider adapter；
+- ModelGateway provider adapter；
+- compaction summary prompt 和 token budget；
 - Runtime-global Session catalog 的物理数据库；
 - power-loss durability、remote replication 或多进程 multi-writer；
 - large payload blob store、physical vacuum 和 retention policy；
@@ -32,53 +32,64 @@
 
 ## 同类项目结论
 
-| 项目 | Storage 形状 | 值得借鉴 | 需要避免 |
+| 项目 | Durable layout | 采用点 | 避免点 |
 | --- | --- | --- | --- |
-| Codex | typed rollout JSONL；TurnContext、ResponseItem、EventMsg 和 Compacted replacement history；SQLite 作为可重建 metadata index | append log、log/index 分离、compaction checkpoint、reconstruction | record/compatibility 类型过多；incremental record 不提供 MiniCore complete ToolRound batch 语义 |
-| pi | 一个 JSONL header + `id/parentId` entry tree；message、compaction、branch summary 都是 entry | 单文件、inspectable、branch tree 简单 | 每条 Message 独立 append；ToolCall/ToolResult 可 partial；approval 和 side-effect barrier 不 durable；rewrite 非 crash-atomic |
-| Grok Build | chat_history、updates、summary 和多个 sidecars；Persistence actor；temp+rename；Committed/NotCommitted error | single writer actor、atomic rewrite、区分 commit outcome、replay checkpoint | 两个 conversation-like logs、多 sidecar ownership、synthetic repair 和较重 operational surface |
-| Claude Code | JSONL uuid/parentUuid；assistant tool_use 与 tool_result 独立记录；file checkpoint 混入 session | resume/fork/checkpoint 产品体验、显式 parent link | partial ToolRound；conversation 与 Workspace file history 过度耦合 |
-| Cursor | 内部格式未公开 | checkpoint/rewind 产品行为 | 不依据不可验证实现决定 MiniCore ownership |
+| pi | header + `id/parentId` entry tree；一个 finalized AgentMessage 保存 thinking、text、tool calls、usage；ToolResult 独立 message | 单文件、逐 entry、parent tree、assistant response 聚合 | approval/side-effect barrier 不 durable；ToolCall/ToolResult 直接进入 transcript，partial round 依赖上层修复 |
+| Codex | 一行一个 `RolloutItem`；ResponseItem、Reasoning、FunctionCall/Output、TurnContext、Compacted、EventMsg 并列 | typed entry stream、reasoning/context fidelity、turn-boundary fork | ResponseItem 与 EventMsg 内容重复；事件类型过多；ToolCall/Output 物理独立但没有 MiniCore promotion gate |
+| Claude Code | 一行一个 uuid/parentUuid record；user/assistant/system/tool_use/tool_result/thinking/usage/file snapshot 等 | 可导航 history、reasoning signature、usage 与 response 同存 | thinking/tool_use 常拆为多 assistant records并重复 usage；执行事件和文件 checkpoint 混入同一历史 |
+| Grok Build | `chat_history.jsonl` ConversationItem + `updates.jsonl` update stream + summary/checkpoint sidecar | reasoning replay、prompt-index rewind、durable update barrier | 两个 conversation-like logs、sidecar ownership、重放/修复 surface 较重 |
 
 MiniCore 采用：
 
 ```text
-pi 的单文件 tree simplicity
-+ Codex 的 log/index separation
-+ Grok 的 commit-outcome discipline
-+ MiniCore atomic SessionWriteBatch / committed-only promotion
+pi 的单文件 entry tree 与 assistant response 聚合
++ Codex/Grok 的 reasoning、context 和 provider-continuity fidelity
++ MiniCore 的 durable Interaction / side-effect barrier
++ committed-only ToolRound conversation gate
 ```
+
+MiniCore 不复制：
+
+- 一行一个业务 batch；
+- Codex 的完整 EventMsg rollout；
+- Grok 的 chat/update 双 durable log；
+- Claude 的 file-history checkpoint；
+- pi 的任意 message 直接进入模型 transcript。
 
 ## 决策摘要
 
 已经确定：
 
 - SessionStorage 是 Session conversation/execution ledger 的唯一 durable truth；
-- 每个 Session 同时最多一个 SessionWriter；
-- 已创建 Session 的全部 ledger mutation 通过 `SessionWriter::commit(SessionWriteBatch)`；
-- Runtime code 不直接 append JSONL、分配 EntryId、移动 current leaf 或构造 committed projection；
-- MVP 使用一个 Session 一个 append-only JSONL batch log；
+- 每个 writable Session 同时最多一个 `SessionWriter`；
+- 已创建 Session 的全部 ledger mutation 通过 `SessionWriter::append(SessionEntryDraft)`；
 - SessionHeader 是第一行，由 create/fork staging 原子写入；
-- 后续每一物理行是一个完整 `StoredSessionBatch`；
-- 一行是 process-crash atomic visibility unit；
-- batch 内 record 顺序稳定，writer 分配 EntryId；
-- operation/idempotency key 解决 commit acknowledgement 丢失和 outcome unknown；
-- `parent_leaf` 形成同一 Session 内的 immutable branch tree；
-- 不建立 Branch entity 或 BranchId；
-- current leaf 是最后成功 commit batch 的 resulting leaf；
-- operational facts 与 conversation promotion facts 保存在同一个 log；
-- conversation projector 只消费 TurnStart、Steer、complete ToolRound、Compaction 和 final AgentMessage；
-- complete ToolRound promotion 与 ToolInvocation Completed transitions 同 batch；
-- hot `CommittedConversationState` 只应用 commit receipt 返回的 trusted delta；
-- projection mismatch 时 reload，不猜测 patch；
-- compaction append overlay，不改写或删除旧 records；
-- user-facing branch/fork 只使用 stable checkpoint；
-- fork baseline 使用 staging deep copy + identity remap + atomic publication；
-- 只忽略/截断最后一个未换行的 partial tail；
-- newline-terminated invalid batch 是 corruption，不能静默 skip；
-- recovery 不生成 synthetic ToolResult，不自动重放 outcome-unknown Tool；
-- projection snapshot、session index 和 search database 都只是 rebuildable cache；
-- 当前不引入通用 Storage trait hierarchy、WAL layer、content-addressed DAG 或双 authoritative log。
+- 后续每一物理行是一条完整 `StoredSessionEntry`；
+- 一条 newline-terminated entry 是 process-crash visibility unit；
+- entry 使用 `EntryId + parent_id` 形成 immutable history tree；
+- 不建立 `BatchId`、`StoredSessionBatch`、batch fingerprint 或 interior-entry 概念；
+- operation key 属于单条 entry intent；同 key同 normalized payload 返回原 receipt，同 key不同 payload conflict；
+- storage append acknowledgement unknown 必须按 operation key reopen/replay；
+- entry 顶层类别固定为 `TurnContext | Message | Event | Compaction`；
+- Message 使用 `role = user | assistant | tool`；
+- 一个 finalized logical model response 保存为一个 assistant message entry；
+- assistant `content[]` 按原始顺序保存 reasoning、text 和 tool_call；
+- usage、model、response ID、finish reason 和 retry summary随 assistant entry 保存；
+- 每个 ToolCall 的 truthful ToolResult 保存为独立 `role = tool` message entry；
+- initiating user message append 是 Turn 开始线性化点；
+- final assistant message append 是 Completed Turn 结束线性化点；
+- Interrupted/Failed Turn 由 durable event terminalize；
+- assistant tool-call response 和 tool messages在 `tool_round_completed` event前都不进入模型 conversation；
+- `tool_round_completed` 引用一个 assistant entry及其全部 ordered tool entries，并作为 complete ToolRound conversation gate；
+- Interaction request/resolution、Tool execution-start 和 Tool abandoned使用 durable event；
+- Runtime observer event 从 committed entry receipt派生，不原样写入 Session ledger；
+- streaming delta、Tool progress、provider retry attempt 和 transient phase不持久化；
+- `CommittedConversationState` 只能由 replay或成功应用 trusted entry delta推进；
+- compaction 是独立 entry并执行 conversation Replace；
+- fork deep-copy selected parent path并 remap target-local identities；
+- 只忽略/截断最后一个未换行partial line；newline-terminated invalid entry是 corruption；
+- recovery不生成 synthetic ToolResult，不自动重放 outcome-unknown Tool；
+- projection snapshot、session index和search database只是 rebuildable cache。
 
 ## Ownership
 
@@ -87,40 +98,38 @@ MiniCoreRuntime
 └─ SessionStorage
    ├─ create/open/fork
    ├─ per-session SessionWriter
-   │  └─ commit(SessionWriteBatch)
+   │  └─ append(SessionEntryDraft)
    ├─ replay / projection rebuild
    └─ private JSONL implementation
 ```
 
-SessionStorage 拥有：
+SessionStorage拥有：
 
 - Session ledger file；
-- EntryId / BatchId allocation；
+- EntryId allocation；
 - operation key index；
-- current leaf 和 branch graph reconstruction；
-- batch validation；
+- current entry和parent graph reconstruction；
+- entry validation和cross-entry reference validation；
 - durable append；
 - replay/projector；
 - partial-tail handling；
 - explicit corruption diagnostics；
-- fork staging copy。
+- fork staging copy和identity remap。
 
-SessionStorage 不拥有：
+SessionStorage不拥有：
 
 - Agent/Session execution scheduling；
 - Prompt assembly；
-- Tool permission 或 execution；
+- Tool permission或execution；
 - Workspace authorization；
 - provider stream / AgentLoop；
-- pending waiter；
+- approval/question waiter；
 - Runtime public transport；
-- physical file checkpoint/Workspace rollback。
-
-AgentDefinition 和 SessionDefinition head 的最终 entity-store shape 留给 Runtime interface/storage integration；本文只固定 Session conversation/execution ledger。
+- Workspace file rollback。
 
 ## 最小接口
 
-当前只有一个真实 backend，因此不建立 `dyn SessionStorageAdapter` 或 Factory trait。
+当前只有一个真实 backend，因此不建立 `dyn SessionStorageAdapter` hierarchy。
 
 ```rust
 pub(crate) struct SessionStorage {
@@ -160,57 +169,40 @@ pub(crate) struct SessionWriter {
 }
 
 impl SessionWriter {
-    pub async fn commit(
+    pub async fn append(
         &mut self,
-        batch: SessionWriteBatch,
-    ) -> Result<CommittedSessionBatch, SessionWriteError>;
+        draft: SessionEntryDraft,
+    ) -> Result<CommittedSessionEntry, SessionWriteError>;
 }
 ```
 
 不提供：
 
 ```text
-append_raw_record
-append_message
-set_current_leaf
+append_raw_json
+append_arbitrary_message
+set_current_entry_without_append
 write_projection
 replace_history
 save_runtime_state
 generic transaction callback
 ```
 
-`SessionWriteBatch` 字段私有，只能由 crate-internal validated constructors/builders 构造。
-
-## 唯一写入 Seam
-
-所有 Session ledger durable mutation 最终进入：
-
-```text
-SessionWriter::commit(SessionWriteBatch)
-```
-
 业务 helper 可以存在：
 
 ```text
-commit_turn_start(...)
-commit_interaction_request(...)
-commit_tool_outcomes(...)
-commit_complete_tool_round(...)
-commit_terminal_turn(...)
+append_turn_context(...)
+append_user_message(...)
+append_assistant_message(...)
+append_tool_message(...)
+append_interaction_event(...)
+append_tool_execution_started(...)
+append_tool_round_completed(...)
+append_turn_interrupted(...)
+append_compaction(...)
 ```
 
-但它们不能写 storage，只能构造 validated batch并调用 commit。
-
-物理 `append_batch_line()` 是 SessionStorage private implementation；Session execution、ToolService、PromptService、command handler 和 event publisher都不能直接调用。
-
-### 例外
-
-只有两个非普通 append 路径：
-
-- `SessionStorage::create()` 原子创建 SessionHeader；
-- `SessionStorage::fork()` 写 staging target并原子 publish。
-
-create/fork 都必须先写 newline-terminated staging file、flush 并完整 replay 验证，再以 exclusive create/atomic rename publish；它们不构成 runtime mutation 的第二 writer seam。
+但它们只能构造 validated `SessionEntryDraft`并调用同一个 writer。
 
 ## 物理文件
 
@@ -222,7 +214,7 @@ sessions/<SessionId>.jsonl
 
 ```text
 line 1   SessionHeader
-line 2+  StoredSessionBatch
+line 2+  StoredSessionEntry
 ```
 
 ```rust
@@ -235,358 +227,524 @@ pub struct SessionHeader {
 
 pub struct ForkOrigin {
     pub source_session_id: SessionId,
-    pub source_checkpoint: ConversationCheckpoint,
+    pub source_entry_id: Option<EntryId>,
+    pub source_transcript_fingerprint: TranscriptFingerprint,
 }
 ```
 
-Header immutable。Session name、lifecycle、current definition pointer 等 mutable entity metadata 不通过重写 Header 更新。
+Header immutable。Session name、lifecycle和current definition pointer等mutable entity metadata不通过重写Header更新。
 
-## StoredSessionBatch
+by-entry layout是首个正式Session ledger `format_version = 1`。旧`StoredSessionBatch`只存在于被supersede的设计文档，没有仓库内已发布production wire data，因此MVP不实现legacy batch reader/migrator。未来只有在真实format v2出现时才定义version migration。
 
-一个物理 JSONL line 编码一个完整 batch。writer 必须使用 compact single-line JSON serialization：禁止 pretty print，字符串中的换行/control characters 必须 JSON escape，record 之间不能产生物理 newline：
+每条 entry 使用 compact single-line JSON serialization：禁止pretty print，字符串中的换行/control characters必须JSON escape。
+
+示意：
+
+```jsonl
+{"type":"session","formatVersion":1,"sessionId":"s1","createdAt":"2026-07-16T10:00:00Z"}
+{"id":"e1","parentId":null,"timestamp":"2026-07-16T10:00:01Z","operationKey":"turn:t1:context","type":"turn_context","turnId":"t1","executionFingerprint":"ctx1"}
+{"id":"e2","parentId":"e1","timestamp":"2026-07-16T10:00:02Z","operationKey":"turn:t1:user","type":"message","role":"user","turnId":"t1","itemId":"i1","source":"input","contextEntryId":"e1","content":[{"type":"text","text":"读取 README"}]}
+```
+
+## Entry Envelope
 
 ```rust
-pub struct StoredSessionBatch {
+pub struct StoredSessionEntry {
     pub format_version: u16,
-    pub batch_id: BatchId,
-    pub operation_key: IdempotencyKey,
-    pub batch_fingerprint: BatchFingerprint,
-    pub purpose: SessionCommitPurpose,
-    pub expected_current_leaf: Option<LeafId>,
-    pub parent_leaf: Option<LeafId>,
-    pub committed_at: Timestamp,
-    pub records: Vec<StoredRecord>,
-}
-
-pub struct StoredRecord {
     pub entry_id: EntryId,
-    pub body: StoredRecordBody,
+    pub parent_id: Option<EntryId>,
+    pub timestamp: Timestamp,
+    pub operation_key: IdempotencyKey,
+    pub body: StoredEntryBody,
 }
 
-pub struct LeafId(EntryId);
+pub enum StoredEntryBody {
+    TurnContext(StoredTurnContext),
+    Message(StoredMessage),
+    Event(StoredDurableEvent),
+    Compaction(StoredCompaction),
+}
 ```
 
 基础规则：
 
-- records 必须非空；
-- Vec order 是 batch 内唯一 authoritative order；
-- 最后一个 record 的 EntryId 生成 resulting LeafId；
-- 只有 `None` 或已提交 batch 的 resulting LeafId 可以作为 parent/checkpoint；interior EntryId 永远不能成为 leaf；
-- parent_leaf 是该 batch 的 logical parent；
-- batch_id 是 private commit diagnostics/snapshot handle，不是领域 identity、branch identity 或 public protocol ID；
-- operation_key 标识 caller intent/retry；
-- batch_fingerprint 防止同 key 不同 payload；它覆盖 format version、purpose、expected_current_leaf、parent_leaf 和 ordered normalized logical records；只排除 envelope BatchId、各 record 自身新分配的 entry_id、committed_at 和 serialization details，payload 内引用的 EntryId/LeafId 必须参与；
-- EntryId 由 writer 分配，caller 不能预分配；
-- JSON object field order 不承担语义；
-- format_version 显式控制当前 typed payload shape；baseline 只实现当前版本和必要的直接读取兼容，不建立通用 migration framework。
+- `entry_id` 由 writer分配，caller不能预分配；
+- `parent_id` 是该 entry 的logical parent；
+- ordinary append的parent是writer current entry；
+- history branch append可以使用已验证历史entry作为parent；
+- `operation_key` 标识一条caller intent/retry；
+- operation key lookup发生在current-entry conflict检查之前；
+- normalized payload fingerprint由writer/index内部计算，不要求序列化独立hash字段；
+- 同key同normalized payload返回原 `CommittedSessionEntry`；
+- 同key不同payload返回 `OperationConflict`；
+- JSON object field order不承担语义；
+- EntryId、ItemId、ToolCallId、TurnId、RequestId不能混用。
 
-当前不增加 physical hash chain、Merkle tree 或 per-line cryptographic checksum。需要 bit-rot 检测时可以在 private file format 中增加 framing/checksum，不改变 SessionWriter interface。
-
-## SessionWriteBatch
+`SessionEntryDraft` 至少包含：
 
 ```rust
-pub struct SessionWriteBatch {
-    expected_current_leaf: Option<LeafId>,
-    parent_leaf: Option<LeafId>,
+pub struct SessionEntryDraft {
+    expected_current_entry: Option<EntryId>,
+    parent_entry: Option<EntryId>,
     operation_key: IdempotencyKey,
-    purpose: SessionCommitPurpose,
-    records: Vec<PendingRecord>,
+    body: PendingEntryBody,
 }
 ```
 
-`expected_current_leaf` 是 CAS precondition；`parent_leaf` 是新 branch parent：
+`expected_current_entry`是调用方观察到的current head；`parent_entry`是新entry parent。ordinary append两者相同。fork staging和显式history branch可以不同，但必须通过writer validation。
 
-```text
-ordinary append
-→ parent_leaf = expected_current_leaf
-
-branch append
-→ expected_current_leaf = 当前 durable leaf
-→ parent_leaf = 已验证 stable historical leaf
-```
-
-commit 成功后 current leaf 变为 batch resulting leaf。
-
-## Commit Purpose
-
-Purpose 用于 validation、diagnostics 和 replay compatibility，不是 entity：
+## TurnContext Entry
 
 ```rust
-pub enum SessionCommitPurpose {
-    TurnStart,
-    ToolOperations,
-    Interaction,
-    ToolOutcome,
-    CompleteToolRound,
+pub struct StoredTurnContext {
+    pub turn_id: TurnId,
+    pub session_definition: StoredSessionDefinitionRef,
+    pub agent: AgentRevisionRef,
+    pub model: TurnModelRef,
+    pub workspace: WorkspaceSnapshotRef,
+    pub prompt_fingerprint: PromptFingerprint,
+    pub tool_fingerprint: ToolSetFingerprint,
+    pub skill_fingerprint: SkillCatalogFingerprint,
+    pub execution_fingerprint: ExecutionContextFingerprint,
+    pub diagnostics: Arc<[StoredContextDiagnostic]>,
+}
+
+pub struct StoredSessionDefinitionRef {
+    pub session_id: SessionId,
+    pub revision: SessionDefinitionRevision,
+    pub content_fingerprint: ContentHash,
+}
+```
+
+`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
+
+Context entry在initiating UserMessage前append，由UserMessage通过`context_entry_id`引用。
+
+Context append成功不创建领域Turn，也不允许调用模型或执行Tool。若进程在Context entry后、UserMessage前崩溃，该entry是安全的orphan preparation fact；replay不会把它投影为Running Turn或conversation message。
+
+Context不保存：
+
+- provider credentials；
+-随机lease token；
+- approval waiter；
+- cancellation token；
+- mutable cache state；
+- executor内存地址。
+
+## Message Entry
+
+```rust
+pub enum StoredMessage {
+    User(StoredUserMessage),
+    Assistant(StoredAssistantMessage),
+    Tool(StoredToolMessage),
+}
+```
+
+JSON使用常规role：
+
+```text
+role = user | assistant | tool
+```
+
+### User Message
+
+```rust
+pub struct StoredUserMessage {
+    pub turn_id: TurnId,
+    pub item_id: ItemId,
+    pub source: StoredUserMessageSource,
+    pub context_entry_id: Option<EntryId>,
+    pub content: Arc<[UserContent]>,
+}
+
+pub enum StoredUserMessageSource {
+    Input,
     Steer,
-    Compaction,
-    TurnTerminal,
-    Recovery,
 }
 ```
 
-不为 purpose 建立 ID、CRUD、registry 或 lifecycle。
+规则：
 
-## StoredRecordBody
+- `source = Input` 必须引用同一TurnId的TurnContext entry；
+- Input entry append是领域Turn开始线性化点；
+- 同时只能有一个Running Turn；
+- `source = Steer` 必须绑定expected Running Turn，不重新捕获Context；
+- Steer entry append后才影响下一次逻辑模型调用；
+- FollowUp不保存为Steer，它在下一Turn写新的Input message；
+- Interaction resolution不是User message。
 
-阶段 5 固定最小 immutable fact family：
+Input/Steer message entry本身就是canonical content和durable lifecycle fact，不再重复写`TurnStarted`或`SteerCommitted` event。
+
+### Assistant Message
+
+一个finalized logical model response保存为一个assistant entry。stream delta和partial draft不持久化。
 
 ```rust
-pub enum StoredRecordBody {
-    TurnStarted(TurnStartedRecord),
+pub struct StoredAssistantMessage {
+    pub turn_id: TurnId,
+    pub phase: StoredAssistantPhase,
+    pub model: TurnModelRef,
+    pub response_id: Option<String>,
+    pub content: Arc<[AssistantContent]>,
+    pub usage: Option<ModelUsage>,
+    pub finish_reason: ModelFinishReason,
+    pub retry_count: u32,
+    pub assembled_context_fingerprint: AssembledModelContextFingerprint,
+}
 
-    ToolInvocationStarted(ToolInvocationStartedRecord),
-    ToolExecutionStarted(ToolExecutionStartedRecord),
-    ToolOutcomeKnown(ToolOutcomeKnownRecord),
-    ToolInvocationClosed(ToolInvocationClosedRecord),
-
-    InteractionRequested(InteractionRequestedRecord),
-    InteractionResolved(InteractionResolvedRecord),
-
-    ToolRoundPromoted(ToolRoundPromotedRecord),
-    SteerCommitted(SteerCommittedRecord),
-    CompactionCommitted(CompactionCommittedRecord),
-    TurnTerminal(TurnTerminalRecord),
+pub enum StoredAssistantPhase {
+    Intermediate,
+    Final {
+        completion: TurnCompletion,
+    },
 }
 ```
 
-稳定 UserMessage、AgentMessage 和 Reasoning values 嵌入真正拥有其 atomic semantics 的 record：
-
-- initiating UserMessage 在 TurnStarted；
-- Tool-producing model output 的 AgentMessage/Reasoning 在 ToolRoundPromoted；
-- Steer UserMessage 在 SteerCommitted；
-- final AgentMessage 在 completed TurnTerminal。
-
-不增加通用 `MessageAppended`，避免调用方绕过 Turn/ToolRound/terminal validation。
-
-未来新增 record variant 必须代表真实 durable fact；stream delta、retry attempt、cache event 和 phase transition不能因为“方便记录”进入该 enum。
-
-## Record 关系
-
-### TurnStarted
-
-```text
-TurnStartedRecord
-├─ TurnId
-├─ exact execution metadata
-└─ initiating UserMessage ItemId + CanonicalUserMessage
+```rust
+pub enum AssistantContent {
+    Reasoning(StoredReasoning),
+    Text {
+        item_id: ItemId,
+        text: String,
+    },
+    ToolCall {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: Value,
+        index: u32,
+    },
+}
 ```
 
-TurnStart batch 必须只有一个新 Turn，且 start 前 Session 没有 Running Turn。
+规则：
 
-### ToolInvocationStarted
+- content order是模型最终输出的canonical顺序；
+- ToolCall name/arguments/index只在assistant entry保存一次；
+- 每个ToolCall block创建一个ToolInvocation Item的Started projection；
+- 同一assistant entry内ToolCallId和ItemId必须唯一；
+- `phase = Intermediate`必须包含至少一个ToolCall；text/reasoning-only稳定响应若结束Turn必须使用`Final`，否则只作为transient draft/observer output；
+- Intermediate assistant entry durable/UI-visible，但在完整ToolRound前不进入模型conversation；
+- `phase = Final`不能包含未满足ToolCall；
+- Final assistant entry append是Completed Turn的结束线性化点；
+- Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的Intermediate assistant entry，且cancel/Steer没有赢得仲裁；
+- usage属于该逻辑模型响应，不另写TokenCount event；
+- Session total usage由assistant entries重建为projection/cache。
 
-```text
-ToolInvocationStartedRecord
-├─ TurnId
-├─ ItemId
-├─ ToolCallId
-├─ model-emitted ToolName / requested arguments
-└─ source_call_index
+### Reasoning
+
+```rust
+pub struct StoredReasoning {
+    pub item_id: ItemId,
+    pub text: Option<String>,
+    pub summary: Option<String>,
+    pub encrypted: Option<String>,
+    pub signature: Option<String>,
+    pub provider_item_id: Option<String>,
+}
 ```
 
-record durable/UI-visible，但不向 model-visible transcript 添加消息。它是 model-visible ToolCall name/requested arguments/source order 的唯一 canonical durable source；后续 promotion 不重复保存或改写 ToolCall payload。它不冒充 preflight 后的 resolved/frozen execution intent。
+只保存provider实际返回的finalized/replayable reasoning artifact：
+
+- 可显示thinking text或summary；
+- provider opaque encrypted content；
+- signature和provider item ID。
+
+不保存：
+
+- 未暴露的hidden chain-of-thought；
+- reasoning streaming delta；
+- partial draft；
+- caller自行推断的reasoning文本。
+
+Prompt/ModelGateway按provider capability决定后续调用是否回放text、summary、encrypted artifact或完全忽略；storage不把reasoning强制转成普通assistant text。
+
+### Usage
+
+```rust
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub cost: Option<Money>,
+}
+```
+
+provider response是瞬时值；若不持久化，process restart后会失去historical usage、cost和cache统计。因此usage随assistant response保存。
+
+provider未返回的字段保持`None`，不能以估算冒充provider truth。本地context estimate属于rebuildable projection，不写入usage事实。
+
+### Tool Message
+
+```rust
+pub struct StoredToolMessage {
+    pub turn_id: TurnId,
+    pub item_id: ItemId,
+    pub tool_call_id: ToolCallId,
+    pub name: Option<ToolName>,
+    pub source: ToolOutcomeSource,
+    pub content: Arc<[ToolContent]>,
+    pub is_error: bool,
+}
+
+pub enum ToolOutcomeSource {
+    PreExecution,
+    Executed {
+        execution_started_entry_id: EntryId,
+    },
+}
+```
+
+Tool message是exact truthful ToolResult的canonical durable source。
+
+规则：
+
+- 必须匹配同一parent path上某个assistant ToolCall block；
+- `PreExecution`用于validation/policy/approval deny/unavailable等没有side effect的结果；
+- `Executed`必须引用同一ItemId/ToolCallId的`tool_execution_started` event；
+- append成功后ToolInvocation Item进入Completed operational state；
+- Tool message durable不等于model-visible；
+- 只有`tool_round_completed`成功后，该Tool message才进入conversation；
+- outcome unknown不生成Tool message；
+- 非幂等Tool不能因为Tool message append acknowledgement unknown而重新执行。
+
+## Durable Event Entry
+
+```rust
+pub enum StoredDurableEvent {
+    InteractionRequested(StoredInteractionRequested),
+    InteractionResolved(StoredInteractionResolved),
+    ToolExecutionStarted(StoredToolExecutionStarted),
+    ToolAbandoned(StoredToolAbandoned),
+    ToolRoundCompleted(StoredToolRoundCompleted),
+    TurnInterrupted(StoredTurnInterrupted),
+    TurnFailed(StoredTurnFailed),
+}
+```
+
+这些是恢复、权限、副作用和conversation gate所需的durable event，不是Runtime公开EventMsg的序列化副本。
+
+Runtime public event必须从成功append并apply的entry receipt派生。Session ledger不保存：
+
+```text
+stream delta
+Tool progress
+Sampling / ExecutingTools / WaitingApproval phase
+每次provider retry
+queue update
+heartbeat
+普通observer notification
+```
 
 ### InteractionRequested / Resolved
 
 ```text
 InteractionRequested
-→ RequestId + parent ItemId + typed request + expires_at
+→ TurnId + ItemId + RequestId + typed request + expires_at
 
 InteractionResolved
-→ RequestId + typed resolution + durable resolution_key
+→ TurnId + ItemId + RequestId + typed resolution + resolution_key
 ```
 
-Requested 未 commit 前不能 notify host；Resolved 未 commit 前不能 wake waiter或执行受保护副作用。
+顺序：
+
+```text
+interaction_requested append + apply
+→ notify host
+
+interaction_resolved append + apply
+→ wake waiter / allow protected continuation
+```
+
+deadline和resolution必须由单一Session execution owner线性化。late resolution不得覆盖已committed timeout/cancel resolution。
 
 ### ToolExecutionStarted
 
-必须在可能发生外部副作用前 commit：
-
-```text
-ItemId
-ToolCallId
-resolved ToolName
-frozen execution invocation fingerprint
-requirements fingerprint
-final authorization fingerprint
-started_at
-```
-
-fingerprint 覆盖 preflight 后的 resolved Tool、frozen normalized arguments 和 execution requirements；exact executor implementation identity/content-reference 细节由 Tool 子系统后续闭合。该 record 证明“准备执行哪一个 side effect intent”，但 baseline recovery 仍不自动重放。
-
-### ToolOutcomeKnown
-
-保存 exact truthful ToolResult：
-
-```text
-ItemId
-ToolCallId
-source:
-  PreExecution(validation / policy / approval / unavailable)
-  | Executed { execution_started_entry_id: EntryId }
-ToolResult
-completed_at
-```
-
-它是 operational truth，不自动完成 Item，也不向 model-visible transcript 添加消息。Executed outcome 必须引用同一 Item/ToolCallId 的 ToolExecutionStarted；PreExecution outcome 禁止伪造 execution-start reference。
-
-### ToolInvocationClosed
-
 ```rust
-pub struct ToolInvocationClosedRecord {
+pub struct StoredToolExecutionStarted {
+    pub turn_id: TurnId,
     pub item_id: ItemId,
     pub tool_call_id: ToolCallId,
-    pub closure: StoredToolInvocationClosure,
-}
-
-pub enum StoredToolInvocationClosure {
-    Completed {
-        outcome_entry_id: EntryId,
-    },
-    Abandoned {
-        reason: ToolAbandonReason,
-    },
+    pub resolved_tool_name: ToolName,
+    pub invocation_fingerprint: ContentHash,
+    pub requirements_fingerprint: ContentHash,
+    pub authorization_fingerprint: ContentHash,
+    pub started_at: Timestamp,
 }
 ```
 
-Completed 必须引用同一 Session、同一 Item、matching ToolCallId 的 ToolOutcomeKnown。若 outcome source 为 Executed，其 execution_started_entry_id 也必须 exact match；PreExecution outcome 则不要求 ToolExecutionStarted。
-
-### ToolRoundPromoted
+必须在可能发生外部副作用前append并apply：
 
 ```text
-ToolRoundPromotedRecord
-├─ TurnId
-├─ optional stable AgentMessage text ItemId + content（不重复内嵌 ToolCall）
-├─ optional Reasoning ItemId + content
-└─ ordered members:
-   ItemId + ToolCallId + outcome EntryId
+tool_execution_started append + apply
+→ side effect
 ```
 
-normal complete ToolRound batch 必须同时包含：
+该entry证明准备执行的frozen intent，但baseline recovery仍不自动重放。
 
-```text
-ToolInvocationClosed(Completed)*
-+ exactly one ToolRoundPromoted
-```
-
-conversation projector只在该 promotion record committed 后看见 assistant/tool call/tool result sequence。promotion validation 必须按 ItemId 读取 canonical ToolInvocationStarted，并证明 ToolCallId、source order 和 outcome reference exact match；任何重复/漂移都 fail closed。
-
-### SteerCommitted
-
-保存 expected Running TurnId，以及由 PromptSet 规范化的 UserMessage ItemId/content。
-
-### CompactionCommitted
-
-保存：
-
-```text
-source ConversationCheckpoint（包含 TranscriptFingerprint）
-summarized-through boundary
-summary
-retained-from boundary / retained references
-```
-
-cut 不能拆分 TurnStart、complete ToolRound 或其他 model-visible atomic unit。
-
-### TurnTerminal
+### ToolAbandoned
 
 ```rust
-pub struct TurnTerminalRecord {
+pub struct StoredToolAbandoned {
     pub turn_id: TurnId,
-    pub terminal: StoredTurnTerminal,
-}
-
-pub enum StoredTurnTerminal {
-    Completed {
-        final_agent_message_item_id: ItemId,
-        final_agent_message: AgentMessageItem,
-        completed_at: Timestamp,
-    },
-    Interrupted {
-        reason: TurnInterruption,
-        completed_at: Timestamp,
-    },
-    Failed {
-        failure: TurnFailure,
-        completed_at: Timestamp,
-    },
+    pub item_id: ItemId,
+    pub tool_call_id: ToolCallId,
+    pub reason: ToolAbandonReason,
 }
 ```
 
-Completed record 同时保存 final AgentMessage ItemId/content。terminal batch 必须关闭所有 Pending Interaction 和 Started ToolInvocation。
+只有没有truthful ToolResult的终止路径使用Abandoned，例如：
 
-## Atomic Commit Units
+- executor/side-effect outcome unknown；
+- host restart后exact result不可恢复；
+- cancellation在允许无结果关闭的pre-execution阶段获胜。
 
-| Domain 时机 | 同 batch records | Conversation change |
-| --- | --- | --- |
-| Turn start | TurnStarted | Append initiating UserMessage |
-| ToolCalls stable | ToolInvocationStarted* | AdvanceOnly |
-| Interaction request | InteractionRequested | AdvanceOnly |
-| Interaction response/timeout | InteractionResolved | AdvanceOnly |
-| Tool side effect barrier | ToolExecutionStarted* | AdvanceOnly |
-| exact Tool results | ToolOutcomeKnown* | AdvanceOnly |
-| complete ToolRound | ToolInvocationClosed(Completed)* + ToolRoundPromoted | Append complete assistant/tool sequence |
-| Steer | SteerCommitted | Append UserMessage |
-| Compaction | CompactionCommitted | Replace projection |
-| Turn completed | TurnTerminal(Completed with final AgentMessage) | Append final AgentMessage |
-| Turn interrupted/failed | closures* + TurnTerminal | AdvanceOnly |
-| Recovery | InteractionResolved* + ToolInvocationClosed* + TurnTerminal(Interrupted) | AdvanceOnly |
+Abandoned没有Tool message，也不能进入complete ToolRound conversation。
 
-多个同类 operational records 可以合并到一个 batch，例如并行 Tool outcomes；不要求每个 Tool 单独 physical append。
-
-## Commit Algorithm
-
-```text
-SessionWriter.commit(batch)
-→ 检查 writer 未 poisoned / closed
-→ 先检查 operation_key
-   ├─ same key + same fingerprint：返回原 receipt，不再执行 leaf CAS
-   └─ same key + different fingerprint：conflict
-→ 检查 expected_current_leaf
-→ 验证 parent_leaf 是 None 或 prior batch-result LeafId，拒绝 interior EntryId
-→ 分配 BatchId / EntryId
-→ 验证 record references 和 domain transitions
-→ 计算 trusted conversation change
-→ serialize one complete StoredSessionBatch + '\n'
-→ append + flush
-→ 更新 writer current leaf / in-memory indexes
-→ 返回 CommittedSessionBatch
-```
-
-commit 一旦进入 physical append，不接受 Turn cancellation。
-
-## CommittedSessionBatch
+### ToolRoundCompleted
 
 ```rust
-pub(crate) struct CommittedSessionBatch {
-    batch_id: BatchId,
-    entries: Arc<[StoredRecord]>,
-    previous_leaf: Option<LeafId>,
-    current_leaf: LeafId,
+pub struct StoredToolRoundCompleted {
+    pub turn_id: TurnId,
+    pub assistant_entry_id: EntryId,
+    pub tool_entry_ids: Arc<[EntryId]>,
+}
+```
+
+`tool_round_completed`是conversation gate，不是ToolRound entity。
+
+append前writer必须验证：
+
+- assistant entry位于同一Session selected parent path；
+- assistant phase为Intermediate；
+- assistant至少包含一个ToolCall；
+- 所有ToolCall属于同一Turn；
+- 每个ToolCallId/ItemId exactly once；
+- tool entries与ToolCall集合exact match；
+- 每个tool entry位于同一path且早于completion event；
+- 每个tool entry的source reference合法；
+- tool entries按assistant ToolCall index规范化排序；
+- 不含Abandoned或outcome-unknown invocation；
+- 同一assistant entry未被另一个completion event重复完成。
+
+append成功后：
+
+- 所有关联ToolInvocation已是Completed operational state；
+- conversation projector一次性追加assistant content和ordered tool messages；
+- transcript fingerprint只在此entry改变；
+- 下一次实际模型调用才可开始。
+
+若crash发生在部分/全部tool message已append但completion event尚未append：
+
+- exact ToolResult仍是durable truth；
+- ToolRound不进入模型conversation；
+- baseline restart不自动补写completion event；
+- recovery保留Completed operational Items，Abandon剩余Started Items，并Interrupted当前Turn。
+
+### TurnInterrupted / TurnFailed
+
+```text
+TurnInterrupted → TurnId + typed reason + completed_at
+TurnFailed      → TurnId + typed failure + completed_at
+```
+
+它们用于没有final assistant message的terminal path。
+
+append前必须验证：
+
+- 所有Pending Interaction已通过resolved event关闭；
+- 所有Started ToolInvocation已有Tool message或ToolAbandoned event；
+- 不再允许新Model/Tool work；
+- 同一Turn没有其他terminal fact。
+
+Interrupted/Failed event不向model conversation追加synthetic assistant message。
+
+## Compaction Entry
+
+```rust
+pub struct StoredCompaction {
+    pub turn_id: Option<TurnId>,
+    pub source: ConversationCheckpoint,
+    pub summarized_through: ConversationBoundary,
+    pub summary: CompactionSummary,
+    pub retained_from: ConversationBoundary,
+    pub protected_entries: Arc<[EntryId]>,
+}
+```
+
+Compaction entry本身是conversation Replace gate，不另写`compaction_completed` durable event。
+
+规则：
+
+- source checkpoint和TranscriptFingerprint必须exact match；
+- cut不能拆分initiating user、complete ToolRound或final assistant model-visible unit；
+- compaction只追加overlay，不重写旧entries；
+- navigating/forking到compaction前的entry自然不应用该compaction；
+- physical retention/vacuum与conversation compaction分离。
+
+## SessionWriter Append Algorithm
+
+```text
+SessionWriter.append(draft)
+→ 检查writer未poisoned/closed
+→ 先lookup operation_key
+   ├─ same key + same normalized payload：返回原receipt
+   └─ same key + different payload：OperationConflict
+→ 检查expected_current_entry
+→ 验证parent_entry存在且可作为本次append parent
+→ 分配EntryId和timestamp
+→ 验证entry body与所有cross-entry references
+→ 计算trusted projection deltas
+→ serialize one StoredSessionEntry + '\n'
+→ append + flush process-visible bytes
+→ 更新writer current entry / indexes
+→ 返回CommittedSessionEntry
+```
+
+append一旦进入physical write，不接受Turn cancellation。
+
+内部可以使用buffered writer或合并OS write以降低syscall，但每条entry仍有独立identity、operation key、validation和receipt；不得重新形成caller-visible业务batch协议。
+
+## CommittedSessionEntry
+
+```rust
+pub(crate) struct CommittedSessionEntry {
+    entry: Arc<StoredSessionEntry>,
+    previous_current_entry: Option<EntryId>,
+    current_entry: EntryId,
     projections: CommittedProjectionDeltaSet,
 }
 
 pub(crate) struct CommittedProjectionDeltaSet {
     conversation: CommittedConversationDelta,
-    // private typed Turn/Item/Interaction/Recovery/branch deltas
+    // private typed Turn/Item/Interaction/Recovery/tree deltas
 }
 ```
 
-CommittedSessionBatch 字段不直接暴露；只提供 diagnostics/read-only accessors 和 storage-owned apply_committed。全部 projection deltas 由 SessionStorage trusted projectors 生成，不接受 caller-provided delta。Session execution 必须先通过 storage-owned `apply_committed(receipt)` 应用 required projections，随后才能 publish event、notify request 或 wake waiter。
+receipt字段不直接公开；只提供diagnostics/read-only accessors和storage-owned `apply_committed`。
 
-apply_committed 必须 all-or-rebuild：任何 projection base/checkpoint 不匹配都丢弃相关 hot projections并从 durable current leaf replay；不能只推进 Conversation 而让 Turn/Item/Interaction 停留在旧 leaf。
+全部projection delta由SessionStorage trusted projectors生成，不接受caller-provided delta。Session execution必须先apply required projections，随后才能：
 
-成功 receipt 是 runtime 应用 projection 和发布事件的唯一依据。
+- 发布Runtime event；
+- notify Interaction request；
+- wake Interaction waiter；
+- 开始Tool side effect；
+- 开始下一次模型调用。
 
-## Commit Error
+apply失败不回滚已append entry；Session execution丢弃hot projections并从durable current entry replay。
+
+## Append Error
 
 ```rust
 pub enum SessionWriteError {
-    StaleLeaf,
+    StaleCurrentEntry,
+    InvalidParent,
     OperationConflict,
-    InvalidBatch,
-    BatchTooLarge,
+    InvalidEntry,
+    EntryTooLarge,
     NotCommitted(StorageError),
     OutcomeUnknown {
         operation_key: IdempotencyKey,
@@ -597,12 +755,13 @@ pub enum SessionWriteError {
 
 语义：
 
-- `NotCommitted`：已证明 batch 不存在，可以安全 retry；
-- `OutcomeUnknown`：必须 reopen/replay 或按 operation_key lookup；它表示 storage commit acknowledgement 不确定，不等于 Tool side-effect outcome unknown，也不能直接派生 ToolInvocation Abandoned；
-- `WriterUnavailable`：writer poisoned，不能继续 append；
-- commit 后 hot projection apply failure 不回滚 durable batch，Session execution reload。
-
-不需要 Grok 式“log committed 但 summary bookkeeping 失败”，因为 baseline commit path 不更新 authoritative sidecar。
+- `NotCommitted`：失败发生在physical write前，已证明entry不存在，可以安全retry同一draft；
+- physical write开始后的write/flush错误返回`OutcomeUnknown`并poison当前writer；
+- `OutcomeUnknown`：必须取得exclusive lease后reopen，处理partial tail并replay/按operation key lookup；解析完成前不能继续使用旧writer；
+- `OutcomeUnknown`表示storage acknowledgement不确定，不等于Tool side-effect outcome unknown；
+- `WriterUnavailable`：writer已poisoned/closed，不能继续append；
+- same key同payload retry返回原receipt，不产生第二条log entry；
+- log中出现duplicate operation key属于corruption。
 
 ## Conversation Projection
 
@@ -613,7 +772,7 @@ pub(crate) struct CommittedConversationState {
 }
 
 pub(crate) struct ConversationCheckpoint {
-    leaf: Option<LeafId>,
+    entry_id: Option<EntryId>,
     transcript_fingerprint: TranscriptFingerprint,
 }
 
@@ -621,26 +780,6 @@ pub(crate) struct CommittedConversationView<'a> {
     checkpoint: &'a ConversationCheckpoint,
     messages: &'a [MessageRecord],
 }
-
-impl CommittedConversationState {
-    pub(crate) fn view(&self) -> CommittedConversationView<'_>;
-}
-
-impl CommittedConversationView<'_> {
-    pub(crate) fn checkpoint(&self) -> &ConversationCheckpoint;
-    pub(crate) fn messages(&self) -> &[MessageRecord];
-    pub(crate) fn transcript_fingerprint(&self) -> &TranscriptFingerprint;
-}
-```
-
-CommittedConversationView 只是已验证 State 的只读借用，没有 public constructor；delta 必须先成功 apply并校验 fingerprint，不能直接变成 view。
-
-唯一构造来源：
-
-```text
-SessionStorage replay
-或
-successful CommittedSessionBatch.projections.conversation apply
 ```
 
 ```rust
@@ -659,597 +798,520 @@ pub(crate) enum ConversationChange {
 }
 ```
 
-每个成功 batch 都返回 conversation delta：operational/terminal-no-message commit 使用 AdvanceOnly，消息和 transcript fingerprint 不变，但 checkpoint leaf 前进。Genesis checkpoint 使用 `leaf = None` 和 canonical empty-transcript fingerprint。不提供 arbitrary insert/delete/reorder。
+每个成功append都推进checkpoint entry_id：
 
-apply：
+- operational/context/event entry通常是`AdvanceOnly`；
+- Input/Steer user和Final assistant是`Append`；
+- `tool_round_completed`是`Append`；
+- Compaction是`Replace`。
+
+`AdvanceOnly`不改变messages或TranscriptFingerprint，但推进ledger checkpoint。
+
+唯一构造来源：
 
 ```text
-state.checkpoint == delta.base
-→ apply change
-→ recompute TranscriptFingerprint
-→ verify it == delta.next.transcript_fingerprint
-→ publish new state
-
-mismatch
-→ discard delta
-→ replay selected leaf
+SessionStorage replay
+或
+successful CommittedSessionEntry delta apply
 ```
 
-TranscriptFingerprint 只存于 ConversationCheckpoint，避免 state 内重复 authority。
+`CommittedConversationView`没有public constructor，不能从draft、stream buffer或裸message vector构造。
 
-## Model-Visible Projection
+## Model-Visible Rules
 
-conversation projector 只消费：
+conversation projector只消费：
 
 ```text
-TurnStarted.initiating UserMessage
-ToolRoundPromoted
-SteerCommitted UserMessage
-CompactionCommitted
-TurnTerminal.Completed final AgentMessage
+Message::User(source = Input)
+Message::User(source = Steer)
+Event::ToolRoundCompleted
+Message::Assistant(phase = Final)
+Compaction
 ```
 
-明确忽略：
+明确不直接消费：
 
 ```text
-ToolInvocationStarted
+TurnContext
+Message::Assistant(phase = Intermediate)
+Message::Tool
 InteractionRequested / Resolved
 ToolExecutionStarted
-ToolOutcomeKnown
-ToolInvocationClosed without ToolRoundPromoted
-Interrupted / Failed terminal detail
-streaming / retry / progress（根本不持久化）
+ToolAbandoned
+TurnInterrupted / TurnFailed
+streaming / retry / progress
 ```
 
-因此 durable 不等于 model-visible。
+`ToolRoundCompleted`投影：
 
-PromptSet 只能接收 `CommittedConversationView`；该 view 不能从裸 `Vec<MessageRecord>` 构造。
+```text
+assistant_entry.content
+→ provider-neutral assistant/reasoning/tool-call sequence
+ordered tool_entry_ids
+→ matching tool messages
+```
+
+任何missing/mismatched reference都fail closed，不能跳过坏member后继续构造模型输入。
 
 ## 其他 Projections
 
-同一个 batch log 重建：
+同一个entry tree重建：
 
 ```text
-Turn/Item projection
+Turn projection
+Item projection
 Interaction projection
 Recovery projection
-Branch/checkpoint projection
 Conversation projection
+Usage projection
+Tree/checkpoint projection
 ```
 
-不创建第二份 authoritative `chat_history.jsonl` 或 `updates.jsonl`。
+不创建第二份authoritative `chat_history.jsonl`、`events.jsonl`或usage ledger。
 
-loaded Session 可以缓存 projections；cache 丢失后从 log replay。
+Runtime public event stream、snapshot和Session index都由entry receipt/replay投影。
 
-## Branch Tree
+## Entry Tree 与 Current Entry
 
-每个 batch 的 parent_leaf 形成 tree：
+每个entry的`parent_id`形成tree：
 
 ```text
 Genesis
-└─ A
-   └─ B
-      ├─ C
-      └─ D
-         └─ E
+└─ e1 TurnContext
+   └─ e2 User
+      └─ e3 Assistant(intermediate)
+         ├─ e4 Tool...
+         └─ e8 Historical branch...
 ```
 
-不建立 Branch entity。
+不建立Branch entity。
 
-### Current Leaf
-
-current leaf 是 physical log 中最后成功 commit batch 的 resulting leaf。
-
-普通 append：
+current entry是physical log中最后成功append entry。ordinary append：
 
 ```text
-expected_current = B
-parent = B
-→ C
+expected_current = e3
+parent = e3
+→ e4
 ```
 
-从历史 checkpoint 创建 branch：
+history branch append：
 
 ```text
-expected_current = C
-parent = B
-→ D
+expected_current = e7
+parent = e3
+→ e8
 ```
 
-这同时把 current leaf 推进到 D，并保留 C branch。
+这保留e4...e7旧path，并让e8成为new current entry。
 
-只查看历史 leaf 是 transient read selection，不持久化 `HeadMoved` record。只有真正 append 新 fact 才改变 durable current leaf。
-
-## Stable Checkpoint
-
-stable checkpoint 是 projection property。用户可 branch/fork 的 baseline checkpoint 必须满足：
-
-```text
-genesis
-或
-selected leaf 上无 Running Turn、Pending Interaction、Started ToolInvocation，
-且 model-visible transcript 不包含 partial atomic unit
-```
-
-典型值是 Turn terminal batch leaf，或该 leaf 后追加的 validated CompactionCommitted leaf。
-
-不允许 navigation 到 complete ToolRound 中间、Interaction pending point 或 Tool side-effect barrier 后的半成品状态。
-
-内部 repair 可以扫描其他 batch，但不能把 unsafe leaf 作为普通可执行 Session current leaf。
+所有entry都可作为storage tree node，但Runtime对外navigation/fork interface可以限制可选择的message anchor。
 
 ## Fork
 
-MVP 使用 staging deep copy，不建立 cross-session shared ancestry。
+ForkSession创建新SessionId，不恢复source执行上下文。
+
+MVP公开anchor：
 
 ```text
-validate source stable checkpoint
-→ walk selected root-to-leaf batch path
+Before UserMessage
+After UserMessage
+Before final AssistantMessage
+After final AssistantMessage
+```
+
+anchor精确解析：
+
+- `Before UserMessage(Input)`解析为其TurnContext entry的`parent_id`，同时排除Context和Input，避免复制orphan Context；
+- `Before UserMessage(Steer)`解析为该UserMessage的`parent_id`；
+- `After UserMessage`解析为该UserMessage entry；Input场景自然包含其TurnContext；
+- `Before final AssistantMessage`解析为final entry的`parent_id`；
+- `After final AssistantMessage`解析为final entry；
+- genesis解析为`None`；`ForkOrigin.source_entry_id`保存解析后的path end，而不是picker message的模糊位置。
+
+带ToolCall的intermediate assistant、Tool message、Interaction/event entry不作为公开picker anchor。storage内部仍可按任意EntryId执行只读replay和repair。
+
+fork流程：
+
+```text
+resolve requested message anchor
+→ flush/open source complete-entry prefix
+→ walk selected root-to-entry parent path
+→ validate references needed by selected path
 → create target staging file
-→ write target SessionHeader + ForkOrigin
-→ copy/rewrite selected batches
-→ remap identities and references
-→ replay target and compare semantic projection/fingerprint
+→ write target SessionHeader with ForkOrigin
+→ copy entries in path order
+→ remap target-local identities/references
+→ if copied prefix contains Running Turn:
+     close Pending Interaction
+     mark remaining Started ToolInvocation Abandoned
+     append TurnInterrupted(HistoricalFork)
+→ full replay/validation of target staging
 → atomic publish target
+→ publish child Session entity
 ```
 
-identity 规则：
+remap：
 
-| Identity | Child |
+| Identity | Fork handling |
 | --- | --- |
-| SessionId | new |
-| BatchId / EntryId | remap |
+| entry ownership/correlation SessionId | new target value；ForkOrigin与historical exact definition refs保留source identity |
+| EntryId / parent_id | remap |
 | TurnId / ItemId / RequestId | remap |
-| operation/idempotency key | regenerate |
-| ToolCallId | preserve exact value |
-| definition/content/fingerprint references | preserve exact semantics |
-| loaded waiter/task/lease | never copy |
+| operation key | regenerate target-local key |
+| ToolCallId | preserve |
+| historical Agent/SessionDefinition/Workspace exact refs | preserve source-scoped exact semantics；不重写为child current revision |
+| content/model/reasoning payload | preserve exact semantics, subject to redaction policy |
 
-target 按 selected root-to-checkpoint path 顺序重写 batches。每个 target batch 的 expected_current_leaf 必须改为 staging file 中 immediately previous resulting LeafId；parent_leaf remap 为 selected parent（在线性 copied path 中同样是 previous leaf）；随后使用 target-local operation key 和 remapped logical records 重新计算 batch_fingerprint。
+必须重写所有nested EntryId references：
 
-remap 必须递归覆盖：
+- User context_entry_id；
+- Tool source execution_started_entry_id；
+- ToolRoundCompleted assistant/tool entry refs；
+- Compaction checkpoint/protected refs；
+- Fork provenance保留source identity但不能作为target operational reference。
 
-- StoredSessionBatch expected_current_leaf / parent_leaf；
-- every StoredRecord.entry_id；
-- ToolInvocationClosed.outcome_entry_id；
-- ToolRoundPromoted member outcome EntryId；
-- CompactionCommitted source checkpoint leaf、summarized-through、retained/protected EntryIds；
-- Turn/Item/Interaction record 内全部 child-local semantic IDs；
-- child 内部 ConversationCheckpoint leaf。
-
-ForkOrigin.source_checkpoint 是 source provenance，保留 source Session/Leaf identity，不 remap 为 child leaf。target replay 必须验证全部 nested references 和所有 projections/fingerprints，不只比较 model conversation。
-
-只复制 selected path，不复制 sibling branches。
-
-Fork 不是高频写路径；deep copy 比 copy-on-write DAG 更容易验证、独立删除和 repair。未来若出现高频 fork/remote sync，可在不改变 SessionWriter interface 的前提下增加不同 private backend。
-
-## Compaction
-
-Compaction 是 append-only projection overlay：
+Fork不复制：
 
 ```text
-raw durable records 不删除
-CompactionCommitted 改变 selected branch 的 conversation projection
+loaded state
+TurnExecutionContext object
+Workspace authorization lease
+provider session
+AgentLoop
+waiter/task
+FollowUp queue
+Session-scoped grants
 ```
 
-replay：
+child下一Turn重新捕获Context。
+
+## Compaction、Fork 与历史分支
+
+Compaction只改变selected path上的conversation projection：
 
 ```text
-latest applicable compaction summary
-+ retained suffix
-+ later model-visible records
+root → old messages → compaction entry → retained tail
 ```
 
-`applicable` 精确定义为：CompactionCommitted 位于 selected root-to-current path；其 source checkpoint leaf 是 selected leaf 的 ancestor；source transcript fingerprint exact match。
+fork到compaction前的entry得到旧conversation；fork到compaction后的message anchor应用compaction overlay。
 
-要求：
+Compaction protection使用EntryId，但必须保护完整model-visible semantic unit：
 
-- source checkpoint 和 transcript fingerprint exact match；
-- cut 不拆分 atomic batch/model-visible unit；
-- protected EntryId 不进入 summary target；
-- navigating/forking 到 compaction 前的 leaf自然不应用该 compaction；
-- compaction failure 不改变 projection；
-- context compaction 不等于 disk vacuum。
+- initiating user entry；
+- ToolRoundCompleted及其referenced assistant/tool entries；
+- final assistant entry。
 
-physical retention、log rewrite 和 GC 留到真实容量需求出现后设计。
+不允许cut产生孤立ToolCall或Tool message。
 
-## Replay
+## Reload
 
 ```text
 read SessionHeader
-→ 逐行读取 complete StoredSessionBatch
-→ 验证 format/payload/session、non-empty batch 和 compact-line framing
-→ 建立并验证 BatchId/EntryId/operation key 唯一 indexes
-→ 从 normalized stored logical payload 重算并验证每个 batch_fingerprint
-→ 验证每个 expected_current_leaf 等于 physical append 前的 durable current leaf
-→ 验证 parent 仅为 None 或 prior batch-result LeafId，且 graph 无 missing/cycle
-→ 取 current leaf
-→ root-to-current path fold
-→ 构建 Turn/Item/Interaction/Recovery projections
-→ 应用 applicable compaction
-→ 构建 CommittedConversationState
+→ 逐行读取complete newline-terminated StoredSessionEntry
+→ 验证format/session/EntryId/operation key唯一性
+→ 建立parent graph
+→ 验证parent只引用prior complete entry或None
+→ 验证cross-entry references位于同一selected ancestry并且类型匹配
+→ fold Turn/Item/Interaction/Conversation/Usage projections
+→ 确定physical current entry
+→ 检测partial tail、corruption和unfinished Turn
 ```
 
-MVP 可以全量 replay。只有真实性能数据证明必要时，才增加：
+Read-only replay：
 
-- reverse scan；
-- projection snapshot；
-- SQLite metadata/search index；
-- cold file compression。
+- 只读取最后一个complete newline prefix；
+- 发现live writer partial tail时不截断；
+- 可以返回`TailIncomplete` diagnostics/retry。
 
-## Projection Snapshot
+Writable open/recovery：
 
-允许 future optional snapshot：
-
-```rust
-pub struct ProjectionSnapshot {
-    pub at_batch_id: BatchId,
-    pub at_leaf: LeafId,
-    pub fold_version: u16,
-    pub projection_fingerprint: ProjectionFingerprint,
-    // rebuildable data
-}
-```
-
-规则：
-
-- snapshot 不是 durable truth；
-- temp file + atomic rename；
-- watermark/fingerprint mismatch 时删除并 replay；
-- snapshot write failure 不改变 commit result；
-- baseline 可以完全不实现 snapshot。
-
-## Session Catalog / Index
-
-Runtime-global session list/search 可以使用 JSON/SQLite index，但它是 rebuildable：
-
-```text
-SessionHeader / lifecycle entity store
-→ rebuild catalog
-```
-
-index stale、missing 或 corrupt 不能改变 ledger facts。不要把 Codex 式 metadata SQLite 提升为 conversation truth。
-
-## Physical Append 与 Durability
-
-baseline commit procedure：
-
-```text
-记录 file old_len
-→ serialize complete batch bytes + newline
-→ single writer append
-→ flush to OS
-→ success receipt
-```
-
-write failure：
-
-- 能证明未写入：truncate 到 old_len，返回 NotCommitted；
-- 无法证明：poison writer，返回 OutcomeUnknown；
-- reopen 后按 operation_key replay/lookup；
-- 未确认前不能使用新 key重复 logical operation；
-- lookup 证明原 ToolOutcomeKnown 已 committed 时使用原 receipt/record；证明未 committed 且 exact result 仍在内存时，只重试 durable result write；只有 executor/side-effect 本身 outcome unknown，或 crash 后 exact result 不可恢复，才关闭为 Abandoned。
-
-当前 contract 与 ADR 0019 一致：
-
-- 保证 process-crash 后只恢复 complete newline-terminated batch；
-- 不承诺 power-loss durability；
-- 不承诺 Tool side effect 与 ledger exactly-once transaction。
-
-未来若需要 power-loss durability，private implementation 可以增加 `sync_data()`；不增加 per-call durability mode或改变领域接口。
-
-## Batch Size
-
-一个 batch line 可能包含完整 ToolRound。baseline：
-
-- inline structured text/result；
-- attachments/images 使用已有 typed reference，而非重复 base64；
-- writer 配置一个明确 `max_batch_bytes`；
-- 超限在 append 前返回 BatchTooLarge；
-- 不自动拆分 atomic ToolRound；
-- large blob/content-addressed store 只有真实需求出现后再增加。
-
-## Partial Tail
-
-tail handling 分离 read-only 与 write/recovery path：
-
-```text
-read-only replay_at
-→ 只读取最后一个 complete newline prefix
-→ 发现 partial tail 时不修改文件，可返回 TailIncomplete diagnostics 或 retry
-
-open writable SessionWriter / recovery
-→ 获取 exclusive per-session write lease
-→ 证明没有 live writer
-→ 保存 diagnostics
-→ truncate 到最后一个 complete newline
-→ replay complete prefix
-```
-
-即使尾部 bytes 可以解析成 JSON，只要没有 terminating newline，仍视为 uncommitted tail。read-only replay 永远不能截断可能仍由 live writer 追加的文件。
-
-append 前 writer 必须确保 file 位于最后一个 complete newline boundary；不能像简单“补换行”那样把 torn JSON 变成中间 corrupt record。
+- 必须先取得exclusive writer lease；
+- 才能truncate最后一个未换行partial tail；
+- 随后完整replay并开始recovery。
 
 ## Corruption
 
-以下是 fatal corruption：
+严格fail closed：
 
-- newline-terminated JSON 无法解析；
-- unsupported required format/payload version；
-- SessionId/header mismatch；
-- duplicate BatchId/EntryId；
-- duplicate stored operation key（无论 fingerprint 是否相同）；same-key idempotency 只能返回原 batch，不能在 log 中出现第二次；
-- recomputed batch_fingerprint mismatch；
-- missing/cyclic parent leaf；
-- dangling record reference；
-- invalid Turn/Item/Interaction transition；
-- Interaction family或 resolution key conflict；
-- ToolCallId/outcome mismatch；
-- ToolRoundPromoted incomplete/misordered；
-- compaction checkpoint/fingerprint mismatch。
+只允许自动忽略/截断：
 
-处理：
+- 文件最后一个未换行partial JSON fragment。
+
+以下是corruption：
+
+- newline-terminated invalid JSON；
+- duplicate EntryId；
+- duplicate operation key；
+- missing/cyclic/forward parent；
+- cross-session/cross-branch illegal reference；
+- User input引用错误Context；
+- Tool message找不到matching ToolCall；
+- Executed Tool message引用错误execution-start；
+- ToolRoundCompleted missing/duplicate/misordered calls/results；
+- final assistant仍有Pending/Started state；
+- terminal Turn后出现属于同一Turn的new work；
+- compaction source checkpoint/fingerprint mismatch；
+- unknown authoritative core entry variant/version。
+
+未知的authoritative entry不能像普通UI event一样静默skip。未来如果需要可忽略extension diagnostics，应使用独立、明确non-authoritative trace facility，而不是向Session durable enum加入任意`Value`。
+
+## Conservative Recovery
+
+process restart后：
 
 ```text
-read-write open fail closed
-→ 不继续 append
-→ 返回 structured corruption report
+replay complete entries
+→ 不恢复provider stream、AgentLoop、waiter或Tool task
+→ 若没有Running Turn：Ready/Idle
+→ 若存在Running Turn：
+     resolve/cancel every Pending Interaction with stable operation key
+     preserve every existing Tool message as truthful Completed Item
+     append ToolAbandoned for remaining Started invocation
+     append TurnInterrupted(HostRestart | RecoveryContextUnavailable)
+→ apply each receipt
+→ Ready/Idle
 ```
 
-不能：
+recovery逐entry执行，不承诺多entry all-or-none。每个recovery operation使用由TurnId/ItemId/RequestId和recovery reason派生的稳定operation key，因此crash后可继续未完成cleanup。
 
-- 静默 skip complete bad line；
-- 自动插入 synthetic ToolResult；
-- 自动回退到早期 compaction；
-- 把 corruption 伪装成 Interrupted Turn。
+重要规则：
 
-显式 repair baseline：导出 longest verified prefix，创建新的 repaired Session；不原地猜测修改 source file。
+- existing Tool message不因缺少ToolRoundCompleted而丢失或改写；
+- baseline不自动补写ToolRoundCompleted；
+- outcome-unknown Tool不自动重放；
+- 不生成synthetic ToolResult；
+- Interrupted/Failed不向conversation添加synthetic assistant message；
+- 如果terminal event已存在但仍有Pending Interaction或Started ToolInvocation，属于semantic corruption，而不是继续append掩盖。
 
-## Crash Recovery
+## Append/Apply-Before-Visibility / Side Effect / Notify
 
-physical replay valid 后，如果 current path 存在 nonterminal Turn：
+统一顺序：
 
 ```text
-构造 deterministic recovery operation key
-→ one Recovery batch：
-     Pending Interaction → Resolved(Cancelled HostRestart/Recovery)
-     Started invocation with exact ToolOutcomeKnown → Closed(Completed existing result)
-     remaining Started invocation → Closed(Abandoned)
-     Turn → Interrupted(HostRestart/RecoveryContextUnavailable)
-→ commit
-→ replay/apply receipt
+SessionWriter.append(draft)
+→ resolve OutcomeUnknown if necessary
+→ storage-owned apply_committed(receipt)
+→ publish/wake/side-effect/model-call
 ```
 
-recovery 不补做缺失 ToolRoundPromoted；exact result 可以关闭 Item，但不会被提升为 model-visible ToolResult。
-
-不恢复：
-
-- provider stream；
-- AgentLoop state；
-- approval/question waiter；
-- Tool task；
-- streaming delta；
-- queued FollowUp/Steer draft。
-
-## Commit-Before-Publish
+具体gate：
 
 ```text
-construct batch
-→ commit
-→ apply required projections
-→ publish domain event / request notification
-```
+User input append/apply
+→ publish Turn started/User message
+→ first model call
 
-observer failure不能回滚 batch。
+InteractionRequested append/apply
+→ notify host
 
-Interaction 特别要求：
+InteractionResolved append/apply
+→ wake waiter
 
-```text
-InteractionRequested commit
-→ request notification
+ToolExecutionStarted append/apply
+→ side effect
 
-InteractionResolved commit
-→ wake waiter / side-effect permission
-```
+Tool message append/apply
+→ Tool outcome available as durable operational fact
 
-ToolRound 特别要求：
-
-```text
-ToolRoundPromoted commit + apply conversation delta
-→ feed committed delta to AgentLoop
+ToolRoundCompleted append/apply
+→ complete ToolRound enters conversation
 → next model call
+
+Final assistant append/apply
+→ Turn Completed
 ```
 
-## Events
+observer failure不能回滚durable entry。
 
-Session event stream 不是 event store。
+## Performance 与 Size
 
-- durable facts 由 StoredRecord 表达；
-- event 在 commit + projection apply 后发布；
-- replay 不要求重放所有历史 observer events；
-- streaming/progress event 可丢失；
-- subscriber reconnect 通过 snapshot/query 获得 current projection。
+By-entry会增加line count和append调用次数，但降低单条line复杂度并提高inspect/fork灵活性。
 
-不把 transport event payload 直接序列化为 StoredRecord。
+MVP要求：
 
-## Error 分类
+- writer可以复用open file handle和buffer；
+- `append()` success语义仍必须明确，不因buffering返回未写入的false success；
+- 不使用每条entry `fsync`宣称power-loss durability；
+- process-crash baseline要求newline-terminated complete entry可replay；
+- 配置`max_entry_bytes`；
+- 超大ToolResult/reasoning未来可以引入private blob reference，但不能自动拆成多个model-visible fragments；
+- streaming/progress不写入ledger，避免高频I/O和fork噪声；
+- usage aggregate、session list和search index使用rebuildable cache。
+
+## 与 Session Execution 的关系
+
+Session execution拥有append sequencing和terminal arbitration，不把它们下推给writer。
+
+推荐执行流：
 
 ```text
-SessionNotFound
-WriterBusy
-WriterClosed
-WriterUnavailable
-StaleLeaf
-InvalidParentLeaf
-UnsafeCheckpoint
-OperationConflict
-InvalidBatch
-BatchTooLarge
-NotCommitted
-OutcomeUnknown
-UnsupportedVersion
-CorruptHeader
-CorruptBatch
-CorruptGraph
-CorruptProjection
-ForkSourceUnavailable
-ForkPublicationFailed
+append TurnContext
+→ append user/input
+→ AgentLoop NeedModel
+→ ModelGateway.generate
+→ append assistant/intermediate
+→ append Interaction events / ToolExecutionStarted as needed
+→ execute Tools
+→ append one tool message per truthful result
+→ append ToolRoundCompleted
+→ AgentLoop NeedModel
+→ ...
+→ append assistant/final
 ```
 
-公开 error enum 最后在 Runtime interface 阶段冻结。
+AgentLoop可以提前维护execution-local ToolResult和pending state，但下一次实际模型调用必须等待ToolRoundCompleted append/apply。
+
+SessionWriter不决定：
+
+- 何时调用模型；
+- 何时执行Tool；
+- Steer/FollowUp；
+- cancel；
+- Interaction deadline；
+- terminal winner。
+
+## 明确不建立
+
+当前不建立：
+
+```text
+StoredSessionBatch
+SessionWriteBatch
+BatchId
+batch fingerprint
+batch commit marker/group protocol
+Branch entity
+ToolRound entity
+MessageManager
+InteractionService
+通用database transaction hierarchy
+chat_history + events dual log
+content-addressed DAG
+```
 
 ## 被否决的方案
 
-### 每条 Message 一行
+### 一行一个业务batch
 
-否决原因：ToolCall、ToolResult、final message 和 terminal fact 无法 all-or-none，crash 会暴露 partial protocol history。
+否决原因：将物理写入、history tree、ToolRound和terminal cleanup耦合为同一协议，增加BatchId/fingerprint/interior-entry/fork remap复杂度，不符合当前by-entry和历史fork目标。
 
-### chat_history + operational updates 双日志
+### 一条content block一个entry
 
-否决原因：两个文件可能不同步，必须额外定义谁是 truth、如何 snapshot 和如何 repair。单 batch log 已能投影两者。
+否决原因：会把同一个finalized assistant response拆成partial response，引入response group、usage重复、ordering和recovery复杂性。一个assistant response使用一个entry和ordered `content[]`。
 
-### SQLite/WAL 作为 baseline truth
+### Message与Runtime Event双写同一内容
 
-优点是 transaction、index 和 query 强；但当前本地单 writer Runtime 不需要 normalized schema、migration、WAL checkpoint 和 per-session database lifecycle。保留 SessionStorage interface，使未来 adapter 仍可替换。
+否决原因：Codex式ResponseItem + AgentMessage/UserMessage EventMsg产生重复事实。MiniCore message是canonical content，Runtime observer event从receipt派生。
 
-### Content-addressed commit DAG
+### Generic durable Event/Custom Value
 
-优点是 cheap fork 和 structural sharing；但需要 canonical hashing、mutable head CAS、GC、reachability、retention lease 和 shared-prefix purge语义，当前过度设计。
+否决原因：未知payload可能影响recovery或conversation，却无法由storage validator理解。核心durable event保持typed且数量受控。
 
-### Cross-session copy-on-write fork
+### chat history和operational events分两个文件
 
-否决原因：source purge、shared corruption、encryption/key rotation 和 GC ownership复杂。MVP fork deep copy selected path。
+否决原因：形成dual durable truth，需要额外snapshot、ordering和repair协议。
 
-### Silent corruption skip / synthetic repair
+### 自动补全partial ToolRound
 
-否决原因：跳过 approval、ToolResult 或 terminal record可能构造从未发生的模型历史。MiniCore fail closed并显式 repair。
-
-### Generic storage plugin interface
-
-否决原因：当前只有一个真实 backend。先设计深 SessionStorage module；未来出现第二实现再提取 seam。
+否决原因：restart时缺少原AgentLoop/control/context，自动promotion可能让模型看到未经当前owner仲裁的旧结果。baseline保留truthful entries并Interrupted Turn。
 
 ## 基础不变量
 
-- SessionStorage 是 Session ledger 唯一 durable truth；
-- 每个 Session 同时最多一个 writer；
-- runtime mutation 只通过 SessionWriter::commit；
-- SessionHeader create/fork 不形成第二 runtime writer；
-- 一个 JSONL line 是一个完整 StoredSessionBatch；
-- incomplete tail batch 不可见；
-- complete invalid line 不静默跳过；
-- writer 分配 BatchId/EntryId；
-- operation key + fingerprint 保证 idempotency；
-- parent_leaf 形成 branch tree；
-- current leaf 是最后成功 commit batch leaf；
-- Branch 不是 entity；
-- durable 不等于 model-visible；
-- operational Tool/Interaction facts只推进 ledger checkpoint，不进入 model-visible transcript；
-- complete ToolRound promotion 与 Item Completed同 batch；
-- CommittedConversationState 只来自 replay 或 trusted commit delta；
-- Prompt 只消费 CommittedConversationView；
-- hot projection mismatch 时 reload；
-- compaction append overlay，不改写 raw history；
-- fork 只从 stable checkpoint；
-- fork deep copy selected path并 remap target-local identities；
-- projection snapshot/index不是 truth；
-- recovery 不恢复旧 task/waiter/stream；
-- outcome unknown 不重放 Tool或生成 ToolResult；
-- terminal/recovery batch关闭 pending/open domain state；
-- event 在 commit + projection apply 后发布；
-- 当前 contract 只承诺 process-crash durability。
+- 一个Session只有一个authoritative JSONL entry tree；
+- 一行一个complete StoredSessionEntry；
+- runtime mutation只通过SessionWriter::append；
+- operation key先于current-entry conflict lookup；
+- same key同payload幂等返回，same key不同payload conflict；
+- EntryId由writer分配；
+- parent_id形成tree，current entry是最后成功append entry；
+- TurnContext不创建Turn；
+- input user message append开始Turn；
+- final assistant message append完成Turn；
+- Steer是source=Steer的user message；
+- assistant response一个entry，content[]保存ordered reasoning/text/tool_call；
+- finalized reasoning和usage随assistant保存；
+- ToolCall创建Started ToolInvocation；
+- Tool message保存truthful result并完成operational Item；
+- ToolExecutionStarted先于side effect；
+- Interaction request先于notify，resolution先于wake；
+- assistant intermediate和tool message在ToolRoundCompleted前不model-visible；
+- ToolRoundCompleted必须exact cover全部ToolCalls和Tool messages；
+- incomplete ToolRound可以durable但不能进入conversation；
+- outcome unknown不生成Tool message；
+- Interrupted/Failed不生成synthetic assistant message；
+- Prompt只消费CommittedConversationView；
+- every append返回trusted AdvanceOnly/Append/Replace delta；
+- projection mismatch时all-or-replay；
+- compaction append overlay，不改写历史；
+- fork deep copy selected parent path并remap nested refs；
+- partial tail只允许最后一个未换行fragment；
+- complete bad line或非法reference fail closed；
+- recovery不恢复旧I/O、不自动重放Tool、不自动补ToolRoundCompleted；
+- observer/cache/index不是第二事实来源。
 
-## Test Matrix
+## 测试矩阵
 
 至少覆盖：
 
-- create writes one valid immutable SessionHeader；
-- concurrent open writer returns WriterBusy；
-- one physical compact-JSON line per commit batch，multiline content 必须 escape；
-- genesis checkpoint 使用 None leaf；
-- writer allocates stable ordered EntryIds/LeafId；
-- ordinary append expected/current parent；
-- stale expected leaf；
-- branch append from stable historical LeafId；
-- interior EntryId 不能作为 parent/checkpoint；
-- unsafe branch checkpoint rejected；
-- same operation key + same fingerprint idempotent receipt，即使 current leaf 已因原 commit 前进；
-- same key + different fingerprint conflict；
-- log 中 duplicate operation key 即使 fingerprint 相同也 corruption；
-- stored batch fingerprint mismatch fails closed；
-- NotCommitted safe retry；
-- OutcomeUnknown reopen + lookup；
-- uncertain ToolOutcomeKnown found committed → preserve exact result；
-- uncertain ToolOutcomeKnown proven absent → retry only durable write；
-- unresolved storage outcome 不直接派生 Abandoned；
-- writer poisoned after uncertain append；
-- TurnStart atomic UserMessage + metadata；
-- ToolInvocationStarted durable，conversation messages/fingerprint unchanged但 checkpoint leaf AdvanceOnly；
-- InteractionRequested commit-before-notify；
-- InteractionResolved commit-before-wake；
-- ToolExecutionStarted commit-before-side-effect；其 SessionWrite OutcomeUnknown 必须先 lookup resolve，未解析前禁止 side effect；
-- pre-execution deny/validation failure 可直接提交 ToolOutcomeKnown，不伪造 ToolExecutionStarted；
-- ToolOutcomeKnown durable，messages/fingerprint unchanged但 checkpoint leaf AdvanceOnly；
-- complete ToolRound closes all Items and promotes one ordered conversation unit；
-- incomplete ToolRound can advance ledger checkpoint but never changes model-visible messages/fingerprint；
-- one Abandoned invocation rejects promotion；
-- Steer append delta；
-- final AgentMessage + TurnTerminal(Completed) atomic；
-- terminal batch closes Pending/Started state；
-- compaction Replace delta；
-- sibling branch compaction 不 applicable；
-- terminal 后 compaction leaf 仍可作为 stable checkpoint；
-- compaction cut cannot split ToolRound；
-- hot delta base mismatch triggers replay；
-- replay reconstructs all projections；
-- projection snapshot missing/corrupt ignored；
-- current leaf follows last committed batch；
-- sibling branches retained；
-- fork copies only selected path；
-- fork rewrites expected_current/parent to target path and recomputes fingerprint；
-- fork remaps nested Batch/Entry/Leaf/Turn/Item/Request IDs and references；
-- fork preserves ToolCallId/content semantics；
-- staging fork crash does not publish child；
-- file with complete newline tail loads；
-- exclusive writable recovery truncates incomplete last line；
-- concurrent/read-only replay does not truncate partial live tail；
-- parseable no-newline tail仍 discarded；
-- interior malformed line fails closed；
-- semantic invalid record fails closed；
-- explicit repair exports verified prefix；
-- recovery exact result closes Item without promotion；
-- recovery unknown outcome Abandoned；
-- recovery closes pending Interaction and interrupts Turn once；
-- streaming/progress never written；
-- max_batch_bytes rejects before append；
-- no fsync/power-loss promise in baseline contract。
+- context entry后crash但无user input；
+- user input append OutcomeUnknown lookup；
+- assistant intermediate含多个ToolCall；text/reasoning-only Intermediate被拒绝；
+- reasoning text/encrypted/signature round-trip；
+- usage/model/response ID/finish reason round-trip；
+- Interaction request-before-notify；
+- resolution-before-wake；
+- ToolExecutionStarted before side effect；
+- pre-execution Tool message无execution-start ref；
+- executed Tool message exact execution-start ref；
+- partial tool results无ToolRoundCompleted；
+- ToolRoundCompleted missing/duplicate/reordered refs fail closed；
+- ToolRoundCompleted后conversation一次append完整round；
+- final assistant拒绝尚未被ToolRoundCompleted引用的Intermediate assistant；
+- final assistant与Cancel/Steer race；
+- Interrupted/Failed terminal cleanup；
+- recovery保留existing tool messages、不补promotion；
+- late completion/late Interaction resolution；
+- duplicate operation key same/different payload；
+- write/flush OutcomeUnknown poisons old writer，reopen后分别覆盖entry存在与partial-tail不存在；
+- partial final line；
+- newline-terminated bad line；
+- parent cycle/missing parent；
+- fork before/after user/final assistant；Before Input同时排除associated TurnContext；
+- fork mid-Turn target-local interruption；
+- nested EntryId/TurnId/ItemId/RequestId remap；
+- copied historicalTurnContext保留source-scoped exact definition refs，child future definition独立；
+- compaction source fingerprint和protected complete ToolRound；
+- Prompt永远看不到uncompleted ToolRound。
 
-## 后续问题
+## 当前开放问题
 
-1. Session execution 如何组织 batch constructors、commit gate 和 ToolTurnPort implementation。
-2. CompactionCommitted summary/cut/retained fields 的最终类型。
-3. Runtime query/snapshot 如何分页 Turn/Item/Interaction projection。
-4. large Tool output 达到何种数据后引入 blob/content reference store。
-5. projection snapshot 触发阈值是否需要实现。
-6. Runtime-global Session catalog 使用 JSON、SQLite 还是现有 entity store。
-7. physical retention/vacuum 和 purge reachability。
-8. future remote/multi-process backend 是否需要提取 storage adapter seam。
+仍需后续阶段闭合：
 
-## 设计进度
+1. `SessionExecutionTask`如何调度entry append、external futures和control ingress；
+2. exact Rust serde tags/field casing，以及未来format v2+ migration policy；
+3. Rig/AgentLoop adapter如何映射一个finalized assistant response及ordered content；
+4. ModelGateway如何规范化provider reasoning、usage、finish reason和response ID；
+5. max entry size及未来blob reference阈值；
+6. FollowUp process-local queue的ack语义；
+7. public fork command的Before/After message anchor payload；
+8. cold exact resume是否值得在稳定executor implementation identity后扩展。
 
-- [x] 选择 per-session append-only JSONL batch log。
-- [x] 固定 SessionWriter::commit 唯一 runtime write seam。
-- [x] 固定 SessionHeader create/fork exception。
-- [x] 定义 StoredSessionBatch、StoredRecord、EntryId、LeafId 和 BatchId。
-- [x] 定义 operation key、fingerprint 和 commit receipt。
-- [x] 定义 operational facts 与 conversation promotion facts。
-- [x] 定义 atomic commit units。
-- [x] 定义 genesis-capable CommittedConversationState/Checkpoint、always-returned Delta 和 trusted apply。
-- [x] 定义 model-visible projector。
-- [x] 定义 parent_leaf branch tree 和 stable checkpoint。
-- [x] 定义 fork staging deep copy 和 identity remap。
-- [x] 定义 append-only compaction overlay。
-- [x] 定义 partial-tail、corruption 和 explicit repair。
-- [x] 定义 conservative recovery。
-- [x] 拒绝 dual log、baseline SQLite、content DAG 和 generic plugin interface。
-- [ ] 完成 Session execution owner 和 batch construction flow。
-- [ ] 完成 Compaction module。
-- [ ] 完成 Runtime public query/event projection。
+## 完成检查
+
+- [x] 选择per-session append-only by-entry JSONL tree。
+- [x] 固定SessionHeader create/fork staging exception。
+- [x] 定义StoredSessionEntry envelope、EntryId、parent_id和operation key。
+- [x] 固定TurnContext / Message / Event / Compaction顶层类别。
+- [x] 固定user/assistant/tool message layout。
+- [x] 固定assistant finalized response聚合、reasoning和usage持久化。
+- [x] 定义durable Interaction和Tool side-effect events。
+- [x] 定义ToolRoundCompleted committed-only conversation gate。
+- [x] 定义CommittedConversationState/View/Delta和AdvanceOnly/Append/Replace。
+- [x] 定义entry-level idempotency和OutcomeUnknown lookup。
+- [x] 定义parent tree、fork deep copy和identity remap。
+- [x] 定义compaction overlay。
+- [x] 定义partial tail、strict corruption和conservative recovery。
+- [x] 保持SessionStorage为唯一durable truth。
+- [ ] 完成Session execution owner和entry append sequencing。
+- [ ] 完成ModelGateway与AgentLoop adapter。
+- [ ] 完成实现、fixture和property tests。

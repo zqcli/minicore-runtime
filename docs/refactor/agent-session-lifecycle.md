@@ -21,7 +21,7 @@
 
 - Agent/Session 的 manager、actor、registry 或 store 具体类型；
 - Runtime command、query、event 和 transport payload；
-- SessionStorage record/batch/fork remap 的重复定义；这些以 [Conversation 与 SessionStorage 架构设计](conversation-storage.md) 为权威；
+- SessionStorage entry/fork remap 的重复定义；这些以 [Conversation 与 SessionStorage 架构设计](conversation-storage.md) 为权威；
 - loaded Session 使用 task、actor、thread 或其他 execution owner；
 - Agent definition 的 Tool/Skill/Model 等未来完整字段；
 - physical purge、retention 和 revision GC 策略。
@@ -198,9 +198,9 @@ Deleted → terminal
 - 普通 catalog/query 默认可以隐藏 Deleted Agent；
 - physical `PurgeAgent` 是未来 retention/admin 操作。
 
-Agent disable/delete 不承担 security revocation。已完成 Turn start commit 的 active Turn 使用不可变 Context，可以继续完成；需要立即停止时使用显式 Turn cancellation 或独立安全策略。
+Agent disable/delete 不承担 security revocation。已完成 initiating UserMessage append 的 active Turn 使用不可变 Context，可以继续完成；需要立即停止时使用显式 Turn cancellation 或独立安全策略。
 
-candidate admission 在 start commit 前必须经过短 Agent lifecycle gate。disable/delete 与 start commit 的胜负由该 gate 线性化，不能靠两个无保护状态读取猜测。
+candidate admission 在 initiating UserMessage append 前必须经过短 Agent lifecycle gate。disable/delete 与该 append 的胜负由该 gate 线性化，不能靠两个无保护状态读取猜测。
 
 ## Agent 操作
 
@@ -239,7 +239,7 @@ name/description 更新只改变 metadata 和 `updated_at`，不产生 AgentRevi
 - 重复进入相同状态幂等；
 - Deleted 不允许 Enable；
 - operation outcome unknown 时按 operation id 查询 durable head，不能重复创建其他状态事实；
-- loaded Sessions 可以接收 readiness invalidation，但 start commit 前的 durable AgentStatus gate 才是 authoritative 决策点。
+- loaded Sessions 可以接收 readiness invalidation，但 initiating UserMessage append 前的 durable AgentStatus gate 才是 authoritative 决策点。
 
 ## Session
 
@@ -531,7 +531,7 @@ Unavailable 可以来自：
 
 `SystemError` 不再是 durable Session lifecycle。需要修复的问题通过 `Unavailable(reason)`、load error 或 recovery diagnostics 表达。
 
-Readiness 是 projection，不是 Agent/Session lifecycle admission 的 authoritative substitute。每次 start commit 前仍必须重新检查 durable SessionLifecycle、AgentStatus、exact revisions 和 Workspace authorization。
+Readiness 是 projection，不是 Agent/Session lifecycle admission 的 authoritative substitute。每次 initiating UserMessage append 前仍必须重新检查 durable SessionLifecycle、AgentStatus、exact revisions 和 Workspace authorization。
 
 ## Session Execution State
 
@@ -550,9 +550,9 @@ pub enum SessionExecutionState {
 
 ```text
 Idle
-→ Starting          // admission reservation / Context capture / start commit
-→ Running           // Turn start batch committed
-→ Finishing         // terminal commit / pending cleanup
+→ Starting          // admission reservation / Context capture / input append
+→ Running           // initiating UserMessage entry appended
+→ Finishing         // terminal entry / pending cleanup
 → Idle
 ```
 
@@ -625,7 +625,8 @@ Approval：
 ```text
 Allow → ExecutingTools
 Deny  → 产生 denied ToolResult
-→ commit 完整 ToolRound
+→ append role=tool message
+→ append tool_round_completed
 → PreparingModel
 ```
 
@@ -638,19 +639,20 @@ Steer 到达时 Turn 保持 Running。请求必须携带 `expected TurnId`，并
 ```text
 Steer(expected TurnId) accepted
 → current Turn control queue
-→ stable barrier commit Steer
+→ stable barrier append Steer
 → 下一次模型调用看见 Steer
 ```
 
-默认情况下，WaitingApproval 中到达的 Steer 先排队，不自动当作审批结果。若 final terminal commit 先于 Steer acceptance 线性化，Steer 不再属于该 Turn；若 Steer 先被接受，final draft 必须先与 queued Steer 仲裁。
+默认情况下，WaitingApproval 中到达的 Steer 先排队，不自动当作审批结果。若 final terminal entry 先于 Steer acceptance 线性化，Steer 不再属于该 Turn；若 Steer 先被接受，final draft 必须先与 queued Steer 仲裁。
 
 若产品选择让 Steer preempt approval：
 
 ```text
 resolve pending Interaction as cancelled
 → 产生 cancelled ToolResult
-→ commit 完整 ToolRound
-→ commit Steer
+→ append role=tool message
+→ append tool_round_completed
+→ append Steer
 → 同一个 Turn 继续 Running
 ```
 
@@ -735,10 +737,10 @@ SessionExecutionState = Idle
 无 admission reservation
 无 active Turn
 无 pending Interaction
-无 in-flight stable commit
+无 in-flight entry append
 ```
 
-不满足时返回 Busy。调用方必须显式 cancel/resolve，并等待 terminal/commit 完成。
+不满足时返回 Busy。调用方必须显式 cancel/resolve，并等待 terminal append 完成。
 
 ```text
 Loaded → Unloading
@@ -755,7 +757,7 @@ Runtime shutdown 使用：
 ```text
 stop new admission
 → cancel active Turn
-→ wait terminal commit
+→ wait terminal append
 → unload
 ```
 
@@ -809,9 +811,9 @@ CloneAgent
 
 - source 为 Open 或 Archived；
 - source 不为 Deleted；
-- source boundary 是 genesis，或已 terminalize Turn 之后仍满足无 Running/Pending/Started projection 的 committed stable checkpoint；terminal 后的 validated compaction leaf 也可满足；
-- forked prefix 不包含 non-terminal Running Turn；
-- boundary 不包含 stream draft、pending approval、半个 ToolRound 或 outcome-unknown batch；
+- public boundary是genesis，或ConversationStorage定义的UserMessage/final AssistantMessage前后anchor；Compaction本身不作为MVP公开anchor，位于selected message path上的Compaction自然随path生效；
+- selected prefix可以包含至多一个non-terminal tail Turn；target staging必须以`HistoricalFork`原因关闭它；
+- stream draft不属于durable prefix；若selected prefix含Pending Interaction、Started ToolInvocation或conversation-hidden incomplete ToolRound，closure entries必须在target staging中按truthful state resolve/abandon/interrupt，不能promotion或恢复执行；
 - source SessionDefinition 和 exact AgentRevision 仍可读取；
 - Agent 必须 Enabled，才能发布 Open child Session。
 
@@ -849,9 +851,9 @@ pending Interaction / FollowUp queue
 Session-scoped Tool grant
 ```
 
-fork 使用 staging + atomic publication。child publication 必须在 Agent lifecycle gate 内最终检查 AgentStatus = Enabled，并与 Agent disable/delete 线性化；失败或 crash 的 staging target 不进入 Session catalog。
+fork使用staging + atomic publication。copy/remap完成后，若target projection仍有Running Turn，则先逐entry append InteractionResolved/ToolAbandoned和`TurnInterrupted(HistoricalFork)`；不得补synthetic ToolResult或`tool_round_completed`。full replay确认无Running/Pending/Started后，child publication才可在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
 
-Conversation/SessionStorage 使用 parent_leaf batch tree；fork deep-copy selected path，并 remap BatchId、EntryId、LeafId、TurnId、ItemId 和 RequestId，preserve ToolCallId 与 exact content/definition references。完整规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
+Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path，并remap EntryId、TurnId、ItemId和RequestId，preserve ToolCallId与exact content/definition references。完整规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
 ## Turn Admission Basis
 
@@ -876,10 +878,10 @@ Session lifecycle/load/readiness/execution gate
 → capture SkillCatalog / ToolSet / PromptSet
 → 获取短 Agent lifecycle gate
 → 最终检查 AgentStatus = Enabled
-→ 在 gate 内 start commit 并确认 outcome
+→ 在gate内append TurnContext和initiating UserMessage，并确认outcome
 ```
 
-start metadata 至少保存：
+TurnContext entry至少保存：
 
 ```text
 SessionDefinitionRevision
@@ -888,7 +890,7 @@ Workspace/Prompt/Tool/Skill/Model exact fingerprints/references
 ExecutionContextFingerprint
 ```
 
-Agent current revision 不参与 Turn capture，因为 Session 已经 pin exact AgentRevisionRef。Agent status 的 authoritative check 与 start commit 使用同一个短 lifecycle gate；capture 前的 status/readiness check 只用于提前失败。
+Agent current revision不参与Turn capture，因为Session已经pin exact AgentRevisionRef。Agent status的authoritative check与initiating UserMessage append使用同一个短lifecycle gate；capture前的status/readiness check只用于提前失败。
 
 ## Active 与 Future Turn
 
@@ -897,7 +899,7 @@ Agent current revision 不参与 Turn capture，因为 Session 已经 pin exact 
 | Agent 发布新 revision | 保持 exact Session pin | 不变 | 仍使用 Session pin，直到显式升级 |
 | Session 显式升级 Agent | 已捕获旧 SessionDefinitionRevision 者不变 | 不变 | 使用新 AgentRevisionRef |
 | Session definition ordinary update | 已捕获旧 revision 者不变 | 不变 | 使用新 SessionDefinitionRevision |
-| Agent disable/delete | start commit 前 gate 决定胜负 | 已 commit Turn 继续 | admission 拒绝 |
+| Agent disable/delete | input append 前 gate 决定胜负 | 已开始 Turn 继续 | admission 拒绝 |
 | Session archive/delete | 要求先无 candidate | 要求先无 active Turn | lifecycle 状态拒绝 |
 | ordinary Workspace update | 已捕获旧 basis 者不变 | 不变 | 使用新 definition/snapshot |
 | restrictive Workspace update | lease/final check 失败 | revoke 并中断 | 使用新 Snapshot |
@@ -909,19 +911,19 @@ Agent current revision 不参与 Turn capture，因为 Session 已经 pin exact 
 
 Session admission gate 保证 candidate 得到完整旧 SessionDefinition 或完整新 SessionDefinition，不允许字段跨 revision 混合。Loading 使用 captured revision 构建临时状态，并在 publication 前 CAS current head；definition update 先赢时旧 load result 被丢弃。
 
-### Agent Disable/Delete vs Start Commit
+### Agent Disable/Delete vs Turn Start Append
 
 短 Agent lifecycle gate 决定：
 
 ```text
-status mutation 先赢
-→ candidate start commit 被拒绝
+status mutation先赢
+→ candidate input append被拒绝
 
-start commit 先赢
+initiating UserMessage append先赢
 → Turn 使用 pinned Context 继续
 ```
 
-Agent lifecycle gate 从 final Enabled check 持有到 start commit outcome 确认；active Turn 不持续持有该 gate。CreateSession、Session Agent upgrade 和 Fork child publication 也使用同一 gate，保证 disable/delete 先赢时不会发布新的可执行引用。
+Agent lifecycle gate从final Enabled check持有到initiating UserMessage append outcome确认；active Turn不持续持有该gate。CreateSession、Session Agent upgrade和Fork child publication也使用同一gate，保证disable/delete先赢时不会发布新的可执行引用。
 
 ### Session Definition/Metadata Update vs Archive/Delete
 
@@ -937,9 +939,9 @@ Session definition update 必须在 per-session lifecycle gate 内同时 CAS `Se
 
 使用同一个 per-session residency/lifecycle gate 串行化。不能让旧 loaded state 和新 loaded state 同时存在。
 
-### Stable Commit vs Cancel/Unload
+### Entry Append vs Cancel/Unload
 
-commit 一旦开始不可被 run cancellation 中断。cancel/unload 等待结果，再完成 terminal handling。
+append一旦进入physical write不可被run cancellation中断。cancel/unload等待结果，再完成terminal handling。
 
 ## Crash Recovery
 
@@ -959,15 +961,15 @@ Runtime restart：
 4. 读取 exact AgentRevisionRef；
 5. 重建 committed conversation；
 6. 重新 resolve Workspace；
-7. 检测没有 TurnTerminal record 的旧 Running Turn及其 pending/open state；
-8. baseline 使用一个幂等 Recovery batch 同时提交 `TurnTerminal(Interrupted { HostRestart | RecoveryContextUnavailable })`、所有 pending Interaction closure，以及 Started ToolInvocation 的 Completed(existing exact durable result)/Abandoned closure；
-9. 已有 TurnTerminal 但仍遗留 Pending Interaction 或 Started Item 属于 semantic corruption，read-write load fail closed并要求显式 repair，不能追加“修复 closure”掩盖历史；
+7. 检测没有final AssistantMessage、TurnInterrupted或TurnFailed entry的旧Running Turn及其pending/open state；
+8. baseline使用稳定operation key逐entry append InteractionResolved、ToolAbandoned和TurnInterrupted；已有role=tool message的ToolInvocation保持Completed，但不补做ToolRound completion；
+9. 已有terminal entry但仍遗留Pending Interaction或Started Item属于semantic corruption，read-write load fail closed并要求显式repair，不能追加“修复closure”掩盖历史；
 10. 进入 Ready、Unavailable 或返回 typed load/corruption error。
 
 禁止：
 
 - 用 Agent current revision 替代 Session pin；
-- 用 current SessionDefinition 替代旧 Turn start metadata；
+- 用current SessionDefinition替代旧TurnContext entry引用的exact definition；
 - 恢复旧 provider stream、AgentLoop、Tool task 或 approval waiter；
 - 自动重放 outcome unknown 的非幂等 Tool；
 - 用 last-good WorkspaceSnapshot 绕过当前 authority。
@@ -1083,16 +1085,16 @@ Agent release channel
 - Deleted 是逻辑删除，Purge 才是物理清除；
 - archive/unload/delete 不使用同一个 close 语义；
 - active Turn 使用 captured exact definitions，不受 ordinary update 影响；
-- Agent disabled/deleted 与 CreateSession、upgrade、fork publication 和 Turn start commit 使用同一 lifecycle gate 线性化；
+- Agent disabled/deleted 与 CreateSession、upgrade、fork publication 和 initiating UserMessage append 使用同一 lifecycle gate 线性化；
 - Agent disabled/deleted 阻止 future admission，但不 patch active Context；
 - Workspace restrictive update仍可 revoke active Turn；
 - WaitingApproval 时 Turn 仍是 Running；
 - Steer 不把 Turn 变成 Interrupted；
-- fork 只从 genesis 或 terminalized Turn 后仍满足 closed projection 的 committed stable boundary 创建新 Session；
+- fork从genesis或公开message anchor创建；mid-Turn prefix在target staging中以HistoricalFork中断后才发布；
 - fork 不复制 loaded execution state或 authorization capability；
 - host restart 后 loaded state 全部丢失，可由 durable truth 重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
-- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 使用同一个幂等 batch。
+- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 使用各自稳定 operation key 逐 entry 幂等追加。
 
 ## Test Matrix
 
@@ -1122,21 +1124,21 @@ Agent release channel
 - WaitingApproval 保持 Turn Running；
 - Steer 在 WaitingApproval 时排队；
 - preempt approval 时 cancelled ToolResult + Steer 仍保持同一 Turn；
-- Agent disable/delete vs start commit final gate；
+- Agent disable/delete vs initiating UserMessage append final gate；
 - CreateSession/Agent upgrade/Fork publication vs Agent disable/delete；
 - Session definition/metadata update vs archive/delete lifecycle gate；
 - Session definition update vs admission 捕获完整旧/新 revision；
-- stable commit vs cancel/unload；
-- fork Open/Archived source，且 boundary 只包含 terminalized Turn prefix；
+- entry append vs cancel/unload；
+- fork Open/Archived source，覆盖terminal boundary与mid-Turn message anchor；
 - fork 复制 exact AgentRevisionRef 与 definition content，但创建 child-local WorkspaceRevision(1)；
 - fork 不复制 Snapshot/lease/ToolSet/PromptSet/SkillCatalog；
-- fork staging crash 不发布 target；
-- restrictive Workspace definition update revoke 后 commit 失败时保持 fail closed / Unavailable；
+- fork staging crash不发布target；mid-Turn fork closure不恢复source执行状态；
+- restrictive Workspace definition update revoke 后 append 失败时保持 fail closed / Unavailable；
 - authority-only restriction 不创建 SessionDefinitionRevision；
-- Steer expected TurnId 与 final terminal commit race；
+- Steer expected TurnId 与 final terminal append race；
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；
-- recovery batch 原子 terminalize Turn、关闭 pending Interaction并 Completed/Abandoned Started ToolInvocation；
+- recovery 逐 entry terminalize Turn、关闭 pending Interaction并保留已有 tool message或Abandon Started ToolInvocation；
 - 已 terminal Turn 遗留 pending Interaction 或 Started Item 时 fail closed并进入 explicit repair；
 - missing exact revision fail closed；
 - Deleted identity 不复用；
@@ -1170,5 +1172,5 @@ Agent release channel
 - [x] 定义 WaitingApproval、Steer 和 Interrupted 的关系。
 - [x] 定义 conservative crash recovery。
 - [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
-- [x] 完成 Session ledger identity、parent_leaf tree、fork remap 和 commit contract。
+- [x] 完成 Session ledger identity、entry parent tree、fork remap 和 append contract。
 - [ ] 完成 Session execution owner 与公开 Runtime interface。

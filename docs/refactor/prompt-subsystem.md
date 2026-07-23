@@ -536,7 +536,7 @@ pub enum PromptContributionSource {
 
 `SkillContributionRef` 必须携带 Catalog revision、SkillId、DefinitionVersion、ContentHash 和 source authorization stamp。TurnExecutionContext 负责 pinned Catalog entry 与 LoadedSkill 的 exact-reference 校验；PromptSet 校验 contribution stamp 和 content hash，并将其固化到 CanonicalUserMessage fingerprint。
 
-PromptContribution 的 producer 负责 I/O、加载和错误分类；PromptSet 只验证、排序并把它固化到 `CanonicalUserMessage`、Steer record 或其他 committed MessageRecord。
+PromptContribution的producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
 
 Required contribution 获取失败必须显式返回 unavailable/error，不能通过 vector 缺项静默忽略。
 
@@ -545,12 +545,13 @@ Required contribution 获取失败必须显式返回 unavailable/error，不能�
 ```text
 PromptContribution
 → PromptSet 输入规范化
-→ MessageRecord + PromptContributionStamp
-→ commit
-→ 后续 assembly 只从 committed conversation 重建
+→ User MessageRecord + PromptContributionStamp
+→ SessionWriter.append + apply_committed
+→ conversation gate接纳
+→ 后续assembly只从committed conversation重建
 ```
 
-Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 PromptSet 创建时固定，不经过每次调用的 PromptContribution。未来若引入动态 Context provider，其输出也必须先经过同一规范化与 commit gate，不能恢复 current-call assembly 旁路。
+Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 PromptSet 创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply conversation gate，不能恢复current-call assembly旁路。
 
 ## 模型上下文组装
 
@@ -564,7 +565,7 @@ pub struct PromptAssemblyInput<'a> {
 }
 ```
 
-`CommittedConversationView` 只能从已验证的 `CommittedConversationState::view()` 获得；State 只能由 SessionStorage replay 构造，或在成功应用 `SessionWriter::commit()` receipt 中的 trusted delta 后前进。其 checkpoint/fingerprint 和 apply 规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。PromptSet assembly 不接收裸 `Vec<MessageRecord>`、任意 ToolPromptView 或任意 PromptContribution。
+`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其 checkpoint/fingerprint 和 apply 规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。PromptSet assembly 不接收裸 `Vec<MessageRecord>`、任意 ToolPromptView 或任意 PromptContribution。
 
 最终输出：
 
@@ -597,7 +598,7 @@ AssembledModelContext 是唯一允许进入 ModelGateway 的 provider-neutral Pr
 - initiating UserMessage 未遗漏或放到 ToolCall/ToolResult 中间；
 - committed MessageRecord 中的 SkillContributionRef、content hash 和 source stamp 与规范化时保存的 stamp 一致；
 - required contribution 在输入规范化阶段缺失时失败；
-- 不存在未 commit 的 current-call model-visible contribution；
+- 不存在未append/apply或尚未通过conversation gate的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
 - 最终大小和 token estimate 不超过有效模型限制。
 
@@ -651,7 +652,7 @@ candidate Turn admission
 → 内部按需 exact-load Skill / SkillInjector.build
 → PromptSet.compose_user_message(...)
 → CanonicalUserMessage
-→ start batch commit
+→ append initiating UserMessage entry
 
 每次模型调用
 → CommittedConversationView

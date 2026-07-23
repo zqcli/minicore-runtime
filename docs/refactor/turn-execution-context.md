@@ -10,8 +10,8 @@
 本文以以下领域定义为前提：
 
 ```text
-Turn 从 initiating UserMessage 所在 start batch 成功 commit 开始
-到 Completed / Interrupted / Failed terminal batch 成功 commit 结束
+Turn 从 initiating UserMessage entry 成功 append 开始
+到 final AssistantMessage / TurnInterrupted / TurnFailed entry 成功 append 结束
 ```
 
 本文重点解决：
@@ -28,9 +28,9 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 本文不提前冻结：
 
 - Session actor、task、mailbox 或锁的具体实现；
-- Session execution 如何构造并提交已定义的 SessionWriteBatch；
+- Session execution 如何构造并append已定义的Session entries；
 - Runtime command、event 和 transport protocol；
-- 已定义 SessionStorage record/batch 在具体 Session execution actor/task 中的实现细节；
+- 已定义 SessionStorage entry 在具体 Session execution actor/task 中的实现细节；
 - ModelGateway provider adapter 的具体接口；
 - AgentLoop 使用 Rig、自研状态机或其他 SDK 的具体实现；
 - FollowUp queue 的持久化和调度策略。
@@ -51,8 +51,8 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 - PromptSet 在创建时绑定同一个 ToolSet 的 ToolPromptView，assembly 时不能再传入任意 Tool view；
 - 模型可见动态事实必须来自 committed conversation，不建立未持久化的 dynamic contribution lane；
 - Skill lazy load 必须使用本 Turn pinned Catalog 的 `SkillCatalogEntryRef`；
-- initiating UserMessage commit 前不调用模型、不执行 Tool，也不发布领域 Turn；
-- Steer 是 current Turn control input；成功 commit 后才影响下一次逻辑模型调用；
+- initiating UserMessage append 前不调用模型、不执行 Tool，也不发布领域 Turn；
+- Steer 是 current Turn control input；成功 append 后才影响下一次逻辑模型调用；
 - FollowUp 不属于 `TurnControl`，它在当前 Turn terminal 后开启新 Turn，并捕获新 Context；
 - ordinary reload 只影响 future Turn；security-restricting update 撤销 lease 并中断 active Turn；
 - exact cold recovery 只有在全部 definition reference、Tool executor identity 和 Workspace reauthorization 可重建时才允许；否则 fail closed。
@@ -66,19 +66,19 @@ MiniCore 必须区分三个不同边界。
 领域 Turn 是 conversation 中的一段业务事实：
 
 ```text
-initiating UserMessage committed
-→ AgentMessage / ToolRound / Steer / Compaction*
-→ terminal Turn fact committed
+initiating UserMessage entry appended
+→ zero or more Message / Event / Compaction entries
+→ final AssistantMessage | TurnInterrupted | TurnFailed appended
 ```
 
-领域 Turn 的开始线性化点是 initiating UserMessage 所在的 start batch 成功 commit。
+领域Turn的开始线性化点是initiating UserMessage entry成功append。
 
-领域 Turn 的结束线性化点是以下任一 terminal batch 成功 commit：
+领域Turn的结束线性化点是以下任一terminal entry成功append：
 
 ```text
-TurnTerminal(Completed { final AgentMessage })
-TurnTerminal(Interrupted)
-TurnTerminal(Failed)
+Message(role = assistant, phase = final)
+TurnInterrupted
+TurnFailed
 ```
 
 candidate TurnId 的预留、Context capture 和 UserMessage 规范化发生在领域 Turn 正式开始之前。
@@ -91,14 +91,14 @@ Turn execution 是围绕一个领域 Turn 的完整运行过程：
 admission reservation
 → TurnExecutionContext capture
 → initiating UserMessage composition
-→ start commit
+→ TurnContext + initiating UserMessage append
 → AgentLoop drive
-→ model / tool / commit loop
-→ terminal commit
+→ model / tool / append/apply loop
+→ terminal entry append
 → release execution state
 ```
 
-因此 Turn execution 的操作边界比领域 Turn 略宽：它包含 start commit 之前的 admission，但失败的 admission 不产生领域 Turn。
+因此 Turn execution 的操作边界比领域 Turn 略宽：它包含 initiating UserMessage append 之前的 admission，但失败的 admission 不产生领域 Turn。
 
 ### AgentLoop
 
@@ -113,11 +113,11 @@ committed conversation seed
 → NeedModel ...
 ```
 
-AgentLoop 不拥有 Turn admission、SessionStorage、Workspace、Prompt source、Tool permission、approval、Sandbox、Steer queue 或 terminal commit。
+AgentLoop 不拥有 Turn admission、SessionStorage、Workspace、Prompt source、Tool permission、approval、Sandbox、Steer queue 或 terminal append。
 
 一个 Turn execution 可以包含多个 AgentLoop segment。例如：
 
-- compaction commit 后从新的 committed conversation seed 重新建立 segment；
+- compaction entry append/apply 后从新的 committed conversation seed 重新建立 segment；
 - AgentLoop adapter 不支持原地注入 Steer 时，在同一 TurnContext 下重新建立 segment；
 - provider 或 SDK rollover 要求重新建立内部 run state。
 
@@ -135,7 +135,7 @@ Session execution owner
    │  ├─ Arc<SkillCatalog>
    │  ├─ ToolSet
    │  └─ PromptSet
-   ├─ CommittedConversationState      // 只消费成功 commit delta
+   ├─ CommittedConversationState      // 只消费成功 append receipts的trusted delta
    ├─ private AgentLoop state         // 底层 AgentLoop segment
    ├─ ModelTurnSession                // ModelGateway 内部连接状态
    ├─ Turn control / cancellation     // 单调或可变执行状态
@@ -349,39 +349,36 @@ SessionLifecycle = Open
    └─ 内部按需完成 pinned Skill load / injection
 → 获取短 Agent lifecycle gate
 → 在 gate 内最终检查 AgentStatus = Enabled
-→ 在 gate 内原子 commit start batch：
-     TurnStarted
-     execution context fingerprint / manifest metadata
-     initiating UserMessage
-→ 确认 commit outcome 并释放 Agent lifecycle gate
-→ apply committed delta
+→ 在 gate 内append TurnContext entry → apply its AdvanceOnly delta
+→ 在 gate 内append initiating UserMessage(source = Input, context_entry_id) → apply its Append delta
+→ 确认两个append outcome并释放Agent lifecycle gate
 → 发布 SessionExecutionState = Running / TurnStatus = Running
 → 启动 private AgentLoop adapter
 → 第一次逻辑模型调用
 ```
 
-start batch 是领域 Turn 的开始线性化点。Agent lifecycle gate 只覆盖 final Enabled check 到 start commit outcome 确认，不覆盖 Context capture、模型调用或整个 Turn；disable/delete 必须等待该 gate 释放。
+initiating UserMessage entry是领域Turn的开始线性化点。Agent lifecycle gate只覆盖final Enabled check到该entry append outcome确认；TurnContext entry本身不创建Turn。disable/delete必须等待该gate释放。
 
 在此之前：
 
 - 不调用 ModelGateway；
 - 不执行 Tool；
 - 不创建 Tool approval Interaction；
-- 不发布 committed TurnStarted 或 UserMessage；
+- 不发布 committed Turn/UserMessage；
 - context capture、source read 和 cache fill 不构成领域事实；
-- `compose_message` 和 start commit 前都必须再次检查 Workspace authorization lease 与 Turn cancellation；
-- revocation 后尚未 commit 的 UserMessage、Steer 和 PromptContribution 全部丢弃。
+- `compose_message` 和 initiating UserMessage append 前都必须再次检查 Workspace authorization lease 与 Turn cancellation；
+- revocation 后尚未 append 的 UserMessage、Steer 和 PromptContribution 全部丢弃。
 
-capture、Skill load、UserMessage composition 或 start commit 失败时，释放 candidate 和局部 Context，SessionExecutionState 返回 Idle，不创建空 Turn 或 `Failed` Turn。
+capture、Skill load、UserMessage composition、Context append或UserMessage append失败时，释放candidate和局部Context，SessionExecutionState返回Idle；仅有orphan Context entry不创建空Turn或`Failed` Turn。
 
-如果 start commit 返回 outcome unknown，Session execution 必须通过 admission idempotency key 和 storage reload 确认结果，不能直接分配另一个 TurnId 重试。
+如果UserMessage append返回OutcomeUnknown，Session execution必须通过admission operation key和storage reload确认结果，不能直接分配另一个TurnId重试。
 
 Session pin exact AgentRevisionRef：
 
 - Agent current revision 更新不改变 candidate、active 或 future Turn；
 - Session 显式升级会创建新的 SessionDefinitionRevision，只影响 update 后开始 admission 的 future Turn；
-- Agent Disabled/Deleted 与 start commit 通过同一个短 Agent lifecycle gate 线性化：status mutation 先赢则 start 被拒绝，start commit 先赢则 active Turn 继续；
-- recovery 使用 Turn start metadata 中的 exact AgentRevisionRef，不能替换为 Agent current。
+- Agent Disabled/Deleted 与 initiating UserMessage append通过同一个短Agent lifecycle gate线性化：status mutation先赢则start被拒绝，message append先赢则active Turn继续；
+- recovery使用TurnContext entry中的exact AgentRevisionRef，不能替换为Agent current。
 
 完整 lifecycle 线性化规则见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
 
@@ -400,7 +397,7 @@ Turn 固定 baseline
 → ModelCallPurpose + OutputContract
 ```
 
-不能存在第四类“调用方临时传入、模型可见但没有 commit 或 pin”的动态字符串。
+不能存在第四类“调用方临时传入、模型可见但没有append/apply或pin”的动态字符串。
 
 因此每次 assembly 的推荐输入为：
 
@@ -426,12 +423,12 @@ ToolPromptView 已经被 PromptSet 固定。Workspace Prompt、Skill Catalog met
 
 动态 PromptContribution 必须在模型可见前变成 committed fact：
 
-- 用户显式 Skill invocation：`Context.compose_message()` 内完成 exact load/injection，并规范化进 `CanonicalUserMessage`，随 UserMessage commit；
-- Steer 中的 Skill invocation：使用同一个 `compose_message()` 规则，随 Steer commit；
-- 模型通过 Tool 调用 Skill：结果进入完整 ToolRound commit；
+- 用户显式 Skill invocation：`Context.compose_message()` 内完成 exact load/injection，并规范化进 `CanonicalUserMessage`，随 UserMessage append；
+- Steer 中的 Skill invocation：使用同一个 `compose_message()` 规则，随 Steer append；
+- 模型通过Tool调用Skill：结果随role=tool message持久化，并在`tool_round_completed`后进入conversation；
 - compaction directive：使用 typed `ModelCallPurpose` 和 `OutputContract`，不伪装成普通 conversation text。
 
-`CommittedConversationView` 只能从已验证 CommittedConversationState 借用；State 由 SessionStorage replay 构造，或成功应用 commit receipt 中的 trusted delta 后前进，不能从 draft、stream buffer 或任意 message vector 构造。
+`CommittedConversationView`只能从已验证CommittedConversationState借用；State由SessionStorage replay构造，或成功应用append receipt中的trusted delta后前进，不能从draft、stream buffer或任意message vector构造。ledger checkpoint可因`AdvanceOnly`entry推进；只有model-visible messages/`TranscriptFingerprint`改变才形成新的逻辑模型调用。
 
 ## 逻辑模型调用
 
@@ -456,8 +453,8 @@ Session execution 使用 `PromptAssemblyInput` 调用 Context，并保留返回�
 
 以下变化必须开始新的逻辑模型调用：
 
-- committed conversation checkpoint 改变；
-- ToolRound、Steer 或 Compaction 成功 commit；
+- model-visible `TranscriptFingerprint`改变；
+- `tool_round_completed`、Steer或Compaction成功append/apply并改变conversation；
 - ModelCallPurpose 改变；
 - OutputContract 改变；
 - PromptSet、ToolSet、SkillCatalog、Workspace 或 Model 改变。
@@ -482,7 +479,7 @@ AgentLoop 不得：
 - 直接调用 PromptService、ToolService 或 SkillService；
 - 读取 current Workspace 或 Session config；
 - 自行拼接 system prompt、messages 或 ToolSpec；
-- 在 ToolRound commit 前把 ToolResult 当作已发生事实；
+- 在 `tool_round_completed` 前把 ToolResult 加入模型 conversation；
 - 处理 Tool approval、grant、Sandbox 或 filesystem authorization；
 - 发布 Turn terminal fact。
 
@@ -491,7 +488,7 @@ AgentLoop 不得：
 推荐逻辑循环：
 
 ```text
-start batch committed
+initiating UserMessage appended
 → private AgentLoop adapter 从 committed ConversationSeed 开始
 
 loop:
@@ -504,39 +501,37 @@ loop:
   → 把 ModelOutput 交回 AgentLoop adapter
 
   NeedTools
-  → 为每个 ToolCall 分配 ItemId
-  → durable ToolInvocationStarted records
+  → append one assistant/intermediate message
+     └─ ordered reasoning/text/tool_call content；每个ToolCall带ItemId
+  → apply assistant entry delta（Started ToolInvocation，conversation AdvanceOnly）
   → control / revocation barrier
   → pinned ToolSet.execute(ToolExecutionRequest[])
      └─ approval 通过 durable Interaction request/resolution
-     └─ ToolTurnPort commit ToolExecutionStarted before side effect
-     └─ ToolTurnPort commit ToolOutcomeKnown before Completed outcome
+     └─ ToolTurnPort append ToolExecutionStarted before side effect
   → ToolExecutionOutcome[]
-     ├─ 全部 Completed：构造完整 ToolRound candidate
-     │  → atomic commit conversation promotion
-     │     + ToolInvocationClosed(Completed) records
-     └─ 任一 Abandoned：不构造 ToolRound，进入 terminal arbitration
-  → apply all committed projection deltas
-  → 把 model-visible committed conversation change 交回 AgentLoop adapter
+     ├─ 每个Completed：append matching role=tool message → apply
+     ├─ 全部Completed：append tool_round_completed → apply conversation delta
+     └─ 任一 Abandoned：append ToolAbandoned → apply并进入terminal arbitration
+  → 把model-visible committed conversation change交回AgentLoop adapter
   → continue
 
   Finished
   → 与 queued Steer / Cancel 仲裁
   → SessionExecutionState = Finishing
-  → commit TurnTerminal(Completed { final AgentMessage })
-  → apply terminal delta / release Context
+  → append assistant/final message → apply terminal delta
+  → release Context
   → SessionExecutionState = Idle
 ```
 
-ToolTurnPort 内每次 operational commit 也必须先通过 storage-owned apply_committed 应用全部 projection deltas，再返回 approval/outcome 或允许 side effect。下一次模型调用只能发生在前一 stable unit 成功 commit 并 apply delta 后。
+ToolTurnPort内每次operational append也必须先通过storage-owned apply_committed应用全部projection deltas，再返回approval或允许side effect。下一次模型调用只能发生在`tool_round_completed`成功append并apply后。
 
 以下内容不能进入下一次逻辑模型调用：
 
 - streaming assistant draft；
 - Started 或 Abandoned ToolInvocation；
-- 未随 complete ToolRound commit 的 ToolResult；
+- 尚无`tool_round_completed`引用的Tool message；
 - pending Interaction；
-- accepted 但未 commit 的 Steer；
+- accepted 但未 append 的 Steer；
 - compaction draft；
 - provider retry 的 partial output。
 
@@ -552,9 +547,9 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-InteractionRequested 必须 commit 后才发布 approval request；InteractionResolved 必须 commit 后才进入 ExecutingTools。Deny 产生 truthful denied ToolResult，并在完整 ToolRound commit 后继续模型调用。
+InteractionRequested必须append后才发布approval request；InteractionResolved必须append后才进入ExecutingTools。Deny产生truthful denied Tool message，并在`tool_round_completed`后继续模型调用。
 
-WaitingApproval 不是 Interrupted。默认情况下此时到达的 Steer 先排队，不自动当作 approval resolution。若未来允许 Steer preempt approval，必须先 commit `InteractionResolution::Cancelled(SteerPreempted)`、形成 truthful cancelled ToolResult、commit 完整 ToolRound，再 commit Steer；同一 Turn 继续 Running。
+WaitingApproval不是Interrupted。默认情况下此时到达的Steer先排队，不自动当作approval resolution。若未来允许Steer preempt approval，必须先append `InteractionResolution::Cancelled(SteerPreempted)`、append truthful cancelled Tool message、append `tool_round_completed`，再append Steer UserMessage；同一Turn继续Running。
 
 只有显式 cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn进入 terminal status。
 
@@ -569,7 +564,7 @@ control(Steer)
 → 绑定 expected TurnId
 → 进入 active Turn control mailbox
 → 在 stable barrier 使用同一个 TurnExecutionContext 规范化
-→ commit Steer fact
+→ append Steer fact
 → apply delta
 → 下一次逻辑模型调用看见 Steer
 ```
@@ -578,13 +573,13 @@ Steer 可以在模型或 Tool 执行期间被接收，但不会直接修改 in-f
 
 基础策略：
 
-- sampling 期间可以 best-effort cancel 当前 draft；未 commit draft 直接丢弃；
+- sampling 期间可以 best-effort cancel 当前 draft；未 append draft 直接丢弃；
 - AgentLoop 返回 NeedTools 后、任何 Tool side effect 前必须再次执行 control/revocation barrier；
-- Tool 已经可能产生副作用且 exact outcome 可得时，默认等待该批调用形成完整 terminal ToolResult 后再 commit ToolRound；executor/side-effect outcome unknown 时 ToolInvocation 进入 Abandoned并 terminalize Turn；
+- Tool 已经可能产生副作用且 exact outcome 可得时，默认等待该轮调用形成完整 Tool messages 后再 append `tool_round_completed`；executor/side-effect outcome unknown 时 ToolInvocation 进入 Abandoned 并 terminalize Turn；
 - approval wait、sleep 或其他明确可中断 Tool 可以形成 cancelled ToolResult，再完成 ToolRound；
-- final AgentMessage commit 与 Steer 由 Session execution 单一 owner 线性化；
-- Steer 先获胜则旧 final draft 不作为 terminal commit；
-- final terminal commit 先获胜则 Steer 不再属于该 Turn。
+- final AssistantMessage append 与 Steer 由 Session execution 单一 owner 线性化；
+- Steer 先获胜则旧 final draft 不作为 terminal entry；
+- final terminal entry 先获胜则 Steer 不再属于该 Turn。
 
 Steer 不重新捕获 WorkspaceSnapshot、SkillCatalog、ToolSet、PromptSet 或 Model。
 
@@ -597,7 +592,7 @@ FollowUp 不属于 `TurnControl`，因为它不控制当前 Turn。
 ```text
 active Turn 期间提交 FollowUp
 → Session execution/scheduler 排队
-→ 当前 Turn terminal commit
+→ 当前 Turn terminal entry append
 → 取下一条 FollowUp
 → 作为普通 UserMessage admission
 → 捕获新的 TurnExecutionContext
@@ -637,7 +632,7 @@ logical model-call retry
 
 partial stream 是 draft。retry 前关闭该 draft lifecycle，但不写入 conversation。
 
-ToolRound 已成功 commit 后的下一次模型调用可以 retry，因为 Tool 不会重放。Tool executor outcome unknown 时不能自动重放 Tool；SessionWrite OutcomeUnknown 则必须按 operation key 解析原 durable write，不能混为 executor outcome unknown。
+`tool_round_completed` 已成功 append/apply 后的下一次模型调用可以 retry，因为 Tool 不会重放。Tool executor outcome unknown 时不能自动重放 Tool；SessionWrite OutcomeUnknown 则必须按 operation key 解析原 durable append，不能混为 executor outcome unknown。
 
 ## Compaction
 
@@ -645,14 +640,14 @@ Compaction 改变 committed conversation，但不改变 TurnExecutionContext。
 
 ```text
 PromptSet::assemble 或 provider 返回 context overflow
-→ 丢弃当前未 commit draft
+→ 丢弃当前未 append draft
 → Compaction 选择 cut/protection/directive
 → Context.assemble_model_context(
      purpose = CompactionSummary,
      output_contract = NoToolCalls
    )
 → summary model call
-→ commit Compaction result
+→ append Compaction entry
 → rebuild committed conversation projection
 → 必要时重建 AgentLoop segment
 → 新的逻辑模型调用
@@ -682,7 +677,7 @@ Cancellation：
 - best-effort cancel in-flight provider/tool operation；
 - 不撤销已经 committed conversation fact；
 - 不伪装回滚已经完成的外部副作用；
-- 通过一个 terminal commit 结束 Turn。
+- 通过一个 terminal entry 结束 Turn。
 
 ### Security Revocation
 
@@ -700,7 +695,7 @@ revocation 后：
 - 不开始新的模型调用；
 - 不执行新的 Tool；
 - 不加载新的 Skill 正文；
-- 基于已撤销上下文产生但尚未 commit 的模型结果或 ToolRound 不进入 conversation；
+- 基于已撤销上下文产生但尚未append的模型结果直接丢弃；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`，随后按terminal cleanup中断Turn；
 - provider 已看到的内容无法撤回，只能 best-effort cancel；
 - 已经发生的 Tool 外部副作用进入 audit/repair，不声称被回滚。
 
@@ -715,11 +710,11 @@ Context capture 的原子性指领域发布原子性，不要求回滚内部 cac
 - 只有全部成功并完成最终 lease/fingerprint 校验后才发布完整 Context；
 - 失败时 drop 局部值，不更新 Session current state；
 - Context capture 本身不创建 Item、Interaction、grant 或 durable Turn；
-- start commit 前不产生模型或 Tool 副作用。
+- initiating UserMessage append 前不产生模型或 Tool 副作用。
 
-Tool 外部副作用与 model-visible ToolRound commit 无法形成通用分布式事务。执行任何 Tool side effect 前，SessionStorage 必须保存非模型可见的 ToolInvocation Started / execution-start operational truth；approval request 和 resolution 也必须先 durable commit。它们不进入 Prompt conversation，也不允许下一次逻辑模型调用看见半个 ToolRound。
+Tool外部副作用与model-visible ToolRound completion无法形成通用分布式事务。assistant tool_call content先保存Started ToolInvocation；执行任何Tool side effect前，SessionStorage必须append非模型可见的`tool_execution_started`event；approval request和resolution也必须先durable append。它们不进入Prompt conversation，也不允许下一次逻辑模型调用看见半个ToolRound。
 
-若 exact ToolResult 已知但 complete ToolRound durable write 返回 NotCommitted，可以只重试同一个 promotion batch；返回 SessionWrite OutcomeUnknown 时必须按 operation key reopen/replay，已 committed 则 apply 原 receipt，已证明未 committed 则重试该 durable batch。两种情况都不能重放非幂等 Tool。只有 executor/side-effect outcome unknown 时，同一个 ToolInvocation Item 才进入 Abandoned且不生成 synthetic ToolResult。这些 facts 通过已定义的 SessionWriteBatch/StoredRecord 写入；完整 schema 见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)，不增加 ToolRound 或 ModelStep entity。
+若exact ToolResult已知但role=tool message append返回NotCommitted，可以只重试同一entry；返回SessionWrite OutcomeUnknown时必须按operation key reopen/replay，已append则apply原receipt，已证明未append则重试同一draft。Tool message都已append后，`tool_round_completed`使用独立operation keyappend；其OutcomeUnknown同样只解析该entry，不能重放Tool。只有executor/side-effect outcome unknown时，同一个ToolInvocation Item才进入Abandoned且不生成synthetic ToolResult。完整schema见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
 ## Fingerprint
 
@@ -775,15 +770,15 @@ PromptFingerprint
 capture schema/algorithm version
 ```
 
-`TurnId` 和 `SessionId` 由 start batch 的 execution context metadata 绑定，不建议仅为实例区分而加入内容 fingerprint。这样 fingerprint 仍可用于判断两个 execution context 的有效内容是否等价。
+`TurnId`和`SessionId`由TurnContext entry及其initiating UserMessage reference绑定，不建议仅为实例区分而加入内容fingerprint。
 
-逻辑模型调用无需额外 fingerprint 类型；`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + AssembledModelContextFingerprint` 已足够判断 provider retry 是否仍是同一次调用。
+逻辑模型调用无需额外fingerprint类型。provider retry必须先证明`ConversationCheckpoint`不变；在此前提下，`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + AssembledModelContextFingerprint`足够判断是否仍是同一次调用。仅TranscriptFingerprint相同不足以忽略AdvanceOnly ledger变化。
 
 Fingerprint 用于一致性、审计、cache 和 recovery 比对，不代替 secret redaction，也不是完整恢复数据。
 
 ## Execution Context Metadata
 
-如果需要精确审计或未来 cold recovery，start batch 应关联以下信息。这些 metadata 进入 TurnStarted record；哪些内容内嵌、哪些使用 exact content reference 仍由对应定义子系统闭合：
+如果需要精确审计或未来cold recovery，TurnContext entry应保存或引用以下信息；哪些内容内嵌、哪些使用exact content reference仍由对应定义子系统闭合：
 
 ```text
 capture schema/version
@@ -824,14 +819,14 @@ SessionStorage reload
 → 不恢复旧 provider stream、AgentLoop state、approval waiter 或 Tool task
 → 不生成 synthetic ToolResult
 → 不自动重放 Tool
-→ one idempotent batch：
-     close Pending Interaction
-     Started ToolInvocation with exact durable result → Completed(existing result, no implicit round promotion)
-     remaining Started ToolInvocation → Abandoned
-     commit TurnTerminal(Interrupted { HostRestart / RecoveryContextUnavailable })
+→ append idempotent recovery entries：
+     resolve Pending Interaction
+     preserve ToolInvocation with existing role=tool message as Completed
+     remaining Started ToolInvocation → ToolAbandoned
+     append TurnInterrupted(HostRestart / RecoveryContextUnavailable)
 ```
 
-已 committed 的 UserMessage、完整 ToolRound、Steer、Compaction 和 AgentMessage 保留。
+已 committed 的 UserMessage、`tool_round_completed` round、Steer、Compaction 和 AssistantMessage 保留。
 
 只有同时满足以下条件，未来才允许 exact same-Turn resume：
 
@@ -845,7 +840,7 @@ SessionStorage reload
 
 任一条件不满足时不能使用 Agent current revision、current SessionDefinition 或其他 current replacement 冒充旧 Context。
 
-当前 Tool 子系统尚未定义稳定 executor implementation identity，因此现阶段不能承诺透明 cold resume。Pending Interaction 必须在 TurnTerminal(Interrupted/Failed) 时以 cancelled、expired 或 recovery reason 持久关闭；Started ToolInvocation 必须 Completed(existing exact durable result) 或 Abandoned，不能只删除内存 waiter/task。
+当前Tool子系统尚未定义稳定executor implementation identity，因此现阶段不能承诺透明cold resume。Pending Interaction必须在TurnInterrupted/Failed前以cancelled、expired或recovery reason持久关闭；Started ToolInvocation必须已有truthful role=tool message或ToolAbandoned，不能只删除内存waiter/task。
 
 ## Diagnostics 与释放
 
@@ -870,11 +865,9 @@ terminal path
 → 停止创建新的逻辑模型调用
 → cancel / close provider Turn session
 → 等待、取消或确认受控 Tool task outcome
-→ 构造同一个 terminal batch：
-     close Pending Interaction
-     Completed 或 Abandoned 所有 Started ToolInvocation
-     TurnTerminal(Completed / Interrupted / Failed)
-→ commit + apply terminal delta
+→ append required InteractionResolved / ToolAbandoned entries
+→ append assistant/final 或 TurnInterrupted / TurnFailed
+→ apply each committed delta
 → drop private AgentLoop state
 → drop assembled context / draft
 → drop Arc<TurnExecutionContext>
@@ -898,7 +891,7 @@ future Session execution 至少负责：
 - model → Tool → model 循环；
 - ToolInvocation Item lifecycle；
 - durable Interaction request/resolution、Steer、FollowUp 和 Cancel；
-- retry、compaction、commit gate 和 terminal arbitration。
+- retry、compaction、append/apply gate 和 terminal arbitration。
 
 Turn control 至少包含三类语义：
 
@@ -980,7 +973,7 @@ AgentLoop registry
 
 ### AgentLoop 直接执行 Tool 和写 storage
 
-否决原因：ToolRound commit gate、approval、Sandbox、Session durable truth 和 Agent SDK 状态会混成一个不可测试循环。
+否决原因：ToolRound conversation gate、approval、Sandbox、Session durable truth 和 Agent SDK 状态会混成一个不可测试循环。
 
 ### 任意 CurrentCall PromptContribution
 
@@ -994,25 +987,25 @@ AgentLoop registry
 
 - Turn execution 包含并驱动 AgentLoop，但 AgentLoop 不拥有领域事实和副作用；
 - candidate admission 不是领域 Turn；
-- initiating UserMessage commit 是领域 Turn 开始线性化点；
-- terminal batch commit 是领域 Turn 结束线性化点；
+- initiating UserMessage append 是领域 Turn 开始线性化点；
+- final assistant、TurnInterrupted或TurnFailed entry是领域Turn结束线性化点；
 - TurnExecutionContext 不是领域 entity、Service 或通用 Resource owner；
 - 同一 Turn pin exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、SkillCatalog、ToolSet、PromptSet 和 Model；
 - active Turn 不读取这些 Service 的 future current value；
 - PromptSet 创建时绑定同一个 ToolSet 的 ToolPromptView；
 - assembly 不接受任意 ToolPromptView；
 - 所有模型可见动态事实来自 committed conversation；
-- 下一次逻辑模型调用只从成功 commit 的 conversation 构建；
+- 下一次逻辑模型调用只从成功 append 并通过 conversation gate 的 facts 构建；
 - Skill lazy load 使用 pinned SkillCatalogEntryRef；
-- compose_message 和 start commit 前重新校验 authorization lease；
+- compose_message 和 initiating UserMessage append 前重新校验 authorization lease；
 - ToolSpec 和 executor route 来自同一个 ToolSet；
-- Tool side effect 前保存非模型可见 ToolInvocation operational truth；
-- Interaction request commit-before-notify，resolution commit-before-resume；
+- Tool side effect前append非模型可见tool_execution_started operational truth；
+- Interaction request append-before-notify，resolution append-before-resume；
 - Started/Abandoned ToolInvocation 和 incomplete ToolRound 不进入模型 conversation；
 - provider retry 复用同一个 immutable assembled context；
-- ToolRound commit 后才开始下一次逻辑模型调用；
+- tool_round_completed append/apply后才开始下一次逻辑模型调用；
 - WaitingApproval 时 Turn 仍是 Running；
-- Steer commit 后才影响下一次逻辑模型调用，不把 Turn 变为 Interrupted；
+- Steer append 后才影响下一次逻辑模型调用，不把 Turn 变为 Interrupted；
 - FollowUp 创建新 Turn 和新 Context；
 - ordinary reload 只影响 future Turn；
 - security revocation 中断 active Turn，不替换其 Context；
@@ -1028,35 +1021,35 @@ AgentLoop registry
 - capture 期间 ordinary Prompt/Tool/Skill reload；
 - capture 最终 lease check 前发生 Workspace revocation；
 - capture failure 不创建领域 Turn；
-- start commit 前不调用模型或 Tool；
-- start commit outcome unknown 的幂等恢复；
+- initiating UserMessage append 前不调用模型或 Tool；
+- initiating UserMessage append OutcomeUnknown 的幂等恢复；
 - PromptSet assembly 无法接收另一个 ToolPromptView；
-- compose_message 和 start commit 前发生 revocation 时丢弃未 commit contribution；
+- compose_message 和 initiating UserMessage append 前发生 revocation 时丢弃未 append contribution；
 - Skill lazy load 拒绝 current Catalog lookup 和 content hash 漂移；
 - User Skill injection 进入 committed CanonicalUserMessage；
 - 逻辑模型调用只接受 CommittedConversationView；
 - provider retry 保持 AssembledModelContextFingerprint 不变；
 - NeedTools 后、任何 side effect 前执行 control/revocation barrier；
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
-- InteractionRequested commit-before-notify；
-- InteractionResolved commit-before-wake/side-effect；
-- 全部 ToolExecutionOutcome Completed 时，ToolRound promotion 与 Item Completed 同 batch；
+- InteractionRequested append-before-notify；
+- InteractionResolved append-before-wake/side-effect；
+- 每个ToolExecutionOutcome Completed时append role=tool message；全部matching messages存在后append tool_round_completed；
 - 任一 ToolExecutionOutcome Abandoned 时不构造 ToolRound并进入 terminal arbitration；
-- 完整 ToolRound commit 前不开始下一次逻辑模型调用；
-- ToolRound commit 后 AgentLoop adapter 只消费 committed delta；
+- tool_round_completed前不开始下一次逻辑模型调用；
+- tool_round_completed后AgentLoop adapter只消费committed delta；
 - WaitingApproval 保持 TurnStatus Running / InteractionState Pending / ToolInvocation Started；
-- Steer 在 sampling 或 WaitingApproval 期间入队并在 stable barrier commit；
-- Steer 与 final terminal commit race；
+- Steer 在 sampling 或 WaitingApproval 期间入队并在 stable barrier append；
+- Steer 与 final terminal append race；
 - FollowUp 在前一 Turn terminal 后创建新 Context；
-- compaction commit 后 conversation checkpoint 和 AssembledModelContextFingerprint 改变；
+- compaction entry append/apply 后 conversation checkpoint 和 AssembledModelContextFingerprint 改变；
 - ordinary reload 不影响 active Context；
 - security revocation 阻止新的 model/tool/skill 操作；
-- revoked result 未 commit 时被丢弃；
+- revoked result 未 append 时被丢弃；
 - Tool side effect 已发起但 executor outcome unknown 时不自动重放，并把 ToolInvocation Abandoned；
-- exact ToolResult 已知但 SessionWrite OutcomeUnknown 时先按 operation key reopen/replay：已 committed 则保留 Completed candidate，已证明未 committed 则只重试 durable result write；未解析前不把它误判为 Abandoned；
+- exact ToolResult 已知但 SessionWrite OutcomeUnknown 时先按 operation key reopen/replay：已 append 则 apply 原 receipt，已证明未 append 则只重试同一 tool message draft；未解析前不把它误判为 Abandoned；
 - client disconnect 后 Interaction 保持 Pending，reconnect 使用相同 RequestId；
 - duplicate/conflicting Interaction resolution；
-- process restart 后 exact durable ToolResult 可以关闭 Item但不补做缺失 ToolRound promotion；
+- process restart后existing tool message保持Item Completed，但不补做缺失ToolRound completion；
 - process restart 后 incomplete Turn 只 terminalize 一次；
 - Turn terminal/restart 时 Pending Interaction 被持久关闭且不重复 resolution；
 - Turn terminal/restart 时 Started ToolInvocation 被 truthful Completed 或 Abandoned；
@@ -1085,12 +1078,12 @@ AgentLoop registry
 - [x] 固定 Skill lazy load 的 pinned identity。
 - [x] 定义逻辑模型调用与 provider retry 边界，不增加 ModelStep struct/entity/ID。
 - [x] 删除 arbitrary per-call ToolPromptView 和 dynamic contribution lane 的目标方向。
-- [x] 固定 candidate admission、start commit 和 terminal commit 边界。
+- [x] 固定 candidate admission、initiating UserMessage append 和 terminal entry 边界。
 - [x] 区分 Steer 与 FollowUp。
 - [x] 固定 ordinary reload 与 security revocation 语义。
 - [x] 定义 fingerprint、manifest 和保守 crash recovery baseline。
 - [x] 完成 Agent/Session lifecycle、exact revision pinning 和 transient state 分层。
 - [x] 完成 operation-centric ToolInvocation Item、durable Interaction 和 terminal cleanup 语义。
-- [x] 完成 SessionWriter、atomic batch、CommittedConversationDelta 和 recovery contract。
+- [x] 完成SessionWriter by-entry append、Message/Event layout、CommittedConversationDelta和recovery contract。
 - [ ] 完成 Session execution owner 和并发状态机。
 - [ ] 完成 ModelGateway 与 AgentLoop adapter。

@@ -157,21 +157,20 @@ pub(crate) struct TurnExecutionContext {
 
 字段保持私有；模型调用和 Tool 执行通过窄操作完成，避免不同 Turn 的子快照被交叉组合。
 
-### Transcript-First 与 commit gate
+### Transcript-First 与 append/apply conversation gate
 
-所有模型可见 conversation fact 必须先形成规范化领域值并成功 commit：
+所有模型可见conversation fact必须先形成规范化entry、成功append并apply trusted delta：
 
 ```text
-UserMessage
-完整 ToolRound
-Steer control input
-Compaction result
-final AgentMessage
+UserMessage(source = Input | Steer)
+ToolRoundCompleted引用的完整assistant/tool sequence
+Compaction entry的Replace projection
+AssistantMessage(phase = Final)
 ```
 
-未 commit 的 draft、局部 ToolCall、孤立 ToolResult 或临时内存状态不能进入下一次模型调用。
+未append的draft不能进入下一次模型调用；已durable但尚无`tool_round_completed`的assistant/tool entries同样不能model-visible。
 
-Session storage 是 durable truth。热内存 conversation projection 只消费成功 commit 返回的 delta，不在稳态重新扫描完整存储，也不与存储共同拥有同一事实。
+SessionStorage是durable truth。热内存conversation projection只消费`CommittedSessionEntry`返回的trusted delta，不在稳态重新扫描完整存储，也不与存储共同拥有同一事实。
 
 ### 先内部不变量，后公开协议
 
@@ -333,7 +332,7 @@ SkillCatalog.prompt_view()
 
 已明确：
 
-- Turn 从 committed initiating UserMessage 开始，到 terminal batch 结束；
+- Turn 从 committed initiating UserMessage entry 开始，到 final AssistantMessage、TurnInterrupted 或 TurnFailed entry 结束；
 - Steer 只作用于 expected Running Turn，FollowUp 开启下一 Turn；
 - `ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；
 - ItemType/ItemStatus 从 ItemContent 派生，不独立保存；
@@ -349,7 +348,7 @@ SkillCatalog.prompt_view()
 
 完成门槛：
 
-- [x] Item 与 transcript/storage record 的关系可以被精确定义；
+- [x] Item 与 transcript/storage entry 的关系可以被精确定义；
 - [x] 每个 Interaction 可追溯到 Item、Turn 和 Session；
 - [x] ToolCall、ToolResult 和 approval 使用同一个 ToolInvocation Item identity；
 - [x] terminal Turn 不保留 Pending Interaction 或 Started Item；
@@ -364,16 +363,18 @@ SkillCatalog.prompt_view()
 
 已明确：
 
-- per-session append-only JSONL batch log；
-- `SessionWriter::commit(SessionWriteBatch)` 是唯一 runtime write seam；
+- per-session append-only by-entry JSONL tree；
+- `SessionWriter::append(SessionEntryDraft)` 是唯一 runtime write seam；
 - SessionHeader 只由 create/fork staging 原子写入；
-- 一个物理 line 编码一个完整 StoredSessionBatch；
+- Header 后一个物理 line 编码一个 StoredSessionEntry；
+- `StoredEntryBody = TurnContext | Message | Event | Compaction`；
+- standard message roles `user | assistant | tool`，assistant finalized response 按原始 content 顺序保存；
 - operational facts 与 conversation promotion facts 位于同一个 durable log；
-- TurnStart、Interaction、Tool barrier/outcome、complete ToolRound、Steer、Compaction 和 terminal commit units；
-- ItemId、ToolCallId、EntryId、LeafId 和 BatchId 分离；
+- initiating input、Interaction、Tool side-effect barrier、tool messages、`tool_round_completed`、Steer、Compaction 和 terminal entries；
+- ItemId、ToolCallId 和 EntryId 分离；
 - `CommittedConversationState / View / Delta / Checkpoint`；
 - trusted all-projection apply、AdvanceOnly 和 mismatch reload；
-- parent_leaf branch tree、current leaf 和 stable checkpoint；
+- `EntryId + parent_id` history tree、current entry 和 stable checkpoint；
 - fork staging deep copy + target-local identity remap；
 - append-only compaction overlay；
 - partial tail、strict corruption、explicit repair 和 conservative recovery；
@@ -383,9 +384,9 @@ SkillCatalog.prompt_view()
 
 - [x] durable truth 只有 SessionStorage；
 - [x] 任意模型调用只能从 committed transcript 构建 conversation；
-- [x] 热内存 projection 可由 storage replay 和 commit delta 重建；
+- [x] 热内存 projection 可由 storage replay 和 committed entry delta 重建；
 - [x] 不存在 current/previous input 等长期特殊消息 lane；
-- [x] crash 后不会把半个 ToolRound 提升为模型 transcript；UI 只看见 truthful Started/Outcome/Abandoned operational state，不把它伪装为 Completed round；
+- [x] crash 后不会把半个 ToolRound 提升为模型 transcript；已 append 的 assistant/tool entries 保持 durable，但在 `tool_round_completed` 前不 model-visible；
 - [x] 不引入 dual log、Branch entity、baseline SQLite 或 content-addressed DAG。
 
 ### 阶段 6：Session 执行子系统
@@ -396,6 +397,8 @@ SkillCatalog.prompt_view()
 docs/refactor/session-execution.md
 ```
 
+当前研究与handoff：[Session Execution 研究进度](session-execution-progress.md)。
+
 必须定义：
 
 - Turn admission 和 UserMessage 创建；
@@ -405,8 +408,8 @@ docs/refactor/session-execution.md
 - Steer 作为 current Turn control input、FollowUp 作为下一 Turn submission；
 - retry、overflow recovery、cancellation 和 timeout；
 - pending Interaction 的等待与恢复；
-- ToolTurnPort 如何通过唯一 SessionWriter 实现 approval、execution-start 和 outcome barriers；
-- SessionWriteBatch construction、apply_committed、事件和状态变更的顺序；
+- ToolTurnPort 如何通过唯一 SessionWriter 实现 approval 和 execution-start barriers；
+- SessionEntryDraft construction、sequential append、apply_committed、conversation gate、事件和状态变更的顺序；
 - Session actor、run task 或其他 execution owner 是否必要。
 
 只有在状态机和所有权明确后，才决定最终使用 manager、actor、task 或 registry 的具体形状。
@@ -416,7 +419,7 @@ docs/refactor/session-execution.md
 - 每个 mutation 只有一个执行 owner；
 - 同一 Turn 复用同一个 TurnExecutionContext、PromptSet、ToolSet 和 pinned SkillCatalog；
 - Session execution 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
-- commit、all-projection apply、模型可见性、side effect 和 UI 可见性顺序无歧义；
+- append、all-projection apply、模型可见性、side effect 和 UI 可见性顺序无歧义；
 - abort/retry/recovery 不产生重复 terminal fact；
 - session execution 可以通过公开 interface 进行集成测试。
 
@@ -459,7 +462,7 @@ docs/refactor/compaction.md
 - context window pressure 和触发条件；
 - transcript cut、protection 和 stable ToolRound 边界；
 - summary model call purpose 和 `OutputContract::NoToolCalls`；
-- summary commit unit；
+- Compaction entry append/apply与conversation Replace projection；
 - compaction 后 conversation seed；
 - compaction 失败、retry 和 recovery；
 - Skill、Workspace instructions 和动态 contribution 的保留策略。
@@ -467,7 +470,7 @@ docs/refactor/compaction.md
 完成门槛：
 
 - compaction 不直接改写未提交 conversation；
-- summary 成功 commit 前不替换模型可见历史；
+- Compaction entry成功append/apply前不替换模型可见历史；
 - cut 不拆散 ToolCall/ToolResult 或其他协议稳定单元；
 - compacted conversation 可从 storage 重建。
 
@@ -617,7 +620,7 @@ Git 已经保存历史版本，因此不要仅为了“以后可能查看”而�
 
 - 改变顶层 ownership；
 - 删除或替代一个长期模块；
-- 改变 durable truth 或 commit gate；
+- 改变 durable truth 或 append/apply conversation gate；
 - 改变公开 protocol contract；
 - 引入新的跨子系统 lifecycle；
 - 推翻已有 Accepted ADR。
@@ -641,7 +644,7 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 
 - value type、排序、fingerprint：单元测试；
 - Service interface、cache、reload、conflict：模块测试；
-- TurnExecutionContext、ToolRound、commit gate：集成测试；
+- TurnExecutionContext、ToolRound、append/apply conversation gate：集成测试；
 - storage reload、fork、crash recovery：持久化测试；
 - provider mapping：adapter contract test；
 - Runtime command/event/snapshot：端到端 protocol test。
@@ -649,8 +652,8 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 关键不变量必须拥有测试：
 
 ```text
-commit-before-model-visible
-完整 ToolRound 才可见
+append/apply-before-model-visible
+只有ToolRoundCompleted引用的完整round才可见
 Prompt 是唯一上下文组装 seam
 ToolSpec 与 executor route 同快照
 active Turn 不受 future reload 影响
@@ -667,13 +670,13 @@ Runtime facade 是唯一外部入口
 - [ ] 目标 interface 已实现；
 - [ ] 生产调用方不再依赖旧 ResourceManager、旧 Prompt、旧 Tools 或旧 SessionRuntime ownership；
 - [ ] 所有模型调用只接收 `AssembledModelContext`；
-- [ ] 所有模型可见 conversation fact 遵守 commit gate；
+- [ ] 所有模型可见 conversation fact 遵守 append/apply conversation gate；
 - [x] Agent/Session revision 与 durable/runtime lifecycle 语义已确定；
 - [x] TurnExecutionContext 可以稳定绑定 AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 Model；
 - [x] Session load/reload/unload 与 fork lifecycle 有确定行为；
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
-- [x] Conversation/SessionStorage durable ownership、batch、branch、fork 和 recovery 已确定；
+- [x] Conversation/SessionStorage durable ownership、entry tree、fork 和 recovery 已确定；
 - [ ] compaction orchestration 的完整行为有确定定义；
 - [ ] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
@@ -691,4 +694,4 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 docs/refactor/session-execution.md
 ```
 
-Conversation/SessionStorage 已确定为“one SessionWriter + one JSONL batch tree + rebuildable projections”。下一阶段需要定义 Session execution owner、batch construction、AgentLoop drive、FollowUp queue、commit gate 和 terminal arbitration；公开 protocol 仍留到 execution 与 ModelGateway 稳定后冻结。
+Conversation/SessionStorage 已确定为“one SessionWriter + one by-entry JSONL tree + rebuildable projections”。下一阶段需要定义 Session execution owner、entry construction、AgentLoop drive、FollowUp queue、append/apply conversation gate 和 terminal arbitration；公开 protocol 仍留到 execution 与 ModelGateway 稳定后冻结。
