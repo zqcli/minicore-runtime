@@ -1,5 +1,7 @@
 # Driver
 
+> 状态：pre-refactor implementation contract。当前ownership以[Session Execution](../refactor/session-execution.md)、[Turn执行上下文](../refactor/turn-execution-context.md)和[ModelGateway](../refactor/model-gateway.md)为权威：SessionExecutor组装ModelCallRequest并启动RunningOperation；private AgentLoop/Driver不拥有Prompt assembly或provider调用。
+
 `Driver` 是 `SessionRuntime` 内部的 Rig sans-IO 适配器。它只负责把 Rig `AgentRunStep` 转换成产品运行时可执行的 I/O 请求，并把 I/O 结果喂回 Rig。一次公开的 MiniCore run 通常推进一个 Rig `AgentRun`；active Steer 需要 continuation 时，可以在同一 `RunId` 下顺序推进多个 Rig `AgentRun` segment。
 
 一句话边界：

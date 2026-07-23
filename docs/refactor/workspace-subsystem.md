@@ -451,7 +451,7 @@ watch
 invalidate
 ```
 
-reload 只是 Session execution owner 用当前 Workspace definition 再次调用 `resolve()`。
+reload 只是 SessionExecutor 用当前 Workspace definition 再次调用 `resolve()`。
 
 ### 内部 Seams
 
@@ -671,13 +671,17 @@ ToolService 通过该 context 获得：
 ```rust
 pub struct WorkspaceAuthorizationLease;
 pub struct WorkspaceAuthorizationControl;
+pub(crate) struct WorkspaceCommitAuthorization;
 
 impl WorkspaceAuthorizationLease {
     pub fn check(&self) -> Result<(), WorkspaceAuthorizationRevoked>;
+    pub(crate) async fn authorize_commit(
+        &self,
+    ) -> Result<WorkspaceCommitAuthorization, WorkspaceAuthorizationRevoked>;
 }
 
 impl WorkspaceAuthorizationControl {
-    pub fn revoke(&self, reason: WorkspaceRevocationReason);
+    pub async fn revoke(&self, reason: WorkspaceRevocationReason);
 }
 ```
 
@@ -690,7 +694,9 @@ pub struct ResolvedWorkspace {
 }
 ```
 
-`WorkspaceAuthorizationControl` 只交给 Session execution owner，不进入 Prompt、Tool、Skill 或领域 Session。Session execution owner 为每个 active Turn 跟踪其 control/cancellation 关联；ordinary Snapshot replacement 不撤销旧 control，security-restricting update 则先调用 `revoke()`，再中断所有使用该 lease 的 active Turn。这样不需要 Runtime-global Workspace registry，也能明确找到受影响执行。
+`WorkspaceAuthorizationControl` 只交给 SessionExecutor，不进入 Prompt、Tool、Skill 或领域 Session。SessionExecutor 为每个 active Turn 跟踪其 control/cancellation 关联；ordinary Snapshot replacement 不撤销旧 control，security-restricting update 则先调用 `revoke()`，再中断所有使用该 lease 的 active Turn。这样不需要 Runtime-global Workspace registry，也能明确找到受影响执行。
+
+`check()`用于普通preflight。workspace-dependent conversation append使用短暂`WorkspaceCommitAuthorization`：`authorize_commit()`与`revoke()`通过同一async同步原语排序。如果revoke先取得写入权，后续authorization失败；如果authorization先取得读取权，revoke等待该次短append/apply sequence完成。authorization不能跨Model/Tool I/O或完整Turn。
 
 语义：
 
@@ -710,7 +716,8 @@ lease 不能扩大 Snapshot 中不存在的 capability。
 - Workspace Skill discover/read/lazy load 前；
 - 每批 ToolCall preflight 前；
 - ToolSandbox 文件操作前；
-- 每次新的模型调用前。
+- 每次新的模型调用前；
+- initiating TurnContext/UserMessage、Steer、Model-produced Assistant和`tool_round_completed` append前。
 
 ## Session Ownership 与 Lifecycle
 
@@ -770,7 +777,7 @@ Workspace unavailable 时：
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision + WorkspaceRevision
-→ 在 per-session lifecycle gate 内构造并 resolve complete candidate
+→ 在per-session lifecycle serialization内构造并resolve complete candidate
 
 ordinary/permissive update
 → 原子提交新 SessionDefinitionRevision
@@ -796,7 +803,7 @@ Session 已保存新 roots
 reload 不属于 WorkspaceService method：
 
 ```text
-Session execution owner 读取 current exact SessionDefinition.workspace
+SessionExecutor 读取 current exact SessionDefinition.workspace
 → 再次 WorkspaceResolver::resolve(...)
 → success：原子发布新 Snapshot
 → unavailable：future Turn admission fail closed
@@ -820,7 +827,7 @@ Session active 时 unload 返回 Busy；调用方先显式 cancel 并等待 Turn
 
 ## Turn Pinning
 
-Turn admission 时，Session execution owner 原子捕获当前 WorkspaceSnapshot：
+Turn admission 时，SessionExecutor 原子捕获当前 WorkspaceSnapshot：
 
 ```rust
 let workspace = session
@@ -842,7 +849,7 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, turn_port, cancellation, updates
+     provider: model.capabilities(), execution_mode, execution_control, cancellation, progress_events
    }) → ToolSet
 
 SkillCatalog.prompt_view()
@@ -925,11 +932,11 @@ managed policy hard deny
 
 Definition-changing restriction，例如移除 root 或修改 Workspace grants：
 
-1. 在 per-session lifecycle gate 内 resolve/validate candidate definition；
+1. 在per-session lifecycle update的串行执行区内resolve/validate candidate definition；
 2. 撤销受影响 WorkspaceAuthorizationLease；
 3. 阻止新的 source read、Skill load、input composition、Tool execution 和模型调用；
 4. durable commit 新 SessionDefinitionRevision；
-5. 通知 Session execution owner并中断使用该 lease 的 active Turn；
+5. 通知 SessionExecutor并中断使用该 lease 的 active Turn；
 6. 发布 future Turn 使用的新 Snapshot；
 7. 最后向调用方确认 update success；
 8. 不把 last-good Snapshot 当作 fallback。
@@ -938,16 +945,16 @@ Definition-changing restriction，例如移除 root 或修改 Workspace grants�
 
 Authority-only restriction，例如 trust/policy store 降级、managed hard deny 或外部撤销 source authorization，不创建假的 WorkspaceRevision 或 SessionDefinitionRevision：
 
-1. WorkspaceAuthority 在自己的 publication gate 内原子发布新 authority revision/policy，并 revoke 受影响旧 lease；
-2. 通知 Session execution owner并中断受影响 active Turn；
+1. WorkspaceAuthority在自己的serialized publication update内原子发布新authority revision/policy，并revoke受影响旧lease；
+2. 通知 SessionExecutor并中断受影响 active Turn；
 3. 使用 current exact SessionDefinition.workspace 重新 resolve；
 4. success 时发布受限的新 Snapshot，unavailable 时 future admission fail closed；
 5. SessionDefinitionRevision 保持不变。
 
 如果撤权发生在 provider request 已发送之后，MiniCore 无法撤回 provider 已看到的内容。它能保证的是：
 
-- best-effort cancel in-flight request；
-- 基于已撤销上下文产生但尚未append的UserMessage、Steer contribution或模型结果直接丢弃；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`，随后中断active Turn；
+- best-effort cancel当前provider request；
+- 未取得WorkspaceCommitAuthorization的UserMessage、Steer contribution或模型结果在lease revoked后直接丢弃；若authorization先于revoke取得，则对应短append先完成，随后revocation中断active Turn；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`；
 - 不开始下一次模型调用；
 - 已完成的外部副作用不伪装成已回滚。
 
@@ -1273,7 +1280,7 @@ upload / telemetry
 1. `WorkspaceRelativePath` 和 `CanonicalWorkspacePath` 的跨平台编码细节。
 2. WorkspaceAuthority 的 persisted trust、managed policy 和 headless adapter 形状。
 3. Workspace source adapter 和 Sandbox 在各平台如何实现 handle-relative open 以防止 TOCTOU。
-4. WorkspaceAuthorizationControl 与 future Session execution owner/cancellation primitive 的实现映射。
+4. WorkspaceAuthorizationControl与SessionExecutor cancellation的实现映射。
 5. Session Workspace update 的最终 command interface。
 6. Workspace unavailable reason 与 SessionReadiness/公开 diagnostics 的最终映射。
 7. crash recovery 是否持久化 WorkspaceFingerprint、view fingerprint 或 authority revision。

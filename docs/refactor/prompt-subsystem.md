@@ -124,12 +124,12 @@ pub struct SessionDefinition {
     pub revision: SessionDefinitionRevision,
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
-    pub model: Model,
+    pub model: SessionModelConfig,
     pub prompts: SessionPrompts,
 }
 ```
 
-Turn admission 从同一个 exact SessionDefinitionRevision 取得 SessionPrompts，并按 `AgentRevisionRef` 读取 exact AgentDefinition。PromptService 不能按 AgentId 回查 current revision，也不能把不同 Session revision 的 Workspace、Model 和 Prompt config 拼接。
+Turn admission 从同一个 exact SessionDefinitionRevision 取得 SessionPrompts，并按 `AgentRevisionRef` 读取 exact AgentDefinition。PromptService 不能按 AgentId 回查 current revision，也不能把不同 Session revision 的 Workspace、SessionModelConfig和Prompt config 拼接。
 
 Workspace project Prompt 在 scope 解析上属于 Session，但 SessionDefinition 不复制从项目文件发现的 PromptDefinition 或正文。PromptService 通过当前 Turn pin 的 `WorkspacePromptContext` 发现、加载和解析已授权 project Prompt source。Workspace 只授权 source，不解析 Prompt。
 
@@ -547,11 +547,11 @@ PromptContribution
 → PromptSet 输入规范化
 → User MessageRecord + PromptContributionStamp
 → SessionWriter.append + apply_committed
-→ conversation gate接纳
+→ conversation projection接纳
 → 后续assembly只从committed conversation重建
 ```
 
-Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 PromptSet 创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply conversation gate，不能恢复current-call assembly旁路。
+Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 PromptSet 创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply和conversation projection规则，不能恢复current-call assembly旁路。
 
 ## 模型上下文组装
 
@@ -571,17 +571,34 @@ pub struct PromptAssemblyInput<'a> {
 
 ```rust
 pub struct AssembledModelContext {
-    pub system_prompt: Arc<str>,
+    pub instructions: Arc<[ModelInstruction]>,
     pub messages: Arc<[ModelMessage]>,
     pub tools: Arc<[ToolSpec]>,
     pub output_contract: Option<OutputContract>,
     pub contribution_stamps: Arc<[PromptContributionStamp]>,
     pub diagnostics: Arc<[PromptDiagnostic]>,
     pub fingerprint: AssembledModelContextFingerprint,
+    pub(crate) assembly_proof: PromptAssemblyProof,
+}
+
+pub struct ModelInstruction {
+    pub role: ModelInstructionRole,
+    pub content: Arc<str>,
+}
+
+pub enum ModelInstructionRole {
+    System,
+    Developer,
+}
+
+pub(crate) struct PromptAssemblyProof {
+    pub purpose: ModelCallPurpose,
+    pub turn_model_fingerprint: TurnModelFingerprint,
+    pub output_contract_hash: Option<ContentHash>,
 }
 ```
 
-AssembledModelContext 是唯一允许进入 ModelGateway 的 provider-neutral Prompt 输出。
+AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot和OutputContract binding。PromptSet保留ordered System/Developer role；provider原生role、deterministic role lowering和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
 `MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
 
@@ -589,7 +606,7 @@ AssembledModelContext 是唯一允许进入 ModelGateway 的 provider-neutral Pr
 
 `PromptSet::assemble()` 集中执行：
 
-- system/developer section 顺序确定；
+- system/developer section顺序确定并保留为ordered ModelInstruction；
 - required Runtime policy 未缺失；
 - PromptKey 和 contribution source 不发生非法重复；
 - PromptSet 内绑定的 ToolPromptView 携带 parent ToolSetFingerprint；该 cross-binding 在 TurnExecutionContext capture/final validation 时完成；
@@ -598,7 +615,7 @@ AssembledModelContext 是唯一允许进入 ModelGateway 的 provider-neutral Pr
 - initiating UserMessage 未遗漏或放到 ToolCall/ToolResult 中间；
 - committed MessageRecord 中的 SkillContributionRef、content hash 和 source stamp 与规范化时保存的 stamp 一致；
 - required contribution 在输入规范化阶段缺失时失败；
-- 不存在未append/apply或尚未通过conversation gate的current-call model-visible contribution；
+- 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
 - 最终大小和 token estimate 不超过有效模型限制。
 
@@ -745,7 +762,7 @@ PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn �
 8. PromptSet fingerprint 的序列化和 Turn recovery 规则。
 9. Prompt content cache 的 key、eviction 和失效策略。
 10. Prompt hook 和动态 Context provider 是否能在不建立未提交模型可见旁路的前提下接入。
-11. Provider 不支持 Developer role 时的 ModelGateway 映射规则。
+11. Provider cache效果和canonical instruction boundary验证。
 12. PromptError 与 Turn terminal/compaction 的映射。
 
 ## 设计进度

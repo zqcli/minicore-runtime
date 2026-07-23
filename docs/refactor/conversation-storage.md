@@ -1,6 +1,6 @@
 # Conversation 与 SessionStorage 架构设计
 
-状态：目标架构已按 by-entry JSONL 修订；Session execution、compaction 和公开 protocol integration 待后续阶段完成
+状态：目标架构已按by-entry JSONL修订；compaction orchestration、公开protocol和实现待后续阶段完成
 日期：2026-07-16
 
 ## 目的
@@ -13,7 +13,7 @@
 - 一个物理 JSONL entry 如何同时保持可检查、可分支和可恢复；
 - User、Assistant、Tool message、Reasoning、usage 和 durable event 如何分类；
 - 哪些已持久化内容可以进入模型 conversation；
-- ToolCall、ToolResult、Interaction 和 side-effect barrier 如何逐 entry 持久化；
+- ToolCall、ToolResult、Interaction和ToolExecutionStarted前置记录如何逐entry持久化；
 - complete ToolRound 如何在没有物理 batch 的前提下 all-or-none 进入模型 conversation；
 - entry-level operation idempotency 和 append acknowledgement unknown 如何处理；
 - hot projection 如何只应用成功 append receipt；
@@ -21,7 +21,7 @@
 
 本文不提前冻结：
 
-- Session execution actor/task/mailbox 的具体实现；
+- SessionExecutor、request queue和异步operation的具体实现；
 - Runtime command、query、event 和 snapshot payload；
 - ModelGateway provider adapter；
 - compaction summary prompt 和 token budget；
@@ -34,18 +34,18 @@
 
 | 项目 | Durable layout | 采用点 | 避免点 |
 | --- | --- | --- | --- |
-| pi | header + `id/parentId` entry tree；一个 finalized AgentMessage 保存 thinking、text、tool calls、usage；ToolResult 独立 message | 单文件、逐 entry、parent tree、assistant response 聚合 | approval/side-effect barrier 不 durable；ToolCall/ToolResult 直接进入 transcript，partial round 依赖上层修复 |
-| Codex | 一行一个 `RolloutItem`；ResponseItem、Reasoning、FunctionCall/Output、TurnContext、Compacted、EventMsg 并列 | typed entry stream、reasoning/context fidelity、turn-boundary fork | ResponseItem 与 EventMsg 内容重复；事件类型过多；ToolCall/Output 物理独立但没有 MiniCore promotion gate |
+| pi | header + `id/parentId` entry tree；一个 finalized AgentMessage 保存 thinking、text、tool calls、usage；ToolResult 独立 message | 单文件、逐 entry、parent tree、assistant response 聚合 | approval和execution-start required records不durable；ToolCall/ToolResult 直接进入 transcript，partial round 依赖上层修复 |
+| Codex | 一行一个 `RolloutItem`；ResponseItem、Reasoning、FunctionCall/Output、TurnContext、Compacted、EventMsg 并列 | typed entry stream、reasoning/context fidelity、turn-boundary fork | ResponseItem 与 EventMsg 内容重复；事件类型过多；ToolCall/Output 物理独立但没有MiniCore ToolRoundCompleted模型可见性规则 |
 | Claude Code | 一行一个 uuid/parentUuid record；user/assistant/system/tool_use/tool_result/thinking/usage/file snapshot 等 | 可导航 history、reasoning signature、usage 与 response 同存 | thinking/tool_use 常拆为多 assistant records并重复 usage；执行事件和文件 checkpoint 混入同一历史 |
-| Grok Build | `chat_history.jsonl` ConversationItem + `updates.jsonl` update stream + summary/checkpoint sidecar | reasoning replay、prompt-index rewind、durable update barrier | 两个 conversation-like logs、sidecar ownership、重放/修复 surface 较重 |
+| Grok Build | `chat_history.jsonl` ConversationItem + `updates.jsonl` update stream + summary/checkpoint sidecar | reasoning replay、prompt-index rewind、durable update ordering | 两个 conversation-like logs、sidecar ownership、重放/修复 surface 较重 |
 
 MiniCore 采用：
 
 ```text
 pi 的单文件 entry tree 与 assistant response 聚合
 + Codex/Grok 的 reasoning、context 和 provider-continuity fidelity
-+ MiniCore 的 durable Interaction / side-effect barrier
-+ committed-only ToolRound conversation gate
++ MiniCore的durable Interaction / ToolExecutionStarted前置记录
++ committed-only ToolRoundCompleted模型可见性规则
 ```
 
 MiniCore 不复制：
@@ -80,7 +80,7 @@ MiniCore 不复制：
 - final assistant message append 是 Completed Turn 结束线性化点；
 - Interrupted/Failed Turn 由 durable event terminalize；
 - assistant tool-call response 和 tool messages在 `tool_round_completed` event前都不进入模型 conversation；
-- `tool_round_completed` 引用一个 assistant entry及其全部 ordered tool entries，并作为 complete ToolRound conversation gate；
+- `tool_round_completed`引用一个assistant entry及其全部ordered tool entries，并作为complete ToolRound进入conversation projection的required record；
 - Interaction request/resolution、Tool execution-start 和 Tool abandoned使用 durable event；
 - Runtime observer event 从 committed entry receipt派生，不原样写入 Session ledger；
 - streaming delta、Tool progress、provider retry attempt 和 transient phase不持久化；
@@ -314,9 +314,15 @@ pub struct StoredSessionDefinitionRef {
     pub revision: SessionDefinitionRevision,
     pub content_fingerprint: ContentHash,
 }
+
+pub struct TurnModelRef {
+    pub selection: ModelSelection,
+    pub definition_version: ModelDefinitionVersion,
+    pub turn_model_fingerprint: TurnModelFingerprint,
+}
 ```
 
-`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
+`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。`TurnModelRef`保存stable selection、exact model definition version和覆盖effective capability/generation policy的TurnModelFingerprint；它不保存endpoint、auth binding或credential。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
 
 Context entry在initiating UserMessage前append，由UserMessage通过`context_entry_id`引用。
 
@@ -389,8 +395,15 @@ pub struct StoredAssistantMessage {
     pub content: Arc<[AssistantContent]>,
     pub usage: Option<ModelUsage>,
     pub finish_reason: ModelFinishReason,
+    pub provider_metadata: StoredProviderResponseMetadata,
     pub retry_count: u32,
     pub assembled_context_fingerprint: AssembledModelContextFingerprint,
+}
+
+pub struct StoredProviderResponseMetadata {
+    pub provider_request_id: Option<String>,
+    pub raw_finish_code: Option<String>,
+    pub service_tier: Option<String>,
 }
 
 pub enum StoredAssistantPhase {
@@ -430,7 +443,9 @@ pub enum AssistantContent {
 - Final assistant entry append是Completed Turn的结束线性化点；
 - Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的Intermediate assistant entry，且cancel/Steer没有赢得仲裁；
 - usage属于该逻辑模型响应，不另写TokenCount event；
-- Session total usage由assistant entries重建为projection/cache。
+- retry_count只表示SessionExecutor对同一logical call执行的logical retry数量，不包含ModelGateway transparent attempt；
+- provider_metadata只保存allowlisted bounded code/request ID，不保存raw response、headers、endpoint或payload；
+- Session total usage由assistant entries和带model_call的Compaction entries重建为projection/cache。
 
 ### Reasoning
 
@@ -469,13 +484,14 @@ pub struct ModelUsage {
     pub reasoning_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
-    pub cost: Option<Money>,
+    pub provider_total_tokens: Option<u64>,
+    pub reported_cost: Option<Money>,
 }
 ```
 
-provider response是瞬时值；若不持久化，process restart后会失去historical usage、cost和cache统计。因此usage随assistant response保存。
+provider response是瞬时值；若不持久化，process restart后会失去historical usage、cost和cache统计。因此AgentRun usage随assistant response保存，CompactionSummary usage随StoredCompaction.model_call保存。
 
-provider未返回的字段保持`None`，不能以估算冒充provider truth。本地context estimate属于rebuildable projection，不写入usage事实。
+provider未返回的字段保持`None`，不能以估算冒充provider truth。provider_total_tokens只保存provider报告值；本地字段求和不能伪装成provider total。本地context estimate和catalog price计算属于rebuildable projection，不写入usage事实；reported_cost只保存provider明确返回的billed cost。
 
 ### Tool Message
 
@@ -525,7 +541,7 @@ pub enum StoredDurableEvent {
 }
 ```
 
-这些是恢复、权限、副作用和conversation gate所需的durable event，不是Runtime公开EventMsg的序列化副本。
+这些是恢复、权限、副作用和conversation projection所需的durable event，不是Runtime公开EventMsg的序列化副本。
 
 Runtime public event必须从成功append并apply的entry receipt派生。Session ledger不保存：
 
@@ -559,7 +575,7 @@ interaction_resolved append + apply
 → wake waiter / allow protected continuation
 ```
 
-deadline和resolution必须由单一Session execution owner线性化。late resolution不得覆盖已committed timeout/cancel resolution。
+deadline和resolution必须由单一SessionExecutor线性化。late resolution不得覆盖已committed timeout/cancel resolution。
 
 ### ToolExecutionStarted
 
@@ -614,7 +630,7 @@ pub struct StoredToolRoundCompleted {
 }
 ```
 
-`tool_round_completed`是conversation gate，不是ToolRound entity。
+`tool_round_completed`是完整ToolRound进入conversation projection的required record，不是ToolRound entity。
 
 append前writer必须验证：
 
@@ -672,10 +688,21 @@ pub struct StoredCompaction {
     pub summary: CompactionSummary,
     pub retained_from: ConversationBoundary,
     pub protected_entries: Arc<[EntryId]>,
+    pub model_call: Option<StoredCompactionModelCall>,
+}
+
+pub struct StoredCompactionModelCall {
+    pub model: TurnModelRef,
+    pub response_id: Option<String>,
+    pub usage: Option<ModelUsage>,
+    pub finish_reason: ModelFinishReason,
+    pub provider_metadata: StoredProviderResponseMetadata,
+    pub logical_retry_count: u32,
+    pub assembled_context_fingerprint: AssembledModelContextFingerprint,
 }
 ```
 
-Compaction entry本身是conversation Replace gate，不另写`compaction_completed` durable event。
+Compaction entry本身触发conversation Replace，不另写`compaction_completed` durable event。
 
 规则：
 
@@ -683,6 +710,8 @@ Compaction entry本身是conversation Replace gate，不另写`compaction_comple
 - cut不能拆分initiating user、complete ToolRound或final assistant model-visible unit；
 - compaction只追加overlay，不重写旧entries；
 - navigating/forking到compaction前的entry自然不应用该compaction；
+- SummaryModel产生的Compaction必须保存model_call；deterministic reduction没有provider调用时为None；
+- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和retry语义；
 - physical retention/vacuum与conversation compaction分离。
 
 ## SessionWriter Append Algorithm
@@ -1094,7 +1123,7 @@ SessionWriter.append(draft)
 → publish/wake/side-effect/model-call
 ```
 
-具体gate：
+具体required ordering：
 
 ```text
 User input append/apply
@@ -1257,7 +1286,8 @@ content-addressed DAG
 - user input append OutcomeUnknown lookup；
 - assistant intermediate含多个ToolCall；text/reasoning-only Intermediate被拒绝；
 - reasoning text/encrypted/signature round-trip；
-- usage/model/response ID/finish reason round-trip；
+- usage/model/response ID/finish reason/allowlisted provider metadata round-trip；
+- logical retry_count不混入ModelGateway transparent retry；
 - Interaction request-before-notify；
 - resolution-before-wake；
 - ToolExecutionStarted before side effect；
@@ -1281,37 +1311,37 @@ content-addressed DAG
 - nested EntryId/TurnId/ItemId/RequestId remap；
 - copied historicalTurnContext保留source-scoped exact definition refs，child future definition独立；
 - compaction source fingerprint和protected complete ToolRound；
+- SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count和provider metadata round-trip；
 - Prompt永远看不到uncompleted ToolRound。
 
 ## 当前开放问题
 
 仍需后续阶段闭合：
 
-1. `SessionExecutionTask`如何调度entry append、external futures和control ingress；
-2. exact Rust serde tags/field casing，以及未来format v2+ migration policy；
-3. Rig/AgentLoop adapter如何映射一个finalized assistant response及ordered content；
-4. ModelGateway如何规范化provider reasoning、usage、finish reason和response ID；
-5. max entry size及未来blob reference阈值；
-6. FollowUp process-local queue的ack语义；
-7. public fork command的Before/After message anchor payload；
-8. cold exact resume是否值得在稳定executor implementation identity后扩展。
+1. exact Rust serde tags/field casing，以及未来format v2+ migration policy；
+2. Rig/AgentLoop adapter如何映射一个finalized assistant response及ordered content；
+3. Rig adapter如何提取各provider的finish reason、reasoning artifact和allowlisted response metadata；
+4. max entry size及未来blob reference阈值；
+5. public fork command的Before/After message anchor payload；
+6. cold exact resume是否值得在稳定executor implementation identity后扩展。
 
 ## 完成检查
 
 - [x] 选择per-session append-only by-entry JSONL tree。
 - [x] 固定SessionHeader create/fork staging exception。
-- [x] 定义StoredSessionEntry envelope、EntryId、parent_id和operation key。
+- [x] 定义StoredSessionEntry record、EntryId、parent_id和operation key。
 - [x] 固定TurnContext / Message / Event / Compaction顶层类别。
 - [x] 固定user/assistant/tool message layout。
 - [x] 固定assistant finalized response聚合、reasoning和usage持久化。
 - [x] 定义durable Interaction和Tool side-effect events。
-- [x] 定义ToolRoundCompleted committed-only conversation gate。
+- [x] 定义ToolRoundCompleted committed-only conversation projection rule。
 - [x] 定义CommittedConversationState/View/Delta和AdvanceOnly/Append/Replace。
 - [x] 定义entry-level idempotency和OutcomeUnknown lookup。
 - [x] 定义parent tree、fork deep copy和identity remap。
 - [x] 定义compaction overlay。
 - [x] 定义partial tail、strict corruption和conservative recovery。
 - [x] 保持SessionStorage为唯一durable truth。
-- [ ] 完成Session execution owner和entry append sequencing。
-- [ ] 完成ModelGateway与AgentLoop adapter。
+- [x] 完成SessionExecutor和entry append sequencing。
+- [x] 完成ModelGateway normalization与persistence contract设计。
+- [ ] 完成ModelGateway与AgentLoop adapter实现。
 - [ ] 完成实现、fixture和property tests。

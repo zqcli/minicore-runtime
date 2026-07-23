@@ -1,5 +1,7 @@
 # ModelGateway
 
+> 状态：pre-refactor implementation contract。ModelGateway的当前目标interface、ownership、retry、stream、usage、auth和cache规则以[ModelGateway架构设计](../refactor/model-gateway.md)与[ADR 0026](../adr/0026-model-gateway-uses-one-deep-async-operation.md)为权威。本文中的SessionRuntime、Driver-owned call、RunId、PreparedMessageTurn、cross-model fallback和caller-visible provider lifecycle不得覆盖目标设计。
+
 `ModelGateway` 是 MiniCore 中唯一负责真实模型调用的运行时边界。它复用 Rig 的 provider/client/streaming 能力，但不把 Rig provider 类型、模型凭据、raw provider payload 或 provider SDK 错误暴露给 `SessionRuntime`、`Driver`、下游 UI 或会话持久化。
 
 一句话边界：

@@ -1,5 +1,7 @@
 # UsageStats
 
+> 状态：UI usage projection的pre-refactor contract。单次provider usage normalization以[ModelGateway目标架构](../refactor/model-gateway.md)为权威，durable usage以[Conversation与SessionStorage](../refactor/conversation-storage.md)为权威；本文中的Driver/SessionRuntime/RunId和独立PersistedModelCallUsage不得覆盖目标ownership。
+
 `UsageStats` 描述模型 token 消耗、会话累计统计和当前上下文占用的统一口径。它不是 UI 组件，也不是 provider SDK；它是运行时把 provider usage、本地估算和会话状态归一化为 UI 可展示数据的能力。
 
 核心原则：
@@ -26,7 +28,7 @@ else:
 
 有效 assistant usage 必须来自非 `aborted`、非 `error` 的 assistant message，且 token 数大于 0。本地估算使用保守字符启发式：文本约 `chars / 4`，图片按固定大块估算，tool call 使用工具名加 JSON 参数长度，tool result/bash/summary 使用内容长度估算。
 
-provider-neutral usage 使用本文“数据结构”小节和 `AgentRuntimeProtocol` 共同定义的唯一 `TokenUsage`：所有字段为 `u64`，并保留 `cached_input_tokens`、`cache_write_tokens`、`reasoning_output_tokens`。不再维护另一份 `i64 TokenUsageInfo` shape。
+provider返回的单次`ModelUsage`字段使用`Option<u64>`保存实际报告值；缺失字段不能补零伪装成provider fact。UI aggregate `TokenUsage`可以在projection层使用`u64`并把缺失值按展示规则归零，但它不是durable provider response shape。
 
 Codex 还把 `token_count` 作为事件推给 UI，并用 `non_cached_input + output` 作为更适合展示的 blended total，同时把 cached input 和 reasoning output 单独展示。
 
@@ -199,15 +201,16 @@ provider 返回 usage 时，它是消耗统计的权威来源。本地估算只�
 
 ```text
 ModelGateway
-  normalizes raw provider usage into ModelCallUsage.
+  normalizes provider-reported usage into ModelUsage.
 
-Driver
-  receives model-call usage through host.call_model result / stream sink;
-  accumulates current Rig drive usage but does not own session stats.
+SessionExecutor
+  receives ModelCallResult through OperationResult;
+  attaches successful usage to assistant/compaction entries;
+  updates rebuildable SessionUsageStats and ContextUsageView.
 
-SessionRuntime
-  owns CurrentRunUsage, SessionUsageStats, ContextUsageView;
-  emits usage_updated and includes final usage in run_finished.
+ProgressEventPublisher
+  may publish process-local usage observations;
+  does not own durable usage.
 
 SessionHandle / SessionStorage
   persist recoverable per-model-call usage with committed assistant/compaction facts;
@@ -220,7 +223,7 @@ UI
 
 `UsageSummary` for a run is the sum of all model calls in that run, not just the last model call. If a run contains multiple model/tool/model cycles, `run_finished { usage }` must include all model calls in that run.
 
-run-level `UsageSummary` 只聚合关联到该 run 的 `ModelCallPurpose::AgentRun` 调用。独立 compaction phase 产生的 `CompactionSummary` usage 进入 `SessionUsageStats`，但不能回填到刚结束或即将重试的 Agent run aggregate。provider fallback/retry 若在同一个逻辑 model call 内发生，由 `ModelCallAttempt` 记录；任何 provider 明确报告的消耗仍使用原始 purpose 记账。
+run-level `UsageSummary` 只聚合关联到该 run 的 `ModelCallPurpose::AgentRun` 调用。独立 compaction phase 产生的 `CompactionSummary` usage 进入 `SessionUsageStats`，但不能回填到刚结束或即将重试的 Agent run aggregate。ModelGateway transparent retry不创建`ModelCallAttempt`领域对象；attempt metadata只属于ModelGateway internal telemetry。provider为失败attempt报告的消耗不进入Session aggregate且在MVP中不保证durable，MiniCore SessionStorage不是billing ledger。
 
 `DriverEvent::ModelCallFinished` 应携带 `Option<ModelCallUsage>`。`run_finished { usage }` 和 `DriveResult::Completed { usage }` 才携带 run-level `UsageSummary`，避免多次模型调用重复计数或丢失 per-call provider/model/source。
 

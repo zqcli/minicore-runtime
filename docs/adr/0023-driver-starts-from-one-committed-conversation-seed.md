@@ -22,12 +22,14 @@ The MiniCore-owned public interfaces below are now decided. BR-049 / the Rig int
 7. **Committed conversation changes are explicit.** Runtime code distinguishes `CommittedConversationState` (a complete committed projection) from `CommittedConversationDelta` (the exact visible change deterministically produced after one or more committed entry receipts are applied).
 8. **Driver entry name is fixed.** `Driver.drive_conversation(...)` is the public driver operation for a run over a `ConversationSeed` and a narrow `DriverTurnInput`.
 9. **ModelGateway entry name is fixed.** `ModelGateway.generate_model_turn(...)` is the model invocation seam. It receives a `ModelCallRequest` whose input is an `AssembledModelContext`.
-10. **Storage ordering is explicit.** Session execution advances through sequential `append -> apply -> conversation gate` operations. Helper names are private implementation detail; no helper may make an uncommitted or conversation-hidden entry visible to Driver/Rig.
+10. **Storage ordering is explicit.** Session execution advances through sequential `append -> apply -> conversation projection` operations. Helper names are private implementation detail; no helper may make an uncommitted or conversation-hidden entry visible to Driver/Rig.
 11. **Compaction is not model-context assembly.** Compaction computes cut/protection/directive data. Protected `EntryId`s are excluded from summary targets. After a Compaction entry append/apply succeeds, Session execution applies/reloads the Replace projection and builds a new `ConversationSeed` from `CommittedConversationState`.
 12. **Tools fingerprint invariant is fixed.** The prompt view and executor inside one `TurnToolProfile` must share the same fingerprint. They are never fetched through separate getters.
 13. **ModelGateway does not decide visibility.** Provider adapters may encode `AssembledModelContext` into provider DTOs and choose wire optimizations such as cache/continuation, but they must not reinterpret which session records are visible or how `MessageRecord` variants map to model messages.
 
 ## Interface Sketch
+
+The ModelCallRequest field shape below is historical and is superseded by ADR 0026; ADR 0023 remains authoritative for the operation name and Prompt-only input seam.
 
 The exact Rust fields still belong to the pre-development contract closure review, but the seam vocabulary and ownership are fixed:
 
@@ -92,5 +94,6 @@ pub struct ModelCallRequest {
 - Amends [ADR 0013](0013-driver-receives-driver-turn-input.md): `DriverTurnInput` remains narrow, but `DriveRequest` now also carries an explicit `ConversationSeed`; this does not re-expand the seam to `TurnState`.
 - Amends [ADR 0017](0017-prompt-uses-immutable-turn-assembly.md): the accepted Prompt vocabulary is now `prepare_message_turn`, `PreparedMessageTurn`, `ModelContextProfile`, `compose_user_message`, and `assemble_model_context -> AssembledModelContext`.
 - Amends [ADR 0019](0019-session-writes-use-one-trusted-batch-writer.md): successful writes may return or construct a `CommittedConversationDelta` used to advance the run-scoped transcript; uncommitted drafts still never advance Driver/Rig.
-- Amended by [ADR 0024](0024-session-storage-uses-by-entry-jsonl.md): writes are by entry, and assistant/tool entries become model-visible only through the explicit conversation gate.
+- Amended by [ADR 0024](0024-session-storage-uses-by-entry-jsonl.md): writes are by entry, and assistant/tool entries become model-visible only through the explicit conversation projection rule.
 - Amends [ADR 0021](0021-session-runtime-separates-actor-control-from-run-execution.md): `Tools.capture_profile_baseline` / `ToolProfileBaseline` are renamed to `Tools.capture_turn_tools` / `TurnToolProfile`, preserving the same fingerprint and actor/run-task separation invariant.
+- Amended by [ADR 0026](0026-model-gateway-uses-one-deep-async-operation.md): `generate_model_turn(...)` uses an exact TurnModelSnapshot, one immutable AssembledModelContext and private provider adapters; streaming/provider sessions do not enter the caller interface.
