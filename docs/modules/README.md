@@ -55,7 +55,7 @@ SessionExecutor ──▶ private AgentLoop / SDK adapter
 
 `ResourceManager` 是运行时内部资源子系统，负责资源来源聚合、信任校验、原子刷新候选、级联 snapshot、cwd-over-runtime overlay policy、提示词素材和诊断。它维护 `OpenWorkspace` 初始化一次的 `RuntimeResourceSnapshot`、store current 的 `CwdResourceSnapshot`、不进入 store 的 `TurnResourceSnapshot` capture，并预留 `StepResourceSnapshot`；在 skill 层面它决定 roots、trust、分层、overlay 和 current snapshot，但不解析 frontmatter、不拼 `<skill>` 消息。
 
-`CommandSurface`是跨UI的用户命令领域面；实现上由共享无状态`CommandManager`和Runtime基于SessionId/SessionExecutor snapshot构造的session-scoped command context组成。它把 `/compact`、`/skill name`、兼容 `/skill:name`、`/{template}`、`/model`、`/usage` 和后续扩展命令通过 nested JSON command tree、dynamic providers、parse/suggest/resolve 和 trusted handlers 映射到 `agent_runtime_protocol::AgentCommand`、受控 query 或 prompt-like 输入，但不直接执行工具或 Agent loop。
+`CommandSurface`是跨UI的用户命令领域面；实现上由共享无状态`CommandManager`和Runtime基于SessionId/SessionExecutor snapshot构造的session-scoped command context组成。它把`/skill name`、兼容`/skill:name`、`/{template}`、`/model`、`/usage`和后续扩展命令通过nested JSON command tree、dynamic providers、parse/suggest/resolve和trusted handlers映射到Runtime command、受控query或prompt-like输入，但不直接执行工具或AgentLoop。`/compact`是否成为manual maintenance command留到阶段9。
 
 message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -> PromptIntent`；普通文本直接归一为 text/composite intent，skill/template slash 先完成 command parse/resolve，再只把稳定 resource key、args 和附件交给目标 `PreparedMessageTurn.compose_user_message(...)`。
 
@@ -65,17 +65,17 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 
 `PromptTemplates` 是平级纯模板能力模块，对应未来的 `prompt_templates.rs`。它定义 template metadata/resource/catalog/invocation、frontmatter、参数解析和单次替换规则；ResourceManager 拥有生命周期，CommandManager 只消费 metadata，目标 `PreparedMessageTurn` 执行正文展开。
 
-`Prompt`是无状态提示词组装子系统，对应未来的`prompt.rs`/`prompt/`。`SessionExecutor`把captured `PromptResourceView`与独立`ToolPromptView`交给`Prompt.prepare_message_turn(...)`；`PreparedMessageTurn` pin resources、展开 intent、通过 `compose_user_message(...)` 产出 `CanonicalUserMessage`，并提供原子 `ModelContextProfile`。每次模型调用前，Driver 把该 profile 与 run-local ordered `LiveConversation`、typed transient context 交给纯 `Prompt.assemble_model_context(...)`，得到协议安全的 `AssembledModelContext`。它不是长期 `PromptManager` / `ContextManager`。
+`Prompt`是无状态提示词组装子系统，对应未来的`prompt.rs`/`prompt/`。`SessionExecutor`把captured Prompt inputs与独立`ToolPromptView`交给`PromptService::for_turn(...)`形成不可变PromptSet；PromptSet通过`compose_user_message(...)`产出`CanonicalUserMessage`。每次模型调用前，SessionExecutor只把trusted `CommittedConversationView`或Compaction prefix view和typed assembly variant交给`PromptSet.assemble(...)`，得到协议安全的`AssembledModelContext`。它不是长期`PromptManager`/`ContextManager`。
 
 目标架构中的`ToolService`是MiniCoreRuntime-owned深模块，通过`for_turn(...) -> ToolSet`原子绑定prompt view与executor snapshot。Session execution先append/apply assistant/intermediate entry，再执行ToolSet；每个truthful result独立append为tool message，只有`tool_round_completed`append/apply后才把完整delta交给AgentLoop。旧`Tools`/`ToolBatchInvoker`细节仅保留在pre-refactor模块文档中。
 
-`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point、protected `EntryId` 集合、provider-neutral directive、`CompactionMethod` plan 和结果校验；它不构造 `ModelCallRequest`，也不组装模型上下文。MVP 使用 portable `SummaryModel`，后期可按当前模型 capability 使用 `ProviderNative`。压缩流程、外部调用、事件和session写入由Session execution编排；Compaction entry append/apply成功后通过Replace projection rebuild `ConversationSeed`。
+`Compaction`是平级压缩能力模块，对应未来的`compaction.rs`。它提供context budget、stable-unit projection、strict cut、protected `EntryId`、portable summary directive和结果校验；它不构造`ModelCallRequest`，也不组装模型上下文。首版只使用portable rolling `SummaryModel`，active Turn initiating UserMessage及其后的连续suffix原样保留。压缩流程、外部调用、control arbitration和session写入由SessionExecutor编排；Compaction entry append/apply成功后通过Replace projection rebuild `ConversationSeed`。
 
 `UsageStats` 是 token 消耗和上下文占用统计模块。它区分模型调用消耗、run 汇总、会话累计 stats 和当前 context usage；provider usage 归一化、本地估算、UI view 口径和压缩阈值计算都在这里统一说明。
 
 `ModelGateway`是runtime-owned模型调用深模块。Turn capture通过`resolve_for_turn(...)`固定exact TurnModelSnapshot；模型调用只通过一个`generate_model_turn(...)`异步operation。Provider catalog、credential、Rig adapter、stream、same-model retry、transport fallback、usage、cache和continuation均为private implementation；active Turn内不执行cross-model fallback，也不重新判断`AssembledModelContext`可见性。
 
-`Driver` 只负责适配 Rig。Rig 决定 `CallModel`、`CallTools` 和 `Done`；`Driver` 把这些 step 接到产品运行时的 provider、`Tools`、event 和 abort 语义。
+private `Driver`/AgentLoop adapter只负责把Rig状态归约为`NeedModel | NeedTools | Finished`。SessionExecutor负责PromptSet、ModelGateway、ToolSet、events和Cancel语义，Driver不是第二execution owner。
 
 ## 文档索引
 
@@ -91,7 +91,7 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 - [PromptTemplates](prompt-templates.md)：`prompt_templates.rs` 平级模块，定义模板资源、参数语法和单次展开 helper。
 - [Prompt目标架构](../refactor/prompt-subsystem.md)：PromptService、Turn-pinned PromptSet、CanonicalUserMessage和ordered ModelInstruction/ModelMessage `AssembledModelContext`；旧[Prompt模块文档](prompt.md)只描述pre-refactor contract。
 - [Tools](tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
-- [Compaction](compaction.md)：`compaction.rs` 平级模块，提供压缩准备、摘要 prompt、上下文重建规则和压缩结果类型。
+- [Compaction目标架构](../refactor/compaction.md)：portable rolling summary、stable-unit cut、`Compacting`执行阶段、StoredCompaction和恢复规则；旧[Compaction模块文档](compaction.md)只描述pre-refactor contract。
 - [UsageStats](usage-stats.md)：token 消耗、run/session stats、context usage、provider usage 归一化和 UI 展示口径。
 - [ModelGateway目标架构](../refactor/model-gateway.md)：exact model resolution、single async operation、private Rig adapter、stream/retry/auth/usage/cache规则；旧[模块文档](model-gateway.md)只描述pre-refactor contract。
 - [Driver](driver.md)：pre-refactor Rig adapter contract；当前private AgentLoop ownership以[Session Execution](../refactor/session-execution.md)为权威。
@@ -173,7 +173,7 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 | `src/tools/builtin/edit.rs` | [Tools](tools.md) | `edit` 工具。 |
 | `src/tools/builtin/apply_patch.rs` | [Tools](tools.md) | `apply-patch` 工具。 |
 | `src/tools/builtin/bash.rs` | [Tools](tools.md) | post-MVP reserved；required enforcement capabilities满足后才实现/启用`bash`。 |
-| `src/compaction.rs` | [Compaction](compaction.md) | 压缩准备、cut point、protected `EntryId`、method plan、`CompactionSummaryDirective` 和结果校验；不构造 `ModelCallRequest`。 |
+| `src/compaction.rs` | [Compaction目标架构](../refactor/compaction.md) | context budget、stable-unit cut、protected `EntryId`、`CompactionPlan`、`CompactionSummaryDirective`和结果校验；不构造`ModelCallRequest`。 |
 | `src/usage_stats.rs` | [UsageStats](usage-stats.md) | provider usage 归一化、run/session/context usage helper；消费 `ModelCallPurpose`，不定义 `UsagePurpose`。 |
 | `src/driver.rs` | [Session Execution](../refactor/session-execution.md)、[Driver](driver.md) | private AgentLoop adapter、`NeedModel | NeedTools | Finished`和Rig step映射。 |
 | `src/driver/rig.rs` | [Driver](driver.md) | 当前 Rig sans-IO adapter 实现细节。 |

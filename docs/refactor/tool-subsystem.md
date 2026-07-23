@@ -827,10 +827,9 @@ TurnExecutionContext 只创建一次 ToolSet。Turn execution 每次从 committe
 
 ```rust
 loop {
-    let assembled = turn_context.assemble_model_context(PromptAssemblyInput {
+    let assembled = turn_context.assemble_model_context(PromptAssemblyInput::AgentRun {
         conversation: committed_conversation.view(),
         output_contract: None,
-        purpose: ModelCallPurpose::AgentRun,
     })?;
 
     let output = model_gateway.generate(&assembled).await?;

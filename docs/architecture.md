@@ -107,7 +107,7 @@ Steer after current operation
 - [Driver](modules/driver.md)：Rig `AgentRun` / `CallModel` / `CallTools` 的适配职责。
 - [ModelGateway目标架构](refactor/model-gateway.md)：exact TurnModelSnapshot、单一`generate_model_turn`、private Rig adapter、stream/retry/auth/usage/cache规则；[旧ModelGateway模块文档](modules/model-gateway.md)只描述pre-refactor contract。
 - [Tools](modules/tools.md)：`tools.rs` / `tools/` session-scoped 工具子系统，封装工具定义、registry、active tools、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executors。
-- [Compaction](modules/compaction.md)：`compaction.rs` 平级模块，提供上下文压缩准备、摘要 prompt、压缩摘要消息和自动压缩语义。
+- [Compaction目标架构](refactor/compaction.md)：portable rolling summary、strict stable-unit cut、连续retained suffix、`Compacting`执行阶段和StoredCompaction恢复规则；[旧Compaction模块文档](modules/compaction.md)只描述pre-refactor contract。
 - [UsageStats](modules/usage-stats.md)：token 消耗、run/session stats、context usage 和 UI 展示口径。
 
 ## 核心边界
@@ -121,10 +121,10 @@ Steer after current operation
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution和bounded request queues。Context构造、UserMessage composition、Model和Tool作为cancellable `RunningOperation`执行，并以`SessionId + TurnId + execution_version + OperationType`返回结果；private AgentLoop不拥有storage、Prompt assembly或Tool execution。一个Runtime允许多个SessionExecutor同时Running。完整设计见[Session Execution](refactor/session-execution.md)。
 - `CommandSurface` 属于运行时用户命令入口：下游 UI 可以渲染 autocomplete / command palette / 嵌套菜单 / picker，但不拥有 command text 的权威解析、catalog selection 的授权、执行映射或用户可见结果语义。`CommandManager`无状态共享；Runtime使用SessionId和SessionExecutor snapshot构造session-scoped command context。
 - `RuntimeHooks` 是 MiniCore 后期内部扩展点系统。当前 MVP 不实现 hook registry / hook invocation；设计上先固定 owner 分层。Hook 后续可以在安全点返回 typed decision / patch / replacement，但不能直接发布 `agent_runtime_protocol::Event`、读写 session storage、执行工具或读取凭据。
-- `Driver` 是 Rig 状态机和产品运行时之间的执行适配层。
+- private `Driver`/AgentLoop adapter只适配Rig状态机；SessionExecutor拥有Prompt assembly、ModelGateway调用、ToolSet执行和Compaction recovery。
 - `ModelGateway`是真实模型调用深模块；Turn capture通过`resolve_for_turn(...)`固定exact `TurnModelSnapshot`，RunningOperation只传`ModelCallRequest { TurnModelSnapshot, ModelCallPurpose, input: AssembledModelContext, max_output_tokens }`。Gateway隐藏provider、credential、endpoint、transport retry、cache和continuation，不判断session message visibility，也不在active Turn内替换model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement capability、资源锁和真实副作用执行由`ToolService`统一治理；新的Turn通过`ToolService::for_turn(...) -> ToolSet`原子绑定模型可见`ToolPromptView`与executor snapshot。Session execution先append/apply assistant tool-call entry，再调用`ToolSet::execute(...)`；approval和`tool_execution_started`遵守append-before-notify/side-effect，每个结果append为tool message，完整round只由`tool_round_completed`进入下一次模型调用。MVP不启用通用`bash`；请求的子进程限制无法由OS-native/external backend强制时必须fail closed。
-- 上下文压缩由Session execution编排；`Compaction`模块只提供context estimate、cut point、protected `EntryId`集合、provider-neutral directive、method plan和结果校验。MVP使用portable `SummaryModel`，后期可按`ModelGateway`暴露的模型capability使用`ProviderNative`；Driver只归约context-limit source，不执行压缩。Compaction entry append/apply后先更新`CommittedConversationState`，再构造新的`ConversationSeed`。
+- 上下文压缩由SessionExecutor编排；`Compaction`模块只提供context budget、stable-unit projection、strict cut、protected `EntryId`、portable directive和结果校验。首版只使用active Turn exact model生成rolling summary，hard-protect initiating UserMessage和连续suffix；不做split-turn、manual或provider-native compaction。PromptSet归约local overflow，ModelGateway归约provider overflow；private Driver/AgentLoop不执行压缩。Compaction entry append/apply后先更新`CommittedConversationState`，再构造新的`ConversationSeed`和private AgentLoop segment。
 - 技能、提示模板、上下文文件、会话管理与会话存储属于 MiniCore 运行时，不属于下游 UI。资源身份、overlay 和 snapshot 归 `ResourceManager`；结构化 intent 展开和最终模型输入组装归 Prompt。
 
 ## 相关决策
@@ -132,6 +132,7 @@ Steer after current operation
 - [ADR 0001：在 UI 无关的 Agent 运行时后使用 Rig](adr/0001-use-rig-behind-agent-runtime.md)
 - [ADR 0002：上下文压缩由 SessionRuntime 编排](adr/0002-compaction-is-session-runtime-owned.md)
 - [ADR 0003：AgentRuntimeEvents 使用 EventMsg、配对生命周期和单 run 终态](adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)
+- [ADR 0027：Compaction使用严格stable suffix和portable summary](adr/0027-compaction-uses-strict-stable-suffix.md)
 - [ADR 0004：SessionManager 拥有已加载会话运行时](adr/0004-session-manager-owns-loaded-session-runtimes.md)
 - [ADR 0005：ResourceManager 是运行时内部资源服务](adr/0005-resource-manager-is-runtime-internal.md)
 - [ADR 0006：CommandSurface 是跨 UI 的运行时命令入口](adr/0006-command-surface-is-runtime-command-surface.md)

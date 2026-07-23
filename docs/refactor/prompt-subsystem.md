@@ -25,7 +25,8 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Workspace、Agent 和 Session Prompt source 的具体文件格式；
 - Prompt template 的最终语法；
 - provider-specific role、cache-control 和 payload encoding；
-- compaction orchestration，以及 Prompt fingerprint/content reference 的 exact cold recovery；
+- Compaction的cut、trigger和SessionExecutor orchestration；本文只固定CompactionSummary assembly contract；
+- Prompt fingerprint/content reference 的 exact cold recovery；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现；
 - PromptSet fingerprint 的持久化和审计格式。
 
@@ -558,14 +559,21 @@ Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 Prom
 每次模型调用的输入只包含 committed conversation proof 和 typed call policy：
 
 ```rust
-pub struct PromptAssemblyInput<'a> {
-    pub conversation: &'a CommittedConversationView,
-    pub output_contract: Option<&'a OutputContract>,
-    pub purpose: ModelCallPurpose,
+pub enum PromptAssemblyInput<'a> {
+    AgentRun {
+        conversation: &'a CommittedConversationView,
+        output_contract: Option<&'a OutputContract>,
+    },
+    CompactionSummary {
+        source: &'a CommittedConversationPrefixView,
+        directive: &'a CompactionSummaryDirective,
+    },
 }
 ```
 
-`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其 checkpoint/fingerprint 和 apply 规则见 [Conversation 与 SessionStorage 架构设计](conversation-storage.md)。PromptSet assembly 不接收裸 `Vec<MessageRecord>`、任意 ToolPromptView 或任意 PromptContribution。
+variant确定`ModelCallPurpose`，caller不能把Compaction prefix伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedConversationPrefixView`只能由同一State按validated stable-unit boundary构造。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint/fingerprint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
+
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required policy、typed summary directive和trusted committed prefix。普通Agent/Session/Workspace/Tool/Skill静态instructions不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
 最终输出：
 
@@ -745,7 +753,7 @@ PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn �
 - Workspace project PromptDefinition 必须保留 typed provenance/source stamp，cache 和 fingerprint 不能只按 path 或 PromptId 复用；
 - PromptScope 与 PromptRole 分开；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
-- assembly 只接受 CommittedConversationView，不接受任意 Tool view 或 current-call contribution；
+- assembly只接受来自CommittedConversationState的trusted full/prefix view和closed typed call policy，不接受任意Tool view或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和 fingerprint；
 - reload 不原地修改 active PromptSet。
@@ -776,7 +784,7 @@ PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn �
 - [x] 确定 PromptService 只消费 ToolPromptView 和 SkillCatalogView。
 - [x] 确定 PromptSet 负责 CanonicalUserMessage 和最终模型上下文组装。
 - [x] 确定 PromptSet 创建时绑定 ToolPromptView 和 SkillCatalogView。
-- [x] 确定 assembly 只接受 CommittedConversationView 和 typed call policy。
+- [x] 确定assembly只接受trusted CommittedConversationView/PrefixView和typed variant policy。
 - [x] 确定 PromptContribution 必须先固化到 committed MessageRecord，不作为 current-call 旁路。
 - [x] 确定 MessageRecord 到 ModelMessage 的唯一转换入口。
 - [x] 确定 PromptService/PromptSet 不执行 Tool、不加载 Skill、不调用模型。

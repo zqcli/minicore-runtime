@@ -19,7 +19,7 @@
 本文不定义：
 
 - ModelGateway的provider映射、auth、fallback和stream wire格式；
-- Compaction算法、cut和summary格式；
+- Compaction的具体planning算法、summary格式和质量评估；本文只引用其执行契约；
 - Runtime公开command/query/event/snapshot协议；
 - Rig 0.40.0 adapter的最终具体类型；
 - 操作系统线程、Tokio task或local task的最终部署方式。
@@ -31,6 +31,7 @@
 - [Turn、Item与Interaction架构设计](turn-item-interaction.md)
 - [Tool子系统架构设计](tool-subsystem.md)
 - [ModelGateway架构设计](model-gateway.md)
+- [Compaction架构设计](compaction.md)
 - [Agent与Session生命周期架构设计](agent-session-lifecycle.md)
 
 ## 决策摘要
@@ -302,7 +303,7 @@ Running cancellation/failure
 - `Running`：initiating UserMessage已经append/apply；
 - `Finishing`：不再启动新的Model/Tool操作，正在完成terminal entries和释放资源；
 - 一个Session不能同时存在两个Starting/Running Turn；
-- WaitingApproval、Sampling和ExecutingTools是Running Turn的执行阶段，不是Session durable state；
+- WaitingApproval、Compacting、Sampling和ExecutingTools是Running Turn的执行阶段，不是Session durable state；
 - state不写入SessionStorage。
 
 ## Current Turn Execution
@@ -333,12 +334,15 @@ pub(crate) struct CurrentTurnExecution {
     cancellation: CancellationToken,
     model_attempt: Option<ModelAttemptState>,
     tool_execution: Option<ToolExecutionState>,
+    compaction: Option<CurrentCompactionState>,
+    automatic_overflow_recovery_used: bool,
 }
 ```
 
 `execution_version`从1开始，在以下情况递增：
 
 - Sampling阶段应用Steer并废弃旧Model request；
+- Compaction成功append/apply并Replace conversation；
 - Cancel；
 - security revocation；
 - Turn进入terminal处理。
@@ -375,6 +379,8 @@ pub(crate) enum RunningOperation {
     CompactConversation {
         turn_id: TurnId,
         execution_version: u64,
+        source: ConversationCheckpoint,
+        plan_fingerprint: CompactionPlanFingerprint,
         cancel: CancellationToken,
     },
 }
@@ -398,7 +404,7 @@ pub(crate) struct OperationResult {
 
 - SessionId不匹配：实现错误，记录diagnostic；
 - TurnId不匹配：忽略结果并记录diagnostic；
-- execution version过期的Context/Model结果：忽略；
+- execution version过期的Context/Model/Compaction结果：忽略；
 - execution version过期的UserMessage composition结果：忽略；
 - Tool尚未越过`ToolExecutionStarted`记录时，过期结果可以取消/忽略；
 - Tool已经越过该记录时，必须确认outcome：exact result保存为Tool message，无法确认则ToolAbandoned；
@@ -443,7 +449,6 @@ AgentLoop是crate-private concrete implementation或private adapter，不定义p
 ```rust
 pub(crate) enum AgentLoopAction {
     NeedModel {
-        purpose: ModelCallPurpose,
         output_contract: Option<OutputContract>,
     },
     NeedTools {
@@ -597,17 +602,17 @@ async fn drive_agent_loop(&mut self) -> Result<(), SessionExecutionError> {
 ```text
 AgentLoop NeedModel
 → 从projections取得CommittedConversationView
-→ TurnExecutionContext.assemble_model_context(...)
-→ 保存immutable AssembledModelContext
-→ 使用TurnModelSnapshot构造immutable ModelCallRequest
-→ phase = Sampling
-→ 启动GenerateModelResponse
-   └─ ModelGateway.generate_model_turn(request, scoped progress publisher, cancel)
+→ TurnExecutionContext.assemble_model_context(AgentRun)
+   ├─ success：保存immutable AssembledModelContext和ModelCallRequest，再检查soft pressure
+   └─ PromptContextOverflow：直接进入hard Compaction planning，没有valid ModelCallRequest
+→ no pressure：phase = Sampling
+   → GenerateModelResponse调用ModelGateway(AgentRun request)
+→ soft/hard pressure：phase = Compacting
+   → CompactConversation调用PromptSet和ModelGateway(CompactionSummary request)
 → Executor继续处理SessionRequestQueue
-→ Model返回OperationResult
-→ 校验SessionId/TurnId/execution_version/OperationType
-→ AgentLoop.accept_model_response
-→ drive_agent_loop
+→ OperationResult返回并校验SessionId/TurnId/execution_version/OperationType
+   ├─ Model：AgentLoop.accept_model_response → drive_agent_loop
+   └─ Compaction：revalidate → append/apply Replace → rebuild AgentLoop → reassemble
 ```
 
 规则：
@@ -761,6 +766,10 @@ execution_version += 1
 → SteerResult::Applied
 ```
 
+### Compacting
+
+Compaction期间Steer进入pending Steer FIFO，不立即append，也不改变Compaction source。Compaction append/apply成功或soft fallback结束后，再按FIFO compose/append Steer并从新conversation开始AgentRun assembly。Cancel和Workspace revocation按control FIFO取消Compaction并推进execution version。
+
 ### WaitingApproval或ExecutingTools
 
 ```text
@@ -882,7 +891,7 @@ cancel BuildTurnContext / ComposeUserMessage
 
 ## Workspace Authorization Revocation
 
-Workspace-dependent conversation entry使用private `WorkspaceCommitAuthorization`消除authorization check与append之间的竞态。覆盖initiating TurnContext/UserMessage、Steer UserMessage、Model-produced Assistant和`tool_round_completed`：
+Workspace-dependent conversation entry使用private `WorkspaceCommitAuthorization`消除authorization check与append之间的竞态。覆盖initiating TurnContext/UserMessage、Steer UserMessage、Model-produced Assistant、`tool_round_completed`和active-Turn `StoredCompaction`：
 
 ```text
 WorkspaceAuthorizationLease.authorize_commit()
@@ -983,27 +992,34 @@ Steer、Cancel、Compaction或任何model-visible conversation change都会使�
 
 ## Context Overflow与Compaction连接
 
-Compaction详细设计属于阶段8。本文只固定SessionExecutor调用关系：
+具体cut、summary和storage规则见[Compaction架构设计](compaction.md)。SessionExecutor固定以下调用关系：
 
 ```text
-Prompt assembly或provider返回ContextLimitExceeded
-→ 当前Turn保持Running
-→ 不启动新的Model/Tool操作
-→ 构造Compaction request
-→ 执行Compaction外部操作
-→ append/apply Compaction entry
+AgentLoop NeedModel
+→ assemble AgentRun context并检查soft pressure/local overflow
+→ 必要时Compaction.plan
+→ TurnExecutionPhase = Compacting
+→ RunningOperation::CompactConversation
+→ 验证Turn/version/source/authorization/control state
+→ append/apply StoredCompaction
 → conversation projection Replace
+→ rebuild ConversationSeed和private AgentLoop segment
 → 使用同一个TurnExecutionContext继续Model操作
 ```
 
+provider ContextOverflow也回到同一流程；同一Turn最多一次automatic overflow recovery。
+
 规则：
 
-- Compaction不能替换TurnExecutionContext；
-- protected entries和cut规则由Compaction模块定义；
-- Compaction失败且不能fallback时TurnFailed；
-- Steer/Cancel在Compaction执行期间仍进入SessionRequestQueue；
-- Cancel使Compaction result失效；
-- Compaction result append前必须重新验证source checkpoint。
+- Compaction不替换TurnExecutionContext、TurnModelSnapshot或PromptSet；
+- 启动Compaction不推进execution_version；成功Replace后推进，Cancel/revocation仍立即推进；
+- active Turn initiating UserMessage及其后的连续suffix必须原样保留；
+- `Compacting`期间Steer排队，Cancel和Workspace revocation可以取消operation并在append前获胜；
+- Compaction result append前必须重新验证source checkpoint和TranscriptFingerprint；
+- soft-pressure失败只有在原ModelCallRequest仍exact valid时才能继续；
+- hard overflow失败或compact后仍overflow时TurnFailed；
+- success后必须重建AgentLoop segment，不能resume携带旧history的run；
+- summary operation、plan和retry timer不跨restart恢复。
 
 ## PrepareForUnload
 
@@ -1271,7 +1287,7 @@ MVP性能要求：
 - PreparingModel Steer直接应用；
 - Sampling Steer推进version并取消旧Model；
 - old Model result被忽略；
-- WaitingApproval/ExecutingTools Steer进入FIFO；
+- Compacting/WaitingApproval/ExecutingTools Steer进入FIFO；
 - queued Steer在tool_round_completed后按序append；
 - Steer queue满返回错误；
 - final append与Steer first-processed-wins；
@@ -1286,12 +1302,13 @@ MVP性能要求：
 
 - Cancel during Context capture；
 - Cancel during Sampling；
+- Cancel during Compaction；
 - Cancel during WaitingApproval；
 - Cancel during Tool execution before/afterexecution-start record；
 - Cancel保存exact ToolResult；
 - Cancel只生成一个TurnInterrupted；
 - duplicate Cancel幂等；
-- WorkspaceAuthorizationRevoked during Starting/Sampling/WaitingApproval/ExecutingTools；
+- WorkspaceAuthorizationRevoked during Starting/Compacting/Sampling/WaitingApproval/ExecutingTools；
 - revoked lease使Model start、record_execution_start和tool_round_completed validation失败；
 - WorkspaceCommitAuthorization与revoke双向race：revoke先赢时不append，authorization先赢时完成短append后再中断；
 - Running failure关闭Pending/Started state；

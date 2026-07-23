@@ -609,6 +609,7 @@ Turn 在 Running 期间使用 transient execution phase：
 ```rust
 pub enum TurnExecutionPhase {
     PreparingModel,
+    Compacting,
     Sampling,
     WaitingApproval,
     ExecutingTools,
@@ -616,7 +617,7 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-这些 phase 不进入 Turn durable status。
+这些phase不进入Turn durable status。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
 
 ### Waiting Approval
 

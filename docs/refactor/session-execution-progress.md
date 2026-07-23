@@ -133,7 +133,7 @@ pi的关键特征：
 | 迟到operation result校验 | 无execution version校验 | Turn/task identity提供部分隔离 | actor/task cancellation，细节未完全公开 | 内部未知 | 内部未知 | 已定：TurnId+execution_version+OperationType |
 | restart恢复active execution | 无；只重建messages | resume history，不恢复旧task | session/checkpoint恢复，不恢复旧future | resume/tasks可见 | checkpoint行为可见 | 已定：不恢复旧I/O，保守terminalize |
 | 每次模型调用刷新上下文 | 有，prepareNextTurn可替换 | 有StepContext refresh | 有动态reminder/interjection | 内部未知 | 内部未知 | 明确无：active Turn保持exact pin |
-| Compaction | 有，post-run/overflow/auto | 有，pre/mid/manual/model-switch | 有独立compaction engine | 行为可见，内部未知 | 行为可见 | 阶段8设计，Session execution协调 |
+| Compaction | 有，post-run/overflow/auto | 有，pre/mid/manual/model-switch | 有独立compaction engine | 行为可见，内部未知 | 行为可见 | 阶段8已确定strict stable suffix方案，由SessionExecutor协调 |
 
 ## 从pi保留什么
 

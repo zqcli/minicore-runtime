@@ -487,6 +487,8 @@ docs/refactor/compaction.md
 - cut 不拆散 ToolCall/ToolResult 或其他协议稳定单元；
 - compacted conversation 可从 storage 重建。
 
+状态：目标设计已完成，见[Compaction架构设计](compaction.md)和[ADR 0027](../adr/0027-compaction-uses-strict-stable-suffix.md)。首版采用portable rolling summary、strict stable-unit cut、连续retained suffix和有界active-Turn recovery；不实现split-turn、manual、hierarchical或provider-native compaction。
+
 ### 阶段 9：Runtime interface 与公开协议
 
 目标文档：
@@ -690,7 +692,7 @@ Runtime facade 是唯一外部入口
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
 - [x] Conversation/SessionStorage durable ownership、entry tree、fork 和 recovery 已确定；
-- [ ] compaction orchestration 的完整行为有确定定义；
+- [x] compaction orchestration、stable cut、StoredCompaction和bounded recovery有确定定义；
 - [ ] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [ ] 新文档已进入正式架构目录；
@@ -704,7 +706,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 按照本文顺序，下一份目标设计文档是：
 
 ```text
-docs/refactor/compaction.md
+docs/refactor/runtime-interface.md
 ```
 
-ModelGateway已确定为“exact TurnModelSnapshot + one deep generate_model_turn operation + private provider adapters”。下一阶段需要冻结Compaction orchestration；公开Runtime protocol仍留到Compaction稳定后冻结。
+Compaction已确定为“portable rolling summary + strict stable-unit cut + contiguous retained suffix + one StoredCompaction entry + bounded active-Turn recovery”。下一阶段冻结Runtime command/query/event/snapshot协议，包括manual `CompactSession`是否需要独立Session maintenance state；生产实现仍需Rig integration spike、SessionExecutor、ModelGateway provider adapter和Compaction测试共同验证。
