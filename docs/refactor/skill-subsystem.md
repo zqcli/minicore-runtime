@@ -409,7 +409,8 @@ SkillInjector
 → 如何把 LoadedSkill 转换为 Prompt contribution
 
 Prompt
-→ 将 contribution 规范化进 committed MessageRecord，并从 committed conversation 组装模型输入
+→ 将contribution规范化进User/Steer MessageRecord
+→ Session execution append/apply后，从committed conversation组装模型输入
 ```
 
 `SkillInjector` 不执行 discovery、Catalog filtering、文件读取、cache lookup 或 Skill 选择。
@@ -438,7 +439,8 @@ Turn admission
 → committed UserMessage / Steer
 
 模型触发的 Skill Tool
-→ complete ToolRound commit
+→ append truthful tool message
+→ append tool_round_completed
 
 下一次模型调用
 → 只从 committed conversation 组装
@@ -522,7 +524,7 @@ SkillService 保存结构化 diagnostics。Catalog 可以返回有效 entries �
 - SkillInjector 不能决定选择哪个 Skill；
 - SkillContributionRef 必须把 catalog revision、version、content hash 和 source stamp 贯穿到 Prompt contribution；
 - Prompt 不能执行 Skill discovery 或 load；
-- SkillInjection 必须进入 committed UserMessage、Steer 或完整 ToolRound，不能作为未提交 current-call 旁路；
+- 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message并由`tool_round_completed`promote，不能作为current-call旁路；
 - SkillService 不决定哪个 Turn 使用哪个 Skill；
 - cache 和 load state 不进入领域对象；
 - active 使用中的不可变内容不被 reload 原地修改。
@@ -551,7 +553,7 @@ SkillService 保存结构化 diagnostics。Catalog 可以返回有效 entries �
 - [x] 确定 Turn execution 决定本次执行使用哪个 Skill。
 - [x] 确定 TurnExecutionContext pin SkillCatalogContext、SkillCatalog 和 fingerprint。
 - [x] 确定 SkillInjector 只负责 LoadedSkill 到 PromptContribution 的转换。
-- [x] 确定 Skill contribution 必须固化到 committed MessageRecord 或完整 ToolRound。
+- [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message + `tool_round_completed`进入conversation。
 - [x] 确定 cache 失效不修改已经返回的不可变 LoadedSkill。
 - [ ] 定义 SkillMetadata 和 SkillContent 的最终字段。
 - [x] 定义 SkillCatalogContext 的 Session/Agent identity 与 WorkspaceSkillContext 输入。

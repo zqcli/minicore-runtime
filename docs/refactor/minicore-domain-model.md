@@ -39,7 +39,7 @@ LoadState
 本阶段暂不设计：
 
 - Session、Turn 等其他模块的 manager、actor 或 execution owner 最终划分；
-- 已定义 SessionStorage JSONL batch log 的 adapter 实现，以及 catalog/loaded-runtime registry；
+- 已定义 SessionStorage by-entry JSONL tree 的 adapter 实现，以及 catalog/loaded-runtime registry；
 - Model 的内部结构；
 - Prompt source、cache、fingerprint 和内容组装的实现细节；
 - Tool 的注册、披露、执行、权限和 Sandbox 实现细节；
@@ -97,14 +97,14 @@ Item            1 ── N Interaction
 - Skill 暂不区分 Runtime、Agent、Session 或 Turn 等配置层级；
 - RuntimePrompts、AgentDefinition、SessionDefinition 保存各自 scope 的 Prompt 配置或稀疏覆盖；
 - TurnExecutionContext pin WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 TurnModelSnapshot；Turn 领域对象不持有这些执行期对象；
-- Turn execution 包含并驱动底层 AgentLoop，但 AgentLoop 不拥有 storage、Tool execution、Prompt assembly 或 terminal commit；
+- Turn execution 包含并驱动底层 AgentLoop，但 AgentLoop 不拥有 storage、Tool execution、Prompt assembly 或 terminal append；
 - 每次逻辑模型调用由 committed conversation checkpoint 与 `AssembledModelContext` 确定，不增加 ModelStep 领域类型、ID 或 registry；
 - Turn 执行期间只通过 pinned SkillCatalogEntryRef 按需加载 Skill，并交给 Injection 层形成可提交的输入材料；
 - 实际加载状态不进入 Definition，由对应子系统单独维护；
 - 同一个 PromptDefinition 可以在不同 Session 中具有不同的启用和可见状态；
 - SessionDefinition pin exact `AgentRevisionRef`；Agent current update 不自动改变既有 Session；
 - Turn 不持有 `AgentId`、`AgentRevisionRef`、SessionDefinition 或 Workspace；
-- Turn 从 initiating UserMessage start batch commit 开始，到 terminal batch commit 结束；
+- Turn 从 initiating UserMessage entry append 开始，到 final AssistantMessage、TurnInterrupted 或 TurnFailed entry append 结束；
 - Steer 是 current Turn control input；FollowUp 在当前 Turn terminal 后开启新 Turn；
 - Item 的最小集合是 UserMessage、AgentMessage、Reasoning 和 ToolInvocation；
 - ToolCall 与 ToolResult 属于同一个 ToolInvocation Item；
@@ -222,7 +222,7 @@ Model 的 identity、字段、状态和生命周期将在后续设计中单独�
 
 ### Turn
 
-Turn 表示从 committed initiating UserMessage 到一个 terminal batch 的用户意图执行过程。
+Turn 表示从 committed initiating UserMessage 到一个 terminal entry 的用户意图执行过程。
 
 ```rust
 pub struct Turn {
@@ -235,11 +235,12 @@ pub struct Turn {
 
 Turn 逻辑上拥有有序 Items，但 durable Turn head 不内联 `Vec<Item>`；Item 顺序由 SessionStorage projection 提供。
 
-Turn 不直接持有 Agent identity 或 Workspace。active/recovered Turn 通过 start batch 关联的 exact execution metadata 解析：
+Turn 不直接持有 Agent identity 或 Workspace。active/recovered Turn 通过 initiating UserMessage 引用的 TurnContext entry 解析 exact execution metadata：
 
 ```text
 TurnId
-→ committed TurnStarted execution metadata
+→ initiating UserMessage.context_entry_id
+→ committed TurnContext entry
 → exact SessionDefinitionRevision
 → exact AgentRevisionRef
 → exact Workspace/Prompt/Tool/Skill/Model references
@@ -257,13 +258,13 @@ session_definition
 workspace
 ```
 
-Turn 使用的 exact Model、Prompt、Workspace、Tool、Skill 和 Agent/Session definition references 属于 start batch execution metadata，不重复保存在 Turn head。
+Turn 使用的 exact Model、Prompt、Workspace、Tool、Skill 和 Agent/Session definition references 属于 TurnContext entry，不重复保存在 Turn head。
 
-Turn 领域对象不持有 PromptSet、Prompt fingerprint 或完整 Prompt definitions。Session execution 在 admission 期间捕获 exact SessionDefinitionRevision 和 AgentRevisionRef，再创建执行期不可变 PromptSet。PromptSet 规范化 initiating UserMessage；只有 start batch 成功 commit 后领域 Turn 才正式开始。Prompt fingerprint 属于 execution metadata。完整规则见 [Prompt 子系统架构设计](prompt-subsystem.md)。
+Turn 领域对象不持有 PromptSet、Prompt fingerprint 或完整 Prompt definitions。Session execution 在 admission 期间捕获 exact SessionDefinitionRevision 和 AgentRevisionRef，再创建执行期不可变 PromptSet。PromptSet 规范化 initiating UserMessage；只有该 UserMessage 成功 append 后领域 Turn 才正式开始。Prompt fingerprint 属于 TurnContext entry。完整规则见 [Prompt 子系统架构设计](prompt-subsystem.md)。
 
 Turn 领域对象不持有 Tool、ToolSet、ToolSpec 或 executor。candidate admission 在第一次模型调用前通过 Runtime 的 `ToolService::for_turn(...)` 创建执行期 `ToolSet`。同一 Turn 内的全部 LLM → Tool → LLM 循环复用该 ToolSet，Turn terminal 后释放。`for_turn` 不创建 Turn，也不修改 TurnStatus。完整规则见 [Tool 子系统架构设计](tool-subsystem.md)。
 
-Turn 不持有 Skill、SkillCatalog、LoadedSkill 或 Skill snapshot。Turn execution 只使用本 Turn pinned Catalog 的 `SkillCatalogEntryRef` 按需加载正文；SkillInjection 必须进入 CanonicalUserMessage、Steer 或完整 ToolRound 等 committed fact，不能成为未提交的模型可见旁路。
+Turn不持有Skill、SkillCatalog、LoadedSkill或Skill snapshot。Turn execution只使用本Turn pinned Catalog的`SkillCatalogEntryRef`按需加载正文；用户侧SkillInjection必须进入CanonicalUserMessage或Steer，模型触发的Skill Tool输出必须进入role=tool message并由`tool_round_completed`promote，不能成为未append/apply的模型可见旁路。
 
 ### Turn Execution
 
@@ -272,10 +273,10 @@ Turn execution 是领域 Turn 外围的执行过程，不增加新的领域层�
 ```text
 admission reservation
 → TurnExecutionContext capture
-→ initiating UserMessage commit
+→ TurnContext + initiating UserMessage append
 → AgentLoop drive
-→ model / Tool / commit loop
-→ terminal commit
+→ model / Tool / append/apply loop
+→ terminal entry append
 ```
 
 ```rust
@@ -297,7 +298,7 @@ pub(crate) struct TurnExecutionContext {
 
 `TurnExecutionContext` 是不可变 execution binding，不是 Service、领域 entity 或通用 Resource owner。逻辑模型调用只由 committed conversation checkpoint、调用 purpose、output contract 和 `AssembledModelContext` 共同确定，不需要新增 `ModelStep` struct、ID、CRUD、registry 或持久生命周期。
 
-Turn execution 包含并驱动 AgentLoop。`NeedModel / NeedTools / Finished` 只是 private adapter 的行为词汇，不冻结成新的领域 enum 或公开 trait；Prompt assembly、Tool execution、commit gate、Steer、FollowUp、cancellation 和 terminal status 由 Session execution owner 负责。
+Turn execution包含并驱动AgentLoop。`NeedModel / NeedTools / Finished`只是private adapter的行为词汇，不冻结成新的领域enum或公开trait；Prompt assembly、Tool execution、append/apply conversation gate、Steer、FollowUp、cancellation和terminal status由Session execution owner负责。
 
 完整边界、interface、pinning、逻辑模型调用、AgentLoop、fingerprint 和 recovery 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
@@ -390,7 +391,7 @@ Interaction 的归属关系固定为：
 Interaction → Item → Turn → Session → Agent
 ```
 
-request 必须先 commit 再通知 host；resolution 必须携带 durable idempotency key，并先 commit 再唤醒 waiter或执行 Tool。expires_at 在同一 commit gate 校验；transport disconnect 不自动关闭 Pending Interaction，reconnect 使用相同 RequestId 重发。host restart baseline 在 recovery batch 中关闭 pending request并中断 Turn。
+request 必须先 append 再通知 host；resolution 必须携带 durable resolution key，并先 append 再唤醒 waiter或执行 Tool。expires_at 在同一 append gate 校验；transport disconnect 不自动关闭 Pending Interaction，reconnect 使用相同 RequestId 重发。host restart baseline 使用稳定 operation key 逐 entry 关闭 pending request并中断 Turn。
 
 结构化 Interaction response 不是 UserMessage，不开启新 Turn。完整 family、timeout、race 和 recovery 规则见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
@@ -463,7 +464,7 @@ candidate Turn admission
       └─ execute(ToolExecutionRequest[]) → ToolExecutionOutcome[]
 ```
 
-`ToolService::for_turn(...)` 从 Turn admission 的执行边界开始：Session execution 已预留 candidate Turn identity，但领域 Turn 尚未对外发布。该方法不创建领域 Turn，不改变 TurnStatus，也不属于 Turn 对象。返回的 ToolSet 只存在于执行期；若 start commit 失败，直接随 candidate Context 释放。
+`ToolService::for_turn(...)` 从 Turn admission 的执行边界开始：Session execution 已预留 candidate Turn identity，但领域 Turn 尚未对外发布。该方法不创建领域 Turn，不改变 TurnStatus，也不属于 Turn 对象。返回的 ToolSet 只存在于执行期；若 initiating UserMessage append 失败，直接随 candidate Context 释放。
 
 领域投影固定为：
 
@@ -475,7 +476,7 @@ Tool approval request / decision
 → Interaction，归属于对应 ToolInvocation Item
 ```
 
-ToolInvocation Started 可以作为 durable operational truth，但只有 Completed invocation 随完整 ToolRound commit 后才进入模型 conversation；executor/side-effect outcome unknown 时进入 Abandoned，不构造 synthetic ToolResult。
+assistant tool_call content使ToolInvocation成为durable Started；matching role=tool message append使它成为Completed operational state。Completed本身不授予模型可见性，只有后续`tool_round_completed`引用完整assistant/tool sequence后才进入模型conversation；executor/side-effect outcome unknown时进入Abandoned，不构造synthetic ToolResult。
 
 Tool 注册、ToolSpec、Direct/Deferred/Hidden 披露、参数校验、Hook、policy、approval、Sandbox、并发和稳定结果顺序以 [Tool 子系统架构设计](tool-subsystem.md) 为权威。
 
@@ -501,7 +502,7 @@ TurnExecutionContext
 
 Skill Catalog 只包含名称、描述、路径、作用域和内容 identity 等轻量 metadata。完整 Skill 内容由 SkillService 在 Turn 执行期间确定需要后按需加载、解析并缓存。
 
-Turn 对象不持有 Skill，也不保存 Catalog、LoadedSkill 或 Skill snapshot。SkillService 不决定哪个 Turn 使用哪个 Skill；该决定属于 Turn execution。Injection 层只负责把已加载内容转换为 typed contribution，随后必须由 PromptSet 规范化进 committed UserMessage、Steer 或完整 ToolRound。
+Turn对象不持有Skill，也不保存Catalog、LoadedSkill或Skill snapshot。SkillService不决定哪个Turn使用哪个Skill；该决定属于Turn execution。Injection层只负责把已加载内容转换为typed contribution；用户侧contribution由PromptSet规范化进UserMessage/Steer entry，模型触发的Skill Tool输出走tool message + `tool_round_completed`路径。
 
 Skill 子系统的对象、interface、渐进披露、cache、失效和 diagnostics 规则以 [Skill 子系统架构设计](skill-subsystem.md) 为权威。
 
@@ -724,7 +725,7 @@ pub enum TurnStatus {
 
 基础不变量：
 
-- start batch commit 后 Turn 首先处于 `Running`；
+- initiating UserMessage entry append 后 Turn 首先处于 `Running`；
 - terminal status 是 `Completed | Interrupted | Failed`；
 - terminal Turn 不可恢复为 Running；
 - 一个 Session 同时最多存在一个 Running Turn；
@@ -789,9 +790,9 @@ Resolved 只表示 request 已关闭，不表示已批准、成功或 Tool 已�
 Turn 的定义是：
 
 ```text
-initiating UserMessage 所在 start batch 成功 commit
+initiating UserMessage entry 成功 append
 → Turn Running
-→ Completed / Interrupted / Failed terminal batch 成功 commit
+→ final AssistantMessage / TurnInterrupted / TurnFailed entry 成功 append
 ```
 
 由此得到以下基础不变量：
@@ -803,7 +804,7 @@ initiating UserMessage 所在 start batch 成功 commit
 - approval response 不是 UserMessage，不开启新 Turn；
 - ToolResult 不是 UserMessage，不开启新 Turn；
 - Turn terminal 后才能开始下一条普通 UserMessage 对应的新 Turn；
-- Steer 若继续当前 Turn，必须是 control input，成功 commit 后才影响下一次逻辑模型调用；
+- Steer 若继续当前 Turn，必须是 control input，成功 append 后才影响下一次逻辑模型调用；
 - FollowUp 只表示“当前 Turn terminal 后提交下一条普通 UserMessage”，因此开启新 Turn 并捕获新 TurnExecutionContext；
 - FollowUp 不属于 TurnControl，也不形成独立领域 entity。
 
@@ -821,10 +822,8 @@ AgentRevision
 AgentRevisionRef
 SessionId
 SessionDefinitionRevision
-BatchId
 EntryId
-LeafId
-IdempotencyKey
+OperationKey
 TurnId
 ItemId
 RequestId
@@ -841,7 +840,7 @@ Agent.id
 AgentDefinition: AgentId + AgentRevision
 Session.id + Session.current_revision
 SessionDefinition.agent: AgentRevisionRef
-StoredSessionBatch: BatchId + parent LeafId + resulting LeafId（由最后 EntryId 生成）
+StoredSessionEntry: EntryId + parent_id + operation_key
 Turn.id + Turn.session_id
 Item.id + Item.turn_id
 Interaction.request_id + session_id + turn_id + item_id
@@ -853,16 +852,17 @@ SkillId + DefinitionVersion
 
 已经固定：
 
-- `parent_leaf: LeafId` 形成 Session 内 batch tree；LeafId 只能来自 batch-result EntryId，不建立 BranchId；
-- Item/Interaction/Tool operational facts 可以映射到多个 StoredRecord；
-- fork remap BatchId、EntryId、LeafId、TurnId、ItemId、RequestId 和 operation key；
+- `parent_id: Option<EntryId>` 形成 Session 内 entry tree，不建立 BranchId；
+- Item/Interaction/Tool operational facts 可以由多个 Message/Event entries 投影；
+- fork remap EntryId、TurnId、ItemId、RequestId 和 operation key，以及所有 target-local nested references；
 - fork preserve ToolCallId 与 exact content/definition semantics。
 
 仍未定义：
 
 - 各 ID 的具体编码和全局唯一范围；
 - ToolCallId 的 provider exact echo adapter；
-- physical retention/vacuum 后 EntryId 的长期可达性。
+- physical retention/vacuum 后 EntryId 的长期可达性；
+- operation key 的具体编码和 namespace。
 
 ## 领域所有权
 
@@ -880,8 +880,8 @@ SkillId + DefinitionVersion
 | 当前 WorkspaceSnapshot | loaded Session execution state；Turn 执行上下文 pin 不可变引用 |
 | canonical roots / effective grants / Workspace views | WorkspaceResolver 解析和 WorkspaceSnapshot 投影 |
 | persisted trust / managed Workspace policy | WorkspaceAuthority adapter 或其后端 store |
-| Session ledger / BatchId / EntryId / LeafId / current leaf | SessionStorage |
-| Turn exact Model / Prompt / execution references | TurnStarted storage record |
+| Session ledger / EntryId / operation key / current leaf | SessionStorage |
+| Turn exact Model / Prompt / execution references | TurnContext storage entry |
 | Turn | Session |
 | Item semantic ownership | Turn；durable projection 来自 SessionStorage |
 | Interaction semantic ownership | Item；durable projection 来自 SessionStorage |
@@ -896,7 +896,7 @@ SkillId + DefinitionVersion
 - 哪个 actor 或 manager 持有 mutable state；
 - Definition content 是内联值还是 immutable content reference；
 - scope definitions 是新增定义、完整集合还是只保存引用；
-- Session execution owner 如何构造 validated SessionWriteBatch；
+- Session execution owner 如何构造 validated SessionEntryDraft；
 - Runtime 是否允许多个 Agent 或 Session 同时 active。
 
 ## 最小代码骨架
@@ -1015,7 +1015,7 @@ pub struct Interaction {
 - [x] 使用 Enabled/Disabled/Deleted 与 Open/Archived/Deleted。
 - [x] 定义 Session load/readiness/execution state 和 TurnExecutionPhase。
 - [x] 确定 WaitingApproval 和 Steer 不使 Turn 进入 Interrupted。
-- [x] 确定 Turn 从 initiating UserMessage start commit 开始，到 terminal batch commit 结束。
+- [x] 确定 Turn 从 initiating UserMessage entry append 开始，到 final AssistantMessage、TurnInterrupted 或 TurnFailed entry append 结束。
 - [x] 定义 Agent、Session、Turn、Item 和 Interaction 的基础状态。
 - [x] 固化 Runtime 初始化 SkillService、loaded Session execution 注入、Turn 按需使用的 Skill 子系统关系。
 - [x] 确定 Turn 对象不持有 Skill、Catalog、LoadedSkill 或 Skill snapshot。
@@ -1031,17 +1031,17 @@ pub struct Interaction {
 - [x] 确定 ItemType/ItemStatus 从 ItemContent 派生，不独立保存。
 - [x] 合并 ToolCall/ToolResult 为同一个 ToolInvocation Item。
 - [x] 定义 ToolInvocation Started/Completed/Abandoned 和 outcome-unknown recovery。
-- [x] 定义 Interaction request/resolution、commit ordering、reconnect 和 timeout。
+- [x] 定义 Interaction request/resolution、append-before-notify/wake ordering、reconnect 和 timeout。
 - [x] 确定 terminal Turn 不保留 Pending Interaction 或 Started Item。
-- [x] 定义 SessionWriter 唯一写 seam、JSONL batch log、StoredRecord 和 commit receipt。
+- [x] 定义 SessionWriter 唯一 append seam、by-entry JSONL tree、Message/Event schema 和 append receipt。
 - [x] 定义 CommittedConversationState/Delta/Checkpoint 和 trusted apply。
-- [x] 定义 parent_leaf branch tree、stable checkpoint 和 fork identity remap。
+- [x] 定义 EntryId/parent_id history tree、stable checkpoint 和 fork identity remap。
 - [x] 定义 partial tail、strict corruption 和 conservative recovery。
 - [ ] 定义 PromptDefinition 的完整字段和内容 identity。
 - [ ] 定义 scope 合并规则。
 - [ ] 定义 Model。
 - [x] 定义 Item type 和 content。
 - [x] 定义 Interaction family。
-- [x] 定义 Session conversation/storage identity、batch、projection 和 recovery。
+- [x] 定义 Session conversation/storage identity、entry tree、projection 和 recovery。
 - [ ] 定义 public protocol。
 - [ ] 定义 manager 和 execution ownership。

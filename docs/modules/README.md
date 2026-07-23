@@ -2,6 +2,8 @@
 
 本目录按可实现的 MiniCore runtime 模块组织文档。每个 md 对应一个需要编写的功能集合，描述它的 seam、interface、职责和不应承担的事情。下游 CLI、TUI、GUI 仓库通过 `AgentRuntimeProtocol` 接入这些模块，但不在本目录实现完整产品 UI。
 
+> 本目录当前仍包含 pre-refactor implementation contract。新目标架构以 `docs/refactor/` 和最新 ADR 为权威；SessionStorage 的 stable batch 设计已由 [ADR 0024](../adr/0024-session-storage-uses-by-entry-jsonl.md) supersede 为 by-entry JSONL。实现迁移完成前，本文档中的 batch 术语只描述旧实现边界。
+
 ## 分层图
 
 ```text
@@ -44,7 +46,7 @@ SessionRuntime actor ◀── private RunLink ── run-scoped RunTask ── 
 
 `SessionManager` 是工作区内会话生命周期 facade。它协调持久化会话目录、`SessionHandle` / `SessionStorage` 和内部 `LoadedSessionRuntimes`；factory 为每个 loaded session 启动 actor，`LoadedSessionRuntimes` 保存显式 `SessionRuntimeHandle`，不作为独立架构层。
 
-`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending stable batch drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment，并通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；新的显式 user turn / work chain 从 `ResourceManager.capture_turn_resources(...)` 捕获 `TurnResourceSnapshot`，retry/recovery/active Steer/同 RunId rollover 复用该 snapshot，并从 committed-only `CommittedConversationState` 热视图构建 `ConversationSeed` 交给 `Driver.drive_conversation(...)`。
+`SessionRuntime` 是单会话产品级编排层和 per-session actor。它持续处理 handle command 与 run control effect，管理阶段、当前 run projection、`PromptDelivery` admission、消息队列、结构化 `PendingSessionAction`、资源、模型状态、工具生命周期、pending entry drafts 和事件归约；每次公开启动的 run 由短期 `RunTask` 持有 `Driver`，Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序 rollover 多个 segment，并通过私有 `RunLink` 回到 owner actor。每个 session 固定一个 workspace cwd；新的显式 user turn / work chain 从 `ResourceManager.capture_turn_resources(...)` 捕获 `TurnResourceSnapshot`，retry/recovery/active Steer/同 RunId rollover 复用该 snapshot，并从 committed-only `CommittedConversationState` 热视图构建 `ConversationSeed` 交给 `Driver.drive_conversation(...)`。
 
 `AgentRuntimeEvents` 是运行时事件生命周期模块。它定义 `agent_runtime_protocol::Event { ..., msg }`、事件命名、事件来源、started/delta/finished 配对、commit 后领域事实、重连和常见场景的事件顺序，供下游 UI reducer 消费。
 
@@ -62,9 +64,9 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 
 `Prompt` 是无状态提示词组装子系统，对应未来的 `prompt.rs` / `prompt/`。`SessionRuntime` 作为 Pull Master，把 captured `PromptResourceView` 与独立 `ToolPromptView` 交给 `Prompt.prepare_message_turn(...)`；`PreparedMessageTurn` pin resources、展开 intent、通过 `compose_user_message(...)` 产出 `CanonicalUserMessage`，并提供原子 `ModelContextProfile`。每次模型调用前，Driver 把该 profile 与 run-local ordered `LiveConversation`、typed transient context 交给纯 `Prompt.assemble_model_context(...)`，得到协议安全的 `AssembledModelContext`。它不是长期 `PromptManager` / `ContextManager`。
 
-`Tools` 是 `SessionRuntime` 内部的 session-scoped 工具子系统，对应未来的 `tools.rs` / `tools/`。它封装工具定义、registry、active tools、prompt catalog、policy、approval、grants、execution coordination、sandbox、mutation locks 和 executor implementations；新的 work chain 通过 `Tools.capture_turn_tools(...) -> TurnToolProfile` 原子获得同 fingerprint 的 `ToolPromptView` 与 run-only `ToolBatchInvoker`，active `RunTask` 再经 `DriverHost::execute_and_commit_tool_round(...)` / `ToolBatchInvoker.invoke_batch(...)` 进入工具管线，并且只有完整 `ToolRound` commit 成功后才把 delta 返回 Driver。`Driver` 不直接依赖 `Tools`，stable commit、审批 control 和公共事件仍由 `SessionRuntime` actor 拥有。
+目标架构中的`ToolService`是MiniCoreRuntime-owned深模块，通过`for_turn(...) -> ToolSet`原子绑定prompt view与executor snapshot。Session execution先append/apply assistant/intermediate entry，再执行ToolSet；每个truthful result独立append为tool message，只有`tool_round_completed`append/apply后才把完整delta交给AgentLoop。旧`Tools`/`ToolBatchInvoker`细节仅保留在pre-refactor模块文档中。
 
-`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point、protected `EntryId` 集合、provider-neutral directive、`CompactionMethod` plan 和结果校验；它不构造 `ModelCallRequest`，也不组装模型上下文。MVP 使用 portable `SummaryModel`，后期可按当前模型 capability 使用 `ProviderNative`。压缩流程、外部调用、事件和 session 写入由 `SessionRuntime` 编排；commit 成功后 rebuild `ConversationSeed`。
+`Compaction` 是平级压缩能力模块，对应未来的 `compaction.rs`。它提供上下文 token 估算、压缩触发判断、cut point、protected `EntryId` 集合、provider-neutral directive、`CompactionMethod` plan 和结果校验；它不构造 `ModelCallRequest`，也不组装模型上下文。MVP 使用 portable `SummaryModel`，后期可按当前模型 capability 使用 `ProviderNative`。压缩流程、外部调用、事件和session写入由Session execution编排；Compaction entry append/apply成功后通过Replace projection rebuild `ConversationSeed`。
 
 `UsageStats` 是 token 消耗和上下文占用统计模块。它区分模型调用消耗、run 汇总、会话累计 stats 和当前 context usage；provider usage 归一化、本地估算、UI view 口径和压缩阈值计算都在这里统一说明。
 
@@ -78,7 +80,7 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 - [SessionRuntime](session-runtime.md)：单会话产品编排模块。
 - [AgentRuntimeProtocol](agent-runtime-protocol.md)：命令、领域分组查询、事件、快照和下游 adapter 协议。
 - [AgentRuntimeEvents](agent-runtime-events.md)：事件命名、`agent_runtime_protocol::Event` / `agent_runtime_protocol::EventMsg`、生命周期、顺序约束、commit 后领域事实和重连语义。
-- [SessionManager / SessionWriter / SessionStorage](session-manager.md)：会话生命周期、已加载会话运行时、统一 stable batch writer、session tree、JSONL 和上下文重建。
+- [SessionManager / SessionWriter / SessionStorage](session-manager.md)：pre-refactor实现说明；目标storage contract见[Conversation / SessionStorage](../refactor/conversation-storage.md)，使用统一by-entry writer、entry tree、JSONL和conversation projection。
 - [ResourceManager](resource-manager.md)：资源来源聚合、级联 snapshot、cwd overlay policy、刷新和诊断。
 - [CommandSurface](command-surface.md)：命令领域面、无状态 `CommandManager`、session-scoped `Command`、nested JSON command tree、dynamic providers、handler registry、执行前 resolve 和 UI 安全边界。
 - [RuntimeHooks](runtime-hooks.md)：后期内部 hook seam、hook/event 边界、capability、typed result、owner 分层和安全点。
@@ -91,7 +93,7 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 - [ModelGateway](model-gateway.md)：provider/model/auth 执行边界、custom provider、Rig provider adapter、usage/error/fallback 规则。
 - [Driver](driver.md)：Rig 状态机适配模块。
 
-事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)，hook owner 分层和延期实现记录在 [ADR 0015](../adr/0015-hook-owners-follow-runtime-boundaries.md)，command run policy 与 prompt delivery 的分离记录在 [ADR 0016](../adr/0016-separate-command-run-policy-from-prompt-delivery.md)，Prompt 的 immutable turn assembly 决策记录在 [ADR 0017](../adr/0017-prompt-uses-immutable-turn-assembly.md)，Command/Query/Event/Snapshot 分离记录在 [ADR 0018](../adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)，统一 session batch writer 记录在 [ADR 0019](../adr/0019-session-writes-use-one-trusted-batch-writer.md)，headless runtime 不拥有 current session 的决策记录在 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，per-session actor 与 run 执行分离记录在 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，单实例 workspace 薄边界记录在 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)，Transcript-First / `ConversationSeed` 决策记录在 [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)。行为与接口以各模块文档、协议文档、事件文档和 ADR 为权威，不再维护容易滞后的集中式开发路线图。
+事件协议的关键取舍记录在 [ADR 0003](../adr/0003-agent-runtime-events-use-event-msg-and-lifecycle-pairs.md)，hook 边界的关键取舍记录在 [ADR 0008](../adr/0008-runtime-hooks-are-internal-safe-point-seams.md)，provider/model 边界记录在 [ADR 0009](../adr/0009-model-gateway-wraps-rig-providers.md)，工具子系统边界记录在 [ADR 0011](../adr/0011-tools-are-session-scoped-subsystem.md)，命令体系边界记录在 [ADR 0012](../adr/0012-command-manager-is-stateless-session-command-facade.md)，driver 输入 seam 记录在 [ADR 0013](../adr/0013-driver-receives-driver-turn-input.md)，ModelGateway 实现顺序记录在 [ADR 0014](../adr/0014-model-gateway-spine-precedes-driver-integration.md)，hook owner 分层和延期实现记录在 [ADR 0015](../adr/0015-hook-owners-follow-runtime-boundaries.md)，command run policy 与 prompt delivery 的分离记录在 [ADR 0016](../adr/0016-separate-command-run-policy-from-prompt-delivery.md)，Prompt 的 immutable turn assembly 决策记录在 [ADR 0017](../adr/0017-prompt-uses-immutable-turn-assembly.md)，Command/Query/Event/Snapshot 分离记录在 [ADR 0018](../adr/0018-agent-runtime-separates-command-query-event-and-snapshot.md)，统一 session writer 的历史决策记录在 [ADR 0019](../adr/0019-session-writes-use-one-trusted-batch-writer.md)，其物理 batch 协议由 [ADR 0024](../adr/0024-session-storage-uses-by-entry-jsonl.md) supersede；headless runtime 不拥有 current session 的决策记录在 [ADR 0020](../adr/0020-agent-runtime-has-no-current-session.md)，per-session actor 与 run 执行分离记录在 [ADR 0021](../adr/0021-session-runtime-separates-actor-control-from-run-execution.md)，单实例 workspace 薄边界记录在 [ADR 0022](../adr/0022-workspace-is-single-instance-thin-boundary.md)，Transcript-First / `ConversationSeed` 决策记录在 [ADR 0023](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)。行为与接口以各模块文档、协议文档、事件文档和 ADR 为权威，不再维护容易滞后的集中式开发路线图。
 
 ## Rust 文件规划
 
@@ -115,10 +117,10 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 | `src/agent_runtime_protocol.rs` | [AgentRuntimeProtocol](agent-runtime-protocol.md)、[AgentRuntimeEvents](agent-runtime-events.md) | `AgentCommand` / `CommandAck`、领域分组 `RuntimeQuery` / `QueryResponse`、`Event` / `EventMsg`、`RuntimeSnapshot`、UI view 类型。 |
 | `src/agent_runtime_events.rs` | [AgentRuntimeEvents](agent-runtime-events.md) | 事件构造、sequence、生命周期断言和 event bus helper；不重新定义协议 enum。 |
 | `src/session_manager.rs` | [SessionManager / SessionStorage](session-manager.md) | 会话生命周期、loaded runtime map、open/fork/delete/close。 |
-| `src/session_storage.rs` | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | `SessionHandle`、`SessionWriter` / `SessionStorage` traits、stable batch 和 context 重建公共类型。 |
+| `src/session_storage.rs` | [Conversation / SessionStorage](../refactor/conversation-storage.md) | `SessionWriter::append`、`SessionEntryDraft` / `CommittedSessionEntry`、entry tree和projection重建公共类型。 |
 | `src/session_storage/memory.rs` | [SessionManager / SessionStorage](session-manager.md) | `InMemorySessionStorage` / 测试与 MVP 原型。 |
-| `src/session_storage/jsonl.rs` | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | 一行一个 committed batch 的 JSONL session adapter。 |
-| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | `SessionRuntimeHandle`、per-session actor loop、phase/queues/`PendingSessionAction`、run/post-run 编排、`ConversationSeed + DriverTurnInput` 投影、事件归约、稳定 batch commit、`RunTask` / `RunLink` 与 owned `SessionDriverHost`。 |
+| `src/session_storage/jsonl.rs` | [Conversation / SessionStorage](../refactor/conversation-storage.md) | Header后每行一个`StoredSessionEntry`的JSONL adapter。 |
+| `src/session_runtime.rs` | [SessionRuntime](session-runtime.md)、[Driver](driver.md) | per-session owner、phase/queues、Turn编排、`ConversationSeed`投影、sequential append/apply gate、external work fencing和terminal arbitration。 |
 | `src/resource_manager.rs` | [ResourceManager](resource-manager.md) | `ResourceManager`、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、overlay policy、cwd reload、diagnostics、prompt materials。 |
 | `src/prompt_templates.rs` | [PromptTemplates](prompt-templates.md)、[ResourceManager](resource-manager.md)、[CommandSurface](command-surface.md) | prompt template metadata/resource/catalog/invocation、frontmatter、参数解析和单次展开 helper；不拥有资源生命周期。 |
 | `src/command.rs` | [CommandSurface](command-surface.md) | command public module 和常用类型 re-export。 |
@@ -183,7 +185,7 @@ message-producing 输入统一经过 `CommandSurface.parse_message_intent(...) -
 | 事件顺序、生命周期、所有权、commit 后领域事实和重连 | [AgentRuntimeEvents](agent-runtime-events.md) | 描述本模块会触发哪些事件，不重新定义事件协议。 |
 | 运行时门面、工作区服务、事件通道 | [AgentRuntime](agent-runtime.md) | 只说明如何被调用或被拥有。 |
 | 单会话运行编排、phase、queue、当前 run、后期 run safe-point hooks | [SessionRuntime](session-runtime.md) | 只说明交给会话运行时编排的 seam。 |
-| 会话生命周期、统一 writer、session tree、JSONL、上下文重建 | [SessionManager / SessionWriter / SessionStorage](session-manager.md) | 只说明何时提交稳定 batch，不重复 writer 契约。 |
+| 会话生命周期、统一 writer、session tree、JSONL、上下文重建 | [Conversation / SessionStorage](../refactor/conversation-storage.md) | 只说明何时append/apply entry，不重复writer契约。 |
 | 资源生命周期、`ResourceSnapshotStore`、runtime/cwd/turn/step snapshots、cwd overlay policy、source info、diagnostics、prompt materials | [ResourceManager](resource-manager.md) | 只说明资源输入或输出，不扫描资源。 |
 | 命令领域面、`CommandManager` / `Command` 命名、nested JSON manifest、dynamic provider、handler registry、command catalog/suggestion/result 和 UI 安全边界 | [CommandSurface](command-surface.md) | 只说明某个命令会映射到什么运行时能力，不重复解析、resolve 和结果规则。 |
 | 后期 hook/event 边界、hook source/capability、typed result、hook 点和安全策略 | [RuntimeHooks](runtime-hooks.md) | 只说明何时触发 hook，不重复 hook 注册和权限规则。 |

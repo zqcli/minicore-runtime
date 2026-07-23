@@ -43,7 +43,7 @@ ToolService::for_turn(context) -> ToolSet
 3. Session execution 调用 `ToolService::for_turn(context)`；
 4. ToolService 原子捕获当前可用 Tool，并返回不可变 `ToolSet`；
 5. ToolSet 的 `prompt_view()` 被同一个 candidate Context 的 PromptSet 固定；
-6. start commit 成功后，同一 Turn 的所有模型调用和 ToolCall 执行复用该 ToolSet；
+6. initiating UserMessage append 成功后，同一 Turn 的所有模型调用和 ToolCall 执行复用该 ToolSet；
 7. admission 失败或 Turn 到达 terminal status 后释放 ToolSet。
 
 因此：
@@ -54,7 +54,7 @@ ToolService::for_turn(context) -> ToolSet
 - ToolService 不创建 Turn，也不修改 TurnStatus；
 - ToolSet 是执行期对象，不写入 Turn 领域对象。
 
-ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在该 Turn 内不改变。每次 ToolCall 的进度、terminal guard、approval waiter、cancellation 和资源锁属于执行状态，不改变 ToolSet 的有效工具快照。完整 admission、AgentLoop、commit gate 和 logical model-call 关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
+ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在该 Turn 内不改变。每次 ToolCall 的进度、terminal guard、approval waiter、cancellation 和资源锁属于执行状态，不改变 ToolSet 的有效工具快照。完整 admission、AgentLoop、append/apply conversation gate 和 logical model-call 关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
 ## 决策摘要
 
@@ -154,6 +154,7 @@ pub struct ToolExecutionRequest {
 pub enum ToolExecutionOutcome {
     Completed {
         item_id: ItemId,
+        source: ToolOutcomeSource,
         result: ToolResult,
     },
     Abandoned {
@@ -176,7 +177,7 @@ impl ToolSet {
 }
 ```
 
-`ToolExecutionOutcome::Completed` 是由 durable ToolOutcomeKnown 支撑的 truthful result candidate，但不是 Item completion；Session execution 只有在 atomic complete ToolRound batch 中才把对应 Item 投影为 `ToolInvocationState::Completed`。`Abandoned` 不进入 ToolRound。
+`ToolExecutionOutcome::Completed` 是truthful result candidate。Session execution把它append为matching `role = tool` message后，对应ToolInvocation进入Completed operational state；只有后续`tool_round_completed`event成功append后，该结果才进入模型conversation。`Abandoned`没有Tool message，也不进入ToolRound。
 
 ToolService 在 Runtime 初始化时一次性注入真实 seam：
 
@@ -634,7 +635,9 @@ pub struct ToolExecutionIntentStamp {
 
 pub enum ToolOutcomeSource {
     PreExecution,
-    Executed,
+    Executed {
+        execution_started_entry_id: EntryId,
+    },
 }
 
 pub(crate) trait ToolTurnPort: Send + Sync {
@@ -644,18 +647,11 @@ pub(crate) trait ToolTurnPort: Send + Sync {
         request: ToolApprovalRequest,
     ) -> Result<ToolApprovalDecision, ToolTurnPortError>;
 
-    async fn commit_execution_started(
+    async fn append_execution_started(
         &self,
         item_id: ItemId,
         intent: ToolExecutionIntentStamp,
-    ) -> Result<(), ToolTurnPortError>;
-
-    async fn commit_outcome(
-        &self,
-        item_id: ItemId,
-        source: ToolOutcomeSource,
-        result: ToolResult,
-    ) -> Result<ToolResult, ToolTurnPortError>;
+    ) -> Result<EntryId, ToolTurnPortError>;
 }
 
 pub trait ToolSandbox: Send + Sync {
@@ -668,18 +664,17 @@ pub trait ToolSandbox: Send + Sync {
 }
 ```
 
-ToolTurnPort 由 Session execution 提供，隐藏三条 durable ordering：
+ToolTurnPort由Session execution提供，隐藏approval和side-effect两条中途durable ordering：
 
 ```text
-InteractionRequested commit → host delivery
-InteractionResolved commit → waiter wake
-ToolExecutionStarted commit → side effect
-ToolOutcomeKnown(PreExecution | Executed) commit → Completed execution outcome
+InteractionRequested append → host delivery
+InteractionResolved append → waiter wake
+ToolExecutionStarted append → side effect
 ```
 
 TUI、RPC 和 Web 是 future Runtime interface 的 transport，不直接成为 ToolService adapter。ToolSandbox 仍可以有不同操作系统或容器 adapter。
 
-ToolTurnPort 是 crate-internal execution seam，不建立 InteractionService、ToolLedgerService 或第二 writer。其实现只能通过当前 SessionWriter 提交已定义 batch，并在返回前完成 storage-owned `apply_committed`；commit_execution_started 成功返回才允许 side effect，commit_outcome 成功返回才允许产生 Completed outcome。
+ToolTurnPort是crate-internal execution seam，不建立InteractionService、ToolLedgerService或第二writer。其实现只能通过当前SessionWriter append已定义event entry，并在返回前完成storage-owned `apply_committed`；`append_execution_started`成功返回exact `EntryId`后才允许side effect。ToolSet把该ID带入`ToolOutcomeSource::Executed`，Session execution随后用它构造可验证的role=tool message。
 
 审批请求至少包含：
 
@@ -719,7 +714,7 @@ pub enum ToolApprovalDecision {
 - 最终 PermissionSet 是 ToolRequirements、WorkspaceAccessView、ToolPolicy 上限、已有 grant 和 approval decision 的交集；
 - `AllowWith` 以 ToolPolicy 允许的 ToolRequirements 为上限，只能进一步收紧；交集无法满足执行要求时在 executor 前拒绝；
 - grant 使用明确 key 保存，不从一条 resolved Interaction 隐式推断；
-- ToolTurnPort unavailable 或任一 required durable commit 失败时，Ask 决策 fail closed且不执行 Tool；validation/policy/approval deny 可提交 PreExecution outcome，不伪造 ToolExecutionStarted；
+- ToolTurnPort unavailable或durable append已确定NotCommitted时，Ask决策fail closed且不执行Tool；OutcomeUnknown必须先按operation key reopen/replay，未解析前既不通知host也不执行Tool；validation/policy/approval deny返回PreExecution outcome，不伪造ToolExecutionStarted；
 - approval 通过后仍然执行 Sandbox；
 - Sandbox 执行失败不能静默回退到无 Sandbox 执行；
 - 是否允许经过新审批后进行 Sandbox escalation，留待具体工具策略决定。
@@ -800,19 +795,21 @@ ToolSet::execute(ToolExecutionRequest[])
 → ToolExecutionGate: workspace ceiling / policy / grant / approval
 → ToolResourceLocks
 → final control/revocation validation
-→ ToolTurnPort.commit_execution_started
+→ ToolTurnPort.append_execution_started → execution_started_entry_id
 → 再校验 revocation lease / cancellation
 → ToolSandbox
 → Tool::execute
 → raw outcome audit
 → PostToolUse
-→ ToolTurnPort.commit_outcome(Executed)
-→ ToolExecutionOutcome::Completed { durable ToolResult }
+→ ToolExecutionOutcome::Completed {
+     source = Executed { execution_started_entry_id },
+     ToolResult candidate
+   }
    或 Abandoned { reason }
 → 按原始 request 顺序返回
 ```
 
-在 commit_execution_started 之前形成的 exact validation/policy/approval/unavailable ToolResult 走 `commit_outcome(PreExecution)` 后返回 Completed；不进入 ToolSandbox，也不伪造 ToolExecutionStarted。若 durable write 已证明 NotCommitted，可保留 exact result并安全重试；若返回 SessionWrite OutcomeUnknown，ToolTurnPort 必须 reopen/replay 或按 operation key lookup，不能直接映射为 Abandoned。暂时无法解析时向 Session execution 返回 persistence-unresolved control error并进入 reload/recovery。只有 Tool side effect 本身 outcome unknown，或 crash 后 exact result 不可恢复，才返回/持久化 Abandoned。
+在append_execution_started之前形成的exact validation/policy/approval/unavailable ToolResult以`source = PreExecution`返回Completed；不进入ToolSandbox，也不伪造ToolExecutionStarted。Session execution随后append role=tool message。若该append已证明NotCommitted，只重试同一entry draft；若返回SessionWrite OutcomeUnknown，必须按operation key reopen/replay，不能直接映射为Abandoned。只有Tool side effect本身outcome unknown，或crash后exact result不可恢复，才返回/持久化Abandoned。
 
 所有调用来源必须进入该唯一执行路径：
 
@@ -839,11 +836,15 @@ loop {
     let output = model_gateway.generate(&assembled).await?;
 
     if output.tool_calls.is_empty() {
-        commit_final_agent_message(output).await?;
+        let final_entry = append_final_assistant_message(output).await?;
+        session_projections.apply_committed(&final_entry)?;
         break;
     }
 
-    let requests = start_tool_invocation_items(output.tool_calls).await?;
+    let assistant_entry = append_intermediate_assistant_message(output).await?;
+    session_projections.apply_committed(&assistant_entry)?;
+    let requests = tool_requests_from_committed_assistant(&assistant_entry)?;
+
     check_control_and_revocation_barrier()?;
     let outcomes = turn_context
         .tool_set
@@ -851,13 +852,23 @@ loop {
         .await;
 
     let results = require_all_completed_or_terminalize(outcomes).await?;
-    let receipt = commit_complete_tool_round(output, results).await?;
-    session_projections.apply_committed(&receipt)?;
+    let mut tool_entry_ids = Vec::with_capacity(results.len());
+    for result in results {
+        let tool_entry = append_tool_message(result).await?;
+        session_projections.apply_committed(&tool_entry)?;
+        tool_entry_ids.push(tool_entry.entry_id());
+    }
+
+    let completion = append_tool_round_completed(
+        assistant_entry.entry_id(),
+        tool_entry_ids,
+    ).await?;
+    session_projections.apply_committed(&completion)?;
     committed_conversation = session_projections.committed_conversation();
 }
 ```
 
-ToolSet 不决定 Turn 何时开始、完成、失败或中断，也不直接写 conversation。完整 ToolRound 成功 commit 后，结果才允许进入下一次逻辑模型调用。
+ToolSet不决定Turn何时开始、完成、失败或中断，也不直接写conversation。`tool_round_completed`成功append后，assistant/tool messages才允许进入下一次逻辑模型调用。
 
 ## Domain 投影
 
@@ -865,8 +876,8 @@ Tool 子系统与领域对象的关系：
 
 ```text
 模型返回 ToolCall
-→ Session execution 分配 ItemId
-→ durable ToolInvocation Item = Started
+→ Session execution append assistant/intermediate message
+→ assistant tool_call content分配ItemId并投影ToolInvocation = Started
 → ToolSet.execute(ToolExecutionRequest { item_id, call })
 
 ToolExecutionGate 需要外部审批
@@ -874,8 +885,9 @@ ToolExecutionGate 需要外部审批
 → Interaction 归属于同一个 ToolInvocation Item
 
 Tool 执行得到 truthful ToolResult
-→ complete ToolRound commit
+→ Session execution append role=tool message
 → 同一个 ToolInvocation Item = Completed { result }
+→ 全部calls匹配后append tool_round_completed
 
 side-effect outcome unknown
 → ToolInvocation Item = Abandoned
@@ -907,7 +919,7 @@ Tool locks
 | `Arc<ToolService>` 生命周期 | MiniCoreRuntime |
 | Tool registration、Hook、policy、grant、Sandbox、locks | ToolService 内部实现 |
 | 本 Turn 的有效工具快照 | TurnExecutionContext 内的 ToolSet |
-| 模型调用循环与 ToolRound commit | future Session execution owner |
+| 模型调用循环、Tool message和ToolRound completion | future Session execution owner |
 | ToolCall + ToolResult | 同一个 ToolInvocation Item |
 | Tool approval request/decision | ToolInvocation-owned Interaction |
 
@@ -967,7 +979,7 @@ CallToolTool / InvokeToolTool
 - 正常、denied、failed 和 confirmed-cancelled ToolCall 都产生 truthful ToolResult；
 - outcome-unknown ToolCall 不生成 ToolResult，对应 ToolInvocation 进入 Abandoned；
 - ToolExecutionOutcome 按原始 request 顺序返回；只有全部 Completed results 才能进入 complete ToolRound；
-- 完整 ToolRound commit 前 ToolResult 不进入下一次逻辑模型调用；
+- `tool_round_completed`前ToolResult不进入下一次逻辑模型调用；
 - ToolSet 不修改 Turn 状态，也不写回 Agent、Session、Turn 或 conversation storage。
 
 ## 后续问题
@@ -1001,11 +1013,11 @@ CallToolTool / InvokeToolTool
 - [x] 确定串行 preflight、并发执行、资源锁和稳定结果顺序。
 - [x] 确定 ToolCall、ToolResult 合并为同一个 ToolInvocation Item。
 - [x] 确定 Tool approval 是 ToolInvocation-owned durable Interaction。
-- [x] 确定 ToolTurnPort 由 Session execution 提供并遵守 approval、execution-start 和 outcome commit ordering。
+- [x] 确定ToolTurnPort由Session execution提供并遵守approval和execution-start ordering；Tool outcome由Session execution append为tool message。
 - [x] 确定 executor/side-effect outcome unknown 时 Abandoned，不生成 synthetic ToolResult。
-- [x] 确定 ToolInvocation/Interaction/ToolOutcome/ToolRound promotion 通过统一 SessionWriter batch log 持久化。
+- [x] 确定ToolInvocation/Interaction/ToolResult/ToolRound completion通过统一SessionWriter by-entry log持久化。
 - [ ] 定义 ToolName namespace 和 schema dialect。
 - [ ] 定义 ToolPolicy、grant、PermissionSet 和 ToolRequirements 的最终字段。
 - [ ] 定义 ToolSandbox adapter 和 ToolUpdate event。
-- [x] 定义 ToolCall、approval、execution-start、outcome 和 complete ToolRound 的持久化 commit baseline。
+- [x] 定义ToolCall、approval、execution-start、tool message和complete ToolRound的by-entry持久化baseline。
 - [ ] 定义 exact Tool executor identity 和 cold recovery 语义。
