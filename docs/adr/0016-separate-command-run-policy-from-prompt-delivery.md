@@ -4,6 +4,8 @@
 
 Accepted
 
+Amended by [ADR 0025](0025-loaded-session-uses-one-session-executor.md) and [ADR 0027](0027-compaction-uses-strict-stable-suffix.md): SessionExecutor replaces SessionRuntime as execution owner, and first-implementation Compaction does not expose running-time `/compact` or `QueueAfterRun` behavior. Manual compaction policy is deferred to the Runtime interface design.
+
 ## 决策
 
 MiniCore 不引入跨子系统的通用 `InputSchedule`。slash/catalog command 使用 `CommandRunPolicy { Immediate, IdleOnly, QueueAfterRun }` 决定 handler 在 active work 中立即执行、拒绝或保存为 typed `PendingSessionAction`；模型可见输入使用 `PromptDelivery { Steer, FollowUp, NextTurn }` 决定进入当前 run 的下一模型调用、当前 work 后的后续 run 或下一次显式用户 turn。`SessionRuntime` 是两类调度状态的唯一 owner，`CommandManager` 只解析和校验策略，`Driver` 只通过 `before_next_model_call` / `before_run_finish` 暴露消费安全点。

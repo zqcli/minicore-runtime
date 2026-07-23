@@ -1,6 +1,6 @@
 # Conversation 与 SessionStorage 架构设计
 
-状态：目标架构已按by-entry JSONL修订；compaction orchestration、公开protocol和实现待后续阶段完成
+状态：目标架构已按by-entry JSONL和strict Compaction overlay修订；公开protocol和生产实现待后续阶段完成
 日期：2026-07-16
 
 ## 目的
@@ -680,6 +680,20 @@ Interrupted/Failed event不向model conversation追加synthetic assistant messag
 
 ## Compaction Entry
 
+`ConversationBoundary`引用一个完整model-visible stable unit：
+
+```rust
+pub struct ConversationBoundary {
+    pub unit_first_entry_id: EntryId,
+    pub unit_last_entry_id: EntryId,
+    pub unit_fingerprint: StableConversationUnitFingerprint,
+}
+
+pub struct StableConversationUnitFingerprint(pub ContentHash);
+```
+
+`summarized_through`表示最后一个被摘要unit，inclusive；`retained_from`表示第一个原样保留unit，inclusive。writer通过source projection证明两者在ordered stable-unit sequence中相邻。`unit_fingerprint`覆盖unit kind、ordered model-visible content和backing reference shape，但不覆盖storage-local EntryId，因此fork remap first/last EntryId后fingerprint保持不变。
+
 ```rust
 pub struct StoredCompaction {
     pub turn_id: Option<TurnId>,
@@ -707,12 +721,17 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 规则：
 
 - source checkpoint和TranscriptFingerprint必须exact match；
-- cut不能拆分initiating user、complete ToolRound或final assistant model-visible unit；
+- summarized range必须是连续prefix，retained range必须是连续suffix，两者在stable boundary相邻；
+- cut不能拆分Input/Steer UserMessage、complete ToolRound、final assistant或existing Compaction summary；
+- active-Turn automatic Compaction必须保护initiating UserMessage及其后的连续suffix；
+- caller不提交raw replacement messages；trusted projector从source、boundaries和summary构造`Replace([summary] + retained suffix)`；
 - compaction只追加overlay，不重写旧entries；
 - navigating/forking到compaction前的entry自然不应用该compaction；
-- SummaryModel产生的Compaction必须保存model_call；deterministic reduction没有provider调用时为None；
+- 首版automatic Compaction固定`turn_id = Some(active TurnId)`且必须保存SummaryModel `model_call`；`None`只为未来maintenance/deterministic method预留；
 - model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和retry语义；
 - physical retention/vacuum与conversation compaction分离。
+
+完整planning、protection和failure规则见[Compaction架构设计](compaction.md)。
 
 ## SessionWriter Append Algorithm
 
@@ -996,7 +1015,7 @@ remap：
 - User context_entry_id；
 - Tool source execution_started_entry_id；
 - ToolRoundCompleted assistant/tool entry refs；
-- Compaction checkpoint/protected refs；
+- Compaction checkpoint/protected refs，以及`summarized_through`/`retained_from` boundary中的`unit_first_entry_id`和`unit_last_entry_id`；
 - Fork provenance保留source identity但不能作为target operational reference。
 
 Fork不复制：
@@ -1030,7 +1049,7 @@ Compaction protection使用EntryId，但必须保护完整model-visible semantic
 - ToolRoundCompleted及其referenced assistant/tool entries；
 - final assistant entry。
 
-不允许cut产生孤立ToolCall或Tool message。
+automatic active-Turn Compaction还必须保护initiating UserMessage及其后的连续suffix。不允许cut产生孤立ToolCall、Tool message或从prefix中挖洞。
 
 ## Reload
 

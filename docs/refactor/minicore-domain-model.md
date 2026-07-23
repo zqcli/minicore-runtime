@@ -758,6 +758,7 @@ pub enum TurnStatus {
 ```rust
 pub enum TurnExecutionPhase {
     PreparingModel,
+    Compacting,
     Sampling,
     WaitingApproval,
     ExecutingTools,
@@ -765,7 +766,7 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-等待审批时 TurnStatus 仍为 Running，InteractionState 为 Pending，parent ToolInvocationState 为 Started。Steer默认排队到当前model/tool operation完成，不把Turn变为Interrupted。
+等待审批或Compaction时TurnStatus仍为Running。WaitingApproval时InteractionState为Pending且parent ToolInvocationState为Started；Compacting时不创建Item或Interaction。Steer默认排队到当前model/tool/compaction operation完成，不把Turn变为Interrupted。
 
 ### ItemStatus
 
@@ -1002,9 +1003,9 @@ pub struct Interaction {
 
 ## 后续设计顺序
 
-1. compaction orchestration。
+1. command、query、event、snapshot和transport protocol。
 2. Rig ModelGateway与AgentLoop adapter implementation spike。
-3. command、query、event、snapshot和transport protocol。
+3. SessionExecutor、ModelGateway provider adapter和Compaction生产实现。
 4. review、background work和按需Extension/Plugin。
 
 跨阶段 backlog：PromptDefinition priority/content identity、scope merge和Skill namespace/content identity；在对应消费方需要前闭合，不改变上述主路径顺序。
@@ -1035,6 +1036,7 @@ pub struct Interaction {
 - [x] 区分 Agent/Session durable lifecycle 与 loaded execution state。
 - [x] 使用 Enabled/Disabled/Deleted 与 Open/Archived/Deleted。
 - [x] 定义 Session load/readiness/execution state 和 TurnExecutionPhase。
+- [x] 定义Compaction ownership、stable-unit cut、current UserMessage protection、StoredCompaction和bounded recovery。
 - [x] 确定 WaitingApproval 和 Steer 不使 Turn 进入 Interrupted。
 - [x] 确定 Turn 从 initiating UserMessage entry append 开始，到 final AssistantMessage、TurnInterrupted 或 TurnFailed entry append 结束。
 - [x] 定义 Agent、Session、Turn、Item 和 Interaction 的基础状态。

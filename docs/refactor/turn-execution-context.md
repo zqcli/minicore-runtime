@@ -1,6 +1,6 @@
 # Turn 执行模块与执行上下文架构设计
 
-状态：目标架构已确定；Rig adapter、compaction和公开protocol实现待后续阶段完成
+状态：目标架构已确定；Rig adapter、Compaction和公开protocol生产实现待后续阶段完成
 日期：2026-07-16
 
 ## 目的
@@ -397,15 +397,22 @@ Turn 固定 baseline
 
 不能存在第四类“调用方临时传入、模型可见但没有append/apply或pin”的动态字符串。
 
-因此每次 assembly 的推荐输入为：
+因此assembly input按purpose使用closed variants：
 
 ```rust
-pub struct PromptAssemblyInput<'a> {
-    pub conversation: &'a CommittedConversationView,
-    pub output_contract: Option<&'a OutputContract>,
-    pub purpose: ModelCallPurpose,
+pub enum PromptAssemblyInput<'a> {
+    AgentRun {
+        conversation: &'a CommittedConversationView,
+        output_contract: Option<&'a OutputContract>,
+    },
+    CompactionSummary {
+        source: &'a CommittedConversationPrefixView,
+        directive: &'a CompactionSummaryDirective,
+    },
 }
 ```
+
+variant确定ModelCallPurpose。Compaction prefix同样来自CommittedConversationState的trusted view，不形成第四类临时model-visible input。
 
 不再接收：
 
@@ -466,12 +473,14 @@ SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated con
 AgentLoop 应保持 sans-I/O。它在逻辑上产生三类动作：
 
 ```text
-NeedModel { purpose, output_contract }
+NeedModel { output_contract }
 NeedTools { calls }
 Finished { message draft }
 ```
 
 具体 Rig/SDK adapter 可以使用自身最自然的 async stream、poll、callback 或 state enum 表达这些动作。当前不冻结 `AgentLoopFactory`、`AgentRun` 或 `AgentLoopAction` trait/enum；只有出现第二个真实 AgentLoop implementation 时才建立稳定 seam。
+
+NeedModel只表示普通`AgentRun`需要模型输出；CompactionSummary由SessionExecutor在AgentLoop之外启动，AgentLoop不能选择ModelCallPurpose。
 
 AgentLoop 不得：
 
@@ -640,26 +649,30 @@ partial stream 是 draft。retry 前关闭该 draft lifecycle，但不写入 con
 
 ## Compaction
 
-Compaction 改变 committed conversation，但不改变 TurnExecutionContext。
+Compaction改变committed conversation，但不改变TurnExecutionContext。完整规则见[Compaction架构设计](compaction.md)。
 
 ```text
-PromptSet::assemble 或 provider 返回 context overflow
-→ 丢弃当前未 append draft
-→ Compaction 选择 cut/protection/directive
+AgentLoop NeedModel安全点
+→ PromptSet assembly显示soft pressure/local overflow，或provider返回ContextOverflow
+→ Compaction选择strict stable-unit cut
+→ hard-protect active Turn initiating UserMessage和连续suffix
 → Context.assemble_model_context(
-     purpose = CompactionSummary,
-     output_contract = NoToolCalls
+     PromptAssemblyInput::CompactionSummary {
+       source: trusted_prefix_view,
+       directive,
+     }
    )
-→ summary model call
-→ append Compaction entry
-→ rebuild committed conversation projection
-→ 必要时重建 AgentLoop segment
+→ SummaryModel call
+→ revalidate source checkpoint/control/authorization
+→ append/apply StoredCompaction
+→ Replace committed conversation projection
+→ rebuild ConversationSeed和AgentLoop segment
 → 新的逻辑模型调用
 ```
 
-compaction model call 仍通过同一个 PromptSet 组装。`NoToolCalls` 保证本次输出不执行 Tool，但不建立第二个 Prompt assembly seam。
+Compaction summary call仍通过同一个PromptSet和exact TurnModelSnapshot。普通Agent/Session/Workspace/Tool/Skill静态instructions不进入summary；下一次AgentRun assembly从同一个TurnExecutionContext重新注入。
 
-同一 work chain 的自动 overflow recovery 必须有明确上限；再次超限时 fail closed，不能形成无限 compact-and-retry loop。
+`TurnExecutionPhase = Compacting`期间TurnStatus保持Running，Steer排队，Cancel和security revocation可以在append前获胜。当前Turn protected suffix自身过大时返回`ProtectedSuffixTooLarge`；首版不split Turn。同一Turn最多一次automatic overflow recovery，再次超限时fail closed。
 
 ## Cancellation 与 Security Revocation
 

@@ -93,7 +93,7 @@ _避免_：Hook 注册表、Driver、UI adapter、任意调用方
 _避免_：事件总线、插件管理器、工具执行器、会话存储
 
 **会话阶段（`SessionPhase`，pre-refactor protocol term）**：
-旧Runtime snapshot中的粗粒度状态。当前内部权威状态是`SessionExecutionState { Idle, Starting, Running, Finishing }`加`TurnExecutionPhase`；阶段8/9再决定公开snapshot是否保留SessionPhase projection。
+旧Runtime snapshot中的粗粒度状态。当前内部权威状态是`SessionExecutionState { Idle, Starting, Running, Finishing }`加`TurnExecutionPhase { PreparingModel, Compacting, Sampling, WaitingApproval, ExecutingTools, Committing }`；阶段9再决定公开snapshot是否保留SessionPhase projection。
 _避免_：SessionExecutor mutable state、ModelGateway attempt、durable TurnStatus
 
 **会话已稳定（`session_settled`）**：
@@ -189,7 +189,7 @@ _避免_：完整 prompt、用户消息、工具描述、实时资源查询
 _避免_：用户消息、命令文本、已展开 prompt、PendingSessionAction
 
 **Prompt子系统**：
-MiniCoreRuntime-owned `PromptService`和Turn-pinned `PromptSet`组成的模型上下文组装模块。`PromptSet.compose_user_message(PromptIntent)`是UserMessage规范化入口，`PromptSet.assemble(CommittedConversationView, purpose, output_contract)`是唯一provider-neutral模型上下文组装interface。它不拥有Session history、request queue、Tool execution、storage或provider调用。
+MiniCoreRuntime-owned `PromptService`和Turn-pinned `PromptSet`组成的模型上下文组装模块。`PromptSet.compose_user_message(PromptIntent)`是UserMessage规范化入口；`PromptSet.assemble(PromptAssemblyInput::AgentRun | CompactionSummary)`是唯一provider-neutral模型上下文组装interface，只接受trusted full/prefix conversation view和typed policy。它不拥有Session history、request queue、Tool execution、storage或provider调用。
 _避免_：PromptManager、ContextManager、ModelGateway内拼接messages
 
 **Turn提示词集合（`PromptSet`）**：
@@ -309,7 +309,7 @@ _避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owne
 _避免_：在SessionExecutor内部替代TurnId、模型调用id、ToolCallId、EntryId
 
 **待执行会话动作（`PendingSessionAction`）**：
-`SessionExecutor`接受`CommandRunPolicy::QueueAfterRun`后保存、并在当前Turn结束后执行的结构化Session操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。
+旧Runtime protocol中，`SessionExecutor`接受`CommandRunPolicy::QueueAfterRun`后保存、并在当前Turn结束后执行结构化Session操作。首版Compaction不接受running-time manual compact；阶段9若增加manual `CompactSession`，必须先定义独立Session maintenance/admission语义。PendingSessionAction不是用户消息，不进入Steer/FollowUp queue或模型上下文。
 _避免_：AgentCommand payload、QueuedMessage、writer 内部 batch draft、CommandManager pending action
 
 **当前运行状态（`CurrentRunState`，pre-refactor protocol term）**：
@@ -434,15 +434,15 @@ ModelGateway通过bounded ProgressEventPublisher发布的process-local attempt/d
 _避免_：durable Message、第二event log、cancellation token
 
 **压缩摘要指令（`CompactionSummaryDirective`）**：
-`Compaction` 根据压缩准备结果生成的摘要目标消息、typed instruction 和最大输出 token 预算。它不是 system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id 或工具 schema；`SessionExecutor`把它作为typed OutputContract/directive输入交给active或operation-scoped PromptSet的`assemble(..., purpose = CompactionSummary)`；exact orchestration留到阶段8。
+`Compaction`根据strict stable-unit plan生成的摘要格式、typed instruction和最大输出token预算。它不是system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id或工具schema；`SessionExecutor`把它和trusted `CommittedConversationPrefixView`交给active PromptSet的`CompactionSummary` assembly variant，固定`OutputContract::NoToolCalls`。完整规则见`docs/refactor/compaction.md`。
 _避免_：SummaryModelRequest、ModelCallRequest、AssembledModelContext、系统提示词状态
 
-**压缩方法（`CompactionMethod`）**：
-一次压缩的 provider-neutral 执行方式。MVP 使用 `SummaryModel`；后期可由模型 capability 提供 `ProviderNative` 专用端点，或使用有界 deterministic reduction fallback。用户配置表达preference，`SessionExecutor`按当前模型capability和trigger解析计划，不按模型名称硬编码。
-_避免_：GPT 压缩、Claude 压缩、provider endpoint 名、UI handler
+**压缩计划（`CompactionPlan`）**：
+从committed conversation、active Turn initiating UserMessage保护、stable-unit boundaries和context budget确定的crate-private immutable plan。首版固定使用portable rolling SummaryModel，不根据模型名称选择ProviderNative，也不使用deterministic conversation truncation。plan携带source checkpoint、summarized-through、retained-from、protected EntryIds和plan fingerprint；它不是durable entry或公开协议对象。
+_避免_：CompactionMethod、GPT压缩、Claude压缩、provider endpoint、UI handler
 
-**上下文限制错误（`DriverError::ContextLimitExceeded`）**：
-当前 Agent run 的下一次模型调用无法进入有效上下文窗口的 typed recovery class。`PromptAssembly` 表示本地最终上下文组装拒绝、未调用 provider；`Provider` 表示 provider 返回 context overflow。两者由`SessionExecutor`在当前Turn failure处理中共享一次compaction recovery，但保留 diagnostics 和 usage 来源差异。
+**上下文限制错误（`ContextOverflow`）**：
+当前Turn的下一次模型调用无法进入有效上下文窗口的typed recovery class。`PromptAssembly`表示PromptSet本地最终组装拒绝、未调用provider；`Provider`表示ModelGateway归约provider context overflow。两者由SessionExecutor共享一次bounded compaction recovery，但保留diagnostics和usage来源差异。
 _避免_：普通 retry error、Prompt admission rejection、模型可见 assistant message
 
 **驱动安全点**：

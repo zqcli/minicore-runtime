@@ -610,6 +610,17 @@ PromptSet instructions和ToolSpec在active Turn内天然稳定；Gateway可以�
 
 `PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint和OutputContract hash。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
+首版provider-neutral output contract至少包含：
+
+```rust
+pub enum OutputContract {
+    NoToolCalls,
+    Structured(StructuredOutputContract),
+}
+```
+
+`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，adapter必须拒绝该结果，不能把它交给SessionExecutor执行。
+
 ModelGateway可以：
 
 - 把System/Developer role映射成provider原生role；
@@ -686,6 +697,15 @@ purpose：
 - 不是retry classification；
 - 不是foreground/background状态；
 - 不因transport fallback、auth refresh或logical retry改变。
+
+`CompactionSummary`额外要求：
+
+- 使用active Turn exact model identity；
+- input由PromptSet的CompactionSummary variant产生；
+- `OutputContract::NoToolCalls`且ToolSpec为空；
+- 提供明确max_output_tokens；
+- 不进入AgentLoop，不把summary result解释成普通assistant response；
+- 不调用provider-native compact endpoint；首版仍是普通portable model generation。
 
 未来只有真实业务任务出现时才增加variant，例如SessionTitle；不能增加`Retry`或`Background`。
 
@@ -1495,7 +1515,7 @@ connection/continuation state
 full AssembledModelContext
 ```
 
-SummaryModel compaction把同一组model/response/usage/finish/logical-retry/fingerprint字段保存到`StoredCompaction.model_call`；没有provider调用的deterministic reduction使用None。
+首版automatic SummaryModel compaction把同一组model/response/usage/finish/logical-retry/fingerprint字段保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
 
 `retry_count`只表示Session logical retry。Gateway transparent retry count可以进入current-host diagnostics，但不作为domain lifecycle。
 

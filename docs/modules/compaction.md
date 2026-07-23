@@ -1,5 +1,7 @@
 # Compaction
 
+> **Pre-refactor implementation contract.** 当前目标设计见[Compaction架构设计](../refactor/compaction.md)和[ADR 0027](../adr/0027-compaction-uses-strict-stable-suffix.md)。目标架构使用SessionExecutor、by-entry StoredCompaction、strict stable-unit cut和portable rolling summary；本文中的SessionRuntime、SessionWriteBatch、manual/post-run和ProviderNative描述不再是MVP权威规则。
+
 `Compaction` 是会话级上下文压缩能力。MVP baseline 把当前会话路径上的旧历史摘要成一条 provider-neutral、模型可见的压缩摘要消息，并保留最近上下文；后期也可按当前模型 capability 使用 provider-native compact endpoint 生成 model-bound context replacement，使后续 Agent 运行在较小上下文中继续。按 Transcript-First 决策，`Compaction` 只产出 cut/protection/directive；模型上下文组装仍由 Prompt 完成，压缩 commit 后必须从 committed session path 重建新的 `ConversationSeed`。
 
 一句话边界：
