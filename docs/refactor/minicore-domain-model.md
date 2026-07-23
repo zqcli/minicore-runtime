@@ -38,7 +38,7 @@ LoadState
 
 本阶段暂不设计：
 
-- Session、Turn 等其他模块的 manager、actor 或 execution owner 最终划分；
+- SessionExecutor的具体scheduler/runtime实现；其ownership以[Session Execution架构设计](session-execution.md)为权威；
 - 已定义 SessionStorage by-entry JSONL tree 的 adapter 实现，以及 catalog/loaded-runtime registry；
 - Model 的内部结构；
 - Prompt source、cache、fingerprint 和内容组装的实现细节；
@@ -98,7 +98,7 @@ Item            1 ── N Interaction
 - RuntimePrompts、AgentDefinition、SessionDefinition 保存各自 scope 的 Prompt 配置或稀疏覆盖；
 - TurnExecutionContext pin WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 TurnModelSnapshot；Turn 领域对象不持有这些执行期对象；
 - Turn execution 包含并驱动底层 AgentLoop，但 AgentLoop 不拥有 storage、Tool execution、Prompt assembly 或 terminal append；
-- 每次逻辑模型调用由 committed conversation checkpoint 与 `AssembledModelContext` 确定，不增加 ModelStep 领域类型、ID 或 registry；
+- 每次逻辑模型调用由committed conversation checkpoint、purpose、output contract、effective max_output_tokens与`AssembledModelContext`确定，不增加ModelStep领域类型、ID或registry；
 - Turn 执行期间只通过 pinned SkillCatalogEntryRef 按需加载 Skill，并交给 Injection 层形成可提交的输入材料；
 - 实际加载状态不进入 Definition，由对应子系统单独维护；
 - 同一个 PromptDefinition 可以在不同 Session 中具有不同的启用和可见状态；
@@ -200,17 +200,19 @@ pub struct SessionDefinition {
     pub revision: SessionDefinitionRevision,
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
-    pub model: Model,
+    pub model: SessionModelConfig,
     pub prompts: SessionPrompts,
     pub created_at: Timestamp,
 }
 ```
 
+`SessionModelConfig`只保存ModelSelection、ReasoningPreference和可选max output token preference；provider definition、capabilities、endpoint和credential不进入SessionDefinition。Turn admission通过ModelGateway解析exact TurnModelSnapshot。
+
 一个 Session 的全部 revisions 只能引用同一个 AgentId。升级 Agent 只能选择该 Agent 的另一个 exact revision；切换到另一个 Agent 必须创建新 Session。
 
 Session 创建时 pin Agent 当时的 current revision。Agent 后续发布新 revision 不自动改变 active 或 future Turn；Session 必须通过新 SessionDefinitionRevision 显式升级。
 
-`SessionDefinitionRevision` 原子绑定 AgentRevisionRef、Workspace、Model 和 SessionPrompts。Workspace definition 更新同时产生新的 WorkspaceRevision 和外层 SessionDefinitionRevision。
+`SessionDefinitionRevision`原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts。Workspace definition 更新同时产生新的 WorkspaceRevision 和外层 SessionDefinitionRevision。
 
 Session 不持有 Runtime Service、WorkspaceSnapshot、SkillCatalog、ToolSet、PromptSet、conversation hot projection 或 active Turn。PromptService、ToolService、SkillService 和 ModelGateway 由 Runtime 注入 loaded Session execution。
 
@@ -296,9 +298,9 @@ pub(crate) struct TurnExecutionContext {
 }
 ```
 
-`TurnExecutionContext` 是不可变 execution binding，不是 Service、领域 entity 或通用 Resource owner。逻辑模型调用只由 committed conversation checkpoint、调用 purpose、output contract 和 `AssembledModelContext` 共同确定，不需要新增 `ModelStep` struct、ID、CRUD、registry 或持久生命周期。
+`TurnExecutionContext` 是不可变 execution binding，不是 Service、领域 entity 或通用 Resource owner。逻辑模型调用只由committed conversation checkpoint、调用purpose、output contract、effective max_output_tokens和`AssembledModelContext`共同确定，不需要新增 `ModelStep` struct、ID、CRUD、registry 或持久生命周期。
 
-Turn execution包含并驱动AgentLoop。`NeedModel / NeedTools / Finished`只是private adapter的行为词汇，不冻结成新的领域enum或公开trait；Prompt assembly、Tool execution、append/apply conversation gate、Steer、FollowUp、cancellation和terminal status由Session execution owner负责。
+Turn execution包含并驱动AgentLoop。`NeedModel / NeedTools / Finished`是private AgentLoop action；Prompt assembly、Tool execution、append/apply和conversation projection、Steer、FollowUp、cancellation及terminal status由SessionExecutor负责。
 
 完整边界、interface、pinning、逻辑模型调用、AgentLoop、fingerprint 和 recovery 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
@@ -391,7 +393,7 @@ Interaction 的归属关系固定为：
 Interaction → Item → Turn → Session → Agent
 ```
 
-request 必须先 append 再通知 host；resolution 必须携带 durable resolution key，并先 append 再唤醒 waiter或执行 Tool。expires_at 在同一 append gate 校验；transport disconnect 不自动关闭 Pending Interaction，reconnect 使用相同 RequestId 重发。host restart baseline 使用稳定 operation key 逐 entry 关闭 pending request并中断 Turn。
+request必须先append再通知host；resolution必须携带durable resolution key，并先append再唤醒waiter或执行Tool。expires_at在同一append-time validation中校验；transport disconnect不自动关闭Pending Interaction，reconnect使用相同RequestId重发。host restart baseline使用稳定operation key逐entry关闭pending request并中断Turn。
 
 结构化 Interaction response 不是 UserMessage，不开启新 Turn。完整 family、timeout、race 和 recovery 规则见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
@@ -446,6 +448,26 @@ PromptService 可以加载 Prompt-specific source、解析 scope overrides、稳
 Turn 领域对象不持有 PromptSet；完整 PromptSet 属于 Turn 执行上下文。Prompt fingerprint 进入 Turn start execution metadata。
 
 PromptDefinition、PromptSourceAdapter、PromptTurnContext、PromptSet、PromptIntent、CanonicalUserMessage、PromptContribution、AssembledModelContext、fingerprint 和校验规则以 [Prompt 子系统架构设计](prompt-subsystem.md) 为权威。
+
+## ModelGateway引用
+
+```text
+MiniCoreRuntime
+└─ Arc<ModelGateway>
+
+SessionDefinition
+└─ ModelSelection
+
+candidate Turn admission
+└─ ModelGateway.resolve_for_turn(...)
+   └─ TurnModelSnapshot
+
+logical model call
+└─ ModelGateway.generate_model_turn(ModelCallRequest)
+   └─ ModelCallResult | ModelCallError
+```
+
+ModelGateway是runtime深模块，不是领域entity。ModelSelection属于Session definition；TurnModelSnapshot属于TurnExecutionContext；provider attempt、stream、connection、auth、cache和continuation都不进入领域模型或SessionStorage。active Turn内不建立ModelStep、ModelAttempt或transparent cross-model fallback。完整规则以[ModelGateway架构设计](model-gateway.md)为权威。
 
 ## Tool 子系统引用
 
@@ -743,7 +765,7 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-等待审批时 TurnStatus 仍为 Running，InteractionState 为 Pending，parent ToolInvocationState 为 Started。Steer 默认排队到 stable barrier，不把 Turn 变为 Interrupted。
+等待审批时 TurnStatus 仍为 Running，InteractionState 为 Pending，parent ToolInvocationState 为 Started。Steer默认排队到当前model/tool operation完成，不把Turn变为Interrupted。
 
 ### ItemStatus
 
@@ -876,7 +898,7 @@ SkillId + DefinitionVersion
 | AgentRevisionRef、SessionPrompts、Workspace definition、Model | SessionDefinition |
 | 本 Turn 的有效执行 binding | Turn execution pin 的 TurnExecutionContext |
 | 本 Turn 的有效 Prompt snapshot | TurnExecutionContext 内的 PromptSet |
-| Runtime Service 注入与 loaded residency | future Session execution owner |
+| Runtime Service注入与loaded residency | SessionExecutor |
 | 当前 WorkspaceSnapshot | loaded Session execution state；Turn 执行上下文 pin 不可变引用 |
 | canonical roots / effective grants / Workspace views | WorkspaceResolver 解析和 WorkspaceSnapshot 投影 |
 | persisted trust / managed Workspace policy | WorkspaceAuthority adapter 或其后端 store |
@@ -888,16 +910,14 @@ SkillId + DefinitionVersion
 | Tool registration、execution policy 和 executor | ToolService |
 | 本 Turn 的有效 Tool snapshot | TurnExecutionContext 内的 ToolSet |
 | 本 Turn 的 Skill metadata snapshot | TurnExecutionContext 内的 pinned SkillCatalog |
-| AgentLoop adapter / logical model-call state / committed conversation hot projection | future Session execution owner |
+| AgentLoop adapter / logical model-call state / committed conversation hot projection | SessionExecutor |
 | Skill load state / cache | Skill 子系统 |
 
 以下问题暂不决定：
 
-- 哪个 actor 或 manager 持有 mutable state；
-- Definition content 是内联值还是 immutable content reference；
-- scope definitions 是新增定义、完整集合还是只保存引用；
-- Session execution owner 如何构造 validated SessionEntryDraft；
-- Runtime 是否允许多个 Agent 或 Session 同时 active。
+- Definition content是内联值还是immutable content reference；
+- scope definitions是新增定义、完整集合还是只保存引用；
+- 公开Runtime protocol如何联系SessionExecutionHandle。
 
 ## 最小代码骨架
 
@@ -945,7 +965,7 @@ pub struct SessionDefinition {
     pub revision: SessionDefinitionRevision,
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
-    pub model: Model,
+    pub model: SessionModelConfig,
     pub prompts: SessionPrompts,
     pub created_at: Timestamp,
 }
@@ -982,13 +1002,12 @@ pub struct Interaction {
 
 ## 后续设计顺序
 
-1. Session execution owner、FollowUp 调度和并发状态机。
-2. ModelGateway 与 AgentLoop adapter。
-3. compaction orchestration。
-4. command、query、event、snapshot 和 transport protocol。
-5. review、background work 和按需 Extension/Plugin。
+1. compaction orchestration。
+2. Rig ModelGateway与AgentLoop adapter implementation spike。
+3. command、query、event、snapshot和transport protocol。
+4. review、background work和按需Extension/Plugin。
 
-跨阶段 backlog：PromptDefinition priority/content identity、scope merge、Skill namespace/content identity 和 Model 最小类型；在对应消费方需要前闭合，不改变上述主路径顺序。
+跨阶段 backlog：PromptDefinition priority/content identity、scope merge和Skill namespace/content identity；在对应消费方需要前闭合，不改变上述主路径顺序。
 
 ## 设计进度
 
@@ -1008,6 +1027,8 @@ pub struct Interaction {
 - [x] 确定 PromptService 只消费 ToolPromptView 和 SkillCatalogView，不主动调用 ToolService 或 SkillService。
 - [x] 确定 PromptSet 负责 CanonicalUserMessage、最终模型上下文和 MessageRecord → ModelMessage 转换。
 - [x] 确定 Turn 领域对象不持有 PromptSet 或 Prompt fingerprint；exact reference 属于 start execution metadata。
+- [x] 确定ModelGateway使用exact TurnModelSnapshot和一个深generate_model_turn operation。
+- [x] 确定provider attempt、stream、auth、cache和continuation不进入领域模型。
 - [x] 确定 Turn 不持有 Agent identity、revision 或 Workspace。
 - [x] 确定 SessionDefinition pin exact AgentRevisionRef，Agent update 不自动改变 Session。
 - [x] 定义 AgentDefinition、SessionDefinition 和 SessionDefinitionRevision。

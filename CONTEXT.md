@@ -49,52 +49,32 @@ _避免_：模型客户端、API wrapper
 _避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
 
 **RuntimeSnapshot**：
-Agent 运行时在某个事件水位上的当前状态读模型，用于 adapter 初始化和同一 host 生命周期内的事件流重连/订阅重建。它在同一水位原子覆盖全部 loaded `SessionRuntime`，包括各自 current run 的 pending approvals；它不是 UI store、会话文件或持久化快照。打开工作区后默认 `loaded_sessions` 为空。MVP 不支持 adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
+Agent 运行时在某个事件水位上的当前状态读模型，用于 adapter 初始化和同一 host 生命周期内的事件流重连/订阅重建。它在同一sequence原子覆盖全部loaded `SessionExecutor`，包括各自current Turn的Pending Interaction；它不是 UI store、会话文件或持久化快照。打开工作区后默认 `loaded_sessions` 为空。MVP 不支持 adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
 _避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
 
-**运行时服务**：
-`AgentRuntime` 内部的后端依赖集合总称，不随任何客户端 selected session 改变。MVP 将服务保留在 `WorkspaceServices` 中；模型可见资源由 `ResourceManager` 管理级联不可变快照；会话和 run 捕获快照引用，而不是 pin 一整套 cwd 绑定服务。
-_避免_：客户端当前选择的可变大包、每 session 服务容器、UI 服务
+**运行时共享模块**：
+`MiniCoreRuntime`拥有的PromptService、ToolService、SkillService和ModelGateway。它们不随UI selected Session改变，也不保存current Session或current Turn。
+_避免_：每Session复制服务、UI服务容器、全局current Session
 
-**WorkspaceServices**：
-绑定到打开的 workspace / host 生命周期的运行时服务，例如 event bus、`SessionManager` / `SessionIndex`、共享无状态 `CommandManager`、`ResourceManager`、user-global settings/provider/auth、`ModelGateway` 和 runtime diagnostics 聚合。后期启用 hook system 时，`RuntimeHookRegistry` 也作为 workspace/runtime service 加入。它不随客户端 session selection 改变而重建。
-_避免_：单会话运行态、selected-session 服务、UI 服务、有状态 CommandSurfaceService
+**Workspace**：
+`SessionDefinition.workspace`中的单实例definition value，描述root、访问规则和配置。它没有WorkspaceId、registry或open/close lifecycle；loaded Session通过WorkspaceResolver得到WorkspaceSnapshot。
+_避免_：全局WorkspaceManager、cwd字符串、UI project object
 
-**ResourceManager**：
-运行时内部资源子系统，负责资源来源解析、project trust gate、source info、diagnostics、级联 snapshot、cwd-over-runtime overlay policy、cwd reload 和 turn resource capture。runtime 与 UI/`AgentRuntime` 生命周期绑定，`OpenWorkspace` 初始化一次 `RuntimeResourceSnapshot`；MVP 没有 runtime reload。`OpenSession/NewSession` 保证目标 cwd snapshot 存在；`start_user_turn -> capture_turn_resources` 在稳态只读取 current cwd pointer 并冻结 typed owner projections，产出 `TurnResourceSnapshot`。它不构造最终 system prompt，不执行技能调用，也不是公开协议的数据存储。
-_避免_：UI 资源 store、系统提示词构建器、会话运行时、实时读文件入口、runtime reload 管理器
+**WorkspaceSnapshot**：
+SessionExecutor在Turn admission期间取得的不可变Workspace解析结果，包含canonical roots、effective access和authorization lease。TurnExecutionContext pin该Snapshot，active Turn不读取future Workspace definition。
+_避免_：实时路径查询、mutable cwd state、跨Turn共享authorization lease
 
-**ResourceSnapshotStore**：
-`ResourceManager` 内部的 current-pointer 存储，保存 runtime 生命周期内初始化一次的 `RuntimeResourceSnapshot`，以及每个 `(workspace_id, cwd)` 的当前 `CwdResourceSnapshot`。MVP 中 `replace_cwd` 是唯一资源 current-pointer 替换线性化点：它只原子替换 cwd current pointer，不修改旧 snapshot；已经 running 的 run 继续使用启动时捕获的旧 snapshot，后续新显式 user turn / work chain 通过 `capture_turn_resources` 读取新 current cwd pointer。
-_避免_：CwdServiceRegistry、CwdScopedServices、服务 generation registry、客户端 selected-session resources、runtime current-pointer 替换
+**WorkspaceAuthorizationControl**：
+用于撤销active Turn Workspace authorization lease并通知SessionExecutor的执行期控制对象。普通definition update只影响future Turn；security-restricting update撤销旧lease并中断受影响Turn。
+_避免_：Prompt contribution、Tool permission扩大机制、durable Session字段
 
-**运行时资源快照（`RuntimeResourceSnapshot`）**：
-一次 product/user-global defaults 解析结果，在 `OpenWorkspace` 初始化一次并与 `AgentRuntime` / UI host 生命周期绑定。它包含 builtin/user-global/runtime 级技能、提示模板、上下文默认值、自定义/追加系统提示词、source info 和 diagnostics。它不包含 cwd-local 项目资源，也不包含 provider/auth/model gateway 状态；MVP 不使用递增 runtime 级 revision。
-_避免_：provider settings、凭据、cwd 项目资源、UI state、runtime reload revision
+**会话执行器（`SessionExecutor`）**：
+单个loaded Session的执行期编排对象，拥有`SessionExecutionState`、`SessionRequestQueue`、SessionWriter、committed projections、CurrentTurnExecution和当前异步operation。每个Session一个Executor；一个Runtime允许多个Executor同时Running。
+_避免_：会话管理器、UI会话状态、全局current Session
 
-**cwd 资源快照（`CwdResourceSnapshot`）**：
-某个 `(workspace_id, cwd)` 在一次成功资源加载/合成后的不可变资源集合。它持有构建时使用的 `Arc<RuntimeResourceSnapshot>`，并包含 cwd-local layer 与 overlay 后的 `resolved` effective view。多个 session 可以共享同一 cwd 的当前快照；不同 cwd 有各自快照。
-_避免_：单纯 cwd 增量、全局当前资源、session 私有资源服务、UI 快照
-
-**turn 资源快照（`TurnResourceSnapshot`）**：
-一次 user turn / work chain 的稳定资源输入，由 `ResourceManager.capture_turn_resources(...)` 生成，包含 `session_id`、`user_turn_id`（不是 `RunId`）、`Arc<CwdResourceSnapshot>`、behavior、model、environment、policy 和 fingerprint。它进入 `TurnState` 后保证 automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用同一 captured 输入；FollowUp、NextTurn 和新 idle prompt 会重新捕获。
-_避免_：实时资源查询、mutable prompt context、RunId 等同 user turn、同时 pin runtime/cwd 的双来源快照
-
-**资源覆盖策略（`ResourceOverlayPolicy`）**：
-由 `ResourceManager` 集中实现的 deterministic overlay 规则。MVP 中 policy 可编码在代码内：runtime/global 资源提供候选，cwd/project 资源可按稳定 `ResourceKey { kind, namespace?, name }` 覆盖同 key 候选；selected 与 shadowed 都保留给 diagnostics。
-_避免_：调用点临时合并、按文件路径碰撞、用户可随意声明 provider 覆盖
-
-**资源更新边界**：
-资源内容进入模型可见 current snapshot 的边界。MVP 中 runtime snapshot 只在 `OpenWorkspace` 初始化一次；cwd snapshot 由 `OpenSession/NewSession` ensure 或显式 `ReloadResources` 构建，并只通过 `replace_cwd` 发布。`resources_changed` 只是通知事件；`capture_turn_resources` 只是读取 current cwd pointer 并冻结传入 typed projections，不扫描文件、不自动 reload。
-_避免_：文件保存即生效、hook 回调刷新、UI event 修改资源、turn 中途换资源、runtime reload
-
-**会话运行时（`SessionRuntime`）**：
-单个会话的产品级 Agent 编排对象；每个 loaded runtime 以 per-session actor 模式持有权威状态并持续处理 mailbox，管理会话阶段、当前运行、队列、模型状态、资源、工具、会话写入和 post-run arbitration。
-_避免_：会话管理器、UI 会话状态
-
-**会话运行时句柄（`SessionRuntimeHandle`）**：
-上层联系某个 loaded `SessionRuntime` 的显式可克隆句柄，用于提交 session command、请求一致 snapshot/read projection 和发起 graceful shutdown；它不保存权威 session 状态，也不直接等待或执行 Agent run。
-_避免_：`Arc<Mutex<SessionRuntime>>`、SessionRuntime 本体、RunTask handle、客户端 selected session
+**会话执行句柄（`SessionExecutionHandle`）**：
+上层联系某个loaded `SessionExecutor`的显式可克隆句柄，用于提交typed request和请求一致snapshot；它不保存权威Session状态，也不直接执行AgentLoop、Model或Tool。
+_避免_：`Arc<Mutex<SessionExecutor>>`、SessionExecutor本体、RunningOperation handle、客户端selected session
 
 **产品级编排能力**：
 围绕一次会话运行所需的阶段、队列、资源、工具、会话写入、中止和事件等职责。它是一组属于会话运行时的能力，不是独立模块。
@@ -105,20 +85,20 @@ _避免_：UI 后端、简单 wrapper
 _避免_：UI 回调、协议事件、插件系统、任意 runtime 后门、当前阶段必做模块
 
 **Hook owner**：
-拥有某个安全点业务不变量的模块。Hook owner 负责调用 hook、应用 typed result、重新校验并记录 diagnostics；`RuntimeHookRegistry` 只保存 handler，不拥有业务流程。`SessionRuntime` 拥有 run/prompt/context/queue/compaction/session commit observer 安全点，`Tools` 拥有工具治理安全点，`ModelGateway` 拥有 model/provider 边界安全点，`CommandManager` / `Command` 拥有 command catalog/resolve/output 安全点。
+拥有某个安全点业务不变量的模块。Hook owner 负责调用 hook、应用 typed result、重新校验并记录 diagnostics；`RuntimeHookRegistry` 只保存 handler，不拥有业务流程。`SessionExecutor`拥有Turn/context/request queue/compaction/session append observer处理位置，`ToolService`拥有工具治理处理位置，`ModelGateway` 拥有 model/provider 边界安全点，`CommandManager` / `Command` 拥有 command catalog/resolve/output 安全点。
 _避免_：Hook 注册表、Driver、UI adapter、任意调用方
 
 **运行时 Hook 注册表（`RuntimeHookRegistry`）**：
 后期保存 hook handler、source、capability、timeout、cancellation 和 failure policy 的内部运行时服务。它不拥有业务状态机，也不拥有 event metadata；hook owner 调用它，并应用 typed result。
 _避免_：事件总线、插件管理器、工具执行器、会话存储
 
-**会话阶段（`SessionPhase`）**：
-会话运行时当前互斥工作状态，封闭为 `Idle`、`Turn`、`Compaction` 和 `RetryBackoff`。`Turn` 可以覆盖 prompt preflight、一个或多个连续 Agent runs、审批等待、可恢复暂停、持久化和 post-run arbitration；它不等于单个 `RunId`。`RetryBackoff` 只表示 Agent run 自动重试前的调度等待，不表示 provider retry 或 compaction 内部重试。
-_避免_：CurrentRunState、branch summary、模型调用状态、loading 状态、按钮状态
+**会话阶段（`SessionPhase`，pre-refactor protocol term）**：
+旧Runtime snapshot中的粗粒度状态。当前内部权威状态是`SessionExecutionState { Idle, Starting, Running, Finishing }`加`TurnExecutionPhase`；阶段8/9再决定公开snapshot是否保留SessionPhase projection。
+_避免_：SessionExecutor mutable state、ModelGateway attempt、durable TurnStatus
 
 **会话已稳定（`session_settled`）**：
 会话处于 `Idle`，且没有 active run、compaction、retry、pending session action 或马上启动的 continuation；`NextTurn` queue 可以保留。它是 runtime 发布给 observer 的状态事实，不是 command、阻塞式 wait API 或“所有队列为空”的同义词。
-_避免_：WaitForIdle、run finished、queue empty、同步屏障
+_避免_：WaitForIdle、run finished、queue empty、同步等待点
 
 **会话**：
 一次工作上下文的持久记录，包含消息、模型变化、思考等级变化、活跃工具变化、压缩摘要、标签、名称和当前叶子位置。
@@ -153,7 +133,7 @@ _避免_：任意 token 截断、显示分页、文件切片
 _避免_：上下文占用、费用账单、消息长度、本地估算事实
 
 **上下文占用**：
-当前会话投影到下一次模型请求时预计占用的上下文窗口大小。它用于上下文进度条、pre-run threshold gate 和压缩触发；每次模型调用的权威大小判断仍由最终 call projection validation 完成。它不等同于历史累计消耗。
+当前会话投影到下一次模型请求时预计占用的上下文窗口大小。它用于上下文进度条、pre-run threshold check和压缩触发；每次模型调用的权威大小判断仍由最终call projection validation完成。它不等同于历史累计消耗。
 _避免_：会话总 token、账单消耗、消息数量
 
 **会话消耗统计**：
@@ -164,8 +144,8 @@ _避免_：当前上下文窗口、压缩摘要大小、UI 计数器
 负责工作区内会话生命周期的运行时模块。它协调持久化会话目录、单会话句柄和已加载会话运行时，但不执行单个 Agent run。
 _避免_：文件工具、会话管理 UI、Agent loop
 
-**已加载会话运行时（`LoadedSessionRuntimes`）**：
-会话管理器内部维护的 live runtime 表，记录当前已加载的 `SessionRuntime`。它是运行时对象索引，不是持久化会话目录；其中每个 `SessionRuntime` 独立持有 phase、queue、current run、pending approval 和固定 workspace cwd。它不保存客户端 selected/current session，多个 runtime 可以同时推进 work。
+**已加载会话执行器（`LoadedSessionExecutors`）**：
+Runtime内部维护的live map，记录当前已加载Session对应的`SessionExecutionHandle`。它不是持久化会话目录；每个`SessionExecutor`独立持有state、request queues、current Turn、Pending Interaction和SessionWriter。它不保存客户端selected/current Session，多个Executor可以同时推进work。
 _避免_：会话存储、会话目录、独立会话运行时注册表、UI selection store
 
 **会话存储（`SessionStorage`）**：
@@ -173,24 +153,24 @@ _避免_：会话存储、会话目录、独立会话运行时注册表、UI sel
 _避免_：会话管理器、会话运行时、聊天状态、第二 durable event log
 
 **技能**：
-可加载的 Markdown 指令包，包含稳定名称、简短描述、来源路径和正文。模型可见 selected skill 必须以 `SkillResource` 形式进入 resource snapshot，或被 snapshot pin 到不可变正文引用；显式调用时由目标 `PreparedMessageTurn` 从 captured `PromptResourceView` 读取正文并作为普通用户消息进入一次 Agent 运行。
-_避免_：提示词片段、插件、工具、运行时按文件路径实时读取正文
+由SkillDefinition描述、通过SkillService发现和加载的Markdown指令包。Turn admission pin SkillCatalog及exact SkillCatalogEntryRef；显式调用时TurnExecutionContext按exact reference加载正文，经SkillInjector产生PromptContribution，再由PromptSet规范化为UserMessage。
+_避免_：提示词片段、插件、工具、按current文件路径漂移加载
 
-**技能模块**：
-与 `ResourceManager`、会话运行时平级的 `skills.rs` 模块，提供 `SkillMetadata` / `SkillResource` / `SkillCatalog` 数据结构，以及给定目录后的发现、校验、frontmatter 处理和格式化 helper。它不决定 skill roots，不拥有 reload/ensure/recompose 生命周期，不执行 overlay，也不构造会话消息。
-_避免_：独立技能加载服务、UI 技能解析、工具注册、技能生命周期管理、资源 scope owner
+**技能模块（`SkillService`）**：
+MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validation、catalog publication、exact-reference load、content cache和diagnostics。它不构造最终UserMessage、不拥有Workspace lifecycle，也不调用模型。
+_避免_：skills.rs helper集合、UI解析器、Prompt manager、Tool registry
 
-**技能目录**：
-技能资源集合的数据结构，可由 `skills.rs` 创建，但 current catalog 的生命周期由 `ResourceManager` 的 `RuntimeResourceSnapshot`、`CwdResourceSnapshot.local`、`CwdResourceSnapshot.resolved` 和 `TurnResourceSnapshot` 持有。对 selected skills，catalog 必须能提供稳定正文或不可变正文引用。
-_避免_：独立生命周期 owner、命令列表、直接读当前磁盘文件
+**技能目录（`SkillCatalog`）**：
+SkillService发布的immutable catalog。TurnExecutionContext pin exact catalog、fingerprint和Workspace authorization context；future reload不改变active Turn，lazy load必须按pinned entry version/content hash解析。
+_避免_：current磁盘目录、命令列表、mutable global catalog
 
 **技能调用**：
-用户显式要求使用某个技能的结构化提示词意图。slash skill 先解析为 `PromptIntent`；目标 turn 的 `PreparedMessageTurn` 从 captured `PromptResourceView` 中读取 selected `SkillResource.body`，调用 `skills.rs` helper 格式化 `<skill>` 块，并通过 `compose_user_message(PromptIntent)` 展开为一条 `CanonicalUserMessage`。
-_避免_：系统提示词注入、工具调用、按 `metadata.file_path` 重新读文件
+用户显式Skill intent先解析为PromptIntent；TurnExecutionContext使用pinned SkillCatalogEntryRef调用SkillService::load，经SkillInjector形成typed PromptContribution，再由PromptSet.compose_user_message生成CanonicalUserMessage并append。模型触发的Skill能力走ToolResult路径。
+_避免_：系统提示词旁路、按metadata path重读、未committed current-call contribution
 
-**运行时资源**：
-由运行时统一管理、可影响未来 Agent 运行的模型资源，包括技能目录、提示模板、上下文文件、自定义系统提示词和追加系统提示词。
-_避免_：UI 文件、会话消息、工具结果
+**运行时资源（pre-refactor aggregate term）**：
+旧ResourceManager设计对Prompt、Skill和Workspace source的统称。目标架构由PromptService、SkillService、ToolService和Workspace各自拥有定义、加载与snapshot语义，不建立通用RuntimeResource entity。
+_避免_：统一ResourceManager、跨模块resource snapshot、UI文件
 
 **资源快照**：
 `ResourceManager` 在一次成功加载/合成后发布的不可变模型资源视图，具体分为 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` 和预留的 `StepResourceSnapshot`。旧 snapshot 永不原地修改；reload 只替换 current pointer，running turn 继续使用已捕获引用。
@@ -208,21 +188,21 @@ _避免_：完整 prompt、用户消息、工具描述、实时资源查询
 尚未展开成模型消息的结构化用户输入，可以引用普通文本、技能、提示模板或它们的组合。队列保存 intent 的稳定资源 key、参数和附件引用，不保存 raw slash command text 或提前展开的资源正文。
 _避免_：用户消息、命令文本、已展开 prompt、PendingSessionAction
 
-**Prompt 子系统**：
-无状态的提示词组装深模块，是唯一模型可见上下文组装 seam。它负责从已捕获和已授权的 typed views 执行 `prepare_message_turn(...) -> PreparedMessageTurn`，通过 `PreparedMessageTurn.compose_user_message(PromptIntent) -> CanonicalUserMessage` 展开用户输入，并通过 `assemble_model_context(ModelContextProfile + ordered committed conversation + transient context + purpose) -> AssembledModelContext` 生成 provider-neutral 模型上下文。它不拥有资源生命周期、会话历史、队列、动态 context provider、工具执行、storage/provider handle 或模型调用。
-_避免_：系统提示词构建器、PromptManager、ContextManager、ResourceManager
+**Prompt子系统**：
+MiniCoreRuntime-owned `PromptService`和Turn-pinned `PromptSet`组成的模型上下文组装模块。`PromptSet.compose_user_message(PromptIntent)`是UserMessage规范化入口，`PromptSet.assemble(CommittedConversationView, purpose, output_contract)`是唯一provider-neutral模型上下文组装interface。它不拥有Session history、request queue、Tool execution、storage或provider调用。
+_避免_：PromptManager、ContextManager、ModelGateway内拼接messages
 
-**已准备消息 turn（`PreparedMessageTurn`）**：
-一次 user turn / work chain 使用的不可变提示词准备值，由 `Prompt.prepare_message_turn(...)` 基于 captured `TurnResourceSnapshot` 投影出的 `PromptResourceView`，以及同一 `TurnToolProfile` 中的 `ToolPromptView` 创建。它用于展开 resource-backed `PromptIntent` 为 `CanonicalUserMessage`，并暴露窄 `ModelContextProfile` 供后续模型上下文组装使用；active Steer 使用当前 `PreparedMessageTurn`，FollowUp、NextTurn 和 idle submission 在目标 future turn 创建新的 `PreparedMessageTurn`。Prompt 不接收 `TurnToolProfile` 中的 executor。
-_避免_：TurnState、长期 PromptManager、资源快照 owner、会话上下文、模型调用请求
+**Turn提示词集合（`PromptSet`）**：
+SessionExecutor在Turn admission期间通过PromptService构造的不可变提示词集合，绑定exact Runtime/Agent/Session prompts、Workspace contribution、SkillCatalog prompt view和同一ToolSet的ToolPromptView。active Turn内的Submit composition、Steer和每次Model context assembly都复用该PromptSet。
+_避免_：长期PromptManager、current Session prompt、模型request、Tool executor
 
-**turn 工具 profile（`TurnToolProfile`）**：
-session-scoped `Tools` 在新的 user turn / work chain 边界通过 `capture_turn_tools()` 原子捕获的不可变组合，包含同一 `ToolProfileFingerprint` 下的模型可见 `prompt_view`、run-only `executor` 和 fingerprint。Prompt 只消费 `prompt_view`，执行路径只消费 `executor`；automatic retry、overflow recovery 和同一 work chain 复用同一 profile，不能分别调用 getter 拼装。
-_避免_：工具运行快照、独立 prompt/invoker getter、ResourceManager-owned tool view
+**Turn工具集合（`ToolSet`）**：
+`ToolService::for_turn(...)`返回的不可变Turn工具集合，原子绑定ToolSpec、ToolPromptView、execution route和ToolSetFingerprint。PromptSet只使用其ToolPromptView，SessionExecutor通过同一ToolSet执行ToolCall；active Turn内不能替换。
+_避免_：session-scoped Tools副本、独立prompt/executor getter、UI工具列表
 
-**模型上下文 profile（`ModelContextProfile`）**：
-`PreparedMessageTurn` 暴露给模型上下文组装的窄 profile，把 system prompt、active tool schemas、`ToolProfileFingerprint`、贡献来源和 fingerprint 绑定在一起。`Prompt.assemble_model_context(...)` 使用它与有序 committed conversation、transient context 和 purpose 构造 `AssembledModelContext`；切换模型可见工具或相关 profile 时必须整体替换，并与 replacement executor fingerprint 相等，不能分别 patch system prompt、schemas 与执行 executor。
-_避免_：DriverTurnInput、ModelCallRequest、ToolPromptCatalog、provider payload
+**组装后的模型上下文identity**：
+`AssembledModelContextFingerprint`绑定PromptSet、CommittedConversationView、ModelCallPurpose、OutputContract和最终provider-neutral content。完整logical call identity还包含TurnModelSnapshot和effective max_output_tokens；provider/logical retry必须复用同一validated ModelCallRequest。
+_避免_：provider payload hash、Session revision、Tool executor identity替代品
 
 **上下文素材（`ContextMaterial`）**：
 由 RAG、memory、IDE、issue lookup 或后期 hook 等动态来源成功提供的 typed 模型上下文，带稳定来源、content hash、`CurrentRun | CurrentCall` 生命周期和 required/optional 要求。需要 durable 的内容必须先由其 owner 转换并提交为 canonical session message；项目文件、技能和提示模板不能绕过 `ResourceManager` 伪装成动态素材。
@@ -233,15 +213,15 @@ _避免_：资源快照、无来源字符串、会话历史、系统提示词
 _避免_：Option<ContextMaterial>、静默跳过、provider future、原始 I/O error
 
 **组装后的模型上下文（`AssembledModelContext`）**：
-Prompt 在一次模型调用前生成的最终 provider-neutral 模型可见上下文现称 `AssembledModelContext`，包含同一 `ModelContextProfile` 的 system prompt 与 tools、协议安全 messages、output contract、贡献来源和 fingerprint。它由 `Prompt.assemble_model_context(...)` 从 ordered committed conversation、transient context 和 purpose 组装，是构造 `ModelCallRequest` 前的唯一组装结果。
-_避免_：ModelCallRequest、provider payload、TurnState、session messages
+PromptSet在一次模型调用前生成的最终provider-neutral模型可见上下文，包含ordered System/Developer ModelInstruction、协议安全ModelMessage、ToolSpec、OutputContract、贡献来源、diagnostics和fingerprint。它由`PromptSet.assemble(...)`从committed conversation和purpose组装，是ModelCallRequest唯一的model-visible input。
+_避免_：provider payload、Turn state、session message vector、Gateway内重新组装
 
 **输出契约（`OutputContract`）**：
 一次模型调用对输出结构的 provider-neutral 要求，例如 JSON schema、response format 或 required tool choice。它与 prompt text 一起进入 `AssembledModelContext`，但不能靠普通文本替代；真实 provider 映射由 `ModelGateway` 完成。
 _避免_：system prompt、provider payload、显示格式、max output tokens
 
 **CommandSurface**：
-Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令领域面。它不是一个有状态 service 名；实现上由共享无状态 `CommandManager` 和 `SessionRuntime` 持有的 session-scoped `Command` 共同组成。
+Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令领域面。它不是一个有状态 service 名；实现上由共享无状态`CommandManager`和Runtime基于SessionId/SessionExecutor snapshot构造的session-scoped command context共同组成。
 _避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop、有状态 CommandSurfaceService
 
 **AgentCommand**：
@@ -254,14 +234,14 @@ _避免_：AgentCommand、CommandOutput、RuntimeSnapshot、UI 本地 selector�
 
 **查询响应（`QueryResponse`）**：
 `RuntimeQuery` 的直接 request/response 结果，包含 `as_of_sequence`、可选领域 revision 和 typed `QueryResult`。它不是业务事件，不分配 `CommandId`，transport request id 也不进入领域模型。
-_避免_：CommandAck、EventMsg、RuntimeSnapshot、JSON-RPC envelope
+_避免_：CommandAck、EventMsg、RuntimeSnapshot、JSON-RPC request object
 
 **CommandManager**：
 `WorkspaceServices` 持有的共享、无状态命令管理器。它持有只读 command packs、candidate provider registry 和 handler registry；每次调用时基于传入 `CommandContext` 临时 materialize command catalog，并执行 parse、suggest、`resolve_for_execution`。
-_避免_：SessionRuntime 子系统、catalog cache、UI 菜单状态、执行工具或模型的 service
+_避免_：SessionExecutor、catalog cache、UI菜单状态、执行Tool或Model的module
 
 **Command（session-scoped）**：
-`SessionRuntime` 持有的命令入口 facade。它不缓存 catalog，只负责从当前 session 组装 `CommandContext` 和 `SessionCommandHost`，再调用共享 `CommandManager`。
+Runtime为指定SessionId构造的命令入口facade。它不缓存catalog，只从SessionExecutor snapshot组装`CommandContext`和`SessionCommandHost`，再调用共享`CommandManager`。
 _避免_：agent_runtime_protocol::AgentCommand、全局命令服务、UI command palette
 
 **CommandNode / CommandPath**：
@@ -320,45 +300,45 @@ _避免_：QueuedMessage、PromptIntent、committed user message、runtime event
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
 
-**RunTask**：
-`SessionRuntime` 为一次已经公开启动的 Agent 运行创建的短期执行任务，拥有 `Driver`、run-local usage/limits 和 cancellation；Driver 通常推进一个 Rig `AgentRun`，active Steer 时可在同一 `RunId` 下顺序推进多个 Rig segment。RunTask 不拥有 session phase、queues、writer、公共事件或 terminal arbitration。
-_避免_：SessionRuntime actor、长期后台 session、RunId、DriverHost
+**异步操作（`RunningOperation`）**：
+SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。它只接收不可变输入并返回`OperationResult`；不能拥有SessionWriter、projections、request queues或Turn terminal state。
+_避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owner
 
-**运行标识（`RunId`）**：
-一次已经公开启动的 `Driver::drive_conversation()` / Agent loop 执行实例的 runtime-host-global opaque id。它在 runtime 准备创建 `CurrentRun`、调用 Driver 并发布 `run_started` 时分配，同一 run 内的模型调用、工具轮次、审批、suspend/resume、Steer 触发的 Rig segment rollover 和 terminal event 共享该 id；新的 retry、FollowUp 或其他 post-run continuation `drive_conversation()` 使用新 id。`RunId` 不绑定单个 Rig `AgentRun` 对象，也不是 prompt admission、`CommandId`、user turn、session revision 或跨进程 resume token，不能用于取消尚未公开启动的 work。
-_避免_：命令 id、模型调用 id、工具调用 id、会话 entry id、持久化 revision
+**运行标识（`RunId`，pre-refactor protocol term）**：
+旧Runtime protocol用于标识一次公开Agent run的identity。当前目标架构内部以SessionId、TurnId、execution_version和OperationType定位执行；是否仍需要独立RunId留到阶段9公开protocol决定。
+_避免_：在SessionExecutor内部替代TurnId、模型调用id、ToolCallId、EntryId
 
 **待执行会话动作（`PendingSessionAction`）**：
-`SessionRuntime` 接受 `CommandRunPolicy::QueueAfterRun` 后保存、并在当前 work 结束后的安全点执行的结构化会话操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。
+`SessionExecutor`接受`CommandRunPolicy::QueueAfterRun`后保存、并在当前Turn结束后执行的结构化Session操作，例如 running 时提交的 manual compact。它不是用户消息，不进入 steering/follow-up/next-turn message queue，也不进入模型上下文；UI-safe 投影通过 `QueueSnapshot.pending_actions` 暴露。
 _避免_：AgentCommand payload、QueuedMessage、writer 内部 batch draft、CommandManager pending action
 
-**当前运行状态（`CurrentRunState`）**：
-`RuntimeSnapshot.loaded_sessions[*].current_run` 中描述对应 session 当前 run 是否正在执行、等待审批或处于可恢复暂停的状态。它不是 run 终态；终态只通过 `run_finished { status: Completed | Failed | Aborted }` 表达。
-_避免_：RunTerminalStatus、SessionPhase、工具调用状态
+**当前运行状态（`CurrentRunState`，pre-refactor protocol term）**：
+旧RuntimeSnapshot中的run read model。当前内部权威值是`SessionExecutionState + CurrentTurnExecution + committed projections`；阶段9决定公开snapshot是否保留CurrentRunState名称。
+_避免_：SessionExecutor mutable state、durable TurnStatus替代品
 
-**可恢复暂停（`Suspended`）**：
-当前 run 在协议安全 checkpoint 停住，并持有 `ResumeId` / resume state，后续可以继续同一个未完成 AgentRun / tool-result continuation。典型 checkpoint 包括 tool result 已产生但尚未回填 Rig、等待用户交互、external job pending 或 safe point 用户暂停。MVP resume state 只在同一 host 生命周期内存活；host shutdown 后不恢复 running run。它不能表达为 `run_finished { status: paused }`。
-_避免_：客户端 session selection、terminal finished、普通 waiting approval、模型 streaming 中途暂停
+**可恢复暂停（`Suspended`，pre-refactor proposal）**：
+阶段6 baseline不定义Suspended execution state。WaitingApproval保持Running；Cancel/host restart使用Interrupted。若未来需要同进程pause/resume，必须另行定义operation state、identity和public protocol。
+_避免_：WaitingApproval、UI selection、跨进程恢复旧Model/Tool operation
 
-**TurnState**：
-`SessionRuntime` 在一次新的显式 user turn / work chain 启动时构建的内部稳定快照，pin 住 `TurnResourceSnapshot`、`TurnToolProfile`、`PreparedMessageTurn`、模型状态和 context usage。它不保存 transcript；automatic retry、overflow recovery、active Steer 和同 `RunId` segment rollover 复用该状态中的 captured resources/tools/profile。它不跨过 `Driver` seam；给 `Driver` 的输入必须先投影成 `DriverTurnInput`，conversation 则独立来自 `ConversationSeed`。
-_避免_：Driver 输入、ResourceManager current view、公开协议快照
+**Turn执行上下文（`TurnExecutionContext`）**：
+SessionExecutor在Turn admission期间构造的不可变execution binding，pin exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog和TurnModelSnapshot。active Turn内的retry、Steer和model→tool→model循环复用该Context；FollowUp创建新Turn并重新capture。
+_避免_：模型request、ResourceManager current view、公开协议snapshot、mutable Turn state
 
-**DriverTurnInput**：
-`TurnState` 投影给 `Driver` 的窄输入，只包含 model selection、原子 `ModelContextProfile`、thinking level 和 stream options。它不能包含 `TurnResourceSnapshot`、resource revision、context usage、queue/storage 或工具治理状态；system prompt 与 active tool schemas 不能作为两个独立可 patch 字段跨过 seam。
-_避免_：TurnState、ToolRunContext、ModelCallRequest、SessionRuntime 状态
+**DriverTurnInput（pre-refactor adapter term）**：
+旧Driver设计使用的窄输入。当前SessionExecutor直接从TurnExecutionContext和CommittedConversationView构造PromptAssemblyInput；private AgentLoop adapter只接收其逻辑所需值。Rig spike可以保留private adapter value，但不能成为Session execution owner。
+_避免_：公开Runtime request、TurnExecutionContext替代品、ModelCallRequest
 
 **Driver（AgentLoop 适配器）**：
 Turn execution内部的private协议适配层，负责在`NeedModel | NeedTools | Finished`之间推进底层SDK/Rig状态，并把稳定模型输出交回Session execution。它不拥有SessionWriter、conversation projection、Prompt assembly、Tool execution或terminal arbitration；Steer rollover是private adapter行为，不改变领域TurnId。
 _避免_：会话状态owner、工具注册表、UI loop、第二conversation
 
-**DriverHost（pre-refactor 名称）**：
-旧模块文档中让Driver回到SessionRuntime的trait seam。目标架构不冻结`execute_and_commit_tool_round`或`commit_pending_messages`等helper名称；阶段6只允许建立crate-private窄port，并且所有durable mutation仍由authoritative Session execution owner按`append → apply → gate`执行。
-_避免_：第二writer、长期状态owner、公开Runtime interface
+**异步操作结果（`OperationResult`）**：
+Context、Model、Tool或Compaction操作返回给SessionExecutor的typed result，携带`SessionId`、`TurnId`、`execution_version`和`OperationType`。只有SessionExecutor验证身份和版本后才能应用结果。
+_避免_：durable entry、Runtime event、直接Session mutation
 
-**SessionDriverHost**：
-一次 `drive_conversation()` 期间由 `RunTask` 持有的 owned `DriverHost` wrapper，保存 run identity、turn resources、`ModelGateway` / `Tools` handle、cancellation 和回到 owner actor 的窄联系 seam；它不借用 `SessionRuntime` 的 mutable state。
-_避免_：长期子系统、session 状态 owner、独立 runtime、DriverTurnInput
+**工具执行控制（`ToolExecutionControl`）**：
+Tool执行期间请求SessionExecutor完成approval和ToolExecutionStarted记录的crate-private interface。它通过typed request/response工作，不借用SessionExecutor mutable state，也不拥有第二writer。
+_避免_：InteractionService、ToolLedgerService、公开Runtime interface
 
 **工具服务（`ToolService`）**：
 `MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、grant、资源锁、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet，Agent/Session/Turn领域对象不持有工具属性。
@@ -405,56 +385,68 @@ _避免_：审批弹窗、路径字符串前缀检查、把 best-effort/full-acc
 `Tools` 子系统内部执行某个具体工具副作用的组件，例如读取文件、搜索文本、修改文件或运行命令。executor 不能绕过 registry、active tool check、policy、approval、sandbox 和 mutation lock。
 _避免_：工具策略、工具注册、UI 执行器
 
-**模型调用网关**：
-运行时服务中负责真实模型调用的边界，处理模型选择解析、凭据注入、provider 请求、fallback、流式结果、usage 归一化和错误分类。后期 provider Hook 的 owner 也在该边界内。`Driver` 只通过 `generate_model_turn` seam 请求它；真实 driver 集成前必须先有最小稳定 spine。
-_避免_：Driver、模型客户端、系统提示词构建器、provider registry、临时 provider 路径
+**模型调用网关（`ModelGateway`）**：
+MiniCoreRuntime-owned深模块，通过`resolve_for_turn(...)`固定exact TurnModelSnapshot，并通过一个`generate_model_turn(...)`异步operation处理provider encoding、credential、stream、same-model retry、transport fallback、usage、error、cache和continuation。它不重新组装Prompt，不保存current Session/Turn，也不在active Turn内替换model identity。
+_避免_：provider client透传、系统提示词构建器、cross-model fallback、第二conversation
 
 **ModelGateway spine**：
-真实 driver 集成前必须稳定的最小模型调用骨架，包括 `ModelCallPurpose`、`ModelCallRequest` / `ModelCallResult` / `ModelCallErrorKind` / `ModelCallUsage`、`ModelGateway.generate_model_turn(...)`、最小 `ProviderRegistry.resolve(...)` 和 `AuthStore.resolve(...)`。它不是完整 custom provider、fallback 或 usage/context usage 实现。
-_避免_：临时 gateway、Driver 直接调用 provider
+真实provider integration前必须稳定的MiniCore-owned类型和interface：TurnModelSnapshot、ModelCallPurpose、ModelCallRequest/Result/Error、ModelUsage、ModelProgressEvent、`resolve_for_turn(...)`和`generate_model_turn(...)`。ProviderCatalog、AuthStore和Rig ProviderAdapter属于其private implementation。
+_避免_：临时provider路径、SessionExecutor直接调用Rig
 
 **模型选择（`ModelSelection`）**：
 一次会话或模型调用使用的稳定模型身份，由 `provider_id` 和 `model_id` 组成。它不等同于 provider API 中的真实模型名，也不包含凭据或 base URL。
 _避免_：模型显示名、API model name、Rig 模型类型
 
-**活跃模型（`ActiveModel`）**：
-一次 turn 使用的模型选择及其安全摘要和能力快照。它可以进入 `TurnState`，但不能携带 provider client、raw payload 或凭据。
-_避免_：ModelSummary、provider client、模型配置文件
+**Turn模型快照（`TurnModelSnapshot`）**：
+Turn admission期间由ModelGateway根据ModelSelection解析的immutable execution value，pin exact ModelDefinitionRef、capabilities、effective limits、generation policy和TurnModelFingerprint。它可以携带crate-private opaque execution reference，但不暴露endpoint、auth reference、credential或provider client。
+_避免_：ModelSummary、current catalog lookup、cross-model fallback plan
 
-**模型状态（`ModelState`）**：
-会话运行时持有的当前模型选择、思考等级、流式选项和 fallback 偏好。它不持有 provider client、API key、OAuth token 或 Rig provider 类型。
-_避免_：ProviderRegistry、ModelGateway、模型客户端
+**模型状态（`ModelState`，pre-refactor term）**：
+旧SessionRuntime中的mutable model execution state。目标架构由SessionDefinition保存ModelSelection和用户偏好，TurnExecutionContext保存TurnModelSnapshot；provider connection、stream和retry state全部留在ModelGateway。
+_避免_：active Turn mutable model、provider client、credential
 
-**模型提供方注册表（`ProviderRegistry`）**：
-运行时服务中的 provider/model catalog，记录内置和自定义 provider、模型能力、API model name 映射和默认模型候选。它不读取凭据，也不执行模型调用。
-_避免_：AuthStore、ModelGateway、provider client pool
+**模型目录（`ProviderCatalog`）**：
+ModelGateway内部的versioned provider/model definition catalog，记录explicit protocol、API model name、capabilities、limits和adapter encoding policy。Runtime公开查询以后只取得safe catalog view，不直接持有该对象。
+_避免_：credential store、provider client pool、project-defined endpoint
 
 **凭据存储（`AuthStore`）**：
-运行时服务中的凭据解析边界，负责根据受控引用解析 API key、OAuth token 或运行时 override。它只向模型调用网关内部提供 secret material。
-_避免_：ProviderRegistry、UI 设置对象、环境变量直读器
+ModelGateway private implementation中的secret解析模块，负责API key、OAuth token和runtime override，并支持singleflight refresh。只向private provider attempt提供typed secret material。
+_避免_：TurnModelSnapshot、Runtime event、环境变量直读调用点
 
 **模型调用目的（`ModelCallPurpose`）**：
 一次模型调用的稳定业务意图，例如`AgentRun`或`CompactionSummary`。它从`ModelCallRequest`原样传播到response metadata；provider usage直接附着finalized assistant entry，不建立独立`SessionEntry::Usage`。retry/fallback、客户端是否选中该session、调用是否在后台执行都不是purpose。
 _避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
 
 **模型调用请求（`ModelCallRequest`）**：
-`Driver` 或 `SessionRuntime` 交给模型调用网关的唯一 provider-neutral 请求，包含模型选择、唯一 `input: AssembledModelContext`、thinking level、输出限制、调用目的和流式选项。system prompt、`ModelMessage[]`、工具 schema 和 output contract 只存在于 assembled input 中，调用方不能再拆成平行字段；请求不包含凭据、auth header、Rig provider 类型或 raw provider payload。
-_避免_：provider HTTP request、Rig provider request、会话消息、SummaryModelRequest
+SessionExecutor交给ModelGateway的唯一provider-neutral request，包含TurnModelSnapshot、ModelCallPurpose、唯一`input: AssembledModelContext`和可选输出token上限。generation defaults和reasoning已在Snapshot固定；stream/cache是Gateway策略；role、messages、ToolSpec和OutputContract只存在于assembled input中。
+_避免_：provider HTTP request、Rig CompletionRequest、SessionId/TurnId、credential、raw params
+
+**模型调用结果（`ModelCallResult`）**：
+ModelGateway返回的一次完整terminal success，包含ordered FinalizedAssistantResponse、normalized finish reason、provider-reported ModelUsage、allowlisted response metadata和transparent retry diagnostics。只有SessionExecutor验证OperationResult identity/version和authorization后才能把它转换为assistant entry。
+_避免_：partial stream、durable Item、provider raw response、Turn terminal
+
+**模型调用错误（`ModelCallError`）**：
+ModelGateway返回的redacted typed terminal error。ModelCallErrorKind区分Cancelled、Auth、RateLimited、Quota、ContextOverflow、Capability、Safety、Timeout、Transport、RequestOutcomeUnknown、StreamInterrupted和Protocol等recovery class；caller不得解析provider字符串决定retry。
+_避免_：generic RuntimeError、raw HTTP body、assistant message、ToolResult
+
+**模型进度（`ModelProgressEvent`）**：
+ModelGateway通过bounded ProgressEventPublisher发布的process-local attempt/delta/retry observer value。可以合并或丢弃，不进入SessionStorage；finalized result或typed error负责最终校正observer draft。
+_避免_：durable Message、第二event log、cancellation token
 
 **压缩摘要指令（`CompactionSummaryDirective`）**：
-`Compaction` 根据压缩准备结果生成的摘要目标消息、typed instruction 和最大输出 token 预算。它不是 system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id 或工具 schema；`SessionRuntime` 把它连同 active/standalone `ModelContextProfile` 交给 `Prompt.assemble_model_context(..., purpose = CompactionSummary)`。
+`Compaction` 根据压缩准备结果生成的摘要目标消息、typed instruction 和最大输出 token 预算。它不是 system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id 或工具 schema；`SessionExecutor`把它作为typed OutputContract/directive输入交给active或operation-scoped PromptSet的`assemble(..., purpose = CompactionSummary)`；exact orchestration留到阶段8。
 _避免_：SummaryModelRequest、ModelCallRequest、AssembledModelContext、系统提示词状态
 
 **压缩方法（`CompactionMethod`）**：
-一次压缩的 provider-neutral 执行方式。MVP 使用 `SummaryModel`；后期可由模型 capability 提供 `ProviderNative` 专用端点，或使用有界 deterministic reduction fallback。用户配置表达 preference，`SessionRuntime` 按当前模型 capability 和 trigger 解析计划，不按模型名称硬编码。
+一次压缩的 provider-neutral 执行方式。MVP 使用 `SummaryModel`；后期可由模型 capability 提供 `ProviderNative` 专用端点，或使用有界 deterministic reduction fallback。用户配置表达preference，`SessionExecutor`按当前模型capability和trigger解析计划，不按模型名称硬编码。
 _避免_：GPT 压缩、Claude 压缩、provider endpoint 名、UI handler
 
 **上下文限制错误（`DriverError::ContextLimitExceeded`）**：
-当前 Agent run 的下一次模型调用无法进入有效上下文窗口的 typed recovery class。`PromptAssembly` 表示本地最终上下文组装拒绝、未调用 provider；`Provider` 表示 provider 返回 context overflow。两者由 `SessionRuntime` 在当前 run failed terminal 后共享一次 work-chain compaction recovery，但保留 diagnostics 和 usage 来源差异。
+当前 Agent run 的下一次模型调用无法进入有效上下文窗口的 typed recovery class。`PromptAssembly` 表示本地最终上下文组装拒绝、未调用 provider；`Provider` 表示 provider 返回 context overflow。两者由`SessionExecutor`在当前Turn failure处理中共享一次compaction recovery，但保留 diagnostics 和 usage 来源差异。
 _避免_：普通 retry error、Prompt admission rejection、模型可见 assistant message
 
 **驱动安全点**：
-AgentLoop在稳定模型输出、完整ToolRound conversation gate和candidate final之间把控制权交回Session execution的边界。Session execution只在对应entry成功`append → apply`后消费Steer、开始下一次模型调用或发布terminal；helper名称是private implementation detail。FollowUp在当前Turn terminal后的admission中启动新Turn。
+AgentLoop在稳定模型输出、`tool_round_completed` conversation projection update和candidate final之间把控制权交回Session execution的边界。Session execution只在对应entry成功`append → apply`后消费Steer、开始下一次模型调用或发布terminal；helper名称是private implementation detail。FollowUp在当前Turn terminal后的admission中启动新Turn。
 _避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 
 **运行时命令**：
@@ -490,7 +482,7 @@ _避免_：前端 store、流程图、内部实现步骤
 _避免_：事件发布器、业务调度器、UI保存状态、通用数据库事务管理器
 
 **会话条目草稿（`SessionEntryDraft`）**：
-一次明确的entry append intent，包含expected parent、稳定operation key和typed body。相同operation key与相同normalized payload幂等返回原receipt；不同payload冲突。多个entries之间的业务完整性由Session execution的sequential `append → apply → gate`编排和cross-entry validation保证，不伪装成物理batch。
+一次明确的entry append intent，包含expected parent、稳定operation key和typed body。相同operation key与相同normalized payload幂等返回原receipt；不同payload冲突。多个entries之间的业务完整性由Session execution的sequential `append → apply → dependent action`编排和cross-entry validation保证，不伪装成物理batch。
 _避免_：CurrentRun snapshot、事件批次、模型请求batch、`SessionWriteBatch`
 
 **模型提供方客户端**：

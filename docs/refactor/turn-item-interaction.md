@@ -19,7 +19,7 @@
 本文不提前冻结：
 
 - 已定义 SessionStorage entry 在具体文件 adapter、index 和 Session execution 中的实现细节；
-- Session execution actor/task/handle 的形状；
+- SessionExecutor/request queue/async operation的具体实现；这些以[Session Execution架构设计](session-execution.md)为权威；
 - Runtime command、query、event 和 snapshot payload；
 - provider-specific message、tool-call 和 reasoning encoding；
 - provider-specific reasoning 的最终编码；
@@ -32,7 +32,7 @@
 | --- | --- | --- |
 | Codex | 一个用户 Turn 包含异构 TurnItem；command、MCP、file change 等使用操作型 Item，调用、状态和结果属于同一个 Item；item started/completed 是稳定快照，delta 是通知；approval 和 user-input 使用 server request | 借鉴操作型 Item、stable ItemId、request/response 和 transient delta；不复制庞大的 Item variant 集合 |
 | pi | `turn_start/turn_end` 更接近一次模型调用加 Tool execution round；ToolCall 在 AssistantMessage，ToolResult 是独立 Message；approval 是 runtime callback | loop 简洁，但“ToolCall 与结果分离 + ephemeral approval”不满足 MiniCore recovery 和 durable Interaction |
-| Grok Build | conversation 与 TurnCompleted 持久化；大部分 pending interaction 是内存 waiter，PlanApproval 又有独立 persisted gate | 特殊 interaction 单独持久化会产生例外；MiniCore 应统一 request/resolution durability |
+| Grok Build | conversation与TurnCompleted持久化；大部分pending interaction是内存waiter，PlanApproval另有独立持久化规则 | 特殊interaction单独持久化会产生例外；MiniCore应统一request/resolution durability |
 | Claude Code | Permission 和 AskUserQuestion 围绕 Tool 调用；interrupt/checkpoint 是产品能力；stream-json partial output 是 observer event | Tool-centric Interaction 合理；permission policy 属于 Tool，Interaction 只表达外部回答 |
 | Cursor | 可观察到 Plan、checkpoint 和 background agent，但内部 Turn/Item ownership 未公开 | 只参考产品体验，不推断其内部领域模型 |
 
@@ -129,7 +129,7 @@ provider session / AgentLoop
 pending Interaction waiter
 ```
 
-exact Agent、SessionDefinition、Workspace、Prompt、Tool、Skill 和 Model references 属于 initiating UserMessage 引用的 TurnContext entry，不重复放入 Turn head。
+exact Agent、SessionDefinition、Workspace、Prompt、Tool、Skill和TurnModel references 属于 initiating UserMessage 引用的 TurnContext entry，不重复放入 Turn head。
 
 ### TurnInterruption
 
@@ -599,17 +599,17 @@ construct typed request
 → publish request notification
 → wait for response
 → validate expected TurnId / RequestId / family / resolution idempotency key
-→ 在同一 append gate 检查 expires_at；deadline 已到时只允许 Expired/fail-closed closure
+→ 由同一个SessionExecutor检查expires_at；deadline已到时只允许Expired/fail-closed closure
 → append InteractionResolved { resolution, resolution_key }
 → apply durable projection
-→ wake waiter / continue Tool gate
+→ wake waiter / continue Tool authorization
 ```
 
 关键不变量：
 
 - request 未 append 前不能通知 host；
 - resolution 未 append 前不能执行受审批保护的副作用；
-- Tool side effect 前仍需 control/revocation barrier；
+- Tool side effect前仍需重新检查Cancel state和current authorization；
 - 相同 resolution_key 重试幂等返回当前结果；
 - 不同 key 的第二次 resolution 返回 AlreadyResolved；
 - `now >= expires_at` 后 late response 返回 InteractionExpired，即使 timeout worker 尚未先写入；
@@ -618,12 +618,12 @@ construct typed request
 ## Tool Approval
 
 ```text
-ToolExecutionGate = Ask
+ToolAuthorization = Ask
 → parent ToolInvocation 已有 ItemId
 → append ToolApproval Interaction
 → host Allow
 → append Interaction resolution
-→ final control/revocation barrier
+→ final Cancel state and authorization validation
 → Sandbox / Tool execute
 ```
 
@@ -698,7 +698,7 @@ Interaction 可以保存可选绝对 `expires_at`，不建立通用 timeout poli
 
 ```text
 Pending + now >= expires_at
-→ append gate 拒绝新的 host response
+→ SessionExecutor拒绝新的host response
 → append Expired，或 request-specific fail-closed resolution
 → timeout worker 与 terminal cleanup 仍使用 first-wins CAS
 ```
@@ -720,7 +720,7 @@ ToolInvocationState = Started
 
 ```text
 Steer(expected TurnId)
-→ 排队到 stable barrier
+→ 排队到当前model/tool operation完成
 → 不作为 approval decision
 ```
 
@@ -830,7 +830,7 @@ SessionStorage 仍是唯一 durable truth；projection 和 event stream 都不�
 | 对象/行为 | Owner |
 | --- | --- |
 | Turn durable facts | SessionStorage；Session execution 负责 append |
-| Turn active execution | Session execution owner |
+| Turn active execution | SessionExecutor |
 | Item identity 和 lifecycle transition | Session execution + trusted entry writer |
 | Item content value | 对应 producer；Session execution 规范化后 append |
 | ToolCall/ToolResult execution semantics | ToolService / ToolSet |
@@ -885,7 +885,7 @@ StaleProjection
 - initiating/terminal append outcome unknown；
 - reconnect resend vs original response acknowledgement。
 
-全部race由per-session trusted append gate、expected TurnId和idempotency key线性化。
+全部race由per-session SessionExecutor、expected TurnId和idempotency key线性化。
 
 ## 被否决的方案
 
@@ -981,7 +981,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - lost acknowledgement 使用 durable resolution_key retry；
 - WaitingApproval 中 Steer 排队；
 - Steer preempt 先 cancelled ToolResult 再 Steer；
-- Tool side effect 前 resolution/control/revocation barrier；
+- Tool side effect前完成resolution并重新检查Cancel state和current authorization；
 - restart recovery使用幂等entries逐步关闭pending、abandon unknown并interrupt Turn；
 - recovery 不生成 synthetic ToolResult；
 - terminal projection 不含 Pending Interaction 或 Started Item；
@@ -994,8 +994,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 2. Question option、secret answer 和 validation 的最终 wire schema。
 3. Tool approval timeout 的 product default。
 4. Reasoning summary retention、redaction 和 user visibility policy。
-5. Session execution 内 ToolTurnPort/approval ingress 的最终 implementation。
-6. standalone compaction、review 和 background work 是否产生 Item。
+5. standalone compaction、review和background work是否产生Item。
 
 ## 设计进度
 
@@ -1014,6 +1013,6 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - [x] 定义 WaitingApproval 与 Steer。
 - [x] 定义 terminal cleanup 和 conservative recovery。
 - [x] 区分 durable Item 与 transient observer delta。
-- [x] 完成 by-entry JSONL tree、Message/Event layout、EntryId、ToolRound gate 和 fork identity schema。
-- [ ] 完成 Session execution owner 与 private interaction ingress。
+- [x] 完成by-entry JSONL tree、Message/Event layout、EntryId、ToolRoundCompleted模型可见性规则和fork identity schema。
+- [x] 完成SessionExecutor与private ToolExecutionControl/Interaction request处理流程。
 - [ ] 完成 public Runtime protocol projection。

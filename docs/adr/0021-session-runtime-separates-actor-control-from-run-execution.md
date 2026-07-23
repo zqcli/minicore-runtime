@@ -1,7 +1,9 @@
 # ADR 0021: SessionRuntime 分离 actor 控制面与 run 执行
 
-状态：已接受
+状态：部分被[ADR 0025](0025-loaded-session-uses-one-session-executor.md)替代
 日期：2026-07-12
+
+ADR 0025保留本文的单一权威owner、运行期间持续处理控制请求、禁止跨外部I/O长期借用mutable state以及progress独立处理原则；替代本文强制的`SessionRuntime actor + RunTask`形状、session-scoped Tools ownership和batch writer术语。本文保留为历史决策记录。
 
 ## 背景
 

@@ -1,5 +1,7 @@
 # Prompt
 
+> 状态：pre-refactor implementation contract。当前PromptService、PromptSet和ordered ModelInstruction/ModelMessage `AssembledModelContext`以[Prompt子系统架构设计](../refactor/prompt-subsystem.md)为权威。
+
 `Prompt` 是 MiniCore 的无状态提示词与模型上下文组装深模块，对应未来的 `prompt.rs` / `prompt/`。它是 **唯一模型可见上下文组装 seam**：所有进入模型的 system prompt、工具 schema、已提交会话消息、用户输入展开结果、动态 context、输出契约和调用目的，都必须经过 Prompt 的 typed API 组装、排序、校验和 fingerprint。
 
 Prompt 不持有 `ResourceManager`、`Tools`、`SessionStorage`、provider、auth、queue 或 context provider handle。`SessionRuntime` 仍是 Pull Master：它决定何时捕获资源和工具 profile、何时读取 committed conversation、何时消费队列、何时收集 transient context，然后把这些 owner 已经捕获或授权的 typed inputs 传给 Prompt。Prompt 只做确定性纯组装。

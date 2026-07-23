@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：目标架构已确定；storage、Session execution 和公开 protocol integration 待后续阶段完成
+状态：目标架构已确定；公开protocol和实现待后续阶段完成
 日期：2026-07-16
 
 ## 目的
@@ -19,10 +19,10 @@
 
 本文不提前冻结：
 
-- Agent/Session 的 manager、actor、registry 或 store 具体类型；
+- Agent/Session durable store的具体实现类型；
 - Runtime command、query、event 和 transport payload；
 - SessionStorage entry/fork remap 的重复定义；这些以 [Conversation 与 SessionStorage 架构设计](conversation-storage.md) 为权威；
-- loaded Session 使用 task、actor、thread 或其他 execution owner；
+- loaded Session的SessionExecutor具体scheduler/runtime实现；其ownership以[Session Execution架构设计](session-execution.md)为权威；
 - Agent definition 的 Tool/Skill/Model 等未来完整字段；
 - physical purge、retention 和 revision GC 策略。
 
@@ -49,7 +49,7 @@ MiniCore 采用 Codex/Grok 的 durable/live 分离，但比这些项目更严格
 - Agent 更新只产生“新 revision 可用”，既有 Session 必须显式升级；
 - 一个 Session 只能引用一个 AgentId；普通 update 不能把 Session 改绑到另一个 Agent；
 - Session definition 使用不可变 `SessionDefinitionRevision`；
-- SessionDefinition 原子绑定 AgentRevisionRef、Workspace、Model 和 SessionPrompts；
+- SessionDefinition原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts；
 - Session durable lifecycle 使用 `Open / Archived / Deleted`；
 - `Deleted` 表示逻辑删除，历史与 exact revision reference 仍保留；物理清除使用 `Purge`；
 - `NotLoaded / Idle / Active / SystemError` 不再是 durable Session lifecycle；
@@ -74,7 +74,7 @@ Session
 ├─ SessionDefinition
 │  ├─ exact AgentRevisionRef
 │  ├─ Workspace
-│  ├─ Model
+│  ├─ SessionModelConfig
 │  └─ SessionPrompts
 └─ SessionStorage conversation
 
@@ -200,7 +200,7 @@ Deleted → terminal
 
 Agent disable/delete 不承担 security revocation。已完成 initiating UserMessage append 的 active Turn 使用不可变 Context，可以继续完成；需要立即停止时使用显式 Turn cancellation 或独立安全策略。
 
-candidate admission 在 initiating UserMessage append 前必须经过短 Agent lifecycle gate。disable/delete 与该 append 的胜负由该 gate 线性化，不能靠两个无保护状态读取猜测。
+candidate admission在initiating UserMessage append前必须经过短Agent lifecycle synchronization。disable/delete与该append的胜负由该synchronization线性化，不能靠两个无保护状态读取猜测。
 
 ## Agent 操作
 
@@ -225,7 +225,7 @@ expected current AgentRevision
 → 原子移动 current pointer
 ```
 
-允许在 Enabled 或 Disabled 状态更新；Deleted 返回 terminal lifecycle error。definition/metadata update 必须在 Agent lifecycle gate 内同时 CAS expected AgentRevision 和 `status != Deleted`，因此不能在 Delete 线性化后发布迟到 revision。
+允许在Enabled或Disabled状态更新；Deleted返回terminal lifecycle error。definition/metadata update必须在Agent lifecycle synchronization内同时CAS expected AgentRevision和`status != Deleted`，因此不能在Delete线性化后发布迟到revision。
 
 Agent update 不 fan-out 修改 Session，也不替换 active Turn Context。
 
@@ -235,11 +235,11 @@ name/description 更新只改变 metadata 和 `updated_at`，不产生 AgentRevi
 
 ### Disable / Enable / Delete
 
-- Disable、Enable 和 Delete 使用 Agent lifecycle gate；
+- Disable、Enable和Delete使用Agent lifecycle synchronization；
 - 重复进入相同状态幂等；
 - Deleted 不允许 Enable；
 - operation outcome unknown 时按 operation id 查询 durable head，不能重复创建其他状态事实；
-- loaded Sessions 可以接收 readiness invalidation，但 initiating UserMessage append 前的 durable AgentStatus gate 才是 authoritative 决策点。
+- loaded Sessions可以接收readiness invalidation，但initiating UserMessage append前的durable AgentStatus validation才是authoritative决策点。
 
 ## Session
 
@@ -265,11 +265,21 @@ pub struct SessionDefinition {
     pub revision: SessionDefinitionRevision,
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
-    pub model: Model,
+    pub model: SessionModelConfig,
     pub prompts: SessionPrompts,
     pub created_at: Timestamp,
 }
 ```
+
+```rust
+pub struct SessionModelConfig {
+    pub selection: ModelSelection,
+    pub reasoning: ReasoningPreference,
+    pub max_output_tokens: Option<NonZeroU32>,
+}
+```
+
+SessionDefinition只保存stable selection和用户偏好，不保存provider endpoint、credential、capabilities或client。Turn admission通过`ModelGateway.resolve_for_turn(...)`把它解析为exact `TurnModelSnapshot`；catalog change只影响future Turn，active Turn不执行cross-model fallback。
 
 基础关系：
 
@@ -343,7 +353,7 @@ expected SessionDefinitionRevision
 
 active Turn、Steer、retry 和 compaction继续使用旧 capture；在 update 线性化点之后开始 admission 的 future Turn 使用新 revision。
 
-loaded Session 只能缓存 current definition head 作为可丢弃 projection。definition update 成功 commit 后，execution owner 在同一 per-session gate 内应用新的 committed pointer；Turn admission 仍以 durable current head/CAS 为准，不能因为 loaded cache 过期而继续创建旧 revision 的 future Turn。
+loaded Session只能缓存current definition head作为可丢弃projection。definition update成功commit后，execution owner在同一per-session lifecycle synchronization内应用新的committed pointer；Turn admission仍以durable current head/CAS为准，不能因为loaded cache过期而继续创建旧revision的future Turn。
 
 Workspace security restriction 是例外，分为两条 fail-closed 路径：
 
@@ -357,14 +367,14 @@ definition-changing restriction
 → 返回 update success
 
 authority-only restriction
-→ authority 在自己的 gate 内原子发布新 authority revision/policy 并 revoke 旧 lease
+→ authority在自己的publication synchronization内原子发布新authority revision/policy并revoke旧lease
 → 通知 execution owner并 terminalize 受影响 active Turn
 → 使用 current exact SessionDefinition 重新 resolve
 → 发布受限的新 Snapshot，或 SessionReadiness = Unavailable
 → SessionDefinitionRevision 不变
 ```
 
-若 definition-changing 路径在 revoke 后 commit 失败，旧 definition 仍是 durable current，但旧 lease 不得恢复；Session readiness 进入 Unavailable，等待从 durable truth 重新 resolve/repair。不能出现 security update 已对调用方确认而旧 lease 仍能通过 model/tool/skill barrier 的窗口。
+若 definition-changing 路径在 revoke 后 commit 失败，旧 definition 仍是 durable current，但旧 lease 不得恢复；Session readiness 进入 Unavailable，等待从 durable truth 重新 resolve/repair。不能出现security update已对调用方确认而旧lease仍能通过model/tool/skill authorization validation的窗口。
 
 ## Session Pin Agent Revision
 
@@ -634,12 +644,12 @@ Deny  → 产生 denied ToolResult
 
 ### Steer
 
-Steer 到达时 Turn 保持 Running。请求必须携带 `expected TurnId`，并在 current-Turn gate 内验证目标仍是同一个 Running Turn：
+Steer到达时Turn保持Running。请求必须携带`expected TurnId`，并在current-Turn validation中验证目标仍是同一个Running Turn：
 
 ```text
 Steer(expected TurnId) accepted
 → current Turn control queue
-→ stable barrier append Steer
+→ 当前model/tool operation完成后append Steer
 → 下一次模型调用看见 Steer
 ```
 
@@ -662,12 +672,12 @@ resolve pending Interaction as cancelled
 
 ```text
 验证 Workspace / Model / SessionPrompts candidate
-→ 获取 Agent lifecycle gate
+→ 获取Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
-→ 在同一 gate 内读取 current AgentRevisionRef
+→ 在同一synchronization内读取current AgentRevisionRef
 → durable 写入 SessionDefinitionRevision(1)
 → durable 发布 Session { Open, current = 1 }
-→ 确认 publication outcome 后释放 gate
+→ 确认publication outcome后释放synchronization
 ```
 
 create 的 baseline 结果是 `Open + Unloaded`。create-and-load 是上层组合，不改变 create 的 durable 语义。
@@ -676,37 +686,37 @@ create 使用预分配 SessionId 和 operation id。outcome unknown 时必须查
 
 ## Update Session Definition
 
-只允许 Open Session。普通 definition update 只能改变 Workspace、Model 或 SessionPrompts；`AgentRevisionRef` 变化必须走显式 Agent upgrade 路径，不能绕过 Agent lifecycle gate。
+只允许Open Session。普通definition update只能改变Workspace、Model或SessionPrompts；`AgentRevisionRef`变化必须走显式Agent upgrade路径，不能绕过Agent lifecycle synchronization。
 
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision
 + complete candidate definition
-→ 在 per-session lifecycle gate 内 validate / CAS
+→ 在per-session lifecycle synchronization内validate / CAS
 → publish revision N+1
 ```
 
 active Turn 不受 ordinary definition update 影响。FollowUp 在真正 admission 时读取 update 后的 current revision。successful update 必须让 loaded execution 的 current-definition projection 与 durable head 一致；若 projection apply 失败，Session 进入 Unavailable 并从 durable truth reload，不能悄悄继续使用旧 head。
 
-metadata update 与 definition update 分开，避免改标题导致 execution Context fingerprint 变化。metadata update 可以作用于 Open 或 Archived，但必须在 per-session lifecycle gate 内 CAS `lifecycle != Deleted` 和 metadata version。
+metadata update与definition update分开，避免改标题导致execution Context fingerprint变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
 
 ## Load Session
 
 load 语义：
 
 ```text
-在 per-session residency/lifecycle gate 内确认 SessionLifecycle = Open
+在per-session residency/lifecycle synchronization内确认SessionLifecycle = Open
 → single-flight 标记 Loading，并 capture current SessionDefinitionRevision
 → 读取 Agent durable head / AgentStatus
 → 读取 exact AgentRevisionRef 对应的 AgentDefinition
 → 重建 committed conversation projection
 → WorkspaceResolver::resolve(definition.workspace)
 → 注入 Runtime Prompt/Tool/Skill/Model dependencies
-→ 重新进入 gate，CAS lifecycle 仍为 Open 且 current revision 未变化
+→ 重新进入synchronization，CAS lifecycle仍为Open且current revision未变化
 → 原子发布 loaded execution state
 ```
 
-若 final CAS 发现 SessionDefinitionRevision 已变化，必须丢弃旧 resolve 结果并按新 revision 重试或返回 retryable stale error，不能把旧 Workspace/Model/Prompt projection 发布为 current loaded state。
+若 final CAS 发现 SessionDefinitionRevision 已变化，必须丢弃旧 resolve 结果并按新 revision 重试或返回 retryable stale error，不能把旧Workspace/SessionModelConfig/Prompt projection 发布为 current loaded state。
 
 重复 load 幂等返回同一个 loaded execution owner/handle。
 
@@ -737,7 +747,7 @@ SessionExecutionState = Idle
 无 admission reservation
 无 active Turn
 无 pending Interaction
-无 in-flight entry append
+当前没有正在执行的entry append
 ```
 
 不满足时返回 Busy。调用方必须显式 cancel/resolve，并等待 terminal append 完成。
@@ -871,12 +881,12 @@ SessionDefinition.prompts
 推荐顺序：
 
 ```text
-Session lifecycle/load/readiness/execution gate
+Session lifecycle/load/readiness/execution validation
 → reserve candidate Turn
 → capture exact SessionDefinitionRevision
 → 读取 exact AgentDefinition 并 capture WorkspaceSnapshot
 → capture SkillCatalog / ToolSet / PromptSet
-→ 获取短 Agent lifecycle gate
+→ 获取短Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在gate内append TurnContext和initiating UserMessage，并确认outcome
 ```
@@ -890,7 +900,7 @@ Workspace/Prompt/Tool/Skill/Model exact fingerprints/references
 ExecutionContextFingerprint
 ```
 
-Agent current revision不参与Turn capture，因为Session已经pin exact AgentRevisionRef。Agent status的authoritative check与initiating UserMessage append使用同一个短lifecycle gate；capture前的status/readiness check只用于提前失败。
+Agent current revision不参与Turn capture，因为Session已经pin exact AgentRevisionRef。Agent status的authoritative check与initiating UserMessage append使用同一个短lifecycle synchronization；capture前的status/readiness check只用于提前失败。
 
 ## Active 与 Future Turn
 
@@ -899,7 +909,7 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 | Agent 发布新 revision | 保持 exact Session pin | 不变 | 仍使用 Session pin，直到显式升级 |
 | Session 显式升级 Agent | 已捕获旧 SessionDefinitionRevision 者不变 | 不变 | 使用新 AgentRevisionRef |
 | Session definition ordinary update | 已捕获旧 revision 者不变 | 不变 | 使用新 SessionDefinitionRevision |
-| Agent disable/delete | input append 前 gate 决定胜负 | 已开始 Turn 继续 | admission 拒绝 |
+| Agent disable/delete | input append前的synchronization决定胜负 | 已开始Turn继续 | admission拒绝 |
 | Session archive/delete | 要求先无 candidate | 要求先无 active Turn | lifecycle 状态拒绝 |
 | ordinary Workspace update | 已捕获旧 basis 者不变 | 不变 | 使用新 definition/snapshot |
 | restrictive Workspace update | lease/final check 失败 | revoke 并中断 | 使用新 Snapshot |
@@ -909,11 +919,11 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 
 ### Definition Update vs Turn Admission/Load
 
-Session admission gate 保证 candidate 得到完整旧 SessionDefinition 或完整新 SessionDefinition，不允许字段跨 revision 混合。Loading 使用 captured revision 构建临时状态，并在 publication 前 CAS current head；definition update 先赢时旧 load result 被丢弃。
+Session admission synchronization保证candidate得到完整旧SessionDefinition或完整新SessionDefinition，不允许字段跨revision混合。Loading使用captured revision构建临时状态，并在publication前CAS current head；definition update先赢时旧load result被丢弃。
 
 ### Agent Disable/Delete vs Turn Start Append
 
-短 Agent lifecycle gate 决定：
+短Agent lifecycle synchronization决定：
 
 ```text
 status mutation先赢
@@ -927,9 +937,9 @@ Agent lifecycle gate从final Enabled check持有到initiating UserMessage append
 
 ### Session Definition/Metadata Update vs Archive/Delete
 
-Session definition update 必须在 per-session lifecycle gate 内同时 CAS `SessionLifecycle::Open` 与 expected revision；metadata update CAS `lifecycle != Deleted` 与 expected metadata version。Archive/Delete 先赢时不满足该 operation 前置条件的迟到 update 失败；update 先赢时 lifecycle mutation 观察新的 durable head。
+Session definition update必须在per-session lifecycle synchronization内同时CAS `SessionLifecycle::Open`与expected revision；metadata update CAS `lifecycle != Deleted`与expected metadata version。Archive/Delete先赢时不满足该operation前置条件的迟到update失败；update先赢时lifecycle mutation观察新的durable head。
 
-跨 Agent/Session 操作使用固定 gate 顺序 `Agent lifecycle → Session lifecycle`，避免 Agent disable、Session upgrade/fork 和 archive 之间形成锁环。
+跨Agent/Session操作使用固定synchronization顺序`Agent lifecycle → Session lifecycle`，避免Agent disable、Session upgrade/fork和archive之间形成锁环。
 
 ### Load vs Load
 
@@ -937,7 +947,7 @@ Session definition update 必须在 per-session lifecycle gate 内同时 CAS `Se
 
 ### Load/Admission vs Unload/Archive/Delete
 
-使用同一个 per-session residency/lifecycle gate 串行化。不能让旧 loaded state 和新 loaded state 同时存在。
+使用同一个per-session residency/lifecycle synchronization串行化。不能让旧loaded state和新loaded state同时存在。
 
 ### Entry Append vs Cancel/Unload
 
@@ -1078,14 +1088,14 @@ Agent release channel
 - Session pin exact AgentRevisionRef；
 - Agent current update 不自动改变 Session；
 - Session 只能升级同一个 AgentId 的 revision；
-- SessionDefinitionRevision 原子绑定 Agent、Workspace、Model 和 SessionPrompts；
+- SessionDefinitionRevision原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts；
 - Session 不持有 Runtime Service handle；
 - Session durable lifecycle 与 load/readiness/execution state 分离；
 - Open 不等于 Loaded；Loaded 不等于 Ready；Ready 不等于 Running；
 - Deleted 是逻辑删除，Purge 才是物理清除；
 - archive/unload/delete 不使用同一个 close 语义；
 - active Turn 使用 captured exact definitions，不受 ordinary update 影响；
-- Agent disabled/deleted 与 CreateSession、upgrade、fork publication 和 initiating UserMessage append 使用同一 lifecycle gate 线性化；
+- Agent disabled/deleted与CreateSession、upgrade、fork publication和initiating UserMessage append使用同一lifecycle synchronization线性化；
 - Agent disabled/deleted 阻止 future admission，但不 patch active Context；
 - Workspace restrictive update仍可 revoke active Turn；
 - WaitingApproval 时 Turn 仍是 Running；
@@ -1124,9 +1134,9 @@ Agent release channel
 - WaitingApproval 保持 Turn Running；
 - Steer 在 WaitingApproval 时排队；
 - preempt approval 时 cancelled ToolResult + Steer 仍保持同一 Turn；
-- Agent disable/delete vs initiating UserMessage append final gate；
+- Agent disable/delete vs initiating UserMessage append final synchronization；
 - CreateSession/Agent upgrade/Fork publication vs Agent disable/delete；
-- Session definition/metadata update vs archive/delete lifecycle gate；
+- Session definition/metadata update vs archive/delete lifecycle synchronization；
 - Session definition update vs admission 捕获完整旧/新 revision；
 - entry append vs cancel/unload；
 - fork Open/Archived source，覆盖terminal boundary与mid-Turn message anchor；
@@ -1153,7 +1163,7 @@ Agent release channel
 5. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
 6. physical purge、retention 和 revision reachability GC。
 7. 多进程同时操作同一个 Agent/Session store 的并发实现。
-8. Session execution actor/task/handle 的最终 interface。
+8. SessionExecutionHandle如何映射到阶段9公开Runtime protocol。
 9. public command/query/event/snapshot lifecycle payload。
 
 ## 设计进度
@@ -1173,4 +1183,5 @@ Agent release channel
 - [x] 定义 conservative crash recovery。
 - [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
 - [x] 完成 Session ledger identity、entry parent tree、fork remap 和 append contract。
-- [ ] 完成 Session execution owner 与公开 Runtime interface。
+- [x] 完成SessionExecutor owner和crate-private request interface。
+- [ ] 完成公开Runtime interface。

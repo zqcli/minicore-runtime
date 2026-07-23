@@ -157,7 +157,7 @@ pub(crate) struct TurnExecutionContext {
 
 字段保持私有；模型调用和 Tool 执行通过窄操作完成，避免不同 Turn 的子快照被交叉组合。
 
-### Transcript-First 与 append/apply conversation gate
+### Transcript-First与conversation projection更新顺序
 
 所有模型可见conversation fact必须先形成规范化entry、成功append并apply trusted delta：
 
@@ -272,7 +272,7 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, turn_port, cancellation, updates
+     provider: model.capabilities(), execution_mode, execution_control, cancellation, progress_events
    }) → ToolSet
 
 SkillCatalog.prompt_view()
@@ -307,7 +307,7 @@ SkillCatalog.prompt_view()
 - Session pin exact `AgentRevisionRef`，Agent update 不自动改变已有 Session；
 - Session 显式升级 Agent revision 的 CAS 和同 AgentId 约束；
 - Session create、definition update、load/unload、archive/unarchive、delete；
-- `SessionDefinitionRevision` 原子绑定 AgentRevisionRef、Workspace、Model 和 SessionPrompts；
+- `SessionDefinitionRevision`原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts；
 - 一个 Agent 对多个 Session、一个 Session 只绑定一个 AgentId；
 - Agent `Enabled / Disabled / Deleted` 和 Session `Open / Archived / Deleted`；
 - transient `SessionLoadState / SessionReadiness / SessionExecutionState`；
@@ -370,7 +370,7 @@ SkillCatalog.prompt_view()
 - `StoredEntryBody = TurnContext | Message | Event | Compaction`；
 - standard message roles `user | assistant | tool`，assistant finalized response 按原始 content 顺序保存；
 - operational facts 与 conversation promotion facts 位于同一个 durable log；
-- initiating input、Interaction、Tool side-effect barrier、tool messages、`tool_round_completed`、Steer、Compaction 和 terminal entries；
+- initiating input、Interaction、ToolExecutionStarted前置记录、tool messages、`tool_round_completed`、Steer、Compaction和terminal entries；
 - ItemId、ToolCallId 和 EntryId 分离；
 - `CommittedConversationState / View / Delta / Checkpoint`；
 - trusted all-projection apply、AdvanceOnly 和 mismatch reload；
@@ -397,31 +397,36 @@ SkillCatalog.prompt_view()
 docs/refactor/session-execution.md
 ```
 
-当前研究与handoff：[Session Execution 研究进度](session-execution-progress.md)。
+状态：目标架构已确定。
 
-必须定义：
+研究与handoff：[Session Execution 研究进度](session-execution-progress.md)。
 
-- Turn admission 和 UserMessage 创建；
-- TurnExecutionContext 创建和持有；
-- model → Tool → model 循环；
-- stable ToolRound；
-- Steer 作为 current Turn control input、FollowUp 作为下一 Turn submission；
-- retry、overflow recovery、cancellation 和 timeout；
-- pending Interaction 的等待与恢复；
-- ToolTurnPort 如何通过唯一 SessionWriter 实现 approval 和 execution-start barriers；
-- SessionEntryDraft construction、sequential append、apply_committed、conversation gate、事件和状态变更的顺序；
-- Session actor、run task 或其他 execution owner 是否必要。
+已明确：
 
-只有在状态机和所有权明确后，才决定最终使用 manager、actor、task 或 registry 的具体形状。
+- 一个loaded Session由一个`SessionExecutor`拥有执行期mutable state；
+- 一个Runtime允许多个SessionExecutor同时Running；
+- bounded FIFO `SessionRequestQueue`和typed request response；
+- `Idle → Starting → Running → Finishing → Idle`状态机；
+- Context构造、UserMessage composition、Model和Tool使用异步`RunningOperation`；
+- operation result使用`SessionId + TurnId + execution_version + OperationType`校验；
+- private AgentLoop只返回`NeedModel | NeedTools | Finished`；
+- `ToolExecutionControl`负责approval和execution-start的required durable ordering；
+- Submit、Steer、FollowUp、ResolveInteraction、Cancel、PrepareForUnload和Snapshot流程；
+- FollowUp使用bounded process-local FIFO；
+- progress event与request queue分离；
+- restart不恢复旧异步操作，unfinished Turn保守terminalize；
+- multi-session共享Model/Tool资源时使用明确并发限制和canonical resource locks。
 
 完成门槛：
 
-- 每个 mutation 只有一个执行 owner；
-- 同一 Turn 复用同一个 TurnExecutionContext、PromptSet、ToolSet 和 pinned SkillCatalog；
-- Session execution 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
-- append、all-projection apply、模型可见性、side effect 和 UI 可见性顺序无歧义；
-- abort/retry/recovery 不产生重复 terminal fact；
-- session execution 可以通过公开 interface 进行集成测试。
+- [x] 每个Session mutation只有一个执行owner；
+- [x] 同一Turn复用一个TurnExecutionContext、PromptSet、ToolSet和pinned SkillCatalog；
+- [x] SessionExecutor驱动AgentLoop，但AgentLoop不拥有storage、Prompt assembly或Tool execution；
+- [x] append、projection apply、模型可见性、side effect和UI event顺序无歧义；
+- [x] retry、Cancel和recovery不产生重复terminal fact；
+- [x] crate-private interface可以通过synthetic request/operation result集成测试；
+- [ ] 完成Rig 0.40.0 adapter spike；
+- [ ] 实现SessionExecutor和自动化测试。
 
 ### 阶段 7：ModelGateway
 
@@ -431,23 +436,31 @@ docs/refactor/session-execution.md
 docs/refactor/model-gateway.md
 ```
 
-必须定义：
+状态：目标架构已确定。
 
-- `AssembledModelContext` 到 provider-neutral request；
-- Model identity、capabilities 和 effective limits；
-- system/developer/user role 映射；
-- ToolSpec、tool choice 和 output contract 映射；
-- stream event、usage、finish reason 和 provider error；
-- provider retry 与 Session retry 的边界；
-- authentication 和 secret redaction；
-- provider cache-control 和 payload encoding。
+已明确：
+
+- `ModelGateway::resolve_for_turn(...)`固定exact TurnModelSnapshot；
+- `ModelGateway::generate_model_turn(...)`是唯一真实模型调用interface；
+- `AssembledModelContext`到provider request的role/tool/output mapping；
+- Model identity、capabilities、effective limits和generation policy；
+- streaming progress与finalized result分离；
+- usage、finish reason、reasoning和allowlisted provider metadata规范化；
+- provider retry、transport fallback与Session logical retry的边界；
+- active Turn内禁止transparent cross-model fallback；
+- authentication、secret redaction、custom provider和concurrency治理；
+- prompt cache、connection reuse和continuation必须保持full-request equivalence；
+- Rig provider差异只存在于private adapter。
 
 完成门槛：
 
-- ModelGateway 不重新组装 Prompt；
-- PromptSet 是模型上下文的唯一 producer；
-- provider adapter 差异不泄漏到 Session execution；
-- 错误分类足以驱动 retry、compaction 或 terminal failure。
+- [x] ModelGateway不重新组装Prompt；
+- [x] PromptSet是模型上下文的唯一producer；
+- [x] provider adapter差异不泄漏到Session execution；
+- [x] 错误分类足以驱动retry、compaction或terminal failure；
+- [x] provider cache/continuation不是第二conversation truth；
+- [ ] 执行Rig 0.40.0 ModelGateway integration spike；
+- [ ] 实现ModelGateway、Rig adapter和mock-server tests。
 
 ### 阶段 8：Compaction
 
@@ -620,7 +633,7 @@ Git 已经保存历史版本，因此不要仅为了“以后可能查看”而�
 
 - 改变顶层 ownership；
 - 删除或替代一个长期模块；
-- 改变 durable truth 或 append/apply conversation gate；
+- 改变durable truth或conversation projection更新顺序；
 - 改变公开 protocol contract；
 - 引入新的跨子系统 lifecycle；
 - 推翻已有 Accepted ADR。
@@ -644,7 +657,7 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 
 - value type、排序、fingerprint：单元测试；
 - Service interface、cache、reload、conflict：模块测试；
-- TurnExecutionContext、ToolRound、append/apply conversation gate：集成测试；
+- TurnExecutionContext、ToolRound和conversation projection更新顺序：集成测试；
 - storage reload、fork、crash recovery：持久化测试；
 - provider mapping：adapter contract test；
 - Runtime command/event/snapshot：端到端 protocol test。
@@ -669,10 +682,10 @@ Runtime facade 是唯一外部入口
 - [ ] 所有阶段 1–9 的目标文档已稳定；
 - [ ] 目标 interface 已实现；
 - [ ] 生产调用方不再依赖旧 ResourceManager、旧 Prompt、旧 Tools 或旧 SessionRuntime ownership；
-- [ ] 所有模型调用只接收 `AssembledModelContext`；
-- [ ] 所有模型可见 conversation fact 遵守 append/apply conversation gate；
+- [ ] 所有模型调用只接收ModelCallRequest，且其唯一model-visible input是`AssembledModelContext`；
+- [ ] 所有模型可见conversation fact遵守append/apply和conversation projection规则；
 - [x] Agent/Session revision 与 durable/runtime lifecycle 语义已确定；
-- [x] TurnExecutionContext 可以稳定绑定 AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 Model；
+- [x] TurnExecutionContext 可以稳定绑定 AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog和TurnModelSnapshot；
 - [x] Session load/reload/unload 与 fork lifecycle 有确定行为；
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
@@ -691,7 +704,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 按照本文顺序，下一份目标设计文档是：
 
 ```text
-docs/refactor/session-execution.md
+docs/refactor/compaction.md
 ```
 
-Conversation/SessionStorage 已确定为“one SessionWriter + one by-entry JSONL tree + rebuildable projections”。下一阶段需要定义 Session execution owner、entry construction、AgentLoop drive、FollowUp queue、append/apply conversation gate 和 terminal arbitration；公开 protocol 仍留到 execution 与 ModelGateway 稳定后冻结。
+ModelGateway已确定为“exact TurnModelSnapshot + one deep generate_model_turn operation + private provider adapters”。下一阶段需要冻结Compaction orchestration；公开Runtime protocol仍留到Compaction稳定后冻结。

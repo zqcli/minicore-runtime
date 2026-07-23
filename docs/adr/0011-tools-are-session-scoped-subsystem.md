@@ -1,7 +1,9 @@
 # ADR 0011: Tools 是 SessionRuntime 内部的 Session-Scoped 子系统
 
-状态：已接受
+状态：ownership部分被[ADR 0025](0025-loaded-session-uses-one-session-executor.md)替代
 日期：2026-07-07
+
+ADR 0025和当前[Tool子系统目标设计](../refactor/tool-subsystem.md)将Tools ownership改为MiniCoreRuntime-owned ToolService + Turn-pinned ToolSet，并由SessionExecutor通过ToolExecutionControl协调approval和execution-start记录。本文保留为pre-refactor历史决策。
 
 ## 背景
 
