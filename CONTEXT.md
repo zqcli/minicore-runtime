@@ -2,6 +2,8 @@
 
 本上下文描述 MiniCore：一个提供 Agent harness 能力的原生运行时核心。它把模型调用、会话、资源、工具、`CommandSurface`、事件和持久化编排收敛在 UI 无关的 runtime 中；后期 RuntimeHooks 作为内部扩展点接入；CLI、TUI 和 GUI 产品会在独立仓库中以 MiniCore 为核心接入。
 
+> **权威顺序**：当前架构文档（`docs/architecture.md` 与 `docs/modules/`）→ 当前 ADR（`docs/adr/`，0100+）→ `docs/research/` → `docs/archive/v1/`（非权威，仅历史参考）。本术语表中标注为「目标架构」的条目即当前 V2 权威架构（设计已冻结，实现进行中）；标注为「pre-refactor term」的名称属于已归档的 V1，仅用于说明术语演变，不得作为当前实现依据。
+
 ## 语言
 
 **MiniCore**：
@@ -446,7 +448,7 @@ ModelGateway通过bounded ProgressEventPublisher发布的process-local attempt/d
 _避免_：durable Message、第二event log、cancellation token
 
 **压缩摘要指令（`CompactionSummaryDirective`）**：
-`Compaction`根据strict stable-unit plan生成的摘要格式、typed instruction和最大输出token预算。它不是system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id或工具schema；`SessionExecutor`把它和trusted `CommittedConversationPrefixView`交给active PromptSet的`CompactionSummary` assembly variant，固定`OutputContract::NoToolCalls`。完整规则见`docs/refactor/compaction.md`。
+`Compaction`根据strict stable-unit plan生成的摘要格式、typed instruction和最大输出token预算。它不是system prompt、模型调用请求或最终模型上下文，不包含模型选择、thinking/stream policy、call/run id或工具schema；`SessionExecutor`把它和trusted `CommittedConversationPrefixView`交给active PromptSet的`CompactionSummary` assembly variant，固定`OutputContract::NoToolCalls`。完整规则见`docs/modules/compaction.md`。
 _避免_：SummaryModelRequest、ModelCallRequest、AssembledModelContext、系统提示词状态
 
 **压缩计划（`CompactionPlan`）**：

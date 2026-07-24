@@ -1,5 +1,7 @@
 # Workspace 子系统架构设计
 
+> **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
+
 状态：目标架构已确定；实现细节待补充
 日期：2026-07-16
 
