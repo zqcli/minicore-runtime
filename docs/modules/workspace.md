@@ -849,7 +849,7 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, execution_control, cancellation, progress_events
+     provider: model.capabilities(), execution_control, cancellation, progress_events
    }) → ToolSet
 
 SkillCatalog.prompt_view()

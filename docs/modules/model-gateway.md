@@ -435,7 +435,6 @@ pub struct ResolveTurnModelRequest {
     pub selection: ModelSelection,
     pub requested_reasoning: ReasoningPreference,
     pub requested_max_output_tokens: Option<NonZeroU32>,
-    pub execution_mode: ExecutionMode,
 }
 ```
 
@@ -1463,7 +1462,7 @@ unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage dur
 - partial draft不持久化；
 - request已发送但尚未开始response时映射为RequestOutcomeUnknown；已产生partial response后映射为StreamInterrupted；
 - SessionExecutor可以在不重放Tool且logical call basis不变时决定retry；
-- duplicate assistant prevention依赖只有terminal ModelCallResult才能append，且append使用稳定operation key。
+- duplicate assistant prevention依赖只有terminal ModelCallResult才能append；重复append的防护靠committed prefix状态（该assistant entry是否已存在）判断，不依赖durable operation key。
 
 ### Projection/Storage Failure
 
@@ -1480,7 +1479,7 @@ append失败时：
 
 - 不让AgentLoop继续到Tool execution；
 - NotCommitted可以重试同一assistant draft；
-- OutcomeUnknown按SessionWriter operation key解析；
+- SessionWrite OutcomeUnknown时保守终结、恢复靠committed prefix状态判断，不按operation key解析；
 - 不能重新调用provider来“确认”storage结果；
 - provider response只在current operation内保留到append outcome确定。
 

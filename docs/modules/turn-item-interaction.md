@@ -480,7 +480,7 @@ ModelStep
 ModelOutput entity
 ```
 
-SessionStorage entry operation key只是private storage value，不具有独立CRUD或lifecycle。
+SessionStorage entry 身份只用 EntryId + parent_id；不再有独立的 durable operation key 字段，也不具有独立CRUD或lifecycle。
 
 ## Item Identity 与 Ordering
 
@@ -510,6 +510,8 @@ EntryId
 Interaction 是 Runtime 在 Running Turn 内发起、等待外部回答的 durable request：
 
 ```rust
+// IdempotencyKey：调用方提供，仅用于活跃 run 内的 resolution 去重（防 host 重复发同一 resolution），
+// 不是 durable crash key；storage 层 entry 不再有 operation_key 字段。
 pub struct IdempotencyKey;
 
 pub struct Interaction {
@@ -682,7 +684,7 @@ client reconnect
 
 - notification 丢失不丢 request；
 - reconnect 不创建新 RequestId；
-- lost response acknowledgement 使用同一个 durable resolution_key 重试；
+- lost response acknowledgement 使用同一个 resolution_key（in-run dedup）在活跃 run 内重试；
 - abrupt client disconnect 默认不等于 Deny 或 Cancel；
 - pending Interaction 使 Session execution 非 Idle，Unload 返回 Busy；
 - host 可以显式关闭 transport 并提交 Cancelled(TransportClosedByHost)；
@@ -735,7 +737,7 @@ append InteractionResolution::Cancelled(SteerPreempted)
 
 ## Turn Terminal Cleanup
 
-Turn terminal entry 前必须使领域projection闭合。Runtime-generated closure使用由terminal operation + RequestId派生的稳定resolution_key；每条cleanup entry使用稳定operation key，使crash retry幂等：
+Turn terminal entry 前必须使领域projection闭合。Runtime-generated closure使用由terminal operation + RequestId派生的resolution_key做本轮去重；crash 后的重复 cleanup 幂等靠 committed prefix 状态判断（该 Interaction 已 resolved、该 Turn 已 terminal 则跳过），不依赖 durable operation key；exclusive lease 下恢复单跑，重复恢复靠状态跳过：
 
 ```text
 all Pending Interaction → Resolved(Cancelled(reason)) 或 Resolved(Expired)
@@ -883,7 +885,7 @@ StaleProjection
 - initiating/terminal append outcome unknown；
 - reconnect resend vs original response acknowledgement。
 
-全部race由per-session SessionExecutor、expected TurnId和idempotency key线性化。
+全部race由per-session SessionExecutor、expected TurnId和in-run idempotency（resolution/submission dedup）线性化。
 
 ## 被否决的方案
 
@@ -976,7 +978,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - response vs terminal cleanup first-wins；
 - disconnect 后 pending 保留；
 - reconnect 使用相同 RequestId resend；
-- lost acknowledgement 使用 durable resolution_key retry；
+- lost acknowledgement 使用 in-run resolution_key retry；
 - WaitingApproval 中 Steer 排队；
 - Steer preempt 先 cancelled ToolResult 再 Steer；
 - Tool side effect前完成resolution并重新检查Cancel state和current authorization；
@@ -984,7 +986,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - recovery 不生成 synthetic ToolResult；
 - terminal projection 不含 Pending Interaction 或 Started Item；
 - Tool-level failure 不自动把 Turn 标为 Failed；
-- tool_round_completed、terminal和recovery entry idempotency。
+- tool_round_completed、terminal和recovery entry 幂等（靠 committed prefix 状态判断——已 resolved/已 terminal 则跳过，不依赖 durable operation key）。
 
 ## 后续问题
 

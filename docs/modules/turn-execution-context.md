@@ -255,12 +255,14 @@ SessionId + exact SessionDefinitionRevision
 SessionDefinition.agent = exact AgentRevisionRef
 SessionDefinition.workspace / model / prompts
 exact AgentDefinition.prompts
-execution mode、Turn-scoped ToolExecutionControl、cancellation和ProgressEventPublisher
+Turn-scoped ToolExecutionControl、cancellation和ProgressEventPublisher
 ```
 
 SessionDefinitionRevision保证AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts来自同一个committed definition。Prompt/Skill adapter 不得按 AgentId 或 SessionId 回查 current heads。
 
-`candidate TurnId` 只表示已预留的 execution identity。stable submission/idempotency key 由外层 admission reservation 持有，不进入 TurnExecutionContext 或其 fingerprint。capture 成功不代表领域 Turn 已经创建。
+presentation 层的前台/后台（用户当前查看哪个 Session）不是 capture 输入，也不进 model resolution、tool for_turn 或 `ExecutionContextFingerprint`；runtime 对所有 loaded Session 一视同仁，共享 Model/Tool 资源由明确配额和 canonical resource lock 协调。若将来出现「后台自主 Turn 必须自动处理审批」这类需求，应建成 tool execution 路径上一个窄的、不进 fingerprint 的 approval disposition，而不是回到 capture 层的前后台标记。
+
+`candidate TurnId` 只表示已预留的 execution identity。stable submission/idempotency key 由外层 admission reservation 持有，仅作为**活跃 run 内**的去重幂等标识（防止重复 Submit），不进入 TurnExecutionContext 或其 fingerprint。它**不承诺跨崩溃 durable 重建**：OutcomeUnknown 不再靠它 reopen 或 replay-by-key，恢复统一读 committed prefix 加状态检查。capture 成功不代表领域 Turn 已经创建。
 
 ## Capture 依赖图
 
@@ -280,7 +282,7 @@ exact SessionDefinitionRevision
             agent, session_id, session_revision, turn_id,
             workspace: workspace.tool_context(),
             provider: model.capabilities(),
-            execution_mode, execution_control, cancellation, progress_events
+            execution_control, cancellation, progress_events
           })
           └─ ToolSet
 
@@ -367,7 +369,7 @@ initiating UserMessage entry是领域Turn的开始线性化点。Agent status sy
 
 capture、Skill load、UserMessage composition、Context append或UserMessage append失败时，释放candidate和局部Context，SessionExecutionState返回Idle；仅有orphan Context entry不创建空Turn或`Failed` Turn。
 
-如果UserMessage append返回OutcomeUnknown，Session execution必须通过admission operation key和storage reload确认结果，不能直接分配另一个TurnId重试。
+如果initiating UserMessage append返回NotCommitted（写入尚未开始，可安全重试同一 draft），可以重试同一 candidate 的同一 append。如果返回OutcomeUnknown（写入已开始但 ack 丢失），Session execution保守终结当前 admission、poison 该 writer、不在本 run 重试该 append、也不分配另一个 TurnId；OutcomeUnknown 不携带 operation_key，不在本 run reopen 或 replay-by-key。此时该 unacked initiating UserMessage 可能丢失，Turn 视为未开始，用户可重新提交。恢复靠下次 load 读 committed prefix 加状态检查，幂等性由状态判断保证，不依赖 operation key。
 
 Session pin exact AgentRevisionRef：
 
@@ -643,7 +645,7 @@ logical model-call retry
 
 partial stream 是 draft。retry 前关闭该 draft lifecycle，但不写入 conversation。
 
-`tool_round_completed` 已成功 append/apply 后的下一次模型调用可以 retry，因为 Tool 不会重放。Tool executor outcome unknown 时不能自动重放 Tool；SessionWrite OutcomeUnknown 则必须按 operation key 解析原 durable append，不能混为 executor outcome unknown。
+`tool_round_completed` 已成功 append/apply 后的下一次模型调用可以 retry，因为 Tool 不会重放。Tool executor outcome unknown 时不能自动重放 Tool；SessionWrite OutcomeUnknown 时保守终结当前 round、恢复靠 committed prefix，不重放 Tool，也不能混为 executor outcome unknown。
 
 ## Compaction
 
@@ -729,7 +731,7 @@ Context capture 的原子性指领域发布原子性，不要求回滚内部 cac
 
 Tool外部副作用与model-visible ToolRound completion无法形成通用分布式事务。assistant tool_call content先保存Started ToolInvocation；执行任何Tool side effect前，SessionStorage必须append非模型可见的`tool_execution_started`event；approval request和resolution也必须先durable append。它们不进入Prompt conversation，也不允许下一次逻辑模型调用看见半个ToolRound。
 
-若exact ToolResult已知但role=tool message append返回NotCommitted，可以只重试同一entry；返回SessionWrite OutcomeUnknown时必须按operation key reopen/replay，已append则apply原receipt，已证明未append则重试同一draft。Tool message都已append后，`tool_round_completed`使用独立operation keyappend；其OutcomeUnknown同样只解析该entry，不能重放Tool。只有executor/side-effect outcome unknown时，同一个ToolInvocation Item才进入Abandoned且不生成synthetic ToolResult。完整schema见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
+若exact ToolResult已知但role=tool message append返回NotCommitted（写入尚未开始，可安全重试），可以只重试同一entry；返回SessionWrite OutcomeUnknown时保守终结当前round，不在本run重试该append，该tool message视为未持久化，下次load按committed prefix恢复（round不完整则Abandon，模型重跑工具），不reopen/replay-by-key。Tool message都已append后，`tool_round_completed`同样按此规则append；其OutcomeUnknown也保守终结、恢复靠committed prefix，不重放Tool。只有executor/side-effect outcome unknown时，同一个ToolInvocation Item才进入Abandoned且不生成synthetic ToolResult。完整schema见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
 ## Fingerprint
 
@@ -1023,7 +1025,7 @@ AgentLoop registry
 - capture 最终 lease check 前发生 Workspace revocation；
 - capture failure 不创建领域 Turn；
 - initiating UserMessage append 前不调用模型或 Tool；
-- initiating UserMessage append OutcomeUnknown 的幂等恢复；
+- initiating UserMessage append NotCommitted 时重试同一 draft；OutcomeUnknown 时保守终结、不在本 run 重试该 append、不分配另一个 TurnId，Turn 视为未开始，用户可重新提交；
 - PromptSet assembly 无法接收另一个 ToolPromptView；
 - compose_message 和 initiating UserMessage append 前发生 revocation 时丢弃未 append contribution；
 - Skill lazy load 拒绝 current Catalog lookup 和 content hash 漂移；
@@ -1047,7 +1049,7 @@ AgentLoop registry
 - security revocation 阻止新的 model/tool/skill 操作；
 - revoked result 未 append 时被丢弃；
 - Tool side effect 已发起但 executor outcome unknown 时不自动重放，并把 ToolInvocation Abandoned；
-- exact ToolResult 已知但 SessionWrite OutcomeUnknown 时先按 operation key reopen/replay：已 append 则 apply 原 receipt，已证明未 append 则只重试同一 tool message draft；未解析前不把它误判为 Abandoned；
+- exact ToolResult 已知但 role=tool message append NotCommitted 时只重试同一 draft；SessionWrite OutcomeUnknown 时保守终结当前 round、不在本 run 重试该 append，该 tool message 视为未持久化，下次 load 按 committed prefix 恢复（round 不完整则 Abandon）；
 - client disconnect 后 Interaction 保持 Pending，reconnect 使用相同 RequestId；
 - duplicate/conflicting Interaction resolution；
 - process restart后existing tool message保持Item Completed，但不补做缺失ToolRound completion；

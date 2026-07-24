@@ -456,7 +456,6 @@ pub struct ToolTurnContext {
     pub turn_id: TurnId,
     pub workspace: WorkspaceToolContext,
     pub provider: ProviderCapabilities,
-    pub execution_mode: ExecutionMode,
     execution_control: Arc<dyn ToolExecutionControl>,
     pub cancellation: CancellationToken,
     pub updates: Arc<dyn ToolUpdateSink>,
@@ -714,7 +713,7 @@ pub enum ToolApprovalDecision {
 - 最终 PermissionSet 是 ToolRequirements、WorkspaceAccessView、ToolPolicy 上限、已有 grant 和 approval decision 的交集；
 - `AllowWith` 以 ToolPolicy 允许的 ToolRequirements 为上限，只能进一步收紧；交集无法满足执行要求时在 executor 前拒绝；
 - grant 使用明确 key 保存，不从一条 resolved Interaction 隐式推断；
-- ToolExecutionControl unavailable或durable append已确定NotCommitted时，Ask决策fail closed且不执行Tool；OutcomeUnknown必须先按operation key reopen/replay，未解析前既不通知host也不执行Tool；validation/policy/approval deny返回PreExecution outcome，不伪造ToolExecutionStarted；
+- ToolExecutionControl unavailable或durable append已确定NotCommitted时，Ask决策fail closed且不执行Tool；SessionWrite OutcomeUnknown时poison writer并保守终结、不在本run重试该append，未终结前既不通知host也不执行Tool，恢复靠下次load的committed prefix；validation/policy/approval deny返回PreExecution outcome，不伪造ToolExecutionStarted；
 - approval 通过后仍然执行 Sandbox；
 - Sandbox 执行失败不能静默回退到无 Sandbox 执行；
 - 是否允许经过新审批后进行 Sandbox escalation，留待具体工具策略决定。
@@ -809,7 +808,7 @@ ToolSet::execute(ToolExecutionRequest[])
 → 按原始 request 顺序返回
 ```
 
-在record_execution_start之前形成的exact validation/policy/approval/unavailable ToolResult以`source = PreExecution`返回Completed；不进入ToolSandbox，也不伪造ToolExecutionStarted。Session execution随后append role=tool message。若该append已证明NotCommitted，只重试同一entry draft；若返回SessionWrite OutcomeUnknown，必须按operation key reopen/replay，不能直接映射为Abandoned。只有Tool side effect本身outcome unknown，或crash后exact result不可恢复，才返回/持久化Abandoned。
+在record_execution_start之前形成的exact validation/policy/approval/unavailable ToolResult以`source = PreExecution`返回Completed；不进入ToolSandbox，也不伪造ToolExecutionStarted。Session execution随后append role=tool message。若该append已证明NotCommitted，只重试同一entry draft；若返回SessionWrite OutcomeUnknown，poison writer并保守终结当前操作、不在本run重放该append，恢复在下次load读committed prefix后按状态处理，不重放Tool。只有Tool side effect本身outcome unknown（工具副作用未知），或crash后exact result不可恢复，才返回/持久化Abandoned；此类不构造synthetic ToolResult。
 
 所有调用来源必须进入该唯一执行路径：
 

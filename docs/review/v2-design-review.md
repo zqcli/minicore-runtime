@@ -199,3 +199,13 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - 严重度经二次核对调整一处：`session-execution` 的 canonical resource lock 项，在复核 `tools.md` 执行链（approval 先于取锁）后，从重大降为非阻塞，残留「多资源全序获取」建议见并发非阻塞组。
 - 本评审仅调研，未修改任何设计文档；所列问题为待决项，不代表文档已错误落地。核心 seam 划分（deep module deletion test、exact model pin、trusted projector 构造 Replace、lease-based revocation、append/apply-before-model-visible）判定为自洽。
+
+---
+
+## 评审决议（2026-07-24）
+
+针对 A 组已作决定并落盘：
+
+- **A1（operation_key）**：**放弃「溯源重建恢复」要求**，key 机制参考 Claude Code / pi——单写者 append + 随机 per-entry `EntryId` + `parent_id` 树 + partial-tail 截断，不做确定性可重建 key、不做 `OperationConflict` 冲突检测索引、不做 payload normalization。已落盘：`conversation-storage.md` 删除 `operation_key`/`IdempotencyKey` storage 字段、`OperationConflict`、operation-key index、normalized payload fingerprint、fork key-regenerate 与 reload/corruption 的 key 校验；`OutcomeUnknown` 改为 poison writer + 保守终结、恢复靠 committed prefix 状态判断（不 in-run replay-by-key）；恢复终结改为**状态驱动**（已 terminal/已 resolved 则跳过），exclusive lease 下单跑。消费方文档（session-execution / turn-execution-context / tools / turn-item-interaction / agent-session-lifecycle / compaction / runtime-interface / model-gateway）与 ADR 0103/0104 同步；`resolution_key` / `CommandId` / admission submission key 保留为 in-run 去重、不承诺跨崩溃 durable 重建。**B2（committed entry 必可 project、append 校验⊇replay）因恢复完全依赖重放 committed prefix 而更关键**。
+- **A2（ExecutionMode）**：**移除**。已从 `ResolveTurnModelRequest`、`ToolTurnContext`、Turn capture DAG 与 fingerprint 删除，并在 `turn-execution-context.md` 记录「前台/后台是 presentation 概念、不进 capture/fingerprint」。若将来需要，改为 tool execution 路径上不进 fingerprint 的窄 approval disposition。
+- **A3（Session↔Agent 绑定）**：**采用方案2（snapshot-current + 显式 reload）**。`SessionCommand::Create` 改收 `agent_id`（创建时快照 current 并钉成 exact ref）；`UpgradeAgentRevision.target` 改为 `Option<AgentRevisionRef>`（`None`=重钉 current 的常规升级，给出 exact ref=钉指定/旧版）。存储层始终保存 exact `AgentRevisionRef`。理由：exact pin 让上下文与 prompt 前缀稳定，最大化 prompt cache 命中。

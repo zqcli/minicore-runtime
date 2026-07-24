@@ -269,7 +269,7 @@ pub enum AgentCommand {
 ```rust
 pub enum SessionCommand {
     Create {
-        agent: AgentRevisionRef,
+        agent_id: AgentId,
         definition: NewSessionDefinition,
         metadata: NewSessionMetadata,
     },
@@ -281,7 +281,7 @@ pub enum SessionCommand {
     UpgradeAgentRevision {
         session_id: SessionId,
         expected_revision: SessionDefinitionRevision,
-        target: AgentRevisionRef,
+        target: Option<AgentRevisionRef>,
     },
     UpdateMetadata {
         session_id: SessionId,
@@ -311,6 +311,10 @@ pub enum SessionCommand {
 ```
 
 `SessionDefinitionPatch`原子修改 Workspace、SessionModelConfig 或 SessionPrompts，并生成新的 `SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。
+
+`Create` 只接受 `agent_id`：Runtime 在创建的 Agent lifecycle synchronization 内读取该 Agent 当时的 current revision，并把它作为 exact `AgentRevisionRef` 钉进 `SessionDefinition`。调用方不在 create 时报 revision——「用哪一版」由 Runtime 在此刻快照 current 决定，之后 Agent 再发布新 revision 不会改变该 Session（snapshot-current）。
+
+`UpgradeAgentRevision.target` 为 `Option`：缺省（`None`）表示「重新钉到该 Agent 当前 current」（显式 reload 升级），是常规路径；给出 exact `AgentRevisionRef` 表示钉到指定版本（可用于钉旧版或回滚）。两种情况都在 gates 内校验 target 属于同一 AgentId、Agent 为 Enabled、target definition 存在，并原子解析为 exact ref 后写入新的 `SessionDefinitionRevision`；`latest` 本身不进入 durable `SessionDefinition`。保持 exact pin 让同一 Session 在两次 upgrade 之间上下文稳定，最大化 prompt cache 前缀命中。
 
 同一Session不提供原地history checkout。创建历史分支使用`Fork`，得到新的SessionId和独立definition revision序列。
 
@@ -729,7 +733,7 @@ pub struct SessionHistoryTreeView {
 }
 ```
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、operation key、ToolRoundCompleted内部event或writer current EntryId。
+History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。
 
 大列表必须分页。Cursor opaque并绑定query family、filter、sort和revision。
 
@@ -1280,7 +1284,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
 - Workspace authorization lease；
-- SessionWriter、operation key、repair internals；
+- SessionWriter、writer internals、repair internals；
 - raw JSONL path作为普通UI能力；
 - internal handler id和完整RuntimeCommand嵌入catalog action。
 

@@ -15,7 +15,7 @@
 - 哪些已持久化内容可以进入模型 conversation；
 - ToolCall、ToolResult、Interaction和ToolExecutionStarted前置记录如何逐entry持久化；
 - complete ToolRound 如何在没有物理 batch 的前提下 all-or-none 进入模型 conversation；
-- entry-level operation idempotency 和 append acknowledgement unknown 如何处理；
+- append acknowledgement unknown 如何以保守终结 + committed prefix 恢复处理；
 - hot projection 如何只应用成功 append receipt；
 - branch、fork、compaction、partial tail、corruption 和 process-crash recovery。
 
@@ -68,8 +68,8 @@ MiniCore 不复制：
 - 一条 newline-terminated entry 是 process-crash visibility unit；
 - entry 使用 `EntryId + parent_id` 形成 immutable history tree；
 - 不建立 `BatchId`、`StoredSessionBatch`、batch fingerprint 或 interior-entry 概念；
-- operation key 属于单条 entry intent；同 key同 normalized payload 返回原 receipt，同 key不同 payload conflict；
-- storage append acknowledgement unknown 必须按 operation key reopen/replay；
+- entry 身份只用随机 `EntryId` + `parent_id`；不建立 durable 可重建 operation key，也不做 same-key 冲突检测；乐观并发只靠 `expected_current_entry`；
+- storage append acknowledgement unknown 时 poison writer 并保守终结；恢复在下次 load 读 committed prefix 后按状态处理，不做 in-run replay-by-key；
 - entry 顶层类别固定为 `TurnContext | Message | Event | Compaction`；
 - Message 使用 `role = user | assistant | tool`；
 - 一个 finalized logical model response 保存为一个 assistant message entry；
@@ -107,7 +107,6 @@ SessionStorage拥有：
 
 - Session ledger file；
 - EntryId allocation；
-- operation key index；
 - current entry和parent graph reconstruction；
 - entry validation和cross-entry reference validation；
 - durable append；
@@ -254,7 +253,6 @@ pub struct StoredSessionEntry {
     pub entry_id: EntryId,
     pub parent_id: Option<EntryId>,
     pub timestamp: Timestamp,
-    pub operation_key: IdempotencyKey,
     pub body: StoredEntryBody,
 }
 
@@ -272,11 +270,7 @@ pub enum StoredEntryBody {
 - `parent_id` 是该 entry 的logical parent；
 - ordinary append的parent是writer current entry；
 - history branch append可以使用已验证历史entry作为parent；
-- `operation_key` 标识一条caller intent/retry；
-- operation key lookup发生在current-entry conflict检查之前；
-- normalized payload fingerprint由writer/index内部计算，不要求序列化独立hash字段；
-- 同key同normalized payload返回原 `CommittedSessionEntry`；
-- 同key不同payload返回 `OperationConflict`；
+- `expected_current_entry` 表达乐观并发；不做 durable operation-key lookup 或 same-key 冲突检测；
 - JSON object field order不承担语义；
 - EntryId、ItemId、ToolCallId、TurnId、RequestId不能混用。
 
@@ -286,7 +280,6 @@ pub enum StoredEntryBody {
 pub struct SessionEntryDraft {
     expected_current_entry: Option<EntryId>,
     parent_entry: Option<EntryId>,
-    operation_key: IdempotencyKey,
     body: PendingEntryBody,
 }
 ```
@@ -738,9 +731,6 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 ```text
 SessionWriter.append(draft)
 → 检查writer未poisoned/closed
-→ 先lookup operation_key
-   ├─ same key + same normalized payload：返回原receipt
-   └─ same key + different payload：OperationConflict
 → 检查expected_current_entry
 → 验证parent_entry存在且可作为本次append parent
 → 分配EntryId和timestamp
@@ -754,7 +744,7 @@ SessionWriter.append(draft)
 
 append一旦进入physical write，不接受Turn cancellation。
 
-内部可以使用buffered writer或合并OS write以降低syscall，但每条entry仍有独立identity、operation key、validation和receipt；不得重新形成caller-visible业务batch协议。
+内部可以使用buffered writer或合并OS write以降低syscall，但每条entry仍有独立identity（EntryId）、validation和receipt；不得重新形成caller-visible业务batch协议。
 
 ## CommittedSessionEntry
 
@@ -790,13 +780,10 @@ apply失败不回滚已append entry；Session execution丢弃hot projections并�
 pub enum SessionWriteError {
     StaleCurrentEntry,
     InvalidParent,
-    OperationConflict,
     InvalidEntry,
     EntryTooLarge,
     NotCommitted(StorageError),
-    OutcomeUnknown {
-        operation_key: IdempotencyKey,
-    },
+    OutcomeUnknown,
     WriterUnavailable(StorageError),
 }
 ```
@@ -805,11 +792,10 @@ pub enum SessionWriteError {
 
 - `NotCommitted`：失败发生在physical write前，已证明entry不存在，可以安全retry同一draft；
 - physical write开始后的write/flush错误返回`OutcomeUnknown`并poison当前writer；
-- `OutcomeUnknown`：必须取得exclusive lease后reopen，处理partial tail并replay/按operation key lookup；解析完成前不能继续使用旧writer；
+- `OutcomeUnknown`：physical write 已开始但 ack 丢失；SessionExecutor 保守终结当前操作，**不在同一 run 内 reopen/replay 该 append**；因为不重试，永不产生重复 entry，代价是该 unacked entry 可能丢失（tool message 丢 → round 不完整 → 恢复 Abandon → 模型重跑工具；initiating UserMessage 丢 → Turn 未开始 → 用户重新提交）；
+- 恢复在下次 load 取得 exclusive lease、截断 partial tail、replay committed prefix 后按状态处理；
 - `OutcomeUnknown`表示storage acknowledgement不确定，不等于Tool side-effect outcome unknown；
-- `WriterUnavailable`：writer已poisoned/closed，不能继续append；
-- same key同payload retry返回原receipt，不产生第二条log entry；
-- log中出现duplicate operation key属于corruption。
+- `WriterUnavailable`：writer已poisoned/closed，不能继续append。
 
 ## Conversation Projection
 
@@ -1005,7 +991,6 @@ remap：
 | entry ownership/correlation SessionId | new target value；ForkOrigin与historical exact definition refs保留source identity |
 | EntryId / parent_id | remap |
 | TurnId / ItemId / RequestId | remap |
-| operation key | regenerate target-local key |
 | ToolCallId | preserve |
 | historical Agent/SessionDefinition/Workspace exact refs | preserve source-scoped exact semantics；不重写为child current revision |
 | content/model/reasoning payload | preserve exact semantics, subject to redaction policy |
@@ -1056,7 +1041,7 @@ automatic active-Turn Compaction还必须保护initiating UserMessage及其后�
 ```text
 read SessionHeader
 → 逐行读取complete newline-terminated StoredSessionEntry
-→ 验证format/session/EntryId/operation key唯一性
+→ 验证format/session/EntryId唯一性
 → 建立parent graph
 → 验证parent只引用prior complete entry或None
 → 验证cross-entry references位于同一selected ancestry并且类型匹配
@@ -1089,7 +1074,6 @@ Writable open/recovery：
 
 - newline-terminated invalid JSON；
 - duplicate EntryId；
-- duplicate operation key；
 - missing/cyclic/forward parent；
 - cross-session/cross-branch illegal reference；
 - User input引用错误Context；
@@ -1112,7 +1096,7 @@ replay complete entries
 → 不恢复provider stream、AgentLoop、waiter或Tool task
 → 若没有Running Turn：Ready/Idle
 → 若存在Running Turn：
-     resolve/cancel every Pending Interaction with stable operation key
+     resolve/cancel every Pending Interaction（幂等靠 committed prefix 状态判断）
      preserve every existing Tool message as truthful Completed Item
      append ToolAbandoned for remaining Started invocation
      append TurnInterrupted(HostRestart | RecoveryContextUnavailable)
@@ -1120,7 +1104,7 @@ replay complete entries
 → Ready/Idle
 ```
 
-recovery逐entry执行，不承诺多entry all-or-none。每个recovery operation使用由TurnId/ItemId/RequestId和recovery reason派生的稳定operation key，因此crash后可继续未完成cleanup。
+recovery逐entry执行，不承诺多entry all-or-none。recovery 在 exclusive lease 下单跑；crash 后重复恢复的幂等靠读 committed prefix 的状态判断（该 Interaction 已 resolved、该 Turn 已 terminal、该 Started 已 Abandoned 则跳过），不依赖 durable operation key。
 
 重要规则：
 
@@ -1137,7 +1121,7 @@ recovery逐entry执行，不承诺多entry all-or-none。每个recovery operatio
 
 ```text
 SessionWriter.append(draft)
-→ resolve OutcomeUnknown if necessary
+→ OutcomeUnknown 时 poison writer 并保守终结（不 apply）
 → storage-owned apply_committed(receipt)
 → publish/wake/side-effect/model-call
 ```
@@ -1268,8 +1252,7 @@ content-addressed DAG
 - 一个Session只有一个authoritative JSONL entry tree；
 - 一行一个complete StoredSessionEntry；
 - runtime mutation只通过SessionWriter::append；
-- operation key先于current-entry conflict lookup；
-- same key同payload幂等返回，same key不同payload conflict；
+- 乐观并发靠expected_current_entry；不做durable operation-key lookup或same-key冲突检测；
 - EntryId由writer分配；
 - parent_id形成tree，current entry是最后成功append entry；
 - TurnContext不创建Turn；
@@ -1302,7 +1285,7 @@ content-addressed DAG
 至少覆盖：
 
 - context entry后crash但无user input；
-- user input append OutcomeUnknown lookup；
+- user input append OutcomeUnknown：保守终结、不在本run重试、不创建第二TurnId、用户可重新提交；
 - assistant intermediate含多个ToolCall；text/reasoning-only Intermediate被拒绝；
 - reasoning text/encrypted/signature round-trip；
 - usage/model/response ID/finish reason/allowlisted provider metadata round-trip；
@@ -1320,8 +1303,7 @@ content-addressed DAG
 - Interrupted/Failed terminal cleanup；
 - recovery保留existing tool messages、不补promotion；
 - late completion/late Interaction resolution；
-- duplicate operation key same/different payload；
-- write/flush OutcomeUnknown poisons old writer，reopen后分别覆盖entry存在与partial-tail不存在；
+- write/flush OutcomeUnknown poisons old writer，保守终结；下次 load 分别覆盖 entry 完整存在与 partial-tail 不存在两种情形；
 - partial final line；
 - newline-terminated bad line；
 - parent cycle/missing parent；
@@ -1339,14 +1321,14 @@ content-addressed DAG
 
 - 选择per-session append-only by-entry JSONL tree；
 - 固定SessionHeader create/fork staging exception；
-- 定义StoredSessionEntry record、EntryId、parent_id和operation key；
+- 定义StoredSessionEntry record、EntryId和parent_id；
 - 固定TurnContext / Message / Event / Compaction顶层类别；
 - 固定user/assistant/tool message layout；
 - 固定assistant finalized response聚合、reasoning和usage持久化；
 - 定义durable Interaction和Tool side-effect events；
 - 定义ToolRoundCompleted committed-only conversation projection rule；
 - 定义CommittedConversationState/View/Delta和AdvanceOnly/Append/Replace；
-- 定义entry-level idempotency和OutcomeUnknown lookup；
+- 定义OutcomeUnknown保守终结与committed-prefix状态化恢复；
 - 定义parent tree、fork deep copy和identity remap；
 - 定义compaction overlay；
 - 定义partial tail、strict corruption和conservative recovery；
