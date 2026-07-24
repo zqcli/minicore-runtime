@@ -508,7 +508,8 @@ async fn append_and_apply(
 
 ```text
 SessionWriter.append(draft)
-→ 如果OutcomeUnknown：停止后续动作并reopen/replay或lookup operation key
+→ 如果NotCommitted：证明未写，可安全重试同一draft
+→ 如果OutcomeUnknown：poison writer并保守终结当前操作；不在本run内按operation key reopen/replay/lookup；恢复在下次load读committed prefix后按状态处理，不重放Tool
 → 得到CommittedSessionEntry
 → apply Turn/Item/Interaction/Conversation/Usage/tree deltas
 → 返回receipt
@@ -565,7 +566,7 @@ Submit
 - Starting时第二个Submit返回`SessionBusy`；
 - Submit request handler保存response sender、启动BuildTurnContext后立即返回主循环；
 - Context append成功、UserMessage append失败时，Context是安全orphan，不创建领域Turn；
-- UserMessage append OutcomeUnknown必须先按operation key解析，不能创建第二个TurnId；
+- UserMessage append OutcomeUnknown时保守终结、不在本run重试该append，也不创建第二个TurnId；initiating UserMessage可能丢失导致Turn未开始，用户可重新提交；
 - UserMessage append/apply前不调用Model或Tool；
 - Agent disable先完成则Submit失败；UserMessage append先完成则active Turn继续；
 - TurnExecutionContext capture失败不创建Failed Turn；
@@ -677,7 +678,7 @@ ToolExecutionOutcome[]
 - Assistant(Intermediate)一旦append/apply，当前Tool round必须先得到Completed或Interrupted处理；此后到达的Steer只能排队，不能插入assistant/tool sequence；
 - ToolSet按source call order返回outcomes；
 - Tool内部允许并发无冲突调用；
-- Tool message append OutcomeUnknown只解析storage write，不能重新执行Tool；
+- Tool message append OutcomeUnknown时poison writer并保守终结，不在本run重试该append，也不重新执行Tool；该unacked tool message可能丢失，恢复时该round不完整按Abandon处理，由模型重跑工具；
 - exact ToolResult必须保存，即使Cancel已经发生；
 - outcome unknown不能生成Tool message；
 - Cancel/security revocation在tool messages之后、`tool_round_completed`之前生效时，truthful results保持durable但不进入conversation；
@@ -989,7 +990,7 @@ Steer、Cancel、Compaction或任何model-visible conversation change都会使�
 
 - pre-execution validation/policy错误可以重新构造新的调用结果，但不自动重新执行同一个side effect；
 - ToolExecutionStarted后outcome unknown禁止自动retry；
-- SessionWrite NotCommitted/OutcomeUnknown只允许重试/解析同一entry write，不允许重放Tool。
+- SessionWrite NotCommitted可安全重试同一entry write；OutcomeUnknown则poison writer并保守终结，不在本run重试该write，也不重放Tool，恢复在下次load读committed prefix后按状态处理。
 
 ## Context Overflow与Compaction连接
 
@@ -1183,7 +1184,7 @@ pub enum SessionExecutionError {
 
 - expected identity/version mismatch不是storage corruption；
 - stale operation result通常记录diagnostic后忽略，不一定返回给host；
-- storage OutcomeUnknown必须解析，不能转换成Tool outcome unknown；
+- storage OutcomeUnknown导致writer poison和保守终结（恢复在下次load按committed prefix状态处理），不能转换成Tool outcome unknown；
 - Tool failed result与Tool execution infrastructure error分开；
 - QueueFull是明确backpressure，不重试/丢弃已有请求；
 - invariant violation停止当前Session执行并触发replay或Unavailable。
@@ -1249,7 +1250,7 @@ MVP性能要求：
 - stale BuildTurnContext/ComposeUserMessage result在version变化后被忽略；
 - Context entry成功、UserMessage失败产生安全orphan；
 - Agent disable与UserMessage append的最终顺序；
-- UserMessage OutcomeUnknown按operation key恢复；
+- UserMessage OutcomeUnknown时保守终结、不在本run重试append也不创建第二个TurnId，用户可重新提交；
 - UserMessage append前不调用Model/Tool。
 
 ### Model
@@ -1280,7 +1281,7 @@ MVP性能要求：
 - partial results不进入conversation；
 - tool_round_completed后完整round一次进入conversation；
 - revocation在tool messages后、tool_round_completed前到达时不把round加入conversation；
-- Tool message append OutcomeUnknown不重放Tool；
+- Tool message append OutcomeUnknown时poison writer并保守终结，不重放Tool；
 - side-effect outcome unknown产生ToolAbandoned。
 
 ### Steer与FollowUp
@@ -1333,7 +1334,7 @@ MVP性能要求：
 - existing Tool message保留；
 - 不补写tool_round_completed；
 - outcome unknown Tool不自动执行；
-- recovery operation key保证重复load幂等；
+- 重复load幂等靠committed prefix状态判断（已terminal/已resolved则跳过），不靠recovery operation key；
 - terminal entry后Pending/Started被判定为corruption。
 
 ## Diagnostics

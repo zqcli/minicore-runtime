@@ -26,7 +26,7 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 - 合并的 ToolInvocation 让 approval 归属、outcome-unknown 处理与 UI/replay correlation 只发生在单一 identity 上，避免 orphan result 与永久悬空的 call。
 - durable Interaction 使 reconnect、lost acknowledgement 与 host restart 都能从 truth 判断请求状态，代价是引入 resolution_key 幂等与 first-wins CAS 的排序复杂度。
 - 「派生而非存储」的 ItemType/ItemStatus 与「无 Manager/Service」的取舍，把复杂性留在 Session execution 与 SessionStorage projection 内，deletion test 成立——移除该模型会让边界与生命周期重新散落。
-- 明确不建 ModelStep/ToolRound entity，意味着逻辑模型调用与 conversation promotion 靠 fingerprint、operation key 与 `tool_round_completed` event 表达，而非新增领域实体。
+- 明确不建 ModelStep/ToolRound entity，意味着逻辑模型调用与 conversation promotion 靠 fingerprint、EntryId/parent_id 引用与 `tool_round_completed` event 表达，而非新增领域实体。
 
 ## 历史
 

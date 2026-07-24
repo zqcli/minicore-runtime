@@ -586,7 +586,7 @@ PromptSet exact
 no winning Cancel
 WorkspaceCommitAuthorization valid
 summary result valid
-no existing compaction with same operation key and different payload
+committed prefix中不存在覆盖同一cut的StoredCompaction（靠状态判断去重，非operation key冲突检测）
 ```
 
 commit顺序：
@@ -598,7 +598,7 @@ process all earlier queued control requests
 → acquire WorkspaceCommitAuthorization
 → revalidate source checkpoint/control state while authorization is held
 → SessionWriter.append(StoredCompaction draft)
-→ resolve SessionWrite OutcomeUnknown by operation key
+→ SessionWrite OutcomeUnknown时保守终结本次compaction，下次触发按committed prefix重新规划
 → apply CommittedConversationDelta::Replace
 → release authorization
 ```
@@ -712,7 +712,7 @@ SessionWriter必须验证：
 - summary text非空且hash匹配；
 - automatic SummaryModel entry有model_call；
 - turn_id存在时Turn仍Running且与source path一致；
-- operation-key dedup规则成立。
+- 基于committed prefix状态的compaction去重规则成立。
 
 caller提供的raw replacement messages不是StoredCompaction字段。trusted projector根据source、boundaries和summary确定性构造Replace delta，避免caller提交任意history rewrite。
 
@@ -768,11 +768,11 @@ summary operation running or completed in memory
 
 ### Crash During Append
 
-使用entry-level operation key规则：
+遵守storage的append/恢复规则（EntryId + parent_id + committed-prefix状态判断）：
 
 - incomplete tail可由exclusive writer recovery truncate；
-- complete matching entry通过lookup/replay返回原receipt；
-- same key different payload是corruption/conflict；
+- 恢复时读committed prefix，若目标cut的StoredCompaction已存在则跳过，不重复写；
+- 不做in-run replay-by-key，也不依赖同operation key不同payload的冲突检测；
 - 不重新调用SummaryModel来解析storage outcome unknown。
 
 ### Crash After Append Before Apply
@@ -888,7 +888,7 @@ COMP-018 Compaction不是Turn、Item或Interaction
 9. summary期间Cancel；
 10. summary期间Workspace revocation；
 11. source checkpoint在result返回前变化；
-12. write OutcomeUnknown lookup成功；
+12. write OutcomeUnknown后按committed prefix状态确认（compaction已存在则跳过）；
 13. crash after append before apply；
 14. provider ContextOverflow后一次成功recovery；
 15. compact后仍overflow并TurnFailed；

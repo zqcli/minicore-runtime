@@ -402,15 +402,16 @@ SessionDefinition.agent.revision != Agent.current_revision
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision
-+ target AgentRevisionRef
++ target: Option<AgentRevisionRef>   // None = 重钉 current（常规 reload 升级）
 → 按 Agent lifecycle → Session lifecycle 固定顺序获取 gates
+→ 解析 target：None 时在 gates 内读取 Agent current 并固定为 exact ref
 → target 必须属于同一个 AgentId
 → Agent 必须 Enabled
 → target definition 必须存在
 → 在 gates 内创建新的 SessionDefinitionRevision
 ```
 
-调用方可以请求“升级到 current”作为 convenience，但提交前必须解析成 exact AgentRevisionRef；`latest` 不进入 durable SessionDefinition。
+常规升级不报 revision：调用方发 `None`，Runtime 在 gates 内把 Agent current 解析成 exact AgentRevisionRef 后钉入。给出 exact `AgentRevisionRef` 用于钉指定/旧版或回滚。无论哪种，提交前都解析成 exact ref；`latest` 不进入 durable SessionDefinition。exact pin 保证同一 Session 在两次升级之间上下文与 prompt 前缀稳定。
 
 不引入：
 
@@ -973,7 +974,7 @@ Runtime restart：
 5. 重建 committed conversation；
 6. 重新 resolve Workspace；
 7. 检测没有final AssistantMessage、TurnInterrupted或TurnFailed entry的旧Running Turn及其pending/open state；
-8. baseline使用稳定operation key逐entry append InteractionResolved、ToolAbandoned和TurnInterrupted；已有role=tool message的ToolInvocation保持Completed，但不补做ToolRound completion；
+8. baseline逐entry append InteractionResolved、ToolAbandoned和TurnInterrupted；重复恢复靠committed prefix状态判断保证幂等（已存在则跳过）；已有role=tool message的ToolInvocation保持Completed，但不补做ToolRound completion；
 9. 已有terminal entry但仍遗留Pending Interaction或Started Item属于semantic corruption，read-write load fail closed并要求显式repair，不能追加“修复closure”掩盖历史；
 10. 进入 Ready、Unavailable 或返回 typed load/corruption error。
 
@@ -1105,7 +1106,7 @@ Agent release channel
 - fork 不复制 loaded execution state或 authorization capability；
 - host restart 后 loaded state 全部丢失，可由 durable truth 重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
-- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 使用各自稳定 operation key 逐 entry 幂等追加。
+- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 逐 entry append，幂等由 committed prefix 状态判断保证（exclusive lease 下恢复单跑，已处理则跳过）。
 
 ## Test Matrix
 
