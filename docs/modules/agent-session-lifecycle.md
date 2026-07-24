@@ -49,7 +49,7 @@ MiniCore 采用 Codex/Grok 的 durable/live 分离，但比这些项目更严格
 - Agent 更新只产生“新 revision 可用”，既有 Session 必须显式升级；
 - 一个 Session 只能引用一个 AgentId；普通 update 不能把 Session 改绑到另一个 Agent；
 - Session definition 使用不可变 `SessionDefinitionRevision`；
-- SessionDefinition原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts；
+- SessionDefinition原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection；
 - Session durable lifecycle 使用 `Open / Archived / Deleted`；
 - `Deleted` 表示逻辑删除，历史与 exact revision reference 仍保留；物理清除使用 `Purge`；
 - `NotLoaded / Idle / Active / SystemError` 不是 durable Session lifecycle；
@@ -59,7 +59,7 @@ MiniCore 采用 Codex/Grok 的 durable/live 分离，但比这些项目更严格
 - active Turn pin exact AgentRevisionRef 和 SessionDefinitionRevision；
 - definition update 只影响 future Turn，Workspace security restriction 仍可 revoke active Turn；
 - Session fork 复制 exact SessionDefinition 内容，但创建新的 SessionId 和独立 revision 序列；
-- fork 不复制 loaded state、WorkspaceSnapshot、lease、PromptSet、ToolSet、SkillCatalog 或 provider session；
+- fork不复制loaded state、WorkspaceSnapshot、lease、PromptSet、ToolSet、SkillView或provider session；
 - process restart 后所有 Session 都视为 unloaded；不恢复旧 stream、Tool task、approval waiter 或 AgentLoop state。
 
 ## 领域关系
@@ -75,7 +75,7 @@ Session
 │  ├─ exact AgentRevisionRef
 │  ├─ Workspace
 │  ├─ SessionModelConfig
-│  └─ SessionPrompts
+│  └─ SessionPromptSelection
 └─ SessionStorage conversation
 
 loaded Session execution
@@ -111,7 +111,7 @@ Agent execution definition 是 immutable revision value：
 pub struct AgentDefinition {
     pub agent_id: AgentId,
     pub revision: AgentRevision,
-    pub prompts: AgentPrompts,
+    pub prompts: AgentPromptSelection,
     pub created_at: Timestamp,
 }
 ```
@@ -257,7 +257,7 @@ pub struct Session {
 }
 ```
 
-Session 不直接重复保存 `agent_id`、Workspace、Model 或 SessionPrompts。这些 execution definition fields 属于 `SessionDefinition`：
+Session不直接重复保存`agent_id`、Workspace、Model或SessionPromptSelection。这些execution definition fields属于`SessionDefinition`：
 
 ```rust
 pub struct SessionDefinition {
@@ -266,7 +266,7 @@ pub struct SessionDefinition {
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
     pub model: SessionModelConfig,
-    pub prompts: SessionPrompts,
+    pub prompts: SessionPromptSelection,
     pub created_at: Timestamp,
 }
 ```
@@ -300,7 +300,7 @@ Arc<ToolService>
 Arc<SkillService>
 ModelGateway
 WorkspaceSnapshot / authorization lease
-SkillCatalog / LoadedSkill
+SkillView / LoadedSkill
 ToolSet / PromptSet
 conversation hot projection
 active Turn / Interaction waiter
@@ -318,7 +318,7 @@ active Turn / Interaction waiter
 AgentRevisionRef
 Workspace definition
 Model
-SessionPrompts
+SessionPromptSelection
 ```
 
 以下变化不创建新 revision：
@@ -411,7 +411,7 @@ expected SessionLifecycle = Open
 → 在 gates 内创建新的 SessionDefinitionRevision
 ```
 
-常规升级不报 revision：调用方发 `None`，Runtime 在 gates 内把 Agent current 解析成 exact AgentRevisionRef 后钉入。给出 exact `AgentRevisionRef` 用于钉指定/旧版或回滚。无论哪种，提交前都解析成 exact ref；`latest` 不进入 durable SessionDefinition。exact pin 保证同一 Session 在两次升级之间上下文与 prompt 前缀稳定。
+常规升级不报 revision：调用方发 `None`，Runtime 在 gates 内把 Agent current 解析成 exact AgentRevisionRef 后钉入。给出 exact `AgentRevisionRef` 用于钉指定/旧版或回滚。无论哪种，提交前都解析成 exact ref；`latest` 不进入 durable SessionDefinition。exact pin保证同一Session在两次升级之间的Agent selection、Workspace和Model配置稳定；显式Prompt resource reload仍可影响future Turn的PromptSet。
 
 不引入：
 
@@ -650,30 +650,20 @@ Steer到达时Turn保持Running。请求必须携带`expected TurnId`，并在cu
 
 ```text
 Steer(expected TurnId) accepted
-→ current Turn control queue
-→ 当前model/tool operation完成后append Steer
+→ push_back进入Steer FIFO
+→ 当前assistant/tool step完整committed
+→ 下一次Model前pop_front一条并append Steer
 → 下一次模型调用看见 Steer
 ```
 
-默认情况下，WaitingApproval 中到达的 Steer 先排队，不自动当作审批结果。若 final terminal entry 先于 Steer acceptance 线性化，Steer 不再属于该 Turn；若 Steer 先被接受，final draft 必须先与 queued Steer 仲裁。
-
-若产品选择让 Steer preempt approval：
-
-```text
-resolve pending Interaction as cancelled
-→ 产生 cancelled ToolResult
-→ append role=tool message
-→ append tool_round_completed
-→ append Steer
-→ 同一个 Turn 继续 Running
-```
+WaitingApproval中到达的Steer只进入同一FIFO，不自动当作审批结果。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
 
 只有显式 Turn cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn terminal。
 
 ## Create Session
 
 ```text
-验证 Workspace / Model / SessionPrompts candidate
+验证Workspace / Model / SessionPromptSelection candidate
 → 获取Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在同一synchronization内读取current AgentRevisionRef
@@ -688,7 +678,7 @@ create 使用预分配 SessionId 和 operation id。outcome unknown 时必须查
 
 ## Update Session Definition
 
-只允许Open Session。普通definition update只能改变Workspace、Model或SessionPrompts；`AgentRevisionRef`变化必须走显式Agent upgrade路径，不能绕过Agent lifecycle synchronization。
+只允许Open Session。普通definition update只能改变Workspace、Model或SessionPromptSelection；`AgentRevisionRef`变化必须走显式Agent upgrade路径，不能绕过Agent lifecycle synchronization。
 
 ```text
 expected SessionLifecycle = Open
@@ -735,7 +725,7 @@ Tool task
 approval waiter
 cancellation token
 old WorkspaceSnapshot / authorization lease
-PromptSet / ToolSet / SkillCatalog
+PromptSet / ToolSet / SkillView
 ```
 
 ## Unload Session
@@ -844,7 +834,7 @@ new SessionId
 SessionDefinitionRevision(1)
 exact copy of source AgentRevisionRef
 copy Workspace semantic fields，但分配 child-local WorkspaceRevision(1)
-copy source Model / SessionPrompts
+copy source Model / SessionPromptSelection
 Open + Unloaded
 independent future revisions
 independent WorkspaceSnapshot / lease
@@ -857,7 +847,7 @@ independent conversation branch
 source SessionDefinitionRevision / WorkspaceRevision number
 loaded execution state
 WorkspaceSnapshot / authorization control
-ToolSet / PromptSet / SkillCatalog
+ToolSet / PromptSet / SkillView
 provider session
 pending Interaction / FollowUp queue
 Session-scoped Tool grant
@@ -887,7 +877,7 @@ Session lifecycle/load/readiness/execution validation
 → reserve candidate Turn
 → capture exact SessionDefinitionRevision
 → 读取 exact AgentDefinition 并 capture WorkspaceSnapshot
-→ capture SkillCatalog / ToolSet / PromptSet
+→ capture SkillView / ToolSet / PromptSet
 → 获取短Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在gate内append TurnContext和initiating UserMessage，并确认outcome
@@ -1090,7 +1080,7 @@ Agent release channel
 - Session pin exact AgentRevisionRef；
 - Agent current update 不自动改变 Session；
 - Session 只能升级同一个 AgentId 的 revision；
-- SessionDefinitionRevision原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPrompts；
+- SessionDefinitionRevision原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection；
 - Session 不持有 Runtime Service handle；
 - Session durable lifecycle 与 load/readiness/execution state 分离；
 - Open 不等于 Loaded；Loaded 不等于 Ready；Ready 不等于 Running；
@@ -1135,7 +1125,7 @@ Agent release channel
 - Session execution Idle/Starting/Running/Finishing；
 - WaitingApproval 保持 Turn Running；
 - Steer 在 WaitingApproval 时排队；
-- preempt approval 时 cancelled ToolResult + Steer 仍保持同一 Turn；
+- WaitingApproval Steer只进入FIFO，不作为approval decision；
 - Agent disable/delete vs initiating UserMessage append final synchronization；
 - CreateSession/Agent upgrade/Fork publication vs Agent disable/delete；
 - Session definition/metadata update vs archive/delete lifecycle synchronization；
@@ -1143,7 +1133,7 @@ Agent release channel
 - entry append vs cancel/unload；
 - fork Open/Archived source，覆盖terminal boundary与mid-Turn message anchor；
 - fork 复制 exact AgentRevisionRef 与 definition content，但创建 child-local WorkspaceRevision(1)；
-- fork 不复制 Snapshot/lease/ToolSet/PromptSet/SkillCatalog；
+- fork不复制Snapshot/lease/ToolSet/PromptSet/SkillView；
 - fork staging crash不发布target；mid-Turn fork closure不恢复source执行状态；
 - restrictive Workspace definition update revoke 后 append 失败时保持 fail closed / Unavailable；
 - authority-only restriction 不创建 SessionDefinitionRevision；

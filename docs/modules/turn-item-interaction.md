@@ -120,7 +120,7 @@ Turn 不内联：
 ```text
 Vec<Item>
 TurnModel
-PromptSet / ToolSet / SkillCatalog
+PromptSet / ToolSet / SkillView
 WorkspaceSnapshot
 AgentRevisionRef / SessionDefinition
 provider session / AgentLoop
@@ -282,7 +282,7 @@ pub struct AgentMessageItem {
 storage assistant message使用稳定`phase = Intermediate | Final`：
 
 - `Final` AssistantMessage 是Turn completed terminal fact；
-- `Intermediate` AssistantMessage表示同一Turn仍需继续，通常包含ToolCall；
+- `Intermediate` AssistantMessage表示同一Turn仍需继续：包含ToolCall时等待完整ToolRound后model-visible；不含ToolCall时是Steer继续前保存的model-visible Assistant Continue step；
 - streaming phase transition不是durable Item。
 
 provider partial output、stream draft 和 abandoned retry attempt 不是 durable AgentMessage Item。
@@ -573,7 +573,6 @@ pub enum InteractionResolution {
 pub enum InteractionCancelReason {
     UserCancelled,
     TurnTerminated,
-    SteerPreempted,
     TransportClosedByHost,
     HostRestart,
     Recovery,
@@ -716,23 +715,14 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-默认 Steer：
+Steer：
 
 ```text
 Steer(expected TurnId)
-→ 排队到当前model/tool operation完成
+→ push_back进入普通FIFO
+→ 等待当前ToolRound truthful completion
+→ 下一次Model前pop_front一条
 → 不作为 approval decision
-```
-
-如果产品启用 Steer preempt approval：
-
-```text
-append InteractionResolution::Cancelled(SteerPreempted)
-→ 形成 truthful cancelled ToolResult candidate
-→ append role=tool cancelled result
-→ append tool_round_completed
-→ append Steer UserMessage Item
-→ 同一个 Turn 继续 Running
 ```
 
 ## Turn Terminal Cleanup
@@ -811,7 +801,7 @@ ToolRoundCompleted?
 
 ```text
 Conversation projection
-→ 只消费 initiating UserMessage、Steer、`tool_round_completed`引用的完整round、Compaction、final AssistantMessage
+→ 只消费 initiating UserMessage、Steer、无ToolCallAssistant Continue、`tool_round_completed`引用的完整round、Compaction、final AssistantMessage
 
 Turn/Item projection
 → 消费 semantic facts 和 operational Item lifecycle
@@ -980,7 +970,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - reconnect 使用相同 RequestId resend；
 - lost acknowledgement 使用 in-run resolution_key retry；
 - WaitingApproval 中 Steer 排队；
-- Steer preempt 先 cancelled ToolResult 再 Steer；
+- WaitingApproval Steer只排队，不preempt Interaction；
 - Tool side effect前完成resolution并重新检查Cancel state和current authorization；
 - restart recovery使用幂等entries逐步关闭pending、abandon unknown并interrupt Turn；
 - recovery 不生成 synthetic ToolResult；

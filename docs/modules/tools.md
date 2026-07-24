@@ -834,9 +834,10 @@ loop {
     let output = model_gateway.generate(&assembled).await?;
 
     if output.tool_calls.is_empty() {
-        let final_entry = append_final_assistant_message(output).await?;
-        session_projections.apply_committed(&final_entry)?;
-        break;
+        match session_executor.handle_candidate_final(output).await? {
+            CandidateFinalResult::Completed => break,
+            CandidateFinalResult::ContinuedBySteer => continue,
+        }
     }
 
     let assistant_entry = append_intermediate_assistant_message(output).await?;
@@ -862,11 +863,14 @@ loop {
         tool_entry_ids,
     ).await?;
     session_projections.apply_committed(&completion)?;
+    session_executor
+        .after_committed_tool_round(completion)
+        .await?; // pop/apply at most one queued Steer before the next model call
     committed_conversation = session_projections.committed_conversation();
 }
 ```
 
-ToolSet不决定Turn何时开始、完成、失败或中断，也不直接写conversation。`tool_round_completed`成功append后，assistant/tool messages才允许进入下一次逻辑模型调用。
+ToolSet不决定Turn何时开始、完成、失败或中断，也不直接写conversation。`tool_round_completed`成功append后，assistant/tool messages才允许进入下一次逻辑模型调用；SessionExecutor随后按FIFO最多消费一条Steer，不能从该snippet直接绕过queue进入下一次assemble。
 
 ## Domain 投影
 

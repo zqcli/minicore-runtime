@@ -10,7 +10,7 @@
 
 - SessionExecutor如何从`AssembledModelContext`发起一次模型调用；
 - Model identity、definition revision、capabilities和effective limits如何在Turn内固定；
-- System、Developer、User、Assistant和Tool role如何映射到不同provider；
+- System、User、Assistant和Tool role如何映射到不同provider；
 - ToolSpec、tool choice、OutputContract、reasoning和attachments如何编码；
 - streaming delta、finalized response、usage、finish reason和provider metadata如何规范化；
 - provider-internal retry、transport fallback与Session logical retry如何区分；
@@ -276,7 +276,7 @@ ModelTurnSession::generate(...) -> ModelCallStream
 - SessionExecutor需要管理第二个turn-scoped lifecycle；
 - caller必须理解stream terminal frame、drop、poisoned continuation和session reset；
 - provider session容易被误认为Turn truth或recovery source；
-- Steer后旧operation和新operation短暂重叠时，session ownership更复杂；
+- 若把provider session暴露给caller，logical retry和Steer后的segment rebuild会迫使SessionExecutor管理第二套session lifecycle；
 - connection/continuation完全可以留在Gateway内部并用full request重新证明兼容性。
 
 结论：不作为外部interface。Codex式WebSocket session可以作为private adapter优化。
@@ -488,7 +488,6 @@ cache和service class属于Turn-pinned execution policy。它们不改变convers
 ```rust
 pub struct ModelCapabilities {
     pub input_modalities: InputModalities,
-    pub instruction_roles: InstructionRoleCapabilities,
     pub tool_calling: ToolCallingCapabilities,
     pub structured_output: StructuredOutputCapabilities,
     pub reasoning: ReasoningCapabilities,
@@ -510,25 +509,7 @@ pub struct InputModalities {
 }
 ```
 
-unsupported content在provider request开始前返回`UnsupportedCapability`。
-
-### InstructionRoleCapabilities
-
-```rust
-pub enum InstructionRoleCapabilities {
-    SystemAndDeveloper,
-    SystemOnly {
-        developer_lowering: DeveloperRoleLowering,
-    },
-}
-
-pub enum DeveloperRoleLowering {
-    MergeIntoSystemWithStableSections,
-    Unsupported,
-}
-```
-
-Developer role lowering是model definition声明的deterministic encoding policy。它不能由provider名称猜测，也不能让adapter重新排序Prompt section。
+unsupported content在provider request开始前返回`UnsupportedCapability`。MiniCore只产生System sections和conversation messages；provider无法表达System instructions时，该model definition不可用，不做role降级。
 
 ### ToolCallingCapabilities
 
@@ -581,11 +562,11 @@ unknown必须保持`None`。不能根据model name猜测limit，也不能把本�
 
 ## AssembledModelContext Contract
 
-PromptSet是唯一producer。为保留role fidelity，assembled shape使用ordered instructions，而不是提前压成单个system string：
+PromptSet是唯一producer。assembled shape显式分开有序System sections与conversation messages：
 
 ```rust
 pub struct AssembledModelContext {
-    pub instructions: Arc<[ModelInstruction]>,
+    pub system: Arc<[PromptSection]>,
     pub messages: Arc<[ModelMessage]>,
     pub tools: Arc<[ToolSpec]>,
     pub output_contract: Option<OutputContract>,
@@ -595,18 +576,9 @@ pub struct AssembledModelContext {
     pub(crate) assembly_proof: PromptAssemblyProof,
 }
 
-pub struct ModelInstruction {
-    pub role: ModelInstructionRole,
-    pub content: Arc<str>,
-}
-
-pub enum ModelInstructionRole {
-    System,
-    Developer,
-}
 ```
 
-PromptSet instructions和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical instruction/tool boundaries选择cache breakpoint，不需要额外stability flag。
+PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。
 
 `PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint和OutputContract hash。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
@@ -623,8 +595,7 @@ pub enum OutputContract {
 
 ModelGateway可以：
 
-- 把System/Developer role映射成provider原生role；
-- 按declared deterministic policy把Developer section并入System；
+- 把System sections映射到provider原生system/instructions字段；
 - 把ModelMessage编码成provider message/item；
 - 把ToolSpec编码成provider tool schema；
 - 把OutputContract编码成tool choice、response format或JSON schema；
@@ -667,7 +638,7 @@ impl ModelCallRequest {
 
 - model generation defaults和effective reasoning已在TurnModelSnapshot固定；
 - tool choice和structured output只存在于`input.output_contract`；
-- system/developer/messages/tools只存在于`input`；
+- system/messages/tools只存在于`input`；
 - streaming是Gateway implementation strategy，不是model-visible caller option；
 - cache policy默认由exact model definition和Runtime policy确定；
 - SessionId、TurnId、execution_version和OperationType由外层RunningOperation携带；
@@ -779,7 +750,7 @@ RigProviderAdapter不被限制为generic `CompletionModel::stream`。当generic�
 
 映射要求：
 
-- ordered instructions映射到Rig preamble/messages或provider-specific instruction字段；
+- ordered System sections映射到Rig preamble或provider-specific system/instructions字段；
 - messages保持source order；
 - reasoning/text/tool call保持final content order；
 - ToolSpec映射到Rig ToolDefinition；
@@ -1109,7 +1080,8 @@ TurnExecutionContext unchanged
 purpose/output contract/effective max_output_tokens unchanged
 AssembledModelContextFingerprint unchanged
 → schedule timer
-→ 使用同一ModelCallRequest启动新RunningOperation
+→ 确认旧RunningOperation已经terminal并从SessionExecutor移除
+→ 使用同一ModelCallRequest启动新的唯一current RunningOperation
 ```
 
 logical retry：
@@ -1119,6 +1091,7 @@ logical retry：
 - 计入StoredAssistantMessage.retry_count；
 - 不创建ModelAttempt entity；
 - 不改变ModelCallPurpose。
+- 不与旧本地Model future重叠；provider端可能继续工作或计费不等于旧future仍可回传SessionExecutor。
 
 ## Cancellation
 
@@ -1135,7 +1108,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 
 - cancellation先被观察：中止request并返回Cancelled；
 - terminal event先被接受：Gateway完成normalization并返回ModelCallResult，之后到达的cancel不把该result改写为Cancelled；
-- SessionExecutor仍会用execution_version和Cancel/Steer arbitration决定该result能否append，因此Gateway terminal先赢不等于Turn一定Completed；
+- SessionExecutor仍会用execution_version和Cancel/revocation arbitration决定该result能否append；普通Steer不拒绝已完成result，只决定无ToolCall response保存为Continue还是Final，因此Gateway terminal先赢不等于Turn一定Completed；
 - 该规则保证terminal usage、finish reason和content不会因normalization期间的timer race随机丢失。
 
 取消行为：
@@ -1157,7 +1130,7 @@ cancel token fires
 - 已发布partial delta可以恢复；
 - cancellation可以回滚provider-side cache。
 
-迟到result仍由SessionExecutor通过SessionId、TurnId、execution_version和OperationType校验。
+SessionExecutor不detach Model future；`generate_model_turn` terminal返回或future被安全drop并关闭结果路径后，才能开始下一次logical operation。因此正常路径不存在旧Model result在新operation之后迟到。SessionId、TurnId、execution_version和OperationType仍用于验证result basis与实现错误。
 
 ## Error Taxonomy
 
@@ -1197,7 +1170,7 @@ pub enum ModelCallErrorKind {
 
 | Error kind | Gateway行为 | SessionExecutor默认处理 |
 | --- | --- | --- |
-| Cancelled | 停止attempt | Cancel/Steer/version规则 |
+| Cancelled | 停止attempt | Cancel/revocation/version规则；普通Steer不取消attempt |
 | ModelUnavailable | 不替换模型 | TurnFailed或要求SetModel |
 | AuthMissing/AuthRejected | 有界refresh后返回 | user action / TurnFailed |
 | RateLimited | 有界retry | 可按logical retry policy等待 |
@@ -1315,7 +1288,7 @@ Prompt cache不是response memoization，也不是conversation state。
 
 Gateway可以根据exact model definition和canonical instruction/tool/message boundaries选择provider cache-control：
 
-- stable System/Developer instructions；
+- stable System sections和前置User context；
 - stable ToolSpec集合；
 - provider允许的conversation prefix；
 - provider-specific cache retention。
@@ -1601,8 +1574,7 @@ opaque encrypted reasoning
 
 ### Prompt Mapping
 
-- System + Developer native mapping；
-- declared deterministic Developer lowering；
+- System和User的provider mapping；
 - unsupported role fail closed；
 - User/Assistant/Tool order保持；
 - reasoning/text/tool call content order保持；
@@ -1653,7 +1625,7 @@ opaque encrypted reasoning
 - cancel during stream；
 - provider terminal先于cancel时Gateway完成result；SessionExecutor仍可因version/cancel拒绝；
 - Rig AbortHandle桥接；
-- late result由execution_version拒绝。
+- logical retry与Steer场景不存在可回传的旧detached Model future；execution_version用于拒绝basis已经变化的result并检测实现错误。
 
 ### Usage And Finish
 

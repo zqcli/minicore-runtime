@@ -19,7 +19,8 @@
 - 外部调用方只持有可克隆的 `SessionExecutionHandle`，不能借用或加锁 Executor 状态；所有请求（含 Tool control、Workspace authorization revocation）经同一个 bounded FIFO 进入。
 - 一个 Runtime 允许多个 `SessionExecutor` 同时 `Running`；每个 Session 独立推进，最多一个 Starting/Running Turn。
 - 执行期 state 只有 `Idle → Starting → Running → Finishing → Idle`；WaitingApproval/Sampling/Compacting/ExecutingTools 是 Running Turn 的阶段，不写 SessionStorage。
-- Context 构造、UserMessage composition、Model 调用与 Tool 执行作为 cancellable `RunningOperation` 异步运行；结果携带 `SessionId + TurnId + execution_version + OperationType` 校验，过期结果被忽略，只有 Tool 越过 `ToolExecutionStarted` 的 outcome 必须确认并保存。
+- Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future与request queue；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
+- Steer和FollowUp分别使用普通`VecDeque<QueuedMessage>` FIFO，不建立queue service或wrapper。Steer不取消Sampling；当前assistant/tool step完整committed后、下一次模型调用前pop一条。FollowUp在Turn terminal后pop一条并开启新Turn。
 - private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
 - 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。
 - restart 不恢复旧的异步操作、queue 或 waiter；unfinished Turn 按 recovery 规则保守 terminalize（closure、preserve tool messages、ToolAbandoned、TurnInterrupted）。
@@ -31,7 +32,7 @@
 - 执行顺序与线性化点集中在单一 owner，entry / projection / event 顺序可独立测试。
 - 单一权威 owner 加异步 operation 分离，避免 lock-across-await 死锁，同时保持控制请求响应性。
 - 多 Session 可后台并发执行，共享服务用配额与 resource locks 协调；UI selection 不影响后台执行。
-- 迟到结果与副作用真实性通过 version 校验和 outcome 确认规则处理，不宣称 exactly-once。
+- 严格串行current operation消除同Session logical retry的本地迟到结果竞态；execution version只验证conversation/control basis。provider端可能继续工作或计费仍不宣称exactly-once。Tool副作用真实性继续由outcome确认规则处理。
 - AgentLoop 可替换（含 Rig adapter），因为它不触碰 storage 与 I/O 顺序。
 
 ## 历史

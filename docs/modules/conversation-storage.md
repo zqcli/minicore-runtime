@@ -297,7 +297,7 @@ pub struct StoredTurnContext {
     pub workspace: WorkspaceSnapshotRef,
     pub prompt_fingerprint: PromptFingerprint,
     pub tool_fingerprint: ToolSetFingerprint,
-    pub skill_fingerprint: SkillCatalogFingerprint,
+    pub skill_fingerprint: SkillViewFingerprint,
     pub execution_fingerprint: ExecutionContextFingerprint,
     pub diagnostics: Arc<[StoredContextDiagnostic]>,
 }
@@ -430,11 +430,12 @@ pub enum AssistantContent {
 - ToolCall name/arguments/index只在assistant entry保存一次；
 - 每个ToolCall block创建一个ToolInvocation Item的Started projection；
 - 同一assistant entry内ToolCallId和ItemId必须唯一；
-- `phase = Intermediate`必须包含至少一个ToolCall；text/reasoning-only稳定响应若结束Turn必须使用`Final`，否则只作为transient draft/observer output；
-- Intermediate assistant entry durable/UI-visible，但在完整ToolRound前不进入模型conversation；
+- `phase = Intermediate`表示同一Turn仍会继续。它可以包含ToolCall，也可以是在Steer FIFO非空时保存的text/reasoning-only Continue step；
+- 含ToolCall的Intermediate durable/UI-visible，但在完整ToolRound前不进入模型conversation；
+- 不含ToolCall的Intermediate必须只包含稳定text/reasoning content，在entry append/apply时直接进入模型conversation，但不结束Turn；
 - `phase = Final`不能包含未满足ToolCall；
 - Final assistant entry append是Completed Turn的结束线性化点；
-- Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的Intermediate assistant entry，且cancel/Steer没有赢得仲裁；
+- Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的ToolCall Intermediate entry，且SessionExecutor已完成Cancel/revocation与Steer FIFO检查；
 - usage属于该逻辑模型响应，不另写TokenCount event；
 - retry_count只表示SessionExecutor对同一logical call执行的logical retry数量，不包含ModelGateway transparent attempt；
 - provider_metadata只保存allowlisted bounded code/request ID，不保存raw response、headers、endpoint或payload；
@@ -715,7 +716,7 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 
 - source checkpoint和TranscriptFingerprint必须exact match；
 - summarized range必须是连续prefix，retained range必须是连续suffix，两者在stable boundary相邻；
-- cut不能拆分Input/Steer UserMessage、complete ToolRound、final assistant或existing Compaction summary；
+- cut不能拆分Input/Steer UserMessage、无ToolCallAssistant Continue、complete ToolRound、final assistant或existing Compaction summary；
 - active-Turn automatic Compaction必须保护initiating UserMessage及其后的连续suffix；
 - caller不提交raw replacement messages；trusted projector从source、boundaries和summary构造`Replace([summary] + retained suffix)`；
 - compaction只追加overlay，不重写旧entries；
@@ -728,14 +729,25 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 
 ## SessionWriter Append Algorithm
 
+append和replay共用同一个pure semantic seam：
+
+```rust
+fn validate_and_project(
+    base: &SessionProjectionState,
+    entry: &StoredSessionEntry,
+) -> Result<CommittedProjectionDeltaSet, SemanticEntryError>;
+```
+
+它集中验证entry body、Turn/Item/Interaction状态、cross-entry references、ToolRound完整性、Compaction boundaries和terminal closure，并生成全部trusted projection deltas。writer和replay不得各自维护一份语义规则。
+
 ```text
 SessionWriter.append(draft)
 → 检查writer未poisoned/closed
 → 检查expected_current_entry
 → 验证parent_entry存在且可作为本次append parent
 → 分配EntryId和timestamp
-→ 验证entry body与所有cross-entry references
-→ 计算trusted projection deltas
+→ 构造candidate StoredSessionEntry
+→ validate_and_project(current projections, candidate)
 → serialize one StoredSessionEntry + '\n'
 → append + flush process-visible bytes
 → 更新writer current entry / indexes
@@ -772,7 +784,19 @@ receipt字段不直接公开；只提供diagnostics/read-only accessors和storag
 - 开始Tool side effect；
 - 开始下一次模型调用。
 
-apply失败不回滚已append entry；Session execution丢弃hot projections并从durable current entry replay。
+`apply_committed`只安装append前已经由`validate_and_project`生成的trusted delta，不得再次执行可能产生不同结论的semantic validation。它不能对已commit entry返回ToolRound非法、Interaction family不匹配或terminal state非法等确定性语义错误。
+
+apply若因资源耗尽、hot base checkpoint mismatch或实现故障失败，不回滚已append entry；Session execution丢弃hot projections并从durable current entry replay。checkpoint mismatch属于hot-state/implementation故障，不表示durable entry非法。
+
+replay按entry顺序调用同一个`validate_and_project`。因此必须成立：
+
+```text
+append semantic validation ⊇ replay semantic validation
+writer成功commit的entry必然可以被projector语义接受
+live append/apply与cold replay得到相同projection fingerprint
+```
+
+若cold replay对writer在同一format version下commit的entry产生确定性semantic error，属于storage implementation bug或文件被外部篡改，不能描述为普通projection recovery。
 
 ## Append Error
 
@@ -835,7 +859,7 @@ pub(crate) enum ConversationChange {
 每个成功append都推进checkpoint entry_id：
 
 - operational/context/event entry通常是`AdvanceOnly`；
-- Input/Steer user和Final assistant是`Append`；
+- Input/Steer user、无ToolCall的Intermediate assistant和Final assistant是`Append`；
 - `tool_round_completed`是`Append`；
 - Compaction是`Replace`。
 
@@ -858,6 +882,7 @@ conversation projector只消费：
 ```text
 Message::User(source = Input)
 Message::User(source = Steer)
+Message::Assistant(phase = Intermediate, no ToolCall)
 Event::ToolRoundCompleted
 Message::Assistant(phase = Final)
 Compaction
@@ -867,7 +892,7 @@ Compaction
 
 ```text
 TurnContext
-Message::Assistant(phase = Intermediate)
+Message::Assistant(phase = Intermediate, contains ToolCall)
 Message::Tool
 InteractionRequested / Resolved
 ToolExecutionStarted
@@ -1044,8 +1069,8 @@ read SessionHeader
 → 验证format/session/EntryId唯一性
 → 建立parent graph
 → 验证parent只引用prior complete entry或None
-→ 验证cross-entry references位于同一selected ancestry并且类型匹配
-→ fold Turn/Item/Interaction/Conversation/Usage projections
+→ 对selected path逐entry调用validate_and_project
+   └─ 同时验证cross-entry references并fold Turn/Item/Interaction/Conversation/Usage projections
 → 确定physical current entry
 → 检测partial tail、corruption和unfinished Turn
 ```
@@ -1265,13 +1290,14 @@ content-addressed DAG
 - Tool message保存truthful result并完成operational Item；
 - ToolExecutionStarted先于side effect；
 - Interaction request先于notify，resolution先于wake；
-- assistant intermediate和tool message在ToolRoundCompleted前不model-visible；
+- 含ToolCall的assistant intermediate和tool message在ToolRoundCompleted前不model-visible；无ToolCall Assistant Continue在append/apply时model-visible但不terminalize Turn；
 - ToolRoundCompleted必须exact cover全部ToolCalls和Tool messages；
 - incomplete ToolRound可以durable但不能进入conversation；
 - outcome unknown不生成Tool message；
 - Interrupted/Failed不生成synthetic assistant message；
 - Prompt只消费CommittedConversationView；
 - every append返回trusted AdvanceOnly/Append/Replace delta；
+- append与replay共用同一个validate_and_project；writer-accepted entry必然可project；
 - projection mismatch时all-or-replay；
 - compaction append overlay，不改写历史；
 - fork deep copy selected parent path并remap nested refs；
@@ -1286,7 +1312,7 @@ content-addressed DAG
 
 - context entry后crash但无user input；
 - user input append OutcomeUnknown：保守终结、不在本run重试、不创建第二TurnId、用户可重新提交；
-- assistant intermediate含多个ToolCall；text/reasoning-only Intermediate被拒绝；
+- assistant intermediate含多个ToolCall；text/reasoning-only Continue Intermediate直接进入conversation但Turn保持Running；
 - reasoning text/encrypted/signature round-trip；
 - usage/model/response ID/finish reason/allowlisted provider metadata round-trip；
 - logical retry_count不混入ModelGateway transparent retry；
@@ -1298,7 +1324,7 @@ content-addressed DAG
 - partial tool results无ToolRoundCompleted；
 - ToolRoundCompleted missing/duplicate/reordered refs fail closed；
 - ToolRoundCompleted后conversation一次append完整round；
-- final assistant拒绝尚未被ToolRoundCompleted引用的Intermediate assistant；
+- final assistant拒绝尚未被ToolRoundCompleted引用的ToolCall Intermediate；已model-visible的无ToolCallContinue不阻塞final；
 - final assistant与Cancel/Steer race；
 - Interrupted/Failed terminal cleanup；
 - recovery保留existing tool messages、不补promotion；
@@ -1314,6 +1340,8 @@ content-addressed DAG
 - compaction source fingerprint和protected complete ToolRound；
 - SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count和provider metadata round-trip；
 - Prompt永远看不到uncompleted ToolRound。
+- 任意writer接受的合法entry sequence经live apply与cold replay得到相同Turn/Item/Interaction/Conversation/Usage projection fingerprints；
+- 注入semantic projector错误时必须在physical append前拒绝，不能生成cold replay才拒绝的committed entry。
 
 ## 设计覆盖范围
 

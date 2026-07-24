@@ -2,7 +2,7 @@
 
 状态：设计评审记录
 日期：2026-07-24
-范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0108）
+范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0109）
 方式：按设计切面并行只读评审（领域/协议、Session 执行/并发、存储/恢复、Prompt·Tool·Skill、ModelGateway·Compaction·Workspace、跨模块一致性），仅调研，未落盘修改设计文档。
 
 ## 总体判断
@@ -42,25 +42,29 @@
 
 ### B. 确定性与恢复正确性（前置不变量）
 
-**B1 · Prompt scope 内 priority / 冲突排序未定**
+> 以下B1–B3正文保留评审时的原始发现和当时建议，仅用于说明问题来源；当前决议已由[ADR 0109](../adr/0109-review-b-determinism-and-serialized-operations.md)替代，权威结果见文末“评审决议”。
+
+**B1 · Prompt scope 内 priority / 冲突排序未定（已关闭）**
 基础不变量要求「相同输入产生相同排序与稳定 `PromptFingerprint`」，但同 scope 多 definition 的全序、同 key 冲突解析留到「后续问题」。`PromptMergeMode::Append` 已引用「priority」，而 `PromptDefinition` 无该字段。
 - 影响：无 scope 内全序则 `PromptSet::assemble` 不确定、`PromptFingerprint` 不稳定，而后者是 cache/continuation、retry 一致性、recovery 比对的基础——Prompt 子系统能否进入实现的前置。
 - 建议：先冻结 scope 内 priority key 与同 key 冲突（diagnostic vs 拒绝）规则，至少给出一个可确定的 total order。
 - 出处：`prompt.md`，跨模块复核确认。
 
-**B2 · 缺「append 校验 ⊇ replay 校验」+「committed entry 必然可 project」不变量**
+**B2 · 缺「append 校验 ⊇ replay 校验」+「committed entry 必然可 project」不变量（已关闭）**
 `apply 失败不回滚已 append entry → 丢弃 hot projection → 从 durable current entry replay`，replay 用同一批 projector 重放同一条已落盘 entry。若 apply 失败是确定性的（projector 语义拒绝而非 OOM 等瞬时故障），replay 会再次失败 → 永久 replay-fail brick，而非承诺的「恢复」；append-time 校验若弱于 reload-time 校验，一条已 commit 的 entry 会在冷 open 时 fail closed，整个 Session 不可打开。
 - 影响：恢复路径能否成立的前提，却未写成不变量。
 - 建议：明确 (a) append 校验集合等价于/强于 reload 校验；(b) 对已通过校验的 committed entry，projector 只能瞬时失败、不得语义拒绝；据此把「apply 失败→replay」限定为瞬时故障重试。
 - 出处：`conversation-storage.md`。
 
-**B3 · `execution_version` 在 logical retry 不递增，四元组失去唯一性**
+**B3 · `execution_version` 在 logical retry 不递增，四元组失去唯一性（已关闭）**
 校验四元组 `SessionId+TurnId+execution_version+OperationType` 在「被判失败的旧 attempt」与「retry attempt」间完全相同（retry 只递增 `retry_count`，不在校验元组内）。retry 最有价值的场景（`RequestOutcomeUnknown`/`StreamInterrupted`/客户端 timeout）恰是旧 future 可能仍 in-flight 时，会出现两个同元组 future，executor 无法区分，可能 accept stale/duplicate model response 或 double-drive AgentLoop。
 - 影响：并发正确性核心。当前隐含不变量「同一 version 至多一个 in-flight future 且新 op 严格晚于同 version 旧 op 返回」只在 retry 由已返回的 retryable failure 触发时成立，对 hang/unknown 场景不成立。
 - 建议：每次新 model attempt（含 logical retry）递增 `execution_version`，或给 `RunningOperation`/`OperationResult` 增加单调 `operation_instance_id`(attempt nonce) 并纳入校验；同时把上述不变量写成显式约束。
 - 出处：`session-execution.md`。
 
 ### C. 安全 / fail-closed 缺口
+
+> 状态说明（2026-07-24）：C1、C2、C4已按[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)关闭；以下原始问题正文仅作评审历史记录。C3本轮不变，仍保持开放。
 
 **C1 · scope override 单调性只是散文约束**
 `DefinitionOverrides.enabled/model_visible/user_visible` 是裸 `Option<bool>`，`PromptMergeMode` 只有 `Required`（强制 present）无对称的 `Forbidden`/sealed。解析为 Runtime→Agent→Session last-wins，resolver 无法区分「default disable（可被下层翻回）」与「required disable（锁定）」，Session override `enabled=true` 规范上可翻回 Runtime 的 disable。
@@ -133,7 +137,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - `CurrentTurnExecution.model_attempt: ModelAttemptState` 与「不建立 ModelAttempt entity」措辞易误读 → 改名如 `CurrentModelCallState`。
 - `AgentLoop::accept_committed_tool_round(round: CommittedToolRound)` 引用了 `conversation-storage.md` 未定义的 `CommittedToolRound` → 补定义或改用现有 delta 类型。
 - `TurnExecutionPhase::Committing` 列出但驱动路径不明 → 补进入/退出点或说明为纯 observer projection。
-- `PromptMergeMode::Append` 引用「priority」但 `PromptDefinition` 无该字段（与 B1 相关，Q1 落地前从描述删去或补字段）。
+- ~~`PromptMergeMode::Append`引用未定义priority~~：已随B1关闭，当前使用固定层级和stable identity顺序，不增加priority字段。
 
 ### 协议 / 事件语义标注（点明即可）
 
@@ -208,4 +212,17 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - **A1（operation_key）**：**放弃「溯源重建恢复」要求**，key 机制参考 Claude Code / pi——单写者 append + 随机 per-entry `EntryId` + `parent_id` 树 + partial-tail 截断，不做确定性可重建 key、不做 `OperationConflict` 冲突检测索引、不做 payload normalization。已落盘：`conversation-storage.md` 删除 `operation_key`/`IdempotencyKey` storage 字段、`OperationConflict`、operation-key index、normalized payload fingerprint、fork key-regenerate 与 reload/corruption 的 key 校验；`OutcomeUnknown` 改为 poison writer + 保守终结、恢复靠 committed prefix 状态判断（不 in-run replay-by-key）；恢复终结改为**状态驱动**（已 terminal/已 resolved 则跳过），exclusive lease 下单跑。消费方文档（session-execution / turn-execution-context / tools / turn-item-interaction / agent-session-lifecycle / compaction / runtime-interface / model-gateway）与 ADR 0103/0104 同步；`resolution_key` / `CommandId` / admission submission key 保留为 in-run 去重、不承诺跨崩溃 durable 重建。**B2（committed entry 必可 project、append 校验⊇replay）因恢复完全依赖重放 committed prefix 而更关键**。
 - **A2（ExecutionMode）**：**移除**。已从 `ResolveTurnModelRequest`、`ToolTurnContext`、Turn capture DAG 与 fingerprint 删除，并在 `turn-execution-context.md` 记录「前台/后台是 presentation 概念、不进 capture/fingerprint」。若将来需要，改为 tool execution 路径上不进 fingerprint 的窄 approval disposition。
-- **A3（Session↔Agent 绑定）**：**采用方案2（snapshot-current + 显式 reload）**。`SessionCommand::Create` 改收 `agent_id`（创建时快照 current 并钉成 exact ref）；`UpgradeAgentRevision.target` 改为 `Option<AgentRevisionRef>`（`None`=重钉 current 的常规升级，给出 exact ref=钉指定/旧版）。存储层始终保存 exact `AgentRevisionRef`。理由：exact pin 让上下文与 prompt 前缀稳定，最大化 prompt cache 命中。
+- **A3（Session↔Agent 绑定）**：**采用方案2（snapshot-current + 显式 reload）**。`SessionCommand::Create` 改收 `agent_id`（创建时快照 current 并钉成 exact ref）；`UpgradeAgentRevision.target` 改为 `Option<AgentRevisionRef>`（`None`=重钉 current 的常规升级，给出 exact ref=钉指定/旧版）。存储层始终保存 exact `AgentRevisionRef`。理由：exact pin让Agent selection、Workspace和Model配置稳定；显式Prompt resource reload另行只影响future Turn。
+
+针对B组已作决定并落盘，长期决策见[ADR 0109](../adr/0109-review-b-determinism-and-serialized-operations.md)：
+
+- **B1（Prompt顺序）**：**已关闭**。不增加priority；当前固定Runtime required System → Runtime base System → Agent System → Session User → Workspace User → Tool → Skill层级。PromptDefinition层按PromptKey、PromptId、DefinitionVersion和stable provenance identity排序；Workspace/Tool/Skill分别按relative path、ToolName、SkillId排序；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
+- **B2（append/replay/projector一致性）**：**已关闭**。writer append与cold replay共用pure `validate_and_project`；append semantic validation等价于或强于replay validation；writer成功commit的entry必须可project。`apply_committed`只安装预计算trusted delta，增加live-apply/cold-replay等价性测试要求。
+- **B3（logical retry operation identity）**：**已关闭**。每Session最多一个current RunningOperation；旧operation terminal/remove或安全drop并关闭结果路径前，不启动retry或下一operation。execution_version继续表示conversation/control basis，不增加operation_instance_id。Steer/FollowUp使用普通`VecDeque<QueuedMessage>`；Steer在完整assistant/tool step后每轮pop一条，无ToolCall candidate final在queue非空时保存为Assistant Continue。
+
+针对C组已作决定并落盘，长期决策见[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)：
+
+- **C1（Prompt override单调性）**：**已关闭**。删除`DefinitionOverrides`；PromptService共享`PromptResourceView`，Agent/Session只保存PromptId selection，各Turn独立构建PromptSet。Runtime required Prompt不进入selection。
+- **C2（role×scope特权）**：**已关闭**。Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；ModelGateway不再执行Developer lowering。
+- **C3（Sandbox capability预执行拒绝）**：**保持开放，本轮不变**。不修改现有ToolSandbox设计。
+- **C4（Skill content drift）**：**已关闭**。不采用Catalog revision/exact hash pin；SkillService发布current SkillView，显式reload成功后原子替换，active Turn继续使用captured view和已加载内容。

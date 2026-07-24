@@ -16,7 +16,7 @@ MiniCore 已确立 Transcript-First 模型输入、by-entry JSONL storage、单�
 1. Compaction 是 crate-internal 的纯 planning/validation 模块，不是 Runtime Service 或领域 entity。它只提供：context budget 计算、stable-unit projection、strict cut/protection planning、protected EntryId、portable summary directive 构造、summary input reduction 和结果/commit candidate 校验。它不构造 `ModelCallRequest`，不拥有 SessionWriter、ModelGateway、events、CancellationToken 或 Turn terminal state。
 2. SessionExecutor 是唯一的 orchestration owner：判断 trigger、驱动 `RunningOperation::CompactConversation`、调用 PromptSet 与 ModelGateway、仲裁 Steer/Cancel/revocation、执行 writer append/apply。
 3. automatic compaction 只在 active Turn 的 `NeedModel` safe point 评估，trigger 为 soft context pressure、Prompt local context overflow 和 provider context overflow。final assistant 完成后不做 eager post-turn compaction，也不提供 standalone/manual compaction。
-4. cut 基于 model-visible stable unit（一个 UserMessage、一个完整 ToolRound、一个 final AssistantMessage 或一个已有 Compaction summary），只在 unit boundary 之间发生，不拆散任何协议稳定单元。
+4. cut基于model-visible stable unit（一个UserMessage、一个无ToolCallAssistant Continue、一个完整ToolRound、一个final AssistantMessage或一个已有Compaction summary），只在unit boundary之间发生，不拆散任何协议稳定单元。
 5. summarized range 是非空连续 prefix，retained range 是非空连续 suffix，两者在 stable boundary 处相邻；projector 不从 history 中间删除任意 message。
 6. hard-protect active Turn 的 initiating UserMessage 及其后全部连续 model-visible history。由于 retained range 必须连续，active Turn 内部更早的 ToolRound 也原样保留。protected suffix 过大时报告 `ProtectedSuffixTooLarge`，不 split、summarize 或截断 current Turn。
 7. 重复 compaction 是 portable rolling summary：previous effective summary 与新 evicted stable units 被合成为一个新 summary，后接 retained suffix；每次只产生一个 effective leading summary。

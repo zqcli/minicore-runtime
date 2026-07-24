@@ -5,17 +5,18 @@
 
 ## 目的
 
-本文定义 MiniCore Prompt 子系统的基础对象、所有权、Prompt source、scope 解析、Turn 快照、用户输入规范化、模型上下文组装、校验、fingerprint 和 diagnostics。
+本文定义 MiniCore Prompt 子系统的基础对象、所有权、共享资源 view、Turn 快照、用户输入规范化、模型上下文组装、校验、fingerprint 和 diagnostics。
 
 本文以以下关系为基础：
 
 ```text
 MiniCoreRuntime 初始化一个 Arc<PromptService>
-AgentDefinition 持有 AgentPrompts 配置
-SessionDefinition 持有 SessionPrompts 配置
+PromptService 发布共享、不可变的 PromptResourceView
+AgentDefinition 保存默认 PromptId selection
+SessionDefinition 保存本 Session 的 PromptId selection
 Turn 领域对象不持有 PromptSet 或完整 Prompt 内容
-Session execution 在 admission 期间预留 candidate Turn identity
-PromptService::for_turn(...) 返回 candidate Turn 使用的不可变 PromptSet
+Session execution 在 admission 期间捕获 current PromptResourceView
+PromptService::for_turn(...) 为 candidate Turn 构造独立、不可变的 PromptSet
 PromptSet 是唯一可以组装模型可见上下文的对象
 ```
 
@@ -36,20 +37,19 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 
 - `MiniCoreRuntime` 初始化并拥有一个 `Arc<PromptService>`；
 - PromptService 是长生命周期深模块；
-- AgentDefinition 和 SessionDefinition 只持有对应 scope 的 Prompt definitions 和 overrides；
+- PromptService 通过不可变 `PromptResourceView` 共享 Prompt definitions；
+- AgentDefinition 和 SessionDefinition 只保存 `PromptId` selection，不复制 Prompt 正文；
 - Turn 领域对象不持有 PromptSet，也不保存完整 Prompt definitions；
 - Session execution 在领域 Turn 发布前、initiating UserMessage 规范化和第一次模型调用前创建 PromptSet；
 - PromptSet 是某个 Turn 使用的不可变有效 Prompt 快照；
-- Runtime、Agent、Session 是 Prompt 的配置 scope；
-- System、Developer、User 是模型消息 role；
-- Prompt scope 与 Prompt role 是两个正交维度；
-- Runtime required policy 不能被 Agent 或 Session 覆盖；
+- Prompt role 只保留 `System` 与 `User`；
+- Runtime required policy 不进入 selection，不能被 Agent 或 Session关闭；
 - PromptService 可以加载 Prompt-specific source，但不拥有 Workspace 生命周期或 trust 状态；
 - PromptService 不主动调用 ToolService 或 SkillService；
-- Session execution 先取得 `ToolPromptView` 和 `SkillCatalogView`，再把窄 view 交给 PromptService；
+- Session execution先取得`PromptResourceView`、`ToolPromptView`和`SkillPromptView`，再交给PromptService；
 - PromptSet 负责 `PromptIntent → CanonicalUserMessage`；
 - PromptSet 负责每次模型调用的最终 provider-neutral context assembly；
-- PromptSet 在创建时绑定 ToolPromptView 和 SkillCatalogView，assembly 时不再接受任意替代 view；
+- PromptSet在创建时绑定这些view，assembly时不再接受任意替代view；
 - 执行中变化的模型可见事实必须先进入 committed conversation，不保留 arbitrary current-call contribution lane；
 - `MessageRecord → ModelMessage` 的唯一转换发生在 Prompt 子系统；
 - 相同输入必须产生相同排序、输出和 fingerprint；
@@ -60,21 +60,22 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 ```text
 MiniCoreRuntime
 └─ Arc<PromptService>
-   ├─ RuntimePrompts
+   ├─ current Arc<PromptResourceView>
    ├─ PromptSourceAdapter*
    ├─ PromptContentCache
    ├─ PromptPolicy
    └─ PromptDiagnostics
 
 AgentDefinition
-└─ AgentPrompts
+└─ AgentPromptSelection
 
 SessionDefinition
-└─ SessionPrompts
+└─ SessionPromptSelection
 
 Turn execution orchestration
-├─ ToolSet.prompt_view()     → ToolPromptView
-├─ SkillCatalog.prompt_view() → SkillCatalogView
+├─ PromptService.current_view() → Arc<PromptResourceView>
+├─ ToolSet.prompt_view()         → ToolPromptView
+├─ SkillView.prompt_view()       → SkillPromptView
 └─ PromptService::for_turn(PromptTurnContext)
    └─ PromptSet
       ├─ compose_user_message(UserMessageCompositionInput)
@@ -106,18 +107,22 @@ Runtime 启动时：
 
 ## AgentDefinition 和 SessionDefinition
 
-Agent scope Prompt 属于 immutable AgentDefinition：
+AgentDefinition 只保存共享 Prompt resource 的默认选择：
 
 ```rust
 pub struct AgentDefinition {
     pub agent_id: AgentId,
     pub revision: AgentRevision,
-    pub prompts: AgentPrompts,
+    pub prompts: AgentPromptSelection,
     // ...
+}
+
+pub struct AgentPromptSelection {
+    pub enabled: BTreeSet<PromptId>,
 }
 ```
 
-Session scope Prompt 属于 immutable SessionDefinition：
+SessionDefinition保存本Session的User Prompt选择，由SessionDefinitionRevision独立管理：
 
 ```rust
 pub struct SessionDefinition {
@@ -126,13 +131,19 @@ pub struct SessionDefinition {
     pub agent: AgentRevisionRef,
     pub workspace: Workspace,
     pub model: SessionModelConfig,
-    pub prompts: SessionPrompts,
+    pub prompts: SessionPromptSelection,
+}
+
+pub struct SessionPromptSelection {
+    pub enabled: BTreeSet<PromptId>,
 }
 ```
 
-Turn admission 从同一个 exact SessionDefinitionRevision 取得 SessionPrompts，并按 `AgentRevisionRef` 读取 exact AgentDefinition。PromptService 不能按 AgentId 回查 current revision，也不能把不同 Session revision 的 Workspace、SessionModelConfig和Prompt config 拼接。
+多个 Session 可以选择同一个 `PromptId`。共享的是 PromptService view 中的不可变 `Arc<PromptDefinition>`，不是 PromptSet；每个 Turn 仍根据自己的 Session selection、Workspace、Tool、Skill和conversation构造独立 PromptSet。
 
-Workspace project Prompt 在 scope 解析上属于 Session，但 SessionDefinition 不复制从项目文件发现的 PromptDefinition 或正文。PromptService 通过当前 Turn pin 的 `WorkspacePromptContext` 发现、加载和解析已授权 project Prompt source。Workspace 只授权 source，不解析 Prompt。
+Turn admission 从同一个 exact SessionDefinitionRevision 取得 selection，并按 `AgentRevisionRef` 读取 exact AgentDefinition。PromptService 不能按 AgentId 回查 current revision，也不能把不同 Session revision 的 Workspace、SessionModelConfig和Prompt selection 拼接。
+
+Workspace project Prompt不写入Session selection。PromptService通过当前Turn pin的`WorkspacePromptContext`读取已授权project Prompt source，并将其作为User context加入本Turn PromptSet。Workspace只授权source，不解析Prompt。
 
 Agent head、Session head 和 definitions 都不保存 PromptService、PromptContentCache、PromptSet 或最终 AssembledModelContext。完整 lifecycle 见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)，Workspace 规则见 [Workspace 子系统架构设计](workspace.md)。
 
@@ -159,18 +170,18 @@ Turn start execution metadata
 → exact Prompt/Model/Workspace/Tool/Skill fingerprints and references
 
 TurnExecutionContext
-→ PromptSet、ToolSet、pinned SkillCatalog 和 WorkspaceSnapshot 等执行期对象
+→ PromptSet、ToolSet、captured SkillView和WorkspaceSnapshot等执行期对象
 ```
 
 Session execution 在 candidate admission 期间创建 PromptSet，并在 admission 失败或 Turn terminal 后随 Context 释放。PromptService 不创建 Turn，也不修改 TurnStatus。完整 capture、committed-only assembly 和 AgentLoop 关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
 ## PromptService
 
-PromptService 对外隐藏 Prompt source discovery、内容加载、cache、scope 解析、排序、policy、校验和 diagnostics：
+PromptService对外隐藏Prompt source discovery、共享view publication、内容加载、cache、selection解析、排序、policy、校验和diagnostics：
 
 ```rust
 pub struct PromptService {
-    runtime_prompts: RuntimePrompts,
+    current: Arc<PromptResourceView>,
     sources: Vec<Arc<dyn PromptSourceAdapter>>,
     content_cache: PromptContentCache,
     policy: PromptPolicy,
@@ -184,6 +195,10 @@ pub struct PromptService {
 impl PromptService {
     pub async fn initialize(&self) -> Result<(), PromptError>;
 
+    pub fn current_view(&self) -> Arc<PromptResourceView>;
+
+    pub async fn reload(&self) -> Result<Arc<PromptResourceView>, PromptError>;
+
     pub async fn for_turn(
         &self,
         context: PromptTurnContext,
@@ -191,22 +206,21 @@ impl PromptService {
 }
 ```
 
-`initialize()` 只初始化 Runtime scope Prompt 和 Prompt source，不创建 Agent、Session 或 Turn。
+`initialize()`构建第一个`PromptResourceView`，不创建Agent、Session或Turn。`reload()`先完整构建并校验candidate view，成功后原子替换current view；失败时继续保留旧view。
 
-`for_turn()` 完成：
+`for_turn()`完成：
 
 ```text
-RuntimePrompts
-+ AgentPrompts
-+ SessionPrompts
+PromptResourceView
++ AgentPromptSelection
++ SessionPromptSelection
 + WorkspacePromptContext
 + TurnModelSnapshot
 + ToolPromptView
-+ SkillCatalogView
-→ source load
-→ scope defaults/overrides 解析
-→ required policy 校验
-→ role 和 merge policy 解析
++ SkillPromptView
+→ 解析PromptId selection
+→ required policy校验
+→ 固定System/User分配
 → 稳定排序
 → PromptProfile
 → PromptSet
@@ -214,39 +228,17 @@ RuntimePrompts
 
 ## Prompt Source Adapter
 
-Prompt-specific source 通过内部 adapter 接入：
+共享Prompt resource通过内部adapter接入：
 
 ```rust
 pub trait PromptSourceAdapter: Send + Sync {
-    async fn discover(
-        &self,
-        context: &PromptSourceContext,
-    ) -> Result<Vec<PromptDefinition>, PromptSourceError>;
+    async fn discover(&self) -> Result<Vec<PromptDefinition>, PromptSourceError>;
 }
 ```
 
-可能的 adapter：
+首版只需要Runtime built-in和用户配置source。AgentDefinition与SessionDefinition引用这些共享definition，不拥有独立source adapter。
 
-```text
-RuntimePromptSource
-UserPromptSource
-AgentPromptSource
-SessionPromptSource
-WorkspacePromptSource
-```
-
-PromptSourceAdapter 只读取 Prompt-specific source。它不创建 Workspace、不决定 Workspace trust，也不获得 provider credentials。Agent/Session source adapter 必须使用 context 中的 exact revisions，不能回查 mutable current head。
-
-```rust
-pub struct PromptSourceContext {
-    pub agent: AgentRevisionRef,
-    pub session_id: SessionId,
-    pub session_revision: SessionDefinitionRevision,
-    pub workspace: WorkspacePromptContext,
-}
-```
-
-`WorkspacePromptContext` 由同一个 Turn-pinned `WorkspaceSnapshot` 投影，至少包含 canonical cwd、primary root、已授权 Prompt source roots、authorization lease 和 WorkspacePromptFingerprint。它不包含 write capability，也不能从 filesystem-readable additional roots 自行扩大 Prompt source。完整定义见 [Workspace 子系统架构设计](workspace.md)。
+Workspace project instructions不进入共享PromptResourceView。`for_turn()`使用同一个Turn-pinned `WorkspacePromptContext`读取已授权source并生成User context section。该context至少包含canonical cwd、primary root、已授权Prompt source roots、authorization lease和WorkspacePromptFingerprint；它不包含write capability，也不能从filesystem-readable additional roots自行扩大Prompt source。完整定义见[Workspace子系统架构设计](workspace.md)。
 
 ## PromptDefinition
 
@@ -257,123 +249,60 @@ pub struct PromptDefinition {
     pub key: PromptKey,
     pub name: String,
     pub description: Option<String>,
-    pub scope: PromptScope,
     pub role: PromptRole,
-    pub merge: PromptMergeMode,
     pub content: PromptContent,
     pub provenance: PromptProvenance,
 }
 
 pub enum PromptProvenance {
     Runtime(PromptSourceId),
-    Agent(PromptSourceId),
-    Session(PromptSourceId),
-    Workspace(WorkspaceSourceRef),
+    User(PromptSourceId),
 }
 ```
 
-Workspace project Prompt 必须保留 `WorkspaceSourceRef`，其中包含 model-safe relative path、source authorization stamp 和 WorkspacePromptFingerprint。Prompt content cache key 不能只使用 path 或 PromptId；authorization-sensitive lookup 必须覆盖 provenance/source stamp。撤销对应 Workspace lease 后，active Turn 不得再次使用该 PromptSet 发起模型调用。
-
-Prompt 的 scope 和 role 分开表达：
+共享Prompt content cache key不能只使用PromptId；必须覆盖definition version和provenance。Workspace project instruction保留独立`WorkspaceSourceRef`，撤销对应Workspace lease后，active Turn不得再次使用该PromptSet发起模型调用。
 
 ```rust
-pub enum PromptScope {
-    Runtime,
-    Agent,
-    Session,
-}
-
 pub enum PromptRole {
     System,
-    Developer,
     User,
 }
 ```
 
-示例：
+固定分配：
 
 ```text
-Runtime required policy
-→ scope = Runtime
-→ role = System
+Runtime required/base policy、Agent behavior
+→ System
 
-Agent behavior instructions
-→ scope = Agent
-→ role = Developer
-
-Workspace instructions
-→ scope = Session
-→ role = Developer
-
-Prompt template invocation
-→ scope = Session
-→ role = User
+Session instructions、Workspace instructions、Skill metadata/正文、用户输入
+→ User
 ```
 
-Merge mode：
+Tool schema进入provider原生`tools`字段；ToolPromptView的说明性metadata进入User context。Runtime通用Tool安全规则若存在，属于Runtime System policy。低信任Workspace或Skill内容不能声明或提升为System。
+
+所有普通selected Prompt按固定层级追加，不提供ReplaceBase或caller-controlled merge mode。Runtime required policy由PromptService单独持有并始终加入。
+
+PromptDefinition的identity是`PromptId + DefinitionVersion`。selection变化不产生新DefinitionVersion。
+
+## 共享资源 View
 
 ```rust
-pub enum PromptMergeMode {
-    Required,
-    ReplaceBase,
-    Append,
+pub struct PromptResourceView {
+    definitions: HashMap<PromptId, Arc<PromptDefinition>>,
+    pub fingerprint: PromptResourceFingerprint,
 }
 ```
 
-基础语义：
+PromptService是共享PromptDefinition的owner。Agent和Session只保存PromptId selection；同一definition可以被任意多个Session使用而不复制正文或加载状态。
 
-| Merge mode | 含义 |
-| --- | --- |
-| `Required` | 必须进入 PromptSet，低层 scope 不可删除或替换。 |
-| `ReplaceBase` | 在 policy 允许时替换可替换的 base Prompt。 |
-| `Append` | 按 scope、priority 和稳定 key 顺序追加。 |
+selection只适用于普通可选Prompt。Runtime required policy始终由PromptService加入，不出现在selection中。Agent selection只能选择声明为System且来源可信的definition；Session selection只能选择User definition。role不匹配或PromptId不存在时返回typed error，不能静默忽略。
 
-PromptDefinition 的精确 identity 是 `PromptId + DefinitionVersion`。加载状态、启用状态和可见性变化不产生新 DefinitionVersion。
-
-## Scope 集合
-
-```rust
-pub struct RuntimePrompts {
-    pub definitions: Vec<PromptDefinition>,
-    pub defaults: HashMap<PromptId, DefinitionOverrides>,
-}
-
-pub struct AgentPrompts {
-    pub definitions: Vec<PromptDefinition>,
-    pub overrides: HashMap<PromptId, DefinitionOverrides>,
-}
-
-pub struct SessionPrompts {
-    pub definitions: Vec<PromptDefinition>,
-    pub overrides: HashMap<PromptId, DefinitionOverrides>,
-}
-```
-
-`Vec` 是 Prompt definitions 的权威有序集合。`PromptKey` 在同一 scope 内必须唯一。
-
-```rust
-pub struct DefinitionOverrides {
-    pub enabled: Option<bool>,
-    pub user_visible: Option<bool>,
-    pub model_visible: Option<bool>,
-    pub load_policy: Option<LoadPolicy>,
-}
-```
-
-解析方向：
-
-```text
-Runtime defaults
-+ Agent overrides
-+ Session overrides
-→ effective Prompt definitions
-```
-
-上层 Required 或明确禁止不能被低层 scope 解除。
+PromptResourceView发布后不可变。reload成功后只替换PromptService的current view；已经创建的PromptSet继续持有旧definition `Arc`，future Turn捕获新view。
 
 ## 外部窄 View
 
-PromptService 不接收 ToolService、ToolSet、SkillService 或完整 SkillCatalog handle，只接收模型安全的只读 view。
+PromptService不接收ToolService、ToolSet、SkillService或完整SkillView handle，只接收模型安全的只读view。
 
 ```rust
 pub struct ToolPromptView {
@@ -381,16 +310,15 @@ pub struct ToolPromptView {
     pub tool_set_fingerprint: ToolSetFingerprint,
 }
 
-pub struct SkillCatalogView {
+pub struct SkillPromptView {
     pub entries: Arc<[ModelVisibleSkillMetadata]>,
-    pub revision: CatalogRevision,
-    pub fingerprint: SkillCatalogFingerprint,
+    pub fingerprint: SkillViewFingerprint,
 }
 ```
 
 ToolPromptView 由当前 ToolSet 投影。它不能执行 Tool，也不暴露 executor、approval、policy、grant 或 Sandbox。
 
-SkillCatalogView 由当前 SkillCatalog 投影。它不包含完整 Skill 正文，也不能通过 PromptService 加载 Skill。
+SkillPromptView由Turn捕获的SkillView投影。它不包含完整Skill正文，也不能通过PromptService加载Skill。
 
 ## PromptTurnContext
 
@@ -401,12 +329,13 @@ pub struct PromptTurnContext {
     pub agent: AgentRevisionRef,
     pub session_id: SessionId,
     pub session_revision: SessionDefinitionRevision,
-    pub agent_prompts: AgentPrompts,
-    pub session_prompts: SessionPrompts,
+    pub resources: Arc<PromptResourceView>,
+    pub agent_prompts: AgentPromptSelection,
+    pub session_prompts: SessionPromptSelection,
     pub workspace: WorkspacePromptContext,
     pub model: TurnModelSnapshot,
     pub tools: ToolPromptView,
-    pub skills: SkillCatalogView,
+    pub skills: SkillPromptView,
 }
 ```
 
@@ -433,7 +362,7 @@ pub struct PromptSet {
     profile: PromptProfile,
     definitions: Arc<[EffectivePromptDefinition]>,
     tools: ToolPromptView,
-    skill_catalog_fingerprint: SkillCatalogFingerprint,
+    skill_view_fingerprint: SkillViewFingerprint,
     model: TurnModelSnapshot,
     fingerprint: PromptFingerprint,
 }
@@ -460,25 +389,43 @@ PromptSet 在同一个 Turn 中不原地修改。Prompt source reload 只影响 
 ```rust
 pub struct PromptProfile {
     pub system: Arc<[PromptSection]>,
-    pub developer: Arc<[PromptSection]>,
+    pub user_context: Arc<[PromptSection]>,
 }
 ```
 
-PromptProfile 保存已经按 scope、role、merge policy 和稳定顺序解析完成的 Prompt baseline。每个 PromptSection 自带 definition provenance/source stamp；它与 committed MessageRecord 中的 PromptContributionStamp 不是同一类 identity。SkillCatalogView metadata 在创建 PromptProfile 时被稳定渲染，PromptSet 另外保存其 fingerprint 用于一致性校验。
+PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt baseline。`system`只包含Runtime required/base policy与Agent behavior；`user_context`包含Session、Workspace、Tool说明性metadata和Skill metadata，并在AgentRun assembly时编码为位于committed conversation之前的确定性User context。每个PromptSection自带definition provenance/source stamp；它与committed MessageRecord中的PromptContributionStamp不是同一类identity。SkillPromptView metadata在创建PromptProfile时被稳定渲染，PromptSet另外保存其fingerprint用于一致性校验。
 
-推荐顺序：
+固定顺序：
 
 ```text
 1. Runtime required system policy
 2. Runtime base system Prompt
-3. Agent instructions
-4. Session instructions
-5. Workspace instructions
-6. ToolPromptView guidelines/spec metadata
-7. SkillCatalogView metadata
+3. Agent system instructions
+4. Session user instructions
+5. Workspace user instructions
+6. ToolPromptView user-facing guidelines metadata
+7. SkillPromptView user metadata
 ```
 
-同 scope 冲突产生 typed diagnostic，不能依赖 source discovery 顺序。
+该顺序参考Codex和Claude Code的固定层级：高信任层的位置不能被低层配置或文件扫描顺序改变。不定义`priority`字段。
+
+各层使用与其数据类型一致的稳定顺序：
+
+```text
+Runtime/Agent/Session selected PromptDefinition
+→ PromptKey → PromptId → DefinitionVersion → provenance source identity
+
+Workspace instructions
+→ model-safe relative path
+
+ToolPromptView metadata
+→ ToolName
+
+SkillPromptView metadata
+→ SkillId
+```
+
+source adapter返回顺序、filesystem枚举顺序和HashMap迭代顺序都不能影响结果。PromptDefinition层内出现相同`PromptKey`时返回`PromptErrorKind::DuplicateKey`并拒绝创建PromptSet；不静默覆盖或选择“最后发现”的definition。
 
 ## PromptIntent 和 CanonicalUserMessage
 
@@ -510,7 +457,7 @@ pub struct CanonicalUserMessage {
 
 CanonicalUserMessage 是可以进入 conversation commit 的标准值，不是裸字符串，也不是与 MessageRecord 并列的第二份消息状态。
 
-SkillIntent 的完整 Skill 内容必须先由 TurnExecutionContext 通过 pinned `SkillCatalogEntryRef` 调用 SkillService 加载，并经 SkillInjector 转换为 PromptContribution。PromptSet 不读取 Skill 文件，只校验 contribution identity 并将其规范化进 MessageRecord。
+SkillIntent的完整Skill内容必须先由TurnExecutionContext使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。PromptSet不读取Skill文件，只校验contribution来源并将其规范化进MessageRecord。
 
 同样的规范化规则可以服务于 Steer control fact，但 storage/domain fact kind 决定它是否开启新 Turn；模型 role 不能反向决定领域 Turn 边界。
 
@@ -521,9 +468,7 @@ PromptContribution 表示在输入规范化前由其他深模块产生的 typed 
 ```rust
 pub struct PromptContribution {
     pub source: PromptContributionSource,
-    pub role: PromptRole,
     pub content: MessageContent,
-    pub content_hash: ContentHash,
 }
 
 pub enum PromptContributionSource {
@@ -535,9 +480,9 @@ pub enum PromptContributionSource {
 
 `WorkspaceSourceRef` 必须携带 root/source identity、model-safe relative path 和 source authorization stamp；不能使用裸绝对 `PathBuf` 表达已授权 Workspace contribution。
 
-`SkillContributionRef` 必须携带 Catalog revision、SkillId、DefinitionVersion、ContentHash 和 source authorization stamp。TurnExecutionContext 负责 pinned Catalog entry 与 LoadedSkill 的 exact-reference 校验；PromptSet 校验 contribution stamp 和 content hash，并将其固化到 CanonicalUserMessage fingerprint。
+`SkillContributionRef`携带SkillId和source authorization stamp。TurnExecutionContext负责确认entry来自本Turn捕获的SkillView并在实际读取时重新校验Workspace authorization；PromptSet把来源stamp固化到CanonicalUserMessage，正文完整性由CanonicalUserMessage自身的fingerprint覆盖。
 
-PromptContribution的producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
+PromptContribution固定为User内容，不能声明System role。producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
 
 Required contribution 获取失败必须显式返回 unavailable/error，不能通过 vector 缺项静默忽略。
 
@@ -552,7 +497,7 @@ PromptContribution
 → 后续assembly只从committed conversation重建
 ```
 
-Turn-static Workspace Prompt、ToolPromptView 和 SkillCatalog metadata 在 PromptSet 创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply和conversation projection规则，不能恢复current-call assembly旁路。
+Turn-static Workspace Prompt、ToolPromptView和SkillView metadata在PromptSet创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply和conversation projection规则，不能恢复current-call assembly旁路。
 
 ## 模型上下文组装
 
@@ -573,13 +518,13 @@ pub enum PromptAssemblyInput<'a> {
 
 variant确定`ModelCallPurpose`，caller不能把Compaction prefix伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedConversationPrefixView`只能由同一State按validated stable-unit boundary构造。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint/fingerprint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required policy、typed summary directive和trusted committed prefix。普通Agent/Session/Workspace/Tool/Skill静态instructions不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted committed prefix。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
 最终输出：
 
 ```rust
 pub struct AssembledModelContext {
-    pub instructions: Arc<[ModelInstruction]>,
+    pub system: Arc<[PromptSection]>,
     pub messages: Arc<[ModelMessage]>,
     pub tools: Arc<[ToolSpec]>,
     pub output_contract: Option<OutputContract>,
@@ -589,16 +534,6 @@ pub struct AssembledModelContext {
     pub(crate) assembly_proof: PromptAssemblyProof,
 }
 
-pub struct ModelInstruction {
-    pub role: ModelInstructionRole,
-    pub content: Arc<str>,
-}
-
-pub enum ModelInstructionRole {
-    System,
-    Developer,
-}
-
 pub(crate) struct PromptAssemblyProof {
     pub purpose: ModelCallPurpose,
     pub turn_model_fingerprint: TurnModelFingerprint,
@@ -606,7 +541,7 @@ pub(crate) struct PromptAssemblyProof {
 }
 ```
 
-AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot和OutputContract binding。PromptSet保留ordered System/Developer role；provider原生role、deterministic role lowering和cache-control encoding由[ModelGateway](model-gateway.md)处理。
+AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot和OutputContract binding。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
 `MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
 
@@ -614,14 +549,14 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 
 `PromptSet::assemble()` 集中执行：
 
-- system/developer section顺序确定并保留为ordered ModelInstruction；
+- System section和前置User context顺序确定；
 - required Runtime policy 未缺失；
 - PromptKey 和 contribution source 不发生非法重复；
 - PromptSet 内绑定的 ToolPromptView 携带 parent ToolSetFingerprint；该 cross-binding 在 TurnExecutionContext capture/final validation 时完成；
 - 不存在 orphan ToolResult；
 - 不存在非法截断的 unresolved ToolCall；
 - initiating UserMessage 未遗漏或放到 ToolCall/ToolResult 中间；
-- committed MessageRecord 中的 SkillContributionRef、content hash 和 source stamp 与规范化时保存的 stamp 一致；
+- committed MessageRecord中的SkillContributionRef和source stamp与规范化时保存的stamp一致；
 - required contribution 在输入规范化阶段缺失时失败；
 - 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
@@ -642,13 +577,14 @@ AssembledModelContextFingerprint
 PromptSet fingerprint 至少覆盖：
 
 ```text
+PromptResourceView fingerprint
+selected PromptId集合
 PromptDefinition identity/version
 PromptDefinition provenance/source authorization stamp
-scope resolution result
-role 和 merge mode
+System/User分配
 WorkspacePromptFingerprint
 ToolPromptView.tool_set_fingerprint
-SkillCatalogView fingerprint
+SkillPromptView fingerprint
 Model capability projection
 稳定 section 顺序
 ```
@@ -665,16 +601,17 @@ MiniCoreRuntime 启动
 → PromptService.initialize()
 
 candidate Turn admission
-├─ SkillService.catalog(pinned context) → SkillCatalog.prompt_view()
+├─ PromptService.current_view() → Arc<PromptResourceView>
+├─ SkillService.current_view(context) → Arc<SkillView> → SkillPromptView
 └─ ToolService.for_turn(pinned context) → ToolSet.prompt_view()
 
-两个 view 均就绪
+三个view均就绪
 → PromptService.for_turn(PromptTurnContext)
 → PromptSet
 
 用户输入
 → TurnExecutionContext.compose_message(PromptIntent)
-→ 内部按需 exact-load Skill / SkillInjector.build
+→ 内部按需load Skill / SkillInjector.build
 → PromptSet.compose_user_message(...)
 → CanonicalUserMessage
 → append initiating UserMessage entry
@@ -694,7 +631,7 @@ Codex 每次模型调用构造一个最终 `Prompt`，其中包含 conversation 
 
 pi 使用纯 `buildSystemPrompt(options)` 组装 custom/base prompt、tools、context files、skills、date 和 cwd。MiniCore 保留其纯确定性组装思路，但使用不可变 PromptSet、typed contribution 和 fingerprint，避免 active tool/resource 变化导致局部重建分裂。
 
-Claude Code 使用 managed、user、project、local 和 path-scoped instructions，并对 Skill 内容使用按需加载。MiniCore 借鉴其 scope 分层和渐进披露，但显式区分 PromptScope 与 PromptRole。
+Claude Code使用managed、user、project、local和path-scoped instructions，并对Skill内容使用按需加载。MiniCore同样共享资源、按Session构建上下文；只保留System与User两种Prompt role。
 
 ## 错误和 Diagnostics
 
@@ -705,7 +642,8 @@ pub enum PromptErrorKind {
     SourceDiscovery,
     ContentLoad,
     DuplicateKey,
-    InvalidMerge,
+    PromptUnavailable,
+    InvalidRole,
     RequiredPromptMissing,
     InvalidIntent,
     InvalidContribution,
@@ -714,23 +652,23 @@ pub enum PromptErrorKind {
 }
 ```
 
-PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn 的 resolution 和 assembly diagnostics。
+PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的selection和assembly diagnostics。
 
-非致命 source error 可以保留有效 Prompt definitions 并产生 diagnostics。Required policy、required contribution 或 conversation protocol 错误必须 fail closed。
+非致命source error可以保留有效Prompt definitions并产生diagnostics。DuplicateKey、Required policy、required contribution或conversation protocol错误必须fail closed。
 
 ## 领域所有权
 
 | 对象 | Owner |
 | --- | --- |
 | `Arc<PromptService>` 生命周期 | MiniCoreRuntime |
-| Runtime Prompt definitions/source/cache | PromptService |
-| AgentPrompts 配置 | exact AgentDefinition revision |
-| SessionPrompts / Workspace definition | exact SessionDefinition revision |
+| PromptResourceView、Prompt definitions/source/cache | PromptService |
+| AgentPromptSelection | exact AgentDefinition revision |
+| SessionPromptSelection / Workspace definition | exact SessionDefinition revision |
 | Workspace project Prompt discovery、definition 和正文 cache | PromptService，经 WorkspacePromptContext 授权 |
 | PromptSet | Turn 执行上下文 |
 | ToolPromptView | ToolSet 投影 |
-| SkillCatalogView | SkillCatalog 投影 |
-| LoadedSkill → PromptContribution | SkillInjector；由 TurnExecutionContext 保证 pinned identity |
+| SkillPromptView | SkillView 投影 |
+| LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext保证view来源和读取授权 |
 | PromptContribution → committed MessageRecord | PromptSet 输入规范化 |
 | conversation | Session conversation owner |
 | CanonicalUserMessage / final context assembly | PromptSet |
@@ -739,36 +677,36 @@ PromptService 保存 source/load/scope diagnostics；PromptSet 保存本 Turn �
 ## 基础不变量
 
 - 一个 MiniCoreRuntime 初始化一个 PromptService；
-- AgentDefinition 和 SessionDefinition 只保存自己 scope 的 Prompt 配置；
-- Prompt capture 使用 exact AgentRevisionRef 和 SessionDefinitionRevision，不读取 Agent current；
+- PromptService拥有共享PromptResourceView；AgentDefinition和SessionDefinition只保存PromptId selection；
+- 同一个PromptDefinition可以被多个Session选择，但每个Turn独立构造PromptSet；
+- Prompt capture使用exact AgentRevisionRef、SessionDefinitionRevision和当时的current PromptResourceView，不读取Agent current；
 - Turn 领域对象不持有完整 PromptSet；
 - TurnExecutionContext 在本 Turn 内复用同一个不可变 PromptSet；
-- PromptSet 在创建时固定 ToolPromptView、渲染后的 SkillCatalogView metadata 和 SkillCatalogFingerprint；
+- PromptSet在创建时固定PromptResourceView、ToolPromptView、渲染后的SkillPromptView metadata和相应fingerprint；
 - PromptService 不主动调用 ToolService、SkillService 或 ModelGateway；
 - PromptSet 不执行 Tool、不加载 Skill、不读写 conversation storage；
-- Runtime required policy 不可被 Agent 或 Session 覆盖；
-- Workspace Prompt 属于 Session scope；
+- Runtime required policy不进入selection，不可被Agent或Session关闭；
+- Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；
 - Workspace file readable 不等于可作为 Prompt source；
 - PromptService 只能从 WorkspacePromptContext 授权的 source roots 加载 project Prompt；
-- Workspace project PromptDefinition 必须保留 typed provenance/source stamp，cache 和 fingerprint 不能只按 path 或 PromptId 复用；
-- PromptScope 与 PromptRole 分开；
+- Workspace project instruction必须保留typed WorkspaceSourceRef/source stamp，cache和fingerprint不能只按path复用；
+- Prompt baseline使用固定信任层顺序；层内使用stable identity全序，不存在caller-controlled priority；
+- 同一固定层内重复PromptKey fail closed；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
 - assembly只接受来自CommittedConversationState的trusted full/prefix view和closed typed call policy，不接受任意Tool view或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和 fingerprint；
-- reload 不原地修改 active PromptSet。
+- Prompt reload先构建candidate view，成功后原子替换current view；不原地修改active PromptSet。
 
 ## 后续问题
 
-1. PromptDefinition priority 和同 scope 冲突规则。
-2. PromptContent 是内联正文还是 immutable content reference。
-3. 多个 authorized Workspace Prompt roots 的 discovery precedence 和同 scope 冲突规则。
-4. PromptSourceAdapter 的 BuiltIn/User/Agent/Session/Workspace 实现。
-5. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
-6. SkillIntent、UserMessageCompositionInput 与 committed contribution stamp 的精确字段。
-7. ToolPromptView 是否包含 guidelines，以及 ToolSpec 如何进入最终 Prompt。
-8. PromptSet fingerprint 的序列化和 Turn recovery 规则。
-9. Prompt content cache 的 key、eviction 和失效策略。
-10. Prompt hook 和动态 Context provider 是否能在不建立未提交模型可见旁路的前提下接入。
-11. Provider cache效果和canonical instruction boundary验证。
-12. PromptError 与 Turn terminal/compaction 的映射。
+1. PromptContent 是内联正文还是 immutable content reference。
+2. PromptResourceView的内部publication和cache eviction实现。
+3. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
+4. SkillIntent、UserMessageCompositionInput 与 committed contribution stamp 的精确字段。
+5. ToolPromptView 是否包含 guidelines，以及 ToolSpec 如何进入最终 Prompt。
+6. PromptSet fingerprint 的序列化和 Turn recovery 规则。
+7. Prompt content cache 的 key、eviction 和失效策略。
+8. Prompt hook 和动态 Context provider 是否能在不建立未提交模型可见旁路的前提下接入。
+9. Provider cache效果和canonical instruction boundary验证。
+10. PromptError 与 Turn terminal/compaction 的映射。

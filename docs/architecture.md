@@ -48,7 +48,7 @@ Item            1 ── N Interaction
 - 一个 Agent 可被多个 Session 引用，一个 Session 只对应一个 Agent；
 - Workspace 属于 Session（`SessionDefinition.workspace`），不属于 Agent 或 Turn，也不是独立 entity 或 Runtime-global registry；
 - Prompt、Tool、Skill 是独立概念，不合并成通用 `Resource`；
-- Turn 领域对象不持有 PromptSet、ToolSet、SkillCatalog、Agent identity 或 Workspace；这些执行期对象由 Turn 执行上下文 pin，exact references 保存在 TurnContext storage entry；
+- Turn领域对象不持有PromptSet、ToolSet、SkillView、Agent identity或Workspace；这些执行期对象由Turn执行上下文capture，fingerprints和必要references保存在TurnContext storage entry；
 - durable lifecycle 与 loaded execution state 分离：内存 projection、cache、snapshot 只能由权威事实派生。
 
 ### 三个长生命周期深模块
@@ -66,10 +66,11 @@ pub struct MiniCoreRuntime {
 Turn 执行边界产生独立、不可变的有效执行对象：
 
 ```text
-PromptService::for_turn(...) → PromptSet
-ToolService::for_turn(...)   → ToolSet
-SkillService::catalog(...)   → SkillCatalog
-SkillService::load(...)      → Arc<LoadedSkill>
+PromptService::current_view() → Arc<PromptResourceView>
+PromptService::for_turn(...)   → PromptSet
+ToolService::for_turn(...)     → ToolSet
+SkillService::current_view(...) → Arc<SkillView>
+SkillService::load(...)        → Arc<LoadedSkill>
 ```
 
 Prompt 是唯一负责模型实际可见上下文组装的 seam：
@@ -83,7 +84,7 @@ PromptSet::compose_user_message(...) → CanonicalUserMessage
 ### 核心实体
 
 - **Agent**：可被多个 Session 引用的 durable entity。head 保存 identity、current definition pointer、status 和 metadata；execution definition 使用 immutable `AgentDefinition`，identity 为 `(AgentId, AgentRevision)`，发布后不可原地修改。`AgentRevision` 只在 execution definition canonical content 改变时产生。
-- **Session**：长期存在的对话对象。head 保存 identity、current `SessionDefinitionRevision`、durable lifecycle 和 metadata。`SessionDefinition` 原子绑定 `AgentRevisionRef`、Workspace、`SessionModelConfig` 和 `SessionPrompts`。Session 创建时 pin Agent 当时的 current revision；Agent 后续发布新 revision 不自动改变已有 Session，必须通过新 `SessionDefinitionRevision` 显式升级，且一个 Session 的全部 revision 只能引用同一个 AgentId。
+- **Session**：长期存在的对话对象。head保存identity、current `SessionDefinitionRevision`、durable lifecycle和metadata。`SessionDefinition`原子绑定`AgentRevisionRef`、Workspace、`SessionModelConfig`和`SessionPromptSelection`。Session 创建时 pin Agent 当时的 current revision；Agent 后续发布新 revision 不自动改变已有 Session，必须通过新 `SessionDefinitionRevision` 显式升级，且一个 Session 的全部 revision 只能引用同一个 AgentId。
 - **Turn**：从 committed initiating UserMessage entry 到 terminal entry（final AssistantMessage / TurnInterrupted / TurnFailed）的用户意图执行过程。Turn head 不内联 `Vec<Item>`；Item 顺序由 SessionStorage projection 提供。active/recovered Turn 通过 initiating UserMessage 引用的 TurnContext entry 解析 exact execution metadata。
 - **Item**：Turn 内稳定、可观察的语义值或长生命周期操作。`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；`ItemType`/`ItemStatus` 从 content 派生，不独立存储。ToolCall 与 ToolResult 属于同一个 `ToolInvocation` Item（`Started → Completed | Abandoned`）。streaming delta、progress、provider retry、execution phase 不是 Item。
 - **Interaction**：某个 Item 执行期间由 Runtime 发起并等待外部回答的 durable request/resolution（`ToolApproval | UserQuestion`）。归属固定为 `Interaction → Item → Turn → Session → Agent`；遵守 request-before-notify 与 resolution-before-resume/side-effect。结构化 Interaction response 不是 UserMessage，不开启新 Turn。
@@ -109,8 +110,8 @@ pub(crate) struct TurnExecutionContext {
     model: TurnModelSnapshot,
     workspace: Arc<WorkspaceSnapshot>,
     skill_service: Arc<SkillService>,
-    skill_context: SkillCatalogContext,
-    skill_catalog: Arc<SkillCatalog>,
+    skill_context: SkillViewContext,
+    skill_view: Arc<SkillView>,
     tool_set: ToolSet,
     prompt_set: PromptSet,
     fingerprint: ExecutionContextFingerprint,
@@ -134,7 +135,7 @@ MiniCore 的 message pipeline 使用固定动词表达每个阶段，调用链�
 CommandSurface.parse_message_intent
   → SessionExecutor.Submit
   → capture exact SessionDefinition / AgentRevision / WorkspaceSnapshot
-  → SkillService.catalog + ToolService.for_turn
+  → PromptService.current_view + SkillService.current_view + ToolService.for_turn
   → PromptService.for_turn
   → TurnExecutionContext.compose_message
   → SessionWriter.append(TurnContext) → apply
@@ -154,21 +155,22 @@ Tool-call response
   → SessionWriter.append(ToolRoundCompleted) → apply
   → CommittedConversationDelta → SessionExecutor applies committed conversation
 
-Steer after current operation
+Steer after complete assistant/tool step
+  → VecDeque<QueuedMessage>.pop_front()
   → TurnExecutionContext.compose_message
   → SessionWriter.append(UserMessage(source = Steer)) → apply
-  → AgentLoop.accept_committed_steer
+  → AgentLoop.accept_committed_steer or rebuild segment
 ```
 
-`SessionStorage` 是 durable truth；`CommittedConversationState` 在 session open/recovery 时从 storage 建立，稳态只应用成功 append receipt 返回的 trusted delta。private AgentLoop 从该热视图构造 immutable conversation state，不要求每个 Turn 重新扫描 session 文件。未 append 的 draft 不能进入模型调用；durable 但尚无 `tool_round_completed` 的 assistant/tool entry 也不能进入模型 conversation。final AssistantMessage entry append/apply 后才发布 completed terminal。
+`SessionStorage`是durable truth；`CommittedConversationState`在session open/recovery时从storage建立，稳态只应用成功append receipt返回的trusted delta。private AgentLoop从该热视图构造immutable conversation state，不要求每个Turn重新扫描session文件。未append的draft不能进入模型调用；含ToolCall的assistant和tool entry在没有`tool_round_completed`前不能进入模型conversation。无ToolCall Assistant Continue在append/apply时model-visible但不terminalize Turn；final AssistantMessage append/apply后才发布completed terminal。
 
 ## 模块文档地图
 
 - [Runtime 公开协议](modules/runtime-interface.md)：`MiniCoreRuntime` 的 `dispatch / query / snapshot / subscribe`、公开领域 identity、scoped cursor/snapshot 和协议边界。
 - [Agent 与 Session 生命周期](modules/agent-session-lifecycle.md)：Agent/Session revision、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 分离。
 - [Workspace](modules/workspace.md)：Session-owned Workspace definition、roots/cwd、trust、authorization、filesystem capability 与窄只读 view。
-- [Prompt](modules/prompt.md)：PromptService、Turn-pinned PromptSet、CanonicalUserMessage、`assemble → AssembledModelContext`。
-- [Skills](modules/skills.md)：SkillService、SkillCatalog 与 LoadedSkill、发现/解析/校验、按需加载。
+- [Prompt](modules/prompt.md)：共享PromptResourceView、各Turn独立PromptSet、CanonicalUserMessage、`assemble → AssembledModelContext`。
+- [Skills](modules/skills.md)：SkillService、reloadable SkillView与LoadedSkill、发现/解析/按需加载。
 - [Tools](modules/tools.md)：ToolService `for_turn → ToolSet`、registry、policy、approval、grants、sandbox、executor。
 - [Turn 执行上下文](modules/turn-execution-context.md)：capture 依赖图、fingerprint、reload 线性化、AgentLoop 分界。
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：Turn 边界、ItemContent、ToolInvocation identity、Interaction、terminal cleanup。
@@ -183,8 +185,8 @@ Steer after current operation
 
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
-- 同一份领域事实只有一个权威 owner：conversation durable truth 属于 SessionStorage；Agent definition 属于 Agent owner；Workspace definition 属于 Session；Prompt/Tool/Skill 定义与 Set 属于各自子系统；最终模型可见上下文属于 PromptSet；provider-specific encoding 和调用属于 ModelGateway。
-- 每个 loaded Session 由一个 `SessionExecutor` 拥有执行期 mutable state、SessionWriter、committed projections、CurrentTurnExecution 和 bounded request queue；一个 Runtime 允许多个 SessionExecutor 同时 Running。所有 ledger mutation 通过 `SessionWriter::append(SessionEntryDraft)` 逐 entry 写入并立即应用 trusted delta。
+- 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和bounded request queue；一个Runtime允许多个SessionExecutor同时Running。Steer/FollowUp各使用普通`VecDeque<QueuedMessage>`。所有ledger mutation通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement、资源锁和真实副作用由 `ToolService` 统一治理；新 Turn 通过 `ToolService::for_turn(...) -> ToolSet` 原子绑定模型可见 `ToolPromptView` 与 executor snapshot。MVP 不启用通用 `bash`；子进程限制无法强制时必须 fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、strict cut、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版只用 active Turn exact model 生成 rolling summary，hard-protect initiating UserMessage 和连续 suffix。
@@ -202,3 +204,5 @@ Steer after current operation
 - [ADR 0106：ModelGateway 是单一深异步 operation](adr/0106-model-gateway-is-single-deep-operation.md)
 - [ADR 0107：Compaction 使用严格 stable suffix](adr/0107-compaction-uses-strict-stable-suffix.md)
 - [ADR 0108：Runtime 公开协议](adr/0108-runtime-public-protocol.md)
+- [ADR 0109：Prompt、Projection 与 Session Operation 使用确定性规则](adr/0109-review-b-determinism-and-serialized-operations.md)
+- [ADR 0110：Prompt 与 Skill 使用共享、可替换 View](adr/0110-prompt-and-skill-use-shared-reloadable-views.md)

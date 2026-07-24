@@ -45,9 +45,10 @@
 - `SessionExecutor`是该Session执行期mutable state的唯一owner；
 - 外部调用方只持有可克隆的`SessionExecutionHandle`，不能直接借用Executor状态；
 - 外部请求通过bounded FIFO `SessionRequestQueue`进入Executor；
-- Context构造、UserMessage composition、Model调用和Tool执行使用异步`RunningOperation`，Executor不等待完整操作后才处理请求；
+- Context构造、UserMessage composition、Model调用和Tool执行使用异步`RunningOperation`；Executor继续处理请求，但同一Session不并行启动第二个logical operation；
 - 每个异步结果携带`SessionId + TurnId + execution_version + OperationType`；
-- Steer、Cancel、security revocation或Turn terminal后，旧execution version的Context/Model结果不能修改当前状态；
+- logical retry只能在旧operation terminal并从`current_operation`移除后启动；不允许detached本地future继续向Executor返回结果；
+- Steer使用普通FIFO并等待当前assistant/tool step完整结束，不取消Sampling，也不丢弃已完成step；
 - Tool副作用已经开始时，迟到结果仍必须确认并保存，不能因为version变化而丢弃；
 - Session execution驱动private AgentLoop；AgentLoop不拥有storage、Prompt assembly、Tool execution或Turn状态；
 - SessionWriter append由Executor发起，receipt必须立即应用到全部required projections；
@@ -63,7 +64,7 @@
 
 ### pi
 
-pi使用AgentSession包装一个内部AgentLoop：模型调用、Tool执行、Steer queue和FollowUp queue都由该loop推进。其内外两层循环简单有效：内层处理model → tools → model并读取Steer；外层在Agent原本结束时读取FollowUp。
+pi使用AgentSession包装一个内部AgentLoop：两个薄`PendingMessageQueue`分别保存Steer和FollowUp；默认`one-at-a-time`，在完整assistant+tools turn后取一条Steer，在Agent原本停止时取一条FollowUp。其内外两层循环简单有效。
 
 MiniCore采用Steer/FollowUp分离和内外两层逻辑，但不采用以下部分：
 
@@ -73,10 +74,11 @@ MiniCore采用Steer/FollowUp分离和内外两层逻辑，但不采用以下部�
 - 没有统一Tool副作用前置记录；
 - 没有explicit ToolRoundCompleted conversation规则；
 - Abort后没有durable Turn cleanup。
+- `all/one-at-a-time`可配置消费模式；MiniCore固定标准FIFO每轮一条，直接使用VecDeque。
 
 ### Codex
 
-Codex使用长期Session/Thread状态和active Turn task，支持expected TurnId Steer、Interrupt、approval以及TurnContext/StepContext。
+Codex使用长期Session/Thread状态和active Turn task；active Regular task期间的新输入进入薄`TurnInputQueue/pending_input`，每轮排出并在Tool output后加入ContextManager。它没有pi式独立core FollowUp mode；没有active Turn时输入自然开启新Turn。
 
 MiniCore采用单Session owner、active Turn identity和异步操作分离，但active Turn不重新读取future Prompt、Tool、Skill、Workspace或Model state。
 
@@ -128,12 +130,17 @@ pub(crate) struct SessionExecutor {
     projections: SessionProjections,
     candidate_turn: Option<CandidateTurnExecution>,
     current_turn: Option<CurrentTurnExecution>,
-    running_operations: RunningOperationSet,
+    current_operation: Option<RunningOperation>,
     interaction_deadlines: InteractionDeadlineSet,
-    pending_steers: VecDeque<PendingSteer>,
-    follow_ups: VecDeque<PendingFollowUp>,
+    steer_queue: VecDeque<QueuedMessage>,
+    follow_up_queue: VecDeque<QueuedMessage>,
     pending_responses: PendingRequestResponses,
     progress_events: ProgressEventPublisher,
+}
+
+pub(crate) struct QueuedMessage {
+    command_id: CommandId,
+    intent: PromptIntent,
 }
 
 #[derive(Clone)]
@@ -165,13 +172,19 @@ pub(crate) enum SessionRequest {
         response: oneshot::Sender<Result<SubmitResult, SessionExecutionError>>,
     },
     Steer {
+        command_id: CommandId,
         expected_turn_id: TurnId,
         intent: PromptIntent,
         response: oneshot::Sender<Result<SteerResult, SessionExecutionError>>,
     },
     FollowUp {
+        command_id: CommandId,
         intent: PromptIntent,
         response: oneshot::Sender<Result<FollowUpResult, SessionExecutionError>>,
+    },
+    CancelQueuedMessage {
+        target_command_id: CommandId,
+        response: oneshot::Sender<Result<CancelQueuedMessageResult, SessionExecutionError>>,
     },
     ResolveInteraction {
         expected_turn_id: TurnId,
@@ -211,18 +224,19 @@ Queue规则：
 - queue满时发送方等待或得到`RequestQueueFull`，不能丢弃已有请求；
 - `GetSnapshot`仍经过同一queue，因此snapshot与mutation具有明确处理顺序；
 - `ResolveInteraction`和`Cancel`不能被progress event阻塞；
-- public protocol是否立即返回queued acknowledgement留到protocol阶段；
+- Steer/FollowUp成功`push_back`后立即返回queued acknowledgement；
 - crate-private `Submit` response只在initiating UserMessage append/apply成功后返回`Started { turn_id }`；
 - capture或append失败返回Rejected，不产生领域Turn；
-- `FollowUp`在进入FollowUp queue后返回Queued；
-- `Steer`返回Applied或Queued，取决于当前执行阶段。
+- `FollowUp`在进入follow-up FIFO后返回Queued；
+- `Steer`在验证expected TurnId并进入steer FIFO后返回Queued。
+- `CancelQueuedMessage`按CommandId从两个FIFO中remove；找到即Cancelled，找不到统一返回NotQueued，不区分从未排队与已经出队，不重新入队。
 
 长流程的response不会让request handler等待：
 
 - Submit response保存在candidate Turn中，UserMessage append/apply后完成；
 - Cancel response保存到terminal处理完成；
 - PrepareForUnload response保存到Executor进入Idle；
-- queued Steer/FollowUp返回process-local completion handle，用于报告Applied、Started或Rejected。
+- queued Steer/FollowUp不保存长期completion handle；真正append的UserMessage和新Turn start由普通StateEvent报告。
 
 ## Tool Execution Control
 
@@ -342,7 +356,6 @@ pub(crate) struct CurrentTurnExecution {
 
 `execution_version`从1开始，在以下情况递增：
 
-- Sampling阶段应用Steer并废弃旧Model request；
 - Compaction成功append/apply并Replace conversation；
 - Cancel；
 - security revocation；
@@ -352,7 +365,17 @@ pub(crate) struct CurrentTurnExecution {
 
 ## Running Operation
 
-`RunningOperationSet`是`FuturesUnordered<RunningOperation>`或等价private实现。SessionExecutor使用它保存异步操作。每个execution version最多有一个current operation；已经取消的旧version operation可以继续存在，直到返回结果或确认取消。
+SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionRequestQueue；“请求处理响应”不等于“并行启动第二个logical operation”。
+
+新operation只能在旧operation满足以下任一条件后启动：
+
+```text
+terminal OperationResult已处理并移除
+或
+对无外部副作用的future执行安全drop，且旧结果通道已关闭
+```
+
+Model、Context、composition和未开始副作用的Tool可以在Cancel后安全drop。Tool越过`ToolExecutionStarted`后必须保留为current operation直到exact outcome或明确Abandoned settlement；期间不启动下一次Model/Tool operation。
 
 ```rust
 pub(crate) enum RunningOperation {
@@ -405,8 +428,8 @@ pub(crate) struct OperationResult {
 
 - SessionId不匹配：实现错误，记录diagnostic；
 - TurnId不匹配：忽略结果并记录diagnostic；
-- execution version过期的Context/Model/Compaction结果：忽略；
-- execution version过期的UserMessage composition结果：忽略；
+- 非current operation产生结果：实现错误；正常实现不存在可迟到的detached Context/Model/Compaction/composition result；
+- execution version仍用于验证result基于的Turn control/conversation generation；
 - Tool尚未越过`ToolExecutionStarted`记录时，过期结果可以取消/忽略；
 - Tool已经越过该记录时，必须确认outcome：exact result保存为Tool message，无法确认则ToolAbandoned；
 - terminal Turn不能接受新的Model result、ToolCall或Interaction；
@@ -423,7 +446,8 @@ loop {
             handle_session_request(request).await?;
         }
 
-        result = running_operations.next() => {
+        result = poll_current_operation(&mut current_operation), if current_operation.is_some() => {
+            current_operation = None;
             handle_operation_result(result).await?;
         }
 
@@ -436,7 +460,7 @@ loop {
 
 实现要求：
 
-- 不能在循环中等待完整Model request、完整Tool execution或用户approval；
+- 不能在request handler中内联等待完整Model request、完整Tool execution或用户approval；主循环通过`select!`同时poll唯一current operation和控制请求；
 - request handler只能更新state、保存response sender或启动operation，然后返回主循环；
 - 可以等待一次短SessionWriter append取得确定结果；
 - 如果文件adapter使用blocking syscall，SessionWriter implementation可以在内部offload I/O，但不能产生第二个Session semantic owner；
@@ -480,6 +504,8 @@ impl AgentLoop {
     ) -> Result<(), AgentLoopError>;
 }
 ```
+
+`Finished`只表示candidate final。Steer FIFO为空时SessionExecutor保存Assistant(Final)；FIFO非空时保存Assistant(Intermediate Continue)、pop一条Steer并从committed ConversationSeed重建AgentLoop segment。
 
 AgentLoop可以使用Rig或其他SDK作为private adapter，但不得：
 
@@ -581,7 +607,11 @@ async fn drive_agent_loop(&mut self) -> Result<(), SessionExecutionError> {
     loop {
         match self.current_turn_mut()?.agent_loop.next_action()? {
             AgentLoopAction::NeedModel { .. } => {
-                self.start_model_operation().await?;
+                if let Some(message) = self.steer_queue.pop_front() {
+                    self.start_steer_composition(message).await?;
+                } else {
+                    self.start_model_operation().await?;
+                }
                 return Ok(());
             }
             AgentLoopAction::NeedTools { response, calls } => {
@@ -589,7 +619,7 @@ async fn drive_agent_loop(&mut self) -> Result<(), SessionExecutionError> {
                 return Ok(());
             }
             AgentLoopAction::Finished { response } => {
-                self.finish_completed_turn(response).await?;
+                self.handle_candidate_final(response).await?;
                 return Ok(());
             }
         }
@@ -613,7 +643,7 @@ AgentLoop NeedModel
    → CompactConversation调用PromptSet和ModelGateway(CompactionSummary request)
 → Executor继续处理SessionRequestQueue
 → OperationResult返回并校验SessionId/TurnId/execution_version/OperationType
-   ├─ Model：AgentLoop.accept_model_response → drive_agent_loop
+   ├─ Model：AgentLoop.accept_model_response → NeedTools或candidate Finished
    └─ Compaction：revalidate → append/apply Replace → rebuild AgentLoop → reassemble
 ```
 
@@ -628,15 +658,15 @@ AgentLoop NeedModel
 - streaming delta通过ProgressEventPublisher发布，不写SessionStorage；
 - partial response不是AgentMessage Item；
 - Model result只有在AgentLoop返回NeedTools或Finished后才决定对应entry类型；
-- NeedTools保存Assistant(Intermediate)；Finished在Steer/Cancel处理后保存Assistant(Final)。
+- NeedTools保存含ToolCall的Assistant(Intermediate)并完成整个ToolRound；不因queued Steer丢弃已完成model step；
+- Finished只是candidate final。steer queue为空时保存Assistant(Final)；queue非空时保存不含ToolCall的Assistant(Intermediate/Continue)，随后消费一条Steer并继续同一Turn。
 
 ## Tool流程
 
 ```text
 AgentLoop NeedTools { finalized response, calls }
-→ 处理已进入SessionRequestQueue的Cancel/Steer/WorkspaceAuthorizationRevoked
+→ 处理已进入SessionRequestQueue的Cancel/WorkspaceAuthorizationRevoked
 → 重新检查Workspace authorization lease
-→ Steer获胜：丢弃尚未持久化的model output，进入Steer composition
 → Cancel/revocation获胜：不保存Assistant(Intermediate)，进入Interrupted处理
 → Turn仍Running：取得WorkspaceCommitAuthorization
 → append/apply Assistant(Intermediate)
@@ -669,8 +699,9 @@ ToolExecutionOutcome[]
 → release WorkspaceCommitAuthorization
 → conversation projection加入assistant/tool sequence
 → AgentLoop.accept_committed_tool_round
-→ 先处理pending Steer
-→ drive_agent_loop
+→ steer_queue.pop_front()
+   ├─ Some：compose并append/apply一条Steer → 下一次Model
+   └─ None：drive_agent_loop
 ```
 
 规则：
@@ -735,69 +766,42 @@ now >= expires_at
 
 ## Steer流程
 
-Steer属于current Turn，必须携带`expected_turn_id`。
-
-### PreparingModel
-
-如果尚未启动Model操作：
+Steer属于current Turn，必须携带`expected_turn_id`。所有Running phase使用同一个普通FIFO；Steer不取消Sampling、Compaction、approval或Tool execution。
 
 ```text
-启动ComposeUserMessage(source=Steer)
-→ composition result identity/version validation
-→ 取得WorkspaceCommitAuthorization
-→ append/apply UserMessage(source=Steer)
-→ release WorkspaceCommitAuthorization
-→ AgentLoop.accept_committed_steer
-→ 使用更新conversation启动Model
-→ SteerResult::Applied
-```
-
-### Sampling
-
-```text
-execution_version += 1
-→ best-effort cancel当前Model操作
-→ 启动ComposeUserMessage(source=Steer)
-→ composition result identity/version validation
-→ 取得WorkspaceCommitAuthorization
-→ append/apply UserMessage(source=Steer)
-→ release WorkspaceCommitAuthorization
-→ AgentLoop.accept_committed_steer
-→ 旧version Model result不再使用
-→ 启动新的Model操作
-→ SteerResult::Applied
-```
-
-### Compacting
-
-Compaction期间Steer进入pending Steer FIFO，不立即append，也不改变Compaction source。Compaction append/apply成功或soft fallback结束后，再按FIFO compose/append Steer并从新conversation开始AgentRun assembly。Cancel和Workspace revocation按control FIFO取消Compaction并推进execution version。
-
-### WaitingApproval或ExecutingTools
-
-```text
-验证expected TurnId
-→ 将PromptIntent放入bounded pending Steer FIFO
+Steer request
+→ 验证expected Running Turn
+→ steer_queue.push_back(QueuedMessage)
 → SteerResult::Queued
-→ 当前Tool round得到truthful结果
-→ tool_round_completed append/apply
-→ 按FIFO逐条启动ComposeUserMessage
-→ 每条composition result校验后取得WorkspaceCommitAuthorization并append/apply Steer
-→ AgentLoop.accept_committed_steer
-→ 下一次Model操作
 ```
+
+每次准备开始下一次AgentRun模型调用前，只消费一条：
+
+```text
+steer_queue.pop_front()
+→ ComposeUserMessage(source = Steer)
+→ append/apply UserMessage(source = Steer)
+→ AgentLoop.accept_committed_steer，或从updated ConversationSeed重建segment
+→ 下一次Model调用
+```
+
+安全点：
+
+- 含ToolCall的assistant step：必须先append assistant、全部truthful ToolResult和`tool_round_completed`，再pop一条Steer；
+- 无ToolCall的candidate final：queue非空时先把该response保存为model-visible non-terminal Assistant Continue step，再pop一条Steer；
+- Compaction：append/apply成功或soft fallback结束后再pop；
+- PreparingModel：没有current operation时可以立即pop，但仍走相同composition/append路径。
 
 规则：
 
-- queued Steer在append前不是durable fact；
-- `SteerResult::Queued`包含process-local completion handle；Steer最终Applied或Rejected时完成该handle；
-- queue满返回`SteerQueueFull`；
-- process crash会丢失尚未append的queued Steer；
-- MVP不使用Steer隐式取消approval；
-- MVP不因为Steer取消已经可能产生副作用的Tool；
+- `VecDeque<QueuedMessage>`只提供标准`push_back/pop_front/remove/clear`语义，不增加queue wrapper、批量模式或优先级；
+- 每轮模型请求最多消费一条Steer；剩余消息继续FIFO等待；
+- 仍在queue中的消息可以按CommandId直接remove；撤销后不重新入队；已经pop并append的Steer不能删除；
+- queued Steer在append前不是durable fact，process crash会丢失；
+- queue满返回`SteerQueueFull`，不删除旧请求；
 - Steer不创建新Turn，不capture新TurnExecutionContext；
-- Steer composition失败时返回Rejected；Sampling已被取消时使用原conversation重新启动Model；
-- final assistant尚未append时，已进入request queue的Steer先处理则继续Turn；
-- final assistant append后到达的Steer返回ExpectedTurnMismatch或TurnNotRunning。
+- composition失败只丢弃当前已pop消息并发布typed failure，不回到queue；
+- final Assistant append后到达的Steer返回ExpectedTurnMismatch或TurnNotRunning。
 
 ## FollowUp流程
 
@@ -805,13 +809,12 @@ FollowUp不是current Turn control。
 
 ```text
 FollowUp request
-→ 放入bounded process-local FIFO
-→ FollowUpResult::Queued { follow_up_id, completion }
-→ current Turn进入Finishing
-→ terminal entry append/apply
-→ release CurrentTurnExecution
-→ state = Idle
-→ 取出下一条FollowUp
+→ follow_up_queue.push_back(QueuedMessage)
+→ FollowUpResult::Queued
+→ 不改变current Turn state或执行路径
+
+current Turn通过自身正常流程terminal后
+→ follow_up_queue.pop_front()
 → 作为普通Submit进入Starting
 → capture新的TurnExecutionContext
 ```
@@ -819,12 +822,13 @@ FollowUp request
 规则：
 
 - FIFO保留accepted ordering；
-- PendingFollowUp保存process-local completion sender；下一Turn的UserMessage append/apply后返回Started，admission失败时返回Rejected；
 - queue满返回`FollowUpQueueFull`，不删除旧请求；
+- 每个terminal Turn后最多pop一条FollowUp；其余保持FIFO并等待后续Turn terminal；
+- 仍在queue中的FollowUp可以按CommandId直接remove；撤销后不重新入队；
 - FollowUp不持久化，restart后不恢复；
-- FollowUp不复用旧TurnId、Context、ToolSet、PromptSet、SkillCatalog或Workspace lease；
+- FollowUp不复用旧TurnId、Context、ToolSet、PromptSet、SkillView或Workspace lease；
 - previous Turn Completed、Interrupted或Failed后都可以重新admit FollowUp；
-- 如果Session变为Archived、Deleted、Unavailable或Agent Disabled，FollowUp admission失败并通过completion handle返回typed Rejected result；
+- 如果Session变为Archived、Deleted、Unavailable或Agent Disabled，已pop FollowUp admission失败并发布typed rejection；该消息不重新入队；
 - PrepareForUnload拒绝新的FollowUp并明确结束尚未执行的queued requests；
 - crash-safe FollowUp acknowledgement需要未来storage schema，当前不提供。
 
@@ -833,18 +837,23 @@ FollowUp request
 ```text
 AgentLoop Finished { finalized response }
 → 停止新的Model/Tool操作
-→ 处理已经进入request queue的Steer、Cancel和WorkspaceAuthorizationRevoked
+→ 处理已经进入request queue的Cancel和WorkspaceAuthorizationRevoked
 → 重新检查Workspace authorization lease
-→ Steer先处理：不append final，继续Running
 → Cancel/revocation先处理：进入Interrupted流程
-→ request queue无相关请求且lease有效：取得WorkspaceCommitAuthorization
-→ state = Finishing
-→ 验证无Pending Interaction、Started ToolInvocation或未完成Intermediate response
-→ append/apply Assistant(Final)
-→ release WorkspaceCommitAuthorization
-→ drop AgentLoop和TurnExecutionContext
-→ state = Idle
-→ 启动下一条FollowUp或保持Idle
+→ 按steer_queue分支
+   ├─ 非空：取得WorkspaceCommitAuthorization
+   │  → append/apply Assistant(Intermediate Continue)
+   │  → release WorkspaceCommitAuthorization
+   │  → pop_front一条Steer并append/apply UserMessage
+   │  → rebuild AgentLoop segment并继续Running
+   └─ 空且lease有效：取得WorkspaceCommitAuthorization
+      → state = Finishing
+      → 验证无Pending Interaction、Started ToolInvocation或未完成ToolCall Intermediate
+      → append/apply Assistant(Final)
+      → release WorkspaceCommitAuthorization
+      → drop AgentLoop和TurnExecutionContext
+      → state = Idle
+      → 启动下一条FollowUp或保持Idle
 ```
 
 Assistant(Final) append是Completed Turn唯一结束线性化点。
@@ -975,6 +984,7 @@ Tool自己的failed/denied result通常是truthful ToolResult，不自动使Turn
 
 ```text
 Model operation retryable failure
+→ current Model operation返回terminal error并从current_operation移除
 → 确认TurnId/execution_version未变
 → 确认ConversationCheckpoint未变
 → 确认TurnExecutionContext未变
@@ -983,6 +993,8 @@ Model operation retryable failure
 ```
 
 Retry delay使用timer，不阻塞SessionRequestQueue。
+
+logical retry不得通过timeout race留下仍可回传结果的旧本地future。若取消无副作用Model future，必须先安全drop并关闭旧结果路径；provider端可能继续生成或计费只属于delivery/telemetry风险，不允许形成第二个SessionExecutor result。
 
 Steer、Cancel、Compaction或任何model-visible conversation change都会使旧logical retry失效。`RequestOutcomeUnknown`和`StreamInterrupted`的logical retry可能重复provider work或billing；Session policy必须显式限制次数并保留diagnostic，不能宣称exactly-once。
 
@@ -1100,6 +1112,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 | 操作 | 线性化点 |
 | --- | --- |
 | Submit开始Turn | initiating UserMessage append |
+| Steer/FollowUp排队 | 对应VecDeque push_back |
 | Steer应用 | Steer UserMessage append |
 | Interaction request | InteractionRequested append |
 | Interaction resolution | InteractionResolved append |
@@ -1117,7 +1130,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 - operation result与request同时ready时，由Executor处理顺序决定；
 - ToolControl、Cancel和WorkspaceAuthorizationRevoked使用同一个FIFO；处理ToolExecutionStarted时，所有排在它之前的request已经完成；
 - Tool results全部保存后、append tool_round_completed前，处理当前已经进入queue的Cancel和WorkspaceAuthorizationRevoked；
-- 处理Finished action前，处理当前已经进入queue的Steer、Cancel和WorkspaceAuthorizationRevoked，并重新检查authorization lease；
+- 处理Finished candidate前先处理Executor已经接收的Cancel和WorkspaceAuthorizationRevoked，并重新检查authorization lease；若steer_queue已非空则保存Assistant Continue而不是Final；
 - 上述queue处理只读取当前已排队request，不等待未来request；
 - workspace-dependent conversation entry的append必须持有WorkspaceCommitAuthorization；它与WorkspaceAuthorizationControl.revoke的先后顺序决定append还是revocation获胜；
 - 不涉及Workspace authorization的其他append在queue检查完成后可以继续，并成为该race的线性化结果；
@@ -1228,7 +1241,7 @@ MVP性能要求：
 
 - 一个loaded Session一个Executor；
 - SessionRequestQueue、Steer queue和FollowUp queue都有容量限制；
-- 每个execution version最多一个current RunningOperation；旧version operation只等待取消或迟到result；
+- 每个Session最多一个current RunningOperation；旧operation terminal/remove或安全drop前不启动新operation；
 - ToolSet内部负责ToolCall并发；
 - SessionWriter复用open file handle和buffer；
 - 短entry append可以由Executorawait；blocking I/O由SessionWriter内部实现处理；
@@ -1259,9 +1272,10 @@ MVP性能要求：
 - Model运行期间处理Steer、Cancel、Snapshot；
 - provider retry复用相同ModelCallRequest且不改变model identity；
 - request delivery outcome unknown和first semantic delta后的stream failure不由Gateway blind retry；
-- execution version过期的Model result被忽略；
-- Finished action在Steer/Cancel/revocation处理和commit authorization后才append final；
-- NeedTools result处理前FIFO已有Steer时丢弃未持久化model output，不创建未闭合Tool round；
+- logical retry只在旧Model operation terminal/remove后启动；不存在两个可向Executor返回结果的同Session Model future；
+- Finished candidate在Steer FIFO为空且Cancel/revocation未获胜时才append final；
+- Finished candidate遇到queued Steer时保存为model-visible Assistant Continue，再消费一条Steer；
+- NeedTools result无论Steer queue是否非空都先完成assistant/tool/tool_round_completed序列；
 - streaming delta丢失不影响final entry；
 - transport fallback保持exact model identity；
 - cross-model substitution返回typed failure而不是静默继续；
@@ -1286,17 +1300,18 @@ MVP性能要求：
 
 ### Steer与FollowUp
 
-- PreparingModel Steer直接应用；
-- Sampling Steer推进version并取消旧Model；
-- old Model result被忽略；
-- Compacting/WaitingApproval/ExecutingTools Steer进入FIFO；
-- queued Steer在tool_round_completed后按序append；
+- 所有Running phase Steer都push_back同一个普通FIFO；
+- Sampling Steer不取消当前Model、不推进execution_version；
+- 每个完整assistant/tool step后最多pop_front一条Steer；
+- ToolCall step必须在tool_round_completed后再pop Steer；
+- 无ToolCall candidate final遇到Steer时保存为Assistant Continue；
+- queue内消息按CommandId remove后不重新入队；
 - Steer queue满返回错误；
-- final append与Steer first-processed-wins；
+- final append前必须确认Steer FIFO为空；
 - FollowUp在current Turn terminal后创建新Turn和新Context；
 - FollowUp FIFO和QueueFull；
 - restart不恢复FollowUp；
-- FollowUp后续admission失败通过completion handle返回Rejected；
+- FollowUp后续admission失败发布typed rejection且不重新入队；
 - PrepareForUnload明确结束queued requests；
 - PrepareForUnload等待期间仍能处理ResolveInteraction、Cancel、operation result和timeout。
 
