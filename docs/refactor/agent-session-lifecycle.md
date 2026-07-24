@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：目标架构已确定；公开protocol和实现待后续阶段完成
+状态：目标架构与公开protocol映射已确定；生产实现待后续完成
 日期：2026-07-16
 
 ## 目的
@@ -864,7 +864,7 @@ Session-scoped Tool grant
 
 fork使用staging + atomic publication。copy/remap完成后，若target projection仍有Running Turn，则先逐entry append InteractionResolved/ToolAbandoned和`TurnInterrupted(HistoricalFork)`；不得补synthetic ToolResult或`tool_round_completed`。full replay确认无Running/Pending/Started后，child publication才可在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
 
-Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path，并remap EntryId、TurnId、ItemId和RequestId，preserve ToolCallId与exact content/definition references。完整规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
+Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path，并remap EntryId、TurnId、ItemId和RequestId，preserve ToolCallId与exact content/definition references。完整storage规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
 ## Turn Admission Basis
 
@@ -1164,8 +1164,8 @@ Agent release channel
 5. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
 6. physical purge、retention 和 revision reachability GC。
 7. 多进程同时操作同一个 Agent/Session store 的并发实现。
-8. SessionExecutionHandle如何映射到阶段9公开Runtime protocol。
-9. public command/query/event/snapshot lifecycle payload。
+8. public protocol实现中的Agent/Session durable store schema和transaction adapter。
+9. auto-unload与per-session subscription residency policy的具体默认值。
 
 ## 设计进度
 
@@ -1185,4 +1185,4 @@ Agent release channel
 - [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
 - [x] 完成 Session ledger identity、entry parent tree、fork remap 和 append contract。
 - [x] 完成SessionExecutor owner和crate-private request interface。
-- [ ] 完成公开Runtime interface。
+- [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。

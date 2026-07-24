@@ -2,7 +2,7 @@
 
 日期：2026-07-16
 
-状态：目标架构已确定；实现、Rig adapter和公开Runtime protocol待后续阶段完成
+状态：目标架构已确定；实现和Rig adapter待后续阶段完成
 
 ## 目的
 
@@ -20,7 +20,7 @@
 
 - ModelGateway的provider映射、auth、fallback和stream wire格式；
 - Compaction的具体planning算法、summary格式和质量评估；本文只引用其执行契约；
-- Runtime公开command/query/event/snapshot协议；
+- Runtime公开command/query/event/snapshot协议；其映射以[Runtime Interface](runtime-interface.md)为权威；
 - Rig 0.40.0 adapter的最终具体类型；
 - 操作系统线程、Tokio task或local task的最终部署方式。
 
@@ -33,6 +33,7 @@
 - [ModelGateway架构设计](model-gateway.md)
 - [Compaction架构设计](compaction.md)
 - [Agent与Session生命周期架构设计](agent-session-lifecycle.md)
+- [Runtime Interface与公开协议架构设计](runtime-interface.md)
 
 ## 决策摘要
 
@@ -1089,7 +1090,7 @@ phase change notification
 - queue满时允许丢弃中间progress，但不能丢失durable final event；
 - final event从append/apply后的entry生成，包含完整final snapshot；
 - progress publisher失败不影响SessionStorage或Turn terminal；
-- Runtime event sequence和reconnect规则留到protocol阶段。
+- reliable状态变化进入per-session StateEvent并推进SessionCursor；ProgressEvent不占用cursor且可以合并/丢弃。完整reconnect规则见[Runtime Interface](runtime-interface.md)。
 
 ## Request与Operation处理顺序
 
@@ -1425,4 +1426,4 @@ unbounded request/progress queue
 - [x] 定义performance和测试矩阵。
 - [ ] 执行Rig 0.40.0 adapter spike。
 - [ ] 实现SessionExecutor和自动化测试。
-- [ ] 在阶段9冻结公开Runtime protocol。
+- [x] 在阶段9冻结公开Runtime protocol。

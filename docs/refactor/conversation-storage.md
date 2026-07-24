@@ -1,6 +1,6 @@
 # Conversation 与 SessionStorage 架构设计
 
-状态：目标架构已按by-entry JSONL和strict Compaction overlay修订；公开protocol和生产实现待后续阶段完成
+状态：目标架构、ForkAnchor和公开event映射已确定；生产实现待后续完成
 日期：2026-07-16
 
 ## 目的
@@ -1341,8 +1341,7 @@ content-addressed DAG
 2. Rig/AgentLoop adapter如何映射一个finalized assistant response及ordered content；
 3. Rig adapter如何提取各provider的finish reason、reasoning artifact和allowlisted response metadata；
 4. max entry size及未来blob reference阈值；
-5. public fork command的Before/After message anchor payload；
-6. cold exact resume是否值得在稳定executor implementation identity后扩展。
+5. cold exact resume是否值得在稳定executor implementation identity后扩展。
 
 ## 完成检查
 
@@ -1362,5 +1361,6 @@ content-addressed DAG
 - [x] 保持SessionStorage为唯一durable truth。
 - [x] 完成SessionExecutor和entry append sequencing。
 - [x] 完成ModelGateway normalization与persistence contract设计。
+- [x] 完成public ForkAnchor payload设计，见[Runtime Interface](runtime-interface.md)。
 - [ ] 完成ModelGateway与AgentLoop adapter实现。
 - [ ] 完成实现、fixture和property tests。

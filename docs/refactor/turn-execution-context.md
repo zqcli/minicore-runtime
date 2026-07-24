@@ -1,6 +1,6 @@
 # Turn 执行模块与执行上下文架构设计
 
-状态：目标架构已确定；Rig adapter、Compaction和公开protocol生产实现待后续阶段完成
+状态：目标架构与公开protocol映射已确定；Rig adapter、Compaction和生产实现待后续完成
 日期：2026-07-16
 
 ## 目的

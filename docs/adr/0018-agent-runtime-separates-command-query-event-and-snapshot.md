@@ -2,7 +2,9 @@
 
 ## 状态
 
-Accepted
+Superseded by [ADR 0028](0028-runtime-protocol-uses-scoped-state-cursors.md)。Command、Query、Event和Snapshot职责分离保留；generic CommandAck、runtime-global sequence和all-loaded RuntimeSnapshot水位被替代。
+
+> 以下Decision/Impact保留原始历史形状。涉及CommandAck、global sequence和RuntimeSnapshot水位的内容不再指导实现。
 
 ## 决策
 

@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：目标架构已按 by-entry storage 修订；Session execution 和公开 protocol integration 待后续阶段完成
+状态：目标架构与公开protocol映射已确定；Session execution生产integration待后续完成
 日期：2026-07-16
 
 ## 目的
@@ -638,7 +638,7 @@ append Deny resolution
 
 Interaction 不决定 Tool permission。ToolRequirements、WorkspaceAccessView、ToolPolicy、grant 和 Sandbox 仍属于 Tool 子系统。
 
-ToolService 只判断需要 approval；durable Interaction ownership 属于 Session execution。外部 TUI/RPC/Web host 通过 Runtime interface 接收 request 和提交 resolution，不能直接持有 Tool executor waiter。
+ToolService 只判断需要 approval；durable Interaction ownership 属于 Session execution。外部 TUI/RPC/Web host 通过[Runtime Interface](runtime-interface.md)的per-session StateEvent接收request，并通过`InteractionCommand::Resolve`提交resolution，不能直接持有Tool executor waiter。
 
 ## UserQuestion
 
@@ -836,7 +836,7 @@ SessionStorage 仍是唯一 durable truth；projection 和 event stream 都不�
 | ToolCall/ToolResult execution semantics | ToolService / ToolSet |
 | ToolInvocation domain projection | Session execution / storage projector |
 | Interaction request/resolution | Session execution + SessionStorage |
-| approval/question external delivery | future Runtime interface |
+| approval/question external delivery | Runtime Interface的per-session StateEvent与InteractionCommand |
 | pending waiter | loaded Session execution，transient |
 | streaming delta/progress | observer event pipeline |
 | model-visible conversation | committed conversation projector + PromptSet |

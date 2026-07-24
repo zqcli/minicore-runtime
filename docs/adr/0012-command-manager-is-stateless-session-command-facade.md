@@ -2,7 +2,9 @@
 
 ## 状态
 
-Accepted
+Partially superseded by [ADR 0028](0028-runtime-protocol-uses-scoped-state-cursors.md)。Stateless CommandManager、explicit SessionId和执行前resolve保留；SessionRuntime-held长期Command facade被Runtime per-call CommandContext替代。
+
+> 以下正文保留原始历史决定。`WorkspaceServices` ownership、SessionRuntime-held Command facade和AgentRuntimeProtocol命名不再指导目标实现。
 
 ## 背景
 
