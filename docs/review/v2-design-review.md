@@ -1,0 +1,201 @@
+# MiniCore V2 设计评审
+
+状态：设计评审记录
+日期：2026-07-24
+范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0108）
+方式：按设计切面并行只读评审（领域/协议、Session 执行/并发、存储/恢复、Prompt·Tool·Skill、ModelGateway·Compaction·Workspace、跨模块一致性），仅调研，未落盘修改设计文档。
+
+## 总体判断
+
+核心 seam 在原则层自洽且防御性强：单 SessionExecutor + 单 mutation 点、append/apply 线性化、exact model pin、PromptSet 唯一模型上下文组装、trusted projector 构造、lease-based revocation。`TurnExecutionContext` 字段 owner、`SessionExecutor`/`AgentLoop` 分界、四类 Workspace/Prompt/Tool/Skill view 契约在各文档表述一致——这是设计的强项。
+
+风险集中在两类：
+
+1. 多处「留待后续」的**共享类型 / 全序规则**实际会阻塞首版实现；
+2. 模块交界处的**归属与失败分类**。
+
+以下问题按「重大（编码前需定案）」与「非阻塞 / 可延后」分列。严重度经二次核对有调整：并发资源锁一项在复核 `tools.md` 执行链后从重大降为非阻塞（见 D 组说明）。
+
+---
+
+## 一、重大问题（影响实施，需在编码前定案）
+
+### A. 跨模块共享契约缺失（最优先）
+
+**A1 · `operation_key` 无全域命名空间语法 + payload normalization 未定义**
+幂等语义（同 key 同 payload 返回原 receipt、不同 payload 报 `OperationConflict`）、`OutcomeUnknown` reopen-by-key、recovery「由 TurnId/ItemId/RequestId + reason 派生稳定 key」、fork regenerate 全部把正确性押在 key 唯一性与 normalized fingerprint 上，但文档只给示例串 `turn:t1:user`，缺少覆盖所有 entry kind 的带命名空间前缀的无碰撞 key 语法，以及 normalized payload 的规范化函数定义。
+- 影响：两个不同 intent 撞 key → 静默别名（返回错误 receipt）或误报 conflict；normalization 不定 → 同一 logical retry fingerprint 不一致，退化为 conflict 或写第二条 log（= corruption）。幂等层无法正确实现。
+- 建议：先冻结 key grammar（kind 前缀 + 稳定业务坐标）与 normalization 白名单，作为 durable 契约而非 helper 惯例，供所有 append 调用点唯一引用。
+- 出处：`conversation-storage.md`，跨模块。
+
+**A2 · `ExecutionMode` 是跨模块使用却从未定义的共享类型**
+`ResolveTurnModelRequest.execution_mode`、`ToolTurnContext.execution_mode`、TurnExecutionContext capture metadata 均引用它并进入 fingerprint，但无枚举/语义；`ModelCallPurpose` 又明确「不是 foreground/background」，故 `ExecutionMode` 是独立概念。
+- 影响：model resolve 与 tool for_turn 两条 capture 关键路径的输入未定义，capture DAG 无法实现，不同实现者臆测取值域破坏 fingerprint 一致性。
+- 建议：定义封闭枚举与语义（如何影响 model resolution 与 tool 披露/授权），或从 context 中移除直到有真实需求。
+- 出处：`model-gateway.md`、`tools.md`、`turn-execution-context.md`。
+
+**A3 · Session `Create` 的 Agent 绑定语义矛盾**
+`runtime-interface.md` 为 `Create { agent: AgentRevisionRef, ... }`（caller 传 exact 修订）；`agent-session-lifecycle.md` 的 create 流程说「在同步内读取 Agent current AgentRevisionRef 来 pin」。若 caller 传 A1 而 current 已是 A2，pin 谁未定。
+- 影响：Session↔Agent 绑定第一因果点自相矛盾，直接决定「一个 Session 只引用一个 AgentId」「create pin current」两条基础不变量能否成立。
+- 建议：二选一并统一。坚持「pin current」则公开命令改为 `Create { agent_id: AgentId, expected_current_revision?: AgentRevisionRef }`；要支持按指定 revision 创建则改 lifecycle 为「校验传入 ref 属该 Agent 且 Enabled，直接 pin」，删除「读取 current」表述。
+- 出处：`runtime-interface.md` ↔ `agent-session-lifecycle.md`。
+
+### B. 确定性与恢复正确性（前置不变量）
+
+**B1 · Prompt scope 内 priority / 冲突排序未定**
+基础不变量要求「相同输入产生相同排序与稳定 `PromptFingerprint`」，但同 scope 多 definition 的全序、同 key 冲突解析留到「后续问题」。`PromptMergeMode::Append` 已引用「priority」，而 `PromptDefinition` 无该字段。
+- 影响：无 scope 内全序则 `PromptSet::assemble` 不确定、`PromptFingerprint` 不稳定，而后者是 cache/continuation、retry 一致性、recovery 比对的基础——Prompt 子系统能否进入实现的前置。
+- 建议：先冻结 scope 内 priority key 与同 key 冲突（diagnostic vs 拒绝）规则，至少给出一个可确定的 total order。
+- 出处：`prompt.md`，跨模块复核确认。
+
+**B2 · 缺「append 校验 ⊇ replay 校验」+「committed entry 必然可 project」不变量**
+`apply 失败不回滚已 append entry → 丢弃 hot projection → 从 durable current entry replay`，replay 用同一批 projector 重放同一条已落盘 entry。若 apply 失败是确定性的（projector 语义拒绝而非 OOM 等瞬时故障），replay 会再次失败 → 永久 replay-fail brick，而非承诺的「恢复」；append-time 校验若弱于 reload-time 校验，一条已 commit 的 entry 会在冷 open 时 fail closed，整个 Session 不可打开。
+- 影响：恢复路径能否成立的前提，却未写成不变量。
+- 建议：明确 (a) append 校验集合等价于/强于 reload 校验；(b) 对已通过校验的 committed entry，projector 只能瞬时失败、不得语义拒绝；据此把「apply 失败→replay」限定为瞬时故障重试。
+- 出处：`conversation-storage.md`。
+
+**B3 · `execution_version` 在 logical retry 不递增，四元组失去唯一性**
+校验四元组 `SessionId+TurnId+execution_version+OperationType` 在「被判失败的旧 attempt」与「retry attempt」间完全相同（retry 只递增 `retry_count`，不在校验元组内）。retry 最有价值的场景（`RequestOutcomeUnknown`/`StreamInterrupted`/客户端 timeout）恰是旧 future 可能仍 in-flight 时，会出现两个同元组 future，executor 无法区分，可能 accept stale/duplicate model response 或 double-drive AgentLoop。
+- 影响：并发正确性核心。当前隐含不变量「同一 version 至多一个 in-flight future 且新 op 严格晚于同 version 旧 op 返回」只在 retry 由已返回的 retryable failure 触发时成立，对 hang/unknown 场景不成立。
+- 建议：每次新 model attempt（含 logical retry）递增 `execution_version`，或给 `RunningOperation`/`OperationResult` 增加单调 `operation_instance_id`(attempt nonce) 并纳入校验；同时把上述不变量写成显式约束。
+- 出处：`session-execution.md`。
+
+### C. 安全 / fail-closed 缺口
+
+**C1 · scope override 单调性只是散文约束**
+`DefinitionOverrides.enabled/model_visible/user_visible` 是裸 `Option<bool>`，`PromptMergeMode` 只有 `Required`（强制 present）无对称的 `Forbidden`/sealed。解析为 Runtime→Agent→Session last-wins，resolver 无法区分「default disable（可被下层翻回）」与「required disable（锁定）」，Session override `enabled=true` 规范上可翻回 Runtime 的 disable。
+- 影响：scope resolution 与 PromptPolicy 核心路径，数据模型无法表达「禁止/密封」一侧——安全相关。
+- 建议：给 override 增加 sealed/lock 一等标记，或由 `PromptPolicy` 承载 per-scope allow/deny；resolver 遇下层解除密封项返回 typed diagnostic 并 fail-closed，使「禁止」与 `Required` 对称。
+- 出处：`prompt.md`。
+
+**C2 · role×scope 特权未约束**
+scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspace prompt 属 Session scope、来自「已授权但不可信」的项目文件，若以 `role=System`/`Developer` 注入即进入特权指令块——现实注入向量（文档示例是 Workspace→Developer，但无强制规则）。
+- 影响：`for_turn`/`assemble` 的 required-policy 校验需要该规则才能封住旁路。
+- 建议：定义 role claim 策略（`System` 保留 Runtime，`Developer` 上限到 Agent，Workspace/Session 仅 `Developer/User` 且受白名单），在 for_turn 解析与 assemble 最终校验双点 fail-closed。
+- 出处：`prompt.md`。
+
+**C3 · sandbox 无法强制某 capability class 时无预执行拒绝**
+文档覆盖「sandbox 执行失败不静默回退」，但未覆盖「adapter 在本平台根本无法约束 process/network（正是无 bash / 子进程限制不可强制场景）」。存在「spec 上有 sandbox、实际未受限执行」的缝隙。
+- 影响：fail-closed 安全基线，须先于 Sandbox adapter 实现确定。
+- 建议：明确「最终 `PermissionSet` 含当前 `ToolSandbox` 不能强制的 capability class → executor 前拒绝（PreExecution ToolResult）」，与「不静默回退无 Sandbox」并列为不变量。
+- 出处：`tools.md`。
+
+**C4 · skills pinned content-hash 再校验表述含糊**
+`SkillCatalogEntryRef` 携 `location + content_hash`；anti-drift 要求对按 `location` 实际读入的 bytes 重算 hash 与 pinned 值比对，但文档只说「校验 content hash」，未明确是校验 request 字段还是重算读入内容——「pinned entry 长 Turn/reload 不漂移」头号属性的落点。
+- 影响：漂移 / TOCTOU 的正确性完全压在这一步。
+- 建议：显式规定 read 后 recompute-and-compare，mismatch → `SkillLoadError`（NotFound/ContentParse），不得用新版本正文替代。
+- 出处：`skills.md`。
+
+### D. 并发控制面
+
+> 复核修正：原「canonical resource lock」重大项经复核 `tools.md` 执行链（`approval → ToolResourceLocks → record_execution_start → Sandbox → execute`）后**降为非阻塞**——资源锁在 approval 之后才获取，不会跨人工审批持有，此前担心的 priority inversion 不成立；残留问题见非阻塞组。本组只保留一条重大。
+
+**D1 · 控制面与数据面共享 bounded FIFO，无优先通道**
+`Cancel`/`ResolveInteraction`/`WorkspaceAuthorizationRevoked` 与 `Submit`/`Steer`/`GetSnapshot`/`ToolControl` 走同一队列；队列满时 Cancel 排队等待，其间 Turn 持续调用 model / 执行 tool / 计费。Revocation 的安全性已由 out-of-band lease（`authorize_commit` vs `revoke` 同一同步原语）保住，但 Revocation 的 terminalize/资源释放/`TurnInterrupted` 事件、以及 Cancel 的全部语义仍受队列排空速度支配，Cancel 无 out-of-band backstop。
+- 影响：控制面被数据面 backpressure 饿死，与文档「Cancel/ResolveInteraction 不被阻塞」的自述矛盾；队列类型选择应在实现前定。
+- 建议：为控制类消息设保留容量或独立高优先 control 通道（或有界队列 + 专用 reserved slot），并明确 fire-and-forget 消息（`WorkspaceAuthorizationRevoked`/`ToolControl`）在队列满时的行为（阻塞 vs 有界重试）。
+- 出处：`session-execution.md`。
+
+### E. 能力缺口 / 可能需重定范围
+
+**E1 · Compaction 对长 agentic Turn 是主路径失败，不是边缘**（重点）
+initiating UserMessage 之后全部 committed model-visible history 被 hard-protect，且 retained 必须是连续 suffix → active Turn 内所有 ToolRound 都不可摘要。大量 / 大体积 tool round（编码 agent 常态）使 protected suffix 单调增长 → `ProtectedSuffixTooLarge` → hard overflow → `TurnFailed`，且「同一 Turn 最多一次 overflow recovery」使其不可挽救；轮间 soft compaction 只能回收 pre-turn 历史，headroom 有限。
+- 影响：这是目标用例（长 agentic Turn）的主路径，而非文档定位的「单个超大 Turn 边缘情形」，决定 v1 是否必须支持 turn 内 tool-round 级压缩/分段。
+- 建议：评估 v1 提供「turn 内已完成 ToolRound 的有界压缩 / 尾部截断（带 provenance）」或最小 split-turn；若坚持不做，应在 ADR 0107 把该限制升级为「已知会在常见 agentic 负载下触发」，并给出产品降级策略（如提示用户开新 Turn 携带摘要）。
+- 出处：`compaction.md`、ADR 0107。
+
+**E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile**
+`CompactionSettings.summary_max_output_tokens` 是单一全局 `NonZeroU32`，直接进入 plan 与 directive；但 `ModelCallRequest::new` 校验 `max_output_tokens ≤ TurnModelSnapshot` effective limit。当 pinned model 上限更小时，每次 compaction 请求构造 `InvalidRequest` → 小 context 模型 compaction 永久失效，且误分类为 InvalidRequest/TurnFailed。
+- 影响：plan → request 是必经路径，文档无 clamp/校验规则，而 model-gateway 又禁止静默 clamp（clamp 会改变已 fingerprint 的 policy）。
+- 建议：plan 阶段基于 pinned `EffectiveModelLimits` 派生 summary 的 `max_output_tokens`（取全局设置与模型上限的 min，并纳入 `CompactionPlanFingerprint`）；模型上限过小无法留出 summary 输出预算时返回明确 compaction 域错误（如 `NoFeasibleCut`），而非 `InvalidRequest`。
+- 出处：`compaction.md` ↔ `model-gateway.md`。
+
+**E3 · `UserQuestion` Interaction 没有发起 seam**
+`InteractionRequest` 冻结为 `ToolApproval | UserQuestion`，公开协议也含 UserAnswer resolution，但 Tool↔SessionExecutor 唯一 crate-internal seam `ToolExecutionControl` 只有 `request_approval`/`record_execution_start`，`Tool::execute` 只有 `ToolUpdateSink` + 窄 context，无法发起 durable Interaction，也无内建 ask-user Tool。
+- 影响：领域与公开协议承诺 UserQuestion，但执行层无生产者，任何 ask-user 能力无法落地。
+- 建议：在 `ToolExecutionControl` 增加 `request_user_question(...)`（与 approval 同走 append-before-notify / resolution-before-resume），或明确 UserQuestion 不在首版、公开 resolution 首版只暴露 ToolApproval。
+- 出处：`turn-item-interaction.md` ↔ `tools.md` ↔ `session-execution.md`。
+
+### F. 实现顺序
+
+**F1 · 路线图低估 SessionExecutor(6) / ModelGateway(7) / Compaction(8) 的耦合**
+三者在「逻辑模型调用」强耦合：compaction planning 内联进 SessionExecutor 的 `NeedModel` 安全点；`ModelCallRequest::new` 用 `PromptAssemblyProof` 校验 `TurnModelFingerprint`/purpose，Prompt 与 ModelGateway 互持类型契约。按 6→7→8 串行独立交付会返工。真正的硬门是仍标 `[ ]` 的 Rig 0.40.0 spike。
+- 建议：把三者作为协同交付束；先落地 `DeterministicProviderAdapter`/`ScriptedProviderAdapter`，让 SessionExecutor + Compaction 在 fake adapter 上闭环，Rig spike 只 gate 真实 provider；把该依赖显式写入迁移记录。
+- 出处：`migration/v1-to-v2.md`（原 roadmap 阶段依赖）。
+
+---
+
+## 二、非阻塞 / 可延后问题
+
+### 类型 / 命名一致性（低成本）
+
+- `ProviderCapabilities`（`tools.md`）vs `ModelCapabilities`（capture DAG 传入 `model.capabilities()`）命名不一致 → 统一或说明窄投影关系。
+- `CurrentTurnExecution.model_attempt: ModelAttemptState` 与「不建立 ModelAttempt entity」措辞易误读 → 改名如 `CurrentModelCallState`。
+- `AgentLoop::accept_committed_tool_round(round: CommittedToolRound)` 引用了 `conversation-storage.md` 未定义的 `CommittedToolRound` → 补定义或改用现有 delta 类型。
+- `TurnExecutionPhase::Committing` 列出但驱动路径不明 → 补进入/退出点或说明为纯 observer projection。
+- `PromptMergeMode::Append` 引用「priority」但 `PromptDefinition` 无该字段（与 B1 相关，Q1 落地前从描述删去或补字段）。
+
+### 协议 / 事件语义标注（点明即可）
+
+- `CommandResponse` 无 cursor watermark → 附命令线性化点水位，避免只靠「subscribe-before-dispatch」纪律（本清单最值得做的非阻塞改进）。
+- cursor 跨 load-epoch / 重启连续性未定义 → 引入 `epoch`/`generation`，旧 epoch cursor 返回 typed re-snapshot；`SnapshotResponse` 携同一 epoch。**若不加 epoch，此条会升级为阻塞。**
+- Interaction `expires_at` 到期后由谁推进未定（auto-deny 系统 resolution vs Turn failed）→ 无人应答时 Running Turn 可能永停在 `WaitingApproval`；可能已在 `turn-item-interaction.md` 覆盖，需回链确认。
+- `CommandId` 与 `SubmissionId` 双 correlation id → 评估用 Submit 的 `CommandId` 统一。
+- reliable StateEvent 混载 durable-derived（turn/item）与 volatile（readiness/queue/phase）→ 标注 volatile StateEvent 可靠性仅限单个 runtime lifetime；`FollowUpQueued`/`SteerQueued` 无 crash-safe 承诺。
+- message/reasoning Item 只有 `item_completed` 无 `*_started`（ToolInvocation 有 started+completed）→ 明确 host 须能仅凭 ProgressEvent 构造 provisional Item view、`ItemId` 在 Item 开始即分配且稳定。
+- Turn/Item 公开排序键未定义（`ItemId` 无序、`EntryId` 不作 UI 输入）→ 明确 opaque sequence/cursor 作 UI order token，保证 Query 拉取与事件插入排序一致。
+- Runtime scope 与 Session scope 无跨流顺序保证 → 给 host 一句 reducer 指引（两 scope 皆可作为 Session 首次出现来源）。
+- 公开 history 读模型 vs 模型可见 conversation 是同一 storage 两投影（durable 但未 `tool_round_completed` 的 tool entry 对 UI 可见、对模型不可见）→ 点明为有意投影差异，避免误判一致性 bug。
+- Agent→Session 是 reference-grouping 而非 containment（删 Agent 不级联、history 仍可读）→ ADR 0100 一句话点明。
+- `QueryResponse.stamp` 与 `SessionSnapshot` 定位重叠 → 点明 Query ReadStamp 不保证跨调用原子一致，Snapshot 才是 reducer bootstrap 的原子读。
+
+### 存储 scale / 恢复兜底（correctness 不阻塞，scale 需规划）
+
+- 无持久 checkpoint/index：冷 open、`OutcomeUnknown` reopen、apply-mismatch reload 全 O(n) 全量 replay（含 O(n) 跨 entry 引用/ancestry 校验）；compaction 只 append overlay、物理文件永不收缩，replay 成本随会话寿命单调增长、compaction 后也不下降 → 补 rebuildable 已校验 projection snapshot + byte-offset/checkpoint index，并给物理 segmentation/vacuum 方案（与 fork anchor 引用旧 entry 相互制约，需尽早留位）。
+- 「同时只有一个 Running Turn」不在 corruption/replay 校验清单，只靠 executor 纪律 → 提升为 writer 追加校验 + replay fold 不变量（fail closed）。
+- 无 explicit repair 工具：中段坏行（delayed-alloc 掉电常见）即 brick 整个 Session 历史，只有 partial-tail 能自动截断 → 补受控 last-valid-prefix 修复 utility（需 exclusive lease）。
+- host restart 跨会话非幂等 Tool 重复副作用（Started-but-no-result → Abandoned → 下一 Turn 模型重新请求并再次执行）→ 点明代价，引入 tool 级副作用幂等 key 缓解。
+- fork = deep copy 无内容共享（已显式否决 DAG），大会话近 tip 反复 fork 成倍复制 → 记为已知取舍；fork 只复制 path 不复制 sibling branch 应显式声明以免被当缺陷。
+
+### 并发（承 D 组复核）
+
+- 多资源 Tool 无全序获取仍可跨 Session 反序死锁，但操作响应 Turn cancellation，故非永久 → 对单次 execute 的多个 canonical `ToolResourceKey` 采用稳定总序获取，避免依赖 cancellation 兜底。
+- 某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁 → 主流 Tool 无此形态，可延后。
+- `PrepareForUnload` graceful unload 不自动 Cancel，Interaction `expires_at` 可为 None、disconnect 不自动关闭 → host 消失且无 deadline 时 response 永不完成 → shutdown 作用域内对 Pending Interaction 施加 grace deadline 或强制 fail-closed cancel。
+- 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
+- Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
+- Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，共享同一 Agent 的多 Session 在 status 原语上跨 Session 串行 turn-start → 文档化二者全局加锁总序，记录同 Agent 多 Session turn-start 串行化吞吐影响。
+- queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义 → 明确仲裁顺序。
+- `assemble_model_context` 为同步 fn，大 context 组装/tokenize 在同步段内阻塞该 executor 控制面 → 随规模评估 offload，或标注为控制面 stall 风险点。
+- Cancel/revocation 路径产生的 Completed（有 truthful tool message 但无 `tool_round_completed`）永久 conversation-hidden，后续 FollowUp/Steer 模型不可见 → 属预期语义，文档显式点明以免实现者误加补偿逻辑。
+
+### ModelGateway / Workspace 弹性与取舍
+
+- gateway 有界 retry 与 executor logical retry 无全局预算，RateLimited/Timeout 下 backoff 复合 → 定义单 Turn 级总 attempt/时间上限并扣除 gateway 已消耗 backoff。
+- continuation 要求 new full input prefix 逐段等价于 cache 的 previous input + finalized response，但 finalized assistant（encrypted/signature reasoning、provider item id、空白规范化）经持久化重组后难逐字节还原，优化几乎不触发 → 给 canonical 等价精确定义 + round-trip golden vectors，接受「full request 是常态」为基线。
+- `resolve_for_turn` 无 availability probe + 禁 active-Turn cross-model fallback → 首消息命中宕机 model 直接 TurnFailed → 增加「下一 Turn 自动 fallback 到显式配置备用 model」策略（保持 exact pin、不在 turn 内静默替换）。
+- 正常 AgentRun 下 provider 返回越权 ToolCall / 结构化输出违约应映射的 `ModelCallErrorKind`（ProtocolViolation? InvalidRequest?）与是否 retryable 未明确 → 显式规定。
+- compaction summary 输入预算基准不一致：usable input budget 用 AgentRun 的 effective max_output_tokens 计算，但 summary 调用自身预留 `summary_max_output_tokens` → feasibility 计算应以 summary 调用自己的 output 预留为准，文中固定基准。
+- 无 manual/proactive compaction（不公开 `CompactSession`）→ 至少预留未来 maintenance 协议位，文档标注为有意 v1 缺口。
+- 无 `WorkspaceId`：历史 session 项目归属靠 primary root canonical path 相等，目录移动/路径复用致分组漂移或跨项目误并（授权侧安全，UI 分组会错）→ 明确 grouping 为 cosmetic，规定 path 复用/失效行为，或引入非授权可持久化 project label。
+- restrictive definition update 若 durable commit 失败，repair 按 durable-current 旧（较宽松）definition 重解析，收紧静默未生效仅中断 active Turn → 在 SessionReadiness/diagnostics 显式标记「上次收紧未持久化，需重试」。
+- lease 在 `authorize()` 时检查，对已 open 的文件 handle 后续写入不再校验，长 handle tool 存在 revocation 窗口 → 补 handle-relative open + 周期 lease recheck 收敛窗口。
+- additional roots 进入 Tool ceiling 但默认不进 Prompt/Skill discovery → monorepo「加目录=期望带上项目指令/skills」直觉会落空 → diagnostics/UI 提示「该 root 未授权为 Prompt/Skill source」，属取舍成本而非缺陷。
+- crash recovery 是否持久化 `WorkspaceFingerprint`/view fingerprint 仍开放，而 Test Matrix 的「ToolGrantKey 绑定 WorkspaceAccessFingerprint」「fork/resume 后 grant 一致」依赖它 → 实现 storage 前定案。
+
+### 横切复用
+
+- Prompt/Tool/Skill 各自复制同一套 pinning + authorization 纪律（exact revision、lease 校验、source stamp、不回查 current head、content-addressed cache、Workspace*Context 三份平行投影）→ 抽出共享的 authorization/pinning **value type**（非领域分层、非 Resource 外壳），让该安全不变量只定义一次；不合并子系统（deletion test 成立）是对的。
+- `prompt_set.tools.tool_set_fingerprint == tool_set.fingerprint()` 的相等性应在 `TurnExecutionContext` 构造处有单一、命名、fail-closed 的断言点。
+- `ToolPromptView` 现仅 `specs + fingerprint`，Prompt 组装引用的「guidelines」未定义（Q7）→ 若 system prompt 需 per-tool 指南，窄 view 不足，确认后再决定是否加 `guidelines` 字段。
+- 「PromptSet 是唯一组装 seam」依赖 ModelGateway 只做 role lowering 与 cache-control 编码、不新增任何模型可见语义内容 → 在 `model-gateway.md` 显式写成不变量，否则 seam 从 provider 侧泄漏。
+- `AssembledModelContextFingerprint` 覆盖 committed conversation + output_contract + purpose，但 `CompactionSummaryDirective` 正文似未入 fingerprint → 纳入 directive hash，保证 summary 请求可复现/可审计。
+- prompt `PromptFingerprint` 只覆盖 definition identity/version；若 `PromptContent` inline 且同 version 可变（Q2 未定），content 变更不被察觉（Workspace prompt 有 WorkspacePromptFingerprint，Runtime/Agent/Session 无）→ 保证 content 变更必 bump version，或 fingerprint 纳入 content hash。
+- prompt「检测不存在未提交的 current-call model-visible contribution」实为 by-construction（assemble 只接受 `CommittedConversationView`），非运行时检查 → 措辞改为 by-construction。
+
+---
+
+## 复核说明
+
+- 严重度经二次核对调整一处：`session-execution` 的 canonical resource lock 项，在复核 `tools.md` 执行链（approval 先于取锁）后，从重大降为非阻塞，残留「多资源全序获取」建议见并发非阻塞组。
+- 本评审仅调研，未修改任何设计文档；所列问题为待决项，不代表文档已错误落地。核心 seam 划分（deep module deletion test、exact model pin、trusted projector 构造 Replace、lease-based revocation、append/apply-before-model-visible）判定为自洽。
