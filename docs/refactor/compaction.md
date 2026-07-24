@@ -2,7 +2,7 @@
 
 日期：2026-07-24
 
-状态：目标架构已确定；实现、质量评估和公开Runtime command待后续阶段完成
+状态：目标架构已确定；实现和质量评估待后续阶段完成
 
 ## 目的
 
@@ -17,7 +17,7 @@
 - Steer、Cancel、Workspace revocation、retry、write outcome unknown和restart如何处理；
 - Workspace/Agent/Session instructions、Skill metadata和动态contribution如何保留。
 
-本文不定义公开`CompactSession`协议、standalone/manual maintenance state、split-turn双摘要、provider-native opaque artifact、hierarchical summary tree、long-term memory、physical JSONL vacuum或provider tokenizer实现。
+首版[Runtime Interface](runtime-interface.md)不提供公开`CompactSession`协议或standalone/manual maintenance state。本文也不定义split-turn双摘要、provider-native opaque artifact、hierarchical summary tree、long-term memory、physical JSONL vacuum或provider tokenizer实现。
 
 相关权威文档：
 
@@ -27,6 +27,7 @@
 - [Prompt子系统架构设计](prompt-subsystem.md)
 - [ModelGateway架构设计](model-gateway.md)
 - [ADR 0027](../adr/0027-compaction-uses-strict-stable-suffix.md)
+- [Runtime Interface与公开协议架构设计](runtime-interface.md)
 
 ## 决策摘要
 
@@ -59,7 +60,7 @@
 | --- | --- | --- |
 | pi | rolling previous summary、recent suffix、Tool安全cut、append-only overlay | split-turn、post-run eager compact、manual implicit abort |
 | Codex | model-call前检查、overflow recovery、replacement conversation | provider-native artifact、active-Turn cross-model fallback、直接live-history replacement |
-| Claude Code | near-limit auto-compaction | 未公开的cut/storage细节；`/compact`留到阶段9 |
+| Claude Code | near-limit auto-compaction | 未公开的cut/storage细节；首版不复制`/compact` |
 | Rig | rolling carry-over、window policy、orphan ToolResult保护 | load-path同步压缩、process-only watermark、system-role summary |
 | Grok Build | Compaction与Session/Sampler分离 | checkout中不可验证的具体算法 |
 
@@ -819,7 +820,7 @@ CompactionCompleted
 CompactionFailed
 ```
 
-阶段9再冻结public event命名和payload。事件必须在对应committed fact apply后发布；progress可合并/丢弃，不进入JSONL。
+public event使用[Runtime Interface](runtime-interface.md)定义的per-session StateEvent与ProgressEvent。事件必须在对应committed fact apply后发布；progress可合并/丢弃，不进入JSONL或SessionCursor。
 
 Session usage由assistant entries和`StoredCompaction.model_call` replay重建。SummaryModel usage属于Session total，但不属于assistant Item或普通Agent response usage。
 
@@ -956,7 +957,7 @@ COMP-018 Compaction不是Turn、Item或Interaction
 7. 完成replay/fork/crash tests；
 8. 完成soft/hard failure和overflow allowance；
 9. 建立summary quality fixtures；
-10. 阶段9决定manual CompactSession协议。
+10. 接入Runtime per-session StateEvent/ProgressEvent并完成公开contract tests。
 
 ## 完成检查
 
@@ -970,6 +971,7 @@ COMP-018 Compaction不是Turn、Item或Interaction
 - [x] 确定retry、failure、restart和fork。
 - [x] 确定static instruction不进入summary。
 - [x] 确定首版不做split-turn、manual、hierarchical或provider-native compaction。
+- [x] 确定首版Runtime protocol不公开manual CompactSession。
 - [ ] 实现Compaction module。
 - [ ] 实现SessionExecutor integration。
 - [ ] 实现Prompt/ModelGateway summary path。

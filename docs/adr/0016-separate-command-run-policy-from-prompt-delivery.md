@@ -2,9 +2,11 @@
 
 ## 状态
 
-Accepted
+Partially superseded by [ADR 0028](0028-runtime-protocol-uses-scoped-state-cursors.md)。Command execution policy与prompt delivery分离保留；SessionExecutor替代SessionRuntime，首版不建立PendingSessionAction/manual compact，公开Turn control使用Submit、Steer和FollowUp typed command。
 
-Amended by [ADR 0025](0025-loaded-session-uses-one-session-executor.md) and [ADR 0027](0027-compaction-uses-strict-stable-suffix.md): SessionExecutor replaces SessionRuntime as execution owner, and first-implementation Compaction does not expose running-time `/compact` or `QueueAfterRun` behavior. Manual compaction policy is deferred to the Runtime interface design.
+Amended by [ADR 0025](0025-loaded-session-uses-one-session-executor.md) and [ADR 0027](0027-compaction-uses-strict-stable-suffix.md): SessionExecutor replaces SessionRuntime as execution owner, and first-implementation Compaction does not expose running-time `/compact` or `QueueAfterRun` behavior.
+
+> 以下Decision/Impact保留原始历史形状。涉及NextTurn、PendingSessionAction、QueueAfterRun `/compact`或删除公开Steer/FollowUp的内容已被ADR 0028替代。
 
 ## 决策
 

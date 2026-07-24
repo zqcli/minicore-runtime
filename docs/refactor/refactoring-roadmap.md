@@ -497,6 +497,20 @@ docs/refactor/compaction.md
 docs/refactor/runtime-interface.md
 ```
 
+状态：目标架构已确定；protocol types、facade、event publisher、snapshot和contract tests待实现。
+
+已明确：
+
+- `MiniCoreRuntime`公开`dispatch / query / snapshot / subscribe`四类能力；
+- 公开领域identity使用`AgentId → SessionId → TurnId → ItemId → RequestId`，不定义`RunId`或`WorkspaceId`；
+- Command在明确线性化点返回typed outcome，Turn长期完成通过Event发布；
+- CommandSurface是Runtime内部无状态命令解释模块，slash text与catalog selection走同一resolve路径；
+- Runtime和每个Session使用独立cursor/snapshot，不建立runtime-global sequence或all-loaded stop-the-world barrier；
+- 可靠StateEvent与可合并/丢弃的ProgressEvent分离；
+- SessionStorage拥有message tree，Runtime提供history Query和message-anchor Fork command；
+- 所有Runtime mutation经过facade，UI selection、draft、scroll和layout留在adapter；
+- 首版不公开standalone/manual `CompactSession`。
+
 必须定义：
 
 - `MiniCoreRuntime` 的最小 command、query、event 和 snapshot interface；
@@ -681,7 +695,7 @@ Runtime facade 是唯一外部入口
 
 只有同时满足以下条件，才能宣布重构完成：
 
-- [ ] 所有阶段 1–9 的目标文档已稳定；
+- [x] 所有阶段 1–9 的目标文档已稳定；
 - [ ] 目标 interface 已实现；
 - [ ] 生产调用方不再依赖旧 ResourceManager、旧 Prompt、旧 Tools 或旧 SessionRuntime ownership；
 - [ ] 所有模型调用只接收ModelCallRequest，且其唯一model-visible input是`AssembledModelContext`；
@@ -693,7 +707,7 @@ Runtime facade 是唯一外部入口
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
 - [x] Conversation/SessionStorage durable ownership、entry tree、fork 和 recovery 已确定；
 - [x] compaction orchestration、stable cut、StoredCompaction和bounded recovery有确定定义；
-- [ ] Runtime command/query/event/snapshot interface 已冻结；
+- [x] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [ ] 新文档已进入正式架构目录；
 - [ ] 旧正式文档已删除或完成 supersede；
@@ -703,10 +717,6 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 
 ## 当前下一步
 
-按照本文顺序，下一份目标设计文档是：
+阶段1–9目标设计已完成。当前下一步进入实现与验证：先完成Rig integration spike、SessionExecutor、ModelGateway provider adapter和Compaction测试，再实现Runtime protocol types、facade routing、scoped snapshot/event publisher和CommandSurface target architecture。
 
-```text
-docs/refactor/runtime-interface.md
-```
-
-Compaction已确定为“portable rolling summary + strict stable-unit cut + contiguous retained suffix + one StoredCompaction entry + bounded active-Turn recovery”。下一阶段冻结Runtime command/query/event/snapshot协议，包括manual `CompactSession`是否需要独立Session maintenance state；生产实现仍需Rig integration spike、SessionExecutor、ModelGateway provider adapter和Compaction测试共同验证。
+Extension / Plugin阶段仍不是核心实现前置条件；只有出现至少两个真实package/adapter source后再启动阶段10设计。

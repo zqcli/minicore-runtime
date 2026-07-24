@@ -134,7 +134,7 @@ SkillService 的完整设计见 [Skill 子系统架构设计](skill-subsystem.md
 
 Workspace 的完整设计见 [Workspace 子系统架构设计](workspace-subsystem.md)。
 
-本阶段不定义 `MiniCoreRuntime` 的 command、query、event、snapshot interface，也不定义它如何创建、保存或查找 Agent。
+`MiniCoreRuntime`的公开`dispatch / query / snapshot / subscribe` interface、Agent/Session管理和host边界见[Runtime Interface与公开协议架构设计](runtime-interface.md)。
 
 ### Agent
 
@@ -918,7 +918,7 @@ SkillId + DefinitionVersion
 
 - Definition content是内联值还是immutable content reference；
 - scope definitions是新增定义、完整集合还是只保存引用；
-- 公开Runtime protocol如何联系SessionExecutionHandle。
+- 公开Runtime protocol通过SessionId在Runtime内部定位SessionExecutionHandle；handle不进入公开payload。完整映射见[Runtime Interface](runtime-interface.md)。
 
 ## 最小代码骨架
 

@@ -326,7 +326,7 @@ Rig 0.40.0 adapter spikes
 2. 实现private AgentLoop adapter
 3. 实现ToolExecutionControl request/reply
 4. 实现race/recovery/performance测试
-5. 在阶段9冻结公开Runtime protocol
+5. 已在阶段9冻结公开Runtime protocol，见[runtime-interface.md](runtime-interface.md)
 ```
 
 ## 明确不建立

@@ -672,7 +672,7 @@ InteractionResolved append → waiter wake
 ToolExecutionStarted append → side effect
 ```
 
-TUI、RPC 和 Web 是 future Runtime interface 的 transport，不直接成为 ToolService adapter。ToolSandbox 仍可以有不同操作系统或容器 adapter。
+TUI、RPC和Web通过[Runtime Interface](runtime-interface.md)接收Interaction StateEvent并提交resolution，不直接成为ToolService adapter。ToolSandbox仍可以有不同操作系统或容器adapter。
 
 ToolExecutionControl是crate-internal execution seam，不建立InteractionService、ToolLedgerService或第二writer。其实现只能通过当前SessionWriter append已定义event entry，并在返回前完成storage-owned `apply_committed`；`record_execution_start`成功返回exact `EntryId`后才允许side effect。ToolSet把该ID带入`ToolOutcomeSource::Executed`，Session execution随后用它构造可验证的role=tool message。
 

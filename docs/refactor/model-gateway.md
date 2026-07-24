@@ -23,7 +23,7 @@
 - Prompt内容、conversation visibility或`MessageRecord → ModelMessage`转换；
 - Session logical retry、compaction orchestration或Turn terminal规则；
 - Tool execution、approval或ToolResult持久化；
-- Runtime公开model catalog/query/event协议；
+- Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
@@ -33,6 +33,7 @@
 - [Turn执行模块与执行上下文架构设计](turn-execution-context.md)
 - [Session Execution架构设计](session-execution.md)
 - [Conversation与SessionStorage架构设计](conversation-storage.md)
+- [Runtime Interface与公开协议架构设计](runtime-interface.md)
 - [ADR 0023：Driver从committed conversation seed开始](../adr/0023-driver-starts-from-one-committed-conversation-seed.md)
 - [ADR 0026：ModelGateway使用一个深异步调用interface](../adr/0026-model-gateway-uses-one-deep-async-operation.md)
 
@@ -1796,4 +1797,4 @@ src/model_gateway/provider/fake.rs
 - [ ] 执行Rig 0.40.0 ModelGateway integration spike。
 - [ ] 实现ModelGateway和provider adapters。
 - [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
-- [ ] 在阶段9冻结公开model catalog/query协议。
+- [x] 在阶段9冻结公开model catalog/query协议。

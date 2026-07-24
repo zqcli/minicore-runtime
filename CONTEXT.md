@@ -24,17 +24,17 @@ _避免_：前端运行时、浏览器应用
 承载 MiniCore Agent 运行时的本地进程，拥有模型凭据、会话状态、本地项目访问和工具执行能力。它可以被下游 CLI/TUI 直接嵌入，也可以嵌入 Tauri 后端或作为原生 sidecar 打包。
 _避免_：WebView SDK、前端 Agent
 
-**AgentRuntimeProtocol**：
-界面适配器与 Agent 运行时之间的稳定通信协议，由 `AgentCommand` / `CommandAck`、`RuntimeQuery` / `QueryResponse`、`Event` / `EventMsg` 和 `RuntimeSnapshot` 等协议类型组成。Command 表达 mutation 或异步工作，Query 表达只读 typed request/response，Event 表达运行变化，Snapshot 表达带事件水位的恢复读模型。
-_避免_：运行时桥接、直接导入 SDK、UI 回调、command 子系统
+**Runtime Interface**：
+界面适配器与 `MiniCoreRuntime` 之间的稳定通信interface，由 `RuntimeCommand` / `CommandResponse`、`RuntimeQuery` / `QueryResponse`、`RuntimeSnapshot` / `SessionSnapshot` 和 `StateEvent` / `ProgressEvent` 组成。Command表达mutation或work admission，Query表达只读typed request/response，Snapshot表达scope-local恢复读模型，Event表达Runtime向host发布的可靠状态变化或best-effort进度。
+_避免_：运行时桥接、直接导入SDK、UI回调、内部Service interface
 
-**AgentRuntimeEvents**：
-描述 `agent_runtime_protocol::Event` 的命名、顺序、所有权、重连和生命周期规则。它不是事件类型定义本身，也不是会话持久化日志。
-_避免_：协议类型集合、会话日志、UI 状态管理
+**Runtime Events**：
+Runtime通知host的observer协议。可靠`StateEvent`按Runtime scope或单个Session scope推进cursor；`ProgressEvent`不占用cursor，可以合并或丢弃。它不是SessionStorage ledger或模型conversation。
+_避免_：会话日志、UI store、provider stream原样透传
 
-**工作区（Workspace）**：
-一次 runtime 生命周期内打开的项目上下文容器，由 `OpenWorkspace { path }` 的 canonical root path 定义身份（`WorkspaceIdV1` 从该路径按版本化算法确定性派生，跨进程稳定）。它界定 session cwd 的合法域（root 及其之下）、充当持久化会话目录的分组维度，并投影 `WorkspaceSummary` 供 UI 展示。MVP 单实例、单根；`AgentRuntime` 是它的持有者，重复 `OpenWorkspace` 同根幂等、异根拒绝。它不承载 project trust（per-cwd）、项目资源 scope（per-cwd）、provider/auth/settings（user-global）或运行时服务生命周期。详见 [ADR 0022](docs/adr/0022-workspace-is-single-instance-thin-boundary.md)。
-_避免_：VS Code 式多根容器、多 workspace 并存、trust 边界、资源 scope owner、UI 当前项目状态、隔离单元
+**工作区（pre-refactor protocol term）**：
+旧协议把Workspace建模为Runtime-global open/close entity并定义WorkspaceId。目标架构已删除该ownership；当前`Workspace`只表示`SessionDefinition.workspace`中的Session-owned definition value。
+_避免_：OpenWorkspace、WorkspaceId、Runtime-global Workspace registry
 
 **编程能力**：
 助手通过 read、edit、write、search、list 或 shell execution 等工具检查或修改工作区的行为。
@@ -44,13 +44,21 @@ _避免_：通用聊天
 可以运行在可信运行宿主内的 Rust、Go、C++ 或类似原生框架；它拥有 Agent loop、工具调用、流式事件和状态推进能力，并且不要求 Node.js 运行时。
 _避免_：模型客户端、API wrapper
 
-**Agent 运行时（`AgentRuntime`）**：
-与 UI 无关的 MiniCore 后端门面，供下游 CLI、TUI 和 GUI 宿主通过协议接入；它通过 `dispatch` 接收 mutation/异步工作，通过 `query` 返回只读业务数据，通过 `subscribe` 发布运行变化，通过 `snapshot` 生成恢复读模型，并管理工作区、会话目录和会话运行时。
-_避免_：TUI 后端、桌面后端、UI 服务、GUI 应用状态
+**MiniCore Runtime（`MiniCoreRuntime`）**：
+与UI无关的唯一顶层门面，供下游CLI、TUI和GUI可信宿主通过`dispatch / query / snapshot / subscribe`接入。它管理Agent/Session durable owner、loaded SessionExecutor路由和Runtime-owned共享模块，不保存UI selected Session。
+_避免_：TUI后端、桌面后端、UI Service、GUI应用状态、全局current Session
 
 **RuntimeSnapshot**：
-Agent 运行时在某个事件水位上的当前状态读模型，用于 adapter 初始化和同一 host 生命周期内的事件流重连/订阅重建。它在同一sequence原子覆盖全部loaded `SessionExecutor`，包括各自current Turn的Pending Interaction；它不是 UI store、会话文件或持久化快照。打开工作区后默认 `loaded_sessions` 为空。MVP 不支持 adapter 失败但 runtime daemon 继续运行再被重连的独立生命周期模型。
-_避免_：UI 状态、session index、JSONL、事件日志、持久化快照文件
+Runtime scope在某个`RuntimeCursor`上的恢复读模型，包含Runtime信息、Agent summary、loaded Session membership、catalog revision和runtime diagnostics。它不包含全部loaded Session的完整message/current Turn/Pending Interaction，也不要求所有SessionExecutor在同一全局水位park。
+_避免_：SessionSnapshot、UI store、Session index、JSONL、全局事件水位
+
+**SessionSnapshot**：
+一个loaded Session在其`SessionCursor`上的恢复读模型，通过对应SessionExecutionHandle排队取得，包含lifecycle、definition summary、readiness、current Turn、active Items、Pending Interaction、queues和usage。完整历史通过Query分页读取。
+_避免_：RuntimeSnapshot、完整JSONL replay、durable storage snapshot
+
+**RuntimeCursor / SessionCursor**：
+可靠StateEvent的scope-local恢复水位。Runtime只有一个RuntimeCursor；每个loaded Session有独立SessionCursor。两种cursor不可比较，ProgressEvent不推进cursor。
+_避免_：runtime-global sequence、EntryId、provider stream offset
 
 **运行时共享模块**：
 `MiniCoreRuntime`拥有的PromptService、ToolService、SkillService和ModelGateway。它们不随UI selected Session改变，也不保存current Session或current Turn。
@@ -81,7 +89,7 @@ _避免_：`Arc<Mutex<SessionExecutor>>`、SessionExecutor本体、RunningOperat
 _避免_：UI 后端、简单 wrapper
 
 **运行时 Hook（`RuntimeHook`）**：
-`RuntimeHooks` 模块规划的后期内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、session commit observer 和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前 MVP 不实现 hook system，也不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布 `agent_runtime_protocol::Event`，不读写 session storage，不执行工具，也不读取凭据。
+`RuntimeHooks` 模块规划的后期内部安全点干预能力，用于在 prompt/context、模型请求、provider payload、工具治理、压缩、session commit observer 和 UI-safe command result 等流程中返回 typed decision / patch / replacement。当前 MVP 不实现 hook system，也不定义资源 discovery/reload hook。Hook 影响最终会发生什么，但不直接发布Runtime StateEvent/ProgressEvent，不读写session storage，不执行工具，也不读取凭据。
 _避免_：UI 回调、协议事件、插件系统、任意 runtime 后门、当前阶段必做模块
 
 **Hook owner**：
@@ -93,20 +101,20 @@ _避免_：Hook 注册表、Driver、UI adapter、任意调用方
 _避免_：事件总线、插件管理器、工具执行器、会话存储
 
 **会话阶段（`SessionPhase`，pre-refactor protocol term）**：
-旧Runtime snapshot中的粗粒度状态。当前内部权威状态是`SessionExecutionState { Idle, Starting, Running, Finishing }`加`TurnExecutionPhase { PreparingModel, Compacting, Sampling, WaitingApproval, ExecutingTools, Committing }`；阶段9再决定公开snapshot是否保留SessionPhase projection。
+旧Runtime snapshot中的粗粒度状态。当前公开SessionSnapshot投影`SessionExecutionView`和optional current Turn phase；内部权威状态仍是`SessionExecutionState { Idle, Starting, Running, Finishing }`加`TurnExecutionPhase`。不保留旧`SessionPhase::{Turn, Compaction, RetryBackoff}`公开enum。
 _避免_：SessionExecutor mutable state、ModelGateway attempt、durable TurnStatus
 
 **会话已稳定（`session_settled`）**：
-会话处于 `Idle`，且没有 active run、compaction、retry、pending session action 或马上启动的 continuation；`NextTurn` queue 可以保留。它是 runtime 发布给 observer 的状态事实，不是 command、阻塞式 wait API 或“所有队列为空”的同义词。
-_避免_：WaitForIdle、run finished、queue empty、同步等待点
+会话处于`Idle`，没有Starting/Running/Finishing Turn，也没有马上启动的FollowUp。它是per-session StateEvent和SessionSnapshot中的状态事实，不是command、阻塞式wait interface或“所有process-local queue为空”的同义词。
+_避免_：WaitForIdle、Turn terminal替代品、同步等待点
 
 **会话**：
 一次工作上下文的持久记录，包含消息、模型变化、思考等级变化、活跃工具变化、压缩摘要、标签、名称和当前叶子位置。
 _避免_：聊天记录、日志文件
 
 **SessionIndex / 会话目录**：
-`SessionManager` 维护的会话轻量清单或索引，用于 `/resume` 和 `SessionQuery::List`。它可以从 session 文件 header、metadata 或本地 index/cache 重建，包含 session id、workspace、名称、更新时间、预览和轻量统计；它不是 `RuntimeSnapshot`，也不包含完整消息、运行中状态或 UI 状态。
-_避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、事件日志
+Runtime内部Session durable owner维护的轻量清单或可重建索引，用于CommandSurface `/resume`和`SessionQuery::List`。它包含SessionId、AgentRevisionRef、Workspace summary、名称、lifecycle、更新时间、预览和轻量统计；不包含完整消息、current Turn或UI状态。
+_避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、第二durable truth
 
 **会话条目（`StoredSessionEntry`）**：
 会话中的一条不可变追加记录。条目通过 `entry_id` 和 `parent_id` 连接成树，并带有 entry-scoped `operation_key`；顶层 body 固定为 `TurnContext`、`Message`、`Event` 或 `Compaction`。Message 使用 `user | assistant | tool` role；usage 和 finalized provider response metadata 随 assistant entry 保存。
@@ -140,9 +148,9 @@ _避免_：会话总 token、账单消耗、消息数量
 一个会话从创建以来累计的模型调用消耗视图。压缩不会降低会话累计消耗，只会降低后续上下文占用。
 _避免_：当前上下文窗口、压缩摘要大小、UI 计数器
 
-**会话管理器（`SessionManager`）**：
-负责工作区内会话生命周期的运行时模块。它协调持久化会话目录、单会话句柄和已加载会话运行时，但不执行单个 Agent run。
-_避免_：文件工具、会话管理 UI、Agent loop
+**会话管理器（`SessionManager`，pre-refactor module term）**：
+旧架构中协调会话目录和loaded runtime的模块名。目标领域不建立SessionManager对象；MiniCoreRuntime内部以Session durable owner、SessionIndex和LoadedSessionExecutors实现同类职责。
+_避免_：公开SessionManager、领域Manager entity、Agent loop owner
 
 **已加载会话执行器（`LoadedSessionExecutors`）**：
 Runtime内部维护的live map，记录当前已加载Session对应的`SessionExecutionHandle`。它不是持久化会话目录；每个`SessionExecutor`独立持有state、request queues、current Turn、Pending Interaction和SessionWriter。它不保存客户端selected/current Session，多个Executor可以同时推进work。
@@ -221,28 +229,28 @@ _避免_：provider payload、Turn state、session message vector、Gateway内�
 _避免_：system prompt、provider payload、显示格式、max output tokens
 
 **CommandSurface**：
-Agent 运行时提供给 CLI、TUI 和 GUI 的跨界面用户命令领域面。它不是一个有状态 service 名；实现上由共享无状态`CommandManager`和Runtime基于SessionId/SessionExecutor snapshot构造的session-scoped command context共同组成。
+MiniCoreRuntime提供给CLI、TUI和GUI的跨界面用户命令领域面。它不是一个有状态Service名；实现上由Runtime-owned共享无状态`CommandManager`和每次调用构造的explicit optional Session command context组成。Slash text和catalog selection必须走相同的materialize、resolve、validate和handler binding。
 _避免_：UI adapter、快捷键系统、协议命令枚举、Agent loop、有状态 CommandSurfaceService
 
-**AgentCommand**：
-`agent_runtime_protocol::AgentCommand`，下游 adapter 提交给 `AgentRuntime` 的公开协议命令枚举，例如 `SubmitPrompt`、`ExecuteCommandText`、`ExecuteCatalogCommand`、`DecideToolApproval`、`ReloadResources`。它表达用户意图，不代表 command tree 节点，也不应包含高权限内部 mutation。
+**RuntimeCommand**：
+下游adapter通过`MiniCoreRuntime.dispatch(...)`提交的公开协议命令，按Agent、Session、Turn、Interaction和CommandSurface分组。它表达领域mutation或work admission，不代表command tree节点，也不包含直接模型调用、raw storage mutation或高权限内部handle。
 _避免_：command::Command、UI action payload、内部调试 API
 
 **运行时查询（`RuntimeQuery`）**：
-下游 adapter 通过 `AgentRuntime.query(...)` 提交的只读 typed 查询总线，按 runtime、session、settings、resources、command surface、models、usage 和 diagnostics 领域分组。它不创建 turn、不启动 run、不消费 queue、不改变 revision，也不通过事件流广播结果。
-_避免_：AgentCommand、CommandOutput、RuntimeSnapshot、UI 本地 selector、后台 job
+下游adapter通过`MiniCoreRuntime.query(...)`提交的只读typed查询总线，按runtime、agent、session、command surface、model、prompt、skill、tool、usage和diagnostics领域分组。它不创建Turn、不启动work、不消费queue、不改变revision，也不通过事件流广播结果。
+_避免_：RuntimeCommand、CommandOutput、Snapshot、UI本地selector、后台job
 
 **查询响应（`QueryResponse`）**：
-`RuntimeQuery` 的直接 request/response 结果，包含 `as_of_sequence`、可选领域 revision 和 typed `QueryResult`。它不是业务事件，不分配 `CommandId`，transport request id 也不进入领域模型。
-_避免_：CommandAck、EventMsg、RuntimeSnapshot、JSON-RPC request object
+`RuntimeQuery`的直接request/response结果，包含scope-local`ReadStamp`、可选领域revision和typed `QueryResult`。它不是业务事件，不推进RuntimeCursor或SessionCursor，transport request id也不进入领域模型。
+_避免_：CommandResponse、StateEvent、Snapshot、JSON-RPC request object
 
 **CommandManager**：
-`WorkspaceServices` 持有的共享、无状态命令管理器。它持有只读 command packs、candidate provider registry 和 handler registry；每次调用时基于传入 `CommandContext` 临时 materialize command catalog，并执行 parse、suggest、`resolve_for_execution`。
+`MiniCoreRuntime`持有的共享、无状态命令管理器。它持有只读command packs、candidate provider registry和handler registry；每次调用时基于显式构造的`CommandContext`临时materialize command catalog，并执行parse、suggest和`resolve_for_execution`。
 _避免_：SessionExecutor、catalog cache、UI菜单状态、执行Tool或Model的module
 
-**Command（session-scoped）**：
-Runtime为指定SessionId构造的命令入口facade。它不缓存catalog，只从SessionExecutor snapshot组装`CommandContext`和`SessionCommandHost`，再调用共享`CommandManager`。
-_避免_：agent_runtime_protocol::AgentCommand、全局命令服务、UI command palette
+**Command（session-scoped，pre-refactor facade term）**：
+旧设计中由SessionRuntime长期持有的命令facade。目标架构不保留该对象；MiniCoreRuntime按每次请求构造CommandContext，并把resolved action路由到公开Command或Query owner。
+_避免_：SessionExecutor持有Command facade、current Session command object
 
 **CommandNode / CommandPath**：
 命令树中的节点与路径。`CommandPath` 可以任意深度，例如 `/model thinking high`、`/model provider openai gpt-5`、`/skill code-review ...`。有限集合和动态候选应作为 command nodes，而不是被塞进普通 args。
@@ -260,13 +268,13 @@ _避免_：资源 loader、文件扫描器、UI autocomplete 函数、任意查�
 用户或 UI 提交给 `ExecuteCommandText` 的文本形式命令。`/...` slash command 是命令文本的一种常见语法；同一 command 也可以来自 `ExecuteCatalogCommand` 的结构化 catalog selection。
 _避免_：普通用户 prompt、shell 命令、Agent 消息类型
 
-**提示词交付方式（`PromptDelivery`）**：
-模型可见输入相对当前 Agent 运行的交付位置：`Steer` 在最早可用的下一次模型调用前注入，`FollowUp` 等当前 work 完成后启动后续运行，`NextTurn` 等下一次显式用户 turn 时合并。它不决定 slash command handler 何时运行。
-_避免_：DeliveryMode、InputSchedule、CommandRunPolicy、PendingSessionAction
+**Command Prompt Delivery（`CommandPromptDelivery`）**：
+Prompt-producing slash/catalog command解析为PromptIntent后选择的公开交付方式：`Submit`创建新Turn，`Steer { expected_turn_id }`作用于当前Running Turn，`FollowUp`在当前Turn terminal后admit下一Turn。它不决定非prompt handler何时运行。
+_避免_：DeliveryMode、NextTurn、通用InputSchedule、raw slash text queue
 
 **命令运行策略（`CommandRunPolicy`）**：
-slash/catalog command 相对 active work 的执行策略：`Immediate` 立即执行，`IdleOnly` 在 active work 时拒绝，`QueueAfterRun` 在 idle 时立即执行、在 active work 时保存为结构化待执行会话动作。它不表示 steer、follow-up 或模型消息队列。
-_避免_：CommandPhasePolicy、DeferUntilPostRun、PromptDelivery、通用任务调度器
+Command manifest/handler相对active work的执行约束。首版普通读取或definition mutation可以Immediate执行，需要Idle的操作显式拒绝；Prompt-producing command使用Submit/Steer/FollowUp。首版不建立generic QueueAfterRun或PendingSessionAction。
+_避免_：通用任务调度器、manual compact queue、Prompt delivery替代品
 
 **命令目录**：
 运行时基于当前 session context 临时 materialize 给界面适配器的命令摘要集合，包含 command key、path、来源、说明、参数提示和当前可用性。它用于 autocomplete、command palette 和嵌套菜单，不等同于执行授权。
@@ -277,7 +285,7 @@ _避免_：命令执行器、工具注册表、资源目录、持久化 catalog
 _避免_：UI 输入框逻辑、Agent loop、shell parser、一次性 planner
 
 **命令输出**：
-由用户命令产生的界面可见说明，例如 `/status` 摘要、`/usage` 统计、`/model` 设置完成提示或解析错误。它可以显示在消息面板中，但不是模型可见消息，也不能携带完整 `AgentCommand`。
+由用户命令产生的display-neutral界面说明，例如`/status`摘要、`/usage`统计、`/model`设置完成提示或解析错误。它可以显示在消息面板中，但不是模型可见消息，也不能携带完整`RuntimeCommand`。
 _避免_：助手消息、工具结果、会话条目、UI action command
 
 **命令交互请求**：
@@ -304,17 +312,21 @@ _避免_：响应、请求、chat completion
 SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。它只接收不可变输入并返回`OperationResult`；不能拥有SessionWriter、projections、request queues或Turn terminal state。
 _避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owner
 
+**提交标识（`SubmissionId`）**：
+Submit在initiating UserMessage append前的process-local admission control identity。公开Cancel target使用`SubmissionId | TurnId`；Turn创建后长期identity切换为TurnId。SubmissionId不持久化，restart后不可恢复。
+_避免_：领域TurnId、CommandId、crash-safe queue identity
+
 **运行标识（`RunId`，pre-refactor protocol term）**：
-旧Runtime protocol用于标识一次公开Agent run的identity。当前目标架构内部以SessionId、TurnId、execution_version和OperationType定位执行；是否仍需要独立RunId留到阶段9公开protocol决定。
-_避免_：在SessionExecutor内部替代TurnId、模型调用id、ToolCallId、EntryId
+旧Runtime protocol用于标识一次公开Agent run。目标Runtime protocol不定义RunId；公开执行identity是SessionId+TurnId，Starting admission使用SubmissionId，内部operation使用execution_version和OperationType。
+_避免_：公开RunId、host-global Run索引、用RunId替代TurnId
 
 **待执行会话动作（`PendingSessionAction`）**：
-旧Runtime protocol中，`SessionExecutor`接受`CommandRunPolicy::QueueAfterRun`后保存、并在当前Turn结束后执行结构化Session操作。首版Compaction不接受running-time manual compact；阶段9若增加manual `CompactSession`，必须先定义独立Session maintenance/admission语义。PendingSessionAction不是用户消息，不进入Steer/FollowUp queue或模型上下文。
-_避免_：AgentCommand payload、QueuedMessage、writer 内部 batch draft、CommandManager pending action
+旧Runtime protocol中用于QueueAfterRun的结构化Session操作。目标首版不建立PendingSessionAction，也不公开manual CompactSession；future maintenance需要独立设计admission、queue、cancel和snapshot语义。
+_避免_：RuntimeCommand payload、QueuedMessage、writer batch、CommandManager pending state
 
 **当前运行状态（`CurrentRunState`，pre-refactor protocol term）**：
-旧RuntimeSnapshot中的run read model。当前内部权威值是`SessionExecutionState + CurrentTurnExecution + committed projections`；阶段9决定公开snapshot是否保留CurrentRunState名称。
-_避免_：SessionExecutor mutable state、durable TurnStatus替代品
+旧RuntimeSnapshot中的run read model。目标SessionSnapshot使用`SessionExecutionView + optional CurrentTurnView`，不保留CurrentRunState或Suspended run模型。
+_避免_：SessionExecutor mutable state、durable TurnStatus替代品、公开Run lifecycle
 
 **可恢复暂停（`Suspended`，pre-refactor proposal）**：
 阶段6 baseline不定义Suspended execution state。WaitingApproval保持Running；Cancel/host restart使用Interrupted。若未来需要同进程pause/resume，必须另行定义operation state、identity和public protocol。
@@ -362,15 +374,15 @@ _避免_：所有工具、工具开关 UI
 _避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 
 **工具审批代理（`ToolApprovalBroker`）**：
-`Tools` 子系统内部的 pending approval 状态机。它保存等待用户确认的工具调用，冻结 prepared args，触发 `tool_call_approval_requested`，并等待 `agent_runtime_protocol::AgentCommand::DecideToolApproval`。
-_避免_：UI 回调、策略判断器、长期授权存储、工具执行器
+Tool执行期等待外部批准的private waiter/broker实现。Durable truth是SessionStorage中的Item-owned Interaction request/resolution；broker不能成为第二pending approval owner，也不能直接通知UI。
+_避免_：UI回调、durable Interaction替代品、长期授权存储、公开Runtime object
 
 **待审批工具调用（`PendingToolApproval`）**：
-`ToolApprovalBroker` 内部保存的当前等待用户批准或拒绝的工具调用。它包含 `ApprovalRequestId`、冻结的 prepared args 和 UI-safe 审批请求；只有 UI-safe 投影 `PendingToolApprovalView` 可以进入对应 `RuntimeSnapshot.loaded_sessions[*].current_run.pending_tool_approvals`，用于同一 host 生命周期内恢复审批 adapter 状态和构造 `DecideToolApproval`。
-_避免_：审批弹窗本身、工具执行结果、会话条目、可由 UI 修改的工具参数
+旧approval-specific projection term。目标公开投影是SessionSnapshot中的`InteractionView`，identity为SessionId+TurnId+ItemId+RequestId；prepared args和executor handle保持private。
+_避免_：独立approval truth、RuntimeSnapshot全局pending列表、可由UI修改的工具参数
 
-**工具审批决定（`agent_runtime_protocol::ToolApprovalDecision`）**：
-下游 UI 对某个 pending tool approval 的协议回答，可以 `ApproveOnce`、`ApproveGrant` 或 `Reject`；它不能替换工具参数，也不能直接执行工具。grant 只记录免批规则，不跳过 schema validation、hard deny、sandbox、mutation queue 或 audit。
+**工具审批决定（`ToolApprovalDecision`）**：
+`InteractionCommand::Resolve`中的typed ToolApproval resolution，可以ApproveOnce、ApproveGrant或Reject；它不能替换工具参数，也不能直接执行工具。grant不跳过schema validation、hard deny、sandbox、mutation ordering或audit。
 _避免_：工具策略决定、工具参数、用户命令结果
 
 **工具执行协调器（`ToolExecutionCoordinator`）**：
@@ -450,23 +462,27 @@ AgentLoop在稳定模型输出、`tool_round_completed` conversation projection 
 _避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 
 **运行时命令**：
-由 UI 发往 Agent 运行时的指令，例如提交 prompt、调用技能、中止、批准工具调用、切换模型或打开会话。
-_避免_：UI 动作、后端 API 调用
+由可信host通过MiniCoreRuntime发出的typed指令，例如创建或更新Agent/Session、Submit/Steer/FollowUp/Cancel Turn、Resolve Interaction或执行CommandSurface text/catalog selection。
+_避免_：UI widget action、直接后端函数调用、raw storage/model mutation
 
-**运行时事件**：
-由 Agent 运行时发出、供界面适配器消费的完整事件记录。它包含顺序、路由、关联和事件消息，用于渲染消息、工具活动、队列状态、会话状态、错误和生命周期变化。
-_避免_：回调、前端状态修改、会话日志
+**StateEvent**：
+Runtime向host发布的可靠、scope-local状态变化记录。Runtime scope使用RuntimeCursor，每个Session scope使用独立SessionCursor；已分配cursor的StateEvent不能静默丢弃，gap通过Snapshot恢复。Durable conversation fact必须从append/apply后的receipt派生。
+_避免_：ProgressEvent、SessionStorage entry副本、runtime-global sequence
 
-**事件消息（`agent_runtime_protocol::EventMsg`）**：
-运行时事件中的业务事实部分，例如 run started、tool call output delta 或 message tool result appended。外层 `agent_runtime_protocol::Event` 是 workspace/session/run/command 坐标以及顺序、关联和重连水位的唯一权威位置；`EventMsg` 不重复这些通用坐标，只保留 message/call/interaction 等局部对象 identity、transition operands 和业务数据。裸 `EventMsg` 不是可独立路由的完整事件。
-_避免_：chat message、UI 显示文案、前端状态对象
+**ProgressEvent**：
+模型文本/reasoning delta、Tool output和provider retry等高频observer update。不占用RuntimeCursor或SessionCursor，可以合并或丢弃；final StateEvent携带完整view进行校正。
+_避免_：durable message、terminal event、恢复水位
+
+**事件消息（`StateEventMsg` / `ProgressEventKind`）**：
+事件中的typed payload。外层event拥有scope cursor、route、timestamp和optional CommandId；payload不重复SessionId/TurnId/ItemId/RequestId等route坐标。Progress payload不能作为独立权威状态。
+_避免_：chat message、UI显示文案、前端store对象
 
 **事件族**：
-按公开生命周期对象划分的一组事件，例如 session、run、message、tool call、resources、compaction、retry 和 diagnostics。事件族用于命名和 reducer 分发，不等同于内部 Rust module。
-_避免_：文件名、模块名、UI 分组
+按公开生命周期对象划分的一组StateEvent或ProgressEvent，例如agent、session、turn、item、interaction、queue、usage和diagnostics。事件族用于wire命名和reducer分发，不等同于内部Rust module。
+_避免_：文件名、模块名、UI分组
 
 **事件类型名**：
-UI/wire 层识别事件种类的稳定名称，使用 flat `snake_case`，例如 `run_started`、`message_assistant_text_delta` 和 `tool_call_output_delta`。
+UI/wire层识别事件种类的稳定名称，使用flat `snake_case`，例如`turn_started`、`item_tool_invocation_completed`和`agent_message_delta`。
 _避免_：Rust enum variant、内部模块路径、显示文案
 
 **事件生命周期**：

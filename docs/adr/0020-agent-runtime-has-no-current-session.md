@@ -1,5 +1,9 @@
 # AgentRuntime 不拥有当前会话
 
+状态：部分被[ADR 0028](0028-runtime-protocol-uses-scoped-state-cursors.md)替代。Runtime没有current Session和所有session-scoped command显式携带SessionId的决策保留；runtime-global sequence与all-loaded atomic RuntimeSnapshot要求被scoped cursor/snapshot替代。
+
+> 以下正文保留原始历史决定。涉及RunId、SessionPhase、runtime-global sequence或all-loaded RuntimeSnapshot的内容不再指导实现；当前协议以ADR 0028和`docs/refactor/runtime-interface.md`为准。
+
 MiniCore 是不包含 UI selection 的 headless、多 session runtime。一个 runtime 可以同时加载多个 `SessionRuntime`，多个 session 也可以同时推进 run、compaction、retry 或 approval work。客户端当前显示、选中或准备向哪个 session 发送命令，是 adapter-local state，不是 runtime-global 领域事实。
 
 我们决定删除 core 的 focused/current/active session selector：公开协议不提供 `FocusSession` 或 `session_focus_changed`，`SessionManager` / `LoadedSessionRuntimes` 不保存 focused session pointer。所有 session-scoped command 必须显式携带 `SessionId`；`ExecuteCommandText.session_id = None` 只允许 runtime/workspace-scoped command，解析到 session-scoped command 时返回 `SessionRequired`，不能从唯一 loaded、最近 opened 或客户端 selection 推断目标。`AbortRun { run_id }` 继续通过 host-global current-run lookup 路由，是已经公开 run identity 的特例，不构成默认 session。
