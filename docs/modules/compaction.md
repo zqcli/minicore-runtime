@@ -10,7 +10,7 @@
 
 - 何时判断下一次模型请求需要压缩；
 - 如何选择需要摘要的连续prefix和原样保留的suffix；
-- UserMessage、完整ToolRound、final AssistantMessage和已有summary如何保持协议完整；
+- UserMessage、Assistant Continue、完整ToolRound、final AssistantMessage和已有summary如何保持协议完整；
 - 如何通过PromptSet和ModelGateway执行portable SummaryModel调用；
 - Compaction entry何时append/apply并触发conversation Replace；
 - 压缩后如何重建ConversationSeed和private AgentLoop；
@@ -39,7 +39,7 @@
 - 不在final response后执行post-turn compaction，也不提供standalone/manual compaction；
 - cut基于model-visible stable unit，不基于裸JSONL行；
 - summarized range是连续prefix，retained range是连续suffix；
-- cut不能拆分UserMessage、完整ToolRound、final AssistantMessage或Compaction summary；
+- cut不能拆分UserMessage、Assistant Continue、完整ToolRound、final AssistantMessage或Compaction summary；
 - active Turn initiating UserMessage及其后全部history hard-protected；
 - current Turn自身过大时返回`ProtectedSuffixTooLarge`，不使用split-turn summary；
 - rolling summary使用“previous summary + newly summarized units”生成一个portable summary；
@@ -197,6 +197,7 @@ Cut基于effective committed conversation order，不基于raw JSONL entry order
 ```rust
 pub(crate) enum StableConversationUnitKind {
     UserMessage,
+    AssistantContinue,
     CompleteToolRound,
     FinalAssistant,
     CompactionSummary,
@@ -216,6 +217,7 @@ pub(crate) struct StableConversationUnit {
 StableConversationUnit不是领域entity，不持久化，也没有UnitId。
 
 - `UserMessage`：一个Input或Steer UserMessage；不能拆分content或PromptContribution stamps。
+- `AssistantContinue`：一个无ToolCall、model-visible、non-terminal Assistant Intermediate response。
 - `CompleteToolRound`：Assistant(Intermediate)、ordered Tool messages和`tool_round_completed`；只有completion event已append/apply的round可见。
 - `FinalAssistant`：一个final AssistantMessage。
 - `CompactionSummary`：latest projection中的已有summary；下一次rolling compaction将它与新增旧历史合成一个新summary。
@@ -395,14 +397,14 @@ purpose由variant确定，不允许caller把Compaction source配成AgentRun purp
 CompactionSummary assembly包含：
 
 - Runtime required safety policy；
-- Compaction-specific system/developer instructions；
+- Compaction-specific System policy和User summary directive；
 - trusted prefix source converted by PromptSet；
 - previous rolling summary if part of source；
 - `OutputContract::NoToolCalls`；
 - empty ToolSpec list；
 - exact TurnModelFingerprint proof。
 
-不包含ordinary Agent/Session instructions、Workspace instructions、ToolPromptView、SkillCatalog metadata、arbitrary current-call contribution、queued Steer或uncommitted draft。这些Turn-static内容不会丢失，因为成功后下一次AgentRun assembly仍使用同一个PromptSet完整重建。
+不包含ordinary Agent/Session instructions、Workspace instructions、ToolPromptView、SkillView metadata、arbitrary current-call contribution、queued Steer或uncommitted draft。这些Turn-static内容不会丢失，因为成功后下一次AgentRun assembly仍使用同一个PromptSet完整重建。
 
 StoredCompaction进入conversation projection时生成typed CompactionSummary MessageRecord，PromptSet映射为user-role历史消息：
 
@@ -414,7 +416,7 @@ The conversation history before this point was compacted into the following summ
 </summary>
 ```
 
-它不是System/Developer instruction，也不允许summary内容改变Runtime policy。
+它不是System instruction，也不允许summary内容改变Runtime policy。
 
 ## Model Call
 
@@ -529,7 +531,7 @@ GenerateModelResponse returns ContextOverflow
 → start CompactConversation
 ```
 
-启动Compaction本身不推进`execution_version`，因此soft failure在没有control或conversation变化时仍可复用original request。成功append/apply Replace后才推进version。Cancel和revocation立即推进version并取消operation；Compacting期间到达的Steer只排队并使saved original request不再可发送，等Compaction结束且Steer UserMessage实际append/apply时才按Steer规则推进version。
+启动Compaction本身不推进`execution_version`，因此soft failure在没有control或conversation变化时仍可复用original request。成功append/apply Replace后才推进version。Cancel和revocation立即推进version并取消operation；Compacting期间到达的Steer只排队并使saved original request不再可发送，Steer UserMessage append/apply也不推进execution_version。
 
 同一个active Turn最多一个automatic overflow recovery；该turn-lifetime flag保存在`CurrentTurnExecution`，不保存在operation-local CurrentCompactionState。soft compaction不消耗allowance；provider或local hard overflow开始recovery时立即标记已使用，即使summary后续失败也不能开启第二次hard recovery。
 
@@ -615,7 +617,7 @@ StoredCompaction append/apply
 → rebuild ConversationSeed
 → rebuild private AgentLoop segment
 → phase = PreparingModel
-→ append queued Steer if any
+→ steer FIFO非空时pop_front一条并append/apply
 → assemble a new AgentRun ModelCallRequest
 → continue the same TurnExecutionContext
 ```
@@ -740,11 +742,11 @@ Agent instructions
 Session instructions
 Workspace instructions
 Tool definitions/guidelines
-SkillCatalog metadata
+SkillView metadata
 TurnModelSnapshot policy
 ```
 
-它们已经被active Turn的PromptSet/ToolSet/SkillCatalog固定，并在每次AgentRun assembly重新注入。把它们再摘要会造成重复、过时内容和summary劫持风险。
+它们已经被active Turn的PromptSet/ToolSet/SkillView固定，并在每次AgentRun assembly重新注入。把它们再摘要会造成重复、过时内容和summary劫持风险。
 
 ### Dynamic Contributions
 
@@ -752,7 +754,7 @@ TurnModelSnapshot policy
 
 ### Exact Resume Limitation
 
-如果历史只保存definition identity而没有保存可重新解析的exact content，Compaction不能补偿该缺口。exact cold resume仍依赖Prompt/Tool/Skill definition identity和content persistence contract，而不是summary复制静态instructions。
+Compaction不能补偿缺失的Prompt或Tool recovery material。same-Turn cold resume仍依赖Prompt和Tool execution basis可重建；已经committed的Skill正文属于conversation fact，未committed Skill不由summary保存或恢复。
 
 ## Recovery
 
@@ -827,7 +829,7 @@ Session usage由assistant entries和`StoredCompaction.model_call` replay重建�
 ## Security
 
 - summary source只来自CommittedConversationPrefixView；
-- 历史中的prompt injection只是待摘要data，不获得system/developer authority；
+- 历史中的prompt injection只是待摘要data，不获得System authority；
 - PromptSet不能把summary text插入Runtime instruction section；
 - secret redaction在写StoredCompaction前执行；
 - provider raw error/body不进入summary或JSONL；

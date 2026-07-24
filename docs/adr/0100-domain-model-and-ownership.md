@@ -13,17 +13,17 @@ MiniCore 作为可嵌入的原生 Agent harness runtime core，需要一套稳�
 
 - **固定领域层级与基数**：`MiniCoreRuntime → Agent* → Session* → Turn* → Item* → Interaction*`，每层 1─N。`MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面。
 - **Agent 与 Session 的引用关系**：一个 Agent 可被多个 Session 引用，一个 Session 只对应一个 AgentId；Session 创建时 pin 当时的 current `AgentRevision`，Agent 后续发布新 revision 不自动改变已有 Session，只能通过新 `SessionDefinitionRevision` 显式升级。
-- **Runtime 持有三个长生命周期深模块**：`PromptService`、`ToolService`、`SkillService` 在 Runtime 生命周期内长期存在；Turn 执行边界从中产生独立、不可变的有效执行对象（`PromptSet` / `ToolSet` / `SkillCatalog` / `LoadedSkill`），执行对象不回写 Service。
+- **Runtime 持有三个长生命周期深模块**：`PromptService`、`ToolService`、`SkillService` 在 Runtime 生命周期内长期存在；Turn执行边界从中捕获或产生独立、不可变的有效执行对象（`PromptResourceView` / `PromptSet` / `ToolSet` / `SkillView` / `LoadedSkill`），执行对象不回写 Service。
 - **Prompt / Tool / Skill 是独立概念，不合并为通用 `Resource`**：三者有各自的定义、Set、授权与 lifecycle，由各自子系统治理；不引入统一 `ResourceManager` 或 per-cwd resource snapshot。详见 [ADR 0102](0102-prompt-tool-skill-are-distinct-subsystems.md)。
 - **Workspace 属于 Session**：以 `SessionDefinition.workspace` 形式归 Session 所有，不属于 Agent 或 Turn，也不是独立 entity 或 Runtime-global registry。详见 [ADR 0101](0101-workspace-ownership.md)。
-- **一个事实来源原则**：同一份领域事实只有一个权威 owner——conversation durable truth 属于 SessionStorage、Agent definition 属于 Agent owner、Workspace definition 属于 Session、Prompt/Tool/Skill 定义与 Set 属于各自子系统、最终模型可见上下文属于 PromptSet、provider encoding 与调用属于 ModelGateway。durable lifecycle 与 loaded execution state 分离；内存 projection、cache、snapshot、UI read model 只能由权威事实派生，不能成为并列 source of truth。
-- **Turn 领域对象不持有执行期对象**：领域 Turn 不内联 PromptSet、ToolSet、SkillCatalog、Agent identity 或 Workspace，也不内联 `Vec<Item>`；这些执行期对象由 Turn 执行上下文（`TurnExecutionContext`）在 admission 时 pin，exact references 保存在 initiating UserMessage 引用的 `TurnContext` storage entry；Item 顺序由 SessionStorage projection 提供。Turn execution 是领域 Turn 外围的执行过程，不新增领域层级。
+- **一个事实来源原则**：同一份领域事实只有一个权威 owner——conversation durable truth 属于 SessionStorage、Agent definition 属于 Agent owner、Workspace definition 属于 Session、PromptResourceView、Tool definitions/ToolSet和SkillView属于各自子系统、最终模型可见上下文属于 PromptSet、provider encoding 与调用属于 ModelGateway。durable lifecycle 与 loaded execution state 分离；内存 projection、cache、snapshot、UI read model 只能由权威事实派生，不能成为并列 source of truth。
+- **Turn 领域对象不持有执行期对象**：领域Turn不内联PromptSet、ToolSet、SkillView、Agent identity或Workspace，也不内联`Vec<Item>`；这些执行期对象由TurnExecutionContext在admission时capture，fingerprints和必要references保存在initiating UserMessage引用的`TurnContext` storage entry；Item 顺序由 SessionStorage projection 提供。Turn execution 是领域 Turn 外围的执行过程，不新增领域层级。
 
 ## 后果
 
 - 领域层级冻结后，下属专项 ADR 与模块文档只需在既定 ownership 内细化，不会重新协商顶层归属；边界收敛可在单一模块内验证。
 - 一个事实来源原则让恢复与 reload 变得确定：重启后所有 Session 视为 Unloaded，所有 projection/cache 从 durable truth 重建，不存在需要对账的并列真相。
-- 拒绝通用 `Resource` 合并的代价是三个子系统各自维护定义、授权与 Set 类型层次，换取的是 Prompt/Tool/Skill 各自的授权硬边界不互相污染。
+- 拒绝通用`Resource`合并的代价是三个子系统各自维护必要的定义、view、授权和有效对象，换取的是 Prompt/Tool/Skill 各自的授权硬边界不互相污染。
 - Turn 领域对象与执行期对象分离带来 pin/fingerprint/reload 线性化的排序复杂度，但换取领域 Turn 的可持久化与可观察性不依赖任何执行期句柄。
 - 未来能力（worktree、remote execution 等）应建立各自深模块并由既有 owner 引用其输出，不得塞回领域 entity 或复活通用 Resource。
 

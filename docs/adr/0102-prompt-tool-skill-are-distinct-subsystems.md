@@ -12,19 +12,19 @@
 ## 决策
 
 - **三者是独立深模块，不合并为通用 Resource**：Prompt、Tool、Skill 各自封装其发现、解析、缓存、失效与投影；不建立 `Resource`/`ResourceManager` 通用外壳，因为通用层无法承载 executor 绑定、权限授权与正文懒加载等各自独有的深职责。
-- **不建立 Runtime/Agent/Session/Turn 领域分层**：不引入 `RuntimeTools/AgentTools/SessionTools/TurnTools` 等按领域层复制的对象；Runtime、Agent、Session 只作为配置 scope，领域 Turn 对象不持有 PromptSet、ToolSet、SkillCatalog 或任何三者的字段。
+- **不建立Runtime/Agent/Session/Turn领域分层**：不引入按领域层复制的Prompt/Tool/Skill对象；Agent和Session只保存PromptId selection，领域Turn对象不持有PromptSet、ToolSet、SkillView或任何三者的字段。
 - **各由 MiniCoreRuntime 初始化一个 `Arc<Service>`**：`MiniCoreRuntime` 创建并拥有 `Arc<PromptService>`、`Arc<ToolService>`、`Arc<SkillService>` 三个长生命周期 Service；durable Session/SessionDefinition 不持有 Service handle，也不复制 definitions 或正文。
-- **Turn 边界产出不可变有效对象**：candidate Turn admission 期间、第一次模型调用前，Session execution 分别取得本 Turn 的不可变快照——`PromptSet`、`ToolSet`、pinned `SkillCatalog`（及按需得到的 `LoadedSkill`）；同一 Turn 内所有模型/Tool 循环复用同一组快照，Service 不创建 Turn、不改 TurnStatus。
-- **Prompt 是唯一模型可见上下文组装 seam**：`MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()`；`AssembledModelContext` 是进入 ModelGateway 的唯一 provider-neutral Prompt 输出。PromptService 只消费窄只读 view `ToolPromptView` / `SkillCatalogView`，不接收 ToolService、ToolSet、SkillService 或完整 SkillCatalog handle，也不主动调用它们。
+- **Turn边界产出或捕获不可变有效对象**：candidate Turn admission期间、第一次模型调用前，Session execution取得`PromptResourceView`、`PromptSet`、`ToolSet`和`SkillView`（及按需得到的`LoadedSkill`）；同一Turn内所有模型/Tool循环复用同一组对象，Service不创建Turn、不改TurnStatus。
+- **Prompt是唯一模型可见上下文组装seam**：`MessageRecord → ModelMessage`的唯一转换发生在`PromptSet::assemble()`；`AssembledModelContext`是进入ModelGateway的唯一provider-neutral Prompt输出。PromptService只消费`PromptResourceView`、`ToolPromptView`和`SkillPromptView`，不接收ToolService、ToolSet、SkillService或完整SkillView handle，也不主动调用它们。
 - **ToolSet 原子绑定模型可见 ToolSpec 与 executor route**：Tool 定义与真实 executor 原子注册，ToolSet 在同一快照内同时保存模型披露 ToolSpec 与 `ToolName → Arc<dyn Tool>` route，使模型所见 schema 与 ToolCall 实际解析到的 executor 必然同源；注册全集、模型披露集、已授权执行集是三个不同集合。
-- **SkillCatalog 与 LoadedSkill 分离、正文按需加载**：Catalog 是轻量可重建的 metadata 快照，不含正文；完整正文只在 `SkillService::load()` 用 pinned `SkillCatalogEntryRef` 精确加载；`SkillInjector` 只把已加载 Skill 转成 `PromptContribution`，交由 PromptSet 规范化进 committed MessageRecord。
+- **SkillView与LoadedSkill分离、正文按需加载**：SkillView是轻量可重建的metadata view，不含正文；current view只在显式reload成功后原子替换。完整正文由`SkillService::load()`按captured entry读取；`SkillInjector`只把已加载Skill转成`PromptContribution`，交由PromptSet规范化进committed MessageRecord。
 
 ## 后果
 
 - 每个模块的价值来自它独有的深职责，deletion test 成立：删除任一模块都会把 executor 绑定、权限授权、协议组装或正文懒加载的复杂性重新散落到 Session execution；而合并三者只会得到无法承载这些职责的浅交集。
-- cross-binding 通过 fingerprint 收敛：PromptSet 创建时固定 `ToolPromptView.tool_set_fingerprint` 与 `SkillCatalogView` fingerprint，assembly 不接受任意替代 view，模型披露与 executor route、Catalog identity 的一致性可在单点验证。
+- cross-binding通过fingerprint收敛：PromptSet创建时固定PromptResourceView、`ToolPromptView.tool_set_fingerprint`与SkillPromptView fingerprint，assembly不接受任意替代view。
 - 依赖方向单一：Prompt 依赖 Tool/Skill 的窄 view，而非反向；三个 Service 之间无相互调用，Session execution 作为编排者按序取 view、组装、执行。
-- 代价是引入 view 投影、fingerprint cross-binding 与 pinned entry 校验等额外类型层次，以及“注册/披露/授权”“Catalog/LoadedSkill”“scope/role”多组分离带来的概念开销。
+- 代价只保留必要的view投影和fingerprint cross-binding；不再引入Prompt多层override或Skill Catalog revision/exact hash恢复协议。
 - 未来的动态 Context provider、Prompt hook、远程 source、插件协议应作为各自模块的 source adapter 接入，其输出必须经过同一 append/apply 与 conversation projection 规则，不得恢复 current-call 组装旁路，也不得据此重新引入通用 Resource 或领域分层。
 
 ## 历史

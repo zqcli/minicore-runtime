@@ -119,7 +119,7 @@ Runtime内部Session durable owner维护的轻量清单或可重建索引，用�
 _避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、第二durable truth
 
 **会话条目（`StoredSessionEntry`）**：
-会话中的一条不可变追加记录。条目通过 `entry_id` 和 `parent_id` 连接成树，并带有 entry-scoped `operation_key`；顶层 body 固定为 `TurnContext`、`Message`、`Event` 或 `Compaction`。Message 使用 `user | assistant | tool` role；usage 和 finalized provider response metadata 随 assistant entry 保存。
+会话中的一条不可变追加记录。条目通过`entry_id`和`parent_id`连接成树；顶层body固定为`TurnContext`、`Message`、`Event`或`Compaction`。Message使用`user | assistant | tool` role；usage和finalized provider response metadata随assistant entry保存。
 _避免_：业务 batch、公开 RuntimeEvent 副本、数据库行
 
 **会话树**：
@@ -163,19 +163,19 @@ _避免_：会话存储、会话目录、独立会话运行时注册表、UI sel
 _避免_：会话管理器、会话运行时、聊天状态、第二 durable event log
 
 **技能**：
-由SkillDefinition描述、通过SkillService发现和加载的Markdown指令包。Turn admission pin SkillCatalog及exact SkillCatalogEntryRef；显式调用时TurnExecutionContext按exact reference加载正文，经SkillInjector产生PromptContribution，再由PromptSet规范化为UserMessage。
-_避免_：提示词片段、插件、工具、按current文件路径漂移加载
+通过SkillService发现和加载的Markdown指令包。Turn admission捕获current SkillView；显式调用时TurnExecutionContext按captured entry加载正文，经SkillInjector产生PromptContribution，再由PromptSet规范化为UserMessage。
+_避免_：提示词片段、插件、工具、独立版本实体
 
 **技能模块（`SkillService`）**：
-MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validation、catalog publication、exact-reference load、content cache和diagnostics。它不构造最终UserMessage、不拥有Workspace lifecycle，也不调用模型。
+MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validation、SkillView publication/reload、lazy load、content cache和diagnostics。它不构造最终UserMessage、不拥有Workspace lifecycle，也不调用模型。
 _避免_：skills.rs helper集合、UI解析器、Prompt manager、Tool registry
 
-**技能目录（`SkillCatalog`）**：
-SkillService发布的immutable catalog。TurnExecutionContext pin exact catalog、fingerprint和Workspace authorization context；future reload不改变active Turn，lazy load必须按pinned entry version/content hash解析。
-_避免_：current磁盘目录、命令列表、mutable global catalog
+**技能视图（`SkillView`）**：
+SkillService按context发布的immutable metadata view。显式reload成功后原子替换current view；TurnExecutionContext捕获view和Workspace authorization context，future reload不改变active Turn。
+_避免_：current磁盘目录、命令列表、mutable global catalog、durable Skill revision
 
 **技能调用**：
-用户显式Skill intent先解析为PromptIntent；TurnExecutionContext使用pinned SkillCatalogEntryRef调用SkillService::load，经SkillInjector形成typed PromptContribution，再由PromptSet.compose_user_message生成CanonicalUserMessage并append。模型触发的Skill能力走ToolResult路径。
+用户显式Skill intent先解析为PromptIntent；TurnExecutionContext使用captured SkillEntry调用SkillService::load，经SkillInjector形成typed PromptContribution，再由PromptSet.compose_user_message生成CanonicalUserMessage并append。模型触发的Skill能力走ToolResult路径。
 _避免_：系统提示词旁路、按metadata path重读、未committed current-call contribution
 
 **运行时资源（pre-refactor aggregate term）**：
@@ -203,7 +203,7 @@ MiniCoreRuntime-owned `PromptService`和Turn-pinned `PromptSet`组成的模型�
 _避免_：PromptManager、ContextManager、ModelGateway内拼接messages
 
 **Turn提示词集合（`PromptSet`）**：
-SessionExecutor在Turn admission期间通过PromptService构造的不可变提示词集合，绑定exact Runtime/Agent/Session prompts、Workspace contribution、SkillCatalog prompt view和同一ToolSet的ToolPromptView。active Turn内的Submit composition、Steer和每次Model context assembly都复用该PromptSet。
+SessionExecutor在Turn admission期间通过PromptService构造的不可变提示词集合，绑定captured PromptResourceView、Agent/Session PromptId selection、Workspace User context、SkillPromptView和同一ToolSet的ToolPromptView。active Turn内的Submit composition、Steer和每次Model context assembly都复用该PromptSet。
 _避免_：长期PromptManager、current Session prompt、模型request、Tool executor
 
 **Turn工具集合（`ToolSet`）**：
@@ -215,7 +215,7 @@ _避免_：session-scoped Tools副本、独立prompt/executor getter、UI工具�
 _避免_：provider payload hash、Session revision、Tool executor identity替代品
 
 **上下文素材（`ContextMaterial`）**：
-由 RAG、memory、IDE、issue lookup 或后期 hook 等动态来源成功提供的 typed 模型上下文，带稳定来源、content hash、`CurrentRun | CurrentCall` 生命周期和 required/optional 要求。需要 durable 的内容必须先由其 owner 转换并提交为 canonical session message；项目文件、技能和提示模板不能绕过 `ResourceManager` 伪装成动态素材。
+由RAG、memory、IDE、issue lookup或后期hook等动态来源成功提供的typed模型上下文，带稳定来源、生命周期和required/optional要求。需要durable的内容必须先由其owner转换并提交为canonical session message；项目文件、技能和提示模板不能绕过PromptSet与append/apply伪装成动态素材。
 _避免_：资源快照、无来源字符串、会话历史、系统提示词
 
 **上下文素材贡献（`ContextMaterialContribution`）**：
@@ -223,7 +223,7 @@ _避免_：资源快照、无来源字符串、会话历史、系统提示词
 _避免_：Option<ContextMaterial>、静默跳过、provider future、原始 I/O error
 
 **组装后的模型上下文（`AssembledModelContext`）**：
-PromptSet在一次模型调用前生成的最终provider-neutral模型可见上下文，包含ordered System/Developer ModelInstruction、协议安全ModelMessage、ToolSpec、OutputContract、贡献来源、diagnostics和fingerprint。它由`PromptSet.assemble(...)`从committed conversation和purpose组装，是ModelCallRequest唯一的model-visible input。
+PromptSet在一次模型调用前生成的最终provider-neutral模型可见上下文，包含ordered System sections、前置User context与协议安全conversation messages、ToolSpec、OutputContract、贡献来源、diagnostics和fingerprint。它由`PromptSet.assemble(...)`从committed conversation和purpose组装，是ModelCallRequest唯一的model-visible input。
 _避免_：provider payload、Turn state、session message vector、Gateway内重新组装
 
 **输出契约（`OutputContract`）**：
@@ -310,8 +310,12 @@ _避免_：QueuedMessage、PromptIntent、committed user message、runtime event
 由 prompt、continuation、排队的 steering message、排队的 follow-up 或 retry 触发的一次 Agent loop 执行。一次运行可以包含多个模型回合和多个工具执行。
 _避免_：响应、请求、chat completion
 
+**排队消息（`QueuedMessage`）**：
+Steer/FollowUp FIFO中的process-local数据值，包含原CommandId和PromptIntent。SessionExecutor直接持有`VecDeque<QueuedMessage>`；不建立PendingMessageQueue service/wrapper。Steer在完整assistant/tool step后、下一次Model前pop一条；FollowUp在Turn terminal后pop一条。仍在队列中的消息可以remove，撤销后不重新入队；append后的UserMessage已是durable fact。
+_避免_：durable entry、Queue entity、priority queue、batch drain mode、PromptSet临时输入
+
 **异步操作（`RunningOperation`）**：
-SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。它只接收不可变输入并返回`OperationResult`；不能拥有SessionWriter、projections、request queues或Turn terminal state。
+SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。每个Session最多一个current operation；主循环同时poll它和request queue，旧operation terminal/remove或安全drop前不启动下一operation。它只接收不可变输入并返回`OperationResult`，不能拥有SessionWriter、projections、request queues或Turn terminal state。
 _避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owner
 
 **提交标识（`SubmissionId`）**：
@@ -335,7 +339,7 @@ _避免_：SessionExecutor mutable state、durable TurnStatus替代品、公开R
 _避免_：WaitingApproval、UI selection、跨进程恢复旧Model/Tool operation
 
 **Turn执行上下文（`TurnExecutionContext`）**：
-SessionExecutor在Turn admission期间构造的不可变execution binding，pin exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog和TurnModelSnapshot。active Turn内的retry、Steer和model→tool→model循环复用该Context；FollowUp创建新Turn并重新capture。
+SessionExecutor在Turn admission期间构造的不可变execution binding，固定exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、captured SkillView和TurnModelSnapshot。active Turn内的retry、Steer和model→tool→model循环复用该Context；FollowUp创建新Turn并重新capture。
 _避免_：模型request、ResourceManager current view、公开协议snapshot、mutable Turn state
 
 **DriverTurnInput（pre-refactor adapter term）**：
@@ -347,7 +351,7 @@ Turn execution内部的private协议适配层，负责在`NeedModel | NeedTools 
 _避免_：会话状态owner、工具注册表、UI loop、第二conversation
 
 **异步操作结果（`OperationResult`）**：
-Context、Model、Tool或Compaction操作返回给SessionExecutor的typed result，携带`SessionId`、`TurnId`、`execution_version`和`OperationType`。只有SessionExecutor验证身份和版本后才能应用结果。
+current Context、Model、Tool或Compaction operation返回给SessionExecutor的typed result，携带`SessionId`、`TurnId`、`execution_version`和`OperationType`。SessionExecutor不detach可迟到的本地future；logical retry只在旧operation terminal/remove后启动。execution_version验证conversation/control basis，不充当retry attempt编号。
 _避免_：durable entry、Runtime event、直接Session mutation
 
 **工具执行控制（`ToolExecutionControl`）**：
@@ -500,7 +504,7 @@ _避免_：前端 store、流程图、内部实现步骤
 _避免_：事件发布器、业务调度器、UI保存状态、通用数据库事务管理器
 
 **会话条目草稿（`SessionEntryDraft`）**：
-一次明确的entry append intent，包含expected parent、稳定operation key和typed body。相同operation key与相同normalized payload幂等返回原receipt；不同payload冲突。多个entries之间的业务完整性由Session execution的sequential `append → apply → dependent action`编排和cross-entry validation保证，不伪装成物理batch。
+一次明确的entry append intent，包含expected current entry、parent和typed body。多个entries之间的业务完整性由Session execution的sequential `append → apply → dependent action`编排和cross-entry validation保证，不伪装成物理batch。
 _避免_：CurrentRun snapshot、事件批次、模型请求batch、`SessionWriteBatch`
 
 **模型提供方客户端**：

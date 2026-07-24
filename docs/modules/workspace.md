@@ -593,7 +593,7 @@ impl WorkspaceSkillContext {
 
 SkillService 只能在这些 source roots 内发现和读取 Workspace Skill。
 
-Catalog entry 必须记录精确 source identity 和 content identity。后续 lazy load 必须使用 pinned Catalog entry 与本 Turn 的 WorkspaceSkillContext，不能通过 `skill_id + current Session Workspace` 重新解析新 source。
+SkillEntry记录source identity和location。后续lazy load使用本Turn captured SkillView entry与WorkspaceSkillContext，不能通过`skill_id + current Session Workspace`重新解析reload后的view；实际读取前仍须校验authorization lease和source stamp。
 
 ### WorkspaceAccessView
 
@@ -841,28 +841,29 @@ let workspace = session
 
 ```text
 exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
-+ AgentPrompts + SessionPrompts + TurnModelSnapshot
++ AgentPromptSelection + SessionPromptSelection + TurnModelSnapshot
 + Arc<WorkspaceSnapshot>
-├─ SkillService::catalog(SkillCatalogContext {
+├─ SkillService::current_view(SkillViewContext {
 │    agent, session_id, session_revision, workspace: workspace.skill_context()
-│  }) → SkillCatalog
+│  }) → SkillView
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
      provider: model.capabilities(), execution_control, cancellation, progress_events
    }) → ToolSet
 
-SkillCatalog.prompt_view()
+PromptService.current_view()
++ SkillView.prompt_view()
 + ToolSet.prompt_view()
 + workspace.prompt_context()
-+ exact AgentPrompts / SessionPrompts
++ exact AgentPromptSelection / SessionPromptSelection
 + TurnModelSnapshot
 → PromptService::for_turn(...)
 → PromptSet
 → TurnExecutionContext
 ```
 
-SkillCatalog 与 ToolSet 没有直接依赖，可以并行捕获；PromptSet 必须最后创建并绑定二者的精确 fingerprint。
+SkillView与ToolSet没有直接依赖，可以并行捕获；PromptSet在PromptResourceView、SkillPromptView和ToolPromptView就绪后创建并绑定对应fingerprint。
 
 ```rust
 pub(crate) struct TurnExecutionContext {
@@ -872,8 +873,8 @@ pub(crate) struct TurnExecutionContext {
     model: TurnModelSnapshot,
     workspace: Arc<WorkspaceSnapshot>,
     skill_service: Arc<SkillService>,
-    skill_context: SkillCatalogContext,
-    skill_catalog: Arc<SkillCatalog>,
+    skill_context: SkillViewContext,
+    skill_view: Arc<SkillView>,
     tool_set: ToolSet,
     prompt_set: PromptSet,
     fingerprint: ExecutionContextFingerprint,
@@ -881,7 +882,7 @@ pub(crate) struct TurnExecutionContext {
 }
 ```
 
-字段保持私有，避免不同 Turn 的 Workspace、Catalog、ToolSet 和 PromptSet 被交叉组合。完整 capture、逻辑模型调用、AgentLoop 和 recovery 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
+字段保持私有，避免不同Turn的Workspace、SkillView、ToolSet和PromptSet被交叉组合。完整 capture、逻辑模型调用、AgentLoop 和 recovery 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
 Turn 领域对象仍不持有 Workspace。只有 Turn execution context pin Snapshot。
 
@@ -916,7 +917,7 @@ cwd 变化
 - active Turn 继续使用旧 Snapshot 和由其派生的同一个 TurnExecutionContext；
 - future Turn admission 捕获新 Snapshot 并创建新 Context；
 - permissive update 不扩大 active Turn 权限；
-- active Turn 不原地重建 PromptSet、ToolSet、SkillCatalog 或模型调用 baseline。
+- active Turn不原地重建PromptSet、ToolSet、SkillView或模型调用baseline。
 
 ### Security-Restricting Update
 
@@ -1143,9 +1144,8 @@ Workspace 只授权 source，不解析 Prompt。
 SkillService 消费 `WorkspaceSkillContext`，负责：
 
 - Skill-specific discovery；
-- Catalog；
+- SkillView publication；
 - metadata conflict；
-- exact content identity；
 - lazy load；
 - content cache。
 
@@ -1172,7 +1172,7 @@ Session conversation
 Turn / Item / Interaction
 PromptDefinition / PromptSet
 ToolRegistry / ToolSet / Tool executor
-SkillCatalog / LoadedSkill
+SkillView / LoadedSkill
 Model / provider / credentials
 network / process / environment policy
 Tool approval / Tool grant
@@ -1212,7 +1212,7 @@ upload / telemetry
 
 ### active Turn 在 reload 后原地替换 Workspace view
 
-否决原因：会造成 PromptSet、ToolSet、SkillCatalog 和 lazy-loaded Skill 来自不同 Workspace revision。
+否决原因：会造成PromptSet、ToolSet、SkillView和lazy-loaded Skill来自不同Workspace authorization basis。
 
 ## 基础不变量
 
@@ -1260,7 +1260,7 @@ upload / telemetry
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
 - Workspace Prompt cache/fingerprint 覆盖 source stamp，revocation 后不复用旧 hidden instructions；
 - Workspace Skill adapter 的 discover/read 只能使用 pinned WorkspaceSkillContext；
-- SkillContributionRef 将 Catalog entry、LoadedSkill、SkillInjection 和 Prompt fingerprint 绑定为同一 identity；
+- captured SkillView entry、LoadedSkill、SkillInjection和committed contribution stamp使用同一SkillId/source stamp；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；

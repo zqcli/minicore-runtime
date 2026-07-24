@@ -310,11 +310,11 @@ pub enum SessionCommand {
 }
 ```
 
-`SessionDefinitionPatch`原子修改 Workspace、SessionModelConfig 或 SessionPrompts，并生成新的 `SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。
+`SessionDefinitionPatch`原子修改Workspace、SessionModelConfig或SessionPromptSelection，并生成新的`SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。
 
 `Create` 只接受 `agent_id`：Runtime 在创建的 Agent lifecycle synchronization 内读取该 Agent 当时的 current revision，并把它作为 exact `AgentRevisionRef` 钉进 `SessionDefinition`。调用方不在 create 时报 revision——「用哪一版」由 Runtime 在此刻快照 current 决定，之后 Agent 再发布新 revision 不会改变该 Session（snapshot-current）。
 
-`UpgradeAgentRevision.target` 为 `Option`：缺省（`None`）表示「重新钉到该 Agent 当前 current」（显式 reload 升级），是常规路径；给出 exact `AgentRevisionRef` 表示钉到指定版本（可用于钉旧版或回滚）。两种情况都在 gates 内校验 target 属于同一 AgentId、Agent 为 Enabled、target definition 存在，并原子解析为 exact ref 后写入新的 `SessionDefinitionRevision`；`latest` 本身不进入 durable `SessionDefinition`。保持 exact pin 让同一 Session 在两次 upgrade 之间上下文稳定，最大化 prompt cache 前缀命中。
+`UpgradeAgentRevision.target` 为 `Option`：缺省（`None`）表示「重新钉到该 Agent 当前 current」（显式 reload 升级），是常规路径；给出 exact `AgentRevisionRef` 表示钉到指定版本（可用于钉旧版或回滚）。两种情况都在 gates 内校验 target 属于同一 AgentId、Agent 为 Enabled、target definition 存在，并原子解析为 exact ref 后写入新的 `SessionDefinitionRevision`；`latest` 本身不进入 durable `SessionDefinition`。保持exact pin让同一Session在两次upgrade之间的Agent selection、Workspace和Model配置稳定；显式Prompt resource reload仍只影响future Turn。
 
 同一Session不提供原地history checkout。创建历史分支使用`Fork`，得到新的SessionId和独立definition revision序列。
 
@@ -368,6 +368,10 @@ pub enum TurnCommand {
         session_id: SessionId,
         intent: PromptIntentInput,
     },
+    CancelQueuedMessage {
+        session_id: SessionId,
+        target_command_id: CommandId,
+    },
     Cancel {
         session_id: SessionId,
         target: PublicCancelTarget,
@@ -384,8 +388,9 @@ pub enum PublicCancelTarget {
 语义：
 
 - `Submit`只在Session可以admit新Turn时使用；initiating UserMessage append/apply后返回`TurnStarted`；
-- `Steer`只作用于expected Running Turn；返回`Applied`或`Queued`；
+- `Steer`只作用于expected Running Turn；成功进入普通FIFO后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
+- `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
 - `Cancel(SubmissionId)`允许取消尚处于Starting admission的Submit；
 - `Cancel(TurnId)`在terminal cleanup完成后返回；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
@@ -480,13 +485,11 @@ pub enum CommandOutcome {
     TurnStarted {
         turn_id: TurnId,
     },
-    SteerApplied {
-        turn_id: TurnId,
-    },
     SteerQueued {
         turn_id: TurnId,
     },
     FollowUpQueued,
+    QueuedMessageCancelled,
     InteractionResolved,
     Cancelled,
     CommandOutput,
@@ -498,7 +501,7 @@ Command response不是完整业务完成流：
 
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `SteerQueued`和`FollowUpQueued`不承诺crash-safe delivery；
+- `SteerQueued`和`FollowUpQueued`只表示对应`VecDeque<QueuedMessage>`已接收，不承诺crash-safe delivery；真正append通过普通UserMessage/Turn StateEvent观察；
 - Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
 - Session/Agent事实变化同时发布StateEvent，让其他subscriber失效或更新read model。
@@ -514,9 +517,9 @@ Command response不是完整业务完成流：
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Unload Session | SessionExecutor进入Idle并从loaded map移除 |
 | Submit | initiating UserMessage append/apply |
-| Steer Applied | Steer UserMessage append/apply |
 | Steer Queued | pending Steer FIFO admission |
 | FollowUp | FollowUp FIFO admission |
+| CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved append/apply |
 | Cancel Submission | Starting candidate取消完成，且不会创建领域Turn |
 | Cancel Turn | Turn terminal append/apply与cleanup完成 |
@@ -548,6 +551,7 @@ SessionNotLoaded
 SessionNotReady
 SessionBusy
 RequestQueueFull
+QueuedMessageNotQueued
 ExpectedTurnMismatch
 TurnNotRunning
 TurnTerminal
@@ -1141,7 +1145,8 @@ CLI / TUI / Tauri backend
 → SessionExecutor reserves candidate Turn
 → WorkspaceResolver.resolve()
 → ModelGateway.resolve_for_turn()
-→ SkillService.catalog()
+→ PromptService.current_view()
+→ SkillService.current_view()
 → ToolService.for_turn()
 → PromptService.for_turn()
 → TurnExecutionContext
@@ -1280,7 +1285,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 
 - API key、OAuth token、auth header；
 - provider endpoint secret和raw response body；
-- PromptSet完整system/developer instructions；
+- PromptSet完整System sections和前置User context；
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
 - Workspace authorization lease；
@@ -1305,7 +1310,7 @@ AgentLoop
 TurnExecutionContext
 PromptService / PromptSet
 ToolService / ToolSet
-SkillService / SkillCatalog / LoadedSkill
+SkillService / SkillView / LoadedSkill
 WorkspaceSnapshot / authorization lease
 ModelGateway / TurnModelSnapshot private execution ref
 ProviderAdapter / AuthStore
@@ -1349,7 +1354,7 @@ Public interface是 contract test surface。
 - Agent/Session revision CAS；
 - Submit只在UserMessage append/apply后返回TurnStarted；
 - Cancel(SubmissionId)关闭Starting admission；
-- Steer expected TurnId与Applied/Queued；
+- Steer expected TurnId与FIFO Queued；CancelQueuedMessage remove/NotQueued；
 - FollowUp bounded queue和restart loss；
 - Interaction first committed resolution wins；
 - Fork Before/After Item anchor；
@@ -1407,7 +1412,7 @@ Public interface是 contract test surface。
 
 优点：dispatch实现简单。
 
-缺点：调用方无法知道revision、TurnId、Applied/Queued或Interaction resolution outcome；需要额外event猜测command结果。
+缺点：调用方无法知道revision、TurnId、Queued或Interaction resolution outcome；需要额外event猜测command结果。
 
 结论：不采用。返回typed CommandOutcome。
 

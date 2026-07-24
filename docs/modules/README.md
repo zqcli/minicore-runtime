@@ -15,20 +15,20 @@ MiniCoreRuntime
             └─ Interaction*
 ```
 
-`MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面，并在 Runtime 生命周期内拥有三个长生命周期深模块 `PromptService`、`ToolService`、`SkillService`。Turn 执行边界产生独立不可变的有效执行对象（`PromptSet` / `ToolSet` / `SkillCatalog`）。领域基础模型见 [MiniCore 架构](../architecture.md)。
+`MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面，并在 Runtime 生命周期内拥有三个长生命周期深模块 `PromptService`、`ToolService`、`SkillService`。Turn执行边界捕获或产生独立不可变的有效对象（`PromptSet` / `ToolSet` / `SkillView`）。领域基础模型见 [MiniCore 架构](../architecture.md)。
 
 ## 模块索引
 
 - [Runtime 公开协议](runtime-interface.md)：`MiniCoreRuntime` 的 `dispatch / query / snapshot / subscribe` 四类能力、公开领域 identity、scoped cursor/snapshot 和协议边界。
 - [Agent 与 Session 生命周期](agent-session-lifecycle.md)：Agent 定义与 `AgentRevision`、Session 定义与 `SessionDefinitionRevision`、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 的分离。
 - [Workspace](workspace.md)：Session-owned Workspace definition、roots/cwd 合法域、trust 与 source authorization、filesystem capability，以及 Prompt/Tool/Skill 消费的窄只读 view。
-- [Prompt](prompt.md)：`PromptService`、Turn-pinned `PromptSet`、`compose_user_message` 产出 `CanonicalUserMessage`、`assemble(...) -> AssembledModelContext`——模型可见上下文组装的唯一 seam。
-- [Skills](skills.md)：`SkillService`、`SkillCatalog` 与 `LoadedSkill` 分离、discovery/解析/校验、pinned entry 与按需加载正文。
+- [Prompt](prompt.md)：`PromptService`共享`PromptResourceView`，各Turn独立构建`PromptSet`；`compose_user_message`产出`CanonicalUserMessage`，`assemble(...) -> AssembledModelContext`是模型可见上下文组装的唯一seam。
+- [Skills](skills.md)：`SkillService`发布reloadable `SkillView`，与`LoadedSkill`分离；metadata discovery和正文按需加载。
 - [Tools](tools.md)：`ToolService` 通过 `for_turn(...) -> ToolSet` 原子绑定模型可见 ToolSpec 与 executor route；registry、policy、approval、grants、sandbox、mutation lock 与 executor。
 - [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、fingerprint、reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
-- [Session 执行](session-execution.md)：一个 loaded Session 一个 `SessionExecutor`、bounded `SessionRequestQueue`、cancellable `RunningOperation`、AgentLoop `NeedModel | NeedTools | Finished`、multi-session 并发与资源锁。
+- [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、bounded `SessionRequestQueue`、严格串行current `RunningOperation`、普通Steer/FollowUp `VecDeque`、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
 - [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用、private Rig adapter、stream/retry/auth/usage/cache/continuation。
 - [Compaction](compaction.md)：portable rolling summary、strict stable-unit cut、连续 retained suffix、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
@@ -46,12 +46,12 @@ MiniCoreRuntime
 | Agent/Session revision、durable/runtime lifecycle、fork | [Agent 与 Session 生命周期](agent-session-lifecycle.md) |
 | Workspace definition、roots、trust、authorization、filesystem capability | [Workspace](workspace.md) |
 | PromptSet、CanonicalUserMessage、PromptIntent 展开、AssembledModelContext | [Prompt](prompt.md) |
-| SkillService、SkillCatalog、LoadedSkill、lazy load、cache | [Skills](skills.md) |
+| SkillService、SkillView、LoadedSkill、lazy load、reload、cache | [Skills](skills.md) |
 | ToolService、ToolSet、policy、approval、grants、sandbox、executor | [Tools](tools.md) |
 | TurnExecutionContext capture、fingerprint、reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction identity、lifecycle、terminal cleanup | [Turn / Item / Interaction](turn-item-interaction.md) |
 | durable truth、entry tree、JSONL、conversation projection、recovery | [Conversation 与 SessionStorage](conversation-storage.md) |
-| 单 Session 执行 owner、request queue、RunningOperation、multi-session 并发 | [Session 执行](session-execution.md) |
+| 单Session执行owner、request queue、唯一current RunningOperation、Steer/FollowUp FIFO、multi-session并发 | [Session 执行](session-execution.md) |
 | TurnModelSnapshot、generate_model_turn、provider adapter、stream/retry/usage | [ModelGateway](model-gateway.md) |
 | 压缩触发、stable cut、summary directive、StoredCompaction | [Compaction](compaction.md) |
 
