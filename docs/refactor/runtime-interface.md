@@ -1,5 +1,7 @@
 # Runtime Interface 与公开协议架构设计
 
+> **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
+
 日期：2026-07-24
 
 状态：目标架构已确定；实现、contract tests 和 transport adapter 待后续完成

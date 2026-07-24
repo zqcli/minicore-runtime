@@ -1,116 +1,1280 @@
-# ModelGateway
+# ModelGateway架构设计
 
-> 状态：pre-refactor implementation contract。ModelGateway的当前目标interface、ownership、retry、stream、usage、auth和cache规则以[ModelGateway架构设计](../refactor/model-gateway.md)与[ADR 0026](../adr/0026-model-gateway-uses-one-deep-async-operation.md)为权威。本文中的SessionRuntime、Driver-owned call、RunId、PreparedMessageTurn、cross-model fallback和caller-visible provider lifecycle不得覆盖目标设计。
+日期：2026-07-16
 
-`ModelGateway` 是 MiniCore 中唯一负责真实模型调用的运行时边界。它复用 Rig 的 provider/client/streaming 能力，但不把 Rig provider 类型、模型凭据、raw provider payload 或 provider SDK 错误暴露给 `SessionRuntime`、`Driver`、下游 UI 或会话持久化。
+状态：当前权威架构（设计已冻结，实现进行中）
 
-一句话边界：
+## 目的
+
+本文定义MiniCore的provider-neutral模型调用模块，回答：
+
+- SessionExecutor如何从`AssembledModelContext`发起一次模型调用；
+- Model identity、definition revision、capabilities和effective limits如何在Turn内固定；
+- System、Developer、User、Assistant和Tool role如何映射到不同provider；
+- ToolSpec、tool choice、OutputContract、reasoning和attachments如何编码；
+- streaming delta、finalized response、usage、finish reason和provider metadata如何规范化；
+- provider-internal retry、transport fallback与Session logical retry如何区分；
+- cancellation、authentication、secret redaction、并发配额和rate limit如何治理；
+- provider prompt cache、connection reuse和continuation如何保持Transcript-First等价性；
+- Rig 0.40.0可以复用哪些能力，哪些差异必须留在private adapter。
+
+本文不定义：
+
+- Prompt内容、conversation visibility或`MessageRecord → ModelMessage`转换；
+- Session logical retry、compaction orchestration或Turn terminal规则；
+- Tool execution、approval或ToolResult持久化；
+- Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
+- provider-native compaction artifact的持久化格式；
+- 完整pricing、billing ledger或成本审计。
+
+相关权威文档：
+
+- [Prompt子系统架构设计](prompt.md)
+- [Turn执行模块与执行上下文架构设计](turn-execution-context.md)
+- [Session Execution架构设计](session-execution.md)
+- [Conversation与SessionStorage架构设计](conversation-storage.md)
+- [Runtime Interface与公开协议架构设计](runtime-interface.md)
+- [ADR 0104：SessionStorage是durable truth](../adr/0104-session-storage-is-durable-truth.md)
+- [ADR 0106：ModelGateway使用一个深异步调用interface](../adr/0106-model-gateway-is-single-deep-operation.md)
+
+## 决策摘要
+
+已经确定：
+
+- `MiniCoreRuntime`拥有一个共享`Arc<ModelGateway>`；
+- ModelGateway不保存current Session、current Turn或UI selected model；
+- `ModelGateway::resolve_for_turn(...)`在Turn capture期间返回immutable `TurnModelSnapshot`；
+- `ModelGateway::generate_model_turn(...)`是唯一真实模型调用interface；
+- `ModelCallRequest.input`只能是PromptSet产生的`AssembledModelContext`；
+- ModelGateway只编码完整provider-neutral context，不重新决定conversation visibility；
+- `TurnModelSnapshot`固定exact model definition、capabilities、effective limits和generation policy；
+- active Turn内不允许静默替换provider/model identity；
+- provider retry只复用同一个immutable request；
+- transparent retry只允许在adapter证明request未执行、provider明确拒绝或支持idempotent resume时发生；
+- WebSocket → HTTP等transport fallback可以发生，但必须保持同一exact model identity和request semantics；
+- cross-model fallback不是ModelGateway transparent behavior；
+- streaming progress是process-local observer data，不进入SessionStorage；
+- finalized response或typed error是一次gateway调用唯一terminal result；
+- provider-reported usage随成功assistant response保存；失败attempt usage在MVP中只属于ModelGateway internal telemetry；
+- authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
+- prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
+- 所有optimization必须能退回完整`AssembledModelContext`请求；
+- ProviderAdapter是private internal seam，至少有Rig adapter和deterministic fake adapter两个实现；
+- 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
+
+## 同类项目研究
+
+### 研究范围
+
+本轮直接检查：
+
+- pi coding agent及其`pi-ai`、`pi-agent-core`安装包；
+- OpenAI Codex Rust实现的`ModelClient`、Responses API和retry代码；
+- Grok Build可取得的sampler/config/package metadata和已研究的Session调用流程；
+- Rig 0.40.0的completion、streaming、provider和sans-I/O AgentRun源码。
+
+Claude Code和Cursor只使用可观察行为作为背景，不推断其未公开provider实现。
+
+### pi
+
+关键实现：
 
 ```text
-ModelGateway owns model invocation governance.
-Rig owns provider protocol implementation.
+pi AgentSession
+→ pi-agent-core AgentLoop
+→ pi-ai streamSimple(model, context, options)
+→ API-specific provider stream
 ```
 
-## 设计决定
+pi的主要特点：
 
-MiniCore 不重新实现 OpenAI、Anthropic、Gemini 或 OpenAI-compatible / Anthropic-compatible HTTP client。provider protocol、stream parsing、provider-specific request/response shape 尽量复用 Rig；MiniCore 在 Rig 外包一层 `ModelGateway`，集中处理 provider/model 选择、凭据解析、custom base URL、fallback、usage 归一化、错误分类和 cancellation。Provider hook 是后期 `RuntimeHooks` 能力；它的 owner 仍是 `ModelGateway`，不属于 `SessionRuntime` 或 `Driver`。
+- `Model`同时描述provider、API protocol、base URL、context window、max tokens、reasoning、cost和compat flags；
+- provider stream使用typed `start → delta* → done/error`事件；
+- text、thinking和tool call都有start/delta/end；
+- `AbortSignal`贯穿AgentSession、AgentLoop和provider request；
+- ModelRegistry组合builtin model、custom model和provider override；
+- AuthStorage支持API key、OAuth refresh、environment和runtime override；
+- context overflow和transient provider error分开分类；
+- automatic retry和compaction由AgentSession编排，不完全属于provider module；
+- provider差异通过OpenAI/Anthropic compat flags处理。
+
+可借鉴：
+
+- typed stream事件；
+- reasoning/tool-call block保持原始顺序；
+- model-level capability和thinking映射；
+- auth refresh与provider catalog分离；
+- context overflow与transient retry分离。
+
+不采用：
+
+- Model descriptor直接携带base URL、headers等执行细节并跨调用层传播；
+- caller可传任意provider compat JSON；
+- provider error靠上层字符串模式判断；
+- AgentSession同时拥有retry、compaction、message state和provider orchestration。
+
+### OpenAI Codex
+
+关键实现：
 
 ```text
-SessionRuntime::ModelState
-  → TurnState.model: ActiveModel
-  → Driver builds ModelCallRequest { model: ModelSelection, input: AssembledModelContext, ... }
-  → ModelGateway.generate_model_turn(...)
-  → ModelGateway
-      → ProviderRegistry.resolve(ModelSelection)
-      → AuthStore.resolve(auth_ref)
-      → private Rig provider adapter
-      → normalized stream / usage / error
+Session / TurnContext
+→ ModelClient
+→ ModelClientSession
+→ Responses WebSocket或HTTP SSE
+→ ResponseStream
+→ Turn event loop
 ```
 
-这不是把 Rig provider API 透传给上层。除私有 adapter，例如 `model_gateway/rig.rs`，其他模块不应导入 `rig::providers::*`。
+Codex的主要特点：
 
-## 实现分期
+- `ModelClient`保存thread级provider/auth/telemetry和connection policy；
+- `ModelClientSession`保存turn级WebSocket和sticky turn state；
+- Responses WebSocket优先，失败后切换HTTP；
+- connection retry使用exponential backoff和jitter；
+- 401可以触发一次auth refresh；
+- prompt cache key和session identity关联；
+- incremental request只有在previous request/response和current full request满足严格prefix关系时使用；
+- cancellation通过stream drop和CancellationToken传播；
+- usage在terminal response event规范化；
+- provider request ID、response ID和timing只进入受控telemetry/metadata。
 
-`ModelGateway` 是 `Driver` 的早期依赖，不能等到 usage/context usage 阶段才稳定。实现顺序采用“两层”策略：先落最小稳定 spine，再补完整 provider 能力。
+可借鉴：
 
-阶段 4/5 前必须稳定的 `ModelGateway` spine：
+- transport fallback与model fallback分离；
+- continuation必须证明full-request prefix equivalence；
+- connection/session state留在model client内部；
+- retry delay带jitter并尊重provider requested delay；
+- cancellation-aware stream mapping；
+- auth refresh只执行有界次数。
 
-- provider-neutral 类型：`ModelSelection`、`ModelCallPurpose`、`ModelCallRequest`、`ModelCallResult`、`ModelCallErrorKind`、`ModelCallUsage` 的字段、purpose 传播和 redaction 规则。
-- `ModelGateway.generate_model_turn(request, sink, cancel)` 主 seam。
-- 最小 `ProviderRegistry.resolve(ModelSelection)`：可以只支持 builtin fake/minimal provider 和最小 capability projection，但调用方必须通过 registry，不允许在 `Driver` / `SessionDriverHost` 中 match provider id。
-- 最小 `AuthStore.resolve(AuthRef)`：可以使用测试 secret 或受控 env resolver，但 secret material 只能出现在 `AuthStore` / `ModelGateway` 内部。
-- fake/minimal provider adapter 或私有 Rig adapter：用于证明 text streaming、cancellation、error mapping 和 `ModelStreamSink` 形状。
+不采用：
 
-阶段 9 才补齐的扩展能力：
+- 把turn-scoped provider session暴露给SessionExecutor；
+- 让provider sticky state成为Turn恢复来源；
+- 以OpenAI Responses协议形状定义MiniCore-owned interface；
+- 默认假设所有provider都支持`previous_response_id`。
 
-- user-global custom provider 配置、`ProviderProtocol`、custom `base_url`、`api_model_name` 和完整 capability validation。
-- keychain / OAuth / runtime override 等完整 auth 来源。
-- fallback chain、model invalid fallback diagnostics 和 provider-specific retry refinement。
-- provider-specific usage extraction、`UsageStats`、`ContextUsageView` 和成本/上下文窗口展示。
-- 为后期 provider hook 预留 redacted summary seam；raw provider payload patch 不进入当前 MVP，只有在 adapter shape 稳定且可脱敏后才开放。
+### Grok Build
 
-禁止的临时路径：阶段 5 不允许让 `Driver`、`SessionDriverHost` 或 `SessionRuntime` 直接读取环境变量、构造 Rig provider client、解析 provider error 字符串、保存 provider API model name 为执行身份，或把 raw provider payload / raw usage 塞进 event、snapshot 或 session JSONL。为了跑通 text-only driver，也必须走 `ModelGateway` spine。
+当前可取得的sampler源码不完整，因此这里只采用可验证的crate和产品结构：
 
-## 模块归属
+- `xai-grok-sampler`是独立sampling/inference crate，声明HTTP streaming和retry，不依赖shell；
+- `xai-grok-sampling-types`保存纯sampling数据类型；
+- model config显式声明`chat_completions | responses | messages` backend；
+- model registry记录context window、temperature、top-p和API backend；
+- authentication支持API key、OAuth/OIDC、session token和external provider；
+- integration测试依赖真实mock HTTP server而不是只mock函数；
+- streaming update与chat/session state分层。
+
+可借鉴：
+
+- sampling module与Session/shell解耦；
+- provider protocol必须显式配置，不能根据base URL猜测；
+- 使用真实mock HTTP server验证SSE、retry、cancel和redaction；
+- telemetry使用closed typed schema并在emit时redact。
+
+不推断：
+
+- 未取得源码中的exact retry state machine；
+- 未公开的provider fallback和continuation内部规则；
+- Grok产品内部credential storage实现。
+
+### Rig 0.40.0
+
+Rig提供：
+
+- `CompletionModel::completion/stream`；
+- provider-neutral `CompletionRequest`；
+- System/User/Assistant、Reasoning、ToolCall和ToolResult content；
+- `ToolChoice::Auto | None | Required | Specific`；
+- structured output schema；
+- streaming `cancel/pause/resume`；
+- input/output/cache-write/cache-read/reasoning/tool-use usage；
+- OpenAI Responses reasoning、prompt cache、previous response和service tier参数；
+- Anthropic thinking/signature和cache control；
+- generic client `base_url` override；
+- sans-I/O `AgentRunStep::CallModel | CallTools | Done`。
+
+Rig 0.40.0的integration gaps：
+
+- generic `CompletionResponse`没有统一finish reason；
+- provider-specific raw response类型不同；
+- `CompletionRequest.additional_params`是raw JSON escape hatch；
+- provider error taxonomy不等于MiniCore recovery taxonomy；
+- stream cancellation使用Rig `AbortHandle`，需要桥接MiniCore CancellationToken；
+- prompt cache、reasoning和structured output仍需provider-specific typed mapping；
+- generic interface不能完整表达所有provider response metadata。
+
+结论：Rig适合作为private provider adapter实现，不适合作为MiniCore ModelGateway interface或domain type来源。
+
+## 对比结论
+
+| 维度 | pi | Codex | Grok Build | Rig 0.40.0 | MiniCore决策 |
+| --- | --- | --- | --- | --- | --- |
+| model invocation seam | AgentLoop调用pi-ai stream | ModelClientSession stream | 独立sampler crate | CompletionModel stream | 一个`generate_model_turn` |
+| provider state | Model/registry + provider module | thread/turn client state | sampler内部 | provider client/model | Gateway内部connection pool |
+| Prompt assembly | AgentSession/AgentLoop context | Turn构造Responses input | chat state/sampling types | CompletionRequest | 只接受PromptSet输出 |
+| streaming | typed content events | typed Responses events | ACP/update stream | typed assistant content stream | droppable progress + one terminal result |
+| retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | provider retry在Gateway，logical retry在Executor |
+| transport fallback | provider-specific | WebSocket → HTTP | backend显式配置 | adapter-specific | 同model transport fallback允许 |
+| cross-model fallback | model selection层 | 不作为transparent stream fallback | 未确认 | 无统一语义 | active Turn内禁止 |
+| continuation/cache | provider compat/cache flags | strict prefix + previous response | 未确认 | provider additional params | strict equivalence，full request fallback |
+| usage | assistant response usage | terminal response usage | telemetry/model usage | generic Usage | 成功response usage durable |
+| error taxonomy | helper + string patterns | CodexErr mapping | typed sampler errors | CompletionError | MiniCore typed recovery classes |
+| auth | registry + AuthStorage | AuthManager + refresh | API key/OAuth/OIDC | provider client setup | Gateway-private AuthStore |
+
+## Interface方案比较
+
+### 方案A：一个深异步operation
+
+```rust
+ModelGateway::generate_model_turn(request, progress, cancel)
+    -> Result<ModelCallResult, ModelCallError>
+```
+
+优点：
+
+- caller只理解完整request、progress和terminal result；
+- provider attempt、connection、auth、retry、cache和continuation全部具有locality；
+- 与SessionExecutor的`RunningOperation`自然对齐；
+- fake adapter可以通过同一interface测试；
+- 删除Gateway会把大量provider复杂性重新散落到caller，满足deep module deletion test。
+
+代价：
+
+- implementation内部较深；
+- 需要private planner、adapter、connection和retry seams辅助测试；
+- progress publisher必须明确non-authoritative语义。
+
+### 方案B：公开prepare/execute两阶段
+
+```rust
+ModelGateway::prepare_model_turn(request) -> PreparedModelTurn
+PreparedModelTurn::execute(progress, cancel) -> Result<...>
+```
+
+问题：
+
+- caller必须理解prepared value何时过期；
+- auth、provider config和capability在prepare还是execute时解析会产生双重时序；
+- dropped prepared value引入无业务价值的lifecycle；
+- concurrency permit和continuation不能安全地在prepare阶段预留；
+- 删除PreparedModelTurn并把private plan放回generate内部不会损失能力。
+
+结论：不作为外部interface。可以作为ModelGateway private implementation structure。
+
+### 方案C：公开ModelTurnSession和async stream
+
+```rust
+ModelGateway::open_turn(...) -> ModelTurnSession
+ModelTurnSession::generate(...) -> ModelCallStream
+```
+
+问题：
+
+- SessionExecutor需要管理第二个turn-scoped lifecycle；
+- caller必须理解stream terminal frame、drop、poisoned continuation和session reset；
+- provider session容易被误认为Turn truth或recovery source；
+- Steer后旧operation和新operation短暂重叠时，session ownership更复杂；
+- connection/continuation完全可以留在Gateway内部并用full request重新证明兼容性。
+
+结论：不作为外部interface。Codex式WebSocket session可以作为private adapter优化。
+
+### 选择
+
+采用方案A。
+
+ModelGateway是一个深模块：对外只有Turn model resolution和一次完整模型调用两个操作；provider variation通过private adapters处理。
+
+## Ownership
 
 ```text
-WorkspaceServices
-  ├─ SettingsStore / user-global EffectiveSettings
-  ├─ ProviderRegistry / user-global provider catalog
-  ├─ AuthStore / user-global credentials boundary
-  └─ ModelGateway / shared model invocation boundary
+MiniCoreRuntime
+└─ Arc<ModelGateway>
+   ├─ ProviderCatalog
+   ├─ AuthStore
+   ├─ ModelConcurrencyController
+   ├─ private ProviderAdapter
+   ├─ ProviderConnectionPool
+   ├─ ContinuationCache
+   ├─ RetryPolicy
+   └─ RedactionPolicy
 
-SessionRuntime
-  ├─ ModelState                 // session-scoped model selection
-  └─ SessionDriverHost          // delegates model requests to ModelGateway
-
-Driver
-  └─ copies ModelSelection and AssembledModelContext into ModelCallRequest only
-
-ModelGateway internals
-  └─ rig_provider_adapter       // private Rig provider/client usage
+SessionExecutor
+└─ RunningOperation::GenerateModelResponse
+   ├─ immutable ModelCallRequest
+   ├─ scoped ProgressEventPublisher<ModelProgressEvent>
+   └─ CancellationToken
 ```
 
-`ModelGateway` 是 runtime-global 的模型调用边界，不随客户端 session selection、cwd 或 resource reload 重建。provider settings、custom provider 声明和 auth 都来自 user-global/runtime-global 配置；项目级 settings 不允许声明 custom provider、覆盖 base URL 或引用 credentials。不同 session 通过自己的 `ModelState` 选择 `ModelSelection`，但 provider/auth 解析使用同一个 user-global `ProviderRegistry` 和 `AuthStore`。
+规则：
 
-## 不应承担
+- ProviderCatalog、AuthStore和ProviderAdapter是ModelGateway implementation details；
+- Runtime公开model query以后通过MiniCoreRuntime facade取得safe catalog view；
+- SessionExecutor不直接resolve auth、base URL、API model name或provider protocol；
+- AgentLoop不直接调用ModelGateway；
+- ToolService、PromptService和SkillService不调用ModelGateway；
+- ModelGateway不读SessionStorage，不append entry，不发布Runtime durable event；
+- ModelGateway没有current Session、current Turn、current cwd或current model字段。
 
-`ModelGateway` 不应：
+## External Interface
 
-- 执行 Agent loop 或推进 Rig `AgentRun`。
-- 执行工具、审批工具或读取工具结果。
-- 构建 system prompt、展开 skill 或解析 command text。
-- 读写 `SessionStorage` 或发布 `agent_runtime_protocol::Event`。
-- 把 raw provider payload、provider response 或 credentials 放进 snapshot/event/session JSONL。
-- 让 hook 获得 `AuthStore` secret material。
+```rust
+pub struct ModelGateway {
+    // private
+}
 
-这些职责分别属于 `Driver`、`Tools`、`Prompt` / `Skills` / `CommandSurface`、`SessionRuntime`、`AgentRuntimeProtocol` 和 `RuntimeHooks`。
+impl ModelGateway {
+    pub(crate) fn resolve_for_turn(
+        &self,
+        request: ResolveTurnModelRequest,
+    ) -> Result<TurnModelSnapshot, ModelResolutionError>;
 
-## 核心类型
+    pub(crate) async fn generate_model_turn(
+        &self,
+        request: ModelCallRequest,
+        progress: ProgressEventPublisher<ModelProgressEvent>,
+        cancel: CancellationToken,
+    ) -> Result<ModelCallResult, ModelCallError>;
+}
+```
 
-执行路径使用 provider-neutral 类型。`ModelSummary`、`ProviderSummary` 和 `AuthStatusView` 是协议 view；它们不是模型调用的权威输入。
+`resolve_for_turn`只访问已经初始化的provider/model catalog，不读取credential。catalog refresh是Runtime lifecycle操作，不在Turn capture期间隐式执行remote I/O。
+
+`generate_model_turn`执行完整provider调用。调用期间可以等待provider并发permit、auth refresh、retry delay和stream，但它运行在`RunningOperation`中，不阻塞SessionRequestQueue。
+
+不提供：
+
+```text
+open_provider_session
+prepare_model_turn
+begin_model_call
+poll_model_call
+finish_model_call
+raw_provider_client
+provider_stream
+```
+
+## Model Identity
+
+### ModelSelection
 
 ```rust
 pub struct ModelSelection {
     pub provider_id: ProviderId,
     pub model_id: ModelId,
 }
+```
 
-pub struct ActiveModel {
-    pub selection: ModelSelection,
-    pub summary: ModelSummary,
-    pub capabilities: ModelCapabilities,
-}
+`ModelSelection`是SessionDefinition保存的稳定用户选择，不包含：
 
-pub struct ModelState {
-    pub selected: ModelSelection,
-    pub thinking_level: ThinkingLevel,
-    pub stream_options: StreamOptions,
-    pub fallback_policy: Option<ModelFallbackPolicy>,
+- API model name；
+- base URL；
+- provider protocol；
+- auth reference或secret；
+- model capability；
+- current catalog revision。
+
+### ModelDefinitionRef
+
+```rust
+pub struct ModelDefinitionRef {
+    pub provider_id: ProviderId,
+    pub model_id: ModelId,
+    pub definition_version: ModelDefinitionVersion,
 }
 ```
 
-`ModelSelection` 是 session entry、command、event 和 request 中的稳定选择身份。`ModelSummary` 是 UI/snapshot 投影；不要用它驱动 provider 调用。
+`definition_version`是validated provider/model definition的content identity。它覆盖影响调用语义的非secret配置：
+
+```text
+provider protocol
+endpoint identity
+nonsecret auth binding reference identity
+API model name
+capabilities
+advertised limits
+generation defaults
+cache/role/tool/output mapping policy
+adapter encoding version
+```
+
+它不覆盖credential内容、OAuth access token或resolved auth principal。`ModelExecutionRef`持有private nonsecret AuthBindingRef；credential和opaque principal identity在每个attempt即时解析。
+
+### TurnModelSnapshot
+
+```rust
+pub struct TurnModelSnapshot {
+    selection: ModelSelection,
+    definition: ModelDefinitionRef,
+    capabilities: ModelCapabilities,
+    limits: EffectiveModelLimits,
+    generation: EffectiveGenerationPolicy,
+    fingerprint: TurnModelFingerprint,
+    execution_ref: ModelExecutionRef,
+}
+```
+
+`ModelExecutionRef`是crate-private opaque reference。它允许ModelGateway找到exact retained provider/model definition，但不暴露base URL、auth reference、headers或provider adapter类型。
+
+TurnModelSnapshot语义：
+
+- 在TurnExecutionContext capture期间创建；
+- active Turn的每次AgentRun模型调用复用同一Snapshot；
+- Steer不重新resolve Model；
+- provider catalog reload只影响future Turn；
+- definition已从catalog current head移除时，Gateway仍可使用Snapshot持有的retained exact definition；
+- process restart不恢复unfinished Turn，因此不承诺跨进程继续旧Snapshot；
+- TurnContext entry保存safe `TurnModelRef`和fingerprint，不保存execution_ref。
+
+### ResolveTurnModelRequest
+
+```rust
+pub struct ResolveTurnModelRequest {
+    pub selection: ModelSelection,
+    pub requested_reasoning: ReasoningPreference,
+    pub requested_max_output_tokens: Option<NonZeroU32>,
+    pub execution_mode: ExecutionMode,
+}
+```
+
+resolution负责：
+
+- exact selection lookup；
+- capability validation；
+- reasoning preference映射；
+- effective context/output limits计算；
+- generation defaults固定；
+- TurnModelFingerprint生成；
+- safe diagnostics生成。
+
+resolution不负责：
+
+- auth resolution；
+- provider connection；
+- prompt assembly；
+- model availability network probe；
+- cross-model fallback。
+
+selection不存在、definition invalid或capability不满足时，Turn admission失败。不能在active Turn开始后静默换模型。
+
+### EffectiveGenerationPolicy
+
+```rust
+pub struct EffectiveGenerationPolicy {
+    pub reasoning: EffectiveReasoningPolicy,
+    pub sampling: SamplingPolicy,
+    pub prompt_cache: PromptCachePolicy,
+    pub service_class: ModelServiceClass,
+}
+
+pub enum PromptCachePolicy {
+    Auto,
+    Disabled,
+}
+
+pub enum ModelServiceClass {
+    Standard,
+    Priority,
+}
+```
+
+`EffectiveReasoningPolicy`是requested preference经过model capability映射后的provider-neutral结果；unsupported preference在resolve_for_turn时失败或按explicit Session policy降级，不能在provider adapter中临时猜测。`SamplingPolicy`只保存validated temperature/top-p等stable values；NaN、Infinity或provider不支持的组合在Turn capture时拒绝。
+
+cache和service class属于Turn-pinned execution policy。它们不改变conversation visibility，但会影响provider request、cost和fingerprint。
+
+## Model Capabilities
+
+```rust
+pub struct ModelCapabilities {
+    pub input_modalities: InputModalities,
+    pub instruction_roles: InstructionRoleCapabilities,
+    pub tool_calling: ToolCallingCapabilities,
+    pub structured_output: StructuredOutputCapabilities,
+    pub reasoning: ReasoningCapabilities,
+    pub prompt_cache: PromptCacheCapabilities,
+    pub supports_streaming: bool,
+    pub supports_parallel_tool_calls: bool,
+    pub advertised_limits: AdvertisedModelLimits,
+}
+```
+
+### InputModalities
+
+```rust
+pub struct InputModalities {
+    pub text: bool,
+    pub image: bool,
+    pub audio: bool,
+    pub document: bool,
+}
+```
+
+unsupported content在provider request开始前返回`UnsupportedCapability`。
+
+### InstructionRoleCapabilities
+
+```rust
+pub enum InstructionRoleCapabilities {
+    SystemAndDeveloper,
+    SystemOnly {
+        developer_lowering: DeveloperRoleLowering,
+    },
+}
+
+pub enum DeveloperRoleLowering {
+    MergeIntoSystemWithStableSections,
+    Unsupported,
+}
+```
+
+Developer role lowering是model definition声明的deterministic encoding policy。它不能由provider名称猜测，也不能让adapter重新排序Prompt section。
+
+### ToolCallingCapabilities
+
+至少描述：
+
+```text
+native tools是否支持
+ToolChoice::None/Auto/Required/Specific支持情况
+tool result name是否required
+parallel tool calls支持情况
+tool call arguments streaming支持情况
+provider tool name限制
+```
+
+### StructuredOutputCapabilities
+
+至少描述：
+
+```text
+JSON object
+JSON schema
+strict schema
+schema限制和sanitization version
+与native tools组合是否支持
+```
+
+### ReasoningCapabilities
+
+至少描述：
+
+```text
+provider reasoning effort levels
+summary支持
+replayable text/summary/encrypted/signature artifact支持
+reasoning token usage是否报告
+```
+
+### EffectiveModelLimits
+
+```rust
+pub struct EffectiveModelLimits {
+    pub context_window_tokens: Option<NonZeroU32>,
+    pub max_output_tokens: Option<NonZeroU32>,
+    pub max_tool_count: Option<NonZeroU32>,
+    pub max_schema_bytes: Option<NonZeroU32>,
+}
+```
+
+unknown必须保持`None`。不能根据model name猜测limit，也不能把本地estimate写成provider-advertised fact。
+
+## AssembledModelContext Contract
+
+PromptSet是唯一producer。为保留role fidelity，assembled shape使用ordered instructions，而不是提前压成单个system string：
+
+```rust
+pub struct AssembledModelContext {
+    pub instructions: Arc<[ModelInstruction]>,
+    pub messages: Arc<[ModelMessage]>,
+    pub tools: Arc<[ToolSpec]>,
+    pub output_contract: Option<OutputContract>,
+    pub contribution_stamps: Arc<[PromptContributionStamp]>,
+    pub diagnostics: Arc<[PromptDiagnostic]>,
+    pub fingerprint: AssembledModelContextFingerprint,
+    pub(crate) assembly_proof: PromptAssemblyProof,
+}
+
+pub struct ModelInstruction {
+    pub role: ModelInstructionRole,
+    pub content: Arc<str>,
+}
+
+pub enum ModelInstructionRole {
+    System,
+    Developer,
+}
+```
+
+PromptSet instructions和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical instruction/tool boundaries选择cache breakpoint，不需要额外stability flag。
+
+`PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint和OutputContract hash。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
+
+首版provider-neutral output contract至少包含：
+
+```rust
+pub enum OutputContract {
+    NoToolCalls,
+    Structured(StructuredOutputContract),
+}
+```
+
+`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，adapter必须拒绝该结果，不能把它交给SessionExecutor执行。
+
+ModelGateway可以：
+
+- 把System/Developer role映射成provider原生role；
+- 按declared deterministic policy把Developer section并入System；
+- 把ModelMessage编码成provider message/item；
+- 把ToolSpec编码成provider tool schema；
+- 把OutputContract编码成tool choice、response format或JSON schema；
+- 对provider schema限制执行不改变业务含义的canonical sanitization；
+- 在canonical section边界添加cache-control metadata。
+
+ModelGateway不能：
+
+- 删除、增加或重新排序model-visible content；
+- 从SessionStorage重新加载messages；
+- 根据provider限制自行摘要或截断conversation；
+- 把diagnostic变成prompt text；
+- 把ToolSpec描述与ToolSet executor重新join；
+- 把OutputContract伪装为system text；
+- 把未committed draft加入payload。
+
+无法无损映射时返回`UnsupportedCapability`或`InvalidRequest`，不能best-effort改变语义。
+
+## ModelCallRequest
+
+```rust
+pub struct ModelCallRequest {
+    model: TurnModelSnapshot,
+    purpose: ModelCallPurpose,
+    input: AssembledModelContext,
+    max_output_tokens: Option<NonZeroU32>,
+}
+
+impl ModelCallRequest {
+    pub(crate) fn new(
+        model: TurnModelSnapshot,
+        purpose: ModelCallPurpose,
+        input: AssembledModelContext,
+        max_output_tokens: Option<NonZeroU32>,
+    ) -> Result<Self, ModelRequestValidationError>;
+}
+```
+
+请求保持最小：
+
+- model generation defaults和effective reasoning已在TurnModelSnapshot固定；
+- tool choice和structured output只存在于`input.output_contract`；
+- system/developer/messages/tools只存在于`input`；
+- streaming是Gateway implementation strategy，不是model-visible caller option；
+- cache policy默认由exact model definition和Runtime policy确定；
+- SessionId、TurnId、execution_version和OperationType由外层RunningOperation携带；
+- request不含ModelCallId、RunId、ModelStepId或ModelAttemptId；
+- request不含credential、auth reference、base URL、header或raw provider params。
+
+constructor验证：
+
+- assembly_proof.purpose等于request purpose；
+- assembly_proof.turn_model_fingerprint等于TurnModelSnapshot fingerprint；
+- assembly_proof.output_contract_hash等于input.output_contract canonical hash；
+- max_output_tokens满足Snapshot effective limits。
+
+### ModelCallPurpose
+
+```rust
+pub enum ModelCallPurpose {
+    AgentRun,
+    CompactionSummary,
+}
+```
+
+purpose：
+
+- 是Prompt assembly和fingerprint输入；
+- 原样传播到usage和diagnostics；
+- 不是retry classification；
+- 不是foreground/background状态；
+- 不因transport fallback、auth refresh或logical retry改变。
+
+`CompactionSummary`额外要求：
+
+- 使用active Turn exact model identity；
+- input由PromptSet的CompactionSummary variant产生；
+- `OutputContract::NoToolCalls`且ToolSpec为空；
+- 提供明确max_output_tokens；
+- 不进入AgentLoop，不把summary result解释成普通assistant response；
+- 不调用provider-native compact endpoint；首版仍是普通portable model generation。
+
+未来只有真实业务任务出现时才增加variant，例如SessionTitle；不能增加`Retry`或`Background`。
+
+### Output Limit
+
+`max_output_tokens`是本次purpose允许的上限：
+
+- `None`使用TurnModelSnapshot中的effective default；
+- 非空值必须大于0；
+- 超过effective max时在provider调用前返回`InvalidRequest`；
+- Gateway不静默clamp，因为clamp会改变调用方已经fingerprint的policy；
+- CompactionSummary应提供明确上限。
+
+## Private Provider Adapter
+
+```rust
+#[async_trait]
+pub(crate) trait ProviderAdapter: Send + Sync {
+    async fn execute(
+        &self,
+        request: ProviderAttemptRequest,
+        content: ProviderContentPublisher,
+        cancel: CancellationToken,
+    ) -> Result<ProviderAttemptResult, ProviderAttemptError>;
+}
+```
+
+该trait是ModelGateway private internal seam，不进入MiniCoreRuntime interface。`ProviderContentPublisher`只能发布attempt内的content delta；AttemptStarted、RetryScheduled和AttemptDiscarded由ModelGateway本身发布，adapter不能伪造retry lifecycle。
+
+真实实现：
+
+```text
+RigProviderAdapter
+```
+
+测试实现：
+
+```text
+DeterministicProviderAdapter
+ScriptedProviderAdapter
+```
+
+因此ProviderAdapter是一个真实seam，而不是为单一implementation增加的假抽象。
+
+ProviderAttemptRequest可以包含：
+
+- exact provider protocol；
+- resolved API model name；
+- resolved auth；
+- provider-specific typed options；
+- canonical encoded payload；
+- connection/continuation candidate；
+- attempt ordinal。
+
+这些类型都必须private、non-serializable并使用redacted Debug。
+
+只有private adapter可以使用Rig provider types和`CompletionRequest.additional_params`。调用方不能提交arbitrary JSON。
+
+## Rig Adapter Mapping
+
+```text
+ModelCallRequest
+→ validate TurnModelSnapshot
+→ encode AssembledModelContext
+→ Rig generic或provider-specific request API
+→ provider stream
+→ FinalizedAssistantResponse
+```
+
+RigProviderAdapter不被限制为generic `CompletionModel::stream`。当generic类型擦除finish reason、request ID或reasoning artifact时，adapter可以使用Rig公开的provider-specific request/response types；这些类型仍不能越过private adapter。
+
+映射要求：
+
+- ordered instructions映射到Rig preamble/messages或provider-specific instruction字段；
+- messages保持source order；
+- reasoning/text/tool call保持final content order；
+- ToolSpec映射到Rig ToolDefinition；
+- OutputContract映射到ToolChoice/output_schema/provider typed options；
+- Rig `additional_params`只由adapter内部typed builder生成；
+- Rig Usage规范化到MiniCore ModelUsage；
+- Rig AbortHandle桥接MiniCore CancellationToken；
+- generic finish reason缺失时读取受支持provider-specific terminal response；仍不可得则使用`Unknown`；optional request ID/metadata不可得时保持None；
+- Rig CompletionError只在adapter内存在，必须转换成ProviderAttemptError。
+
+如果Rig generic和provider-specific API都无法保留MiniCore要求的semantic content、tool identity或usage，spike必须阻止该provider adapter并提出targeted follow-up ADR；不能把Rig raw types泄漏给caller。直接重写provider HTTP client不属于当前accepted baseline。
+
+Rig spike必须验证：
+
+- OpenAI Responses和Anthropic Messages的role映射；
+- reasoning text/summary/encrypted/signature round-trip；
+- tool call index/name/arguments和content order；
+- stream EOF、cancel和usage terminal行为；
+- custom base URL；
+- typed cache-control；
+- finish reason提取；
+- provider request/response ID提取；
+- context overflow与rate-limit分类。
+
+## Streaming And Progress
+
+`generate_model_turn`内部消费provider stream，caller不持有raw stream。provider不支持streaming时Gateway使用non-streaming completion并只返回terminal result；这不改变caller interface。
+
+```rust
+pub enum ModelProgressEvent {
+    AttemptStarted {
+        ordinal: NonZeroU16,
+    },
+    ContentDelta {
+        ordinal: NonZeroU16,
+        content_index: u32,
+        delta: ModelContentDelta,
+    },
+    RetryScheduled {
+        next_ordinal: NonZeroU16,
+        delay: Duration,
+        reason: ModelCallErrorKind,
+    },
+    AttemptDiscarded {
+        ordinal: NonZeroU16,
+        reason: AttemptDiscardReason,
+    },
+}
+```
+
+```rust
+pub enum ModelContentDelta {
+    ReasoningText(Arc<str>),
+    ReasoningSummary(Arc<str>),
+    Text(Arc<str>),
+    ToolCallName(Arc<str>),
+    ToolCallArguments(Arc<str>),
+}
+```
+
+规则：
+
+- progress publisher是bounded、non-authoritative和process-local；
+- publisher由RunningOperation scope到SessionId/TurnId/Item draft identity；
+- ModelGateway本身不接收SessionId或TurnId；
+- 连续text/reasoning delta可以合并；
+- queue满可以丢弃中间delta；
+- progress publisher关闭不取消provider调用；
+- cancellation由CancellationToken决定；
+- partial reasoning/text/tool arguments不是durable Item；
+- hidden chain-of-thought不可发布；
+- provider未暴露的reasoning不可推断；
+- terminal success必须返回完整FinalizedAssistantResponse；
+- terminal error必须返回typed ModelCallError；
+- SessionExecutor使用terminal result清理或替换UI draft。
+
+不通过progress发布：
+
+```text
+credential
+raw headers/body
+provider SDK error
+unredacted endpoint query
+full prompt
+full tool schema
+opaque encrypted reasoning artifact
+```
+
+## Finalized Response
+
+```rust
+pub struct ModelCallResult {
+    pub response: FinalizedAssistantResponse,
+    pub transparent_retry_count: u32,
+    pub diagnostics: Arc<[ModelCallDiagnostic]>,
+}
+
+pub struct FinalizedAssistantResponse {
+    pub model: ModelDefinitionRef,
+    pub response_id: Option<ProviderResponseId>,
+    pub content: Arc<[FinalizedAssistantContent]>,
+    pub finish_reason: ModelFinishReason,
+    pub usage: Option<ModelUsage>,
+    pub metadata: ProviderResponseMetadata,
+}
+```
+
+```rust
+pub enum FinalizedAssistantContent {
+    Reasoning(FinalizedReasoning),
+    Text {
+        text: Arc<str>,
+    },
+    ToolCall {
+        provider_item_id: Option<ProviderItemId>,
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: Value,
+        index: u32,
+    },
+}
+```
+
+`content[]`保持provider finalized semantic order。SessionExecutor随后分配或关联ItemId并构造assistant entry。
+
+### FinalizedReasoning
+
+```rust
+pub struct FinalizedReasoning {
+    pub text: Option<Arc<str>>,
+    pub summary: Option<Arc<str>>,
+    pub encrypted: Option<Arc<str>>,
+    pub signature: Option<Arc<str>>,
+    pub provider_item_id: Option<ProviderItemId>,
+}
+```
+
+只保存provider实际返回且允许replay/display的artifact。不得：
+
+- 保存hidden chain-of-thought；
+- 根据token usage生成reasoning text；
+- 把encrypted artifact当普通text展示；
+- 丢失provider要求的signature/item identity；
+- 在不兼容provider/model上回放opaque artifact。
+
+### Finish Reason
+
+```rust
+pub enum ModelFinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFiltered,
+    Refused,
+    Unknown,
+}
+```
+
+规则：
+
+- provider native finish code映射到closed taxonomy；
+- 原始code可以作为allowlisted redacted metadata保留；
+- generic Rig response没有finish reason时使用provider-specific adapter提取；
+- 仍不可得时使用Unknown，不根据文本内容伪造；
+- ToolCall content是AgentLoop决定NeedTools的主要事实，finish reason用于一致性校验和diagnostics；
+- Length不自动当Completed，需要Session execution根据OutputContract和AgentLoop规则处理；
+- provider返回finalized refusal content时使用successful response + Refused；请求在生成response前被policy拦截时返回SafetyBlocked error；
+- safety/refusal不能只表现为空Stop。
+
+### Provider Response Metadata
+
+```rust
+pub struct ProviderResponseMetadata {
+    pub provider_request_id: Option<ProviderRequestId>,
+    pub raw_finish_code: Option<RedactedProviderCode>,
+    pub service_tier: Option<RedactedProviderCode>,
+}
+```
+
+metadata使用allowlist字段。response/request ID、finish code和service tier都必须执行长度、字符集、control-character和redaction validation。禁止保存raw response、headers map、request payload、server trace或secret-bearing URL。
+
+`response_id`可以随assistant entry持久化用于diagnostics和可能的provider replay artifact关联，但它不是conversation identity，也不能单独授权continuation。
+
+## Usage
+
+```rust
+pub struct ModelUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub provider_total_tokens: Option<u64>,
+    pub reported_cost: Option<Money>,
+}
+```
+
+规则：
+
+- provider未返回的字段保持`None`；
+- `provider_total_tokens`只保存provider报告值，不通过其他字段相加伪造；
+- locally estimated tokens属于ContextUsage projection，不进入ModelUsage；
+- locally calculated price属于rebuildable cost estimate，不写`reported_cost`；
+- `reported_cost`只用于provider明确返回billed cost的情况；
+- successful response usage随对应assistant entry保存；
+- Session total usage由assistant/compaction entries replay重建；
+- transparent retry只允许delivery state证明NotSent/RejectedBeforeExecution，或provider支持idempotent replay/exact resume；usage是否出现不能作为retry safety判断；
+- provider若为失败attempt报告usage，该事实只进入ModelGateway internal telemetry；不放入ModelCallError、不进入Session aggregate，也不创建synthetic assistant或独立Usage entry；
+- 因此MiniCore SessionStorage不是provider billing ledger。
+
+`transparent_retry_count`只记录Gateway内部额外attempt数量。StoredAssistantMessage的`retry_count`定义为SessionExecutor对同一logical call执行的logical retry数量，不混入transparent retry。
+
+## Retry
+
+### Provider-Internal Retry
+
+ModelGateway可以处理：
+
+- DNS/connect/TLS失败；
+- provider connection establishment失败；
+- 有界401 auth refresh；
+- adapter确认没有开始model execution的provider rejection和short rate-limit delay；
+- WebSocket upgrade失败后切换HTTP；
+- provider-supported idempotent replay或exact resume。
+
+每个ProviderAttemptError必须携带private delivery state：
+
+```rust
+pub(crate) enum ProviderRequestDeliveryState {
+    NotSent,
+    RejectedBeforeExecution,
+    AcceptedNoOutput,
+    OutputStarted,
+    Unknown,
+}
+```
+
+HTTP status或“尚无delta”本身不能决定delivery state。只有adapter根据protocol contract、provider response和transport阶段证明`NotSent`或`RejectedBeforeExecution`时才能普通transparent retry。`AcceptedNoOutput`和`OutputStarted`只有在provider支持相同idempotency key或exact resume时才能继续；`Unknown`必须返回`RequestOutcomeUnknown`。
+
+必须满足：
+
+```text
+same TurnModelSnapshot
+same ModelCallPurpose
+same AssembledModelContext
+same max_output_tokens
+same provider/model identity
+```
+
+每次`generate_model_turn`在Gateway内部创建process-local ProviderInvocationId。支持idempotency key的provider在transparent retry中复用该key；该ID不进入ModelCallRequest、领域模型或SessionStorage。
+
+每次attempt：
+
+1. 检查cancellation；
+2. resolve current credential和opaque auth principal identity，不持有model concurrency permit；
+3. 等待global/provider/model/auth-principal concurrency permits；
+4. build provider payload；
+5. start provider request并更新delivery state；
+6. consume stream；
+7. normalize terminal result；
+8. release permits。
+
+retry delay和auth refresh期间不持有model concurrency permit。provider返回401时先释放permits，再进入singleflight refresh，然后创建新attempt。
+
+### Semantic Delta Rule
+
+默认规则：
+
+- delivery state为NotSent或RejectedBeforeExecution时，可以按policy transparent retry；
+- AcceptedNoOutput或OutputStarted只有provider-supported idempotent replay/exact resume时才能transparent继续；
+- request已经发送但尚无response，delivery outcome不确定时返回`RequestOutcomeUnknown`，不能仅因没有delta就blind retry；
+- 第一个model-visible delta发布后，普通restart可能重复text、tool call或billing，因此返回`StreamInterrupted`；
+- 只有provider adapter能证明exact resume且不会重复semantic content时才允许继续同一attempt；
+- MVP Rig adapter不假设支持exact resume；
+- progress中已经发布的partial draft由SessionExecutor在terminal error后丢弃。
+
+### Authentication Retry
+
+- AuthMissing不重试；
+- AuthRejected可以触发一次singleflight refresh；
+- refresh成功后只重试一次；
+- refresh失败或第二次401返回AuthRejected；
+- credential每个attempt即时resolve，不pin access token到TurnModelSnapshot；
+- refresh log和error不得包含token。
+
+### Rate Limit
+
+- 尊重typed Retry-After；
+- 无Retry-After时使用bounded exponential backoff + jitter；
+- total attempts和elapsed time都有限制；
+- cancellation中止backoff；
+- rate-limit state按provider route和auth principal的opaque identity隔离；
+- 不把一个provider的cooldown应用到无关provider。
+
+### Transport Fallback
+
+允许：
+
+```text
+same OpenAI Responses model
+WebSocket → HTTP SSE
+```
+
+不允许作为transparent fallback：
+
+```text
+provider A/model X → provider B/model Y
+model X → model Z
+Responses model → capability不同的Chat Completions model
+```
+
+跨模型替换会改变capabilities、limits、cost和输出行为，破坏Turn-pinned exact Model。需要替换时：
+
+- 在Session definition update或下一Turn admission前显式resolve；
+- 形成新的SessionDefinitionRevision或明确的future Turn model choice；
+- 当前Turn失败或由用户显式Cancel后重试；
+- 不由ModelGateway悄悄完成。
+
+### Session Logical Retry
+
+Gateway返回exhausted typed error后，SessionExecutor决定logical retry：
+
+```text
+TurnId/execution_version unchanged
+ConversationCheckpoint unchanged
+TurnExecutionContext unchanged
+purpose/output contract/effective max_output_tokens unchanged
+AssembledModelContextFingerprint unchanged
+→ schedule timer
+→ 使用同一ModelCallRequest启动新RunningOperation
+```
+
+logical retry：
+
+- 不阻塞SessionRequestQueue；
+- Steer、Cancel、Compaction或conversation change使其失效；
+- 计入StoredAssistantMessage.retry_count；
+- 不创建ModelAttempt entity；
+- 不改变ModelCallPurpose。
+
+## Cancellation
+
+ModelGateway在以下位置检查CancellationToken：
+
+- resolution validation后；
+- concurrency wait期间；
+- auth resolution和refresh前后；
+- retry delay期间；
+- provider request开始前；
+- stream read期间，直到provider terminal event被adapter接受。
+
+Gateway success/cancel的线性化点是adapter接受完整provider terminal event：
+
+- cancellation先被观察：中止request并返回Cancelled；
+- terminal event先被接受：Gateway完成normalization并返回ModelCallResult，之后到达的cancel不把该result改写为Cancelled；
+- SessionExecutor仍会用execution_version和Cancel/Steer arbitration决定该result能否append，因此Gateway terminal先赢不等于Turn一定Completed；
+- 该规则保证terminal usage、finish reason和content不会因normalization期间的timer race随机丢失。
+
+取消行为：
+
+```text
+cancel token fires
+→ 停止新attempt
+→ 取消retry timer/concurrency wait
+→ 调用Rig stream.cancel或transport abort
+→ 停止发布新progress
+→ 返回ModelCallErrorKind::Cancelled
+```
+
+不能承诺：
+
+- provider没有收到request；
+- provider立即停止generation；
+- provider不会计费；
+- 已发布partial delta可以恢复；
+- cancellation可以回滚provider-side cache。
+
+迟到result仍由SessionExecutor通过SessionId、TurnId、execution_version和OperationType校验。
+
+## Error Taxonomy
+
+```rust
+pub struct ModelCallError {
+    pub kind: ModelCallErrorKind,
+    pub message: RedactedErrorMessage,
+    pub retry_after: Option<Duration>,
+    pub transparent_retry_count: u32,
+    pub diagnostics: Arc<[ModelCallDiagnostic]>,
+}
+```
+
+```rust
+pub enum ModelCallErrorKind {
+    Cancelled,
+    ModelUnavailable,
+    AuthMissing,
+    AuthRejected,
+    RateLimited,
+    QuotaExceeded,
+    ContextOverflow,
+    UnsupportedCapability,
+    InvalidRequest,
+    SafetyBlocked,
+    Timeout,
+    TransportUnavailable,
+    ProviderUnavailable,
+    ProviderRejected,
+    RequestOutcomeUnknown,
+    StreamInterrupted,
+    ProtocolViolation,
+}
+```
+
+错误映射：
+
+| Error kind | Gateway行为 | SessionExecutor默认处理 |
+| --- | --- | --- |
+| Cancelled | 停止attempt | Cancel/Steer/version规则 |
+| ModelUnavailable | 不替换模型 | TurnFailed或要求SetModel |
+| AuthMissing/AuthRejected | 有界refresh后返回 | user action / TurnFailed |
+| RateLimited | 有界retry | 可按logical retry policy等待 |
+| QuotaExceeded | 不自动retry | user action / TurnFailed |
+| ContextOverflow | 不改Prompt | bounded compaction recovery |
+| UnsupportedCapability | provider调用前拒绝 | configuration failure |
+| InvalidRequest | provider调用前或400 mapping | implementation/config failure |
+| SafetyBlocked | 不自动retry | truthful terminal response/error policy |
+| Timeout | 有界retry | logical retry或TurnFailed |
+| TransportUnavailable | 有界retry/transport fallback | logical retry或TurnFailed |
+| ProviderUnavailable | 有界retry | logical retry或TurnFailed |
+| ProviderRejected | 不解析raw string | TurnFailed/diagnostic |
+| RequestOutcomeUnknown | 不transparent replay | explicit logical retry policy，提示可能重复provider work/cost |
+| StreamInterrupted | 不blind restart | logical retry only after draft discard |
+| ProtocolViolation | fail closed | TurnFailed + diagnostic |
+
+规则：
+
+- caller不能解析`message`决定retry；
+- provider raw error body不越过adapter；
+- error message必须redacted、bounded且provider-neutral；
+- provider status、request ID等只作为allowlisted diagnostic；
+- ContextOverflow必须与Prompt本地size validation保留不同source；
+- SafetyBlocked和Refused response的最终建模必须由adapter根据provider protocol一致处理。
+
+## Authentication And Secret Redaction
+
+ModelGateway implementation包含：
+
+```text
+ProviderCatalog
+AuthStore
+ResolvedAuth
+ProviderClientFactory
+```
+
+AuthBindingRef固定credential source/account binding，不包含secret。ResolvedAuth另外产生opaque AuthPrincipalIdentity，用于per-principal concurrency、connection/cache隔离和continuation compatibility；该identity不进入TurnModelSnapshot、diagnostics或storage。若同一AuthBindingRef在active Turn期间解析为不同principal，Gateway必须清除旧connection/continuation candidate，不能跨principal复用provider state。
+
+secret只允许存在于：
+
+```text
+AuthStore
+ModelGateway private ResolvedAuth
+provider client/request
+actual transport request
+```
+
+secret不得进入：
+
+```text
+TurnModelSnapshot
+ModelCallRequest
+AssembledModelContext
+ModelProgressEvent
+ModelCallResult
+ModelCallError
+SessionStorage
+Runtime event/snapshot
+Prompt/Tool/Skill
+logs或Debug output
+```
+
+要求：
+
+- ResolvedAuth不实现revealing Debug/Display/Serialize；
+- headers和URL query在diagnostics前redact；
+- API key、OAuth token、cookie和signed URL使用typed secret wrappers；
+- auth refresh使用singleflight，避免并发请求重复refresh；
+- custom provider auth reference只能来自user-global trusted config；
+- project Workspace不能注册base URL、headers或credential source；
+- Runtime hook未来只能看到provider-neutral redacted request summary；
+- raw provider payload hook默认不提供。
+
+## Provider Catalog And Custom Providers
+
+custom provider必须显式声明：
 
 ```rust
 pub enum ProviderProtocol {
@@ -119,487 +1283,518 @@ pub enum ProviderProtocol {
     AnthropicMessages,
     Gemini,
 }
+```
 
-pub struct ProviderSpec {
+```rust
+pub struct CustomProviderDefinition {
     pub provider_id: ProviderId,
-    pub display_name: String,
     pub protocol: ProviderProtocol,
-    pub base_url: Option<Url>,
+    pub endpoint: Url,
     pub auth_ref: AuthRef,
-    pub models: Vec<ModelSpec>,
-}
-
-pub struct ModelSpec {
-    pub model_id: ModelId,
-    pub display_name: String,
-    pub api_model_name: String,
-    pub capabilities: ModelCapabilities,
-    pub default_options: ModelDefaultOptions,
-}
-
-pub struct ResolvedModelSpec {
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
-    pub protocol: ProviderProtocol,
-    pub base_url: Option<Url>,
-    pub api_model_name: String,
-    pub capabilities: ModelCapabilities,
-    pub auth_ref: AuthRef,
-}
-
-struct ResolvedProviderCall {
-    model: ResolvedModelSpec,
-    auth: ResolvedAuth,
-    request: ModelCallRequest,
+    pub models: Arc<[CustomModelDefinition]>,
 }
 ```
 
-`model_id` 是 MiniCore 内的稳定 ID；`api_model_name` 是真实传给 provider API / Rig provider client 的模型名。二者可以相同，也可以不同。
+规则：
 
-`ResolvedProviderCall` 是 `ModelGateway` 内部对象，不是 public API。它是少数允许同时持有 resolved model spec、resolved auth 和 provider-neutral request 的地方，生命周期应限制在一次 provider 调用内。
+- 不根据endpoint猜protocol；
+- endpoint必须HTTPS，localhost/development exception需要显式runtime policy；
+- config load拒绝URL userinfo、query和fragment；path必须canonicalize且不得携带secret-like token；
+- endpoint identity只使用canonical origin和validated base path，safe catalog view默认不显示完整custom path；
+- auth_ref是nonsecret reference，只存在于Gateway implementation；
+- arbitrary headers必须来自user-global trusted config并经过allowlist/redaction；
+- model capability由definition声明并validate；
+- capability声明错误在adapter mapping时fail closed；
+- catalog refresh产生新的ModelDefinitionVersion；
+- active Turn继续使用retained exact definition；
+- future Turn resolve current definition；
+- model listing/query返回safe view，不返回endpoint credential details。
 
-```rust
-pub struct ModelCapabilities {
-    pub context_window: Option<u64>,
-    pub max_output_tokens: Option<u64>,
-    pub supports_streaming: bool,
-    pub supports_tools: bool,
-    pub supports_vision: bool,
-    pub supports_json_schema: bool,
-    pub supports_thinking: bool,
-    pub supports_prompt_cache: bool,
-    pub reports_usage: bool,
-    pub compaction: CompactionCapabilities,
-}
-```
+## Prompt Cache
 
-能力用于裁剪 thinking level、过滤 active tools、估算 context usage、决定 compaction / overflow 策略和生成 UI 可用性说明。能力缺失时必须保守处理，不应靠 provider 名称猜测。
+Prompt cache不是response memoization，也不是conversation state。
 
-`CompactionCapabilities` 描述当前 model/provider 可执行的 provider-neutral method 集，例如 `SummaryModel`、后期 `ProviderNative` 和确定性 reduction fallback，以及 native method 是否接受 custom instructions、结果是否 model-bound、输入上限等。能力由 `ProviderRegistry` / provider adapter 声明，用户配置只表达 `Auto`、native preferred、portable preferred 或 strict preference；`SessionRuntime` 在每次压缩前根据当前 `ModelSelection`、trigger 和 capability 解析 effective plan，不能通过 `gpt*` / `claude*` 名称分支。
+Gateway可以根据exact model definition和canonical instruction/tool/message boundaries选择provider cache-control：
 
-## ProviderRegistry
+- stable System/Developer instructions；
+- stable ToolSpec集合；
+- provider允许的conversation prefix；
+- provider-specific cache retention。
 
-`ProviderRegistry` 是 provider/model catalog，不是 provider client pool，也不是 credential store。
+规则：
 
-它负责：
+- cache annotation只能添加到canonical content边界；
+- 不为了cache重排、删除、复制或改写content；
+- cache key不得包含secret或raw user content；
+- cache key可以基于opaque runtime salt + fingerprints；
+- cache miss不改变语义；
+- cache eviction直接发送full request；
+- cache read/write token只作为usage；
+- PromptSet fingerprint不等于provider cache key；
+- cache policy变化不改变conversation truth。
 
-- 合并 Rig 支持的内置 provider、user-global settings 中的 custom provider 和后续 user-trusted extension 声明。
-- 校验 `ProviderSpec` / `ModelSpec`，包括 `provider_id`、`model_id`、`protocol`、`base_url`、`api_model_name` 和 capabilities。
-- 提供 `resolve(ModelSelection) -> ResolvedModelSpec`。
-- 提供 `list_providers()` / `list_models()` 的协议投影数据。
-- 提供默认模型和 fallback chain 的候选解析。
+## Connection Reuse And Continuation
 
-它不负责：
+ProviderConnectionPool和ContinuationCache都属于ModelGateway implementation。
 
-- 读取 API key 或 OAuth token。
-- 构造 Rig provider client。
-- 执行模型调用。
-- 发布 model changed 事件。
+### Connection Reuse
 
-custom provider 必须显式声明 protocol：
-
-```rust
-pub struct CustomProviderConfig {
-    pub provider_id: ProviderId,
-    pub display_name: String,
-    pub protocol: ProviderProtocol,
-    pub base_url: Url,
-    pub auth_ref: AuthRef,
-    pub models: Vec<CustomModelConfig>,
-}
-
-pub struct CustomModelConfig {
-    pub model_id: ModelId,
-    pub api_model_name: String,
-    pub display_name: Option<String>,
-    pub capabilities: ModelCapabilities,
-}
-```
-
-不要用“只要填了 base_url 就自动猜 OpenAI-compatible”。显式 `ProviderProtocol` 让 provider request、tool schema、usage extraction 和错误分类都能有确定映射。
-
-custom provider 是 user-global 能力。项目级资源、项目级 settings 或未信任工作区不能声明 custom provider，也不能把默认模型指向项目提供的 base URL。这避免打开项目后把用户凭据发送到项目控制的 provider endpoint。
-
-## AuthStore
-
-`AuthStore` 是凭据解析边界。`ProviderRegistry` 只保存 `AuthRef`，不保存 secret material。
-
-```rust
-pub enum AuthRef {
-    Env { var: String },
-    Named { key: String },
-    OAuth { account_id: String, provider_id: ProviderId },
-    RuntimeOverride { key: String },
-}
-
-pub trait AuthStore: Send + Sync {
-    fn status(&self, auth_ref: &AuthRef) -> AuthStatusView;
-    fn resolve(&self, auth_ref: &AuthRef) -> Result<ResolvedAuth, AuthError>;
-}
-```
-
-`ResolvedAuth` 只允许存在于 `ModelGateway` 内部和随后的 Rig provider client / HTTP request 中。它不得实现泄漏 secret 的 `Debug` / `Display`。
-
-secret 只允许存在于：
+允许按以下safe identity复用connection：
 
 ```text
-AuthStore
-ModelGateway internal ResolvedAuth / ResolvedProviderCall
-Rig provider client/request
-actual HTTP request
+provider protocol
+endpoint identity
+auth principal opaque identity
+transport configuration
 ```
 
-secret 不得出现在：
+不能按SessionId保存credential-bearingclient作为Session state。
+
+### Continuation
+
+`previous_response_id`、incremental input或sticky provider state只在以下条件全部满足时使用：
 
 ```text
-Command
-TurnState
-DriverTurnInput
-ConversationDriveRequest
-ModelCallRequest
-DriverEvent
-agent_runtime_protocol::Event
-RuntimeSnapshot
-SessionEntry / JSONL
-RuntimeHookContext
-diagnostics 明文
-logs
+same provider protocol and endpoint
+same ModelDefinitionRef
+same auth principal opaque identity
+same purpose
+same effective generation policy
+same tool schemas and output contract
+same adapter encoding version
+previous call completed successfully
+new full logical input可证明为previous full input + previous finalized response + exact committed suffix
 ```
 
-## ModelCallRequest
+必须使用完整provider-neutral input或其canonical hash sequence证明prefix；不能只比较SessionId、TurnId、response_id或message count。
 
-`ModelCallRequest` 是 `Driver` / `SessionRuntime` 给 `ModelGateway` 的唯一 provider-neutral 请求。它携带模型选择、已由 Prompt 组装并校验的 `AssembledModelContext`、输出限制和调用目的，但不携带 credentials、raw headers、Rig provider 类型或 raw provider payload。`Compaction` 不构造第二套模型上下文；它只产出 cut/protection/directive，由 `Prompt.assemble_model_context(...)` 组装 `CompactionSummary` 用的 `AssembledModelContext`，再由 `SessionRuntime` 补齐调用策略后构造本类型。
+以下情况清除continuation candidate并发送full request：
 
-Prompt 是 `AgentRun` 和 `CompactionSummary` 的唯一模型上下文组装 seam：`Prompt.prepare_message_turn(...) -> PreparedMessageTurn -> ModelContextProfile` 固定 system/tool/profile 基线，`Prompt.assemble_model_context(...) -> AssembledModelContext` 固定 provider-neutral model messages、tool schemas、output contract、diagnostics 和 fingerprint。`ModelGateway` 只编码 `AssembledModelContext` 并调用 provider；它不读取 session storage、不判断 `MessageRecord` 可见性、不把 `Custom` / `BranchSummary` / `CompactionSummary` 等 session-domain variant 重新映射成模型消息。
+- process restart；
+- Cancel或Steer丢弃previous response；
+- previous stream partial/error；
+- Compaction Replace projection；
+- model definition变化；
+- ToolSpec或OutputContract变化；
+- capability/encoding version变化；
+- prefix proof失败；
+- provider拒绝continuation。
 
-```rust
-pub enum ModelCallPurpose {
-    AgentRun,
-    CompactionSummary,
-}
+ContinuationCache不是durable truth，不进入TurnExecutionContext，不通过SessionStorage恢复。
 
-pub struct ModelCallRequest {
-    pub session_id: SessionId,
-    pub run_id: Option<RunId>,
-    pub call_id: ModelCallId,
-    pub purpose: ModelCallPurpose,
-    pub model: ModelSelection,
-    pub input: AssembledModelContext,
-    pub thinking_level: ThinkingLevel,
-    pub stream_options: StreamOptions,
-    pub max_output_tokens: Option<u64>,
-}
-```
+## Concurrency And Rate Governance
 
-`AssembledModelContext` 是 Prompt 的输出，不是 provider DTO；其完整字段只由 [Prompt](prompt.md) 定义。ModelGateway 只依赖其中已经组装完成的 system prompt、`ModelMessage[]`、tool schemas、output contract、diagnostics 和 fingerprint，并从 `ModelCallRequest.purpose` 读取唯一调用目的；不能在本模块复制另一套可见性、排序或 purpose 规则。
-
-`ModelMessage` / `ModelTurn` 是 MiniCore-owned provider-neutral model types；session-domain `MessageRecord` 只能在 Prompt 的 `assemble_model_context()` 中转换成它们：
-
-```rust
-pub enum ModelMessage {
-    User { content: Vec<ModelContentPart> },
-    Assistant { content: Vec<ModelContentPart>, tool_calls: Vec<ModelToolCall> },
-    ToolResult { call_id: ToolCallId, content: Vec<ModelContentPart>, is_error: bool },
-}
-
-pub struct ModelTurn {
-    pub assistant: ModelMessage,
-    pub finish_reason: ModelFinishReason,
-}
-```
-
-`ModelCallPurpose` 是模型调用业务目的的唯一权威类型，并原样传播到 `ModelCallUsage` 和 future `SessionEntry::Usage`；不存在第二套 `UsagePurpose`，也不允许在 usage/persistence 层重新分类。
-
-`Retry` 不是 purpose。provider fallback / retry 由 `ModelCallAttempt` 表达，session/run 级 retry 由 `RetryReason` 或 call lineage 表达；重试后的调用仍保留原 purpose。`Background` 也不是 purpose：某个 loaded session 在客户端未显示时继续运行，它的调用仍是 `AgentRun`。未来如果增加 branch summary、session title 等真实模型任务，应增加明确业务变体，而不是恢复模糊的 `Background`。
-
-`AgentRun` 请求必须来自已校验的 `AssembledModelContext`，通常带 `tools`、完整 system prompt 和可选 `OutputContract`；`max_output_tokens` 可以为空并使用模型默认值。`CompactionSummary` 请求同样来自 Prompt 组装的 `AssembledModelContext`：属于 active/pre-run work chain 时复用同一 `ModelContextProfile` 和尽可能长的稳定 conversation prefix，只追加 typed compaction directive；standalone compaction 则通过 `prepare_message_turn()` 生成确定性 profile。调用策略禁用 tool execution，并把 directive 的输出预算写入请求；ModelGateway 不另建一条 summary prompt 路径。
-
-`max_output_tokens` 表示调用方期望的输出上限，不是 provider 已验证值。`ModelGateway` 在 provider capability validation 时必须保证它大于 0，并按 `ModelCapabilities.max_output_tokens` 拒绝或确定性裁剪；最终生效值可进入 redacted attempt/diagnostic summary，但不能由 `Compaction` 直接读取 provider capability。
-
-## ModelCallResult
-
-```rust
-pub struct ModelCallResult {
-    pub call_id: ModelCallId,
-    pub actual_model: ModelSelection,
-    pub finish_reason: ModelFinishReason,
-    pub turn: ModelTurn,
-    pub usage: Option<ModelCallUsage>,
-    pub attempts: Vec<ModelCallAttempt>,
-    pub response_summary: ProviderResponseSummary,
-}
-
-pub struct ModelCallAttempt {
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
-    pub api_model_name: String,
-    pub status: ModelCallAttemptStatus,
-    pub error_kind: Option<ModelCallErrorKind>,
-}
-
-pub struct ProviderResponseSummary {
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
-    pub status_code: Option<u16>,
-    pub request_id: Option<String>,
-    pub finish_reason: Option<String>,
-    pub usage_source: UsageSource,
-}
-```
-
-`ProviderResponseSummary` 是安全摘要，不是 raw provider response。默认不进入 session storage；如果进入 diagnostics，也必须 redacted。
-
-错误分类使用 MiniCore taxonomy，禁止上层解析 provider 字符串：
-
-```rust
-pub struct ModelCallError {
-    pub kind: ModelCallErrorKind,
-    pub message: String, // redacted, provider-neutral
-    pub retry_after: Option<Duration>,
-}
-
-pub enum ModelCallErrorKind {
-    AuthMissing,
-    AuthInvalid,
-    RateLimited,
-    ContextOverflow,
-    UnsupportedCapability,
-    SafetyBlocked,
-    Transport,
-    Provider,
-    Cancelled,
-    Protocol,
-}
-```
-
-`ModelGateway.generate_model_turn(...)` 返回 `Result<ModelCallResult, ModelCallError>`，不能把错误先擦成 generic `RuntimeError`。`Driver` 将 `ModelCallErrorKind::ContextOverflow` 映射为 provider-source `DriverError::ContextLimitExceeded`；`SessionRuntime` 根据该 recovery class 触发 overflow compaction recovery，并根据其他 transient 分类决定 retry。任何上层都不解析 Rig/provider error 文本。
-
-## 调用生命周期
-
-### Startup
+ModelGateway提供：
 
 ```text
-AgentRuntime initializes WorkspaceServices
-  → SettingsStore loads user-global provider/model settings
-  → ProviderRegistry builds builtin + user-global custom catalog
-  → AuthStore prepares env/keychain/oauth/runtime overrides
-  → ModelGateway is created as shared runtime-global invocation boundary
+global model-call limit
+per-provider route limit
+per-model limit
+optional per-auth-principal limit
 ```
 
-### Session restore
+要求：
+
+- permit wait cancellation-aware；
+- fairness至少保证FIFO admission或等价无饥饿策略；
+- 不在retry backoff期间持有permit；
+- streaming request持有permit到terminal/cancel；
+- auth refresh有独立singleflight，不占用全部model permits；
+- provider cooldown只影响对应route/principal；
+- 一个Session不能耗尽全部Runtime capacity；
+- limits是Runtime policy，不进入ModelCallPurpose或conversation fingerprint；
+- progress publisher阻塞不能占用provider stream读取。
+
+## Complete Call Flow
 
 ```text
-SessionHandle.load_committed_conversation()
-  → replays latest ModelChange { provider_id, model_id }
-  → SessionRuntime initializes ModelState
-  → invalid selection falls back through ProviderRegistry default/fallback policy
-  → diagnostics records fallback reason
-  → RuntimeSnapshot exposes model_fallback_message if needed
+Turn admission
+→ ModelGateway.resolve_for_turn(ModelSelection + preferences)
+→ TurnModelSnapshot
+→ TurnExecutionContext pins snapshot
+
+AgentLoop NeedModel
+→ PromptSet.assemble(CommittedConversationView, purpose, output contract)
+→ AssembledModelContext
+→ SessionExecutor creates ModelCallRequest
+→ RunningOperation::GenerateModelResponse
+→ ModelGateway.generate_model_turn
+   → validate snapshot/request binding
+   → choose exact provider adapter and route
+   → resolve credential and opaque auth principal
+   → encode full AssembledModelContext
+   → wait global/provider/model/auth-principal concurrency permits
+   → optional cache/continuation optimization with equivalence proof
+   → provider stream
+   → publish droppable progress
+   → normalize ordered finalized content/usage/finish reason/metadata
+   → return ModelCallResult
+→ OperationResult(SessionId + TurnId + execution_version + OperationType)
+→ SessionExecutor validates identity/version and Workspace authorization
+→ AgentLoop.accept_model_response
+→ NeedTools或Finished
+→ SessionExecutor append/apply assistant entry
 ```
 
-`ModelChange` 中保存的是 MiniCore `provider_id` / `model_id`，不是 Rig provider type，也不是 provider API model name。
+## Failure And Recovery
 
-### SetModel
+### Process Restart
+
+不恢复：
 
 ```text
-AgentCommand::SetModel { provider_id, model_id }
-  → AgentRuntime routes to SessionRuntime
-  → SessionRuntime checks CommandRunPolicy / session phase guard
-  → ProviderRegistry.resolve(ModelSelection)
-  → clamp thinking/options against ModelCapabilities
-  → batch = SessionWriteBatch::session_mutation([ModelChangeDraft(selection)])
-  → SessionHandle.commit(batch)
-  → ModelState.selected = selection
-  → emit session_model_changed
+provider stream
+connection
+retry timer
+ContinuationCache
+resolved credential
+partial draft
+transparent attempt state
 ```
 
-如果当前 run 正在进行，MVP 可以拒绝切换；完整版本可保存 typed pending session mutation，并在 `commit_pending_messages` 安全点先 commit 对应 `SessionMutation` batch，再 patch future model call。运行中的 provider request 不被中途替换。
+unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage durable truth重新assemble full context并建立新provider request。
 
-### SubmitPrompt
+### Outcome Ambiguity
+
+模型调用不是Tool side effect ledger：
+
+- transport error后provider可能已经生成或计费；
+- 未取得terminal finalized response时不能创建synthetic assistant message；
+- partial draft不持久化；
+- request已发送但尚未开始response时映射为RequestOutcomeUnknown；已产生partial response后映射为StreamInterrupted；
+- SessionExecutor可以在不重放Tool且logical call basis不变时决定retry；
+- duplicate assistant prevention依赖只有terminal ModelCallResult才能append，且append使用稳定operation key。
+
+### Projection/Storage Failure
+
+ModelGateway成功不等于assistant durable：
 
 ```text
-SubmitPrompt / prompt-like intent
-  → SessionRuntime calls ResourceManager.capture_turn_resources(...) and Tools.capture_turn_tools(...)
-  → Prompt.prepare_message_turn(...) returns PreparedMessageTurn
-  → PreparedMessageTurn.compose_user_message(intent) returns CanonicalUserMessage
-  → SessionRuntime applies bounded BeforeAgentStart / PromptBuilt / RunBeforeStart and revalidates
-  → SessionRuntime commits final UserInput and publishes invocation/message events
-  → SessionRuntime rebuilds CommittedConversationState and ConversationSeed
-  → allocate RunId + establish CurrentRun + publish run_started
-  → SessionRuntime projects DriverTurnInput { model, context_profile: ModelContextProfile, thinking_level, stream_options }
-  → Driver.drive_conversation(ConversationSeed, DriverTurnInput, ...)
-  → AgentRunStep::CallModel
-  → Driver applies NextConversationStep
-  → Driver calls Prompt.assemble_model_context(ModelContextProfile + committed conversation + transient context)
-  → AssembledModelContext validation succeeds
-  → Driver builds ModelCallRequest { model: ModelSelection, input: AssembledModelContext, ... }
-  → ModelGateway.generate_model_turn
-      → user-global ProviderRegistry.resolve(selection)
-      → user-global AuthStore.resolve(auth_ref)
-      → future BeforeModelCall hook
-      → private Rig provider adapter builds provider request/client
-      → future optional privileged redacted provider payload hook
-      → provider streaming
-      → usage normalization
-      → future AfterProviderResponse / ProviderUsageNormalized hooks
-  → Driver feeds ModelCallResult back into Rig AgentRun
-  → SessionRuntime persists messages and emits usage/run events
+ModelCallResult
+→ SessionExecutor identity/authorization validation
+→ append assistant entry
+→ apply projections
 ```
 
-### Tool-call continuation
+append失败时：
+
+- 不让AgentLoop继续到Tool execution；
+- NotCommitted可以重试同一assistant draft；
+- OutcomeUnknown按SessionWriter operation key解析；
+- 不能重新调用provider来“确认”storage结果；
+- provider response只在current operation内保留到append outcome确定。
+
+## Persistence Contract
+
+Conversation storage中的`TurnModelRef`固定为`ModelSelection + ModelDefinitionVersion + TurnModelFingerprint`，因此catalog revision变化后仍能解释historical model identity和reasoning replay compatibility。
+
+成功assistant entry保存：
 
 ```text
-Rig CallTools
-  → DriverHost::execute_and_commit_tool_round
-  → SessionRuntime
-  → Tools policy / approval / grants / executor
-  → Driver feeds tool_results back to Rig
-  → next Rig CallModel
-  → Driver builds a new ModelCallRequest with the same or patched ModelSelection
+TurnModelRef
+allowlisted response_id
+ordered finalized content[]
+normalized ModelUsage
+normalized ModelFinishReason
+Session logical retry_count
+AssembledModelContextFingerprint
+allowlisted provider metadata
 ```
 
-工具 schema 与 system prompt 必须来自同一个 `ModelContextProfile` / `AssembledModelContext` 后再进入 `ModelCallRequest`；工具执行绝不经过 `ModelGateway`，也不由 Rig high-level runner 自动执行。
-
-### Compaction execution
+不保存：
 
 ```text
-SessionRuntime compaction flow
-  → compaction::prepare_compaction(...)
-  → query current model CompactionCapabilities
-  → resolve CompactionMethod plan from trigger + user preference + capabilities
-  → SummaryModel: Prompt.assemble_model_context(...) builds compaction summary context and SessionRuntime calls ModelGateway.generate_model_turn
-  → post-MVP ProviderNative: provider adapter calls its dedicated compact endpoint
-  → CompactionResult
+raw provider request/response
+credential
+headers
+base URL
+provider SDK object
+partial stream
+transparent attempt list
+retry timer
+connection/continuation state
+full AssembledModelContext
 ```
 
-MVP baseline 使用 `SummaryModel`：调用使用同一套 auth、usage、error、cancellation 和 hook redaction 规则，但不进入 `Driver.drive_conversation(...)`。后期 `ProviderNative` 只由声明该 capability 的 adapter 执行；例如 GPT 专用 compact endpoint 可返回需要后续请求原样回传的加密、model-bound context artifact。该 artifact 只持久化一次并由同 provider adapter 注入后续 model request，不进入普通 `MessageRecord`、公共 event 或 UI snapshot；模型/provider 不兼容时必须从仍保留的原始 durable entries 重新压缩。artifact envelope、兼容 key 和 provider payload 的具体字段留待 ProviderNative integration design 定型。
+首版automatic SummaryModel compaction把同一组model/response/usage/finish/logical-retry/fingerprint字段保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
 
-## Hooks
+`retry_count`只表示Session logical retry。Gateway transparent retry count可以进入current-host diagnostics，但不作为domain lifecycle。
 
-模型/provider 边界 hook 的 owner 是 `ModelGateway`，不是 `SessionRuntime`，也不是 `Driver`。`SessionRuntime` 只拥有进入 `ModelGateway.generate_model_turn(...)` 前的 run safe point，例如 `BeforeNextModelCall`、typed context collection、队列处理和 `ModelContextProfile` rebuild；Prompt 拥有最终 provider-neutral `AssembledModelContext` 与协议校验。当前 MVP 不实现 provider hook；本节只是固定后期 hook 的边界，避免 BR-010 中的双 owner。
+Provider response ID和reasoning opaque artifact必须有长度限制和redaction validation。
 
-推荐阶段：
+## Performance
+
+目标：
+
+- `resolve_for_turn`只做local catalog lookup和validation；
+- full context encoding与provider I/O在RunningOperation执行；
+- connection pool和HTTP client跨Session共享；
+- provider/model concurrency有界；
+- progress delta可以合并；
+- provider stream reader不等待slow observer；
+- retry backoff不占permit；
+- auth refresh singleflight；
+- cache/continuation failure快速退回full request；
+- 不因optimization额外复制完整conversation多次。
+
+性能不能牺牲：
+
+- full logical request equivalence；
+- exact model pin；
+- cancellation responsiveness；
+- usage/finish/content order正确性；
+- secret redaction；
+- SessionExecutor的request响应能力。
+
+## Diagnostics
+
+ModelCallDiagnostic是bounded、redacted、provider-neutral value：
 
 ```text
-BeforeModelCall
-  provider-neutral request/options patch; no credentials
-
-BeforeProviderPayload
-  privileged, redacted, adapter-private shape; MVP may keep disabled
-
-AfterProviderResponse
-  observer; status code, request id, allowlisted headers only
-
-ProviderUsageNormalized
-  observer; receives sanitized `PersistedModelCallUsage`; no `raw_provider_usage`
+model definition ref
+adapter kind
+transport kind
+attempt ordinal
+timing category
+status class
+retry reason
+cache hit/miss/unsupported
+continuation used/full-request fallback
+request/response allowlisted IDs
 ```
 
-`BeforeProviderPayload` 是最高风险 hook。除非 Rig adapter 能提供不含 auth headers 的安全 payload，并且 MiniCore 愿意把该 payload shape 作为受控内部扩展契约，否则不得开放 raw provider payload patch。后期若先接入模型 hook，也应先接 provider-neutral `BeforeModelCall`。
-
-Hook 不能读取 `AuthStore`，不能看到 authorization header，不能保存 raw provider response，不能绕过 provider capability validation。
-
-## Usage And Events
-
-`ModelGateway` 输出单次模型调用的 `ModelCallUsage`。`Driver` 可以在一次 `drive_conversation()` 内聚合多次模型调用，最终返回 run-level `UsageSummary`；`SessionRuntime` 更新 `CurrentRunUsage`、`SessionUsageStats` 和 `ContextUsageView`。
+不得包含：
 
 ```text
-ModelGateway
-  → ModelCallUsage
-Driver
-  → current drive_conversation UsageSummary
-SessionRuntime
-  → usage_updated
-  → run_finished { usage }
-  → matching RuntimeSnapshot.loaded_sessions[*].session_stats / context_usage
+prompt正文
+user message正文
+tool arguments/results
+credential
+raw headers/body
+full URL query
+opaque encrypted reasoning
 ```
 
-`ModelCallUsage.raw_provider_usage` 如果保留，只能作为 internal redacted diagnostic，不进入 `AgentRuntimeProtocol`，不进 session JSONL，不进 hook context。写入 stable batch 前必须转换为 [UsageStats](usage-stats.md) 定义的 `PersistedModelCallUsage`；writer 不接受 runtime `ModelCallUsage` 的 raw shape。
+内容级debug需要显式secure diagnostic mode，并且仍不得记录credential。
 
-`ModelGateway` 不发布 UI event。模型文本 delta 通过 `ModelStreamSink` 进入 `DriverEvent`，再由 `SessionRuntime` 归约为 `message_assistant_*` 和 `usage_updated`。
+## Test Matrix
 
-## Skill And Tool Injection
+### Interface And Ownership
 
-技能有两个路径：
+- 只有`resolve_for_turn`和`generate_model_turn`进入Session execution；
+- SessionExecutor/AgentLoop不import Rig provider类型；
+- ModelGateway不能读取SessionStorage或Prompt definitions；
+- ProviderAdapter不能append Session entry；
+- shared Gateway并发处理多个Session；
+- 没有global current Session/model。
+
+### Model Resolution
+
+- exact provider/model selection；
+- missing provider/model；
+- catalog revision变化时active Snapshot保持旧definition；
+- future Turn取得新definition；
+- capability/limit validation；
+- reasoning preference映射；
+- unknown limits保持None；
+- project config不能注册provider/auth；
+- active Turn不执行cross-model fallback。
+
+### Prompt Mapping
+
+- System + Developer native mapping；
+- declared deterministic Developer lowering；
+- unsupported role fail closed；
+- User/Assistant/Tool order保持；
+- reasoning/text/tool call content order保持；
+- orphan ToolResult拒绝；
+- ToolSpec schema/name mapping；
+- ToolChoice None/Auto/Required/Specific；
+- JSON schema/output contract；
+- unsupported image/audio/document；
+- Gateway不截断或摘要context；
+- AssembledModelContextFingerprint不被修改；
+- assembly proof purpose/model/output-contract mismatch在ModelCallRequest constructor被拒绝。
+
+### Streaming
+
+- start/text/reasoning/tool-call delta；
+- delta queue满时合并/丢弃不影响final result；
+- publisher关闭不取消call；
+- cancellation停止progress；
+- unexpected EOF → StreamInterrupted；
+- partial draft不进入storage；
+- finalized response可以完整替换observer draft；
+- hidden reasoning不发布。
+
+### Retry
+
+- connect failure before request send透明重试；
+- NotSent/RejectedBeforeExecution允许policy retry；
+- AcceptedNoOutput/OutputStarted只在idempotent replay/exact resume时继续；
+- request delivery outcome unknown不透明重试；
+- generic 408/429/5xx或no-delta不能单独证明safe retry；
+- 401 singleflight refresh一次；
+- 429 Retry-After；
+- exponential backoff + jitter上限；
+- retry delay不持有permit；
+- first semantic delta后普通failure不blind retry；
+- WebSocket → HTTP保持same model/request；
+- 不允许provider/model substitution；
+- exhausted error交给Session logical retry；
+- Steer/Cancel使logical retry失效。
+
+### Cancellation
+
+- cancel before permit；
+- cancel during permit wait；
+- cancel duringauth resolve/refresh；
+- cancel during backoff；
+- cancel before request start；
+- cancel during stream；
+- provider terminal先于cancel时Gateway完成result；SessionExecutor仍可因version/cancel拒绝；
+- Rig AbortHandle桥接；
+- late result由execution_version拒绝。
+
+### Usage And Finish
+
+- all provider usage fields；
+- missing fields保持None；
+- no local estimate in ModelUsage；
+- failed attempt usage只进ModelGateway internal telemetry，不进入ModelCallError或Session aggregate；
+- successful response usage随assistant保存；
+- logical retry_count与transparent retry count分离；
+- Stop/ToolCalls/Length/ContentFiltered/Refused/Unknown；
+- generic Rig缺finish reason时provider-specific extraction；
+- response ID长度和字符validation。
+
+### Auth And Redaction
+
+- AuthMissing/AuthRejected；
+- OAuth refresh并发singleflight；
+- Debug/Display/Serialize不泄漏secret；
+- raw error body redaction；
+- URL/header redaction；
+- progress/result/error/storage不含credential；
+- custom endpoint HTTPS、userinfo/query/fragment和canonical path policy；
+- runtime trusted config source。
+
+### Cache And Continuation
+
+- deterministic cache annotation不改变content；
+- cache miss/full request equivalence；
+- cache token usage；
+- strict prefix continuation success；
+- Steer/Cancel/Compaction/model/tool/output change使continuation失效；
+- process restart不恢复continuation；
+- provider拒绝continuation后full request fallback；
+- concurrent continuation candidate race不发送错误delta。
+
+### Multi-Session And Performance
+
+- global/provider/model limits；
+- fairness/no starvation；
+- one Session cancellation不影响另一个；
+- one provider cooldown不影响另一个；
+- slow progress observer不阻塞stream；
+- connection pool按endpoint/auth principal隔离；
+- slow credential resolution/auth refresh不持有或耗尽model permits；
+- per-auth-principal permit在opaque principal解析后获取。
+
+### Real Adapter Integration
+
+- Rig OpenAI Responses mock server；
+- Rig Anthropic Messages mock server；
+- SSE fragmented frames；
+- WebSocket upgrade failure；
+- malformed provider payload；
+- rate-limit/status/body mapping；
+- custom base URL；
+- tool/reasoning/usage round-trip；
+- cancellation and connection close。
+
+## Source Plan
+
+推荐实现：
 
 ```text
-explicit SkillPromptIntent
-  → target PreparedMessageTurn / compose_user_message(...) formats captured skill body as CanonicalUserMessage
-
-available skill summaries
-  → PromptResourceView.materials
-  → Prompt.prepare_message_turn(...) builds ModelContextProfile
+src/model_gateway.rs
+src/model_gateway/model.rs
+src/model_gateway/request.rs
+src/model_gateway/response.rs
+src/model_gateway/error.rs
+src/model_gateway/catalog.rs
+src/model_gateway/auth.rs
+src/model_gateway/concurrency.rs
+src/model_gateway/retry.rs
+src/model_gateway/cache.rs
+src/model_gateway/continuation.rs
+src/model_gateway/redaction.rs
+src/model_gateway/provider.rs
+src/model_gateway/provider/rig.rs
+src/model_gateway/provider/fake.rs
 ```
 
-技能不直接选择 provider/model，也不接触 auth。
+这是一个module及其private implementation文件，不建立provider crate hierarchy，除非真实build time或dependency isolation证明需要拆分。
 
-工具有两个模型可见路径：
+## Rejected Designs
 
-```text
-system prompt snippets/guidelines
-provider tool schemas in ModelCallRequest.input.tools
-```
+### SessionExecutor直接调用Rig provider
 
-`ModelGateway` 可以把 `ToolSchema` 转成 provider/Rig 需要的 provider-specific tool schema，但不能执行工具。若模型不支持 tools，`SessionRuntime` / `ActiveToolSet` 应根据 `ModelCapabilities.supports_tools` 过滤或禁用 active tools，并给 UI 诊断。
+否决原因：provider type、auth、base URL、retry、usage和error会扩散到Session execution。
 
-## Custom Provider Examples
+### ModelGateway重新组装Prompt
 
-OpenAI-compatible：
+否决原因：产生第二个model-visible context seam，破坏Transcript-First。
 
-```text
-provider_id = "acme-openai"
-protocol = OpenAiChatCompletions
-base_url = "https://api.acme.example/v1"
-auth_ref = Env("ACME_API_KEY")
-model_id = "qwen3-coder"
-api_model_name = "Qwen/Qwen3-Coder"
-```
+### 公开PreparedModelTurn
 
-Anthropic-compatible：
+否决原因：增加stale plan和dropped prepared lifecycle，不能提高caller leverage。
 
-```text
-provider_id = "acme-anthropic"
-protocol = AnthropicMessages
-base_url = "https://anthropic-proxy.acme.example"
-auth_ref = Named("acme-anthropic")
-model_id = "claude-compatible"
-api_model_name = "claude-sonnet-4-5"
-```
+### 公开ModelTurnSession
 
-两者都走同一路径：
+否决原因：让SessionExecutor管理第二个turn-scoped state owner；connection/continuation可以private复用。
 
-```text
-ProviderRegistry
-  → ModelGateway
-  → private Rig provider adapter with overridden base_url / api_model_name / auth
-```
+### 返回raw provider stream
 
-## Grilling 结论
+否决原因：caller必须理解provider event、terminal EOF、retry和partial draft；error/usage normalization失去locality。
 
-需要被测试和持续追问的边界：
+### active Turn自动跨模型fallback
 
-- 阶段 5 的 text-only driver 是否已经只通过 `ModelGateway.generate_model_turn(...)`，没有临时 provider/auth 路径。
-- Rig provider API 是否支持 custom `base_url`、headers、streaming、usage extraction、tool schema 和 cancellation。
-- `Driver` 是否真的不 import provider registry/auth，也不解析 provider errors。
-- `BeforeProviderPayload` 是否能做到 redacted；做不到就不开。
-- `ModelGateway` 是否只把 `AssembledModelContext` 编码成 provider DTO，而不重新判断 session message visibility。
-- `ModelSummary` 是否只在 protocol/snapshot 中出现，执行路径是否只用 `ModelSelection`。
-- `ModelCallUsage` 和 run-level `UsageSummary` 是否不会重复计数。
-- compaction summary 是否使用 `ModelCallPurpose::CompactionSummary`，复用 active work chain 的稳定 profile/prefix，并通过 call policy 禁用 tool execution。
-- `ModelCallRequest.purpose` 是否原样进入 `ModelCallUsage` / future `SessionEntry::Usage`，没有 `UsagePurpose` 转换层。
-- provider fallback、session retry 和后台 session 运行是否都不会把 purpose 改写为 `Retry` / `Background`。
-- session restore 中失效模型是否有明确 fallback / diagnostics / snapshot 展示，而不是静默换模型。
+否决原因：破坏exact Model pin，改变capabilities、limits、cost和语义。
 
-## 必测项
+### 把provider attempt持久化为ModelAttempt entity
 
-- early spine：`Driver/SessionDriverHost -> ModelGateway.generate_model_turn(ModelCallRequest)` 是阶段 5 唯一模型调用路径；`Driver` / `SessionDriverHost` 不 match provider id、不读 env、不构造 Rig provider client。
-- `ProviderRegistry.resolve(ModelSelection)`：builtin/custom、invalid provider、invalid model、capability projection。
-- minimal provider registry：阶段 4/5 可只支持 fake/minimal provider，但仍必须走 `ProviderRegistry` / `AuthStore` seam。
-- `SetModel`：phase guard、session entry、`session_model_changed`、snapshot 当前模型一致。
-- auth redaction：snapshot/event/session entry/diagnostics/hook context 不含 API key、OAuth token、authorization header。
-- custom provider：OpenAI-compatible / Anthropic-compatible 的 `base_url + api_model_name + auth_ref` 能传到 Rig adapter。
-- custom provider 来源：项目级资源/settings 不能注册 custom provider、覆盖 base URL 或引用新的 `AuthRef`；只有 user-global 配置或后续 user-trusted extension 可以声明 custom provider。
-- submit flow：`TurnState.model.selection -> DriverTurnInput.model -> ModelCallRequest.model -> ProviderRegistry.resolve` 不丢失，`ConversationSeed -> AssembledModelContext -> ModelCallRequest.input` 不被 ModelGateway 重新裁剪。
-- error taxonomy：auth missing、rate limit、context overflow、cancelled 不靠字符串解析给上层。
-- usage：多次 `model -> tools -> model` 的 `ModelCallUsage` 聚合成一次 run `UsageSummary`，不重复计数。
-- purpose：`AgentRun` / `CompactionSummary` 从 request 到 usage/persistence 原样传播；retry/fallback 只改变 attempt/lineage metadata。
-- compaction：Compaction directive 由 Prompt 转成 `ModelCallPurpose::CompactionSummary` 的 `AssembledModelContext`，复用稳定 profile/prefix，以 `OutputContract::NoToolCalls` 禁止工具执行，带明确 `max_output_tokens`，usage 归入 compaction purpose。
+否决原因：attempt是transport/execution detail，不是领域事实；会扩大storage和recovery surface。
+
+### 把partial stream写SessionStorage
+
+否决原因：一个finalized assistant response应对应一个entry；partial draft不可恢复且会制造重复usage和content ordering问题。
+
+### 根据model name猜capability
+
+否决原因：custom provider和alias会使行为不确定；capability必须来自validated definition。
+
+### 使用response_id作为conversation truth
+
+否决原因：provider state不可替代完整committed transcript；continuation必须证明full logical equivalence。
+
+## 完成检查
+
+- [x] 定义ModelGateway ownership和deep interface。
+- [x] 定义ModelSelection、ModelDefinitionRef和TurnModelSnapshot。
+- [x] 定义capabilities、effective limits和role mapping。
+- [x] 定义AssembledModelContext到provider request的职责。
+- [x] 定义ToolSpec、tool choice和OutputContract mapping。
+- [x] 定义stream progress和finalized response。
+- [x] 定义usage、finish reason和provider metadata。
+- [x] 定义provider retry、transport fallback和logical retry边界。
+- [x] 禁止active Turn cross-model fallback。
+- [x] 定义cancellation、auth、redaction和custom provider规则。
+- [x] 定义cache、connection reuse和continuation等价性规则。
+- [x] 定义multi-session concurrency和rate governance。
+- [x] 定义persistence、recovery、performance和test matrix。
+- [ ] 执行Rig 0.40.0 ModelGateway integration spike。
+- [ ] 实现ModelGateway和provider adapters。
+- [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
+- [x] 在阶段9冻结公开model catalog/query协议。

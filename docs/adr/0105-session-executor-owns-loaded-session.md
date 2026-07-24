@@ -1,0 +1,44 @@
+# ADR 0105: SessionExecutor 拥有 loaded Session
+
+状态：Accepted
+日期：2026-07-24
+
+## 背景
+
+一个 loaded Session 必须在 Context 构造、Model 调用或 Tool 执行等待外部 I/O 期间，持续处理 Submit、Steer、FollowUp、Interaction resolution、Cancel、snapshot 和 shutdown 请求。
+
+- 若在 Session 状态 owner 内内联等待整个 Agent run，会阻塞请求处理，并在 approval 流程上产生死锁；
+- 若允许 Model/Tool task 直接修改 Session 状态，SessionWriter、projection 与 terminal 顺序会散落到多个 owner；
+- 一个 Runtime 需要同时运行多个 loaded Session，且它们共享 Model、Tool 等服务。
+
+需要一个明确、单一的执行期 owner，同时保持异步操作与请求处理解耦。详见 [Session Execution 模块](../modules/session-execution.md)。
+
+## 决策
+
+- 每个 loaded Session 拥有恰好一个 `SessionExecutor`，它是该 Session 执行期 mutable state 的唯一 owner：SessionWriter、committed projections、`CurrentTurnExecution`、execution version 与 bounded `SessionRequestQueue`。
+- 外部调用方只持有可克隆的 `SessionExecutionHandle`，不能借用或加锁 Executor 状态；所有请求（含 Tool control、Workspace authorization revocation）经同一个 bounded FIFO 进入。
+- 一个 Runtime 允许多个 `SessionExecutor` 同时 `Running`；每个 Session 独立推进，最多一个 Starting/Running Turn。
+- 执行期 state 只有 `Idle → Starting → Running → Finishing → Idle`；WaitingApproval/Sampling/Compacting/ExecutingTools 是 Running Turn 的阶段，不写 SessionStorage。
+- Context 构造、UserMessage composition、Model 调用与 Tool 执行作为 cancellable `RunningOperation` 异步运行；结果携带 `SessionId + TurnId + execution_version + OperationType` 校验，过期结果被忽略，只有 Tool 越过 `ToolExecutionStarted` 的 outcome 必须确认并保存。
+- private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
+- 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。
+- restart 不恢复旧的异步操作、queue 或 waiter；unfinished Turn 按 recovery 规则保守 terminalize（closure、preserve tool messages、ToolAbandoned、TurnInterrupted）。
+- multi-session 共享 Model/Tool 时使用明确并发限制（ModelGateway provider 配额）与 canonical resource locks（ToolService 按物理资源 identity），不以 SessionId 代替资源 identity。
+- 上下文压缩由 `SessionExecutor` 编排为 `CompactConversation` operation，不由 Driver 或 AgentLoop 拥有。
+
+## 后果
+
+- 执行顺序与线性化点集中在单一 owner，entry / projection / event 顺序可独立测试。
+- 单一权威 owner 加异步 operation 分离，避免 lock-across-await 死锁，同时保持控制请求响应性。
+- 多 Session 可后台并发执行，共享服务用配额与 resource locks 协调；UI selection 不影响后台执行。
+- 迟到结果与副作用真实性通过 version 校验和 outcome 确认规则处理，不宣称 exactly-once。
+- AgentLoop 可替换（含 Rig adapter），因为它不触碰 storage 与 I/O 顺序。
+
+## 历史
+
+本 ADR 属 V2 决策集，取代以下 V1 决策，原文见 `docs/archive/v1/adr/`：
+
+- ADR 0025（一个 loaded Session 一个 SessionExecutor）；
+- ADR 0021（actor/run 分离的 two-task 形状）；
+- ADR 0004（SessionManager 拥有 loaded runtime）；
+- ADR 0002（compaction 由 session runtime 编排）。

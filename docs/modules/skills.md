@@ -1,296 +1,565 @@
-# Skills
+# Skill 子系统架构设计
 
-`skills.rs` 是和 `resource_manager.rs`、`session_runtime.rs` 平级的技能文件能力模块。它不拥有资源生命周期，也不拥有会话运行生命周期；它提供技能元数据、技能目录数据结构，以及发现、解析、校验和格式化辅助函数。
+状态：当前权威架构（设计已冻结，实现进行中）
+日期：2026-07-16
 
-技能不是工具，也不是插件代码。技能是 Markdown 指令包：它可以告诉模型“遇到某类任务时应采用什么流程”，但真正的本地副作用仍然只能通过 `SessionRuntime` 持有的 session-scoped `Tools` 子系统发生，并受工具策略、审批、工作区沙箱和 executor 约束。
+## 目的
 
-## 设计定位
+本文定义 MiniCore Skill 子系统的基础对象、所有权、渐进披露、按需加载、缓存、失效和 Prompt Injection 关系。
 
-建议代码布局：
-
-```text
-src/
-  agent_runtime.rs
-  session_runtime.rs
-  resource_manager.rs
-  skills.rs
-  tools.rs
-  driver.rs
-```
-
-职责边界：
+本文以以下关系为基础：
 
 ```text
-ResourceManager
-  owns: 技能来源 roots、trust gate、runtime/cwd 分层、cwd reload、overlay、current snapshot、diagnostics
-
-skills.rs
-  provides: SkillMetadata / SkillResource / SkillCatalog 数据结构，以及给定目录后的发现、metadata 解析、校验、去重、prompt 格式化 helper
-
-PreparedMessageTurn
-  owns: 结构化 PromptIntent::Skill 展开、从 captured PromptResourceView 取正文、<skill> 块构造和 CanonicalUserMessage 生成
-
-SessionRuntime
-  owns: /skill intent admission、PromptDelivery、目标 turn capture、入队或启动 run
+MiniCoreRuntime 初始化一个 Arc<SkillService>
+Runtime 将该 Service 注入 loaded Session execution / TurnExecutionContext
+Turn 领域对象不持有 Skill、Skill Catalog、LoadedSkill 或 TurnSkills
+TurnExecutionContext pin SkillCatalog，并通过 exact reference 延迟加载 Skill
+Injection 层把已加载 Skill 转换为本轮 Prompt contribution
 ```
 
-`skills.rs` 可以被 `ResourceManager` 和 `Prompt` 同时调用，但它本身不是 runtime service。模型可见技能的生命周期和 cwd-over-runtime overlay 由 `ResourceManager` 负责。
+以下内容不在本设计范围内：
 
-## 与 ResourceManager 的边界
+- BuiltIn、Runtime、User、Workspace、Agent、Session 等 Skill 层级；
+- 不同 Skill 来源之间的优先级、覆盖和 namespace 规则；
+- Skill 配置的持久化格式；
+- Skill invocation 的 protocol method 和 Item 表达；
+- 文件监听器、远程 Skill source 或插件协议的具体实现；
+- manager、actor 或 storage 的最终划分。
 
-`skills.rs` 和 `ResourceManager` 会共享 skill 数据结构，但不能共同拥有同一段生命周期。推荐边界是：
+## 决策摘要
 
-| 能力 | `skills.rs` | `ResourceManager` |
-| --- | --- | --- |
-| 定义 `SkillMetadata` / `SkillResource` / `SkillCatalog` | 是 | 使用这些类型 |
-| 在给定目录中发现 `SKILL.md` | 是，作为纯 helper | 决定给哪些目录调用 helper |
-| 解析 frontmatter、校验 name/description | 是 | 不做格式细节 |
-| 剥离 frontmatter、格式化 `<available_skills>` / `<skill>` | 是 | 不拼消息、不拼最终 prompt |
-| 决定 builtin / user-global / cwd/project skill roots | 否 | 是 |
-| project trust gate | 否 | 是 |
-| runtime/global 与 cwd/project 分层 | 否 | 是 |
-| cwd 覆盖 runtime 的 overlay | 否 | 是 |
-| runtime-once / cwd ensure / cwd reload 生命周期 | 否 | 是 |
-| 发布 current `RuntimeResourceSnapshot` / `CwdResourceSnapshot` | 否 | 是 |
-| `resources_changed` 所需 skill summary / diagnostics | 提供 summary 数据/格式 helper | 提供 resolved selected resources，由 `AgentRuntime` 发布事件 |
-| `/skill <name>` / `/skill:name` command text 解析 | 否 | 否，属于 `CommandManager.resolve_for_execution` |
-| skill intent 构造 user message | 否，提供格式化 helper | 否，属于 `PreparedMessageTurn.compose_user_message()` |
+本设计确定以下要点：
 
-一句话：`skills.rs` 负责“skill 长什么样、如何解析、如何格式化”；`ResourceManager` 负责“skill 从哪里来、何时加载、如何分层覆盖、哪一版对当前 turn 可见”。
+- `SkillService` 在 `MiniCoreRuntime` 启动时初始化；
+- 一个 Runtime 内的 loaded Session execution 共享同一个 `Arc<SkillService>`；
+- durable Session/SessionDefinition 不持有 Service handle，也不复制 Skill definitions、references、Catalog entries 或正文；
+- SkillService 负责 Skill 发现、metadata 解析、过滤、Catalog 构建、完整内容加载、解析、缓存、失效和 diagnostics；
+- Skill Catalog 是轻量、可重建的 metadata snapshot；
+- Catalog 不包含完整 Skill 内容；
+- Skill 内容默认按需加载；
+- Turn 对象不保存任何 Skill 字段；
+- 哪一个 Turn 在执行期间需要哪个 Skill，由 Turn execution 决定；
+- TurnExecutionContext 使用 pinned Catalog context 通过 SkillService 请求 Skill；
+- `SkillInjector` 只负责把已经加载的 Skill 转换成 Prompt contribution；
+- Prompt 负责把 Skill contribution 与其他输入组装成最终模型上下文；
+- 已加载 Skill 内容是不可变值；
+- cache 失效不会修改已经返回的 `Arc<LoadedSkill>`；
+- Catalog 或内容失效影响后续 catalog/load 结果，不回写已经开始的模型调用。
 
-`SkillCatalog` 作为数据结构可以定义在 `skills.rs`，但 current catalog 的生命周期 owner 是 snapshot：
+## 对象关系
 
 ```text
-RuntimeResourceSnapshot.skills
-CwdResourceSnapshot.local.skills
-CwdResourceSnapshot.resolved.skills
-TurnResourceSnapshot.cwd.resolved.skills
+MiniCoreRuntime
+└─ Arc<SkillService>
+   ├─ SkillSourceAdapter*
+   ├─ SkillCatalogCache
+   ├─ SkillContentCache
+   ├─ SkillLoadStateStore
+   └─ SkillDiagnostics
+
+loaded Session execution
+└─ Runtime 注入 Arc<SkillService>
+
+TurnExecutionContext
+├─ pinned SkillCatalogContext
+├─ Arc<SkillCatalog>
+└─ SkillService::load(SkillLoadRequest { pinned context, pinned entry })
+      └─ Arc<LoadedSkill>
+         └─ SkillInjector
+            └─ PromptContribution
+               └─ committed input normalization
 ```
 
-因此 `skills.rs` 可以创建 catalog，`ResourceManager` 决定 catalog 何时创建、如何 overlay、何时发布。
+## MiniCoreRuntime
 
-## 设计原则
-
-`skills.rs` 只提供给定输入后的发现、metadata/frontmatter 解析、校验、去重、诊断和格式化 helper。资源 roots、trust、overlay、snapshot 和 reload 归 `ResourceManager`；显式调用的 delivery 归 `SessionRuntime`；skill body 到普通 user message 的组装归 `PreparedMessageTurn.compose_user_message()`。
-
-pi coding-agent 的技能加载和显式注入路径可以作为参考对象，但不构成 MiniCore 的类型、文件布局或行为兼容承诺。MiniCore 的权威 interface 和不变量只由本文件及 ResourceManager/Prompt 文档定义。
-
-## 技能发现和 metadata 加载
-
-`ResourceManager.reload_cwd()` / `ensure_cwd_snapshot()` 负责决定来源，`skills.rs` 负责把给定路径转换成 skill candidate / catalog 数据。
-
-MVP 技能发现规则：
-
-- 若目录包含 `SKILL.md`，该目录就是一个技能根，并且不再向下递归。
-- 若目录不包含 `SKILL.md`，递归子目录寻找 `SKILL.md`。
-- 根目录直接 `.md` 文件也可以作为轻量技能加载。
-- 遵守 `.gitignore`、`.ignore`、`.fdignore`。
-- 跳过隐藏目录和 `node_modules`。
-- 跟随可解析的 symlink，并用 canonical path 去重。
-- 缺失目录静默跳过；不可读、解析失败或元数据无效产生诊断。
-
-加载规则：
-
-- frontmatter 中 `description` 必填。
-- `name` 可来自 frontmatter；缺省时使用父目录名。
-- `name` 限制为小写字母、数字和连字符，长度上限 64。
-- `description` 长度上限 1024。
-- `disable-model-invocation: true` 表示不让模型主动发现该技能。
-- 同名技能按确定顺序 first wins，loser 产生 collision diagnostic。
-- 同一真实文件路径通过 symlink 重复出现时静默去重。
-
-## 数据结构
-
-MiniCore 的 `ResourceManager` snapshot 要求 selected skill 保存 stable body content，或保存 content hash + immutable loaded content reference。这样 running turn 不会在 reload 或文件修改后读到与 captured catalog 不一致的正文。
+`MiniCoreRuntime` 是 SkillService 的创建者和生命周期 owner：
 
 ```rust
-pub struct SkillMetadata {
-    pub name: SkillName,
-    pub description: String,
-    pub file_path: PathBuf,
-    pub base_dir: PathBuf,
-    pub source: ResourceSourceInfo,
-    pub disable_model_invocation: bool,
+pub struct MiniCoreRuntime {
+    pub prompt_service: Arc<PromptService>,
+    pub tools: Arc<ToolService>,
+    pub skills: Arc<SkillService>,
+}
+```
+
+Runtime 启动时：
+
+1. 创建 Skill source adapters；
+2. 创建 `SkillService`；
+3. 初始化基础 discovery 和 metadata Catalog；
+4. 将同一个 `Arc<SkillService>` 注入后续 loaded Session execution / Turn capture；
+5. Runtime shutdown 时停止新的 discovery/load，并释放子系统资源。
+
+## Session
+
+Durable Session 和 SessionDefinition 不保存 SkillService、Catalog 或正文：
+
+```text
+Session / SessionDefinition
+≠ Arc<SkillService>
+≠ SkillCatalog
+≠ LoadedSkill
+≠ Skill cache
+```
+
+Runtime 在 load/capture 时把同一个 SkillService 注入 Session execution。Turn admission 使用 exact AgentRevisionRef、SessionDefinitionRevision 和本 Turn pin 的 WorkspaceSkillContext 构造 SkillCatalogContext；SkillService 不能从 SessionId 回查 current SessionDefinition 或自行扩大 Workspace Skill source。
+
+完整 Agent/Session lifecycle 见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)，Workspace 授权见 [Workspace 子系统架构设计](workspace.md)。
+
+## Turn
+
+Turn 对象不持有 Skill：
+
+```rust
+pub struct Turn {
+    pub id: TurnId,
+    pub session_id: SessionId,
+    pub started_at: Timestamp,
+    pub status: TurnStatus,
+}
+```
+
+Turn 不包含：
+
+```text
+skills
+TurnSkills
+SkillCatalog
+CatalogRevision
+SkillRef
+SkillId[]
+LoadedSkill[]
+```
+
+Turn 执行期间若确定需要某个 Skill，TurnExecutionContext 使用本 Turn 已捕获的 SkillCatalog entry 和 `WorkspaceSkillContext` 请求完整内容。加载结果进入 Injection 和输入规范化流程，不写回 Turn 对象。Skill load 不能通过 `skill_id + current Session context` 重新解析 future Catalog，也不能把 SkillInjection 作为未提交的 current-call Prompt 旁路。完整 pinning、input composition 和 reload 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
+
+## SkillService
+
+`SkillService` 是 Skill 子系统的深模块，对外隐藏 discovery、文件读取、解析、过滤、cache、并发去重、失效和 diagnostics：
+
+```rust
+pub struct SkillService {
+    sources: Vec<Arc<dyn SkillSourceAdapter>>,
+    catalog_cache: SkillCatalogCache,
+    content_cache: SkillContentCache,
+    load_states: SkillLoadStateStore,
+    diagnostics: SkillDiagnostics,
+}
+```
+
+Catalog context 固定当前 Agent、Session 和 Turn-pinned Workspace Skill view：
+
+```rust
+pub struct SkillCatalogContext {
+    pub agent: AgentRevisionRef,
+    pub session_id: SessionId,
+    pub session_revision: SessionDefinitionRevision,
+    pub workspace: WorkspaceSkillContext,
 }
 
-pub struct SkillResource {
+pub struct SkillLoadRequest {
+    pub context: SkillCatalogContext,
+    pub entry: SkillCatalogEntryRef,
+}
+```
+
+基础 interface：
+
+```rust
+impl SkillService {
+    pub async fn initialize(&self) -> Result<(), SkillError>;
+
+    pub async fn catalog(
+        &self,
+        context: SkillCatalogContext,
+    ) -> Result<Arc<SkillCatalog>, SkillError>;
+
+    pub async fn load(
+        &self,
+        request: SkillLoadRequest,
+    ) -> Result<Arc<LoadedSkill>, SkillLoadError>;
+
+    pub async fn invalidate(
+        &self,
+        request: SkillInvalidation,
+    ) -> Result<(), SkillError>;
+}
+```
+
+`catalog()` 只返回 metadata。`load()` 才允许读取和解析完整正文。
+
+`load()` 必须：
+
+- 使用 Catalog 返回的 `SkillCatalogEntryRef` 精确定位 source；
+- 使用与该 Catalog 相同的 pinned `SkillCatalogContext`；
+- 校验 Workspace authorization lease 仍有效；
+- 校验 entry 的 version、content hash、location 和 source stamp；
+- 不重新查询 current Catalog；
+- 不把相同 `SkillId` 静默解析到更新后的正文。
+
+## Skill Source Adapter
+
+不同物理来源通过内部 adapter 接入 SkillService：
+
+```rust
+pub trait SkillSourceAdapter: Send + Sync {
+    async fn discover(
+        &self,
+        context: &SkillCatalogContext,
+    ) -> Result<Vec<DiscoveredSkill>, SkillSourceError>;
+
+    async fn read(
+        &self,
+        request: &SkillSourceReadRequest<'_>,
+    ) -> Result<Vec<u8>, SkillSourceError>;
+}
+
+pub struct SkillSourceReadRequest<'a> {
+    pub context: &'a SkillCatalogContext,
+    pub entry: &'a SkillCatalogEntryRef,
+}
+```
+
+Workspace Skill source adapter 只能使用 `SkillCatalogContext.workspace` 中的 authorized source roots，并在 discover/read 时校验 authorization lease 和 source stamp。BuiltIn/User adapter 可以忽略 Workspace roots，但不能伪造 Workspace source stamp。本设计不定义 BuiltIn/User/Workspace/Agent/Session 等来源层级和优先级。
+
+```rust
+pub struct DiscoveredSkill {
+    pub location: SkillLocation,
+    pub modified_at: Option<Timestamp>,
+    pub content_hash: Option<ContentHash>,
+    pub source_stamp: SkillSourceAuthorizationStamp,
+}
+```
+
+## Skill Catalog
+
+Catalog 是渐进披露的第一阶段，只包含轻量 metadata：
+
+```rust
+pub struct SkillCatalog {
+    pub revision: CatalogRevision,
+    pub fingerprint: SkillCatalogFingerprint,
+    entries: Arc<[SkillCatalogEntry]>,
+}
+
+pub struct SkillCatalogEntry {
     pub metadata: SkillMetadata,
-    pub body: Arc<str>,
+    pub reference: SkillCatalogEntryRef,
+}
+
+pub struct SkillMetadata {
+    pub id: SkillId,
+    pub version: DefinitionVersion,
+    pub name: SkillName,
+    pub description: String,
+    pub path: PathBuf,
+    pub scope: SkillScope,
     pub content_hash: ContentHash,
 }
 
-pub struct SkillSummary {
-    pub name: SkillName,
-    pub description: String,
-    pub file_path: PathBuf,
-    pub source: ResourceSourceInfo,
-    pub disable_model_invocation: bool,
-}
-
-pub struct SkillCatalog {
-    pub skills: Vec<SkillResource>,
-    pub diagnostics: Vec<ResourceDiagnostic>,
+pub struct SkillCatalogEntryRef {
+    pub catalog_revision: CatalogRevision,
+    pub id: SkillId,
+    pub version: DefinitionVersion,
+    pub content_hash: ContentHash,
+    pub location: SkillLocation,
+    pub source_stamp: SkillSourceAuthorizationStamp,
 }
 ```
 
-`SkillDocument` 可以作为显式调用或 `ResourceQuery::GetSkill` 的临时值，但不应放进 `agent_runtime_protocol::RuntimeSnapshot`：
+`SkillCatalogEntryRef` 是 lazy load 的 pinned identity。`SkillCatalog::entries()` 返回同时包含 metadata 和 reference 的不可变 entry；调用方不需要按 SkillId 回查 current Catalog。模型可见 projection 只暴露必要 metadata，省略 location 和 source stamp。
+
+`SkillScope` 只作为 metadata 和 filtering 输入，不定义层级、覆盖或优先级语义：
 
 ```rust
-pub struct SkillDocument {
+pub struct SkillScope;
+```
+
+Catalog 必须满足：
+
+- 不包含 Skill 正文；
+- fingerprint 覆盖稳定排序后的完整 SkillCatalogEntryRef 和模型可见 metadata；
+- metadata 顺序确定；
+- `SkillId` 稳定；
+- `SkillName` 冲突必须产生明确 diagnostics；
+- Catalog revision 在有效 metadata 集合变化时改变；
+- Catalog 可以从 Skill sources 重新构建；
+- UI 可见 Catalog 与模型可见 Catalog 可以使用不同安全投影。
+
+模型披露建议只暴露必要字段，避免自动泄漏本地绝对路径：
+
+```rust
+pub struct ModelVisibleSkillMetadata {
+    pub id: SkillId,
+    pub name: SkillName,
+    pub description: String,
+}
+```
+
+## 完整 Skill 内容
+
+完整内容只在 `load()` 后产生：
+
+```rust
+pub struct LoadedSkill {
     pub metadata: SkillMetadata,
+    pub reference: SkillCatalogEntryRef,
+    pub content: Arc<SkillContent>,
+}
+
+pub struct SkillContent {
     pub body: String,
 }
 ```
 
-## 函数能力
+精确定义身份为：
 
-`skills.rs` 建议提供函数，而不是提供一个长期持有状态的 loader service：
+```text
+SkillId + DefinitionVersion + ContentHash
+```
+
+正文变化必须形成新的 version 或 content hash。加载状态变化不改变 Skill 定义身份。
+
+## 加载状态
+
+SkillService 单独维护实际加载状态：
 
 ```rust
-pub fn load_skill_catalog(inputs: SkillLoadInputs) -> Result<SkillCatalog, ResourceError>;
-pub fn load_skills_from_dir(dir: &Path, source: ResourceSourceInfo) -> SkillLoadReport;
-pub fn parse_skill_metadata(path: &Path, markdown: &str, source: ResourceSourceInfo) -> Result<SkillMetadata, SkillError>;
-pub fn strip_skill_frontmatter(markdown: &str) -> String;
-pub fn format_available_skills(catalog: &SkillCatalog, active_tools: &[ToolName]) -> String;
-pub fn format_skill_block(metadata: &SkillMetadata, body: &str) -> String;
+pub enum SkillLoadState {
+    Unloaded,
+    Loading,
+    Loaded,
+    Failed {
+        message: String,
+    },
+}
 ```
 
-显式调用时，目标 `PreparedMessageTurn` 应从 captured `PromptResourceView` 取得 `SkillResource.body`，再调用 `format_skill_block()`。该 view pin 住对应 `TurnResourceSnapshot`，因此 message 构造集中在 Prompt 组装 seam，`skills.rs` 只提供纯辅助能力，同时不绕过 snapshot 原子性。
+加载状态不进入 Session、Turn、SkillMetadata 或 SkillContent。
 
-## 模型可见技能摘要
+基础规则：
 
-模型可见技能摘要采用以下稳定结构：
+- Catalog metadata 可用不代表正文已经加载；
+- 同一正文 identity 的并发 load 应合并为一次底层读取和解析；
+- content cache 保存不可变 `Arc<SkillContent>`，不缓存带某个 Session source stamp 的完整 LoadedSkill；
+- load 失败进入 diagnostics，并允许后续按失效或重试规则重新加载；
+- 默认 baseline 是 metadata discovery + content lazy load；
+- 不引入 Eager/Lazy/Manual 多级 LoadPolicy；Skill 不使用领域模型中仅适用于 PromptDefinition 的 `DefinitionOverrides.load_policy`。
+
+## Cache
+
+内容 cache 使用精确定义身份作为 key：
 
 ```text
-The following skills provide specialized instructions for specific tasks.
-Use the read tool to load a skill's file when the task matches its description.
-When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.
-
-<available_skills>
-  <skill>
-    <name>...</name>
-    <description>...</description>
-    <location>...</location>
-  </skill>
-</available_skills>
+SkillCacheKey {
+    skill_id,
+    version,
+    content_hash,
+}
 ```
 
-该结构必须遵守两个约束：
+cache 规则：
 
-- 只列出 `disable_model_invocation == false` 的技能。
-- 只有 active tools 中包含 `read` 时，才把可见技能列表放进 system prompt。
+- 同一个 key 返回同一个或等价的不可变 `Arc<SkillContent>`；
+- content cache 不保存 `SkillCatalogEntryRef`、source stamp 或 authorization lease；
+- 每次 `load()` 都先校验 request 中的 pinned entry、source stamp 和 authorization lease，再用 request 的 metadata/reference 包装新的 `LoadedSkill`；
+- 不同 Session 或 source grant 可以共享相同正文 bytes，但不能共享错误 provenance；
+- cache 不改变 SkillMetadata；
+- cache eviction 不改变 Catalog；
+- Catalog metadata 指向新 content hash 时，后续 load 使用新 key；
+- 已经返回的 `Arc<SkillContent>` 和 `Arc<LoadedSkill>` 不被原地修改。
 
-摘要会指示模型通过 `read` 加载技能文件；如果当前会话没有 `read`，把技能位置暴露给模型会形成不可执行的承诺。用户显式 skill intent 不受这个限制，因为目标 `PreparedMessageTurn` 会直接展开 captured 正文。
+## Injection
 
-## 显式技能调用
+Injection 层只消费已经加载的 Skill：
 
-显式调用的 delivery 属于 `SessionRuntime`，组装属于 `PreparedMessageTurn`：
+```rust
+pub struct SkillContributionRef {
+    pub catalog_revision: CatalogRevision,
+    pub skill_id: SkillId,
+    pub version: DefinitionVersion,
+    pub content_hash: ContentHash,
+    pub source_stamp: SkillSourceAuthorizationStamp,
+}
+
+pub struct SkillInjection {
+    pub reference: SkillContributionRef,
+    pub contribution: PromptContribution,
+}
+
+pub struct SkillInjector;
+
+impl SkillInjector {
+    pub fn build(skill: &LoadedSkill) -> Result<SkillInjection, SkillInjectionError>;
+}
+```
+
+SkillInjector 从 `LoadedSkill.reference` 生成 `SkillContributionRef`。该引用必须进入 PromptContribution source/stamp 和最终 fingerprint，使 TurnExecutionContext 与 PromptSet 可以验证 Catalog entry、LoadedSkill 正文与注入内容来自同一 pinned identity。
+
+职责划分：
 
 ```text
-InvokeSkill、/skill <name> 或兼容 /skill:name
-  → CommandManager resolves PromptIntent::Skill
-  → SessionRuntime admits intent by PromptDelivery
-  → target turn captures TurnResourceSnapshot / TurnToolProfile and creates PreparedMessageTurn
-  → PreparedMessageTurn.compose_user_message(...) finds selected SkillResource
-  → skills::format_skill_block(metadata, body)
-  → CanonicalUserMessage / MessageRecord::user(...)
+SkillService
+→ 找到并加载什么内容
+
+Turn execution
+→ 本轮需要哪个 Skill，并保证使用 pinned Catalog entry
+
+SkillInjector
+→ 如何把 LoadedSkill 转换为 Prompt contribution
+
+Prompt
+→ 将contribution规范化进User/Steer MessageRecord
+→ Session execution append/apply后，从committed conversation组装模型输入
 ```
 
-显式 skill block 使用以下稳定格式：
+`SkillInjector` 不执行 discovery、Catalog filtering、文件读取、cache lookup 或 Skill 选择。
+
+## 渐进披露流程
 
 ```text
-<skill name="skill-name" location="/abs/path/SKILL.md">
-References are relative to /abs/path.
+MiniCoreRuntime 启动
+→ 创建 Arc<SkillService>
+→ SkillService.initialize()
+→ 发现并解析轻量 metadata
 
-...skill body without frontmatter...
-</skill>
+Turn admission
+→ 使用 pinned WorkspaceSkillContext 构造 SkillCatalogContext
+→ SkillService.catalog(...)
+→ 得到 Arc<SkillCatalog>
+→ TurnExecutionContext pin Catalog 和 context
 
-...additional instructions...
+输入规范化需要 Skill
+→ TurnExecutionContext.compose_message(PromptIntent)
+→ 从 pinned SkillCatalog 取得 SkillCatalogEntryRef
+→ SkillService.load(SkillLoadRequest { pinned context, pinned entry })
+→ cache hit，或读取、解析并缓存完整内容
+→ SkillInjector.build(loaded_skill)
+→ PromptSet.compose_user_message(...)
+→ committed UserMessage / Steer
+
+模型触发的 Skill Tool
+→ append truthful tool message
+→ append tool_round_completed
+
+下一次模型调用
+→ 只从 committed conversation 组装
 ```
 
-这段文本成为一次普通 user message。它不是 system prompt，也不是隐藏上下文。
-
-## 和已有 messages 如何组成一次运行
-
-一次显式技能调用进入 Agent 运行时后，应按这个顺序处理：
-
-1. `SessionRuntime` 已持有只由成功 commit 更新的 `CommittedConversationState`；session open/recovery 时才从 storage 重建。
-2. `SessionRuntime` 调用 `capture_turn_resources(...)` / `capture_turn_tools(...)` 捕获目标 work chain 输入。
-3. `CommandManager` 已将 `/skill <name>` 或兼容 `/skill:name` 解析为结构化 `PromptIntent::Skill`；`SessionRuntime` 只决定 delivery。
-4. delivery 到达目标边界时选择 `PreparedMessageTurn`：active Steer 使用 `CurrentRun.prepared_turn`；idle submission、FollowUp 和 NextTurn 在 future turn capture resources/tools 并创建新 `PreparedMessageTurn`。所有 steering/follow-up/next-turn queues 都只保存未展开的结构化 `PromptIntent`（key/args/attachments）。
-5. 目标 `PreparedMessageTurn.compose_user_message()` 从 captured `PromptResourceView` 读取 selected skill body，调用 `skills.rs` helper 格式化 `<skill>` 块，得到目标边界的一条 `CanonicalUserMessage`；已展开技能正文绝不放回队列。
-6. new-run 路径中，`Prompt.prepare_message_turn(...)` 已基于 captured `PromptResourceView` 与同一 `TurnToolProfile.prompt_view` 构建同版 `ModelContextProfile`；后期 bounded `BeforeAgentStart` / `PromptBuilt` / `RunBeforeStart` 可以在 commit 前变换并重新校验 input/profile。
-7. new-run 路径先提交 `UserInput` batch；成功后应用 `CommittedConversationDelta`、发布外层 `Event.run_id = None` 的 `skill_invoked` / `message_user_appended`，再调用 `build_conversation_seed()`，分配 `RunId`、建立 `CurrentRun`、发布 `run_started` 并调用 Driver。
-8. active Steer 路径在 `commit_pending_messages` safe point 提交 `UserInput` batch；成功后应用并返回同一个 `CommittedConversationDelta`，发布外层 `Event.run_id = Some(current_run_id)` 的 `skill_invoked` / `message_user_appended`，Driver 再把 delta 应用到 `LiveConversation`，不创建新 RunId。
-9. 后续完整 tool rounds 和 final assistant 继续由 `SessionRuntime` 通过 session writer 提交。
-
-这意味着：
-
-- 过去的对话历史来自 session storage。
-- 技能摘要来自当前 `SkillCatalog` 和 system prompt。
-- 被显式调用的技能全文只进入当前 user message。
-- 同一技能后续 reload 不会改变已经持久化的历史消息。
-
-## 生命周期
+渐进披露阶段：
 
 ```text
-App / workspace open
-  → ResourceManager.ensure_runtime_snapshot_once()
-  → ResourceManager.ensure_cwd_snapshot(CwdResourceRequest)
-  → ResourceManager resolves skill sources
-  → skills::load_skill_catalog(inputs)
-  → ResourceManager overlays runtime/global and cwd/project skill candidates
-  → ResourceManager publishes CwdResourceSnapshot { resolved.skills, diagnostics, ... }
-  → AgentRuntime publishes `resources_changed`
-  → next new user turn / work chain captures the new cwd snapshot
-  → SessionRuntime creates a new `PreparedMessageTurn` / `ModelContextProfile`
-
-InvokeSkill (new-run delivery)
-  → SessionRuntime captures TurnResourceSnapshot / TurnToolProfile
-  → SessionRuntime creates PreparedMessageTurn from captured PromptResourceView / ToolPromptView
-  → PreparedMessageTurn.compose_user_message reads SkillResource
-  → skills::format_skill_block()
-  → bounded pre-run hooks + revalidation
-  → SessionRuntime commits UserInput through SessionHandle
-  → publish skill_invoked with outer Event.run_id = None
-  → publish message_user_appended
-  → allocate RunId + establish CurrentRun + publish run_started
-  → Driver.drive_conversation
-  → SessionRuntime commits ToolRound / AssistantFinal through SessionHandle
-
-InvokeSkill (active Steer)
-  → resolve with CurrentRun.prepared_turn
-  → commit UserInput through SessionHandle
-  → publish skill_invoked with outer Event.run_id = Some(current_run_id)
-  → publish message_user_appended
-  → return CommittedConversationDelta from commit_pending_messages
-  → Driver applies delta to LiveConversation
-
-ReloadResources
-  → ResourceManager builds a new CwdResourceSnapshot for target cwd
-  → ResourceManager atomically replaces ResourceSnapshotStore current cwd pointer
-  → AgentRuntime publishes diagnostics and `resources_changed`
-  → future turns use new catalog
-  → existing persisted messages remain unchanged
+阶段 1：Catalog metadata
+阶段 2：selected Skill full content
+阶段 3：Prompt contribution
 ```
 
-## 管理能力
+## 失效
 
-`SkillCatalog` 是数据结构，不是生命周期 owner。它至少需要支持：
+失效可以由显式 reload、source 变化、metadata 变化或 content hash 变化触发：
 
-- `list()`：返回 `SkillSummary`。
-- `get(name)`：返回 selected `SkillResource` 或结构化 not found。
-- `visible(active_tools)`：返回可进入 system prompt 的技能摘要。
-- `diagnostics()`：返回加载、校验、碰撞和路径错误。
+```text
+invalidate
+→ 标记受影响 Catalog/cache entry 失效
+→ 重建 Catalog 或在下一次访问时重建
+→ 新 Catalog revision
+→ 后续 load 使用新的精确定义 key
+```
 
-名称碰撞处理应确定且可诊断。不要依赖文件系统遍历顺序。产品必须定义来源优先级；MVP 统一使用 [ResourceManager](resource-manager.md) 的 `ResourceOverlayPolicy`。runtime/global 候选先进入 `RuntimeResourceSnapshot`，cwd/project 候选在 `CwdResourceSnapshot` 构建时覆盖 same-key runtime/global 候选；被覆盖技能保留在 `shadowed` 中供 diagnostics/UI 展示。无论谁获胜，都不能绕过工具策略。
+基础不变量：
 
-## 设计约束
+- 失效不修改已经返回的 `Arc<LoadedSkill>`；
+- 已经生成并固化到 committed MessageRecord 的 contribution stamp 不被回写；
+- future Turn 的新 catalog/load 请求必须看到失效后的结果；
+- active Turn 的 pinned entry 只能加载其 exact content hash；ordinary invalidation 后旧正文仍可从 content-addressed cache/source 获得时继续加载，无法获得时 fail closed，不能漂移到新 Catalog；
+- 失效失败进入 diagnostics，不静默返回已知错误内容作为新版本；
+- source 删除后 Catalog 不再披露该 Skill；已有不可变引用的生命周期由持有者自然结束。
 
-- 不要把技能当工具。技能只是 prompt resource；工具才有副作用。
-- 不要把技能全文塞进 `RuntimeSnapshot` 或资源摘要事件。`CwdResourceSnapshot` 可以为原子性保存 selected skill body，但 UI 默认只能看到 summary/detail query 的受控结果。
-- 不要让 UI 拼 `<skill>` 块。否则相对路径规则、frontmatter 剥离、队列语义和 session persistence 会分叉。
-- 不要让 `SessionRuntime`、CommandManager 或 Driver 各自实现一套 skill message 拼装；统一调用 `PreparedMessageTurn.compose_user_message()`。
-- 不要把模型可见技能列表和显式技能调用混为一谈。前者只是摘要，后者注入全文。
-- 不要在没有 `read` 工具时把技能列表暴露给模型。模型无法按摘要中的指令加载技能文件。
-- 不要让资源 reload 改写历史。已经持久化的 skill invocation 是一次历史 user message。
+## 错误和 Diagnostics
+
+基础错误分类：
+
+```rust
+pub enum SkillErrorKind {
+    Discovery,
+    MetadataParse,
+    DuplicateName,
+    NotFound,
+    ContentRead,
+    ContentParse,
+    Injection,
+    Invalidated,
+}
+```
+
+SkillService 保存结构化 diagnostics。Catalog 可以返回有效 entries 和非致命 diagnostics；请求加载某个失败 Skill 时返回对应 typed error。
+
+## 领域所有权
+
+| 对象 | Owner |
+| --- | --- |
+| `Arc<SkillService>` 生命周期 | MiniCoreRuntime |
+| `Arc<SkillService>` execution 引用 | loaded Session execution / TurnExecutionContext |
+| Skill discovery/filter/cache/invalidation | SkillService |
+| Skill Catalog 创建和 cache | SkillService |
+| 本 Turn 的 pinned SkillCatalog | TurnExecutionContext |
+| Skill metadata | SkillService / Catalog |
+| 完整 Skill 内容 | SkillService content cache |
+| 某次执行选择哪个 Skill | Turn execution |
+| pinned entry 校验和 exact load | TurnExecutionContext + SkillService |
+| Skill 到 Prompt contribution 的转换 | SkillInjector |
+| contribution 到 committed MessageRecord | PromptSet 输入规范化 |
+| 最终模型上下文组装 | PromptSet |
+
+## 基础不变量
+
+- 一个 Runtime 初始化一个 SkillService；
+- durable Session 不持有 SkillService；Runtime 将同一个 SkillService 注入 loaded execution；
+- Turn 对象不持有 Skill；
+- Catalog 不包含完整正文；
+- 完整正文只能通过 SkillService 按需加载；
+- Turn execution 不能直接读取 Skill 文件；
+- TurnExecutionContext pin SkillCatalogContext、SkillCatalog 和 SkillCatalogFingerprint；
+- Workspace Skill 的 discover/read 只能通过携带 pinned SkillCatalogContext 和 SkillCatalogEntryRef 的 source adapter seam；
+- SkillInjector 不能决定选择哪个 Skill；
+- SkillContributionRef 必须把 catalog revision、version、content hash 和 source stamp 贯穿到 Prompt contribution；
+- Prompt 不能执行 Skill discovery 或 load；
+- 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message并由`tool_round_completed`promote，不能作为current-call旁路；
+- SkillService 不决定哪个 Turn 使用哪个 Skill；
+- cache 和 load state 不进入领域对象；
+- active 使用中的不可变内容不被 reload 原地修改。
+
+## 后续问题
+
+1. SkillMetadata 的完整字段和 `DefinitionVersion` 生成方式。
+2. Agent、Session 与 Workspace Skill source 的 scope precedence 和 filtering 规则。
+3. SkillScope 的精确定义。
+4. SkillName 冲突、namespace 和稳定排序规则。
+5. Skill invocation 如何触发，以及是否形成 Item。
+6. SkillInjection、UserMessageCompositionInput 和 committed contribution stamp 的最终格式。
+7. source watcher、显式 reload 和 debounce 行为。
+8. cache 容量、eviction 和失败重试策略。
+9. SkillService 初始化失败对 Runtime 启动的影响。
+10. Session reload 后如何重新获得同一个 SkillService。
+
+## 设计进度
+
+- [x] 确定 MiniCoreRuntime 初始化并拥有一个 `Arc<SkillService>`。
+- [x] 确定 durable Session 不持有 SkillService，Runtime 注入 loaded execution。
+- [x] 确定 Turn 对象不持有 Skill、Catalog、LoadedSkill 或 Skill snapshot。
+- [x] 确定 Catalog 只包含轻量 metadata，不包含完整正文。
+- [x] 确定完整 Skill 内容由 SkillService 按需加载、解析和缓存。
+- [x] 确定 SkillService 管理 discovery、filtering、cache、invalidation 和 diagnostics。
+- [x] 确定 Turn execution 决定本次执行使用哪个 Skill。
+- [x] 确定 TurnExecutionContext pin SkillCatalogContext、SkillCatalog 和 fingerprint。
+- [x] 确定 SkillInjector 只负责 LoadedSkill 到 PromptContribution 的转换。
+- [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message + `tool_round_completed`进入conversation。
+- [x] 确定 cache 失效不修改已经返回的不可变 LoadedSkill。
+- [ ] 定义 SkillMetadata 和 SkillContent 的最终字段。
+- [x] 定义 SkillCatalogContext 的 Session/Agent identity 与 WorkspaceSkillContext 输入。
+- [x] 确定 load 使用 pinned SkillCatalogEntryRef，不重新解析 current Catalog。
+- [x] 确定 Workspace Skill source adapter 在 discover/read 时强制校验 pinned context、lease 和 source stamp。
+- [ ] 定义 SkillScope。
+- [ ] 定义 SkillName 冲突和 namespace 规则。
+- [ ] 定义 invocation、Item、UserMessageCompositionInput 和 PromptContribution stamp 的最终形状。
+- [ ] 定义 watcher、reload、cache eviction 和失败重试策略。

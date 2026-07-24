@@ -13,3 +13,12 @@ AgentRuntime.snapshot() -> agent_runtime_protocol::RuntimeSnapshot
 ```
 
 架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)。
+
+## 文档权威顺序
+
+当前架构文档（[docs/architecture.md](docs/architecture.md) 与 [docs/modules/](docs/modules/README.md)）
+→ 当前 ADR（[docs/adr/](docs/adr/)，0100+）
+→ [docs/research/](docs/research/)
+→ [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
+
+V1 已归档，仅用于历史参考；V2 是当前权威架构（目标设计已冻结，生产实现进行中）。版本迁移记录见 [docs/migration/v1-to-v2.md](docs/migration/v1-to-v2.md)。正式文档不再链接 V1 归档；只有迁移说明和新 ADR 的历史依据部分可以引用它。
