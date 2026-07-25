@@ -18,7 +18,7 @@
 - Gateway 隐藏 provider catalog、credential/auth、Rig adapter、stream、same-model retry、transport fallback、usage、cache 与 continuation；这些都是 private implementation detail，不进入 MiniCoreRuntime interface。
 - ModelGateway 不重新组装 Prompt：PromptSet 产出的 `AssembledModelContext` 是模型上下文的唯一 producer；Gateway 不重新加载 message、不判断 message visibility、不截断或摘要 conversation。
 - active Turn 内禁止 transparent cross-model fallback。同一 exact model identity 下允许 transport fallback（如 WebSocket → HTTP），跨 provider/model 替换必须由显式 Session definition update 或下一 Turn admission 完成。
-- Rig provider 差异只存在于 private `ProviderAdapter`；Rig raw types、`additional_params`、SDK error 不越过 adapter seam。至少有 Rig adapter 与 deterministic fake adapter 两个实现，保证它是真实 seam。
+- Rig provider 差异只存在于 private `ProviderAdapter`；Rig raw types、`additional_params`、SDK error 不越过 adapter seam。首批实现为RigProviderAdapter与ScriptedProviderAdapter，保证它是真实seam并支持阶段6–8共享vertical-slice tests。
 - 错误分类为 closed taxonomy，足以驱动 retry、compaction recovery（如 `ContextOverflow`）与 terminal failure，caller 不解析 raw message；`RequestOutcomeUnknown`/`StreamInterrupted` 禁止 blind transparent replay。
 - cache、connection reuse 与 continuation 必须保持 full-request equivalence：任何 optimization 都能退回完整 `AssembledModelContext` 请求，它们只是 wire optimization，不是第二 conversation truth。
 

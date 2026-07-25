@@ -43,7 +43,7 @@ Turn 执行边界产生独立、不可变的有效执行对象：
 ```text
 PromptService::for_turn(...) → PromptSet
 ToolService::for_turn(...)   → ToolSet
-SkillService::catalog(...)   → SkillCatalog
+SkillService::current_view(...) → SkillView
 SkillService::load(...)      → Arc<LoadedSkill>
 ```
 
@@ -133,7 +133,7 @@ caller → new facade → compatibility manager → old manager → implementati
 ```text
 PromptSet    → Prompt 的 Turn 有效快照
 ToolSet      → ToolSpec 与 executor route 的原子快照
-SkillCatalog → Skill metadata 的有效快照
+SkillView    → Skill metadata 的有效view
 LoadedSkill  → 某个精确定义的不可变正文
 ```
 
@@ -147,8 +147,8 @@ pub(crate) struct TurnExecutionContext {
     model: TurnModelSnapshot,
     workspace: Arc<WorkspaceSnapshot>,
     skill_service: Arc<SkillService>,
-    skill_context: SkillCatalogContext,
-    skill_catalog: Arc<SkillCatalog>,
+    skill_context: SkillViewContext,
+    skill_view: Arc<SkillView>,
     tool_set: ToolSet,
     prompt_set: PromptSet,
     fingerprint: ExecutionContextFingerprint,
@@ -197,7 +197,7 @@ SessionStorage 是 durable truth。热内存 conversation projection 只消费 `
 - Prompt、Tool、Skill 的 owner 和核心 interface 已确定；
 - Prompt 是唯一模型上下文组装 seam；
 - ToolSet 原子绑定模型可见 ToolSpec 和 executor route；
-- SkillCatalog 与 LoadedSkill 分离，正文默认按需加载；
+- SkillView与LoadedSkill分离，正文默认按需加载；
 - 不再把三者合并为通用 Resource；
 - 已记录尚未解决的 scope、identity、cache、reload 和 recovery 问题。
 
@@ -250,7 +250,7 @@ WorkspaceAccessView
 已定义：
 
 - 领域 Turn、Turn execution 和 AgentLoop 的开始与结束边界；
-- `SkillCatalog`、`ToolSet`、`PromptSet` 的 capture 依赖图；
+- `SkillView`、`ToolSet`、`PromptSet`的capture依赖图；
 - 哪些对象在整个 Turn 内固定；
 - 逻辑模型调用与 provider retry 的边界，不增加新的领域类型；
 - PromptSet 如何绑定同一 ToolSet 的 `ToolPromptView`；
@@ -267,16 +267,16 @@ capture 依赖图：
 exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 + exact AgentPrompts / SessionPrompts
 + WorkspaceSnapshot + TurnModelSnapshot
-├─ SkillService::catalog(SkillCatalogContext {
+├─ SkillService::current_view(SkillViewContext {
 │    agent, session_id, session_revision, workspace: workspace.skill_context()
-│  }) → SkillCatalog
+│  }) → SkillView
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
      provider: model.capabilities(), execution_mode, execution_control, cancellation, progress_events
    }) → ToolSet
 
-SkillCatalog.prompt_view()
+SkillView.prompt_view()
 + ToolSet.prompt_view()
 + WorkspacePromptContext
 + exact AgentPrompts / SessionPrompts
@@ -391,11 +391,51 @@ SkillCatalog.prompt_view()
 - [x] crash 后不会把半个 ToolRound 提升为模型 transcript；已 append 的 assistant/tool entries 保持 durable，但在 `tool_round_completed` 前不 model-visible；
 - [x] 不引入 dual log、Branch entity、baseline SQLite 或 content-addressed DAG。
 
+### 阶段 6-8 模型调用协同交付束
+
+状态：三个模块的目标设计均已完成；生产实现、Rig spike和自动化测试尚未开始。阶段6、7、8继续作为职责索引，但实现不再按`6 → 7 → 8`独立串行验收。
+
+三个模块共享同一条模型调用spine：
+
+```text
+SessionExecutor NeedModel
+→ PromptSet.assemble(purpose)
+→ ModelCallRequest::new(TurnModelSnapshot, purpose, AssembledModelContext)
+→ ModelGateway.generate_model_turn(...)
+→ AgentRun result或CompactionSummary result
+→ SessionExecutor append/apply并继续同一Turn
+```
+
+普通调用和summary调用必须共用：
+
+- 同一个`ModelCallRequest`构造和proof校验路径；
+- 同一个exact `TurnModelSnapshot`、effective limits、cancellation、usage和error taxonomy；
+- 同一个ModelGateway retry/provider adapter边界；
+- 不同的typed purpose与output contract：`AgentRun`或`CompactionSummary + NoToolCalls`。
+
+协同实现顺序：
+
+1. 冻结最小共享spine：`ModelCallRequest::new`、purpose、proof、limits和terminal result/error；
+2. 先实现`ScriptedProviderAdapter`，但它必须挂在真实ModelGateway private `ProviderAdapter` seam后，SessionExecutor不能直接调用fake model interface；
+3. 在scripted adapter上闭环普通调用：Submit → NeedModel → AgentRun request → assistant/tool result → append/apply；
+4. 在同一harness闭环overflow路径：AgentRun assembly overflow → Compaction plan → CompactionSummary request → StoredCompaction append/apply → reassemble → AgentRun继续；
+5. 尽早并行执行Rig 0.40.0 spike；它不阻塞scripted vertical slice，但在冻结真实provider adapter前必须通过；
+6. 接入RigProviderAdapter和mock-server tests，证明真实provider mapping与scripted path使用同一ModelGateway contract。
+
+共同完成门槛：
+
+- [ ] scripted ordinary AgentRun vertical slice通过；
+- [ ] scripted overflow → summary → append/apply → reassemble → AgentRun vertical slice通过；
+- [ ] AgentRun与CompactionSummary都只能通过`ModelCallRequest::new`进入ModelGateway；
+- [ ] cancellation、logical retry、usage和typed error在两种purpose下行为一致；
+- [ ] Rig 0.40.0 spike验证OpenAI Responses与Anthropic Messages关键映射；
+- [ ] production provider adapter与mock-server contract tests通过。
+
 ### 阶段 6：Session 执行子系统
 
 对应 V2 文档：[Session Execution 架构设计](../modules/session-execution.md)。
 
-状态：目标架构已确定；SessionExecutor 与自动化测试实现待落地。研究与 handoff 记录（Session Execution 研究进度，V1 阶段文档已删除）不再作为权威。
+状态：目标架构已确定；作为阶段6–8协同交付束的一部分实现，SessionExecutor与自动化测试尚未落地。研究与handoff记录（Session Execution研究进度，V1阶段文档已删除）不再作为权威。
 
 已明确：
 
@@ -417,20 +457,20 @@ SkillCatalog.prompt_view()
 完成门槛：
 
 - [x] 每个 Session mutation 只有一个执行 owner；
-- [x] 同一 Turn 复用一个 TurnExecutionContext、PromptSet、ToolSet 和 pinned SkillCatalog；
+- [x] 同一Turn复用一个TurnExecutionContext、PromptSet、ToolSet和captured SkillView；
 - [x] SessionExecutor 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
 - [x] append、projection apply、模型可见性、side effect 和 UI event 顺序无歧义；
 - [x] retry、Cancel 和 recovery 不产生重复 terminal fact；
 - [x] 普通work lane满不会阻塞Cancel/revocation signal，Unload有有限grace deadline并最终fail closed；
 - [x] crate-private interface 可以通过 synthetic request/operation result 集成测试；
-- [ ] 完成 Rig 0.40.0 adapter spike；
-- [ ] 实现 SessionExecutor 和自动化测试。
+- [ ] 通过协同交付束的ordinary/compaction scripted vertical slices；
+- [ ] 实现SessionExecutor和自动化测试。
 
 ### 阶段 7：ModelGateway
 
 对应 V2 文档：[ModelGateway 架构设计](../modules/model-gateway.md)。
 
-状态：目标架构已确定。
+状态：目标架构已确定；作为阶段6–8协同交付束的一部分实现，ModelGateway、provider adapter和测试尚未落地。
 
 已明确：
 
@@ -453,12 +493,14 @@ SkillCatalog.prompt_view()
 - [x] provider adapter 差异不泄漏到 Session execution；
 - [x] 错误分类足以驱动 retry、compaction 或 terminal failure；
 - [x] provider cache/continuation 不是第二 conversation truth；
-- [ ] 执行 Rig 0.40.0 ModelGateway integration spike；
-- [ ] 实现 ModelGateway、Rig adapter 和 mock-server tests。
+- [ ] 执行协同交付束的Rig 0.40.0 integration spike；
+- [ ] 实现ModelGateway、ScriptedProviderAdapter、Rig adapter和mock-server tests。
 
 ### 阶段 8：Compaction
 
 对应 V2 文档：[Compaction 架构设计](../modules/compaction.md)。
+
+状态：目标架构已确定；作为阶段6–8协同交付束的一部分实现，Compaction module、summary model path和自动化测试尚未落地。
 
 已定义：
 
@@ -472,12 +514,14 @@ SkillCatalog.prompt_view()
 
 完成门槛：
 
-- compaction 不直接改写未提交 conversation；
-- Compaction entry 成功 append/apply 前不替换模型可见历史；
-- cut 不拆散 ToolCall/ToolResult 或其他协议稳定单元；
-- compacted conversation 可从 storage 重建。
+- [x] compaction不直接改写未提交conversation；
+- [x] Compaction entry成功append/apply前不替换模型可见历史；
+- [x] cut不拆散ToolCall/ToolResult或其他协议稳定单元；
+- [x] compacted conversation可从storage重建；
+- [ ] 通过scripted overflow → summary → append/apply → reassemble集成测试；
+- [ ] 实现Compaction module与storage/projector tests。
 
-状态：目标设计已完成，见 [Compaction 架构设计](../modules/compaction.md) 和 [ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。首版采用portable rolling summary、stable-unit safe cut、leading conversation summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget和有界frontier advancement；不实现manual、hierarchical或provider-native compaction，也不通过强制新Turn代替checkpoint。
+目标设计见[Compaction架构设计](../modules/compaction.md)和[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。首版采用portable rolling summary、stable-unit safe cut、leading conversation summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget和有界frontier advancement；不实现manual、hierarchical或provider-native compaction，也不通过强制新Turn代替checkpoint。
 
 ### 阶段 9：Runtime interface 与公开协议
 
@@ -529,7 +573,7 @@ SkillCatalog.prompt_view()
 ExtensionService::for_session(...) → ExtensionSet
 ```
 
-ExtensionSet 管理 package lifecycle，不替代 PromptSet、ToolSet、SkillCatalog，也不恢复 V1 通用 ResourceManager。
+ExtensionSet管理package lifecycle，不替代PromptSet、ToolSet、SkillView，也不恢复V1通用ResourceManager。
 
 完成门槛：
 
@@ -661,6 +705,8 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 - provider mapping：adapter contract test；
 - Runtime command/event/snapshot：端到端 protocol test。
 
+阶段6–8优先建立一个共享的scripted vertical-slice harness。该harness必须经过真实`PromptSet → ModelCallRequest::new → ModelGateway → ProviderAdapter`路径，不能为SessionExecutor或Compaction建立第二个fake request seam。Rig spike与该harness并行推进，并在production provider adapter冻结前完成。
+
 关键不变量必须拥有测试：
 
 ```text
@@ -684,7 +730,7 @@ Runtime facade 是唯一外部入口
 - [ ] 所有模型调用只接收 ModelCallRequest，且其唯一 model-visible input 是 `AssembledModelContext`；
 - [ ] 所有模型可见 conversation fact 遵守 append/apply 和 conversation projection 规则；
 - [x] Agent/Session revision 与 durable/runtime lifecycle 语义已确定；
-- [x] TurnExecutionContext 可以稳定绑定 AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillCatalog 和 TurnModelSnapshot；
+- [x] TurnExecutionContext可以稳定绑定AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillView和TurnModelSnapshot；
 - [x] Session load/reload/unload 与 fork lifecycle 有确定行为；
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
@@ -730,6 +776,8 @@ ADR 对应：
 
 ## 当前迁移状态
 
-阶段 1–9 目标设计已完成并进入 V2 正式文档。当前迁移进入实现与验证：先完成 Rig integration spike、SessionExecutor、ModelGateway provider adapter 和 Compaction 测试，再实现 Runtime protocol types、facade routing、scoped snapshot/event publisher 和 CommandSurface target architecture。
+阶段1–9目标设计已完成并进入V2正式文档。仓库当前仍为文档阶段，没有`Cargo.toml`、`src/`或`tests/`；production interface和自动化测试尚未实现。
+
+下一实现里程碑是阶段6–8模型调用协同交付束：先建立ScriptedProviderAdapter vertical slice并尽早完成Rig integration spike，再共同落地SessionExecutor、ModelGateway provider adapter和Compaction闭环。该交付束通过后，才进入Runtime protocol types、facade routing、scoped snapshot/event publisher和CommandSurface target architecture实现。
 
 Extension / Plugin 阶段仍不是核心实现前置条件；只有出现至少两个真实 package/adapter source 后再启动阶段 10 设计。

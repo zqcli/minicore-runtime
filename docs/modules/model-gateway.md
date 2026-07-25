@@ -2,7 +2,7 @@
 
 日期：2026-07-25
 
-状态：当前权威架构（设计已冻结，实现进行中）
+状态：当前权威架构（设计已冻结，生产实现待启动）
 
 ## 目的
 
@@ -59,7 +59,7 @@
 - authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
 - prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
 - 所有optimization必须能退回完整`AssembledModelContext`请求；
-- ProviderAdapter是private internal seam，至少有Rig adapter和deterministic fake adapter两个实现；
+- ProviderAdapter是private internal seam，首批实现为RigProviderAdapter和ScriptedProviderAdapter；
 - 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
 
 ## 同类项目研究
@@ -716,12 +716,13 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 RigProviderAdapter
 ```
 
-测试实现：
+首个测试实现使用：
 
 ```text
-DeterministicProviderAdapter
 ScriptedProviderAdapter
 ```
+
+它按脚本返回stream delta、terminal response或typed error，并记录收到的private request，供SessionExecutor、ModelGateway和Compaction共享vertical-slice tests使用。测试仍必须经过`ModelCallRequest::new → ModelGateway.generate_model_turn → ProviderAdapter`，不能让SessionExecutor或Compaction直接调用fake model interface。只有出现需要纯函数映射/property test的真实场景时再增加`DeterministicProviderAdapter`。
 
 因此ProviderAdapter是一个真实seam，而不是为单一implementation增加的假抽象。
 
@@ -1710,7 +1711,7 @@ src/model_gateway/continuation.rs
 src/model_gateway/redaction.rs
 src/model_gateway/provider.rs
 src/model_gateway/provider/rig.rs
-src/model_gateway/provider/fake.rs
+src/model_gateway/provider/scripted.rs
 ```
 
 这是一个module及其private implementation文件，不建立provider crate hierarchy，除非真实build time或dependency isolation证明需要拆分。
@@ -1772,7 +1773,8 @@ src/model_gateway/provider/fake.rs
 - [x] 定义cache、connection reuse和continuation等价性规则。
 - [x] 定义multi-session concurrency和rate governance。
 - [x] 定义persistence、recovery、performance和test matrix。
-- [ ] 执行Rig 0.40.0 ModelGateway integration spike。
-- [ ] 实现ModelGateway和provider adapters。
+- [ ] 实现ScriptedProviderAdapter并通过阶段6–8 ordinary/compaction vertical slices。
+- [ ] 尽早执行Rig 0.40.0 ModelGateway integration spike，在production adapter冻结前完成。
+- [ ] 实现ModelGateway和Rig provider adapters。
 - [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
 - [x] 在阶段9冻结公开model catalog/query协议。

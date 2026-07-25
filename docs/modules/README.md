@@ -17,6 +17,8 @@ MiniCoreRuntime
 
 `MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面，并在 Runtime 生命周期内拥有三个长生命周期深模块 `PromptService`、`ToolService`、`SkillService`。Turn执行边界捕获或产生独立不可变的有效对象（`PromptSet` / `ToolSet` / `SkillView`）。领域基础模型见 [MiniCore 架构](../architecture.md)。
 
+当前仓库仍处于设计完成、生产实现待启动阶段，没有Rust crate或自动化测试。下一实现里程碑是[迁移记录](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)中的阶段6–8协同交付束：SessionExecutor、ModelGateway和Compaction通过同一scripted vertical slice共同落地。
+
 ## 模块索引
 
 - [Runtime 公开协议](runtime-interface.md)：`MiniCoreRuntime` 的 `dispatch / query / snapshot / subscribe` 四类能力、公开领域 identity、scoped cursor/snapshot 和协议边界。

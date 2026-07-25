@@ -2,7 +2,7 @@
 
 日期：2026-07-25
 
-状态：当前权威架构（设计已冻结，实现进行中）
+状态：当前权威架构（设计已冻结，生产实现待启动）
 
 ## 目的
 
@@ -1443,6 +1443,28 @@ MVP性能要求：
 - outcome unknown Tool不自动执行；
 - 重复load幂等靠committed prefix状态判断（已terminal/已resolved则跳过），不靠recovery operation key；
 - terminal entry后Pending/Started被判定为corruption。
+
+## 协同实现顺序
+
+SessionExecutor不以临时model trait独立交付。首个实现必须与ModelGateway和Compaction共享一个vertical-slice harness：
+
+```text
+Submit
+→ NeedModel
+→ PromptSet.assemble(AgentRun)
+→ ModelCallRequest::new
+→ ModelGateway + ScriptedProviderAdapter
+→ assistant/tool result append/apply
+
+context overflow
+→ Compaction.plan
+→ PromptSet.assemble(CompactionSummary)
+→ 同一个ModelCallRequest::new和ModelGateway
+→ StoredCompaction append/apply
+→ reassemble AgentRun并继续
+```
+
+Rig spike可以与scripted harness并行，但production provider adapter冻结前必须完成。SessionExecutor、ModelGateway和Compaction只有在上述两条路径共同通过后才算完成阶段6–8核心交付；职责ownership不因此合并。
 
 ## Diagnostics
 
