@@ -1,7 +1,7 @@
 # Conversation 与 SessionStorage 架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -21,7 +21,7 @@
 
 本文范围之外（由相关文档或后续实现定义）：
 
-- SessionExecutor、request queue和异步operation的具体实现；
+- SessionExecutor、SessionIngress lane和异步operation的具体实现；
 - Runtime command、query、event 和 snapshot payload；
 - ModelGateway provider adapter；
 - compaction summary prompt 和 token budget；
@@ -435,7 +435,7 @@ pub enum AssistantContent {
 - 不含ToolCall的Intermediate必须只包含稳定text/reasoning content，在entry append/apply时直接进入模型conversation，但不结束Turn；
 - `phase = Final`不能包含未满足ToolCall；
 - Final assistant entry append是Completed Turn的结束线性化点；
-- Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的ToolCall Intermediate entry，且SessionExecutor已完成Cancel/revocation与Steer FIFO检查；
+- Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的ToolCall Intermediate entry，且SessionExecutor已观察最新EmergencyControl/authorization并完成current Turn Steer FIFO检查；
 - usage属于该逻辑模型响应，不另写TokenCount event；
 - retry_count只表示SessionExecutor对同一logical call执行的logical retry数量，不包含ModelGateway transparent attempt；
 - provider_metadata只保存allowlisted bounded code/request ID，不保存raw response、headers、endpoint或payload；
@@ -1037,7 +1037,7 @@ Workspace authorization lease
 provider session
 AgentLoop
 waiter/task
-FollowUp queue
+任何process-local SessionIngress lane（含Steer/FollowUp）
 Session-scoped grants
 ```
 

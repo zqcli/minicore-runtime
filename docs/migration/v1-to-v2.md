@@ -1,7 +1,7 @@
 # MiniCore V1 → V2 版本迁移记录
 
 状态：V1 → V2 版本迁移记录
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -400,17 +400,18 @@ SkillCatalog.prompt_view()
 
 - 一个 loaded Session 由一个 `SessionExecutor` 拥有执行期 mutable state；
 - 一个 Runtime 允许多个 SessionExecutor 同时 Running；
-- bounded FIFO `SessionRequestQueue` 和 typed request response；
+- per-session `SessionIngress` semantic lanes和typed request response；Submit/Steer/FollowUp/Interaction/Tool control各自bounded，Cancel/revocation与lifecycle使用sticky signal，Snapshot使用latest-wins mailbox；
 - `Idle → Starting → Running → Finishing → Idle` 状态机；
 - Context 构造、UserMessage composition、Model 和 Tool 使用异步 `RunningOperation`；
 - operation result 使用 `SessionId + TurnId + execution_version + OperationType` 校验；
 - private AgentLoop 只返回 `NeedModel | NeedTools | Finished`；
 - `ToolExecutionControl` 负责 approval 和 execution-start 的 required durable ordering；
-- Submit、Steer、FollowUp、ResolveInteraction、Cancel、PrepareForUnload 和 Snapshot 流程；
+- Submit、Steer、FollowUp、CancelQueuedMessage、ResolveInteraction、Cancel、Workspace revocation、PrepareForUnload 和 Snapshot 流程；
 - FollowUp 使用 bounded process-local FIFO；
-- progress event 与 request queue 分离；
+- progress event 与全部mutation/control ingress lane分离；
 - restart 不恢复旧异步操作，unfinished Turn 保守 terminalize；
 - multi-session 共享 Model/Tool 资源时使用明确并发限制和 canonical resource locks。
+- lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 
 完成门槛：
 
@@ -419,6 +420,7 @@ SkillCatalog.prompt_view()
 - [x] SessionExecutor 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
 - [x] append、projection apply、模型可见性、side effect 和 UI event 顺序无歧义；
 - [x] retry、Cancel 和 recovery 不产生重复 terminal fact；
+- [x] 普通work lane满不会阻塞Cancel/revocation signal，Unload有有限grace deadline并最终fail closed；
 - [x] crate-private interface 可以通过 synthetic request/operation result 集成测试；
 - [ ] 完成 Rig 0.40.0 adapter spike；
 - [ ] 实现 SessionExecutor 和自动化测试。
@@ -700,7 +702,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0108）构成，是当前唯一权威事实来源。
+- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0111）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
@@ -723,7 +725,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR 采用 `0100`–`0108` 编号，位于 [`docs/adr/`](../adr/)。其中 compaction 的稳定后缀决策由 [ADR 0107](../adr/0107-compaction-uses-strict-stable-suffix.md) 记录，替代 V1 时期同主题的旧 ADR（原 `0027`）。
+- V2 ADR 采用 `0100`–`0111` 编号，位于 [`docs/adr/`](../adr/)。其中 compaction 的稳定后缀决策由 [ADR 0107](../adr/0107-compaction-uses-strict-stable-suffix.md) 记录，Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录。
 
 ## 当前迁移状态
 

@@ -1,7 +1,7 @@
 # Tool 子系统架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -663,13 +663,15 @@ pub trait ToolSandbox: Send + Sync {
 }
 ```
 
-ToolExecutionControl由SessionExecutor提供，并执行以下durable ordering：
+ToolExecutionControl由SessionExecutor提供；请求进入per-session bounded `ToolControlQueue`，但所有durable mutation仍由同一个SessionExecutor/SessionWriter执行：
 
 ```text
 InteractionRequested append → host delivery
 InteractionResolved append → waiter wake
 ToolExecutionStarted append → side effect
 ```
+
+`ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并重新验证cancellation与Workspace lease。Cancel/revocation先被观察则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
 
 TUI、RPC和Web通过[Runtime Interface](runtime-interface.md)接收Interaction StateEvent并提交resolution，不直接成为ToolService adapter。ToolSandbox仍可以有不同操作系统或容器adapter。
 

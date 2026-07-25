@@ -1,7 +1,7 @@
 # Turn、Item 与 Interaction 架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -19,7 +19,7 @@
 本文不定义以下内容（由对应文档或 Runtime protocol 权威定义）：
 
 - SessionStorage entry 在具体文件 adapter、index 和 Session execution 中的实现细节；
-- SessionExecutor/request queue/async operation 的具体实现，以[Session Execution架构设计](session-execution.md)为权威；
+- SessionExecutor/SessionIngress lane/async operation 的具体实现，以[Session Execution架构设计](session-execution.md)为权威；
 - Runtime command、query、event 和 snapshot payload；
 - provider-specific message、tool-call 和 reasoning encoding；
 - provider-specific reasoning 的最终编码；
@@ -685,7 +685,7 @@ client reconnect
 - reconnect 不创建新 RequestId；
 - lost response acknowledgement 使用同一个 resolution_key（in-run dedup）在活跃 run 内重试；
 - abrupt client disconnect 默认不等于 Deny 或 Cancel；
-- pending Interaction 使 Session execution 非 Idle，Unload 返回 Busy；
+- pending Interaction 使 Session execution 非 Idle；PrepareForUnload在grace期继续接受resolution，deadline到期后写入fail-closed resolution并Cancel active Turn，Unload不会永久悬挂；
 - host 可以显式关闭 transport 并提交 Cancelled(TransportClosedByHost)；
 - 没有 subscriber 时可以继续等待，直到 timeout、cancel、shutdown 或 restart。
 
@@ -719,7 +719,7 @@ Steer：
 
 ```text
 Steer(expected TurnId)
-→ push_back进入普通FIFO
+→ push_back进入该Turn的bounded SteerQueue FIFO
 → 等待当前ToolRound truthful completion
 → 下一次Model前pop_front一条
 → 不作为 approval decision
