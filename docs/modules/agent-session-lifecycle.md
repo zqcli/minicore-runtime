@@ -613,6 +613,7 @@ pub enum TurnExecutionPhase {
     Compacting,
     Sampling,
     WaitingApproval,
+    WaitingForUserInput,
     ExecutingTools,
     Committing,
 }
@@ -644,6 +645,20 @@ Deny  → 产生 denied ToolResult
 
 等待审批不是 Interrupted。Interaction 和 parent ToolInvocation 的完整语义见 [Turn、Item 与 Interaction 架构设计](turn-item-interaction.md)。
 
+### WaitingForUserInput
+
+等待结构化UserQuestion回答时：
+
+```text
+TurnStatus = Running
+SessionExecutionState = Running
+TurnExecutionPhase = WaitingForUserInput
+InteractionState = Pending
+ToolInvocationState = Started
+```
+
+当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、timeout、PrepareForUnload和Snapshot。等待期间不持有Tool资源锁或Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
+
 ### Steer
 
 Steer到达时Turn保持Running。请求必须携带`expected TurnId`，并在current-Turn validation中验证目标仍是同一个Running Turn：
@@ -656,7 +671,7 @@ Steer(expected TurnId) accepted
 → 下一次模型调用看见 Steer
 ```
 
-WaitingApproval中到达的Steer只进入该Turn的FIFO，不自动当作审批结果。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
+WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，不自动当作Interaction resolution。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
 
 只有显式 Turn cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn terminal。
 
@@ -1094,7 +1109,7 @@ Agent release channel
 - Agent disabled/deleted与CreateSession、upgrade、fork publication和initiating UserMessage append使用同一lifecycle synchronization线性化；
 - Agent disabled/deleted 阻止 future admission，但不 patch active Context；
 - Workspace restrictive update仍可 revoke active Turn；
-- WaitingApproval 时 Turn 仍是 Running；
+- WaitingApproval和WaitingForUserInput时Turn仍是Running；
 - Steer 不把 Turn 变成 Interrupted；
 - fork从genesis或公开message anchor创建；mid-Turn prefix在target staging中以HistoricalFork中断后才发布；
 - fork 不复制 loaded execution state或 authorization capability；
@@ -1130,6 +1145,9 @@ Agent release channel
 - WaitingApproval 保持 Turn Running；
 - Steer 在 WaitingApproval 时排队；
 - WaitingApproval Steer只进入FIFO，不作为approval decision；
+- WaitingForUserInput保持Turn/Session execution Running，且不持有Tool资源锁；
+- WaitingForUserInput时Steer只排队，UserAnswer恢复同一Turn；
+- 一个Session等待UserQuestion时，其他Session继续运行；
 - Agent disable/delete vs initiating UserMessage append final synchronization；
 - CreateSession/Agent upgrade/Fork publication vs Agent disable/delete；
 - Session definition/metadata update vs archive/delete lifecycle synchronization；
@@ -1175,7 +1193,7 @@ Agent release channel
 - [x] 定义 create/update/load/unload/archive/unarchive/delete。
 - [x] 定义 fork 的 definition copy 和 stable boundary 语义。
 - [x] 定义 active/future Turn 和 lifecycle race。
-- [x] 定义 WaitingApproval、Steer 和 Interrupted 的关系。
+- [x] 定义 WaitingApproval、WaitingForUserInput、Steer 和 Interrupted 的关系。
 - [x] 定义 conservative crash recovery。
 - [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
 - [x] 完成 Session ledger identity、entry parent tree、fork remap 和 append contract。

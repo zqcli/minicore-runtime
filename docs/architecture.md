@@ -87,7 +87,7 @@ PromptSet::compose_user_message(...) → CanonicalUserMessage
 - **Session**：长期存在的对话对象。head保存identity、current `SessionDefinitionRevision`、durable lifecycle和metadata。`SessionDefinition`原子绑定`AgentRevisionRef`、Workspace、`SessionModelConfig`和`SessionPromptSelection`。Session 创建时 pin Agent 当时的 current revision；Agent 后续发布新 revision 不自动改变已有 Session，必须通过新 `SessionDefinitionRevision` 显式升级，且一个 Session 的全部 revision 只能引用同一个 AgentId。
 - **Turn**：从 committed initiating UserMessage entry 到 terminal entry（final AssistantMessage / TurnInterrupted / TurnFailed）的用户意图执行过程。Turn head 不内联 `Vec<Item>`；Item 顺序由 SessionStorage projection 提供。active/recovered Turn 通过 initiating UserMessage 引用的 TurnContext entry 解析 exact execution metadata。
 - **Item**：Turn 内稳定、可观察的语义值或长生命周期操作。`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；`ItemType`/`ItemStatus` 从 content 派生，不独立存储。ToolCall 与 ToolResult 属于同一个 `ToolInvocation` Item（`Started → Completed | Abandoned`）。streaming delta、progress、provider retry、execution phase 不是 Item。
-- **Interaction**：某个 Item 执行期间由 Runtime 发起并等待外部回答的 durable request/resolution（`ToolApproval | UserQuestion`）。归属固定为 `Interaction → Item → Turn → Session → Agent`；遵守 request-before-notify 与 resolution-before-resume/side-effect。结构化 Interaction response 不是 UserMessage，不开启新 Turn。
+- **Interaction**：某个 Item 执行期间由 Runtime 发起并等待外部回答的 durable request/resolution（`ToolApproval | UserQuestion`）。归属固定为 `Interaction → Item → Turn → Session → Agent`；遵守 request-before-notify 与 resolution-before-resume/side-effect。MiniCore拥有交互协议和durable truth，Presentation Adapter只负责presentation与提交resolution。结构化 Interaction response 不是 UserMessage，不开启新 Turn。
 
 ### Turn 执行上下文
 
@@ -125,7 +125,7 @@ pub(crate) struct TurnExecutionContext {
 
 - `AgentStatus = Enabled | Disabled | Deleted`；`SessionLifecycle = Open | Archived | Deleted`（`Open ↔ Archived → Deleted`）。`Deleted` 是不可恢复的逻辑删除，物理清除留给 `PurgeAgent` / `PurgeSession`。
 - `SessionLoadState`、`SessionReadiness`、`SessionExecutionState` 是进程内 projection，不进入 durable Session；重启后所有 Session 视为 Unloaded。Loaded 不等于 Ready：Workspace、exact AgentRevision 或 conversation 不可用时 history 仍可读，但 Turn admission fail closed。
-- `TurnStatus = Running | Completed | Interrupted | Failed`。initiating UserMessage entry append 后 Turn 首先 `Running`；terminal 不可恢复为 Running；一个 Session 同时最多一个 Running Turn。`WaitingApproval`、`Sampling`、`ExecutingTools`、`Compacting` 都只是 Running Turn 的 `TurnExecutionPhase`——等待审批或 Compaction 时 TurnStatus 仍为 Running，Steer 默认排队到当前 operation 完成，不把 Turn 变为 Interrupted。
+- `TurnStatus = Running | Completed | Interrupted | Failed`。initiating UserMessage entry append 后 Turn 首先 `Running`；terminal 不可恢复为 Running；一个 Session 同时最多一个 Running Turn。`WaitingApproval`、`WaitingForUserInput`、`Sampling`、`ExecutingTools`、`Compacting` 都只是 Running Turn 的 `TurnExecutionPhase`——等待审批、用户回答或 Compaction 时 TurnStatus 仍为 Running，Steer 默认排队到当前 operation 完成，不把 Turn 变为 Interrupted。
 
 ## Message Pipeline
 
@@ -154,6 +154,13 @@ Tool-call response
   → SessionWriter.append(Tool message)* → apply each
   → SessionWriter.append(ToolRoundCompleted) → apply
   → CommittedConversationDelta → SessionExecutor applies committed conversation
+
+Ask-user Tool-call
+  → ToolExecutionControl.request_user_question
+  → InteractionRequested append/apply → UI-safe StateEvent
+  → InteractionResolved(UserAnswer) append/apply
+  → PreExecution truthful Tool message → tool_round_completed
+  → same Turn next model call
 
 Steer after complete assistant/tool step
   → SteerQueue<TurnId>.pop_front()
@@ -186,7 +193,7 @@ Steer after complete assistant/tool step
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
-- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取带cursor的immutable published view。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取带cursor的immutable published view。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement、资源锁和真实副作用由 `ToolService` 统一治理；新 Turn 通过 `ToolService::for_turn(...) -> ToolSet` 原子绑定模型可见 `ToolPromptView` 与 executor snapshot。MVP 不启用通用 `bash`；子进程限制无法强制时必须 fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
@@ -208,3 +215,4 @@ Steer after complete assistant/tool step
 - [ADR 0110：Prompt 与 Skill 使用共享、可替换 View](adr/0110-prompt-and-skill-use-shared-reloadable-views.md)
 - [ADR 0111：SessionIngress 分离控制与工作 lane](adr/0111-session-ingress-separates-control-and-work-lanes.md)
 - [ADR 0112：Compaction支持active-Turn checkpoint与模型感知预算](adr/0112-compaction-supports-active-turn-checkpoints.md)
+- [ADR 0113：UserQuestion使用Runtime交互协议与UI展示Adapter](adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)

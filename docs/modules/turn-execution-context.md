@@ -507,6 +507,7 @@ loop:
   → release WorkspaceCommitAuthorization
   → pinned ToolSet.execute(ToolExecutionRequest[])
      └─ approval 通过 durable Interaction request/resolution
+     └─ ask-user route通过durable UserQuestion等待typed answer，并产生PreExecution outcome
      └─ ToolExecutionControl record ToolExecutionStarted before side effect
   → ToolExecutionOutcome[]
      ├─ 每个Completed：append matching role=tool message → apply
@@ -527,7 +528,7 @@ loop:
      → SessionExecutionState = Idle
 ```
 
-ToolExecutionControl要求的每次durable append都必须先通过storage-owned apply_committed更新全部projection，再返回approval或允许side effect。下一次模型调用只能发生在`tool_round_completed`成功append并apply后。
+ToolExecutionControl要求的每次durable append都必须先通过storage-owned apply_committed更新全部projection，再返回approval/UserAnswer或允许side effect。下一次模型调用只能发生在`tool_round_completed`成功append并apply后。
 
 以下内容不能进入下一次逻辑模型调用：
 
@@ -557,6 +558,22 @@ WaitingApproval不是Interrupted。此时到达的Steer只进入current Turn的b
 
 只有显式 cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn进入 terminal status。
 
+## WaitingForUserInput
+
+等待UserQuestion时，Turn也没有结束：
+
+```text
+TurnStatus = Running
+SessionExecutionState = Running
+TurnExecutionPhase = WaitingForUserInput
+InteractionState = Pending
+ToolInvocationState = Started
+```
+
+首版ask-user route在`ToolExecutionStarted`、资源锁和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不持有`ToolResourceLocks`或`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、timeout、Unload和Snapshot。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
+
+WaitingForUserInput不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为UserAnswer，也不preempt当前Interaction。
+
 ## Steer
 
 Steer是current Turn的queued input，不是开启新Turn的普通UserMessage。它使用`SteerQueue<TurnId>`中的bounded per-Turn FIFO，不取消当前Model/Tool operation。
@@ -579,7 +596,7 @@ Steer可以在Model或Tool执行期间被接收，但不会修改已经发送给
 - Sampling期间不cancel、不推进execution_version；已完成response必须先保存为ToolCall step或无ToolCallAssistant Continue step；
 - AgentLoop返回NeedTools后、任何Tool side effect前必须重新检查Cancel state和current authorization；
 - Tool 已经可能产生副作用且 exact outcome 可得时，默认等待该轮调用形成完整 Tool messages 后再 append `tool_round_completed`；executor/side-effect outcome unknown 时 ToolInvocation 进入 Abandoned 并 terminalize Turn；
-- approval wait、sleep 或其他明确可中断 Tool 可以形成 cancelled ToolResult，再完成 ToolRound；
+- approval/UserQuestion wait、sleep 或其他明确可中断 Tool 可以形成 cancelled ToolResult，再完成 ToolRound；
 - candidate final与Steer FIFO由SessionExecutor线性化；已有queued Steer时candidate final保存为non-terminal Continue，queue为空时才append Final；
 - final terminal entry先完成后到达的Steer不再属于该Turn。
 
@@ -997,7 +1014,7 @@ AgentLoop registry
 - Started/Abandoned ToolInvocation 和 incomplete ToolRound 不进入模型 conversation；
 - provider retry 复用同一个 immutable assembled context；
 - tool_round_completed append/apply后才开始下一次逻辑模型调用；
-- WaitingApproval 时 Turn 仍是 Running；
+- WaitingApproval和WaitingForUserInput时Turn仍是Running；
 - Steer在完整assistant/tool step后FIFO出队，append后才影响下一次逻辑模型调用，不把Turn变为Interrupted；
 - FollowUp 创建新 Turn 和新 Context；
 - ordinary reload 只影响 future Turn；
@@ -1026,12 +1043,15 @@ AgentLoop registry
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
 - InteractionRequested append-before-notify；
 - InteractionResolved append-before-wake/side-effect；
+- `request_user_question`在ToolExecutionStarted和资源锁之前创建UserQuestion；
+- WaitingForUserInput不持有Tool资源锁，sibling ToolCall尚未启动，其他Session可继续运行；
 - 每个ToolExecutionOutcome Completed时append role=tool message；全部matching messages存在后append tool_round_completed；
 - 任一 ToolExecutionOutcome Abandoned 时不构造 ToolRound并进入 terminal arbitration；
 - tool_round_completed前不开始下一次逻辑模型调用；
 - tool_round_completed后AgentLoop adapter只消费committed delta；
 - WaitingApproval 保持 TurnStatus Running / InteractionState Pending / ToolInvocation Started；
-- Sampling Steer不取消旧Model；WaitingApproval/ExecutingTools Steer在current ToolRound完成后FIFO出队；
+- WaitingForUserInput保持TurnStatus/SessionExecutionState Running，UserAnswer恢复同一Turn而不是创建UserMessage；
+- Sampling Steer不取消旧Model；WaitingApproval/WaitingForUserInput/ExecutingTools Steer在current ToolRound完成后FIFO出队；
 - Steer 与 final terminal append race；
 - FollowUp 在前一 Turn terminal 后创建新 Context；
 - compaction entry append/apply 后 conversation checkpoint 和 AssembledModelContextFingerprint 改变；

@@ -150,7 +150,7 @@ AgentLoop NeedModel
 → evaluate compaction trigger
 ```
 
-safe point包括initiating UserMessage后第一次Model前、`tool_round_completed`后下一次Model前、queued Steer append/apply后下一次Model前，以及provider ContextOverflow recovery。Sampling、WaitingApproval、ExecutingTools和Finishing期间不启动Compaction。
+safe point包括initiating UserMessage后第一次Model前、`tool_round_completed`后下一次Model前、queued Steer append/apply后下一次Model前，以及provider ContextOverflow recovery。Sampling、WaitingApproval、WaitingForUserInput、ExecutingTools和Finishing期间不启动Compaction。
 
 ```rust
 pub enum CompactionTrigger {
@@ -548,16 +548,7 @@ logical SummaryModel retry由SessionExecutor决定，必须复用相同Compactio
 
 ### Phase
 
-```rust
-pub enum TurnExecutionPhase {
-    PreparingModel,
-    Compacting,
-    Sampling,
-    WaitingApproval,
-    ExecutingTools,
-    Committing,
-}
-```
+`TurnExecutionPhase`的权威枚举由[Agent与Session生命周期](agent-session-lifecycle.md#turn-status-与-execution-phase)定义；Compaction integration只使用其中的`Compacting`，不在本模块重复声明完整枚举。
 
 `Compacting`期间：
 

@@ -26,15 +26,15 @@ MiniCoreRuntime
 - [Skills](skills.md)：`SkillService`发布reloadable `SkillView`，与`LoadedSkill`分离；metadata discovery和正文按需加载。
 - [Tools](tools.md)：`ToolService` 通过 `for_turn(...) -> ToolSet` 原子绑定模型可见 ToolSpec 与 executor route；registry、policy、approval、grants、sandbox、mutation lock 与 executor。
 - [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、fingerprint、reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
-- [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、terminal cleanup 与保守恢复。
+- [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、UI/MiniCore职责、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
-- [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
+- [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、`WaitingForUserInput`、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
 - [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用、private Rig adapter、stream/retry/auth/usage/cache/continuation。
 - [Compaction](compaction.md)：portable rolling summary、stable-unit safe cut、leading summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
 ## 相关决策
 
-长期架构决策记录在 [`docs/adr/`](../adr/)（0100+）：领域与 ownership、Workspace ownership、Prompt/Tool/Skill 边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime 公开协议。行为与接口以各模块文档、协议文档和 ADR 为权威。
+长期架构决策记录在 [`docs/adr/`](../adr/)（0100+）：领域与 ownership、Workspace ownership、Prompt/Tool/Skill 边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime 公开协议以及UserQuestion的UI/Runtime职责分离。行为与接口以各模块文档、协议文档和 ADR 为权威。
 
 ## 权威归属
 
@@ -50,6 +50,9 @@ MiniCoreRuntime
 | ToolService、ToolSet、policy、approval、grants、sandbox、executor | [Tools](tools.md) |
 | TurnExecutionContext capture、fingerprint、reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction identity、lifecycle、terminal cleanup | [Turn / Item / Interaction](turn-item-interaction.md) |
+| UserQuestion producer seam与ask-user Tool route | [Tools](tools.md) |
+| TurnExecutionPhase与WaitingForUserInput状态语义 | [Agent 与 Session 生命周期](agent-session-lifecycle.md) |
+| UserQuestion公开view、Presentation Adapter与resolution protocol | [Runtime 公开协议](runtime-interface.md) |
 | durable truth、entry tree、JSONL、conversation projection、recovery | [Conversation 与 SessionStorage](conversation-storage.md) |
 | 单Session执行owner、SessionIngress lanes、唯一current RunningOperation、Steer/FollowUp FIFO、emergency/lifecycle control、multi-session并发 | [Session 执行](session-execution.md) |
 | TurnModelSnapshot、generate_model_turn、provider adapter、stream/retry/usage | [ModelGateway](model-gateway.md) |

@@ -314,7 +314,7 @@ SkillCatalog.prompt_view()
 - transient `SessionLoadState / SessionReadiness / SessionExecutionState`；
 - Session fork、Runtime restart 和 conservative recovery；
 - Agent/Session lifecycle 与 active/future Turn 的 race；
-- WaitingApproval、Steer 和 Turn terminal status 的关系。
+- WaitingApproval、WaitingForUserInput、Steer 和 Turn terminal status 的关系。
 
 完成门槛：
 
@@ -343,9 +343,10 @@ SkillCatalog.prompt_view()
 - Interaction request/resolution、timeout 和 cancellation family；
 - request-before-notify、resolution-before-resume/side-effect；
 - Tool approval 与 UserQuestion 归属于 parent Item；
+- UserQuestion由MiniCore producer seam发起，Presentation Adapter只负责presentation与resolution；
 - pending Interaction reconnect/resend 和 abrupt transport loss；
 - `TurnStatus = Running | Completed | Interrupted | Failed` 与 typed terminal detail；
-- WaitingApproval、Steer、terminal cleanup 和 conservative recovery。
+- WaitingApproval、WaitingForUserInput、Steer、terminal cleanup 和 conservative recovery。
 
 完成门槛：
 
@@ -405,12 +406,12 @@ SkillCatalog.prompt_view()
 - Context 构造、UserMessage composition、Model 和 Tool 使用异步 `RunningOperation`；
 - operation result 使用 `SessionId + TurnId + execution_version + OperationType` 校验；
 - private AgentLoop 只返回 `NeedModel | NeedTools | Finished`；
-- `ToolExecutionControl` 负责 approval 和 execution-start 的 required durable ordering；
+- `ToolExecutionControl` 负责 approval、UserQuestion 和 execution-start 的 required durable ordering；`request_user_question`只在pre-execution ask-user route使用，等待不持有资源锁；
 - Submit、Steer、FollowUp、CancelQueuedMessage、ResolveInteraction、Cancel、Workspace revocation、PrepareForUnload 和 Snapshot 流程；
 - FollowUp 使用 bounded process-local FIFO；
 - progress event 与全部mutation/control ingress lane分离；
 - restart 不恢复旧异步操作，unfinished Turn 保守 terminalize；
-- multi-session 共享 Model/Tool 资源时使用明确并发限制和 canonical resource locks。
+- multi-session 共享 Model/Tool 资源时使用明确并发限制和 canonical resource locks；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。
 - lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 
 完成门槛：
@@ -702,7 +703,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0112）构成，是当前唯一权威事实来源。
+- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0113）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
@@ -725,7 +726,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR 采用 `0100`–`0112` 编号，位于 [`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录。
+- V2 ADR 采用 `0100`–`0113` 编号，位于 [`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录；UserQuestion producer与UI presentation决策由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。
 
 ## 当前迁移状态
 

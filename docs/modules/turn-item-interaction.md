@@ -34,6 +34,7 @@
 | pi | `turn_start/turn_end` 更接近一次模型调用加 Tool execution round；ToolCall 在 AssistantMessage，ToolResult 是独立 Message；approval 是 runtime callback | loop 简洁，但“ToolCall 与结果分离 + ephemeral approval”不满足 MiniCore recovery 和 durable Interaction |
 | Grok Build | conversation与TurnCompleted持久化；大部分pending interaction是内存waiter，PlanApproval另有独立持久化规则 | 特殊interaction单独持久化会产生例外；MiniCore应统一request/resolution durability |
 | Claude Code | Permission 和 AskUserQuestion 围绕 Tool 调用；interrupt/checkpoint 是产品能力；stream-json partial output 是 observer event | Tool-centric Interaction 合理；permission policy 属于 Tool，Interaction 只表达外部回答 |
+| MCP Elicitation | server 发起结构化 elicitation，client 负责展示并返回结果；具体持久化由宿主决定 | 借鉴 server-request/client-presentation 形状；MiniCore 保留自己的 durable Interaction truth |
 | Cursor | 可观察到 Plan、checkpoint 和 background agent，但内部 Turn/Item ownership 未公开 | 只参考产品体验，不推断其内部领域模型 |
 
 MiniCore 采用：
@@ -59,6 +60,7 @@ storage implementation：immutable facts + projection fold
 - streaming delta、Tool progress、provider retry 和 execution phase 不是 Item；
 - 只保存 provider 实际返回的 finalized/replayable reasoning，不获取 hidden chain-of-thought；
 - Interaction 是 Item-owned durable request/resolution；
+- UserQuestion 使用“MiniCore-owned interaction protocol + UI-owned presentation”：Runtime 决定何时问、问的是哪个 Item，Presentation Adapter决定如何呈现和收集答案；
 - Interaction request append 后才向 host 发布；
 - Interaction resolution append 后才唤醒 waiter或执行 Tool；
 - transport disconnect 不自动关闭 Interaction；
@@ -536,6 +538,13 @@ pub enum InteractionState {
 }
 ```
 
+Interaction 的职责分为两层：
+
+- Session execution与SessionStorage拥有`RequestId`、`TurnId`/`ItemId`绑定、Pending/Resolved durable state、deadline、幂等、Cancel、terminal cleanup和waiter resume；
+- TUI、Web、GUI或RPC host是Presentation Adapter，只负责把UI-safe `InteractionView`变成对用户可理解的对话框、聊天消息或表单，并通过Runtime facade提交resolution。
+
+Presentation Adapter不能直接持有Tool future、SessionExecutor或SessionWriter，也不能用一个新的UserMessage代替`InteractionCommand::Resolve`。如果UI自己发起问题而MiniCore没有Pending Interaction，答案就会成为新Turn，不能继续原来的ToolInvocation。
+
 不用 `InteractionStatus + Option<InteractionResolution>`，避免构造 `Resolved + None` 或 `Pending + Some(...)`。
 
 read projection 可以派生：
@@ -583,6 +592,7 @@ pub enum InteractionCancelReason {
 
 - ToolApproval request 只能由 Tool-related Item 触发；
 - UserQuestion 通常归属于 ask-user ToolInvocation，也允许归属于其他真正发起 request 的 Item；
+- 首版由 ToolSet 的独占 pre-execution ask-user route 发起 UserQuestion；它发生在 `ToolExecutionStarted`、资源锁和外部副作用之前；
 - request/resolution family 必须匹配；
 - Cancelled 和 Expired 可以关闭任意 family；
 - auto-approved、auto-denied 的 Tool policy 不需要创建 Interaction；
@@ -653,6 +663,8 @@ pub struct UserQuestionAnswer {
 
 一个 request 可以包含多个相关问题，避免为同一个问卷创建多个 pending lifecycle。
 
+producer seam 由 Turn-scoped `ToolExecutionControl::request_user_question(item_id, request)` 提供。它是 MiniCore 内部 interface，不是 UI 接口；调用方等待 typed answer，SessionExecutor 负责 append、notify、resolve validation 和 wake。首版 ask-user route 在一个 ToolRound 中独占等待：答案形成该route的`PreExecution` outcome后，同一assistant step的其他ToolCall才进入普通调度。
+
 answer：
 
 ```text
@@ -665,6 +677,8 @@ append UserAnswer resolution
 
 Interaction answer 本身不是 UserMessage，不开启新 Turn。
 
+`Cancelled`/`Expired` 由 ask-user route 映射为 typed `PreExecution` outcome 或 terminal cleanup；不得伪造已经发生的外部副作用。
+
 ## Reconnect 与 Transport Loss
 
 transport delivery 是 at-least-once；durable Interaction 是 truth：
@@ -672,7 +686,7 @@ transport delivery 是 at-least-once；durable Interaction 是 truth：
 ```text
 client disconnect
 → Interaction 保持 Pending
-→ Turn 保持 Running / WaitingApproval 或 waiting question
+→ Turn 保持 Running / WaitingApproval 或 WaitingForUserInput
 
 client reconnect
 → query loaded Session snapshot / pending interactions
@@ -704,7 +718,9 @@ Pending + now >= expires_at
 
 Tool approval 默认 fail closed。是否把 timeout 映射为 denied ToolResult 由 Tool policy决定，但必须是明确、durable 的 resolution。
 
-## WaitingApproval 与 Steer
+## Interaction等待与 Steer
+
+### WaitingApproval
 
 等待审批时：
 
@@ -714,6 +730,24 @@ TurnExecutionPhase = WaitingApproval
 InteractionState = Pending
 ToolInvocationState = Started
 ```
+
+### WaitingForUserInput
+
+等待 UserQuestion 时：
+
+```text
+TurnStatus = Running
+SessionExecutionState = Running
+TurnExecutionPhase = WaitingForUserInput
+InteractionState = Pending
+ToolInvocationState = Started
+```
+
+当前 Turn 的逻辑执行停在该 Interaction，不开始下一次 Model 调用，也不开始新的副作用 Tool operation；SessionExecutor 本身不阻塞，仍然处理 `ResolveInteraction`、Cancel、timeout、PrepareForUnload、Snapshot 和其他 per-session control。首版 ask-user route 在同一 assistant step 内独占等待：同一 step 的 sibling ToolCall 不会在答案返回前启动，也不持有 `ToolResourceLocks` 或 `WorkspaceCommitAuthorization`。其他 Session 的 Tool outcome 不受该等待影响。
+
+Steer 仍进入该 Turn 的 bounded FIFO，不抢占 UserQuestion；回答完成并形成 truthful ToolResult、`tool_round_completed` 后，下一次 Model 调用前最多消费一条 Steer。
+
+### Steer
 
 Steer：
 
@@ -826,7 +860,7 @@ SessionStorage 仍是唯一 durable truth；projection 和 event stream 都不�
 | ToolCall/ToolResult execution semantics | ToolService / ToolSet |
 | ToolInvocation domain projection | Session execution / storage projector |
 | Interaction request/resolution | Session execution + SessionStorage |
-| approval/question external delivery | Runtime Interface的per-session StateEvent与InteractionCommand |
+| approval/question external delivery | Runtime Interface的per-session StateEvent与InteractionCommand；具体 UI 是外部 Presentation Adapter |
 | pending waiter | loaded Session execution，transient |
 | streaming delta/progress | observer event pipeline |
 | model-visible conversation | committed conversation projector + PromptSet |
@@ -971,6 +1005,11 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - lost acknowledgement 使用 in-run resolution_key retry；
 - WaitingApproval 中 Steer 排队；
 - WaitingApproval Steer只排队，不preempt Interaction；
+- WaitingForUserInput 中 TurnStatus/SessionExecutionState 仍为 Running；
+- WaitingForUserInput 不持有 ToolResourceLocks/WorkspaceCommitAuthorization，且 Session A 等待时 Session B 可以继续执行；
+- WaitingForUserInput解决前，同一assistant step的sibling ToolCall不启动；解决后恢复普通调度；
+- `request_user_question` 在 ToolExecutionStarted 前建立 UserQuestion Interaction；
+- Presentation Adapter不能用新UserMessage代替Interaction resolution，也不能直接持有waiter；
 - Tool side effect前完成resolution并重新检查Cancel state和current authorization；
 - restart recovery使用幂等entries逐步关闭pending、abandon unknown并interrupt Turn；
 - recovery 不生成 synthetic ToolResult；
@@ -1001,6 +1040,8 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - [x] 定义 request-before-notify 和 resolution-before-resume。
 - [x] 定义 reconnect/resend、timeout 和 transport loss。
 - [x] 定义 WaitingApproval 与 Steer。
+- [x] 定义 UI-owned presentation、MiniCore-owned Interaction protocol 和 `request_user_question` producer seam。
+- [x] 定义 WaitingForUserInput、per-session isolation 和不持锁等待。
 - [x] 定义 terminal cleanup 和 conservative recovery。
 - [x] 区分 durable Item 与 transient observer delta。
 - [x] 完成by-entry JSONL tree、Message/Event layout、EntryId、ToolRoundCompleted模型可见性规则和fork identity schema。
