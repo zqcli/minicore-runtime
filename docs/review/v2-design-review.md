@@ -2,7 +2,7 @@
 
 状态：设计评审记录
 日期：2026-07-25
-范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0111）
+范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0112）
 方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4与D1已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
 
 ## 总体判断
@@ -102,16 +102,16 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 
 ### E. 能力缺口 / 可能需重定范围
 
-**E1 · Compaction 对长 agentic Turn 是主路径失败，不是边缘**（重点）
+**E1 · Compaction 对长 agentic Turn 是主路径失败，不是边缘（已关闭）**
 initiating UserMessage 之后全部 committed model-visible history 被 hard-protect，且 retained 必须是连续 suffix → active Turn 内所有 ToolRound 都不可摘要。大量 / 大体积 tool round（编码 agent 常态）使 protected suffix 单调增长 → `ProtectedSuffixTooLarge` → hard overflow → `TurnFailed`，且「同一 Turn 最多一次 overflow recovery」使其不可挽救；轮间 soft compaction 只能回收 pre-turn 历史，headroom 有限。
 - 影响：这是目标用例（长 agentic Turn）的主路径，而非文档定位的「单个超大 Turn 边缘情形」，决定 v1 是否必须支持 turn 内 tool-round 级压缩/分段。
-- 建议：评估 v1 提供「turn 内已完成 ToolRound 的有界压缩 / 尾部截断（带 provenance）」或最小 split-turn；若坚持不做，应在 ADR 0107 把该限制升级为「已知会在常见 agentic 负载下触发」，并给出产品降级策略（如提示用户开新 Turn 携带摘要）。
-- 出处：`compaction.md`、ADR 0107。
+- 决议：保留initiating与Steer UserMessage原文，新增`ActiveTurnCompletedPrefix` scope；每个exact UserMessage开启一个instruction segment，在完整ToolRound安全边界把该segment早期已完成work滚动为至多一个`ActiveTurnCheckpoint`。Pending/Started/incomplete ToolRound、explicit protected entries和recent exact tail不进入coverage。每个segment使用单调coverage frontier；滚动时用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance，不能把checkpoint boundary误当成原始frontier。successful compaction推进后可在单Turn有界次数内再次compact；同一source/frontier hard recovery不重复。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
+- 出处：`compaction.md`、ADR 0112（取代ADR 0107）。
 
-**E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile**
+**E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile（已关闭）**
 `CompactionSettings.summary_max_output_tokens` 是单一全局 `NonZeroU32`，直接进入 plan 与 directive；但 `ModelCallRequest::new` 校验 `max_output_tokens ≤ TurnModelSnapshot` effective limit。当 pinned model 上限更小时，每次 compaction 请求构造 `InvalidRequest` → 小 context 模型 compaction 永久失效，且误分类为 InvalidRequest/TurnFailed。
 - 影响：plan → request 是必经路径，文档无 clamp/校验规则，而 model-gateway 又禁止静默 clamp（clamp 会改变已 fingerprint 的 policy）。
-- 建议：plan 阶段基于 pinned `EffectiveModelLimits` 派生 summary 的 `max_output_tokens`（取全局设置与模型上限的 min，并纳入 `CompactionPlanFingerprint`）；模型上限过小无法留出 summary 输出预算时返回明确 compaction 域错误（如 `NoFeasibleCut`），而非 `InvalidRequest`。
+- 决议：plan阶段派生`CompactionSummaryBudget`，对全局上限、pinned known model output limit、summary source、Prompt固定开销、context window与safety reserve求交；最终值进入plan/directive/fingerprint。低于`summary_min_output_tokens`时返回`NoFeasibleSummaryBudget`，ModelGateway继续strict validate且不静默clamp。plan/Prompt proof/ModelCallRequest/SessionExecutor append gate负责临时budget一致性，SessionStorage冷重放只验证entry可重建的scope、boundary、hash、checkpoint和provenance关系。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
 - 出处：`compaction.md` ↔ `model-gateway.md`。
 
 **E3 · `UserQuestion` Interaction 没有发起 seam**
@@ -179,7 +179,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - continuation 要求 new full input prefix 逐段等价于 cache 的 previous input + finalized response，但 finalized assistant（encrypted/signature reasoning、provider item id、空白规范化）经持久化重组后难逐字节还原，优化几乎不触发 → 给 canonical 等价精确定义 + round-trip golden vectors，接受「full request 是常态」为基线。
 - `resolve_for_turn` 无 availability probe + 禁 active-Turn cross-model fallback → 首消息命中宕机 model 直接 TurnFailed → 增加「下一 Turn 自动 fallback 到显式配置备用 model」策略（保持 exact pin、不在 turn 内静默替换）。
 - 正常 AgentRun 下 provider 返回越权 ToolCall / 结构化输出违约应映射的 `ModelCallErrorKind`（ProtocolViolation? InvalidRequest?）与是否 retryable 未明确 → 显式规定。
-- compaction summary 输入预算基准不一致：usable input budget 用 AgentRun 的 effective max_output_tokens 计算，但 summary 调用自身预留 `summary_max_output_tokens` → feasibility 计算应以 summary 调用自己的 output 预留为准，文中固定基准。
+- ~~compaction summary 输入预算基准不一致~~：**已随E2关闭**。AgentRun pressure budget与`CompactionSummaryBudget`分离，summary feasibility使用自身effective output reserve。
 - 无 manual/proactive compaction（不公开 `CompactSession`）→ 至少预留未来 maintenance 协议位，文档标注为有意 v1 缺口。
 - 无 `WorkspaceId`：历史 session 项目归属靠 primary root canonical path 相等，目录移动/路径复用致分组漂移或跨项目误并（授权侧安全，UI 分组会错）→ 明确 grouping 为 cosmetic，规定 path 复用/失效行为，或引入非授权可持久化 project label。
 - restrictive definition update 若 durable commit 失败，repair 按 durable-current 旧（较宽松）definition 重解析，收紧静默未生效仅中断 active Turn → 在 SessionReadiness/diagnostics 显式标记「上次收紧未持久化，需重试」。

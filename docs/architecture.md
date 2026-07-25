@@ -177,7 +177,7 @@ Steer after complete assistant/tool step
 - [Conversation 与 SessionStorage](modules/conversation-storage.md)：by-entry JSONL tree、唯一 append seam、entry tree、projection、fork、recovery。
 - [Session 执行](modules/session-execution.md)：单 SessionExecutor、semantic SessionIngress lanes、RunningOperation、multi-session 并发与资源锁。
 - [ModelGateway](modules/model-gateway.md)：`resolve_for_turn` / `generate_model_turn`、private Rig adapter、stream/retry/auth/usage/cache。
-- [Compaction](modules/compaction.md)：portable rolling summary、strict stable-unit cut、`Compacting` 阶段、StoredCompaction 恢复。
+- [Compaction](modules/compaction.md)：portable rolling summary、stable-unit cut、active-Turn checkpoint、model-aware summary budget、`Compacting` 阶段与StoredCompaction恢复。
 
 模块索引与权威归属见 [模块总览](modules/README.md)。
 
@@ -189,7 +189,7 @@ Steer after complete assistant/tool step
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取带cursor的immutable published view。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement、资源锁和真实副作用由 `ToolService` 统一治理；新 Turn 通过 `ToolService::for_turn(...) -> ToolSet` 原子绑定模型可见 `ToolPromptView` 与 executor snapshot。MVP 不启用通用 `bash`；子进程限制无法强制时必须 fail closed。
-- 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、strict cut、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版只用 active Turn exact model 生成 rolling summary，hard-protect initiating UserMessage 和连续 suffix。
+- 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
 
 ## 相关决策
 
@@ -202,8 +202,9 @@ Steer after complete assistant/tool step
 - [ADR 0104：SessionStorage 是 durable truth](adr/0104-session-storage-is-durable-truth.md)
 - [ADR 0105：SessionExecutor 拥有 loaded Session](adr/0105-session-executor-owns-loaded-session.md)
 - [ADR 0106：ModelGateway 是单一深异步 operation](adr/0106-model-gateway-is-single-deep-operation.md)
-- [ADR 0107：Compaction 使用严格 stable suffix](adr/0107-compaction-uses-strict-stable-suffix.md)
+- [ADR 0107：Compaction 使用严格 stable suffix（已被0112取代）](adr/0107-compaction-uses-strict-stable-suffix.md)
 - [ADR 0108：Runtime 公开协议](adr/0108-runtime-public-protocol.md)
 - [ADR 0109：Prompt、Projection 与 Session Operation 使用确定性规则](adr/0109-review-b-determinism-and-serialized-operations.md)
 - [ADR 0110：Prompt 与 Skill 使用共享、可替换 View](adr/0110-prompt-and-skill-use-shared-reloadable-views.md)
 - [ADR 0111：SessionIngress 分离控制与工作 lane](adr/0111-session-ingress-separates-control-and-work-lanes.md)
+- [ADR 0112：Compaction支持active-Turn checkpoint与模型感知预算](adr/0112-compaction-supports-active-turn-checkpoints.md)

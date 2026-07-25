@@ -674,55 +674,24 @@ Interrupted/Failed event不向model conversation追加synthetic assistant messag
 
 ## Compaction Entry
 
-`ConversationBoundary`引用一个完整model-visible stable unit：
+`StoredCompaction`、`CompactionScope`、`ConversationBoundary`和`StoredCompactionModelCall`的权威schema见[Compaction](compaction.md#storedcompaction)。ConversationStorage只负责证明这些typed fields可以安全应用到selected committed path。
 
-```rust
-pub struct ConversationBoundary {
-    pub unit_first_entry_id: EntryId,
-    pub unit_last_entry_id: EntryId,
-    pub unit_fingerprint: StableConversationUnitFingerprint,
-}
-
-pub struct StableConversationUnitFingerprint(pub ContentHash);
-```
-
-`summarized_through`表示最后一个被摘要unit，inclusive；`retained_from`表示第一个原样保留unit，inclusive。writer通过source projection证明两者在ordered stable-unit sequence中相邻。`unit_fingerprint`覆盖unit kind、ordered model-visible content和backing reference shape，但不覆盖storage-local EntryId，因此fork remap first/last EntryId后fingerprint保持不变。
-
-```rust
-pub struct StoredCompaction {
-    pub turn_id: Option<TurnId>,
-    pub source: ConversationCheckpoint,
-    pub summarized_through: ConversationBoundary,
-    pub summary: CompactionSummary,
-    pub retained_from: ConversationBoundary,
-    pub protected_entries: Arc<[EntryId]>,
-    pub model_call: Option<StoredCompactionModelCall>,
-}
-
-pub struct StoredCompactionModelCall {
-    pub model: TurnModelRef,
-    pub response_id: Option<String>,
-    pub usage: Option<ModelUsage>,
-    pub finish_reason: ModelFinishReason,
-    pub provider_metadata: StoredProviderResponseMetadata,
-    pub logical_retry_count: u32,
-    pub assembled_context_fingerprint: AssembledModelContextFingerprint,
-}
-```
+scope中的`summarized_through`表示本次source effective projection中最后一个被摘要unit，inclusive；`retained_from`表示第一个原样保留unit，inclusive。active-Turn scope另保存selected exact UserMessage anchor（initiating或Steer）和该instruction segment的optional `previous_checkpoint`。该字段指向当前effective checkpoint；它覆盖的原始范围必须从backing `StoredCompaction`的scope provenance派生，不能把checkpoint boundary当成原始covered-through frontier。writer通过source projection证明boundary的相邻、anchor、provenance和frontier单调关系。`unit_fingerprint`覆盖unit kind、ordered model-visible content和backing reference shape，但不覆盖storage-local EntryId，因此fork remap first/last EntryId后fingerprint保持不变。
 
 Compaction entry本身触发conversation Replace，不另写`compaction_completed` durable event。
 
 规则：
 
 - source checkpoint和TranscriptFingerprint必须exact match；
-- summarized range必须是连续prefix，retained range必须是连续suffix，两者在stable boundary相邻；
+- `ConversationPrefix`必须是active Turn之前的连续prefix与相邻retained suffix；
+- `ActiveTurnCompletedPrefix`必须保留selected exact initiating或Steer UserMessage anchor，只覆盖其后、下一条active UserMessage之前已经完整提交的连续units；若存在`previous_checkpoint`，必须先解析其backing compaction的covered-through provenance，新coverage只能在该segment内紧接其后单调推进；
 - cut不能拆分Input/Steer UserMessage、无ToolCallAssistant Continue、complete ToolRound、final assistant或existing Compaction summary；
-- active-Turn automatic Compaction必须保护initiating UserMessage及其后的连续suffix；
-- caller不提交raw replacement messages；trusted projector从source、boundaries和summary构造`Replace([summary] + retained suffix)`；
+- active-Turn automatic Compaction必须保护全部active UserMessage、真实protected units和recent exact tail，但各instruction segment内已完成的早期ToolRound可以进入checkpoint coverage；
+- caller不提交raw replacement messages；trusted projector从source、typed scope、boundaries和summary构造leading-summary或anchor-after checkpoint `Replace`；
 - compaction只追加overlay，不重写旧entries；
 - navigating/forking到compaction前的entry自然不应用该compaction；
 - 首版automatic Compaction固定`turn_id = Some(active TurnId)`且必须保存SummaryModel `model_call`；`None`只为未来maintenance/deterministic method预留；
-- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和retry语义；
+- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和retry语义；requested max output与summary budget fingerprint必须是合法、可round-trip的durable值。validated plan/directive/model-limit的一致性只在entry落盘前由Compaction、Prompt assembly、ModelCallRequest和SessionExecutor append gate共同证明；cold replay不重新声称验证已消失的临时plan或limits；
 - physical retention/vacuum与conversation compaction分离。
 
 完整planning、protection和failure规则见[Compaction架构设计](compaction.md)。
@@ -737,6 +706,8 @@ fn validate_and_project(
     entry: &StoredSessionEntry,
 ) -> Result<CommittedProjectionDeltaSet, SemanticEntryError>;
 ```
+
+Compaction的plan、Prompt proof、`ModelCallRequest`和pinned `EffectiveModelLimits`只存在于当前Turn的内存执行上下文。SessionExecutor在调用`SessionWriter.append`前必须用`CompactionCommitCandidate`验证这些临时值与candidate/result完全一致；`validate_and_project`不接收也不依赖它们。这样append路径仍在落盘前fail closed，而冷重放只验证entry自身能够重建的scope、boundary、hash、checkpoint和provenance关系。
 
 它集中验证entry body、Turn/Item/Interaction状态、cross-entry references、ToolRound完整性、Compaction boundaries和terminal closure，并生成全部trusted projection deltas。writer和replay不得各自维护一份语义规则。
 
@@ -1025,7 +996,7 @@ remap：
 - User context_entry_id；
 - Tool source execution_started_entry_id；
 - ToolRoundCompleted assistant/tool entry refs；
-- Compaction checkpoint/protected refs，以及`summarized_through`/`retained_from` boundary中的`unit_first_entry_id`和`unit_last_entry_id`；
+- Compaction checkpoint/protected refs，以及scope中的anchor、`previous_checkpoint`、`summarized_through`/`retained_from` boundary内全部`unit_first_entry_id`和`unit_last_entry_id`；
 - Fork provenance保留source identity但不能作为target operational reference。
 
 Fork不复制：
@@ -1045,21 +1016,25 @@ child下一Turn重新捕获Context。
 
 ## Compaction、Fork 与历史分支
 
-Compaction只改变selected path上的conversation projection：
+Compaction只改变selected path上的effective conversation projection；物理selected path仍保留raw entries并追加StoredCompaction：
 
 ```text
-root → old messages → compaction entry → retained tail
+ConversationPrefix:
+[leading summary] → [retained exact suffix]
+
+ActiveTurnCompletedPrefix:
+[prefix] → [exact UserMessage anchor] → [segment checkpoint] → [retained exact suffix / next exact UserMessage]
 ```
 
 fork到compaction前的entry得到旧conversation；fork到compaction后的message anchor应用compaction overlay。
 
 Compaction protection使用EntryId，但必须保护完整model-visible semantic unit：
 
-- initiating user entry；
+- active Turn initiating与Steer user entries；
 - ToolRoundCompleted及其referenced assistant/tool entries；
 - final assistant entry。
 
-automatic active-Turn Compaction还必须保护initiating UserMessage及其后的连续suffix。不允许cut产生孤立ToolCall、Tool message或从prefix中挖洞。
+automatic active-Turn Compaction必须保护initiating与Steer UserMessage原文和相对位置；每个UserMessage开启一个instruction segment，其后已经`tool_round_completed`的早期连续units可以被该segment checkpoint覆盖，但coverage不能跨越下一UserMessage。Pending/Started/incomplete ToolRound与explicit protected units不能进入coverage；任何scope都不得产生孤立ToolCall、Tool message、交叉frontier或未经typed scope表达的历史空洞。
 
 ## Reload
 
@@ -1337,8 +1312,10 @@ content-addressed DAG
 - fork mid-Turn target-local interruption；
 - nested EntryId/TurnId/ItemId/RequestId remap；
 - copied historicalTurnContext保留source-scoped exact definition refs，child future definition独立；
-- compaction source fingerprint和protected complete ToolRound；
-- SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count和provider metadata round-trip；
+- compaction source fingerprint、scope/anchor/previous-checkpoint provenance和protected complete ToolRound；
+- active checkpoint滚动后live apply与replay在每个instruction segment只得到一个effective checkpoint；
+- summary budget已在plan、Prompt proof和model request前与pinned model known limits求交并闭合（storage cold replay只验证durable entry关系）；
+- SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count、requested max output、summary budget fingerprint和provider metadata round-trip；
 - Prompt永远看不到uncompleted ToolRound。
 - 任意writer接受的合法entry sequence经live apply与cold replay得到相同Turn/Item/Interaction/Conversation/Usage projection fingerprints；
 - 注入semantic projector错误时必须在physical append前拒绝，不能生成cold replay才拒绝的committed entry。

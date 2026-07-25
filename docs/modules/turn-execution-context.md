@@ -399,22 +399,7 @@ Turn 固定 baseline
 
 不能存在第四类“调用方临时传入、模型可见但没有append/apply或pin”的动态字符串。
 
-因此assembly input按purpose使用closed variants：
-
-```rust
-pub enum PromptAssemblyInput<'a> {
-    AgentRun {
-        conversation: &'a CommittedConversationView,
-        output_contract: Option<&'a OutputContract>,
-    },
-    CompactionSummary {
-        source: &'a CommittedConversationPrefixView,
-        directive: &'a CompactionSummaryDirective,
-    },
-}
-```
-
-variant确定ModelCallPurpose。Compaction prefix同样来自CommittedConversationState的trusted view，不形成第四类临时model-visible input。
+因此assembly input按purpose使用[Prompt子系统定义的closed variants](prompt.md#模型上下文组装)：`AgentRun`只接收trusted committed conversation与output contract，`CompactionSummary`只接收trusted scope-aware source与fingerprinted directive。variant确定ModelCallPurpose；Compaction source同样来自CommittedConversationState的trusted view，不形成第四类临时model-visible input。
 
 不接收：
 
@@ -658,11 +643,11 @@ Compaction改变committed conversation，但不改变TurnExecutionContext。完�
 ```text
 AgentLoop NeedModel安全点
 → PromptSet assembly显示soft pressure/local overflow，或provider返回ContextOverflow
-→ Compaction选择strict stable-unit cut
-→ hard-protect active Turn initiating UserMessage和连续suffix
+→ Compaction选择ConversationPrefix或ActiveTurnCompletedPrefix stable-unit cut
+→ 保留exact initiating/Steer UserMessage anchors、真实protected region和recent exact tail
 → Context.assemble_model_context(
      PromptAssemblyInput::CompactionSummary {
-       source: trusted_prefix_view,
+       source: trusted_scope_aware_view,
        directive,
      }
    )
@@ -676,7 +661,7 @@ AgentLoop NeedModel安全点
 
 Compaction summary call仍通过同一个PromptSet和exact TurnModelSnapshot。普通Agent/Session/Workspace/Tool/Skill静态instructions不进入summary；下一次AgentRun assembly从同一个TurnExecutionContext重新注入。
 
-`TurnExecutionPhase = Compacting`期间TurnStatus保持Running，Steer排队，Cancel和security revocation可以在append前获胜。当前Turn protected suffix自身过大时返回`ProtectedSuffixTooLarge`；不split Turn。同一Turn最多一次automatic overflow recovery，再次超限时fail closed。
+`TurnExecutionPhase = Compacting`期间TurnStatus保持Running，Steer排队，Cancel和security revocation可以在append前获胜。每个active instruction segment的completed coverage frontier可在完整ToolRound安全点滚动推进；滚动checkpoint用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance。exact active UserMessage anchors或真实protected region自身过大时返回`ProtectedRegionTooLarge`。同一source/scope-frontier的hard recovery只尝试一次，但成功推进后允许在`max_compactions_per_turn`内再次compact。
 
 ## Cancellation 与 Security Revocation
 

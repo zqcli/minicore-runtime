@@ -580,7 +580,7 @@ pub struct AssembledModelContext {
 
 PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。
 
-`PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint和OutputContract hash。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
+`PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint、OutputContract hash和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
 首版provider-neutral output contract至少包含：
 
@@ -650,6 +650,7 @@ constructor验证：
 - assembly_proof.purpose等于request purpose；
 - assembly_proof.turn_model_fingerprint等于TurnModelSnapshot fingerprint；
 - assembly_proof.output_contract_hash等于input.output_contract canonical hash；
+- `CompactionSummary`的assembly budget proof必须存在，且proof max output等于request `max_output_tokens`；`AgentRun`不得携带该proof；
 - max_output_tokens满足Snapshot effective limits。
 
 ### ModelCallPurpose
@@ -674,7 +675,7 @@ purpose：
 - 使用active Turn exact model identity；
 - input由PromptSet的CompactionSummary variant产生；
 - `OutputContract::NoToolCalls`且ToolSpec为空；
-- 提供明确max_output_tokens；
+- 提供由Compaction planning基于pinned `EffectiveModelLimits`和summary call context feasibility派生的明确max_output_tokens；
 - 不进入AgentLoop，不把summary result解释成普通assistant response；
 - 不调用provider-native compact endpoint；首版仍是普通portable model generation。
 
@@ -688,7 +689,10 @@ purpose：
 - 非空值必须大于0；
 - 超过effective max时在provider调用前返回`InvalidRequest`；
 - Gateway不静默clamp，因为clamp会改变调用方已经fingerprint的policy；
-- CompactionSummary应提供明确上限。
+- CompactionSummary应提供明确上限，并保证该值已写入`CompactionPlanFingerprint`和assembly proof；
+- known model limit小于全局summary配置时，由Compaction plan确定性取较小值，而不是让Gateway修正；
+- known context/output limit无法留下最低摘要预算时，Compaction返回`NoFeasibleSummaryBudget`，不构造ModelCallRequest；
+- 若CompactionSummary仍以越界值到达constructor，`InvalidRequest`表示caller实现或fingerprint contract错误，不能分类成provider故障。
 
 ## Private Provider Adapter
 
@@ -1488,7 +1492,7 @@ connection/continuation state
 full AssembledModelContext
 ```
 
-首版automatic SummaryModel compaction把同一组model/response/usage/finish/logical-retry/fingerprint字段保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
+首版automatic SummaryModel compaction把model/response/usage/finish/logical-retry、requested max output、CompactionSummaryBudget fingerprint和assembled context fingerprint保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
 
 `retry_count`只表示Session logical retry。Gateway transparent retry count可以进入current-host diagnostics，但不作为domain lifecycle。
 
@@ -1586,6 +1590,9 @@ opaque encrypted reasoning
 - Gateway不截断或摘要context；
 - AssembledModelContextFingerprint不被修改；
 - assembly proof purpose/model/output-contract mismatch在ModelCallRequest constructor被拒绝。
+- Compaction budget proof missing、purpose不匹配或request max output不相等时constructor拒绝；
+- CompactionSummary的effective max_output_tokens不超过Snapshot known limit；
+- 越界CompactionSummary在provider调用前以InvalidRequest拒绝，Gateway不静默clamp。
 
 ### Streaming
 

@@ -510,15 +510,32 @@ pub enum PromptAssemblyInput<'a> {
         output_contract: Option<&'a OutputContract>,
     },
     CompactionSummary {
-        source: &'a CommittedConversationPrefixView,
+        source: &'a CommittedCompactionSourceView,
         directive: &'a CompactionSummaryDirective,
     },
 }
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction prefix伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedConversationPrefixView`只能由同一State按validated stable-unit boundary构造。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint/fingerprint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
+variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedCompactionSourceView`只能由同一State按validated Compaction scope、anchor、previous checkpoint、coverage provenance和stable-unit boundaries构造。它把不进入coverage的protected context与真正待摘要的messages分开；active scope的protected context包含current effective prefix through selected exact initiating/Steer UserMessage anchor，不能为了让summary request fit而静默删减。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint/fingerprint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted committed prefix。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted scope-aware committed source。directive中的effective summary budget必须来自Compaction plan，并与pinned model fingerprint一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+
+planning前，SessionExecutor从同一个PromptSet取得窄的固定开销basis：
+
+```rust
+pub struct CompactionSummaryAssemblyBasis {
+    pub fixed_prompt_tokens: u64,
+    pub fingerprint: CompactionSummaryAssemblyBasisFingerprint,
+}
+
+impl PromptSet {
+    pub(crate) fn compaction_summary_assembly_basis(
+        &self,
+    ) -> CompactionSummaryAssemblyBasis;
+}
+```
+
+该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis fingerprint与实际固定sections一致。
 
 最终输出：
 
@@ -538,10 +555,16 @@ pub(crate) struct PromptAssemblyProof {
     pub purpose: ModelCallPurpose,
     pub turn_model_fingerprint: TurnModelFingerprint,
     pub output_contract_hash: Option<ContentHash>,
+    pub compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
+}
+
+pub(crate) struct CompactionSummaryBudgetProof {
+    pub max_output_tokens: NonZeroU32,
+    pub budget_fingerprint: CompactionSummaryBudgetFingerprint,
 }
 ```
 
-AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot和OutputContract binding。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
+AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot、OutputContract binding，以及CompactionSummary request max output与budget fingerprint。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
 `MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
 
@@ -560,6 +583,7 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 - required contribution 在输入规范化阶段缺失时失败；
 - 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
+- CompactionSummary directive budget与assembly proof exact match，AgentRun不携带Compaction budget proof；
 - 最终大小和 token estimate 不超过有效模型限制。
 
 PromptSet 不自行执行 compaction。超限时返回结构化 PromptError，由 Session execution 决定后续行为。

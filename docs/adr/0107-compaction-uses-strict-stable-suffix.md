@@ -1,6 +1,6 @@
 # ADR 0107: Compaction 使用严格 stable suffix
 
-状态：Accepted
+状态：Superseded by [ADR 0112](0112-compaction-supports-active-turn-checkpoints.md)
 日期：2026-07-24
 
 ## 背景
