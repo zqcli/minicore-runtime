@@ -1,9 +1,9 @@
 # MiniCore V2 设计评审
 
 状态：设计评审记录
-日期：2026-07-24
-范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0109）
-方式：按设计切面并行只读评审（领域/协议、Session 执行/并发、存储/恢复、Prompt·Tool·Skill、ModelGateway·Compaction·Workspace、跨模块一致性），仅调研，未落盘修改设计文档。
+日期：2026-07-25
+范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0111）
+方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4与D1已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
 
 ## 总体判断
 
@@ -92,12 +92,12 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 
 ### D. 并发控制面
 
-> 复核修正：原「canonical resource lock」重大项经复核 `tools.md` 执行链（`approval → ToolResourceLocks → record_execution_start → Sandbox → execute`）后**降为非阻塞**——资源锁在 approval 之后才获取，不会跨人工审批持有，此前担心的 priority inversion 不成立；残留问题见非阻塞组。本组只保留一条重大。
+> 复核修正：原「canonical resource lock」重大项经复核 `tools.md` 执行链（`approval → ToolResourceLocks → record_execution_start → Sandbox → execute`）后**降为非阻塞**——资源锁在 approval 之后才获取，不会跨人工审批持有，此前担心的 priority inversion 不成立；残留问题见非阻塞组。原评审本组只保留D1，现已关闭。
 
-**D1 · 控制面与数据面共享 bounded FIFO，无优先通道**
+**D1 · 控制面与数据面共享 bounded FIFO，无优先通道（已关闭）**
 `Cancel`/`ResolveInteraction`/`WorkspaceAuthorizationRevoked` 与 `Submit`/`Steer`/`GetSnapshot`/`ToolControl` 走同一队列；队列满时 Cancel 排队等待，其间 Turn 持续调用 model / 执行 tool / 计费。Revocation 的安全性已由 out-of-band lease（`authorize_commit` vs `revoke` 同一同步原语）保住，但 Revocation 的 terminalize/资源释放/`TurnInterrupted` 事件、以及 Cancel 的全部语义仍受队列排空速度支配，Cancel 无 out-of-band backstop。
 - 影响：控制面被数据面 backpressure 饿死，与文档「Cancel/ResolveInteraction 不被阻塞」的自述矛盾；队列类型选择应在实现前定。
-- 建议：为控制类消息设保留容量或独立高优先 control 通道（或有界队列 + 专用 reserved slot），并明确 fire-and-forget 消息（`WorkspaceAuthorizationRevoked`/`ToolControl`）在队列满时的行为（阻塞 vs 有界重试）。
+- 决议：采用per-session `SessionIngress` semantic lanes，不再建立跨lane全局FIFO。Submit、per-Turn Steer、FollowUp、InteractionControl和ToolControl各自bounded；Cancel/revocation使用sticky `EmergencyControl`；PrepareForUnload使用sticky lifecycle signal和有限grace deadline；Snapshot读取带cursor的immutable published view。保留单一SessionExecutor/Writer owner。权威决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 - 出处：`session-execution.md`。
 
 ### E. 能力缺口 / 可能需重定范围
@@ -165,11 +165,11 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - 多资源 Tool 无全序获取仍可跨 Session 反序死锁，但操作响应 Turn cancellation，故非永久 → 对单次 execute 的多个 canonical `ToolResourceKey` 采用稳定总序获取，避免依赖 cancellation 兜底。
 - 某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁 → 主流 Tool 无此形态，可延后。
-- `PrepareForUnload` graceful unload 不自动 Cancel，Interaction `expires_at` 可为 None、disconnect 不自动关闭 → host 消失且无 deadline 时 response 永不完成 → shutdown 作用域内对 Pending Interaction 施加 grace deadline 或强制 fail-closed cancel。
+- ~~`PrepareForUnload` graceful unload 不自动 Cancel，Interaction `expires_at` 可为 None、disconnect 不自动关闭~~：**已随D1关闭**。LifecycleControl立即stop admission，有限grace deadline到期后对Pending Interaction fail closed并Cancel active Turn。
 - 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
 - Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
 - Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，共享同一 Agent 的多 Session 在 status 原语上跨 Session 串行 turn-start → 文档化二者全局加锁总序，记录同 Agent 多 Session turn-start 串行化吞吐影响。
-- queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义 → 明确仲裁顺序。
+- ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
 - `assemble_model_context` 为同步 fn，大 context 组装/tokenize 在同步段内阻塞该 executor 控制面 → 随规模评估 offload，或标注为控制面 stall 风险点。
 - Cancel/revocation 路径产生的 Completed（有 truthful tool message 但无 `tool_round_completed`）永久 conversation-hidden，后续 FollowUp/Steer 模型不可见 → 属预期语义，文档显式点明以免实现者误加补偿逻辑。
 
@@ -202,11 +202,11 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 ## 复核说明
 
 - 严重度经二次核对调整一处：`session-execution` 的 canonical resource lock 项，在复核 `tools.md` 执行链（approval 先于取锁）后，从重大降为非阻塞，残留「多资源全序获取」建议见并发非阻塞组。
-- 本评审仅调研，未修改任何设计文档；所列问题为待决项，不代表文档已错误落地。核心 seam 划分（deep module deletion test、exact model pin、trusted projector 构造 Replace、lease-based revocation、append/apply-before-model-visible）判定为自洽。
+- 初始问题正文保留为历史依据；已关闭项以本页“评审决议”和对应ADR为准，开放项仍是待决输入。核心 seam 划分（deep module deletion test、exact model pin、trusted projector 构造 Replace、lease-based revocation、append/apply-before-model-visible）判定为自洽。
 
 ---
 
-## 评审决议（2026-07-24）
+## 评审决议（更新至2026-07-25）
 
 针对 A 组已作决定并落盘：
 
@@ -218,7 +218,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - **B1（Prompt顺序）**：**已关闭**。不增加priority；当前固定Runtime required System → Runtime base System → Agent System → Session User → Workspace User → Tool → Skill层级。PromptDefinition层按PromptKey、PromptId、DefinitionVersion和stable provenance identity排序；Workspace/Tool/Skill分别按relative path、ToolName、SkillId排序；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
 - **B2（append/replay/projector一致性）**：**已关闭**。writer append与cold replay共用pure `validate_and_project`；append semantic validation等价于或强于replay validation；writer成功commit的entry必须可project。`apply_committed`只安装预计算trusted delta，增加live-apply/cold-replay等价性测试要求。
-- **B3（logical retry operation identity）**：**已关闭**。每Session最多一个current RunningOperation；旧operation terminal/remove或安全drop并关闭结果路径前，不启动retry或下一operation。execution_version继续表示conversation/control basis，不增加operation_instance_id。Steer/FollowUp使用普通`VecDeque<QueuedMessage>`；Steer在完整assistant/tool step后每轮pop一条，无ToolCall candidate final在queue非空时保存为Assistant Continue。
+- **B3（logical retry operation identity）**：**已关闭**。每Session最多一个current RunningOperation；旧operation terminal/remove或安全drop并关闭结果路径前，不启动retry或下一operation。execution_version继续表示conversation/control basis，不增加operation_instance_id。Steer/FollowUp保持普通FIFO消费语义（物理ingress lane后由ADR 0111修订）；Steer在完整assistant/tool step后每轮pop一条，无ToolCall candidate final在queue非空时保存为Assistant Continue。
 
 针对C组已作决定并落盘，长期决策见[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)：
 
@@ -226,3 +226,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - **C2（role×scope特权）**：**已关闭**。Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；ModelGateway不再执行Developer lowering。
 - **C3（Sandbox capability预执行拒绝）**：**保持开放，本轮不变**。不修改现有ToolSandbox设计。
 - **C4（Skill content drift）**：**已关闭**。不采用Catalog revision/exact hash pin；SkillService发布current SkillView，显式reload成功后原子替换，active Turn继续使用captured view和已加载内容。
+
+针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
+
+- **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量，Tool副作用以`ToolExecutionStarted` append为race线性化点；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline并最终fail closed；Snapshot从带cursor的immutable published view读取。lane只拆ingress，不增加第二个Session状态或durable owner。

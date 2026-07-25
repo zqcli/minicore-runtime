@@ -1,7 +1,7 @@
 # Agent 与 Session 生命周期架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -468,7 +468,7 @@ Deleted → terminal
 
 - archive 要求 Session 已 Unloaded；
 - delete 要求 Session 已 Archived 且 Unloaded；
-- lifecycle mutation 不隐式取消 active Turn；调用方先显式 cancel、等待 terminal、unload，再 archive/delete。
+- archive/delete本身不隐式取消active Turn或卸载；调用方先执行Unload，Unload按有限grace deadline自然drain或fail-closed cancel，再进行archive/delete。
 
 不使用裸 `close` 表示领域生命周期。协议应使用明确词：
 
@@ -650,13 +650,13 @@ Steer到达时Turn保持Running。请求必须携带`expected TurnId`，并在cu
 
 ```text
 Steer(expected TurnId) accepted
-→ push_back进入Steer FIFO
+→ push_back进入该Turn的SteerQueue
 → 当前assistant/tool step完整committed
 → 下一次Model前pop_front一条并append Steer
 → 下一次模型调用看见 Steer
 ```
 
-WaitingApproval中到达的Steer只进入同一FIFO，不自动当作审批结果。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
+WaitingApproval中到达的Steer只进入该Turn的FIFO，不自动当作审批结果。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
 
 只有显式 Turn cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn terminal。
 
@@ -730,36 +730,40 @@ PromptSet / ToolSet / SkillView
 
 ## Unload Session
 
-unload 不修改 durable Session lifecycle、SessionDefinitionRevision 或 conversation。
-
-前置条件：
+unload 不修改 durable Session lifecycle或SessionDefinitionRevision。若grace deadline后必须停止active work，Executor仍按普通fail-closed规则append Interaction closure、truthful Tool settlement和TurnInterrupted；这些是执行事实，不是Unload专用metadata或conversation重写。
 
 ```text
-SessionExecutionState = Idle
-无 admission reservation
-无 active Turn
-无 pending Interaction
-当前没有正在执行的entry append
-```
-
-不满足时返回 Busy。调用方必须显式 cancel/resolve，并等待 terminal append 完成。
-
-```text
-Loaded → Unloading
+Loaded
+→ LifecycleControl::PrepareForUnload(grace_deadline)
+→ stop new Submit/Steer/FollowUp admission
+→ reject pending TurnAdmission requests
+→ clear queued Steer/FollowUp并完成其typed outcome
+→ grace期内允许active admission/Turn自然完成，继续处理Interaction resolution和truthful Tool outcome
+→ deadline到期仍未Idle：fail-closed resolve Pending Interaction并Cancel active submission/Turn
+→ terminal append / writer flush完成
+→ Unloading
 → drop resolved Workspace state
 → drop hot conversation projection
 → drop execution owner/runtime handles
 → Unloaded
 ```
 
-重复 unload 幂等。
+规则：
+
+- grace deadline必须有限，由Runtime config定义上限；Interaction自身`expires_at = None`不能让Unload永久悬挂；
+- grace期内显式Cancel可以加速结束，但调用方不需要先手工cancel/resolve再调用Unload；
+- Cancel current Turn默认保留FollowUp，但PrepareForUnload已经在stop-admission时清理queued FollowUp，因此不会在卸载前启动新Turn；
+- 已越过`ToolExecutionStarted`的Tool必须先确认truthful outcome或记录Abandoned，不能为了卸载直接drop；
+- 进入Idle且没有current append后关闭ingress/writer，Runtime才从loaded map移除handle；
+- 重复 unload 订阅同一个LifecycleControl completion generation并幂等返回同一个最终结果；effective deadline只能缩短，不能被后续请求延长。
 
 Runtime shutdown 使用：
 
 ```text
-stop new admission
-→ cancel active Turn
-→ wait terminal append
+逐Session发布PrepareForUnload
+→ 各Session独立graceful drain
+→ deadline到期后各自fail-closed cancel
+→ wait terminal append / writer close
 → unload
 ```
 
@@ -849,7 +853,7 @@ loaded execution state
 WorkspaceSnapshot / authorization control
 ToolSet / PromptSet / SkillView
 provider session
-pending Interaction / FollowUp queue
+pending Interaction / 任何process-local SessionIngress lane
 Session-scoped Tool grant
 ```
 
@@ -905,7 +909,7 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 | Session archive/delete | 要求先无 candidate | 要求先无 active Turn | lifecycle 状态拒绝 |
 | ordinary Workspace update | 已捕获旧 basis 者不变 | 不变 | 使用新 definition/snapshot |
 | restrictive Workspace update | lease/final check 失败 | revoke 并中断 | 使用新 Snapshot |
-| unload | Starting/Running 时 Busy | 不允许 | load 后重新 admission |
+| unload | stop admission并等待或取消candidate | grace期自然完成，deadline后fail-closed cancel | unload后需重新load才可admission |
 
 ## 并发线性化
 
@@ -1121,7 +1125,7 @@ Agent release channel
 - load single-flight，且 definition update 先赢时旧 load publication CAS 失败；
 - load exact Agent revision，不用 current 替代；
 - Workspace unavailable 形成 Loaded + Unavailable；
-- unload Busy 与幂等 unload；
+- unload stop-admission、grace deadline、fail-closed cancel与幂等completion generation；
 - Session execution Idle/Starting/Running/Finishing；
 - WaitingApproval 保持 Turn Running；
 - Steer 在 WaitingApproval 时排队；

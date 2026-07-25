@@ -1,7 +1,7 @@
 # Turn 执行模块与执行上下文架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -27,7 +27,7 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 
 本文不重复定义：
 
-- `SessionExecutor`、`SessionRequestQueue`和异步operation的完整实现；这些以[Session Execution架构设计](session-execution.md)为权威；
+- `SessionExecutor`、`SessionIngress`语义lane和异步operation的完整实现；这些以[Session Execution架构设计](session-execution.md)为权威；
 - Runtime command、event和transport protocol；
 - ModelGateway private Rig/provider adapter的实现细节；
 - AgentLoop使用Rig、自研状态机或其他SDK的private adapter实现。
@@ -512,7 +512,7 @@ loop:
   → 把 ModelOutput 交回 AgentLoop adapter
 
   NeedTools
-  → process Cancel/WorkspaceAuthorizationRevoked
+  → observe EmergencyControl Cancel/revocation epoch
   → validate current authorization
      └─ Cancel/revocation wins：进入Interrupted cleanup
   → 取得WorkspaceCommitAuthorization
@@ -568,20 +568,20 @@ ToolInvocationState = Started
 
 InteractionRequested必须append后才发布approval request；InteractionResolved必须append后才进入ExecutingTools。Deny产生truthful denied Tool message，并在`tool_round_completed`后继续模型调用。
 
-WaitingApproval不是Interrupted。此时到达的Steer只进入普通FIFO，不作为approval resolution，也不preempt当前Interaction/ToolRound。
+WaitingApproval不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为approval resolution，也不preempt当前Interaction/ToolRound。
 
 只有显式 cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn进入 terminal status。
 
 ## Steer
 
-Steer是current Turn的queued input，不是开启新Turn的普通UserMessage。它使用普通`VecDeque<QueuedMessage>` FIFO，不取消当前Model/Tool operation。
+Steer是current Turn的queued input，不是开启新Turn的普通UserMessage。它使用`SteerQueue<TurnId>`中的bounded per-Turn FIFO，不取消当前Model/Tool operation。
 
 语义：
 
 ```text
 Steer(expected TurnId)
-→ 进入SessionRequestQueue
-→ 验证后push_back到Steer FIFO
+→ 进入该Session的`SteerQueue<expected TurnId>`
+→ 验证后push_back到该Turn FIFO
 → 当前assistant/tool step完整结束
 → 下一次Model调用前pop_front一条并append/apply Steer
 → 下一次逻辑模型调用看见Steer
@@ -624,7 +624,7 @@ active Turn 期间提交 FollowUp
 - 可以看到当前 Turn 期间完成的 ordinary reload；
 - 失败或取消不会改变已经 terminal 的前一个 Turn。
 
-FollowUp使用普通`VecDeque<QueuedMessage>` FIFO；每个terminal Turn后pop_front一条开始新Turn。队列不增加独立领域entity或queue wrapper。
+FollowUp使用`FollowUpQueue` bounded FIFO；它最多获得一次连续admission优先，若上一Turn由FollowUp启动且下一次Idle decision有external Submit，则先选Submit。Submit不是隐式FollowUp，未选中且Session再次Busy时明确返回。该lane不是独立领域entity，也不拥有Session状态。
 
 ## Retry
 
@@ -902,7 +902,8 @@ Context drop 不 unregister Runtime-global Tool、不清空共享 content cache�
 
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state；
 - 一个Runtime允许多个SessionExecutor同时Running；
-- `SessionRequestQueue`接收Submit、Steer、FollowUp、ResolveInteraction、Cancel、PrepareForUnload和GetSnapshot；
+- `SessionIngress`按语义分为TurnAdmission、per-Turn Steer、FollowUp、InteractionControl、ToolControl、EmergencyControl、LifecycleControl和SnapshotMailbox；
+- Cancel/revocation不等待普通work lane，GetSnapshot从带cursor的immutable published view读取；
 - Context、Model和Tool使用cancellable `RunningOperation`；
 - operation result使用`SessionId + TurnId + execution_version + OperationType`校验；
 - private AgentLoop只返回NeedModel、NeedTools或Finished；

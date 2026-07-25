@@ -1,6 +1,6 @@
 # Compaction架构设计
 
-日期：2026-07-24
+日期：2026-07-25
 
 状态：当前权威架构（设计已冻结，实现进行中）
 
@@ -563,12 +563,12 @@ Compacting期间：
 
 - Steer进入existing pending Steer FIFO，不立即append；
 - FollowUp保持FollowUpQueue语义；
-- Cancel按FIFO顺序推进execution_version并取消operation；
-- WorkspaceAuthorizationRevoked按同一control FIFO排序并取消operation；
-- PrepareForUnload停止new admission，但不阻塞main loop；
+- Cancel通过`EmergencyControl` sticky signal立即触发operation cancellation token；Executor观察signal后推进execution_version；
+- WorkspaceAuthorizationRevoked先out-of-band revoke lease，再设置同一`EmergencyControl`的revocation signal；不等待普通lane容量；
+- PrepareForUnload通过`LifecycleControl`停止new admission；grace deadline到期时转为fail-closed Cancel；
 - ResolveInteraction与Compaction无关，不应存在由Compaction创建的Interaction。
 
-Compaction完成后，先处理已排队且排序上先于commit的Cancel/revocation。Steer本身不让已生成summary失真，因为它尚未append；成功commit后再compose/append Steer，然后重新assemble AgentRun。
+Compaction启动前、结果返回后和StoredCompaction append前都必须观察最新emergency epoch并重新检查Workspace authorization。Cancel/revocation已生效时丢弃未commit summary并进入Interrupted处理。Steer本身不让已生成summary失真，因为它尚未append；成功commit后再compose/append Steer，然后重新assemble AgentRun。
 
 ### Commit Validation
 

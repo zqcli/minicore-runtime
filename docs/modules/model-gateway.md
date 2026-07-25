@@ -1,6 +1,6 @@
 # ModelGateway架构设计
 
-日期：2026-07-16
+日期：2026-07-25
 
 状态：当前权威架构（设计已冻结，实现进行中）
 
@@ -342,7 +342,7 @@ impl ModelGateway {
 
 `resolve_for_turn`只访问已经初始化的provider/model catalog，不读取credential。catalog refresh是Runtime lifecycle操作，不在Turn capture期间隐式执行remote I/O。
 
-`generate_model_turn`执行完整provider调用。调用期间可以等待provider并发permit、auth refresh、retry delay和stream，但它运行在`RunningOperation`中，不阻塞SessionRequestQueue。
+`generate_model_turn`执行完整provider调用。调用期间可以等待provider并发permit、auth refresh、retry delay和stream，但它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。
 
 不提供：
 
@@ -1086,7 +1086,7 @@ AssembledModelContextFingerprint unchanged
 
 logical retry：
 
-- 不阻塞SessionRequestQueue；
+- 不阻塞SessionIngress scheduler或control loop；
 - Steer、Cancel、Compaction或conversation change使其失效；
 - 计入StoredAssistantMessage.retry_count；
 - 不创建ModelAttempt entity；

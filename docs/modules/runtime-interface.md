@@ -1,6 +1,6 @@
 # Runtime Interface 与公开协议架构设计
 
-日期：2026-07-24
+日期：2026-07-25
 
 状态：当前权威架构（设计已冻结，实现进行中）
 
@@ -388,11 +388,12 @@ pub enum PublicCancelTarget {
 语义：
 
 - `Submit`只在Session可以admit新Turn时使用；initiating UserMessage append/apply后返回`TurnStarted`；
-- `Steer`只作用于expected Running Turn；成功进入普通FIFO后返回`Queued`；
+- `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
 - `Cancel(SubmissionId)`允许取消尚处于Starting admission的Submit；
-- `Cancel(TurnId)`在terminal cleanup完成后返回；
+- `Cancel(TurnId)`通过per-session target-scoped sticky `EmergencyControl`校验active Turn generation后触发其operation cancellation，不等待普通work lane；stale target不影响新Turn，response在terminal cleanup完成后返回；
+- Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
 
 Queued Steer和FollowUp仍是process-local值。Runtime restart后未append的queued input不会恢复。
@@ -501,7 +502,7 @@ Command response不是完整业务完成流：
 
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `SteerQueued`和`FollowUpQueued`只表示对应`VecDeque<QueuedMessage>`已接收，不承诺crash-safe delivery；真正append通过普通UserMessage/Turn StateEvent观察；
+- `SteerQueued`和`FollowUpQueued`只表示对应SessionIngress lane已接收，不承诺crash-safe delivery；真正append通过普通UserMessage/Turn StateEvent观察；
 - Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
 - Session/Agent事实变化同时发布StateEvent，让其他subscriber失效或更新read model。
@@ -515,10 +516,10 @@ Command response不是完整业务完成流：
 | Create Session | SessionHeader/definition durable publication |
 | Update SessionDefinition | new revision durable publication |
 | Load Session | single-flight load/recovery完成并发布readiness |
-| Unload Session | SessionExecutor进入Idle并从loaded map移除 |
+| Unload Session | LifecycleControl完成grace/fail-closed drain，writer关闭并从loaded map移除 |
 | Submit | initiating UserMessage append/apply |
-| Steer Queued | pending Steer FIFO admission |
-| FollowUp | FollowUp FIFO admission |
+| Steer Queued | target Turn的SteerQueue admission |
+| FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved append/apply |
 | Cancel Submission | Starting candidate取消完成，且不会创建领域Turn |
@@ -550,10 +551,11 @@ SessionDeleted
 SessionNotLoaded
 SessionNotReady
 SessionBusy
-RequestQueueFull
+IngressLaneFull
 QueuedMessageNotQueued
 ExpectedTurnMismatch
 TurnNotRunning
+TurnCancelling
 TurnTerminal
 InteractionNotFound
 InteractionAlreadyResolved
@@ -567,6 +569,8 @@ RuntimeClosing
 ```
 
 外部调用方不能解析自然语言message决定retry。`RetryAdvice`使用typed值，例如`DoNotRetry | RefreshAndRetry | RetryWithBackoff | UserActionRequired`。
+
+`IngressLaneFull`必须携带safe lane kind（TurnAdmission、Steer、FollowUp、InteractionControl或ToolControl）；EmergencyControl、LifecycleControl和SnapshotMailbox不返回该错误。
 
 ## CommandSurface
 
@@ -839,9 +843,18 @@ pub struct SessionSnapshot {
     pub usage: Option<SessionUsageView>,
     pub diagnostics: Vec<SessionDiagnosticView>,
 }
+
+pub struct SessionQueueView {
+    pub pending_submit_count: usize,
+    pub current_turn_steer_count: usize,
+    pub follow_up_count: usize,
+    pub accepting_input: bool,
+}
 ```
 
 完整历史通过Query分页读取。Snapshot只携带恢复当前执行UI所需状态。
+
+`SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。
 
 ### Snapshot Consistency
 
@@ -855,7 +868,7 @@ SessionSnapshot B at SessionCursor B:42
 
 不存在跨scope可比较的全局sequence。
 
-`SessionSnapshot`请求通过对应SessionExecutionHandle进入SessionRequestQueue，因此与该Session之前处理的mutation和operation result有明确顺序。
+`SessionSnapshot`从对应SessionExecutor带`SessionCursor`的immutable published view读取，并通过latest-wins/coalesced `SnapshotMailbox`返回。view publication与SessionCursor推进在Executor内原子完成：cursor N包含全部`<= N`的StateEvent效果且不包含`> N`的效果。它不进入mutation/control lane，也不承诺与不同SessionIngress lane形成全局FIFO。
 
 `RuntimeSnapshot`由Runtime owner捕获Agent/Session membership和runtime projection。它不等待所有SessionExecutor parked，也不构造all-loaded stop-the-world barrier。
 
@@ -943,6 +956,7 @@ StateEvent规则：
 - durable conversation fact必须从append/apply后的CommittedSessionEntry派生；
 - process-local load/readiness/queue事实必须能从对应Snapshot重建；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
+- Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未append消息伪造成durable UserMessage。
 
 主要event family：
 
@@ -1097,7 +1111,7 @@ loaded SessionId → private SessionExecutionHandle
 - public command显式携带SessionId；
 - Runtime不保存selected/current Session；
 - load single-flight；
-- unload先走PrepareForUnload；
+- unload先设置`PrepareForUnload` lifecycle signal：停止admission、清理queued input，在有限grace期后fail-closed cancel，再移除loaded owner；
 - SessionDefinition update使用expected revision；
 - active Turn继续pin旧definition；future Turn使用新revision；
 - archive/delete与load/admission按lifecycle规则线性化。
@@ -1141,7 +1155,7 @@ CLI / TUI / Tauri backend
 → Runtime校验Session lifecycle/load/readiness
 → Runtime校验exact Agent status和SessionDefinitionRevision
 → SessionExecutionHandle
-→ bounded SessionRequestQueue
+→ per-session SessionIngress.TurnAdmissionQueue
 → SessionExecutor reserves candidate Turn
 → WorkspaceResolver.resolve()
 → ModelGateway.resolve_for_turn()
@@ -1302,7 +1316,8 @@ Renderer不应直接持有MiniCoreRuntime credential或filesystem capability。T
 ```text
 SessionExecutor
 SessionExecutionHandle
-SessionRequestQueue
+SessionIngress及其内部lane
+TurnControlGate / LifecycleControl / EmergencyControl
 RunningOperation
 OperationResult
 execution_version
@@ -1354,8 +1369,12 @@ Public interface是 contract test surface。
 - Agent/Session revision CAS；
 - Submit只在UserMessage append/apply后返回TurnStarted；
 - Cancel(SubmissionId)关闭Starting admission；
-- Steer expected TurnId与FIFO Queued；CancelQueuedMessage remove/NotQueued；
+- Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
+- 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
+- Cancel清理current Turn Steer但保留FollowUp；
+- stale Cancel TurnId/generation不取消新的active Turn；
+- Unload grace deadline到期后fail-closed且不会永久等待Interaction；
 - Interaction first committed resolution wins；
 - Fork Before/After Item anchor；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
@@ -1366,7 +1385,8 @@ Public interface是 contract test surface。
 - Query只读且不增加cursor；
 - session list不加载SessionExecutor；
 - history tree不暴露internal entry/event；
-- SessionSnapshot通过request queue线性化；
+- SessionSnapshot读取带SessionCursor的immutable published view；
+- SessionSnapshot cursor N恰好包含全部`<= N`且不包含`> N`的StateEvent效果；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
 - cursor与scope不匹配时拒绝。

@@ -17,4 +17,4 @@
 | `refactoring-roadmap.md` | `../migration/v1-to-v2.md` |
 | `session-execution-progress.md` | 研究/handoff 记录，迁移完成后由 Git history 保留 |
 
-当前权威架构：`../architecture.md` + `../modules/`（12 篇）+ `../adr/`（0100–0108）+ `../migration/v1-to-v2.md`。
+当前权威架构：`../architecture.md` + `../modules/`（12 篇）+ `../adr/`（0100–0111，D1见`0111-session-ingress-separates-control-and-work-lanes.md`）+ `../migration/v1-to-v2.md`。

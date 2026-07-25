@@ -156,7 +156,7 @@ Tool-call response
   → CommittedConversationDelta → SessionExecutor applies committed conversation
 
 Steer after complete assistant/tool step
-  → VecDeque<QueuedMessage>.pop_front()
+  → SteerQueue<TurnId>.pop_front()
   → TurnExecutionContext.compose_message
   → SessionWriter.append(UserMessage(source = Steer)) → apply
   → AgentLoop.accept_committed_steer or rebuild segment
@@ -175,7 +175,7 @@ Steer after complete assistant/tool step
 - [Turn 执行上下文](modules/turn-execution-context.md)：capture 依赖图、fingerprint、reload 线性化、AgentLoop 分界。
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：Turn 边界、ItemContent、ToolInvocation identity、Interaction、terminal cleanup。
 - [Conversation 与 SessionStorage](modules/conversation-storage.md)：by-entry JSONL tree、唯一 append seam、entry tree、projection、fork、recovery。
-- [Session 执行](modules/session-execution.md)：单 SessionExecutor、request queue、RunningOperation、multi-session 并发与资源锁。
+- [Session 执行](modules/session-execution.md)：单 SessionExecutor、semantic SessionIngress lanes、RunningOperation、multi-session 并发与资源锁。
 - [ModelGateway](modules/model-gateway.md)：`resolve_for_turn` / `generate_model_turn`、private Rig adapter、stream/retry/auth/usage/cache。
 - [Compaction](modules/compaction.md)：portable rolling summary、strict stable-unit cut、`Compacting` 阶段、StoredCompaction 恢复。
 
@@ -186,7 +186,7 @@ Steer after complete assistant/tool step
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
-- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和bounded request queue；一个Runtime允许多个SessionExecutor同时Running。Steer/FollowUp各使用普通`VecDeque<QueuedMessage>`。所有ledger mutation通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取带cursor的immutable published view。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement、资源锁和真实副作用由 `ToolService` 统一治理；新 Turn 通过 `ToolService::for_turn(...) -> ToolSet` 原子绑定模型可见 `ToolPromptView` 与 executor snapshot。MVP 不启用通用 `bash`；子进程限制无法强制时必须 fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、strict cut、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版只用 active Turn exact model 生成 rolling summary，hard-protect initiating UserMessage 和连续 suffix。
@@ -206,3 +206,4 @@ Steer after complete assistant/tool step
 - [ADR 0108：Runtime 公开协议](adr/0108-runtime-public-protocol.md)
 - [ADR 0109：Prompt、Projection 与 Session Operation 使用确定性规则](adr/0109-review-b-determinism-and-serialized-operations.md)
 - [ADR 0110：Prompt 与 Skill 使用共享、可替换 View](adr/0110-prompt-and-skill-use-shared-reloadable-views.md)
+- [ADR 0111：SessionIngress 分离控制与工作 lane](adr/0111-session-ingress-separates-control-and-work-lanes.md)

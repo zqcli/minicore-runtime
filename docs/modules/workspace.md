@@ -1,7 +1,7 @@
 # Workspace 子系统架构设计
 
 状态：当前权威架构（设计已冻结，实现进行中）
-日期：2026-07-16
+日期：2026-07-25
 
 ## 目的
 
@@ -694,7 +694,7 @@ pub struct ResolvedWorkspace {
 }
 ```
 
-`WorkspaceAuthorizationControl` 只交给 SessionExecutor，不进入 Prompt、Tool、Skill 或领域 Session。SessionExecutor 为每个 active Turn 跟踪其 control/cancellation 关联；ordinary Snapshot replacement 不撤销旧 control，security-restricting update 则先调用 `revoke()`，再中断所有使用该 lease 的 active Turn。这样不需要 Runtime-global Workspace registry，也能明确找到受影响执行。
+`WorkspaceAuthorizationControl` 只交给 SessionExecutor，不进入 Prompt、Tool、Skill 或领域 Session。SessionExecutor 为每个 active Turn 跟踪其 control/cancellation 关联；ordinary Snapshot replacement 不撤销旧 control，security-restricting update 则先调用 `revoke()`，再设置该Session `EmergencyControl`的sticky revocation signal并中断所有使用该 lease 的 active Turn。signal不等待普通bounded ingress lane。这样不需要 Runtime-global Workspace registry，也能明确找到受影响执行。
 
 `check()`用于普通preflight。workspace-dependent conversation append使用短暂`WorkspaceCommitAuthorization`：`authorize_commit()`与`revoke()`通过同一async同步原语排序。如果revoke先取得写入权，后续authorization失败；如果authorization先取得读取权，revoke等待该次短append/apply sequence完成。authorization不能跨Model/Tool I/O或完整Turn。
 
@@ -816,12 +816,13 @@ reload 只重新解析 Workspace facts。Prompt、Skill 和 Tool 的 source/cach
 Workspace 没有独立 unload lifecycle。
 
 ```text
-SessionExecutionState = Idle
-→ UnloadSession
+UnloadSession
+→ Session LifecycleControl完成grace/fail-closed drain
+→ SessionExecutionState = Idle
 → 释放 SessionWorkspaceState
 ```
 
-Session active 时 unload 返回 Busy；调用方先显式 cancel 并等待 Turn terminal。
+Session active时由Session层的PrepareForUnload停止admission并等待自然terminal；grace deadline到期后fail-closed cancel。Workspace只在Executor进入Idle、writer关闭后释放resolved state，不自行决定Cancel或deadline。
 
 没有 Workspace registry entry、shared aggregate 或 backend connection 需要单独关闭。
 
@@ -937,7 +938,7 @@ Definition-changing restriction，例如移除 root 或修改 Workspace grants�
 2. 撤销受影响 WorkspaceAuthorizationLease；
 3. 阻止新的 source read、Skill load、input composition、Tool execution 和模型调用；
 4. durable commit 新 SessionDefinitionRevision；
-5. 通知 SessionExecutor并中断使用该 lease 的 active Turn；
+5. 设置SessionExecutor的EmergencyControl revocation signal并中断使用该 lease 的 active Turn；
 6. 发布 future Turn 使用的新 Snapshot；
 7. 最后向调用方确认 update success；
 8. 不把 last-good Snapshot 当作 fallback。
@@ -947,7 +948,7 @@ Definition-changing restriction，例如移除 root 或修改 Workspace grants�
 Authority-only restriction，例如 trust/policy store 降级、managed hard deny 或外部撤销 source authorization，不创建假的 WorkspaceRevision 或 SessionDefinitionRevision：
 
 1. WorkspaceAuthority在自己的serialized publication update内原子发布新authority revision/policy，并revoke受影响旧lease；
-2. 通知 SessionExecutor并中断受影响 active Turn；
+2. 设置SessionExecutor的EmergencyControl revocation signal并中断受影响 active Turn；
 3. 使用 current exact SessionDefinition.workspace 重新 resolve；
 4. success 时发布受限的新 Snapshot，unavailable 时 future admission fail closed；
 5. SessionDefinitionRevision 保持不变。

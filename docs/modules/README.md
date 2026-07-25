@@ -28,7 +28,7 @@ MiniCoreRuntime
 - [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、fingerprint、reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
-- [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、bounded `SessionRequestQueue`、严格串行current `RunningOperation`、普通Steer/FollowUp `VecDeque`、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
+- [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
 - [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用、private Rig adapter、stream/retry/auth/usage/cache/continuation。
 - [Compaction](compaction.md)：portable rolling summary、strict stable-unit cut、连续 retained suffix、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
@@ -51,7 +51,7 @@ MiniCoreRuntime
 | TurnExecutionContext capture、fingerprint、reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction identity、lifecycle、terminal cleanup | [Turn / Item / Interaction](turn-item-interaction.md) |
 | durable truth、entry tree、JSONL、conversation projection、recovery | [Conversation 与 SessionStorage](conversation-storage.md) |
-| 单Session执行owner、request queue、唯一current RunningOperation、Steer/FollowUp FIFO、multi-session并发 | [Session 执行](session-execution.md) |
+| 单Session执行owner、SessionIngress lanes、唯一current RunningOperation、Steer/FollowUp FIFO、emergency/lifecycle control、multi-session并发 | [Session 执行](session-execution.md) |
 | TurnModelSnapshot、generate_model_turn、provider adapter、stream/retry/usage | [ModelGateway](model-gateway.md) |
 | 压缩触发、stable cut、summary directive、StoredCompaction | [Compaction](compaction.md) |
 

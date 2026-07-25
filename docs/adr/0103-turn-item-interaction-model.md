@@ -12,7 +12,7 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 ## 决策
 
 - **Turn 边界由 committed entry 线性化**：Turn 从 initiating UserMessage（`source = Input`）entry 成功 append 开始，到唯一 terminal entry（final AssistantMessage、TurnInterrupted 或 TurnFailed）成功 append 结束。admission 在 initiating UserMessage append 前失败不创建 Turn；`Interrupted` 与 `Failed` 都是 terminal，不恢复为 Running。
-- **Steer与FollowUp分工**：Steer携带expected TurnId并进入当前Running Turn的普通FIFO；不取消当前Model/Tool step，完整step committed后、下一次模型调用前pop一条并append为Steer UserMessage。FollowUp不是`TurnControl`，它在当前Turn terminal后从独立FIFO pop一条，作为新的`Input` UserMessage开启下一Turn并捕获新Context。
+- **Steer与FollowUp分工**：Steer携带expected TurnId并进入当前Running Turn的bounded per-Turn FIFO；不取消当前Model/Tool step，完整step committed后、下一次模型调用前pop一条并append为Steer UserMessage。FollowUp不是`TurnControl`，它在当前Turn terminal后从独立bounded FIFO pop一条，作为新的`Input` UserMessage开启下一Turn并捕获新Context。具体SessionIngress lane由ADR 0111修订。
 - **Assistant Continue step**：provider返回无ToolCall稳定response但Steer FIFO非空时，该response保存为model-visible、non-terminal `Assistant(Intermediate)`；queue为空时才保存`Assistant(Final)`并结束Turn。含ToolCall的Intermediate仍只在`tool_round_completed`后model-visible。
 - **最小 ItemContent 四类**：`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`。`ItemType` 与 `ItemStatus` 都是从 content discriminant 派生的 read projection，不作为独立存储的第二事实字段。UserMessage/AgentMessage/Reasoning 只在形成稳定值后成为 durable Item 且创建即 Completed。
 - **ToolCall 与 ToolResult 合并为同一 ToolInvocation Item**：一个 Item 贯穿 call、approval、execution、result 与 recovery，状态 `Started → Completed | Abandoned`。Completed 必须持有 truthful ToolResult（typed `disposition`，不用单 bool 压平 denied/cancelled/failed）；outcome unknown 时进入 Abandoned，不生成 synthetic ToolResult，不进入模型 conversation。拒绝 sibling ToolCall/ToolResult Items。
@@ -32,3 +32,5 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 ## 历史
 
 本 ADR 属 V2 决策集，是 V2 领域模型新增的长期决策，不取代某一条 V1 ADR。相关的 V1 事件形状与生命周期背景（如 ADR 0003：agent-runtime events 使用 event-msg 与 lifecycle pairs）见 [`../archive/v1/adr/`](../archive/v1/adr/)。
+
+2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)明确Steer/FollowUp的物理SessionIngress lane、Cancel清理和跨lane仲裁；本ADR的领域分工不变。

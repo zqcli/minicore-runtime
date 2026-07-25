@@ -17,9 +17,9 @@ MiniCore不需要为这些问题增加priority system、queue service或attempt 
 2. 不给PromptDefinition增加priority。Runtime/Agent/Session PromptDefinition层按PromptKey、PromptId、DefinitionVersion和稳定provenance source identity排序；Workspace按model-safe relative path，Tool按ToolName，Skill按SkillId排序。filesystem/discovery/HashMap顺序不得影响结果；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
 3. SessionWriter append与cold replay共用一个pure `validate_and_project(base, entry)` semantic seam。append-time semantic validation必须等价于或强于replay validation；writer成功commit的entry必须可被projector语义接受。
 4. `apply_committed`只安装append前生成的trusted delta，不能对已commit entry再次产生确定性semantic rejection。writer-accepted sequence必须通过live apply与cold replay projection等价性测试。
-5. 每个Session最多一个current RunningOperation。主循环同时poll该future和request queue以保持响应，但旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
+5. 每个Session最多一个current RunningOperation。主循环同时poll该future、deadline和SessionIngress wakeup以保持响应，但旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。SessionIngress的lane划分由ADR 0111修订，不改变本条的单operation约束。
 6. execution_version表示conversation/control basis，不是retry attempt编号。logical retry复用相同version和ModelCallRequest，但只能严格串行启动。provider端可能继续工作或计费不等于旧本地future仍可向SessionExecutor返回结果。
-7. Steer与FollowUp分别使用普通`VecDeque<QueuedMessage>`，不建立PendingMessageQueue wrapper、priority、batch drain mode或独立queue owner。仍在队列中的消息可以按CommandId remove，撤销后不重新入队。
+7. Steer与FollowUp分别使用`SessionIngress`中的bounded per-Turn `SteerQueue`和`FollowUpQueue`；lane内部保留普通FIFO语义，不增加priority、batch drain mode或独立状态owner。仍在队列中的消息可以按CommandId remove，撤销后不重新入队。具体ingress形状由ADR 0111修订。
 8. Steer不取消Sampling、Compaction、WaitingApproval或ExecutingTools。当前assistant/tool step完整committed后，下一次Model调用前pop_front一条Steer并append/apply为UserMessage。
 9. 含ToolCall的step必须先完成assistant → truthful ToolResult → tool_round_completed，再加入Steer。无ToolCall candidate final遇到queued Steer时保存为model-visible、non-terminal Assistant Continue step；queue为空时才保存Assistant Final并terminalize Turn。
 10. FollowUp只在current Turn terminal后pop_front一条，重新capture TurnExecutionContext并开启新Turn。
