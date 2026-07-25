@@ -18,8 +18,8 @@
 - 每个 loaded Session 拥有恰好一个 `SessionExecutor`，它是该 Session 执行期 mutable state 的唯一 owner：SessionWriter、committed projections、`CurrentTurnExecution`、execution version 与 `SessionIngress`。
 - 外部调用方只持有可克隆的 `SessionExecutionHandle`，不能借用或加锁 Executor 状态。请求经每个Session独立的semantic ingress lane进入；Cancel/revocation、lifecycle和Snapshot不与普通work共享单一bounded FIFO。lane划分与仲裁由[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)定义。
 - 一个 Runtime 允许多个 `SessionExecutor` 同时 `Running`；每个 Session 独立推进，最多一个 Starting/Running Turn。
-- 执行期 state 只有 `Idle → Starting → Running → Finishing → Idle`；WaitingApproval/Sampling/Compacting/ExecutingTools 是 Running Turn 的阶段，不写 SessionStorage。
-- Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future、deadline与SessionIngress wakeup；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
+- 执行期 state 只有 `Idle → Starting → Running → Finishing → Idle`；WaitingApproval/WaitingForUserInput/Sampling/Compacting/ExecutingTools 是 Running Turn 的阶段，不写 SessionStorage。
+- Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future、deadline与SessionIngress wakeup；等待UserQuestion时只暂停当前Tool future，不阻塞Executor；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
 - Steer和FollowUp分别位于`SessionIngress`的bounded per-Turn `SteerQueue`与`FollowUpQueue`；各自只保留普通FIFO push/pop/remove语义，不拥有Session状态。Steer不取消Sampling；当前assistant/tool step完整committed后、下一次模型调用前pop一条。FollowUp在Turn terminal后最多pop一条并开启新Turn。
 - private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
 - 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。
@@ -32,6 +32,7 @@
 - 执行顺序与线性化点集中在单一 owner，entry / projection / event 顺序可独立测试。
 - 单一权威 owner 加异步 operation 分离，避免 lock-across-await 死锁；semantic lane和sticky emergency signal避免普通work backpressure饿死控制面。
 - 多 Session 可后台并发执行，共享服务用配额与 resource locks 协调；UI selection 不影响后台执行。
+- Pending UserQuestion只暂停所属Session当前Turn的逻辑推进；UI presentation断线不改变durable Interaction，其他Session仍可独立运行。
 - 严格串行current operation消除同Session logical retry的本地迟到结果竞态；execution version只验证conversation/control basis。provider端可能继续工作或计费仍不宣称exactly-once。Tool副作用真实性继续由outcome确认规则处理。
 - AgentLoop 可替换（含 Rig adapter），因为它不触碰 storage 与 I/O 顺序。
 
@@ -45,3 +46,4 @@
 - ADR 0002（compaction 由 session runtime 编排）。
 
 2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)修订本ADR原有的单一bounded request FIFO细节；单SessionExecutor/Writer ownership不变。
+2026-07-25：[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)补充UserQuestion等待阶段与Presentation Adapter职责；单SessionExecutor/Writer ownership不变。

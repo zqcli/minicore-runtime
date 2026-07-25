@@ -77,6 +77,7 @@ ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在
 - 所有直接、Deferred 和内部调用共享唯一执行链；
 - approval 只授予执行资格，Sandbox 继续执行强制限制；
 - 同批调用串行完成 preflight，再根据并发模式和资源锁执行；
+- 首版ask-user route在同批副作用ToolCall前独占等待，不持有资源锁，回答后其余调用才进入普通调度；
 - ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；
 - 正常、错误、拒绝和 confirmed cancellation 产生 truthful ToolResult；executor/side-effect outcome unknown 返回 Abandoned，不生成 ToolResult。
 
@@ -190,7 +191,7 @@ pub struct ToolServiceConfig {
 }
 ```
 
-Approval delivery 不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal ToolExecutionControl；无交互环境由该interface durable resolve为fail-closed decision，不使用 `None` 表示隐式允许。
+Approval 和 UserQuestion delivery 都不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal `ToolExecutionControl`；它是 Tool 到 SessionExecutor 的 crate-internal producer seam。无交互环境由该 interface durable resolve 为 fail-closed decision，不使用 `None` 表示隐式允许。TUI、Web、GUI 和 RPC 只是接收 UI-safe Interaction view 的 Adapter，不直接持有 waiter 或 writer。
 
 调用方不需要直接了解 ToolRegistry、ToolPolicy、Interaction persistence、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
 
@@ -621,7 +622,9 @@ Frozen ToolCall + ToolRequirements + WorkspaceAccessView
 → execute
 ```
 
-真实 seam：
+### Tool Execution Control
+
+权威 execution seam：
 
 ```rust
 pub struct ToolExecutionIntentStamp {
@@ -645,6 +648,12 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
         item_id: ItemId,
         request: ToolApprovalRequest,
     ) -> Result<ToolApprovalDecision, ToolExecutionControlError>;
+
+    async fn request_user_question(
+        &self,
+        item_id: ItemId,
+        request: UserQuestionRequest,
+    ) -> Result<UserQuestionAnswer, ToolExecutionControlError>;
 
     async fn record_execution_start(
         &self,
@@ -673,9 +682,11 @@ ToolExecutionStarted append → side effect
 
 `ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并重新验证cancellation与Workspace lease。Cancel/revocation先被观察则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
 
-TUI、RPC和Web通过[Runtime Interface](runtime-interface.md)接收Interaction StateEvent并提交resolution，不直接成为ToolService adapter。ToolSandbox仍可以有不同操作系统或容器adapter。
+`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、`ToolResourceLocks`和外部副作用之前。等待期间不取得或持有资源锁、`WorkspaceCommitAuthorization`或其他跨Session资源；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control、deadline和Snapshot。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
 
-ToolExecutionControl是crate-internal execution seam，不建立InteractionService、ToolLedgerService或第二writer。其实现只能通过当前SessionWriter append已定义event entry，并在返回前完成storage-owned `apply_committed`；`record_execution_start`成功返回exact `EntryId`后才允许side effect。ToolSet把该ID带入`ToolOutcomeSource::Executed`，Session execution随后用它构造可验证的role=tool message。
+TUI、RPC、Web和GUI通过[Runtime Interface](runtime-interface.md)接收UI-safe Interaction StateEvent并提交resolution；它们是Presentation Adapter，负责展示、表单和本地交互，不是ToolService Adapter，也不直接持有Tool waiter。ToolSandbox仍可以有不同操作系统或容器Adapter。
+
+ToolExecutionControl是crate-internal execution seam，不建立InteractionService、ToolLedgerService或第二writer。其实现只能通过当前SessionWriter append已定义event entry，并在返回前完成storage-owned `apply_committed`；`request_user_question`完成`InteractionRequested → host delivery → InteractionResolved`，`record_execution_start`成功返回exact `EntryId`后才允许side effect。ToolSet把该ID带入`ToolOutcomeSource::Executed`，Session execution随后用它构造可验证的role=tool message。
 
 审批请求至少包含：
 
@@ -756,6 +767,7 @@ ToolSet 内部完成批量调度，不暴露独立 ToolScheduler 类。
 ToolExecutionRequest[]
 → 全程保留 item_id + call
 → 按原始顺序串行 preflight
+→ 若存在内建 ask-user route，先独占完成该 route
 → 收集允许执行的调用
 → 根据 ToolConcurrency 和 ToolResourceAccess 调度
 → 并发执行无冲突调用
@@ -771,6 +783,7 @@ ToolExecutionRequest[]
 - 参数名称猜测不能作为安全资源锁的唯一来源；
 - ToolCall event 可以按实际完成顺序流式发布；
 - ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；complete ToolRound 只消费 Completed results；
+- 首版ask-user route pending时不启动同一assistant step的其他ToolCall；它形成`PreExecution` outcome后，剩余调用才进入普通调度；
 - schema、Hook 或 policy 对单个调用的拒绝形成该调用的 ToolResult；
 - 用户显式拒绝或 Turn cancellation 停止后续 preflight，并为未执行调用生成取消结果；
 - 所有等待 approval、锁和 executor 的操作都响应 Turn cancellation。
@@ -809,6 +822,19 @@ ToolSet::execute(ToolExecutionRequest[])
    或 Abandoned { reason }
 → 按原始 request 顺序返回
 ```
+
+内建 ask-user route 使用同一执行入口，但不进入有副作用的后半段：
+
+```text
+preflight / schema / hook / policy
+→ ToolExecutionControl.request_user_question
+→ WaitingForUserInput（不取资源锁、不写ToolExecutionStarted）
+→ UserAnswer / Cancelled / Expired
+→ PreExecution ToolResult candidate
+→ Session execution append role=tool message
+```
+
+普通 Tool 在已经`ToolExecutionStarted`或持有资源锁后不得调用`request_user_question`；若未来需要该能力，必须另行定义不持锁的producer protocol。
 
 在record_execution_start之前形成的exact validation/policy/approval/unavailable ToolResult以`source = PreExecution`返回Completed；不进入ToolSandbox，也不伪造ToolExecutionStarted。Session execution随后append role=tool message。若该append已证明NotCommitted，只重试同一entry draft；若返回SessionWrite OutcomeUnknown，poison writer并保守终结当前操作、不在本run重放该append，恢复在下次load读committed prefix后按状态处理，不重放Tool。只有Tool side effect本身outcome unknown（工具副作用未知），或crash后exact result不可恢复，才返回/持久化Abandoned；此类不构造synthetic ToolResult。
 
@@ -888,6 +914,11 @@ ToolAuthorization 需要外部审批
 → ToolExecutionControl 创建 durable ToolApproval Interaction
 → Interaction 归属于同一个 ToolInvocation Item
 
+内建 ask-user route
+→ ToolExecutionControl 创建 durable UserQuestion Interaction
+→ Presentation Adapter 展示并通过 Runtime facade 返回 UserAnswer
+→ Interaction 归属于同一个 ToolInvocation Item
+
 Tool 执行得到 truthful ToolResult
 → Session execution append role=tool message
 → 同一个 ToolInvocation Item = Completed { result }
@@ -940,7 +971,7 @@ Tool locks
 | 权限与资源 | `ToolRequirements`、`PermissionSet`、`FilePermission`、`NetworkPermission`、`ProcessPermission`、`EnvironmentPermission`、`ToolResourceAccess`、`ToolResourceKey`、`ToolResourceMode` |
 | 审批与授权 | `ToolApprovalRequest`、`ToolApprovalDecision`、`ToolGrantKey`、`ToolGrantScope`、`ToolGrantSuggestion`、`PolicyRevision`、`BeforeToolUseDecision` |
 | 保留模型路由 | `search_tools`、`invoke_tool` |
-| Domain 投影 | `ItemContent::ToolInvocation`、`InteractionRequest::ToolApproval` |
+| Domain 投影 | `ItemContent::ToolInvocation`、`InteractionRequest::ToolApproval`、`InteractionRequest::UserQuestion` |
 
 不建立以下独立对象：
 
@@ -1017,7 +1048,7 @@ CallToolTool / InvokeToolTool
 - [x] 确定串行 preflight、并发执行、资源锁和稳定结果顺序。
 - [x] 确定 ToolCall、ToolResult 合并为同一个 ToolInvocation Item。
 - [x] 确定 Tool approval 是 ToolInvocation-owned durable Interaction。
-- [x] 确定ToolExecutionControl由Session execution提供并遵守approval和execution-start ordering；Tool outcome由Session execution append为tool message。
+- [x] 确定ToolExecutionControl由Session execution提供并遵守approval、UserQuestion和execution-start ordering；Tool outcome由Session execution append为tool message。
 - [x] 确定 executor/side-effect outcome unknown 时 Abandoned，不生成 synthetic ToolResult。
 - [x] 确定ToolInvocation/Interaction/ToolResult/ToolRound completion通过统一SessionWriter by-entry log持久化。
 - [ ] 定义 ToolName namespace 和 schema dialect。

@@ -54,7 +54,7 @@
 - SessionWriter append由Executor发起，receipt必须立即应用到全部required projections；
 - initiating UserMessage append/apply后才允许第一次Model调用；
 - assistant intermediate和tool messages只有在`tool_round_completed`append/apply后才进入模型conversation；
-- Interaction request append/apply后才通知host；resolution append/apply后才恢复Tool执行；
+- Interaction request append/apply后才通知host；resolution append/apply后才恢复Tool执行；UserQuestion等待使用`WaitingForUserInput`且UI只负责presentation；
 - `tool_execution_started`append/apply后才允许外部副作用；
 - FollowUp使用process-local bounded FIFO，当前不承诺crash-safe delivery；Snapshot使用latest-wins mailbox，不占用mutation/control容量；
 - Cancel与Workspace authorization revocation使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；PrepareForUnload使用sticky lifecycle signal和shared completion generation；
@@ -113,7 +113,7 @@ MiniCoreRuntime
 多Session规则：
 
 - 每个Session有独立`SessionIngress`、writer、projections、current Turn和execution version；
-- 多个Session可以同时Sampling、WaitingApproval或ExecutingTools；
+- 多个Session可以同时Sampling、WaitingApproval、WaitingForUserInput或ExecutingTools；
 - ModelGateway负责provider并发限制；
 - ToolService使用canonical resource locks协调跨Session文件和外部资源冲突；
 - WorkspaceSnapshot和TurnExecutionContext按Session/Turn独立；
@@ -192,7 +192,7 @@ pub(crate) enum CancelTarget {
 | `FollowUp` | `FollowUpQueue` | bounded FIFO；terminal Turn 后作为新 Turn admission |
 | `CancelQueuedMessage` | `InputMailboxControl` | 按 `CommandId` 原子删除 Steer 或 FollowUp 中一条，不清空队列 |
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO并配置独立保留容量；只处理已存在的 Pending Interaction |
-| `ToolControl` | `ToolControlQueue` | bounded FIFO；approval/start 等内部 durable control |
+| `ToolControl` | `ToolControlQueue` | bounded FIFO；approval、UserQuestion、execution-start 等内部 durable control |
 | `Cancel` | `EmergencyControl` | target-scoped sticky、可合并 signal；每个目标 Submission/Turn 使用共享completion generation，不因普通 lane 满而延迟触发取消 |
 | `WorkspaceAuthorizationRevoked` | `EmergencyControl` | sticky signal；先撤销 lease，再唤醒 Executor |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion generation，可附 grace deadline |
@@ -238,25 +238,9 @@ Admission规则：
 
 ## Tool Execution Control
 
-Tool执行使用crate-private `ToolExecutionControl`请求SessionExecutor完成durable操作：
+Tool执行使用crate-private `ToolExecutionControl`请求SessionExecutor完成durable操作。权威 interface（包括 `request_approval`、`request_user_question` 和 `record_execution_start`）只在[Tool子系统](tools.md#tool-execution-control)定义；本模块不重复定义 trait，避免两个窄 interface 漂移。
 
-```rust
-pub(crate) trait ToolExecutionControl: Send + Sync {
-    async fn request_approval(
-        &self,
-        item_id: ItemId,
-        request: ToolApprovalRequest,
-    ) -> Result<ToolApprovalDecision, ToolExecutionControlError>;
-
-    async fn record_execution_start(
-        &self,
-        item_id: ItemId,
-        intent: ToolExecutionIntentStamp,
-    ) -> Result<EntryId, ToolExecutionControlError>;
-}
-```
-
-实现把Tool control request写入`ToolControlQueue`。Tool future发送request后等待typed response，但不持有SessionExecutor的锁或mutable reference。
+实现把Tool control request写入`ToolControlQueue`。Tool future发送request后等待typed response，但不持有SessionExecutor的锁或mutable reference。`request_approval`与`request_user_question`都由同一SessionExecutor完成InteractionRequested/Resolved的append/apply、deadline与waiter唤醒；前者返回typed approval，后者返回typed UserQuestion answer。
 
 `ToolControlQueue`只保证自身FIFO，不与Steer或Submit建立全局顺序。安全性依赖state-aware arbitration和append线性化点：处理任何`record_execution_start`前，Executor必须先观察`EmergencyControl`的最新epoch并重新验证Turn、cancellation和authorization；若emergency已生效，拒绝新的execution start。若`ToolExecutionStarted`已经append/apply，则该副作用获得真实线性化结果，后续Cancel只能best-effort取消并确认outcome。
 
@@ -266,7 +250,7 @@ SessionExecutor处理Tool control request时必须重新验证：
 - execution version；
 - ItemId/ToolCallId仍属于current Running Turn；
 - Turn没有Cancel或security revocation；
-- Interaction状态和approval family匹配；
+- Interaction状态与approval/UserQuestion family匹配；
 - Workspace authorization和Tool policy仍允许继续；
 - required entry append/apply成功。
 
@@ -316,7 +300,7 @@ Running cancellation/failure
 - `Running`：initiating UserMessage已经append/apply；
 - `Finishing`：不再启动新的Model/Tool操作，正在完成terminal entries和释放资源；
 - 一个Session不能同时存在两个Starting/Running Turn；
-- WaitingApproval、Compacting、Sampling和ExecutingTools是Running Turn的执行阶段，不是Session durable state；
+- WaitingApproval、WaitingForUserInput、Compacting、Sampling和ExecutingTools是Running Turn的执行阶段，不是Session durable state；
 - state不写入SessionStorage。
 
 ## Current Turn Execution
@@ -697,7 +681,7 @@ AgentLoop NeedTools { finalized response, calls }
 → release WorkspaceCommitAuthorization
 → ToolInvocation projection = Started
 → phase = ExecutingTools
-→ 启动ToolSet.execute；需要approval时phase = WaitingApproval
+→ 启动ToolSet.execute；需要approval时phase = WaitingApproval，需要ask-user时phase = WaitingForUserInput
 ```
 
 ToolSet流程：
@@ -709,6 +693,19 @@ preflight / schema / hook / policy
 → sandbox / executor
 → truthful ToolExecutionOutcome
 ```
+
+若该ToolRound包含首版内建 ask-user route，调度器先处理该 route：
+
+```text
+preflight / schema / hook / policy
+→ ToolExecutionControl.request_user_question
+→ phase = WaitingForUserInput
+→ InteractionResolved(UserAnswer | Cancelled | Expired)
+→ PreExecution ToolResult candidate
+→ ask-user route完成后，才允许同一assistant step的其他ToolCall进入普通调度
+```
+
+等待期间不启动 sibling ToolCall，不取得或持有`ToolResourceLocks`、`WorkspaceCommitAuthorization`或其他跨Session副作用资源。UserQuestion解决后，剩余调用才按原始请求顺序和既有资源锁规则继续；不改变ToolResult的稳定返回顺序。
 
 Tool结果处理：
 
@@ -743,17 +740,18 @@ ToolExecutionOutcome[]
 
 ## Interaction流程
 
-Approval request：
+Approval 或 UserQuestion request：
 
 ```text
-ToolExecutionControl.request_approval
+ToolExecutionControl.request_approval 或 request_user_question
 → SessionExecutor验证Turn/Item/version
 → append/apply InteractionRequested
 → 注册Pending Interaction和deadline
 → 保存Tool control response sender
 → EventPublisher通知host
 → request handler返回主循环
-→ Tool future等待typed decision
+→ phase = WaitingApproval 或 WaitingForUserInput
+→ Tool future等待typed decision/answer
 ```
 
 Resolution：
@@ -763,7 +761,7 @@ ResolveInteraction(expected TurnId, RequestId, resolution_key)
 → 验证family、deadline和Pending state
 → append/apply InteractionResolved
 → 删除deadline
-→ 返回typed decision给Tool future
+→ 返回typed decision/answer给Tool future
 → request response成功
 ```
 
@@ -785,12 +783,13 @@ now >= expires_at
 - different key在Resolved后返回AlreadyResolved；
 - disconnect不自动关闭Interaction；
 - no-interaction host也必须写入明确fail-closed resolution；
-- WaitingApproval时TurnStatus仍为Running；
-- request_approval handler不能等待host response；ResolveInteraction或timeout负责完成保存的Tool control response sender。
+- Presentation Adapter只渲染UI-safe Interaction view并通过Runtime facade提交resolution；它不能创建MiniCore未请求的问题、直接写SessionStorage或持有Tool waiter；
+- WaitingApproval和WaitingForUserInput时TurnStatus与SessionExecutionState仍为Running；
+- `request_approval`/`request_user_question` handler不能在Executor内等待host response；ResolveInteraction或timeout负责完成保存的Tool control response sender；UserQuestion回答只唤醒原Tool future，不创建新Turn。
 
 ## Steer流程
 
-Steer属于current Turn，必须携带`expected_turn_id`。它进入按`TurnId`隔离的bounded `SteerQueue<TurnId>` FIFO；Steer不取消Sampling、Compaction、approval或Tool execution。
+Steer属于current Turn，必须携带`expected_turn_id`。它进入按`TurnId`隔离的bounded `SteerQueue<TurnId>` FIFO；Steer不取消Sampling、Compaction、approval、UserQuestion或Tool execution。
 
 ```text
 Steer request
@@ -1195,10 +1194,11 @@ SessionExecutor是唯一状态修改者。线性化点：
 一个Runtime中的多个Executor独立推进：
 
 ```text
-Session A: Sampling
-Session B: WaitingApproval
-Session C: ExecutingTools
-Session D: Idle
+Session A: WaitingForUserInput
+Session B: Sampling
+Session C: WaitingApproval
+Session D: ExecutingTools
+Session E: Idle
 ```
 
 必须保证：
@@ -1214,6 +1214,8 @@ Session D: Idle
 - 跨Session仍可能在ModelGateway配额、Tool resource lock和共享I/O处等待；
 - Runtime shutdown逐Session设置PrepareForUnload；grace deadline到期后由各Session fail-closed cancel；
 - UI current tab不影响后台Session执行。
+
+特别是，Session A 的 UserQuestion waiter 只属于 A 的`SessionExecutor`和`ToolControlQueue`；A 在等待答案时，B/C/D仍可各自推进。共享ModelGateway配额、canonical resource lock或宿主I/O仍可能造成正常竞争，但不会因为UserQuestion本身把其他Session放入同一个等待队列。
 
 ## Error分类
 
@@ -1354,6 +1356,10 @@ MVP性能要求：
 - Cancel signal与ToolExecutionStarted controlled reservation双向race均有唯一结果，signal发布不因reservation阻塞；
 - approval request append-before-notify；
 - resolution append-before-resume；
+- UserQuestion request在`ToolExecutionStarted`前append，等待期间不持有资源锁；
+- UserQuestion回答恢复同一个Tool future并形成`PreExecution` ToolResult，不伪造副作用；
+- Presentation Adapter只消费UI-safe Interaction view并通过Runtime facade Resolve，不能直接写Interaction或持有waiter；
+- WaitingForUserInput期间同Session不启动sibling副作用ToolCall，其他Session仍可运行；
 - timeout与host resolution first-wins；
 - parallel ToolCall按source order保存results；
 - 每个ToolResult独立append；
@@ -1392,6 +1398,7 @@ MVP性能要求：
 - Cancel during Sampling；
 - Cancel during Compaction；
 - Cancel during WaitingApproval；
+- Cancel during WaitingForUserInput；
 - Cancel during Tool execution before/after execution-start record；
 - Cancel保存exact ToolResult；
 - Cancel只生成一个TurnInterrupted；
@@ -1400,7 +1407,7 @@ MVP性能要求：
 - cancel epoch发布后新的同Turn Steer被拒绝，epoch前accepted Steer被清理；
 - 普通lane全部满时Cancel仍立即发布sticky signal；
 - Cancel不清空FollowUp或其他Submit；
-- WorkspaceAuthorizationRevoked during Starting/Compacting/Sampling/WaitingApproval/ExecutingTools；
+- WorkspaceAuthorizationRevoked during Starting/Compacting/Sampling/WaitingApproval/WaitingForUserInput/ExecutingTools；
 - WorkspaceAuthorizationRevoked不等待任何bounded FIFO容量；
 - revoked lease/control generation的signal不影响捕获新lease的future Turn；
 - revoked lease使Model start、record_execution_start和tool_round_completed validation失败；

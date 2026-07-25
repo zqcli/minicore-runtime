@@ -424,7 +424,11 @@ InteractionRequested append/apply
 → resume waiter或允许后续side effect
 ```
 
-结构化Interaction answer不是UserMessage，不开启新Turn。
+`InteractionResolutionInput`必须与request family匹配：ToolApproval接受approval decision，UserQuestion接受UserAnswer；Cancelled/Expired按领域规则关闭任一family。所有identity与family校验由MiniCore执行，不能信任UI本地状态。
+
+MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，持久化request/resolution，处理deadline、Cancel、幂等和recovery。Presentation Adapter只把UI-safe request渲染为弹窗、聊天消息、终端菜单或表单，并把用户答案提交为`InteractionCommand::Resolve`；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionWriter。
+
+结构化Interaction answer不是UserMessage，不开启新Turn。尤其是UserQuestion回答会恢复原来的ToolInvocation；若UI把答案改成Submit/UserMessage，就会错误地创建新Turn。
 
 ### CommandSurfaceCommand
 
@@ -1037,9 +1041,14 @@ pub struct InteractionView {
     pub state: InteractionStateView,
     pub expires_at: Option<Timestamp>,
 }
+
+pub enum InteractionRequestView {
+    ToolApproval(/* UI-safe approval fields */),
+    UserQuestion(/* UI-safe question fields */),
+}
 ```
 
-prepared Tool args、executor handle、sandbox internals和credential不进入event。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。
+prepared Tool args、executor handle、sandbox internals和credential不进入event。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity、deadline和first-wins状态。
 
 ## Message Tree 管理
 
@@ -1219,6 +1228,26 @@ ModelCallResult contains ToolCall
 → next PromptSet.assemble
 ```
 
+### User Question
+
+```text
+ModelCallResult contains built-in ask-user ToolCall
+→ SessionExecutor creates ToolInvocation ItemId
+→ ToolExecutionControl.request_user_question
+→ append/apply InteractionRequested(UserQuestion)
+→ session StateEvent::InteractionRequested with UI-safe InteractionView
+→ Presentation Adapter展示并收集答案
+→ UI dispatch InteractionCommand::Resolve(UserAnswer)
+→ append/apply InteractionResolved
+→ session StateEvent::InteractionResolved
+→ wake original Tool future
+→ append/apply PreExecution truthful Tool result
+→ append/apply tool_round_completed
+→ same Turn next PromptSet.assemble
+```
+
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/timeout/Unload/Snapshot；其他Session的Executor不受影响。等待期间不持有Tool资源锁或Workspace commit authorization。
+
 ## Transport 与 Adapter
 
 生产优先级：
@@ -1229,7 +1258,7 @@ ModelCallResult contains ToolCall
 
 JSON-RPC、stdio或WebSocket adapter出现第二个真实transport需求后实现。
 
-Transport adapter只负责：
+Transport Adapter只负责：
 
 - serialization/deserialization；
 - transport request id correlation；
@@ -1238,7 +1267,7 @@ Transport adapter只负责：
 - protocol initialize/version negotiation；
 - EventStream到transport notification映射。
 
-Transport adapter不负责：
+Transport Adapter不负责：
 
 - Session selection；
 - command parse/authorization；
@@ -1247,6 +1276,8 @@ Transport adapter不负责：
 - Tool approval policy；
 - provider retry；
 - storage truth。
+
+Presentation Adapter与Transport Adapter可以由同一个host实现，但职责不同：Presentation Adapter决定modal、聊天卡片、终端菜单、表单文案与本地交互；Transport Adapter只传输Runtime已定义的request/resolution。两者都不拥有MiniCore Interaction truth。
 
 Transport request id不能替代CommandId、TurnId、RequestId或cursor。
 
@@ -1399,6 +1430,8 @@ Public interface是 contract test surface。
 - progress丢失不产生state gap；
 - final Item event携带完整view；
 - Interaction request-after-append和resolution-before-resume；
+- UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
+- Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
 - Turn只有一个terminal event；
 - subscriber buffer不足返回Gap并可snapshot恢复。
 
@@ -1406,6 +1439,7 @@ Public interface是 contract test surface。
 
 - catalog/query/snapshot/event不包含credential；
 - renderer不能提交raw internal command；
+- renderer不能直接持有Tool waiter、SessionWriter或伪造MiniCore未请求的Pending Interaction；
 - stale catalog selection重新resolve；
 - cross-sessionItem/RequestId拒绝；
 - Workspace restriction通过Runtime path生效。

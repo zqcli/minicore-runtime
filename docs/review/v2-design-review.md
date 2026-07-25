@@ -2,8 +2,8 @@
 
 状态：设计评审记录
 日期：2026-07-25
-范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0112）
-方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4与D1已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
+范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0113）
+方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
 
 ## 总体判断
 
@@ -114,10 +114,10 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - 决议：plan阶段派生`CompactionSummaryBudget`，对全局上限、pinned known model output limit、summary source、Prompt固定开销、context window与safety reserve求交；最终值进入plan/directive/fingerprint。低于`summary_min_output_tokens`时返回`NoFeasibleSummaryBudget`，ModelGateway继续strict validate且不静默clamp。plan/Prompt proof/ModelCallRequest/SessionExecutor append gate负责临时budget一致性，SessionStorage冷重放只验证entry可重建的scope、boundary、hash、checkpoint和provenance关系。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
 - 出处：`compaction.md` ↔ `model-gateway.md`。
 
-**E3 · `UserQuestion` Interaction 没有发起 seam**
+**E3 · `UserQuestion` Interaction 没有发起 seam（已关闭）**
 `InteractionRequest` 冻结为 `ToolApproval | UserQuestion`，公开协议也含 UserAnswer resolution，但 Tool↔SessionExecutor 唯一 crate-internal seam `ToolExecutionControl` 只有 `request_approval`/`record_execution_start`，`Tool::execute` 只有 `ToolUpdateSink` + 窄 context，无法发起 durable Interaction，也无内建 ask-user Tool。
 - 影响：领域与公开协议承诺 UserQuestion，但执行层无生产者，任何 ask-user 能力无法落地。
-- 建议：在 `ToolExecutionControl` 增加 `request_user_question(...)`（与 approval 同走 append-before-notify / resolution-before-resume），或明确 UserQuestion 不在首版、公开 resolution 首版只暴露 ToolApproval。
+- 决议：在 `ToolExecutionControl` 增加 `request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、资源锁和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不持有跨Session资源；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、timeout、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)。
 - 出处：`turn-item-interaction.md` ↔ `tools.md` ↔ `session-execution.md`。
 
 ### F. 实现顺序
@@ -164,7 +164,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 ### 并发（承 D 组复核）
 
 - 多资源 Tool 无全序获取仍可跨 Session 反序死锁，但操作响应 Turn cancellation，故非永久 → 对单次 execute 的多个 canonical `ToolResourceKey` 采用稳定总序获取，避免依赖 cancellation 兜底。
-- 某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁 → 主流 Tool 无此形态，可延后。
+- ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3关闭**。ADR 0113禁止普通Tool在`ToolExecutionStarted`或持有资源锁后调用`request_user_question`；若未来需要，必须另行定义不持锁的producer protocol。
 - ~~`PrepareForUnload` graceful unload 不自动 Cancel，Interaction `expires_at` 可为 None、disconnect 不自动关闭~~：**已随D1关闭**。LifecycleControl立即stop admission，有限grace deadline到期后对Pending Interaction fail closed并Cancel active Turn。
 - 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
 - Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
@@ -230,3 +230,8 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
 
 - **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量，Tool副作用以`ToolExecutionStarted` append为race线性化点；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline并最终fail closed；Snapshot从带cursor的immutable published view读取。lane只拆ingress，不增加第二个Session状态或durable owner。
+
+针对E组已作决定并落盘：
+
+- **E1/E2**：**已关闭**，分别由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录active-Turn checkpoint与模型感知summary budget。
+- **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、timeout/Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。

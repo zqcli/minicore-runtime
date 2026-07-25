@@ -16,7 +16,7 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 - **Assistant Continue step**：provider返回无ToolCall稳定response但Steer FIFO非空时，该response保存为model-visible、non-terminal `Assistant(Intermediate)`；queue为空时才保存`Assistant(Final)`并结束Turn。含ToolCall的Intermediate仍只在`tool_round_completed`后model-visible。
 - **最小 ItemContent 四类**：`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`。`ItemType` 与 `ItemStatus` 都是从 content discriminant 派生的 read projection，不作为独立存储的第二事实字段。UserMessage/AgentMessage/Reasoning 只在形成稳定值后成为 durable Item 且创建即 Completed。
 - **ToolCall 与 ToolResult 合并为同一 ToolInvocation Item**：一个 Item 贯穿 call、approval、execution、result 与 recovery，状态 `Started → Completed | Abandoned`。Completed 必须持有 truthful ToolResult（typed `disposition`，不用单 bool 压平 denied/cancelled/failed）；outcome unknown 时进入 Abandoned，不生成 synthetic ToolResult，不进入模型 conversation。拒绝 sibling ToolCall/ToolResult Items。
-- **Interaction 是 Item-owned durable request/resolution**：`InteractionRequest = ToolApproval | UserQuestion`，request/resolution family 必须匹配。遵循 request-before-notify（request append 后才通知 host）与 resolution-before-resume（resolution append 后才唤醒 waiter 或执行受审批保护的副作用）。transport disconnect不自动关闭Interaction；reconnect使用相同RequestId；同一loaded execution内重复Resolve使用相同resolution_key去重，crash recovery则按committed prefix状态判断，不承诺durable key重建。Interaction answer不是UserMessage，不开启新Turn。
+- **Interaction 是 Item-owned durable request/resolution**：`InteractionRequest = ToolApproval | UserQuestion`，request/resolution family 必须匹配。遵循 request-before-notify（request append 后才通知 host）与 resolution-before-resume（resolution append 后才唤醒 waiter 或执行受审批保护的副作用）。UserQuestion由Turn-scoped `ToolExecutionControl::request_user_question`在pre-execution ask-user route中发起；Presentation Adapter只负责展示UI-safe view和提交resolution。transport disconnect不自动关闭Interaction；reconnect使用相同RequestId；同一loaded execution内重复Resolve使用相同resolution_key去重，crash recovery则按committed prefix状态判断，不承诺durable key重建。Interaction answer不是UserMessage，不开启新Turn。
 - **terminal Turn 领域闭合**：terminal entry 前必须关闭所有 Pending Interaction（Cancelled/Expired）与 Started Item（Completed 已有 truthful result，或 Abandoned）；terminal Turn 不保留 Pending Interaction 或 Started Item，terminal 后不接受 Steer、Item append 或 Interaction response。
 - **identity 三分且不混用**：`ItemId`（MiniCore 语义 Item identity）、`ToolCallId`（provider/transcript correlation，原样回显）、`EntryId`（storage entry identity）不要求相等；Interaction 归属于 ItemId，不归属于裸 ToolCallId。
 - **不引入总控对象**：不建立 `ItemManager`/`ItemService`、`InteractionManager`/`InteractionService`、`ModelStep`、`ToolRound` entity（ToolRound 只是 conversation promotion 单位，非领域 entity）。SessionStorage 是唯一 durable truth，projection 与 event stream 都不是第二事实来源。
@@ -26,6 +26,7 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 - Turn / Item / Interaction 的开始、结束、可见性与 side-effect 都锚定在 committed entry 的 append 线性化点，replay、UI projection 与 recovery 可独立测试。
 - 合并的 ToolInvocation 让 approval 归属、outcome-unknown 处理与 UI/replay correlation 只发生在单一 identity 上，避免 orphan result 与永久悬空的 call。
 - durable Interaction 使 reconnect、lost acknowledgement 与 host restart 都能从 truth 判断请求状态，代价是引入 resolution_key 幂等与 first-wins CAS 的排序复杂度。
+- UI presentation与MiniCore interaction protocol分离，使同一UserQuestion可以由TUI、Web、GUI或RPC Adapter呈现而不复制pending state；首版ask-user等待不持有资源锁，避免跨Session阻塞。
 - 「派生而非存储」的 ItemType/ItemStatus 与「无 Manager/Service」的取舍，把复杂性留在 Session execution 与 SessionStorage projection 内，deletion test 成立——移除该模型会让边界与生命周期重新散落。
 - 明确不建 ModelStep/ToolRound entity，意味着逻辑模型调用与 conversation promotion 靠 fingerprint、EntryId/parent_id 引用与 `tool_round_completed` event 表达，而非新增领域实体。
 
@@ -34,3 +35,4 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 本 ADR 属 V2 决策集，是 V2 领域模型新增的长期决策，不取代某一条 V1 ADR。相关的 V1 事件形状与生命周期背景（如 ADR 0003：agent-runtime events 使用 event-msg 与 lifecycle pairs）见 [`../archive/v1/adr/`](../archive/v1/adr/)。
 
 2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)明确Steer/FollowUp的物理SessionIngress lane、Cancel清理和跨lane仲裁；本ADR的领域分工不变。
+2026-07-25：[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)补充UserQuestion producer seam、WaitingForUserInput和UI presentation职责；本ADR的Item-owned durable Interaction不变。

@@ -17,4 +17,4 @@
 | `refactoring-roadmap.md` | `../migration/v1-to-v2.md` |
 | `session-execution-progress.md` | 研究/handoff 记录，迁移完成后由 Git history 保留 |
 
-当前权威架构：`../architecture.md` + `../modules/`（12 篇）+ `../adr/`（0100–0112；D1见0111，E1/E2见0112）+ `../migration/v1-to-v2.md`。
+当前权威架构：`../architecture.md` + `../modules/`（12 篇）+ `../adr/`（0100–0113；D1见0111，E1/E2见0112，E3见0113）+ `../migration/v1-to-v2.md`。本目录不复制E3正文；UserQuestion producer与UI presentation的权威说明见`../modules/turn-item-interaction.md`、`../modules/tools.md`和`../modules/runtime-interface.md`。
