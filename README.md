@@ -21,4 +21,4 @@ AgentRuntime.snapshot() -> agent_runtime_protocol::RuntimeSnapshot
 → [docs/research/](docs/research/)
 → [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
 
-V1 已归档，仅用于历史参考；V2 是当前权威架构（目标设计已冻结，生产实现进行中）。版本迁移记录见 [docs/migration/v1-to-v2.md](docs/migration/v1-to-v2.md)。正式文档不再链接 V1 归档；只有迁移说明和新 ADR 的历史依据部分可以引用它。
+V1已归档，仅用于历史参考；V2是当前权威架构（目标设计已冻结，生产实现待启动）。下一里程碑是阶段6–8模型调用协同交付束，完整进度见[版本迁移记录](docs/migration/v1-to-v2.md)。正式文档不再链接V1归档；只有迁移说明和新ADR的历史依据部分可以引用它。

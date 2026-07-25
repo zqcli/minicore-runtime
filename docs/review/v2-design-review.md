@@ -122,6 +122,8 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ### F. 实现顺序
 
+> 状态说明（2026-07-26）：F1已关闭。阶段6、7、8保留职责编号，但改为一个模型调用协同交付束；以下原始问题正文仅作评审历史记录。
+
 **F1 · 路线图低估 SessionExecutor(6) / ModelGateway(7) / Compaction(8) 的耦合**
 三者在「逻辑模型调用」强耦合：compaction planning 内联进 SessionExecutor 的 `NeedModel` 安全点；`ModelCallRequest::new` 用 `PromptAssemblyProof` 校验 `TurnModelFingerprint`/purpose，Prompt 与 ModelGateway 互持类型契约。按 6→7→8 串行独立交付会返工。真正的硬门是仍标 `[ ]` 的 Rig 0.40.0 spike。
 - 建议：把三者作为协同交付束；先落地 `DeterministicProviderAdapter`/`ScriptedProviderAdapter`，让 SessionExecutor + Compaction 在 fake adapter 上闭环，Rig spike 只 gate 真实 provider；把该依赖显式写入迁移记录。
@@ -206,7 +208,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ---
 
-## 评审决议（更新至2026-07-25）
+## 评审决议（更新至2026-07-26）
 
 针对 A 组已作决定并落盘：
 
@@ -235,3 +237,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - **E1/E2**：**已关闭**，分别由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录active-Turn checkpoint与模型感知summary budget。
 - **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、timeout/Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。
+
+针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)：
+
+- **F1（SessionExecutor / ModelGateway / Compaction实现顺序）**：**已关闭**。三个模块保持既有职责边界，但不再按6→7→8独立串行验收。首个实现里程碑使用`ScriptedProviderAdapter`通过真实`PromptSet → ModelCallRequest::new → ModelGateway → ProviderAdapter`路径闭环普通AgentRun与overflow→CompactionSummary→append/apply→reassemble→AgentRun；Rig 0.40.0 spike并行提前执行，并在production provider adapter冻结前作为门禁。

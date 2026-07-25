@@ -2,7 +2,7 @@
 
 日期：2026-07-25
 
-状态：当前权威架构（设计已冻结，实现进行中）
+状态：当前权威架构（设计已冻结，生产实现待启动）
 
 ## 目的
 
@@ -1064,16 +1064,18 @@ COMP-020 effective summary budget与pinned model known limits一致并进入fing
 
 ## Implementation Sequence
 
-1. 实现stable-unit projection、scope/frontier和property tests；
-2. 实现context pressure、model-aware CompactionSummaryBudget和CompactionPlan；
-3. 扩展PromptAssemblyInput和CompactionSummaryDirective；
-4. 在SessionExecutor加入`Compacting`和CurrentCompactionState；
-5. 接入ModelGateway SummaryModel call；
-6. 完成StoredCompaction scope-aware writer validation和trusted Replace delta；
-7. 完成replay/fork/crash tests；
-8. 完成soft/hard failure、same-source recovery和per-Turn compaction budget；
-9. 建立summary quality fixtures；
-10. 接入Runtime per-session StateEvent/ProgressEvent并完成公开contract tests。
+Compaction的纯planning/projection可以先做模块测试，但summary model path不能在SessionExecutor和ModelGateway之后另行接入。阶段6–8共享以下交付顺序：
+
+1. 实现stable-unit projection、scope/frontier、context pressure、model-aware budget和property tests；
+2. 冻结`PromptAssemblyInput::CompactionSummary`、`CompactionSummaryDirective`和共用`ModelCallRequest::new`契约；
+3. 通过ModelGateway的`ScriptedProviderAdapter`闭环普通AgentRun；
+4. 在同一harness加入`Compacting`、summary call、StoredCompaction append/apply、trusted Replace和AgentRun reassembly；
+5. 完成soft/hard failure、same-source recovery、per-Turn compaction budget、replay/fork/crash tests；
+6. 并行完成Rig spike，再接入RigProviderAdapter和provider mock-server tests；
+7. 建立summary quality fixtures；
+8. 接入Runtime per-session StateEvent/ProgressEvent并完成公开contract tests。
+
+步骤3和4是共同完成门槛；不允许Compaction使用第二个summary request类型或绕过ModelGateway。
 
 ## 完成检查
 
@@ -1090,7 +1092,8 @@ COMP-020 effective summary budget与pinned model known limits一致并进入fing
 - [x] 确定不强制split为新Turn，不做manual、hierarchical或provider-native compaction。
 - [x] 确定Runtime protocol不公开manual CompactSession。
 - [ ] 实现Compaction module。
+- [ ] 通过ScriptedProviderAdapter完成overflow → summary → append/apply → reassemble → AgentRun vertical slice。
 - [ ] 实现SessionExecutor integration。
-- [ ] 实现Prompt/ModelGateway summary path。
+- [ ] 实现共用Prompt/ModelGateway summary path。
 - [ ] 实现storage/projector/replay/fork tests。
 - [ ] 完成summary quality evaluation。

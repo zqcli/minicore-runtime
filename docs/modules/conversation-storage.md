@@ -1,6 +1,6 @@
 # Conversation 与 SessionStorage 架构设计
 
-状态：当前权威架构（设计已冻结，实现进行中）
+状态：当前权威架构（设计已冻结，生产实现待启动）
 日期：2026-07-25
 
 ## 目的
@@ -1342,7 +1342,7 @@ content-addressed DAG
 - 定义ModelGateway normalization与persistence contract；
 - 定义public ForkAnchor payload，见[Runtime Interface](runtime-interface.md)。
 
-实现进行中的部分：
+待实现部分：
 
 - ModelGateway与AgentLoop adapter实现；
 - 实现、fixture和property tests。
