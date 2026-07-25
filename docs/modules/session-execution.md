@@ -342,13 +342,24 @@ pub(crate) struct CurrentTurnExecution {
     turn_id: TurnId,
     execution_version: u64,
     context: Arc<TurnExecutionContext>,
+    compaction_settings: Arc<CompactionSettingsSnapshot>,
     agent_loop: AgentLoop,
     phase: TurnExecutionPhase,
     cancellation: CancellationToken,
     model_attempt: Option<ModelAttemptState>,
     tool_execution: Option<ToolExecutionState>,
     compaction: Option<CurrentCompactionState>,
-    automatic_overflow_recovery_used: bool,
+    successful_compactions: u32,
+    last_hard_compaction_basis: Option<CompactionRecoveryBasis>,
+}
+```
+
+`CompactionRecoveryBasis`由source checkpoint与当前scope frontier fingerprint组成；active scope的fingerprint同时覆盖effective `previous_checkpoint`和由backing compaction派生的covered-through provenance。同一basis的hard recovery只启动一次；成功StoredCompaction推进checkpoint/frontier后，后续新增completed units可以形成新的basis，但总次数受Turn-pinned `max_compactions_per_turn`限制。
+
+```rust
+pub(crate) struct CompactionRecoveryBasis {
+    pub source: ConversationCheckpoint,
+    pub scope_frontier_fingerprint: CompactionScopeFrontierFingerprint,
 }
 ```
 
@@ -402,6 +413,7 @@ pub(crate) enum RunningOperation {
         turn_id: TurnId,
         execution_version: u64,
         source: ConversationCheckpoint,
+        scope: CompactionScope,
         plan_fingerprint: CompactionPlanFingerprint,
         cancel: CancellationToken,
     },
@@ -652,6 +664,7 @@ AgentLoop NeedModel
 → no pressure：phase = Sampling
    → GenerateModelResponse调用ModelGateway(AgentRun request)
 → soft/hard pressure：phase = Compacting
+   → Compaction基于pinned EffectiveModelLimits派生summary budget
    → CompactConversation调用PromptSet和ModelGateway(CompactionSummary request)
 → Executor继续处理SessionIngress的 wakeup 与各 lane
 → OperationResult返回并校验SessionId/TurnId/execution_version/OperationType
@@ -1034,6 +1047,7 @@ Steer、Cancel、Compaction或任何model-visible conversation change都会使�
 ```text
 AgentLoop NeedModel
 → assemble AgentRun context并检查soft pressure/local overflow
+→ PromptSet.compaction_summary_assembly_basis()
 → 必要时Compaction.plan
 → TurnExecutionPhase = Compacting
 → RunningOperation::CompactConversation
@@ -1044,17 +1058,19 @@ AgentLoop NeedModel
 → 使用同一个TurnExecutionContext继续Model操作
 ```
 
-provider ContextOverflow也回到同一流程；同一Turn最多一次automatic overflow recovery。
+provider ContextOverflow也回到同一流程。同一`source checkpoint + scope frontier`最多一次hard recovery；successful compaction推进basis后，同一Turn可以在`max_compactions_per_turn`内再次compact。
 
 规则：
 
 - Compaction不替换TurnExecutionContext、TurnModelSnapshot或PromptSet；
 - 启动Compaction不推进execution_version；成功Replace后推进，Cancel/revocation仍立即推进；
-- active Turn initiating UserMessage及其后的连续suffix必须原样保留；
+- `ConversationPrefix`压缩pre-Turn history；`ActiveTurnCompletedPrefix`保留exact initiating/Steer UserMessage anchors，并在每个instruction segment内滚动摘要已完成的早期stable units；
+- Pending/Started/incomplete ToolRound、explicit protected units和recent exact tail不进入active checkpoint coverage；
+- summary output budget必须在plan阶段与pinned model known limits和summary call context空间求交，并进入plan fingerprint；SessionExecutor在append前用`CompactionCommitCandidate`/`ModelCallRequest` proof复核该临时一致性，storage cold replay只验证durable entry关系；
 - `Compacting`期间Steer排队，Cancel和Workspace revocation可以取消operation并在append前获胜；
 - Compaction result append前必须重新验证source checkpoint和TranscriptFingerprint；
 - soft-pressure失败只有在原ModelCallRequest仍exact valid时才能继续；
-- hard overflow失败或compact后仍overflow时TurnFailed；
+- hard overflow失败时TurnFailed；successful compact后仍overflow只在存在新可行scope/frontier且次数有余量时再次plan，否则`ContextStillTooLargeAfterCompaction`；
 - success后必须重建AgentLoop segment，不能resume携带旧history的run；
 - summary operation、plan和retry timer不跨restart恢复。
 

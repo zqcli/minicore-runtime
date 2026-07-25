@@ -476,7 +476,7 @@ SkillCatalog.prompt_view()
 - cut 不拆散 ToolCall/ToolResult 或其他协议稳定单元；
 - compacted conversation 可从 storage 重建。
 
-状态：目标设计已完成，见 [Compaction 架构设计](../modules/compaction.md) 和 [ADR 0107](../adr/0107-compaction-uses-strict-stable-suffix.md)。首版采用 portable rolling summary、strict stable-unit cut、连续 retained suffix 和有界 active-Turn recovery；不实现 split-turn、manual、hierarchical 或 provider-native compaction。
+状态：目标设计已完成，见 [Compaction 架构设计](../modules/compaction.md) 和 [ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。首版采用portable rolling summary、stable-unit safe cut、leading conversation summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget和有界frontier advancement；不实现manual、hierarchical或provider-native compaction，也不通过强制新Turn代替checkpoint。
 
 ### 阶段 9：Runtime interface 与公开协议
 
@@ -688,7 +688,7 @@ Runtime facade 是唯一外部入口
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
 - [x] Conversation/SessionStorage durable ownership、entry tree、fork 和 recovery 已确定；
-- [x] compaction orchestration、stable cut、StoredCompaction 和 bounded recovery 有确定定义；
+- [x] compaction orchestration、stable cut、active-Turn checkpoint、model-aware summary budget、StoredCompaction 和 bounded recovery 有确定定义；
 - [x] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [x] 新文档已进入正式架构目录 [`docs/modules/`](../modules/)；
@@ -702,7 +702,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0111）构成，是当前唯一权威事实来源。
+- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0112）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
@@ -725,7 +725,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR 采用 `0100`–`0111` 编号，位于 [`docs/adr/`](../adr/)。其中 compaction 的稳定后缀决策由 [ADR 0107](../adr/0107-compaction-uses-strict-stable-suffix.md) 记录，Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录。
+- V2 ADR 采用 `0100`–`0112` 编号，位于 [`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录。
 
 ## 当前迁移状态
 
