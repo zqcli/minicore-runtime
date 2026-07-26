@@ -178,7 +178,7 @@ pub(crate) struct SessionIngress {
 }
 
 pub(crate) enum CancelTarget {
-    Submission(SubmissionId),
+    Submit(CommandId),
     Turn(TurnId),
 }
 ```
@@ -193,7 +193,7 @@ pub(crate) enum CancelTarget {
 | `CancelQueuedMessage` | `InputMailboxControl` | 按 `CommandId` 原子删除 Steer 或 FollowUp 中一条，不清空队列 |
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO并配置独立保留容量；只处理已存在的 Pending Interaction |
 | `ToolControl` | `ToolControlQueue` | bounded FIFO；approval、UserQuestion、execution-start 等内部 durable control |
-| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并 signal；每个目标 Submission/Turn 使用共享completion generation，不因普通 lane 满而延迟触发取消 |
+| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；每个目标Submit(CommandId)/Turn使用共享completion generation，不因普通lane满而延迟触发取消 |
 | `WorkspaceAuthorizationRevoked` | `EmergencyControl` | sticky signal；先撤销 lease，再唤醒 Executor |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion generation，可附 grace deadline |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced 请求，从 immutable published view 读取 |
@@ -309,7 +309,7 @@ Starting期间使用execution-local candidate：
 
 ```rust
 pub(crate) struct CandidateTurnExecution {
-    submission_id: SubmissionId,
+    submit_command_id: CommandId,
     turn_id: TurnId,
     execution_version: u64,
     intent: PromptIntent,
@@ -319,7 +319,7 @@ pub(crate) struct CandidateTurnExecution {
 }
 ```
 
-Candidate不是领域Turn。initiating UserMessage append前Cancel使用`CancelTarget::Submission(submission_id)`定位它。
+Candidate不是领域Turn。initiating UserMessage append前，Executor复制Submit envelope的`CommandId`并使用`CancelTarget::Submit(command_id)`定位它；不生成第二个submission identity。
 
 ```rust
 pub(crate) struct CurrentTurnExecution {
@@ -576,7 +576,7 @@ projection apply失败时：
 Submit
 → 验证Session lifecycle/load/readiness
 → state = Starting
-→ 创建SubmissionId、candidate TurnId和execution_version=1
+→ 保存Submit CommandId，创建candidate TurnId和execution_version=1
 → 启动BuildTurnContext
 → Context result identity/version validation
 → 启动ComposeUserMessage(source=Input)
@@ -918,7 +918,7 @@ Cancel(CancelTarget::Turn(expected TurnId))
 
 Cancel的signal写入不等待任何bounded work lane；target/generation匹配时，signal路径立即触发该target绑定的current operation cancellation token。Executor消费signal后推进shared completion state、更新Session state并返回主循环；后续OperationResult或timeout处理继续cleanup，TurnInterrupted append/apply后完成Cancel response。
 
-Starting期间使用`CancelTarget::Submission(submission_id)`：
+Turn创建前使用`CancelTarget::Submit(command_id)`：
 
 ```text
 matching request still in TurnAdmissionQueue
@@ -969,7 +969,7 @@ WorkspaceAuthorizationRevoked
 - 即使Executor尚未消费唤醒，已revoked lease也必须使authorization validation失败；
 - revocation不能撤回provider已经看到的内容，也不能回滚已发生副作用；
 - 已append但conversation-hidden的assistant/tool entries保持durable；
-- Starting期间revocation取消candidate submission，不创建领域Turn；
+- Starting期间revocation取消candidate Submit，不创建领域Turn；
 - FollowUp重新admit时使用current readiness和新的WorkspaceSnapshot。
 
 ## Failure流程
@@ -1085,7 +1085,7 @@ LifecycleControl.prepare_for_unload(deadline)
 → 如果Idle：关闭ingress/writer并返回ReadyToUnload
 → 如果Starting/Running/Finishing：保留shared completion generation并允许current work在grace期内自然完成
 → 继续处理EmergencyControl、ResolveInteraction、ToolControl依赖、operation result和timeout
-→ grace deadline到期仍未Idle：fail-closed resolve Pending Interaction，触发current submission/Turn cancel
+→ grace deadline到期仍未Idle：fail-closed resolve Pending Interaction，触发current pre-Turn Submit或Turn cancel
 → truthful Tool outcome与terminal append完成
 → 完成PrepareForUnload completion generation
 → Runtime移除SessionExecutionHandle并释放Executor
@@ -1231,7 +1231,7 @@ pub enum SessionExecutionError {
     FollowUpQueueFull,
     InteractionControlQueueFull,
     ToolControlQueueFull,
-    SubmissionNotFound,
+    SubmitNotFound,
     NoRunningTurn,
     TurnCancelling,
     ExpectedTurnMismatch,
@@ -1320,7 +1320,9 @@ MVP性能要求：
 - Starting期间第二个Submit返回SessionBusy；
 - TurnAdmissionQueue满返回TurnAdmissionQueueFull，且不影响EmergencyControl；
 - Submit ingress未在本次Idle decision选中且Session被其他消息占用时返回SessionBusy，不跨整个Turn等待；
-- CancelTarget::Submission在Context capture和UserMessage composition期间取消candidate；
+- duplicate in-flight Submit使用相同CommandId加入原completion，不创建第二个candidate；
+- 相同CommandId携带不同command返回CommandConflict；
+- CancelTarget::Submit(CommandId)在排队、Context capture和UserMessage composition期间取消candidate；target退休或restart后返回SubmitNotFound且不能影响future Turn；
 - Session不是Open/Loaded/Ready时拒绝Submit；
 - Context failure不创建Turn；
 - stale BuildTurnContext/ComposeUserMessage result在version变化后被忽略；

@@ -318,12 +318,12 @@ _避免_：durable entry、Queue entity、priority queue、batch drain mode、Pr
 SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。每个Session最多一个current operation；主循环同时poll它和request queue，旧operation terminal/remove或安全drop前不启动下一operation。它只接收不可变输入并返回`OperationResult`，不能拥有SessionWriter、projections、request queues或Turn terminal state。
 _避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owner
 
-**提交标识（`SubmissionId`）**：
-Submit在initiating UserMessage append前的process-local admission control identity。公开Cancel target使用`SubmissionId | TurnId`；Turn创建后长期identity切换为TurnId。SubmissionId不持久化，restart后不可恢复。
-_避免_：领域TurnId、CommandId、crash-safe queue identity
+**Submit命令标识（Submit `CommandId`）**：
+Submit envelope的随机、不可复用CommandId同时作为initiating UserMessage append前的process-local admission/cancel identity。公开Cancel target使用`Submit(CommandId) | Turn(TurnId)`；同一Runtime内duplicate in-flight Submit加入原completion，Turn创建后长期execution identity切换为TurnId。CommandId不写入SessionStorage，restart后不可恢复或重放。
+_避免_：独立SubmissionId、领域TurnId、crash-safe queue identity
 
 **运行标识（`RunId`，pre-refactor protocol term）**：
-旧Runtime protocol用于标识一次公开Agent run。目标Runtime protocol不定义RunId；公开执行identity是SessionId+TurnId，Starting admission使用SubmissionId，内部operation使用execution_version和OperationType。
+旧Runtime protocol用于标识一次公开Agent run。目标Runtime protocol不定义RunId；公开执行identity是SessionId+TurnId，Starting admission使用Submit的CommandId，内部operation使用execution_version和OperationType。
 _避免_：公开RunId、host-global Run索引、用RunId替代TurnId
 
 **待执行会话动作（`PendingSessionAction`）**：

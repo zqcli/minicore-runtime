@@ -909,7 +909,7 @@ StaleProjection
 - initiating/terminal append outcome unknown；
 - reconnect resend vs original response acknowledgement。
 
-全部race由per-session SessionExecutor、expected TurnId和in-run idempotency（resolution/submission dedup）线性化。
+全部race由per-session SessionExecutor、expected TurnId和in-run idempotency（resolution key / Submit CommandId dedup）线性化。
 
 ## 被否决的方案
 

@@ -753,7 +753,7 @@ Loaded
 → reject pending TurnAdmission requests
 → clear queued Steer/FollowUp并完成其typed outcome
 → grace期内允许active admission/Turn自然完成，继续处理Interaction resolution和truthful Tool outcome
-→ deadline到期仍未Idle：fail-closed resolve Pending Interaction并Cancel active submission/Turn
+→ deadline到期仍未Idle：fail-closed resolve Pending Interaction并Cancel active pre-Turn Submit或Turn
 → terminal append / writer flush完成
 → Unloading
 → drop resolved Workspace state

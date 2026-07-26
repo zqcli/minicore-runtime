@@ -249,7 +249,7 @@ Context 的 fingerprint 和 diagnostics 也保持内部值，只有 storage、di
 capture 必须从 Session execution 的一个原子 admission basis 取得：
 
 ```text
-stable submission/idempotency key
+Submit `CommandId` from the CommandRequest envelope
 candidate TurnId
 SessionId + exact SessionDefinitionRevision
 SessionDefinition.agent = exact AgentRevisionRef
@@ -262,7 +262,7 @@ SessionDefinitionRevision保证AgentRevisionRef、Workspace、SessionModelConfig
 
 presentation 层的前台/后台（用户当前查看哪个 Session）不是 capture 输入，也不进 model resolution、tool for_turn 或 `ExecutionContextFingerprint`；runtime 对所有 loaded Session 一视同仁，共享 Model/Tool 资源由明确配额和 canonical resource lock 协调。若将来出现「后台自主 Turn 必须自动处理审批」这类需求，应建成 tool execution 路径上一个窄的、不进 fingerprint 的 approval disposition，而不是回到 capture 层的前后台标记。
 
-`candidate TurnId` 只表示已预留的 execution identity。stable submission/idempotency key 由外层 admission reservation 持有，仅作为**活跃 run 内**的去重幂等标识（防止重复 Submit），不进入 TurnExecutionContext 或其 fingerprint。它**不承诺跨崩溃 durable 重建**：OutcomeUnknown 不再靠它 reopen 或 replay-by-key，恢复统一读 committed prefix 加状态检查。capture 成功不代表领域 Turn 已经创建。
+`candidate TurnId`只表示已预留的execution identity。Submit `CommandId`由外层admission reservation持有，仅用于当前Runtime内定位同一in-flight Submit、合并重复请求和精确Cancel；它不是额外submission key，不进入TurnExecutionContext或fingerprint，也不承诺跨崩溃恢复。OutcomeUnknown不靠它reopen或replay-by-key，恢复统一读committed prefix加状态检查。capture成功不代表领域Turn已经创建。
 
 ## Capture 依赖图
 
@@ -340,7 +340,7 @@ SessionLifecycle = Open
 + SessionLoadState = Loaded
 + SessionReadiness = Ready
 + SessionExecutionState = Idle
-→ reserve admission slot + stable submission/idempotency key + candidate TurnId
+→ reserve admission slot + Submit CommandId + candidate TurnId
 → SessionExecutionState = Starting
 → capture current exact SessionDefinitionRevision
 → check AgentStatus = Enabled and read exact AgentRevisionRef
