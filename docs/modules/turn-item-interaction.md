@@ -542,8 +542,12 @@ EntryId
 - ToolCallId 必须按 provider contract 原样回显；
 - Interaction 归属于 ItemId，不归属于裸 ToolCallId；
 - 一个 ToolInvocation Item 可以对应多条 operational/conversation entries；
-- Turn Item ordering由selected parent path上的entry sequence提供，不在Item内保存可变ordinal；
-- 并发 Tool 执行可以乱序结束，但 complete ToolRound 按原始 call order 投影。
+- Turn Item ordering由selected parent path上的entry sequence和同一assistant entry的canonical content顺序提供；
+- public Snapshot/Query中的有序`Vec<ItemView>`与new-Item StateEvent发送顺序就是排序契约，不在Item内保存`DisplaySequence`、ordinal或其他order token；
+- finalized assistant entry必须在Tool执行前append/apply并按call order创建Started ToolInvocation；exact ToolResult只在outcome确定后durable更新对应Item，因此不能把整个ToolInvocation推迟到Completed时才首次写入；
+- 并发Tool可以乱序结束，UI按ItemId更新原位置；ToolInvocation展示顺序和complete ToolRound始终保持原始call order；
+- streaming progress的first-seen顺序只属于provisional presentation，不能改变committed Item order；
+- fork remap identity但保留selected path上的相对Turn/Item顺序。
 
 ## Interaction
 
@@ -1019,7 +1023,9 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - Completed invocation 必须有 matching ToolResult；
 - Abandoned invocation 不允许 ToolResult；
 - ItemId 与 ToolCallId 独立；
-- parallel Tool completion后按source call order append tool messages和completion references；
+- parallel Tool逆序完成时，UI状态按ItemId原位更新，durable Item与ToolRound仍保持source call order；
+- ItemId/EntryId/ToolCallId/timestamp/completion time都不作为display sort key；
+- Snapshot与turn-scoped ListItems返回相同canonical Item order；
 - incomplete ToolRound 不进入 conversation；
 - message/reasoning started、delta与completed使用稳定ItemId；
 - started或全部delta丢失仍可由item_completed final view恢复；

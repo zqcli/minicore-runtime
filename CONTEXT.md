@@ -55,11 +55,11 @@ Runtime scope的完整恢复读模型，包含Runtime信息、Agent summary、lo
 _避免_：SessionSnapshot、UI store、Session index、JSONL、全局事件水位
 
 **SessionSnapshot**：
-一个loaded Session的完整恢复读模型，通过对应SessionExecutionHandle的immutable published view取得，包含lifecycle、definition summary、readiness、current Turn、active Items、Pending Interaction、queues和usage。完整历史通过Query分页读取。
+一个loaded Session的live observer baseline，通过对应SessionExecutionHandle的immutable published view取得，包含lifecycle、definition summary、readiness、current Turn、按selected path entry顺序与assistant Reasoning/Text/ToolCall content顺序排列的active Items、Pending Interaction、queues和usage。它不是durable execution checkpoint；process restart先从JSONL replay并保守关闭unfinished Turn。长期Turn历史通过Query按需读取。
 _避免_：RuntimeSnapshot、完整JSONL replay、durable storage snapshot
 
 **Snapshot-first subscription**：
-Runtime或单个Session的实时观察方式。owner原子完成subscriber注册和初始Snapshot capture，EventStream第一帧返回Snapshot，随后只发送实时事件；断线、背压或restart后重新订阅并获取新Snapshot，不提供公开cursor或事件重放。
+Runtime或单个Session的实时观察方式。owner原子完成subscriber注册和初始Snapshot capture，EventStream第一帧返回Snapshot，随后只发送实时事件；断线或背压后重新订阅并获取新Snapshot，不提供公开cursor或事件重放。process restart则先完成JSONL replay/conservative recovery，再建立新的snapshot-first stream。
 _避免_：先snapshot再subscribe的非原子组合、durable observer log、跨restart offset
 
 **运行时共享模块**：

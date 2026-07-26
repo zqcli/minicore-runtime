@@ -149,7 +149,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~`CommandId`与`SubmissionId`双correlation id~~：**已关闭**。删除独立`SubmissionId`；Submit envelope的随机、不可复用`CommandId`同时作为Turn创建前的process-local admission/cancel target。duplicate in-flight Submit加入原completion；CommandId不持久化，restart后不重放，Turn创建后使用`TurnId`。
 - ~~StateEvent混载durable-derived与process-local状态的可靠性范围不清~~：**已关闭**。StateEvent本身统一为非durable observer record；committed-derived与readiness/queue/phase都只在当前subscription lifetime内按序交付。restart后前者从projection重建，未append Steer/FollowUp和旧phase可以消失，host以新Snapshot为准。
 - ~~message/reasoning Item只有`item_completed`，流式临时view和ItemId语义不清~~：**已关闭**。SessionExecutor只为AgentRun维护process-local `StreamingItem`；message/reasoning在首个streamed content update分配稳定ItemId，started与delta走ProgressEvent，provider final生成`FinalItemCandidate`，append/apply后才发布同ItemId的`item_completed` StateEvent。Host漏掉started时可由首个delta构造临时view；logical retry清理上一operation的临时view，Turn terminal或新Snapshot提供最终校正。
-- Turn/Item公开排序键未定义（`ItemId`无序、`EntryId`不作UI输入）→ 定义scope-local opaque display sequence作为UI order token；它只负责当前read model排序，不承担event replay cursor。
+- ~~Turn/Item公开排序键未定义~~：**已关闭**。不增加DisplaySequence。Turn/Item顺序由selected history path、assistant content/call顺序、Snapshot/Query ordered Vec和new-Item StateEvent顺序表达；并发Tool逆序完成只按ItemId更新原位置。Snapshot是live observer baseline，restart从JSONL replay/conservative recovery开始；MVP只为长期Session/Turn历史和大型catalog分页。
 - Runtime scope 与 Session scope 无跨流顺序保证 → 给 host 一句 reducer 指引（两 scope 皆可作为 Session 首次出现来源）。
 - 公开 history 读模型 vs 模型可见 conversation 是同一 storage 两投影（durable 但未 `tool_round_completed` 的 tool entry 对 UI 可见、对模型不可见）→ 点明为有意投影差异，避免误判一致性 bug。
 - Agent→Session 是 reference-grouping 而非 containment（删 Agent 不级联、history 仍可读）→ ADR 0100 一句话点明。
@@ -251,3 +251,5 @@ StateEvent可靠性后续决议：不增加durability enum或第二event通道�
 Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套存储。SessionExecutor只为AgentRun维护`StreamingItem`累积buffer和未提交`FinalItemCandidate`；正式Item只由append/apply后的projection产生。AgentMessage/Reasoning的started/delta属于ProgressEvent。ToolInvocation Started仍由assistant/intermediate tool_call entry append/apply后的projection派生committed-derived StateEvent；后续`ToolExecutionStarted`只表示真实副作用边界。
 
 Interaction等待后续决议：MVP不把用户沉默解释为领域事件，删除通用`expires_at`、`Expired`和Interaction timeout调度。Pending只由typed host resolution或显式生命周期动作关闭；disconnect和无subscriber保持Pending，Unload grace deadline仍独立生效。
+
+Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或segment entity。Assistant finalized entry在Tool执行前durable创建call/content有序Items；Tool异步完成只更新对应ItemId的原位置。Snapshot/Query ordered Vec和new-Item StateEvent创建顺序是公开排序契约，progress顺序只属于provisional presentation。

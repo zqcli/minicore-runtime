@@ -345,6 +345,7 @@ SkillView.prompt_view()
 - Tool approval 与 UserQuestion 归属于 parent Item；
 - UserQuestion由MiniCore producer seam发起，Presentation Adapter只负责presentation与resolution；
 - pending Interaction reconnect/resend 和 abrupt transport loss；
+- Turn/Item顺序由selected path、assistant content/call顺序和public ordered Vec表达，不增加DisplaySequence；
 - `TurnStatus = Running | Completed | Interrupted | Failed` 与 typed terminal detail；
 - WaitingApproval、WaitingForUserInput、Steer、terminal cleanup 和 conservative recovery。
 
@@ -355,6 +356,7 @@ SkillView.prompt_view()
 - [x] ToolCall、ToolResult 和 approval 使用同一个 ToolInvocation Item identity；
 - [x] terminal Turn 不保留 Pending Interaction 或 Started Item；
 - [x] AgentMessage/Reasoning started与delta使用稳定ItemId和process-local `StreamingItem`，只有append/apply后才产生Completed Item；
+- [x] Snapshot/Query ordered Vec与new-Item StateEvent创建顺序稳定表达Turn/Item展示顺序，Tool逆序完成只原位更新；
 - [x] 不引入 ItemManager、InteractionService、ModelStep 或 ToolRound entity。
 
 ### 阶段 5：Conversation 与 SessionStorage

@@ -651,8 +651,9 @@ AgentLoop NeedModel
 → AgentRun后续delta更新同一StreamingItem并使用同一ItemId发布ProgressEvent
 → OperationResult返回并校验SessionId/TurnId/execution_version/OperationType
    ├─ AgentRun Model：finalized text/reasoning生成FinalItemCandidate → AgentLoop.accept_model_response → NeedTools或candidate Finished
-   │  → Assistant entry append/apply后发布message/reasoning item_completed并清理StreamingItem
-   │  → finalized ToolCall由同一entry产生Started ToolInvocation projection
+   │  → Assistant entry append/apply
+   │  → 按finalized content顺序一次投影/publish：Reasoning/AgentMessage Completed、ToolInvocation Started
+   │  → 清理matching StreamingItem
    └─ CompactionSummary：不创建StreamingItem/ItemId → revalidate → append/apply Replace → rebuild AgentLoop → reassemble
 ```
 
@@ -667,7 +668,7 @@ AgentLoop NeedModel
 - `StreamingItem`只属于当前AgentRun `GenerateModelResponse` operation，按provider-neutral `content_index`关联，不进入CompactionSummary、CurrentTurnExecution、TurnExecutionContext、SessionStorage或Snapshot authoritative view；
 - message/reasoning在首个streamed content update分配稳定ItemId，started与delta通过ProgressEventPublisher发布；
 - partial response和StreamingItem都不是AgentMessage/Reasoning Item；
-- provider terminal success只生成FinalItemCandidate；从未产生progress的final content在normalization时分配ItemId，candidate成功append/apply后projection才产生Completed Item并发布`item_completed`；
+- provider terminal success只生成FinalItemCandidate；从未产生progress的final content在normalization时分配ItemId。candidate成功append/apply后，Reasoning/AgentMessage成为Completed Item，ToolCall成为Started ToolInvocation；同一assistant entry的new-Item StateEvent严格按finalized Reasoning/Text/ToolCall content顺序发布；
 - terminal error、Cancel或validation failure直接丢弃StreamingItem，不发布synthetic completed；
 - Model result只有在AgentLoop返回NeedTools或Finished后才决定对应entry类型；
 - NeedTools保存含ToolCall的Assistant(Intermediate)并完成整个ToolRound；不因queued Steer丢弃已完成model step；
@@ -731,8 +732,8 @@ ToolExecutionOutcome[]
 规则：
 
 - Assistant(Intermediate)一旦append/apply，当前Tool round必须先得到Completed或Interrupted处理；此后到达的Steer只能排队，不能插入assistant/tool sequence；
-- ToolSet按source call order返回outcomes；
-- Tool内部允许并发无冲突调用；
+- ToolSet按source call order返回outcomes，Tool内部允许并发无冲突调用；先完成的Tool可以先通过process-local progress更新UI activity，但ToolInvocation的authoritative Completed只在matching Tool message append/apply后成立；
+- Tool terminal状态按ItemId更新assistant ToolCall创建的原位置，不按完成时间移动Item；
 - Tool message append OutcomeUnknown时poison writer并保守终结，不在本run重试该append，也不重新执行Tool；该unacked tool message可能丢失，恢复时该round不完整按Abandon处理，由模型重跑工具；
 - exact ToolResult必须保存，即使Cancel已经发生；
 - outcome unknown不能生成Tool message；
@@ -1105,7 +1106,7 @@ Executor在每次state/projection变更后发布新的immutable `SessionExecutio
 Session lifecycle/readiness
 SessionExecutionState
 current TurnId/TurnStatus/phase
-committed Items
+committed Items（selected path + assistant content canonical order）
 Pending Interactions
 pending Submit / queued Steer / FollowUp count
 accepting_input / lifecycle stopping state
@@ -1122,7 +1123,7 @@ Snapshot不包含：
 - mutable references；
 - streaming partial buffer作为authoritative content。
 
-Snapshot不进入mutation/control lane，也不声称与跨lane请求形成全局FIFO。多个并发snapshot请求可以latest-wins/coalesce，但每个caller都必须得到一个不早于其注册时已published版本的view或typed unavailable error。subscription背压、disconnect或restart后不重放旧事件；host重新subscribe并从新Snapshot恢复。
+Snapshot不进入mutation/control lane，也不声称与跨lane请求形成全局FIFO。多个并发snapshot请求可以latest-wins/coalesce，但每个caller都必须得到一个不早于其注册时已published版本的view或typed unavailable error。它是live observer baseline，不是durable execution checkpoint。subscription背压或disconnect后不重放旧事件；host重新subscribe并从新Snapshot恢复。Runtime process restart先replay JSONL并conservative terminalize unfinished Turn，随后Snapshot只反映Idle/Ready/Unavailable等恢复结果。
 
 ## Progress Event
 
@@ -1141,7 +1142,7 @@ phase change notification
 规则：
 
 - 使用独立bounded queue；
-- started、delta和append/apply后的completed使用同一ItemId；Host漏掉started时可由首个delta创建临时view；
+- started、delta和append/apply后的completed使用同一ItemId；Host漏掉started时可由首个delta创建临时view；跨Item progress first-seen顺序仅用于provisional presentation，不是durable Item order；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
 - queue满时允许丢弃中间progress；StateEvent通道无法继续时关闭subscription，由新Snapshot恢复，不把final event称为durable log；
 - committed-derived final StateEvent从append/apply后的entry生成，包含完整final view；process-local final view由当前Executor snapshot校正；
@@ -1363,13 +1364,14 @@ MVP性能要求：
 - Presentation Adapter只消费UI-safe Interaction view并通过Runtime facade Resolve，不能直接写Interaction或持有waiter；
 - WaitingForUserInput期间同Session不启动sibling副作用ToolCall，其他Session仍可运行；
 - 长时间无回答保持Pending，不产生默认Deny；
-- message/reasoning streaming start分配稳定ItemId，started/delta/completed identity一致；
+- message/reasoning streaming start分配稳定ItemId，started/delta/completed identity一致；progress first-seen顺序不作为committed Item order；
 - 丢失started或delta仍可由item_completed完整final view恢复；
 - append失败不产生item_completed，Cancel/failure丢弃StreamingItem；logical retry通知Host清除上一operation临时view；
 - item_completed或Turn terminal之后迟到的started/delta被Host忽略；
 - CompactionSummary progress不创建StreamingItem、ItemId或item_completed；
-- parallel ToolCall按source order保存results；
-- 每个ToolResult独立append；
+- parallel ToolCall按source call order投影和展示，逆序完成只按ItemId更新原位置；
+- 每个ToolResult独立append，物理result entry位置和Tool completion time都不作为Item sort key；
+- active Items/Snapshot/turn-scoped ListItems使用同一canonical顺序，不公开DisplaySequence或ordinal；
 - partial results不进入conversation；
 - tool_round_completed后完整round一次进入conversation；
 - revocation在tool messages后、tool_round_completed前到达时不把round加入conversation；
