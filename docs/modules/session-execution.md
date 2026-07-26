@@ -1143,8 +1143,8 @@ phase change notification
 
 - 使用独立bounded queue；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
-- queue满时允许丢弃中间progress，但不能丢失durable final event；
-- final event从append/apply后的entry生成，包含完整final snapshot；
+- queue满时允许丢弃中间progress；StateEvent通道无法继续时关闭subscription，由新Snapshot恢复，不把final event称为durable log；
+- committed-derived final StateEvent从append/apply后的entry生成，包含完整final view；process-local final view由当前Executor snapshot校正；
 - progress publisher失败不影响SessionStorage或Turn terminal；
 - 状态变化进入per-session StateEvent；ProgressEvent可以合并/丢弃。subscription背压或disconnect时关闭stream并重新snapshot，完整规则见[Runtime Interface](runtime-interface.md)。
 
