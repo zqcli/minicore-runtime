@@ -48,7 +48,7 @@
 - Command 修改事实或启动工作；Query 只读；Snapshot 恢复当前读模型；Event 通知状态变化和进度；
 - 公开领域 identity 使用 `AgentId → SessionId → TurnId → ItemId → RequestId`；
 - 不定义公开 `RunId` 或 `WorkspaceId`；
-- `CommandId` 只做协议命令 correlation和幂等，不是领域 entity；Starting admission控制使用process-local `SubmissionId`；
+- `CommandId`用于协议命令correlation和in-flight去重；对Submit，它同时作为Turn创建前的process-local admission/cancel target，不是领域entity；
 - Command response 在对应 command 的明确线性化点返回 typed outcome，不使用只有 `accepted: bool` 的通用 acknowledgement；
 - Turn 的长期完成、Item 生命周期和 Interaction request/resolution通过 Event 发布；
 - `StateEvent`与可合并/丢弃的`ProgressEvent`分离；
@@ -161,8 +161,7 @@ MiniCoreRuntime
 - `SessionDefinitionRevision`：future Turn definition的原子revision；
 - `ToolCallId`：provider/tool protocol correlation，不替代ItemId；
 - `EntryId`：SessionStorage identity，默认不作为普通UI mutation input；
-- `CommandId`：public command correlation和幂等identity；
-- `SubmissionId`：Submit在领域Turn创建前的process-local admission control identity；
+- `CommandId`：public command correlation和in-flight dedup identity；Submit的CommandId同时标识领域Turn创建前的process-local admission candidate；
 
 不公开：
 
@@ -218,7 +217,7 @@ pub struct CommandRequest {
 }
 ```
 
-`CommandId`由调用adapter在dispatch前生成。相同CommandId与相同normalized payload重试必须幂等；相同CommandId携带不同payload返回`CommandConflict`。每个Command使用语义明确的expected revision、expected status或expected TurnId表达乐观并发。
+`CommandId`由调用adapter在dispatch前生成，必须使用不可预测随机值且不得复用于另一条命令。当前Runtime内原命令仍in-flight时，相同`CommandId + exact typed command`重试加入同一completion；同一in-flight CommandId携带不同command返回`CommandConflict`。CommandId不持久化，restart后旧命令不能靠它重放或恢复；调用方改用Snapshot/Query确认durable结果，并为新命令生成新ID。每个Command使用语义明确的expected revision、expected status或expected TurnId表达乐观并发。
 
 ### RuntimeCommand
 
@@ -356,7 +355,6 @@ Runtime把公开anchor解析为合法storage path end：
 pub enum TurnCommand {
     Submit {
         session_id: SessionId,
-        submission_id: SubmissionId,
         intent: PromptIntentInput,
     },
     Steer {
@@ -380,7 +378,7 @@ pub enum TurnCommand {
 }
 
 pub enum PublicCancelTarget {
-    Submission(SubmissionId),
+    Submit(CommandId),
     Turn(TurnId),
 }
 ```
@@ -391,7 +389,7 @@ pub enum PublicCancelTarget {
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
-- `Cancel(SubmissionId)`允许取消尚处于Starting admission的Submit；
+- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Turn创建后调用方使用`TurnId`取消；
 - `Cancel(TurnId)`通过per-session target-scoped sticky `EmergencyControl`校验active Turn generation后触发其operation cancellation，不等待普通work lane；stale target不影响新Turn，response在terminal cleanup完成后返回；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
@@ -526,7 +524,7 @@ Command response不是完整业务完成流：
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved append/apply |
-| Cancel Submission | Starting candidate取消完成，且不会创建领域Turn |
+| Cancel Submit(CommandId) | queued admission remove或Starting candidate取消完成，且不会创建领域Turn |
 | Cancel Turn | Turn terminal append/apply与cleanup完成 |
 | Fork Session | target staging验证完成并原子发布 |
 
@@ -1368,7 +1366,9 @@ Public interface是 contract test surface。
 
 - Agent/Session revision CAS；
 - Submit只在UserMessage append/apply后返回TurnStarted；
-- Cancel(SubmissionId)关闭Starting admission；
+- duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
+- 相同CommandId携带不同command返回CommandConflict；
+- Cancel(Submit CommandId)关闭排队或Starting admission，target退休或restart后返回NotFound且不影响future Turn；
 - Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；

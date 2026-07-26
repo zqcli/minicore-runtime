@@ -32,7 +32,7 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 
 ### Emergency 与 Tool side effect
 
-`Cancel`先原子校验`CancelTarget + target generation`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId/SubmissionId不得取消当前或下一Turn；目标terminal后signal retire，新Turn使用新的generation和token。Executor在启动新Model、取得或继续Tool资源、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
+`Cancel`先原子校验`CancelTarget + target generation`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn使用新的generation和token。Executor在启动新Model、取得或继续Tool资源、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
 
 `SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的target generation、emergency epoch、Steer admission gate和controlled append reservation：
 
@@ -66,7 +66,7 @@ Cancel current Turn时：
 
 ### Lifecycle 与 Snapshot
 
-`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后对Pending Interaction fail closed并取消active submission/Turn，完成truthful Tool settlement和terminal append后卸载。Unload不能因host消失或无Interaction deadline而永久悬挂。
+`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后对Pending Interaction fail closed并取消active pre-Turn Submit或Turn，完成truthful Tool settlement和terminal append后卸载。Unload不能因host消失或无Interaction deadline而永久悬挂。
 
 `GetSnapshot`不进入mutation/control queue。Executor持续发布immutable view，Snapshot mailbox返回latest完整view。用于持续观察时，subscriber注册与初始Snapshot capture在同一publication synchronization内原子完成，之后只发送实时事件。Snapshot与不同lane之间不宣称全局FIFO。
 
