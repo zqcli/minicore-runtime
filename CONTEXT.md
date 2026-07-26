@@ -351,12 +351,12 @@ SessionExecutor在Turn admission期间构造的不可变execution binding，固�
 _避免_：模型request、ResourceManager current view、公开协议snapshot、mutable Turn state
 
 **DriverTurnInput（pre-refactor adapter term）**：
-旧Driver设计使用的窄输入。当前SessionExecutor直接从TurnExecutionContext和CommittedConversationView构造PromptAssemblyInput；private AgentLoop adapter只接收其逻辑所需值。Rig spike可以保留private adapter value，但不能成为Session execution owner。
+旧Driver设计使用的窄输入。当前SessionExecutor直接从TurnExecutionContext和CommittedConversationView构造PromptAssemblyInput；自研AgentLoop只接收其逻辑所需值（ADR 0115），不存在SDK adapter value。
 _避免_：公开Runtime request、TurnExecutionContext替代品、ModelCallRequest
 
-**Driver（AgentLoop 适配器）**：
-Turn execution内部的private协议适配层，负责在`NeedModel | NeedTools | Finished`之间推进底层SDK/Rig状态，并把稳定模型输出交回Session execution。它不拥有SessionWriter、conversation projection、Prompt assembly、Tool execution或terminal arbitration；Steer rollover是private adapter行为，不改变领域TurnId。
-_避免_：会话状态owner、工具注册表、UI loop、第二conversation
+**AgentLoop（自研协议状态机）**：
+Turn execution内部的crate-private sans-I/O同步状态机（ADR 0115），在`NeedModel | NeedTools | Finished`之间推进并把稳定模型输出交回Session execution；不由Rig或其他SDK驱动。它不拥有SessionWriter、conversation projection、Prompt assembly、Tool execution或terminal arbitration；Steer由`accept_committed_steer`原地推进或等价重建segment，Compaction Replace后必须重建segment。旧称「Driver（AgentLoop适配器）」随ADR 0115废弃。
+_避免_：SDK loop适配层、Driver、会话状态owner、工具注册表、UI loop、第二conversation
 
 **异步操作结果（`OperationResult`）**：
 current Context、Model、Tool或Compaction operation返回给SessionExecutor的typed result，携带`SessionId`、`TurnId`、`execution_version`和`OperationType`。SessionExecutor不detach可迟到的本地future；logical retry只在旧operation terminal/remove后启动。execution_version验证conversation/control basis，不充当retry attempt编号。

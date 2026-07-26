@@ -30,7 +30,7 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 - `SessionExecutor`、`SessionIngress`语义lane和异步operation的完整实现；这些以[Session Execution架构设计](session-execution.md)为权威；
 - Runtime command、event和transport protocol；
 - ModelGateway private Rig/provider adapter的实现细节；
-- AgentLoop使用Rig、自研状态机或其他SDK的private adapter实现。
+- 自研AgentLoop状态机的内部实现细节；其自研决策见[ADR 0115](../adr/0115-agent-loop-is-first-party-state-machine.md)。
 
 ## 决策摘要
 
@@ -110,11 +110,10 @@ committed conversation seed
 
 AgentLoop 不拥有 Turn admission、SessionStorage、Workspace、Prompt source、Tool permission、approval、Sandbox、Steer queue 或 terminal append。
 
-一个 Turn execution 可以包含多个 AgentLoop segment。例如：
+一个 Turn execution 可以包含多个 AgentLoop segment：
 
-- compaction entry append/apply 后从新的 committed conversation seed 重新建立 segment；
-- AgentLoop adapter 不支持原地注入 Steer 时，在同一 TurnContext 下重新建立 segment；
-- provider 或 SDK rollover 要求重新建立内部 run state。
+- compaction entry append/apply 后必须从新的 committed conversation seed 重新建立 segment；
+- Steer 默认由 `accept_committed_steer` 原地推进；实现也可以选择等价地重建 segment（ADR 0115）。
 
 segment 重建不创建新 Turn，也不重新捕获 TurnExecutionContext。
 
@@ -465,7 +464,7 @@ NeedTools { calls }
 Finished { message draft }
 ```
 
-具体 Rig/SDK adapter 可以使用自身最自然的 async stream、poll、callback 或 state enum 表达这些动作。不冻结 `AgentLoopFactory`、`AgentRun` 或 `AgentLoopAction` trait/enum；只有出现第二个真实 AgentLoop implementation 时才建立稳定 seam。
+AgentLoop 是自研的同步协议状态机（ADR 0115），以直接方法调用表达这些动作，不由 Rig 或其他 SDK 驱动。不冻结 `AgentLoopFactory`、`AgentRun` 或 public `AgentLoopAction` trait/enum；只有出现第二个真实 AgentLoop implementation 时才建立稳定 seam。
 
 NeedModel只表示普通`AgentRun`需要模型输出；CompactionSummary由SessionExecutor在AgentLoop之外启动，AgentLoop不能选择ModelCallPurpose。`Finished`只表示candidate final：Steer FIFO为空时保存为Assistant Final；FIFO非空时保存为Assistant Continue并重建AgentLoop segment。
 
@@ -911,7 +910,7 @@ Context drop 不 unregister Runtime-global Tool、不清空共享 content cache�
 - private AgentLoop只返回NeedModel、NeedTools或Finished；
 - FollowUp使用bounded process-local FIFO；
 - progress通过独立`ProgressEventPublisher`发布；
-- Rig只有在必须使用monolithic async run时才增加private adapter task。
+- AgentLoop是自研同步状态机，由主循环直接调用，不存在monolithic adapter task（ADR 0115）。
 
 普通Submit在Starting/Running/Finishing时返回SessionBusy；FollowUp在active Turn terminal后重新进入普通admission，不属于current Turn control。
 
@@ -1071,8 +1070,8 @@ AgentLoop registry
 
 ## 后续问题
 
-1. AgentLoop 与 Rig 0.40.0 的具体 sans-I/O adapter 形状。
-2. Rig 0.40.0对TurnModelSnapshot、finish reason、reasoning和provider retry的private adapter映射。
+1. ~~AgentLoop 与 Rig 0.40.0 的具体 sans-I/O adapter 形状~~（已由 ADR 0115 关闭：AgentLoop 自研，Rig 不参与 loop）。
+2. Rig 0.40.0对TurnModelSnapshot、finish reason、reasoning和provider retry的ModelGateway private adapter映射。
 3. Tool executor implementation identity/version 的注册和 recovery 规则。
 4. PromptResourceView、SkillView和ToolSet fingerprint/reference的最终持久化细节。
 5. Runtime pending Interaction公开query/event payload。
