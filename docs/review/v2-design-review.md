@@ -136,9 +136,9 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 ### 类型 / 命名一致性（低成本）
 
 - ~~`ProviderCapabilities`（`tools.md`）vs `ModelCapabilities`命名不一致~~：**已关闭**。删除未定义的`ProviderCapabilities`；`ToolTurnContext.tool_calling`直接接收selected model现有的`ToolCallingCapabilities`，不传完整`ModelCapabilities`，也不增加新projection类型。
-- `CurrentTurnExecution.model_attempt: ModelAttemptState` 与「不建立 ModelAttempt entity」措辞易误读 → 改名如 `CurrentModelCallState`。
-- `AgentLoop::accept_committed_tool_round(round: CommittedToolRound)` 引用了 `conversation-storage.md` 未定义的 `CommittedToolRound` → 补定义或改用现有 delta 类型。
-- `TurnExecutionPhase::Committing` 列出但驱动路径不明 → 补进入/退出点或说明为纯 observer projection。
+- ~~`CurrentTurnExecution.model_attempt: ModelAttemptState`与“不建立ModelAttempt entity”矛盾~~：**已关闭**。删除该字段；`current_operation: Option<RunningOperation>`是当前逻辑模型工作的唯一execution-local状态，provider attempt和transparent retry留在ModelGateway内部。
+- ~~`AgentLoop::accept_committed_tool_round(round: CommittedToolRound)`引用未定义类型~~：**已关闭**。不新增ToolRound表示；方法直接接收`tool_round_completed`成功append/apply后由SessionStorage生成的trusted `CommittedConversationDelta`。
+- ~~`TurnExecutionPhase::Committing`无驱动路径~~：**已关闭**。删除该variant；append/apply保持在当前业务phase内，terminal写入使用`SessionExecutionState::Finishing`，写入延迟通过ProgressEvent/diagnostics观察。
 - ~~`PromptMergeMode::Append`引用未定义priority~~：已随B1关闭，当前使用固定层级和stable identity顺序，不增加priority字段。
 
 ### 协议 / 事件语义标注（点明即可）

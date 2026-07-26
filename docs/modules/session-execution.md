@@ -330,7 +330,6 @@ pub(crate) struct CurrentTurnExecution {
     agent_loop: AgentLoop,
     phase: TurnExecutionPhase,
     cancellation: CancellationToken,
-    model_attempt: Option<ModelAttemptState>,
     tool_execution: Option<ToolExecutionState>,
     compaction: Option<CurrentCompactionState>,
     successful_compactions: u32,
@@ -358,7 +357,7 @@ pub(crate) struct CompactionRecoveryBasis {
 
 ## Running Operation
 
-SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
+SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`，它是当前逻辑Model/Tool/Compaction工作的唯一execution-local状态。provider attempt和transparent retry完全由ModelGateway内部管理，CurrentTurnExecution不保存并列的ModelAttemptState。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
 
 新operation只能在旧operation满足以下任一条件后启动：
 
@@ -503,7 +502,7 @@ impl AgentLoop {
 
     pub(crate) fn accept_committed_tool_round(
         &mut self,
-        round: CommittedToolRound,
+        change: CommittedConversationDelta,
     ) -> Result<(), AgentLoopError>;
 
     pub(crate) fn accept_committed_steer(
@@ -513,7 +512,7 @@ impl AgentLoop {
 }
 ```
 
-`Finished`只表示candidate final。Steer FIFO为空时SessionExecutor保存Assistant(Final)；FIFO非空时保存Assistant(Intermediate Continue)、pop一条Steer并从committed ConversationSeed重建AgentLoop segment。
+`accept_committed_tool_round`的delta只能来自`tool_round_completed`成功append/apply后SessionStorage生成的trusted `CommittedConversationDelta`，不能由execution-local ToolResult自行构造。`Finished`只表示candidate final。Steer FIFO为空时SessionExecutor保存Assistant(Final)；FIFO非空时保存Assistant(Intermediate Continue)、pop一条Steer并从committed ConversationSeed重建AgentLoop segment。
 
 AgentLoop可以使用Rig或其他SDK作为private adapter，但不得：
 

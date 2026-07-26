@@ -615,11 +615,10 @@ pub enum TurnExecutionPhase {
     WaitingApproval,
     WaitingForUserInput,
     ExecutingTools,
-    Committing,
 }
 ```
 
-这些phase不进入Turn durable status。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
+这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
 
 ### Waiting Approval
 
