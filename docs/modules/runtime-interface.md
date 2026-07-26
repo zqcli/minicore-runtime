@@ -385,7 +385,7 @@ pub enum PublicCancelTarget {
 
 语义：
 
-- `Submit`只在Session可以admit新Turn时使用；initiating UserMessage append/apply后返回`TurnStarted`；
+- `Submit`只在Session可以admit新Turn（Idle admission decision）时使用；Session非Idle时返回`SessionBusy`，不排队跨Turn等待；Turn Running期间的用户输入应由adapter路由为`Steer`（交互式默认）或`FollowUp`；initiating UserMessage append/apply后返回`TurnStarted`；
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
@@ -455,6 +455,8 @@ pub enum CommandPromptDelivery {
 ```
 
 `delivery`只对产生PromptIntent的command生效。`/status`、`/help`、`/model`等command忽略该字段。
+
+`delivery = None`时默认解析为`Submit`。交互式UI应按观察到的Session状态路由：Turn Running时默认`Steer { expected_turn_id }`，用户显式选择"排到下一轮"时使用`FollowUp`。Steer因Turn terminal返回typed stale/terminal outcome时，adapter把同一输入改发为`Submit`（开启新Turn）或提示用户；Submit因竞态返回`SessionBusy`时，adapter按新Snapshot重新路由。运行中输入的解释属于adapter层，Runtime不把Submit静默转换为Steer。
 
 ### Command Response
 
@@ -847,7 +849,7 @@ pub struct SessionQueueView {
 
 长期Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的committed Items，并按selected path entry顺序与assistant Reasoning/Text/ToolCall content顺序排列。它不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
 
-`SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。
+`SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。`pending_submit_count`是尚未被仲裁的admission信箱瞬时计数（正常为0），不表示存在跨Turn排队的Submit通道。
 
 ### Snapshot Consistency
 
