@@ -426,7 +426,7 @@ pub enum AssistantContent {
 
 规则：
 
-- content order是模型最终输出的canonical顺序；
+- content order是模型最终输出的canonical顺序，也是该entry创建Reasoning、AgentMessage和ToolInvocation Items的public display顺序；
 - ToolCall name/arguments/index只在assistant entry保存一次；
 - 每个ToolCall block创建一个ToolInvocation Item的Started projection；
 - 同一assistant entry内ToolCallId和ItemId必须唯一；
@@ -515,7 +515,7 @@ Tool message是exact truthful ToolResult的canonical durable source。
 - 必须匹配同一parent path上某个assistant ToolCall block；
 - `PreExecution`用于validation/policy/approval deny/unavailable等没有side effect的结果；
 - `Executed`必须引用同一ItemId/ToolCallId的`tool_execution_started` event；
-- append成功后ToolInvocation Item进入Completed operational state；
+- append成功后ToolInvocation Item进入Completed operational state，但只按ItemId更新assistant ToolCall创建的原位置，不按Tool message物理append时间或完成时间重新排序；
 - Tool message durable不等于model-visible；
 - 只有`tool_round_completed`成功后，该Tool message才进入conversation；
 - outcome unknown不生成Tool message；
@@ -889,7 +889,7 @@ ordered tool_entry_ids
 
 ```text
 Turn projection
-Item projection
+Item projection（selected path entry顺序 + assistant content顺序）
 Interaction projection
 Recovery projection
 Conversation projection
@@ -1317,6 +1317,7 @@ content-addressed DAG
 - SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count、requested max output、summary budget fingerprint和provider metadata round-trip；
 - Prompt永远看不到uncompleted ToolRound。
 - 任意writer接受的合法entry sequence经live apply与cold replay得到相同Turn/Item/Interaction/Conversation/Usage projection fingerprints；
+- replay、live apply和fork remap得到相同的relative Turn/Item order，并且Tool逆序完成不会移动ToolInvocation Item；
 - 注入semantic projector错误时必须在physical append前拒绝，不能生成cold replay才拒绝的committed entry。
 
 ## 设计覆盖范围

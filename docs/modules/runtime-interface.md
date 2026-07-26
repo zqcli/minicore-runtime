@@ -726,7 +726,7 @@ GetSessionReadiness
 GetHistoryTree
 ListTurns
 GetTurn
-ListItems
+ListItems { turn_id }
 GetItem
 ListPendingInteractions
 ```
@@ -742,9 +742,9 @@ pub struct SessionHistoryTreeView {
 }
 ```
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。
+History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。`GetHistoryTree`首版按一个明确`SessionHistoryRevision`返回完整compact branch topology，不内联Turn Item bodies，也不分页；它服务fork/navigation拓扑，不代替聊天timeline读取。
 
-大列表必须分页。Cursor opaque并绑定query family、filter、sort和revision。
+MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
 ### CommandSurfaceQuery
 
@@ -845,7 +845,7 @@ pub struct SessionQueueView {
 }
 ```
 
-完整历史通过Query分页读取。Snapshot只携带恢复当前执行UI所需状态。
+长期Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的committed Items，并按selected path entry顺序与assistant Reasoning/Text/ToolCall content顺序排列。它不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
 
 `SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。
 
@@ -857,7 +857,7 @@ Runtime与每个Session使用独立owner和Snapshot，不存在跨scope可比较
 
 单独调用`snapshot()`只读取调用时的当前view。用于持续观察时，host调用`subscribe(scope)`：owner必须在同一publication synchronization内注册subscriber并捕获初始Snapshot，EventStream第一帧返回该Snapshot，随后只发送该点之后的实时事件。禁止用非原子的“先snapshot再subscribe”或“先subscribe再snapshot”替代。
 
-断线、subscriber背压、Runtime restart或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。
+断线、subscriber背压或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。Runtime process restart时先从JSONL replay并执行conservative recovery，使旧unfinished Turn terminalize并让Session进入Idle/Ready/Unavailable；之后的新Snapshot只反映该恢复结果，不承诺从旧执行现场继续。
 
 ## Event
 
@@ -1009,6 +1009,25 @@ model_attempt_progress
 - progress不写SessionStorage，不成为conversation truth；
 - progress publisher失败不影响Turn执行或terminal。
 
+### Turn And Item Ordering
+
+不公开`DisplaySequence`、ordinal或可排序ID。公开排序由现有有序集合和new-Item StateEvent创建顺序表达：
+
+```text
+Turn order
+→ selected history path上的initiating UserMessage顺序
+
+Item order
+→ selected path entry顺序
+→ 同一assistant entry内的Reasoning/Text/ToolCall content顺序
+```
+
+`ItemId`、`EntryId`、`ToolCallId`、timestamp、Tool completion time和ProgressEvent arrival都不能用于排序。`SessionSnapshot.active_items`和turn-scoped `ListItems`按canonical Item order返回；Host必须保留Vec顺序。
+
+新committed Item的StateEvent按canonical创建顺序发布并追加到durable Item list。ToolInvocation的Completed/Abandoned事件和Tool progress都只按`ItemId`更新原位置，不移动Item；因此Tool B可以先结束并先通过process-local activity显示完成，authoritative terminal view稍后校正，但展示位置始终保持call order A、B。
+
+AgentMessage/Reasoning progress只属于独立provisional view，first-seen顺序没有durable意义。收到matching new-Item committed StateEvent时Host删除provisional view，并按该创建事件顺序加入durable list；Snapshot则整体替换durable list并清空provisional view。未知Item的terminal update或任何需要插入既有durable Item之前的事件表示reducer失步，Host应重新subscribe获取Snapshot而不是猜测顺序。
+
 ### Interaction Event
 
 `interaction_requested`必须携带UI-safe request：
@@ -1062,7 +1081,7 @@ UI不能：
 
 公开能力：
 
-- 分页读取history tree、Turn和Item read model；
+- 读取完整compact history tree以及Turn/Item read model；长期Session的`ListTurns`使用分页，`GetTurn`和turn-scoped `ListItems`首版完整返回；
 - 使用Genesis、UserMessage或FinalAgentMessage anchor创建Fork Session；
 - 查询fork provenance；
 - 在新Session继续future Turn。
@@ -1397,8 +1416,11 @@ Public interface是 contract test surface。
 
 - Query只读且不发布Event；
 - session list不加载SessionExecutor；
+- GetHistoryTree在单一SessionHistoryRevision返回完整compact branch topology，不内联Item bodies且不分页；
 - history tree不暴露internal entry/event；
-- SessionSnapshot读取immutable published view；
+- 长期Session的ListTurns分页可用于首次加载最近历史和向上滚动，cursor绑定sort与revision；
+- GetTurn、turn-scoped ListItems和active_items首版不分页；
+- SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
 - snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
@@ -1415,6 +1437,10 @@ Public interface是 contract test surface。
 - append失败不发布item_completed；logical retry、Turn terminal或新Snapshot清理临时Item view，completed/terminal后忽略迟到progress；
 - logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；
 - final Item event携带完整view；
+- assistant content创建事件按Reasoning/Text/ToolCall顺序发布；
+- parallel Tool逆序完成只更新各自原位置，不改变call order；
+- Snapshot替换有序durable Items并清空provisional Items；
+- Runtime restart从JSONL replay和conservative recovery开始，不把Snapshot当作execution checkpoint；
 - Interaction request-after-append和resolution-before-resume；
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
