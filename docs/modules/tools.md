@@ -442,7 +442,7 @@ ToolService 在 `for_turn()` 内完成：
 → 建立 ToolName → Arc<dyn Tool> routes
 → 提取 Direct ToolSpec
 → 建立 DeferredToolIndex snapshot
-→ 根据 provider 能力生成原生 deferred 投影，或注入 fallback search_tools / invoke_tool specs
+→ 根据selected model的ToolCallingCapabilities生成原生deferred投影，或注入fallback search_tools / invoke_tool specs
 → 计算 ToolSetFingerprint
 → 返回不可变 ToolSet
 ```
@@ -456,14 +456,14 @@ pub struct ToolTurnContext {
     pub session_revision: SessionDefinitionRevision,
     pub turn_id: TurnId,
     pub workspace: WorkspaceToolContext,
-    pub provider: ProviderCapabilities,
+    pub tool_calling: ToolCallingCapabilities,
     execution_control: Arc<dyn ToolExecutionControl>,
     pub cancellation: CancellationToken,
     pub updates: Arc<dyn ToolUpdateSink>,
 }
 ```
 
-ToolTurnContext 是 crate-internal execution input；private `execution_control` 字段只能由 Session execution 注入。它不进入 Agent、Session 或 Turn 的持久领域字段。它必须来自同一个 captured SessionDefinitionRevision，不能按 AgentId/SessionId 回查 mutable current heads；完整规则见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
+ToolTurnContext是crate-internal execution input；private `execution_control`字段只能由Session execution注入。`tool_calling`直接来自本Turn exact `TurnModelSnapshot.capabilities.tool_calling`，不按provider名称推断，也不把完整ModelCapabilities传入ToolService。它不进入Agent、Session或Turn的持久领域字段，并且必须来自同一个captured SessionDefinitionRevision；完整规则见[Agent与Session生命周期架构设计](agent-session-lifecycle.md)。
 
 `WorkspaceToolContext` 由本 Turn pin 的 `WorkspaceSnapshot` 投影，包含 canonical cwd、`WorkspaceAccessView`、authorization lease 和 stable fingerprint。它是 filesystem capability ceiling：ToolRequirements、ToolPolicy、approval 和 grant 只能进一步收紧，不能扩大该 view。ToolService 不自行 canonicalize Workspace roots，也不从 trust 推断权限。完整规则见 [Workspace 子系统架构设计](workspace.md)。
 
@@ -477,7 +477,7 @@ ToolExposure 和 Deferred projection
 ToolName → executor route identity
 WorkspaceToolFingerprint / WorkspaceAccessFingerprint
 Tool policy revision
-provider capability projection
+ToolCallingCapabilities projection
 ToolSet capture algorithm version
 ```
 

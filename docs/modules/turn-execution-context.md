@@ -282,7 +282,7 @@ exact SessionDefinitionRevision
        └─ ToolService::for_turn(ToolTurnContext {
             agent, session_id, session_revision, turn_id,
             workspace: workspace.tool_context(),
-            provider: model.capabilities(),
+            tool_calling: model.capabilities().tool_calling.clone(),
             execution_control, cancellation, progress_events
           })
           └─ ToolSet
@@ -773,7 +773,7 @@ AssembledModelContextFingerprint
 - executor route identity/version；
 - WorkspaceToolFingerprint / WorkspaceAccessFingerprint；
 - Tool policy revision；
-- provider capability projection；
+- ToolCallingCapabilities projection；
 - ToolSet capture algorithm version。
 
 随机 executor pointer、锁状态、approval waiter 和 cancellation 不进入 fingerprint。
