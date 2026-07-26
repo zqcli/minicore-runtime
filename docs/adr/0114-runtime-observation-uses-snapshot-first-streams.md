@@ -14,7 +14,7 @@ pi、Codex和Claude Code公开行为更接近“当前状态或transcript恢复 
 1. 首版删除公开`RuntimeCursor`、`SessionCursor`、`ScopedCursor`、`EventCursor`、cursor-based `ReadStamp`和`EventGap` replay协议。
 2. `subscribe(scope)`建立snapshot-first实时流：订阅成功后的第一帧是该scope完整Snapshot，后续帧是实时`StateEvent`或`ProgressEvent`。
 3. Snapshot capture与subscriber注册必须在对应owner内原子完成，保证第一帧Snapshot之后发生的StateEvent不会丢失，也不会把Snapshot之前的旧事件重新应用到其后。
-4. StateEvent在当前subscription lifetime内按发送顺序可靠交付；subscriber背压、transport断开、Runtime restart或publisher关闭时终止stream，不缓存等待重放。Host重新subscribe并从新Snapshot恢复。
+4. StateEvent无论来自committed projection还是process-local execution state，都只在当前subscription lifetime内按发送顺序交付；它本身不是durable log。subscriber背压、transport断开、Runtime restart或publisher关闭时终止stream，不缓存等待重放。Host重新subscribe并从新Snapshot恢复；durable-derived状态可重建，未append queue、旧load/readiness和旧phase可以消失。
 5. ProgressEvent仍可合并或丢弃；final StateEvent和下一次Snapshot携带完整final view。
 6. CommandResponse只返回typed outcome，不返回cursor watermark。QueryResponse只返回typed data与可选领域revision，不返回cursor stamp。
 7. Runtime scope和每个Session scope仍使用独立owner、Snapshot和event stream；不建立跨scope全局顺序。该变化不影响多个SessionExecutor并行Running。

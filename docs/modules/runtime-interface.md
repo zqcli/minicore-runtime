@@ -504,7 +504,7 @@ Command response不是完整业务完成流：
 
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `SteerQueued`和`FollowUpQueued`只表示对应SessionIngress lane已接收，不承诺crash-safe delivery；真正append通过普通UserMessage/Turn StateEvent观察；
+- `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
 - Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
 - Session/Agent事实变化同时发布StateEvent，让其他subscriber失效或更新read model。
@@ -919,6 +919,13 @@ pub struct StateEvent {
 }
 ```
 
+StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
+
+| 来源 | 例子 | restart后的恢复 |
+| --- | --- | --- |
+| committed-derived | Agent/Session definition、Turn/Item terminal、Interaction request/resolution | 从durable catalog或SessionStorage projection重建，并出现在新Snapshot/Query中 |
+| process-local | load/readiness、execution/phase、queue、settled、diagnostics | 只描述当前Runtime状态；restart后可以消失、重置或由新状态替代 |
+
 StateEvent规则：
 
 - subscription第一帧必须是与scope匹配的完整Snapshot；
@@ -926,7 +933,7 @@ StateEvent规则：
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - durable conversation fact必须从append/apply后的CommittedSessionEntry派生；
-- process-local load/readiness/queue事实必须能从对应Snapshot重建；
+- process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
 - Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未append消息伪造成durable UserMessage。
 
@@ -1394,8 +1401,9 @@ Public interface是 contract test surface。
 
 - Runtime与每个Session subscription彼此独立；
 - 每条stream首帧是scope匹配的Snapshot；
-- 当前subscription内StateEvent保持发送顺序；
+- 当前subscription内StateEvent保持发送顺序，不区分committed-derived与process-local来源；
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
+- restart后durable-derived状态从projection重建，queued Steer/FollowUp和旧phase等process-local状态不恢复；
 - ProgressEvent可以合并/丢弃；
 - final Item event携带完整view；
 - Interaction request-after-append和resolution-before-resume；
@@ -1453,7 +1461,7 @@ Public interface是 contract test surface。
 
 缺点：streaming/progress、provider retry和UI状态会污染Session durable truth；ToolRoundCompleted模型可见性无法安全表达。
 
-结论：不采用。SessionStorage是durable truth，StateEvent从projection派生。
+结论：不采用。SessionStorage是durable truth；committed-derived StateEvent从durable projection派生，process-local StateEvent从当前Runtime/Executor view派生，两者都不成为event log。
 
 ### 公开 Manual CompactSession
 

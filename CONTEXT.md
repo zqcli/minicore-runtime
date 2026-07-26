@@ -27,7 +27,7 @@ _避免_：前端运行时、浏览器应用
 _避免_：WebView SDK、前端 Agent
 
 **Runtime Interface**：
-界面适配器与 `MiniCoreRuntime` 之间的稳定通信interface，由 `RuntimeCommand` / `CommandResponse`、`RuntimeQuery` / `QueryResponse`、`RuntimeSnapshot` / `SessionSnapshot` 和 `StateEvent` / `ProgressEvent` 组成。Command表达mutation或work admission，Query表达只读typed request/response，Snapshot表达scope-local恢复读模型，Event表达Runtime向host发布的可靠状态变化或best-effort进度。
+界面适配器与`MiniCoreRuntime`之间的稳定通信interface，由`RuntimeCommand`/`CommandResponse`、`RuntimeQuery`/`QueryResponse`、`RuntimeSnapshot`/`SessionSnapshot`和`StateEvent`/`ProgressEvent`组成。Command表达mutation或work admission，Query表达只读typed request/response，Snapshot表达scope-local恢复读模型，StateEvent在当前subscription内按序交付，ProgressEvent为best-effort。
 _避免_：运行时桥接、直接导入SDK、UI回调、内部Service interface
 
 **Runtime Events**：
@@ -472,7 +472,7 @@ _避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 _避免_：UI widget action、直接后端函数调用、raw storage/model mutation
 
 **StateEvent**：
-Runtime向host发布的scope-local状态变化记录。它在当前snapshot-first subscription lifetime内按发送顺序交付；stream断开或背压时不重放，host重新订阅并从Snapshot恢复。Durable conversation fact必须从append/apply后的receipt派生。
+Runtime向host发布的scope-local、非durable observer record。它可以描述committed-derived状态或process-local readiness/phase/queue状态，两者都只在当前snapshot-first subscription lifetime内按发送顺序交付。stream断开、背压或restart时不重放；host以新Snapshot为准，durable-derived状态从projection重建，未append queue和旧phase可以消失。Durable conversation fact必须从append/apply后的receipt派生。
 _避免_：ProgressEvent、SessionStorage entry副本、runtime-global sequence
 
 **ProgressEvent**：
