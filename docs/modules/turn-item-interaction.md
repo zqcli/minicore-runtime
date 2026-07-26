@@ -12,7 +12,7 @@
 - UserMessage、AgentMessage、Reasoning 和 Tool work 如何表达为 Item；
 - ToolCall 与 ToolResult 是否应是两个 Item；
 - approval 和结构化用户问题如何归属于 Item；
-- Interaction request、resolution、timeout、reconnect 和 crash recovery；
+- Interaction request、resolution、长期等待、reconnect 和 crash recovery；
 - streaming delta、Tool progress、retry 和 diagnostics 是否属于 durable domain truth；
 - Item 与 SessionStorage entry 的关系。
 
@@ -357,7 +357,7 @@ executor success
 executor/schema/sandbox failure
 policy/approval deny
 confirmed cancellation
-confirmed timeout
+confirmed executor timeout
 ```
 
 以下情况必须 Abandoned：
@@ -566,7 +566,6 @@ pub struct Interaction {
 pub enum InteractionState {
     Pending {
         requested_at: Timestamp,
-        expires_at: Option<Timestamp>,
     },
     Resolved {
         resolution: InteractionResolution,
@@ -578,7 +577,7 @@ pub enum InteractionState {
 
 Interaction 的职责分为两层：
 
-- Session execution与SessionStorage拥有`RequestId`、`TurnId`/`ItemId`绑定、Pending/Resolved durable state、deadline、幂等、Cancel、terminal cleanup和waiter resume；
+- Session execution与SessionStorage拥有`RequestId`、`TurnId`/`ItemId`绑定、Pending/Resolved durable state、幂等、Cancel、terminal cleanup和waiter resume；
 - TUI、Web、GUI或RPC host是Presentation Adapter，只负责把UI-safe `InteractionView`变成对用户可理解的对话框、聊天消息或表单，并通过Runtime facade提交resolution。
 
 Presentation Adapter不能直接持有Tool future、SessionExecutor或SessionWriter，也不能用一个新的UserMessage代替`InteractionCommand::Resolve`。如果UI自己发起问题而MiniCore没有Pending Interaction，答案就会成为新Turn，不能继续原来的ToolInvocation。
@@ -612,7 +611,6 @@ pub enum InteractionResolution {
     ToolApproval(ToolApprovalDecision),
     UserAnswer(UserQuestionAnswer),
     Cancelled(InteractionCancelReason),
-    Expired,
 }
 ```
 
@@ -632,7 +630,7 @@ pub enum InteractionCancelReason {
 - UserQuestion 通常归属于 ask-user ToolInvocation，也允许归属于其他真正发起 request 的 Item；
 - 首版由 ToolSet 的独占 pre-execution ask-user route 发起 UserQuestion；它发生在 `ToolExecutionStarted`、资源锁和外部副作用之前；
 - request/resolution family 必须匹配；
-- Cancelled 和 Expired 可以关闭任意 family；
+- Cancelled可以关闭任意family；用户沉默不等于Deny或Cancelled；
 - auto-approved、auto-denied 的 Tool policy 不需要创建 Interaction；
 - 一个 Item 可以顺序拥有多个 Interaction；
 - domain 不强制一个 Turn 同时只能有一个 Pending Interaction，execution policy 可以进一步收紧。
@@ -646,7 +644,6 @@ construct typed request
 → publish request notification
 → wait for response
 → validate expected TurnId / RequestId / family / resolution idempotency key
-→ 由同一个SessionExecutor检查expires_at；deadline已到时只允许Expired/fail-closed closure
 → append InteractionResolved { resolution, resolution_key }
 → apply durable projection
 → wake waiter / continue Tool authorization
@@ -659,7 +656,7 @@ construct typed request
 - Tool side effect前仍需重新检查Cancel state和current authorization；
 - 相同 resolution_key 重试幂等返回当前结果；
 - 不同 key 的第二次 resolution 返回 AlreadyResolved；
-- `now >= expires_at` 后 late response 返回 InteractionExpired，即使 timeout worker 尚未先写入；
+- elapsed time不改变Pending state，也不产生默认Deny；
 - first committed terminal resolution wins。
 
 ## Tool Approval
@@ -715,7 +712,7 @@ append UserAnswer resolution
 
 Interaction answer 本身不是 UserMessage，不开启新 Turn。
 
-`Cancelled`/`Expired` 由 ask-user route 映射为 typed `PreExecution` outcome 或 terminal cleanup；不得伪造已经发生的外部副作用。
+`Cancelled`由ask-user route映射为typed `PreExecution` outcome或terminal cleanup；不得伪造已经发生的外部副作用。
 
 ## Reconnect 与 Transport Loss
 
@@ -737,24 +734,24 @@ client reconnect
 - reconnect 不创建新 RequestId；
 - lost response acknowledgement 使用同一个 resolution_key（in-run dedup）在活跃 run 内重试；
 - abrupt client disconnect 默认不等于 Deny 或 Cancel；
-- pending Interaction 使 Session execution 非 Idle；PrepareForUnload在grace期继续接受resolution，deadline到期后写入fail-closed resolution并Cancel active Turn，Unload不会永久悬挂；
-- host 可以显式关闭 transport 并提交 Cancelled(TransportClosedByHost)；
-- 没有 subscriber 时可以继续等待，直到 timeout、cancel、shutdown 或 restart。
+- pending Interaction使Session execution非Idle；PrepareForUnload在grace期继续接受resolution，grace deadline到期后Cancel active Turn并以`Cancelled(TurnTerminated)`关闭Interaction，Unload不会永久悬挂；
+- host可以显式关闭transport并提交`Cancelled(TransportClosedByHost)`；
+- 没有subscriber时继续保持Pending，直到用户回答、显式Cancel、Unload/shutdown或restart recovery。
 
-## Timeout 与 Auto Resolution
+## Indefinite Waiting
 
-Interaction 可以保存可选绝对 `expires_at`，不建立通用 timeout policy entity。
-
-到期：
+MVP不定义Interaction级timeout、`expires_at`、`Expired` resolution或默认Deny。用户没有回答只表示Interaction仍为Pending：
 
 ```text
-Pending + now >= expires_at
-→ SessionExecutor拒绝新的host response
-→ append Expired，或 request-specific fail-closed resolution
-→ timeout worker 与 terminal cleanup 仍使用 first-wins CAS
+Pending + elapsed time
+→ remain Pending
+→ no ToolExecutionStarted
+→ no ToolResult
+→ no next Model operation for this Turn
 ```
 
-Tool approval 默认 fail closed。是否把 timeout 映射为 denied ToolResult 由 Tool policy决定，但必须是明确、durable 的 resolution。
+无限等待是fail closed：受审批保护的副作用不会开始，同时等待发生在`ToolResourceLocks`和`WorkspaceCommitAuthorization`之前，不阻塞其他Session。若embedding根本无法展示Interaction，应在启动该工作前选择不需要人工回答的明确policy或显式Cancel；不能用“暂时没有subscriber”推断Deny。
+
 
 ## Interaction等待与 Steer
 
@@ -781,7 +778,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-当前 Turn 的逻辑执行停在该 Interaction，不开始下一次 Model 调用，也不开始新的副作用 Tool operation；SessionExecutor 本身不阻塞，仍然处理 `ResolveInteraction`、Cancel、timeout、PrepareForUnload、Snapshot 和其他 per-session control。首版 ask-user route 在同一 assistant step 内独占等待：同一 step 的 sibling ToolCall 不会在答案返回前启动，也不持有 `ToolResourceLocks` 或 `WorkspaceCommitAuthorization`。其他 Session 的 Tool outcome 不受该等待影响。
+当前 Turn 的逻辑执行停在该 Interaction，不开始下一次 Model 调用，也不开始新的副作用 Tool operation；SessionExecutor 本身不阻塞，仍然处理 `ResolveInteraction`、Cancel、PrepareForUnload、Snapshot 和其他 per-session control。首版 ask-user route 在同一 assistant step 内独占等待：同一 step 的 sibling ToolCall 不会在答案返回前启动，也不持有 `ToolResourceLocks` 或 `WorkspaceCommitAuthorization`。其他 Session 的 Tool outcome 不受该等待影响。
 
 Steer 仍进入该 Turn 的 bounded FIFO，不抢占 UserQuestion；回答完成并形成 truthful ToolResult、`tool_round_completed` 后，下一次 Model 调用前最多消费一条 Steer。
 
@@ -802,7 +799,7 @@ Steer(expected TurnId)
 Turn terminal entry 前必须使领域projection闭合。Runtime-generated closure使用由terminal operation + RequestId派生的resolution_key做本轮去重；crash 后的重复 cleanup 幂等靠 committed prefix 状态判断（该 Interaction 已 resolved、该 Turn 已 terminal 则跳过），不依赖 durable operation key；exclusive lease 下恢复单跑，重复恢复靠状态跳过：
 
 ```text
-all Pending Interaction → Resolved(Cancelled(reason)) 或 Resolved(Expired)
+all Pending Interaction → Resolved(Cancelled(reason))
 all Started ToolInvocation → Completed(existing exact durable result) 或 Abandoned
 Turn Running → Completed / Interrupted / Failed
 ```
@@ -929,7 +926,6 @@ ItemAlreadyTerminal
 InteractionNotFound
 InteractionAlreadyResolved
 InteractionFamilyMismatch
-InteractionExpired
 ParentItemMismatch
 ToolCallMismatch
 OutcomeUnknown
@@ -940,7 +936,6 @@ StaleProjection
 关键 race：
 
 - Steer vs terminal append；
-- Interaction response vs timeout；
 - Interaction response vs Turn terminal cleanup；
 - Tool result vs security revocation；
 - tool_round_completed append vs cancel；
@@ -1041,8 +1036,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - Interaction family mismatch；
 - duplicate same resolution_key 幂等；
 - conflicting second resolution key；
-- response before deadline vs timeout first-wins；
-- response after expires_at 被拒绝，即使 timeout worker 尚未 append；
+- 长时间无回答保持Pending且不产生默认Deny；
 - response vs terminal cleanup first-wins；
 - disconnect 后 pending 保留；
 - reconnect 使用相同 RequestId resend；
@@ -1065,9 +1059,8 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 
 1. Runtime pending Interaction query/snapshot/event payload。
 2. Question option、secret answer 和 validation 的最终 wire schema。
-3. Tool approval timeout 的 product default。
-4. Reasoning summary retention、redaction 和 user visibility policy。
-5. standalone compaction、review和background work是否产生Item。
+3. Reasoning summary retention、redaction 和 user visibility policy。
+4. standalone compaction、review和background work是否产生Item。
 
 ## 设计进度
 
@@ -1082,7 +1075,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - [x] 区分 Item、ToolCall 和 storage identity。
 - [x] 定义 Interaction request/resolution family。
 - [x] 定义 request-before-notify 和 resolution-before-resume。
-- [x] 定义 reconnect/resend、timeout 和 transport loss。
+- [x] 定义 reconnect/resend、无限等待和 transport loss。
 - [x] 定义 WaitingApproval 与 Steer。
 - [x] 定义 UI-owned presentation、MiniCore-owned Interaction protocol 和 `request_user_question` producer seam。
 - [x] 定义 WaitingForUserInput、per-session isolation 和不持锁等待。
