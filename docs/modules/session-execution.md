@@ -21,7 +21,7 @@
 - ModelGateway的provider映射、auth、fallback和stream wire格式；
 - Compaction的具体planning算法、summary格式和质量评估；本文只引用其执行契约；
 - Runtime公开command/query/event/snapshot协议；其映射以[Runtime Interface](runtime-interface.md)为权威；
-- Rig 0.40.0 adapter的最终具体类型；
+- ModelGateway Rig provider adapter的最终具体类型；
 - 操作系统线程、Tokio task或local task的最终部署方式。
 
 相关权威文档：
@@ -471,7 +471,7 @@ loop {
 
 ## AgentLoop Interface
 
-AgentLoop是crate-private concrete implementation或private adapter，不定义public trait。
+AgentLoop是自研的crate-private concrete implementation（[ADR 0115](../adr/0115-agent-loop-is-first-party-state-machine.md)），不定义public trait。
 
 ```rust
 pub(crate) enum AgentLoopAction {
@@ -509,7 +509,7 @@ impl AgentLoop {
 
 `accept_committed_tool_round`的delta只能来自`tool_round_completed`成功append/apply后SessionStorage生成的trusted `CommittedConversationDelta`，不能由execution-local ToolResult自行构造。`Finished`只表示candidate final。Steer FIFO为空时SessionExecutor保存Assistant(Final)；FIFO非空时保存Assistant(Intermediate Continue)、pop一条Steer并从committed ConversationSeed重建AgentLoop segment。
 
-AgentLoop可以使用Rig或其他SDK作为private adapter，但不得：
+AgentLoop是自研的同步sans-I/O状态机，不由Rig或其他SDK驱动（ADR 0115）。它不得：
 
 - 读取SessionStorage；
 - 调用SessionWriter；
@@ -1539,7 +1539,7 @@ unbounded ingress/progress lane
 
 ### 强制two-owner execution
 
-否决原因：容易让独立operation task拥有AgentLoop、writer、queue或terminal状态，形成第二owner。只有Rig adapter确实只能以monolithic future运行时，才允许private adapter task；它只返回OperationResult。
+否决原因：容易让独立operation task拥有AgentLoop、writer、queue或terminal状态，形成第二owner。自研AgentLoop是同步纯逻辑状态机，由主循环直接调用；原为Rig monolithic future保留的private adapter task例外已随ADR 0115删除。
 
 ### 每个Model/Tool/Interaction一个actor
 

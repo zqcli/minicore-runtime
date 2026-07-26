@@ -36,7 +36,7 @@ MiniCoreRuntime
 
 ## 相关决策
 
-长期架构决策记录在 [`docs/adr/`](../adr/)（0100+）：领域与 ownership、Workspace ownership、Prompt/Tool/Skill 边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime 公开协议以及UserQuestion的UI/Runtime职责分离。行为与接口以各模块文档、协议文档和 ADR 为权威。
+长期架构决策记录在 [`docs/adr/`](../adr/)（0100+）：领域与 ownership、Workspace ownership、Prompt/Tool/Skill 边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime 公开协议、UserQuestion的UI/Runtime职责分离以及自研AgentLoop状态机（ADR 0115）。行为与接口以各模块文档、协议文档和 ADR 为权威。
 
 ## 权威归属
 

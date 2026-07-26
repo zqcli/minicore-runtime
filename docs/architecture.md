@@ -15,7 +15,7 @@ V1 → V2 的版本迁移记录见 [`docs/migration/v1-to-v2.md`](migration/v1-t
 
 ## 设计定位
 
-MiniCore 使用 Rig 作为原生 Agent SDK，但 Rig 保持为实现细节。下游 CLI、TUI、GUI 宿主只通过 `MiniCoreRuntime` 的 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
+MiniCore 的 AgentLoop 是自研的 crate-private 协议状态机（[ADR 0115](adr/0115-agent-loop-is-first-party-state-machine.md)）；Rig 只作为 `ModelGateway` private provider adapter 的实现库，保持为实现细节。下游 CLI、TUI、GUI 宿主只通过 `MiniCoreRuntime` 的 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
 
 MiniCore 不重新实现 provider SDK 的底层 sampling/tool-call protocol，也不重新实现 provider HTTP client。模型返回 ToolCall 时，Session execution 先 append 完整 assistant/intermediate entry，再由 ToolService 执行工具治理；每个 truthful result 独立 append 为 tool message，最后以 `tool_round_completed` 推进模型可见 conversation。真实模型调用通过共享 `ModelGateway` 的一个深异步 operation 复用 Rig provider system。
 
@@ -191,7 +191,7 @@ Steer after complete assistant/tool step
 ## 核心边界
 
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
-- Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
+- AgentLoop 是 MiniCore 自研的 crate-private sans-I/O 协议状态机（ADR 0115）；Rig 只作为 `ModelGateway` 的 private provider adapter 实现库，不拥有 agent loop、产品级工具治理、会话持久化或 UI 呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。Snapshot只作为live observer baseline，process restart仍从JSONL replay并保守关闭unfinished Turn。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
@@ -217,3 +217,4 @@ Steer after complete assistant/tool step
 - [ADR 0112：Compaction支持active-Turn checkpoint与模型感知预算](adr/0112-compaction-supports-active-turn-checkpoints.md)
 - [ADR 0113：UserQuestion使用Runtime交互协议与UI展示Adapter](adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)
 - [ADR 0114：Runtime观察协议使用Snapshot-First实时流](adr/0114-runtime-observation-uses-snapshot-first-streams.md)
+- [ADR 0115：AgentLoop使用自研协议状态机](adr/0115-agent-loop-is-first-party-state-machine.md)

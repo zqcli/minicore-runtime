@@ -421,7 +421,7 @@ SessionExecutor NeedModel
 2. 先实现`ScriptedProviderAdapter`，但它必须挂在真实ModelGateway private `ProviderAdapter` seam后，SessionExecutor不能直接调用fake model interface；
 3. 在scripted adapter上闭环普通调用：Submit → NeedModel → AgentRun request → assistant/tool result → append/apply；
 4. 在同一harness闭环overflow路径：AgentRun assembly overflow → Compaction plan → CompactionSummary request → StoredCompaction append/apply → reassemble → AgentRun继续；
-5. 尽早并行执行Rig 0.40.0 spike；它不阻塞scripted vertical slice，但在冻结真实provider adapter前必须通过；
+5. 尽早并行执行Rig 0.40.0 spike；它不阻塞scripted vertical slice，但在冻结真实provider adapter前必须通过。AgentLoop按[ADR 0115](../adr/0115-agent-loop-is-first-party-state-machine.md)自研，spike范围只覆盖ModelGateway provider mapping，不评估Rig sans-I/O AgentRun；
 6. 接入RigProviderAdapter和mock-server tests，证明真实provider mapping与scripted path使用同一ModelGateway contract。
 
 共同完成门槛：
