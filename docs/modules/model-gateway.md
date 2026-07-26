@@ -818,19 +818,20 @@ pub enum ModelContentDelta {
 
 规则：
 
-- progress publisher是bounded、non-authoritative和process-local；
-- publisher由RunningOperation scope到SessionId/TurnId/Item draft identity；
-- ModelGateway本身不接收SessionId或TurnId；
+- scoped publisher是process-local；AgentRun adapter必须先无损更新`StreamingItem`和ItemId映射，之后的Host ProgressEvent enqueue才是bounded、可合并/丢弃的observer路径；CompactionSummary adapter不创建ItemId；
+- publisher由RunningOperation scope到SessionId/TurnId；SessionExecutor创建的AgentRun adapter使用`content_index`维护`StreamingItem`并分配MiniCore ItemId；
+- ModelGateway只发布provider-neutral attempt ordinal、content index和delta，不创建ItemId，也不接收SessionId或TurnId；
 - 连续text/reasoning delta可以合并；
-- queue满可以丢弃中间delta；
-- progress publisher关闭不取消provider调用；
+- Host progress queue满可以丢弃中间delta，但不能跳过operation-local累积；
+- Host progress sink关闭不取消provider调用或operation-local累积；
 - cancellation由CancellationToken决定；
 - partial reasoning/text/tool arguments不是durable Item；
 - hidden chain-of-thought不可发布；
 - provider未暴露的reasoning不可推断；
 - terminal success必须返回完整FinalizedAssistantResponse；
 - terminal error必须返回typed ModelCallError；
-- SessionExecutor使用terminal result清理或替换UI draft。
+- 对AgentRun，SessionExecutor把finalized text/reasoning content转为同ItemId的FinalItemCandidate；ToolCall走assistant entry append/apply后的Started ToolInvocation projection，只有正式Item append/apply后才发布对应StateEvent；CompactionSummary结果不创建Item；
+- SessionExecutor在terminal error后丢弃StreamingItem；若启动logical retry则发布`model_retry_scheduled`清理Host临时view，Turn terminal或新Snapshot提供最终校正。
 
 不通过progress发布：
 
@@ -879,7 +880,7 @@ pub enum FinalizedAssistantContent {
 }
 ```
 
-`content[]`保持provider finalized semantic order。SessionExecutor随后分配或关联ItemId并构造assistant entry。
+`content[]`保持provider finalized semantic order。`ModelProgressEvent::ContentDelta.content_index`是该terminal `content[]`的zero-based位置，不是ToolCall内部`index`；adapter必须保证stream与terminal normalization使用同一位置语义，无法关联时返回protocol/validation failure。SessionExecutor随后分配或关联ItemId并构造assistant entry。
 
 ### FinalizedReasoning
 
@@ -1030,7 +1031,7 @@ retry delay和auth refresh期间不持有model concurrency permit。provider返�
 - 第一个model-visible delta发布后，普通restart可能重复text、tool call或billing，因此返回`StreamInterrupted`；
 - 只有provider adapter能证明exact resume且不会重复semantic content时才允许继续同一attempt；
 - MVP Rig adapter不假设支持exact resume；
-- progress中已经发布的partial draft由SessionExecutor在terminal error后丢弃。
+- progress中已经发布的StreamingItem由SessionExecutor在terminal error后丢弃，不生成Completed Item。
 
 ### Authentication Retry
 
@@ -1403,7 +1404,9 @@ AgentLoop NeedModel
    → wait global/provider/model/auth-principal concurrency permits
    → optional cache/continuation optimization with equivalence proof
    → provider stream
-   → publish droppable progress
+   → publish ModelProgressEvent to operation-local adapter
+      → lossless StreamingItem/ItemId update
+      → best-effort Host ProgressEvent enqueue
    → normalize ordered finalized content/usage/finish reason/metadata
    → return ModelCallResult
 → OperationResult(SessionId + TurnId + execution_version + OperationType)
@@ -1598,7 +1601,8 @@ opaque encrypted reasoning
 ### Streaming
 
 - start/text/reasoning/tool-call delta；
-- delta queue满时合并/丢弃不影响final result；
+- `content_index`与terminal `content[]`位置一致，ToolCall内部index不参与该correlation；
+- AgentRun operation-local StreamingItem累积先于Host queue，delta queue满时合并/丢弃不影响ItemId映射或final result；CompactionSummary不分配ItemId；
 - publisher关闭不取消call；
 - cancellation停止progress；
 - unexpected EOF → StreamInterrupted；

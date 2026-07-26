@@ -987,7 +987,9 @@ pub struct ProgressEvent {
 ProgressEvent不参与可靠状态恢复，可以合并或丢弃。典型内容：
 
 ```text
+agent_message_started
 agent_message_delta
+reasoning_started
 reasoning_delta
 tool_output_delta
 model_retry_scheduled
@@ -996,10 +998,15 @@ model_attempt_progress
 
 规则：
 
+- 有stream progress的AgentMessage/Reasoning在首个content update时分配稳定`ItemId`；started、全部delta和最终`item_completed`使用同一ItemId；
+- message/reasoning started属于AgentRun ProgressEvent，不创建durable `ItemStatus::Started`；CompactionSummary不创建StreamingItem或ItemId；
+- Host漏掉started时可以用首个delta创建临时Item view；漏掉全部progress或provider为non-streaming时直接使用final `item_completed`；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
 - queue满时可以丢弃中间progress；
 - progress缺失不影响StateEvent或Snapshot正确性；
-- Item/Turn最终StateEvent携带完整final view；
+- `item_completed`只在final candidate成功append/apply后发布，携带完整final Item view；append失败不能发布completed；
+- Cancel/failure丢弃未commit的streaming state；logical `model_retry_scheduled`要求Host清除上一Model operation的临时view，若progress丢失则由Turn terminal或新Snapshot最终校正；
+- Host收到同ItemId的`item_completed`或Turn terminal后忽略迟到started/delta；
 - progress不写SessionStorage，不成为conversation truth；
 - progress publisher失败不影响Turn执行或terminal。
 
@@ -1405,6 +1412,9 @@ Public interface是 contract test surface。
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
 - restart后durable-derived状态从projection重建，queued Steer/FollowUp和旧phase等process-local状态不恢复；
 - ProgressEvent可以合并/丢弃；
+- message/reasoning started、delta和completed使用稳定ItemId，丢失started/delta仍可由completed校正；
+- append失败不发布item_completed；logical retry、Turn terminal或新Snapshot清理临时Item view，completed/terminal后忽略迟到progress；
+- logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；
 - final Item event携带完整view；
 - Interaction request-after-append和resolution-before-resume；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
