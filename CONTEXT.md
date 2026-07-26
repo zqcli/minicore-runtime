@@ -318,6 +318,14 @@ _避免_：durable entry、Queue entity、priority queue、batch drain mode、Pr
 SessionExecutor启动的Context构造、Model调用、Tool执行或Compaction操作。每个Session最多一个current operation；主循环同时poll它和request queue，旧operation terminal/remove或安全drop前不启动下一operation。它只接收不可变输入并返回`OperationResult`，不能拥有SessionWriter、projections、request queues或Turn terminal state。
 _避免_：SessionExecutor、长期后台Session、领域Turn、第二状态owner
 
+**流式Item（`StreamingItem`）**：
+SessionExecutor在当前AgentRun logical Model operation中保存的process-local AgentMessage或Reasoning累积buffer。首次content progress时分配稳定ItemId，started/delta使用该ID；它不是Item projection、JSONL entry或Snapshot authoritative content，terminal error/Cancel时直接丢弃。
+_避免_：ProvisionalItem、durable Started Item、provider attempt entity、UI store draft
+
+**最终Item候选（`FinalItemCandidate`）**：
+provider完成并通过validation后，由finalized response和可选StreamingItem映射生成的未提交值。有progress时沿用StreamingItem的ItemId；没有progress时在terminal normalization分配ItemId。只有append/apply成功后projection才产生Completed Item并发布item_completed。
+_避免_：Committed Item、StoredSessionEntry、提前发布的StateEvent
+
 **Submit命令标识（Submit `CommandId`）**：
 Submit envelope的随机、不可复用CommandId同时作为initiating UserMessage append前的process-local admission/cancel identity。公开Cancel target使用`Submit(CommandId) | Turn(TurnId)`；同一Runtime内duplicate in-flight Submit加入原completion，Turn创建后长期execution identity切换为TurnId。CommandId不写入SessionStorage，restart后不可恢复或重放。
 _避免_：独立SubmissionId、领域TurnId、crash-safe queue identity
@@ -448,7 +456,7 @@ ModelGateway返回的redacted typed terminal error。ModelCallErrorKind区分Can
 _避免_：generic RuntimeError、raw HTTP body、assistant message、ToolResult
 
 **模型进度（`ModelProgressEvent`）**：
-ModelGateway通过bounded ProgressEventPublisher发布的process-local attempt/delta/retry observer value。可以合并或丢弃，不进入SessionStorage；finalized result或typed error负责最终校正observer draft。
+ModelGateway发布的process-local attempt/delta/retry value。AgentRun GenerateModelResponse的scoped adapter先无损更新StreamingItem/ItemId映射，再把observer update送入bounded、可合并/丢弃的Host ProgressEvent queue；CompactionSummary adapter不创建ItemId。两者都不进入SessionStorage，finalized result或typed error负责最终校正。
 _避免_：durable Message、第二event log、cancellation token
 
 **压缩摘要指令（`CompactionSummaryDirective`）**：
@@ -476,7 +484,7 @@ Runtime向host发布的scope-local、非durable observer record。它可以描�
 _避免_：ProgressEvent、SessionStorage entry副本、runtime-global sequence
 
 **ProgressEvent**：
-模型文本/reasoning delta、Tool output和provider retry等高频observer update。它可以合并或丢弃；final StateEvent或重新订阅后的Snapshot携带完整view进行校正。
+模型AgentMessage/Reasoning started与delta、Tool output和provider retry等高频observer update。它可以合并或丢弃；message/reasoning started、delta与final completed共享稳定ItemId，append/apply后的StateEvent或重新订阅后的Snapshot携带完整view进行校正。
 _避免_：durable message、terminal event、恢复水位
 
 **事件消息（`StateEventMsg` / `ProgressEventKind`）**：

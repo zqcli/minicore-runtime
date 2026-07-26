@@ -354,7 +354,7 @@ SkillView.prompt_view()
 - [x] 每个 Interaction 可追溯到 Item、Turn 和 Session；
 - [x] ToolCall、ToolResult 和 approval 使用同一个 ToolInvocation Item identity；
 - [x] terminal Turn 不保留 Pending Interaction 或 Started Item；
-- [x] streaming delta/progress 与 durable Item truth 分离；
+- [x] AgentMessage/Reasoning started与delta使用稳定ItemId和process-local `StreamingItem`，只有append/apply后才产生Completed Item；
 - [x] 不引入 ItemManager、InteractionService、ModelStep 或 ToolRound entity。
 
 ### 阶段 5：Conversation 与 SessionStorage
@@ -536,7 +536,7 @@ SessionExecutor NeedModel
 - Command 在明确线性化点返回 typed outcome，Turn 长期完成通过 Event 发布；
 - CommandSurface 是 Runtime 内部无状态命令解释模块，slash text 与 catalog selection 走同一 resolve 路径；
 - Runtime和每个Session使用独立Snapshot与snapshot-first实时流，不建立runtime-global sequence、公开cursor/replay或all-loaded stop-the-world barrier；
-- StateEvent与可合并/丢弃的ProgressEvent分离；断线、背压或restart后重新订阅并获取新Snapshot；
+- StateEvent与可合并/丢弃的ProgressEvent分离；message/reasoning started、delta与append/apply后的completed使用稳定ItemId，断线、背压或restart后重新订阅并获取新Snapshot；
 - SessionStorage 拥有 message tree，Runtime 提供 history Query 和 message-anchor Fork command；
 - 所有 Runtime mutation 经过 facade，UI selection、draft、scroll 和 layout 留在 adapter；
 - 首版不公开 standalone/manual `CompactSession`。

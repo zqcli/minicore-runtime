@@ -357,7 +357,7 @@ pub(crate) struct CompactionRecoveryBasis {
 
 ## Running Operation
 
-SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`，它是当前逻辑Model/Tool/Compaction工作的唯一execution-local状态。provider attempt和transparent retry完全由ModelGateway内部管理，CurrentTurnExecution不保存并列的ModelAttemptState。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
+SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`，它是当前逻辑Model/Tool/Compaction工作的唯一execution-local状态。provider attempt和transparent retry完全由ModelGateway内部管理，CurrentTurnExecution不保存并列的ModelAttemptState。`GenerateModelResponse` operation的scoped progress adapter持有`content_index → StreamingItem`的operation-local map；其terminal `OperationOutput::Model`包装Gateway的`ModelCallResult`和ItemId映射，ModelGateway interface保持不变。该adapter不直接修改CurrentTurnExecution或projection。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
 
 新operation只能在旧operation满足以下任一条件后启动：
 
@@ -650,9 +650,15 @@ AgentLoop NeedModel
    → Compaction基于pinned EffectiveModelLimits派生summary budget
    → CompactConversation调用PromptSet和ModelGateway(CompactionSummary request)
 → Executor继续处理SessionIngress的 wakeup 与各 lane
+→ AgentRun GenerateModelResponse期间首次出现message/reasoning content_index
+   → 分配稳定ItemId并创建StreamingItem
+   → 发布agent_message_started / reasoning_started ProgressEvent
+→ AgentRun后续delta更新同一StreamingItem并使用同一ItemId发布ProgressEvent
 → OperationResult返回并校验SessionId/TurnId/execution_version/OperationType
-   ├─ Model：AgentLoop.accept_model_response → NeedTools或candidate Finished
-   └─ Compaction：revalidate → append/apply Replace → rebuild AgentLoop → reassemble
+   ├─ AgentRun Model：finalized text/reasoning生成FinalItemCandidate → AgentLoop.accept_model_response → NeedTools或candidate Finished
+   │  → Assistant entry append/apply后发布message/reasoning item_completed并清理StreamingItem
+   │  → finalized ToolCall由同一entry产生Started ToolInvocation projection
+   └─ CompactionSummary：不创建StreamingItem/ItemId → revalidate → append/apply Replace → rebuild AgentLoop → reassemble
 ```
 
 规则：
@@ -663,8 +669,11 @@ AgentLoop NeedModel
 - provider transport fallback不得改变exact provider/model identity；
 - active Turn内不允许transparent cross-model fallback；
 - logical retry只允许在ConversationCheckpoint、TurnExecutionContext、purpose、output contract和effective max_output_tokens均未改变时发生；
-- streaming delta通过ProgressEventPublisher发布，不写SessionStorage；
-- partial response不是AgentMessage Item；
+- `StreamingItem`只属于当前AgentRun `GenerateModelResponse` operation，按provider-neutral `content_index`关联，不进入CompactionSummary、CurrentTurnExecution、TurnExecutionContext、SessionStorage或Snapshot authoritative view；
+- message/reasoning在首个streamed content update分配稳定ItemId，started与delta通过ProgressEventPublisher发布；
+- partial response和StreamingItem都不是AgentMessage/Reasoning Item；
+- provider terminal success只生成FinalItemCandidate；从未产生progress的final content在normalization时分配ItemId，candidate成功append/apply后projection才产生Completed Item并发布`item_completed`；
+- terminal error、Cancel或validation failure直接丢弃StreamingItem，不发布synthetic completed；
 - Model result只有在AgentLoop返回NeedTools或Finished后才决定对应entry类型；
 - NeedTools保存含ToolCall的Assistant(Intermediate)并完成整个ToolRound；不因queued Steer丢弃已完成model step；
 - Finished只是candidate final。steer queue为空时保存Assistant(Final)；queue非空时保存不含ToolCall的Assistant(Intermediate/Continue)，随后消费一条Steer并继续同一Turn。
@@ -1022,6 +1031,7 @@ Model operation retryable failure
 → 确认TurnId/execution_version未变
 → 确认ConversationCheckpoint未变
 → 确认TurnExecutionContext未变
+→ 发布logical model_retry_scheduled，丢弃上一operation的StreamingItem
 → 使用相同ModelCallRequest重试
 → increment logical retry_count
 ```
@@ -1133,18 +1143,24 @@ Snapshot不进入mutation/control lane，也不声称与跨lane请求形成全�
 `ProgressEventPublisher`处理高频、非durable事件：
 
 ```text
-assistant text/reasoning delta
+agent message / reasoning started
+assistant text / reasoning delta
 Tool stdout/progress
 provider retry notification
 phase change notification
 ```
 
+`StreamingItem`和`FinalItemCandidate`的权威形状见[Turn、Item与Interaction](turn-item-interaction.md#streaming与observer-event)。SessionExecutor只为AgentRun `GenerateModelResponse`创建Item progress adapter；adapter先无损更新`content_index → StreamingItem`映射，再尝试向可合并/丢弃的Host ProgressEvent queue发布，并在`OperationOutput::Model`中归还ItemId映射。CompactionSummary使用不创建ItemId的compaction progress adapter。ModelGateway只发布provider-neutral content index/delta，不创建MiniCore ItemId。
+
 规则：
 
 - 使用独立bounded queue；
+- started、delta和append/apply后的completed使用同一ItemId；Host漏掉started时可由首个delta创建临时view；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
 - queue满时允许丢弃中间progress；StateEvent通道无法继续时关闭subscription，由新Snapshot恢复，不把final event称为durable log；
 - committed-derived final StateEvent从append/apply后的entry生成，包含完整final view；process-local final view由当前Executor snapshot校正；
+- append失败不能发布item_completed；logical retry发布`model_retry_scheduled`并要求Host清理上一Model operation的临时view，Turn terminal或新Snapshot提供最终校正；
+- Host收到同ItemId completed或Turn terminal后忽略独立progress queue中迟到的started/delta；
 - progress publisher失败不影响SessionStorage或Turn terminal；
 - 状态变化进入per-session StateEvent；ProgressEvent可以合并/丢弃。subscription背压或disconnect时关闭stream并重新snapshot，完整规则见[Runtime Interface](runtime-interface.md)。
 
@@ -1362,6 +1378,11 @@ MVP性能要求：
 - Presentation Adapter只消费UI-safe Interaction view并通过Runtime facade Resolve，不能直接写Interaction或持有waiter；
 - WaitingForUserInput期间同Session不启动sibling副作用ToolCall，其他Session仍可运行；
 - timeout与host resolution first-wins；
+- message/reasoning streaming start分配稳定ItemId，started/delta/completed identity一致；
+- 丢失started或delta仍可由item_completed完整final view恢复；
+- append失败不产生item_completed，Cancel/failure丢弃StreamingItem；logical retry通知Host清除上一operation临时view；
+- item_completed或Turn terminal之后迟到的started/delta被Host忽略；
+- CompactionSummary progress不创建StreamingItem、ItemId或item_completed；
 - parallel ToolCall按source order保存results；
 - 每个ToolResult独立append；
 - partial results不进入conversation；

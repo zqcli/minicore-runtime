@@ -294,6 +294,7 @@ provider partial output、stream draft 和 abandoned retry attempt 不是 durabl
 ```rust
 pub struct ReasoningItem {
     pub summary: ReasoningSummary,
+    pub content: Option<Arc<str>>,
 }
 ```
 
@@ -301,6 +302,7 @@ Reasoning Item是面向领域/UI的policy-filtered read projection：
 
 - 可选；
 - `summary`只表达允许展示的摘要，不是完整storage wire schema；
+- `content`只包含policy允许展示的finalized reasoning text；未公开、仅加密或被redaction policy隐藏时为None；
 - authoritative assistant entry可以保存provider实际返回的finalized/replayable text、summary、encrypted payload、signature和provider item id；
 - 不获取或伪造provider未返回的hidden chain-of-thought；
 - provider reasoning delta是transient observer event；
@@ -413,29 +415,65 @@ pub enum ItemStatus {
 
 ItemStatus 是 projection，不作为与 ItemContent 独立更新的第二事实字段。
 
-## Streaming 与 Observer Event
+## Streaming与Observer Event
 
-以下内容不是 durable Item：
+AgentMessage和Reasoning的流式阶段不是durable Item。SessionExecutor在首个streamed content update时分配稳定`ItemId`，并只在当前Model operation内保存：
 
-```text
-message_start / text_delta / reasoning_delta
-Tool progress / stdout chunk
-provider retry attempt
-TurnExecutionPhase transition
-approval dialog opened/closed notification
-cache hit / token usage update
+```rust
+pub(crate) enum StreamingItem {
+    AgentMessage {
+        item_id: ItemId,
+        text: String,
+    },
+    Reasoning {
+        item_id: ItemId,
+        summary: Vec<String>,
+        content: Vec<String>,
+    },
+}
+
+pub(crate) enum FinalItemCandidate {
+    AgentMessage {
+        item_id: ItemId,
+        content: AgentMessageContent,
+    },
+    Reasoning {
+        item_id: ItemId,
+        summary: ReasoningSummary,
+        content: Option<Arc<str>>,
+    },
+}
 ```
 
-Runtime 可以发布：
+`StreamingItem`只累积允许发布的visible text/summary，不保存hidden reasoning或opaque provider artifact；final Reasoning candidate把允许展示的完整text放入`content`，因此`item_completed`可以校正丢失的reasoning delta。StreamingItem是process-local buffer，不是Item projection、JSONL entry或Snapshot authoritative content。provider完成并通过validation后，有stream映射的content生成同一`ItemId`的`FinalItemCandidate`，无stream映射的content在terminal normalization分配ItemId；只有candidate成功append/apply后，projection才产生正式`ItemStatus::Completed` Item。
 
 ```text
-ItemStarted
-ItemDelta
-ItemCompleted
-ItemAbandoned
+logical item start
+→ StreamingItem
+→ agent_message_started / reasoning_started ProgressEvent
+→ delta更新同一个StreamingItem并发布ProgressEvent
+→ provider final + validation
+→ FinalItemCandidate
+→ append StoredSessionEntry
+→ apply committed receipt
+→ ItemStatus::Completed
+→ item_completed StateEvent
+→ drop StreamingItem
 ```
 
-公开 event shape 由 Runtime protocol 定义。completed/abandoned durable snapshot 是 replay truth；delta 可丢失、合并或不 replay。
+事件规则：
+
+| Item kind | Started / Delta | Terminal |
+| --- | --- | --- |
+| AgentMessage | ProgressEvent | append/apply后的`item_completed` StateEvent |
+| Reasoning | ProgressEvent | append/apply后的`item_completed` StateEvent |
+| ToolInvocation | assistant/intermediate tool_call entry append/apply后派生的`item_tool_invocation_started` StateEvent | completed或abandoned StateEvent |
+
+started/delta可丢失或合并；Host漏掉started时可以从首个delta创建临时view，漏掉全部progress时可以直接使用final `item_completed`。所有progress和final使用同一`ItemId`。non-streaming provider或从未发布progress的content在terminal normalization时分配ItemId并直接生成candidate；不要求补发started。若stream index与finalized content不能一致关联，validation失败且不发布completed。Cancel、failure或无final output时直接丢弃`StreamingItem`，不生成synthetic Item；logical retry scheduled时Host清除上一Model operation尚未commit的临时view，若该ProgressEvent丢失则最迟在Turn terminal或新Snapshot时清除。completed或terminal之后迟到的started/delta必须忽略。
+
+ToolInvocation的Started与外部副作用开始是两个边界：assistant/intermediate tool_call entry append/apply后Item成为Started；`ToolExecutionStarted`必须在真实executor副作用前另行append/apply。pre-execution拒绝可以在没有`ToolExecutionStarted`的情况下把Started ToolInvocation完成为truthful ToolResult。
+
+以下内容同样不是durable Item：Tool progress/stdout chunk、provider retry attempt、TurnExecutionPhase transition、approval presentation状态、cache hit和临时token update。
 
 ## Complete ToolRound
 
@@ -988,7 +1026,13 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - ItemId 与 ToolCallId 独立；
 - parallel Tool completion后按source call order append tool messages和completion references；
 - incomplete ToolRound 不进入 conversation；
-- streaming delta 丢失不影响 replay；
+- message/reasoning started、delta与completed使用稳定ItemId；
+- started或全部delta丢失仍可由item_completed final view恢复；
+- non-streaming content在terminal normalization分配ItemId并直接生成candidate；
+- append失败、Cancel或provider terminal error不产生Completed Item；
+- logical retry要求Host清理上一Model operation临时view，丢失该progress时由Turn terminal或新Snapshot校正；
+- completed/terminal之后迟到的started/delta被Host忽略；
+- text-only reasoning stream在final candidate保留policy-visible content，item_completed可校正丢失delta；
 - finalized provider reasoning artifact 按 retention/redaction policy replay；
 - InteractionRequested append-before-notify；
 - InteractionResolved append-before-wake；
@@ -1046,4 +1090,4 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - [x] 区分 durable Item 与 transient observer delta。
 - [x] 完成by-entry JSONL tree、Message/Event layout、EntryId、ToolRoundCompleted模型可见性规则和fork identity schema。
 - [x] 完成SessionExecutor与private ToolExecutionControl/Interaction request处理流程。
-- [ ] 完成 public Runtime protocol projection。
+- [x] 完成 public Runtime protocol projection。

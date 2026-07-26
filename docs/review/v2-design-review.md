@@ -148,7 +148,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - Interaction `expires_at` 到期后由谁推进未定（auto-deny 系统 resolution vs Turn failed）→ 无人应答时 Running Turn 可能永停在 `WaitingApproval`；可能已在 `turn-item-interaction.md` 覆盖，需回链确认。
 - ~~`CommandId`与`SubmissionId`双correlation id~~：**已关闭**。删除独立`SubmissionId`；Submit envelope的随机、不可复用`CommandId`同时作为Turn创建前的process-local admission/cancel target。duplicate in-flight Submit加入原completion；CommandId不持久化，restart后不重放，Turn创建后使用`TurnId`。
 - ~~StateEvent混载durable-derived与process-local状态的可靠性范围不清~~：**已关闭**。StateEvent本身统一为非durable observer record；committed-derived与readiness/queue/phase都只在当前subscription lifetime内按序交付。restart后前者从projection重建，未append Steer/FollowUp和旧phase可以消失，host以新Snapshot为准。
-- message/reasoning Item 只有 `item_completed` 无 `*_started`（ToolInvocation 有 started+completed）→ 明确 host 须能仅凭 ProgressEvent 构造 provisional Item view、`ItemId` 在 Item 开始即分配且稳定。
+- ~~message/reasoning Item只有`item_completed`，流式临时view和ItemId语义不清~~：**已关闭**。SessionExecutor只为AgentRun维护process-local `StreamingItem`；message/reasoning在首个streamed content update分配稳定ItemId，started与delta走ProgressEvent，provider final生成`FinalItemCandidate`，append/apply后才发布同ItemId的`item_completed` StateEvent。Host漏掉started时可由首个delta构造临时view；logical retry清理上一operation的临时view，Turn terminal或新Snapshot提供最终校正。
 - Turn/Item公开排序键未定义（`ItemId`无序、`EntryId`不作UI输入）→ 定义scope-local opaque display sequence作为UI order token；它只负责当前read model排序，不承担event replay cursor。
 - Runtime scope 与 Session scope 无跨流顺序保证 → 给 host 一句 reducer 指引（两 scope 皆可作为 Session 首次出现来源）。
 - 公开 history 读模型 vs 模型可见 conversation 是同一 storage 两投影（durable 但未 `tool_round_completed` 的 tool entry 对 UI 可见、对模型不可见）→ 点明为有意投影差异，避免误判一致性 bug。
@@ -247,3 +247,5 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 协议identity后续决议：独立`SubmissionId`没有独立生命周期，已删除。Submit的随机、不可复用`CommandId`在initiating UserMessage append前定位唯一admission candidate和Cancel target；同一Runtime内duplicate in-flight Submit加入原completion，restart后旧CommandId不重放。append后返回`TurnStarted { turn_id }`，后续取消使用`TurnId`。
 
 StateEvent可靠性后续决议：不增加durability enum或第二event通道。所有StateEvent都是当前subscription内按序交付的非durable observer record；payload来源决定restart后的重建方式，Host始终以新Snapshot重置read model。
+
+Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套存储。SessionExecutor只为AgentRun维护`StreamingItem`累积buffer和未提交`FinalItemCandidate`；正式Item只由append/apply后的projection产生。AgentMessage/Reasoning的started/delta属于ProgressEvent。ToolInvocation Started仍由assistant/intermediate tool_call entry append/apply后的projection派生committed-derived StateEvent；后续`ToolExecutionStarted`只表示真实副作用边界。
