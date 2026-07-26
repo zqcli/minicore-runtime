@@ -21,7 +21,7 @@ MiniCoreRuntime
 
 ## 模块索引
 
-- [Runtime 公开协议](runtime-interface.md)：`MiniCoreRuntime` 的 `dispatch / query / snapshot / subscribe` 四类能力、公开领域 identity、scoped cursor/snapshot 和协议边界。
+- [Runtime公开协议](runtime-interface.md)：`MiniCoreRuntime`的`dispatch / query / snapshot / subscribe`四类能力、公开领域identity、snapshot-first实时流和协议边界。
 - [Agent 与 Session 生命周期](agent-session-lifecycle.md)：Agent 定义与 `AgentRevision`、Session 定义与 `SessionDefinitionRevision`、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 的分离。
 - [Workspace](workspace.md)：Session-owned Workspace definition、roots/cwd 合法域、trust 与 source authorization、filesystem capability，以及 Prompt/Tool/Skill 消费的窄只读 view。
 - [Prompt](prompt.md)：`PromptService`共享`PromptResourceView`，各Turn独立构建`PromptSet`；`compose_user_message`产出`CanonicalUserMessage`，`assemble(...) -> AssembledModelContext`是模型可见上下文组装的唯一seam。

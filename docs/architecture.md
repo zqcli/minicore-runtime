@@ -173,7 +173,7 @@ Steer after complete assistant/tool step
 
 ## 模块文档地图
 
-- [Runtime 公开协议](modules/runtime-interface.md)：`MiniCoreRuntime` 的 `dispatch / query / snapshot / subscribe`、公开领域 identity、scoped cursor/snapshot 和协议边界。
+- [Runtime公开协议](modules/runtime-interface.md)：`MiniCoreRuntime`的`dispatch / query / snapshot / subscribe`、公开领域identity、snapshot-first实时流和协议边界。
 - [Agent 与 Session 生命周期](modules/agent-session-lifecycle.md)：Agent/Session revision、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 分离。
 - [Workspace](modules/workspace.md)：Session-owned Workspace definition、roots/cwd、trust、authorization、filesystem capability 与窄只读 view。
 - [Prompt](modules/prompt.md)：共享PromptResourceView、各Turn独立PromptSet、CanonicalUserMessage、`assemble → AssembledModelContext`。
@@ -193,7 +193,7 @@ Steer after complete assistant/tool step
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
 - Rig 拥有 agent loop 的协议级状态机，不拥有产品级工具治理、会话持久化或 UI 呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
-- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取带cursor的immutable published view。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement、资源锁和真实副作用由 `ToolService` 统一治理；新 Turn 通过 `ToolService::for_turn(...) -> ToolSet` 原子绑定模型可见 `ToolPromptView` 与 executor snapshot。MVP 不启用通用 `bash`；子进程限制无法强制时必须 fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
@@ -216,3 +216,4 @@ Steer after complete assistant/tool step
 - [ADR 0111：SessionIngress 分离控制与工作 lane](adr/0111-session-ingress-separates-control-and-work-lanes.md)
 - [ADR 0112：Compaction支持active-Turn checkpoint与模型感知预算](adr/0112-compaction-supports-active-turn-checkpoints.md)
 - [ADR 0113：UserQuestion使用Runtime交互协议与UI展示Adapter](adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)
+- [ADR 0114：Runtime观察协议使用Snapshot-First实时流](adr/0114-runtime-observation-uses-snapshot-first-streams.md)

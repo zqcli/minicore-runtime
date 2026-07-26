@@ -51,11 +51,12 @@
 - `CommandId` 只做协议命令 correlation和幂等，不是领域 entity；Starting admission控制使用process-local `SubmissionId`；
 - Command response 在对应 command 的明确线性化点返回 typed outcome，不使用只有 `accepted: bool` 的通用 acknowledgement；
 - Turn 的长期完成、Item 生命周期和 Interaction request/resolution通过 Event 发布；
-- 可靠 `StateEvent` 与可合并/丢弃的 `ProgressEvent` 分离；
-- recovery cursor 只覆盖可靠 StateEvent，ProgressEvent 不占用 cursor；
-- Runtime scope 和每个 Session scope 使用独立 cursor；不建立 runtime-global event sequence；
-- `RuntimeSnapshot` 只覆盖 Runtime/Agent/Session summary 和 loaded membership；
-- `SessionSnapshot` 覆盖一个 loaded Session 的 current Turn、Items、Pending Interaction 和 queues；
+- `StateEvent`与可合并/丢弃的`ProgressEvent`分离；
+- subscribe使用snapshot-first实时流，第一帧是完整Snapshot，后续是当前连接内的StateEvent/ProgressEvent；
+- 不公开cursor、event replay、Gap或跨restart续订；断线、背压或restart后重新subscribe并获取新Snapshot；
+- Runtime scope和每个Session scope使用独立owner、Snapshot与event stream，不建立runtime-global event sequence；
+- `RuntimeSnapshot`只覆盖Runtime/Agent/Session summary和loaded membership；
+- `SessionSnapshot`覆盖一个loaded Session的current Turn、Items、Pending Interaction和queues；
 - 不要求 all-loaded Session 在一个全局水位上 stop-the-world snapshot；
 - SessionStorage 拥有 durable entry tree；Runtime 通过 Query 暴露 read model，通过 Fork command创建新 Session branch；
 - 同一 Session 内不提供原地 checkout/navigation mutation；
@@ -162,7 +163,6 @@ MiniCoreRuntime
 - `EntryId`：SessionStorage identity，默认不作为普通UI mutation input；
 - `CommandId`：public command correlation和幂等identity；
 - `SubmissionId`：Submit在领域Turn创建前的process-local admission control identity；
-- `RuntimeCursor` / `SessionCursor`：可靠StateEvent恢复水位。
 
 不公开：
 
@@ -783,22 +783,16 @@ Tool:   ListTools / GetToolSummary
 
 ```rust
 pub struct QueryResponse {
-    pub stamp: ReadStamp,
     pub revision: Option<QueryRevision>,
     pub data: QueryResult,
 }
-
-pub struct ReadStamp {
-    pub runtime_cursor: Option<RuntimeCursor>,
-    pub session_cursor: Option<SessionCursor>,
-}
 ```
 
-Query不增加cursor，不发布Event，不创建Turn，不加载完整SessionExecutor来读取持久化目录，不消费Steer/FollowUp queue。
+Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot；需要完整恢复读模型时使用Snapshot或snapshot-first subscription。
 
 ## Snapshot
 
-Snapshot用于UI初始化、subscriber重建和StateEvent gap恢复。
+Snapshot用于UI初始化、显式状态读取和subscriber重建。
 
 ```rust
 pub enum SnapshotRequest {
@@ -818,7 +812,6 @@ pub enum SnapshotResponse {
 
 ```rust
 pub struct RuntimeSnapshot {
-    pub cursor: RuntimeCursor,
     pub runtime: RuntimeView,
     pub agents: Vec<AgentSummary>,
     pub loaded_sessions: Vec<LoadedSessionSummary>,
@@ -834,7 +827,6 @@ pub struct RuntimeSnapshot {
 ```rust
 pub struct SessionSnapshot {
     pub session_id: SessionId,
-    pub cursor: SessionCursor,
     pub lifecycle: SessionLifecycleView,
     pub definition: SessionDefinitionSummary,
     pub load_state: SessionLoadState,
@@ -862,29 +854,13 @@ pub struct SessionQueueView {
 
 ### Snapshot Consistency
 
-Runtime与Session使用独立owner和cursor：
+Runtime与每个Session使用独立owner和Snapshot，不存在跨scope可比较的全局sequence。
 
-```text
-RuntimeSnapshot at RuntimeCursor R
-SessionSnapshot A at SessionCursor A:17
-SessionSnapshot B at SessionCursor B:42
-```
+`SessionSnapshot`从对应SessionExecutor的latest-wins/coalesced immutable published view读取，不进入mutation/control lane，也不承诺与不同SessionIngress lane形成全局FIFO。`RuntimeSnapshot`由Runtime owner捕获Agent/Session membership和runtime projection，不等待所有SessionExecutor parked，也不构造all-loaded stop-the-world barrier。
 
-不存在跨scope可比较的全局sequence。
+单独调用`snapshot()`只读取调用时的当前view。用于持续观察时，host调用`subscribe(scope)`：owner必须在同一publication synchronization内注册subscriber并捕获初始Snapshot，EventStream第一帧返回该Snapshot，随后只发送该点之后的实时事件。禁止用非原子的“先snapshot再subscribe”或“先subscribe再snapshot”替代。
 
-`SessionSnapshot`从对应SessionExecutor带`SessionCursor`的immutable published view读取，并通过latest-wins/coalesced `SnapshotMailbox`返回。view publication与SessionCursor推进在Executor内原子完成：cursor N包含全部`<= N`的StateEvent效果且不包含`> N`的效果。它不进入mutation/control lane，也不承诺与不同SessionIngress lane形成全局FIFO。
-
-`RuntimeSnapshot`由Runtime owner捕获Agent/Session membership和runtime projection。它不等待所有SessionExecutor parked，也不构造all-loaded stop-the-world barrier。
-
-UI恢复一个Session：
-
-```text
-snapshot(SessionId) → cursor N
-subscribe(SessionId, after N)
-ignore state events <= N
-```
-
-若snapshot与subscribe之间发生变化，subscription从bounded reliable buffer补发；buffer不足返回Gap，调用方重新snapshot。
+断线、subscriber背压、Runtime restart或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。
 
 ## Event
 
@@ -900,14 +876,8 @@ pub enum SubscriptionScope {
     },
 }
 
-pub enum EventCursor {
-    Runtime(RuntimeCursor),
-    Session(SessionCursor),
-}
-
 pub struct SubscriptionRequest {
     pub scope: SubscriptionScope,
-    pub after: Option<EventCursor>,
     pub include_progress: bool,
 }
 ```
@@ -932,9 +902,9 @@ Session scope发布：
 
 ```rust
 pub enum EventFrame {
+    Snapshot(SnapshotResponse),
     State(StateEvent),
     Progress(ProgressEvent),
-    Gap(EventGap),
     Closed(SubscriptionClosed),
 }
 ```
@@ -944,7 +914,6 @@ pub enum EventFrame {
 ```rust
 pub struct StateEvent {
     pub event_id: EventId,
-    pub cursor: ScopedCursor,
     pub timestamp: Timestamp,
     pub command_id: Option<CommandId>,
     pub route: EventRoute,
@@ -954,9 +923,10 @@ pub struct StateEvent {
 
 StateEvent规则：
 
-- scope内cursor严格单调；
-- 一旦分配cursor，subscriber delivery不能静默丢弃；
-- subscriber queue无法继续时发送Gap/Closed，调用方使用Snapshot恢复；
+- subscription第一帧必须是与scope匹配的完整Snapshot；
+- 同一subscription lifetime内，StateEvent按publisher发送顺序交付；
+- subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
+- 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - durable conversation fact必须从append/apply后的CommittedSessionEntry派生；
 - process-local load/readiness/queue事实必须能从对应Snapshot重建；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
@@ -1009,7 +979,7 @@ pub struct ProgressEvent {
 }
 ```
 
-ProgressEvent不携带RuntimeCursor或SessionCursor。典型内容：
+ProgressEvent不参与可靠状态恢复，可以合并或丢弃。典型内容：
 
 ```text
 agent_message_delta
@@ -1023,7 +993,7 @@ model_attempt_progress
 
 - 可以按SessionId/TurnId/ItemId合并连续delta；
 - queue满时可以丢弃中间progress；
-- progress缺失不触发StateEvent gap；
+- progress缺失不影响StateEvent或Snapshot正确性；
 - Item/Turn最终StateEvent携带完整final view；
 - progress不写SessionStorage，不成为conversation truth；
 - progress publisher失败不影响Turn执行或terminal。
@@ -1271,7 +1241,6 @@ Transport Adapter不负责：
 
 - Session selection；
 - command parse/authorization；
-- event cursor生成；
 - Session state；
 - Tool approval policy；
 - provider retry；
@@ -1279,7 +1248,7 @@ Transport Adapter不负责：
 
 Presentation Adapter与Transport Adapter可以由同一个host实现，但职责不同：Presentation Adapter决定modal、聊天卡片、终端菜单、表单文案与本地交互；Transport Adapter只传输Runtime已定义的request/resolution。两者都不拥有MiniCore Interaction truth。
 
-Transport request id不能替代CommandId、TurnId、RequestId或cursor。
+Transport request id不能替代CommandId、TurnId或RequestId。
 
 ## Version 与 Capability
 
@@ -1383,7 +1352,7 @@ SnapshotError
   scope不存在、Session未loaded、snapshot unavailable
 
 SubscriptionError
-  invalid cursor、scope不支持、replay window不足
+  scope不支持、Session未loaded、publisher unavailable
 
 StateEvent
   已接受异步工作的后续业务失败，例如TurnFailed
@@ -1413,27 +1382,27 @@ Public interface是 contract test surface。
 
 ### Query/Snapshot Tests
 
-- Query只读且不增加cursor；
+- Query只读且不发布Event；
 - session list不加载SessionExecutor；
 - history tree不暴露internal entry/event；
-- SessionSnapshot读取带SessionCursor的immutable published view；
-- SessionSnapshot cursor N恰好包含全部`<= N`且不包含`> N`的StateEvent效果；
+- SessionSnapshot读取immutable published view；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
-- cursor与scope不匹配时拒绝。
+- snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
 
 ### Event Tests
 
-- RuntimeCursor和每个SessionCursor独立单调；
-- StateEvent不能静默丢弃；
+- Runtime与每个Session subscription彼此独立；
+- 每条stream首帧是scope匹配的Snapshot；
+- 当前subscription内StateEvent保持发送顺序；
+- subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
 - ProgressEvent可以合并/丢弃；
-- progress丢失不产生state gap；
 - final Item event携带完整view；
 - Interaction request-after-append和resolution-before-resume；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
 - Turn只有一个terminal event；
-- subscriber buffer不足返回Gap并可snapshot恢复。
+- subscriber buffer不足时关闭stream，不做event replay。
 
 ### Security Tests
 
@@ -1450,9 +1419,9 @@ Public interface是 contract test surface。
 
 优点：所有event有单一total order，reducer概念简单。
 
-缺点：每次完整snapshot需要协调所有SessionExecutor；一个慢Session拖住全Runtime；filtered subscriber仍要处理无关gap；多Session之间通常没有业务因果关系。
+缺点：每次完整snapshot需要协调所有SessionExecutor；一个慢Session拖住全Runtime；filtered subscriber仍要处理无关event；多Session之间通常没有业务因果关系。
 
-结论：不采用。Runtime与Session使用独立cursor和snapshot。
+结论：不采用。Runtime与Session使用独立Snapshot和snapshot-first实时流，不建立全局或per-scope公开cursor。
 
 ### 一个长请求持有完整Turn
 
@@ -1499,8 +1468,8 @@ Public interface是 contract test surface。
 1. 冻结public serde naming和protocol crate layout；
 2. 实现Agent/Session durable command/query owner；
 3. 实现MiniCoreRuntime dispatch routing；
-4. 实现RuntimeCursor publisher和RuntimeSnapshot；
-5. 实现per-session StateEvent publisher、SessionCursor和SessionSnapshot；
+4. 实现Runtime snapshot-first publisher和RuntimeSnapshot；
+5. 实现per-session snapshot-first publisher、SessionSnapshot和原子subscriber注册；
 6. 实现ProgressEventPublisher adapter；
 7. 实现CommandManager target migration和builtin command packs；
 8. 实现history tree Query和ForkAnchor解析；
@@ -1518,7 +1487,7 @@ Public interface是 contract test surface。
 - [x] 确定CommandSurface ownership和slash/catalog统一入口。
 - [x] 确定Query family和分页规则。
 - [x] 确定RuntimeSnapshot与SessionSnapshot分域。
-- [x] 确定RuntimeCursor与per-session SessionCursor。
+- [x] 确定Runtime与per-session snapshot-first实时流，不公开cursor/replay。
 - [x] 分离StateEvent与ProgressEvent。
 - [x] 确定Interaction公开request/resolution。
 - [x] 确定message tree Query和ForkAnchor。

@@ -97,7 +97,7 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 **D1 · 控制面与数据面共享 bounded FIFO，无优先通道（已关闭）**
 `Cancel`/`ResolveInteraction`/`WorkspaceAuthorizationRevoked` 与 `Submit`/`Steer`/`GetSnapshot`/`ToolControl` 走同一队列；队列满时 Cancel 排队等待，其间 Turn 持续调用 model / 执行 tool / 计费。Revocation 的安全性已由 out-of-band lease（`authorize_commit` vs `revoke` 同一同步原语）保住，但 Revocation 的 terminalize/资源释放/`TurnInterrupted` 事件、以及 Cancel 的全部语义仍受队列排空速度支配，Cancel 无 out-of-band backstop。
 - 影响：控制面被数据面 backpressure 饿死，与文档「Cancel/ResolveInteraction 不被阻塞」的自述矛盾；队列类型选择应在实现前定。
-- 决议：采用per-session `SessionIngress` semantic lanes，不再建立跨lane全局FIFO。Submit、per-Turn Steer、FollowUp、InteractionControl和ToolControl各自bounded；Cancel/revocation使用sticky `EmergencyControl`；PrepareForUnload使用sticky lifecycle signal和有限grace deadline；Snapshot读取带cursor的immutable published view。保留单一SessionExecutor/Writer owner。权威决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
+- 决议：采用per-session `SessionIngress` semantic lanes，不再建立跨lane全局FIFO。Submit、per-Turn Steer、FollowUp、InteractionControl和ToolControl各自bounded；Cancel/revocation使用sticky `EmergencyControl`；PrepareForUnload使用sticky lifecycle signal和有限grace deadline；Snapshot读取immutable published view。保留单一SessionExecutor/Writer owner。权威决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 - 出处：`session-execution.md`。
 
 ### E. 能力缺口 / 可能需重定范围
@@ -143,17 +143,17 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ### 协议 / 事件语义标注（点明即可）
 
-- `CommandResponse` 无 cursor watermark → 附命令线性化点水位，避免只靠「subscribe-before-dispatch」纪律（本清单最值得做的非阻塞改进）。
-- cursor 跨 load-epoch / 重启连续性未定义 → 引入 `epoch`/`generation`，旧 epoch cursor 返回 typed re-snapshot；`SnapshotResponse` 携同一 epoch。**若不加 epoch，此条会升级为阻塞。**
+- ~~`CommandResponse`无cursor watermark~~：**已关闭**。ADR 0114删除公开cursor/replay；CommandResponse只返回typed outcome，持续观察使用原子snapshot-first subscription。
+- ~~cursor跨load-epoch/restart连续性未定义~~：**已关闭**。首版无公开cursor或跨restart续订；disconnect、背压或restart后重新subscribe并获取新Snapshot。
 - Interaction `expires_at` 到期后由谁推进未定（auto-deny 系统 resolution vs Turn failed）→ 无人应答时 Running Turn 可能永停在 `WaitingApproval`；可能已在 `turn-item-interaction.md` 覆盖，需回链确认。
 - `CommandId` 与 `SubmissionId` 双 correlation id → 评估用 Submit 的 `CommandId` 统一。
-- reliable StateEvent 混载 durable-derived（turn/item）与 volatile（readiness/queue/phase）→ 标注 volatile StateEvent 可靠性仅限单个 runtime lifetime；`FollowUpQueued`/`SteerQueued` 无 crash-safe 承诺。
+- StateEvent混载durable-derived（turn/item）与volatile（readiness/queue/phase）→ 标注两者只在当前subscription lifetime内按序交付；`FollowUpQueued`/`SteerQueued`无crash-safe承诺，restart后以Snapshot和durable projection恢复。
 - message/reasoning Item 只有 `item_completed` 无 `*_started`（ToolInvocation 有 started+completed）→ 明确 host 须能仅凭 ProgressEvent 构造 provisional Item view、`ItemId` 在 Item 开始即分配且稳定。
-- Turn/Item 公开排序键未定义（`ItemId` 无序、`EntryId` 不作 UI 输入）→ 明确 opaque sequence/cursor 作 UI order token，保证 Query 拉取与事件插入排序一致。
+- Turn/Item公开排序键未定义（`ItemId`无序、`EntryId`不作UI输入）→ 定义scope-local opaque display sequence作为UI order token；它只负责当前read model排序，不承担event replay cursor。
 - Runtime scope 与 Session scope 无跨流顺序保证 → 给 host 一句 reducer 指引（两 scope 皆可作为 Session 首次出现来源）。
 - 公开 history 读模型 vs 模型可见 conversation 是同一 storage 两投影（durable 但未 `tool_round_completed` 的 tool entry 对 UI 可见、对模型不可见）→ 点明为有意投影差异，避免误判一致性 bug。
 - Agent→Session 是 reference-grouping 而非 containment（删 Agent 不级联、history 仍可读）→ ADR 0100 一句话点明。
-- `QueryResponse.stamp` 与 `SessionSnapshot` 定位重叠 → 点明 Query ReadStamp 不保证跨调用原子一致，Snapshot 才是 reducer bootstrap 的原子读。
+- ~~`QueryResponse.stamp`与`SessionSnapshot`定位重叠~~：**已关闭**。删除cursor-based ReadStamp；Query只返回typed data与可选领域revision，Snapshot或snapshot-first subscription负责完整恢复读模型。
 
 ### 存储 scale / 恢复兜底（correctness 不阻塞，scale 需规划）
 
@@ -231,7 +231,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
 
-- **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量，Tool副作用以`ToolExecutionStarted` append为race线性化点；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline并最终fail closed；Snapshot从带cursor的immutable published view读取。lane只拆ingress，不增加第二个Session状态或durable owner。
+- **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量，Tool副作用以`ToolExecutionStarted` append为race线性化点；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline并最终fail closed；Snapshot从immutable published view读取。lane只拆ingress，不增加第二个Session状态或durable owner。
 
 针对E组已作决定并落盘：
 
@@ -241,3 +241,5 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)：
 
 - **F1（SessionExecutor / ModelGateway / Compaction实现顺序）**：**已关闭**。三个模块保持既有职责边界，但不再按6→7→8独立串行验收。首个实现里程碑使用`ScriptedProviderAdapter`通过真实`PromptSet → ModelCallRequest::new → ModelGateway → ProviderAdapter`路径闭环普通AgentRun与overflow→CompactionSummary→append/apply→reassemble→AgentRun；Rig 0.40.0 spike并行提前执行，并在production provider adapter冻结前作为门禁。
+
+观察协议后续决策见[ADR 0114](../adr/0114-runtime-observation-uses-snapshot-first-streams.md)：首版删除公开RuntimeCursor/SessionCursor、ReadStamp、Gap和event replay；subscribe首帧原子返回Snapshot，之后只发送实时事件，断线/背压/restart后重新subscribe。该变化不影响多Session并行执行。

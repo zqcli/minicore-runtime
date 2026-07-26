@@ -42,7 +42,7 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 
 LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`同样原子排序：admission先赢则Unload drain明确拒绝/清理该请求，stop先赢则直接返回stopping。Emergency、required cleanup control和Snapshot仍可进入。
 
-这些gate只依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、typed completion、StateEvent/cursor和所有durable mutation仍由SessionExecutor确认。
+这些gate只依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、typed completion、StateEvent publication和所有durable mutation仍由SessionExecutor确认。
 
 `ToolExecutionStarted` append/apply是副作用竞态的真实线性化点：
 
@@ -68,7 +68,7 @@ Cancel current Turn时：
 
 `PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后对Pending Interaction fail closed并取消active submission/Turn，完成truthful Tool settlement和terminal append后卸载。Unload不能因host消失或无Interaction deadline而永久悬挂。
 
-`GetSnapshot`不进入mutation/control queue。Executor把StateEvent cursor推进与同cursor的immutable view原子发布；cursor N包含全部`<= N`的效果且不包含`> N`的效果。Snapshot mailbox返回一个明确cursor对应的完整view，调用方从该cursor续订StateEvent。Snapshot与不同lane之间不宣称全局FIFO。
+`GetSnapshot`不进入mutation/control queue。Executor持续发布immutable view，Snapshot mailbox返回latest完整view。用于持续观察时，subscriber注册与初始Snapshot capture在同一publication synchronization内原子完成，之后只发送实时事件。Snapshot与不同lane之间不宣称全局FIFO。
 
 ### State-aware arbitration
 
@@ -98,12 +98,12 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 - 普通输入backpressure不能阻塞Cancel/revocation signal；D1关闭。
 - 不再依赖跨类型全局FIFO；每个race必须由state validation、emergency epoch、authorization lease和durable append线性化点说明。
 - lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate control请求复用shared completion generation，不能让Executor保存无界sender集合。
-- Snapshot读取更轻，不会因工作队列拥塞而超时，但调用方必须使用cursor理解一致性，而不是假设“排在某条mutation之后”。
+- Snapshot读取更轻，不会因工作队列拥塞而超时；持续观察必须使用snapshot-first subscription，不能假设单独Snapshot与某条mutation或后续subscribe形成顺序。
 - 仍只有一个SessionExecutor和一个SessionWriter；没有新增第二个conversation owner或并发mutation actor。
 
 ## 修订关系
 
-本ADR修订 [ADR 0105](0105-session-executor-owns-loaded-session.md) 中“所有请求经同一个bounded FIFO”的ingress细节，并修订 [ADR 0108](0108-runtime-public-protocol.md) 中“SessionSnapshot经request queue线性化”的一致性表述。单Executor ownership、scoped cursor和Runtime公开协议的其他决策保持不变。
+本ADR修订[ADR 0105](0105-session-executor-owns-loaded-session.md)中“所有请求经同一个bounded FIFO”的ingress细节，并修订[ADR 0108](0108-runtime-public-protocol.md)中“SessionSnapshot经request queue线性化”的一致性表述。单Executor ownership保持不变；公开观察协议后由[ADR 0114](0114-runtime-observation-uses-snapshot-first-streams.md)改为snapshot-first实时流。
 
 ## 被否决的方案
 
