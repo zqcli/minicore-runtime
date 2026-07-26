@@ -553,7 +553,7 @@ heartbeat
 
 ```text
 InteractionRequested
-→ TurnId + ItemId + RequestId + typed request + expires_at
+→ TurnId + ItemId + RequestId + typed request
 
 InteractionResolved
 → TurnId + ItemId + RequestId + typed resolution + resolution_key
@@ -569,7 +569,7 @@ interaction_resolved append + apply
 → wake waiter / allow protected continuation
 ```
 
-deadline和resolution必须由单一SessionExecutor线性化。late resolution不得覆盖已committed timeout/cancel resolution。
+resolution与terminal cleanup必须由单一SessionExecutor线性化。late resolution不得覆盖已committed Cancelled resolution；elapsed time本身不写入resolution。
 
 ### ToolExecutionStarted
 
@@ -1199,7 +1199,6 @@ SessionWriter不决定：
 - 何时执行Tool；
 - Steer/FollowUp；
 - cancel；
-- Interaction deadline；
 - terminal winner。
 
 ## 明确不建立

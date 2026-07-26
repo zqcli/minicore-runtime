@@ -19,7 +19,7 @@
 - 外部调用方只持有可克隆的 `SessionExecutionHandle`，不能借用或加锁 Executor 状态。请求经每个Session独立的semantic ingress lane进入；Cancel/revocation、lifecycle和Snapshot不与普通work共享单一bounded FIFO。lane划分与仲裁由[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)定义。
 - 一个 Runtime 允许多个 `SessionExecutor` 同时 `Running`；每个 Session 独立推进，最多一个 Starting/Running Turn。
 - 执行期 state 只有 `Idle → Starting → Running → Finishing → Idle`；WaitingApproval/WaitingForUserInput/Sampling/Compacting/ExecutingTools 是 Running Turn 的阶段，不写 SessionStorage。
-- Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future、deadline与SessionIngress wakeup；等待UserQuestion时只暂停当前Tool future，不阻塞Executor；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
+- Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future与SessionIngress wakeup，LifecycleControl grace deadline通过wakeup推进；等待UserQuestion时只暂停当前Tool future，不阻塞Executor；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
 - Steer和FollowUp分别位于`SessionIngress`的bounded per-Turn `SteerQueue`与`FollowUpQueue`；各自只保留普通FIFO push/pop/remove语义，不拥有Session状态。Steer不取消Sampling；当前assistant/tool step完整committed后、下一次模型调用前pop一条。FollowUp在Turn terminal后最多pop一条并开启新Turn。
 - private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
 - 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。

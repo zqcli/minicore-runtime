@@ -570,7 +570,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-首版ask-user route在`ToolExecutionStarted`、资源锁和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不持有`ToolResourceLocks`或`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、timeout、Unload和Snapshot。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
+首版ask-user route在`ToolExecutionStarted`、资源锁和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不持有`ToolResourceLocks`或`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、Unload和Snapshot；用户沉默时保持Pending，不产生默认Deny。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
 
 WaitingForUserInput不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为UserAnswer，也不preempt当前Interaction。
 

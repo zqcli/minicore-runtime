@@ -191,7 +191,7 @@ pub struct ToolServiceConfig {
 }
 ```
 
-Approval 和 UserQuestion delivery 都不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal `ToolExecutionControl`；它是 Tool 到 SessionExecutor 的 crate-internal producer seam。无交互环境由该 interface durable resolve 为 fail-closed decision，不使用 `None` 表示隐式允许。TUI、Web、GUI 和 RPC 只是接收 UI-safe Interaction view 的 Adapter，不直接持有 waiter 或 writer。
+Approval 和 UserQuestion delivery 都不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal `ToolExecutionControl`；它是 Tool 到 SessionExecutor 的 crate-internal producer seam。明确的non-interactive embedding必须在创建Interaction前选择fail-closed Tool policy或显式Cancel；已经创建的Interaction不会因无subscriber或elapsed time自动resolve，也不使用`None`表示隐式允许。TUI、Web、GUI 和 RPC 只是接收 UI-safe Interaction view 的 Adapter，不直接持有 waiter 或 writer。
 
 调用方不需要直接了解 ToolRegistry、ToolPolicy、Interaction persistence、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
 
@@ -407,7 +407,7 @@ pub enum ToolResultDisposition {
 }
 ```
 
-ToolResult 既表达 executor success，也表达 unknown tool、schema error、Hook deny、policy deny、approval reject、Sandbox deny、timeout 和 confirmed cancellation。provider adapter 可以从 disposition 派生 `is_error`。side-effect outcome unknown 时不构造 ToolResult；对应 ToolInvocation Item 进入 Abandoned。
+ToolResult 既表达 executor success，也表达 unknown tool、schema error、Hook deny、policy deny、approval reject、Sandbox deny、executor timeout 和 confirmed cancellation。provider adapter 可以从 disposition 派生 `is_error`。side-effect outcome unknown 时不构造 ToolResult；对应 ToolInvocation Item 进入 Abandoned。
 
 流式更新使用最小 interface：
 
@@ -682,7 +682,7 @@ ToolExecutionStarted append → side effect
 
 `ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并重新验证cancellation与Workspace lease。Cancel/revocation先被观察则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
 
-`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、`ToolResourceLocks`和外部副作用之前。等待期间不取得或持有资源锁、`WorkspaceCommitAuthorization`或其他跨Session资源；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control、deadline和Snapshot。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
+`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、`ToolResourceLocks`和外部副作用之前。等待期间不取得或持有资源锁、`WorkspaceCommitAuthorization`或其他跨Session资源；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control和Snapshot。Approval与UserQuestion都没有inactivity timeout：用户沉默时保持Pending，不推断Deny。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
 
 TUI、RPC、Web和GUI通过[Runtime Interface](runtime-interface.md)接收UI-safe Interaction StateEvent并提交resolution；它们是Presentation Adapter，负责展示、表单和本地交互，不是ToolService Adapter，也不直接持有Tool waiter。ToolSandbox仍可以有不同操作系统或容器Adapter。
 
@@ -829,7 +829,7 @@ ToolSet::execute(ToolExecutionRequest[])
 preflight / schema / hook / policy
 → ToolExecutionControl.request_user_question
 → WaitingForUserInput（不取资源锁、不写ToolExecutionStarted）
-→ UserAnswer / Cancelled / Expired
+→ UserAnswer / Cancelled
 → PreExecution ToolResult candidate
 → Session execution append role=tool message
 ```

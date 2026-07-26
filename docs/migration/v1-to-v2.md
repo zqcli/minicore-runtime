@@ -340,7 +340,7 @@ SkillView.prompt_view()
 - ToolCall 与 ToolResult 合并为同一个 ToolInvocation Item；
 - ToolInvocation `Started → Completed | Abandoned`；
 - outcome unknown 不生成 synthetic ToolResult；
-- Interaction request/resolution、timeout 和 cancellation family；
+- Interaction request/resolution和cancellation family；用户沉默时保持Pending，不定义默认timeout或Deny；
 - request-before-notify、resolution-before-resume/side-effect；
 - Tool approval 与 UserQuestion 归属于 parent Item；
 - UserQuestion由MiniCore producer seam发起，Presentation Adapter只负责presentation与resolution；

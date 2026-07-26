@@ -133,7 +133,6 @@ pub(crate) struct SessionExecutor {
     candidate_turn: Option<CandidateTurnExecution>,
     current_turn: Option<CurrentTurnExecution>,
     current_operation: Option<RunningOperation>,
-    interaction_deadlines: InteractionDeadlineSet,
     pending_responses: PendingRequestResponses,
     progress_events: ProgressEventPublisher,
 }
@@ -240,7 +239,7 @@ Admission规则：
 
 Tool执行使用crate-private `ToolExecutionControl`请求SessionExecutor完成durable操作。权威 interface（包括 `request_approval`、`request_user_question` 和 `record_execution_start`）只在[Tool子系统](tools.md#tool-execution-control)定义；本模块不重复定义 trait，避免两个窄 interface 漂移。
 
-实现把Tool control request写入`ToolControlQueue`。Tool future发送request后等待typed response，但不持有SessionExecutor的锁或mutable reference。`request_approval`与`request_user_question`都由同一SessionExecutor完成InteractionRequested/Resolved的append/apply、deadline与waiter唤醒；前者返回typed approval，后者返回typed UserQuestion answer。
+实现把Tool control request写入`ToolControlQueue`。Tool future发送request后等待typed response，但不持有SessionExecutor的锁或mutable reference。`request_approval`与`request_user_question`都由同一SessionExecutor完成InteractionRequested/Resolved的append/apply与waiter唤醒；前者返回typed approval，后者返回typed UserQuestion answer。
 
 `ToolControlQueue`只保证自身FIFO，不与Steer或Submit建立全局顺序。安全性依赖state-aware arbitration和append线性化点：处理任何`record_execution_start`前，Executor必须先观察`EmergencyControl`的最新epoch并重新验证Turn、cancellation和authorization；若emergency已生效，拒绝新的execution start。若`ToolExecutionStarted`已经append/apply，则该副作用获得真实线性化结果，后续Cancel只能best-effort取消并确认outcome。
 
@@ -443,17 +442,13 @@ loop {
             current_operation = None;
             handle_operation_result(result).await?;
         }
-
-        deadline = interaction_deadlines.next() => {
-            handle_interaction_timeout(deadline).await?;
-        }
     }
 }
 ```
 
 实现要求：
 
-- 不能在ingress handler中内联等待完整Model request、完整Tool execution或用户approval；主循环通过`select!`同时poll唯一current operation、deadline和lane wakeup；
+- 不能在ingress handler中内联等待完整Model request、完整Tool execution或用户approval；主循环通过`select!`同时poll唯一current operation和lane wakeup；LifecycleControl的grace deadline通过对应wakeup推进；
 - wakeup只触发一次state-aware arbitration；handler按lane取出一条或合并signal，然后更新state、保存response sender或启动operation，再返回主循环；
 - 可以等待一次短SessionWriter append取得确定结果；
 - 如果文件adapter使用blocking syscall，SessionWriter implementation可以在内部offload I/O，但不能产生第二个Session semantic owner；
@@ -465,7 +460,7 @@ loop {
 各 lane 没有隐含的全局 FIFO。Executor在每个安全点按当前状态仲裁，固定优先级为：
 
 1. `EmergencyControl` 与 `LifecycleControl`：先应用新的 cancel/revocation epoch，停止 admission；卸载 deadline 到期时 fail-closed；
-2. 已完成的 operation result、interaction timeout 和 terminal cleanup；它们负责兑现已经发生的 durable work；
+2. 已完成的operation result和terminal cleanup；它们负责兑现已经发生的durable work；
 3. `InteractionControlQueue`：只处理当前 Pending Interaction 的 resolution，append/apply 后再恢复 Tool；
 4. 当前 Tool round 需要的 `ToolControlQueue` 请求；每次只消费 bounded burst，避免 control flood 持续饿死普通 admission；
 5. 当前 Turn 的安全点消费至多一条 `SteerQueue` 消息；
@@ -708,7 +703,7 @@ preflight / schema / hook / policy
 preflight / schema / hook / policy
 → ToolExecutionControl.request_user_question
 → phase = WaitingForUserInput
-→ InteractionResolved(UserAnswer | Cancelled | Expired)
+→ InteractionResolved(UserAnswer | Cancelled)
 → PreExecution ToolResult candidate
 → ask-user route完成后，才允许同一assistant step的其他ToolCall进入普通调度
 ```
@@ -754,7 +749,7 @@ Approval 或 UserQuestion request：
 ToolExecutionControl.request_approval 或 request_user_question
 → SessionExecutor验证Turn/Item/version
 → append/apply InteractionRequested
-→ 注册Pending Interaction和deadline
+→ 注册Pending Interaction
 → 保存Tool control response sender
 → EventPublisher通知host
 → request handler返回主循环
@@ -766,22 +761,13 @@ Resolution：
 
 ```text
 ResolveInteraction(expected TurnId, RequestId, resolution_key)
-→ 验证family、deadline和Pending state
+→ 验证family和Pending state
 → append/apply InteractionResolved
-→ 删除deadline
 → 返回typed decision/answer给Tool future
 → request response成功
 ```
 
-Timeout：
-
-```text
-now >= expires_at
-→ SessionExecutor处理deadline
-→ append/apply InteractionResolved(Expired或fail-closed resolution)
-→ 恢复Tool future
-→ late host response返回InteractionExpired或AlreadyResolved
-```
+等待不会因elapsed time自动结束。Pending Interaction只由Host resolution、显式Cancel、Turn terminal cleanup、Unload/shutdown或restart recovery关闭。
 
 规则：
 
@@ -789,11 +775,11 @@ now >= expires_at
 - reconnect使用相同RequestId；
 - same resolution_key重试幂等；
 - different key在Resolved后返回AlreadyResolved；
-- disconnect不自动关闭Interaction；
-- no-interaction host也必须写入明确fail-closed resolution；
+- disconnect、暂时没有subscriber或长时间无回答都不自动关闭Interaction，也不产生默认Deny；
+- embedding无法展示Interaction时必须选择明确的non-interactive policy或显式Cancel，不能靠时间推断用户决定；
 - Presentation Adapter只渲染UI-safe Interaction view并通过Runtime facade提交resolution；它不能创建MiniCore未请求的问题、直接写SessionStorage或持有Tool waiter；
 - WaitingApproval和WaitingForUserInput时TurnStatus与SessionExecutionState仍为Running；
-- `request_approval`/`request_user_question` handler不能在Executor内等待host response；ResolveInteraction或timeout负责完成保存的Tool control response sender；UserQuestion回答只唤醒原Tool future，不创建新Turn。
+- `request_approval`/`request_user_question` handler不能在Executor内等待host response；ResolveInteraction或生命周期cleanup负责完成保存的Tool control response sender；UserQuestion回答只唤醒原Tool future，不创建新Turn。
 
 ## Steer流程
 
@@ -925,7 +911,7 @@ Cancel(CancelTarget::Turn(expected TurnId))
 - Cancel与Assistant(Final)由Executor实际处理顺序决定；
 - Final先append则Cancel返回TurnNotRunning；Cancel先处理则Final candidate丢弃。
 
-Cancel的signal写入不等待任何bounded work lane；target/generation匹配时，signal路径立即触发该target绑定的current operation cancellation token。Executor消费signal后推进shared completion state、更新Session state并返回主循环；后续OperationResult或timeout处理继续cleanup，TurnInterrupted append/apply后完成Cancel response。
+Cancel的signal写入不等待任何bounded work lane；target/generation匹配时，signal路径立即触发该target绑定的current operation cancellation token。Executor消费signal后推进shared completion state、更新Session state并返回主循环；后续OperationResult或terminal cleanup继续推进，TurnInterrupted append/apply后完成Cancel response。
 
 Turn创建前使用`CancelTarget::Submit(command_id)`：
 
@@ -1094,8 +1080,8 @@ LifecycleControl.prepare_for_unload(deadline)
 → 清理并明确结束queued Steer/FollowUp
 → 如果Idle：关闭ingress/writer并返回ReadyToUnload
 → 如果Starting/Running/Finishing：保留shared completion generation并允许current work在grace期内自然完成
-→ 继续处理EmergencyControl、ResolveInteraction、ToolControl依赖、operation result和timeout
-→ grace deadline到期仍未Idle：fail-closed resolve Pending Interaction，触发current pre-Turn Submit或Turn cancel
+→ 继续处理EmergencyControl、ResolveInteraction、ToolControl依赖和operation result
+→ grace deadline到期仍未Idle：触发current pre-Turn Submit或Turn cancel，并以Cancelled关闭Pending Interaction
 → truthful Tool outcome与terminal append完成
 → 完成PrepareForUnload completion generation
 → Runtime移除SessionExecutionHandle并释放Executor
@@ -1104,9 +1090,9 @@ LifecycleControl.prepare_for_unload(deadline)
 规则：
 
 - signal handler不能内联等待current Turn完成；
-- grace deadline必须由Runtime config给出有限上限，不能依赖可为空的Interaction `expires_at`；
+- grace deadline必须由Runtime config给出有限上限；它是显式Unload的生命周期deadline，不是Interaction inactivity timeout；
 - grace期内current Turn可以正常完成，host也可以ResolveInteraction或显式Cancel；
-- deadline到期后必须fail closed，不能让无host、无Interaction deadline或不可取消等待使Unload永久悬挂；
+- deadline到期后必须Cancel active work并以`Cancelled(TurnTerminated)`关闭Pending Interaction，不能让等待阻止Unload；
 - queued FollowUp默认不会在unload前执行，因为它们在stop-admission时被明确清理；
 - SnapshotMailbox在等待期间仍可读最后published view；
 - executor释放前ingress关闭、writer closed、progress publisher停止，所有response/completion完成。
@@ -1195,7 +1181,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 - 处理`ToolExecutionStarted`前必须观察最新emergency epoch；Cancel/revocation先被观察则拒绝start，start append先完成则副作用可以开始并必须保存真实outcome；
 - Tool results全部保存后、append `tool_round_completed`前，再观察`EmergencyControl`和authorization lease；
 - 处理Finished candidate前观察`EmergencyControl`并重新检查authorization lease；若current Turn的SteerQueue已非空则保存Assistant Continue而不是Final；
-- control lane按bounded burst消费；每个burst结束重新poll operation result、deadline和普通admission，防止control flood无限饿死工作；
+- control lane按bounded burst消费；每个burst结束重新poll operation result、lifecycle signal和普通admission，防止control flood无限饿死工作；
 - terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且TurnAdmissionQueue非空，则先选Submit。未选中的Submit在Session再次Busy时明确结束，不作为隐式FollowUp长期等待；
 - 仲裁只读取当前已观察到的lane/signal，不等待未来request；
 - workspace-dependent conversation entry的append必须持有WorkspaceCommitAuthorization；它与WorkspaceAuthorizationControl.revoke的先后顺序决定append还是revocation获胜；
@@ -1254,7 +1240,6 @@ pub enum SessionExecutionError {
     WorkspaceAuthorizationRevoked,
     InteractionNotFound,
     InteractionAlreadyResolved,
-    InteractionExpired,
     ToolControlRejected,
     StaleOperationResult,
     Storage(SessionWriteError),
@@ -1377,7 +1362,7 @@ MVP性能要求：
 - UserQuestion回答恢复同一个Tool future并形成`PreExecution` ToolResult，不伪造副作用；
 - Presentation Adapter只消费UI-safe Interaction view并通过Runtime facade Resolve，不能直接写Interaction或持有waiter；
 - WaitingForUserInput期间同Session不启动sibling副作用ToolCall，其他Session仍可运行；
-- timeout与host resolution first-wins；
+- 长时间无回答保持Pending，不产生默认Deny；
 - message/reasoning streaming start分配稳定ItemId，started/delta/completed identity一致；
 - 丢失started或delta仍可由item_completed完整final view恢复；
 - append失败不产生item_completed，Cancel/failure丢弃StreamingItem；logical retry通知Host清除上一operation临时view；
@@ -1411,8 +1396,8 @@ MVP性能要求：
 - terminal后FollowUp连续最多admit一条；下一次Idle decision有external Submit时优先Submit，未选中的Submit不跨Turn静默等待；
 - PrepareForUnload拒绝pending Submit并明确结束queued Steer/FollowUp；
 - PrepareForUnload stop-admission与Submit/Steer/FollowUp try_admit双向race无丢失ack：admission先赢则drain明确结束，stop先赢则立即ExecutorStopping；
-- PrepareForUnload grace期仍能处理ResolveInteraction、Cancel、required ToolControl、operation result和timeout；
-- unload deadline到期对无deadline Pending Interaction fail-closed并取消active Turn。
+- PrepareForUnload grace期仍能处理ResolveInteraction、Cancel、required ToolControl和operation result；
+- unload deadline到期取消active Turn并以Cancelled关闭Pending Interaction。
 
 ### Cancel、Security Revocation与Failure
 

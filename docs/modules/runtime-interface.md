@@ -422,9 +422,9 @@ InteractionRequested append/apply
 → resume waiter或允许后续side effect
 ```
 
-`InteractionResolutionInput`必须与request family匹配：ToolApproval接受approval decision，UserQuestion接受UserAnswer；Cancelled/Expired按领域规则关闭任一family。所有identity与family校验由MiniCore执行，不能信任UI本地状态。
+`InteractionResolutionInput`必须与request family匹配：ToolApproval接受approval decision，UserQuestion接受UserAnswer；Cancelled按领域规则关闭任一family。所有identity与family校验由MiniCore执行，不能信任UI本地状态。
 
-MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，持久化request/resolution，处理deadline、Cancel、幂等和recovery。Presentation Adapter只把UI-safe request渲染为弹窗、聊天消息、终端菜单或表单，并把用户答案提交为`InteractionCommand::Resolve`；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionWriter。
+MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，持久化request/resolution，处理Cancel、terminal cleanup、Unload、幂等和recovery。用户长时间无回答、暂时没有subscriber或transport断开都保持Pending，不产生默认Deny。Presentation Adapter只把UI-safe request渲染为弹窗、聊天消息、终端菜单或表单，并把用户答案提交为`InteractionCommand::Resolve`；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionWriter。
 
 结构化Interaction answer不是UserMessage，不开启新Turn。尤其是UserQuestion回答会恢复原来的ToolInvocation；若UI把答案改成Submit/UserMessage，就会错误地创建新Turn。
 
@@ -561,7 +561,6 @@ TurnCancelling
 TurnTerminal
 InteractionNotFound
 InteractionAlreadyResolved
-InteractionExpired
 InteractionFamilyMismatch
 InvalidForkAnchor
 Unauthorized
@@ -1021,7 +1020,6 @@ pub struct InteractionView {
     pub item_id: ItemId,
     pub request: InteractionRequestView,
     pub state: InteractionStateView,
-    pub expires_at: Option<Timestamp>,
 }
 
 pub enum InteractionRequestView {
@@ -1030,7 +1028,7 @@ pub enum InteractionRequestView {
 }
 ```
 
-prepared Tool args、executor handle、sandbox internals和credential不进入event。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity、deadline和first-wins状态。
+prepared Tool args、executor handle、sandbox internals和credential不进入event。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity和first-wins状态。
 
 ## Message Tree 管理
 
@@ -1228,7 +1226,7 @@ ModelCallResult contains built-in ask-user ToolCall
 → same Turn next PromptSet.assemble
 ```
 
-Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/timeout/Unload/Snapshot；其他Session的Executor不受影响。等待期间不持有Tool资源锁或Workspace commit authorization。
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/Unload/Snapshot；其他Session的Executor不受影响。等待期间不持有Tool资源锁或Workspace commit authorization，elapsed time不会自动关闭Interaction。
 
 ## Transport 与 Adapter
 
@@ -1388,7 +1386,8 @@ Public interface是 contract test surface。
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
 - Cancel清理current Turn Steer但保留FollowUp；
 - stale Cancel TurnId/generation不取消新的active Turn；
-- Unload grace deadline到期后fail-closed且不会永久等待Interaction；
+- Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
+- Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
 - Interaction first committed resolution wins；
 - Fork Before/After Item anchor；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
@@ -1417,6 +1416,7 @@ Public interface是 contract test surface。
 - logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；
 - final Item event携带完整view；
 - Interaction request-after-append和resolution-before-resume；
+- elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
 - Turn只有一个terminal event；

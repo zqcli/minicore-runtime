@@ -117,7 +117,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 **E3 · `UserQuestion` Interaction 没有发起 seam（已关闭）**
 `InteractionRequest` 冻结为 `ToolApproval | UserQuestion`，公开协议也含 UserAnswer resolution，但 Tool↔SessionExecutor 唯一 crate-internal seam `ToolExecutionControl` 只有 `request_approval`/`record_execution_start`，`Tool::execute` 只有 `ToolUpdateSink` + 窄 context，无法发起 durable Interaction，也无内建 ask-user Tool。
 - 影响：领域与公开协议承诺 UserQuestion，但执行层无生产者，任何 ask-user 能力无法落地。
-- 决议：在 `ToolExecutionControl` 增加 `request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、资源锁和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不持有跨Session资源；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、timeout、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)。
+- 决议：在 `ToolExecutionControl` 增加 `request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、资源锁和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不持有跨Session资源；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、无限等待、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)。
 - 出处：`turn-item-interaction.md` ↔ `tools.md` ↔ `session-execution.md`。
 
 ### F. 实现顺序
@@ -145,7 +145,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - ~~`CommandResponse`无cursor watermark~~：**已关闭**。ADR 0114删除公开cursor/replay；CommandResponse只返回typed outcome，持续观察使用原子snapshot-first subscription。
 - ~~cursor跨load-epoch/restart连续性未定义~~：**已关闭**。首版无公开cursor或跨restart续订；disconnect、背压或restart后重新subscribe并获取新Snapshot。
-- Interaction `expires_at` 到期后由谁推进未定（auto-deny 系统 resolution vs Turn failed）→ 无人应答时 Running Turn 可能永停在 `WaitingApproval`；可能已在 `turn-item-interaction.md` 覆盖，需回链确认。
+- ~~Interaction `expires_at`到期后由谁推进未定~~：**已关闭**。MVP删除Interaction级`expires_at`、`Expired` resolution和timeout worker；用户沉默、subscriber缺失或transport断开时保持Pending，不推断Deny。Cancel、Turn terminal、PrepareForUnload和restart recovery使用明确Cancelled closure收口。
 - ~~`CommandId`与`SubmissionId`双correlation id~~：**已关闭**。删除独立`SubmissionId`；Submit envelope的随机、不可复用`CommandId`同时作为Turn创建前的process-local admission/cancel target。duplicate in-flight Submit加入原completion；CommandId不持久化，restart后不重放，Turn创建后使用`TurnId`。
 - ~~StateEvent混载durable-derived与process-local状态的可靠性范围不清~~：**已关闭**。StateEvent本身统一为非durable observer record；committed-derived与readiness/queue/phase都只在当前subscription lifetime内按序交付。restart后前者从projection重建，未append Steer/FollowUp和旧phase可以消失，host以新Snapshot为准。
 - ~~message/reasoning Item只有`item_completed`，流式临时view和ItemId语义不清~~：**已关闭**。SessionExecutor只为AgentRun维护process-local `StreamingItem`；message/reasoning在首个streamed content update分配稳定ItemId，started与delta走ProgressEvent，provider final生成`FinalItemCandidate`，append/apply后才发布同ItemId的`item_completed` StateEvent。Host漏掉started时可由首个delta构造临时view；logical retry清理上一operation的临时view，Turn terminal或新Snapshot提供最终校正。
@@ -167,7 +167,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - 多资源 Tool 无全序获取仍可跨 Session 反序死锁，但操作响应 Turn cancellation，故非永久 → 对单次 execute 的多个 canonical `ToolResourceKey` 采用稳定总序获取，避免依赖 cancellation 兜底。
 - ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3关闭**。ADR 0113禁止普通Tool在`ToolExecutionStarted`或持有资源锁后调用`request_user_question`；若未来需要，必须另行定义不持锁的producer protocol。
-- ~~`PrepareForUnload` graceful unload 不自动 Cancel，Interaction `expires_at` 可为 None、disconnect 不自动关闭~~：**已随D1关闭**。LifecycleControl立即stop admission，有限grace deadline到期后对Pending Interaction fail closed并Cancel active Turn。
+- ~~`PrepareForUnload` graceful unload 不自动 Cancel，长期Pending Interaction可能阻止卸载~~：**已随D1关闭**。LifecycleControl立即stop admission；有限grace deadline属于Unload lifecycle，到期后Cancel active Turn并以Cancelled关闭Pending Interaction。
 - 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
 - Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
 - Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，共享同一 Agent 的多 Session 在 status 原语上跨 Session 串行 turn-start → 文档化二者全局加锁总序，记录同 Agent 多 Session turn-start 串行化吞吐影响。
@@ -236,7 +236,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 针对E组已作决定并落盘：
 
 - **E1/E2**：**已关闭**，分别由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录active-Turn checkpoint与模型感知summary budget。
-- **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、timeout/Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。
+- **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、无限等待、Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。
 
 针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)：
 
@@ -249,3 +249,5 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 StateEvent可靠性后续决议：不增加durability enum或第二event通道。所有StateEvent都是当前subscription内按序交付的非durable observer record；payload来源决定restart后的重建方式，Host始终以新Snapshot重置read model。
 
 Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套存储。SessionExecutor只为AgentRun维护`StreamingItem`累积buffer和未提交`FinalItemCandidate`；正式Item只由append/apply后的projection产生。AgentMessage/Reasoning的started/delta属于ProgressEvent。ToolInvocation Started仍由assistant/intermediate tool_call entry append/apply后的projection派生committed-derived StateEvent；后续`ToolExecutionStarted`只表示真实副作用边界。
+
+Interaction等待后续决议：MVP不把用户沉默解释为领域事件，删除通用`expires_at`、`Expired`和Interaction timeout调度。Pending只由typed host resolution或显式生命周期动作关闭；disconnect和无subscriber保持Pending，Unload grace deadline仍独立生效。

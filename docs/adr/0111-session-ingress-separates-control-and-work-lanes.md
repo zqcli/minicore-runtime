@@ -66,7 +66,7 @@ Cancel current Turn时：
 
 ### Lifecycle 与 Snapshot
 
-`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后对Pending Interaction fail closed并取消active pre-Turn Submit或Turn，完成truthful Tool settlement和terminal append后卸载。Unload不能因host消失或无Interaction deadline而永久悬挂。
+`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后取消active pre-Turn Submit或Turn，以Cancelled关闭Pending Interaction，完成truthful Tool settlement和terminal append后卸载。该deadline属于显式Unload lifecycle，不是Interaction inactivity timeout。
 
 `GetSnapshot`不进入mutation/control queue。Executor持续发布immutable view，Snapshot mailbox返回latest完整view。用于持续观察时，subscriber注册与初始Snapshot capture在同一publication synchronization内原子完成，之后只发送实时事件。Snapshot与不同lane之间不宣称全局FIFO。
 
@@ -74,8 +74,8 @@ Cancel current Turn时：
 
 Executor在每个安全点按状态仲裁：
 
-1. emergency与lifecycle signal；
-2. 已完成operation result、deadline和terminal cleanup；
+1. emergency与lifecycle signal，包括到期的Unload grace deadline；
+2. 已完成operation result和terminal cleanup；
 3. Interaction control；
 4. 当前Tool round依赖的Tool control；
 5. 当前Turn安全点消费一条Steer；

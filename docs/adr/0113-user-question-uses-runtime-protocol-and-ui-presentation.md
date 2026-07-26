@@ -5,7 +5,7 @@
 
 ## 背景
 
-`InteractionRequest` 已包含 `ToolApproval | UserQuestion`，但 Tool 到 SessionExecutor 只有 approval 与 execution-start seam，没有真正创建 `UserQuestion` 的 producer。若让 UI 自己决定何时提问、自己保存 pending state，MiniCore 收到的答案就无法可靠绑定到原来的 `TurnId`、`ItemId` 和 `RequestId`；UI 断线、重复提交、Cancel、timeout 和 crash recovery 也会各自形成第二套状态。
+`InteractionRequest` 已包含 `ToolApproval | UserQuestion`，但 Tool 到 SessionExecutor 只有 approval 与 execution-start seam，没有真正创建 `UserQuestion` 的 producer。若让 UI 自己决定何时提问、自己保存 pending state，MiniCore 收到的答案就无法可靠绑定到原来的 `TurnId`、`ItemId` 和 `RequestId`；UI 断线、重复提交、Cancel 和 crash recovery 也会各自形成第二套状态。
 
 同时，等待用户回答不能持有 `ToolResourceLocks`、`WorkspaceCommitAuthorization` 或其他跨 Session 的副作用资源。否则一个用户不回答就可能阻塞其他 Session。
 
@@ -13,7 +13,7 @@
 
 ### 1. 分离展示职责与交互协议职责
 
-- **MiniCore-owned interaction protocol**：SessionExecutor/SessionStorage 创建并持有 typed Interaction 的 request/resolution、identity、durable Pending/Resolved state、append-before-notify、resolution-before-resume、deadline、Cancel、Unload、幂等和 recovery。
+- **MiniCore-owned interaction protocol**：SessionExecutor/SessionStorage 创建并持有 typed Interaction 的 request/resolution、identity、durable Pending/Resolved state、append-before-notify、resolution-before-resume、Cancel、Unload、幂等和 recovery。
 - **UI-owned presentation**：TUI、Web、GUI 或 RPC host 作为 Adapter，决定问题如何呈现（对话框、聊天消息、终端菜单、表单、文案和本地校验），收集答案后提交 `InteractionCommand::Resolve`。
 - UI 不直接持有 Tool waiter、SessionWriter、SessionExecutor handle，也不直接 append Interaction entry。MiniCore 向 UI 发布 UI-safe 的 `InteractionView`，不发布 executor handle、凭据、准备好的 Tool 参数或 Sandbox 内部信息。
 
@@ -52,7 +52,7 @@ TurnExecutionPhase = WaitingForUserInput
 InteractionState = Pending
 ```
 
-当前 Turn 的逻辑执行停在该 Interaction：不开始下一次 Model 调用，也不开始新的副作用 Tool operation。SessionExecutor 本身不阻塞，继续 poll 当前 Tool future、InteractionControl、EmergencyControl、LifecycleControl、deadline 和 Snapshot mailbox。Steer 继续进入该 Turn 的 FIFO，Cancel/timeout/Unload 可以获胜。
+当前 Turn 的逻辑执行停在该 Interaction：不开始下一次 Model 调用，也不开始新的副作用 Tool operation。SessionExecutor 本身不阻塞，继续 poll 当前 Tool future、InteractionControl、EmergencyControl、LifecycleControl 和 Snapshot mailbox。Steer 继续进入该 Turn 的 FIFO，Cancel 或 Unload 可以获胜；elapsed time 不会自动结束等待。
 
 `UserAnswer` 不是新的 UserMessage，也不创建新 Turn；它恢复原 ToolInvocation，随后由同一 Turn 继续。UI transport disconnect 默认不等于 Cancel；MiniCore process restart 仍按既定 conservative recovery 关闭 Pending Interaction 并中断 Turn，不恢复旧 waiter。
 
@@ -87,7 +87,7 @@ Model ToolCall (ask-user)
 ## 后果
 
 - 新增一个小而稳定的 producer interface，Presentation Adapter数量可以增加而不改变Session execution语义。
-- Pending、重复回答、断线、timeout 和 terminal cleanup 仍集中在 MiniCore，避免 UI 与 Runtime 双重事实。
+- Pending、重复回答、断线和 terminal cleanup 仍集中在 MiniCore，避免 UI 与 Runtime 双重事实。
 - 首版 ask-user route 的独占和 pre-execution 限制牺牲了一些 Tool 内部自由度，但明确避免 lock-across-await 和跨 Session 饥饿。
 - `WaitingForUserInput` 是 transient phase，不写入 SessionStorage；Interaction request/resolution 仍是 durable facts。
 
@@ -95,7 +95,7 @@ Model ToolCall (ask-user)
 
 ### UI 自己提问，MiniCore 只接收裸答案
 
-这会把答案变成新的 Submit/UserMessage，无法继续原 ToolInvocation/Turn，也无法可靠处理重复回答、断线和 timeout。
+这会把答案变成新的 Submit/UserMessage，无法继续原 ToolInvocation/Turn，也无法可靠处理重复回答、断线和 Cancel。
 
 ### UI 直接持有 Tool waiter 或写 SessionStorage
 

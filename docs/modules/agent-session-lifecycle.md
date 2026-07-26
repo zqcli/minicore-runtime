@@ -656,7 +656,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、timeout、PrepareForUnload和Snapshot。等待期间不持有Tool资源锁或Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
+当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、PrepareForUnload和Snapshot。等待期间不持有Tool资源锁或Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。用户长时间不回答时Interaction保持Pending。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
 
 ### Steer
 
@@ -753,7 +753,7 @@ Loaded
 → reject pending TurnAdmission requests
 → clear queued Steer/FollowUp并完成其typed outcome
 → grace期内允许active admission/Turn自然完成，继续处理Interaction resolution和truthful Tool outcome
-→ deadline到期仍未Idle：fail-closed resolve Pending Interaction并Cancel active pre-Turn Submit或Turn
+→ deadline到期仍未Idle：Cancel active pre-Turn Submit或Turn，并以Cancelled关闭Pending Interaction
 → terminal append / writer flush完成
 → Unloading
 → drop resolved Workspace state
@@ -764,7 +764,7 @@ Loaded
 
 规则：
 
-- grace deadline必须有限，由Runtime config定义上限；Interaction自身`expires_at = None`不能让Unload永久悬挂；
+- grace deadline必须有限，由Runtime config定义上限；它属于显式Unload lifecycle，不是Interaction inactivity timeout；
 - grace期内显式Cancel可以加速结束，但调用方不需要先手工cancel/resolve再调用Unload；
 - Cancel current Turn默认保留FollowUp，但PrepareForUnload已经在stop-admission时清理queued FollowUp，因此不会在卸载前启动新Turn；
 - 已越过`ToolExecutionStarted`的Tool必须先确认truthful outcome或记录Abandoned，不能为了卸载直接drop；
@@ -1141,7 +1141,8 @@ Agent release channel
 - Workspace unavailable 形成 Loaded + Unavailable；
 - unload stop-admission、grace deadline、fail-closed cancel与幂等completion generation；
 - Session execution Idle/Starting/Running/Finishing；
-- WaitingApproval 保持 Turn Running；
+- WaitingApproval保持Turn Running，长时间无回答不产生默认Deny；
+- subscriber断开后Pending Interaction保持并可由新Snapshot重建；
 - Steer 在 WaitingApproval 时排队；
 - WaitingApproval Steer只进入FIFO，不作为approval decision；
 - WaitingForUserInput保持Turn/Session execution Running，且不持有Tool资源锁；
