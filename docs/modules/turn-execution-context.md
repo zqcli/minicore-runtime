@@ -905,7 +905,7 @@ Context drop 不 unregister Runtime-global Tool、不清空共享 content cache�
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state；
 - 一个Runtime允许多个SessionExecutor同时Running；
 - `SessionIngress`按语义分为TurnAdmission、per-Turn Steer、FollowUp、InteractionControl、ToolControl、EmergencyControl、LifecycleControl和SnapshotMailbox；
-- Cancel/revocation不等待普通work lane，GetSnapshot从带cursor的immutable published view读取；
+- Cancel/revocation不等待普通work lane，GetSnapshot从immutable published view读取，持续观察使用snapshot-first subscription；
 - Context、Model和Tool使用cancellable `RunningOperation`；
 - operation result使用`SessionId + TurnId + execution_version + OperationType`校验；
 - private AgentLoop只返回NeedModel、NeedTools或Finished；

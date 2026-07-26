@@ -535,8 +535,8 @@ SessionExecutor NeedModel
 - 公开领域 identity 使用 `AgentId → SessionId → TurnId → ItemId → RequestId`，不定义 `RunId` 或 `WorkspaceId`；
 - Command 在明确线性化点返回 typed outcome，Turn 长期完成通过 Event 发布；
 - CommandSurface 是 Runtime 内部无状态命令解释模块，slash text 与 catalog selection 走同一 resolve 路径；
-- Runtime 和每个 Session 使用独立 cursor/snapshot，不建立 runtime-global sequence 或 all-loaded stop-the-world barrier；
-- 可靠 StateEvent 与可合并/丢弃的 ProgressEvent 分离；
+- Runtime和每个Session使用独立Snapshot与snapshot-first实时流，不建立runtime-global sequence、公开cursor/replay或all-loaded stop-the-world barrier；
+- StateEvent与可合并/丢弃的ProgressEvent分离；断线、背压或restart后重新订阅并获取新Snapshot；
 - SessionStorage 拥有 message tree，Runtime 提供 history Query 和 message-anchor Fork command；
 - 所有 Runtime mutation 经过 facade，UI selection、draft、scroll 和 layout 留在 adapter；
 - 首版不公开 standalone/manual `CompactSession`。
@@ -547,7 +547,7 @@ SessionExecutor NeedModel
 - Agent、Session、Turn、Item、Interaction 的公开 payload；
 - command acceptance 与业务完成事件；
 - query consistency；
-- snapshot 水位和重连；
+- Snapshot-first原子订阅、stream关闭和重新Snapshot恢复；
 - adapter capability 与权限；
 - protocol versioning 和兼容策略；
 - 哪些内部对象绝不进入公开协议。
@@ -749,7 +749,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0113）构成，是当前唯一权威事实来源。
+- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0114）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
@@ -772,12 +772,12 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR 采用 `0100`–`0113` 编号，位于 [`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录；UserQuestion producer与UI presentation决策由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。
+- V2 ADR采用`0100`–`0114`编号，位于[`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录；UserQuestion producer与UI presentation决策由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录；snapshot-first观察协议由[ADR 0114](../adr/0114-runtime-observation-uses-snapshot-first-streams.md)记录。
 
 ## 当前迁移状态
 
 阶段1–9目标设计已完成并进入V2正式文档。仓库当前仍为文档阶段，没有`Cargo.toml`、`src/`或`tests/`；production interface和自动化测试尚未实现。
 
-下一实现里程碑是阶段6–8模型调用协同交付束：先建立ScriptedProviderAdapter vertical slice并尽早完成Rig integration spike，再共同落地SessionExecutor、ModelGateway provider adapter和Compaction闭环。该交付束通过后，才进入Runtime protocol types、facade routing、scoped snapshot/event publisher和CommandSurface target architecture实现。
+下一实现里程碑是阶段6–8模型调用协同交付束：先建立ScriptedProviderAdapter vertical slice并尽早完成Rig integration spike，再共同落地SessionExecutor、ModelGateway provider adapter和Compaction闭环。该交付束通过后，才进入Runtime protocol types、facade routing、snapshot-first publisher和CommandSurface target architecture实现。
 
 Extension / Plugin 阶段仍不是核心实现前置条件；只有出现至少两个真实 package/adapter source 后再启动阶段 10 设计。

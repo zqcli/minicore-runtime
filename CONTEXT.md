@@ -31,8 +31,8 @@ _避免_：WebView SDK、前端 Agent
 _避免_：运行时桥接、直接导入SDK、UI回调、内部Service interface
 
 **Runtime Events**：
-Runtime通知host的observer协议。可靠`StateEvent`按Runtime scope或单个Session scope推进cursor；`ProgressEvent`不占用cursor，可以合并或丢弃。它不是SessionStorage ledger或模型conversation。
-_避免_：会话日志、UI store、provider stream原样透传
+Runtime通知host的observer协议。subscribe第一帧是scope完整Snapshot，随后发送当前连接内的`StateEvent`和可合并/丢弃的`ProgressEvent`；断线、背压或restart后重新subscribe，不重放旧事件。它不是SessionStorage ledger或模型conversation。
+_避免_：会话日志、UI store、provider stream原样透传、可恢复event log
 
 **工作区（pre-refactor protocol term）**：
 旧协议把Workspace建模为Runtime-global open/close entity并定义WorkspaceId。目标架构已删除该ownership；当前`Workspace`只表示`SessionDefinition.workspace`中的Session-owned definition value。
@@ -51,16 +51,16 @@ _避免_：模型客户端、API wrapper
 _避免_：TUI后端、桌面后端、UI Service、GUI应用状态、全局current Session
 
 **RuntimeSnapshot**：
-Runtime scope在某个`RuntimeCursor`上的恢复读模型，包含Runtime信息、Agent summary、loaded Session membership、catalog revision和runtime diagnostics。它不包含全部loaded Session的完整message/current Turn/Pending Interaction，也不要求所有SessionExecutor在同一全局水位park。
+Runtime scope的完整恢复读模型，包含Runtime信息、Agent summary、loaded Session membership、catalog revision和runtime diagnostics。它不包含全部loaded Session的完整message/current Turn/Pending Interaction，也不要求所有SessionExecutor同时park。
 _避免_：SessionSnapshot、UI store、Session index、JSONL、全局事件水位
 
 **SessionSnapshot**：
-一个loaded Session在其`SessionCursor`上的恢复读模型，通过对应SessionExecutionHandle排队取得，包含lifecycle、definition summary、readiness、current Turn、active Items、Pending Interaction、queues和usage。完整历史通过Query分页读取。
+一个loaded Session的完整恢复读模型，通过对应SessionExecutionHandle的immutable published view取得，包含lifecycle、definition summary、readiness、current Turn、active Items、Pending Interaction、queues和usage。完整历史通过Query分页读取。
 _避免_：RuntimeSnapshot、完整JSONL replay、durable storage snapshot
 
-**RuntimeCursor / SessionCursor**：
-可靠StateEvent的scope-local恢复水位。Runtime只有一个RuntimeCursor；每个loaded Session有独立SessionCursor。两种cursor不可比较，ProgressEvent不推进cursor。
-_避免_：runtime-global sequence、EntryId、provider stream offset
+**Snapshot-first subscription**：
+Runtime或单个Session的实时观察方式。owner原子完成subscriber注册和初始Snapshot capture，EventStream第一帧返回Snapshot，随后只发送实时事件；断线、背压或restart后重新订阅并获取新Snapshot，不提供公开cursor或事件重放。
+_避免_：先snapshot再subscribe的非原子组合、durable observer log、跨restart offset
 
 **运行时共享模块**：
 `MiniCoreRuntime`拥有的PromptService、ToolService、SkillService和ModelGateway。它们不随UI selected Session改变，也不保存current Session或current Turn。
@@ -243,7 +243,7 @@ _避免_：command::Command、UI action payload、内部调试 API
 _避免_：RuntimeCommand、CommandOutput、Snapshot、UI本地selector、后台job
 
 **查询响应（`QueryResponse`）**：
-`RuntimeQuery`的直接request/response结果，包含scope-local`ReadStamp`、可选领域revision和typed `QueryResult`。它不是业务事件，不推进RuntimeCursor或SessionCursor，transport request id也不进入领域模型。
+`RuntimeQuery`的直接request/response结果，包含可选领域revision和typed `QueryResult`。它不是业务事件，也不保证多个Query调用形成原子Snapshot；transport request id不进入领域模型。
 _避免_：CommandResponse、StateEvent、Snapshot、JSON-RPC request object
 
 **CommandManager**：
@@ -472,15 +472,15 @@ _避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 _避免_：UI widget action、直接后端函数调用、raw storage/model mutation
 
 **StateEvent**：
-Runtime向host发布的可靠、scope-local状态变化记录。Runtime scope使用RuntimeCursor，每个Session scope使用独立SessionCursor；已分配cursor的StateEvent不能静默丢弃，gap通过Snapshot恢复。Durable conversation fact必须从append/apply后的receipt派生。
+Runtime向host发布的scope-local状态变化记录。它在当前snapshot-first subscription lifetime内按发送顺序交付；stream断开或背压时不重放，host重新订阅并从Snapshot恢复。Durable conversation fact必须从append/apply后的receipt派生。
 _避免_：ProgressEvent、SessionStorage entry副本、runtime-global sequence
 
 **ProgressEvent**：
-模型文本/reasoning delta、Tool output和provider retry等高频observer update。不占用RuntimeCursor或SessionCursor，可以合并或丢弃；final StateEvent携带完整view进行校正。
+模型文本/reasoning delta、Tool output和provider retry等高频observer update。它可以合并或丢弃；final StateEvent或重新订阅后的Snapshot携带完整view进行校正。
 _避免_：durable message、terminal event、恢复水位
 
 **事件消息（`StateEventMsg` / `ProgressEventKind`）**：
-事件中的typed payload。外层event拥有scope cursor、route、timestamp和optional CommandId；payload不重复SessionId/TurnId/ItemId/RequestId等route坐标。Progress payload不能作为独立权威状态。
+事件中的typed payload。外层event拥有route、timestamp和optional CommandId；payload不重复SessionId/TurnId/ItemId/RequestId等route坐标。Progress payload不能作为独立权威状态。
 _避免_：chat message、UI显示文案、前端store对象
 
 **事件族**：

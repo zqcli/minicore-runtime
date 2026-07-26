@@ -212,7 +212,7 @@ pub(crate) enum CancelTarget {
 
 `LifecycleControl`的stop-admission transition与Submit/Steer/FollowUp的`try_admit`原子排序：input admission先赢时PrepareForUnload必须在drain中明确拒绝/清理它；stop-admission先赢时发送方直接得到`ExecutorStopping`。Emergency、required cleanup control和Snapshot不受该gate阻止。
 
-Ingress gate只能依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、StateEvent/cursor推进与typed `Queued` completion仍由Executor确认。这样lane可以独立背压，但不会产生第二个Session read/write owner。
+Ingress gate只能依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、StateEvent publication与typed `Queued` completion仍由Executor确认。这样lane可以独立背压，但不会产生第二个Session read/write owner。
 
 Admission规则：
 
@@ -222,7 +222,7 @@ Admission规则：
 - `ResolveInteraction`和`ToolControl`只能对仍然有效的 interaction/turn 生效，过期或不匹配返回 typed rejection；
 - `CancelQueuedMessage`只按`CommandId`删除一条仍在 Steer 或 FollowUp lane 的消息；找到即`Cancelled`，找不到统一返回`NotQueued`，不区分从未排队与已经出队；
 - `InputMailboxControl.remove(command_id)`与对应lane的`pop_front`使用同一原子同步：remove先赢则消息不执行，pop先赢则返回`NotQueued`且不能把消息重新入队；
-- `InputMailboxControl`不直接发布Runtime状态；Executor完成remove、更新immutable snapshot view并发布`queue_updated`后才完成`CancelQueuedMessage` response，因此不产生第二个StateEvent/cursor owner；
+- `InputMailboxControl`不直接发布Runtime状态；Executor完成remove、更新immutable snapshot view并发布`queue_updated`后才完成`CancelQueuedMessage` response，因此不产生第二个StateEvent owner；
 - `Cancel`重复请求只按相同`CancelTarget + target generation`合并，调用方订阅同一个completion generation并在同一terminal fact后完成；Executor不为每个duplicate保存独立sender；stale target不得触发当前或下一Turn的cancellation token；
 - Emergency signal在目标terminal/取消完成后retire，新的Turn使用新的target generation和CancellationToken；
 - revocation signal绑定被撤销的Workspace lease/control generation；future Turn捕获新lease后不继承旧signal；
@@ -1103,7 +1103,7 @@ LifecycleControl.prepare_for_unload(deadline)
 
 ## Snapshot
 
-Executor在每次state/projection变更后，把StateEvent cursor推进与带同一`SessionCursor`的immutable `SessionExecutionSnapshotView`原子发布。cursor N的view包含全部`<= N`的StateEvent效果且不包含`> N`的效果。`GetSnapshot`通过`SnapshotMailbox`读取最新published view：
+Executor在每次state/projection变更后发布新的immutable `SessionExecutionSnapshotView`。`GetSnapshot`通过`SnapshotMailbox`读取latest published view；持续观察通过Runtime Interface的snapshot-first subscription完成：subscriber注册与初始view capture必须在同一publication synchronization内原子完成，随后只接收该点之后的实时事件。view至少包含：
 
 ```text
 Session lifecycle/readiness
@@ -1126,7 +1126,7 @@ Snapshot不包含：
 - mutable references；
 - streaming partial buffer作为authoritative content。
 
-Snapshot不进入mutation/control lane，也不声称与跨 lane 请求形成全局FIFO。它返回某个明确`SessionCursor`对应的完整immutable view；调用方随后从该cursor订阅StateEvent即可补齐snapshot发布后的变化。多个并发snapshot请求可以latest-wins/coalesce，但每个caller都必须得到一个不早于其注册时已published版本的view或typed unavailable error。
+Snapshot不进入mutation/control lane，也不声称与跨lane请求形成全局FIFO。多个并发snapshot请求可以latest-wins/coalesce，但每个caller都必须得到一个不早于其注册时已published版本的view或typed unavailable error。subscription背压、disconnect或restart后不重放旧事件；host重新subscribe并从新Snapshot恢复。
 
 ## Progress Event
 
@@ -1146,7 +1146,7 @@ phase change notification
 - queue满时允许丢弃中间progress，但不能丢失durable final event；
 - final event从append/apply后的entry生成，包含完整final snapshot；
 - progress publisher失败不影响SessionStorage或Turn terminal；
-- reliable状态变化进入per-session StateEvent并推进SessionCursor；ProgressEvent不占用cursor且可以合并/丢弃。完整reconnect规则见[Runtime Interface](runtime-interface.md)。
+- 状态变化进入per-session StateEvent；ProgressEvent可以合并/丢弃。subscription背压或disconnect时关闭stream并重新snapshot，完整规则见[Runtime Interface](runtime-interface.md)。
 
 ## Ingress与Operation处理顺序
 
@@ -1167,7 +1167,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 | Workspace authorization revocation | WorkspaceAuthorizationControl.revoke |
 | Cancel触发 | `EmergencyControl` cancel epoch发布；durable完成点仍是terminal append |
 | PrepareForUnload | `LifecycleControl` stop-admission epoch发布；完成点是ReadyToUnload |
-| Snapshot | immutable view所携带的SessionCursor |
+| Snapshot | latest immutable view读取；subscription初始Snapshot与subscriber注册原子完成 |
 | Turn Completed | Assistant(Final) append |
 | Turn Interrupted | TurnInterrupted append |
 | Turn Failed | TurnFailed append |
@@ -1428,7 +1428,7 @@ MVP性能要求：
 
 ### Snapshot与Lane Arbitration
 
-- Snapshot view与SessionCursor原子发布；cursor N恰好覆盖全部`<= N`的StateEvent效果；
+- snapshot-first subscription初始view capture与subscriber注册原子完成，后续事件无缺口且不回放旧事件；
 - SnapshotMailbox在TurnAdmission/ToolControl lane满时仍可返回latest view；
 - emergency/lifecycle优先后，operation result不会被持续control burst永久饿死；
 - InteractionControl和ToolControl按bounded burst消费后重新poll普通admission。
@@ -1477,7 +1477,7 @@ OperationType和duration
 TurnAdmission / Steer / FollowUp / InteractionControl / ToolControl lane depth
 EmergencyControl epoch、target generation与completion subscriber count
 LifecycleControl state、grace deadline与completion subscriber count
-Snapshot published cursor与subscriber count
+Snapshot publication generation与subscriber count
 lane arbitration burst/fairness counters
 Model/Tool cancellation result
 SessionWriter error class
