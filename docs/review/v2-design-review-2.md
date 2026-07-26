@@ -29,9 +29,32 @@
 
 阶段 6–8 交付束的多个关键路径依赖 token 估算：soft trigger 的上下文占用、`CompactionSummaryBudget.estimated_source_tokens`、`StableConversationUnit.estimated_tokens`、PromptSet 最终校验「token estimate 不超过有效模型限制」、`CompactionSummaryAssemblyBasis.fixed_prompt_tokens`。没有任何文档定义估算器归谁所有、算法口径、跨 provider 如何规范化；而估算值进入 `CompactionPlanFingerprint`，意味着估算算法版本本身需要 fingerprint 纪律。
 
-- 影响：这是交付束的隐藏前置，会先于 Rig spike 卡住 Compaction 的 property tests 和 budget 派生实现。
-- 建议：明确 `TokenEstimator` 的 owner（PromptSet 或 ModelGateway 二选一）、估算口径（字节启发式 vs provider tokenizer）、算法版本进入哪些 fingerprint，并重申"本地估算不冒充 provider fact"在接口上的落点。
+- 影响：这是交付束的隐藏前置，会先于 Rig spike 卡住 Compaction 的 property tests 和 budget 派生实现。典型爆发场景：① 英文启发式（bytes÷4）对 UTF-8 中文低估 2–4 倍 → soft trigger 迟到 → 中文长会话系统性走 provider 硬 overflow → 撞上"同 basis 只一次 hard recovery + 单 Turn 次数上限" → TurnFailed，且英文测试集无法复现；② Compaction 与 PromptSet 各自实现估算且口径不一 → 压缩后仍判 overflow 而无新 frontier → `ContextStillTooLargeAfterCompaction`；③ 估算值进入 plan fingerprint，实现不确定或算法升级无版本承载 → 同内容不同指纹的伪失效。
 - 出处：`compaction.md`（Context Budget / Compaction Summary Budget / StableConversationUnit）↔ `prompt.md`（最终校验 / CompactionSummaryAssemblyBasis）↔ `model-gateway.md`（EffectiveModelLimits）。
+
+**修复方案（方案已定稿，权威文档回写待执行）**：
+
+同类产品共识（Codex / Claude Code / pi）均为"上次 provider usage 为主信号 + 保守本地启发式补增量"，多 provider 产品无一内置精确 tokenizer；MiniCore 既有原则文字（provider usage 优先、估算不冒充 fact、window 未知不触发）与共识一致，只补归属与口径：
+
+- **Owner**：token 估算率是 per-model 事实，归 ModelGateway 的 validated model definition——新增 `TokenEstimateRate { bytes_per_token: NonZeroU32, algorithm_version: u16 }`，进入 `ModelDefinitionVersion` / `TurnModelFingerprint` 覆盖范围（不新增独立版本字段；rate 变化 = definition 变化 = 只影响 future Turn，与 exact-pin 语义一致）；
+- **分发**：经 `TurnModelSnapshot::token_estimator()` 以确定性纯值分发；PromptSet 最终校验、Compaction 的 unit/source/pressure 估算与 `CompactionSummaryAssemblyBasis.fixed_prompt_tokens` 共用同一 estimator，**禁止各调用点自行实现估算**；
+- **算法（首版）**：字节保守启发式 `tokens = ceil(bytes / bytes_per_token)`；definition 未声明时 resolution 使用 Runtime 保守默认 `bytes_per_token = 3` 并记 diagnostics（对中文≈1 token/字，对英文高估约 25%——高估方向安全，只会提早压缩）；非文本 content 返回 typed unknown，不参与 soft trigger 估算；
+- **红线不变**：估算不进 `ModelUsage`/durable usage fact；context window 未知不执行 soft trigger；权威判断仍是 PromptSet 最终校验 + provider 响应。
+
+权威文档回写清单（待执行）：
+
+| # | 文件 | 改动 |
+| --- | --- | --- |
+| M1 | `model-gateway.md` | `definition_version` 覆盖清单加入 `token estimate rate` |
+| M2 | `model-gateway.md` | EffectiveModelLimits 节后新增「TokenEstimateRate」小节：struct、`TurnModelSnapshot::token_estimator()`、唯一估算来源与消费纪律；TurnModelSnapshot 增加私有 `token_estimate` 字段 |
+| M3 | `model-gateway.md` | Test Matrix（Model Resolution）新增：rate 入 definition/fingerprint 且只影响 future Turn；未声明用保守默认并记 diagnostics；estimator 跨调用点确定性一致 |
+| C1 | `compaction.md` | `CompactionPlanningInput` 携带 Turn-pinned `TokenEstimator`（与 EffectiveModelLimits 并列）；声明 unit/source/pressure 估算全部来自该 estimator，Compaction 不自行实现 |
+| C2 | `compaction.md` | Context Budget 规则中"本地estimate补充trailing committed content"限定为"必须使用`TurnModelSnapshot::token_estimator()`" |
+| C3 | `compaction.md` | Invariants 新增 `COMP-021 所有本地token estimate来自Turn-pinned TokenEstimator；估算rate与算法版本由model definition version覆盖` |
+| P1 | `prompt.md` | 最终校验末条注明 token estimate 使用 `TurnModelSnapshot::token_estimator()` |
+| P2 | `prompt.md` | `CompactionSummaryAssemblyBasis` 段注明 `fixed_prompt_tokens` 使用同一 estimator |
+
+不改动：`StableConversationUnit.estimated_tokens` 等字段本体（来源由 C1 总括约束）、既有红线原文、`ModelUsage` 持久化规则；`TokenEstimator` 的具体方法签名粒度留给实现阶段。
 
 ### R3 · `MiniCoreRuntime` pub 字段与协议禁公开清单矛盾；共享模块口径不一
 
@@ -120,5 +143,7 @@
 ## 评审决议
 
 - **R1（Submit admission语义）**：**已关闭**（2026-07-26）。运行中用户输入的解释归UI/CommandSurface层：Turn Running时默认路由为`Steer`，显式选择时`FollowUp`（与pi的调用方选择、Codex/Claude Code的默认注入一致）。协议层`Submit`收窄为Idle-decision-only：Executor仲裁时非Idle立即`SessionBusy`，`TurnAdmissionQueue`只是请求信箱而非跨Turn排队通道，与FollowUp的职责重叠消除；terminal decision窗口内到达的Submit参与该次公平admission。两条竞态回退为adapter约定：Steer遇terminal typed outcome后改发Submit；Submit遇`SessionBusy`后按新Snapshot重新路由。`Cancel(Submit)`生命周期覆盖信箱停留与Starting期间。已同步：`session-execution.md`（Submit流程、SessionIngress表、Admission规则、Lane arbitration、并发规则、Test Matrix）、`runtime-interface.md`（TurnCommand语义、CommandPromptDelivery、SessionQueueView）。
+
+- **R2（token估算器owner）**：**方案已定稿，权威文档回写待执行**（2026-07-26）。估算率归 ModelGateway 的 validated model definition（`TokenEstimateRate`），经 `TurnModelSnapshot::token_estimator()` 分发为唯一本地估算来源；首版字节保守启发式，rate 由 `ModelDefinitionVersion`/`TurnModelFingerprint` 覆盖。完整方案与 M1–M3/C1–C3/P1–P2 回写清单见上文 R2 节。
 
 其余各项决议后按第一轮惯例在此登记并回写权威文档。
