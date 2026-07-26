@@ -186,7 +186,7 @@ pub(crate) enum CancelTarget {
 
 | 请求 | lane | 容量与语义 |
 | --- | --- | --- |
-| `Submit` | `TurnAdmissionQueue` | bounded FIFO；只保存尚未开始的 Turn admission |
+| `Submit` | `TurnAdmissionQueue` | bounded FIFO 请求信箱；Executor观察到时Idle则参与admission decision，非Idle立即返回`SessionBusy`；不作为跨Turn排队通道 |
 | `Steer` | `SteerQueue<TurnId>` | bounded、按目标 Turn 分组的 FIFO；只作用于 current Turn |
 | `FollowUp` | `FollowUpQueue` | bounded FIFO；terminal Turn 后作为新 Turn admission |
 | `CancelQueuedMessage` | `InputMailboxControl` | 按 `CommandId` 原子删除 Steer 或 FollowUp 中一条，不清空队列 |
@@ -216,7 +216,7 @@ Ingress gate只能依据Executor发布的immutable target/admission generation�
 Admission规则：
 
 - lane capacity由Runtime config决定；lane满时返回对应 typed error（如`TurnAdmissionQueueFull`、`SteerQueueFull`、`FollowUpQueueFull`、`InteractionControlQueueFull`或`ToolControlQueueFull`），不静默丢弃已有输入；
-- `Submit`成功进入`TurnAdmissionQueue`后只表示等待一次Idle admission决策；它不是隐式FollowUp，也不能跨越另一个新Turn长期等待。未选中且Session已被其他消息占用时及时返回`SessionBusy`；真正的 `Started { turn_id }` 仍在线性化的 initiating UserMessage append/apply 后返回；
+- `Submit`进入`TurnAdmissionQueue`后只等待Executor的下一次state-aware仲裁：仲裁时Session为Idle则参与admission decision，非Idle（含Starting/Running/Finishing）立即返回`SessionBusy`。它不是隐式FollowUp，不跨当前或任何Turn等待；Running期间的用户输入应由UI/CommandSurface路由为Steer或FollowUp。真正的 `Started { turn_id }` 仍在线性化的 initiating UserMessage append/apply 后返回；
 - `Steer`/`FollowUp`验证通过并进入各自 FIFO 后立即返回 `Queued`；
 - `ResolveInteraction`和`ToolControl`只能对仍然有效的 interaction/turn 生效，过期或不匹配返回 typed rejection；
 - `CancelQueuedMessage`只按`CommandId`删除一条仍在 Steer 或 FollowUp lane 的消息；找到即`Cancelled`，找不到统一返回`NotQueued`，不区分从未排队与已经出队；
@@ -464,7 +464,7 @@ loop {
 3. `InteractionControlQueue`：只处理当前 Pending Interaction 的 resolution，append/apply 后再恢复 Tool；
 4. 当前 Tool round 需要的 `ToolControlQueue` 请求；每次只消费 bounded burst，避免 control flood 持续饿死普通 admission；
 5. 当前 Turn 的安全点消费至多一条 `SteerQueue` 消息；
-6. Turn terminal 后在 `FollowUpQueue` 与 `TurnAdmissionQueue` 之间做一次公平 admission：已接受的 FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且当前有external Submit，则先选Submit。未选中的Submit在Session再次Busy时明确返回`SessionBusy`，不能被静默留过整个Turn；
+6. Turn terminal 后在 `FollowUpQueue` 与信箱中此刻已到达的 `TurnAdmissionQueue` Submit 之间做一次公平 admission：已接受的 FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且此刻有external Submit，则先选Submit。本次decision未选中的Submit立即返回`SessionBusy`；decision之后到达的Submit按Session当时状态处理（非Idle立即`SessionBusy`）；
 7. `SnapshotMailbox`独立读取最新 immutable published view，不等待上述 lane。
 
 `EmergencyControl`的检查点至少位于启动新 Model、取得 Tool resource lock、`ToolExecutionStarted` append 前，以及 terminal Assistant/`tool_round_completed` append 前。仲裁只处理当前已观察到的 signal，不等待未来请求；因此每个安全点仍有有限、可测试的边界。
@@ -565,7 +565,7 @@ projection apply失败时：
 
 ## Submit流程
 
-普通Submit只在`Idle + Open + Loaded + Ready + accepting_requests`时接受。
+普通Submit只在`Idle + Open + Loaded + Ready + accepting_requests`时接受；Executor处理Submit时Session非Idle则立即返回`SessionBusy`，不跨当前Turn等待。Turn Running期间的用户输入由UI/CommandSurface路由为`Steer`（交互式默认）或`FollowUp`；`TurnAdmissionQueue`只是admission请求信箱，其中的Submit至多等待到下一次state-aware仲裁被观察，不构成隐式FollowUp。
 
 ```text
 Submit
@@ -1183,7 +1183,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 - Tool results全部保存后、append `tool_round_completed`前，再观察`EmergencyControl`和authorization lease；
 - 处理Finished candidate前观察`EmergencyControl`并重新检查authorization lease；若current Turn的SteerQueue已非空则保存Assistant Continue而不是Final；
 - control lane按bounded burst消费；每个burst结束重新poll operation result、lifecycle signal和普通admission，防止control flood无限饿死工作；
-- terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且TurnAdmissionQueue非空，则先选Submit。未选中的Submit在Session再次Busy时明确结束，不作为隐式FollowUp长期等待；
+- terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且此刻信箱中有external Submit，则先选Submit。本次decision未选中的Submit立即返回SessionBusy；decision之后到达的Submit按Session当时状态处理，不作为隐式FollowUp等待；
 - 仲裁只读取当前已观察到的lane/signal，不等待未来request；
 - workspace-dependent conversation entry的append必须持有WorkspaceCommitAuthorization；它与WorkspaceAuthorizationControl.revoke的先后顺序决定append还是revocation获胜；
 - 同时需要两种保护时，先取得非阻塞`TurnControlGate` reservation，再取得`WorkspaceCommitAuthorization`，然后执行一次append/apply；authorization失败则立即释放reservation。TurnControlGate不等待signal，因此不形成反向锁等待；
@@ -1321,7 +1321,9 @@ MVP性能要求：
 - Idle Submit进入Starting；
 - Starting期间第二个Submit返回SessionBusy；
 - TurnAdmissionQueue满返回TurnAdmissionQueueFull，且不影响EmergencyControl；
-- Submit ingress未在本次Idle decision选中且Session被其他消息占用时返回SessionBusy，不跨整个Turn等待；
+- Submit在Executor仲裁时Session非Idle（Starting/Running/Finishing）立即返回SessionBusy，不跨Turn等待；
+- terminal后decision窗口内到达的Submit参与该次公平admission；decision未选中立即SessionBusy；
+- UI默认-Steer回退：Steer遇TurnNotRunning/ExpectedTurnMismatch后，同一输入改发Submit在Idle成功开启新Turn；
 - duplicate in-flight Submit使用相同CommandId加入原completion，不创建第二个candidate；
 - 相同CommandId携带不同command返回CommandConflict；
 - CancelTarget::Submit(CommandId)在排队、Context capture和UserMessage composition期间取消candidate；target退休或restart后返回SubmitNotFound且不能影响future Turn；
