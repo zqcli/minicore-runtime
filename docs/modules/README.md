@@ -36,7 +36,7 @@ MiniCoreRuntime
 
 ## 相关决策
 
-长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)以及[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)。行为与接口以各模块文档、协议文档和ADR为权威。
+长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)、[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)以及[失败由事实拥有模块分类、恢复由执行拥有者决定（ADR 0120）](../adr/0120-failures-stay-with-owning-modules.md)。ADR 0120首版只应用于ModelGateway response validation，不建立独立Error module。行为与接口以各模块文档、协议文档和ADR为权威。
 
 ## 权威归属
 
@@ -57,8 +57,8 @@ MiniCoreRuntime
 | UserQuestion公开view、Presentation Adapter与resolution protocol | [Runtime 公开协议](runtime-interface.md) |
 | durable truth、entry tree、JSONL、conversation projection、recovery | [Conversation 与 SessionStorage](conversation-storage.md) |
 | 单Session执行owner、SessionIngress lanes、唯一current RunningOperation、Steer/FollowUp FIFO、emergency/lifecycle control、multi-session并发 | [Session 执行](session-execution.md) |
-| TurnModelSnapshot、generate_model_turn、provider adapter、single attempt、stream/usage | [ModelGateway](model-gateway.md) |
-| AgentRun/CompactionSummary logical retry policy | [Session 执行](session-execution.md) |
+| TurnModelSnapshot、generate_model_turn、provider adapter、single attempt、stream/usage、response validation与ModelCallErrorReason | [ModelGateway](model-gateway.md) |
+| AgentRun/CompactionSummary logical retry与Turn recovery policy | [Session 执行](session-execution.md) |
 | 压缩触发、stable cut、summary directive、StoredCompaction | [Compaction](compaction.md) |
 
 内存 projection、cache、snapshot 和 UI read model 只能由权威事实派生，不能成为并列 source of truth。

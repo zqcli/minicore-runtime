@@ -227,7 +227,7 @@ PromptSet在一次模型调用前生成的最终provider-neutral模型可见上�
 _避免_：provider payload、Turn state、session message vector、Gateway内重新组装
 
 **输出契约（`OutputContract`）**：
-一次模型调用对输出结构的 provider-neutral 要求，例如 JSON schema、response format 或 required tool choice。它与 prompt text 一起进入 `AssembledModelContext`，但不能靠普通文本替代；真实 provider 映射由 `ModelGateway` 完成。
+一次模型调用对输出结构的provider-neutral要求，例如NoToolCalls或JSON schema。它与prompt text一起进入`AssembledModelContext`，但不能靠普通文本替代；真实provider映射和response validation由`ModelGateway`完成。MVP Structured调用不携带ToolSpec。
 _避免_：system prompt、provider payload、显示格式、max output tokens
 
 **CommandSurface**：
@@ -456,7 +456,10 @@ ModelGateway返回的一次完整terminal success，包含ordered FinalizedAssis
 _避免_：partial stream、durable Item、provider raw response、Turn terminal
 
 **模型调用错误（`ModelCallError`）**：
-ModelGateway返回的redacted typed terminal error。ModelCallErrorKind区分Cancelled、Auth、RateLimited、Quota、ContextOverflow、Capability、Safety、Timeout、Transport、RequestOutcomeUnknown、StreamInterrupted和Protocol等recovery class；caller不得解析provider字符串决定retry。
+ModelGateway返回的redacted typed terminal error。`ModelCallErrorReason`区分Cancelled、Auth、RateLimited、Quota、ContextOverflow、Capability、Safety、Timeout、Transport、RequestOutcomeUnknown、StreamInterrupted，以及UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse；caller不得解析provider字符串决定retry。后四者由Response Validation产生且不自动retry。
+
+**失败处理归属**：
+raw external failure只存在于具体adapter implementation；发生事实的module负责typed error或truthful outcome，掌握Turn、control和durable state的owner负责恢复。不建立全局Error module、ErrorService或共同retryable分类。该规则由ADR 0120记录，首版只应用于ModelGateway response validation。
 _避免_：generic RuntimeError、raw HTTP body、assistant message、ToolResult
 
 **模型进度（`ModelProgressEvent`）**：

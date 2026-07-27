@@ -33,7 +33,7 @@ Turn execution 内部的 AgentLoop 是 sans-I/O 推理协议状态机，只在 `
 ```text
 AwaitingModel { output_contract }
   ← ConversationSeed 构造 / accept_committed_tool_round / accept_committed_steer
-  → accept_model_response(FinalizedAssistantResponse)
+  → accept_model_response(validated FinalizedAssistantResponse)
      ├─ content 含 ToolCall → PendingToolRound { expected: ordered ToolCallIds }
      └─ content 无 ToolCall → EmittedCandidate（next_action 返回 Finished candidate）
 
@@ -48,8 +48,10 @@ EmittedCandidate
      → accept_committed_steer 原地推进回 AwaitingModel（或等价重建 segment）
 ```
 
+ADR 0120关闭了原L1 finish-reason歧义：ModelGateway在构造`ModelCallResult`前已经校验`ModelFinishReason × ToolCall presence × OutputContract`。UnexpectedToolCall、invalid Structured output、finish/content不一致、Length、ContentFiltered和empty terminal response均返回`ModelCallError`，不进入AgentLoop。AgentLoop只对validated response按ToolCall presence做上述二路转换；non-empty Refused是合法无ToolCall candidate。
+
 5. **Steer 原地推进为默认路径**：`accept_committed_steer` 消费 trusted delta 后直接回到 `AwaitingModel`；从 ConversationSeed 重建 segment 保留为等价实现自由。**Compaction Replace 后必须重建 segment**（committed conversation 被整体替换），该规则不变。原为"adapter 不支持原地注入 Steer"和"provider/SDK rollover"保留的重建理由随本 ADR 删除。
-6. **协议校验归 loop**：状态错配（`AwaitingModel` 之外调用 `accept_model_response`、`PendingToolRound` 之外调用 `accept_committed_tool_round`）、tool round coverage 与 expected calls 不匹配、candidate 重复消费，均返回 typed `AgentLoopError`（ProtocolViolation 类），由 SessionExecutor 按 invariant violation 规则处理（停止执行、replay 或 Unavailable）。
+6. **状态机校验归 loop**：状态错配、tool round coverage与expected calls不匹配、candidate重复消费都返回typed `AgentLoopError`，由SessionExecutor按invariant failure规则处理（停止执行、replay或Unavailable）。Provider response错误归ModelGateway，不使用AgentLoop error表达。AgentLoop具体error reason随第三轮L2/L3一起冻结，不由ADR 0120提前决定。
 7. **禁令清单不变**：不读写 SessionStorage、不调用 PromptService/ToolService/SkillService/ModelGateway、不读取 current Workspace/definition、不拼接 prompt、不在 `tool_round_completed` 前把 ToolResult 加入 conversation、不处理 approval、不发布事件、不决定 terminal。
 8. **删除 monolithic adapter task 例外**：自研状态机是同步纯逻辑，由 SessionExecutor 主循环直接方法调用；`session-execution.md`"强制 two-owner execution"否决条款中为 Rig monolithic future 保留的 private adapter task 但书随本 ADR 删除。
 
@@ -70,7 +72,8 @@ EmittedCandidate
 
 ## 测试要求
 
-- 三态转换全覆盖：合法序列产生确定动作序列；每个非法转换返回 typed ProtocolViolation；
+- 三态转换全覆盖：合法序列产生确定动作序列；每个非法转换返回typed AgentLoop error；具体reason随L2/L3冻结；
+- ModelGateway response decision table全覆盖；UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse永不进入AgentLoop；
 - tool round coverage：missing/duplicate/reordered/跨 Turn ToolCallId 均拒绝；
 - candidate 幂等：EmittedCandidate 只能被消费一次；Continue 后状态机可继续；
 - Compaction Replace 后旧 segment 不可继续使用，新 seed 重建后行为与全量 replay 等价；

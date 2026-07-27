@@ -529,12 +529,14 @@ Compaction只接受：
 - non-empty text summary；
 - no ToolCall；
 - no unresolved structured output；
-- finish reason不是Length/Safety/ContentFilter；
+- finish reason为Stop或adapter合法归一化的Unknown；
 - summary bytes不超过max；
 - usage和provider metadata可规范化；
 - returned request/assembly fingerprint exact match。
 
 SummaryModel返回的reasoning不进入conversation。StoredCompaction不单独保存summary-call reasoning；实现不得保存或伪造provider未返回的hidden chain-of-thought。
+
+由于CompactionSummary固定使用`OutputContract::NoToolCalls`，Provider返回ToolCall时ModelGateway直接返回`UnexpectedToolCall`，Compaction不会看到可执行call。`InvalidProviderResponse`和`IncompleteResponse`同样不会产生summary candidate；non-empty `Refused`虽然是合法Model response，但不是合法summary，由Compaction映射为`SummaryInvalid`。这些结果都不属于SummaryModel transient retry。
 
 ### Retry
 
@@ -542,7 +544,7 @@ ModelGateway每次SummaryModel operation最多执行一个provider attempt；Rig
 
 logical SummaryModel retry由SessionExecutor决定，默认最多1次并使用2秒backoff。`RunningOperation::CompactConversation`形成并持有exact `Arc<ModelCallRequest>`及其request proof；进入`WaitForModelRetry`时同时移动该Arc与`ModelRetryResume::CompactionSummary { source, scope, plan_fingerprint }`，恢复Compaction operation时不重新plan或assemble。由此复用相同CompactionPlan、PromptSet、TurnModelSnapshot、AssembledModelContext、summary directive和source checkpoint；request前credential refresh不改变logical request。
 
-只有Gateway已证明`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`时，才允许该一次retry。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理；`RequestOutcomeUnknown`或`StreamInterrupted`不能重放，也不能通过改变summary directive伪装成同一次retry。完整规则见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
+只有Gateway已证明`NotSent`或`RejectedBeforeExecution`，且reason是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`时，才允许该一次retry。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理；`RequestOutcomeUnknown`、`StreamInterrupted`、`UnexpectedToolCall`、`InvalidProviderResponse`和`IncompleteResponse`不能重放，也不能通过改变summary directive伪装成同一次retry。完整规则见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)和[ADR 0120](../adr/0120-failures-stay-with-owning-modules.md)。
 
 ## Session Execution Integration
 
@@ -728,7 +730,7 @@ Compaction summary output不交给AgentLoop当作assistant response。旧AgentLo
 | NoFeasibleSummaryBudget | 原request仍valid时继续 | TurnFailed；保留Compaction domain error |
 | SummarySourceTooLarge | 原request仍valid时继续 | TurnFailed |
 | summary auth/rate/transport exhausted | 原request仍valid时继续 | TurnFailed |
-| summary invalid/length/tool call | 原request仍valid时继续 | TurnFailed |
+| summary Refused/invalid，或Gateway返回UnexpectedToolCall/InvalidProviderResponse/IncompleteResponse（CompactionSummary不使用Structured） | 原request仍valid时继续 | TurnFailed |
 | source changed | 不使用candidate并fail closed | fail closed；不在同一operation内重计划 |
 | Cancelled/revoked | 进入Turn interruption cleanup | 进入Turn interruption cleanup |
 | storage failure | Session unavailable/Turn failure规则 | 同左 |
@@ -1000,8 +1002,8 @@ COMP-020 effective summary budget与pinned model known limits一致并进入fing
 10. context剩余空间低于summary minimum时返回NoFeasibleSummaryBudget；
 11. unknown model limit保持unknown且不按model name猜测；
 12. Tool messages durable但缺少`tool_round_completed`；
-13. summary result返回ToolCall；
-14. summary finish reason Length；
+13. summary result返回ToolCall时Gateway返回UnexpectedToolCall，Compaction不取得candidate；
+14. summary finish reason Length时Gateway返回IncompleteResponse，Compaction不取得candidate；
 15. summary期间Steer排队；
 16. summary期间Cancel；
 17. summary期间Workspace revocation；

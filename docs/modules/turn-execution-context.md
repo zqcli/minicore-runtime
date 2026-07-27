@@ -468,6 +468,8 @@ AgentLoop 是自研的同步协议状态机（ADR 0115），以直接方法调�
 
 NeedModel只表示普通`AgentRun`需要模型输出；CompactionSummary由SessionExecutor在AgentLoop之外启动，AgentLoop不能选择ModelCallPurpose。`Finished`只表示candidate final：Steer FIFO为空时保存为Assistant Final；FIFO非空时保存为Assistant Continue并重建AgentLoop segment。
 
+ModelGateway在`ModelCallResult`前完成Response Validation。AgentLoop只接收validated `FinalizedAssistantResponse`：含ToolCall时进入NeedTools，无ToolCall时进入candidate Finished。UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse由Gateway返回typed ModelCallError，不进入AgentLoop。
+
 AgentLoop 不得：
 
 - 从 SessionStorage 读取或写入 conversation；
@@ -493,7 +495,8 @@ loop:
   → steer FIFO非空时pop_front一条并append/apply Steer
   → Context.assemble_model_context(committed conversation)
   → ModelGateway.generate_model_turn(immutable ModelCallRequest)
-  → 把 ModelOutput 交回 AgentLoop adapter
+     ├─ validated response：交回AgentLoop
+     └─ response error：SessionExecutor按non-retryable Model failure收口
 
   NeedTools
   → observe EmergencyControl Cancel/revocation epoch
@@ -1040,6 +1043,7 @@ AgentLoop registry
 - User Skill injection 进入 committed CanonicalUserMessage；
 - 逻辑模型调用只接受 CommittedConversationView；
 - Session logical retry保持AssembledModelContextFingerprint不变；
+- ModelGateway response error不进入AgentLoop，不执行Tool且不logical retry；
 - NeedTools后、任何side effect前重新检查Cancel state和current authorization；
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
 - InteractionRequested append-before-notify；

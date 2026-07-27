@@ -19,7 +19,7 @@
 - ModelGateway 不重新组装 Prompt：PromptSet 产出的 `AssembledModelContext` 是模型上下文的唯一 producer；Gateway 不重新加载 message、不判断 message visibility、不截断或摘要 conversation。
 - active Turn内禁止transparent transport或cross-model fallback。跨transport/provider/model替换必须由显式Session definition update或下一Turn admission完成。
 - Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只编码并执行一个由Gateway规划好的provider attempt，并把stream/terminal/error映射回MiniCore attempt类型。它不选择provider/model，不决定Session logical retry或cache/continuation policy，也不构造最终`ModelCallResult`；SDK automatic retry固定为0。Rig raw types、`additional_params`、SDK error不越过adapter seam。首批实现为RigProviderAdapter与ScriptedProviderAdapter，保证它是真实seam并支持阶段6–8共享vertical-slice tests。
-- 错误分类为 closed taxonomy，足以驱动 retry、compaction recovery（如 `ContextOverflow`）与 terminal failure，caller 不解析 raw message；`RequestOutcomeUnknown`/`StreamInterrupted` 禁止 blind transparent replay。
+- 错误原因使用closed typed taxonomy，足以驱动retry、compaction recovery（如`ContextOverflow`）与terminal failure，caller不解析raw message；`RequestOutcomeUnknown`/`StreamInterrupted`禁止blind replay。ADR 0120进一步规定Gateway在`ModelCallResult`前验证finish/content与OutputContract。
 - cache、connection reuse 与 continuation 必须保持 full-request equivalence：任何 optimization 都能退回完整 `AssembledModelContext` 请求，它们只是 wire optimization，不是第二 conversation truth。
 
 ## 后果
@@ -41,4 +41,4 @@
 
 原文见 `docs/archive/v1/adr/`。
 
-Model retry与transport fallback部分由[ADR 0119](0119-model-calls-use-session-logical-retries.md)进一步收窄；本ADR的single deep operation与provider-neutral seam决策保持有效。
+Model retry与transport fallback部分由[ADR 0119](0119-model-calls-use-session-logical-retries.md)进一步收窄；response error ownership与命名由[ADR 0120](0120-failures-stay-with-owning-modules.md)补充。本ADR的single deep operation与provider-neutral seam决策保持有效。
