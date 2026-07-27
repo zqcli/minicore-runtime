@@ -49,12 +49,12 @@ ADR 0115 将 `accept_committed_steer` 原地推进定为默认路径，Conversat
 - 建议：SessionExecutor 的规范流程固定调用 `accept_committed_steer(trusted delta)`；AgentLoop implementation 可以在该方法内部增量推进或通过 private helper 等价重建。只有 Compaction Replace 由 SessionExecutor 从新 ConversationSeed 强制重建 segment。
 - 出处：ADR 0115「Steer 原地推进为默认路径」；`session-execution.md`「AgentLoop Interface」「Steer流程」「Completed Turn流程」。
 
-### L5 · ADR 0105 残留“AgentLoop 可替换（含 Rig adapter）”旧结论
+### L5 · ADR 0105 残留“AgentLoop 可替换（含 Rig adapter）”旧结论（已关闭）
 
 ADR 0105 的后果仍写“AgentLoop 可替换（含 Rig adapter）”，与 ADR 0115 已关闭 Rig/SDK loop 实现分支、且第二个真实实现出现前不建立稳定 seam 的决定冲突。
 
 - 影响：正式 ADR 同时给出两种相反结论，可能诱导实现者增加 `AgentLoop` public trait、factory、registry 或 Rig loop adapter，重新引入已删除的间接层。
-- 建议：修订 ADR 0105 对应条目，明确 AgentLoop 保持 crate-private concrete state machine；它不触碰 storage 与 I/O 顺序，但当前不承诺可替换 seam，Rig 只用于 ModelGateway private provider adapter。并在 ADR 0105 历史段登记 ADR 0115 的修订关系。
+- 处理：已修订 ADR 0105，明确 AgentLoop 保持 crate-private concrete state machine、第二个真实实现出现前不建立稳定替换 seam，并在历史段登记 ADR 0115；同时在架构入口、ModelGateway权威设计、ADR 0106/0115、Runtime调用链和迁移记录中统一Rig职责：RigProviderAdapter只处理provider attempt，ModelGateway拥有其余模型调用编排与terminal语义。
 - 出处：ADR 0105「后果」；ADR 0115「决定」「后果」。
 
 ## 三、结论摘要
@@ -65,10 +65,11 @@ ADR 0105 的后果仍写“AgentLoop 可替换（含 Rig adapter）”，与 ADR
 | SessionExecutor / AgentLoop ownership | 总体清晰，无需合并 |
 | 编码前阻塞 | L1 finish-reason 决策表、L2 one-shot action emission |
 | interface 收窄 | L3 建议使用 trusted typed protocol delta |
-| 文档一致性 | L4 Steer 路径、L5 ADR 0105 需同步 |
+| 文档一致性 | L4 Steer 路径待同步；L5 ADR 0105 与Rig职责说明已关闭 |
 | Rig 边界 | 只实现 ModelGateway 内部 ProviderAdapter 的 provider 映射与调用，不拥有 ModelGateway |
 
 ## 评审决议
 
-- **L1–L5**：均为待决议。建议在 AgentLoop 首个实现提交前一次性回写 ADR 0115、ADR 0105、`session-execution.md`、`model-gateway.md` 与必要的 storage interface 说明。
+- **L1–L4**：待决议。建议在 AgentLoop 首个实现提交前一次性回写 ADR 0115、`session-execution.md`、`model-gateway.md` 与必要的 storage interface 说明。
+- **L5**：**已关闭**（2026-07-27）。ADR 0105旧结论已修订，Rig职责已统一为ModelGateway private ProviderAdapter中的provider attempt映射与调用；Rig不拥有AgentLoop或ModelGateway编排。
 - 修订完成门槛：finish-reason 决策表冻结；action one-shot 语义可测试；ToolRound/Steer 输入 contract 收窄；Steer 规范路径唯一；正式 ADR 不再保留 Rig loop adapter 旧叙事。

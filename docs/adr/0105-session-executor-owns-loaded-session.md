@@ -34,7 +34,7 @@
 - 多 Session 可后台并发执行，共享服务用配额与 resource locks 协调；UI selection 不影响后台执行。
 - Pending UserQuestion只暂停所属Session当前Turn的逻辑推进；UI presentation断线不改变durable Interaction，其他Session仍可独立运行。
 - 严格串行current operation消除同Session logical retry的本地迟到结果竞态；execution version只验证conversation/control basis。provider端可能继续工作或计费仍不宣称exactly-once。Tool副作用真实性继续由outcome确认规则处理。
-- AgentLoop 可替换（含 Rig adapter），因为它不触碰 storage 与 I/O 顺序。
+- AgentLoop保持为MiniCore自研的crate-private concrete state machine，不触碰storage与I/O顺序；第二个真实实现出现前不建立稳定替换seam，Rig不参与AgentLoop，只用于ModelGateway private ProviderAdapter（ADR 0115）。
 
 ## 历史
 
@@ -47,3 +47,4 @@
 
 2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)修订本ADR原有的单一bounded request FIFO细节；单SessionExecutor/Writer ownership不变。
 2026-07-25：[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)补充UserQuestion等待阶段与Presentation Adapter职责；单SessionExecutor/Writer ownership不变。
+2026-07-27：[ADR 0115](0115-agent-loop-is-first-party-state-machine.md)关闭Rig/SDK AgentLoop adapter分支；AgentLoop改为自研crate-private状态机，Rig职责收窄到ModelGateway private ProviderAdapter。

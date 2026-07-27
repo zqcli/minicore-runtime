@@ -1352,7 +1352,7 @@ content-addressed DAG
 以下细节由后续实现阶段闭合：
 
 1. exact Rust serde tags/field casing，以及未来format v2+ migration policy；
-2. ModelGateway Rig provider adapter如何映射一个finalized assistant response及ordered content（AgentLoop只消费MiniCore类型，见ADR 0115）；
-3. Rig adapter如何提取各provider的finish reason、reasoning artifact和allowlisted response metadata；
+2. ModelGateway private `RigProviderAdapter`如何把单次provider attempt映射为finalized assistant response及ordered content（AgentLoop只消费MiniCore类型，见ADR 0115）；
+3. `RigProviderAdapter`如何提取各provider的finish reason、reasoning artifact和allowlisted response metadata；retry/fallback与最终错误分类仍由ModelGateway拥有；
 4. max entry size及未来blob reference阈值；
 5. cold exact resume是否值得在稳定executor implementation identity后扩展。

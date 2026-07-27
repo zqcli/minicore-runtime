@@ -416,8 +416,12 @@ MiniCoreRuntime-owned深模块，通过`resolve_for_turn(...)`固定exact TurnMo
 _避免_：provider client透传、系统提示词构建器、cross-model fallback、第二conversation
 
 **ModelGateway spine**：
-真实provider integration前必须稳定的MiniCore-owned类型和interface：TurnModelSnapshot、ModelCallPurpose、ModelCallRequest/Result/Error、ModelUsage、ModelProgressEvent、`resolve_for_turn(...)`和`generate_model_turn(...)`。ProviderCatalog、AuthStore和Rig ProviderAdapter属于其private implementation。
+真实provider integration前必须稳定的MiniCore-owned类型和interface：TurnModelSnapshot、ModelCallPurpose、ModelCallRequest/Result/Error、ModelUsage、ModelProgressEvent、`resolve_for_turn(...)`和`generate_model_turn(...)`。ProviderCatalog、AuthStore和private ProviderAdapter属于其implementation；首个production adapter使用Rig。
 _避免_：临时provider路径、SessionExecutor直接调用Rig
+
+**Provider适配器（`ProviderAdapter` / `RigProviderAdapter`）**：
+ModelGateway内部执行单次provider attempt的private seam。它接收Gateway已经规划并解析model/endpoint/credential的`ProviderAttemptRequest`，完成具体provider协议编码、request/stream调用、cancellation桥接和attempt result/error映射。`RigProviderAdapter`是首个production implementation；它不选择provider/model，不拥有retry/fallback、auth policy、cache/continuation policy、ModelGateway attempt lifecycle或最终`ModelCallResult`。
+_避免_：ModelGateway替代品、AgentLoop adapter、provider选择器、重试scheduler、公开SDK client
 
 **模型选择（`ModelSelection`）**：
 一次会话或模型调用使用的稳定模型身份，由 `provider_id` 和 `model_id` 组成。它不等同于 provider API 中的真实模型名，也不包含凭据或 base URL。

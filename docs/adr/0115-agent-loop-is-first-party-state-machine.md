@@ -26,7 +26,7 @@ Turn execution 内部的 AgentLoop 是 sans-I/O 推理协议状态机，只在 `
 ## 决定
 
 1. **AgentLoop 是 MiniCore 自研的 crate-private 同步 sans-I/O 状态机**，不由 Rig 或其他 SDK 驱动。
-2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**（provider 协议编码、streaming、auth payload、finish reason/usage 提取）。Rig 0.40.0 spike 的门禁范围同步收窄为 provider mapping 验证，不再评估 Rig sans-I/O AgentRun。
+2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**：它只编码并执行一个由ModelGateway规划好的provider attempt，桥接stream/cancellation，并提取finish reason、usage和allowlisted metadata。model resolution、request validation、auth policy与credential resolution、retry/fallback、cache/continuation policy、错误分类和最终`ModelCallResult`仍由ModelGateway拥有。Rig 0.40.0 spike 的门禁范围同步收窄为provider mapping验证，不再评估Rig sans-I/O AgentRun。
 3. **crate-private interface 维持 `session-execution.md` 既有形状不变**：`next_action()`、`accept_model_response()`、`accept_committed_tool_round()`、`accept_committed_steer()` 与 `AgentLoopAction { NeedModel | NeedTools | Finished }`。不新建 public trait、`AgentLoopFactory` 或 registry；「第二个真实实现出现才建立稳定 seam」的既有原则不变。
 4. **内部状态机冻结为三态**：
 
@@ -61,7 +61,7 @@ EmittedCandidate
 
 ## 后果
 
-- `architecture.md`：设计定位与核心边界改写——Rig 从「原生 Agent SDK」降为「ModelGateway private provider adapter 的实现库」；AgentLoop 归 MiniCore 自研。
+- `architecture.md`：设计定位与核心边界改写——Rig 从「原生 Agent SDK」收窄为只执行单次provider attempt映射与调用的`RigProviderAdapter`；ModelGateway继续拥有模型调用编排与terminal语义，AgentLoop归MiniCore自研。
 - `session-execution.md`：AgentLoop Interface 表述改为自研 concrete implementation；删除 monolithic adapter task 例外。
 - `turn-execution-context.md`：AgentLoop Contract 删除 SDK adapter 措辞；segment 重建理由收窄为 Compaction Replace；后续问题 1（Rig sans-I/O adapter 形状）关闭。
 - `CONTEXT.md`：「Driver（AgentLoop 适配器）」条目改写为自研状态机描述，Driver 旧称废弃。
