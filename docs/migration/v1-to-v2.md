@@ -456,6 +456,7 @@ SessionExecutor NeedModel
 - 每个loaded Session拥有独立file mutation queue：同Session同文件mutation FIFO，多文件/open-world Tool按批次Serial；跨Session共享Workspace不协调并由host/user负责隔离。ModelGateway继续提供共享provider并发限制；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。完整决策见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
 - lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 - 异步同步不建设全局lock-rank系统：普通guard不跨await/owner调用，release后fan-out；有意的bounded异步串行使用typed permit和私有组合helper。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
+- Cancel在sticky epoch发布后立即返回typed`CancelAccepted`；Session进入Finishing完成write/process/remote Tool结构化收口，期间允许FollowUp排队，旧Turnterminal后再启动下一Turn。完整决策见[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。
 
 完成门槛：
 

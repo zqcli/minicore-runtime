@@ -57,7 +57,7 @@
 - Interaction request append/apply后才通知host；resolution append/apply后才恢复Tool执行；UserQuestion等待使用`WaitingForUserInput`且UI只负责presentation；
 - `tool_execution_started`append/apply后才允许外部副作用；
 - FollowUp使用process-local bounded FIFO，当前不承诺crash-safe delivery；Snapshot使用latest-wins mailbox，不占用mutation/control容量；
-- Cancel与Workspace authorization revocation使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；PrepareForUnload使用sticky lifecycle signal和shared completion generation；
+- Cancel与Workspace authorization revocation使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；Cancel在线性化sticky epoch后立即返回typed accepted response，PrepareForUnload仍使用sticky lifecycle signal和shared completion generation；
 - lane容量、拒绝和仲裁规则在`SessionIngress`内定义；一个Session的lane拥塞不能耗尽另一个Session的容量，但共享Model配额和宿主I/O仍可能形成跨Session等待；
 - Progress event可以合并或丢弃，不能影响request处理和durable state；
 - restart不恢复旧Context/Model/Tool异步操作，unfinished Turn按既有recovery规则终止。
@@ -194,7 +194,7 @@ pub(crate) enum CancelTarget {
 | `CancelQueuedMessage` | `InputMailboxControl` | 按 `CommandId` 原子删除 Steer 或 FollowUp 中一条，不清空队列 |
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO并配置独立保留容量；只处理已存在的 Pending Interaction |
 | `ToolControl` | `ToolControlQueue` | bounded FIFO；approval、UserQuestion、execution-start 等内部 durable control |
-| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；每个目标Submit(CommandId)/Turn使用共享completion generation，不因普通lane满而延迟触发取消 |
+| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；在线性化cancel epoch后立即返回`CancelAccepted`，不因普通lane满而延迟 |
 | `WorkspaceAuthorizationRevoked` | `EmergencyControl` | sticky signal；先撤销 lease，再唤醒 Executor |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion generation，可附 grace deadline |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced 请求，从 immutable published view 读取 |
@@ -224,7 +224,7 @@ Admission规则：
 - `CancelQueuedMessage`只按`CommandId`删除一条仍在 Steer 或 FollowUp lane 的消息；找到即`Cancelled`，找不到统一返回`NotQueued`，不区分从未排队与已经出队；
 - `InputMailboxControl.remove(command_id)`与对应lane的`pop_front`使用同一原子同步：remove先赢则消息不执行，pop先赢则返回`NotQueued`且不能把消息重新入队；
 - `InputMailboxControl`不直接发布Runtime状态；Executor完成remove、更新immutable snapshot view并发布`queue_updated`后才完成`CancelQueuedMessage` response，因此不产生第二个StateEvent owner；
-- `Cancel`重复请求只按相同`CancelTarget + target generation`合并，调用方订阅同一个completion generation并在同一terminal fact后完成；Executor不为每个duplicate保存独立sender；stale target不得触发当前或下一Turn的cancellation token；
+- `Cancel`重复请求只按相同`CancelTarget + target generation`合并，并立即返回同一accepted cancel epoch；EmergencyControl不保存completion sender，stale target不得触发当前或下一Turn的cancellation token；
 - Emergency signal在目标terminal/取消完成后retire，新的Turn使用新的target generation和CancellationToken；
 - revocation signal绑定被撤销的Workspace lease/control generation；future Turn捕获新lease后不继承旧signal；
 - `PrepareForUnload`重复请求订阅同一个completion generation，effective grace deadline取现有与新请求的最早值，后续请求不能延长shutdown；
@@ -233,7 +233,7 @@ Admission规则：
 长流程 response 不让 ingress handler 等待完整 operation：
 
 - Submit response 保存在 candidate/admission record 中，UserMessage append/apply 后完成；
-- Cancel response等待emergency completion generation，`TurnInterrupted`/其他 terminal fact append/apply 后完成；
+- Cancel response在sticky cancel epoch成功发布后立即返回；`TurnInterrupted`/其他terminal fact由后续StateEvent和Snapshot表达；
 - PrepareForUnload response等待lifecycle completion generation，进入 Unloaded 前完成；
 - queued Steer/FollowUp 不保存跨崩溃 completion handle；真正 append、新 Turn start 和拒绝由 StateEvent/typed outcome 表达。
 
@@ -881,8 +881,9 @@ Assistant(Final) append是Completed Turn唯一结束线性化点。
 
 ```text
 Cancel(CancelTarget::Turn(expected TurnId))
-→ `EmergencyControl`原子验证active target generation并设置sticky cancel
-→ 仅触发该target绑定的current operation cancellation token
+→ `EmergencyControl`通过`TurnControlGate`原子验证active target generation仍可取消且final reservation未赢
+→ 设置sticky cancel epoch并触发该target绑定的current operation cancellation token
+→ 立即返回CancelAccepted { target, cancel_epoch }
 → Executor验证current Running Turn
 → execution_version += 1
 → state = Finishing
@@ -909,26 +910,30 @@ Cancel(CancelTarget::Turn(expected TurnId))
 - 若产品需要“停止该Session全部工作”，必须定义显式`StopAll`/`ClearQueuedMessages`语义，不能复用单Turn Cancel；
 - Cancel不能生成synthetic ToolResult；尚未执行且已确认取消可以生成truthful Cancelled ToolResult；
 - Model partial response直接丢弃；
-- Cancel response只在TurnInterrupted append/apply完成后返回；
-- duplicate Cancel在相同terminal fact后幂等返回当前结果；
-- Cancel与Assistant(Final)由Executor实际处理顺序决定；
-- Final先append则Cancel返回TurnNotRunning；Cancel先处理则Final candidate丢弃。
+- Cancel response只确认sticky epoch已发布，不确认Tool已停止或Turn已terminal；
+- duplicate Cancel幂等返回同一accepted target/epoch；
+- Cancel与Assistant(Final)由`TurnControlGate`上的cancel epoch/final append reservation first-wins决定；
+- final reservation先赢则Cancel返回typed terminal/transition error；Cancel先赢并返回accepted则Final candidate必须丢弃。
 
-Cancel的signal写入不等待任何bounded work lane；target/generation匹配时，signal路径立即触发该target绑定的current operation cancellation token。Executor消费signal后推进shared completion state、更新Session state并返回主循环；后续OperationResult或terminal cleanup继续推进，TurnInterrupted append/apply后完成Cancel response。
+Cancel的signal写入不等待任何bounded work lane；target/generation仍可取消且对应commit reservation未赢时，signal路径立即触发该target绑定的current operation cancellation token并返回`CancelAccepted`。reservation先赢时直接返回typed transition/terminal error。Executor消费signal后递增execution_version、进入Finishing并发布新snapshot/event；后续OperationResult或terminal cleanup继续推进，TurnInterrupted append/apply后发布最终StateEvent。
+
+Cancel后不立即启动同Session新Turn。Session未进入Unload stop-admission时，Finishing期间仍接受FollowUp进入bounded FIFO并返回Queued；普通Submit返回SessionBusy，新Steer返回TurnCancelling/TurnNotRunning。旧Turnterminal后，FollowUp按既有公平admission规则开启下一Turn。
 
 Turn创建前使用`CancelTarget::Submit(command_id)`：
+
+Cancel epoch与initiating UserMessage append reservation使用同一`TurnControlGate` first-wins。cancel先赢才返回`CancelAccepted`并保证不创建领域Turn；initiating reservation先赢时Cancel返回typed stale/transition error，原Submit完成append/apply并返回`TurnStarted`。
 
 ```text
 matching request still in TurnAdmissionQueue
 → remove queued admission
 → complete Submit response as Rejected(Cancelled)
-→ complete Cancel response，current state不变
+→ Cancel response已在cancel epoch发布时返回，current state不变
 
 candidate已进入Starting
 → cancel BuildTurnContext / ComposeUserMessage
 → discard candidate Context/message
 → complete Submit response as Rejected(Cancelled)
-→ complete Cancel response
+→ Cancel response已返回
 → state = Idle
 ```
 
@@ -1301,7 +1306,7 @@ open SessionStorage
 old SessionIngress lane contents
 queued Submit / Steer / FollowUp
 InteractionControl / ToolControl requests
-Emergency/Lifecycle completion subscribers和SnapshotMailbox请求
+Lifecycle completion subscribers和SnapshotMailbox请求
 AgentLoop internal state
 Context/UserMessage composition/Model/Tool/Compaction async operation
 approval waiter
@@ -1317,7 +1322,7 @@ MVP性能要求：
 
 - 一个loaded Session一个Executor；
 - TurnAdmission、Steer、FollowUp、InteractionControl和ToolControl lane分别有容量限制；
-- EmergencyControl和LifecycleControl使用O(1) target/state与shared completion generation；SnapshotMailbox只保留latest immutable view，不能无限增长；
+- EmergencyControl使用O(1) target/generation/sticky epoch且不保存Cancel completion sender；LifecycleControl使用shared completion generation；SnapshotMailbox只保留latest immutable view，不能无限增长；
 - 每个Session最多一个current RunningOperation；旧operation terminal/remove或安全drop前不启动新operation；
 - ToolSet内部负责ToolCall并发；
 - SessionWriter复用open file handle和buffer；
@@ -1429,6 +1434,10 @@ MVP性能要求：
 - Cancel保存exact ToolResult；
 - Cancel只生成一个TurnInterrupted；
 - duplicate Cancel幂等；
+- valid Cancel立即返回同一accepted epoch，不等待Tool settlement；
+- Cancel(Submit)与initiating append reservation first-wins，accepted Cancel不创建Turn；
+- Cancel(Turn)与final append reservation first-wins，accepted Cancel不提交Final Assistant；
+- Finishing期间FollowUp可Queued，Steer拒绝且Submit SessionBusy；
 - stale CancelTarget/generation不触发current或next Turn token；
 - cancel epoch发布后新的同Turn Steer被拒绝，epoch前accepted Steer被清理；
 - 普通lane全部满时Cancel仍立即发布sticky signal；
@@ -1504,7 +1513,7 @@ SessionExecutionState / TurnExecutionPhase
 execution_version
 OperationType和duration
 TurnAdmission / Steer / FollowUp / InteractionControl / ToolControl lane depth
-EmergencyControl epoch、target generation与completion subscriber count
+EmergencyControl epoch与target generation
 LifecycleControl state、grace deadline与completion subscriber count
 Snapshot publication generation与subscriber count
 lane arbitration burst/fairness counters

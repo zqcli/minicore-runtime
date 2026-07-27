@@ -563,7 +563,7 @@ pub enum SessionExecutionState {
 Idle
 → Starting          // admission reservation / Context capture / input append
 → Running           // initiating UserMessage entry appended
-→ Finishing         // terminal entry / pending cleanup
+→ Finishing         // Tool/process/filesystem结构化收口、terminal entry与pending cleanup
 → Idle
 ```
 
@@ -618,7 +618,9 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
+这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入和Cancel后的结构化收口由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
+
+`SessionExecutionState::Finishing`优先于TurnExecutionPhase解释：CancelAccepted后phase可以保留`ExecutingTools`等最后工作位置，但UI显示Stopping/Finishing。Finishing期间新的Steer被拒绝，FollowUp仍可进入process-local FIFO；新Turn只在旧Turnterminal并回到Idle后启动。
 
 ### Waiting Approval
 
@@ -1143,6 +1145,8 @@ Agent release channel
 - Workspace unavailable 形成 Loaded + Unavailable；
 - unload stop-admission、grace deadline、fail-closed cancel与幂等completion generation；
 - Session execution Idle/Starting/Running/Finishing；
+- Cancel sticky epoch发布后立即返回CancelAccepted并进入Finishing；
+- Finishing期间FollowUp可Queued，旧Turnterminal前不启动新Turn；
 - WaitingApproval保持Turn Running，长时间无回答不产生默认Deny；
 - subscriber断开后Pending Interaction保持并可由新Snapshot重建；
 - Steer 在 WaitingApproval 时排队；

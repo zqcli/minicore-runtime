@@ -390,8 +390,8 @@ pub enum PublicCancelTarget {
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
 - `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Turn创建后调用方使用`TurnId`取消；
-- `Cancel(TurnId)`通过per-session target-scoped sticky `EmergencyControl`校验active Turn generation后触发其operation cancellation，不等待普通work lane；stale target不影响新Turn，response在terminal cleanup完成后返回；
-- Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
+- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn generation并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal append；stale target不影响新Turn；
+- Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
 
 Queued Steer和FollowUp仍是process-local值。Runtime restart后未append的queued input不会恢复。
@@ -496,7 +496,10 @@ pub enum CommandOutcome {
     FollowUpQueued,
     QueuedMessageCancelled,
     InteractionResolved,
-    Cancelled,
+    CancelAccepted {
+        target: PublicCancelTarget,
+        cancel_epoch: u64,
+    },
     CommandOutput,
     NoChange,
 }
@@ -506,6 +509,7 @@ Command response不是完整业务完成流：
 
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
+- `CancelAccepted`只表示target/generation仍可取消且sticky cancel epoch已经发布；它与initiating/final append reservation first-wins，accepted后对应Started/Completed commit不得再赢；Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
 - `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
 - Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
@@ -526,8 +530,8 @@ Command response不是完整业务完成流：
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved append/apply |
-| Cancel Submit(CommandId) | queued admission remove或Starting candidate取消完成，且不会创建领域Turn |
-| Cancel Turn | Turn terminal append/apply与cleanup完成 |
+| Cancel Submit(CommandId) | target/generation仍可取消且sticky cancel epoch发布；initiating append reservation先赢时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
+| Cancel Turn | target/generation仍可取消且sticky cancel epoch发布；final append reservation先赢时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
 | Fork Session | target staging验证完成并原子发布 |
 
 ### Command Error
@@ -850,6 +854,8 @@ pub struct SessionQueueView {
 长期Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的committed Items，并按selected path entry顺序与assistant Reasoning/Text/ToolCall content顺序排列。它不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
 
 `SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。`pending_submit_count`是尚未被仲裁的admission信箱瞬时计数（正常为0），不表示存在跨Turn排队的Submit通道。
+
+Cancel被Executor接受后，`SessionExecutionView`必须立即反映`Finishing`并发布`session_execution_changed`。当execution为Finishing时，host优先显示Stopping/Finishing；`CurrentTurnView.phase`保留Cancel前最后工作位置供diagnostic，不建立`TurnExecutionPhase::Cancelling`。Finishing期间host可以继续发送FollowUp并收到`FollowUpQueued`，普通Submit仍返回SessionBusy。
 
 ### Snapshot Consistency
 
@@ -1405,7 +1411,10 @@ Public interface是 contract test surface。
 - Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
-- Cancel清理current Turn Steer但保留FollowUp；
+- valid Cancel立即返回`CancelAccepted`且不等待Tool settlement；duplicate返回同一target/epoch；
+- Cancel与initiating/final append reservation first-wins，不能accepted后再提交Started/Completed；
+- Cancel清理current Turn Steer但保留FollowUp，Finishing期间新FollowUp仍可Queued；
+- CancelAccepted后execution snapshot/event进入Finishing，最终TurnInterrupted另行发布；
 - stale Cancel TurnId/generation不取消新的active Turn；
 - Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；

@@ -912,7 +912,7 @@ Context drop 不 unregister Runtime-global Tool、不清空共享 content cache�
 - progress通过独立`ProgressEventPublisher`发布；
 - AgentLoop是自研同步状态机，由主循环直接调用，不存在monolithic adapter task（ADR 0115）。
 
-普通Submit在Starting/Running/Finishing时返回SessionBusy；FollowUp在active Turn terminal后重新进入普通admission，不属于current Turn control。
+普通Submit在Starting/Running/Finishing时返回SessionBusy；FollowUp在Running或Finishing期间可进入bounded FIFO，在active Turn terminal后重新进入普通admission，不属于current Turn control。CancelAccepted只停止current Turn推进，不清除FollowUp。
 
 Session durable lifecycle、load/readiness/execution state 的完整定义见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
 
