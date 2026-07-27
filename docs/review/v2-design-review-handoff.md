@@ -4,38 +4,73 @@
 
 用途：在另一台电脑或新的Agent会话中恢复当前工作进度。架构事实仍以`docs/architecture.md`、`docs/modules/`和Accepted ADR为权威；本文只记录评审推进状态。
 
-## 恢复入口
+## 新电脑恢复
+
+仓库尚未clone时：
 
 ```bash
+git clone https://zqcli@github.com/zqcli/minicore-runtime
+cd minicore-runtime
 git switch dev
 git pull --ff-only origin dev
-git log --oneline -8
 ```
 
-随后阅读：
+仓库已存在时：
+
+```bash
+cd /path/to/minicore-runtime
+git switch dev
+git pull --ff-only origin dev
+```
+
+恢复后验证：
+
+```bash
+git status --short --branch
+git log --oneline -8
+git show --stat 9aea732
+```
+
+随后按顺序阅读：
 
 1. [第一版设计评审与开放项跟进](v2-design-review.md)
-2. [第二版设计评审](v2-design-review-2.md)
-3. [第三版AgentLoop设计评审](v2-design-review-3.md)
+2. [第三版AgentLoop设计评审](v2-design-review-3.md)
+3. [ADR 0121：Workspace定义只在Idle更新](../adr/0121-workspace-updates-require-idle.md)
 4. [架构总览](../architecture.md)
+5. [Workspace模块](../modules/workspace.md)
+6. [Session Execution模块](../modules/session-execution.md)
 
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 仓库仍处于V2设计冻结阶段，生产实现尚未启动；
-- 当前没有`Cargo.toml`、`src/`或自动化测试；
+- Workspace设计提交：`9aea732 docs: require idle for workspace updates`；
+- 该提交之前的两项关键设计提交：`dfbecfb`（Model response error handling）、`51f3bdb`（Session logical model retry）；
+- 本轮完成后应已push到`origin/dev`；若本地显示ahead/behind，先检查远端与最新log，不要reset用户改动；
+- 仓库仍处于V2设计阶段，没有`Cargo.toml`、`src/`或自动化测试；
 - 下一实现里程碑仍是阶段6–8模型调用协同交付束；
 - Rig只实现`ModelGateway` private `ProviderAdapter`中的单次provider attempt，不拥有ModelGateway或AgentLoop。
 
-## 最近完成
+## 本轮完成
 
-- `c8bf700`：新增第三版AgentLoop设计评审；
-- `32f0841`：统一Rig provider adapter职责；
-- `5e21993`：通过ADR 0116/0117关闭O4文件mutation并发和O5异步同步纪律；
-- `60ea813`：通过ADR 0118关闭O6，Cancel立即返回`CancelAccepted`，Finishing期间FollowUp排队，旧Turn结构化收口后再启动下一Turn；
-- 本轮关闭O7：同步Prompt assembly是纯内存线性操作，1000条约1 MB消息预计约1–30 ms；保持当前同步实现，不增加offload、work budget、counter或observer。
-- ADR 0119关闭O8：MVP采用ModelGateway single attempt、SDK retry=0；AgentRun由SessionExecutor最多logical retry 3次，CompactionSummary最多1次，不引入共享ModelCallBudget。
-- ADR 0120关闭O9与第三轮L1：失败由事实拥有module分类、恢复由SessionExecutor决定，不新增Error module；ModelGateway使用UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse收口非法输出。
+`9aea732`新增[ADR 0121](../adr/0121-workspace-updates-require-idle.md)，并同步25份现有文档：
+
+- loaded Session的Workspace definition patch只在`SessionExecutionState::Idle`接受；Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel；
+- Host修改active Session Workspace的显式流程是`Cancel → wait session_settled → UpdateDefinition`；
+- active Turn pin的`WorkspaceSnapshot`完全immutable；
+- 删除`WorkspaceAuthorizationLease`、`WorkspaceAuthorizationControl`、`WorkspaceCommitAuthorization`及append/revoke双permit竞态；
+- authority/host hard restriction通过Runtime current loaded map向对应`SessionExecutionHandle`发送sticky `SecurityRevoked`；old handle关闭后不重定向到new Executor；
+- Idle直接失效old Snapshot并重新resolve；Starting取消candidate后resolve；Running/Finishing停止新operation、truthful settle started Tool、append`TurnInterrupted(SecurityRevoked)`后resolve；
+- resolve success发布new Snapshot并Ready，failure进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`；
+- 不承诺动态撤销open OS handle、回滚已进入kernel/provider的operation或建立Runtime-global handle registry；
+- O10和O11关闭；O1 Sandbox fail-closed与O12 fingerprint recovery保持开放。
+
+同步时还修正了直接受影响的旧术语和接口漂移：
+
+- `TurnControlGate`成为Cancel/SecurityRevoked与controlled append/Tool start的唯一first-wins control permit；
+- WaitingForUserInput不持有Workspace permit，仍处理SecurityRevoked；
+- Compaction、ModelGateway、Tool、Prompt、Skill、Interaction和Runtime Interface统一使用SecurityRevoked语义；
+- Migration capture graph恢复为`AgentPromptSelection / SessionPromptSelection`和`ToolCallingCapabilities`；
+- Architecture明确Runtime private拥有PromptService、ToolService、SkillService和ModelGateway四个共享深模块。
 
 ## 已关闭评审项
 
@@ -47,36 +82,73 @@ git log --oneline -8
 | O7 | 保持同步Prompt assembly；缺少真实性能数据，不增加额外机制 |
 | O8 | ADR 0119：Gateway single attempt，SessionExecutor有限logical retry |
 | O9 | ADR 0120：ModelGateway response validation与四个non-retryable error reason |
+| O10 | ADR 0121删除revoke-before-commit状态；Idle update失败保留old definition/Snapshot |
+| O11 | ADR 0121不承诺dynamic open-handle revocation；SecurityRevoked复用Cancel settlement |
 
 ## 下一步
 
-从O11继续：已打开文件handle在Workspace authorization revocation后仍可能继续写入，需要冻结handle-relative open和lease recheck策略。
-
-随后依次处理：
+从O12继续，冻结`WorkspaceFingerprint`和各view fingerprint的确定性重建、算法版本与golden vectors：
 
 ```text
 O12 Workspace/view fingerprint恢复策略
-O14 CompactionSummaryDirective fingerprint coverage
-O15 Prompt正文与PromptFingerprint
+→ O14 CompactionSummaryDirective fingerprint coverage
+→ O15 Prompt正文与PromptFingerprint
 ```
 
-其他仍开放项：O1、O2、O3、O10、O13、O16、O17、O18。状态与优先级以`v2-design-review.md`的“当前问题跟进总览”为准。
+其他开放项：`O1 O2 O3 O13 O16 O17 O18`。其中O1是首个production Tool/Sandbox adapter前的P0门禁；O2/O3属于storage/运维硬化；O13不要重新引入authorization lease，只评估真正同构的source stamp/pinning value。
+
+第三版AgentLoop评审仍有`L2–L4`开放；`L2`必须在首个AgentLoop实现前冻结。完成O12/O14/O15后，应回到[第三版评审](v2-design-review-3.md)核对实现前门禁。
+
+后续实现顺序仍是：
+
+```text
+Rig 0.40.0 integration spike
+→ ScriptedProviderAdapter ordinary AgentRun
+→ ContextOverflow
+→ CompactionSummary
+→ StoredCompaction append/apply
+→ reassemble并继续AgentRun
+```
 
 ## 已冻结关键决策
 
 - 每个loaded Session只有一个`SessionExecutor`、一个`SessionWriter`、一个current Turn和一个current `RunningOperation`；
 - AgentLoop是crate-private同步sans-I/O状态机，只输出`NeedModel | NeedTools | Finished`；
-- ModelGateway拥有model resolution、credential、single-attempt lifecycle和provider-neutral terminal result；SessionExecutor拥有有限logical retry；
+- ModelGateway每次invocation最多一个provider attempt，SDK retry=0；SessionExecutor拥有有限logical retry；
+- PromptSet是唯一模型上下文组装seam，模型可见动态事实必须来自committed conversation；
 - 文件mutation只在单Session内按canonical file key FIFO，多文件/open-world Tool整批Serial；
-- Cancel可以立即确认业务请求，但已开始write/process/remote Tool必须truthful settlement；
-- Cancel后同Session不立即启动第二Turn，新输入进入FollowUp；
-- Prompt assembly保持同步；当前不为理论性能风险增加异步operation或观测设施。
+- Cancel/SecurityRevoked可以立即关闭新operation，但越过`ToolExecutionStarted`的Tool必须truthful settlement；
+- Workspace definition只在Idle更新，active Turn不热替换Snapshot或任何派生view；
+- Snapshot-first是公开观察协议，Snapshot不是durable execution checkpoint。
 
-## 提交前检查惯例
+## 本轮验证
+
+已执行并通过：
+
+```text
+git diff --check
+Markdown fenced-code parity
+modified Markdown relative-link existence check
+active Workspace lease/revoke/current-update残留扫描
+两轮独立semantic/cross-document review
+```
+
+本轮是docs-only变更；仓库没有production代码或测试入口，因此未运行cargo/test。第二轮review发现的Idle安全失效、TurnControlGate signal范围、WaitingForUserInput旧permit、ToolRound emergency gate和Runtime update response线性化问题均已修正。
+
+## 提交纪律
+
+继续工作前先运行：
+
+```bash
+git status --short --branch
+git log --oneline -8
+```
+
+提交前运行：
 
 ```bash
 git diff --check
 git status --short
 ```
 
-Markdown变更还需检查相对链接；提交时只暂存当前评审相关文件，不撤销工作树中可能存在的用户改动。
+不要使用`git reset --hard`或撤销不属于当前任务的工作树改动。Markdown变更继续检查相对链接和代码围栏。
