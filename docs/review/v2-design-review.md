@@ -169,7 +169,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3和ADR 0116关闭**。普通Tool在开始file mutation后不得调用`request_user_question`；若未来需要，必须另行定义不持有mutation permit的producer protocol。
 - ~~`PrepareForUnload` graceful unload 不自动 Cancel，长期Pending Interaction可能阻止卸载~~：**已随D1关闭**。LifecycleControl立即stop admission；有限grace deadline属于Unload lifecycle，到期后Cancel active Turn并以Cancelled关闭Pending Interaction。
 - 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
-- Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
+- ~~Cancel需等待越过`ToolExecutionStarted`的Tool结构化收口，command response和可观察状态绑定terminal~~：**已由ADR 0118关闭**。sticky cancel epoch发布后立即返回`CancelAccepted`并进入Finishing；FollowUp可排队，最终TurnInterrupted通过StateEvent/Snapshot观察。
 - ~~Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，可能需要全局锁序~~：**已由ADR 0117关闭**。当前single-owner、non-blocking reservation、release-before-fan-out和typed permit使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
 - `assemble_model_context` 为同步 fn，大 context 组装/tokenize 在同步段内阻塞该 executor 控制面 → 随规模评估 offload，或标注为控制面 stall 风险点。
@@ -269,7 +269,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O3 | 中段corruption无显式repair utility | 仍开放 | P2 |
 | O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
 | O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
-| O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 部分开放 | P2 |
+| O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 已关闭：ADR 0118即时CancelAccepted、复用Finishing并允许FollowUp排队 | — |
 | O7 | 同步Prompt assembly可能阻塞Session控制面 | 仍开放 | P2 |
 | O8 | Gateway retry与logical retry无Turn级共享预算 | 仍开放 | P1 |
 | O9 | provider输出违约的错误分类与retry语义未冻结 | 仍开放，与第三轮L1相关 | P1 |
@@ -338,11 +338,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 决议：不建设Runtime-global lock hierarchy或lock-rank manager。普通Mutex/RwLock guard不得跨`.await`、跨owner调用、event publication或fan-out；有意覆盖bounded append/apply的异步串行使用typed permit/semaphore；Agent/Workspace状态变化释放gate后再通知Session；Model、Tool、approval、UserQuestion与file mutation ticket等待期间零持有短状态guard。
 - 关闭依据：[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)与`session-execution.md`“异步同步纪律”。保留P2 lint与竞态测试作为实现防回归，不再作为P1设计缺陷。
 
-#### O6 · Cancelling可观察状态
+#### O6 · Cancelling可观察状态（已关闭）
 
-- 发生场景：不可取消的远程部署或数据库操作已经append `ToolExecutionStarted`；用户Cancel后，Executor必须等待真实outcome或判定Abandoned才能append `TurnInterrupted`。
-- 风险：UI在等待期间仍只看到Running，容易误判Cancel无效或Session卡死。
-- 推荐修复：公开snapshot/event增加`TurnExecutionPhase::Cancelling`，或提供稳定的`cancellation_pending_on_started_tool`状态；它表示cancel epoch已接受、当前正在等待不可回滚副作用收口，不改变最终truthful terminal规则。
+- 原发生场景：write、process或remote Tool已append`ToolExecutionStarted`；用户Cancel后，原协议直到exact outcome/Abandoned与`TurnInterrupted`完成才返回，期间用户无法确认Cancel是否已接受。
+- 复核结论：pi会等待Tool Promise、filesystem I/O和process termination；Codex对普通Tool丢弃业务结果，但shell等Tool等待runtime teardown。所有await结果一律丢弃会留下旧write、child process或已提交remote request；同Session立即开启第二Turn还会破坏单current Turn、单RunningOperation与conversation顺序。
+- 决议：sticky cancel epoch线性化后立即返回typed`CancelAccepted { target, cancel_epoch }`；Executor停止逻辑推进、递增execution_version并进入公开`Finishing`。Model/Context迟到结果丢弃，Tool按write I/O settle、process teardown或remote outcome unknown规则结构化收口。Finishing期间Steer拒绝、FollowUp可Queued、Submit仍SessionBusy；旧Turnterminal后再启动FollowUp Turn。
+- 关闭依据：[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。不新增`TurnExecutionPhase::Cancelling`；UI优先按`SessionExecutionState::Finishing`显示Stopping，最终事实由`turn_interrupted`、条件满足时的`session_settled`与Snapshot表达。Cancel和initiating/final append reservation first-wins，避免accepted后仍提交Started/Completed。
 
 #### O7 · 同步assembly控制面stall
 
@@ -410,6 +411,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 多资源Tool锁序：ADR 0116删除跨Session多资源锁，以Session-local单文件FIFO和Serial批次降级关闭O4；
 - 全局同步原语锁序：ADR 0117确认当前不存在可构造循环等待，以single owner、短guard、typed permit和release-before-fan-out关闭O5；
+- Cancel可观察收口：ADR 0118将Cancel acceptance与Tool settlement分离，立即返回CancelAccepted、复用Finishing并在期间接收FollowUp，关闭O6；
 - Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
 - public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
 - Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；

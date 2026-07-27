@@ -1,6 +1,8 @@
 # Runtime Interface 与公开协议架构设计
 
 > **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
+>
+> **后续修订**：本文Cancel response等待Turn terminal的旧结论已被[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)取代；当前协议在sticky cancel epoch发布后立即返回`CancelAccepted`，最终settlement由StateEvent与Snapshot表达。
 
 日期：2026-07-24
 

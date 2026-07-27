@@ -23,7 +23,7 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 | `CancelQueuedMessage` | `InputMailboxControl` | 按`CommandId`原子删除一条Steer或FollowUp |
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO，配置保留容量 |
 | `ToolControl` | `ToolControlQueue` | 内部bounded FIFO |
-| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal和shared completion generation |
+| `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；cancel epoch发布后立即返回typed accepted response |
 | `WorkspaceAuthorizationRevoked` | `EmergencyControl` | 先out-of-band revoke lease，再设置sticky signal |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion generation |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced immutable published view |
@@ -37,7 +37,7 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 `SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的target generation、emergency epoch、Steer admission gate和controlled append reservation：
 
 - Steer admission与final commit reservation first-wins；Steer先赢则candidate final转为Continue，final reservation先赢则拒绝新Steer；
-- Cancel signal与controlled append reservation first-wins；Cancel先赢则append不得开始，reservation先赢则该次短append完成，Cancel在其后cleanup；
+- Cancel signal与controlled append reservation first-wins；Cancel先赢则append不得开始并返回`CancelAccepted`，reservation先赢则该次短append完成且该Cancel返回typed transition/terminal error，不得先accepted再把Submit/Turn提交为Started/Completed；
 - reservation只跨一次`SessionWriter.append → apply`，signal发布不阻塞；Workspace-dependent append仍另行取得`WorkspaceCommitAuthorization`。
 
 LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`同样原子排序：admission先赢则Unload drain明确拒绝/清理该请求，stop先赢则直接返回stopping。Emergency、required cleanup control和Snapshot仍可进入。
@@ -57,9 +57,10 @@ Workspace revocation先通过与`WorkspaceCommitAuthorization`共享的同步原
 
 Cancel current Turn时：
 
+- sticky epoch发布后立即返回`CancelAccepted`；最终TurnInterrupted通过StateEvent/Snapshot观察；
 - 清理所有仍指向该Turn的queued Steer；
 - cancel epoch发布后拒绝新的同Turn Steer；
-- 默认保留FollowUp，当前Turn terminal后继续正常admission；
+- 默认保留FollowUp，并在Finishing期间继续接受新的FollowUp；当前Turn terminal后继续正常admission；
 - 不清除其他Submit；若产品需要“停止该Session全部工作”，必须定义显式`StopAll`/`ClearQueuedMessages`能力。
 
 清理accepted queued input时发布带`CommandId + reason`的`queue_updated` StateEvent；该事件只描述process-local队列事实，不把未append消息伪造成durable UserMessage。
@@ -97,7 +98,7 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 
 - 普通输入backpressure不能阻塞Cancel/revocation signal；D1关闭。
 - 不再依赖跨类型全局FIFO；每个race必须由state validation、emergency epoch、authorization lease和durable append线性化点说明。
-- lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate control请求复用shared completion generation，不能让Executor保存无界sender集合。
+- lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate Cancel返回同一accepted epoch且不保存sender，PrepareForUnload继续复用shared completion generation。
 - Snapshot读取更轻，不会因工作队列拥塞而超时；持续观察必须使用snapshot-first subscription，不能假设单独Snapshot与某条mutation或后续subscribe形成顺序。
 - 仍只有一个SessionExecutor和一个SessionWriter；没有新增第二个conversation owner或并发mutation actor。
 
@@ -107,6 +108,7 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 
 2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)删除跨SessionTool resource lock；本ADR的lane隔离、emergency与短append仲裁不变。
 2026-07-27：[ADR 0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md)明确不建设全局lock-rank系统；普通guard不跨await，controlled append使用typed permit和私有组合helper。
+2026-07-27：[ADR 0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)将Cancel response改为sticky epoch发布后立即确认；Finishing期间允许FollowUp排队，最终terminal通过StateEvent/Snapshot观察。
 
 ## 被否决的方案
 

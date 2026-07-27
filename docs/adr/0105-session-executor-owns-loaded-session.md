@@ -50,3 +50,4 @@
 2026-07-27：[ADR 0115](0115-agent-loop-is-first-party-state-machine.md)关闭Rig/SDK AgentLoop adapter分支；AgentLoop改为自研crate-private状态机，Rig职责收窄到ModelGateway private ProviderAdapter。
 2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)修订跨Sessioncanonical resource lock结论；改为Session-local file mutation queue，跨SessionWorkspace并发由host/user管理。
 2026-07-27：[ADR 0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md)关闭全局lock-rank需求；并发实现采用single owner、短guard、release-before-fan-out和typed permit。
+2026-07-27：[ADR 0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)将Cancel command改为sticky epoch发布后立即确认；Finishing期间允许FollowUp排队，旧Turn结构化收口后再启动下一Turn。
