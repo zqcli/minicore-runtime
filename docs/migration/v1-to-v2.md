@@ -497,7 +497,7 @@ SessionExecutor NeedModel
 - [x] provider adapter 差异不泄漏到 Session execution；
 - [x] AgentRun默认最多3次Session logical retry，CompactionSummary最多1次；
 - [x] delivery-safe transport/provider错误足以驱动logical retry、compaction或terminal failure；
-- [ ] OutputContract/finish-reason违约分类与retry语义由O9/L1冻结；
+- [x] ADR 0120冻结OutputContract/finish-reason response validation与non-retry语义，关闭O9/L1；
 - [x] provider cache/continuation 不是第二 conversation truth；
 - [ ] 执行协同交付束的Rig 0.40.0 integration spike；
 - [ ] 实现ModelGateway、ScriptedProviderAdapter、RigProviderAdapter和mock-server tests。
@@ -755,7 +755,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2新架构由[`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/) + [`docs/adr/`](../adr/)（0100–0119）构成，是当前唯一权威事实来源。
+- V2新架构由[`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/) + [`docs/adr/`](../adr/)（0100–0120）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 

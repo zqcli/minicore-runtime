@@ -35,6 +35,7 @@ git log --oneline -8
 - `60ea813`：通过ADR 0118关闭O6，Cancel立即返回`CancelAccepted`，Finishing期间FollowUp排队，旧Turn结构化收口后再启动下一Turn；
 - 本轮关闭O7：同步Prompt assembly是纯内存线性操作，1000条约1 MB消息预计约1–30 ms；保持当前同步实现，不增加offload、work budget、counter或observer。
 - ADR 0119关闭O8：MVP采用ModelGateway single attempt、SDK retry=0；AgentRun由SessionExecutor最多logical retry 3次，CompactionSummary最多1次，不引入共享ModelCallBudget。
+- ADR 0120关闭O9与第三轮L1：失败由事实拥有module分类、恢复由SessionExecutor决定，不新增Error module；ModelGateway使用UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse收口非法输出。
 
 ## 已关闭评审项
 
@@ -45,15 +46,15 @@ git log --oneline -8
 | O6 | ADR 0118：即时CancelAccepted、Finishing结构化收口、FollowUp等待旧Turnterminal |
 | O7 | 保持同步Prompt assembly；缺少真实性能数据，不增加额外机制 |
 | O8 | ADR 0119：Gateway single attempt，SessionExecutor有限logical retry |
+| O9 | ADR 0120：ModelGateway response validation与四个non-retryable error reason |
 
 ## 下一步
 
-从O9继续：provider输出违反`OutputContract`时的错误分类与retry语义尚未冻结，并与第三轮AgentLoop评审L1的finish-reason决策表直接相关。
+从O11继续：已打开文件handle在Workspace authorization revocation后仍可能继续写入，需要冻结handle-relative open和lease recheck策略。
 
 随后依次处理：
 
 ```text
-O11 open-handle revocation窗口
 O12 Workspace/view fingerprint恢复策略
 O14 CompactionSummaryDirective fingerprint coverage
 O15 Prompt正文与PromptFingerprint

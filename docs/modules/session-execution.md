@@ -533,6 +533,15 @@ impl AgentLoop {
 
 `accept_committed_tool_round`的delta只能来自`tool_round_completed`成功append/apply后SessionStorage生成的trusted `CommittedConversationDelta`，不能由execution-local ToolResult自行构造。`Finished`只表示candidate final。Steer FIFO为空时SessionExecutor保存Assistant(Final)；FIFO非空时保存Assistant(Intermediate Continue)、pop一条Steer并从committed ConversationSeed重建AgentLoop segment。
 
+`accept_model_response`只接收ModelGateway已经通过Response Validation的`FinalizedAssistantResponse`。Provider wire、finish/content consistency和OutputContract错误不会进入AgentLoop：
+
+```text
+validated response含ToolCall → PendingToolRound → NeedTools
+validated response无ToolCall → EmittedCandidate → Finished
+```
+
+合法ToolCall只可能来自`output_contract = None`且request tools非空的调用；`ToolCalls`无call、`Stop/Refused`带call、Length、ContentFiltered、empty response、UnexpectedToolCall和invalid Structured output已经由ModelGateway返回typed error。AgentLoop仍校验自身state transition、trusted ToolRound coverage和candidate one-shot consumption，但不重新解释Provider错误。
+
 AgentLoop是自研的同步sans-I/O状态机，不由Rig或其他SDK驱动（ADR 0115）。它不得：
 
 - 读取SessionStorage；
@@ -679,7 +688,8 @@ AgentLoop NeedModel
    │  → 按finalized content顺序一次投影/publish：Reasoning/AgentMessage Completed、ToolInvocation Started
    │  → 清理matching StreamingItem
    ├─ CompactionSummary：不创建StreamingItem/ItemId → revalidate → append/apply Replace → rebuild AgentLoop → reassemble
-   └─ delivery-safe terminal error：移除旧operation → WaitForModelRetry → timer后重新校验 → 复用同一request启动下一operation
+   ├─ delivery-safe terminal error：移除旧operation → WaitForModelRetry → timer后重新校验 → 复用同一request启动下一operation
+   └─ model response error：丢弃StreamingItem → 不调用AgentLoop/ToolSet → non-retryable Model TurnFailure
 ```
 
 规则：
@@ -1060,7 +1070,7 @@ delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_
 
 logical retry不得通过timeout race留下仍可回传结果的旧本地future。若取消无副作用Model future，必须先安全drop并关闭旧结果路径；provider端可能继续生成或计费只属于delivery/telemetry风险，不允许形成第二个SessionExecutor result。
 
-默认AgentRun最多3次logical retry，backoff为2秒、4秒、8秒；一次成功finalized response或新的ModelCallRequest开始后计数重置。自动retry必须同时满足Gateway已证明`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`；实际delay取指数backoff与provider hint的较大值。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理。超过60秒、`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全和协议错误默认不自动retry。`ContextOverflow`进入Compaction。
+默认AgentRun最多3次logical retry，backoff为2秒、4秒、8秒；一次成功finalized response或新的ModelCallRequest开始后计数重置。自动retry必须同时满足Gateway已证明`NotSent`或`RejectedBeforeExecution`，且reason是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`；实际delay取指数backoff与provider hint的较大值。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理。超过60秒、`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全、`UnexpectedToolCall`、`InvalidStructuredOutput`、`InvalidProviderResponse`和`IncompleteResponse`默认不自动retry。`ContextOverflow`进入Compaction。
 
 Steer、Cancel、成功Compaction Replace或任何model-visible conversation change都会使旧logical retry失效。任何logical retry都可能重复provider work或billing，不能宣称exactly-once。完整policy见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
@@ -1393,7 +1403,9 @@ MVP性能要求：
 - CompactionSummary最多1次logical retry，即最多2次Gateway invocation；
 - `NotSent`/`RejectedBeforeExecution`的Timeout/TransportUnavailable/ProviderUnavailable分别允许logical retry；AcceptedNoOutput默认不允许；
 - `NotSent`/`RejectedBeforeExecution`的RateLimited在Retry-After不超过60秒时，delay取purpose backoff与hint较大值；超过60秒不自动等待；
-- RequestOutcomeUnknown、StreamInterrupted、认证、quota、配置、安全和协议错误不自动logical retry；
+- RequestOutcomeUnknown、StreamInterrupted、认证、quota、配置和安全错误不自动logical retry；
+- UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse不自动logical retry，不调用AgentLoop/ToolSet，不append assistant entry；
+- non-empty Refused response仍进入candidate Finished并可truthful append；
 - request delivery outcome unknown和first semantic delta后的stream failure不由Gateway blind retry；
 - logical retry只在旧Model operation terminal/remove后启动；不存在两个可向Executor返回结果的同Session Model future；
 - Finished candidate在Steer FIFO为空且Cancel/revocation未获胜时才append final；

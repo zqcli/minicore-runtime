@@ -37,6 +37,7 @@
 - [ADR 0104：SessionStorage是durable truth](../adr/0104-session-storage-is-durable-truth.md)
 - [ADR 0106：ModelGateway使用一个深异步调用interface](../adr/0106-model-gateway-is-single-deep-operation.md)
 - [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
+- [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](../adr/0120-failures-stay-with-owning-modules.md)
 
 ## 决策摘要
 
@@ -596,7 +597,9 @@ pub enum OutputContract {
 }
 ```
 
-`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，adapter必须拒绝该结果，不能把它交给SessionExecutor执行。
+`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，Gateway必须返回`UnexpectedToolCall`，不能把它交给SessionExecutor执行。
+
+`Structured`在MVP中同样要求`tools`为空。provider-native strict schema只是第一层约束；Gateway仍必须对terminal text执行exact JSON parse和本地schema validation。MVP不做JSON repair、type coercion或Markdown code-fence extraction。需要Tool的AgentRun先完成普通ToolRound，之后再使用新的Structured `ModelCallRequest`取得terminal structured response。
 
 ModelGateway可以：
 
@@ -655,6 +658,7 @@ constructor验证：
 - assembly_proof.purpose等于request purpose；
 - assembly_proof.turn_model_fingerprint等于TurnModelSnapshot fingerprint；
 - assembly_proof.output_contract_hash等于input.output_contract canonical hash；
+- `NoToolCalls`或`Structured`时input tools为空；
 - `CompactionSummary`的assembly budget proof必须存在，且proof max output等于request `max_output_tokens`；`AgentRun`不得携带该proof；
 - max_output_tokens满足Snapshot effective limits。
 
@@ -888,7 +892,49 @@ pub enum FinalizedAssistantContent {
 }
 ```
 
-`content[]`保持provider finalized semantic order。`ModelProgressEvent::ContentDelta.content_index`是该terminal `content[]`的zero-based位置，不是ToolCall内部`index`；adapter必须保证stream与terminal normalization使用同一位置语义，无法关联时返回protocol/validation failure。SessionExecutor随后分配或关联ItemId并构造assistant entry。
+`content[]`保持provider finalized semantic order。`ModelProgressEvent::ContentDelta.content_index`是该terminal `content[]`的zero-based位置，不是ToolCall内部`index`；adapter必须保证stream与terminal normalization使用同一位置语义，无法关联时返回`InvalidProviderResponse`。SessionExecutor随后分配或关联ItemId并构造assistant entry。
+
+### Response Validation
+
+ModelGateway必须在构造`ModelCallResult`前执行一个纯provider-neutral validation step：
+
+```text
+ProviderAttemptResult
+→ normalize provider wire
+→ validate finish/content consistency
+→ validate OutputContract
+→ ModelCallResult或ModelCallError
+```
+
+ToolCall仅在`output_contract = None`且request tools非空时允许。validation按以下顺序执行：
+
+1. malformed provider wire、重复/缺失terminal identity、stream与final `content_index`无法对应，返回`InvalidProviderResponse`；
+2. 当前调用不允许ToolCall却出现任意ToolCall，返回`UnexpectedToolCall`；
+3. 在ToolCall本来允许的调用中，`Length`或`ContentFiltered`返回`IncompleteResponse`；即使content中已经出现ToolCall也不得执行；
+4. `ToolCalls`但content无ToolCall、`Stop`或`Refused`却带ToolCall，以及provider要求finish reason但terminal缺失，返回`InvalidProviderResponse`；
+5. `Refused`且包含非空finalized refusal text是successful response，不执行Structured schema validation；空refusal返回`InvalidProviderResponse`；
+6. `Stop`或`Unknown`且无ToolCall时必须包含非空user-visible Text；空response或reasoning-only response返回`IncompleteResponse`；
+7. `Structured`必须规范化为exact一个非空Text block（Reasoning可另存），该Text可直接解析为JSON并满足schema；否则返回`InvalidStructuredOutput`；
+8. `Unknown`只用于adapter已经证明该provider无法可靠提供native finish reason的情况；若协议要求finish但wire缺失，必须返回`InvalidProviderResponse`。
+
+可解析为JSON `Value`但不符合matching `ToolSpec` schema的arguments不是Response Validation error。该ToolCall在允许Tool的调用中保持valid model action，随后由ToolSet preflight形成failed ToolResult；Gateway不得把它改写为`InvalidProviderResponse`或`InvalidStructuredOutput`。
+
+规范决策表如下；若同时命中多行，按上述validation顺序选择更早的error：
+
+| ToolCall permission | Content | Finish reason | Result |
+| --- | --- | --- | --- |
+| forbidden | any ToolCall | any | UnexpectedToolCall |
+| allowed | ToolCall | ToolCalls / Unknown | valid response → NeedTools |
+| allowed | ToolCall | Length / ContentFiltered | IncompleteResponse |
+| allowed | ToolCall | Stop / Refused | InvalidProviderResponse |
+| any | no ToolCall | ToolCalls | InvalidProviderResponse |
+| any | no ToolCall | Length / ContentFiltered | IncompleteResponse |
+| any | no ToolCall + non-empty refusal text | Refused | valid refusal response → Finished |
+| any | no ToolCall + empty refusal | Refused | InvalidProviderResponse |
+| any | no user-visible Text | Stop / Unknown | IncompleteResponse |
+| any | user-visible Text | Stop / Unknown | validate Structured when requested → Finished |
+
+通过validation后，ToolCall presence才是AgentLoop路由到`NeedTools`的主要事实；无ToolCall response路由到candidate `Finished`。ModelGateway不执行Tool，也不决定Turn terminal。
 
 ### FinalizedReasoning
 
@@ -929,8 +975,8 @@ pub enum ModelFinishReason {
 - 原始code可以作为allowlisted redacted metadata保留；
 - generic Rig response没有finish reason时使用provider-specific adapter提取；
 - 仍不可得时使用Unknown，不根据文本内容伪造；
-- ToolCall content是AgentLoop决定NeedTools的主要事实，finish reason用于一致性校验和diagnostics；
-- Length不自动当Completed，需要Session execution根据OutputContract和AgentLoop规则处理；
+- ToolCall content是通过Response Validation后AgentLoop决定NeedTools的主要事实；finish reason在Gateway中用于一致性校验和diagnostics；
+- Length和ContentFiltered返回`IncompleteResponse`，不进入AgentLoop；
 - provider返回finalized refusal content时使用successful response + Refused；请求在生成response前被policy拦截时返回SafetyBlocked error；
 - safety/refusal不能只表现为空Stop。
 
@@ -1008,7 +1054,7 @@ pub(crate) enum ProviderRequestDeliveryState {
 
 HTTP status或“尚无delta”本身不能决定delivery state。adapter必须根据protocol contract、provider response和transport阶段准确映射：已发送但outcome不确定时返回`RequestOutcomeUnknown`，已发布partial output后失败返回`StreamInterrupted`。该proof决定SessionExecutor能否安全logical retry，不能因为Gateway不内联retry而省略。
 
-只有`NotSent`和provider明确证明未开始执行的`RejectedBeforeExecution`可以映射为默认retryable kind。`AcceptedNoOutput`若没有更强的provider terminal proof必须映射`RequestOutcomeUnknown`；不能把“还没收到delta”当作未执行证明。
+只有`NotSent`和provider明确证明未开始执行的`RejectedBeforeExecution`可以映射为默认retryable reason。`AcceptedNoOutput`若没有更强的provider terminal proof必须映射`RequestOutcomeUnknown`；不能把“还没收到delta”当作未执行证明。
 
 每次`generate_model_turn`在Gateway内部创建process-local ProviderInvocationId；该ID只关联本次single attempt，不进入ModelCallRequest、领域模型或SessionStorage。
 
@@ -1101,7 +1147,7 @@ logical retry：
 | AgentRun | 3 | 2s、4s、8s |
 | CompactionSummary | 1 | 2s |
 
-自动retry必须同时满足delivery proof为`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`。`AcceptedNoOutput`没有明确pre-execution rejection proof时归一化为`RequestOutcomeUnknown`。`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全和协议错误默认不自动retry；`ContextOverflow`进入Compaction。完整决策见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
+自动retry必须同时满足delivery proof为`NotSent`或`RejectedBeforeExecution`，且reason是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`。`AcceptedNoOutput`没有明确pre-execution rejection proof时归一化为`RequestOutcomeUnknown`。`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全、`UnexpectedToolCall`、`InvalidStructuredOutput`、`InvalidProviderResponse`和`IncompleteResponse`默认不自动retry；`ContextOverflow`进入Compaction。完整决策见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)和[ADR 0120](../adr/0120-failures-stay-with-owning-modules.md)。
 
 ## Cancellation
 
@@ -1127,7 +1173,7 @@ cancel token fires
 → 取消concurrency wait或当前single attempt
 → 调用Rig stream.cancel或transport abort
 → 停止发布新progress
-→ 返回ModelCallErrorKind::Cancelled
+→ 返回ModelCallErrorReason::Cancelled
 ```
 
 不能承诺：
@@ -1144,7 +1190,7 @@ SessionExecutor不detach Model future；`generate_model_turn` terminal返回或f
 
 ```rust
 pub struct ModelCallError {
-    pub kind: ModelCallErrorKind,
+    pub reason: ModelCallErrorReason,
     pub message: RedactedErrorMessage,
     pub retry_after: Option<Duration>,
     pub diagnostics: Arc<[ModelCallDiagnostic]>,
@@ -1152,7 +1198,7 @@ pub struct ModelCallError {
 ```
 
 ```rust
-pub enum ModelCallErrorKind {
+pub enum ModelCallErrorReason {
     Cancelled,
     ModelUnavailable,
     AuthMissing,
@@ -1169,13 +1215,16 @@ pub enum ModelCallErrorKind {
     ProviderRejected,
     RequestOutcomeUnknown,
     StreamInterrupted,
-    ProtocolViolation,
+    UnexpectedToolCall,
+    InvalidStructuredOutput,
+    InvalidProviderResponse,
+    IncompleteResponse,
 }
 ```
 
 错误映射：
 
-| Error kind | Gateway行为 | SessionExecutor默认处理 |
+| Error reason | Gateway行为 | SessionExecutor默认处理 |
 | --- | --- | --- |
 | Cancelled | 停止attempt | Cancel/revocation/version规则；普通Steer不取消attempt |
 | ModelUnavailable | 不替换模型 | TurnFailed或要求SetModel |
@@ -1192,7 +1241,10 @@ pub enum ModelCallErrorKind {
 | ProviderRejected | 不解析raw string | TurnFailed/diagnostic |
 | RequestOutcomeUnknown | 不重放 | 默认TurnFailed，提示可能重复provider work/cost |
 | StreamInterrupted | 不重启stream | 丢弃draft并默认TurnFailed |
-| ProtocolViolation | fail closed | TurnFailed + diagnostic |
+| UnexpectedToolCall | 不返回assistant candidate，不执行Tool | non-retryable Model TurnFailure |
+| InvalidStructuredOutput | 不修复、不coerce、不blind retry | non-retryable Model TurnFailure |
+| InvalidProviderResponse | fail closed | non-retryable Model TurnFailure + diagnostic |
+| IncompleteResponse | 丢弃partial candidate | non-retryable Model TurnFailure |
 
 规则：
 
@@ -1202,7 +1254,8 @@ pub enum ModelCallErrorKind {
 - provider status、request ID等只作为allowlisted diagnostic；
 - ContextOverflow必须与Prompt本地size validation保留不同source；
 - SafetyBlocked和Refused response的最终建模必须由adapter根据provider protocol一致处理；
-- `Timeout`、`TransportUnavailable`和`ProviderUnavailable`只有在delivery proof为`NotSent`或`RejectedBeforeExecution`时才能保持该retryable kind；`AcceptedNoOutput`没有明确pre-execution rejection proof时、以及其他outcome unknown都必须映射`RequestOutcomeUnknown`，已有semantic delta必须映射`StreamInterrupted`。
+- `Timeout`、`TransportUnavailable`和`ProviderUnavailable`只有在delivery proof为`NotSent`或`RejectedBeforeExecution`时才能保持该retryable reason；`AcceptedNoOutput`没有明确pre-execution rejection proof时、以及其他outcome unknown都必须映射`RequestOutcomeUnknown`，已有semantic delta必须映射`StreamInterrupted`；
+- 上述四个response error发生在request已经离开`NotSent | RejectedBeforeExecution`安全状态之后，或在completed response validation期间，不满足ADR 0119的safe-delivery retry前提；SessionExecutor不得把它们重新解释为transient failure。
 
 ## Authentication And Secret Redaction
 
@@ -1587,6 +1640,7 @@ opaque encrypted reasoning
 - ToolSpec schema/name mapping；
 - ToolChoice None/Auto/Required/Specific；
 - JSON schema/output contract；
+- NoToolCalls和Structured携带非空tools时constructor拒绝；
 - unsupported image/audio/document；
 - Gateway不截断或摘要context；
 - AssembledModelContextFingerprint不被修改；
@@ -1647,6 +1701,16 @@ opaque encrypted reasoning
 - successful response usage随assistant保存；
 - logical retry_count准确记录0–3（AgentRun）或0–1（CompactionSummary）；
 - Stop/ToolCalls/Length/ContentFiltered/Refused/Unknown；
+- NoToolCalls或Structured返回ToolCall → UnexpectedToolCall，ToolSet从未被调用；
+- output_contract=None且tools为空时返回ToolCall → UnexpectedToolCall；
+- output_contract=None且tools非空时，parseable但ToolSpec schema-invalid的arguments仍形成valid ToolCall并交给ToolSet preflight；
+- Structured exact JSON/schema success → ModelCallResult；
+- Structured non-empty syntax/schema/fence/coercion failure → InvalidStructuredOutput；
+- ToolCalls无call、Stop/Refused带call、required finish缺失、stream/final index不一致 → InvalidProviderResponse；
+- Length、ContentFiltered、empty/reasoning-only terminal → IncompleteResponse；
+- non-empty Refused作为successful response，不经过Structured schema validation；
+- empty Refused → InvalidProviderResponse；
+- 上述四个response error均不logical retry且不生成Completed Item；
 - generic Rig缺finish reason时provider-specific extraction；
 - response ID长度和字符validation。
 
@@ -1769,6 +1833,7 @@ src/model_gateway/provider/scripted.rs
 - [x] 定义ToolSpec、tool choice和OutputContract mapping。
 - [x] 定义stream progress和finalized response。
 - [x] 定义usage、finish reason和provider metadata。
+- [x] 定义Response Validation、Structured约束和四个non-retryable response error reason（ADR 0120）。
 - [x] 定义single provider attempt与Session logical retry边界，MVP禁用Gateway transparent retry和transport fallback。
 - [x] 禁止active Turn cross-model fallback。
 - [x] 定义cancellation、auth、redaction和custom provider规则。

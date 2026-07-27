@@ -2,32 +2,33 @@
 
 状态：设计评审记录（发现待决议）
 日期：2026-07-27
-范围：ADR 0115、`session-execution.md`、`turn-execution-context.md`、`model-gateway.md`、`conversation-storage.md`、ADR 0105
+范围：ADR 0105、0115、0120，`session-execution.md`、`turn-execution-context.md`、`model-gateway.md`、`conversation-storage.md`
 方式：在 ADR 0115 接受 AgentLoop 自研协议状态机后，对其状态转换、输入 interface、动作消费语义和既有文档同步情况进行专项复核。
 
 ## 总体判断
 
 ADR 0115 的核心方向合理：AgentLoop 收敛为 MiniCore 自研、crate-private、同步 sans-I/O 协议状态机；SessionExecutor 继续拥有模型调用、Tool 副作用、storage、control、compaction 与 terminal arbitration；Rig 只作为 ModelGateway private `ProviderAdapter` 的实现选择，不拥有 AgentLoop 或 ModelGateway interface。
 
-该设计符合 Transcript-First、单执行 owner 和深模块原则，也消除了 Rig monolithic run 造成的第二 owner 与双向翻译 adapter。当前仍有五项 interface/文档缺口，其中 L1、L2 应在 AgentLoop 编码前冻结；L3–L5 应在同一轮文档修订中关闭。
+该设计符合 Transcript-First、单执行 owner 和深模块原则，也消除了 Rig monolithic run 造成的第二 owner 与双向翻译 adapter。原评审发现五项interface/文档缺口；L1已由ADR 0120关闭，L5此前已关闭。L2仍是AgentLoop编码前阻塞项，L3–L4保持开放。
 
 ## 一、编码前必须定案
 
-### L1 · Model finish reason 与三态转换缺少完整决策表
+### L1 · Model finish reason 与三态转换缺少完整决策表（已关闭）
 
-ADR 0115 将模型响应归约为：content 含 ToolCall 时进入 `PendingToolRound`，不含 ToolCall 时进入 `EmittedCandidate`。但 `model-gateway.md` 明确规定 `Length` 不能自动视为 Completed，需要 Session execution 根据 `OutputContract` 和 AgentLoop 规则处理；`ContentFiltered`、`Refused`、`Unknown` 也具有不同语义。
+原问题是：ADR 0115将模型响应归约为content含ToolCall时进入`PendingToolRound`，不含ToolCall时进入`EmittedCandidate`；当时`model-gateway.md`又把Length、ContentFiltered、Refused和Unknown的最终裁决留给Session execution，导致转换不唯一。
 
-- 影响：`Length + 无 ToolCall` 同时满足“进入 EmittedCandidate”和“不能自动完成”，实现无法无歧义选择状态；`finish_reason = ToolCalls` 但 content 无 ToolCall、以及其他 finish reason 携带 ToolCall 时也没有一致性裁决规则。
-- 建议：在 AgentLoop contract 中增加规范决策表，覆盖 `ModelFinishReason × ToolCall presence × OutputContract`，明确每个组合映射为 `NeedTools`、`Finished`、typed incomplete/failure 或 ProtocolViolation。MVP 若不支持截断响应续写，应将 `Length` 映射为明确的 typed incomplete/failure，不能进入 candidate final。
-- 测试：覆盖 `ToolCalls + no calls`、`Stop/Length/Refused/Unknown + calls`、`Length + Structured/None`、空 refusal 与非空 refusal。
+- 决议：ModelGateway在构造`ModelCallResult`前统一校验`ModelFinishReason × ToolCall presence × OutputContract`。当前调用禁止Tool却返回call时使用`UnexpectedToolCall`；Structured JSON/schema错误使用`InvalidStructuredOutput`；finish/content、empty Refused或wire语义冲突使用`InvalidProviderResponse`；Length、ContentFiltered、empty Stop/Unknown和reasoning-only terminal使用`IncompleteResponse`。四者均non-retryable，不进入AgentLoop或ToolSet。
+- AgentLoop precondition：`accept_model_response`只接收validated response；含ToolCall进入`PendingToolRound`，不含ToolCall进入`EmittedCandidate`。non-empty Refused是合法candidate；pre-generation safety block仍是Model error。
+- 测试：覆盖`ToolCalls + no calls`、`Stop/Length/Refused/Unknown + calls`、Length/ContentFiltered、empty与non-empty Refused、Structured syntax/schema，以及NoToolCalls/Structured下UnexpectedToolCall。
+- 关闭依据：[ADR 0120](../adr/0120-failures-stay-with-owning-modules.md)、`model-gateway.md` Response Validation与ADR 0115更新。
 - 出处：ADR 0115「内部状态机冻结为三态」；`model-gateway.md`「Finish Reason」。
 
 ### L2 · `next_action()` 的一次性发出与消费语义未冻结
 
-AgentLoop interface 只有 `next_action(&mut self) -> AgentLoopAction`，ADR 同时要求 `EmittedCandidate` 只能被消费一次。文档没有说明重复调用 `next_action()` 时返回相同动作、返回 ProtocolViolation，还是依赖内部 issued marker。相同问题也存在于 `NeedTools`，但当前测试要求只点名 candidate。
+AgentLoop interface只有`next_action(&mut self) -> AgentLoopAction`，ADR同时要求`EmittedCandidate`只能被消费一次。文档没有说明重复调用`next_action()`时返回相同动作、返回typed duplicate-action error，还是依赖内部issued marker。相同问题也存在于`NeedTools`，但当前测试要求只点名candidate。
 
 - 影响：Executor 重入、错误恢复或未来重构可能重复启动 Tool operation、重复处理 candidate final；三态名称本身不能证明 action 已发出还是尚未发出。
-- 建议：冻结 `next_action()` 为 one-shot action emission；每个带副作用后续处理的 action 在当前状态中只能成功取出一次，重复调用返回 typed ProtocolViolation。实现可在三种顶层状态内部使用 private `issued/response: Option<_>` 子状态，无需增加 public trait、第四个公开状态或额外方法。
+- 建议：冻结`next_action()`为one-shot action emission；每个带副作用后续处理的action在当前状态中只能成功取出一次，重复调用返回typed duplicate-action error。具体reason名称随L2一起决定，不由ADR 0120提前冻结。实现可在三种顶层状态内部使用private `issued/response: Option<_>`子状态，无需增加public trait、第四个公开状态或额外方法。
 - 测试：`NeedTools`、`Finished` 重复 poll 均拒绝；`NeedModel` 在 operation 已启动期间不会被二次发出；合法 accept 后 issued marker 被正确重置。
 - 出处：`session-execution.md`「AgentLoop Interface」；ADR 0115「协议校验」「测试要求」。
 
@@ -63,13 +64,15 @@ ADR 0105 的后果仍写“AgentLoop 可替换（含 Rig adapter）”，与 ADR
 | --- | --- |
 | 自研 AgentLoop 决策 | 合理，保持 Accepted |
 | SessionExecutor / AgentLoop ownership | 总体清晰，无需合并 |
-| 编码前阻塞 | L1 finish-reason 决策表、L2 one-shot action emission |
+| 已关闭 | L1 finish-reason/OutputContract决策表、L5 Rig职责旧叙事 |
+| 编码前阻塞 | L2 one-shot action emission |
 | interface 收窄 | L3 建议使用 trusted typed protocol delta |
-| 文档一致性 | L4 Steer 路径待同步；L5 ADR 0105 与Rig职责说明已关闭 |
+| 文档一致性 | L4 Steer路径待同步 |
 | Rig 边界 | 只实现 ModelGateway 内部 ProviderAdapter 的 provider 映射与调用，不拥有 ModelGateway |
 
 ## 评审决议
 
-- **L1–L4**：待决议。建议在 AgentLoop 首个实现提交前一次性回写 ADR 0115、`session-execution.md`、`model-gateway.md` 与必要的 storage interface 说明。
+- **L1**：**已关闭**（2026-07-27）。ADR 0120将Provider response错误归ModelGateway，并冻结四个直接error reason与non-retry语义；AgentLoop只接收validated response。
+- **L2–L4**：待决议。建议在AgentLoop首个实现提交前回写ADR 0115、`session-execution.md`与必要的storage interface说明。
 - **L5**：**已关闭**（2026-07-27）。ADR 0105旧结论已修订，Rig职责已统一为ModelGateway private ProviderAdapter中的provider attempt映射与调用；Rig不拥有AgentLoop或ModelGateway编排。
-- 修订完成门槛：finish-reason 决策表冻结；action one-shot 语义可测试；ToolRound/Steer 输入 contract 收窄；Steer 规范路径唯一；正式 ADR 不再保留 Rig loop adapter 旧叙事。
+- 修订完成门槛：action one-shot语义可测试；ToolRound/Steer输入contract收窄；Steer规范路径唯一。finish-reason决策表与Rig loop adapter旧叙事已完成。
