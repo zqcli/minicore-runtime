@@ -656,7 +656,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、PrepareForUnload和Snapshot。等待期间不持有Tool资源锁或Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。用户长时间不回答时Interaction保持Pending。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
+当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、PrepareForUnload和Snapshot。等待期间不预留file mutation ticket，也不持有Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。用户长时间不回答时Interaction保持Pending。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
 
 ### Steer
 
@@ -951,6 +951,8 @@ Session definition update必须在per-session lifecycle synchronization内同时
 
 跨Agent/Session操作使用固定synchronization顺序`Agent lifecycle → Session lifecycle`，避免Agent disable、Session upgrade/fork和archive之间形成锁环。
 
+该顺序只适用于短durable state synchronization。实现不得在持有Agent lifecycle guard/permit时等待SessionExecutor、Unload completion、event subscriber或host callback；status/revision mutation完成后先释放gate，再向loaded Sessions fan-out readiness invalidation。普通Mutex/RwLock guard不得跨`.await`，有意覆盖initiating append的串行边界使用typed start-commit permit并由私有组合操作收口（ADR 0117）。
+
 ### Load vs Load
 
 同一 Session load single-flight；不能创建两个 execution owners。
@@ -1145,7 +1147,7 @@ Agent release channel
 - subscriber断开后Pending Interaction保持并可由新Snapshot重建；
 - Steer 在 WaitingApproval 时排队；
 - WaitingApproval Steer只进入FIFO，不作为approval decision；
-- WaitingForUserInput保持Turn/Session execution Running，且不持有Tool资源锁；
+- WaitingForUserInput保持Turn/Session execution Running，且不预留file mutation ticket；
 - WaitingForUserInput时Steer只排队，UserAnswer恢复同一Turn；
 - 一个Session等待UserQuestion时，其他Session继续运行；
 - Agent disable/delete vs initiating UserMessage append final synchronization；

@@ -448,13 +448,14 @@ SessionExecutor NeedModel
 - Context 构造、UserMessage composition、Model 和 Tool 使用异步 `RunningOperation`；
 - operation result 使用 `SessionId + TurnId + execution_version + OperationType` 校验；
 - private AgentLoop 只返回 `NeedModel | NeedTools | Finished`；
-- `ToolExecutionControl` 负责 approval、UserQuestion 和 execution-start 的 required durable ordering；`request_user_question`只在pre-execution ask-user route使用，等待不持有资源锁；
+- `ToolExecutionControl` 负责 approval、UserQuestion 和 execution-start 的 required durable ordering；`request_user_question`只在pre-execution ask-user route使用，等待不预留file mutation ticket；
 - Submit、Steer、FollowUp、CancelQueuedMessage、ResolveInteraction、Cancel、Workspace revocation、PrepareForUnload 和 Snapshot 流程；
 - FollowUp 使用 bounded process-local FIFO；
 - progress event 与全部mutation/control ingress lane分离；
 - restart 不恢复旧异步操作，unfinished Turn 保守 terminalize；
-- multi-session 共享 Model/Tool 资源时使用明确并发限制和 canonical resource locks；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。
+- 每个loaded Session拥有独立file mutation queue：同Session同文件mutation FIFO，多文件/open-world Tool按批次Serial；跨Session共享Workspace不协调并由host/user负责隔离。ModelGateway继续提供共享provider并发限制；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。完整决策见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
 - lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
+- 异步同步不建设全局lock-rank系统：普通guard不跨await/owner调用，release后fan-out；有意的bounded异步串行使用typed permit和私有组合helper。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
 
 完成门槛：
 

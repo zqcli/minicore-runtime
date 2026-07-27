@@ -224,27 +224,19 @@ pub trait ToolSandbox: Send + Sync {
 
 ### 复杂度观察（不要求修改，实现时警惕）
 
-- **同步原语无全局获取总序**：initiating append 同时涉及 Agent lifecycle gate、TurnControlGate reservation、WorkspaceCommitAuthorization 三层；文档分散给出了两两顺序（"先 reservation 再 authorization"、"Agent lifecycle → Session lifecycle"），但没有一处列出全部同步原语的全局锁序总表。建议在 `session-execution.md` 增补一节，把死锁分析从实现者脑中移到文档里。
-- **Tool 子系统对 MVP 偏重**：Deferred/search_tools/invoke_tool、跨 Session canonical resource locks、grant store 在"MVP 禁 bash、内置工具为主"前提下首版收益有限。设计冻结无碍，但实现排期应显式后置（当前迁移记录未给 Tools 排期）。
+- ~~**同步原语无全局获取总序**~~：**已由ADR 0117关闭**。复核未发现当前可构造循环等待；single owner、non-blocking reservation、release-before-fan-out和typed permit取代全局lock-rank方案。
+- **Tool 子系统对 MVP 偏重**：Deferred/search_tools/invoke_tool、grant store和完整Sandbox adapter在"MVP禁bash、内置工具为主"前提下首版收益有限。文件并发已由ADR 0116收窄为Session-local单文件FIFO queue与Serial批次降级。
 - **每 Session 8 类 ingress lane/signal**：对 in-process 单用户 runtime 是重装备，但每条 lane 有 D1 失败模式论证支撑，属"有据可查的重"；建议首版容量给保守小值并靠 diagnostics 观察。
 - **Fork deep-copy + nested remap（含 compaction boundary）**：已知取舍；remap 校验是最易写错的角落，property test 优先级应排最高一档。
 
 **推荐方案（按条对应）**：
 
-1. *锁序总表*：在 `session-execution.md` 增补「同步原语获取总序」一节，冻结全局顺序：
-
-   ```text
-   Agent lifecycle gate
-   → per-session lifecycle/residency synchronization
-   → TurnControlGate reservation（非阻塞，失败即放弃不等待）
-   → WorkspaceCommitAuthorization
-   → 一次短 SessionWriter.append → apply
-   ```
-
-   并列出三条豁免声明：EmergencyControl / LifecycleControl 是无等待 sticky signal，不参与锁序；ModelGateway concurrency permit 与 ToolResourceLocks 的等待期间不得持有上表任何原语（permit/lock 等待只响应 cancellation）；跨 Agent/Session 操作沿用既有「Agent lifecycle → Session lifecycle」固定顺序。任何新增同步点必须先在此表登记位置。
-2. *Tools 实现排期后置*：在 `migration/v1-to-v2.md` 补一句显式排期：Tool 子系统完整实现（Deferred/search_tools/invoke_tool、跨 Session resource locks、grant store）后置于阶段 6–8 交付束之后；交付束期间仅需 ToolSet 接口签名与 ScriptedProviderAdapter 联调所需的最小 stub。
+1. *异步同步纪律*：不建设全局锁序总表。普通Mutex/RwLock guard不得跨await、owner调用、event publication或fan-out；有意的bounded async serialization使用typed permit；controlled append由私有helper固定`TurnControl reservation → WorkspaceCommitAuthorization → append/apply`；Agent/Workspace mutation释放gate后再通知Session。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
+2. *Tools 实现排期后置*：在`migration/v1-to-v2.md`补一句显式排期：Tool子系统完整实现（Deferred/search_tools/invoke_tool、grant store和完整Sandbox adapter）后置于阶段6–8交付束之后；交付束期间仅需ToolSet接口签名、Session-local mutation queue最小stub与ScriptedProviderAdapter联调。
 3. *lane 容量默认值*：Runtime config 为各 lane 给出保守小默认（如 TurnAdmission=4、Steer=16、FollowUp=16、InteractionControl=8、ToolControl=32），随 diagnostics 的 lane depth 指标观察后调整；默认值本身不入 fingerprint。
 4. *fork remap property test*：在 `conversation-storage.md` 测试矩阵已有条目基础上，标注实现顺序要求——remap round-trip property test（任意合法 entry 序列 fork 后 replay 得到相同相对顺序与 fingerprint）在 fork 功能合入同一 PR 内交付，不允许后补。
+
+> 2026-07-27后续决议：文件并发的权威范围见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)；异步同步纪律见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。MVP不建设全局lock-rank系统。
 
 ### 可实现性排序（直接开工的卡点顺序）
 

@@ -637,7 +637,7 @@ pub enum WorkspaceFileMode {
 
 Tool policy、Tool requirements 和 Sandbox 使用该 view 作为文件权限硬上限。普通 Tool 不能直接使用 roots 自行实现包含判断。
 
-`CwdRelative` 只能相对 Snapshot 中的 canonical cwd 解析；`Absolute` 必须重新执行 root containment。任何其他相对 `Path`、平台 prefix、`..` 逃逸或 ambient process cwd 解释都必须拒绝。`AuthorizedWorkspacePath` 是文件类 ToolRequirement、资源锁和 Sandbox 可以消费的唯一已授权 path 值；raw model path 不能越过该类型直接进入 executor。
+`CwdRelative` 只能相对 Snapshot 中的 canonical cwd 解析；`Absolute` 必须重新执行 root containment。任何其他相对 `Path`、平台 prefix、`..` 逃逸或 ambient process cwd 解释都必须拒绝。`AuthorizedWorkspacePath` 是文件类 ToolRequirement、Session-local `FileMutationKey`推导和Sandbox可以消费的唯一已授权path值；raw model path不能越过该类型直接进入executor。
 
 ### WorkspaceToolContext
 

@@ -1,6 +1,6 @@
 # MiniCore V2 设计评审
 
-状态：设计评审记录
+状态：设计评审记录（未关闭项持续跟进）
 日期：2026-07-25
 范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0113）
 方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
@@ -14,7 +14,7 @@
 1. 多处「留待后续」的**共享类型 / 全序规则**实际会阻塞首版实现；
 2. 模块交界处的**归属与失败分类**。
 
-以下问题按「重大（编码前需定案）」与「非阻塞 / 可延后」分列。严重度经二次核对有调整：并发资源锁一项在复核 `tools.md` 执行链后从重大降为非阻塞（见 D 组说明）。
+以下问题按「重大（编码前需定案）」与「非阻塞 / 可延后」分列。严重度经二次核对有调整；原并发资源锁问题随后由[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)删除跨Session多资源锁协议并改为Session-local file mutation queue。
 
 ---
 
@@ -92,7 +92,7 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 
 ### D. 并发控制面
 
-> 复核修正：原「canonical resource lock」重大项经复核 `tools.md` 执行链（`approval → ToolResourceLocks → record_execution_start → Sandbox → execute`）后**降为非阻塞**——资源锁在 approval 之后才获取，不会跨人工审批持有，此前担心的 priority inversion 不成立；残留问题见非阻塞组。原评审本组只保留D1，现已关闭。
+> 历史复核：原「canonical resource lock」重大项曾因approval先于取锁而降为非阻塞。2026-07-27的[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)进一步删除跨Session通用resource lock，改为Session-local file mutation queue；原priority inversion和多锁问题均不再进入MVP。
 
 **D1 · 控制面与数据面共享 bounded FIFO，无优先通道（已关闭）**
 `Cancel`/`ResolveInteraction`/`WorkspaceAuthorizationRevoked` 与 `Submit`/`Steer`/`GetSnapshot`/`ToolControl` 走同一队列；队列满时 Cancel 排队等待，其间 Turn 持续调用 model / 执行 tool / 计费。Revocation 的安全性已由 out-of-band lease（`authorize_commit` vs `revoke` 同一同步原语）保住，但 Revocation 的 terminalize/资源释放/`TurnInterrupted` 事件、以及 Cancel 的全部语义仍受队列排空速度支配，Cancel 无 out-of-band backstop。
@@ -117,7 +117,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 **E3 · `UserQuestion` Interaction 没有发起 seam（已关闭）**
 `InteractionRequest` 冻结为 `ToolApproval | UserQuestion`，公开协议也含 UserAnswer resolution，但 Tool↔SessionExecutor 唯一 crate-internal seam `ToolExecutionControl` 只有 `request_approval`/`record_execution_start`，`Tool::execute` 只有 `ToolUpdateSink` + 窄 context，无法发起 durable Interaction，也无内建 ask-user Tool。
 - 影响：领域与公开协议承诺 UserQuestion，但执行层无生产者，任何 ask-user 能力无法落地。
-- 决议：在 `ToolExecutionControl` 增加 `request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、资源锁和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不持有跨Session资源；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、无限等待、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)。
+- 决议：在`ToolExecutionControl`增加`request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不预留mutation ticket；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、无限等待、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)与[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
 - 出处：`turn-item-interaction.md` ↔ `tools.md` ↔ `session-execution.md`。
 
 ### F. 实现顺序
@@ -165,12 +165,12 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ### 并发（承 D 组复核）
 
-- 多资源 Tool 无全序获取仍可跨 Session 反序死锁，但操作响应 Turn cancellation，故非永久 → 对单次 execute 的多个 canonical `ToolResourceKey` 采用稳定总序获取，避免依赖 cancellation 兜底。
-- ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3关闭**。ADR 0113禁止普通Tool在`ToolExecutionStarted`或持有资源锁后调用`request_user_question`；若未来需要，必须另行定义不持锁的producer protocol。
+- ~~多资源 Tool 无全序获取仍可跨 Session 反序死锁~~：**已由ADR 0116关闭**。MVP删除跨Session多资源锁；同Session单文件mutation使用单key FIFO，多文件/open-world Tool使同批调用整体Serial。
+- ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3和ADR 0116关闭**。普通Tool在开始file mutation后不得调用`request_user_question`；若未来需要，必须另行定义不持有mutation permit的producer protocol。
 - ~~`PrepareForUnload` graceful unload 不自动 Cancel，长期Pending Interaction可能阻止卸载~~：**已随D1关闭**。LifecycleControl立即stop admission；有限grace deadline属于Unload lifecycle，到期后Cancel active Turn并以Cancelled关闭Pending Interaction。
 - 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
 - Cancel 需等待越过 `ToolExecutionStarted` 的不可取消 Tool 确认 outcome 后才能 append `TurnInterrupted`，延迟受最慢在途副作用约束（truthfulness 换速度）→ 暴露「Cancelling」中间可观察状态，避免 UI 误判无响应。
-- Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，共享同一 Agent 的多 Session 在 status 原语上跨 Session 串行 turn-start → 文档化二者全局加锁总序，记录同 Agent 多 Session turn-start 串行化吞吐影响。
+- ~~Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，可能需要全局锁序~~：**已由ADR 0117关闭**。当前single-owner、non-blocking reservation、release-before-fan-out和typed permit使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
 - `assemble_model_context` 为同步 fn，大 context 组装/tokenize 在同步段内阻塞该 executor 控制面 → 随规模评估 offload，或标注为控制面 stall 风险点。
 - Cancel/revocation 路径产生的 Completed（有 truthful tool message 但无 `tool_round_completed`）永久 conversation-hidden，后续 FollowUp/Steer 模型不可见 → 属预期语义，文档显式点明以免实现者误加补偿逻辑。
@@ -203,7 +203,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ## 复核说明
 
-- 严重度经二次核对调整一处：`session-execution` 的 canonical resource lock 项，在复核 `tools.md` 执行链（approval 先于取锁）后，从重大降为非阻塞，残留「多资源全序获取」建议见并发非阻塞组。
+- 严重度经二次核对调整一处：`session-execution`的canonical resource lock项曾从重大降为非阻塞；后续ADR 0116删除该协议并关闭残留的多资源全序问题。
 - 初始问题正文保留为历史依据；已关闭项以本页“评审决议”和对应ADR为准，开放项仍是待决输入。核心 seam 划分（deep module deletion test、exact model pin、trusted projector 构造 Replace、lease-based revocation、append/apply-before-model-visible）判定为自洽。
 
 ---
@@ -253,3 +253,179 @@ Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套�
 Interaction等待后续决议：MVP不把用户沉默解释为领域事件，删除通用`expires_at`、`Expired`和Interaction timeout调度。Pending只由typed host resolution或显式生命周期动作关闭；disconnect和无subscriber保持Pending，Unload grace deadline仍独立生效。
 
 Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或segment entity。Assistant finalized entry在Tool执行前durable创建call/content有序Items；Tool异步完成只更新对应ItemId的原位置。Snapshot/Query ordered Vec和new-Item StateEvent创建顺序是公开排序契约，progress顺序只属于provisional presentation。
+
+---
+
+## 第一版开放项跟进（2026-07-27）
+
+本节对第一版评审中未划线或明确保持开放的条目重新核对。原始正文保留为历史依据，当前状态以本节为准。优先级含义：P0 = 对应模块任何production执行前必须关闭；P1 = 首个production vertical slice前冻结；P2 = 首轮实现/运维硬化阶段完成；P3 = 有真实产品需求或性能数据后处理。
+
+### 当前问题跟进总览
+
+| ID | 问题 | 当前状态 | 优先级 |
+| --- | --- | --- | --- |
+| O1 | Sandbox capability无法强制时缺少预执行拒绝 | 仍开放，方案已明确 | P0 |
+| O2 | 长Session无持久projection snapshot/checkpoint index | 仍开放 | P2 |
+| O3 | 中段corruption无显式repair utility | 仍开放 | P2 |
+| O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
+| O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
+| O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 部分开放 | P2 |
+| O7 | 同步Prompt assembly可能阻塞Session控制面 | 仍开放 | P2 |
+| O8 | Gateway retry与logical retry无Turn级共享预算 | 仍开放 | P1 |
+| O9 | provider输出违约的错误分类与retry语义未冻结 | 仍开放，与第三轮L1相关 | P1 |
+| O10 | restrictive Workspace update未持久化缺少专用诊断 | 仍开放 | P2 |
+| O11 | 已打开文件handle存在revocation窗口 | 仍开放 | P1 |
+| O12 | Workspace/view fingerprint的恢复策略未冻结 | 仍开放 | P1 |
+| O13 | Prompt/Skill/Workspace共享pinning/authorization值类型未落地 | 仍开放 | P2 |
+| O14 | CompactionSummaryDirective正文的fingerprint coverage不明确 | 部分开放 | P1 |
+| O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 仍开放 | P1 |
+| O16 | ToolPromptView是否支持guidelines未定 | 仍开放，可直接收窄MVP | P3 |
+| O17 | committed-only约束仍被描述成运行时扫描 | 文档语义待收口 | P3 |
+| O18 | Model配额只保证no-starvation，未提供交互延迟隔离 | 条件性开放 | P3 |
+
+### 安全与授权
+
+#### O1 · Sandbox capability预执行拒绝
+
+- 发生场景：Windows或container sandbox只能限制filesystem，无法强制network/process；Tool最终`PermissionSet`声明禁止联网，approval通过后adapter仍可直接联网。
+- 风险：文档声明受限执行，实际形成授权后裸跑；approval不能弥补enforcement缺失。
+- 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、`ToolExecutionStarted`前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入`ToolSetFingerprint`。权威回写到`tools.md`并关闭第二轮R7。
+
+#### O10 · Restrictive Workspace update未持久化诊断
+
+- 发生场景：用户收紧Workspace roots/network权限，旧lease已revoke且active Turn已中断，但新SessionDefinition append失败。
+- 风险：运行时fail-closed，但host只看到普通`Unavailable`；用户可能误认为新限制已持久化，restart后durable旧definition仍是权威值。
+- 推荐修复：增加typed reason，例如`WorkspaceUnavailable::RestrictiveUpdateNotCommitted { old_revision, attempted_fingerprint }`；command response明确“撤权已发生、definition未提交、必须重试”，该process内Session保持Unavailable直至显式reload/retry。不得把失败更新报告为成功应用。
+
+#### O11 · Open-handle revocation窗口
+
+- 发生场景：Tool在lease有效时打开文件handle，随后Workspace restrictive update撤销lease；Tool继续通过旧handle执行长时间写入。
+- 风险：下一次authorize虽会失败，已打开handle仍可在撤权后写入。
+- 推荐修复：文件能力使用handle-relative authorized open，并由`RevocableHandle`绑定lease epoch；每次write/rename/delete等副作用前重新检查epoch，revocation时best-effort关闭已登记handle。平台无法收敛窗口时必须在Sandbox capability中声明不可强制并由O1拒绝。
+
+#### O12 · Workspace fingerprint恢复策略
+
+- 发生场景：restart/fork后重建Tool grants或authorization cache，grant key依赖`WorkspaceAccessFingerprint`，但文档未冻结该fingerprint持久化还是确定性重建。
+- 风险：恢复后fingerprint漂移会导致grant过宽、异常失效或同一Session重启前后行为不同。
+- 推荐修复：优先采用确定性重建：从durable exact `SessionDefinitionRevision`、Workspace definition、authorization policy/enforcement version计算versioned fingerprint，并提供golden vectors；只有存在不可重建输入时才持久化fingerprint。ToolGrantKey只能绑定可重建、算法已版本化的值。
+
+### Storage与恢复
+
+#### O2 · Projection snapshot/checkpoint index
+
+- 发生场景：长期Session积累数万entries并多次compaction/fork；每次load、recovery或history replay仍从文件头执行cross-entry validation。
+- 风险：冷启动与恢复延迟随会话寿命线性增长；compaction只降低模型上下文，不降低ledger replay成本。
+- 推荐修复：增加rebuildable verified projection snapshot与byte-offset/checkpoint index；snapshot记录format/version、selected-path checkpoint、projection fingerprints和覆盖offset，open时先验证snapshot再replay tail。提前为physical segment/vacuum留接口，但不改变SessionStorage是唯一durable truth。
+
+#### O3 · Explicit repair utility
+
+- 发生场景：掉电或磁盘故障产生中段newline-terminated坏行，后续entries仍存在；自动恢复只能截断最后一个未换行partial tail。
+- 风险：单行损坏导致整个Session不可打开，只能人工编辑JSONL。
+- 推荐修复：提供exclusive-lease下运行的显式管理员repair utility：先备份原文件，扫描last-valid-prefix，报告损坏entry与将丢失范围，经确认后截断/导出修复副本并执行完整replay。保持fail-closed，禁止普通load隐式修复。
+
+### 并发与控制面
+
+#### O4 · 多资源锁稳定总序（已关闭）
+
+- 原发生场景：Session A依次请求`file:a → file:b`，Session B依次请求`file:b → file:a`，两者各持一把锁并等待另一把。
+- 决议：不建立跨Session、跨Runtime或跨进程通用resource lock。每个loaded Session拥有独立`SessionFileMutationQueue`；同Session同一canonical file mutation按call_index FIFO，不同file key并行；多文件和open-world Tool使同批普通ToolCall按原始顺序Serial。跨Session共享Workspace由host/user通过worktree、独立Workspace或外部机制协调。
+- 关闭依据：[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)与`tools.md`的“批量调度和Session-local文件mutation queue”。原AB/BA多锁状态不可构造，O4关闭。
+
+#### O5 · 全局同步原语获取顺序（已关闭）
+
+- 原担忧：Turn start与Agent Disable、controlled append与Workspace revoke若反序持有多把锁并相互等待，可能形成AB/BA死锁。
+- 复核结论：当前设计中每个Session只有一个Executor owner，`TurnControlGate` reservation非阻塞，Workspace revoke在线性化lease后释放同步保护再发sticky signal，跨Agent/Session durable operation已有`Agent → Session`局部顺序，未发现可构造的现行循环等待。同Agent多Session在短start-commit permit上的串行属于有限吞吐取舍。
+- 决议：不建设Runtime-global lock hierarchy或lock-rank manager。普通Mutex/RwLock guard不得跨`.await`、跨owner调用、event publication或fan-out；有意覆盖bounded append/apply的异步串行使用typed permit/semaphore；Agent/Workspace状态变化释放gate后再通知Session；Model、Tool、approval、UserQuestion与file mutation ticket等待期间零持有短状态guard。
+- 关闭依据：[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)与`session-execution.md`“异步同步纪律”。保留P2 lint与竞态测试作为实现防回归，不再作为P1设计缺陷。
+
+#### O6 · Cancelling可观察状态
+
+- 发生场景：不可取消的远程部署或数据库操作已经append `ToolExecutionStarted`；用户Cancel后，Executor必须等待真实outcome或判定Abandoned才能append `TurnInterrupted`。
+- 风险：UI在等待期间仍只看到Running，容易误判Cancel无效或Session卡死。
+- 推荐修复：公开snapshot/event增加`TurnExecutionPhase::Cancelling`，或提供稳定的`cancellation_pending_on_started_tool`状态；它表示cancel epoch已接受、当前正在等待不可回滚副作用收口，不改变最终truthful terminal规则。
+
+#### O7 · 同步assembly控制面stall
+
+- 发生场景：长conversation、大ToolResult和复杂token estimate使`assemble_model_context()`执行大对象拼接、hash或token估算；该同步调用位于SessionExecutor的NeedModel路径。
+- 风险：对应Session在assembly期间无法及时处理Cancel、revocation和Snapshot；其他Session不受影响，但单Session控制面响应目标被削弱。
+- 推荐修复：优先把assembly/token estimate作为cancellable `RunningOperation`；若MVP保持同步，则冻结最大输入/CPU预算，超过阈值offload到blocking pool，并发布assembly duration/size diagnostics。
+
+#### O18 · Model配额的交互延迟隔离
+
+- 发生场景：多个长流式Session占满Model permits，新的交互请求虽不会永久饿死，但first-token latency持续较高。
+- 风险：属于体验与SLO问题，不影响correctness；第一版“foreground/background进入领域模型”的建议已失效。
+- 推荐修复：有真实延迟SLO后，在Runtime policy/host admission层增加`ModelSchedulingClass`或weighted fair queue；该值不进入Turn fingerprint，不改变exact model pin，也不成为Session领域状态。
+
+### ModelGateway协议
+
+#### O8 · Turn级共享retry预算
+
+- 发生场景：ModelGateway内部对RateLimited/Timeout执行多次退避，返回错误后SessionExecutor再启动多轮logical retry；两个局部上限相乘。
+- 风险：单Turn耗时、provider work和计费失控，并占用共享Model配额。
+- 推荐修复：定义Turn-scoped `ModelCallBudget { max_attempts, max_elapsed, max_backoff }`；Gateway每次attempt/退避扣减并在result/error diagnostics返回消耗量，Executor logical retry继续使用同一remaining budget。budget耗尽返回typed terminal failure，不再调度新attempt。
+
+#### O9 · Provider输出违约分类
+
+- 发生场景：`NoToolCalls`请求返回ToolCall；structured output缺字段或类型错误；finish reason与content形状冲突。
+- 风险：实现可能分别映射为`InvalidRequest`、`ProtocolViolation`或transient failure，导致retry、TurnFailed和diagnostics行为分叉；越权ToolCall若被误接收还会进入Tool执行。
+- 推荐修复：与第三轮L1一起冻结决策表：forbidden ToolCall和schema违约映射为typed `OutputContractViolation`，不得执行Tool、不得transparent retry，可由Session policy决定至多一次logical retry；wire/content结构自相矛盾映射`ProtocolViolation`且默认non-retryable；request自身无法映射provider能力才使用`InvalidRequest/UnsupportedCapability`。
+
+### Fingerprint与横切值
+
+#### O13 · 共享pinning/authorization value type
+
+- 发生场景：Prompt、Skill和Workspace分别实现source stamp、authorized root、lease recheck和canonical hash，在wire/identity freeze阶段产生三套编码。
+- 风险：同一安全不变量在多处漂移，golden vector、fingerprint coverage和revocation时机不一致。
+- 推荐修复：新增共享value模块，只抽`SourceAuthorizationStamp`、`AuthorizedSourceRoot`、pinned-view/lease helper和canonical hash coverage；Prompt/Tool/Skill继续保持独立深模块，不建立通用Resource owner。
+
+#### O14 · CompactionSummaryDirective fingerprint coverage
+
+- 发生场景：summary instruction正文或format发生变化，但source checkpoint、scope和budget不变；实现只hash plan/budget，没有hash directive正文。
+- 风险：不同summary请求可能共享同一fingerprint，破坏request proof、审计与golden vector可复现性。
+- 推荐修复：定义versioned `CompactionSummaryDirectiveFingerprint`，覆盖`instruction body + scope + format_version + output limits`，并纳入`PromptAssemblyProof`和最终`AssembledModelContextFingerprint` coverage。
+
+#### O15 · Prompt正文与PromptFingerprint
+
+- 发生场景：Runtime/Agent/Session prompt正文热修，但实现没有bump DefinitionVersion；当前fingerprint只覆盖identity/version/provenance。
+- 风险：同一PromptFingerprint对应不同模型可见正文，cache、retry proof和故障对比失真。
+- 推荐修复：冻结双重约束：任何正文变化必须bump DefinitionVersion，同时PromptFingerprint纳入canonical content hash。content hash算法与encoding并入第二轮wire/identity freeze和golden vectors。
+
+### Interface收口
+
+#### O16 · ToolPromptView guidelines
+
+- 发生场景：实现者希望给单个Tool增加使用规则或风险提示，但`ToolPromptView`只有specs与fingerprint，可能把guideline旁路塞入普通Prompt文本。
+- 风险：Tool/Prompt owner模糊，guideline是否进入provider payload和fingerprint不一致。
+- 推荐修复：MVP直接关闭该能力：`ToolPromptView`只包含ToolSpec，工具使用说明进入ToolSpec description；出现无法由schema/description表达的真实需求后，再新增typed `guidelines`并明确排序、role与fingerprint coverage。
+
+#### O17 · Committed-only by-construction措辞
+
+- 发生场景：实现者按Prompt最终校验文字增加一次“扫描是否存在未提交model-visible contribution”的运行时检查。
+- 风险：重复实现上游projection规则，并把类型保证误建模为可恢复runtime error。
+- 推荐修复：把`prompt.md`对应条目改为by-construction说明：AgentRun assembly只接受无public constructor的`CommittedConversationView`；未提交draft无法构造该输入，不增加额外扫描。
+
+### 已被后续设计实质关闭
+
+以下第一版未划线项已经被当前权威文档覆盖，后续不再作为开放问题：
+
+- 多资源Tool锁序：ADR 0116删除跨Session多资源锁，以Session-local单文件FIFO和Serial批次降级关闭O4；
+- 全局同步原语锁序：ADR 0117确认当前不存在可构造循环等待，以single owner、短guard、typed permit和release-before-fan-out关闭O5；
+- Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
+- public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
+- Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；
+- 同时只能有一个Running Turn：writer append与cold replay共享`validate_and_project`并按Turn状态fail closed；
+- Cancel/revocation后truthful Tool message保持conversation-hidden：`session-execution.md`已明确不补写`tool_round_completed`；
+- ToolSet/ToolPromptView fingerprint cross-binding：`TurnExecutionContext` final validation已有单点fail-closed断言；
+- ModelGateway不得新增模型可见语义：`model-gateway.md`已禁止增删重排content、注入diagnostic或未提交draft。
+
+### 已确认的设计取舍
+
+以下条目保留其代价，但当前不要求修复：
+
+- restart后模型可能再次请求非幂等Tool：baseline选择truthfulness，不承诺跨崩溃exactly-once；高风险Tool未来可单独增加业务幂等键；
+- fork deep-copy selected parent path：已明确否决content-addressed DAG，接受存储放大换取ownership与repair简单性；
+- provider continuation优化可能经常回退full request：full-request equivalence是基线，后续只需golden vector验证；
+- `resolve_for_turn`不做availability probe、active Turn不cross-model fallback：exact pin优先；future Turn备用模型属于新策略ADR；
+- MVP不提供manual/proactive compaction：ADR 0112已明确首版范围；
+- 不建立WorkspaceId：primary-root grouping仅是UI/cosmetic，不参与授权；
+- additional roots不自动成为Prompt/Skill source：文件访问授权与指令/技能注入授权保持分离，可由UI diagnostics解释。

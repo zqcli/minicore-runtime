@@ -54,7 +54,7 @@ ToolService::for_turn(context) -> ToolSet
 - ToolService 不创建 Turn，也不修改 TurnStatus；
 - ToolSet 是执行期对象，不写入 Turn 领域对象。
 
-ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在该 Turn 内不改变。每次ToolCall的进度、terminal state、approval waiter、cancellation和资源锁属于执行状态，不改变ToolSet的有效工具快照。完整admission、AgentLoop、append/apply conversation projection和logical model-call关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
+ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在该 Turn 内不改变。每次ToolCall的进度、terminal state、approval waiter、cancellation和Session-local file mutation queue属于执行状态，不改变ToolSet的有效工具快照。完整admission、AgentLoop、append/apply conversation projection和logical model-call关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
 
 ## 决策摘要
 
@@ -63,7 +63,7 @@ ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在
 - 一个 MiniCoreRuntime 初始化并拥有一个 `Arc<ToolService>`；
 - Agent、Session 和 Turn 不保存 Tool definitions、Tool overrides、active tools、executor 或 ToolSet；
 - Tool 注册时原子绑定模型定义和真实 executor；
-- `ToolService` 是长生命周期深模块，隐藏注册表、策略、审批、Sandbox、Hook、锁和 Deferred index；
+- `ToolService` 是长生命周期深模块，隐藏注册表、策略、审批、Sandbox、Hook和 Deferred index；
 - `ToolSet` 是某个 Turn 的不可变有效工具快照；
 - `ToolSet::prompt_view()` 提供给 PromptSet 的模型安全工具投影；
 - `ToolSet::fingerprint()` 标识 ToolSpec、Exposure、route、Workspace、policy 和 provider projection 的有效组合；
@@ -76,8 +76,8 @@ ToolSet 的“不可变”指 ToolSpec、Exposure、route 和 Deferred index 在
 - 参数在权限判断和审批前冻结，审批后不允许修改；
 - 所有直接、Deferred 和内部调用共享唯一执行链；
 - approval 只授予执行资格，Sandbox 继续执行强制限制；
-- 同批调用串行完成 preflight，再根据并发模式和资源锁执行；
-- 首版ask-user route在同批副作用ToolCall前独占等待，不持有资源锁，回答后其余调用才进入普通调度；
+- 同批调用串行完成 preflight，再根据并发模式和Session-local file mutation queue执行；
+- 首版ask-user route在同批副作用ToolCall前独占等待，不预留mutation ticket，回答后其余调用才进入普通调度；
 - ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；
 - 正常、错误、拒绝和 confirmed cancellation 产生 truthful ToolResult；executor/side-effect outcome unknown 返回 Abandoned，不生成 ToolResult。
 
@@ -92,8 +92,11 @@ MiniCoreRuntime
    │  ├─ ToolPolicy
    │  ├─ ToolGrantStore
    │  └─ ToolSandbox
-   ├─ ToolResourceLocks
    └─ DeferredToolIndex
+
+Loaded Session
+└─ SessionExecutor
+   └─ SessionFileMutationQueue
 
 candidate Turn admission
 └─ ToolService::for_turn(ToolTurnContext)
@@ -101,6 +104,7 @@ candidate Turn admission
       ├─ Turn-scoped ToolExecutionControl
       ├─ ToolPromptView
       ├─ ToolSetFingerprint
+      ├─ SessionFileMutationQueue shared reference
       ├─ immutable ToolName → Arc<dyn Tool> routes
       ├─ DeferredToolIndex snapshot
       └─ execute(ToolExecutionRequest[]) → ToolExecutionOutcome[]
@@ -130,7 +134,6 @@ pub struct ToolService {
     registry: ToolRegistry,
     hooks: Arc<dyn ToolHooks>,
     authorization: ToolAuthorization,
-    locks: ToolResourceLocks,
 }
 
 impl ToolService {
@@ -193,7 +196,7 @@ pub struct ToolServiceConfig {
 
 Approval 和 UserQuestion delivery 都不是 Runtime-global ToolService dependency。Session execution 在 Turn capture 时提供一个 Turn-scoped internal `ToolExecutionControl`；它是 Tool 到 SessionExecutor 的 crate-internal producer seam。明确的non-interactive embedding必须在创建Interaction前选择fail-closed Tool policy或显式Cancel；已经创建的Interaction不会因无subscriber或elapsed time自动resolve，也不使用`None`表示隐式允许。TUI、Web、GUI 和 RPC 只是接收 UI-safe Interaction view 的 Adapter，不直接持有 waiter 或 writer。
 
-调用方不需要直接了解 ToolRegistry、ToolPolicy、Interaction persistence、Sandbox、Hook 顺序、资源锁或 Deferred lookup。
+调用方不需要直接了解 ToolRegistry、ToolPolicy、Interaction persistence、Sandbox、Hook 顺序、file mutation queue或 Deferred lookup。
 
 ## Tool 注册
 
@@ -305,18 +308,6 @@ ToolRequirements 根据规范化后的具体参数动态生成：
 ```rust
 pub struct ToolRequirements {
     pub permissions: PermissionSet,
-    pub resources: Vec<ToolResourceAccess>,
-}
-
-pub struct ToolResourceAccess {
-    pub key: ToolResourceKey,
-    pub mode: ToolResourceMode,
-}
-
-pub enum ToolResourceMode {
-    Read,
-    Write,
-    Exclusive,
 }
 ```
 
@@ -331,7 +322,7 @@ pub struct PermissionSet {
 }
 ```
 
-空集合表示不请求对应权限。具体 path、network target、process 和 environment 表达留给后续细化，但 PermissionSet 必须支持确定性规范化、交集计算和 fingerprint。
+空集合表示不请求对应权限。具体 path、network target、process 和 environment 表达留给后续细化，但 PermissionSet 必须支持确定性规范化、交集计算和 fingerprint。ToolSet在authorization后从结构化文件权限私有地得到`None | SingleFile(FileMutationKey) | Serial`调度分类；不得根据参数名称猜测mutation target，也不把该分类暴露为通用resource-lock API。
 
 例如，同一个 Bash Tool 可以因为具体命令不同产生完全不同的 ToolRequirements。ToolPolicy、approval 和 Sandbox 都必须使用动态 requirements，不可信任静态 read-only hint。
 
@@ -682,7 +673,7 @@ ToolExecutionStarted append → side effect
 
 `ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并重新验证cancellation与Workspace lease。Cancel/revocation先被观察则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
 
-`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、`ToolResourceLocks`和外部副作用之前。等待期间不取得或持有资源锁、`WorkspaceCommitAuthorization`或其他跨Session资源；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control和Snapshot。Approval与UserQuestion都没有inactivity timeout：用户沉默时保持Pending，不推断Deny。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
+`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前。等待期间不预留mutation ticket，也不持有`WorkspaceCommitAuthorization`；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control和Snapshot。Approval与UserQuestion都没有inactivity timeout：用户沉默时保持Pending，不推断Deny。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
 
 TUI、RPC、Web和GUI通过[Runtime Interface](runtime-interface.md)接收UI-safe Interaction StateEvent并提交resolution；它们是Presentation Adapter，负责展示、表单和本地交互，不是ToolService Adapter，也不直接持有Tool waiter。ToolSandbox仍可以有不同操作系统或容器Adapter。
 
@@ -759,7 +750,7 @@ pub struct PolicyRevision;
 
 更宽泛的目录、命令或域名规则必须作为显式 ToolGrant rule 表达，不能通过忽略 arguments hash 自动扩大一次审批。
 
-## 批量调度和资源锁
+## 批量调度和 Session-local 文件 mutation queue
 
 ToolSet 内部完成批量调度，不暴露独立 ToolScheduler 类。
 
@@ -769,28 +760,33 @@ ToolExecutionRequest[]
 → 按原始顺序串行 preflight
 → 若存在内建 ask-user route，先独占完成该 route
 → 收集允许执行的调用
-→ 根据 ToolConcurrency 和 ToolResourceAccess 调度
-→ 并发执行无冲突调用
+→ authorization后投影file mutation调度分类
+→ 若存在Serial调用，整个普通批次按原始顺序执行
+→ 否则并发执行，并对同FileMutationKey按FIFO排队
 → 按原始 request/call_index 返回 ToolExecutionOutcome[]
 ```
 
 调度规则：
 
-- `Serial` Tool 默认按 ToolName 串行；跨 Tool 冲突由 ToolResourceAccess 统一处理；
-- `Parallel` Tool 只有在资源访问不冲突时并发执行；
-- 同一资源允许并发 Read，Write 或 Exclusive 与冲突访问串行；
-- 资源 key 来自规范化参数后的 ToolRequirements；
-- 参数名称猜测不能作为安全资源锁的唯一来源；
+- 同批runnable调用存在任一`Serial` Tool时，整个普通Tool批次按原始request/call_index串行；
+- `read`、`list`、`search`、`stat`等只读调用不进入file mutation queue；
+- `edit`、`write`、`delete`等只有一个明确mutation target的`Parallel`调用按`FileMutationKey` FIFO，同key串行、不同key并行；
+- rename/move、多文件patch、无法证明单一mutation target的copy，以及bash/process-spawning/open-world Tool按`Serial`处理；
+- mutation分类来自authorization后的结构化文件权限，不能根据参数名称猜测；
 - ToolCall event 可以按实际完成顺序流式发布；
 - ToolExecutionOutcome 按原始 ToolExecutionRequest 顺序返回；complete ToolRound 只消费 Completed results；
 - 首版ask-user route pending时不启动同一assistant step的其他ToolCall；它形成`PreExecution` outcome后，剩余调用才进入普通调度；
 - schema、Hook 或 policy 对单个调用的拒绝形成该调用的 ToolResult；
 - 用户显式拒绝或 Turn cancellation 停止后续 preflight，并为未执行调用生成取消结果；
-- 所有等待 approval、锁和 executor 的操作都响应 Turn cancellation。
+- 所有等待 approval、mutation ticket和 executor 的操作都响应 Turn cancellation。
 
-ToolResourceLocks 属于 ToolService，用于协调同一 Runtime 内跨 Turn 的共享 workspace 和外部资源；单个 ToolSet 只持有它的共享引用。
+`SessionFileMutationQueue`属于loaded Session的`SessionExecutor`；当前Turn的ToolSet只持有共享引用。当前每个Session最多一个Starting/Running Turn，因此queue只协调同一Session、同一Tool批次中的sibling mutation，不承担跨Turn调度。
 
-文件类 ToolResourceKey 必须基于 canonical filesystem namespace 和 fully canonical target identity，而不是 `WorkspaceId`、root fingerprint 或裸相对路径。对于尚不存在的 create/rename target，key 使用 canonical nearest-existing ancestor 加规范化剩余 path。这样两个 Session 即使使用不同 root anchor 指向同一物理目标，也会正确竞争同一把锁。外部资源使用对应实例的稳定 namespace/key。
+`FileMutationKey`必须基于fully canonical target identity，而不是`WorkspaceId`、root fingerprint、SessionId或裸相对路径。对于尚不存在的create target，key使用canonical nearest-existing ancestor加规范化剩余path。ToolSet按原始call_index串行完成canonicalization和ticket reservation，再启动并发executor；因此FIFO不依赖异步task的poll顺序，也不需要process-global registration queue。
+
+两个Session即使指向同一physical file，也拥有不同的queue并可能并发mutation。MiniCore不提供跨Session、跨Runtime或跨进程文件协调；共享Workspace的并发修改由host/user通过worktree、独立Workspace或外部机制处理。外部资源同样没有通用resource-lock manager。
+
+queue permit覆盖完整mutation window。read-modify-write Tool从首次读取到最终写入和raw outcome捕获均持有permit；waiting cancellation移除或跳过ticket，in-flight filesystem operation尚未收口时不得提前释放。最后一个ticket完成后清理对应queue entry。
 
 ## Tool 执行流程
 
@@ -807,7 +803,7 @@ ToolSet::execute(ToolExecutionRequest[])
 → Tool::requirements
 → WorkspaceAccessView.authorize(file requirements)
 → ToolAuthorization: workspace ceiling / policy / grant / approval
-→ ToolResourceLocks
+→ SessionFileMutationQueue ticket/permit（仅single-file mutation）
 → final control/revocation validation
 → ToolExecutionControl.record_execution_start → execution_started_entry_id
 → 再校验 revocation lease / cancellation
@@ -828,13 +824,13 @@ ToolSet::execute(ToolExecutionRequest[])
 ```text
 preflight / schema / hook / policy
 → ToolExecutionControl.request_user_question
-→ WaitingForUserInput（不取资源锁、不写ToolExecutionStarted）
+→ WaitingForUserInput（不预留mutation ticket、不写ToolExecutionStarted）
 → UserAnswer / Cancelled
 → PreExecution ToolResult candidate
 → Session execution append role=tool message
 ```
 
-普通 Tool 在已经`ToolExecutionStarted`或持有资源锁后不得调用`request_user_question`；若未来需要该能力，必须另行定义不持锁的producer protocol。
+普通 Tool 在已经`ToolExecutionStarted`或开始file mutation后不得调用`request_user_question`；若未来需要该能力，必须另行定义不持有mutation permit的producer protocol。
 
 在record_execution_start之前形成的exact validation/policy/approval/unavailable ToolResult以`source = PreExecution`返回Completed；不进入ToolSandbox，也不伪造ToolExecutionStarted。Session execution随后append role=tool message。若该append已证明NotCommitted，只重试同一entry draft；若返回SessionWrite OutcomeUnknown，poison writer并保守终结当前操作、不在本run重放该append，恢复在下次load读committed prefix后按状态处理，不重放Tool。只有Tool side effect本身outcome unknown（工具副作用未知），或crash后exact result不可恢复，才返回/持久化Abandoned；此类不构造synthetic ToolResult。
 
@@ -944,7 +940,7 @@ Tool executor
 active tool names
 Tool approval state
 Tool grants
-Tool locks
+SessionFileMutationQueue
 ```
 
 领域所有权：
@@ -952,7 +948,8 @@ Tool locks
 | 对象 | Owner |
 | --- | --- |
 | `Arc<ToolService>` 生命周期 | MiniCoreRuntime |
-| Tool registration、Hook、policy、grant、Sandbox、locks | ToolService 内部实现 |
+| Tool registration、Hook、policy、grant、Sandbox | ToolService 内部实现 |
+| Session-local file mutation queue | loaded Session的SessionExecutor；ToolSet持共享引用 |
 | 本 Turn 的有效工具快照 | TurnExecutionContext 内的 ToolSet |
 | 模型调用循环、Tool message和ToolRound completion | SessionExecutor |
 | ToolCall + ToolResult | 同一个 ToolInvocation Item |
@@ -965,10 +962,10 @@ Tool locks
 | 外部对象 | `Tool`、`ToolService`、`ToolSet` |
 | 外部 seam | `ToolHooks`、`ToolSandbox`、`ToolUpdateSink` |
 | crate-internal execution seam | `ToolExecutionControl` |
-| 私有实现 | `ToolRegistry`、`ToolAuthorization`、`ToolPolicy`、`ToolGrantStore`、`ToolResourceLocks`、`DeferredToolIndex` |
+| 私有实现 | `ToolRegistry`、`ToolAuthorization`、`ToolPolicy`、`ToolGrantStore`、`SessionFileMutationQueue`、`FileMutationKey`、`DeferredToolIndex` |
 | 调用值类型 | `ToolCall`、`ToolExecutionRequest`、`ToolExecutionOutcome`、`ResolvedToolCall`、`ToolCallSource`、`ToolInvocation`、`ToolResult`、`ToolResultDisposition`、`ToolUpdate` |
 | 定义与上下文 | `ToolServiceConfig`、`ToolPolicyConfig`、`ToolName`、`ToolSpec`、`ToolExposure`、`ToolAnnotations`、`ToolConcurrency`、`ToolTurnContext`、`ToolCallContext`、`ToolExecutionContext`、`ToolSetFingerprint`、`ToolPromptView` |
-| 权限与资源 | `ToolRequirements`、`PermissionSet`、`FilePermission`、`NetworkPermission`、`ProcessPermission`、`EnvironmentPermission`、`ToolResourceAccess`、`ToolResourceKey`、`ToolResourceMode` |
+| 权限 | `ToolRequirements`、`PermissionSet`、`FilePermission`、`NetworkPermission`、`ProcessPermission`、`EnvironmentPermission` |
 | 审批与授权 | `ToolApprovalRequest`、`ToolApprovalDecision`、`ToolGrantKey`、`ToolGrantScope`、`ToolGrantSuggestion`、`PolicyRevision`、`BeforeToolUseDecision` |
 | 保留模型路由 | `search_tools`、`invoke_tool` |
 | Domain 投影 | `ItemContent::ToolInvocation`、`InteractionRequest::ToolApproval`、`InteractionRequest::UserQuestion` |
@@ -1016,6 +1013,8 @@ CallToolTool / InvokeToolTool
 - ToolExecutionOutcome 按原始 request 顺序返回；只有全部 Completed results 才能进入 complete ToolRound；
 - `tool_round_completed`前ToolResult不进入下一次逻辑模型调用；
 - ToolSet 不修改 Turn 状态，也不写回 Agent、Session、Turn 或 conversation storage。
+- 每个loaded Session拥有独立file mutation queue；同Session同FileMutationKey按call_index FIFO，跨Session不协调。
+- read-only文件操作不进入queue；多文件和open-world mutation进入Serial批次。
 
 ## 后续问题
 
@@ -1023,7 +1022,7 @@ CallToolTool / InvokeToolTool
 2. ToolSpec input/output schema 使用的具体 JSON Schema dialect。
 3. AuthorizedWorkspacePath 如何映射到各平台 Sandbox adapter，并在 open/create/rename 时抵抗 TOCTOU。
 4. ToolPolicy rule、grant key 和持久化格式。
-5. ToolRequirements 的文件、网络、进程和资源表达能力。
+5. ToolRequirements 的文件、网络和进程权限表达能力。
 6. ToolSandbox 的 Windows、Linux、容器和远程执行 adapter。
 7. DeferredToolIndex 的搜索算法、排序和最大返回数量。
 8. provider 原生 deferred loading 与 fallback `search_tools / invoke_tool` 的 adapter 规则。
@@ -1045,7 +1044,7 @@ CallToolTool / InvokeToolTool
 - [x] 确定参数校验、Hook、policy、approval、Sandbox 和 executor 的唯一执行链。
 - [x] 确定 WorkspaceAccessView 是所有文件 ToolRequirements 的硬上限，grant/approval 不能扩大。
 - [x] 确定 `search_tools / invoke_tool` 命名和 Deferred 防绕过规则。
-- [x] 确定串行 preflight、并发执行、资源锁和稳定结果顺序。
+- [x] 确定串行 preflight、Session-local file mutation queue、Serial批次降级和稳定结果顺序。
 - [x] 确定 ToolCall、ToolResult 合并为同一个 ToolInvocation Item。
 - [x] 确定 Tool approval 是 ToolInvocation-owned durable Interaction。
 - [x] 确定ToolExecutionControl由Session execution提供并遵守approval、UserQuestion和execution-start ordering；Tool outcome由Session execution append为tool message。

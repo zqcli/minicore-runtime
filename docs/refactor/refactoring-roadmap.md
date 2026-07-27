@@ -417,7 +417,7 @@ docs/refactor/session-execution.md
 - FollowUp使用bounded process-local FIFO；
 - progress event与request queue分离；
 - restart不恢复旧异步操作，unfinished Turn保守terminalize；
-- multi-session共享Model/Tool资源时使用明确并发限制和canonical resource locks。
+- 后续权威决议改为：ModelGateway提供共享provider并发限制；每个loaded Session拥有独立file mutation queue，跨SessionWorkspace并发由host/user管理（ADR 0116）。
 
 完成门槛：
 
@@ -489,7 +489,7 @@ docs/refactor/compaction.md
 - cut 不拆散 ToolCall/ToolResult 或其他协议稳定单元；
 - compacted conversation 可从 storage 重建。
 
-状态：目标设计已完成，见[Compaction架构设计](compaction.md)和[ADR 0027](../adr/0027-compaction-uses-strict-stable-suffix.md)。首版采用portable rolling summary、strict stable-unit cut、连续retained suffix和有界active-Turn recovery；不实现split-turn、manual、hierarchical或provider-native compaction。
+状态：目标设计已完成，见[Compaction架构设计](compaction.md)和[V1 ADR 0027](../archive/v1/adr/0027-compaction-uses-strict-stable-suffix.md)。首版采用portable rolling summary、strict stable-unit cut、连续retained suffix和有界active-Turn recovery；不实现split-turn、manual、hierarchical或provider-native compaction。
 
 ### 阶段 9：Runtime interface 与公开协议
 
