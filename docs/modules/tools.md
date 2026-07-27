@@ -456,7 +456,7 @@ pub struct ToolTurnContext {
 
 ToolTurnContext是crate-internal execution input；private `execution_control`字段只能由Session execution注入。`tool_calling`直接来自本Turn exact `TurnModelSnapshot.capabilities.tool_calling`，不按provider名称推断，也不把完整ModelCapabilities传入ToolService。它不进入Agent、Session或Turn的持久领域字段，并且必须来自同一个captured SessionDefinitionRevision；完整规则见[Agent与Session生命周期架构设计](agent-session-lifecycle.md)。
 
-`WorkspaceToolContext` 由本 Turn pin 的 `WorkspaceSnapshot` 投影，包含 canonical cwd、`WorkspaceAccessView`、authorization lease 和 stable fingerprint。它是 filesystem capability ceiling：ToolRequirements、ToolPolicy、approval 和 grant 只能进一步收紧，不能扩大该 view。ToolService 不自行 canonicalize Workspace roots，也不从 trust 推断权限。完整规则见 [Workspace 子系统架构设计](workspace.md)。
+`WorkspaceToolContext`由本Turn pin的`WorkspaceSnapshot`投影，包含canonical cwd、`WorkspaceAccessView`和stable fingerprint。它是filesystem capability ceiling：ToolRequirements、ToolPolicy、approval和grant只能进一步收紧，不能扩大该view。ToolService不自行canonicalize Workspace roots，也不从trust推断权限。Workspace definition只在Session Idle更新；active Turn的hard restriction通过SecurityRevoked control处理。完整规则见[Workspace子系统架构设计](workspace.md)。
 
 ## ToolSet Fingerprint
 
@@ -671,9 +671,9 @@ InteractionResolved append → waiter wake
 ToolExecutionStarted append → side effect
 ```
 
-`ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并重新验证cancellation与Workspace lease。Cancel/revocation先被观察则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
+`ToolControlQueue`不与普通Submit/Steer形成全局FIFO。SessionExecutor处理`record_execution_start`前必须观察最新`EmergencyControl` epoch并reserve controlled append。Cancel/SecurityRevoked先赢则拒绝start；`ToolExecutionStarted`先append/apply则side effect可以开始，之后必须保存truthful outcome。
 
-`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前。等待期间不预留mutation ticket，也不持有`WorkspaceCommitAuthorization`；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control和Snapshot。Approval与UserQuestion都没有inactivity timeout：用户沉默时保持Pending，不推断Deny。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
+`request_user_question`只允许在pre-execution ask-user route中使用：它必须发生在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前。等待期间不预留mutation ticket，也不持有TurnControl reservation；该调用的Tool future等待typed answer，但SessionExecutor本身返回主循环继续处理control和Snapshot。Approval与UserQuestion都没有inactivity timeout：用户沉默时保持Pending，不推断Deny。首版ask-user route在一个ToolRound中独占等待：ToolSet先完成该route，再允许同一assistant step的其他ToolCall进入普通调度。
 
 TUI、RPC、Web和GUI通过[Runtime Interface](runtime-interface.md)接收UI-safe Interaction StateEvent并提交resolution；它们是Presentation Adapter，负责展示、表单和本地交互，不是ToolService Adapter，也不直接持有Tool waiter。ToolSandbox仍可以有不同操作系统或容器Adapter。
 
@@ -804,9 +804,9 @@ ToolSet::execute(ToolExecutionRequest[])
 → WorkspaceAccessView.authorize(file requirements)
 → ToolAuthorization: workspace ceiling / policy / grant / approval
 → SessionFileMutationQueue ticket/permit（仅single-file mutation）
-→ final control/revocation validation
+→ final Cancel/SecurityRevoked control validation
 → ToolExecutionControl.record_execution_start → execution_started_entry_id
-→ 再校验 revocation lease / cancellation
+→ 再观察Cancel/SecurityRevoked；若已触发且尚未调用Sandbox，生成truthful cancelled outcome
 → ToolSandbox
 → Tool::execute
 → raw outcome audit

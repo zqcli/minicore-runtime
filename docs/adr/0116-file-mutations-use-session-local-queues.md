@@ -22,7 +22,7 @@
 7. **等待响应 cancellation**。尚未开始的cancelled ticket从队列移除或标记跳过，并唤醒下一个waiter；已经开始的mutation等待底层操作确认完成或形成outcome unknown后再释放permit。
 8. **不提供跨 Session、跨 Runtime或跨进程文件协调**。两个Session即使拥有相同`FileMutationKey`也使用不同队列，可能并发写同一文件。该行为是明确的best-effort共享Workspace语义，host/user负责隔离与冲突处理。
 9. **删除MVP通用资源锁协议**。不建立`ToolResourceLocks`、`ToolResourceAccess`、`ToolResourceKey`或多资源锁总序；外部资源并发同样不由MiniCore统一协调。`ToolRequirements`继续表达权限需求，授权后的结构化文件权限由ToolSet私有地投影为`None | SingleFile(FileMutationKey) | Serial`调度分类，禁止根据参数名称猜测。
-10. **UserQuestion和approval发生在排队前**。等待人工输入时不预留mutation ticket、不持有file mutation permit或`WorkspaceCommitAuthorization`。普通Tool在开始mutation后不得发起UserQuestion。
+10. **UserQuestion和approval发生在排队前**。等待人工输入时不预留mutation ticket、不持有file mutation permit或TurnControl reservation。普通Tool在开始mutation后不得发起UserQuestion。
 
 ## 理由
 

@@ -1163,7 +1163,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 
 - cancellation先被观察：中止request并返回Cancelled；
 - terminal event先被接受：Gateway完成normalization并返回ModelCallResult，之后到达的cancel不把该result改写为Cancelled；
-- SessionExecutor仍会用execution_version和Cancel/revocation arbitration决定该result能否append；普通Steer不拒绝已完成result，只决定无ToolCall response保存为Continue还是Final，因此Gateway terminal先赢不等于Turn一定Completed；
+- SessionExecutor仍会用execution_version和Cancel/SecurityRevoked arbitration决定该result能否append；普通Steer不拒绝已完成result，只决定无ToolCall response保存为Continue还是Final，因此Gateway terminal先赢不等于Turn一定Completed；
 - 该规则保证terminal usage、finish reason和content不会因normalization期间的timer race随机丢失。
 
 取消行为：
@@ -1226,7 +1226,7 @@ pub enum ModelCallErrorReason {
 
 | Error reason | Gateway行为 | SessionExecutor默认处理 |
 | --- | --- | --- |
-| Cancelled | 停止attempt | Cancel/revocation/version规则；普通Steer不取消attempt |
+| Cancelled | 停止attempt | Cancel/SecurityRevoked/version规则；普通Steer不取消attempt |
 | ModelUnavailable | 不替换模型 | TurnFailed或要求SetModel |
 | AuthMissing/AuthRejected | 不重发；401直接AuthRejected | user action / TurnFailed |
 | RateLimited | 返回typed Retry-After | hint <= 60s时可logical retry |

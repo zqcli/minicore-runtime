@@ -12,7 +12,7 @@
 - primary root、additional roots 和 cwd 如何建模；
 - trust、文件访问能力和 Prompt/Skill source authorization 如何分离；
 - PromptService、ToolService 和 SkillService 消费哪些窄 view；
-- Workspace 更新如何影响 active Turn 和 future Turn；
+- Workspace definition如何在Turn之间更新，authority hard restriction如何中断active Turn；
 - 多个 Session 指向同一目录时是否共享 Workspace 状态；
 - `WorkspaceId` 是否必要。
 
@@ -54,8 +54,8 @@ Turn execution context
 - additional root 默认只扩展文件访问，不自动成为 Prompt 或 Skill source；
 - Prompt、Tool、Skill 不自行 canonicalize roots，也不自行查询 trust；
 - Turn 开始时 pin 一个不可变 `Arc<WorkspaceSnapshot>`；
-- ordinary reload 只影响 future Turn；
-- security-restricting update 撤销 active lease，并要求中断受影响 Turn；
+- Workspace definition update只在Session Idle时接受，非Idle返回SessionBusy；
+- authority hard restriction通过sticky SecurityRevoked中断active Turn，不动态撤销WorkspaceSnapshot或open handle；
 - 多个 Session 即使使用相同目录，也不共享 mutable Workspace state；
 - Workspace 不拥有 Prompt/Skill discovery、Tool registry、Sandbox、conversation、Model、provider、VCS、indexing、UI window 或 remote workspace server。
 
@@ -92,7 +92,7 @@ Turn execution context
 - Prompt/Skill source authorization；
 - Tool sandbox root projection；
 - Turn snapshot fingerprint；
-- reload 与 security revocation。
+- Idle-only update、authority resolution与security interruption。
 
 因此 Workspace 模块通过 deletion test：删除它后，复杂性会重新出现在 Session execution、Prompt source、Skill source、Tool policy 和 Sandbox 中。
 
@@ -432,7 +432,7 @@ Workspace definition
 → effective filesystem grants
 → effective Prompt source grants
 → effective Skill source grants
-→ authorization lease
+→ authority revision/proof
 → view fingerprints
 → immutable WorkspaceSnapshot
 ```
@@ -451,7 +451,7 @@ watch
 invalidate
 ```
 
-reload 只是 SessionExecutor 用当前 Workspace definition 再次调用 `resolve()`。
+reload由Session lifecycle在Idle时使用current exact Workspace definition再次调用`resolve()`；active Turn期间不reload。
 
 ### 内部 Seams
 
@@ -496,7 +496,6 @@ pub struct WorkspaceSnapshot {
     definition_revision: WorkspaceRevision,
     roots: Arc<[ResolvedWorkspaceRoot]>,
     cwd: ResolvedWorkspaceCwd,
-    authorization: WorkspaceAuthorizationLease,
     diagnostics: Arc<[WorkspaceDiagnostic]>,
     fingerprint: WorkspaceFingerprint,
 }
@@ -519,7 +518,7 @@ pub enum WorkspaceRootRole {
 }
 ```
 
-Snapshot 的数据部分不原地修改。authority 更新、reload 或 root 变化产生新的 Snapshot。
+Snapshot不原地修改。Workspace definition update只在Idle时产生新的Snapshot；authority hard restriction中断active Turn，terminal后按current authority重新resolve新Snapshot。
 
 ```rust
 impl WorkspaceSnapshot {
@@ -544,7 +543,6 @@ pub struct WorkspacePromptContext {
     cwd: CanonicalWorkspacePath,
     primary_root: CanonicalWorkspacePath,
     source_roots: Arc<[AuthorizedPromptSourceRoot]>,
-    authorization: WorkspaceAuthorizationLease,
     fingerprint: WorkspacePromptFingerprint,
 }
 
@@ -552,7 +550,6 @@ impl WorkspacePromptContext {
     pub fn cwd(&self) -> &CanonicalWorkspacePath;
     pub fn primary_root(&self) -> &CanonicalWorkspacePath;
     pub fn source_roots(&self) -> &[AuthorizedPromptSourceRoot];
-    pub fn check_authorization(&self) -> Result<(), WorkspaceAuthorizationRevoked>;
     pub fn fingerprint(&self) -> &WorkspacePromptFingerprint;
 }
 ```
@@ -579,21 +576,19 @@ pub struct WorkspaceSkillContext {
     session_id: SessionId,
     cwd: CanonicalWorkspacePath,
     source_roots: Arc<[AuthorizedSkillSourceRoot]>,
-    authorization: WorkspaceAuthorizationLease,
     fingerprint: WorkspaceSkillFingerprint,
 }
 
 impl WorkspaceSkillContext {
     pub fn cwd(&self) -> &CanonicalWorkspacePath;
     pub fn source_roots(&self) -> &[AuthorizedSkillSourceRoot];
-    pub fn check_authorization(&self) -> Result<(), WorkspaceAuthorizationRevoked>;
     pub fn fingerprint(&self) -> &WorkspaceSkillFingerprint;
 }
 ```
 
 SkillService 只能在这些 source roots 内发现和读取 Workspace Skill。
 
-SkillEntry记录source identity和location。后续lazy load使用本Turn captured SkillView entry与WorkspaceSkillContext，不能通过`skill_id + current Session Workspace`重新解析reload后的view；实际读取前仍须校验authorization lease和source stamp。
+SkillEntry记录source identity和location。后续lazy load使用本Turn captured SkillView entry与WorkspaceSkillContext，不能通过`skill_id + current Session Workspace`重新解析future view；实际读取仍须校验source stamp。SecurityRevoked会取消active operation并使迟到结果因execution basis失效而被丢弃。
 
 ### WorkspaceAccessView
 
@@ -602,7 +597,6 @@ pub struct WorkspaceAccessView {
     session_id: SessionId,
     cwd: CanonicalWorkspacePath,
     roots: Arc<[WorkspaceAccessRoot]>,
-    authorization: WorkspaceAuthorizationLease,
     fingerprint: WorkspaceAccessFingerprint,
 }
 ```
@@ -657,67 +651,36 @@ ToolService 通过该 context 获得：
 
 - canonical cwd；
 - read/write root ceiling；
-- authorization lease；
+- authority revision-bound effective grants；
 - stable access fingerprint。
 
 它不包含 Prompt source、Skill source、Tool registry、approval 或 provider 信息。
 
-## WorkspaceAuthorizationLease
+## Immutable Snapshot And Security Events
 
-不可变 Snapshot 不能被原地收紧，但 security revocation 不能等待下一个 Turn。
-
-因此 Snapshot 携带一个不授予额外能力、只允许被撤销的 lease：
-
-```rust
-pub struct WorkspaceAuthorizationLease;
-pub struct WorkspaceAuthorizationControl;
-pub(crate) struct WorkspaceCommitAuthorization;
-
-impl WorkspaceAuthorizationLease {
-    pub fn check(&self) -> Result<(), WorkspaceAuthorizationRevoked>;
-    pub(crate) async fn authorize_commit(
-        &self,
-    ) -> Result<WorkspaceCommitAuthorization, WorkspaceAuthorizationRevoked>;
-}
-
-impl WorkspaceAuthorizationControl {
-    pub async fn revoke(&self, reason: WorkspaceRevocationReason);
-}
-```
-
-WorkspaceResolver 返回 Snapshot 与 revocation control 的 resolved pair：
+WorkspaceSnapshot在Turn内没有可撤销lease。Workspace definition update只在Session Idle时执行，因此active Turn不会与definition update竞争，也不需要`WorkspaceAuthorizationControl`或`WorkspaceCommitAuthorization`。
 
 ```rust
 pub struct ResolvedWorkspace {
     pub snapshot: Arc<WorkspaceSnapshot>,
-    control: WorkspaceAuthorizationControl,
 }
 ```
 
-`WorkspaceAuthorizationControl` 只交给 SessionExecutor，不进入 Prompt、Tool、Skill 或领域 Session。SessionExecutor 为每个 active Turn 跟踪其 control/cancellation 关联；ordinary Snapshot replacement 不撤销旧 control，security-restricting update 则先调用 `revoke()`，再设置该Session `EmergencyControl`的sticky revocation signal并中断所有使用该 lease 的 active Turn。signal不等待普通bounded ingress lane。这样不需要 Runtime-global Workspace registry，也能明确找到受影响执行。
-
-`check()`用于普通preflight。workspace-dependent conversation append使用短暂`WorkspaceCommitAuthorization`：`authorize_commit()`与`revoke()`通过同一async同步原语排序。如果revoke先取得写入权，后续authorization失败；如果authorization先取得读取权，revoke等待该次短append/apply sequence完成。authorization不能跨Model/Tool I/O或完整Turn。
-
-语义：
+Authority hard restriction由WorkspaceAuthority或host作为独立security event发布，不伪装成Workspace definition update：
 
 ```text
-Snapshot data
-→ 固定本 Turn 的 capability ceiling
-
-Authorization lease
-→ 只回答该 ceiling 是否仍可继续使用
+current authority/policy fact published
+→ route handle-scoped SecurityRevoked to affected current loaded SessionExecutionHandle
+→ close admission；bind candidate/current target generation when present
+→ EmergencyControl sticky signal
+→ Idle直接resolve；Starting取消candidate；active Turn Finishing + truthful settlement
+→ active Turn时TurnInterrupted(SecurityRevoked)
+→ cleanup/terminal后重新resolve current durable Workspace definition
 ```
 
-lease 不能扩大 Snapshot 中不存在的 capability。
+SecurityRevoked只保证signal first-wins后不启动新的MiniCore-sanctioned Model、Tool、source read或workspace-dependent append。已经进入provider、kernel、子进程或远端系统的operation不能回滚，按Cancel规则保存exact outcome或`ToolAbandoned`。MiniCore不提供open-handle动态revocation，也不建立Runtime-global handle registry。
 
-检查点至少包括：
-
-- project Prompt source discover/read 前；
-- Workspace Skill discover/read/lazy load 前；
-- 每批 ToolCall preflight 前；
-- ToolSandbox 文件操作前；
-- 每次新的模型调用前；
-- initiating TurnContext/UserMessage、Steer、Model-produced Assistant和`tool_round_completed` append前。
+active Turn仍在既有安全点观察`EmergencyControl`：启动新Model、消费新的source/lazy load结果、处理`ToolExecutionStarted`、提交workspace-dependent conversation entry和开始下一次Tool operation前。operation先于signal完成时按现有basis/controlled-append规则结算；signal先赢时结果被拒绝或丢弃。
 
 ## Session Ownership 与 Lifecycle
 
@@ -735,7 +698,7 @@ pub struct SessionDefinition {
 }
 ```
 
-Workspace definition update 同时产生新的 WorkspaceRevision 和 SessionDefinitionRevision。active Turn 继续 pin 旧 Snapshot，loaded Session execution 只更新 future admission 的 current definition projection。完整生命周期和线性化规则见 [Agent 与 Session 生命周期架构设计](agent-session-lifecycle.md)。
+Workspace definition update同时产生新的WorkspaceRevision和SessionDefinitionRevision。loaded Session只在execution state为Idle时接受Workspace patch；active Turn与Workspace definition update不存在并发语义。完整生命周期和线性化规则见[Agent与Session生命周期架构设计](agent-session-lifecycle.md)。
 
 loaded Session execution state 保存当前解析状态：
 
@@ -756,7 +719,7 @@ pub enum SessionWorkspaceState {
 → capture exact SessionDefinitionRevision / WorkspaceRevision
 → WorkspaceResolver::resolve(exact definition.workspace)
 → publication 前 CAS SessionLifecycle 仍为 Open且 current revision 未变化
-→ Ready(ResolvedWorkspace { snapshot, control })
+→ Ready(ResolvedWorkspace { snapshot })
    或 Unavailable(error)
 
 CAS stale 时丢弃旧 resolve 结果并按新 SessionDefinitionRevision 重试，不能发布旧 Workspace projection
@@ -777,36 +740,32 @@ Workspace unavailable 时：
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision + WorkspaceRevision
+→ loaded Session要求SessionExecutionState = Idle；否则SessionBusy
 → 在per-session lifecycle serialization内构造并resolve complete candidate
-
-ordinary/permissive update
-→ 原子提交新 SessionDefinitionRevision
-→ 发布 future Snapshot
-
-security-restricting definition update
-→ 先 revoke 受影响的旧 lease
-→ durable commit 新 SessionDefinitionRevision
-→ terminalize 受影响 active Turn
-→ 发布 future Snapshot
-→ 最后确认 update success
+→ durable commit新SessionDefinitionRevision与WorkspaceRevision
+→ publish Ready(new WorkspaceSnapshot)
+→ 最后确认update success
 ```
 
-这样不会出现：
+resolve或durable commit失败时旧definition和旧Snapshot保持current。这样不会出现：
 
 ```text
-Session 已保存新 roots
-但 Tool/Prompt/Skill 仍使用旧授权
+旧Workspace能力已撤销
+但新definition没有durable commit
 ```
+
+unloaded Session可以直接提交通过结构校验/CAS的Workspace definition；下次load按current authority完整resolve。
 
 ### Reload
 
 reload 不属于 WorkspaceService method：
 
 ```text
-SessionExecutor 读取 current exact SessionDefinition.workspace
+loaded Session要求SessionExecutionState = Idle；否则SessionBusy
+→ SessionExecutor读取current exact SessionDefinition.workspace
 → 再次 WorkspaceResolver::resolve(...)
-→ success：原子发布新 Snapshot
-→ unavailable：future Turn admission fail closed
+→ success：原子发布新Snapshot并Ready
+→ unavailable：SessionReadiness = Unavailable，future Turn admission fail closed
 ```
 
 reload 只重新解析 Workspace facts。Prompt、Skill 和 Tool 的 source/cache/registry reload 仍由各自子系统负责。
@@ -899,67 +858,39 @@ Turn 领域对象仍不持有 Workspace。只有 Turn execution context pin Snap
 - ToolSet 继续使用 pinned WorkspaceToolContext；
 - PromptSet 继续使用 pinned WorkspacePromptContext。
 
-## Update 对 Active/Future Turn 的影响
+## Workspace Update And Security Restriction
 
-Workspace 变化分为两类。
+### Workspace Definition Update
 
-### Ordinary Update
-
-包括：
+所有Workspace definition patch都使用同一Idle-only规则，不区分ordinary、permissive或restrictive active-update分支：
 
 ```text
-cwd 变化
-新增 root
-新增 capability
-新增 Prompt/Skill source grant
+Session Idle
+→ validate/CAS/resolve candidate
+→ durable commit definition revision
+→ publish new WorkspaceSnapshot
+
+Session Starting / Running / Finishing
+→ SessionBusy
 ```
 
-语义：
+Host希望在长Turn中修改Workspace时，显式执行`Cancel → wait session_settled → UpdateDefinition`。Runtime不提供queued Workspace update、WaitForIdle或隐式Cancel。
 
-- active Turn 继续使用旧 Snapshot 和由其派生的同一个 TurnExecutionContext；
-- future Turn admission 捕获新 Snapshot 并创建新 Context；
-- permissive update 不扩大 active Turn 权限；
-- active Turn不原地重建PromptSet、ToolSet、SkillView或模型调用baseline。
+### Authority Hard Restriction
 
-### Security-Restricting Update
+managed hard deny、trust/policy store降级或host安全事件可以在active Turn期间触发`SecurityRevoked`，但它不是definition patch，也不创建假的WorkspaceRevision或SessionDefinitionRevision：
 
-包括：
+1. WorkspaceAuthority或host发布current authority/policy事实；
+2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定target generation；
+3. SessionExecutor停止new admission/operation；Idle直接进入resolve，Starting取消candidate，Running/Finishing进入或保持Finishing；
+4. 已越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，不补缺失的`tool_round_completed`；
+5. 有active Turn时append/apply`TurnInterrupted(SecurityRevoked)`并释放Turn；
+6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve；
+7. success时retire signal、Ready并发布new Snapshot，failure时Unavailable且future admission fail closed。
 
-```text
-trust 降级
-移除 root
-收紧 read/write grant
-撤销 Prompt/Skill source authorization
-managed policy hard deny
-```
+FollowUp可以在Finishing期间排队，但terminal和重新resolve完成前不得启动；resolve失败时明确拒绝。Security signal是process-local control fact，不跨restart恢复；recovery只有在durable evidence足够时才可使用SecurityRevoked，否则使用HostRestart或RecoveryContextUnavailable。
 
-Definition-changing restriction，例如移除 root 或修改 Workspace grants：
-
-1. 在per-session lifecycle update的串行执行区内resolve/validate candidate definition；
-2. 撤销受影响 WorkspaceAuthorizationLease；
-3. 阻止新的 source read、Skill load、input composition、Tool execution 和模型调用；
-4. durable commit 新 SessionDefinitionRevision；
-5. 设置SessionExecutor的EmergencyControl revocation signal并中断使用该 lease 的 active Turn；
-6. 发布 future Turn 使用的新 Snapshot；
-7. 最后向调用方确认 update success；
-8. 不把 last-good Snapshot 当作 fallback。
-
-若 revoke 后 durable commit 失败，不能恢复旧 lease；旧 definition 仍是 durable current，SessionReadiness 进入 Unavailable，等待从 durable truth 重新 resolve/repair。
-
-Authority-only restriction，例如 trust/policy store 降级、managed hard deny 或外部撤销 source authorization，不创建假的 WorkspaceRevision 或 SessionDefinitionRevision：
-
-1. WorkspaceAuthority在自己的serialized publication update内原子发布新authority revision/policy，并revoke受影响旧lease；
-2. 设置SessionExecutor的EmergencyControl revocation signal并中断受影响 active Turn；
-3. 使用 current exact SessionDefinition.workspace 重新 resolve；
-4. success 时发布受限的新 Snapshot，unavailable 时 future admission fail closed；
-5. SessionDefinitionRevision 保持不变。
-
-如果撤权发生在 provider request 已发送之后，MiniCore 无法撤回 provider 已看到的内容。它能保证的是：
-
-- best-effort cancel当前provider request；
-- 未取得WorkspaceCommitAuthorization的UserMessage、Steer contribution或模型结果在lease revoked后直接丢弃；若authorization先于revoke取得，则对应短append先完成，随后revocation中断active Turn；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`；
-- 不开始下一次模型调用；
-- 已完成的外部副作用不伪装成已回滚。
+如果security event发生在provider request、kernel syscall、子进程或remote side effect开始之后，MiniCore无法撤回已经看到或发生的内容。它只保证signal获胜后不启动新的sanctioned operation，并对in-flight work执行truthful settlement。已打开OS handle不会被动态撤销，该限制不再作为Workspace feature承诺。
 
 ## 多 Session 语义
 
@@ -977,7 +908,7 @@ Session B ── Workspace B definition ── Snapshot B
 - requested access 可以不同；
 - source policy 可以不同；
 - WorkspaceRevision 不同；
-- authorization lease 不共享；
+- resolved Snapshot和authority-sensitive cache不共享；
 - Session A reload 不替换 Session B Snapshot；
 - Session-scoped Tool grant 不跨 Session 复用。
 
@@ -1073,7 +1004,7 @@ WorkspaceFingerprint 覆盖：
 - Prompt/Skill 文件内容；
 - diagnostics 文本；
 - cache/load state；
-- 随机 lease token；
+- process-local security signal/target generation；
 - display name；
 - filesystem watcher 状态。
 
@@ -1097,7 +1028,6 @@ pub enum WorkspaceErrorKind {
     AuthorityUnavailable,
     AuthorityDenied,
     RequiredCapabilityUnavailable,
-    AuthorizationRevoked,
 }
 ```
 
@@ -1108,10 +1038,7 @@ Rejected
 → definition 确定非法，不应自动 retry
 
 Unavailable
-→ definition 可能有效，但当前目录或 authority 暂不可用
-
-Revoked
-→ 先前 Snapshot 的安全资格已失效
+→ definition可能有效，但当前目录或authority暂不可用
 ```
 
 Diagnostics 至少记录：
@@ -1228,13 +1155,13 @@ upload / telemetry
 - additional root 默认 access-only；
 - Prompt、Tool、Skill 不自行查询 trust 或重新推断 roots；
 - 一个 WorkspaceSnapshot 原子投影全部窄 view；
-- active Turn pin 同一个 WorkspaceSnapshot；
-- ordinary reload 只影响 future Turn；
-- permissive update 不扩大 active Turn capability；
-- restrictive update 撤销 lease 并中断 active Turn；
+- active Turn在整个生命周期pin同一个immutable WorkspaceSnapshot；
+- Workspace definition update和reload只在Session Idle时接受，非Idle返回SessionBusy；
+- authority hard restriction通过SecurityRevoked中断Turn，terminal后重新resolve；
+- 不承诺动态撤销已打开OS handle或回滚已开始副作用；
 - Tool approval 不能扩大 WorkspaceAccessView；
 - Workspace unavailable 时 future Turn fail closed；
-- 同根多 Session 不共享 mutable Snapshot 或 authorization lease；
+- 同根多Session不共享mutable Snapshot或authority-sensitive cache；
 - Workspace 不恢复通用 ResourceManager。
 
 ## Test Matrix
@@ -1260,20 +1187,22 @@ upload / telemetry
 - 不同 Session 使用不同 root anchor 指向同一目标时仍竞争同一文件锁；
 - create/rename target 使用 nearest-existing-ancestor 校验，并覆盖 symlink race；
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
-- Workspace Prompt cache/fingerprint 覆盖 source stamp，revocation 后不复用旧 hidden instructions；
+- Workspace Prompt cache/fingerprint覆盖source stamp，SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
 - Workspace Skill adapter 的 discover/read 只能使用 pinned WorkspaceSkillContext；
 - captured SkillView entry、LoadedSkill、SkillInjection和committed contribution stamp使用同一SkillId/source stamp；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；
-- reload success 原子替换 future Snapshot；
-- active Turn 保持旧 Snapshot；
-- permissive update 不扩大 active Turn；
-- restrictive definition update 撤销 active lease 并提交新 SessionDefinitionRevision；
-- revoke 后 definition commit 失败时旧 lease 不恢复且 readiness Unavailable；
-- authority-only restriction 重新 resolve current definition且不创建 SessionDefinitionRevision；
-- revoked model/tool result 不进入后续 committed conversation；
-- 同 root 两个 Session 的 cwd/grant/lease/fingerprint 隔离；
+- loaded Session非Idle时Workspace update/reload返回SessionBusy且不排队；
+- Idle Workspace update成功durable commit revision并原子发布新Snapshot；
+- candidate resolve或commit失败时旧definition/Snapshot保持current；
+- SecurityRevoked触发Finishing、truthful Tool settlement和TurnInterrupted；
+- Idle SecurityRevoked立即失效old Snapshot并重新resolve，不创建TurnInterrupted；
+- Starting SecurityRevoked取消candidate后重新resolve，不创建领域Turn；
+- terminal后使用current definition/current authority重新resolve，success Ready、failure Unavailable；
+- security signal先赢时迟到model/tool/source结果不进入后续committed conversation；
+- crash无法证明security cause时使用HostRestart/RecoveryContextUnavailable；
+- 同root两个Session的cwd/grant/fingerprint和security target generation隔离；
 - view-specific fingerprint golden vectors；
 - absolute path 不泄漏到模型可见 Skill metadata 或 Prompt provenance。
 
@@ -1281,12 +1210,11 @@ upload / telemetry
 
 1. `WorkspaceRelativePath` 和 `CanonicalWorkspacePath` 的跨平台编码细节。
 2. WorkspaceAuthority 的 persisted trust、managed policy 和 headless adapter 形状。
-3. Workspace source adapter 和 Sandbox 在各平台如何实现 handle-relative open 以防止 TOCTOU。
-4. WorkspaceAuthorizationControl与SessionExecutor cancellation的实现映射。
-5. Session Workspace update 的最终 command interface。
-6. Workspace unavailable reason 与 SessionReadiness/公开 diagnostics 的最终映射。
-7. crash recovery 是否持久化 WorkspaceFingerprint、view fingerprint 或 authority revision。
-8. future remote backend 出现后，是否引入 Workspace locator/backend seam。
+3. Workspace source adapter和Sandbox在各平台如何实现handle-relative open以防止TOCTOU；该问题属于O1 enforcement，不提供动态handle revocation。
+4. Session Workspace Idle-only update的最终command payload。
+5. Workspace unavailable reason与SessionReadiness/公开diagnostics的最终映射。
+6. crash recovery如何确定性重建WorkspaceFingerprint、view fingerprint和authority policy basis（O12）。
+7. future remote backend出现后，是否引入Workspace locator/backend seam。
 
 ## 设计进度
 
@@ -1297,9 +1225,9 @@ upload / telemetry
 - [x] 区分 trust、filesystem capability、Prompt source 和 Skill source。
 - [x] 定义 WorkspaceResolver 与 WorkspaceSnapshot。
 - [x] 定义 WorkspacePromptContext、WorkspaceSkillContext、WorkspaceToolContext 和 WorkspaceAccessView。
-- [x] 定义 Turn pinning、ordinary reload 和 security revocation。
+- [x] 定义Turn-pinned immutable Snapshot、Idle-only update和SecurityRevoked interruption（ADR 0121）。
 - [x] 将 WorkspaceSnapshot 纳入 TurnExecutionContext capture DAG，并固定字段私有。
 - [x] 定义同根多 Session 的隔离语义。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
-- [x] 对齐 Session lifecycle、definition revision、load/readiness/execution state 和 revocation 语义。
+- [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
 - [ ] 定义公开 command payload 与 recovery manifest/storage integration。

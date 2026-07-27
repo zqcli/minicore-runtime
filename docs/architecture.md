@@ -46,20 +46,21 @@ Item            1 ── N Interaction
 
 - `MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面；
 - 一个 Agent 可被多个 Session 引用，一个 Session 只对应一个 Agent；
-- Workspace 属于 Session（`SessionDefinition.workspace`），不属于 Agent 或 Turn，也不是独立 entity 或 Runtime-global registry；
+- Workspace属于Session（`SessionDefinition.workspace`），不属于Agent或Turn，也不是独立entity或Runtime-global registry；loaded Session只在Idle时接受Workspace definition update，active Turn pin immutable WorkspaceSnapshot；
 - Prompt、Tool、Skill 是独立概念，不合并成通用 `Resource`；
 - Turn领域对象不持有PromptSet、ToolSet、SkillView、Agent identity或Workspace；这些执行期对象由Turn执行上下文capture，fingerprints和必要references保存在TurnContext storage entry；
 - durable lifecycle 与 loaded execution state 分离：内存 projection、cache、snapshot 只能由权威事实派生。
 
-### 三个长生命周期深模块
+### Runtime-Owned共享深模块
 
-`MiniCoreRuntime` 在 Runtime 生命周期内拥有三个长生命周期深模块：
+`MiniCoreRuntime`在Runtime生命周期内拥有四个共享深模块；字段保持private，只通过顶层facade和crate-internal orchestration使用：
 
 ```rust
 pub struct MiniCoreRuntime {
-    pub prompt_service: Arc<PromptService>,
-    pub tools: Arc<ToolService>,
-    pub skills: Arc<SkillService>,
+    prompt_service: Arc<PromptService>,
+    tool_service: Arc<ToolService>,
+    skill_service: Arc<SkillService>,
+    model_gateway: Arc<ModelGateway>,
 }
 ```
 
@@ -194,7 +195,7 @@ Steer after complete assistant/tool step
 - AgentLoop 是 MiniCore 自研的 crate-private sans-I/O 协议状态机（ADR 0115）；Rig只实现`ModelGateway` private `ProviderAdapter`中的provider协议映射与单次attempt调用，SDK automatic retry固定为0，不拥有AgentLoop、model resolution、Session logical retry、ModelGateway terminal语义、产品级工具治理、会话持久化或UI呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
 - raw failure只存在于具体adapter implementation；发生事实的module负责typed、redacted分类，掌握Turn/control/durable state的owner负责恢复（ADR 0120）。不建立全局Error module或ErrorService；该规则首版只在ModelGateway response validation落地，其他module按真实需求逐步采用。
-- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。valid Cancel在sticky epoch发布后立即返回`CancelAccepted`并进入Finishing，已开始Tool结构化收口期间仍允许FollowUp排队，旧Turnterminal前不启动新Turn。Snapshot只作为live observer baseline，process restart仍从JSONL replay并保守关闭unfinished Turn。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/SecurityRevoked与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。valid Cancel在sticky epoch发布后立即返回`CancelAccepted`并进入Finishing，已开始Tool结构化收口期间仍允许FollowUp排队，旧Turnterminal前不启动新Turn。Authority hard restriction通过SecurityRevoked停止新operation并truthful settle，terminal后重新resolve Workspace；不承诺动态撤销open handle。Snapshot只作为live observer baseline，process restart仍从JSONL replay并保守关闭unfinished Turn。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway`通过`resolve_for_turn(...)`固定exact `TurnModelSnapshot`，RunningOperation只传`ModelCallRequest`；每个Gateway operation最多执行一个provider attempt，SessionExecutor对同一个AgentRun request最多logical retry 3次、CompactionSummary最多1次。Gateway隐藏provider、credential、endpoint、cache和continuation，在`ModelCallResult`前验证finish/content与OutputContract；它不判断session message visibility，也不在active Turn内执行transport/model fallback。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`统一治理；每个loaded Session的`SessionExecutor`拥有独立file mutation queue，新Turn的`ToolSet`只持共享引用。同Session同文件mutation FIFO，跨Session共享Workspace不协调并由host/user负责隔离（ADR 0116）。MVP不启用通用`bash`；子进程限制无法强制时必须fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
@@ -224,3 +225,4 @@ Steer after complete assistant/tool step
 - [ADR 0118：Cancel立即确认，FollowUp等待结构化收口后启动](adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)
 - [ADR 0119：模型调用使用Session逻辑重试](adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](adr/0120-failures-stay-with-owning-modules.md)
+- [ADR 0121：Workspace定义只在Idle更新，安全撤权中断当前Turn](adr/0121-workspace-updates-require-idle.md)

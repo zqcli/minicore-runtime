@@ -171,7 +171,7 @@ MiniCoreRuntime
 - `OperationType`；
 - provider attempt id；
 - Tool executor route；
-- Workspace authorization lease id。
+- Workspace security target generation。
 
 ### Event Route
 
@@ -309,7 +309,7 @@ pub enum SessionCommand {
 }
 ```
 
-`SessionDefinitionPatch`原子修改Workspace、SessionModelConfig或SessionPromptSelection，并生成新的`SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。
+`SessionDefinitionPatch`原子修改Workspace、SessionModelConfig或SessionPromptSelection，并生成新的`SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。若patch改变Workspace且Session已loaded，只在`SessionExecutionState::Idle`接受；Starting/Running/Finishing返回typed `SessionBusy`，不排队、不隐式Cancel。Host需要显式`Cancel → wait session_settled → UpdateDefinition`。
 
 `Create` 只接受 `agent_id`：Runtime 在创建的 Agent lifecycle synchronization 内读取该 Agent 当时的 current revision，并把它作为 exact `AgentRevisionRef` 钉进 `SessionDefinition`。调用方不在 create 时报 revision——「用哪一版」由 Runtime 在此刻快照 current 决定，之后 Agent 再发布新 revision 不会改变该 Session（snapshot-current）。
 
@@ -522,7 +522,8 @@ Command response不是完整业务完成流：
 | Create Agent | Agent head与revision durable publication |
 | Update Agent | expected revision/status CAS成功 |
 | Create Session | SessionHeader/definition durable publication |
-| Update SessionDefinition | new revision durable publication |
+| Update SessionDefinition（non-Workspace或unloaded Workspace） | new revision durable publication |
+| Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Unload Session | LifecycleControl完成grace/fail-closed drain，writer关闭并从loaded map移除 |
 | Submit | initiating UserMessage append/apply |
@@ -1252,7 +1253,7 @@ ModelCallResult contains built-in ask-user ToolCall
 → same Turn next PromptSet.assemble
 ```
 
-Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/Unload/Snapshot；其他Session的Executor不受影响。等待期间不预留file mutation ticket，也不持有Workspace commit authorization，elapsed time不会自动关闭Interaction。
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session的Executor不受影响。等待期间不预留file mutation ticket，也不持有TurnControl reservation，elapsed time不会自动关闭Interaction。
 
 ## Transport 与 Adapter
 
@@ -1338,7 +1339,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - PromptSet完整System sections和前置User context；
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
-- Workspace authorization lease；
+- WorkspaceSnapshot、EmergencyControl signal或security target generation；
 - SessionWriter、writer internals、repair internals；
 - raw JSONL path作为普通UI能力；
 - internal handler id和完整RuntimeCommand嵌入catalog action。
@@ -1362,7 +1363,7 @@ TurnExecutionContext
 PromptService / PromptSet
 ToolService / ToolSet
 SkillService / SkillView / LoadedSkill
-WorkspaceSnapshot / authorization lease
+WorkspaceSnapshot / EmergencyControl signal
 ModelGateway / TurnModelSnapshot private execution ref
 ProviderAdapter / AuthStore
 SessionWriter / SessionStorage implementation

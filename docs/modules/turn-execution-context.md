@@ -45,11 +45,11 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 - PromptSet 是唯一产生 `AssembledModelContext` 的对象；
 - PromptSet 在创建时绑定同一个 ToolSet 的 ToolPromptView，assembly 时不能再传入任意 Tool view；
 - 模型可见动态事实必须来自 committed conversation，不建立未持久化的 dynamic contribution lane；
-- Skill lazy load使用本Turn捕获的SkillView entry，并在实际读取时校验Workspace authorization；
+- Skill lazy load使用本Turn捕获的SkillView entry，并在实际读取时校验source stamp与current Turn control basis；
 - initiating UserMessage append 前不调用模型、不执行 Tool，也不发布领域 Turn；
 - Steer 是 current Turn control input；成功 append 后才影响下一次逻辑模型调用；
 - FollowUp 不属于 `TurnControl`，它在当前 Turn terminal 后开启新 Turn，并捕获新 Context；
-- ordinary reload 只影响 future Turn；security-restricting update 撤销 lease 并中断 active Turn；
+- Workspace definition update只在Session Idle；authority/host hard restriction通过SecurityRevoked中断active Turn；
 - same-Turn cold resume只有在Prompt/Model/Tool execution basis和Workspace reauthorization可重建时才允许；Skill旧正文不单独恢复，已经committed的Skill内容由conversation保留；否则保守中断。
 
 ## 三层边界
@@ -199,7 +199,7 @@ SkillViewContext + SkillEntry
 以下执行状态不进入 fingerprint，也不表示 Context 发生变化：
 
 - cancellation token 是否已触发；
-- Workspace authorization lease 是否已撤销；
+- EmergencyControl是否已触发Cancel/SecurityRevoked；
 - Tool approval waiter；
 - provider attempt；
 - stream draft；
@@ -229,11 +229,11 @@ compose_message
 → 从captured SkillView解析SkillIntent
 → SkillService::load(context + entry)
 → SkillInjector::build
-→ 校验authorization lease和source stamp；正文由CanonicalUserMessage fingerprint覆盖
+→ 校验source stamp、operation identity/version和TurnControl basis；正文由CanonicalUserMessage fingerprint覆盖
 → PromptSet::compose_user_message
 
 assemble_model_context
-→ 校验 committed conversation proof、authorization lease 和 Context binding
+→ 校验committed conversation proof、current Turn control basis和Context binding
 → PromptSet::assemble
 ```
 
@@ -304,8 +304,7 @@ SkillView和ToolSet不互相依赖，实现可以并行捕获。PromptSet必须�
 
 capture 完成前必须再次检查：
 
-- Workspace authorization lease 未撤销；
-- Turn cancellation 未触发；
+- Turn cancellation或SecurityRevoked未触发；
 - Session admission reservation 仍然有效；
 - SkillViewContext / ToolTurnContext与captured AgentRevisionRef、SessionDefinitionRevision和candidate TurnId一致；
 - ToolSet.prompt_view().tool_set_fingerprint 等于 parent ToolSet fingerprint；
@@ -315,14 +314,14 @@ capture 完成前必须再次检查：
 
 Prompt、Tool 和 Skill 是独立领域，没有跨三者的 global publication instant。
 
-ordinary reload 在 capture 期间发生时：
+Prompt/Tool/Skill reload在capture期间发生时：
 
 - 某子系统在自己的 capture 线性化点之前发布的新值，可以被本次 Context 捕获；
 - 已经捕获的值不被后续 reload 原地替换；
 - PromptSet只绑定实际捕获的PromptResourceView、SkillPromptView和ToolPromptView；
 - 最终发布的是一个内部一致的组合，而不是“同一纳秒”的全局资源快照。
 
-capture完成后的Skill reload不改变active Turn持有的SkillView。尚未lazy-load的entry按captured location读取当前文件内容；读取前仍必须校验authorization lease和source stamp。已经加载的`Arc<LoadedSkill>`保持不变。
+capture完成后的Skill reload不改变active Turn持有的SkillView。尚未lazy-load的entry按captured location读取当前文件内容；读取前仍必须校验source stamp、operation basis和EmergencyControl。已经加载的`Arc<LoadedSkill>`保持不变。Workspace definition update在Starting/Running/Finishing时返回SessionBusy，因此不会与capture并发替换Snapshot。
 
 这不引入通用 ResourceManager。
 
@@ -365,8 +364,8 @@ initiating UserMessage entry是领域Turn的开始线性化点。Agent status sy
 - 不创建 Tool approval Interaction；
 - 不发布 committed Turn/UserMessage；
 - context capture、source read 和 cache fill 不构成领域事实；
-- `compose_message` 和 initiating UserMessage append 前都必须再次检查 Workspace authorization lease 与 Turn cancellation；
-- revocation 后尚未 append 的 UserMessage、Steer 和 PromptContribution 全部丢弃。
+- `compose_message`和initiating UserMessage append前都必须再次观察Turn cancellation/SecurityRevoked epoch并使用controlled reservation；
+- emergency signal获胜后尚未append的UserMessage、Steer和PromptContribution全部丢弃。
 
 capture、Skill load、UserMessage composition、Context append或UserMessage append失败时，释放candidate和局部Context，SessionExecutionState返回Idle；仅有orphan Context entry不创建空Turn或`Failed` Turn。
 
@@ -499,28 +498,29 @@ loop:
      └─ response error：SessionExecutor按non-retryable Model failure收口
 
   NeedTools
-  → observe EmergencyControl Cancel/revocation epoch
-  → validate current authorization
-     └─ Cancel/revocation wins：进入Interrupted cleanup
-  → 取得WorkspaceCommitAuthorization
+  → observe EmergencyControl Cancel/SecurityRevoked epoch
+  → reserve TurnControlGate controlled append
+     └─ emergency wins：进入Interrupted cleanup
   → append one assistant/intermediate message
      └─ ordered reasoning/text/tool_call content；每个ToolCall带ItemId
   → apply assistant entry delta（Started ToolInvocation，conversation AdvanceOnly）
-  → release WorkspaceCommitAuthorization
+  → release controlled reservation
   → pinned ToolSet.execute(ToolExecutionRequest[])
      └─ approval 通过 durable Interaction request/resolution
      └─ ask-user route通过durable UserQuestion等待typed answer，并产生PreExecution outcome
      └─ ToolExecutionControl record ToolExecutionStarted before side effect
   → ToolExecutionOutcome[]
      ├─ 每个Completed：append matching role=tool message → apply
-     ├─ 全部Completed：append tool_round_completed → apply conversation delta
+     ├─ 全部Completed：重新observe EmergencyControl并reserve controlled append
+     │  ├─ success：append tool_round_completed → apply conversation delta
+     │  └─ Cancel/SecurityRevoked：保留tool messages，进入Interrupted cleanup
      └─ 任一Abandoned：append ToolAbandoned → apply并确定Turn terminal result
   → 把model-visible committed conversation change交回AgentLoop adapter
   → steer FIFO非空时pop_front一条并append/apply Steer
   → continue
 
   Finished
-  → 与Cancel/revocation仲裁
+  → 与Cancel/SecurityRevoked仲裁
   → steer FIFO非空：append model-visible Assistant Continue
      → pop_front一条Steer并append/apply
      → rebuild AgentLoop segment并continue
@@ -558,7 +558,7 @@ InteractionRequested必须append后才发布approval request；InteractionResolv
 
 WaitingApproval不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为approval resolution，也不preempt当前Interaction/ToolRound。
 
-只有显式 cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn进入 terminal status。
+只有显式cancel、runtime shutdown、SecurityRevoked或不可恢复错误才使Turn进入terminal status。
 
 ## WaitingForUserInput
 
@@ -572,7 +572,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-首版ask-user route在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不预留mutation ticket，也不持有`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、Unload和Snapshot；用户沉默时保持Pending，不产生默认Deny。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
+首版ask-user route在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不预留mutation ticket，也不持有TurnControl reservation，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、SecurityRevoked、Unload和Snapshot；用户沉默时保持Pending，不产生默认Deny。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
 
 WaitingForUserInput不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为UserAnswer，也不preempt当前Interaction。
 
@@ -596,7 +596,7 @@ Steer可以在Model或Tool执行期间被接收，但不会修改已经发送给
 基础策略：
 
 - Sampling期间不cancel、不推进execution_version；已完成response必须先保存为ToolCall step或无ToolCallAssistant Continue step；
-- AgentLoop返回NeedTools后、任何Tool side effect前必须重新检查Cancel state和current authorization；
+- AgentLoop返回NeedTools后、任何Tool side effect前必须重新观察Cancel/SecurityRevoked epoch；
 - Tool 已经可能产生副作用且 exact outcome 可得时，默认等待该轮调用形成完整 Tool messages 后再 append `tool_round_completed`；executor/side-effect outcome unknown 时 ToolInvocation 进入 Abandoned 并 terminalize Turn；
 - approval/UserQuestion wait、sleep 或其他明确可中断 Tool 可以形成 cancelled ToolResult，再完成 ToolRound；
 - candidate final与Steer FIFO由SessionExecutor线性化；已有queued Steer时candidate final保存为non-terminal Continue，queue为空时才append Final；
@@ -623,9 +623,9 @@ active Turn 期间提交 FollowUp
 因此 FollowUp：
 
 - 不复用旧 TurnExecutionContext；
-- 不复用旧 Workspace authorization lease；
+- 不复用旧WorkspaceSnapshot或security target generation；
 - 不复用旧ToolSet、PromptSet或SkillView；
-- 可以看到当前 Turn 期间完成的 ordinary reload；
+- 在真正admission时看到Idle期间成功提交的Workspace update和current Prompt/Tool/Skill views；
 - 失败或取消不会改变已经 terminal 的前一个 Turn。
 
 FollowUp使用`FollowUpQueue` bounded FIFO；它最多获得一次连续admission优先，若上一Turn由FollowUp启动且下一次Idle decision有external Submit，则先选Submit。Submit不是隐式FollowUp，未选中且Session再次Busy时明确返回。该lane不是独立领域entity，也不拥有Session状态。
@@ -673,7 +673,7 @@ AgentLoop NeedModel安全点
      }
    )
 → SummaryModel call
-→ revalidate source checkpoint/control/authorization
+→ revalidate source checkpoint/control/context basis
 → append/apply StoredCompaction
 → Replace committed conversation projection
 → rebuild ConversationSeed和AgentLoop segment
@@ -682,11 +682,11 @@ AgentLoop NeedModel安全点
 
 Compaction summary call仍通过同一个PromptSet和exact TurnModelSnapshot。普通Agent/Session/Workspace/Tool/Skill静态instructions不进入summary；下一次AgentRun assembly从同一个TurnExecutionContext重新注入。
 
-`TurnExecutionPhase = Compacting`期间TurnStatus保持Running，Steer排队，Cancel和security revocation可以在append前获胜。每个active instruction segment的completed coverage frontier可在完整ToolRound安全点滚动推进；滚动checkpoint用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance。exact active UserMessage anchors或真实protected region自身过大时返回`ProtectedRegionTooLarge`。同一source/scope-frontier的hard recovery只尝试一次，但成功推进后允许在`max_compactions_per_turn`内再次compact。
+`TurnExecutionPhase = Compacting`期间TurnStatus保持Running，Steer排队，Cancel和SecurityRevoked可以在append前获胜。每个active instruction segment的completed coverage frontier可在完整ToolRound安全点滚动推进；滚动checkpoint用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance。exact active UserMessage anchors或真实protected region自身过大时返回`ProtectedRegionTooLarge`。同一source/scope-frontier的hard recovery只尝试一次，但成功推进后允许在`max_compactions_per_turn`内再次compact。
 
-## Cancellation 与 Security Revocation
+## Cancellation And Security Revoked
 
-普通 Turn cancellation 和 Workspace security revocation 都可以停止执行，但安全语义不同。
+普通Turn cancellation和authority/host `SecurityRevoked`都可以停止执行，并复用同一Finishing/truthful settlement机制。
 
 ### Turn Cancellation
 
@@ -700,33 +700,33 @@ runtime shutdown
 
 Cancellation：
 
-- 阻止新的逻辑模型调用、Skill load 和 Tool execution；
+- 阻止新的逻辑模型调用、Skill load和Tool execution；
 - best-effort cancel当前provider/tool operation；
-- 不撤销已经 committed conversation fact；
+- 不撤销已经committed conversation fact；
 - 不伪装回滚已经完成的外部副作用；
-- 通过一个 terminal entry 结束 Turn。
+- 通过一个terminal entry结束Turn。
 
-### Security Revocation
+### SecurityRevoked
 
-Workspace security-restricting update：
+Authority hard restriction不是Workspace definition update：
 
 ```text
-WorkspaceAuthorizationControl.revoke()
-→ authorization lease 失效
-→ 通知 SessionExecutor
-→ cancel active Turn
+publish current authority/policy fact
+→ EmergencyControl::SecurityRevoked(target generation)
+→ SessionExecutor停止新operation并进入Finishing
+→ TurnInterrupted(SecurityRevoked)
+→ terminal后重新resolve current Workspace definition
 ```
 
-revocation 后：
+signal获胜后：
 
-- 不开始新的模型调用；
-- 不执行新的 Tool；
-- 不加载新的 Skill 正文；
-- 基于已撤销上下文产生但尚未append的模型结果直接丢弃；已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`，随后按terminal cleanup中断Turn；
-- provider 已看到的内容无法撤回，只能 best-effort cancel；
-- 已经发生的 Tool 外部副作用进入 audit/repair，不声称被回滚。
+- 不开始新的模型调用、Tool或Skill/source read；
+- 尚未append的model/source result因control或execution basis失效而丢弃；
+- 已append但conversation-hidden的assistant/tool entries不得再追加`tool_round_completed`；
+- 已越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`；
+- provider已经看到的内容、已打开OS handle和已进入kernel/remote system的副作用无法撤回，只能best-effort cancel并truthful settlement。
 
-ordinary permissive update 不撤销 active lease，也不扩大 active Turn capability。
+Workspace definition patch只在Session Idle时提交，因此active Context没有ordinary/permissive/restrictive hot-update分支。
 
 ## Failure Atomicity
 
@@ -734,7 +734,7 @@ Context capture 的原子性指领域发布原子性，不要求回滚内部 cac
 
 - Skill discovery 或 Prompt source read 可以填充 content-addressed cache；
 - ToolSet、SkillView或PromptSet局部值可以先后创建；
-- 只有全部成功并完成最终 lease/fingerprint 校验后才发布完整 Context；
+- 只有全部成功并完成最终control/basis/fingerprint校验后才发布完整Context；
 - 失败时 drop 局部值，不更新 Session current state；
 - Context capture 本身不创建 Item、Interaction、grant 或 durable Turn；
 - initiating UserMessage append 前不产生模型或 Tool 副作用。
@@ -827,7 +827,7 @@ PromptFingerprint 只存在于 Turn start execution metadata，用于 Prompt dia
 metadata 不保存：
 
 - provider credentials；
-- 随机 lease token；
+- process-local cancellation/security signal；
 - Tool approval waiter；
 - cancellation token；
 - mutable cache state；
@@ -877,7 +877,7 @@ Context capture diagnostics 至少记录：
 - Workspace、SkillView、ToolSet、PromptSet和Model fingerprint；
 - source unavailable、optional degradation 和 required failure；
 - capture duration 和 cache hit；
-- final lease validation；
+- final control/basis validation；
 - recovery mismatch 的具体 child reference。
 
 绝对路径、Prompt 正文、Skill 正文、Tool arguments 和 credentials 默认不进入公开 diagnostics。
@@ -900,7 +900,7 @@ terminal path
 → drop Arc<TurnExecutionContext>
 ```
 
-Context drop 不 unregister Runtime-global Tool、不清空共享 content cache，也不 revoke 其他 Turn 的 lease。
+Context drop不unregister Runtime-global Tool、不清空共享content cache，也不影响其他Session/Turn的security target generation。
 
 ## 与 Session Execution 的关系
 
@@ -909,7 +909,7 @@ Context drop 不 unregister Runtime-global Tool、不清空共享 content cache�
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state；
 - 一个Runtime允许多个SessionExecutor同时Running；
 - `SessionIngress`按语义分为TurnAdmission、per-Turn Steer、FollowUp、InteractionControl、ToolControl、EmergencyControl、LifecycleControl和SnapshotMailbox；
-- Cancel/revocation不等待普通work lane，GetSnapshot从immutable published view读取，持续观察使用snapshot-first subscription；
+- Cancel/SecurityRevoked不等待普通work lane，GetSnapshot从immutable published view读取，持续观察使用snapshot-first subscription；
 - Context、Model和Tool使用cancellable `RunningOperation`；
 - operation result使用`SessionId + TurnId + execution_version + OperationType`校验；
 - private AgentLoop只返回NeedModel、NeedTools或Finished；
@@ -1010,8 +1010,8 @@ AgentLoop registry
 - assembly 不接受任意 ToolPromptView；
 - 所有模型可见动态事实来自 committed conversation；
 - 下一次逻辑模型调用只从成功append并已进入conversation projection的facts构建；
-- Skill lazy load使用captured SkillEntry并重新校验读取授权；
-- compose_message 和 initiating UserMessage append 前重新校验 authorization lease；
+- Skill lazy load使用captured SkillEntry并重新校验source stamp与current operation basis；
+- compose_message和initiating UserMessage append前重新观察TurnControl epoch；
 - ToolSpec 和 executor route 来自同一个 ToolSet；
 - Tool side effect前append非模型可见tool_execution_started operational truth；
 - Interaction request append-before-notify，resolution append-before-resume；
@@ -1021,8 +1021,8 @@ AgentLoop registry
 - WaitingApproval和WaitingForUserInput时Turn仍是Running；
 - Steer在完整assistant/tool step后FIFO出队，append后才影响下一次逻辑模型调用，不把Turn变为Interrupted；
 - FollowUp 创建新 Turn 和新 Context；
-- ordinary reload 只影响 future Turn；
-- security revocation 中断 active Turn，不替换其 Context；
+- Workspace definition update只在Session Idle，active Context完全immutable；
+- SecurityRevoked中断active Turn，不原地替换其Context；
 - crash recovery 不自动重放 outcome unknown 的 Tool；
 - same-Turn execution basis不可重建时保守中断，不使用current resource冒充旧Context。
 
@@ -1032,19 +1032,19 @@ AgentLoop registry
 
 - Context capture 成功并绑定 exact AgentRevisionRef、SessionDefinitionRevision 和 WorkspaceSnapshot；
 - PromptResourceView、SkillView与ToolSet capture后，PromptSet绑定对应fingerprints；
-- capture 期间 ordinary Prompt/Tool/Skill reload；
-- capture 最终 lease check 前发生 Workspace revocation；
+- capture期间Prompt/Tool/Skill reload；
+- capture final control/basis check前发生SecurityRevoked；
 - capture failure 不创建领域 Turn；
 - initiating UserMessage append 前不调用模型或 Tool；
 - initiating UserMessage append NotCommitted 时重试同一 draft；OutcomeUnknown 时保守终结、不在本 run 重试该 append、不分配另一个 TurnId，Turn 视为未开始，用户可重新提交；
 - PromptSet assembly 无法接收另一个 ToolPromptView；
-- compose_message 和 initiating UserMessage append 前发生 revocation 时丢弃未 append contribution；
+- compose_message和initiating UserMessage append前SecurityRevoked获胜时丢弃未append contribution；
 - Skill lazy load不查询reload后的current SkillView；未加载entry允许读取location当前正文；
 - User Skill injection 进入 committed CanonicalUserMessage；
 - 逻辑模型调用只接受 CommittedConversationView；
 - Session logical retry保持AssembledModelContextFingerprint不变；
 - ModelGateway response error不进入AgentLoop，不执行Tool且不logical retry；
-- NeedTools后、任何side effect前重新检查Cancel state和current authorization；
+- NeedTools后、任何side effect前重新观察Cancel/SecurityRevoked；
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
 - InteractionRequested append-before-notify；
 - InteractionResolved append-before-wake/side-effect；
@@ -1060,9 +1060,10 @@ AgentLoop registry
 - Steer 与 final terminal append race；
 - FollowUp 在前一 Turn terminal 后创建新 Context；
 - compaction entry append/apply 后 conversation checkpoint 和 AssembledModelContextFingerprint 改变；
-- ordinary reload 不影响 active Context；
-- security revocation 阻止新的 model/tool/skill 操作；
-- revoked result 未 append 时被丢弃；
+- active Turn期间Workspace update返回SessionBusy，不影响active Context；
+- SecurityRevoked阻止新的model/tool/skill操作；
+- security signal获胜后的迟到Model/source或pre-start Tool result未append时被丢弃；越过ToolExecutionStarted的Tool必须truthful settle；
+- 已打开OS handle或已开始provider/kernel operation不承诺动态撤销；
 - Tool side effect 已发起但 executor outcome unknown 时不自动重放，并把 ToolInvocation Abandoned；
 - exact ToolResult 已知但 role=tool message append NotCommitted 时只重试同一 draft；SessionWrite OutcomeUnknown 时保守终结当前 round、不在本 run 重试该 append，该 tool message 视为未持久化，下次 load 按 committed prefix 恢复（round 不完整则 Abandon）；
 - client disconnect 后 Interaction 保持 Pending，reconnect 使用相同 RequestId；

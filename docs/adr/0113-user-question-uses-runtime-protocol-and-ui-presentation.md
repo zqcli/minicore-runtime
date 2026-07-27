@@ -7,7 +7,7 @@
 
 `InteractionRequest` 已包含 `ToolApproval | UserQuestion`，但 Tool 到 SessionExecutor 只有 approval 与 execution-start seam，没有真正创建 `UserQuestion` 的 producer。若让 UI 自己决定何时提问、自己保存 pending state，MiniCore 收到的答案就无法可靠绑定到原来的 `TurnId`、`ItemId` 和 `RequestId`；UI 断线、重复提交、Cancel 和 crash recovery 也会各自形成第二套状态。
 
-同时，等待用户回答不能预留file mutation ticket，也不能持有`WorkspaceCommitAuthorization`。否则一个用户不回答就会阻塞同一Session后续sibling ToolCall。
+同时，等待用户回答不能预留file mutation ticket，也不能持有TurnControl reservation。否则一个用户不回答就会阻塞同一Session后续sibling ToolCall。
 
 ## 决策
 
@@ -36,7 +36,7 @@ request_user_question(
 
 - ToolSet 提供一个内建 ask-user route；具体公开 ToolName 不在本 ADR 冻结。
 - route 在`ToolExecutionStarted`、file mutation ticket reservation和任何外部副作用之前调用`request_user_question`。
-- 等待期间不预留mutation ticket，也不持有Workspace commit authorization；该Interaction不需要伪造`ToolExecutionStarted`。
+- 等待期间不预留mutation ticket，也不持有TurnControl reservation；该Interaction不需要伪造`ToolExecutionStarted`。
 - ask-user route 返回 `UserAnswer` 后生成 `PreExecution` truthful ToolResult，再按普通顺序 append `role=tool` 与 `tool_round_completed`。
 - 首版 ask-user Interaction 在一个 ToolRound 中独占等待；同一 assistant step 的其他 ToolCall 不得并行启动。这样当前 Turn 的“等待用户”语义不会与未决副作用混在一起。
 - 普通Tool在已经`ToolExecutionStarted`或开始file mutation后不得调用该seam；未来若确有需要，必须另行定义可证明不持有mutation permit的producer protocol。

@@ -108,7 +108,7 @@
 
 ### R6 · 不变量复述是最大的结构性负债
 
-同一不变量普遍在 4–6 篇文档全文复写（OutcomeUnknown 保守终结 5 处；WaitingForUserInput 语义 5 处；Steer 消费时机 4 处；WorkspaceCommitAuthorization 竞态 3 处）。`modules/README.md` 的权威归属表方向正确，但同步机制是"重写 + 人肉对齐"：E3/D1 各需同步 8+ 文件，R4 即漏网实例。只有 `compaction.md` 使用了可引用的不变量 ID（COMP-001..020）。
+同一不变量普遍在4–6篇文档全文复写（OutcomeUnknown保守终结5处；WaitingForUserInput语义5处；Steer消费时机4处；当时的Workspace commit/revoke竞态3处）。`modules/README.md`的权威归属表方向正确，但同步机制是“重写 + 人肉对齐”：E3/D1各需同步8+文件，R4即漏网实例。只有`compaction.md`使用了可引用的不变量ID（COMP-001..020）。ADR 0121随后删除了Workspace commit/revoke不变量，恰好证明重复复述的同步成本。
 
 - 出处：全仓横切。
 
@@ -135,10 +135,10 @@ INV-4xx  安全与授权（权威：workspace.md / tools.md）
 | INV-102 | Steer 只在完整 assistant/tool step 后、下一次 Model 前 FIFO 消费一条，append 后才 model-visible | 4 |
 | INV-103 | recovery 不重放 outcome-unknown Tool、不生成 synthetic ToolResult、不补 ToolRoundCompleted | 4 |
 | INV-201 | active Turn 不读取 Prompt/Tool/Skill/Workspace/Model 的 future current value（Skill 未加载正文按 C4 弱一致例外） | 4 |
-| INV-202 | ordinary reload 只影响 future Turn；security-restricting update 撤销 lease 并中断 active Turn | 4 |
+| INV-202 | Workspace definition只在Session Idle更新；SecurityRevoked中断active Turn并在terminal后重新resolve | 4 |
 | INV-301 | Interaction request append-before-notify、resolution append-before-resume/side-effect | 4 |
 | INV-302 | 用户沉默/断线/无 subscriber 保持 Pending，不产生默认 Deny 或超时 resolution | 4 |
-| INV-401 | WorkspaceCommitAuthorization 与 revoke 经同一同步原语排序，只跨一次短 append/apply | 3 |
+| INV-401 | Cancel/SecurityRevoked与controlled append通过TurnControlGate first-wins；reservation只跨一次短append/apply | 3 |
 | INV-402 | WorkspaceAccessView 是文件权限硬上限，approval/grant 只能收紧 | 3 |
 
 **3) 替换规则**：每条不变量的**权威文档保留完整定义并标注编号**；其余文档的复述段替换为「见 INV-xxx」+ 至多一句话概述。CONTEXT.md 术语表条目视为概述层，同样只引用编号。compaction.md 的 COMP-001..020 保留原编号不迁移（域内清单与全局清单并存，全局清单只收跨模块条目）。
@@ -206,7 +206,7 @@ pub trait ToolSandbox: Send + Sync {
 1. *serde 惯例*：JSON field 使用 camelCase（storage 示例 `formatVersion`/`sessionId`/`parentId` 已是此风格，顺势冻结）；type/enum tag 值使用 snake_case（与事件类型名 `turn_started` 等既有约定一致）；tag 形态用 internally-tagged（`"type": "..."`）对齐现有示例。写入 `conversation-storage.md` 开放问题 1 的闭合处与 `runtime-interface.md` 实现顺序第 1 条。
 2. *ID 生成策略*：EntryId 已定随机；TurnId/ItemId/RequestId/SkillId/CommandId 统一为 128-bit 不可预测随机值（UUIDv4 或等价），字符串编码统一（推荐无连字符 hex 或 base32，选定一种全仓一致）。不用 UUIDv7/时间有序——时间前缀会在 fork remap 后产生误导性排序暗示，且文档已明确 ID 不作排序键。定义处：`architecture.md` identity 一节或 wire-freeze 决议文档。
 3. *ContentHash 规范化*：算法定为 SHA-256；输入必须是确定性 canonical encoding——固定字段顺序的专用序列化（不是 serde JSON 默认输出），集合先按 stable identity 排序，禁止 HashMap 迭代顺序参与；每类 fingerprint 声明自己的 coverage + algorithm version 字段（capture/estimator/canonicalization version 已有先例，补齐其余）。产出 golden vector 测试文件作为冻结物。
-4. *共享 pinning value type*：第一轮「横切复用」建议落地为一个共享 value 模块（非领域分层）：`SourceAuthorizationStamp`、`AuthorizedSourceRoot`、"pinned view + lease 校验"helper，由 Prompt/Skill/Workspace 共用，安全不变量只定义一次；若实现时发现三处差异本质不同，允许放弃合并，但需在本文登记放弃理由。
+4. *共享pinning value type*：第一轮“横切复用”建议在实现前比较真实字段；确实同构时才建立共享value模块（非领域分层），复用`SourceAuthorizationStamp`、`AuthorizedSourceRoot`和“pinned view + source stamp”helper。ADR 0121已删除lease校验；若三处差异本质不同，应放弃合并并登记理由。
 5. *基础类型*：`Timestamp` = UTC RFC3339 毫秒精度字符串（JSONL 示例已是此形态）；`Money` = `{ amount: String（decimal 原文）, currency: ISO4217 }`，只承载 provider 返回的 billed cost 原值，不做本地算术——与"reported_cost 只存 provider 明确返回值"原则一致。
 6. *Gemini*：从首版 `ProviderProtocol` 删除，真实需求出现时随新 provider adapter 一起加回（与"不为未来需求预置枚举"的仓库纪律一致）。
 
@@ -231,12 +231,12 @@ pub trait ToolSandbox: Send + Sync {
 
 **推荐方案（按条对应）**：
 
-1. *异步同步纪律*：不建设全局锁序总表。普通Mutex/RwLock guard不得跨await、owner调用、event publication或fan-out；有意的bounded async serialization使用typed permit；controlled append由私有helper固定`TurnControl reservation → WorkspaceCommitAuthorization → append/apply`；Agent/Workspace mutation释放gate后再通知Session。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
+1. *异步同步纪律*：不建设全局锁序总表。普通Mutex/RwLock guard不得跨await、owner调用、event publication或fan-out；有意的bounded async serialization使用typed permit；controlled append由私有helper固定`TurnControl reservation → append/apply → release`；状态mutation释放gate后再通知Session。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)与[ADR 0121](../adr/0121-workspace-updates-require-idle.md)。
 2. *Tools 实现排期后置*：在`migration/v1-to-v2.md`补一句显式排期：Tool子系统完整实现（Deferred/search_tools/invoke_tool、grant store和完整Sandbox adapter）后置于阶段6–8交付束之后；交付束期间仅需ToolSet接口签名、Session-local mutation queue最小stub与ScriptedProviderAdapter联调。
 3. *lane 容量默认值*：Runtime config 为各 lane 给出保守小默认（如 TurnAdmission=4、Steer=16、FollowUp=16、InteractionControl=8、ToolControl=32），随 diagnostics 的 lane depth 指标观察后调整；默认值本身不入 fingerprint。
 4. *fork remap property test*：在 `conversation-storage.md` 测试矩阵已有条目基础上，标注实现顺序要求——remap round-trip property test（任意合法 entry 序列 fork 后 replay 得到相同相对顺序与 fingerprint）在 fork 功能合入同一 PR 内交付，不允许后补。
 
-> 2026-07-27后续决议：文件并发的权威范围见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)；异步同步纪律见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。MVP不建设全局lock-rank系统。
+> 2026-07-27后续决议：文件并发的权威范围见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)；异步同步纪律见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)；Workspace Idle-only update与SecurityRevoked见[ADR 0121](../adr/0121-workspace-updates-require-idle.md)。MVP不建设全局lock-rank系统或Workspace lease。
 
 ### 可实现性排序（直接开工的卡点顺序）
 

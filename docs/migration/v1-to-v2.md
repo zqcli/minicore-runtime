@@ -217,10 +217,10 @@ SessionStorage 是 durable truth。热内存 conversation projection 只消费 `
 - Workspace 属于 Session 的精确语义；
 - trust、source authorization 和 filesystem capability；
 - Prompt、Tool、Skill 可以消费的窄只读 view；
-- Workspace 更新对 active Turn 和 future Turn 的影响；
-- 同根多 Session 的 mutable state 和 authorization 隔离；
-- Workspace unavailable 和 reload 语义；
-- ordinary reload 与 security-restricting revocation 的区别。
+- Workspace definition只在Session Idle更新，non-Idle返回SessionBusy；
+- authority/host hard restriction通过SecurityRevoked中断active Turn；
+- 同根多Session的mutable state和authorization隔离；
+- Workspace unavailable、terminal后重新resolve和reload语义。
 
 核心输出：
 
@@ -238,8 +238,9 @@ WorkspaceAccessView
 - 三个 Service 不再接收模糊的 `WorkspaceContext` 占位类型；
 - project source 不存在绕过 Workspace authorization 的加载路径；
 - additional roots 必须进入 Tool filesystem ceiling，但默认不自动进入 Prompt/Skill source discovery；
-- active Turn pin 一个 WorkspaceSnapshot，restrictive update 可以撤销 lease 并中断执行；
-- 同根 Session 不共享 mutable Snapshot、authorization lease 或 Session-scoped grant。
+- active Turn pin一个immutable WorkspaceSnapshot，definition update不与active Turn并发；
+- SecurityRevoked停止新operation并truthful settle，但不承诺动态撤销open handle；
+- 同根Session不共享mutable Snapshot、security target generation或Session-scoped grant。
 
 ### 阶段 2：Turn 执行上下文
 
@@ -265,7 +266,7 @@ capture 依赖图：
 
 ```text
 exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
-+ exact AgentPrompts / SessionPrompts
++ exact AgentPromptSelection / SessionPromptSelection
 + WorkspaceSnapshot + TurnModelSnapshot
 ├─ SkillService::current_view(SkillViewContext {
 │    agent, session_id, session_revision, workspace: workspace.skill_context()
@@ -273,13 +274,15 @@ exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
 └─ ToolService::for_turn(ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
-     provider: model.capabilities(), execution_mode, execution_control, cancellation, progress_events
+     tool_calling: model.capabilities().tool_calling.clone(),
+     execution_control, cancellation, progress_events
    }) → ToolSet
 
 SkillView.prompt_view()
 + ToolSet.prompt_view()
 + WorkspacePromptContext
-+ exact AgentPrompts / SessionPrompts
++ PromptResourceView
++ exact AgentPromptSelection / SessionPromptSelection
 + TurnModelSnapshot
 → PromptService::for_turn(...)
 → PromptSet
@@ -308,7 +311,7 @@ SkillView.prompt_view()
 - Session pin exact `AgentRevisionRef`，Agent update 不自动改变已有 Session；
 - Session 显式升级 Agent revision 的 CAS 和同 AgentId 约束；
 - Session create、definition update、load/unload、archive/unarchive、delete；
-- `SessionDefinitionRevision` 原子绑定 AgentRevisionRef、Workspace、SessionModelConfig 和 SessionPrompts；
+- `SessionDefinitionRevision`原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection；
 - 一个 Agent 对多个 Session、一个 Session 只绑定一个 AgentId；
 - Agent `Enabled / Disabled / Deleted` 和 Session `Open / Archived / Deleted`；
 - transient `SessionLoadState / SessionReadiness / SessionExecutionState`；
@@ -443,13 +446,13 @@ SessionExecutor NeedModel
 
 - 一个 loaded Session 由一个 `SessionExecutor` 拥有执行期 mutable state；
 - 一个 Runtime 允许多个 SessionExecutor 同时 Running；
-- per-session `SessionIngress` semantic lanes和typed request response；Submit/Steer/FollowUp/Interaction/Tool control各自bounded，Cancel/revocation与lifecycle使用sticky signal，Snapshot使用latest-wins mailbox；
+- per-session `SessionIngress` semantic lanes和typed request response；Submit/Steer/FollowUp/Interaction/Tool control各自bounded，Cancel/SecurityRevoked与lifecycle使用sticky signal，Snapshot使用latest-wins mailbox；
 - `Idle → Starting → Running → Finishing → Idle` 状态机；
 - Context 构造、UserMessage composition、Model 和 Tool 使用异步 `RunningOperation`；
 - operation result 使用 `SessionId + TurnId + execution_version + OperationType` 校验；
 - private AgentLoop 只返回 `NeedModel | NeedTools | Finished`；
 - `ToolExecutionControl` 负责 approval、UserQuestion 和 execution-start 的 required durable ordering；`request_user_question`只在pre-execution ask-user route使用，等待不预留file mutation ticket；
-- Submit、Steer、FollowUp、CancelQueuedMessage、ResolveInteraction、Cancel、Workspace revocation、PrepareForUnload 和 Snapshot 流程；
+- Submit、Steer、FollowUp、CancelQueuedMessage、ResolveInteraction、Cancel、SecurityRevoked、PrepareForUnload和Snapshot流程；
 - FollowUp 使用 bounded process-local FIFO；
 - progress event 与全部mutation/control ingress lane分离；
 - restart 不恢复旧异步操作，unfinished Turn 保守 terminalize；
@@ -457,6 +460,7 @@ SessionExecutor NeedModel
 - lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 - 异步同步不建设全局lock-rank系统：普通guard不跨await/owner调用，release后fan-out；有意的bounded异步串行使用typed permit和私有组合helper。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
 - Cancel在sticky epoch发布后立即返回typed`CancelAccepted`；Session进入Finishing完成write/process/remote Tool结构化收口，期间允许FollowUp排队，旧Turnterminal后再启动下一Turn。完整决策见[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。
+- Workspace definition update只在loaded Session Idle时接受；authority hard restriction通过SecurityRevoked中断Turn并在terminal后重新resolve，不承诺动态撤销open handle。完整决策见[ADR 0121](../adr/0121-workspace-updates-require-idle.md)。
 
 完成门槛：
 
@@ -465,7 +469,7 @@ SessionExecutor NeedModel
 - [x] SessionExecutor 驱动 AgentLoop，但 AgentLoop 不拥有 storage、Prompt assembly 或 Tool execution；
 - [x] append、projection apply、模型可见性、side effect 和 UI event 顺序无歧义；
 - [x] retry、Cancel 和 recovery 不产生重复 terminal fact；
-- [x] 普通work lane满不会阻塞Cancel/revocation signal，Unload有有限grace deadline并最终fail closed；
+- [x] 普通work lane满不会阻塞Cancel/SecurityRevoked signal，Unload有有限grace deadline并最终fail closed；
 - [x] crate-private interface 可以通过 synthetic request/operation result 集成测试；
 - [ ] 通过协同交付束的ordinary/compaction scripted vertical slices；
 - [ ] 实现SessionExecutor和自动化测试。
@@ -755,7 +759,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2新架构由[`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/) + [`docs/adr/`](../adr/)（0100–0120）构成，是当前唯一权威事实来源。
+- V2新架构由[`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/) + [`docs/adr/`](../adr/)（0100–0121，后续继续递增）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
@@ -778,7 +782,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR采用`0100`–`0114`编号，位于[`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress控制/工作lane决策由[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)记录；UserQuestion producer与UI presentation决策由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录；snapshot-first观察协议由[ADR 0114](../adr/0114-runtime-observation-uses-snapshot-first-streams.md)记录。
+- V2 ADR采用`0100+`递增编号，位于[`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress由ADR 0111记录；AgentLoop、file mutation、async synchronization、Cancel、model retry、failure ownership和Workspace Idle-only update分别由ADR 0115–0121记录。
 
 ## 当前迁移状态
 
