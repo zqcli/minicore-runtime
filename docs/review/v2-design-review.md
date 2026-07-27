@@ -172,7 +172,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~Cancel需等待越过`ToolExecutionStarted`的Tool结构化收口，command response和可观察状态绑定terminal~~：**已由ADR 0118关闭**。sticky cancel epoch发布后立即返回`CancelAccepted`并进入Finishing；FollowUp可排队，最终TurnInterrupted通过StateEvent/Snapshot观察。
 - ~~Agent status synchronization 与 WorkspaceCommitAuthorization 两个跨切面同步原语嵌套包裹 initiating append，可能需要全局锁序~~：**已由ADR 0117关闭**。当前single-owner、non-blocking reservation、release-before-fan-out和typed permit使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
-- `assemble_model_context` 为同步 fn，大 context 组装/tokenize 在同步段内阻塞该 executor 控制面 → 随规模评估 offload，或标注为控制面 stall 风险点。
+- ~~`assemble_model_context`为同步fn，大context组装/tokenize可能阻塞该Executor控制面~~：**已随O7关闭**。量化复核确认当前是低成本纯内存线性assembly；保持同步实现，不增加offload、counter或observer。
 - Cancel/revocation 路径产生的 Completed（有 truthful tool message 但无 `tool_round_completed`）永久 conversation-hidden，后续 FollowUp/Steer 模型不可见 → 属预期语义，文档显式点明以免实现者误加补偿逻辑。
 
 ### ModelGateway / Workspace 弹性与取舍
@@ -270,7 +270,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
 | O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
 | O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 已关闭：ADR 0118即时CancelAccepted、复用Finishing并允许FollowUp排队 | — |
-| O7 | 同步Prompt assembly可能阻塞Session控制面 | 仍开放 | P2 |
+| O7 | 同步Prompt assembly可能阻塞Session控制面 | 已关闭：保持同步纯内存assembly，不增加offload或观测机制 | — |
 | O8 | Gateway retry与logical retry无Turn级共享预算 | 仍开放 | P1 |
 | O9 | provider输出违约的错误分类与retry语义未冻结 | 仍开放，与第三轮L1相关 | P1 |
 | O10 | restrictive Workspace update未持久化缺少专用诊断 | 仍开放 | P2 |
@@ -345,11 +345,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 决议：sticky cancel epoch线性化后立即返回typed`CancelAccepted { target, cancel_epoch }`；Executor停止逻辑推进、递增execution_version并进入公开`Finishing`。Model/Context迟到结果丢弃，Tool按write I/O settle、process teardown或remote outcome unknown规则结构化收口。Finishing期间Steer拒绝、FollowUp可Queued、Submit仍SessionBusy；旧Turnterminal后再启动FollowUp Turn。
 - 关闭依据：[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。不新增`TurnExecutionPhase::Cancelling`；UI优先按`SessionExecutionState::Finishing`显示Stopping，最终事实由`turn_interrupted`、条件满足时的`session_settled`与Snapshot表达。Cancel和initiating/final append reservation first-wins，避免accepted后仍提交Started/Completed。
 
-#### O7 · 同步assembly控制面stall
+#### O7 · 同步assembly控制面stall（已关闭）
 
-- 发生场景：长conversation、大ToolResult和复杂token estimate使`assemble_model_context()`执行大对象拼接、hash或token估算；该同步调用位于SessionExecutor的NeedModel路径。
-- 风险：对应Session在assembly期间无法及时处理Cancel、revocation和Snapshot；其他Session不受影响，但单Session控制面响应目标被削弱。
-- 推荐修复：优先把assembly/token estimate作为cancellable `RunningOperation`；若MVP保持同步，则冻结最大输入/CPU预算，超过阈值offload到blocking pool，并发布assembly duration/size diagnostics。
+- 原发生场景：长conversation或大ToolResult使`assemble_model_context()`遍历消息、转换`MessageRecord → ModelMessage`、校验ToolCall/ToolResult、执行字节启发式token estimate并组合fingerprint；该同步调用位于SessionExecutor的NeedModel路径。
+- 量化复核：assembly不执行文件I/O、网络调用或精确tokenizer，静态Prompt/Tool/Skill内容已在PromptSet创建时解析。1000条、总计约1 MB的消息在合理Rust实现中预计约1–10 ms；存在多次遍历或少量序列化时通常约10–30 ms。总字节数比消息条数更影响耗时。
+- 同类产品依据：pi、Codex和Gemini CLI都保留同步conversation转换或字符/字节启发式估算，没有为普通文本assembly建立专用worker/offload。外层async调用链不消除同步CPU段。
+- 决议：保持当前同步`assemble_model_context()`和NeedModel调用流程，不增加`RunningOperation`、blocking pool、work budget、counter或observer。Cancel已由ADR 0118在sticky epoch发布后立即确认；短同步assembly结束后，Executor在启动Model前继续按既有emergency checkpoint处理Cancel/revocation。未来只有真实性能数据证明assembly形成明显延迟时才重新开启该问题。
 
 #### O18 · Model配额的交互延迟隔离
 
@@ -412,6 +413,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 多资源Tool锁序：ADR 0116删除跨Session多资源锁，以Session-local单文件FIFO和Serial批次降级关闭O4；
 - 全局同步原语锁序：ADR 0117确认当前不存在可构造循环等待，以single owner、短guard、typed permit和release-before-fan-out关闭O5；
 - Cancel可观察收口：ADR 0118将Cancel acceptance与Tool settlement分离，立即返回CancelAccepted、复用Finishing并在期间接收FollowUp，关闭O6；
+- Prompt assembly控制面延迟：量化复核确认当前纯内存线性assembly成本较低，保持同步实现并不增加offload、counter或observer，关闭O7；
 - Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
 - public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
 - Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；
