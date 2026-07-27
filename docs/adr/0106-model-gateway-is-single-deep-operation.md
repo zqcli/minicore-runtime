@@ -15,19 +15,19 @@
 - ModelGateway 是 runtime-owned 深模块，对外只暴露两个 `pub(crate)` 操作：
   - `resolve_for_turn(...)` 在 Turn capture 期间返回 immutable `TurnModelSnapshot`，固定 exact model definition、capabilities、effective limits 与 generation policy；catalog revision 变化只影响 future Turn。
   - `generate_model_turn(ModelCallRequest, progress, cancel)` 是唯一真实模型调用 interface，返回一个 terminal `ModelCallResult` 或 typed `ModelCallError`。
-- Gateway拥有并隐藏provider catalog、credential/auth policy、attempt planning、stream lifecycle、same-model retry、transport fallback、usage、cache与continuation；这些都是private implementation detail，不进入MiniCoreRuntime interface。
+- Gateway拥有并隐藏provider catalog、credential/auth policy、single-attempt planning、stream lifecycle、usage、cache与continuation；这些都是private implementation detail，不进入MiniCoreRuntime interface。MVP retry policy由ADR 0119收窄为Gateway single attempt加Session logical retry。
 - ModelGateway 不重新组装 Prompt：PromptSet 产出的 `AssembledModelContext` 是模型上下文的唯一 producer；Gateway 不重新加载 message、不判断 message visibility、不截断或摘要 conversation。
-- active Turn 内禁止 transparent cross-model fallback。同一 exact model identity 下允许 transport fallback（如 WebSocket → HTTP），跨 provider/model 替换必须由显式 Session definition update 或下一 Turn admission 完成。
-- Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只编码并执行一个由Gateway规划好的provider attempt，并把stream/terminal/error映射回MiniCore attempt类型。它不选择provider/model，不决定retry/fallback/cache/continuation policy，也不构造最终`ModelCallResult`。Rig raw types、`additional_params`、SDK error不越过adapter seam。首批实现为RigProviderAdapter与ScriptedProviderAdapter，保证它是真实seam并支持阶段6–8共享vertical-slice tests。
+- active Turn内禁止transparent transport或cross-model fallback。跨transport/provider/model替换必须由显式Session definition update或下一Turn admission完成。
+- Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只编码并执行一个由Gateway规划好的provider attempt，并把stream/terminal/error映射回MiniCore attempt类型。它不选择provider/model，不决定Session logical retry或cache/continuation policy，也不构造最终`ModelCallResult`；SDK automatic retry固定为0。Rig raw types、`additional_params`、SDK error不越过adapter seam。首批实现为RigProviderAdapter与ScriptedProviderAdapter，保证它是真实seam并支持阶段6–8共享vertical-slice tests。
 - 错误分类为 closed taxonomy，足以驱动 retry、compaction recovery（如 `ContextOverflow`）与 terminal failure，caller 不解析 raw message；`RequestOutcomeUnknown`/`StreamInterrupted` 禁止 blind transparent replay。
 - cache、connection reuse 与 continuation 必须保持 full-request equivalence：任何 optimization 都能退回完整 `AssembledModelContext` 请求，它们只是 wire optimization，不是第二 conversation truth。
 
 ## 后果
 
-- caller 只理解完整 request、droppable progress 与一个 terminal result；provider attempt、connection、auth、retry、cache locality 全部集中在 Gateway 内。
+- caller只理解完整request、droppable progress与一个terminal result；provider attempt、connection、auth和cache locality集中在Gateway内，SessionExecutor只理解typed terminal error与logical retry policy。
 - 删除 Gateway 会把 provider 复杂性重新散落到 caller，满足 deep module deletion test。
-- 不引入 `ModelStep`、`ModelAttempt` 领域 entity、provider session public object 或第二 conversation state；transparent retry 与 logical retry 严格分离。
-- Gateway 内部较深，需要 private planner/adapter/connection/retry seam 辅助测试；progress publisher 必须明确 non-authoritative、process-local 语义。
+- 不引入`ModelStep`、`ModelAttempt`领域entity、provider session public object、共享`ModelCallBudget`或第二conversation state。
+- Gateway内部较深，需要private planner/adapter/connection seam辅助测试；progress publisher必须明确non-authoritative、process-local语义。
 - exact model pin 与 full-request equivalence 优先于性能优化，cache/continuation failure 快速退回 full request。
 
 ## 历史
@@ -40,3 +40,5 @@
 - ADR 0013（Driver 接收 DriverTurnInput）
 
 原文见 `docs/archive/v1/adr/`。
+
+Model retry与transport fallback部分由[ADR 0119](0119-model-calls-use-session-logical-retries.md)进一步收窄；本ADR的single deep operation与provider-neutral seam决策保持有效。

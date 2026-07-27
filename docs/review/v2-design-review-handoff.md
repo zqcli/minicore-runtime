@@ -34,6 +34,7 @@ git log --oneline -8
 - `5e21993`：通过ADR 0116/0117关闭O4文件mutation并发和O5异步同步纪律；
 - `60ea813`：通过ADR 0118关闭O6，Cancel立即返回`CancelAccepted`，Finishing期间FollowUp排队，旧Turn结构化收口后再启动下一Turn；
 - 本轮关闭O7：同步Prompt assembly是纯内存线性操作，1000条约1 MB消息预计约1–30 ms；保持当前同步实现，不增加offload、work budget、counter或observer。
+- ADR 0119关闭O8：MVP采用ModelGateway single attempt、SDK retry=0；AgentRun由SessionExecutor最多logical retry 3次，CompactionSummary最多1次，不引入共享ModelCallBudget。
 
 ## 已关闭评审项
 
@@ -43,15 +44,15 @@ git log --oneline -8
 | O5 | ADR 0117：single owner、短guard、typed permit；不建设全局lock rank |
 | O6 | ADR 0118：即时CancelAccepted、Finishing结构化收口、FollowUp等待旧Turnterminal |
 | O7 | 保持同步Prompt assembly；缺少真实性能数据，不增加额外机制 |
+| O8 | ADR 0119：Gateway single attempt，SessionExecutor有限logical retry |
 
 ## 下一步
 
-从O8继续：Gateway transparent retry与SessionExecutor logical retry目前各自有局部上限，可能形成attempt、backoff和总耗时相乘。需要结合pi、Codex、Gemini CLI、OpenHands等实现，判断是否需要Turn-scoped共享`ModelCallBudget`，以及该预算由谁拥有、如何跨Gateway与Executor扣减。
+从O9继续：provider输出违反`OutputContract`时的错误分类与retry语义尚未冻结，并与第三轮AgentLoop评审L1的finish-reason决策表直接相关。
 
-O8完成后依次处理：
+随后依次处理：
 
 ```text
-O9  provider输出违约分类与retry语义
 O11 open-handle revocation窗口
 O12 Workspace/view fingerprint恢复策略
 O14 CompactionSummaryDirective fingerprint coverage
@@ -64,7 +65,7 @@ O15 Prompt正文与PromptFingerprint
 
 - 每个loaded Session只有一个`SessionExecutor`、一个`SessionWriter`、一个current Turn和一个current `RunningOperation`；
 - AgentLoop是crate-private同步sans-I/O状态机，只输出`NeedModel | NeedTools | Finished`；
-- ModelGateway拥有model resolution、credential、retry/fallback、attempt lifecycle和provider-neutral terminal result；
+- ModelGateway拥有model resolution、credential、single-attempt lifecycle和provider-neutral terminal result；SessionExecutor拥有有限logical retry；
 - 文件mutation只在单Session内按canonical file key FIFO，多文件/open-world Tool整批Serial；
 - Cancel可以立即确认业务请求，但已开始write/process/remote Tool必须truthful settlement；
 - Cancel后同Session不立即启动第二Turn，新输入进入FollowUp；

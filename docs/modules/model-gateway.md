@@ -13,7 +13,7 @@
 - System、User、Assistant和Tool role如何映射到不同provider；
 - ToolSpec、tool choice、OutputContract、reasoning和attachments如何编码；
 - streaming delta、finalized response、usage、finish reason和provider metadata如何规范化；
-- provider-internal retry、transport fallback与Session logical retry如何区分；
+- 单次provider attempt与Session logical retry如何区分；
 - cancellation、authentication、secret redaction、并发配额和rate limit如何治理；
 - provider prompt cache、connection reuse和continuation如何保持Transcript-First等价性；
 - Rig 0.40.0可以为provider协议映射与单次attempt调用复用哪些能力，以及这些能力如何被限制在private `ProviderAdapter`内。
@@ -21,7 +21,7 @@
 本文不定义：
 
 - Prompt内容、conversation visibility或`MessageRecord → ModelMessage`转换；
-- Session logical retry、compaction orchestration或Turn terminal规则；
+- Session logical retry、compaction orchestration或Turn terminal规则；本文只摘要Gateway terminal error与该policy的边界，具体规则以Session Execution和ADR 0119为权威；
 - Tool execution、approval或ToolResult持久化；
 - Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
 - provider-native compaction artifact的持久化格式；
@@ -36,6 +36,7 @@
 - [Runtime Interface与公开协议架构设计](runtime-interface.md)
 - [ADR 0104：SessionStorage是durable truth](../adr/0104-session-storage-is-durable-truth.md)
 - [ADR 0106：ModelGateway使用一个深异步调用interface](../adr/0106-model-gateway-is-single-deep-operation.md)
+- [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
 
 ## 决策摘要
 
@@ -49,9 +50,9 @@
 - ModelGateway只编码完整provider-neutral context，不重新决定conversation visibility；
 - `TurnModelSnapshot`固定exact model definition、capabilities、effective limits和generation policy；
 - active Turn内不允许静默替换provider/model identity；
-- provider retry只复用同一个immutable request；
-- transparent retry只允许在adapter证明request未执行、provider明确拒绝或支持idempotent resume时发生；
-- WebSocket → HTTP等transport fallback可以发生，但必须保持同一exact model identity和request semantics；
+- MVP中每次`generate_model_turn`只执行一个provider attempt，Rig和底层provider SDK automatic retry固定为0；
+- ModelGateway不执行transparent retry、401 refresh-and-resend或WebSocket → HTTP transport fallback；
+- SessionExecutor只对同一个immutable request执行最多3次AgentRun logical retry；CompactionSummary最多1次；
 - cross-model fallback不是ModelGateway transparent behavior；
 - streaming progress是process-local observer data，不进入SessionStorage；
 - finalized response或typed error是一次gateway调用唯一terminal result；
@@ -60,7 +61,7 @@
 - prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
 - 所有optimization必须能退回完整`AssembledModelContext`请求；
 - ProviderAdapter是private internal seam，首批实现为RigProviderAdapter和ScriptedProviderAdapter；
-- RigProviderAdapter只负责具体provider的request/stream/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、retry/fallback、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
+- RigProviderAdapter只负责具体provider的request/stream/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
 - 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
 
 ## 同类项目研究
@@ -217,8 +218,8 @@ Rig 0.40.0的integration gaps：
 | provider state | Model/registry + provider module | thread/turn client state | sampler内部 | provider client/model | Gateway内部connection pool |
 | Prompt assembly | AgentSession/AgentLoop context | Turn构造Responses input | chat state/sampling types | CompletionRequest | 只接受PromptSet输出 |
 | streaming | typed content events | typed Responses events | ACP/update stream | typed assistant content stream | droppable progress + one terminal result |
-| retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | provider retry在Gateway，logical retry在Executor |
-| transport fallback | provider-specific | WebSocket → HTTP | backend显式配置 | adapter-specific | 同model transport fallback允许 |
+| retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | Gateway single attempt，SessionExecutor logical retry |
+| transport fallback | provider-specific | WebSocket → HTTP | backend显式配置 | adapter-specific | MVP不启用 |
 | cross-model fallback | model selection层 | 不作为transparent stream fallback | 未确认 | 无统一语义 | active Turn内禁止 |
 | continuation/cache | provider compat/cache flags | strict prefix + previous response | 未确认 | provider additional params | strict equivalence，full request fallback |
 | usage | assistant response usage | terminal response usage | telemetry/model usage | generic Usage | 成功response usage durable |
@@ -237,7 +238,7 @@ ModelGateway::generate_model_turn(request, progress, cancel)
 优点：
 
 - caller只理解完整request、progress和terminal result；
-- provider attempt、connection、auth、retry、cache和continuation全部具有locality；
+- provider attempt、connection、auth、delivery-state mapping、cache和continuation全部具有locality；
 - 与SessionExecutor的`RunningOperation`自然对齐；
 - fake adapter可以通过同一interface测试；
 - 删除Gateway会把大量provider复杂性重新散落到caller，满足deep module deletion test。
@@ -245,7 +246,7 @@ ModelGateway::generate_model_turn(request, progress, cancel)
 代价：
 
 - implementation内部较深；
-- 需要private planner、adapter、connection和retry seams辅助测试；
+- 需要private planner、adapter和connection seams辅助测试；
 - progress publisher必须明确non-authoritative语义。
 
 ### 方案B：公开prepare/execute两阶段
@@ -299,14 +300,17 @@ MiniCoreRuntime
    ├─ private ProviderAdapter
    ├─ ProviderConnectionPool
    ├─ ContinuationCache
-   ├─ RetryPolicy
+   ├─ ProviderRateLimitState
    └─ RedactionPolicy
 
 SessionExecutor
-└─ RunningOperation::GenerateModelResponse
-   ├─ immutable ModelCallRequest
-   ├─ scoped ProgressEventPublisher<ModelProgressEvent>
-   └─ CancellationToken
+├─ RunningOperation::GenerateModelResponse
+│  ├─ immutable ModelCallRequest + logical_retry_count
+│  └─ scoped ProgressEventPublisher<ModelProgressEvent>
+├─ RunningOperation::WaitForModelRetry
+│  └─ same ModelCallRequest + ready_at + typed resume basis
+└─ RunningOperation::CompactConversation
+   └─ immutable CompactionSummary ModelCallRequest + logical_retry_count
 ```
 
 规则：
@@ -343,7 +347,7 @@ impl ModelGateway {
 
 `resolve_for_turn`只访问已经初始化的provider/model catalog，不读取credential。catalog refresh是Runtime lifecycle操作，不在Turn capture期间隐式执行remote I/O。
 
-`generate_model_turn`执行完整provider调用。调用期间可以等待provider并发permit、auth refresh、retry delay和stream，但它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。
+`generate_model_turn`最多执行一个完整provider attempt。admitted调用期间可以等待provider并发permit、request前credential resolve/refresh和stream，但它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。provider terminal error返回SessionExecutor后，本次Gateway operation结束；Gateway不内联retry timer。
 
 不提供：
 
@@ -669,7 +673,7 @@ purpose：
 - 原样传播到usage和diagnostics；
 - 不是retry classification；
 - 不是foreground/background状态；
-- 不因transport fallback、auth refresh或logical retry改变。
+- 不因request前credential refresh或Session logical retry改变。
 
 `CompactionSummary`额外要求：
 
@@ -709,7 +713,7 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 }
 ```
 
-该trait是ModelGateway private internal seam，不进入MiniCoreRuntime interface。一次`execute`只执行一个由ModelGateway规划好的provider attempt。`ProviderContentPublisher`只能发布该attempt内的content delta；AttemptStarted、RetryScheduled和AttemptDiscarded由ModelGateway本身发布，adapter不能伪造retry lifecycle。
+该trait是ModelGateway private internal seam，不进入MiniCoreRuntime interface。一次`generate_model_turn`最多调用一次`execute`，一次`execute`只执行一个由ModelGateway规划好的provider attempt。`ProviderContentPublisher`只能发布该attempt内的content delta；adapter和底层SDK都不能自行重试。
 
 ProviderAdapter可以：
 
@@ -722,7 +726,7 @@ ProviderAdapter不能：
 
 - 选择或替换provider/model，解析catalog current value或改变Turn-pinned model identity；
 - 重新组装Prompt、判断conversation visibility或执行Tool；
-- 决定transparent retry、transport fallback、logical retry、cache/continuation policy或terminal Turn结果；
+- 决定logical retry、执行transport fallback、cache/continuation policy或terminal Turn结果；
 - 发布ModelGateway attempt lifecycle、构造最终`ModelCallResult`或把Rig raw type泄漏给caller。
 
 首个production实现：
@@ -749,7 +753,7 @@ ProviderAttemptRequest可以包含：
 - provider-specific typed options；
 - canonical encoded payload；
 - connection/continuation candidate；
-- attempt ordinal。
+- single-attempt request correlation。
 
 这些类型都必须private、non-serializable并使用redacted Debug。
 
@@ -763,13 +767,13 @@ ModelCallRequest
 → private ProviderAttemptRequest
 → RigProviderAdapter encode并执行一个provider attempt
 → ProviderAttemptResult或ProviderAttemptError
-→ ModelGateway retry/fallback仲裁与terminal归一化
+→ ModelGateway terminal归一化
 → FinalizedAssistantResponse或ModelCallError
 ```
 
 RigProviderAdapter不被限制为generic `CompletionModel::stream`。当generic类型擦除finish reason、request ID或reasoning artifact时，adapter可以使用Rig公开的provider-specific request/response types；这些类型仍不能越过private adapter。
 
-RigProviderAdapter是provider attempt adapter，不是ModelGateway implementation的替代品。它不拥有provider选择、attempt调度、重试/回退策略、cache/continuation判定或最终错误分类。
+RigProviderAdapter是provider attempt adapter，不是ModelGateway implementation的替代品。它不拥有provider选择、logical retry、cache/continuation判定或最终错误分类。Rig和provider SDK的内建retry必须显式配置为0；spike无法证明这一点时不得冻结production adapter。
 
 映射要求：
 
@@ -804,22 +808,9 @@ Rig spike必须验证：
 
 ```rust
 pub enum ModelProgressEvent {
-    AttemptStarted {
-        ordinal: NonZeroU16,
-    },
     ContentDelta {
-        ordinal: NonZeroU16,
         content_index: u32,
         delta: ModelContentDelta,
-    },
-    RetryScheduled {
-        next_ordinal: NonZeroU16,
-        delay: Duration,
-        reason: ModelCallErrorKind,
-    },
-    AttemptDiscarded {
-        ordinal: NonZeroU16,
-        reason: AttemptDiscardReason,
     },
 }
 ```
@@ -838,7 +829,7 @@ pub enum ModelContentDelta {
 
 - scoped publisher是process-local；AgentRun adapter必须先无损更新`StreamingItem`和ItemId映射，之后的Host ProgressEvent enqueue才是bounded、可合并/丢弃的observer路径；CompactionSummary adapter不创建ItemId；
 - publisher由RunningOperation scope到SessionId/TurnId；SessionExecutor创建的AgentRun adapter使用`content_index`维护`StreamingItem`并分配MiniCore ItemId；
-- ModelGateway只发布provider-neutral attempt ordinal、content index和delta，不创建ItemId，也不接收SessionId或TurnId；
+- ModelGateway只发布provider-neutral content index和delta，不创建ItemId，也不接收SessionId或TurnId；Session logical retry由SessionExecutor发布`model_retry_scheduled`；
 - 连续text/reasoning delta可以合并；
 - Host progress queue满可以丢弃中间delta，但不能跳过operation-local累积；
 - Host progress sink关闭不取消provider调用或operation-local累积；
@@ -868,7 +859,6 @@ opaque encrypted reasoning artifact
 ```rust
 pub struct ModelCallResult {
     pub response: FinalizedAssistantResponse,
-    pub transparent_retry_count: u32,
     pub diagnostics: Arc<[ModelCallDiagnostic]>,
 }
 
@@ -981,24 +971,28 @@ pub struct ModelUsage {
 - `reported_cost`只用于provider明确返回billed cost的情况；
 - successful response usage随对应assistant entry保存；
 - Session total usage由assistant/compaction entries replay重建；
-- transparent retry只允许delivery state证明NotSent/RejectedBeforeExecution，或provider支持idempotent replay/exact resume；usage是否出现不能作为retry safety判断；
+- 每次Gateway operation最多一个provider attempt；usage是否出现不能代替delivery-state分类，也不能把不确定outcome降级成普通transient error；
 - provider若为失败attempt报告usage，该事实只进入ModelGateway internal telemetry；不放入ModelCallError、不进入Session aggregate，也不创建synthetic assistant或独立Usage entry；
 - 因此MiniCore SessionStorage不是provider billing ledger。
 
-`transparent_retry_count`只记录Gateway内部额外attempt数量。StoredAssistantMessage的`retry_count`定义为SessionExecutor对同一logical call执行的logical retry数量，不混入transparent retry。
+StoredAssistantMessage的`retry_count`定义为SessionExecutor对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
 
 ## Retry
 
-### Provider-Internal Retry
+### Single Provider Attempt
 
-ModelGateway可以处理：
+MVP中一次`generate_model_turn`最多执行一个provider attempt：
 
-- DNS/connect/TLS失败；
-- provider connection establishment失败；
-- 有界401 auth refresh；
-- adapter确认没有开始model execution的provider rejection和short rate-limit delay；
-- WebSocket upgrade失败后切换HTTP；
-- provider-supported idempotent replay或exact resume。
+```text
+validate request
+→ resolve/refresh credential before request
+→ preflight/cooldown typed terminal error：0次ProviderAdapter.execute
+  或
+→ acquire permits → ProviderAdapter.execute exactly once
+→ normalize one terminal result or typed error
+```
+
+Rig和底层provider SDK automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由SessionExecutor根据typed error决定是否logical retry。
 
 每个ProviderAttemptError必须携带private delivery state：
 
@@ -1012,19 +1006,11 @@ pub(crate) enum ProviderRequestDeliveryState {
 }
 ```
 
-HTTP status或“尚无delta”本身不能决定delivery state。只有adapter根据protocol contract、provider response和transport阶段证明`NotSent`或`RejectedBeforeExecution`时才能普通transparent retry。`AcceptedNoOutput`和`OutputStarted`只有在provider支持相同idempotency key或exact resume时才能继续；`Unknown`必须返回`RequestOutcomeUnknown`。
+HTTP status或“尚无delta”本身不能决定delivery state。adapter必须根据protocol contract、provider response和transport阶段准确映射：已发送但outcome不确定时返回`RequestOutcomeUnknown`，已发布partial output后失败返回`StreamInterrupted`。该proof决定SessionExecutor能否安全logical retry，不能因为Gateway不内联retry而省略。
 
-必须满足：
+只有`NotSent`和provider明确证明未开始执行的`RejectedBeforeExecution`可以映射为默认retryable kind。`AcceptedNoOutput`若没有更强的provider terminal proof必须映射`RequestOutcomeUnknown`；不能把“还没收到delta”当作未执行证明。
 
-```text
-same TurnModelSnapshot
-same ModelCallPurpose
-same AssembledModelContext
-same max_output_tokens
-same provider/model identity
-```
-
-每次`generate_model_turn`在Gateway内部创建process-local ProviderInvocationId。支持idempotency key的provider在transparent retry中复用该key；该ID不进入ModelCallRequest、领域模型或SessionStorage。
+每次`generate_model_turn`在Gateway内部创建process-local ProviderInvocationId；该ID只关联本次single attempt，不进入ModelCallRequest、领域模型或SessionStorage。
 
 每次attempt：
 
@@ -1037,54 +1023,45 @@ same provider/model identity
 7. normalize terminal result；
 8. release permits。
 
-retry delay和auth refresh期间不持有model concurrency permit。provider返回401时先释放permits，再进入singleflight refresh，然后创建新attempt。
+request前credential resolve/refresh不持有model concurrency permit。provider返回401时释放permit并terminal为`AuthRejected`，不在本次Gateway operation中refresh-and-resend。
 
 ### Semantic Delta Rule
 
 默认规则：
 
-- delivery state为NotSent或RejectedBeforeExecution时，可以按policy transparent retry；
-- AcceptedNoOutput或OutputStarted只有provider-supported idempotent replay/exact resume时才能transparent继续；
-- request已经发送但尚无response，delivery outcome不确定时返回`RequestOutcomeUnknown`，不能仅因没有delta就blind retry；
+- `NotSent`或`RejectedBeforeExecution`映射为具体typed transient error和optional `retry_after`，交给SessionExecutor裁决；
+- `AcceptedNoOutput`缺少明确pre-execution rejection proof时映射`RequestOutcomeUnknown`；
+- request已经发送但尚无response，delivery outcome不确定时返回`RequestOutcomeUnknown`；
 - 第一个model-visible delta发布后，普通restart可能重复text、tool call或billing，因此返回`StreamInterrupted`；
-- 只有provider adapter能证明exact resume且不会重复semantic content时才允许继续同一attempt；
-- MVP Rig adapter不假设支持exact resume；
+- MVP不执行exact resume或stream restart；
 - progress中已经发布的StreamingItem由SessionExecutor在terminal error后丢弃，不生成Completed Item。
 
-### Authentication Retry
+### Authentication
 
 - AuthMissing不重试；
-- AuthRejected可以触发一次singleflight refresh；
-- refresh成功后只重试一次；
-- refresh失败或第二次401返回AuthRejected；
-- credential每个attempt即时resolve，不pin access token到TurnModelSnapshot；
+- credential在single attempt前即时resolve，必要的token refresh可以singleflight完成，不pin access token到TurnModelSnapshot；
+- provider返回401后直接返回AuthRejected，不在Gateway内部重发；
 - refresh log和error不得包含token。
 
 ### Rate Limit
 
-- 尊重typed Retry-After；
-- 无Retry-After时使用bounded exponential backoff + jitter；
-- total attempts和elapsed time都有限制；
-- cancellation中止backoff；
+- Gateway规范化typed `Retry-After`但不sleep；
+- SessionExecutor只在provider hint不超过60秒时按logical retry policy等待；
 - rate-limit state按provider route和auth principal的opaque identity隔离；
-- 不把一个provider的cooldown应用到无关provider。
+- active cooldown只对对应route/principal快速返回`RateLimited { retry_after }`，Gateway本身不sleep，也不影响无关provider。
 
 ### Transport Fallback
 
-允许：
+MVP不执行transparent transport fallback：
 
 ```text
-same OpenAI Responses model
 WebSocket → HTTP SSE
-```
-
-不允许作为transparent fallback：
-
-```text
 provider A/model X → provider B/model Y
 model X → model Z
 Responses model → capability不同的Chat Completions model
 ```
+
+首个production adapter应选择一个明确transport。任何transport/model替换都留到future Turn或显式Session definition update；不能在active Turn内静默完成。
 
 跨模型替换会改变capabilities、limits、cost和输出行为，破坏Turn-pinned exact Model。需要替换时：
 
@@ -1095,7 +1072,7 @@ Responses model → capability不同的Chat Completions model
 
 ### Session Logical Retry
 
-Gateway返回exhausted typed error后，SessionExecutor决定logical retry：
+Gateway single attempt返回typed error后，SessionExecutor决定logical retry：
 
 ```text
 TurnId/execution_version unchanged
@@ -1111,11 +1088,20 @@ AssembledModelContextFingerprint unchanged
 logical retry：
 
 - 不阻塞SessionIngress scheduler或control loop；
-- Steer、Cancel、Compaction或conversation change使其失效；
+- Steer、Cancel、成功Compaction Replace或conversation change使其失效；
 - 计入StoredAssistantMessage.retry_count；
 - 不创建ModelAttempt entity；
-- 不改变ModelCallPurpose。
+- 不改变ModelCallPurpose；
 - 不与旧本地Model future重叠；provider端可能继续工作或计费不等于旧future仍可回传SessionExecutor。
+
+默认policy：
+
+| Purpose | 最大logical retries | Backoff |
+| --- | ---: | --- |
+| AgentRun | 3 | 2s、4s、8s |
+| CompactionSummary | 1 | 2s |
+
+自动retry必须同时满足delivery proof为`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`。`AcceptedNoOutput`没有明确pre-execution rejection proof时归一化为`RequestOutcomeUnknown`。`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全和协议错误默认不自动retry；`ContextOverflow`进入Compaction。完整决策见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
 ## Cancellation
 
@@ -1123,8 +1109,7 @@ ModelGateway在以下位置检查CancellationToken：
 
 - resolution validation后；
 - concurrency wait期间；
-- auth resolution和refresh前后；
-- retry delay期间；
+- auth resolution和request前refresh前后；
 - provider request开始前；
 - stream read期间，直到provider terminal event被adapter接受。
 
@@ -1139,8 +1124,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 
 ```text
 cancel token fires
-→ 停止新attempt
-→ 取消retry timer/concurrency wait
+→ 取消concurrency wait或当前single attempt
 → 调用Rig stream.cancel或transport abort
 → 停止发布新progress
 → 返回ModelCallErrorKind::Cancelled
@@ -1163,7 +1147,6 @@ pub struct ModelCallError {
     pub kind: ModelCallErrorKind,
     pub message: RedactedErrorMessage,
     pub retry_after: Option<Duration>,
-    pub transparent_retry_count: u32,
     pub diagnostics: Arc<[ModelCallDiagnostic]>,
 }
 ```
@@ -1196,19 +1179,19 @@ pub enum ModelCallErrorKind {
 | --- | --- | --- |
 | Cancelled | 停止attempt | Cancel/revocation/version规则；普通Steer不取消attempt |
 | ModelUnavailable | 不替换模型 | TurnFailed或要求SetModel |
-| AuthMissing/AuthRejected | 有界refresh后返回 | user action / TurnFailed |
-| RateLimited | 有界retry | 可按logical retry policy等待 |
+| AuthMissing/AuthRejected | 不重发；401直接AuthRejected | user action / TurnFailed |
+| RateLimited | 返回typed Retry-After | hint <= 60s时可logical retry |
 | QuotaExceeded | 不自动retry | user action / TurnFailed |
 | ContextOverflow | 不改Prompt | bounded compaction recovery |
 | UnsupportedCapability | provider调用前拒绝 | configuration failure |
 | InvalidRequest | provider调用前或400 mapping | implementation/config failure |
 | SafetyBlocked | 不自动retry | truthful terminal response/error policy |
-| Timeout | 有界retry | logical retry或TurnFailed |
-| TransportUnavailable | 有界retry/transport fallback | logical retry或TurnFailed |
-| ProviderUnavailable | 有界retry | logical retry或TurnFailed |
+| Timeout | 仅`NotSent`/`RejectedBeforeExecution`时映射；single attempt terminal | logical retry或TurnFailed |
+| TransportUnavailable | 仅`NotSent`/`RejectedBeforeExecution`时映射；single attempt terminal | logical retry或TurnFailed |
+| ProviderUnavailable | 仅`NotSent`/`RejectedBeforeExecution`时映射；single attempt terminal | logical retry或TurnFailed |
 | ProviderRejected | 不解析raw string | TurnFailed/diagnostic |
-| RequestOutcomeUnknown | 不transparent replay | explicit logical retry policy，提示可能重复provider work/cost |
-| StreamInterrupted | 不blind restart | logical retry only after draft discard |
+| RequestOutcomeUnknown | 不重放 | 默认TurnFailed，提示可能重复provider work/cost |
+| StreamInterrupted | 不重启stream | 丢弃draft并默认TurnFailed |
 | ProtocolViolation | fail closed | TurnFailed + diagnostic |
 
 规则：
@@ -1218,7 +1201,8 @@ pub enum ModelCallErrorKind {
 - error message必须redacted、bounded且provider-neutral；
 - provider status、request ID等只作为allowlisted diagnostic；
 - ContextOverflow必须与Prompt本地size validation保留不同source；
-- SafetyBlocked和Refused response的最终建模必须由adapter根据provider protocol一致处理。
+- SafetyBlocked和Refused response的最终建模必须由adapter根据provider protocol一致处理；
+- `Timeout`、`TransportUnavailable`和`ProviderUnavailable`只有在delivery proof为`NotSent`或`RejectedBeforeExecution`时才能保持该retryable kind；`AcceptedNoOutput`没有明确pre-execution rejection proof时、以及其他outcome unknown都必须映射`RequestOutcomeUnknown`，已有semantic delta必须映射`StreamInterrupted`。
 
 ## Authentication And Secret Redaction
 
@@ -1262,7 +1246,7 @@ logs或Debug output
 - ResolvedAuth不实现revealing Debug/Display/Serialize；
 - headers和URL query在diagnostics前redact；
 - API key、OAuth token、cookie和signed URL使用typed secret wrappers；
-- auth refresh使用singleflight，避免并发请求重复refresh；
+- request前auth resolve/refresh使用singleflight，避免并发请求重复refresh；401后不重发；
 - custom provider auth reference只能来自user-global trusted config；
 - project Workspace不能注册base URL、headers或credential source；
 - Runtime hook未来只能看到provider-neutral redacted request summary；
@@ -1393,10 +1377,9 @@ optional per-auth-principal limit
 
 - permit wait cancellation-aware；
 - fairness至少保证FIFO admission或等价无饥饿策略；
-- 不在retry backoff期间持有permit；
 - streaming request持有permit到terminal/cancel；
-- auth refresh有独立singleflight，不占用全部model permits；
-- provider cooldown只影响对应route/principal；
+- request前auth refresh有独立singleflight，不占用全部model permits；
+- provider cooldown只对对应route/principal fast-fail，不在Gateway内等待；
 - 一个Session不能耗尽全部Runtime capacity；
 - limits是Runtime policy，不进入ModelCallPurpose或conversation fingerprint；
 - progress publisher阻塞不能占用provider stream读取。
@@ -1443,11 +1426,10 @@ AgentLoop NeedModel
 ```text
 provider stream
 connection
-retry timer
 ContinuationCache
 resolved credential
 partial draft
-transparent attempt state
+single-attempt state
 ```
 
 unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage durable truth重新assemble full context并建立新provider request。
@@ -1460,7 +1442,7 @@ unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage dur
 - 未取得terminal finalized response时不能创建synthetic assistant message；
 - partial draft不持久化；
 - request已发送但尚未开始response时映射为RequestOutcomeUnknown；已产生partial response后映射为StreamInterrupted；
-- SessionExecutor可以在不重放Tool且logical call basis不变时决定retry；
+- `RequestOutcomeUnknown`和`StreamInterrupted`默认禁止logical retry；SessionExecutor只能对Gateway已经证明delivery-safe的typed error应用ADR 0119 policy；
 - duplicate assistant prevention依赖只有terminal ModelCallResult才能append；重复append的防护靠committed prefix状态（该assistant entry是否已存在）判断，不依赖durable operation key。
 
 ### Projection/Storage Failure
@@ -1508,15 +1490,15 @@ headers
 base URL
 provider SDK object
 partial stream
-transparent attempt list
-retry timer
+provider attempt trace
+SessionExecutor `WaitForModelRetry` timer
 connection/continuation state
 full AssembledModelContext
 ```
 
 首版automatic SummaryModel compaction把model/response/usage/finish/logical-retry、requested max output、CompactionSummaryBudget fingerprint和assembled context fingerprint保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
 
-`retry_count`只表示Session logical retry。Gateway transparent retry count可以进入current-host diagnostics，但不作为domain lifecycle。
+`retry_count`只表示Session logical retry。Gateway没有transparent retry count。
 
 Provider response ID和reasoning opaque artifact必须有长度限制和redaction validation。
 
@@ -1530,8 +1512,7 @@ Provider response ID和reasoning opaque artifact必须有长度限制和redactio
 - provider/model concurrency有界；
 - progress delta可以合并；
 - provider stream reader不等待slow observer；
-- retry backoff不占permit；
-- auth refresh singleflight；
+- request前auth refresh singleflight；
 - cache/continuation failure快速退回full request；
 - 不因optimization额外复制完整conversation多次。
 
@@ -1552,10 +1533,8 @@ ModelCallDiagnostic是bounded、redacted、provider-neutral value：
 model definition ref
 adapter kind
 transport kind
-attempt ordinal
 timing category
 status class
-retry reason
 cache hit/miss/unsupported
 continuation used/full-request fallback
 request/response allowlisted IDs
@@ -1630,27 +1609,29 @@ opaque encrypted reasoning
 
 ### Retry
 
-- connect failure before request send透明重试；
-- NotSent/RejectedBeforeExecution允许policy retry；
-- AcceptedNoOutput/OutputStarted只在idempotent replay/exact resume时继续；
-- request delivery outcome unknown不透明重试；
-- generic 408/429/5xx或no-delta不能单独证明safe retry；
-- 401 singleflight refresh一次；
-- 429 Retry-After；
-- exponential backoff + jitter上限；
-- retry delay不持有permit；
-- first semantic delta后普通failure不blind retry；
-- WebSocket → HTTP保持same model/request；
+- admitted request每次generate_model_turn只调用一次ProviderAdapter.execute；preflight validation或active route/principal cooldown可以在provider调用前以typed error terminal，因此总调用数为0或1；
+- Rig和provider SDK automatic retry固定为0；
+- connect failure、429、5xx和timeout都以typed error terminal返回Gateway caller；
+- delivery state准确区分NotSent、RejectedBeforeExecution、AcceptedNoOutput、OutputStarted和Unknown；
+- request delivery outcome unknown返回RequestOutcomeUnknown；
+- first semantic delta后failure返回StreamInterrupted；
+- 401不refresh-and-resend；request前credential refresh可以singleflight；
+- 429返回typed Retry-After，Gateway不sleep；
+- active cooldown零provider attempt并返回typed Retry-After，但仍算当前logical call chain的一次Gateway invocation；若该调用由retry启动，对应retry_count已经消耗；
+- MVP不做WebSocket → HTTP fallback；
 - 不允许provider/model substitution；
-- exhausted error交给Session logical retry；
+- AgentRun最多3次Session logical retry，backoff 2s/4s/8s；
+- CompactionSummary最多1次Session logical retry，backoff 2s；
+- RequestOutcomeUnknown和StreamInterrupted默认不logical retry；
+- 仅`NotSent`/`RejectedBeforeExecution`的Timeout/TransportUnavailable/ProviderUnavailable允许logical retry；AcceptedNoOutput和unsafe/unknown outcome必须归一化为RequestOutcomeUnknown或StreamInterrupted；
+- Retry-After <= 60s时实际delay取purpose backoff与hint较大值，超过60s不调度；
 - Steer/Cancel使logical retry失效。
 
 ### Cancellation
 
 - cancel before permit；
 - cancel during permit wait；
-- cancel duringauth resolve/refresh；
-- cancel during backoff；
+- cancel during auth resolve/request前refresh；
 - cancel before request start；
 - cancel during stream；
 - provider terminal先于cancel时Gateway完成result；SessionExecutor仍可因version/cancel拒绝；
@@ -1664,7 +1645,7 @@ opaque encrypted reasoning
 - no local estimate in ModelUsage；
 - failed attempt usage只进ModelGateway internal telemetry，不进入ModelCallError或Session aggregate；
 - successful response usage随assistant保存；
-- logical retry_count与transparent retry count分离；
+- logical retry_count准确记录0–3（AgentRun）或0–1（CompactionSummary）；
 - Stop/ToolCalls/Length/ContentFiltered/Refused/Unknown；
 - generic Rig缺finish reason时provider-specific extraction；
 - response ID长度和字符validation。
@@ -1672,7 +1653,7 @@ opaque encrypted reasoning
 ### Auth And Redaction
 
 - AuthMissing/AuthRejected；
-- OAuth refresh并发singleflight；
+- request前OAuth refresh并发singleflight，401后不重发；
 - Debug/Display/Serialize不泄漏secret；
 - raw error body redaction；
 - URL/header redaction；
@@ -1696,10 +1677,10 @@ opaque encrypted reasoning
 - global/provider/model limits；
 - fairness/no starvation；
 - one Session cancellation不影响另一个；
-- one provider cooldown不影响另一个；
+- one provider cooldown只fast-fail对应route/principal，不影响另一个；
 - slow progress observer不阻塞stream；
 - connection pool按endpoint/auth principal隔离；
-- slow credential resolution/auth refresh不持有或耗尽model permits；
+- slow credential resolution/request前auth refresh不持有或耗尽model permits；
 - per-auth-principal permit在opaque principal解析后获取。
 
 ### Real Adapter Integration
@@ -1727,7 +1708,6 @@ src/model_gateway/error.rs
 src/model_gateway/catalog.rs
 src/model_gateway/auth.rs
 src/model_gateway/concurrency.rs
-src/model_gateway/retry.rs
 src/model_gateway/cache.rs
 src/model_gateway/continuation.rs
 src/model_gateway/redaction.rs
@@ -1789,7 +1769,7 @@ src/model_gateway/provider/scripted.rs
 - [x] 定义ToolSpec、tool choice和OutputContract mapping。
 - [x] 定义stream progress和finalized response。
 - [x] 定义usage、finish reason和provider metadata。
-- [x] 定义provider retry、transport fallback和logical retry边界。
+- [x] 定义single provider attempt与Session logical retry边界，MVP禁用Gateway transparent retry和transport fallback。
 - [x] 禁止active Turn cross-model fallback。
 - [x] 定义cancellation、auth、redaction和custom provider规则。
 - [x] 定义cache、connection reuse和continuation等价性规则。

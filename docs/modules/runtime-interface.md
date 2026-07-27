@@ -1000,7 +1000,6 @@ reasoning_started
 reasoning_delta
 tool_output_delta
 model_retry_scheduled
-model_attempt_progress
 ```
 
 规则：
@@ -1280,7 +1279,7 @@ Transport Adapter不负责：
 - command parse/authorization；
 - Session state；
 - Tool approval policy；
-- provider retry；
+- model logical retry policy；
 - storage truth。
 
 Presentation Adapter与Transport Adapter可以由同一个host实现，但职责不同：Presentation Adapter决定modal、聊天卡片、终端菜单、表单文案与本地交互；Transport Adapter只传输Runtime已定义的request/resolution。两者都不拥有MiniCore Interaction truth。
@@ -1506,7 +1505,7 @@ Public interface是 contract test surface。
 
 优点：单一stream看似可以同时驱动模型与UI。
 
-缺点：streaming/progress、provider retry和UI状态会污染Session durable truth；ToolRoundCompleted模型可见性无法安全表达。
+缺点：streaming/progress、model logical retry和UI状态会污染Session durable truth；ToolRoundCompleted模型可见性无法安全表达。
 
 结论：不采用。SessionStorage是durable truth；committed-derived StateEvent从durable projection派生，process-local StateEvent从当前Runtime/Executor view派生，两者都不成为event log。
 

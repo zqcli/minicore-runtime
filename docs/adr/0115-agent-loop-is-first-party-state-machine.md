@@ -26,7 +26,7 @@ Turn execution 内部的 AgentLoop 是 sans-I/O 推理协议状态机，只在 `
 ## 决定
 
 1. **AgentLoop 是 MiniCore 自研的 crate-private 同步 sans-I/O 状态机**，不由 Rig 或其他 SDK 驱动。
-2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**：它只编码并执行一个由ModelGateway规划好的provider attempt，桥接stream/cancellation，并提取finish reason、usage和allowlisted metadata。model resolution、request validation、auth policy与credential resolution、retry/fallback、cache/continuation policy、错误分类和最终`ModelCallResult`仍由ModelGateway拥有。Rig 0.40.0 spike 的门禁范围同步收窄为provider mapping验证，不再评估Rig sans-I/O AgentRun。
+2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**：它只编码并执行一个由ModelGateway规划好的provider attempt，桥接stream/cancellation，并提取finish reason、usage和allowlisted metadata；SDK automatic retry固定为0。model resolution、request validation、auth policy与credential resolution、cache/continuation policy、错误分类和最终`ModelCallResult`由ModelGateway拥有，logical retry由SessionExecutor拥有（ADR 0119）。Rig 0.40.0 spike 的门禁范围同步收窄为provider mapping验证，不再评估Rig sans-I/O AgentRun。
 3. **crate-private interface 维持 `session-execution.md` 既有形状不变**：`next_action()`、`accept_model_response()`、`accept_committed_tool_round()`、`accept_committed_steer()` 与 `AgentLoopAction { NeedModel | NeedTools | Finished }`。不新建 public trait、`AgentLoopFactory` 或 registry；「第二个真实实现出现才建立稳定 seam」的既有原则不变。
 4. **内部状态机冻结为三态**：
 

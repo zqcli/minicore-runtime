@@ -83,7 +83,7 @@ MiniCore 不复制：
 - `tool_round_completed`引用一个assistant entry及其全部ordered tool entries，并作为complete ToolRound进入conversation projection的required record；
 - Interaction request/resolution、Tool execution-start 和 Tool abandoned使用 durable event；
 - Runtime observer event 从 committed entry receipt派生，不原样写入 Session ledger；
-- streaming delta、Tool progress、provider retry attempt 和 transient phase不持久化；
+- streaming delta、Tool progress、failed provider attempt和transient phase不持久化；
 - `CommittedConversationState` 只能由 replay或成功应用 trusted entry delta推进；
 - compaction 是独立 entry并执行 conversation Replace；
 - fork deep-copy selected parent path并 remap target-local identities；
@@ -437,7 +437,7 @@ pub enum AssistantContent {
 - Final assistant entry append是Completed Turn的结束线性化点；
 - Final append前必须验证Turn仍Running、没有Pending Interaction或Started ToolInvocation、没有尚未被`tool_round_completed`引用的ToolCall Intermediate entry，且SessionExecutor已观察最新EmergencyControl/authorization并完成current Turn Steer FIFO检查；
 - usage属于该逻辑模型响应，不另写TokenCount event；
-- retry_count只表示SessionExecutor对同一logical call执行的logical retry数量，不包含ModelGateway transparent attempt；
+- retry_count只表示SessionExecutor对同一logical call执行的logical retry数量；AgentRun范围为0–3，ModelGateway每个operation最多一个provider attempt；trusted writer和cold replay semantic validation都拒绝大于3的值；
 - provider_metadata只保存allowlisted bounded code/request ID，不保存raw response、headers、endpoint或payload；
 - Session total usage由assistant entries和带model_call的Compaction entries重建为projection/cache。
 
@@ -543,7 +543,7 @@ Runtime public event必须从成功append并apply的entry receipt派生。Sessio
 stream delta
 Tool progress
 Sampling / ExecutingTools / WaitingApproval phase
-每次provider retry
+每次model logical retry
 queue update
 heartbeat
 普通observer notification
@@ -691,7 +691,7 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 - compaction只追加overlay，不重写旧entries；
 - navigating/forking到compaction前的entry自然不应用该compaction；
 - 首版automatic Compaction固定`turn_id = Some(active TurnId)`且必须保存SummaryModel `model_call`；`None`只为未来maintenance/deterministic method预留；
-- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和retry语义；requested max output与summary budget fingerprint必须是合法、可round-trip的durable值。validated plan/directive/model-limit的一致性只在entry落盘前由Compaction、Prompt assembly、ModelCallRequest和SessionExecutor append gate共同证明；cold replay不重新声称验证已消失的临时plan或limits；
+- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和field meaning，但使用CompactionSummary的0–1 bound；requested max output与summary budget fingerprint必须是合法、可round-trip的durable值。validated plan/directive/model-limit的一致性只在entry落盘前由Compaction、Prompt assembly、ModelCallRequest和SessionExecutor append gate共同证明；cold replay不重新声称验证已消失的临时plan或limits；
 - physical retention/vacuum与conversation compaction分离。
 
 完整planning、protection和failure规则见[Compaction架构设计](compaction.md)。
@@ -1289,7 +1289,7 @@ content-addressed DAG
 - assistant intermediate含多个ToolCall；text/reasoning-only Continue Intermediate直接进入conversation但Turn保持Running；
 - reasoning text/encrypted/signature round-trip；
 - usage/model/response ID/finish reason/allowlisted provider metadata round-trip；
-- logical retry_count不混入ModelGateway transparent retry；
+- logical retry_count准确round-trip；assistant值大于3、CompactionSummary值大于1 fail closed；ModelGateway没有transparent retry count；
 - Interaction request-before-notify；
 - resolution-before-wake；
 - ToolExecutionStarted before side effect；
@@ -1353,6 +1353,6 @@ content-addressed DAG
 
 1. exact Rust serde tags/field casing，以及未来format v2+ migration policy；
 2. ModelGateway private `RigProviderAdapter`如何把单次provider attempt映射为finalized assistant response及ordered content（AgentLoop只消费MiniCore类型，见ADR 0115）；
-3. `RigProviderAdapter`如何提取各provider的finish reason、reasoning artifact和allowlisted response metadata；retry/fallback与最终错误分类仍由ModelGateway拥有；
+3. `RigProviderAdapter`如何提取各provider的finish reason、reasoning artifact、delivery state和allowlisted response metadata；SDK retry固定为0，最终错误分类仍由ModelGateway拥有；
 4. max entry size及未来blob reference阈值；
 5. cold exact resume是否值得在稳定executor implementation identity后扩展。

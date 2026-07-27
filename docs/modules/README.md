@@ -31,12 +31,12 @@ MiniCoreRuntime
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、UI/MiniCore职责、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
 - [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、`WaitingForUserInput`、即时CancelAccepted与Finishing结构化收口、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
-- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用；stream/retry/auth/usage/cache/continuation由ModelGateway拥有，private `ProviderAdapter`只执行provider attempt映射与调用，首个production实现为`RigProviderAdapter`。
+- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)`固定`TurnModelSnapshot`、`generate_model_turn(...)`唯一真实模型调用；每个Gateway operation最多执行一个provider attempt，SessionExecutor拥有有限logical retry。stream/auth/usage/cache/continuation由ModelGateway拥有，private`ProviderAdapter`只执行provider attempt映射与调用，首个production实现为`RigProviderAdapter`。
 - [Compaction](compaction.md)：portable rolling summary、stable-unit safe cut、leading summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
 ## 相关决策
 
-长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)以及[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。行为与接口以各模块文档、协议文档和ADR为权威。
+长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)以及[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)。行为与接口以各模块文档、协议文档和ADR为权威。
 
 ## 权威归属
 
@@ -57,7 +57,8 @@ MiniCoreRuntime
 | UserQuestion公开view、Presentation Adapter与resolution protocol | [Runtime 公开协议](runtime-interface.md) |
 | durable truth、entry tree、JSONL、conversation projection、recovery | [Conversation 与 SessionStorage](conversation-storage.md) |
 | 单Session执行owner、SessionIngress lanes、唯一current RunningOperation、Steer/FollowUp FIFO、emergency/lifecycle control、multi-session并发 | [Session 执行](session-execution.md) |
-| TurnModelSnapshot、generate_model_turn、provider adapter、stream/retry/usage | [ModelGateway](model-gateway.md) |
+| TurnModelSnapshot、generate_model_turn、provider adapter、single attempt、stream/usage | [ModelGateway](model-gateway.md) |
+| AgentRun/CompactionSummary logical retry policy | [Session 执行](session-execution.md) |
 | 压缩触发、stable cut、summary directive、StoredCompaction | [Compaction](compaction.md) |
 
 内存 projection、cache、snapshot 和 UI read model 只能由权威事实派生，不能成为并列 source of truth。

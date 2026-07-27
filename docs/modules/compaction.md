@@ -538,11 +538,11 @@ SummaryModel返回的reasoning不进入conversation。StoredCompaction不单独�
 
 ### Retry
 
-provider-internal retry遵守ModelGateway delivery proof。
+ModelGateway每次SummaryModel operation最多执行一个provider attempt；Rig和底层provider SDK automatic retry固定为0。
 
-logical SummaryModel retry由SessionExecutor决定，必须复用相同CompactionPlan、PromptSet、TurnModelSnapshot、AssembledModelContext和source checkpoint。Auth refresh/rate-limit backoff不改变logical request。
+logical SummaryModel retry由SessionExecutor决定，默认最多1次并使用2秒backoff。`RunningOperation::CompactConversation`形成并持有exact `Arc<ModelCallRequest>`及其request proof；进入`WaitForModelRetry`时同时移动该Arc与`ModelRetryResume::CompactionSummary { source, scope, plan_fingerprint }`，恢复Compaction operation时不重新plan或assemble。由此复用相同CompactionPlan、PromptSet、TurnModelSnapshot、AssembledModelContext、summary directive和source checkpoint；request前credential refresh不改变logical request。
 
-`RequestOutcomeUnknown`或`StreamInterrupted`不能盲目重放。logical summary retry应有很小上限，不能通过改变summary directive伪装成同一次retry。
+只有Gateway已证明`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`时，才允许该一次retry。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理；`RequestOutcomeUnknown`或`StreamInterrupted`不能重放，也不能通过改变summary directive伪装成同一次retry。完整规则见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
 ## Session Execution Integration
 
@@ -613,7 +613,10 @@ RunningOperation::CompactConversation {
     turn_id,
     execution_version,
     source,
+    scope,
     plan_fingerprint,
+    summary_request,
+    logical_retry_count,
     cancel,
 }
 ```
@@ -792,7 +795,7 @@ pub struct CompactionSummary {
 }
 ```
 
-`StoredCompactionModelCall`保存exact model、response id、usage、finish reason、provider metadata、logical retry count、requested max output、summary budget fingerprint和assembled context fingerprint。失败attempt usage只进入ModelGateway telemetry，不写入Session totals。
+`StoredCompactionModelCall`保存exact model、response id、usage、finish reason、provider metadata、logical retry count、requested max output、summary budget fingerprint和assembled context fingerprint。`logical_retry_count`范围为0–1；trusted writer和cold replay semantic validation都拒绝更大值。失败attempt usage只进入ModelGateway telemetry，不写入Session totals。
 
 ### Append and Durable Entry Validation
 

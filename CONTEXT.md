@@ -211,7 +211,7 @@ _避免_：长期PromptManager、current Session prompt、模型request、Tool e
 _避免_：session-scoped Tools副本、独立prompt/executor getter、UI工具列表
 
 **组装后的模型上下文identity**：
-`AssembledModelContextFingerprint`绑定PromptSet、CommittedConversationView、ModelCallPurpose、OutputContract和最终provider-neutral content。完整logical call identity还包含TurnModelSnapshot和effective max_output_tokens；provider/logical retry必须复用同一validated ModelCallRequest。
+`AssembledModelContextFingerprint`绑定PromptSet、CommittedConversationView、ModelCallPurpose、OutputContract和最终provider-neutral content。完整logical call identity还包含TurnModelSnapshot和effective max_output_tokens；Session logical retry必须复用同一validated ModelCallRequest。
 _避免_：provider payload hash、Session revision、Tool executor identity替代品
 
 **上下文素材（`ContextMaterial`）**：
@@ -412,7 +412,7 @@ _避免_：审批弹窗、路径字符串前缀检查、把 best-effort/full-acc
 _避免_：工具策略、工具注册、UI 执行器
 
 **模型调用网关（`ModelGateway`）**：
-MiniCoreRuntime-owned深模块，通过`resolve_for_turn(...)`固定exact TurnModelSnapshot，并通过一个`generate_model_turn(...)`异步operation处理provider encoding、credential、stream、same-model retry、transport fallback、usage、error、cache和continuation。它不重新组装Prompt，不保存current Session/Turn，也不在active Turn内替换model identity。
+MiniCoreRuntime-owned深模块，通过`resolve_for_turn(...)`固定exact TurnModelSnapshot，并通过一个`generate_model_turn(...)`异步operation处理provider encoding、credential、单次request/stream、usage、error、cache和continuation。MVP每个operation最多执行一个provider attempt，不做transparent retry或transport fallback；它不重新组装Prompt，不保存current Session/Turn，也不在active Turn内替换model identity。
 _避免_：provider client透传、系统提示词构建器、cross-model fallback、第二conversation
 
 **ModelGateway spine**：
@@ -420,7 +420,7 @@ _避免_：provider client透传、系统提示词构建器、cross-model fallba
 _避免_：临时provider路径、SessionExecutor直接调用Rig
 
 **Provider适配器（`ProviderAdapter` / `RigProviderAdapter`）**：
-ModelGateway内部执行单次provider attempt的private seam。它接收Gateway已经规划并解析model/endpoint/credential的`ProviderAttemptRequest`，完成具体provider协议编码、request/stream调用、cancellation桥接和attempt result/error映射。`RigProviderAdapter`是首个production implementation；它不选择provider/model，不拥有retry/fallback、auth policy、cache/continuation policy、ModelGateway attempt lifecycle或最终`ModelCallResult`。
+ModelGateway内部执行单次provider attempt的private seam。它接收Gateway已经规划并解析model/endpoint/credential的`ProviderAttemptRequest`，完成具体provider协议编码、request/stream调用、cancellation桥接和attempt result/error映射。`RigProviderAdapter`是首个production implementation；底层SDK automatic retry固定为0。它不选择provider/model，不拥有Session logical retry、auth policy、cache/continuation policy或最终`ModelCallResult`。
 _避免_：ModelGateway替代品、AgentLoop adapter、provider选择器、重试scheduler、公开SDK client
 
 **模型选择（`ModelSelection`）**：
@@ -432,7 +432,7 @@ Turn admission期间由ModelGateway根据ModelSelection解析的immutable execut
 _避免_：ModelSummary、current catalog lookup、cross-model fallback plan
 
 **模型状态（`ModelState`，pre-refactor term）**：
-旧SessionRuntime中的mutable model execution state。目标架构由SessionDefinition保存ModelSelection和用户偏好，TurnExecutionContext保存TurnModelSnapshot；provider connection、stream和retry state全部留在ModelGateway。
+旧SessionRuntime中的mutable model execution state。目标架构由SessionDefinition保存ModelSelection和用户偏好，TurnExecutionContext保存TurnModelSnapshot；provider connection与stream state留在ModelGateway，logical retry delay/count由SessionExecutor的RunningOperation持有。
 _避免_：active Turn mutable model、provider client、credential
 
 **模型目录（`ProviderCatalog`）**：
@@ -440,11 +440,11 @@ ModelGateway内部的versioned provider/model definition catalog，记录explici
 _避免_：credential store、provider client pool、project-defined endpoint
 
 **凭据存储（`AuthStore`）**：
-ModelGateway private implementation中的secret解析模块，负责API key、OAuth token和runtime override，并支持singleflight refresh。只向private provider attempt提供typed secret material。
+ModelGateway private implementation中的secret解析模块，负责API key、OAuth token和runtime override，并支持request前singleflight refresh。只向private provider attempt提供typed secret material；provider返回401后本次Gateway operation不refresh-and-resend。
 _避免_：TurnModelSnapshot、Runtime event、环境变量直读调用点
 
 **模型调用目的（`ModelCallPurpose`）**：
-一次模型调用的稳定业务意图，例如`AgentRun`或`CompactionSummary`。它从`ModelCallRequest`原样传播到response metadata；provider usage直接附着finalized assistant entry，不建立独立`SessionEntry::Usage`。retry/fallback、客户端是否选中该session、调用是否在后台执行都不是purpose。
+一次模型调用的稳定业务意图，例如`AgentRun`或`CompactionSummary`。它从`ModelCallRequest`原样传播到response metadata；provider usage直接附着finalized assistant entry，不建立独立`SessionEntry::Usage`。logical retry、客户端是否选中该session、调用是否在后台执行都不是purpose。
 _避免_：`UsagePurpose`、Retry、Background、provider attempt status、调度状态
 
 **模型调用请求（`ModelCallRequest`）**：
@@ -452,7 +452,7 @@ SessionExecutor交给ModelGateway的唯一provider-neutral request，包含TurnM
 _避免_：provider HTTP request、Rig CompletionRequest、SessionId/TurnId、credential、raw params
 
 **模型调用结果（`ModelCallResult`）**：
-ModelGateway返回的一次完整terminal success，包含ordered FinalizedAssistantResponse、normalized finish reason、provider-reported ModelUsage、allowlisted response metadata和transparent retry diagnostics。只有SessionExecutor验证OperationResult identity/version和authorization后才能把它转换为assistant entry。
+ModelGateway返回的一次完整terminal success，包含ordered FinalizedAssistantResponse、normalized finish reason、provider-reported ModelUsage和allowlisted response metadata。只有SessionExecutor验证OperationResult identity/version和authorization后才能把它转换为assistant entry。
 _避免_：partial stream、durable Item、provider raw response、Turn terminal
 
 **模型调用错误（`ModelCallError`）**：
@@ -460,7 +460,7 @@ ModelGateway返回的redacted typed terminal error。ModelCallErrorKind区分Can
 _避免_：generic RuntimeError、raw HTTP body、assistant message、ToolResult
 
 **模型进度（`ModelProgressEvent`）**：
-ModelGateway发布的process-local attempt/delta/retry value。AgentRun GenerateModelResponse的scoped adapter先无损更新StreamingItem/ItemId映射，再把observer update送入bounded、可合并/丢弃的Host ProgressEvent queue；CompactionSummary adapter不创建ItemId。两者都不进入SessionStorage，finalized result或typed error负责最终校正。
+ModelGateway发布的process-local content delta。AgentRun GenerateModelResponse的scoped adapter先无损更新StreamingItem/ItemId映射，再把observer update送入bounded、可合并/丢弃的Host ProgressEvent queue；CompactionSummary adapter不创建ItemId。Session logical retry由SessionExecutor另行发布`model_retry_scheduled`。两者都不进入SessionStorage，finalized result或typed error负责最终校正。
 _避免_：durable Message、第二event log、cancellation token
 
 **压缩摘要指令（`CompactionSummaryDirective`）**：
@@ -488,7 +488,7 @@ Runtime向host发布的scope-local、非durable observer record。它可以描�
 _避免_：ProgressEvent、SessionStorage entry副本、runtime-global sequence
 
 **ProgressEvent**：
-模型AgentMessage/Reasoning started与delta、Tool output和provider retry等高频observer update。它可以合并或丢弃；message/reasoning started、delta与final completed共享稳定ItemId，append/apply后的StateEvent或重新订阅后的Snapshot携带完整view进行校正。
+模型AgentMessage/Reasoning started与delta、Tool output和Session logical retry等高频observer update。它可以合并或丢弃；message/reasoning started、delta与final completed共享稳定ItemId，append/apply后的StateEvent或重新订阅后的Snapshot携带完整view进行校正。
 _避免_：durable message、terminal event、恢复水位
 
 **事件消息（`StateEventMsg` / `ProgressEventKind`）**：
