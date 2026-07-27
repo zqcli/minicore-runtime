@@ -29,7 +29,7 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 
 - `SessionExecutor`、`SessionIngress`语义lane和异步operation的完整实现；这些以[Session Execution架构设计](session-execution.md)为权威；
 - Runtime command、event和transport protocol；
-- ModelGateway private Rig/provider adapter的实现细节；
+- ModelGateway private `ProviderAdapter`的实现细节；首个production `RigProviderAdapter`只处理provider attempt映射与调用；
 - 自研AgentLoop状态机的内部实现细节；其自研决策见[ADR 0115](../adr/0115-agent-loop-is-first-party-state-machine.md)。
 
 ## 决策摘要

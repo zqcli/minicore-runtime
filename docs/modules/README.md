@@ -31,7 +31,7 @@ MiniCoreRuntime
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、UI/MiniCore职责、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
 - [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、`WaitingForUserInput`、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
-- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用、private Rig adapter、stream/retry/auth/usage/cache/continuation。
+- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)` 固定 `TurnModelSnapshot`、`generate_model_turn(...)` 唯一真实模型调用；stream/retry/auth/usage/cache/continuation由ModelGateway拥有，private `ProviderAdapter`只执行provider attempt映射与调用，首个production实现为`RigProviderAdapter`。
 - [Compaction](compaction.md)：portable rolling summary、stable-unit safe cut、leading summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
 ## 相关决策

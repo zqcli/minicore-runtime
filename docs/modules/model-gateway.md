@@ -16,7 +16,7 @@
 - provider-internal retry、transport fallback与Session logical retry如何区分；
 - cancellation、authentication、secret redaction、并发配额和rate limit如何治理；
 - provider prompt cache、connection reuse和continuation如何保持Transcript-First等价性；
-- Rig 0.40.0可以复用哪些能力，哪些差异必须留在private adapter。
+- Rig 0.40.0可以为provider协议映射与单次attempt调用复用哪些能力，以及这些能力如何被限制在private `ProviderAdapter`内。
 
 本文不定义：
 
@@ -60,6 +60,7 @@
 - prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
 - 所有optimization必须能退回完整`AssembledModelContext`请求；
 - ProviderAdapter是private internal seam，首批实现为RigProviderAdapter和ScriptedProviderAdapter；
+- RigProviderAdapter只负责具体provider的request/stream/response/error映射与单次attempt执行；model resolution、request validation、auth policy与credential resolution、retry/fallback、progress lifecycle、cache/continuation policy和terminal result归一化均由ModelGateway拥有；
 - 不增加`ModelStep`、`ModelAttempt`领域entity、provider session public object或第二conversation state。
 
 ## 同类项目研究
@@ -708,9 +709,23 @@ pub(crate) trait ProviderAdapter: Send + Sync {
 }
 ```
 
-该trait是ModelGateway private internal seam，不进入MiniCoreRuntime interface。`ProviderContentPublisher`只能发布attempt内的content delta；AttemptStarted、RetryScheduled和AttemptDiscarded由ModelGateway本身发布，adapter不能伪造retry lifecycle。
+该trait是ModelGateway private internal seam，不进入MiniCoreRuntime interface。一次`execute`只执行一个由ModelGateway规划好的provider attempt。`ProviderContentPublisher`只能发布该attempt内的content delta；AttemptStarted、RetryScheduled和AttemptDiscarded由ModelGateway本身发布，adapter不能伪造retry lifecycle。
 
-真实实现：
+ProviderAdapter可以：
+
+- 把private `ProviderAttemptRequest`编码成具体provider/Rig typed request；
+- 使用已经解析的model、endpoint和credential执行一次provider request；
+- 桥接provider stream与attempt cancellation；
+- 把provider content、finish reason、usage、metadata和SDK error映射为`ProviderAttemptResult`或`ProviderAttemptError`。
+
+ProviderAdapter不能：
+
+- 选择或替换provider/model，解析catalog current value或改变Turn-pinned model identity；
+- 重新组装Prompt、判断conversation visibility或执行Tool；
+- 决定transparent retry、transport fallback、logical retry、cache/continuation policy或terminal Turn结果；
+- 发布ModelGateway attempt lifecycle、构造最终`ModelCallResult`或把Rig raw type泄漏给caller。
+
+首个production实现：
 
 ```text
 RigProviderAdapter
@@ -744,14 +759,17 @@ ProviderAttemptRequest可以包含：
 
 ```text
 ModelCallRequest
-→ validate TurnModelSnapshot
-→ encode AssembledModelContext
-→ Rig generic或provider-specific request API
-→ provider stream
-→ FinalizedAssistantResponse
+→ ModelGateway validate / resolve / plan attempt
+→ private ProviderAttemptRequest
+→ RigProviderAdapter encode并执行一个provider attempt
+→ ProviderAttemptResult或ProviderAttemptError
+→ ModelGateway retry/fallback仲裁与terminal归一化
+→ FinalizedAssistantResponse或ModelCallError
 ```
 
 RigProviderAdapter不被限制为generic `CompletionModel::stream`。当generic类型擦除finish reason、request ID或reasoning artifact时，adapter可以使用Rig公开的provider-specific request/response types；这些类型仍不能越过private adapter。
+
+RigProviderAdapter是provider attempt adapter，不是ModelGateway implementation的替代品。它不拥有provider选择、attempt调度、重试/回退策略、cache/continuation判定或最终错误分类。
 
 映射要求：
 

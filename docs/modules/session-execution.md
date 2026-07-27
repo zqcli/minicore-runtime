@@ -21,7 +21,7 @@
 - ModelGateway的provider映射、auth、fallback和stream wire格式；
 - Compaction的具体planning算法、summary格式和质量评估；本文只引用其执行契约；
 - Runtime公开command/query/event/snapshot协议；其映射以[Runtime Interface](runtime-interface.md)为权威；
-- ModelGateway Rig provider adapter的最终具体类型；
+- ModelGateway private `ProviderAdapter`的最终具体类型；首个production `RigProviderAdapter`只处理provider attempt映射与调用；
 - 操作系统线程、Tokio task或local task的最终部署方式。
 
 相关权威文档：

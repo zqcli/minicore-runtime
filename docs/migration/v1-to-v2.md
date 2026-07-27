@@ -486,7 +486,7 @@ SessionExecutor NeedModel
 - active Turn 内禁止 transparent cross-model fallback；
 - authentication、secret redaction、custom provider 和 concurrency 治理；
 - prompt cache、connection reuse 和 continuation 必须保持 full-request equivalence；
-- Rig provider 差异只存在于 private adapter。
+- Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只执行由ModelGateway规划好的provider attempt，model resolution、retry/fallback、cache/continuation policy与terminal归一化仍归ModelGateway。
 
 完成门槛：
 
@@ -496,7 +496,7 @@ SessionExecutor NeedModel
 - [x] 错误分类足以驱动 retry、compaction 或 terminal failure；
 - [x] provider cache/continuation 不是第二 conversation truth；
 - [ ] 执行协同交付束的Rig 0.40.0 integration spike；
-- [ ] 实现ModelGateway、ScriptedProviderAdapter、Rig adapter和mock-server tests。
+- [ ] 实现ModelGateway、ScriptedProviderAdapter、RigProviderAdapter和mock-server tests。
 
 ### 阶段 8：Compaction
 

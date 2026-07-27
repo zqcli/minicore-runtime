@@ -2,7 +2,7 @@
 
 MiniCore 是一个轻量级原生 Agent harness runtime core。
 
-本仓库提供可复用的 Agent 运行时核心能力：`AgentRuntimeProtocol`、会话与运行编排、资源加载、技能、工具、`CommandSurface`、运行时事件、内部 `RuntimeHooks`、持久化、上下文压缩、`ModelGateway`、usage stats、自研 `AgentLoop` 状态机，以及 Rig provider 集成。CLI、TUI 和 GUI 产品会在独立仓库中开发，并通过运行时协议嵌入 MiniCore。
+本仓库提供可复用的 Agent 运行时核心能力：`AgentRuntimeProtocol`、会话与运行编排、资源加载、技能、工具、`CommandSurface`、运行时事件、内部 `RuntimeHooks`、持久化、上下文压缩、`ModelGateway`、usage stats、自研 `AgentLoop` 状态机，以及 `ModelGateway` 内部的 Rig-backed provider adapter。Rig 只负责具体 provider 的协议编码、单次请求/stream 调用和响应映射；模型解析、请求校验、重试/回退、错误分类与 provider-neutral terminal result 由 `ModelGateway` 拥有。CLI、TUI 和 GUI 产品会在独立仓库中开发，并通过运行时协议嵌入 MiniCore。
 
 MiniCore 不是 CLI/GUI 产品仓库。下游宿主应通过下面的运行时接口接入：
 
