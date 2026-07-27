@@ -15,7 +15,7 @@ V1 → V2 的版本迁移记录见 [`docs/migration/v1-to-v2.md`](migration/v1-t
 
 ## 设计定位
 
-MiniCore 的 AgentLoop 是自研的 crate-private 协议状态机（[ADR 0115](adr/0115-agent-loop-is-first-party-state-machine.md)）；Rig 只用于实现 `ModelGateway` private `ProviderAdapter`，保持为实现细节。`RigProviderAdapter`只编码并执行具体 provider 的单次 attempt、桥接stream/cancellation并映射provider响应；model resolution、request validation、auth policy、retry/fallback、progress lifecycle、cache/continuation policy、错误分类和provider-neutral terminal result均由`ModelGateway`拥有。下游 CLI、TUI、GUI 宿主只通过 `MiniCoreRuntime` 的 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
+MiniCore 的 AgentLoop 是自研的 crate-private 协议状态机（[ADR 0115](adr/0115-agent-loop-is-first-party-state-machine.md)）；Rig只用于实现`ModelGateway` private `ProviderAdapter`，保持为实现细节。`RigProviderAdapter`只编码并执行具体provider的单次attempt、桥接stream/cancellation并映射provider响应，SDK automatic retry固定为0；model resolution、request validation、auth policy、progress lifecycle、cache/continuation policy、错误分类和provider-neutral terminal result由`ModelGateway`拥有，logical retry由`SessionExecutor`拥有。下游 CLI、TUI、GUI 宿主只通过 `MiniCoreRuntime` 的 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
 
 MiniCore 不重新实现 provider SDK 的底层 sampling/tool-call protocol，也不重新实现 provider HTTP client。模型返回 ToolCall 时，Session execution 先 append 完整 assistant/intermediate entry，再由 ToolService 执行工具治理；每个 truthful result 独立 append 为 tool message，最后以 `tool_round_completed` 推进模型可见 conversation。真实模型调用统一进入共享 `ModelGateway` 的深异步 operation，再由其private `ProviderAdapter`执行具体provider attempt；首个production adapter使用Rig的provider client能力。
 
@@ -86,7 +86,7 @@ PromptSet::compose_user_message(...) → CanonicalUserMessage
 - **Agent**：可被多个 Session 引用的 durable entity。head 保存 identity、current definition pointer、status 和 metadata；execution definition 使用 immutable `AgentDefinition`，identity 为 `(AgentId, AgentRevision)`，发布后不可原地修改。`AgentRevision` 只在 execution definition canonical content 改变时产生。
 - **Session**：长期存在的对话对象。head保存identity、current `SessionDefinitionRevision`、durable lifecycle和metadata。`SessionDefinition`原子绑定`AgentRevisionRef`、Workspace、`SessionModelConfig`和`SessionPromptSelection`。Session 创建时 pin Agent 当时的 current revision；Agent 后续发布新 revision 不自动改变已有 Session，必须通过新 `SessionDefinitionRevision` 显式升级，且一个 Session 的全部 revision 只能引用同一个 AgentId。
 - **Turn**：从 committed initiating UserMessage entry 到 terminal entry（final AssistantMessage / TurnInterrupted / TurnFailed）的用户意图执行过程。Turn head 不内联 `Vec<Item>`；Item 顺序由 SessionStorage projection 提供。active/recovered Turn 通过 initiating UserMessage 引用的 TurnContext entry 解析 exact execution metadata。
-- **Item**：Turn 内稳定、可观察的语义值或长生命周期操作。`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；`ItemType`/`ItemStatus` 从 content 派生，不独立存储。ToolCall 与 ToolResult 属于同一个 `ToolInvocation` Item（`Started → Completed | Abandoned`）。Turn/Item公开顺序由selected path entry顺序和assistant content/call顺序表达，有序Vec与new-Item StateEvent创建顺序就是契约，不增加DisplaySequence。AgentRun 的 AgentMessage/Reasoning started 与 delta 使用稳定 ItemId 和 process-local `StreamingItem`，但只有 final candidate append/apply 后才产生 Completed Item；provider retry、Tool progress 和 execution phase 同样不是 Item。
+- **Item**：Turn 内稳定、可观察的语义值或长生命周期操作。`ItemContent = UserMessage | AgentMessage | Reasoning | ToolInvocation`；`ItemType`/`ItemStatus` 从 content 派生，不独立存储。ToolCall 与 ToolResult 属于同一个 `ToolInvocation` Item（`Started → Completed | Abandoned`）。Turn/Item公开顺序由selected path entry顺序和assistant content/call顺序表达，有序Vec与new-Item StateEvent创建顺序就是契约，不增加DisplaySequence。AgentRun 的 AgentMessage/Reasoning started 与 delta 使用稳定 ItemId 和 process-local `StreamingItem`，但只有 final candidate append/apply 后才产生 Completed Item；model logical retry、Tool progress 和 execution phase 同样不是 Item。
 - **Interaction**：某个 Item 执行期间由 Runtime 发起并等待外部回答的 durable request/resolution（`ToolApproval | UserQuestion`）。归属固定为 `Interaction → Item → Turn → Session → Agent`；遵守 request-before-notify 与 resolution-before-resume/side-effect。MiniCore拥有交互协议和durable truth，Presentation Adapter只负责presentation与提交resolution。用户沉默、subscriber缺失或transport断开都保持Pending，不产生超时或默认Deny；Cancel、Turn terminal cleanup、Unload和recovery负责显式生命周期收口。结构化 Interaction response 不是 UserMessage，不开启新 Turn。
 
 ### Turn 执行上下文
@@ -183,7 +183,7 @@ Steer after complete assistant/tool step
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：Turn 边界、ItemContent、ToolInvocation identity、Interaction、terminal cleanup。
 - [Conversation 与 SessionStorage](modules/conversation-storage.md)：by-entry JSONL tree、唯一 append seam、entry tree、projection、fork、recovery。
 - [Session 执行](modules/session-execution.md)：单 SessionExecutor、semantic SessionIngress lanes、RunningOperation、multi-session 并发与Session-local file mutation queue。
-- [ModelGateway](modules/model-gateway.md)：`resolve_for_turn` / `generate_model_turn`、ModelGateway-owned stream/retry/auth/usage/cache，以及只负责provider attempt映射与调用的private `ProviderAdapter`（首个production实现为`RigProviderAdapter`）。
+- [ModelGateway](modules/model-gateway.md)：`resolve_for_turn` / `generate_model_turn`、ModelGateway-owned single-attempt stream/auth/usage/cache，以及只负责provider attempt映射与调用的private `ProviderAdapter`（首个production实现为`RigProviderAdapter`）；logical retry归SessionExecutor。
 - [Compaction](modules/compaction.md)：portable rolling summary、stable-unit cut、active-Turn checkpoint、model-aware summary budget、`Compacting` 阶段与StoredCompaction恢复。
 
 模块索引与权威归属见 [模块总览](modules/README.md)。
@@ -191,10 +191,10 @@ Steer after complete assistant/tool step
 ## 核心边界
 
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
-- AgentLoop 是 MiniCore 自研的 crate-private sans-I/O 协议状态机（ADR 0115）；Rig 只实现 `ModelGateway` private `ProviderAdapter`中的provider协议映射与单次attempt调用，不拥有AgentLoop、model resolution、retry/fallback、ModelGateway terminal语义、产品级工具治理、会话持久化或UI呈现。
+- AgentLoop 是 MiniCore 自研的 crate-private sans-I/O 协议状态机（ADR 0115）；Rig只实现`ModelGateway` private `ProviderAdapter`中的provider协议映射与单次attempt调用，SDK automatic retry固定为0，不拥有AgentLoop、model resolution、Session logical retry、ModelGateway terminal语义、产品级工具治理、会话持久化或UI呈现。
 - 同一份领域事实只有一个权威owner：conversation durable truth属于SessionStorage；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/revocation与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。valid Cancel在sticky epoch发布后立即返回`CancelAccepted`并进入Finishing，已开始Tool结构化收口期间仍允许FollowUp排队，旧Turnterminal前不启动新Turn。Snapshot只作为live observer baseline，process restart仍从JSONL replay并保守关闭unfinished Turn。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
-- `ModelGateway` 通过 `resolve_for_turn(...)` 固定 exact `TurnModelSnapshot`，RunningOperation 只传 `ModelCallRequest`；Gateway 隐藏 provider、credential、endpoint、transport retry、cache 和 continuation，不判断 session message visibility，也不在 active Turn 内替换 model identity。
+- `ModelGateway`通过`resolve_for_turn(...)`固定exact `TurnModelSnapshot`，RunningOperation只传`ModelCallRequest`；每个Gateway operation最多执行一个provider attempt，SessionExecutor对同一个AgentRun request最多logical retry 3次、CompactionSummary最多1次。Gateway隐藏provider、credential、endpoint、cache和continuation，不判断session message visibility，也不在active Turn内执行transport/model fallback。
 - 工具注册、审批、授权记忆、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`统一治理；每个loaded Session的`SessionExecutor`拥有独立file mutation queue，新Turn的`ToolSet`只持共享引用。同Session同文件mutation FIFO，跨Session共享Workspace不协调并由host/user负责隔离（ADR 0116）。MVP不启用通用`bash`；子进程限制无法强制时必须fail closed。
 - 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
 
@@ -221,3 +221,4 @@ Steer after complete assistant/tool step
 - [ADR 0116：文件mutation使用Session-local FIFO队列](adr/0116-file-mutations-use-session-local-queues.md)
 - [ADR 0117：异步同步使用单Owner、短临界区与Typed Permit](adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)
 - [ADR 0118：Cancel立即确认，FollowUp等待结构化收口后启动](adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)
+- [ADR 0119：模型调用使用Session逻辑重试](adr/0119-model-calls-use-session-logical-retries.md)

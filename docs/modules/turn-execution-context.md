@@ -41,7 +41,7 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 - active Turn 不重新读取 Workspace、Prompt、Tool、Skill 或 Model 的 future current value；
 - 一次逻辑模型调用由committed conversation checkpoint、purpose、output contract、effective max_output_tokens和`AssembledModelContext`唯一确定；
 - 不增加 `ModelStep` struct、ID、领域 entity 或公开协议对象；
-- provider retry 复用同一个不可变 assembled context，不创建新的领域对象；
+- Session logical retry复用同一个不可变assembled context，不创建新的领域对象；
 - PromptSet 是唯一产生 `AssembledModelContext` 的对象；
 - PromptSet 在创建时绑定同一个 ToolSet 的 ToolPromptView，assembly 时不能再传入任意 Tool view；
 - 模型可见动态事实必须来自 committed conversation，不建立未持久化的 dynamic contribution lane；
@@ -201,7 +201,7 @@ SkillViewContext + SkillEntry
 - cancellation token 是否已触发；
 - Workspace authorization lease 是否已撤销；
 - Tool approval waiter；
-- provider retry attempt；
+- provider attempt；
 - stream draft；
 - diagnostics delivery 状态；
 - cache hit、load state 或 telemetry。
@@ -434,14 +434,14 @@ ExecutionContextFingerprint
 + AssembledModelContextFingerprint
 ```
 
-SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated constructor形成并保留完整immutable `ModelCallRequest`供provider/logical retry复用。不增加 `ModelStep`、`ModelStepId`、`ModelAttempt` 或额外 fingerprint 类型。
+SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated constructor形成并保留完整immutable `ModelCallRequest`供Session logical retry复用。不增加`ModelStep`、`ModelStepId`、`ModelAttempt`或额外fingerprint类型。
 
-以下变化仍属于同一次逻辑模型调用：
+以下行为不改变逻辑模型调用identity：
 
-- provider connection retry；
-- rate-limit backoff；
-- 尚未产生可提交结果的 transient retry；
-- 同一 assembled request 的 provider attempt。
+- SessionExecutor等待logical retry backoff；
+- delivery-safe terminal error后，再次调用Gateway并复用同一个immutable `ModelCallRequest`。
+
+每次Gateway operation仍是独立single provider attempt；provider connection retry、401 resend和transport fallback不属于MVP。
 
 以下变化必须开始新的逻辑模型调用：
 
@@ -537,7 +537,7 @@ ToolExecutionControl要求的每次durable append都必须先通过storage-owned
 - pending Interaction；
 - accepted 但未 append 的 Steer；
 - compaction draft；
-- provider retry 的 partial output。
+- failed provider attempt的partial output。
 
 ## Waiting Approval
 
@@ -629,15 +629,17 @@ FollowUp使用`FollowUpQueue` bounded FIFO；它最多获得一次连续admissio
 
 ## Retry
 
-retry 分为两层：
+模型调用失败恢复分为两个边界：
 
 ```text
-provider-internal attempt
-→ ModelGateway负责连接、认证刷新、same-model retry和transport fallback
+single provider attempt
+→ ModelGateway负责一次request/stream和typed terminal mapping
 
 logical model-call retry
-→ Session execution 负责是否复用同一个 immutable assembled context
+→ Session execution负责是否复用同一个immutable ModelCallRequest
 ```
+
+MVP不执行provider transparent retry、401 refresh-and-resend或transport fallback；Rig和底层provider SDK automatic retry固定为0。AgentRun默认最多3次logical retry，CompactionSummary最多1次，完整policy见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
 同一次逻辑模型调用的retry只能在旧Model RunningOperation已经terminal/remove或被安全drop并关闭结果路径后启动，并且必须满足：
 
@@ -794,7 +796,7 @@ capture schema/algorithm version
 
 `TurnId`和`SessionId`由TurnContext entry及其initiating UserMessage reference绑定，不建议仅为实例区分而加入内容fingerprint。
 
-逻辑模型调用无需额外fingerprint类型。provider retry必须先证明`ConversationCheckpoint`不变；在此前提下，`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + effective max_output_tokens + AssembledModelContextFingerprint`足够判断是否仍是同一次调用。仅TranscriptFingerprint相同不足以忽略AdvanceOnly ledger变化。
+逻辑模型调用无需额外fingerprint类型。Session logical retry必须先证明`ConversationCheckpoint`不变；在此前提下，`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + effective max_output_tokens + AssembledModelContextFingerprint`足够判断是否仍是同一次调用。仅TranscriptFingerprint相同不足以忽略AdvanceOnly ledger变化。
 
 Fingerprint 用于一致性、审计、cache 和 recovery 比对，不代替 secret redaction，也不是完整恢复数据。
 
@@ -1011,7 +1013,7 @@ AgentLoop registry
 - Tool side effect前append非模型可见tool_execution_started operational truth；
 - Interaction request append-before-notify，resolution append-before-resume；
 - Started/Abandoned ToolInvocation 和 incomplete ToolRound 不进入模型 conversation；
-- provider retry 复用同一个 immutable assembled context；
+- Session logical retry复用同一个immutable assembled context；
 - tool_round_completed append/apply后才开始下一次逻辑模型调用；
 - WaitingApproval和WaitingForUserInput时Turn仍是Running；
 - Steer在完整assistant/tool step后FIFO出队，append后才影响下一次逻辑模型调用，不把Turn变为Interrupted；
@@ -1037,7 +1039,7 @@ AgentLoop registry
 - Skill lazy load不查询reload后的current SkillView；未加载entry允许读取location当前正文；
 - User Skill injection 进入 committed CanonicalUserMessage；
 - 逻辑模型调用只接受 CommittedConversationView；
-- provider retry 保持 AssembledModelContextFingerprint 不变；
+- Session logical retry保持AssembledModelContextFingerprint不变；
 - NeedTools后、任何side effect前重新检查Cancel state和current authorization；
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
 - InteractionRequested append-before-notify；
@@ -1071,7 +1073,7 @@ AgentLoop registry
 ## 后续问题
 
 1. ~~AgentLoop 与 Rig 0.40.0 的具体 sans-I/O adapter 形状~~（已由 ADR 0115 关闭：AgentLoop 自研，Rig 不参与 loop）。
-2. Rig 0.40.0对TurnModelSnapshot、finish reason、reasoning和provider retry的ModelGateway private adapter映射。
+2. Rig 0.40.0对TurnModelSnapshot、finish reason、reasoning、single-attempt error/delivery state和SDK retry=0的ModelGateway private adapter映射。
 3. Tool executor implementation identity/version 的注册和 recovery 规则。
 4. PromptResourceView、SkillView和ToolSet fingerprint/reference的最终持久化细节。
 5. Runtime pending Interaction公开query/event payload。

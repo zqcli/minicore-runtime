@@ -57,7 +57,7 @@ storage implementation：immutable facts + projection fold
 - 一个 ToolInvocation Item 贯穿 call、approval、execution、result 和 recovery；
 - ItemType 从 ItemContent discriminant 派生，不独立保存；
 - UserMessage、AgentMessage 和 Reasoning 只在形成稳定值后成为 durable Item；
-- streaming delta、Tool progress、provider retry 和 execution phase 不是 Item；
+- streaming delta、Tool progress、model logical retry和execution phase不是Item；
 - 只保存 provider 实际返回的 finalized/replayable reasoning，不获取 hidden chain-of-thought；
 - Interaction 是 Item-owned durable request/resolution；
 - UserQuestion 使用“MiniCore-owned interaction protocol + UI-owned presentation”：Runtime 决定何时问、问的是哪个 Item，Presentation Adapter决定如何呈现和收集答案；
@@ -473,7 +473,7 @@ started/delta可丢失或合并；Host漏掉started时可以从首个delta创建
 
 ToolInvocation的Started与外部副作用开始是两个边界：assistant/intermediate tool_call entry append/apply后Item成为Started；`ToolExecutionStarted`必须在真实executor副作用前另行append/apply。pre-execution拒绝可以在没有`ToolExecutionStarted`的情况下把Started ToolInvocation完成为truthful ToolResult。
 
-以下内容同样不是durable Item：Tool progress/stdout chunk、provider retry attempt、TurnExecutionPhase transition、approval presentation状态、cache hit和临时token update。
+以下内容同样不是durable Item：Tool progress/stdout chunk、model logical retry notification、TurnExecutionPhase transition、approval presentation状态、cache hit和临时token update。
 
 ## Complete ToolRound
 

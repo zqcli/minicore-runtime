@@ -358,7 +358,7 @@ pub(crate) struct CompactionRecoveryBasis {
 
 ## Running Operation
 
-SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`，它是当前逻辑Model/Tool/Compaction工作的唯一execution-local状态。provider attempt和transparent retry完全由ModelGateway内部管理，CurrentTurnExecution不保存并列的ModelAttemptState。`GenerateModelResponse` operation的scoped progress adapter持有`content_index → StreamingItem`的operation-local map；其terminal `OperationOutput::Model`包装Gateway的`ModelCallResult`和ItemId映射，ModelGateway interface保持不变。该adapter不直接修改CurrentTurnExecution或projection。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
+SessionExecutor最多持有一个`current_operation: Option<RunningOperation>`，它是当前逻辑Model/Tool/Compaction工作的唯一execution-local状态。每个ModelGateway operation最多包含一个provider attempt；CurrentTurnExecution不保存并列的ModelAttemptState。`GenerateModelResponse` operation的scoped progress adapter持有`content_index → StreamingItem`的operation-local map；其terminal `OperationOutput::Model`包装Gateway的`ModelCallResult`和ItemId映射，ModelGateway interface保持不变。该adapter不直接修改CurrentTurnExecution或projection。operation future由主循环直接poll，不detach成可以在owner不知情时回传结果的后台task。等待Model/Tool I/O时，Executor仍可通过`select!`处理SessionIngress的各 lane；“处理一个 ingress 请求”不等于“并行启动第二个logical operation”。
 
 新operation只能在旧operation满足以下任一条件后启动：
 
@@ -368,9 +368,18 @@ terminal OperationResult已处理并移除
 对无外部副作用的future执行安全drop，且旧结果通道已关闭
 ```
 
-Model、Context、composition和未开始副作用的Tool可以在Cancel后安全drop。Tool越过`ToolExecutionStarted`后必须保留为current operation直到exact outcome或明确Abandoned settlement；期间不启动下一次Model/Tool operation。
+Model、retry delay、Context、composition和未开始副作用的Tool可以在Cancel后安全drop。Tool越过`ToolExecutionStarted`后必须保留为current operation直到exact outcome或明确Abandoned settlement；期间不启动下一次Model/Tool operation。
 
 ```rust
+pub(crate) enum ModelRetryResume {
+    AgentRun,
+    CompactionSummary {
+        source: ConversationCheckpoint,
+        scope: CompactionScope,
+        plan_fingerprint: CompactionPlanFingerprint,
+    },
+}
+
 pub(crate) enum RunningOperation {
     BuildTurnContext {
         turn_id: TurnId,
@@ -386,6 +395,17 @@ pub(crate) enum RunningOperation {
     GenerateModelResponse {
         turn_id: TurnId,
         execution_version: u64,
+        request: Arc<ModelCallRequest>,
+        logical_retry_count: u8,
+        cancel: CancellationToken,
+    },
+    WaitForModelRetry {
+        turn_id: TurnId,
+        execution_version: u64,
+        request: Arc<ModelCallRequest>,
+        logical_retry_count: u8,
+        ready_at: Instant,
+        resume: ModelRetryResume,
         cancel: CancellationToken,
     },
     ExecuteTools {
@@ -399,6 +419,8 @@ pub(crate) enum RunningOperation {
         source: ConversationCheckpoint,
         scope: CompactionScope,
         plan_fingerprint: CompactionPlanFingerprint,
+        summary_request: Option<Arc<ModelCallRequest>>,
+        logical_retry_count: u8,
         cancel: CancellationToken,
     },
 }
@@ -656,15 +678,16 @@ AgentLoop NeedModel
    │  → Assistant entry append/apply
    │  → 按finalized content顺序一次投影/publish：Reasoning/AgentMessage Completed、ToolInvocation Started
    │  → 清理matching StreamingItem
-   └─ CompactionSummary：不创建StreamingItem/ItemId → revalidate → append/apply Replace → rebuild AgentLoop → reassemble
+   ├─ CompactionSummary：不创建StreamingItem/ItemId → revalidate → append/apply Replace → rebuild AgentLoop → reassemble
+   └─ delivery-safe terminal error：移除旧operation → WaitForModelRetry → timer后重新校验 → 复用同一request启动下一operation
 ```
 
 规则：
 
 - PromptSet是唯一context assembly实现；
 - ModelGateway只接收validated `ModelCallRequest`；该request的唯一model-visible input是`AssembledModelContext`；
-- provider retry复用同一个immutable ModelCallRequest；
-- provider transport fallback不得改变exact provider/model identity；
+- ModelGateway single attempt失败后，Session logical retry复用同一个immutable ModelCallRequest；
+- MVP不执行provider transparent retry或transport fallback；
 - active Turn内不允许transparent cross-model fallback；
 - logical retry只允许在ConversationCheckpoint、TurnExecutionContext、purpose、output contract和effective max_output_tokens均未改变时发生；
 - `StreamingItem`只属于当前AgentRun `GenerateModelResponse` operation，按provider-neutral `content_index`关联，不进入CompactionSummary、CurrentTurnExecution、TurnExecutionContext、SessionStorage或Snapshot authoritative view；
@@ -1011,30 +1034,35 @@ Tool自己的failed/denied result通常是truthful ToolResult，不自动使Turn
 
 ## Retry
 
-### Provider retry
+### Provider attempt
 
-由ModelGateway内部处理连接、认证刷新、same-model attempt和transport fallback。必须复用同一个immutable ModelCallRequest；active Turn内不得替换provider/model identity。
+MVP中ModelGateway每个operation最多执行一个provider attempt；Rig和底层provider SDK automatic retry固定为0。Gateway不在401后重发，不执行WebSocket → HTTP fallback，也不持有retry timer。request前credential resolve/refresh仍由Gateway负责；provider error以typed terminal result返回SessionExecutor。
 
 ### Logical model retry
 
 由SessionExecutor决定：
 
 ```text
-Model operation retryable failure
-→ current Model operation返回terminal error并从current_operation移除
+Model/CompactionSummary operation retryable failure
+→ current operation返回terminal error并从current_operation移除
 → 确认TurnId/execution_version未变
 → 确认ConversationCheckpoint未变
 → 确认TurnExecutionContext未变
-→ 发布logical model_retry_scheduled，丢弃上一operation的StreamingItem
-→ 使用相同ModelCallRequest重试
-→ increment logical retry_count
+→ increment logical_retry_count并检查purpose上限
+→ 发布logical model_retry_scheduled，丢弃上一AgentRun operation的StreamingItem
+→ 创建WaitForModelRetry
+→ timer terminal/remove后使用相同ModelCallRequest启动下一operation
 ```
 
-Retry delay使用timer，不阻塞SessionIngress scheduler或control loop。
+Retry delay使用`RunningOperation::WaitForModelRetry`中的timer，不阻塞SessionIngress scheduler或control loop。旧Model/Compaction operation必须terminal并移除后才能创建该delay operation；delay terminal并移除后才能创建下一次Model/Compaction operation，因此`current_operation`仍是唯一execution-local work state。
+
+delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_count`、`ready_at`和恢复下一operation所需的最小typed `ModelRetryResume`，不分配attempt ID，也不是`ModelAttemptState`。AgentRun resume没有额外数据；CompactionSummary resume只保留source、scope和plan fingerprint，summary directive、assembled context与request proof继续由同一个immutable request提供。timer到期后必须先处理已经到达的Cancel/revocation/Steer，再决定是否启动下一次single-attempt Gateway operation。成功response、新ModelCallRequest或失效control会清除该调用链计数。
 
 logical retry不得通过timeout race留下仍可回传结果的旧本地future。若取消无副作用Model future，必须先安全drop并关闭旧结果路径；provider端可能继续生成或计费只属于delivery/telemetry风险，不允许形成第二个SessionExecutor result。
 
-Steer、Cancel、Compaction或任何model-visible conversation change都会使旧logical retry失效。`RequestOutcomeUnknown`和`StreamInterrupted`的logical retry可能重复provider work或billing；Session policy必须显式限制次数并保留diagnostic，不能宣称exactly-once。
+默认AgentRun最多3次logical retry，backoff为2秒、4秒、8秒；一次成功finalized response或新的ModelCallRequest开始后计数重置。自动retry必须同时满足Gateway已证明`NotSent`或`RejectedBeforeExecution`，且kind是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`；实际delay取指数backoff与provider hint的较大值。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理。超过60秒、`RequestOutcomeUnknown`、`StreamInterrupted`、认证、quota、配置、安全和协议错误默认不自动retry。`ContextOverflow`进入Compaction。
+
+Steer、Cancel、成功Compaction Replace或任何model-visible conversation change都会使旧logical retry失效。任何logical retry都可能重复provider work或billing，不能宣称exactly-once。完整policy见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
 ### Tool retry
 
@@ -1140,7 +1168,7 @@ Snapshot不进入mutation/control lane，也不声称与跨lane请求形成全�
 agent message / reasoning started
 assistant text / reasoning delta
 Tool stdout/progress
-provider retry notification
+logical model retry scheduled
 phase change notification
 ```
 
@@ -1359,7 +1387,13 @@ MVP性能要求：
 
 - NeedModel只使用CommittedConversationView；
 - Model运行期间接收Steer；Cancel signal立即触发cancellation token；Snapshot从published view返回；
-- provider retry复用相同ModelCallRequest且不改变model identity；
+- ModelGateway一次operation最多执行一个provider attempt，SDK automatic retry为0；
+- AgentRun logical retry复用相同ModelCallRequest且不改变model identity，最多3次；initial加3次retry最多产生4次Gateway invocation；
+- 第4个AgentRun retry不调度，logical retry计数在success或新ModelCallRequest时重置；
+- CompactionSummary最多1次logical retry，即最多2次Gateway invocation；
+- `NotSent`/`RejectedBeforeExecution`的Timeout/TransportUnavailable/ProviderUnavailable分别允许logical retry；AcceptedNoOutput默认不允许；
+- `NotSent`/`RejectedBeforeExecution`的RateLimited在Retry-After不超过60秒时，delay取purpose backoff与hint较大值；超过60秒不自动等待；
+- RequestOutcomeUnknown、StreamInterrupted、认证、quota、配置、安全和协议错误不自动logical retry；
 - request delivery outcome unknown和first semantic delta后的stream failure不由Gateway blind retry；
 - logical retry只在旧Model operation terminal/remove后启动；不存在两个可向Executor返回结果的同Session Model future；
 - Finished candidate在Steer FIFO为空且Cancel/revocation未获胜时才append final；
@@ -1367,9 +1401,9 @@ MVP性能要求：
 - Steer admission与final commit reservation双向race：Steer先赢转Continue，reservation先赢拒绝Steer；
 - NeedTools result无论Steer queue是否非空都先完成assistant/tool/tool_round_completed序列；
 - streaming delta丢失不影响final entry；
-- transport fallback保持exact model identity；
+- MVP不执行transport fallback；
 - cross-model substitution返回typed failure而不是静默继续；
-- logical retry_count与Gateway transparent retry count分离。
+- logical retry_count准确记录0–3；Gateway没有transparent retry count。
 
 ### Tool
 

@@ -2,7 +2,7 @@
 
 状态：设计评审记录（未关闭项持续跟进）
 日期：2026-07-25
-范围：`docs/architecture.md` + `docs/modules/`（12 篇）+ `docs/adr/`（0100–0113）
+范围：`docs/architecture.md` + `docs/modules/` + `docs/adr/`（0100–0119）
 方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
 
 ## 总体判断
@@ -136,7 +136,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 ### 类型 / 命名一致性（低成本）
 
 - ~~`ProviderCapabilities`（`tools.md`）vs `ModelCapabilities`命名不一致~~：**已关闭**。删除未定义的`ProviderCapabilities`；`ToolTurnContext.tool_calling`直接接收selected model现有的`ToolCallingCapabilities`，不传完整`ModelCapabilities`，也不增加新projection类型。
-- ~~`CurrentTurnExecution.model_attempt: ModelAttemptState`与“不建立ModelAttempt entity”矛盾~~：**已关闭**。删除该字段；`current_operation: Option<RunningOperation>`是当前逻辑模型工作的唯一execution-local状态，provider attempt和transparent retry留在ModelGateway内部。
+- ~~`CurrentTurnExecution.model_attempt: ModelAttemptState`与“不建立ModelAttempt entity”矛盾~~：**已关闭**。删除该字段；`current_operation: Option<RunningOperation>`是当前逻辑模型工作的唯一execution-local状态。ADR 0119进一步收窄为每个Gateway operation最多一个provider attempt，不增加并列retry state。
 - ~~`AgentLoop::accept_committed_tool_round(round: CommittedToolRound)`引用未定义类型~~：**已关闭**。不新增ToolRound表示；方法直接接收`tool_round_completed`成功append/apply后由SessionStorage生成的trusted `CommittedConversationDelta`。
 - ~~`TurnExecutionPhase::Committing`无驱动路径~~：**已关闭**。删除该variant；append/apply保持在当前业务phase内，terminal写入使用`SessionExecutionState::Finishing`，写入延迟通过ProgressEvent/diagnostics观察。
 - ~~`PromptMergeMode::Append`引用未定义priority~~：已随B1关闭，当前使用固定层级和stable identity顺序，不增加priority字段。
@@ -177,7 +177,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ### ModelGateway / Workspace 弹性与取舍
 
-- gateway 有界 retry 与 executor logical retry 无全局预算，RateLimited/Timeout 下 backoff 复合 → 定义单 Turn 级总 attempt/时间上限并扣除 gateway 已消耗 backoff。
+- ~~gateway有界retry与executor logical retry无全局预算~~：**已由ADR 0119关闭**。MVP删除Gateway transparent retry和transport fallback；每个Gateway operation最多执行一个provider attempt，SDK retry=0。SessionExecutor对同一AgentRun request最多logical retry 3次，CompactionSummary最多1次。
 - continuation 要求 new full input prefix 逐段等价于 cache 的 previous input + finalized response，但 finalized assistant（encrypted/signature reasoning、provider item id、空白规范化）经持久化重组后难逐字节还原，优化几乎不触发 → 给 canonical 等价精确定义 + round-trip golden vectors，接受「full request 是常态」为基线。
 - `resolve_for_turn` 无 availability probe + 禁 active-Turn cross-model fallback → 首消息命中宕机 model 直接 TurnFailed → 增加「下一 Turn 自动 fallback 到显式配置备用 model」策略（保持 exact pin、不在 turn 内静默替换）。
 - 正常 AgentRun 下 provider 返回越权 ToolCall / 结构化输出违约应映射的 `ModelCallErrorKind`（ProtocolViolation? InvalidRequest?）与是否 retryable 未明确 → 显式规定。
@@ -271,7 +271,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
 | O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 已关闭：ADR 0118即时CancelAccepted、复用Finishing并允许FollowUp排队 | — |
 | O7 | 同步Prompt assembly可能阻塞Session控制面 | 已关闭：保持同步纯内存assembly，不增加offload或观测机制 | — |
-| O8 | Gateway retry与logical retry无Turn级共享预算 | 仍开放 | P1 |
+| O8 | Gateway retry与logical retry无Turn级共享预算 | 已关闭：ADR 0119采用Gateway single attempt + Session有限logical retry | — |
 | O9 | provider输出违约的错误分类与retry语义未冻结 | 仍开放，与第三轮L1相关 | P1 |
 | O10 | restrictive Workspace update未持久化缺少专用诊断 | 仍开放 | P2 |
 | O11 | 已打开文件handle存在revocation窗口 | 仍开放 | P1 |
@@ -360,17 +360,19 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 ### ModelGateway协议
 
-#### O8 · Turn级共享retry预算
+#### O8 · Turn级共享retry预算（已关闭）
 
-- 发生场景：ModelGateway内部对RateLimited/Timeout执行多次退避，返回错误后SessionExecutor再启动多轮logical retry；两个局部上限相乘。
-- 风险：单Turn耗时、provider work和计费失控，并占用共享Model配额。
-- 推荐修复：定义Turn-scoped `ModelCallBudget { max_attempts, max_elapsed, max_backoff }`；Gateway每次attempt/退避扣减并在result/error diagnostics返回消耗量，Executor logical retry继续使用同一remaining budget。budget耗尽返回typed terminal failure，不再调度新attempt。
+- 原发生场景：ModelGateway内部对RateLimited/Timeout执行多次退避，返回错误后SessionExecutor再启动多轮logical retry；两个局部上限相乘。
+- 同类实现复核：pi默认provider retry为0、AgentSession最多auto-retry 3次；Codex、Gemini CLI和OpenHands均以多层局部上限为主，request/stream/fallback/compaction可能组合，未形成可直接复用的统一Turn budget。
+- 决议：不引入`ModelCallBudget`。MVP每次`generate_model_turn`只执行一个provider attempt，Rig/provider SDK automatic retry固定为0，不做401 resend或transport fallback。SessionExecutor对同一个immutable AgentRun `ModelCallRequest`最多logical retry 3次（2s/4s/8s），CompactionSummary最多1次（2s）。成功response或新request重置计数，不让整个健康agentic Turn共享attempt池。
+- 安全边界：只自动retry Gateway已证明`NotSent`或`RejectedBeforeExecution`，且kind为Timeout/TransportUnavailable/ProviderUnavailable或`Retry-After <= 60s`的RateLimited；AcceptedNoOutput默认按RequestOutcomeUnknown处理。RequestOutcomeUnknown、StreamInterrupted、认证、quota、配置、安全和协议错误默认不重放，ContextOverflow进入Compaction。
+- 关闭依据：[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)。
 
 #### O9 · Provider输出违约分类
 
 - 发生场景：`NoToolCalls`请求返回ToolCall；structured output缺字段或类型错误；finish reason与content形状冲突。
 - 风险：实现可能分别映射为`InvalidRequest`、`ProtocolViolation`或transient failure，导致retry、TurnFailed和diagnostics行为分叉；越权ToolCall若被误接收还会进入Tool执行。
-- 推荐修复：与第三轮L1一起冻结决策表：forbidden ToolCall和schema违约映射为typed `OutputContractViolation`，不得执行Tool、不得transparent retry，可由Session policy决定至多一次logical retry；wire/content结构自相矛盾映射`ProtocolViolation`且默认non-retryable；request自身无法映射provider能力才使用`InvalidRequest/UnsupportedCapability`。
+- 推荐修复：与第三轮L1一起冻结决策表：forbidden ToolCall和schema违约映射为typed `OutputContractViolation`，不得执行Tool；MVP默认不logical retry，若后续放宽也至多一次。wire/content结构自相矛盾映射`ProtocolViolation`且non-retryable；request自身无法映射provider能力才使用`InvalidRequest/UnsupportedCapability`。
 
 ### Fingerprint与横切值
 

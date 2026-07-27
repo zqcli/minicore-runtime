@@ -252,7 +252,7 @@ WorkspaceAccessView
 - 领域 Turn、Turn execution 和 AgentLoop 的开始与结束边界；
 - `SkillView`、`ToolSet`、`PromptSet`的capture依赖图；
 - 哪些对象在整个 Turn 内固定；
-- 逻辑模型调用与 provider retry 的边界，不增加新的领域类型；
+- single provider attempt与Session logical retry的边界，不增加新的领域类型；
 - PromptSet 如何绑定同一 ToolSet 的 `ToolPromptView`；
 - Skill load 如何使用 pinned Catalog entry 的精确 identity；
 - reload 与 Turn capture 的线性化语义；
@@ -293,7 +293,7 @@ SkillView.prompt_view()
 - 模型看到的 ToolSpec 必然对应同一个 ToolSet 的 executor；
 - PromptSet assembly 不接受另一个任意 ToolPromptView；
 - assembly 只从 committed conversation 和 typed call policy 构建，不存在任意 current-call contribution lane；
-- 逻辑模型调用、provider retry、Steer 和 FollowUp 的边界无歧义；
+- 逻辑模型调用、Session logical retry、Steer和FollowUp的边界无歧义；
 - reload 只影响 future TurnExecutionContext。
 
 ### 阶段 3：Agent 与 Session 生命周期
@@ -412,7 +412,7 @@ SessionExecutor NeedModel
 
 - 同一个`ModelCallRequest`构造和proof校验路径；
 - 同一个exact `TurnModelSnapshot`、effective limits、cancellation、usage和error taxonomy；
-- 同一个ModelGateway retry/provider adapter边界；
+- 同一个ModelGateway single-attempt/provider adapter边界与Session logical retry policy；
 - 不同的typed purpose与output contract：`AgentRun`或`CompactionSummary + NoToolCalls`。
 
 协同实现顺序：
@@ -429,7 +429,7 @@ SessionExecutor NeedModel
 - [ ] scripted ordinary AgentRun vertical slice通过；
 - [ ] scripted overflow → summary → append/apply → reassemble → AgentRun vertical slice通过；
 - [ ] AgentRun与CompactionSummary都只能通过`ModelCallRequest::new`进入ModelGateway；
-- [ ] cancellation、logical retry、usage和typed error在两种purpose下行为一致；
+- [ ] Gateway single attempt、SDK retry=0、cancellation、logical retry、usage和typed error在两种purpose下行为符合ADR 0119；
 - [ ] Rig 0.40.0 spike验证OpenAI Responses与Anthropic Messages关键映射；
 - [ ] production provider adapter与mock-server contract tests通过。
 
@@ -484,18 +484,20 @@ SessionExecutor NeedModel
 - Model identity、capabilities、effective limits 和 generation policy；
 - streaming progress 与 finalized result 分离；
 - usage、finish reason、reasoning 和 allowlisted provider metadata 规范化；
-- provider retry、transport fallback 与 Session logical retry 的边界；
+- single provider attempt与Session logical retry的边界；MVP不启用Gateway transparent retry或transport fallback；
 - active Turn 内禁止 transparent cross-model fallback；
 - authentication、secret redaction、custom provider 和 concurrency 治理；
 - prompt cache、connection reuse 和 continuation 必须保持 full-request equivalence；
-- Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只执行由ModelGateway规划好的provider attempt，model resolution、retry/fallback、cache/continuation policy与terminal归一化仍归ModelGateway。
+- Rig provider差异只存在于private`ProviderAdapter`；`RigProviderAdapter`只执行由ModelGateway规划好的single attempt，底层SDK automatic retry固定为0；model resolution、cache/continuation policy与terminal归一化仍归ModelGateway，logical retry归SessionExecutor。
 
 完成门槛：
 
 - [x] ModelGateway 不重新组装 Prompt；
 - [x] PromptSet 是模型上下文的唯一 producer；
 - [x] provider adapter 差异不泄漏到 Session execution；
-- [x] 错误分类足以驱动 retry、compaction 或 terminal failure；
+- [x] AgentRun默认最多3次Session logical retry，CompactionSummary最多1次；
+- [x] delivery-safe transport/provider错误足以驱动logical retry、compaction或terminal failure；
+- [ ] OutputContract/finish-reason违约分类与retry语义由O9/L1冻结；
 - [x] provider cache/continuation 不是第二 conversation truth；
 - [ ] 执行协同交付束的Rig 0.40.0 integration spike；
 - [ ] 实现ModelGateway、ScriptedProviderAdapter、RigProviderAdapter和mock-server tests。
@@ -753,7 +755,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 本节记录 V1 与 V2 的模块/ADR 对应关系与归档位置。
 
 - V1 旧模块文档 `docs/modules/*` 与 V1 ADR `docs/adr/0001`–`docs/adr/0028` 已归档到 [`docs/archive/v1/`](../archive/v1/)，仅作历史参考，非权威。
-- V2 新架构由 [`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/)（12 篇模块文档）+ [`docs/adr/`](../adr/)（0100–0114）构成，是当前唯一权威事实来源。
+- V2新架构由[`docs/architecture.md`](../architecture.md) + [`docs/modules/`](../modules/) + [`docs/adr/`](../adr/)（0100–0119）构成，是当前唯一权威事实来源。
 
 子系统文档对应：
 
