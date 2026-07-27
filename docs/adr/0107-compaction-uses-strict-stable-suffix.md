@@ -14,7 +14,7 @@ MiniCore 已确立 Transcript-First 模型输入、by-entry JSONL storage、单�
 ## 决策
 
 1. Compaction 是 crate-internal 的纯 planning/validation 模块，不是 Runtime Service 或领域 entity。它只提供：context budget 计算、stable-unit projection、strict cut/protection planning、protected EntryId、portable summary directive 构造、summary input reduction 和结果/commit candidate 校验。它不构造 `ModelCallRequest`，不拥有 SessionWriter、ModelGateway、events、CancellationToken 或 Turn terminal state。
-2. SessionExecutor 是唯一的 orchestration owner：判断 trigger、驱动 `RunningOperation::CompactConversation`、调用 PromptSet 与 ModelGateway、仲裁 Steer/Cancel/revocation、执行 writer append/apply。
+2. SessionExecutor是唯一的orchestration owner：判断trigger、驱动`RunningOperation::CompactConversation`、调用PromptSet与ModelGateway、仲裁Steer/Cancel/SecurityRevoked、执行writer append/apply。
 3. automatic compaction 只在 active Turn 的 `NeedModel` safe point 评估，trigger 为 soft context pressure、Prompt local context overflow 和 provider context overflow。final assistant 完成后不做 eager post-turn compaction，也不提供 standalone/manual compaction。
 4. cut基于model-visible stable unit（一个UserMessage、一个无ToolCallAssistant Continue、一个完整ToolRound、一个final AssistantMessage或一个已有Compaction summary），只在unit boundary之间发生，不拆散任何协议稳定单元。
 5. summarized range 是非空连续 prefix，retained range 是非空连续 suffix，两者在 stable boundary 处相邻；projector 不从 history 中间删除任意 message。
@@ -22,7 +22,7 @@ MiniCore 已确立 Transcript-First 模型输入、by-entry JSONL storage、单�
 7. 重复 compaction 是 portable rolling summary：previous effective summary 与新 evicted stable units 被合成为一个新 summary，后接 retained suffix；每次只产生一个 effective leading summary。
 8. summary 生成使用 active Turn exact `TurnModelSnapshot`、`CompactionSummary` purpose 和 `NoToolCalls` output contract；PromptSet 是唯一 context 组装 seam，ModelGateway 是唯一 model-call seam，且不调用 provider-native compaction endpoint。summary source 只来自 `CommittedConversationPrefixView`；大 ToolResult 仅在 summary request representation 中带标记 reduction，durable Tool message 不被改写。
 9. SummaryModel 成功不立即改变 conversation。只有 `StoredCompaction` entry append/apply 成功后，trusted projector 才确定性构造 `Replace([summary] + retained suffix)`；此前旧 conversation 仍是模型可见的权威历史。caller 不能提交任意 replacement message 向量。
-10. `Compacting` 是 transient `TurnExecutionPhase`，保持 `TurnStatus = Running`。append/apply 是唯一 linearization point：append 前 Cancel 与 Workspace revocation 可获胜并取消 operation，Steer 只排队；成功后重建 ConversationSeed 和 private AgentLoop segment，并沿用同一 TurnExecutionContext。
+10. `Compacting`是transient `TurnExecutionPhase`，保持`TurnStatus = Running`。append/apply是唯一linearization point：append前Cancel与SecurityRevoked可获胜并取消operation，Steer只排队；成功后重建ConversationSeed和private AgentLoop segment，并沿用同一TurnExecutionContext。
 11. soft-pressure 失败只在原 ModelCallRequest 的 checkpoint、assembly fingerprint、execution version 和 control state 全部未变时才回退到未压缩调用；hard-overflow 失败 TurnFailed。同一 active Turn 最多一次 automatic overflow recovery，compact 后仍 overflow 则 TurnFailed，不做无界 compact-and-retry。
 12. compacted conversation 可从 storage 重建：restart replay validate durable `StoredCompaction` 并确定性 apply Replace，但绝不恢复 summary call、retry timer、CompactionPlan、provider continuation 或旧 AgentLoop。原始 entries 保持 append-only，在 Compaction entry 之前的 history branch 上仍可得未压缩历史。
 13. 首版不做 split-turn summary、hierarchical summary tree、provider-native compaction、cross-model fallback、standalone/manual compaction 或 deterministic conversation truncation；Runtime Interface 不公开 manual `CompactSession` 协议。

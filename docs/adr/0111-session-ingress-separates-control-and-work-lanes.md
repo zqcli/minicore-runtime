@@ -5,9 +5,9 @@
 
 ## 背景
 
-V2 原设计让 Submit、Steer、FollowUp、Interaction resolution、Tool control、Cancel、Workspace authorization revocation、PrepareForUnload 和 Snapshot 共用每个 Session 的一个 bounded FIFO。该形状保留了单 owner 和简单全序，但把容量和延迟也绑定在一起：大量普通输入或内部 Tool control 可以占满队列，使 Cancel、revocation cleanup、Interaction resolution 和 unload 只能等待前序工作排空。
+V2 原设计让Submit、Steer、FollowUp、Interaction resolution、Tool control、Cancel、authority security interruption、PrepareForUnload和Snapshot共用每个Session的一个bounded FIFO。该形状保留了single owner和简单全序，但把容量和延迟也绑定在一起：大量普通输入或内部Tool control可以占满队列，使Cancel、security cleanup、Interaction resolution和unload只能等待前序工作排空。
 
-Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新的 workspace-dependent append”，但资源释放、truthful Tool settlement 和 `TurnInterrupted` 仍需要 Executor及时运行；普通 Cancel 更没有独立的安全 backstop。单一 FIFO 因而不能同时满足 bounded backpressure、紧急控制响应和公平 admission。
+Authority hard restriction与普通Cancel都需要out-of-band sticky signal，使新operation立即受gate阻止，同时让Executor完成truthful Tool settlement和`TurnInterrupted`。单一FIFO不能同时满足bounded backpressure、紧急控制响应和公平admission。
 
 本决策只拆分 ingress seam，不拆分状态 owner。`SessionExecutor`、`SessionWriter`、committed projections、current Turn 和 terminal decision 仍各自只有一个 owner。完整设计见 [Session Execution](../modules/session-execution.md)。
 
@@ -24,7 +24,7 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO，配置保留容量 |
 | `ToolControl` | `ToolControlQueue` | 内部bounded FIFO |
 | `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；cancel epoch发布后立即返回typed accepted response |
-| `WorkspaceAuthorizationRevoked` | `EmergencyControl` | 先out-of-band revoke lease，再设置sticky signal |
+| `SecurityRevoked` | `EmergencyControl` | current SessionExecutionHandle-scoped sticky signal；关闭admission，存在Turn时进入truthful settlement |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion generation |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced immutable published view |
 
@@ -37,8 +37,8 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 `SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的target generation、emergency epoch、Steer admission gate和controlled append reservation：
 
 - Steer admission与final commit reservation first-wins；Steer先赢则candidate final转为Continue，final reservation先赢则拒绝新Steer；
-- Cancel signal与controlled append reservation first-wins；Cancel先赢则append不得开始并返回`CancelAccepted`，reservation先赢则该次短append完成且该Cancel返回typed transition/terminal error，不得先accepted再把Submit/Turn提交为Started/Completed；
-- reservation只跨一次`SessionWriter.append → apply`，signal发布不阻塞；Workspace-dependent append仍另行取得`WorkspaceCommitAuthorization`。
+- Cancel/SecurityRevoked signal与controlled append reservation first-wins；signal先赢则append不得开始，reservation先赢则该次短append完成，signal仍立即发布并在append后驱动cleanup；
+- reservation只跨一次`SessionWriter.append → apply`，signal发布不阻塞；不再叠加Workspace commit permit。
 
 LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`同样原子排序：admission先赢则Unload drain明确拒绝/清理该请求，stop先赢则直接返回stopping。Emergency、required cleanup control和Snapshot仍可进入。
 
@@ -46,10 +46,10 @@ LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`
 
 `ToolExecutionStarted` append/apply是副作用竞态的真实线性化点：
 
-- Cancel/revocation先被观察：拒绝新的execution start；
+- Cancel/SecurityRevoked先被观察：拒绝新的execution start；
 - `ToolExecutionStarted`先append/apply：副作用可以开始，之后必须保存真实outcome；Cancel只能best-effort取消，不能声称回滚。
 
-Workspace revocation先通过与`WorkspaceCommitAuthorization`共享的同步原语撤销lease，再以该lease/control generation设置signal并唤醒Executor。即使Executor尚未处理signal，revoked lease也会使后续authorization validation失败；future Turn捕获的新lease不继承旧revocation signal。
+Authority/host hard restriction先发布current security/policy fact，再通过Runtime current loaded map向对应`SessionExecutionHandle`设置sticky `SecurityRevoked`并唤醒Executor；存在candidate/current Turn时同时绑定其target generation。即使Executor尚未处理signal，owner-local admission gate与`TurnControlGate`也会阻止new admission/controlled append/Tool start/Model start。Idle直接resolve，Starting取消candidate，active Turn terminal后resolve；成功后signal retire。old handle关闭后不得把signal转发到new Executor，future Turn使用new Snapshot和target generation。
 
 ### Queued input 与 Cancel
 
@@ -96,8 +96,8 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 
 ## 后果
 
-- 普通输入backpressure不能阻塞Cancel/revocation signal；D1关闭。
-- 不再依赖跨类型全局FIFO；每个race必须由state validation、emergency epoch、authorization lease和durable append线性化点说明。
+- 普通输入backpressure不能阻塞Cancel/SecurityRevoked signal；D1关闭。
+- 不再依赖跨类型全局FIFO；每个race必须由state validation、emergency epoch和durable append线性化点说明。
 - lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate Cancel返回同一accepted epoch且不保存sender，PrepareForUnload继续复用shared completion generation。
 - Snapshot读取更轻，不会因工作队列拥塞而超时；持续观察必须使用snapshot-first subscription，不能假设单独Snapshot与某条mutation或后续subscribe形成顺序。
 - 仍只有一个SessionExecutor和一个SessionWriter；没有新增第二个conversation owner或并发mutation actor。
@@ -109,6 +109,7 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)删除跨SessionTool resource lock；本ADR的lane隔离、emergency与短append仲裁不变。
 2026-07-27：[ADR 0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md)明确不建设全局lock-rank系统；普通guard不跨await，controlled append使用typed permit和私有组合helper。
 2026-07-27：[ADR 0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)将Cancel response改为sticky epoch发布后立即确认；Finishing期间允许FollowUp排队，最终terminal通过StateEvent/Snapshot观察。
+2026-07-27：[ADR 0121](0121-workspace-updates-require-idle.md)删除active-Turn Workspace lease/revoke分支；Workspace definition只在Idle更新，authority hard restriction直接发布`SecurityRevoked` sticky signal。
 
 ## 被否决的方案
 

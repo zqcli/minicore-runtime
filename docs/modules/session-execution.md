@@ -57,7 +57,7 @@
 - Interaction request append/apply后才通知host；resolution append/apply后才恢复Tool执行；UserQuestion等待使用`WaitingForUserInput`且UI只负责presentation；
 - `tool_execution_started`append/apply后才允许外部副作用；
 - FollowUp使用process-local bounded FIFO，当前不承诺crash-safe delivery；Snapshot使用latest-wins mailbox，不占用mutation/control容量；
-- Cancel与Workspace authorization revocation使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；Cancel在线性化sticky epoch后立即返回typed accepted response，PrepareForUnload仍使用sticky lifecycle signal和shared completion generation；
+- Cancel与authority/host `SecurityRevoked`使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；Cancel在线性化sticky epoch后立即返回typed accepted response，PrepareForUnload仍使用sticky lifecycle signal和shared completion generation；
 - lane容量、拒绝和仲裁规则在`SessionIngress`内定义；一个Session的lane拥塞不能耗尽另一个Session的容量，但共享Model配额和宿主I/O仍可能形成跨Session等待；
 - Progress event可以合并或丢弃，不能影响request处理和durable state；
 - restart不恢复旧Context/Model/Tool异步操作，unfinished Turn按既有recovery规则终止。
@@ -195,20 +195,20 @@ pub(crate) enum CancelTarget {
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO并配置独立保留容量；只处理已存在的 Pending Interaction |
 | `ToolControl` | `ToolControlQueue` | bounded FIFO；approval、UserQuestion、execution-start 等内部 durable control |
 | `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；在线性化cancel epoch后立即返回`CancelAccepted`，不因普通lane满而延迟 |
-| `WorkspaceAuthorizationRevoked` | `EmergencyControl` | sticky signal；先撤销 lease，再唤醒 Executor |
+| `SecurityRevoked` | `EmergencyControl` | current SessionExecutionHandle-scoped sticky signal；关闭admission，存在candidate/current Turn时绑定target generation |
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion generation，可附 grace deadline |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced 请求，从 immutable published view 读取 |
 
 `SessionIngress`的外层唤醒机制可以是一个很小的 bounded wake channel，但 wake 只表示“某个 lane 有变化”，不承载请求本身；wake 丢失或合并时由 Executor 重新检查各 lane。因此普通工作容量不会成为 emergency、lifecycle 或 snapshot 的隐藏瓶颈。
 
-表中的`EmergencyControl`是`TurnControlGate`暴露的逻辑signal facet，不是另一个queue或owner。active target registration只由Executor在candidate/current Turn切换时发布；发送方只能针对该immutable `CancelTarget + generation`设置signal，不能修改Session state或把stale cancel重定向到新的Turn。
+表中的`EmergencyControl`是owner-local admission gate与`TurnControlGate`暴露的逻辑signal facet，不是另一个queue或owner。active target registration只由Executor发布。Cancel必须针对immutable `CancelTarget + generation`；SecurityRevoked通过current `SessionExecutionHandle`路由，并在存在candidate/current Turn时绑定其target generation。old/unloaded handle关闭结果路径后，发送方不能修改Session state，也不能把stale signal重定向到new Executor或Turn。
 
-`TurnControlGate`不是queue、actor或第二状态owner，而是`SessionIngress`内部的原子仲裁原语。它只保存active target generation、emergency epoch、Steer admission gate和短commit reservation：
+`TurnControlGate`不是queue、actor或第二状态owner，而是`SessionIngress`内部的原子仲裁原语。owner-local admission gate保存security admission状态；TurnControlGate保存active target generation、emergency epoch、Steer admission gate和短commit reservation：
 
 - `try_admit_steer(expected_turn_id)`与`reserve_final_commit(expected_generation)`原子排序。Steer admission先赢时candidate final必须保存为Assistant Continue；final reservation先赢时新Steer返回TurnCancelling/TurnNotRunning；
-- `publish_cancel(target, generation)`与`reserve_controlled_append(expected_epoch, kind)`原子排序。Cancel先赢时reservation失败；reservation先赢时该次短append获得胜利，Cancel仍立即设置token并在append后继续cleanup；
+- `publish_emergency(signal, optional_target_generation)`与admission/`reserve_controlled_append(expected_epoch, kind)`原子排序。Cancel或SecurityRevoked先赢时对应admission/reservation失败；reservation先赢时该次短append获得胜利，signal仍立即sticky并在append后继续cleanup；
 - reservation只跨一次短`SessionWriter.append → apply`，不跨Model/Tool I/O、approval或完整Turn；signal发布不阻塞，只记录pending epoch并唤醒Executor；
-- 所有以“没有winning emergency”为前置条件的append都必须使用controlled reservation，至少包括initiating UserMessage、Model-produced Assistant、`ToolExecutionStarted`、`tool_round_completed`和active-Turn StoredCompaction；Workspace-dependent append还必须同时取得`WorkspaceCommitAuthorization`。
+- 所有以“没有winning emergency”为前置条件的append都必须使用controlled reservation，至少包括initiating UserMessage、Model-produced Assistant、`ToolExecutionStarted`、`tool_round_completed`和active-Turn StoredCompaction；不再叠加第二个Workspace commit permit。
 - append返回`NotCommitted`时释放reservation并先观察pending emergency，再决定是否重新reserve并重试同一draft；`OutcomeUnknown`时保持admission closed、poison writer并按既有保守终结规则处理，不能以旧epoch盲重试。
 
 `LifecycleControl`的stop-admission transition与Submit/Steer/FollowUp的`try_admit`原子排序：input admission先赢时PrepareForUnload必须在drain中明确拒绝/清理它；stop-admission先赢时发送方直接得到`ExecutorStopping`。Emergency、required cleanup control和Snapshot不受该gate阻止。
@@ -226,7 +226,7 @@ Admission规则：
 - `InputMailboxControl`不直接发布Runtime状态；Executor完成remove、更新immutable snapshot view并发布`queue_updated`后才完成`CancelQueuedMessage` response，因此不产生第二个StateEvent owner；
 - `Cancel`重复请求只按相同`CancelTarget + target generation`合并，并立即返回同一accepted cancel epoch；EmergencyControl不保存completion sender，stale target不得触发当前或下一Turn的cancellation token；
 - Emergency signal在目标terminal/取消完成后retire，新的Turn使用新的target generation和CancellationToken；
-- revocation signal绑定被撤销的Workspace lease/control generation；future Turn捕获新lease后不继承旧signal；
+- SecurityRevoked signal绑定current `SessionExecutionHandle`，并在存在candidate/current Turn时绑定`CancelTarget + target generation`；重新resolve完成后retire，不得影响future Turn；
 - `PrepareForUnload`重复请求订阅同一个completion generation，effective grace deadline取现有与新请求的最早值，后续请求不能延长shutdown；
 - Snapshot 请求不改变任何 mutation lane 的顺序，不等待普通 queue 排空。
 
@@ -250,7 +250,7 @@ SessionExecutor处理Tool control request时必须重新验证：
 - expected SessionId和TurnId；
 - execution version；
 - ItemId/ToolCallId仍属于current Running Turn；
-- Turn没有Cancel或security revocation；
+- Turn没有Cancel或SecurityRevoked；
 - Interaction状态与approval/UserQuestion family匹配；
 - Workspace authorization和Tool policy仍允许继续；
 - required entry append/apply成功。
@@ -351,7 +351,7 @@ pub(crate) struct CompactionRecoveryBasis {
 
 - Compaction成功append/apply并Replace conversation；
 - Cancel；
-- security revocation；
+- SecurityRevoked；
 - Turn进入terminal处理。
 
 递增version不能撤销已经append的entry，也不能丢弃已经可能发生副作用的Tool outcome。
@@ -483,7 +483,7 @@ loop {
 
 各 lane 没有隐含的全局 FIFO。Executor在每个安全点按当前状态仲裁，固定优先级为：
 
-1. `EmergencyControl` 与 `LifecycleControl`：先应用新的 cancel/revocation epoch，停止 admission；卸载 deadline 到期时 fail-closed；
+1. `EmergencyControl`与`LifecycleControl`：先应用新的Cancel/SecurityRevoked epoch，停止admission；卸载deadline到期时fail-closed；
 2. 已完成的operation result和terminal cleanup；它们负责兑现已经发生的durable work；
 3. `InteractionControlQueue`：只处理当前 Pending Interaction 的 resolution，append/apply 后再恢复 Tool；
 4. 当前 Tool round 需要的 `ToolControlQueue` 请求；每次只消费 bounded burst，避免 control flood 持续饿死普通 admission；
@@ -611,10 +611,10 @@ Submit
 → composition result identity/version validation
 → 与Agent status update串行化
 → final AgentStatus = Enabled check
-→ 取得WorkspaceCommitAuthorization
+→ reserve TurnControlGate controlled append
 → append/apply TurnContext
 → append/apply UserMessage(source=Input)
-→ release WorkspaceCommitAuthorization
+→ release controlled reservation
 → 释放Agent status synchronization
 → 创建CurrentTurnExecution和AgentLoop
 → state = Running
@@ -713,11 +713,10 @@ AgentLoop NeedModel
 
 ```text
 AgentLoop NeedTools { finalized response, calls }
-→ 观察`EmergencyControl`最新epoch并重新检查Workspace authorization lease
-→ Cancel/revocation获胜：不保存Assistant(Intermediate)，进入Interrupted处理
-→ Turn仍Running：取得WorkspaceCommitAuthorization
+→ 观察`EmergencyControl`最新epoch并reserve controlled append
+→ Cancel/SecurityRevoked获胜：不保存Assistant(Intermediate)，进入Interrupted处理
 → append/apply Assistant(Intermediate)
-→ release WorkspaceCommitAuthorization
+→ release controlled reservation
 → ToolInvocation projection = Started
 → phase = ExecutingTools
 → 启动ToolSet.execute；需要approval时phase = WaitingApproval，需要ask-user时phase = WaitingForUserInput
@@ -744,7 +743,7 @@ preflight / schema / hook / policy
 → ask-user route完成后，才允许同一assistant step的其他ToolCall进入普通调度
 ```
 
-等待期间不启动 sibling ToolCall，不预留file mutation ticket，也不取得`WorkspaceCommitAuthorization`。UserQuestion解决后，剩余调用才按原始请求顺序和既有mutation queue/Serial批次规则继续；不改变ToolResult的稳定返回顺序。
+等待期间不启动 sibling ToolCall，不预留file mutation ticket，也不持有TurnControl reservation。UserQuestion解决后，剩余调用才按原始请求顺序和既有mutation queue/Serial批次规则继续；不改变ToolResult的稳定返回顺序。
 
 Tool结果处理：
 
@@ -752,11 +751,10 @@ Tool结果处理：
 ToolExecutionOutcome[]
 → 每个Completed outcome append/apply role=tool message
 → 任一Abandoned：append/apply ToolAbandoned并进入Turn terminal处理
-→ 全部Completed：再次观察`EmergencyControl`和WorkspaceAuthorization lease
-→ Cancel/revocation已生效：保留tool messages，不append tool_round_completed，完成Interrupted处理
-→ Turn仍Running：取得WorkspaceCommitAuthorization
+→ 全部Completed：再次观察`EmergencyControl`并reserve controlled append
+→ Cancel/SecurityRevoked已生效：保留tool messages，不append tool_round_completed，完成Interrupted处理
 → append/apply tool_round_completed
-→ release WorkspaceCommitAuthorization
+→ release controlled reservation
 → conversation projection加入assistant/tool sequence
 → AgentLoop.accept_committed_tool_round
 → current Turn的SteerQueue.pop_front()
@@ -772,7 +770,7 @@ ToolExecutionOutcome[]
 - Tool message append OutcomeUnknown时poison writer并保守终结，不在本run重试该append，也不重新执行Tool；该unacked tool message可能丢失，恢复时该round不完整按Abandon处理，由模型重跑工具；
 - exact ToolResult必须保存，即使Cancel已经发生；
 - outcome unknown不能生成Tool message；
-- Cancel/security revocation在tool messages之后、`tool_round_completed`之前生效时，truthful results保持durable但不进入conversation；
+- Cancel/SecurityRevoked在tool messages之后、`tool_round_completed`之前生效时，truthful results保持durable但不进入conversation；
 - `tool_round_completed`必须exact cover assistant中的全部ToolCall；
 - 下一次Model操作必须等待该entry append/apply；
 - Tool result progress不是durable Item。
@@ -879,7 +877,7 @@ current Turn通过自身正常流程terminal后
 - 每个terminal Turn后最多pop一条FollowUp；其余保持FIFO并等待后续Turn terminal。该 admission 后重新检查 `TurnAdmissionQueue`，连续最多处理一条 FollowUp 后让 external Submit 获得一次公平机会；
 - 仍在queue中的FollowUp可以按CommandId直接remove；撤销后不重新入队；
 - FollowUp不持久化，restart后不恢复；
-- FollowUp不复用旧TurnId、Context、ToolSet、PromptSet、SkillView或Workspace lease；
+- FollowUp不复用旧TurnId、Context、ToolSet、PromptSet、SkillView或WorkspaceSnapshot；
 - previous Turn Completed、Interrupted或Failed后都可以重新admit FollowUp；
 - 如果Session变为Archived、Deleted、Unavailable或Agent Disabled，已pop FollowUp admission失败并发布typed rejection；该消息不重新入队；
 - PrepareForUnload拒绝新的FollowUp，并清理且明确结束尚未执行的 queued Steer/FollowUp；
@@ -890,19 +888,19 @@ current Turn通过自身正常流程terminal后
 ```text
 AgentLoop Finished { finalized response }
 → 停止新的Model/Tool操作
-→ 观察`EmergencyControl`最新epoch并重新检查Workspace authorization lease
-→ Cancel/revocation先处理：进入Interrupted流程
+→ 观察`EmergencyControl`最新epoch
+→ Cancel/SecurityRevoked先处理：进入Interrupted流程
 → 按current Turn的SteerQueue分支
-   ├─ 非空：取得WorkspaceCommitAuthorization
+   ├─ 非空：reserve controlled append
    │  → append/apply Assistant(Intermediate Continue)
-   │  → release WorkspaceCommitAuthorization
-   │  → pop_front一条Steer并append/apply UserMessage
+   │  → release reservation
+   │  → pop_front一条Steer，重新reserve并append/apply UserMessage
    │  → rebuild AgentLoop segment并继续Running
-   └─ 空且lease有效：取得WorkspaceCommitAuthorization
+   └─ 空：reserve final commit
       → state = Finishing
       → 验证无Pending Interaction、Started ToolInvocation或未完成ToolCall Intermediate
       → append/apply Assistant(Final)
-      → release WorkspaceCommitAuthorization
+      → release final reservation
       → drop AgentLoop和TurnExecutionContext
       → state = Idle
       → 在FollowUpQueue与TurnAdmissionQueue间执行公平admission或保持Idle
@@ -970,43 +968,35 @@ candidate已进入Starting
 → state = Idle
 ```
 
-## Workspace Authorization Revocation
+## Authority Security Interruption
 
-Workspace-dependent conversation entry使用private `WorkspaceCommitAuthorization`消除authorization check与append之间的竞态。覆盖initiating TurnContext/UserMessage、Steer UserMessage、Model-produced Assistant、`tool_round_completed`和active-Turn `StoredCompaction`：
-
-```text
-WorkspaceAuthorizationLease.authorize_commit()
-→ 与WorkspaceAuthorizationControl.revoke()使用同一同步原语排序
-→ revocation先线性化：authorize_commit失败，不允许append
-→ authorize_commit先线性化：短暂持有authorization，完成append/apply后释放
-→ revoke等待已有authorization释放，然后标记lease revoked
-```
-
-`WorkspaceCommitAuthorization`只跨越一次短SessionWriter append/apply sequence，不能跨Model/Tool I/O、request handler等待或完整Turn。它不替代entry append线性化点；它保证revocation不可能在authorization validation和对应append之间生效。
-
-WorkspaceAuthorizationControl撤销当前lease后，设置`EmergencyControl`中的sticky revocation signal并唤醒Executor；不等待普通 lane 的容量。
+WorkspaceAuthority或host发布hard restriction后，Runtime通过current loaded map向受影响`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`；存在candidate/current Turn时同时绑定target generation。它不是Workspace definition update，不原地替换active Snapshot，也不携带lease identity。
 
 ```text
-WorkspaceAuthorizationRevoked
-→ 重新检查current Turn使用的lease已经revoked
-→ execution_version += 1
-→ state = Finishing
+SecurityRevoked(optional_target_generation)
+→ owner-local admission gate立即拒绝new Turn admission
+→ Idle：旧Snapshot停止admit，直接重新resolve
+→ Starting：取消candidate，不创建领域Turn，然后重新resolve
+→ Running/Finishing：TurnControlGate signal first-wins后拒绝新的append/Tool/Model start
+→ execution_version += 1，state = Finishing
 → cancel Context/Model和可取消Tool operation
-→ 已开始副作用的Tool按Cancel规则确认outcome
+→ 已开始副作用的Tool按Cancel规则确认exact outcome或ToolAbandoned
 → 不append缺失的tool_round_completed
 → append/apply TurnInterrupted(SecurityRevoked)
-→ release current Turn
-→ state = Idle或Unavailable
+→ release current Turn（若存在）
+→ 使用current durable Workspace definition/current authority重新resolve
+→ Ready + Idle，或Unavailable
 ```
 
 规则：
 
-- Model启动和ToolExecutionStarted记录前重新检查lease；workspace-dependent conversation entry必须在WorkspaceCommitAuthorization内append/apply；
-- 即使Executor尚未消费唤醒，已revoked lease也必须使authorization validation失败；
-- revocation不能撤回provider已经看到的内容，也不能回滚已发生副作用；
+- `SecurityRevoked`与controlled append、final reservation和`ToolExecutionStarted`只使用现有`TurnControlGate` epoch排序；signal先赢则operation不得开始，reservation/start先赢则短append或已开始副作用完成truthful settlement；
+- signal不等待bounded lane，不需要第二个Workspace permit或handle registry；
+- interruption不能撤回provider已经看到的内容、已经打开的OS handle或已发生副作用；
 - 已append但conversation-hidden的assistant/tool entries保持durable；
-- Starting期间revocation取消candidate Submit，不创建领域Turn；
-- FollowUp重新admit时使用current readiness和新的WorkspaceSnapshot。
+- Idle/Starting也必须失效旧Snapshot：Idle直接resolve，Starting取消candidate后resolve，不等待创建Turn；
+- FollowUp可在Finishing期间排队，但只有terminal、重新resolve且Ready后才能admit；
+- signal是process-local control fact。restart无法从durable evidence证明security cause时使用`HostRestart`或`RecoveryContextUnavailable`，不猜测`SecurityRevoked`。
 
 ## Failure流程
 
@@ -1066,7 +1056,7 @@ Model/CompactionSummary operation retryable failure
 
 Retry delay使用`RunningOperation::WaitForModelRetry`中的timer，不阻塞SessionIngress scheduler或control loop。旧Model/Compaction operation必须terminal并移除后才能创建该delay operation；delay terminal并移除后才能创建下一次Model/Compaction operation，因此`current_operation`仍是唯一execution-local work state。
 
-delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_count`、`ready_at`和恢复下一operation所需的最小typed `ModelRetryResume`，不分配attempt ID，也不是`ModelAttemptState`。AgentRun resume没有额外数据；CompactionSummary resume只保留source、scope和plan fingerprint，summary directive、assembled context与request proof继续由同一个immutable request提供。timer到期后必须先处理已经到达的Cancel/revocation/Steer，再决定是否启动下一次single-attempt Gateway operation。成功response、新ModelCallRequest或失效control会清除该调用链计数。
+delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_count`、`ready_at`和恢复下一operation所需的最小typed `ModelRetryResume`，不分配attempt ID，也不是`ModelAttemptState`。AgentRun resume没有额外数据；CompactionSummary resume只保留source、scope和plan fingerprint，summary directive、assembled context与request proof继续由同一个immutable request提供。timer到期后必须先处理已经到达的Cancel/SecurityRevoked/Steer，再决定是否启动下一次single-attempt Gateway operation。成功response、新ModelCallRequest或失效control会清除该调用链计数。
 
 logical retry不得通过timeout race留下仍可回传结果的旧本地future。若取消无副作用Model future，必须先安全drop并关闭旧结果路径；provider端可能继续生成或计费只属于delivery/telemetry风险，不允许形成第二个SessionExecutor result。
 
@@ -1103,11 +1093,11 @@ provider ContextOverflow也回到同一流程。同一`source checkpoint + scope
 规则：
 
 - Compaction不替换TurnExecutionContext、TurnModelSnapshot或PromptSet；
-- 启动Compaction不推进execution_version；成功Replace后推进，Cancel/revocation仍立即推进；
+- 启动Compaction不推进execution_version；成功Replace后推进，Cancel/SecurityRevoked仍立即推进；
 - `ConversationPrefix`压缩pre-Turn history；`ActiveTurnCompletedPrefix`保留exact initiating/Steer UserMessage anchors，并在每个instruction segment内滚动摘要已完成的早期stable units；
 - Pending/Started/incomplete ToolRound、explicit protected units和recent exact tail不进入active checkpoint coverage；
 - summary output budget必须在plan阶段与pinned model known limits和summary call context空间求交，并进入plan fingerprint；SessionExecutor在append前用`CompactionCommitCandidate`/`ModelCallRequest` proof复核该临时一致性，storage cold replay只验证durable entry关系；
-- `Compacting`期间Steer排队，Cancel和Workspace revocation可以取消operation并在append前获胜；
+- `Compacting`期间Steer排队，Cancel和SecurityRevoked可以取消operation并在append前获胜；
 - Compaction result append前必须重新验证source checkpoint和TranscriptFingerprint；
 - soft-pressure失败只有在原ModelCallRequest仍exact valid时才能继续；
 - hard overflow失败时TurnFailed；successful compact后仍overflow只在存在新可行scope/frontier且次数有余量时再次plan，否则`ContextStillTooLargeAfterCompaction`；
@@ -1212,7 +1202,7 @@ SessionExecutor是唯一状态修改者。线性化点：
 | Tool允许副作用 | ToolExecutionStarted append |
 | Tool result确定 | Tool message append |
 | Tool round进入conversation | tool_round_completed append |
-| Workspace authorization revocation | WorkspaceAuthorizationControl.revoke |
+| Authority/host security interruption | `EmergencyControl::SecurityRevoked` epoch publication；durable completion仍是TurnInterrupted append |
 | Cancel触发 | `EmergencyControl` cancel epoch发布；durable完成点仍是terminal append |
 | PrepareForUnload | `LifecycleControl` stop-admission epoch发布；完成点是ReadyToUnload |
 | Snapshot | latest immutable view读取；subscription初始Snapshot与subscriber注册原子完成 |
@@ -1224,15 +1214,15 @@ SessionExecutor是唯一状态修改者。线性化点：
 
 - 只承诺lane内FIFO；不同lane之间不承诺按调用时间或wake时间形成全局顺序；
 - operation result与lane同时ready时，先应用emergency/lifecycle signal，再优先完成已经发生的operation outcome和terminal cleanup；
-- 处理`ToolExecutionStarted`前必须观察最新emergency epoch；Cancel/revocation先被观察则拒绝start，start append先完成则副作用可以开始并必须保存真实outcome；
-- Tool results全部保存后、append `tool_round_completed`前，再观察`EmergencyControl`和authorization lease；
-- 处理Finished candidate前观察`EmergencyControl`并重新检查authorization lease；若current Turn的SteerQueue已非空则保存Assistant Continue而不是Final；
+- 处理`ToolExecutionStarted`前必须观察最新emergency epoch；Cancel/SecurityRevoked先被观察则拒绝start，start append先完成则副作用可以开始并必须保存真实outcome；
+- Tool results全部保存后、append `tool_round_completed`前，再观察`EmergencyControl`并reserve controlled append；
+- 处理Finished candidate前观察`EmergencyControl`；若current Turn的SteerQueue已非空则保存Assistant Continue而不是Final；
 - control lane按bounded burst消费；每个burst结束重新poll operation result、lifecycle signal和普通admission，防止control flood无限饿死工作；
 - terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且此刻信箱中有external Submit，则先选Submit。本次decision未选中的Submit立即返回SessionBusy；decision之后到达的Submit按Session当时状态处理，不作为隐式FollowUp等待；
 - 仲裁只读取当前已观察到的lane/signal，不等待未来request；
-- workspace-dependent conversation entry的append必须持有WorkspaceCommitAuthorization；它与WorkspaceAuthorizationControl.revoke的先后顺序决定append还是revocation获胜；
-- 同时需要两种保护时，先取得非阻塞`TurnControlGate` reservation，再取得`WorkspaceCommitAuthorization`，然后执行一次append/apply；authorization失败则立即释放reservation。TurnControlGate不等待signal，因此不形成反向锁等待；
-- 不涉及Workspace authorization的其他append在emergency检查完成后可以继续，并成为该race的线性化结果；
+- 依赖current Turn继续有效的conversation append统一使用`TurnControlGate` reservation；它与Cancel/SecurityRevoked signal的先后顺序决定append还是interruption获胜；
+- TurnControlGate reservation是唯一control commit permit，不再叠加Workspace authorization permit；
+- cleanup/terminal append按对应Finishing规则执行，不因security signal重复产生terminal事实；
 - 每个处理函数结束时state和projections必须保持合法；
 - 任何异步operation不能直接修改SessionExecutor字段。
 
@@ -1244,9 +1234,9 @@ MiniCore不建立覆盖全Runtime的lock-rank系统。并发安全依赖single o
 - Agent/Session lifecycle状态只在短同步作用域内读取、clone、CAS或替换；durable mutation完成后先释放gate，再通知loaded Executor；
 - 有意跨await的一次一个操作使用typed permit/semaphore，只允许覆盖文档指定的bounded append/apply sequence；
 - Agent start commit使用私有组合操作固定final AgentStatus check、controlled append和permit释放，调用方不能自行嵌套同步原语；
-- Workspace-dependent append使用私有`append_workspace_controlled(...)`等价helper固定`TurnControl reservation → WorkspaceCommitAuthorization → append/apply`；
+- controlled append使用私有helper固定`TurnControl reservation → append/apply → release`；
 - Model permit、file mutation ticket、Tool/Sandbox、approval、UserQuestion和provider I/O等待期间零持有上述短guard；
-- Workspace revoke和lifecycle/emergency signal不等待SessionExecutor acknowledgement或terminal cleanup；
+- SecurityRevoked和lifecycle/emergency signal不等待SessionExecutor acknowledgement或terminal cleanup；
 - Rust实现启用Clippy`await_holding_lock`，并把Tokio Mutex/RwLock guard列入`await_holding_invalid_type`；typed permit的例外必须显式记录理由。
 
 ## Multi-Session并发
@@ -1296,7 +1286,6 @@ pub enum SessionExecutionError {
     NoRunningTurn,
     TurnCancelling,
     ExpectedTurnMismatch,
-    WorkspaceAuthorizationRevoked,
     InteractionNotFound,
     InteractionAlreadyResolved,
     ToolControlRejected,
@@ -1349,7 +1338,7 @@ AgentLoop internal state
 Context/UserMessage composition/Model/Tool/Compaction async operation
 approval waiter
 provider continuation/session
-Workspace authorization lease
+process-local EmergencyControl signal/target generation
 ```
 
 如果terminal entry已存在但projection仍有Pending Interaction或Started Item，load fail closed并要求explicit repair。
@@ -1408,7 +1397,7 @@ MVP性能要求：
 - non-empty Refused response仍进入candidate Finished并可truthful append；
 - request delivery outcome unknown和first semantic delta后的stream failure不由Gateway blind retry；
 - logical retry只在旧Model operation terminal/remove后启动；不存在两个可向Executor返回结果的同Session Model future；
-- Finished candidate在Steer FIFO为空且Cancel/revocation未获胜时才append final；
+- Finished candidate在Steer FIFO为空且Cancel/SecurityRevoked未获胜时才append final；
 - Finished candidate遇到queued Steer时保存为model-visible Assistant Continue，再消费一条Steer；
 - Steer admission与final commit reservation双向race：Steer先赢转Continue，reservation先赢拒绝Steer；
 - NeedTools result无论Steer queue是否非空都先完成assistant/tool/tool_round_completed序列；
@@ -1422,7 +1411,7 @@ MVP性能要求：
 - Assistant(Intermediate)先于Tool执行；
 - Cancel在ToolExecutionStarted前获胜时不执行副作用；
 - ToolControlQueue已满时Cancel仍可设置EmergencyControl；
-- record_execution_start处理前观察到Cancel/revocation epoch时被拒绝；
+- record_execution_start处理前观察到Cancel/SecurityRevoked epoch时被拒绝；
 - ToolExecutionStarted先获胜时Cancel不声称回滚；
 - Cancel signal与ToolExecutionStarted controlled reservation双向race均有唯一结果，signal发布不因reservation阻塞；
 - approval request append-before-notify；
@@ -1488,11 +1477,14 @@ MVP性能要求：
 - cancel epoch发布后新的同Turn Steer被拒绝，epoch前accepted Steer被清理；
 - 普通lane全部满时Cancel仍立即发布sticky signal；
 - Cancel不清空FollowUp或其他Submit；
-- WorkspaceAuthorizationRevoked during Starting/Compacting/Sampling/WaitingApproval/WaitingForUserInput/ExecutingTools；
-- WorkspaceAuthorizationRevoked不等待任何bounded FIFO容量；
-- revoked lease/control generation的signal不影响捕获新lease的future Turn；
-- revoked lease使Model start、record_execution_start和tool_round_completed validation失败；
-- WorkspaceCommitAuthorization与revoke双向race：revoke先赢时不append，authorization先赢时完成短append后再中断；
+- SecurityRevoked during Starting/Compacting/Sampling/WaitingApproval/WaitingForUserInput/ExecutingTools；
+- SecurityRevoked while Idle closes admission, invalidates old Snapshot and resolves without creating TurnInterrupted；
+- SecurityRevoked不等待任何bounded FIFO容量；
+- stale target generation的signal不影响terminal后重新resolve并启动的future Turn；
+- SecurityRevoked与Model start、ToolExecutionStarted、controlled append双向race遵循TurnControlGate first-wins；
+- started Tool在security interruption下保存exact outcome或ToolAbandoned；
+- terminal后Workspace重新resolve success Ready、failure Unavailable；
+- open fd或已进入kernel/provider的operation不承诺动态撤销；
 - Running failure关闭Pending/Started state；
 - projection apply failure触发replay；
 - replay failure使Session Unavailable。

@@ -190,7 +190,7 @@ impl SkillService {
 
 - 使用Turn捕获的`SkillEntry.location`定位source；
 - 使用与该view相同的`SkillViewContext`；
-- 在实际读取时校验Workspace authorization lease和source stamp仍有效；
+- 在实际读取时校验source stamp、operation identity/version和TurnControl basis仍有效；
 - 不重新查询reload后的current view。
 
 本设计采用常规弱一致性：尚未加载的entry在文件变化后可能读到新正文；已经返回的`Arc<LoadedSkill>`和已经committed的UserMessage不被修改。
@@ -218,7 +218,7 @@ pub struct SkillSourceReadRequest<'a> {
 }
 ```
 
-Workspace Skill source adapter只能使用`SkillViewContext.workspace`中的authorized source roots，并在discover/read时校验authorization lease和source stamp。BuiltIn/User adapter可以忽略Workspace roots，但不能伪造Workspace source stamp。本设计不定义BuiltIn/User/Workspace/Agent/Session等来源层级和优先级。
+Workspace Skill source adapter只能使用`SkillViewContext.workspace`中的authorized source roots，并在discover/read时校验source stamp和current operation basis。BuiltIn/User adapter可以忽略Workspace roots，但不能伪造Workspace source stamp。SecurityRevoked取消active source operation；Workspace definition update只在Session Idle。本设计不定义BuiltIn/User/Workspace/Agent/Session等来源层级和优先级。
 
 ```rust
 pub struct DiscoveredSkill {
@@ -344,8 +344,8 @@ SkillCacheKey {
 cache 规则：
 
 - 同一个 key 返回同一个或等价的不可变 `Arc<SkillContent>`；
-- content cache不保存authorization lease；
-- 每次`load()`都校验entry来源、source stamp和authorization lease，再包装新的`LoadedSkill`；
+- content cache不保存process-local cancellation/security signal；
+- 每次`load()`都校验entry来源、source stamp和operation basis，再包装新的`LoadedSkill`；
 - 不同Session或source grant可以共享相同正文bytes，但不能共享错误provenance；
 - cache不改变SkillMetadata或已发布SkillView；
 - cache eviction不改变current view；
@@ -539,7 +539,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - [ ] 定义 SkillMetadata 和 SkillContent 的最终字段。
 - [x] 定义SkillViewContext的Session/Agent identity与WorkspaceSkillContext输入。
 - [x] 确定load使用captured SkillEntry，不重新查询reload后的current view。
-- [x] 确定Workspace Skill source adapter在discover/read时强制校验context、lease和source stamp。
+- [x] 确定Workspace Skill source adapter在discover/read时强制校验context、source stamp和operation basis。
 - [x] 确定current SkillView只在显式reload成功后原子替换。
 - [ ] 定义 SkillScope。
 - [ ] 定义 SkillName 冲突和 namespace 规则。

@@ -238,7 +238,7 @@ pub trait PromptSourceAdapter: Send + Sync {
 
 首版只需要Runtime built-in和用户配置source。AgentDefinition与SessionDefinition引用这些共享definition，不拥有独立source adapter。
 
-Workspace project instructions不进入共享PromptResourceView。`for_turn()`使用同一个Turn-pinned `WorkspacePromptContext`读取已授权source并生成User context section。该context至少包含canonical cwd、primary root、已授权Prompt source roots、authorization lease和WorkspacePromptFingerprint；它不包含write capability，也不能从filesystem-readable additional roots自行扩大Prompt source。完整定义见[Workspace子系统架构设计](workspace.md)。
+Workspace project instructions不进入共享PromptResourceView。`for_turn()`使用同一个Turn-pinned `WorkspacePromptContext`读取已授权source并生成User context section。该context至少包含canonical cwd、primary root、已授权Prompt source roots和WorkspacePromptFingerprint；它不包含write capability，也不能从filesystem-readable additional roots自行扩大Prompt source。active Turn期间Workspace definition不热更新；SecurityRevoked通过Turn control取消相关source operation。完整定义见[Workspace子系统架构设计](workspace.md)。
 
 ## PromptDefinition
 
@@ -260,7 +260,7 @@ pub enum PromptProvenance {
 }
 ```
 
-共享Prompt content cache key不能只使用PromptId；必须覆盖definition version和provenance。Workspace project instruction保留独立`WorkspaceSourceRef`，撤销对应Workspace lease后，active Turn不得再次使用该PromptSet发起模型调用。
+共享Prompt content cache key不能只使用PromptId；必须覆盖definition version和provenance。Workspace project instruction保留独立`WorkspaceSourceRef`；SecurityRevoked获胜后，active Turn不得再次使用该PromptSet发起模型调用，terminal后new Turn必须从重新resolved Workspace捕获new context。
 
 ```rust
 pub enum PromptRole {

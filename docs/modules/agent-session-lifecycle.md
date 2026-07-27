@@ -57,9 +57,9 @@ MiniCore 采用 Codex/Grok 的 durable/live 分离，但比这些项目更严格
 - Session 不持有 `Arc<PromptService>`、`Arc<ToolService>`、`Arc<SkillService>` 或 ModelGateway；
 - Runtime 在 loaded Session execution / Turn capture 时注入这些依赖；
 - active Turn pin exact AgentRevisionRef 和 SessionDefinitionRevision；
-- definition update 只影响 future Turn，Workspace security restriction 仍可 revoke active Turn；
+- loaded Session的Workspace definition update只在Idle时接受；authority hard restriction通过SecurityRevoked中断active Turn；
 - Session fork 复制 exact SessionDefinition 内容，但创建新的 SessionId 和独立 revision 序列；
-- fork不复制loaded state、WorkspaceSnapshot、lease、PromptSet、ToolSet、SkillView或provider session；
+- fork不复制loaded state、WorkspaceSnapshot、security signal、PromptSet、ToolSet、SkillView或provider session；
 - process restart 后所有 Session 都视为 unloaded；不恢复旧 stream、Tool task、approval waiter 或 AgentLoop state。
 
 ## 领域关系
@@ -299,7 +299,7 @@ Arc<PromptService>
 Arc<ToolService>
 Arc<SkillService>
 ModelGateway
-WorkspaceSnapshot / authorization lease
+WorkspaceSnapshot / process-local security signal
 SkillView / LoadedSkill
 ToolSet / PromptSet
 conversation hot projection
@@ -351,30 +351,30 @@ expected SessionDefinitionRevision
 → 原子移动 Session current pointer
 ```
 
-active Turn、Steer、retry 和 compaction继续使用旧 capture；在 update 线性化点之后开始 admission 的 future Turn 使用新 revision。
+active Turn、Steer、retry和compaction继续使用old capture；非Workspace字段update线性化后admit的future Turn使用new revision。Workspace字段update对loaded Session另有Idle前置条件。
 
 loaded Session只能缓存current definition head作为可丢弃projection。definition update成功commit后，execution owner在同一per-session lifecycle synchronization内应用新的committed pointer；Turn admission仍以durable current head/CAS为准，不能因为loaded cache过期而继续创建旧revision的future Turn。
 
-Workspace security restriction 是例外，分为两条 fail-closed 路径：
+Workspace definition与authority hard restriction分为两条路径：
 
 ```text
-definition-changing restriction
+Workspace definition patch on loaded Session
+→ require SessionExecutionState = Idle；否则SessionBusy
 → resolve/validate candidate
-→ revoke 受影响的旧 authorization lease
 → durable commit 新 SessionDefinitionRevision
-→ 通知 execution owner并 terminalize 受影响 active Turn
-→ 发布 future WorkspaceSnapshot
+→ execution owner原子发布新WorkspaceSnapshot
 → 返回 update success
 
-authority-only restriction
-→ authority在自己的publication synchronization内原子发布新authority revision/policy并revoke旧lease
-→ 通知 execution owner并 terminalize 受影响 active Turn
+authority/host hard restriction
+→ authority或host先发布current policy/security fact
+→ 通过current SessionExecutionHandle向affected loaded Session发布sticky SecurityRevoked
+→ Idle直接失效old Snapshot；Starting取消candidate；active Turn停止新operation、truthful settle并TurnInterrupted
 → 使用 current exact SessionDefinition 重新 resolve
 → 发布受限的新 Snapshot，或 SessionReadiness = Unavailable
 → SessionDefinitionRevision 不变
 ```
 
-若 definition-changing 路径在 revoke 后 commit 失败，旧 definition 仍是 durable current，但旧 lease 不得恢复；Session readiness 进入 Unavailable，等待从 durable truth 重新 resolve/repair。不能出现security update已对调用方确认而旧lease仍能通过model/tool/skill authorization validation的窗口。
+Workspace candidate resolve或durable commit失败时，旧definition与旧Snapshot保持current，不存在“已撤权但未提交”的状态。SecurityRevoked不承诺撤销已经打开的OS handle或回滚已进入kernel/provider的operation；started Tool使用Cancel相同的truthful settlement规则。
 
 ## Session Pin Agent Revision
 
@@ -447,7 +447,7 @@ Deleted → terminal
 | Archived | 是 | 否 | 否 | 是 | 否 |
 | Deleted | audit/repair only | 否 | 否 | 否 | 否 |
 
-`Open` 表示 durable Session 可以执行，不表示当前已加载。
+`Open`表示durable Session允许definition update；若patch改变Workspace且Session已loaded，还必须是`SessionExecutionState::Idle`，否则返回`SessionBusy`。
 
 `Archived` 是可逆只读状态：
 
@@ -618,7 +618,7 @@ pub enum TurnExecutionPhase {
 }
 ```
 
-这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入和Cancel后的结构化收口由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和Workspace revocation。
+这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入和Cancel后的结构化收口由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和SecurityRevoked。
 
 `SessionExecutionState::Finishing`优先于TurnExecutionPhase解释：CancelAccepted后phase可以保留`ExecutingTools`等最后工作位置，但UI显示Stopping/Finishing。Finishing期间新的Steer被拒绝，FollowUp仍可进入process-local FIFO；新Turn只在旧Turnterminal并回到Idle后启动。
 
@@ -658,7 +658,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、PrepareForUnload和Snapshot。等待期间不预留file mutation ticket，也不持有Workspace commit authorization；其他Session拥有独立Executor，因此可以继续执行。用户长时间不回答时Interaction保持Pending。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
+当前Turn的逻辑执行暂停在原ToolInvocation，但loaded Session及其Executor没有暂停：它继续处理`ResolveInteraction`、Cancel、SecurityRevoked、PrepareForUnload和Snapshot。等待期间不预留file mutation ticket，也不持有TurnControl reservation；其他Session拥有独立Executor，因此可以继续执行。用户长时间不回答时Interaction保持Pending。UserAnswer恢复同一Turn，不作为新UserMessage开启新Turn。
 
 ### Steer
 
@@ -674,7 +674,7 @@ Steer(expected TurnId) accepted
 
 WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，不自动当作Interaction resolution。若final terminal entry先于Steer acceptance线性化，Steer不再属于该Turn；若Steer先进入FIFO，candidate final保存为Assistant Continue并在下一次Model前消费一条Steer。
 
-只有显式 Turn cancel、runtime shutdown、security revocation 或不可恢复错误才使 Turn terminal。
+只有显式Turn cancel、runtime shutdown、SecurityRevoked或不可恢复错误才使Turn terminal。
 
 ## Create Session
 
@@ -696,6 +696,8 @@ create 使用预分配 SessionId 和 operation id。outcome unknown 时必须查
 
 只允许Open Session。普通definition update只能改变Workspace、Model或SessionPromptSelection；`AgentRevisionRef`变化必须走显式Agent upgrade路径，不能绕过Agent lifecycle synchronization。
 
+若candidate改变Workspace且Session已loaded，额外要求`SessionExecutionState::Idle`；Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel。Model或SessionPromptSelection的future-only update仍可在active Turn期间提交，因为它们不会改变current Turn captured Context。
+
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision
@@ -704,7 +706,7 @@ expected SessionLifecycle = Open
 → publish revision N+1
 ```
 
-active Turn 不受 ordinary definition update 影响。FollowUp 在真正 admission 时读取 update 后的 current revision。successful update 必须让 loaded execution 的 current-definition projection 与 durable head 一致；若 projection apply 失败，Session 进入 Unavailable 并从 durable truth reload，不能悄悄继续使用旧 head。
+active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交并立即发布new Snapshot。successful update必须让loaded execution的current-definition projection与durable head一致；若projection apply失败，Session进入Unavailable并从durable truth reload，不能悄悄继续使用old head。
 
 metadata update与definition update分开，避免改标题导致execution Context fingerprint变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
 
@@ -740,7 +742,7 @@ AgentLoop state
 Tool task
 approval waiter
 cancellation token
-old WorkspaceSnapshot / authorization lease
+old WorkspaceSnapshot / EmergencyControl signal
 PromptSet / ToolSet / SkillView
 ```
 
@@ -857,7 +859,7 @@ copy Workspace semantic fields，但分配 child-local WorkspaceRevision(1)
 copy source Model / SessionPromptSelection
 Open + Unloaded
 independent future revisions
-independent WorkspaceSnapshot / lease
+independent WorkspaceSnapshot / security target generation
 independent conversation branch
 ```
 
@@ -866,7 +868,7 @@ independent conversation branch
 ```text
 source SessionDefinitionRevision / WorkspaceRevision number
 loaded execution state
-WorkspaceSnapshot / authorization control
+WorkspaceSnapshot / process-local security signal
 ToolSet / PromptSet / SkillView
 provider session
 pending Interaction / 任何process-local SessionIngress lane
@@ -920,11 +922,11 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 | --- | --- | --- | --- |
 | Agent 发布新 revision | 保持 exact Session pin | 不变 | 仍使用 Session pin，直到显式升级 |
 | Session 显式升级 Agent | 已捕获旧 SessionDefinitionRevision 者不变 | 不变 | 使用新 AgentRevisionRef |
-| Session definition ordinary update | 已捕获旧 revision 者不变 | 不变 | 使用新 SessionDefinitionRevision |
+| Session definition non-Workspace update | 已捕获旧revision者不变 | 不变 | 使用新SessionDefinitionRevision |
 | Agent disable/delete | input append前的synchronization决定胜负 | 已开始Turn继续 | admission拒绝 |
 | Session archive/delete | 要求先无 candidate | 要求先无 active Turn | lifecycle 状态拒绝 |
-| ordinary Workspace update | 已捕获旧 basis 者不变 | 不变 | 使用新 definition/snapshot |
-| restrictive Workspace update | lease/final check 失败 | revoke 并中断 | 使用新 Snapshot |
+| Workspace definition update | candidate存在/非Idle时SessionBusy | active时SessionBusy，不提交update | Idle commit后使用new definition/snapshot |
+| authority/host hard restriction | handle-scoped signal取消candidate | SecurityRevoked + truthful settlement + TurnInterrupted | Idle直接resolve；active terminal后resolve，Ready或Unavailable |
 | unload | stop admission并等待或取消candidate | grace期自然完成，deadline后fail-closed cancel | unload后需重新load才可admission |
 
 ## 并发线性化
@@ -932,6 +934,8 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 ### Definition Update vs Turn Admission/Load
 
 Session admission synchronization保证candidate得到完整旧SessionDefinition或完整新SessionDefinition，不允许字段跨revision混合。Loading使用captured revision构建临时状态，并在publication前CAS current head；definition update先赢时旧load result被丢弃。
+
+Workspace patch还与execution admission在同一per-session lifecycle synchronization中检查Idle：update先赢则new Snapshot publication完成后才能admit；Submit/FollowUp先把state推进Starting则Workspace patch返回`SessionBusy`。不提供active update等待或排队。
 
 ### Agent Disable/Delete vs Turn Start Append
 
@@ -1111,7 +1115,7 @@ Agent release channel
 - active Turn 使用 captured exact definitions，不受 ordinary update 影响；
 - Agent disabled/deleted与CreateSession、upgrade、fork publication和initiating UserMessage append使用同一lifecycle synchronization线性化；
 - Agent disabled/deleted 阻止 future admission，但不 patch active Context；
-- Workspace restrictive update仍可 revoke active Turn；
+- Workspace definition update只在Idle；authority/host hard restriction通过SecurityRevoked中断active Turn；
 - WaitingApproval和WaitingForUserInput时Turn仍是Running；
 - Steer 不把 Turn 变成 Interrupted；
 - fork从genesis或公开message anchor创建；mid-Turn prefix在target staging中以HistoricalFork中断后才发布；
@@ -1161,10 +1165,13 @@ Agent release channel
 - entry append vs cancel/unload；
 - fork Open/Archived source，覆盖terminal boundary与mid-Turn message anchor；
 - fork 复制 exact AgentRevisionRef 与 definition content，但创建 child-local WorkspaceRevision(1)；
-- fork不复制Snapshot/lease/ToolSet/PromptSet/SkillView；
+- fork不复制Snapshot/security signal/ToolSet/PromptSet/SkillView；
 - fork staging crash不发布target；mid-Turn fork closure不恢复source执行状态；
-- restrictive Workspace definition update revoke 后 append 失败时保持 fail closed / Unavailable；
-- authority-only restriction 不创建 SessionDefinitionRevision；
+- loaded Session非Idle时Workspace definition update返回SessionBusy且不排队；
+- Idle Workspace update成功同时改变WorkspaceRevision和SessionDefinitionRevision并发布new Snapshot；
+- Workspace candidate resolve/commit失败保留old definition/Snapshot；
+- authority/host SecurityRevoked不创建SessionDefinitionRevision，Turn terminal后重新resolve；
+- started Tool在SecurityRevoked下truthful settlement，open handle不承诺动态撤销；
 - Steer expected TurnId 与 final terminal append race；
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；

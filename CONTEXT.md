@@ -71,15 +71,15 @@ _避免_：每Session复制服务、UI服务容器、全局current Session
 _避免_：全局WorkspaceManager、cwd字符串、UI project object
 
 **WorkspaceSnapshot**：
-SessionExecutor在Turn admission期间取得的不可变Workspace解析结果，包含canonical roots、effective access和authorization lease。TurnExecutionContext pin该Snapshot，active Turn不读取future Workspace definition。
-_避免_：实时路径查询、mutable cwd state、跨Turn共享authorization lease
+SessionExecutor在Turn admission期间取得的不可变Workspace解析结果，包含canonical roots、effective access、source grants和fingerprints。TurnExecutionContext pin该Snapshot；loaded Session的Workspace definition update只在Idle时接受，active Turn完全不读取future Workspace definition。
+_避免_：实时路径查询、mutable cwd state、可撤销authorization lease、跨Turn共享mutable Snapshot
 
-**WorkspaceAuthorizationControl**：
-用于撤销active Turn Workspace authorization lease并通知SessionExecutor的执行期控制对象。普通definition update只影响future Turn；security-restricting update撤销旧lease并中断受影响Turn。
-_避免_：Prompt contribution、Tool permission扩大机制、durable Session字段
+**SecurityRevoked**：
+WorkspaceAuthority或host发布hard restriction后，通过Runtime current loaded map发送给对应`SessionExecutionHandle`的process-local sticky EmergencyControl signal；存在candidate/current Turn时同时绑定其target generation。它立即关闭admission和新的Model/Tool/source operation：Idle直接重新resolve，Starting取消candidate，active Turn执行truthful settlement和`TurnInterrupted(SecurityRevoked)`；old handle关闭后不重定向到new Executor，也不承诺动态撤销open OS handle。
+_避免_：Workspace definition patch、durable Session字段、RevocableHandle registry、已发生副作用回滚
 
 **会话执行器（`SessionExecutor`）**：
-单个loaded Session的执行期编排对象，拥有`SessionExecutionState`、`SessionRequestQueue`、SessionWriter、committed projections、CurrentTurnExecution和当前异步operation。每个Session一个Executor；一个Runtime允许多个Executor同时Running。
+单个loaded Session的执行期编排对象，拥有`SessionExecutionState`、per-session `SessionIngress` semantic lanes/signals、SessionWriter、committed projections、CurrentTurnExecution和current `RunningOperation`。每个Session一个Executor；一个Runtime允许多个Executor同时Running。
 _避免_：会话管理器、UI会话状态、全局current Session
 
 **会话执行句柄（`SessionExecutionHandle`）**：
@@ -171,7 +171,7 @@ MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validat
 _避免_：skills.rs helper集合、UI解析器、Prompt manager、Tool registry
 
 **技能视图（`SkillView`）**：
-SkillService按context发布的immutable metadata view。显式reload成功后原子替换current view；TurnExecutionContext捕获view和Workspace authorization context，future reload不改变active Turn。
+SkillService按context发布的immutable metadata view。显式reload成功后原子替换current view；TurnExecutionContext捕获view和WorkspaceSkillContext，future reload不改变active Turn。SecurityRevoked通过Turn control取消active source operation。
 _避免_：current磁盘目录、命令列表、mutable global catalog、durable Skill revision
 
 **技能调用**：
@@ -275,7 +275,7 @@ Prompt-producing slash/catalog command解析为PromptIntent后选择的公开交
 _避免_：DeliveryMode、NextTurn、通用InputSchedule、raw slash text queue
 
 **命令运行策略（`CommandRunPolicy`）**：
-Command manifest/handler相对active work的执行约束。首版普通读取或definition mutation可以Immediate执行，需要Idle的操作显式拒绝；Prompt-producing command使用Submit/Steer/FollowUp。首版不建立generic QueueAfterRun或PendingSessionAction。
+Command manifest/handler相对active work的执行约束。首版普通读取和不改变Workspace的future-only definition mutation可以Immediate执行；Workspace definition patch明确要求Session Idle，非Idle返回SessionBusy且不排队；Prompt-producing command使用Submit/Steer/FollowUp。首版不建立generic QueueAfterRun或PendingSessionAction。
 _避免_：通用任务调度器、manual compact queue、Prompt delivery替代品
 
 **命令目录**：

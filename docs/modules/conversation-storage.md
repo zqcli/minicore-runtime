@@ -1004,7 +1004,7 @@ Fork不复制：
 ```text
 loaded state
 TurnExecutionContext object
-Workspace authorization lease
+WorkspaceSnapshot / process-local security signal
 provider session
 AgentLoop
 waiter/task

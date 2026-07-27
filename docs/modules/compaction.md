@@ -14,7 +14,7 @@
 - 如何通过PromptSet和ModelGateway执行portable SummaryModel调用；
 - Compaction entry何时append/apply并触发conversation Replace；
 - 压缩后如何重建ConversationSeed和private AgentLoop；
-- Steer、Cancel、Workspace revocation、retry、write outcome unknown和restart如何处理；
+- Steer、Cancel、SecurityRevoked、retry、write outcome unknown和restart如何处理；
 - Workspace/Agent/Session instructions、Skill metadata和动态contribution如何保留。
 
 [Runtime Interface](runtime-interface.md)不提供公开`CompactSession`协议或standalone/manual maintenance state。本文也不定义provider-native opaque artifact、hierarchical summary tree、long-term memory、physical JSONL vacuum或provider tokenizer实现。
@@ -47,7 +47,7 @@
 - summary输出预算在plan阶段与pinned `EffectiveModelLimits`和summary call context可行性求交；
 - PromptSet是SummaryModel context的唯一组装者；purpose固定为`CompactionSummary`，output contract固定为`NoToolCalls`；
 - SummaryModel成功不立即改变conversation；只有StoredCompaction append/apply后Replace生效；
-- append前重新验证source checkpoint、Cancel和Workspace authorization；
+- append前重新验证source checkpoint和Cancel/SecurityRevoked control；
 - 成功后从updated CommittedConversationState重建ConversationSeed和private AgentLoop segment；
 - 同一active Turn允许在frontier推进后再次compact，但受单Turn次数、minimum reclaim和same-source hard-recovery规则约束；
 - soft-pressure compaction失败时，只有原ModelCallRequest仍valid才允许继续未压缩调用；
@@ -85,7 +85,7 @@ SessionExecutor
 ├─ owns CurrentCompactionState
 ├─ starts RunningOperation::CompactConversation
 ├─ calls PromptSet and ModelGateway
-├─ arbitrates Steer/Cancel/revocation
+├─ arbitrates Steer/Cancel/SecurityRevoked
 └─ append/applies StoredCompaction
 
 Compaction module
@@ -364,7 +364,7 @@ pub enum CompactionErrorKind {
     SummaryInvalid,
     SourceChanged,
     Cancelled,
-    AuthorizationRevoked,
+    SecurityRevoked,
     Storage,
     ContextStillTooLargeAfterCompaction,
 }
@@ -575,7 +575,7 @@ pub(crate) struct CurrentCompactionState {
 }
 ```
 
-soft trigger可以暂存尚未发送的original request。任何Steer、Cancel、revocation或conversation change都使它失效。
+soft trigger可以暂存尚未发送的original request。任何Steer、Cancel、SecurityRevoked或conversation change都使它失效。
 
 ### Start Flow
 
@@ -604,7 +604,7 @@ GenerateModelResponse returns ContextOverflow
 → start CompactConversation
 ```
 
-启动Compaction本身不推进`execution_version`，因此soft failure在没有control或conversation变化时仍可复用original request。成功append/apply Replace后才推进version。Cancel和revocation立即推进version并取消operation；Compacting期间到达的Steer只排队并使saved original request不再可发送，Steer UserMessage append/apply也不推进execution_version。
+启动Compaction本身不推进`execution_version`，因此soft failure在没有control或conversation变化时仍可复用original request。成功append/apply Replace后才推进version。Cancel和SecurityRevoked立即推进version并取消operation；Compacting期间到达的Steer只排队并使saved original request不再可发送，Steer UserMessage append/apply也不推进execution_version。
 
 `CurrentTurnExecution`保存successful compaction count和last hard-recovery basis，不把它们放在operation-local CurrentCompactionState。同一个`source checkpoint + scope frontier`（active scope中包含previous checkpoint及其covered-through provenance）最多启动一次hard recovery；失败不能在同一basis透明重试。成功append/apply会推进source或frontier，之后只有新增eligible stable units达到`minimum_reclaimed_tokens`且尚未达到`max_compactions_per_turn`时，才允许在同一Turn再次compact。soft compaction也计入成功次数，但不会占用未实际启动的hard-recovery basis。
 
@@ -640,11 +640,11 @@ Compacting期间：
 - Steer进入existing pending Steer FIFO，不立即append；
 - FollowUp保持FollowUpQueue语义；
 - Cancel通过`EmergencyControl` sticky signal立即触发operation cancellation token；Executor观察signal后推进execution_version；
-- WorkspaceAuthorizationRevoked先out-of-band revoke lease，再设置同一`EmergencyControl`的revocation signal；不等待普通lane容量；
+- SecurityRevoked按current target generation设置同一`EmergencyControl`的sticky signal；不等待普通lane容量；
 - PrepareForUnload通过`LifecycleControl`停止new admission；grace deadline到期时转为fail-closed Cancel；
 - ResolveInteraction与Compaction无关，不应存在由Compaction创建的Interaction。
 
-Compaction启动前、结果返回后和StoredCompaction append前都必须观察最新emergency epoch并重新检查Workspace authorization。Cancel/revocation已生效时丢弃未commit summary并进入Interrupted处理。Steer本身不让已生成summary失真，因为它尚未append；成功commit后再compose/append Steer，然后重新assemble AgentRun。
+Compaction启动前、结果返回后和StoredCompaction append前都必须观察最新emergency epoch。Cancel/SecurityRevoked已生效时丢弃未commit summary并进入Interrupted处理。Steer本身不让已生成summary失真，因为它尚未append；成功commit后再compose/append Steer，然后重新assemble AgentRun。
 
 ### Commit Validation
 
@@ -662,7 +662,8 @@ TurnExecutionContext exact
 TurnModelSnapshot exact
 PromptSet exact
 no winning Cancel
-WorkspaceCommitAuthorization valid
+no winning SecurityRevoked
+TurnControlGate controlled reservation valid
 summary result valid
 CompactionScope anchor/previous checkpoint/coverage provenance与current effective projection exact
 committed path中不存在覆盖同一scope frontier的StoredCompaction（靠状态判断去重，非operation key冲突检测）
@@ -672,17 +673,17 @@ commit顺序：
 
 ```text
 process all earlier queued control requests
-→ winning Cancel/revocation：discard candidate并进入cleanup
+→ winning Cancel/SecurityRevoked：discard candidate并进入cleanup
 → validate candidate and current execution version
-→ acquire WorkspaceCommitAuthorization
-→ revalidate source checkpoint/control state while authorization is held
+→ reserve TurnControlGate controlled append
+→ revalidate source checkpoint/control state while reservation is held
 → SessionWriter.append(StoredCompaction draft)
 → SessionWrite OutcomeUnknown时保守终结本次compaction，下次触发按committed prefix重新规划
 → apply scope-aware CommittedConversationDelta::Replace
-→ release authorization
+→ release reservation
 ```
 
-Compaction summary本身不读取Workspace文件，但其active Turn和后续AgentRun依赖captured Workspace authorization，因此security revocation必须在线性化点前获胜。
+Compaction summary本身不读取Workspace文件，但它仍属于active Turn logical execution；因此Cancel/SecurityRevoked与StoredCompaction commit通过同一个TurnControlGate first-wins。
 
 ### Success Flow
 
@@ -732,13 +733,13 @@ Compaction summary output不交给AgentLoop当作assistant response。旧AgentLo
 | summary auth/rate/transport exhausted | 原request仍valid时继续 | TurnFailed |
 | summary Refused/invalid，或Gateway返回UnexpectedToolCall/InvalidProviderResponse/IncompleteResponse（CompactionSummary不使用Structured） | 原request仍valid时继续 | TurnFailed |
 | source changed | 不使用candidate并fail closed | fail closed；不在同一operation内重计划 |
-| Cancelled/revoked | 进入Turn interruption cleanup | 进入Turn interruption cleanup |
+| Cancelled/SecurityRevoked | 进入Turn interruption cleanup | 进入Turn interruption cleanup |
 | storage failure | Session unavailable/Turn failure规则 | 同左 |
 | still too large after commit | TurnFailed | TurnFailed |
 
 soft fallback使用原ModelCallRequest必须满足conversation checkpoint、assembly fingerprint、execution version和control state全部未变；否则重新assemble，不能发送stale request。
 
-`SourceChanged`不做transparent replan。合法Steer在Compacting期间尚未append，Cancel/revocation会推进version；因此operation result对应的source意外变化表示实现race或未经授权的projection advance，必须结束当前candidate。新的planning只能由SessionExecutor在重新进入NeedModel后作为新的明确操作启动；同一hard-recovery basis仍视为已使用。
+`SourceChanged`不做transparent replan。合法Steer在Compacting期间尚未append，Cancel/SecurityRevoked会推进version；因此operation result对应的source意外变化表示实现race或未经授权的projection advance，必须结束当前candidate。新的planning只能由SessionExecutor在重新进入NeedModel后作为新的明确操作启动；同一hard-recovery basis仍视为已使用。
 
 ## StoredCompaction
 
@@ -915,7 +916,7 @@ Compaction是selected entry path上的overlay：
 - fork到Compaction后anchor复制Compaction entry及其referenced source/protected identities；
 - target remap全部nested EntryId、anchor、frontier和ConversationBoundary references；
 - replay在child中按scope重建同一个leading summary或active checkpoint与exact tail；
-- 不复制Compaction operation、AgentLoop、provider continuation或Workspace lease。
+- 不复制Compaction operation、AgentLoop、provider continuation、WorkspaceSnapshot或process-local security signal。
 
 Compaction entry不暴露成独立public fork anchor，但selected message path上的Compaction自然随path生效。
 
@@ -941,7 +942,7 @@ Session usage由assistant entries和`StoredCompaction.model_call` replay重建�
 - PromptSet不能把summary text插入Runtime instruction section；
 - secret redaction在写StoredCompaction前执行；
 - provider raw error/body不进入summary或JSONL；
-- Workspace revocation在线性化点前阻止append；
+- SecurityRevoked可在线性化点前通过TurnControlGate阻止append；
 - compaction不重新读取live Workspace绕过captured snapshot；
 - no-tools contract防止summary产生外部副作用。
 
@@ -960,7 +961,7 @@ COMP-007 summary调用只经过PromptSet和ModelGateway
 COMP-008 SummaryModel不能调用Tool
 COMP-009 active Turn exact model identity不变
 COMP-010 source checkpoint变化使candidate失效
-COMP-011 Cancel/revocation可在append前获胜
+COMP-011 Cancel/SecurityRevoked可在append前获胜
 COMP-012 Replace由trusted projector构造，不接收caller raw history
 COMP-013 最多一个leading summary且每个active instruction segment最多一个checkpoint
 COMP-014 raw historical entries不被改写
@@ -1006,7 +1007,7 @@ COMP-020 effective summary budget与pinned model known limits一致并进入fing
 14. summary finish reason Length时Gateway返回IncompleteResponse，Compaction不取得candidate；
 15. summary期间Steer排队；
 16. summary期间Cancel；
-17. summary期间Workspace revocation；
+17. summary期间SecurityRevoked；
 18. source checkpoint在result返回前变化；
 19. write OutcomeUnknown后按committed path状态确认（compaction已存在则跳过）；
 20. crash after append before apply；
