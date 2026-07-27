@@ -367,7 +367,7 @@ Tool执行期间请求SessionExecutor完成approval和ToolExecutionStarted记录
 _避免_：InteractionService、ToolLedgerService、公开Runtime interface
 
 **工具服务（`ToolService`）**：
-`MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、grant、资源锁、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet，Agent/Session/Turn领域对象不持有工具属性。
+`MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、grant、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet。每个loaded Session的SessionExecutor另行拥有独立file mutation queue（ADR 0116），Agent/Session/Turn领域对象不持有工具属性。
 _避免_：session-scoped工具配置副本、UI工具层、Rig ToolServer替代品、平级helper-only模块
 
 **工具定义**：

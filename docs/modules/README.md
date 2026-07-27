@@ -26,7 +26,7 @@ MiniCoreRuntime
 - [Workspace](workspace.md)：Session-owned Workspace definition、roots/cwd 合法域、trust 与 source authorization、filesystem capability，以及 Prompt/Tool/Skill 消费的窄只读 view。
 - [Prompt](prompt.md)：`PromptService`共享`PromptResourceView`，各Turn独立构建`PromptSet`；`compose_user_message`产出`CanonicalUserMessage`，`assemble(...) -> AssembledModelContext`是模型可见上下文组装的唯一seam。
 - [Skills](skills.md)：`SkillService`发布reloadable `SkillView`，与`LoadedSkill`分离；metadata discovery和正文按需加载。
-- [Tools](tools.md)：`ToolService` 通过 `for_turn(...) -> ToolSet` 原子绑定模型可见 ToolSpec 与 executor route；registry、policy、approval、grants、sandbox、mutation lock 与 executor。
+- [Tools](tools.md)：`ToolService`通过`for_turn(...) -> ToolSet`原子绑定模型可见ToolSpec与executor route；registry、policy、approval、grants、sandbox与executor；每个loaded Session另有独立file mutation queue。
 - [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、fingerprint、reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、UI/MiniCore职责、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
@@ -36,7 +36,7 @@ MiniCoreRuntime
 
 ## 相关决策
 
-长期架构决策记录在 [`docs/adr/`](../adr/)（0100+）：领域与 ownership、Workspace ownership、Prompt/Tool/Skill 边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime 公开协议、UserQuestion的UI/Runtime职责分离以及自研AgentLoop状态机（ADR 0115）。行为与接口以各模块文档、协议文档和 ADR 为权威。
+长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)以及[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。行为与接口以各模块文档、协议文档和ADR为权威。
 
 ## 权威归属
 
@@ -49,7 +49,7 @@ MiniCoreRuntime
 | Workspace definition、roots、trust、authorization、filesystem capability | [Workspace](workspace.md) |
 | PromptSet、CanonicalUserMessage、PromptIntent 展开、AssembledModelContext | [Prompt](prompt.md) |
 | SkillService、SkillView、LoadedSkill、lazy load、reload、cache | [Skills](skills.md) |
-| ToolService、ToolSet、policy、approval、grants、sandbox、executor | [Tools](tools.md) |
+| ToolService、ToolSet、policy、approval、grants、sandbox、executor、Session-local file mutation queue | [Tools](tools.md) |
 | TurnExecutionContext capture、fingerprint、reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction identity、lifecycle、terminal cleanup | [Turn / Item / Interaction](turn-item-interaction.md) |
 | UserQuestion producer seam与ask-user Tool route | [Tools](tools.md) |

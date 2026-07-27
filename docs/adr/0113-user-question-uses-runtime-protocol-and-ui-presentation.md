@@ -7,7 +7,7 @@
 
 `InteractionRequest` 已包含 `ToolApproval | UserQuestion`，但 Tool 到 SessionExecutor 只有 approval 与 execution-start seam，没有真正创建 `UserQuestion` 的 producer。若让 UI 自己决定何时提问、自己保存 pending state，MiniCore 收到的答案就无法可靠绑定到原来的 `TurnId`、`ItemId` 和 `RequestId`；UI 断线、重复提交、Cancel 和 crash recovery 也会各自形成第二套状态。
 
-同时，等待用户回答不能持有 `ToolResourceLocks`、`WorkspaceCommitAuthorization` 或其他跨 Session 的副作用资源。否则一个用户不回答就可能阻塞其他 Session。
+同时，等待用户回答不能预留file mutation ticket，也不能持有`WorkspaceCommitAuthorization`。否则一个用户不回答就会阻塞同一Session后续sibling ToolCall。
 
 ## 决策
 
@@ -35,11 +35,11 @@ request_user_question(
 ### 3. 首版 producer 是独占的 pre-execution ask-user route
 
 - ToolSet 提供一个内建 ask-user route；具体公开 ToolName 不在本 ADR 冻结。
-- route 在 `ToolExecutionStarted`、`ToolResourceLocks` 和任何外部副作用之前调用 `request_user_question`。
-- 等待期间不取得、也不持有资源锁或 Workspace commit authorization；该 Interaction 不需要伪造 `ToolExecutionStarted`。
+- route 在`ToolExecutionStarted`、file mutation ticket reservation和任何外部副作用之前调用`request_user_question`。
+- 等待期间不预留mutation ticket，也不持有Workspace commit authorization；该Interaction不需要伪造`ToolExecutionStarted`。
 - ask-user route 返回 `UserAnswer` 后生成 `PreExecution` truthful ToolResult，再按普通顺序 append `role=tool` 与 `tool_round_completed`。
 - 首版 ask-user Interaction 在一个 ToolRound 中独占等待；同一 assistant step 的其他 ToolCall 不得并行启动。这样当前 Turn 的“等待用户”语义不会与未决副作用混在一起。
-- 普通 Tool 在已经 `ToolExecutionStarted` 或持有资源锁后不得调用该 seam；未来若确有需要，必须另行定义可证明不持锁的 producer protocol。
+- 普通Tool在已经`ToolExecutionStarted`或开始file mutation后不得调用该seam；未来若确有需要，必须另行定义可证明不持有mutation permit的producer protocol。
 
 ### 4. 等待语义
 
@@ -58,7 +58,7 @@ InteractionState = Pending
 
 ### 5. Session 隔离
 
-每个 loaded Session 拥有独立的 SessionExecutor、InteractionControl lane、pending waiter 和 `WaitingForUserInput` phase。Session A 等待答案时，Session B/C 可以继续 Sampling、ExecutingTools 或等待各自的 Interaction。只有共享 ModelGateway 配额、canonical resource lock 或宿主 I/O 等既有全局资源限制可能造成正常竞争；UserQuestion 等待本身不占用这些资源。
+每个loaded Session拥有独立的SessionExecutor、InteractionControl lane、pending waiter、file mutation queue和`WaitingForUserInput` phase。Session A等待答案时，Session B/C可以继续Sampling、ExecutingTools或等待各自的Interaction。只有共享ModelGateway配额或宿主I/O可能造成正常竞争；UserQuestion等待本身不占用这些资源。
 
 ### 6. 公开协议不携带 UI 组件
 
@@ -88,7 +88,7 @@ Model ToolCall (ask-user)
 
 - 新增一个小而稳定的 producer interface，Presentation Adapter数量可以增加而不改变Session execution语义。
 - Pending、重复回答、断线和 terminal cleanup 仍集中在 MiniCore，避免 UI 与 Runtime 双重事实。
-- 首版 ask-user route 的独占和 pre-execution 限制牺牲了一些 Tool 内部自由度，但明确避免 lock-across-await 和跨 Session 饥饿。
+- 首版ask-user route的独占和pre-execution限制牺牲了一些Tool内部自由度，但明确避免mutation-permit-across-await和同批sibling ToolCall饥饿。
 - `WaitingForUserInput` 是 transient phase，不写入 SessionStorage；Interaction request/resolution 仍是 durable facts。
 
 ## 被否决的方案
@@ -101,10 +101,12 @@ Model ToolCall (ask-user)
 
 这会产生第二个 mutable owner，破坏 append/apply 线性化、Session 隔离和 crash recovery。
 
-### 在已持有资源锁的普通 Tool 内等待用户
+### 在已开始file mutation的普通Tool内等待用户
 
-用户不响应时会长期占用文件或外部资源，可能阻塞其他 Session；首版明确禁止。
+用户不响应时会长期占用该Session的file mutation permit并阻塞后续sibling ToolCall；首版明确禁止。
 
 ## 修订关系
 
 本 ADR 补充并细化 [ADR 0103](0103-turn-item-interaction-model.md) 的 Interaction producer 与等待语义、[ADR 0105](0105-session-executor-owns-loaded-session.md) 的 transient phase 与单 Session owner、[ADR 0108](0108-runtime-public-protocol.md) 的 UI/Runtime facade 关系；不改变 durable Interaction、per-session Executor 或 append/apply ownership 决策。
+
+2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)将本ADR的resource-lock表述修订为Session-local file mutation ticket/permit；pre-execution等待顺序保持不变。

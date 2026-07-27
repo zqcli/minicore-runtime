@@ -24,14 +24,14 @@
 - private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
 - 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。
 - restart 不恢复旧的异步操作、queue 或 waiter；unfinished Turn 按 recovery 规则保守 terminalize（closure、preserve tool messages、ToolAbandoned、TurnInterrupted）。
-- multi-session 共享 Model/Tool 时使用明确并发限制（ModelGateway provider 配额）与 canonical resource locks（ToolService 按物理资源 identity），不以 SessionId 代替资源 identity。
+- multi-session共享Model时使用ModelGateway provider配额；每个SessionExecutor拥有独立file mutation queue，只协调该Session同批sibling ToolCall。跨Session共享Workspace的并发mutation由host/user负责隔离或协调（ADR 0116）。
 - 上下文压缩由 `SessionExecutor` 编排为 `CompactConversation` operation，不由 Driver 或 AgentLoop 拥有。
 
 ## 后果
 
 - 执行顺序与线性化点集中在单一 owner，entry / projection / event 顺序可独立测试。
 - 单一权威 owner 加异步 operation 分离，避免 lock-across-await 死锁；semantic lane和sticky emergency signal避免普通work backpressure饿死控制面。
-- 多 Session 可后台并发执行，共享服务用配额与 resource locks 协调；UI selection 不影响后台执行。
+- 多Session可后台并发执行，共享Model服务使用配额；Session-local file mutation queue不造成跨Session等待，UI selection不影响后台执行。
 - Pending UserQuestion只暂停所属Session当前Turn的逻辑推进；UI presentation断线不改变durable Interaction，其他Session仍可独立运行。
 - 严格串行current operation消除同Session logical retry的本地迟到结果竞态；execution version只验证conversation/control basis。provider端可能继续工作或计费仍不宣称exactly-once。Tool副作用真实性继续由outcome确认规则处理。
 - AgentLoop保持为MiniCore自研的crate-private concrete state machine，不触碰storage与I/O顺序；第二个真实实现出现前不建立稳定替换seam，Rig不参与AgentLoop，只用于ModelGateway private ProviderAdapter（ADR 0115）。
@@ -48,3 +48,5 @@
 2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)修订本ADR原有的单一bounded request FIFO细节；单SessionExecutor/Writer ownership不变。
 2026-07-25：[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)补充UserQuestion等待阶段与Presentation Adapter职责；单SessionExecutor/Writer ownership不变。
 2026-07-27：[ADR 0115](0115-agent-loop-is-first-party-state-machine.md)关闭Rig/SDK AgentLoop adapter分支；AgentLoop改为自研crate-private状态机，Rig职责收窄到ModelGateway private ProviderAdapter。
+2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)修订跨Sessioncanonical resource lock结论；改为Session-local file mutation queue，跨SessionWorkspace并发由host/user管理。
+2026-07-27：[ADR 0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md)关闭全局lock-rank需求；并发实现采用single owner、短guard、release-before-fan-out和typed permit。

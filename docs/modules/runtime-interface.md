@@ -1247,7 +1247,7 @@ ModelCallResult contains built-in ask-user ToolCall
 → same Turn next PromptSet.assemble
 ```
 
-Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/Unload/Snapshot；其他Session的Executor不受影响。等待期间不持有Tool资源锁或Workspace commit authorization，elapsed time不会自动关闭Interaction。
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/Unload/Snapshot；其他Session的Executor不受影响。等待期间不预留file mutation ticket，也不持有Workspace commit authorization，elapsed time不会自动关闭Interaction。
 
 ## Transport 与 Adapter
 

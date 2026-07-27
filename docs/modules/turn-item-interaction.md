@@ -632,7 +632,7 @@ pub enum InteractionCancelReason {
 
 - ToolApproval request 只能由 Tool-related Item 触发；
 - UserQuestion 通常归属于 ask-user ToolInvocation，也允许归属于其他真正发起 request 的 Item；
-- 首版由 ToolSet 的独占 pre-execution ask-user route 发起 UserQuestion；它发生在 `ToolExecutionStarted`、资源锁和外部副作用之前；
+- 首版由ToolSet的独占pre-execution ask-user route发起UserQuestion；它发生在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前；
 - request/resolution family 必须匹配；
 - Cancelled可以关闭任意family；用户沉默不等于Deny或Cancelled；
 - auto-approved、auto-denied 的 Tool policy 不需要创建 Interaction；
@@ -754,7 +754,7 @@ Pending + elapsed time
 → no next Model operation for this Turn
 ```
 
-无限等待是fail closed：受审批保护的副作用不会开始，同时等待发生在`ToolResourceLocks`和`WorkspaceCommitAuthorization`之前，不阻塞其他Session。若embedding根本无法展示Interaction，应在启动该工作前选择不需要人工回答的明确policy或显式Cancel；不能用“暂时没有subscriber”推断Deny。
+无限等待是fail closed：受审批保护的副作用不会开始，同时等待发生在file mutation ticket reservation和`WorkspaceCommitAuthorization`之前，不阻塞同批sibling ToolCall。若embedding根本无法展示Interaction，应在启动该工作前选择不需要人工回答的明确policy或显式Cancel；不能用“暂时没有subscriber”推断Deny。
 
 
 ## Interaction等待与 Steer
@@ -782,7 +782,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-当前 Turn 的逻辑执行停在该 Interaction，不开始下一次 Model 调用，也不开始新的副作用 Tool operation；SessionExecutor 本身不阻塞，仍然处理 `ResolveInteraction`、Cancel、PrepareForUnload、Snapshot 和其他 per-session control。首版 ask-user route 在同一 assistant step 内独占等待：同一 step 的 sibling ToolCall 不会在答案返回前启动，也不持有 `ToolResourceLocks` 或 `WorkspaceCommitAuthorization`。其他 Session 的 Tool outcome 不受该等待影响。
+当前Turn的逻辑执行停在该Interaction，不开始下一次Model调用，也不开始新的副作用Tool operation；SessionExecutor本身不阻塞，仍然处理`ResolveInteraction`、Cancel、PrepareForUnload、Snapshot和其他per-session control。首版ask-user route在同一assistant step内独占等待：同一step的sibling ToolCall不会在答案返回前启动，也不预留file mutation ticket或持有`WorkspaceCommitAuthorization`。其他Session的Tool outcome不受该等待影响。
 
 Steer 仍进入该 Turn 的 bounded FIFO，不抢占 UserQuestion；回答完成并形成 truthful ToolResult、`tool_round_completed` 后，下一次 Model 调用前最多消费一条 Steer。
 
@@ -1050,7 +1050,7 @@ Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不
 - WaitingApproval 中 Steer 排队；
 - WaitingApproval Steer只排队，不preempt Interaction；
 - WaitingForUserInput 中 TurnStatus/SessionExecutionState 仍为 Running；
-- WaitingForUserInput 不持有 ToolResourceLocks/WorkspaceCommitAuthorization，且 Session A 等待时 Session B 可以继续执行；
+- WaitingForUserInput不预留file mutation ticket或持有WorkspaceCommitAuthorization，且Session A等待时Session B可以继续执行；
 - WaitingForUserInput解决前，同一assistant step的sibling ToolCall不启动；解决后恢复普通调度；
 - `request_user_question` 在 ToolExecutionStarted 前建立 UserQuestion Interaction；
 - Presentation Adapter不能用新UserMessage代替Interaction resolution，也不能直接持有waiter；

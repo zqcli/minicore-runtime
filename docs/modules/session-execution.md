@@ -58,7 +58,7 @@
 - `tool_execution_started`append/apply后才允许外部副作用；
 - FollowUp使用process-local bounded FIFO，当前不承诺crash-safe delivery；Snapshot使用latest-wins mailbox，不占用mutation/control容量；
 - Cancel与Workspace authorization revocation使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；PrepareForUnload使用sticky lifecycle signal和shared completion generation；
-- lane容量、拒绝和仲裁规则在`SessionIngress`内定义；一个Session的lane拥塞不能耗尽另一个Session的容量，但共享Model/Tool/I/O资源仍可能形成跨Session等待；
+- lane容量、拒绝和仲裁规则在`SessionIngress`内定义；一个Session的lane拥塞不能耗尽另一个Session的容量，但共享Model配额和宿主I/O仍可能形成跨Session等待；
 - Progress event可以合并或丢弃，不能影响request处理和durable state；
 - restart不恢复旧Context/Model/Tool异步操作，unfinished Turn按既有recovery规则终止。
 
@@ -115,7 +115,8 @@ MiniCoreRuntime
 - 每个Session有独立`SessionIngress`、writer、projections、current Turn和execution version；
 - 多个Session可以同时Sampling、WaitingApproval、WaitingForUserInput或ExecutingTools；
 - ModelGateway负责provider并发限制；
-- ToolService使用canonical resource locks协调跨Session文件和外部资源冲突；
+- 每个SessionExecutor拥有独立`SessionFileMutationQueue`，只协调该Session同批sibling ToolCall的同文件mutation；
+- 跨Session共享Workspace的文件和外部资源冲突不由MiniCore协调，host/user负责worktree、独立Workspace或外部并发控制；
 - WorkspaceSnapshot和TurnExecutionContext按Session/Turn独立；
 - Runtime不能保存全局current Session、current cwd、current Model或current Turn；
 - UI selection属于UI，所有Runtime请求和事件必须携带SessionId。
@@ -133,6 +134,7 @@ pub(crate) struct SessionExecutor {
     candidate_turn: Option<CandidateTurnExecution>,
     current_turn: Option<CurrentTurnExecution>,
     current_operation: Option<RunningOperation>,
+    file_mutations: Arc<SessionFileMutationQueue>,
     pending_responses: PendingRequestResponses,
     progress_events: ProgressEventPublisher,
 }
@@ -467,7 +469,7 @@ loop {
 6. Turn terminal 后在 `FollowUpQueue` 与信箱中此刻已到达的 `TurnAdmissionQueue` Submit 之间做一次公平 admission：已接受的 FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且此刻有external Submit，则先选Submit。本次decision未选中的Submit立即返回`SessionBusy`；decision之后到达的Submit按Session当时状态处理（非Idle立即`SessionBusy`）；
 7. `SnapshotMailbox`独立读取最新 immutable published view，不等待上述 lane。
 
-`EmergencyControl`的检查点至少位于启动新 Model、取得 Tool resource lock、`ToolExecutionStarted` append 前，以及 terminal Assistant/`tool_round_completed` append 前。仲裁只处理当前已观察到的 signal，不等待未来请求；因此每个安全点仍有有限、可测试的边界。
+`EmergencyControl`的检查点至少位于启动新Model、预留或继续file mutation ticket、`ToolExecutionStarted` append前，以及terminal Assistant/`tool_round_completed` append前。仲裁只处理当前已观察到的signal，不等待未来请求；因此每个安全点仍有有限、可测试的边界。
 
 ## AgentLoop Interface
 
@@ -709,7 +711,7 @@ preflight / schema / hook / policy
 → ask-user route完成后，才允许同一assistant step的其他ToolCall进入普通调度
 ```
 
-等待期间不启动 sibling ToolCall，不取得或持有`ToolResourceLocks`、`WorkspaceCommitAuthorization`或其他跨Session副作用资源。UserQuestion解决后，剩余调用才按原始请求顺序和既有资源锁规则继续；不改变ToolResult的稳定返回顺序。
+等待期间不启动 sibling ToolCall，不预留file mutation ticket，也不取得`WorkspaceCommitAuthorization`。UserQuestion解决后，剩余调用才按原始请求顺序和既有mutation queue/Serial批次规则继续；不改变ToolResult的稳定返回顺序。
 
 Tool结果处理：
 
@@ -1191,6 +1193,19 @@ SessionExecutor是唯一状态修改者。线性化点：
 - 每个处理函数结束时state和projections必须保持合法；
 - 任何异步operation不能直接修改SessionExecutor字段。
 
+### 异步同步纪律
+
+MiniCore不建立覆盖全Runtime的lock-rank系统。并发安全依赖single owner、短状态guard、non-blocking signal/reservation和语义明确的typed permit（[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)）：
+
+- 普通Mutex/RwLock guard不得跨任意`.await`、跨owner调用、event publication、fan-out或host callback；
+- Agent/Session lifecycle状态只在短同步作用域内读取、clone、CAS或替换；durable mutation完成后先释放gate，再通知loaded Executor；
+- 有意跨await的一次一个操作使用typed permit/semaphore，只允许覆盖文档指定的bounded append/apply sequence；
+- Agent start commit使用私有组合操作固定final AgentStatus check、controlled append和permit释放，调用方不能自行嵌套同步原语；
+- Workspace-dependent append使用私有`append_workspace_controlled(...)`等价helper固定`TurnControl reservation → WorkspaceCommitAuthorization → append/apply`；
+- Model permit、file mutation ticket、Tool/Sandbox、approval、UserQuestion和provider I/O等待期间零持有上述短guard；
+- Workspace revoke和lifecycle/emergency signal不等待SessionExecutor acknowledgement或terminal cleanup；
+- Rust实现启用Clippy`await_holding_lock`，并把Tokio Mutex/RwLock guard列入`await_holding_invalid_type`；typed permit的例外必须显式记录理由。
+
 ## Multi-Session并发
 
 一个Runtime中的多个Executor独立推进：
@@ -1209,15 +1224,15 @@ Session E: Idle
 - 每个SessionStorage文件只有对应Executor的writer；
 - shared services实现并发安全；
 - ModelGateway提供global/provider/model/auth-principal并发限制；
-- ToolService资源锁使用canonical resource identity，不使用SessionId代替物理资源identity；
-- 同一Workspace中的冲突write Tool跨Session串行；
-- read-only无冲突Tool可以跨Session并行；
+- 每个Session的`SessionFileMutationQueue`独立；同Session同canonical file mutation按call_index FIFO，不同file key可以并行；
+- read-only文件Tool不进入queue；多文件与open-world Tool在同一批次按Serial执行；
+- 不同Session对同一physical file可以并发mutation，MiniCore不承诺跨Session文件一致性；
 - 一个Session的任一ingress/progress lane达到容量不能耗尽其他Session的lane容量；
-- 跨Session仍可能在ModelGateway配额、Tool resource lock和共享I/O处等待；
+- 跨Session仍可能在ModelGateway配额和共享宿主I/O处等待；
 - Runtime shutdown逐Session设置PrepareForUnload；grace deadline到期后由各Session fail-closed cancel；
 - UI current tab不影响后台Session执行。
 
-特别是，Session A 的 UserQuestion waiter 只属于 A 的`SessionExecutor`和`ToolControlQueue`；A 在等待答案时，B/C/D仍可各自推进。共享ModelGateway配额、canonical resource lock或宿主I/O仍可能造成正常竞争，但不会因为UserQuestion本身把其他Session放入同一个等待队列。
+特别是，Session A 的 UserQuestion waiter 和file mutation queue只属于 A 的`SessionExecutor`；A 在等待答案时，B/C/D仍可各自推进。共享ModelGateway配额或宿主I/O仍可能造成正常竞争，但不会因为UserQuestion或A的mutation queue把其他Session放入同一个等待队列。
 
 ## Error分类
 
@@ -1361,7 +1376,7 @@ MVP性能要求：
 - Cancel signal与ToolExecutionStarted controlled reservation双向race均有唯一结果，signal发布不因reservation阻塞；
 - approval request append-before-notify；
 - resolution append-before-resume；
-- UserQuestion request在`ToolExecutionStarted`前append，等待期间不持有资源锁；
+- UserQuestion request在`ToolExecutionStarted`前append，等待期间不预留file mutation ticket；
 - UserQuestion回答恢复同一个Tool future并形成`PreExecution` ToolResult，不伪造副作用；
 - Presentation Adapter只消费UI-safe Interaction view并通过Runtime facade Resolve，不能直接写Interaction或持有waiter；
 - WaitingForUserInput期间同Session不启动sibling副作用ToolCall，其他Session仍可运行；
@@ -1431,8 +1446,10 @@ MVP性能要求：
 
 - 两个Session同时Sampling；
 - 一个Session WaitingApproval不阻塞另一个Session；
-- 同一物理文件write Tool跨Session串行；
-- 不同资源Tool跨Session并行；
+- 同Session同一canonical file的mutation按call_index FIFO；
+- 同Session不同file key的mutation可以并行；
+- read-only文件Tool不进入queue；任一Serial Tool使同批普通ToolCall按原始顺序执行；
+- 两个Session对同一物理文件不共享queue，测试明确验证其无协调语义；
 - 一个Session任一ingress lane满不消耗其他Session的lane容量；
 - Session A ingress满时Session B的Cancel/Resolve/Submit仍可独立进入其自身lane；
 - UI selection变化不影响后台Session；
@@ -1551,4 +1568,4 @@ unbounded ingress/progress lane
 
 ### 一个Runtime只允许一个Running Session
 
-否决原因：UI需要后台Session；SessionStorage、TurnExecutionContext和SessionIngress已经按Session隔离，共享资源可以用明确配额和resource locks协调。
+否决原因：UI需要后台Session；SessionStorage、TurnExecutionContext和SessionIngress已经按Session隔离，共享Model使用明确配额，Workspace并发mutation由host/user通过worktree或独立Workspace协调。

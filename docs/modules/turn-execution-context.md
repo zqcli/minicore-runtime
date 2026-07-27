@@ -259,7 +259,7 @@ Turn-scoped ToolExecutionControl、cancellation和ProgressEventPublisher
 
 SessionDefinitionRevision保证AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection来自同一个committed definition。Prompt/Skill adapter不得按AgentId或SessionId回查current heads。
 
-presentation 层的前台/后台（用户当前查看哪个 Session）不是 capture 输入，也不进 model resolution、tool for_turn 或 `ExecutionContextFingerprint`；runtime 对所有 loaded Session 一视同仁，共享 Model/Tool 资源由明确配额和 canonical resource lock 协调。若将来出现「后台自主 Turn 必须自动处理审批」这类需求，应建成 tool execution 路径上一个窄的、不进 fingerprint 的 approval disposition，而不是回到 capture 层的前后台标记。
+presentation层的前台/后台（用户当前查看哪个Session）不是capture输入，也不进model resolution、tool for_turn或`ExecutionContextFingerprint`；runtime对所有loaded Session一视同仁，共享Model资源由明确配额协调。File mutation queue按Session独立，跨Session共享Workspace由host/user负责隔离。若将来出现「后台自主Turn必须自动处理审批」这类需求，应建成tool execution路径上一个窄的、不进fingerprint的approval disposition，而不是回到capture层的前后台标记。
 
 `candidate TurnId`只表示已预留的execution identity。Submit `CommandId`由外层admission reservation持有，仅用于当前Runtime内定位同一in-flight Submit、合并重复请求和精确Cancel；它不是额外submission key，不进入TurnExecutionContext或fingerprint，也不承诺跨崩溃恢复。OutcomeUnknown不靠它reopen或replay-by-key，恢复统一读committed prefix加状态检查。capture成功不代表领域Turn已经创建。
 
@@ -569,7 +569,7 @@ InteractionState = Pending
 ToolInvocationState = Started
 ```
 
-首版ask-user route在`ToolExecutionStarted`、资源锁和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不持有`ToolResourceLocks`或`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、Unload和Snapshot；用户沉默时保持Pending，不产生默认Deny。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
+首版ask-user route在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前调用`ToolExecutionControl::request_user_question`。等待期间不预留mutation ticket，也不持有`WorkspaceCommitAuthorization`，同一assistant step的sibling ToolCall尚未启动；SessionExecutor继续处理Interaction resolution、Cancel、Unload和Snapshot；用户沉默时保持Pending，不产生默认Deny。答案形成`PreExecution` ToolResult后，同一ToolRound恢复普通调度；其他Session始终由各自Executor独立推进。
 
 WaitingForUserInput不是Interrupted。此时到达的Steer只进入current Turn的bounded FIFO，不作为UserAnswer，也不preempt当前Interaction。
 
@@ -1042,8 +1042,8 @@ AgentLoop registry
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
 - InteractionRequested append-before-notify；
 - InteractionResolved append-before-wake/side-effect；
-- `request_user_question`在ToolExecutionStarted和资源锁之前创建UserQuestion；
-- WaitingForUserInput不持有Tool资源锁，sibling ToolCall尚未启动，其他Session可继续运行；
+- `request_user_question`在ToolExecutionStarted和file mutation ticket reservation之前创建UserQuestion；
+- WaitingForUserInput不预留mutation ticket，sibling ToolCall尚未启动，其他Session可继续运行；
 - 每个ToolExecutionOutcome Completed时append role=tool message；全部matching messages存在后append tool_round_completed；
 - 任一 ToolExecutionOutcome Abandoned 时不构造 ToolRound并进入 terminal arbitration；
 - tool_round_completed前不开始下一次逻辑模型调用；

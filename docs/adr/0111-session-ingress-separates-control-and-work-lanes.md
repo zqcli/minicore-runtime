@@ -28,11 +28,11 @@ Workspace revocation 已通过 out-of-band lease revoke 保证“不再授权新
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion generation |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced immutable published view |
 
-各 Session 的 lane 容量完全独立。Session A 的 ingress 满不会占用 Session B 的容量；跨 Session 仍可能在 ModelGateway 配额、Tool canonical resource lock和共享I/O处等待。
+各 Session 的 lane 容量完全独立。Session A 的 ingress 满不会占用 Session B 的容量；跨 Session 仍可能在 ModelGateway 配额和共享宿主I/O处等待。File mutation queue按Session独立，不造成跨Session等待（ADR 0116）。
 
 ### Emergency 与 Tool side effect
 
-`Cancel`先原子校验`CancelTarget + target generation`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn使用新的generation和token。Executor在启动新Model、取得或继续Tool资源、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
+`Cancel`先原子校验`CancelTarget + target generation`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn使用新的generation和token。Executor在启动新Model、预留或继续file mutation ticket、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
 
 `SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的target generation、emergency epoch、Steer admission gate和controlled append reservation：
 
@@ -104,6 +104,9 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 ## 修订关系
 
 本ADR修订[ADR 0105](0105-session-executor-owns-loaded-session.md)中“所有请求经同一个bounded FIFO”的ingress细节，并修订[ADR 0108](0108-runtime-public-protocol.md)中“SessionSnapshot经request queue线性化”的一致性表述。单Executor ownership保持不变；公开观察协议后由[ADR 0114](0114-runtime-observation-uses-snapshot-first-streams.md)改为snapshot-first实时流。
+
+2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)删除跨SessionTool resource lock；本ADR的lane隔离、emergency与短append仲裁不变。
+2026-07-27：[ADR 0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md)明确不建设全局lock-rank系统；普通guard不跨await，controlled append使用typed permit和私有组合helper。
 
 ## 被否决的方案
 

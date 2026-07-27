@@ -26,7 +26,7 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 - Turn / Item / Interaction 的 durable 开始、结束、可见性与 side-effect 都锚定在 committed entry 的 append 线性化点；StreamingItem 只服务当前连接的 observer 体验，不改变 replay truth。
 - 合并的 ToolInvocation 让 approval 归属、outcome-unknown 处理与 UI/replay correlation 只发生在单一 identity 上，避免 orphan result 与永久悬空的 call。
 - durable Interaction 使 reconnect、lost acknowledgement 与 host restart 都能从 truth 判断请求状态，代价是引入 resolution_key 幂等与 first-wins CAS 的排序复杂度。
-- UI presentation与MiniCore interaction protocol分离，使同一UserQuestion可以由TUI、Web、GUI或RPC Adapter呈现而不复制pending state；首版ask-user等待不持有资源锁，避免跨Session阻塞。
+- UI presentation与MiniCore interaction protocol分离，使同一UserQuestion可以由TUI、Web、GUI或RPC Adapter呈现而不复制pending state；首版ask-user等待不预留Session-local file mutation ticket，避免阻塞同批sibling ToolCall。
 - 「派生而非存储」的 ItemType/ItemStatus 与「无 Manager/Service」的取舍，把复杂性留在 Session execution 与 SessionStorage projection 内，deletion test 成立——移除该模型会让边界与生命周期重新散落。
 - 明确不建 ModelStep/ToolRound entity，意味着逻辑模型调用与 conversation promotion 靠 fingerprint、EntryId/parent_id 引用与 `tool_round_completed` event 表达，而非新增领域实体。
 
@@ -36,3 +36,4 @@ MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 d
 
 2026-07-25：[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)明确Steer/FollowUp的物理SessionIngress lane、Cancel清理和跨lane仲裁；本ADR的领域分工不变。
 2026-07-25：[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)补充UserQuestion producer seam、WaitingForUserInput和UI presentation职责；本ADR的Item-owned durable Interaction不变。
+2026-07-27：[ADR 0116](0116-file-mutations-use-session-local-queues.md)将Tool并发控制收窄为Session-local file mutation queue；跨Session共享Workspace不协调。
