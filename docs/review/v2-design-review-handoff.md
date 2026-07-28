@@ -65,7 +65,7 @@ git show --stat HEAD
 - Idle直接失效old Snapshot并重新resolve；Starting取消candidate后resolve；Running/Finishing停止新operation、truthful settle started Tool、append`TurnInterrupted(SecurityRevoked)`后resolve；
 - resolve success发布new Snapshot并Ready，failure进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`；
 - 不承诺动态撤销open OS handle、回滚已进入kernel/provider的operation或建立Runtime-global handle registry；
-- O10和O11关闭；O1 Sandbox fail-closed保持开放。O12先由ADR 0122以放弃跨Runtime Workspace fingerprint恢复关闭，现由ADR 0123取代为删除fingerprint族。
+- O10和O11关闭；O1 Sandbox fail-closed保持开放，但延后到首个production Tool/Sandbox adapter开始前，不阻塞阶段6–8。O12先由ADR 0122以放弃跨Runtime Workspace fingerprint恢复关闭，现由ADR 0123取代为删除fingerprint族。
 
 随后新增[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)，关闭O12（现已被ADR 0123取代）：
 
@@ -187,17 +187,17 @@ NeedModel / ContextOverflow
 
 ## 下一步
 
-O13/O14/O15/O16已关闭。下一轮评审/实现前门禁顺序改为：
+O13/O14/O15/O16已关闭。O1保持开放但从当前工作队列移出；下一轮评审/实现前门禁顺序改为：
 
 ```text
-1. O1：首个production Tool/Sandbox adapter前关闭Sandbox capability fail-closed
-2. 第三版AgentLoop评审：L2必须在首个AgentLoop实现前冻结，随后处理L3/L4
-3. R2：token估算器owner按ADR0123术语回写（不使用TurnModelFingerprint）
-4. wire/schema freeze：serde/casing、public ID生成策略、基础类型；不要恢复ContentHash/fingerprint freeze
-5. 阶段6–8：Rig 0.40.0 spike + ScriptedProviderAdapter ordinary AgentRun → ContextOverflow → CompactionSummary → StoredCompaction append/apply → reassemble
+1. 第三版AgentLoop评审：L2必须在首个AgentLoop实现前冻结，随后处理L3/L4
+2. R2：token估算器owner按ADR0123术语回写（不使用TurnModelFingerprint）
+3. wire/schema freeze：serde/casing、public ID生成策略、基础类型；不要恢复ContentHash/fingerprint freeze
+4. 阶段6–8：Rig 0.40.0 spike + ScriptedProviderAdapter ordinary AgentRun → ContextOverflow → CompactionSummary → StoredCompaction append/apply → reassemble
+5. O1条件门禁：开始首个production Tool/Sandbox adapter前重新激活并关闭Sandbox capability fail-closed
 ```
 
-其他开放项：`O1 O2 O3 O17 O18`。其中O1是首个production Tool/Sandbox adapter前的P0门禁；O2/O3属于storage/运维硬化；O17/O18可按真实需求或实现触碰时处理。O16已收窄为MVP无独立Tool guidelines。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
+其他开放项：`O1 O2 O3 O17 O18`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O2/O3属于storage/运维硬化；O17/O18可按真实需求或实现触碰时处理。O16已收窄为MVP无独立Tool guidelines。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
 
 后续实现顺序仍是：
 
