@@ -89,7 +89,7 @@ MiniCore 不复制：
 - fork deep-copy selected parent path并 remap target-local identities；
 - 只忽略/截断最后一个未换行partial line；newline-terminated invalid entry是 corruption；
 - recovery不生成 synthetic ToolResult，不自动重放 outcome-unknown Tool；
-- projection snapshot、session index和search database只是 rebuildable cache。
+- MVP不实现projection snapshot、byte-offset/checkpoint index、physical segmentation或vacuum；session index和search database仍只是rebuildable cache。cold load顺序replay全部complete entries到physical current entry（最后成功append的EntryId），重建durable projections后执行conservative recovery并进入Idle。
 
 ## Ownership
 
@@ -1093,6 +1093,8 @@ Writable open/recovery：
 - 才能truncate最后一个未换行partial tail；
 - 随后完整replay并开始recovery。
 
+该完整replay是MVP有意接受的线性cold-load成本。Runtime内已loaded Session之间的UI/host切换只通过`LoadedSessionExecutors`路由现有`SessionExecutionHandle`，不重新打开ledger。cold load重建全部durable Turn/Item/Interaction/Conversation/Usage/tree projections，但不恢复provider stream、AgentLoop、Tool task、waiter、queue或其他process-local execution object；recovery完成后Session必须是Idle或typed Unavailable/error，不能只在内存中覆盖durable Running事实。
+
 ## Corruption
 
 严格fail closed：
@@ -1189,6 +1191,8 @@ observer failure不能回滚durable entry。
 ## Performance 与 Size
 
 By-entry会增加line count和append调用次数，但降低单条line复杂度并提高inspect/fork灵活性。
+
+MVP明确接受cold open、recovery和hot projection丢弃后的reload按complete entry数量线性增长。Compaction只降低下一次模型调用的effective conversation，不删除原始ledger entry，也不作为完整Session projection checkpoint。没有真实Session规模、load latency或资源数据前，不建设ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum；未来重开该问题时仍必须保持SessionStorage为唯一durable truth并提供full-replay fallback。
 
 实现要求：
 

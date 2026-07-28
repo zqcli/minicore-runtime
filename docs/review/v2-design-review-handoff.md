@@ -171,6 +171,7 @@ NeedModel / ContextOverflow
 
 | ID | 决议 |
 | --- | --- |
+| O2 | MVP接受cold load完整线性replay；不建设ProjectionSnapshot/checkpoint index，unfinished Turn保守收口后Idle |
 | O4 | ADR 0116：Session-local file mutation queue；跨Session不协调 |
 | O5 | ADR 0117：single owner、短guard、typed permit；不建设全局lock rank |
 | O6 | ADR 0118：即时CancelAccepted、Finishing结构化收口、FollowUp等待旧Turnterminal |
@@ -187,7 +188,7 @@ NeedModel / ContextOverflow
 
 ## 下一步
 
-O13/O14/O15/O16已关闭。O1保持开放但从当前工作队列移出；下一轮评审/实现前门禁顺序改为：
+O2/O13/O14/O15/O16已关闭。O1保持开放但从当前工作队列移出；下一轮评审/实现前门禁顺序改为：
 
 ```text
 1. 第三版AgentLoop评审：L2必须在首个AgentLoop实现前冻结，随后处理L3/L4
@@ -197,7 +198,7 @@ O13/O14/O15/O16已关闭。O1保持开放但从当前工作队列移出；下一
 5. O1条件门禁：开始首个production Tool/Sandbox adapter前重新激活并关闭Sandbox capability fail-closed
 ```
 
-其他开放项：`O1 O2 O3 O17 O18`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O2/O3属于storage/运维硬化；O17/O18可按真实需求或实现触碰时处理。O16已收窄为MVP无独立Tool guidelines。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
+其他开放项：`O1 O3 O17 O18`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O3属于storage/运维硬化；O17/O18可按真实需求或实现触碰时处理。O2已关闭：MVP cold load完整replay全部complete entries并在conservative recovery后进入Idle，不建设ProjectionSnapshot/checkpoint index。O16已收窄为MVP无独立Tool guidelines。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
 
 后续实现顺序仍是：
 

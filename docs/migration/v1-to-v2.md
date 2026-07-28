@@ -367,7 +367,7 @@ capture 依赖图以 [`../modules/turn-execution-context.md`](../modules/turn-ex
 - fork staging deep copy + target-local identity remap；
 - append-only compaction overlay；
 - partial tail、strict corruption、explicit repair 和 conservative recovery；
-- projection snapshot/session index 只是 rebuildable cache。
+- MVP不实现projection snapshot或checkpoint index；cold load完整replay全部complete entries到physical current entry（最后成功append的EntryId），重建durable projections并保守关闭unfinished Turn后进入Idle。session index仍只是rebuildable cache。
 
 完成门槛：
 

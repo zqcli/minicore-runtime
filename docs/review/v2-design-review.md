@@ -155,9 +155,9 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - Agent→Session 是 reference-grouping 而非 containment（删 Agent 不级联、history 仍可读）→ ADR 0100 一句话点明。
 - ~~`QueryResponse.stamp`与`SessionSnapshot`定位重叠~~：**已关闭**。删除cursor-based ReadStamp；Query只返回typed data与可选领域revision，Snapshot或snapshot-first subscription负责完整恢复读模型。
 
-### 存储 scale / 恢复兜底（correctness 不阻塞，scale 需规划）
+### 存储 scale / 恢复兜底（correctness 不阻塞）
 
-- 无持久 checkpoint/index：冷 open、`OutcomeUnknown` reopen、apply-mismatch reload 全 O(n) 全量 replay（含 O(n) 跨 entry 引用/ancestry 校验）；compaction 只 append overlay、物理文件永不收缩，replay 成本随会话寿命单调增长、compaction 后也不下降 → 补 rebuildable 已校验 projection snapshot + byte-offset/checkpoint index，并给物理 segmentation/vacuum 方案（与 fork anchor 引用旧 entry 相互制约，需尽早留位）。
+- ~~无持久checkpoint/index导致cold open为O(n)完整replay。~~ **已关闭，接受MVP取舍**：冷启动顺序读取全部complete `StoredSessionEntry`直到physical current entry（最后成功append的`EntryId`）并重建durable projections；不恢复provider stream、AgentLoop、Tool task、waiter或queue，unfinished Turn按conservative recovery追加terminal事实后进入Idle。已loaded Session之间切换只路由现有`SessionExecutionHandle`，不触发storage replay。Compaction只降低model-visible conversation，不降低ledger replay成本；MVP不实现ProjectionSnapshot、byte-offset/checkpoint index、segmentation或vacuum，没有真实性能数据前不增加加速层。
 - 「同时只有一个 Running Turn」不在 corruption/replay 校验清单，只靠 executor 纪律 → 提升为 writer 追加校验 + replay fold 不变量（fail closed）。
 - 无 explicit repair 工具：中段坏行（delayed-alloc 掉电常见）即 brick 整个 Session 历史，只有 partial-tail 能自动截断 → 补受控 last-valid-prefix 修复 utility（需 exclusive lease）。
 - host restart 跨会话非幂等 Tool 重复副作用（Started-but-no-result → Abandoned → 下一 Turn 模型重新请求并再次执行）→ 点明代价，引入 tool 级副作用幂等 key 缓解。
@@ -265,7 +265,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | ID | 问题 | 当前状态 | 优先级 |
 | --- | --- | --- | --- |
 | O1 | Sandbox capability无法强制时缺少预执行拒绝 | 延后：不阻塞阶段6–8；production Tool/Sandbox adapter前关闭 | 条件性P0 |
-| O2 | 长Session无持久projection snapshot/checkpoint index | 仍开放 | P2 |
+| O2 | 长Session无持久projection snapshot/checkpoint index | 已关闭：MVP接受cold load完整线性replay | — |
 | O3 | 中段corruption无显式repair utility | 仍开放 | P2 |
 | O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
 | O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
@@ -314,11 +314,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 ### Storage与恢复
 
-#### O2 · Projection snapshot/checkpoint index
+#### O2 · Projection snapshot/checkpoint index（已关闭）
 
 - 发生场景：长期Session积累数万entries并多次compaction/fork；每次load、recovery或history replay仍从文件头执行cross-entry validation。
-- 风险：冷启动与恢复延迟随会话寿命线性增长；compaction只降低模型上下文，不降低ledger replay成本。
-- 推荐修复：增加rebuildable verified projection snapshot与byte-offset/checkpoint index；snapshot记录format/version、selected-path checkpoint、structural validation coverage和覆盖offset，open时先验证snapshot再replay tail。提前为physical segment/vacuum留接口，但不改变SessionStorage是唯一durable truth。
+- 复核结论：pi、Codex和Gemini CLI的cold resume同样顺序读取完整session/rollout记录，再用latest effective compaction或replacement history构造模型上下文；Compaction不是完整execution checkpoint。MiniCore的多loaded Session切换不执行cold open，因此该成本只发生在显式load、restart recovery或hot projection丢弃后的replay。
+- 关闭决议：MVP有意接受O(n)完整replay。cold load读取全部complete entries到physical current entry（最后成功append的`EntryId`），通过同一个`validate_and_project`重建Turn/Item/Interaction/Conversation/Usage/tree projections，不恢复任何process-local execution object；unfinished Turn保守写入Interaction closure、ToolAbandoned和TurnInterrupted后进入Idle。MVP不增加ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum。
+- 重开条件：真实Session规模或load/recovery遥测证明线性replay造成不可接受的用户可见延迟或资源占用时，以独立设计重新评估；不能仅因Compaction存在就把它提升为完整Session checkpoint。
 
 #### O3 · Explicit repair utility
 
