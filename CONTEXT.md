@@ -159,7 +159,7 @@ Runtime内部维护的live map，记录当前已加载Session对应的`SessionEx
 _避免_：会话存储、会话目录、独立会话运行时注册表、UI selection store
 
 **会话存储（`SessionStorage`）**：
-单个会话的底层 by-entry ledger，也是 `SessionWriter` 的 adapter；负责读取 header/entries、重建 parent tree、校验entry body与cross-entry references、生成 committed projections，并隐藏 memory/JSONL实现。它不决定Agent如何运行，也不直接服务UI。
+单个会话的底层 by-entry ledger，也是 `SessionWriter` 的 adapter；负责读取 header/entries、重建 parent tree、校验entry body与cross-entry references、生成 committed projections，并隐藏 memory/JSONL实现。MVP cold load完整replay全部complete entries到physical current entry（最后成功append的EntryId），不恢复process-local执行对象，保守关闭unfinished Turn后进入Idle；已loaded Session切换不触发storage replay。MVP不实现ProjectionSnapshot或checkpoint index。它不决定Agent如何运行，也不直接服务UI。
 _避免_：会话管理器、会话运行时、聊天状态、第二 durable event log
 
 **技能**：

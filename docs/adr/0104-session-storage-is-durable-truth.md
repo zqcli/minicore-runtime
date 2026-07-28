@@ -26,7 +26,7 @@
 - entry 用 `EntryId + parent_id` 形成 immutable history tree；current entry 是最后成功 append 的 entry；stable checkpoint 由 boundary/tree projection 提供。不建立 Branch entity。
 - fork 对 selected parent path 做 deep copy 并 remap target-local identities（EntryId/parent_id、TurnId/ItemId/RequestId），保留 ToolCallId 与 historical exact refs 的 source-scoped 语义。
 - crash后不把半个ToolRound提升为模型可见：含ToolCall的assistant intermediate与tool message在`tool_round_completed`前不model-visible；无ToolCallAssistant Continue在append/apply时直接可见但不结束Turn。baseline不自动补写completion event、不自动重放outcome-unknown Tool、不生成synthetic ToolResult。
-- projection snapshot、session index 与 search database 只是 rebuildable cache，不是第二事实来源。
+- MVP不实现projection snapshot、byte-offset/checkpoint index、physical segmentation或vacuum；session index与search database只是rebuildable cache，不是第二事实来源。cold load完整replay全部complete entries到physical current entry（最后成功append的EntryId），重建durable projections并保守关闭unfinished Turn后进入Idle。
 - 明确不引入：chat/event dual log、Branch entity、SQLite baseline、content-addressed DAG、业务 batch 协议。
 
 ## 后果
@@ -36,6 +36,7 @@
 - by-entry 增加 line count 与 append 次数，但降低单 line 复杂度，并让 inspect、history branch 与 fork 更灵活。
 - committed-only 模型可见性配合保守 recovery，保证 crash 后模型永远看不到 uncompleted ToolRound，代价是被 abandon 的 in-flight Tool 需重新发起而非自动续接。
 - rebuildable cache可随时重建，schema演进不影响durable truth，但要求projector与durable enum保持fail-closed；writer-accepted sequence必须拥有live-apply/cold-replay等价性测试。
+- cold load时间随complete entry数量线性增长是MVP接受的取舍；已loaded Session切换不触发storage replay，Compaction只降低model-visible conversation。只有真实性能数据证明该取舍不可接受时，才重新评估projection acceleration。
 
 ## 历史
 

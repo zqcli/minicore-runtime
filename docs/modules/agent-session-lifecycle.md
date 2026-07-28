@@ -996,16 +996,16 @@ Runtime restart：
 
 显式 load 时：
 
-1. 读取 Session durable head；
-2. 校验 lifecycle；
-3. 读取 current exact SessionDefinitionRevision；
-4. 读取 exact AgentRevisionRef；
-5. 重建 committed conversation；
-6. 重新 resolve Workspace；
-7. 检测没有final AssistantMessage、TurnInterrupted或TurnFailed entry的旧Running Turn及其pending/open state；
-8. baseline逐entry append InteractionResolved、ToolAbandoned和TurnInterrupted；重复恢复靠committed prefix状态判断保证幂等（已存在则跳过）；已有role=tool message的ToolInvocation保持Completed，但不补做ToolRound completion；
-9. 已有terminal entry但仍遗留Pending Interaction或Started Item属于semantic corruption，read-write load fail closed并要求显式repair，不能追加“修复closure”掩盖历史；
-10. 进入 Ready、Unavailable 或返回 typed load/corruption error。
+1. 读取SessionHeader和durable head并校验lifecycle；
+2. 读取current exact SessionDefinitionRevision与exact AgentRevisionRef；
+3. 顺序读取全部complete StoredSessionEntry到physical current entry（最后成功append的EntryId），通过shared reducer重建Turn/Item/Interaction/Conversation/Usage/tree projections；
+4. 重新resolve Workspace；
+5. 检测没有final AssistantMessage、TurnInterrupted或TurnFailed entry的旧Running Turn及其pending/open state；
+6. baseline逐entry append InteractionResolved、ToolAbandoned和TurnInterrupted；重复恢复靠committed prefix状态判断保证幂等（已存在则跳过）；已有role=tool message的ToolInvocation保持Completed，但不补做ToolRound completion；
+7. 已有terminal entry但仍遗留Pending Interaction或Started Item属于semantic corruption，read-write load fail closed并要求显式repair，不能追加“修复closure”掩盖历史；
+8. 进入Ready、Unavailable或返回typed load/corruption error。
+
+MVP不保存或加载ProjectionSnapshot/checkpoint index；完整replay的线性成本是有意取舍。Runtime内切换不同已loaded Session只路由现有SessionExecutionHandle，不执行上述load。步骤3–6恢复的是durable事实并终结旧unfinished work，不恢复旧provider stream、AgentLoop、Tool task、waiter、queue或其他process-local执行状态。
 
 禁止：
 
