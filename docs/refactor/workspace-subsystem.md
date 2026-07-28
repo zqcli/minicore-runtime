@@ -3,6 +3,8 @@
 > **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
 >
 > **后续修订**：本文将`AuthorizedWorkspacePath`交给通用资源锁消费的描述已被[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)取代；当前仅用于权限、Sandbox与Session-local `FileMutationKey`推导。
+>
+> **后续修订**：本文的active lease revocation与Workspace fingerprint确定性恢复要求已分别被[ADR 0121](../adr/0121-workspace-updates-require-idle.md)和[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)取代。当前fingerprint只在Runtime内有效，restart重新resolve。
 
 状态：目标架构已确定；实现细节待补充
 日期：2026-07-16

@@ -863,7 +863,7 @@ TurnModelSnapshot policy
 
 ### Exact Resume Limitation
 
-Compaction不能补偿缺失的Prompt或Tool recovery material。same-Turn cold resume仍依赖Prompt和Tool execution basis可重建；已经committed的Skill正文属于conversation fact，未committed Skill不由summary保存或恢复。
+Compaction不能把execution Context变成可恢复checkpoint。MVP在process restart后关闭unfinished Turn，不恢复旧PromptSet、ToolSet或Workspace fingerprint family；已经committed的Skill正文与StoredCompaction属于conversation fact，仍可由storage replay，未committed Skill不由summary保存或恢复。
 
 ## Recovery
 

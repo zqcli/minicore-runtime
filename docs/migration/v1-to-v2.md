@@ -260,7 +260,7 @@ WorkspaceAccessView
 - `ExecutionContextFingerprint`；
 - cancellation、Steer、FollowUp、diagnostics 和释放时机；
 - AgentLoop 与 Session execution 的职责分界；
-- 崩溃恢复时需要持久化哪些 fingerprint 或 definition reference。
+- 崩溃恢复时保留哪些exact definition reference和opaque historical fingerprint；MVP不恢复旧Workspace/Prompt/Tool/Skill execution Context。
 
 capture 依赖图：
 
@@ -461,6 +461,7 @@ SessionExecutor NeedModel
 - 异步同步不建设全局lock-rank系统：普通guard不跨await/owner调用，release后fan-out；有意的bounded异步串行使用typed permit和私有组合helper。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
 - Cancel在sticky epoch发布后立即返回typed`CancelAccepted`；Session进入Finishing完成write/process/remote Tool结构化收口，期间允许FollowUp排队，旧Turnterminal后再启动下一Turn。完整决策见[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。
 - Workspace definition update只在loaded Session Idle时接受；authority hard restriction通过SecurityRevoked中断Turn并在terminal后重新resolve，不承诺动态撤销open handle。完整决策见[ADR 0121](../adr/0121-workspace-updates-require-idle.md)。
+- Workspace及其窄view fingerprint只在当前Runtime的一次resolve生命周期内有效；restart、fork或重新resolve不恢复旧Snapshot、grant、cache或fingerprint family。完整决策见[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)。
 
 完成门槛：
 

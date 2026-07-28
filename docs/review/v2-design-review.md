@@ -187,7 +187,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~restrictive definition update若durable commit失败需要专用diagnostic~~ → **已由ADR 0121关闭**：Workspace patch只在Idle，commit失败保留old definition/Snapshot。
 - ~~lease recheck/RevocableHandle收敛open-handle动态撤权窗口~~ → **已由ADR 0121关闭**：MVP不承诺动态handle revocation；handle-relative open仅作为O1/TOCTOU防护候选。
 - additional roots 进入 Tool ceiling 但默认不进 Prompt/Skill discovery → monorepo「加目录=期望带上项目指令/skills」直觉会落空 → diagnostics/UI 提示「该 root 未授权为 Prompt/Skill source」，属取舍成本而非缺陷。
-- crash recovery 是否持久化 `WorkspaceFingerprint`/view fingerprint 仍开放，而 Test Matrix 的「ToolGrantKey 绑定 WorkspaceAccessFingerprint」「fork/resume 后 grant 一致」依赖它 → 实现 storage 前定案。
+- ~~crash recovery是否持久化或确定性重建`WorkspaceFingerprint`/view fingerprint~~：**已由ADR 0122关闭**。这些值只在当前Runtime的一次resolve生命周期内有效；restart/fork不恢复Tool grant、cache或旧fingerprint family。
 
 ### 横切复用
 
@@ -275,7 +275,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O9 | provider输出错误的命名与retry语义未冻结 | 已关闭：ADR 0120冻结ModelGateway response validation与四个直接error reason | — |
 | O10 | restrictive Workspace update未持久化缺少专用诊断 | 已关闭：ADR 0121删除active-Turn restrictive update/revoke-before-commit路径 | — |
 | O11 | 已打开文件handle存在revocation窗口 | 已关闭：MVP不承诺动态handle revocation；SecurityRevoked按Cancel规则收口 | — |
-| O12 | Workspace/view fingerprint的恢复策略未冻结 | 仍开放 | P1 |
+| O12 | Workspace/view fingerprint的恢复策略未冻结 | 已关闭：ADR 0122放弃跨Runtime恢复，fingerprint仅当前Runtime有效 | — |
 | O13 | Prompt/Skill/Workspace共享pinning/authorization值类型未落地 | 仍开放 | P2 |
 | O14 | CompactionSummaryDirective正文的fingerprint coverage不明确 | 部分开放 | P1 |
 | O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 仍开放 | P1 |
@@ -304,11 +304,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 关闭决议：Workspace definition不在active Turn热更新。Authority/host hard restriction发布sticky SecurityRevoked，停止新的MiniCore-sanctioned operation；越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，随后`TurnInterrupted(SecurityRevoked)`。不承诺动态关闭open fd、回滚kernel/provider side effect或建立Runtime-global handle registry。
 - 边界：O1仍独立开放。Sandbox无法强制某capability class时，必须在`ToolExecutionStarted`前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
 
-#### O12 · Workspace fingerprint恢复策略
+#### O12 · Workspace fingerprint恢复策略（已关闭）
 
-- 发生场景：restart/fork后重建Tool grants或authorization cache，grant key依赖`WorkspaceAccessFingerprint`，但文档未冻结该fingerprint持久化还是确定性重建。
-- 风险：恢复后fingerprint漂移会导致grant过宽、异常失效或同一Session重启前后行为不同。
-- 推荐修复：优先采用确定性重建：从durable exact `SessionDefinitionRevision`、Workspace definition、authorization policy/enforcement version计算versioned fingerprint，并提供golden vectors；只有存在不可重建输入时才持久化fingerprint。ToolGrantKey只能绑定可重建、算法已版本化的值。
+- 原发生场景：restart/fork后尝试恢复Tool grant或authorization cache，grant key依赖`WorkspaceAccessFingerprint`，旧文档未说明该值应持久化、重建还是失效。
+- 同类产品复核：pi恢复conversation/cwd但重新加载resources、tools和system prompt；Codex resume重新构造cwd、workspace roots、approval与sandbox config；Gemini CLI只声明保存conversation/tool history；OpenHands在sandbox state丢失时从durable event history启动fresh agent session；Claude Code重新读取settings，且不恢复bypassPermissions、后台Bash和临时add-dir。共同基线是保留history、重建current execution environment。
+- 决议：durable Session definition与conversation继续保留；WorkspaceSnapshot、各view fingerprint、Tool grant、authorization cache和旧execution Context不跨Runtime恢复。每次load/re-resolve创建新的Runtime-local fingerprint family；historical fingerprint只作opaque diagnostic，不参与current授权或same-Turn resume。fork不复制Session grant，unfinished Turn继续按HostRestart/RecoveryContextUnavailable关闭。
+- 关闭依据：[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)。historical fingerprint仅用于correlation，不是authorization proof；删除Workspace fingerprint canonical encoding、algorithm version和golden-vector要求。未来durable grant或跨设备execution migration必须另建ADR。
 
 ### Storage与恢复
 
@@ -419,6 +420,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 全局同步原语锁序：ADR 0117确认当前不存在可构造循环等待，以single owner、短guard、typed permit和release-before-fan-out关闭O5；
 - Cancel可观察收口：ADR 0118将Cancel acceptance与Tool settlement分离，立即返回CancelAccepted、复用Finishing并在期间接收FollowUp，关闭O6；
 - Prompt assembly控制面延迟：量化复核确认当前纯内存线性assembly成本较低，保持同步实现并不增加offload、counter或observer，关闭O7；
+- Workspace fingerprint恢复：ADR 0122保留durable Session/history但放弃旧Workspace execution state恢复，以Runtime-local fingerprint和重新resolve关闭O12；
 - Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
 - public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
 - Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；

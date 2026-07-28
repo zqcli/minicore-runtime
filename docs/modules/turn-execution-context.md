@@ -50,7 +50,7 @@ Turn、Item 与 Interaction 的领域语义以 [Turn、Item 与 Interaction 架�
 - Steer 是 current Turn control input；成功 append 后才影响下一次逻辑模型调用；
 - FollowUp 不属于 `TurnControl`，它在当前 Turn terminal 后开启新 Turn，并捕获新 Context；
 - Workspace definition update只在Session Idle；authority/host hard restriction通过SecurityRevoked中断active Turn；
-- same-Turn cold resume只有在Prompt/Model/Tool execution basis和Workspace reauthorization可重建时才允许；Skill旧正文不单独恢复，已经committed的Skill内容由conversation保留；否则保守中断。
+- MVP不提供process restart后的same-Turn cold resume；unfinished Turn保守中断，future Turn按current definition、current authority和current Runtime resources重新capture Context。
 
 ## 三层边界
 
@@ -801,11 +801,11 @@ capture schema/algorithm version
 
 逻辑模型调用无需额外fingerprint类型。Session logical retry必须先证明`ConversationCheckpoint`不变；在此前提下，`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + effective max_output_tokens + AssembledModelContextFingerprint`足够判断是否仍是同一次调用。仅TranscriptFingerprint相同不足以忽略AdvanceOnly ledger变化。
 
-Fingerprint 用于一致性、审计、cache 和 recovery 比对，不代替 secret redaction，也不是完整恢复数据。
+Fingerprint用于当前Runtime内的一致性、cache和diagnostics。包含Workspace child fingerprint的值可以写入TurnContext作为opaque historical correlation，但cold replay不重算、不与current view比较后授权，也不作为旧Context恢复证明。
 
 ## Execution Context Metadata
 
-如果需要精确审计或 cold recovery，TurnContext entry应保存或引用以下信息；哪些内容内嵌、哪些使用exact content reference由对应定义子系统闭合：
+TurnContext entry为历史审计和conservative recovery保存或引用以下信息；哪些内容内嵌、哪些使用exact content reference由对应定义子系统闭合：
 
 ```text
 capture schema/version
@@ -813,7 +813,7 @@ SessionId / TurnId
 SessionDefinitionRevision
 AgentRevisionRef
 TurnModel exact reference
-WorkspaceSnapshot / authority revision reference
+WorkspaceSnapshotRef（revision + opaque historical fingerprint）
 SkillView fingerprint and selected entry source references
 ToolSet spec/route implementation references
 PromptSet definition/content references
@@ -855,19 +855,9 @@ SessionStorage reload
 
 已 committed 的 UserMessage、`tool_round_completed` round、Steer、Compaction 和 AssistantMessage 保留。
 
-只有同时满足以下条件，才允许 exact same-Turn resume：
+MVP不提供process restart后的exact same-Turn resume。old WorkspaceSnapshot、PromptSet、ToolSet、SkillView和它们的fingerprint family全部丢弃；没有terminal fact的Turn按上述流程关闭。future Turn使用durable current SessionDefinition、current authority和current Runtime resources重新capture完整Context，不能使用current replacement冒充旧Turn曾经执行的Context。
 
-- exact SessionDefinitionRevision 和 AgentRevisionRef 仍可读取；
-- Workspace 可以重新授权，并且 capability ceiling 不比原 Context 更宽；
-- PromptResourceView与Prompt fingerprint仍匹配，或旧Turn按recovery policy中断；
-- SkillView不要求恢复旧正文；已经committed的Skill contribution仍由conversation保存；
-- ToolSpec 与 executor route 有稳定、可重建的 implementation version；
-- Model identity、capability 和请求语义可重建；
-- pending Tool side effect outcome 已知或有专用 repair protocol。
-
-任一条件不满足时不能使用 Agent current revision、current SessionDefinition 或其他 current replacement 冒充旧 Context。
-
-Tool子系统尚未定义稳定executor implementation identity，因此不承诺透明cold resume。Pending Interaction必须在TurnInterrupted/Failed前以cancelled、expired或recovery reason持久关闭；Started ToolInvocation必须已有truthful role=tool message或ToolAbandoned，不能只删除内存waiter/task。
+Pending Interaction必须在TurnInterrupted/Failed前以cancelled、expired或recovery reason持久关闭；Started ToolInvocation必须已有truthful role=tool message或ToolAbandoned，不能只删除内存waiter/task。未来若需要exact resume，必须另行定义durable execution manifest、可恢复Tool route和authority proof。
 
 ## Diagnostics 与释放
 
@@ -878,7 +868,7 @@ Context capture diagnostics 至少记录：
 - source unavailable、optional degradation 和 required failure；
 - capture duration 和 cache hit；
 - final control/basis validation；
-- recovery mismatch 的具体 child reference。
+- recovery使用的historical child reference；不尝试重建process-local fingerprint。
 
 绝对路径、Prompt 正文、Skill 正文、Tool arguments 和 credentials 默认不进入公开 diagnostics。
 
@@ -1072,7 +1062,7 @@ AgentLoop registry
 - process restart 后 incomplete Turn 只 terminalize 一次；
 - Turn terminal/restart 时 Pending Interaction 被持久关闭且不重复 resolution；
 - Turn terminal/restart 时 Started ToolInvocation 被 truthful Completed 或 Abandoned；
-- active Turn不原地替换PromptSet、ToolSet或SkillView；进程重启后旧Prompt fingerprint无法重建时保守中断Turn；
+- active Turn不原地替换PromptSet、ToolSet或SkillView；进程重启后一律保守中断unfinished Turn，不重建旧fingerprint family；
 - terminal 后释放 Context 且不清空 Runtime-global cache。
 
 ## 后续问题
@@ -1080,6 +1070,6 @@ AgentLoop registry
 1. ~~AgentLoop 与 Rig 0.40.0 的具体 sans-I/O adapter 形状~~（已由 ADR 0115 关闭：AgentLoop 自研，Rig 不参与 loop）。
 2. Rig 0.40.0对TurnModelSnapshot、finish reason、reasoning、single-attempt error/delivery state和SDK retry=0的ModelGateway private adapter映射。
 3. Tool executor implementation identity/version 的注册和 recovery 规则。
-4. PromptResourceView、SkillView和ToolSet fingerprint/reference的最终持久化细节。
+4. PromptResourceView、SkillView和ToolSet historical reference的最终持久化细节；MVP不用于exact Turn resume。
 5. Runtime pending Interaction公开query/event payload。
 6. standalone compaction、review和background work是否使用Turn execution。

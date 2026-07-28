@@ -1,6 +1,8 @@
 # Turn 执行模块与执行上下文架构设计
 
 > **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
+>
+> **后续修订**：[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)取消MVP的exact same-Turn cold resume；restart关闭unfinished Turn，future Turn按current definition/current authority重新capture Context。
 
 状态：目标架构与公开protocol映射已确定；Rig adapter、Compaction和生产实现待后续完成
 日期：2026-07-16

@@ -27,7 +27,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Prompt template 的最终语法；
 - provider-specific role、cache-control 和 payload encoding；
 - Compaction的cut、trigger和SessionExecutor orchestration；本文只固定CompactionSummary assembly contract；
-- Prompt fingerprint/content reference 的 exact cold recovery；
+- Prompt fingerprint/content reference 的historical审计格式；MVP不执行exact same-Turn cold recovery；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现；
 - PromptSet fingerprint 的持久化和审计格式。
 
@@ -729,7 +729,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 3. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
 4. SkillIntent、UserMessageCompositionInput 与 committed contribution stamp 的精确字段。
 5. ToolPromptView 是否包含 guidelines，以及 ToolSpec 如何进入最终 Prompt。
-6. PromptSet fingerprint 的序列化和 Turn recovery 规则。
+6. PromptSet fingerprint 的historical序列化格式；包含Runtime-local Workspace child fingerprint的值不用于Turn cold resume。
 7. Prompt content cache 的 key、eviction 和失效策略。
 8. Prompt hook 和动态 Context provider 是否能在不建立未提交模型可见旁路的前提下接入。
 9. Provider cache效果和canonical instruction boundary验证。

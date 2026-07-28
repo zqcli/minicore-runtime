@@ -46,7 +46,7 @@ Turn execution context
 - 当前不定义 `WorkspaceId`；
 - `SessionId` 是 Workspace definition 的 owner identity；
 - `WorkspaceRevision` 标识 Session Workspace definition 的版本；
-- `WorkspaceFingerprint` 标识一次解析后的有效 Workspace 快照；
+- `WorkspaceFingerprint`标识当前Runtime中一次解析后的有效Workspace快照；它不跨Runtime恢复；
 - primary root、additional roots 和 cwd 由 Workspace 模块统一规范化和校验；
 - trust 是 policy 输入，不等于文件权限；
 - 文件可读不等于允许作为 Prompt 或 Skill source；
@@ -652,7 +652,7 @@ ToolService 通过该 context 获得：
 - canonical cwd；
 - read/write root ceiling；
 - authority revision-bound effective grants；
-- stable access fingerprint。
+- typed current-Runtime access fingerprint。
 
 它不包含 Prompt source、Skill source、Tool registry、approval 或 provider 信息。
 
@@ -986,29 +986,13 @@ WorkspaceAccessFingerprint
 WorkspaceToolFingerprint
 ```
 
-WorkspaceFingerprint 覆盖：
+这些fingerprint是Runtime-instance-local opaque identity：每次成功`WorkspaceResolver::resolve`创建一个新的fingerprint family，同一个Snapshot投影出的各窄view绑定该family。调用方只允许在当前Runtime内比较typed value，不能解析字段或假设具体hash算法。
 
-- SessionId；
-- WorkspaceRevision；
-- canonical roots 和稳定顺序；
-- resolved cwd；
-- per-root trust verdict/revision；
-- effective filesystem grants；
-- effective Prompt source grants；
-- effective Skill source grants；
-- authority policy revision；
-- canonicalization algorithm version。
+Runtime restart、unload后的重新load、SecurityRevoked后的重新resolve都会创建新family；即使SessionDefinition、canonical roots和effective grants未变化，新fingerprint也不要求与旧值相等。MVP不定义Workspace fingerprint的跨进程canonical encoding、algorithm version、确定性重建或golden vector。
 
-不覆盖：
+各窄view使用不同的typed fingerprint，防止Prompt、Skill、Access和Tool view identity混用，并支持同一个Snapshot内的精确cross-binding。MVP不承诺任一child fingerprint在两次resolve之间保持相等；新的resolution family可以保守失效全部派生cache。
 
-- Prompt/Skill 文件内容；
-- diagnostics 文本；
-- cache/load state；
-- process-local security signal/target generation；
-- display name；
-- filesystem watcher 状态。
-
-各窄 view 使用自己的 fingerprint，避免无关变化造成跨子系统 cache invalidation。例如只收紧 write grant，不应改变 WorkspacePromptFingerprint。
+这些fingerprint不表达或校验Prompt/Skill文件内容、diagnostics文本、file watcher、process handle或security signal。authorization-sensitive cache与ToolGrantKey必须同时绑定当前view fingerprint；旧Runtime或旧resolve产生的cache/grant不得迁移到新view。
 
 ## Error 与 Diagnostics
 
@@ -1163,6 +1147,8 @@ upload / telemetry
 - Workspace unavailable 时 future Turn fail closed；
 - 同根多Session不共享mutable Snapshot或authority-sensitive cache；
 - Workspace 不恢复通用 ResourceManager。
+- WorkspaceSnapshot及其view fingerprint不跨Runtime恢复；load使用current definition/current authority重新resolve；
+- Tool grant和authorization-sensitive cache是Runtime-instance-local，不跨restart、fork或Workspace重新resolve迁移；
 
 ## Test Matrix
 
@@ -1203,7 +1189,8 @@ upload / telemetry
 - security signal先赢时迟到model/tool/source结果不进入后续committed conversation；
 - crash无法证明security cause时使用HostRestart/RecoveryContextUnavailable；
 - 同root两个Session的cwd/grant/fingerprint和security target generation隔离；
-- view-specific fingerprint golden vectors；
+- 同一个WorkspaceSnapshot投影的各view绑定同一次resolution family；
+- Runtime restart或重新resolve后生成新的fingerprint family，旧cache/grant不可复用；
 - absolute path 不泄漏到模型可见 Skill metadata 或 Prompt provenance。
 
 ## 后续问题
@@ -1213,8 +1200,7 @@ upload / telemetry
 3. Workspace source adapter和Sandbox在各平台如何实现handle-relative open以防止TOCTOU；该问题属于O1 enforcement，不提供动态handle revocation。
 4. Session Workspace Idle-only update的最终command payload。
 5. Workspace unavailable reason与SessionReadiness/公开diagnostics的最终映射。
-6. crash recovery如何确定性重建WorkspaceFingerprint、view fingerprint和authority policy basis（O12）。
-7. future remote backend出现后，是否引入Workspace locator/backend seam。
+6. future remote backend出现后，是否引入Workspace locator/backend seam。
 
 ## 设计进度
 
@@ -1228,6 +1214,7 @@ upload / telemetry
 - [x] 定义Turn-pinned immutable Snapshot、Idle-only update和SecurityRevoked interruption（ADR 0121）。
 - [x] 将 WorkspaceSnapshot 纳入 TurnExecutionContext capture DAG，并固定字段私有。
 - [x] 定义同根多 Session 的隔离语义。
+- [x] 确定Workspace及view fingerprint只在当前Runtime有效，不做跨进程恢复（ADR 0122）。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
-- [ ] 定义公开 command payload 与 recovery manifest/storage integration。
+- [ ] 定义公开command payload与historical WorkspaceSnapshotRef storage integration。
