@@ -23,7 +23,7 @@ Tool approval 表达为该 Item-owned durable Interaction
 
 - Tool 注册配置的持久化格式；
 - 跨 Runtime 的 Tool 分发；
-- Turn cold recovery 时如何证明并重建完全相同的 Tool executor implementation；
+- future exact Turn migration如何证明并重建完全相同的Tool executor implementation；MVP不提供该能力；
 - ToolResult large-content reference 和 executor identity 的 exact storage payload；
 - 具体操作系统 Sandbox 实现；
 - MCP transport、插件协议和 provider tool-search adapter 的实现细节。
@@ -456,7 +456,7 @@ pub struct ToolTurnContext {
 
 ToolTurnContext是crate-internal execution input；private `execution_control`字段只能由Session execution注入。`tool_calling`直接来自本Turn exact `TurnModelSnapshot.capabilities.tool_calling`，不按provider名称推断，也不把完整ModelCapabilities传入ToolService。它不进入Agent、Session或Turn的持久领域字段，并且必须来自同一个captured SessionDefinitionRevision；完整规则见[Agent与Session生命周期架构设计](agent-session-lifecycle.md)。
 
-`WorkspaceToolContext`由本Turn pin的`WorkspaceSnapshot`投影，包含canonical cwd、`WorkspaceAccessView`和stable fingerprint。它是filesystem capability ceiling：ToolRequirements、ToolPolicy、approval和grant只能进一步收紧，不能扩大该view。ToolService不自行canonicalize Workspace roots，也不从trust推断权限。Workspace definition只在Session Idle更新；active Turn的hard restriction通过SecurityRevoked control处理。完整规则见[Workspace子系统架构设计](workspace.md)。
+`WorkspaceToolContext`由本Turn pin的`WorkspaceSnapshot`投影，包含canonical cwd、`WorkspaceAccessView`和current-Runtime comparable fingerprint。它是filesystem capability ceiling：ToolRequirements、ToolPolicy、approval和grant只能进一步收紧，不能扩大该view。ToolService不自行canonicalize Workspace roots，也不从trust推断权限。Workspace definition只在Session Idle更新；active Turn的hard restriction通过SecurityRevoked control处理。完整规则见[Workspace子系统架构设计](workspace.md)。
 
 ## ToolSet Fingerprint
 
@@ -474,7 +474,7 @@ ToolSet capture algorithm version
 
 锁状态、approval waiter、随机指针、cancellation 和 ToolUpdate 不进入 fingerprint。
 
-ToolSetFingerprint 首先保证同一进程内模型披露与 executor route 的一致性。exact cold recovery 还要求 Tool 注册提供可持久重建的 implementation identity/version；如果某个 route 只有进程内 identity，manifest 可以记录为不可恢复，host restart 后必须 fail closed，不能用同名 current Tool 静默替代。
+ToolSetFingerprint保证当前Runtime内模型披露与executor route的一致性。它包含Runtime-local Workspace view fingerprint，persisted值只作为historical diagnostic；MVP不使用它执行exact cold recovery，也不能用同名current Tool冒充旧Turn route。
 
 `ToolPromptView.tool_set_fingerprint` 携带 parent ToolSetFingerprint，必须等于来源 ToolSet 的 fingerprint。该字段不进入模型 payload，只用于 PromptSet/ToolSet cross-binding。
 
@@ -750,6 +750,8 @@ pub struct PolicyRevision;
 
 更宽泛的目录、命令或域名规则必须作为显式 ToolGrant rule 表达，不能通过忽略 arguments hash 自动扩大一次审批。
 
+`ToolGrantStore`是Runtime-instance-local。Turn/Session grant只在当前Runtime且matching current `WorkspaceAccessFingerprint + PolicyRevision`时有效；Runtime restart、fork或Workspace重新resolve后不恢复、不迁移旧grant。
+
 ## 批量调度和 Session-local 文件 mutation queue
 
 ToolSet 内部完成批量调度，不暴露独立 ToolScheduler 类。
@@ -1005,6 +1007,7 @@ CallToolTool / InvokeToolTool
 - approval 绑定冻结参数和动态 requirements；
 - WorkspaceAccessView 是文件权限硬上限，并在 grant lookup、approval 和 Sandbox 前生效；
 - ToolGrantKey 绑定 WorkspaceAccessFingerprint，旧 access snapshot 的 grant 不能扩大新 snapshot；
+- Tool grant不跨Runtime restart、fork或Workspace重新resolve恢复；
 - executor 只接收 narrow ToolExecutionContext，不能访问 WorkspaceAccessView 或重新授权未声明 path；
 - approval 不替代 Sandbox；
 - 每个调用最多执行一次 PostToolUse 和 terminal lifecycle；
@@ -1027,8 +1030,7 @@ CallToolTool / InvokeToolTool
 7. DeferredToolIndex 的搜索算法、排序和最大返回数量。
 8. provider 原生 deferred loading 与 fallback `search_tools / invoke_tool` 的 adapter 规则。
 9. ToolUpdate 的事件类型和流式输出背压。
-10. Tool route/executor implementation fingerprint 的稳定生成和 cold recovery 规则；缺失时 recovery 必须 fail closed。
-11. Tool executor implementation identity 与 large ToolResult content reference 的最终持久化细节。
+10. Tool executor implementation identity 与 large ToolResult content reference 的最终持久化细节；MVP不用于exact same-Turn resume。
 
 ## 设计进度
 
@@ -1054,4 +1056,4 @@ CallToolTool / InvokeToolTool
 - [ ] 定义 ToolPolicy、grant、PermissionSet 和 ToolRequirements 的最终字段。
 - [ ] 定义 ToolSandbox adapter 和 ToolUpdate event。
 - [x] 定义ToolCall、approval、execution-start、tool message和complete ToolRound的by-entry持久化baseline。
-- [ ] 定义 exact Tool executor identity 和 cold recovery 语义。
+- [x] 确定MVP不做exact Tool/Turn cold resume；persisted ToolSetFingerprint只作historical diagnostic（ADR 0122）。

@@ -226,3 +226,4 @@ Steer after complete assistant/tool step
 - [ADR 0119：模型调用使用Session逻辑重试](adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](adr/0120-failures-stay-with-owning-modules.md)
 - [ADR 0121：Workspace定义只在Idle更新，安全撤权中断当前Turn](adr/0121-workspace-updates-require-idle.md)
+- [ADR 0122：Workspace fingerprint只在当前Runtime有效](adr/0122-workspace-fingerprints-are-runtime-local.md)

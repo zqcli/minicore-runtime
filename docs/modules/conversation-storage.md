@@ -313,9 +313,17 @@ pub struct TurnModelRef {
     pub definition_version: ModelDefinitionVersion,
     pub turn_model_fingerprint: TurnModelFingerprint,
 }
+
+pub struct WorkspaceSnapshotRef {
+    pub session_id: SessionId,
+    pub workspace_revision: WorkspaceRevision,
+    pub workspace_fingerprint: WorkspaceFingerprint,
+}
 ```
 
-`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。`TurnModelRef`保存stable selection、exact model definition version和覆盖effective capability/generation policy的TurnModelFingerprint；它不保存endpoint、auth binding或credential。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
+`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。`TurnModelRef`保存stable selection、exact model definition version和覆盖effective capability/generation policy的TurnModelFingerprint；它不保存endpoint、auth binding或credential。`WorkspaceSnapshotRef.workspace_fingerprint`是当时Runtime生成的opaque historical label，不是current authority、可恢复capability或重新resolve指令；cold replay不得重算或用于grant lookup、approval reuse、Sandbox admission或其他授权判断。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
+
+`prompt_fingerprint`、`tool_fingerprint`、`skill_fingerprint`和`execution_fingerprint`同样只记录当时capture事实。包含process-local Workspace child fingerprint的值不要求跨Runtime重建；unfinished Turn按conservative recovery关闭，future Turn创建新的Context。
 
 Context entry在initiating UserMessage前append，由UserMessage通过`context_entry_id`引用。
 
@@ -324,7 +332,7 @@ Context append成功不创建领域Turn，也不允许调用模型或执行Tool�
 Context不保存：
 
 - provider credentials；
--随机lease token；
+- process-local security signal/generation；
 - approval waiter；
 - cancellation token；
 - mutable cache state；

@@ -12,7 +12,7 @@ MiniCore 后端需要统一解释工作目录、文件访问域、trust 与 sour
 ## 决策
 
 - **Workspace 是 Session-owned definition**：属于 immutable `SessionDefinition.workspace`，不是独立 entity、Runtime-global service、registry 或 lifecycle aggregate；`SessionId` 即 owner identity，当前不定义 `WorkspaceId`。
-- **三种精确 identity 分工**：`WorkspaceRevision` 标识 definition 版本；`WorkspaceSnapshot` 是一次解析后的不可变有效快照；`WorkspaceFingerprint` 标识该快照的有效 identity（用于 cache/授权敏感 key，不以 canonical root 作为授权 key）。
+- **三种精确 identity 分工**：`WorkspaceRevision`标识definition版本；`WorkspaceSnapshot`是一次解析后的不可变有效快照；`WorkspaceFingerprint`标识该快照在当前Runtime内的有效identity（用于cache/授权敏感key，不以canonical root作为授权key，不跨Runtime恢复）。
 - **root、cwd 由 Workspace 模块统一规范化和校验**：唯一 primary root 加显式 additional roots；先 canonicalize 后校验；canonical duplicate 与 overlap fail closed；cwd 必须且只能位于一个明确 root。
 - **trust、filesystem capability、source authorization 三者分离**：trust 是 policy 输入不等于文件权限；文件可读不等于允许作为 Prompt 或 Skill source；Prompt source 与 Skill source 相互独立；additional root 默认仅扩展文件访问。
 - **Prompt/Tool/Skill 只消费窄只读 view**：`WorkspacePromptContext`/`WorkspaceSkillContext`/`WorkspaceToolContext`/`WorkspaceAccessView` 由同一 `WorkspaceSnapshot` 原子投影；三个 Service 不自行 canonicalize roots、不查询 trust、不据文件可读性自行启用 source。
@@ -36,3 +36,4 @@ MiniCore 后端需要统一解释工作目录、文件访问域、trust 与 sour
 两份 V1 原文见 [`../archive/v1/adr/`](../archive/v1/adr/)。
 
 2026-07-27：[ADR 0121](0121-workspace-updates-require-idle.md)将Workspace definition update收窄为Idle-only，并以SecurityRevoked Turn interruption取代active lease revocation；本ADR的Session ownership、窄view与Turn pinning保持有效。
+2026-07-28：[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)将Workspace及其view fingerprint收窄为Runtime-instance-local opaque identity；restart重新resolve，不恢复旧Snapshot、grant或fingerprint family。

@@ -1,6 +1,8 @@
 # Prompt 子系统架构设计
 
 > **已迁移 · 非权威 · 待删除**：本文内容已提炼迁移到正式架构文档（见 [docs/refactor/README.md](README.md) 的去向表）。当前权威架构以 `docs/architecture.md`、`docs/modules/`、`docs/adr/`（0100+）为准，本目录仅暂留供 review。
+>
+> **后续修订**：[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)取消MVP的exact same-Turn cold resume；包含Workspace child fingerprint的PromptSet fingerprint只作为current-Runtime identity和historical diagnostic。
 
 状态：基础架构已确定；实现细节待补充
 日期：2026-07-16

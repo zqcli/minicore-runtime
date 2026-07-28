@@ -34,7 +34,7 @@ pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动�
 - Workspace update UX从热更新变为Turn间更新；长Turn中修改配置需要先Cancel。
 - 删除Workspace lease/control/commit authorization相关字段、同步排序、generation和测试；ADR 0111/0117中的Workspace revoke特殊分支由本ADR修订。
 - `TurnInterruptionKind::SecurityRevoked`与sticky EmergencyControl保留，但它表示authority/host安全事件，不表示Workspace definition patch。
-- O10和O11关闭；O1 Sandbox enforcement与O12 fingerprint恢复策略继续开放。
+- O10和O11关闭；O1 Sandbox enforcement继续开放。O12后由[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)以放弃跨Runtime Workspace fingerprint恢复关闭。
 - handle-relative open仍可作为O1/TOCTOU防护的platform adapter实现问题，但不再用于承诺active-Turn动态revocation。
 
 ## 被否决方案
