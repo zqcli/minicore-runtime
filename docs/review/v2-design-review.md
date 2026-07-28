@@ -111,7 +111,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 **E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile（已关闭）**
 `CompactionSettings.summary_max_output_tokens` 是单一全局 `NonZeroU32`，直接进入 plan 与 directive；但 `ModelCallRequest::new` 校验 `max_output_tokens ≤ TurnModelSnapshot` effective limit。当 pinned model 上限更小时，每次 compaction 请求构造 `InvalidRequest` → 小 context 模型 compaction 永久失效，且误分类为 InvalidRequest/TurnFailed。
 - 影响：plan → request 是必经路径，文档无 clamp/校验规则，而 model-gateway 又禁止静默 clamp（clamp 会改变已 fingerprint 的 policy）。
-- 决议：plan阶段派生`CompactionSummaryBudget`，对全局上限、pinned known model output limit、summary source、Prompt固定开销、context window与safety reserve求交；最终值进入plan/directive/fingerprint。低于`summary_min_output_tokens`时返回`NoFeasibleSummaryBudget`，ModelGateway继续strict validate且不静默clamp。plan/Prompt proof/ModelCallRequest/SessionExecutor append gate负责临时budget一致性，SessionStorage冷重放只验证entry可重建的scope、boundary、hash、checkpoint和provenance关系。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
+- 决议：plan阶段派生`CompactionSummaryBudget`，对全局上限、pinned known model output limit、summary source、Prompt固定开销、context window与safety reserve求交；最终值进入immutable plan/directive并由同一个`Arc<CompactionPlan>`承载。低于`summary_min_output_tokens`时返回`NoFeasibleSummaryBudget`，ModelGateway继续strict validate且不静默clamp。plan/Prompt proof/ModelCallRequest/SessionExecutor append gate负责临时budget一致性，SessionStorage冷重放只验证entry可重建的scope、boundary、exact checkpoint和provenance关系。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)与[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)。
 - 出处：`compaction.md` ↔ `model-gateway.md`。
 
 **E3 · `UserQuestion` Interaction 没有发起 seam（已关闭）**
@@ -125,7 +125,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 > 状态说明（2026-07-26）：F1已关闭。阶段6、7、8保留职责编号，但改为一个模型调用协同交付束；以下原始问题正文仅作评审历史记录。
 
 **F1 · 路线图低估 SessionExecutor(6) / ModelGateway(7) / Compaction(8) 的耦合**
-三者在「逻辑模型调用」强耦合：compaction planning 内联进 SessionExecutor 的 `NeedModel` 安全点；`ModelCallRequest::new` 用 `PromptAssemblyProof` 校验 `TurnModelFingerprint`/purpose，Prompt 与 ModelGateway 互持类型契约。按 6→7→8 串行独立交付会返工。真正的硬门是仍标 `[ ]` 的 Rig 0.40.0 spike。
+三者在「逻辑模型调用」强耦合：compaction planning 内联进 SessionExecutor 的 `NeedModel` 安全点；`ModelCallRequest::new` 用 `PromptAssemblyProof` 校验exact `TurnModelSnapshot`/purpose，Prompt 与 ModelGateway 互持类型契约。按 6→7→8 串行独立交付会返工。真正的硬门是仍标 `[ ]` 的 Rig 0.40.0 spike。
 - 建议：把三者作为协同交付束；先落地 `DeterministicProviderAdapter`/`ScriptedProviderAdapter`，让 SessionExecutor + Compaction 在 fake adapter 上闭环，Rig spike 只 gate 真实 provider；把该依赖显式写入迁移记录。
 - 出处：`migration/v1-to-v2.md`（原 roadmap 阶段依赖）。
 
@@ -187,16 +187,16 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~restrictive definition update若durable commit失败需要专用diagnostic~~ → **已由ADR 0121关闭**：Workspace patch只在Idle，commit失败保留old definition/Snapshot。
 - ~~lease recheck/RevocableHandle收敛open-handle动态撤权窗口~~ → **已由ADR 0121关闭**：MVP不承诺动态handle revocation；handle-relative open仅作为O1/TOCTOU防护候选。
 - additional roots 进入 Tool ceiling 但默认不进 Prompt/Skill discovery → monorepo「加目录=期望带上项目指令/skills」直觉会落空 → diagnostics/UI 提示「该 root 未授权为 Prompt/Skill source」，属取舍成本而非缺陷。
-- ~~crash recovery是否持久化或确定性重建`WorkspaceFingerprint`/view fingerprint~~：**已由ADR 0122关闭**。这些值只在当前Runtime的一次resolve生命周期内有效；restart/fork不恢复Tool grant、cache或旧fingerprint family。
+- ~~crash recovery是否持久化或确定性重建`WorkspaceFingerprint`/view fingerprint~~：**已由ADR 0122关闭，后由ADR 0123取代**。当前架构删除Workspace/view fingerprint族；restart/fork不恢复旧Snapshot或authorization-sensitive cache，MVP不保存跨调用Tool grant，future Turn按current exact refs重新capture。
 
 ### 横切复用
 
-- Prompt/Tool/Skill各自复制相近的pinning + source identity纪律（exact revision、source stamp、不回查current head、content-addressed cache、Workspace*Context三份平行投影）→ 实现前比较真实字段，只在确实同构时抽共享value type；不合并子系统（deletion test成立）是对的。
-- `prompt_set.tools.tool_set_fingerprint == tool_set.fingerprint()` 的相等性应在 `TurnExecutionContext` 构造处有单一、命名、fail-closed 的断言点。
-- `ToolPromptView` 现仅 `specs + fingerprint`，Prompt 组装引用的「guidelines」未定义（Q7）→ 若 system prompt 需 per-tool 指南，窄 view 不足，确认后再决定是否加 `guidelines` 字段。
+- Prompt/Tool/Skill各自复制相近的pinning/source纪律的担忧已由ADR 0123关闭：不抽共享pinning/fingerprint value module，一致性由各deep module的private immutable interface和explicit reload保证；不合并子系统（deletion test成立）是对的。
+- `ToolPromptView` 与 executor route同源的要求已由ADR 0123关闭：ToolPromptView只能由parent ToolSet私有投影并随PromptSet捕获，caller不能伪造或替换，不使用ToolSet binding ID/hash。
+- `ToolPromptView` 现仅 `specs`，Prompt 组装引用的「guidelines」未定义（Q7）→ 若 system prompt 需 per-tool 指南，窄 view 不足，确认后再决定是否加 `guidelines` 字段。
 - 「PromptSet 是唯一组装 seam」依赖 ModelGateway 只做 role lowering 与 cache-control 编码、不新增任何模型可见语义内容 → 在 `model-gateway.md` 显式写成不变量，否则 seam 从 provider 侧泄漏。
-- `AssembledModelContextFingerprint` 覆盖 committed conversation + output_contract + purpose，但 `CompactionSummaryDirective` 正文似未入 fingerprint → 纳入 directive hash，保证 summary 请求可复现/可审计。
-- prompt `PromptFingerprint` 只覆盖 definition identity/version；若 `PromptContent` inline 且同 version 可变（Q2 未定），content 变更不被察觉（Workspace prompt 有 WorkspacePromptFingerprint，Runtime/Agent/Session 无）→ 保证 content 变更必 bump version，或 fingerprint 纳入 content hash。
+- `AssembledModelContextFingerprint` / `CompactionSummaryDirective` fingerprint coverage担忧已由ADR 0123关闭：不新增Directive fingerprint；Directive由Compaction private constructor创建，模板/格式不兼容变化递增`CompactionSummaryFormatVersion`，operation复用同一个`Arc<ModelCallRequest>`并验证exact checkpoint与typed entries。
+- Prompt正文与`PromptFingerprint`关系已由ADR 0123关闭：不定义PromptFingerprint或跨reload正文identity；Prompt正文由initialize/reload发布的immutable captured content承载，watcher只标记dirty，active Turn继续使用old content。
 - prompt「检测不存在未提交的 current-call model-visible contribution」实为 by-construction（assemble 只接受 `CommittedConversationView`），非运行时检查 → 措辞改为 by-construction。
 
 ---
@@ -218,7 +218,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 针对B组已作决定并落盘，长期决策见[ADR 0109](../adr/0109-review-b-determinism-and-serialized-operations.md)：
 
-- **B1（Prompt顺序）**：**已关闭**。不增加priority；当前固定Runtime required System → Runtime base System → Agent System → Session User → Workspace User → Tool → Skill层级。PromptDefinition层按PromptKey、PromptId、DefinitionVersion和stable provenance identity排序；Workspace/Tool/Skill分别按relative path、ToolName、SkillId排序；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
+- **B1（Prompt顺序）**：**已关闭**。不增加priority或replacement version；当前固定Runtime required System → Runtime base System → Agent System → Session User → Workspace User → Tool → Skill层级。PromptDefinition层按PromptKey、PromptId和stable provenance source key排序；Workspace/Tool/Skill分别按relative path、ToolName、SkillId排序；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
 - **B2（append/replay/projector一致性）**：**已关闭**。writer append与cold replay共用pure `validate_and_project`；append semantic validation等价于或强于replay validation；writer成功commit的entry必须可project。`apply_committed`只安装预计算trusted delta，增加live-apply/cold-replay等价性测试要求。
 - **B3（logical retry operation identity）**：**已关闭**。每Session最多一个current RunningOperation；旧operation terminal/remove或安全drop并关闭结果路径前，不启动retry或下一operation。execution_version继续表示conversation/control basis，不增加operation_instance_id。Steer/FollowUp保持普通FIFO消费语义（物理ingress lane后由ADR 0111修订）；Steer在完整assistant/tool step后每轮pop一条，无ToolCall candidate final在queue非空时保存为Assistant Continue。
 
@@ -227,7 +227,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - **C1（Prompt override单调性）**：**已关闭**。删除`DefinitionOverrides`；PromptService共享`PromptResourceView`，Agent/Session只保存PromptId selection，各Turn独立构建PromptSet。Runtime required Prompt不进入selection。
 - **C2（role×scope特权）**：**已关闭**。Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；ModelGateway不再执行Developer lowering。
 - **C3（Sandbox capability预执行拒绝）**：**保持开放，本轮不变**。不修改现有ToolSandbox设计。
-- **C4（Skill content drift）**：**已关闭**。不采用Catalog revision/exact hash pin；SkillService发布current SkillView，显式reload成功后原子替换，active Turn继续使用captured view和已加载内容。
+- **C4（Skill content drift）**：**已关闭**。不采用Catalog revision/exact hash pin；SkillService在shared reload时发布SkillResourceView，并从captured shared root与WorkspaceSkillContext按Turn构建SkillView。active Turn继续使用captured view和已加载内容。
 
 针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
 
@@ -275,11 +275,11 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O9 | provider输出错误的命名与retry语义未冻结 | 已关闭：ADR 0120冻结ModelGateway response validation与四个直接error reason | — |
 | O10 | restrictive Workspace update未持久化缺少专用诊断 | 已关闭：ADR 0121删除active-Turn restrictive update/revoke-before-commit路径 | — |
 | O11 | 已打开文件handle存在revocation窗口 | 已关闭：MVP不承诺动态handle revocation；SecurityRevoked按Cancel规则收口 | — |
-| O12 | Workspace/view fingerprint的恢复策略未冻结 | 已关闭：ADR 0122放弃跨Runtime恢复，fingerprint仅当前Runtime有效 | — |
-| O13 | Prompt/Skill/Workspace共享pinning/authorization值类型未落地 | 仍开放 | P2 |
-| O14 | CompactionSummaryDirective正文的fingerprint coverage不明确 | 部分开放 | P1 |
-| O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 仍开放 | P1 |
-| O16 | ToolPromptView是否支持guidelines未定 | 仍开放，可直接收窄MVP | P3 |
+| O12 | Workspace/view fingerprint的恢复策略未冻结 | 已关闭：ADR 0122曾放弃跨Runtime恢复；ADR 0123取代并删除fingerprint族 | — |
+| O13 | Prompt/Skill/Workspace共享pinning/authorization值类型未落地 | 已关闭：ADR 0123不抽共享pinning/fingerprint value module | — |
+| O14 | CompactionSummaryDirective正文的fingerprint coverage不明确 | 已关闭：ADR 0123不新增Directive fingerprint，使用private constructor、format version和同一Arc request | — |
+| O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 已关闭：ADR 0123不定义PromptFingerprint，Prompt正文由explicit reload发布的immutable content承载 | — |
+| O16 | ToolPromptView是否支持guidelines未定 | 已关闭：MVP只含ToolSpec，User metadata由Direct spec name/description确定性投影 | — |
 | O17 | committed-only约束仍被描述成运行时扫描 | 文档语义待收口 | P3 |
 | O18 | Model配额只保证no-starvation，未提供交互延迟隔离 | 条件性开放 | P3 |
 
@@ -289,7 +289,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 发生场景：Windows或container sandbox只能限制filesystem，无法强制network/process；Tool最终`PermissionSet`声明禁止联网，approval通过后adapter仍可直接联网。
 - 风险：文档声明受限执行，实际形成授权后裸跑；approval不能弥补enforcement缺失。
-- 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、`ToolExecutionStarted`前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入`ToolSetFingerprint`。权威回写到`tools.md`并关闭第二轮R7。
+- 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、`ToolExecutionStarted`前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入ToolSet构造与execution routing validation。权威回写到`tools.md`并关闭第二轮R7。
 
 #### O10 · Restrictive Workspace update未持久化诊断（已关闭）
 
@@ -304,12 +304,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 关闭决议：Workspace definition不在active Turn热更新。Authority/host hard restriction发布sticky SecurityRevoked，停止新的MiniCore-sanctioned operation；越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，随后`TurnInterrupted(SecurityRevoked)`。不承诺动态关闭open fd、回滚kernel/provider side effect或建立Runtime-global handle registry。
 - 边界：O1仍独立开放。Sandbox无法强制某capability class时，必须在`ToolExecutionStarted`前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
 
-#### O12 · Workspace fingerprint恢复策略（已关闭）
+#### O12 · Workspace fingerprint恢复策略（已关闭，ADR 0123进一步取代）
 
 - 原发生场景：restart/fork后尝试恢复Tool grant或authorization cache，grant key依赖`WorkspaceAccessFingerprint`，旧文档未说明该值应持久化、重建还是失效。
 - 同类产品复核：pi恢复conversation/cwd但重新加载resources、tools和system prompt；Codex resume重新构造cwd、workspace roots、approval与sandbox config；Gemini CLI只声明保存conversation/tool history；OpenHands在sandbox state丢失时从durable event history启动fresh agent session；Claude Code重新读取settings，且不恢复bypassPermissions、后台Bash和临时add-dir。共同基线是保留history、重建current execution environment。
-- 决议：durable Session definition与conversation继续保留；WorkspaceSnapshot、各view fingerprint、Tool grant、authorization cache和旧execution Context不跨Runtime恢复。每次load/re-resolve创建新的Runtime-local fingerprint family；historical fingerprint只作opaque diagnostic，不参与current授权或same-Turn resume。fork不复制Session grant，unfinished Turn继续按HostRestart/RecoveryContextUnavailable关闭。
-- 关闭依据：[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)。historical fingerprint仅用于correlation，不是authorization proof；删除Workspace fingerprint canonical encoding、algorithm version和golden-vector要求。未来durable grant或跨设备execution migration必须另建ADR。
+- 决议：durable Session definition与conversation继续保留；WorkspaceSnapshot、authorization-sensitive cache和旧execution Context不跨Runtime恢复。ADR 0122曾使用Runtime-local fingerprint family关闭O12；[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)进一步删除Workspace/view fingerprint族，不新增generation/replacement identity，并将MVP审批收窄为per-call `AllowOnce/AllowWith`，不保存Session/Turn grant。unfinished Turn继续按HostRestart/RecoveryContextUnavailable关闭。
+- 关闭依据：[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)取代[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)。当前授权、retry、recovery和cache correctness不依赖Workspace fingerprint canonical encoding、algorithm version或golden-vector。未来durable grant或跨设备execution migration必须另建ADR。
 
 ### Storage与恢复
 
@@ -317,7 +317,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 发生场景：长期Session积累数万entries并多次compaction/fork；每次load、recovery或history replay仍从文件头执行cross-entry validation。
 - 风险：冷启动与恢复延迟随会话寿命线性增长；compaction只降低模型上下文，不降低ledger replay成本。
-- 推荐修复：增加rebuildable verified projection snapshot与byte-offset/checkpoint index；snapshot记录format/version、selected-path checkpoint、projection fingerprints和覆盖offset，open时先验证snapshot再replay tail。提前为physical segment/vacuum留接口，但不改变SessionStorage是唯一durable truth。
+- 推荐修复：增加rebuildable verified projection snapshot与byte-offset/checkpoint index；snapshot记录format/version、selected-path checkpoint、structural validation coverage和覆盖offset，open时先验证snapshot再replay tail。提前为physical segment/vacuum留接口，但不改变SessionStorage是唯一durable truth。
 
 #### O3 · Explicit repair utility
 
@@ -349,7 +349,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 #### O7 · 同步assembly控制面stall（已关闭）
 
-- 原发生场景：长conversation或大ToolResult使`assemble_model_context()`遍历消息、转换`MessageRecord → ModelMessage`、校验ToolCall/ToolResult、执行字节启发式token estimate并组合fingerprint；该同步调用位于SessionExecutor的NeedModel路径。
+- 原发生场景：长conversation或大ToolResult使`assemble_model_context()`遍历消息、转换`MessageRecord → ModelMessage`、校验ToolCall/ToolResult并执行字节启发式token estimate；该同步调用位于SessionExecutor的NeedModel路径。
 - 量化复核：assembly不执行文件I/O、网络调用或精确tokenizer，静态Prompt/Tool/Skill内容已在PromptSet创建时解析。1000条、总计约1 MB的消息在合理Rust实现中预计约1–10 ms；存在多次遍历或少量序列化时通常约10–30 ms。总字节数比消息条数更影响耗时。
 - 同类产品依据：pi、Codex和Gemini CLI都保留同步conversation转换或字符/字节启发式估算，没有为普通文本assembly建立专用worker/offload。外层async调用链不消除同步CPU段。
 - 决议：保持当前同步`assemble_model_context()`和NeedModel调用流程，不增加`RunningOperation`、blocking pool、work budget、counter或observer。Cancel已由ADR 0118在sticky epoch发布后立即确认；短同步assembly结束后，Executor在启动Model前继续按既有emergency checkpoint处理Cancel/SecurityRevoked。未来只有真实性能数据证明assembly形成明显延迟时才重新开启该问题。
@@ -358,7 +358,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 发生场景：多个长流式Session占满Model permits，新的交互请求虽不会永久饿死，但first-token latency持续较高。
 - 风险：属于体验与SLO问题，不影响correctness；第一版“foreground/background进入领域模型”的建议已失效。
-- 推荐修复：有真实延迟SLO后，在Runtime policy/host admission层增加`ModelSchedulingClass`或weighted fair queue；该值不进入Turn fingerprint，不改变exact model pin，也不成为Session领域状态。
+- 推荐修复：有真实延迟SLO后，在Runtime policy/host admission层增加`ModelSchedulingClass`或weighted fair queue；该值不进入Turn execution identity，不改变exact model pin，也不成为Session领域状态。
 
 ### ModelGateway协议
 
@@ -378,33 +378,30 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - Structured约束：MVP要求tools为空；本地执行exact JSON parse与schema validation，不repair、不coerce、不从Markdown fence提取。
 - 关闭依据：[ADR 0120](../adr/0120-failures-stay-with-owning-modules.md)、`model-gateway.md` Response Validation和第三轮L1关闭记录。
 
-### Fingerprint与横切值
+### Fingerprint与横切值（O13/O14/O15已由ADR 0123关闭）
 
 #### O13 · 共享pinning/authorization value type
 
-- 发生场景：Prompt、Skill和Workspace分别实现source stamp、authorized root、pinned-view basis和canonical hash，在wire/identity freeze阶段可能产生三套编码。
-- 风险：同一source identity/fingerprint不变量在多处漂移，golden vector、fingerprint coverage和stale-result rejection不一致。
-- 推荐修复：实现前先比较真实字段；只有确实同构时新增共享value模块，抽`SourceAuthorizationStamp`、`AuthorizedSourceRoot`、pinned-view/source-stamp helper和canonical hash coverage。Prompt/Tool/Skill继续保持独立深模块，不建立通用Resource owner或authorization lease抽象。
+- 历史发生场景：Prompt、Skill和Workspace分别实现source stamp、authorized root、pinned-view basis和canonical hash，在wire/identity freeze阶段可能产生三套编码。
+- 关闭决议：ADR 0123明确不抽共享pinning/fingerprint value module；一致性由各deep module的private immutable interface、exact refs和explicit reload保证。Prompt/Tool/Skill继续保持独立深模块，不建立通用Resource owner或authorization lease抽象。
 
 #### O14 · CompactionSummaryDirective fingerprint coverage
 
-- 发生场景：summary instruction正文或format发生变化，但source checkpoint、scope和budget不变；实现只hash plan/budget，没有hash directive正文。
-- 风险：不同summary请求可能共享同一fingerprint，破坏request proof、审计与golden vector可复现性。
-- 推荐修复：定义versioned `CompactionSummaryDirectiveFingerprint`，覆盖`instruction body + scope + format_version + output limits`，并纳入`PromptAssemblyProof`和最终`AssembledModelContextFingerprint` coverage。
+- 历史发生场景：summary instruction正文或format发生变化，但source checkpoint、scope和budget不变；旧建议倾向增加directive hash。
+- 关闭决议：ADR 0123不新增`CompactionSummaryDirectiveFingerprint`。Directive由Compaction唯一private constructor创建，模板/格式不兼容变化递增`CompactionSummaryFormatVersion`；Compaction operation持有同一个`Arc<CompactionPlan>`和`Arc<ModelCallRequest>`，append前验证exact source checkpoint、scope、boundaries、provenance、current Turn/version/control和actual typed entries。
 
 #### O15 · Prompt正文与PromptFingerprint
 
-- 发生场景：Runtime/Agent/Session prompt正文热修，但实现没有bump DefinitionVersion；当前fingerprint只覆盖identity/version/provenance。
-- 风险：同一PromptFingerprint对应不同模型可见正文，cache、retry proof和故障对比失真。
-- 推荐修复：冻结双重约束：任何正文变化必须bump DefinitionVersion，同时PromptFingerprint纳入canonical content hash。content hash算法与encoding并入第二轮wire/identity freeze和golden vectors。
+- 历史发生场景：Runtime/Agent/Session prompt正文热修，但实现没有bump DefinitionVersion；旧架构担心同一PromptFingerprint对应不同模型可见正文。
+- 关闭决议：ADR 0123不定义PromptFingerprint或跨reload正文identity。Prompt filesystem/source正文只在initialize或显式`/reload`时捕获为immutable content；reload成功后future Turn使用new content，active/completed Turn不更新，watcher只标记dirty。
 
 ### Interface收口
 
 #### O16 · ToolPromptView guidelines
 
-- 发生场景：实现者希望给单个Tool增加使用规则或风险提示，但`ToolPromptView`只有specs与fingerprint，可能把guideline旁路塞入普通Prompt文本。
-- 风险：Tool/Prompt owner模糊，guideline是否进入provider payload和fingerprint不一致。
-- 推荐修复：MVP直接关闭该能力：`ToolPromptView`只包含ToolSpec，工具使用说明进入ToolSpec description；出现无法由schema/description表达的真实需求后，再新增typed `guidelines`并明确排序、role与fingerprint coverage。
+- 发生场景：实现者希望给单个Tool增加使用规则或风险提示，但`ToolPromptView`只有specs，可能把guideline旁路塞入普通Prompt文本。
+- 风险：Tool/Prompt owner模糊，guideline是否进入provider payload不一致。
+- 关闭决议：MVP不增加独立`guidelines`字段。`ToolPromptView`只包含Direct ToolSpec；provider tools字段使用完整spec，PromptProfile中的Tool User metadata只从spec name/description按ToolName确定性投影。出现无法由schema/description表达的真实需求后，再新增typed `guidelines`并明确排序、role与validation coverage。
 
 #### O17 · Committed-only by-construction措辞
 
@@ -420,13 +417,13 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 全局同步原语锁序：ADR 0117确认当前不存在可构造循环等待，以single owner、短guard、typed permit和release-before-fan-out关闭O5；
 - Cancel可观察收口：ADR 0118将Cancel acceptance与Tool settlement分离，立即返回CancelAccepted、复用Finishing并在期间接收FollowUp，关闭O6；
 - Prompt assembly控制面延迟：量化复核确认当前纯内存线性assembly成本较低，保持同步实现并不增加offload、counter或observer，关闭O7；
-- Workspace fingerprint恢复：ADR 0122保留durable Session/history但放弃旧Workspace execution state恢复，以Runtime-local fingerprint和重新resolve关闭O12；
+- Workspace fingerprint恢复：ADR 0122曾保留durable Session/history但放弃旧Workspace execution state恢复；ADR 0123进一步删除fingerprint族，以exact refs、immutable objects和显式reload关闭O12；
 - Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
 - public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
 - Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；
 - 同时只能有一个Running Turn：writer append与cold replay共享`validate_and_project`并按Turn状态fail closed；
 - Cancel/SecurityRevoked后truthful Tool message保持conversation-hidden：`session-execution.md`已明确不补写`tool_round_completed`；
-- ToolSet/ToolPromptView fingerprint cross-binding：`TurnExecutionContext` final validation已有单点fail-closed断言；
+- ToolSet/ToolPromptView cross-binding：ADR 0123规定ToolPromptView只能由parent ToolSet私有投影并随PromptSet捕获；
 - ModelGateway不得新增模型可见语义：`model-gateway.md`已禁止增删重排content、注入diagnostic或未提交draft。
 
 ### 已确认的设计取舍

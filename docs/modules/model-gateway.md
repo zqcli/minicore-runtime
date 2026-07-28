@@ -45,7 +45,7 @@
 
 - `MiniCoreRuntime`拥有一个共享`Arc<ModelGateway>`；
 - ModelGateway不保存current Session、current Turn或UI selected model；
-- `ModelGateway::resolve_for_turn(...)`在Turn capture期间返回immutable `TurnModelSnapshot`；
+- `ModelGateway::resolve_for_turn(...)`在Turn capture期间返回`Arc<TurnModelSnapshot>`；
 - `ModelGateway::generate_model_turn(...)`是唯一真实模型调用interface；
 - `ModelCallRequest.input`只能是PromptSet产生的`AssembledModelContext`；
 - ModelGateway只编码完整provider-neutral context，不重新决定conversation visibility；
@@ -331,22 +331,35 @@ pub struct ModelGateway {
     // private
 }
 
+pub(crate) struct ModelCatalogView {
+    // private validated retained definitions and selection index
+}
+
 impl ModelGateway {
+    pub(crate) async fn initialize(
+        &self,
+    ) -> Result<Arc<ModelCatalogView>, ModelResolutionError>;
+
+    pub(crate) async fn build_reload_candidate(
+        &self,
+    ) -> Result<Arc<ModelCatalogView>, ModelResolutionError>;
+
     pub(crate) fn resolve_for_turn(
         &self,
+        catalog: Arc<ModelCatalogView>,
         request: ResolveTurnModelRequest,
-    ) -> Result<TurnModelSnapshot, ModelResolutionError>;
+    ) -> Result<Arc<TurnModelSnapshot>, ModelResolutionError>;
 
     pub(crate) async fn generate_model_turn(
         &self,
-        request: ModelCallRequest,
+        request: Arc<ModelCallRequest>,
         progress: ProgressEventPublisher<ModelProgressEvent>,
         cancel: CancellationToken,
     ) -> Result<ModelCallResult, ModelCallError>;
 }
 ```
 
-`resolve_for_turn`只访问已经初始化的provider/model catalog，不读取credential。catalog refresh是Runtime lifecycle操作，不在Turn capture期间隐式执行remote I/O。
+`initialize()`构建并返回第一个immutable catalog root。`build_reload_candidate()`准备并validate新catalog但不发布。ModelGateway不保存current catalog pointer，也没有publish方法；Runtime把candidate放入完整`SharedResourceRoots`后一次publication。`resolve_for_turn`只访问Turn admission已捕获的catalog Arc，不读取credential，也不在capture期间隐式执行remote I/O。
 
 `generate_model_turn`最多执行一个完整provider attempt。admitted调用期间可以等待provider并发permit、request前credential resolve/refresh和stream，但它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。provider terminal error返回SessionExecutor后，本次Gateway operation结束；Gateway不内联retry timer。
 
@@ -380,7 +393,7 @@ pub struct ModelSelection {
 - provider protocol；
 - auth reference或secret；
 - model capability；
-- current catalog revision。
+- current catalog publication state。
 
 ### ModelDefinitionRef
 
@@ -417,7 +430,6 @@ pub struct TurnModelSnapshot {
     capabilities: ModelCapabilities,
     limits: EffectiveModelLimits,
     generation: EffectiveGenerationPolicy,
-    fingerprint: TurnModelFingerprint,
     execution_ref: ModelExecutionRef,
 }
 ```
@@ -432,7 +444,7 @@ TurnModelSnapshot语义：
 - provider catalog reload只影响future Turn；
 - definition已从catalog current head移除时，Gateway仍可使用Snapshot持有的retained exact definition；
 - process restart不恢复unfinished Turn，因此不承诺跨进程继续旧Snapshot；
-- TurnContext entry保存safe `TurnModelRef`和fingerprint，不保存execution_ref。
+- TurnContext entry保存safe `TurnModelRef`，不保存execution_ref。
 
 ### ResolveTurnModelRequest
 
@@ -451,7 +463,6 @@ resolution负责：
 - reasoning preference映射；
 - effective context/output limits计算；
 - generation defaults固定；
-- TurnModelFingerprint生成；
 - safe diagnostics生成。
 
 resolution不负责：
@@ -487,7 +498,7 @@ pub enum ModelServiceClass {
 
 `EffectiveReasoningPolicy`是requested preference经过model capability映射后的provider-neutral结果；unsupported preference在resolve_for_turn时失败或按explicit Session policy降级，不能在provider adapter中临时猜测。`SamplingPolicy`只保存validated temperature/top-p等stable values；NaN、Infinity或provider不支持的组合在Turn capture时拒绝。
 
-cache和service class属于Turn-pinned execution policy。它们不改变conversation visibility，但会影响provider request、cost和fingerprint。
+cache和service class属于Turn-pinned execution policy。它们不改变conversation visibility，但会影响provider request和cost。
 
 ## Model Capabilities
 
@@ -578,7 +589,6 @@ pub struct AssembledModelContext {
     pub output_contract: Option<OutputContract>,
     pub contribution_stamps: Arc<[PromptContributionStamp]>,
     pub diagnostics: Arc<[PromptDiagnostic]>,
-    pub fingerprint: AssembledModelContextFingerprint,
     pub(crate) assembly_proof: PromptAssemblyProof,
 }
 
@@ -586,7 +596,7 @@ pub struct AssembledModelContext {
 
 PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。
 
-`PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、TurnModelFingerprint、OutputContract hash和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
+`PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、exact TurnModelRef、OutputContract结构值和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
 首版provider-neutral output contract至少包含：
 
@@ -626,7 +636,7 @@ ModelGateway不能：
 
 ```rust
 pub struct ModelCallRequest {
-    model: TurnModelSnapshot,
+    model: Arc<TurnModelSnapshot>,
     purpose: ModelCallPurpose,
     input: AssembledModelContext,
     max_output_tokens: Option<NonZeroU32>,
@@ -634,7 +644,7 @@ pub struct ModelCallRequest {
 
 impl ModelCallRequest {
     pub(crate) fn new(
-        model: TurnModelSnapshot,
+        model: Arc<TurnModelSnapshot>,
         purpose: ModelCallPurpose,
         input: AssembledModelContext,
         max_output_tokens: Option<NonZeroU32>,
@@ -656,8 +666,8 @@ impl ModelCallRequest {
 constructor验证：
 
 - assembly_proof.purpose等于request purpose；
-- assembly_proof.turn_model_fingerprint等于TurnModelSnapshot fingerprint；
-- assembly_proof.output_contract_hash等于input.output_contract canonical hash；
+- `assembly_proof.turn_model`等于TurnModelSnapshot的exact `TurnModelRef`；
+- assembly_proof.output_contract等于input.output_contract结构值；
 - `NoToolCalls`或`Structured`时input tools为空；
 - `CompactionSummary`的assembly budget proof必须存在，且proof max output等于request `max_output_tokens`；`AgentRun`不得携带该proof；
 - max_output_tokens满足Snapshot effective limits。
@@ -673,7 +683,7 @@ pub enum ModelCallPurpose {
 
 purpose：
 
-- 是Prompt assembly和fingerprint输入；
+- 选择Prompt assembly closed variant；
 - 原样传播到usage和diagnostics；
 - 不是retry classification；
 - 不是foreground/background状态；
@@ -697,11 +707,11 @@ purpose：
 - `None`使用TurnModelSnapshot中的effective default；
 - 非空值必须大于0；
 - 超过effective max时在provider调用前返回`InvalidRequest`；
-- Gateway不静默clamp，因为clamp会改变调用方已经fingerprint的policy；
-- CompactionSummary应提供明确上限，并保证该值已写入`CompactionPlanFingerprint`和assembly proof；
+- Gateway不静默clamp，因为clamp会改变调用方已经固定的policy；
+- CompactionSummary应提供明确上限，并保证该值已写入同一个immutable `Arc<CompactionPlan>`和assembly proof；
 - known model limit小于全局summary配置时，由Compaction plan确定性取较小值，而不是让Gateway修正；
 - known context/output limit无法留下最低摘要预算时，Compaction返回`NoFeasibleSummaryBudget`，不构造ModelCallRequest；
-- 若CompactionSummary仍以越界值到达constructor，`InvalidRequest`表示caller实现或fingerprint contract错误，不能分类成provider故障。
+- 若CompactionSummary仍以越界值到达constructor，`InvalidRequest`表示caller实现或plan/request contract错误，不能分类成provider故障。
 
 ## Private Provider Adapter
 
@@ -1056,8 +1066,6 @@ HTTP status或“尚无delta”本身不能决定delivery state。adapter必须�
 
 只有`NotSent`和provider明确证明未开始执行的`RejectedBeforeExecution`可以映射为默认retryable reason。`AcceptedNoOutput`若没有更强的provider terminal proof必须映射`RequestOutcomeUnknown`；不能把“还没收到delta”当作未执行证明。
 
-每次`generate_model_turn`在Gateway内部创建process-local ProviderInvocationId；该ID只关联本次single attempt，不进入ModelCallRequest、领域模型或SessionStorage。
-
 每次attempt：
 
 1. 检查cancellation；
@@ -1121,11 +1129,11 @@ Responses model → capability不同的Chat Completions model
 Gateway single attempt返回typed error后，SessionExecutor决定logical retry：
 
 ```text
-TurnId/execution_version unchanged
-ConversationCheckpoint unchanged
-TurnExecutionContext unchanged
-purpose/output contract/effective max_output_tokens unchanged
-AssembledModelContextFingerprint unchanged
+current Turn still Running and TurnId matches
+execution_version unchanged
+ConversationCheckpoint.entry_id unchanged
+current operation/control basis unchanged
+same `Arc<ModelCallRequest>` is reused; no reassembly
 → schedule timer
 → 确认旧RunningOperation已经terminal并从SessionExecutor移除
 → 使用同一ModelCallRequest启动新的唯一current RunningOperation
@@ -1359,11 +1367,11 @@ Gateway可以根据exact model definition和canonical instruction/tool/message b
 - cache annotation只能添加到canonical content边界；
 - 不为了cache重排、删除、复制或改写content；
 - cache key不得包含secret或raw user content；
-- cache key可以基于opaque runtime salt + fingerprints；
+- cache key可以基于opaque runtime salt和private canonical encoding；
 - cache miss不改变语义；
 - cache eviction直接发送full request；
 - cache read/write token只作为usage；
-- PromptSet fingerprint不等于provider cache key；
+- provider cache key不是PromptSet、Turn或conversation identity；
 - cache policy变化不改变conversation truth。
 
 ## Connection Reuse And Continuation
@@ -1399,7 +1407,7 @@ previous call completed successfully
 new full logical input可证明为previous full input + previous finalized response + exact committed suffix
 ```
 
-必须使用完整provider-neutral input或其canonical hash sequence证明prefix；不能只比较SessionId、TurnId、response_id或message count。
+必须使用完整provider-neutral input和private canonical equivalence proof证明prefix；不能只比较SessionId、TurnId、response_id或message count。
 
 以下情况清除continuation candidate并发送full request：
 
@@ -1434,15 +1442,16 @@ optional per-auth-principal limit
 - request前auth refresh有独立singleflight，不占用全部model permits；
 - provider cooldown只对对应route/principal fast-fail，不在Gateway内等待；
 - 一个Session不能耗尽全部Runtime capacity；
-- limits是Runtime policy，不进入ModelCallPurpose或conversation fingerprint；
+- limits是Runtime policy，不进入ModelCallPurpose或conversation truth；
 - progress publisher阻塞不能占用provider stream读取。
 
 ## Complete Call Flow
 
 ```text
 Turn admission
-→ ModelGateway.resolve_for_turn(ModelSelection + preferences)
-→ TurnModelSnapshot
+→ shared publication gate captures Arc<ModelCatalogView>
+→ ModelGateway.resolve_for_turn(captured catalog, ModelSelection + preferences)
+→ Arc<TurnModelSnapshot>
 → TurnExecutionContext pins snapshot
 
 AgentLoop NeedModel
@@ -1519,7 +1528,7 @@ append失败时：
 
 ## Persistence Contract
 
-Conversation storage中的`TurnModelRef`固定为`ModelSelection + ModelDefinitionVersion + TurnModelFingerprint`，因此catalog revision变化后仍能解释historical model identity和reasoning replay compatibility。
+Conversation storage中的`TurnModelRef`固定为`ModelSelection + ModelDefinitionVersion`以及必要safe retained definition reference，因此catalog重新发布后仍能解释historical model identity和reasoning replay compatibility。
 
 成功assistant entry保存：
 
@@ -1530,7 +1539,6 @@ ordered finalized content[]
 normalized ModelUsage
 normalized ModelFinishReason
 Session logical retry_count
-AssembledModelContextFingerprint
 allowlisted provider metadata
 ```
 
@@ -1549,7 +1557,7 @@ connection/continuation state
 full AssembledModelContext
 ```
 
-首版automatic SummaryModel compaction把model/response/usage/finish/logical-retry、requested max output、CompactionSummaryBudget fingerprint和assembled context fingerprint保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
+首版automatic SummaryModel compaction把model/response/usage/finish/logical-retry、requested max output、summary text、exact source checkpoint、typed scope/boundaries/provenance和provider metadata保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
 
 `retry_count`只表示Session logical retry。Gateway没有transparent retry count。
 
@@ -1622,7 +1630,7 @@ opaque encrypted reasoning
 
 - exact provider/model selection；
 - missing provider/model；
-- catalog revision变化时active Snapshot保持旧definition；
+- catalog重新发布时active Snapshot保持旧definition；
 - future Turn取得新definition；
 - capability/limit validation；
 - reasoning preference映射；
@@ -1643,7 +1651,7 @@ opaque encrypted reasoning
 - NoToolCalls和Structured携带非空tools时constructor拒绝；
 - unsupported image/audio/document；
 - Gateway不截断或摘要context；
-- AssembledModelContextFingerprint不被修改；
+- ModelGateway不修改`AssembledModelContext`；
 - assembly proof purpose/model/output-contract mismatch在ModelCallRequest constructor被拒绝。
 - Compaction budget proof missing、purpose不匹配或request max output不相等时constructor拒绝；
 - CompactionSummary的effective max_output_tokens不超过Snapshot known limit；

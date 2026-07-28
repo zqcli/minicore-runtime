@@ -17,14 +17,14 @@
 - **Turn边界产出或捕获不可变有效对象**：candidate Turn admission期间、第一次模型调用前，Session execution取得`PromptResourceView`、`PromptSet`、`ToolSet`和`SkillView`（及按需得到的`LoadedSkill`）；同一Turn内所有模型/Tool循环复用同一组对象，Service不创建Turn、不改TurnStatus。
 - **Prompt是唯一模型可见上下文组装seam**：`MessageRecord → ModelMessage`的唯一转换发生在`PromptSet::assemble()`；`AssembledModelContext`是进入ModelGateway的唯一provider-neutral Prompt输出。PromptService只消费`PromptResourceView`、`ToolPromptView`和`SkillPromptView`，不接收ToolService、ToolSet、SkillService或完整SkillView handle，也不主动调用它们。
 - **ToolSet 原子绑定模型可见 ToolSpec 与 executor route**：Tool 定义与真实 executor 原子注册，ToolSet 在同一快照内同时保存模型披露 ToolSpec 与 `ToolName → Arc<dyn Tool>` route，使模型所见 schema 与 ToolCall 实际解析到的 executor 必然同源；注册全集、模型披露集、已授权执行集是三个不同集合。
-- **SkillView与LoadedSkill分离、正文按需加载**：SkillView是轻量可重建的metadata view，不含正文；current view只在显式reload成功后原子替换。完整正文由`SkillService::load()`按captured entry读取；`SkillInjector`只把已加载Skill转成`PromptContribution`，交由PromptSet规范化进committed MessageRecord。
+- **SkillView与LoadedSkill分离、正文可按需解析**：SkillResourceView是shared reload publication root；SkillView是从captured shared root和WorkspaceSkillContext构建的轻量Turn-local metadata view。shared source在Runtime initialize/`/reload`时捕获，Workspace source在Session load、Idle definition update或`/reload workspace`时捕获；`SkillService::load()`可以lazy parse captured bytes，但不能在Turn内按path重新读取current file。`SkillInjector`只把已加载Skill转成`PromptContribution`，交由PromptSet规范化进committed MessageRecord。
 
 ## 后果
 
 - 每个模块的价值来自它独有的深职责，deletion test 成立：删除任一模块都会把 executor 绑定、权限授权、协议组装或正文懒加载的复杂性重新散落到 Session execution；而合并三者只会得到无法承载这些职责的浅交集。
-- cross-binding通过fingerprint收敛：PromptSet创建时固定PromptResourceView、`ToolPromptView.tool_set_fingerprint`与SkillPromptView fingerprint，assembly不接受任意替代view。
+- cross-binding通过private immutable object收敛：PromptSet创建时固定同一次capture得到的PromptResourceView、由parent ToolSet私有投影的ToolPromptView与SkillPromptView；assembly不接受caller伪造或来自另一组capture的替代view。
 - 依赖方向单一：Prompt 依赖 Tool/Skill 的窄 view，而非反向；三个 Service 之间无相互调用，Session execution 作为编排者按序取 view、组装、执行。
-- 代价只保留必要的view投影和fingerprint cross-binding；不再引入Prompt多层override或Skill Catalog revision/exact hash恢复协议。
+- 代价只保留必要的view投影、private constructors和explicit reload publication；不再引入Prompt多层override、Skill Catalog revision/exact hash恢复协议或跨子系统fingerprint链。
 - 未来的动态 Context provider、Prompt hook、远程 source、插件协议应作为各自模块的 source adapter 接入，其输出必须经过同一 append/apply 与 conversation projection 规则，不得恢复 current-call 组装旁路，也不得据此重新引入通用 Resource 或领域分层。
 
 ## 历史
@@ -36,3 +36,5 @@
 - ADR 0016（command run policy 与 prompt delivery 分离）——V2 将该分离一般化：权限/审批/Sandbox 属 Tool 子系统，模型可见上下文组装属 Prompt 子系统，二者不互相越界。
 
 三份 V1 原文见 [`../archive/v1/adr/`](../archive/v1/adr/)。
+
+2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)进一步删除Prompt/Tool/Skill fingerprint cross-binding术语，要求Prompt/Skill/Tool资源只在初始化或显式`/reload`后替换current immutable object；active Turn继续使用old captured objects。

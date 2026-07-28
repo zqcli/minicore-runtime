@@ -25,16 +25,16 @@ Authority hard restriction与普通Cancel都需要out-of-band sticky signal，�
 | `ToolControl` | `ToolControlQueue` | 内部bounded FIFO |
 | `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；cancel epoch发布后立即返回typed accepted response |
 | `SecurityRevoked` | `EmergencyControl` | current SessionExecutionHandle-scoped sticky signal；关闭admission，存在Turn时进入truthful settlement |
-| `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion generation |
+| `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion waiter |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced immutable published view |
 
 各 Session 的 lane 容量完全独立。Session A 的 ingress 满不会占用 Session B 的容量；跨 Session 仍可能在 ModelGateway 配额和共享宿主I/O处等待。File mutation queue按Session独立，不造成跨Session等待（ADR 0116）。
 
 ### Emergency 与 Tool side effect
 
-`Cancel`先原子校验`CancelTarget + target generation`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn使用新的generation和token。Executor在启动新Model、预留或继续file mutation ticket、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
+`Cancel`先原子校验current immutable `CancelTarget`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn发布新的active target和token。Executor在启动新Model、预留或继续file mutation ticket、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
 
-`SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的target generation、emergency epoch、Steer admission gate和controlled append reservation：
+`SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的active target、emergency epoch、Steer admission gate和controlled append reservation：
 
 - Steer admission与final commit reservation first-wins；Steer先赢则candidate final转为Continue，final reservation先赢则拒绝新Steer；
 - Cancel/SecurityRevoked signal与controlled append reservation first-wins；signal先赢则append不得开始，reservation先赢则该次短append完成，signal仍立即发布并在append后驱动cleanup；
@@ -42,14 +42,14 @@ Authority hard restriction与普通Cancel都需要out-of-band sticky signal，�
 
 LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`同样原子排序：admission先赢则Unload drain明确拒绝/清理该请求，stop先赢则直接返回stopping。Emergency、required cleanup control和Snapshot仍可进入。
 
-这些gate只依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、typed completion、StateEvent publication和所有durable mutation仍由SessionExecutor确认。
+这些gate只依据Executor发布的immutable active target和admission state做容量预留和race排序；领域validation、typed completion、StateEvent publication和所有durable mutation仍由SessionExecutor确认。
 
 `ToolExecutionStarted` append/apply是副作用竞态的真实线性化点：
 
 - Cancel/SecurityRevoked先被观察：拒绝新的execution start；
 - `ToolExecutionStarted`先append/apply：副作用可以开始，之后必须保存真实outcome；Cancel只能best-effort取消，不能声称回滚。
 
-Authority/host hard restriction先发布current security/policy fact，再通过Runtime current loaded map向对应`SessionExecutionHandle`设置sticky `SecurityRevoked`并唤醒Executor；存在candidate/current Turn时同时绑定其target generation。即使Executor尚未处理signal，owner-local admission gate与`TurnControlGate`也会阻止new admission/controlled append/Tool start/Model start。Idle直接resolve，Starting取消candidate，active Turn terminal后resolve；成功后signal retire。old handle关闭后不得把signal转发到new Executor，future Turn使用new Snapshot和target generation。
+Authority/host hard restriction先发布current security/policy fact，再通过Runtime current loaded map向对应`SessionExecutionHandle`设置sticky `SecurityRevoked`并唤醒Executor；存在candidate/current Turn时同时绑定current target。即使Executor尚未处理signal，owner-local admission gate与`TurnControlGate`也会阻止new admission/controlled append/Tool start/Model start。Idle直接resolve，Starting取消candidate，active Turn terminal后resolve；成功后signal retire。old handle关闭后不得把signal转发到new Executor，future Turn使用new Snapshot和新的active target。
 
 ### Queued input 与 Cancel
 
@@ -67,7 +67,7 @@ Cancel current Turn时：
 
 ### Lifecycle 与 Snapshot
 
-`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion generation，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后取消active pre-Turn Submit或Turn，以Cancelled关闭Pending Interaction，完成truthful Tool settlement和terminal append后卸载。该deadline属于显式Unload lifecycle，不是Interaction inactivity timeout。
+`PrepareForUnload`立即停止新admission，拒绝尚未admit的Submit并清理queued Steer/FollowUp。重复请求订阅同一个completion waiter，effective deadline只可取更早值、不可延长shutdown。grace期内current Turn可以自然完成；deadline到期后取消active pre-Turn Submit或Turn，以Cancelled关闭Pending Interaction，完成truthful Tool settlement和terminal append后卸载。该deadline属于显式Unload lifecycle，不是Interaction inactivity timeout。
 
 `GetSnapshot`不进入mutation/control queue。Executor持续发布immutable view，Snapshot mailbox返回latest完整view。用于持续观察时，subscriber注册与初始Snapshot capture在同一publication synchronization内原子完成，之后只发送实时事件。Snapshot与不同lane之间不宣称全局FIFO。
 
@@ -98,7 +98,7 @@ MiniCore采用这些产品共同的“输入队列与中断分离”方向，同
 
 - 普通输入backpressure不能阻塞Cancel/SecurityRevoked signal；D1关闭。
 - 不再依赖跨类型全局FIFO；每个race必须由state validation、emergency epoch和durable append线性化点说明。
-- lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate Cancel返回同一accepted epoch且不保存sender，PrepareForUnload继续复用shared completion generation。
+- lane容量、bounded burst、公平admission和unload deadline都必须成为配置与测试项；duplicate Cancel返回同一accepted epoch且不保存sender，PrepareForUnload继续复用shared completion waiter。
 - Snapshot读取更轻，不会因工作队列拥塞而超时；持续观察必须使用snapshot-first subscription，不能假设单独Snapshot与某条mutation或后续subscribe形成顺序。
 - 仍只有一个SessionExecutor和一个SessionWriter；没有新增第二个conversation owner或并发mutation actor。
 

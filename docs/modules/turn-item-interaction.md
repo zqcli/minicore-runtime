@@ -129,7 +129,7 @@ provider session / AgentLoop
 pending Interaction waiter
 ```
 
-exact Agent、SessionDefinition、Workspace、Prompt、Tool、Skill和TurnModel references 属于 initiating UserMessage 引用的 TurnContext entry，不重复放入 Turn head。
+exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceRevision和TurnModelRef属于initiating UserMessage引用的TurnContext entry，不重复放入Turn head。Prompt selection已经包含在exact Agent/Session definitions中；PromptSet、ToolSet和SkillView没有durable ref，不写入TurnContext。
 
 ### TurnInterruption
 
@@ -684,7 +684,7 @@ append Deny resolution
 → append tool_round_completed
 ```
 
-Interaction 不决定 Tool permission。ToolRequirements、WorkspaceAccessView、ToolPolicy、grant 和 Sandbox 仍属于 Tool 子系统。
+Interaction 不决定 Tool permission。ToolRequirements、WorkspaceAccessView、ToolPolicy、per-call approval application和Sandbox 仍属于 Tool 子系统。
 
 ToolService 只判断需要 approval；durable Interaction ownership 属于 Session execution。外部 TUI/RPC/Web host 通过[Runtime Interface](runtime-interface.md)的per-session StateEvent接收request，并通过`InteractionCommand::Resolve`提交resolution，不能直接持有Tool executor waiter。
 

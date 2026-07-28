@@ -7,7 +7,7 @@
 
 既有设计允许active Turn期间提交ordinary Workspace update，并为restrictive update引入`WorkspaceAuthorizationLease`、`WorkspaceAuthorizationControl`和`WorkspaceCommitAuthorization`：先撤销旧lease，再与workspace-dependent append排序并中断Turn。该能力进一步产生两个开放问题：restrictive update在revoke后durable commit失败的状态不一致（O10），以及已经打开的OS file handle不会随lease自动失效（O11）。
 
-pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动前冻结cwd与权限；配置变化通过Cancel、interrupt或下一次执行生效，不提供active execution中的open-handle动态撤权。MiniCore当前仍处于设计阶段，没有真实需求证明热更新Workspace值得承担跨平台handle revocation、lease generation和append/revoke竞态复杂度。
+pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动前冻结cwd与权限；配置变化通过Cancel、interrupt或下一次执行生效，不提供active execution中的open-handle动态撤权。MiniCore当前仍处于设计阶段，没有真实需求证明热更新Workspace值得承担跨平台handle revocation和append/revoke竞态复杂度。
 
 ## 决定
 
@@ -15,7 +15,7 @@ pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动�
 2. active Turn捕获的`Arc<WorkspaceSnapshot>`在整个Turn生命周期内完全不可变。Turn不重新读取current Workspace、不获得新增root/grant，也不因definition update原地替换PromptSet、SkillView或ToolSet。
 3. 删除active-Turn动态lease模型：`WorkspaceAuthorizationLease`、`WorkspaceAuthorizationControl`和`WorkspaceCommitAuthorization`不进入MVP。WorkspaceSnapshot及其Prompt/Skill/Tool/Access views不携带可撤销lease，也不暴露`check_authorization()`或`authorize_commit()`。
 4. Workspace definition update在Idle下按以下顺序执行：validate/CAS candidate → resolve complete candidate → durable commit新的`SessionDefinitionRevision`与`WorkspaceRevision` → publish new `SessionWorkspaceState::Ready`。resolve或commit失败时旧definition与旧Snapshot保持current，不存在“已revoke但未提交”的中间状态。
-5. authority hard restriction不是Workspace definition update。WorkspaceAuthority或host先发布新的authority/policy事实，再通过Runtime current loaded map向受影响`SessionExecutionHandle`发送handle-scoped sticky `EmergencyControl::SecurityRevoked`；存在candidate/current Turn时同时绑定其target generation。old/unloaded handle关闭后不能把signal重定向到new Executor。该signal不携带lease identity，也不创建假的WorkspaceRevision或SessionDefinitionRevision。
+5. authority hard restriction不是Workspace definition update。WorkspaceAuthority或host先发布新的authority/policy事实，再通过Runtime current loaded map向受影响`SessionExecutionHandle`发送handle-scoped sticky `EmergencyControl::SecurityRevoked`；存在candidate/current Turn时绑定该handle内的current control epoch。old/unloaded handle关闭后不能把signal重定向到new Executor。该signal不携带lease identity、generation identity，也不创建假的WorkspaceRevision或SessionDefinitionRevision。
 6. SessionExecutor观察`SecurityRevoked`后立即关闭new Turn admission和新Model、Tool、source read、workspace-dependent append。Idle时直接标记旧Snapshot不可admit并重新resolve；Starting时取消candidate且不创建领域Turn；Running/Finishing时递增execution version并进入/保持Finishing。未开始副作用的operation安全取消；越过`ToolExecutionStarted`的Tool按既有规则保存exact outcome或`ToolAbandoned`；不补缺失的`tool_round_completed`。有active Turn时最终append/apply`TurnInterrupted(SecurityRevoked)`。
 7. candidate清理或Turn terminal后，loaded Session使用durable current `SessionDefinition.workspace`和current authority重新resolve。success时发布new Snapshot、retire signal并恢复Ready/Idle；failure时retire execution signal但进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。FollowUp可以在Finishing期间排队，但只能在terminal、重新resolve和Ready之后admit；失败时明确拒绝。
 8. `SecurityRevoked`与admission、Tool start/append使用现有owner-local admission gate、`EmergencyControl` epoch和`TurnControlGate` first-wins语义：signal先赢则candidate/new operation不得开始；admission/controlled append或`ToolExecutionStarted`先赢则对应candidate被取消、短append完成或已开始副作用truthful settlement。无需第二个Workspace permit。
@@ -32,9 +32,9 @@ pi、Codex和Claude Code等同类产品通常在Session、Tool或sandbox启动�
 ## 后果
 
 - Workspace update UX从热更新变为Turn间更新；长Turn中修改配置需要先Cancel。
-- 删除Workspace lease/control/commit authorization相关字段、同步排序、generation和测试；ADR 0111/0117中的Workspace revoke特殊分支由本ADR修订。
+- 删除Workspace lease/control/commit authorization相关字段、同步排序和测试；ADR 0111/0117中的Workspace revoke特殊分支由本ADR修订。
 - `TurnInterruptionKind::SecurityRevoked`与sticky EmergencyControl保留，但它表示authority/host安全事件，不表示Workspace definition patch。
-- O10和O11关闭；O1 Sandbox enforcement继续开放。O12后由[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)以放弃跨Runtime Workspace fingerprint恢复关闭。
+- O10和O11关闭；O1 Sandbox enforcement继续开放。O12先由[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)收窄Workspace fingerprint恢复策略，后由[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Workspace fingerprint族并取代ADR 0122。
 - handle-relative open仍可作为O1/TOCTOU防护的platform adapter实现问题，但不再用于承诺active-Turn动态revocation。
 
 ## 被否决方案

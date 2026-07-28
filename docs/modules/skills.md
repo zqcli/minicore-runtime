@@ -5,7 +5,7 @@
 
 ## 目的
 
-本文定义MiniCore Skill子系统的基础对象、所有权、渐进披露、按需加载、缓存、reload view和Prompt Injection关系。
+本文定义MiniCore Skill子系统的基础对象、所有权、渐进披露、按需加载、缓存、explicit reload和Prompt Injection关系。
 
 本文以以下关系为基础：
 
@@ -13,8 +13,8 @@
 MiniCoreRuntime 初始化一个 Arc<SkillService>
 Runtime 将该 Service 注入 loaded Session execution / TurnExecutionContext
 Turn 领域对象不持有 Skill、SkillView、LoadedSkill 或 TurnSkills
-SkillService按context发布不可变current SkillView
-TurnExecutionContext捕获view，并按entry location延迟加载Skill
+SkillService从captured SkillResourceView与WorkspaceSkillContext构建不可变SkillView
+TurnExecutionContext捕获view，并从entry captured bytes延迟解析Skill
 Injection 层把已加载 Skill 转换为本轮 Prompt contribution
 ```
 
@@ -34,9 +34,9 @@ Injection 层把已加载 Skill 转换为本轮 Prompt contribution
 - `SkillService` 在 `MiniCoreRuntime` 启动时初始化；
 - 一个 Runtime 内的 loaded Session execution 共享同一个 `Arc<SkillService>`；
 - durable Session/SessionDefinition不持有Service handle，也不复制Skill definitions、view entries或正文；
-- SkillService负责Skill发现、metadata解析、过滤、SkillView构建、完整内容加载、解析、缓存、reload和diagnostics；
-- SkillView是轻量、可重建、发布后不可变的metadata view；
-- SkillView不包含完整Skill内容；
+- SkillService负责Skill发现、shared initialize/reload与Workspace load/reload时捕获source bytes、metadata解析、过滤、per-Turn SkillView构建、完整内容lazy parse、缓存和diagnostics；
+- SkillResourceView是shared reload publication root；SkillView是从captured resource root与WorkspaceSkillContext构建的Turn-local immutable view。模型可见投影只包含轻量metadata，entry私有持有captured source bytes；
+- SkillView的模型可见投影不包含完整Skill内容；完整Skill内容可以lazy parse，但只能来自entry已捕获的bytes；
 - Skill 内容默认按需加载；
 - Turn 对象不保存任何 Skill 字段；
 - 哪一个 Turn 在执行期间需要哪个 Skill，由 Turn execution 决定；
@@ -45,18 +45,20 @@ Injection 层把已加载 Skill 转换为本轮 Prompt contribution
 - Prompt 负责把 Skill contribution 与其他输入组装成最终模型上下文；
 - 已加载 Skill 内容是不可变值；
 - cache eviction或reload不会修改已经返回的`Arc<LoadedSkill>`；
-- reload成功后原子替换current SkillView，只影响future Turn；已加载内容和已经开始的模型调用不回写。
+- shared reload成功后原子替换current SkillResourceView，Workspace reload成功后替换Snapshot中的captured sources；两者都只影响future Turn，已加载内容和已经开始的模型调用不回写。
 
 ## 对象关系
 
 ```text
 MiniCoreRuntime
-└─ Arc<SkillService>
-   ├─ SkillSourceAdapter*
-   ├─ current SkillView cache
-   ├─ SkillContentCache
-   ├─ SkillLoadStateStore
-   └─ SkillDiagnostics
+├─ Arc<SkillService>
+│  ├─ SharedSkillSourceAdapter*
+│  ├─ WorkspaceSkillSourceAdapter*
+│  ├─ derived SkillView cache
+│  ├─ SkillContentCache
+│  ├─ SkillLoadStateStore
+│  └─ SkillDiagnostics
+└─ SharedResourceRoots.skills: Arc<SkillResourceView>
 
 loaded Session execution
 └─ Runtime 注入 Arc<SkillService>
@@ -77,9 +79,11 @@ TurnExecutionContext
 
 ```rust
 pub struct MiniCoreRuntime {
-    pub prompt_service: Arc<PromptService>,
-    pub tools: Arc<ToolService>,
-    pub skills: Arc<SkillService>,
+    prompt_service: Arc<PromptService>,
+    tool_service: Arc<ToolService>,
+    skill_service: Arc<SkillService>,
+    model_gateway: Arc<ModelGateway>,
+    shared_resources: RwLock<SharedResourceRoots>,
 }
 ```
 
@@ -87,7 +91,7 @@ Runtime 启动时：
 
 1. 创建 Skill source adapters；
 2. 创建 `SkillService`；
-3. 初始化基础discovery和current SkillView；
+3. `SkillService::initialize()`返回initial SkillResourceView，由Runtime放入SharedResourceRoots；
 4. 将同一个 `Arc<SkillService>` 注入后续 loaded Session execution / Turn capture；
 5. Runtime shutdown 时停止新的 discovery/load，并释放子系统资源。
 
@@ -131,7 +135,7 @@ SkillId[]
 LoadedSkill[]
 ```
 
-Turn执行期间若确定需要某个Skill，TurnExecutionContext使用本Turn捕获的SkillView entry和`WorkspaceSkillContext`请求完整内容。加载结果进入Injection和输入规范化流程，不写回Turn对象。load不重新查询reload后的current view，也不能把SkillInjection作为未提交的current-call Prompt旁路。完整capture、input composition和reload规则见[Turn执行模块与执行上下文架构设计](turn-execution-context.md)。
+Turn执行期间若确定需要某个Skill，TurnExecutionContext使用本Turn捕获的SkillView entry和`WorkspaceSkillContext`请求完整内容。加载结果进入Injection和输入规范化流程，不写回Turn对象。load不查询reload后的shared root或future SkillView，不按path重新读取current filesystem，也不能把SkillInjection作为未提交的current-call Prompt旁路。完整capture、input composition和reload规则见[Turn执行模块与执行上下文架构设计](turn-execution-context.md)。
 
 ## SkillService
 
@@ -139,11 +143,16 @@ Turn执行期间若确定需要某个Skill，TurnExecutionContext使用本Turn�
 
 ```rust
 pub struct SkillService {
-    sources: Vec<Arc<dyn SkillSourceAdapter>>,
+    shared_sources: Vec<Arc<dyn SharedSkillSourceAdapter>>,
+    workspace_sources: Vec<Arc<dyn WorkspaceSkillSourceAdapter>>,
     views: SkillViewCache,
     content_cache: SkillContentCache,
     load_states: SkillLoadStateStore,
     diagnostics: SkillDiagnostics,
+}
+
+pub(crate) struct SkillResourceView {
+    shared_sources: Arc<[CapturedSkillSource]>,
 }
 ```
 
@@ -163,15 +172,20 @@ pub struct SkillViewContext {
 
 ```rust
 impl SkillService {
-    pub async fn initialize(&self) -> Result<(), SkillError>;
+    pub(crate) async fn initialize(&self) -> Result<Arc<SkillResourceView>, SkillError>;
 
-    pub async fn current_view(
+    pub(crate) async fn build_reload_candidate(
         &self,
-        context: SkillViewContext,
-    ) -> Result<Arc<SkillView>, SkillError>;
+    ) -> Result<Arc<SkillResourceView>, SkillError>;
 
-    pub async fn reload(
+    pub(crate) async fn capture_workspace_sources(
         &self,
+        context: WorkspaceSkillCaptureContext,
+    ) -> Result<Arc<[CapturedWorkspaceSkillSource]>, SkillError>;
+
+    pub(crate) async fn for_turn(
+        &self,
+        resources: Arc<SkillResourceView>,
         context: SkillViewContext,
     ) -> Result<Arc<SkillView>, SkillError>;
 
@@ -184,66 +198,108 @@ impl SkillService {
 }
 ```
 
-`current_view()`只返回已发布metadata view；`reload()`完整构建candidate view，成功后原子替换同一context的current view，失败时保留旧view。`load()`才允许读取和解析完整正文。
+`initialize()`构建并返回第一个SkillResourceView。`build_reload_candidate()`读取并捕获required shared filesystem source bytes、构建candidate并validate，但不发布。SkillService不保存current pointer，也没有publish方法；Runtime把candidate放入完整`SharedResourceRoots`后一次publication。`for_turn()`使用Turn admission捕获的shared resource root与`WorkspaceSkillContext`中的captured Workspace sources构建immutable `SkillView`。watcher最多标记dirty，不自动publication；`load()`只允许从entry captured bytes lazy parse完整正文。
+
+`capture_workspace_sources()`只接受Workspace candidate私有投影出的`WorkspaceSkillCaptureContext`，只能在其中authorized Skill roots内discover/read并返回immutable captured values。它不发布SkillView或WorkspaceSnapshot；Session lifecycle负责在Workspace resolve、Prompt capture和Skill capture全部成功后一次发布new Snapshot。
 
 `load()`必须：
 
 - 使用Turn捕获的`SkillEntry.location`定位source；
 - 使用与该view相同的`SkillViewContext`；
-- 在实际读取时校验source stamp、operation identity/version和TurnControl basis仍有效；
-- 不重新查询reload后的current view。
+- 在lazy parse前校验entry属于传入的captured SkillViewContext且source authorization/provenance一致；
+- 不查询reload后的shared root或future SkillView；
+- 不按path重新读取current file。
 
-本设计采用常规弱一致性：尚未加载的entry在文件变化后可能读到新正文；已经返回的`Arc<LoadedSkill>`和已经committed的UserMessage不被修改。
+本设计采用显式reload一致性：文件变化只产生dirty diagnostic；尚未加载的entry也只能解析已捕获bytes，不能读到新正文。已经返回的`Arc<LoadedSkill>`和已经committed的UserMessage不被修改。
 
 ## Skill Source Adapter
 
 不同物理来源通过内部 adapter 接入 SkillService：
 
 ```rust
-pub trait SkillSourceAdapter: Send + Sync {
+pub trait SharedSkillSourceAdapter: Send + Sync {
     async fn discover(
         &self,
-        context: &SkillViewContext,
     ) -> Result<Vec<DiscoveredSkill>, SkillSourceError>;
 
-    async fn read(
+    async fn capture(
         &self,
-        request: &SkillSourceReadRequest<'_>,
-    ) -> Result<Vec<u8>, SkillSourceError>;
+    ) -> Result<Vec<CapturedSkillSource>, SkillSourceError>;
 }
 
-pub struct SkillSourceReadRequest<'a> {
-    pub context: &'a SkillViewContext,
-    pub entry: &'a SkillEntry,
+pub(crate) trait WorkspaceSkillSourceAdapter: Send + Sync {
+    async fn capture(
+        &self,
+        context: &WorkspaceSkillCaptureContext,
+    ) -> Result<Vec<CapturedWorkspaceSkillSource>, SkillSourceError>;
+}
+
+pub struct CapturedSkillSource {
+    location: SkillLocation,
+    bytes: Arc<[u8]>,
+    authorization: SkillSourceAuthorization,
+    modified_at: Option<Timestamp>,
+}
+
+pub enum SkillLocation {
+    Shared(PathBuf),
+    Workspace(WorkspaceRelativePath),
+}
+
+pub enum SkillSourceAuthorization {
+    Shared,
+    Workspace(WorkspaceSourceAuthorization),
+}
+
+pub struct SkillSourceRef {
+    location: SkillLocation,
+    authorization: SkillSourceAuthorization,
+}
+
+impl SkillSourceRef {
+    pub fn location(&self) -> &SkillLocation;
+    pub fn authorization(&self) -> &SkillSourceAuthorization;
+}
+
+impl CapturedSkillSource {
+    pub fn shared(
+        location: SkillLocation,
+        bytes: Arc<[u8]>,
+        modified_at: Option<Timestamp>,
+    ) -> Self;
+
+    pub(crate) fn from_workspace(
+        source: &CapturedWorkspaceSkillSource,
+    ) -> Self;
 }
 ```
 
-Workspace Skill source adapter只能使用`SkillViewContext.workspace`中的authorized source roots，并在discover/read时校验source stamp和current operation basis。BuiltIn/User adapter可以忽略Workspace roots，但不能伪造Workspace source stamp。SecurityRevoked取消active source operation；Workspace definition update只在Session Idle。本设计不定义BuiltIn/User/Workspace/Agent/Session等来源层级和优先级。
+Workspace Skill source adapter只能使用`WorkspaceSkillCaptureContext`中的authorized source roots，并必须通过context `capture(...)`重新验证location/authorization。Shared BuiltIn/User adapter不接收Workspace roots，也不能伪造Workspace authorization/provenance。Session lifecycle operation负责cancellation与publication前的current authority/revision validation；Skill adapter不拥有TurnControl。Workspace definition update只在Session Idle。本设计不定义BuiltIn/User/Workspace/Agent/Session等来源层级和优先级。
+
+Workspace adapter必须通过`WorkspaceSkillCaptureContext::capture(...)`返回`CapturedWorkspaceSkillSource`。`SkillService::for_turn()`再使用`CapturedSkillSource::from_workspace(...)`转换为SkillEntry统一持有的captured type；转换把relative location映射为`SkillLocation::Workspace`，并clone immutable bytes和exact WorkspaceSourceAuthorization，不重新读取filesystem。
 
 ```rust
 pub struct DiscoveredSkill {
     pub location: SkillLocation,
     pub modified_at: Option<Timestamp>,
-    pub source_stamp: SkillSourceAuthorizationStamp,
+    pub authorization: SkillSourceAuthorization,
 }
 ```
 
 ## Skill View
 
-SkillView是渐进披露的第一阶段，只包含轻量metadata：
+SkillView是渐进披露的第一阶段：模型可见部分只包含轻量metadata，entry私有持有captured source bytes：
 
 ```rust
 pub struct SkillView {
-    pub fingerprint: SkillViewFingerprint,
     entries: Arc<[SkillEntry]>,
 }
 
 pub struct SkillEntry {
     pub metadata: SkillMetadata,
     pub location: SkillLocation,
-    pub source_stamp: SkillSourceAuthorizationStamp,
+    captured: Arc<CapturedSkillSource>,
 }
-
 pub struct SkillMetadata {
     pub id: SkillId,
     pub name: SkillName,
@@ -253,7 +309,7 @@ pub struct SkillMetadata {
 }
 ```
 
-`SkillView::entries()`返回不可变entry。Turn捕获`Arc<SkillView>`后不再查询current view；模型可见projection只暴露必要metadata，省略location和source stamp。
+`SkillView::entries()`返回不可变entry。Turn捕获`Arc<SkillView>`后不再查询shared current root或构建future view；模型可见projection只暴露必要metadata，省略location、authorization和captured bytes。
 
 `SkillScope` 只作为 metadata 和 filtering 输入，不定义层级、覆盖或优先级语义：
 
@@ -263,12 +319,13 @@ pub struct SkillScope;
 
 SkillView必须满足：
 
-- 不包含Skill正文；
-- fingerprint覆盖稳定排序后的entry和模型可见metadata，仅用于当前view一致性、cache和diagnostics；
+- 模型可见投影不包含Skill正文；
+- entry私有持有shared publication或WorkspaceSnapshot中捕获的immutable source bytes；
+- view一致性由同一个immutable `Arc<SkillView>` ownership和private construction保证；
 - metadata顺序确定；
 - `SkillId`稳定；
 - `SkillName`冲突产生明确diagnostics；
-- reload可以从Skill sources重建candidate view，并在成功后原子替换current view；
+- shared reload可以重建candidate SkillResourceView；future `for_turn()`从new shared root构建new SkillView；
 - UI可见view与模型可见view可以使用不同安全投影。
 
 模型披露建议只暴露必要字段，避免自动泄漏本地绝对路径：
@@ -280,12 +337,20 @@ pub struct ModelVisibleSkillMetadata {
     pub description: String,
 }
 
+pub struct SkillPromptView {
+    entries: Arc<[ModelVisibleSkillMetadata]>,
+}
+
 impl SkillView {
     pub fn prompt_view(&self) -> SkillPromptView;
 }
+
+impl SkillPromptView {
+    pub fn entries(&self) -> &[ModelVisibleSkillMetadata];
+}
 ```
 
-`SkillPromptView`只包含稳定排序后的模型安全metadata和`SkillViewFingerprint`。
+`SkillPromptView`字段和constructor保持private，只包含稳定排序后的模型安全metadata，并只能由parent `SkillView`私有投影。
 
 ## 完整 Skill 内容
 
@@ -293,13 +358,23 @@ impl SkillView {
 
 ```rust
 pub struct LoadedSkill {
-    pub metadata: SkillMetadata,
-    pub source: SkillSourceRef,
-    pub content: Arc<SkillContent>,
+    metadata: SkillMetadata,
+    source: SkillSourceRef,
+    content: Arc<SkillContent>,
 }
 
 pub struct SkillContent {
-    pub body: String,
+    body: String,
+}
+
+impl LoadedSkill {
+    pub fn metadata(&self) -> &SkillMetadata;
+    pub fn source(&self) -> &SkillSourceRef;
+    pub fn content(&self) -> &SkillContent;
+}
+
+impl SkillContent {
+    pub fn body(&self) -> &str;
 }
 ```
 
@@ -324,7 +399,7 @@ pub enum SkillLoadState {
 
 - SkillView metadata可用不代表正文已经加载；
 - 同一内部cache key的并发load应合并为一次底层读取和解析；
-- content cache保存不可变`Arc<SkillContent>`，不缓存带某个Session source stamp的完整LoadedSkill；
+- content cache保存不可变`Arc<SkillContent>`，不缓存带某个Session authorization/provenance的完整LoadedSkill；
 - load失败进入diagnostics，并允许后续重试；
 - 默认baseline是metadata discovery + content lazy load；
 - 不引入Eager/Lazy/Manual多级LoadPolicy。
@@ -336,8 +411,8 @@ pub enum SkillLoadState {
 ```text
 SkillCacheKey {
     location,
-    source_stamp,
-    file_state,
+    captured_bytes,
+    parser_version,
 }
 ```
 
@@ -345,11 +420,11 @@ cache 规则：
 
 - 同一个 key 返回同一个或等价的不可变 `Arc<SkillContent>`；
 - content cache不保存process-local cancellation/security signal；
-- 每次`load()`都校验entry来源、source stamp和operation basis，再包装新的`LoadedSkill`；
+- 每次`load()`都校验entry来源与exact authorization/provenance，再从captured bytes解析或读取cache并包装新的`LoadedSkill`；TurnExecutionContext在await前后验证current Turn、execution_version、current operation和TurnControl basis；
 - 不同Session或source grant可以共享相同正文bytes，但不能共享错误provenance；
-- cache不改变SkillMetadata或已发布SkillView；
-- cache eviction不改变current view；
-- reload或文件状态变化后，后续load使用新的内部cache key；
+- cache不改变SkillMetadata或已经返回的SkillView；
+- cache eviction不改变任何已返回view；
+- shared或Workspace source重新publication后，future SkillView entry使用新的内部cache key；active Turn entry仍使用old captured bytes；
 - 已经返回的 `Arc<SkillContent>` 和 `Arc<LoadedSkill>` 不被原地修改。
 
 ## Injection
@@ -358,13 +433,18 @@ Injection 层只消费已经加载的 Skill：
 
 ```rust
 pub struct SkillContributionRef {
-    pub skill_id: SkillId,
-    pub source_stamp: SkillSourceAuthorizationStamp,
+    skill_id: SkillId,
+    source: SkillSourceRef,
 }
 
 pub struct SkillInjection {
-    pub reference: SkillContributionRef,
-    pub contribution: PromptContribution,
+    reference: SkillContributionRef,
+    contribution: PromptContribution,
+}
+
+impl SkillContributionRef {
+    pub fn skill_id(&self) -> &SkillId;
+    pub fn source(&self) -> &SkillSourceRef;
 }
 
 pub struct SkillInjector;
@@ -372,9 +452,14 @@ pub struct SkillInjector;
 impl SkillInjector {
     pub fn build(skill: &LoadedSkill) -> Result<SkillInjection, SkillInjectionError>;
 }
+
+impl SkillInjection {
+    pub fn reference(&self) -> &SkillContributionRef;
+    pub fn contribution(&self) -> &PromptContribution;
+}
 ```
 
-SkillInjector从`LoadedSkill`生成`SkillContributionRef`。该引用只保留SkillId和source stamp，用于committed UserMessage provenance；正文完整性由最终CanonicalUserMessage自身的fingerprint覆盖。
+`LoadedSkill`、`SkillContent`、`SkillContributionRef`和`SkillInjection`字段/constructor保持private，只能由SkillService或SkillInjector创建。SkillInjector从`LoadedSkill`生成`SkillContributionRef`；该引用只保留SkillId和exact `SkillSourceRef`，用于committed UserMessage provenance。正文正确性由已规范化的MessageRecord实际内容承担，不使用额外派生摘要证明。
 
 职责划分：
 
@@ -401,11 +486,11 @@ Prompt
 MiniCoreRuntime 启动
 → 创建 Arc<SkillService>
 → SkillService.initialize()
-→ 发现并解析轻量 metadata
+→ 捕获authorized source bytes并解析轻量 metadata
 
 Turn admission
 → 使用pinned WorkspaceSkillContext构造SkillViewContext
-→ SkillService.current_view(...)
+→ SkillService.for_turn(captured SkillResourceView, ...)
 → 得到Arc<SkillView>
 → TurnExecutionContext捕获view和context
 
@@ -413,7 +498,7 @@ Turn admission
 → TurnExecutionContext.compose_message(PromptIntent)
 → 从捕获的SkillView取得SkillEntry
 → SkillService.load(&context, &entry)
-→ cache hit，或读取、解析并缓存完整内容
+→ cache hit，或从captured bytes解析并缓存完整内容
 → SkillInjector.build(loaded_skill)
 → PromptSet.compose_user_message(...)
 → committed UserMessage / Steer
@@ -436,24 +521,27 @@ Turn admission
 
 ## Reload
 
-source watcher只标记dirty或reload available，不自动替换current view。显式reload流程：
+source watcher只标记dirty或reload available，不自动替换current resource root，也不更新captured bytes。shared Skill source由显式`/reload`发布：
 
 ```text
-discover/read metadata
-→ 构建candidate SkillView
+capture authorized source bytes
+→ 从captured bytes解析metadata
+→ 构建candidate SkillResourceView
 → 完整校验
-→ 成功后原子替换同一context的current view
+→ 与Prompt/Tool/Model candidates一起原子替换current roots
 → future Turn捕获新view
 ```
 
+Workspace Skill source不由shared `/reload`读取。Session load、Idle Workspace definition update或`/reload workspace`在publication前捕获authorized Workspace Skill bytes；成功后future Turn的`WorkspaceSkillContext`携带new captured sources。initial load失败进入Unavailable；definition update失败保留old definition/Snapshot；Ready reload失败保留old Snapshot；Unavailable reload失败保持Unavailable。
+
 基础不变量：
 
-- reload失败时继续保留旧current view；
+- shared reload失败时继续保留旧SkillResourceView；Workspace candidate失败按initial load、definition update、Ready reload或Unavailable retry的对应Session lifecycle规则处理；
 - reload不修改已经返回的`Arc<LoadedSkill>`；
 - 已经生成并固化到committed MessageRecord的contribution stamp不被回写；
 - active Turn继续使用捕获的旧SkillView；
-- 尚未加载的entry按捕获view中的location读取，允许看到文件当前内容；
-- source删除后，新view不再披露该Skill；旧view和已有不可变引用按持有者生命周期释放。
+- 尚未加载的entry只解析捕获view中的immutable bytes，不能看到reload之后但未发布的文件当前内容；
+- shared source删除后，必须等显式`/reload`成功，future view才不再披露该Skill；Workspace source删除后必须等`/reload workspace`、Idle definition update或下一次Session load成功。旧view、captured bytes和已有不可变引用按持有者生命周期释放。
 
 ## 错误和 Diagnostics
 
@@ -481,7 +569,8 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 | `Arc<SkillService>` 生命周期 | MiniCoreRuntime |
 | `Arc<SkillService>` execution 引用 | loaded Session execution / TurnExecutionContext |
 | Skill discovery/filter/cache/invalidation | SkillService |
-| SkillView创建、publication和cache | SkillService |
+| SkillResourceView candidate build/validation、SkillView创建和cache | SkillService |
+| complete SharedResourceRoots publication | MiniCoreRuntime |
 | 本Turn捕获的SkillView | TurnExecutionContext |
 | Skill metadata | SkillService / SkillView |
 | 完整Skill内容 | SkillService content cache |
@@ -496,18 +585,18 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - 一个 Runtime 初始化一个 SkillService；
 - durable Session 不持有 SkillService；Runtime 将同一个 SkillService 注入 loaded execution；
 - Turn 对象不持有 Skill；
-- SkillView不包含完整正文；
-- 完整正文只能通过SkillService按需加载；
+- SkillView的模型可见投影不包含完整正文；entry私有持有captured source bytes；
+- 完整正文只能通过SkillService从captured bytes按需解析；
 - Turn execution不能直接读取Skill文件；
 - TurnExecutionContext捕获SkillViewContext和`Arc<SkillView>`；
-- Workspace Skill的discover/read只能通过携带该context和SkillEntry的source adapter seam；
+- Workspace Skill的capture只能通过携带该context的source adapter seam，load只能解析captured entry bytes；
 - SkillInjector不能决定选择哪个Skill；
-- SkillContributionRef把SkillId和source stamp贯穿到Prompt contribution；
+- SkillContributionRef把SkillId和exact source authorization/provenance贯穿到Prompt contribution；
 - Prompt 不能执行 Skill discovery 或 load；
 - 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message并由`tool_round_completed`promote，不能作为current-call旁路；
 - SkillService 不决定哪个 Turn 使用哪个 Skill；
 - cache和load state不进入领域对象；
-- source变化只标记dirty；current view只在显式reload成功后原子替换；
+- source变化只标记dirty；shared current root只在显式`/reload`成功后替换，Workspace captured sources只在Session-local candidate publication后替换；
 - active使用中的view和不可变内容不被reload原地修改。
 
 ## 后续问题
@@ -532,15 +621,15 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - [x] 确定完整 Skill 内容由 SkillService 按需加载、解析和缓存。
 - [x] 确定 SkillService 管理 discovery、filtering、cache、invalidation 和 diagnostics。
 - [x] 确定 Turn execution 决定本次执行使用哪个 Skill。
-- [x] 确定TurnExecutionContext捕获SkillViewContext、Arc<SkillView>和fingerprint。
+- [x] 确定TurnExecutionContext捕获SkillViewContext和Arc<SkillView>。
 - [x] 确定 SkillInjector 只负责 LoadedSkill 到 PromptContribution 的转换。
 - [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message + `tool_round_completed`进入conversation。
 - [x] 确定reload和cache eviction不修改已经返回的不可变LoadedSkill。
 - [ ] 定义 SkillMetadata 和 SkillContent 的最终字段。
 - [x] 定义SkillViewContext的Session/Agent identity与WorkspaceSkillContext输入。
-- [x] 确定load使用captured SkillEntry，不重新查询reload后的current view。
-- [x] 确定Workspace Skill source adapter在discover/read时强制校验context、source stamp和operation basis。
-- [x] 确定current SkillView只在显式reload成功后原子替换。
+- [x] 确定load使用captured SkillEntry，不查询reload后的shared root或future SkillView。
+- [x] 确定Workspace Skill source adapter通过capture context强制校验location和exact source authorization；Session lifecycle负责operation/control validation，lazy load只解析captured bytes。
+- [x] 确定Runtime中的SkillResourceView root只在显式`/reload`成功后替换，per-Turn SkillView从captured roots构建。
 - [ ] 定义 SkillScope。
 - [ ] 定义 SkillName 冲突和 namespace 规则。
 - [ ] 定义 invocation、Item、UserMessageCompositionInput 和 PromptContribution stamp 的最终形状。

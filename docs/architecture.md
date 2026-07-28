@@ -48,7 +48,7 @@ Item            1 ── N Interaction
 - 一个 Agent 可被多个 Session 引用，一个 Session 只对应一个 Agent；
 - Workspace属于Session（`SessionDefinition.workspace`），不属于Agent或Turn，也不是独立entity或Runtime-global registry；loaded Session只在Idle时接受Workspace definition update，active Turn pin immutable WorkspaceSnapshot；
 - Prompt、Tool、Skill 是独立概念，不合并成通用 `Resource`；
-- Turn领域对象不持有PromptSet、ToolSet、SkillView、Agent identity或Workspace；这些执行期对象由Turn执行上下文capture，fingerprints和必要references保存在TurnContext storage entry；
+- Turn领域对象不持有PromptSet、ToolSet、SkillView、Agent identity或Workspace；这些执行期对象由Turn执行上下文capture为immutable `Arc`/private objects，TurnContext storage entry只保存exact durable refs、safe execution values/provenance和diagnostics；
 - durable lifecycle 与 loaded execution state 分离：内存 projection、cache、snapshot 只能由权威事实派生。
 
 ### Runtime-Owned共享深模块
@@ -61,17 +61,44 @@ pub struct MiniCoreRuntime {
     tool_service: Arc<ToolService>,
     skill_service: Arc<SkillService>,
     model_gateway: Arc<ModelGateway>,
+    shared_resources: RwLock<SharedResourceRoots>,
+}
+
+#[derive(Clone)]
+struct SharedResourceRoots {
+    prompt: Arc<PromptResourceView>,
+    skills: Arc<SkillResourceView>,
+    tools: Arc<ToolResourceView>,
+    models: Arc<ModelCatalogView>,
+}
+
+impl MiniCoreRuntime {
+    fn capture_shared_resources(&self) -> SharedResourceRoots;
+
+    async fn reload_shared_resources(
+        &self,
+    ) -> Result<(), CommandError>;
 }
 ```
+
+`SharedResourceRoots`只是Runtime-private的四个current pointer原子publication value，不拥有source、definition、cache或reload逻辑，也没有ID/version/generation。各deep module独立build candidate；Runtime在短gate内整体替换该值，Turn admission在同一gate内整体clone该值，因此不存在per-service partial publish。
 
 Turn 执行边界产生独立、不可变的有效执行对象：
 
 ```text
-PromptService::current_view() → Arc<PromptResourceView>
-PromptService::for_turn(...)   → PromptSet
-ToolService::for_turn(...)     → ToolSet
-SkillService::current_view(...) → Arc<SkillView>
-SkillService::load(...)        → Arc<LoadedSkill>
+MiniCoreRuntime::capture_shared_resources()
+→ SharedResourceRoots {
+     Arc<PromptResourceView>,
+     Arc<SkillResourceView>,
+     Arc<ToolResourceView>,
+     Arc<ModelCatalogView>
+   }
+
+captured roots + exact Turn context
+├─ ModelGateway::resolve_for_turn(...) → Arc<TurnModelSnapshot>
+├─ SkillService::for_turn(...)         → Arc<SkillView>
+├─ ToolService::for_turn(...)          → Arc<ToolSet>
+└─ PromptService::for_turn(...)        → Arc<PromptSet>
 ```
 
 Prompt 是唯一负责模型实际可见上下文组装的 seam：
@@ -108,19 +135,18 @@ pub(crate) struct TurnExecutionContext {
     session_id: SessionId,
     session_revision: SessionDefinitionRevision,
     agent: AgentRevisionRef,
-    model: TurnModelSnapshot,
+    model: Arc<TurnModelSnapshot>,
     workspace: Arc<WorkspaceSnapshot>,
     skill_service: Arc<SkillService>,
     skill_context: SkillViewContext,
     skill_view: Arc<SkillView>,
-    tool_set: ToolSet,
-    prompt_set: PromptSet,
-    fingerprint: ExecutionContextFingerprint,
+    tool_set: Arc<ToolSet>,
+    prompt_set: Arc<PromptSet>,
     diagnostics: Arc<[TurnContextDiagnostic]>,
 }
 ```
 
-`TurnExecutionContext` 是不可变 execution binding，不是 Service、领域 entity 或通用 Resource owner。字段保持私有；每次逻辑模型调用由 committed conversation checkpoint、purpose、output contract、effective max_output_tokens 与 `AssembledModelContext` 共同确定，不引入 `ModelStep` 领域类型、ID 或 registry。Turn execution 包含并驱动 AgentLoop；`NeedModel | NeedTools | Finished` 是 private AgentLoop action，Prompt assembly、Tool execution、append/apply、Steer、FollowUp、cancellation 和 terminal status 由 SessionExecutor 负责。
+`TurnExecutionContext` 是不可变 execution binding，不是 Service、领域 entity 或通用 Resource owner。字段保持私有；private constructor只接受同一次capture得到的`Arc<WorkspaceSnapshot>`、`Arc<SkillView>`、`Arc<ToolSet>`、`Arc<PromptSet>`和`Arc<TurnModelSnapshot>`，调用方不能跨capture拼接任意view。PromptSet内部保留本次捕获的`Arc<PromptResourceView>`及Tool/Skill投影。每次逻辑模型调用由同一个immutable `Arc<ModelCallRequest>`、latest committed `ConversationCheckpoint.entry_id`、purpose、output contract与effective max_output_tokens共同确定，不引入 `ModelStep` 领域类型、ID、registry或额外派生身份值。Turn execution 包含并驱动 AgentLoop；`NeedModel | NeedTools | Finished` 是 private AgentLoop action，Prompt assembly、Tool execution、append/apply、Steer、FollowUp、cancellation 和 terminal status 由 SessionExecutor 负责。
 
 ### 状态模型
 
@@ -136,7 +162,8 @@ MiniCore 的 message pipeline 使用固定动词表达每个阶段，调用链�
 CommandSurface.parse_message_intent
   → SessionExecutor.Submit
   → capture exact SessionDefinition / AgentRevision / WorkspaceSnapshot
-  → PromptService.current_view + SkillService.current_view + ToolService.for_turn
+  → shared gate clones PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
+  → ModelGateway.resolve_for_turn + SkillService.for_turn + ToolService.for_turn
   → PromptService.for_turn
   → TurnExecutionContext.compose_message
   → SessionWriter.append(TurnContext) → apply
@@ -178,9 +205,9 @@ Steer after complete assistant/tool step
 - [Agent 与 Session 生命周期](modules/agent-session-lifecycle.md)：Agent/Session revision、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 分离。
 - [Workspace](modules/workspace.md)：Session-owned Workspace definition、roots/cwd、trust、authorization、filesystem capability 与窄只读 view。
 - [Prompt](modules/prompt.md)：共享PromptResourceView、各Turn独立PromptSet、CanonicalUserMessage、`assemble → AssembledModelContext`。
-- [Skills](modules/skills.md)：SkillService、reloadable SkillView与LoadedSkill、发现/解析/按需加载。
-- [Tools](modules/tools.md)：ToolService `for_turn → ToolSet`、registry、policy、approval、grants、sandbox、executor。
-- [Turn 执行上下文](modules/turn-execution-context.md)：capture 依赖图、fingerprint、reload 线性化、AgentLoop 分界。
+- [Skills](modules/skills.md)：SkillService、shared SkillResourceView、per-Turn SkillView与LoadedSkill、发现/解析/按需加载。
+- [Tools](modules/tools.md)：ToolService `for_turn → ToolSet`、registry、policy、per-call approval、sandbox、executor。
+- [Turn 执行上下文](modules/turn-execution-context.md)：capture 依赖图、exact refs、immutable Arc与explicit reload线性化、AgentLoop 分界。
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：Turn 边界、ItemContent、ToolInvocation identity、Interaction、terminal cleanup。
 - [Conversation 与 SessionStorage](modules/conversation-storage.md)：by-entry JSONL tree、唯一 append seam、entry tree、projection、fork、recovery。
 - [Session 执行](modules/session-execution.md)：单 SessionExecutor、semantic SessionIngress lanes、RunningOperation、multi-session 并发与Session-local file mutation queue。
@@ -197,8 +224,9 @@ Steer after complete assistant/tool step
 - raw failure只存在于具体adapter implementation；发生事实的module负责typed、redacted分类，掌握Turn/control/durable state的owner负责恢复（ADR 0120）。不建立全局Error module或ErrorService；该规则首版只在ModelGateway response validation落地，其他module按真实需求逐步采用。
 - 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/SecurityRevoked与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。valid Cancel在sticky epoch发布后立即返回`CancelAccepted`并进入Finishing，已开始Tool结构化收口期间仍允许FollowUp排队，旧Turnterminal前不启动新Turn。Authority hard restriction通过SecurityRevoked停止新operation并truthful settle，terminal后重新resolve Workspace；不承诺动态撤销open handle。Snapshot只作为live observer baseline，process restart仍从JSONL replay并保守关闭unfinished Turn。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
 - `ModelGateway`通过`resolve_for_turn(...)`固定exact `TurnModelSnapshot`，RunningOperation只传`ModelCallRequest`；每个Gateway operation最多执行一个provider attempt，SessionExecutor对同一个AgentRun request最多logical retry 3次、CompactionSummary最多1次。Gateway隐藏provider、credential、endpoint、cache和continuation，在`ModelCallResult`前验证finish/content与OutputContract；它不判断session message visibility，也不在active Turn内执行transport/model fallback。
-- 工具注册、审批、授权记忆、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`统一治理；每个loaded Session的`SessionExecutor`拥有独立file mutation queue，新Turn的`ToolSet`只持共享引用。同Session同文件mutation FIFO，跨Session共享Workspace不协调并由host/user负责隔离（ADR 0116）。MVP不启用通用`bash`；子进程限制无法强制时必须fail closed。
-- 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
+- Prompt/Skill/Tool/Model共享资源只在Runtime初始化或显式`/reload`后替换current immutable object；watcher最多标记dirty，不自动publish。`/reload`先完整build candidate并validate required resources，再在短publication gate下原子替换四个current `Arc`；Turn admission在同一gate下只克隆四个Arc，失败时保留全部old current values。shared Prompt/Skill filesystem source在Runtime initialize或shared reload时捕获；Workspace-bound Prompt/Skill source随Session load、Idle definition update或`/reload workspace` candidate捕获并与WorkspaceSnapshot一起发布。active/completed Turn不原地更新；future Turn capture new objects。`/reload workspace`沿用Idle-only规则，非Idle返回`SessionBusy`。
+- 工具注册、per-call审批、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`统一治理；每个loaded Session的`SessionExecutor`拥有独立file mutation queue，新Turn的`ToolSet`只持共享引用。同Session同文件mutation FIFO，跨Session共享Workspace不协调并由host/user负责隔离（ADR 0116）。MVP不启用通用`bash`；子进程限制无法强制时必须fail closed。
+- 上下文压缩由 SessionExecutor 编排；`Compaction` 只提供 context budget、stable-unit projection、scope/frontier planning、protected `EntryId`、portable directive 和结果校验，不构造 `ModelCallRequest`，也不组装模型上下文。Compaction operation持有同一个`Arc<CompactionPlan>`及其source checkpoint、scope、boundaries、provenance、budget和request；append前验证exact source checkpoint、typed entries和current Turn/version/control，cold replay/fork执行structural validation，不使用transcript、plan、budget、directive或stable-unit hash。首版使用active Turn exact model生成leading rolling summary或anchored active-Turn segment checkpoint；initiating与Steer UserMessage保持原文，每个instruction segment内已完成的早期ToolRound可在安全边界摘要，summary budget在plan阶段与pinned model limits求交。
 
 ## 相关决策
 
@@ -226,4 +254,5 @@ Steer after complete assistant/tool step
 - [ADR 0119：模型调用使用Session逻辑重试](adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](adr/0120-failures-stay-with-owning-modules.md)
 - [ADR 0121：Workspace定义只在Idle更新，安全撤权中断当前Turn](adr/0121-workspace-updates-require-idle.md)
-- [ADR 0122：Workspace fingerprint只在当前Runtime有效](adr/0122-workspace-fingerprints-are-runtime-local.md)
+- [ADR 0122：Workspace fingerprint历史决策（已被0123取代）](adr/0122-workspace-fingerprints-are-runtime-local.md)
+- [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](adr/0123-identity-uses-refs-and-explicit-reload.md)

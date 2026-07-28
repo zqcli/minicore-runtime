@@ -5,7 +5,7 @@
 
 ## 目的
 
-本文定义 MiniCore Turn 执行模块的基础边界、执行上下文、AgentLoop 关系、模型调用步骤、创建顺序、pinning、reload、cancellation、fingerprint 和 recovery 规则。
+本文定义 MiniCore Turn 执行模块的基础边界、执行上下文、AgentLoop 关系、模型调用步骤、创建顺序、pinning、显式reload、cancellation 和 recovery 规则。
 
 本文以以下领域定义为前提：
 
@@ -142,7 +142,7 @@ Turn domain
 → id、session_id、started_at、terminal-aware status
 
 Turn start execution metadata
-→ Agent/SessionDefinition/Workspace/Prompt/Tool/Skill view/TurnModel fingerprints and references
+→ Agent/SessionDefinition/Workspace/Prompt/Tool/Skill/Model exact references and safe diagnostics
 
 Turn Item collection
 → SessionStorage ordered projection，不内联 Turn head
@@ -162,17 +162,16 @@ pub(crate) struct TurnExecutionContext {
     session_id: SessionId,
     session_revision: SessionDefinitionRevision,
     agent: AgentRevisionRef,
-    model: TurnModelSnapshot,
+    model: Arc<TurnModelSnapshot>,
     workspace: Arc<WorkspaceSnapshot>,
 
     skill_service: Arc<SkillService>,
     skill_context: SkillViewContext,
     skill_view: Arc<SkillView>,
 
-    tool_set: ToolSet,
-    prompt_set: PromptSet,
+    tool_set: Arc<ToolSet>,
+    prompt_set: Arc<PromptSet>,
 
-    fingerprint: ExecutionContextFingerprint,
     diagnostics: Arc<[TurnContextDiagnostic]>,
 }
 ```
@@ -186,17 +185,17 @@ SkillViewContext + SkillEntry
 → SkillService::load(...)
 ```
 
-它不能重新查询reload后的current SkillView或重新解释Workspace。
+它不能查询reload后的shared SkillResourceView、构建future SkillView或重新解释Workspace。
 
 `TurnExecutionContext` 的“不可变”指：
 
 - model identity 和 capability projection 不变；
 - WorkspaceSnapshot 和各 view 不变；
-- captured SkillView entries和fingerprint不变；
-- ToolSpec、Exposure、executor route 和 ToolSet fingerprint 不变；
-- PromptProfile、ToolPromptView、SkillPromptView和Prompt fingerprint不变。
+- captured SkillView entries及其captured source bytes/content不变；
+- ToolSpec、Exposure、executor route 来自同一个不可变 ToolSet；
+- PromptProfile、ToolPromptView、SkillPromptView和PromptResourceView来自同一个不可变 PromptSet。
 
-以下执行状态不进入 fingerprint，也不表示 Context 发生变化：
+以下执行状态不表示 Context 发生变化，也不参与执行一致性判断：
 
 - cancellation token 是否已触发；
 - EmergencyControl是否已触发Cancel/SecurityRevoked；
@@ -229,7 +228,7 @@ compose_message
 → 从captured SkillView解析SkillIntent
 → SkillService::load(context + entry)
 → SkillInjector::build
-→ 校验source stamp、operation identity/version和TurnControl basis；正文由CanonicalUserMessage fingerprint覆盖
+→ 只读取captured Skill bytes/content；校验current Turn、execution_version、current operation和TurnControl basis；正文随UserMessage append成为durable fact
 → PromptSet::compose_user_message
 
 assemble_model_context
@@ -239,7 +238,7 @@ assemble_model_context
 
 Tool execution 不在 Context 上复制一层公开转发方法。SessionExecutor 与 Context 位于同一内部模块，通过 Context 中 pinned ToolSet 执行调用；Tool 的 route、approval、Sandbox 和 executor 仍只由 ToolSet 处理。
 
-Context 的 fingerprint 和 diagnostics 也保持内部值，只有 storage、diagnostics 或 recovery 出现真实调用方时才暴露窄 getter。
+Diagnostics保持内部值，只有storage、diagnostics或recovery出现真实调用方时才暴露窄getter；Context一致性不通过公开或durable摘要证明。
 
 ## Context Capture
 
@@ -259,32 +258,36 @@ Turn-scoped ToolExecutionControl、cancellation和ProgressEventPublisher
 
 SessionDefinitionRevision保证AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection来自同一个committed definition。Prompt/Skill adapter不得按AgentId或SessionId回查current heads。
 
-presentation层的前台/后台（用户当前查看哪个Session）不是capture输入，也不进model resolution、tool for_turn或`ExecutionContextFingerprint`；runtime对所有loaded Session一视同仁，共享Model资源由明确配额协调。File mutation queue按Session独立，跨Session共享Workspace由host/user负责隔离。若将来出现「后台自主Turn必须自动处理审批」这类需求，应建成tool execution路径上一个窄的、不进fingerprint的approval disposition，而不是回到capture层的前后台标记。
+presentation层的前台/后台（用户当前查看哪个Session）不是capture输入，也不进model resolution或tool for_turn；runtime对所有loaded Session一视同仁，共享Model资源由明确配额协调。File mutation queue按Session独立，跨Session共享Workspace由host/user负责隔离。若将来出现「后台自主Turn必须自动处理审批」这类需求，应建成tool execution路径上一个窄的approval disposition，而不是回到capture层的前后台标记。
 
-`candidate TurnId`只表示已预留的execution identity。Submit `CommandId`由外层admission reservation持有，仅用于当前Runtime内定位同一in-flight Submit、合并重复请求和精确Cancel；它不是额外submission key，不进入TurnExecutionContext或fingerprint，也不承诺跨崩溃恢复。OutcomeUnknown不靠它reopen或replay-by-key，恢复统一读committed prefix加状态检查。capture成功不代表领域Turn已经创建。
+`candidate TurnId`只表示已预留的execution identity。Submit `CommandId`由外层admission reservation持有，仅用于当前Runtime内定位同一in-flight Submit、合并重复请求和精确Cancel；它不是额外submission key，不进入TurnExecutionContext，也不承诺跨崩溃恢复。OutcomeUnknown不靠它reopen或replay-by-key，恢复统一读committed prefix加状态检查。capture成功不代表领域Turn已经创建。
 
 ## Capture 依赖图
 
-Context capture 的逻辑依赖是 DAG，不要求建立跨 Service 的全局锁或 Resource generation：
+Context capture 的逻辑依赖是 DAG。Runtime只用一个短shared-resource publication gate原子克隆四个current Arc；candidate build和后续Context构建都不持有该gate，也不建立聚合identity或替代版本号：
 
 ```text
 exact SessionDefinitionRevision
 ├─ exact AgentRevisionRef / AgentPromptSelection / SessionPromptSelection
-├─ PromptService.current_view() → Arc<PromptResourceView>
-├─ SessionDefinition.model
-│  └─ ModelGateway.resolve_for_turn(...) → TurnModelSnapshot
+├─ shared publication gate
+│  └─ MiniCoreRuntime captures SharedResourceRoots {
+│       Arc<PromptResourceView>, Arc<SkillResourceView>,
+│       Arc<ToolResourceView>, Arc<ModelCatalogView>
+│     }
+├─ SessionDefinition.model + captured ModelCatalogView
+│  └─ ModelGateway.resolve_for_turn(...) → Arc<TurnModelSnapshot>
 └─ Arc<WorkspaceSnapshot>
-       ├─ SkillService::current_view(SkillViewContext {
+       ├─ SkillService::for_turn(captured SkillResourceView, SkillViewContext {
        │    agent, session_id, session_revision, workspace: workspace.skill_context()
        │  })
        │  └─ Arc<SkillView>
-       └─ ToolService::for_turn(ToolTurnContext {
+       └─ ToolService::for_turn(captured ToolResourceView, ToolTurnContext {
             agent, session_id, session_revision, turn_id,
             workspace: workspace.tool_context(),
             tool_calling: model.capabilities().tool_calling.clone(),
             execution_control, cancellation, progress_events
           })
-          └─ ToolSet
+          └─ Arc<ToolSet>
 
 SkillView.prompt_view()
 + ToolSet.prompt_view()
@@ -293,9 +296,9 @@ SkillView.prompt_view()
 + Agent/Session Prompt selection
 + TurnModelSnapshot
 → PromptService::for_turn(...)
-→ PromptSet
+→ Arc<PromptSet>
 
-all child fingerprints
+actual captured Arc objects + exact durable refs
 → final validation
 → TurnExecutionContext
 ```
@@ -307,29 +310,26 @@ capture 完成前必须再次检查：
 - Turn cancellation或SecurityRevoked未触发；
 - Session admission reservation 仍然有效；
 - SkillViewContext / ToolTurnContext与captured AgentRevisionRef、SessionDefinitionRevision和candidate TurnId一致；
-- ToolSet.prompt_view().tool_set_fingerprint 等于 parent ToolSet fingerprint；
-- PromptSet记录的PromptResourceView、ToolSet、SkillView、Workspace和Model fingerprint与实际对象一致。
+- ToolPromptView只能来自本次captured parent ToolSet的私有投影；
+- PromptSet只绑定本次captured PromptResourceView、ToolPromptView、SkillPromptView、Workspace prompt context和TurnModelSnapshot，不接受caller传入的替代view。
 
 ## Capture 线性化
 
-Prompt、Tool 和 Skill 是独立领域，没有跨三者的 global publication instant。
+Prompt、Tool、Skill和Model仍是独立深模块，但共享`/reload`具有一个Runtime-owned publication instant：
 
-Prompt/Tool/Skill reload在capture期间发生时：
+- reload先在gate外完整build并validate四个candidates；
+- publication在短gate内替换四个current Arc；
+- Turn capture在同一gate内只克隆四个Arc后立即释放，因此只能观察到完整old set或完整new set；
+- SkillView、ToolSet、TurnModelSnapshot和PromptSet在gate外从captured roots构建；已经捕获的对象不被后续reload原地替换；
+- PromptSet只绑定实际捕获的PromptResourceView、SkillPromptView和ToolPromptView。
 
-- 某子系统在自己的 capture 线性化点之前发布的新值，可以被本次 Context 捕获；
-- 已经捕获的值不被后续 reload 原地替换；
-- PromptSet只绑定实际捕获的PromptResourceView、SkillPromptView和ToolPromptView；
-- 最终发布的是一个内部一致的组合，而不是“同一纳秒”的全局资源快照。
+Workspace-bound Prompt/Skill source使用Session-local publication边界：Session load、Idle Workspace definition update或`/reload workspace`在发布Snapshot前捕获immutable source bytes/content；任一步失败时old Snapshot和old sources保持不变。capture完成后的shared或Workspace reload都不改变active Turn。尚未lazy-parse的Skill entry只能解析captured bytes，不能在Turn内按path重新读取current file；读取前仍必须校验current Turn、execution_version、current operation和EmergencyControl。已经加载的`Arc<LoadedSkill>`保持不变。
 
-capture完成后的Skill reload不改变active Turn持有的SkillView。尚未lazy-load的entry按captured location读取当前文件内容；读取前仍必须校验source stamp、operation basis和EmergencyControl。已经加载的`Arc<LoadedSkill>`保持不变。Workspace definition update在Starting/Running/Finishing时返回SessionBusy，因此不会与capture并发替换Snapshot。
-
-这不引入通用 ResourceManager。
-
-如果一个 versioned extension package 必须原子贡献 Prompt、Skill 和 Tool，应由独立 `ExtensionSet` 提供 package-level publication，而不是让 TurnExecutionContext 推断跨领域事务。
+该短gate只协调四个current root的publication/capture，不拥有资源定义、source discovery、cache或Turn state，因此不引入通用 ResourceManager。
 
 ## Admission
 
-initiating UserMessage需要PromptSet规范化，而PromptSet又需要本次admission捕获的ToolSet和SkillView；其中 ToolTurnContext、cancellation 和 Turn-scoped grant 需要已预留的 candidate TurnId。因此 admission 必须使用未发布的 candidate，而不是先创建空 Turn。PromptSet 本身不保存 candidate TurnId。
+initiating UserMessage需要PromptSet规范化，而PromptSet又需要本次admission捕获的ToolSet和SkillView；其中 ToolTurnContext、cancellation和Turn-scoped execution control需要已预留的candidate TurnId。因此admission必须使用未发布的candidate，而不是先创建空Turn。PromptSet本身不保存candidate TurnId。
 
 推荐顺序：
 
@@ -397,7 +397,7 @@ Turn 固定 baseline
 
 不能存在第四类“调用方临时传入、模型可见但没有append/apply或pin”的动态字符串。
 
-因此assembly input按purpose使用[Prompt子系统定义的closed variants](prompt.md#模型上下文组装)：`AgentRun`只接收trusted committed conversation与output contract，`CompactionSummary`只接收trusted scope-aware source与fingerprinted directive。variant确定ModelCallPurpose；Compaction source同样来自CommittedConversationState的trusted view，不形成第四类临时model-visible input。
+因此assembly input按purpose使用[Prompt子系统定义的closed variants](prompt.md#模型上下文组装)：`AgentRun`只接收trusted committed conversation与output contract，`CompactionSummary`只接收trusted scope-aware source和同一个不可变compaction plan中的directive。variant确定ModelCallPurpose；Compaction source同样来自CommittedConversationState的trusted view，不形成第四类临时model-visible input。
 
 不接收：
 
@@ -405,7 +405,7 @@ Turn 固定 baseline
 任意 ToolPromptView
 任意 PromptContribution[]
 任意 current Workspace context
-任意current SkillView
+任意future SkillView
 裸 Vec<MessageRecord>
 ```
 
@@ -418,22 +418,13 @@ ToolPromptView已经被PromptSet固定。Workspace Prompt、SkillPromptView meta
 - 模型通过Tool调用Skill：结果随role=tool message持久化，并在`tool_round_completed`后进入conversation；
 - compaction directive：使用 typed `ModelCallPurpose` 和 `OutputContract`，不伪装成普通 conversation text。
 
-`CommittedConversationView`只能从已验证CommittedConversationState借用；State由SessionStorage replay构造，或成功应用append receipt中的trusted delta后前进，不能从draft、stream buffer或任意message vector构造。ledger checkpoint可因`AdvanceOnly`entry推进；只有model-visible messages/`TranscriptFingerprint`改变才形成新的逻辑模型调用。
+`CommittedConversationView`只能从已验证CommittedConversationState借用；State由SessionStorage replay构造，或成功应用append receipt中的trusted delta后前进，不能从draft、stream buffer或任意message vector构造。ConversationCheckpoint只保存latest committed `EntryId`，包括`AdvanceOnly`在内的所有append都会推进checkpoint；新的逻辑模型调用只从当前checkpoint对应的committed projection重新assemble。
 
 ## 逻辑模型调用
 
-一次逻辑模型调用由以下值共同确定：
+一次逻辑模型调用由同一个不可变`Arc<ModelCallRequest>`承载。该request由本Turn的`Arc<TurnExecutionContext>`、exact `ConversationCheckpoint.entry_id`、`ModelCallPurpose`、`OutputContract`和effective `max_output_tokens`组装并经constructor验证。
 
-```text
-ExecutionContextFingerprint
-+ ConversationCheckpoint / TranscriptFingerprint
-+ ModelCallPurpose
-+ OutputContract
-+ effective max_output_tokens
-+ AssembledModelContextFingerprint
-```
-
-SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated constructor形成并保留完整immutable `ModelCallRequest`供Session logical retry复用。不增加`ModelStep`、`ModelStepId`、`ModelAttempt`或额外fingerprint类型。
+SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated constructor形成并保留完整immutable `Arc<ModelCallRequest>`供Session logical retry复用。不增加`ModelStep`、`ModelStepId`、`ModelAttempt`或额外identity。
 
 以下行为不改变逻辑模型调用identity：
 
@@ -444,12 +435,12 @@ SessionExecutor使用`PromptAssemblyInput`调用Context，再通过validated con
 
 以下变化必须开始新的逻辑模型调用：
 
-- model-visible `TranscriptFingerprint`改变；
+- latest committed `ConversationCheckpoint.entry_id`改变；
 - `tool_round_completed`、Steer或Compaction成功append/apply并改变conversation；
 - ModelCallPurpose 改变；
 - OutputContract改变；
 - effective max_output_tokens改变；
-- PromptSet、ToolSet、SkillView、Workspace或TurnModelSnapshot改变。
+- active Turn持有的PromptSet、ToolSet、SkillView、Workspace或TurnModelSnapshot被替换（正常实现中不可发生）。
 
 后一个条件在 active Turn 中不应发生；发生时必须中断当前 Turn，而不是悄悄替换 Context。
 
@@ -476,7 +467,7 @@ AgentLoop 不得：
 - 读取 current Workspace 或 Session config；
 - 自行拼接 system prompt、messages 或 ToolSpec；
 - 在 `tool_round_completed` 前把 ToolResult 加入模型 conversation；
-- 处理 Tool approval、grant、Sandbox 或 filesystem authorization；
+- 处理 Tool approval、Sandbox 或 filesystem authorization；
 - 发布 Turn terminal fact。
 
 ## Turn Execution Loop
@@ -623,9 +614,9 @@ active Turn 期间提交 FollowUp
 因此 FollowUp：
 
 - 不复用旧 TurnExecutionContext；
-- 不复用旧WorkspaceSnapshot或security target generation；
+- 不复用旧WorkspaceSnapshot或process-local security signal；
 - 不复用旧ToolSet、PromptSet或SkillView；
-- 在真正admission时看到Idle期间成功提交的Workspace update和current Prompt/Tool/Skill views；
+- 在真正admission时看到Idle期间成功提交的Workspace Snapshot/source update，以及shared gate当时捕获的Prompt/Skill/Tool/Model current roots；
 - 失败或取消不会改变已经 terminal 的前一个 Turn。
 
 FollowUp使用`FollowUpQueue` bounded FIFO；它最多获得一次连续admission优先，若上一Turn由FollowUp启动且下一次Idle decision有external Submit，则先选Submit。Submit不是隐式FollowUp，未选中且Session再次Busy时明确返回。该lane不是独立领域entity，也不拥有Session状态。
@@ -646,11 +637,12 @@ MVP不执行provider transparent retry、401 refresh-and-resend或transport fall
 
 同一次逻辑模型调用的retry只能在旧Model RunningOperation已经terminal/remove或被安全drop并关闭结果路径后启动，并且必须满足：
 
-- ExecutionContextFingerprint 不变；
-- conversation checkpoint 不变；
-- AssembledModelContextFingerprint 不变；
-- purpose、output contract和effective max_output_tokens不变；
-- 没有新的 committed fact；
+- current Turn仍为Running且TurnId匹配；
+- execution_version不变；
+- `ConversationCheckpoint.entry_id`不变；
+- current operation仍是该logical call对应的Model/Compaction operation或retry timer；
+- TurnControl basis未被Cancel/SecurityRevoked/terminal reservation改变；
+- 复用同一个`Arc<ModelCallRequest>`，不重新assemble；
 - Tool 没有因为该 retry 被重新执行。
 
 partial stream 是 draft。retry 前关闭该 draft lifecycle，但不写入 conversation。
@@ -673,7 +665,7 @@ AgentLoop NeedModel安全点
      }
    )
 → SummaryModel call
-→ revalidate source checkpoint/control/context basis
+→ revalidate exact source checkpoint、current operation/control basis
 → append/apply StoredCompaction
 → Replace committed conversation projection
 → rebuild ConversationSeed和AgentLoop segment
@@ -712,7 +704,7 @@ Authority hard restriction不是Workspace definition update：
 
 ```text
 publish current authority/policy fact
-→ EmergencyControl::SecurityRevoked(target generation)
+→ EmergencyControl::SecurityRevoked(process-local target)
 → SessionExecutor停止新operation并进入Finishing
 → TurnInterrupted(SecurityRevoked)
 → terminal后重新resolve current Workspace definition
@@ -734,95 +726,56 @@ Context capture 的原子性指领域发布原子性，不要求回滚内部 cac
 
 - Skill discovery 或 Prompt source read 可以填充 content-addressed cache；
 - ToolSet、SkillView或PromptSet局部值可以先后创建；
-- 只有全部成功并完成最终control/basis/fingerprint校验后才发布完整Context；
+- 只有全部成功并完成最终current Turn、execution_version、operation/control校验后才发布完整Context；
 - 失败时 drop 局部值，不更新 Session current state；
-- Context capture 本身不创建 Item、Interaction、grant 或 durable Turn；
+- Context capture 本身不创建 Item、Interaction、approval decision或durable Turn；
 - initiating UserMessage append 前不产生模型或 Tool 副作用。
 
 Tool外部副作用与model-visible ToolRound completion无法形成通用分布式事务。assistant tool_call content先保存Started ToolInvocation；执行任何Tool side effect前，SessionStorage必须append非模型可见的`tool_execution_started`event；approval request和resolution也必须先durable append。它们不进入Prompt conversation，也不允许下一次逻辑模型调用看见半个ToolRound。
 
 若exact ToolResult已知但role=tool message append返回NotCommitted（写入尚未开始，可安全重试），可以只重试同一entry；返回SessionWrite OutcomeUnknown时保守终结当前round，不在本run重试该append，该tool message视为未持久化，下次load按committed prefix恢复（round不完整则Abandon，模型重跑工具），不reopen/replay-by-key。Tool message都已append后，`tool_round_completed`同样按此规则append；其OutcomeUnknown也保守终结、恢复靠committed prefix，不重放Tool。只有executor/side-effect outcome unknown时，同一个ToolInvocation Item才进入Abandoned且不生成synthetic ToolResult。完整schema见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。
 
-## Fingerprint
+## Exact Binding 与内部一致性
 
-至少需要：
-
-```text
-WorkspaceFingerprint 及各 view fingerprint
-SkillViewFingerprint
-ToolSetFingerprint
-PromptFingerprint
-TurnModelFingerprint
-ExecutionContextFingerprint
-AssembledModelContextFingerprint
-```
-
-### SkillViewFingerprint
-
-覆盖：
-
-- 稳定排序后的SkillView entries；
-- SkillId、location identity和source stamp；
-- 模型可见metadata projection；
-- view filtering/ordering algorithm version。
-
-该fingerprint用于capture一致性、cache和diagnostics，不是Skill版本或旧正文恢复协议。
-
-### ToolSetFingerprint
-
-覆盖：
-
-- 规范化 ToolSpec；
-- Exposure 和 Deferred projection；
-- executor route identity/version；
-- WorkspaceToolFingerprint / WorkspaceAccessFingerprint；
-- Tool policy revision；
-- ToolCallingCapabilities projection；
-- ToolSet capture algorithm version。
-
-随机 executor pointer、锁状态、approval waiter 和 cancellation 不进入 fingerprint。
-
-### ExecutionContextFingerprint
-
-由以下 child fingerprint 组合：
+MVP不定义命名执行摘要类型，也不把摘要值写入执行接口、durable schema、authorization、retry或recovery不变量。执行一致性由以下事实保证：
 
 ```text
-AgentRevisionRef
-SessionDefinitionRevision
-TurnModelFingerprint
-WorkspaceFingerprint 及相关 view fingerprint
-SkillViewFingerprint
-ToolSetFingerprint
-PromptFingerprint
-capture schema/algorithm version
+exact SessionDefinitionRevision
++ exact AgentRevisionRef
++ exact WorkspaceRevision / WorkspaceSnapshot
++ immutable Arc<PromptResourceView>
++ immutable Arc<SkillView>
++ immutable Arc<ToolSet> / ToolPromptView private projection
++ immutable Arc<PromptSet>
++ exact Arc<TurnModelSnapshot>
++ current ConversationCheckpoint.entry_id
++ current_operation + execution_version + TurnControl basis
 ```
 
-`TurnId`和`SessionId`由TurnContext entry及其initiating UserMessage reference绑定，不建议仅为实例区分而加入内容fingerprint。
+同一个immutable对象比比较摘要更强：active Turn直接持有实际值，调用方无法通过public constructor把不同capture的PromptSet、ToolSet、SkillView或WorkspaceSnapshot交叉组合。PromptSet只能由本次captured PromptResourceView、ToolPromptView、SkillPromptView、Workspace prompt context和TurnModelSnapshot创建；ToolPromptView只能由parent ToolSet私有投影。
 
-逻辑模型调用无需额外fingerprint类型。Session logical retry必须先证明`ConversationCheckpoint`不变；在此前提下，`ExecutionContextFingerprint + TranscriptFingerprint + purpose + output contract + effective max_output_tokens + AssembledModelContextFingerprint`足够判断是否仍是同一次调用。仅TranscriptFingerprint相同不足以忽略AdvanceOnly ledger变化。
+`ConversationCheckpoint`只保存latest committed `EntryId`。所有append，包括`AdvanceOnly`，都推进checkpoint；因此任何ledger或model-visible变化都会使旧operation source失效。Transcript projection的正确性由shared semantic reducer、append/live-apply/cold-replay等价性和actual typed messages验证，不使用Transcript摘要。
 
-Fingerprint用于当前Runtime内的一致性、cache和diagnostics。包含Workspace child fingerprint的值可以写入TurnContext作为opaque historical correlation，但cold replay不重算、不与current view比较后授权，也不作为旧Context恢复证明。
+Session logical retry不重新assemble，也不比较request/context摘要。retry只在旧operation terminal/remove或安全drop后启动，并复用同一个`Arc<ModelCallRequest>`；timer到期前后验证current Turn仍Running、`execution_version`、exact checkpoint `EntryId`、`current_operation`仍为持有该request的对应retry slot且TurnControl basis未改变。
+
+Compaction operation/result持有并复用同一个`Arc<CompactionPlan>`以及由该plan创建的同一个summary `Arc<ModelCallRequest>`。append前验证exact source checkpoint、typed scope/boundaries/provenance、current Turn/version/control和actual typed entries；operation result只能交回当前operation slot。
+
+实现可以在cache内部使用未公开摘要优化，但摘要不能进入module interface、durable schema、authorization、retry、recovery或架构不变量。
 
 ## Execution Context Metadata
 
-TurnContext entry为历史审计和conservative recovery保存或引用以下信息；哪些内容内嵌、哪些使用exact content reference由对应定义子系统闭合：
+TurnContext entry为历史审计和conservative recovery只保存能够长期解释的exact durable refs、actual typed model values和safe diagnostics：
 
 ```text
-capture schema/version
 SessionId / TurnId
 SessionDefinitionRevision
 AgentRevisionRef
-TurnModel exact reference
-WorkspaceSnapshotRef（revision + opaque historical fingerprint）
-SkillView fingerprint and selected entry source references
-ToolSet spec/route implementation references
-PromptSet definition/content references
-ExecutionContextFingerprint
+TurnModelRef + effective limits/output defaults
+WorkspaceSnapshotRef（exact WorkspaceRevision）
+TurnContext diagnostics
 ```
 
-这些 metadata 是 execution/storage fact，不是领域 entity，不建立独立 CRUD、registry 或 `ExecutionContextManifest` struct。
-
-PromptFingerprint 只存在于 Turn start execution metadata，用于 Prompt diagnostics，不能替代完整 execution context metadata；Turn head 不重复保存该字段。
+Prompt/Tool/Skill shared objects没有durable ref，因此TurnContext不保存其占位摘要。selected PromptId已经属于exact Session/Agent definitions；Skill正文provenance随committed UserMessage contribution保存；Tool调用事实随assistant/tool entries保存。这些metadata是execution/storage fact，不是领域entity，不建立独立CRUD、registry或`ExecutionContextManifest` struct。MVP明确不从该entry重建旧execution environment。
 
 metadata 不保存：
 
@@ -832,7 +785,8 @@ metadata 不保存：
 - cancellation token；
 - mutable cache state；
 - 完整 Skill 正文副本；
-- executor 内存地址。
+- executor 内存地址；
+- request/context/transcript/content摘要。
 
 ## Crash Recovery
 
@@ -855,20 +809,20 @@ SessionStorage reload
 
 已 committed 的 UserMessage、`tool_round_completed` round、Steer、Compaction 和 AssistantMessage 保留。
 
-MVP不提供process restart后的exact same-Turn resume。old WorkspaceSnapshot、PromptSet、ToolSet、SkillView和它们的fingerprint family全部丢弃；没有terminal fact的Turn按上述流程关闭。future Turn使用durable current SessionDefinition、current authority和current Runtime resources重新capture完整Context，不能使用current replacement冒充旧Turn曾经执行的Context。
+MVP不提供process restart后的exact same-Turn resume。old WorkspaceSnapshot、PromptSet、ToolSet、SkillView等process-local immutable objects全部丢弃；没有terminal fact的Turn按上述流程关闭。future Turn使用durable current SessionDefinition、current authority和current Runtime resources重新capture完整Context，不能使用current replacement冒充旧Turn曾经执行的Context。
 
-Pending Interaction必须在TurnInterrupted/Failed前以cancelled、expired或recovery reason持久关闭；Started ToolInvocation必须已有truthful role=tool message或ToolAbandoned，不能只删除内存waiter/task。未来若需要exact resume，必须另行定义durable execution manifest、可恢复Tool route和authority proof。
+Pending Interaction必须在TurnInterrupted/Failed前以cancelled或recovery reason持久关闭；Started ToolInvocation必须已有truthful role=tool message或ToolAbandoned，不能只删除内存waiter/task。未来若需要exact resume，必须另行定义durable execution manifest、可恢复Tool route和authority evidence。
 
 ## Diagnostics 与释放
 
 Context capture diagnostics 至少记录：
 
-- captured AgentRevisionRef、SessionDefinitionRevision、PromptFingerprint、WorkspaceRevision 和 TurnModelFingerprint；
-- Workspace、SkillView、ToolSet、PromptSet和Model fingerprint；
+- captured AgentRevisionRef、SessionDefinitionRevision、WorkspaceRevision 和 exact TurnModelRef；
+- captured Workspace、SkillView、ToolSet、PromptSet和Model的safe diagnostics（例如数量、名称与provenance，不作为恢复引用）；
 - source unavailable、optional degradation 和 required failure；
-- capture duration 和 cache hit；
-- final control/basis validation；
-- recovery使用的historical child reference；不尝试重建process-local fingerprint。
+- initialize/reload/capture duration 和 cache hit；
+- final current Turn、execution_version、operation/control validation；
+- recovery使用的historical child reference；不尝试重建process-local execution environment。
 
 绝对路径、Prompt 正文、Skill 正文、Tool arguments 和 credentials 默认不进入公开 diagnostics。
 
@@ -890,7 +844,7 @@ terminal path
 → drop Arc<TurnExecutionContext>
 ```
 
-Context drop不unregister Runtime-global Tool、不清空共享content cache，也不影响其他Session/Turn的security target generation。
+Context drop不unregister Runtime-global Tool、不清空共享content cache，也不影响其他Session/Turn的process-local security signal。
 
 ## 与 Session Execution 的关系
 
@@ -956,7 +910,7 @@ AgentLoop registry
 
 - Turn execution 的长期 owner 属于 Session execution；
 - Context capture 只有一个真实调用方；
-- 逻辑模型调用只需要 execution-local assembled context 和已有 fingerprints；
+- 逻辑模型调用只需要 execution-local immutable request 和已有 exact refs；
 - provider attempt 属于 ModelGateway/telemetry；
 - FollowUp 是下一 Turn 的调度请求；
 - Prompt、Tool、Skill 已经由各自深模块拥有。
@@ -1000,7 +954,7 @@ AgentLoop registry
 - assembly 不接受任意 ToolPromptView；
 - 所有模型可见动态事实来自 committed conversation；
 - 下一次逻辑模型调用只从成功append并已进入conversation projection的facts构建；
-- Skill lazy load使用captured SkillEntry并重新校验source stamp与current operation basis；
+- Skill lazy load使用captured SkillEntry；TurnExecutionContext在await前后重新校验source provenance、current operation和TurnControl basis；
 - compose_message和initiating UserMessage append前重新观察TurnControl epoch；
 - ToolSpec 和 executor route 来自同一个 ToolSet；
 - Tool side effect前append非模型可见tool_execution_started operational truth；
@@ -1021,7 +975,7 @@ AgentLoop registry
 至少覆盖：
 
 - Context capture 成功并绑定 exact AgentRevisionRef、SessionDefinitionRevision 和 WorkspaceSnapshot；
-- PromptResourceView、SkillView与ToolSet capture后，PromptSet绑定对应fingerprints；
+- PromptResourceView、SkillView与ToolSet capture后，PromptSet绑定对应immutable view对象；
 - capture期间Prompt/Tool/Skill reload；
 - capture final control/basis check前发生SecurityRevoked；
 - capture failure 不创建领域 Turn；
@@ -1029,10 +983,10 @@ AgentLoop registry
 - initiating UserMessage append NotCommitted 时重试同一 draft；OutcomeUnknown 时保守终结、不在本 run 重试该 append、不分配另一个 TurnId，Turn 视为未开始，用户可重新提交；
 - PromptSet assembly 无法接收另一个 ToolPromptView；
 - compose_message和initiating UserMessage append前SecurityRevoked获胜时丢弃未append contribution；
-- Skill lazy load不查询reload后的current SkillView；未加载entry允许读取location当前正文；
+- Skill lazy load不查询reload后的shared root或future SkillView；未加载entry只能解析对应shared/Workspace publication中captured bytes/content；
 - User Skill injection 进入 committed CanonicalUserMessage；
 - 逻辑模型调用只接受 CommittedConversationView；
-- Session logical retry保持AssembledModelContextFingerprint不变；
+- Session logical retry复用同一个`Arc<ModelCallRequest>`且不重新assemble；
 - ModelGateway response error不进入AgentLoop，不执行Tool且不logical retry；
 - NeedTools后、任何side effect前重新观察Cancel/SecurityRevoked；
 - Tool side effect 前保存非模型可见 ToolInvocation Started/execution operational truth；
@@ -1049,7 +1003,7 @@ AgentLoop registry
 - Sampling Steer不取消旧Model；WaitingApproval/WaitingForUserInput/ExecutingTools Steer在current ToolRound完成后FIFO出队；
 - Steer 与 final terminal append race；
 - FollowUp 在前一 Turn terminal 后创建新 Context；
-- compaction entry append/apply 后 conversation checkpoint 和 AssembledModelContextFingerprint 改变；
+- compaction entry append/apply 后 conversation checkpoint 推进并触发下一次重新assemble；
 - active Turn期间Workspace update返回SessionBusy，不影响active Context；
 - SecurityRevoked阻止新的model/tool/skill操作；
 - security signal获胜后的迟到Model/source或pre-start Tool result未append时被丢弃；越过ToolExecutionStarted的Tool必须truthful settle；
@@ -1062,7 +1016,7 @@ AgentLoop registry
 - process restart 后 incomplete Turn 只 terminalize 一次；
 - Turn terminal/restart 时 Pending Interaction 被持久关闭且不重复 resolution；
 - Turn terminal/restart 时 Started ToolInvocation 被 truthful Completed 或 Abandoned；
-- active Turn不原地替换PromptSet、ToolSet或SkillView；进程重启后一律保守中断unfinished Turn，不重建旧fingerprint family；
+- active Turn不原地替换PromptSet、ToolSet或SkillView；进程重启后一律保守中断unfinished Turn，不重建旧execution environment；
 - terminal 后释放 Context 且不清空 Runtime-global cache。
 
 ## 后续问题

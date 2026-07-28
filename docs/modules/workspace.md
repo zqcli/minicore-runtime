@@ -46,7 +46,7 @@ Turn execution context
 - 当前不定义 `WorkspaceId`；
 - `SessionId` 是 Workspace definition 的 owner identity；
 - `WorkspaceRevision` 标识 Session Workspace definition 的版本；
-- `WorkspaceFingerprint`标识当前Runtime中一次解析后的有效Workspace快照；它不跨Runtime恢复；
+- 当前有效 Workspace 状态由不可变 `Arc<WorkspaceSnapshot>` 本身及其私有投影承载，不定义解析标识或代际值；
 - primary root、additional roots 和 cwd 由 Workspace 模块统一规范化和校验；
 - trust 是 policy 输入，不等于文件权限；
 - 文件可读不等于允许作为 Prompt 或 Skill source；
@@ -91,7 +91,7 @@ Turn execution context
 - effective read/write ceiling；
 - Prompt/Skill source authorization；
 - Tool sandbox root projection；
-- Turn snapshot fingerprint；
+- Turn-pinned immutable Snapshot 及其私有窄 view；
 - Idle-only update、authority resolution与security interruption。
 
 因此 Workspace 模块通过 deletion test：删除它后，复杂性会重新出现在 Session execution、Prompt source、Skill source、Tool policy 和 Sandbox 中。
@@ -223,7 +223,7 @@ Prompt/Skill 文件内容变化
 cache 或 load state 变化
 ```
 
-后者通过新的 WorkspaceSnapshot、authority revision 或对应子系统自己的 definition/content identity 表达。
+后者通过显式 `/reload` 或 Idle-only workspace re-resolve 后发布新的不可变对象表达；cache 可直接清空，不能成为正确性依据。
 
 ## Root 与 cwd 规则
 
@@ -370,7 +370,7 @@ Workspace 只定义文件访问上限，不拥有：
 ```text
 ToolRequirements
 ∩ ToolPolicy
-∩ approval/grant
+∩ per-call approval
 ∩ WorkspaceAccessView
 ∩ ToolSandbox capability
 ```
@@ -418,7 +418,7 @@ impl WorkspaceResolver {
         &self,
         session_id: SessionId,
         workspace: &Workspace,
-    ) -> Result<ResolvedWorkspace, WorkspaceResolveError>;
+    ) -> Result<WorkspaceSnapshotCandidate, WorkspaceResolveError>;
 }
 ```
 
@@ -432,10 +432,11 @@ Workspace definition
 → effective filesystem grants
 → effective Prompt source grants
 → effective Skill source grants
-→ authority revision/proof
-→ view fingerprints
-→ immutable WorkspaceSnapshot
+→ current authority decision/provenance
+→ WorkspaceSnapshotCandidate
 ```
+
+Resolver不读取Prompt/Skill正文。Session lifecycle随后让PromptService和SkillService只在candidate授权的source roots内capture immutable values，最后调用candidate private `finish(...)`创建WorkspaceSnapshot；因此任一source capture失败都不会发布partial Snapshot。
 
 WorkspaceResolver 不提供：
 
@@ -496,8 +497,9 @@ pub struct WorkspaceSnapshot {
     definition_revision: WorkspaceRevision,
     roots: Arc<[ResolvedWorkspaceRoot]>,
     cwd: ResolvedWorkspaceCwd,
+    prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
+    skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
     diagnostics: Arc<[WorkspaceDiagnostic]>,
-    fingerprint: WorkspaceFingerprint,
 }
 ```
 
@@ -527,13 +529,125 @@ impl WorkspaceSnapshot {
     pub fn tool_context(&self) -> WorkspaceToolContext;
     pub fn access_view(&self) -> WorkspaceAccessView;
     pub fn summary(&self) -> WorkspaceSummary;
-    pub fn fingerprint(&self) -> &WorkspaceFingerprint;
 }
 ```
 
 这些投影的构造器是私有的，调用方不能用任意 paths 自行构造“已授权 Workspace context”。
 
 ## 窄只读 View
+
+Workspace candidate在publication前提供两个互不扩权的capture context；字段和constructor均为crate-private：
+
+```rust
+pub struct AuthorizedPromptSourceRoot {
+    key: WorkspaceRootKey,
+    canonical_path: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+pub struct AuthorizedSkillSourceRoot {
+    key: WorkspaceRootKey,
+    canonical_path: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+pub(crate) struct WorkspacePromptCaptureContext {
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    roots: Arc<[AuthorizedPromptSourceRoot]>,
+}
+
+pub(crate) struct WorkspaceSkillCaptureContext {
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    roots: Arc<[AuthorizedSkillSourceRoot]>,
+}
+
+pub struct CapturedWorkspacePromptSource {
+    relative_location: WorkspaceRelativePath,
+    content: Arc<str>,
+    authorization: WorkspaceSourceAuthorization,
+}
+
+pub struct CapturedWorkspaceSkillSource {
+    relative_location: WorkspaceRelativePath,
+    bytes: Arc<[u8]>,
+    authorization: WorkspaceSourceAuthorization,
+}
+
+pub struct WorkspaceSourceAuthorization {
+    root_key: WorkspaceRootKey,
+    canonical_root: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+pub enum WorkspaceSourceCaptureError {
+    InvalidRelativeLocation,
+    SourceOutsideAuthorizedRoot,
+    SourceKindNotAuthorized,
+}
+
+impl WorkspacePromptCaptureContext {
+    pub(crate) fn session_id(&self) -> SessionId;
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath;
+    pub(crate) fn roots(&self) -> &[AuthorizedPromptSourceRoot];
+}
+
+impl WorkspaceSkillCaptureContext {
+    pub(crate) fn session_id(&self) -> SessionId;
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath;
+    pub(crate) fn roots(&self) -> &[AuthorizedSkillSourceRoot];
+}
+
+impl AuthorizedPromptSourceRoot {
+    pub(crate) fn key(&self) -> &WorkspaceRootKey;
+    pub(crate) fn canonical_path(&self) -> &CanonicalWorkspacePath;
+    pub(crate) fn trust(&self) -> WorkspaceRootTrust;
+}
+
+impl AuthorizedSkillSourceRoot {
+    pub(crate) fn key(&self) -> &WorkspaceRootKey;
+    pub(crate) fn canonical_path(&self) -> &CanonicalWorkspacePath;
+    pub(crate) fn trust(&self) -> WorkspaceRootTrust;
+}
+
+impl WorkspaceSourceAuthorization {
+    pub(crate) fn root_key(&self) -> &WorkspaceRootKey;
+    pub(crate) fn trust(&self) -> WorkspaceRootTrust;
+}
+
+impl WorkspacePromptCaptureContext {
+    pub(crate) fn capture(
+        &self,
+        root_key: &WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        content: Arc<str>,
+    ) -> Result<CapturedWorkspacePromptSource, WorkspaceSourceCaptureError>;
+}
+
+impl WorkspaceSkillCaptureContext {
+    pub(crate) fn capture(
+        &self,
+        root_key: &WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        bytes: Arc<[u8]>,
+    ) -> Result<CapturedWorkspaceSkillSource, WorkspaceSourceCaptureError>;
+}
+
+impl CapturedWorkspacePromptSource {
+    pub(crate) fn relative_location(&self) -> &WorkspaceRelativePath;
+    pub(crate) fn content(&self) -> &str;
+    pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization;
+}
+
+impl CapturedWorkspaceSkillSource {
+    pub(crate) fn relative_location(&self) -> &WorkspaceRelativePath;
+    pub(crate) fn bytes(&self) -> &Arc<[u8]>;
+    pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization;
+}
+```
+
+PromptService只能接收Prompt capture context，SkillService只能接收Skill capture context；二者不能读取另一类source roots，也不能自行扩大candidate授权。adapter通过`roots()`取得root key/canonical path用于discover/read，读取文件后必须调用`capture(root_key, relative_location, ...)`构造结果；该方法重新验证root仍在authorized set、relative location位于该root并填充authorization/provenance，避免sibling module伪造captured source。
 
 ### WorkspacePromptContext
 
@@ -542,24 +656,22 @@ pub struct WorkspacePromptContext {
     session_id: SessionId,
     cwd: CanonicalWorkspacePath,
     primary_root: CanonicalWorkspacePath,
-    source_roots: Arc<[AuthorizedPromptSourceRoot]>,
-    fingerprint: WorkspacePromptFingerprint,
+    sources: Arc<[CapturedWorkspacePromptSource]>,
 }
 
 impl WorkspacePromptContext {
     pub fn cwd(&self) -> &CanonicalWorkspacePath;
     pub fn primary_root(&self) -> &CanonicalWorkspacePath;
-    pub fn source_roots(&self) -> &[AuthorizedPromptSourceRoot];
-    pub fn fingerprint(&self) -> &WorkspacePromptFingerprint;
+    pub fn sources(&self) -> &[CapturedWorkspacePromptSource];
 }
 ```
 
 PromptService 可以：
 
-- 在 `source_roots` 内执行 Prompt-specific discovery；
+- 解析和选择已经capture的Workspace Prompt source；
 - 使用 cwd 选择路径相关 instructions；
 - 记录 source provenance；
-- 以 fingerprint 作为 Workspace source cache 输入。
+- 可以使用captured source values作为内部cache输入，或在重新resolve时直接清空cache。
 
 PromptService 不可以：
 
@@ -575,20 +687,18 @@ PromptService 不可以：
 pub struct WorkspaceSkillContext {
     session_id: SessionId,
     cwd: CanonicalWorkspacePath,
-    source_roots: Arc<[AuthorizedSkillSourceRoot]>,
-    fingerprint: WorkspaceSkillFingerprint,
+    sources: Arc<[CapturedWorkspaceSkillSource]>,
 }
 
 impl WorkspaceSkillContext {
     pub fn cwd(&self) -> &CanonicalWorkspacePath;
-    pub fn source_roots(&self) -> &[AuthorizedSkillSourceRoot];
-    pub fn fingerprint(&self) -> &WorkspaceSkillFingerprint;
+    pub fn sources(&self) -> &[CapturedWorkspaceSkillSource];
 }
 ```
 
-SkillService 只能在这些 source roots 内发现和读取 Workspace Skill。
+SkillService只能从这些captured sources构建Workspace Skill entries，不在Turn内重新discover或读取filesystem。
 
-SkillEntry记录source identity和location。后续lazy load使用本Turn captured SkillView entry与WorkspaceSkillContext，不能通过`skill_id + current Session Workspace`重新解析future view；实际读取仍须校验source stamp。SecurityRevoked会取消active operation并使迟到结果因execution basis失效而被丢弃。
+`CapturedWorkspacePromptSource`和`CapturedWorkspaceSkillSource`保存model-safe relative location、exact source authorization/provenance与immutable bytes/content；字段和constructor保持crate-private。它们只能由PromptService/SkillService在对应capture context授权roots内产生，再由Session lifecycle candidate组装进WorkspaceSnapshot。SkillEntry后续lazy parse只解析本Turn captured SkillView entry中的captured bytes，不能通过`skill_id + current Session Workspace`重新解析future view，也不能在Turn内按path重新读取current file。SecurityRevoked会取消active operation并使迟到结果因current operation/control basis失效而被丢弃。
 
 ### WorkspaceAccessView
 
@@ -597,7 +707,6 @@ pub struct WorkspaceAccessView {
     session_id: SessionId,
     cwd: CanonicalWorkspacePath,
     roots: Arc<[WorkspaceAccessRoot]>,
-    fingerprint: WorkspaceAccessFingerprint,
 }
 ```
 
@@ -607,8 +716,6 @@ WorkspaceAccessView 隐藏 path containment 和 capability 检查：
 impl WorkspaceAccessView {
     pub fn session_id(&self) -> SessionId;
     pub fn cwd(&self) -> &CanonicalWorkspacePath;
-    pub fn fingerprint(&self) -> &WorkspaceAccessFingerprint;
-
     pub async fn authorize(
         &self,
         input: WorkspacePathInput<'_>,
@@ -638,12 +745,10 @@ Tool policy、Tool requirements 和 Sandbox 使用该 view 作为文件权限硬
 ```rust
 pub struct WorkspaceToolContext {
     access: WorkspaceAccessView,
-    fingerprint: WorkspaceToolFingerprint,
 }
 
 impl WorkspaceToolContext {
     pub fn access(&self) -> &WorkspaceAccessView;
-    pub fn fingerprint(&self) -> &WorkspaceToolFingerprint;
 }
 ```
 
@@ -652,7 +757,7 @@ ToolService 通过该 context 获得：
 - canonical cwd；
 - read/write root ceiling；
 - authority revision-bound effective grants；
-- typed current-Runtime access fingerprint。
+- exact normalized access roots、cwd 和 effective filesystem grants。
 
 它不包含 Prompt source、Skill source、Tool registry、approval 或 provider 信息。
 
@@ -664,14 +769,31 @@ WorkspaceSnapshot在Turn内没有可撤销lease。Workspace definition update只
 pub struct ResolvedWorkspace {
     pub snapshot: Arc<WorkspaceSnapshot>,
 }
+
+pub(crate) struct WorkspaceSnapshotCandidate {
+    // resolved roots, cwd, effective access and diagnostics; not yet published
+}
+
+impl WorkspaceSnapshotCandidate {
+    pub(crate) fn prompt_capture_context(&self) -> WorkspacePromptCaptureContext;
+    pub(crate) fn skill_capture_context(&self) -> WorkspaceSkillCaptureContext;
+
+    pub(crate) fn finish(
+        self,
+        prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
+        skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
+    ) -> Arc<WorkspaceSnapshot>;
+}
 ```
+
+`ResolvedWorkspace`是`SessionWorkspaceState::Ready`保存的published wrapper，不是WorkspaceResolver的直接返回值；只有candidate `finish(...)`完成Prompt/Skill source capture后才能创建。
 
 Authority hard restriction由WorkspaceAuthority或host作为独立security event发布，不伪装成Workspace definition update：
 
 ```text
 current authority/policy fact published
 → route handle-scoped SecurityRevoked to affected current loaded SessionExecutionHandle
-→ close admission；bind candidate/current target generation when present
+→ close admission；bind current active target when present
 → EmergencyControl sticky signal
 → Idle直接resolve；Starting取消candidate；active Turn Finishing + truthful settlement
 → active Turn时TurnInterrupted(SecurityRevoked)
@@ -717,12 +839,15 @@ pub enum SessionWorkspaceState {
 ```text
 创建或加载 Session
 → capture exact SessionDefinitionRevision / WorkspaceRevision
-→ WorkspaceResolver::resolve(exact definition.workspace)
+→ WorkspaceResolver::resolve(exact definition.workspace) → WorkspaceSnapshotCandidate
+→ PromptService.capture_workspace_sources(candidate.prompt_capture_context())
+→ SkillService.capture_workspace_sources(candidate.skill_capture_context())
+→ candidate.finish(prompt_sources, skill_sources) → Arc<WorkspaceSnapshot>
 → publication 前 CAS SessionLifecycle 仍为 Open且 current revision 未变化
 → Ready(ResolvedWorkspace { snapshot })
    或 Unavailable(error)
 
-CAS stale 时丢弃旧 resolve 结果并按新 SessionDefinitionRevision 重试，不能发布旧 Workspace projection
+任一resolve/source capture失败时不发布partial Snapshot。CAS stale时丢弃旧candidate并按新SessionDefinitionRevision重试，不能发布旧Workspace projection或旧source capture。
 ```
 
 Workspace unavailable 时：
@@ -741,7 +866,9 @@ Workspace unavailable 时：
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision + WorkspaceRevision
 → loaded Session要求SessionExecutionState = Idle；否则SessionBusy
-→ 在per-session lifecycle serialization内构造并resolve complete candidate
+→ 在per-session lifecycle serialization内构造并resolve Workspace candidate
+→ PromptService/SkillService捕获candidate授权的Workspace-bound sources
+→ candidate.finish得到complete immutable WorkspaceSnapshot
 → durable commit新SessionDefinitionRevision与WorkspaceRevision
 → publish Ready(new WorkspaceSnapshot)
 → 最后确认update success
@@ -763,12 +890,15 @@ reload 不属于 WorkspaceService method：
 ```text
 loaded Session要求SessionExecutionState = Idle；否则SessionBusy
 → SessionExecutor读取current exact SessionDefinition.workspace
-→ 再次 WorkspaceResolver::resolve(...)
-→ success：原子发布新Snapshot并Ready
-→ unavailable：SessionReadiness = Unavailable，future Turn admission fail closed
+→ WorkspaceResolver::resolve(...)得到candidate
+→ PromptService/SkillService捕获candidate授权的Workspace-bound sources
+→ Ready + success：原子替换new Snapshot及captured source values
+→ Ready + failure：保留old Snapshot/source values并返回typed reload error
+→ Unavailable + success：发布new Snapshot并恢复Ready
+→ Unavailable + failure：保持Unavailable并返回typed reload error
 ```
 
-reload 只重新解析 Workspace facts。Prompt、Skill 和 Tool 的 source/cache/registry reload 仍由各自子系统负责。
+`/reload workspace`重新解析Workspace facts并重新捕获Workspace-bound Prompt/Skill source；它不替换shared Prompt/Skill/Tool/Model roots。authority hard restriction后的mandatory re-resolve若失败仍进入Unavailable；该security路径不同于用户发起且允许保留old Snapshot的reload。
 
 ### Unload
 
@@ -801,44 +931,45 @@ let workspace = session
 
 ```text
 exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
-+ AgentPromptSelection + SessionPromptSelection + TurnModelSnapshot
++ AgentPromptSelection + SessionPromptSelection
++ shared-gate captured PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
 + Arc<WorkspaceSnapshot>
-├─ SkillService::current_view(SkillViewContext {
+├─ ModelGateway::resolve_for_turn(captured ModelCatalogView, ...) → Arc<TurnModelSnapshot>
+├─ SkillService::for_turn(captured SkillResourceView, SkillViewContext {
 │    agent, session_id, session_revision, workspace: workspace.skill_context()
-│  }) → SkillView
-└─ ToolService::for_turn(ToolTurnContext {
+│  }) → Arc<SkillView>
+└─ ToolService::for_turn(captured ToolResourceView, ToolTurnContext {
      agent, session_id, session_revision, turn_id,
      workspace: workspace.tool_context(),
      tool_calling: model.capabilities().tool_calling.clone(),
      execution_control, cancellation, progress_events
-   }) → ToolSet
+   }) → Arc<ToolSet>
 
-PromptService.current_view()
+captured PromptResourceView
 + SkillView.prompt_view()
 + ToolSet.prompt_view()
 + workspace.prompt_context()
 + exact AgentPromptSelection / SessionPromptSelection
 + TurnModelSnapshot
 → PromptService::for_turn(...)
-→ PromptSet
+→ Arc<PromptSet>
 → TurnExecutionContext
 ```
 
-SkillView与ToolSet没有直接依赖，可以并行捕获；PromptSet在PromptResourceView、SkillPromptView和ToolPromptView就绪后创建并绑定对应fingerprint。
+SkillView与ToolSet没有直接依赖，可以并行捕获；PromptSet在PromptResourceView、SkillPromptView和ToolPromptView就绪后创建。ToolPromptView只能由parent ToolSet私有投影，SkillPromptView只能由captured SkillView私有投影，调用方不能伪造或替换。
 
 ```rust
 pub(crate) struct TurnExecutionContext {
     session_id: SessionId,
     session_revision: SessionDefinitionRevision,
     agent: AgentRevisionRef,
-    model: TurnModelSnapshot,
+    model: Arc<TurnModelSnapshot>,
     workspace: Arc<WorkspaceSnapshot>,
     skill_service: Arc<SkillService>,
     skill_context: SkillViewContext,
     skill_view: Arc<SkillView>,
-    tool_set: ToolSet,
-    prompt_set: PromptSet,
-    fingerprint: ExecutionContextFingerprint,
+    tool_set: Arc<ToolSet>,
+    prompt_set: Arc<PromptSet>,
     diagnostics: Arc<[TurnContextDiagnostic]>,
 }
 ```
@@ -867,8 +998,9 @@ Turn 领域对象仍不持有 Workspace。只有 Turn execution context pin Snap
 ```text
 Session Idle
 → validate/CAS/resolve candidate
+→ capture candidate-authorized Workspace Prompt/Skill sources
 → durable commit definition revision
-→ publish new WorkspaceSnapshot
+→ publish new WorkspaceSnapshot及captured source values
 
 Session Starting / Running / Finishing
 → SessionBusy
@@ -881,12 +1013,12 @@ Host希望在长Turn中修改Workspace时，显式执行`Cancel → wait session
 managed hard deny、trust/policy store降级或host安全事件可以在active Turn期间触发`SecurityRevoked`，但它不是definition patch，也不创建假的WorkspaceRevision或SessionDefinitionRevision：
 
 1. WorkspaceAuthority或host发布current authority/policy事实；
-2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定target generation；
+2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定current active target；
 3. SessionExecutor停止new admission/operation；Idle直接进入resolve，Starting取消candidate，Running/Finishing进入或保持Finishing；
 4. 已越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，不补缺失的`tool_round_completed`；
 5. 有active Turn时append/apply`TurnInterrupted(SecurityRevoked)`并释放Turn；
-6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve；
-7. success时retire signal、Ready并发布new Snapshot，failure时Unavailable且future admission fail closed。
+6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve，并捕获new candidate授权的Workspace-bound Prompt/Skill sources；
+7. success时retire signal、Ready并发布new Snapshot及captured source values，failure时Unavailable且future admission fail closed。
 
 FollowUp可以在Finishing期间排队，但terminal和重新resolve完成前不得启动；resolve失败时明确拒绝。Security signal是process-local control fact，不跨restart恢复；recovery只有在durable evidence足够时才可使用SecurityRevoked，否则使用HostRestart或RecoveryContextUnavailable。
 
@@ -910,17 +1042,17 @@ Session B ── Workspace B definition ── Snapshot B
 - WorkspaceRevision 不同；
 - resolved Snapshot和authority-sensitive cache不共享；
 - Session A reload 不替换 Session B Snapshot；
-- Session-scoped Tool grant 不跨 Session 复用。
+- per-call Tool approval不跨调用或Session复用。
 
 允许共享的只是不可变实现 cache：
 
 ```text
 canonical path metadata
-content-addressed Prompt/Skill body
+immutable Prompt/Skill body cache using captured content values or conservative invalidation
 只读文件 metadata
 ```
 
-不能仅以 canonical root 作为授权 cache key。任何 authorization-sensitive cache 至少必须包含对应 Workspace view fingerprint。
+不能仅以 canonical root 作为授权 cache key。authorization-sensitive cache在Workspace re-resolve时可以直接清空；若实现内部保留cache，也必须以exact normalized root/grant/policy values保证不会跨授权basis复用。
 
 ## Workspace Identity
 
@@ -937,7 +1069,7 @@ content-addressed Prompt/Skill body
 
 因此独立 `WorkspaceId` 会与 `SessionId` 重复，并诱导错误共享。
 
-MiniCore 使用四种精确 identity：
+MiniCore 使用精确 durable ref 和 exact structural value：
 
 ```text
 Workspace definition owner
@@ -947,13 +1079,15 @@ Definition concurrency/version
 → WorkspaceRevision
 
 Canonical root grouping/cache input
-→ WorkspaceRootFingerprint
+→ CanonicalWorkspacePath / WorkspaceRootKey（仅definition内稳定）
 
 Effective Turn-visible Workspace state
-→ WorkspaceFingerprint / view fingerprint
+→ 当前Turn持有的同一个 immutable Arc<WorkspaceSnapshot> 及其私有投影
 ```
 
-primary root fingerprint 可以用于 UI 和 Session catalog 的项目分组，但它不表示一个 Workspace entity，也不能用于授权。
+这些值不是替代身份机制。WorkspaceSnapshot字段私有，`WorkspacePromptContext`、`WorkspaceSkillContext`、`WorkspaceAccessView`和`WorkspaceToolContext`只能由同一个Snapshot投影创建；调用方不能用任意paths、grants或policy revision拼接一个“等价view”。
+
+primary root canonical path 可以用于 UI 和 Session catalog 的项目分组，但它不表示一个 Workspace entity，也不能用于授权。
 
 ### 何时重新引入 WorkspaceId
 
@@ -970,29 +1104,8 @@ primary root fingerprint 可以用于 UI 和 Session catalog 的项目分组，�
 ```text
 WorkspaceId
 ≠ canonical path
-≠ WorkspaceFingerprint
 ≠ authorization token
 ```
-
-## Fingerprint
-
-Workspace 至少需要：
-
-```text
-WorkspaceFingerprint
-WorkspacePromptFingerprint
-WorkspaceSkillFingerprint
-WorkspaceAccessFingerprint
-WorkspaceToolFingerprint
-```
-
-这些fingerprint是Runtime-instance-local opaque identity：每次成功`WorkspaceResolver::resolve`创建一个新的fingerprint family，同一个Snapshot投影出的各窄view绑定该family。调用方只允许在当前Runtime内比较typed value，不能解析字段或假设具体hash算法。
-
-Runtime restart、unload后的重新load、SecurityRevoked后的重新resolve都会创建新family；即使SessionDefinition、canonical roots和effective grants未变化，新fingerprint也不要求与旧值相等。MVP不定义Workspace fingerprint的跨进程canonical encoding、algorithm version、确定性重建或golden vector。
-
-各窄view使用不同的typed fingerprint，防止Prompt、Skill、Access和Tool view identity混用，并支持同一个Snapshot内的精确cross-binding。MVP不承诺任一child fingerprint在两次resolve之间保持相等；新的resolution family可以保守失效全部派生cache。
-
-这些fingerprint不表达或校验Prompt/Skill文件内容、diagnostics文本、file watcher、process handle或security signal。authorization-sensitive cache与ToolGrantKey必须同时绑定当前view fingerprint；旧Runtime或旧resolve产生的cache/grant不得迁移到新view。
 
 ## Error 与 Diagnostics
 
@@ -1034,7 +1147,6 @@ Diagnostics 至少记录：
 - source grant 被拒绝原因；
 - canonical duplicate/overlap；
 - unavailable/retryable；
-- fingerprint。
 
 绝对路径默认不进入模型可见 metadata。公开 diagnostics 和 UI projection 应支持 path redaction 或 display-relative path。
 
@@ -1042,9 +1154,9 @@ Diagnostics 至少记录：
 
 ### PromptService
 
-PromptService 消费 `WorkspacePromptContext`，负责：
+PromptService在candidate阶段消费`WorkspacePromptCaptureContext`，在Turn构建阶段消费`WorkspacePromptContext`，负责：
 
-- Prompt-specific discovery；
+- candidate阶段的Prompt-specific discovery和source capture；
 - source parsing；
 - scope/role/merge；
 - content cache；
@@ -1054,10 +1166,10 @@ Workspace 只授权 source，不解析 Prompt。
 
 ### SkillService
 
-SkillService 消费 `WorkspaceSkillContext`，负责：
+SkillService在candidate阶段消费`WorkspaceSkillCaptureContext`，在Turn构建阶段消费`WorkspaceSkillContext`，负责：
 
-- Skill-specific discovery；
-- SkillView publication；
+- candidate阶段的Skill-specific discovery和source capture；
+- per-Turn SkillView构建；
 - metadata conflict；
 - lazy load；
 - content cache。
@@ -1071,7 +1183,7 @@ ToolService 消费 `WorkspaceToolContext`，负责：
 - Tool filtering；
 - dynamic ToolRequirements；
 - ToolPolicy；
-- approval/grant；
+- per-call approval；
 - Sandbox；
 - Tool execution。
 
@@ -1088,7 +1200,7 @@ ToolRegistry / ToolSet / Tool executor
 SkillView / LoadedSkill
 Model / provider / credentials
 network / process / environment policy
-Tool approval / Tool grant
+Tool approval
 Sandbox implementation
 VCS / worktree
 code index
@@ -1143,12 +1255,12 @@ upload / telemetry
 - Workspace definition update和reload只在Session Idle时接受，非Idle返回SessionBusy；
 - authority hard restriction通过SecurityRevoked中断Turn，terminal后重新resolve；
 - 不承诺动态撤销已打开OS handle或回滚已开始副作用；
-- Tool approval 不能扩大 WorkspaceAccessView；
+- Tool approval不能扩大WorkspaceAccessView，且MVP不保存跨调用grant；
 - Workspace unavailable 时 future Turn fail closed；
 - 同根多Session不共享mutable Snapshot或authority-sensitive cache；
 - Workspace 不恢复通用 ResourceManager。
-- WorkspaceSnapshot及其view fingerprint不跨Runtime恢复；load使用current definition/current authority重新resolve；
-- Tool grant和authorization-sensitive cache是Runtime-instance-local，不跨restart、fork或Workspace重新resolve迁移；
+- WorkspaceSnapshot及其view不跨Runtime恢复；load使用current definition/current authority重新resolve；
+- authorization-sensitive cache在Workspace re-resolve、Tool/Policy reload或Runtime restart时清空；MVP不保存跨调用Tool grant；
 
 ## Test Matrix
 
@@ -1167,15 +1279,14 @@ upload / telemetry
 - Prompt source grant 不授权 Skill；
 - Skill source grant 不授权 Prompt；
 - Tool write request 被 Workspace read-only ceiling 拒绝；
-- Tool approval/grant 不能扩大 WorkspaceAccessView；
+- Tool approval不能扩大WorkspaceAccessView；
 - Tool executor 不能访问 WorkspaceAccessView 或为未声明 path 重新授权；
-- ToolGrantKey 绑定 WorkspaceAccessFingerprint；
 - 不同 Session 使用不同 root anchor 指向同一目标时仍竞争同一文件锁；
 - create/rename target 使用 nearest-existing-ancestor 校验，并覆盖 symlink race；
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
-- Workspace Prompt cache/fingerprint覆盖source stamp，SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
-- Workspace Skill adapter 的 discover/read 只能使用 pinned WorkspaceSkillContext；
-- captured SkillView entry、LoadedSkill、SkillInjection和committed contribution stamp使用同一SkillId/source stamp；
+- Workspace Prompt source在Session load、Idle definition update或`/reload workspace`时捕获immutable content；SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
+- Workspace Skill adapter的capture只能使用WorkspaceSkillCaptureContext，并必须通过context构造CapturedWorkspaceSkillSource；
+- captured SkillView entry、LoadedSkill、SkillInjection和committed contribution provenance使用同一SkillId和exact source authorization/provenance；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；
@@ -1188,9 +1299,9 @@ upload / telemetry
 - terminal后使用current definition/current authority重新resolve，success Ready、failure Unavailable；
 - security signal先赢时迟到model/tool/source结果不进入后续committed conversation；
 - crash无法证明security cause时使用HostRestart/RecoveryContextUnavailable；
-- 同root两个Session的cwd/grant/fingerprint和security target generation隔离；
-- 同一个WorkspaceSnapshot投影的各view绑定同一次resolution family；
-- Runtime restart或重新resolve后生成新的fingerprint family，旧cache/grant不可复用；
+- 同root两个Session的cwd/grant和security operation basis隔离；
+- WorkspacePromptContext、WorkspaceSkillContext、WorkspaceAccessView和WorkspaceToolContext只能由同一个`Arc<WorkspaceSnapshot>`私有投影，不能跨Snapshot拼接；
+- Runtime restart或重新resolve后使用新解析出的不可变Snapshot，旧authorization-sensitive cache不可复用；
 - absolute path 不泄漏到模型可见 Skill metadata 或 Prompt provenance。
 
 ## 后续问题
@@ -1214,7 +1325,7 @@ upload / telemetry
 - [x] 定义Turn-pinned immutable Snapshot、Idle-only update和SecurityRevoked interruption（ADR 0121）。
 - [x] 将 WorkspaceSnapshot 纳入 TurnExecutionContext capture DAG，并固定字段私有。
 - [x] 定义同根多 Session 的隔离语义。
-- [x] 确定Workspace及view fingerprint只在当前Runtime有效，不做跨进程恢复（ADR 0122）。
+- [x] 按ADR 0123删除Workspace及view命名指纹；执行一致性由不可变Snapshot、私有投影和显式reload/re-resolve保证。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
 - [ ] 定义公开command payload与historical WorkspaceSnapshotRef storage integration。

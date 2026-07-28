@@ -14,11 +14,11 @@ MiniCore不需要为这些问题增加priority system、queue service或attempt 
 ## 决策
 
 1. Prompt baseline采用固定顺序：Runtime required System policy → Runtime base System Prompt → Agent System instructions → Session User instructions → Workspace User instructions → ToolPromptView metadata → SkillPromptView User metadata。Prompt role只保留System和User，完整资源与reload规则见ADR 0110。
-2. 不给PromptDefinition增加priority。Runtime/Agent/Session PromptDefinition层按PromptKey、PromptId、DefinitionVersion和稳定provenance source identity排序；Workspace按model-safe relative path，Tool按ToolName，Skill按SkillId排序。filesystem/discovery/HashMap顺序不得影响结果；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
+2. 不给PromptDefinition增加priority或replacement version。Runtime/Agent/Session PromptDefinition层按PromptKey、PromptId和稳定provenance source key排序；Workspace按model-safe relative path，Tool按ToolName，Skill按SkillId排序。filesystem/discovery/HashMap顺序不得影响结果；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
 3. SessionWriter append与cold replay共用一个pure `validate_and_project(base, entry)` semantic seam。append-time semantic validation必须等价于或强于replay validation；writer成功commit的entry必须可被projector语义接受。
 4. `apply_committed`只安装append前生成的trusted delta，不能对已commit entry再次产生确定性semantic rejection。writer-accepted sequence必须通过live apply与cold replay projection等价性测试。
 5. 每个Session最多一个current RunningOperation。主循环同时poll该future和SessionIngress wakeup以保持响应，LifecycleControl grace deadline通过lifecycle signal推进，但旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。SessionIngress的lane划分由ADR 0111修订，不改变本条的单operation约束。
-6. execution_version表示conversation/control basis，不是retry attempt编号。logical retry复用相同version和ModelCallRequest，但只能严格串行启动。provider端可能继续工作或计费不等于旧本地future仍可向SessionExecutor返回结果。
+6. execution_version表示conversation/control basis，不是retry attempt编号。logical retry复用相同version和同一个immutable `Arc<ModelCallRequest>`，但只能严格串行启动。provider端可能继续工作或计费不等于旧本地future仍可向SessionExecutor返回结果。
 7. Steer与FollowUp分别使用`SessionIngress`中的bounded per-Turn `SteerQueue`和`FollowUpQueue`；lane内部保留普通FIFO语义，不增加priority、batch drain mode或独立状态owner。仍在队列中的消息可以按CommandId remove，撤销后不重新入队。具体ingress形状由ADR 0111修订。
 8. Steer不取消Sampling、Compaction、WaitingApproval、WaitingForUserInput或ExecutingTools。当前assistant/tool step完整committed后，下一次Model调用前pop_front一条Steer并append/apply为UserMessage；等待UserQuestion时Steer只排队，不作为UserAnswer。
 9. 含ToolCall的step必须先完成assistant → truthful ToolResult → tool_round_completed，再加入Steer。无ToolCall candidate final遇到queued Steer时保存为model-visible、non-terminal Assistant Continue step；queue为空时才保存Assistant Final并terminalize Turn。
@@ -26,7 +26,7 @@ MiniCore不需要为这些问题增加priority system、queue service或attempt 
 
 ## 后果
 
-- PromptFingerprint不再依赖未定义priority或source发现顺序。
+- Prompt顺序不再依赖未定义priority或source发现顺序；ADR 0123后不再以PromptFingerprint作为架构术语。
 - 已commit JSONL不会因append/replay validator分叉而在冷启动时被同版本代码拒绝。
 - Session控制请求保持响应，但logical Model/Tool/Compaction work严格串行，B3不需要operation_instance_id作为正确性前提。
 - Steer FIFO与tool protocol顺序固定为`assistant tool_call → truthful tool result(s) → tool_round_completed → user steer → next model`。
@@ -38,3 +38,7 @@ MiniCore不需要为这些问题增加priority system、queue service或attempt 
 - B1：Prompt scope内priority/冲突排序未定。
 - B2：缺append校验覆盖replay校验与committed entry必可project不变量。
 - B3：logical retry可能与旧本地operation重叠，结果坐标不足。
+
+## 后续修订
+
+2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除`*Fingerprint`身份族。本文关于固定排序、append/replay等价、单current operation和严格串行logical retry的决策保持有效；retry一致性改为复用同一个`Arc<ModelCallRequest>`并验证Turn仍Running、`execution_version`、exact checkpoint entry、`current_operation`仍为对应retry slot且control basis未变。

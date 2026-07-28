@@ -1,7 +1,9 @@
 # ADR 0107: Compaction 使用严格 stable suffix
 
-状态：Superseded by [ADR 0112](0112-compaction-supports-active-turn-checkpoints.md)
+状态：Superseded by [ADR 0112](0112-compaction-supports-active-turn-checkpoints.md)；identity/fingerprint条款 further superseded by [ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)
 日期：2026-07-24
+
+> 历史说明：以下正文保留为被取代的ADR历史记录。当前Compaction identity、request retry和durable schema规则以ADR 0112与ADR 0123为准；其中所有plan/assembly/transcript fingerprint叙事均不再是当前架构决策。
 
 ## 背景
 

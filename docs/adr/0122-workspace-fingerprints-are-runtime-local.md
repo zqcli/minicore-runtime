@@ -1,7 +1,9 @@
 # ADR 0122：Workspace fingerprint只在当前Runtime有效
 
-状态：Accepted
+状态：Superseded by [ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)
 日期：2026-07-28
+
+> 历史说明：本ADR正文保留为被取代的O12决策记录。当前V2架构不再定义`WorkspaceFingerprint`或任何Workspace view fingerprint，也不新增WorkspaceResolutionId/generation等替代identity；执行一致性以[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)的exact refs、immutable `Arc`、explicit reload和structural validation为准。
 
 ## 背景
 

@@ -169,9 +169,9 @@ MiniCoreRuntime
 - `WorkspaceId`；
 - `execution_version`；
 - `OperationType`；
-- provider attempt id；
+- provider transport internals；
 - Tool executor route；
-- Workspace security target generation。
+- Workspace security signal。
 
 ### Event Route
 
@@ -223,13 +223,20 @@ pub struct CommandRequest {
 
 ```rust
 pub enum RuntimeCommand {
+    Runtime(RuntimeLifecycleCommand),
     Agent(AgentCommand),
     Session(SessionCommand),
     Turn(TurnCommand),
     Interaction(InteractionCommand),
     CommandSurface(CommandSurfaceCommand),
 }
+
+pub enum RuntimeLifecycleCommand {
+    ReloadSharedResources,
+}
 ```
+
+`ReloadSharedResources`对应`/reload`，发布新的共享Prompt/Skill/Tool/Model immutable objects；它不修改任何SessionDefinitionRevision，也不更新active/completed Turn。
 
 ### AgentCommand
 
@@ -290,6 +297,9 @@ pub enum SessionCommand {
     Load {
         session_id: SessionId,
     },
+    ReloadWorkspace {
+        session_id: SessionId,
+    },
     Unload {
         session_id: SessionId,
     },
@@ -309,11 +319,15 @@ pub enum SessionCommand {
 }
 ```
 
+`ReloadSharedResources`对应`/reload`：Runtime完整build Prompt/Skill/Tool/Model candidates，validate所有required candidates，然后在短publication gate下原子替换current immutable objects；任一required candidate失败时保留全部old current values并返回`ReloadValidationFailed`，不发布`RuntimeReloaded`或`shared_resources_reloaded`。active/completed Turn不更新，future Turn捕获reload后的objects。
+
+`ReloadWorkspace`对应`/reload workspace`：作用于loaded Session的current Workspace state，不修改SessionDefinitionRevision。Session必须Idle；Runtime重新resolve current definition，并由PromptService/SkillService捕获candidate授权的Workspace-bound sources。Ready时成功则替换Snapshot及captured values，失败保留old Snapshot；Unavailable时成功发布new Snapshot并恢复Ready，失败保持Unavailable。失败返回`ReloadValidationFailed`且不发布`WorkspaceReloaded`或`session_workspace_reloaded`。Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel、不原地替换active Turn Context。unloaded Session的Workspace在后续load时完成同一流程。
+
 `SessionDefinitionPatch`原子修改Workspace、SessionModelConfig或SessionPromptSelection，并生成新的`SessionDefinitionRevision`。修改Agent reference必须走`UpgradeAgentRevision`。若patch改变Workspace且Session已loaded，只在`SessionExecutionState::Idle`接受；Starting/Running/Finishing返回typed `SessionBusy`，不排队、不隐式Cancel。Host需要显式`Cancel → wait session_settled → UpdateDefinition`。
 
 `Create` 只接受 `agent_id`：Runtime 在创建的 Agent lifecycle synchronization 内读取该 Agent 当时的 current revision，并把它作为 exact `AgentRevisionRef` 钉进 `SessionDefinition`。调用方不在 create 时报 revision——「用哪一版」由 Runtime 在此刻快照 current 决定，之后 Agent 再发布新 revision 不会改变该 Session（snapshot-current）。
 
-`UpgradeAgentRevision.target` 为 `Option`：缺省（`None`）表示「重新钉到该 Agent 当前 current」（显式 reload 升级），是常规路径；给出 exact `AgentRevisionRef` 表示钉到指定版本（可用于钉旧版或回滚）。两种情况都在 gates 内校验 target 属于同一 AgentId、Agent 为 Enabled、target definition 存在，并原子解析为 exact ref 后写入新的 `SessionDefinitionRevision`；`latest` 本身不进入 durable `SessionDefinition`。保持exact pin让同一Session在两次upgrade之间的Agent selection、Workspace和Model配置稳定；显式Prompt resource reload仍只影响future Turn。
+`UpgradeAgentRevision.target` 为 `Option`：缺省（`None`）表示「重新钉到该 Agent 当前 current」（显式revision upgrade），是常规路径；给出 exact `AgentRevisionRef` 表示钉到指定版本（可用于钉旧版或回滚）。两种情况都在 gates 内校验 target 属于同一 AgentId、Agent 为 Enabled、target definition 存在，并原子解析为 exact ref 后写入新的 `SessionDefinitionRevision`；`latest` 本身不进入 durable `SessionDefinition`。保持exact pin让同一Session在两次upgrade之间的Agent selection、Workspace和Model配置稳定；显式Prompt resource reload仍只影响future Turn。
 
 同一Session不提供原地history checkout。创建历史分支使用`Fork`，得到新的SessionId和独立definition revision序列。
 
@@ -390,7 +404,7 @@ pub enum PublicCancelTarget {
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
 - `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Turn创建后调用方使用`TurnId`取消；
-- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn generation并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal append；stale target不影响新Turn；
+- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal append；stale target不影响新Turn；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
 
@@ -481,6 +495,8 @@ pub enum CommandOutcome {
     },
     SessionLoaded,
     SessionUnloaded,
+    RuntimeReloaded,
+    WorkspaceReloaded,
     SessionUpdated {
         revision: SessionDefinitionRevision,
     },
@@ -509,7 +525,7 @@ Command response不是完整业务完成流：
 
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `CancelAccepted`只表示target/generation仍可取消且sticky cancel epoch已经发布；它与initiating/final append reservation first-wins，accepted后对应Started/Completed commit不得再赢；Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
+- `CancelAccepted`只表示active target仍可取消且sticky cancel epoch已经发布；它与initiating/final append reservation first-wins，accepted后对应Started/Completed commit不得再赢；Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
 - `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
 - Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
@@ -524,15 +540,17 @@ Command response不是完整业务完成流：
 | Create Session | SessionHeader/definition durable publication |
 | Update SessionDefinition（non-Workspace或unloaded Workspace） | new revision durable publication |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
+| Reload shared Prompt/Skill/Tool/Model | required candidates全部validate，并在publication gate下替换current immutable objects；失败时old current values保持不变 |
 | Load Session | single-flight load/recovery完成并发布readiness |
+| Reload Workspace | Session Idle校验、Workspace resolve和Workspace-bound Prompt/Skill source capture全部完成后替换Snapshot；非Idle返回SessionBusy |
 | Unload Session | LifecycleControl完成grace/fail-closed drain，writer关闭并从loaded map移除 |
 | Submit | initiating UserMessage append/apply |
 | Steer Queued | target Turn的SteerQueue admission |
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved append/apply |
-| Cancel Submit(CommandId) | target/generation仍可取消且sticky cancel epoch发布；initiating append reservation先赢时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
-| Cancel Turn | target/generation仍可取消且sticky cancel epoch发布；final append reservation先赢时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
+| Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；initiating append reservation先赢时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
+| Cancel Turn | active target仍可取消且sticky cancel epoch发布；final append reservation先赢时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
 | Fork Session | target staging验证完成并原子发布 |
 
 ### Command Error
@@ -560,6 +578,7 @@ SessionDeleted
 SessionNotLoaded
 SessionNotReady
 SessionBusy
+ReloadValidationFailed
 IngressLaneFull
 QueuedMessageNotQueued
 ExpectedTurnMismatch
@@ -745,11 +764,10 @@ pub struct SessionHistoryTreeView {
     pub session_id: SessionId,
     pub current_anchor: Option<HistoryAnchorView>,
     pub nodes: Vec<HistoryNodeView>,
-    pub revision: SessionHistoryRevision,
 }
 ```
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。`GetHistoryTree`首版按一个明确`SessionHistoryRevision`返回完整compact branch topology，不内联Turn Item bodies，也不分页；它服务fork/navigation拓扑，不代替聊天timeline读取。
+History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。`GetHistoryTree`首版从owner一次性捕获并返回自洽的完整compact branch topology，不内联Turn Item bodies，也不分页；它服务fork/navigation拓扑，不代替聊天timeline读取，因此不需要额外history revision或generation。
 
 MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
@@ -819,12 +837,11 @@ pub struct RuntimeSnapshot {
     pub runtime: RuntimeView,
     pub agents: Vec<AgentSummary>,
     pub loaded_sessions: Vec<LoadedSessionSummary>,
-    pub catalogs: RuntimeCatalogRevisions,
     pub diagnostics: Vec<RuntimeDiagnosticView>,
 }
 ```
 
-`RuntimeSnapshot`不包含所有loaded Session的完整message、current Items或Pending Interaction。它只负责Runtime scope状态和loaded membership。
+`RuntimeSnapshot`不包含所有loaded Session的完整message、current Items、Pending Interaction或大型Prompt/Skill/Tool/Model/Command catalogs。它只负责Runtime scope状态和loaded membership；host收到每个新的Runtime Snapshot后按需重新执行safe catalog queries，不使用catalog revision判断本地cache是否仍有效。
 
 ### SessionSnapshot
 
@@ -913,17 +930,87 @@ pub enum EventFrame {
     Progress(ProgressEvent),
     Closed(SubscriptionClosed),
 }
+
+pub enum SubscriptionClosed {
+    Backpressure,
+    RuntimeClosing,
+    PublisherRestarted,
+}
 ```
 
 ### StateEvent
 
 ```rust
 pub struct StateEvent {
-    pub event_id: EventId,
     pub timestamp: Timestamp,
     pub command_id: Option<CommandId>,
     pub route: EventRoute,
     pub msg: StateEventMsg,
+}
+
+pub enum StateEventMsg {
+    Runtime {
+        kind: RuntimeStateEventKind,
+        snapshot: RuntimeSnapshot,
+    },
+    Session {
+        kind: SessionStateEventKind,
+        snapshot: SessionSnapshot,
+        detail: Option<SessionEventDetail>,
+    },
+}
+
+pub enum RuntimeStateEventKind {
+    AgentCreated,
+    AgentDefinitionUpdated,
+    AgentStatusChanged,
+    SessionCreated,
+    SessionLoaded,
+    SessionUnloaded,
+    SessionDefinitionUpdated,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
+    SessionForked,
+    DiagnosticsUpdated,
+    SharedResourcesReloaded,
+    CommandCatalogInvalidated,
+}
+
+pub enum SessionStateEventKind {
+    SessionDefinitionUpdated,
+    SessionWorkspaceReloaded,
+    SessionReadinessChanged,
+    SessionExecutionChanged,
+    SessionSettled,
+    TurnStarted,
+    TurnPhaseChanged,
+    TurnCompleted,
+    TurnInterrupted,
+    TurnFailed,
+    ItemCompleted,
+    ItemToolInvocationStarted,
+    ItemToolInvocationCompleted,
+    ItemToolInvocationAbandoned,
+    InteractionRequested,
+    InteractionResolved,
+    QueueUpdated,
+    UsageUpdated,
+    DiagnosticsUpdated,
+}
+
+pub enum SessionEventDetail {
+    QueueUpdated {
+        removed_command_ids: Arc<[CommandId]>,
+        reason: QueueUpdateReason,
+    },
+}
+
+pub enum QueueUpdateReason {
+    CancelQueuedMessage,
+    TurnCancelled,
+    TurnTerminal,
+    PrepareForUnload,
 }
 ```
 
@@ -942,10 +1029,13 @@ StateEvent规则：
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - durable conversation fact必须从append/apply后的CommittedSessionEntry派生；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
+- `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
 - Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未append消息伪造成durable UserMessage。
 
-主要event family：
+上述两个kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整Snapshot；`SessionEventDetail`只承载Snapshot无法表达但对本次transition有用的safe correlation信息。
+
+wire命名：
 
 ```text
 agent_created
@@ -976,10 +1066,14 @@ interaction_resolved
 queue_updated
 usage_updated
 diagnostics_updated
+shared_resources_reloaded
+session_workspace_reloaded
 command_catalog_invalidated
 ```
 
-Turn terminal使用三个互斥event type，或wire adapter使用一个`turn_finished { status }`。同一protocol major内只能选择一种稳定wire形状；Rust领域payload保持`Completed | Interrupted | Failed` typed union。
+`shared_resources_reloaded`是Runtime-scope typed unit payload，表示Prompt/Skill/Tool/Model四个safe catalog都可能变化；它不携带revision/generation。`session_workspace_reloaded { session_id }`是Session-scope payload，表示new WorkspaceSnapshot及Workspace-bound Prompt/Skill captured sources已经一起发布；订阅者随后以new SessionSnapshot为准。
+
+MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；wire adapter不得另行折叠成未定义的`turn_finished`形状。Rust领域payload保持`Completed | Interrupted | Failed` typed union。
 
 ### ProgressEvent
 
@@ -989,6 +1083,45 @@ pub struct ProgressEvent {
     pub route: EventRoute,
     pub kind: ProgressEventKind,
     pub update: ProgressUpdate,
+}
+
+pub enum ProgressEventKind {
+    Model,
+    Tool,
+    Compaction,
+    Retry,
+}
+
+pub enum ProgressUpdate {
+    ItemStarted {
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+    },
+    ItemDelta {
+        item_id: ItemId,
+        content_index: u32,
+        content_kind: ItemProgressContentKind,
+        delta: String,
+    },
+    ToolOutputDelta {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        delta: String,
+    },
+    ModelRetryScheduled {
+        purpose: ModelCallPurpose,
+        retry_count: u8,
+        ready_at: Timestamp,
+    },
+    OperationStatus {
+        message: String,
+    },
+}
+
+pub enum ItemProgressContentKind {
+    AssistantText,
+    Reasoning,
 }
 ```
 
@@ -1174,10 +1307,10 @@ CLI / TUI / Tauri backend
 → per-session SessionIngress.TurnAdmissionQueue
 → SessionExecutor reserves candidate Turn
 → WorkspaceResolver.resolve()
-→ ModelGateway.resolve_for_turn()
-→ PromptService.current_view()
-→ SkillService.current_view()
-→ ToolService.for_turn()
+→ shared publication gate克隆PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
+→ ModelGateway.resolve_for_turn(captured catalog)
+→ SkillService.for_turn(captured resources)
+→ ToolService.for_turn(captured tool resources)
 → PromptService.for_turn()
 → TurnExecutionContext
 → PromptSet.compose_user_message()
@@ -1339,7 +1472,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - PromptSet完整System sections和前置User context；
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
-- WorkspaceSnapshot、EmergencyControl signal或security target generation；
+- WorkspaceSnapshot、EmergencyControl signal或security target；
 - SessionWriter、writer internals、repair internals；
 - raw JSONL path作为普通UI能力；
 - internal handler id和完整RuntimeCommand嵌入catalog action。
@@ -1415,7 +1548,7 @@ Public interface是 contract test surface。
 - Cancel与initiating/final append reservation first-wins，不能accepted后再提交Started/Completed；
 - Cancel清理current Turn Steer但保留FollowUp，Finishing期间新FollowUp仍可Queued；
 - CancelAccepted后execution snapshot/event进入Finishing，最终TurnInterrupted另行发布；
-- stale Cancel TurnId/generation不取消新的active Turn；
+- stale Cancel TurnId不取消新的active Turn；
 - Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
 - Interaction first committed resolution wins；
@@ -1427,7 +1560,7 @@ Public interface是 contract test surface。
 
 - Query只读且不发布Event；
 - session list不加载SessionExecutor；
-- GetHistoryTree在单一SessionHistoryRevision返回完整compact branch topology，不内联Item bodies且不分页；
+- GetHistoryTree由owner一次性捕获并返回自洽的完整compact branch topology，不内联Item bodies、不分页、也不返回额外history revision；
 - history tree不暴露internal entry/event；
 - 长期Session的ListTurns分页可用于首次加载最近历史和向上滚动，cursor绑定sort与revision；
 - GetTurn、turn-scoped ListItems和active_items首版不分页；

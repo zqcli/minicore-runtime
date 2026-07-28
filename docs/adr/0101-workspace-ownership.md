@@ -12,12 +12,12 @@ MiniCore 后端需要统一解释工作目录、文件访问域、trust 与 sour
 ## 决策
 
 - **Workspace 是 Session-owned definition**：属于 immutable `SessionDefinition.workspace`，不是独立 entity、Runtime-global service、registry 或 lifecycle aggregate；`SessionId` 即 owner identity，当前不定义 `WorkspaceId`。
-- **三种精确 identity 分工**：`WorkspaceRevision`标识definition版本；`WorkspaceSnapshot`是一次解析后的不可变有效快照；`WorkspaceFingerprint`标识该快照在当前Runtime内的有效identity（用于cache/授权敏感key，不以canonical root作为授权key，不跨Runtime恢复）。
+- **精确ref与不可变快照分工**：`WorkspaceRevision`标识definition版本；`WorkspaceSnapshot`是一次解析后的不可变有效快照，并由active Turn以同一个`Arc<WorkspaceSnapshot>`持有到terminal。Workspace不定义`WorkspaceFingerprint`或替代resolution identity；cache可以使用内部私有key，但授权、retry、recovery和架构不变量只依赖exact refs、当前authority和实际快照内容。
 - **root、cwd 由 Workspace 模块统一规范化和校验**：唯一 primary root 加显式 additional roots；先 canonicalize 后校验；canonical duplicate 与 overlap fail closed；cwd 必须且只能位于一个明确 root。
 - **trust、filesystem capability、source authorization 三者分离**：trust 是 policy 输入不等于文件权限；文件可读不等于允许作为 Prompt 或 Skill source；Prompt source 与 Skill source 相互独立；additional root 默认仅扩展文件访问。
 - **Prompt/Tool/Skill 只消费窄只读 view**：`WorkspacePromptContext`/`WorkspaceSkillContext`/`WorkspaceToolContext`/`WorkspaceAccessView` 由同一 `WorkspaceSnapshot` 原子投影；三个 Service 不自行 canonicalize roots、不查询 trust、不据文件可读性自行启用 source。
 - **Turn pin快照，Workspace update只在Idle**：active Turn admission时pin一个`Arc<WorkspaceSnapshot>`并保持到terminal；loaded Session的Workspace definition patch在Starting/Running/Finishing时返回`SessionBusy`。authority hard restriction通过Turn-targeted`SecurityRevoked`中断执行，terminal后重新resolve，不动态撤销Snapshot或open handle；Tool approval不能扩大`WorkspaceAccessView`。完整规则见ADR 0121。
-- **同根多Session隔离**：即使primary root相同，各Session的cwd、additional roots、requested access、source policy、WorkspaceRevision、Snapshot与security target generation均不共享；仅共享不可变实现cache。
+- **同根多Session隔离**：即使primary root相同，各Session的cwd、additional roots、requested access、source policy、WorkspaceRevision与Snapshot均不共享；仅共享不影响correctness的内部不可变实现cache。
 
 ## 后果
 
@@ -36,4 +36,4 @@ MiniCore 后端需要统一解释工作目录、文件访问域、trust 与 sour
 两份 V1 原文见 [`../archive/v1/adr/`](../archive/v1/adr/)。
 
 2026-07-27：[ADR 0121](0121-workspace-updates-require-idle.md)将Workspace definition update收窄为Idle-only，并以SecurityRevoked Turn interruption取代active lease revocation；本ADR的Session ownership、窄view与Turn pinning保持有效。
-2026-07-28：[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)将Workspace及其view fingerprint收窄为Runtime-instance-local opaque identity；restart重新resolve，不恢复旧Snapshot、grant或fingerprint family。
+2026-07-28：[ADR 0122](0122-workspace-fingerprints-are-runtime-local.md)曾将Workspace及其view fingerprint收窄为Runtime-instance-local opaque identity；该历史决策已被[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)取代。当前规则删除Workspace fingerprint族，不新增任何替代身份机制，执行一致性由exact `WorkspaceRevision`、Turn-pinned immutable `WorkspaceSnapshot`、Idle-only update和explicit reload/re-resolve保证。
