@@ -45,13 +45,37 @@ git show --stat HEAD
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 最新已接受决策：ADR 0123取代ADR 0122，删除`*Fingerprint`身份族并关闭O13/O14/O15；同一文档收敛同时以ToolSpec-only MVP关闭O16；
+- 本次换机存档前的最新功能决策提交：`76148ab docs: accept linear session replay`；本handoff存档提交位于其后；
+- 最近已接受决策：ADR 0123取代ADR 0122，删除`*Fingerprint`身份族并关闭O13/O14/O15；ToolSpec-only MVP关闭O16；O1延后到首个production Tool/Sandbox adapter前；O2以接受cold load完整线性replay关闭；
 - O14/O15不再是当前进行中的未决issue；其历史调查记录已被ADR 0123的方案B式决策取代（不新增Directive/Prompt fingerprint，使用private constructor、immutable content和explicit reload）；
-- 本轮ADR 0123文档修订前的base为`5a764bf docs: archive O14 design investigation`；
-- 本文随ADR 0123整组文档提交并push到`origin/dev`后继续作为跨机器恢复入口；新环境先检查远端与最新log，不要reset用户改动；
+- 当前恢复链上的关键提交为`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
+- 本文随当前进度存档提交push到`origin/dev`后继续作为跨机器恢复入口；新环境先检查远端与最新log，不要reset用户改动；
 - 仓库仍处于V2设计阶段，没有`Cargo.toml`、`src/`或自动化测试；
 - 下一实现里程碑仍是阶段6–8模型调用协同交付束；
+- 当前第一项工作是第三版AgentLoop评审L2；O1不在当前工作队列，O2已经关闭；
 - Rig只实现`ModelGateway` private `ProviderAdapter`中的单次provider attempt，不拥有ModelGateway或AgentLoop。
+
+## 最近进度存档
+
+```text
+4a3fd24 docs: replace fingerprints with explicit reload refs
+→ ADR 0123取代ADR 0122
+→ 删除当前架构中的*Fingerprint身份族
+→ 共享资源使用all-or-none explicit reload
+
+e6966a0 docs: defer sandbox capability review
+→ O1保持开放但延后
+→ production Tool/Sandbox adapter开始前恢复为条件性P0
+
+76148ab docs: accept linear session replay
+→ O2关闭
+→ cold load完整replay全部complete entries到physical current entry
+→ 不恢复process-local执行对象
+→ unfinished Turn保守terminalize后Session进入Idle
+→ MVP不建设ProjectionSnapshot/checkpoint index
+```
+
+换机后不要重新调查O1/O2。直接从[第三版AgentLoop设计评审](v2-design-review-3.md)的L2继续；需要核对全局状态时回到本文“下一步”和“已冻结关键决策”。
 
 ## 本轮完成
 
