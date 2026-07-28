@@ -64,7 +64,7 @@
 
 ### C. 安全 / fail-closed 缺口
 
-> 状态说明（2026-07-24）：C1、C2、C4已按[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)关闭；以下原始问题正文仅作评审历史记录。C3本轮不变，仍保持开放。
+> 状态说明（2026-07-27）：C1、C2、C4已按[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)关闭；以下原始问题正文仅作评审历史记录。C3/O1仍开放，但已延后到首个production Tool/Sandbox adapter开始前处理，不阻塞阶段6–8的ScriptedProviderAdapter、ModelGateway与Compaction实现。
 
 **C1 · scope override 单调性只是散文约束**
 `DefinitionOverrides.enabled/model_visible/user_visible` 是裸 `Option<bool>`，`PromptMergeMode` 只有 `Required`（强制 present）无对称的 `Forbidden`/sealed。解析为 Runtime→Agent→Session last-wins，resolver 无法区分「default disable（可被下层翻回）」与「required disable（锁定）」，Session override `enabled=true` 规范上可翻回 Runtime 的 disable。
@@ -226,7 +226,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - **C1（Prompt override单调性）**：**已关闭**。删除`DefinitionOverrides`；PromptService共享`PromptResourceView`，Agent/Session只保存PromptId selection，各Turn独立构建PromptSet。Runtime required Prompt不进入selection。
 - **C2（role×scope特权）**：**已关闭**。Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；ModelGateway不再执行Developer lowering。
-- **C3（Sandbox capability预执行拒绝）**：**保持开放，本轮不变**。不修改现有ToolSandbox设计。
+- **C3（Sandbox capability预执行拒绝）**：**保持开放但延后**。不阻塞当前阶段6–8；首个production Tool/Sandbox adapter开始前必须重新激活并关闭。
 - **C4（Skill content drift）**：**已关闭**。不采用Catalog revision/exact hash pin；SkillService在shared reload时发布SkillResourceView，并从captured shared root与WorkspaceSkillContext按Turn构建SkillView。active Turn继续使用captured view和已加载内容。
 
 针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
@@ -258,13 +258,13 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 ## 第一版开放项跟进（2026-07-27）
 
-本节对第一版评审中未划线或明确保持开放的条目重新核对。原始正文保留为历史依据，当前状态以本节为准。优先级含义：P0 = 对应模块任何production执行前必须关闭；P1 = 首个production vertical slice前冻结；P2 = 首轮实现/运维硬化阶段完成；P3 = 有真实产品需求或性能数据后处理。
+本节对第一版评审中未划线或明确保持开放的条目重新核对。原始正文保留为历史依据，当前状态以本节为准。优先级含义：P0 = 对应模块任何production执行前必须关闭；条件性P0 = 当前可延后，但一旦开始对应production adapter即升级为P0；P1 = 首个production vertical slice前冻结；P2 = 首轮实现/运维硬化阶段完成；P3 = 有真实产品需求或性能数据后处理。
 
 ### 当前问题跟进总览
 
 | ID | 问题 | 当前状态 | 优先级 |
 | --- | --- | --- | --- |
-| O1 | Sandbox capability无法强制时缺少预执行拒绝 | 仍开放，方案已明确 | P0 |
+| O1 | Sandbox capability无法强制时缺少预执行拒绝 | 延后：不阻塞阶段6–8；production Tool/Sandbox adapter前关闭 | 条件性P0 |
 | O2 | 长Session无持久projection snapshot/checkpoint index | 仍开放 | P2 |
 | O3 | 中段corruption无显式repair utility | 仍开放 | P2 |
 | O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
@@ -287,6 +287,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 #### O1 · Sandbox capability预执行拒绝
 
+- 延期边界：当前阶段只实现ScriptedProviderAdapter、ModelGateway、Compaction和非production Tool seam，不交付可产生真实OS/网络/进程副作用的Sandbox adapter，因此O1不进入当前工作队列。开始首个production Tool/Sandbox adapter时必须先冻结capability声明和预执行拒绝，不得以“已延后”为由裸跑。
 - 发生场景：Windows或container sandbox只能限制filesystem，无法强制network/process；Tool最终`PermissionSet`声明禁止联网，approval通过后adapter仍可直接联网。
 - 风险：文档声明受限执行，实际形成授权后裸跑；approval不能弥补enforcement缺失。
 - 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、`ToolExecutionStarted`前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入ToolSet构造与execution routing validation。权威回写到`tools.md`并关闭第二轮R7。
@@ -302,7 +303,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 原发生场景：Tool在authorization有效时打开文件handle，随后restrictive update要求撤权，旧handle仍可继续写入。
 - 复核结论：pi、Codex和Claude Code等同类产品在Session/Tool/Sandbox启动前冻结cwd与权限，Cancel通过abort/kill收口；均不承诺配置变化会让已打开fd自动失效。跨平台OS也无法可靠回滚已经进入kernel的write，通用RevocableHandle/handle registry只能缩小部分窗口，不能提供原承诺。
 - 关闭决议：Workspace definition不在active Turn热更新。Authority/host hard restriction发布sticky SecurityRevoked，停止新的MiniCore-sanctioned operation；越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，随后`TurnInterrupted(SecurityRevoked)`。不承诺动态关闭open fd、回滚kernel/provider side effect或建立Runtime-global handle registry。
-- 边界：O1仍独立开放。Sandbox无法强制某capability class时，必须在`ToolExecutionStarted`前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
+- 边界：O1仍独立开放但按上述条件延后。开始production Sandbox adapter时，无法强制某capability class必须在`ToolExecutionStarted`前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
 
 #### O12 · Workspace fingerprint恢复策略（已关闭，ADR 0123进一步取代）
 

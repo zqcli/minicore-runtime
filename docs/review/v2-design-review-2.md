@@ -149,15 +149,15 @@ INV-4xx  安全与授权（权威：workspace.md / tools.md）
 
 **5) 验收**：改造后全文检索上表 12 条的关键短语，确认非权威文档中不再存在整段复述（一句话概述除外）。
 
-### R7 · C3（sandbox 无法强制时的预执行拒绝）仍开放且无实现门槛挂钩
+### R7 · C3（sandbox 无法强制时的预执行拒绝）已延后并保留条件门禁
 
-第一轮 C3 明确"保持开放，本轮不变"，是唯一未关闭的安全类重大项。MVP 禁 bash 缓解大部分风险，且 Tools 不在阶段 6–8 交付束内，时序可容忍；但迁移记录未把"关闭 C3"挂为 Tool 子系统实现的前置门槛，存在被遗忘的风险。
+第一轮 C3 明确"保持开放，本轮不变"，是唯一未关闭的安全类重大项。当前排期决定将其延后：Tools不在阶段6–8交付束内，当前不实现会产生真实OS/网络/进程副作用的production Sandbox adapter；但开始首个production Tool/Sandbox adapter前，仍必须把"关闭 C3"作为条件性P0门禁，避免被遗忘。
 
 - 出处：评审一 C3 ↔ `tools.md` ↔ `migration/v1-to-v2.md`。
 
 **修复方案（低分歧，建议直接定案而非继续挂起）**：
 
-C3 本身没有真正的方案分歧——第一轮评审的原建议就是正确答案，拖延的风险大于定案成本。分两步：
+C3的技术方案没有实质分歧；以下保留原推荐方案，等production Tool/Sandbox adapter进入计划时直接定案，不要求阶段6–8提前实现：
 
 **1) 定案文本**（回写 `tools.md`「Policy、Approval 和 Sandbox」基础不变量清单，新增一条）：
 
@@ -255,7 +255,7 @@ pub trait ToolSandbox: Send + Sync {
 | 核心 seam / 不变量 | 自洽且防御性强，第一轮重大问题无复发 |
 | 残留矛盾 | 3 处具体（R1 语义歧义、R3 可见性矛盾、R4/R5 陈旧残留） |
 | 横切缺口 | R2 token 估算 owner仍需按current术语回写；ContentHash/fingerprint规范化已由ADR 0123删除，public ID/serde/basic types仍需wire/schema freeze |
-| 安全开放项 | 1 个（R7 = C3，时序可容忍，需挂实现门槛） |
+| 安全开放项 | 1 个（R7 = C3，已延后；production Sandbox adapter前为条件性P0门禁） |
 | 文档结构 | 权威归属表方向对，复述式同步是负债（R6）；refactor/ 应删除 |
 | 最大整体风险 | 零实现验证：冻结设计与 Rig 现实的首次碰撞 |
 
