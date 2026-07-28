@@ -238,7 +238,7 @@ name/description 更新只改变 metadata 和 `updated_at`，不产生 AgentRevi
 - Disable、Enable和Delete使用Agent lifecycle synchronization；
 - 重复进入相同状态幂等；
 - Deleted 不允许 Enable；
-- operation outcome unknown 时按 operation id 查询 durable head，不能重复创建其他状态事实；
+- command outcome unknown时按`CommandId`查询durable head，不能重复创建其他状态事实；
 - loaded Sessions可以接收readiness invalidation，但initiating UserMessage append前的durable AgentStatus validation才是authoritative决策点。
 
 ## Session
@@ -279,7 +279,7 @@ pub struct SessionModelConfig {
 }
 ```
 
-SessionDefinition只保存stable selection和用户偏好，不保存provider endpoint、credential、capabilities或client。Turn admission通过`ModelGateway.resolve_for_turn(...)`把它解析为exact `TurnModelSnapshot`；catalog change只影响future Turn，active Turn不执行cross-model fallback。
+SessionDefinition只保存stable selection和用户偏好，不保存provider endpoint、credential、capabilities或client。Turn admission通过`ModelGateway.resolve_for_turn(...)`把它解析为exact `Arc<TurnModelSnapshot>`；catalog change只影响future Turn，active Turn不执行cross-model fallback。
 
 基础关系：
 
@@ -360,17 +360,18 @@ Workspace definition与authority hard restriction分为两条路径：
 ```text
 Workspace definition patch on loaded Session
 → require SessionExecutionState = Idle；否则SessionBusy
-→ resolve/validate candidate
+→ resolve candidate并捕获candidate授权的Workspace-bound Prompt/Skill sources
+→ validate complete immutable WorkspaceSnapshot
 → durable commit 新 SessionDefinitionRevision
-→ execution owner原子发布新WorkspaceSnapshot
+→ execution owner原子发布new WorkspaceSnapshot及captured source values
 → 返回 update success
 
 authority/host hard restriction
 → authority或host先发布current policy/security fact
 → 通过current SessionExecutionHandle向affected loaded Session发布sticky SecurityRevoked
 → Idle直接失效old Snapshot；Starting取消candidate；active Turn停止新operation、truthful settle并TurnInterrupted
-→ 使用 current exact SessionDefinition 重新 resolve
-→ 发布受限的新 Snapshot，或 SessionReadiness = Unavailable
+→ 使用 current exact SessionDefinition 重新resolve，并捕获新authority允许的Workspace-bound Prompt/Skill sources
+→ 发布受限的新 Snapshot及captured source values，或 SessionReadiness = Unavailable
 → SessionDefinitionRevision 不变
 ```
 
@@ -690,7 +691,7 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 
 create 的 baseline 结果是 `Open + Unloaded`。create-and-load 是上层组合，不改变 create 的 durable 语义。
 
-create 使用预分配 SessionId 和 operation id。outcome unknown 时必须查询已发布 target，不能创建重复 Session。
+create使用预分配SessionId和外层`CommandId`。outcome unknown时必须查询已发布target，不能创建重复Session。
 
 ## Update Session Definition
 
@@ -706,9 +707,17 @@ expected SessionLifecycle = Open
 → publish revision N+1
 ```
 
-active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交并立即发布new Snapshot。successful update必须让loaded execution的current-definition projection与durable head一致；若projection apply失败，Session进入Unavailable并从durable truth reload，不能悄悄继续使用old head。
+active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交，并在resolve与Workspace-bound Prompt/Skill source capture全部成功后发布new Snapshot。successful update必须让loaded execution的current-definition projection与durable head一致；若projection apply失败，Session进入Unavailable并从durable truth reload，不能悄悄继续使用old head。
 
-metadata update与definition update分开，避免改标题导致execution Context fingerprint变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
+metadata update与definition update分开，避免改标题导致future Turn execution definition变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
+
+## Explicit Reload
+
+共享Prompt/Skill/Tool/Model资源不属于durable Agent或Session definition。Runtime初始化后，它们只通过显式`/reload`替换current immutable objects；filesystem/config watcher最多标记dirty diagnostic，不自动publication。
+
+`/reload`对共享资源执行two-phase流程：完整build candidates → validate所有required candidates → 短publication gate下原子替换四个current `Arc`。Turn admission在同一gate下只克隆四个current Arc；任一required candidate失败时保留全部old current values。active Turn继续使用已captured old Prompt/Skill/Tool/Model objects；reload成功后admit的future Turn使用new objects；completed Turn不更新。shared Prompt和Skill filesystem source在Runtime initialize/shared reload时读取为immutable captured bytes/content，reload失败继续使用old bytes。
+
+`/reload workspace`是Session lifecycle操作，不是共享资源publication。loaded Session必须处于`SessionExecutionState::Idle`：Idle时重新resolve current SessionDefinition.workspace，并在candidate阶段捕获Workspace-bound Prompt/Skill sources；Ready时成功替换Snapshot、失败保留old Snapshot，Unavailable时成功恢复Ready、失败保持Unavailable。Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel，也不原地替换active Turn Context。unloaded Session的Workspace在后续load时完成同一resolve/capture流程。
 
 ## Load Session
 
@@ -720,7 +729,9 @@ load 语义：
 → 读取 Agent durable head / AgentStatus
 → 读取 exact AgentRevisionRef 对应的 AgentDefinition
 → 重建 committed conversation projection
-→ WorkspaceResolver::resolve(definition.workspace)
+→ WorkspaceResolver::resolve(definition.workspace)得到candidate
+→ PromptService/SkillService捕获candidate授权的Workspace-bound sources
+→ candidate.finish得到immutable WorkspaceSnapshot
 → 注入 Runtime Prompt/Tool/Skill/Model dependencies
 → 重新进入synchronization，CAS lifecycle仍为Open且current revision未变化
 → 原子发布 loaded execution state
@@ -773,7 +784,7 @@ Loaded
 - Cancel current Turn默认保留FollowUp，但PrepareForUnload已经在stop-admission时清理queued FollowUp，因此不会在卸载前启动新Turn；
 - 已越过`ToolExecutionStarted`的Tool必须先确认truthful outcome或记录Abandoned，不能为了卸载直接drop；
 - 进入Idle且没有current append后关闭ingress/writer，Runtime才从loaded map移除handle；
-- 重复 unload 订阅同一个LifecycleControl completion generation并幂等返回同一个最终结果；effective deadline只能缩短，不能被后续请求延长。
+- 重复 unload 订阅同一个LifecycleControl completion waiter并幂等返回同一个最终结果；effective deadline只能缩短，不能被后续请求延长。
 
 Runtime shutdown 使用：
 
@@ -859,7 +870,7 @@ copy Workspace semantic fields，但分配 child-local WorkspaceRevision(1)
 copy source Model / SessionPromptSelection
 Open + Unloaded
 independent future revisions
-independent WorkspaceSnapshot / security target generation
+independent WorkspaceSnapshot / process-local security signal
 independent conversation branch
 ```
 
@@ -872,7 +883,6 @@ WorkspaceSnapshot / process-local security signal
 ToolSet / PromptSet / SkillView
 provider session
 pending Interaction / 任何process-local SessionIngress lane
-Session-scoped Tool grant
 ```
 
 fork使用staging + atomic publication。copy/remap完成后，若target projection仍有Running Turn，则先逐entry append InteractionResolved/ToolAbandoned和`TurnInterrupted(HistoricalFork)`；不得补synthetic ToolResult或`tool_round_completed`。full replay确认无Running/Pending/Started后，child publication才可在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
@@ -910,9 +920,12 @@ TurnContext entry至少保存：
 ```text
 SessionDefinitionRevision
 AgentRevisionRef
-Workspace/Prompt/Tool/Skill/Model exact fingerprints/references
-ExecutionContextFingerprint
+WorkspaceRevision
+TurnModelRef及必要actual typed model values
+safe diagnostics/provenance
 ```
+
+TurnContext metadata不保存request/context/transcript摘要，MVP也不从该entry重建旧execution environment。
 
 Agent current revision不参与Turn capture，因为Session已经pin exact AgentRevisionRef。Agent status的authoritative check与initiating UserMessage append使用同一个短lifecycle synchronization；capture前的status/readiness check只用于提前失败。
 
@@ -1050,7 +1063,7 @@ OutcomeUnknown
 
 优点：支持 staged rollout、promotion 和 rollback。
 
-缺点：增加 channel generation、promotion CAS、fork 漂移、GC roots 和 UI 状态。当前没有足够产品需求。
+缺点：增加 channel state、promotion CAS、fork 漂移、GC roots 和 UI 状态。当前没有足够产品需求。
 
 ### 决策
 
@@ -1147,7 +1160,7 @@ Agent release channel
 - load single-flight，且 definition update 先赢时旧 load publication CAS 失败；
 - load exact Agent revision，不用 current 替代；
 - Workspace unavailable 形成 Loaded + Unavailable；
-- unload stop-admission、grace deadline、fail-closed cancel与幂等completion generation；
+- unload stop-admission、grace deadline、fail-closed cancel与幂等completion waiter；
 - Session execution Idle/Starting/Running/Finishing；
 - Cancel sticky epoch发布后立即返回CancelAccepted并进入Finishing；
 - Finishing期间FollowUp可Queued，旧Turnterminal前不启动新Turn；
@@ -1185,7 +1198,7 @@ Agent release channel
 
 1. AgentDefinition 未来是否持有 Tool/Skill/Model constraints。
 2. Agent/Session immutable definition 的具体 persistence schema。
-3. Agent/Session entity head 的 operation id、CAS 和 durable store 形状。
+3. Agent/Session entity head 的CommandId correlation、CAS和durable store形状。
 4. Session list 如何投影 load/readiness/execution state。
 5. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
 6. physical purge、retention 和 revision reachability GC。

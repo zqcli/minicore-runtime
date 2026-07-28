@@ -5,7 +5,7 @@
 
 ## 目的
 
-本文定义 MiniCore Prompt 子系统的基础对象、所有权、共享资源 view、Turn 快照、用户输入规范化、模型上下文组装、校验、fingerprint 和 diagnostics。
+本文定义 MiniCore Prompt 子系统的基础对象、所有权、共享资源 view、Turn 快照、用户输入规范化、模型上下文组装、校验和 diagnostics。
 
 本文以以下关系为基础：
 
@@ -27,9 +27,8 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Prompt template 的最终语法；
 - provider-specific role、cache-control 和 payload encoding；
 - Compaction的cut、trigger和SessionExecutor orchestration；本文只固定CompactionSummary assembly contract；
-- Prompt fingerprint/content reference 的historical审计格式；MVP不执行exact same-Turn cold recovery；
-- Prompt hook、远程 Prompt source 或插件协议的具体实现；
-- PromptSet fingerprint 的持久化和审计格式。
+- Prompt content reference 的historical审计格式；MVP不执行exact same-Turn cold recovery；
+- Prompt hook、远程 Prompt source 或插件协议的具体实现。
 
 ## 决策摘要
 
@@ -52,19 +51,19 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - PromptSet在创建时绑定这些view，assembly时不再接受任意替代view；
 - 执行中变化的模型可见事实必须先进入 committed conversation，不保留 arbitrary current-call contribution lane；
 - `MessageRecord → ModelMessage` 的唯一转换发生在 Prompt 子系统；
-- 相同输入必须产生相同排序、输出和 fingerprint；
+- 相同输入必须产生相同排序和输出；
 - PromptService 和 PromptSet 都不执行 Tool、不加载 Skill、不保存 conversation，也不调用模型。
 
 ## 对象关系
 
 ```text
 MiniCoreRuntime
-└─ Arc<PromptService>
-   ├─ current Arc<PromptResourceView>
-   ├─ PromptSourceAdapter*
-   ├─ PromptContentCache
-   ├─ PromptPolicy
-   └─ PromptDiagnostics
+├─ Arc<PromptService>
+│  ├─ PromptSourceAdapter*
+│  ├─ PromptContentCache
+│  ├─ PromptPolicy
+│  └─ PromptDiagnostics
+└─ SharedResourceRoots.prompt: Arc<PromptResourceView>
 
 AgentDefinition
 └─ AgentPromptSelection
@@ -73,11 +72,11 @@ SessionDefinition
 └─ SessionPromptSelection
 
 Turn execution orchestration
-├─ PromptService.current_view() → Arc<PromptResourceView>
+├─ captured SharedResourceRoots.prompt → Arc<PromptResourceView>
 ├─ ToolSet.prompt_view()         → ToolPromptView
 ├─ SkillView.prompt_view()       → SkillPromptView
 └─ PromptService::for_turn(PromptTurnContext)
-   └─ PromptSet
+   └─ Arc<PromptSet>
       ├─ compose_user_message(UserMessageCompositionInput)
       │  └─ CanonicalUserMessage
       └─ assemble(PromptAssemblyInput)
@@ -91,9 +90,11 @@ Turn execution orchestration
 
 ```rust
 pub struct MiniCoreRuntime {
-    pub prompt_service: Arc<PromptService>,
-    pub tools: Arc<ToolService>,
-    pub skills: Arc<SkillService>,
+    prompt_service: Arc<PromptService>,
+    tool_service: Arc<ToolService>,
+    skill_service: Arc<SkillService>,
+    model_gateway: Arc<ModelGateway>,
+    shared_resources: RwLock<SharedResourceRoots>,
 }
 ```
 
@@ -101,9 +102,10 @@ Runtime 启动时：
 
 1. 创建 Prompt source adapters；
 2. 创建 `PromptService`；
-3. 加载 RuntimePrompt definitions 和 required policy；
-4. 初始化 Prompt content cache、policy 和 diagnostics；
-5. Runtime shutdown 时停止新的 source load，并释放 Prompt 子系统资源。
+3. `PromptService::initialize()`构建initial PromptResourceView；
+4. 四个module initial candidates全部成功后，Runtime安装SharedResourceRoots；
+5. 初始化Prompt content cache、policy和diagnostics；
+6. Runtime shutdown 时停止新的 source load，并释放 Prompt 子系统资源。
 
 ## AgentDefinition 和 SessionDefinition
 
@@ -166,11 +168,11 @@ pub struct Turn {
 Turn domain
 → identity、started_at、terminal-aware status
 
-Turn start execution metadata
-→ exact Prompt/Model/Workspace/Tool/Skill fingerprints and references
+Turn start durable metadata
+→ exact SessionDefinition/Agent/Workspace/Model refs、actual typed model values和safe diagnostics
 
-TurnExecutionContext
-→ PromptSet、ToolSet、captured SkillView和WorkspaceSnapshot等执行期对象
+TurnExecutionContext（process-local）
+→ Arc<PromptSet>、Arc<ToolSet>、captured Arc<SkillView>、Arc<WorkspaceSnapshot>和Arc<TurnModelSnapshot>
 ```
 
 Session execution 在 candidate admission 期间创建 PromptSet，并在 admission 失败或 Turn terminal 后随 Context 释放。PromptService 不创建 Turn，也不修改 TurnStatus。完整 capture、committed-only assembly 和 AgentLoop 关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
@@ -181,8 +183,8 @@ PromptService对外隐藏Prompt source discovery、共享view publication、内�
 
 ```rust
 pub struct PromptService {
-    current: Arc<PromptResourceView>,
     sources: Vec<Arc<dyn PromptSourceAdapter>>,
+    workspace_sources: Vec<Arc<dyn WorkspacePromptSourceAdapter>>,
     content_cache: PromptContentCache,
     policy: PromptPolicy,
     diagnostics: PromptDiagnostics,
@@ -193,20 +195,25 @@ pub struct PromptService {
 
 ```rust
 impl PromptService {
-    pub async fn initialize(&self) -> Result<(), PromptError>;
+    pub(crate) async fn initialize(&self) -> Result<Arc<PromptResourceView>, PromptError>;
 
-    pub fn current_view(&self) -> Arc<PromptResourceView>;
+    pub(crate) async fn build_reload_candidate(
+        &self,
+    ) -> Result<Arc<PromptResourceView>, PromptError>;
 
-    pub async fn reload(&self) -> Result<Arc<PromptResourceView>, PromptError>;
+    pub(crate) async fn capture_workspace_sources(
+        &self,
+        context: WorkspacePromptCaptureContext,
+    ) -> Result<Arc<[CapturedWorkspacePromptSource]>, PromptError>;
 
-    pub async fn for_turn(
+    pub(crate) async fn for_turn(
         &self,
         context: PromptTurnContext,
-    ) -> Result<PromptSet, PromptError>;
+    ) -> Result<Arc<PromptSet>, PromptError>;
 }
 ```
 
-`initialize()`构建第一个`PromptResourceView`，不创建Agent、Session或Turn。`reload()`先完整构建并校验candidate view，成功后原子替换current view；失败时继续保留旧view。
+`initialize()`构建并返回第一个shared `PromptResourceView`，读取并捕获所有required shared filesystem Prompt source content，不创建Agent、Session或Turn。`build_reload_candidate()`只准备并校验candidate，不发布。PromptService不保存current pointer，也没有publish方法；Runtime把candidate放入完整`SharedResourceRoots`后一次publication。任一Prompt/Skill/Tool/Model required candidate失败时old roots全部保持不变。watcher最多标记dirty，不自动publication。
 
 `for_turn()`完成：
 
@@ -234,18 +241,26 @@ PromptResourceView
 pub trait PromptSourceAdapter: Send + Sync {
     async fn discover(&self) -> Result<Vec<PromptDefinition>, PromptSourceError>;
 }
+
+pub(crate) trait WorkspacePromptSourceAdapter: Send + Sync {
+    async fn capture(
+        &self,
+        context: &WorkspacePromptCaptureContext,
+    ) -> Result<Vec<CapturedWorkspacePromptSource>, PromptSourceError>;
+}
 ```
 
-首版只需要Runtime built-in和用户配置source。AgentDefinition与SessionDefinition引用这些共享definition，不拥有独立source adapter。
+首版shared adapter只需要Runtime built-in和用户配置source；Workspace adapter只在Session load、Idle definition update或`/reload workspace` candidate阶段运行。AgentDefinition与SessionDefinition引用shared definition，不拥有独立source adapter。
 
-Workspace project instructions不进入共享PromptResourceView。`for_turn()`使用同一个Turn-pinned `WorkspacePromptContext`读取已授权source并生成User context section。该context至少包含canonical cwd、primary root、已授权Prompt source roots和WorkspacePromptFingerprint；它不包含write capability，也不能从filesystem-readable additional roots自行扩大Prompt source。active Turn期间Workspace definition不热更新；SecurityRevoked通过Turn control取消相关source operation。完整定义见[Workspace子系统架构设计](workspace.md)。
+Workspace project instructions不进入全局共享PromptResourceView。其filesystem source在Session load、Idle Workspace definition update或显式`/reload workspace`的candidate阶段经授权读取并捕获为不可变content；成功publication后由Turn-pinned `WorkspacePromptContext`直接携带。`for_turn()`只选择和解析该context中的captured sources，不在Turn内按path读取current file。该context包含canonical cwd、primary root和已授权captured Prompt sources；它不包含write capability，也不能从filesystem-readable additional roots自行扩大Prompt source。active Turn期间Workspace definition不热更新；Session lifecycle candidate operation负责source capture cancellation，并在publication前重新验证current authority/revision。完整定义见[Workspace子系统架构设计](workspace.md)。
+
+`capture_workspace_sources()`只接受Workspace candidate私有投影出的`WorkspacePromptCaptureContext`，只能在其中authorized Prompt roots内discover/read，并返回带model-safe relative location与exact authorization/provenance的immutable captured values。它不发布Snapshot；Session lifecycle只有在Workspace resolve、Prompt capture和Skill capture全部成功后才原子发布new WorkspaceSnapshot。
 
 ## PromptDefinition
 
 ```rust
 pub struct PromptDefinition {
     pub id: PromptId,
-    pub version: DefinitionVersion,
     pub key: PromptKey,
     pub name: String,
     pub description: Option<String>,
@@ -260,7 +275,7 @@ pub enum PromptProvenance {
 }
 ```
 
-共享Prompt content cache key不能只使用PromptId；必须覆盖definition version和provenance。Workspace project instruction保留独立`WorkspaceSourceRef`；SecurityRevoked获胜后，active Turn不得再次使用该PromptSet发起模型调用，terminal后new Turn必须从重新resolved Workspace捕获new context。
+共享Prompt content在candidate build期间已经capture并解析。cache可以按captured source object与parser输入复用，也可以在每次reload直接清空；correctness不能依赖PromptId或额外version命中。Workspace project instruction保留独立`WorkspaceSourceRef`；SecurityRevoked获胜后，active Turn不得再次使用该PromptSet发起模型调用，terminal后new Turn必须从重新resolved Workspace捕获new context。
 
 ```rust
 pub enum PromptRole {
@@ -283,14 +298,13 @@ Tool schema进入provider原生`tools`字段；ToolPromptView的说明性metadat
 
 所有普通selected Prompt按固定层级追加，不提供ReplaceBase或caller-controlled merge mode。Runtime required policy由PromptService单独持有并始终加入。
 
-PromptDefinition的identity是`PromptId + DefinitionVersion`。selection变化不产生新DefinitionVersion。
+`PromptId`是selection使用的稳定key；PromptDefinition实际正文属于当前immutable PromptResourceView。shared `/reload`可以在PromptId不变时发布new definition object，active PromptSet继续持有old object，future Turn捕获new object，不为该替换增加version或generation。
 
 ## 共享资源 View
 
 ```rust
-pub struct PromptResourceView {
+pub(crate) struct PromptResourceView {
     definitions: HashMap<PromptId, Arc<PromptDefinition>>,
-    pub fingerprint: PromptResourceFingerprint,
 }
 ```
 
@@ -298,25 +312,11 @@ PromptService是共享PromptDefinition的owner。Agent和Session只保存PromptI
 
 selection只适用于普通可选Prompt。Runtime required policy始终由PromptService加入，不出现在selection中。Agent selection只能选择声明为System且来源可信的definition；Session selection只能选择User definition。role不匹配或PromptId不存在时返回typed error，不能静默忽略。
 
-PromptResourceView发布后不可变。reload成功后只替换PromptService的current view；已经创建的PromptSet继续持有旧definition `Arc`，future Turn捕获新view。
+PromptResourceView发布后不可变。shared `/reload`成功后在同一个Runtime publication gate内与Skill/Tool/Model current roots一起替换；已经创建的PromptSet继续持有旧definition `Arc`，future Turn捕获新view。
 
 ## 外部窄 View
 
-PromptService不接收ToolService、ToolSet、SkillService或完整SkillView handle，只接收模型安全的只读view。
-
-```rust
-pub struct ToolPromptView {
-    pub specs: Arc<[ToolSpec]>,
-    pub tool_set_fingerprint: ToolSetFingerprint,
-}
-
-pub struct SkillPromptView {
-    pub entries: Arc<[ModelVisibleSkillMetadata]>,
-    pub fingerprint: SkillViewFingerprint,
-}
-```
-
-ToolPromptView 由当前 ToolSet 投影。它不能执行 Tool，也不暴露 executor、approval、policy、grant 或 Sandbox。
+PromptService不接收ToolService、ToolSet、SkillService或完整SkillView handle，只接收模型安全的只读view。`ToolPromptView`由Tools模块定义且只能由parent ToolSet构造；`SkillPromptView`由Skills模块定义且只能由parent SkillView构造。二者字段与constructor都private，只暴露只读slice getter，因此调用方不能从任意spec/metadata数组构造替代view。ToolPromptView不能执行Tool，也不暴露executor、approval、policy或Sandbox。MVP没有独立guidelines字段；PromptProfile只从Direct ToolSpec的name/description按ToolName投影User metadata。
 
 SkillPromptView由Turn捕获的SkillView投影。它不包含完整Skill正文，也不能通过PromptService加载Skill。
 
@@ -326,18 +326,20 @@ Turn 编排层交给 PromptService 的输入：
 
 ```rust
 pub struct PromptTurnContext {
-    pub agent: AgentRevisionRef,
-    pub session_id: SessionId,
-    pub session_revision: SessionDefinitionRevision,
-    pub resources: Arc<PromptResourceView>,
-    pub agent_prompts: AgentPromptSelection,
-    pub session_prompts: SessionPromptSelection,
-    pub workspace: WorkspacePromptContext,
-    pub model: TurnModelSnapshot,
-    pub tools: ToolPromptView,
-    pub skills: SkillPromptView,
+    agent: AgentRevisionRef,
+    session_id: SessionId,
+    session_revision: SessionDefinitionRevision,
+    resources: Arc<PromptResourceView>,
+    agent_prompts: AgentPromptSelection,
+    session_prompts: SessionPromptSelection,
+    workspace: WorkspacePromptContext,
+    model: Arc<TurnModelSnapshot>,
+    tools: ToolPromptView,
+    skills: SkillPromptView,
 }
 ```
+
+字段与constructor保持crate-private。只有TurnExecutionContext capture能从同一个captured `SharedResourceRoots`、WorkspaceSnapshot、parent ToolSet和parent SkillView构造该context；PromptService不接受普通caller自行拼装的PromptTurnContext。
 
 PromptTurnContext 不包含：
 
@@ -355,16 +357,15 @@ Turn mutable state
 
 ## PromptSet
 
-PromptSet 是某个 Turn 的不可变有效 Prompt 快照：
+PromptSet 是某个 Turn 的不可变有效 Prompt 快照，由 PromptService private constructor 创建并以 `Arc<PromptSet>` 交给 TurnExecutionContext：
 
 ```rust
 pub struct PromptSet {
+    resources: Arc<PromptResourceView>,
     profile: PromptProfile,
     definitions: Arc<[EffectivePromptDefinition]>,
     tools: ToolPromptView,
-    skill_view_fingerprint: SkillViewFingerprint,
-    model: TurnModelSnapshot,
-    fingerprint: PromptFingerprint,
+    model: Arc<TurnModelSnapshot>,
 }
 ```
 
@@ -382,7 +383,7 @@ impl PromptSet {
 }
 ```
 
-PromptSet 在同一个 Turn 中不原地修改。Prompt source reload 只影响 future PromptSet。
+PromptSet 在同一个 Turn 中不原地修改。shared Prompt source只能通过显式`/reload`发布新content；Workspace-bound Prompt source只能通过Session load、Idle definition update或显式`/reload workspace`发布。两者都只影响future PromptSet。
 
 ## PromptProfile
 
@@ -393,7 +394,7 @@ pub struct PromptProfile {
 }
 ```
 
-PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt baseline。`system`只包含Runtime required/base policy与Agent behavior；`user_context`包含Session、Workspace、Tool说明性metadata和Skill metadata，并在AgentRun assembly时编码为位于committed conversation之前的确定性User context。每个PromptSection自带definition provenance/source stamp；它与committed MessageRecord中的PromptContributionStamp不是同一类identity。SkillPromptView metadata在创建PromptProfile时被稳定渲染，PromptSet另外保存其fingerprint用于一致性校验。
+PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt baseline。`system`只包含Runtime required/base policy与Agent behavior；`user_context`包含Session、Workspace、Tool说明性metadata和Skill metadata，并在AgentRun assembly时编码为位于committed conversation之前的确定性User context。每个PromptSection自带definition provenance/source authorization；它与committed MessageRecord中的PromptContributionStamp不是同一类provenance。SkillPromptView metadata在创建PromptProfile时被稳定渲染，并由parent SkillView私有投影保证来源。
 
 固定顺序：
 
@@ -403,7 +404,7 @@ PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt bas
 3. Agent system instructions
 4. Session user instructions
 5. Workspace user instructions
-6. ToolPromptView user-facing guidelines metadata
+6. ToolPromptView中由Direct ToolSpec name/description确定性投影的User metadata
 7. SkillPromptView user metadata
 ```
 
@@ -413,7 +414,7 @@ PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt bas
 
 ```text
 Runtime/Agent/Session selected PromptDefinition
-→ PromptKey → PromptId → DefinitionVersion → provenance source identity
+→ PromptKey → PromptId → provenance source key
 
 Workspace instructions
 → model-safe relative path
@@ -449,13 +450,28 @@ pub struct UserMessageCompositionInput {
 }
 
 pub struct CanonicalUserMessage {
-    pub message: MessageRecord,
-    pub contribution_stamps: Arc<[PromptContributionStamp]>,
-    pub fingerprint: CanonicalUserMessageFingerprint,
+    message: MessageRecord,
+    contribution_stamps: Arc<[PromptContributionStamp]>,
+}
+
+impl CanonicalUserMessage {
+    pub fn message(&self) -> &MessageRecord;
+    pub fn contribution_stamps(&self) -> &[PromptContributionStamp];
+}
+
+pub struct PromptContributionStamp {
+    source: PromptContributionSource,
+    content_start: u32,
+    content_end_exclusive: u32,
+}
+
+impl PromptContributionStamp {
+    pub fn source(&self) -> &PromptContributionSource;
+    pub fn content_range(&self) -> Range<u32>;
 }
 ```
 
-CanonicalUserMessage 是可以进入 conversation commit 的标准值，不是裸字符串，也不是与 MessageRecord 并列的第二份消息状态。
+CanonicalUserMessage字段和constructor保持private，只能由PromptSet成功规范化后创建。它是可以进入conversation commit的标准值，不是裸字符串，也不是与MessageRecord并列的第二份消息状态。
 
 SkillIntent的完整Skill内容必须先由TurnExecutionContext使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。PromptSet不读取Skill文件，只校验contribution来源并将其规范化进MessageRecord。
 
@@ -467,22 +483,40 @@ PromptContribution 表示在输入规范化前由其他深模块产生的 typed 
 
 ```rust
 pub struct PromptContribution {
-    pub source: PromptContributionSource,
-    pub content: MessageContent,
+    source: PromptContributionSource,
+    content: MessageContent,
+}
+
+impl PromptContribution {
+    pub fn source(&self) -> &PromptContributionSource;
+    pub fn content(&self) -> &MessageContent;
 }
 
 pub enum PromptContributionSource {
     Skill(SkillContributionRef),
-    Tool(ToolName),
     Workspace(WorkspaceSourceRef),
+}
+
+pub struct WorkspaceSourceRef {
+    relative_location: WorkspaceRelativePath,
+    authorization: WorkspaceSourceAuthorization,
+}
+
+impl WorkspaceSourceRef {
+    pub(crate) fn relative_location(&self) -> &WorkspaceRelativePath;
+    pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization;
+}
+
+impl CapturedWorkspacePromptSource {
+    pub(crate) fn source_ref(&self) -> WorkspaceSourceRef;
 }
 ```
 
-`WorkspaceSourceRef` 必须携带 root/source identity、model-safe relative path 和 source authorization stamp；不能使用裸绝对 `PathBuf` 表达已授权 Workspace contribution。
+`WorkspaceSourceRef`字段和constructor保持private，只能从`CapturedWorkspacePromptSource::source_ref()`得到。它携带exact root/source provenance、model-safe relative path和source authorization values；不能使用裸绝对`PathBuf`表达已授权Workspace contribution。`PromptContributionStamp`只能由PromptSet在规范化成功后创建，caller不能伪造“已committed provenance”。
 
-`SkillContributionRef`携带SkillId和source authorization stamp。TurnExecutionContext负责确认entry来自本Turn捕获的SkillView并在实际读取时重新校验Workspace authorization；PromptSet把来源stamp固化到CanonicalUserMessage，正文完整性由CanonicalUserMessage自身的fingerprint覆盖。
+`SkillContributionRef`携带SkillId和source authorization provenance。TurnExecutionContext负责确认entry来自本Turn捕获的SkillView，并且SkillService lazy parse只能使用entry captured bytes；PromptSet把来源provenance固化到CanonicalUserMessage，正文正确性由实际规范化后的MessageRecord内容承担。
 
-PromptContribution固定为User内容，不能声明System role。producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
+PromptContribution字段和constructor保持private，只能由已授权producer seam创建；它固定为User内容，不能声明System role。producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
 
 Required contribution 获取失败必须显式返回 unavailable/error，不能通过 vector 缺项静默忽略。
 
@@ -516,16 +550,17 @@ pub enum PromptAssemblyInput<'a> {
 }
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedCompactionSourceView`只能由同一State按validated Compaction scope、anchor、previous checkpoint、coverage provenance和stable-unit boundaries构造。它把不进入coverage的protected context与真正待摘要的messages分开；active scope的protected context包含current effective prefix through selected exact initiating/Steer UserMessage anchor，不能为了让summary request fit而静默删减。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint/fingerprint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
+variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedCompactionSourceView`只能由同一State按validated Compaction scope、anchor、previous checkpoint、coverage provenance和exact first/last `EntryId` boundaries构造。它把不进入coverage的protected context与真正待摘要的messages分开；active scope的protected context包含current effective prefix through selected exact initiating/Steer UserMessage anchor，不能为了让summary request fit而静默删减。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted scope-aware committed source。directive中的effective summary budget必须来自Compaction plan，并与pinned model fingerprint一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted scope-aware committed source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
 planning前，SessionExecutor从同一个PromptSet取得窄的固定开销basis：
 
 ```rust
 pub struct CompactionSummaryAssemblyBasis {
     pub fixed_prompt_tokens: u64,
-    pub fingerprint: CompactionSummaryAssemblyBasisFingerprint,
+    pub system_sections: Arc<[PromptSection]>,
+    pub output_contract: OutputContract,
 }
 
 impl PromptSet {
@@ -535,7 +570,7 @@ impl PromptSet {
 }
 ```
 
-该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis fingerprint与实际固定sections一致。
+该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis exact structural values与实际固定sections一致。
 
 最终输出：
 
@@ -547,24 +582,23 @@ pub struct AssembledModelContext {
     pub output_contract: Option<OutputContract>,
     pub contribution_stamps: Arc<[PromptContributionStamp]>,
     pub diagnostics: Arc<[PromptDiagnostic]>,
-    pub fingerprint: AssembledModelContextFingerprint,
     pub(crate) assembly_proof: PromptAssemblyProof,
 }
 
 pub(crate) struct PromptAssemblyProof {
     pub purpose: ModelCallPurpose,
-    pub turn_model_fingerprint: TurnModelFingerprint,
-    pub output_contract_hash: Option<ContentHash>,
+    pub turn_model: TurnModelRef,
+    pub output_contract: Option<OutputContract>,
     pub compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
 }
 
 pub(crate) struct CompactionSummaryBudgetProof {
     pub max_output_tokens: NonZeroU32,
-    pub budget_fingerprint: CompactionSummaryBudgetFingerprint,
+    pub budget: CompactionSummaryBudget,
 }
 ```
 
-AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、TurnModelSnapshot、OutputContract binding，以及CompactionSummary request max output与budget fingerprint。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
+AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、exact `TurnModelRef`、OutputContract binding，以及CompactionSummary request max output与exact budget values。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
 `MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
 
@@ -575,63 +609,35 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 - System section和前置User context顺序确定；
 - required Runtime policy 未缺失；
 - PromptKey 和 contribution source 不发生非法重复；
-- PromptSet 内绑定的 ToolPromptView 携带 parent ToolSetFingerprint；该 cross-binding 在 TurnExecutionContext capture/final validation 时完成；
+- PromptSet 内绑定的 ToolPromptView 必须是parent ToolSet私有投影；该 cross-binding 在 TurnExecutionContext capture/final validation 时通过对象所有权完成；
 - 不存在 orphan ToolResult；
 - 不存在非法截断的 unresolved ToolCall；
 - initiating UserMessage 未遗漏或放到 ToolCall/ToolResult 中间；
-- committed MessageRecord中的SkillContributionRef和source stamp与规范化时保存的stamp一致；
+- committed MessageRecord中的SkillContributionRef和source authorization provenance与规范化时保存的provenance一致；
 - required contribution 在输入规范化阶段缺失时失败；
 - 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
-- CompactionSummary directive budget与assembly proof exact match，AgentRun不携带Compaction budget proof；
+- CompactionSummary directive budget与assembly proof exact structural values match，AgentRun不携带Compaction budget proof；
 - 最终大小和 token estimate 不超过有效模型限制。
 
 PromptSet 不自行执行 compaction。超限时返回结构化 PromptError，由 Session execution 决定后续行为。
-
-## Fingerprint
-
-至少需要：
-
-```text
-PromptFingerprint
-CanonicalUserMessageFingerprint
-AssembledModelContextFingerprint
-```
-
-PromptSet fingerprint 至少覆盖：
-
-```text
-PromptResourceView fingerprint
-selected PromptId集合
-PromptDefinition identity/version
-PromptDefinition provenance/source authorization stamp
-System/User分配
-WorkspacePromptFingerprint
-ToolPromptView.tool_set_fingerprint
-SkillPromptView fingerprint
-Model capability projection
-稳定 section 顺序
-```
-
-AssembledModelContext fingerprint 另外覆盖 committed conversation fingerprint、output contract 和 model-call purpose。PromptContribution 已固化在 committed MessageRecord 及其 stamp 中，不作为独立 current-call 输入重复计算。
-
-Fingerprint 用于一致性校验、diagnostics、测试和未来 provider cache，不代替 secret redaction。
 
 ## 调用流程
 
 ```text
 MiniCoreRuntime 启动
 → 创建 Arc<PromptService>
-→ PromptService.initialize()
+→ PromptService.initialize()返回initial PromptResourceView
+→ 四个module initial roots全部成功后，Runtime安装SharedResourceRoots
 
 candidate Turn admission
-├─ PromptService.current_view() → Arc<PromptResourceView>
-├─ SkillService.current_view(context) → Arc<SkillView> → SkillPromptView
-└─ ToolService.for_turn(pinned context) → ToolSet.prompt_view()
+├─ shared publication gate克隆PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
+├─ SkillService.for_turn(captured resources, context) → Arc<SkillView> → SkillPromptView
+└─ ToolService.for_turn(captured tool resources, context) → Arc<ToolSet> → ToolPromptView
 
 三个view均就绪
 → PromptService.for_turn(PromptTurnContext)
-→ PromptSet
+→ Arc<PromptSet>
 
 用户输入
 → TurnExecutionContext.compose_message(PromptIntent)
@@ -653,7 +659,7 @@ PromptService 不主动调用 ToolService、SkillService 或 ModelGateway。
 
 Codex 每次模型调用构造一个最终 `Prompt`，其中包含 conversation input、ToolSpec、base instructions 和 output schema。Skill/plugin injection 先转成 input item，再进入最终 Prompt。MiniCore 保留这种“每次调用形成唯一最终 Prompt”的思路，但把分散在 Turn 流程中的组装规则收敛到 PromptService/PromptSet。
 
-pi 使用纯 `buildSystemPrompt(options)` 组装 custom/base prompt、tools、context files、skills、date 和 cwd。MiniCore 保留其纯确定性组装思路，但使用不可变 PromptSet、typed contribution 和 fingerprint，避免 active tool/resource 变化导致局部重建分裂。
+pi 使用纯 `buildSystemPrompt(options)` 组装 custom/base prompt、tools、context files、skills、date 和 cwd。MiniCore 保留其纯确定性组装思路，但使用不可变 PromptSet、typed contribution 和 private Arc ownership，避免 active tool/resource 变化导致局部重建分裂。
 
 Claude Code使用managed、user、project、local和path-scoped instructions，并对Skill内容使用按需加载。MiniCore同样共享资源、按Session构建上下文；只保留System与User两种Prompt role。
 
@@ -685,11 +691,12 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 | 对象 | Owner |
 | --- | --- |
 | `Arc<PromptService>` 生命周期 | MiniCoreRuntime |
-| PromptResourceView、Prompt definitions/source/cache | PromptService |
+| PromptResourceView candidate、Prompt definitions/source/cache | PromptService |
+| complete SharedResourceRoots publication | MiniCoreRuntime |
 | AgentPromptSelection | exact AgentDefinition revision |
 | SessionPromptSelection / Workspace definition | exact SessionDefinition revision |
-| Workspace project Prompt discovery、definition 和正文 cache | PromptService，经 WorkspacePromptContext 授权 |
-| PromptSet | Turn 执行上下文 |
+| Workspace project Prompt discovery/capture与正文cache | PromptService，经WorkspacePromptCaptureContext授权 |
+| Arc<PromptSet> | Turn 执行上下文 |
 | ToolPromptView | ToolSet 投影 |
 | SkillPromptView | SkillView 投影 |
 | LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext保证view来源和读取授权 |
@@ -706,30 +713,30 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Prompt capture使用exact AgentRevisionRef、SessionDefinitionRevision和当时的current PromptResourceView，不读取Agent current；
 - Turn 领域对象不持有完整 PromptSet；
 - TurnExecutionContext 在本 Turn 内复用同一个不可变 PromptSet；
-- PromptSet在创建时固定PromptResourceView、ToolPromptView、渲染后的SkillPromptView metadata和相应fingerprint；
+- PromptSet在创建时固定PromptResourceView、ToolPromptView和渲染后的SkillPromptView metadata；
 - PromptService 不主动调用 ToolService、SkillService 或 ModelGateway；
 - PromptSet 不执行 Tool、不加载 Skill、不读写 conversation storage；
 - Runtime required policy不进入selection，不可被Agent或Session关闭；
 - Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；
 - Workspace file readable 不等于可作为 Prompt source；
-- PromptService 只能从 WorkspacePromptContext 授权的 source roots 加载 project Prompt；
-- Workspace project instruction必须保留typed WorkspaceSourceRef/source stamp，cache和fingerprint不能只按path复用；
-- Prompt baseline使用固定信任层顺序；层内使用stable identity全序，不存在caller-controlled priority；
+- PromptService只能在candidate阶段从WorkspacePromptCaptureContext授权roots读取project Prompt；`for_turn()`只解析WorkspacePromptContext中的captured sources；
+- Workspace project instruction必须保留typed WorkspaceSourceRef/source authorization provenance和captured content，cache不能只按path复用；
+- Prompt baseline使用固定信任层顺序；层内使用stable typed keys全序，不存在caller-controlled priority；
 - 同一固定层内重复PromptKey fail closed；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
 - assembly只接受来自CommittedConversationState的trusted full/prefix view和closed typed call policy，不接受任意Tool view或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
-- 相同输入产生相同排序和 fingerprint；
-- Prompt reload先构建candidate view，成功后原子替换current view；不原地修改active PromptSet。
+- 相同输入产生相同排序和输出；
+- Prompt reload先构建candidate PromptResourceView，四个shared candidates全部成功后在Runtime publication gate内替换current root；不原地修改active PromptSet。
 
 ## 后续问题
 
 1. PromptContent 是内联正文还是 immutable content reference。
-2. PromptResourceView的内部publication和cache eviction实现。
+2. PromptResourceView candidate build和content cache eviction实现。
 3. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
 4. SkillIntent、UserMessageCompositionInput 与 committed contribution stamp 的精确字段。
-5. ToolPromptView 是否包含 guidelines，以及 ToolSpec 如何进入最终 Prompt。
-6. PromptSet fingerprint 的historical序列化格式；包含Runtime-local Workspace child fingerprint的值不用于Turn cold resume。
+5. 未来若ToolSpec description无法表达真实per-tool使用约束，是否新增typed guidelines；MVP不支持独立guidelines字段。
+6. Historical PromptSet审计格式；MVP不用于Turn cold resume。
 7. Prompt content cache 的 key、eviction 和失效策略。
 8. Prompt hook 和动态 Context provider 是否能在不建立未提交模型可见旁路的前提下接入。
 9. Provider cache效果和canonical instruction boundary验证。

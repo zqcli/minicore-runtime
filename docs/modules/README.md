@@ -15,7 +15,7 @@ MiniCoreRuntime
             └─ Interaction*
 ```
 
-`MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面，并在 Runtime 生命周期内拥有三个长生命周期深模块 `PromptService`、`ToolService`、`SkillService`。Turn执行边界捕获或产生独立不可变的有效对象（`PromptSet` / `ToolSet` / `SkillView`）。领域基础模型见 [MiniCore 架构](../architecture.md)。
+`MiniCoreRuntime` 是外部宿主接触 MiniCore 的唯一顶层门面，并在 Runtime 生命周期内拥有四个Runtime-owned共享深模块 `PromptService`、`ToolService`、`SkillService`、`ModelGateway`。Turn执行边界捕获或产生独立不可变的有效对象（`WorkspaceSnapshot` / `PromptSet` / `ToolSet` / `SkillView` / `TurnModelSnapshot`）。四个current root由`MiniCoreRuntime`的private `SharedResourceRoots`整体持有，只在初始化或显式`/reload`成功后原子替换；各Service不单独保存/publish current pointer，active Turn继续使用已捕获的immutable `Arc`。领域基础模型见 [MiniCore 架构](../architecture.md)。
 
 当前仓库仍处于设计完成、生产实现待启动阶段，没有Rust crate或自动化测试。下一实现里程碑是[迁移记录](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)中的阶段6–8协同交付束：SessionExecutor、ModelGateway和Compaction通过同一scripted vertical slice共同落地。
 
@@ -25,18 +25,18 @@ MiniCoreRuntime
 - [Agent 与 Session 生命周期](agent-session-lifecycle.md)：Agent 定义与 `AgentRevision`、Session 定义与 `SessionDefinitionRevision`、create/load/unload/archive/fork、durable lifecycle 与 loaded execution state 的分离。
 - [Workspace](workspace.md)：Session-owned Workspace definition、roots/cwd 合法域、trust 与 source authorization、filesystem capability，以及 Prompt/Tool/Skill 消费的窄只读 view。
 - [Prompt](prompt.md)：`PromptService`共享`PromptResourceView`，各Turn独立构建`PromptSet`；`compose_user_message`产出`CanonicalUserMessage`，`assemble(...) -> AssembledModelContext`是模型可见上下文组装的唯一seam。
-- [Skills](skills.md)：`SkillService`发布reloadable `SkillView`，与`LoadedSkill`分离；metadata discovery和正文按需加载。
-- [Tools](tools.md)：`ToolService`通过`for_turn(...) -> ToolSet`原子绑定模型可见ToolSpec与executor route；registry、policy、approval、grants、sandbox与executor；每个loaded Session另有独立file mutation queue。
-- [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、fingerprint、reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
+- [Skills](skills.md)：`SkillService`发布shared `SkillResourceView`，按Turn构建immutable `SkillView`并与`LoadedSkill`分离；metadata discovery和正文按需加载。
+- [Tools](tools.md)：`ToolService`通过`for_turn(...) -> Arc<ToolSet>`原子绑定模型可见ToolSpec与executor route；registry、policy、per-call approval、sandbox与executor；每个loaded Session另有独立file mutation queue。
+- [Turn 执行上下文](turn-execution-context.md)：`TurnExecutionContext` 的 capture 依赖图、exact refs、immutable Arc、explicit reload 线性化、cancellation/Steer/FollowUp 与 AgentLoop 分界。
 - [Turn / Item / Interaction](turn-item-interaction.md)：Turn 边界、`ItemContent`、`ToolInvocation` 合并 identity、`Interaction` request/resolution、UI/MiniCore职责、terminal cleanup 与保守恢复。
 - [Conversation 与 SessionStorage](conversation-storage.md)：per-session append-only by-entry JSONL tree、`SessionWriter::append` 唯一写 seam、entry parent tree、conversation projection、fork 与 recovery。
 - [Session 执行](session-execution.md)：一个loaded Session一个`SessionExecutor`、per-session semantic `SessionIngress` lanes、严格串行current `RunningOperation`、per-Turn Steer/FollowUp FIFO、`WaitingForUserInput`、即时CancelAccepted与Finishing结构化收口、sticky emergency/lifecycle control、AgentLoop `NeedModel | NeedTools | Finished`和multi-session并发。
-- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)`固定`TurnModelSnapshot`、`generate_model_turn(...)`唯一真实模型调用；每个Gateway operation最多执行一个provider attempt，SessionExecutor拥有有限logical retry。stream/auth/usage/cache/continuation由ModelGateway拥有，private`ProviderAdapter`只执行provider attempt映射与调用，首个production实现为`RigProviderAdapter`。
+- [ModelGateway](model-gateway.md)：`resolve_for_turn(...)`固定`Arc<TurnModelSnapshot>`、`generate_model_turn(...)`唯一真实模型调用；每个Gateway operation最多执行一个provider attempt，SessionExecutor拥有有限logical retry。stream/auth/usage/cache/continuation由ModelGateway拥有，private`ProviderAdapter`只执行provider attempt映射与调用，首个production实现为`RigProviderAdapter`。
 - [Compaction](compaction.md)：portable rolling summary、stable-unit safe cut、leading summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget、`Compacting` 执行阶段与 `StoredCompaction` 恢复规则。
 
 ## 相关决策
 
-长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)、[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)、[失败由事实拥有模块分类、恢复由执行拥有者决定（ADR 0120）](../adr/0120-failures-stay-with-owning-modules.md)、[Workspace Idle-only update（ADR 0121）](../adr/0121-workspace-updates-require-idle.md)以及[Runtime-local Workspace fingerprint（ADR 0122）](../adr/0122-workspace-fingerprints-are-runtime-local.md)。ADR 0120首版只应用于ModelGateway response validation，不建立独立Error module。行为与接口以各模块文档、协议文档和ADR为权威。
+长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)、[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)、[失败由事实拥有模块分类、恢复由执行拥有者决定（ADR 0120）](../adr/0120-failures-stay-with-owning-modules.md)、[Workspace Idle-only update（ADR 0121）](../adr/0121-workspace-updates-require-idle.md)、[ADR 0122（已被0123取代的Workspace fingerprint历史决策）](../adr/0122-workspace-fingerprints-are-runtime-local.md)以及[Exact Ref、不可变快照与显式Reload（ADR 0123）](../adr/0123-identity-uses-refs-and-explicit-reload.md)。ADR 0120首版只应用于ModelGateway response validation，不建立独立Error module。行为与接口以各模块文档、协议文档和ADR为权威。
 
 ## 权威归属
 
@@ -49,8 +49,8 @@ MiniCoreRuntime
 | Workspace definition、roots、trust、authorization、filesystem capability | [Workspace](workspace.md) |
 | PromptSet、CanonicalUserMessage、PromptIntent 展开、AssembledModelContext | [Prompt](prompt.md) |
 | SkillService、SkillView、LoadedSkill、lazy load、reload、cache | [Skills](skills.md) |
-| ToolService、ToolSet、policy、approval、grants、sandbox、executor、Session-local file mutation queue | [Tools](tools.md) |
-| TurnExecutionContext capture、fingerprint、reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
+| ToolService、ToolSet、policy、per-call approval、sandbox、executor、Session-local file mutation queue | [Tools](tools.md) |
+| TurnExecutionContext capture、exact refs、immutable Arc、explicit reload 线性化 | [Turn 执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction identity、lifecycle、terminal cleanup | [Turn / Item / Interaction](turn-item-interaction.md) |
 | UserQuestion producer seam与ask-user Tool route | [Tools](tools.md) |
 | TurnExecutionPhase与WaitingForUserInput状态语义 | [Agent 与 Session 生命周期](agent-session-lifecycle.md) |

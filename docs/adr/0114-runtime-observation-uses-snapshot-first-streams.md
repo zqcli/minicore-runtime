@@ -18,7 +18,7 @@ pi、Codex和Claude Code公开行为更接近“当前状态或transcript恢复 
 5. Turn/Item顺序由Snapshot/Query ordered Vec和new-Item StateEvent发送顺序表达，不公开DisplaySequence；Tool terminal update按ItemId更新原位置，ProgressEvent不建立durable order。ProgressEvent仍可合并或丢弃。AgentRun的AgentMessage/Reasoning started与delta使用稳定ItemId；同ItemId的`item_completed`只在final candidate append/apply后作为StateEvent发布。CompactionSummary不创建ItemId。漏掉全部progress时，final StateEvent和下一次Snapshot仍携带完整final view。
 6. CommandResponse只返回typed outcome，不返回cursor watermark。QueryResponse只返回typed data与可选领域revision，不返回cursor stamp。
 7. Runtime scope和每个Session scope仍使用独立owner、Snapshot和event stream；不建立跨scope全局顺序。该变化不影响多个SessionExecutor并行Running。
-8. 实现可以保留private monotonic generation用于原子publication、debug或测试，但该值不进入公开协议，也不承诺跨restart连续。
+8. 原子publication依赖owner内同步与immutable published view，不定义private publication generation、cursor或watermark作为正确性机制。普通metrics counter可以存在，但不能参与Snapshot/Event acceptance或ordering判断。
 
 ## 后果
 

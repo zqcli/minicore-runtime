@@ -39,16 +39,16 @@ git show --stat HEAD
 4. [Prompt模块](../modules/prompt.md)
 5. [ADR 0112：Compaction active-Turn checkpoint与模型感知预算](../adr/0112-compaction-supports-active-turn-checkpoints.md)
 6. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
-7. [ADR 0122：Workspace fingerprint只在当前Runtime有效](../adr/0122-workspace-fingerprints-are-runtime-local.md)
+7. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
 8. [架构总览](../architecture.md)
 
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 最新已接受决策：ADR 0122关闭O12；提交为`ca2b02e docs: make workspace fingerprints runtime-local`；
-- O14仍是当前进行中的未决issue；本轮只完成调查和候选方案评估，没有修改权威Compaction/Prompt设计，没有创建或接受ADR 0123；
-- 前一项Workspace设计提交：`9aea732 docs: require idle for workspace updates`；
-- 发布条件：本handoff提交必须与`ca2b02e`一并push到`origin/dev`后，本文才作为跨机器恢复入口；本轮结束前执行该push。若新环境pull后缺少本文，先检查远端与最新log，不要reset用户改动；
+- 最新已接受决策：ADR 0123取代ADR 0122，删除`*Fingerprint`身份族并关闭O13/O14/O15；同一文档收敛同时以ToolSpec-only MVP关闭O16；
+- O14/O15不再是当前进行中的未决issue；其历史调查记录已被ADR 0123的方案B式决策取代（不新增Directive/Prompt fingerprint，使用private constructor、immutable content和explicit reload）；
+- 本轮ADR 0123文档修订前的base为`5a764bf docs: archive O14 design investigation`；
+- 本文随ADR 0123整组文档提交并push到`origin/dev`后继续作为跨机器恢复入口；新环境先检查远端与最新log，不要reset用户改动；
 - 仓库仍处于V2设计阶段，没有`Cargo.toml`、`src/`或自动化测试；
 - 下一实现里程碑仍是阶段6–8模型调用协同交付束；
 - Rig只实现`ModelGateway` private `ProviderAdapter`中的单次provider attempt，不拥有ModelGateway或AgentLoop。
@@ -65,9 +65,9 @@ git show --stat HEAD
 - Idle直接失效old Snapshot并重新resolve；Starting取消candidate后resolve；Running/Finishing停止新operation、truthful settle started Tool、append`TurnInterrupted(SecurityRevoked)`后resolve；
 - resolve success发布new Snapshot并Ready，failure进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`；
 - 不承诺动态撤销open OS handle、回滚已进入kernel/provider的operation或建立Runtime-global handle registry；
-- O10和O11关闭；O1 Sandbox fail-closed保持开放。O12由ADR 0122以放弃跨Runtime Workspace fingerprint恢复关闭。
+- O10和O11关闭；O1 Sandbox fail-closed保持开放。O12先由ADR 0122以放弃跨Runtime Workspace fingerprint恢复关闭，现由ADR 0123取代为删除fingerprint族。
 
-本轮新增[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)，关闭O12：
+随后新增[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)，关闭O12（现已被ADR 0123取代）：
 
 - durable Agent/Session definition与conversation history继续保留；
 - loaded Session、WorkspaceSnapshot、各view fingerprint、Tool grant、authorization cache和旧execution Context不跨Runtime恢复；
@@ -75,17 +75,30 @@ git show --stat HEAD
 - restart后的unfinished Turn保守关闭，MVP不提供exact same-Turn resume；
 - 删除Workspace fingerprint canonical encoding、algorithm version和golden-vector要求。
 
-## 当前进行中：O14调查存档
+本轮新增[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)，关闭O13/O14/O15并取代ADR 0122；同轮Prompt/Tool接口收窄关闭O16：
 
-O14是`CompactionSummaryDirective`正文与fingerprint coverage是否需要独立冻结的问题，当前仍开放。权威文档仍保持原设计：
+- MVP删除所有命名`*Fingerprint`类型，不新增`WorkspaceResolutionId`、`ToolSetId`、view generation或其他替代identity；
+- durable definition继续使用exact refs/revisions：`AgentRevisionRef`、`SessionDefinitionRevision`、`WorkspaceRevision`、`ModelDefinitionVersion`及对应immutable definition retention；ledger/domain correlation继续使用`SessionId`、`TurnId`、`ItemId`、`RequestId`、`EntryId`和`ToolCallId`；
+- active Turn持有同一组immutable `Arc<WorkspaceSnapshot>`、`Arc<PromptResourceView>`、`Arc<SkillView>`、`Arc<ToolSet>`、`Arc<PromptSet>`和`Arc<TurnModelSnapshot>`；private constructors阻止跨capture拼接任意view；
+- Prompt/Skill/Tool/Model资源只在Runtime初始化或显式`/reload`后替换current immutable object；watcher最多标记dirty，不自动publication；active Turn继续使用old captured objects；
+- `/reload`对Prompt/Skill/Tool/Model执行two-phase流程：各module只build/validate candidate，Runtime在短publication gate内整体替换private `SharedResourceRoots`（PromptResourceView、SkillResourceView、ToolResourceView、ModelCatalogView）；该bundle没有ID/version/generation，任一required candidate失败时保留完整old roots。`/reload workspace`继续要求Session Idle，非Idle返回`SessionBusy`；
+- shared Prompt/Skill filesystem source在Runtime initialize或shared `/reload`时捕获；Workspace-bound Prompt/Skill source在Session load、Idle definition update或`/reload workspace`时捕获并随WorkspaceSnapshot发布；Skill可以lazy parse captured bytes，不能在Turn内按path重新读取current file；
+- Tool approval在MVP只支持per-call `AllowOnce/AllowWith`，不保存`ToolGrantStore`、Turn grant或Session grant；
+- logical retry复用同一个`Arc<ModelCallRequest>`，只验证Turn仍Running、`execution_version`、exact `ConversationCheckpoint.entry_id`、`current_operation`仍为持有该request的对应retry slot且control basis未变；不重新assemble，也不比较context摘要；
+- Compaction operation持有同一个`Arc<CompactionPlan>`（settings、budget、scope、source）与由其组装出的同一个`Arc<ModelCallRequest>`，exact rendered directive随request固定；append前验证exact source checkpoint、scope、boundaries、provenance、current Turn/version/control和actual typed entries；
+- `StoredTurnContext`和`StoredCompaction`删除Prompt/Tool/Skill/Workspace/Model/Execution、transcript、plan、budget、directive、summary等fingerprint/hash字段，只保存exact durable refs、typed scope/boundaries/provenance、safe diagnostics和model-call metadata。
+
+## O14调查存档（历史，已由ADR 0123关闭）
+
+O14曾是`CompactionSummaryDirective`正文与fingerprint coverage是否需要独立冻结的问题。以下保留为历史调查记录，不再是当前待办。当前权威决策见[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)：不新增`CompactionSummaryDirectiveFingerprint`，Directive由Compaction唯一private constructor创建，模板/格式不兼容变化递增`CompactionSummaryFormatVersion`，operation复用同一个`Arc<CompactionPlan>`与`Arc<ModelCallRequest>`。
 
 ```rust
 pub struct CompactionSummaryDirective {
-    pub format_version: CompactionSummaryFormatVersion,
-    pub scope: CompactionSummaryScope,
-    pub instruction: Arc<str>,
-    pub max_output_tokens: NonZeroU32,
-    pub max_summary_bytes: usize,
+    format_version: CompactionSummaryFormatVersion,
+    scope: CompactionSummaryScope,
+    instruction: Arc<str>,
+    max_output_tokens: NonZeroU32,
+    max_summary_bytes: usize,
 }
 ```
 
@@ -119,7 +132,7 @@ NeedModel / ContextOverflow
 - Gemini CLI源码：<https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/context/chatCompressionService.ts>与<https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/prompts/snippets.ts>，关键词`getCompressionPrompt`、`systemInstruction`、verification；
 - Claude官方文档：<https://platform.claude.com/docs/en/build-with-claude/compaction>，关键词`compact_20260112`和`instructions`。
 
-已讨论但尚未接受的两个方案：
+历史上曾讨论但当时未接受的两个方案（现由ADR 0123关闭，保留为调查脉络）：
 
 ```text
 方案A：新增CompactionSummaryDirectiveFingerprint
@@ -134,17 +147,17 @@ NeedModel / ContextOverflow
 → retry继续复用同一Arc<ModelCallRequest>
 ```
 
-当前调查形成的working hypothesis倾向方案B：它更符合MVP、single producer和deep module原则，也与同类产品持有完整请求的实现接近。该倾向不具有决策权重，不能作为实现依据；接手者必须重新根据O14的真实需求和下列冻结问题正式确认A/B。
+历史调查当时形成的working hypothesis倾向方案B。ADR 0123随后正式接受“不新增Directive fingerprint/private constructor + format version + 同一Arc request”的方向；旧“必须重新确认A/B”的要求不再适用。
 
-下一步需要冻结的具体问题：
+历史上下一步曾需要冻结的问题（已由ADR 0123关闭）：
 
-1. `AssembledModelContextFingerprint`对CompactionSummary variant是否覆盖exact rendered System/User sections、directive正文、source、purpose和NoToolCalls。
-2. `CompactionSummaryDirective`字段是否改为private，以及PromptSet需要哪些只读getter。
-3. instruction正文或summary section语义变化是否强制bump`CompactionSummaryFormatVersion`，测试使用rendered snapshot还是hash golden vector。
-4. MVP是否确认不支持manual/custom/plugin-provided compact instructions；若未来需要，在哪个版本重新评估专用Directive identity。
-5. O14与O15的边界：O14只处理CompactionSummary请求；O15继续处理ordinary Runtime/Agent/Session Prompt正文、`PromptFingerprint`、cache和DefinitionVersion。
+1. 是否定义`AssembledModelContextFingerprint`覆盖CompactionSummary rendered sections（已删除fingerprint路径，改为同一个`Arc<ModelCallRequest>`）。
+2. `CompactionSummaryDirective`字段是否改为private，以及PromptSet需要哪些只读getter（已采用private constructor方向）。
+3. instruction正文或summary section语义变化是否强制bump`CompactionSummaryFormatVersion`（已确认不兼容变化递增format version；不使用hash golden vector）。
+4. MVP是否确认不支持manual/custom/plugin-provided compact instructions（已确认MVP不支持；未来需求另立ADR）。
+5. O14与O15的边界（两者均由ADR 0123关闭）。
 
-本轮曾按方案B形成临时ADR/文档草案并完成独立cross-document consistency review；该review只证明草案内部一致，不证明方案B优于方案A。用户明确要求O14保持未决后，草案已完整回退，未进入git history。
+历史说明：本轮早期曾按方案B形成临时ADR/文档草案并完成独立cross-document consistency review，随后回退。ADR 0123最终接受了该方向并扩大为全局identity/reload决策；旧“方案A/方案B未定”的描述只作为调查脉络保存。
 
 同步时还修正了直接受影响的旧术语和接口漂移：
 
@@ -166,34 +179,25 @@ NeedModel / ContextOverflow
 | O9 | ADR 0120：ModelGateway response validation与四个non-retryable error reason |
 | O10 | ADR 0121删除revoke-before-commit状态；Idle update失败保留old definition/Snapshot |
 | O11 | ADR 0121不承诺dynamic open-handle revocation；SecurityRevoked复用Cancel settlement |
-| O12 | ADR 0122：Workspace/view fingerprint仅当前Runtime有效；restart重新resolve且不恢复grant/cache |
+| O12 | ADR 0122曾收窄Workspace/view fingerprint；ADR 0123取代并删除fingerprint族 |
+| O13 | ADR 0123：不抽共享pinning/fingerprint value module；由各deep module private immutable interface保证一致性 |
+| O14 | ADR 0123：不新增CompactionSummaryDirectiveFingerprint；private constructor + format version + Arc plan/request |
+| O15 | ADR 0123：不定义PromptFingerprint；Prompt正文由explicit reload发布的immutable captured content承载 |
+| O16 | MVP不增加独立Tool guidelines；Tool User metadata从Direct ToolSpec name/description确定性投影 |
 
 ## 下一步
 
-从O14继续，先在方案A与方案B之间作正式决策，再处理Prompt正文identity：
+O13/O14/O15/O16已关闭。下一轮评审/实现前门禁顺序改为：
 
 ```text
-O14 确认是否新增Directive fingerprint
-→ 冻结Directive constructor/template/version/assembled coverage
-→ O15 Prompt正文与PromptFingerprint
+1. O1：首个production Tool/Sandbox adapter前关闭Sandbox capability fail-closed
+2. 第三版AgentLoop评审：L2必须在首个AgentLoop实现前冻结，随后处理L3/L4
+3. R2：token估算器owner按ADR0123术语回写（不使用TurnModelFingerprint）
+4. wire/schema freeze：serde/casing、public ID生成策略、基础类型；不要恢复ContentHash/fingerprint freeze
+5. 阶段6–8：Rig 0.40.0 spike + ScriptedProviderAdapter ordinary AgentRun → ContextOverflow → CompactionSummary → StoredCompaction append/apply → reassemble
 ```
 
-接手后的第一项操作是执行以下检查，再按上面的5个冻结问题重新评估方案A/B：
-
-```bash
-git log --oneline -3
-git log -1 --oneline -- docs/review/v2-design-review-handoff.md
-git log --all --oneline --grep='ADR 0123\|deterministic template'
-test ! -e docs/adr/0123-compaction-directive-uses-deterministic-template.md
-rg '^\| O14 ' docs/review/v2-design-review.md
-rg -n 'pub instruction: Arc<str>|fingerprinted.*CompactionSummaryDirective' docs/modules/compaction.md
-```
-
-预期结果：log包含`ca2b02e`和本文handoff提交；ADR 0123搜索为空且文件不存在；O14仍显示“部分开放”；Compaction模块仍保留原始public `instruction`与fingerprinted Directive表述，说明方案A/B尚未写入权威设计。
-
-其他开放项：`O1 O2 O3 O13 O16 O17 O18`。其中O1是首个production Tool/Sandbox adapter前的P0门禁；O2/O3属于storage/运维硬化；O13不要重新引入authorization lease，只评估真正同构的source stamp/pinning value。
-
-第三版AgentLoop评审仍有`L2–L4`开放；`L2`必须在首个AgentLoop实现前冻结。完成O14/O15后，应回到[第三版评审](v2-design-review-3.md)核对实现前门禁。
+其他开放项：`O1 O2 O3 O17 O18`。其中O1是首个production Tool/Sandbox adapter前的P0门禁；O2/O3属于storage/运维硬化；O17/O18可按真实需求或实现触碰时处理。O16已收窄为MVP无独立Tool guidelines。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
 
 后续实现顺序仍是：
 
@@ -215,24 +219,25 @@ Rig 0.40.0 integration spike
 - 文件mutation只在单Session内按canonical file key FIFO，多文件/open-world Tool整批Serial；
 - Cancel/SecurityRevoked可以立即关闭新operation，但越过`ToolExecutionStarted`的Tool必须truthful settlement；
 - Workspace definition只在Idle更新，active Turn不热替换Snapshot或任何派生view；
-- Workspace及其view fingerprint只在当前Runtime有效；restart/re-resolve不恢复旧Snapshot、grant或cache；
+- 执行一致性使用exact refs、immutable Arc、explicit reload和structural validation；不定义`*Fingerprint`身份族或任何替代generation/ID；
+- Workspace restart/re-resolve不恢复旧Snapshot或authorization-sensitive cache；MVP不保存跨调用Tool grant；
 - Snapshot-first是公开观察协议，Snapshot不是durable execution checkpoint。
 
 ## 本轮验证
 
-已执行并通过：
+本handoff期望提交前至少执行：
 
 ```text
 git diff --check
 Markdown fenced-code parity
 modified Markdown relative-link existence check
-O12/cold-resume/fingerprint-recovery残留扫描
+O12/O13/O14/O15 fingerprint/hash/reload残留扫描与O16 guidelines扫描
 独立semantic/cross-document review
 ```
 
-本轮是docs-only变更；仓库没有production代码或测试入口，因此未运行cargo/test。独立review发现的条件式same-Turn cold resume残留、authority revision reference未落Schema和stable fingerprint歧义均已修正。
+本轮是docs-only变更；仓库没有production代码或测试入口，因此通常不运行cargo/test。
 
-O14调查阶段还核对了pi本机安装源码、Codex与Gemini CLI公开源码以及Claude compaction文档。方案B临时草案已在回退前通过`git diff --check`和独立semantic consistency review；当前handoff只存档调查结果，不代表O14关闭，也不表示方案B已经获得架构批准。
+O14调查阶段还核对了pi本机安装源码、Codex与Gemini CLI公开源码以及Claude compaction文档。方案B临时草案曾在回退前通过`git diff --check`和独立semantic consistency review；ADR 0123最终接受“不新增Directive fingerprint/private constructor+format version+Arc request”的方向，并扩展为全局identity/reload决策。
 
 ## 提交纪律
 

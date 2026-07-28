@@ -57,7 +57,7 @@
 - Interaction request append/apply后才通知host；resolution append/apply后才恢复Tool执行；UserQuestion等待使用`WaitingForUserInput`且UI只负责presentation；
 - `tool_execution_started`append/apply后才允许外部副作用；
 - FollowUp使用process-local bounded FIFO，当前不承诺crash-safe delivery；Snapshot使用latest-wins mailbox，不占用mutation/control容量；
-- Cancel与authority/host `SecurityRevoked`使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；Cancel在线性化sticky epoch后立即返回typed accepted response，PrepareForUnload仍使用sticky lifecycle signal和shared completion generation；
+- Cancel与authority/host `SecurityRevoked`使用sticky、可合并的`EmergencyControl`，不等待普通工作lane的容量；Cancel在线性化sticky epoch后立即返回typed accepted response，PrepareForUnload仍使用sticky lifecycle signal和shared completion waiter；
 - lane容量、拒绝和仲裁规则在`SessionIngress`内定义；一个Session的lane拥塞不能耗尽另一个Session的容量，但共享Model配额和宿主I/O仍可能形成跨Session等待；
 - Progress event可以合并或丢弃，不能影响request处理和durable state；
 - restart不恢复旧Context/Model/Tool异步操作，unfinished Turn按既有recovery规则终止。
@@ -195,25 +195,25 @@ pub(crate) enum CancelTarget {
 | `ResolveInteraction` | `InteractionControlQueue` | bounded FIFO并配置独立保留容量；只处理已存在的 Pending Interaction |
 | `ToolControl` | `ToolControlQueue` | bounded FIFO；approval、UserQuestion、execution-start 等内部 durable control |
 | `Cancel` | `EmergencyControl` | target-scoped sticky、可合并signal；在线性化cancel epoch后立即返回`CancelAccepted`，不因普通lane满而延迟 |
-| `SecurityRevoked` | `EmergencyControl` | current SessionExecutionHandle-scoped sticky signal；关闭admission，存在candidate/current Turn时绑定target generation |
-| `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion generation，可附 grace deadline |
+| `SecurityRevoked` | `EmergencyControl` | current SessionExecutionHandle-scoped sticky signal；关闭admission，存在candidate/current Turn时绑定当前process-local target |
+| `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal + shared completion waiter，可附 grace deadline |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced 请求，从 immutable published view 读取 |
 
 `SessionIngress`的外层唤醒机制可以是一个很小的 bounded wake channel，但 wake 只表示“某个 lane 有变化”，不承载请求本身；wake 丢失或合并时由 Executor 重新检查各 lane。因此普通工作容量不会成为 emergency、lifecycle 或 snapshot 的隐藏瓶颈。
 
-表中的`EmergencyControl`是owner-local admission gate与`TurnControlGate`暴露的逻辑signal facet，不是另一个queue或owner。active target registration只由Executor发布。Cancel必须针对immutable `CancelTarget + generation`；SecurityRevoked通过current `SessionExecutionHandle`路由，并在存在candidate/current Turn时绑定其target generation。old/unloaded handle关闭结果路径后，发送方不能修改Session state，也不能把stale signal重定向到new Executor或Turn。
+表中的`EmergencyControl`是owner-local admission gate与`TurnControlGate`暴露的逻辑signal facet，不是另一个queue或owner。active target registration只由Executor发布。Cancel必须针对当前immutable `CancelTarget`；SecurityRevoked通过current `SessionExecutionHandle`路由，并在存在candidate/current Turn时绑定当前target。old/unloaded handle关闭结果路径后，发送方不能修改Session state，也不能把stale signal重定向到new Executor或Turn。
 
-`TurnControlGate`不是queue、actor或第二状态owner，而是`SessionIngress`内部的原子仲裁原语。owner-local admission gate保存security admission状态；TurnControlGate保存active target generation、emergency epoch、Steer admission gate和短commit reservation：
+`TurnControlGate`不是queue、actor或第二状态owner，而是`SessionIngress`内部的原子仲裁原语。owner-local admission gate保存security admission状态；TurnControlGate保存active target、emergency epoch、Steer admission gate和短commit reservation：
 
-- `try_admit_steer(expected_turn_id)`与`reserve_final_commit(expected_generation)`原子排序。Steer admission先赢时candidate final必须保存为Assistant Continue；final reservation先赢时新Steer返回TurnCancelling/TurnNotRunning；
-- `publish_emergency(signal, optional_target_generation)`与admission/`reserve_controlled_append(expected_epoch, kind)`原子排序。Cancel或SecurityRevoked先赢时对应admission/reservation失败；reservation先赢时该次短append获得胜利，signal仍立即sticky并在append后继续cleanup；
+- `try_admit_steer(expected_turn_id)`与`reserve_final_commit(current_target)`原子排序。Steer admission先赢时candidate final必须保存为Assistant Continue；final reservation先赢时新Steer返回TurnCancelling/TurnNotRunning；
+- `publish_emergency(signal, current_target)`与admission/`reserve_controlled_append(expected_epoch, kind)`原子排序。Cancel或SecurityRevoked先赢时对应admission/reservation失败；reservation先赢时该次短append获得胜利，signal仍立即sticky并在append后继续cleanup；
 - reservation只跨一次短`SessionWriter.append → apply`，不跨Model/Tool I/O、approval或完整Turn；signal发布不阻塞，只记录pending epoch并唤醒Executor；
 - 所有以“没有winning emergency”为前置条件的append都必须使用controlled reservation，至少包括initiating UserMessage、Model-produced Assistant、`ToolExecutionStarted`、`tool_round_completed`和active-Turn StoredCompaction；不再叠加第二个Workspace commit permit。
 - append返回`NotCommitted`时释放reservation并先观察pending emergency，再决定是否重新reserve并重试同一draft；`OutcomeUnknown`时保持admission closed、poison writer并按既有保守终结规则处理，不能以旧epoch盲重试。
 
 `LifecycleControl`的stop-admission transition与Submit/Steer/FollowUp的`try_admit`原子排序：input admission先赢时PrepareForUnload必须在drain中明确拒绝/清理它；stop-admission先赢时发送方直接得到`ExecutorStopping`。Emergency、required cleanup control和Snapshot不受该gate阻止。
 
-Ingress gate只能依据Executor发布的immutable target/admission generation做容量预留和race排序；领域validation、StateEvent publication与typed `Queued` completion仍由Executor确认。这样lane可以独立背压，但不会产生第二个Session read/write owner。
+Ingress gate只能依据Executor发布的immutable active target和admission state做容量预留和race排序；领域validation、StateEvent publication与typed `Queued` completion仍由Executor确认。这样lane可以独立背压，但不会产生第二个Session read/write owner。
 
 Admission规则：
 
@@ -224,17 +224,17 @@ Admission规则：
 - `CancelQueuedMessage`只按`CommandId`删除一条仍在 Steer 或 FollowUp lane 的消息；找到即`Cancelled`，找不到统一返回`NotQueued`，不区分从未排队与已经出队；
 - `InputMailboxControl.remove(command_id)`与对应lane的`pop_front`使用同一原子同步：remove先赢则消息不执行，pop先赢则返回`NotQueued`且不能把消息重新入队；
 - `InputMailboxControl`不直接发布Runtime状态；Executor完成remove、更新immutable snapshot view并发布`queue_updated`后才完成`CancelQueuedMessage` response，因此不产生第二个StateEvent owner；
-- `Cancel`重复请求只按相同`CancelTarget + target generation`合并，并立即返回同一accepted cancel epoch；EmergencyControl不保存completion sender，stale target不得触发当前或下一Turn的cancellation token；
-- Emergency signal在目标terminal/取消完成后retire，新的Turn使用新的target generation和CancellationToken；
-- SecurityRevoked signal绑定current `SessionExecutionHandle`，并在存在candidate/current Turn时绑定`CancelTarget + target generation`；重新resolve完成后retire，不得影响future Turn；
-- `PrepareForUnload`重复请求订阅同一个completion generation，effective grace deadline取现有与新请求的最早值，后续请求不能延长shutdown；
+- `Cancel`重复请求只按相同active `CancelTarget`合并，并立即返回同一accepted cancel epoch；EmergencyControl不保存completion sender，stale target不得触发当前或下一Turn的cancellation token；
+- Emergency signal在目标terminal/取消完成后retire，新的Turn使用新的active target和CancellationToken；
+- SecurityRevoked signal绑定current `SessionExecutionHandle`，并在存在candidate/current Turn时绑定当前`CancelTarget`；重新resolve完成后retire，不得影响future Turn；
+- `PrepareForUnload`重复请求订阅同一个completion waiter，effective grace deadline取现有与新请求的最早值，后续请求不能延长shutdown；
 - Snapshot 请求不改变任何 mutation lane 的顺序，不等待普通 queue 排空。
 
 长流程 response 不让 ingress handler 等待完整 operation：
 
 - Submit response 保存在 candidate/admission record 中，UserMessage append/apply 后完成；
 - Cancel response在sticky cancel epoch成功发布后立即返回；`TurnInterrupted`/其他terminal fact由后续StateEvent和Snapshot表达；
-- PrepareForUnload response等待lifecycle completion generation，进入 Unloaded 前完成；
+- PrepareForUnload response等待lifecycle completion waiter，进入 Unloaded 前完成；
 - queued Steer/FollowUp 不保存跨崩溃 completion handle；真正 append、新 Turn start 和拒绝由 StateEvent/typed outcome 表达。
 
 ## Tool Execution Control
@@ -338,12 +338,12 @@ pub(crate) struct CurrentTurnExecution {
 }
 ```
 
-`CompactionRecoveryBasis`由source checkpoint与当前scope frontier fingerprint组成；active scope的fingerprint同时覆盖effective `previous_checkpoint`和由backing compaction派生的covered-through provenance。同一basis的hard recovery只启动一次；成功StoredCompaction推进checkpoint/frontier后，后续新增completed units可以形成新的basis，但总次数受Turn-pinned `max_compactions_per_turn`限制。
+`CompactionRecoveryBasis`由exact source checkpoint与当前typed scope frontier组成；active scope frontier显式包含effective `previous_checkpoint`和由backing compaction派生的covered-through provenance。同一basis的hard recovery只启动一次；成功StoredCompaction推进checkpoint/frontier后，后续新增completed units可以形成新的basis，但总次数受Turn-pinned `max_compactions_per_turn`限制。
 
 ```rust
 pub(crate) struct CompactionRecoveryBasis {
     pub source: ConversationCheckpoint,
-    pub scope_frontier_fingerprint: CompactionScopeFrontierFingerprint,
+    pub scope_frontier: CompactionScopeFrontier,
 }
 ```
 
@@ -374,9 +374,7 @@ Model、retry delay、Context、composition和未开始副作用的Tool可以在
 pub(crate) enum ModelRetryResume {
     AgentRun,
     CompactionSummary {
-        source: ConversationCheckpoint,
-        scope: CompactionScope,
-        plan_fingerprint: CompactionPlanFingerprint,
+        plan: Arc<CompactionPlan>,
     },
 }
 
@@ -416,9 +414,7 @@ pub(crate) enum RunningOperation {
     CompactConversation {
         turn_id: TurnId,
         execution_version: u64,
-        source: ConversationCheckpoint,
-        scope: CompactionScope,
-        plan_fingerprint: CompactionPlanFingerprint,
+        plan: Arc<CompactionPlan>,
         summary_request: Option<Arc<ModelCallRequest>>,
         logical_retry_count: u8,
         cancel: CancellationToken,
@@ -445,7 +441,7 @@ pub(crate) struct OperationResult {
 - SessionId不匹配：实现错误，记录diagnostic；
 - TurnId不匹配：忽略结果并记录diagnostic；
 - 非current operation产生结果：实现错误；正常实现不存在可迟到的detached Context/Model/Compaction/composition result；
-- execution version仍用于验证result基于的Turn control/conversation generation；
+- execution version仍用于验证result基于的Turn control和conversation basis；
 - Tool尚未越过`ToolExecutionStarted`记录时，过期结果可以取消/忽略；
 - Tool已经越过该记录时，必须确认outcome：exact result保存为Tool message，无法确认则ToolAbandoned；
 - terminal Turn不能接受新的Model result、ToolCall或Interaction；
@@ -912,7 +908,7 @@ Assistant(Final) append是Completed Turn唯一结束线性化点。
 
 ```text
 Cancel(CancelTarget::Turn(expected TurnId))
-→ `EmergencyControl`通过`TurnControlGate`原子验证active target generation仍可取消且final reservation未赢
+→ `EmergencyControl`通过`TurnControlGate`原子验证active target仍可取消且final reservation未赢
 → 设置sticky cancel epoch并触发该target绑定的current operation cancellation token
 → 立即返回CancelAccepted { target, cancel_epoch }
 → Executor验证current Running Turn
@@ -946,7 +942,7 @@ Cancel(CancelTarget::Turn(expected TurnId))
 - Cancel与Assistant(Final)由`TurnControlGate`上的cancel epoch/final append reservation first-wins决定；
 - final reservation先赢则Cancel返回typed terminal/transition error；Cancel先赢并返回accepted则Final candidate必须丢弃。
 
-Cancel的signal写入不等待任何bounded work lane；target/generation仍可取消且对应commit reservation未赢时，signal路径立即触发该target绑定的current operation cancellation token并返回`CancelAccepted`。reservation先赢时直接返回typed transition/terminal error。Executor消费signal后递增execution_version、进入Finishing并发布新snapshot/event；后续OperationResult或terminal cleanup继续推进，TurnInterrupted append/apply后发布最终StateEvent。
+Cancel的signal写入不等待任何bounded work lane；active target仍可取消且对应commit reservation未赢时，signal路径立即触发该target绑定的current operation cancellation token并返回`CancelAccepted`。reservation先赢时直接返回typed transition/terminal error。Executor消费signal后递增execution_version、进入Finishing并发布新snapshot/event；后续OperationResult或terminal cleanup继续推进，TurnInterrupted append/apply后发布最终StateEvent。
 
 Cancel后不立即启动同Session新Turn。Session未进入Unload stop-admission时，Finishing期间仍接受FollowUp进入bounded FIFO并返回Queued；普通Submit返回SessionBusy，新Steer返回TurnCancelling/TurnNotRunning。旧Turnterminal后，FollowUp按既有公平admission规则开启下一Turn。
 
@@ -970,10 +966,10 @@ candidate已进入Starting
 
 ## Authority Security Interruption
 
-WorkspaceAuthority或host发布hard restriction后，Runtime通过current loaded map向受影响`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`；存在candidate/current Turn时同时绑定target generation。它不是Workspace definition update，不原地替换active Snapshot，也不携带lease identity。
+WorkspaceAuthority或host发布hard restriction后，Runtime通过current loaded map向受影响`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`；存在candidate/current Turn时同时绑定当前target。它不是Workspace definition update，不原地替换active Snapshot，也不携带lease identity。
 
 ```text
-SecurityRevoked(optional_target_generation)
+SecurityRevoked(current_target)
 → owner-local admission gate立即拒绝new Turn admission
 → Idle：旧Snapshot停止admit，直接重新resolve
 → Starting：取消candidate，不创建领域Turn，然后重新resolve
@@ -985,7 +981,8 @@ SecurityRevoked(optional_target_generation)
 → append/apply TurnInterrupted(SecurityRevoked)
 → release current Turn（若存在）
 → 使用current durable Workspace definition/current authority重新resolve
-→ Ready + Idle，或Unavailable
+→ PromptService/SkillService捕获new candidate授权的Workspace-bound sources
+→ Ready(new Snapshot + captured source values) + Idle，或Unavailable
 ```
 
 规则：
@@ -1043,20 +1040,21 @@ MVP中ModelGateway每个operation最多执行一个provider attempt；Rig和底�
 由SessionExecutor决定：
 
 ```text
-Model/CompactionSummary operation retryable failure
-→ current operation返回terminal error并从current_operation移除
-→ 确认TurnId/execution_version未变
-→ 确认ConversationCheckpoint未变
-→ 确认TurnExecutionContext未变
+Model/CompactionSummary current operation返回retryable terminal failure
+→ 在该slot仍是current时验证它持有expected Arc<ModelCallRequest>、TurnId、execution_version和source checkpoint
+→ terminal/remove old operation并关闭其结果路径
 → increment logical_retry_count并检查purpose上限
+→ 原子安装WaitForModelRetry { same request, expected checkpoint/version/control basis, typed resume }
 → 发布logical model_retry_scheduled，丢弃上一AgentRun operation的StreamingItem
-→ 创建WaitForModelRetry
-→ timer terminal/remove后使用相同ModelCallRequest启动下一operation
+→ timer到期时先处理已到达的Cancel/SecurityRevoked/Steer
+→ 验证current slot仍是持有same request的该WaitForModelRetry，Turn仍Running且checkpoint/version/control basis未变
+→ terminal/remove delay operation
+→ 复用same Arc<ModelCallRequest>安装下一次single-attempt operation，不重新assemble
 ```
 
 Retry delay使用`RunningOperation::WaitForModelRetry`中的timer，不阻塞SessionIngress scheduler或control loop。旧Model/Compaction operation必须terminal并移除后才能创建该delay operation；delay terminal并移除后才能创建下一次Model/Compaction operation，因此`current_operation`仍是唯一execution-local work state。
 
-delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_count`、`ready_at`和恢复下一operation所需的最小typed `ModelRetryResume`，不分配attempt ID，也不是`ModelAttemptState`。AgentRun resume没有额外数据；CompactionSummary resume只保留source、scope和plan fingerprint，summary directive、assembled context与request proof继续由同一个immutable request提供。timer到期后必须先处理已经到达的Cancel/SecurityRevoked/Steer，再决定是否启动下一次single-attempt Gateway operation。成功response、新ModelCallRequest或失效control会清除该调用链计数。
+delay operation只持有同一个`Arc<ModelCallRequest>`、当前`logical_retry_count`、`ready_at`和恢复下一operation所需的最小typed `ModelRetryResume`，不分配attempt ID，也不是`ModelAttemptState`。AgentRun resume没有额外数据；CompactionSummary resume只保留同一个`Arc<CompactionPlan>`，summary directive、settings、budget、source、scope、assembled context与request proof继续由该plan和同一个immutable request提供。timer到期后必须先处理已经到达的Cancel/SecurityRevoked/Steer，再决定是否启动下一次single-attempt Gateway operation。成功response、新ModelCallRequest或失效control会清除该调用链计数。
 
 logical retry不得通过timeout race留下仍可回传结果的旧本地future。若取消无副作用Model future，必须先安全drop并关闭旧结果路径；provider端可能继续生成或计费只属于delivery/telemetry风险，不允许形成第二个SessionExecutor result。
 
@@ -1096,13 +1094,21 @@ provider ContextOverflow也回到同一流程。同一`source checkpoint + scope
 - 启动Compaction不推进execution_version；成功Replace后推进，Cancel/SecurityRevoked仍立即推进；
 - `ConversationPrefix`压缩pre-Turn history；`ActiveTurnCompletedPrefix`保留exact initiating/Steer UserMessage anchors，并在每个instruction segment内滚动摘要已完成的早期stable units；
 - Pending/Started/incomplete ToolRound、explicit protected units和recent exact tail不进入active checkpoint coverage；
-- summary output budget必须在plan阶段与pinned model known limits和summary call context空间求交，并进入plan fingerprint；SessionExecutor在append前用`CompactionCommitCandidate`/`ModelCallRequest` proof复核该临时一致性，storage cold replay只验证durable entry关系；
+- summary output budget必须在plan阶段与pinned model known limits和summary call context空间求交，并写入同一个immutable `Arc<CompactionPlan>`；SessionExecutor在append前用`CompactionCommitCandidate`、该plan和`ModelCallRequest` proof复核该临时一致性，storage cold replay只验证durable entry关系；
 - `Compacting`期间Steer排队，Cancel和SecurityRevoked可以取消operation并在append前获胜；
-- Compaction result append前必须重新验证source checkpoint和TranscriptFingerprint；
+- Compaction result append前必须重新验证exact source checkpoint、scope/boundaries/provenance和actual typed entries；
 - soft-pressure失败只有在原ModelCallRequest仍exact valid时才能继续；
 - hard overflow失败时TurnFailed；successful compact后仍overflow只在存在新可行scope/frontier且次数有余量时再次plan，否则`ContextStillTooLargeAfterCompaction`；
 - success后必须重建AgentLoop segment，不能resume携带旧history的run；
 - summary operation、plan和retry timer不跨restart恢复。
+
+## Reload
+
+Runtime shared resources（Prompt/Skill/Tool/Model）只在Runtime初始化或显式`/reload`后替换current immutable object。watcher最多标记dirty并发布diagnostic，不自动publication。
+
+`/reload`执行two-phase流程：完整build Prompt/Skill/Tool/Model candidates，validate所有required candidates，然后在短publication gate下原子替换四个current `Arc`；Turn admission在同一gate下只克隆四个Arc。任一required candidate失败时保留全部old current values。active Turn继续使用已captured old objects；reload成功后admit的future Turn捕获new objects；completed Turn不更新。shared Prompt和Skill filesystem source在Runtime initialize/shared reload时读取为immutable captured bytes/content，Skill可以lazy parse但不能在Turn内按path重新读取current file。
+
+`/reload workspace`不是shared-resource reload。它遵守Session lifecycle的Idle-only规则：loaded Session处于Idle时重新resolve current definition，并在candidate阶段捕获Workspace-bound Prompt/Skill sources；Ready时成功替换Snapshot、失败保留old Snapshot，Unavailable时成功恢复Ready、失败保持Unavailable。Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel、不原地替换active Turn Context。
 
 ## PrepareForUnload
 
@@ -1115,11 +1121,11 @@ LifecycleControl.prepare_for_unload(deadline)
 → reject尚未admit的TurnAdmissionQueue请求
 → 清理并明确结束queued Steer/FollowUp
 → 如果Idle：关闭ingress/writer并返回ReadyToUnload
-→ 如果Starting/Running/Finishing：保留shared completion generation并允许current work在grace期内自然完成
+→ 如果Starting/Running/Finishing：保留shared completion waiter并允许current work在grace期内自然完成
 → 继续处理EmergencyControl、ResolveInteraction、ToolControl依赖和operation result
 → grace deadline到期仍未Idle：触发current pre-Turn Submit或Turn cancel，并以Cancelled关闭Pending Interaction
 → truthful Tool outcome与terminal append完成
-→ 完成PrepareForUnload completion generation
+→ 完成PrepareForUnload completion waiter
 → Runtime移除SessionExecutionHandle并释放Executor
 ```
 
@@ -1338,7 +1344,7 @@ AgentLoop internal state
 Context/UserMessage composition/Model/Tool/Compaction async operation
 approval waiter
 provider continuation/session
-process-local EmergencyControl signal/target generation
+process-local EmergencyControl signal/target
 ```
 
 如果terminal entry已存在但projection仍有Pending Interaction或Started Item，load fail closed并要求explicit repair。
@@ -1349,7 +1355,7 @@ MVP性能要求：
 
 - 一个loaded Session一个Executor；
 - TurnAdmission、Steer、FollowUp、InteractionControl和ToolControl lane分别有容量限制；
-- EmergencyControl使用O(1) target/generation/sticky epoch且不保存Cancel completion sender；LifecycleControl使用shared completion generation；SnapshotMailbox只保留latest immutable view，不能无限增长；
+- EmergencyControl使用O(1) target/sticky epoch且不保存Cancel completion sender；LifecycleControl使用shared completion waiter；SnapshotMailbox只保留latest immutable view，不能无限增长；
 - 每个Session最多一个current RunningOperation；旧operation terminal/remove或安全drop前不启动新operation；
 - ToolSet内部负责ToolCall并发；
 - SessionWriter复用open file handle和buffer；
@@ -1473,14 +1479,14 @@ MVP性能要求：
 - Cancel(Submit)与initiating append reservation first-wins，accepted Cancel不创建Turn；
 - Cancel(Turn)与final append reservation first-wins，accepted Cancel不提交Final Assistant；
 - Finishing期间FollowUp可Queued，Steer拒绝且Submit SessionBusy；
-- stale CancelTarget/generation不触发current或next Turn token；
+- stale CancelTarget不触发current或next Turn token；
 - cancel epoch发布后新的同Turn Steer被拒绝，epoch前accepted Steer被清理；
 - 普通lane全部满时Cancel仍立即发布sticky signal；
 - Cancel不清空FollowUp或其他Submit；
 - SecurityRevoked during Starting/Compacting/Sampling/WaitingApproval/WaitingForUserInput/ExecutingTools；
 - SecurityRevoked while Idle closes admission, invalidates old Snapshot and resolves without creating TurnInterrupted；
 - SecurityRevoked不等待任何bounded FIFO容量；
-- stale target generation的signal不影响terminal后重新resolve并启动的future Turn；
+- stale target signal不影响terminal后重新resolve并启动的future Turn；
 - SecurityRevoked与Model start、ToolExecutionStarted、controlled append双向race遵循TurnControlGate first-wins；
 - started Tool在security interruption下保存exact outcome或ToolAbandoned；
 - terminal后Workspace重新resolve success Ready、failure Unavailable；
@@ -1551,9 +1557,9 @@ SessionExecutionState / TurnExecutionPhase
 execution_version
 OperationType和duration
 TurnAdmission / Steer / FollowUp / InteractionControl / ToolControl lane depth
-EmergencyControl epoch与target generation
+EmergencyControl epoch与target
 LifecycleControl state、grace deadline与completion subscriber count
-Snapshot publication generation与subscriber count
+Snapshot publication counter与subscriber count
 lane arbitration burst/fairness counters
 Model/Tool cancellation result
 SessionWriter error class

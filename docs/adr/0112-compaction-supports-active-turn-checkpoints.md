@@ -9,7 +9,7 @@ ADR 0107要求保留active Turn的initiating UserMessage及其后的连续model-
 
 同时，`CompactionSettings.summary_max_output_tokens`原样进入plan和directive，没有与active Turn固定的`EffectiveModelLimits`求交。若全局摘要输出上限高于当前模型上限，`ModelCallRequest::new`会在provider调用前拒绝每一个Compaction请求。Gateway保持严格校验是正确的，缺失的是Compaction planning seam上的effective budget。
 
-MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一SessionExecutor/Writer、portable summary和append-before-Replace。问题不要求建立第二份conversation truth，而是要求StoredCompaction能够表达active Turn内部已经完成的进度checkpoint，并让预算在请求fingerprint前闭合。
+MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一SessionExecutor/Writer、portable summary和append-before-Replace。问题不要求建立第二份conversation truth，而是要求StoredCompaction能够表达active Turn内部已经完成的进度checkpoint，并让预算在构造summary request前闭合。
 
 ## 决策
 
@@ -33,14 +33,14 @@ MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一S
    active scope的summary request把current effective prefix through selected anchor作为protected context，帮助模型理解“继续”等依赖历史的任务，但该prefix不进入本次summary coverage，也不能被checkpoint替换或改写。若pre-Turn context导致第一个segment的summary request不可行，必须先执行`ConversationPrefix`，不能静默省略。
 5. 每个active instruction segment拥有独立、单调的coverage frontier。第一次覆盖anchor UserMessage之后的一段完整stable units，且不能跨越下一个active-Turn UserMessage；后续scope使用指向当前effective checkpoint unit的`previous_checkpoint`，再从该checkpoint backing compaction派生covered-through provenance，并只允许把其后的新完成连续units合并为一个replacement checkpoint。checkpoint boundary与原始coverage frontier不得混为一个字段；frontier不得后退、交叉或留下空洞，每个segment至多一个effective checkpoint。
 6. initiating input和所有已append Steer UserMessage都保持原文和相对位置。planner优先保留recent exact tail；explicit caller-protected entries、Pending Interaction相关内容、未完成ToolRound和任何包含它们的完整stable unit都必须位于未摘要区域。只有这些真实protected regions自身仍超过usable budget时才返回`ProtectedRegionTooLarge`；已经完成的早期Assistant/ToolRound不再因“位于initiating UserMessage之后”自动受保护。
-7. 大ToolResult在summary request representation中继续使用带tool name、call identity、outcome、head/tail、原始字节数、content hash和omitted bytes的确定性reduction。durable Tool message不改写；checkpoint覆盖完整ToolRound，不能产生孤立ToolCall或ToolResult。首版不把无摘要的任意截断直接安装为conversation结果。
-8. `StoredCompaction`保存typed `CompactionScope`、source checkpoint、coverage boundaries/provenance、protected entries、portable summary和model-call provenance。caller不能提交raw replacement messages；trusted projector根据scope确定性构造leading-summary Replace或anchor-after checkpoint Replace。live apply、replay和fork必须生成相同`TranscriptFingerprint`。
-9. active Turn在admission时捕获immutable `CompactionSettingsSnapshot`，配置reload只影响future Turn。automatic compaction在同一Turn内可以重复，但必须有界：
+7. 大ToolResult在summary request representation中继续使用带tool name、call identity、outcome、head/tail、原始字节数和omitted bytes的确定性reduction。durable Tool message不改写；checkpoint覆盖完整ToolRound，不能产生孤立ToolCall或ToolResult。首版不把无摘要的任意截断直接安装为conversation结果。
+8. `StoredCompaction`保存typed `CompactionScope`、exact source checkpoint、coverage boundaries/provenance、protected entries、portable summary和model-call provenance。caller不能提交raw replacement messages；trusted projector根据scope确定性构造leading-summary Replace或anchor-after checkpoint Replace。live apply、replay和fork必须通过actual typed entries和structural replay validation得到等价projection；不使用Transcript hash或stable-unit hash。
+9. active Turn在admission时捕获immutable `CompactionSettingsSnapshot`。MVP把CompactionSettings作为Runtime startup config，不提供独立hot reload。automatic compaction在同一Turn内可以重复，但必须有界：
    - 同一个`source checkpoint + scope frontier`最多启动一次hard-overflow recovery；
    - 成功append/apply并推进frontier后，只有新增完整stable units达到`minimum_reclaimed_tokens`才可再次compact；
    - `CompactionSettings.max_compactions_per_turn`限制单Turn总次数；
    - compact后没有推进frontier或仍无可行cut时fail closed，不进行无界compact-and-retry。
-10. PromptSet通过窄的`CompactionSummaryAssemblyBasis`暴露fixed summary policy/output-contract开销的token estimate与fingerprint，不暴露或复制完整assembly实现。planning阶段用该basis派生一个immutable `CompactionSummaryBudget`，输入至少包括Turn-pinned Compaction设置、pinned `EffectiveModelLimits`、summary source的reduced token estimate、candidate directive、PromptSet固定摘要开销和runtime safety reserve。最终输出上限满足：
+10. PromptSet通过窄的`CompactionSummaryAssemblyBasis`暴露fixed summary policy/output-contract开销的token estimate和typed assembly basis，不暴露或复制完整assembly实现。planning阶段用该basis派生一个immutable `CompactionSummaryBudget`，输入至少包括Turn-pinned Compaction设置、pinned `EffectiveModelLimits`、summary source的reduced token estimate、candidate directive、PromptSet固定摘要开销和runtime safety reserve。最终输出上限满足：
 
     ```text
     effective summary output
@@ -51,8 +51,8 @@ MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一S
       )
     ```
 
-    未知limit保持unknown，不根据model name猜测；已知limit必须参与求交。最终预算写入`CompactionPlan`、`CompactionSummaryDirective`和`CompactionPlanFingerprint`。
-11. `CompactionSettings`同时提供`summary_min_output_tokens`。若已知模型/context限制不能留下该最低输出空间，planning返回`NoFeasibleSummaryBudget`；它是Compaction domain error，不得落成Gateway `InvalidRequest`。PromptSet仍做最终context validation，ModelGateway仍拒绝超出effective model limit的请求且绝不静默clamp。plan、Prompt assembly proof、`ModelCallRequest` constructor和SessionExecutor append gate负责验证临时budget/plan/directive/model-limit一致性；SessionStorage的`validate_and_project`只验证durable entry能够重建的scope、boundary、hash、checkpoint和coverage provenance，cold replay不声称重新验证已经消失的plan或limits。
+    未知limit保持unknown，不根据model name猜测；已知limit必须参与求交。最终预算写入immutable `CompactionPlan`和`CompactionSummaryDirective`，由同一个`Arc<CompactionPlan>`和后续`Arc<ModelCallRequest>`承载到operation完成；不生成`CompactionPlanFingerprint`。
+11. `CompactionSettings`同时提供`summary_min_output_tokens`。若已知模型/context限制不能留下该最低输出空间，planning返回`NoFeasibleSummaryBudget`；它是Compaction domain error，不得落成Gateway `InvalidRequest`。PromptSet仍做最终context validation，ModelGateway仍拒绝超出effective model limit的请求且绝不静默clamp。plan、Prompt assembly proof、`ModelCallRequest` constructor和SessionExecutor append gate负责验证临时budget/plan/directive/model-limit一致性；SessionStorage的`validate_and_project`只验证durable entry能够重建的scope、boundary、exact checkpoint、actual typed entries和coverage provenance，cold replay不声称重新验证已经消失的plan或limits。
 12. pre-Turn leading summary和active-Turn checkpoint都是user-role historical checkpoint，不获得System authority。普通Agent/Session/Workspace/Tool/Skill静态内容不写入summary，由下一次AgentRun assembly从同一个TurnExecutionContext重新注入。
 13. 首版仍不提供standalone/manual compaction、hierarchical summary tree、provider-native opaque artifact、active-Turn cross-model fallback或load-path模型调用。
 
@@ -68,6 +68,8 @@ MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一S
 ## 修订关系
 
 本ADR取代[ADR 0107](0107-compaction-uses-strict-stable-suffix.md)。ADR 0107中关于durable truth、stable-unit cut、portable summary、PromptSet/ModelGateway唯一调用路径、append/apply后Replace、exact active-Turn model、control arbitration、restart/fork和不公开manual compaction的决策继续保留；连续retained suffix、active Turn全量hard-protect和单Turn仅一次overflow recovery由本ADR修订。
+
+2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Compaction相关transcript/plan/budget/directive/summary/stable-unit fingerprint条款。当前Compaction operation持有同一个`Arc<CompactionPlan>`（settings、budget、scope、source）与由其组装出的同一个`Arc<ModelCallRequest>`；exact rendered directive随request固定。append前验证exact source checkpoint、scope、boundaries、provenance、current Turn/version/control和actual typed entries。`StoredCompaction`只保存exact refs、typed scope/boundaries/provenance、summary text和model-call provenance。
 
 ## 被否决的方案
 
@@ -85,4 +87,4 @@ MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一S
 
 ### 让ModelGateway静默clamp摘要输出
 
-会改变调用方已经fingerprint的policy，并让plan中的token feasibility与真实请求不一致。预算必须在Compaction planning阶段闭合。
+会改变调用方已经构造并验证的policy，并让plan中的token feasibility与真实请求不一致。预算必须在Compaction planning阶段闭合。

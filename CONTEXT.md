@@ -51,7 +51,7 @@ _避免_：模型客户端、API wrapper
 _避免_：TUI后端、桌面后端、UI Service、GUI应用状态、全局current Session
 
 **RuntimeSnapshot**：
-Runtime scope的完整恢复读模型，包含Runtime信息、Agent summary、loaded Session membership、catalog revision和runtime diagnostics。它不包含全部loaded Session的完整message/current Turn/Pending Interaction，也不要求所有SessionExecutor同时park。
+Runtime scope的完整恢复读模型，包含Runtime信息、Agent summary、loaded Session membership和runtime diagnostics。它不包含全部loaded Session的完整message/current Turn/Pending Interaction，也不要求所有SessionExecutor同时park；shared resource reload后host通过新Snapshot或safe catalog query读取current values，不依赖额外catalog版本值。
 _避免_：SessionSnapshot、UI store、Session index、JSONL、全局事件水位
 
 **SessionSnapshot**：
@@ -63,7 +63,7 @@ Runtime或单个Session的实时观察方式。owner原子完成subscriber注册
 _避免_：先snapshot再subscribe的非原子组合、durable observer log、跨restart offset
 
 **运行时共享模块**：
-`MiniCoreRuntime`拥有的PromptService、ToolService、SkillService和ModelGateway。它们不随UI selected Session改变，也不保存current Session或current Turn。
+`MiniCoreRuntime`拥有的PromptService、ToolService、SkillService和ModelGateway。四个Service各自build/validate immutable candidate，Runtime用private `SharedResourceRoots`原子持有四个current Arc；Service不单独publish current pointer。它们不随UI selected Session改变，也不保存current Session或current Turn。
 _避免_：每Session复制服务、UI服务容器、全局current Session
 
 **Workspace**：
@@ -71,11 +71,11 @@ _避免_：每Session复制服务、UI服务容器、全局current Session
 _避免_：全局WorkspaceManager、cwd字符串、UI project object
 
 **WorkspaceSnapshot**：
-SessionExecutor在Turn admission期间取得的不可变Workspace解析结果，包含canonical roots、effective access、source grants和fingerprints。TurnExecutionContext pin该Snapshot；loaded Session的Workspace definition update只在Idle时接受，active Turn完全不读取future Workspace definition。
+SessionExecutor在Turn admission期间取得的不可变Workspace解析结果，包含canonical roots、effective access和source grants。TurnExecutionContext持有同一个`Arc<WorkspaceSnapshot>`直到terminal；loaded Session的Workspace definition update只在Idle时接受，active Turn完全不读取future Workspace definition或重新拼接Workspace view。
 _避免_：实时路径查询、mutable cwd state、可撤销authorization lease、跨Turn共享mutable Snapshot
 
 **SecurityRevoked**：
-WorkspaceAuthority或host发布hard restriction后，通过Runtime current loaded map发送给对应`SessionExecutionHandle`的process-local sticky EmergencyControl signal；存在candidate/current Turn时同时绑定其target generation。它立即关闭admission和新的Model/Tool/source operation：Idle直接重新resolve，Starting取消candidate，active Turn执行truthful settlement和`TurnInterrupted(SecurityRevoked)`；old handle关闭后不重定向到new Executor，也不承诺动态撤销open OS handle。
+WorkspaceAuthority或host发布hard restriction后，通过Runtime current loaded map发送给对应`SessionExecutionHandle`的process-local sticky EmergencyControl signal；存在candidate/current Turn时绑定该handle内的current control epoch。它立即关闭admission和新的Model/Tool/source operation：Idle直接重新resolve，Starting取消candidate，active Turn执行truthful settlement和`TurnInterrupted(SecurityRevoked)`；old handle关闭后不重定向到new Executor，也不承诺动态撤销open OS handle。
 _避免_：Workspace definition patch、durable Session字段、RevocableHandle registry、已发生副作用回滚
 
 **会话执行器（`SessionExecutor`）**：
@@ -159,19 +159,19 @@ Runtime内部维护的live map，记录当前已加载Session对应的`SessionEx
 _避免_：会话存储、会话目录、独立会话运行时注册表、UI selection store
 
 **会话存储（`SessionStorage`）**：
-单个会话的底层 by-entry ledger，也是 `SessionWriter` 的 adapter；负责读取 header/entries、重建 parent tree、校验 operation key与cross-entry references、生成 committed projections，并隐藏 memory/JSONL实现。它不决定Agent如何运行，也不直接服务UI。
+单个会话的底层 by-entry ledger，也是 `SessionWriter` 的 adapter；负责读取 header/entries、重建 parent tree、校验entry body与cross-entry references、生成 committed projections，并隐藏 memory/JSONL实现。它不决定Agent如何运行，也不直接服务UI。
 _避免_：会话管理器、会话运行时、聊天状态、第二 durable event log
 
 **技能**：
-通过SkillService发现和加载的Markdown指令包。Turn admission捕获current SkillView；显式调用时TurnExecutionContext按captured entry加载正文，经SkillInjector产生PromptContribution，再由PromptSet规范化为UserMessage。
+通过SkillService发现和加载的Markdown指令包。Turn admission从captured shared resource root与WorkspaceSkillContext构建并捕获SkillView；显式调用时TurnExecutionContext按captured entry加载正文，经SkillInjector产生PromptContribution，再由PromptSet规范化为UserMessage。
 _避免_：提示词片段、插件、工具、独立版本实体
 
 **技能模块（`SkillService`）**：
-MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validation、SkillView publication/reload、lazy load、content cache和diagnostics。它不构造最终UserMessage、不拥有Workspace lifecycle，也不调用模型。
+MiniCoreRuntime-owned深模块，负责Skill source discovery、metadata validation、shared SkillResourceView candidate build、per-Turn SkillView构建、lazy load、content cache和diagnostics；完整SharedResourceRoots publication由MiniCoreRuntime负责。它不构造最终UserMessage、不拥有Workspace lifecycle，也不调用模型。
 _避免_：skills.rs helper集合、UI解析器、Prompt manager、Tool registry
 
 **技能视图（`SkillView`）**：
-SkillService按context发布的immutable metadata view。显式reload成功后原子替换current view；TurnExecutionContext捕获view和WorkspaceSkillContext，future reload不改变active Turn。SecurityRevoked通过Turn control取消active source operation。
+SkillService从Turn admission捕获的`Arc<SkillResourceView>`和`WorkspaceSkillContext`构建的immutable metadata view；它不是global current view。TurnExecutionContext持有同一个`Arc<SkillView>`，future shared或Workspace reload不改变active Turn。Skill可以lazy parse/load，但只能基于对应publication捕获的immutable bytes/content，不能在Turn内按path重新读取current file。SecurityRevoked通过Turn control取消active source operation。
 _避免_：current磁盘目录、命令列表、mutable global catalog、durable Skill revision
 
 **技能调用**：
@@ -179,20 +179,8 @@ _避免_：current磁盘目录、命令列表、mutable global catalog、durable
 _避免_：系统提示词旁路、按metadata path重读、未committed current-call contribution
 
 **运行时资源（pre-refactor aggregate term）**：
-旧ResourceManager设计对Prompt、Skill和Workspace source的统称。目标架构由PromptService、SkillService、ToolService和Workspace各自拥有定义、加载与snapshot语义，不建立通用RuntimeResource entity。
+旧ResourceManager设计对Prompt、Skill和Workspace source的统称。目标架构由PromptService、SkillService、ToolService和Workspace各自拥有定义、加载与snapshot语义，不建立通用RuntimeResource entity。旧设计派生的“资源快照/资源摘要/提示词素材”随ResourceManager一并废除：快照语义由WorkspaceSnapshot、PromptSet、ToolSet、SkillView等Turn-pinned immutable `Arc`对象承接；UI安全投影由各子系统UI-safe view承接；Prompt输入由PromptIntent与PromptContribution承接。
 _避免_：统一ResourceManager、跨模块resource snapshot、UI文件
-
-**资源快照**：
-`ResourceManager` 在一次成功加载/合成后发布的不可变模型资源视图，具体分为 `RuntimeResourceSnapshot`、`CwdResourceSnapshot`、`TurnResourceSnapshot` 和预留的 `StepResourceSnapshot`。旧 snapshot 永不原地修改；reload 只替换 current pointer，running turn 继续使用已捕获引用。
-_避免_：界面快照、事件日志、会话条目、实时文件视图
-
-**资源摘要**：
-资源快照投影给界面适配器的安全视图，只包含展示、来源、revision、覆盖关系和诊断等信息，不包含技能正文、上下文文件正文或完整系统提示词。
-_避免_：资源正文、提示词素材、完整运行时资源
-
-**提示词素材**：
-`ResourceManager` 从 captured `TurnResourceSnapshot.cwd.resolved` 投影给 Prompt 的结构化资源输入，例如自定义系统提示词、追加系统提示词、上下文文件和技能目录摘要。它不是最终 system prompt，也不包含工具、agent profile、动态上下文或模型调用契约。
-_避免_：完整 prompt、用户消息、工具描述、实时资源查询
 
 **提示词意图（`PromptIntent`）**：
 尚未展开成模型消息的结构化用户输入，可以引用普通文本、技能、提示模板或它们的组合。队列保存 intent 的稳定资源 key、参数和附件引用，不保存 raw slash command text 或提前展开的资源正文。
@@ -207,12 +195,12 @@ SessionExecutor在Turn admission期间通过PromptService构造的不可变提�
 _避免_：长期PromptManager、current Session prompt、模型request、Tool executor
 
 **Turn工具集合（`ToolSet`）**：
-`ToolService::for_turn(...)`返回的不可变Turn工具集合，原子绑定ToolSpec、ToolPromptView、execution route和ToolSetFingerprint。PromptSet只使用其ToolPromptView，SessionExecutor通过同一ToolSet执行ToolCall；active Turn内不能替换。
+`ToolService::for_turn(...)`返回的不可变Turn工具集合，原子绑定ToolSpec、ToolPromptView和execution route。ToolPromptView只能由parent ToolSet私有投影并随PromptSet捕获；PromptSet只使用该view，SessionExecutor通过同一ToolSet执行ToolCall；active Turn内不能替换或由caller伪造替代view。
 _避免_：session-scoped Tools副本、独立prompt/executor getter、UI工具列表
 
-**组装后的模型上下文identity**：
-`AssembledModelContextFingerprint`绑定PromptSet、CommittedConversationView、ModelCallPurpose、OutputContract和最终provider-neutral content。完整logical call identity还包含TurnModelSnapshot和effective max_output_tokens；Session logical retry必须复用同一validated ModelCallRequest。
-_避免_：provider payload hash、Session revision、Tool executor identity替代品
+**组装后的模型上下文**：
+`AssembledModelContext`绑定PromptSet、CommittedConversationView、ModelCallPurpose、OutputContract和最终provider-neutral content。完整logical call由同一个immutable `Arc<ModelCallRequest>`承载；Session logical retry必须复用该request，不重新assemble，也不以派生摘要作一致性证明。
+_避免_：provider payload hash、Session revision、Tool executor identity替代品、模型上下文摘要身份
 
 **上下文素材（`ContextMaterial`）**：
 由RAG、memory、IDE、issue lookup或后期hook等动态来源成功提供的typed模型上下文，带稳定来源、生命周期和required/optional要求。需要durable的内容必须先由其owner转换并提交为canonical session message；项目文件、技能和提示模板不能绕过PromptSet与append/apply伪装成动态素材。
@@ -223,7 +211,7 @@ _避免_：资源快照、无来源字符串、会话历史、系统提示词
 _避免_：Option<ContextMaterial>、静默跳过、provider future、原始 I/O error
 
 **组装后的模型上下文（`AssembledModelContext`）**：
-PromptSet在一次模型调用前生成的最终provider-neutral模型可见上下文，包含ordered System sections、前置User context与协议安全conversation messages、ToolSpec、OutputContract、贡献来源、diagnostics和fingerprint。它由`PromptSet.assemble(...)`从committed conversation和purpose组装，是ModelCallRequest唯一的model-visible input。
+PromptSet在一次模型调用前生成的最终provider-neutral模型可见上下文，包含ordered System sections、前置User context与协议安全conversation messages、ToolSpec、OutputContract、贡献来源和diagnostics。它由`PromptSet.assemble(...)`从committed conversation和purpose组装，是ModelCallRequest唯一的model-visible input；correctness由typed messages、exact checkpoint和同一个immutable request保证，不公开额外模型上下文身份值。
 _避免_：provider payload、Turn state、session message vector、Gateway内重新组装
 
 **输出契约（`OutputContract`）**：
@@ -367,7 +355,7 @@ Tool执行期间请求SessionExecutor完成approval和ToolExecutionStarted记录
 _避免_：InteractionService、ToolLedgerService、公开Runtime interface
 
 **工具服务（`ToolService`）**：
-`MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、grant、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet。每个loaded Session的SessionExecutor另行拥有独立file mutation queue（ADR 0116），Agent/Session/Turn领域对象不持有工具属性。
+`MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet。每个loaded Session的SessionExecutor另行拥有独立file mutation queue（ADR 0116），Agent/Session/Turn领域对象不持有工具属性。
 _避免_：session-scoped工具配置副本、UI工具层、Rig ToolServer替代品、平级helper-only模块
 
 **工具定义**：
@@ -384,7 +372,7 @@ _避免_：Rig tools、UI 工具列表
 _避免_：所有工具、工具开关 UI
 
 **工具策略（`ToolPolicy`）**：
-`Tools` 子系统内部的纯策略判断器。它根据工具定义、prepared invocation、工作区信任、沙箱结果、用户设置和 grant 决定允许、拒绝、要求审批、改写参数、强制串行或中止运行；后期启用 hook system 时可以叠加 hook 结果。它不等待 UI、不执行工具、不构造需要 I/O 的 preview。
+`Tools` 子系统内部的纯策略判断器。它根据工具定义、prepared invocation、工作区信任、沙箱结果和用户设置决定允许、拒绝、要求审批、改写参数、强制串行或中止运行；后期启用 hook system 时可以叠加 hook 结果。它不等待 UI、不执行工具、不构造需要 I/O 的 preview。
 _避免_：审批弹窗、工具执行器、UI 权限系统、preview builder
 
 **工具审批代理（`ToolApprovalBroker`）**：
@@ -396,11 +384,11 @@ _避免_：UI回调、durable Interaction替代品、长期授权存储、公开
 _避免_：独立approval truth、RuntimeSnapshot全局pending列表、可由UI修改的工具参数
 
 **工具审批决定（`ToolApprovalDecision`）**：
-`InteractionCommand::Resolve`中的typed ToolApproval resolution，可以ApproveOnce、ApproveGrant或Reject；它不能替换工具参数，也不能直接执行工具。grant不跳过schema validation、hard deny、sandbox、mutation ordering或audit。
+`InteractionCommand::Resolve`中的typed ToolApproval resolution，可以ApproveOnce、ApproveWithRestrictions或Reject；它不能替换工具参数，也不能直接执行工具。approval不跳过schema validation、hard deny、sandbox、mutation ordering或audit，也不保存跨调用授权。
 _避免_：工具策略决定、工具参数、用户命令结果
 
 **工具执行协调器（`ToolExecutionCoordinator`）**：
-`Tools` 子系统内部的 batch 执行协调器。它执行已经声明的 parallel/sequential、approval wait、grant、并发限制和 mutation lock 约束，并按 LLM source `call_index` 稳定回填结果；它不根据工具名自行发明执行策略。
+`Tools` 子系统内部的 batch 执行协调器。它执行已经声明的 parallel/sequential、approval wait、并发限制和 mutation lock 约束，并按 LLM source `call_index` 稳定回填结果；它不根据工具名自行发明执行策略。
 _避免_：独立 scheduler、LLM 策略解释器、工具执行器
 
 **工具沙箱视图（`ToolSandboxView`）**：
@@ -428,7 +416,7 @@ _避免_：ModelGateway替代品、AgentLoop adapter、provider选择器、重�
 _避免_：模型显示名、API model name、Rig 模型类型
 
 **Turn模型快照（`TurnModelSnapshot`）**：
-Turn admission期间由ModelGateway根据ModelSelection解析的immutable execution value，pin exact ModelDefinitionRef、capabilities、effective limits、generation policy和TurnModelFingerprint。它可以携带crate-private opaque execution reference，但不暴露endpoint、auth reference、credential或provider client。
+Turn admission期间由ModelGateway根据ModelSelection解析的immutable execution value，pin exact ModelDefinitionRef、ModelDefinitionVersion、capabilities、effective limits和generation policy。它可以携带crate-private opaque execution reference，但不暴露endpoint、auth reference、credential或provider client。
 _避免_：ModelSummary、current catalog lookup、cross-model fallback plan
 
 **模型状态（`ModelState`，pre-refactor term）**：
@@ -471,7 +459,7 @@ _避免_：durable Message、第二event log、cancellation token
 _避免_：SummaryModelRequest、ModelCallRequest、AssembledModelContext、系统提示词状态
 
 **压缩计划（`CompactionPlan`）**：
-从committed conversation、active Turn initiating UserMessage保护、stable-unit boundaries和context budget确定的crate-private immutable plan。首版固定使用portable rolling SummaryModel，不根据模型名称选择ProviderNative，也不使用deterministic conversation truncation。plan携带source checkpoint、summarized-through、retained-from、protected EntryIds和plan fingerprint；它不是durable entry或公开协议对象。
+从committed conversation、active Turn initiating UserMessage保护、stable-unit boundaries和context budget确定的crate-private immutable plan。首版固定使用portable rolling SummaryModel，不根据模型名称选择ProviderNative，也不使用deterministic conversation truncation。operation持有同一个`Arc<CompactionPlan>`及其immutable settings、budget、directive、source和request；durable entry只保存exact source checkpoint、typed boundaries/provenance与模型调用结果，不保存派生plan摘要。
 _避免_：CompactionMethod、GPT压缩、Claude压缩、provider endpoint、UI handler
 
 **上下文限制错误（`ContextOverflow`）**：
@@ -515,7 +503,7 @@ _避免_：UI 动画流程、内部函数调用顺序
 _避免_：前端 store、流程图、内部实现步骤
 
 **会话写入器（`SessionWriter`）**：
-所有会话ledger mutation共用的可信写入seam。它接受一个`SessionEntryDraft`，校验parent/operation key和body contract，分配storage-owned identity，append一条JSONL entry并返回`CommittedSessionEntry`。只有receipt被全部required projections应用后，领域事实才可通知host或进入模型conversation。
+所有会话ledger mutation共用的可信写入seam。它接受一个`SessionEntryDraft`，校验expected current parent、body contract和cross-entry references，分配storage-owned identity，append一条JSONL entry并返回`CommittedSessionEntry`。只有receipt被全部required projections应用后，领域事实才可通知host或进入模型conversation。
 _避免_：事件发布器、业务调度器、UI保存状态、通用数据库事务管理器
 
 **会话条目草稿（`SessionEntryDraft`）**：

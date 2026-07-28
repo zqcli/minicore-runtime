@@ -20,8 +20,8 @@
    }
    ```
 
-   该response只表示target/generation仍处于可取消状态且取消信号已经发布，不表示Turn已经terminal，也不承诺外部副作用已回滚。
-2. **duplicate Cancel立即返回同一accepted cancel epoch**。stale Submit CommandId、TurnId或generation返回既有typed stale/terminal error，不能影响current或future Turn。`EmergencyControl`不再保存Cancel completion subscribers；它只保存O(1) active target、generation、sticky epoch与token。
+   该response只表示active target仍处于可取消状态且取消信号已经发布，不表示Turn已经terminal，也不承诺外部副作用已回滚。
+2. **duplicate Cancel立即返回同一accepted cancel epoch**。stale Submit CommandId或TurnId返回既有typed stale/terminal error，不能影响current或future Turn。`EmergencyControl`不再保存Cancel completion subscribers；它只保存O(1) active target、sticky epoch与token。
 3. **Cancel立即停止逻辑推进**。signal发布后触发current operation cancellation token；Executor观察后递增`execution_version`、进入`SessionExecutionState::Finishing`、立即发布snapshot/`session_execution_changed`，不再启动新的Model、Tool、Compaction或Steer。迟到Model/Context/Compaction结果按stale result丢弃。
 4. **`Finishing`是公开的停止/收口状态**。不新增`TurnExecutionPhase::Cancelling`；当`SessionExecutionState = Finishing`时，UI必须优先显示Stopping/Finishing，current Turn phase只保留为最后工作位置的diagnostic。
 5. **Tool取消采用结构化收口**：
@@ -48,7 +48,7 @@
 
 - UI收到`CancelAccepted`后可以立即恢复输入，并将新输入路由为FollowUp；同Session执行仍等待旧Turnterminal后继续。
 - Cancel command成功不等于外部副作用停止；UI可显示Stopping，最终结果以`turn_interrupted`、ToolResult/ToolAbandoned和Snapshot为准。
-- `EmergencyControl`移除Cancel completion subscriber集合，状态更小；PrepareForUnload仍保留自己的shared completion generation。
+- `EmergencyControl`移除Cancel completion subscriber集合，状态更小；PrepareForUnload仍保留自己的shared completion waiter。
 - O6通过复用Finishing、即时CancelAccepted与FollowUp queue关闭。
 
 ## 测试要求
@@ -67,4 +67,4 @@
 
 ## 修订关系
 
-本ADR修订[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)的Cancel shared completion generation、`runtime-interface.md`的Cancel response线性化点和`session-execution.md`的Cancel流程，并关闭`docs/review/v2-design-review.md`的O6。Tool truthfulness、单SessionExecutor/Writer owner、一个current Turn和FollowUp process-local语义保持不变。
+本ADR修订[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)的Cancel completion语义、`runtime-interface.md`的Cancel response线性化点和`session-execution.md`的Cancel流程，并关闭`docs/review/v2-design-review.md`的O6。Tool truthfulness、单SessionExecutor/Writer owner、一个current Turn和FollowUp process-local语义保持不变。

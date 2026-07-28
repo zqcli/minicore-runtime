@@ -67,7 +67,7 @@ MiniCore 不复制：
 - 后续每一物理行是一条完整 `StoredSessionEntry`；
 - 一条 newline-terminated entry 是 process-crash visibility unit；
 - entry 使用 `EntryId + parent_id` 形成 immutable history tree；
-- 不建立 `BatchId`、`StoredSessionBatch`、batch fingerprint 或 interior-entry 概念；
+- 不建立 `BatchId`、`StoredSessionBatch`、batch-level identity 或 interior-entry 概念；
 - entry 身份只用随机 `EntryId` + `parent_id`；不建立 durable 可重建 operation key，也不做 same-key 冲突检测；乐观并发只靠 `expected_current_entry`；
 - storage append acknowledgement unknown 时 poison writer 并保守终结；恢复在下次 load 读 committed prefix 后按状态处理，不做 in-run replay-by-key；
 - entry 顶层类别固定为 `TurnContext | Message | Event | Compaction`；
@@ -227,7 +227,6 @@ pub struct SessionHeader {
 pub struct ForkOrigin {
     pub source_session_id: SessionId,
     pub source_entry_id: Option<EntryId>,
-    pub source_transcript_fingerprint: TranscriptFingerprint,
 }
 ```
 
@@ -241,8 +240,8 @@ by-entry layout是首个正式Session ledger `format_version = 1`。没有已发
 
 ```jsonl
 {"type":"session","formatVersion":1,"sessionId":"s1","createdAt":"2026-07-16T10:00:00Z"}
-{"id":"e1","parentId":null,"timestamp":"2026-07-16T10:00:01Z","operationKey":"turn:t1:context","type":"turn_context","turnId":"t1","executionFingerprint":"ctx1"}
-{"id":"e2","parentId":"e1","timestamp":"2026-07-16T10:00:02Z","operationKey":"turn:t1:user","type":"message","role":"user","turnId":"t1","itemId":"i1","source":"input","contextEntryId":"e1","content":[{"type":"text","text":"读取 README"}]}
+{"id":"e1","parentId":null,"timestamp":"2026-07-16T10:00:01Z","type":"turn_context","turnId":"t1","agent":{"revision":"a1"},"model":{"selection":"default","definitionVersion":"m1"}}
+{"id":"e2","parentId":"e1","timestamp":"2026-07-16T10:00:02Z","type":"message","role":"user","turnId":"t1","itemId":"i1","source":"input","contextEntryId":"e1","content":[{"type":"text","text":"读取 README"}]}
 ```
 
 ## Entry Envelope
@@ -295,35 +294,30 @@ pub struct StoredTurnContext {
     pub agent: AgentRevisionRef,
     pub model: TurnModelRef,
     pub workspace: WorkspaceSnapshotRef,
-    pub prompt_fingerprint: PromptFingerprint,
-    pub tool_fingerprint: ToolSetFingerprint,
-    pub skill_fingerprint: SkillViewFingerprint,
-    pub execution_fingerprint: ExecutionContextFingerprint,
     pub diagnostics: Arc<[StoredContextDiagnostic]>,
 }
 
 pub struct StoredSessionDefinitionRef {
     pub session_id: SessionId,
     pub revision: SessionDefinitionRevision,
-    pub content_fingerprint: ContentHash,
 }
 
 pub struct TurnModelRef {
     pub selection: ModelSelection,
     pub definition_version: ModelDefinitionVersion,
-    pub turn_model_fingerprint: TurnModelFingerprint,
+    pub effective_limits: EffectiveModelLimits,
+    pub generation: EffectiveGenerationPolicy,
 }
 
 pub struct WorkspaceSnapshotRef {
     pub session_id: SessionId,
     pub workspace_revision: WorkspaceRevision,
-    pub workspace_fingerprint: WorkspaceFingerprint,
 }
 ```
 
-`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。`TurnModelRef`保存stable selection、exact model definition version和覆盖effective capability/generation policy的TurnModelFingerprint；它不保存endpoint、auth binding或credential。`WorkspaceSnapshotRef.workspace_fingerprint`是当时Runtime生成的opaque historical label，不是current authority、可恢复capability或重新resolve指令；cold replay不得重算或用于grant lookup、approval reuse、Sandbox admission或其他授权判断。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
+`StoredSessionDefinitionRef`是历史exact reference，不是“读取target Session current head”的指令。`TurnModelRef`保存stable selection、exact model definition version和actual typed effective limits/generation policy；它不保存endpoint、auth binding或credential。`WorkspaceSnapshotRef`保存source Session与exact workspace revision；cold replay不得用它重新resolve current Workspace，也不得用于approval reuse、Sandbox admission或其他授权判断。被fork的历史TurnContext保留source-scoped exact reference；child的`SessionDefinitionRevision(1)`只治理future Turn。retention/purge必须保留仍被历史entry引用的immutable definition content。
 
-`prompt_fingerprint`、`tool_fingerprint`、`skill_fingerprint`和`execution_fingerprint`同样只记录当时capture事实。包含process-local Workspace child fingerprint的值不要求跨Runtime重建；unfinished Turn按conservative recovery关闭，future Turn创建新的Context。
+`StoredTurnContext`只保存能够长期解释的exact durable refs、actual typed model values和safe diagnostics。Prompt/Tool/Skill shared objects没有durable ref，因此不保存占位摘要；selected PromptId已经属于exact Session/Agent definitions，Skill正文provenance随committed UserMessage contribution保存，Tool调用事实随assistant/tool entries保存。MVP明确不从TurnContext entry重建旧PromptSet、ToolSet、SkillView或WorkspaceSnapshot；unfinished Turn按conservative recovery关闭，future Turn创建新的Context。
 
 Context entry在initiating UserMessage前append，由UserMessage通过`context_entry_id`引用。
 
@@ -332,7 +326,7 @@ Context append成功不创建领域Turn，也不允许调用模型或执行Tool�
 Context不保存：
 
 - provider credentials；
-- process-local security signal/generation；
+- process-local security signal；
 - approval waiter；
 - cancellation token；
 - mutable cache state；
@@ -357,12 +351,42 @@ role = user | assistant | tool
 ### User Message
 
 ```rust
+pub struct StoredPromptContributionStamp {
+    pub source: StoredPromptContributionSource,
+    pub content_start: u32,
+    pub content_end_exclusive: u32,
+}
+
+pub enum StoredPromptContributionSource {
+    Skill {
+        skill_id: SkillId,
+        source: StoredSkillSourceRef,
+    },
+    Workspace {
+        root_key: WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        trust: WorkspaceRootTrust,
+    },
+}
+
+pub enum StoredSkillSourceRef {
+    Shared {
+        location: SkillLocation,
+    },
+    Workspace {
+        root_key: WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        trust: WorkspaceRootTrust,
+    },
+}
+
 pub struct StoredUserMessage {
     pub turn_id: TurnId,
     pub item_id: ItemId,
     pub source: StoredUserMessageSource,
     pub context_entry_id: Option<EntryId>,
     pub content: Arc<[UserContent]>,
+    pub contribution_stamps: Arc<[StoredPromptContributionStamp]>,
 }
 
 pub enum StoredUserMessageSource {
@@ -380,8 +404,10 @@ pub enum StoredUserMessageSource {
 - Steer entry append后才影响下一次逻辑模型调用；
 - FollowUp不保存为Steer，它在下一Turn写新的Input message；
 - Interaction resolution不是User message。
+- SessionWriter只接受PromptSet产生的opaque `PromptContributionStamp`，通过只读getter把它转换为上述stored DTO后append；cold replay直接decode stored DTO，不需要也不能调用Prompt runtime constructor；
+- `contribution_stamps`与CanonicalUserMessage一起append，保存Skill/Workspace typed contribution provenance；每个content range必须non-empty、in-bounds、按content顺序排列且不重叠，source provenance必须通过typed validation；`StoredSkillSourceRef::Shared`只接受`SkillLocation::Shared`，Workspace variant的root key必须存在于TurnContext exact WorkspaceRevision引用的historical definition且relative location合法；stored trust只作historical provenance round-trip，不在cold replay时重新执行authority判断。writer和cold replay共用该校验，不能由caller补写未出现的来源；
 
-Input/Steer message entry本身就是canonical content和durable lifecycle fact，不再重复写`TurnStarted`或`SteerCommitted` event。
+Input/Steer message entry本身就是canonical content、contribution provenance和durable lifecycle fact，不再重复写`TurnStarted`或`SteerCommitted` event。
 
 ### Assistant Message
 
@@ -398,7 +424,6 @@ pub struct StoredAssistantMessage {
     pub finish_reason: ModelFinishReason,
     pub provider_metadata: StoredProviderResponseMetadata,
     pub retry_count: u32,
-    pub assembled_context_fingerprint: AssembledModelContextFingerprint,
 }
 
 pub struct StoredProviderResponseMetadata {
@@ -584,12 +609,13 @@ resolution与terminal cleanup必须由单一SessionExecutor线性化。late reso
 ```rust
 pub struct StoredToolExecutionStarted {
     pub turn_id: TurnId,
+    pub assistant_entry_id: EntryId,
     pub item_id: ItemId,
     pub tool_call_id: ToolCallId,
     pub resolved_tool_name: ToolName,
-    pub invocation_fingerprint: ContentHash,
-    pub requirements_fingerprint: ContentHash,
-    pub authorization_fingerprint: ContentHash,
+    pub frozen_arguments: Value,
+    pub requirements: ToolRequirements,
+    pub effective_permissions: PermissionSet,
     pub started_at: Timestamp,
 }
 ```
@@ -601,7 +627,7 @@ tool_execution_started append + apply
 → side effect
 ```
 
-该entry证明准备执行的frozen intent，但baseline recovery仍不自动重放。
+该entry通过assistant ToolCall/Item reference、resolved ToolName、exact frozen arguments、exact ToolRequirements和effective permissions证明准备执行的truthful intent，但baseline recovery仍不自动重放。
 
 ### ToolAbandoned
 
@@ -652,7 +678,6 @@ append成功后：
 
 - 所有关联ToolInvocation已是Completed operational state；
 - conversation projector一次性追加assistant content和ordered tool messages；
-- transcript fingerprint只在此entry改变；
 - 下一次实际模型调用才可开始。
 
 若crash发生在部分/全部tool message已append但completion event尚未append：
@@ -684,13 +709,13 @@ Interrupted/Failed event不向model conversation追加synthetic assistant messag
 
 `StoredCompaction`、`CompactionScope`、`ConversationBoundary`和`StoredCompactionModelCall`的权威schema见[Compaction](compaction.md#storedcompaction)。ConversationStorage只负责证明这些typed fields可以安全应用到selected committed path。
 
-scope中的`summarized_through`表示本次source effective projection中最后一个被摘要unit，inclusive；`retained_from`表示第一个原样保留unit，inclusive。active-Turn scope另保存selected exact UserMessage anchor（initiating或Steer）和该instruction segment的optional `previous_checkpoint`。该字段指向当前effective checkpoint；它覆盖的原始范围必须从backing `StoredCompaction`的scope provenance派生，不能把checkpoint boundary当成原始covered-through frontier。writer通过source projection证明boundary的相邻、anchor、provenance和frontier单调关系。`unit_fingerprint`覆盖unit kind、ordered model-visible content和backing reference shape，但不覆盖storage-local EntryId，因此fork remap first/last EntryId后fingerprint保持不变。
+scope中的`summarized_through`表示本次source effective projection中最后一个被摘要unit，inclusive；`retained_from`表示第一个原样保留unit，inclusive。active-Turn scope另保存selected exact UserMessage anchor（initiating或Steer）和该instruction segment的optional `previous_checkpoint`。该字段指向当前effective checkpoint；它覆盖的原始范围必须从backing `StoredCompaction`的scope provenance派生，不能把checkpoint boundary当成原始covered-through frontier。`ConversationBoundary`只保存unit first/last `EntryId`。writer通过source projection证明boundary的相邻、anchor、provenance、typed entry shape和frontier单调关系。fork remap全部nested `EntryId`后必须对target staging执行完整replay和structural validation。
 
 Compaction entry本身触发conversation Replace，不另写`compaction_completed` durable event。
 
 规则：
 
-- source checkpoint和TranscriptFingerprint必须exact match；
+- source checkpoint必须exact match；
 - `ConversationPrefix`必须是active Turn之前的连续prefix与相邻retained suffix；
 - `ActiveTurnCompletedPrefix`必须保留selected exact initiating或Steer UserMessage anchor，只覆盖其后、下一条active UserMessage之前已经完整提交的连续units；若存在`previous_checkpoint`，必须先解析其backing compaction的covered-through provenance，新coverage只能在该segment内紧接其后单调推进；
 - cut不能拆分Input/Steer UserMessage、无ToolCallAssistant Continue、complete ToolRound、final assistant或existing Compaction summary；
@@ -699,7 +724,7 @@ Compaction entry本身触发conversation Replace，不另写`compaction_complete
 - compaction只追加overlay，不重写旧entries；
 - navigating/forking到compaction前的entry自然不应用该compaction；
 - 首版automatic Compaction固定`turn_id = Some(active TurnId)`且必须保存SummaryModel `model_call`；`None`只为未来maintenance/deterministic method预留；
-- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和field meaning，但使用CompactionSummary的0–1 bound；requested max output与summary budget fingerprint必须是合法、可round-trip的durable值。validated plan/directive/model-limit的一致性只在entry落盘前由Compaction、Prompt assembly、ModelCallRequest和SessionExecutor append gate共同证明；cold replay不重新声称验证已消失的临时plan或limits；
+- model_call usage与logical_retry_count遵守和assistant response相同的provider-truth、redaction和field meaning，但使用CompactionSummary的0–1 bound；requested max output、model ref、finish reason、usage和provider metadata必须是合法、可round-trip的durable值。validated plan/directive/model-limit的一致性只在entry落盘前由Compaction、Prompt assembly、ModelCallRequest和SessionExecutor append gate共同证明；cold replay不重新声称验证已消失的临时plan或limits；
 - physical retention/vacuum与conversation compaction分离。
 
 完整planning、protection和failure规则见[Compaction架构设计](compaction.md)。
@@ -715,7 +740,7 @@ fn validate_and_project(
 ) -> Result<CommittedProjectionDeltaSet, SemanticEntryError>;
 ```
 
-Compaction的plan、Prompt proof、`ModelCallRequest`和pinned `EffectiveModelLimits`只存在于当前Turn的内存执行上下文。SessionExecutor在调用`SessionWriter.append`前必须用`CompactionCommitCandidate`验证这些临时值与candidate/result完全一致；`validate_and_project`不接收也不依赖它们。这样append路径仍在落盘前fail closed，而冷重放只验证entry自身能够重建的scope、boundary、hash、checkpoint和provenance关系。
+Compaction的plan、Prompt proof、`ModelCallRequest`和pinned `EffectiveModelLimits`只存在于当前Turn的内存执行上下文。SessionExecutor在调用`SessionWriter.append`前必须用同一个`Arc<CompactionPlan>`、当前operation/version/control、exact source checkpoint和`CompactionCommitCandidate`验证这些临时值与candidate/result完全一致；`validate_and_project`不接收也不依赖它们。这样append路径仍在落盘前fail closed，而冷重放只验证entry自身能够重建的scope、boundary、typed entry、checkpoint和provenance关系。
 
 它集中验证entry body、Turn/Item/Interaction状态、cross-entry references、ToolRound完整性、Compaction boundaries和terminal closure，并生成全部trusted projection deltas。writer和replay不得各自维护一份语义规则。
 
@@ -772,7 +797,7 @@ replay按entry顺序调用同一个`validate_and_project`。因此必须成立�
 ```text
 append semantic validation ⊇ replay semantic validation
 writer成功commit的entry必然可以被projector语义接受
-live append/apply与cold replay得到相同projection fingerprint
+live append/apply与cold replay得到相同typed projection state
 ```
 
 若cold replay对writer在同一format version下commit的entry产生确定性semantic error，属于storage implementation bug或文件被外部篡改，不能描述为普通projection recovery。
@@ -810,7 +835,6 @@ pub(crate) struct CommittedConversationState {
 
 pub(crate) struct ConversationCheckpoint {
     entry_id: Option<EntryId>,
-    transcript_fingerprint: TranscriptFingerprint,
 }
 
 pub(crate) struct CommittedConversationView<'a> {
@@ -842,7 +866,7 @@ pub(crate) enum ConversationChange {
 - `tool_round_completed`是`Append`；
 - Compaction是`Replace`。
 
-`AdvanceOnly`不改变messages或TranscriptFingerprint，但推进ledger checkpoint。
+`AdvanceOnly`不改变messages，但推进ledger checkpoint。
 
 唯一构造来源：
 
@@ -1017,7 +1041,6 @@ provider session
 AgentLoop
 waiter/task
 任何process-local SessionIngress lane（含Steer/FollowUp）
-Session-scoped grants
 ```
 
 child下一Turn重新捕获Context。
@@ -1090,7 +1113,7 @@ Writable open/recovery：
 - ToolRoundCompleted missing/duplicate/misordered calls/results；
 - final assistant仍有Pending/Started state；
 - terminal Turn后出现属于同一Turn的new work；
-- compaction source checkpoint/fingerprint mismatch；
+- compaction source checkpoint、scope或provenance mismatch；
 - unknown authoritative core entry variant/version。
 
 未知的authoritative entry不能像普通UI event一样静默skip。未来如果需要可忽略extension diagnostics，应使用独立、明确non-authoritative trace facility，而不是向Session durable enum加入任意`Value`。
@@ -1217,7 +1240,7 @@ SessionWriter不决定：
 StoredSessionBatch
 SessionWriteBatch
 BatchId
-batch fingerprint
+batch-level identity
 batch commit marker/group protocol
 Branch entity
 ToolRound entity
@@ -1232,7 +1255,7 @@ content-addressed DAG
 
 ### 一行一个业务batch
 
-否决原因：将物理写入、history tree、ToolRound和terminal cleanup耦合为同一协议，增加BatchId/fingerprint/interior-entry/fork remap复杂度，不符合by-entry和历史fork设计。
+否决原因：将物理写入、history tree、ToolRound和terminal cleanup耦合为同一协议，增加BatchId、batch-level identity、interior-entry和fork remap复杂度，不符合by-entry和历史fork设计。
 
 ### 一条content block一个entry
 
@@ -1319,13 +1342,14 @@ content-addressed DAG
 - fork mid-Turn target-local interruption；
 - nested EntryId/TurnId/ItemId/RequestId remap；
 - copied historicalTurnContext保留source-scoped exact definition refs，child future definition独立；
-- compaction source fingerprint、scope/anchor/previous-checkpoint provenance和protected complete ToolRound；
+- compaction source checkpoint、scope/anchor/previous-checkpoint provenance和protected complete ToolRound；
 - active checkpoint滚动后live apply与replay在每个instruction segment只得到一个effective checkpoint；
 - summary budget已在plan、Prompt proof和model request前与pinned model known limits求交并闭合（storage cold replay只验证durable entry关系）；
-- SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count、requested max output、summary budget fingerprint和provider metadata round-trip；
+- SummaryModel compaction的TurnModelRef、usage、finish reason、logical retry count、requested max output和provider metadata round-trip；
 - Prompt永远看不到uncompleted ToolRound。
-- 任意writer接受的合法entry sequence经live apply与cold replay得到相同Turn/Item/Interaction/Conversation/Usage projection fingerprints；
+- 任意writer接受的合法entry sequence经live apply与cold replay得到相同Turn/Item/Interaction/Conversation/Usage typed projection state；
 - replay、live apply和fork remap得到相同的relative Turn/Item order，并且Tool逆序完成不会移动ToolInvocation Item；
+- 任意合法selected entry sequence经fork nested-ID remap后，target full replay/structural validation成功，并得到与source prefix等价的typed Turn/Item/Interaction/Conversation/Compaction projection（仅target-local IDs按规则变化）；
 - 注入semantic projector错误时必须在physical append前拒绝，不能生成cold replay才拒绝的committed entry。
 
 ## 设计覆盖范围

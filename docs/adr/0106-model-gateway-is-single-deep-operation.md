@@ -13,7 +13,7 @@
 ## 决策
 
 - ModelGateway 是 runtime-owned 深模块，对外只暴露两个 `pub(crate)` 操作：
-  - `resolve_for_turn(...)` 在 Turn capture 期间返回 immutable `TurnModelSnapshot`，固定 exact model definition、capabilities、effective limits 与 generation policy；catalog revision 变化只影响 future Turn。
+  - `resolve_for_turn(...)` 在 Turn capture 期间返回 immutable `Arc<TurnModelSnapshot>`，固定 exact model definition、capabilities、effective limits 与 generation policy；catalog重新发布只影响future Turn。
   - `generate_model_turn(ModelCallRequest, progress, cancel)` 是唯一真实模型调用 interface，返回一个 terminal `ModelCallResult` 或 typed `ModelCallError`。
 - Gateway拥有并隐藏provider catalog、credential/auth policy、single-attempt planning、stream lifecycle、usage、cache与continuation；这些都是private implementation detail，不进入MiniCoreRuntime interface。MVP retry policy由ADR 0119收窄为Gateway single attempt加Session logical retry。
 - ModelGateway 不重新组装 Prompt：PromptSet 产出的 `AssembledModelContext` 是模型上下文的唯一 producer；Gateway 不重新加载 message、不判断 message visibility、不截断或摘要 conversation。
