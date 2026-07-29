@@ -917,66 +917,9 @@ Session active时由Session层的PrepareForUnload停止admission并等待自然t
 
 ## Turn Pinning
 
-Turn admission 时，SessionExecutor 原子捕获当前 WorkspaceSnapshot：
+Turn admission时，SessionExecutor把current `Arc<WorkspaceSnapshot>`交给TurnExecutionContext的canonical capture流程。完整依赖图、private constructor和跨资源同源校验只在[Turn执行模块与执行上下文](turn-execution-context.md#context-capture)维护，并由[INV-201](../architecture.md#跨模块不变量索引)约束；Workspace module不保存该图的副本。
 
-```rust
-let workspace = session
-    .workspace_state()
-    .require_ready()?
-    .snapshot
-    .clone();
-```
-
-推荐 capture 依赖图：
-
-```text
-exact SessionDefinitionRevision + AgentRevisionRef + candidate TurnId
-+ AgentPromptSelection + SessionPromptSelection
-+ shared-gate captured PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
-+ Arc<WorkspaceSnapshot>
-├─ ModelGateway::resolve_for_turn(captured ModelCatalogView, ...) → Arc<TurnModelSnapshot>
-├─ SkillService::for_turn(captured SkillResourceView, SkillViewContext {
-│    agent, session_id, session_revision, workspace: workspace.skill_context()
-│  }) → Arc<SkillView>
-└─ ToolService::for_turn(captured ToolResourceView, ToolTurnContext {
-     agent, session_id, session_revision, turn_id,
-     workspace: workspace.tool_context(),
-     tool_calling: model.capabilities().tool_calling.clone(),
-     execution_control, cancellation, progress_events
-   }) → Arc<ToolSet>
-
-captured PromptResourceView
-+ SkillView.prompt_view()
-+ ToolSet.prompt_view()
-+ workspace.prompt_context()
-+ exact AgentPromptSelection / SessionPromptSelection
-+ TurnModelSnapshot
-→ PromptService::for_turn(...)
-→ Arc<PromptSet>
-→ TurnExecutionContext
-```
-
-SkillView与ToolSet没有直接依赖，可以并行捕获；PromptSet在PromptResourceView、SkillPromptView和ToolPromptView就绪后创建。ToolPromptView只能由parent ToolSet私有投影，SkillPromptView只能由captured SkillView私有投影，调用方不能伪造或替换。
-
-```rust
-pub(crate) struct TurnExecutionContext {
-    session_id: SessionId,
-    session_revision: SessionDefinitionRevision,
-    agent: AgentRevisionRef,
-    model: Arc<TurnModelSnapshot>,
-    workspace: Arc<WorkspaceSnapshot>,
-    skill_service: Arc<SkillService>,
-    skill_context: SkillViewContext,
-    skill_view: Arc<SkillView>,
-    tool_set: Arc<ToolSet>,
-    prompt_set: Arc<PromptSet>,
-    diagnostics: Arc<[TurnContextDiagnostic]>,
-}
-```
-
-字段保持私有，避免不同Turn的Workspace、SkillView、ToolSet和PromptSet被交叉组合。完整 capture、逻辑模型调用、AgentLoop 和 recovery 规则见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
-
-Turn 领域对象仍不持有 Workspace。只有 Turn execution context pin Snapshot。
+Workspace在该流程中只保证：candidate来自current exact SessionDefinitionRevision、Snapshot已经resolve且Ready、Prompt/Skill/Tool窄view均从同一immutable Snapshot投影。Turn领域对象仍不持有Workspace，只有Turn execution context pin Snapshot。
 
 同一 Turn 内：
 
@@ -1009,6 +952,8 @@ Session Starting / Running / Finishing
 Host希望在长Turn中修改Workspace时，显式执行`Cancel → wait session_settled → UpdateDefinition`。Runtime不提供queued Workspace update、WaitForIdle或隐式Cancel。
 
 ### Authority Hard Restriction
+
+Tool start与SecurityRevoked的first-wins/settlement合同由[INV-401](../architecture.md#跨模块不变量索引)定义；Workspace只拥有authority fact、Snapshot invalidation和重新resolve。本节不重复ToolOperationSlot状态机。
 
 managed hard deny、trust/policy store降级或host安全事件可以在active Turn期间触发`SecurityRevoked`，但它不是definition patch，也不创建假的WorkspaceRevision或SessionDefinitionRevision：
 

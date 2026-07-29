@@ -37,11 +37,11 @@ request_user_question(
 ### 3. 首版 producer 是独占的 pre-execution ask-user route
 
 - ToolSet 提供一个内建 ask-user route；具体公开 ToolName 不在本 ADR 冻结。
-- route 在`ToolExecutionStarted`、file mutation ticket reservation和任何外部副作用之前调用`request_user_question`。
-- 等待期间不预留mutation ticket，也不持有TurnControl reservation；该Interaction不需要伪造`ToolExecutionStarted`。
-- ask-user route 返回 `UserAnswer` 后生成 `PreExecution` truthful ToolResult，再按普通顺序 append `role=tool` 与 `tool_round_completed`。
-- 首版 ask-user Interaction 在一个 ToolRound 中独占等待；同一 assistant step 的其他 ToolCall 不得并行启动。这样当前 Turn 的“等待用户”语义不会与未决副作用混在一起。
-- 普通Tool在已经`ToolExecutionStarted`或开始file mutation后不得调用该seam；未来若确有需要，必须另行定义可证明不持有mutation permit的producer protocol。
+- route在owner-local Tool start reservation、file mutation ticket reservation和任何外部副作用之前调用`request_user_question`。
+- 等待期间不预留mutation ticket，也不持有TurnControl reservation或`ToolStartPermit`。
+- ask-user route返回`UserAnswer`后生成`PreExecution` truthful ToolResult并append `role=tool`；当同一assistant的全部matching results存在时，ConversationStorage自动形成complete exchange。
+- 首版ask-user Interaction在一个assistant Tool exchange中独占等待；同一assistant step的其他ToolCall不得并行启动。这样当前Turn的“等待用户”语义不会与未决副作用混在一起。
+- 普通Tool在start reservation已获胜或开始file mutation后不得调用该seam；未来若确有需要，必须另行定义可证明不持有mutation permit的producer protocol。完整start规则见[INV-401](../architecture.md#跨模块不变量索引)。
 
 ### 4. 等待语义
 
@@ -60,7 +60,7 @@ InteractionState = Pending
 
 ### 5. Session 隔离
 
-每个loaded Session拥有独立的SessionExecutor、InteractionControl lane、pending waiter、file mutation queue和`WaitingForUserInput` phase。Session A等待答案时，Session B/C可以继续Sampling、ExecutingTools或等待各自的Interaction。只有共享ModelGateway配额或宿主I/O可能造成正常竞争；UserQuestion等待本身不占用这些资源。
+每个loaded Session拥有独立的SessionExecutor、InteractionControl lane、pending waiter、file mutation queue和`WaitingForUserInput` phase。Session A等待答案时，Session B/C可以继续Sampling、ExecutingTools或等待各自的Interaction。provider/backend或共享宿主I/O可能产生正常外部竞争；UserQuestion等待本身不占用这些资源。
 
 ### 6. 公开协议不携带 UI 组件
 
@@ -78,7 +78,7 @@ Model ToolCall (ask-user)
 → InteractionResolved append/apply
 → 唤醒 Tool future
 → PreExecution ToolResult append
-→ tool_round_completed append
+→ matching result set complete时形成CommittedToolExchangeDelta
 → 同一 Turn 的下一次 Model 调用
 ```
 

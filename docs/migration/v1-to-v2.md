@@ -439,7 +439,7 @@ SessionExecutor NeedModel
 - FollowUp 使用 bounded process-local FIFO；
 - progress event 与全部mutation/control ingress lane分离；
 - restart 不恢复旧异步操作，unfinished Turn 保守 terminalize；
-- 每个loaded Session拥有独立file mutation queue：同Session同文件mutation FIFO，多文件/open-world Tool按批次Serial；跨Session共享Workspace不协调并由host/user负责隔离。ModelGateway继续提供共享provider并发限制；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。完整决策见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
+- 每个loaded Session拥有独立file mutation queue：同Session同文件mutation FIFO，多文件/open-world Tool按批次Serial；跨Session共享Workspace不协调并由host/user负责隔离。共享ModelGateway不设置本地模型调用permit，多个Session可直接进入各自provider attempt；WaitingForUserInput只暂停所属Session的逻辑Turn，不阻塞其他Session。完整决策见[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)与[ADR 0125](../adr/0125-model-gateway-has-no-local-call-permits.md)。
 - lane只拆ingress、不拆SessionExecutor/SessionWriter owner；完整决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)。
 - 异步同步不建设全局lock-rank系统：普通guard不跨await/owner调用，release后fan-out；有意的bounded异步串行使用typed permit和私有组合helper。完整决策见[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)。
 - Cancel在sticky epoch发布后立即返回typed`CancelAccepted`；Session进入Finishing完成write/process/remote Tool结构化收口，期间允许FollowUp排队，旧Turnterminal后再启动下一Turn。完整决策见[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。
@@ -677,6 +677,8 @@ Git 已经保存历史版本，因此不为了“以后可能查看”而保留�
 
 ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤。
 
+横切ADR的文档回写遵守[跨模块不变量索引](../architecture.md#跨模块不变量索引)纪律：先修改canonical owner，再检查直接interface消费者，随后更新review/handoff，最后检查archive/supersession说明。非owner文档只保留一句摘要与canonical链接。删除或替换机制时必须用旧类型、事件、字段和source-plan文件名执行`rg`残留扫描；命中只允许出现在明确的历史、否决或“已删除”说明中。
+
 被替代 ADR 的处理方式：
 
 ```text
@@ -766,7 +768,7 @@ Extension / Plugin 子系统只有在产品确实需要可安装扩展包时才�
 ADR 对应：
 
 - V1 ADR `0001`–`0028` 归档于 [`docs/archive/v1/`](../archive/v1/)。
-- V2 ADR采用`0100+`递增编号，位于[`docs/adr/`](../adr/)。Compaction当前决策由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录并取代ADR 0107；Session ingress由ADR 0111记录；AgentLoop、file mutation、async synchronization、Cancel、model retry、failure ownership、Workspace Idle-only update和execution identity/reload分别由ADR 0115–0123记录。
+- V2 ADR采用`0100+`递增编号，位于[`docs/adr/`](../adr/)。Compaction/replay当前形状由[ADR 0124](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)记录并取代ADR 0112的active-checkpoint形状；Session ingress由ADR 0111记录；AgentLoop、file mutation、async synchronization、Cancel、model retry、failure ownership、Workspace Idle-only update、execution identity/reload、tolerant replay和ModelGateway无本地permit决策由ADR 0115–0125记录。
 
 ## 当前迁移状态
 

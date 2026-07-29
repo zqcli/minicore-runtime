@@ -22,9 +22,9 @@
 - Context构造、UserMessage composition、Model调用与Tool执行作为cancellable `RunningOperation`异步运行，但每个Session最多一个current operation。主循环同时poll该future与SessionIngress wakeup，LifecycleControl grace deadline通过wakeup推进；等待UserQuestion时只暂停当前Tool future，不阻塞Executor；旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
 - Steer和FollowUp分别位于`SessionIngress`的bounded per-Turn `SteerQueue`与`FollowUpQueue`；各自只保留普通FIFO push/pop/remove语义，不拥有Session状态。Steer不取消Sampling；当前assistant/tool step完整committed后、下一次模型调用前pop一条。FollowUp在Turn terminal后最多pop一条并开启新Turn。
 - private `AgentLoop` 只返回 `NeedModel | NeedTools | Finished`，不拥有 storage、Prompt assembly、Tool execution、approval 或 Turn terminal 决策。
-- 所有 durable 动作遵循 `SessionWriter.append → apply projections → 依赖动作`；append/apply 是 append、可见性、side-effect、UI event 的唯一线性化点，顺序无歧义。
+- 所有durable动作遵循`SessionWriter.append → apply trusted projections → 依赖动作`；durable/model-visible事实和Interaction通知/恢复分别遵守[INV-001与INV-301](../architecture.md#跨模块不变量索引)。Tool side-effect start独立遵守owner-local[INV-401](../architecture.md#跨模块不变量索引)，不以durable append作为start marker。
 - restart 不恢复旧的异步操作、queue 或 waiter；unfinished Turn 按 recovery 规则保守 terminalize（closure、preserve tool messages、ToolAbandoned、TurnInterrupted）。
-- multi-session共享Model时使用ModelGateway provider配额；每个SessionExecutor拥有独立file mutation queue，只协调该Session同批sibling ToolCall。跨Session共享Workspace的并发mutation由host/user负责隔离或协调（ADR 0116）。
+- multi-session共享ModelGateway但不经过本地模型调用permit；多个Session可直接进入各自provider attempt，provider/backend负责外部容量反馈（ADR 0125）。每个SessionExecutor拥有独立file mutation queue，只协调该Session同批sibling ToolCall；跨Session共享Workspace的并发mutation由host/user隔离或协调（ADR 0116）。
 - 上下文压缩由 `SessionExecutor` 编排为 `CompactConversation` operation，不由 Driver 或 AgentLoop 拥有。
 
 ## 后果

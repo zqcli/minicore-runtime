@@ -71,7 +71,7 @@ MiniCore仍需保持SessionStorage durable truth、完整ToolRound cut、单一S
 
 本ADR取代[ADR 0107](0107-compaction-uses-strict-stable-suffix.md)。ADR 0107中关于durable truth、stable-unit cut、portable summary、PromptSet/ModelGateway唯一调用路径、append/apply后Replace、exact active-Turn model、control arbitration、restart/fork和不公开manual compaction的决策继续保留；连续retained suffix、active Turn全量hard-protect和单Turn仅一次overflow recovery由本ADR修订。
 
-2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Compaction相关transcript/plan/budget/directive/summary/stable-unit fingerprint条款。当前Compaction operation持有同一个`Arc<CompactionPlan>`（settings、budget、scope、source）与由其组装出的同一个`Arc<ModelCallRequest>`；exact rendered directive随request固定。append前验证exact source checkpoint、scope、boundaries、provenance、current Turn/version/control和actual typed entries。`StoredCompaction`只保存exact refs、typed scope/boundaries/provenance、summary text和model-call provenance。
+2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除Compaction相关fingerprint条款。2026-07-29：[ADR 0124](0124-session-replay-is-tolerant-and-links-are-minimal.md)进一步取代本ADR的active scope/boundary/provenance形状；当前plan只持有rolling-summary source、summary prefix、single `first_kept_entry_id` marker、budget/settings和同一个immutable request，`StoredCompaction`保存summary、single marker与safe model-call provenance。
 
 ## 被否决的方案
 

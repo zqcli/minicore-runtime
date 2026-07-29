@@ -283,6 +283,8 @@ Abandoned不生成synthetic ToolResult。
 
 ## Tool Side-Effect Start
 
+**Canonical cross-module invariant: INV-401.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+
 Tool side-effect start是current Runtime的执行状态：
 
 ```rust
@@ -444,6 +446,8 @@ pub enum InteractionResolution {
 - domain允许多个Pending Interaction，MVP execution policy可以收紧为同一assistant step独占ask-user等待。
 
 ## Interaction Append Order
+
+**Canonical cross-module invariant: INV-301.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
 
 ```text
 construct typed request

@@ -1170,6 +1170,8 @@ AgentMessage/Reasoning progress只属于独立provisional view，first-seen顺�
 
 ### Interaction Event
 
+request-before-notify与resolution-before-resume的durable顺序由[INV-301](../architecture.md#跨模块不变量索引)定义；Runtime Interface只冻结UI-safe view和host提交resolution所需route。
+
 `interaction_requested`必须携带UI-safe request：
 
 ```rust

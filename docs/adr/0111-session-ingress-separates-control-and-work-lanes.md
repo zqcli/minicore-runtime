@@ -30,11 +30,11 @@ Authority hard restriction与普通Cancel都需要out-of-band sticky signal，�
 | `PrepareForUnload` | `LifecycleControl` | sticky stop-admission signal、有限grace deadline和shared completion waiter |
 | `GetSnapshot` | `SnapshotMailbox` | latest-wins/coalesced immutable published view |
 
-各 Session 的 lane 容量完全独立。Session A 的 ingress 满不会占用 Session B 的容量；跨 Session 仍可能在 ModelGateway 配额和共享宿主I/O处等待。File mutation queue按Session独立，不造成跨Session等待（ADR 0116）。
+各Session的lane容量完全独立。Session A的ingress满不会占用Session B的容量；共享ModelGateway不设置本地模型调用permit，多个Session可直接进入各自provider attempt，provider/backend与共享宿主I/O仍可能产生外部竞争（ADR 0125）。File mutation queue按Session独立，不造成跨Session等待（ADR 0116）。
 
 ### Emergency 与 Tool side effect
 
-`Cancel`先原子校验current immutable `CancelTarget`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn发布新的active target和token。Executor在启动新Model、预留或继续file mutation ticket、`ToolExecutionStarted` append前、`tool_round_completed`前和terminal Assistant append前观察最新emergency epoch。
+`Cancel`先原子校验current immutable `CancelTarget`，只触发该target绑定的operation cancellation token，不等待普通bounded lane。stale TurnId或Submit CommandId不得取消当前或下一Turn；目标terminal后signal retire，新Turn发布新的active target和token。Executor在启动新Model、发放owner-local Tool start reservation、预留或继续file mutation ticket、提交Tool result和terminal Assistant前观察最新emergency epoch。
 
 `SessionIngress`内部使用一个非持久化`TurnControlGate`使检查与短append可线性化。它不是actor或状态owner，只提供原子CAS式的active target、emergency epoch、Steer admission gate和controlled append reservation：
 
@@ -46,10 +46,12 @@ LifecycleControl的stop-admission transition与Submit/Steer/FollowUp `try_admit`
 
 这些gate只依据Executor发布的immutable active target和admission state做容量预留和race排序；领域validation、typed completion、StateEvent publication和所有durable mutation仍由SessionExecutor确认。
 
-`ToolExecutionStarted` append/apply是副作用竞态的真实线性化点：
+Tool副作用竞态由owner-local `ToolStartPermit/ToolOperationSlot`线性化，不写durable start marker：
 
-- Cancel/SecurityRevoked先被观察：拒绝新的execution start；
-- `ToolExecutionStarted`先append/apply：副作用可以开始，之后必须保存真实outcome；Cancel只能best-effort取消，不能声称回滚。
+- Cancel/SecurityRevoked先赢：拒绝新的execution start；
+- start reservation先赢并进入Running：副作用可以开始，之后必须truthful settle exact outcome或`ToolAbandoned`；Cancel只能best-effort取消，不能声称回滚。
+
+完整规则见[INV-401](../architecture.md#跨模块不变量索引)。
 
 Authority/host hard restriction先发布current security/policy fact，再通过Runtime current loaded map向对应`SessionExecutionHandle`设置sticky `SecurityRevoked`并唤醒Executor；存在candidate/current Turn时同时绑定current target。即使Executor尚未处理signal，owner-local admission gate与`TurnControlGate`也会阻止new admission/controlled append/Tool start/Model start。Idle直接resolve，Starting取消candidate，active Turn terminal后resolve；成功后signal retire。old handle关闭后不得把signal转发到new Executor，future Turn使用new Snapshot和新的active target。
 

@@ -17,7 +17,7 @@ V1 → V2 的版本迁移记录见 [`docs/migration/v1-to-v2.md`](migration/v1-t
 
 MiniCore 的 AgentLoop 是自研的 crate-private 协议状态机（[ADR 0115](adr/0115-agent-loop-is-first-party-state-machine.md)）；Rig只用于实现`ModelGateway` private `ProviderAdapter`，保持为实现细节。`RigProviderAdapter`只编码并执行具体provider的单次attempt、桥接stream/cancellation并映射provider响应，SDK automatic retry固定为0；model resolution、request validation、auth policy、progress lifecycle、cache/continuation policy、错误分类和provider-neutral terminal result由`ModelGateway`拥有，logical retry由`SessionExecutor`拥有。下游 CLI、TUI、GUI 宿主只通过 `MiniCoreRuntime` 的 command、query、event 和 snapshot 交互，不依赖 Rig 类型、模型提供方类型或工具实现细节。pi、Codex 等项目可以作为设计参考，但除非文档明确标注兼容契约，否则其类型、调用方式和行为都不是 MiniCore 的兼容目标。
 
-MiniCore 不重新实现 provider SDK 的底层 sampling/tool-call protocol，也不重新实现 provider HTTP client。模型返回 ToolCall 时，Session execution先append完整assistant/intermediate entry，再由ToolService执行工具治理；每个truthful result独立append为tool message。live路径中，同一assistant response的全部ToolCall都存在exactly one matching ToolResult时，Conversation projector自动形成完整Tool exchange并推进模型可见conversation，不再写独立`ToolRoundCompleted` marker；cold replay对duplicate result采用first-valid-wins并报告diagnostic。真实模型调用统一进入共享`ModelGateway`的深异步operation，再由其private `ProviderAdapter`执行具体provider attempt；首个production adapter使用Rig的provider client能力。
+MiniCore 不重新实现 provider SDK 的底层 sampling/tool-call protocol，也不重新实现 provider HTTP client。模型返回 ToolCall 时，Session execution先append完整assistant/intermediate entry，再由ToolService执行工具治理；每个truthful result独立append为tool message。live路径中，同一assistant response的全部ToolCall都存在exactly one matching ToolResult时，Conversation projector自动形成完整Tool exchange并推进模型可见conversation，不再写独立`ToolRoundCompleted` marker；cold replay对duplicate result采用first-valid-wins并报告diagnostic。真实模型调用统一进入共享`ModelGateway`的深异步operation，再由其private `ProviderAdapter`执行具体provider attempt；首个production adapter使用Rig的provider client能力。共享Gateway支持多个Session直接并发调用，不设置Runtime global、provider route、model或auth-principal模型调用permit；provider 429、quota、`Retry-After`和cooldown仍按typed error处理（ADR 0125）。
 
 ## 领域模型
 
@@ -197,7 +197,7 @@ Steer after complete assistant/tool step
   → AgentLoop.accept_committed_steer(CommittedSteerDelta)
 ```
 
-`SessionStorage`是已写入conversation/message/lifecycle history的durable truth；live writer严格校验，cold replay跳过或隔离局部损坏并返回diagnostics。`CommittedConversationState`在session open/recovery时从sanitized selected path建立，稳态应用成功append receipt返回的trusted delta。未append的draft不能进入模型调用；含ToolCall的assistant只有在全部matching ToolResult存在时才与ordered results一起进入conversation。无ToolCall Assistant Continue在append/apply时model-visible但不terminalize Turn；final AssistantMessage append/apply后才发布completed terminal。
+`SessionStorage`是已写入conversation/message/lifecycle history的durable truth，并唯一拥有strict live append、tolerant replay和complete Tool exchange projection。架构总览只保留导航：commit可见性见[INV-001](#跨模块不变量索引)，cold replay见[INV-002](#跨模块不变量索引)，Tool exchange模型可见性见[INV-003](#跨模块不变量索引)；完整顺序以ConversationStorage canonical sections为准。
 
 ## 模块文档地图
 
@@ -216,16 +216,33 @@ Steer after complete assistant/tool step
 
 模块索引与权威归属见 [模块总览](modules/README.md)。
 
+## 跨模块不变量索引
+
+这里只索引同时被至少三个module消费、错误会影响correctness/security且预计继续演进的规则。完整定义只保留在canonical owner；其他文档只能给出一句摘要并链接，不维护可独立修改的完整副本。
+
+| ID | 不变量摘要 | Canonical Owner |
+| --- | --- | --- |
+| INV-001 | live entry只有成功strict append并应用storage-owned trusted delta后才可通知、恢复waiter或进入模型conversation | [ConversationStorage · Strict Live Append](modules/conversation-storage.md#strict-live-append) |
+| INV-002 | cold replay顺序扫描完整行，局部skip/isolate并返回diagnostics，不恢复process-local execution object | [ConversationStorage · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
+| INV-003 | 含ToolCall的assistant只有在全部matching terminal results形成provider-valid complete exchange后才model-visible | [ConversationStorage · Tool Exchange Projection](modules/conversation-storage.md#tool-exchange-projection) |
+| INV-101 | 每个loaded Session只有一个mutable Executor owner和一个current RunningOperation；旧结果必须先失效/关闭结果路径 | [Session Execution · Running Operation](modules/session-execution.md#running-operation) |
+| INV-102 | Steer只在完整assistant/tool step committed后、下一次Model前FIFO消费并append/apply | [Session Execution · Steer流程](modules/session-execution.md#steer流程) |
+| INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象，不读取future current value | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
+| INV-301 | Interaction request append/apply后才notify；resolution append/apply后才resume waiter或开始受保护副作用 | [Turn / Item / Interaction · Interaction Append Order](modules/turn-item-interaction.md#interaction-append-order) |
+| INV-401 | Tool side-effect start由owner-local reservation与EmergencyControl first-wins；Running后Cancel/SecurityRevoked只能truthful settle | [Turn / Item / Interaction · Tool Side-Effect Start](modules/turn-item-interaction.md#tool-side-effect-start) |
+
+`compaction.md`中的`COMP-xxx`继续作为Compaction module内部不变量，不迁移到本表。新增ID必须满足上述门槛；普通局部约束留在owner module，不为编号完整性扩张本索引。
+
 ## 核心边界
 
 - 下游 CLI/TUI/GUI 不能导入 Rig 类型，不能直接调用模型提供方、执行工具、读取凭据、扫描技能或读写会话文件；只依赖 `MiniCoreRuntime` facade。
 - AgentLoop 是 MiniCore 自研的 crate-private sans-I/O 协议状态机（ADR 0115）；Rig只实现`ModelGateway` private `ProviderAdapter`中的provider协议映射与单次attempt调用，SDK automatic retry固定为0，不拥有AgentLoop、model resolution、Session logical retry、ModelGateway terminal语义、产品级工具治理、会话持久化或UI呈现。
 - 同一份领域事实只有一个权威owner：已写入conversation/message/lifecycle history属于SessionStorage；current-Runtime Tool start/settlement属于SessionExecutor与ToolSet；Agent definition属于Agent owner；Workspace definition属于Session；PromptResourceView、ToolSet和SkillView属于各自子系统；最终模型可见上下文属于PromptSet；provider-specific encoding和调用属于ModelGateway。
 - raw failure只存在于具体adapter implementation；发生事实的module负责typed、redacted分类，掌握Turn/control/durable state的owner负责恢复（ADR 0120）。不建立全局Error module或ErrorService；该规则首版只在ModelGateway response validation落地，其他module按真实需求逐步采用。
-- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、唯一current RunningOperation、ToolOperationSlot和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。Submit、Steer、FollowUp、Interaction和Tool control使用独立bounded lane，Cancel/SecurityRevoked与lifecycle使用sticky signal，Snapshot读取immutable published view；持续订阅以原子Snapshot首帧开始。valid Cancel在sticky epoch发布后立即返回`CancelAccepted`并进入Finishing，已开始Tool结构化收口期间仍允许FollowUp排队，旧Turnterminal前不启动新Turn。Tool side-effect start由owner-local reservation线性化，不写durable marker；Authority hard restriction停止新operation并truthful settle，terminal后重新resolve Workspace，不承诺动态撤销open handle。Snapshot只作为live observer baseline；process restart或显式cold load顺序扫描JSONL，跳过/隔离局部损坏并返回diagnostics，不恢复process-local执行对象，保守关闭unfinished Turn后进入Idle或Unavailable。MVP有意接受O(n)成本，不实现ProjectionSnapshot/checkpoint index；已loaded Session切换不触发replay。WaitingForUserInput只暂停当前Turn的逻辑推进，不阻塞该SessionExecutor或其他Session。所有ledger mutation仍只由Executor通过`SessionWriter::append(SessionEntryDraft)`逐entry写入并立即应用trusted delta。
+- 每个loaded Session由一个`SessionExecutor`拥有执行期mutable state、SessionWriter、committed projections、CurrentTurnExecution、ToolOperationSlot和per-session `SessionIngress`；一个Runtime允许多个SessionExecutor同时Running。唯一current operation与迟到结果规则见[INV-101](#跨模块不变量索引)，Steer消费点见[INV-102](#跨模块不变量索引)，Tool start/Cancel/SecurityRevoked竞态见[INV-401](#跨模块不变量索引)，cold recovery见[INV-002](#跨模块不变量索引)。Runtime协议仍使用semantic lanes、sticky control和snapshot-first观察，但执行细节只在Session Execution及其canonical owner维护。
 - `ModelGateway`通过`resolve_for_turn(...)`固定exact `TurnModelSnapshot`及validated `TokenEstimateRate`；PromptSet和Compaction只使用该Snapshot分发的同一个Turn-pinned estimator。RunningOperation只传`ModelCallRequest`；每个Gateway operation最多执行一个provider attempt，SessionExecutor对同一个AgentRun request最多logical retry 3次、CompactionSummary最多1次。Gateway隐藏provider、credential、endpoint、cache和continuation，在`ModelCallResult`前验证finish/content与OutputContract；它不判断session message visibility，也不在active Turn内执行transport/model fallback。
-- Prompt/Skill/Tool/Model共享资源只在Runtime初始化或显式`/reload`后替换current immutable object；watcher最多标记dirty，不自动publish。`/reload`先完整build candidate并validate required resources，再在短publication gate下原子替换四个current `Arc`；Turn admission在同一gate下只克隆四个Arc，失败时保留全部old current values。shared Prompt/Skill filesystem source在Runtime initialize或shared reload时捕获；Workspace-bound Prompt/Skill source随Session load、Idle definition update或`/reload workspace` candidate捕获并与WorkspaceSnapshot一起发布。active/completed Turn不原地更新；future Turn capture new objects。`/reload workspace`沿用Idle-only规则，非Idle返回`SessionBusy`。
-- 工具注册、per-call审批、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`统一治理；SessionExecutor在current Runtime内发放一次性ToolStartPermit并管理Running/Settling状态，ledger不保存start marker。每个loaded Session拥有独立file mutation queue，新Turn的`ToolSet`只持共享引用。同Session同文件mutation FIFO，跨Session共享Workspace不协调并由host/user负责隔离（ADR 0116）。MVP不启用通用`bash`；子进程限制无法强制时必须fail closed。
+- Prompt/Skill/Tool/Model共享资源只在Runtime初始化或显式`/reload`成功后原子替换current immutable objects；active Turn继续使用admission时captured值，完整capture/reload纪律见[INV-201](#跨模块不变量索引)及Turn Execution Context。Workspace reload继续遵守Session Idle-only规则。
+- 工具注册、per-call审批、路径授权、sandbox enforcement和真实副作用pipeline由`ToolService`治理；current-Runtime Tool start与结构化settlement遵守[INV-401](#跨模块不变量索引)，Tool exchange模型可见性遵守[INV-003](#跨模块不变量索引)。每个loaded Session拥有独立file mutation queue，跨Session共享Workspace由host/user隔离（ADR 0116）；Sandbox无法强制的capability仍由R7/O1在production adapter前fail closed。
 - 上下文压缩由SessionExecutor编排；`Compaction`只提供context budget、provider-valid prefix cut、single-marker plan、portable directive和结果校验，不构造`ModelCallRequest`，也不组装模型上下文。Compaction operation持有同一个`Arc<CompactionPlan>`及其source checkpoint、summary prefix、single `first_kept_entry_id` marker、budget和request；append前验证current checkpoint/Turn/version/control。StoredCompaction不保存scope、protected entries、previous checkpoint、boundary或coverage provenance；cold replay无法应用marker时忽略该Compaction并继续。首版使用active Turn captured model生成rolling summary，旧initiating/Steer UserMessage必要时可以进入summary，summary budget在plan阶段与pinned model limits求交。
 
 ## 相关决策
@@ -257,3 +274,4 @@ Steer after complete assistant/tool step
 - [ADR 0122：Workspace fingerprint历史决策（已被0123取代）](adr/0122-workspace-fingerprints-are-runtime-local.md)
 - [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload（持久化条款部分被0124取代）](adr/0123-identity-uses-refs-and-explicit-reload.md)
 - [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
+- [ADR 0125：ModelGateway不设置本地模型调用Permit](adr/0125-model-gateway-has-no-local-call-permits.md)
