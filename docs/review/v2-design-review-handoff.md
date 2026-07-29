@@ -1,6 +1,6 @@
 # V2设计评审工作交接
 
-日期：2026-07-29
+日期：2026-07-30
 
 用途：在另一台电脑或新的Agent会话中恢复当前工作进度。架构事实仍以`docs/architecture.md`、`docs/modules/`和Accepted ADR为权威；本文只记录评审推进状态。
 
@@ -19,9 +19,12 @@ git pull --ff-only origin dev
 
 ```bash
 cd /path/to/minicore-runtime
+git status --short --branch
 git switch dev
 git pull --ff-only origin dev
 ```
+
+若`git status`显示本地改动，先确认并保留这些改动；不要reset或覆盖后再pull。
 
 恢复后验证：
 
@@ -36,33 +39,47 @@ git show --stat HEAD
 1. [第一版设计评审与开放项跟进](v2-design-review.md)
 2. [第二版设计评审与R6收口](v2-design-review-2.md)
 3. [第三版AgentLoop设计评审](v2-design-review-3.md)
-4. [架构总览与跨模块不变量索引](../architecture.md#跨模块不变量索引)
-5. [Conversation与SessionStorage](../modules/conversation-storage.md)
-6. [Compaction模块](../modules/compaction.md)
-7. [Prompt模块](../modules/prompt.md)
-8. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
-9. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
-10. [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
-11. [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
+4. [AgentLoop执行模型跨项目研究](../research/agent-loop-execution-model-study.md)
+5. [架构总览与跨模块不变量索引](../architecture.md#跨模块不变量索引)
+6. [Conversation与SessionStorage](../modules/conversation-storage.md)
+7. [Compaction模块](../modules/compaction.md)
+8. [Prompt模块](../modules/prompt.md)
+9. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
+10. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
+11. [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
+12. [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
 
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 当前设计基线提交：`af6be9a54f9ec4706ceaaf6d64500e31fa2d5ebd`（`af6be9a docs: simplify model admission and close review R6`）；本handoff存档提交位于其后，只更新恢复信息；
-- 换机后`git pull --ff-only origin dev`，预期工作树干净；先用`git log -2 --oneline`确认handoff存档提交和`af6be9a`设计基线均存在；
+- 当前远端设计基线提交：`dcacbc0`（`docs: archive current v2 design progress`）；本次AgentLoop研究存档提交位于其后，不改变Accepted架构；
+- 换机后`git pull --ff-only origin dev`，预期工作树干净；用`git log -4 --oneline`确认本次AgentLoop研究存档、`dcacbc0`handoff存档和`af6be9a`设计基线均存在；
 - 最近已接受决策：ADR 0125删除ModelGateway的Runtime global、per-provider route、per-model与per-auth-principal调用permit；共享Gateway保持跨Session直接并发，provider 429/Retry-After与cooldown仍保留；O18关闭；
 - 第二轮评审R1–R6均已关闭；R6通过8条高风险INV索引、canonical owner/link纪律、旧ADR current措辞统一和删除`docs/refactor/`收口；R7与第一轮C3/O1是同一条件性Sandbox门禁；
 - O14/O15不再是当前进行中的未决issue；其历史调查记录已被ADR 0123的方案B式决策取代（不新增Directive/Prompt fingerprint，使用private constructor、immutable content和explicit reload）；
-- 当前恢复链上的关键提交为`af6be9a`（ADR 0125 + R6关闭）、`7b42648`（ADR 0124）、`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
+- 当前恢复链上的关键提交为`dcacbc0`（前次handoff存档）、`af6be9a`（ADR 0125 + R6关闭）、`7b42648`（ADR 0124）、`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
 - 本文继续作为跨机器恢复入口。新环境先检查远端与最新log，不要reset用户改动；
 - 仓库仍处于V2设计阶段，没有`Cargo.toml`、`src/`或自动化测试；
 - 下一实现里程碑仍是阶段6–8模型调用协同交付束；
-- 当前第一项工作仍是第三版AgentLoop评审L2；`accept_committed_tool_round`已因ADR 0124改名并收窄为`accept_committed_tool_results(CommittedToolExchangeDelta)`，但`next_action()` one-shot emission/重复poll/typed error仍未冻结；O1不在当前工作队列；
+- 当前第一项工作仍是第三版AgentLoop评审L2；`accept_committed_tool_round`已因ADR 0124改名并收窄为`accept_committed_tool_results(CommittedToolExchangeDelta)`；2026-07-30补充研究后，L2必须先在“保留pull式`next_action()`并冻结one-shot”与“改用accepted fact直接返回effect的纯reducer”之间二选一；O1不在当前工作队列；
+- 本轮研究当前倾向transition-returning effect reducer，但这只是working recommendation，不是Accepted决策；当前权威interface仍是`next_action() + accept_*()`；
+- 完整审查另发现`model-gateway.md`描述`RunningOperation::WaitForModelRetry`，而`session-execution.md`canonical enum只有`Model | Tools | Compaction`；SessionExecutor实现前必须冻结retry wait slot的owner-local表示；
 - Rig只实现`ModelGateway` private `ProviderAdapter`中的单次provider attempt，不拥有ModelGateway或AgentLoop。
 
 ## 最近进度存档
 
 ```text
+2026-07-30 AgentLoop执行模型研究
+→ 完整review当前V2权威文档、ADR 0100–0125、三轮评审、migration、CONTEXT、research与V1 archive历史链
+→ 固定源码对比Pi 0.80.6、Codex 61a4488、OpenCode 7565e03、Gemini CLI 3818efb、OpenHands SDK 68cd02e
+→ 结论：first-party loop常见，但coding-agent产品主要使用async task/fiber；纯NeedModel/NeedTools sans-I/O reducer少见
+→ Codex approval使用TurnState pending oneshot；OpenCode Permission/Question使用pending Map + Deferred；等待Tool不阻塞独立control path
+→ MiniCore single owner、committed-only、Tool exchange和retry正确性主要由SessionExecutor/Storage保证，不都要求同步AgentLoop
+→ ADR 0124删除same-Turn recovery和durable Tool proof后，AgentLoop定位收窄为live protocol reducer
+→ 当前研究倾向删除next_action polling，让from_seed/accept_*直接返回NeedModel/NeedTools/CandidateReady effect
+→ L2保持开放；未修改Accepted ADR或权威module interface
+→ 发现WaitForModelRetry与canonical RunningOperation enum不一致，登记为实现前待闭合项
+
 af6be9a docs: simplify model admission and close review R6
 → ADR 0125删除ModelGateway全部本地模型调用permit/admission queue
 → 共享Arc<ModelGateway>支持多Session直接并发provider attempt
@@ -92,7 +109,7 @@ e6966a0 docs: defer sandbox capability review
 → MVP不建设ProjectionSnapshot/checkpoint index
 ```
 
-换机后不要重新调查O1/O2/O3/O17、O18或第二轮R1–R6。直接从[第三版AgentLoop设计评审](v2-design-review-3.md)的L2继续；L3/L4已经按ADR 0124的新typed Tool exchange与Steer delta术语关闭。随后执行wire/schema freeze和Rig 0.40.0 spike。需要核对全局状态时回到本文“下一步”和“已冻结关键决策”。
+换机后不要重新调查O1/O2/O3/O17、O18或第二轮R1–R6。先读[AgentLoop执行模型跨项目研究](../research/agent-loop-execution-model-study.md)，再从[第三版AgentLoop设计评审](v2-design-review-3.md)的L2继续：正式比较方案A（pull one-shot）与方案B（transition-returning effect reducer），形成明确决议后再改权威文档。L3/L4已经按ADR 0124的新typed Tool exchange与Steer delta术语关闭。随后冻结logical retry wait slot、执行wire/schema freeze和Rig 0.40.0 spike。需要核对全局状态时回到本文“下一步”和“已冻结关键决策”。
 
 ## 本轮完成
 
@@ -270,10 +287,11 @@ NeedModel / ContextOverflow
 O2/O3/O13/O14/O15/O16/O17已关闭。O1保持开放但从当前工作队列移出；下一轮评审/实现前门禁顺序改为：
 
 ```text
-1. 第三版AgentLoop评审：L2必须在首个AgentLoop实现前冻结；L3/L4均已关闭
-2. wire/schema freeze：serde/casing、MiniCore-generated Session-scoped public ID策略、ToolCallId opaque wire格式、基础类型、StoredTurnStart/StoredCompaction schema
-3. 阶段6–8：Rig 0.40.0 spike + ScriptedProviderAdapter ordinary AgentRun → complete Tool exchange → ContextOverflow → single-marker CompactionSummary → append/apply → reassemble
-4. O1条件门禁：开始首个production Tool/Sandbox adapter前重新激活并关闭Sandbox capability fail-closed
+1. 第三版AgentLoop评审：L2在pull one-shot与transition-returning effect reducer之间二选一并形成正式决议；L3/L4均已关闭
+2. 冻结logical retry wait slot：统一`WaitForModelRetry`与canonical `RunningOperation`/owner-local retry state
+3. wire/schema freeze：serde/casing、MiniCore-generated Session-scoped public ID策略、ToolCallId opaque wire格式、基础类型、StoredTurnStart/StoredCompaction schema
+4. 阶段6–8：Rig 0.40.0 spike + ScriptedProviderAdapter ordinary AgentRun → complete Tool exchange → ContextOverflow → single-marker CompactionSummary → append/apply → reassemble
+5. O1条件门禁：开始首个production Tool/Sandbox adapter前重新激活并关闭Sandbox capability fail-closed
 ```
 
 第一轮评审的O项只剩`O1`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O18已由ADR 0125删除permit-wait触发前提并关闭。O2/O3/O17均已关闭：cold load保持O(n)扫描但采用tolerant replay，不建设ProjectionSnapshot/checkpoint index或repair utility；Prompt只消费sanitized committed view。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
@@ -292,7 +310,7 @@ Rig 0.40.0 integration spike
 ## 已冻结关键决策
 
 - 每个loaded Session只有一个`SessionExecutor`、一个`SessionWriter`、一个current Turn和一个current `RunningOperation`；
-- AgentLoop是crate-private同步sans-I/O状态机，只输出`NeedModel | NeedTools | Finished`；
+- AgentLoop当前Accepted定位是crate-private同步sans-I/O状态机，只输出`NeedModel | NeedTools | Finished`；L2正在评估是否只把private emission interface改为transition-returning effect，first-party/no-I/O边界本身尚未提议推翻；
 - ModelGateway每次invocation最多一个provider attempt，SDK retry=0；SessionExecutor拥有有限logical retry；
 - PromptSet是唯一模型上下文组装seam，模型可见动态事实必须来自committed conversation；
 - 文件mutation只在单Session内按canonical file key FIFO，多文件/open-world Tool整批Serial；
@@ -318,6 +336,8 @@ O12/O13/O14/O15 fingerprint/hash/reload残留扫描与O16 guidelines扫描
 本轮是docs-only变更；仓库没有production代码或测试入口，因此通常不运行cargo/test。
 
 O14调查阶段还核对了pi本机安装源码、Codex与Gemini CLI公开源码以及Claude compaction文档。方案B临时草案曾在回退前通过`git diff --check`和独立semantic consistency review；ADR 0123最终接受“不新增Directive fingerprint/private constructor+format version+Arc request”的方向，并扩展为全局identity/reload决策。
+
+2026-07-30 AgentLoop研究新增固定源码证据与完整架构review；研究文档为非权威归档，L2正式决议前不得据此直接实现transition-returning reducer，也不得把当前`next_action()`研究建议误记为已关闭。
 
 ## 提交纪律
 
