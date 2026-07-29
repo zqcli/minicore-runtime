@@ -1,7 +1,9 @@
 # ADR 0117：异步同步使用单 Owner、短临界区与 Typed Permit
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-27
+
+> 2026-07-29修订：single owner、短guard、release-before-fan-out和typed permit规则保持有效。ADR 0124用process-local `ToolStartPermit`替代`ToolExecutionStarted` controlled append；file mutation permit仍按原规则settle后释放。
 
 ## 背景
 

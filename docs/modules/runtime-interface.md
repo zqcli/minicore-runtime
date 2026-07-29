@@ -159,8 +159,8 @@ MiniCoreRuntime
 
 - `AgentRevision`：immutable AgentDefinition revision；
 - `SessionDefinitionRevision`：future Turn definition的原子revision；
-- `ToolCallId`：provider/tool protocol correlation，不替代ItemId；
-- `EntryId`：SessionStorage identity，默认不作为普通UI mutation input；
+- `ToolCallId`：ModelGateway adapter归一化的provider/tool protocol correlation，不替代ItemId；协议无原生ID时生成response-local opaque ID，只要求同一assistant response内唯一；
+- `EntryId`：SessionStorage tree identity，默认不作为普通UI mutation input；Fork复制历史EntryId，因此其唯一性scope是Session；
 - `CommandId`：public command correlation和in-flight dedup identity；Submit的CommandId同时标识领域Turn创建前的process-local admission candidate；
 
 不公开：
@@ -355,8 +355,7 @@ pub enum ForkAnchor {
 
 Runtime把公开anchor解析为合法storage path end：
 
-- `BeforeUserMessage(Input)`同时排除associated TurnContext；
-- `BeforeUserMessage(Steer)`解析到该message的parent；
+- `BeforeUserMessage(Input/Steer)`解析到该message的parent；Input的`StoredTurnStart`与UserMessage同entry，因此一起排除；
 - `AfterUserMessage`包含对应durable UserMessage；
 - `Before/AfterFinalAgentMessage`只接受`phase = Final`的AgentMessage Item；
 - anchor产生non-terminal tail Turn时，fork staging按`HistoricalFork`规则关闭；
@@ -767,7 +766,7 @@ pub struct SessionHistoryTreeView {
 }
 ```
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals、ToolRoundCompleted内部event或writer current EntryId。`GetHistoryTree`首版从owner一次性捕获并返回自洽的完整compact branch topology，不内联Turn Item bodies，也不分页；它服务fork/navigation拓扑，不代替聊天timeline读取，因此不需要额外history revision或generation。
+History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals或writer current EntryId。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
 
 MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
@@ -1197,9 +1196,10 @@ Session message/history tree由MiniCore内部管理：
 ```text
 SessionStorage
 ├─ owns EntryId + parent_id immutable tree
-├─ owns current physical entry and replay
-├─ validates cross-entry references
-└─ produces trusted projections
+├─ owns current physical entry and tolerant replay
+├─ strict-validates live append
+├─ isolates invalid replay references and emits diagnostics
+└─ produces sanitized trusted projections
 
 SessionExecutor
 ├─ performs append → apply
@@ -1216,7 +1216,7 @@ UI不能：
 - 直接读取或修改JSONL；
 - 直接指定任意EntryId作为writer parent；
 - 追加raw message；
-- 补写ToolResult或ToolRoundCompleted；
+- 补写ToolResult、猜测parent或重写中段损坏entry；
 - 删除历史entry；
 - 修改current leaf pointer。
 
@@ -1314,9 +1314,7 @@ CLI / TUI / Tauri backend
 → PromptService.for_turn()
 → TurnExecutionContext
 → PromptSet.compose_user_message()
-→ SessionWriter.append(TurnContext)
-→ apply trusted projections
-→ SessionWriter.append(UserMessage source=Input)
+→ SessionWriter.append(UserMessage source=Input + StoredTurnStart)
 → apply trusted projections
 → CommandResponse::TurnStarted { turn_id }
 → AgentLoop returns NeedModel
@@ -1360,11 +1358,10 @@ ModelCallResult contains ToolCall
 → UI dispatch InteractionCommand::Resolve
 → append/apply InteractionResolved
 → session StateEvent::InteractionResolved
-→ ToolExecutionControl records ToolExecutionStarted
-→ append/apply
+→ SessionExecutor owner-local ToolStartPermit
 → executor side effect
 → append/apply truthful Tool result
-→ append/apply tool_round_completed
+→ final matching result produces CommittedToolExchangeDelta
 → next PromptSet.assemble
 ```
 
@@ -1382,8 +1379,7 @@ ModelCallResult contains built-in ask-user ToolCall
 → session StateEvent::InteractionResolved
 → wake original Tool future
 → append/apply PreExecution truthful Tool result
-→ append/apply tool_round_completed
-→ same Turn next PromptSet.assemble
+→ complete exchange后same Turn next PromptSet.assemble
 ```
 
 Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session的Executor不受影响。等待期间不预留file mutation ticket，也不持有TurnControl reservation，elapsed time不会自动关闭Interaction。
@@ -1473,7 +1469,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
 - WorkspaceSnapshot、EmergencyControl signal或security target；
-- SessionWriter、writer internals、repair internals；
+- SessionWriter、writer internals、replay internals；
 - raw JSONL path作为普通UI能力；
 - internal handler id和完整RuntimeCommand嵌入catalog action。
 
@@ -1500,8 +1496,8 @@ WorkspaceSnapshot / EmergencyControl signal
 ModelGateway / TurnModelSnapshot private execution ref
 ProviderAdapter / AuthStore
 SessionWriter / SessionStorage implementation
-CommittedConversationState / Delta
-ToolExecutionControl
+CommittedConversationState / ConversationChange / CommittedToolExchangeDelta / CommittedSteerDelta
+ToolExecutionControl / ToolStartPermit
 ```
 
 公开view可以投影其安全状态，但不能携带内部handle或允许调用方拼接不一致快照。
@@ -1584,7 +1580,7 @@ Public interface是 contract test surface。
 - assistant content创建事件按Reasoning/Text/ToolCall顺序发布；
 - parallel Tool逆序完成只更新各自原位置，不改变call order；
 - Snapshot替换有序durable Items并清空provisional Items；
-- Runtime restart从JSONL replay和conservative recovery开始，不把Snapshot当作execution checkpoint；
+- Runtime restart从JSONL tolerant replay和conservative recovery开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现，不把Snapshot当作execution checkpoint；
 - Interaction request-after-append和resolution-before-resume；
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
@@ -1639,9 +1635,9 @@ Public interface是 contract test surface。
 
 优点：单一stream看似可以同时驱动模型与UI。
 
-缺点：streaming/progress、model logical retry和UI状态会污染Session durable truth；ToolRoundCompleted模型可见性无法安全表达。
+缺点：streaming/progress、model logical retry和UI状态会污染Session history；observer delivery failure也不能决定conversation durability。
 
-结论：不采用。SessionStorage是durable truth；committed-derived StateEvent从durable projection派生，process-local StateEvent从当前Runtime/Executor view派生，两者都不成为event log。
+结论：不采用。SessionStorage保存message/lifecycle history；committed-derived StateEvent从durable projection派生，process-local StateEvent从当前Runtime/Executor view派生，两者都不成为event log。
 
 ### 公开 Manual CompactSession
 

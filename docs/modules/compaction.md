@@ -1,1123 +1,621 @@
-# Compaction架构设计
+# Compaction 架构设计
 
-日期：2026-07-25
-
-状态：当前权威架构（设计已冻结，生产实现待启动）
+状态：当前权威架构（ADR 0124后，生产实现待启动）
+日期：2026-07-29
 
 ## 目的
 
-本文定义MiniCore的conversation compaction模块，回答：
+Compaction在模型上下文接近上限时，把当前sanitized committed conversation的连续prefix转换为portable rolling summary，并保留recent exact suffix。
 
-- 何时判断下一次模型请求需要压缩；
-- 如何在conversation prefix或active-Turn completed prefix中选择安全摘要范围，并保留原样recent tail；
-- UserMessage、Assistant Continue、完整ToolRound、final AssistantMessage和已有summary如何保持协议完整；
-- 如何通过PromptSet和ModelGateway执行portable SummaryModel调用；
-- Compaction entry何时append/apply并触发conversation Replace；
-- 压缩后如何重建ConversationSeed和private AgentLoop；
-- Steer、Cancel、SecurityRevoked、retry、write outcome unknown和restart如何处理；
-- Workspace/Agent/Session instructions、Skill metadata和动态contribution如何保留。
+目标：
 
-[Runtime Interface](runtime-interface.md)不提供公开`CompactSession`协议或standalone/manual maintenance state。本文也不定义provider-native opaque artifact、hierarchical summary tree、long-term memory、physical JSONL vacuum或provider tokenizer实现。
-
-相关权威文档：
-
-- [Conversation与SessionStorage架构设计](conversation-storage.md)
-- [Session Execution架构设计](session-execution.md)
-- [Turn执行上下文架构设计](turn-execution-context.md)
-- [Prompt子系统架构设计](prompt.md)
-- [ModelGateway架构设计](model-gateway.md)
-- [ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)
-- [Runtime Interface与公开协议架构设计](runtime-interface.md)
+- 所有模型调用仍经过PromptSet和ModelGateway；
+- summary可跨provider使用；
+- StoredCompaction保持简单、可检查；
+- 支持Turn内多次rolling summary；
+- 不维护active instruction segment、protected EntryId集合或coverage证明链；
+- replay遇到坏marker时忽略该Compaction，而不brick Session。
 
 ## 决策摘要
 
-- Compaction是crate-internal纯planning/validation模块，不是Runtime Service或领域entity；
-- SessionExecutor是orchestration、request arbitration和writer调用的唯一owner；
-- SessionStorage是唯一durable truth；
-- 只在active Turn的`NeedModel`安全点执行automatic compaction；
-- trigger包括soft context pressure、Prompt local context overflow和provider context overflow；
-- 不在final response后执行post-turn compaction，也不提供standalone/manual compaction；
-- cut基于model-visible stable unit，不基于裸JSONL行；
-- Compaction scope分为pre-Turn `ConversationPrefix`和`ActiveTurnCompletedPrefix`；
-- cut不能拆分UserMessage、Assistant Continue、完整ToolRound、final AssistantMessage或Compaction summary；
-- active Turn的initiating input和已append Steer UserMessage保持原文；每个instruction segment内已经完成的早期stable units可以滚动为`ActiveTurnCheckpoint`；
-- leading conversation summary最多一个，每个active instruction segment最多一个effective checkpoint；
-- rolling summary使用“previous effective summary/checkpoint + newly summarized units”生成一个portable replacement；
-- SummaryModel使用active Turn exact `TurnModelSnapshot`；
-- summary输出预算在plan阶段与pinned `EffectiveModelLimits`和summary call context可行性求交；
-- PromptSet是SummaryModel context的唯一组装者；purpose固定为`CompactionSummary`，output contract固定为`NoToolCalls`；
-- SummaryModel成功不立即改变conversation；只有StoredCompaction append/apply后Replace生效；
-- append前重新验证source checkpoint和Cancel/SecurityRevoked control；
-- 成功后从updated CommittedConversationState重建ConversationSeed和private AgentLoop segment；
-- 同一active Turn允许在frontier推进后再次compact，但受单Turn次数、minimum reclaim和same-source hard-recovery规则约束；
-- soft-pressure compaction失败时，只有原ModelCallRequest仍valid才允许继续未压缩调用；
-- hard-overflow compaction失败时Turn Failed；
-- restart不恢复summary call、retry timer、CompactionPlan或旧AgentLoop；
-- 原始entries始终保留，fork到Compaction前自然得到未压缩历史。
+- Compaction是crate-private planning/validation module；
+- SessionExecutor拥有trigger、model call、append和control arbitration；
+- source只能来自`CommittedConversationView`；
+- source已经通过Tool exchange sanitizer，不含unmatched ToolCall/ToolResult；
+- cut只发生在model-visible entry boundary；
+- planner选择一个连续prefix进行摘要和一个recent exact suffix保留；
+- latest initiating/Steer UserMessage不再hard-protect，必要时可以进入summary；
+- StoredCompaction只保存`summary + first_kept_entry_id + optional model-call provenance`；
+- `first_kept_entry_id = None`表示摘要覆盖当时全部effective conversation；
+- 后续Compaction把旧summary作为普通source再次摘要，始终保持一个leading rolling summary；
+- CompactionSummary使用active Turn captured model和`OutputContract::NoToolCalls`；
+- summary output budget在planning阶段与model limits求交；
+- ModelGateway每次operation一个provider attempt，SessionExecutor最多一次CompactionSummary logical retry；
+- append成功后conversation执行Replace；
+- cold replay无法应用marker时忽略entry并报告diagnostic。
 
 ## 同类项目取舍
 
-| 项目 | 采用 | 不采用 |
+| 项目 | 形状 | MiniCore采用点 |
 | --- | --- | --- |
-| pi | rolling previous summary、recent suffix、Tool安全cut、turn-prefix summary | post-run eager compact、manual implicit abort |
-| Codex | model-call前检查、overflow recovery、replacement conversation | provider-native artifact、active-Turn cross-model fallback、直接live-history replacement |
-| Claude Code | near-limit auto-compaction | 未公开的cut/storage细节；不复制`/compact` |
-| Rig | rolling carry-over、window policy、orphan ToolResult保护 | load-path同步压缩、process-only watermark、system-role summary |
-| Grok Build | Compaction与Session/Sampler分离 | checkout中不可验证的具体算法 |
+| pi | summary + `firstKeptEntryId` | 单marker、rolling summary、简单fork/replay |
+| Codex | compacted item/summary重建history | portable summary、普通model path |
+| Gemini CLI | compression prompt生成新history | 当前history作为source、调用前验证 |
+| Claude compaction | server/client summary replacement | summary是conversation artifact，不是execution checkpoint |
 
-MiniCore采用：
-
-```text
-Portable Rolling Summary
-+ Stable-Unit Safe Cut
-+ Leading Conversation Summary
-+ Anchored Active-Turn Segment Checkpoints
-+ Model-Aware Summary Budget
-+ One StoredCompaction Entry
-+ Bounded Frontier Advancement
-```
+MiniCore不再建设比这些产品更强的active-segment coverage ledger。
 
 ## Ownership
 
 ```text
 SessionExecutor
-├─ decides trigger
-├─ owns CurrentCompactionState
-├─ starts RunningOperation::CompactConversation
-├─ calls PromptSet and ModelGateway
-├─ arbitrates Steer/Cancel/SecurityRevoked
-└─ append/applies StoredCompaction
+├─ decides when to compact
+├─ captures current operation/control basis
+├─ calls Compaction::plan
+├─ asks PromptSet to assemble summary request
+├─ calls ModelGateway
+├─ validates current basis and result
+└─ appends StoredCompaction
 
-Compaction module
-├─ context budget calculation
-├─ stable-unit projection
-├─ cut/protection planning
-├─ summary directive construction
-├─ summary input reduction
-└─ result/commit candidate validation
-
-PromptSet
-├─ exposes deterministic CompactionSummaryAssemblyBasis
-└─ assembles CompactionSummary context
-
-ModelGateway
-└─ performs one provider-neutral SummaryModel call
+Compaction
+├─ estimates pressure
+├─ chooses prefix cut
+├─ builds directive
+├─ validates summary
+└─ constructs commit candidate
 
 SessionStorage
-└─ validates StoredCompaction scope/frontier and emits trusted Replace delta
+├─ appends StoredCompaction
+├─ applies Replace live
+└─ applies or ignores marker during tolerant replay
 ```
 
-Compaction module不拥有SessionWriter、CommittedConversationState mutation、ModelGateway、PromptService、Runtime events、CancellationToken lifecycle或Turn terminal state。
+Compaction不拥有：
+
+- provider、credential或retry transport；
+- SessionWriter；
+- AgentLoop；
+- Workspace、Tool或Skill reload；
+- Turn terminal arbitration；
+- manual repair。
 
 ## Module Interface
-
-Compaction是concrete crate-internal module，不建立public trait：
 
 ```rust
 pub(crate) struct Compaction;
 
 impl Compaction {
-    pub(crate) fn plan(
-        input: CompactionPlanningInput<'_>,
-    ) -> Result<CompactionPlan, CompactionError>;
+    pub fn pressure(
+        &self,
+        input: CompactionPressureInput<'_>,
+    ) -> CompactionPressure;
 
-    pub(crate) fn build_summary_directive(
-        plan: &CompactionPlan,
+    pub fn plan(
+        &self,
+        input: CompactionPlanInput<'_>,
+    ) -> Result<Arc<CompactionPlan>, CompactionError>;
+
+    pub fn build_summary_directive(
+        &self,
+        plan: &Arc<CompactionPlan>,
     ) -> CompactionSummaryDirective;
 
-    pub(crate) fn validate_summary(
-        plan: Arc<CompactionPlan>,
-        result: ModelCallResult,
-    ) -> Result<CompactionCommitCandidate, CompactionError>;
+    pub fn validate_summary(
+        &self,
+        plan: &Arc<CompactionPlan>,
+        output: &FinalizedAssistantResponse,
+    ) -> Result<ValidatedCompactionSummary, CompactionError>;
+
+    pub fn commit_candidate(
+        &self,
+        plan: &Arc<CompactionPlan>,
+        summary: ValidatedCompactionSummary,
+        model_call: StoredCompactionModelCall,
+    ) -> StoredCompaction;
 }
 ```
 
-模型调用、timer、writer和events都由SessionExecutor编排。
-
-`CompactionPlanningInput`携带active Turn的`CompactionSettingsSnapshot`、pinned `EffectiveModelLimits`和PromptSet产出的`CompactionSummaryAssemblyBasis`。Compaction不读取Prompt内部section，也不自行猜测Runtime policy开销；该basis只暴露固定摘要policy/tool-contract开销的token estimate与typed assembly basis，不是第二个assembly实现。
+`CompactionPressureInput`与`CompactionPlanInput`必须携带active Turn的`EffectiveModelLimits`和由同一个`TurnModelSnapshot::token_estimator()`取得的`TokenEstimator`。caller不能直接提交raw replacement messages、scope graph、protected EntryId集合或自定义估算率。
 
 ## Trigger
 
-### NeedModel Safe Point
-
-Compaction只在AgentLoop返回`NeedModel`且当前没有Model/Tool external operation时检查：
+Compaction只在准备实际模型调用的safe point检查：
 
 ```text
 AgentLoop NeedModel
-→ PromptSet assemble AgentRun context
-   ├─ success：得到ModelCallRequest和context estimate
-   └─ ContextOverflow：得到typed local overflow
-→ evaluate compaction trigger
+→ current committed conversation
+→ PromptSet使用Turn-pinned TokenEstimator估算 / model limits
+→ pressure decision
 ```
 
-safe point包括initiating UserMessage后第一次Model前、`tool_round_completed`后下一次Model前、queued Steer append/apply后下一次Model前，以及provider ContextOverflow recovery。Sampling、WaitingApproval、WaitingForUserInput、ExecutingTools和Finishing期间不启动Compaction。
-
 ```rust
-pub enum CompactionTrigger {
-    ContextPressure,
-    PromptContextOverflow,
-    ProviderContextOverflow,
+pub enum CompactionPressure {
+    None,
+    Soft,
+    Hard,
 }
 ```
 
-`ContextPressure`是soft trigger；其余是hard trigger。
+- `None`：直接AgentRun；
+- `Soft`：策略允许时先compact；
+- `Hard`：当前AgentRun无法构造，必须compact或返回typed overflow failure。
 
-### Context Budget
+Compaction本身不在load路径发起模型调用，也不后台预摘要。
 
-```rust
-pub struct CompactionSettings {
-    pub enabled: bool,
-    pub soft_trigger_percent: u8,
-    pub target_after_percent: u8,
-    pub summary_max_output_tokens: NonZeroU32,
-    pub summary_min_output_tokens: NonZeroU32,
-    pub minimum_reclaimed_tokens: u64,
-    pub max_compactions_per_turn: NonZeroU32,
-    pub max_tool_result_summary_bytes: usize,
-    pub max_summary_bytes: usize,
-}
-```
-
-active Turn使用admission时捕获的immutable `CompactionSettingsSnapshot`。MVP的CompactionSettings是Runtime startup config，不提供独立hot reload；参与planning、次数限制和summary budget的字段都来自该Turn持有的同一个immutable settings object，不能在同一Turn中途改变policy。
-
-```rust
-pub struct CompactionSettingsSnapshot {
-    pub settings: Arc<CompactionSettings>,
-}
-```
-
-推荐但不冻结的默认范围：soft trigger为usable input budget的80%–85%，target after为55%–65%。
+## Context Budget
 
 ```text
-usable input budget
+usable_input
 = context_window
-- effective max_output_tokens
-- runtime safety reserve
+- requested_agent_output
+- runtime_safety_reserve
 ```
 
-规则：
+unknown model limit保持unknown，不按model名称猜测。token estimator owner是ModelGateway validated model definition；Compaction和PromptSet只消费同一个Turn-pinned `TokenEstimator`。non-text estimate为unknown时不触发Soft，仍由最终assembly/provider给出权威overflow结果。
 
-- context window未知时不执行soft trigger；
-- max output来自当前ModelCallRequest；
-- 不使用Session total usage判断context pressure；
-- provider usage优先，本地estimate补充trailing committed content；
-- PromptSet final validation仍是调用前权威检查；
-- estimate低于阈值不保证provider接受，provider overflow仍走hard recovery。
+pressure必须考虑：
 
-### Compaction Summary Budget
+- ordered System sections；
+- sanitized committed messages；
+- pending User/Steer message若已commit；
+- Tool metadata；
+- requested output reserve；
+- provider/tool protocol overhead estimate。
 
-AgentRun的usable input budget只决定“是否需要压缩”；SummaryModel调用必须使用自己的预算。`Compaction::plan`从全局设置、active Turn pinned `EffectiveModelLimits`、PromptSet固定摘要开销、reduced summary source token estimate和runtime safety reserve派生：
+## Compaction Summary Budget
+
+SummaryModel请求单独计算预算：
+
+```text
+summary_output
+= min(
+    configured_summary_max,
+    known_model_output_max,
+    context_window
+      - summary_system_and_directive
+      - reduced_source
+      - safety_reserve
+  )
+```
 
 ```rust
 pub struct CompactionSummaryBudget {
     pub max_output_tokens: NonZeroU32,
-    pub estimated_source_tokens: u64,
-    pub fixed_prompt_tokens: u64,
-    pub safety_reserve_tokens: u64,
+    pub estimated_input_tokens: u64,
 }
 ```
 
-`estimated_source_tokens`覆盖全部protected context与经过有标记reduction的summary target，不得只计算将被替换的units。
+若剩余空间低于`summary_min_output_tokens`，返回`NoFeasibleSummaryBudget`。ModelGateway不静默clamp。
+
+## Provider-Valid Conversation Unit
+
+planner输入是sanitized `CommittedConversationView`。cut只能位于以下unit之间：
 
 ```text
-effective summary output
-= min(
-    settings.summary_max_output_tokens,
-    known EffectiveModelLimits.max_output_tokens,
-    context_window - fixed prompt - reduced source - safety reserve
-  )
+UserMessage
+Assistant without ToolCall
+complete assistant + ordered ToolResult exchange
+Final Assistant
+previous rolling summary
 ```
 
-规则：
+不完整Tool exchange已经被Conversation projector排除，不进入Compaction source。
 
-- `summary_min_output_tokens <= summary_max_output_tokens`，否则配置加载失败；
-- 已知model output/context limit必须参与求交，未知limit保持unknown，不根据model name猜测；
-- context subtraction使用checked arithmetic；固定开销、source和reserve已经占满known window时直接返回`NoFeasibleSummaryBudget`；
-- 最终`max_output_tokens`不得低于`summary_min_output_tokens`，否则返回`NoFeasibleSummaryBudget`；
-- 最终budget进入同一个immutable `CompactionPlan`、directive和`ModelCallRequest`，request构造后不得改变；
-- PromptSet仍执行最终context validation；ModelGateway仍严格拒绝越过effective limit的请求，不能静默clamp；
-- summary source feasibility使用SummaryModel自己的output预留，不能复用AgentRun的effective max output基准。
-
-final AssistantMessage后不立即auto compact。延迟到下一次NeedModel能避免无效summary调用，并使用真正的future TurnContext。
-
-## Stable Conversation Units
-
-Cut基于effective committed conversation order，不基于raw JSONL entry order：
+一个unit携带用于cut的anchor：
 
 ```rust
-pub(crate) enum StableConversationUnitKind {
-    UserMessage,
-    AssistantContinue,
-    CompleteToolRound,
-    FinalAssistant,
-    CompactionSummary,
-}
-
-pub(crate) struct StableConversationUnit {
-    kind: StableConversationUnitKind,
-    first_entry_id: EntryId,
-    last_entry_id: EntryId,
-    backing_entry_ids: Arc<[EntryId]>,
-    messages: Arc<[MessageRecord]>,
-    estimated_tokens: u64,
+pub struct CompactionUnitRef {
+    pub first_entry_id: EntryId,
+    pub estimated_tokens: u64,
 }
 ```
 
-StableConversationUnit不是领域entity，不持久化，也没有UnitId。
-
-- `UserMessage`：一个Input或Steer UserMessage；不能拆分content或PromptContribution stamps。
-- `AssistantContinue`：一个无ToolCall、model-visible、non-terminal Assistant Intermediate response。
-- `CompleteToolRound`：Assistant(Intermediate)、ordered Tool messages和`tool_round_completed`；只有completion event已append/apply的round可见。
-- `FinalAssistant`：一个final AssistantMessage。
-- `CompactionSummary`：latest projection中的leading summary或active-Turn checkpoint；下一次同scope rolling compaction将previous effective summary与新增旧历史合成一个replacement summary。
-
-Started、Abandoned或conversation-hidden Tool round不能成为summary source。
-
-## Protection与Scope
-
-始终exact-protect：
-
-- active Turn全部UserMessage entry及其完整unit，包括initiating input和已append Steer；
-- explicit caller-protected entries及其完整unit；
-- Pending Interaction关联且仍需精确恢复的内容；
-- Started、Abandoned、conversation-hidden或缺少`tool_round_completed`的Tool round；
-- planner为recent exact tail选中的完整stable units。
-
-每个active UserMessage之后已经完整提交的早期Assistant Continue和CompleteToolRound不再自动hard-protect。保留全部active UserMessage原文可以避免summary改写任务目标、Steer约束、精确路径或错误文本；checkpoint只描述对应instruction segment中已经完成的工作。
-
-```rust
-pub enum CompactionScope {
-    ConversationPrefix {
-        summarized_through: ConversationBoundary,
-        retained_from: ConversationBoundary,
-    },
-    ActiveTurnCompletedPrefix {
-        anchor_user_message: ConversationBoundary,
-        previous_checkpoint: Option<ConversationBoundary>,
-        summarized_through: ConversationBoundary,
-        retained_from: ConversationBoundary,
-    },
-}
-```
-
-`ConversationPrefix`保持原有leading rolling summary：被摘要范围是active Turn之前的连续prefix，retained range是其后的连续exact suffix。
-
-`ActiveTurnCompletedPrefix`把summary放在selected exact active-Turn UserMessage anchor之后。anchor可以是initiating input或已append Steer。第一次从anchor后的第一个eligible stable unit开始且不能跨越下一个active UserMessage；后续从该segment的`previous_checkpoint`之后继续，只能向后推进。`previous_checkpoint`指向当前effective projection中的checkpoint unit；该checkpoint所覆盖的原始范围（covered-through provenance）由其backing `StoredCompaction`派生，不能把两者混成一个boundary。previous checkpoint与新完成units被合成为一个replacement checkpoint，同一segment不会形成checkpoint链。
-
-只有exact active UserMessage anchors、真实protected units和要求保留的recent tail本身仍超过usable input budget时返回：
-
-```text
-CompactionError::ProtectedRegionTooLarge
-```
-
-该错误不再由“所有active-Turn历史都被政策性保护”触发。不会摘要未完成ToolRound、截断current UserMessage或切换active Turn模型。
+该ref只存在于plan内存对象。StoredCompaction不保存unit last boundary、stable hash或coverage provenance。
 
 ## Cut Algorithm
 
-所有合法plan必须满足：
+planner按当前effective conversation顺序：
 
-- cut只在stable-unit boundary；
-- 不拆分任何unit或ToolRound；
-- source checkpoint来自同一个trusted view；
-- summary source fit派生后的`CompactionSummaryBudget`；
-- predicted result满足target-after或至少达到`minimum_reclaimed_tokens`并推进frontier；
-- protected unit不进入summary coverage；
-- summary coverage、anchor、previous checkpoint及其covered-through provenance和retained tail无重叠、无空洞。
+1. 计算必须回收的tokens；
+2. 从最旧unit开始扩展summary prefix；
+3. 保留配置要求的recent exact units/tokens；
+4. 选择prefix后第一个retained unit的`first_entry_id`作为`first_kept_entry_id`；
+5. 若没有retained suffix，marker为None；
+6. 估算summary request是否可行；
+7. 返回immutable plan。
 
-scope-specific规则：
-
-- `ConversationPrefix`的summarized range为非空连续prefix，结束在active Turn initiating UserMessage之前；
-- `ActiveTurnCompletedPrefix`必须保留anchor UserMessage原文，只覆盖anchor之后、下一个active UserMessage之前已经完整提交的连续eligible units；
-- active scope的`retained_from`紧邻`summarized_through`，并保留尽可能多的recent exact units；
-- `previous_checkpoint`存在时必须等于current effective projection中的该segment checkpoint；其backing compaction记录的covered-through provenance必须位于selected ancestry，且新coverage紧接该provenance之后单调前进。
-
-选择过程：
+优先级：
 
 ```text
-1. 从CommittedConversationState构造ordered stable units
-2. 找到active Turn全部exact UserMessage anchors及各instruction segment的previous checkpoint与covered-through frontier
-3. 标记exact-protected units与minimum recent tail
-4. 构造ConversationPrefix和ActiveTurnCompletedPrefix候选
-5. 对每个候选执行ToolResult summary-input reduction并派生CompactionSummaryBudget
-6. 优先选择能一次达到target-after且保留最多recent exact history的候选
-7. 若没有单一候选达到target，但存在能推进frontier且达到minimum reclaim的候选，选择回收量最大的候选
-8. 无eligible range时返回NoFeasibleCut；真实protected region过大时返回ProtectedRegionTooLarge
-9. known model/context limit无法留下最低摘要输出时返回NoFeasibleSummaryBudget
-10. 生成private immutable `CompactionPlan`
+满足hard input budget
+→ 尽量保留recent exact suffix
+→ 尽量减少summary source
 ```
 
-一次成功Compaction后重新assemble。若仍有压力，只能在source/frontier已经推进且单Turn预算仍有余额时规划下一次scope；不能对同一source和frontier无界重试。
+MVP不承诺永久保留initiating或Steer UserMessage。长active Turn中，旧用户指令、Tool output和assistant内容都可以进入summary。summary prompt要求保留当前目标、约束、已完成工作、关键文件/命令结果和未完成事项。
 
-```rust
-pub enum CompactionErrorKind {
-    Disabled,
-    NothingToCompact,
-    NoFeasibleCut,
-    ProtectedRegionTooLarge,
-    NoFeasibleSummaryBudget,
-    SummarySourceTooLarge,
-    SummaryFailed,
-    SummaryInvalid,
-    SourceChanged,
-    Cancelled,
-    SecurityRevoked,
-    Storage,
-    ContextStillTooLargeAfterCompaction,
-}
-```
+以下情况返回typed error：
+
+- 没有任何cut能让summary request可行；
+- 单个recent unit本身超过可用窗口且policy不允许全部summary；
+- token estimator失败；
+- model没有可行summary output budget。
 
 ## CompactionPlan
 
-`ConversationBoundary`是完整stable unit reference。`CompactionScope`中的`summarized_through`是本次source effective projection中inclusive last newly covered unit，`retained_from`是inclusive first exact-retained unit；active scope还保存selected active UserMessage anchor和该segment的optional `previous_checkpoint`。`previous_checkpoint`是当前effective checkpoint unit的boundary；它所代表的原始coverage frontier必须从backing `StoredCompaction`的scope provenance派生。boundary只保存unit first/last `EntryId`；writer必须用current effective projection证明scope内的相邻、provenance、typed entry shape和单调关系。fork remap全部nested `EntryId`后必须对target执行完整replay和structural validation。
-
 ```rust
 pub(crate) struct CompactionPlan {
-    pub trigger: CompactionTrigger,
-    pub settings: Arc<CompactionSettings>,
-    pub source: ConversationCheckpoint,
-    pub scope: CompactionScope,
-    pub protected_entries: Arc<[EntryId]>,
-    pub summary_source: CommittedCompactionSourceView,
-    pub tokens_before: u64,
-    pub retained_tokens: u64,
-    pub predicted_tokens_after: u64,
-    pub summary_budget: CompactionSummaryBudget,
-}
-
-pub(crate) struct CommittedCompactionSourceView {
-    checkpoint: ConversationCheckpoint,
-    scope: CompactionScope,
-    protected_context: Arc<[MessageRecord]>,
-    summary_target: Arc<[MessageRecord]>,
-}
-
-impl CommittedCompactionSourceView {
-    pub(crate) fn checkpoint(&self) -> &ConversationCheckpoint;
-    pub(crate) fn scope(&self) -> &CompactionScope;
-    pub(crate) fn protected_context(&self) -> &[MessageRecord];
-    pub(crate) fn summary_target(&self) -> &[MessageRecord];
-}
-
-impl CommittedConversationState {
-    pub(crate) fn compaction_source(
-        &self,
-        scope: &CompactionScope,
-    ) -> Result<CommittedCompactionSourceView, CompactionError>;
+    source_checkpoint: ConversationCheckpoint,
+    source: Arc<[MessageRecord]>,
+    summary_prefix: Arc<[MessageRecord]>,
+    first_kept_entry_id: Option<EntryId>,
+    retained_suffix: Arc<[MessageRecord]>,
+    budget: CompactionSummaryBudget,
+    settings: CompactionSettingsSnapshot,
+    token_estimator: TokenEstimator,
 }
 ```
 
-SessionExecutor启动operation时持有同一个`Arc<CompactionPlan>`，并把该Arc与同一个`Arc<ModelCallRequest>`一起移动到retry/resume state。operation result validation不比较派生标识；它验证current operation slot仍引用同一plan object、Turn/version/control未改变、source checkpoint exact，并对当前effective projection执行typed entry、scope、boundary和provenance结构验证。
+字段private。operation全程持有同一个`Arc<CompactionPlan>`。plan中的TokenEstimator必须与PromptSet持有的TurnModelSnapshot estimator结构相等；不使用hash/fingerprint比较。
 
-`CommittedCompactionSourceView`是owned immutable view，没有public constructor，只能由CommittedConversationState基于validated scope和stable-unit boundaries产生。它分别携带不进入coverage的protected context与真正待摘要的messages，并证明source checkpoint exact、coverage来自trusted projection、boundaries合法、messages顺序正确且没有hidden Tool round。active scope的protected context包含current effective prefix through selected UserMessage anchor，使“继续处理上一个决定”之类请求仍可正确解释；第一个segment的pre-Turn context过大时必须先执行`ConversationPrefix`，不能静默省略。PromptSet只通过getter读取并执行唯一`MessageRecord → ModelMessage`转换，不接收caller拼装的裸message vector。
+plan不包含：
+
+```text
+CompactionScope
+ConversationBoundary
+protected_entries
+previous_checkpoint
+instruction_segment
+coverage_frontier
+stable-unit hash
+plan fingerprint
+```
 
 ## Summary Input Reduction
 
-SummaryModel input必须有界。缩减只影响summary request representation，不修改durable source entries或AgentRun conversation。
+超大ToolResult可以在summary request中确定性reduce，durable原文不改写。
 
-大ToolResult转换为明确标记的representation：
+reduction至少保留：
 
 ```text
-Tool: <name>
-Outcome: success | error
-Original bytes: N
-Head:
-...
-Tail:
-...
-Omitted bytes: M
+tool name
+ToolCallId
+success/error disposition
+original byte count
+head/tail excerpts
+omitted byte count
 ```
 
-规则：保留tool name、call identity、outcome、head/tail、原始字节数和省略字节数；不能静默截断；原始Tool message保持durable；summary coverage仍引用完整stable unit。
-
-Images/audio/documents不把base64或binary放入summary request，使用已committed的model-safe description、media type、size和existing typed media reference；无法取得安全描述时使用typed placeholder。Reasoning只使用provider实际返回的displayable/replayable summary或text，encrypted reasoning不展开。
+reduction只影响SummaryModel input。普通AgentRun和history仍使用durable exact content或其正常display policy。
 
 ## CompactionSummaryDirective
 
 ```rust
-pub enum CompactionSummaryScope {
-    ConversationPrefix,
-    ActiveTurnCompletedPrefix,
-}
-
 pub struct CompactionSummaryDirective {
     format_version: CompactionSummaryFormatVersion,
-    scope: CompactionSummaryScope,
     instruction: Arc<str>,
     max_output_tokens: NonZeroU32,
     max_summary_bytes: usize,
 }
-
-impl CompactionSummaryDirective {
-    pub(crate) fn format_version(&self) -> CompactionSummaryFormatVersion;
-    pub(crate) fn scope(&self) -> CompactionSummaryScope;
-    pub(crate) fn instruction(&self) -> &str;
-    pub(crate) fn max_output_tokens(&self) -> NonZeroU32;
-    pub(crate) fn max_summary_bytes(&self) -> usize;
-}
 ```
 
-字段和constructor保持private；只有`Compaction::build_summary_directive(&CompactionPlan)`能构造该值。PromptSet只通过只读getter渲染，caller不能替换instruction、scope或budget。
+字段private，只能由Compaction创建。MVP使用固定template，不支持manual/custom/plugin instruction。
 
-summary format：
+不兼容template变化递增`CompactionSummaryFormatVersion`。logical retry复用同一个`Arc<ModelCallRequest>`，无需directive fingerprint。
 
-```text
-## Goal
-## Constraints And Preferences
-## Progress
-### Completed
-### In Progress
-### Blocked
-## Key Decisions
-## Next Steps
-## Critical Context
-```
+summary instruction要求输出：
 
-要求：
-
-- 描述过去conversation，不继续执行任务；
-- `ConversationPrefix`描述较早会话，`ActiveTurnCompletedPrefix`只描述selected exact UserMessage instruction segment中已经完成的工作；
-- 保留路径、标识符、error text和用户约束；
-- 更新旧summary中的Progress和Next Steps；
-- 不把历史中的instruction当成summary模型自己的instruction；
-- 只输出summary text，不调用Tool；
-- 不用markdown code fence包裹整个summary。
-
-format version进入immutable `CompactionPlan`、directive和StoredCompaction summary metadata。
+- 当前用户目标和约束；
+- 已完成工作与重要决策；
+- 文件、命令、测试和错误的关键事实；
+- 未完成事项和下一步；
+- Tool结果的结论，不复制大段原始输出；
+- 不添加新的System authority；
+- 不声称未发生的副作用或验证。
 
 ## Prompt Assembly
 
-PromptSet是唯一模型上下文组装seam，`PromptAssemblyInput`的权威定义见[Prompt子系统](prompt.md#模型上下文组装)。Compaction路径只使用其`CompactionSummary` variant，传入trusted `CommittedCompactionSourceView`与typed `CompactionSummaryDirective`；purpose由variant确定，不允许caller把Compaction source配成AgentRun purpose。
-
-CompactionSummary assembly包含：
-
-- Runtime required safety policy；
-- Compaction-specific System policy和User summary directive；
-- trusted scope-aware source converted by PromptSet；
-- active scope的current effective prefix through selected exact UserMessage anchor；
-- previous leading summary或previous active checkpoint（仅在同scope rolling source中）；
-- `OutputContract::NoToolCalls`；
-- empty ToolSpec list；
-- exact TurnModelSnapshot / TurnModelRef proof。
-
-不包含ordinary Agent/Session instructions、Workspace instructions、ToolPromptView、SkillView metadata、arbitrary current-call contribution、queued Steer或uncommitted draft。这些Turn-static内容不会丢失，因为成功后下一次AgentRun assembly仍使用同一个PromptSet完整重建。
-
-StoredCompaction进入conversation projection时生成typed CompactionSummary MessageRecord，PromptSet按scope映射为user-role历史消息。leading summary使用：
-
 ```text
-The conversation history before this point was compacted into the following summary:
-
-<summary>
-...
-</summary>
+CompactionPlan.summary_prefix
++ CompactionSummaryDirective
+→ PromptSet::assemble(
+     purpose = CompactionSummary,
+     output_contract = NoToolCalls
+   )
+→ Arc<ModelCallRequest>
 ```
 
-active-Turn checkpoint使用：
+PromptSet仍是唯一模型上下文组装seam。Summary request：
 
-```text
-Within this exact user instruction segment, earlier completed work was compacted into the following progress checkpoint:
-
-<summary>
-...
-</summary>
-```
-
-两者都不是System instruction，也不允许summary内容改变Runtime policy。active checkpoint位于对应exact UserMessage anchor之后、该segment recent exact tail或下一条exact UserMessage之前。
+- 使用当前Turn捕获的PromptSet和TurnModelSnapshot；
+- 不披露Tools；
+- 不允许ToolCall输出；
+- 不从filesystem重新读取Prompt/Skill；
+- 不把summary提升为System authority。
 
 ## Model Call
 
-SummaryModel调用：
+ModelGateway执行一次provider attempt。SessionExecutor对同一个immutable request最多logical retry一次。
 
-```text
-purpose = CompactionSummary
-output_contract = NoToolCalls
-model = active TurnModelSnapshot exact identity
-max_output_tokens = CompactionSummaryDirective.max_output_tokens()
-tools = []
-```
+有效结果必须：
 
-SessionExecutor调用同一个：
+- finish/content符合`NoToolCalls`；
+- 至少有non-empty text；
+- UTF-8/byte/token上限合法；
+- 不包含ToolCall；
+- provider response已经通过ModelGateway validation。
 
 ```rust
-ModelGateway::generate_model_turn(
-    request,
-    progress,
-    cancellation,
-)
+pub struct ValidatedCompactionSummary {
+    text: Arc<str>,
+}
 ```
 
-ModelGateway不因为purpose改变provider/model identity，也不调用provider-native compaction endpoint。
-
-### Valid Result
-
-Compaction只接受：
-
-- one finalized assistant response；
-- non-empty text summary；
-- no ToolCall；
-- no unresolved structured output；
-- finish reason为Stop或adapter合法归一化的Unknown；
-- summary bytes不超过max；
-- usage和provider metadata可规范化；
-- returned result仍绑定同一个`Arc<ModelCallRequest>`和typed assembly request。
-
-SummaryModel返回的reasoning不进入conversation。StoredCompaction不单独保存summary-call reasoning；实现不得保存或伪造provider未返回的hidden chain-of-thought。
-
-由于CompactionSummary固定使用`OutputContract::NoToolCalls`，Provider返回ToolCall时ModelGateway直接返回`UnexpectedToolCall`，Compaction不会看到可执行call。`InvalidProviderResponse`和`IncompleteResponse`同样不会产生summary candidate；non-empty `Refused`虽然是合法Model response，但不是合法summary，由Compaction映射为`SummaryInvalid`。这些结果都不属于SummaryModel transient retry。
-
-### Retry
-
-ModelGateway每次SummaryModel operation最多执行一个provider attempt；Rig和底层provider SDK automatic retry固定为0。
-
-logical SummaryModel retry由SessionExecutor决定，默认最多1次并使用2秒backoff。`RunningOperation::CompactConversation`形成并持有exact `Arc<CompactionPlan>`与exact `Arc<ModelCallRequest>`；进入`WaitForModelRetry`时，operation自身继续持有request，`ModelRetryResume::CompactionSummary { plan }`持有同一plan Arc。恢复Compaction operation时不重新plan或assemble。由此复用相同CompactionPlan、PromptSet、TurnModelSnapshot、AssembledModelContext、summary directive和source checkpoint；request前credential refresh不改变logical request。
-
-只有Gateway已证明`NotSent`或`RejectedBeforeExecution`，且reason是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After <= 60s`的`RateLimited`时，才允许该一次retry。`AcceptedNoOutput`没有明确pre-execution rejection proof时按`RequestOutcomeUnknown`处理；`RequestOutcomeUnknown`、`StreamInterrupted`、`UnexpectedToolCall`、`InvalidProviderResponse`和`IncompleteResponse`不能重放，也不能通过改变summary directive伪装成同一次retry。完整规则见[ADR 0119](../adr/0119-model-calls-use-session-logical-retries.md)和[ADR 0120](../adr/0120-failures-stay-with-owning-modules.md)。
+Compaction不尝试从Markdown fence、JSON或其他格式repair摘要。
 
 ## Session Execution Integration
 
-### Phase
-
-`TurnExecutionPhase`的权威枚举由[Agent与Session生命周期](agent-session-lifecycle.md#turn-status-与-execution-phase)定义；Compaction integration只使用其中的`Compacting`，不在本模块重复声明完整枚举。
-
-`Compacting`期间：
-
-```text
-TurnStatus = Running
-SessionExecutionState = Running
-RunningOperation = CompactConversation
-```
-
-phase是transient observer projection，不写入JSONL。
-
-### Current State
-
-```rust
-pub(crate) struct CurrentCompactionState {
-    pub trigger: CompactionTrigger,
-    pub source: ConversationCheckpoint,
-    pub scope: CompactionScope,
-    pub plan: Arc<CompactionPlan>,
-    pub original_model_request: Option<Arc<ModelCallRequest>>,
-    pub cancellation: CancellationToken,
-}
-```
-
-soft trigger可以暂存尚未发送的original request。任何Steer、Cancel、SecurityRevoked或conversation change都使它失效。
-
-### Start Flow
+### Start
 
 ```text
 NeedModel
-→ assemble AgentRun context
-→ classify no pressure / soft pressure / hard local overflow
-
-no pressure
-→ start GenerateModelResponse
-
-soft/hard pressure
+→ capture source checkpoint
+→ pressure = Soft/Hard
 → Compaction::plan
-→ phase = Compacting
-→ start CompactConversation operation
+→ build directive
+→ PromptSet assemble
+→ install RunningOperation::CompactionSummary
+→ ModelGateway.generate_model_turn
 ```
 
-provider overflow路径：
-
-```text
-GenerateModelResponse returns ContextOverflow
-→ validate TurnId/version/exact request object
-→ reserve hard-recovery basis(source checkpoint + current scope frontier)
-→ Compaction::plan(trigger = ProviderContextOverflow)
-→ phase = Compacting
-→ start CompactConversation
-```
-
-启动Compaction本身不推进`execution_version`，因此soft failure在没有control或conversation变化时仍可复用original request。成功append/apply Replace后才推进version。Cancel和SecurityRevoked立即推进version并取消operation；Compacting期间到达的Steer只排队并使saved original request不再可发送，Steer UserMessage append/apply也不推进execution_version。
-
-`CurrentTurnExecution`保存successful compaction count和last hard-recovery basis，不把它们放在operation-local CurrentCompactionState。同一个`source checkpoint + scope frontier`（active scope中包含previous checkpoint及其covered-through provenance）最多启动一次hard recovery；失败不能在同一basis透明重试。成功append/apply会推进source或frontier，之后只有新增eligible stable units达到`minimum_reclaimed_tokens`且尚未达到`max_compactions_per_turn`时，才允许在同一Turn再次compact。soft compaction也计入成功次数，但不会占用未实际启动的hard-recovery basis。
-
-### RunningOperation
-
-```rust
-RunningOperation::CompactConversation {
-    turn_id,
-    execution_version,
-    source,
-    scope,
-    plan: Arc<CompactionPlan>,
-    summary_request,
-    logical_retry_count,
-    cancel,
-}
-```
-
-output：
-
-```rust
-OperationOutput::Compaction(
-    Result<CompactionCommitCandidate, CompactionOperationError>
-)
-```
-
-operation不能append JSONL，也不能apply projection。
-
-### Control Arbitration
-
-Compacting期间：
-
-- Steer进入existing pending Steer FIFO，不立即append；
-- FollowUp保持FollowUpQueue语义；
-- Cancel通过`EmergencyControl` sticky signal立即触发operation cancellation token；Executor观察signal后推进execution_version；
-- SecurityRevoked绑定current active target并设置同一`EmergencyControl`的sticky signal；不等待普通lane容量；
-- PrepareForUnload通过`LifecycleControl`停止new admission；grace deadline到期时转为fail-closed Cancel；
-- ResolveInteraction与Compaction无关，不应存在由Compaction创建的Interaction。
-
-Compaction启动前、结果返回后和StoredCompaction append前都必须观察最新emergency epoch。Cancel/SecurityRevoked已生效时丢弃未commit summary并进入Interrupted处理。Steer本身不让已生成summary失真，因为它尚未append；成功commit后再compose/append Steer，然后重新assemble AgentRun。
+TurnStatus保持Running，execution phase为Compacting。Steer继续排队；Cancel/SecurityRevoked可以停止尚未commit的Compaction。
 
 ### Commit Validation
 
-SessionExecutor append前必须验证：
+结果返回后SessionExecutor验证：
 
 ```text
-SessionId exact
-TurnId exact and Running
-execution_version exact
-phase = Compacting
-current operation slot still owns the same Arc<CompactionPlan>
-current operation slot still owns the same Arc<ModelCallRequest>
-source ConversationCheckpoint exact
-current TurnExecutionContext/TurnModelSnapshot/PromptSet are the ones captured by that request
-no winning Cancel
-no winning SecurityRevoked
-TurnControlGate controlled reservation valid
-summary result valid
-CompactionScope anchor/previous checkpoint/coverage provenance与current effective projection structural exact
-committed path中不存在覆盖同一scope frontier的StoredCompaction（靠状态判断去重，非operation key冲突检测）
+Turn仍Running
+execution_version未变
+current operation仍持有同一个Arc plan/request
+ConversationCheckpoint == plan.source_checkpoint
+control basis仍有效
+summary result validated
 ```
 
-commit顺序：
+验证失败丢弃结果，不append。
+
+### Success
 
 ```text
-process all earlier queued control requests
-→ winning Cancel/SecurityRevoked：discard candidate并进入cleanup
-→ validate candidate and current execution version
-→ reserve TurnControlGate controlled append
-→ revalidate source checkpoint/control state while reservation is held
-→ SessionWriter.append(StoredCompaction draft)
-→ SessionWrite OutcomeUnknown时保守终结本次compaction，下次触发按committed prefix重新规划
-→ apply scope-aware CommittedConversationDelta::Replace
-→ release reservation
+ValidatedCompactionSummary
+→ StoredCompaction {
+     summary,
+     first_kept_entry_id,
+     model_call
+   }
+→ SessionWriter.append
+→ apply Replace
+→ rebuild AgentLoop segment from new CommittedConversationView
+→ re-evaluate pressure
+→ AgentRun
 ```
 
-Compaction summary本身不读取Workspace文件，但它仍属于active Turn logical execution；因此Cancel/SecurityRevoked与StoredCompaction commit通过同一个TurnControlGate first-wins。
-
-### Success Flow
-
-```text
-StoredCompaction append/apply
-→ CommittedConversationState checkpoint advances
-→ increment execution_version
-→ ConversationPrefix: Replace = [new leading summary] + [retained exact suffix]
-→ ActiveTurnCompletedPrefix: Replace = [prefix through exact anchor] + [new checkpoint] + [retained exact active tail]
-→ rebuild ConversationSeed
-→ rebuild private AgentLoop segment
-→ phase = PreparingModel
-→ steer FIFO非空时pop_front一条并append/apply
-→ assemble a new AgentRun ModelCallRequest
-→ continue the same TurnExecutionContext
-```
-
-Compaction summary output不交给AgentLoop当作assistant response。旧AgentLoop segment、provider connection和continuation全部丢弃。
-
-成功不会：
-
-- 开启新Turn；
-- 改变TurnExecutionContext；
-- 改变TurnModelSnapshot；
-- 重新捕获Workspace/Skill/Tool/Prompt；
-- 生成Assistant Item；
-- 生成Compaction Item；
-- 发布Turn terminal fact。
-
-### Post-Commit Validation
-
-下一次AgentRun assembly仍执行完整PromptSet validation。若compacted context仍overflow：
-
-- 本次Compaction entry保持durable；
-- 若另一个scope或已经推进后的active frontier存在eligible range、达到minimum reclaim且单Turn次数仍有余额，重新进入一个明确的Compaction planning cycle；
-- 若没有新frontier、没有可行cut或次数耗尽，TurnFailed with `ContextStillTooLargeAfterCompaction`；
-- 不在同一source/frontier上无限compact-and-retry。
-
-## Failure Policy
-
-| Failure | Soft pressure | Hard overflow |
-| --- | --- | --- |
-| NothingToCompact / NoFeasibleCut | 原request仍valid时继续 | TurnFailed |
-| ProtectedRegionTooLarge | 原request通过validation时继续 | TurnFailed |
-| NoFeasibleSummaryBudget | 原request仍valid时继续 | TurnFailed；保留Compaction domain error |
-| SummarySourceTooLarge | 原request仍valid时继续 | TurnFailed |
-| summary auth/rate/transport exhausted | 原request仍valid时继续 | TurnFailed |
-| summary Refused/invalid，或Gateway返回UnexpectedToolCall/InvalidProviderResponse/IncompleteResponse（CompactionSummary不使用Structured） | 原request仍valid时继续 | TurnFailed |
-| source changed | 不使用candidate并fail closed | fail closed；不在同一operation内重计划 |
-| Cancelled/SecurityRevoked | 进入Turn interruption cleanup | 进入Turn interruption cleanup |
-| storage failure | Session unavailable/Turn failure规则 | 同左 |
-| still too large after commit | TurnFailed | TurnFailed |
-
-soft fallback只能复用原`Arc<ModelCallRequest>`，并且必须满足conversation checkpoint、execution version、current operation/control state全部未变。任一basis变化时本次fallback被拒绝，不能在Compaction failure handler内重新assemble或发送stale request；按SourceChanged、Cancel或其他对应control outcome结束当前candidate。
-
-`SourceChanged`不做transparent replan。合法Steer在Compacting期间尚未append，Cancel/SecurityRevoked会推进version；因此operation result对应的source意外变化表示实现race或未经授权的projection advance，必须结束当前candidate。新的planning只能由SessionExecutor在重新进入NeedModel后作为新的明确操作启动；同一hard-recovery basis仍视为已使用。
+Compaction Replace后必须重建AgentLoop segment；旧seed不可继续。
 
 ## StoredCompaction
 
-本节是`StoredCompaction`及其nested schema的权威定义；[Conversation Storage](conversation-storage.md#compaction-entry)只拥有append/replay validation和projection，不重复声明这些类型。
-
 ```rust
-pub struct ConversationBoundary {
-    pub unit_first_entry_id: EntryId,
-    pub unit_last_entry_id: EntryId,
-}
-
 pub struct StoredCompaction {
     pub turn_id: Option<TurnId>,
-    pub source: ConversationCheckpoint,
-    pub scope: CompactionScope,
-    pub summary: CompactionSummary,
-    pub protected_entries: Arc<[EntryId]>,
+    pub summary: Arc<str>,
+    pub first_kept_entry_id: Option<EntryId>,
     pub model_call: Option<StoredCompactionModelCall>,
 }
 
 pub struct StoredCompactionModelCall {
-    pub model: TurnModelRef,
-    pub response_id: Option<String>,
-    pub usage: Option<ModelUsage>,
-    pub finish_reason: ModelFinishReason,
-    pub provider_metadata: StoredProviderResponseMetadata,
-    pub logical_retry_count: u32,
+    pub provider_id: ProviderId,
+    pub model_id: ModelId,
     pub requested_max_output_tokens: NonZeroU32,
+    pub finish_reason: ModelFinishReason,
+    pub usage: Option<ModelUsage>,
+    pub logical_retry_count: u8,
+    pub provider_metadata: StoredProviderResponseMetadata,
 }
 ```
 
-automatic active-Turn compaction约束：
+首版automatic Compaction使用`turn_id = Some(active TurnId)`和`model_call = Some(...)`。`None`为未来deterministic maintenance/import预留，不在MVP公开。
+
+不保存：
 
 ```text
-turn_id = Some(active TurnId)
-model_call = Some(...)
+source checkpoint
+scope kind
+anchor UserMessage
+protected EntryIds
+unit first/last boundaries
+previous checkpoint
+coverage provenance
+workspace/model definition revision
+prompt/tool/skill snapshot reference
+hash/fingerprint
 ```
 
-`turn_id = None`和`model_call = None`保留给未来standalone/deterministic maintenance，不由automatic active-Turn流程产生。
+## Live Append Validation
 
-`CompactionSummary`至少保存：
+live writer验证：
 
-```rust
-pub struct CompactionSummary {
-    pub format_version: CompactionSummaryFormatVersion,
-    pub text: Arc<str>,
-    pub tokens_before: u64,
-    pub estimated_tokens_after: u64,
-}
-```
+- summary non-empty且bounded；
+- `first_kept_entry_id`位于current selected path；
+- marker对应当前effective model-visible unit的first entry；
+- marker前存在可摘要prefix，或marker为None；
+- retained suffix是当前effective conversation的exact suffix；
+- model_call retry count为0–1；
+- active automatic entry的Turn仍Running。
 
-`StoredCompactionModelCall`保存exact model ref、response id、usage、finish reason、provider metadata、logical retry count和requested max output。`logical_retry_count`范围为0–1；trusted writer和cold replay semantic validation都拒绝更大值。失败attempt usage只进入ModelGateway telemetry，不写入Session totals。
+这些验证使用current hot projection。Stored entry不携带完整proof。
 
-### Append and Durable Entry Validation
+## Projection
 
-`Compaction::validate_summary`和SessionExecutor append gate在调用`SessionWriter.append`前验证当前Turn仍可提交candidate：
-
-- current operation仍持有同一个`Arc<CompactionPlan>`和`Arc<ModelCallRequest>`；
-- source checkpoint、TurnId和execution version exact，且`current_operation`仍是持有上述plan/request的对应Compaction slot；
-- candidate的scope anchor、`previous_checkpoint`、coverage provenance与current effective projection structural exact，且committed path没有同一scope frontier的已提交compaction；
-- ModelCall request、directive、typed assembly request、summary budget和pinned model limits actual values exact一致；
-- TurnControl basis仍有效，automatic entry满足`turn_id`和SummaryModel约束。
-
-`SessionStorage::validate_and_project`（append与cold replay共用）只验证entry自身可以重建的durable关系：
-
-- source checkpoint位于selected ancestry并等于current checkpoint；
-- scope中的全部boundary都是source effective projection上的stable boundaries；
-- `ConversationPrefix`的summarized prefix非空、retained suffix连续且两者相邻，且coverage不越过active Turn anchor；
-- `ActiveTurnCompletedPrefix`的anchor是current Turn exact initiating或Steer UserMessage，coverage位于anchor之后且不跨越下一条active UserMessage；
-- active scope的`previous_checkpoint`（若存在）必须与该instruction segment current effective checkpoint exact match；解析其backing `StoredCompaction`得到covered-through provenance，确认新coverage在selected ancestry中紧接该provenance并只向后推进，且retained tail或下一UserMessage紧邻coverage；
-- protected entries都存在于selected ancestry，所属完整unit不进入summary coverage，且任何ToolRound都未被拆分；
-- durable `StoredCompactionModelCall`中的requested output、summary text和model metadata可round-trip；cold replay不重新声称验证已经消失的plan/directive/model limits；
-- automatic SummaryModel entry有model_call，turn_id存在时Turn仍Running且与source path一致；
-- 基于committed prefix状态的compaction去重规则成立。
-
-caller提供的raw replacement messages不是StoredCompaction字段。trusted projector根据source、typed scope、boundaries和summary确定性构造Replace delta，避免caller提交任意history rewrite。
-
-### Projection
+遇到合法StoredCompaction：
 
 ```text
-ConversationPrefix：
-
-old = [summarized prefix] + [retained exact suffix]
-new = [leading CompactionSummary] + [same retained exact suffix]
-
-ActiveTurnCompletedPrefix：
-
-old = [prefix through selected exact UserMessage] + [optional previous checkpoint] + [newly completed units] + [retained exact suffix]
-new = [same prefix through selected exact UserMessage] + [replacement segment checkpoint] + [same retained exact suffix]
+current effective conversation
+→ locate first_kept_entry_id
+→ [historical summary user message]
+   + exact suffix from marker
+→ Replace
 ```
 
-Compaction entry本身推进ConversationCheckpoint。下一次rolling compaction的source只看effective conversation，不重新展开更早已被覆盖的raw entries。effective conversation最多包含一个leading summary，并且每个active instruction segment最多一个checkpoint。
-
-## Prompt、Workspace、Skill和Tool保留
-
-### Turn-Static Inputs
-
-以下内容不写入summary：
+marker为None：
 
 ```text
-Runtime safety policy
-Agent instructions
-Session instructions
-Workspace instructions
-Tool definitions/guidelines
-SkillView metadata
-TurnModelSnapshot policy
+current effective conversation
+→ [historical summary user message]
 ```
 
-它们已经被active Turn的PromptSet/ToolSet/SkillView固定，并在每次AgentRun assembly重新注入。把它们再摘要会造成重复、过时内容和summary劫持风险。
+summary message使用User role和明确historical-summary metadata，不获得System authority。
 
-### Dynamic Contributions
+## Tolerant Replay
 
-已经规范化并随UserMessage/Steer/Tool message持久化的动态contribution属于conversation fact，可以进入summary source。未append contribution、live filesystem state、current skill file内容或Tool progress不能进入summary。
+cold replay：
 
-### Exact Resume Limitation
+- marker存在且指向当前effective model-visible unit：应用Replace；
+- marker missing、指向ignored entry、位于unit内部或不能产生provider-valid suffix：忽略该Compaction并记录`IgnoredCompaction`；
+- malformed summary/model_call：忽略entry；
+- 后续有效消息和Compaction继续处理。
 
-Compaction不能把execution Context变成可恢复checkpoint。MVP在process restart后关闭unfinished Turn，不恢复旧PromptSet、ToolSet或Workspace captured runtime objects；已经committed的Skill正文与StoredCompaction属于conversation fact，仍可由storage replay，未committed Skill不由summary保存或恢复。
+replay不重新运行token estimator、Prompt assembly或model-limit validation，也不要求旧TurnModel/Workspace/Prompt资源存在。
+
+## Rolling Summary
+
+每个effective conversation最多一个leading summary。再次Compaction时：
+
+```text
+previous summary
++ retained exact suffix
++ newly committed messages
+→ new summary prefix
++ newer retained exact suffix
+```
+
+新StoredCompaction追加到ledger，不重写旧entry。selected path应用latest有效Compaction得到current effective conversation。
+
+不维护per-instruction checkpoint或summary tree。多次摘要可能发生信息损失，这是MVP接受的取舍；质量通过eval和保留recent exact tail缓解。
+
+## Cancellation 与 Failure
+
+- Cancel/SecurityRevoked在append前获胜：丢弃summary result；
+- StoredCompaction append成功后Cancel到达：Replace已生效，随后按普通Turn interruption处理；
+- provider/validation失败：按Compaction failure policy决定retry一次或TurnFailed；
+- `NoFeasibleSummaryBudget`、`NoValidCut`或summary仍无法解除hard overflow：返回typed Compaction error；
+- 不执行无限compact-and-retry；
+- `max_compactions_per_turn`限制单Turn次数；
+- 同一个source checkpoint最多启动一次hard recovery，成功Replace推进checkpoint后可形成新basis。
 
 ## Recovery
 
-### Crash Before Append
+crash前后：
 
-```text
-summary operation running or completed in memory
-→ no StoredCompaction
-→ old conversation remains authoritative
-→ restart does not resume summary call
-→ unfinished Turn按conservative recovery Interrupted
-```
-
-### Crash During Append
-
-遵守storage的append/恢复规则（EntryId + parent_id + committed-prefix状态判断）：
-
-- incomplete tail可由exclusive writer recovery truncate；
-- 恢复时读committed prefix，若目标cut的StoredCompaction已存在则跳过，不重复写；
-- 不做in-run replay-by-key，也不依赖同operation key不同payload的冲突检测；
-- 不重新调用SummaryModel来解析storage outcome unknown。
-
-### Crash After Append Before Apply
-
-```text
-StoredCompaction durable
-→ replay validates entry
-→ projector deterministically applies Replace
-→ current Turn仍按unfinished-Turn recovery终止
-```
-
-Compaction效果保留；不恢复旧AgentLoop、provider stream或RunningOperation。
-
-### Recovery Never Invents
-
-recovery不得：
-
-- 生成synthetic summary；
-- 自动重新调用SummaryModel；
-- 猜测cut boundary；
-- 重新读取current Workspace形成历史summary；
-- 丢弃已经durable的Compaction；
-- 把hidden incomplete ToolRound放入conversation。
+- append前crash：没有durable Compaction；
+- append OutcomeUnknown：writer poison；下次load按实际完整行决定是否应用；
+- append成功apply前crash：cold replay应用或忽略marker；
+- old model operation不恢复；
+- Running Turn按Session recovery中断；
+- 不重新调用SummaryModel修复坏Compaction。
 
 ## Fork
 
-Compaction是selected entry path上的overlay：
+Fork复制selected path上的StoredCompaction且保留`first_kept_entry_id`和所有历史ID。因为复制path保留EntryId，不需要remap marker。
 
-- fork到Compaction前anchor得到旧conversation；
-- fork到Compaction后anchor复制Compaction entry及其referenced source/protected EntryId refs；
-- target remap全部nested EntryId、anchor、frontier和ConversationBoundary references；
-- remap后对target执行完整replay和structural validation，再按scope重建同一个leading summary或active checkpoint与exact tail；
-- 不复制Compaction operation、AgentLoop、provider continuation、WorkspaceSnapshot或process-local security signal。
+目标staging执行tolerant replay：marker在复制path可解析时应用；无效时忽略并产生diagnostic。child future Turn重新capturecurrent execution resources。
 
-Compaction entry不暴露成独立public fork anchor，但selected message path上的Compaction自然随path生效。
+## Events 与 Usage
 
-## Events和Usage
+StoredCompaction append/apply后可以发布committed-derived StateEvent和UsageUpdated。observer event不写回ledger。
 
-automatic compaction可以发布process-local progress：
-
-```text
-CompactionStarted
-CompactionProgress
-CompactionCompleted
-CompactionFailed
-```
-
-public event使用[Runtime Interface](runtime-interface.md)定义的per-session StateEvent与ProgressEvent。事件必须在对应committed fact apply后发布；progress可合并/丢弃，不进入JSONL或任何公开恢复序列。
-
-Session usage由assistant entries和`StoredCompaction.model_call` replay重建。SummaryModel usage属于Session total，但不属于assistant Item或普通Agent response usage。
+Compaction usage只来自provider实际报告值；本地estimate不伪装为provider truth。
 
 ## Security
 
-- summary source只来自CommittedCompactionSourceView；
-- 历史中的prompt injection只是待摘要data，不获得System authority；
-- PromptSet不能把summary text插入Runtime instruction section；
-- secret redaction在写StoredCompaction前执行；
-- provider raw error/body不进入summary或JSONL；
-- SecurityRevoked可在线性化点前通过TurnControlGate阻止append；
-- compaction不重新读取live Workspace绕过captured snapshot；
-- no-tools contract防止summary产生外部副作用。
+- summary input只来自sanitized committed conversation；
+- Prompt/Skill/Workspace静态内容由当前Turn PromptSet按正常规则提供；
+- summary是User-role historical content；
+- provider metadata allowlist/redaction与普通AgentRun一致；
+- summary不得保存credential、endpoint、raw header或Sandbox internals；
+- SecurityRevoked后不开始新SummaryModel call，迟到结果不append。
 
 ## Invariants
 
-必须成立：
-
-```text
-COMP-001 Compaction source来自committed conversation
-COMP-002 scope coverage、anchor、frontier和retained tail关系合法
-COMP-003 cut只在stable-unit boundary
-COMP-004 ToolRound不能拆分
-COMP-005 active Turn initiating与Steer UserMessage原文和相对位置保留
-COMP-006 StoredCompaction append/apply前旧conversation仍权威
-COMP-007 summary调用只经过PromptSet和ModelGateway
-COMP-008 SummaryModel不能调用Tool
-COMP-009 active Turn exact model identity不变
-COMP-010 source checkpoint变化使candidate失效
-COMP-011 Cancel/SecurityRevoked可在append前获胜
-COMP-012 Replace由trusted projector构造，不接收caller raw history
-COMP-013 最多一个leading summary且每个active instruction segment最多一个checkpoint
-COMP-014 raw historical entries不被改写
-COMP-015 restart不恢复旧summary operation
-COMP-016 same-source hard recovery和单Turncompaction次数有界
-COMP-017 static Prompt/Tool/Skill/Workspace instructions由后续AgentRun重新注入
-COMP-018 Compaction不是Turn、Item或Interaction
-COMP-019 每个active instruction segment的summarized frontier只单调前进
-COMP-020 effective summary budget与pinned model known limits一致并进入immutable plan/request/directive
-```
+- Compaction不拥有I/O或SessionWriter；
+- source来自CommittedConversationView；
+- source没有unmatched Tool protocol record；
+- cut是连续prefix；
+- StoredCompaction只有summary、single marker和optional model provenance；
+- marker指向first retained model-visible entry；
+- rolling summary可以再次被摘要；
+- initiating/Steer UserMessage没有永久hard protection；
+- PromptSet唯一组装SummaryModel input；
+- ModelGateway single provider attempt；
+- logical retry复用同一request；
+- append后才Replace；
+- replay坏marker时忽略，不brick Session；
+- Fork保留marker和历史ID；
+- 所有本地token estimate来自Turn-pinned TokenEstimator，effective rate/algorithm version由ModelDefinitionVersion覆盖；
+- 不建设scope/boundary/provenance/fingerprint链。
 
 ## Tests
 
-### Stable Cut Property Tests
-
-随机生成合法conversation entry sequences，验证：
-
-- 任意plan都不拆分ToolRound；
-- scope coverage、anchor、frontier和retained ranges无重叠、无空洞；
-- protected unit始终位于summary coverage之外；
-- Replace后不存在orphan ToolResult；
-- leading rolling N次后仍只有一个leading summary；
-- 每个active instruction segment rolling N次后frontier单调且仍只有一个segment checkpoint；
-- replay和live apply得到相同effective conversation和typed projection state。
-
-### Scenario Tests
-
 至少覆盖：
 
-1. 多个completed Turns后第一次Model前soft compact；
-2. previous summary +新增Turns rolling compact；
-3. initiating segment含多个completed ToolRounds并生成第一个checkpoint；
-4. previous segment checkpoint +新completed ToolRounds滚动推进frontier；
-5. initiating与Steer UserMessage都保持exact且checkpoint不跨越下一UserMessage；
-6. 多个Steer segment各自最多一个checkpoint且相对顺序保持；
-7. Pending/Started/incomplete ToolRound不进入coverage；
-8. true protected region自身过大；
-9. global summary max大于pinned model output limit时plan确定性下调；
-10. context剩余空间低于summary minimum时返回NoFeasibleSummaryBudget；
-11. unknown model limit保持unknown且不按model name猜测；
-12. Tool messages durable但缺少`tool_round_completed`；
-13. summary result返回ToolCall时Gateway返回UnexpectedToolCall，Compaction不取得candidate；
-14. summary finish reason Length时Gateway返回IncompleteResponse，Compaction不取得candidate；
-15. summary期间Steer排队；
-16. summary期间Cancel；
-17. summary期间SecurityRevoked；
-18. source checkpoint在result返回前变化；
-19. write OutcomeUnknown后按committed path状态确认（compaction已存在则跳过）；
-20. crash after append before apply；
-21. provider ContextOverflow后成功推进frontier并在新增work后再次compact；
-22. 同一source/frontier hard recovery不重复；
-23. max_compactions_per_turn耗尽后仍overflow并TurnFailed；
-24. soft compact失败后原request仍valid；
-25. fork到leading summary和不同segment checkpoint前后；
-26. large ToolResult head/tail reduction metadata；
-27. static Workspace/Skill/Tool instructions未写入summary但下一次AgentRun仍存在；
-28. encrypted reasoning不进入summary正文。
+- soft/hard/no-pressure decision；
+- model-aware summary budget；
+- PromptSet/Compaction使用同一Turn-pinned estimator且结果确定；
+- definition default rate的保守估算与diagnostic；
+- non-text unknown不触发Soft；
+- no feasible budget；
+- cut只在provider-valid unit boundary；
+- complete multi-tool exchange作为一个unit；
+- incomplete exchange不进入source；
+- marker指向first retained entry；
+- marker None覆盖全部context；
+- previous summary再次进入source；
+- 多次rolling summary只有一个effective leading summary；
+- initiating UserMessage可被summary覆盖；
+- large ToolResult reduction deterministic；
+- NoToolCalls response validation；
+- CompactionSummary logical retry 0–1；
+- stale checkpoint/current operation/control basis拒绝append；
+- append OutcomeUnknown后replay有entry/无entry两种情况；
+- missing/ignored marker使Compaction被跳过且后续history可读；
+- Fork保留marker并成功replay；
+- summary与provider metadata redaction；
+- max compactions per Turn；
+- compact后仍hard overflow时有界失败。
 
-### Quality Evaluation
+## 明确不建立
 
-算法正确不代表summary质量足够。建立可重复fixture，人工或grader检查：
+```text
+CompactionScope
+ConversationBoundary
+ActiveTurnCheckpoint
+instruction segment
+protected EntryId set
+previous checkpoint
+coverage frontier/provenance
+hierarchical summary tree
+summary content hash/fingerprint
+provider-native opaque-only history
+manual/public CompactSession
+load-path model call
+```
 
-- goal/constraints preservation；
-- file path和symbol preservation；
-- completed/in-progress区分；
-- decision和reason preservation；
-- unresolved failure preservation；
-- hallucination和obsolete next-step rate；
-- summary token ratio。
+## 开放问题
 
-质量评估不能取代storage/cut property tests。
+实现阶段闭合：
 
-## Rejected Alternatives
-
-### 强制结束当前Turn并开启continuation Turn
-
-实现上可以把长任务切成多个用户可见Turn，但会人为终止当前Tool/Interaction lifecycle，并改变Steer、Cancel、usage和terminal语义。仅作为真正无可行cut时的产品降级，不代替active-Turn checkpoint。
-
-### Hierarchical Summary Tree
-
-适合极长Session，但增加summary frontier、引用、失效和repair。先用rolling summary收集真实质量与成本数据。
-
-### Provider-Native First
-
-可能更忠实保留provider-specific state，但artifact不可移植，且要求provider/model/auth continuity。以portable summary作为durable representation。
-
-### Post-Run Eager Compaction
-
-可以降低下一次Turn latency，但会为不再继续的Session支付成本，并使用旧Turn模型策略。只在真正NeedModel时执行。
-
-### Direct Live-History Replacement
-
-实现简单，但进程崩溃后无法证明replacement已持久化。MiniCore必须append/apply后生效。
-
-### Load-Path Compaction
-
-会让Session load等待外部模型调用，并混淆read/recovery和new durable write。load只replay existing Compaction entry。
-
-### Summary As System Message
-
-容易赋予历史内容额外authority。Compaction summary是user-role historical checkpoint。
-
-### Deterministic Truncation As Automatic Fallback
-
-任意丢弃旧message会破坏任务连续性。只允许有标记的summary-input ToolResult reduction，不把它当conversation compaction result。
-
-## Implementation Sequence
-
-Compaction的纯planning/projection可以先做模块测试，但summary model path不能在SessionExecutor和ModelGateway之后另行接入。阶段6–8共享以下交付顺序：
-
-1. 实现stable-unit projection、scope/frontier、context pressure、model-aware budget和property tests；
-2. 冻结`PromptAssemblyInput::CompactionSummary`、`CompactionSummaryDirective`和共用`ModelCallRequest::new`契约；
-3. 通过ModelGateway的`ScriptedProviderAdapter`闭环普通AgentRun；
-4. 在同一harness加入`Compacting`、summary call、StoredCompaction append/apply、trusted Replace和AgentRun reassembly；
-5. 完成soft/hard failure、same-source recovery、per-Turn compaction budget、replay/fork/crash tests；
-6. 并行完成Rig spike，再接入RigProviderAdapter和provider mock-server tests；
-7. 建立summary quality fixtures；
-8. 接入Runtime per-session StateEvent/ProgressEvent并完成公开contract tests。
-
-步骤3和4是共同完成门槛；不允许Compaction使用第二个summary request类型或绕过ModelGateway。
-
-## 完成检查
-
-- [x] 确定Compaction ownership和边界。
-- [x] 确定NeedModel trigger和soft/hard overflow分类。
-- [x] 确定stable-unit cut、current UserMessage protection和active-Turn checkpoint。
-- [x] 确定leading summary、active frontier与scope-aware projection。
-- [x] 确定pinned-model-aware summary budget与domain error。
-- [x] 确定PromptSet/ModelGateway summary调用。
-- [x] 确定`TurnExecutionPhase::Compacting`和control arbitration。
-- [x] 确定append/apply线性化和Replace projection。
-- [x] 确定retry、failure、restart和fork。
-- [x] 确定static instruction不进入summary。
-- [x] 确定不强制split为新Turn，不做manual、hierarchical或provider-native compaction。
-- [x] 确定Runtime protocol不公开manual CompactSession。
-- [ ] 实现Compaction module。
-- [ ] 通过ScriptedProviderAdapter完成overflow → summary → append/apply → reassemble → AgentRun vertical slice。
-- [ ] 实现SessionExecutor integration。
-- [ ] 实现共用Prompt/ModelGateway summary path。
-- [ ] 实现storage/projector/replay/fork tests。
-- [ ] 完成summary quality evaluation。
+1. default pressure thresholds；
+2. recent exact suffix token/unit下限；
+3. `max_summary_bytes`；
+4. deterministic ToolResult reduction head/tail尺寸；
+5. summary quality eval fixture和最低可接受信息保留标准。

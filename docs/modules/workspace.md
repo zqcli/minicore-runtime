@@ -802,7 +802,7 @@ current authority/policy fact published
 
 SecurityRevoked只保证signal first-wins后不启动新的MiniCore-sanctioned Model、Tool、source read或workspace-dependent append。已经进入provider、kernel、子进程或远端系统的operation不能回滚，按Cancel规则保存exact outcome或`ToolAbandoned`。MiniCore不提供open-handle动态revocation，也不建立Runtime-global handle registry。
 
-active Turn仍在既有安全点观察`EmergencyControl`：启动新Model、消费新的source/lazy load结果、处理`ToolExecutionStarted`、提交workspace-dependent conversation entry和开始下一次Tool operation前。operation先于signal完成时按现有basis/controlled-append规则结算；signal先赢时结果被拒绝或丢弃。
+active Turn仍在既有安全点观察`EmergencyControl`：启动新Model、消费新的source/lazy load结果、发放owner-local ToolStartPermit、提交workspace-dependent conversation entry和开始下一次Tool operation前。operation先于signal完成时按现有basis/owner状态结算；signal先赢时结果被拒绝或丢弃。
 
 ## Session Ownership 与 Lifecycle
 
@@ -1015,7 +1015,7 @@ managed hard deny、trust/policy store降级或host安全事件可以在active T
 1. WorkspaceAuthority或host发布current authority/policy事实；
 2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定current active target；
 3. SessionExecutor停止new admission/operation；Idle直接进入resolve，Starting取消candidate，Running/Finishing进入或保持Finishing；
-4. 已越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，不补缺失的`tool_round_completed`；
+4. 已取得ToolStartPermit并进入Running的Tool保存exact outcome或`ToolAbandoned`；Prepared Tool不再启动；
 5. 有active Turn时append/apply`TurnInterrupted(SecurityRevoked)`并释放Turn；
 6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve，并捕获new candidate授权的Workspace-bound Prompt/Skill sources；
 7. success时retire signal、Ready并发布new Snapshot及captured source values，failure时Unavailable且future admission fail closed。
@@ -1328,4 +1328,4 @@ upload / telemetry
 - [x] 按ADR 0123删除Workspace及view命名指纹；执行一致性由不可变Snapshot、私有投影和显式reload/re-resolve保证。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
-- [ ] 定义公开command payload与historical WorkspaceSnapshotRef storage integration。
+- [x] StoredTurnStart只保存model-safe Workspace摘要；不保存historical WorkspaceSnapshotRef或WorkspaceRevision execution binding。

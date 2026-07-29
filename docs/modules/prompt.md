@@ -516,7 +516,7 @@ impl CapturedWorkspacePromptSource {
 
 `SkillContributionRef`携带SkillId和source authorization provenance。TurnExecutionContext负责确认entry来自本Turn捕获的SkillView，并且SkillService lazy parse只能使用entry captured bytes；PromptSet把来源provenance固化到CanonicalUserMessage，正文正确性由实际规范化后的MessageRecord内容承担。
 
-PromptContribution字段和constructor保持private，只能由已授权producer seam创建；它固定为User内容，不能声明System role。producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message + `tool_round_completed`路径，不形成未归属的PromptContribution lane。
+PromptContribution字段和constructor保持private，只能由已授权producer seam创建；它固定为User内容，不能声明System role。producer负责I/O、加载和错误分类；PromptSet只验证、排序并把它固化到`CanonicalUserMessage`或Steer user message。模型触发的Skill Tool输出走truthful role=tool message，并在同一assistant全部matching results存在后随complete Tool exchange进入conversation，不形成未归属的PromptContribution lane。
 
 Required contribution 获取失败必须显式返回 unavailable/error，不能通过 vector 缺项静默忽略。
 
@@ -550,9 +550,9 @@ pub enum PromptAssemblyInput<'a> {
 }
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从已验证的`CommittedConversationState::view()`获得；`CommittedCompactionSourceView`只能由同一State按validated Compaction scope、anchor、previous checkpoint、coverage provenance和exact first/last `EntryId` boundaries构造。它把不进入coverage的protected context与真正待摘要的messages分开；active scope的protected context包含current effective prefix through selected exact initiating/Steer UserMessage anchor，不能为了让summary request fit而静默删减。State只能由SessionStorage replay构造，或在成功应用`SessionWriter::append()`返回的`CommittedSessionEntry` trusted delta后前进。其checkpoint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
+variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从`CommittedConversationState::view()`获得；该State由strict live append/apply或tolerant replay生成，并已隔离orphan/incomplete Tool exchange。`CommittedCompactionSourceView`只能由同一State按single prefix cut构造，包含待摘要的连续provider-valid prefix和marker后的exact retained suffix；不接收scope、protected EntryId、previous checkpoint或coverage provenance。其checkpoint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted scope-aware committed source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted committed prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
 planning前，SessionExecutor从同一个PromptSet取得窄的固定开销basis：
 
@@ -570,7 +570,7 @@ impl PromptSet {
 }
 ```
 
-该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis exact structural values与实际固定sections一致。
+该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；`fixed_prompt_tokens`使用PromptSet持有的`TurnModelSnapshot::token_estimator()`计算。不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis exact structural values与实际固定sections一致，并验证CompactionPlan携带的TokenEstimator rate/algorithm version等于PromptSet的TurnModelSnapshot。
 
 最终输出：
 
@@ -612,13 +612,13 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 - PromptSet 内绑定的 ToolPromptView 必须是parent ToolSet私有投影；该 cross-binding 在 TurnExecutionContext capture/final validation 时通过对象所有权完成；
 - 不存在 orphan ToolResult；
 - 不存在非法截断的 unresolved ToolCall；
-- initiating UserMessage 未遗漏或放到 ToolCall/ToolResult 中间；
-- committed MessageRecord中的SkillContributionRef和source authorization provenance与规范化时保存的provenance一致；
+- conversation中的UserMessage没有被放到ToolCall/ToolResult exchange中间；Compaction产生的historical summary可以覆盖旧initiating/Steer原文；
+- live committed MessageRecord中的SkillContributionRef和source authorization provenance与规范化时保存的provenance一致；cold replay只保留stored provenance，不重新读取或重新授权旧source；
 - required contribution 在输入规范化阶段缺失时失败；
 - 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
 - CompactionSummary directive budget与assembly proof exact structural values match，AgentRun不携带Compaction budget proof；
-- 最终大小和 token estimate 不超过有效模型限制。
+- 最终大小和token estimate不超过有效模型限制；所有estimate使用PromptSet持有的`TurnModelSnapshot::token_estimator()`，不得自定义bytes/token常量。
 
 PromptSet 不自行执行 compaction。超限时返回结构化 PromptError，由 Session execution 决定后续行为。
 
@@ -724,7 +724,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Prompt baseline使用固定信任层顺序；层内使用stable typed keys全序，不存在caller-controlled priority；
 - 同一固定层内重复PromptKey fail closed；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
-- assembly只接受来自CommittedConversationState的trusted full/prefix view和closed typed call policy，不接受任意Tool view或current-call contribution；
+- assembly只接受来自CommittedConversationState的sanitized full/prefix view和closed typed call policy，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和输出；
 - Prompt reload先构建candidate PromptResourceView，四个shared candidates全部成功后在Runtime publication gate内替换current root；不原地修改active PromptSet。

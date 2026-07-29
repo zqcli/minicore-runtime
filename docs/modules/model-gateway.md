@@ -414,6 +414,7 @@ nonsecret auth binding reference identity
 API model name
 capabilities
 advertised limits
+effective token estimate rate and algorithm version
 generation defaults
 cache/role/tool/output mapping policy
 adapter encoding version
@@ -429,6 +430,7 @@ pub struct TurnModelSnapshot {
     definition: ModelDefinitionRef,
     capabilities: ModelCapabilities,
     limits: EffectiveModelLimits,
+    token_estimate_rate: TokenEstimateRate,
     generation: EffectiveGenerationPolicy,
     execution_ref: ModelExecutionRef,
 }
@@ -444,7 +446,7 @@ TurnModelSnapshot语义：
 - provider catalog reload只影响future Turn；
 - definition已从catalog current head移除时，Gateway仍可使用Snapshot持有的retained exact definition；
 - process restart不恢复unfinished Turn，因此不承诺跨进程继续旧Snapshot；
-- TurnContext entry保存safe `TurnModelRef`，不保存execution_ref。
+- Input UserMessage内联的`StoredTurnStart`只保存safe provider/model descriptor和generation settings，不保存`ModelDefinitionVersion`或execution_ref。
 
 ### ResolveTurnModelRequest
 
@@ -576,6 +578,41 @@ pub struct EffectiveModelLimits {
 ```
 
 unknown必须保持`None`。不能根据model name猜测limit，也不能把本地estimate写成provider-advertised fact。
+
+### Token Estimate Rate
+
+本地token估算率归validated model definition所有，并随`ModelDefinitionVersion`变化：
+
+```rust
+pub struct TokenEstimateRate {
+    pub bytes_per_token: NonZeroU32,
+    pub algorithm_version: u16,
+}
+
+pub struct TokenEstimator {
+    rate: TokenEstimateRate,
+}
+
+impl TurnModelSnapshot {
+    pub(crate) fn token_estimator(&self) -> TokenEstimator;
+}
+```
+
+首版算法对canonical UTF-8/JSON bytes使用保守启发式：
+
+```text
+tokens = ceil(byte_count / bytes_per_token)
+```
+
+model definition未声明rate时，validated definition使用Runtime保守默认`bytes_per_token = 3`并产生safe diagnostic；这个effective default及algorithm version同样进入definition content identity。非文本binary content或无法canonicalize的provider extension返回typed unknown，不为soft trigger伪造数字。
+
+纪律：
+
+- PromptSet final validation、Compaction pressure/unit/source estimate和`CompactionSummaryAssemblyBasis.fixed_prompt_tokens`只能使用同一Turn-pinned estimator；
+- 各调用点不得按model name猜测或实现自己的bytes/token常量；
+- catalog reload或rate调整只影响future Turn，active Turn继续使用旧Snapshot；
+- estimator是确定性纯值，不读取provider、filesystem或mutable catalog；
+- estimate属于ContextUsage/planning，不进入`ModelUsage`、StoredAssistantMessage或provider-reported usage。
 
 ## AssembledModelContext Contract
 
@@ -903,6 +940,8 @@ pub enum FinalizedAssistantContent {
 ```
 
 `content[]`保持provider finalized semantic order。`ModelProgressEvent::ContentDelta.content_index`是该terminal `content[]`的zero-based位置，不是ToolCall内部`index`；adapter必须保证stream与terminal normalization使用同一位置语义，无法关联时返回`InvalidProviderResponse`。SessionExecutor随后分配或关联ItemId并构造assistant entry。
+
+`ToolCallId`由ProviderAdapter归一化：provider提供native call ID时原样保留；协议没有call ID时生成只需在当前assistant response内唯一的opaque ID。native ID在同一response内重复、stream/final映射不一致或无法按provider协议回填ToolResult时返回`InvalidProviderResponse`。ToolCallId不要求Session-wide唯一，durable层使用`TurnId + ItemId + ToolCallId`关联。
 
 ### Response Validation
 
@@ -1528,12 +1567,12 @@ append失败时：
 
 ## Persistence Contract
 
-Conversation storage中的`TurnModelRef`固定为`ModelSelection + ModelDefinitionVersion`以及必要safe retained definition reference，因此catalog重新发布后仍能解释historical model identity和reasoning replay compatibility。
+Conversation storage保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于历史显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；unfinished Turn也不跨restart恢复旧TurnModelSnapshot。
 
 成功assistant entry保存：
 
 ```text
-TurnModelRef
+StoredModelDescriptor
 allowlisted response_id
 ordered finalized content[]
 normalized ModelUsage
@@ -1557,7 +1596,7 @@ connection/continuation state
 full AssembledModelContext
 ```
 
-首版automatic SummaryModel compaction把model/response/usage/finish/logical-retry、requested max output、summary text、exact source checkpoint、typed scope/boundaries/provenance和provider metadata保存到`StoredCompaction.model_call`，因此该字段必须为Some。`None`只为未来明确设计的standalone/deterministic maintenance保留，不是automatic overflow fallback。
+首版automatic SummaryModel compaction把provider/model、usage、finish、logical retry、requested max output和allowlisted provider metadata保存到`StoredCompaction.model_call`，并由StoredCompaction本体保存summary与single `first_kept_entry_id` marker，因此automatic路径该字段必须为Some。`None`只为未来明确设计的deterministic maintenance/import保留，不是automatic overflow fallback。
 
 `retry_count`只表示Session logical retry。Gateway没有transparent retry count。
 
@@ -1635,6 +1674,10 @@ opaque encrypted reasoning
 - capability/limit validation；
 - reasoning preference映射；
 - unknown limits保持None；
+- effective TokenEstimateRate进入ModelDefinitionVersion，rate/catalog更新只影响future Turn；
+- definition未声明rate时使用保守默认并产生diagnostic；
+- 同一个TurnModelSnapshot的estimator在PromptSet/Compaction调用点结果一致；
+- non-text unknown estimate不触发soft compaction；
 - project config不能注册provider/auth；
 - active Turn不执行cross-model fallback。
 

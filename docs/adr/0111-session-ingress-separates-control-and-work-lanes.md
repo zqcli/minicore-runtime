@@ -1,7 +1,9 @@
 # ADR 0111: SessionIngress 分离控制与工作 lane
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-25
+
+> 2026-07-29修订：lane、sticky EmergencyControl、Cancel即时响应和single owner保持有效。ADR 0124删除durable `ToolExecutionStarted`与`tool_round_completed`安全点；Tool start改为SessionExecutor owner-local `ToolStartPermit/ToolOperationSlot`，完整Tool exchange由matching results自动形成。
 
 ## 背景
 

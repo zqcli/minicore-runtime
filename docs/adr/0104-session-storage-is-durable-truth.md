@@ -1,7 +1,9 @@
 # ADR 0104: SessionStorage 是 durable truth
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-24
+
+> 2026-07-29修订：ADR 0124保留SessionStorage作为已写入conversation/message/lifecycle history的单一durable owner和唯一write seam；删除完整execution-ledger、shared strict append/replay validator、ToolExecutionStarted/ToolRoundCompleted证明链和Fork identity remap。cold replay改为局部skip/isolate并返回diagnostics。
 
 ## 背景
 

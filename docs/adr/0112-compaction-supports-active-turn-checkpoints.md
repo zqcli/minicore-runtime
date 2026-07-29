@@ -1,7 +1,9 @@
 # ADR 0112: Compaction支持active-Turn checkpoint与模型感知预算
 
-状态：Accepted
+状态：Superseded by ADR 0124
 日期：2026-07-25
+
+> ADR 0124删除active instruction segment、protected entries、previous checkpoint、scope/boundary和coverage provenance。当前StoredCompaction只保存rolling summary、single `first_kept_entry_id` marker和optional model-call provenance；model-aware summary budget与SessionExecutor编排继续保留。
 
 ## 背景
 
