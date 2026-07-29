@@ -1,7 +1,7 @@
 # MiniCore V2 设计评审
 
 状态：设计评审记录（未关闭项持续跟进）
-日期：2026-07-25
+日期：2026-07-29
 范围：`docs/architecture.md` + `docs/modules/` + `docs/adr/`（0100–0120）
 方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
 
@@ -105,7 +105,7 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 **E1 · Compaction 对长 agentic Turn 是主路径失败，不是边缘（已关闭）**
 initiating UserMessage 之后全部 committed model-visible history 被 hard-protect，且 retained 必须是连续 suffix → active Turn 内所有 ToolRound 都不可摘要。大量 / 大体积 tool round（编码 agent 常态）使 protected suffix 单调增长 → `ProtectedSuffixTooLarge` → hard overflow → `TurnFailed`，且「同一 Turn 最多一次 overflow recovery」使其不可挽救；轮间 soft compaction 只能回收 pre-turn 历史，headroom 有限。
 - 影响：这是目标用例（长 agentic Turn）的主路径，而非文档定位的「单个超大 Turn 边缘情形」，决定 v1 是否必须支持 turn 内 tool-round 级压缩/分段。
-- 决议：保留initiating与Steer UserMessage原文，新增`ActiveTurnCompletedPrefix` scope；每个exact UserMessage开启一个instruction segment，在完整ToolRound安全边界把该segment早期已完成work滚动为至多一个`ActiveTurnCheckpoint`。Pending/Started/incomplete ToolRound、explicit protected entries和recent exact tail不进入coverage。每个segment使用单调coverage frontier；滚动时用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance，不能把checkpoint boundary误当成原始frontier。successful compaction推进后可在单Turn有界次数内再次compact；同一source/frontier hard recovery不重复。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
+- 历史决议（active-checkpoint形状已被ADR 0124取代）：保留initiating与Steer UserMessage原文，新增`ActiveTurnCompletedPrefix` scope；每个exact UserMessage开启一个instruction segment，在完整ToolRound安全边界把该segment早期已完成work滚动为至多一个`ActiveTurnCheckpoint`。Pending/Started/incomplete ToolRound、explicit protected entries和recent exact tail不进入coverage。每个segment使用单调coverage frontier；滚动时用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance，不能把checkpoint boundary误当成原始frontier。successful compaction推进后可在单Turn有界次数内再次compact；同一source/frontier hard recovery不重复。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
 - 出处：`compaction.md`、ADR 0112（取代ADR 0107）。
 
 **E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile（已关闭）**
@@ -117,7 +117,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 **E3 · `UserQuestion` Interaction 没有发起 seam（已关闭）**
 `InteractionRequest` 冻结为 `ToolApproval | UserQuestion`，公开协议也含 UserAnswer resolution，但 Tool↔SessionExecutor 唯一 crate-internal seam `ToolExecutionControl` 只有 `request_approval`/`record_execution_start`，`Tool::execute` 只有 `ToolUpdateSink` + 窄 context，无法发起 durable Interaction，也无内建 ask-user Tool。
 - 影响：领域与公开协议承诺 UserQuestion，但执行层无生产者，任何 ask-user 能力无法落地。
-- 决议：在`ToolExecutionControl`增加`request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不预留mutation ticket；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、无限等待、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)与[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
+- 决议：在`ToolExecutionControl`增加`request_user_question(item_id, request)` crate-internal producer seam；首版由独占的pre-execution ask-user route调用，在ToolStartPermit、file mutation ticket reservation和外部副作用之前创建durable UserQuestion Interaction。等待阶段使用`WaitingForUserInput`，不预留mutation ticket；答案恢复原Tool future并形成`PreExecution` truthful ToolResult。Presentation Adapter负责展示和提交`InteractionCommand::Resolve`，MiniCore负责协议、durability、校验、无限等待、Cancel、Unload、幂等和recovery。权威决策见[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)与[ADR 0116](../adr/0116-file-mutations-use-session-local-queues.md)。
 - 出处：`turn-item-interaction.md` ↔ `tools.md` ↔ `session-execution.md`。
 
 ### F. 实现顺序
@@ -137,7 +137,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - ~~`ProviderCapabilities`（`tools.md`）vs `ModelCapabilities`命名不一致~~：**已关闭**。删除未定义的`ProviderCapabilities`；`ToolTurnContext.tool_calling`直接接收selected model现有的`ToolCallingCapabilities`，不传完整`ModelCapabilities`，也不增加新projection类型。
 - ~~`CurrentTurnExecution.model_attempt: ModelAttemptState`与“不建立ModelAttempt entity”矛盾~~：**已关闭**。删除该字段；`current_operation: Option<RunningOperation>`是当前逻辑模型工作的唯一execution-local状态。ADR 0119进一步收窄为每个Gateway operation最多一个provider attempt，不增加并列retry state。
-- ~~`AgentLoop::accept_committed_tool_round(round: CommittedToolRound)`引用未定义类型~~：**已关闭**。不新增ToolRound表示；方法直接接收`tool_round_completed`成功append/apply后由SessionStorage生成的trusted `CommittedConversationDelta`。
+- ~~`AgentLoop::accept_committed_tool_round(round: CommittedToolRound)`引用未定义类型~~：**已关闭并由ADR 0124进一步收窄**。当前方法为`accept_committed_tool_results(CommittedToolExchangeDelta)`；该type只在全部matching ToolResult存在时由SessionStorage生成。
 - ~~`TurnExecutionPhase::Committing`无驱动路径~~：**已关闭**。删除该variant；append/apply保持在当前业务phase内，terminal写入使用`SessionExecutionState::Finishing`，写入延迟通过ProgressEvent/diagnostics观察。
 - ~~`PromptMergeMode::Append`引用未定义priority~~：已随B1关闭，当前使用固定层级和stable identity顺序，不增加priority字段。
 
@@ -151,7 +151,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~message/reasoning Item只有`item_completed`，流式临时view和ItemId语义不清~~：**已关闭**。SessionExecutor只为AgentRun维护process-local `StreamingItem`；message/reasoning在首个streamed content update分配稳定ItemId，started与delta走ProgressEvent，provider final生成`FinalItemCandidate`，append/apply后才发布同ItemId的`item_completed` StateEvent。Host漏掉started时可由首个delta构造临时view；logical retry清理上一operation的临时view，Turn terminal或新Snapshot提供最终校正。
 - ~~Turn/Item公开排序键未定义~~：**已关闭**。不增加DisplaySequence。Turn/Item顺序由selected history path、assistant content/call顺序、Snapshot/Query ordered Vec和new-Item StateEvent顺序表达；并发Tool逆序完成只按ItemId更新原位置。Snapshot是live observer baseline，restart从JSONL replay/conservative recovery开始；MVP只为长期Session/Turn历史和大型catalog分页。
 - Runtime scope 与 Session scope 无跨流顺序保证 → 给 host 一句 reducer 指引（两 scope 皆可作为 Session 首次出现来源）。
-- 公开 history 读模型 vs 模型可见 conversation 是同一 storage 两投影（durable 但未 `tool_round_completed` 的 tool entry 对 UI 可见、对模型不可见）→ 点明为有意投影差异，避免误判一致性 bug。
+- 公开history读模型与模型可见conversation是同一storage的两种投影：orphan/incomplete Tool facts可供UI检查，只有complete matching exchange进入模型。
 - Agent→Session 是 reference-grouping 而非 containment（删 Agent 不级联、history 仍可读）→ ADR 0100 一句话点明。
 - ~~`QueryResponse.stamp`与`SessionSnapshot`定位重叠~~：**已关闭**。删除cursor-based ReadStamp；Query只返回typed data与可选领域revision，Snapshot或snapshot-first subscription负责完整恢复读模型。
 
@@ -159,7 +159,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 - ~~无持久checkpoint/index导致cold open为O(n)完整replay。~~ **已关闭，接受MVP取舍**：冷启动顺序读取全部complete `StoredSessionEntry`直到physical current entry（最后成功append的`EntryId`）并重建durable projections；不恢复provider stream、AgentLoop、Tool task、waiter或queue，unfinished Turn按conservative recovery追加terminal事实后进入Idle。已loaded Session之间切换只路由现有`SessionExecutionHandle`，不触发storage replay。Compaction只降低model-visible conversation，不降低ledger replay成本；MVP不实现ProjectionSnapshot、byte-offset/checkpoint index、segmentation或vacuum，没有真实性能数据前不增加加速层。
 - 「同时只有一个 Running Turn」不在 corruption/replay 校验清单，只靠 executor 纪律 → 提升为 writer 追加校验 + replay fold 不变量（fail closed）。
-- 无 explicit repair 工具：中段坏行（delayed-alloc 掉电常见）即 brick 整个 Session 历史，只有 partial-tail 能自动截断 → 补受控 last-valid-prefix 修复 utility（需 exclusive lease）。
+- ~~无explicit repair工具导致中段坏行brick整个Session。~~ **已由ADR 0124关闭**：live append保持strict；cold replay跳过malformed/unknown/duplicate记录、把missing parent隔离为orphan root，并返回line/offset diagnostics。MVP明确不建设repair utility。
 - host restart 跨会话非幂等 Tool 重复副作用（Started-but-no-result → Abandoned → 下一 Turn 模型重新请求并再次执行）→ 点明代价，引入 tool 级副作用幂等 key 缓解。
 - fork = deep copy 无内容共享（已显式否决 DAG），大会话近 tip 反复 fork 成倍复制 → 记为已知取舍；fork 只复制 path 不复制 sibling branch 应显式声明以免被当缺陷。
 
@@ -173,7 +173,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~Agent status synchronization与当时的独立Workspace commit permit嵌套包裹initiating append，可能需要全局锁序~~：**已由ADR 0117关闭，ADR 0121进一步删除Workspace permit**。当前single-owner、non-blocking TurnControl reservation和release-before-fan-out使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
 - ~~`assemble_model_context`为同步fn，大context组装/tokenize可能阻塞该Executor控制面~~：**已随O7关闭**。量化复核确认当前是低成本纯内存线性assembly；保持同步实现，不增加offload、counter或observer。
-- Cancel/SecurityRevoked路径产生的Completed（有truthful tool message但无`tool_round_completed`）永久conversation-hidden，后续FollowUp/Steer模型不可见 → 属预期语义，文档显式点明以免实现者误加补偿逻辑。
+- Cancel/SecurityRevoked路径已存在的truthful Tool messages继续保留；如果全部matching results自然形成complete exchange则可见，incomplete exchange保持隐藏并告警。
 
 ### ModelGateway / Workspace 弹性与取舍
 
@@ -219,7 +219,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 针对B组已作决定并落盘，长期决策见[ADR 0109](../adr/0109-review-b-determinism-and-serialized-operations.md)：
 
 - **B1（Prompt顺序）**：**已关闭**。不增加priority或replacement version；当前固定Runtime required System → Runtime base System → Agent System → Session User → Workspace User → Tool → Skill层级。PromptDefinition层按PromptKey、PromptId和stable provenance source key排序；Workspace/Tool/Skill分别按relative path、ToolName、SkillId排序；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
-- **B2（append/replay/projector一致性）**：**已关闭**。writer append与cold replay共用pure `validate_and_project`；append semantic validation等价于或强于replay validation；writer成功commit的entry必须可project。`apply_committed`只安装预计算trusted delta，增加live-apply/cold-replay等价性测试要求。
+- **B2（append/replay/projector一致性）**：**原由ADR 0109关闭，现由ADR 0124取代其强合同**。live writer仍在physical write前strict validate并生成trusted delta；cold replay采用独立tolerant fold，跳过/隔离局部损坏。无corruption fixture仍应验证hot apply与replay得到相同model conversation。
 - **B3（logical retry operation identity）**：**已关闭**。每Session最多一个current RunningOperation；旧operation terminal/remove或安全drop并关闭结果路径前，不启动retry或下一operation。execution_version继续表示conversation/control basis，不增加operation_instance_id。Steer/FollowUp保持普通FIFO消费语义（物理ingress lane后由ADR 0111修订）；Steer在完整assistant/tool step后每轮pop一条，无ToolCall candidate final在queue非空时保存为Assistant Continue。
 
 针对C组已作决定并落盘，长期决策见[ADR 0110](../adr/0110-prompt-and-skill-use-shared-reloadable-views.md)：
@@ -231,11 +231,11 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 针对D组已作决定并落盘，长期决策见[ADR 0111](../adr/0111-session-ingress-separates-control-and-work-lanes.md)：
 
-- **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量，Tool副作用以`ToolExecutionStarted` append为race线性化点；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline并最终fail closed；Snapshot从immutable published view读取。lane只拆ingress，不增加第二个Session状态或durable owner。
+- **D1（控制面与工作面共享bounded FIFO）**：**已关闭**。每个Session使用独立semantic ingress lanes；EmergencyControl不等待普通lane容量。ADR 0124后Tool副作用以SessionExecutor owner-local ToolStartPermit/ToolOperationSlot线性化；Cancel清理目标Turn的queued Steer但默认保留FollowUp；PrepareForUnload使用有限grace deadline，Snapshot读取immutable published view。
 
 针对E组已作决定并落盘：
 
-- **E1/E2**：**已关闭**，分别由[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)记录active-Turn checkpoint与模型感知summary budget。
+- **E1/E2**：**已关闭**。ADR 0112曾采用active-Turn checkpoint；ADR 0124取代该形状，允许旧Input/Steer进入rolling summary并使用single marker。模型感知summary budget继续保留。
 - **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、无限等待、Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。
 
 针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)：
@@ -248,7 +248,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 StateEvent可靠性后续决议：不增加durability enum或第二event通道。所有StateEvent都是当前subscription内按序交付的非durable observer record；payload来源决定restart后的重建方式，Host始终以新Snapshot重置read model。
 
-Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套存储。SessionExecutor只为AgentRun维护`StreamingItem`累积buffer和未提交`FinalItemCandidate`；正式Item只由append/apply后的projection产生。AgentMessage/Reasoning的started/delta属于ProgressEvent。ToolInvocation Started仍由assistant/intermediate tool_call entry append/apply后的projection派生committed-derived StateEvent；后续`ToolExecutionStarted`只表示真实副作用边界。
+Item streaming后续决议：不建立StartedItem/DeltaItem/CompletedItem三套存储。SessionExecutor只为AgentRun维护`StreamingItem`累积buffer和未提交`FinalItemCandidate`；正式Item只由append/apply后的projection产生。AgentMessage/Reasoning的started/delta属于ProgressEvent。ToolInvocation Started由assistant/intermediate ToolCall entry派生；ADR 0124后真实副作用边界由owner-local ToolStartPermit/ToolOperationSlot表达，不写durable event。
 
 Interaction等待后续决议：MVP不把用户沉默解释为领域事件，删除通用`expires_at`、`Expired`和Interaction timeout调度。Pending只由typed host resolution或显式生命周期动作关闭；disconnect和无subscriber保持Pending，Unload grace deadline仍独立生效。
 
@@ -266,7 +266,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | --- | --- | --- | --- |
 | O1 | Sandbox capability无法强制时缺少预执行拒绝 | 延后：不阻塞阶段6–8；production Tool/Sandbox adapter前关闭 | 条件性P0 |
 | O2 | 长Session无持久projection snapshot/checkpoint index | 已关闭：MVP接受cold load完整线性replay | — |
-| O3 | 中段corruption无显式repair utility | 仍开放 | P2 |
+| O3 | 中段corruption无显式repair utility | 已关闭：ADR 0124采用tolerant replay，MVP不建设repair utility | — |
 | O4 | 单次Tool多资源锁无稳定总序 | 已关闭：ADR 0116删除多资源锁并采用Session-local file mutation queue | — |
 | O5 | 跨切面同步原语无全局获取总序 | 已关闭：ADR 0117采用single owner、短guard与typed permit，不建设全局lock rank | — |
 | O6 | Cancel等待已开始Tool收口时缺少可观察中间态 | 已关闭：ADR 0118即时CancelAccepted、复用Finishing并允许FollowUp排队 | — |
@@ -280,7 +280,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O14 | CompactionSummaryDirective正文的fingerprint coverage不明确 | 已关闭：ADR 0123不新增Directive fingerprint，使用private constructor、format version和同一Arc request | — |
 | O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 已关闭：ADR 0123不定义PromptFingerprint，Prompt正文由explicit reload发布的immutable content承载 | — |
 | O16 | ToolPromptView是否支持guidelines未定 | 已关闭：MVP只含ToolSpec，User metadata由Direct spec name/description确定性投影 | — |
-| O17 | committed-only约束仍被描述成运行时扫描 | 文档语义待收口 | P3 |
+| O17 | committed-only约束仍被描述成运行时扫描 | 已关闭：Prompt只接收sanitized CommittedConversationView，未提交draft和incomplete exchange无法构造输入 | — |
 | O18 | Model配额只保证no-starvation，未提供交互延迟隔离 | 条件性开放 | P3 |
 
 ### 安全与授权
@@ -290,7 +290,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 延期边界：当前阶段只实现ScriptedProviderAdapter、ModelGateway、Compaction和非production Tool seam，不交付可产生真实OS/网络/进程副作用的Sandbox adapter，因此O1不进入当前工作队列。开始首个production Tool/Sandbox adapter时必须先冻结capability声明和预执行拒绝，不得以“已延后”为由裸跑。
 - 发生场景：Windows或container sandbox只能限制filesystem，无法强制network/process；Tool最终`PermissionSet`声明禁止联网，approval通过后adapter仍可直接联网。
 - 风险：文档声明受限执行，实际形成授权后裸跑；approval不能弥补enforcement缺失。
-- 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、`ToolExecutionStarted`前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入ToolSet构造与execution routing validation。权威回写到`tools.md`并关闭第二轮R7。
+- 推荐修复：`ToolSandbox`增加`enforceable() -> SandboxEnforcementCapabilities`；approval后、发放ToolStartPermit前计算`PermissionSet - enforceable`，差集非空时生成`PreExecution` Denied ToolResult并拒绝副作用；capability声明进入ToolSet构造与execution routing validation。权威回写到`tools.md`并关闭第二轮R7。
 
 #### O10 · Restrictive Workspace update未持久化诊断（已关闭）
 
@@ -302,8 +302,8 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 原发生场景：Tool在authorization有效时打开文件handle，随后restrictive update要求撤权，旧handle仍可继续写入。
 - 复核结论：pi、Codex和Claude Code等同类产品在Session/Tool/Sandbox启动前冻结cwd与权限，Cancel通过abort/kill收口；均不承诺配置变化会让已打开fd自动失效。跨平台OS也无法可靠回滚已经进入kernel的write，通用RevocableHandle/handle registry只能缩小部分窗口，不能提供原承诺。
-- 关闭决议：Workspace definition不在active Turn热更新。Authority/host hard restriction发布sticky SecurityRevoked，停止新的MiniCore-sanctioned operation；越过`ToolExecutionStarted`的Tool保存exact outcome或`ToolAbandoned`，随后`TurnInterrupted(SecurityRevoked)`。不承诺动态关闭open fd、回滚kernel/provider side effect或建立Runtime-global handle registry。
-- 边界：O1仍独立开放但按上述条件延后。开始production Sandbox adapter时，无法强制某capability class必须在`ToolExecutionStarted`前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
+- 关闭决议：Workspace definition不在active Turn热更新。Authority/host hard restriction发布sticky SecurityRevoked，停止新的MiniCore-sanctioned operation；已取得ToolStartPermit并进入Running/Settling的Tool保存exact outcome或`ToolAbandoned`，随后`TurnInterrupted(SecurityRevoked)`。不承诺动态关闭open fd、回滚kernel/provider side effect或建立Runtime-global handle registry。
+- 边界：O1仍独立开放但按上述条件延后。开始production Sandbox adapter时，无法强制某capability class必须在ToolStartPermit前PreExecution fail closed；handle-relative open仍可用于TOCTOU防护，但不是动态revocation协议。
 
 #### O12 · Workspace fingerprint恢复策略（已关闭，ADR 0123进一步取代）
 
@@ -318,14 +318,15 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 发生场景：长期Session积累数万entries并多次compaction/fork；每次load、recovery或history replay仍从文件头执行cross-entry validation。
 - 复核结论：pi、Codex和Gemini CLI的cold resume同样顺序读取完整session/rollout记录，再用latest effective compaction或replacement history构造模型上下文；Compaction不是完整execution checkpoint。MiniCore的多loaded Session切换不执行cold open，因此该成本只发生在显式load、restart recovery或hot projection丢弃后的replay。
-- 关闭决议：MVP有意接受O(n)完整replay。cold load读取全部complete entries到physical current entry（最后成功append的`EntryId`），通过同一个`validate_and_project`重建Turn/Item/Interaction/Conversation/Usage/tree projections，不恢复任何process-local execution object；unfinished Turn保守写入Interaction closure、ToolAbandoned和TurnInterrupted后进入Idle。MVP不增加ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum。
+- 关闭决议：MVP有意接受O(n)完整扫描。ADR 0124后cold load顺序扫描全部newline-terminated entries，跳过malformed/duplicate记录、隔离orphan/invalid relation并重建sanitized projections，不恢复任何process-local execution object；unfinished Turnbest-effort closure后进入Idle或Unavailable。MVP不增加ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum。
 - 重开条件：真实Session规模或load/recovery遥测证明线性replay造成不可接受的用户可见延迟或资源占用时，以独立设计重新评估；不能仅因Compaction存在就把它提升为完整Session checkpoint。
 
-#### O3 · Explicit repair utility
+#### O3 · Explicit repair utility（已关闭）
 
-- 发生场景：掉电或磁盘故障产生中段newline-terminated坏行，后续entries仍存在；自动恢复只能截断最后一个未换行partial tail。
-- 风险：单行损坏导致整个Session不可打开，只能人工编辑JSONL。
-- 推荐修复：提供exclusive-lease下运行的显式管理员repair utility：先备份原文件，扫描last-valid-prefix，报告损坏entry与将丢失范围，经确认后截断/导出修复副本并执行完整replay。保持fail-closed，禁止普通load隐式修复。
+- 发生场景：中段newline-terminated坏行、duplicate EntryId、missing parent或非法cross-entry reference，后续entries仍存在。
+- 同类产品复核：pi/Gemini跳过坏行，Codex记录parse warning后继续，OpenHands使用event隔离；官方语义repair命令并非常见基线。
+- 关闭决议：[ADR 0124](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)采用“live append strict、cold replay tolerant”。malformed/unknown/duplicate记录skip，missing parent形成orphan root，invalid relation只影响对应projection；model input sanitizer排除incomplete Tool exchange。每次load返回line/byte offset diagnostics。
+- MVP范围：只在exclusive writable open时截断final unterminated partial tail；不建设repair command、不自动reparent、不合成ToolResult、不重写中段内容。真实用户数据出现明确repair需求后再独立设计maintenance module。
 
 ### 并发与控制面
 
@@ -405,11 +406,10 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 风险：Tool/Prompt owner模糊，guideline是否进入provider payload不一致。
 - 关闭决议：MVP不增加独立`guidelines`字段。`ToolPromptView`只包含Direct ToolSpec；provider tools字段使用完整spec，PromptProfile中的Tool User metadata只从spec name/description按ToolName确定性投影。出现无法由schema/description表达的真实需求后，再新增typed `guidelines`并明确排序、role与validation coverage。
 
-#### O17 · Committed-only by-construction措辞
+#### O17 · Committed-only by-construction措辞（已关闭）
 
 - 发生场景：实现者按Prompt最终校验文字增加一次“扫描是否存在未提交model-visible contribution”的运行时检查。
-- 风险：重复实现上游projection规则，并把类型保证误建模为可恢复runtime error。
-- 推荐修复：把`prompt.md`对应条目改为by-construction说明：AgentRun assembly只接受无public constructor的`CommittedConversationView`；未提交draft无法构造该输入，不增加额外扫描。
+- 关闭决议：`prompt.md`现明确AgentRun只接受SessionStorage strict live apply或tolerant replay生成的sanitized `CommittedConversationView`；未提交draft、execution-local ToolResult和orphan/incomplete Tool exchange无法构造该输入。Prompt只检查provider protocol completeness，不扫描任意current-call buffer。
 
 ### 已被后续设计实质关闭
 
@@ -421,10 +421,10 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - Prompt assembly控制面延迟：量化复核确认当前纯内存线性assembly成本较低，保持同步实现并不增加offload、counter或observer，关闭O7；
 - Workspace fingerprint恢复：ADR 0122曾保留durable Session/history但放弃旧Workspace execution state恢复；ADR 0123进一步删除fingerprint族，以exact refs、immutable objects和显式reload关闭O12；
 - Runtime scope与Session scope无跨流顺序：ADR 0114与`runtime-interface.md`已冻结snapshot-first reducer模型和scope内顺序；
-- public history与model-visible conversation差异：`conversation-storage.md`已明确durable Tool message在`tool_round_completed`前不model-visible；
+- public history与model-visible conversation差异：ADR 0124允许history显示orphan/incomplete Tool facts，model conversation只包含全部matching results存在的complete exchange；
 - Agent→Session reference-grouping：`agent-session-lifecycle.md`已明确删除Agent不级联删除Session history；
-- 同时只能有一个Running Turn：writer append与cold replay共享`validate_and_project`并按Turn状态fail closed；
-- Cancel/SecurityRevoked后truthful Tool message保持conversation-hidden：`session-execution.md`已明确不补写`tool_round_completed`；
+- live同时只有一个Running Turn：SessionExecutor和strict writer保证；cold replay遇冲突时first valid start/terminal wins并告警，不brick Session；
+- committed-only by-construction：Prompt只接收sanitized CommittedConversationView，O17关闭；
 - ToolSet/ToolPromptView cross-binding：ADR 0123规定ToolPromptView只能由parent ToolSet私有投影并随PromptSet捕获；
 - ModelGateway不得新增模型可见语义：`model-gateway.md`已禁止增删重排content、注入diagnostic或未提交draft。
 
@@ -433,9 +433,9 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 以下条目保留其代价，但当前不要求修复：
 
 - restart后模型可能再次请求非幂等Tool：baseline选择truthfulness，不承诺跨崩溃exactly-once；高风险Tool未来可单独增加业务幂等键；
-- fork deep-copy selected parent path：已明确否决content-addressed DAG，接受存储放大换取ownership与repair简单性；
+- fork deep-copy selected parent path：已明确否决content-addressed DAG，接受存储放大；ADR 0124复制并保留历史IDs，不再执行nested remap；
 - provider continuation优化可能经常回退full request：full-request equivalence是基线，后续只需golden vector验证；
 - `resolve_for_turn`不做availability probe、active Turn不cross-model fallback：exact pin优先；future Turn备用模型属于新策略ADR；
-- MVP不提供manual/proactive compaction：ADR 0112已明确首版范围；
+- MVP不提供manual/proactive compaction：ADR 0124保留该范围，并将StoredCompaction收窄为rolling summary + single marker；
 - 不建立WorkspaceId：primary-root grouping仅是UI/cosmetic，不参与授权；
 - additional roots不自动成为Prompt/Skill source：文件访问授权与指令/技能注入授权保持分离，可由UI diagnostics解释。

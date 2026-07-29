@@ -171,12 +171,12 @@ pub(crate) struct TurnExecutionContext {
 
 ```text
 UserMessage(source = Input | Steer)
-ToolRoundCompleted 引用的完整 assistant/tool sequence
+全部matching ToolResult存在的complete assistant/tool exchange
 Compaction entry 的 Replace projection
 AssistantMessage(phase = Final)
 ```
 
-未 append 的 draft 不进入下一次模型调用；已 durable 但尚无 `tool_round_completed` 的 assistant/tool entries 同样不 model-visible。
+未append的draft不进入下一次模型调用；assistant ToolCall在全部matching ToolResult存在前不model-visible，cold replay中的incomplete/ambiguous exchange被隔离并产生diagnostic。
 
 SessionStorage 是 durable truth。热内存 conversation projection 只消费 `CommittedSessionEntry` 返回的 trusted delta，不在稳态重新扫描完整存储，也不与存储共同拥有同一事实。
 
@@ -267,7 +267,7 @@ WorkspaceAccessView
 - exact durable refs、immutable Arc和private constructor如何阻止跨capture拼接；
 - cancellation、Steer、FollowUp、diagnostics 和释放时机；
 - AgentLoop 与 Session execution 的职责分界；
-- 崩溃恢复时保留哪些exact definition reference与safe diagnostics；MVP不恢复旧Workspace/Prompt/Tool/Skill execution Context，也不从StoredTurnContext重建旧execution environment。
+- Input UserMessage内联哪些safe StoredTurnStart metadata；MVP不恢复旧Workspace/Prompt/Tool/Skill execution Context，也不把historical refs当成restart execution checkpoint。
 
 capture 依赖图以 [`../modules/turn-execution-context.md`](../modules/turn-execution-context.md#capture-依赖图) 为唯一权威版本，本文不维护副本。要点：exact `SessionDefinitionRevision`展开Agent/Prompt/Model/Workspace，Workspace、Prompt、Skill、Tool和Model对象在admission线性化点捕获为immutable refs，SkillView与ToolSet可并行捕获，PromptSet在三个view就绪后创建，最终private constructor校验同源对象并组成`TurnExecutionContext`。
 
@@ -356,18 +356,19 @@ capture 依赖图以 [`../modules/turn-execution-context.md`](../modules/turn-ex
 - `SessionWriter::append(SessionEntryDraft)` 是唯一 runtime write seam；
 - SessionHeader 只由 create/fork staging 原子写入；
 - Header 后一个物理 line 编码一个 StoredSessionEntry；
-- `StoredEntryBody = TurnContext | Message | Event | Compaction`；
-- standard message roles `user | assistant | tool`，assistant finalized response 按原始 content 顺序保存；
-- operational facts 与 conversation promotion facts 位于同一个 durable log；
-- initiating input、Interaction、ToolExecutionStarted 前置记录、tool messages、`tool_round_completed`、Steer、Compaction 和 terminal entries；
-- ItemId、ToolCallId 和 EntryId 分离；
-- `CommittedConversationState / View / Delta / Checkpoint`；
-- trusted all-projection apply、AdvanceOnly 和 mismatch reload；
-- `EntryId + parent_id` history tree、current entry 和 stable checkpoint；
-- fork staging deep copy + target-local identity remap；
-- append-only compaction overlay；
-- partial tail、strict corruption、explicit repair 和 conservative recovery；
-- MVP不实现projection snapshot或checkpoint index；cold load完整replay全部complete entries到physical current entry（最后成功append的EntryId），重建durable projections并保守关闭unfinished Turn后进入Idle。session index仍只是rebuildable cache。
+- `StoredEntryBody = Message | Event | Compaction`；Input UserMessage内联StoredTurnStart；
+- standard message roles `user | assistant | tool`，assistant finalized response按原始content顺序保存；
+- durable Interaction、tool messages、Steer、Compaction和terminal entries位于同一个history log；
+- Tool side-effect start使用current-Runtime ToolStartPermit，不写durable marker；
+- complete Tool exchange由matching ToolResult集合自动形成，不写ToolRoundCompleted；
+- ItemId、ToolCallId和EntryId分离；
+- `CommittedConversationState / View / Delta / Checkpoint`与`CommittedToolExchangeDelta`；
+- strict live append、trusted hot apply和tolerant replay；
+- `EntryId + parent_id` history tree、current entry和orphan roots；
+- fork staging deep copy并保留历史IDs，只分配new SessionId；
+- append-onlysingle-marker Compaction overlay；
+- partial tail handling、malformed line skip、replay diagnostics和conservative recovery；
+- MVP不实现projection snapshot、checkpoint index或repair utility；cold load完整O(n)扫描并保守关闭unfinished Turn。session index仍只是rebuildable cache。
 
 完成门槛：
 
@@ -375,7 +376,7 @@ capture 依赖图以 [`../modules/turn-execution-context.md`](../modules/turn-ex
 - [x] 任意模型调用只能从 committed transcript 构建 conversation；
 - [x] 热内存 projection 可由 storage replay 和 committed entry delta 重建；
 - [x] 不存在 current/previous input 等长期特殊消息 lane；
-- [x] crash 后不会把半个 ToolRound 提升为模型 transcript；已 append 的 assistant/tool entries 保持 durable，但在 `tool_round_completed` 前不 model-visible；
+- [x] crash后的incomplete Tool exchange不进入模型transcript；complete matching exchange保持model-visible，后续合法history继续恢复；
 - [x] 不引入 dual log、Branch entity、baseline SQLite 或 content-addressed DAG。
 
 ### 阶段 6-8 模型调用协同交付束
@@ -498,7 +499,7 @@ SessionExecutor NeedModel
 已定义：
 
 - context window pressure 和触发条件；
-- transcript cut、protection 和 stable ToolRound 边界；
+- sanitized transcript连续prefix cut、recent exact suffix和single first-kept marker；
 - summary model call purpose 和 `OutputContract::NoToolCalls`；
 - Compaction entry append/apply 与 conversation Replace projection；
 - compaction 后 conversation seed；
@@ -514,7 +515,7 @@ SessionExecutor NeedModel
 - [ ] 通过scripted overflow → summary → append/apply → reassemble集成测试；
 - [ ] 实现Compaction module与storage/projector tests。
 
-目标设计见[Compaction架构设计](../modules/compaction.md)和[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。首版采用portable rolling summary、stable-unit safe cut、leading conversation summary、per-instruction-segment active-Turn checkpoint、model-aware summary budget和有界frontier advancement；不实现manual、hierarchical或provider-native compaction，也不通过强制新Turn代替checkpoint。
+目标设计见[Compaction架构设计](../modules/compaction.md)和[ADR 0124](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)。首版采用portable rolling summary、provider-valid连续prefix cut、single `first_kept_entry_id` marker、model-aware summary budget和有界compact retry；不实现manual、hierarchical、provider-native或per-instruction checkpoint compaction。
 
 ### 阶段 9：Runtime interface 与公开协议
 
@@ -693,7 +694,7 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 
 - value type、排序、exact-ref/structural validation：单元测试；
 - Service interface、cache、reload、conflict：模块测试；
-- TurnExecutionContext、ToolRound 和 conversation projection 更新顺序：集成测试；
+- TurnExecutionContext、Tool exchange和conversation projection更新顺序：集成测试；
 - storage reload、fork、crash recovery：持久化测试；
 - provider mapping：adapter contract test；
 - Runtime command/event/snapshot：端到端 protocol test。
@@ -704,7 +705,7 @@ ADR 只记录具有长期影响的决策，不记录每个字段和实现步骤�
 
 ```text
 append/apply-before-model-visible
-只有 ToolRoundCompleted 引用的完整 round 才可见
+只有全部matching ToolResult存在的complete exchange才可见
 Prompt 是唯一上下文组装 seam
 ToolSpec 与 executor route 同快照
 active Turn 不受 future reload 影响
@@ -728,7 +729,7 @@ Runtime facade 是唯一外部入口
 - [x] Turn/Item/Interaction 的 identity、lifecycle 和 terminal cleanup 已确定；
 - [x] pending Interaction 的 request/resolution、reconnect 和 recovery 行为已确定；
 - [x] Conversation/SessionStorage durable ownership、entry tree、fork 和 recovery 已确定；
-- [x] compaction orchestration、stable cut、active-Turn checkpoint、model-aware summary budget、StoredCompaction 和 bounded recovery 有确定定义；
+- [x] compaction orchestration、provider-valid prefix cut、single-marker StoredCompaction、model-aware summary budget和bounded recovery有确定定义；
 - [x] Runtime command/query/event/snapshot interface 已冻结；
 - [ ] 关键不变量有自动化测试；
 - [x] 新文档已进入正式架构目录 [`docs/modules/`](../modules/)；

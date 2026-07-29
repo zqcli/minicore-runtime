@@ -54,4 +54,4 @@
 
 ## 修订关系
 
-本ADR修订[ADR 0105](0105-session-executor-owns-loaded-session.md)的跨Session Tool resource lock结论、[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)与[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)中的共享resource-lock表述，并关闭`docs/review/v2-design-review.md`的O4。SessionExecutor单owner、Workspace授权、Sandbox、approval、`ToolExecutionStarted`和truthful outcome顺序保持不变。
+本ADR修订[ADR 0105](0105-session-executor-owns-loaded-session.md)的跨Session Tool resource lock结论、[ADR 0111](0111-session-ingress-separates-control-and-work-lanes.md)与[ADR 0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md)中的共享resource-lock表述，并关闭`docs/review/v2-design-review.md`的O4。SessionExecutor单owner、Workspace授权、Sandbox、approval和truthful outcome顺序保持不变；ADR 0124随后以owner-local ToolStartPermit取代durable `ToolExecutionStarted`。

@@ -1,7 +1,9 @@
 # ADR 0109: Prompt、Projection 与 Session Operation 使用确定性规则
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-24
+
+> 2026-07-29修订：ADR 0124取代第3、4条的strict append/replay等价合同和第9条的`tool_round_completed` gate。live append仍strict；cold replay跳过/隔离局部损坏。Tool step由有效matching ToolResult集合自动形成`CommittedToolExchangeDelta`。Prompt排序和single current operation规则保持有效。
 
 ## 背景
 

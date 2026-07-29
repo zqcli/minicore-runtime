@@ -1,73 +1,50 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
-日期：2026-07-25
+状态：当前权威架构（ADR 0124后，生产实现待启动）
+日期：2026-07-29
 
 ## 目的
 
-本文定义 MiniCore 的 Turn、Item 和 Interaction 领域模型，重点解决：
+本文定义MiniCore的Turn、Item和Interaction领域模型：
 
-- 一个用户 Turn 的精确开始和结束边界；
-- Turn durable status 与 transient execution phase 的区别；
-- UserMessage、AgentMessage、Reasoning 和 Tool work 如何表达为 Item；
-- ToolCall 与 ToolResult 是否应是两个 Item；
-- approval 和结构化用户问题如何归属于 Item；
-- Interaction request、resolution、长期等待、reconnect 和 crash recovery；
-- streaming delta、Tool progress、retry 和 diagnostics 是否属于 durable domain truth；
-- Item 与 SessionStorage entry 的关系。
-
-本文不定义以下内容（由对应文档或 Runtime protocol 权威定义）：
-
-- SessionStorage entry 在具体文件 adapter、index 和 Session execution 中的实现细节；
-- SessionExecutor/SessionIngress lane/async operation 的具体实现，以[Session Execution架构设计](session-execution.md)为权威；
-- Runtime command、query、event 和 snapshot payload；
-- provider-specific message、tool-call 和 reasoning encoding；
-- provider-specific reasoning 的最终编码；
-- Question UI schema 的全部展示字段；
-- compaction、review、background work 的最终 Item 投影。
+- Turn开始、结束与Steer/FollowUp边界；
+- UserMessage、AgentMessage、Reasoning和Tool work的Item投影；
+- ToolCall、ToolResult和provider/tool关联；
+- approval与结构化UserQuestion；
+- streaming/progress与durable Item的区别；
+- 宽容replay下incomplete Tool exchange和crash recovery。
 
 ## 同类产品结论
 
-| 项目 | Turn / Item / Interaction 形状 | MiniCore 结论 |
+| 项目 | Identity与形状 | MiniCore采用点 |
 | --- | --- | --- |
-| Codex | 一个用户 Turn 包含异构 TurnItem；command、MCP、file change 等使用操作型 Item，调用、状态和结果属于同一个 Item；item started/completed 是稳定快照，delta 是通知；approval 和 user-input 使用 server request | 借鉴操作型 Item、stable ItemId、request/response 和 transient delta；不复制庞大的 Item variant 集合 |
-| pi | `turn_start/turn_end` 更接近一次模型调用加 Tool execution round；ToolCall 在 AssistantMessage，ToolResult 是独立 Message；approval 是 runtime callback | loop 简洁，但“ToolCall 与结果分离 + ephemeral approval”不满足 MiniCore recovery 和 durable Interaction |
-| Grok Build | conversation与TurnCompleted持久化；大部分pending interaction是内存waiter，PlanApproval另有独立持久化规则 | 特殊interaction单独持久化会产生例外；MiniCore应统一request/resolution durability |
-| Claude Code | Permission 和 AskUserQuestion 围绕 Tool 调用；interrupt/checkpoint 是产品能力；stream-json partial output 是 observer event | Tool-centric Interaction 合理；permission policy 属于 Tool，Interaction 只表达外部回答 |
-| MCP Elicitation | server 发起结构化 elicitation，client 负责展示并返回结果；具体持久化由宿主决定 | 借鉴 server-request/client-presentation 形状；MiniCore 保留自己的 durable Interaction truth |
-| Cursor | 可观察到 Plan、checkpoint 和 background agent，但内部 Turn/Item ownership 未公开 | 只参考产品体验，不推断其内部领域模型 |
+| Codex | Thread→Turn→ThreadItem，每个Item稳定ID，Tool/command状态更新同一Item | TurnId、ItemId、operation-centric Item |
+| pi | entry tree；ToolCall在assistant message，ToolResult按ToolCallId关联 | 简单transcript correlation，不增加ToolRound marker |
+| Gemini CLI | message ID与callId；scheduler更新同一ToolCall状态 | ToolCallId关联和model-input sanitization |
+| OpenHands | EventID/parent、ActionID、tool_call_id、observation action_id | event/item identity与结果关联分离 |
+| Claude Code | entry UUID/parent UUID、tool_use.id/tool_result.tool_use_id | tree identity与provider call identity并存 |
 
-MiniCore 采用：
-
-```text
-领域/public projection：operation-centric Item
-storage implementation：immutable facts + projection fold
-```
+MiniCore保留显式Turn/Item/Interaction公开模型，但持久化关系向同类产品的简单call/result关联收敛。
 
 ## 决策摘要
 
-- Turn 从 initiating UserMessage entry 成功 append 开始；
-- Turn 到 final AssistantMessage、TurnInterrupted 或 TurnFailed entry 成功 append 结束；
-- `Interrupted` 是 terminal，不恢复为 Running；
-- Steer 只作用于同一个 Running Turn，并携带 expected TurnId；
-- FollowUp 在 current Turn terminal 后开启下一 Turn；
-- Turn 逻辑上拥有有序 Item，但 durable Turn head 不内联 `Vec<Item>`；
-- 最小 ItemContent 只有 UserMessage、AgentMessage、Reasoning、ToolInvocation；
-- ToolCall 与 ToolResult 不建立两个 sibling Items；
-- 一个 ToolInvocation Item 贯穿 call、approval、execution、result 和 recovery；
-- ItemType 从 ItemContent discriminant 派生，不独立保存；
-- UserMessage、AgentMessage 和 Reasoning 只在形成稳定值后成为 durable Item；
-- streaming delta、Tool progress、model logical retry和execution phase不是Item；
-- 只保存 provider 实际返回的 finalized/replayable reasoning，不获取 hidden chain-of-thought；
-- Interaction 是 Item-owned durable request/resolution；
-- UserQuestion 使用“MiniCore-owned interaction protocol + UI-owned presentation”：Runtime 决定何时问、问的是哪个 Item，Presentation Adapter决定如何呈现和收集答案；
-- Interaction request append 后才向 host 发布；
-- Interaction resolution append 后才唤醒 waiter或执行 Tool；
-- transport disconnect 不自动关闭 Interaction；
-- host restart baseline 关闭 pending Interaction并中断 Turn，不恢复旧 waiter；
-- outcome-unknown ToolInvocation 进入 Abandoned，不生成 synthetic ToolResult；
-- ToolRound 是 committed conversation unit，不是 entity、Manager 或公开 lifecycle object；
-- ItemId、ToolCallId 和 storage entry identity 是不同 identity。
+- Turn从`source = Input`的UserMessage成功append开始；
+- Input UserMessage内联`StoredTurnStart`，不再引用独立TurnContext entry；
+- Turn以Final AssistantMessage、TurnInterrupted或TurnFailed结束；
+- Steer属于同一Running Turn，FollowUp开启下一Turn；
+- 最小ItemContent为UserMessage、AgentMessage、Reasoning、ToolInvocation；
+- ToolCall与ToolResult属于同一个ToolInvocation Item；
+- ToolInvocation状态为Started、Completed或Abandoned；
+- Tool side-effect start只属于current Runtime执行状态，不是durable Item/event；
+- ToolResult以`TurnId + ItemId + ToolCallId`关联ToolInvocation；
+- 不建立ToolRound entity或ToolRoundCompleted event；
+- live路径中，同一assistant response的全部ToolCall得到exactly one matching ToolResult后，完整exchange自动进入模型conversation；cold replay duplicate result first valid wins；
+- incomplete/orphan/identity-conflicting或abandoned-first exchange在cold replay中隔离并告警；
+- Interaction是Item-owned durable request/resolution；
+- 一个Item可以顺序拥有多个Interaction；
+- request append后notify，resolution append后wake/side-effect；
+- streaming delta、Tool progress、retry和execution phase不是durable Item；
+- restart不恢复old waiter/Tool task，旧Running Turn中断。
 
 ## 领域关系
 
@@ -76,10 +53,8 @@ Session
 └─ Turn*
    ├─ ordered Item*
    │  └─ Interaction*
-   └─ initiating UserMessage → exact TurnContext entry
+   └─ Input UserMessage内联TurnStart metadata
 ```
-
-基数：
 
 ```text
 Session 1 ── 0..* Turn
@@ -87,11 +62,41 @@ Turn    1 ── 1..* Item
 Item    1 ── 0..* Interaction
 ```
 
-Item 与 Interaction 的集合由 SessionStorage projection 提供，不要求在 Turn/Item struct 内嵌完整 children。
+Turn/Item/Interaction集合由SessionStorage projection提供，不要求parent struct内联完整children。
+
+## Identity
+
+```text
+TurnId
+→ 一次用户意图执行、Cancel和Steer target
+
+ItemId
+→ MiniCore稳定语义Item和UI/progress update target
+
+ToolCallId
+→ provider/tool协议call/result correlation
+
+RequestId
+→ Interaction request/resolution correlation
+
+EntryId
+→ SessionStorage tree node
+
+CommandId
+→ 当前Runtime command correlation，不持久化
+```
+
+规则：
+
+- identities不要求相等，不通用合并；
+- 一个assistant entry可以产生多个Item；
+- 一个ToolInvocation Item跨assistant、Interaction、ToolResult和terminal等多条entry；
+- 一个Item可以顺序产生多个RequestId；
+- ToolCallId由ModelGateway adapter按provider contract归一化：保留原生ID，缺失时生成response-local opaque ID；只要求同一assistant response内唯一，durable关联使用`TurnId + ItemId + ToolCallId`；
+- Fork保留历史TurnId、ItemId、RequestId、EntryId和ToolCallId；public route始终携带SessionId；
+- ordered Vec和new-Item StateEvent顺序是展示排序契约，ID/timestamp/completion time不用于排序。
 
 ## Turn
-
-Turn 是一条用户意图的 durable execution boundary：
 
 ```rust
 pub struct Turn {
@@ -103,9 +108,7 @@ pub struct Turn {
 
 pub enum TurnStatus {
     Running,
-    Completed {
-        completed_at: Timestamp,
-    },
+    Completed { completed_at: Timestamp },
     Interrupted {
         completed_at: Timestamp,
         reason: TurnInterruption,
@@ -117,99 +120,41 @@ pub enum TurnStatus {
 }
 ```
 
-Turn 不内联：
+Turn不内联：
 
 ```text
 Vec<Item>
-TurnModel
 PromptSet / ToolSet / SkillView
 WorkspaceSnapshot
-AgentRevisionRef / SessionDefinition
 provider session / AgentLoop
-pending Interaction waiter
+pending waiter
 ```
 
-exact AgentRevisionRef、SessionDefinitionRevision、WorkspaceRevision和TurnModelRef属于initiating UserMessage引用的TurnContext entry，不重复放入Turn head。Prompt selection已经包含在exact Agent/Session definitions中；PromptSet、ToolSet和SkillView没有durable ref，不写入TurnContext。
-
-### TurnInterruption
-
-Interrupted 表示执行被外部控制或安全事件终止：
-
-```rust
-pub enum TurnInterruptionKind {
-    UserCancelled,
-    RuntimeShutdown,
-    HostRestart,
-    SecurityRevoked,
-    RecoveryContextUnavailable,
-}
-
-pub struct TurnInterruption {
-    pub kind: TurnInterruptionKind,
-    pub message: Option<String>,
-}
-```
-
-Interrupted 是 terminal：
-
-- 不恢复为 Running；
-- 不接受 Steer；
-- 后续普通用户输入创建新 Turn；
-- 已 committed conversation prefix 保留；
-- 未 append draft 不进入 conversation。
-
-### TurnFailure
-
-Failed 表示 Turn 已经开始，但遇到不可恢复的执行错误：
-
-```rust
-pub enum TurnFailureKind {
-    Model,
-    Storage,
-    Execution,
-    Invariant,
-}
-
-pub struct TurnFailure {
-    pub kind: TurnFailureKind,
-    pub message: String,
-    pub retryable: bool,
-}
-```
-
-Tool 自身失败、schema error、policy deny 或 approval deny如果已经产生真实 ToolResult，通常只是 ToolInvocation outcome，Turn 可以继续 Running。
-
-Admission 在 initiating UserMessage append 前失败不创建 Failed Turn。
+live TurnExecutionContext持有exact immutable执行对象；durable Input UserMessage只保存安全历史metadata，cold replay不重建旧execution environment。
 
 ## Turn 边界
 
 ```text
 candidate admission
-→ compose initiating UserMessage
-→ append TurnContext entry
-→ append initiating UserMessage Item
-→ TurnStatus = Running
-→ zero or more committed messages/events
+→ capture TurnExecutionContext
+→ compose Input UserMessage + StoredTurnStart
+→ append/apply
+→ Turn Running
+→ zero or more message/event entries
 → append one terminal fact
 ```
 
-terminal entry：
+terminal：
 
 ```text
-Message(role = assistant, phase = final)
-
-或
-
-InteractionResolved*
-ToolAbandoned*
-TurnInterrupted | TurnFailed
+Assistant(Final)
+TurnInterrupted
+TurnFailed
 ```
 
-一个 Turn 只能有一个 terminal fact。
+live writer拒绝一个Turn多个terminal。cold replay采用first valid terminal wins，后续冲突entry从Turn projection忽略并报告diagnostic。
 
 ## UserMessage、Steer 与 FollowUp
-
-UserMessage Item 表达 durable、规范化后的用户可见消息：
 
 ```rust
 pub struct UserMessageItem {
@@ -217,17 +162,13 @@ pub struct UserMessageItem {
 }
 ```
 
-不在 ItemContent 中增加第二份可变status。storage message entry的`source = Input | Steer`是authoritative classification：
-
-- `Input` UserMessage 开启Turn并引用TurnContext entry；
-- `Steer` UserMessage属于expected Running Turn；
-- FollowUp在下一Turn写入新的`Input` UserMessage。
-
-结构化Interaction answer不是UserMessage Item。它先关闭Interaction，随后成为对应ToolResult/tool message，并在`tool_round_completed`后进入conversation。
+- Input开始Turn并内联TurnStart；
+- Steer绑定expected Running Turn，不重新capture Context；
+- FollowUp在旧Turnterminal后重新capture并写新Input；
+- Interaction answer不创建UserMessage；
+- raw input、未commit Steer和FollowUp queue内容不是Item。
 
 ## Item
-
-Item 是 Turn 内稳定、可观察的语义值或长生命周期操作：
 
 ```rust
 pub struct Item {
@@ -244,34 +185,11 @@ pub enum ItemContent {
 }
 ```
 
-不独立存储 `ItemType`：
-
-```rust
-pub enum ItemType {
-    UserMessage,
-    AgentMessage,
-    Reasoning,
-    ToolInvocation,
-}
-```
-
-`Item::item_type()` 从 ItemContent discriminant 派生。
-
-## Item 类型
+`ItemType`和`ItemStatus`从content/state派生，不作为第二份可变事实。
 
 ### UserMessage
 
-UserMessage 只能来自 PromptSet 规范化后的 durable value。
-
-```text
-raw host input
-→ PromptSet.compose_user_message(...)
-→ CanonicalUserMessage
-→ append user message entry
-→ UserMessage Item
-```
-
-raw input、accepted-but-uncommitted Steer 或 PromptContribution draft 不是 Item。
+PromptSet规范化后的Input/Steer在append/apply后成为Completed Item。
 
 ### AgentMessage
 
@@ -281,13 +199,11 @@ pub struct AgentMessageItem {
 }
 ```
 
-storage assistant message使用稳定`phase = Intermediate | Final`：
-
-- `Final` AssistantMessage 是Turn completed terminal fact；
-- `Intermediate` AssistantMessage表示同一Turn仍需继续：包含ToolCall时等待完整ToolRound后model-visible；不含ToolCall时是Steer继续前保存的model-visible Assistant Continue step；
-- streaming phase transition不是durable Item。
-
-provider partial output、stream draft 和 abandoned retry attempt 不是 durable AgentMessage Item。
+- provider partial output不是durable Item；
+- finalized assistant entry可以产生一个AgentMessage Item和多个Reasoning/ToolInvocation Items；
+- 无ToolCall Intermediate是model-visible Continue，不结束Turn；
+- 含ToolCall Intermediate创建pending Tool exchange；
+- Final不含ToolCall并完成Turn。
 
 ### Reasoning
 
@@ -298,19 +214,9 @@ pub struct ReasoningItem {
 }
 ```
 
-Reasoning Item是面向领域/UI的policy-filtered read projection：
-
-- 可选；
-- `summary`只表达允许展示的摘要，不是完整storage wire schema；
-- `content`只包含policy允许展示的finalized reasoning text；未公开、仅加密或被redaction policy隐藏时为None；
-- authoritative assistant entry可以保存provider实际返回的finalized/replayable text、summary、encrypted payload、signature和provider item id；
-- 不获取或伪造provider未返回的hidden chain-of-thought；
-- provider reasoning delta是transient observer event；
-- 是否对模型重新可见由Prompt/conversation policy决定，不能仅因它是Item就自动进入模型上下文。
+只投影provider实际返回且policy允许展示的finalized reasoning artifact。hidden chain-of-thought、stream delta和abandoned retry draft不持久化。
 
 ### ToolInvocation
-
-ToolInvocation 是 ToolCall、approval、execution 和结果的统一领域对象：
 
 ```rust
 pub struct ToolInvocationItem {
@@ -320,57 +226,22 @@ pub struct ToolInvocationItem {
 
 pub enum ToolInvocationState {
     Started,
-    Completed {
-        result: ToolResult,
-    },
-    Abandoned {
-        reason: ToolAbandonReason,
-    },
+    Completed { result: ToolResult },
+    Abandoned { reason: ToolAbandonReason },
 }
 ```
 
-```rust
-pub enum ToolAbandonReason {
-    TurnTerminated,
-    HostRestart,
-    OutcomeUnknown,
-    RecoveryContextUnavailable,
-}
-```
+状态语义：
 
-语义：
-
-| 状态 | terminal | 有 ToolResult | 可进入 complete ToolRound conversation |
+| 状态 | terminal | ToolResult | 可进入模型conversation |
 | --- | --- | --- | --- |
-| Started | 否 | 否 | 否 |
-| Completed | 是 | 是 | 只有 `tool_round_completed` 引用完整 round 后进入 |
-| Abandoned | 是 | 否 | 否 |
+| Started | 否 | 无 | 否 |
+| Completed | 是 | 有 | 同一assistant exchange全部calls完成后 |
+| Abandoned | 是 | 无 | 否 |
 
-`Abandoned` 是 truthful operational outcome：MiniCore 知道该操作不能继续，但无法诚实构造 ToolResult。
+assistant ToolCall entry append/apply后Item成为Started。Tool执行、approval和current-Runtime start状态不创建额外Item。
 
-正常执行路径中，ToolResult 先是 execution-local candidate；`role = tool` message成功append后，ToolInvocation进入Completed operational state。Completed不等于已进入模型conversation；只有后续`tool_round_completed`event成功append后，完整assistant/tool sequence才一次性进入conversation。terminal/recovery保留已存在的truthful tool message，但不会隐式补做缺失的ToolRound completion event。
-
-以下情况可以 Completed：
-
-```text
-executor success
-executor/schema/sandbox failure
-policy/approval deny
-confirmed cancellation
-confirmed executor timeout
-```
-
-以下情况必须 Abandoned：
-
-```text
-side effect 已可能开始但 outcome unknown
-host restart 后没有 exact result
-required recovery context 不可重建
-```
-
-## ToolResult Disposition
-
-`Completed` 不等于 Tool 成功。ToolResult 使用 typed disposition：
+## ToolResult
 
 ```rust
 pub struct ToolResult {
@@ -388,13 +259,93 @@ pub enum ToolResultDisposition {
 }
 ```
 
-provider adapter 可以从 disposition 派生 `is_error`，但领域层不使用一个 bool 压平 denied、cancelled 和 failed。
+ToolResult保存为role=tool message并包含TurnId、ItemId和ToolCallId。
 
-`ToolCallId` 是 provider/transcript correlation；`ItemId` 是 MiniCore Tool operation identity。二者不能互相替代。
+Completed可以来自：
+
+```text
+executor success
+executor/schema/sandbox failure
+policy/approval deny
+cancelled-before-start
+confirmed executor cancellation/timeout
+```
+
+Abandoned用于：
+
+```text
+side effect可能发生且outcome unknown
+host restart后exact result不可恢复
+required current-Runtime state丢失
+```
+
+Abandoned不生成synthetic ToolResult。
+
+## Tool Side-Effect Start
+
+Tool side-effect start是current Runtime的执行状态：
+
+```rust
+pub(crate) enum ToolOperationState {
+    Prepared,
+    Running,
+    Settling,
+    Terminal,
+}
+```
+
+顺序：
+
+```text
+policy/approval/sandbox validation
+→ observe EmergencyControl
+→ owner-local start reservation
+→ mark Running
+→ call executor
+→ exact ToolExecutionOutcome
+```
+
+不写`ToolExecutionStarted` ledger event。Cancel/SecurityRevoked在start reservation前获胜则Tool不执行；Running后获胜只能best-effort cancel并等待truthful result或Abandoned。
+
+process crash可能遗漏side-effect start事实，MVP接受该限制；restart不会自动重放Tool。
+
+## Complete Tool Exchange
+
+一个assistant response内的ordered ToolCalls形成execution-local pending exchange：
+
+```text
+Assistant(intermediate, calls A/B/C) committed
+→ ToolInvocation A/B/C Started
+→ ToolResult按任意完成顺序append
+→ A/B/C每个exactly one result
+→ complete exchange进入conversation
+```
+
+不建立：
+
+```text
+ToolRound entity
+ToolRoundId
+ToolRoundCompleted event
+assistant_entry_id/tool_entry_ids durable proof
+```
+
+conversation顺序固定为：
+
+```text
+assistant content原顺序
+→ tool result A
+→ tool result B
+→ tool result C
+```
+
+物理结果append顺序和executor completion顺序不改变模型或UI的call order。
+
+最后一个补齐集合的tool entry生成trusted `CommittedToolExchangeDelta`。SessionExecutor只把该delta交给AgentLoop；execution-local result vector不能直接推进模型conversation。
+
+cold replay遇到missing、orphan或identity冲突时排除整个exchange并报告diagnostic；下一条合法User、Assistant、Compaction或Turn terminal会关闭尚未完成的exchange，之后到达的旧result视为orphan。duplicate result采用first valid wins并告警，不撤销已完成exchange。后续合法User/Assistant entry可以继续恢复。
 
 ## Item Lifecycle
-
-Item read projection 可以派生：
 
 ```rust
 pub enum ItemStatus {
@@ -404,160 +355,40 @@ pub enum ItemStatus {
 }
 ```
 
-规则：
+- UserMessage、AgentMessage和Reasoning创建时即Completed；
+- ToolInvocation从Started到Completed或Abandoned；live writer拒绝Completed/Abandoned并存；
+- cold replay对ToolResult与ToolAbandoned采用first valid terminal outcome wins并报告后续冲突；
+- terminal Item不回到Started；
+- live Turnterminal后不创建新Item；
+- cold replay terminal后的冲突Item被忽略并告警；
+- Turn terminal时未完成ToolInvocation可以在projection中显示Abandoned/Incomplete，不要求每个都存在durableAbandoned entry。
 
-- UserMessage、AgentMessage 和 Reasoning durable Item 创建时即 Completed；
-- ToolInvocation 从 Started 到 Completed 或 Abandoned；
-- terminal Item 不回到 Started；
-- Turn terminal 后不创建新 Item；
-- Turn terminal entry 前必须关闭所有 Started Item；
-- Completed 只表示该 Item 有真实、稳定的最终语义，不表示业务成功。
+## Streaming 与 Observer Event
 
-ItemStatus 是 projection，不作为与 ItemContent 独立更新的第二事实字段。
-
-## Streaming与Observer Event
-
-AgentMessage和Reasoning的流式阶段不是durable Item。SessionExecutor在首个streamed content update时分配稳定`ItemId`，并只在当前Model operation内保存：
+AgentMessage/Reasoning stream只属于process-local provisional view。
 
 ```rust
 pub(crate) enum StreamingItem {
-    AgentMessage {
-        item_id: ItemId,
-        text: String,
-    },
+    AgentMessage { item_id: ItemId, text: String },
     Reasoning {
         item_id: ItemId,
         summary: Vec<String>,
         content: Vec<String>,
     },
 }
-
-pub(crate) enum FinalItemCandidate {
-    AgentMessage {
-        item_id: ItemId,
-        content: AgentMessageContent,
-    },
-    Reasoning {
-        item_id: ItemId,
-        summary: ReasoningSummary,
-        content: Option<Arc<str>>,
-    },
-}
 ```
 
-`StreamingItem`只累积允许发布的visible text/summary，不保存hidden reasoning或opaque provider artifact；final Reasoning candidate把允许展示的完整text放入`content`，因此`item_completed`可以校正丢失的reasoning delta。StreamingItem是process-local buffer，不是Item projection、JSONL entry或Snapshot authoritative content。provider完成并通过validation后，有stream映射的content生成同一`ItemId`的`FinalItemCandidate`，无stream映射的content在terminal normalization分配ItemId；只有candidate成功append/apply后，projection才产生正式`ItemStatus::Completed` Item。
-
-```text
-logical item start
-→ StreamingItem
-→ agent_message_started / reasoning_started ProgressEvent
-→ delta更新同一个StreamingItem并发布ProgressEvent
-→ provider final + validation
-→ FinalItemCandidate
-→ append StoredSessionEntry
-→ apply committed receipt
-→ ItemStatus::Completed
-→ item_completed StateEvent
-→ drop StreamingItem
-```
-
-事件规则：
-
-| Item kind | Started / Delta | Terminal |
-| --- | --- | --- |
-| AgentMessage | ProgressEvent | append/apply后的`item_completed` StateEvent |
-| Reasoning | ProgressEvent | append/apply后的`item_completed` StateEvent |
-| ToolInvocation | assistant/intermediate tool_call entry append/apply后派生的`item_tool_invocation_started` StateEvent | completed或abandoned StateEvent |
-
-started/delta可丢失或合并；Host漏掉started时可以从首个delta创建临时view，漏掉全部progress时可以直接使用final `item_completed`。所有progress和final使用同一`ItemId`。non-streaming provider或从未发布progress的content在terminal normalization时分配ItemId并直接生成candidate；不要求补发started。若stream index与finalized content不能一致关联，validation失败且不发布completed。Cancel、failure或无final output时直接丢弃`StreamingItem`，不生成synthetic Item；logical retry scheduled时Host清除上一Model operation尚未commit的临时view，若该ProgressEvent丢失则最迟在Turn terminal或新Snapshot时清除。completed或terminal之后迟到的started/delta必须忽略。
-
-ToolInvocation的Started与外部副作用开始是两个边界：assistant/intermediate tool_call entry append/apply后Item成为Started；`ToolExecutionStarted`必须在真实executor副作用前另行append/apply。pre-execution拒绝可以在没有`ToolExecutionStarted`的情况下把Started ToolInvocation完成为truthful ToolResult。
-
-以下内容同样不是durable Item：Tool progress/stdout chunk、model logical retry notification、TurnExecutionPhase transition、approval presentation状态、cache hit和临时token update。
-
-## Complete ToolRound
-
-ToolRound 是 conversation promotion unit，不是领域 entity：
-
-```text
-one stable model output
-├─ optional AgentMessage / Reasoning Items
-├─ ordered ToolInvocation Items
-└─ exactly one truthful ToolResult per Completed invocation
-```
-
-执行顺序：
-
-```text
-parse stable ModelOutput
-→ append one assistant/intermediate message with ordered reasoning/text/tool_call content
-→ every tool_call creates a Started ToolInvocation projection
-→ approval / execution durable events
-→ all exact ToolResult candidates known
-→ append one role=tool message per truthful result
-→ append tool_round_completed event referencing assistant + all tool entries
-→ storage-owned apply_committed applies the conversation promotion
-→ next logical model call
-```
-
-Started/Completed Item可以是durable operational truth和UI projection，但`tool_round_completed`前对应assistant/tool messages不能进入模型conversation。
-
-ToolRound completion 必须保持：
-
-- 原始 ToolCall 顺序；
-- 每个 call 恰好一个 truthful ToolResult；
-- optional AgentMessage/Reasoning 与 calls 来自同一个 stable model output；
-- ToolResult call_id 与 ToolCallId 匹配；
-- 所有 ToolInvocation ItemId 属于同一个 Turn；
-- incomplete、Abandoned 或 outcome-unknown invocation 不被纳入completion event。
-
-不建立：
-
-```text
-ToolRoundId
-ToolRound entity
-ModelStep
-ModelOutput entity
-```
-
-SessionStorage entry 身份只用 EntryId + parent_id；不再有独立的 durable operation key 字段，也不具有独立CRUD或lifecycle。
-
-## Item Identity 与 Ordering
-
-```text
-ItemId
-→ MiniCore semantic Item identity
-
-ToolCallId
-→ provider/tool protocol correlation
-
-EntryId
-→ fixed StoredSessionEntry.entry_id identity
-```
-
-基础规则：
-
-- 三者不要求相等；
-- fork remap child-local ItemId/EntryId 等 identity及nested references，preserve ToolCallId；完整规则由 Conversation/SessionStorage 定义；
-- ToolCallId 必须按 provider contract 原样回显；
-- Interaction 归属于 ItemId，不归属于裸 ToolCallId；
-- 一个 ToolInvocation Item 可以对应多条 operational/conversation entries；
-- Turn Item ordering由selected parent path上的entry sequence和同一assistant entry的canonical content顺序提供；
-- public Snapshot/Query中的有序`Vec<ItemView>`与new-Item StateEvent发送顺序就是排序契约，不在Item内保存`DisplaySequence`、ordinal或其他order token；
-- finalized assistant entry必须在Tool执行前append/apply并按call order创建Started ToolInvocation；exact ToolResult只在outcome确定后durable更新对应Item，因此不能把整个ToolInvocation推迟到Completed时才首次写入；
-- 并发Tool可以乱序结束，UI按ItemId更新原位置；ToolInvocation展示顺序和complete ToolRound始终保持原始call order；
-- streaming progress的first-seen顺序只属于provisional presentation，不能改变committed Item order；
-- fork remap identity但保留selected path上的相对Turn/Item顺序。
+- 首个visible delta分配稳定ItemId；
+- started/delta走ProgressEvent；
+- provider final产生同ItemId的FinalItemCandidate；
+- append/apply后才发布ItemCompleted StateEvent；
+- append失败、Cancel、retry或provider error丢弃provisional state；
+- Host漏progress时由final StateEvent/Snapshot校正；
+- Tool stdout/progress同样不持久化。
 
 ## Interaction
 
-Interaction 是 Runtime 在 Running Turn 内发起、等待外部回答的 durable request：
-
 ```rust
-// IdempotencyKey：调用方提供，仅用于活跃 run 内的 resolution 去重（防 host 重复发同一 resolution），
-// 不是 durable crash key；storage 层 entry 不再有 operation_key 字段。
-pub struct IdempotencyKey;
-
 pub struct Interaction {
     pub request_id: RequestId,
     pub session_id: SessionId,
@@ -568,49 +399,32 @@ pub struct Interaction {
 }
 
 pub enum InteractionState {
-    Pending {
-        requested_at: Timestamp,
-    },
+    Pending,
     Resolved {
         resolution: InteractionResolution,
-        resolution_key: IdempotencyKey,
         resolved_at: Timestamp,
+        resolution_key: IdempotencyKey,
     },
 }
 ```
 
-Interaction 的职责分为两层：
+MiniCore拥有RequestId、durable request/resolution、Cancel、terminal cleanup和waiter resume。TUI/Web/GUI/RPC只是Presentation Adapter。
 
-- Session execution与SessionStorage拥有`RequestId`、`TurnId`/`ItemId`绑定、Pending/Resolved durable state、幂等、Cancel、terminal cleanup和waiter resume；
-- TUI、Web、GUI或RPC host是Presentation Adapter，只负责把UI-safe `InteractionView`变成对用户可理解的对话框、聊天消息或表单，并通过Runtime facade提交resolution。
+Presentation Adapter不能：
 
-Presentation Adapter不能直接持有Tool future、SessionExecutor或SessionWriter，也不能用一个新的UserMessage代替`InteractionCommand::Resolve`。如果UI自己发起问题而MiniCore没有Pending Interaction，答案就会成为新Turn，不能继续原来的ToolInvocation。
-
-不用 `InteractionStatus + Option<InteractionResolution>`，避免构造 `Resolved + None` 或 `Pending + Some(...)`。
-
-read projection 可以派生：
-
-```rust
-pub enum InteractionStatus {
-    Pending,
-    Resolved,
-}
-```
+- 创建MiniCore没有请求的Pending Interaction；
+- 用UserMessage代替resolution；
+- 直接持有Tool future、SessionWriter或SessionExecutor；
+- 自行推断timeout Deny。
 
 ## Interaction Family
-
-最小 request family：
 
 ```rust
 pub enum InteractionRequest {
     ToolApproval(ToolApprovalRequest),
     UserQuestion(UserQuestionRequest),
 }
-```
 
-最小 resolution family：
-
-```rust
 pub enum InteractionResolution {
     ToolApproval(ToolApprovalDecision),
     UserAnswer(UserQuestionAnswer),
@@ -618,75 +432,52 @@ pub enum InteractionResolution {
 }
 ```
 
-```rust
-pub enum InteractionCancelReason {
-    UserCancelled,
-    TurnTerminated,
-    TransportClosedByHost,
-    HostRestart,
-    Recovery,
-}
-```
-
 规则：
 
-- ToolApproval request 只能由 Tool-related Item 触发；
-- UserQuestion 通常归属于 ask-user ToolInvocation，也允许归属于其他真正发起 request 的 Item；
-- 首版由ToolSet的独占pre-execution ask-user route发起UserQuestion；它发生在`ToolExecutionStarted`、file mutation ticket reservation和外部副作用之前；
-- request/resolution family 必须匹配；
-- Cancelled可以关闭任意family；用户沉默不等于Deny或Cancelled；
-- auto-approved、auto-denied 的 Tool policy 不需要创建 Interaction；
-- 一个 Item 可以顺序拥有多个 Interaction；
-- domain 不强制一个 Turn 同时只能有一个 Pending Interaction，execution policy 可以进一步收紧。
+- ToolApproval只由Tool-related Item触发；
+- UserQuestion通常归属ask-user ToolInvocation；
+- request/resolution family必须匹配；
+- Cancelled可以关闭任意family；
+- auto-allow/deny policy不创建Interaction；
+- 一个Item可以顺序拥有多个Interaction；
+- 一个request可以包含多个相关问题；
+- domain允许多个Pending Interaction，MVP execution policy可以收紧为同一assistant step独占ask-user等待。
 
 ## Interaction Append Order
 
 ```text
 construct typed request
 → append InteractionRequested
-→ apply durable projection
-→ publish request notification
-→ wait for response
-→ validate expected TurnId / RequestId / family / resolution idempotency key
-→ append InteractionResolved { resolution, resolution_key }
-→ apply durable projection
-→ wake waiter / continue Tool authorization
+→ apply projection
+→ notify host
+→ wait
+→ validate Session/Turn/Item/Request/family/resolution key
+→ append InteractionResolved
+→ apply projection
+→ wake waiter / continue authorization
 ```
 
-关键不变量：
+first committed terminal resolution wins：
 
-- request 未 append 前不能通知 host；
-- resolution 未 append 前不能执行受审批保护的副作用；
-- Tool side effect前仍需重新观察Cancel/SecurityRevoked和current operation basis；
-- 相同 resolution_key 重试幂等返回当前结果；
-- 不同 key 的第二次 resolution 返回 AlreadyResolved；
-- elapsed time不改变Pending state，也不产生默认Deny；
-- first committed terminal resolution wins。
+- 相同resolution_key在当前run重试幂等返回；
+- 不同key的第二次resolution返回AlreadyResolved；
+- elapsed time不改变Pending；
+- transport断开不产生默认resolution。
 
 ## Tool Approval
 
 ```text
-ToolAuthorization = Ask
-→ parent ToolInvocation 已有 ItemId
-→ append ToolApproval Interaction
-→ host Allow
-→ append Interaction resolution
-→ final Cancel state and authorization validation
-→ Sandbox / Tool execute
+Tool policy = Ask
+→ ToolInvocation Item已Started
+→ append approval request
+→ host Allow/Deny
+→ append resolution
+→ re-observe Cancel/SecurityRevoked
+→ Allow: start reservation + executor
+→ Deny: PreExecution ToolResult
 ```
 
-Deny：
-
-```text
-append Deny resolution
-→ 形成 truthful denied ToolResult candidate
-→ append role=tool message
-→ append tool_round_completed
-```
-
-Interaction 不决定 Tool permission。ToolRequirements、WorkspaceAccessView、ToolPolicy、per-call approval application和Sandbox 仍属于 Tool 子系统。
-
-ToolService 只判断需要 approval；durable Interaction ownership 属于 Session execution。外部 TUI/RPC/Web host 通过[Runtime Interface](runtime-interface.md)的per-session StateEvent接收request，并通过`InteractionCommand::Resolve`提交resolution，不能直接持有Tool executor waiter。
+approval表示用户意愿，不替代Sandbox enforcement。
 
 ## UserQuestion
 
@@ -700,393 +491,192 @@ pub struct UserQuestionAnswer {
 }
 ```
 
-一个 request 可以包含多个相关问题，避免为同一个问卷创建多个 pending lifecycle。
+首版由`ToolExecutionControl::request_user_question(item_id, request)`发起：
 
-producer seam 由 Turn-scoped `ToolExecutionControl::request_user_question(item_id, request)` 提供。它是 MiniCore 内部 interface，不是 UI 接口；调用方等待 typed answer，SessionExecutor 负责 append、notify、resolve validation 和 wake。首版 ask-user route 在一个 ToolRound 中独占等待：答案形成该route的`PreExecution` outcome后，同一assistant step的其他ToolCall才进入普通调度。
-
-answer：
-
-```text
-append UserAnswer resolution
-→ ask-user Tool 生成 truthful ToolResult candidate
-→ append role=tool message
-→ append tool_round_completed
-→ 下一次模型调用看见 answer
-```
-
-Interaction answer 本身不是 UserMessage，不开启新 Turn。
-
-`Cancelled`由ask-user route映射为typed `PreExecution` outcome或terminal cleanup；不得伪造已经发生的外部副作用。
+- 发生在file mutation ticket reservation和外部副作用前；
+- 等待期间不持有mutation permit或TurnControl reservation；
+- 同一assistant step的sibling ToolCall尚未启动；
+- answer形成PreExecution ToolResult；
+- matching results完整后exchange进入conversation；
+- 其他Session继续独立执行。
 
 ## Reconnect 与 Transport Loss
 
-transport delivery 是 at-least-once；durable Interaction 是 truth：
-
 ```text
 client disconnect
-→ Interaction 保持 Pending
-→ Turn 保持 Running / WaitingApproval 或 WaitingForUserInput
+→ Interaction保持Pending
 
 client reconnect
-→ query loaded Session snapshot / pending interactions
-→ 使用相同 RequestId 重发 request
+→ Snapshot返回相同RequestId
+→ host重新展示
+→ Resolve提交相同RequestId
 ```
 
-规则：
+- notification丢失不丢request；
+- reconnect不创建新RequestId；
+- 没有subscriber仍保持Pending；
+- PrepareForUnload使用有限grace，deadline后Cancel Turn并关闭Pending；
+- restart不恢复waiter，recovery best-effort写Cancelled resolution并中断Turn。
 
-- notification 丢失不丢 request；
-- reconnect 不创建新 RequestId；
-- lost response acknowledgement 使用同一个 resolution_key（in-run dedup）在活跃 run 内重试；
-- abrupt client disconnect 默认不等于 Deny 或 Cancel；
-- pending Interaction使Session execution非Idle；PrepareForUnload在grace期继续接受resolution，grace deadline到期后Cancel active Turn并以`Cancelled(TurnTerminated)`关闭Interaction，Unload不会永久悬挂；
-- host可以显式关闭transport并提交`Cancelled(TransportClosedByHost)`；
-- 没有subscriber时继续保持Pending，直到用户回答、显式Cancel、Unload/shutdown或restart recovery。
+## Steer
 
-## Indefinite Waiting
-
-MVP不定义Interaction级timeout、`expires_at`、`Expired` resolution或默认Deny。用户没有回答只表示Interaction仍为Pending：
+Steer属于current Running Turn：
 
 ```text
-Pending + elapsed time
-→ remain Pending
-→ no ToolExecutionStarted
-→ no ToolResult
-→ no next Model operation for this Turn
+WaitingApproval/WaitingForUserInput/ExecutingTools
+→ Steer进入bounded FIFO
+→ 不作为Interaction answer
+→ current operation或complete Tool exchange结束
+→ append one Steer
+→ next model call
 ```
 
-无限等待是fail closed：受审批保护的副作用不会开始，同时等待发生在file mutation ticket reservation和TurnControl reservation之前，不阻塞同批sibling ToolCall。若embedding根本无法展示Interaction，应在启动该工作前选择不需要人工回答的明确policy或显式Cancel；不能用“暂时没有subscriber”推断Deny。
-
-
-## Interaction等待与 Steer
-
-### WaitingApproval
-
-等待审批时：
-
-```text
-TurnStatus = Running
-TurnExecutionPhase = WaitingApproval
-InteractionState = Pending
-ToolInvocationState = Started
-```
-
-### WaitingForUserInput
-
-等待 UserQuestion 时：
-
-```text
-TurnStatus = Running
-SessionExecutionState = Running
-TurnExecutionPhase = WaitingForUserInput
-InteractionState = Pending
-ToolInvocationState = Started
-```
-
-当前Turn的逻辑执行停在该Interaction，不开始下一次Model调用，也不开始新的副作用Tool operation；SessionExecutor本身不阻塞，仍然处理`ResolveInteraction`、Cancel、SecurityRevoked、PrepareForUnload、Snapshot和其他per-session control。首版ask-user route在同一assistant step内独占等待：同一step的sibling ToolCall不会在答案返回前启动，也不预留file mutation ticket或持有TurnControl reservation。其他Session的Tool outcome不受该等待影响。
-
-Steer 仍进入该 Turn 的 bounded FIFO，不抢占 UserQuestion；回答完成并形成 truthful ToolResult、`tool_round_completed` 后，下一次 Model 调用前最多消费一条 Steer。
-
-### Steer
-
-Steer：
-
-```text
-Steer(expected TurnId)
-→ push_back进入该Turn的bounded SteerQueue FIFO
-→ 等待当前ToolRound truthful completion
-→ 下一次Model前pop_front一条
-→ 不作为 approval decision
-```
+ToolCall step始终先等待complete exchange；无需额外ToolRound marker。
 
 ## Turn Terminal Cleanup
 
-Turn terminal entry 前必须使领域projection闭合。Runtime-generated closure使用由terminal operation + RequestId派生的resolution_key做本轮去重；crash 后的重复 cleanup 幂等靠 committed prefix 状态判断（该 Interaction 已 resolved、该 Turn 已 terminal 则跳过），不依赖 durable operation key；exclusive lease 下恢复单跑，重复恢复靠状态跳过：
+live terminal前SessionExecutor尽力关闭：
 
 ```text
-all Pending Interaction → Resolved(Cancelled(reason))
-all Started ToolInvocation → Completed(existing exact durable result) 或 Abandoned
-Turn Running → Completed / Interrupted / Failed
+Pending Interaction → Resolved(Cancelled)
+Running Tool operation → exact result或Abandoned
+Started但未运行ToolInvocation → Cancelled ToolResult或Abandoned
+Turn → Final / Interrupted / Failed
 ```
 
-不能：
-
-- terminal Turn 保留 Pending Interaction；
-- terminal Turn 保留 Started Item；
-- outcome unknown 时生成 fake error ToolResult；
-- terminal 后接受 Interaction response、Steer 或新 Item。
-
-response 与 terminal race：
-
-```text
-resolution append 先赢
-→ execution 按 resolution 继续或参与 terminal cleanup
-
-terminal cleanup 先赢
-→ Interaction 已 Cancelled
-→ late response返回AlreadyResolved / TurnNotRunning
-```
+宽容durable模型不要求这些事实形成事务。任一append OutcomeUnknown时writer poison，当前run停止继续写；下次load按实际可见prefix/suffix恢复。
 
 ## Crash Recovery
 
-baseline：
+restart：
+
+- 不恢复provider stream、AgentLoop、Tool task或Interaction waiter；
+- replay保留existing User/Assistant/Tool/Interaction事实；
+- complete Tool exchange继续model-visible；
+- incomplete exchange从模型conversation排除；
+- Pending Interaction best-effort Cancelled；
+- Running Turn best-effort appendTurnInterrupted；
+- 未完成ToolInvocation显示Abandoned/Incomplete；
+- 不自动重放Tool、不合成ToolResult；
+- 单条损坏不brick整个Session。
+
+## Entries 与 Projection
+
+一个ToolInvocation可以由以下entries投影：
 
 ```text
-reload durable facts
-→ 检测没有 terminal fact 的 Turn
-→ 检测 Pending Interaction
-→ 检测 Started ToolInvocation / operational execution records
-→ append idempotent recovery entries：
-     Pending Interaction → InteractionResolved(Cancelled)
-     已有 role=tool message的invocation保持Completed
-     其余Started invocation → ToolAbandoned
-     Turn → TurnInterrupted
-```
-
-不恢复：
-
-```text
-provider stream
-AgentLoop state
-approval/question waiter
-Tool task
-streaming delta
-```
-
-不自动重放 outcome-unknown Tool，不生成 synthetic ToolResult，不把 Abandoned invocation 放入模型 conversation。
-
-## Entries、Projection 与 Storage
-
-Conversation 采用 per-session by-entry JSONL tree，完整定义见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)。一个ToolInvocation由message/event entries投影：
-
-```text
-assistant content: tool_call
+Assistant content: ToolCall
 InteractionRequested*
 InteractionResolved*
-ToolExecutionStarted?
-role=tool message?
+Tool message?
 ToolAbandoned?
-ToolRoundCompleted?
+Turn terminal?
 ```
 
-这些是SessionStorage private durable entries，不是Runtime public event的序列化副本，也不形成独立entity/CRUD。
+Tool side-effect start不进入ledger。完整exchange由assistant call集合与matching tool messages动态识别。
 
-需要的 projection：
-
-```text
-Conversation projection
-→ 只消费 initiating UserMessage、Steer、无ToolCallAssistant Continue、`tool_round_completed`引用的完整round、Compaction、final AssistantMessage
-
-Turn/Item projection
-→ 消费 semantic facts 和 operational Item lifecycle
-
-Pending Interaction projection
-→ Requested - Resolved
-
-Recovery projection
-→ started operation - known outcome/terminal entry
-```
-
-SessionStorage 仍是唯一 durable truth；projection 和 event stream 都不是第二事实来源。
+History/UI projection可以显示incomplete/orphan事实；model conversation只消费provider-valid complete exchange。这是同一storage的两个有意不同投影。
 
 ## Ownership
 
-| 对象/行为 | Owner |
-| --- | --- |
-| Turn durable facts | SessionStorage；Session execution 负责 append |
-| Turn active execution | SessionExecutor |
-| Item identity 和 lifecycle transition | Session execution + trusted entry writer |
-| Item content value | 对应 producer；Session execution 规范化后 append |
-| ToolCall/ToolResult execution semantics | ToolService / ToolSet |
-| ToolInvocation domain projection | Session execution / storage projector |
-| Interaction request/resolution | Session execution + SessionStorage |
-| approval/question external delivery | Runtime Interface的per-session StateEvent与InteractionCommand；具体 UI 是外部 Presentation Adapter |
-| pending waiter | loaded Session execution，transient |
-| streaming delta/progress | observer event pipeline |
-| model-visible conversation | committed conversation projector + PromptSet |
+- SessionExecutor：Turn/Item/Interaction sequencing、start reservation、terminal arbitration；
+- SessionStorage：strict append、tolerant replay和typed projections；
+- ToolSet：validation/policy/approval/sandbox/executor；
+- PromptSet：只消费sanitized committed conversation；
+- Presentation Adapter：展示Interaction并提交resolution；
+- AgentLoop：只推进NeedModel/NeedTools/Finished协议状态。
 
-不建立：
-
-```text
-TurnManager
-ItemManager / ItemService
-InteractionManager / InteractionService
-ToolResult entity
-ToolRound entity
-ModelStep entity
-PendingRequest registry as durable truth
-```
-
-loaded Session 可以维护 waiter map，但 durable pending state 必须从 SessionStorage 重建。
+不建立InteractionService、ToolRoundService、ItemManager或第二writer。
 
 ## Error 与 Race 分类
 
-本节固定语义；公开 error enum 由 Runtime protocol 定义：
+### Append
 
-```text
-TurnNotRunning
-ExpectedTurnMismatch
-ItemNotFound
-ItemAlreadyTerminal
-InteractionNotFound
-InteractionAlreadyResolved
-InteractionFamilyMismatch
-ParentItemMismatch
-ToolCallMismatch
-OutcomeUnknown
-TerminalAppendConflict
-StaleProjection
-```
+- NotCommitted：可retry同一draft；
+- OutcomeUnknown：poison writer，停止当前run继续写；
+- cold replay按实际文件恢复并报告diagnostic。
 
-关键 race：
+### Tool start vs Cancel
 
-- Steer vs terminal append；
-- Interaction response vs Turn terminal cleanup；
-- Tool result vs security revocation；
-- tool_round_completed append vs cancel；
-- initiating/terminal append outcome unknown；
-- reconnect resend vs original response acknowledgement。
+- emergency先被owner观察：Tool不启动；
+- start reservation先完成：Tool可以运行，Cancel只best-effort；
+- 不依赖durableToolExecutionStarted判定该race。
 
-全部race由per-session SessionExecutor、expected TurnId和in-run idempotency（resolution key / Submit CommandId dedup）线性化。
+### Tool result
 
-## 被否决的方案
+- exact result已知但append失败：不重新执行Tool；
+- duplicate result live append拒绝；
+- duplicate result cold replay采用first valid wins；后续duplicate忽略并产生diagnostic；
+- outcome unknown：Abandoned，无synthetic result；cold replay若同时存在result，first valid terminal outcome wins。
 
-### ToolCall 和 ToolResult 是 sibling Items
+### Interaction
 
-否决原因：
-
-- approval 不知道应该归属于 call、result 还是二者之间的隐式 operation；
-- 容易产生 orphan ToolResult 或一个 call 多个 result；
-- UI、replay 和 recovery 必须反复 correlation；
-- outcome unknown 时 call 永久悬空；
-- 同一用户可观察操作被拆成两个 identity。
-
-Transcript 可以保存独立 tool-call/tool-result records，但领域 Item 不需要复制这种 provider encoding。
-
-### 所有事件都成为 Item variant
-
-否决原因：stream delta、retry、cache、token update 和 phase 都是 observer/execution facts，不值得获得领域 identity 与 lifecycle。
-
-### 公开纯事实模型
-
-否决原因：immutable facts 适合作为 SessionStorage implementation，但直接暴露会把 SessionStorage schema、projection fold 和 migration complexity 泄漏给领域调用方。
-
-### Ephemeral Interaction
-
-否决原因：request notification 丢失、client reconnect、response acknowledgement 丢失和 host restart 都无法从 durable truth判断 request 状态。
-
-### Interrupted 恢复为 Running
-
-否决原因：破坏 terminal status 和 exact execution context语义。继续工作应创建新 Turn，或在 terminal 前使用 Steer。
+- response与terminal cleanup first committed wins；
+- stale Turn/Item/Request返回typed error；
+- wrong family拒绝；
+- reconnect重复相同resolution_key幂等。
 
 ## 基础不变量
 
-- Turn 由 committed initiating UserMessage 开始；
-- final assistant、TurnInterrupted或TurnFailed entry是Turn唯一结束线性化点；
-- Interrupted 和 Failed 都是 terminal；
-- Steer 只属于 expected Running Turn；
-- FollowUp 开启新 Turn；
-- Turn head 不内联完整 Items；
-- ItemType 从 ItemContent 派生；
-- 最小 ItemContent 只有 UserMessage、AgentMessage、Reasoning、ToolInvocation；
-- ToolCall 与 ToolResult 属于同一个 ToolInvocation Item；
-- ItemId、ToolCallId、EntryId 不混用；
-- streaming delta 和 progress 不是 durable Item；
-- 只持久化provider实际返回的finalized/replayable reasoning，不获取hidden chain-of-thought；
-- Started ToolInvocation 不进入模型 conversation；
-- Completed ToolInvocation 必须拥有 truthful ToolResult；
-- Abandoned ToolInvocation 不拥有 ToolResult，也不进入 conversation；
-- `tool_round_completed`前不开始下一次模型调用；
-- Interaction request append-before-notify；
-- Interaction resolution append-before-resume/side-effect；
-- Interaction response 不是 UserMessage；
-- transport disconnect 不自动 resolution；
-- reconnect 使用相同 RequestId；
-- Turn terminal 后没有 Pending Interaction 或 Started Item；
-- outcome unknown 不生成 synthetic ToolResult；
-- SessionStorage 是 durable truth；
-- 不建立新的 Manager、Service、ModelStep 或 ToolRound entity。
+- Session→Turn→Item→Interaction关系保持；
+- TurnId、ItemId、RequestId、EntryId、ToolCallId职责分离；
+- Fork保留历史ID；
+- Input开始Turn，Final/Interrupted/Failed结束Turn；
+- Steer不开始新Turn，FollowUp开始新Turn；
+- ToolCall与ToolResult属于同一ToolInvocation Item；
+- side-effect start是current-Runtime状态；
+- complete exchange才进入模型conversation；
+- incomplete exchange隔离并告警；
+- Interaction request-before-notify、resolution-before-wake；
+- transport断开不自动Deny；
+- streaming/progress不是durable Item；
+- recovery不重放Tool、不合成ToolResult；
+- cold replay局部损坏不brick Session。
 
 ## Test Matrix
 
 至少覆盖：
 
-- initiating UserMessage append创建Running Turn和对应Item；
-- admission failure 不创建 Turn；
-- completed/interrupted/failed terminal exclusivity；
-- terminal Turn 拒绝 Steer、Item append 和 Interaction resolution；
-- expected TurnId mismatch；
-- UserMessage/AgentMessage/Reasoning 创建即 Completed projection；
-- ItemType 从 ItemContent 派生；
-- ToolInvocation Started → Completed(success)；
-- ToolInvocation Started → Completed(failed/denied/cancelled)；
-- ToolInvocation Started → Abandoned(outcome unknown)；
-- Completed invocation 必须有 matching ToolResult；
-- Abandoned invocation 不允许 ToolResult；
-- ItemId 与 ToolCallId 独立；
-- parallel Tool逆序完成时，UI状态按ItemId原位更新，durable Item与ToolRound仍保持source call order；
-- ItemId/EntryId/ToolCallId/timestamp/completion time都不作为display sort key；
-- Snapshot与turn-scoped ListItems返回相同canonical Item order；
-- incomplete ToolRound 不进入 conversation；
-- message/reasoning started、delta与completed使用稳定ItemId；
-- started或全部delta丢失仍可由item_completed final view恢复；
-- non-streaming content在terminal normalization分配ItemId并直接生成candidate；
-- append失败、Cancel或provider terminal error不产生Completed Item；
-- logical retry要求Host清理上一Model operation临时view，丢失该progress时由Turn terminal或新Snapshot校正；
-- completed/terminal之后迟到的started/delta被Host忽略；
-- text-only reasoning stream在final candidate保留policy-visible content，item_completed可校正丢失delta；
-- finalized provider reasoning artifact 按 retention/redaction policy replay；
-- InteractionRequested append-before-notify；
-- InteractionResolved append-before-wake；
-- Tool approval allow/deny；
-- UserQuestion 多问题单 request；
-- Interaction family mismatch；
-- duplicate same resolution_key 幂等；
-- conflicting second resolution key；
-- 长时间无回答保持Pending且不产生默认Deny；
-- response vs terminal cleanup first-wins；
-- disconnect 后 pending 保留；
-- reconnect 使用相同 RequestId resend；
-- lost acknowledgement 使用 in-run resolution_key retry；
-- WaitingApproval 中 Steer 排队；
-- WaitingApproval Steer只排队，不preempt Interaction；
-- WaitingForUserInput 中 TurnStatus/SessionExecutionState 仍为 Running；
-- WaitingForUserInput不预留file mutation ticket或持有TurnControl reservation，且Session A等待时Session B可以继续执行；
-- WaitingForUserInput解决前，同一assistant step的sibling ToolCall不启动；解决后恢复普通调度；
-- `request_user_question` 在 ToolExecutionStarted 前建立 UserQuestion Interaction；
-- Presentation Adapter不能用新UserMessage代替Interaction resolution，也不能直接持有waiter；
-- Tool side effect前完成resolution并重新观察Cancel/SecurityRevoked和current operation basis；
-- restart recovery使用幂等entries逐步关闭pending、abandon unknown并interrupt Turn；
-- recovery 不生成 synthetic ToolResult；
-- terminal projection 不含 Pending Interaction 或 Started Item；
-- Tool-level failure 不自动把 Turn 标为 Failed；
-- tool_round_completed、terminal和recovery entry 幂等（靠 committed prefix 状态判断——已 resolved/已 terminal 则跳过，不依赖 durable operation key）。
+- Input/Steer/FollowUp边界；
+- Turn first terminal wins；
+- AgentMessage/Reasoning streaming ItemId稳定；
+- ToolInvocation Started→Completed/Abandoned；
+- ItemId与ToolCallId独立；
+- 多ToolCall结果逆序完成但UI/model顺序保持call order；
+- 最后一个matching ToolResult产生CommittedToolExchangeDelta；
+- missing/orphan ToolResult隔离，duplicate first valid wins；
+- 下一条合法User、Assistant、Compaction或Turn terminal关闭incomplete exchange，迟到result成为orphan；
+- incomplete exchange后的后续conversation可恢复；
+- start reservation与Cancel双向race；
+- start后exact outcome/Abandoned settlement；
+- ToolApproval allow/deny；
+- UserQuestion多问题单request；
+- 一个Item顺序多个Interaction；
+- family mismatch与stale identity；
+- disconnect/reconnect相同RequestId；
+- response与terminal cleanup first-wins；
+- restart Pending/Running/incomplete Tool recovery；
+- Fork保留全部历史ID；
+- malformed中段entry只影响局部projection。
 
-## 后续问题
+## 明确不建立
 
-1. Runtime pending Interaction query/snapshot/event payload。
-2. Question option、secret answer 和 validation 的最终 wire schema。
-3. Reasoning summary retention、redaction 和 user visibility policy。
-4. standalone compaction、review和background work是否产生Item。
+```text
+ToolRound entity / ToolRoundId / ToolRoundCompleted
+ToolExecutionStarted durable event
+ToolCall和ToolResult sibling Items
+InteractionService
+ItemManager
+StartedItem/DeltaItem durable variants
+DisplaySequence
+RunId / ModelStepId
+```
 
-## 设计进度
+## 开放问题
 
-- [x] 固定 Turn initiating/terminal entry 边界。
-- [x] 固定 Running/Completed/Interrupted/Failed semantics。
-- [x] 固定 Steer、FollowUp 和 Interaction response 的区别。
-- [x] 选择 operation-centric ToolInvocation Item。
-- [x] 拒绝 sibling ToolCall/ToolResult Items。
-- [x] 定义最小 ItemContent 和派生 ItemType。
-- [x] 定义 ToolInvocation Started/Completed/Abandoned。
-- [x] 定义 typed ToolResultDisposition。
-- [x] 区分 Item、ToolCall 和 storage identity。
-- [x] 定义 Interaction request/resolution family。
-- [x] 定义 request-before-notify 和 resolution-before-resume。
-- [x] 定义 reconnect/resend、无限等待和 transport loss。
-- [x] 定义 WaitingApproval 与 Steer。
-- [x] 定义 UI-owned presentation、MiniCore-owned Interaction protocol 和 `request_user_question` producer seam。
-- [x] 定义 WaitingForUserInput、per-session isolation 和不持锁等待。
-- [x] 定义 terminal cleanup 和 conservative recovery。
-- [x] 区分 durable Item 与 transient observer delta。
-- [x] 完成by-entry JSONL tree、Message/Event layout、EntryId、ToolRoundCompleted模型可见性规则和fork identity schema。
-- [x] 完成SessionExecutor与private ToolExecutionControl/Interaction request处理流程。
-- [x] 完成 public Runtime protocol projection。
+实现阶段冻结：
+
+1. public ID UUID格式；
+2. Item/Interaction wire casing；
+3. replay中`Incomplete`与`Abandoned` UI文案；
+4. simultaneous Pending Interaction的MVP execution上限。

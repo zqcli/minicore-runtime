@@ -505,10 +505,10 @@ Turn admission
 
 模型触发的 Skill Tool
 → append truthful tool message
-→ append tool_round_completed
+→ 同一assistant全部matching ToolResult存在时形成complete exchange
 
 下一次模型调用
-→ 只从 committed conversation 组装
+→ 只从sanitized committed conversation组装
 ```
 
 渐进披露阶段：
@@ -593,7 +593,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - SkillInjector不能决定选择哪个Skill；
 - SkillContributionRef把SkillId和exact source authorization/provenance贯穿到Prompt contribution；
 - Prompt 不能执行 Skill discovery 或 load；
-- 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message并由`tool_round_completed`promote，不能作为current-call旁路；
+- 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message，并在同一assistant的全部ToolCall拥有matching result后随complete exchange进入conversation，不能作为current-call旁路；
 - SkillService 不决定哪个 Turn 使用哪个 Skill；
 - cache和load state不进入领域对象；
 - source变化只标记dirty；shared current root只在显式`/reload`成功后替换，Workspace captured sources只在Session-local candidate publication后替换；
@@ -623,7 +623,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - [x] 确定 Turn execution 决定本次执行使用哪个 Skill。
 - [x] 确定TurnExecutionContext捕获SkillViewContext和Arc<SkillView>。
 - [x] 确定 SkillInjector 只负责 LoadedSkill 到 PromptContribution 的转换。
-- [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message + `tool_round_completed`进入conversation。
+- [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message和complete Tool exchange进入conversation。
 - [x] 确定reload和cache eviction不修改已经返回的不可变LoadedSkill。
 - [ ] 定义 SkillMetadata 和 SkillContent 的最终字段。
 - [x] 定义SkillViewContext的Session/Agent identity与WorkspaceSkillContext输入。

@@ -1,7 +1,9 @@
 # ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-28
+
+> 2026-07-29修订：immutable Arc、private constructor、explicit reload、same request logical retry和删除fingerprint族保持有效。ADR 0124取代durable Workspace/Model execution refs与proof links、StoredTurnContext、ConversationBoundary、Fork identity remap、ToolExecutionStarted和StoredCompaction scope/provenance条款；AgentRevisionRef与SessionDefinitionRevision仍作为StoredTurnStart历史说明保留。
 
 ## 背景
 
@@ -71,4 +73,4 @@ active/completed Turn
 
 ## 修订关系
 
-本ADR取代ADR 0122；ADR 0122改为Superseded。它修订ADR 0100/0101/0102/0103/0109/0110/0112/0119/0121及Workspace、Prompt、Skill、Tool、Turn execution、Session execution、ModelGateway、Compaction和ConversationStorage中的fingerprint条款。它不改变Transcript-First、SessionStorage durable truth、append/apply、ToolExecutionStarted、ToolRound gate、Idle-only Workspace update、SecurityRevoked settlement和logical retry次数/安全错误分类。
+本ADR取代ADR 0122；ADR 0122改为Superseded。它修订ADR 0100/0101/0102/0103/0109/0110/0112/0119/0121及Workspace、Prompt、Skill、Tool、Turn execution、Session execution、ModelGateway、Compaction和ConversationStorage中的fingerprint条款。ADR 0124随后取代本ADR的durable Workspace/Model execution refs与proof links、StoredTurnContext、ConversationBoundary、Fork remap、ToolExecutionStarted和StoredCompaction scope/provenance条款；Agent/Session historical exact refs继续保留，immutable Arc、private constructor、explicit reload、same request retry和删除fingerprint族继续有效。

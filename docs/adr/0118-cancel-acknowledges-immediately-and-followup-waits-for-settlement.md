@@ -1,7 +1,9 @@
 # ADR 0118：Cancel立即确认，FollowUp等待结构化收口后启动
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-27
+
+> 2026-07-29修订：Cancel即时确认、Finishing、FollowUp等待和truthful settlement保持有效。Tool是否已开始由current-Runtime `ToolOperationSlot`判断，不再以durable `ToolExecutionStarted`为边界。
 
 ## 背景
 

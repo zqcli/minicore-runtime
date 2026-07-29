@@ -1,7 +1,9 @@
 # ADR 0115：AgentLoop 使用自研协议状态机（Rig 收窄为 provider adapter）
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-27
+
+> 2026-07-29修订：自研同步sans-I/O AgentLoop与Rig provider-only职责保持有效。`accept_committed_tool_round`改为`accept_committed_tool_results(CommittedToolExchangeDelta)`；coverage来自matching ToolResult集合，不再依赖durable ToolRoundCompleted marker。
 
 ## 背景
 
@@ -21,38 +23,38 @@ Turn execution 内部的 AgentLoop 是 sans-I/O 推理协议状态机，只在 `
 | Grok Build | 自研 actor 式 loop；sampler 独立 crate | loop 与 sampling 分离，与 MiniCore 的 Executor/Gateway 分界同构 |
 | OpenHands | 自研 agent controller loop | SDK 层与 loop 层分离 |
 
-跨项目共识：**认真做 harness 的产品无一例外自研 loop**。SDK 内置 agent loop（Rig `Agent`/AgentRun、LangChain agents 等）服务于轻量集成场景，其 loop 通常自持 conversation history、tool 注册与调用编排——这三点分别与 MiniCore 的 Transcript-First（模型可见事实只来自 committed conversation）、ToolService 统一治理、`tool_round_completed` 可见性规则直接冲突。
+跨项目共识：**认真做 harness 的产品无一例外自研 loop**。SDK内置agent loop（Rig `Agent`/AgentRun、LangChain agents等）服务于轻量集成场景，其loop通常自持conversation history、tool注册与调用编排——这三点分别与MiniCore的committed/sanitized conversation、ToolService统一治理和SessionExecutor-owned Tool exchange completion直接冲突。
 
 ## 决定
 
 1. **AgentLoop 是 MiniCore 自研的 crate-private 同步 sans-I/O 状态机**，不由 Rig 或其他 SDK 驱动。
 2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**：它只编码并执行一个由ModelGateway规划好的provider attempt，桥接stream/cancellation，并提取finish reason、usage和allowlisted metadata；SDK automatic retry固定为0。model resolution、request validation、auth policy与credential resolution、cache/continuation policy、错误分类和最终`ModelCallResult`由ModelGateway拥有，logical retry由SessionExecutor拥有（ADR 0119）。Rig 0.40.0 spike 的门禁范围同步收窄为provider mapping验证，不再评估Rig sans-I/O AgentRun。
-3. **crate-private interface 维持 `session-execution.md` 既有形状不变**：`next_action()`、`accept_model_response()`、`accept_committed_tool_round()`、`accept_committed_steer()` 与 `AgentLoopAction { NeedModel | NeedTools | Finished }`。不新建 public trait、`AgentLoopFactory` 或 registry；「第二个真实实现出现才建立稳定 seam」的既有原则不变。
+3. **crate-private interface维持窄typed形状**：`next_action()`、`accept_model_response()`、`accept_committed_tool_results()`、`accept_committed_steer()`与`AgentLoopAction { NeedModel | NeedTools | Finished }`。不新建public trait、`AgentLoopFactory`或registry；「第二个真实实现出现才建立稳定seam」的既有原则不变。
 4. **内部状态机冻结为三态**：
 
 ```text
 AwaitingModel { output_contract }
-  ← ConversationSeed 构造 / accept_committed_tool_round / accept_committed_steer
+  ← ConversationSeed 构造 / accept_committed_tool_results / accept_committed_steer
   → accept_model_response(validated FinalizedAssistantResponse)
-     ├─ content 含 ToolCall → PendingToolRound { expected: ordered ToolCallIds }
+     ├─ content 含 ToolCall → PendingToolExchange { expected: ordered ToolCallIds }
      └─ content 无 ToolCall → EmittedCandidate（next_action 返回 Finished candidate）
 
-PendingToolRound
+PendingToolExchange
   → next_action 返回 NeedTools { response, calls }
-  → accept_committed_tool_round(trusted CommittedConversationDelta)
-     └─ 验证 delta 覆盖 exact expected calls → AwaitingModel
+  → accept_committed_tool_results(trusted CommittedToolExchangeDelta)
+     └─ 验证delta覆盖exact expected calls → AwaitingModel
 
 EmittedCandidate
   → SessionExecutor 仲裁：Steer FIFO 为空 → Assistant(Final)，Turn Completed
      Steer FIFO 非空 → Assistant(Continue) append/apply
-     → accept_committed_steer 原地推进回 AwaitingModel（或等价重建 segment）
+     → accept_committed_steer回到AwaitingModel（方法内部可等价重建segment）
 ```
 
 ADR 0120关闭了原L1 finish-reason歧义：ModelGateway在构造`ModelCallResult`前已经校验`ModelFinishReason × ToolCall presence × OutputContract`。UnexpectedToolCall、invalid Structured output、finish/content不一致、Length、ContentFiltered和empty terminal response均返回`ModelCallError`，不进入AgentLoop。AgentLoop只对validated response按ToolCall presence做上述二路转换；non-empty Refused是合法无ToolCall candidate。
 
-5. **Steer 原地推进为默认路径**：`accept_committed_steer` 消费 trusted delta 后直接回到 `AwaitingModel`；从 ConversationSeed 重建 segment 保留为等价实现自由。**Compaction Replace 后必须重建 segment**（committed conversation 被整体替换），该规则不变。原为"adapter 不支持原地注入 Steer"和"provider/SDK rollover"保留的重建理由随本 ADR 删除。
-6. **状态机校验归 loop**：状态错配、tool round coverage与expected calls不匹配、candidate重复消费都返回typed `AgentLoopError`，由SessionExecutor按invariant failure规则处理（停止执行、replay或Unavailable）。Provider response错误归ModelGateway，不使用AgentLoop error表达。AgentLoop具体error reason随第三轮L2/L3一起冻结，不由ADR 0120提前决定。
-7. **禁令清单不变**：不读写 SessionStorage、不调用 PromptService/ToolService/SkillService/ModelGateway、不读取 current Workspace/definition、不拼接 prompt、不在 `tool_round_completed` 前把 ToolResult 加入 conversation、不处理 approval、不发布事件、不决定 terminal。
+5. **Steer原地推进为默认路径**：SessionExecutor固定调用`accept_committed_steer`；该方法消费trusted delta后回到`AwaitingModel`，其内部可以增量推进或经private helper从ConversationSeed等价重建segment。**Compaction Replace 后必须重建 segment**（committed conversation 被整体替换），该规则不变。原为"adapter 不支持原地注入 Steer"和"provider/SDK rollover"保留的重建理由随本 ADR 删除。
+6. **状态机校验归loop**：状态错配、Tool exchange coverage与expected calls不匹配、candidate重复消费都返回typed `AgentLoopError`，由SessionExecutor按invariant failure规则处理（停止执行、replay或Unavailable）。Provider response错误归ModelGateway，不使用AgentLoop error表达。AgentLoop具体error reason随第三轮L2冻结，不由ADR 0120提前决定。
+7. **禁令清单不变**：不读写SessionStorage、不调用PromptService/ToolService/SkillService/ModelGateway、不读取current Workspace/definition、不拼接prompt、不接收execution-local或incomplete ToolResult集合、不处理approval、不发布事件、不决定terminal。
 8. **删除 monolithic adapter task 例外**：自研状态机是同步纯逻辑，由 SessionExecutor 主循环直接方法调用；`session-execution.md`"强制 two-owner execution"否决条款中为 Rig monolithic future 保留的 private adapter task 但书随本 ADR 删除。
 
 ## 理由
@@ -74,7 +76,7 @@ ADR 0120关闭了原L1 finish-reason歧义：ModelGateway在构造`ModelCallResu
 
 - 三态转换全覆盖：合法序列产生确定动作序列；每个非法转换返回typed AgentLoop error；具体reason随L2/L3冻结；
 - ModelGateway response decision table全覆盖；UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse永不进入AgentLoop；
-- tool round coverage：missing/duplicate/reordered/跨 Turn ToolCallId 均拒绝；
+- Tool exchange coverage：missing/duplicate/跨Turn coverage或非canonical assistant call order均拒绝；
 - candidate 幂等：EmittedCandidate 只能被消费一次；Continue 后状态机可继续；
 - Compaction Replace 后旧 segment 不可继续使用，新 seed 重建后行为与全量 replay 等价；
 - property test：任意合法 committed delta 序列驱动，loop 动作与 conversation 协议不变量（无孤立 ToolCall、无未覆盖 round 进入 NeedModel）恒成立；

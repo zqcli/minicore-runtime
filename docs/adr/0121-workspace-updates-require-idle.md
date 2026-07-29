@@ -1,7 +1,9 @@
 # ADR 0121：Workspace定义只在Idle更新，安全撤权中断当前Turn
 
-状态：Accepted
+状态：Partially Superseded by ADR 0124
 日期：2026-07-27
+
+> 2026-07-29修订：Idle-only Workspace update、SecurityRevoked和重新resolve规则保持有效。Tool start/settlement改用owner-local ToolOperationSlot，不再写`ToolExecutionStarted`或补`tool_round_completed`。
 
 ## 背景
 

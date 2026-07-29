@@ -119,12 +119,12 @@ Runtime内部Session durable owner维护的轻量清单或可重建索引，用�
 _避免_：RuntimeSnapshot、完整会话上下文、UI sidebar store、第二durable truth
 
 **会话条目（`StoredSessionEntry`）**：
-会话中的一条不可变追加记录。条目通过`entry_id`和`parent_id`连接成树；顶层body固定为`TurnContext`、`Message`、`Event`或`Compaction`。Message使用`user | assistant | tool` role；usage和finalized provider response metadata随assistant entry保存。
-_避免_：业务 batch、公开 RuntimeEvent 副本、数据库行
+会话中的一条不可变追加记录。条目通过`entry_id`和`parent_id`连接成树；顶层body固定为`Message`、`Event`或`Compaction`。Input UserMessage内联safe `StoredTurnStart`；Message使用`user | assistant | tool` role；usage和finalized provider response metadata随assistant entry保存。
+_避免_：业务batch、公开RuntimeEvent副本、数据库行、独立TurnContext entry
 
 **会话树**：
-由会话条目的父子关系形成的历史树。当前对话上下文由根到 current entry 的 selected path 投影，而不是由文件中所有条目线性构建。物理 entry 可独立 durable；assistant/tool sequence 只有在 `tool_round_completed` 后才作为完整 round 进入模型 conversation。
-_避免_：消息数组、历史列表、batch-result leaf
+由会话条目的父子关系形成的历史树。当前对话上下文由根到current entry的selected path投影。live append保持strict；cold replay跳过malformed/duplicate记录并把missing parent隔离为orphan root。assistant ToolCall只有在全部matching ToolResult存在时才与ordered results一起进入模型conversation。
+_避免_：消息数组、历史列表、ToolRoundCompleted marker、strict replay brick
 
 **上下文压缩**：
 把会话较早历史替换为摘要，同时保留近期上下文的会话级能力。它用于控制模型上下文大小，并保持后续 Agent 运行能够继续理解已有目标、约束、进展和关键决定。
@@ -351,8 +351,8 @@ current Context、Model、Tool或Compaction operation返回给SessionExecutor的
 _避免_：durable entry、Runtime event、直接Session mutation
 
 **工具执行控制（`ToolExecutionControl`）**：
-Tool执行期间请求SessionExecutor完成approval和ToolExecutionStarted记录的crate-private interface。它通过typed request/response工作，不借用SessionExecutor mutable state，也不拥有第二writer。
-_避免_：InteractionService、ToolLedgerService、公开Runtime interface
+Tool执行期间请求SessionExecutor完成approval、UserQuestion和owner-local ToolStartPermit的crate-private interface。它通过typed request/response工作，不借用SessionExecutor mutable state，也不拥有第二writer。ToolStartPermit只在current Runtime内有效，不写Session ledger。
+_避免_：InteractionService、ToolLedgerService、公开Runtime interface、durable ToolExecutionStarted
 
 **工具服务（`ToolService`）**：
 `MiniCoreRuntime`拥有的独立深模块，封装工具定义、registry、prompt view、policy、approval需要、sandbox和executor implementations。candidate Turn通过`ToolService::for_turn(...)`得到不可变`ToolSet`；Session execution协调AgentLoop与ToolSet。每个loaded Session的SessionExecutor另行拥有独立file mutation queue（ADR 0116），Agent/Session/Turn领域对象不持有工具属性。
@@ -419,6 +419,10 @@ _避免_：模型显示名、API model name、Rig 模型类型
 Turn admission期间由ModelGateway根据ModelSelection解析的immutable execution value，pin exact ModelDefinitionRef、ModelDefinitionVersion、capabilities、effective limits和generation policy。它可以携带crate-private opaque execution reference，但不暴露endpoint、auth reference、credential或provider client。
 _避免_：ModelSummary、current catalog lookup、cross-model fallback plan
 
+**Token估算器（`TokenEstimateRate` / `TokenEstimator`）**：
+ModelGateway validated model definition拥有的本地context估算参数，经TurnModelSnapshot固定并分发给PromptSet与Compaction。首版按canonical UTF-8/JSON bytes执行保守估算；estimate只用于planning，不进入ModelUsage或durable provider usage fact。
+_避免_：按model name猜tokenizer、每个调用点自定义bytes/token常量、TokenEstimator fingerprint
+
 **模型状态（`ModelState`，pre-refactor term）**：
 旧SessionRuntime中的mutable model execution state。目标架构由SessionDefinition保存ModelSelection和用户偏好，TurnExecutionContext保存TurnModelSnapshot；provider connection与stream state留在ModelGateway，logical retry delay/count由SessionExecutor的RunningOperation持有。
 _避免_：active Turn mutable model、provider client、credential
@@ -459,15 +463,15 @@ _避免_：durable Message、第二event log、cancellation token
 _避免_：SummaryModelRequest、ModelCallRequest、AssembledModelContext、系统提示词状态
 
 **压缩计划（`CompactionPlan`）**：
-从committed conversation、active Turn initiating UserMessage保护、stable-unit boundaries和context budget确定的crate-private immutable plan。首版固定使用portable rolling SummaryModel，不根据模型名称选择ProviderNative，也不使用deterministic conversation truncation。operation持有同一个`Arc<CompactionPlan>`及其immutable settings、budget、directive、source和request；durable entry只保存exact source checkpoint、typed boundaries/provenance与模型调用结果，不保存派生plan摘要。
-_避免_：CompactionMethod、GPT压缩、Claude压缩、provider endpoint、UI handler
+从sanitized committed conversation、连续prefix cut、recent exact suffix和context budget确定的crate-private immutable plan。operation持有同一个`Arc<CompactionPlan>`及其settings、budget、directive、source、single `first_kept_entry_id` marker和request；durable entry只保存rolling summary、marker与optional model-call provenance。
+_避免_：CompactionScope、protected EntryId、previous checkpoint、coverage frontier、provider endpoint、UI handler
 
 **上下文限制错误（`ContextOverflow`）**：
 当前Turn的下一次模型调用无法进入有效上下文窗口的typed recovery class。`PromptAssembly`表示PromptSet本地最终组装拒绝、未调用provider；`Provider`表示ModelGateway归约provider context overflow。两者由SessionExecutor共享一次bounded compaction recovery，但保留diagnostics和usage来源差异。
 _避免_：普通 retry error、Prompt admission rejection、模型可见 assistant message
 
 **驱动安全点**：
-AgentLoop在稳定模型输出、`tool_round_completed` conversation projection update和candidate final之间把控制权交回Session execution的边界。Session execution只在对应entry成功`append → apply`后消费Steer、开始下一次模型调用或发布terminal；helper名称是private implementation detail。FollowUp在当前Turn terminal后的admission中启动新Turn。
+AgentLoop在稳定模型输出、complete Tool exchange committed delta和candidate final之间把控制权交回Session execution的边界。Session execution只在对应entry成功`append → apply`后消费Steer、开始下一次模型调用或发布terminal；helper名称是private implementation detail。FollowUp在当前Turn terminal后的admission中启动新Turn。
 _避免_：prepare next turn、UI回调、工具Hook、physical batch boundary
 
 **运行时命令**：
