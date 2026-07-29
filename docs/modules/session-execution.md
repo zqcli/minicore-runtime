@@ -173,6 +173,8 @@ validate current Turn/Item/call
 
 ## Running Operation
 
+**Canonical cross-module invariant: INV-101.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+
 ```rust
 pub(crate) enum RunningOperation {
     Model {
@@ -253,6 +255,8 @@ AgentLoop禁止：
 - 接收uncommitted conversation。
 
 ## Append与Projection更新
+
+SessionExecutor只消费ConversationStorage的append receipt和trusted delta；strict commit可见性由[INV-001](../architecture.md#跨模块不变量索引)定义，tolerant replay由[INV-002](../architecture.md#跨模块不变量索引)定义。本节只描述Executor在这些结果上的本地推进。
 
 ```text
 SessionWriter.append(draft)
@@ -373,6 +377,8 @@ pre-execution deny/failure/cancel产生truthfulPreExecution ToolResult，不启�
 
 ### Side Effect
 
+Tool start/Cancel/SecurityRevoked的canonical first-wins与settlement规则见[INV-401](../architecture.md#跨模块不变量索引)；本节只描述SessionExecutor如何安装和驱动owner-local slot。
+
 ```text
 start reservation wins
 → ToolOperationSlot::Running
@@ -384,7 +390,7 @@ file mutation仍使用Session-local canonical file queue。持有mutation permit
 
 ### Commit Results
 
-Tool futures可以逆序完成。owner按结果到达逐个：
+Tool futures可以逆序完成。complete exchange的model-visible判定和typed delta构造由ConversationStorage按[INV-003](../architecture.md#跨模块不变量索引)拥有；SessionExecutor只提交exact outcome并消费返回的delta。owner按结果到达逐个：
 
 ```text
 exact ToolExecutionOutcome::Completed
@@ -431,6 +437,8 @@ ToolExecutionControl.request_approval/request_user_question
 等待不持有TurnControl reservation、lifecycle guard或file mutation permit。Steer只排队。
 
 ## Steer流程
+
+**Canonical cross-module invariant: INV-102.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
 
 ```text
 Steer(expected_turn_id, CommandId)
@@ -642,12 +650,12 @@ StateEvent/Snapshot提供最终校正。ProgressEvent不写storage，不决定Tu
 7. publish snapshot if changed
 ```
 
-不持有短guard跨await。Model permit、Tool execution、approval、UserQuestion、file mutation、provider I/O和observer notify期间零持有lifecycle/TurnControl短guard。
+不持有短guard跨await。Model provider I/O、Tool execution、approval、UserQuestion、file mutation和observer notify期间零持有lifecycle/TurnControl短guard。
 
 ## Multi-Session并发
 
 - 每Session独立Executor/Writer/Ingress/file mutation queue；
-- shared ModelGateway有全局/per-provider capacity和no-starvation；
+- shared ModelGateway并发安全，多个Session的provider request不经过Gateway本地permit或admission queue；
 - 同Session同文件mutation FIFO；不同文件可并发；多文件/open-world Tool使batch Serial；
 - 跨Session共享Workspace冲突由host/user通过worktree或独立Workspace处理；
 - 不建立Runtime-global Session lock hierarchy。
@@ -673,6 +681,8 @@ pub enum SessionExecutionError {
 raw adapter error在owner module归一化；SessionExecutor只决定Turn recovery/terminal policy。
 
 ## Recovery
+
+物理扫描、局部corruption隔离与complete/incomplete exchange投影分别由[INV-002与INV-003](../architecture.md#跨模块不变量索引)定义；SessionExecutor只拥有unfinished Turn的保守terminalization和future admission状态。
 
 cold load：
 

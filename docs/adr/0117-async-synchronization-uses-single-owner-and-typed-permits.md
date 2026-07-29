@@ -1,9 +1,9 @@
 # ADR 0117：异步同步使用单 Owner、短临界区与 Typed Permit
 
-状态：Partially Superseded by ADR 0124
+状态：Partially Superseded by ADRs 0124 and 0125
 日期：2026-07-27
 
-> 2026-07-29修订：single owner、短guard、release-before-fan-out和typed permit规则保持有效。ADR 0124用process-local `ToolStartPermit`替代`ToolExecutionStarted` controlled append；file mutation permit仍按原规则settle后释放。
+> 2026-07-29修订：single owner、短guard、release-before-fan-out和typed permit规则保持有效。ADR 0124用process-local `ToolStartPermit`替代`ToolExecutionStarted` controlled append；file mutation permit仍按原规则settle后释放。ADR 0125删除ModelGateway模型调用permit，Model provider I/O仍不得持有普通短guard。
 
 ## 背景
 
@@ -18,11 +18,11 @@
 1. **不建立Runtime-global lock hierarchy、lock-rank manager或运行时死锁检测器**。O5不再作为缺少全局锁序的P1架构缺陷。
 2. **Session mutable state保持单Owner**。只有`SessionExecutor`修改Session执行状态、writer和projections；异步operation、lane和外部service不能直接取得Session mutable guard。
 3. **普通Mutex/RwLock guard不得跨任意`.await`、跨owner同步调用、event publication、fan-out通知或host callback**。共享内存锁只保护可在同步短作用域内完成的读取、clone、CAS或状态替换。
-4. **有意跨`.await`的一次一个操作使用语义明确的typed permit/semaphore**。允许跨越的范围必须在类型和文档中固定，例如Agent final-status check到initiating append outcome的start-commit permit、Model concurrency permit和file mutation permit。不得用通用`Mutex<()>`隐藏长临界区。
+4. **有意跨`.await`的一次一个操作使用语义明确的typed permit/semaphore**。允许跨越的范围必须在类型和文档中固定，例如Agent final-status check到initiating append outcome的start-commit permit和file mutation permit。不得用通用`Mutex<()>`隐藏长临界区；ModelGateway按ADR 0125不建立模型调用permit。
 5. **跨Agent/Session durable operation保留局部固定顺序`Agent lifecycle → Session lifecycle`**。实现不得在持有Agent lifecycle guard/permit时等待SessionExecutor响应、Unload completion或其他host-visible completion；durable mutation完成后先释放gate，再向loaded Session fan-out readiness invalidation。
 6. **controlled append保留局部固定顺序**：非阻塞`TurnControlGate` reservation → 一次bounded `SessionWriter.append/apply` sequence → release。所有通知和后续operation在reservation释放后执行，不叠加第二个Workspace permit。
 7. **SecurityRevoked不反向等待Session控制面**。authority/host先发布current security fact，再设置Turn-targeted sticky signal并唤醒Executor；不等待TurnControl、普通lane或terminal cleanup确认。
-8. **长等待发生时零持有短状态guard**。Model permit、Session-local file mutation ticket、Tool execution、approval、UserQuestion、Sandbox、provider I/O和外部通知等待期间不得持有Agent/Session lifecycle guard或TurnControl reservation。已经取得file mutation permit后可以请求短`ToolExecutionStarted` controlled append；任何路径都不得持有TurnControl reservation反向等待mutation permit。
+8. **长等待发生时零持有短状态guard**。Model provider I/O、Session-local file mutation ticket、Tool execution、approval、UserQuestion、Sandbox和外部通知等待期间不得持有Agent/Session lifecycle guard或TurnControl reservation。owner-local `ToolStartPermit`和file mutation permit都不进入durable controlled append；任何路径都不得持有TurnControl reservation反向等待mutation permit。
 9. **实现使用私有组合操作收口顺序**。至少提供等价于`commit_turn_start(...)`和`append_controlled(...)`的crate-private helper，调用方不能自由拼装同步原语。
 10. **以lint和竞态测试防回归**。Rust实现启用Clippy `await_holding_lock`，并将Tokio Mutex/RwLock guard加入`await_holding_invalid_type`；确需跨await的typed permit显式allow并附作用域理由。
 
@@ -44,7 +44,7 @@
 - Turn start与Agent Disable/Delete竞态产生唯一first-wins结果，Disable不在持gate时等待SessionExecutor；
 - Agent/Session upgrade与Archive/Delete遵守`Agent → Session`局部顺序；
 - controlled append与Cancel/SecurityRevoked竞态产生append或signal唯一first-wins结果，双方不循环等待；
-- `ToolExecutionStarted`与Cancel/SecurityRevoked竞态保持已有truthful outcome规则；
+- owner-local `ToolStartPermit`与Cancel/SecurityRevoked竞态保持已有first-wins与truthful settlement规则；
 - 两个Session同时从同一Agent启动Turn只发生有限短等待；
 - lint拒绝普通Mutex/RwLock guard跨`.await`；
 - event publication、fan-out和host callback发生在相关状态guard/permit释放后。

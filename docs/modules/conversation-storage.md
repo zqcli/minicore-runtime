@@ -454,6 +454,8 @@ live writer仍要求一个Turn最多一个terminal fact。cold replay采用first
 
 ## Tool Exchange Projection
 
+**Canonical cross-module invariant: INV-003.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+
 不建立ToolRound entity或durable completion marker。
 
 assistant entry含ToolCall时，conversation projector创建pending exchange：
@@ -525,6 +527,8 @@ projection规则：
 
 ## Strict Live Append
 
+**Canonical cross-module invariant: INV-001.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+
 `SessionWriter.append()`在physical write前执行strict validation和projection preview：
 
 ```text
@@ -582,6 +586,8 @@ pub enum SessionWriteError {
 - 不建立durable operation key或payload conflict index。
 
 ## Tolerant Replay
+
+**Canonical cross-module invariant: INV-002.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
 
 replay分为物理扫描和projection fold。
 

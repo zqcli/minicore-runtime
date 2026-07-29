@@ -2,8 +2,8 @@
 
 状态：设计评审记录（发现待决议）
 日期：2026-07-26
-范围：`docs/architecture.md` + `CONTEXT.md` + `docs/modules/`（13 篇）+ `docs/adr/`（0100–0114）+ `docs/migration/v1-to-v2.md` + `docs/refactor/`
-方式：在[第一轮评审](v2-design-review.md)全部 A–F 决议落盘后的整体复审。目标是超越第一轮已关闭项，检查残留矛盾、未分配 owner 的横切依赖、协议完备性与文档结构风险。本文所有发现均未形成决议；决议后按第一轮惯例回写并标注。
+范围：`docs/architecture.md` + `CONTEXT.md` + `docs/modules/`（13 篇）+ `docs/adr/`（0100–0114）+ `docs/migration/v1-to-v2.md` + 当时仍存在的`docs/refactor/`
+方式：在[第一轮评审](v2-design-review.md)全部 A–F 决议落盘后的整体复审。目标是超越第一轮已关闭项，检查残留矛盾、未分配 owner 的横切依赖、协议完备性与文档结构风险。R1–R6已关闭；R7与第一轮C3/O1是同一条件性安全门禁；非阻塞项按文中状态继续跟踪。
 
 ## 总体判断
 
@@ -14,12 +14,12 @@
 当前最大风险已从"设计缺陷"转移为三类：
 
 1. **设计冻结与零实现之间的验证缺口**——Rig 0.40.0 spike 尚未执行，而 spike 结论可能反推已冻结类型（`FinalizedAssistantResponse`、`StoredReasoning`、`content_index` 对齐）的修订；
-2. **文档规模成为一致性负债**——同一不变量在 4–6 篇文档中全文复述，决议同步靠人肉，已出现漏网（见 R4）；
-3. **评审时识别的残留矛盾与未分配owner**（Submit admission与token estimator）现均已分别关闭；当前剩余门禁见文末评审决议与handoff。
+2. **文档一致性负债已按R6收口**——8条高风险规则拥有stable ID与canonical owner，非owner副本已收窄，`docs/refactor/`已删除，横切ADR扫描纪律已写入migration；
+3. **评审时识别的具体矛盾、未分配owner与文档治理问题**（R1–R6）均已关闭；当前剩余门禁见文末评审决议与handoff。
 
 ## 一、重大问题（编码前需定案或修复）
 
-### R1 · Submit admission 语义自相矛盾
+### R1 · Submit admission 语义自相矛盾（已关闭）
 
 `session-execution.md` 的「Submit流程」写「普通Submit只在`Idle + Open + Loaded + Ready + accepting_requests`时接受」；但同文档 `SessionIngress` 定义了 bounded `TurnAdmissionQueue`（"只保存尚未开始的 Turn admission"），lane arbitration 第 6 条描述 Turn terminal 后在 FollowUpQueue 与 TurnAdmissionQueue 之间做公平 admission，`runtime-interface.md` 的 `SessionQueueView` 还暴露 `pending_submit_count`。两组表述冲突：**Running 期间到达的 Submit 到底排队等 terminal，还是立刻 SessionBusy？**「未选中且Session已被其他消息占用时及时返回SessionBusy」中"及时"的时点未定义。
 
@@ -58,7 +58,7 @@
 
 不改动：`CompactionUnitRef.estimated_tokens`等字段本体（来源由 C1 总括约束）、既有红线原文、`ModelUsage` 持久化规则；`TokenEstimator`除`TurnModelSnapshot::token_estimator()`外的具体方法签名粒度留给实现阶段。
 
-### R3 · `MiniCoreRuntime` pub 字段与协议禁公开清单矛盾；共享模块口径不一
+### R3 · `MiniCoreRuntime` pub 字段与协议禁公开清单矛盾；共享模块口径不一（已关闭）
 
 `architecture.md`、`prompt.md`、`skills.md` 均展示 `pub struct MiniCoreRuntime { pub prompt_service: Arc<PromptService>, ... }`，而 `runtime-interface.md`「内部对象禁止公开」清单明确 `PromptService / ToolService / SkillService` 永远留在 crate 内部、外部宿主只依赖 facade 四能力。字段可见性应为 `pub(crate)`。同时该 struct 只列三个 Service，遗漏同为 Runtime-owned 的 ModelGateway；`architecture.md`「三个长生命周期深模块」与 `CONTEXT.md`「运行时共享模块」（四个，含 ModelGateway）、`session-execution.md` Runtime 关系图（四个 shared）口径不一致。
 
@@ -78,7 +78,9 @@
 
 若认为 ModelGateway 与三个资源 Service 定位确有差异（它不产生 `for_turn` 快照对象），可保留"三个资源 Service + 一个模型网关"的表述，但必须在 architecture.md 一处写清，且 struct 字段可见性仍需修正——`pub` 字段是硬伤，与口径之争无关。
 
-### R4 · 迁移记录残留已被推翻的决议内容
+**关闭结果（2026-07-29）**：`architecture.md`已统一为四个Runtime-owned共享深模块，`MiniCoreRuntime`示例中的`prompt_service`、`tool_service`、`skill_service`、`model_gateway`和`shared_resources`均为private字段；`prompt.md`、`skills.md`和`modules/README.md`使用同一口径。外部host仍只通过MiniCoreRuntime facade交互，R3关闭。
+
+### R4 · 迁移记录残留已被推翻的决议内容（已关闭）
 
 `migration/v1-to-v2.md` 阶段 2 的 capture 依赖图仍写 `ToolTurnContext { ..., provider: model.capabilities(), execution_mode, ... }`：`execution_mode` 已被第一轮 A2 决议**移除**；完整 `ModelCapabilities` 传参已被非阻塞项决议改为 `tool_calling: ToolCallingCapabilities`。`turn-execution-context.md` 与 `workspace.md` 的同一张图是正确版本。
 
@@ -93,7 +95,9 @@
 
 理由：迁移记录是排期文档，不是技术规范；其中的技术图副本没有独立价值，只有漂移风险（本次 `execution_mode` / `provider: model.capabilities()` 残留即为实证）。这也是 R6 原则的第一个落地样例。若坚持保留内联图，则最低限度修正两处：删除 `execution_mode`，`provider: model.capabilities()` 改为 `tool_calling: model.capabilities().tool_calling`。
 
-### R5 · CONTEXT.md 混入未标注的 V1 条目
+**关闭结果（2026-07-29）**：`migration/v1-to-v2.md`已删除capture依赖图副本，改为链接`turn-execution-context.md#capture-依赖图`，只保留排期所需摘要；`execution_mode`和完整`ModelCapabilities`旧传参不再出现，R4关闭。
+
+### R5 · CONTEXT.md 混入未标注的 V1 条目（已关闭）
 
 「资源快照」「资源摘要」「提示词素材」三个条目仍以现行语气描述 `ResourceManager` 的四层 snapshot，而其上方「运行时资源（pre-refactor aggregate term）」已声明目标架构删除 ResourceManager。三条既无 pre-refactor 标注又与 V2 冲突；CONTEXT.md 是每个会话加载的术语表，误导成本高。
 
@@ -108,48 +112,55 @@
 
 不推荐"保留三条 + 加 pre-refactor 标注"的做法：这三条描述的四层 snapshot 结构在 V2 中没有一一对应物，保留详细旧结构描述只会持续占据术语表篇幅并诱导错误联想；术语演变说明由「运行时资源」一条承担即可。删除后全文检索确认无其他文档引用这三个词条名。
 
-### R6 · 不变量复述是最大的结构性负债
+**关闭结果（2026-07-29）**：`CONTEXT.md`已删除“资源快照”“资源摘要”“提示词素材”三个独立现行条目，并在“运行时资源（pre-refactor aggregate term）”中统一说明其废除后的V2归属，R5关闭。
 
-同一不变量普遍在4–6篇文档全文复写（OutcomeUnknown保守终结5处；WaitingForUserInput语义5处；Steer消费时机4处；当时的Workspace commit/revoke竞态3处）。`modules/README.md`的权威归属表方向正确，但同步机制是“重写 + 人肉对齐”：E3/D1各需同步8+文件，R4即漏网实例。只有`compaction.md`使用了可引用的不变量ID（COMP-001..020）。ADR 0121随后删除了Workspace commit/revoke不变量，恰好证明重复复述的同步成本。
+### R6 · 跨文档不变量复述造成一致性负债（已关闭）
 
-- 出处：全仓横切。
+R6关注的不是“相同概念在多篇文档出现”，而是**同一规范性规则在多个可独立编辑的位置保留完整副本**。每个副本都像权威定义，ADR修改其中一份后，其他副本仍可能继续描述旧接口、旧状态或旧错误语义。`modules/README.md`已经给出module权威归属，`architecture.md`也定义了文档权威顺序，但当前仍主要依靠全文搜索和人工判断完成同步。
 
-**修复方案（半天量级的一次性结构改造）**：
+**发生场景**：
 
-**1) 建立全局不变量清单**。在 `architecture.md` 新增「跨模块不变量索引」一节（或独立 `docs/invariants.md`，推荐前者——architecture.md 本来就是总入口），编号按域分段预留空间：
+1. **跨模块ADR改变同一规则**：ADR 0124同时改变Session replay、Tool exchange、Compaction、Fork与AgentLoop输入，曾需要同步三十余篇文档；复核时仍发现ADR 0117残留durable `ToolExecutionStarted`措辞。实现者若只阅读该段，会重新引入已删除的durable marker。
+2. **删除一个横切机制**：ADR 0125删除ModelGateway四级permit，需要同步ModelGateway call flow、SessionExecutor并发说明、同步ADR、评审状态、handoff和历史refactor副本；第一次扫描后仍发现`generate_model_turn`会等待provider并发permit的残留描述。该残留会让实现者误建`concurrency.rs`或把共享Gateway错误串行化。
+3. **协议或状态机字段冻结**：wire/schema freeze将同时影响ConversationStorage、Runtime Interface、Turn/Item/Interaction、migration示例和测试合同。若多个文档各自保存完整serde/ID规则，未来字段改名或casing变化可能只更新storage而漏掉公开协议。
+4. **安全规则升级**：R7/O1关闭时，sandbox enforceability、Tool authorization、ToolStartPermit、PreExecution ToolResult和Runtime UI view会跨Tools、Workspace、Session Execution及Runtime Interface出现。任一旧副本仍写“approval后可执行”都会形成fail-open误导。
+5. **跨机器或AI辅助恢复**：handoff、review、migration和module文档可能被不同工程师或agent作为入口。非权威副本若包含完整且过期的规则，读者可能在尚未进入权威module前就形成错误实现方案。
 
-```text
-INV-0xx  存储与 append/apply（权威：conversation-storage.md）
-INV-1xx  Turn 执行与恢复（权威：session-execution.md / turn-execution-context.md）
-INV-2xx  资源 pin 与 reload（权威：prompt/tools/skills/workspace.md）
-INV-3xx  协议与观察（权威：runtime-interface.md）
-INV-4xx  安全与授权（权威：workspace.md / tools.md）
-```
+**可能结果**：
 
-**2) 首批候选条目**（即当前复述最多、漂移风险最高的）：
+- 两个module按不同状态名、字段或错误语义实现，直到vertical slice集成时才暴露；
+- 测试依据旧副本通过，但权威interface要求不同，形成“测试证明了错误合同”；
+- 已关闭issue因旧措辞再次被评审提出，重复消耗设计时间；
+- 安全或replay规则只部分更新，产生fail-open、history brick或模型输入污染风险；
+- 每个ADR都需要大范围人工同步，文档越多，漏改概率越高。
 
-| 编号（建议） | 不变量 | 当前复述处数 |
-| --- | --- | --- |
-| INV-001 | live entry strict append/apply之后才可通知或进入模型；Tool side-effect start使用owner-local permit，不依赖durable marker | 5+ |
-| INV-002 | SessionWrite OutcomeUnknown → poison writer + 保守终结，不 in-run 重试；cold replay按实际文件tolerant恢复 | 5 |
-| INV-003 | 含ToolCall的assistant只有在全部matching ToolResult存在时才以complete exchange进入model conversation | 4+ |
-| INV-101 | WaitingApproval / WaitingForUserInput 期间 TurnStatus 与 SessionExecutionState 保持 Running | 5 |
-| INV-102 | Steer 只在完整 assistant/tool step 后、下一次 Model 前 FIFO 消费一条，append 后才 model-visible | 4 |
-| INV-103 | recovery不重放outcome-unknown Tool、不生成synthetic ToolResult；incomplete exchange隔离 | 4 |
-| INV-201 | active Turn不读取Prompt/Tool/Skill/Workspace/Model的future current value；Skill lazy load只解析captured bytes，无弱一致例外 | 4 |
-| INV-202 | Workspace definition只在Session Idle更新；SecurityRevoked中断active Turn并在terminal后重新resolve | 4 |
-| INV-301 | Interaction request append-before-notify、resolution append-before-resume/side-effect | 4 |
-| INV-302 | 用户沉默/断线/无 subscriber 保持 Pending，不产生默认 Deny 或超时 resolution | 4 |
-| INV-401 | Cancel/SecurityRevoked与Model/final append及owner-local ToolStartPermit first-wins；Running Tooltruthful settle | 3 |
-| INV-402 | WorkspaceAccessView 是文件权限硬上限，per-call approval只能收紧 | 3 |
+**影响边界与优先级**：
 
-**3) 替换规则**：每条不变量的**权威文档保留完整定义并标注编号**；其余文档的复述段替换为「见 INV-xxx」+ 至多一句话概述。CONTEXT.md 术语表条目视为概述层，同样只引用编号。compaction.md 的 COMP-001..020 保留原编号不迁移（域内清单与全局清单并存，全局清单只收跨模块条目）。
+- R6本身不会直接产生运行时错误，风险通过后续实现或维护读取错误合同间接发生；
+- 当前权威顺序、ADR supersession说明和机械全文扫描已经降低风险，因此R6不阻塞AgentLoop L2、wire/schema freeze、Rig spike或ScriptedProviderAdapter vertical slice；
+- 开始多人并行实现、production Tool/Sandbox adapter或继续新增大量横切ADR前，风险会明显上升；
+- 修复前`docs/refactor/`仍存在完整历史副本，是最明显的额外误读面；该目录现已删除。
 
-**4) 流程约束**：在 `migration/v1-to-v2.md` 的「ADR 策略」旁补一条文档纪律——新决议只允许修改权威文档与不变量清单两处；发现第三处需要改动时，说明该处是非法复述，应改为引用。
+**MVP采用的收窄修复**：
 
-**5) 验收**：改造后全文检索上表 12 条的关键短语，确认非权威文档中不再存在整段复述（一句话概述除外）。
+原方案一次建立12条全局`INV-xxx`并大批重写文档，收益存在但改动面偏大。MVP先采用更轻的规则：
 
-### R7 · C3（sandbox 无法强制时的预执行拒绝）已延后并保留条件门禁
+1. 每条跨模块规则只指定一个权威module保存完整定义；其他module、review、migration和handoff只保留一句摘要与链接。
+2. 只有同时满足“至少三个消费module、错误会影响correctness/security、预计继续演进”的规则才分配稳定`INV-xxx`；不为所有普通约束建立编号体系。
+3. 新ADR回写时执行“权威定义 → interface消费者 → review/handoff → 历史副本”的固定扫描，并用关键旧术语`rg`验证删除项无current性残留。
+4. 删除`docs/refactor/`完整副本；仍需保留的历史只进入明确archive或Git history，避免形成第三份规范。（已完成）
+
+**关闭结果（2026-07-29）**：
+
+- `architecture.md`新增8条高风险跨模块不变量索引：INV-001/002/003、INV-101/102、INV-201、INV-301、INV-401，并链接唯一canonical owner section；
+- canonical sections在ConversationStorage、Session Execution、Turn Execution Context和Turn/Item/Interaction中显式标注ID；`modules/README.md`冻结owner/link维护纪律；
+- Architecture长篇执行副本、Workspace capture依赖图、Tools durable projection算法，以及Session/Lifecycle/Runtime消费者中的相关复述已收窄为本地职责摘要与canonical链接；
+- ADR 0104/0105/0109/0111/0113/0118/0121/0123中仍像current规则的旧Tool marker、strict replay和ModelGateway capacity措辞已统一到ADR 0124/0125后的设计；
+- `docs/refactor/`完整重复目录已删除，历史继续由Git与`docs/archive/v1/`保存；
+- `migration/v1-to-v2.md`已写入横切ADR固定回写顺序与`rg`旧术语残留扫描要求；ADR 0125收口作为该流程的首个已完成验证，future wire/schema freeze按同一纪律执行；
+- handoff已同步。R6关闭，不建设覆盖所有普通约束的全局不变量数据库。
+
+### R7 · C3（sandbox 无法强制时的预执行拒绝；开放，已延后）
 
 第一轮 C3 明确"保持开放，本轮不变"，是唯一未关闭的安全类重大项。当前排期决定将其延后：Tools不在阶段6–8交付束内，当前不实现会产生真实OS/网络/进程副作用的production Sandbox adapter；但开始首个production Tool/Sandbox adapter前，仍必须把"关闭 C3"作为条件性P0门禁，避免被遗忘。
 
@@ -215,13 +226,13 @@ pub trait ToolSandbox: Send + Sync {
 ### 措辞级冲突 / 陈旧残留
 
 - ~~`turn-execution-context.md`需标注Skill lazy load弱一致例外。~~ **已由ADR 0123取代**：active Turn不读取future current value；Skill lazy load只解析shared或Workspace publication中captured bytes，不按location读取current file。
-- `refactor/README.md` 写"ADR 0100–0113"（已有 0114）；该目录标注"review 后删除"，多轮 review 已完成，建议尽快删除，消除第三份可被误引用的副本。
+- ~~`refactor/README.md`写"ADR 0100–0113"且完整目录形成第三份副本。~~ **已由R6关闭**：`docs/refactor/`已删除，历史由Git保存。
 - `compaction.md` 的 `CompactionSettingsSnapshot` 来源（Runtime config？Session 可配？）未说明，SessionDefinition 四字段中无它；建议加一句「首版为 Runtime-global config，per-session 配置留待未来（将产生新的 revision 语义）」。
 
 **推荐方案（三处均为一句话级修改）**：
 
 1. *Skill 弱一致例外标注（历史建议，已废弃）*：ADR 0123不再允许尚未lazy-load的Skill按location读取current file。shared source在Runtime initialize/`/reload`时capture，Workspace source在Session load、Idle definition update或`/reload workspace`时capture；lazy load只解析entry captured bytes。
-2. *refactor/ 目录删除*：执行 `git rm -r docs/refactor/`；删除前全仓 grep 确认无正式文档链接指向该目录（migration 的对应关系表引用的是 archive 而非 refactor，应无阻碍）；README/architecture 导航无需变更（本就未链接）。
+2. *refactor/目录删除（已完成）*：正式文档无依赖后删除`docs/refactor/`；README/architecture导航无需变更。
 3. *CompactionSettings 来源*：`compaction.md`「Context Budget」的 CompactionSettings 定义后加一句：「`CompactionSettings` 是 Runtime-global config；`CompactionSettingsSnapshot` 在 Turn admission 时从当前 Runtime config 捕获。per-session 压缩配置是未来扩展，届时须进入 `SessionDefinition` 并产生新的 revision 语义，本版不提供。」
 
 ### 复杂度观察（不要求修改，实现时警惕）
@@ -242,20 +253,20 @@ pub trait ToolSandbox: Send + Sync {
 
 ### 可实现性排序（直接开工的卡点顺序）
 
-1. R1（Submit admission 语义）——主循环第一周即触碰；
-2. 「wire/schema freeze」（serde/casing + public ID 策略 + 基础类型）——storage/protocol contract tests 的前置；ContentHash/fingerprint freeze已由ADR 0123删除；
-3. Rig 0.40.0 spike——唯一硬外部门槛；建议在迁移记录中写明「spike 允许触发 ADR 级修订」，避免"设计已冻结"话语惯性阻碍必要修改；
-4. `prompt.md` 后续问题中 Q1（PromptContent inline vs reference）与 Q4（stamp 精确字段）阻塞 CanonicalUserMessage 存储 schema，属交付束内必须闭合；其余可延后。
+1. 「wire/schema freeze」（serde/casing + public ID策略 + 基础类型）——storage/protocol contract tests的前置；ContentHash/fingerprint freeze已由ADR 0123删除；
+2. Rig 0.40.0 spike——唯一硬外部门槛；spike允许触发必要的ADR级修订；
+3. `prompt.md`后续问题中Q1（PromptContent inline vs reference）与Q4（stamp精确字段）——阻塞CanonicalUserMessage storage schema，需纳入wire/schema freeze；
+4. R7继续延后到首个production Tool/Sandbox adapter前，届时升级为条件性P0门禁。R6已关闭，future横切决议遵守既定owner/link与扫描纪律。
 
 ## 三、结论摘要
 
 | 维度 | 评价 |
 | --- | --- |
 | 核心 seam / 不变量 | 自洽且防御性强，第一轮重大问题无复发 |
-| 残留矛盾 | 3 处具体（R1 语义歧义、R3 可见性矛盾、R4/R5 陈旧残留） |
+| 已关闭具体问题 | R1 Submit admission、R2 token estimator owner、R3 Runtime字段/共享模块、R4 migration副本、R5 CONTEXT旧术语 |
 | 横切缺口 | R2 token估算owner已关闭；ContentHash/fingerprint规范化已由ADR 0123删除，public ID/serde/basic types仍需wire/schema freeze |
 | 安全开放项 | 1 个（R7 = C3，已延后；production Sandbox adapter前为条件性P0门禁） |
-| 文档结构 | 权威归属表方向对，复述式同步是负债（R6）；refactor/ 应删除 |
+| 文档结构 | R6已关闭：8条高风险INV索引 + canonical owner/link纪律；`docs/refactor/`已删除 |
 | 最大整体风险 | 零实现验证：冻结设计与 Rig 现实的首次碰撞 |
 
 ## 评审决议
@@ -264,6 +275,16 @@ pub trait ToolSandbox: Send + Sync {
 
 - **R2（token估算器owner）**：**已关闭**（2026-07-29）。估算率归ModelGateway validated model definition（`TokenEstimateRate`），经`TurnModelSnapshot::token_estimator()`分发为唯一本地估算来源；首版使用保守字节启发式，effective rate与algorithm version由`ModelDefinitionVersion`覆盖。已回写`model-gateway.md`、`compaction.md`和`prompt.md`，不使用`TurnModelFingerprint`。
 
-- **R3–R7 与全部非阻塞项**：推荐解决方案已详细写入各自章节（R3/R4/R5 机械修复清单、R6 不变量编号化改造方案与首批 12 条候选、R7 定案文本与 SandboxEnforcementCapabilities 接口、协议完备性 6 条、wire & identity freeze 决议包 6 条、措辞级 3 条、复杂度观察 4 条）。均为**方案建议待确认**状态；逐项确认后回写权威文档并在此登记关闭。
+- **R3（Runtime字段可见性与共享模块口径）**：**已关闭**（2026-07-29）。MiniCoreRuntime拥有四个private Runtime-owned共享深模块；architecture、Prompt、Skills、modules README和Runtime Interface口径一致。
+
+- **R4（migration capture图陈旧副本）**：**已关闭**（2026-07-29）。migration删除内联capture图，链接Turn Execution Context权威版本并只保留排期摘要。
+
+- **R5（CONTEXT混入V1资源术语）**：**已关闭**（2026-07-29）。三个旧条目已删除，其历史归属合并到pre-refactor aggregate term。
+
+- **R6（跨文档不变量复述）**：**已关闭**（2026-07-29）。建立8条高风险INV索引与canonical owner/link纪律，收窄非owner副本，统一旧ADR current措辞，删除`docs/refactor/`并把横切ADR扫描流程写入migration；不建设覆盖所有普通约束的全局不变量数据库。
+
+- **R7（Sandbox capability预执行拒绝）**：**开放但延后**。与第一轮C3/O1为同一问题；开始首个production Tool/Sandbox adapter前升级为条件性P0并关闭。
+
+- **非阻塞项**：ContentHash/fingerprint、Skill lazy-load例外、全局锁序、Fork nested remap与`docs/refactor/`清理已被后续ADR或R6关闭；协议完备性、wire/schema freeze、Gemini枚举、CompactionSettings来源和复杂度观察中未明确接受的建议继续开放。
 
 其余各项决议后按第一轮惯例在此登记并回写权威文档。

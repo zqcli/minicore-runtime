@@ -27,7 +27,7 @@ pi当前默认关闭provider层retry，由AgentSession对失败模型调用执�
 ## 后果
 
 - 每个AgentRun logical call最多4次Gateway invocation、因此最多4次provider request；每个CompactionSummary最多2次。preflight/cooldown可以使实际provider request更少，次数不再由两层上限相乘。
-- retry backoff由SessionExecutor timer调度，不持有ModelGateway并发permit，也不阻塞SessionIngress control loop。
+- retry backoff由SessionExecutor timer调度，不执行provider request，也不阻塞SessionIngress control loop。ADR 0125后ModelGateway不再提供模型调用并发permit。
 - Host可通过`model_retry_scheduled`观察logical retry；provider attempt本身仍只发布content delta，失败attempt不进入SessionStorage。
 - MVP面对瞬时网络故障时会经过完整operation terminal/revalidation路径，代码路径略长，但符合单Session严格串行和Transcript-First边界。
 - 禁用transparent transport fallback和401 resend会降低部分瞬时故障恢复率；有真实生产数据后可以另立ADR增加窄Gateway retry，但必须先证明不会重新引入隐藏SDK retry和次数相乘。

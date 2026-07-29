@@ -17,21 +17,21 @@ MiniCore不需要为这些问题增加priority system、queue service或attempt 
 
 1. Prompt baseline采用固定顺序：Runtime required System policy → Runtime base System Prompt → Agent System instructions → Session User instructions → Workspace User instructions → ToolPromptView metadata → SkillPromptView User metadata。Prompt role只保留System和User，完整资源与reload规则见ADR 0110。
 2. 不给PromptDefinition增加priority或replacement version。Runtime/Agent/Session PromptDefinition层按PromptKey、PromptId和稳定provenance source key排序；Workspace按model-safe relative path，Tool按ToolName，Skill按SkillId排序。filesystem/discovery/HashMap顺序不得影响结果；PromptDefinition层内重复PromptKey返回DuplicateKey并fail closed。
-3. SessionWriter append与cold replay共用一个pure `validate_and_project(base, entry)` semantic seam。append-time semantic validation必须等价于或强于replay validation；writer成功commit的entry必须可被projector语义接受。
-4. `apply_committed`只安装append前生成的trusted delta，不能对已commit entry再次产生确定性semantic rejection。writer-accepted sequence必须通过live apply与cold replay projection等价性测试。
+3. SessionWriter live append执行strict typed validation并在commit前生成storage-owned trusted delta；cold replay使用同一typed entry/projector语义，但对局部malformed、duplicate、orphan和invalid relation执行skip/isolate并返回diagnostics。完整合同见[INV-001与INV-002](../architecture.md#跨模块不变量索引)。
+4. `apply_committed`只安装append前生成的trusted delta，不能让caller提供projection delta；hot apply失败时丢弃hot projections并执行tolerant replay。
 5. 每个Session最多一个current RunningOperation。主循环同时poll该future和SessionIngress wakeup以保持响应，LifecycleControl grace deadline通过lifecycle signal推进，但旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。SessionIngress的lane划分由ADR 0111修订，不改变本条的单operation约束。
 6. execution_version表示conversation/control basis，不是retry attempt编号。logical retry复用相同version和同一个immutable `Arc<ModelCallRequest>`，但只能严格串行启动。provider端可能继续工作或计费不等于旧本地future仍可向SessionExecutor返回结果。
 7. Steer与FollowUp分别使用`SessionIngress`中的bounded per-Turn `SteerQueue`和`FollowUpQueue`；lane内部保留普通FIFO语义，不增加priority、batch drain mode或独立状态owner。仍在队列中的消息可以按CommandId remove，撤销后不重新入队。具体ingress形状由ADR 0111修订。
 8. Steer不取消Sampling、Compaction、WaitingApproval、WaitingForUserInput或ExecutingTools。当前assistant/tool step完整committed后，下一次Model调用前pop_front一条Steer并append/apply为UserMessage；等待UserQuestion时Steer只排队，不作为UserAnswer。
-9. 含ToolCall的step必须先完成assistant → truthful ToolResult → tool_round_completed，再加入Steer。无ToolCall candidate final遇到queued Steer时保存为model-visible、non-terminal Assistant Continue step；queue为空时才保存Assistant Final并terminalize Turn。
+9. 含ToolCall的step必须先commit assistant及全部matching truthful terminal results，由ConversationStorage自动形成complete exchange和`CommittedToolExchangeDelta`，随后才可消费Steer。无ToolCall candidate final遇到queued Steer时保存为model-visible、non-terminal Assistant Continue step；queue为空时才保存Assistant Final并terminalize Turn。完整规则见[INV-003与INV-102](../architecture.md#跨模块不变量索引)。
 10. FollowUp只在current Turn terminal后pop_front一条，重新capture TurnExecutionContext并开启新Turn。
 
 ## 后果
 
 - Prompt顺序不再依赖未定义priority或source发现顺序；ADR 0123后不再以PromptFingerprint作为架构术语。
-- 已commit JSONL不会因append/replay validator分叉而在冷启动时被同版本代码拒绝。
+- live writer不能产生current schema下的非法entry；cold replay遇到局部损坏时隔离对应projection并继续恢复可解释history。
 - Session控制请求保持响应，但logical Model/Tool/Compaction work严格串行，B3不需要operation_instance_id作为正确性前提。
-- Steer FIFO与tool protocol顺序固定为`assistant tool_call → truthful tool result(s) → tool_round_completed → user steer → next model`。
+- Steer FIFO与tool protocol顺序固定为`assistant tool_call → all matching truthful terminal results → complete exchange delta → user steer → next model`。
 - 为保存无ToolCall response后继续同一Turn，Assistant Intermediate允许一个无ToolCall Continue形态；它在append/apply时model-visible但不terminalize Turn。
 - 队列保持普通容器语义；未来只有出现真实容量、去重或调度需求时才提取wrapper。
 

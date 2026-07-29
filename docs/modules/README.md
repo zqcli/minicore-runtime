@@ -36,7 +36,7 @@ MiniCoreRuntime
 
 ## 相关决策
 
-长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)、[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)、[失败由事实拥有模块分类、恢复由执行拥有者决定（ADR 0120）](../adr/0120-failures-stay-with-owning-modules.md)、[Workspace Idle-only update（ADR 0121）](../adr/0121-workspace-updates-require-idle.md)、[ADR 0122（已被0123取代的Workspace fingerprint历史决策）](../adr/0122-workspace-fingerprints-are-runtime-local.md)以及[Exact Ref、不可变快照与显式Reload（ADR 0123）](../adr/0123-identity-uses-refs-and-explicit-reload.md)、[Session Replay宽容恢复并收窄持久化引用链（ADR 0124）](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)。ADR 0120首版只应用于ModelGateway response validation，不建立独立Error module。行为与接口以各模块文档、协议文档和ADR为权威。
+长期架构决策记录在[`docs/adr/`](../adr/)（0100+）：领域与ownership、Workspace ownership、Prompt/Tool/Skill边界、Turn/Item/Interaction、SessionStorage durable truth、SessionExecutor ownership、ModelGateway、Compaction、Runtime公开协议、UserQuestion的UI/Runtime职责分离、自研AgentLoop状态机（ADR 0115）、[Session-local file mutation queue（ADR 0116）](../adr/0116-file-mutations-use-session-local-queues.md)、[异步同步纪律（ADR 0117）](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)、[即时Cancel确认与FollowUp收口（ADR 0118）](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)、[模型调用使用Session逻辑重试（ADR 0119）](../adr/0119-model-calls-use-session-logical-retries.md)、[失败由事实拥有模块分类、恢复由执行拥有者决定（ADR 0120）](../adr/0120-failures-stay-with-owning-modules.md)、[Workspace Idle-only update（ADR 0121）](../adr/0121-workspace-updates-require-idle.md)、[ADR 0122（已被0123取代的Workspace fingerprint历史决策）](../adr/0122-workspace-fingerprints-are-runtime-local.md)、[Exact Ref、不可变快照与显式Reload（ADR 0123）](../adr/0123-identity-uses-refs-and-explicit-reload.md)、[Session Replay宽容恢复并收窄持久化引用链（ADR 0124）](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)以及[ModelGateway不设置本地模型调用Permit（ADR 0125）](../adr/0125-model-gateway-has-no-local-call-permits.md)。ADR 0120首版只应用于ModelGateway response validation，不建立独立Error module。行为与接口以各模块文档、协议文档和ADR为权威。
 
 ## 权威归属
 
@@ -62,5 +62,7 @@ MiniCoreRuntime
 | 压缩触发、prefix cut、summary directive、single-marker StoredCompaction | [Compaction](compaction.md) |
 
 内存 projection、cache、snapshot 和 UI read model 只能由权威事实派生，不能成为并列 source of truth。
+
+跨模块高风险规则的稳定ID和canonical section见[架构总览的跨模块不变量索引](../architecture.md#跨模块不变量索引)。维护纪律：owner module保留完整定义；interface消费者只保留本地职责所需的一句摘要与链接；review、migration和handoff只记录决议状态与导航。新ADR删除或替换横切机制时，按“canonical owner → interface消费者 → review/handoff → archive”扫描，并用旧类型/事件/字段名执行`rg`残留检查。
 
 > Prompt Templates 目前作为 Prompt 子系统的内部能力，Usage Stats 目前作为 projection helper，均不单独设立正式模块。

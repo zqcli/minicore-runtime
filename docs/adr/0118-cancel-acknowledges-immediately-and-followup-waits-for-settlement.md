@@ -27,7 +27,7 @@
 3. **Cancel立即停止逻辑推进**。signal发布后触发current operation cancellation token；Executor观察后递增`execution_version`、进入`SessionExecutionState::Finishing`、立即发布snapshot/`session_execution_changed`，不再启动新的Model、Tool、Compaction或Steer。迟到Model/Context/Compaction结果按stale result丢弃。
 4. **`Finishing`是公开的停止/收口状态**。不新增`TurnExecutionPhase::Cancelling`；当`SessionExecutionState = Finishing`时，UI必须优先显示Stopping/Finishing，current Turn phase只保留为最后工作位置的diagnostic。
 5. **Tool取消采用结构化收口**：
-   - 尚未越过`ToolExecutionStarted`：确认未执行后生成truthful Cancelled ToolResult；
+   - `ToolOperationSlot`仍为Prepared且start reservation未获胜：确认未执行后生成truthful Cancelled ToolResult；
    - write/edit：等待已提交给filesystem的I/O settle后再释放Session-local mutation permit；
    - process/shell：发送kill/cancel并等待本地process teardown；
    - remote/server Tool：发送协议支持的cancel；请求可能已提交且无法确认结果时形成`ToolAbandoned(outcome unknown)`；

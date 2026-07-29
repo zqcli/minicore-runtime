@@ -931,6 +931,8 @@ Agent current revision不参与Turn capture，因为Session已经pin exact Agent
 
 ## Active 与 Future Turn
 
+active Turn资源固定的canonical合同见[INV-201](../architecture.md#跨模块不变量索引)；本节只描述Agent/Session lifecycle mutation对candidate、active和future Turn的影响。
+
 | 操作 | candidate admission | active Turn | future Turn |
 | --- | --- | --- | --- |
 | Agent 发布新 revision | 保持 exact Session pin | 不变 | 仍使用 Session pin，直到显式升级 |
@@ -986,6 +988,8 @@ append一旦进入physical write不可被run cancellation中断。cancel/unload�
 
 ## Crash Recovery
 
+ConversationStorage的物理扫描与Tool exchange sanitizer以[INV-002和INV-003](../architecture.md#跨模块不变量索引)为准；本节只拥有Session load/readiness和unfinished Turn closure。
+
 Runtime restart：
 
 ```text
@@ -998,8 +1002,8 @@ Runtime restart：
 
 1. 读取SessionHeader和durable head并校验lifecycle；
 2. 读取current exact SessionDefinitionRevision与exact AgentRevisionRef，供future Turn使用；
-3. 顺序扫描全部newline-terminated StoredSessionEntry，跳过malformed/unknown/duplicate记录，把missing parent隔离为orphan root，并返回replay diagnostics；
-4. 从selected path重建sanitized Turn/Item/Interaction/Conversation/Usage/tree projections；
+3. 调用ConversationStorage执行INV-002 tolerant replay并取得selected path、sanitized projections与diagnostics；
+4. 保留INV-003认定的complete Tool exchange，隔离incomplete/orphan exchange；
 5. 重新resolve Workspace；
 6. 检测旧Running Turn及pending/open state；不恢复旧Tool task，complete Tool exchange保留，incomplete exchange从model conversation排除；
 7. writable recovery best-effort appendInteraction closure和TurnInterrupted；closure失败不隐藏history，但future Turn admission可以Unavailable；

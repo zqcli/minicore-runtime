@@ -476,15 +476,7 @@ ToolAbandoned：
 ToolInvocation Item → Abandoned
 ```
 
-live writer拒绝同一ToolInvocation同时出现ToolResult与ToolAbandoned。cold replay采用first valid terminal outcome wins：result先出现可参与complete exchange；Abandoned先出现会永久隔离该exchange，迟到result只产生diagnostic。
-
-同一assistant全部calls完成：
-
-```text
-complete Tool exchange → model conversation Append
-```
-
-cold replay中missing/orphan result不进入model conversation；duplicate result first valid wins并产生diagnostic。下一条合法User、Assistant、Compaction或Turn terminal关闭incomplete exchange，迟到result成为orphan。history inspector仍可展示可解析entry和diagnostic。
+ToolSet只产出typed terminal outcome，不拥有durable conflict/replay判定。ToolResult/ToolAbandoned first-terminal规则、complete exchange形成、duplicate/orphan/incomplete隔离和模型可见性全部由ConversationStorage按[INV-003](../architecture.md#跨模块不变量索引)定义；Tools module不维护第二份projection算法。
 
 ## Cancellation 与 SecurityRevoked
 

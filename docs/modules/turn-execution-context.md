@@ -133,6 +133,8 @@ impl TurnExecutionContext {
 
 ## Context Capture
 
+**Canonical cross-module invariant: INV-201.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+
 capture输入：
 
 ```text
@@ -262,6 +264,8 @@ SessionStorage是已写入history的来源；Prompt在模型调用前保证ToolC
 
 ## 逻辑模型调用
 
+每Session唯一current RunningOperation和旧结果路径关闭纪律由[INV-101](../architecture.md#跨模块不变量索引)定义。
+
 ```rust
 pub struct ModelCallRequest {
     // immutable provider-neutral request
@@ -326,6 +330,8 @@ Input committed
 
 ## Tool Execution
 
+Tool start竞态由[INV-401](../architecture.md#跨模块不变量索引)的canonical owner定义，complete exchange模型可见性由[INV-003](../architecture.md#跨模块不变量索引)定义。本节只说明TurnExecutionContext向ToolSet提供的execution-local输入。
+
 ToolSet接收：
 
 ```rust
@@ -374,7 +380,7 @@ ToolAuthorization = Ask
 
 ## Steer
 
-Steer复用current Context，不重新resolveModel/Workspace/Tools/Skills。
+Steer的唯一FIFO消费点由[INV-102](../architecture.md#跨模块不变量索引)定义。Steer复用current Context，不重新resolveModel/Workspace/Tools/Skills。
 
 ```text
 Steer enqueue(expected TurnId)
@@ -464,6 +470,8 @@ Cancel publish后立即ack。Context不再用于启动新operation。
 
 ## Failure Atomicity
 
+commit可见性、tolerant replay和complete exchange分别以[INV-001、INV-002、INV-003](../architecture.md#跨模块不变量索引)为准。本节只说明这些storage结果对active Turn context的影响。
+
 逐entry append，不提供跨entry事务：
 
 - assistant已append、部分ToolResult已append时crash，history保留可见事实；
@@ -492,6 +500,8 @@ current execution_version/checkpoint/operation/control basis
 这些一致性由ownership、private constructor和same Arc保证。durable StoredTurnStart只作历史说明，不参与restart authorization或same-Turn recovery。
 
 ## Crash Recovery
+
+cold replay合同以[INV-002](../architecture.md#跨模块不变量索引)为准；TurnExecutionContext只规定process-local execution objects全部失效。
 
 restart：
 

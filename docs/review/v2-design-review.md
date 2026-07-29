@@ -105,7 +105,7 @@ scope 与 role 正交，但类型上任意 scope 可用 `role=System`。Workspac
 **E1 · Compaction 对长 agentic Turn 是主路径失败，不是边缘（已关闭）**
 initiating UserMessage 之后全部 committed model-visible history 被 hard-protect，且 retained 必须是连续 suffix → active Turn 内所有 ToolRound 都不可摘要。大量 / 大体积 tool round（编码 agent 常态）使 protected suffix 单调增长 → `ProtectedSuffixTooLarge` → hard overflow → `TurnFailed`，且「同一 Turn 最多一次 overflow recovery」使其不可挽救；轮间 soft compaction 只能回收 pre-turn 历史，headroom 有限。
 - 影响：这是目标用例（长 agentic Turn）的主路径，而非文档定位的「单个超大 Turn 边缘情形」，决定 v1 是否必须支持 turn 内 tool-round 级压缩/分段。
-- 历史决议（active-checkpoint形状已被ADR 0124取代）：保留initiating与Steer UserMessage原文，新增`ActiveTurnCompletedPrefix` scope；每个exact UserMessage开启一个instruction segment，在完整ToolRound安全边界把该segment早期已完成work滚动为至多一个`ActiveTurnCheckpoint`。Pending/Started/incomplete ToolRound、explicit protected entries和recent exact tail不进入coverage。每个segment使用单调coverage frontier；滚动时用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance，不能把checkpoint boundary误当成原始frontier。successful compaction推进后可在单Turn有界次数内再次compact；同一source/frontier hard recovery不重复。权威决策见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)。
+- 历史决议（active-checkpoint形状已被ADR 0124取代）：保留initiating与Steer UserMessage原文，新增`ActiveTurnCompletedPrefix` scope；每个exact UserMessage开启一个instruction segment，在完整ToolRound安全边界把该segment早期已完成work滚动为至多一个`ActiveTurnCheckpoint`。Pending/Started/incomplete ToolRound、explicit protected entries和recent exact tail不进入coverage。每个segment使用单调coverage frontier；滚动时用`previous_checkpoint`指向当前effective checkpoint，并从backing compaction派生covered-through provenance，不能把checkpoint boundary误当成原始frontier。successful compaction推进后可在单Turn有界次数内再次compact；同一source/frontier hard recovery不重复。历史详情见[ADR 0112](../adr/0112-compaction-supports-active-turn-checkpoints.md)，当前权威形状见[ADR 0124](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)。
 - 出处：`compaction.md`、ADR 0112（取代ADR 0107）。
 
 **E2 · `summary_max_output_tokens` 与 pinned model `EffectiveModelLimits` 未 reconcile（已关闭）**
@@ -168,7 +168,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~多资源 Tool 无全序获取仍可跨 Session 反序死锁~~：**已由ADR 0116关闭**。MVP删除跨Session多资源锁；同Session单文件mutation使用单key FIFO，多文件/open-world Tool使同批调用整体Serial。
 - ~~某 Tool 在 execute 内部临时发起 UserQuestion（持锁后）会跨该交互持锁~~：**已随E3和ADR 0116关闭**。普通Tool在开始file mutation后不得调用`request_user_question`；若未来需要，必须另行定义不持有mutation permit的producer protocol。
 - ~~`PrepareForUnload` graceful unload 不自动 Cancel，长期Pending Interaction可能阻止卸载~~：**已随D1关闭**。LifecycleControl立即stop admission；有限grace deadline属于Unload lifecycle，到期后Cancel active Turn并以Cancelled关闭Pending Interaction。
-- 共享 ModelGateway 配额下无前台/后台公平性，大量后台 Session 可饿死交互 Session → 为交互 Session 预留配额/优先级。
+- ~~共享ModelGateway配额下无前台/后台公平性，大量后台Session可能抬高交互延迟。~~ **已由ADR 0125关闭**：删除ModelGateway全部本地模型调用permit与admission queue，多Session直接进入各自provider attempt；不建设foreground/background优先级。
 - ~~Cancel需等待越过`ToolExecutionStarted`的Tool结构化收口，command response和可观察状态绑定terminal~~：**已由ADR 0118关闭**。sticky cancel epoch发布后立即返回`CancelAccepted`并进入Finishing；FollowUp可排队，最终TurnInterrupted通过StateEvent/Snapshot观察。
 - ~~Agent status synchronization与当时的独立Workspace commit permit嵌套包裹initiating append，可能需要全局锁序~~：**已由ADR 0117关闭，ADR 0121进一步删除Workspace permit**。当前single-owner、non-blocking TurnControl reservation和release-before-fan-out使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
@@ -281,7 +281,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 | O15 | Prompt正文变化与PromptFingerprint关系未冻结 | 已关闭：ADR 0123不定义PromptFingerprint，Prompt正文由explicit reload发布的immutable content承载 | — |
 | O16 | ToolPromptView是否支持guidelines未定 | 已关闭：MVP只含ToolSpec，User metadata由Direct spec name/description确定性投影 | — |
 | O17 | committed-only约束仍被描述成运行时扫描 | 已关闭：Prompt只接收sanitized CommittedConversationView，未提交draft和incomplete exchange无法构造输入 | — |
-| O18 | Model配额只保证no-starvation，未提供交互延迟隔离 | 条件性开放 | P3 |
+| O18 | Model配额只保证no-starvation，未提供交互延迟隔离 | 已关闭：ADR 0125删除ModelGateway本地调用permit与admission queue | — |
 
 ### 安全与授权
 
@@ -340,7 +340,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 原担忧：Turn start与Agent Disable、controlled append与当时的Workspace revoke permit若反序持有多把锁并相互等待，可能形成AB/BA死锁。
 - 复核结论：每个Session只有一个Executor owner，`TurnControlGate` reservation非阻塞，Cancel/SecurityRevoked signal不等待lane/terminal，跨Agent/Session durable operation已有`Agent → Session`局部顺序，未发现可构造的现行循环等待。ADR 0121已删除第二个Workspace permit。
-- 决议：不建设Runtime-global lock hierarchy或lock-rank manager。普通Mutex/RwLock guard不得跨`.await`、跨owner调用、event publication或fan-out；有意的bounded async serialization使用typed permit/semaphore；状态变化释放gate后再通知Session；Model、Tool、approval、UserQuestion与file mutation ticket等待期间零持有短状态guard。
+- 决议：不建设Runtime-global lock hierarchy或lock-rank manager。普通Mutex/RwLock guard不得跨`.await`、跨owner调用、event publication或fan-out；有意的bounded async serialization使用typed permit/semaphore；状态变化释放gate后再通知Session；Model provider I/O、Tool、approval、UserQuestion与file mutation ticket等待期间零持有短状态guard。ADR 0125进一步删除ModelGateway模型调用permit。
 - 关闭依据：[ADR 0117](../adr/0117-async-synchronization-uses-single-owner-and-typed-permits.md)与`session-execution.md`“异步同步纪律”。保留P2 lint与竞态测试作为实现防回归，不再作为P1设计缺陷。
 
 #### O6 · Cancelling可观察状态（已关闭）
@@ -357,11 +357,12 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 同类产品依据：pi、Codex和Gemini CLI都保留同步conversation转换或字符/字节启发式估算，没有为普通文本assembly建立专用worker/offload。外层async调用链不消除同步CPU段。
 - 决议：保持当前同步`assemble_model_context()`和NeedModel调用流程，不增加`RunningOperation`、blocking pool、work budget、counter或observer。Cancel已由ADR 0118在sticky epoch发布后立即确认；短同步assembly结束后，Executor在启动Model前继续按既有emergency checkpoint处理Cancel/SecurityRevoked。未来只有真实性能数据证明assembly形成明显延迟时才重新开启该问题。
 
-#### O18 · Model配额的交互延迟隔离
+#### O18 · Model配额的交互延迟隔离（已关闭）
 
-- 发生场景：多个长流式Session占满Model permits，新的交互请求虽不会永久饿死，但first-token latency持续较高。
-- 风险：属于体验与SLO问题，不影响correctness；第一版“foreground/background进入领域模型”的建议已失效。
-- 推荐修复：有真实延迟SLO后，在Runtime policy/host admission层增加`ModelSchedulingClass`或weighted fair queue；该值不进入Turn execution identity，不改变exact model pin，也不成为Session领域状态。
+- 原发生场景：多个长流式Session占满Model permits，新的交互请求虽不会永久饿死，但first-token latency持续较高。
+- 复核结论：pi、Codex、Gemini CLI和OpenHands没有为普通模型调用建立同类global/provider/model/auth-principal多级permit。云provider配额主要按RPM/TPM与organization/project/model family计算，active stream semaphore不能准确表达；固定slot本地backend也会直接暴露busy/429等容量事实。
+- 关闭决议：[ADR 0125](../adr/0125-model-gateway-has-no-local-call-permits.md)删除ModelGateway全部本地模型调用permit、admission queue与fairness scheduler。共享Gateway保持并发安全，不用长guard包围provider I/O；多个Session可以同时进入各自provider attempt，因此当前架构不再产生permit wait造成的交互延迟隔离问题。
+- 重开条件：未来host/backend引入明确的本地admission queue，且真实first-token latency SLO和遥测证明需要交互隔离时，以新ADR重新评审；`ModelSchedulingClass`仍不进入Turn identity、SessionStorage或model request语义。
 
 ### ModelGateway协议
 

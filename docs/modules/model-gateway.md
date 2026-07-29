@@ -14,7 +14,7 @@
 - ToolSpec、tool choice、OutputContract、reasoning和attachments如何编码；
 - streaming delta、finalized response、usage、finish reason和provider metadata如何规范化；
 - 单次provider attempt与Session logical retry如何区分；
-- cancellation、authentication、secret redaction、并发配额和rate limit如何治理；
+- cancellation、authentication、secret redaction、跨Session并发调用和provider rate limit反馈如何治理；
 - provider prompt cache、connection reuse和continuation如何保持Transcript-First等价性；
 - Rig 0.40.0可以为provider协议映射与单次attempt调用复用哪些能力，以及这些能力如何被限制在private `ProviderAdapter`内。
 
@@ -38,12 +38,14 @@
 - [ADR 0106：ModelGateway使用一个深异步调用interface](../adr/0106-model-gateway-is-single-deep-operation.md)
 - [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](../adr/0120-failures-stay-with-owning-modules.md)
+- [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
 
 ## 决策摘要
 
 已经确定：
 
 - `MiniCoreRuntime`拥有一个共享`Arc<ModelGateway>`；
+- 共享Gateway支持多个Session直接并发调用，不设置Runtime global、provider route、model或auth-principal调用permit；
 - ModelGateway不保存current Session、current Turn或UI selected model；
 - `ModelGateway::resolve_for_turn(...)`在Turn capture期间返回`Arc<TurnModelSnapshot>`；
 - `ModelGateway::generate_model_turn(...)`是唯一真实模型调用interface；
@@ -262,7 +264,7 @@ PreparedModelTurn::execute(progress, cancel) -> Result<...>
 - caller必须理解prepared value何时过期；
 - auth、provider config和capability在prepare还是execute时解析会产生双重时序；
 - dropped prepared value引入无业务价值的lifecycle；
-- concurrency permit和continuation不能安全地在prepare阶段预留；
+- credential、connection和continuation runtime state不能安全地在prepare阶段预留；
 - 删除PreparedModelTurn并把private plan放回generate内部不会损失能力。
 
 结论：不作为外部interface。可以作为ModelGateway private implementation structure。
@@ -297,7 +299,6 @@ MiniCoreRuntime
 └─ Arc<ModelGateway>
    ├─ ProviderCatalog
    ├─ AuthStore
-   ├─ ModelConcurrencyController
    ├─ private ProviderAdapter
    ├─ ProviderConnectionPool
    ├─ ContinuationCache
@@ -361,7 +362,7 @@ impl ModelGateway {
 
 `initialize()`构建并返回第一个immutable catalog root。`build_reload_candidate()`准备并validate新catalog但不发布。ModelGateway不保存current catalog pointer，也没有publish方法；Runtime把candidate放入完整`SharedResourceRoots`后一次publication。`resolve_for_turn`只访问Turn admission已捕获的catalog Arc，不读取credential，也不在capture期间隐式执行remote I/O。
 
-`generate_model_turn`最多执行一个完整provider attempt。admitted调用期间可以等待provider并发permit、request前credential resolve/refresh和stream，但它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。provider terminal error返回SessionExecutor后，本次Gateway operation结束；Gateway不内联retry timer。
+`generate_model_turn`最多执行一个完整provider attempt。调用期间可以等待request前credential resolve/refresh和stream，但不经过Gateway本地模型调用permit；它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。provider terminal error返回SessionExecutor后，本次Gateway operation结束；Gateway不内联retry timer。
 
 不提供：
 
@@ -1083,7 +1084,7 @@ validate request
 → resolve/refresh credential before request
 → preflight/cooldown typed terminal error：0次ProviderAdapter.execute
   或
-→ acquire permits → ProviderAdapter.execute exactly once
+→ ProviderAdapter.execute exactly once
 → normalize one terminal result or typed error
 ```
 
@@ -1108,15 +1109,13 @@ HTTP status或“尚无delta”本身不能决定delivery state。adapter必须�
 每次attempt：
 
 1. 检查cancellation；
-2. resolve current credential和opaque auth principal identity，不持有model concurrency permit；
-3. 等待global/provider/model/auth-principal concurrency permits；
-4. build provider payload；
-5. start provider request并更新delivery state；
-6. consume stream；
-7. normalize terminal result；
-8. release permits。
+2. resolve current credential和opaque auth principal identity；
+3. build provider payload；
+4. start provider request并更新delivery state；
+5. consume stream；
+6. normalize terminal result。
 
-request前credential resolve/refresh不持有model concurrency permit。provider返回401时释放permit并terminal为`AuthRejected`，不在本次Gateway operation中refresh-and-resend。
+request前credential可以resolve/refresh。provider返回401时terminal为`AuthRejected`，不在本次Gateway operation中refresh-and-resend。
 
 ### Semantic Delta Rule
 
@@ -1462,26 +1461,19 @@ new full logical input可证明为previous full input + previous finalized respo
 
 ContinuationCache不是durable truth，不进入TurnExecutionContext，不通过SessionStorage恢复。
 
-## Concurrency And Rate Governance
+## Concurrent Calls And Rate Governance
 
-ModelGateway提供：
-
-```text
-global model-call limit
-per-provider route limit
-per-model limit
-optional per-auth-principal limit
-```
+ModelGateway不提供Runtime global、per-provider route、per-model或per-auth-principal模型调用permit，也不建立本地admission queue或公平调度器。该决策由[ADR 0125](../adr/0125-model-gateway-has-no-local-call-permits.md)冻结。
 
 要求：
 
-- permit wait cancellation-aware；
-- fairness至少保证FIFO admission或等价无饥饿策略；
-- streaming request持有permit到terminal/cancel；
-- request前auth refresh有独立singleflight，不占用全部model permits；
+- 共享`Arc<ModelGateway>`支持多个Session并发执行独立provider attempt；
+- 不用Gateway-wide mutex或其他长guard包围credential resolution、provider request或stream读取；
+- 每个Session最多一个current model `RunningOperation`由SessionExecutor保证，不形成跨Session容量限制；
+- request前auth refresh只对同一credential执行singleflight，不阻塞无关credential的调用；
 - provider cooldown只对对应route/principal fast-fail，不在Gateway内等待；
-- 一个Session不能耗尽全部Runtime capacity；
-- limits是Runtime policy，不进入ModelCallPurpose或conversation truth；
+- provider `RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由SessionExecutor裁决logical retry；
+- Provider SDK/HTTP connection pool的transport资源管理是private implementation detail，不成为MiniCore admission policy；
 - progress publisher阻塞不能占用provider stream读取。
 
 ## Complete Call Flow
@@ -1503,7 +1495,6 @@ AgentLoop NeedModel
    → choose exact provider adapter and route
    → resolve credential and opaque auth principal
    → encode full AssembledModelContext
-   → wait global/provider/model/auth-principal concurrency permits
    → optional cache/continuation optimization with equivalence proof
    → provider stream
    → publish ModelProgressEvent to operation-local adapter
@@ -1609,7 +1600,7 @@ Provider response ID和reasoning opaque artifact必须有长度限制和redactio
 - `resolve_for_turn`只做local catalog lookup和validation；
 - full context encoding与provider I/O在RunningOperation执行；
 - connection pool和HTTP client跨Session共享；
-- provider/model concurrency有界；
+- 多个Session可并发执行provider request，不经过Gateway本地admission queue；
 - progress delta可以合并；
 - provider stream reader不等待slow observer；
 - request前auth refresh singleflight；
@@ -1734,8 +1725,6 @@ opaque encrypted reasoning
 
 ### Cancellation
 
-- cancel before permit；
-- cancel during permit wait；
 - cancel during auth resolve/request前refresh；
 - cancel before request start；
 - cancel during stream；
@@ -1789,14 +1778,14 @@ opaque encrypted reasoning
 
 ### Multi-Session And Performance
 
-- global/provider/model limits；
-- fairness/no starvation；
+- shared ModelGateway并发执行多个Session的provider request；
+- 不存在Gateway-local model permit wait或admission fairness语义；
 - one Session cancellation不影响另一个；
 - one provider cooldown只fast-fail对应route/principal，不影响另一个；
 - slow progress observer不阻塞stream；
 - connection pool按endpoint/auth principal隔离；
-- slow credential resolution/request前auth refresh不持有或耗尽model permits；
-- per-auth-principal permit在opaque principal解析后获取。
+- slow credential resolution/request前auth refresh不持有Gateway-wide长guard；
+- 两个Session同时调用同一provider/model时都可以进入各自attempt。
 
 ### Real Adapter Integration
 
@@ -1822,7 +1811,6 @@ src/model_gateway/response.rs
 src/model_gateway/error.rs
 src/model_gateway/catalog.rs
 src/model_gateway/auth.rs
-src/model_gateway/concurrency.rs
 src/model_gateway/cache.rs
 src/model_gateway/continuation.rs
 src/model_gateway/redaction.rs
@@ -1889,7 +1877,7 @@ src/model_gateway/provider/scripted.rs
 - [x] 禁止active Turn cross-model fallback。
 - [x] 定义cancellation、auth、redaction和custom provider规则。
 - [x] 定义cache、connection reuse和continuation等价性规则。
-- [x] 定义multi-session concurrency和rate governance。
+- [x] 定义multi-session直接并发和provider rate-limit governance（ADR 0125）。
 - [x] 定义persistence、recovery、performance和test matrix。
 - [ ] 实现ScriptedProviderAdapter并通过阶段6–8 ordinary/compaction vertical slices。
 - [ ] 尽早执行Rig 0.40.0 ModelGateway integration spike，在production adapter冻结前完成。

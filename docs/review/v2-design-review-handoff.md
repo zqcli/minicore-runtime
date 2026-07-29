@@ -41,13 +41,15 @@ git show --stat HEAD
 6. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
 7. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
 8. [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
-9. [架构总览](../architecture.md)
+9. [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
+10. [架构总览](../architecture.md)
 
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 本文件所在最新`dev`提交包含ADR 0124、相关权威模块收口、R2 token estimator owner回写以及L3/L4关闭；跨机器恢复先执行`git log -1 --oneline`确认该提交；
-- 最近已接受决策：ADR 0124将SessionStorage改为live strict/cold replay tolerant，保留核心ID但删除durable ToolExecutionStarted、ToolRoundCompleted和大部分nested EntryId证明链；Compaction收窄为rolling summary + single marker；Fork保留历史ID；O3和O17关闭；R2 token estimator owner已回写并关闭；
+- 本文件所在版本包含ADR 0124 replay收口、R2 token estimator owner回写、L3/L4关闭以及ADR 0125 ModelGateway permit删除；跨机器恢复先执行`git log -1 --oneline`确认对应提交；
+- 最近已接受决策：ADR 0125删除ModelGateway的Runtime global、per-provider route、per-model与per-auth-principal调用permit；共享Gateway保持跨Session直接并发，provider 429/Retry-After与cooldown仍保留；O18关闭；
+- 第二轮评审R1–R6均已关闭；R6通过8条高风险INV索引、canonical owner/link纪律、旧ADR current措辞统一和删除`docs/refactor/`收口；R7与第一轮C3/O1是同一条件性Sandbox门禁；
 - O14/O15不再是当前进行中的未决issue；其历史调查记录已被ADR 0123的方案B式决策取代（不新增Directive/Prompt fingerprint，使用private constructor、immutable content和explicit reload）；
 - 当前恢复链上的关键提交为`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
 - 本文继续作为跨机器恢复入口。新环境先检查远端与最新log，不要reset用户改动；
@@ -128,6 +130,26 @@ e6966a0 docs: defer sandbox capability review
 - MVP不提供repair utility，O3关闭；Prompt committed-only改为by-construction，O17关闭。
 
 ADR 0124部分取代ADR 0104/0109/0111/0113/0115/0117/0118/0121/0123，并完全取代ADR 0112的active-Turn checkpoint形状。旧ADR正文保留历史脉络，状态和顶部修订说明指向0124。
+
+## ADR 0125收口
+
+本轮新增[ADR 0125](../adr/0125-model-gateway-has-no-local-call-permits.md)，删除ModelGateway本地模型调用admission：
+
+- 删除Runtime global、per-provider route、per-model和per-auth-principal四级permit，以及`ModelConcurrencyController`、FIFO/no-starvation queue和`ModelSchedulingClass`；
+- 共享`Arc<ModelGateway>`支持多个Session直接并发进入独立provider attempt，实现不得持有Gateway-wide长guard跨credential/provider I/O；
+- 每Session最多一个current model `RunningOperation`保持不变，但不形成跨Session串行；
+- provider `RateLimited`、`QuotaExceeded`、typed `Retry-After`和route/principal cooldown继续保留，由SessionExecutor按ADR 0119裁决logical retry；
+- O18因permit-wait触发前提被删除而关闭；只有未来重新引入明确admission queue并出现真实SLO证据时才重开。
+
+## 第二轮评审状态
+
+[第二轮设计评审](v2-design-review-2.md)已按当前权威文档重新登记：
+
+- R1 Submit admission、R2 token estimator owner、R3 Runtime字段/四个共享模块、R4 migration capture副本、R5 CONTEXT旧资源术语均已关闭；
+- R6已关闭：`architecture.md`索引INV-001/002/003、INV-101/102、INV-201、INV-301和INV-401，各自链接唯一canonical owner；非owner文档只保留本地职责摘要与链接；
+- `docs/refactor/`已删除；横切ADR固定按canonical owner、interface消费者、review/handoff、archive顺序回写，并以`rg`扫描被删除的旧术语；不建设覆盖所有普通约束的全局不变量数据库；
+- R7与第一轮C3/O1相同，继续延后到首个production Tool/Sandbox adapter前关闭；
+- 第二轮非阻塞项中，协议完备性、wire/schema freeze、Gemini枚举和CompactionSettings来源仍需后续决议。
 
 ## O14调查存档（历史，已由ADR 0123关闭）
 
@@ -227,6 +249,7 @@ NeedModel / ContextOverflow
 | O15 | ADR 0123：不定义PromptFingerprint；Prompt正文由explicit reload发布的immutable captured content承载 |
 | O16 | MVP不增加独立Tool guidelines；Tool User metadata从Direct ToolSpec name/description确定性投影 |
 | O17 | Prompt只接收sanitized CommittedConversationView；未提交draft/incomplete Tool exchange无法构造输入 |
+| O18 | ADR 0125：删除ModelGateway本地调用permit/admission queue；多Session直接并发进入provider attempt |
 
 ## 下一步
 
@@ -239,7 +262,7 @@ O2/O3/O13/O14/O15/O16/O17已关闭。O1保持开放但从当前工作队列移�
 4. O1条件门禁：开始首个production Tool/Sandbox adapter前重新激活并关闭Sandbox capability fail-closed
 ```
 
-第一轮评审的O项只剩`O1 O18`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O18等待真实first-token latency SLO和运行数据。O2/O3/O17均已关闭：cold load保持O(n)扫描但采用tolerant replay，不建设ProjectionSnapshot/checkpoint index或repair utility；Prompt只消费sanitized committed view。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
+第一轮评审的O项只剩`O1`。O1当前延后且不阻塞阶段6–8，但开始production Tool/Sandbox adapter时立即升级为P0门禁；O18已由ADR 0125删除permit-wait触发前提并关闭。O2/O3/O17均已关闭：cold load保持O(n)扫描但采用tolerant replay，不建设ProjectionSnapshot/checkpoint index或repair utility；Prompt只消费sanitized committed view。不要重新打开O13/O14/O15，除非新ADR提出超出MVP的durable grant、跨设备execution migration、manual/custom/plugin compaction或adversarial tamper detection需求。
 
 后续实现顺序仍是：
 
