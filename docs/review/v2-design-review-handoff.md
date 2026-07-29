@@ -9,7 +9,7 @@
 仓库尚未clone时：
 
 ```bash
-git clone https://zqcli@github.com/zqcli/minicore-runtime
+git clone https://github.com/zqcli/minicore-runtime.git
 cd minicore-runtime
 git switch dev
 git pull --ff-only origin dev
@@ -34,24 +34,26 @@ git show --stat HEAD
 随后按顺序阅读：
 
 1. [第一版设计评审与开放项跟进](v2-design-review.md)
-2. [第三版AgentLoop设计评审](v2-design-review-3.md)
-3. [Conversation与SessionStorage](../modules/conversation-storage.md)
-4. [Compaction模块](../modules/compaction.md)
-5. [Prompt模块](../modules/prompt.md)
-6. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
-7. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
-8. [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
-9. [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
-10. [架构总览](../architecture.md)
+2. [第二版设计评审与R6收口](v2-design-review-2.md)
+3. [第三版AgentLoop设计评审](v2-design-review-3.md)
+4. [架构总览与跨模块不变量索引](../architecture.md#跨模块不变量索引)
+5. [Conversation与SessionStorage](../modules/conversation-storage.md)
+6. [Compaction模块](../modules/compaction.md)
+7. [Prompt模块](../modules/prompt.md)
+8. [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
+9. [ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload](../adr/0123-identity-uses-refs-and-explicit-reload.md)
+10. [ADR 0124：Session Replay宽容恢复并收窄持久化引用链](../adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)
+11. [ADR 0125：ModelGateway不设置本地模型调用Permit](../adr/0125-model-gateway-has-no-local-call-permits.md)
 
 ## 当前仓库状态
 
 - 当前分支：`dev`；
-- 本文件所在版本包含ADR 0124 replay收口、R2 token estimator owner回写、L3/L4关闭以及ADR 0125 ModelGateway permit删除；跨机器恢复先执行`git log -1 --oneline`确认对应提交；
+- 当前设计基线提交：`af6be9a54f9ec4706ceaaf6d64500e31fa2d5ebd`（`af6be9a docs: simplify model admission and close review R6`）；本handoff存档提交位于其后，只更新恢复信息；
+- 换机后`git pull --ff-only origin dev`，预期工作树干净；先用`git log -2 --oneline`确认handoff存档提交和`af6be9a`设计基线均存在；
 - 最近已接受决策：ADR 0125删除ModelGateway的Runtime global、per-provider route、per-model与per-auth-principal调用permit；共享Gateway保持跨Session直接并发，provider 429/Retry-After与cooldown仍保留；O18关闭；
 - 第二轮评审R1–R6均已关闭；R6通过8条高风险INV索引、canonical owner/link纪律、旧ADR current措辞统一和删除`docs/refactor/`收口；R7与第一轮C3/O1是同一条件性Sandbox门禁；
 - O14/O15不再是当前进行中的未决issue；其历史调查记录已被ADR 0123的方案B式决策取代（不新增Directive/Prompt fingerprint，使用private constructor、immutable content和explicit reload）；
-- 当前恢复链上的关键提交为`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
+- 当前恢复链上的关键提交为`af6be9a`（ADR 0125 + R6关闭）、`7b42648`（ADR 0124）、`4a3fd24`（ADR 0123收敛）、`e6966a0`（O1延后）和`76148ab`（O2关闭）；
 - 本文继续作为跨机器恢复入口。新环境先检查远端与最新log，不要reset用户改动；
 - 仓库仍处于V2设计阶段，没有`Cargo.toml`、`src/`或自动化测试；
 - 下一实现里程碑仍是阶段6–8模型调用协同交付束；
@@ -61,6 +63,18 @@ git show --stat HEAD
 ## 最近进度存档
 
 ```text
+af6be9a docs: simplify model admission and close review R6
+→ ADR 0125删除ModelGateway全部本地模型调用permit/admission queue
+→ 共享Arc<ModelGateway>支持多Session直接并发provider attempt
+→ O18关闭；provider 429/Retry-After/cooldown继续保留
+→ R6建立INV-001/002/003、INV-101/102、INV-201、INV-301、INV-401 canonical owner索引后关闭
+→ 删除docs/refactor/完整重复目录，横切ADR使用owner/link + rg残留扫描纪律
+
+7b42648 docs: adopt tolerant session replay design
+→ ADR 0124采用live strict / cold replay tolerant
+→ 删除durable ToolExecutionStarted、ToolRoundCompleted和大部分proof chain
+→ complete Tool exchange按matching results自动形成，Compaction使用single marker，Fork保留历史ID
+
 4a3fd24 docs: replace fingerprints with explicit reload refs
 → ADR 0123取代ADR 0122
 → 删除当前架构中的*Fingerprint身份族
@@ -78,7 +92,7 @@ e6966a0 docs: defer sandbox capability review
 → MVP不建设ProjectionSnapshot/checkpoint index
 ```
 
-换机后不要重新调查O1/O2/O3/O17。直接从[第三版AgentLoop设计评审](v2-design-review-3.md)的L2继续；L3/L4已经按ADR 0124的新typed Tool exchange与Steer delta术语关闭。需要核对全局状态时回到本文“下一步”和“已冻结关键决策”。
+换机后不要重新调查O1/O2/O3/O17、O18或第二轮R1–R6。直接从[第三版AgentLoop设计评审](v2-design-review-3.md)的L2继续；L3/L4已经按ADR 0124的新typed Tool exchange与Steer delta术语关闭。随后执行wire/schema freeze和Rig 0.40.0 spike。需要核对全局状态时回到本文“下一步”和“已冻结关键决策”。
 
 ## 本轮完成
 
