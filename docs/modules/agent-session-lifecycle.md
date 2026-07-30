@@ -250,6 +250,7 @@ pub struct Session {
     pub id: SessionId,
     pub current_revision: SessionDefinitionRevision,
     pub lifecycle: SessionLifecycle,
+    pub fork_provenance: Option<SessionForkProvenance>,
     pub name: Option<String>,
     pub description: Option<String>,
     pub created_at: Timestamp,
@@ -684,12 +685,12 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 → 获取Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在同一synchronization内读取current AgentRevisionRef
-→ durable 写入 SessionDefinitionRevision(1)
-→ durable 发布 Session { Open, current = 1 }
+→ durable staging SessionDefinitionRevision(1) + initial SessionHeader
+→ 原子发布 Session { Open, current = 1 }及conversation storage target
 → 确认publication outcome后释放synchronization
 ```
 
-create 的 baseline 结果是 `Open + Unloaded`。create-and-load 是上层组合，不改变 create 的 durable 语义。
+create 的 baseline 结果是 `Open + Unloaded`，不创建SessionExecutor或SessionRecorder。SessionHeader staging失败时Create失败且target不进入Session catalog；create-and-load是上层组合，不改变create的durable语义。
 
 create使用预分配SessionId和外层`CommandId`。outcome unknown时必须查询已发布target，不能创建重复Session。
 
@@ -729,7 +730,7 @@ load 语义：
 → 读取 Agent durable head / AgentStatus
 → 读取 exact AgentRevisionRef 对应的 AgentDefinition
 → replay recorded conversation prefix
-→ writable recording open取得exclusive lease后只截断final unterminated partial tail
+→ writable recording open尝试取得exclusive lease；失败建立Degraded health，成功时只截断final unterminated partial tail
 → 从replayed recorded head构建sanitized live state与new Recorder health
 → WorkspaceResolver::resolve(definition.workspace)得到candidate
 → PromptService/SkillService捕获candidate授权的Workspace-bound sources
@@ -850,7 +851,7 @@ CloneAgent
 - source 为 Open 或 Archived；
 - source 不为 Deleted；
 - public boundary是genesis，或ConversationStorage定义的UserMessage/final AssistantMessage前后anchor；Compaction本身不作为MVP公开anchor，位于selected message path上的Compaction自然随path生效；
-- selected prefix可以包含non-terminal tail Turn；target live recovery以`HistoricalFork`原因关闭它并best-effort record；
+- selected path可以包含non-terminal tail Turn；target staging以`HistoricalFork`原因关闭它，closure完整写入并验证后才允许发布child；
 - stream draft不属于recorded prefix；若selected prefix含Pending Interaction、Started ToolInvocation或incomplete Tool exchange，不恢复旧waiter/Tool task，也不合成ToolResult；history仍可读，model conversation隔离不完整exchange；
 - source SessionDefinition 和 exact AgentRevision 仍可读取；
 - Agent 必须 Enabled，才能发布 Open child Session。
@@ -859,9 +860,14 @@ fork capture：
 
 ```text
 source SessionDefinition at fork linearization point
-+ recorded path或显式live snapshot
-+ lightweight source provenance
++ loaded时同一LiveSnapshot中的anchor与selected path
++ unloaded时tolerant replay得到的RecordedHistory path
++ durable SessionForkProvenance
 ```
+
+source kind由同一residency/lifecycle synchronization决定。source在该linearization point已loaded时必须使用`LiveSnapshot`，即使Recorder已经Degraded或当前entry的record attempt尚未返回；source未loaded时使用`RecordedHistory`。Unload先赢则走RecordedHistory，Fork先完成snapshot capture则后续Unload不改变该Fork。不得从loaded source静默fallback到RecordedHistory，因为这会丢失用户当前可见的unrecorded tail。
+
+LiveSnapshot在短live-state critical section内同时解析anchor并复制immutable selected path，随后释放guard再执行target staging I/O。capture前已apply的事实进入child，capture后apply的事实不进入；stream draft和process-local queue不进入。target selected path未完整materialize并通过replay validation时不发布child。
 
 child：
 
@@ -888,7 +894,7 @@ provider session
 pending Interaction / 任何process-local SessionIngress lane
 ```
 
-fork使用staging + atomic publication。复制完成后执行tolerant replay；若target live view仍有Running Turn，立即标记`TurnInterrupted(HistoricalFork)`并best-effort record，不合成ToolResult。recording失败不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
+fork使用staging + atomic publication。复制完成后执行tolerant replay；若target live view仍有Running Turn，立即标记`TurnInterrupted(HistoricalFork)`并写入staging stream，不合成ToolResult。selected path与该closure完整materialize后才能发布child；发布后的future recording failure不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
 
 Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。ID按Session scope路由，新append为EntryId及MiniCore生成的Turn/Item/Request ID使用fresh随机值避免碰撞，不执行nested remap。完整storage规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
@@ -1010,8 +1016,9 @@ conversation只保留SessionRecorder已写入的prefix
 4. 保留INV-003认定的complete Tool exchange，隔离incomplete/orphan exchange；
 5. 重新resolve Workspace；
 6. 检测旧Running Turn及pending/open state；不恢复旧Tool task，complete Tool exchange保留，incomplete exchange从model conversation排除；
-7. 在live view中把unfinished Turn标记InterruptedByRestart，并inline best-effort append recovery closure；recording失败不阻止admission；
-8. 初始化新SessionRecorder，进入Ready、WorkspaceUnavailable或带recording warning的状态。
+7. 在replayed recorded head初始化新SessionRecorder，结果为Healthy或Degraded；
+8. 在live view中把unfinished Turn标记InterruptedByRestart；是否inline best-effort record recovery closure由Q10决定，失败不阻止admission；
+9. 进入Ready、WorkspaceUnavailable或带recording warning的状态。
 
 MVP不保存或加载ProjectionSnapshot/checkpoint index；完整recorded-prefix replay的线性成本是有意取舍。Runtime内切换不同已loaded Session只路由现有SessionExecutionHandle。恢复不加载旧provider stream、ActiveTurnTask、Tool task、waiter、queue或其他process-local执行状态。
 
@@ -1136,6 +1143,7 @@ Agent release channel
 - archive/unload/delete 不使用同一个 close 语义；
 - active Turn 使用 captured exact definitions，不受 ordinary update 影响；
 - Agent disabled/deleted与CreateSession、upgrade、fork publication和initiating UserMessage append使用同一lifecycle synchronization线性化；
+- Create SessionHeader staging失败或publication前crash不发布Session catalog entry；
 - Agent disabled/deleted 阻止 future admission，但不 patch active Context；
 - Workspace definition update只在Idle；authority/host hard restriction通过SecurityRevoked中断active Turn；
 - WaitingApproval和WaitingForUserInput时Turn仍是Running；
@@ -1144,7 +1152,7 @@ Agent release channel
 - fork 不复制 loaded execution state或 authorization capability；
 - host restart后loaded state全部丢失，只能由durable definitions与recorded conversation prefix重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
-- recovery terminalization、pending Interaction closure和Started ToolInvocation closure先更新live recovery view，再best-effort record；recording失败不阻止future admission。
+- recovery terminalization、pending Interaction和Started ToolInvocation cleanup先更新live recovery view；是否record closure由Q10决定，任何attempt都在new Recorder初始化之后且不阻止future admission。
 
 ## Test Matrix
 
@@ -1189,6 +1197,9 @@ Agent release channel
 - Session definition update vs admission 捕获完整旧/新 revision；
 - entry append vs cancel/unload；
 - fork Open/Archived source，覆盖terminal boundary与mid-Turn message anchor；
+- loaded source使用同一LiveSnapshot解析anchor并复制unrecorded tail，unloaded source使用RecordedHistory；
+- Fork与Unload竞态按source residency linearization选择并保存ForkSourceKind；
+- live Fork staging失败不发布partial child；
 - fork 复制 exact AgentRevisionRef 与 definition content，但创建 child-local WorkspaceRevision(1)；
 - fork不复制Snapshot/security signal/ToolSet/PromptSet/SkillView；
 - fork staging crash不发布target；mid-Turn fork closure不恢复source执行状态；
@@ -1200,7 +1211,7 @@ Agent release channel
 - Steer expected TurnId与live final arbitration race；
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；
-- recovery best-effort terminalize Turn、关闭pending Interaction并保留已有tool message；incomplete Tool exchange从model conversation隔离；
+- recovery在live view terminalize Turn、关闭pending Interaction并保留已有tool message；incomplete Tool exchange从model conversation隔离；是否record closure由Q10覆盖；
 - 已terminal Turn遗留pending Interaction或Started Item时产生replay diagnostic，history仍可读，future admission只由definition/Workspace readiness决定；
 - current exact revision缺失时future Turn admission fail closed；historical StoredTurnStart ref缺失不阻塞history read；
 - Deleted identity 不复用；

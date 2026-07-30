@@ -188,7 +188,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 - `TurnExecutionPhase = Sampling | ExecutingTools | WaitingApproval | WaitingForUserInput | RetryBackoff | Compacting`；
 - StateEvent和Snapshot描述live state；recording Degraded或process crash时，它们可能领先可恢复的recorded prefix；Healthy状态没有后台queue lag；
 - ProgressEvent仍可合并或丢弃；
-- `SessionSnapshot.recording.state = healthy | degraded | disabled`；first `Healthy → Degraded`先由当前domain event发布Degraded Snapshot，再补发一次`session_recording_changed`；Snapshot保留当前脱敏recording diagnostic；
+- `SessionSnapshot.recording.state = healthy | degraded`；每个loaded Session都尝试记录，first `Healthy → Degraded`先由当前domain event发布Degraded Snapshot，再补发一次`session_recording_changed`；Snapshot保留当前脱敏recording diagnostic；
 - StateEvent不是durable acknowledgement。
 
 ## 跨模块不变量索引
@@ -200,6 +200,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 | INV-001 | live mutation先apply，再完成inline record attempt，随后publish final state或推进协议；record outcome不提供durable execution permit | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
+| INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
 | INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
 | INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
 | INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象 | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |

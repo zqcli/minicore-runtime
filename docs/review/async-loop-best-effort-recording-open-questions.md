@@ -31,14 +31,13 @@ inline append会延迟同Session的final StateEvent或下一protocol step，但�
 
 状态：Closed。
 
-决议：`SessionSnapshot.recording`公开object形式的`SessionRecordingView { state }`，其中state固定为`healthy | degraded | disabled`。不使用`recording_degraded: bool`，避免Healthy与显式Disabled无法区分，也避免多个boolean产生无效组合。
+决议：`SessionSnapshot.recording`继续使用object形式的`SessionRecordingView { state }`，其中state固定为`healthy | degraded`。Q7删除Disabled后不改动object结构，避免在尚无实现收益时再次重塑Snapshot schema。
 
 语义：
 
-- `Healthy`表示BestEffort已启用且当前load尚未观察到record failure，不表示flush/fsync durability；
-- `Degraded`表示期望记录但初始化、encode或append失败，当前load停止后续记录；
-- `Disabled`只表示Host显式关闭recording或ephemeral policy；
-- 同一load只允许`Healthy → Degraded`，不增加Initializing/Writing/per-entry receipt状态。
+- `Healthy`表示当前load尚未观察到record failure，不表示flush/fsync durability；
+- `Degraded`表示初始化、encode或append失败，当前load停止后续记录；
+- 同一load只允许`Healthy → Degraded`，不增加Disabled、Initializing、Writing或per-entry receipt状态。
 
 first failure先让当前domain StateEvent携带Degraded Snapshot发布，随后补发一次`session_recording_changed`；两者的完整SessionSnapshot都包含Degraded state和至少一条当前脱敏recording diagnostic。允许的公开code为`session_recording_initialization_failed | session_recording_encode_failed | session_recording_append_failed | session_recording_outcome_unknown`。raw I/O error、绝对路径、credential、完整entry和Tool output不进入公开payload。
 
@@ -73,25 +72,28 @@ Degraded → Healthy state event
 修复存储后，Host可以：
 
 - 继续当前loaded Session，接受后续内容不保存；
-- `Unload + Load`同一Session：只从recorded prefix重建，旧unrecorded live tail丢失；新loaded instance按current policy和storage结果建立Healthy/Degraded/Disabled Recorder；
-- 显式Fork到新Session；是否从live snapshot保留unrecorded tail由Q6决定。
+- `Unload + Load`同一Session：只从recorded prefix重建，旧unrecorded live tail丢失；新loaded instance重新尝试初始化Recorder并建立Healthy或Degraded；
+- 显式Fork到新Session；source已loaded时从LiveSnapshot保留snapshot capture前已apply的unrecorded tail。
 
-writable Load取得exclusive lease后，只截断replay忽略的最终未换行partial tail，再从replayed recorded head继续append。完整newline-terminated entry保留；不修改中段行，不合成missing entry，不记录gap marker。新load通过`session_loaded` Snapshot表达新health，不产生旧loaded instance的`Degraded → Healthy`transition。
+writable Load尝试取得exclusive lease；失败建立Degraded loaded Session，成功时只截断replay忽略的最终未换行partial tail，再从replayed recorded head继续append。完整newline-terminated entry保留；不修改中段行，不合成missing entry，不记录gap marker。新load通过latest SessionSnapshot表达new health，不产生旧loaded instance的`Degraded → Healthy`transition。
 
 ## Q6：Loaded Session fork的数据源
 
-候选：
+状态：Closed。
 
-- 复制当前live selected path，包括尚未record的tail；
-- 只复制recorded prefix。
+决议：source在Fork linearization point已loaded时固定使用`LiveSnapshot`，未loaded时固定使用`RecordedHistory`。loaded source不根据Recorder health或当前entry是否已经写入而fallback到RecordedHistory。
 
-初始建议：显式fork使用live snapshot并为目标Session创建新的record stream；源Session crash resume仍只得到recorded prefix。实现必须在Fork结果中报告source是`LiveSnapshot`还是`RecordedHistory`。
+LiveSnapshot在同一个短live-state critical section内解析anchor并复制immutable selected path。capture前已apply的事实会进入fork，即使对应record attempt尚未返回；capture后才apply的事实不进入。Unload先赢时使用RecordedHistory，Fork先完成snapshot capture时保持LiveSnapshot。
+
+target通过staging建立完整新record stream；selected path未全部materialize或验证失败时不发布child。`ForkSourceKind::LiveSnapshot | RecordedHistory`同时进入`SessionForked`outcome和child durable fork provenance。
 
 ## Q7：Recording策略配置
 
-待定：是否像Codex提供`save-all | none`，或像Pi通过ephemeral session模式控制。
+状态：Closed。
 
-初始建议：MVP支持默认`BestEffort`和显式`Disabled`，不提供per-entry policy。
+决议：MVP不提供recording policy、`Disabled`或ephemeral Session。Session Create必须先完成initial SessionHeader staging再发布`Open + Unloaded`，但不创建SessionRecorder；每次Load都必须尝试初始化SessionRecorder，loaded Session后续所有recordable live mutation都经过inline record attempt。
+
+初始化或写入失败进入`Degraded`并按ADR 0126继续live execution；因此“所有Session都记录”表示没有用户/Host opt-out，不表示每条entry获得fsync或durable commit保证。不保留未使用的policy enum、Create/Load字段或public disabled wire value；出现明确临时Session产品需求后再独立设计。
 
 ## Q8：Event与record attempt的微观顺序
 
@@ -115,4 +117,4 @@ record failure更新RecordingHealth并继续publication/protocol。successful wr
 
 待定：recorded unfinished Turn在load时仅投影为`InterruptedByRestart`，还是同时best-effort追加terminal entry。
 
-初始建议：先在live view中立即标记Interrupted并允许admission；随后inline attempt record closure，失败只影响future resume显示。
+已冻结前置：new Recorder必须在任何optional closure attempt之前初始化；live recovery view必须立即标记Interrupted。是否追加closure，以及attempt与Ready/admission publication的精确顺序，仍由本问题决定。

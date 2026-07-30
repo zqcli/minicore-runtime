@@ -62,7 +62,7 @@ SessionStorage
 ├─ create/open recorded file
 ├─ tolerant replay
 ├─ history tree/query
-└─ fork recorded path
+└─ stage recorded-path or live-snapshot Fork
 ```
 
 Live reducer拥有domain validation和当前进程conversation。Recorder只接受private constructors创建的immutable `StoredSessionEntry`，不重新决定Model/Tool协议。
@@ -136,15 +136,14 @@ pub enum RecordingHealth {
         failed_entry_id: Option<EntryId>,
         reason: SessionRecordingError,
     },
-    Disabled,
 }
 ```
 
-该类型是crate-private Recorder状态。Runtime公开投影固定为`SessionRecordingView { state: Healthy | Degraded | Disabled }`：
+该类型是crate-private Recorder状态。Runtime公开投影固定为`SessionRecordingView { state: Healthy | Degraded }`：
 
 - internal reason和failed EntryId不进入普通Snapshot；
 - Runtime把reason映射为allowlisted recording diagnostic code；
-- `Disabled`只由显式recording policy建立；初始化、lease、权限、磁盘、encode或write failure进入`Degraded`；
+- 每次Load都尝试初始化Recorder；初始化、lease、权限、磁盘、encode或write failure进入`Degraded`；
 - 同一loaded Session只允许`Healthy → Degraded`，Recorder不会在当前load中自动恢复Healthy；
 - Degraded后不自动probe/retry、不创建新segment、不保留或backfill unrecorded suffix；
 - Health与当前recording diagnostic通过同一次immutable Snapshot publication对host可见。
@@ -173,7 +172,7 @@ recording failure：
 - 不尝试追溯补写已经unrecorded的live gap；
 - 存储恢复后当前loaded Session仍保持Degraded，后续`record()`继续返回`NotRecorded`。
 
-Recorder没有后台queue、flush watermark或drain operation。graceful unload等待或取消ActiveTurnTask；task结束后不存在待写record tail。Host可以继续unsaved execution，或显式`Unload + Load`从recorded prefix创建新的loaded instance。loaded live fork是否保留unrecorded tail由Q6决定。
+Recorder没有后台queue、flush watermark或drain operation。graceful unload等待或取消ActiveTurnTask；task结束后不存在待写record tail。Host可以继续unsaved execution，或显式`Unload + Load`从recorded prefix创建新的loaded instance。显式Fork在source已loaded时使用LiveSnapshot，因此可以把snapshot捕获前已apply的unrecorded tail写入独立child record stream。
 
 ## SessionStorage Interface
 
@@ -185,10 +184,10 @@ pub(crate) struct SessionStorage {
 }
 
 impl SessionStorage {
-    pub async fn create(
+    pub async fn stage_create(
         &self,
-        request: CreateSession,
-    ) -> Result<OpenedSession, SessionStorageError>;
+        request: CreateSessionStorage,
+    ) -> Result<StagedSessionStorage, SessionStorageError>;
 
     pub async fn open(
         &self,
@@ -204,20 +203,31 @@ impl SessionStorage {
     pub async fn fork_recorded(
         &self,
         request: ForkRecordedSession,
-    ) -> Result<OpenedSession, SessionStorageError>;
+    ) -> Result<StagedSessionStorage, SessionStorageError>;
+
+    pub async fn fork_live(
+        &self,
+        request: ForkLiveSession,
+    ) -> Result<StagedSessionStorage, SessionStorageError>;
 }
 ```
 
 ```rust
+pub(crate) struct StagedSessionStorage {
+    // unpublished target and validated initial SessionHeader
+}
+
 pub(crate) struct OpenedSession {
     pub replay: ReplayedSession,
     pub recorder: Arc<SessionRecorder>,
 }
 ```
 
-open时lease或recorder初始化失败返回`RecordingHealth::Degraded`的loaded Session；只有显式recording policy才建立`Disabled`。history可读且Workspace/definition可用时仍允许Turn admission。
+`StagedSessionStorage`只能由Agent/Session lifecycle publication路径消费，不能被query、Load或Turn admission观察。
 
-create时header recording失败可以得到仅当前进程存在的Session identity；host必须能观察recording degradation。Recorder初始化和header append都不创建后台worker。
+`stage_create()`写入initial SessionHeader但不创建SessionRecorder；Agent/Session lifecycle只在该staging与SessionDefinition都成功后原子发布`Open + Unloaded`Session。header staging失败使Create失败，partial staging target不进入catalog。
+
+`open()`始终尝试初始化Recorder；lease或初始化失败返回`RecordingHealth::Degraded`的loaded Session。history可读且Workspace/definition可用时仍允许Turn admission。Recorder初始化和header append都不创建后台worker。
 
 不提供：
 
@@ -444,27 +454,64 @@ PromptSet可消费两者共同实现的private sanitized view interface。它们
 
 ## Fork
 
-recorded Session fork：复制selected recorded path并保留历史Entry/Turn/Item/Request/ToolCall IDs，只分配新SessionId；future entry使用fresh ID。
+**Canonical cross-module invariant: INV-004.**
 
-loaded Session显式fork是否包含尚未record的live tail见[开放问题Q6](../review/async-loop-best-effort-recording-open-questions.md#q6loaded-session-fork的数据源)。初始建议从immutable live snapshot创建目标Session的新record stream，并在结果中标记source kind。
+Fork使用[Runtime Interface](runtime-interface.md#forkanchor)定义的公开`ForkSourceKind::LiveSnapshot | RecordedHistory`；本节是source selection与copy语义的canonical owner。
+
+Fork source由source Session在residency/lifecycle synchronization内的状态决定：
+
+```text
+loaded at source linearization point
+→ ForkSourceKind::LiveSnapshot
+
+unloaded at source linearization point
+→ ForkSourceKind::RecordedHistory
+```
+
+loaded source始终使用LiveSnapshot，不根据Recorder是Healthy、Degraded或某条entry是否已经写入而切换到RecordedHistory。Unload先完成时按unloaded路径读取RecordedHistory；Fork先完成snapshot capture时保持LiveSnapshot，后续Unload不改变已捕获source。
+
+LiveSnapshot在一次短live-state critical section内完成：
+
+```text
+resolve public ForkAnchor
+→ capture exact selected path
+→ clone immutable recordable facts and stable IDs
+```
+
+anchor解析和selected path必须来自同一个snapshot。capture前已经apply的live mutation会被复制，即使对应`SessionRecorder.record().await`仍在执行；capture后才apply的mutation不会被复制。stream draft、ProgressEvent、pending queue value和其他未apply状态不属于snapshot。source guard必须在target staging I/O前释放。
+
+RecordedHistory从tolerant replay得到的selected recorded path复制。两种source都保留复制历史的Entry/Turn/Item/Request/ToolCall IDs，只分配新SessionId；future entry使用fresh ID。
+
+target使用staging + atomic publication建立完整新record stream。selected path未全部materialize或replay validation失败时Fork返回typed error且不发布child；这一步是Fork publication前的完整copy，不是已发布Session上的best-effort suffix recording。child后续和其他Session一样始终尝试记录。selected path包含non-terminal tail时，child按`HistoricalFork`规则追加closure后才发布。
+
+child durable provenance至少保存：
+
+```rust
+pub struct SessionForkProvenance {
+    pub source_session_id: SessionId,
+    pub source: ForkSourceKind,
+    pub anchor: ForkAnchor,
+}
+```
 
 Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object或in-flight append。
 
 ## Recovery
 
 ```text
-open file and acquire writable lease when recording is enabled
+open file and attempt writable lease
 → tolerant replay recorded prefix
 → writable open truncates only final unterminated partial tail ignored by replay
 → create LiveSessionState from replay
 → sanitize incomplete exchange
-→ mark recorded unfinished Turn InterruptedByRestart
 → initialize new inline recorder at replayed recorded head
+→ mark recorded unfinished Turn InterruptedByRestart in live recovery view
+→ optional Q10 closure attempt only after recorder initialization
 → resolve current Workspace/Agent definition
 → SessionExecutor Idle or WorkspaceUnavailable
 ```
 
-recording unavailable不阻止admission。新loaded instance根据current recording policy与open结果初始化为Healthy、Degraded或Disabled；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail。cold recovery closure可以best-effort record；失败只影响未来history。
+recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail。是否record cold recovery closure仍由Q10决定；任何optional attempt必须发生在Recorder初始化之后，且失败不能阻止admission。
 
 Tail处理只允许截断final unterminated partial line。完整newline-terminated entry即使来自先前outcome-unknown write，只要typed replay有效就必须保留；malformed中段行继续由tolerant replay隔离，不执行repair、reparent或gap marker synthesis。
 
@@ -483,6 +530,8 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 测试要求
 
+- Create的SessionHeader staging失败或publication前crash不产生catalog-visible Session；
+- Load始终尝试初始化Recorder，失败得到Degraded而不是Disabled；
 - recorder按live mutation顺序inline写出；
 - encode/write failure后停止suffix，replay保持有效完整行前缀；
 - recording failure不阻止Model/Tool/Interaction/terminal；
@@ -494,10 +543,14 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - complete/incomplete/duplicate/conflicting Tool exchange；
 - compaction marker missing/invalid；
 - fork历史ID保留和future ID无collision；
+- loaded Fork包含snapshot capture前已apply的unrecorded tail，unloaded Fork只复制RecordedHistory；
+- live mutation apply后、record attempt返回前Fork仍使用LiveSnapshot包含该mutation；
+- Fork与Unload竞态产生稳定且公开的LiveSnapshot或RecordedHistory source；
+- live Fork staging失败不发布partial child；
 - restart不恢复execution objects；
 - bounded redacted diagnostics；
 - LiveConversation与无corruption replay产生相同sanitized messages。
 
 ## 开放问题
 
-ID wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。Recording state wire由Q2关闭，Degraded recovery由Q5关闭；Recorder特有问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+ID wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。Recording state wire由Q2关闭，Degraded recovery由Q5关闭，Fork source由Q6关闭，强制记录且无Disabled policy由Q7关闭；Recorder其余问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

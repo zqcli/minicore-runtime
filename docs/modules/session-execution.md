@@ -170,7 +170,7 @@ Submit accepted by control actor
 → return SubmitAccepted { turn_id }
 ```
 
-Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded或Disabled时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
+Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
 
 capture、Workspace、Prompt composition或live validation失败时不创建Turn。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
 
@@ -438,13 +438,14 @@ recording Degraded或process crash时，Snapshot/StateEvent可能领先可恢复
 ## Recovery
 
 ```text
-open recorded Session and acquire writable lease when enabled
+open recorded Session and attempt writable lease
 → tolerant replay complete lines
 → writable Load truncates only final unterminated partial tail
 → construct LiveSessionState from recorded prefix
 → sanitize incomplete Tool exchanges
-→ mark recorded unfinished Turn InterruptedByRestart
 → initialize new inline SessionRecorder at replayed recorded head
+→ mark recorded unfinished Turn InterruptedByRestart in live recovery view
+→ optional Q10 closure attempt only after Recorder initialization
 → capture current Workspace/readiness
 → start SessionExecutor Idle or Unavailable
 ```
@@ -459,7 +460,7 @@ open recorded Session and acquire writable lease when enabled
 - retry timer；
 - old Recorder object或in-flight append。
 
-recorded recovery closure可以inline best-effort append；失败不阻止admission。同一loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始，并根据current policy/storage重新建立health；旧unrecorded live tail永久丢失。
+是否record recovery closure仍由Q10决定；本模块只冻结任何optional closure attempt必须发生在new Recorder初始化之后，且失败不能阻止admission。同一loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始并重新尝试初始化Recorder，结果为Healthy或Degraded；旧unrecorded live tail永久丢失。
 
 ## 测试要求
 
@@ -479,4 +480,4 @@ recorded recovery closure可以inline best-effort append；失败不阻止admiss
 
 ## 开放问题
 
-RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。
+RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭，所有Session强制尝试记录且无Disabled policy已由Q7关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。
