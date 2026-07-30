@@ -1,7 +1,9 @@
 # ADR 0113: UserQuestion 使用 MiniCore 交互协议与 UI 展示 Adapter
 
-状态：Partially Superseded by ADR 0124
+状态：Partially Superseded by ADRs 0124 and 0126
 日期：2026-07-25
+
+> 2026-07-30：typed Interaction、Presentation Adapter和oneshot等待保留；request/resolution改为live apply + inline best-effort append attempt，record failure不阻止notify/resume。
 
 > 2026-07-29修订：MiniCore-owned durable Interaction、UI-owned presentation和pre-execution ask-user顺序保持有效。ADR 0124删除durable `ToolExecutionStarted`和`tool_round_completed`；ask-user仍发生在owner-local Tool start permit与file mutation ticket之前，answer的ToolResult在complete Tool exchange形成后进入conversation。
 

@@ -1,7 +1,9 @@
 # ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-27
+
+> 2026-07-30：failure taxonomy与owner-local recovery保留；StateEvent和Turn progression从live state派生，Session recording failure降级health而不终止Turn。
 
 ## 背景
 

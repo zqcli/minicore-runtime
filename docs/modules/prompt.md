@@ -1,7 +1,7 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
-日期：2026-07-16
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
@@ -49,7 +49,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - PromptSet 负责 `PromptIntent → CanonicalUserMessage`；
 - PromptSet 负责每次模型调用的最终 provider-neutral context assembly；
 - PromptSet在创建时绑定这些view，assembly时不再接受任意替代view；
-- 执行中变化的模型可见事实必须先进入 committed conversation，不保留 arbitrary current-call contribution lane；
+- 执行中变化的模型可见事实必须先进入sanitized live conversation，不保留arbitrary current-call contribution lane；
 - `MessageRecord → ModelMessage` 的唯一转换发生在 Prompt 子系统；
 - 相同输入必须产生相同排序和输出；
 - PromptService 和 PromptSet 都不执行 Tool、不加载 Skill、不保存 conversation，也不调用模型。
@@ -175,7 +175,7 @@ TurnExecutionContext（process-local）
 → Arc<PromptSet>、Arc<ToolSet>、captured Arc<SkillView>、Arc<WorkspaceSnapshot>和Arc<TurnModelSnapshot>
 ```
 
-Session execution 在 candidate admission 期间创建 PromptSet，并在 admission 失败或 Turn terminal 后随 Context 释放。PromptService 不创建 Turn，也不修改 TurnStatus。完整 capture、committed-only assembly 和 AgentLoop 关系见 [Turn 执行模块与执行上下文架构设计](turn-execution-context.md)。
+Session execution在candidate admission期间创建PromptSet，并在admission失败或Turn terminal后随Context释放。PromptService不创建Turn，也不修改TurnStatus。完整capture、live conversation assembly和async loop关系见[Turn执行上下文](turn-execution-context.md)。
 
 ## PromptService
 
@@ -394,7 +394,7 @@ pub struct PromptProfile {
 }
 ```
 
-PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt baseline。`system`只包含Runtime required/base policy与Agent behavior；`user_context`包含Session、Workspace、Tool说明性metadata和Skill metadata，并在AgentRun assembly时编码为位于committed conversation之前的确定性User context。每个PromptSection自带definition provenance/source authorization；它与committed MessageRecord中的PromptContributionStamp不是同一类provenance。SkillPromptView metadata在创建PromptProfile时被稳定渲染，并由parent SkillView私有投影保证来源。
+PromptProfile保存已经按固定层级和稳定顺序解析完成的Prompt baseline。`system`只包含Runtime required/base policy与Agent behavior；`user_context`包含Session、Workspace、Tool说明性metadata和Skill metadata，并在AgentRun assembly时编码为位于sanitized live conversation之前的确定性User context。每个PromptSection自带definition provenance/source authorization；它与UserMessage中的PromptContributionStamp不是同一类provenance。SkillPromptView metadata在创建PromptProfile时被稳定渲染，并由parent SkillView私有投影保证来源。
 
 固定顺序：
 
@@ -471,7 +471,7 @@ impl PromptContributionStamp {
 }
 ```
 
-CanonicalUserMessage字段和constructor保持private，只能由PromptSet成功规范化后创建。它是可以进入conversation commit的标准值，不是裸字符串，也不是与MessageRecord并列的第二份消息状态。
+CanonicalUserMessage字段和constructor保持private，只能由PromptSet成功规范化后创建。它是可以进入live conversation并被best-effort record的标准值，不是裸字符串，也不是与MessageRecord并列的第二份消息状态。
 
 SkillIntent的完整Skill内容必须先由TurnExecutionContext使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。PromptSet不读取Skill文件，只校验contribution来源并将其规范化进MessageRecord。
 
@@ -512,7 +512,7 @@ impl CapturedWorkspacePromptSource {
 }
 ```
 
-`WorkspaceSourceRef`字段和constructor保持private，只能从`CapturedWorkspacePromptSource::source_ref()`得到。它携带exact root/source provenance、model-safe relative path和source authorization values；不能使用裸绝对`PathBuf`表达已授权Workspace contribution。`PromptContributionStamp`只能由PromptSet在规范化成功后创建，caller不能伪造“已committed provenance”。
+`WorkspaceSourceRef`字段和constructor保持private，只能从`CapturedWorkspacePromptSource::source_ref()`得到。它携带exact root/source provenance、model-safe relative path和source authorization values；不能使用裸绝对`PathBuf`表达已授权Workspace contribution。`PromptContributionStamp`只能由PromptSet在规范化成功后创建，caller不能伪造已接受的source provenance。
 
 `SkillContributionRef`携带SkillId和source authorization provenance。TurnExecutionContext负责确认entry来自本Turn捕获的SkillView，并且SkillService lazy parse只能使用entry captured bytes；PromptSet把来源provenance固化到CanonicalUserMessage，正文正确性由实际规范化后的MessageRecord内容承担。
 
@@ -526,33 +526,33 @@ Required contribution 获取失败必须显式返回 unavailable/error，不能�
 PromptContribution
 → PromptSet 输入规范化
 → User MessageRecord + PromptContributionStamp
-→ SessionWriter.append + apply_committed
-→ conversation projection接纳
-→ 后续assembly只从committed conversation重建
+→ LiveConversation typed apply
+→ await SessionRecorder.record
+→ 后续assembly只从sanitized live conversation重建
 ```
 
-Turn-static Workspace Prompt、ToolPromptView和SkillView metadata在PromptSet创建时固定，不经过每次调用的 PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与append/apply和conversation projection规则，不能恢复current-call assembly旁路。
+Turn-static Workspace Prompt、ToolPromptView和SkillView metadata在PromptSet创建时固定，不经过每次调用的PromptContribution。未来若引入动态Context provider，其输出也必须先经过同一规范化与live conversation apply规则，不能恢复current-call assembly旁路。
 
 ## 模型上下文组装
 
-每次模型调用的输入只包含 committed conversation proof 和 typed call policy：
+每次模型调用的输入只包含sanitized live conversation和typed call policy：
 
 ```rust
 pub enum PromptAssemblyInput<'a> {
     AgentRun {
-        conversation: &'a CommittedConversationView,
+        conversation: &'a LiveConversationView,
         output_contract: Option<&'a OutputContract>,
     },
     CompactionSummary {
-        source: &'a CommittedCompactionSourceView,
+        source: &'a LiveCompactionSourceView,
         directive: &'a CompactionSummaryDirective,
     },
 }
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`CommittedConversationView`只能从`CommittedConversationState::view()`获得；该State由strict live append/apply或tolerant replay生成，并已隔离orphan/incomplete Tool exchange。`CommittedCompactionSourceView`只能由同一State按single prefix cut构造，包含待摘要的连续provider-valid prefix和marker后的exact retained suffix；不接收scope、protected EntryId、previous checkpoint或coverage provenance。其checkpoint和apply规则见[Conversation与SessionStorage架构设计](conversation-storage.md)，Compaction-specific规则见[Compaction架构设计](compaction.md)。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。
+variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`LiveConversationView`只能由live conversation reducer构造，并已隔离orphan/incomplete Tool exchange；cold replay产生的sanitized view通过同一个private只读interface进入future Turn。`LiveCompactionSourceView`只能由Compaction按provider-valid prefix cut构造，包含待摘要prefix和exact retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，Compaction规则见[Compaction](compaction.md)。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和trusted committed prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和sanitized live prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
 planning前，SessionExecutor从同一个PromptSet取得窄的固定开销basis：
 
@@ -588,6 +588,7 @@ pub struct AssembledModelContext {
 pub(crate) struct PromptAssemblyProof {
     pub purpose: ModelCallPurpose,
     pub turn_model: TurnModelRef,
+    pub source_revision: ConversationRevision,
     pub output_contract: Option<OutputContract>,
     pub compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
 }
@@ -598,7 +599,7 @@ pub(crate) struct CompactionSummaryBudgetProof {
 }
 ```
 
-AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、exact `TurnModelRef`、OutputContract binding，以及CompactionSummary request max output与exact budget values。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
+AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、exact `TurnModelRef`、source ConversationRevision、OutputContract binding，以及CompactionSummary request max output与exact budget values。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
 `MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
 
@@ -613,9 +614,9 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 - 不存在 orphan ToolResult；
 - 不存在非法截断的 unresolved ToolCall；
 - conversation中的UserMessage没有被放到ToolCall/ToolResult exchange中间；Compaction产生的historical summary可以覆盖旧initiating/Steer原文；
-- live committed MessageRecord中的SkillContributionRef和source authorization provenance与规范化时保存的provenance一致；cold replay只保留stored provenance，不重新读取或重新授权旧source；
+- live MessageRecord中的SkillContributionRef和source authorization provenance与规范化时保存的provenance一致；cold replay只保留stored provenance，不重新读取或重新授权旧source；
 - required contribution 在输入规范化阶段缺失时失败；
-- 不存在未append/apply或尚未进入conversation projection的current-call model-visible contribution；
+- 不存在尚未进入LiveConversation的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
 - CompactionSummary directive budget与assembly proof exact structural values match，AgentRun不携带Compaction budget proof；
 - 最终大小和token estimate不超过有效模型限制；所有estimate使用PromptSet持有的`TurnModelSnapshot::token_estimator()`，不得自定义bytes/token常量。
@@ -647,7 +648,7 @@ candidate Turn admission
 → append initiating UserMessage entry
 
 每次模型调用
-→ CommittedConversationView
+→ LiveConversationView
 → PromptSet.assemble(...)
 → AssembledModelContext
 → ModelGateway
@@ -700,7 +701,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 | ToolPromptView | ToolSet 投影 |
 | SkillPromptView | SkillView 投影 |
 | LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext保证view来源和读取授权 |
-| PromptContribution → committed MessageRecord | PromptSet 输入规范化 |
+| PromptContribution → live MessageRecord | PromptSet 输入规范化 |
 | conversation | Session conversation owner |
 | CanonicalUserMessage / final context assembly | PromptSet |
 | provider payload encoding | ModelGateway |
@@ -724,7 +725,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Prompt baseline使用固定信任层顺序；层内使用stable typed keys全序，不存在caller-controlled priority；
 - 同一固定层内重复PromptKey fail closed；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
-- assembly只接受来自CommittedConversationState的sanitized full/prefix view和closed typed call policy，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
+- assembly只接受live/replayed reducer提供的sanitized full/prefix view和closed typed call policy，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和输出；
 - Prompt reload先构建candidate PromptResourceView，四个shared candidates全部成功后在Runtime publication gate内替换current root；不原地修改active PromptSet。
@@ -734,7 +735,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 1. PromptContent 是内联正文还是 immutable content reference。
 2. PromptResourceView candidate build和content cache eviction实现。
 3. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
-4. SkillIntent、UserMessageCompositionInput 与 committed contribution stamp 的精确字段。
+4. SkillIntent、UserMessageCompositionInput与recorded contribution stamp的精确字段。
 5. 未来若ToolSpec description无法表达真实per-tool使用约束，是否新增typed guidelines；MVP不支持独立guidelines字段。
 6. Historical PromptSet审计格式；MVP不用于Turn cold resume。
 7. Prompt content cache 的 key、eviction 和失效策略。

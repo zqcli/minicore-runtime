@@ -5,7 +5,7 @@
 
 ## 背景
 
-- SessionExecutor 需要一个 provider-neutral 的模型调用 seam，把 provider catalog、credential、private ProviderAdapter、stream、retry、usage、cache 等复杂性挡在 Session execution 之外；首个production ProviderAdapter使用Rig。
+- ActiveTurnTask需要一个provider-neutral模型调用seam，把provider catalog、credential、private ProviderAdapter、stream、usage和cache复杂性挡在Turn execution之外；首个production ProviderAdapter使用Rig。logical retry留在ActiveTurnTask。
 - V1 曾把这些职责拆散：ADR 0009 让 ModelGateway 只是 Rig providers 的 wrapper，ADR 0014 把 Gateway spine 与 driver 集成分阶段，ADR 0013 让 Driver 接收 `DriverTurnInput`，ADR 0026 才收敛为一个深异步 operation。这些切分制造了多个 turn-scoped lifecycle 与 provider state 泄漏点。
 - V2 需要明确：Model identity 在 Turn 内 exact 固定；模型调用只有一个真实 interface；provider variation 完全隐藏在 private adapter 内。
 - 权威设计见 [ModelGateway 架构设计](../modules/model-gateway.md)。
@@ -24,7 +24,7 @@
 
 ## 后果
 
-- caller只理解完整request、droppable progress与一个terminal result；provider attempt、connection、auth和cache locality集中在Gateway内，SessionExecutor只理解typed terminal error与logical retry policy。
+- caller只理解完整request、droppable progress与一个terminal result；provider attempt、connection、auth和cache locality集中在Gateway内，ActiveTurnTask只理解typed terminal error与logical retry policy。
 - 删除 Gateway 会把 provider 复杂性重新散落到 caller，满足 deep module deletion test。
 - 不引入`ModelStep`、`ModelAttempt`领域entity、provider session public object、共享`ModelCallBudget`或第二conversation state。
 - Gateway内部较深，需要private planner/adapter/connection seam辅助测试；progress publisher必须明确non-authoritative、process-local语义。

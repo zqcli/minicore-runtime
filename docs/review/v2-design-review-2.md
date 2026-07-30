@@ -3,7 +3,9 @@
 状态：设计评审记录（发现待决议）
 日期：2026-07-26
 范围：`docs/architecture.md` + `CONTEXT.md` + `docs/modules/`（13 篇）+ `docs/adr/`（0100–0114）+ `docs/migration/v1-to-v2.md` + 当时仍存在的`docs/refactor/`
-方式：在[第一轮评审](v2-design-review.md)全部 A–F 决议落盘后的整体复审。目标是超越第一轮已关闭项，检查残留矛盾、未分配 owner 的横切依赖、协议完备性与文档结构风险。R1–R6已关闭；R7与第一轮C3/O1是同一条件性安全门禁；非阻塞项按文中状态继续跟踪。
+方式：在[第一轮评审](v2-design-review.md)全部A–F决议落盘后的整体复审。R1–R6已关闭；R7与第一轮C3/O1是同一条件性安全门禁。
+
+> 2026-07-30：本文对SessionStorage durable truth、append/apply、single mutable owner和AgentLoop的评价属于ADR 0126之前的历史基线。当前执行/recording设计以ADR 0126和current modules为准；R6文档治理纪律与R7 Sandbox门禁继续有效。
 
 ## 总体判断
 

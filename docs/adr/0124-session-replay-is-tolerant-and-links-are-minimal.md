@@ -1,7 +1,9 @@
 # ADR 0124：Session Replay宽容恢复并收窄持久化引用链
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-29
+
+> 2026-07-30：tolerant replay、minimal durable links和Tool exchange sanitizer保留；strict `SessionWriter`、committed typed delta、append-before-model-visible和read-only writer admission由ADR 0126取代。
 
 ## 背景
 

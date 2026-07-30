@@ -1,7 +1,7 @@
 # Skill 子系统架构设计
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
-日期：2026-07-16
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
@@ -70,7 +70,7 @@ TurnExecutionContext
       └─ Arc<LoadedSkill>
          └─ SkillInjector
             └─ PromptContribution
-               └─ committed input normalization
+               └─ live input normalization
 ```
 
 ## MiniCoreRuntime
@@ -459,7 +459,7 @@ impl SkillInjection {
 }
 ```
 
-`LoadedSkill`、`SkillContent`、`SkillContributionRef`和`SkillInjection`字段/constructor保持private，只能由SkillService或SkillInjector创建。SkillInjector从`LoadedSkill`生成`SkillContributionRef`；该引用只保留SkillId和exact `SkillSourceRef`，用于committed UserMessage provenance。正文正确性由已规范化的MessageRecord实际内容承担，不使用额外派生摘要证明。
+`LoadedSkill`、`SkillContent`、`SkillContributionRef`和`SkillInjection`字段/constructor保持private，只能由SkillService或SkillInjector创建。SkillInjector从`LoadedSkill`生成`SkillContributionRef`；该引用只保留SkillId和exact `SkillSourceRef`，用于live/recorded UserMessage provenance。正文正确性由已规范化的MessageRecord实际内容承担，不使用额外派生摘要证明。
 
 职责划分：
 
@@ -475,7 +475,7 @@ SkillInjector
 
 Prompt
 → 将contribution规范化进User/Steer MessageRecord
-→ Session execution append/apply后，从committed conversation组装模型输入
+→ ActiveTurnTask apply到LiveConversation后，从sanitized live conversation组装模型输入
 ```
 
 `SkillInjector`不执行discovery、view filtering、文件读取、cache lookup或Skill选择。
@@ -501,14 +501,14 @@ Turn admission
 → cache hit，或从captured bytes解析并缓存完整内容
 → SkillInjector.build(loaded_skill)
 → PromptSet.compose_user_message(...)
-→ committed UserMessage / Steer
+→ live UserMessage / Steer + record attempt
 
 模型触发的 Skill Tool
-→ append truthful tool message
+→ apply truthful tool message live + record attempt
 → 同一assistant全部matching ToolResult存在时形成complete exchange
 
 下一次模型调用
-→ 只从sanitized committed conversation组装
+→ 只从sanitized LiveConversationView组装
 ```
 
 渐进披露阶段：
@@ -538,7 +538,7 @@ Workspace Skill source不由shared `/reload`读取。Session load、Idle Workspa
 
 - shared reload失败时继续保留旧SkillResourceView；Workspace candidate失败按initial load、definition update、Ready reload或Unavailable retry的对应Session lifecycle规则处理；
 - reload不修改已经返回的`Arc<LoadedSkill>`；
-- 已经生成并固化到committed MessageRecord的contribution stamp不被回写；
+- 已经生成并固化到live/recorded MessageRecord的contribution stamp不被回写；
 - active Turn继续使用捕获的旧SkillView；
 - 尚未加载的entry只解析捕获view中的immutable bytes，不能看到reload之后但未发布的文件当前内容；
 - shared source删除后，必须等显式`/reload`成功，future view才不再披露该Skill；Workspace source删除后必须等`/reload workspace`、Idle definition update或下一次Session load成功。旧view、captured bytes和已有不可变引用按持有者生命周期释放。
@@ -577,7 +577,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 | 某次执行选择哪个Skill | Turn execution |
 | entry来源和读取授权校验 | TurnExecutionContext + SkillService |
 | Skill 到 Prompt contribution 的转换 | SkillInjector |
-| contribution 到 committed MessageRecord | PromptSet 输入规范化 |
+| contribution到live MessageRecord | PromptSet输入规范化 |
 | 最终模型上下文组装 | PromptSet |
 
 ## 基础不变量
@@ -593,7 +593,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - SkillInjector不能决定选择哪个Skill；
 - SkillContributionRef把SkillId和exact source authorization/provenance贯穿到Prompt contribution；
 - Prompt 不能执行 Skill discovery 或 load；
-- 用户侧SkillInjection必须进入append/applied UserMessage或Steer；模型触发的Skill Tool输出进入role=tool message，并在同一assistant的全部ToolCall拥有matching result后随complete exchange进入conversation，不能作为current-call旁路；
+- 用户侧SkillInjection必须进入live UserMessage或Steer并完成inline record attempt；模型触发的Skill Tool输出进入live role=tool message，并在同一assistant全部ToolCall拥有matching result后随complete exchange进入conversation，不能作为current-call旁路；
 - SkillService 不决定哪个 Turn 使用哪个 Skill；
 - cache和load state不进入领域对象；
 - source变化只标记dirty；shared current root只在显式`/reload`成功后替换，Workspace captured sources只在Session-local candidate publication后替换；
@@ -606,7 +606,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 3. SkillScope 的精确定义。
 4. SkillName 冲突、namespace 和稳定排序规则。
 5. Skill invocation 如何触发，以及是否形成 Item。
-6. SkillInjection、UserMessageCompositionInput 和 committed contribution stamp 的最终格式。
+6. SkillInjection、UserMessageCompositionInput和recorded contribution stamp的最终格式。
 7. source watcher的dirty notification和debounce行为。
 8. cache容量、eviction和失败重试策略。
 9. SkillService 初始化失败对 Runtime 启动的影响。

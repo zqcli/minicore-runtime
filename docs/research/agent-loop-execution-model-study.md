@@ -1,15 +1,15 @@
 # AgentLoop执行模型跨项目研究
 
 日期：2026-07-30
-状态：研究归档（非Accepted ADR）
-关联：[第三轮AgentLoop设计评审](../review/v2-design-review-3.md) L2
+状态：研究归档；后续决策已由ADR 0126接受方案C
+关联：[第三轮AgentLoop设计评审](../review/v2-design-review-3.md)、[ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
 目的：评估MiniCore同步sans-I/O AgentLoop在ADR 0124简化durable机制后的合理性，并比较Pi、Codex、OpenCode、Gemini CLI和OpenHands的实际实现。
 
 ## 0. 权威边界
 
-当前正式架构仍以[`docs/architecture.md`](../architecture.md)、[`docs/modules/`](../modules/README.md)和Accepted ADR为权威。本文只归档源码事实、设计分析和推荐，不关闭L2，也不修改当前`next_action() + accept_*()`合同。
+当前正式架构仍以[`docs/architecture.md`](../architecture.md)、[`docs/modules/`](../modules/README.md)和Accepted ADR为权威。本文正文保留决策前的源码事实、分析和当时推荐。
 
-当前正式设计：
+下列“当前正式设计”是研究发生时的历史基线，已被ADR 0126取代：
 
 ```text
 SessionExecutor async owner
@@ -576,3 +576,26 @@ ADR 0119：要求current_operation仍为对应retry slot
 - committed typed delta提供Tool exactly-once；
 - AgentLoop需要成为public trait、插件或稳定扩展seam；
 - 当前研究已经关闭L2。
+
+## 23. 后续Accepted决策
+
+2026-07-30用户明确选择参考Codex/Pi的async loop，并同时放弃SessionWriter commit barrier。ADR 0126接受方案C，但采用Codex式control actor + ActiveTurnTask，不采用Pi式单task直接拥有全部Session control。
+
+```text
+SessionExecutor control actor
+└─ one ActiveTurnTask async loop
+
+LiveSessionState = current-process truth
+SessionRecorder = ordered best-effort recorded prefix
+```
+
+因此：
+
+- L2关闭；
+- `next_action()`、issued marker和整个同步AgentLoop删除；
+- logical retry wait变为ActiveTurnTask cancellation-aware sleep；
+- committed Tool/Steer delta接口删除；
+- complete Tool exchange门禁移动到LiveConversation reducer；
+- physical persistence不再是StateEvent、waiter resume或next Model的门禁。
+
+本节只记录后续决策导航；完整规则以ADR 0126和current modules为准。

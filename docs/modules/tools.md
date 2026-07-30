@@ -1,7 +1,7 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构（ADR 0124后，生产实现待启动）
-日期：2026-07-29
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
@@ -9,7 +9,7 @@
 
 ADR 0124后的关键变化：
 
-- Tool side-effect start由SessionExecutor current-Runtime状态管理；
+- Tool side-effect start由ActiveTurnTask current-Runtime状态管理；
 - Session ledger不保存`ToolExecutionStarted`；
 - ToolResult不引用execution-start entry；
 - Session ledger不保存`ToolRoundCompleted`；
@@ -39,9 +39,9 @@ ToolSet只服务一个Turn。shared resource reload不改变active ToolSet；fut
 - Tool execution outcome为Completed(exact ToolResult)或Abandoned；
 - pre-execution deny/failure产生truthful ToolResult；
 - side-effect start不持久化；
-- SessionExecutor owner-local start reservation与EmergencyControl排序；
-- ToolResult append后更新Item；同一assistant所有calls有matching result后exchange自动进入conversation；
-- ToolSet不直接写SessionStorage或推进AgentLoop；
+- ActiveTurnTask owner-local start reservation与EmergencyControl排序；
+- ToolResult live apply后更新Item；同一assistant所有calls有matching result后exchange自动进入conversation；
+- ToolSet不直接修改LiveSessionState、写SessionRecorder或开始下一次Model；
 - 每loaded Session拥有独立file mutation queue；
 - 同Session同canonical file key FIFO，不同key可并发；
 - 多文件/open-world/Serial Tool使batch按call order串行；
@@ -103,7 +103,7 @@ impl ToolSet {
 }
 ```
 
-ToolService/ToolSet不暴露generic registry mutation、raw executor、SessionWriter或Workspace absolute path。
+ToolService/ToolSet不暴露generic registry mutation、raw executor、SessionRecorder或Workspace absolute path。
 
 ## Tool 注册
 
@@ -223,7 +223,7 @@ pub struct ToolResult {
 ```text
 execution_started_entry_id
 ToolRoundId
-SessionWriter receipt
+Session recording receipt
 provider-visible message wrapper
 ```
 
@@ -241,7 +241,7 @@ pub struct ToolTurnContext {
 }
 ```
 
-private execution_control只能由Session execution注入。
+private execution_control只能由ActiveTurnTask注入。
 
 `for_turn`：
 
@@ -293,7 +293,7 @@ Hook规则：
 - rewrite后重新schema/policy/requirements验证；
 - PreToolUse failure默认deny/fail closed；
 - PostToolUse可以redact/normalize result，不能把unknown outcome伪造成success；
-- hook不直接写SessionStorage、发布Runtime event或持有waiter。
+- hook不直接修改LiveSessionState、写SessionRecorder、发布Runtime event或持有waiter。
 
 ## Policy、Approval 和 Sandbox
 
@@ -343,7 +343,7 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
 
 `ToolStartPermit`是current-Runtime typed permit，不持久化：
 
-- SessionExecutor验证current Turn/Item/call；
+- ActiveTurnTask验证current Turn/Item/call；
 - 观察latest EmergencyControl；
 - 原子把ToolOperationSlot从Prepared变为Running；
 - permit只允许对应executor开始一次；
@@ -406,7 +406,7 @@ Completed {
 }
 ```
 
-Session executionappend role=tool message。
+ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
 
 ### Executed Result
 
@@ -421,7 +421,7 @@ all validation passes
 → Completed { source = Executed }
 ```
 
-ToolResult append失败不能重新执行Tool。
+ToolResult recording失败不能重新执行Tool。
 
 ### Abandoned
 
@@ -435,36 +435,36 @@ host restart loses exact result
 
 ## LLM 循环
 
-SessionExecutor流程：
+ActiveTurnTask流程：
 
 ```text
-append Assistant(intermediate with ToolCalls)
+apply Assistant(intermediate with ToolCalls) live
+→ await SessionRecorder.record
 → ToolSet.execute calls
-→ append each exact ToolResult as role=tool
-→ SessionStorage matches all calls/results
-→ final matching result produces CommittedToolExchangeDelta
-→ AgentLoop.accept_committed_tool_results
+→ apply each exact ToolResult live + await inline record attempt
+→ LiveConversation reducer matches all calls/results
+→ complete exchange becomes model-visible
 → optional Steer
 → next Model
 ```
 
 ToolSet只返回outcome。它不能：
 
-- append Assistant/Tool/terminal；
+- apply Assistant/Tool/terminal live mutation；
+- 写SessionRecorder；
 - 决定exchange complete；
-- 调用AgentLoop；
 - 开始下一次模型调用；
 - 消费Steer/FollowUp。
 
 ## Domain 投影
 
-assistant ToolCall append：
+assistant ToolCall live apply：
 
 ```text
 ToolInvocation Item → Started
 ```
 
-matching Tool message append：
+matching Tool message live apply：
 
 ```text
 ToolInvocation Item → Completed(result)
@@ -476,7 +476,7 @@ ToolAbandoned：
 ToolInvocation Item → Abandoned
 ```
 
-ToolSet只产出typed terminal outcome，不拥有durable conflict/replay判定。ToolResult/ToolAbandoned first-terminal规则、complete exchange形成、duplicate/orphan/incomplete隔离和模型可见性全部由ConversationStorage按[INV-003](../architecture.md#跨模块不变量索引)定义；Tools module不维护第二份projection算法。
+ToolSet只产出typed terminal outcome，不拥有conversation reducer。live complete exchange和first-terminal规则由[Turn / Item / Interaction](turn-item-interaction.md#complete-tool-exchange)拥有；cold duplicate/orphan/incomplete隔离由Conversation Recording replay projector实现。Tools module不维护第二份算法。
 
 ## Cancellation 与 SecurityRevoked
 
@@ -562,12 +562,12 @@ Tool grant store
 - active ToolSet immutable；
 - ToolCallId/ItemId职责分离；
 - schema/hook/policy/approval/Sandbox在side effect前；
-- start permit由SessionExecutor current owner发放；
+- start permit由ActiveTurnTask current owner发放；
 - permit不持久化；
 - Running Tooltruthful settle；
-- ToolResult append失败不重放Tool；
+- ToolResult recording失败不重放Tool；
 - complete call/result集合才进入model conversation；
-- ToolSet不写SessionStorage或推进AgentLoop；
+- ToolSet不修改LiveSessionState、不写SessionRecorder、不推进async loop；
 - ask-user不持mutation permit；
 - 同Session同file mutation FIFO；
 - 跨Session不协调；
@@ -587,7 +587,7 @@ Tool grant store
 - ToolStartPermit只使用一次；
 - start permit vs Cancel/Security双向race；
 - Running Tool cancellation settlement；
-- exact result append失败不重新执行；
+- exact result recording失败不重新执行；
 - outcome unknown Abandoned；
 - multi-call inverse completion；
 - final matching result形成ordered exchange；

@@ -1,7 +1,9 @@
 # ADR 0115：AgentLoop 使用自研协议状态机（Rig 收窄为 provider adapter）
 
-状态：Partially Superseded by ADR 0124
+状态：Superseded by ADR 0126
 日期：2026-07-27
+
+> 2026-07-30：同步sans-I/O AgentLoop、`next_action()`和`accept_*()`已删除，Turn执行改为MiniCore first-party `ActiveTurnTask` async loop。Rig provider-only边界继续保留。
 
 > 2026-07-29修订：自研同步sans-I/O AgentLoop与Rig provider-only职责保持有效。`accept_committed_tool_round`改为`accept_committed_tool_results(CommittedToolExchangeDelta)`；coverage来自matching ToolResult集合，不再依赖durable ToolRoundCompleted marker。
 

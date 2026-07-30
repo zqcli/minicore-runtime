@@ -23,7 +23,7 @@ pi、Codex和Claude Code采用更直接的常规模式：资源由Runtime共享�
 
 - PromptDefinition正文由Runtime共享，Session只保存选择，删除scope override单调性问题。
 - ModelGateway不再需要第三种instruction role的lowering，只映射System与conversation messages。
-- PromptSet、ToolSet和captured SkillView在active Turn内仍保持不可变；Transcript-First和PromptSet唯一assembly seam不变。
+- PromptSet、ToolSet和captured SkillView在active Turn内仍保持不可变；PromptSet唯一assembly seam和sanitized LiveConversation输入不变。
 - Prompt/Skill采用显式reload一致性：shared文件变化只有在`/reload`成功后影响future Turn，Workspace-bound文件变化只有在Session load、Idle definition update或`/reload workspace`成功后影响future Turn；active Turn和reload失败都继续使用old captured content。正文一旦committed就成为固定conversation事实。
 - 进程重启后不恢复旧Prompt/Skill execution objects；unfinished Turn保守中断，不使用current Prompt或Skill冒充旧Context继续执行。
 

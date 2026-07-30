@@ -1,7 +1,9 @@
 # ADR 0108: Runtime 公开协议
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-24
+
+> 2026-07-30：dispatch/query/snapshot/subscribe、typed outcomes和snapshot-first保留；TurnStarted、item_completed和Interaction events确认live mutation，不确认physical Session recording。
 
 ## 背景
 

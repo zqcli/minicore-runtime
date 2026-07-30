@@ -1,8 +1,8 @@
 # Runtime Interface 与公开协议架构设计
 
-日期：2026-07-25
+日期：2026-07-30
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
+状态：当前权威架构（ADR 0126后，生产实现待启动）
 
 ## 目的
 
@@ -58,7 +58,7 @@
 - `RuntimeSnapshot`只覆盖Runtime/Agent/Session summary和loaded membership；
 - `SessionSnapshot`覆盖一个loaded Session的current Turn、Items、Pending Interaction和queues；
 - 不要求 all-loaded Session 在一个全局水位上 stop-the-world snapshot；
-- SessionStorage 拥有 durable entry tree；Runtime 通过 Query 暴露 read model，通过 Fork command创建新 Session branch；
+- SessionRecorder保存best-effort recorded entry tree；Runtime通过Query暴露recorded history和loaded live read model，通过Fork command创建新Session branch；
 - 同一 Session 内不提供原地 checkout/navigation mutation；
 - CommandSurface 是 MiniCoreRuntime 内部无状态命令解释模块；slash command 只是 command text 的一种语法；
 - 所有改变 Runtime 事实的 UI 操作都经过 MiniCoreRuntime；纯 UI 状态留在 adapter；
@@ -72,7 +72,7 @@
 | Agent Client Protocol | session/prompt长请求；session/update通知；client反向处理permission和filesystem | 采用typed Interaction和capability思想；不让一个长请求持有整个Turn完成生命周期 |
 | Claude Agent SDK | long-lived Query对象、async message iterator、control methods和callback | 采用嵌入式易用性；不把callback或SDK对象句柄固化为wire contract |
 | LangGraph Agent Server | Thread/Run资源、durable task queue、checkpoint、SSE join/cancel | 独立daemon出现后再评估Run resource和durable replay；不支付分布式队列成本 |
-| OpenHands | SDK与Agent Server分层；append-only events同时服务memory和integration | 采用SDK/transport分层；继续让SessionStorage durable truth与公开observer event分离 |
+| OpenHands | SDK与Agent Server分层；append-only events同时服务memory和integration | 采用SDK/transport分层；live observer state与best-effort Session recording分离 |
 
 ## 顶层 Ownership
 
@@ -93,7 +93,7 @@ MiniCoreRuntime private implementation
 ├─ SkillService
 ├─ ModelGateway
 ├─ WorkspaceResolver / WorkspaceAuthority adapters
-├─ SessionStorage / SessionWriter
+├─ SessionStorage / SessionRecorder
 ├─ runtime state publisher
 └─ per-session state/progress publishers
 ```
@@ -398,16 +398,16 @@ pub enum PublicCancelTarget {
 
 语义：
 
-- `Submit`只在Session可以admit新Turn（Idle admission decision）时使用；Session非Idle时返回`SessionBusy`，不排队跨Turn等待；Turn Running期间的用户输入应由adapter路由为`Steer`（交互式默认）或`FollowUp`；initiating UserMessage append/apply后返回`TurnStarted`；
+- `Submit`只在Session可以admit新Turn（Idle admission decision）时使用；Session非Idle时返回`SessionBusy`，不排队跨Turn等待；Turn Running期间的用户输入应由adapter路由为`Steer`（交互式默认）或`FollowUp`；initiating UserMessage成功apply到live state并完成inline record attempt后返回`TurnStarted`。该publication顺序消费[INV-001](../architecture.md#跨模块不变量索引)；
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
 - `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Turn创建后调用方使用`TurnId`取消；
-- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal append；stale target不影响新Turn；
+- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal recording；stale target不影响新Turn；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
 
-Queued Steer和FollowUp仍是process-local值。Runtime restart后未append的queued input不会恢复。
+Queued Steer和FollowUp仍是process-local值。Runtime restart后未被SessionRecorder写入的input不会恢复。
 
 ### InteractionCommand
 
@@ -427,17 +427,17 @@ pub enum InteractionCommand {
 Interaction request/resolution遵守：
 
 ```text
-InteractionRequested append/apply
+InteractionRequested live apply + inline record attempt
 → StateEvent::InteractionRequested
 → host提交Resolve
-→ InteractionResolved append/apply
+→ InteractionResolved live apply + inline record attempt
 → StateEvent::InteractionResolved
 → resume waiter或允许后续side effect
 ```
 
 `InteractionResolutionInput`必须与request family匹配：ToolApproval接受approval decision，UserQuestion接受UserAnswer；Cancelled按领域规则关闭任一family。所有identity与family校验由MiniCore执行，不能信任UI本地状态。
 
-MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，持久化request/resolution，处理Cancel、terminal cleanup、Unload、幂等和recovery。用户长时间无回答、暂时没有subscriber或transport断开都保持Pending，不产生默认Deny。Presentation Adapter只把UI-safe request渲染为弹窗、聊天消息、终端菜单或表单，并把用户答案提交为`InteractionCommand::Resolve`；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionWriter。
+MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，在live state中管理request/resolution并best-effort record，处理Cancel、terminal cleanup、Unload和幂等。用户长时间无回答、暂时没有subscriber或transport断开都保持Pending，不产生默认Deny。Presentation Adapter只把UI-safe request渲染并提交resolution；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionRecorder。
 
 结构化Interaction answer不是UserMessage，不开启新Turn。尤其是UserQuestion回答会恢复原来的ToolInvocation；若UI把答案改成Submit/UserMessage，就会错误地创建新Turn。
 
@@ -536,20 +536,20 @@ Command response不是完整业务完成流：
 | --- | --- |
 | Create Agent | Agent head与revision durable publication |
 | Update Agent | expected revision/status CAS成功 |
-| Create Session | SessionHeader/definition durable publication |
+| Create Session | live Session identity/definition建立并启动Recorder；recording health随response/Snapshot可见 |
 | Update SessionDefinition（non-Workspace或unloaded Workspace） | new revision durable publication |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
 | Reload shared Prompt/Skill/Tool/Model | required candidates全部validate，并在publication gate下替换current immutable objects；失败时old current values保持不变 |
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Reload Workspace | Session Idle校验、Workspace resolve和Workspace-bound Prompt/Skill source capture全部完成后替换Snapshot；非Idle返回SessionBusy |
-| Unload Session | LifecycleControl完成grace/fail-closed drain，writer关闭并从loaded map移除 |
-| Submit | initiating UserMessage append/apply |
+| Unload Session | LifecycleControl完成grace/fail-closed task settlement并从loaded map移除；Recorder无后台drain |
+| Submit | initiating UserMessage live apply与inline record attempt |
 | Steer Queued | target Turn的SteerQueue admission |
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
-| Resolve Interaction | InteractionResolved append/apply |
-| Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；initiating append reservation先赢时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
-| Cancel Turn | active target仍可取消且sticky cancel epoch发布；final append reservation先赢时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
+| Resolve Interaction | InteractionResolved live apply与inline record attempt |
+| Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；live Turn admission先完成时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
+| Cancel Turn | active target仍可取消且sticky cancel epoch发布；live final arbitration先完成时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
 | Fork Session | target staging验证完成并原子发布 |
 
 ### Command Error
@@ -766,7 +766,7 @@ pub struct SessionHistoryTreeView {
 }
 ```
 
-History node使用Turn/Item/message语义，不向普通UI暴露raw SessionEntryDraft、writer internals或writer current EntryId。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
+History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessionEntry、recorder internals或physical recorded head。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
 
 MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
@@ -856,6 +856,7 @@ pub struct SessionSnapshot {
     pub active_items: Vec<ItemView>,
     pub pending_interactions: Vec<InteractionView>,
     pub queues: SessionQueueView,
+    pub recording: SessionRecordingView,
     pub usage: Option<SessionUsageView>,
     pub diagnostics: Vec<SessionDiagnosticView>,
 }
@@ -866,9 +867,53 @@ pub struct SessionQueueView {
     pub follow_up_count: usize,
     pub accepting_input: bool,
 }
+
+pub struct SessionRecordingView {
+    pub state: SessionRecordingState,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum SessionRecordingState {
+    Healthy,
+    Degraded,
+    Disabled,
+}
 ```
 
-长期Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的committed Items，并按selected path entry顺序与assistant Reasoning/Text/ToolCall content顺序排列。它不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
+wire固定为object + string state：
+
+```json
+{"recording":{"state":"healthy"}}
+{"recording":{"state":"degraded"}}
+{"recording":{"state":"disabled"}}
+```
+
+长期recorded Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的live Items，并按live conversation顺序与assistant Reasoning/Text/ToolCall content顺序排列。一个Session最多暴露一个current Turn/ActiveTurnTask，消费[INV-101](../architecture.md#跨模块不变量索引)。Snapshot不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
+
+`SessionRecordingState`语义：
+
+- `Healthy`：BestEffort recording已启用，当前load尚未观察到record failure；不表示flush、fsync或power-loss durability；
+- `Degraded`：期望记录，但初始化、encode或append已经失败；当前load停止后续记录，Session execution继续；
+- `Disabled`：Host显式选择不记录或ephemeral policy；属于预期配置，不产生故障warning；
+- 初始化、lease、权限、磁盘或write错误必须投影为`Degraded`，不能投影为`Disabled`；
+- 同一次load只允许`Healthy → Degraded`；`Disabled`在该load内保持`Disabled`；修复storage不会使当前loaded instance恢复；
+- 只有显式`Unload + Load`创建的新loaded instance可以重新成为Healthy，并且只恢复recorded prefix；旧unrecorded live tail丢失；
+- MVP不提供`ResumeSessionRecording`、`StartRecordingSegment`、自动storage probe/retry或live-tail backfill。
+
+MVP不增加`Initializing`、`Writing`或per-entry receipt状态。内部`RecordingHealth`可以携带typed reason和failed entry identity，公开view只投影三态。
+
+recording failure同时产生一条脱敏`SessionDiagnosticView`，code只允许：
+
+```text
+session_recording_initialization_failed
+session_recording_encode_failed
+session_recording_append_failed
+session_recording_outcome_unknown
+```
+
+raw OS error、绝对路径、credential、完整StoredSessionEntry和Tool output只进入受控内部日志。Session保持`Degraded`期间，latest SessionSnapshot必须保留至少一条当前recording diagnostic，使断线重连的host能够同时恢复状态和粗粒度原因。状态变化与该diagnostic在同一次immutable Snapshot publication中原子可见。
+
+Host展示语义：`Healthy`不提示；`Disabled`使用中性“此会话不会保存”状态；`Degraded`持续显示“后续内容无法恢复”的warning，但不得禁用Submit、Model、Tool、Interaction或Compaction。warning应明确：继续使用会保留current live state但不保存；Unload/Load只恢复到最后recorded prefix并丢失之后的live内容。
 
 `SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。`pending_submit_count`是尚未被仲裁的admission信箱瞬时计数（正常为0），不表示存在跨Turn排队的Submit通道。
 
@@ -882,7 +927,7 @@ Runtime与每个Session使用独立owner和Snapshot，不存在跨scope可比较
 
 单独调用`snapshot()`只读取调用时的当前view。用于持续观察时，host调用`subscribe(scope)`：owner必须在同一publication synchronization内注册subscriber并捕获初始Snapshot，EventStream第一帧返回该Snapshot，随后只发送该点之后的实时事件。禁止用非原子的“先snapshot再subscribe”或“先subscribe再snapshot”替代。
 
-断线、subscriber背压或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。Runtime process restart时先从JSONL replay并执行conservative recovery，使旧unfinished Turn terminalize并让Session进入Idle/Ready/Unavailable；之后的新Snapshot只反映该恢复结果，不承诺从旧执行现场继续。
+断线、subscriber背压或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。Runtime process restart时只从JSONL recorded prefix replay并执行conservative recovery；未record的live tail消失。之后的新Snapshot只反映该恢复结果。
 
 ## Event
 
@@ -995,6 +1040,7 @@ pub enum SessionStateEventKind {
     InteractionResolved,
     QueueUpdated,
     UsageUpdated,
+    SessionRecordingChanged,
     DiagnosticsUpdated,
 }
 
@@ -1017,8 +1063,8 @@ StateEvent本身始终是非durable observer record，不因payload来源不同�
 
 | 来源 | 例子 | restart后的恢复 |
 | --- | --- | --- |
-| committed-derived | Agent/Session definition、Turn/Item terminal、Interaction request/resolution | 从durable catalog或SessionStorage projection重建，并出现在新Snapshot/Query中 |
-| process-local | load/readiness、execution/phase、queue、settled、diagnostics | 只描述当前Runtime状态；restart后可以消失、重置或由新状态替代 |
+| live domain state | Turn/Item terminal、Interaction request/resolution、active conversation | 当前process立即可见；只有已record部分能在restart后重建 |
+| process-local control | load/readiness、execution/phase、queue、settled、recording health、diagnostics | restart后消失、重置或由新状态替代 |
 
 StateEvent规则：
 
@@ -1026,11 +1072,11 @@ StateEvent规则：
 - 同一subscription lifetime内，StateEvent按publisher发送顺序交付；
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
-- durable conversation fact必须从append/apply后的CommittedSessionEntry派生；
+- final domain StateEvent必须从成功live mutation派生，并在发送前完成inline record attempt；record outcome不提供durable acknowledgement；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
-- Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未append消息伪造成durable UserMessage。
+- Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未record消息伪造成可恢复UserMessage。
 
 上述两个kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整Snapshot；`SessionEventDetail`只承载Snapshot无法表达但对本次transition有用的safe correlation信息。
 
@@ -1064,6 +1110,7 @@ interaction_requested
 interaction_resolved
 queue_updated
 usage_updated
+session_recording_changed
 diagnostics_updated
 shared_resources_reloaded
 session_workspace_reloaded
@@ -1071,6 +1118,10 @@ command_catalog_invalidated
 ```
 
 `shared_resources_reloaded`是Runtime-scope typed unit payload，表示Prompt/Skill/Tool/Model四个safe catalog都可能变化；它不携带revision/generation。`session_workspace_reloaded { session_id }`是Session-scope payload，表示new WorkspaceSnapshot及Workspace-bound Prompt/Skill captured sources已经一起发布；订阅者随后以new SessionSnapshot为准。
+
+`session_recording_changed`只在loaded Session的公开recording state发生变化时发布。first failure执行`Healthy → Degraded`并在同一Snapshot publication中安装当前脱敏recording diagnostic；显式`Disabled`在初始Create/Load response与Snapshot中可见，不需要故障warning event。重复`record()`在Degraded/Disabled下返回`NotRecorded`时不重复发布state event。
+
+failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved、Compaction或terminal路径，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。这样领域事件不会被health event抢先，同时实时subscriber仍得到显式transition signal。
 
 MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；wire adapter不得另行折叠成未定义的`turn_finished`形状。Rust领域payload保持`Completed | Interrupted | Failed` typed union。
 
@@ -1138,15 +1189,15 @@ model_retry_scheduled
 规则：
 
 - 有stream progress的AgentMessage/Reasoning在首个content update时分配稳定`ItemId`；started、全部delta和最终`item_completed`使用同一ItemId；
-- message/reasoning started属于AgentRun ProgressEvent，不创建durable `ItemStatus::Started`；CompactionSummary不创建StreamingItem或ItemId；
+- message/reasoning started属于AgentRun ProgressEvent，不创建final live Item；CompactionSummary不创建StreamingItem或ItemId；
 - Host漏掉started时可以用首个delta创建临时Item view；漏掉全部progress或provider为non-streaming时直接使用final `item_completed`；
 - 可以按SessionId/TurnId/ItemId合并连续delta；
 - queue满时可以丢弃中间progress；
 - progress缺失不影响StateEvent或Snapshot正确性；
-- `item_completed`只在final candidate成功append/apply后发布，携带完整final Item view；append失败不能发布completed；
-- Cancel/failure丢弃未commit的streaming state；logical `model_retry_scheduled`要求Host清除上一Model operation的临时view，若progress丢失则由Turn terminal或新Snapshot最终校正；
+- `item_completed`只在final candidate成功apply到live state并完成inline record attempt后发布，携带完整final Item view；recording failure不阻止发布；
+- Cancel/failure丢弃未finalize的streaming state；logical `model_retry_scheduled`要求Host清除上一Model attempt的临时view，若progress丢失则由Turn terminal或新Snapshot最终校正；
 - Host收到同ItemId的`item_completed`或Turn terminal后忽略迟到started/delta；
-- progress不写SessionStorage，不成为conversation truth；
+- progress不进入LiveConversation或SessionRecorder；
 - progress publisher失败不影响Turn执行或terminal。
 
 ### Turn And Item Ordering
@@ -1164,13 +1215,13 @@ Item order
 
 `ItemId`、`EntryId`、`ToolCallId`、timestamp、Tool completion time和ProgressEvent arrival都不能用于排序。`SessionSnapshot.active_items`和turn-scoped `ListItems`按canonical Item order返回；Host必须保留Vec顺序。
 
-新committed Item的StateEvent按canonical创建顺序发布并追加到durable Item list。ToolInvocation的Completed/Abandoned事件和Tool progress都只按`ItemId`更新原位置，不移动Item；因此Tool B可以先结束并先通过process-local activity显示完成，authoritative terminal view稍后校正，但展示位置始终保持call order A、B。
+新live Item的StateEvent按canonical创建顺序发布并追加到live Item list。ToolInvocation的Completed/Abandoned事件和Tool progress都只按`ItemId`更新原位置，不移动Item；因此Tool B可以先结束，展示位置仍保持call order A、B。
 
-AgentMessage/Reasoning progress只属于独立provisional view，first-seen顺序没有durable意义。收到matching new-Item committed StateEvent时Host删除provisional view，并按该创建事件顺序加入durable list；Snapshot则整体替换durable list并清空provisional view。未知Item的terminal update或任何需要插入既有durable Item之前的事件表示reducer失步，Host应重新subscribe获取Snapshot而不是猜测顺序。
+AgentMessage/Reasoning progress只属于独立provisional view。收到matching new-Item final StateEvent时Host删除provisional view，并按该创建事件顺序加入live list；Snapshot整体替换live list并清空provisional view。未知Item的terminal update表示reducer失步，Host应重新subscribe获取Snapshot。
 
 ### Interaction Event
 
-request-before-notify与resolution-before-resume的durable顺序由[INV-301](../architecture.md#跨模块不变量索引)定义；Runtime Interface只冻结UI-safe view和host提交resolution所需route。
+request-before-notify与resolution-before-resume的live顺序由[INV-301](../architecture.md#跨模块不变量索引)定义；Runtime Interface只冻结UI-safe view和host提交resolution所需route。
 
 `interaction_requested`必须携带UI-safe request：
 
@@ -1204,9 +1255,9 @@ SessionStorage
 └─ produces sanitized trusted projections
 
 SessionExecutor
-├─ performs append → apply
+├─ applies live mutation → attempts record
 ├─ owns active Turn mutation ordering
-└─ requests SessionStorage branch/fork operations
+└─ requests SessionStorage history/fork operations
 
 MiniCoreRuntime
 ├─ exposes SessionQuery::GetHistoryTree / ListTurns / ListItems
@@ -1216,7 +1267,7 @@ MiniCoreRuntime
 UI不能：
 
 - 直接读取或修改JSONL；
-- 直接指定任意EntryId作为writer parent；
+- 直接指定任意EntryId作为recorded parent；
 - 追加raw message；
 - 补写ToolResult、猜测parent或重写中段损坏entry；
 - 删除历史entry；
@@ -1316,19 +1367,19 @@ CLI / TUI / Tauri backend
 → PromptService.for_turn()
 → TurnExecutionContext
 → PromptSet.compose_user_message()
-→ SessionWriter.append(UserMessage source=Input + StoredTurnStart)
-→ apply trusted projections
+→ LiveSessionState.apply(UserMessage source=Input + StoredTurnStart)
+→ await SessionRecorder.record
 → CommandResponse::TurnStarted { turn_id }
-→ AgentLoop returns NeedModel
-→ PromptSet.assemble(committed conversation)
+→ ActiveTurnTask async loop
+→ PromptSet.assemble(LiveConversationView)
 → AssembledModelContext
 → ModelCallRequest
 → ModelGateway.generate_model_turn()
 → ModelGateway private ProviderAdapter（production可使用RigProviderAdapter，仅处理provider attempt）
 → OpenAI Responses / Anthropic Messages / other provider
 → ModelCallResult
-→ SessionExecutor validates SessionId + TurnId + execution_version
-→ append/apply AgentMessage、Tool entries或Turn terminal
+→ ActiveTurnTask validates SessionId + TurnId + control_generation + ConversationRevision
+→ apply live AgentMessage、Tool result或Turn terminal + await inline record attempt
 → StateEvent + optional ProgressEvent
 → host reducer/UI
 ```
@@ -1354,16 +1405,16 @@ UI dispatch ExecuteText("/model provider openai gpt-5")
 
 ```text
 ModelCallResult contains ToolCall
-→ SessionExecutor creates ToolInvocation ItemId
-→ append/apply InteractionRequested
+→ ActiveTurnTask creates live ToolInvocation ItemId
+→ apply InteractionRequested live + await inline record attempt
 → session StateEvent::InteractionRequested
 → UI dispatch InteractionCommand::Resolve
-→ append/apply InteractionResolved
+→ apply InteractionResolved live + await inline record attempt
 → session StateEvent::InteractionResolved
-→ SessionExecutor owner-local ToolStartPermit
+→ ActiveTurnTask owner-local ToolStartPermit
 → executor side effect
-→ append/apply truthful Tool result
-→ final matching result produces CommittedToolExchangeDelta
+→ apply truthful Tool result live + await inline record attempt
+→ live reducer forms complete Tool exchange
 → next PromptSet.assemble
 ```
 
@@ -1371,20 +1422,20 @@ ModelCallResult contains ToolCall
 
 ```text
 ModelCallResult contains built-in ask-user ToolCall
-→ SessionExecutor creates ToolInvocation ItemId
+→ ActiveTurnTask creates live ToolInvocation ItemId
 → ToolExecutionControl.request_user_question
-→ append/apply InteractionRequested(UserQuestion)
+→ apply InteractionRequested(UserQuestion) live + await inline record attempt
 → session StateEvent::InteractionRequested with UI-safe InteractionView
 → Presentation Adapter展示并收集答案
 → UI dispatch InteractionCommand::Resolve(UserAnswer)
-→ append/apply InteractionResolved
+→ apply InteractionResolved live + await inline record attempt
 → session StateEvent::InteractionResolved
 → wake original Tool future
-→ append/apply PreExecution truthful Tool result
+→ apply PreExecution truthful Tool result live + await inline record attempt
 → complete exchange后same Turn next PromptSet.assemble
 ```
 
-Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。当前Turn的逻辑执行暂停，但对应SessionExecutor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session的Executor不受影响。等待期间不预留file mutation ticket，也不持有TurnControl reservation，elapsed time不会自动关闭Interaction。
+Pending期间`TurnStatus`和`SessionExecutionState`仍为Running，`TurnExecutionPhase = WaitingForUserInput`。ActiveTurnTask只等待oneshot，对应SessionExecutor control actor继续处理Resolve/Cancel/SecurityRevoked/Unload/Snapshot；其他Session不受影响。等待期间不预留file mutation ticket，也不持有ToolStartGate，elapsed time不会自动关闭Interaction。
 
 ## Transport 与 Adapter
 
@@ -1471,7 +1522,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - Skill正文和Prompt template正文；
 - Tool executor handle、prepared private args和sandbox internals；
 - WorkspaceSnapshot、EmergencyControl signal或security target；
-- SessionWriter、writer internals、replay internals；
+- SessionRecorder file/health internals、replay internals；
 - raw JSONL path作为普通UI能力；
 - internal handler id和完整RuntimeCommand嵌入catalog action。
 
@@ -1485,11 +1536,9 @@ Renderer不应直接持有MiniCoreRuntime credential或filesystem capability。T
 SessionExecutor
 SessionExecutionHandle
 SessionIngress及其内部lane
-TurnControlGate / LifecycleControl / EmergencyControl
-RunningOperation
-OperationResult
-execution_version
-AgentLoop
+ActiveTurnTask / ActiveTurnHandle / ActiveTurnControl
+ToolStartGate / LifecycleControl / EmergencyControl
+ConversationRevision / control_generation
 TurnExecutionContext
 PromptService / PromptSet
 ToolService / ToolSet
@@ -1497,8 +1546,8 @@ SkillService / SkillView / LoadedSkill
 WorkspaceSnapshot / EmergencyControl signal
 ModelGateway / TurnModelSnapshot private execution ref
 ProviderAdapter / AuthStore
-SessionWriter / SessionStorage implementation
-CommittedConversationState / ConversationChange / CommittedToolExchangeDelta / CommittedSteerDelta
+SessionRecorder / SessionStorage implementation
+LiveSessionState / LiveConversation reducer
 ToolExecutionControl / ToolStartPermit
 ```
 
@@ -1535,7 +1584,7 @@ Public interface是 contract test surface。
 ### Command Tests
 
 - Agent/Session revision CAS；
-- Submit只在UserMessage append/apply后返回TurnStarted；
+- Submit只在UserMessage成功live apply并完成inline record attempt后返回TurnStarted；
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
 - 相同CommandId携带不同command返回CommandConflict；
 - Cancel(Submit CommandId)关闭排队或Starting admission，target退休或restart后返回NotFound且不影响future Turn；
@@ -1543,13 +1592,13 @@ Public interface是 contract test surface。
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
 - valid Cancel立即返回`CancelAccepted`且不等待Tool settlement；duplicate返回同一target/epoch；
-- Cancel与initiating/final append reservation first-wins，不能accepted后再提交Started/Completed；
+- Cancel与initiating/final live arbitration first-wins，不能accepted后再提交Started/Completed；
 - Cancel清理current Turn Steer但保留FollowUp，Finishing期间新FollowUp仍可Queued；
 - CancelAccepted后execution snapshot/event进入Finishing，最终TurnInterrupted另行发布；
 - stale Cancel TurnId不取消新的active Turn；
 - Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
-- Interaction first committed resolution wins；
+- Interaction first live terminal resolution wins；
 - Fork Before/After Item anchor；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
 - `/compact`不在catalog。
@@ -1565,25 +1614,31 @@ Public interface是 contract test surface。
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
+- Healthy/Degraded/Disabled三态JSON wire稳定，初始化/write failure不能投影为Disabled；
+- Degraded Snapshot始终携带至少一条当前脱敏recording diagnostic；
 - snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
 
 ### Event Tests
 
 - Runtime与每个Session subscription彼此独立；
 - 每条stream首帧是scope匹配的Snapshot；
-- 当前subscription内StateEvent保持发送顺序，不区分committed-derived与process-local来源；
+- 当前subscription内StateEvent保持发送顺序；
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
-- restart后durable-derived状态从projection重建，queued Steer/FollowUp和旧phase等process-local状态不恢复；
+- restart后只从recorded prefix重建，unrecorded live tail、queued Steer/FollowUp和旧phase不恢复；
 - ProgressEvent可以合并/丢弃；
 - message/reasoning started、delta和completed使用稳定ItemId，丢失started/delta仍可由completed校正；
-- append失败不发布item_completed；logical retry、Turn terminal或新Snapshot清理临时Item view，completed/terminal后忽略迟到progress；
+- live final mutation失败不发布item_completed；recording失败仍可发布；logical retry、Turn terminal或新Snapshot清理临时Item view；
+- Healthy首次失败时原domain event先携带Degraded Snapshot发布，随后一次`session_recording_changed`；后续NotRecorded不重复发state event；
+- Disabled只在初始Snapshot表达预期policy，不产生failure warning；
+- Degraded后修复storage、重复Load command或后续record call均不能恢复当前loaded instance；
+- Unload/Load的新Snapshot可以重新Healthy，但只包含recorded prefix；
 - logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；
 - final Item event携带完整view；
 - assistant content创建事件按Reasoning/Text/ToolCall顺序发布；
 - parallel Tool逆序完成只更新各自原位置，不改变call order；
-- Snapshot替换有序durable Items并清空provisional Items；
+- Snapshot替换有序live Items并清空provisional Items；
 - Runtime restart从JSONL tolerant replay和conservative recovery开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现，不把Snapshot当作execution checkpoint；
-- Interaction request-after-append和resolution-before-resume；
+- Interaction request live apply/record-attempt-before-notify和resolution live apply/record-attempt-before-resume；
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
@@ -1594,7 +1649,7 @@ Public interface是 contract test surface。
 
 - catalog/query/snapshot/event不包含credential；
 - renderer不能提交raw internal command；
-- renderer不能直接持有Tool waiter、SessionWriter或伪造MiniCore未请求的Pending Interaction；
+- renderer不能直接持有Tool waiter、SessionRecorder或伪造MiniCore未请求的Pending Interaction；
 - stale catalog selection重新resolve；
 - cross-sessionItem/RequestId拒绝；
 - Workspace restriction通过Runtime path生效。
@@ -1639,7 +1694,7 @@ Public interface是 contract test surface。
 
 缺点：streaming/progress、model logical retry和UI状态会污染Session history；observer delivery failure也不能决定conversation durability。
 
-结论：不采用。SessionStorage保存message/lifecycle history；committed-derived StateEvent从durable projection派生，process-local StateEvent从当前Runtime/Executor view派生，两者都不成为event log。
+结论：不采用。LiveSessionState驱动当前Runtime和observer；SessionRecorder保存best-effort resume history。StateEvent与recorded JSONL都不互相充当传输或durability acknowledgement。
 
 ### 公开 Manual CompactSession
 
