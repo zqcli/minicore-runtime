@@ -1,7 +1,9 @@
 # ADR 0103: Turn / Item / Interaction 模型
 
-状态：Partially Superseded by ADR 0124
+状态：Partially Superseded by ADRs 0124 and 0126
 日期：2026-07-24
+
+> 2026-07-30：Turn/Item/Interaction identity与lifecycle保留；它们先进入LiveSessionState再best-effort record，storage committed delta和append-before-event条款失效。
 
 > 2026-07-29修订：Turn/Item/Interaction identity、ToolInvocation合并模型和durable Interaction保持有效。ADR 0124删除ToolRoundCompleted和durable ToolExecutionStarted；complete Tool exchange由有效matching ToolResult集合自动形成，cold replay允许局部不闭合并产生diagnostics。
 

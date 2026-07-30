@@ -1,7 +1,9 @@
 # ADR 0117：异步同步使用单 Owner、短临界区与 Typed Permit
 
-状态：Partially Superseded by ADRs 0124 and 0125
+状态：Partially Superseded by ADRs 0124, 0125 and 0126
 日期：2026-07-27
+
+> 2026-07-30：短guard、no-lock-across-await、ToolStartGate和release-before-fan-out保留；single mutable Executor owner与controlled append permit由control actor + ActiveTurnTask + live mutation取代。
 
 > 2026-07-29修订：single owner、短guard、release-before-fan-out和typed permit规则保持有效。ADR 0124用process-local `ToolStartPermit`替代`ToolExecutionStarted` controlled append；file mutation permit仍按原规则settle后释放。ADR 0125删除ModelGateway模型调用permit，Model provider I/O仍不得持有普通短guard。
 

@@ -1,101 +1,133 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0124后，生产实现待启动）
-日期：2026-07-29
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
-本文定义loaded Session的单owner执行模型、SessionIngress语义lane、AgentLoop驱动、Model/Tool/Interaction/Steer/FollowUp/Cancel/Compaction流程，以及宽容SessionStorage语义下的restart recovery。
+本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
 核心目标：
 
-- 每个loaded Session只有一个mutable execution owner；
-- 多Session可以并行；
-- control不被普通work queue饿死；
-- live执行严格，storage replay宽容；
-- Tool side-effect start由current Runtime owner管理，不依赖durable start marker；
-- complete Tool exchange由matching ToolResult集合自动形成；
-- old provider/Tool task不跨restart恢复。
+- 每个loaded Session最多一个active Turn task；
+- Model、Tool、Interaction和retry用普通async控制流表达；
+- control actor在Turn task await期间保持响应；
+- live state驱动当前进程行为，Session recording outcome不作为correctness或retry permit；
+- 多Session共享Runtime modules并可并发运行；
+- restart不恢复旧task、future、waiter或queue。
 
 ## 决策摘要
 
-- 每个loaded Session一个`SessionExecutor`、一个`SessionWriter`、一个current Turn和一个current `RunningOperation`；
-- `SessionIngress`分离Submit、Steer、FollowUp、Interaction、Tool control和sticky lifecycle/emergency；
-- AgentLoop是crate-private同步sans-I/O状态机；
-- ModelGateway每次operation一个provider attempt；logical retry归SessionExecutor；
-- Input UserMessage内联StoredTurnStart并开始Turn；
-- Tool side-effect start是owner-local reservation与in-memory state；
-- 不append`ToolExecutionStarted`；
-- 不append`ToolRoundCompleted`；
-- 最后一个补齐assistant call集合的Tool message产生`CommittedToolExchangeDelta`；
-- AgentLoop只消费typed committed model response、Tool exchange和Steer delta；
-- Cancel发布sticky epoch后立即返回`CancelAccepted`；
-- 已开始Tool继续settle，旧Turn进入Finishing；
-- FollowUp可以在Finishing排队，旧Turnterminal前不启动；
-- cold replay局部损坏不brick Session；
-- restart后Running Turn保守中断，incomplete Tool exchange不进入模型conversation；
-- Prompt assembly保持同步纯内存操作。
+- 一个loaded Session一个`SessionExecutor` control actor；
+- 一个Running Session最多一个`ActiveTurnTask`；
+- 删除同步`AgentLoop`、`next_action()`和`RunningOperation`；
+- `ActiveTurnTask::run_turn`直接await ModelGateway、ToolSet和Interaction；
+- `LiveSessionState`是current-process live truth；
+- `SessionRecorder`顺序inline append有序best-effort前缀；
+- complete Tool exchange由live conversation reducer判定；
+- Steer只在safe point消费；FollowUp只在旧task结束后启动；
+- Cancel立即ack，Running Tool继续truthful settle；
+- logical retry和backoff是task-local状态；
+- recording Degraded或process crash时，Snapshot/StateEvent可以领先可恢复的recorded prefix；Healthy状态没有后台queue lag。
 
-## Runtime关系
+## Ownership
+
+**Canonical cross-module invariant: INV-101.**
 
 ```text
 MiniCoreRuntime
 └─ LoadedSessionExecutors
-   ├─ SessionId A → SessionExecutionHandle A → SessionExecutor A
-   ├─ SessionId B → SessionExecutionHandle B → SessionExecutor B
-   └─ SessionId C → SessionExecutionHandle C → SessionExecutor C
+   └─ SessionExecutor
+      ├─ SessionIngress
+      ├─ Arc<LiveSessionStateHandle>
+      ├─ Arc<SessionRecorder>
+      ├─ SessionSnapshot publisher
+      ├─ FollowUpQueue
+      └─ Option<ActiveTurnHandle>
+         └─ ActiveTurnTask::run_turn
 ```
 
-Runtime不拥有一个全局active Session。UI当前选中Session只是Presentation状态。
+`SessionExecutor`拥有：
+
+- Session load/readiness/lifecycle control；
+- Submit和FollowUp admission；
+- active task spawn、join和terminal handoff；
+- Cancel、SecurityRevoked、Unload和Shutdown路由；
+- Interaction resolution入口；
+- snapshot-first subscription和StateEvent publication；
+- recording health、current diagnostic和`session_recording_changed` publication。
+
+`ActiveTurnTask`拥有：
+
+- 当前Turn async control flow；
+- exact `Arc<TurnExecutionContext>`；
+- current phase和provisional streaming items；
+- Model/Tool futures和ToolOperationSlot；
+- logical retry counter/timer；
+- current CompactionPlan；
+- safe-point Steer消费；
+- terminal candidate和settlement。
+
+`LiveSessionState`保存当前进程的conversation、Turn、Item、Interaction和usage read model。实现可以使用短锁或actor methods；guard不得跨await。SessionExecutor和ActiveTurnTask不能保存两份独立mutable conversation。
+
+每个Session最多一个ActiveTurnTask。同一个Runtime中的不同Session可以同时Running。
 
 ## 核心对象
 
 ```rust
 pub(crate) struct SessionExecutor {
     session_id: SessionId,
-    writer: SessionWriter,
-    projections: SessionProjections,
     ingress: SessionIngress,
+    live_state: LiveSessionStateHandle,
+    recorder: Arc<SessionRecorder>,
     state: SessionExecutionState,
-    current_turn: Option<CurrentTurnExecution>,
-    current_operation: Option<RunningOperation>,
+    active_turn: Option<ActiveTurnHandle>,
+    follow_up: FollowUpQueue,
     published_snapshot: ArcSwap<SessionSnapshot>,
 }
 ```
 
 ```rust
-pub(crate) struct SessionExecutionHandle {
-    session_id: SessionId,
-    ingress: SessionIngressHandle,
-    snapshot: SessionSnapshotHandle,
+pub(crate) struct ActiveTurnHandle {
+    turn_id: TurnId,
+    control: ActiveTurnControl,
+    join: JoinHandle<TurnTaskOutcome>,
 }
 ```
 
-Handle不暴露writer、projection internals、AgentLoop、waiter或Tool executor。
+```rust
+pub(crate) struct ActiveTurnControl {
+    emergency: EmergencyControlHandle,
+    steer_tx: mpsc::Sender<AcceptedSteer>,
+    interaction_tx: mpsc::Sender<InteractionResolutionCommand>,
+    lifecycle: LifecycleSignal,
+}
+```
+
+不建立public `AgentLoop` trait、Turn runner registry或SDK-owned loop。
 
 ## SessionIngress
 
 ```text
-TurnAdmissionQueue      → Submit
-SteerQueue<TurnId>      → Steer
-FollowUpQueue           → FollowUp
-InteractionControl      → ResolveInteraction
-ToolControlQueue        → Tool callback/control request
-EmergencyControl        → Cancel / SecurityRevoked sticky epoch
-LifecycleControl        → PrepareForUnload / Shutdown sticky signal
-Snapshot                → immutable published view
+TurnAdmissionQueue      Submit
+FollowUpQueue           FollowUp
+SteerControl            Steer(expected_turn_id)
+InteractionControl      ResolveInteraction
+EmergencyControl        Cancel / SecurityRevoked sticky epoch
+LifecycleControl        PrepareForUnload / Shutdown
+Snapshot                 immutable published view
 ```
 
 规则：
 
 - lane内部FIFO；
 - 不建立跨lane全局FIFO；
-- 每次wakeup由state-aware arbitration选择可处理工作；
-- EmergencyControl不等待普通bounded lane容量；
-- stale TurnId/CommandId不能影响new Turn；
-- Snapshot读取不排队到长Tool或provider I/O之后。
+- Emergency和Lifecycle不依赖普通bounded queue容量；
+- stale TurnId/CommandId不能影响新task；
+- Snapshot读取不等待Model/Tool future；
+- control actor不得await整个Turn完成来处理Cancel或Interaction resolution。
 
-## Session Execution State
+## Session State
 
 ```rust
 pub enum SessionExecutionState {
@@ -106,28 +138,10 @@ pub enum SessionExecutionState {
 }
 ```
 
-- Idle：可admit新Submit或FollowUp；
-- Starting：已预留candidate TurnId，尚未append Input；
-- Running：Turn已开始；
-- Finishing：Cancel/SecurityRevoked/failure已停止新逻辑推进，正在settle operation和appendterminal。
-
-Workspace definition update只在Idle接受。
-
-## Current Turn Execution
-
-```rust
-pub(crate) struct CurrentTurnExecution {
-    submit_command_id: CommandId,
-    turn_id: TurnId,
-    execution_version: u64,
-    context: Arc<TurnExecutionContext>,
-    agent_loop: AgentLoop,
-    phase: TurnExecutionPhase,
-    steer_queue: SteerQueue,
-    tool_operations: HashMap<ItemId, ToolOperationSlot>,
-    compactions_completed: u8,
-}
-```
+- `Idle`：没有ActiveTurnTask，可admit Submit/FollowUp或更新Workspace definition；
+- `Starting`：正在capture context和安装live Input；
+- `Running`：ActiveTurnTask存在；
+- `Finishing`：task已停止新逻辑推进，正在settle Running Tool/Interaction并返回outcome。
 
 ```rust
 pub enum TurnExecutionPhase {
@@ -135,678 +149,334 @@ pub enum TurnExecutionPhase {
     ExecutingTools,
     WaitingApproval,
     WaitingForUserInput,
+    RetryBackoff,
     Compacting,
 }
 ```
 
-phase是process-local observer状态，不持久化。
+phase只用于live Snapshot/Progress，不持久化。
 
-## Tool Operation Slot
+## Turn Admission
+
+```text
+Submit accepted by control actor
+→ reserve TurnId and control_generation
+→ capture TurnExecutionContext
+→ compose CanonicalUserMessage
+→ apply live Input + StoredTurnStart
+→ await SessionRecorder.record(entry)
+→ publish TurnStarted
+→ spawn ActiveTurnTask
+→ return SubmitAccepted { turn_id }
+```
+
+Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded或Disabled时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
+
+capture、Workspace、Prompt composition或live validation失败时不创建Turn。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
+
+## Async Run Loop
+
+概念实现：
+
+```rust
+async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
+    loop {
+        turn.check_emergency()?;
+        turn.consume_one_safe_point_steer().await?;
+
+        let context = turn.prompt_set.assemble(
+            turn.live_conversation.sanitized_view(),
+            ModelCallPurpose::AgentRun,
+        )?;
+        let request = Arc::new(ModelCallRequest::new(
+            turn.model.clone(),
+            context,
+        )?);
+
+        let response = turn.call_model_with_logical_retry(request).await?;
+
+        if response.has_tool_calls() {
+            turn.apply_assistant_tool_calls(response).await?;
+            turn.execute_tool_exchange().await?;
+            continue;
+        }
+
+        match turn.arbitrate_candidate_or_steer(response).await? {
+            CandidateDecision::Continue => continue,
+            CandidateDecision::Finish(candidate) => {
+                return turn.finish_completed(candidate).await;
+            }
+        }
+    }
+}
+```
+
+这里的`await`不表示ActiveTurnTask可以任意写Session。所有live mutation仍通过`LiveSessionState` private typed methods；所有recording只通过`SessionRecorder`。调用`record().await`前必须释放live-state guard。
+
+## Live Mutation与Recording
+
+每个domain mutation使用同一局部顺序：
+
+```text
+validate Turn/control_generation/conversation_revision
+→ allocate IDs
+→ apply LiveSessionMutation
+→ await recorder.record(StoredSessionEntry)
+→ publish final StateEvent or continue protocol
+```
+
+`record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error使Recorder Degraded。mutation不回滚，Turn不失败。
+
+禁止：
+
+- record成功前暂存另一份“pending committed conversation”；
+- recording failure后重新执行Model或Tool；
+- 从cold projector取得live推进permit；
+- 让UI event反向修改live state。
+
+## Model
+
+ActiveTurnTask调用：
+
+```rust
+ModelGateway::generate_model_turn(
+    Arc<ModelCallRequest>,
+    CancellationToken,
+) -> Result<ModelCallResult, ModelCallError>
+```
+
+ModelGateway仍只执行一个provider attempt。validated final response返回task；streaming delta只更新provisional Item和ProgressEvent。
+
+Assistant final/tool-call response先apply live并完成inline record attempt，再产生final Item StateEvent或启动Tool。Provider error不创建assistant Item。
+
+## Logical Retry
+
+logical retry由ActiveTurnTask拥有：
+
+```text
+retryable ModelCallError
+→ verify Turn still Running
+→ verify same control_generation
+→ verify same ConversationRevision
+→ retain exact Arc<ModelCallRequest>
+→ phase = RetryBackoff
+→ select(cancel, security, lifecycle, sleep(delay))
+→ next ModelGateway attempt
+```
+
+AgentRun默认最多3次logical retry；CompactionSummary默认最多1次，错误分类和delay继续遵守ADR 0119。
+
+Steer在RetryBackoff期间只排队，不改变conversation revision；Cancel/SecurityRevoked立即使retry失效。旧provider future的结果路径必须在开始下一attempt前关闭。
+
+## Tool Execution
+
+```text
+validated assistant ToolCalls
+→ apply Assistant(intermediate) live
+→ await inline record assistant attempt
+→ build expected call set
+→ phase ExecutingTools
+→ execute calls through captured ToolSet
+→ each truthful result applies live + await inline record attempt
+→ live reducer checks complete exchange
+→ complete: consume safe-point Steer or next Model
+```
+
+Tool futures可以并行，但属于同一个ActiveTurnTask。它们不能直接修改LiveSessionState或发布final StateEvent，只返回typed outcomes给task。
+
+### Tool Operation Slot
 
 ```rust
 pub(crate) enum ToolOperationSlot {
-    Prepared {
-        call: ToolCall,
-    },
-    Running {
-        call: ToolCall,
-        cancellation: ToolCancellationHandle,
-    },
-    Settling {
-        call: ToolCall,
-    },
+    Prepared { call: ToolCall },
+    Running { call: ToolCall, cancellation: ToolCancellationHandle },
+    Settling { call: ToolCall },
     Terminal,
 }
 ```
 
-Tool start线性化发生在SessionExecutor owner内：
+Tool start遵守INV-401。recording不是Tool start marker。
+
+## Interaction
+
+ActiveTurnTask通过SessionExecutor-owned Interaction router等待approval或UserQuestion：
 
 ```text
-validate current Turn/Item/call
-→ observe latest EmergencyControl
-→ reserve start in current slot
-→ slot = Running
-→ invoke executor future
+task sends InteractionRequestCommand
+→ actor validates active Turn/Item
+→ apply Pending Interaction live
+→ await inline record request attempt
+→ publish StateEvent
+→ task awaits oneshot
+→ actor receives ResolveInteraction
+→ validate family/key/current Turn
+→ apply resolution live
+→ await inline record resolution attempt
+→ complete oneshot
 ```
 
-不写durable `ToolExecutionStarted`。start reservation前Emergency获胜则Tool不执行；slot进入Running后Cancel只能best-effort并等待settlement。
+等待期间不持有live state lock、file mutation permit或ToolStartGate。recording degraded时Interaction仍正常运行。
 
-## Running Operation
+## Steer
 
-**Canonical cross-module invariant: INV-101.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
-
-```rust
-pub(crate) enum RunningOperation {
-    Model {
-        turn_id: TurnId,
-        execution_version: u64,
-        purpose: ModelCallPurpose,
-        source_checkpoint: ConversationCheckpoint,
-        request: Arc<ModelCallRequest>,
-    },
-    Tools {
-        turn_id: TurnId,
-        execution_version: u64,
-        assistant_entry_id: EntryId,
-        expected_calls: Arc<[ExpectedToolCall]>,
-    },
-    Compaction {
-        turn_id: TurnId,
-        execution_version: u64,
-        source_checkpoint: ConversationCheckpoint,
-        plan: Arc<CompactionPlan>,
-        request: Arc<ModelCallRequest>,
-    },
-}
-```
-
-每Session最多一个current RunningOperation。Tool executor futures可以并行存在，但由一个Tools operation集合拥有并回传owner；它们不能直接写storage或推进AgentLoop。
-
-旧operation terminal/remove或安全drop并关闭结果路径前，不启动logical retry或下一operation。
-
-## AgentLoop Interface
-
-```rust
-pub(crate) struct AgentLoop {
-    // concrete private state
-}
-
-impl AgentLoop {
-    pub fn from_seed(seed: ConversationSeed) -> Result<Self, AgentLoopError>;
-
-    pub fn next_action(&mut self) -> Result<AgentLoopAction, AgentLoopError>;
-
-    pub fn accept_model_response(
-        &mut self,
-        response: FinalizedAssistantResponse,
-    ) -> Result<(), AgentLoopError>;
-
-    pub fn accept_committed_tool_results(
-        &mut self,
-        delta: CommittedToolExchangeDelta,
-    ) -> Result<(), AgentLoopError>;
-
-    pub fn accept_committed_steer(
-        &mut self,
-        delta: CommittedSteerDelta,
-    ) -> Result<(), AgentLoopError>;
-}
-
-pub enum AgentLoopAction {
-    NeedModel { output_contract: OutputContract },
-    NeedTools {
-        response: FinalizedAssistantResponse,
-        calls: Arc<[ToolCall]>,
-    },
-    Finished { candidate: FinalizedAssistantResponse },
-}
-```
-
-Tool delta只能来自SessionStorage对最后一个matching Tool message生成的trusted delta。AgentLoop不接收execution-local ToolResult vector。
-
-`next_action()`one-shot emission、重复poll和typed error的精确契约仍由第三版评审L2冻结；本次ADR不提前关闭L2。
-
-AgentLoop禁止：
-
-- I/O；
-- 调用ModelGateway/ToolSet/PromptSet；
-- 写SessionStorage；
-- 处理approval、Cancel、Steer queue或terminal；
-- 接收uncommitted conversation。
-
-## Append与Projection更新
-
-SessionExecutor只消费ConversationStorage的append receipt和trusted delta；strict commit可见性由[INV-001](../architecture.md#跨模块不变量索引)定义，tolerant replay由[INV-002](../architecture.md#跨模块不变量索引)定义。本节只描述Executor在这些结果上的本地推进。
+**Canonical cross-module invariant: INV-102.**
 
 ```text
-SessionWriter.append(draft)
-→ strict live validation
-→ physical append
-→ CommittedSessionEntry
-→ storage-owned apply_committed
-→ publish StateEvent / wake waiter / start next operation
-```
-
-append OutcomeUnknown：
-
-- poison writer；
-- 不在同一run reopen/replay；
-- 进入Finishing；
-- 下次load执行tolerant replay。
-
-hot apply因资源/checkpoint故障失败时，丢弃hot projections并full replay；replay可以隔离损坏记录，不要求和live validator返回同一错误。
-
-## Submit流程
-
-```text
-CommandRequest(Submit, CommandId)
-→ TurnAdmissionQueue
-→ Idle arbitration
-→ reserve candidate TurnId
-→ state = Starting
-→ capture exact SessionDefinition/Agent/Workspace/shared resources
-→ build Arc<TurnExecutionContext>
-→ PromptSet.compose_user_message
-→ build StoredUserMessage {
-     source = Input,
-     turn_start = StoredTurnStart { safe history metadata }
-   }
-→ controlled append/apply
-→ Turn Running
-→ state = Running
-→ return TurnStarted { turn_id }
-→ AgentLoop.from_seed(current committed conversation)
-```
-
-Input append是领域Turn开始线性化点。capture/context compose失败时不创建Turn。
-
-`CommandId`只在当前Runtime定位in-flight Submit和pre-Turn Cancel，不进入ledger。
-
-## Drive AgentLoop
-
-```text
-AgentLoop.next_action()
-├─ NeedModel → pressure/Compaction or AgentRun
-├─ NeedTools → append Assistant(intermediate) then execute Tools
-└─ Finished → terminal/Steer arbitration
-```
-
-每次drive前验证：
-
-- current Turn仍Running；
-- execution_version一致；
-- no winning EmergencyControl；
-- writer可用；
-- current operation为空。
-
-## Model流程
-
-```text
-NeedModel
-→ current CommittedConversationView
-→ Compaction pressure check
-→ PromptSet.assemble
-→ ModelCallRequest::new
-→ install RunningOperation::Model
-→ ModelGateway.generate_model_turn
-→ terminal result
-→ revalidate Turn/version/checkpoint/operation/control
-→ AgentLoop.accept_model_response
-→ drive next action
-```
-
-ModelGateway每次operation最多一个provider attempt，SDK retry=0。
-
-logical retry：
-
-- AgentRun最多3次；
-- 同一个immutable `Arc<ModelCallRequest>`；
-- 旧future已terminal/drop且结果路径关闭；
-- retry delay期间仍处理Emergency/Lifecycle/Interaction/Snapshot；
-- source checkpoint、execution_version和current operation basis必须未变。
-
-## Tool流程
-
-### Start Exchange
-
-```text
-NeedTools { response, calls }
-→ append/apply Assistant(Intermediate with ToolCall content)
-→ ToolInvocation Items become Started
-→ install RunningOperation::Tools
-→ phase = ExecutingTools
-→ ToolSet.execute batch
-```
-
-assistant entry在Tool执行前durable，但不依赖额外ToolRound marker。
-
-### Prepare and Approval
-
-每个call：
-
-```text
-validate schema
-→ run PreToolUse hooks
-→ resolve policy/requirements
-→ optional Interaction approval/UserQuestion
-→ Sandbox capability check
-→ re-observe EmergencyControl
-```
-
-pre-execution deny/failure/cancel产生truthfulPreExecution ToolResult，不启动side effect。
-
-### Side Effect
-
-Tool start/Cancel/SecurityRevoked的canonical first-wins与settlement规则见[INV-401](../architecture.md#跨模块不变量索引)；本节只描述SessionExecutor如何安装和驱动owner-local slot。
-
-```text
-start reservation wins
-→ ToolOperationSlot::Running
-→ executor future
-→ Completed(exact result) | Abandoned
-```
-
-file mutation仍使用Session-local canonical file queue。持有mutation permit时不得等待UserQuestion；ask-user发生在ticket reservation前。
-
-### Commit Results
-
-Tool futures可以逆序完成。complete exchange的model-visible判定和typed delta构造由ConversationStorage按[INV-003](../architecture.md#跨模块不变量索引)拥有；SessionExecutor只提交exact outcome并消费返回的delta。owner按结果到达逐个：
-
-```text
-exact ToolExecutionOutcome::Completed
-→ append role=tool message
-→ apply Item Completed
-→ if this completes assistant call set:
-     receive CommittedToolExchangeDelta
-     AgentLoop.accept_committed_tool_results(delta)
-     clear Tools operation
-     consume at most one Steer before next Model
-
-ToolExecutionOutcome::Abandoned
-→ optional append ToolAbandoned
-→ terminalize/interruption path
-```
-
-complete exchange判断使用assistant call order和`TurnId + ItemId + ToolCallId`。没有`tool_round_completed`append。
-
-Cancel/SecurityRevoked在部分results之后到达：
-
-- 不启动remaining Prepared Tool；
-- Running Tool settle；
-- 已存在Tool messages保留；
-- complete call集合如果自然形成，则conversation projector可以将其加入conversation；
-- Turn仍按Interrupted terminalize；
-- incomplete exchange在cold/hot model view中排除。
-
-## Interaction流程
-
-```text
-ToolExecutionControl.request_approval/request_user_question
-→ SessionExecutor validates current Turn/Item
-→ append InteractionRequested
-→ apply
-→ publish UI-safe StateEvent
-→ phase WaitingApproval/WaitingForUserInput
-→ host ResolveInteraction
-→ validate expected Turn/Item/Request/family/key
-→ append InteractionResolved
-→ apply
-→ wake Tool continuation
-```
-
-等待不持有TurnControl reservation、lifecycle guard或file mutation permit。Steer只排队。
-
-## Steer流程
-
-**Canonical cross-module invariant: INV-102.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
-
-```text
-Steer(expected_turn_id, CommandId)
-→ validate current Running Turn
-→ bounded FIFO enqueue
+Steer(expected_turn_id, command_id)
+→ SessionExecutor validates active task
+→ enqueue to ActiveTurnControl steer channel
 → return Queued
 ```
 
-消费点：
+ActiveTurnTask只在以下safe point消费一条FIFO Steer：
 
-- complete Tool exchange进入conversation后；
-- 无ToolCall candidate final保存为Assistant Continue后；
-- Compaction Replace后重建AgentLoop再消费；
-- WaitingApproval/UserInput期间不消费。
+- complete Tool exchange已经进入live conversation后；
+- 无ToolCall candidate被保存为Assistant Continue后；
+- Compaction Replace完成后；
+- 下一次Model assembly前。
 
 ```text
 pop one Steer
-→ PromptSet.compose_user_message
-→ append UserMessage(source=Steer, turn_start=None)
-→ apply CommittedSteerDelta
-→ AgentLoop.accept_committed_steer
+→ compose CanonicalUserMessage
+→ apply live UserMessage(source=Steer)
+→ await inline record attempt
 → next Model
 ```
 
-Final reservation与Steer admission必须由owner原子排序。
+WaitingApproval、WaitingForUserInput、Sampling和Running Tool期间不消费。
 
-## FollowUp流程
+candidate final与Steer admission通过control actor的owner-local arbitration排序。该线性化点是内存control decision，不是Session record。
 
-FollowUp进入独立FIFO，可以在Running/Finishing期间排队。旧Turnterminal后：
+## FollowUp
+
+FollowUp由SessionExecutor保存，Running/Finishing期间可以排队。ActiveTurnTask返回terminal outcome后：
 
 ```text
-state = Idle
+actor clears active task
+→ state Idle
+→ apply/publish terminal if task尚未完成
 → admission arbitration
-→ accepted FollowUp或external Submit
-→ new TurnExecutionContext
-→ new Input UserMessage
+→ optional FollowUp starts new Turn with new context
 ```
 
-FollowUp不复用旧TurnContext、AgentLoop或Tool state。
+FollowUp不复用旧TurnExecutionContext、Tool state、retry state或conversation revision basis。
 
-连续优先规则保持：旧Turn不是由FollowUp启动时，已accepted FollowUp最多获得一次连续优先；随后有external Submit待决时优先external Submit。
-
-## Completed Turn流程
-
-AgentLoop Finished candidate：
+## Cancel
 
 ```text
-reserve final commit vs Steer admission
-├─ Steer queue empty
-│  → append Assistant(Final)
-│  → apply Turn Completed
-│  → state Idle
-└─ Steer admitted
-   → append Assistant(Intermediate Continue)
-   → apply
-   → consume one Steer
-   → continue same Turn
-```
-
-Final Assistant不能含ToolCall。
-
-## Cancel流程
-
-```text
-Cancel(Submit CommandId | TurnId)
-→ validate active target
+Cancel(target)
+→ validate active command/Turn
 → publish sticky cancel epoch
-→ cancel model/tool token where applicable
-→ return CancelAccepted { target, cancel_epoch }
+→ signal ActiveTurnTask and Tool cancellation handles
+→ return CancelAccepted
 ```
 
-立即response只确认control signal已发布。
+ActiveTurnTask随后：
 
-Executor观察后：
-
-- Starting：取消candidate，不创建Turn；
-- Running：停止新Model/Tool/Compaction和Steer消费，state→Finishing；
-- Prepared Tool：生成Cancelled result或Abandoned，不启动；
-- Running Tool：best-effort cancel，等待exact outcome或Abandoned；
-- Pending Interaction：appendCancelled resolution；
-- append TurnInterrupted(UserCancelled)；
-- state→Idle；
-- FollowUp保留等待。
-
-不承诺回滚已进入OS/provider的副作用。
-
-## Authority Security Interruption
-
-SecurityRevoked使用sticky EmergencyControl，流程与Cancel settlement相同，但terminal reason为SecurityRevoked。
-
-signal获胜后：
-
-- 不启动新Model/Tool/source read；
-- 不消费Steer；
+- 停止新Model、Tool、Compaction和Steer消费；
 - Prepared Tool不启动；
-- Running Tooltruthful settle；
-- terminal后重新resolve Workspace；
-- success Ready/Idle，failure Unavailable。
+- Running Toolbest-effort cancel并等待truthful outcome或Abandoned；
+- Pending Interaction在live state中Cancelled并resume waiter；
+- apply live TurnInterrupted(UserCancelled)；
+- await inline record terminal attempt；
+- return Interrupted outcome。
 
-不依赖durable ToolExecutionStarted；owner-local slot决定当前run是否已经开始副作用。
+Cancel response不等待recording或settlement。
 
-## Failure流程
+## SecurityRevoked
 
-### Starting failure
+SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。task结束后SessionExecutor使用current definition/authority重新resolveWorkspace；失败时进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。
 
-capture、composition或Input append NotCommitted失败：不创建Turn，返回typed rejection。
+recording failure不会产生Unavailable。
 
-Input append OutcomeUnknown：writer poison，candidate不在本run重试；下次load按文件实际内容决定Turn是否存在。
-
-### Running failure
-
-- model/compaction terminal failure：按retry policy后appendTurnFailed；
-- Tool普通失败有truthful ToolResult时Turn可以继续；
-- Tool outcome unknown、writer unavailable或invariant failure进入Finishing并appendInterrupted/Failed；
-- terminal append失败时history仍可read-only恢复，Session admission可Unavailable。
-
-### Projection failure
-
-hot apply失败：丢弃hot state并tolerant full replay。局部corruption返回diagnostics；无法得到安全current execution basis时停止Turn admission，不隐藏全部history。
-
-## Tool Retry
-
-MiniCore不自动retry已经可能发生副作用的Tool。
-
-- validation/policy前失败可以形成PreExecution result；
-- executor明确返回retryable error仍作为ToolResult交给模型，由模型决定是否再次调用；
-- append ToolResult失败不能重新执行Tool；
-- restart不自动重放incomplete ToolCall。
-
-## Context Overflow 与 Compaction
+## Compaction
 
 ```text
-NeedModel
-→ pressure Soft/Hard
-→ Compaction::plan(single prefix marker)
-→ PromptSet assemble Summary request
-→ RunningOperation::Compaction
-→ ModelGateway
-→ validate same plan/request/checkpoint/control
-→ append StoredCompaction(summary + first_kept_entry_id)
-→ apply Replace
-→ rebuild AgentLoop from new seed
-→ pressure recheck
+AgentRun assembly returns ContextOverflow/pressure
+→ ActiveTurnTask phase Compacting
+→ capture ConversationRevision and Arc<CompactionPlan>
+→ assemble CompactionSummary request
+→ call ModelGateway with bounded logical retry
+→ verify same revision/control generation
+→ validate summary
+→ apply live Replace
+→ await inline record StoredCompaction attempt
+→ next AgentRun assembly
 ```
 
-没有active instruction segment、protected entries、previous checkpoint或coverage frontier。
+record marker丢失时当前process继续使用summary；restart恢复旧conversation。Compaction不重建AgentLoop。
 
-单TurnCompaction受`max_compactions_per_turn`限制。同source checkpoint hard recovery最多一次；successful Replace后可以形成新basis。
+## Terminal与Failure
 
-## Reload
-
-shared `/reload`原子替换Prompt/Skill/Tool/Model current roots，只影响future Turn。active Turn继续使用captured old Arcs。
-
-`/reload workspace`与Workspace definition update要求Idle。Running/Finishing返回SessionBusy。
-
-## PrepareForUnload
+Terminal mutation先进入live state，再完成inline record attempt并publish：
 
 ```text
-LifecycleControl(PrepareForUnload)
-→ stop new admission
-→ grace period处理current control/resolution
-→ deadline到达则Cancel active Turn
-→ settle Running Tool
-→ best-effort terminal append
-→ close writer/executor
+apply Final Assistant / TurnInterrupted / TurnFailed
+→ await inline record attempt
+→ publish terminal StateEvent
+→ task returns TurnTaskOutcome
 ```
 
-旧queue、waiter、operation和snapshot handle不跨reload恢复。
+Model/Prompt/Tool invariant failure可以使Turn Failed/Interrupted。Session recording first failure原子更新internal `RecordingHealth`、公开`SessionRecordingState::Degraded`和当前脱敏diagnostic；Turn继续。当前domain StateEvent先携带Degraded Snapshot发布，随后补发一次`session_recording_changed`。后续`NotRecorded`不重复发布state event。
 
-## Snapshot
+如果ActiveTurnTask panic或channel异常退出，SessionExecutor把live Turn标记`Interrupted(RuntimeFailure)`，inline best-effort record并进入Idle或按Workspace readiness进入Unavailable。
 
-SessionExecutor每次authoritative mutation后发布immutable SessionSnapshot。Snapshot读取不等待普通work lane。
+## Snapshot与Events
 
-Snapshot包含：
+SessionExecutor发布的Snapshot包含：
 
-- Session readiness/execution state；
-- current Turn/phase；
-- ordered Items；
-- Pending Interactions；
-- queue摘要；
-- replay diagnostics摘要；
-- usage与safe diagnostics。
+- SessionExecutionState和optional current Turn；
+- ActiveTurn phase；
+- live Items和Pending Interaction；
+- Steer/FollowUp queue summary；
+- usage；
+- recording health；
+- redacted diagnostics。
 
-History中的orphan/incomplete Tool事实可以显示warning；model-visible conversation仍由sanitized projection决定。
-
-## Progress Event
-
-ProgressEvent可合并/丢弃：
-
-```text
-AgentMessage/Reasoning started/delta
-Tool stdout/progress
-model retry scheduled
-```
-
-StateEvent/Snapshot提供最终校正。ProgressEvent不写storage，不决定Turn状态。
-
-## Ingress与Operation处理顺序
-
-每次主循环iteration：
-
-```text
-1. observe EmergencyControl/LifecycleControl
-2. collect current operation readiness
-3. process Interaction control
-4. process Tool control/outcomes
-5. process state-eligible Steer/Submit/FollowUp
-6. drive AgentLoop when no current operation
-7. publish snapshot if changed
-```
-
-不持有短guard跨await。Model provider I/O、Tool execution、approval、UserQuestion、file mutation和observer notify期间零持有lifecycle/TurnControl短guard。
-
-## Multi-Session并发
-
-- 每Session独立Executor/Writer/Ingress/file mutation queue；
-- shared ModelGateway并发安全，多个Session的provider request不经过Gateway本地permit或admission queue；
-- 同Session同文件mutation FIFO；不同文件可并发；多文件/open-world Tool使batch Serial；
-- 跨Session共享Workspace冲突由host/user通过worktree或独立Workspace处理；
-- 不建立Runtime-global Session lock hierarchy。
-
-## Error分类
-
-```rust
-pub enum SessionExecutionError {
-    SessionBusy,
-    SessionNotReady,
-    TurnNotRunning,
-    StaleTurn,
-    InvalidState,
-    Storage(SessionStorageError),
-    Model(ModelCallError),
-    Tool(ToolExecutionError),
-    Interaction(InteractionError),
-    Compaction(CompactionError),
-    Invariant(SessionInvariantError),
-}
-```
-
-raw adapter error在owner module归一化；SessionExecutor只决定Turn recovery/terminal policy。
+recording Degraded或process crash时，Snapshot/StateEvent可能领先可恢复JSONL prefix。Host不能把收到`item_completed`或`turn_completed`解释为flush/fsync acknowledgement。
 
 ## Recovery
 
-物理扫描、局部corruption隔离与complete/incomplete exchange投影分别由[INV-002与INV-003](../architecture.md#跨模块不变量索引)定义；SessionExecutor只拥有unfinished Turn的保守terminalization和future admission状态。
-
-cold load：
-
 ```text
-SessionStorage tolerant replay
-→ publish replay diagnostics
-→ no Running Turn: Idle
-→ Running Turn:
-     do not restore AgentLoop/provider/Tool/waiter/queue
-     best-effort cancel Pending Interaction
-     preserve complete Tool exchanges
-     exclude incomplete exchanges from model conversation
-     append TurnInterrupted(HostRestart | RecoveryContextUnavailable)
-→ Idle or Unavailable
+open recorded Session and acquire writable lease when enabled
+→ tolerant replay complete lines
+→ writable Load truncates only final unterminated partial tail
+→ construct LiveSessionState from recorded prefix
+→ sanitize incomplete Tool exchanges
+→ mark recorded unfinished Turn InterruptedByRestart
+→ initialize new inline SessionRecorder at replayed recorded head
+→ capture current Workspace/readiness
+→ start SessionExecutor Idle or Unavailable
 ```
 
-replay malformed line、orphan、duplicate和invalid cross-reference不会brick整个Session。无法appendrecovery terminal时history仍可read-only读取，future admission按writer/readiness状态决定。
+不恢复：
 
-## Performance
+- ActiveTurnTask；
+- ModelCallRequest/provider stream；
+- Tool task/process handle；
+- Interaction waiter；
+- Steer/FollowUp queue；
+- retry timer；
+- old Recorder object或in-flight append。
 
-- Prompt assembly同步纯内存O(n)；
-- cold open完整O(n) replay；
-- loaded Session切换不replay；
-- no ProjectionSnapshot/checkpoint index；
-- observer progress有界并可丢弃；
-- Tool/Model futures不持有Session mutex；
-- 没有真实性能数据前不增加offload/counter/observer机制。
+recorded recovery closure可以inline best-effort append；失败不阻止admission。同一loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始，并根据current policy/storage重新建立health；旧unrecorded live tail永久丢失。
 
-## Test Matrix
+## 测试要求
 
-### State与Admission
+- 每Session最多一个ActiveTurnTask；
+- 多Session并发Model calls；
+- ordinary Model→Tool→Model async flow；
+- parallel Tool completion与ordered complete exchange；
+- Steer safe-point和final arbitration；
+- Interaction oneshot与Cancel；
+- retry backoff被Cancel/SecurityRevoked打断；
+- slow append只延迟同Session finalization，其他Session与sticky EmergencyControl仍可推进；
+- recording failure后Snapshot/StateEvent仍反映live state；
+- Degraded后修复storage不会使当前loaded instance重新写入；
+- Unload/Load可建立新Healthy Recorder，但只恢复recorded prefix；
+- task panic收口；
+- restart只恢复recorded prefix。
 
-- Idle→Starting→Running→Idle；
-- candidate取消不创建Turn；
-- Input内联StoredTurnStart；
-- duplicate in-flight CommandId；
-- Workspace update非Idle返回Busy。
+## 开放问题
 
-### AgentLoop与Model
-
-- NeedModel/NeedTools/Finished驱动；
-- typed committed Tool exchange delta；
-- logical retry复用同一request；
-- stale checkpoint/version/operation result丢弃；
-- Compaction Replace后重建segment。
-
-### Tool
-
-- Assistant ToolCall先append；
-- start reservation vs Cancel/Security双向race；
-- 不写ToolExecutionStarted；
-- 多Tool并发逆序结果；
-- 最后matching result自动形成exchange；
-- live duplicate result及ToolResult/ToolAbandoned冲突被strict writer拒绝；cold replay duplicate first valid wins、terminal outcome first valid wins，missing/orphan/abandoned-first result不推进AgentLoop；
-- append result失败不重放Tool；
-- outcome unknown→Abandoned；
-- Session-local file mutation FIFO。
-
-### Interaction
-
-- request-before-notify；
-- resolution-before-wake；
-- Waiting状态处理Steer/Cancel/Snapshot；
-- reconnect同RequestId；
-- terminal cleanup first-wins。
-
-### Steer与FollowUp
-
-- Tool exchange完成后再消费一条Steer；
-- final reservation race；
-- Finishing允许FollowUp排队；
-- 旧Turnterminal前不启动FollowUp。
-
-### Cancel与Recovery
-
-- CancelAccepted即时返回；
-- Prepared Tool不执行；
-- Running Toolsettlement；
-- malformed中段entry后load继续；
-- incomplete exchange隔离；
-- terminal append失败history仍readable；
-- restart不恢复old tasks。
-
-## 协同实现顺序
-
-阶段6–8继续作为一个vertical slice：
-
-```text
-AgentLoop core types
-→ ScriptedProviderAdapter
-→ PromptSet / ModelCallRequest
-→ ModelGateway single attempt
-→ SessionExecutor ordinary AgentRun
-→ Tool exchange auto-completion
-→ Compaction single-marker Replace
-→ cancellation/retry/replay fixtures
-→ Rig provider spike
-```
-
-## Diagnostics
-
-至少暴露：
-
-- current Session/Turn/phase；
-- active operation purpose；
-- queued Steer/FollowUp count；
-- Running/Settling Tool count；
-- retry count；
-- replay warning count/categories；
-- last storage/model/tool typed error。
-
-不得暴露credential、raw headers、absolute unauthorized path或full provider payload。
-
-## 明确不建立
-
-```text
-Runtime-global active Session
-Arc<Mutex<SessionExecutor>> across await
-Tool actor per call
-Interaction actor per request
-ToolRound entity / ToolRoundCompleted event
-ToolExecutionStarted durable marker
-ModelAttempt entity
-RunId / ModelStepId
-cross-Session resource lock manager
-projection checkpoint/index
-```
+RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。

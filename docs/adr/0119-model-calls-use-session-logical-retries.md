@@ -1,7 +1,9 @@
 # ADR 0119: 模型调用使用Session逻辑重试
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-27
+
+> 2026-07-30：Gateway single attempt、retry次数/backoff和delivery-safe error policy保留；logical retry owner改为ActiveTurnTask，basis改为control generation + `ConversationRevision`，删除`RunningOperation`和durable checkpoint校验。
 
 ## 背景
 

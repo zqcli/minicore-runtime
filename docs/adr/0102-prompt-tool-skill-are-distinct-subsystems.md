@@ -25,7 +25,7 @@
 - cross-binding通过private immutable object收敛：PromptSet创建时固定同一次capture得到的PromptResourceView、由parent ToolSet私有投影的ToolPromptView与SkillPromptView；assembly不接受caller伪造或来自另一组capture的替代view。
 - 依赖方向单一：Prompt 依赖 Tool/Skill 的窄 view，而非反向；三个 Service 之间无相互调用，Session execution 作为编排者按序取 view、组装、执行。
 - 代价只保留必要的view投影、private constructors和explicit reload publication；不再引入Prompt多层override、Skill Catalog revision/exact hash恢复协议或跨子系统fingerprint链。
-- 未来的动态 Context provider、Prompt hook、远程 source、插件协议应作为各自模块的 source adapter 接入，其输出必须经过同一 append/apply 与 conversation projection 规则，不得恢复 current-call 组装旁路，也不得据此重新引入通用 Resource 或领域分层。
+- 未来的动态Context provider、Prompt hook、远程source、插件协议应作为各自module的source adapter接入；需要影响后续模型输入的输出必须先通过LiveConversation typed apply，不得恢复current-call组装旁路。
 
 ## 历史
 

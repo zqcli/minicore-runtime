@@ -1,7 +1,7 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
-日期：2026-07-25
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
@@ -60,7 +60,7 @@ MiniCore 采用 Codex/Grok 的 durable/live 分离，但比这些项目更严格
 - loaded Session的Workspace definition update只在Idle时接受；authority hard restriction通过SecurityRevoked中断active Turn；
 - Session fork 复制 exact SessionDefinition 内容，但创建新的 SessionId 和独立 revision 序列；
 - fork不复制loaded state、WorkspaceSnapshot、security signal、PromptSet、ToolSet、SkillView或provider session；
-- process restart 后所有 Session 都视为 unloaded；不恢复旧 stream、Tool task、approval waiter 或 AgentLoop state。
+- process restart后所有Session都视为unloaded；不恢复旧ActiveTurnTask、stream、Tool task、approval waiter、Recorder object或in-flight append。
 
 ## 领域关系
 
@@ -81,7 +81,7 @@ Session
 loaded Session execution
 ├─ exact SessionDefinition
 ├─ resolved Workspace state
-├─ committed conversation projection
+├─ LiveSessionState seeded from recorded conversation prefix
 ├─ readiness
 ├─ execution state
 └─ optional active TurnExecutionContext
@@ -543,7 +543,7 @@ Unavailable 可以来自：
 
 `SystemError` 不是 durable Session lifecycle。需要修复的问题通过 `Unavailable(reason)`、load error 或 recovery diagnostics 表达。
 
-Readiness 是 projection，不是 Agent/Session lifecycle admission 的 authoritative substitute。每次 initiating UserMessage append 前仍必须重新检查 durable SessionLifecycle、AgentStatus、exact revisions 和 Workspace authorization。
+Readiness是projection，不是Agent/Session lifecycle admission的authoritative substitute。每次initiating UserMessage live apply前仍必须重新检查durable SessionLifecycle、AgentStatus、exact revisions和Workspace authorization。
 
 ## Session Execution State
 
@@ -610,16 +610,16 @@ Turn 在 Running 期间使用 transient execution phase：
 
 ```rust
 pub enum TurnExecutionPhase {
-    PreparingModel,
-    Compacting,
     Sampling,
+    RetryBackoff,
+    Compacting,
     WaitingApproval,
     WaitingForUserInput,
     ExecutingTools,
 }
 ```
 
-这些phase不进入Turn durable status。append/apply是各业务phase内的短线性化操作，不建立`Committing` phase；terminal entry写入和Cancel后的结构化收口由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由active SessionExecutor协调Cancel、Steer和SecurityRevoked。
+这些phase不进入recorded Turn status。live mutation是各业务phase内的短线性化操作，不建立`Committing` phase；terminal settlement和Cancel后的结构化收口由`SessionExecutionState::Finishing`表达。`Compacting`仍保持`TurnStatus = Running`，并由ActiveTurnTask协调Cancel、Steer和SecurityRevoked。
 
 `SessionExecutionState::Finishing`优先于TurnExecutionPhase解释：CancelAccepted后phase可以保留`ExecutingTools`等最后工作位置，但UI显示Stopping/Finishing。Finishing期间新的Steer被拒绝，FollowUp仍可进入process-local FIFO；新Turn只在旧Turnterminal并回到Idle后启动。
 
@@ -668,8 +668,8 @@ Steer到达时Turn保持Running。请求必须携带`expected TurnId`，并在cu
 ```text
 Steer(expected TurnId) accepted
 → push_back进入该Turn的SteerQueue
-→ 当前assistant/tool step完整committed
-→ 下一次Model前pop_front一条并append Steer
+→ 当前assistant/tool step已在LiveConversation中完整
+→ 下一次Model前pop_front一条并apply Steer live
 → 下一次模型调用看见 Steer
 ```
 
@@ -707,7 +707,7 @@ expected SessionLifecycle = Open
 → publish revision N+1
 ```
 
-active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交，并在resolve与Workspace-bound Prompt/Skill source capture全部成功后发布new Snapshot。successful update必须让loaded execution的current-definition projection与durable head一致；若projection apply失败，Session进入Unavailable并从durable truth reload，不能悄悄继续使用old head。
+active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交，并在resolve与Workspace-bound Prompt/Skill source capture全部成功后发布new Snapshot。definition owner的CAS成功后更新loaded definition view；conversation Recorder health不参与该操作。
 
 metadata update与definition update分开，避免改标题导致future Turn execution definition变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
 
@@ -728,7 +728,9 @@ load 语义：
 → single-flight 标记 Loading，并 capture current SessionDefinitionRevision
 → 读取 Agent durable head / AgentStatus
 → 读取 exact AgentRevisionRef 对应的 AgentDefinition
-→ 重建 committed conversation projection
+→ replay recorded conversation prefix
+→ writable recording open取得exclusive lease后只截断final unterminated partial tail
+→ 从replayed recorded head构建sanitized live state与new Recorder health
 → WorkspaceResolver::resolve(definition.workspace)得到candidate
 → PromptService/SkillService捕获candidate授权的Workspace-bound sources
 → candidate.finish得到immutable WorkspaceSnapshot
@@ -739,27 +741,28 @@ load 语义：
 
 若 final CAS 发现 SessionDefinitionRevision 已变化，必须丢弃旧 resolve 结果并按新 revision 重试或返回 retryable stale error，不能把旧Workspace/SessionModelConfig/Prompt projection 发布为 current loaded state。
 
-重复 load 幂等返回同一个 loaded execution owner/handle。
+重复load幂等返回同一个loaded execution owner/handle，不重建Recorder，也不能借重复load把Degraded恢复为Healthy。只有先完成Unload、再执行新的Load，才创建新的loaded instance与Recorder health；该Load只恢复recorded prefix，旧unrecorded live tail永久丢失。
 
 Agent Disabled/Deleted 时可以加载 history projection，但 readiness 为 Unavailable，新 Turn admission 被拒绝。
 
-exact AgentRevision 缺失或定义损坏时不能替换为 Agent current revision。history 若仍可读取，可以返回 read-only diagnostics；execution fail closed。
+exact AgentRevision缺失或定义损坏时不能替换为Agent current revision。recorded history若仍可读取可以返回diagnostics；execution fail closed。
 
 load 不恢复：
 
 ```text
 provider stream
-AgentLoop state
+ActiveTurnTask
 Tool task
 approval waiter
 cancellation token
+old SessionRecorder object / in-flight append / unrecorded live tail
 old WorkspaceSnapshot / EmergencyControl signal
 PromptSet / ToolSet / SkillView
 ```
 
 ## Unload Session
 
-unload 不修改 durable Session lifecycle或SessionDefinitionRevision。若grace deadline后必须停止active work，Executor仍按普通fail-closed规则append Interaction closure、truthful Tool settlement和TurnInterrupted；这些是执行事实，不是Unload专用metadata或conversation重写。
+unload不修改durable Session lifecycle或SessionDefinitionRevision。若grace deadline后必须停止active work，ActiveTurnTask仍按普通规则完成live Interaction closure、truthful Tool settlement和TurnInterrupted，并best-effort record；recording失败不阻止unload。
 
 ```text
 Loaded
@@ -769,10 +772,10 @@ Loaded
 → clear queued Steer/FollowUp并完成其typed outcome
 → grace期内允许active admission/Turn自然完成，继续处理Interaction resolution和truthful Tool outcome
 → deadline到期仍未Idle：Cancel active pre-Turn Submit或Turn，并以Cancelled关闭Pending Interaction
-→ terminal append / writer flush完成
+→ ActiveTurnTask terminal settlement完成
 → Unloading
 → drop resolved Workspace state
-→ drop hot conversation projection
+→ drop LiveSessionState
 → drop execution owner/runtime handles
 → Unloaded
 ```
@@ -783,16 +786,16 @@ Loaded
 - grace期内显式Cancel可以加速结束，但调用方不需要先手工cancel/resolve再调用Unload；
 - Cancel current Turn默认保留FollowUp，但PrepareForUnload已经在stop-admission时清理queued FollowUp，因此不会在卸载前启动新Turn；
 - 已取得ToolStartPermit并进入Running/Settling的Tool必须先确认truthful outcome或记录Abandoned，不能为了卸载直接drop；
-- 进入Idle且没有current append后关闭ingress/writer，Runtime才从loaded map移除handle；
+- ActiveTurnTask结束后关闭ingress；Recorder没有后台queue或drain step，Runtime随后从loaded map移除handle；Degraded health与unrecorded live tail随loaded instance一起销毁；
 - 重复 unload 订阅同一个LifecycleControl completion waiter并幂等返回同一个最终结果；effective deadline只能缩短，不能被后续请求延长。
 
 Runtime shutdown 使用：
 
 ```text
 逐Session发布PrepareForUnload
-→ 各Session独立graceful drain
+→ 各Session独立等待graceful Turn settlement
 → deadline到期后各自fail-closed cancel
-→ wait terminal append / writer close
+→ wait ActiveTurnTask settlement
 → unload
 ```
 
@@ -847,8 +850,8 @@ CloneAgent
 - source 为 Open 或 Archived；
 - source 不为 Deleted；
 - public boundary是genesis，或ConversationStorage定义的UserMessage/final AssistantMessage前后anchor；Compaction本身不作为MVP公开anchor，位于selected message path上的Compaction自然随path生效；
-- selected prefix可以包含non-terminal tail Turn；target staging在writable recovery时best-effort以`HistoricalFork`原因关闭它；
-- stream draft不属于durable prefix；若selected prefix含Pending Interaction、Started ToolInvocation或incomplete Tool exchange，不恢复旧waiter/Tool task，也不合成ToolResult；history仍可读，model conversation隔离不完整exchange；
+- selected prefix可以包含non-terminal tail Turn；target live recovery以`HistoricalFork`原因关闭它并best-effort record；
+- stream draft不属于recorded prefix；若selected prefix含Pending Interaction、Started ToolInvocation或incomplete Tool exchange，不恢复旧waiter/Tool task，也不合成ToolResult；history仍可读，model conversation隔离不完整exchange；
 - source SessionDefinition 和 exact AgentRevision 仍可读取；
 - Agent 必须 Enabled，才能发布 Open child Session。
 
@@ -856,7 +859,7 @@ fork capture：
 
 ```text
 source SessionDefinition at fork linearization point
-+ committed stable conversation checkpoint
++ recorded path或显式live snapshot
 + lightweight source provenance
 ```
 
@@ -885,7 +888,7 @@ provider session
 pending Interaction / 任何process-local SessionIngress lane
 ```
 
-fork使用staging + atomic publication。复制完成后执行tolerant replay；若target projection仍有Running Turn，writable recovery best-effort appendInteraction closure和`TurnInterrupted(HistoricalFork)`，不合成ToolResult。closure失败不隐藏已复制history，但child readiness可以Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
+fork使用staging + atomic publication。复制完成后执行tolerant replay；若target live view仍有Running Turn，立即标记`TurnInterrupted(HistoricalFork)`并best-effort record，不合成ToolResult。recording失败不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
 
 Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。ID按Session scope路由，新append为EntryId及MiniCore生成的Turn/Item/Request ID使用fresh随机值避免碰撞，不执行nested remap。完整storage规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
@@ -984,7 +987,7 @@ Session definition update必须在per-session lifecycle synchronization内同时
 
 ### Entry Append vs Cancel/Unload
 
-append一旦进入physical write不可被run cancellation中断。cancel/unload等待结果，再完成terminal handling。
+inline `SessionRecorder.record().await`一旦进入当前physical write attempt，不由run cancellation截断。sticky Cancel/SecurityRevoked仍可立即发布；同Session terminal publication和Unload completion等待该attempt返回。
 
 ## Crash Recovery
 
@@ -993,29 +996,30 @@ ConversationStorage的物理扫描与Tool exchange sanitizer以[INV-002和INV-00
 Runtime restart：
 
 ```text
-所有 durable Agent/Session/definition/conversation 保留
+durable Agent/Session definitions保留
+conversation只保留SessionRecorder已写入的prefix
 所有 loaded Session execution state 消失
 → SessionLoadState = Unloaded
 ```
 
 显式 load 时：
 
-1. 读取SessionHeader和durable head并校验lifecycle；
+1. 读取Session durable definition owner并校验lifecycle；
 2. 读取current exact SessionDefinitionRevision与exact AgentRevisionRef，供future Turn使用；
-3. 调用ConversationStorage执行INV-002 tolerant replay并取得selected path、sanitized projections与diagnostics；
+3. 调用ConversationStorage执行INV-002 tolerant replay并取得recorded selected path、sanitized live seed与diagnostics；
 4. 保留INV-003认定的complete Tool exchange，隔离incomplete/orphan exchange；
 5. 重新resolve Workspace；
 6. 检测旧Running Turn及pending/open state；不恢复旧Tool task，complete Tool exchange保留，incomplete exchange从model conversation排除；
-7. writable recovery best-effort appendInteraction closure和TurnInterrupted；closure失败不隐藏history，但future Turn admission可以Unavailable；
-8. 进入Ready、Unavailable或带warning的readable状态。
+7. 在live view中把unfinished Turn标记InterruptedByRestart，并inline best-effort append recovery closure；recording失败不阻止admission；
+8. 初始化新SessionRecorder，进入Ready、WorkspaceUnavailable或带recording warning的状态。
 
-MVP不保存或加载ProjectionSnapshot/checkpoint index；完整replay的线性成本是有意取舍。Runtime内切换不同已loaded Session只路由现有SessionExecutionHandle，不执行上述load。恢复不加载旧provider stream、AgentLoop、Tool task、waiter、queue或其他process-local执行状态。
+MVP不保存或加载ProjectionSnapshot/checkpoint index；完整recorded-prefix replay的线性成本是有意取舍。Runtime内切换不同已loaded Session只路由现有SessionExecutionHandle。恢复不加载旧provider stream、ActiveTurnTask、Tool task、waiter、queue或其他process-local执行状态。
 
 禁止：
 
 - 用Agent current revision替代Session pin来构造future Turn；
 - 把StoredTurnStart当成restart execution checkpoint；
-- 恢复旧provider stream、AgentLoop、Tool task或approval waiter；
+- 恢复旧provider stream、ActiveTurnTask、Tool task或approval waiter；
 - 自动重放outcome unknown的非幂等Tool；
 - 用last-good WorkspaceSnapshot绕过当前authority；
 - 自动reparent、合成ToolResult或重写中段损坏记录。
@@ -1037,18 +1041,18 @@ SessionBusy
 SessionUnavailable
 RevisionUnavailable
 InvalidLifecycleTransition
-DurableStateCorrupt
+RecordedStateCorrupt
 IdConflict
 OutcomeUnknown
 ```
 
 重试建议：
 
-- stale/busy/outcome unknown：重新读取 durable truth 后决定；
+- stale/busy/outcome unknown：重新读取对应definition owner或recorded prefix后决定；
 - disabled/archived：需要显式 enable/unarchive；
 - deleted/invalid transition：普通流程不可恢复；
 - unavailable/current definition revision missing：修复Workspace/dependency或definition retention后retry admission/load；
-- history corruption：保留read-only history与replay diagnostics；普通load不自动repair，中段坏记录被skip/isolate。
+- history corruption：保留可解释recorded history与replay diagnostics；普通load不自动repair，中段坏记录被skip/isolate。
 
 ## 方案比较
 
@@ -1118,7 +1122,7 @@ Agent release channel
 
 ## 基础不变量
 
-- Agent 是 durable reusable definition owner，不是 running AgentLoop；
+- Agent是durable reusable definition owner，不是running ActiveTurnTask；
 - Agent revision immutable，old revision 不被 current update 覆盖；
 - Agent status 与 AgentRevision 正交；
 - Session pin exact AgentRevisionRef；
@@ -1138,9 +1142,9 @@ Agent release channel
 - Steer 不把 Turn 变成 Interrupted；
 - fork从genesis或公开message anchor创建；mid-Turn prefix在target staging中以HistoricalFork中断后才发布；
 - fork 不复制 loaded execution state或 authorization capability；
-- host restart 后 loaded state 全部丢失，可由 durable truth 重建；
+- host restart后loaded state全部丢失，只能由durable definitions与recorded conversation prefix重建；
 - recovery 不使用 current revision 冒充历史 exact reference；
-- recovery terminalization、pending Interaction closure 和 Started ToolInvocation closure 逐 entry append，幂等由 committed prefix 状态判断保证（exclusive lease 下恢复单跑，已处理则跳过）。
+- recovery terminalization、pending Interaction closure和Started ToolInvocation closure先更新live recovery view，再best-effort record；recording失败不阻止future admission。
 
 ## Test Matrix
 
@@ -1164,6 +1168,9 @@ Agent release channel
 - delete 非 Archived/loaded Session 返回 conflict；
 - load single-flight，且 definition update 先赢时旧 load publication CAS 失败；
 - load exact Agent revision，不用 current 替代；
+- Degraded状态下重复Load幂等返回同一owner，不能恢复Recorder；
+- Unload/Load只恢复recorded prefix并重新建立Recorder health；
+- writable Load只截断final unterminated partial tail，保留完整newline-terminated entry与中段内容；
 - Workspace unavailable 形成 Loaded + Unavailable；
 - unload stop-admission、grace deadline、fail-closed cancel与幂等completion waiter；
 - Session execution Idle/Starting/Running/Finishing；
@@ -1190,11 +1197,11 @@ Agent release channel
 - Workspace candidate resolve/commit失败保留old definition/Snapshot；
 - authority/host SecurityRevoked不创建SessionDefinitionRevision，Turn terminal后重新resolve；
 - started Tool在SecurityRevoked下truthful settlement，open handle不承诺动态撤销；
-- Steer expected TurnId 与 final terminal append race；
+- Steer expected TurnId与live final arbitration race；
 - restart 后所有 Session Unloaded；
 - incomplete Turn 只 terminalize 一次；
 - recovery best-effort terminalize Turn、关闭pending Interaction并保留已有tool message；incomplete Tool exchange从model conversation隔离；
-- 已terminal Turn遗留pending Interaction或Started Item时产生replay diagnostic，history仍可读，future admission按writer/readiness决定；
+- 已terminal Turn遗留pending Interaction或Started Item时产生replay diagnostic，history仍可读，future admission只由definition/Workspace readiness决定；
 - current exact revision缺失时future Turn admission fail closed；historical StoredTurnStart ref缺失不阻塞history read；
 - Deleted identity 不复用；
 - Purge 不属于普通 lifecycle。
@@ -1226,7 +1233,7 @@ Agent release channel
 - [x] 定义 active/future Turn 和 lifecycle race。
 - [x] 定义 WaitingApproval、WaitingForUserInput、Steer 和 Interrupted 的关系。
 - [x] 定义 conservative crash recovery。
-- [x] 完成 operation-centric Item、durable Interaction 和 terminal cleanup 类型。
+- [x] 完成operation-centric Item、live Interaction和terminal cleanup类型。
 - [x] 完成Session ledger identity、entry parent tree、Fork保留历史ID、strict append与tolerant replay contract。
 - [x] 完成SessionExecutor owner和crate-private request interface。
 - [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。

@@ -1,27 +1,27 @@
 # ModelGateway架构设计
 
-日期：2026-07-25
+日期：2026-07-30
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
+状态：当前权威架构（ADR 0126后，生产实现待启动）
 
 ## 目的
 
 本文定义MiniCore的provider-neutral模型调用模块，回答：
 
-- SessionExecutor如何从`AssembledModelContext`发起一次模型调用；
+- ActiveTurnTask如何从`AssembledModelContext`发起一次模型调用；
 - Model identity、definition revision、capabilities和effective limits如何在Turn内固定；
 - System、User、Assistant和Tool role如何映射到不同provider；
 - ToolSpec、tool choice、OutputContract、reasoning和attachments如何编码；
 - streaming delta、finalized response、usage、finish reason和provider metadata如何规范化；
 - 单次provider attempt与Session logical retry如何区分；
 - cancellation、authentication、secret redaction、跨Session并发调用和provider rate limit反馈如何治理；
-- provider prompt cache、connection reuse和continuation如何保持Transcript-First等价性；
+- provider prompt cache、connection reuse和continuation如何保持完整logical input等价性；
 - Rig 0.40.0可以为provider协议映射与单次attempt调用复用哪些能力，以及这些能力如何被限制在private `ProviderAdapter`内。
 
 本文不定义：
 
 - Prompt内容、conversation visibility或`MessageRecord → ModelMessage`转换；
-- Session logical retry、compaction orchestration或Turn terminal规则；本文只摘要Gateway terminal error与该policy的边界，具体规则以Session Execution和ADR 0119为权威；
+- ActiveTurnTask logical retry、compaction orchestration或Turn terminal规则；本文只摘要Gateway terminal error与该policy的边界，具体规则以Session Execution和ADR 0119为权威；
 - Tool execution、approval或ToolResult持久化；
 - Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
 - provider-native compaction artifact的持久化格式；
@@ -32,9 +32,9 @@
 - [Prompt子系统架构设计](prompt.md)
 - [Turn执行模块与执行上下文架构设计](turn-execution-context.md)
 - [Session Execution架构设计](session-execution.md)
-- [Conversation与SessionStorage架构设计](conversation-storage.md)
+- [Conversation Recording与Replay架构设计](conversation-storage.md)
 - [Runtime Interface与公开协议架构设计](runtime-interface.md)
-- [ADR 0104：SessionStorage是durable truth](../adr/0104-session-storage-is-durable-truth.md)
+- [ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
 - [ADR 0106：ModelGateway使用一个深异步调用interface](../adr/0106-model-gateway-is-single-deep-operation.md)
 - [ADR 0119：模型调用使用Session逻辑重试](../adr/0119-model-calls-use-session-logical-retries.md)
 - [ADR 0120：失败由事实拥有模块分类，恢复由执行拥有者决定](../adr/0120-failures-stay-with-owning-modules.md)
@@ -55,11 +55,11 @@
 - active Turn内不允许静默替换provider/model identity；
 - MVP中每次`generate_model_turn`只执行一个provider attempt，Rig和底层provider SDK automatic retry固定为0；
 - ModelGateway不执行transparent retry、401 refresh-and-resend或WebSocket → HTTP transport fallback；
-- SessionExecutor只对同一个immutable request执行最多3次AgentRun logical retry；CompactionSummary最多1次；
+- ActiveTurnTask只对同一个immutable request执行最多3次AgentRun logical retry；CompactionSummary最多1次；
 - cross-model fallback不是ModelGateway transparent behavior；
 - streaming progress是process-local observer data，不进入SessionStorage；
 - finalized response或typed error是一次gateway调用唯一terminal result；
-- provider-reported usage随成功assistant response保存；失败attempt usage在MVP中只属于ModelGateway internal telemetry；
+- provider-reported usage随成功assistant response进入live state并成为record candidate；recording degraded时可能无法跨restart恢复；失败attempt usage只属于ModelGateway internal telemetry；
 - authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
 - prompt cache、connection reuse、`previous_response_id`和incremental request只是wire optimization；
 - 所有optimization必须能退回完整`AssembledModelContext`请求；
@@ -221,7 +221,7 @@ Rig 0.40.0的integration gaps：
 | provider state | Model/registry + provider module | thread/turn client state | sampler内部 | provider client/model | Gateway内部connection pool |
 | Prompt assembly | AgentSession/AgentLoop context | Turn构造Responses input | chat state/sampling types | CompletionRequest | 只接受PromptSet输出 |
 | streaming | typed content events | typed Responses events | ACP/update stream | typed assistant content stream | droppable progress + one terminal result |
-| retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | Gateway single attempt，SessionExecutor logical retry |
+| retry owner | AgentSession为主 | client/turn loop协作 | sampler retry | caller决定 | Gateway single attempt，ActiveTurnTask logical retry |
 | transport fallback | provider-specific | WebSocket → HTTP | backend显式配置 | adapter-specific | MVP不启用 |
 | cross-model fallback | model selection层 | 不作为transparent stream fallback | 未确认 | 无统一语义 | active Turn内禁止 |
 | continuation/cache | provider compat/cache flags | strict prefix + previous response | 未确认 | provider additional params | strict equivalence，full request fallback |
@@ -242,7 +242,7 @@ ModelGateway::generate_model_turn(request, progress, cancel)
 
 - caller只理解完整request、progress和terminal result；
 - provider attempt、connection、auth、delivery-state mapping、cache和continuation全部具有locality；
-- 与SessionExecutor的`RunningOperation`自然对齐；
+- 与ActiveTurnTask中的一次普通async await自然对齐；
 - fake adapter可以通过同一interface测试；
 - 删除Gateway会把大量provider复杂性重新散落到caller，满足deep module deletion test。
 
@@ -278,10 +278,10 @@ ModelTurnSession::generate(...) -> ModelCallStream
 
 问题：
 
-- SessionExecutor需要管理第二个turn-scoped lifecycle；
+- ActiveTurnTask需要管理第二个turn-scoped provider lifecycle；
 - caller必须理解stream terminal frame、drop、poisoned continuation和session reset；
 - provider session容易被误认为Turn truth或recovery source；
-- 若把provider session暴露给caller，logical retry和Steer后的segment rebuild会迫使SessionExecutor管理第二套session lifecycle；
+- 若把provider session暴露给caller，logical retry和Steer后的新request会迫使ActiveTurnTask管理第二套provider session lifecycle；
 - connection/continuation完全可以留在Gateway内部并用full request重新证明兼容性。
 
 结论：不作为外部interface。Codex式WebSocket session可以作为private adapter优化。
@@ -305,22 +305,21 @@ MiniCoreRuntime
    ├─ ProviderRateLimitState
    └─ RedactionPolicy
 
-SessionExecutor
-├─ RunningOperation::GenerateModelResponse
+ActiveTurnTask
+├─ await ModelGateway::generate_model_turn
 │  ├─ immutable ModelCallRequest + logical_retry_count
 │  └─ scoped ProgressEventPublisher<ModelProgressEvent>
-├─ RunningOperation::WaitForModelRetry
-│  └─ same ModelCallRequest + ready_at + typed resume basis
-└─ RunningOperation::CompactConversation
-   └─ immutable CompactionSummary ModelCallRequest + logical_retry_count
+├─ cancellation-aware retry sleep
+│  └─ same ModelCallRequest + ConversationRevision/control_generation
+└─ async CompactionSummary call
+   └─ immutable CompactionPlan + ModelCallRequest
 ```
 
 规则：
 
 - ProviderCatalog、AuthStore和ProviderAdapter是ModelGateway implementation details；
 - Runtime公开model query以后通过MiniCoreRuntime facade取得safe catalog view；
-- SessionExecutor不直接resolve auth、base URL、API model name或provider protocol；
-- AgentLoop不直接调用ModelGateway；
+- ActiveTurnTask不直接resolve auth、base URL、API model name或provider protocol；
 - ToolService、PromptService和SkillService不调用ModelGateway；
 - ModelGateway不读SessionStorage，不append entry，不发布Runtime durable event；
 - ModelGateway没有current Session、current Turn、current cwd或current model字段。
@@ -362,7 +361,7 @@ impl ModelGateway {
 
 `initialize()`构建并返回第一个immutable catalog root。`build_reload_candidate()`准备并validate新catalog但不发布。ModelGateway不保存current catalog pointer，也没有publish方法；Runtime把candidate放入完整`SharedResourceRoots`后一次publication。`resolve_for_turn`只访问Turn admission已捕获的catalog Arc，不读取credential，也不在capture期间隐式执行remote I/O。
 
-`generate_model_turn`最多执行一个完整provider attempt。调用期间可以等待request前credential resolve/refresh和stream，但不经过Gateway本地模型调用permit；它运行在`RunningOperation`中，不阻塞SessionIngress scheduler或control loop。provider terminal error返回SessionExecutor后，本次Gateway operation结束；Gateway不内联retry timer。
+`generate_model_turn`最多执行一个完整provider attempt。调用期间可以等待request前credential resolve/refresh和stream，但不经过Gateway本地模型调用permit；它由ActiveTurnTask直接await，SessionExecutor control actor继续处理ingress。provider terminal error返回ActiveTurnTask后，本次Gateway operation结束；Gateway不内联retry timer。
 
 不提供：
 
@@ -645,7 +644,7 @@ pub enum OutputContract {
 }
 ```
 
-`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，Gateway必须返回`UnexpectedToolCall`，不能把它交给SessionExecutor执行。
+`NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，Gateway必须返回`UnexpectedToolCall`，不能把它交给ActiveTurnTask执行。
 
 `Structured`在MVP中同样要求`tools`为空。provider-native strict schema只是第一层约束；Gateway仍必须对terminal text执行exact JSON parse和本地schema validation。MVP不做JSON repair、type coercion或Markdown code-fence extraction。需要Tool的AgentRun先完成普通ToolRound，之后再使用新的Structured `ModelCallRequest`取得terminal structured response。
 
@@ -666,7 +665,7 @@ ModelGateway不能：
 - 把diagnostic变成prompt text；
 - 把ToolSpec描述与ToolSet executor重新join；
 - 把OutputContract伪装为system text；
-- 把未committed draft加入payload。
+- 把尚未进入sanitized LiveConversation的draft加入payload。
 
 无法无损映射时返回`UnsupportedCapability`或`InvalidRequest`，不能best-effort改变语义。
 
@@ -676,7 +675,8 @@ ModelGateway不能：
 pub struct ModelCallRequest {
     model: Arc<TurnModelSnapshot>,
     purpose: ModelCallPurpose,
-    input: AssembledModelContext,
+    input: Arc<AssembledModelContext>,
+    source_revision: ConversationRevision,
     max_output_tokens: Option<NonZeroU32>,
 }
 
@@ -684,7 +684,8 @@ impl ModelCallRequest {
     pub(crate) fn new(
         model: Arc<TurnModelSnapshot>,
         purpose: ModelCallPurpose,
-        input: AssembledModelContext,
+        input: Arc<AssembledModelContext>,
+        source_revision: ConversationRevision,
         max_output_tokens: Option<NonZeroU32>,
     ) -> Result<Self, ModelRequestValidationError>;
 }
@@ -697,7 +698,7 @@ impl ModelCallRequest {
 - system/messages/tools只存在于`input`；
 - streaming是Gateway implementation strategy，不是model-visible caller option；
 - cache policy默认由exact model definition和Runtime policy确定；
-- SessionId、TurnId、execution_version和OperationType由外层RunningOperation携带；
+- SessionId、TurnId和control_generation由ActiveTurnTask调用scope携带；source ConversationRevision随request固定；
 - request不含ModelCallId、RunId、ModelStepId或ModelAttemptId；
 - request不含credential、auth reference、base URL、header或raw provider params。
 
@@ -706,6 +707,7 @@ constructor验证：
 - assembly_proof.purpose等于request purpose；
 - `assembly_proof.turn_model`等于TurnModelSnapshot的exact `TurnModelRef`；
 - assembly_proof.output_contract等于input.output_contract结构值；
+- assembly_proof.source_revision等于request source_revision；
 - `NoToolCalls`或`Structured`时input tools为空；
 - `CompactionSummary`的assembly budget proof必须存在，且proof max output等于request `max_output_tokens`；`AgentRun`不得携带该proof；
 - max_output_tokens满足Snapshot effective limits。
@@ -733,7 +735,7 @@ purpose：
 - input由PromptSet的CompactionSummary variant产生；
 - `OutputContract::NoToolCalls`且ToolSpec为空；
 - 提供由Compaction planning基于pinned `EffectiveModelLimits`和summary call context feasibility派生的明确max_output_tokens；
-- 不进入AgentLoop，不把summary result解释成普通assistant response；
+- 不进入AgentRun conversation path，不把summary result解释成普通assistant response；
 - 不调用provider-native compact endpoint；首版仍是普通portable model generation。
 
 未来只有真实业务任务出现时才增加variant，例如SessionTitle；不能增加`Retry`或`Background`。
@@ -793,7 +795,7 @@ RigProviderAdapter
 ScriptedProviderAdapter
 ```
 
-它按脚本返回stream delta、terminal response或typed error，并记录收到的private request，供SessionExecutor、ModelGateway和Compaction共享vertical-slice tests使用。测试仍必须经过`ModelCallRequest::new → ModelGateway.generate_model_turn → ProviderAdapter`，不能让SessionExecutor或Compaction直接调用fake model interface。只有出现需要纯函数映射/property test的真实场景时再增加`DeterministicProviderAdapter`。
+它按脚本返回stream delta、terminal response或typed error，并记录收到的private request，供ActiveTurnTask、ModelGateway和Compaction共享vertical-slice tests使用。测试仍必须经过`ModelCallRequest::new → ModelGateway.generate_model_turn → ProviderAdapter`，不能让ActiveTurnTask或Compaction直接调用fake model interface。只有出现需要纯函数映射/property test的真实场景时再增加`DeterministicProviderAdapter`。
 
 因此ProviderAdapter是一个真实seam，而不是为单一implementation增加的假抽象。
 
@@ -880,8 +882,8 @@ pub enum ModelContentDelta {
 规则：
 
 - scoped publisher是process-local；AgentRun adapter必须先无损更新`StreamingItem`和ItemId映射，之后的Host ProgressEvent enqueue才是bounded、可合并/丢弃的observer路径；CompactionSummary adapter不创建ItemId；
-- publisher由RunningOperation scope到SessionId/TurnId；SessionExecutor创建的AgentRun adapter使用`content_index`维护`StreamingItem`并分配MiniCore ItemId；
-- ModelGateway只发布provider-neutral content index和delta，不创建ItemId，也不接收SessionId或TurnId；Session logical retry由SessionExecutor发布`model_retry_scheduled`；
+- publisher由ActiveTurnTask scope到SessionId/TurnId；task创建的AgentRun adapter使用`content_index`维护`StreamingItem`并分配MiniCore ItemId；
+- ModelGateway只发布provider-neutral content index和delta，不创建ItemId，也不接收SessionId或TurnId；logical retry由ActiveTurnTask发布`model_retry_scheduled`；
 - 连续text/reasoning delta可以合并；
 - Host progress queue满可以丢弃中间delta，但不能跳过operation-local累积；
 - Host progress sink关闭不取消provider调用或operation-local累积；
@@ -891,8 +893,8 @@ pub enum ModelContentDelta {
 - provider未暴露的reasoning不可推断；
 - terminal success必须返回完整FinalizedAssistantResponse；
 - terminal error必须返回typed ModelCallError；
-- 对AgentRun，SessionExecutor把finalized text/reasoning content转为同ItemId的FinalItemCandidate；ToolCall走assistant entry append/apply后的Started ToolInvocation projection，只有正式Item append/apply后才发布对应StateEvent；CompactionSummary结果不创建Item；
-- SessionExecutor在terminal error后丢弃StreamingItem；若启动logical retry则发布`model_retry_scheduled`清理Host临时view，Turn terminal或新Snapshot提供最终校正。
+- 对AgentRun，ActiveTurnTask把finalized text/reasoning content转为同ItemId的live final mutation；ToolCall在assistant live apply后产生Started ToolInvocation，随后完成inline record attempt并发布StateEvent；CompactionSummary结果不创建Item；
+- ActiveTurnTask在terminal error后丢弃StreamingItem；若启动logical retry则发布`model_retry_scheduled`清理Host临时view，Turn terminal或新Snapshot提供最终校正。
 
 不通过progress发布：
 
@@ -974,17 +976,17 @@ ToolCall仅在`output_contract = None`且request tools非空时允许。validati
 | ToolCall permission | Content | Finish reason | Result |
 | --- | --- | --- | --- |
 | forbidden | any ToolCall | any | UnexpectedToolCall |
-| allowed | ToolCall | ToolCalls / Unknown | valid response → NeedTools |
+| allowed | ToolCall | ToolCalls / Unknown | valid response → async loop执行Tool path |
 | allowed | ToolCall | Length / ContentFiltered | IncompleteResponse |
 | allowed | ToolCall | Stop / Refused | InvalidProviderResponse |
 | any | no ToolCall | ToolCalls | InvalidProviderResponse |
 | any | no ToolCall | Length / ContentFiltered | IncompleteResponse |
-| any | no ToolCall + non-empty refusal text | Refused | valid refusal response → Finished |
+| any | no ToolCall + non-empty refusal text | Refused | valid candidate response |
 | any | no ToolCall + empty refusal | Refused | InvalidProviderResponse |
 | any | no user-visible Text | Stop / Unknown | IncompleteResponse |
-| any | user-visible Text | Stop / Unknown | validate Structured when requested → Finished |
+| any | user-visible Text | Stop / Unknown | validate Structured when requested → candidate response |
 
-通过validation后，ToolCall presence才是AgentLoop路由到`NeedTools`的主要事实；无ToolCall response路由到candidate `Finished`。ModelGateway不执行Tool，也不决定Turn terminal。
+通过validation后，ToolCall presence决定ActiveTurnTask进入Tool path还是candidate arbitration。ModelGateway不执行Tool，也不决定Turn terminal。
 
 ### FinalizedReasoning
 
@@ -1025,8 +1027,8 @@ pub enum ModelFinishReason {
 - 原始code可以作为allowlisted redacted metadata保留；
 - generic Rig response没有finish reason时使用provider-specific adapter提取；
 - 仍不可得时使用Unknown，不根据文本内容伪造；
-- ToolCall content是通过Response Validation后AgentLoop决定NeedTools的主要事实；finish reason在Gateway中用于一致性校验和diagnostics；
-- Length和ContentFiltered返回`IncompleteResponse`，不进入AgentLoop；
+- ToolCall content是通过Response Validation后ActiveTurnTask进入Tool path的主要事实；finish reason在Gateway中用于一致性校验和diagnostics；
+- Length和ContentFiltered返回`IncompleteResponse`，不进入live conversation；
 - provider返回finalized refusal content时使用successful response + Refused；请求在生成response前被policy拦截时返回SafetyBlocked error；
 - safety/refusal不能只表现为空Stop。
 
@@ -1071,7 +1073,7 @@ pub struct ModelUsage {
 - provider若为失败attempt报告usage，该事实只进入ModelGateway internal telemetry；不放入ModelCallError、不进入Session aggregate，也不创建synthetic assistant或独立Usage entry；
 - 因此MiniCore SessionStorage不是provider billing ledger。
 
-StoredAssistantMessage的`retry_count`定义为SessionExecutor对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
+StoredAssistantMessage的`retry_count`定义为ActiveTurnTask对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
 
 ## Retry
 
@@ -1088,7 +1090,7 @@ validate request
 → normalize one terminal result or typed error
 ```
 
-Rig和底层provider SDK automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由SessionExecutor根据typed error决定是否logical retry。
+Rig和底层provider SDK automatic retry必须配置为0。ModelGateway不执行DNS/connect/TLS retry、429/5xx retry、401 refresh-and-resend、stream restart或WebSocket → HTTP fallback。失败后本次Gateway operation立即terminal，由ActiveTurnTask根据typed error决定是否logical retry。
 
 每个ProviderAttemptError必须携带private delivery state：
 
@@ -1102,7 +1104,7 @@ pub(crate) enum ProviderRequestDeliveryState {
 }
 ```
 
-HTTP status或“尚无delta”本身不能决定delivery state。adapter必须根据protocol contract、provider response和transport阶段准确映射：已发送但outcome不确定时返回`RequestOutcomeUnknown`，已发布partial output后失败返回`StreamInterrupted`。该proof决定SessionExecutor能否安全logical retry，不能因为Gateway不内联retry而省略。
+HTTP status或“尚无delta”本身不能决定delivery state。adapter必须根据protocol contract、provider response和transport阶段准确映射：已发送但outcome不确定时返回`RequestOutcomeUnknown`，已发布partial output后失败返回`StreamInterrupted`。该proof决定ActiveTurnTask能否安全logical retry，不能因为Gateway不内联retry而省略。
 
 只有`NotSent`和provider明确证明未开始执行的`RejectedBeforeExecution`可以映射为默认retryable reason。`AcceptedNoOutput`若没有更强的provider terminal proof必须映射`RequestOutcomeUnknown`；不能把“还没收到delta”当作未执行证明。
 
@@ -1138,7 +1140,7 @@ request前credential可以resolve/refresh。provider返回401时terminal为`Auth
 ### Rate Limit
 
 - Gateway规范化typed `Retry-After`但不sleep；
-- SessionExecutor只在provider hint不超过60秒时按logical retry policy等待；
+- ActiveTurnTask只在provider hint不超过60秒时按logical retry policy等待；
 - rate-limit state按provider route和auth principal的opaque identity隔离；
 - active cooldown只对对应route/principal快速返回`RateLimited { retry_after }`，Gateway本身不sleep，也不影响无关provider。
 
@@ -1162,29 +1164,28 @@ Responses model → capability不同的Chat Completions model
 - 当前Turn失败或由用户显式Cancel后重试；
 - 不由ModelGateway悄悄完成。
 
-### Session Logical Retry
+### ActiveTurnTask Logical Retry
 
-Gateway single attempt返回typed error后，SessionExecutor决定logical retry：
+Gateway single attempt返回typed error后，ActiveTurnTask决定logical retry：
 
 ```text
 current Turn still Running and TurnId matches
-execution_version unchanged
-ConversationCheckpoint.entry_id unchanged
-current operation/control basis unchanged
+control_generation unchanged
+ConversationRevision unchanged
 same `Arc<ModelCallRequest>` is reused; no reassembly
-→ schedule timer
-→ 确认旧RunningOperation已经terminal并从SessionExecutor移除
-→ 使用同一ModelCallRequest启动新的唯一current RunningOperation
+→ close/drop previous local future result path
+→ cancellation-aware sleep
+→ 使用同一ModelCallRequest再次await ModelGateway
 ```
 
 logical retry：
 
-- 不阻塞SessionIngress scheduler或control loop；
+- 不阻塞SessionExecutor control actor；
 - Steer、Cancel、成功Compaction Replace或conversation change使其失效；
 - 计入StoredAssistantMessage.retry_count；
 - 不创建ModelAttempt entity；
 - 不改变ModelCallPurpose；
-- 不与旧本地Model future重叠；provider端可能继续工作或计费不等于旧future仍可回传SessionExecutor。
+- 不与旧本地Model future重叠；provider端可能继续工作或计费不等于旧future仍可回传ActiveTurnTask。
 
 默认policy：
 
@@ -1209,7 +1210,7 @@ Gateway success/cancel的线性化点是adapter接受完整provider terminal eve
 
 - cancellation先被观察：中止request并返回Cancelled；
 - terminal event先被接受：Gateway完成normalization并返回ModelCallResult，之后到达的cancel不把该result改写为Cancelled；
-- SessionExecutor仍会用execution_version和Cancel/SecurityRevoked arbitration决定该result能否append；普通Steer不拒绝已完成result，只决定无ToolCall response保存为Continue还是Final，因此Gateway terminal先赢不等于Turn一定Completed；
+- ActiveTurnTask仍会用control_generation、ConversationRevision和Cancel/SecurityRevoked arbitration决定该result能否apply live；普通Steer不拒绝已完成result，只决定无ToolCall response保存为Continue还是Final，因此Gateway terminal先赢不等于Turn一定Completed；
 - 该规则保证terminal usage、finish reason和content不会因normalization期间的timer race随机丢失。
 
 取消行为：
@@ -1230,7 +1231,7 @@ cancel token fires
 - 已发布partial delta可以恢复；
 - cancellation可以回滚provider-side cache。
 
-SessionExecutor不detach Model future；`generate_model_turn` terminal返回或future被安全drop并关闭结果路径后，才能开始下一次logical operation。因此正常路径不存在旧Model result在新operation之后迟到。SessionId、TurnId、execution_version和OperationType仍用于验证result basis与实现错误。
+ActiveTurnTask不detach Model future；`generate_model_turn` terminal返回或future被安全drop并关闭结果路径后，才能开始下一次logical attempt。因此正常路径不存在旧Model result在新attempt之后迟到。SessionId、TurnId、control_generation和ConversationRevision用于验证result basis。
 
 ## Error Taxonomy
 
@@ -1442,7 +1443,7 @@ same effective generation policy
 same tool schemas and output contract
 same adapter encoding version
 previous call completed successfully
-new full logical input可证明为previous full input + previous finalized response + exact committed suffix
+new full logical input可证明为previous full input + previous finalized response + exact sanitized live suffix
 ```
 
 必须使用完整provider-neutral input和private canonical equivalence proof证明prefix；不能只比较SessionId、TurnId、response_id或message count。
@@ -1459,7 +1460,7 @@ new full logical input可证明为previous full input + previous finalized respo
 - prefix proof失败；
 - provider拒绝continuation。
 
-ContinuationCache不是durable truth，不进入TurnExecutionContext，不通过SessionStorage恢复。
+ContinuationCache是process-local optimization，不进入TurnExecutionContext，不通过Session recording恢复。
 
 ## Concurrent Calls And Rate Governance
 
@@ -1469,10 +1470,10 @@ ModelGateway不提供Runtime global、per-provider route、per-model或per-auth-
 
 - 共享`Arc<ModelGateway>`支持多个Session并发执行独立provider attempt；
 - 不用Gateway-wide mutex或其他长guard包围credential resolution、provider request或stream读取；
-- 每个Session最多一个current model `RunningOperation`由SessionExecutor保证，不形成跨Session容量限制；
+- 每个Session最多一个ActiveTurnTask，task内部最多await一个current model call，不形成跨Session容量限制；
 - request前auth refresh只对同一credential执行singleflight，不阻塞无关credential的调用；
 - provider cooldown只对对应route/principal fast-fail，不在Gateway内等待；
-- provider `RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由SessionExecutor裁决logical retry；
+- provider `RateLimited`、`QuotaExceeded`和typed `Retry-After`继续规范化为terminal result，由ActiveTurnTask裁决logical retry；
 - Provider SDK/HTTP connection pool的transport资源管理是private implementation detail，不成为MiniCore admission policy；
 - progress publisher阻塞不能占用provider stream读取。
 
@@ -1485,11 +1486,10 @@ Turn admission
 → Arc<TurnModelSnapshot>
 → TurnExecutionContext pins snapshot
 
-AgentLoop NeedModel
-→ PromptSet.assemble(CommittedConversationView, purpose, output contract)
+ActiveTurnTask requests next model step
+→ PromptSet.assemble(LiveConversationView, purpose, output contract)
 → AssembledModelContext
-→ SessionExecutor creates ModelCallRequest
-→ RunningOperation::GenerateModelResponse
+→ ActiveTurnTask creates ModelCallRequest(source_revision)
 → ModelGateway.generate_model_turn
    → validate snapshot/request binding
    → choose exact provider adapter and route
@@ -1502,11 +1502,10 @@ AgentLoop NeedModel
       → best-effort Host ProgressEvent enqueue
    → normalize ordered finalized content/usage/finish reason/metadata
    → return ModelCallResult
-→ OperationResult(SessionId + TurnId + execution_version + OperationType)
-→ SessionExecutor validates identity/version and Workspace authorization
-→ AgentLoop.accept_model_response
-→ NeedTools或Finished
-→ SessionExecutor append/apply assistant entry
+→ ModelCallResult returned to ActiveTurnTask
+→ task validates Turn/control_generation/ConversationRevision and Workspace authorization
+→ Tool path或candidate arbitration
+→ apply assistant live + await SessionRecorder.record
 ```
 
 ## Failure And Recovery
@@ -1524,7 +1523,7 @@ partial draft
 single-attempt state
 ```
 
-unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage durable truth重新assemble full context并建立新provider request。
+unfinished Turn按Session recovery规则终止。下一Turn从recorded prefix重建sanitized live context并建立新provider request；未record tail不可恢复。
 
 ### Outcome Ambiguity
 
@@ -1534,33 +1533,28 @@ unfinished Turn按Session recovery规则终止。下一Turn从SessionStorage dur
 - 未取得terminal finalized response时不能创建synthetic assistant message；
 - partial draft不持久化；
 - request已发送但尚未开始response时映射为RequestOutcomeUnknown；已产生partial response后映射为StreamInterrupted；
-- `RequestOutcomeUnknown`和`StreamInterrupted`默认禁止logical retry；SessionExecutor只能对Gateway已经证明delivery-safe的typed error应用ADR 0119 policy；
-- duplicate assistant prevention依赖只有terminal ModelCallResult才能append；重复append的防护靠committed prefix状态（该assistant entry是否已存在）判断，不依赖durable operation key。
+- `RequestOutcomeUnknown`和`StreamInterrupted`默认禁止logical retry；ActiveTurnTask只能对Gateway已经证明delivery-safe的typed error应用ADR 0119 policy；
+- duplicate assistant prevention依赖task只接受一次terminal ModelCallResult并通过live reducer应用；Session recording不提供operation key或去重permit。
 
-### Projection/Storage Failure
+### Session Recording Failure
 
-ModelGateway成功不等于assistant durable：
+ModelGateway成功后assistant先进入live state，再best-effort record：
 
 ```text
 ModelCallResult
-→ SessionExecutor identity/authorization validation
-→ append assistant entry
-→ apply projections
+→ ActiveTurnTask identity/authorization/revision validation
+→ apply assistant live
+→ await SessionRecorder.record
+→ publish final StateEvent / continue Tool path
 ```
 
-append失败时：
+encode/write失败时，assistant live mutation保留，recording health转为Degraded，随后Tool path或candidate流程继续。不能重新调用provider或重新执行Tool来补偿recording failure。
 
-- 不让AgentLoop继续到Tool execution；
-- NotCommitted可以重试同一assistant draft；
-- SessionWrite OutcomeUnknown时保守终结、恢复靠committed prefix状态判断，不按operation key解析；
-- 不能重新调用provider来“确认”storage结果；
-- provider response只在current operation内保留到append outcome确定。
+## Recording Contract
 
-## Persistence Contract
+SessionRecorder可以保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；unfinished Turn也不跨restart恢复旧TurnModelSnapshot。
 
-Conversation storage保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于历史显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；unfinished Turn也不跨restart恢复旧TurnModelSnapshot。
-
-成功assistant entry保存：
+实际record成功的assistant entry保存：
 
 ```text
 StoredModelDescriptor
@@ -1582,7 +1576,7 @@ base URL
 provider SDK object
 partial stream
 provider attempt trace
-SessionExecutor `WaitForModelRetry` timer
+ActiveTurnTask retry timer
 connection/continuation state
 full AssembledModelContext
 ```
@@ -1598,7 +1592,7 @@ Provider response ID和reasoning opaque artifact必须有长度限制和redactio
 目标：
 
 - `resolve_for_turn`只做local catalog lookup和validation；
-- full context encoding与provider I/O在RunningOperation执行；
+- full context encoding与provider I/O在ActiveTurnTask await的Gateway operation内执行；
 - connection pool和HTTP client跨Session共享；
 - 多个Session可并发执行provider request，不经过Gateway本地admission queue；
 - progress delta可以合并；
@@ -1614,7 +1608,7 @@ Provider response ID和reasoning opaque artifact必须有长度限制和redactio
 - cancellation responsiveness；
 - usage/finish/content order正确性；
 - secret redaction；
-- SessionExecutor的request响应能力。
+- SessionExecutor control actor的request响应能力。
 
 ## Diagnostics
 
@@ -1650,7 +1644,7 @@ opaque encrypted reasoning
 ### Interface And Ownership
 
 - 只有`resolve_for_turn`和`generate_model_turn`进入Session execution；
-- SessionExecutor/AgentLoop不import Rig provider类型；
+- ActiveTurnTask/SessionExecutor不import Rig provider类型；
 - ModelGateway不能读取SessionStorage或Prompt definitions；
 - ProviderAdapter不能append Session entry；
 - shared Gateway并发处理多个Session；
@@ -1823,13 +1817,13 @@ src/model_gateway/provider/scripted.rs
 
 ## Rejected Designs
 
-### SessionExecutor直接调用Rig provider
+### ActiveTurnTask直接调用Rig provider
 
-否决原因：provider type、auth、base URL、retry、usage和error会扩散到Session execution。
+否决原因：provider type、auth、base URL、retry、usage和error会扩散到Turn execution。
 
 ### ModelGateway重新组装Prompt
 
-否决原因：产生第二个model-visible context seam，破坏Transcript-First。
+否决原因：产生第二个model-visible context seam，绕过PromptSet与sanitized LiveConversation。
 
 ### 公开PreparedModelTurn
 
@@ -1837,7 +1831,7 @@ src/model_gateway/provider/scripted.rs
 
 ### 公开ModelTurnSession
 
-否决原因：让SessionExecutor管理第二个turn-scoped state owner；connection/continuation可以private复用。
+否决原因：让ActiveTurnTask管理第二个provider-session state owner；connection/continuation可以private复用。
 
 ### 返回raw provider stream
 
@@ -1851,9 +1845,9 @@ src/model_gateway/provider/scripted.rs
 
 否决原因：attempt是transport/execution detail，不是领域事实；会扩大storage和recovery surface。
 
-### 把partial stream写SessionStorage
+### 把partial stream写SessionRecorder
 
-否决原因：一个finalized assistant response应对应一个entry；partial draft不可恢复且会制造重复usage和content ordering问题。
+否决原因：一个finalized assistant response应对应一个record candidate；partial draft不可恢复且会制造重复usage和content ordering问题。
 
 ### 根据model name猜capability
 
@@ -1861,7 +1855,7 @@ src/model_gateway/provider/scripted.rs
 
 ### 使用response_id作为conversation truth
 
-否决原因：provider state不可替代完整committed transcript；continuation必须证明full logical equivalence。
+否决原因：provider state不可替代完整sanitized live conversation；continuation必须证明full logical equivalence。
 
 ## 完成检查
 

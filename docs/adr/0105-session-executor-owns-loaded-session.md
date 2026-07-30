@@ -1,7 +1,9 @@
 # ADR 0105: SessionExecutor 拥有 loaded Session
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-24
+
+> 2026-07-30：SessionExecutor control actor与每Session单active Turn约束保留；single mutable Executor owner、`SessionWriter`、`RunningOperation`和同步AgentLoop改为control actor + `ActiveTurnTask` + live state。
 
 ## 背景
 

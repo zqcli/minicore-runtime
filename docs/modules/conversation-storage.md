@@ -1,168 +1,235 @@
-# Conversation 与 SessionStorage 架构设计
+# Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0124后，生产实现待启动）
-日期：2026-07-29
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
-本文定义MiniCore conversation与SessionStorage的durable ownership、逐entry JSONL、history tree、宽容replay、Tool exchange投影、Compaction、fork和restart recovery。
+本文定义MiniCore的live conversation、SessionRecorder、by-entry JSONL、recorded history tree、tolerant replay、recording health、fork和restart recovery。
 
-设计目标：
+核心定位：
 
-- SessionStorage保存已成功写入的conversation、message与durable lifecycle事实；
-- live execution只写严格合法entry；
-- 单行损坏或局部引用异常不brick整个Session；
-- 模型只接收provider-valid conversation；
-- branch、rewind和fork继续使用简单`EntryId + parent_id`树；
-- 避免用大量nested EntryId把本地transcript提升为事务式执行证明系统。
+- `LiveSessionState`是loaded Session的current-process truth；
+- `SessionRecorder`把live mutation顺序inline append为可恢复的best-effort前缀；
+- append outcome不作为Model、Tool、Interaction或StateEvent的durable correctness proof；
+- cold replay只恢复已经record的完整行；
+- replay仍必须构造provider-valid sanitized conversation。
 
-本文不定义：
+本文不定义Model/Tool scheduling、Prompt assembly、Tool sandbox或Runtime wire schema。
 
-- SessionExecutor、SessionIngress和异步operation的完整实现；
-- Runtime command/query/event/snapshot payload；
-- provider adapter；
-- Sandbox enforcement；
-- power-loss durability、remote replication、多进程multi-writer；
-- projection snapshot、segmentation、vacuum或blob store。
+## 同类项目基线
 
-## 同类项目结论
-
-| 项目 | Durable layout | 恢复与Identity |
+| 项目 | Live state | Recording |
 | --- | --- | --- |
-| pi | header + `id/parentId` entry tree | malformed line跳过；fork复制历史entry ID；ToolResult按ToolCallId关联 |
-| Codex | typed rollout JSONL | parse error warning后继续；公开协议保留thread/turn/item/call ID |
-| Gemini CLI | metadata/message JSONL | 单行解析错误忽略；message/tool-call ID用于rewind和更新 |
-| OpenHands | base state + per-event JSON | event ID/parent ID树；action/tool-call ID关联结果 |
-| Claude Code | session JSONL | 可观察到session UUID、entry UUID、parent UUID和tool-use ID |
+| Pi | Agent内存messages | `message_end`后同步JSONL append；listener可以先收到事件 |
+| Codex | Session in-memory history | rollout recording，failure通常log-and-continue |
+| Gemini CLI | agent history | finalized message同步append JSONL，ENOSPC可禁用recording后继续 |
+| OpenHands | conversation state/event view | optional FileStore EventLog；未配置时使用InMemoryFileStore |
 
-MiniCore采用相同的宽松恢复基线，同时保留严格live writer和typed diagnostics。
+MiniCore采用同类产品的live-first语义，同时保留typed JSONL、tree identity、Tool exchange sanitizer和bounded diagnostics。
 
 ## 决策摘要
 
-- 每个Session一个JSONL文件；第一行为immutable SessionHeader；
-- 后续一行一个`StoredSessionEntry`；完整换行行是process-crash可见单位；
-- 一个writable Session同时最多一个`SessionWriter`；
-- 所有mutation通过`SessionWriter::append(SessionEntryDraft)`；
-- `EntryId + parent_id`形成history tree；
-- `EntryId`由writer分配，ordinary append的parent是current entry；
-- live append严格校验；cold replay跳过或隔离局部损坏并返回diagnostics；
-- `source = Input`的UserMessage内联`StoredTurnStart`，不再有独立TurnContext entry；
-- ledger不保存`ToolExecutionStarted`；
-- ledger不保存`ToolRoundCompleted`；
-- assistant ToolCall与Tool message按`TurnId + ItemId + ToolCallId`关联；
-- complete Tool exchange由最后一个补齐集合的tool entry触发conversation delta；
-- replay遇到incomplete/orphan/identity-conflicting Tool exchange时从模型conversation排除整个exchange；duplicate result first valid wins并告警；
-- Compaction只保存rolling summary和`first_kept_entry_id`；
-- Fork复制selected path并保留历史ID，只分配新SessionId；
-- MVP不提供repair utility；
-- cold load仍按完整文件O(n)线性扫描，不建设projection checkpoint/index。
+- 一个Session一个header + by-entry JSONL文件；
+- Live reducer分配EntryId并先更新current-process state；
+- `SessionRecorder::record(entry).await`顺序encode并append当前JSONL line；
+- Recorder不使用后台task、channel或process-local queue；
+- encode或physical write失败不回滚live state；
+- first recording failure后停止该loaded Session后续记录；
+- 文件最多是live event stream的一个合法前缀；
+- cold replay宽容skip/isolate局部坏记录；
+- incomplete/orphan/abandoned-first Tool exchange不进入模型conversation；
+- EntryId继续用于recorded tree、fork和history query；
+- `ConversationRevision`取代EntryId checkpoint作为live execution basis；
+- restart不恢复未record tail或旧execution objects。
 
 ## Ownership
 
 ```text
-MiniCoreRuntime
-└─ SessionStorage
-   ├─ create/open/fork
-   ├─ per-session SessionWriter
-   ├─ strict append validation
-   ├─ tolerant replay/projectors
-   └─ private JSONL implementation
+SessionExecutor / ActiveTurnTask
+├─ LiveSessionState
+│  ├─ LiveConversation
+│  ├─ Turn/Item/Interaction view
+│  ├─ ConversationRevision
+│  └─ EntryIdGenerator
+└─ SessionRecorder
+   ├─ single-Session async append serialization
+   ├─ JSONL encoder
+   ├─ exclusive recorder lease when available
+   └─ RecordingHealth
+
+SessionStorage
+├─ create/open recorded file
+├─ tolerant replay
+├─ history tree/query
+└─ fork recorded path
 ```
 
-SessionStorage拥有：
+Live reducer拥有domain validation和当前进程conversation。Recorder只接受private constructors创建的immutable `StoredSessionEntry`，不重新决定Model/Tool协议。
 
-- Session ledger文件与Header；
-- EntryId allocation；
-- current physical head和parent graph；
-- strict live append；
-- tolerant replay；
-- conversation、Turn、Item、Interaction、Usage和history projections；
-- partial-tail handling；
-- replay diagnostics；
-- fork selected-path copy。
+## Live Mutation And Recording
 
-SessionStorage不拥有：
+**Canonical cross-module invariant: INV-001.**
 
-- Model/Tool scheduling；
-- current-Runtime Tool side-effect start状态；
-- Prompt assembly；
-- Tool permission、Sandbox或executor；
-- Workspace authorization；
-- AgentLoop；
-- provider stream；
-- UI repair workflow。
+```text
+validate live mutation
+→ allocate stable IDs
+→ apply LiveSessionState
+→ increment ConversationRevision when model-visible
+→ await SessionRecorder.record(entry)
+→ publish final StateEvent / resume waiter / continue protocol
+```
 
-## 最小接口
+`record().await`返回：
 
-当前只有一个backend，不建立`dyn SessionStorageAdapter` hierarchy。
+```rust
+pub(crate) enum RecordOutcome {
+    Written,
+    NotRecorded { health: RecordingHealth },
+}
+```
+
+`Written`只表示该JSONL line的`write_all`成功，不表示flush、fsync或power-loss durability。调用方不能把outcome当成execution permit，也不能因`NotRecorded`重新执行Model或Tool。
+
+Live mutation失败时不record、不publish。Live mutation成功后recording失败不回滚。record await期间不得持有`LiveSessionState` guard。
+
+## ConversationRevision
+
+```rust
+pub(crate) struct ConversationRevision(u64);
+```
+
+规则：
+
+- loaded Session初始化时从0开始；
+- 每次model-visible live mutation递增；
+- Input/Steer UserMessage、Assistant、complete Tool exchange和Compaction Replace会改变revision；
+- progress、Interaction、usage-only或recording health变化不改变model conversation revision；
+- ModelCallRequest和CompactionPlan捕获exact revision；
+- revision是process-local执行basis，不写入JSONL，不跨restart比较。
+
+EntryId继续存在，但只承担history identity和引用。
+
+## SessionRecorder
+
+```rust
+pub(crate) struct SessionRecorder {
+    session_id: SessionId,
+    state: tokio::sync::Mutex<SessionRecorderState>,
+    health: ArcSwap<RecordingHealth>,
+}
+
+impl SessionRecorder {
+    pub async fn record(
+        &self,
+        entry: Arc<StoredSessionEntry>,
+    ) -> RecordOutcome;
+
+    pub fn health(&self) -> Arc<RecordingHealth>;
+}
+```
+
+```rust
+pub enum RecordingHealth {
+    Healthy,
+    Degraded {
+        failed_entry_id: Option<EntryId>,
+        reason: SessionRecordingError,
+    },
+    Disabled,
+}
+```
+
+该类型是crate-private Recorder状态。Runtime公开投影固定为`SessionRecordingView { state: Healthy | Degraded | Disabled }`：
+
+- internal reason和failed EntryId不进入普通Snapshot；
+- Runtime把reason映射为allowlisted recording diagnostic code；
+- `Disabled`只由显式recording policy建立；初始化、lease、权限、磁盘、encode或write failure进入`Degraded`；
+- 同一loaded Session只允许`Healthy → Degraded`，Recorder不会在当前load中自动恢复Healthy；
+- Degraded后不自动probe/retry、不创建新segment、不保留或backfill unrecorded suffix；
+- Health与当前recording diagnostic通过同一次immutable Snapshot publication对host可见。
+
+### 顺序与Prefix规则
+
+MVP的recordable domain mutation保持单producer ownership：Starting/Idle mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction routing只在对应task等待期间完成request/resolution mutation。不得让两个独立caller并发apply可记录的live mutation，再依赖Recorder mutex acquisition决定history顺序。未来出现真实multi-producer需求时必须引入显式domain sequencing，不能静默依赖scheduler顺序。
+
+Recorder的async mutex只保护单文件handle和append原子串行化。`health`通过独立immutable publication读取，Snapshot不等待当前file write。Recorder按单Session顺序处理当前entry。以下任一情况首次发生后进入Degraded并停止后续append：
+
+- encode失败；
+- lease丢失；
+- create/append I/O失败；
+- partial write或outcome unknown。
+
+因此不会在已知丢失entry之后继续写后续entry。process crash或failed write仍可能留下最后partial line；replay忽略该tail，只恢复此前newline-terminated的有效前缀。Recorder不执行per-entry `fsync`或`sync_data`。
+
+### Recording failure
+
+recording failure：
+
+- 发布redacted diagnostic/health update；
+- 不使Session execution Unavailable；
+- 不阻止Submit、Model、Tool、Interaction、Compaction或terminal；
+- 不自动切换到第二文件或新segment；
+- 不尝试追溯补写已经unrecorded的live gap；
+- 存储恢复后当前loaded Session仍保持Degraded，后续`record()`继续返回`NotRecorded`。
+
+Recorder没有后台queue、flush watermark或drain operation。graceful unload等待或取消ActiveTurnTask；task结束后不存在待写record tail。Host可以继续unsaved execution，或显式`Unload + Load`从recorded prefix创建新的loaded instance。loaded live fork是否保留unrecorded tail由Q6决定。
+
+## SessionStorage Interface
+
+当前只有一个backend，不建立public adapter hierarchy。
 
 ```rust
 pub(crate) struct SessionStorage {
-    // private root/index/config
+    // root/index/config
 }
 
 impl SessionStorage {
     pub async fn create(
         &self,
-        create: CreateSessionLedger,
-    ) -> Result<OpenedSessionLedger, SessionStorageError>;
+        request: CreateSession,
+    ) -> Result<OpenedSession, SessionStorageError>;
 
     pub async fn open(
         &self,
         session_id: SessionId,
-    ) -> Result<OpenedSessionLedger, SessionStorageError>;
+    ) -> Result<OpenedSession, SessionStorageError>;
 
     pub async fn replay_at(
         &self,
         session_id: SessionId,
-        checkpoint: ConversationCheckpoint,
+        entry_id: EntryId,
     ) -> Result<ReplayedSession, SessionStorageError>;
 
-    pub async fn fork(
+    pub async fn fork_recorded(
         &self,
-        request: ForkSessionLedger,
-    ) -> Result<OpenedSessionLedger, SessionStorageError>;
-}
-
-pub(crate) struct OpenedSessionLedger {
-    pub replay: ReplayedSession,
-    pub access: SessionLedgerAccess,
-}
-
-pub(crate) enum SessionLedgerAccess {
-    Writable(SessionWriter),
-    ReadOnly { reason: SessionStorageError },
-}
-
-pub(crate) struct ReplayedSession {
-    pub projections: SessionProjections,
-    pub diagnostics: Arc<[SessionReplayDiagnostic]>,
-}
-
-pub(crate) struct SessionWriter {
-    // exclusive per-session writer state
-}
-
-impl SessionWriter {
-    pub async fn append(
-        &mut self,
-        draft: SessionEntryDraft,
-    ) -> Result<CommittedSessionEntry, SessionWriteError>;
+        request: ForkRecordedSession,
+    ) -> Result<OpenedSession, SessionStorageError>;
 }
 ```
 
-`create()`成功必须返回Writable；`open()`在history可读但exclusive lease、recovery terminal或writer初始化失败时可以返回ReadOnly access。Session lifecycle仍可发布history/query view，但future Turn admission为Unavailable；调用方不能从ReadOnly access构造SessionExecutor writer。
+```rust
+pub(crate) struct OpenedSession {
+    pub replay: ReplayedSession,
+    pub recorder: Arc<SessionRecorder>,
+}
+```
+
+open时lease或recorder初始化失败返回`RecordingHealth::Degraded`的loaded Session；只有显式recording policy才建立`Disabled`。history可读且Workspace/definition可用时仍允许Turn admission。
+
+create时header recording失败可以得到仅当前进程存在的Session identity；host必须能观察recording degradation。Recorder初始化和header append都不创建后台worker。
 
 不提供：
 
 ```text
+SessionWriter::append
 append_raw_json
-append_arbitrary_message
-rewrite_middle_line
-set_current_entry_without_append
-automatic_reparent
-repair_session
-generic transaction callback
+caller-provided projection delta
+repair middle line
+recording failure rollback
+ResumeSessionRecording / StartRecordingSegment
+unrecorded suffix backfill
+physical commit receipt as execution permit
 ```
 
 ## 物理文件
@@ -178,70 +245,36 @@ line 2+  StoredSessionEntry
 
 ```rust
 pub struct SessionHeader {
-    pub format_version: u16,
+    pub format_version: u32,
     pub session_id: SessionId,
     pub created_at: Timestamp,
-    pub fork_origin: Option<ForkOrigin>,
-}
-
-pub struct ForkOrigin {
-    pub source_session_id: SessionId,
-    pub source_entry_id: Option<EntryId>,
+    pub initial_agent: AgentRevisionRef,
+    pub initial_definition_revision: SessionDefinitionRevision,
 }
 ```
 
-Header immutable。Session name、lifecycle、current definition pointer等entity metadata不通过重写Header更新。
-
-每条entry使用单行compact JSON，字符串换行/control character必须escape。field order不承担语义。
-
-## Entry Envelope
-
 ```rust
 pub struct StoredSessionEntry {
-    pub format_version: u16,
     pub entry_id: EntryId,
     pub parent_id: Option<EntryId>,
+    pub session_id: SessionId,
+    pub turn_id: Option<TurnId>,
     pub timestamp: Timestamp,
     pub body: StoredEntryBody,
 }
+```
 
+```rust
 pub enum StoredEntryBody {
     Message(StoredMessage),
-    Event(StoredDurableEvent),
+    Event(StoredEvent),
     Compaction(StoredCompaction),
 }
 ```
 
-不再定义：
+每行immutable。EntryId在live apply时分配，Recorder不能改写。
 
-```text
-StoredEntryBody::TurnContext
-StoredDurableEvent::ToolExecutionStarted
-StoredDurableEvent::ToolRoundCompleted
-```
-
-基础规则：
-
-- `entry_id`由writer分配，caller不能预分配；
-- ordinary append的`parent_id`等于writer current entry；
-- history branch append可以选择已存在entry为parent并使新entry成为current；
-- live writer拒绝duplicate ID、unknown parent和terminal后新work；
-- cold replay将missing parent视为orphan root，不拒绝整个Session；
-- EntryId、TurnId、ItemId、RequestId和ToolCallId保持typed，不混用；
-- EntryId、TurnId、ItemId和RequestId在Session内唯一；Fork复制历史ID，因此跨Session不要求唯一；
-- ToolCallId由ModelGateway adapter归一化：保留provider原生ID，缺失时生成response-local opaque ID；只要求同一assistant entry内唯一，durable关联使用`TurnId + ItemId + ToolCallId`。
-
-```rust
-pub struct SessionEntryDraft {
-    expected_current_entry: Option<EntryId>,
-    parent_entry: Option<EntryId>,
-    body: PendingEntryBody,
-}
-```
-
-`expected_current_entry`用于当前writer的乐观并发，不进入durable operation-key protocol。
-
-## Message Entry
+## Stored Message
 
 ```rust
 pub enum StoredMessage {
@@ -251,707 +284,220 @@ pub enum StoredMessage {
 }
 ```
 
-### User Message
-
 ```rust
 pub struct StoredUserMessage {
-    pub turn_id: TurnId,
     pub item_id: ItemId,
-    pub source: StoredUserMessageSource,
+    pub source: UserMessageSource,
+    pub content: CanonicalUserMessage,
     pub turn_start: Option<StoredTurnStart>,
-    pub content: Arc<[UserContent]>,
     pub contribution_stamps: Arc<[StoredPromptContributionStamp]>,
-}
-
-pub enum StoredUserMessageSource {
-    Input,
-    Steer,
 }
 ```
 
-规则：
-
-- `Input`必须携带`turn_start`，其append是领域Turn开始线性化点；
-- `Steer`不得携带`turn_start`，必须绑定current Running Turn；
-- FollowUp在下一Turn写新的Input；
-- Interaction resolution不是UserMessage；
-- contribution stamp只作历史provenance，不在cold replay时重新读取Workspace/Skill source或验证旧authorization。
-
-### StoredTurnStart
+Input UserMessage要求`turn_start = Some(...)`；Steer要求`None`。
 
 ```rust
 pub struct StoredTurnStart {
-    pub agent_id: AgentId,
-    pub agent_revision: AgentRevisionRef,
-    pub session_definition_revision: SessionDefinitionRevision,
-    pub model: StoredModelDescriptor,
-    pub workspace: StoredWorkspaceSummary,
-    pub diagnostics: Arc<[StoredContextDiagnostic]>,
-}
-
-pub struct StoredModelDescriptor {
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
-    pub generation: EffectiveGenerationPolicy,
-}
-
-pub struct StoredWorkspaceSummary {
-    pub cwd: WorkspaceRelativeDisplay,
-    pub roots: Arc<[WorkspaceRootDisplay]>,
+    pub agent: AgentRevisionRef,
+    pub session_revision: SessionDefinitionRevision,
+    pub model: ModelSelectionSummary,
+    pub started_at: Timestamp,
 }
 ```
 
-当前MVP支持exact Agent pin和Session definition revision，因此live Input必须写入这两个exact ref；这些字段用于历史解释和UI，不是restart authorization input。cold replay不要求旧AgentDefinition、SessionDefinition、WorkspaceSnapshot或ModelDefinition仍可解析。
-
-不保存：
-
-```text
-WorkspaceRevision
-WorkspaceSnapshotRef
-ModelDefinitionVersion
-ModelExecutionRef
-PromptSet / ToolSet / SkillView
-credential / endpoint / auth principal
-cancellation token / waiter / executor handle
-```
-
-### Assistant Message
-
-一个finalized logical model response保存为一个assistant entry，stream delta不持久化。
+StoredTurnStart只用于历史说明。cold replay不要求旧Workspace/Prompt/Skill/Tool/Model对象仍可解析。
 
 ```rust
 pub struct StoredAssistantMessage {
-    pub turn_id: TurnId,
-    pub phase: StoredAssistantPhase,
-    pub model: StoredModelDescriptor,
-    pub response_id: Option<String>,
+    pub item_ids: Arc<[ItemId]>,
+    pub disposition: AssistantDisposition,
     pub content: Arc<[AssistantContent]>,
+    pub model: ModelResponseSummary,
     pub usage: Option<ModelUsage>,
-    pub finish_reason: ModelFinishReason,
-    pub provider_metadata: StoredProviderResponseMetadata,
-    pub retry_count: u32,
-}
-
-pub enum StoredAssistantPhase {
-    Intermediate,
-    Final { completion: TurnCompletion },
-}
-
-pub enum AssistantContent {
-    Reasoning(StoredReasoning),
-    Text {
-        item_id: ItemId,
-        text: String,
-    },
-    ToolCall {
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-        name: ToolName,
-        arguments: Value,
-        index: u32,
-    },
+    pub logical_retry_count: u8,
 }
 ```
 
-live规则：
+```rust
+pub enum AssistantContent {
+    Reasoning(StoredReasoning),
+    Text(String),
+    ToolCall(StoredToolCall),
+}
+```
 
-- content顺序是canonical display与ToolCall顺序；
-- 同一assistant entry内ItemId和ToolCallId唯一；
-- 含ToolCall的assistant必须为Intermediate；
-- 无ToolCall Intermediate用于Steer前的Assistant Continue；
-- Final不能包含ToolCall；
-- Final append完成Turn；
-- retry_count遵守AgentRun 0–3限制；
-- provider metadata只保存allowlisted bounded字段。
-
-cold replay遇到违反这些规则的entry时忽略其conversation/Turn projection并报告diagnostic，不brick其他history。
-
-### Tool Message
+```rust
+pub struct StoredToolCall {
+    pub item_id: ItemId,
+    pub tool_call_id: ToolCallId,
+    pub name: ToolName,
+    pub arguments: JsonValue,
+}
+```
 
 ```rust
 pub struct StoredToolMessage {
-    pub turn_id: TurnId,
     pub item_id: ItemId,
     pub tool_call_id: ToolCallId,
-    pub name: Option<ToolName>,
-    pub source: ToolOutcomeSource,
-    pub content: Arc<[ToolContent]>,
-    pub is_error: bool,
-}
-
-pub enum ToolOutcomeSource {
-    PreExecution,
-    Executed,
+    pub outcome: StoredToolOutcome,
 }
 ```
 
-规则：
+Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId只要求同一assistant response内唯一。
 
-- live append必须匹配同一selected path上的assistant ToolCall；
-- ToolResult通过`TurnId + ItemId + ToolCallId`定位ToolInvocation；
-- 同一个ToolCall最多一个Tool message；
-- `PreExecution`用于validation/policy/approval deny/unavailable/cancelled-before-start；
-- `Executed`表示executor已经运行并返回exact outcome；
-- 不保存side-effect start entry reference；
-- outcome unknown不生成Tool message，可以追加ToolAbandoned event或由terminal projection显示incomplete。
-
-## Durable Event Entry
+## Stored Events
 
 ```rust
-pub enum StoredDurableEvent {
-    InteractionRequested(StoredInteractionRequested),
-    InteractionResolved(StoredInteractionResolved),
-    ToolAbandoned(StoredToolAbandoned),
-    TurnInterrupted(StoredTurnInterrupted),
-    TurnFailed(StoredTurnFailed),
+pub enum StoredEvent {
+    InteractionRequested(StoredInteractionRequest),
+    InteractionResolved(StoredInteractionResolution),
+    TurnCompleted(StoredTurnTerminal),
+    TurnInterrupted(StoredTurnTerminal),
+    TurnFailed(StoredTurnTerminal),
+    SessionDefinitionChanged(StoredSessionDefinitionChange),
+    SessionLifecycleChanged(StoredSessionLifecycleChange),
 }
 ```
 
-### Interaction
+不记录：
 
-```text
-InteractionRequested
-→ TurnId + ItemId + RequestId + typed request
+- `ToolExecutionStarted`；
+- `ToolRoundCompleted`；
+- `RunningOperation`；
+- ActiveTurn phase；
+- provider stream delta；
+- retry timer；
+- recorder health changes；
+- process-local cancellation epoch。
 
-InteractionResolved
-→ TurnId + ItemId + RequestId + typed resolution + resolution_key
-```
-
-live顺序：
-
-```text
-request append/apply → notify host
-resolution append/apply → wake waiter / continue Tool
-```
-
-cold replay：
-
-- missing request的resolution被Interaction projection忽略并报告；
-- duplicate/conflicting resolution first valid terminal wins；
-- 其他conversation仍继续恢复。
-
-### ToolAbandoned
-
-```rust
-pub struct StoredToolAbandoned {
-    pub turn_id: TurnId,
-    pub item_id: ItemId,
-    pub tool_call_id: ToolCallId,
-    pub reason: ToolAbandonReason,
-}
-```
-
-ToolAbandoned表示当前Runtime知道该ToolInvocation不能继续且没有truthful ToolResult。它不进入模型conversation。live writer拒绝同一ToolInvocation同时出现Tool message与ToolAbandoned；cold replay采用first valid terminal outcome wins：ToolAbandoned先出现会永久使对应pending exchange不可完成，之后的Tool message只进入history inspection并产生diagnostic；Tool message先出现时，之后的ToolAbandoned被忽略并告警。restart也可以仅通过TurnInterrupted和incomplete Tool exchange投影表达旧工作无法恢复，因此recovery不要求为每个open call补写Abandoned。
-
-### Turn Terminal
-
-```text
-TurnInterrupted → TurnId + typed reason + completed_at
-TurnFailed      → TurnId + typed failure + completed_at
-```
-
-live writer仍要求一个Turn最多一个terminal fact。cold replay采用first valid terminal wins，之后属于同Turn的新work从Turn projection忽略并报告。
-
-## Tool Exchange Projection
-
-**Canonical cross-module invariant: INV-003.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
-
-不建立ToolRound entity或durable completion marker。
-
-assistant entry含ToolCall时，conversation projector创建pending exchange：
-
-```rust
-struct PendingToolExchange {
-    assistant_entry_id: EntryId,
-    turn_id: TurnId,
-    expected: Arc<[ExpectedToolCall]>,
-    outcomes: HashMap<ToolCallId, ProjectedToolOutcome>,
-}
-
-enum ProjectedToolOutcome {
-    Result(StoredToolMessageRef),
-    Abandoned,
-}
-```
-
-`assistant_entry_id`只属于hot/replay projector内部索引，不写入其他entry。
-
-`exchange-closing entry`定义为下一条合法User、Assistant、Compaction或Turn terminal；Interaction、progress和其他non-conversation event不关闭pending exchange。
-
-当每个expected ToolCall在exchange-closing entry之前的first valid terminal outcome都是matching Tool message时，exchange完成；duplicate result仍由first valid result wins：
-
-```text
-assistant content
-→ ordered tool messages by assistant call index
-→ CommittedToolExchangeDelta
-```
-
-该delta同时：
-
-- 将完整assistant/tool sequence加入CommittedConversationState；
-- 将对应ToolInvocation Item投影为Completed；
-- 允许SessionExecutor调用`AgentLoop::accept_committed_tool_results(...)`；
-- 允许下一次模型调用。
-
-以下情况使exchange不进入模型conversation：
-
-- exchange-closing entry出现前仍missing ToolResult；
-- orphan ToolResult；
-- ToolCallId、ItemId或TurnId冲突；
-- assistant entry本身被replay忽略；
-- ToolAbandoned先于matching result出现，或outcome unknown。
-
-同一个call出现duplicate ToolResult时，first valid result wins，后续duplicate从conversation/Item mutation忽略并产生diagnostic；它不撤销已经形成的complete exchange。replay不会合成ToolResult，也不会把部分calls/results发送给provider。后续合法User/Assistant entry仍可进入conversation。
-
-## Compaction Entry
-
-权威schema见[Compaction](compaction.md)。ConversationStorage只处理：
+## StoredCompaction
 
 ```rust
 pub struct StoredCompaction {
-    pub turn_id: Option<TurnId>,
-    pub summary: Arc<str>,
+    pub summary: String,
     pub first_kept_entry_id: Option<EntryId>,
     pub model_call: Option<StoredCompactionModelCall>,
 }
 ```
 
-projection规则：
+recorded marker只影响future replay。live Replace在inline record attempt前已经生效。marker缺失时restart恢复旧conversation；marker存在但无法安全应用时replay忽略并报告diagnostic。
 
-- marker必须指向当前selected path上已经model-visible的entry；
-- summary替换marker之前的effective conversation prefix；
-- marker及之后内容原样保留；
-- marker为None时summary替换当时全部effective conversation；
-- marker missing、指向ignored entry或不能形成provider-valid retained suffix时，忽略该Compaction并报告diagnostic；
-- 后续Compaction可以再次摘要previous summary和新增内容。
+## History Tree
 
-## Strict Live Append
+`EntryId + parent_id`形成recorded tree。ordinary live mutation的parent使用当前live selected head。由于Recorder只写连续前缀，正常failure不会主动写出缺失parent后的suffix。
 
-**Canonical cross-module invariant: INV-001.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+cold file仍可能因手工编辑、旧bug或partial migration包含orphan；replay隔离而不是brick全部history。
 
-`SessionWriter.append()`在physical write前执行strict validation和projection preview：
-
-```text
-检查writer可用
-→ 检查expected_current_entry
-→ 检查parent_entry存在
-→ 分配EntryId和timestamp
-→ validate_live_entry(current projections, candidate)
-→ 生成trusted projection delta
-→ serialize candidate + '\n'
-→ append/flush process-visible bytes
-→ 更新current/index/projections
-→ 返回CommittedSessionEntry
-```
-
-```rust
-pub(crate) struct CommittedSessionEntry {
-    entry: Arc<StoredSessionEntry>,
-    previous_current_entry: Option<EntryId>,
-    current_entry: EntryId,
-    projections: CommittedProjectionDeltaSet,
-}
-```
-
-live validator拒绝：
-
-- stale current、invalid parent；
-- duplicate Turn/Item/Request/ToolResult identity；
-- Interaction family mismatch；
-- Tool message找不到current path matching ToolCall；
-- terminal后new work；
-- invalid Compaction marker；
-- entry超出`max_entry_bytes`。
-
-apply只安装append前已生成的trusted delta；资源耗尽或hot checkpoint mismatch时丢弃hot projections并执行tolerant full replay。
-
-## Append Error
-
-```rust
-pub enum SessionWriteError {
-    StaleCurrentEntry,
-    InvalidParent,
-    InvalidEntry,
-    EntryTooLarge,
-    NotCommitted(StorageError),
-    OutcomeUnknown,
-    WriterUnavailable(StorageError),
-}
-```
-
-- `NotCommitted`：physical write前失败，caller可以retry同一draft；
-- `OutcomeUnknown`：physical write已开始但ack未知，poison writer并保守终结当前operation；
-- 同一run不reopen/replay-by-key；
-- 下次load按文件实际可见记录宽容replay；
-- 不建立durable operation key或payload conflict index。
+不建立Branch entity。selected path由root到chosen leaf确定。
 
 ## Tolerant Replay
 
-**Canonical cross-module invariant: INV-002.** 索引见[架构总览](../architecture.md#跨模块不变量索引)。
+**Canonical cross-module invariant: INV-002.**
 
-replay分为物理扫描和projection fold。
+replay顺序扫描newline-terminated records：
 
-### 物理扫描
+1. 解析Header；
+2. 对每个完整line解析typed entry；
+3. duplicate EntryId使用first valid wins并告警；
+4. malformed body跳过；
+5. missing parent形成isolated orphan root；
+6. invalid Session/Turn/Item/Interaction relation只隔离对应projection；
+7. 最后partial line忽略并报告；
+8. 构建recorded tree、history view和sanitized conversation；
+9. 返回bounded redacted diagnostics。
 
-```text
-read SessionHeader
-→ scan every newline-terminated line
-→ parse envelope/body
-→ first valid EntryId wins
-→ build parent index and physical order
-→ collect diagnostics
-→ choose last indexed entry as physical current head
-```
+Replay不恢复任何process-local执行对象。
 
-处理规则：
+## Tool Exchange Replay
 
-| 问题 | replay行为 |
-| --- | --- |
-| final unterminated line | 忽略；writable lease下可truncate |
-| invalid JSON | skip line |
-| unknown core variant/version | skip line |
-| duplicate EntryId | first wins，skip duplicate |
-| missing parent | entry成为orphan root |
-| forward parent | 当前entry成为orphan root；后续不回填 |
-| invalid typed body | 对应entry skip |
-| invalid cross-entry reference | relation/projection忽略，entry tree保留 |
+cold projector维护每个assistant response的expected ordered ToolCalls：
 
-### Selected Path
+- 每个call最多接收一个first valid terminal outcome；
+- duplicate ToolResult first valid wins；
+- ToolResult与ToolAbandoned冲突first terminal wins；
+- 全部first terminal outcome均为matching truthful ToolResult时，exchange model-visible；
+- abandoned-first、missing、orphan或identity-conflicting exchange不进入模型conversation；
+- 下一条合法User、Assistant、Compaction或Turn terminal关闭未完成exchange；
+- closure后迟到result视为orphan；
+- 后续合法conversation可以继续恢复。
 
-默认selected path从physical current entry沿parent向root回溯。遇到missing parent时停止，因此一个坏行后的有效suffix可以形成新的orphan-root path。
+该projector只服务cold replay。live complete-exchange owner见[Turn / Item / Interaction](turn-item-interaction.md#complete-tool-exchange)。
 
-History query可以返回全部roots和branches，并标注orphan/ignored diagnostics。普通模型conversation只使用selected path。
-
-### Projection Fold
-
-每个projector独立应用best-effort规则：
-
-- Conversation：只接受合法User、无ToolCall Assistant、complete Tool exchange、有效Compaction和Final Assistant；
-- Turn：first valid Input starts，first valid terminal ends；
-- Item：可解释的content进入，duplicate/conflict first wins；
-- Interaction：request/resolution按RequestId关联，missing side忽略；
-- Usage：只聚合合法assistant/compaction usage；
-- Tree：保留所有成功parse且EntryId唯一的节点。
-
-一个projector忽略entry不要求其他projector也删除它。例如orphan Tool message可以在history inspector显示，但不进入conversation或ToolInvocation projection。
-
-## Replay Diagnostics
+## Live与Cold Conversation
 
 ```rust
-pub struct SessionReplayDiagnostic {
-    pub severity: ReplayDiagnosticSeverity,
-    pub line: Option<u64>,
-    pub byte_offset: Option<u64>,
-    pub entry_id: Option<EntryId>,
-    pub reason: SessionReplayDiagnosticReason,
+pub(crate) struct LiveConversationView {
+    revision: ConversationRevision,
+    messages: Arc<[ModelMessage]>,
+}
+
+pub(crate) struct ReplayedConversationView {
+    recorded_head: Option<EntryId>,
+    messages: Arc<[ModelMessage]>,
+    diagnostics: Arc<[SessionReplayDiagnostic]>,
 }
 ```
 
-reason至少包括：
+PromptSet可消费两者共同实现的private sanitized view interface。它们都保证provider-valid Tool exchange，但只有Live view参与当前Turn execution。
 
-```text
-MalformedJson
-UnknownEntryVariant
-DuplicateEntryId
-MissingParent
-InvalidEntryShape
-InvalidReference
-OrphanToolResult
-DuplicateToolResult
-ConflictingToolOutcome
-IncompleteToolExchange
-ConflictingTerminal
-IgnoredCompaction
-TailIncomplete
-```
-
-要求：
-
-- diagnostic bounded、redacted；
-- 不保存raw credential/header/payload；
-- Host可以显示“部分历史未恢复”；
-- warning本身不阻塞read-only history；
-- safety-critical current Workspace/Agent/model无法resolve时，future Turn admission仍可Unavailable。
-
-## Conversation Projection
-
-```rust
-pub(crate) struct CommittedConversationState {
-    checkpoint: ConversationCheckpoint,
-    messages: Arc<[MessageRecord]>,
-}
-
-pub(crate) struct ConversationCheckpoint {
-    entry_id: Option<EntryId>,
-}
-```
-
-checkpoint表示当前selected ledger head，不是内容hash。live append全部推进checkpoint，包括不改变messages的event。
-
-```rust
-pub(crate) enum ConversationChange {
-    AdvanceOnly,
-    Append(Arc<[MessageRecord]>),
-    Replace { messages: Arc<[MessageRecord]> },
-}
-
-pub(crate) struct CommittedToolExchangeDelta {
-    turn_id: TurnId,
-    basis_checkpoint: ConversationCheckpoint,
-    committed_checkpoint: ConversationCheckpoint,
-    assistant_entry_id: EntryId,
-    ordered_tool_call_ids: Arc<[ToolCallId]>,
-    appended_messages: Arc<[MessageRecord]>,
-}
-
-pub(crate) struct CommittedSteerDelta {
-    turn_id: TurnId,
-    basis_checkpoint: ConversationCheckpoint,
-    committed_checkpoint: ConversationCheckpoint,
-    steer_entry_id: EntryId,
-    appended_messages: Arc<[MessageRecord]>,
-}
-```
-
-两个typed delta都只能由ConversationStorage的private constructor从committed receipts与当前selected-path projection构造：
-
-- `basis_checkpoint`必须等于同一个AgentLoop最后接受的conversation basis；
-- `committed_checkpoint`是触发delta时的current ledger head，允许跨过不改变model messages的Interaction/event entry；
-- Tool delta的messages必须是一个assistant entry加按assistant call index排序的完整Tool messages；
-- Steer delta的messages必须以同Turn的Steer UserMessage结束，可包含刚刚commit的Assistant Continue；
-- incomplete/orphan/identity-conflicting exchange无法构造Tool delta；
-- cold replay只生成新的`ConversationSeed`，不会把historical delta重新交给live AgentLoop。
-
-`CommittedSessionEntry.projections`可以携带由当前append直接完成的Tool delta。Steer路径由ConversationStorage在Assistant Continue（如有）与Steer都commit后，根据committed receipts构造单个Steer delta；SessionExecutor不能自行拼装message vector或伪造checkpoint。
-
-model-visible来源：
-
-```text
-User(Input/Steer)
-Assistant Intermediate without ToolCall
-complete Tool exchange
-Assistant Final
-valid Compaction
-```
-
-不直接消费：
-
-```text
-orphan/incomplete assistant ToolCall
-orphan/duplicate Tool message
-Interaction events
-ToolAbandoned
-TurnInterrupted / TurnFailed
-streaming / retry / progress
-```
-
-Prompt只接受`CommittedConversationView`，并在provider lowering前再次断言没有unmatched ToolCall/ToolResult。
-
-## Entry Tree 与 Current Entry
-
-```text
-Genesis
-└─ e1 User(Input)
-   └─ e2 Assistant
-      ├─ e3 Tool result
-      └─ e7 Historical branch
-```
-
-不建立Branch entity。
-
-ordinary append：
-
-```text
-expected_current = e3
-parent = e3
-→ e4
-```
-
-history branch append：
-
-```text
-expected_current = e6
-parent = e2
-→ e7
-```
-
-physical current entry是最后成功append且可解析的unique EntryId。branch通过新append改变current，不修改旧entry。
+不再存在`CommittedConversationView`或storage签发的推进permit。
 
 ## Fork
 
-公开anchor仍使用UserMessage或Final Assistant Item语义，Runtime解析到selected path end。
+recorded Session fork：复制selected recorded path并保留历史Entry/Turn/Item/Request/ToolCall IDs，只分配新SessionId；future entry使用fresh ID。
 
-fork流程：
+loaded Session显式fork是否包含尚未record的live tail见[开放问题Q6](../review/async-loop-best-effort-recording-open-questions.md#q6loaded-session-fork的数据源)。初始建议从immutable live snapshot创建目标Session的新record stream，并在结果中标记source kind。
 
-```text
-resolve anchor
-→ read source selected root-to-anchor path
-→ create target staging header with new SessionId/ForkOrigin
-→ copy selected entries unchanged
-→ tolerant full replay target staging
-→ atomic publish target
-→ create child Session entity
-```
-
-复制时保留：
-
-```text
-EntryId / parent_id
-TurnId / ItemId / RequestId
-ToolCallId
-historical model/provenance payload
-```
-
-不执行nested identity remap。新append的EntryId及MiniCore生成的Turn/Item/Request ID使用fresh随机值；writer必须检查目标文件内EntryId不重复。ToolCallId继续按adapter normalization规则处理。
-
-child不恢复：
-
-```text
-loaded state
-provider session
-AgentLoop
-Tool task/waiter
-Steer/FollowUp queue
-old WorkspaceSnapshot或authorization cache
-```
-
-若复制path以unfinished Turn结束，target writable open按普通recovery中断旧Turn；history仍可读取。
+Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object或in-flight append。
 
 ## Recovery
 
-process restart后：
-
 ```text
-tolerant replay selected path
-→ 不恢复provider stream、AgentLoop、Tool task、waiter或queue
-→ 若无Running Turn：Ready/Idle
-→ 若存在Running Turn：
-     best-effort关闭Pending Interaction
-     可选append ToolAbandoned或直接保留incomplete invocation
-     append TurnInterrupted(HostRestart | RecoveryContextUnavailable)
-→ apply receipts
-→ Ready/Idle或typed Unavailable
+open file and acquire writable lease when recording is enabled
+→ tolerant replay recorded prefix
+→ writable open truncates only final unterminated partial tail ignored by replay
+→ create LiveSessionState from replay
+→ sanitize incomplete exchange
+→ mark recorded unfinished Turn InterruptedByRestart
+→ initialize new inline recorder at replayed recorded head
+→ resolve current Workspace/Agent definition
+→ SessionExecutor Idle or WorkspaceUnavailable
 ```
 
-recovery不：
+recording unavailable不阻止admission。新loaded instance根据current recording policy与open结果初始化为Healthy、Degraded或Disabled；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail。cold recovery closure可以best-effort record；失败只影响未来history。
 
-- 自动重放Tool；
-- 合成ToolResult；
-- 补写ToolRound completion marker；
-- 猜测丢失parent；
-- 重建旧WorkspaceSnapshot/PromptSet/ToolSet/SkillView；
-- 因无法写terminal而隐藏全部历史。
+Tail处理只允许截断final unterminated partial line。完整newline-terminated entry即使来自先前outcome-unknown write，只要typed replay有效就必须保留；malformed中段行继续由tolerant replay隔离，不执行repair、reparent或gap marker synthesis。
 
-如果recovery append失败，Session history仍可read-only打开；future Turn admission可以标记Unavailable，等待用户新建/fork Session或解决storage问题。
+## Diagnostics
 
-## Corruption 与 Repair Policy
-
-MVP不提供explicit repair utility。普通load只执行可逆的读取决策和final partial-tail截断，不修改中段内容。
-
-禁止：
-
-```text
-automatic reparent
-rewrite malformed middle line
-invent missing ToolResult
-merge duplicate IDs
-semantic reconstruction
-silent in-place repair
+```rust
+pub struct SessionReplayDiagnostic {
+    pub code: SessionReplayDiagnosticCode,
+    pub entry_id: Option<EntryId>,
+    pub line_number: Option<u64>,
+    pub redacted_detail: Option<String>,
+}
 ```
 
-用户可以通过通用文件工具备份/检查原始JSONL；MiniCore只保证diagnostics足够定位line/offset和受影响entry。
+Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，并禁止暴露credential、绝对敏感路径、完整Tool output或raw provider payload。
 
-## Performance
+## 测试要求
 
-- cold open/recovery按完整文件O(n)扫描；
-- loaded Session切换只路由现有SessionExecutionHandle；
-- writer复用open file handle和buffer；
-- 不以每entry `fsync`声称power-loss durability；
-- 配置`max_entry_bytes`；
-- streaming/progress不写ledger；
-- usage aggregate、session list和search index是rebuildable cache；
-- 没有真实规模数据前不建设ProjectionSnapshot、byte-offset index、segmentation或vacuum。
-
-## 与 Session Execution 的关系
-
-推荐执行流：
-
-```text
-append User(Input + StoredTurnStart)
-→ AgentLoop NeedModel
-→ ModelGateway.generate
-→ append Assistant(Intermediate with ToolCall)
-→ execute Tools under current-Runtime control
-→ append one Tool message per truthful result
-→ final matching Tool message produces CommittedToolExchangeDelta
-→ AgentLoop accepts committed tool results
-→ next model call
-→ append Assistant(Final)
-```
-
-Ask-user：
-
-```text
-InteractionRequested append/apply
-→ host notify
-→ InteractionResolved append/apply
-→ PreExecution ToolResult append
-→ exchange complete后进入conversation
-```
-
-SessionWriter不决定何时调用Model、执行Tool、消费Steer、Cancel或terminalize Turn。
-
-## 基础不变量
-
-- 一个Session一个authoritative JSONL history tree；
-- mutation只通过一个SessionWriter；
-- live append严格、cold replay宽容；
-- core IDs保持typed；Entry/Turn/Item/Request ID在Session内唯一，ToolCallId只在单assistant response内唯一；
-- Fork保留复制历史ID；
-- Input UserMessage内联TurnStart并开始Turn；
-- Final Assistant或terminal event结束Turn；
-- ToolCall与ToolResult通过TurnId/ItemId/ToolCallId关联；
-- complete Tool exchange才进入模型conversation；
-- incomplete exchange在replay中隔离并告警；
-- ledger不保存ToolExecutionStarted或ToolRoundCompleted；
-- Interaction request-before-notify、resolution-before-resume；
-- Compaction使用summary + first-kept marker；
-- corruption不brick整个Session；
-- recovery不恢复旧I/O、不自动重放Tool、不合成结果；
-- Prompt只消费sanitized CommittedConversationView。
-
-## Test Matrix
-
-至少覆盖：
-
-- Input UserMessage与StoredTurnStart round-trip；
-- Steer不能携带turn_start；
-- strict live append拒绝missing parent/duplicate ToolResult/ToolResult与ToolAbandoned冲突/terminal后new work；
-- malformed中段JSON被skip，后续valid line继续加载；
-- duplicate EntryId first wins；
-- missing parent形成orphan root；
-- invalid body只影响对应projection；
-- assistant多ToolCall、结果逆序完成，最后一个结果产生ordered Tool exchange delta；
-- missing/orphan ToolResult不进入模型conversation；duplicate result first valid wins并告警；ToolResult/ToolAbandoned冲突采用first terminal wins；
-- incomplete exchange被exchange-closing entry关闭，迟到result视为orphan；
-- incomplete exchange后的新User/Assistant内容可恢复；
-- Prompt输入无unmatched Tool protocol record；
-- Interaction missing request/duplicate resolution diagnostics；
-- final partial tail read-only ignore与writable truncate；
-- Compaction marker valid/missing/ignored；
-- Fork保留Entry/Turn/Item/Request/ToolCall IDs并分配新SessionId；
-- Fork后新append的MiniCore-generated ID不发生collision；
-- restart不恢复Tool task，Running Turn中断；
-- recovery terminal append失败时history仍readable；
-- full O(n) replay与hot projections在无corruption时得到相同模型conversation；
-- corruption fixture返回bounded redacted diagnostics。
+- recorder按live mutation顺序inline写出；
+- encode/write failure后停止suffix，replay保持有效完整行前缀；
+- recording failure不阻止Model/Tool/Interaction/terminal；
+- crash或failed write留下partial tail时read-only replay安全忽略，writable Load只截断final unterminated tail；
+- Degraded后即使storage恢复，当前loaded Session仍不写新entry；
+- Unload/Load只恢复recorded prefix并可建立新的Healthy Recorder；
+- 不创建segment、gap marker或backfill suffix；
+- malformed/duplicate/orphan/partial-tail replay；
+- complete/incomplete/duplicate/conflicting Tool exchange；
+- compaction marker missing/invalid；
+- fork历史ID保留和future ID无collision；
+- restart不恢复execution objects；
+- bounded redacted diagnostics；
+- LiveConversation与无corruption replay产生相同sanitized messages。
 
 ## 开放问题
 
-实现阶段仍需冻结：
-
-1. serde tags/field casing；
-2. public ID和EntryId的UUID版本/文本格式；
-3. `max_entry_bytes`；
-4. replay diagnostic数量上限与聚合规则；
-5. future format migration policy。
+ID wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。Recording state wire由Q2关闭，Degraded recovery由Q5关闭；Recorder特有问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

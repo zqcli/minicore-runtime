@@ -3,7 +3,9 @@
 状态：设计评审记录（未关闭项持续跟进）
 日期：2026-07-29
 范围：`docs/architecture.md` + `docs/modules/` + `docs/adr/`（0100–0120）
-方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到权威文档，未关闭项继续保留为评审输入。
+方式：初始发现来自按设计切面的只读评审；A、B、C1/C2/C4、D1与E3已形成决议并同步到当时权威文档，未关闭项继续保留为评审输入。
+
+> 2026-07-30：本文评审的SessionWriter、append/apply、committed projection、single RunningOperation和AgentLoop结论属于ADR 0126之前的历史基线。当前执行/recording设计以ADR 0126和current modules为准；O1 Sandbox门禁继续有效。
 
 ## 总体判断
 

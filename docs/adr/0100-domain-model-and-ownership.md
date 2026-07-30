@@ -1,7 +1,9 @@
 # ADR 0100: 领域模型与 ownership
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-24
+
+> 2026-07-30：领域层级和definition ownership保留；loaded Session的live truth改为`LiveSessionState`，SessionStorage只保存best-effort recorded prefix。
 
 ## 背景
 
@@ -16,13 +18,13 @@ MiniCore 作为可嵌入的原生 Agent harness runtime core，需要一套稳�
 - **Runtime 持有共享深模块**：`PromptService`、`ToolService`、`SkillService`和`ModelGateway`在 Runtime 生命周期内长期存在；Turn执行边界从中捕获或产生独立、不可变的有效执行对象（`PromptResourceView` / `PromptSet` / `ToolSet` / `SkillView` / `LoadedSkill` / `TurnModelSnapshot`），执行对象不回写 Service。
 - **Prompt / Tool / Skill 是独立概念，不合并为通用 `Resource`**：三者有各自的定义、Set、授权与 lifecycle，由各自子系统治理；不引入统一 `ResourceManager` 或 per-cwd resource snapshot。详见 [ADR 0102](0102-prompt-tool-skill-are-distinct-subsystems.md)。
 - **Workspace 属于 Session**：以 `SessionDefinition.workspace` 形式归 Session 所有，不属于 Agent 或 Turn，也不是独立 entity 或 Runtime-global registry。详见 [ADR 0101](0101-workspace-ownership.md)。
-- **一个事实来源原则**：同一份领域事实只有一个权威 owner——conversation durable truth 属于 SessionStorage、Agent definition 属于 Agent owner、Workspace definition 属于 Session、PromptResourceView、Tool definitions/ToolSet和SkillView属于各自子系统、最终模型可见上下文属于 PromptSet、provider encoding 与调用属于 ModelGateway。durable lifecycle 与 loaded execution state 分离；内存 projection、cache、snapshot、UI read model 只能由权威事实派生，不能成为并列 source of truth。
+- **一个事实来源原则**：loaded conversation与Turn/Item/Interaction current state属于`LiveSessionState`，recorded history属于SessionStorage，Agent definition属于Agent owner，Workspace definition属于Session，Prompt/Tool/Skill objects属于各自module，最终模型可见上下文属于PromptSet，provider encoding与调用属于ModelGateway。StateEvent和SessionRecorder都不能反向成为live state owner。
 - **Turn 领域对象不持有执行期对象**：领域Turn不内联PromptSet、ToolSet、SkillView、Agent identity或Workspace，也不内联`Vec<Item>`；这些执行期对象由TurnExecutionContext在admission时capture为同一组immutable `Arc`/private对象，`TurnContext` storage entry只保存exact durable refs、必要safe execution values/provenance和diagnostics，不保存执行fingerprint作为恢复证明；Item 顺序由 SessionStorage projection 提供。Turn execution 是领域 Turn 外围的执行过程，不新增领域层级。
 
 ## 后果
 
 - 领域层级冻结后，下属专项 ADR 与模块文档只需在既定 ownership 内细化，不会重新协商顶层归属；边界收敛可在单一模块内验证。
-- 一个事实来源原则让恢复与 reload 变得确定：重启后所有 Session 视为 Unloaded，所有 projection/cache 从 durable truth 重建，不存在需要对账的并列真相。
+- restart后所有Session视为Unloaded；definition从durable owner恢复，conversation只从recorded prefix恢复，未record live tail按设计丢失。
 - 拒绝通用`Resource`合并的代价是三个子系统各自维护必要的定义、view、授权和有效对象，换取的是 Prompt/Tool/Skill 各自的授权硬边界不互相污染。
 - Turn 领域对象与执行期对象分离带来capture/reload线性化的排序复杂度，但换取领域 Turn 的可持久化与可观察性不依赖任何执行期句柄或fingerprint恢复协议。
 - 未来能力（worktree、remote execution 等）应建立各自深模块并由既有 owner 引用其输出，不得塞回领域 entity 或复活通用 Resource。

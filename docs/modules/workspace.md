@@ -1,7 +1,7 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（设计已冻结，生产实现待启动）
-日期：2026-07-25
+状态：当前权威架构（ADR 0126后，生产实现待启动）
+日期：2026-07-30
 
 ## 目的
 
@@ -911,7 +911,7 @@ UnloadSession
 → 释放 SessionWorkspaceState
 ```
 
-Session active时由Session层的PrepareForUnload停止admission并等待自然terminal；grace deadline到期后fail-closed cancel。Workspace只在Executor进入Idle、writer关闭后释放resolved state，不自行决定Cancel或deadline。
+Session active时由Session层的PrepareForUnload停止admission并等待自然terminal；grace deadline到期后fail-closed cancel。Workspace只在ActiveTurnTask结束、Executor进入Idle后释放resolved state。SessionRecorder没有后台queue或physical flush drain。
 
 没有 Workspace registry entry、shared aggregate 或 backend connection 需要单独关闭。
 
@@ -959,9 +959,9 @@ managed hard deny、trust/policy store降级或host安全事件可以在active T
 
 1. WorkspaceAuthority或host发布current authority/policy事实；
 2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定current active target；
-3. SessionExecutor停止new admission/operation；Idle直接进入resolve，Starting取消candidate，Running/Finishing进入或保持Finishing；
+3. SessionExecutor停止new admission；Idle直接进入resolve，Starting取消candidate，Running/Finishing向ActiveTurnTask发布SecurityRevoked并进入或保持Finishing；
 4. 已取得ToolStartPermit并进入Running的Tool保存exact outcome或`ToolAbandoned`；Prepared Tool不再启动；
-5. 有active Turn时append/apply`TurnInterrupted(SecurityRevoked)`并释放Turn；
+5. 有active Turn时apply live `TurnInterrupted(SecurityRevoked)`、完成inline record attempt并释放Turn；
 6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve，并捕获new candidate授权的Workspace-bound Prompt/Skill sources；
 7. success时retire signal、Ready并发布new Snapshot及captured source values，failure时Unavailable且future admission fail closed。
 
@@ -1231,7 +1231,7 @@ upload / telemetry
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
 - Workspace Prompt source在Session load、Idle definition update或`/reload workspace`时捕获immutable content；SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
 - Workspace Skill adapter的capture只能使用WorkspaceSkillCaptureContext，并必须通过context构造CapturedWorkspaceSkillSource；
-- captured SkillView entry、LoadedSkill、SkillInjection和committed contribution provenance使用同一SkillId和exact source authorization/provenance；
+- captured SkillView entry、LoadedSkill、SkillInjection和live/recorded contribution provenance使用同一SkillId和exact source authorization/provenance；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；
@@ -1242,7 +1242,7 @@ upload / telemetry
 - Idle SecurityRevoked立即失效old Snapshot并重新resolve，不创建TurnInterrupted；
 - Starting SecurityRevoked取消candidate后重新resolve，不创建领域Turn；
 - terminal后使用current definition/current authority重新resolve，success Ready、failure Unavailable；
-- security signal先赢时迟到model/tool/source结果不进入后续committed conversation；
+- security signal先赢时迟到model/tool/source结果不进入后续LiveConversation；
 - crash无法证明security cause时使用HostRestart/RecoveryContextUnavailable；
 - 同root两个Session的cwd/grant和security operation basis隔离；
 - WorkspacePromptContext、WorkspaceSkillContext、WorkspaceAccessView和WorkspaceToolContext只能由同一个`Arc<WorkspaceSnapshot>`私有投影，不能跨Snapshot拼接；

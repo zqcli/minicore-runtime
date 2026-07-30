@@ -1,7 +1,9 @@
 # ADR 0116：文件 mutation 使用 Session-local FIFO 队列
 
-状态：Accepted
+状态：Partially Superseded by ADR 0126
 日期：2026-07-27
+
+> 2026-07-30：Session-local file mutation queue与跨Session不协调规则保留；current Turn的ActiveTurnTask使用该queue，旧SessionExecutor single mutable owner表述由ADR 0126修订。
 
 ## 背景
 
