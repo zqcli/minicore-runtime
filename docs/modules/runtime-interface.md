@@ -333,6 +333,15 @@ pub enum SessionCommand {
 
 ### ForkAnchor
 
+```rust
+pub enum ForkSourceKind {
+    LiveSnapshot,
+    RecordedHistory,
+}
+```
+
+`ForkSourceKind`由Runtime在source residency linearization point确定：source已loaded时为`LiveSnapshot`，未loaded时为`RecordedHistory`。调用方不能请求loaded source退回RecordedHistory，也不能根据recording health推断source。
+
 普通UI使用message/item anchor，不直接构造EntryId：
 
 ```rust
@@ -353,11 +362,11 @@ pub enum ForkAnchor {
 }
 ```
 
-Runtime把公开anchor解析为合法storage path end：
+Runtime在已确定的Fork source内解析公开anchor：loaded source在同一个LiveSnapshot内解析anchor并复制selected path，unloaded source在RecordedHistory中解析。解析结果是target staging的合法path end：
 
 - `BeforeUserMessage(Input/Steer)`解析到该message的parent；Input的`StoredTurnStart`与UserMessage同entry，因此一起排除；
-- `AfterUserMessage`包含对应durable UserMessage；
-- `Before/AfterFinalAgentMessage`只接受`phase = Final`的AgentMessage Item；
+- `AfterUserMessage`包含source中的对应UserMessage；该Item已live apply即可，不要求source record attempt已经成功；
+- `Before/AfterFinalAgentMessage`只接受source中`phase = Final`的AgentMessage Item；
 - anchor产生non-terminal tail Turn时，fork staging按`HistoricalFork`规则关闭；
 - intermediate AgentMessage、Reasoning、ToolInvocation、Interaction和裸ToolResult不作为普通UI anchor；
 - cross-session、stale或kind不匹配的ItemId返回typed error。
@@ -501,6 +510,7 @@ pub enum CommandOutcome {
     },
     SessionForked {
         session_id: SessionId,
+        source: ForkSourceKind,
     },
     TurnStarted {
         turn_id: TurnId,
@@ -522,11 +532,12 @@ pub enum CommandOutcome {
 
 Command response不是完整业务完成流：
 
+- `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
 - `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
 - `CancelAccepted`只表示active target仍可取消且sticky cancel epoch已经发布；它与initiating/final append reservation first-wins，accepted后对应Started/Completed commit不得再赢；Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
 - `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
-- Session load可以在load/recovery完成后返回typed loaded/readiness outcome；
+- `SessionLoaded`在load/recovery完成并原子发布latest SessionSnapshot后返回；recording health从随后显式`Snapshot(Session)`或subscription首帧读取，不内联进unit outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
 - Session/Agent事实变化同时发布StateEvent，让其他subscriber失效或更新read model。
 
@@ -536,7 +547,7 @@ Command response不是完整业务完成流：
 | --- | --- |
 | Create Agent | Agent head与revision durable publication |
 | Update Agent | expected revision/status CAS成功 |
-| Create Session | live Session identity/definition建立并启动Recorder；recording health随response/Snapshot可见 |
+| Create Session | SessionDefinition与initial SessionHeader staging成功后原子发布Open + Unloaded Session；不启动Recorder |
 | Update SessionDefinition（non-Workspace或unloaded Workspace） | new revision durable publication |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
 | Reload shared Prompt/Skill/Tool/Model | required candidates全部validate，并在publication gate下替换current immutable objects；失败时old current values保持不变 |
@@ -550,7 +561,7 @@ Command response不是完整业务完成流：
 | Resolve Interaction | InteractionResolved live apply与inline record attempt |
 | Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；live Turn admission先完成时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
 | Cancel Turn | active target仍可取消且sticky cancel epoch发布；live final arbitration先完成时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
-| Fork Session | target staging验证完成并原子发布 |
+| Fork Session | source kind与immutable path已捕获，target staging完整materialize并验证后原子发布 |
 
 ### Command Error
 
@@ -748,6 +759,7 @@ ListSessions
 GetSession
 GetSessionDefinition
 GetSessionReadiness
+GetSessionForkProvenance
 GetHistoryTree
 ListTurns
 GetTurn
@@ -765,6 +777,16 @@ pub struct SessionHistoryTreeView {
     pub nodes: Vec<HistoryNodeView>,
 }
 ```
+
+```rust
+pub struct SessionForkProvenanceView {
+    pub source_session_id: SessionId,
+    pub source: ForkSourceKind,
+    pub anchor: ForkAnchor,
+}
+```
+
+non-fork Session的`GetSessionForkProvenance`返回`None`；fork child返回durable provenance。该query不重新判断source当前是否loaded，也不根据后续recording health改写`source`。
 
 History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessionEntry、recorder internals或physical recorded head。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
 
@@ -876,7 +898,6 @@ pub struct SessionRecordingView {
 pub enum SessionRecordingState {
     Healthy,
     Degraded,
-    Disabled,
 }
 ```
 
@@ -885,22 +906,20 @@ wire固定为object + string state：
 ```json
 {"recording":{"state":"healthy"}}
 {"recording":{"state":"degraded"}}
-{"recording":{"state":"disabled"}}
 ```
 
 长期recorded Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的live Items，并按live conversation顺序与assistant Reasoning/Text/ToolCall content顺序排列。一个Session最多暴露一个current Turn/ActiveTurnTask，消费[INV-101](../architecture.md#跨模块不变量索引)。Snapshot不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
 
 `SessionRecordingState`语义：
 
-- `Healthy`：BestEffort recording已启用，当前load尚未观察到record failure；不表示flush、fsync或power-loss durability；
-- `Degraded`：期望记录，但初始化、encode或append已经失败；当前load停止后续记录，Session execution继续；
-- `Disabled`：Host显式选择不记录或ephemeral policy；属于预期配置，不产生故障warning；
-- 初始化、lease、权限、磁盘或write错误必须投影为`Degraded`，不能投影为`Disabled`；
-- 同一次load只允许`Healthy → Degraded`；`Disabled`在该load内保持`Disabled`；修复storage不会使当前loaded instance恢复；
+- `Healthy`：当前load尚未观察到record failure；不表示flush、fsync或power-loss durability；
+- `Degraded`：初始化、encode或append已经失败；当前load停止后续记录，Session execution继续；
+- Create先完成initial SessionHeader staging并发布Unloaded Session；每次Load都尝试初始化Recorder，不提供Disabled、ephemeral Session或per-entry opt-out；
+- 同一次load只允许`Healthy → Degraded`；修复storage不会使当前loaded instance恢复；
 - 只有显式`Unload + Load`创建的新loaded instance可以重新成为Healthy，并且只恢复recorded prefix；旧unrecorded live tail丢失；
 - MVP不提供`ResumeSessionRecording`、`StartRecordingSegment`、自动storage probe/retry或live-tail backfill。
 
-MVP不增加`Initializing`、`Writing`或per-entry receipt状态。内部`RecordingHealth`可以携带typed reason和failed entry identity，公开view只投影三态。
+MVP不增加`Disabled`、`Initializing`、`Writing`或per-entry receipt状态。内部`RecordingHealth`可以携带typed reason和failed entry identity，公开view只投影Healthy或Degraded。
 
 recording failure同时产生一条脱敏`SessionDiagnosticView`，code只允许：
 
@@ -913,7 +932,7 @@ session_recording_outcome_unknown
 
 raw OS error、绝对路径、credential、完整StoredSessionEntry和Tool output只进入受控内部日志。Session保持`Degraded`期间，latest SessionSnapshot必须保留至少一条当前recording diagnostic，使断线重连的host能够同时恢复状态和粗粒度原因。状态变化与该diagnostic在同一次immutable Snapshot publication中原子可见。
 
-Host展示语义：`Healthy`不提示；`Disabled`使用中性“此会话不会保存”状态；`Degraded`持续显示“后续内容无法恢复”的warning，但不得禁用Submit、Model、Tool、Interaction或Compaction。warning应明确：继续使用会保留current live state但不保存；Unload/Load只恢复到最后recorded prefix并丢失之后的live内容。
+Host展示语义：`Healthy`不提示；`Degraded`持续显示“后续内容无法恢复”的warning，但不得禁用Submit、Model、Tool、Interaction或Compaction。warning应明确：继续使用会保留current live state但不保存；Unload/Load只恢复到最后recorded prefix并丢失之后的live内容。
 
 `SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。`pending_submit_count`是尚未被仲裁的admission信箱瞬时计数（正常为0），不表示存在跨Turn排队的Submit通道。
 
@@ -1119,7 +1138,9 @@ command_catalog_invalidated
 
 `shared_resources_reloaded`是Runtime-scope typed unit payload，表示Prompt/Skill/Tool/Model四个safe catalog都可能变化；它不携带revision/generation。`session_workspace_reloaded { session_id }`是Session-scope payload，表示new WorkspaceSnapshot及Workspace-bound Prompt/Skill captured sources已经一起发布；订阅者随后以new SessionSnapshot为准。
 
-`session_recording_changed`只在loaded Session的公开recording state发生变化时发布。first failure执行`Healthy → Degraded`并在同一Snapshot publication中安装当前脱敏recording diagnostic；显式`Disabled`在初始Create/Load response与Snapshot中可见，不需要故障warning event。重复`record()`在Degraded/Disabled下返回`NotRecorded`时不重复发布state event。
+`session_recording_changed`只在loaded Session的公开recording state发生变化时发布。first failure执行`Healthy → Degraded`并在同一Snapshot publication中安装当前脱敏recording diagnostic。重复`record()`在Degraded下返回`NotRecorded`时不重复发布state event。
+
+`session_forked`是Runtime-scope membership invalidation；command caller直接读取`SessionForked.source`，其他subscriber通过`GetSessionForkProvenance`查询durable source，不在Runtime event detail中重复该字段。
 
 failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved、Compaction或terminal路径，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。这样领域事件不会被health event抢先，同时实时subscriber仍得到显式transition signal。
 
@@ -1584,6 +1605,8 @@ Public interface是 contract test surface。
 ### Command Tests
 
 - Agent/Session revision CAS；
+- Create Session只有在SessionDefinition与SessionHeader staging成功后返回SessionCreated；失败不发布partial Session；
+- Load始终尝试初始化Recorder，初始化失败后SessionSnapshot recording为Degraded；
 - Submit只在UserMessage成功live apply并完成inline record attempt后返回TurnStarted；
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
 - 相同CommandId携带不同command返回CommandConflict；
@@ -1600,6 +1623,10 @@ Public interface是 contract test surface。
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
 - Interaction first live terminal resolution wins；
 - Fork Before/After Item anchor；
+- loaded Fork outcome/provenance为LiveSnapshot并包含capture前已apply的unrecorded tail；
+- unloaded Fork outcome/provenance为RecordedHistory；
+- Fork与Unload竞态的source kind和复制path来自同一linearization decision；
+- live Fork staging失败不发布SessionForked或partial child；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
 - `/compact`不在catalog。
 
@@ -1614,7 +1641,7 @@ Public interface是 contract test surface。
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
-- Healthy/Degraded/Disabled三态JSON wire稳定，初始化/write failure不能投影为Disabled；
+- Healthy/Degraded两态JSON wire稳定，Create无recording opt-out且每次Load都尝试初始化Recorder；
 - Degraded Snapshot始终携带至少一条当前脱敏recording diagnostic；
 - snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
 
@@ -1629,7 +1656,7 @@ Public interface是 contract test surface。
 - message/reasoning started、delta和completed使用稳定ItemId，丢失started/delta仍可由completed校正；
 - live final mutation失败不发布item_completed；recording失败仍可发布；logical retry、Turn terminal或新Snapshot清理临时Item view；
 - Healthy首次失败时原domain event先携带Degraded Snapshot发布，随后一次`session_recording_changed`；后续NotRecorded不重复发state event；
-- Disabled只在初始Snapshot表达预期policy，不产生failure warning；
+- public wire不接受Disabled，Create/Load没有recording opt-out字段；Create header staging失败不发布Session，Load recorder初始化失败投影为Degraded；
 - Degraded后修复storage、重复Load command或后续record call均不能恢复当前loaded instance；
 - Unload/Load的新Snapshot可以重新Healthy，但只包含recorded prefix；
 - logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；

@@ -46,12 +46,14 @@ SessionRecorder
 - 接受ADR 0126：`SessionExecutor control actor + one ActiveTurnTask`；
 - 删除同步AgentLoop、RunningOperation与SessionWriter durable commit barrier；
 - Q1关闭：删除Recorder后台queue、容量、Flush和drain；改为`record(entry).await`顺序append；
-- Q2关闭：公开`recording.state = healthy | degraded | disabled`，first degradation发布`session_recording_changed`并保留脱敏diagnostic；
+- Q2关闭：公开`recording.state = healthy | degraded`，first degradation发布`session_recording_changed`并保留脱敏diagnostic；
 - Q3/Q4关闭：无public Flush、无Recorder drain deadline；
 - Q5关闭：Degraded在同一loaded instance内为终态；不retry、不创建segment、不backfill；Unload/Load只恢复recorded prefix；
+- Q6关闭：loaded Fork使用同一LiveSnapshot解析anchor并复制unrecorded tail，unloaded Fork使用RecordedHistory；source进入outcome与durable provenance；
+- Q7关闭：无recording policy、Disabled或ephemeral Session；Create严格stage SessionHeader，Load始终尝试初始化Recorder；
 - Q8关闭：live apply → inline record attempt → final domain publication/protocol continuation；
 - writable Load只截断final unterminated partial tail，不修改完整行或中段内容；
-- 完成current Markdown链接、代码围栏、旧术语、8条INV owner和`git diff --check`验证。
+- 完成current Markdown链接、代码围栏、旧术语、9条INV owner和`git diff --check`验证。
 
 ## 恢复顺序
 
@@ -77,13 +79,15 @@ SessionRecorder
 - SessionRecorder通过inline `record().await`顺序append，不使用后台queue，也不提供durable commit receipt；
 - live mutation成功后完成inline record attempt，再publish final event或推进协议；
 - recorder first encode/write failure后Degraded并停止后续suffix；
-- public recording wire固定为`{ state: healthy | degraded | disabled }`；first degradation发布`session_recording_changed`并保留当前脱敏diagnostic；
-- `Disabled`只表示显式policy，初始化/write failure必须为`Degraded`；
+- public recording wire固定为`{ state: healthy | degraded }`；first degradation发布`session_recording_changed`并保留当前脱敏diagnostic；
+- Create严格stage SessionHeader后发布Unloaded Session；Load始终尝试初始化Recorder；不提供recording policy、Disabled或ephemeral Session；
 - Degraded在同一loaded instance内为终态，不retry、不创建segment、不backfill；Unload/Load只恢复recorded prefix并可建立new health；
 - writable Load只截断final unterminated partial tail，不修改完整行或中段内容；
 - recording failure不终止Turn、不产生SessionUnavailable；
 - recording Degraded或process crash时StateEvent/Snapshot可以领先可恢复recorded prefix；Healthy状态无后台queue lag；
 - cold replay只恢复recorded prefix，未record tail丢失；
+- loaded Fork可以把snapshot capture前已apply的unrecorded tail写入独立child record stream；unloaded Fork只复制RecordedHistory；
+- ForkSourceKind进入SessionForked outcome和child durable provenance；target staging失败不发布partial child；
 - restart不恢复task、stream、Tool process、waiter、queue或retry timer；
 - Interaction request/resolution使用live apply + record attempt + oneshot；
 - logical retry使用same Arc<ModelCallRequest>、control generation和ConversationRevision；
@@ -97,6 +101,7 @@ SessionRecorder
 INV-001 live apply → inline record attempt → final publish/continue
 INV-002 tolerant replay of recorded prefix
 INV-003 complete Tool exchange before model visibility
+INV-004 loaded Fork LiveSnapshot / unloaded Fork RecordedHistory
 INV-101 one control actor + at most one ActiveTurnTask
 INV-102 Steer safe-point FIFO
 INV-201 immutable Turn capture
@@ -127,24 +132,21 @@ writer-poisoned/read-only execution admission
 
 详见[独立review](async-loop-best-effort-recording-open-questions.md)：
 
-- loaded live fork是否包含unrecorded tail；
-- BestEffort/Disabled recording policy；
 - EntryId generator实现owner；
 - cold recovery closure是否best-effort record。
 
-Q1 queue容量、Q2 RecordingHealth wire、Q3 Flush、Q4 drain deadline、Q5 Degraded recovery和Q8 event/record顺序已经关闭。其余问题不重新打开async loop和inline best-effort recording的核心方向。
+Q1 queue容量、Q2 RecordingHealth wire、Q3 Flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy和Q8 event/record顺序已经关闭。其余问题不重新打开async loop和inline best-effort recording的核心方向。
 
 ## 下一步
 
-1. 从Q6开始review：loaded Session fork使用live snapshot还是recorded prefix；
-2. 继续关闭Q7 recording policy、Q9 EntryId owner和Q10 cold recovery closure；
-3. 冻结剩余wire/schema：通用serde casing、ID、Timestamp/Money、StoredTurnStart/StoredCompaction；
-4. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
-5. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
-6. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
-7. 实现Interaction、Cancel、logical retry和Compaction async paths；
-8. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
-9. production Tool/Sandbox adapter前关闭O1/R7。
+1. 关闭Q9 EntryId owner和Q10 cold recovery closure；
+2. 冻结剩余wire/schema：通用serde casing、ID、Timestamp/Money、StoredTurnStart/StoredCompaction；
+3. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
+4. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
+5. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
+6. 实现Interaction、Cancel、logical retry和Compaction async paths；
+7. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
+8. production Tool/Sandbox adapter前关闭O1/R7。
 
 ## Review状态
 
@@ -158,4 +160,4 @@ R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应先继续Q6评审，不要按旧同步AgentLoop、后台Recorder queue或durable SessionWriter开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应先关闭Q9/Q10，不要按旧同步AgentLoop、后台Recorder queue或durable SessionWriter开始编码。

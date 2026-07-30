@@ -95,11 +95,10 @@ pub(crate) enum RecordingHealth {
         failed_entry_id: Option<EntryId>,
         reason: SessionRecordingError,
     },
-    Disabled,
 }
 ```
 
-`Disabled`只由Host显式recording policy建立。初始化、lease、权限、磁盘、encode、append或unknown write failure全部进入`Degraded`。Runtime公开投影固定为`SessionRecordingView { state: healthy | degraded | disabled }`；internal reason映射为allowlisted diagnostic，不公开raw error或failed EntryId。first `Healthy → Degraded`原子安装new Snapshot state和当前recording diagnostic；当前domain event先携带该Snapshot发布，随后补发一次`session_recording_changed`。同一load不自动恢复Healthy。
+MVP不提供recording policy、`Disabled`或ephemeral Session。Session Create严格staging初始SessionHeader后发布`Open + Unloaded`，不创建loaded-session Recorder；header staging失败则Create失败且不发布Session。每次Load都尝试初始化SessionRecorder；初始化、lease、权限、磁盘、encode、append或unknown write failure进入`Degraded`。Runtime公开投影固定为`SessionRecordingView { state: healthy | degraded }`；internal reason映射为allowlisted diagnostic，不公开raw error或failed EntryId。first `Healthy → Degraded`原子安装new Snapshot state和当前recording diagnostic；当前domain event先携带该Snapshot发布，随后补发一次`session_recording_changed`。同一load不自动恢复Healthy。
 
 实现应使用async filesystem API。仅Recorder自身用于保护单文件handle的async mutex可以跨append await；任何`LiveSessionState`、Session phase或Tool control guard都必须先释放。RecordingHealth通过独立immutable view发布，使Snapshot不等待file write。不同Session不能共享Recorder锁。
 
@@ -190,25 +189,41 @@ ActiveTurnTask从sanitized `LiveConversationView`规划Compaction并调用ModelG
 
 Cold load只恢复recorded JSONL完整行：
 
-- writable open取得exclusive lease后，只截断final unterminated partial tail；完整newline-terminated entry和中段内容不改写；
+- writable open尝试取得exclusive lease；失败建立Degraded loaded Session；成功时只截断final unterminated partial tail，完整newline-terminated entry和中段内容不改写；
 - replay继续容忍malformed、duplicate、orphan和invalid relation；
 - model view继续排除不完整Tool exchange；
 - 未记录的live tail永久丢失；
-- recorded Running Turn在新进程中投影为Interrupted/Incomplete，并可inline best-effort记录`HostRestart` closure；
-- closure记录失败不阻止读取或新Turn admission；
+- recorded Running Turn在新进程中投影为Interrupted/Incomplete；
+- 是否追加`HostRestart` closure仍由Q10决定；任何closure attempt都必须发生在new Recorder初始化之后，且不能成为读取或new Turn admission的correctness gate；
 - Workspace/Prompt/Skill/Tool/Model execution objects仍按current definitions重新capture；
-- new loaded instance根据current recording policy与storage结果建立Healthy、Degraded或Disabled，不继承旧health object；
+- new loaded instance始终尝试初始化Recorder，并根据storage结果建立Healthy或Degraded，不继承旧health object；
 - Unload/Load永久丢弃旧unrecorded live tail，不记录gap marker。
 
 Session recording不可用不再产生read-only loaded Session或writer-poisoned Unavailable。Workspace、安全或定义解析失败仍可产生`SessionReadiness::Unavailable`。
 
 Recorder没有后台queue。graceful unload等待或取消ActiveTurnTask；task结束后不存在待drain recording tail，因此不提供Recorder drain deadline或public flush command。forced process exit仍可能中断当前append并留下partial line。
 
+### 13. Fork source
+
+Fork在source Session的residency/lifecycle synchronization内确定source kind：
+
+- source在linearization point已loaded时固定使用`LiveSnapshot`；
+- source在linearization point未loaded时固定使用`RecordedHistory`；
+- Unload先赢则使用RecordedHistory；Fork先捕获snapshot则使用LiveSnapshot，后续Unload不改变已捕获source；
+- loaded source不根据Recorder health或当前entry是否已写入而降级为RecordedHistory。
+
+LiveSnapshot必须在一次短live-state critical section内同时解析anchor并复制immutable selected path。live mutation在snapshot捕获前已apply时，即使对应`record().await`仍在执行，该事实也进入fork；捕获后才apply的mutation不进入。stream draft、ProgressEvent和其他未apply状态不进入snapshot。
+
+Fork释放source guard后再创建target staging record stream。selected path必须完整写入并通过tolerant replay验证后才能原子发布child；staging失败不发布部分child。non-terminal tail在child中以`HistoricalFork`关闭。Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object、in-flight append或authorization capability。
+
+`ForkSourceKind::LiveSnapshot | RecordedHistory`进入child durable fork provenance和`SessionForked`command outcome。Host不需要根据recording health推断Fork是否包含live tail。
+
 ## 跨模块不变量变更
 
 - `INV-001`改为live mutation先apply，再完成inline record attempt，随后final publication/protocol continuation；record outcome不提供durable execution permit；
 - `INV-002`保留tolerant replay，并明确只恢复recorded prefix；
 - `INV-003`canonical owner移动到live conversation reducer，cold projector只负责恢复期sanitization；
+- `INV-004`新增Fork source规则：loaded使用同一LiveSnapshot解析anchor并复制path，unloaded使用RecordedHistory，source kind进入durable provenance和command outcome；
 - `INV-101`改为每Session一个control actor和最多一个ActiveTurnTask；
 - `INV-102`语义保留，consumer从AgentLoop改为ActiveTurnTask；
 - `INV-201`保持；
@@ -238,12 +253,14 @@ Recorder没有后台queue。graceful unload等待或取消ActiveTurnTask；task�
 - 同Session的final event和下一protocol step等待该append attempt返回；
 - Host观察到的live状态仍可能因Degraded、partial write或process crash无法完整恢复；
 - Tool副作用、Interaction和terminal记录可能缺失；
-- fork/resume只对recorded prefix提供跨进程保证；
-- 修复storage后要恢复保存能力，必须接受Unload/Load只回到recorded prefix，或等待Q6定义显式live fork；
+- source Session的crash resume仍只恢复recorded prefix；显式loaded Fork可以把已apply但未record的live tail写入独立child record stream；
+- live fork需要捕获并materialize完整selected path，target staging失败时整个Fork失败；
 - MiniCore不再宣称Transcript-First或“已观察事实必可恢复”。
 
 ## 测试要求
 
+- Session Create严格stage SessionHeader，失败或publication前crash不发布partial Session；
+- 每次Load都尝试初始化Recorder，初始化失败建立Degraded loaded Session；
 - ordinary async Model→Tool→Model loop；
 - parallel Tool completion形成ordered complete exchange；
 - incomplete exchange永不进入下一次Model；
@@ -253,10 +270,13 @@ Recorder没有后台queue。graceful unload等待或取消ActiveTurnTask；task�
 - crash/partial-line replay丢弃未记录live tail，writable Load只截断final unterminated tail；
 - Degraded后修复storage不会恢复当前loaded instance；
 - Unload/Load可以建立新Healthy Recorder，但旧unrecorded live tail丢失；
+- loaded Fork包含snapshot linearization point前已apply的unrecorded tail，unloaded Fork只包含RecordedHistory；
+- Fork与Unload竞态按source residency linearization选择且回报稳定`ForkSourceKind`；
+- live Fork target staging失败不发布partial child；
 - Cancel、SecurityRevoked与ToolStartGate first-wins；
 - Interaction request/resolution在recording degraded时仍可完成；
 - retry sleep可被Cancel打断并复用exact request；
 - Compaction record丢失后replay恢复旧conversation而不brick；
-- Snapshot以三态state暴露recording health，不能被解释为fsync acknowledgement；
+- Snapshot以`healthy | degraded`暴露recording health，不能被解释为fsync acknowledgement；
 - first failure的domain event先携带Degraded Snapshot，随后只发布一次`session_recording_changed`，Snapshot保留当前脱敏diagnostic；
-- explicit Disabled与initialization/write Degraded不能混淆。
+- Create必须先完成SessionHeader staging再发布Unloaded Session；Load始终尝试初始化Recorder，不存在Disabled或ephemeral Session路径。

@@ -246,9 +246,10 @@ Cold replay不尝试恢复当时source revision或ActiveTurnTask。
 
 Fork复制其source中的effective conversation：
 
-- recorded fork按recorded marker投影；
-- loaded live fork是否包含unrecorded summary由fork source policy决定；
-- target Session建立独立Recorder；
+- RecordedHistory Fork按recorded marker投影；
+- loaded Fork从LiveSnapshot复制effective conversation，因此包含snapshot capture前已经live Replace但尚未record的summary；
+- unloaded Fork从RecordedHistory投影，marker未record时不包含该summary；
+- target staging建立独立record stream；child保持Unloaded，未来Load再初始化SessionRecorder；
 - 不复制Compaction task/request/retry timer。
 
 ## 测试要求
@@ -266,4 +267,4 @@ Fork复制其source中的effective conversation：
 
 ## 开放问题
 
-CompactionSettings来源、wire schema和loaded live fork语义仍需freeze。Recorder策略见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+CompactionSettings来源和wire schema仍需freeze。loaded live fork语义已由Q6关闭；Recorder其余策略见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

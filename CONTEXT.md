@@ -52,13 +52,13 @@ process-local单调版本，每次model-visible live mutation递增。ModelCallR
 每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append当前JSONL line，不使用后台task或queue，也不提供durable commit receipt。
 
 **RecordingHealth**：
-Recorder内部状态`Healthy | Degraded { reason, failed_entry_id } | Disabled`。Recorder第一次encode/write失败后Degraded并停止后续记录；replay最多恢复此前有效完整行前缀。`Disabled`只来自显式recording policy。Degraded在同一loaded instance内为终态，不retry、不创建segment、不backfill；recording failure不终止Turn、不使Session execution Unavailable。
+Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严格stage initial SessionHeader；每次Load都尝试初始化Recorder。Recorder第一次initialize/encode/write失败后Degraded并停止后续记录，replay最多恢复此前有效完整行前缀。Degraded在同一loaded instance内为终态，不retry、不创建segment、不backfill；recording failure不终止Turn、不使Session execution Unavailable。
 
 **SessionRecordingView**：
-公开`SessionSnapshot.recording`使用`{ state: healthy | degraded | disabled }`。first `Healthy → Degraded`发布一次`session_recording_changed`，同一Snapshot保留至少一条当前脱敏recording diagnostic。raw I/O error、路径和entry内容不公开。
+公开`SessionSnapshot.recording`使用`{ state: healthy | degraded }`。first `Healthy → Degraded`发布一次`session_recording_changed`，同一Snapshot保留至少一条当前脱敏recording diagnostic。raw I/O error、路径和entry内容不公开。
 
 **SessionStorage**：
-负责create/open recorded JSONL、tolerant replay、history tree/query和recorded fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
+负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
 SessionRecorder可能写入的一条immutable JSONL record。使用EntryId和parent_id形成recorded history tree。EntryId在live apply时分配，Recorder不能改写。
@@ -68,6 +68,9 @@ process crash或recording degradation后实际留在JSONL中的完整行前缀�
 
 **Tolerant replay**：
 顺序读取recorded完整行，skip malformed/duplicate，隔离orphan/invalid relation，排除incomplete Tool exchange并返回bounded diagnostics。不恢复ActiveTurnTask、provider stream、Tool task、waiter、queue或retry timer。
+
+**ForkSourceKind**：
+Fork在source linearization point选择的事实来源：loaded Session固定为`LiveSnapshot`，unloaded Session固定为`RecordedHistory`。该值进入child durable fork provenance和`SessionForked`结果。
 
 ## Turn与执行
 
@@ -192,7 +195,7 @@ loaded Session是否可admit future Turn。Workspace/Agent revision不可用可�
 停止admission，等待/取消ActiveTurnTask，然后删除loaded handle。Recorder没有后台queue；task结束后不存在待drain record tail。Degraded health与unrecorded live tail随loaded instance销毁。forced process exit可以中断当前append。
 
 **Fork**：
-创建新SessionId。recorded fork复制selected recorded path；loaded live fork是否包含unrecord tail仍在review。Fork不复制task、waiter、queue、Tool process、Recorder object或in-flight append。
+创建新SessionId。loaded source从同一immutable LiveSnapshot解析anchor并复制selected path，因此可以包含unrecorded live tail；unloaded source复制tolerant replay得到的RecordedHistory。Fork不复制task、waiter、queue、Tool process、Recorder object或in-flight append。
 
 ## Runtime命令与观察
 
@@ -238,8 +241,6 @@ writer-poisoned Session Unavailable
 
 - wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredTurnStart/StoredCompaction；
 - Prompt Q1/Q4：PromptContent representation与contribution stamp字段；
-- loaded live fork是否包含unrecorded tail；
-- BestEffort/Disabled recording policy；
 - EntryId generator owner；
 - cold recovery closure是否record；
 - Rig 0.40.0 provider spike；

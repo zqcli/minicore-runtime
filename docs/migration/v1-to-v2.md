@@ -108,7 +108,7 @@ writer failure → read-only/Unavailable
 - `dispatch / query / snapshot / subscribe`；
 - Command/Query/StateEvent/ProgressEvent分离；
 - snapshot-first subscription；
-- SessionSnapshot现在描述live state，并以`recording.state = healthy | degraded | disabled`公开recording health；
+- SessionSnapshot现在描述live state，并以`recording.state = healthy | degraded`公开recording health；所有Session都尝试记录；
 - first degradation发布`session_recording_changed`，Snapshot保留当前脱敏recording diagnostic；
 - StateEvent不再表示physical Session commit。
 
@@ -233,12 +233,10 @@ SessionExecutor admits Turn
 
 Recorder问题集中在[`docs/review/async-loop-best-effort-recording-open-questions.md`](../review/async-loop-best-effort-recording-open-questions.md)：
 
-- loaded live fork source；
-- BestEffort/Disabled policy；
 - EntryId allocation owner；
 - recovery closure recording。
 
-Q1 queue容量、Q2 RecordingHealth wire、Q3 explicit flush、Q4 drain deadline、Q5 Degraded recovery和Q8 event/record顺序已经关闭。
+Q1 queue容量、Q2 RecordingHealth wire、Q3 explicit flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy和Q8 event/record顺序已经关闭。
 
 其他门禁：
 
