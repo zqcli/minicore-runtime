@@ -5,7 +5,7 @@
 
 > [ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)进一步冻结本ADR的执行seam：TurnExecutionContext异步加载captured Skill并构造composition input，PromptSet同步原子规范化，Session Execution处理Starting/Steer cancellation与await后重验。
 
-> 2026-07-31：V4-P1-1 public payload freeze删除未定义的`PromptBodyIntent::Template`。MVP body只支持Empty/Text；本ADR的`body + ordered skills[]`、part boundary与safe provenance决策保持。future template必须另行定义TemplateId、arguments、materialized render、limits、reload和capability。
+> [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)删除未定义的`PromptBodyIntent::Template`。MVP body只支持Empty/Text；本ADR的`body + ordered skills[]`、part boundary与safe provenance决策保持。future template必须另行定义TemplateId、arguments、materialized render、limits、reload和capability。
 
 ## 背景
 

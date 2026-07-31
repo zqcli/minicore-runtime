@@ -2,14 +2,14 @@
 
 状态：Open；Rust实现前需关闭本文对应门禁
 日期：2026-07-31
-范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0132、migration、research和前三轮review/handoff
+范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0133、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
-关闭进度：V4-P0-1至P0-5与V4-P1-4 Closed；V4-P1-1至P1-3和V4-C0-1 Open。ADR 0130–0132是本review关闭过程中新增的Accepted决议。
+关闭进度：V4-P0-1至P0-5、V4-P1-1与V4-P1-4 Closed；V4-P1-2、V4-P1-3和V4-C0-1 Open。ADR 0130–0133是本review关闭过程中新增的Accepted决议。
 
 ## 总体结论
 
-ADR 0126–0132确定的主方向继续成立：
+ADR 0126–0133确定的主方向继续成立：
 
 ```text
 SessionExecutor control actor
@@ -23,7 +23,7 @@ Rig = ModelGateway private ProviderAdapter
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-本review创建时识别出的五个P0现已全部关闭。剩余P1集中在Runtime public payload、wire/storage envelope和production provider scope；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
+本review创建时识别出的五个P0现已全部关闭。剩余P1集中在wire/storage envelope和production provider scope；Runtime public payload已由ADR 0133闭合，Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
 
 严重度定义：
 
@@ -40,7 +40,7 @@ Rig = ModelGateway private ProviderAdapter
 | V4-P0-3 | P0 | Closed | Prompt/Skill composition的sync/async与capture ownership无法闭合 | Submit/Steer Skill path前 |
 | V4-P0-4 | P0 | Closed | conversation JSONL仍含无合法single-producer owner的Session definition/lifecycle events | storage schema前 |
 | V4-P0-5 | P0 | Closed | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
-| V4-P1-1 | P1 | Open | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
+| V4-P1-1 | P1 | Closed | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
 | V4-P1-2 | P1 | Open | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
 | V4-P1-3 | P1 | Open | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
 | V4-P1-4 | P1 | Closed | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
@@ -319,6 +319,26 @@ complete Tool exchange是一个unit；rolling summary unit的origin是对应Stor
 
 ## V4-P1-1 · Runtime public protocol缺少可恢复、可操作的完整payload
 
+状态：Closed（2026-07-31）。[ADR 0133](../adr/0133-runtime-public-payload-is-snapshot-recoverable.md)冻结snapshot-recoverable closed payload、metadata CAS、SubmitCancelled completion、public error mapping、安全Interaction与MVP Prompt body。canonical owner见[Runtime Interface](../modules/runtime-interface.md)、[Agent/Session Lifecycle](../modules/agent-session-lifecycle.md)、[Tools](../modules/tools.md)、[Turn / Item / Interaction](../modules/turn-item-interaction.md)和[Prompt](../modules/prompt.md)。
+
+关闭映射：
+
+- `df0dce8`：Agent/Session独立metadata revision、CAS、outcome、event与readback；
+- `3687be4`：exact-one CommandCompletion、Starting Submit cancel竞态和public error mapping；
+- `8889601`：SessionSnapshot完整枚举可取消Submit/Steer/FollowUp CommandId，新增INV-103；
+- `f709ba2`：concrete QueryResult、Runtime/Session Snapshot、Item/terminal/usage/diagnostic safe read models；
+- `c29268a`：request-scoped approval option、non-secret UserQuestion、Interaction resolution key、safe Runtime/event payload与storage secret boundary、INV-302；
+- `d260117`：删除未定义Template intent/query/decode入口，MVP只保留Empty/Text；
+- `6961403`：定义全部nested Command/Query request DTO、typed catalog args/cursor/suggestion和ReasoningPreference；
+- `b364461`：Runtime durable entity event携带changed Agent/Session summary，闭合metadata event token；
+- `0c4a0ce`：严格分离outer dispatch failure与accepted-command error，并冻结SessionNotReady cause→retry映射；
+- `4fee962`：Workspace public update只CAS outer SessionDefinitionRevision，删除第二个WorkspaceRevision proof；
+- `d5ae19a`：补齐UserMessageSource、AssistantDisposition和ToolResultDisposition closed Item semantics。
+
+因此重新subscribe后的host可以只用Snapshot恢复全部current public cancel/resolve action；secret input fail closed；metadata和Submit completion可进行typed contract test；public enums无未定义future payload。具体serde casing、ID/Timestamp/Money与byte/count limits仍属于V4-P1-2。
+
+### 关闭前问题
+
 该组问题不阻塞最小internal reducer，但会阻塞public protocol crate、snapshot-first host和contract tests。
 
 ### Queue可操作性
@@ -353,12 +373,12 @@ Cancel可在Input apply前关闭pre-Turn Submit。`runtime-interface.md:573`要�
 ### Error mapping与Prompt variant
 
 - `SessionExecutionError/PromptError/ToolError → CommandErrorCode + RetryAdvice`没有canonical mapping，内部模块和public contract tests会各自解释Busy、NotReady、Cancelled、Unavailable和InvariantFailure。
-- `PromptBodyIntent::Template(PromptTemplateIntent)`已进入current public shape，但`PromptTemplateIntent`没有current定义；Prompt后续问题仍在讨论模板是否属于MVP。首版应定义完整materialized template intent，或从MVP public enum移除该variant。
+- 关闭前public Prompt body保留了未定义的Template variant；Prompt后续问题仍在讨论模板是否属于MVP。首版应定义完整materialized template intent，或从MVP public enum移除该variant；关闭时采用后者。
 
 ### 关闭条件
 
 - 重新subscribe后host能对所有public queue和Pending Interaction执行合法command；
-- Interaction request/resolution wire完整且secret policy fail closed；
+- Interaction request/resolution semantic payload完整且secret policy fail closed；exact wire DTO/casing/limits由V4-P1-2冻结；
 - metadata update有独立CAS token、outcome和event；
 - pre-Turn Submit cancel有typed completion；
 - public error mapping有contract table；
@@ -397,7 +417,7 @@ current modules显式保留以下开放项：
 
 ### 首版scope
 
-`ProviderProtocol`当前公开四个variants（`model-gateway.md:1360-1365`）：
+`ProviderProtocol`当前公开四个variants（`model-gateway.md:1381-1386`）：
 
 ```text
 OpenAiResponses
@@ -418,9 +438,9 @@ Rig 0.40.0 spike仍需验证：system/instructions、message/tool schema、Anthr
 
 ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 
-- `model-gateway.md:1204`、`:1220`要求取消“concurrency wait”，但当前Gateway没有本地permit/admission wait；
-- `:1318`称AuthPrincipalIdentity用于“per-principal concurrency”，与`:1467`禁止per-auth-principal permit冲突；
-- `:1718`测试要求Steer使logical retry失效，而Session Execution canonical规则（`session-execution.md:274`）规定RetryBackoff期间Steer只排队且不改变revision，retry继续；Steer本来就不取消Sampling。
+- `model-gateway.md:1225`、`:1241`要求取消“concurrency wait”，但当前Gateway没有本地permit/admission wait；
+- `:1339`称AuthPrincipalIdentity用于“per-principal concurrency”，与Gateway禁止per-auth-principal permit的current规则冲突；
+- `:1744`测试要求Steer使logical retry失效，而Session Execution canonical规则（`session-execution.md:296`）规定RetryBackoff期间Steer只排队且不改变revision，retry继续；Steer本来就不取消Sampling。
 
 这些句子会让实现或测试重新引入本地permit，或在queued Steer时错误放弃安全retry。
 
@@ -463,7 +483,7 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 
 ## V4-C0-1 · Sandbox enforcement条件性P0继续有效
 
-这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0132关闭。
+这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0133关闭。
 
 production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capability classes。最终PermissionSet要求与adapter enforceable capabilities的差集非空时，必须生成PreExecution Denied ToolResult并拒绝side effect。approval不能把不可强制限制转换为裸执行许可，Sandbox失败也不能静默fallback到无Sandbox执行。
 
@@ -486,9 +506,9 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 ## 当前继续顺序
 
-已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1。
 
-1. V4-P1-1/V4-P1-2：一次完成public protocol与wire/schema freeze。
+1. V4-P1-2：冻结public wire与conversation storage format v1。
 2. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
 3. V4-P1-3：执行Rig spike并冻结production provider scope。
 4. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。

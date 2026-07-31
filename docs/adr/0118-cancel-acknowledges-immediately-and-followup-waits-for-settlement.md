@@ -1,9 +1,9 @@
 # ADR 0118：Cancel立即确认，FollowUp等待结构化收口后启动
 
-状态：Partially Superseded by ADRs 0124, 0126 and 0127
+状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
 日期：2026-07-27
 
-> 2026-07-31：Runtime public completion现明确区分Starting两条竞态：user Cancel在Input live apply前先赢时，Cancel command返回CancelAccepted、原Submit返回SubmitCancelled且不创建Turn；Input apply先赢时原Submit返回TurnStarted，随后同一Turn发布TurnInterrupted。SecurityRevoked/Lifecycle不是SubmitCancelled。
+> [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结Starting Submit两条public completion：Input apply前user Cancel先赢为`Completed(SubmitCancelled)`且无Turn；Input apply先赢为`Completed(TurnStarted)`，随后观察同一Turn Interrupted。
 
 > 2026-07-31：CancelAccepted、Finishing、truthful Tool settlement、live TurnInterrupted和FollowUp handoff继续有效；ADR 0127删除TurnInterrupted JSONL entry，并使`Cancel(Submit)`在整个Starting阶段保持有效。Input已live apply时Cancel绑定同一Turn并阻止task spawn，不再按正文旧start-commit reservation规则返回transition error。Terminal完成由current-process StateEvent/Snapshot表达。
 

@@ -1,7 +1,9 @@
 # ADR 0114: Runtime观察协议使用Snapshot-First实时流
 
-状态：Partially Superseded by ADRs 0126 and 0127
+状态：Partially Superseded by ADRs 0126, 0127 and 0133
 日期：2026-07-26
+
+> [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)要求SessionSnapshot完整列出current可取消Submit/Steer/FollowUp和Pending Interaction safe request；event/count不再能成为操作target的唯一恢复来源。
 
 > 2026-07-31：snapshot-first与非durable observer stream保留；ADR 0127删除restart conservative terminalization。Turn terminal StateEvent只在current process可见，新Runtime从conversation prefix建立无current Turn的Snapshot。
 

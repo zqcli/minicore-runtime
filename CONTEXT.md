@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环。
 
 权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -70,7 +70,7 @@ Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严
 负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
-SessionRecorder可能写入的一条immutable conversation/configuration JSONL record。使用EntryId和parent_id形成recorded history tree；TurnId只承担conversation correlation。EntryId由live owner在apply前分配，Recorder不能创建或改写。
+SessionRecorder可能写入的一条immutable conversation JSONL record。使用EntryId和parent_id形成recorded history tree；TurnId只承担conversation correlation。EntryId由live owner在apply前分配，Recorder不能创建或改写。
 
 **Recorded prefix**：
 process crash或recording degradation后实际留在JSONL中的完整行前缀。restart只能恢复该prefix，未record live tail永久丢失。
@@ -122,7 +122,7 @@ PromptService拥有definitions/materialized content/source/cache；每Turn构造
 Prompt candidate build期间已经读取、解析和规范化的immutable text value。多个definition/Turn可以通过进程内强`Arc`共享正文；path、URL、source ID、hash或cache key不承担正文resolver或durable identity。
 
 **PromptIntent**：
-用户body与ordered SkillIntent selections组成的结构化输入。body为Empty、Text或Template；不定义Skill/Composite顶层variant。队列保存intent，不提前展开Skill正文。
+用户body与ordered SkillIntent selections组成的结构化输入。MVP body只有Empty或non-empty Text；不定义Template、Skill或Composite顶层variant。队列保存intent，不提前展开Skill正文。
 
 **SkillIntent**：
 显式请求本次用户消息使用某个Skill的稳定选择，只保存SkillId；name、path与source authorization不属于intent。
@@ -221,7 +221,13 @@ loaded Session是否可admit future Turn。Workspace/Agent revision不可用可�
 可信host提交的typed mutation/work request，包括Agent/Session lifecycle、Submit/Steer/FollowUp/Cancel、Resolve Interaction和CommandSurface action。
 
 **CommandId**：
-当前process内command correlation和in-flight去重ID。Submit在TurnId创建前也使用CommandId作为Cancel target。不跨restart恢复。
+当前process内command correlation和in-flight去重ID。Submit在TurnId创建前也使用CommandId作为Cancel target。不跨restart恢复。SessionSnapshot完整列出当前可取消Submit/Steer/FollowUp CommandId，不公开queued prompt正文。
+
+**InteractionResolutionKey**：
+Presentation Adapter为一次logical Resolve生成的不可预测random 128-bit key。exact request内same key/same canonical payload幂等；same key/different payload冲突；不同key不能覆盖terminal resolution。它不是approval capability。
+
+**Metadata revision**：
+AgentMetadataRevision与SessionMetadataRevision分别为metadata CAS token；与AgentRevision/SessionDefinitionRevision正交。Create/read/outcome/event闭合下一次UpdateMetadata所需token。
 
 **CommandSurface**：
 Runtime内部无状态命令解释module。slash text和GUI catalog selection最终解析为同一typed RuntimeCommand或PromptIntent。
@@ -257,13 +263,14 @@ StoredTurnStart
 StoredTurnTerminal
 HistoricalFork terminal closure
 cold recovery Turn terminalization
+PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ```
 
 ## 当前开放问题
 
-- 第四轮评审：全部V4-P0与V4-P1-4已关闭；V4-P1-1至P1-3仍开放；
-- V4-P1-1至P1-3：Runtime public payload、wire/storage envelope和production provider scope/Rig现实映射；
-- wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction format-v1；
+- 第四轮评审：全部V4-P0、V4-P1-1与V4-P1-4已关闭；V4-P1-2、V4-P1-3仍开放；
+- V4-P1-2/P1-3：wire/storage envelope与production provider scope/Rig现实映射；
+- wire/schema freeze：serde casing、public IDs/path、Timestamp/Money、ProtocolLimits和format-v1 Stored DTO（ModelResponseSummary、StoredToolOutcome、StoredInteraction、StoredCompaction）；
 - EntryId算法与public文本wire；
 - Rig 0.40.0 provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。

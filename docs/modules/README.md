@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；仓库仍无Rust生产实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；仓库仍无Rust生产实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -51,7 +51,7 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-1. 联合关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-1/V4-P1-2，冻结Runtime public payload与wire/storage format v1；全部V4-P0与P1-4已关闭；
+1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-2，冻结public wire与conversation storage format v1；全部V4-P0、V4-P1-1与P1-4已关闭；
 2. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
 3. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
 4. 加入recording slow-write/failure与cold replay fixtures；

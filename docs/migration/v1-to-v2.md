@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0132；全部V4-P0与P1-4已关闭，P1-1至P1-3待关闭，生产实现未启动
+状态：V2目标架构已推进至ADR 0133；全部V4-P0、V4-P1-1与P1-4已关闭，P1-2/P1-3待关闭，生产实现未启动
 日期：2026-07-31
 
 ## 目的
@@ -92,6 +92,8 @@ TurnStatus和terminal StateEvent继续服务current loaded execution。Replay只
 
 ADR 0132关闭Compaction实现门禁：Live reducer发布Session/revision-bound EntryId-bearing stable units；Runtime settings在Turn admission capture；Compaction从source+cut派生marker并使用Prompt/Model exact basis闭合pressure与summary budget；automatic StoredCompaction保存完整safe model-call provenance。
 
+ADR 0133关闭Runtime public payload门禁：CommandCompletion/error mapping、metadata CAS、queued command Snapshot、concrete Query/Snapshot/Item views和safe Interaction形成closed protocol；MVP Prompt body只保留Empty/Text。semantic payload已冻结，wire casing/ID/Timestamp/Money/limits仍由V4-P1-2完成。
+
 ## 迁移原则
 
 - module interface优先，不按V1文件名机械搬运；
@@ -119,21 +121,25 @@ ADR 0132关闭Compaction实现门禁：Live reducer发布Session/revision-bound 
 
 ### 阶段2：Runtime公开协议
 
-状态：目标设计完成，wire/schema待冻结。
+状态：semantic payload目标设计完成，wire/schema待冻结。
 
 - `dispatch / query / snapshot / subscribe`；
 - Command/Query/StateEvent/ProgressEvent分离；
 - snapshot-first subscription；
 - SessionSnapshot现在描述live state，并以`recording.state = healthy | degraded`公开recording health；所有Session都尝试记录；
 - first degradation发布`session_recording_changed`，Snapshot保留当前脱敏recording diagnostic；
-- StateEvent不再表示physical Session commit。
+- StateEvent不再表示physical Session commit；
+- SessionSnapshot完整列出可取消Submit/Steer/FollowUp和Pending Interaction safe request；
+- Agent/Session metadata独立CAS，Starting Submit cancel和public errors使用typed completion；
+- UserQuestion仅支持non-secret Text/SingleChoice，approval只提交request-scoped option index；
+- Query/Snapshot/Item read models为closed concrete payload，MVP Prompt body只有Empty/Text。
 
 待完成：
 
 - serde casing/tag；
 - public ID文本格式；
 - Timestamp/Money；
-- StoredCompaction schema。
+- format-v1 Stored DTO：ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution和StoredCompaction。
 
 ### 阶段3：Conversation Recording与Replay
 
@@ -175,7 +181,7 @@ ADR 0132关闭Compaction实现门禁：Live reducer发布Session/revision-bound 
 
 - PromptSet从LiveConversationView组装；
 - PromptContent在candidate build期间完全materialize并由强Arc共享，PromptSet不解析source locator；
-- PromptIntent使用`body + skills[]`，SkillIntent只保存SkillId；
+- PromptIntent使用`body + skills[]`，MVP body只有Empty/Text，SkillIntent只保存SkillId；
 - Skill/Workspace contribution先完成captured source authorization，再按独立顶层part原子规范化并apply live；
 - live/JSONL共同使用safe part-level stamp，不保存字符offset、绝对路径或authorization；
 - ToolSet immutable并与ToolPromptView同源；
@@ -214,7 +220,7 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-开始下列实现前，先联合关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-1/V4-P1-2 public payload与wire/storage format门禁；全部P0与P1-4已关闭。V4-P1-3在production ProviderAdapter前通过Rig spike关闭。
+开始下列实现前，先关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-2 wire/storage format门禁；全部P0、P1-1与P1-4已关闭。V4-P1-3在production ProviderAdapter前通过Rig spike关闭。
 
 1. 创建Rust crate与基础ID/error types；
 2. 实现LiveConversation reducer和ScriptedProviderAdapter；
@@ -261,8 +267,8 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- 第四轮V4-P1-1至P1-3 Runtime public payload、wire/storage envelope和provider scope；全部V4-P0与P1-4已关闭；
-- wire/schema freeze（serde casing、public IDs、Timestamp/Money、StoredCompaction format-v1）；
+- 第四轮V4-P1-2/P1-3 wire/storage envelope和provider scope；全部V4-P0、V4-P1-1与P1-4已关闭；
+- wire/schema freeze（serde casing、public IDs/path、Timestamp/Money、ProtocolLimits、全部format-v1 Stored DTO）；
 - Rig provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 
@@ -279,7 +285,7 @@ canonical owner
 → rg old terminology scan
 ```
 
-ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124被部分修订；ADR 0130–0132分别冻结async Skill composition、conversation JSONL configuration/lifecycle边界和Compaction stable-unit/settings/provenance contract。历史正文保留，但实现必须以current modules与最新Accepted ADR为准。
+ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124和0129被部分修订；ADR 0130–0133分别冻结async Skill composition、conversation JSONL configuration/lifecycle边界、Compaction stable-unit/settings/provenance和snapshot-recoverable Runtime public payload。历史正文保留，但实现必须以current modules与最新Accepted ADR为准。
 
 ## 完成定义
 
