@@ -647,7 +647,7 @@ impl CapturedWorkspaceSkillSource {
 }
 ```
 
-PromptService只能接收Prompt capture context，SkillService只能接收Skill capture context；二者不能读取另一类source roots，也不能自行扩大candidate授权。adapter通过`roots()`取得root key/canonical path用于discover/read，读取文件后必须调用`capture(root_key, relative_location, ...)`构造结果；该方法重新验证root仍在authorized set、relative location位于该root并填充authorization/provenance，避免sibling module伪造captured source。
+PromptService只能接收Prompt capture context，SkillService只能接收Skill capture context；二者不能读取另一类source roots，也不能自行扩大candidate授权。adapter通过`roots()`取得root key/canonical path用于discover/read，读取文件后必须调用`capture(root_key, relative_location, ...)`构造结果；该方法重新验证root仍在authorized set、relative location位于该root并填充authorization/provenance，避免sibling module伪造captured source。exact authorization只服务candidate/composition校验；CanonicalUserMessage最多投影`WorkspaceRootKey + WorkspaceRelativePath`safe origin，不能保存canonical root、trust或authorization。该投影边界消费[INV-202](../architecture.md#跨模块不变量索引)。
 
 ### WorkspacePromptContext
 
@@ -698,7 +698,7 @@ impl WorkspaceSkillContext {
 
 SkillService只能从这些captured sources构建Workspace Skill entries，不在Turn内重新discover或读取filesystem。
 
-`CapturedWorkspacePromptSource`和`CapturedWorkspaceSkillSource`保存model-safe relative location、exact source authorization/provenance与immutable bytes/content；字段和constructor保持crate-private。它们只能由PromptService/SkillService在对应capture context授权roots内产生，再由Session lifecycle candidate组装进WorkspaceSnapshot。SkillEntry后续lazy parse只解析本Turn captured SkillView entry中的captured bytes，不能通过`skill_id + current Session Workspace`重新解析future view，也不能在Turn内按path重新读取current file。SecurityRevoked会取消active operation并使迟到结果因current operation/control basis失效而被丢弃。
+`CapturedWorkspacePromptSource`保存model-safe relative location、exact source authorization/provenance与candidate阶段已经读取、解析和规范化的immutable text `Arc`；relative location不承担正文resolver。PromptService从该值构造或复用`PromptContent`时不再读取source。`CapturedWorkspaceSkillSource`保存对应provenance与immutable captured bytes。两者字段和constructor保持crate-private，只能由PromptService/SkillService在对应capture context授权roots内产生，再由Session lifecycle candidate组装进WorkspaceSnapshot。SkillEntry后续lazy parse只解析本Turn captured SkillView entry中的captured bytes，不能通过`skill_id + current Session Workspace`重新解析future view，也不能在Turn内按path重新读取current file。SecurityRevoked会取消active operation并使迟到结果因current operation/control basis失效而被丢弃。
 
 ### WorkspaceAccessView
 
@@ -1231,7 +1231,7 @@ upload / telemetry
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
 - Workspace Prompt source在Session load、Idle definition update或`/reload workspace`时捕获immutable content；SecurityRevoked后重新resolve时不复用不匹配的新authority basis；
 - Workspace Skill adapter的capture只能使用WorkspaceSkillCaptureContext，并必须通过context构造CapturedWorkspaceSkillSource；
-- captured SkillView entry、LoadedSkill、SkillInjection和live/recorded contribution provenance使用同一SkillId和exact source authorization/provenance；
+- captured SkillView entry、LoadedSkill和SkillInjection使用同一SkillId与exact source authorization完成composition前校验；live/recorded stamp只保存SkillId或Workspace root-relative safe origin；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；

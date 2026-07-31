@@ -7,6 +7,8 @@
 
 > 2026-07-30：本文对SessionStorage durable truth、append/apply、single mutable owner和AgentLoop的评价属于ADR 0126之前的历史基线。当前执行/recording设计以ADR 0126和current modules为准；R6文档治理纪律与R7 Sandbox门禁继续有效。
 
+> 2026-07-31：Prompt Q1/Q4已分别由[ADR 0128](../adr/0128-prompt-content-is-materialized-before-publication.md)和[ADR 0129](../adr/0129-user-message-contributions-use-part-level-safe-provenance.md)关闭：正文在candidate build期间materialize；用户body与SkillIntent正交；contribution使用safe part-level stamp。下文Q1/Q4门禁均已关闭。
+
 ## 总体判断
 
 核心 seam 与不变量体系在决议回写后仍然自洽：append/apply 线性化、SessionStorage 唯一 durable truth、exact pin 纪律、PromptSet 唯一组装 seam、OutcomeUnknown 保守终结（A1 后语义）在全部文档中一致。第一轮的重大问题没有复发。
@@ -257,7 +259,7 @@ pub trait ToolSandbox: Send + Sync {
 
 1. 「wire/schema freeze」（serde/casing + public ID策略 + 基础类型）——storage/protocol contract tests的前置；ContentHash/fingerprint freeze已由ADR 0123删除；
 2. Rig 0.40.0 spike——唯一硬外部门槛；spike允许触发必要的ADR级修订；
-3. `prompt.md`后续问题中Q1（PromptContent inline vs reference）与Q4（stamp精确字段）——阻塞CanonicalUserMessage storage schema，需纳入wire/schema freeze；
+3. `prompt.md`后续问题中Q1/Q4已由ADR 0128/0129关闭；CanonicalUserMessage使用safe part-level stamp且损坏stamp不丢conversation正文，剩余阻塞只属于通用wire/schema freeze；
 4. R7继续延后到首个production Tool/Sandbox adapter前，届时升级为条件性P0门禁。R6已关闭，future横切决议遵守既定owner/link与扫描纪律。
 
 ## 三、结论摘要

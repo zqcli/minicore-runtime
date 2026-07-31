@@ -631,7 +631,7 @@ pub struct AssembledModelContext {
 
 ```
 
-PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。
+PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。`contribution_stamps`是从sanitized conversation复制的safe part-level解释元数据，不是provider payload、source locator或authorization；adapter不得据此重新读取Skill/Workspace正文。
 
 `PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、exact TurnModelRef、OutputContract结构值和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 

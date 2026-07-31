@@ -926,7 +926,7 @@ Session lifecycle/load/readiness/execution validation
 → 完成当前Input record attempt并publish TurnStarted
 ```
 
-Input entry只保存conversation内容、TurnId相关性和contribution stamps，不内联Turn-start execution snapshot。actual response model由后续`StoredAssistantMessage.model`说明；AgentRevisionRef、SessionDefinitionRevision和Workspace配置由各自durable owner保存，restart不据此重建旧execution environment。
+Input entry只保存conversation内容、TurnId相关性和safe part-level contribution stamps，不内联Turn-start execution snapshot或source authorization。actual response model由后续`StoredAssistantMessage.model`说明；AgentRevisionRef、SessionDefinitionRevision和Workspace配置由各自durable owner保存，restart不据此重建旧execution environment。
 
 Agent current revision不参与Turn capture，因为Session已经pin exact AgentRevisionRef。Agent status的authoritative check与initiating UserMessage live apply使用同一个短lifecycle synchronization；capture前的status/readiness check只用于提前失败。Recorder await发生在释放该synchronization之后。
 

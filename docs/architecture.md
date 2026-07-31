@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为不含Turn lifecycle的conversation transcript；生产实现待启动。 |
+| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128冻结Prompt content materialization；ADR 0129冻结用户消息contribution与safe provenance；生产实现待启动。 |
 
 权威顺序：本文与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -61,7 +61,7 @@ captured SharedResourceRoots + Session/Agent/Workspace facts
 └─ PromptService::for_turn        → Arc<PromptSet>
 ```
 
-active Turn始终使用admission时捕获的immutable对象。显式reload只影响future Turn。
+active Turn始终使用admission时捕获的immutable对象。Prompt source在candidate build期间完全materialize为强`Arc`持有的正文；path/URL/source ID只用于discovery或provenance，PromptSet不执行正文I/O或resolver lookup。显式reload只影响future Turn。
 
 ## Loaded Session结构
 
@@ -206,7 +206,8 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 | INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
 | INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
 | INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
-| INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象 | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
+| INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象；PromptContent在capture前已materialize，Turn执行不解析source locator | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
+| INV-202 | exact Skill/Workspace authorization在composition前完成；每个contribution形成独立content part，live/JSONL只保留safe part-level provenance，replay不重新加载或授权source | [Prompt · PromptIntent和CanonicalUserMessage](modules/prompt.md#promptintent-和-canonicalusermessage) |
 | INV-301 | Interaction live request在notify前apply并完成inline record attempt；resolution在resume前apply并完成inline record attempt | [Turn / Item / Interaction · Interaction Ordering](modules/turn-item-interaction.md#interaction-ordering) |
 | INV-401 | Tool side-effect start由ToolStartGate与EmergencyControl first-wins；Running后只能truthful settle | [Turn / Item / Interaction · Tool Side-Effect Start](modules/turn-item-interaction.md#tool-side-effect-start) |
 
@@ -215,7 +216,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 - [Runtime公开协议](modules/runtime-interface.md)：dispatch/query/snapshot/subscribe和live observer语义。
 - [Agent与Session生命周期](modules/agent-session-lifecycle.md)：definition、revision、load/unload/archive/fork。
 - [Workspace](modules/workspace.md)：Session-owned Workspace、authority和immutable snapshot。
-- [Prompt](modules/prompt.md)：PromptSet、CanonicalUserMessage和live model context assembly。
+- [Prompt](modules/prompt.md)：materialized PromptContent、orthogonal PromptIntent、safe part-level contribution provenance和live model context assembly。
 - [Skills](modules/skills.md)：SkillService、SkillView和reload。
 - [Tools](modules/tools.md)：ToolSet、policy、approval、sandbox和executor。
 - [Turn执行上下文](modules/turn-execution-context.md)：immutable capture和ConversationRevision basis。
@@ -229,6 +230,9 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 
 核心当前决策：
 
+- [ADR 0129：用户消息贡献使用part-level安全provenance](adr/0129-user-message-contributions-use-part-level-safe-provenance.md)
+- [ADR 0128：Prompt content在publication前materialize](adr/0128-prompt-content-is-materialized-before-publication.md)
+- [ADR 0127：Session recording不保存Turn lifecycle](adr/0127-session-recording-omits-turn-lifecycle.md)
 - [ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append](adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
 - [ADR 0125：ModelGateway不设置本地模型调用Permit](adr/0125-model-gateway-has-no-local-call-permits.md)
 - [ADR 0124：Session replay宽容恢复](adr/0124-session-replay-is-tolerant-and-links-are-minimal.md)，其strict writer/committed-delta条款已被ADR 0126取代

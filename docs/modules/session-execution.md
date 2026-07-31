@@ -175,7 +175,7 @@ Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Reco
 
 `Starting`期间`Cancel(Submit(command_id))`持续有效，包括Input已经live apply但`TurnStarted`尚未发布的窗口。此时Cancel绑定已经分配的同一TurnId、发布sticky epoch并阻止ActiveTurnTask spawn；Input record attempt返回后仍先发布`TurnStarted`，随后完成live `TurnInterrupted(UserCancelled)` settlement。调用方收到`TurnStarted`后改用`Cancel(TurnId)`。
 
-capture、Workspace、Prompt composition或live validation失败时不创建Turn。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
+capture、Workspace、Prompt composition或live validation失败时不创建Turn。Prompt composition必须先按[INV-202](../architecture.md#跨模块不变量索引)验证全部ordered Skill/Workspace contributions，失败时不apply部分Input。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
 
 ## Async Run Loop
 
@@ -342,8 +342,9 @@ ActiveTurnTask只在以下safe point消费一条FIFO Steer：
 
 ```text
 pop one Steer
-→ compose CanonicalUserMessage
-→ apply live UserMessage(source=Steer)
+→ resolve全部intent contributions并compose CanonicalUserMessage
+→ composition失败时不apply部分Steer
+→ success才apply live UserMessage(source=Steer)
 → await inline record attempt
 → next Model
 ```

@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已按ADR 0126/0127重构，生产实现待启动
+状态：V2目标架构已按ADR 0126–0129重构，生产实现待启动
 日期：2026-07-31
 
 ## 目的
@@ -172,12 +172,15 @@ TurnStatus和terminal StateEvent继续服务current loaded execution。Replay只
 状态：目标设计完成，生产实现未开始。
 
 - PromptSet从LiveConversationView组装；
-- Skill/Workspace contribution先规范化并apply live；
+- PromptContent在candidate build期间完全materialize并由强Arc共享，PromptSet不解析source locator；
+- PromptIntent使用`body + skills[]`，SkillIntent只保存SkillId；
+- Skill/Workspace contribution先完成captured source authorization，再按独立顶层part原子规范化并apply live；
+- live/JSONL共同使用safe part-level stamp，不保存字符offset、绝对路径或authorization；
 - ToolSet immutable并与ToolPromptView同源；
 - ToolStartGate独立于Session recording；
 - Workspace update Idle-only，SecurityRevoked保持。
 
-待完成：Prompt Q1/Q4、Tool/Sandbox O1/R7。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。待完成：Tool/Sandbox O1/R7。
 
 ### 阶段5：Agent/Session lifecycle
 
@@ -254,8 +257,7 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- wire/schema freeze；
-- Prompt Q1/Q4；
+- wire/schema freeze（serde casing、public IDs、Timestamp/Money、StoredCompaction）；
 - Rig provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

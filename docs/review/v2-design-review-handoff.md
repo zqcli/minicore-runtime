@@ -3,7 +3,7 @@
 日期：2026-07-31
 状态：async loop / conversation-only best-effort recording refactor分支
 
-架构事实以`docs/architecture.md`、`docs/modules/`、ADR 0126和ADR 0127为权威。本文记录恢复入口与剩余工作。
+架构事实以`docs/architecture.md`、`docs/modules/`、ADR 0126、ADR 0127、ADR 0128和ADR 0129为权威。本文记录恢复入口与剩余工作。
 
 ## 当前分支
 
@@ -66,20 +66,28 @@ SessionRecorder
 - Q10关闭为Not Applicable：Load不推断旧Turn outcome、不追加closure，`current_turn = None`；
 - Fork原样复制selected conversation path，不追加fork-specific terminal；
 - historical `ListTurns/GetTurn`按TurnId分组conversation且不返回execution status。
+- 接受ADR 0128并关闭Prompt Q1：PromptContent在candidate build期间完全materialize，内部使用强`Arc<str>`共享；不定义可重新解析或durable的PromptContentRef；
+- PromptSet `for_turn()`/`assemble()`不执行正文I/O或cache-key resolver lookup，cache eviction不影响已发布view；
+- 接受ADR 0129并关闭Prompt Q4：PromptIntent使用`body + skills[]`，SkillIntent只保存SkillId；
+- exact Skill/Workspace authorization在composition前完成，每个contribution形成独立顶层content part；
+- live/JSONL共同使用`content_part_index + safe origin`，不保存字符offset、绝对路径或authorization；损坏stamp只产生diagnostic，不丢conversation正文。
 
 ## 恢复顺序
 
 1. [ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
 2. [ADR 0127](../adr/0127-session-recording-omits-turn-lifecycle.md)
-3. [架构总览](../architecture.md)
-4. [Session Execution](../modules/session-execution.md)
-5. [Conversation Recording与Replay](../modules/conversation-storage.md)
-6. [Turn Execution Context](../modules/turn-execution-context.md)
-7. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
-8. [Compaction](../modules/compaction.md)
-9. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
-10. [第三轮评审关闭记录](v2-design-review-3.md)
-11. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
+3. [ADR 0128](../adr/0128-prompt-content-is-materialized-before-publication.md)
+4. [ADR 0129](../adr/0129-user-message-contributions-use-part-level-safe-provenance.md)
+5. [架构总览](../architecture.md)
+6. [Prompt](../modules/prompt.md)
+7. [Session Execution](../modules/session-execution.md)
+8. [Conversation Recording与Replay](../modules/conversation-storage.md)
+9. [Turn Execution Context](../modules/turn-execution-context.md)
+10. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
+11. [Compaction](../modules/compaction.md)
+12. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
+13. [第三轮评审关闭记录](v2-design-review-3.md)
+14. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
 
 ## 已冻结决策
 
@@ -109,6 +117,11 @@ SessionRecorder
 - logical retry使用same Arc<ModelCallRequest>、control generation和ConversationRevision；
 - Compaction先Replace live conversation，再best-effort record marker；
 - ToolStartGate、Cancel immediate ack、FollowUp settlement、Workspace immutable capture和ModelGateway single-attempt保持；
+- PromptContent是candidate build期间完全materialize的immutable text value；PromptResourceView/PromptSet强Arc持有，source locator与cache key不能解析Turn正文；
+- PromptIntent使用body与ordered SkillIntent正交结构；SkillIntent只保存SkillId；
+- UserMessage contribution按独立顶层content part规范化，stamp使用content_part_index与safe Skill/Workspace origin；
+- exact source authorization不进入conversation JSONL；tolerant replay丢弃损坏stamp并保留正文；
+- 用户显式Skill选择不创建Item，模型触发Skill Tool继续使用ToolInvocation Item；
 - Rig仍只实现ModelGateway private ProviderAdapter。
 
 ## 跨模块不变量
@@ -120,7 +133,8 @@ INV-003 complete Tool exchange before model visibility
 INV-004 loaded Fork LiveSnapshot / unloaded Fork RecordedHistory
 INV-101 one control actor + at most one ActiveTurnTask
 INV-102 Steer safe-point FIFO
-INV-201 immutable Turn capture
+INV-201 immutable Turn capture；PromptContent materialized before capture
+INV-202 exact contribution authorization before composition；safe part-level provenance after composition
 INV-301 live Interaction apply/inline-record-attempt ordering
 INV-401 ToolStartGate vs EmergencyControl
 ```
@@ -143,17 +157,24 @@ writer-poisoned/read-only execution admission
 StoredTurnStart / StoredTurnTerminal
 cold recovery Turn terminalization
 HistoricalFork terminal closure
+re-resolvable/durable PromptContentRef
+PromptIntent::Skill / PromptIntent::Composite
+character-offset contribution stamp
+StoredPromptContributionStamp
+exact source authorization in JSONL
 ```
 
-旧ADR正文作为历史保留，顶部状态与修订说明指向ADR 0126/0127。
+旧ADR正文作为历史保留，顶部状态与修订说明指向ADR 0126/0127/0128/0129。
 
 ## 当前开放问题
 
 Recorder review的Q1–Q10已经全部关闭，详见[独立review](async-loop-best-effort-recording-open-questions.md)。Q10由ADR 0127确定conversation-only schema和无closure Load。
 
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。剩余Prompt template/cache/hook等问题不阻塞当前conversation storage schema。
+
 ## 下一步
 
-1. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money、StoredCompaction；
+1. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money和StoredCompaction；
 2. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
 3. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
 4. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
@@ -173,4 +194,4 @@ R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应从ADR 0126/0127开始，不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter或Turn terminal ledger开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应从ADR 0126/0127/0128/0129开始，不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter、Turn terminal ledger、PromptContent resolver、recursive Skill/Composite intent或字符offset provenance开始编码。
