@@ -147,48 +147,50 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 
 ## V4-P0-3 · Prompt/Skill composition的async seam无法闭合
 
-### 发生场景
+状态：Closed（2026-07-31；ADR 0130）。TurnExecutionContext现绑定SkillService/SkillViewContext/SkillView并提供唯一async `resolve_user_message()`；PromptSet同步normalize，Session Execution拥有Starting/Steer cancellation与await后basis重验。
+
+### 关闭前场景
 
 Submit或Steer携带SkillIntent。TurnExecutionContext需要从本Turn的SkillView加载captured bytes，再由SkillInjector产生PromptContribution。
 
-current interface冲突：
+关闭前interface冲突：
 
-- `docs/modules/turn-execution-context.md:83-91`把`compose_input()`和`compose_steer()`定义为同步`fn`；
-- `docs/modules/skills.md:192-196`把`SkillService::load()`定义为`async fn`；
-- `docs/modules/turn-execution-context.md:64-76`只捕获`Arc<SkillView>`，没有`SkillViewContext`或SkillService/loader；
-- `docs/modules/skills.md:67-69`、`592`和`628`明确要求TurnExecutionContext同时捕获SkillViewContext并调用SkillService；
-- `SkillView`本身只含entries（`skills.md:294-305`），没有绑定load方法或context；
-- `docs/modules/skills.md:423`仍要求已被ADR 0126删除的`execution_version/current operation`校验。
+- Turn Execution Context把`compose_input()`和`compose_steer()`定义为同步`fn`；
+- Skills把`SkillService::load()`定义为`async fn`；
+- Context只捕获`Arc<SkillView>`，没有SkillViewContext或SkillService/loader；
+- Skills又要求TurnExecutionContext同时捕获SkillViewContext并调用SkillService；
+- `SkillView`本身只含entries，没有绑定load所需context；
+- Skills cache段落仍要求已被ADR 0126删除的`execution_version/current operation`校验。
 
 Starting阶段还要求`Cancel(Submit CommandId)`持续有效。任何async Skill load/candidate composition都必须观察已发布的candidate emergency target，并且不得持有live-state或lifecycle guard跨await。
 
 ### 影响
 
-- 当前方法签名无法调用SkillService；
+- 关闭前方法签名无法调用SkillService；
 - Steer无法按Turn-pinned旧Skill bytes展开；
 - 实现者可能在PromptSet中偷偷做I/O，破坏唯一assembly seam；
 - 实现者也可能重新读取current Skill source，破坏explicit reload和INV-201/202；
 - Starting async等待若没有candidate control seam，会形成按CommandId无法及时停止或无法安全丢弃迟到composition result的窗口。
 
-### 推荐决议
+### 已采纳决议
 
-冻结一个明确方案，推荐保留Skill lazy parse并拆成async resolve + sync normalize：
+采用保留Skill lazy parse并拆成async resolve + sync normalize的方案：
 
 ```text
-TurnExecutionContext.resolve_composition(intent).await
+TurnExecutionContext.resolve_user_message(intent).await
 → 使用captured SkillViewContext + bound Skill loader加载全部Skill
 → SkillInjector产生typed contributions
 → 构造private UserMessageCompositionInput
 → PromptSet.compose_user_message()同步纯内存规范化
 ```
 
-TurnExecutionContext捕获`SkillViewContext`和一个只允许加载captured entry的窄loader handle；可由`Arc<SkillService>`实现，也可以由SkillView私有绑定cache/loader。PromptSet继续不持有SkillService。
+TurnExecutionContext捕获同一个`Arc<SkillService>`、`Arc<SkillViewContext>`和绑定该context的`Arc<SkillView>`。SkillService load接收captured view与其entry，PromptSet继续不持有SkillService。
 
-Starting candidate在await前发布CommandId target和CancellationToken。control actor可以用out-of-band EmergencyControl驱动取消；async resolve返回后必须重验candidate target/control generation，再允许live Input apply。删除Skills文档中的`execution_version/current operation`，统一为current Turn/candidate target、control_generation和captured view validation。
+Starting candidate在await前安装CommandId target与observed emergency epoch。control actor的Starting subloop同时等待async resolve、out-of-band EmergencyControl与Lifecycle；Cancel/SecurityRevoked先赢时drop future。resolve返回后必须重验candidate target/control generation/authority，再允许live Input apply。删除Skills文档中的`execution_version/current operation`，统一为current Turn/candidate target、control_generation、ConversationRevision和captured view validation。
 
-另一可行方案是把captured bytes解析改为同步纯函数并删除`SkillService::load async`。两种方案不能同时保留。
+同步eager parse方案未采用；lazy async parse与Prompt sync normalize的owner保持分离。
 
-### 关闭条件
+### 关闭验证
 
 - Submit和Steer各有唯一、可调用的Skill composition路径；
 - Context字段与Skills owner文档一致；
