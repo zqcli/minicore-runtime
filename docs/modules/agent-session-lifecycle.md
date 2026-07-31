@@ -273,7 +273,7 @@ expected AgentMetadataRevision
 → durable metadata + updated_at + metadata revision N+1原子publication
 ```
 
-metadata update不产生AgentRevision，也不改变active/future Turn execution definition。successful mutation返回new AgentMetadataRevision并发布独立`AgentMetadataUpdated` event。
+metadata update不产生AgentRevision，也不改变active/future Turn execution definition。successful mutation返回new AgentMetadataRevision并发布独立`AgentMetadataUpdated` Runtime event；event detail携带mutation后的完整safe AgentSummary，因此host直接取得下一次metadata CAS token。
 
 ### Disable / Enable / Delete
 
@@ -769,7 +769,7 @@ expected SessionMetadataRevision
 → durable metadata + updated_at + metadata revision N+1原子publication
 ```
 
-successful mutation返回new SessionMetadataRevision并发布独立`SessionMetadataUpdated` Runtime event；Session已loaded时同一mutation也更新SessionSnapshot并发布Session-scope metadata event。definition/status/load/conversation mutation不递增该token。
+successful mutation返回new SessionMetadataRevision并发布独立`SessionMetadataUpdated` Runtime event，detail携带mutation后的完整safe SessionSummary；Session已loaded时同一mutation也更新SessionSnapshot并发布Session-scope metadata event。definition/status/load/conversation mutation不递增该token。
 
 Session definition/metadata update只写Session durable owner。loaded Session可以收到future-readiness/current-definition observer update或private invalidation，但该mutation不调用SessionRecorder、不生成StoredSessionEntry，也不与ActiveTurnTask竞争record order；metadata使用Runtime Interface冻结的独立event kind。完整conversation scope见[ADR 0131](../adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)。
 
