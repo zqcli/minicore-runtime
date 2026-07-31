@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-27
 
+> 2026-07-31：Runtime public completion现明确区分Starting两条竞态：user Cancel在Input live apply前先赢时，Cancel command返回CancelAccepted、原Submit返回SubmitCancelled且不创建Turn；Input apply先赢时原Submit返回TurnStarted，随后同一Turn发布TurnInterrupted。SecurityRevoked/Lifecycle不是SubmitCancelled。
+
 > 2026-07-31：CancelAccepted、Finishing、truthful Tool settlement、live TurnInterrupted和FollowUp handoff继续有效；ADR 0127删除TurnInterrupted JSONL entry，并使`Cancel(Submit)`在整个Starting阶段保持有效。Input已live apply时Cancel绑定同一Turn并阻止task spawn，不再按正文旧start-commit reservation规则返回transition error。Terminal完成由current-process StateEvent/Snapshot表达。
 
 > 2026-07-30：即时CancelAccepted、truthful Tool settlement和FollowUp等待旧Turn结束保留；terminal和Interaction closure先apply live并best-effort record，不等待physical append。
@@ -61,7 +63,7 @@
 
 - valid Turn Cancel在sticky epoch发布后立即返回`CancelAccepted`，不等待started Tool；
 - duplicate Cancel返回相同target/epoch，不创建completion waiter；
-- Cancel(Submit)与initiating append reservation first-wins：accepted Cancel不创建Turn，reservation先赢时Cancel不返回accepted；
+- Cancel(Submit)与initiating Input live apply first-wins：user Cancel先赢时Cancel command立即accepted、原Submit完成SubmitCancelled且不创建Turn；Input apply先赢时原Submit完成TurnStarted并随后TurnInterrupted；
 - Cancel(Turn)与final append reservation first-wins：accepted Cancel不允许final Assistant commit，reservation先赢时Cancel不返回accepted；
 - CancelAccepted后立即发布Finishing snapshot/event，迟到Model/Context结果不进入projection；
 - Finishing期间Steer拒绝、FollowUp可Queued、Submit返回SessionBusy；
