@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-25
 
+> 2026-07-31：MVP UserQuestion payload冻结为non-secret Text/SingleChoice fields；answer会进入live state、JSONL、event/history、ToolResult并可能发送给模型。secret/password/token input不属于Interaction，未来必须使用独立secure host capability。Tool approval使用request-scoped safe option index，host不能构造PermissionSet。
+
 > 2026-07-31：typed Interaction、MiniCore-owned live request/resolution与Presentation Adapter职责继续有效；ADR 0127规定restart不恢复Pending waiter/state，也不合成Cancelled resolution或Turn terminal。Recorded request/resolution只作为historical facts。
 
 > 2026-07-30：typed Interaction、Presentation Adapter和oneshot等待保留；request/resolution改为live apply + inline best-effort append attempt，record failure不阻止notify/resume。

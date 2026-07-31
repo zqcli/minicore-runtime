@@ -257,7 +257,7 @@ Replay对旧或损坏记录采用：
 ## Interaction
 
 ```rust
-pub struct Interaction {
+pub(crate) struct Interaction {
     pub request_id: RequestId,
     pub session_id: SessionId,
     pub turn_id: TurnId,
@@ -268,28 +268,32 @@ pub struct Interaction {
 ```
 
 ```rust
-pub enum InteractionState {
+pub(crate) enum InteractionState {
     Pending,
     Resolved {
         resolution: InteractionResolution,
         resolved_at: Timestamp,
-        resolution_key: IdempotencyKey,
+        resolution_key: Option<InteractionResolutionKey>,
     },
 }
+
+pub struct InteractionResolutionKey(/* opaque random 128-bit value */);
 ```
 
 ```rust
-pub enum InteractionRequest {
+pub(crate) enum InteractionRequest {
     ToolApproval(ToolApprovalRequest),
     UserQuestion(UserQuestionRequest),
 }
 
-pub enum InteractionResolution {
+pub(crate) enum InteractionResolution {
     ToolApproval(ToolApprovalDecision),
     UserAnswer(UserQuestionAnswer),
     Cancelled(InteractionCancelReason),
 }
 ```
+
+`resolution_key = Some`只用于host `InteractionCommand::Resolve`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
 
 MiniCore拥有RequestId、live state、Cancel、terminal cleanup和waiter routing。Presentation Adapter只展示并提交typed resolution。
 
@@ -313,8 +317,12 @@ notify/resume等待当前inline append attempt返回；recording failure转为De
 
 first live terminal resolution wins：
 
-- same resolution_key在current run幂等；
-- different key返回AlreadyResolved；
+- Presentation Adapter为每一次逻辑Resolve生成不可预测random 128-bit `InteractionResolutionKey`，retry exact same canonical resolution时复用；
+- key scope固定为`SessionId + TurnId + ItemId + RequestId`，不能跨request/session复用；
+- same key + same canonical resolution在current run幂等返回`InteractionResolved`，不产生第二live mutation、record或event；
+- same key + different canonical resolution返回`CommandConflict`；
+- different key在Interaction已经Resolved后返回`InteractionAlreadyResolved`；
+- internal Cancel/SecurityRevoked/Lifecycle closure没有public key；
 - transport断开和elapsed time不自动resolve；
 - Cancel可以显式关闭任意family。
 
@@ -341,6 +349,8 @@ approval只对当前call有效。MVP不持久化Session/Turn grant。
 
 ## UserQuestion
 
+**Canonical cross-module invariant: INV-302.**
+
 Ask-user Tool使用Interaction：
 
 ```text
@@ -353,7 +363,7 @@ assistant asks ask-user ToolCall
 → next Model
 ```
 
-UserAnswer不是UserMessage，不创建新Turn，也不进入Steer queue。
+UserAnswer不是UserMessage，不创建新Turn，也不进入Steer queue。MVP UserQuestion只允许[Tools定义的non-secret Text/SingleChoice fields](tools.md#approval-and-question-types)。question/answer完整值可以进入live state、JSONL、Interaction event/history和PreExecution ToolResult，并可能发送给模型；不得用于credential/password/token收集。任何future secret input必须建立独立secure host port与non-recorded one-time reference，不能只给当前request增加`secret: true`。
 
 ## Cancel与Terminal Cleanup
 
@@ -396,7 +406,8 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - parallel result completion与canonical order；
 - incomplete/abandoned/duplicate/conflicting exchange；
 - ToolStartGate vs Cancel/SecurityRevoked；
-- Interaction request/resolution ordering与idempotency；
+- Interaction request/resolution ordering与host-generated resolution key idempotency/conflict；
+- non-secret Text/SingleChoice validation，secret/password variant不可构造；
 - recording degraded时Tool/Interaction继续；
 - crash造成request/result缺失后的replay，且不合成Turn terminal；
 - Cancel settlement与FollowUp handoff。

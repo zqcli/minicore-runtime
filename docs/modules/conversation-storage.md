@@ -384,7 +384,9 @@ pub enum StoredEvent {
 }
 ```
 
-StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
+StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。`StoredInteractionRequest/Resolution`保存与Runtime public view同源的bounded safe request/resolution及optional host resolution key：Tool approval只保存redacted summary、safe option views与selected kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer。format v1没有secret/password/credential Interaction variant，raw secret不得进入JSONL。
+
+Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
 
 ```text
 Agent/Session durable owner updates head/revision/lifecycle
@@ -393,7 +395,7 @@ Agent/Session durable owner updates head/revision/lifecycle
 → no SessionRecorder call
 ```
 
-Runtime observer output不是durable transition log。restart从entity durable head恢复current Agent/Session state，从JSONL恢复conversation；两者按owner组合，不从conversation反推configuration timeline。metadata专用event shape仍属于Runtime public protocol freeze，不影响本节的no-JSONL owner规则。
+Runtime observer output不是durable transition log。restart从entity durable head恢复current Agent/Session state，从JSONL恢复conversation；两者按owner组合，不从conversation反推configuration timeline。metadata使用Runtime Interface冻结的独立event kind，不影响本节的no-JSONL owner规则。
 
 JSONL不保存`TurnStarted`、`TurnCompleted`、`TurnInterrupted`、`TurnFailed`或`StoredTurnTerminal`。Final Assistant是稳定conversation fact；Interrupted/Failed只属于当前loaded execution的StateEvent/Snapshot。
 

@@ -316,14 +316,125 @@ ToolRequirements
 ```
 
 ```rust
-pub enum ToolAuthorization {
+pub(crate) enum ToolAuthorization {
     Allow,
     Deny { reason: ToolDenyReason },
     Ask { request: ToolApprovalRequest },
 }
 ```
 
-MVP approval只支持per-call `AllowOnce`和进一步收紧权限的`AllowWith`，不保存Turn/Session grant。
+MVP approval只支持per-call `AllowOnce`和进一步收紧权限的`AllowWith`，不保存Turn/Session grant。public host不直接构造PermissionSet，而从exact request提供的allow options中选择。
+
+### Approval And Question Types
+
+```rust
+pub(crate) struct ToolApprovalRequest {
+    tool_name: ToolName,
+    arguments_summary: String,
+    reason: String,
+    requirements: ToolRequirementSummaryView,
+    options: Arc<[ToolApprovalOption]>,
+}
+
+pub(crate) struct ToolApprovalOption {
+    view: ToolApprovalOptionView,
+    decision: ToolApprovalDecision,
+}
+
+pub struct ToolApprovalRequestView {
+    pub tool_name: ToolName,
+    pub arguments_summary: String,
+    pub reason: String,
+    pub requirements: ToolRequirementSummaryView,
+    pub options: Arc<[ToolApprovalOptionView]>,
+}
+
+pub struct ToolApprovalOptionView {
+    pub option_index: u32,
+    pub kind: ToolApprovalOptionKindView,
+    pub label: String,
+    pub effective_requirements: ToolRequirementSummaryView,
+}
+
+pub enum ToolApprovalOptionKindView {
+    AsRequested,
+    Restricted,
+}
+
+pub struct ToolRequirementSummaryView {
+    pub filesystem: Option<String>,
+    pub network: Option<String>,
+    pub process: Option<String>,
+}
+
+pub enum ToolApprovalDecisionInput {
+    Allow { option_index: u32 },
+    Deny,
+}
+
+pub(crate) enum ToolApprovalDecision {
+    AllowOnce,
+    AllowWith(ToolPermissionSet),
+    Deny,
+}
+
+pub(crate) struct ToolPermissionSet {
+    // exact private capability ceiling; shape closes with production Sandbox adapter
+}
+```
+
+approval invariants：
+
+- `arguments_summary`、reason和requirements summary由trusted Tool-owned projection产生并bounded/redacted；不能直接serialize model arguments；projection失败在Interaction apply前fail closed；
+- option indices在一个request内从0连续分配并唯一；request至少一个allow option，Deny始终由resolution enum提供；
+- `AsRequested`映射`AllowOnce`；`Restricted`映射已证明不宽于requested/effective ceiling的`AllowWith`；
+- public resolution只回传option index，不能提交path/host/process或任意permission object；unknown/cross-request index返回InteractionFamilyMismatch/InvalidArgument；
+- resolution后再次执行Workspace/policy/Sandbox enforceability与ToolStartGate revalidation，approval从不替代enforcement；
+- exact private option map只存在于Pending Interaction/live waiter，不进入普通Snapshot、event或diagnostic；recorded history只保存safe option view与selected decision kind。
+
+UserQuestion首版是显式non-secret、recordable、model-visible的结构化表单：
+
+```rust
+pub struct UserQuestionRequest {
+    pub title: Option<String>,
+    pub questions: Arc<[UserQuestionField]>,
+}
+
+pub struct UserQuestionField {
+    pub question_index: u32,
+    pub prompt: String,
+    pub required: bool,
+    pub input: UserQuestionInput,
+}
+
+pub enum UserQuestionInput {
+    Text { multiline: bool },
+    SingleChoice { options: Arc<[UserQuestionChoice]> },
+}
+
+pub struct UserQuestionChoice {
+    pub option_index: u32,
+    pub label: String,
+}
+
+pub struct UserQuestionAnswer {
+    pub answers: Arc<[UserQuestionFieldAnswer]>,
+}
+
+pub struct UserQuestionFieldAnswer {
+    pub question_index: u32,
+    pub value: UserQuestionAnswerValue,
+}
+
+pub enum UserQuestionAnswerValue {
+    Text(String),
+    Choice { option_index: u32 },
+}
+```
+
+questions/options按index严格递增且唯一。answer必须无duplicate/unknown question，required字段齐全，value family和choice index匹配。Text/labels/count/total answer limits由V4-P1-2冻结。
+
+MVP没有`secret`、password、credential、file upload或arbitrary JSON answer variant。producer和Presentation Adapter必须明确告知用户：answer会进入live state、conversation JSONL、event/history和ask-user ToolResult，并可能发送给模型，不能输入API key、password、token或其他secret。`NonSecret`是协议约束，不是Runtime对自然语言的secret classifier。需要credential时必须未来新增独立secure host capability/one-time secret reference，raw value不得经过Interaction/ToolResult/model context。
 
 approval不替代Sandbox。无法强制required capability时production executor必须在side effect前拒绝；该能力声明和差集算法由O1在production Tool/Sandbox adapter开始前冻结。
 
@@ -601,6 +712,9 @@ Tool grant store
 - approval deny、Sandbox unavailable和cancel-before-start均返回matching PreExecution ToolResult；
 - Hook rewrite后重新验证；
 - approval allow/deny/family；
+- approval public view redaction，request-scoped option index映射AllowOnce/AllowWith且restricted不能扩大权限；
+- unknown/cross-request option拒绝，resolution后重新执行Sandbox enforceability与ToolStartGate；
+- UserQuestion Text/SingleChoice index/required/family validation且protocol无secret variant；
 - UserQuestion在mutation/start前；
 - ToolSet在task spawn前由captured control handle与Session-local queue完整构造；
 - ToolStartPermit只使用一次；
