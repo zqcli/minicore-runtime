@@ -202,7 +202,7 @@ Starting candidate在await前安装CommandId target与observed emergency epoch�
 
 ## V4-P0-4 · conversation JSONL含无合法writer owner的configuration/lifecycle events
 
-状态：Closed（2026-07-31；ADR 0131）。StoredEvent现只含InteractionRequested/Resolved；Agent/Session definition、metadata和lifecycle由entity durable owner保存，Create/Archive/Delete与loaded update均不调用Recorder。
+状态：Closed（2026-07-31；ADR 0131/0134）。Format v1使用六种flat StoredEntryBody conversation facts，不再定义StoredEvent wrapper；Agent/Session definition、metadata和lifecycle由entity durable owner保存，Create/Archive/Delete与loaded update均不调用Recorder。
 
 ### 关闭前场景
 
@@ -246,7 +246,7 @@ StoredCompaction
 
 ### 关闭验证
 
-- `StoredEvent`不存在无loaded recorder也必须写入的variant；
+- Format v1不存在StoredEvent wrapper或任何configuration/lifecycle body variant；
 - 所有StoredSessionEntry都有唯一EntryId分配owner；
 - active Turn期间definition update不会成为第二record producer；
 - Fork只复制conversation/history facts，不复制source lifecycle timeline。

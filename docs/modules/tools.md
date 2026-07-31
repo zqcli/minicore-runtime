@@ -265,9 +265,18 @@ pub enum ToolAbandonReason {
 }
 ```
 
-`ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。structured executor payload必须由Tool owner确定性render为Text；raw JSON仍可在bounded `details`中供trusted history/debug projection使用，但不自动进入模型。
+`ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。structured executor payload必须由Tool owner确定性render为Text；raw JSON可在bounded `details`中供current-process trusted debug projection使用，但不自动进入模型，且[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#tool-message)明确不记录details。
 
 `Succeeded`要求executor产生exact successful business result；`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
+
+source/disposition valid matrix：
+
+| Source | Allowed dispositions |
+| --- | --- |
+| PreExecution | Failed、Denied、Cancelled |
+| Executed | Succeeded、Failed、Cancelled |
+
+Executed Denied与PreExecution Succeeded invalid；unknown outcome使用Abandoned，不伪造Completed。
 
 这三个execution类型、`ToolResultContent`、`ToolResultDisposition`和`ToolAbandonReason`的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
 
@@ -418,6 +427,14 @@ pub enum ToolApprovalDecisionInput {
     Deny,
 }
 
+pub enum ToolApprovalResolution {
+    Allowed {
+        option_index: u32,
+        kind: ToolApprovalOptionKindView,
+    },
+    Denied,
+}
+
 pub(crate) enum ToolApprovalDecision {
     AllowOnce,
     AllowWith(ToolPermissionSet),
@@ -435,6 +452,7 @@ approval invariants：
 - option indices在一个request内从0连续分配并唯一；request至少一个allow option，Deny始终由resolution enum提供；
 - `AsRequested`映射`AllowOnce`；`Restricted`映射已证明不宽于requested/effective ceiling的`AllowWith`；
 - public resolution只回传option index，不能提交path/host/process或任意permission object；unknown/cross-request index返回InteractionFamilyMismatch/InvalidArgument；
+- public/storage terminal projection使用同一个ToolApprovalResolution；Allowed必须保存exact selected option index与kind，Denied无private reason/PermissionSet；
 - resolution后再次执行Workspace/policy/Sandbox enforceability与ToolStartGate revalidation，approval从不替代enforcement；
 - exact private option map只存在于Pending Interaction/live waiter，不进入普通Snapshot、event或diagnostic；recorded history只保存safe option view与selected decision kind。
 
@@ -738,6 +756,7 @@ Tool grant store
 - Turn-scoped ToolExecutionControl只在ActiveTurnTask current scope内发放start permit；
 - permit不持久化；
 - Running Tooltruthful settle；
+- StoredToolOutcome format-v1 Completed/Abandoned round-trip且不含details/raw error；
 - ToolResult recording失败不重放Tool；
 - complete call/result集合才进入model conversation；
 - ToolSet不修改LiveSessionState、不写SessionRecorder、不推进async loop；

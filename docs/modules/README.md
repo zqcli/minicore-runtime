@@ -28,6 +28,7 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 - [Tools](tools.md)：ToolSet、policy、approval、sandbox、executor和Session-local file mutation queue。
 - [Turn执行上下文](turn-execution-context.md)：immutable capture、ConversationRevision和ModelCallRequest basis。
 - [Turn / Item / Interaction](turn-item-interaction.md)：live lifecycle、complete Tool exchange、Interaction和Tool start gate。
+- [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field order、limits与corruption vectors。
 - [Conversation Recording与Replay](conversation-storage.md)：SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork。
 - [Session执行](session-execution.md)：SessionExecutor actor、ActiveTurnTask、async run loop、Steer/FollowUp/Cancel。
 - [ModelGateway](model-gateway.md)：TurnModelSnapshot、single provider attempt、stream、usage和typed errors。
@@ -46,7 +47,8 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 | Tool policy/approval/sandbox/execution | [Tools](tools.md) |
 | immutable Turn capture与live execution basis | [Turn执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction与Tool exchange | [Turn / Item / Interaction](turn-item-interaction.md) |
-| JSONL recording、RecordingHealth与cold replay | [Conversation Recording与Replay](conversation-storage.md) |
+| exact conversation JSONL v1 envelope与Stored DTO projection | [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md) |
+| JSONL semantic recording、RecordingHealth与cold replay | [Conversation Recording与Replay](conversation-storage.md) |
 | control actor、ActiveTurnTask与async loop | [Session执行](session-execution.md) |
 | provider attempt与response validation | [ModelGateway](model-gateway.md) |
 | compaction planning与summary validation | [Compaction](compaction.md) |

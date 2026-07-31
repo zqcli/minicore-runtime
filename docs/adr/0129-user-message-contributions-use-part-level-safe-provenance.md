@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-31
 
+> [ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Format V1](../formats/conversation-jsonl-v1.md#user-message)冻结MessageRecord Text parts、camelCase contributionStamps与independently degradable stamp decode；safe provenance语义不变。
+
 > [ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)进一步冻结本ADR的执行seam：TurnExecutionContext异步加载captured Skill并构造composition input，PromptSet同步原子规范化，Session Execution处理Starting/Steer cancellation与await后重验。
 
 > [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)删除未定义的`PromptBodyIntent::Template`。MVP body只支持Empty/Text；本ADR的`body + ordered skills[]`、part boundary与safe provenance决策保持。future template必须另行定义TemplateId、arguments、materialized render、limits、reload和capability。

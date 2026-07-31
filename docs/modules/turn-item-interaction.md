@@ -318,7 +318,7 @@ pub enum InteractionCancelReason {
 
 `InteractionResolutionKey`的bytes由Presentation Adapter使用CSPRNG生成；field保持private，public constructor校验exact 16 bytes，Debug/Display不得输出raw value；wire使用[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)的`irk_<32 hex>`。
 
-`InteractionCancelReason`是live/storage-safe closed taxonomy；subscriber disconnect、elapsed time和user silence没有variant，因为它们不自动resolve。public `InteractionResolutionInput::Cancelled`映射HostCancelled；其他variants只能由对应control/lifecycle owner产生。
+`InteractionCancelReason`是live/storage-safe closed taxonomy；subscriber disconnect、elapsed time和user silence没有variant，因为它们不自动resolve。public `InteractionResolutionInput::Cancelled`映射HostCancelled；其他variants只能由对应control/lifecycle owner产生。[Format V1](../formats/conversation-jsonl-v1.md#interaction-resolved)保存exact reason与optional host resolution key。
 
 `resolution_key = Some`只用于host `InteractionCommand::Resolve`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
 
@@ -436,6 +436,7 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - incomplete/abandoned/duplicate/conflicting exchange；
 - ToolStartGate vs Cancel/SecurityRevoked；
 - Interaction request/resolution ordering与host-generated resolution key idempotency/conflict；
+- StoredInteraction request/resolution format-v1 round-trip、family/reason/key relation和unknown variant isolation；
 - InteractionCancelReason只允许Host/Turn/Security/Unload/Runtime/Terminal owner causes，silence/disconnect不产生reason；
 - non-secret Text/SingleChoice validation，secret/password variant不可构造；
 - recording degraded时Tool/Interaction继续；

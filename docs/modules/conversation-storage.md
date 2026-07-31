@@ -92,7 +92,7 @@ impl EntryIdGenerator {
 - Degraded时generator继续工作，recording failure不改变已经进入live Item/Interaction/Compaction的identity；
 - EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。
 
-UUID/ULID算法、文本编码和serde wire由后续ID schema freeze决定。Recorder只验证entry identity已经存在且relation合法，不能创建、替换或规范化EntryId。
+EntryId exact wire由[Wire Schema typed carrier](wire-schema.md#runtime-generated-ids)冻结为`ent_<32 lowercase hex>`；generator使用16 CSPRNG bytes且不承载时间/顺序。Recorder只验证entry identity已经存在且relation合法，不能创建、替换或规范化EntryId。
 
 ## Live Mutation And Recording
 
@@ -240,6 +240,19 @@ impl SessionStorage {
 ```
 
 ```rust
+pub(crate) enum SessionStorageErrorKind {
+    UnsupportedFormatVersion,
+    HeaderCorrupt,
+    HistoryTooLarge,
+    StorageUnavailable,
+    InvariantViolation,
+}
+
+pub(crate) struct SessionStorageError {
+    pub kind: SessionStorageErrorKind,
+    // private source; public projection is typed/redacted
+}
+
 pub(crate) struct StagedSessionStorage {
     // unpublished target and validated initial SessionHeader
 }
@@ -249,6 +262,8 @@ pub(crate) struct OpenedSession {
     pub recorder: Arc<SessionRecorder>,
 }
 ```
+
+Header strict failure映射HeaderCorrupt或UnsupportedFormatVersion；1 GiB/1,000,000-entry hard cap映射HistoryTooLarge；ordinary recorder initialization/lease failure仍可以创建Degraded loaded Session。Runtime public mapping分别使用DurableStateCorrupt、DurableStateTooLarge或Unavailable，不能解析private source string。
 
 `StagedSessionStorage`只能由Agent/Session lifecycle publication路径消费，不能被query、Load或Turn admission观察。
 
@@ -273,13 +288,12 @@ physical commit receipt as execution permit
 
 ## 物理文件
 
-```text
-sessions/<SessionId>.jsonl
-```
+物理encoding、field order、limits和bounded scanner的exact owner是[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)。semantic overview：
 
 ```text
-line 1   SessionHeader
-line 2+  StoredSessionEntry
+sessions/<SessionId>.jsonl
+line 1   session_header
+line 2+  entry
 ```
 
 ```rust
@@ -297,7 +311,7 @@ pub struct StoredSessionEntry {
     pub entry_id: EntryId,
     pub parent_id: Option<EntryId>,
     pub session_id: SessionId,
-    pub turn_id: Option<TurnId>,
+    pub turn_id: TurnId,
     pub timestamp: Timestamp,
     pub body: StoredEntryBody,
 }
@@ -305,23 +319,18 @@ pub struct StoredSessionEntry {
 
 ```rust
 pub enum StoredEntryBody {
-    Message(StoredMessage),
-    Event(StoredEvent),
+    UserMessage(StoredUserMessage),
+    AssistantMessage(StoredAssistantMessage),
+    ToolMessage(StoredToolMessage),
+    InteractionRequested(StoredInteractionRequest),
+    InteractionResolved(StoredInteractionResolution),
     Compaction(StoredCompaction),
 }
 ```
 
-每行immutable。EntryId由live owner在apply前分配并进入collision guard，Recorder不能创建或改写。
+每行immutable。EntryId由live owner在apply前分配并进入collision guard，Recorder不能创建或改写。v1只记录Turn-scoped conversation/Interaction/Compaction facts，因此turn_id required；旧optional形状只服务已删除的Session configuration/lifecycle entries，不进入format v1。
 
-## Stored Message
-
-```rust
-pub enum StoredMessage {
-    User(StoredUserMessage),
-    Assistant(StoredAssistantMessage),
-    Tool(StoredToolMessage),
-}
-```
+## Stored Messages
 
 ```rust
 pub struct StoredUserMessage {
@@ -339,29 +348,34 @@ Session JSONL不保存Turn-static Prompt baseline、`PromptContent`、source loc
 
 ```rust
 pub struct StoredAssistantMessage {
-    pub item_ids: Arc<[ItemId]>,
     pub disposition: AssistantDisposition,
-    pub content: Arc<[AssistantContent]>,
+    pub content: Arc<[StoredAssistantContent]>,
     pub model: ModelResponseSummary,
+    pub response_id: Option<ProviderResponseId>,
+    pub finish_reason: ModelFinishReason,
+    pub effective_max_output_tokens: NonZeroU32,
     pub usage: Option<ModelUsage>,
     pub logical_retry_count: u8,
+    pub metadata: ProviderResponseMetadata,
 }
 ```
 
 ```rust
-pub enum AssistantContent {
-    Reasoning(ReasoningContent),
-    Text(String),
-    ToolCall(StoredToolCall),
-}
-```
-
-```rust
-pub struct StoredToolCall {
-    pub item_id: ItemId,
-    pub tool_call_id: ToolCallId,
-    pub name: ToolName,
-    pub arguments: BoundedJsonObject,
+pub enum StoredAssistantContent {
+    Reasoning {
+        item_id: ItemId,
+        content: ReasoningContent,
+    },
+    Text {
+        item_id: ItemId,
+        text: Arc<str>,
+    },
+    ToolCall {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+    },
 }
 ```
 
@@ -377,7 +391,6 @@ pub enum StoredToolOutcome {
         source: ToolOutcomeSource,
         disposition: ToolResultDisposition,
         content: ToolResultContent,
-        details: Option<BoundedJsonValue>,
     },
     Abandoned {
         reason: ToolAbandonReason,
@@ -385,20 +398,41 @@ pub enum StoredToolOutcome {
 }
 ```
 
-Conversation Storage直接复用Wire-owned BoundedJsonObject/BoundedJsonValue、ModelGateway-owned ReasoningContent，以及Tools-owned ToolOutcomeSource/ToolResultContent/ToolResultDisposition/ToolAbandonReason；不定义StoredReasoning、unbounded JsonValue或第二套Tool disposition。
+每个StoredAssistantContent直接携带其ItemId；禁止`item_ids[] + content[]`平行数组。entry内ItemId unique，ToolCallId在response内unique，content保持provider finalized semantic order。response ID、finish reason、effective max output、usage、retry和metadata与ModelResponseSummary分开保存；exact validation与wire见[Format V1 · Assistant Message](../formats/conversation-jsonl-v1.md#assistant-message)。
+
+Conversation Storage直接复用Wire-owned BoundedJsonObject、ModelGateway-owned ReasoningContent/ModelResponseSummary/usage/finish/metadata，以及Tools-owned ToolOutcomeSource/ToolResultContent/ToolResultDisposition/ToolAbandonReason；不定义StoredReasoning、unbounded JsonValue或第二套Tool disposition。ToolResult.details是process-local/private debug value，format v1不记录。
 
 Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId只要求同一assistant response内唯一。
 
-## Stored Events
+## Stored Interactions
 
 ```rust
-pub enum StoredEvent {
-    InteractionRequested(StoredInteractionRequest),
-    InteractionResolved(StoredInteractionResolution),
+pub struct StoredInteractionRequest {
+    pub request_id: RequestId,
+    pub item_id: ItemId,
+    pub request: StoredInteractionRequestBody,
+}
+
+pub enum StoredInteractionRequestBody {
+    ToolApproval(ToolApprovalRequestView),
+    UserQuestion(UserQuestionRequest),
+}
+
+pub struct StoredInteractionResolution {
+    pub request_id: RequestId,
+    pub item_id: ItemId,
+    pub resolution: StoredInteractionResolutionBody,
+    pub resolution_key: Option<InteractionResolutionKey>,
+}
+
+pub enum StoredInteractionResolutionBody {
+    ToolApproval(ToolApprovalResolution),
+    UserAnswer(UserQuestionAnswer),
+    Cancelled(InteractionCancelReason),
 }
 ```
 
-StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。`StoredInteractionRequest/Resolution`保存与Runtime public view同源的bounded safe request/resolution及optional host resolution key：Tool approval只保存redacted summary、safe option views与selected kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer；Cancelled保存Turn/Interaction owner定义的closed InteractionCancelReason。format v1没有secret/password/credential Interaction variant，raw secret不得进入JSONL。
+Stored interactions只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的facts。request/resolution使用Runtime public view同源的bounded safe types：Tool approval只保存redacted summary、safe options与selected index/kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer；Cancelled保存closed InteractionCancelReason。任意host Resolve的resolution_key为Some，owner-driven closure为None。exact relation/wire见Format V1的[request](../formats/conversation-jsonl-v1.md#interaction-requested)与[resolution](../formats/conversation-jsonl-v1.md#interaction-resolved)。format v1没有secret/password/credential variant，raw secret不得进入JSONL。
 
 Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
 
@@ -435,7 +469,7 @@ pub struct StoredCompaction {
 }
 ```
 
-`StoredCompactionModelCall`的唯一semantic定义位于[Compaction](compaction.md#summary-validation与provenance)。automatic SummaryModel路径始终为`Some`；Conversation Storage只负责format-v1 encoder/decoder，不复制另一份provenance projection。wire casing、字段长度和bounded decode仍由V4-P1-2冻结。
+`StoredCompactionModelCall`的唯一semantic定义位于[Compaction](compaction.md#summary-validation与provenance)。automatic SummaryModel路径始终为`Some`；Conversation Storage只负责[format-v1 projection](../formats/conversation-jsonl-v1.md#compaction)，不复制第二份provenance semantic type。summary<=65,536 bytes，finish/retry/request max/metadata使用Format v1 exact limits。
 
 recorded marker只影响future replay。live Replace在inline record attempt前已经生效。marker缺失时restart恢复旧conversation；marker存在但无法在当前effective stable-unit projection上匹配index大于0的unit `first_entry_id`时，replay忽略并报告diagnostic。`None`只在当前effective conversation非空时表示覆盖全部units。
 
@@ -451,18 +485,19 @@ cold file仍可能因手工编辑、旧bug或partial migration包含orphan；rep
 
 **Canonical cross-module invariant: INV-002.**
 
-replay顺序扫描newline-terminated records：
+replay按[Format V1 bounded decode](../formats/conversation-jsonl-v1.md#bounded-decode与replay)顺序：
 
-1. 解析Header；
-2. 对每个完整line解析typed entry；
-3. UserMessage正文与解释性contribution stamps独立校验；未知origin、malformed stamp或越界`content_part_index`直接丢弃；同一part的stamp按recorded顺序first valid wins，后续重复丢弃并告警；合法正文始终保留；
-4. duplicate EntryId使用first valid wins并告警；
-5. malformed body跳过；
+1. 检查whole-file physical byte cap；超过1 GiB返回HistoryTooLarge，不truncate tail；
+2. strict解析Header；oversized/malformed/invalid UTF-8/unsupported version立即fail Load；
+3. 以bounded scanner读取newline-terminated entries并在scan中执行1,000,000 complete-entry cap；oversized line stream-discard到LF，invalid UTF-8/malformed/unknown variant skip + diagnostic；
+4. UserMessage正文与解释性contribution stamps独立校验；未知origin、malformed stamp或越界`content_part_index`直接丢弃；同一part first valid stamp wins；合法正文保留；
+5. duplicate EntryId使用first valid wins并告警；
 6. missing parent形成isolated orphan root；
-7. invalid Session/Turn/Item/Interaction relation只隔离对应projection；
-8. 最后partial line忽略并报告；
-9. 构建recorded tree、history view和sanitized conversation；
-10. 返回bounded redacted diagnostics。
+7. invalid Session/Turn/Item/Tool/Interaction relation只隔离对应projection；
+8. invalid Compaction marker忽略该effect并diagnose；
+9. whole-file cap已通过时，最后unterminated bytes作为partial tail忽略；
+10. 构建recorded tree、history view和sanitized conversation；
+11. 保留最多100条redacted diagnostic detail，额外按code aggregate并追加truncated summary。
 
 Replay不恢复任何process-local执行对象，也不根据stamp重新加载Skill/Workspace正文、重新授权source或重建旧PromptSet。conversation正文是恢复正确性的事实，stamp只承担安全解释作用。
 
@@ -574,7 +609,7 @@ open file and attempt writable lease
 
 recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail和旧TurnStatus。Load不推断旧Turn outcome、不创建restart interruption，也不执行recovery append。
 
-Tail处理只允许截断final unterminated partial line。完整newline-terminated entry即使来自先前outcome-unknown write，只要typed replay有效就必须保留；malformed中段行继续由tolerant replay隔离，不执行repair、reparent或gap marker synthesis。
+Tail处理只允许在valid v1 Header、exclusive writable lease且whole-file cap通过后，截断final unterminated partial line到last LF。完整newline-terminated entry即使oversized、malformed、unknown或来自先前outcome-unknown write，也必须保留physical bytes；typed replay决定接受或隔离，不执行middle repair、reparent或gap marker synthesis。
 
 ## Diagnostics
 
@@ -587,7 +622,7 @@ pub struct SessionReplayDiagnostic {
 }
 ```
 
-Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，并禁止暴露credential、绝对敏感路径、完整Tool output或raw provider payload。
+Diagnostics exact code、100-detail cap、512-byte redacted message和aggregate规则由[Wire Schema](wire-schema.md#diagnostics)与[Format V1](../formats/conversation-jsonl-v1.md#bounded-decode与replay)拥有。禁止暴露raw line、credential、绝对敏感路径、完整Tool output、OS error或provider payload。
 
 ## 测试要求
 
@@ -605,8 +640,15 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - Unload/Load只恢复recorded prefix并可建立新的Healthy Recorder；
 - 不创建segment、gap marker或backfill suffix；
 - malformed/duplicate/orphan/partial-tail replay；
+- strict Header version/UTF-8/64KiB，entry 1MiB，file 1GiB/1,000,000 lines exact boundary/+1；
+- oversized complete line后续valid line继续恢复，完整bad line不truncate；
+- byte-exact golden覆盖六种StoredEntryBody、all option null和canonical field order；
 - malformed、unknown或越界contribution stamp被丢弃；同一part重复stamp first valid wins；合法UserMessage正文继续恢复；
 - complete/incomplete/duplicate/conflicting Tool exchange；
+- Assistant content ItemId内联且unique，不存在parallel item_ids/content错位；
+- Assistant response/model/finish/max-output/usage/retry/metadata round-trip；
+- Stored Tool Completed/Abandoned closed variants且不保存details；
+- ToolApproval/UserQuestion request/resolution/cancel reason/key relation；
 - compaction marker missing/invalid/指向第一个unit或ToolResult内部时忽略；
 - duplicate identical messages仍按stable-unit EntryId定位exact marker；
 - repeated rolling summary使用前一StoredCompaction outer EntryId作为source origin；
@@ -622,6 +664,6 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - bounded redacted diagnostics；
 - LiveConversation与无corruption replay产生相同sanitized messages。
 
-## 开放问题
+## 后续扩展
 
-EntryId算法/文本wire、max entry bytes、全部format-v1 Stored DTO（ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution、StoredCompaction）的tag/casing/limits、diagnostic总量上限和format migration仍需freeze。Compaction stable-unit source、marker replay和automatic model-call semantic fields已由ADR 0132关闭；EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+format v1 wire、IDs/revisions、line/file limits、Stored DTO、Compaction projection、diagnostic cap和tolerant scanner已由ADR 0134与[exact format](../formats/conversation-jsonl-v1.md)冻结。future工作只包括显式format-v2 migration/repair utility、blob/artifact side channel和超过v1 hard caps的export方案；这些能力不能修改v1 reader/writer语义。Compaction stable-unit source由ADR 0132关闭，EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，configuration/lifecycle owner由ADR 0131关闭，Prompt stamp由ADR 0129关闭。

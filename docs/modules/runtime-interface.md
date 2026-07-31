@@ -755,6 +755,7 @@ pub enum CommandErrorCode {
     Unauthorized,
     Unavailable,
     DurableStateCorrupt,
+    DurableStateTooLarge,
     RuntimeClosing,
 }
 
@@ -819,6 +820,7 @@ pub enum QueryErrorCode {
     ResultTooLarge,
     Unavailable,
     DurableStateCorrupt,
+    DurableStateTooLarge,
     RuntimeClosing,
 }
 
@@ -1579,6 +1581,7 @@ pub enum SessionUnavailableView {
     ModelUnavailable,
     PromptUnavailable,
     DurableStateCorrupt,
+    DurableStateTooLarge,
     RuntimeDependencyUnavailable,
 }
 
@@ -2105,19 +2108,11 @@ pub enum InteractionRequestView {
 }
 
 pub enum InteractionResolutionView {
-    ToolApproval(ToolApprovalResolutionView),
+    ToolApproval(ToolApprovalResolution),
     UserAnswer(UserQuestionAnswer),
     Cancelled {
         reason: InteractionCancelReason,
     },
-}
-
-pub enum ToolApprovalResolutionView {
-    Allowed {
-        option_index: u32,
-        kind: ToolApprovalOptionKindView,
-    },
-    Denied,
 }
 ```
 
@@ -2526,6 +2521,7 @@ Runtime Interface只拥有public projection，不把module error迁移到全局e
 | Workspace authority或security policy拒绝 | `Unauthorized` | `UserActionRequired` |
 | temporary source/storage/model resolution unavailable before admission | `Unavailable` | `RetryWithBackoff` |
 | required durable entity/history损坏 | `DurableStateCorrupt` | `UserActionRequired` |
+| valid durable history超过v1 1 GiB/1,000,000-entry hard cap | `DurableStateTooLarge` | `UserActionRequired` |
 | admitted command遇Runtime shutdown | `RuntimeClosing` | `RetryWithBackoff` |
 | internal invariant/channel failure发生在command seam | `Unavailable` | `DoNotRetry` + redacted diagnostic |
 
@@ -2551,6 +2547,7 @@ Envelope/runtime入口失败不进入上述Command table：
 | `Unavailable(PromptUnavailable)` | `UserActionRequired` |
 | `Unavailable(RuntimeDependencyUnavailable)` | `RetryWithBackoff` |
 | `Unavailable(DurableStateCorrupt)` | override code为`DurableStateCorrupt` + `UserActionRequired`，不使用`SessionNotReady` |
+| `Unavailable(DurableStateTooLarge)` | override code为`DurableStateTooLarge` + `UserActionRequired`，不使用`SessionNotReady` |
 
 stage规则：
 
@@ -2583,7 +2580,7 @@ Public interface是 contract test surface。
 - user Cancel在Input apply前使所有joined Submit caller得到同一SubmitCancelled completion；Input apply先赢时全部得到同一TurnStarted；
 - 相同CommandId携带不同command返回Rejected CommandError(code=CommandConflict)；
 - invalid envelope/request-too-large/closed runtime使用outer RuntimeDispatchError；accepted typed command的field/domain invalid保留CommandId进入CommandCompletion::Rejected(InvalidArgument)；
-- SessionNotReady每个Preparing/Unavailable cause按canonical table产生exact retry，DurableStateCorrupt使用专用code；
+- SessionNotReady每个Preparing/Unavailable cause按canonical table产生exact retry，DurableStateCorrupt/TooLarge使用专用code；
 - CommandOutput只允许bounded redacted plain text；
 - Cancel(Submit CommandId)关闭排队或Starting admission；Input apply前user Cancel使原Submit完成SubmitCancelled且无Turn，Input已live apply但TurnStarted尚未发布时原Submit仍完成TurnStarted并阻止task spawn；target退休或restart后返回NotFound，已发布Turn target返回SubmitNotCancellable且不影响future Turn；
 - Starting async Skill load期间user Cancel使原Submit为SubmitCancelled；SecurityRevoked使原Submit Rejected(Unauthorized)；两者在Input apply前先赢时均无Turn/task，apply后保持TurnStarted→Interrupted顺序；

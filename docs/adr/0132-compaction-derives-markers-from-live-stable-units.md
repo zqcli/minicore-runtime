@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-31
 
+> [ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Format V1 Compaction](../formats/conversation-jsonl-v1.md#compaction)冻结StoredCompaction camelCase projection、65,536-byte summary、typed IDs/usage/metadata和automatic modelCall non-null；本ADR的stable-unit/cut/provenance语义不变。
+
 ## 背景
 
 ADR 0124把`StoredCompaction`收窄为portable rolling summary、single `first_kept_entry_id` marker和optional safe model-call provenance；ADR 0126又把execution truth移到`LiveSessionState`，Compaction先Replace live conversation再best-effort record marker。

@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-31
 
+> [ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Format V1](../formats/conversation-jsonl-v1.md)进一步flatten `StoredMessage/StoredEvent` wrappers为六种Turn-scoped body variants，并使StoredSessionEntry.turn_id required；仍只保存User/Assistant/Tool、Interaction与Compaction，owner边界不变。
+
 ## 背景
 
 ADR 0126/0127已经把JSONL收缩为inline best-effort conversation recording，并删除Turn start/terminal ledger。Conversation Storage仍保留`StoredEvent::SessionDefinitionChanged`与`SessionLifecycleChanged`，但这些mutation可以发生在Unloaded Session：Create发布`Open + Unloaded`且不创建Recorder，Archive/Delete要求Unloaded，definition/metadata update也可在Unloaded执行。Unloaded owner没有LiveSessionState EntryIdGenerator；loaded active Turn期间写definition event又会引入第二record producer。
@@ -35,7 +37,7 @@ ADR 0126/0127已经把JSONL收缩为inline best-effort conversation recording，
 - active Turn期间future-only definition update不成为第二record producer；
 - Load从current entity head + recorded conversation prefix恢复；
 - loaded/unloaded Fork均只复制conversation facts，child definition来自lifecycle staging；
-- golden StoredEvent只包含InteractionRequested/InteractionResolved；
+- format-v1 StoredEntryBody使用UserMessage/AssistantMessage/ToolMessage/InteractionRequested/InteractionResolved/Compaction六个flat variants，不恢复StoredEvent wrapper；
 - current canonical docs不再定义两个已删除variant/payload。
 
 ## 修订关系

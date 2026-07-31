@@ -111,7 +111,7 @@ MVP不提供recording policy、`Disabled`或ephemeral Session。Session Create�
 
 MVP保持单producer domain ownership：Starting/Idle recordable mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction request/resolution发生在对应task等待期间。所有路径都必须通过同一个`LiveSessionState` private mutation seam分配EntryId；SessionExecutor和ActiveTurnTask不能各自保存generator。新增并发record producer前必须设计显式domain sequencing，不能用async mutex acquisition顺序定义history。
 
-Replay以文件中全部first-valid EntryId初始化collision guard；loaded Fork target以全部copied EntryId初始化child generator。Degraded不停止ID分配，EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。具体UUID/ULID算法和文本wire留到ID schema freeze。
+Replay以文件中全部first-valid EntryId初始化collision guard；loaded Fork target以全部copied EntryId初始化child generator。Degraded不停止ID分配，EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)现冻结CSPRNG typed-prefix ID与exact text wire。
 
 ### 4. Observe与记录顺序
 

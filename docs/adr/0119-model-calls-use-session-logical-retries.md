@@ -24,7 +24,7 @@ pi当前默认关闭provider层retry，由AgentSession对失败模型调用执�
 7. 默认可自动logical retry的错误必须由Gateway证明delivery为`NotSent`或`RejectedBeforeExecution`，且reason是`Timeout`、`TransportUnavailable`、`ProviderUnavailable`，或typed `Retry-After`不超过60秒的`RateLimited`。仅“尚无delta”或`AcceptedNoOutput`不足以重放；缺少provider明确的pre-execution rejection proof时必须映射`RequestOutcomeUnknown`。实际delay取当前指数backoff与provider hint的较大值；超过60秒时直接返回terminal error。
 8. `RequestOutcomeUnknown`、`StreamInterrupted`、`AuthMissing`、`AuthRejected`、`QuotaExceeded`、`ModelUnavailable`、`UnsupportedCapability`、`InvalidRequest`、`SafetyBlocked`、`ProviderRejected`、`UnexpectedToolCall`、`InvalidStructuredOutput`、`InvalidProviderResponse`和`IncompleteResponse`默认不自动retry。`ContextOverflow`进入bounded Compaction recovery，不算普通retry。模型响应错误的ownership与命名由[ADR 0120](0120-failures-stay-with-owning-modules.md)确定。
 9. logical retry前必须重新确认Turn仍Running、`execution_version`、exact `ConversationCheckpoint.entry_id`、`current_operation`仍为持有同一request的对应retry slot、control basis、purpose、output contract和effective max output均未变化。Steer、Cancel、revocation、Compaction Replace或任何model-visible conversation变化都会推进checkpoint或control basis，使scheduled retry失效。由于retry复用同一个`Arc<ModelCallRequest>`，不重新assemble，也不比较`AssembledModelContextFingerprint`。
-10. `StoredAssistantMessage.retry_count`和`StoredCompactionModelCall.logical_retry_count`只记录Session logical retry次数。Gateway不再返回`transparent_retry_count`，不发布provider retry lifecycle progress，也不引入`ModelCallBudget`、`ModelAttempt`或retry registry。
+10. `StoredAssistantMessage.logical_retry_count`和`StoredCompactionModelCall.logical_retry_count`只记录Session logical retry次数。Gateway不再返回`transparent_retry_count`，不发布provider retry lifecycle progress，也不引入`ModelCallBudget`、`ModelAttempt`或retry registry。
 
 ## 后果
 
