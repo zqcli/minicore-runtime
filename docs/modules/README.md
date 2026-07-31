@@ -51,12 +51,13 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-1. 冻结wire/schema和[开放问题](../review/async-loop-best-effort-recording-open-questions.md)中的必要MVP默认值；
-2. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
-3. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
-4. 加入recording slow-write/failure与cold replay fixtures；
-5. 实现overflow → CompactionSummary → live Replace → inline best-effort record；
-6. 完成Rig 0.40.0 provider spike和mock-server tests；
-7. production Tool/Sandbox adapter前关闭O1/R7。
+1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)中的P0共享类型、composition、recording owner和Compaction contract；
+2. 冻结public/runtime/storage wire schema与必要MVP限制；
+3. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
+4. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
+5. 加入recording slow-write/failure与cold replay fixtures；
+6. 实现overflow → CompactionSummary → live Replace → inline best-effort record；
+7. 完成Rig 0.40.0 provider spike和mock-server tests；
+8. production Tool/Sandbox adapter前关闭O1/R7。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

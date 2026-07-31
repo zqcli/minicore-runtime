@@ -1083,9 +1083,9 @@ SessionDefinition.agent = AgentRevisionRef
 
 不同时支持 follow-current/pinned 两种模式，也不引入 Agent channel。未来若出现真实 release workflow，channel 只能作为创建或显式升级 Session 时解析 exact revision 的 convenience alias，不能成为 Session 的持续动态绑定。
 
-## 与三个 Service 的关系
+## 与Runtime-Owned共享模块的关系
 
-PromptService、ToolService 和 SkillService 都由 MiniCoreRuntime 创建并在 Runtime 生命周期内共享。
+PromptService、ToolService、SkillService和ModelGateway都由MiniCoreRuntime创建并在Runtime生命周期内共享。前三者提供Turn capture所需的资源/执行view，ModelGateway提供exact model resolution和单次provider attempt。
 
 它们不进入 durable Agent 或 Session：
 
