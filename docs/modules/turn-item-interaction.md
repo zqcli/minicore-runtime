@@ -87,7 +87,7 @@ Item顺序由live conversation顺序和assistant content顺序决定；不增加
 - UserMessage、final AgentMessage和Reasoning在live final mutation时Completed；
 - ToolInvocation由assistant ToolCall创建为Started；
 - truthful ToolResult使其Completed；
-- unknown/cancelled settlement可以使其Abandoned；
+- possible side effect的exact outcome未知时使其Abandoned；cancel-before-start有truthful Cancelled ToolResult，因此使其Completed；
 - terminal Item不能回到Started。
 
 ## Streaming
@@ -111,14 +111,7 @@ Host可能先看到streaming，随后进程crash且没有任何recorded final It
 
 ## ToolCall Identity
 
-```rust
-pub struct ToolCall {
-    pub item_id: ItemId,
-    pub tool_call_id: ToolCallId,
-    pub name: ToolName,
-    pub arguments: JsonValue,
-}
-```
+`ToolCall`与`ToolExecutionRequest`的唯一canonical shape由[Tools](tools.md#toolcallinvocation-和-result)拥有。canonical ToolCall保存`ToolCallId + ToolName + arguments + call_index`，不保存ItemId。ActiveTurnTask在assistant response live apply时为每个call分配ItemId，建立Item projection并构造携带`ItemId + Arc<ToolCall>`的execution request。
 
 ToolCallId由ModelGateway adapter归一化：provider有native ID时保留，没有时生成response-local opaque ID。同一assistant response内必须唯一。
 
@@ -134,14 +127,7 @@ ToolCallId不替代ItemId，也不要求Session-global唯一。
 
 **Canonical cross-module invariant: INV-401.**
 
-```rust
-pub(crate) enum ToolOperationState {
-    Prepared,
-    Running,
-    Settling,
-    Terminal,
-}
-```
+唯一`ToolOperationSlot`类型及其`Prepared → Running → Settling → Terminal`状态由[Session Execution](session-execution.md#tool-operation-slot)拥有。本节只拥有INV-401的跨模块语义和Item投影，不定义第二个operation state enum。
 
 ```text
 policy/approval/sandbox validation
@@ -205,16 +191,9 @@ Replay对旧或损坏记录采用：
 
 ## Tool Outcome
 
-```rust
-pub enum ToolExecutionOutcome {
-    Completed(ToolResult),
-    PreExecutionFailed(PreExecutionToolError),
-    CancelledBeforeStart,
-    Abandoned(ToolAbandonedReason),
-}
-```
+`ToolExecutionOutcome`的唯一canonical enum由[Tools](tools.md#toolcallinvocation-和-result)拥有：`Completed { source = PreExecution | Executed, result } | Abandoned { ... }`。
 
-- validation、policy deny、approval deny或sandbox deny产生truthful pre-execution result；
+- validation、policy deny、approval deny、sandbox deny或cancel-before-start都产生matching truthful pre-execution ToolResult；
 - 已可能发生副作用的Tool不自动retry；
 - record failure不能触发Tool re-execution；
 - Abandoned不生成synthetic ToolResult供模型继续。
@@ -299,7 +278,7 @@ Tool policy = Ask
 → await resolution
 ├─ AllowOnce / AllowWith → revalidate ToolStartGate → execute
 ├─ Deny → PreExecution ToolResult
-└─ Cancelled → Cancelled/Abandoned settlement
+└─ Cancelled before start → PreExecution Cancelled ToolResult
 ```
 
 approval只对当前call有效。MVP不持久化Session/Turn grant。
@@ -325,7 +304,7 @@ UserAnswer不是UserMessage，不创建新Turn，也不进入Steer queue。
 Cancel/SecurityRevoked后：
 
 - Pending Interaction live-resolve为Cancelled；
-- Prepared Tool不启动；
+- Prepared Tool不启动并生成matching PreExecution Cancelled ToolResult；
 - Running Tooltruthful settle；
 - incomplete exchange不进入model conversation；
 - apply live TurnInterrupted；
@@ -355,6 +334,8 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - Turn/Item lifecycle；
 - streaming finalization和retry cleanup；
 - ToolCall ID uniqueness/correlation；
+- Tools-owned ToolCall/Outcome和Session-owned ToolOperationSlot没有第二份type definition；
+- unknown/schema-invalid/approval-deny/Sandbox-unavailable/cancel-before-start均闭合为matching ToolResult；
 - parallel result completion与canonical order；
 - incomplete/abandoned/duplicate/conflicting exchange；
 - ToolStartGate vs Cancel/SecurityRevoked；

@@ -1,7 +1,7 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（第四轮Tool contract收口后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -34,6 +34,7 @@ ToolSet只服务一个Turn。shared resource reload不改变active ToolSet；fut
 - 每Turn构造独立immutable ToolSet；
 - ToolPromptView只能由parent ToolSet投影；
 - Tool schema validation、Hook、policy、approval、Sandbox和executor统一通过ToolSet；
+- Tools唯一拥有`ToolCall`、`ToolExecutionRequest`和`ToolExecutionOutcome`；
 - ToolCallId由ModelGateway adapter从provider/tool protocol归一化；协议无原生ID时生成response-local opaque ID；ItemId来自MiniCore；
 - ToolInvocation Item贯穿call、Interaction、execution、result和recovery；
 - Tool execution outcome为Completed(exact ToolResult)或Abandoned；
@@ -43,6 +44,7 @@ ToolSet只服务一个Turn。shared resource reload不改变active ToolSet；fut
 - ToolResult live apply后更新Item；同一assistant所有calls有matching result后exchange自动进入conversation；
 - ToolSet不直接修改LiveSessionState、写SessionRecorder或开始下一次Model；
 - 每loaded Session拥有独立file mutation queue；
+- SessionExecutor在Turn capture前创建Turn-scoped execution control handle，并把该handle与Session-local mutation queue注入ToolSet；
 - 同Session同canonical file key FIFO，不同key可并发；
 - 多文件/open-world/Serial Tool使batch按call order串行；
 - 跨Session共享Workspace不协调；
@@ -58,11 +60,14 @@ MiniCoreRuntime
 │  ├─ current Arc<ToolResourceView>
 │  └─ cache/registry internals
 └─ loaded Session
+   ├─ SessionExecutor
+   │  └─ Arc<SessionFileMutationQueue>
    └─ TurnExecutionContext
       └─ Arc<ToolSet>
          ├─ ToolPromptView
          ├─ Tool route/requirements
-         ├─ ToolExecutionControl
+         ├─ Turn-scoped ToolExecutionControl handle
+         ├─ Arc<SessionFileMutationQueue>
          └─ shared executor implementations
 ```
 
@@ -97,7 +102,7 @@ impl ToolSet {
 
     pub async fn execute(
         &self,
-        request: ToolExecutionRequest<'_>,
+        request: ToolExecutionRequest,
         sink: &dyn ToolUpdateSink,
     ) -> ToolExecutionOutcome;
 }
@@ -174,15 +179,16 @@ annotations用于UI/policy/scheduling提示，requirements用于实际authorizat
 
 ```rust
 pub struct ToolCall {
-    pub id: ToolCallId,
+    pub tool_call_id: ToolCallId,
     pub name: ToolName,
     pub arguments: Value,
-    pub index: u32,
+    pub call_index: u32,
 }
 
-pub struct ToolExecutionRequest<'a> {
+#[derive(Clone)]
+pub struct ToolExecutionRequest {
     pub item_id: ItemId,
-    pub call: &'a ToolCall,
+    pub call: Arc<ToolCall>,
 }
 ```
 
@@ -190,13 +196,12 @@ pub struct ToolExecutionRequest<'a> {
 pub enum ToolExecutionOutcome {
     Completed {
         item_id: ItemId,
-        call_id: ToolCallId,
         source: ToolOutcomeSource,
         result: ToolResult,
     },
     Abandoned {
         item_id: ItemId,
-        call_id: ToolCallId,
+        tool_call_id: ToolCallId,
         reason: ToolAbandonReason,
     },
 }
@@ -211,12 +216,16 @@ ToolResult：
 
 ```rust
 pub struct ToolResult {
-    pub call_id: ToolCallId,
+    pub tool_call_id: ToolCallId,
     pub disposition: ToolResultDisposition,
     pub content: ToolResultContent,
     pub details: Option<Value>,
 }
 ```
+
+这三个execution类型的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
+
+Raw ToolExecutor只返回业务payload、disposition或typed internal failure，不能选择ItemId/ToolCallId，也不能直接构造public outcome。ToolSet private outcome constructor从`ToolExecutionRequest`复制identity，并保证Completed中的`result.tool_call_id`与`request.call.tool_call_id`一致；mismatch属于internal invariant failure，不进入live reducer。
 
 不包含：
 
@@ -238,10 +247,11 @@ pub struct ToolTurnContext {
     pub workspace: WorkspaceToolContext,
     pub tool_calling: ToolCallingCapabilities,
     execution_control: Arc<dyn ToolExecutionControl>,
+    mutation_queue: Arc<SessionFileMutationQueue>,
 }
 ```
 
-private execution_control只能由ActiveTurnTask注入。
+`execution_control`与`mutation_queue`均为crate-private capture输入。SessionExecutor在reserve candidate TurnId/control_generation后创建一个绑定该candidate与EmergencyControl的Turn-scoped control handle，并克隆本loaded Session拥有的mutation queue；两者在ActiveTurnTask spawn前进入`ToolTurnContext`。同一个control handle随后交给ActiveTurnTask使用，禁止task spawn后替换或二次注入。
 
 `for_turn`：
 
@@ -249,7 +259,7 @@ private execution_control只能由ActiveTurnTask注入。
 2. 应用Agent/Session Tool policy；
 3. 检查model tool-calling capability；
 4. 结合WorkspaceToolContext计算route ceiling；
-5. 构建immutableToolSet和ToolPromptView；
+5. 绑定Turn-scoped execution control与Session-local mutation queue，构建immutable ToolSet和ToolPromptView；
 6. 不执行Tool、不发起Interaction、不写storage。
 
 ## Deferred Tool
@@ -336,14 +346,14 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
     async fn reserve_execution_start(
         &self,
         item_id: ItemId,
-        call_id: ToolCallId,
+        tool_call_id: ToolCallId,
     ) -> Result<ToolStartPermit, ToolExecutionControlError>;
 }
 ```
 
 `ToolStartPermit`是current-Runtime typed permit，不持久化：
 
-- ActiveTurnTask验证current Turn/Item/call；
+- Session Execution拥有唯一`ToolOperationSlot`类型；Turn-scoped control handle验证current Turn/Item/call；
 - 观察latest EmergencyControl；
 - 原子把ToolOperationSlot从Prepared变为Running；
 - permit只允许对应executor开始一次；
@@ -358,7 +368,7 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
 
 调度规则：
 
-- call按assistant index规范化；
+- call按canonical `call_index`规范化；
 - preflight/schema/policy按call order；
 - ask-user route独占并先完成；
 - `Serial`、multi-file或open-world Tool使batch按call order串行；
@@ -368,7 +378,7 @@ pub(crate) trait ToolExecutionControl: Send + Sync {
 - model-visible output始终按assistant call order。
 
 ```rust
-pub struct SessionFileMutationQueue {
+pub(crate) struct SessionFileMutationQueue {
     // private per-loaded-session queues
 }
 ```
@@ -406,7 +416,7 @@ Completed {
 }
 ```
 
-ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
+`CancelledBeforeStart`不是独立terminal outcome variant。只要start reservation尚未获胜且可以证明没有side effect，Cancel/SecurityRevoked也返回`Completed { source = PreExecution, result.disposition = Cancelled }`。ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
 
 ### Executed Result
 
@@ -480,7 +490,7 @@ ToolSet只产出typed terminal outcome，不拥有conversation reducer。live co
 
 ## Cancellation 与 SecurityRevoked
 
-- Prepared：Emergency先赢，不发permit，产生Cancelled result或Abandoned；
+- Prepared：Emergency先赢，不发permit，产生PreExecution Cancelled ToolResult；
 - Running：发送best-effort cancellation，等待executor teardown/result；
 - Settling：等待resource/mutation permit安全释放；
 - exact outcome可得：保存ToolResult；
@@ -512,7 +522,7 @@ SessionStorage replay：
 ## Error
 
 ```rust
-pub enum ToolExecutionError {
+pub(crate) enum ToolExecutionError {
     ToolUnavailable,
     InvalidArguments,
     HookFailed,
@@ -526,7 +536,13 @@ pub enum ToolExecutionError {
 }
 ```
 
-发生事实的module负责typed/redacted分类；SessionExecutor决定Turn继续或terminal。
+`ToolExecutionError`只在Tools implementation内部分类，不与`ToolExecutionOutcome`并列越过module seam。`ToolSet::execute`按实际阶段统一映射：
+
+- start前的Tool unavailable、invalid arguments、hook/policy/approval/Sandbox failure或Cancel → `Completed { source = PreExecution, result }`；
+- start后的exact executor failure/result → `Completed { source = Executed, result }`；
+- side effect可能已经发生且exact outcome未知 → `Abandoned`。
+
+无法保持Item/ToolCall correlation的internal invariant error不得伪造ToolResult；它投影为Abandoned并由Session Execution按typed diagnostic决定Turn failure。caller只match唯一terminal outcome enum。
 
 ## 对象清单
 
@@ -562,7 +578,7 @@ Tool grant store
 - active ToolSet immutable；
 - ToolCallId/ItemId职责分离；
 - schema/hook/policy/approval/Sandbox在side effect前；
-- start permit由ActiveTurnTask current owner发放；
+- Turn-scoped ToolExecutionControl只在ActiveTurnTask current scope内发放start permit；
 - permit不持久化；
 - Running Tooltruthful settle；
 - ToolResult recording失败不重放Tool；
@@ -580,16 +596,20 @@ Tool grant store
 
 - duplicate ToolName candidate失败；
 - disclosed route与executor同源；
+- executor不能伪造ItemId/ToolCallId，outcome identity与request exact match；
 - schema invalid/unknown Tool PreExecution result；
+- approval deny、Sandbox unavailable和cancel-before-start均返回matching PreExecution ToolResult；
 - Hook rewrite后重新验证；
 - approval allow/deny/family；
 - UserQuestion在mutation/start前；
+- ToolSet在task spawn前由captured control handle与Session-local queue完整构造；
 - ToolStartPermit只使用一次；
 - start permit vs Cancel/Security双向race；
 - Running Tool cancellation settlement；
 - exact result recording失败不重新执行；
 - outcome unknown Abandoned；
 - multi-call inverse completion；
+- 一个pre-execution deny与一个executed success仍按call_index闭合完整exchange；
 - final matching result形成ordered exchange；
 - missing/orphan result隔离，duplicate result first valid wins；
 - ToolResult与ToolAbandoned冲突first valid terminal outcome wins；
@@ -605,8 +625,9 @@ Tool grant store
 1. O1：Sandbox enforcement capability schema与pre-execution差集算法；
 2. production builtin Tool最小集合；
 3. `max_tool_result_bytes`和future blob handling；
-4. ToolStartPermit具体owner-local实现；
-5. provider-specific ToolResult error lowering。
+4. provider-specific ToolResult error lowering。
+
+ToolStartPermit使用actor message、owner-local CAS或等价private实现属于Session Execution内部选择；只要保持本节冻结的Turn-scoped handle、single-use permit和EmergencyControl first-wins interface，就不再是开放架构问题。
 
 ## 设计进度
 
@@ -617,6 +638,7 @@ Tool grant store
 - [x] policy/approval/UserQuestion/Sandbox顺序；
 - [x] Session-local file mutation queue；
 - [x] 删除durable ToolExecutionStarted和ToolRoundCompleted；
+- [x] 统一ToolCall/ToolExecutionRequest/ToolExecutionOutcome canonical owner与pre-execution result；
 - [x] complete Tool exchange自动projection；
 - [ ] O1 production Sandbox gate；
 - [ ] production implementation/tests。

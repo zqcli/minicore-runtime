@@ -5,6 +5,8 @@
 
 > 2026-07-30：Session-local file mutation queue与跨Session不协调规则保留；current Turn的ActiveTurnTask使用该queue，旧SessionExecutor single mutable owner表述由ADR 0126修订。
 
+> 2026-07-31：构造路径明确为SessionExecutor持有queue，并在Starting candidate capture时把同一`Arc<SessionFileMutationQueue>`连同Turn-scoped `ToolExecutionControl` handle注入ToolSet；ToolSet不在task spawn后补注入依赖。
+
 ## 背景
 
 模型可以在同一个 assistant step 中返回多个 ToolCall。若同一 Session 的两个 `edit` / `write` 调用并行读取同一个旧文件并分别写回，后完成的调用会覆盖先完成的修改。MiniCore 能完整控制这些 sibling ToolCall 的本地调度，因此需要给出确定性顺序。
