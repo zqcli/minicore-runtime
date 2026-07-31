@@ -263,13 +263,15 @@ retryable ModelCallError
 → verify Turn still Running
 → verify same control_generation
 → verify same ConversationRevision
-→ retain exact Arc<ModelCallRequest>
+→ retain exact same Arc<ModelCallRequest> produced by the ModelGateway-owned constructor
 → phase = RetryBackoff
 → select(cancel, security, lifecycle, sleep(delay))
 → next ModelGateway attempt
 ```
 
 AgentRun默认最多3次logical retry；CompactionSummary默认最多1次，错误分类和delay继续遵守ADR 0119。
+
+ActiveTurnTask不读取或复制request内部字段来建立第二份retry proof；request identity、control generation和ConversationRevision共同构成当前process内的重验basis。
 
 Steer在RetryBackoff期间只排队，不改变conversation revision；Cancel/SecurityRevoked立即使retry失效。旧provider future的结果路径必须在开始下一attempt前关闭。
 

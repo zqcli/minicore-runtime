@@ -24,6 +24,7 @@ TurnExecutionContext
 - ActiveTurnTask直接运行async Model→Tool→Model loop；
 - 不再存在同步AgentLoop或committed delta interface；
 - PromptSet从sanitized `LiveConversationView`组装模型输入；
+- `ModelCallRequest`由ModelGateway唯一拥有，Context只调用其private constructor；
 - `ConversationRevision`是current-process model-visible basis；
 - SessionRecorder不参与context correctness；
 - Steer复用同一TurnExecutionContext；
@@ -147,28 +148,30 @@ pub(crate) struct LiveConversationView {
 
 PromptSet不要求消息已经physical record。Model-visible mutation先更新LiveConversation并递增revision。
 
-## ModelCallRequest
+## ModelCallRequest Binding
 
-```rust
-pub(crate) struct ModelCallRequest {
-    model: Arc<TurnModelSnapshot>,
-    purpose: ModelCallPurpose,
-    context: Arc<AssembledModelContext>,
-    source_revision: ConversationRevision,
-    output_contract: OutputContract,
-    effective_max_output_tokens: u32,
-}
+`ModelCallRequest`的唯一canonical owner、完整字段和private constructor位于[ModelGateway](model-gateway.md#modelcallrequest)。Turn Execution Context不复制第二份struct，也不保存独立OutputContract或effective output limit。
+
+Context只负责把同一次capture产生的对象交给canonical constructor：
+
+```text
+Arc<TurnModelSnapshot>
++ ModelCallPurpose
++ Arc<AssembledModelContext>
++ source ConversationRevision
++ optional request max_output_tokens
+→ ModelCallRequest::new(...)
 ```
 
-由private constructor验证：
+cross-binding分工固定为：
 
-- model/context来自同一TurnExecutionContext；
-- purpose与OutputContract一致；
-- token limits闭合；
-- source revision等于assembly输入view；
-- ToolSpec与captured ToolSet一致。
+- TurnExecutionContext private constructor保证model、PromptSet和ToolSet来自同一次capture；
+- PromptSet保证ToolPromptView来自该ToolSet并生成crate-private assembly proof；
+- ModelCallRequest constructor验证purpose、exact TurnModelRef、source revision、OutputContract proof、Compaction budget proof和request max output limit；
+- ordinary AgentRun允许`input.output_contract = None`和`max_output_tokens = None`；
+- CompactionSummary必须使用plan固定的`Some(NonZeroU32)` request max output。
 
-logical retry移动并复用同一个`Arc<ModelCallRequest>`，不重新assemble。Session record head或EntryId不参与retry proof。
+logical retry移动并复用同一个`Arc<ModelCallRequest>`，不重新assemble或复制request字段。Session record head或EntryId不参与retry proof。
 
 ## Async Loop Contract
 
@@ -177,7 +180,7 @@ ActiveTurnTask直接使用Context：
 ```text
 LiveConversationView
 → PromptSet.assemble
-→ ModelCallRequest::new
+→ ModelGateway-owned ModelCallRequest::new
 → await ModelGateway
 → validated FinalizedAssistantResponse
 → live Assistant mutation
@@ -273,8 +276,10 @@ restart后：
 - Prompt source变化或cache eviction不改变active PromptContent，assemble不执行正文I/O；
 - SkillIntent只从captured SkillView解析；exact authorization在composition前验证，最终message只保留safe part-level stamp；
 - Prompt ToolSpec与Tool execution route一致；
-- ModelCallRequest source revision与assembly一致；
-- retry复用exact request；
+- ModelCallRequest constructor拒绝purpose/model/source revision/OutputContract proof不一致；
+- ordinary AgentRun可用`output_contract = None`和`max_output_tokens = None`构造；
+- Structured、NoToolCalls和CompactionSummary使用同一个canonical request type；
+- retry复用exact same `Arc<ModelCallRequest>`；
 - Steer复用Context但递增conversation revision；
 - FollowUp重新capture；
 - Compaction Replace后同一Context继续运行；
