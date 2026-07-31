@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128冻结Prompt content materialization；ADR 0129冻结用户消息contribution与safe provenance；生产实现待启动。 |
+| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128/0129/0130冻结Prompt content与async contribution composition；ADR 0131冻结conversation-only owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；生产实现待启动。 |
 
 权威顺序：本文与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -183,7 +183,9 @@ retryable terminal ModelCallError
 
 ## Compaction
 
-ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/ModelGateway路径生成summary。验证后先Replace live conversation，再inline attempt record `StoredCompaction`。marker未写入时，restart恢复未压缩的旧conversation；这是best-effort recording允许的降级。
+ActiveTurnTask从live reducer在同一revision取得ordinary `LiveConversationView`和额外的`LiveCompactionSourceView`。后者按EntryId-bearing provider-valid stable units表达User、Assistant、complete Tool exchange和leading rolling summary；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
+
+Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summary assembly bases和同一TurnModelSnapshot estimator/limits，从`source + cut index`派生summary prefix、retained suffix和single `first_kept_entry_id`，不按message equality反查。summary调用仍经过PromptSet/ModelGateway；automatic marker保存完整safe model-call provenance。验证后先分配Compaction EntryId并Replace live conversation，再inline attempt record `StoredCompaction`。marker未写入时restart恢复未压缩旧conversation；这是best-effort recording允许的降级。
 
 ## 状态与观察
 
@@ -204,6 +206,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
 | INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
+| INV-005 | Compaction source由live reducer按Session/revision发布EntryId-bearing stable units；plan从source+cut派生marker，apply要求exact control/plan/request/revision并在record前安装new summary origin | [Compaction · Live Replace与Recording](modules/compaction.md#live-replace与recording) |
 | INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
 | INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
 | INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象；PromptContent在capture前已materialize，Turn执行不解析source locator | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
@@ -230,6 +233,9 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 
 核心当前决策：
 
+- [ADR 0132：Compaction从revision-bound stable units派生marker](adr/0132-compaction-derives-markers-from-live-stable-units.md)
+- [ADR 0131：Conversation Recording不保存Session definition/lifecycle](adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)
+- [ADR 0130：用户消息composition异步解析captured Skill](adr/0130-user-message-composition-resolves-skills-asynchronously.md)
 - [ADR 0129：用户消息贡献使用part-level安全provenance](adr/0129-user-message-contributions-use-part-level-safe-provenance.md)
 - [ADR 0128：Prompt content在publication前materialize](adr/0128-prompt-content-is-materialized-before-publication.md)
 - [ADR 0127：Session recording不保存Turn lifecycle](adr/0127-session-recording-omits-turn-lifecycle.md)
