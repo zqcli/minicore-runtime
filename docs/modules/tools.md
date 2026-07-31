@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构（第四轮Tool contract收口后，生产实现待启动）
+状态：当前权威架构（ADR 0133后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -221,9 +221,18 @@ pub struct ToolResult {
     pub content: ToolResultContent,
     pub details: Option<Value>,
 }
+
+pub enum ToolResultDisposition {
+    Succeeded,
+    Failed,
+    Denied,
+    Cancelled,
+}
 ```
 
-这三个execution类型的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
+`Succeeded`要求executor产生exact successful business result；`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`。
+
+这三个execution类型及`ToolResultDisposition`的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
 
 Raw ToolExecutor只返回业务payload、disposition或typed internal failure，不能选择ItemId/ToolCallId，也不能直接构造public outcome。ToolSet private outcome constructor从`ToolExecutionRequest`复制identity，并保证Completed中的`result.tool_call_id`与`request.call.tool_call_id`一致；mismatch属于internal invariant failure，不进入live reducer。
 
@@ -709,6 +718,7 @@ Tool grant store
 - disclosed route与executor同源；
 - executor不能伪造ItemId/ToolCallId，outcome identity与request exact match；
 - schema invalid/unknown Tool PreExecution result；
+- ToolResultDisposition closed mapping：Succeeded/Failed/Denied/Cancelled，unknown outcome只能Abandoned；
 - approval deny、Sandbox unavailable和cancel-before-start均返回matching PreExecution ToolResult；
 - Hook rewrite后重新验证；
 - approval allow/deny/family；
