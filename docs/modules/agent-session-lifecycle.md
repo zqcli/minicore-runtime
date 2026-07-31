@@ -830,7 +830,7 @@ unload不修改durable Session lifecycle或SessionDefinitionRevision。若grace 
 Loaded
 → LifecycleControl::PrepareForUnload(grace_deadline)
 → stop new Submit/Steer/FollowUp admission
-→ reject pending TurnAdmission requests
+→ reject queued Submit admissions并从QueueView移除其CommandId
 → clear queued Steer/FollowUp并完成其typed outcome
 → grace期内允许active admission/Turn自然完成，继续处理Interaction resolution和truthful Tool outcome
 → deadline到期仍未Idle：Cancel active pre-Turn Submit或Turn，并以Cancelled关闭Pending Interaction
