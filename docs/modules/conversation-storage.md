@@ -65,7 +65,31 @@ SessionStorage
 └─ stage recorded-path or live-snapshot Fork
 ```
 
-Live reducer拥有domain validation和当前进程conversation。Recorder只接受private constructors创建的immutable `StoredSessionEntry`，不重新决定Model/Tool协议。
+Live reducer拥有domain validation、EntryId allocation和当前进程conversation。Recorder只接受private constructors创建的immutable `StoredSessionEntry`，不重新决定Model/Tool协议或identity。
+
+## EntryId Ownership
+
+```rust
+pub(crate) struct EntryIdGenerator {
+    // private algorithm + collision guard
+}
+
+impl EntryIdGenerator {
+    pub fn allocate(&mut self) -> EntryId;
+}
+```
+
+`EntryIdGenerator`由`LiveSessionState`私有持有，不暴露给SessionRecorder、Tool、ModelGateway、Prompt或Runtime adapter。owner规则：
+
+- domain validation成功后、live apply之前分配EntryId；
+- ordinary mutation的`parent_id`同时绑定当前live selected head；
+- generated ID立即登记到collision guard，同一loaded instance内不复用；
+- replay初始化时用文件中全部first-valid EntryId seed guard，不只使用selected model-visible path；
+- loaded Fork child用已经materialize到target的全部copied EntryId seed guard，future entry分配fresh ID；
+- Degraded时generator继续工作，recording failure不改变已经进入live Item/Interaction/Compaction的identity；
+- EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。
+
+UUID/ULID算法、文本编码和serde wire由后续ID schema freeze决定。Recorder只验证entry identity已经存在且relation合法，不能创建、替换或规范化EntryId。
 
 ## Live Mutation And Recording
 
@@ -73,7 +97,7 @@ Live reducer拥有domain validation和当前进程conversation。Recorder只接�
 
 ```text
 validate live mutation
-→ allocate stable IDs
+→ LiveSessionState.EntryIdGenerator.allocate + bind parent_id
 → apply LiveSessionState
 → increment ConversationRevision when model-visible
 → await SessionRecorder.record(entry)
@@ -108,7 +132,7 @@ pub(crate) struct ConversationRevision(u64);
 - ModelCallRequest和CompactionPlan捕获exact revision；
 - revision是process-local执行basis，不写入JSONL，不跨restart比较。
 
-EntryId继续存在，但只承担history identity和引用。
+EntryId继续存在，但只承担history identity和引用。ConversationRevision承担process-local model-visible basis；两者不能互相派生。
 
 ## SessionRecorder
 
@@ -282,7 +306,7 @@ pub enum StoredEntryBody {
 }
 ```
 
-每行immutable。EntryId在live apply时分配，Recorder不能改写。
+每行immutable。EntryId由live owner在apply前分配并进入collision guard，Recorder不能创建或改写。
 
 ## Stored Message
 
@@ -532,6 +556,9 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 - Create的SessionHeader staging失败或publication前crash不产生catalog-visible Session；
 - Load始终尝试初始化Recorder，失败得到Degraded而不是Disabled；
+- live owner在apply前分配EntryId，Recorder观察到exact same ID；
+- replay与Fork copied IDs正确seed collision guard，future ID不碰撞；
+- Degraded状态继续分配ID且不复用未publish ID；
 - recorder按live mutation顺序inline写出；
 - encode/write failure后停止suffix，replay保持有效完整行前缀；
 - recording failure不阻止Model/Tool/Interaction/terminal；
@@ -553,4 +580,4 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 开放问题
 
-ID wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。Recording state wire由Q2关闭，Degraded recovery由Q5关闭，Fork source由Q6关闭，强制记录且无Disabled policy由Q7关闭；Recorder其余问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Recording state wire由Q2关闭，Degraded recovery由Q5关闭，Fork source由Q6关闭，强制记录且无Disabled policy由Q7关闭；Recorder其余问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

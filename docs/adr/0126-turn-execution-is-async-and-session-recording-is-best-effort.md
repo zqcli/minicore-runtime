@@ -55,14 +55,15 @@ Rig继续只实现`ModelGateway` private `ProviderAdapter`的单次provider atte
 - StateEvent和Snapshot描述live state，不承诺已fsync或可在crash后恢复；
 - process crash后只恢复SessionRecorder实际留下的完整JSONL前缀。
 
-`LiveSessionState`通过private typed methods修改。实现可以使用`Arc<Mutex<LiveSessionState>>`或等价actor-owned state，但任何live-state guard不得跨Model、Tool、filesystem、provider或Interaction await。
+`LiveSessionState`通过private typed methods修改，并私有持有唯一Session-scoped `EntryIdGenerator`。实现可以使用`Arc<Mutex<LiveSessionState>>`或等价actor-owned state，但任何live-state guard不得跨Model、Tool、filesystem、provider或Interaction await。
 
 ### 3. SessionRecorder
 
 `SessionWriter`被`SessionRecorder`取代。每个loaded Session拥有一个有序inline best-effort recorder：
 
 ```text
-validate live mutation and allocate stable IDs
+validate live mutation
+→ LiveSessionState.EntryIdGenerator allocates EntryId and binds parent_id
 → apply to LiveSessionState
 → build immutable StoredSessionEntry
 → await SessionRecorder.record(entry)
@@ -76,7 +77,7 @@ validate live mutation and allocate stable IDs
 Recorder必须满足：
 
 1. 每个loaded Session只有一个有序append seam，record order来自SessionExecutor/ActiveTurnTask的domain mutation ownership，不依赖mutex竞争顺序；
-2. 记录格式仍是header + by-entry JSONL；
+2. 记录格式仍是header + by-entry JSONL；Recorder只接受已经具有稳定EntryId的immutable entry，不能创建或改写identity；
 3. 第一次encode、lease、create、append、partial/unknown write失败后进入`RecordingHealth::Degraded`；
 4. Degraded后停止该loaded Session的后续entry append，避免在已知缺口后继续写suffix；
 5. failure产生redacted diagnostic，不能把Session置为Unavailable，不能终止active Turn；
@@ -102,7 +103,9 @@ MVP不提供recording policy、`Disabled`或ephemeral Session。Session Create�
 
 实现应使用async filesystem API。仅Recorder自身用于保护单文件handle的async mutex可以跨append await；任何`LiveSessionState`、Session phase或Tool control guard都必须先释放。RecordingHealth通过独立immutable view发布，使Snapshot不等待file write。不同Session不能共享Recorder锁。
 
-MVP保持单producer domain ownership：Starting/Idle recordable mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction request/resolution发生在对应task等待期间。新增并发record producer前必须设计显式domain sequencing，不能用async mutex acquisition顺序定义history。
+MVP保持单producer domain ownership：Starting/Idle recordable mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction request/resolution发生在对应task等待期间。所有路径都必须通过同一个`LiveSessionState` private mutation seam分配EntryId；SessionExecutor和ActiveTurnTask不能各自保存generator。新增并发record producer前必须设计显式domain sequencing，不能用async mutex acquisition顺序定义history。
+
+Replay以文件中全部first-valid EntryId初始化collision guard；loaded Fork target以全部copied EntryId初始化child generator。Degraded不停止ID分配，EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。具体UUID/ULID算法和文本wire留到ID schema freeze。
 
 ### 4. Observe与记录顺序
 
@@ -220,7 +223,7 @@ Fork释放source guard后再创建target staging record stream。selected path�
 
 ## 跨模块不变量变更
 
-- `INV-001`改为live mutation先apply，再完成inline record attempt，随后final publication/protocol continuation；record outcome不提供durable execution permit；
+- `INV-001`改为live owner在apply前分配稳定EntryId并绑定parent，live mutation先apply，再完成inline record attempt，随后final publication/protocol continuation；Recorder不得改写identity；
 - `INV-002`保留tolerant replay，并明确只恢复recorded prefix；
 - `INV-003`canonical owner移动到live conversation reducer，cold projector只负责恢复期sanitization；
 - `INV-004`新增Fork source规则：loaded使用同一LiveSnapshot解析anchor并复制path，unloaded使用RecordedHistory，source kind进入durable provenance和command outcome；
@@ -262,6 +265,8 @@ Fork释放source guard后再创建target staging record stream。selected path�
 - Session Create严格stage SessionHeader，失败或publication前crash不发布partial Session；
 - 每次Load都尝试初始化Recorder，初始化失败建立Degraded loaded Session；
 - ordinary async Model→Tool→Model loop；
+- live owner在apply前分配EntryId，Recorder观察exact same ID；
+- replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
 - parallel Tool completion形成ordered complete exchange；
 - incomplete exchange永不进入下一次Model；
 - inline recorder按live mutation顺序写出；

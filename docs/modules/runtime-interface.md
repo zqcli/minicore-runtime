@@ -160,7 +160,7 @@ MiniCoreRuntime
 - `AgentRevision`：immutable AgentDefinition revision；
 - `SessionDefinitionRevision`：future Turn definition的原子revision；
 - `ToolCallId`：ModelGateway adapter归一化的provider/tool protocol correlation，不替代ItemId；协议无原生ID时生成response-local opaque ID，只要求同一assistant response内唯一；
-- `EntryId`：SessionStorage tree identity，默认不作为普通UI mutation input；Fork复制历史EntryId，因此其唯一性scope是Session；
+- `EntryId`：Session history tree identity，由`LiveSessionState` private Session-scoped generator在apply前分配并由Recorder原样保存；默认不作为普通UI mutation input；Fork复制历史EntryId，因此其唯一性scope是Session；
 - `CommandId`：public command correlation和in-flight dedup identity；Submit的CommandId同时标识领域Turn创建前的process-local admission candidate；
 
 不公开：
@@ -1268,15 +1268,21 @@ prepared Tool args、executor handle、sandbox internals和credential不进入ev
 Session message/history tree由MiniCore内部管理：
 
 ```text
-SessionStorage
-├─ owns EntryId + parent_id immutable tree
-├─ owns current physical entry and tolerant replay
-├─ strict-validates live append
-├─ isolates invalid replay references and emits diagnostics
-└─ produces sanitized trusted projections
+LiveSessionState
+├─ owns Session-scoped EntryIdGenerator and current live selected head
+├─ validates domain mutation and binds EntryId + parent_id before apply
+└─ preserves identity when recording is Degraded
 
-SessionExecutor
-├─ applies live mutation → attempts record
+SessionRecorder
+└─ validates immutable entry identity/relation, then encode/append without rewriting ID
+
+SessionStorage
+├─ owns recorded EntryId + parent_id tree, tolerant replay and fork staging
+├─ isolates invalid replay references and emits diagnostics
+└─ produces recorded history/read projections
+
+SessionExecutor / ActiveTurnTask
+├─ invokes LiveSessionState private mutation methods
 ├─ owns active Turn mutation ordering
 └─ requests SessionStorage history/fork operations
 
@@ -1288,7 +1294,7 @@ MiniCoreRuntime
 UI不能：
 
 - 直接读取或修改JSONL；
-- 直接指定任意EntryId作为recorded parent；
+- 直接指定任意EntryId作为recorded parent或要求Recorder分配/改写ID；
 - 追加raw message；
 - 补写ToolResult、猜测parent或重写中段损坏entry；
 - 删除历史entry；

@@ -48,6 +48,9 @@ PromptSet可消费的sanitized只读view。只包含provider-valid messages；in
 **ConversationRevision**：
 process-local单调版本，每次model-visible live mutation递增。ModelCallRequest、logical retry和CompactionPlan使用它验证stale result。它不持久化，不跨restart比较。
 
+**EntryIdGenerator**：
+`LiveSessionState`私有持有的Session-scoped identity generator。domain validation后、live apply前分配EntryId并绑定parent_id；replay/Fork copied IDs用于collision guard。Degraded不影响分配，Recorder不能创建或改写ID。
+
 **SessionRecorder**：
 每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append当前JSONL line，不使用后台task或queue，也不提供durable commit receipt。
 
@@ -61,7 +64,7 @@ Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严
 负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
-SessionRecorder可能写入的一条immutable JSONL record。使用EntryId和parent_id形成recorded history tree。EntryId在live apply时分配，Recorder不能改写。
+SessionRecorder可能写入的一条immutable JSONL record。使用EntryId和parent_id形成recorded history tree。EntryId由live owner在apply前分配，Recorder不能创建或改写。
 
 **Recorded prefix**：
 process crash或recording degradation后实际留在JSONL中的完整行前缀。restart只能恢复该prefix，未record live tail永久丢失。
@@ -241,7 +244,7 @@ writer-poisoned Session Unavailable
 
 - wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredTurnStart/StoredCompaction；
 - Prompt Q1/Q4：PromptContent representation与contribution stamp字段；
-- EntryId generator owner；
+- EntryId算法与public文本wire；
 - cold recovery closure是否record；
 - Rig 0.40.0 provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。

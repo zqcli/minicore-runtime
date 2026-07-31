@@ -117,8 +117,8 @@ Context不拥有：
 SessionExecutor reserves candidate TurnId/control_generation
 → capture TurnExecutionContext
 → compose Input
-→ LiveSessionState.start_turn(...)
-→ allocate EntryId and increment ConversationRevision
+→ LiveSessionState validates start + allocates EntryId + binds parent_id
+→ apply start_turn(...) and increment ConversationRevision
 → await SessionRecorder.record(Input + StoredTurnStart)
 → publish TurnStarted
 → spawn ActiveTurnTask with same Arc<TurnExecutionContext>

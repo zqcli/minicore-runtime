@@ -68,7 +68,7 @@ MiniCoreRuntime
 - safe-point Steer消费；
 - terminal candidate和settlement。
 
-`LiveSessionState`保存当前进程的conversation、Turn、Item、Interaction和usage read model。实现可以使用短锁或actor methods；guard不得跨await。SessionExecutor和ActiveTurnTask不能保存两份独立mutable conversation。
+`LiveSessionState`保存当前进程的conversation、Turn、Item、Interaction、usage read model和private Session-scoped `EntryIdGenerator`。实现可以使用短锁或actor methods；guard不得跨await。SessionExecutor和ActiveTurnTask不能保存两份独立mutable conversation，也不能各自拥有ID generator。
 
 每个Session最多一个ActiveTurnTask。同一个Runtime中的不同Session可以同时Running。
 
@@ -163,6 +163,7 @@ Submit accepted by control actor
 → reserve TurnId and control_generation
 → capture TurnExecutionContext
 → compose CanonicalUserMessage
+→ LiveSessionState validates + allocates EntryId + binds parent_id
 → apply live Input + StoredTurnStart
 → await SessionRecorder.record(entry)
 → publish TurnStarted
@@ -219,7 +220,7 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
 
 ```text
 validate Turn/control_generation/conversation_revision
-→ allocate IDs
+→ LiveSessionState allocates EntryId and binds parent_id
 → apply LiveSessionMutation
 → await recorder.record(StoredSessionEntry)
 → publish final StateEvent or continue protocol
@@ -231,6 +232,8 @@ validate Turn/control_generation/conversation_revision
 
 - record成功前暂存另一份“pending committed conversation”；
 - recording failure后重新执行Model或Tool；
+- 让SessionRecorder创建、替换或规范化EntryId；
+- 从JSONL line number、storage ordinal或ConversationRevision派生EntryId；
 - 从cold projector取得live推进permit；
 - 让UI event反向修改live state。
 
@@ -467,6 +470,8 @@ open recorded Session and attempt writable lease
 - 每Session最多一个ActiveTurnTask；
 - 多Session并发Model calls；
 - ordinary Model→Tool→Model async flow；
+- 所有recordable mutation由同一LiveSessionState generator分配EntryId；
+- Degraded继续分配ID，Recorder看到的ID与live Item/Interaction/Compaction一致；
 - parallel Tool completion与ordered complete exchange；
 - Steer safe-point和final arbitration；
 - Interaction oneshot与Cancel；
@@ -480,4 +485,4 @@ open recorded Session and attempt writable lease
 
 ## 开放问题
 
-RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭，所有Session强制尝试记录且无Disabled policy已由Q7关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。
+RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭，所有Session强制尝试记录且无Disabled policy已由Q7关闭，EntryId owner已由Q9关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。
