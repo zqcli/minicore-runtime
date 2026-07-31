@@ -360,7 +360,7 @@ effective headroom
 - Recommended情况下若count耗尽或没有满足minimum reclaim的prefix，caller保留已经valid的ordinary AgentRun并发布diagnostic，不把它升级为Turn failure；
 - checked add overflow视为Required；若随后无法plan则fail closed。
 
-`max_compactions_per_turn`统计已经安装为current Compaction operation并将启动summary logical call chain的次数。ActiveTurnTask在plan通过、安装exact plan/request ownership之后，第一次Gateway调用前递增。一次CompactionSummary logical retry不增加该计数；纯pressure/plan失败不增加。
+`max_compactions_per_turn`统计已经成功assemble immutable summary request、并把exact plan/request安装为current Compaction operation而即将启动summary logical call chain的次数。ActiveTurnTask在该原子task-local安装点递增，随后才允许第一次Gateway调用。一次CompactionSummary logical retry不增加该计数；pressure、plan、Prompt assembly或ModelCallRequest construction失败均不增加。
 
 ## Prefix Cut与Budget
 
@@ -551,8 +551,9 @@ exact next AgentRun pressure/ContextOverflow
 → capture LiveCompactionSourceView + Turn bases
 → Compaction::pressure
 → Compaction::plan
-→ install exact plan/current operation and increment per-Turn count
-→ assemble CompactionSummary request
+→ assemble CompactionSummary + immutable ModelCallRequest
+→ atomically install exact plan/request as current task-local operation
+   and increment per-Turn count
 → await ModelGateway
 → optional one logical retry with same request
 → validate same Turn/control/session/revision/plan/request

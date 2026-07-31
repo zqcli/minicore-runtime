@@ -14,6 +14,7 @@ remote: https://github.com/zqcli/minicore-runtime.git
 latest completed Compaction contract commits:
 bdad432 docs: define compaction stable-unit contract
 8045342 docs: bind compaction consumers to stable units
+48c4b01 docs: close compaction implementation gate
 ```
 
 分支名保留创建时的`eventual-session-log`历史命名；当前权威设计已经收窄为inline best-effort append，以ADR 0126和current modules为准。

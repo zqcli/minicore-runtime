@@ -212,15 +212,8 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
         turn.check_emergency()?;
         turn.consume_one_safe_point_steer().await?;
 
-        let context = turn.prompt_set.assemble(
-            turn.live_conversation.sanitized_view(),
-            ModelCallPurpose::AgentRun,
-        )?;
-        let request = Arc::new(ModelCallRequest::new(
-            turn.model.clone(),
-            context,
-        )?);
-
+        let conversation = turn.live_conversation.sanitized_view();
+        let request = turn.build_agent_run_request(&conversation)?;
         let response = turn.call_model_with_logical_retry(request).await?;
 
         if response.has_tool_calls() {
@@ -238,6 +231,8 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
     }
 }
 ```
+
+`build_agent_run_request()`只是ActiveTurnTask private convenience：它调用同一`TurnExecutionContext::assemble_agent_run(&conversation)`，随后使用ModelGateway唯一拥有的constructor传入exact `Arc<TurnModelSnapshot> + ModelCallPurpose::AgentRun + Arc<AssembledModelContext> + conversation.revision + None`。它不定义第二个request DTO，也不省略source revision/output-limit语义。
 
 这里的`await`不表示ActiveTurnTask可以任意写Session。所有live mutation仍通过`LiveSessionState` private typed methods；所有recording只通过`SessionRecorder`。调用`record().await`前必须释放live-state guard。
 
@@ -441,9 +436,9 @@ exact next AgentRun pressure/Prompt ContextOverflow/provider ContextOverflow
 → release live-state guard
 → context.compaction_pressure(source, trigger, compactions_started)
 → context.plan_compaction(exact source, trigger, compactions_started)
-→ install exact Arc<CompactionPlan> as current task-local operation
 → assemble CompactionSummary + Arc<ModelCallRequest>
-→ increment compactions_started before first Gateway call
+→ atomically install exact Arc<CompactionPlan> + Arc<ModelCallRequest>
+   as current task-local operation and increment compactions_started
 → phase Compacting
 → call ModelGateway with at most one logical retry using same request
 → verify exact Turn/control/session/revision/plan/request and no winning emergency

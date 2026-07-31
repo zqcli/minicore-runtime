@@ -148,7 +148,7 @@ LiveConversationView {
 
    summary source中的大ToolResult可以按`CompactionSummaryFormatVersion`执行确定性reduction，但durable/live ToolResult不改写，Tool exchange unit不拆分。没有可行candidate时返回typed Compaction error；ModelGateway不clamp。
 
-8. `max_compactions_per_turn`计算已经安装为current Compaction operation、即将开始summary logical call chain的次数。ActiveTurnTask在plan通过并安装operation后、第一次Gateway调用前递增；同一request的一次logical retry不再计数。纯planning失败不计数。Recommended Compaction不可行且ordinary AgentRun仍valid时可以跳过并发布diagnostic；Required Compaction不可行时Turn按ContextOverflow failure收口。
+8. `max_compactions_per_turn`计算已经成功assemble immutable summary request，并把exact plan/request安装为current Compaction operation、即将开始summary logical call chain的次数。ActiveTurnTask在该原子task-local安装点递增，随后才允许第一次Gateway调用；同一request的一次logical retry不再计数。pressure、planning、Prompt assembly或request construction失败均不计数。Recommended Compaction不可行且ordinary AgentRun仍valid时可以跳过并发布diagnostic；Required Compaction不可行时Turn按ContextOverflow failure收口。
 
 9. automatic SummaryModel路径的唯一provenance schema由Compaction拥有：
 
