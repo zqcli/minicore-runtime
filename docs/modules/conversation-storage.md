@@ -419,7 +419,9 @@ pub struct StoredCompaction {
 }
 ```
 
-recorded marker只影响future replay。live Replace在inline record attempt前已经生效。marker缺失时restart恢复旧conversation；marker存在但无法安全应用时replay忽略并报告diagnostic。
+`StoredCompactionModelCall`的唯一semantic定义位于[Compaction](compaction.md#summary-validation与provenance)。automatic SummaryModel路径始终为`Some`；Conversation Storage只负责format-v1 encoder/decoder，不复制另一份provenance projection。wire casing、字段长度和bounded decode仍由V4-P1-2冻结。
+
+recorded marker只影响future replay。live Replace在inline record attempt前已经生效。marker缺失时restart恢复旧conversation；marker存在但无法在当前effective stable-unit projection上匹配index大于0的unit `first_entry_id`时，replay忽略并报告diagnostic。`None`只在当前effective conversation非空时表示覆盖全部units。
 
 ## History Tree
 
@@ -479,6 +481,18 @@ pub(crate) struct ReplayedConversationView {
 ```
 
 PromptSet可消费两者共同实现的private sanitized view interface。它们都保证provider-valid Tool exchange，但只有Live view参与当前Turn execution。
+
+Compaction通过同一个live reducer取得额外的crate-private projection：
+
+```rust
+impl LiveSessionState {
+    pub(crate) fn compaction_source_view(
+        &self,
+    ) -> Arc<LiveCompactionSourceView>;
+}
+```
+
+`LiveCompactionSourceView`及stable-unit shape由[Compaction](compaction.md#stable-unit-source)唯一拥有。reducer负责把ordinary User、无ToolCall Assistant、完整Assistant+ToolResults exchange和leading rolling summary分组成exact EntryId-bearing units；Compaction负责估算和cut。每个rolling summary unit的origin是安装它的外层StoredCompaction entry ID，Tool exchange只能以Assistant entry作为marker boundary。该projection与ordinary `LiveConversationView`在同一次短guard内从同一revision构造，guard在planning或任何await前释放。
 
 不再存在`CommittedConversationView`或storage签发的推进permit。
 
@@ -577,7 +591,9 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - malformed/duplicate/orphan/partial-tail replay；
 - malformed、unknown或越界contribution stamp被丢弃；同一part重复stamp first valid wins；合法UserMessage正文继续恢复；
 - complete/incomplete/duplicate/conflicting Tool exchange；
-- compaction marker missing/invalid；
+- compaction marker missing/invalid/指向第一个unit或ToolResult内部时忽略；
+- duplicate identical messages仍按stable-unit EntryId定位exact marker；
+- repeated rolling summary使用前一StoredCompaction outer EntryId作为source origin；
 - fork历史ID保留和future ID无collision；
 - loaded Fork包含snapshot capture前已apply的unrecorded tail，unloaded Fork只复制RecordedHistory；
 - live mutation apply后、record attempt返回前Fork仍使用LiveSnapshot包含该mutation；
@@ -592,4 +608,4 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 开放问题
 
-EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、StoredCompaction format-v1 casing/limits、diagnostic总量上限和format migration仍需freeze。Compaction stable-unit source、marker replay和automatic model-call semantic fields已由ADR 0132关闭；EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

@@ -51,7 +51,7 @@ Session current definition
 → Arc<TurnExecutionContext>
 ```
 
-所有对象必须来自同一次admission capture。capture完成后：
+所有对象必须来自同一次admission capture。Runtime-global validated `CompactionSettings`也在该点clone为immutable `CompactionSettingsSnapshot`；MVP不在active Turn中读取current config、per-Session override或hot-reloaded policy。capture完成后：
 
 - Agent新revision不影响active Turn；
 - SessionDefinition update只在Idle并只影响future Turn；
@@ -94,6 +94,20 @@ impl TurnExecutionContext {
         &self,
         conversation: &LiveConversationView,
     ) -> Result<Arc<AssembledModelContext>, PromptError>;
+
+    pub fn compaction_pressure(
+        &self,
+        source: &LiveCompactionSourceView,
+        trigger: CompactionTrigger,
+        compactions_started: u8,
+    ) -> CompactionPressure;
+
+    pub fn plan_compaction(
+        &self,
+        source: Arc<LiveCompactionSourceView>,
+        trigger: CompactionTrigger,
+        compactions_started: u8,
+    ) -> Result<Arc<CompactionPlan>, CompactionError>;
 
     pub fn assemble_compaction(
         &self,
@@ -150,6 +164,8 @@ pub(crate) struct LiveConversationView {
 - deterministic ordering。
 
 PromptSet不要求消息已经physical record。Model-visible mutation先更新LiveConversation并递增revision。
+
+Compaction使用同一个reducer在同一短guard内产生的`Arc<LiveCompactionSourceView>`。该view额外携带SessionId、revision和EntryId-bearing stable units，但不携带token estimate或settings。TurnExecutionContext不构造stable units；它只验证source Session/revision并用captured PromptSet、model和settings构造[Compaction完整private input](compaction.md#module-interface)。ordinary assembly仍只看到`LiveConversationView`。
 
 ## ModelCallRequest Binding
 
@@ -236,20 +252,24 @@ Interaction request绑定Context中的exact ToolSet和Workspace policy，但Pend
 
 ## Compaction
 
-ActiveTurnTask使用同一Context中的PromptSet、model和TokenEstimator：
+ActiveTurnTask从LiveSessionState取得revision-bound stable-unit source，但不直接拼装settings/model/Prompt scalar。它只把source、trigger和本Turn`compactions_started`交给同一个Context：
 
 ```text
-sanitized LiveConversationView
-→ Compaction::plan(source_revision)
-→ context.assemble_compaction(plan)
+LiveSessionState.compaction_source_view()
+→ context.compaction_pressure(source, trigger, count)
+→ context.plan_compaction(source, trigger, count)
+   ├─ captured CompactionSettingsSnapshot
+   ├─ same PromptSet AgentRun/Summary assembly bases
+   └─ same TurnModelSnapshot model basis/TokenEstimator
+→ context.assemble_compaction(exact plan)
 → ModelCallRequest::new(CompactionSummary)
 → await ModelGateway
-→ validate same control_generation/revision
-→ apply live Replace
+→ validate same Turn/control/session/revision/plan/request
+→ live owner applies plan-derived Replace
 → await inline record StoredCompaction attempt
 ```
 
-recording marker不是Replace生效条件。Compaction后继续使用同一TurnExecutionContext，不需要rebuild AgentLoop。
+`compaction_pressure()`和`plan_compaction()`是exact capture façade：内部构造Compaction canonical `PressureInput/PlanInput`，不向ActiveTurnTask暴露可跨Context拼接的basis fields。plan marker只能由stable-unit cut派生。recording marker不是Replace生效条件；Compaction后继续使用同一TurnExecutionContext，不需要rebuild loop。
 
 ## Cancel与SecurityRevoked
 
@@ -293,6 +313,8 @@ restart后：
 - retry复用exact same `Arc<ModelCallRequest>`；
 - Steer复用Context但递增conversation revision；
 - FollowUp重新capture；
+- Compaction pressure/plan只能由Context用captured settings、Prompt bases和model basis构造，不能跨Turn拼接；
+- duplicate message、ToolExchange和rolling summary source通过EntryId-bearing stable units形成exact marker；
 - Compaction Replace后同一Context继续运行；
 - recording degraded不改变Context；
 - restart不恢复Context。

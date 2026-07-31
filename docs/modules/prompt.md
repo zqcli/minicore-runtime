@@ -587,33 +587,46 @@ pub enum PromptAssemblyInput<'a> {
         output_contract: Option<&'a OutputContract>,
     },
     CompactionSummary {
-        source: &'a LiveCompactionSourceView,
+        source: &'a CompactionSummarySourceView,
         directive: &'a CompactionSummaryDirective,
     },
 }
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`LiveConversationView`只能由live conversation reducer构造，并已隔离orphan/incomplete Tool exchange；cold replay产生的sanitized view通过同一个private只读interface进入future Turn。`LiveCompactionSourceView`只能由Compaction按provider-valid prefix cut构造，包含待摘要prefix和exact retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，Compaction规则见[Compaction](compaction.md)。
+variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`LiveConversationView`只能由live conversation reducer构造，并已隔离orphan/incomplete Tool exchange；cold replay产生的sanitized view通过同一个private只读interface进入future Turn。`CompactionSummarySourceView`只能由exact `CompactionPlan`从reducer-owned stable-unit prefix派生，包含待摘要prefix的确定性reduced representation，不包含retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，stable units、cut与marker规则见[Compaction](compaction.md#stable-unit-source)。
 
-`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和sanitized live prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
+`CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和sanitized reduced prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
-planning前，SessionExecutor从同一个PromptSet取得窄的固定开销basis：
+planning前，TurnExecutionContext从同一个PromptSet取得两个窄的固定开销basis：
 
 ```rust
-pub struct CompactionSummaryAssemblyBasis {
-    pub fixed_prompt_tokens: u64,
-    pub system_sections: Arc<[PromptSection]>,
-    pub output_contract: OutputContract,
+pub(crate) struct AgentRunCompactionAssemblyBasis {
+    fixed_input_tokens: u64,
+    rolling_summary_message_overhead_tokens: u64,
+    estimator: TokenEstimator,
+}
+
+pub(crate) struct CompactionSummaryAssemblyBasis {
+    fixed_prompt_tokens: u64,
+    system_sections: Arc<[PromptSection]>,
+    output_contract: OutputContract,
+    estimator: TokenEstimator,
 }
 
 impl PromptSet {
+    pub(crate) fn agent_run_compaction_assembly_basis(
+        &self,
+    ) -> AgentRunCompactionAssemblyBasis;
+
     pub(crate) fn compaction_summary_assembly_basis(
         &self,
     ) -> CompactionSummaryAssemblyBasis;
 }
 ```
 
-该basis只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；`fixed_prompt_tokens`使用PromptSet持有的`TurnModelSnapshot::token_estimator()`计算。不包含conversation source、Compaction directive正文或任意动态contribution。Compaction负责把basis、candidate-specific directive/source estimate、pinned model limits和safety reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis exact structural values与实际固定sections一致，并验证CompactionPlan携带的TokenEstimator rate/algorithm version等于PromptSet的TurnModelSnapshot。
+`AgentRunCompactionAssemblyBasis.fixed_input_tokens`覆盖exact next ordinary AgentRun中conversation之外的System、Turn-static User context、ToolSpec和structural framing；`rolling_summary_message_overhead_tokens`覆盖future user-role historical summary message除正文之外的开销。该basis与Compaction对stable units的估算相加，必须形成final AgentRun input estimate的conservative upper bound。
+
+`CompactionSummaryAssemblyBasis`只覆盖Runtime required summary System policy、`NoToolCalls` output contract和empty ToolSpec的固定组装开销；不包含summary source、directive正文或任意dynamic contribution。两个basis都使用PromptSet持有的`TurnModelSnapshot::token_estimator()`。Compaction负责把它们、candidate-specific reduced source/directive、pinned model limits和settings reserve合成为最终`CompactionSummaryBudget`。最终assembly必须复算并验证basis exact structural values与实际sections一致，并验证plan、PromptSet和TurnModelSnapshot使用同一个TokenEstimator。
 
 最终输出：
 
@@ -661,6 +674,7 @@ AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt
 - required contribution 在输入规范化阶段缺失时失败；
 - 不存在尚未进入LiveConversation的current-call model-visible contribution；
 - output contract 不被伪装成普通 Prompt text；
+- CompactionSummary source只能是plan从完整stable-unit prefix派生的reduced view，不包含retained suffix，也不能切开Tool exchange；
 - CompactionSummary directive budget与assembly proof exact structural values match，AgentRun不携带Compaction budget proof；
 - 最终大小和token estimate不超过有效模型限制；所有estimate使用PromptSet持有的`TurnModelSnapshot::token_estimator()`，不得自定义bytes/token常量。
 
@@ -772,7 +786,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Prompt baseline使用固定信任层顺序；层内使用stable typed keys全序，不存在caller-controlled priority；
 - 同一固定层内重复PromptKey fail closed；
 - `MessageRecord → ModelMessage` 只有一个转换入口；
-- assembly只接受live/replayed reducer提供的sanitized full/prefix view和closed typed call policy，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
+- assembly只接受live/replayed reducer提供的sanitized full view或CompactionPlan提供的reduced stable-prefix view，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和输出；
 - Prompt reload先构建candidate PromptResourceView，四个shared candidates全部成功后在Runtime publication gate内替换current root；不原地修改active PromptSet。

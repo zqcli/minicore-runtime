@@ -68,7 +68,7 @@ MiniCoreRuntime
 - current phase和provisional streaming items；
 - Model/Tool futures和ToolOperationSlot；
 - logical retry counter/timer；
-- current CompactionPlan；
+- current CompactionPlan与`compactions_started` bound；
 - safe-point Steer消费；
 - terminal candidate和settlement。
 
@@ -435,19 +435,32 @@ recording failure不会产生Unavailable。
 ## Compaction
 
 ```text
-AgentRun assembly returns ContextOverflow/pressure
-→ ActiveTurnTask phase Compacting
-→ capture ConversationRevision and Arc<CompactionPlan>
-→ assemble CompactionSummary request
-→ call ModelGateway with bounded logical retry
-→ verify same revision/control generation
-→ validate summary
-→ apply live Replace
-→ await inline record StoredCompaction attempt
-→ next AgentRun assembly
+exact next AgentRun pressure/Prompt ContextOverflow/provider ContextOverflow
+→ short live-state capture:
+     LiveConversationView + Arc<LiveCompactionSourceView> at one revision
+→ release live-state guard
+→ context.compaction_pressure(source, trigger, compactions_started)
+→ context.plan_compaction(exact source, trigger, compactions_started)
+→ install exact Arc<CompactionPlan> as current task-local operation
+→ assemble CompactionSummary + Arc<ModelCallRequest>
+→ increment compactions_started before first Gateway call
+→ phase Compacting
+→ call ModelGateway with at most one logical retry using same request
+→ verify exact Turn/control/session/revision/plan/request and no winning emergency
+→ Compaction validates summary + complete automatic provenance
+→ one no-await live-owner operation:
+     derive marker from plan cut
+     allocate Compaction EntryId + bind parent
+     Replace with new rolling-summary origin + exact retained units
+     increment ConversationRevision once
+     return same StoredSessionEntry record candidate
+→ await inline SessionRecorder.record attempt
+→ consume one safe-point Steer or reassemble AgentRun
 ```
 
-record marker丢失时当前process继续使用summary；restart恢复旧conversation。Compaction不重建AgentLoop。
+`compactions_started`计算installed summary logical call chains；logical retry不再次增加，pressure/plan失败不增加。Recommended plan不可行但ordinary AgentRun仍通过Prompt validation时，task可以保留该AgentRun并发布diagnostic；Required plan不可行时按ContextOverflow failure收口。
+
+queued Steer在Compaction期间只排队，不改变revision或使request失效；safe point实际apply后才递增revision。Cancel/SecurityRevoked可以在revision未变时拒绝summary result。record marker丢失时current process继续使用summary；restart恢复旧conversation。Compaction不重建AgentLoop，也不让control actor await整个operation。
 
 ## Terminal与Failure
 
@@ -533,6 +546,13 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - recording failure后Snapshot/StateEvent仍反映live state；
 - Degraded后修复storage不会使当前loaded instance重新写入；
 - Unload/Load可建立新Healthy Recorder，但只恢复recorded prefix；
+- Compaction source与ordinary LiveConversationView在同一revision snapshot产生，guard在planning/await前释放；
+- duplicate message和complete Tool exchange只能在stable-unit boundary派生marker；
+- Compaction settings、Prompt bases和model basis来自同一TurnExecutionContext；
+- Compaction budget等于Prompt proof和ModelCallRequest max output；
+- `compactions_started`计logical call chain、不计retry，达到默认4次后hard overflow fail closed；
+- queued Steer不使Compaction stale，consumed Steer与Cancel/SecurityRevoked按各自basis拒绝result；
+- live Compaction EntryId allocation/Replace先于recording，record failure保留summary；
 - task panic收口；
 - restart只恢复recorded conversation prefix，current_turn为空且无synthetic terminal。
 

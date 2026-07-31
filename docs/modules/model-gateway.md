@@ -481,6 +481,7 @@ selection不存在、definition invalid或capability不满足时，Turn admissio
 
 ```rust
 pub struct EffectiveGenerationPolicy {
+    pub max_output_tokens: NonZeroU32,
     pub reasoning: EffectiveReasoningPolicy,
     pub sampling: SamplingPolicy,
     pub prompt_cache: PromptCachePolicy,
@@ -497,6 +498,8 @@ pub enum ModelServiceClass {
     Priority,
 }
 ```
+
+`max_output_tokens`是在model resolution时由explicit request、validated model generation default和known effective output limit闭合的ordinary AgentRun reservation。`ModelCallRequest.max_output_tokens = None`使用该值；Compaction pressure把它与Runtime `pressure_reserve_tokens`取较大值，不根据model name或provider隐式default猜测。无法形成non-zero、limit-valid effective default时Turn model resolution失败。
 
 `EffectiveReasoningPolicy`是requested preference经过model capability映射后的provider-neutral结果；unsupported preference在resolve_for_turn时失败或按explicit Session policy降级，不能在provider adapter中临时猜测。`SamplingPolicy`只保存validated temperature/top-p等stable values；NaN、Infinity或provider不支持的组合在Turn capture时拒绝。
 
@@ -1556,12 +1559,12 @@ encode/write失败时，assistant live mutation保留，recording health转为De
 
 ## Recording Contract
 
-SessionRecorder可以在`StoredAssistantMessage`中保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
+SessionRecorder可以在`StoredAssistantMessage`中保存safe `ModelResponseSummary`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
 
 实际record成功的assistant entry保存：
 
 ```text
-StoredModelDescriptor
+ModelResponseSummary
 allowlisted response_id
 ordered finalized content[]
 normalized ModelUsage
@@ -1585,7 +1588,7 @@ connection/continuation state
 full AssembledModelContext
 ```
 
-首版automatic SummaryModel compaction把provider/model、usage、finish、logical retry、requested max output和allowlisted provider metadata保存到`StoredCompaction.model_call`，并由StoredCompaction本体保存summary与single `first_kept_entry_id` marker，因此automatic路径该字段必须为Some。`None`只为未来明确设计的deterministic maintenance/import保留，不是automatic overflow fallback。
+首版automatic SummaryModel compaction把normalized result投影到[Compaction唯一拥有的`StoredCompactionModelCall`](compaction.md#summary-validation与provenance)：`ModelResponseSummary`、allowlisted response ID、usage、finish reason、requested max output、Session logical retry count和`ProviderResponseMetadata`。StoredCompaction本体保存summary与single `first_kept_entry_id` marker；automatic路径该字段必须为Some。`None`只为未来明确设计的deterministic maintenance/import保留，不是automatic overflow fallback。ModelGateway不定义第二份stored provenance type，也不接收marker/cut。
 
 `retry_count`只表示Session logical retry。Gateway没有transparent retry count。
 
@@ -1668,7 +1671,9 @@ opaque encrypted reasoning
 - 同一个TurnModelSnapshot的estimator在PromptSet/Compaction调用点结果一致；
 - non-text unknown estimate不触发soft compaction；
 - project config不能注册provider/auth；
-- active Turn不执行cross-model fallback。
+- active Turn不执行cross-model fallback；
+- explicit requested/default AgentRun max output在resolve时形成non-zero effective reservation，超过known model limit时拒绝；
+- Compaction pressure读取该exact reservation，不使用provider隐式default或model-name heuristic。
 
 ### Prompt Mapping
 
@@ -1741,6 +1746,7 @@ opaque encrypted reasoning
 - failed attempt usage只进ModelGateway internal telemetry，不进入ModelCallError或Session aggregate；
 - successful response usage随assistant保存；
 - logical retry_count准确记录0–3（AgentRun）或0–1（CompactionSummary）；
+- automatic Compaction projection完整携带model/response ID/usage/finish/requested max output/logical retry/allowlisted metadata且总是Some；
 - Stop/ToolCalls/Length/ContentFiltered/Refused/Unknown；
 - NoToolCalls或Structured返回ToolCall → UnexpectedToolCall，ToolSet从未被调用；
 - output_contract=None且tools为空时返回ToolCall → UnexpectedToolCall；
