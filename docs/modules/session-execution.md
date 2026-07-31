@@ -189,16 +189,16 @@ Submit accepted by control actor
 → await SessionRecorder.record(entry)
 → publish TurnStarted
 → spawn ActiveTurnTask
-→ return SubmitAccepted { turn_id }
+→ complete original Submit as TurnStarted { turn_id }
 ```
 
-control actor在Starting subloop中继续处理out-of-band Emergency/Lifecycle signals，不持有live-state、Agent/Session lifecycle、Workspace或publication guard跨await。Cancel/SecurityRevoked在Input apply前先赢时，actor drop capture/composition future、退休candidate并完成原Submit内部cancel/revoked settlement；不创建领域Turn，也不spawn ActiveTurnTask。其public typed response映射由Runtime protocol freeze单独定义。
+control actor在Starting subloop中继续处理out-of-band Emergency/Lifecycle signals，不持有live-state、Agent/Session lifecycle、Workspace或publication guard跨await。user Cancel在Input apply前先赢时，actor drop capture/composition future、退休candidate，不创建领域Turn或task，并把原Submit完成为`SubmitCancelled`；SecurityRevoked/Lifecycle/Runtime shutdown使用对应typed rejection。
 
 resolve future返回不授予apply权。actor必须重新确认same `command_id + turn_id + control_generation`、observed emergency epoch仍current、Agent/Session仍可执行且Workspace authority未被hard-revoke；任一不匹配直接丢弃结果。SkillService shared cache parse可以继续，但不能反向发布UserMessage。
 
 Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
 
-`Starting`期间`Cancel(Submit(command_id))`持续有效，包括Input已经live apply但`TurnStarted`尚未发布的窗口。此时Cancel绑定已经分配的同一TurnId、发布sticky epoch并阻止ActiveTurnTask spawn；Input record attempt返回后仍先发布`TurnStarted`，随后完成live `TurnInterrupted(UserCancelled)` settlement。调用方收到`TurnStarted`后改用`Cancel(TurnId)`。
+`Starting`期间`Cancel(Submit(command_id))`持续有效，包括Input已经live apply但`TurnStarted`尚未发布的窗口。Input apply前user Cancel使原Submit完成`SubmitCancelled`；Input已apply时Cancel绑定已经分配的同一TurnId、发布sticky epoch并阻止ActiveTurnTask spawn，Input record attempt返回后仍先发布/完成`TurnStarted`，随后完成live `TurnInterrupted(UserCancelled)` settlement。调用方收到`TurnStarted`后改用`Cancel(TurnId)`。
 
 capture、Workspace、Prompt composition或live validation失败时不创建Turn。Prompt composition必须先按[INV-202](../architecture.md#跨模块不变量索引)验证全部ordered Skill/Workspace contributions，失败时不apply部分Input。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
 
@@ -474,7 +474,7 @@ Interrupted / Failed
 → task returns TurnTaskOutcome
 ```
 
-Model/Prompt/Tool invariant failure可以使Turn Failed/Interrupted，但不会创建synthetic Session entry。Session recording first failure原子更新internal `RecordingHealth`、公开`SessionRecordingState::Degraded`和当前脱敏diagnostic；Turn继续。触发该record attempt的conversation StateEvent先携带Degraded Snapshot发布，随后补发一次`session_recording_changed`。后续`NotRecorded`不重复发布state event。
+Model/Prompt/Tool invariant failure可以使Turn Failed/Interrupted，但不会创建synthetic Session entry。`TurnStarted`完成后发生的Prompt/Model/Tool/Compaction failure只通过Turn terminal StateEvent/Snapshot表达，不能retroactively Reject原Submit。pre-Turn composition/admission failure才映射为Command Rejected；user Cancel特例映射为SubmitCancelled。Session recording first failure原子更新internal `RecordingHealth`、公开`SessionRecordingState::Degraded`和当前脱敏diagnostic；Turn继续。触发该record attempt的conversation StateEvent先携带Degraded Snapshot发布，随后补发一次`session_recording_changed`。后续`NotRecorded`不重复发布state event。
 
 如果ActiveTurnTask panic或channel异常退出，SessionExecutor把live Turn标记`Interrupted(RuntimeFailure)`，发布terminal StateEvent并进入Idle或按Workspace readiness进入Unavailable。JSONL不追加RuntimeFailure terminal。
 
@@ -531,9 +531,9 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - 同一Session same-file FIFO、different-file parallel，跨Session同physical target不协调；
 - Steer safe-point和final arbitration；
 - Interaction oneshot与Cancel；
-- Starting async Skill load期间Cancel/SecurityRevoked先赢时无live Input、无Turn、无task spawn；
+- Starting async Skill load期间user Cancel先赢时原Submit为SubmitCancelled且无live Input/Turn/task；SecurityRevoked/Lifecycle使用typed rejection；
 - resolve返回后candidate/control/emergency/authority任一stale都丢弃结果；
-- Input已apply后的Starting Cancel仍先发布TurnStarted再Interrupted；
+- Input已apply后的Starting Cancel仍先完成TurnStarted再Interrupted；
 - Steer resolve期间reload不改变captured bytes，Cancel/SecurityRevoked或revision变化使结果失效；
 - composition await不持有live/lifecycle/Workspace guard；
 - retry backoff被Cancel/SecurityRevoked打断；

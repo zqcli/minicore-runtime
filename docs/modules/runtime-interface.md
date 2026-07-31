@@ -131,11 +131,13 @@ pub trait MiniCoreRuntimeInterface: Send + Sync {
 
 四个 entry point 是同一个深模块的公开 interface。它们共享 identity、error、view、revision 和 redaction 类型，但职责不重叠。
 
+`dispatch()`的外层`Err(RuntimeDispatchError)`只表示请求无法进入Runtime/dedup completion owner；一旦进入，领域成功、typed rejection和user pre-Turn cancellation都通过`Ok(CommandResponse { command_id, completion })`返回。这样每个accepted envelope恰好有一个可correlate completion。
+
 ### Capability Matrix
 
 | 能力 | 修改状态 | 启动异步工作 | 直接返回业务数据 | 产生StateEvent | 产生ProgressEvent |
 | --- | --- | --- | --- | --- | --- |
-| Command | 可以 | 可以 | 只返回typed command outcome或CommandOutput | 可以 | 间接可以 |
+| Command | 可以 | 可以 | 返回Completed outcome/CommandOutput或typed Rejected completion | 可以 | 间接可以 |
 | Query | 不可以 | 不可以 | 可以 | 不可以 | 不可以 |
 | Snapshot | 不可以 | 不可以 | 返回恢复读模型 | 不可以 | 不可以 |
 | Subscribe | 不可以 | 不可以 | 返回stream handle | 消费 | 消费 |
@@ -217,7 +219,7 @@ pub struct CommandRequest {
 }
 ```
 
-`CommandId`由调用adapter在dispatch前生成，必须使用不可预测随机值且不得复用于另一条命令。当前Runtime内原命令仍in-flight时，相同`CommandId + exact typed command`重试加入同一completion；同一in-flight CommandId携带不同command返回`CommandConflict`。CommandId不持久化，restart后旧命令不能靠它重放或恢复；调用方改用Snapshot/Query确认durable结果，并为新命令生成新ID。每个Command使用语义明确的expected revision、expected status或expected TurnId表达乐观并发。
+`CommandId`由调用adapter在dispatch前生成，必须使用不可预测随机值且不得复用于另一条命令。当前Runtime内原命令仍in-flight时，相同`CommandId + exact typed command`重试加入同一completion；同一in-flight CommandId携带不同command返回`CommandCompletion::Rejected(CommandError { code: CommandConflict, ... })`。CommandId不持久化，restart后旧命令不能靠它重放或恢复；调用方改用Snapshot/Query确认durable结果，并为新命令生成新ID。每个Command使用语义明确的expected revision、expected status或expected TurnId表达乐观并发。
 
 ### RuntimeCommand
 
@@ -422,7 +424,7 @@ pub enum PublicCancelTarget {
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
-- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Starting覆盖async context capture/Skill composition、Input live apply、record attempt与`TurnStarted` publication。Input apply前Cancel使candidate resolve future失效且不创建Turn；Input已live apply但response尚未发布时仍绑定同一Turn、阻止ActiveTurnTask spawn，并在Input publication后完成live interruption；调用方收到`TurnStarted`后使用`TurnId`取消；
+- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Starting覆盖async context capture/Skill composition、Input live apply、record attempt与`TurnStarted` publication。Input apply前user Cancel使candidate resolve future失效、不创建Turn，并使原Submit完成`SubmitCancelled`；Input已live apply但response尚未发布时Cancel仍绑定同一Turn、阻止ActiveTurnTask spawn，原Submit完成`TurnStarted { turn_id }`，随后发布live interruption。调用方收到`TurnStarted`后使用`TurnId`取消；
 - `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal publication；stale target不影响新Turn；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
@@ -496,10 +498,25 @@ pub enum CommandPromptDelivery {
 ```rust
 pub struct CommandResponse {
     pub command_id: CommandId,
-    pub outcome: CommandOutcome,
-    pub output: Option<CommandOutput>,
+    pub completion: CommandCompletion,
 }
 
+pub enum CommandCompletion {
+    Completed {
+        outcome: CommandOutcome,
+        output: Option<CommandOutput>,
+    },
+    Rejected(CommandError),
+}
+
+pub struct CommandOutput {
+    pub text: String,
+}
+```
+
+MVP `CommandOutput`只承载bounded、redacted plain text；不承载HTML、ANSI escape、Markdown action、embedded RuntimeCommand或credential。rich catalog/help数据使用typed QueryResult。string limit与wire encoding由V4-P1-2冻结。
+
+```rust
 pub enum CommandOutcome {
     AgentCreated {
         agent_id: AgentId,
@@ -541,6 +558,7 @@ pub enum CommandOutcome {
     TurnStarted {
         turn_id: TurnId,
     },
+    SubmitCancelled,
     SteerQueued {
         turn_id: TurnId,
     },
@@ -556,11 +574,14 @@ pub enum CommandOutcome {
 }
 ```
 
-Command response不是完整业务完成流：
+Command completion不是完整业务完成流：
 
+- command一旦通过envelope validation进入Runtime，所有领域/admission成功或拒绝都通过同一个`CommandResponse.command_id`完成；`RuntimeDispatchError`不承载普通Stale/Busy/NotFound；
+- `Completed.output`只有`outcome = CommandOutput`时为Some，其他outcome为None；`Rejected`没有CommandOutput；
 - Agent/Session create返回definition与metadata两个独立revision；definition、metadata、status/lifecycle mutation使用不同outcome，caller不能把metadata token误当execution revision；
 - metadata canonical no-op返回`NoChange`并保持原token，不发布metadata event；
 - `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
+- `SubmitCancelled`只表示用户Cancel在initiating UserMessage live apply前获胜；没有TurnId、UserMessage、TurnStarted或Turn terminal event。Input live apply先赢时原Submit仍返回`TurnStarted { turn_id }`，随后同一Turn按Cancel路径发布`TurnInterrupted`；SecurityRevoked、Unload或Runtime shutdown使用各自typed rejection，不伪装成SubmitCancelled；
 - `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
 - `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它使正在进行的capture/composition future失效并取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
@@ -584,12 +605,12 @@ Command response不是完整业务完成流：
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Reload Workspace | Session Idle校验、Workspace resolve和Workspace-bound Prompt/Skill source capture全部完成后替换Snapshot；非Idle返回SessionBusy |
 | Unload Session | LifecycleControl完成grace/fail-closed task settlement并从loaded map移除；Recorder无后台drain |
-| Submit | async captured contribution resolve完成并通过candidate/control/emergency/authority重验后，initiating UserMessage live apply与inline record attempt |
+| Submit | async captured contribution resolve完成并通过candidate/control/emergency/authority重验后，initiating UserMessage live apply与inline record attempt；若user Cancel在apply前先赢，原Submit完成为SubmitCancelled |
 | Steer Queued | target Turn的SteerQueue admission |
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
 | Resolve Interaction | InteractionResolved live apply与inline record attempt |
-| Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；live Turn admission先完成时返回typed transition error；Submit的最终Rejected(Cancelled)由原Submit response表达 |
+| Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；user Cancel在Input apply前先赢时原Submit完成`SubmitCancelled`，Input apply先赢时原Submit完成`TurnStarted`并随后TurnInterrupted；target已转换为published Turn时返回SubmitNotCancellable |
 | Cancel Turn | active target仍可取消且sticky cancel epoch发布；live final arbitration先完成时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
 | Fork Session | source kind与immutable path已捕获，target staging完整materialize并验证后原子发布 |
 
@@ -602,42 +623,85 @@ pub struct CommandError {
     pub retry: RetryAdvice,
     pub subject: Option<PublicSubject>,
 }
+
+pub enum CommandErrorCode {
+    InvalidArgument,
+    NotFound,
+    CommandConflict,
+    StaleRevision,
+    AgentDisabled,
+    AgentDeleted,
+    SessionArchived,
+    SessionDeleted,
+    SessionNotLoaded,
+    SessionNotReady,
+    SessionBusy,
+    ReloadValidationFailed,
+    IngressLaneFull { lane: PublicIngressLane },
+    QueuedMessageNotQueued,
+    SubmitNotCancellable,
+    ExpectedTurnMismatch,
+    TurnNotRunning,
+    TurnCancelling,
+    TurnTerminal,
+    InteractionNotFound,
+    InteractionAlreadyResolved,
+    InteractionFamilyMismatch,
+    InvalidForkAnchor,
+    Unauthorized,
+    Unavailable,
+    DurableStateCorrupt,
+    RuntimeClosing,
+}
+
+pub enum PublicIngressLane {
+    TurnAdmission,
+    Steer,
+    FollowUp,
+    InteractionControl,
+    ToolControl,
+}
+
+pub enum RetryAdvice {
+    DoNotRetry,
+    RefreshAndRetry,
+    RetryWithBackoff {
+        retry_after: Option<Duration>,
+    },
+    UserActionRequired,
+}
+
+pub enum PublicSubject {
+    Runtime,
+    Command(CommandId),
+    Agent(AgentId),
+    Session(SessionId),
+    Turn { session_id: SessionId, turn_id: TurnId },
+    Item { session_id: SessionId, turn_id: TurnId, item_id: ItemId },
+    Interaction {
+        session_id: SessionId,
+        turn_id: TurnId,
+        item_id: ItemId,
+        request_id: RequestId,
+    },
+    Skill(SkillId),
+}
 ```
 
-主要分类：
+`message`是bounded、redacted、仅供人读的补充；外部调用方不能解析它决定retry。`code + retry + subject`是唯一machine contract。`IngressLaneFull`只允许上面的五个public work lane；EmergencyControl、LifecycleControl和SnapshotMailbox不产生该错误。
 
-```text
-InvalidArgument
-NotFound
-CommandConflict
-StaleRevision
-AgentDisabled
-AgentDeleted
-SessionArchived
-SessionDeleted
-SessionNotLoaded
-SessionNotReady
-SessionBusy
-ReloadValidationFailed
-IngressLaneFull
-QueuedMessageNotQueued
-ExpectedTurnMismatch
-TurnNotRunning
-TurnCancelling
-TurnTerminal
-InteractionNotFound
-InteractionAlreadyResolved
-InteractionFamilyMismatch
-InvalidForkAnchor
-Unauthorized
-Unavailable
-DurableStateCorrupt
-RuntimeClosing
+`RuntimeDispatchError`只用于无法形成command completion的envelope/runtime入口故障：
+
+```rust
+pub enum RuntimeDispatchError {
+    InvalidEnvelope,
+    RequestTooLarge,
+    RuntimeClosed,
+    InternalDispatchUnavailable,
+}
 ```
 
-外部调用方不能解析自然语言message决定retry。`RetryAdvice`使用typed值，例如`DoNotRetry | RefreshAndRetry | RetryWithBackoff | UserActionRequired`。
-
-`IngressLaneFull`必须携带safe lane kind（TurnAdmission、Steer、FollowUp、InteractionControl或ToolControl）；EmergencyControl、LifecycleControl和SnapshotMailbox不返回该错误。
+同一in-flight CommandId携带不同command已经进入dedup owner，因此返回`CommandCompletion::Rejected(CommandError { code: CommandConflict, ... })`；不是transport error。
 
 ## CommandSurface
 
@@ -1508,7 +1572,10 @@ UI dispatch ExecuteText("/model provider openai gpt-5")
 → ResolvedCommandAction::Dispatch(SessionCommand::UpdateDefinition)
 → Session lifecycle owner CAS expected revision
 → durable new SessionDefinitionRevision
-→ CommandResponse { revision, output }
+→ CommandCompletion::Completed {
+     outcome = SessionDefinitionUpdated { definition_revision },
+     output = optional bounded plain text
+   }
 → session_definition_updated StateEvent
 → future Turn admission resolve new TurnModelSnapshot
 ```
@@ -1689,6 +1756,48 @@ StateEvent
 
 Model、Tool和Storage内部错误必须归约成typed、redacted public failure。调用方不能解析provider字符串决定retry。
 
+### Command Error Mapping
+
+Runtime Interface只拥有public projection，不把module error迁移到全局error hierarchy。canonical映射如下：
+
+| Internal condition | Public code | RetryAdvice |
+| --- | --- | --- |
+| invalid envelope/shape/size、duplicate SkillId、`PromptErrorKind::InvalidIntent`或`InvalidContribution` | `InvalidArgument` | `DoNotRetry` |
+| missing Agent/Session/Skill/Item/Request | `NotFound` | `RefreshAndRetry` |
+| same CommandId或Interaction resolution key携带different canonical payload | `CommandConflict` | `DoNotRetry` |
+| Agent/Session definition或metadata CAS mismatch | `StaleRevision` | `RefreshAndRetry` |
+| Agent disabled / deleted | `AgentDisabled` / `AgentDeleted` | `UserActionRequired` / `DoNotRetry` |
+| Session archived / deleted | `SessionArchived` / `SessionDeleted` | `UserActionRequired` / `DoNotRetry` |
+| loaded executor不存在 | `SessionNotLoaded` | `UserActionRequired` |
+| Workspace/Agent/model/required Prompt使loaded Session当前不可admit | `SessionNotReady` | typed cause决定`RetryWithBackoff`或`UserActionRequired` |
+| Starting/Running/Finishing conflict | `SessionBusy` | `RefreshAndRetry` |
+| reload candidate validation失败 | `ReloadValidationFailed` | `UserActionRequired` |
+| bounded public work lane满 | `IngressLaneFull { lane }` | `RetryWithBackoff` |
+| Steer/FollowUp已消费或不在queue | `QueuedMessageNotQueued` | `RefreshAndRetry` |
+| Submit target已发布Turn或不再处于pre-Turn cancel window | `SubmitNotCancellable` | `RefreshAndRetry` |
+| expected Turn与current不同 | `ExpectedTurnMismatch` | `RefreshAndRetry` |
+| Turn absent / cancelling / terminal | `TurnNotRunning`、`TurnCancelling`或`TurnTerminal` | `RefreshAndRetry` |
+| Interaction absent / already terminal | `InteractionNotFound`或`InteractionAlreadyResolved` | `RefreshAndRetry` |
+| Interaction request/resolution family mismatch | `InteractionFamilyMismatch` | `DoNotRetry` |
+| stale/cross-session/illegal Fork anchor | `InvalidForkAnchor` | `RefreshAndRetry` |
+| Workspace authority或security policy拒绝 | `Unauthorized` | `UserActionRequired` |
+| temporary source/storage/model resolution unavailable before admission | `Unavailable` | `RetryWithBackoff` |
+| required durable entity/history损坏 | `DurableStateCorrupt` | `UserActionRequired` |
+| admitted command遇Runtime shutdown | `RuntimeClosing` | `RetryWithBackoff` |
+| internal invariant/channel failure发生在command seam | `Unavailable` | `DoNotRetry` + redacted diagnostic |
+
+stage规则：
+
+- Prompt/Skill/Workspace/Agent/model resolution发生在initiating Input live apply前时，可以`Rejected(CommandError)`；Input没有部分apply；
+- user Cancel在Input apply前获胜是`Completed(SubmitCancelled)`，不是`CommandErrorCode`；
+- Input live apply后原Submit已经成功，后续Prompt assembly、Model、Compaction或loop invariant failure只能发布`TurnFailed` StateEvent/Snapshot，不得retroactively Reject Submit；
+- Tool unknown/schema/policy/approval/sandbox/cancel-before-start形成truthful PreExecution ToolResult；Running后outcome unknown形成Abandoned。它们不是CommandError；
+- Interaction `Resolve`自身的route/family/idempotency错误仍是CommandError；被接受后Tool后续失败走ToolResult/Turn terminal；
+- SessionRecorder failure只把recording投影为Degraded，不改变command outcome、Turn terminal reason或retry advice；
+- ModelGateway error永不直接公开为CommandError。TurnStarted后的Model failure由TurnFailed safe reason/diagnostic投影，provider raw message不越界。
+
+Session Execution、Prompt、Tools、ModelGateway和Storage保留各自typed error owner；禁止新增通用`RecoverableError` trait、global error registry或severity系统。
+
 ## Test Strategy
 
 Public interface是 contract test surface。
@@ -1702,9 +1811,12 @@ Public interface是 contract test surface。
 - Load始终尝试初始化Recorder，初始化失败后SessionSnapshot recording为Degraded；
 - Submit只在UserMessage成功live apply并完成inline record attempt后返回TurnStarted；
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
-- 相同CommandId携带不同command返回CommandConflict；
-- Cancel(Submit CommandId)关闭排队或Starting admission；Input已live apply但TurnStarted尚未发布时仍绑定同一Turn并阻止task spawn，target退休或restart后返回NotFound且不影响future Turn；
-- Starting async Skill load期间Cancel/SecurityRevoked使迟到composition result失效；Input apply前无Turn/task，apply后保持TurnStarted→Interrupted顺序；
+- user Cancel在Input apply前使所有joined Submit caller得到同一SubmitCancelled completion；Input apply先赢时全部得到同一TurnStarted；
+- 相同CommandId携带不同command返回Rejected CommandError(code=CommandConflict)；
+- invalid envelope/request-too-large/closed runtime使用outer RuntimeDispatchError，所有领域/admission拒绝保留CommandId进入CommandCompletion::Rejected；
+- CommandOutput只允许bounded redacted plain text；
+- Cancel(Submit CommandId)关闭排队或Starting admission；Input apply前user Cancel使原Submit完成SubmitCancelled且无Turn，Input已live apply但TurnStarted尚未发布时原Submit仍完成TurnStarted并阻止task spawn；target退休或restart后返回NotFound，已发布Turn target返回SubmitNotCancellable且不影响future Turn；
+- Starting async Skill load期间user Cancel使原Submit为SubmitCancelled；SecurityRevoked使原Submit Rejected(Unauthorized)；两者在Input apply前先赢时均无Turn/task，apply后保持TurnStarted→Interrupted顺序；
 - Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
@@ -1725,6 +1837,8 @@ Public interface是 contract test surface。
 - `/skill code-review task`解析为Text body加一个SkillId selection，不产生Skill/Composite variant；
 - duplicate SkillId在边界拒绝，exact captured Skill失败不apply部分UserMessage；
 - Submit与Steer共享async captured Skill resolve；reload期间Steer继续使用old bytes，resolve await不持有ordinary state guard；
+- TurnStarted后的Prompt/Model/Compaction failure发布TurnFailed而不改变原Submit completion；Tool failure走truthful ToolResult/Abandoned，Recorder failure只改变recording health；
+- public error mapping每个code/retry/subject family有contract vector，host不解析message；
 - 用户显式Skill选择不创建Item，模型Skill Tool仍创建ToolInvocation Item；
 - `/compact`不在catalog。
 
