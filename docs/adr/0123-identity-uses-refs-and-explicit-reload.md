@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0129
 日期：2026-07-28
 
+> 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化本文第6/17条：Compaction source改为reducer-owned Session/revision-bound stable units；plan从source+cut派生single marker，automatic provenance字段完整且总是Some。本文不再支持独立caller-provided prefix/suffix/marker。
+
 > 2026-07-31：exact refs、immutable capture和explicit reload继续有效；ADR 0127删除`StoredTurnStart`，Agent/Session/Workspace/Model execution metadata不再随Input记录。
 
 > 2026-07-31：[ADR 0128](0128-prompt-content-is-materialized-before-publication.md)细化本ADR的Prompt规则：正文在candidate build期间materialize为强Arc持有的text value；不恢复PromptFingerprint，也不新增PromptContentRef、content version或durable content store。

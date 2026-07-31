@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADR 0127
 日期：2026-07-30
 
+> 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化Compaction live-first路径：source是reducer-owned revision-bound stable units；LiveSessionState在record前分配Compaction EntryId并安装rolling-summary origin，marker从plan cut派生。
+
 > 2026-07-31：async Turn loop、LiveSessionState truth、inline best-effort conversation recording与Degraded semantics保留。ADR 0127删除`StoredTurnStart`、recorded Turn terminal、cold recovery closure和fork closure；TurnStatus/terminal StateEvent改为current-process only。
 
 > 2026-07-31：[ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)细化Starting/Steer async composition：control actor拥有可取消candidate future，ActiveTurnTask拥有Steer resolve；两者在await后重验control/ConversationRevision，PromptSet不执行Skill load。
