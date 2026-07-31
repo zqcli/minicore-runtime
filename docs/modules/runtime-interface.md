@@ -441,8 +441,14 @@ pub enum InteractionCommand {
         item_id: ItemId,
         request_id: RequestId,
         resolution: InteractionResolutionInput,
-        resolution_key: IdempotencyKey,
+        resolution_key: InteractionResolutionKey,
     },
+}
+
+pub enum InteractionResolutionInput {
+    ToolApproval(ToolApprovalDecisionInput),
+    UserAnswer(UserQuestionAnswer),
+    Cancelled,
 }
 ```
 
@@ -457,7 +463,9 @@ InteractionRequested live apply + inline record attempt
 → resume waiter或允许后续side effect
 ```
 
-`InteractionResolutionInput`必须与request family匹配：ToolApproval接受approval decision，UserQuestion接受UserAnswer；Cancelled按领域规则关闭任一family。所有identity与family校验由MiniCore执行，不能信任UI本地状态。
+`InteractionResolutionInput`必须与request family匹配：ToolApproval只接受request提供的allow option index或Deny；UserQuestion接受完整`UserQuestionAnswer`；Cancelled关闭任一family。所有identity、index、required field、choice和family校验由MiniCore执行，不能信任UI本地状态。
+
+`InteractionResolutionKey`由Presentation Adapter为一次logical resolution action生成，必须不可预测且在retry exact same payload时复用。scope为exact Session/Turn/Item/Request：same key + same canonical input幂等；same key + different input返回CommandConflict；different key after terminal返回InteractionAlreadyResolved。key不是approval capability或authorization secret。
 
 MiniCore拥有Interaction protocol：它创建`RequestId`并绑定Turn/Item，在live state中管理request/resolution并best-effort record，处理Cancel、terminal cleanup、Unload和幂等。用户长时间无回答、暂时没有subscriber或transport断开都保持Pending，不产生默认Deny。Presentation Adapter只把UI-safe request渲染并提交resolution；它不能自行创建MiniCore未请求的Pending Interaction，也不能直接持有Tool waiter或SessionRecorder。
 
@@ -1576,6 +1584,10 @@ pub enum SessionEventDetail {
         turn_id: TurnId,
         terminal: TurnTerminalView,
     },
+    InteractionResolved {
+        request_id: RequestId,
+        resolution: InteractionResolutionView,
+    },
 }
 
 pub enum TurnTerminalView {
@@ -1618,7 +1630,8 @@ StateEvent规则：
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent；
 - `ItemCompleted | ItemToolInvocation*`必须携带matching `ItemChanged` detail；
-- `TurnCompleted | TurnInterrupted | TurnFailed`必须携带matching `TurnTerminal` detail，即使该event后的Snapshot已经把`current_turn`清空；detail reason只使用safe closed taxonomy，不含provider/Tool/raw error。
+- `TurnCompleted | TurnInterrupted | TurnFailed`必须携带matching `TurnTerminal` detail，即使该event后的Snapshot已经把`current_turn`清空；detail reason只使用safe closed taxonomy，不含provider/Tool/raw error；
+- `InteractionResolved`必须携带matching request ID和safe resolution detail；same-key idempotent retry不发布第二event。
 - Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未record消息伪造成可恢复UserMessage。
 
 上述两个kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整Snapshot；`SessionEventDetail`只承载Snapshot无法表达但对本次transition有用的safe correlation信息。
@@ -1778,16 +1791,31 @@ pub struct InteractionView {
     pub turn_id: TurnId,
     pub item_id: ItemId,
     pub request: InteractionRequestView,
-    pub state: InteractionStateView,
 }
 
 pub enum InteractionRequestView {
-    ToolApproval(/* UI-safe approval fields */),
-    UserQuestion(/* UI-safe question fields */),
+    ToolApproval(ToolApprovalRequestView),
+    UserQuestion(UserQuestionRequest),
+}
+
+pub enum InteractionResolutionView {
+    ToolApproval(ToolApprovalResolutionView),
+    UserAnswer(UserQuestionAnswer),
+    Cancelled,
+}
+
+pub enum ToolApprovalResolutionView {
+    Allowed {
+        option_index: u32,
+        kind: ToolApprovalOptionKindView,
+    },
+    Denied,
 }
 ```
 
-prepared Tool args、executor handle、sandbox internals和credential不进入event。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity和first-wins状态。
+prepared Tool args、executor handle、private option→PermissionSet map、sandbox internals和credential不进入event。`pending_interactions`只含Pending request；resolved request从Snapshot移除，并通过`InteractionResolved` event detail传递safe resolution。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity、option/question indices和first-wins状态。
+
+UserQuestion request/answer是non-secret recordable data；它们可以进入event/history/ToolResult。Presentation Adapter必须提示不能输入credential。Runtime没有`secret` field，Transport Adapter也不能私自把某个Text answer当作secure channel。
 
 ## Message Tree 管理
 
@@ -2002,7 +2030,11 @@ ModelCallResult contains ToolCall
 → ActiveTurnTask creates live ToolInvocation ItemId
 → apply InteractionRequested live + await inline record attempt
 → session StateEvent::InteractionRequested
-→ UI dispatch InteractionCommand::Resolve
+→ UI dispatch InteractionCommand::Resolve(
+     ToolApproval::Allow { option_index } | Deny,
+     fresh/reused InteractionResolutionKey
+   )
+→ MiniCore validates exact pending request option/family/key
 → apply InteractionResolved live + await inline record attempt
 → session StateEvent::InteractionResolved
 → ActiveTurnTask owner-local ToolStartPermit
@@ -2020,8 +2052,12 @@ ModelCallResult contains built-in ask-user ToolCall
 → ToolExecutionControl.request_user_question
 → apply InteractionRequested(UserQuestion) live + await inline record attempt
 → session StateEvent::InteractionRequested with UI-safe InteractionView
-→ Presentation Adapter展示并收集答案
-→ UI dispatch InteractionCommand::Resolve(UserAnswer)
+→ Presentation Adapter展示non-secret Text/SingleChoice fields并明确禁止credential输入
+→ UI dispatch InteractionCommand::Resolve(
+     UserAnswer,
+     fresh/reused InteractionResolutionKey
+   )
+→ MiniCore validates required fields/indices/family/key
 → apply InteractionResolved live + await inline record attempt
 → session StateEvent::InteractionResolved
 → wake original Tool future
@@ -2242,7 +2278,9 @@ Public interface是 contract test surface。
 - stale Cancel TurnId不取消新的active Turn；
 - Unload grace deadline到期后Cancel active Turn并以Cancelled关闭Interaction；
 - Interaction长时间无回答或subscriber断开时保持Pending，不产生默认Deny；
-- Interaction first live terminal resolution wins；
+- Interaction first live terminal resolution wins；same key/same canonical payload幂等且无第二record/event，same key/different payload为CommandConflict，different key after terminal为InteractionAlreadyResolved；
+- Tool approval只接受exact request option index或Deny；unknown index/cross-request reuse拒绝，restricted option不能扩大PermissionSet；
+- UserQuestion Text/SingleChoice required/index/family/total-size validation；protocol不存在secret/password answer variant；
 - Fork Before/After Item anchor；
 - loaded Fork outcome/provenance为LiveSnapshot并包含capture前已apply的unrecorded tail；
 - unloaded Fork outcome/provenance为RecordedHistory；
@@ -2272,7 +2310,7 @@ Public interface是 contract test surface。
 - first/new SessionSnapshot完整枚举Submit admission、Steer和FollowUp CommandId，lane-local顺序稳定且不公开prompt preview；
 - Snapshot中每个Submit entry可用Cancel(Submit)定位，每个Steer/FollowUp可用CancelQueuedMessage定位；Starting转TurnStarted后Submit CommandId消失并由current TurnId成为cancel target；
 - RuntimeSnapshot不等待所有SessionExecutor；每个new Runtime Snapshot后host必须重新分页ListAgents/ListSessions，恢复断线期间durable catalog变化；
-- pending Interaction可从SessionSnapshot恢复；
+- pending Interaction可从SessionSnapshot恢复，request足以完整渲染并构造合法Resolve；private approval option map不进入Snapshot；
 - Healthy/Degraded两态JSON wire稳定，Create无recording opt-out且每次Load都尝试初始化Recorder；
 - Degraded Snapshot始终携带至少一条当前脱敏recording diagnostic；
 - snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
@@ -2299,8 +2337,9 @@ Public interface是 contract test surface。
 - Snapshot替换有序live Items并清空provisional Items；
 - Runtime restart从JSONL tolerant replay开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现；旧TurnStatus不恢复，也不把Snapshot当作execution checkpoint；
 - Interaction request live apply/record-attempt-before-notify和resolution live apply/record-attempt-before-resume；
+- InteractionResolved携带safe resolution detail；same-key idempotent retry不发布第二event；
 - elapsed time和subscriber缺失不产生Interaction resolution；
-- UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
+- UserQuestion event只携带non-secret Text/SingleChoice request；UI提交validated UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
 - Turn只有一个terminal event，且携带matching TurnTerminal detail；event后的Snapshot可以清空current_turn；
 - subscriber buffer不足时关闭stream，不做event replay。
@@ -2311,6 +2350,8 @@ Public interface是 contract test surface。
 - SessionDefinitionSummary不包含Workspace absolute path；ItemView不包含Skill/Workspace注入正文、raw Tool args/result或hidden reasoning；
 - renderer不能提交raw internal command；
 - renderer不能直接持有Tool waiter、SessionRecorder或伪造MiniCore未请求的Pending Interaction；
+- approval view不包含raw arguments/private PermissionSet map；unknown option不能扩大权限；
+- UserQuestion request/answer没有secret variant，credential/password/token不得进入Interaction/JSONL/ToolResult/model；
 - QueueView只暴露cancel所需CommandId/kind/Turn target，不包含queued PromptIntent正文、Skill IDs或preview；
 - stale catalog selection重新resolve；
 - cross-sessionItem/RequestId拒绝；

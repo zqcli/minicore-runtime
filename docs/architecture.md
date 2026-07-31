@@ -213,6 +213,7 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 | INV-201 | active Turn只使用admission时captured immutable Workspace/Prompt/Skill/Tool/Model对象；PromptContent在capture前已materialize，Turn执行不解析source locator | [Turn Execution Context · Context Capture](modules/turn-execution-context.md#context-capture) |
 | INV-202 | exact Skill/Workspace authorization在composition前完成；每个contribution形成独立content part，live/JSONL只保留safe part-level provenance，replay不重新加载或授权source | [Prompt · PromptIntent和CanonicalUserMessage](modules/prompt.md#promptintent-和-canonicalusermessage) |
 | INV-301 | Interaction live request在notify前apply并完成inline record attempt；resolution在resume前apply并完成inline record attempt | [Turn / Item / Interaction · Interaction Ordering](modules/turn-item-interaction.md#interaction-ordering) |
+| INV-302 | MVP UserQuestion只有non-secret Text/SingleChoice；request/answer可进入JSONL/event/ToolResult/model，secret input必须走未来独立secure host capability | [Turn / Item / Interaction · UserQuestion](modules/turn-item-interaction.md#userquestion) |
 | INV-401 | Tool side-effect start由ToolStartGate与EmergencyControl first-wins；Running后只能truthful settle | [Turn / Item / Interaction · Tool Side-Effect Start](modules/turn-item-interaction.md#tool-side-effect-start) |
 
 ## 模块地图
