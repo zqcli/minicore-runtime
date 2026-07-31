@@ -1,6 +1,6 @@
 # ADR 0124：Session Replay宽容恢复并收窄持久化引用链
 
-状态：Partially Superseded by ADRs 0126 and 0127
+状态：Partially Superseded by ADRs 0126, 0127, 0131 and 0132
 日期：2026-07-29
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化single prefix marker：`first_kept_entry_id`必须由live reducer发布的provider-valid stable-unit source与cut派生；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。

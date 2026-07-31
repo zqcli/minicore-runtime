@@ -1,6 +1,6 @@
 # ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append
 
-状态：Partially Superseded by ADR 0127
+状态：Partially Superseded by ADRs 0127, 0130 and 0132
 日期：2026-07-30
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化Compaction live-first路径：source是reducer-owned revision-bound stable units；LiveSessionState在record前分配Compaction EntryId并安装rolling-summary origin，marker从plan cut派生。

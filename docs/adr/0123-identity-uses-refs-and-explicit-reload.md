@@ -1,6 +1,6 @@
 # ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload
 
-状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0129
+状态：Partially Superseded by ADRs 0124, 0126, 0127, 0129 and 0132
 日期：2026-07-28
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化本文第6/17条：Compaction source改为reducer-owned Session/revision-bound stable units；plan从source+cut派生single marker，automatic provenance字段完整且总是Some。本文不再支持独立caller-provided prefix/suffix/marker。
