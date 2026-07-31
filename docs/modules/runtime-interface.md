@@ -1811,6 +1811,7 @@ pub enum StateEventMsg {
     Runtime {
         kind: RuntimeStateEventKind,
         snapshot: RuntimeSnapshot,
+        detail: Option<RuntimeEventDetail>,
     },
     Session {
         kind: SessionStateEventKind,
@@ -1860,6 +1861,15 @@ pub enum SessionStateEventKind {
     UsageUpdated,
     SessionRecordingChanged,
     DiagnosticsUpdated,
+}
+
+pub enum RuntimeEventDetail {
+    AgentChanged {
+        agent: AgentSummary,
+    },
+    SessionChanged {
+        session: SessionSummary,
+    },
 }
 
 pub enum SessionEventDetail {
@@ -1915,16 +1925,18 @@ StateEvent规则：
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - final domain StateEvent必须从成功live mutation派生。对应recordable conversation fact时，发送前完成inline record attempt；`TurnInterrupted`/`TurnFailed`没有record attempt，等待recordable settlement facts完成后发布；record outcome不提供durable acknowledgement；
-- Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；Agent/Session metadata使用独立`AgentMetadataUpdated | SessionMetadataUpdated` kind，event后的full view/snapshot携带new metadata CAS token；metadata同样不得写conversation JSONL；
+- Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；Runtime-scope durable entity event必须携带matching `RuntimeEventDetail::AgentChanged | SessionChanged` complete safe summary，其中包含current definition/metadata revision与status/lifecycle。Agent/Session metadata使用独立`AgentMetadataUpdated | SessionMetadataUpdated` kind；metadata同样不得写conversation JSONL；
+- loaded Session的SessionMetadataUpdated还携带mutation后的SessionSnapshot；unloaded Session没有Session-scope event，但Runtime detail已提供new SessionMetadataRevision。新Runtime subscription仍按RuntimeSnapshot规则重新page catalogs，不依赖旧event replay；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent；
+- `RuntimeEventDetail::AgentChanged`只用于AgentCreated/AgentDefinitionUpdated/AgentMetadataUpdated/AgentStatusChanged；`SessionChanged`只用于SessionCreated/SessionDefinitionUpdated/SessionMetadataUpdated/SessionArchived/SessionUnarchived/SessionDeleted/SessionForked。detail identity必须匹配EventRoute和kind；
 - `ItemCompleted | ItemToolInvocation*`必须携带matching `ItemChanged` detail；
 - `TurnCompleted | TurnInterrupted | TurnFailed`必须携带matching `TurnTerminal` detail，即使该event后的Snapshot已经把`current_turn`清空；detail reason只使用safe closed taxonomy，不含provider/Tool/raw error；
 - `InteractionResolved`必须携带matching request ID和safe resolution detail；same-key idempotent retry不发布第二event。
 - Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未record消息伪造成可恢复UserMessage。
 
-上述两个kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整Snapshot；`SessionEventDetail`只承载Snapshot无法表达但对本次transition有用的safe correlation信息。
+上述kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整scope Snapshot；Runtime durable catalog mutation额外携带single changed entity summary，SessionEventDetail只承载SessionSnapshot无法表达但对本次transition有用的safe correlation信息。
 
 wire命名：
 
@@ -2615,7 +2627,8 @@ Public interface是 contract test surface。
 ### Event Tests
 
 - Runtime与每个Session subscription彼此独立；
-- AgentMetadataUpdated/SessionMetadataUpdated使用独立event kind，event后的view/snapshot携带new CAS token；unloaded Session metadata只发布Runtime-scope event；
+- AgentMetadataUpdated/SessionMetadataUpdated使用独立event kind；Runtime event detail携带matching complete AgentSummary/SessionSummary和new CAS token，loaded Session event还携带new SessionSnapshot；unloaded Session metadata只发布Runtime-scope event；
+- all durable Agent/Session catalog event kind与RuntimeEventDetail family/identity匹配，RuntimeSnapshot仍不内联全catalog；
 - 每条stream首帧是scope匹配的Snapshot；
 - 当前subscription内StateEvent保持发送顺序；
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
