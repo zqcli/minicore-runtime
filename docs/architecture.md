@@ -86,13 +86,13 @@ live mutation顺序：
 
 ```text
 validate domain mutation
-→ allocate stable IDs
+→ LiveSessionState.EntryIdGenerator allocates EntryId and binds parent_id
 → apply LiveSessionState / LiveConversation
 → await SessionRecorder.record(entry)
 → publish final StateEvent / resume waiter / continue loop
 ```
 
-`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。
+EntryId由`LiveSessionState`私有Session-scoped generator在apply前分配；Recorder不得创建或改写identity。`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。
 
 Cold replay：
 
@@ -197,7 +197,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 
 | ID | 不变量摘要 | Canonical Owner |
 | --- | --- | --- |
-| INV-001 | live mutation先apply，再完成inline record attempt，随后publish final state或推进协议；record outcome不提供durable execution permit | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
+| INV-001 | live owner在apply前分配稳定EntryId并绑定parent，live mutation先apply，再完成inline record attempt，随后publish final state或推进协议；Recorder不得改写identity | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
 | INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |

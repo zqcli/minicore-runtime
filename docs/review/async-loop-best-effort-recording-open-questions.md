@@ -109,9 +109,18 @@ record failure更新RecordingHealth并继续publication/protocol。successful wr
 
 ## Q9：EntryId分配owner
 
-待定实现细节：由live reducer还是SessionRecorder分配。
+状态：Closed。
 
-约束：ID必须在live Item/Interaction/Compaction引用它之前稳定；Recorder不能在append时改写ID。初始建议由Session-scoped `EntryIdGenerator`在live apply时分配。
+决议：`LiveSessionState`私有持有Session-scoped `EntryIdGenerator`。每个recordable mutation在domain validation成功后、live apply之前分配EntryId并绑定`parent_id`；Recorder只能验证、encode和append，不能创建、替换或规范化EntryId。
+
+规则：
+
+- loaded replay使用文件中全部first-valid EntryId初始化collision guard，包括selected path之外的valid branch/orphan identity；
+- loaded Fork child使用复制到target的全部EntryId初始化自己的generator；future child entry生成fresh ID；
+- Degraded不影响ID分配；live Item、Interaction、Compaction和StateEvent继续使用已分配ID；
+- generated ID在同一loaded instance内不复用，即使后续mutation因内部invariant失败而未publish；
+- EntryId与JSONL line number、Codex式rollout ordinal或ConversationRevision分离；
+- 具体UUID/ULID算法、字符串编码和serde wire留到public ID schema freeze。初始实现优先评估UUIDv7，但Q9不冻结算法。
 
 ## Q10：Cold recovery closure
 

@@ -3,7 +3,7 @@
 状态：Partially Superseded by ADR 0126
 日期：2026-07-29
 
-> 2026-07-30：tolerant replay、minimal durable links和Tool exchange sanitizer保留；strict `SessionWriter`、committed typed delta、append-before-model-visible和read-only writer admission由ADR 0126取代。
+> 2026-07-30：tolerant replay、minimal durable links和Tool exchange sanitizer保留；strict `SessionWriter`、committed typed delta、append-before-model-visible和read-only writer admission由ADR 0126取代。EntryId generation owner由ADR 0126/Q9固定为`LiveSessionState` private Session-scoped generator；Recorder不得创建或改写ID。
 
 ## 背景
 

@@ -127,7 +127,7 @@ writer failure → read-only/Unavailable
 
 1. `LiveSessionState`和`LiveConversation` typed reducers；
 2. `ConversationRevision`；
-3. Session-scoped EntryId generator；
+3. LiveSessionState-private Session-scoped EntryId generator；
 4. inline ordered SessionRecorder；
 5. first failure → Degraded → stop suffix；
 6. by-entry JSONL encoder；
@@ -138,6 +138,8 @@ writer failure → read-only/Unavailable
 
 完成门槛：
 
+- [ ] live owner在apply前分配EntryId/parent，Recorder观察exact same identity；
+- [ ] replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
 - [ ] ordinary live mutation后inline await当前append attempt；
 - [ ] slow append只延迟同Session finalization，不串行化其他Session；
 - [ ] first failure后停止suffix并保留可恢复完整行前缀；
@@ -233,10 +235,9 @@ SessionExecutor admits Turn
 
 Recorder问题集中在[`docs/review/async-loop-best-effort-recording-open-questions.md`](../review/async-loop-best-effort-recording-open-questions.md)：
 
-- EntryId allocation owner；
 - recovery closure recording。
 
-Q1 queue容量、Q2 RecordingHealth wire、Q3 explicit flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy和Q8 event/record顺序已经关闭。
+Q1 queue容量、Q2 RecordingHealth wire、Q3 explicit flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy、Q8 event/record顺序和Q9 EntryId owner已经关闭。
 
 其他门禁：
 

@@ -896,7 +896,7 @@ pending Interaction / 任何process-local SessionIngress lane
 
 fork使用staging + atomic publication。复制完成后执行tolerant replay；若target live view仍有Running Turn，立即标记`TurnInterrupted(HistoricalFork)`并写入staging stream，不合成ToolResult。selected path与该closure完整materialize后才能发布child；发布后的future recording failure不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。
 
-Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。ID按Session scope路由，新append为EntryId及MiniCore生成的Turn/Item/Request ID使用fresh随机值避免碰撞，不执行nested remap。完整storage规则见[Conversation 与 SessionStorage 架构设计](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
+Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。具体ID算法和文本wire后续冻结。完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
 ## Turn Admission Basis
 
@@ -1202,6 +1202,7 @@ Agent release channel
 - live Fork staging失败不发布partial child；
 - fork 复制 exact AgentRevisionRef 与 definition content，但创建 child-local WorkspaceRevision(1)；
 - fork不复制Snapshot/security signal/ToolSet/PromptSet/SkillView；
+- fork copied EntryId seed child collision guard，future EntryId由child live owner分配且不碰撞；
 - fork staging crash不发布target；mid-Turn fork closure不恢复source执行状态；
 - loaded Session非Idle时Workspace definition update返回SessionBusy且不排队；
 - Idle Workspace update成功同时改变WorkspaceRevision和SessionDefinitionRevision并发布new Snapshot；

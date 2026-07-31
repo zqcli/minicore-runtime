@@ -52,6 +52,7 @@ SessionRecorder
 - Q6关闭：loaded Fork使用同一LiveSnapshot解析anchor并复制unrecorded tail，unloaded Fork使用RecordedHistory；source进入outcome与durable provenance；
 - Q7关闭：无recording policy、Disabled或ephemeral Session；Create严格stage SessionHeader，Load始终尝试初始化Recorder；
 - Q8关闭：live apply → inline record attempt → final domain publication/protocol continuation；
+- Q9关闭：LiveSessionState私有Session-scoped EntryIdGenerator在apply前分配并绑定parent；Recorder不得创建或改写ID；
 - writable Load只截断final unterminated partial tail，不修改完整行或中段内容；
 - 完成current Markdown链接、代码围栏、旧术语、9条INV owner和`git diff --check`验证。
 
@@ -76,6 +77,7 @@ SessionRecorder
 - ActiveTurnTask直接await ModelGateway、ToolSet、Interaction和retry timer；
 - LiveSessionState是current-process truth；
 - LiveConversation reducer拥有complete Tool exchange和ConversationRevision；
+- LiveSessionState私有持有唯一Session-scoped EntryIdGenerator；replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
 - SessionRecorder通过inline `record().await`顺序append，不使用后台queue，也不提供durable commit receipt；
 - live mutation成功后完成inline record attempt，再publish final event或推进协议；
 - recorder first encode/write failure后Degraded并停止后续suffix；
@@ -98,7 +100,7 @@ SessionRecorder
 ## 跨模块不变量
 
 ```text
-INV-001 live apply → inline record attempt → final publish/continue
+INV-001 live owner allocates EntryId/parent → apply → inline record attempt → final publish/continue
 INV-002 tolerant replay of recorded prefix
 INV-003 complete Tool exchange before model visibility
 INV-004 loaded Fork LiveSnapshot / unloaded Fork RecordedHistory
@@ -132,15 +134,14 @@ writer-poisoned/read-only execution admission
 
 详见[独立review](async-loop-best-effort-recording-open-questions.md)：
 
-- EntryId generator实现owner；
 - cold recovery closure是否best-effort record。
 
-Q1 queue容量、Q2 RecordingHealth wire、Q3 Flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy和Q8 event/record顺序已经关闭。其余问题不重新打开async loop和inline best-effort recording的核心方向。
+Q1 queue容量、Q2 RecordingHealth wire、Q3 Flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy、Q8 event/record顺序和Q9 EntryId owner已经关闭。其余问题不重新打开async loop和inline best-effort recording的核心方向。
 
 ## 下一步
 
-1. 关闭Q9 EntryId owner和Q10 cold recovery closure；
-2. 冻结剩余wire/schema：通用serde casing、ID、Timestamp/Money、StoredTurnStart/StoredCompaction；
+1. 关闭Q10 cold recovery closure；
+2. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money、StoredTurnStart/StoredCompaction；
 3. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
 4. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
 5. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
@@ -160,4 +161,4 @@ R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应先关闭Q9/Q10，不要按旧同步AgentLoop、后台Recorder queue或durable SessionWriter开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应先关闭Q10，不要按旧同步AgentLoop、后台Recorder queue或durable SessionWriter开始编码。
