@@ -485,10 +485,12 @@ SessionExecutor发布的Snapshot包含：
 - SessionExecutionState和optional current Turn；
 - ActiveTurn phase；
 - live Items和Pending Interaction；
-- Steer/FollowUp queue summary；
+- exact Submit admission/Steer/FollowUp queue views（CommandId与lane-local FIFO，不含prompt body/preview）；
 - usage；
 - recording health；
 - redacted diagnostics。
+
+SessionExecutor在一次短owner-state capture中同时投影execution/current Turn与三个public input lane。QueueView不得从event history重建，也不得只读atomic count后再分批读取IDs；否则snapshot可能出现count与cancel target不一致。该capture不等待Model/Tool/Recorder I/O。
 
 recording Degraded或process crash时，Snapshot/StateEvent可能领先可恢复JSONL prefix。Host不能把收到`item_completed`或`turn_completed`解释为flush/fsync acknowledgement。
 
@@ -512,7 +514,7 @@ open recorded Session and attempt writable lease
 - ModelCallRequest/provider stream；
 - Tool task/process handle；
 - Interaction waiter；
-- Steer/FollowUp queue；
+- Submit admission/Steer/FollowUp queue；
 - retry timer；
 - old Recorder object或in-flight append。
 
@@ -548,6 +550,8 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - `compactions_started`计logical call chain、不计retry，达到默认4次后hard overflow fail closed；
 - queued Steer不使Compaction stale，consumed Steer与Cancel/SecurityRevoked按各自basis拒绝result；
 - live Compaction EntryId allocation/Replace先于recording，record failure保留summary；
+- Snapshot完整枚举Submit admission、Steer和FollowUp cancel targets，lane-local FIFO稳定且不泄漏queued intent正文；
+- QueueView与execution/current Turn来自同一次owner snapshot，Starting→TurnStarted切换不会同时暴露旧Submit target和new Turn target；
 - task panic收口；
 - restart只恢复recorded conversation prefix，current_turn为空且无synthetic terminal。
 

@@ -585,7 +585,7 @@ Command completion不是完整业务完成流：
 - `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
 - `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它使正在进行的capture/composition future失效并取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
-- `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
+- `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；matching CommandId立即出现在new SessionSnapshot的lane-local queue Vec中。真正append通过普通UserMessage/Turn StateEvent观察；restart后未append的消息和queue Vec都消失；
 - `SessionLoaded`在load/recovery完成并原子发布latest SessionSnapshot后返回；recording health从随后显式`Snapshot(Session)`或subscription首帧读取，不内联进unit outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
 - Session/Agent事实变化同时发布StateEvent，让其他subscriber失效或更新read model。
@@ -988,10 +988,29 @@ pub struct SessionSnapshot {
 }
 
 pub struct SessionQueueView {
-    pub pending_submit_count: usize,
-    pub current_turn_steer_count: usize,
-    pub follow_up_count: usize,
+    pub submit_admissions: Vec<SubmitAdmissionView>,
+    pub steers: Vec<QueuedSteerView>,
+    pub follow_ups: Vec<QueuedFollowUpView>,
     pub accepting_input: bool,
+}
+
+pub struct SubmitAdmissionView {
+    pub command_id: CommandId,
+    pub state: SubmitAdmissionStateView,
+}
+
+pub enum SubmitAdmissionStateView {
+    Queued,
+    Starting,
+}
+
+pub struct QueuedSteerView {
+    pub command_id: CommandId,
+    pub expected_turn_id: TurnId,
+}
+
+pub struct QueuedFollowUpView {
+    pub command_id: CommandId,
 }
 
 pub struct SessionRecordingView {
@@ -1038,7 +1057,21 @@ raw OS error、绝对路径、credential、完整StoredSessionEntry和Tool outpu
 
 Host展示语义：`Healthy`不提示；`Degraded`持续显示“后续内容无法恢复”的warning，但不得禁用Submit、Model、Tool、Interaction或Compaction。warning应明确：继续使用会保留current live state但不保存；Unload/Load只恢复到最后recorded prefix并丢失之后的live内容。
 
-`SessionQueueView`只暴露public input admission状态；InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。`pending_submit_count`是尚未被仲裁的admission信箱瞬时计数（正常为0），不表示存在跨Turn排队的Submit通道。
+**Canonical cross-module invariant: INV-103.**
+
+`SessionQueueView`完整列出当前process中每个public cancelable pre-Turn/queued input，Snapshot不得只返回count或截断列表：
+
+- `submit_admissions`按TurnAdmission lane FIFO排列，最多一个entry为`Starting`；其CommandId使用`Cancel(PublicCancelTarget::Submit)`；
+- `steers`按current Turn的Steer FIFO排列，携带exact expected TurnId；
+- `follow_ups`按FollowUp FIFO排列；
+- Steer/FollowUp使用`CancelQueuedMessage(target_command_id)`；
+- 三个Vec之间没有cross-lane ordering语义，不能按数组位置或CommandId比较先后；
+- queue capacities已经bounded，因此Snapshot必须完整复制lane-local values，不需要分页或preview truncation；
+- queued PromptIntent正文、Skill selection、expanded Skill/Workspace content和preview不进入QueueView。host可以恢复类型、目标与合法cancel command，但不能从observer surface读取尚未apply的用户draft；
+- `accepting_input`是该Snapshot时点的UI hint，command仍必须重新验证readiness/execution/lane capacity，不能把hint当permit；
+- restart后这些process-local Vec为空，host不能把旧CommandId重放为queue事实。
+
+InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。
 
 Cancel被Executor接受后，`SessionExecutionView`必须立即反映`Finishing`并发布`session_execution_changed`。当execution为Finishing时，host优先显示Stopping/Finishing；`CurrentTurnView.phase`保留Cancel前最后工作位置供diagnostic，不建立`TurnExecutionPhase::Cancelling`。Finishing期间host可以继续发送FollowUp并收到`FollowUpQueued`，普通Submit仍返回SessionBusy。
 
@@ -1853,6 +1886,8 @@ Public interface是 contract test surface。
 - history query不从conversation JSONL返回Session definition/metadata/lifecycle timeline；
 - GetTurn、turn-scoped ListItems和active_items首版不分页；
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
+- first/new SessionSnapshot完整枚举Submit admission、Steer和FollowUp CommandId，lane-local顺序稳定且不公开prompt preview；
+- Snapshot中每个Submit entry可用Cancel(Submit)定位，每个Steer/FollowUp可用CancelQueuedMessage定位；Starting转TurnStarted后Submit CommandId消失并由current TurnId成为cancel target；
 - RuntimeSnapshot不等待所有SessionExecutor；
 - pending Interaction可从SessionSnapshot恢复；
 - Healthy/Degraded两态JSON wire稳定，Create无recording opt-out且每次Load都尝试初始化Recorder；
@@ -1866,7 +1901,7 @@ Public interface是 contract test surface。
 - 每条stream首帧是scope匹配的Snapshot；
 - 当前subscription内StateEvent保持发送顺序；
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
-- restart后只从recorded prefix重建，unrecorded live tail、queued Steer/FollowUp和旧phase不恢复；
+- restart后只从recorded prefix重建，unrecorded live tail、queued Submit/Steer/FollowUp和旧phase不恢复；
 - ProgressEvent可以合并/丢弃；
 - message/reasoning started、delta和completed使用稳定ItemId，丢失started/delta仍可由completed校正；
 - live final mutation失败不发布item_completed；recording失败仍可发布；logical retry、Turn terminal或新Snapshot清理临时Item view；
@@ -1892,6 +1927,7 @@ Public interface是 contract test surface。
 - catalog/query/snapshot/event不包含credential；
 - renderer不能提交raw internal command；
 - renderer不能直接持有Tool waiter、SessionRecorder或伪造MiniCore未请求的Pending Interaction；
+- QueueView只暴露cancel所需CommandId/kind/Turn target，不包含queued PromptIntent正文、Skill IDs或preview；
 - stale catalog selection重新resolve；
 - cross-sessionItem/RequestId拒绝；
 - Workspace restriction通过Runtime path生效。
