@@ -873,8 +873,23 @@ ListPendingInteractions
 ```rust
 pub struct SessionHistoryTreeView {
     pub session_id: SessionId,
-    pub current_anchor: Option<HistoryAnchorView>,
+    pub current_anchor: HistoryAnchorView,
     pub nodes: Vec<HistoryNodeView>,
+}
+
+pub enum HistoryAnchorView {
+    Genesis,
+    UserMessage { item_id: ItemId },
+    FinalAgentMessage { item_id: ItemId },
+}
+
+pub struct HistoryNodeView {
+    pub anchor: HistoryAnchorView,
+    pub parent: Option<HistoryAnchorView>,
+    pub turn_id: Option<TurnId>,
+    pub timestamp: Option<Timestamp>,
+    pub orphan_root: bool,
+    pub diagnostic_count: u32,
 }
 ```
 
@@ -930,12 +945,250 @@ Tool:   ListTools / GetToolSummary
 
 ```rust
 pub struct QueryResponse {
-    pub revision: Option<QueryRevision>,
     pub data: QueryResult,
+}
+
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<PageCursor>,
+}
+
+pub struct PageCursor(/* opaque */);
+
+pub enum QueryResult {
+    Runtime(RuntimeQueryResult),
+    Agent(AgentQueryResult),
+    Session(SessionQueryResult),
+    CommandSurface(CommandSurfaceQueryResult),
+    Model(ModelQueryResult),
+    Prompt(PromptQueryResult),
+    Skill(SkillQueryResult),
+    Tool(ToolQueryResult),
+    Usage(SessionUsageView),
+    Diagnostics(DiagnosticsQueryResult),
+}
+
+pub enum RuntimeQueryResult {
+    Capabilities(RuntimeCapabilities),
+    Info(RuntimeInfo),
+    LoadedSessions(Vec<LoadedSessionSummary>),
+}
+
+pub enum AgentQueryResult {
+    Agents(Page<AgentSummary>),
+    Agent(AgentSummary),
+    Revisions(Page<AgentDefinitionSummary>),
+    Definition(AgentDefinitionSummary),
+}
+
+pub enum SessionQueryResult {
+    Sessions(Page<SessionSummary>),
+    Session(SessionSummary),
+    Definition(SessionDefinitionSummary),
+    Readiness(Option<SessionReadinessView>),
+    ForkProvenance(Option<SessionForkProvenanceView>),
+    HistoryTree(SessionHistoryTreeView),
+    Turns(Page<HistoricalTurnSummaryView>),
+    Turn(HistoricalTurnView),
+    Items(Vec<ItemView>),
+    Item(ItemView),
+    PendingInteractions(Vec<InteractionView>),
+}
+
+pub enum CommandSurfaceQueryResult {
+    Catalog(CommandCatalogView),
+    Suggestions(Vec<CommandSuggestionView>),
+    Help(CommandOutput),
+}
+
+pub enum ModelQueryResult {
+    Providers(Page<ProviderSummaryView>),
+    Models(Page<ModelSummaryView>),
+    Capabilities(ModelCapabilitiesSummaryView),
+}
+
+pub enum PromptQueryResult {
+    Prompts(Page<PromptSummaryView>),
+    Prompt(PromptSummaryView),
+}
+
+pub enum SkillQueryResult {
+    Skills(Page<SkillSummaryView>),
+    Skill(SkillSummaryView),
+}
+
+pub enum ToolQueryResult {
+    Tools(Page<ToolSummaryView>),
+    Tool(ToolSummaryView),
+}
+
+pub struct DiagnosticsQueryResult {
+    pub runtime: Vec<RuntimeDiagnosticView>,
+    pub sessions: Vec<SessionDiagnosticsView>,
+}
+
+pub struct SessionDiagnosticsView {
+    pub session_id: SessionId,
+    pub diagnostics: Vec<SessionDiagnosticView>,
 }
 ```
 
-Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot；需要完整恢复读模型时使用Snapshot或snapshot-first subscription。
+Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Submit/Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot。domain CAS revision直接存在于`AgentSummary`、`SessionSummary`或definition result中，不再增加未定义generic `QueryRevision`。pagination cursor绑定query family、filter、sort和captured durable catalog revision；wire encoding由V4-P1-2冻结。
+
+### Common Read Views
+
+```rust
+pub struct RuntimeInfo {
+    pub protocol_version: ProtocolVersion,
+    pub implementation: String,
+    pub implementation_version: String,
+}
+
+pub struct RuntimeCapabilities {
+    pub values: Vec<RuntimeCapability>,
+}
+
+pub enum RuntimeCapability {
+    StateEvents,
+    ProgressEvents,
+    RuntimeSnapshot,
+    SessionSnapshot,
+    PagedQueries,
+    CommandCatalog,
+    InteractionResolution,
+    SessionFork,
+}
+
+pub struct AgentDefinitionSummary {
+    pub agent_id: AgentId,
+    pub revision: AgentRevision,
+    pub prompt_ids: Vec<PromptId>,
+    pub created_at: Timestamp,
+}
+
+pub struct SessionDefinitionSummary {
+    pub session_id: SessionId,
+    pub revision: SessionDefinitionRevision,
+    pub agent: AgentRevisionRef,
+    pub workspace: WorkspaceDefinitionSummaryView,
+    pub model: SessionModelSummaryView,
+    pub prompt_ids: Vec<PromptId>,
+    pub created_at: Timestamp,
+}
+
+pub struct WorkspaceDefinitionSummaryView {
+    pub roots: Vec<WorkspaceRootSummaryView>,
+    pub cwd_root: WorkspaceRootKey,
+    pub cwd_relative: WorkspaceRelativePath,
+}
+
+pub struct WorkspaceRootSummaryView {
+    pub key: WorkspaceRootKey,
+    pub requested_access: RequestedFilesystemAccess,
+    pub prompt_source: bool,
+    pub skill_source: bool,
+}
+
+pub struct SessionModelSummaryView {
+    pub selection: ModelSelection,
+    pub reasoning: ReasoningPreference,
+    pub max_output_tokens: Option<NonZeroU32>,
+}
+
+pub struct HistoricalTurnSummaryView {
+    pub turn_id: TurnId,
+    pub has_final_agent_message: bool,
+    pub first_timestamp: Timestamp,
+    pub last_timestamp: Timestamp,
+}
+
+pub struct HistoricalTurnView {
+    pub turn_id: TurnId,
+    pub items: Vec<ItemView>,
+    pub has_final_agent_message: bool,
+    pub first_timestamp: Timestamp,
+    pub last_timestamp: Timestamp,
+}
+
+pub struct RuntimeDiagnosticView {
+    pub code: String,
+    pub message: String,
+}
+
+pub struct SessionDiagnosticView {
+    pub code: String,
+    pub message: String,
+}
+```
+
+diagnostic view没有global severity。code由owning module allowlist投影，message bounded/redacted；raw provider/storage/OS text不公开。
+
+### Catalog Read Views
+
+```rust
+pub struct CommandCatalogView {
+    pub entries: Vec<CommandCatalogEntryView>,
+}
+
+pub struct CommandCatalogEntryView {
+    pub path: Vec<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub accepts_prompt: bool,
+}
+
+pub struct CommandSuggestionView {
+    pub replacement: String,
+    pub display: String,
+}
+
+pub struct ProviderSummaryView {
+    pub provider_id: ProviderId,
+    pub display_name: String,
+    pub available: bool,
+}
+
+pub struct ModelSummaryView {
+    pub selection: ModelSelection,
+    pub display_name: String,
+    pub context_window_tokens: Option<NonZeroU32>,
+    pub max_output_tokens: Option<NonZeroU32>,
+    pub capabilities: ModelCapabilitiesSummaryView,
+    pub available: bool,
+}
+
+pub struct ModelCapabilitiesSummaryView {
+    pub tools: bool,
+    pub structured_output: bool,
+    pub reasoning: bool,
+    pub streaming: bool,
+    pub parallel_tool_calls: bool,
+}
+
+pub struct PromptSummaryView {
+    pub prompt_id: PromptId,
+    pub display_name: String,
+    pub role: PromptRole,
+    pub available: bool,
+}
+
+pub struct SkillSummaryView {
+    pub skill_id: SkillId,
+    pub name: String,
+    pub description: Option<String>,
+    pub available: bool,
+}
+
+pub struct ToolSummaryView {
+    pub name: ToolName,
+    pub description: String,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub open_world: bool,
+}
+```
+
+catalog views不包含Prompt/Skill正文、Tool schema/private route、provider endpoint/auth或Workspace absolute path。每个owner负责构造safe summary；P1-2只冻结wire/limits，不重新定义业务字段。
 
 ## Snapshot
 
@@ -960,11 +1213,28 @@ pub enum SnapshotResponse {
 ```rust
 pub struct RuntimeSnapshot {
     pub runtime: RuntimeView,
-    pub agents: Vec<AgentSummary>,
     pub loaded_sessions: Vec<LoadedSessionSummary>,
     pub diagnostics: Vec<RuntimeDiagnosticView>,
 }
+
+pub struct RuntimeView {
+    pub status: RuntimeStatusView,
+}
+
+pub enum RuntimeStatusView {
+    Running,
+    Closing,
+}
+
+pub struct LoadedSessionSummary {
+    pub session_id: SessionId,
+    pub readiness: SessionReadinessView,
+    pub execution: SessionExecutionView,
+    pub recording: SessionRecordingView,
+}
 ```
+
+`RuntimeSnapshot`只恢复current-process Runtime状态与loaded membership，不无界内联durable Agent/Session catalog。host每次收到新的Runtime Snapshot（首次subscribe、reconnect或publisher restart）都必须丢弃本地Agent/Session catalog cache并重新执行paged `ListAgents`与`ListSessions`；随后当前subscription内的typed Runtime StateEvent用于增量失效/刷新。该两步规则使断线期间丢失的create/archive/delete可以恢复，又不建立all-catalog stop-the-world Snapshot。
 
 `RuntimeSnapshot`不包含所有loaded Session的完整message、current Items、Pending Interaction或大型Prompt/Skill/Tool/Model/Command catalogs。它只负责Runtime scope状态和loaded membership；host收到每个新的Runtime Snapshot后按需重新执行safe catalog queries，不使用catalog revision判断本地cache是否仍有效。
 
@@ -974,9 +1244,10 @@ pub struct RuntimeSnapshot {
 pub struct SessionSnapshot {
     pub session_id: SessionId,
     pub lifecycle: SessionLifecycleView,
+    pub metadata: SessionMetadataView,
     pub definition: SessionDefinitionSummary,
-    pub load_state: SessionLoadState,
-    pub readiness: SessionReadiness,
+    pub load_state: SessionLoadStateView,
+    pub readiness: SessionReadinessView,
     pub execution: SessionExecutionView,
     pub current_turn: Option<CurrentTurnView>,
     pub active_items: Vec<ItemView>,
@@ -985,6 +1256,96 @@ pub struct SessionSnapshot {
     pub recording: SessionRecordingView,
     pub usage: Option<SessionUsageView>,
     pub diagnostics: Vec<SessionDiagnosticView>,
+}
+
+pub enum SessionLifecycleView {
+    Open,
+    Archived,
+    Deleted,
+}
+
+pub enum SessionLoadStateView {
+    Loaded,
+    Unloading,
+}
+
+pub enum SessionReadinessView {
+    Preparing,
+    Ready,
+    Unavailable(SessionUnavailableView),
+}
+
+pub enum SessionUnavailableView {
+    AgentUnavailable,
+    WorkspaceUnavailable,
+    ModelUnavailable,
+    PromptUnavailable,
+    DurableStateCorrupt,
+    RuntimeDependencyUnavailable,
+}
+
+pub enum SessionExecutionView {
+    Idle,
+    Starting,
+    Running,
+    Finishing,
+}
+
+pub struct CurrentTurnView {
+    pub turn_id: TurnId,
+    pub status: TurnStatusView,
+    pub phase: Option<TurnExecutionPhaseView>,
+    pub started_at: Timestamp,
+}
+
+pub enum TurnStatusView {
+    Running,
+    Completed { completed_at: Timestamp },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruptionView,
+    },
+    Failed {
+        completed_at: Timestamp,
+        reason: TurnFailureView,
+    },
+}
+
+pub enum TurnExecutionPhaseView {
+    Sampling,
+    RetryBackoff,
+    Compacting,
+    WaitingApproval,
+    WaitingForUserInput,
+    ExecutingTools,
+}
+
+pub enum TurnInterruptionView {
+    UserCancelled,
+    SecurityRevoked,
+    PrepareForUnload,
+    RuntimeShutdown,
+    RuntimeFailure,
+}
+
+pub enum TurnFailureView {
+    Prompt,
+    Model,
+    Tool,
+    ContextOverflow,
+    DependencyUnavailable,
+    InvariantFailure,
+}
+
+pub struct SessionUsageView {
+    pub model_calls: u64,
+    pub compaction_calls: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reported_cost: Option<Money>,
 }
 
 pub struct SessionQueueView {
@@ -1031,7 +1392,7 @@ wire固定为object + string state：
 {"recording":{"state":"degraded"}}
 ```
 
-长期recorded Turn历史通过Query按需读取。Snapshot只携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的live Items，并按live conversation顺序与assistant Reasoning/Text/ToolCall content顺序排列。一个Session最多暴露一个current Turn/ActiveTurnTask，消费[INV-101](../architecture.md#跨模块不变量索引)。Snapshot不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
+长期recorded Turn历史通过Query按需读取。`SessionSnapshot`只存在于已原子发布的loaded execution；Loading尚未发布Session owner，因此`snapshot(Session)`返回SessionNotLoaded/Unavailable而不是半成品Snapshot。Snapshot携带当前loaded Session的live observer baseline；`active_items`完整包含current Turn的live Items，并按live conversation顺序与assistant Reasoning/Text/ToolCall content顺序排列。一个Session最多暴露一个current Turn/ActiveTurnTask，消费[INV-101](../architecture.md#跨模块不变量索引)。Snapshot不是durable checkpoint，也不用于恢复旧Model/Tool waiter。
 
 `SessionRecordingState`语义：
 
@@ -1079,7 +1440,7 @@ Cancel被Executor接受后，`SessionExecutionView`必须立即反映`Finishing`
 
 Runtime与每个Session使用独立owner和Snapshot，不存在跨scope可比较的全局sequence。
 
-`SessionSnapshot`从对应SessionExecutor的latest-wins/coalesced immutable published view读取，不进入mutation/control lane，也不承诺与不同SessionIngress lane形成全局FIFO。`RuntimeSnapshot`由Runtime owner捕获Agent/Session membership和runtime projection，不等待所有SessionExecutor parked，也不构造all-loaded stop-the-world barrier。
+`SessionSnapshot`从对应SessionExecutor的latest-wins/coalesced immutable published view读取，不进入mutation/control lane，也不承诺与不同SessionIngress lane形成全局FIFO。`RuntimeSnapshot`由Runtime owner捕获Runtime status与loaded Session membership，不等待所有SessionExecutor parked，也不构造all-loaded stop-the-world barrier；durable Agent/Session catalogs通过paged Query恢复。
 
 单独调用`snapshot()`只读取调用时的当前view。用于持续观察时，host调用`subscribe(scope)`：owner必须在同一publication synchronization内注册subscriber并捕获初始Snapshot，EventStream第一帧返回该Snapshot，随后只发送该点之后的实时事件。禁止用非原子的“先snapshot再subscribe”或“先subscribe再snapshot”替代。
 
@@ -1208,6 +1569,25 @@ pub enum SessionEventDetail {
         removed_command_ids: Arc<[CommandId]>,
         reason: QueueUpdateReason,
     },
+    ItemChanged {
+        item: ItemView,
+    },
+    TurnTerminal {
+        turn_id: TurnId,
+        terminal: TurnTerminalView,
+    },
+}
+
+pub enum TurnTerminalView {
+    Completed { completed_at: Timestamp },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruptionView,
+    },
+    Failed {
+        completed_at: Timestamp,
+        reason: TurnFailureView,
+    },
 }
 
 pub enum QueueUpdateReason {
@@ -1236,7 +1616,9 @@ StateEvent规则：
 - Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；Agent/Session metadata使用独立`AgentMetadataUpdated | SessionMetadataUpdated` kind，event后的full view/snapshot携带new metadata CAS token；metadata同样不得写conversation JSONL；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
-- payload包含完整final view，能够校正之前丢失的ProgressEvent。
+- payload包含完整final view，能够校正之前丢失的ProgressEvent；
+- `ItemCompleted | ItemToolInvocation*`必须携带matching `ItemChanged` detail；
+- `TurnCompleted | TurnInterrupted | TurnFailed`必须携带matching `TurnTerminal` detail，即使该event后的Snapshot已经把`current_turn`清空；detail reason只使用safe closed taxonomy，不含provider/Tool/raw error。
 - Cancel/PrepareForUnload清理process-local Steer或FollowUp时，`queue_updated`携带被移除的CommandId和typed reason；它只说明队列事实变化，不把未record消息伪造成可恢复UserMessage。
 
 上述两个kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整Snapshot；`SessionEventDetail`只承载Snapshot无法表达但对本次transition有用的safe correlation信息。
@@ -1878,6 +2260,7 @@ Public interface是 contract test surface。
 ### Query/Snapshot Tests
 
 - Query只读且不发布Event；
+- QueryResponse所有family使用closed QueryResult variant，domain CAS token内联在对应summary/definition，不存在generic QueryRevision；
 - session list不加载SessionExecutor；
 - GetHistoryTree由owner一次性捕获并返回自洽的完整compact branch topology，不内联Item bodies、不分页、也不返回额外history revision；
 - history tree不暴露internal entry/event；
@@ -1888,7 +2271,7 @@ Public interface是 contract test surface。
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - first/new SessionSnapshot完整枚举Submit admission、Steer和FollowUp CommandId，lane-local顺序稳定且不公开prompt preview；
 - Snapshot中每个Submit entry可用Cancel(Submit)定位，每个Steer/FollowUp可用CancelQueuedMessage定位；Starting转TurnStarted后Submit CommandId消失并由current TurnId成为cancel target；
-- RuntimeSnapshot不等待所有SessionExecutor；
+- RuntimeSnapshot不等待所有SessionExecutor；每个new Runtime Snapshot后host必须重新分页ListAgents/ListSessions，恢复断线期间durable catalog变化；
 - pending Interaction可从SessionSnapshot恢复；
 - Healthy/Degraded两态JSON wire稳定，Create无recording opt-out且每次Load都尝试初始化Recorder；
 - Degraded Snapshot始终携带至少一条当前脱敏recording diagnostic；
@@ -1910,7 +2293,7 @@ Public interface是 contract test surface。
 - Degraded后修复storage、重复Load command或后续record call均不能恢复当前loaded instance；
 - Unload/Load的新Snapshot可以重新Healthy，但只包含recorded prefix；
 - logical model_retry_scheduled丢失时不影响最终Snapshot/terminal校正；
-- final Item event携带完整view；
+- final Item event携带完整ItemChanged detail和UI-safe ItemView；
 - assistant content创建事件按Reasoning/Text/ToolCall顺序发布；
 - parallel Tool逆序完成只更新各自原位置，不改变call order；
 - Snapshot替换有序live Items并清空provisional Items；
@@ -1919,12 +2302,13 @@ Public interface是 contract test surface。
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
-- Turn只有一个terminal event；
+- Turn只有一个terminal event，且携带matching TurnTerminal detail；event后的Snapshot可以清空current_turn；
 - subscriber buffer不足时关闭stream，不做event replay。
 
 ### Security Tests
 
 - catalog/query/snapshot/event不包含credential；
+- SessionDefinitionSummary不包含Workspace absolute path；ItemView不包含Skill/Workspace注入正文、raw Tool args/result或hidden reasoning；
 - renderer不能提交raw internal command；
 - renderer不能直接持有Tool waiter、SessionRecorder或伪造MiniCore未请求的Pending Interaction；
 - QueueView只暴露cancel所需CommandId/kind/Turn target，不包含queued PromptIntent正文、Skill IDs或preview；

@@ -82,6 +82,62 @@ pub enum ItemStatus {
 }
 ```
 
+公开`ItemView`是owner-produced UI-safe projection，不序列化private MessageRecord、Tool arguments或reasoning artifact：
+
+```rust
+pub struct ItemView {
+    pub item_id: ItemId,
+    pub turn_id: TurnId,
+    pub status: ItemStatus,
+    pub content: ItemContentView,
+    pub created_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+}
+
+pub enum ItemContentView {
+    UserMessage(UserMessageView),
+    AgentMessage(AgentMessageView),
+    Reasoning(ReasoningView),
+    ToolInvocation(ToolInvocationView),
+}
+
+pub struct UserMessageView {
+    pub source: UserMessageSource,
+    pub body: Option<String>,
+    pub contributions: Arc<[PromptContributionOrigin]>,
+}
+
+pub struct AgentMessageView {
+    pub disposition: AssistantDisposition,
+    pub text: Arc<[String]>,
+}
+
+pub struct ReasoningView {
+    pub summaries: Arc<[String]>,
+}
+
+pub struct ToolInvocationView {
+    pub tool_call_id: ToolCallId,
+    pub tool_name: ToolName,
+    pub arguments_summary: String,
+    pub result: Option<ToolResultSummaryView>,
+}
+
+pub struct ToolResultSummaryView {
+    pub disposition: ToolResultDisposition,
+    pub summary: String,
+}
+```
+
+rules：
+
+- User body只返回用户显式body；Skill/Workspace contribution返回safe origin，不返回注入正文、absolute path或authorization；
+- AgentMessage只返回user-visible finalized Text；opaque/hidden reasoning不混入；
+- Reasoning只返回provider允许display的summary，不返回encrypted/signature/hidden chain-of-thought；
+- Tool arguments/result由Tool-owned redaction policy产生bounded summary，不返回prepared args、raw details、credential或sandbox internals；
+- public summary construction失败时使用typed redacted placeholder，不fallback raw payload；
+- string/count limits和serde shape由V4-P1-2冻结。
+
 Item顺序由live conversation顺序和assistant content顺序决定；不增加DisplaySequence。
 
 - UserMessage、final AgentMessage和Reasoning在live final mutation时Completed；
@@ -332,6 +388,7 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 ## 测试要求
 
 - Turn/Item lifecycle；
+- ItemView只含user body/safe contribution origin、visible assistant text、reasoning summary和redacted Tool summary；
 - streaming finalization和retry cleanup；
 - ToolCall ID uniqueness/correlation；
 - Tools-owned ToolCall/Outcome和Session-owned ToolOperationSlot没有第二份type definition；
