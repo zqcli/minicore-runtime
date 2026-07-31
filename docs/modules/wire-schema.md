@@ -532,7 +532,7 @@ Snapshot aggregate proof同时要求：每个ItemView encoded bytes<=65,536、�
 
 ## Conversation JSONL Shared V1 Rules
 
-Conversation Storage拥有Stored semantic DTO和replay projection；本节冻结共同wire/scanner floor。
+Conversation Storage拥有Stored semantic DTO和replay projection；本节冻结共同wire/scanner floor。六种body与byte-exact field projection见[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)。
 
 ### Physical Records
 
@@ -562,7 +562,7 @@ scanner不得使用unbounded `read_line`/`read_until`。open首先对包含tail�
 - final bytes没有LF且whole file未超cap：无论是否构成valid JSON都视为partial tail；read-only replay忽略，writable open在valid v1 header和exclusive lease下只truncate到last LF；
 - newline-terminated malformed/oversized/unknown line永不truncate或rewrite；
 - later valid line可以成为orphan root并按Conversation Storage规则隔离；
-- replay达到1,000,000 complete entry cap时由Conversation Storage返回`HistoryTooLarge`；不能把未扫描suffix误报为普通complete history。
+- replay在准备接受第1,000,001个complete entry时由Conversation Storage返回`HistoryTooLarge`；不能把未扫描suffix误报为普通complete history。
 
 ### Diagnostics
 

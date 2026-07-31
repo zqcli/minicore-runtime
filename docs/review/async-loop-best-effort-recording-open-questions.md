@@ -121,7 +121,7 @@ TurnInterrupted/TurnFailed只apply live并在recordable settlement facts完成�
 - Degraded不影响ID分配；live Item、Interaction、Compaction和StateEvent继续使用已分配ID；
 - generated ID在同一loaded instance内不复用，即使后续mutation因内部invariant失败而未publish；
 - EntryId与JSONL line number、Codex式rollout ordinal或ConversationRevision分离；
-- 具体UUID/ULID算法、字符串编码和serde wire留到public ID schema freeze。初始实现优先评估UUIDv7，但Q9不冻结算法。
+- Q9当时不冻结具体ID wire；该后续项现由[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)关闭为typed prefix + 128-bit CSPRNG lowercase hex。
 
 ## Q10：Cold recovery closure
 

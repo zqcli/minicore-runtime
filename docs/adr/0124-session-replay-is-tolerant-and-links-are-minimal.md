@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0126, 0127, 0131 and 0132
 日期：2026-07-29
 
+> 2026-07-31：[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Format V1](../formats/conversation-jsonl-v1.md)冻结typed ID/revision、strict Header、bounded scanner、oversized complete line、partial-tail truncation precedence和exact Stored DTO。tolerant replay/minimal links语义保持。
+
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化single prefix marker：`first_kept_entry_id`必须由live reducer发布的provider-valid stable-unit source与cut派生；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
 
 > 2026-07-31：tolerant replay、minimal links与Tool exchange sanitizer继续保留；ADR 0127删除`StoredTurnStart`、Turn terminal entries、restart/fork closure。Replay只重建conversation facts，Load后的`current_turn`为空。
@@ -206,7 +208,7 @@ O3关闭。MVP普通loader提供：
 
 ## 实现约束
 
-- wire schema仍使用typed IDs，serde casing和MiniCore生成ID的UUID策略在wire/schema freeze中统一；ToolCallId保持adapter-normalized opaque string，不承诺UUID；
+- wire schema使用typed IDs；[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)已冻结MiniCore-generated prefix + 128-bit CSPRNG lowercase hex，ToolCallId保持adapter-normalized opaque string；
 - append strict validator与replay tolerant reducer分别测试，禁止把replay skip逻辑用于live append；
 - 每个skip/isolate必须产生bounded、redacted diagnostic；
 - model input sanitizer必须有complete/missing/duplicate/orphan ToolCall/ToolResult及ToolResult/ToolAbandoned冲突测试；

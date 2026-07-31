@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -559,6 +559,16 @@ pub enum SessionReadiness {
     Ready,
     Unavailable(SessionUnavailable),
 }
+
+pub enum SessionUnavailable {
+    AgentUnavailable,
+    WorkspaceUnavailable,
+    ModelUnavailable,
+    PromptUnavailable,
+    DurableStateCorrupt,
+    DurableStateTooLarge,
+    RuntimeDependencyUnavailable,
+}
 ```
 
 ```text
@@ -582,10 +592,11 @@ Unavailable 可以来自：
 - exact AgentRevision 不可读或损坏；
 - Agent Disabled/Deleted；
 - Workspace root/authority unavailable；
-- replay后无法得到安全future-admission basis（局部history corruption本身只产生diagnostic）；
+- replay Header/required durable basis损坏；
+- valid conversation file超过format-v1 1 GiB/1,000,000-entry hard cap；
 - required Runtime dependency unavailable。
 
-`SystemError` 不是 durable Session lifecycle。需要修复的问题通过 `Unavailable(reason)`、load error 或 recovery diagnostics 表达。
+局部entry/history corruption本身只产生diagnostic并隔离projection；strict Header/required durable basis failure使用DurableStateCorrupt，hard size/count cap使用DurableStateTooLarge。`SystemError`不是 durable Session lifecycle。需要修复的问题通过 `Unavailable(reason)`、load error 或 recovery diagnostics 表达。
 
 Readiness是projection，不是Agent/Session lifecycle admission的authoritative substitute。每次initiating UserMessage live apply前仍必须重新检查durable SessionLifecycle、AgentStatus、exact revisions和Workspace authorization。
 
@@ -959,7 +970,7 @@ fork使用staging + atomic publication。复制完成后执行tolerant replay并
 
 child definition由本lifecycle owner从source durable SessionDefinition构造revision 1；conversation copy只包含selected User/Assistant/Tool、Interaction和Compaction facts，不复制source definition/metadata/lifecycle transition timeline。
 
-Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。具体ID算法和文本wire后续冻结。完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
+Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。exact typed ID carrier由[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)冻结；完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
 ## Turn Admission Basis
 

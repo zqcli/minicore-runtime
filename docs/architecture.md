@@ -227,6 +227,7 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 - [Tools](modules/tools.md)：ToolSet、policy、approval、sandbox和executor。
 - [Turn执行上下文](modules/turn-execution-context.md)：immutable capture和ConversationRevision basis。
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：live lifecycle、Tool exchange和Interaction。
+- [Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field/tag、limits和corruption behavior。
 - [Conversation Recording与Replay](modules/conversation-storage.md)：JSONL recorder、recording health、tolerant replay和fork。
 - [Session执行](modules/session-execution.md)：control actor、ActiveTurnTask、async loop和queues。
 - [ModelGateway](modules/model-gateway.md)：single provider attempt和response taxonomy。

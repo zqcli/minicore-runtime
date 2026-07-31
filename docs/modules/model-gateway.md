@@ -1135,7 +1135,7 @@ pub struct ModelUsage {
 - provider若为失败attempt报告usage，该事实只进入ModelGateway internal telemetry；不放入ModelCallError、不进入Session aggregate，也不创建synthetic assistant或独立Usage entry；
 - 因此MiniCore SessionStorage不是provider billing ledger。
 
-StoredAssistantMessage的`retry_count`定义为ActiveTurnTask对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
+StoredAssistantMessage的`logical_retry_count`定义为ActiveTurnTask对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
 
 ## Retry
 
@@ -1244,7 +1244,7 @@ logical retry：
 
 - 不阻塞SessionExecutor control actor；
 - Steer、Cancel、成功Compaction Replace或conversation change使其失效；
-- 计入StoredAssistantMessage.retry_count；
+- 计入StoredAssistantMessage.logical_retry_count；
 - 不创建ModelAttempt entity；
 - 不改变ModelCallPurpose；
 - 不与旧本地Model future重叠；provider端可能继续工作或计费不等于旧future仍可回传ActiveTurnTask。
@@ -1616,16 +1616,17 @@ encode/write失败时，assistant live mutation保留，recording health转为De
 
 SessionRecorder可以在`StoredAssistantMessage`中保存safe `ModelResponseSummary`：actual `ProviderId + ModelId + ModelReasoningSummary + ModelServiceClass`。response ID、finish reason、effective max output、usage、logical retry和allowlisted ProviderResponseMetadata是StoredAssistantMessage的独立fields，不属于ModelResponseSummary。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
 
-实际record成功的assistant entry保存：
+实际record成功的assistant entry按[Format V1 Assistant Message](../formats/conversation-jsonl-v1.md#assistant-message)保存：
 
 ```text
 ModelResponseSummary
 allowlisted response_id
-ordered finalized content[]
-normalized ModelUsage
+ordered StoredAssistantContent[]（每variant内联ItemId）
 normalized ModelFinishReason
-Session logical retry_count
-allowlisted provider metadata
+effective_max_output_tokens
+normalized ModelUsage
+Session logical_retry_count
+allowlisted ProviderResponseMetadata
 ```
 
 不保存：
@@ -1645,9 +1646,9 @@ full AssembledModelContext
 
 首版automatic SummaryModel compaction把normalized result投影到[Compaction唯一拥有的`StoredCompactionModelCall`](compaction.md#summary-validation与provenance)：`ModelResponseSummary`、allowlisted response ID、usage、finish reason、requested max output、Session logical retry count和`ProviderResponseMetadata`。StoredCompaction本体保存summary与single `first_kept_entry_id` marker；automatic路径该字段必须为Some。`None`只为未来明确设计的deterministic maintenance/import保留，不是automatic overflow fallback。ModelGateway不定义第二份stored provenance type，也不接收marker/cut。
 
-`retry_count`只表示Session logical retry。Gateway没有transparent retry count。
+`logical_retry_count`只表示Session logical retry。Gateway没有transparent retry count。
 
-Provider response ID和reasoning opaque artifact必须有长度限制和redaction validation。
+Provider response ID和ReasoningContent opaque artifact使用Wire/Format v1 exact length、safe-character和redaction validation；oversized response在live apply前ModelGateway fail，不依赖Recorder截断。
 
 ## Performance
 
@@ -1778,7 +1779,7 @@ opaque encrypted reasoning
 - first semantic delta后failure返回StreamInterrupted；
 - 401不refresh-and-resend；request前credential refresh可以singleflight；
 - 429返回typed Retry-After，Gateway不sleep；
-- active cooldown零provider attempt并返回typed Retry-After，但仍算当前logical call chain的一次Gateway invocation；若该调用由retry启动，对应retry_count已经消耗；
+- active cooldown零provider attempt并返回typed Retry-After，但仍算当前logical call chain的一次Gateway invocation；若该调用由retry启动，对应logical_retry_count已经消耗；
 - MVP不做WebSocket → HTTP fallback；
 - 不允许provider/model substitution；
 - AgentRun最多3次Session logical retry，backoff 2s/4s/8s；

@@ -1,6 +1,6 @@
 # Compaction 架构设计
 
-状态：当前权威架构（ADR 0132后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -498,7 +498,7 @@ plan-derived first_kept_entry_id
 Some(StoredCompactionModelCall)
 ```
 
-首版automatic SummaryModel Compaction始终`model_call = Some`。`None`仅为future显式设计的deterministic maintenance/import路径保留，不是automatic overflow fallback。wire casing、字段长度和format-v1 encoding进入V4-P1-2，不改变这里冻结的semantic fields。
+首版automatic SummaryModel Compaction始终`model_call = Some`。`None`仅为future显式设计的deterministic maintenance/import路径保留，不是automatic overflow fallback。[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#compaction)冻结camelCase fields、null、summary<=65,536 bytes、finish/retry/request-max/metadata和marker encoding；不改变这里的semantic owner。
 
 ## Live Replace与Recording
 
@@ -616,6 +616,7 @@ exact next AgentRun pressure/ContextOverflow
 - plan budget等于Prompt proof与ModelCallRequest max output；
 - summary retry复用same plan/request；
 - automatic provenance总是Some且字段完整；
+- StoredCompaction format-v1 golden round-trip、summary 65,536-byte boundary/+1、automatic model_call non-null；
 - wrong model、Refused、multiple/empty Text或retry count > 1拒绝；
 - consumed Steer使plan stale，queued Steer不使其stale；
 - Cancel/SecurityRevoked在revision不变时仍拒绝result；
@@ -659,6 +660,6 @@ ADR 0124已经删除scope、frontier与coverage chain。MVP允许旧Input/Steer�
 - [x] 冻结Pressure/Plan input、cut、budget和bounded progress。
 - [x] 冻结automatic StoredCompaction model-call provenance。
 - [x] 冻结live Replace与cold replay marker规则。
-- [ ] V4-P1-2冻结StoredCompaction wire casing、limits与golden vectors。
+- [x] ADR 0134/Format V1冻结StoredCompaction wire casing、limits与golden vector contract。
 - [ ] 实现ScriptedProviderAdapter Compaction vertical slice。
 - [ ] 实现Rig provider CompactionSummary mapping。

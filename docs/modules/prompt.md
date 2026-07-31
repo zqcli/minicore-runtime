@@ -531,7 +531,7 @@ impl PromptContributionStamp {
 }
 ```
 
-CanonicalUserMessage、UserMessageCompositionInput和PromptContributionStamp字段/constructor保持private。CanonicalUserMessage只能由PromptSet成功规范化后创建，是可以进入live conversation并被best-effort record的标准值；它不是裸字符串，也不是与MessageRecord并列的第二份消息状态。live与storage共同使用同一个PromptContributionStamp类型，不定义`StoredPromptContributionStamp`。
+CanonicalUserMessage、UserMessageCompositionInput和PromptContributionStamp字段/constructor保持private。CanonicalUserMessage只能由PromptSet成功规范化后创建，是可以进入live conversation并被best-effort record的标准值；它不是裸字符串，也不是与MessageRecord并列的第二份消息状态。live与storage共同使用同一个PromptContributionStamp类型，不定义`StoredPromptContributionStamp`。[Format V1 User Message](../formats/conversation-jsonl-v1.md#user-message)冻结parts/stamps camelCase wire、independent stamp degradation和exact limits。
 
 SkillIntent的完整Skill内容必须先由TurnExecutionContext的async `resolve_user_message()`使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。TurnExecutionContext确认全部required Workspace contributions成功后才构造composition input。PromptSet不读取Skill文件；它把SkillIntent与Skill contributions一一匹配，验证全部supplied Workspace contributions并规范化进MessageRecord。Skill缺失、stale selection、重复Skill、额外Skill contribution、required Workspace contribution失败或source mismatch时，整条composition在live apply前失败；不能创建部分用户消息。
 
@@ -821,6 +821,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - duplicate SkillId、captured Skill缺失/删除、source mismatch或required Workspace contribution失败时不apply部分UserMessage；
 - reload发生在active Turn期间时，Steer继续从captured SkillView加载旧entry；future Turn使用new view；
 - resolve等待Skill load时Cancel/SecurityRevoked由Session execution终止caller，迟到cache结果不能进入PromptSet/live conversation；
+- PromptContributionStamp format-v1 golden：Skill/Workspace origin、unknown/malformed/out-of-range/duplicate first-valid behavior；
 - Workspace contributions按`WorkspaceRootKey + WorkspaceRelativePath`稳定排序；
 - Unicode正文、emoji和Image等结构化part不影响`content_part_index`关联；
 - stamp不包含绝对路径、canonical root、trust、authorization、hash、cache key或正文引用；
