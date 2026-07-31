@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已按ADR 0126–0129重构，生产实现待启动
+状态：V2目标架构已推进至ADR 0131；V4-P0-1至P0-4/P1-4已关闭，P0-5与P1-1至P1-3待关闭，生产实现未启动
 日期：2026-07-31
 
 ## 目的
@@ -212,7 +212,7 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-开始下列实现前，先关闭[第四轮设计评审](../review/v2-design-review-4.md)中的P0 shared contract；P1 public/wire/provider项按对应crate surface门槛关闭。
+开始下列实现前，先关闭[第四轮设计评审](../review/v2-design-review-4.md)剩余的V4-P0-5 Compaction contract；P0-1至P0-4与P1-4已关闭。P1-1至P1-3按对应public/wire/provider crate surface门槛关闭。
 
 1. 创建Rust crate与基础ID/error types；
 2. 实现LiveConversation reducer和ScriptedProviderAdapter；
@@ -259,8 +259,8 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- [第四轮设计评审](../review/v2-design-review-4.md)中的P0共享类型、Prompt/Skill composition、conversation recording owner与Compaction contract；
-- 第四轮P1 Runtime public payload、wire/storage envelope和provider scope；
+- [第四轮设计评审](../review/v2-design-review-4.md)中的V4-P0-5 Compaction stable-unit source、settings、plan input与model-call provenance；
+- 第四轮V4-P1-1至P1-3 Runtime public payload、wire/storage envelope和provider scope；V4-P1-4已关闭；
 - wire/schema freeze（serde casing、public IDs、Timestamp/Money、StoredCompaction）；
 - Rig provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
@@ -278,7 +278,7 @@ canonical owner
 → rg old terminology scan
 ```
 
-ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124被部分修订。历史正文保留，但实现必须以ADR 0126和current modules为准。
+ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124被部分修订；ADR 0130/0131分别冻结async Skill composition和conversation JSONL configuration/lifecycle边界。历史正文保留，但实现必须以current modules与最新Accepted ADR为准。
 
 ## 完成定义
 

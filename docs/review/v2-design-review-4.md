@@ -5,9 +5,11 @@
 范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0129、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
+关闭进度：V4-P0-1至P0-4与V4-P1-4 Closed；V4-P0-5、V4-P1-1至P1-3和V4-C0-1 Open。ADR 0130/0131是本review关闭过程中新增的Accepted决议。
+
 ## 总体结论
 
-ADR 0126–0129确定的主方向继续成立：
+ADR 0126–0131确定的主方向继续成立：
 
 ```text
 SessionExecutor control actor
@@ -21,7 +23,7 @@ Rig = ModelGateway private ProviderAdapter
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-实现风险已经集中到接口闭合：若直接创建Rust crate，多个共享类型存在两套不兼容定义，Prompt/Skill composition没有可调用的async路径，conversation JSONL仍含无合法writer owner的configuration/lifecycle variants，Compaction无法从当前source view产生可重放marker，public/wire协议仍有不可构造或不可恢复的payload。
+本review创建时识别出五个P0；当前前四项已经关闭。剩余P0是Compaction无法从current source view产生可重放marker，settings与model-call provenance仍未闭合；P1仍集中在Runtime public payload、wire/storage envelope和production provider scope。
 
 严重度定义：
 
@@ -31,18 +33,18 @@ Rig = ModelGateway private ProviderAdapter
 
 ## Finding总览
 
-| ID | 严重度 | Finding | 关闭门槛 |
-| --- | --- | --- | --- |
-| V4-P0-1 | P0 | `ModelCallRequest`有两套不兼容定义 | ordinary AgentRun前 |
-| V4-P0-2 | P0 | Tool call/outcome/start state与mutation queue contract未统一 | complete Tool exchange前 |
-| V4-P0-3 | P0 | Prompt/Skill composition的sync/async与capture ownership无法闭合 | Submit/Steer Skill path前 |
-| V4-P0-4 | P0 | conversation JSONL仍含无合法single-producer owner的Session definition/lifecycle events | storage schema前 |
-| V4-P0-5 | P0 | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
-| V4-P1-1 | P1 | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
-| V4-P1-2 | P1 | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
-| V4-P1-3 | P1 | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
-| V4-P1-4 | P1 | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
-| V4-C0-1 | 条件性P0 | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
+| ID | 严重度 | 状态 | Finding | 关闭门槛 |
+| --- | --- | --- | --- | --- |
+| V4-P0-1 | P0 | Closed | `ModelCallRequest`有两套不兼容定义 | ordinary AgentRun前 |
+| V4-P0-2 | P0 | Closed | Tool call/outcome/start state与mutation queue contract未统一 | complete Tool exchange前 |
+| V4-P0-3 | P0 | Closed | Prompt/Skill composition的sync/async与capture ownership无法闭合 | Submit/Steer Skill path前 |
+| V4-P0-4 | P0 | Closed | conversation JSONL仍含无合法single-producer owner的Session definition/lifecycle events | storage schema前 |
+| V4-P0-5 | P0 | Open | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
+| V4-P1-1 | P1 | Open | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
+| V4-P1-2 | P1 | Open | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
+| V4-P1-3 | P1 | Open | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
+| V4-P1-4 | P1 | Closed | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
+| V4-C0-1 | 条件性P0 | Open | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
 
 ## V4-P0-1 · `ModelCallRequest`有两套不兼容定义
 
@@ -458,7 +460,7 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 
 ## V4-C0-1 · Sandbox enforcement条件性P0继续有效
 
-这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0129关闭。
+这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0131关闭。
 
 production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capability classes。最终PermissionSet要求与adapter enforceable capabilities的差集非空时，必须生成PreExecution Denied ToolResult并拒绝side effect。approval不能把不可强制限制转换为裸执行许可，Sandbox失败也不能静默fallback到无Sandbox执行。
 
@@ -479,18 +481,15 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 - Gateway本地模型permit；ADR 0125继续有效；
 - README遗漏`query`、Agent/Session lifecycle局部“three services”措辞；属于导航问题，已在本轮机械修复，不改变canonical contract。
 
-## 推荐关闭顺序
+## 当前继续顺序
 
-1. V4-P0-1：统一ModelCallRequest。
-2. V4-P0-2：统一ToolCall/Outcome/Slot并接通mutation queue/control handle。
-3. V4-P0-3：冻结async composition与Starting cancellation seam。
-4. V4-P0-4：从conversation JSONL移除无owner的definition/lifecycle events。
-5. V4-P0-5：冻结Compaction stable-unit source、settings和StoredCompaction provenance。
-6. V4-P1-1/V4-P1-2：一次完成public protocol与wire/schema freeze。
-7. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
-8. V4-P1-3：执行Rig spike并冻结production provider scope。
-9. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
-10. V4-P1-4可与Tool canonical修订一起机械关闭。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4。
+
+1. V4-P0-5：冻结Compaction stable-unit source、settings和StoredCompaction provenance。
+2. V4-P1-1/V4-P1-2：一次完成public protocol与wire/schema freeze。
+3. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
+4. V4-P1-3：执行Rig spike并冻结production provider scope。
+5. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
 
 ## 第四轮关闭定义
 

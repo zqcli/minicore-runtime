@@ -51,7 +51,7 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)中的P0共享类型、composition、recording owner和Compaction contract；
+1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)中剩余的V4-P0-5 Compaction stable-unit/settings/provenance contract；P0-1至P0-4与P1-4已关闭；
 2. 冻结public/runtime/storage wire schema与必要MVP限制；
 3. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
 4. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
