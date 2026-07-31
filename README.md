@@ -22,6 +22,6 @@ MiniCoreRuntime.subscribe(SubscriptionRequest) -> EventStream
 → [docs/research/](docs/research/)
 → [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
 
-V1已归档，仅用于历史参考；V2是当前权威架构。ADR 0126已完成async loop与inline best-effort Session recording设计重构，生产实现仍待启动。下一里程碑是先关闭[第四轮设计评审](docs/review/v2-design-review-4.md)确认的共享类型与接口门禁，再完成wire/schema freeze和阶段6–8 async vertical slice；完整进度见[版本迁移记录](docs/migration/v1-to-v2.md)。
+V1已归档，仅用于历史参考；V2是当前权威架构。第四轮评审的P0-1至P0-4与P1-4已关闭并推送，生产实现仍待启动；当前暂停点是[第四轮设计评审](docs/review/v2-design-review-4.md)的V4-P0-5 Compaction contract，之后再关闭P1/wire并启动阶段6–8 async vertical slice。完整换机进度见[设计评审工作交接](docs/review/v2-design-review-handoff.md)。
 
 跨机器恢复当前设计评审工作时，从[设计评审工作交接](docs/review/v2-design-review-handoff.md)开始。
