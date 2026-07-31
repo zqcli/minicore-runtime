@@ -97,6 +97,7 @@ Agent head 保存 identity、当前 definition pointer、durable status 和用�
 pub struct Agent {
     pub id: AgentId,
     pub current_revision: AgentRevision,
+    pub metadata_revision: AgentMetadataRevision,
     pub status: AgentStatus,
     pub name: String,
     pub description: Option<String>,
@@ -163,6 +164,31 @@ name / description / status 改变
 - 被 SessionDefinition、Turn metadata 或 fork provenance 引用的 revision 必须保留；
 - revision GC 留到完整引用追踪可用后设计。
 
+## Metadata Revision
+
+```rust
+pub struct AgentMetadataRevision(/* opaque */);
+pub struct SessionMetadataRevision(/* opaque */);
+```
+
+两者是各自entity内独立、单调、不复用的CAS token：
+
+```text
+Create entity
+→ metadata revision 1
+
+canonical name/description change
+→ metadata revision N+1
+
+no-op metadata patch
+→ revision不变
+
+definition/status/lifecycle/load/conversation change
+→ metadata revision不变
+```
+
+metadata revision不从Timestamp、definition revision或storage ordinal派生。CAS先验证expected metadata revision和non-deleted lifecycle/status，再做canonical no-op detection；stale expected token即使patch恰好等于current metadata也返回`StaleRevision`。definition与metadata revision不能互换。
+
 ## Agent Status
 
 ```rust
@@ -208,9 +234,14 @@ candidate admission在initiating UserMessage live apply前必须经过短Agent l
 
 ```text
 验证 AgentId 未使用
-→ 验证 initial AgentDefinition
+→ 验证 initial AgentDefinition与metadata
 → durable 写入 AgentRevision(1)
-→ durable 发布 Agent head { Enabled, current = 1 }
+→ durable 发布 Agent head {
+     Enabled,
+     current_revision = 1,
+     metadata_revision = 1,
+     initial metadata
+   }
 ```
 
 create 必须原子可见。失败或 crash 的 staging definition 不进入 Agent catalog。
@@ -225,15 +256,24 @@ expected current AgentRevision
 → 原子移动 current pointer
 ```
 
-允许在Enabled或Disabled状态更新；Deleted返回terminal lifecycle error。definition/metadata update必须在Agent lifecycle synchronization内同时CAS expected AgentRevision和`status != Deleted`，因此不能在Delete线性化后发布迟到revision。
+允许在Enabled或Disabled状态更新；Deleted返回terminal lifecycle error。definition update必须在Agent lifecycle synchronization内同时CAS expected AgentRevision和`status != Deleted`；metadata update在同一synchronization内CAS expected AgentMetadataRevision和`status != Deleted`。因此Delete线性化后不能发布迟到definition或metadata。
 
 Agent update 不 fan-out 修改 Session，也不替换 active Turn Context。
 
-Agent definition、metadata和status mutation只写Agent durable owner并更新Runtime read/observer surface；它们不写任一Session conversation JSONL，也不分配Session EntryId。metadata专用event kind仍由Runtime public protocol freeze决定。
+Agent definition、metadata和status mutation只写Agent durable owner并更新Runtime read/observer surface；它们不写任一Session conversation JSONL，也不分配Session EntryId。metadata使用Runtime Interface冻结的独立event kind。
 
 ### Update Agent Metadata
 
-name/description 更新只改变 metadata 和 `updated_at`，不产生 AgentRevision。
+```text
+expected AgentMetadataRevision
++ canonical name/description patch
+→ lifecycle synchronization内CAS status != Deleted
+→ stale expected token: StaleRevision
+→ canonical no-op: NoChange，revision不变，无event
+→ durable metadata + updated_at + metadata revision N+1原子publication
+```
+
+metadata update不产生AgentRevision，也不改变active/future Turn execution definition。successful mutation返回new AgentMetadataRevision并发布独立`AgentMetadataUpdated` event。
 
 ### Disable / Enable / Delete
 
@@ -251,6 +291,7 @@ Session head 保存 identity、当前 definition pointer、durable lifecycle 和
 pub struct Session {
     pub id: SessionId,
     pub current_revision: SessionDefinitionRevision,
+    pub metadata_revision: SessionMetadataRevision,
     pub lifecycle: SessionLifecycle,
     pub fork_provenance: Option<SessionForkProvenance>,
     pub name: Option<String>,
@@ -688,7 +729,12 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 → 最终检查 AgentStatus = Enabled
 → 在同一synchronization内读取current AgentRevisionRef
 → durable staging SessionDefinitionRevision(1) + initial SessionHeader
-→ 原子发布 Session { Open, current = 1 }及conversation storage target
+→ 原子发布 Session {
+     Open,
+     current_revision = 1,
+     metadata_revision = 1,
+     initial metadata
+   }及conversation storage target
 → 确认publication outcome后释放synchronization
 ```
 
@@ -712,9 +758,20 @@ expected SessionLifecycle = Open
 
 active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交，并在resolve与Workspace-bound Prompt/Skill source capture全部成功后发布new Snapshot。definition owner的CAS成功后更新loaded definition view；conversation Recorder health不参与该操作。
 
-metadata update与definition update分开，避免改标题导致future Turn execution definition变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
+metadata update与definition update分开，避免改标题导致future Turn execution definition变化。metadata update可以作用于Open或Archived，并执行：
 
-Session definition/metadata update只写Session durable owner。loaded Session可以收到future-readiness/current-definition observer update或private invalidation，但该mutation不调用SessionRecorder、不生成StoredSessionEntry，也不与ActiveTurnTask竞争record order；metadata专用event kind仍由Runtime public protocol freeze决定。完整conversation scope见[ADR 0131](../adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)。
+```text
+expected SessionMetadataRevision
++ canonical name/description patch
+→ per-session lifecycle synchronization内CAS lifecycle != Deleted
+→ stale expected token: StaleRevision
+→ canonical no-op: NoChange，revision不变，无event
+→ durable metadata + updated_at + metadata revision N+1原子publication
+```
+
+successful mutation返回new SessionMetadataRevision并发布独立`SessionMetadataUpdated` Runtime event；Session已loaded时同一mutation也更新SessionSnapshot并发布Session-scope metadata event。definition/status/load/conversation mutation不递增该token。
+
+Session definition/metadata update只写Session durable owner。loaded Session可以收到future-readiness/current-definition observer update或private invalidation，但该mutation不调用SessionRecorder、不生成StoredSessionEntry，也不与ActiveTurnTask竞争record order；metadata使用Runtime Interface冻结的独立event kind。完整conversation scope见[ADR 0131](../adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)。
 
 ## Explicit Reload
 
@@ -975,7 +1032,7 @@ Agent lifecycle gate从final Enabled check持有到initiating UserMessage live a
 
 ### Session Definition/Metadata Update vs Archive/Delete
 
-Session definition update必须在per-session lifecycle synchronization内同时CAS `SessionLifecycle::Open`与expected revision；metadata update CAS `lifecycle != Deleted`与expected metadata version。Archive/Delete先赢时不满足该operation前置条件的迟到update失败；update先赢时lifecycle mutation观察新的durable head。
+Session definition update必须在per-session lifecycle synchronization内同时CAS `SessionLifecycle::Open`与expected SessionDefinitionRevision；metadata update CAS `lifecycle != Deleted`与expected SessionMetadataRevision。Archive/Delete先赢时不满足该operation前置条件的迟到update失败；update先赢时lifecycle mutation观察新的durable head。
 
 跨Agent/Session操作使用固定synchronization顺序`Agent lifecycle → Session lifecycle`，避免Agent disable、Session upgrade/fork和archive之间形成锁环。
 
@@ -1137,6 +1194,8 @@ Agent release channel
 - Session 不持有 Runtime Service handle；
 - Session durable lifecycle 与 load/readiness/execution state 分离；
 - Agent/Session definition、metadata与durable lifecycle不写conversation JSONL；
+- Agent/Session metadata revision从1开始，只随canonical metadata mutation递增；
+- stale metadata CAS即使patch等于current也失败，no-op只在CAS成功后返回且不发布event；
 - Open 不等于 Loaded；Loaded 不等于 Ready；Ready 不等于 Running；
 - Deleted 是逻辑删除，Purge 才是物理清除；
 - archive/unload/delete 不使用同一个 close 语义；
@@ -1169,6 +1228,7 @@ Agent release channel
 - explicit Session Agent upgrade；
 - upgrade AgentId mismatch；
 - SessionDefinition update CAS；
+- Agent/Session metadata independent CAS、readback、no-op与delete/archive竞态；
 - loaded/unloaded definition与metadata update均不append conversation entry；
 - Workspace update 同时改变 WorkspaceRevision 和 SessionDefinitionRevision；
 - Open/Archived/Deleted transition；

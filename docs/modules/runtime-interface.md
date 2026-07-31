@@ -503,22 +503,37 @@ pub struct CommandResponse {
 pub enum CommandOutcome {
     AgentCreated {
         agent_id: AgentId,
-        revision: AgentRevision,
+        definition_revision: AgentRevision,
+        metadata_revision: AgentMetadataRevision,
     },
-    AgentUpdated {
-        revision: AgentRevision,
+    AgentDefinitionUpdated {
+        definition_revision: AgentRevision,
     },
+    AgentMetadataUpdated {
+        metadata_revision: AgentMetadataRevision,
+    },
+    AgentStatusChanged {
+        status: AgentStatus,
+    },
+    AgentDeleted,
     SessionCreated {
         session_id: SessionId,
-        revision: SessionDefinitionRevision,
+        definition_revision: SessionDefinitionRevision,
+        metadata_revision: SessionMetadataRevision,
+    },
+    SessionDefinitionUpdated {
+        definition_revision: SessionDefinitionRevision,
+    },
+    SessionMetadataUpdated {
+        metadata_revision: SessionMetadataRevision,
     },
     SessionLoaded,
     SessionUnloaded,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     RuntimeReloaded,
     WorkspaceReloaded,
-    SessionUpdated {
-        revision: SessionDefinitionRevision,
-    },
     SessionForked {
         session_id: SessionId,
         source: ForkSourceKind,
@@ -543,6 +558,8 @@ pub enum CommandOutcome {
 
 Command response不是完整业务完成流：
 
+- Agent/Session create返回definition与metadata两个独立revision；definition、metadata、status/lifecycle mutation使用不同outcome，caller不能把metadata token误当execution revision；
+- metadata canonical no-op返回`NoChange`并保持原token，不发布metadata event；
 - `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
 - `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
@@ -556,10 +573,12 @@ Command response不是完整业务完成流：
 
 | Command | Response线性化点 |
 | --- | --- |
-| Create Agent | Agent head与revision durable publication |
-| Update Agent | expected revision/status CAS成功 |
-| Create Session | SessionDefinition与initial SessionHeader staging成功后原子发布Open + Unloaded Session；不启动Recorder |
-| Update SessionDefinition（non-Workspace或unloaded Workspace） | new revision durable publication |
+| Create Agent | Agent definition、metadata与head（definition revision 1、metadata revision 1）原子durable publication |
+| Update Agent Definition | expected AgentRevision/status CAS成功，返回new definition revision或NoChange |
+| Update Agent Metadata | expected AgentMetadataRevision/status CAS成功，返回new metadata revision或NoChange |
+| Create Session | SessionDefinition、metadata与initial SessionHeader staging成功后原子发布Open + Unloaded Session；definition/metadata revision均为1，不启动Recorder |
+| Update SessionDefinition（non-Workspace或unloaded Workspace） | new definition revision durable publication |
+| Update Session Metadata | expected SessionMetadataRevision/lifecycle CAS成功，返回new metadata revision或NoChange |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
 | Reload shared Prompt/Skill/Tool/Model | required candidates全部validate，并在publication gate下替换current immutable objects；失败时old current values保持不变 |
 | Load Session | single-flight load/recovery完成并发布readiness |
@@ -1047,11 +1066,13 @@ pub enum StateEventMsg {
 pub enum RuntimeStateEventKind {
     AgentCreated,
     AgentDefinitionUpdated,
+    AgentMetadataUpdated,
     AgentStatusChanged,
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
     SessionDefinitionUpdated,
+    SessionMetadataUpdated,
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
@@ -1063,6 +1084,7 @@ pub enum RuntimeStateEventKind {
 
 pub enum SessionStateEventKind {
     SessionDefinitionUpdated,
+    SessionMetadataUpdated,
     SessionWorkspaceReloaded,
     SessionReadinessChanged,
     SessionExecutionChanged,
@@ -1114,7 +1136,7 @@ StateEvent规则：
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - final domain StateEvent必须从成功live mutation派生。对应recordable conversation fact时，发送前完成inline record attempt；`TurnInterrupted`/`TurnFailed`没有record attempt，等待recordable settlement facts完成后发布；record outcome不提供durable acknowledgement；
-- Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；metadata专用event kind仍待本module public protocol freeze，但metadata同样不得写conversation JSONL；
+- Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；Agent/Session metadata使用独立`AgentMetadataUpdated | SessionMetadataUpdated` kind，event后的full view/snapshot携带new metadata CAS token；metadata同样不得写conversation JSONL；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
@@ -1127,11 +1149,13 @@ wire命名：
 ```text
 agent_created
 agent_definition_updated
+agent_metadata_updated
 agent_status_changed
 session_created
 session_loaded
 session_unloaded
 session_definition_updated
+session_metadata_updated
 session_archived
 session_unarchived
 session_deleted
@@ -1336,7 +1360,24 @@ UI不能：
 
 ### Agent
 
-MiniCoreRuntime路由Agent command到durable Agent owner：
+```rust
+pub struct AgentMetadataView {
+    pub revision: AgentMetadataRevision,
+    pub name: String,
+    pub description: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+pub struct AgentSummary {
+    pub agent_id: AgentId,
+    pub definition_revision: AgentRevision,
+    pub metadata: AgentMetadataView,
+    pub status: AgentStatus,
+    pub created_at: Timestamp,
+}
+```
+
+`ListAgents`和`GetAgent`都返回包含matching metadata revision的safe head projection；`GetAgentRevision`另行返回immutable execution definition。MiniCoreRuntime路由Agent command到durable Agent owner：
 
 ```text
 Create/Update/Status/Delete
@@ -1349,7 +1390,25 @@ Session保存exact AgentRevisionRef。Agent发布新revision不会自动改变ex
 
 ### Session
 
-MiniCoreRuntime维护：
+```rust
+pub struct SessionMetadataView {
+    pub revision: SessionMetadataRevision,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub updated_at: Timestamp,
+}
+
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub definition_revision: SessionDefinitionRevision,
+    pub metadata: SessionMetadataView,
+    pub lifecycle: SessionLifecycleView,
+    pub forked: bool,
+    pub created_at: Timestamp,
+}
+```
+
+`ListSessions`和`GetSession`从durable Session owner返回该projection，不要求Session loaded。definition revision与metadata revision正交；host更新metadata时只回传`metadata.revision`。MiniCoreRuntime维护：
 
 ```text
 persistent Session catalog
@@ -1636,7 +1695,9 @@ Public interface是 contract test surface。
 
 ### Command Tests
 
-- Agent/Session revision CAS；
+- Agent/Session definition revision与metadata revision独立CAS；Create同时返回两个revision 1；
+- metadata stale expected token失败，canonical no-op保持token且不发布event，successful update返回new metadata revision；
+- Agent/Session metadata update不写conversation JSONL，archive/delete竞态按entity lifecycle synchronization线性化；
 - Create Session只有在SessionDefinition与SessionHeader staging成功后返回SessionCreated；失败不发布partial Session；
 - Load始终尝试初始化Recorder，初始化失败后SessionSnapshot recording为Degraded；
 - Submit只在UserMessage成功live apply并完成inline record attempt后返回TurnStarted；
@@ -1687,6 +1748,7 @@ Public interface是 contract test surface。
 ### Event Tests
 
 - Runtime与每个Session subscription彼此独立；
+- AgentMetadataUpdated/SessionMetadataUpdated使用独立event kind，event后的view/snapshot携带new CAS token；unloaded Session metadata只发布Runtime-scope event；
 - 每条stream首帧是scope匹配的Snapshot；
 - 当前subscription内StateEvent保持发送顺序；
 - subscriber背压、disconnect和restart关闭stream，重新subscribe返回新Snapshot；
