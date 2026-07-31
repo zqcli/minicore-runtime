@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0133后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -107,9 +107,19 @@ pub struct UserMessageView {
     pub contributions: Arc<[PromptContributionOrigin]>,
 }
 
+pub enum UserMessageSource {
+    Input,
+    Steer,
+}
+
 pub struct AgentMessageView {
     pub disposition: AssistantDisposition,
     pub text: Arc<[String]>,
+}
+
+pub enum AssistantDisposition {
+    Intermediate,
+    Final,
 }
 
 pub struct ReasoningView {
@@ -131,6 +141,10 @@ pub struct ToolResultSummaryView {
 
 rules：
 
+- `UserMessageSource::Input`表示创建Turn的initiating message；direct Submit和从FollowUp FIFO真正admit的新Turn都投影为Input。`Steer`只表示在same Running Turn safe point apply的message；
+- `AssistantDisposition::Intermediate`表示same Turn仍需Tool exchange、queued Steer或下一次Model；`Final`只表示该assistant fact与live TurnCompleted同一decision形成；Interrupted/Failed不合成Final；
+
+- Item read model的UserMessageSource/AssistantDisposition/ToolResultDisposition closed variants与live/storage projection一致；
 - User body只返回用户显式body；Skill/Workspace contribution返回safe origin，不返回注入正文、absolute path或authorization；
 - AgentMessage只返回user-visible finalized Text；opaque/hidden reasoning不混入；
 - Reasoning只返回provider允许display的summary，不返回encrypted/signature/hidden chain-of-thought；
@@ -401,6 +415,8 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 
 - Turn/Item lifecycle；
 - ItemView只含user body/safe contribution origin、visible assistant text、reasoning summary和redacted Tool summary；
+- direct Submit/FollowUp admission投影Input、same-Turn Steer投影Steer；Intermediate/Final只按live continuation/terminal decision产生；
+- ToolResult Succeeded/Failed/Denied/Cancelled在Item、conversation和replay projection一致；
 - streaming finalization和retry cleanup；
 - ToolCall ID uniqueness/correlation；
 - Tools-owned ToolCall/Outcome和Session-owned ToolOperationSlot没有第二份type definition；
