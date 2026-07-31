@@ -46,20 +46,22 @@ Rig = ModelGateway private ProviderAdapter
 
 ## V4-P0-1 · `ModelCallRequest`有两套不兼容定义
 
-### 发生场景
+状态：Closed（2026-07-31）。`docs/modules/model-gateway.md`现为唯一canonical owner；Turn Execution Context已删除第二份struct，ordinary/Structured/Compaction和logical retry统一使用同一个immutable request type。
 
-ordinary AgentRun完成Prompt assembly后创建唯一provider-neutral request。实现者同时按Turn Execution Context和ModelGateway的current定义建模，会得到两个不同struct：
+### 关闭前场景
 
-- `docs/modules/turn-execution-context.md:153-159`：
+ordinary AgentRun完成Prompt assembly后创建唯一provider-neutral request。关闭前同时按Turn Execution Context和ModelGateway建模会得到两个不同struct：
+
+- Turn Execution Context旧定义：
   - `context: Arc<AssembledModelContext>`；
   - 独立、必填`output_contract: OutputContract`；
   - `effective_max_output_tokens: u32`。
-- `docs/modules/model-gateway.md:675-690`：
+- ModelGateway定义：
   - `input: Arc<AssembledModelContext>`；
   - output contract只存在于`input.output_contract: Option<OutputContract>`；
   - `max_output_tokens: Option<NonZeroU32>`。
 
-`docs/modules/prompt.md:624-635`也把`PromptAssemblyProof.output_contract`定义为`Option<OutputContract>`。普通非structured AgentRun允许`None`，因此Turn Execution Context版本无法表示当前主路径。
+Prompt的`PromptAssemblyProof.output_contract`也定义为`Option<OutputContract>`。普通非structured AgentRun允许`None`，因此旧Turn Execution Context版本无法表示主路径。
 
 ### 影响
 
@@ -69,7 +71,7 @@ ordinary AgentRun完成Prompt assembly后创建唯一provider-neutral request。
 - logical retry无法保证复用的是同一种immutable request；
 - ordinary AgentRun、Structured和CompactionSummary contract tests会产生不同预期。
 
-### 推荐决议
+### 已采纳决议
 
 以ModelGateway为`ModelCallRequest`唯一canonical owner：
 
@@ -85,7 +87,7 @@ pub struct ModelCallRequest {
 
 Turn Execution Context只说明它如何调用private constructor并链接ModelGateway，不再复制struct。OutputContract只保存在`AssembledModelContext`及其private proof中；request constructor验证proof，不保存第二字段。
 
-### 关闭条件
+### 关闭验证
 
 - current modules只剩一个完整struct定义；
 - ordinary AgentRun `output_contract = None`有fixture；

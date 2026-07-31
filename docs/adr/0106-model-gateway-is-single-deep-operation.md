@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-24
 
+> 2026-07-31：`ModelCallRequest`由ModelGateway唯一拥有；Turn Execution Context、Prompt、Session Execution和Compaction只调用其private constructor或消费immutable request，不复制第二份字段定义。OutputContract只存在于`AssembledModelContext`及其assembly proof。
+
 ## 背景
 
 - ActiveTurnTask需要一个provider-neutral模型调用seam，把provider catalog、credential、private ProviderAdapter、stream、usage和cache复杂性挡在Turn execution之外；首个production ProviderAdapter使用Rig。logical retry留在ActiveTurnTask。
@@ -17,6 +19,7 @@
   - `generate_model_turn(ModelCallRequest, progress, cancel)` 是唯一真实模型调用 interface，返回一个 terminal `ModelCallResult` 或 typed `ModelCallError`。
 - Gateway拥有并隐藏provider catalog、credential/auth policy、single-attempt planning、stream lifecycle、usage、cache与continuation；这些都是private implementation detail，不进入MiniCoreRuntime interface。MVP retry policy由ADR 0119收窄为Gateway single attempt加Session logical retry。
 - ModelGateway 不重新组装 Prompt：PromptSet 产出的 `AssembledModelContext` 是模型上下文的唯一 producer；Gateway 不重新加载 message、不判断 message visibility、不截断或摘要 conversation。
+- ModelGateway拥有provider-neutral `ModelCallRequest`及其private constructor。request只保存exact model、purpose、assembled input、source `ConversationRevision`和optional request max output；constructor验证Prompt assembly proof，不保存第二份OutputContract。
 - active Turn内禁止transparent transport或cross-model fallback。跨transport/provider/model替换必须由显式Session definition update或下一Turn admission完成。
 - Rig provider差异只存在于private `ProviderAdapter`；`RigProviderAdapter`只编码并执行一个由Gateway规划好的provider attempt，并把stream/terminal/error映射回MiniCore attempt类型。它不选择provider/model，不决定Session logical retry或cache/continuation policy，也不构造最终`ModelCallResult`；SDK automatic retry固定为0。Rig raw types、`additional_params`、SDK error不越过adapter seam。首批实现为RigProviderAdapter与ScriptedProviderAdapter，保证它是真实seam并支持阶段6–8共享vertical-slice tests。
 - 错误原因使用closed typed taxonomy，足以驱动retry、compaction recovery（如`ContextOverflow`）与terminal failure，caller不解析raw message；`RequestOutcomeUnknown`/`StreamInterrupted`禁止blind replay。ADR 0120进一步规定Gateway在`ModelCallResult`前验证finish/content与OutputContract。

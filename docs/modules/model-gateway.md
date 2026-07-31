@@ -671,6 +671,8 @@ ModelGateway不能：
 
 ## ModelCallRequest
 
+ModelGateway是`ModelCallRequest`的唯一canonical owner。Turn Execution Context、Session Execution、Prompt和Compaction只引用该类型及constructor contract，不复制字段或定义第二个request DTO。
+
 ```rust
 pub struct ModelCallRequest {
     model: Arc<TurnModelSnapshot>,
@@ -1681,8 +1683,11 @@ opaque encrypted reasoning
 - Gateway不截断或摘要context；
 - ModelGateway不修改`AssembledModelContext`；
 - assembly proof purpose/model/output-contract mismatch在ModelCallRequest constructor被拒绝。
+- ordinary AgentRun允许`input.output_contract = None`和`max_output_tokens = None`；
+- explicit AgentRun output limit使用`Some(NonZeroU32)`且不得超过Snapshot effective limit；
+- Structured与NoToolCalls只存在于`input.output_contract`，request不保存第二份contract；
 - Compaction budget proof missing、purpose不匹配或request max output不相等时constructor拒绝；
-- CompactionSummary的effective max_output_tokens不超过Snapshot known limit；
+- CompactionSummary的request `max_output_tokens`必须为`Some`且不超过Snapshot known limit；
 - 越界CompactionSummary在provider调用前以InvalidRequest拒绝，Gateway不静默clamp。
 
 ### Streaming

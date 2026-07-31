@@ -141,7 +141,7 @@ pub enum CompactionPressure {
 }
 ```
 
-planning使用Turn-pinned `TokenEstimator`与exact model limits。summary output budget在plan阶段闭合，并与ModelCallRequest的effective max output一致。
+planning使用Turn-pinned `TokenEstimator`与exact model limits。summary output budget在plan阶段闭合，并与`ModelCallRequest.max_output_tokens`一致。
 
 PromptSet仍是唯一assembly seam：
 
@@ -257,7 +257,7 @@ Fork复制其source中的effective conversation：
 - complete Tool exchange不可被prefix cut拆分；
 - rolling summary再次压缩；
 - exact source revision stale rejection；
-- summary budget与ModelCallRequest一致；
+- summary budget与`ModelCallRequest.max_output_tokens`一致；
 - Cancel/Steer/Compaction竞态；
 - live Replace先于recording；
 - marker record失败后current process继续；
