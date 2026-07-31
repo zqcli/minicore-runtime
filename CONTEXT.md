@@ -255,6 +255,7 @@ cold recovery Turn terminalization
 
 ## 当前开放问题
 
+- 第四轮完整设计评审确认的P0/P1实施门禁：共享`ModelCallRequest`、Tool contract、async Skill composition、conversation JSONL event ownership、Compaction source/settings、Runtime public payload与wire/provider scope；见`docs/review/v2-design-review-4.md`；
 - wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction；
 - EntryId算法与public文本wire；
 - Rig 0.40.0 provider spike；

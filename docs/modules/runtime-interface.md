@@ -340,7 +340,7 @@ pub enum ForkSourceKind {
 }
 ```
 
-`ForkSourceKind`由Runtime在source residency linearization point确定：source已loaded时为`LiveSnapshot`，未loaded时为`RecordedHistory`。调用方不能请求loaded source退回RecordedHistory，也不能根据recording health推断source。
+`ForkSourceKind`由Runtime在source residency linearization point确定：source已loaded时为`LiveSnapshot`，未loaded时为`RecordedHistory`。调用方不能请求loaded source退回RecordedHistory，也不能根据recording health推断source。该public projection消费[INV-004](../architecture.md#跨模块不变量索引)，source selection与copy的完整规则由Conversation Recording canonical owner定义。
 
 普通UI使用message/item anchor，不直接构造EntryId：
 

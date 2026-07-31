@@ -212,6 +212,8 @@ SessionExecutor admits Turn
 
 实现顺序：
 
+开始下列实现前，先关闭[第四轮设计评审](../review/v2-design-review-4.md)中的P0 shared contract；P1 public/wire/provider项按对应crate surface门槛关闭。
+
 1. 创建Rust crate与基础ID/error types；
 2. 实现LiveConversation reducer和ScriptedProviderAdapter；
 3. 实现SessionExecutor control actor与ActiveTurnTask；
@@ -257,6 +259,8 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
+- [第四轮设计评审](../review/v2-design-review-4.md)中的P0共享类型、Prompt/Skill composition、conversation recording owner与Compaction contract；
+- 第四轮P1 Runtime public payload、wire/storage envelope和provider scope；
 - wire/schema freeze（serde casing、public IDs、Timestamp/Money、StoredCompaction）；
 - Rig provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
@@ -280,6 +284,7 @@ ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118
 
 V2生产迁移完成需要：
 
+- 第四轮P0/P1实施门禁已按对应module关闭；
 - Rust crate、module interfaces和private implementations存在；
 - scripted async vertical slices通过；
 - recorder failure/replay fixtures通过；

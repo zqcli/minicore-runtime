@@ -72,22 +72,31 @@ SessionRecorder
 - exact Skill/Workspace authorization在composition前完成，每个contribution形成独立顶层content part；
 - live/JSONL共同使用`content_part_index + safe origin`，不保存字符offset、绝对路径或authorization；损坏stamp只产生diagnostic，不丢conversation正文。
 
+## 2026-07-31第四轮完整复审
+
+- 主审逐份通读全部55个current、非归档Markdown；subagent输出仅作查漏线索；
+- 新增[第四轮设计评审](v2-design-review-4.md)，确认5个P0、4个P1和1个既有条件性Sandbox P0；
+- P0集中在共享`ModelCallRequest`、Tool contract、async Skill composition、conversation JSONL event owner和Compaction source/settings；
+- P1集中在Runtime public payload、wire/storage envelope、provider scope/Rig现实验证和Workspace跨Session测试残留；
+- ADR 0126–0129主方向保持，不恢复同步AgentLoop、durable SessionWriter、Turn lifecycle JSONL或Prompt resolver。
+
 ## 恢复顺序
 
 1. [ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
 2. [ADR 0127](../adr/0127-session-recording-omits-turn-lifecycle.md)
 3. [ADR 0128](../adr/0128-prompt-content-is-materialized-before-publication.md)
 4. [ADR 0129](../adr/0129-user-message-contributions-use-part-level-safe-provenance.md)
-5. [架构总览](../architecture.md)
-6. [Prompt](../modules/prompt.md)
-7. [Session Execution](../modules/session-execution.md)
-8. [Conversation Recording与Replay](../modules/conversation-storage.md)
-9. [Turn Execution Context](../modules/turn-execution-context.md)
-10. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
-11. [Compaction](../modules/compaction.md)
-12. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
-13. [第三轮评审关闭记录](v2-design-review-3.md)
-14. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
+5. [第四轮完整设计评审与实施门禁](v2-design-review-4.md)
+6. [架构总览](../architecture.md)
+7. [Prompt](../modules/prompt.md)
+8. [Session Execution](../modules/session-execution.md)
+9. [Conversation Recording与Replay](../modules/conversation-storage.md)
+10. [Turn Execution Context](../modules/turn-execution-context.md)
+11. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
+12. [Compaction](../modules/compaction.md)
+13. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
+14. [第三轮评审关闭记录](v2-design-review-3.md)
+15. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
 
 ## 已冻结决策
 
@@ -174,13 +183,14 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭。剩余Prompt template/cache/hook�
 
 ## 下一步
 
-1. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money和StoredCompaction；
-2. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
-3. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
-4. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
-5. 实现Interaction、Cancel、logical retry和Compaction async paths；
-6. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
-7. production Tool/Sandbox adapter前关闭O1/R7。
+1. 按[第四轮评审](v2-design-review-4.md)顺序关闭P0：ModelCallRequest、Tool contract、async Skill composition、conversation JSONL event owner和Compaction source/settings；
+2. 关闭第四轮P1并冻结通用serde casing、ID文本格式、Timestamp/Money、StoredCompaction与Runtime UI-safe payload；
+3. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
+4. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
+5. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
+6. 实现Interaction、Cancel、logical retry和Compaction async paths；
+7. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
+8. production Tool/Sandbox adapter前关闭O1/R7。
 
 ## Review状态
 
@@ -188,10 +198,11 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭。剩余Prompt template/cache/hook�
 第一轮 O2–O18   原设计下已关闭；O1 Sandbox条件性开放
 第二轮 R1–R6   原设计下已关闭；R7 = O1
 第三轮 L1–L5   已关闭或被ADR 0126取代
+第四轮 V4-*    P0/P1已识别，等待canonical owner决议与关闭
 ```
 
 R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是：canonical owner → interface consumers → review/handoff → supersession notes → `rg` residue scan。
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应从ADR 0126/0127/0128/0129开始，不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter、Turn terminal ledger、PromptContent resolver、recursive Skill/Composite intent或字符offset provenance开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成目标架构、Recorder/Prompt决策收口和第四轮完整review finding识别，不包含Rust生产实现。下一台电脑应先读取ADR 0126–0129与第四轮review并关闭P0/P1；不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter、Turn terminal ledger、PromptContent resolver、recursive Skill/Composite intent或字符offset provenance开始编码。

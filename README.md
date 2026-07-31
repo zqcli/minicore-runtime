@@ -7,9 +7,10 @@ MiniCore 是一个轻量级原生 Agent harness runtime core。
 MiniCore 不是 CLI/GUI 产品仓库。下游宿主应通过下面的运行时接口接入：
 
 ```text
-AgentRuntime.dispatch(agent_runtime_protocol::Command)
-AgentRuntime.subscribe() -> agent_runtime_protocol::EventStream
-AgentRuntime.snapshot() -> agent_runtime_protocol::RuntimeSnapshot
+MiniCoreRuntime.dispatch(CommandRequest)
+MiniCoreRuntime.query(RuntimeQuery)
+MiniCoreRuntime.snapshot(SnapshotRequest)
+MiniCoreRuntime.subscribe(SubscriptionRequest) -> EventStream
 ```
 
 架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)。
@@ -21,6 +22,6 @@ AgentRuntime.snapshot() -> agent_runtime_protocol::RuntimeSnapshot
 → [docs/research/](docs/research/)
 → [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
 
-V1已归档，仅用于历史参考；V2是当前权威架构。ADR 0126已完成async loop与inline best-effort Session recording设计重构，生产实现仍待启动。下一里程碑是wire/schema freeze、Recorder基础类型和阶段6–8 async vertical slice，完整进度见[版本迁移记录](docs/migration/v1-to-v2.md)。
+V1已归档，仅用于历史参考；V2是当前权威架构。ADR 0126已完成async loop与inline best-effort Session recording设计重构，生产实现仍待启动。下一里程碑是先关闭[第四轮设计评审](docs/review/v2-design-review-4.md)确认的共享类型与接口门禁，再完成wire/schema freeze和阶段6–8 async vertical slice；完整进度见[版本迁移记录](docs/migration/v1-to-v2.md)。
 
 跨机器恢复当前设计评审工作时，从[设计评审工作交接](docs/review/v2-design-review-handoff.md)开始。
