@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -350,7 +350,7 @@ pub struct StoredAssistantMessage {
 
 ```rust
 pub enum AssistantContent {
-    Reasoning(StoredReasoning),
+    Reasoning(ReasoningContent),
     Text(String),
     ToolCall(StoredToolCall),
 }
@@ -361,7 +361,7 @@ pub struct StoredToolCall {
     pub item_id: ItemId,
     pub tool_call_id: ToolCallId,
     pub name: ToolName,
-    pub arguments: JsonValue,
+    pub arguments: BoundedJsonObject,
 }
 ```
 
@@ -371,7 +371,21 @@ pub struct StoredToolMessage {
     pub tool_call_id: ToolCallId,
     pub outcome: StoredToolOutcome,
 }
+
+pub enum StoredToolOutcome {
+    Completed {
+        source: ToolOutcomeSource,
+        disposition: ToolResultDisposition,
+        content: ToolResultContent,
+        details: Option<BoundedJsonValue>,
+    },
+    Abandoned {
+        reason: ToolAbandonReason,
+    },
+}
 ```
+
+Conversation Storage直接复用Wire-owned BoundedJsonObject/BoundedJsonValue、ModelGateway-owned ReasoningContent，以及Tools-owned ToolOutcomeSource/ToolResultContent/ToolResultDisposition/ToolAbandonReason；不定义StoredReasoning、unbounded JsonValue或第二套Tool disposition。
 
 Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId只要求同一assistant response内唯一。
 
@@ -384,7 +398,7 @@ pub enum StoredEvent {
 }
 ```
 
-StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。`StoredInteractionRequest/Resolution`保存与Runtime public view同源的bounded safe request/resolution及optional host resolution key：Tool approval只保存redacted summary、safe option views与selected kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer。format v1没有secret/password/credential Interaction variant，raw secret不得进入JSONL。
+StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。`StoredInteractionRequest/Resolution`保存与Runtime public view同源的bounded safe request/resolution及optional host resolution key：Tool approval只保存redacted summary、safe option views与selected kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer；Cancelled保存Turn/Interaction owner定义的closed InteractionCancelReason。format v1没有secret/password/credential Interaction variant，raw secret不得进入JSONL。
 
 Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
 

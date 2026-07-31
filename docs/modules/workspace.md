@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -171,7 +171,7 @@ pub struct WorkspaceCwdSpec {
 }
 ```
 
-`WorkspaceRelativePath` 必须满足：
+`WorkspaceRootSpec.path`的public wire使用[Wire Schema canonical RFC 8089 file URI](wire-schema.md#workspace-paths)，v1只接受lossless UTF-8 native path；内部仍立即转换/validate为platform PathBuf。`WorkspaceRelativePath` wire使用同节的forward-slash carrier。wire lexical validation不替代以下Workspace semantic约束：
 
 - 不是绝对路径；
 - 不含平台 path prefix；
@@ -1217,6 +1217,8 @@ upload / telemetry
 
 至少覆盖：
 
+- public file URI POSIX/Windows drive/UNC decode与non-UTF-8 rejection，relative path slash/traversal/segment limits；
+
 - primary root 正常解析；
 - additional root 正常解析；
 - canonical duplicate root；
@@ -1260,7 +1262,7 @@ upload / telemetry
 
 ## 后续问题
 
-1. `WorkspaceRelativePath` 和 `CanonicalWorkspacePath` 的跨平台编码细节。
+1. non-UTF-8 native Workspace path的future capability；v1明确拒绝lossy encoding。
 2. WorkspaceAuthority 的 persisted trust、managed policy 和 headless adapter 形状。
 3. Workspace source adapter和Sandbox在各平台如何实现handle-relative open以防止TOCTOU；该问题属于O1 enforcement，不提供动态handle revocation。
 4. Workspace unavailable的细分diagnostic code allowlist；SessionReadiness与RetryAdvice映射已由Runtime Interface冻结。

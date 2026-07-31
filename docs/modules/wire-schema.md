@@ -400,6 +400,8 @@ pub struct PagingLimits {
 pub struct PromptWireLimits {
     pub max_skills_per_intent: u16,
     pub max_user_message_parts: u16,
+    pub max_message_part_bytes: u32,
+    pub max_user_message_bytes: u32,
 }
 
 pub struct WorkspaceWireLimits {
@@ -494,6 +496,8 @@ pub struct JsonSchemaLimits {
 | max_page_cursor_bytes | 256 |
 | max_skills_per_intent | 32 |
 | max_user_message_parts | 64 |
+| max_message_part_bytes | 131,072 |
+| max_user_message_bytes | 524,288 |
 | max_workspace_roots | 16 |
 | max_absolute_path_uri_bytes | 8,192 |
 | max_relative_path_bytes | 4,096 |

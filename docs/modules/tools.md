@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -113,6 +113,20 @@ ToolService/ToolSet不暴露generic registry mutation、raw executor、SessionRe
 ## Tool 注册
 
 ```rust
+pub struct ToolName(String);
+
+pub struct ToolInputSchema {
+    schema: BoundedJsonSchema,
+}
+
+impl ToolName {
+    pub fn as_str(&self) -> &str;
+}
+
+impl ToolInputSchema {
+    pub fn schema(&self) -> &BoundedJsonSchema;
+}
+
 pub struct ToolDefinition {
     pub name: ToolName,
     pub description: Arc<str>,
@@ -123,7 +137,9 @@ pub struct ToolDefinition {
 }
 ```
 
-ToolName是stable selection/protocol key。同一个ToolResourceView内duplicate ToolName拒绝candidate publication。
+ToolName是stable selection/protocol key。同一个ToolResourceView内duplicate ToolName拒绝candidate publication。constructor验证[Wire Schema](wire-schema.md#stable-symbolic-keys)共同floor以及provider/tool-name更窄grammar；field保持private，不能用任意String绕过。
+
+`ToolInputSchema`只能从BoundedJsonSchema构造。MVP semantic subset支持object root、type/properties/required/additionalProperties/items/enum/const、numeric/string/array bounds、description/title、allOf/anyOf/oneOf与local `$defs/$ref`；拒绝remote ref、patternProperties、dynamic/recursive ref、network lookup和owner未支持keyword。schema candidate必须同时通过bounded wire validation与Tool schema semantic validation。
 
 MVP Tool来源：
 
@@ -181,7 +197,7 @@ annotations用于UI/policy/scheduling提示，requirements用于实际authorizat
 pub struct ToolCall {
     pub tool_call_id: ToolCallId,
     pub name: ToolName,
-    pub arguments: Value,
+    pub arguments: BoundedJsonObject,
     pub call_index: u32,
 }
 
@@ -219,7 +235,21 @@ pub struct ToolResult {
     pub tool_call_id: ToolCallId,
     pub disposition: ToolResultDisposition,
     pub content: ToolResultContent,
-    pub details: Option<Value>,
+    pub details: Option<BoundedJsonValue>,
+}
+
+pub struct ToolResultContent {
+    parts: Arc<[ToolResultContentPart]>,
+}
+
+pub enum ToolResultContentPart {
+    Text {
+        text: Arc<str>,
+    },
+}
+
+impl ToolResultContent {
+    pub fn parts(&self) -> &[ToolResultContentPart];
 }
 
 pub enum ToolResultDisposition {
@@ -228,11 +258,18 @@ pub enum ToolResultDisposition {
     Denied,
     Cancelled,
 }
+
+pub enum ToolAbandonReason {
+    OutcomeUnknown,
+    RuntimeFailure,
+}
 ```
 
-`Succeeded`要求executor产生exact successful business result；`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`。
+`ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。structured executor payload必须由Tool owner确定性render为Text；raw JSON仍可在bounded `details`中供trusted history/debug projection使用，但不自动进入模型。
 
-这三个execution类型及`ToolResultDisposition`的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
+`Succeeded`要求executor产生exact successful business result；`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
+
+这三个execution类型、`ToolResultContent`、`ToolResultDisposition`和`ToolAbandonReason`的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
 
 Raw ToolExecutor只返回业务payload、disposition或typed internal failure，不能选择ItemId/ToolCallId，也不能直接构造public outcome。ToolSet private outcome constructor从`ToolExecutionRequest`复制identity，并保证Completed中的`result.tool_call_id`与`request.call.tool_call_id`一致；mismatch属于internal invariant failure，不进入live reducer。
 
@@ -441,7 +478,7 @@ pub enum UserQuestionAnswerValue {
 }
 ```
 
-questions/options按index严格递增且唯一。answer必须无duplicate/unknown question，required字段齐全，value family和choice index匹配。Text/labels/count/total answer limits由V4-P1-2冻结。
+questions/options按index严格递增且唯一。answer必须无duplicate/unknown question，required字段齐全，value family和choice index匹配。Text/labels/count/total answer limits使用[Wire Schema InteractionLimits](wire-schema.md#queueinteraction与observation)。
 
 MVP没有`secret`、password、credential、file upload或arbitrary JSON answer variant。producer和Presentation Adapter必须明确告知用户：answer会进入live state、conversation JSONL、event/history和ask-user ToolResult，并可能发送给模型，不能输入API key、password、token或其他secret。`NonSecret`是协议约束，不是Runtime对自然语言的secret classifier。需要credential时必须未来新增独立secure host capability/one-time secret reference，raw value不得经过Interaction/ToolResult/model context。
 
@@ -715,10 +752,14 @@ Tool grant store
 至少覆盖：
 
 - duplicate ToolName candidate失败；
+- ToolName/ToolInputSchema private constructor，BoundedJsonSchema keyword/ref/depth/byte limits；
+- ToolCall arguments与ToolResult details拒绝raw/unbounded JSON；
 - disclosed route与executor同源；
 - executor不能伪造ItemId/ToolCallId，outcome identity与request exact match；
 - schema invalid/unknown Tool PreExecution result；
 - ToolResultDisposition closed mapping：Succeeded/Failed/Denied/Cancelled，unknown outcome只能Abandoned；
+- ToolResultContent part/aggregate exact boundary与oversized known output归约bounded Failed result；
+- ToolAbandonReason只允许OutcomeUnknown/RuntimeFailure且无raw error；
 - approval deny、Sandbox unavailable和cancel-before-start均返回matching PreExecution ToolResult；
 - Hook rewrite后重新验证；
 - approval allow/deny/family；

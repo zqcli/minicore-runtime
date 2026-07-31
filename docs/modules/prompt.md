@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -472,11 +472,27 @@ pub struct TextIntent {
 pub struct SkillIntent {
     pub skill_id: SkillId,
 }
+
+pub struct MessageRecord {
+    content: Arc<[MessageContent]>,
+}
+
+pub enum MessageContent {
+    Text {
+        text: Arc<str>,
+    },
+}
+
+impl MessageRecord {
+    pub fn content(&self) -> &[MessageContent];
+}
 ```
 
-用户body与Skill选择正交；不再定义`PromptIntent::Skill`、`PromptIntent::Composite`、`CompositePromptIntent`或未实现的Template variant。多个Skill按`skills`中的声明顺序表达，重复`SkillId`在正文I/O或live apply前失败。`TextIntent`是non-empty user-authored text value；normalization/size limits由Runtime boundary与V4-P1-2冻结。`SkillIntent`只保存稳定`SkillId`，不能携带name、path、source ref或authorization。Runtime command input使用同样的逻辑形状；slash name和GUI catalog selection必须先解析为SkillId，queue保存intent而不提前展开正文。
+用户body与Skill选择正交；不再定义`PromptIntent::Skill`、`PromptIntent::Composite`、`CompositePromptIntent`或未实现的Template variant。多个Skill按`skills`中的声明顺序表达，重复`SkillId`在正文I/O或live apply前失败。`TextIntent`是non-empty user-authored text value；normalization/size limits由[Wire Schema](wire-schema.md#protocollimits-v10)冻结。`SkillIntent`只保存稳定`SkillId`，不能携带name、path、source ref或authorization。Runtime command input使用同样的逻辑形状；slash name和GUI catalog selection必须先解析为SkillId，queue保存intent而不提前展开正文。
 
-TurnExecutionContext使用本Turncaptured对象解析intent后，PromptSet把PromptIntent和已经授权的typed contributions原子规范化为唯一用户消息：
+MVP `MessageRecord`只包含ordered Text parts；role由拥有它的UserMessage semantic位置确定，不在record内重复保存。constructor保持private，执行safe-text normalization，并使用`ProtocolLimits.prompt.max_message_part_bytes = 131,072`、`max_user_message_bytes = 524,288`和`max_user_message_parts = 64`。image/audio/document或arbitrary JSON content需要future capability和new variant，不能塞进Text。
+
+TurnExecutionContext使用本Turn captured对象解析intent后，PromptSet把PromptIntent和已经授权的typed contributions原子规范化为唯一用户消息：
 
 ```rust
 pub(crate) struct UserMessageCompositionInput {
@@ -801,6 +817,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 ## 测试要求
 
 - Text body + one Skill、empty body + one Skill和ordered multiple Skills产生稳定part顺序；
+- MessageRecord只接受1..64个bounded safe Text parts，body/contribution aggregate超limit时不apply；
 - duplicate SkillId、captured Skill缺失/删除、source mismatch或required Workspace contribution失败时不apply部分UserMessage；
 - reload发生在active Turn期间时，Steer继续从captured SkillView加载旧entry；future Turn使用new view；
 - resolve等待Skill load时Cancel/SecurityRevoked由Session execution终止caller，迟到cache结果不能进入PromptSet/live conversation；
