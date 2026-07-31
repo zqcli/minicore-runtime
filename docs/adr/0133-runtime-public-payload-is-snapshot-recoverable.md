@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-31
 
+> [ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)冻结本ADR后置的public JSON v1、typed scalar carriers、ProtocolLimits、bounded JSON与conversation JSONL scanner基础；各semantic payload owner保持不变，Stored DTO/format projection继续由对应module同步。
+
 ## 背景
 
 ADR 0108、0113、0114和0118已经确定transport-neutral Runtime facade、typed Interaction、snapshot-first stream与Cancel语义，但第四轮实现评审发现public payload仍不能直接生成Rust协议crate或host contract tests：
@@ -56,7 +58,7 @@ snapshot-first的关键问题不是“Snapshot字段够多”，而是断线后h
 
 12. MVP `PromptBodyIntent`只允许`Empty | Text(TextIntent)`；Text在boundary normalization后必须non-empty并满足ProtocolLimits。未定义的Template variant从public enum、query和decoder删除。future Prompt template必须一起定义stable TemplateId、argument grammar、materialized render、limits、reload/capture和protocol capability。
 
-13. 本ADR冻结semantic payload和恢复/操作规则，不冻结通用wire representation。field casing、enum tagging、base ID与path文本格式、Timestamp、Money、具体string/count/byte limits、unknown variant policy、PageCursor encoding和conversation format v1继续由V4-P1-2拥有。ADR 0126已经冻结的`SessionRecordingView { state: healthy | degraded }` lowercase wire是窄例外，也是P1-2 consolidation的既有输入，不授权各module继续自行冻结其他serde casing。
+13. 本ADR只冻结semantic payload和恢复/操作规则。其acceptance时后置的field casing、enum tagging、base ID/path carrier、Timestamp、Money、ProtocolLimits、unknown variant policy、PageCursor和conversation format基础现由[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)统一拥有；Stored DTO semantic projection与golden fixtures仍由V4-P1-2后续consumer同步。ADR 0126已经冻结的`SessionRecordingView { state: healthy | degraded }` lowercase wire作为ADR 0134输入保留。
 
 ## 结果
 
@@ -72,7 +74,7 @@ snapshot-first的关键问题不是“Snapshot字段够多”，而是断线后h
 - Snapshot capture必须在Session owner内原子读取queue、current Turn/Items、Pending Interaction、usage、recording和diagnostic views；不得拼接多个时点的mutable state。
 - public projection必须在module owner处完成redaction，再交给Transport/Presentation Adapter；adapter不能接收private object后自行删字段。
 - same-key Interaction幂等retry不能重复record、event或Tool resume。
-- ProtocolLimits的具体数值与bounded decoder在V4-P1-2冻结前不得由各module自行选择不兼容默认值。
+- ProtocolLimits具体数值与bounded decoder以ADR 0134/Wire Schema为唯一owner；各module不得选择不兼容override。
 - contract tests至少覆盖queue snapshot recovery、metadata CAS、Submit cancel两条race、error mapping、approval option scope、non-secret question validation、Interaction key conflict和Template variant拒绝。
 
 ## 修订关系
