@@ -1,9 +1,9 @@
 # ADR 0113: UserQuestion 使用 MiniCore 交互协议与 UI 展示 Adapter
 
-状态：Partially Superseded by ADRs 0124, 0126 and 0127
+状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0133
 日期：2026-07-25
 
-> 2026-07-31：MVP UserQuestion payload冻结为non-secret Text/SingleChoice fields；answer会进入live state、JSONL、event/history、ToolResult并可能发送给模型。secret/password/token input不属于Interaction，未来必须使用独立secure host capability。Tool approval使用request-scoped safe option index，host不能构造PermissionSet。
+> [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结request-scoped approval options、non-secret Text/SingleChoice question payload、safe Runtime view和random request-scoped resolution key；host不能构造PermissionSet或通过Interaction收集credential。
 
 > 2026-07-31：typed Interaction、MiniCore-owned live request/resolution与Presentation Adapter职责继续有效；ADR 0127规定restart不恢复Pending waiter/state，也不合成Cancelled resolution或Turn terminal。Recorded request/resolution只作为historical facts。
 

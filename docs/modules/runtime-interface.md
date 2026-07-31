@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0133后，生产实现待启动）
 
 ## 目的
 
@@ -1938,7 +1938,7 @@ StateEvent规则：
 
 上述kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整scope Snapshot；Runtime durable catalog mutation额外携带single changed entity summary，SessionEventDetail只承载SessionSnapshot无法表达但对本次transition有用的safe correlation信息。
 
-wire命名：
+event semantic labels（lowercase rendering is provisional until V4-P1-2 fixes enum tagging/casing）：
 
 ```text
 agent_created
@@ -1985,7 +1985,7 @@ command_catalog_invalidated
 
 failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved或Compaction record path，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。Turn terminal本身不触发recording failure，但会携带当时最新recording state。
 
-MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；wire adapter不得另行折叠成未定义的`turn_finished`形状。Rust领域payload保持`Completed | Interrupted | Failed` typed union。
+MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；V4-P1-2必须把它们映射为三个distinct wire variants，不得折叠成未定义的`turn_finished`形状。Rust semantic payload保持`Completed | Interrupted | Failed` typed union。
 
 ### ProgressEvent
 

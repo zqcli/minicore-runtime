@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0131后，生产实现待启动）
+状态：当前权威架构（ADR 0133后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -610,4 +610,4 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 开放问题
 
-EntryId算法/文本wire、max entry bytes、StoredCompaction format-v1 casing/limits、diagnostic总量上限和format migration仍需freeze。Compaction stable-unit source、marker replay和automatic model-call semantic fields已由ADR 0132关闭；EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、全部format-v1 Stored DTO（ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution、StoredCompaction）的tag/casing/limits、diagnostic总量上限和format migration仍需freeze。Compaction stable-unit source、marker replay和automatic model-call semantic fields已由ADR 0132关闭；EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

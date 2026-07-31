@@ -1,7 +1,9 @@
 # ADR 0108: Runtime 公开协议
 
-状态：Partially Superseded by ADRs 0126 and 0127
+状态：Partially Superseded by ADRs 0126, 0127 and 0133
 日期：2026-07-24
+
+> [ADR 0133](0133-runtime-public-payload-is-snapshot-recoverable.md)冻结closed command/query/snapshot/event payload、metadata CAS、SubmitCancelled completion、public error mapping与snapshot-recoverable queue/Interaction views；本ADR的四类facade和transport-neutral边界保持。
 
 > 2026-07-31：typed commands、snapshot-first stream和live terminal events保留；ADR 0127规定Turn lifecycle不持久化，historical ListTurns/GetTurn不返回execution status，restart Snapshot的current_turn为空。
 
