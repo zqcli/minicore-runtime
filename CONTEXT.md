@@ -110,16 +110,25 @@ ActiveTurnTask对同一个`Arc<ModelCallRequest>`执行的有限retry。使用co
 ## Prompt、Tool、Skill与Model
 
 **PromptService / PromptSet**：
-PromptService拥有definitions/source/cache；每Turn构造immutable PromptSet。PromptSet是`PromptIntent → CanonicalUserMessage`和`LiveConversationView → AssembledModelContext`的唯一seam。
+PromptService拥有definitions/materialized content/source/cache；每Turn构造immutable PromptSet。PromptSet是`PromptIntent → CanonicalUserMessage`和`LiveConversationView → AssembledModelContext`的唯一seam。
+
+**PromptContent**：
+Prompt candidate build期间已经读取、解析和规范化的immutable text value。多个definition/Turn可以通过进程内强`Arc`共享正文；path、URL、source ID、hash或cache key不承担正文resolver或durable identity。
 
 **PromptIntent**：
-Text、Template、Skill或Composite结构化用户输入。队列保存intent，不保存提前展开正文。
+用户body与ordered SkillIntent selections组成的结构化输入。body为Empty、Text或Template；不定义Skill/Composite顶层variant。队列保存intent，不提前展开Skill正文。
+
+**SkillIntent**：
+显式请求本次用户消息使用某个Skill的稳定选择，只保存SkillId；name、path与source authorization不属于intent。
 
 **CanonicalUserMessage**：
 PromptSet规范化产生、可apply到LiveConversation并best-effort record的标准UserMessage。
 
 **PromptContribution**：
-Skill/Workspace等module产生的typed User内容。它必须先进入CanonicalUserMessage和LiveConversation，不能作为current-call assembly旁路。
+Skill/Workspace等module产生的typed User内容。exact source authorization在composition前验证；每个contribution形成独立顶层content part并进入CanonicalUserMessage和LiveConversation，不能作为current-call assembly旁路。
+
+**PromptContributionStamp**：
+通过`content_part_index`关联一个顶层content part的安全解释元数据。只保存SkillId或WorkspaceRootKey加relative location；不保存字符offset、绝对路径、authorization或正文引用。
 
 **AssembledModelContext**：
 PromptSet产生的唯一provider-neutral模型输入，包含ordered System sections、User context、sanitized messages、ToolSpec、OutputContract和assembly proof。
@@ -247,7 +256,6 @@ cold recovery Turn terminalization
 ## 当前开放问题
 
 - wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction；
-- Prompt Q1/Q4：PromptContent representation与contribution stamp字段；
 - EntryId算法与public文本wire；
 - Rig 0.40.0 provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。

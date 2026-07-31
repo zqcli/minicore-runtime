@@ -1,9 +1,13 @@
 # ADR 0110: Prompt 与 Skill 使用共享、可替换 View
 
-状态：Partially Superseded by ADR 0127
+状态：Partially Superseded by ADRs 0127 and 0129
 日期：2026-07-24
 
 > 2026-07-31：Prompt/Skill shared immutable views、explicit reload和future-Turn生效规则继续有效；ADR 0127删除restart时的unfinished Turn terminalization，Load只恢复conversation并清空current Turn。
+
+> 2026-07-31：[ADR 0128](0128-prompt-content-is-materialized-before-publication.md)关闭Prompt Q1：PromptDefinition持有candidate build期间完全materialize的immutable正文，内部强Arc共享；source locator与cache key不进入Turn resolver或durable schema。
+
+> 2026-07-31：[ADR 0129](0129-user-message-contributions-use-part-level-safe-provenance.md)关闭Prompt Q4：用户body与ordered SkillIntent正交；exact source authorization只用于composition前校验，conversation只保留safe part-level provenance。
 
 ## 背景
 
@@ -40,3 +44,7 @@ C3保持开放。
 ## 后续修订
 
 2026-07-28：[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)删除PromptFingerprint/Skill content-hash pin作为当前架构一致性机制，新增四个shared current roots的原子publication gate，并区分shared source capture与Session-local Workspace source capture。本文的共享view、显式reload只影响future Turn和已committed正文不回写原则保持有效。
+
+2026-07-31：[ADR 0128](0128-prompt-content-is-materialized-before-publication.md)进一步冻结Prompt content representation与cache independence；本文不应被解读为允许`PromptContentRef`、lazy source resolver或content-addressed recovery。
+
+2026-07-31：[ADR 0129](0129-user-message-contributions-use-part-level-safe-provenance.md)进一步冻结SkillIntent、composition input、part-level stamp和用户/模型Skill invocation边界；本文不应被解读为允许字符offset provenance或把exact source authorization写入JSONL。

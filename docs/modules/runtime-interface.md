@@ -373,6 +373,17 @@ Runtime在已确定的Fork source内解析公开anchor：loaded source在同一�
 
 ### TurnCommand
 
+Runtime command边界使用与domain intent同构的非递归输入；容器在进入Session ingress前规范化为PromptIntent：
+
+```rust
+pub struct PromptIntentInput {
+    pub body: PromptBodyIntent,
+    pub skills: Vec<SkillIntent>,
+}
+```
+
+`PromptIntentInput`没有独立Skill或Composite variant。SkillIntent只携带SkillId；slash name和GUI catalog selection必须先resolve为SkillId。Runtime边界执行shape/size与重复SkillId校验；exact Skill存在性、captured source读取与authorization由TurnExecutionContext在Submit admission或Steer safe point完成。任一composition失败都不apply部分UserMessage；具体PromptError到command/event的映射仍属于Prompt error mapping，不由ADR 0129扩大。serde tag/casing由通用wire freeze统一决定。
+
 ```rust
 pub enum TurnCommand {
     Submit {
@@ -690,10 +701,16 @@ active Turn继续使用已pin的TurnModelSnapshot；新revision只影响future T
 
 ```text
 /skill code-review 修复这个问题
-→ PromptIntentInput::Skill
+→ resolve code-review → SkillId
+→ PromptIntentInput {
+     body: Text("修复这个问题"),
+     skills: [SkillIntent { skill_id }]
+   }
 → delivery选择Submit、Steer或FollowUp
 → 对应TurnCommand
 ```
+
+用户显式Skill选择最终成为UserMessage/Steer的一组content parts，不创建独立Item。模型发起Skill Tool时仍使用ToolInvocation Item与ToolCall/ToolResult协议。
 
 ```text
 /status
@@ -1637,6 +1654,9 @@ Public interface是 contract test surface。
 - Fork与Unload竞态的source kind和复制path来自同一linearization decision；
 - live Fork staging失败不发布SessionForked或partial child；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
+- `/skill code-review task`解析为Text body加一个SkillId selection，不产生Skill/Composite variant；
+- duplicate SkillId在边界拒绝，exact captured Skill失败不apply部分UserMessage；
+- 用户显式Skill选择不创建Item，模型Skill Tool仍创建ToolInvocation Item；
 - `/compact`不在catalog。
 
 ### Query/Snapshot Tests

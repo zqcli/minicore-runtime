@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0129后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -325,11 +325,14 @@ pub struct StoredUserMessage {
     pub item_id: ItemId,
     pub source: UserMessageSource,
     pub content: CanonicalUserMessage,
-    pub contribution_stamps: Arc<[StoredPromptContributionStamp]>,
 }
 ```
 
 Input与Steer通过`StoredSessionEntry.turn_id`和`UserMessageSource`区分。TurnId只用于history grouping和Item/Tool correlation；replay不从它重建TurnStatus。实际响应模型保存在对应`StoredAssistantMessage.model`，future Turn配置从current durable Session/Agent definition重新capture。
+
+`CanonicalUserMessage`是`MessageRecord + Arc<[PromptContributionStamp]>`的唯一事实源。Storage不定义`StoredPromptContributionStamp`，也不在StoredUserMessage上保存第二份stamp。live reducer、JSONL encoder和Prompt assembly使用同一个safe part-level stamp表示。该storage projection消费[INV-202](../architecture.md#跨模块不变量索引)。
+
+Session JSONL不保存Turn-static Prompt baseline、`PromptContent`、source locator、cache key或`PromptContentRef`。Prompt/Skill/Workspace正文只有在已经规范化为CanonicalUserMessage内容时才成为conversation fact。stamp只保存`content_part_index`以及`SkillId`或`WorkspaceRootKey + WorkspaceRelativePath`；不保存name、绝对路径、canonical root、trust revision、authorization、hash、cache key或正文引用。
 
 ```rust
 pub struct StoredAssistantMessage {
@@ -422,15 +425,16 @@ replay顺序扫描newline-terminated records：
 
 1. 解析Header；
 2. 对每个完整line解析typed entry；
-3. duplicate EntryId使用first valid wins并告警；
-4. malformed body跳过；
-5. missing parent形成isolated orphan root；
-6. invalid Session/Turn/Item/Interaction relation只隔离对应projection；
-7. 最后partial line忽略并报告；
-8. 构建recorded tree、history view和sanitized conversation；
-9. 返回bounded redacted diagnostics。
+3. UserMessage正文与解释性contribution stamps独立校验；未知origin、malformed stamp或越界`content_part_index`直接丢弃；同一part的stamp按recorded顺序first valid wins，后续重复丢弃并告警；合法正文始终保留；
+4. duplicate EntryId使用first valid wins并告警；
+5. malformed body跳过；
+6. missing parent形成isolated orphan root；
+7. invalid Session/Turn/Item/Interaction relation只隔离对应projection；
+8. 最后partial line忽略并报告；
+9. 构建recorded tree、history view和sanitized conversation；
+10. 返回bounded redacted diagnostics。
 
-Replay不恢复任何process-local执行对象。
+Replay不恢复任何process-local执行对象，也不根据stamp重新加载Skill/Workspace正文、重新授权source或重建旧PromptSet。conversation正文是恢复正确性的事实，stamp只承担安全解释作用。
 
 ## Tool Exchange Replay
 
@@ -556,6 +560,7 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - Unload/Load只恢复recorded prefix并可建立新的Healthy Recorder；
 - 不创建segment、gap marker或backfill suffix；
 - malformed/duplicate/orphan/partial-tail replay；
+- malformed、unknown或越界contribution stamp被丢弃；同一part重复stamp first valid wins；合法UserMessage正文继续恢复；
 - complete/incomplete/duplicate/conflicting Tool exchange；
 - compaction marker missing/invalid；
 - fork历史ID保留和future ID无collision；
@@ -571,4 +576,4 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 开放问题
 
-EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

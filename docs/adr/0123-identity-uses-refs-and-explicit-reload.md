@@ -1,9 +1,13 @@
 # ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload
 
-状态：Partially Superseded by ADRs 0124, 0126 and 0127
+状态：Partially Superseded by ADRs 0124, 0126, 0127 and 0129
 日期：2026-07-28
 
 > 2026-07-31：exact refs、immutable capture和explicit reload继续有效；ADR 0127删除`StoredTurnStart`，Agent/Session/Workspace/Model execution metadata不再随Input记录。
+
+> 2026-07-31：[ADR 0128](0128-prompt-content-is-materialized-before-publication.md)细化本ADR的Prompt规则：正文在candidate build期间materialize为强Arc持有的text value；不恢复PromptFingerprint，也不新增PromptContentRef、content version或durable content store。
+
+> 2026-07-31：[ADR 0129](0129-user-message-contributions-use-part-level-safe-provenance.md)细化Skill/Workspace exact ref边界：source ref与authorization只用于Turn-local composition校验；conversation只保存safe part-level origin，不把exact authorization作为durable identity。
 
 > 2026-07-30：exact refs、immutable capture和explicit reload保留；`ConversationCheckpoint.entry_id`不再是live execution proof，改用process-local `ConversationRevision`。
 

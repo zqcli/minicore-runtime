@@ -1,6 +1,6 @@
 # Turn Execution Context 架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0129后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -18,6 +18,7 @@ TurnExecutionContext
 ## 决策摘要
 
 - Turn admission一次性capture exact Agent/Session/Workspace/Prompt/Skill/Tool/Model对象；
+- PromptSet只包含candidate build期间已经materialize并由强Arc持有的PromptContent，不携带source resolver；
 - active Turn不读取future current roots；
 - private constructor阻止跨capture拼接；
 - ActiveTurnTask直接运行async Model→Tool→Model loop；
@@ -54,6 +55,8 @@ Session current definition
 - shared `/reload`只替换future capture roots；
 - Workspace hard restriction通过SecurityRevoked中断Turn，不热替换Context；
 - provider fallback不会在active Turn内重新resolve另一模型。
+
+PromptService在该capture之前已经完成Prompt source读取、解析和materialization。TurnExecutionContext、PromptSet和ActiveTurnTask都不能持有path/URL/content key并在后续`compose_*()`或`assemble_*()`中解析正文；cache eviction不能使captured PromptSet失效。
 
 ## TurnExecutionContext
 
@@ -107,6 +110,8 @@ Context不拥有：
 - provider stream；
 - mutable Workspace/Prompt/Tool/Skill root；
 - public event publisher。
+
+`compose_input()`和`compose_steer()`遍历`PromptIntent.skills`，只从该Context捕获的SkillView按SkillId取得entry并加载captured bytes；随后把exact Skill/Workspace source refs连同intent交给PromptSet。缺失、重复、stale、source mismatch或required contribution失败时返回typed error，不apply任何部分UserMessage。PromptSet成功后只保留safe part-level stamps；Context不把source authorization交给Recorder。该路径消费[INV-202](../architecture.md#跨模块不变量索引)。
 
 ## Turn Admission
 
@@ -248,7 +253,7 @@ Context本身immutable且不可撤销。EmergencyControl由ActiveTurnTask观察�
 
 ## Reload
 
-Shared Prompt/Skill/Tool/Model reload使用all-or-none candidate publication。Workspace reload只在Idle。active Turn的Context保持不变。
+Shared Prompt/Skill/Tool/Model reload使用all-or-none candidate publication。Workspace reload只在Idle。Prompt candidate必须包含完整materialized PromptContent后才能publication；active Turn的Context保持不变。
 
 不建立fingerprint、generation或hot replacement identity。`ConversationRevision`只描述live conversation变化，不描述resource reload。
 
@@ -265,6 +270,8 @@ restart后：
 
 - 同一次capture objects不能跨root拼接；
 - reload不改变active Context；
+- Prompt source变化或cache eviction不改变active PromptContent，assemble不执行正文I/O；
+- SkillIntent只从captured SkillView解析；exact authorization在composition前验证，最终message只保留safe part-level stamp；
 - Prompt ToolSpec与Tool execution route一致；
 - ModelCallRequest source revision与assembly一致；
 - retry复用exact request；
@@ -276,4 +283,4 @@ restart后：
 
 ## 开放问题
 
-PromptContent inline/reference和contribution stamp字段仍需在wire/schema freeze关闭。Async loop/recording策略问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭。剩余serde casing与public ID格式进入通用wire/schema freeze。Async loop/recording策略问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

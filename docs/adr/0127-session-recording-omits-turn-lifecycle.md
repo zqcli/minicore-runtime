@@ -5,6 +5,8 @@
 
 MiniCore的Session JSONL用于恢复conversation transcript、history tree与必要解释元数据。它不承担Turn execution ledger职责，不保存`StoredTurnStart`、`TurnCompleted`、`TurnInterrupted`或`TurnFailed`。该决策关闭Q10：cold Load不推断、不合成也不追加旧Turn terminal。
 
+> 2026-07-31：[ADR 0129](0129-user-message-contributions-use-part-level-safe-provenance.md)冻结UserMessage解释元数据：conversation正文继续承担恢复正确性；contribution stamp只保存safe part-level origin，损坏stamp不能导致正文丢失。
+
 ## 背景
 
 ADR 0126已经把`LiveSessionState`确定为current-process truth，并把Session recording降级为inline best-effort前缀。继续记录Turn start/terminal会产生不对称生命周期：process可以在start之后、terminal之前退出，Recorder也可以在live terminal之后Degraded。文件随后包含unfinished Turn，迫使Load或Fork选择隐式边界、live recovery projection或synthetic closure。
