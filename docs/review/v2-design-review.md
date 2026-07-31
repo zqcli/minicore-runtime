@@ -159,7 +159,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 ### 存储 scale / 恢复兜底（correctness 不阻塞）
 
-- ~~无持久checkpoint/index导致cold open为O(n)完整replay。~~ **已关闭，接受MVP取舍**：冷启动顺序读取全部complete `StoredSessionEntry`直到physical current entry（最后成功append的`EntryId`）并重建durable projections；不恢复provider stream、AgentLoop、Tool task、waiter或queue，unfinished Turn按conservative recovery追加terminal事实后进入Idle。已loaded Session之间切换只路由现有`SessionExecutionHandle`，不触发storage replay。Compaction只降低model-visible conversation，不降低ledger replay成本；MVP不实现ProjectionSnapshot、byte-offset/checkpoint index、segmentation或vacuum，没有真实性能数据前不增加加速层。
+- ~~无持久checkpoint/index导致cold open为O(n)完整replay。~~ **已关闭，接受MVP取舍**：冷启动顺序读取全部complete `StoredSessionEntry`直到recorded head并重建conversation/history projections；不恢复provider stream、AgentLoop、Tool task、waiter、queue或旧TurnStatus，Load后`current_turn = None`并进入Idle。已loaded Session之间切换只路由现有`SessionExecutionHandle`，不触发storage replay。Compaction只降低model-visible conversation，不降低history replay成本；MVP不实现ProjectionSnapshot、byte-offset/checkpoint index、segmentation或vacuum，没有真实性能数据前不增加加速层。
 - 「同时只有一个 Running Turn」不在 corruption/replay 校验清单，只靠 executor 纪律 → 提升为 writer 追加校验 + replay fold 不变量（fail closed）。
 - ~~无explicit repair工具导致中段坏行brick整个Session。~~ **已由ADR 0124关闭**：live append保持strict；cold replay跳过malformed/unknown/duplicate记录、把missing parent隔离为orphan root，并返回line/offset diagnostics。MVP明确不建设repair utility。
 - host restart 跨会话非幂等 Tool 重复副作用（Started-but-no-result → Abandoned → 下一 Turn 模型重新请求并再次执行）→ 点明代价，引入 tool 级副作用幂等 key 缓解。
@@ -172,7 +172,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - ~~`PrepareForUnload` graceful unload 不自动 Cancel，长期Pending Interaction可能阻止卸载~~：**已随D1关闭**。LifecycleControl立即stop admission；有限grace deadline属于Unload lifecycle，到期后Cancel active Turn并以Cancelled关闭Pending Interaction。
 - ~~共享ModelGateway配额下无前台/后台公平性，大量后台Session可能抬高交互延迟。~~ **已由ADR 0125关闭**：删除ModelGateway全部本地模型调用permit与admission queue，多Session直接进入各自provider attempt；不建设foreground/background优先级。
 - ~~Cancel需等待越过`ToolExecutionStarted`的Tool结构化收口，command response和可观察状态绑定terminal~~：**已由ADR 0118关闭**。sticky cancel epoch发布后立即返回`CancelAccepted`并进入Finishing；FollowUp可排队，最终TurnInterrupted通过StateEvent/Snapshot观察。
-- ~~Agent status synchronization与当时的独立Workspace commit permit嵌套包裹initiating append，可能需要全局锁序~~：**已由ADR 0117关闭，ADR 0121进一步删除Workspace permit**。当前single-owner、non-blocking TurnControl reservation和release-before-fan-out使循环等待不可构造；同Agent多Session只可能在短start-commit permit上有限串行。
+- ~~Agent status synchronization与当时的独立Workspace commit permit嵌套包裹initiating append，可能需要全局锁序~~：**已由ADR 0117关闭，ADR 0121进一步删除Workspace permit，ADR 0127把start线性化点收缩为live admission**。当前single-owner、non-blocking TurnControl reservation和release-before-fan-out使循环等待不可构造；同Agent多Session只在不跨I/O的短admission permit上有限串行。
 - ~~queued FollowUp（process-local FIFO）与队首新到 external Submit 的处理优先级未定义~~：**已随D1关闭**。terminal后已accepted FollowUp最多获得一次连续优先；若上一Turn由FollowUp启动且external Submit待决，则下一次Idle decision先选Submit。Submit不会被当作隐式FollowUp跨整个Turn等待。
 - ~~`assemble_model_context`为同步fn，大context组装/tokenize可能阻塞该Executor控制面~~：**已随O7关闭**。量化复核确认当前是低成本纯内存线性assembly；保持同步实现，不增加offload、counter或observer。
 - Cancel/SecurityRevoked路径已存在的truthful Tool messages继续保留；如果全部matching results自然形成complete exchange则可见，incomplete exchange保持隐藏并告警。
@@ -246,7 +246,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 
 观察协议后续决策见[ADR 0114](../adr/0114-runtime-observation-uses-snapshot-first-streams.md)：首版删除公开RuntimeCursor/SessionCursor、ReadStamp、Gap和event replay；subscribe首帧原子返回Snapshot，之后只发送实时事件，断线/背压/restart后重新subscribe。该变化不影响多Session并行执行。
 
-协议identity后续决议：独立`SubmissionId`没有独立生命周期，已删除。Submit的随机、不可复用`CommandId`在initiating UserMessage append前定位唯一admission candidate和Cancel target；同一Runtime内duplicate in-flight Submit加入原completion，restart后旧CommandId不重放。append后返回`TurnStarted { turn_id }`，后续取消使用`TurnId`。
+协议identity后续决议：独立`SubmissionId`没有独立生命周期，已删除。Submit的随机、不可复用`CommandId`在整个Starting阶段定位唯一admission candidate/Turn和Cancel target；同一Runtime内duplicate in-flight Submit加入原completion，restart后旧CommandId不重放。Input live apply并完成当前record attempt后返回`TurnStarted { turn_id }`，response publication后取消使用`TurnId`。
 
 StateEvent可靠性后续决议：不增加durability enum或第二event通道。所有StateEvent都是当前subscription内按序交付的非durable observer record；payload来源决定restart后的重建方式，Host始终以新Snapshot重置read model。
 
@@ -311,7 +311,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 原发生场景：restart/fork后尝试恢复Tool grant或authorization cache，grant key依赖`WorkspaceAccessFingerprint`，旧文档未说明该值应持久化、重建还是失效。
 - 同类产品复核：pi恢复conversation/cwd但重新加载resources、tools和system prompt；Codex resume重新构造cwd、workspace roots、approval与sandbox config；Gemini CLI只声明保存conversation/tool history；OpenHands在sandbox state丢失时从durable event history启动fresh agent session；Claude Code重新读取settings，且不恢复bypassPermissions、后台Bash和临时add-dir。共同基线是保留history、重建current execution environment。
-- 决议：durable Session definition与conversation继续保留；WorkspaceSnapshot、authorization-sensitive cache和旧execution Context不跨Runtime恢复。ADR 0122曾使用Runtime-local fingerprint family关闭O12；[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)进一步删除Workspace/view fingerprint族，不新增generation/replacement identity，并将MVP审批收窄为per-call `AllowOnce/AllowWith`，不保存Session/Turn grant。unfinished Turn继续按HostRestart/RecoveryContextUnavailable关闭。
+- 决议：durable Session definition与conversation继续保留；WorkspaceSnapshot、authorization-sensitive cache和旧execution Context不跨Runtime恢复。ADR 0122曾使用Runtime-local fingerprint family关闭O12；[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)进一步删除Workspace/view fingerprint族，不新增generation/replacement identity，并将MVP审批收窄为per-call `AllowOnce/AllowWith`，不保存Session/Turn grant。[ADR 0127](../adr/0127-session-recording-omits-turn-lifecycle.md)进一步删除restart Turn closure，Load不恢复旧TurnStatus。
 - 关闭依据：[ADR 0123](../adr/0123-identity-uses-refs-and-explicit-reload.md)取代[ADR 0122](../adr/0122-workspace-fingerprints-are-runtime-local.md)。当前授权、retry、recovery和cache correctness不依赖Workspace fingerprint canonical encoding、algorithm version或golden-vector。未来durable grant或跨设备execution migration必须另建ADR。
 
 ### Storage与恢复
@@ -320,7 +320,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 
 - 发生场景：长期Session积累数万entries并多次compaction/fork；每次load、recovery或history replay仍从文件头执行cross-entry validation。
 - 复核结论：pi、Codex和Gemini CLI的cold resume同样顺序读取完整session/rollout记录，再用latest effective compaction或replacement history构造模型上下文；Compaction不是完整execution checkpoint。MiniCore的多loaded Session切换不执行cold open，因此该成本只发生在显式load、restart recovery或hot projection丢弃后的replay。
-- 关闭决议：MVP有意接受O(n)完整扫描。ADR 0124后cold load顺序扫描全部newline-terminated entries，跳过malformed/duplicate记录、隔离orphan/invalid relation并重建sanitized projections，不恢复任何process-local execution object；unfinished Turnbest-effort closure后进入Idle或Unavailable。MVP不增加ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum。
+- 关闭决议：MVP有意接受O(n)完整扫描。ADR 0124后cold load顺序扫描全部newline-terminated entries，跳过malformed/duplicate记录、隔离orphan/invalid relation并重建sanitized projections，不恢复任何process-local execution object；ADR 0127后不推断旧Turn outcome，`current_turn = None`并进入Idle或Unavailable。MVP不增加ProjectionSnapshot、byte-offset/checkpoint index、physical segmentation或vacuum。
 - 重开条件：真实Session规模或load/recovery遥测证明线性replay造成不可接受的用户可见延迟或资源占用时，以独立设计重新评估；不能仅因Compaction存在就把它提升为完整Session checkpoint。
 
 #### O3 · Explicit repair utility（已关闭）
@@ -350,7 +350,7 @@ Turn/Item排序后续决议：不增加scope-local DisplaySequence、ordinal或s
 - 原发生场景：write、process或remote Tool已append`ToolExecutionStarted`；用户Cancel后，原协议直到exact outcome/Abandoned与`TurnInterrupted`完成才返回，期间用户无法确认Cancel是否已接受。
 - 复核结论：pi会等待Tool Promise、filesystem I/O和process termination；Codex对普通Tool丢弃业务结果，但shell等Tool等待runtime teardown。所有await结果一律丢弃会留下旧write、child process或已提交remote request；同Session立即开启第二Turn还会破坏单current Turn、单RunningOperation与conversation顺序。
 - 决议：sticky cancel epoch线性化后立即返回typed`CancelAccepted { target, cancel_epoch }`；Executor停止逻辑推进、递增execution_version并进入公开`Finishing`。Model/Context迟到结果丢弃，Tool按write I/O settle、process teardown或remote outcome unknown规则结构化收口。Finishing期间Steer拒绝、FollowUp可Queued、Submit仍SessionBusy；旧Turnterminal后再启动FollowUp Turn。
-- 关闭依据：[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。不新增`TurnExecutionPhase::Cancelling`；UI优先按`SessionExecutionState::Finishing`显示Stopping，最终事实由`turn_interrupted`、条件满足时的`session_settled`与Snapshot表达。Cancel和initiating/final append reservation first-wins，避免accepted后仍提交Started/Completed。
+- 关闭依据：[ADR 0118](../adr/0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md)。不新增`TurnExecutionPhase::Cancelling`；UI优先按`SessionExecutionState::Finishing`显示Stopping，最终事实由current-process `turn_interrupted`、条件满足时的`session_settled`与Snapshot表达。Cancel在Input live apply前取消candidate，apply后绑定同一Turn；cancel epoch与live Completed decision first-wins，避免accepted后仍提交Completed。
 
 #### O7 · 同步assembly控制面stall（已关闭）
 

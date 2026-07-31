@@ -1,7 +1,7 @@
 # Turn Execution Context 架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（ADR 0127后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -13,9 +13,6 @@ Turn
 
 TurnExecutionContext
 → 当前Runtime内一次Turn捕获的immutable execution objects
-
-StoredTurnStart
-→ best-effort Session log中的safe historical metadata
 ```
 
 ## 决策摘要
@@ -119,27 +116,12 @@ SessionExecutor reserves candidate TurnId/control_generation
 → compose Input
 → LiveSessionState validates start + allocates EntryId + binds parent_id
 → apply start_turn(...) and increment ConversationRevision
-→ await SessionRecorder.record(Input + StoredTurnStart)
+→ await SessionRecorder.record(Input UserMessage)
 → publish TurnStarted
 → spawn ActiveTurnTask with same Arc<TurnExecutionContext>
 ```
 
 recording failure不撤销已开始的live Turn。capture或live validation失败时不创建Turn。
-
-## StoredTurnStart
-
-Input UserMessage可以best-effort record：
-
-```rust
-pub struct StoredTurnStart {
-    pub agent: AgentRevisionRef,
-    pub session_revision: SessionDefinitionRevision,
-    pub model: ModelSelectionSummary,
-    pub started_at: Timestamp,
-}
-```
-
-它用于history说明，不用于restart execution restore。cold replay不重新解析旧PromptSet、ToolSet、SkillView或WorkspaceSnapshot。
 
 ## Live Conversation Basis
 
@@ -276,7 +258,7 @@ restart后：
 
 - replay recorded Session prefix；
 - 不恢复TurnExecutionContext、ActiveTurnTask、ModelCallRequest、provider continuation、Tool task或Interaction waiter；
-- recorded unfinished Turn标记restart interruption；
+- 不从recorded `TurnId`推断旧TurnStatus，`current_turn`为空；
 - future Turn按current definition重新capture。
 
 ## 测试要求

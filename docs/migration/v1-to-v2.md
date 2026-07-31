@@ -1,7 +1,7 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已按ADR 0126重构，生产实现待启动
-日期：2026-07-30
+状态：V2目标架构已按ADR 0126/0127重构，生产实现待启动
+日期：2026-07-31
 
 ## 目的
 
@@ -46,8 +46,8 @@ LiveConversationView
 → ModelCallRequest::new
 → await ModelGateway
 → optional await ToolSet / Interaction
-→ live mutation + record attempt
-→ next Model or terminal
+→ recordable conversation mutation + record attempt
+→ next Model or live terminal
 ```
 
 ## 2026-07-30重构
@@ -68,13 +68,27 @@ writer failure → read-only/Unavailable
 新规则：
 
 - LiveSessionState是current-process truth；
-- SessionRecorder只保存有序best-effort JSONL prefix；
-- live apply成功后完成inline record attempt，再publish/continue；
+- SessionRecorder只保存有序best-effort conversation JSONL prefix；
+- recordable conversation fact live apply成功后完成inline record attempt，再publish/continue；
 - recording failure只更新health；
 - cold replay只恢复recorded prefix；
 - complete Tool exchange仍是Model visibility门禁，但由live reducer拥有；
 - logical retry由ActiveTurnTask使用ConversationRevision验证；
 - Compaction先Replace live conversation，再record marker。
+
+## 2026-07-31重构
+
+ADR 0127进一步删除持久化Turn lifecycle：
+
+```text
+StoredTurnStart
+StoredTurnTerminal
+TurnCompleted / TurnInterrupted / TurnFailed JSONL events
+cold recovery closure
+HistoricalFork terminal
+```
+
+TurnStatus和terminal StateEvent继续服务current loaded execution。Replay只恢复conversation facts并sanitize incomplete Tool exchange；Load设置`current_turn = None`，Fork原样复制selected conversation path。
 
 ## 迁移原则
 
@@ -117,11 +131,11 @@ writer failure → read-only/Unavailable
 - serde casing/tag；
 - public ID文本格式；
 - Timestamp/Money；
-- StoredTurnStart/StoredCompaction schema。
+- StoredCompaction schema。
 
 ### 阶段3：Conversation Recording与Replay
 
-状态：目标设计已按ADR 0126重写，生产实现未开始。
+状态：目标设计已按ADR 0126/0127重写，生产实现未开始。
 
 必须实现：
 
@@ -134,7 +148,8 @@ writer failure → read-only/Unavailable
 7. tolerant replay；
 8. complete/incomplete Tool exchange sanitizer；
 9. recorded history tree/query/fork；
-10. recording health Snapshot/diagnostics。
+10. recording health Snapshot/diagnostics；
+11. conversation-only schema：无StoredTurnStart/terminal，Load无closure。
 
 完成门槛：
 
@@ -148,7 +163,9 @@ writer failure → read-only/Unavailable
 - [ ] crash/failed write留下partial tail时replay不brick，writable Load只截断final unterminated tail；
 - [ ] incomplete Tool exchange不进入model input；
 - [ ] recording failure不产生SessionUnavailable；
-- [ ] no-corruption live/replay sanitizer结果一致。
+- [ ] no-corruption live/replay sanitizer结果一致；
+- [ ] restart后current_turn为空，不推断或追加旧Turn terminal；
+- [ ] historical ListTurns/GetTurn按TurnId分组且不返回execution status。
 
 ### 阶段4：Prompt、Skill、Tool与Workspace capture
 
@@ -233,11 +250,7 @@ SessionExecutor admits Turn
 
 ## 开放问题
 
-Recorder问题集中在[`docs/review/async-loop-best-effort-recording-open-questions.md`](../review/async-loop-best-effort-recording-open-questions.md)：
-
-- recovery closure recording。
-
-Q1 queue容量、Q2 RecordingHealth wire、Q3 explicit flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy、Q8 event/record顺序和Q9 EntryId owner已经关闭。
+Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.md`](../review/async-loop-best-effort-recording-open-questions.md)。Q1–Q10已经全部关闭；Q10由ADR 0127确定conversation-only schema和无closure Load。
 
 其他门禁：
 

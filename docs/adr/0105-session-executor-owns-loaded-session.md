@@ -1,7 +1,9 @@
 # ADR 0105: SessionExecutor 拥有 loaded Session
 
-状态：Partially Superseded by ADR 0126
+状态：Partially Superseded by ADRs 0126 and 0127
 日期：2026-07-24
+
+> 2026-07-31：control actor、single ActiveTurnTask和live terminal handoff保留；ADR 0127删除restart conservative terminalization，Load从recorded conversation建立Idle view。
 
 > 2026-07-30：SessionExecutor control actor与每Session单active Turn约束保留；single mutable Executor owner、`SessionWriter`、`RunningOperation`和同步AgentLoop改为control actor + `ActiveTurnTask` + live state。
 

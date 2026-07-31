@@ -1,7 +1,9 @@
 # ADR 0118：Cancel立即确认，FollowUp等待结构化收口后启动
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-27
+
+> 2026-07-31：CancelAccepted、Finishing、truthful Tool settlement、live TurnInterrupted和FollowUp handoff继续有效；ADR 0127删除TurnInterrupted JSONL entry，并使`Cancel(Submit)`在整个Starting阶段保持有效。Input已live apply时Cancel绑定同一Turn并阻止task spawn，不再按正文旧start-commit reservation规则返回transition error。Terminal完成由current-process StateEvent/Snapshot表达。
 
 > 2026-07-30：即时CancelAccepted、truthful Tool settlement和FollowUp等待旧Turn结束保留；terminal和Interaction closure先apply live并best-effort record，不等待physical append。
 

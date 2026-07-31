@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop，并把Session持久化降级为inline best-effort recording。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording。
 
 权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -52,7 +52,7 @@ process-local单调版本，每次model-visible live mutation递增。ModelCallR
 `LiveSessionState`私有持有的Session-scoped identity generator。domain validation后、live apply前分配EntryId并绑定parent_id；replay/Fork copied IDs用于collision guard。Degraded不影响分配，Recorder不能创建或改写ID。
 
 **SessionRecorder**：
-每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append当前JSONL line，不使用后台task或queue，也不提供durable commit receipt。
+每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append稳定conversation fact，不使用后台task或queue，也不提供durable commit receipt。TurnStatus与terminal reason不进入Recorder。
 
 **RecordingHealth**：
 Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严格stage initial SessionHeader；每次Load都尝试初始化Recorder。Recorder第一次initialize/encode/write失败后Degraded并停止后续记录，replay最多恢复此前有效完整行前缀。Degraded在同一loaded instance内为终态，不retry、不创建segment、不backfill；recording failure不终止Turn、不使Session execution Unavailable。
@@ -64,13 +64,13 @@ Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严
 负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
-SessionRecorder可能写入的一条immutable JSONL record。使用EntryId和parent_id形成recorded history tree。EntryId由live owner在apply前分配，Recorder不能创建或改写。
+SessionRecorder可能写入的一条immutable conversation/configuration JSONL record。使用EntryId和parent_id形成recorded history tree；TurnId只承担conversation correlation。EntryId由live owner在apply前分配，Recorder不能创建或改写。
 
 **Recorded prefix**：
 process crash或recording degradation后实际留在JSONL中的完整行前缀。restart只能恢复该prefix，未record live tail永久丢失。
 
 **Tolerant replay**：
-顺序读取recorded完整行，skip malformed/duplicate，隔离orphan/invalid relation，排除incomplete Tool exchange并返回bounded diagnostics。不恢复ActiveTurnTask、provider stream、Tool task、waiter、queue或retry timer。
+顺序读取recorded完整行，skip malformed/duplicate，隔离orphan/invalid relation，排除incomplete Tool exchange并返回bounded diagnostics。不恢复ActiveTurnTask、provider stream、Tool task、waiter、queue、retry timer或旧TurnStatus；Load后的current Turn为空。
 
 **ForkSourceKind**：
 Fork在source linearization point选择的事实来源：loaded Session固定为`LiveSnapshot`，unloaded Session固定为`RecordedHistory`。该值进入child durable fork provenance和`SessionForked`结果。
@@ -78,7 +78,7 @@ Fork在source linearization point选择的事实来源：loaded Session固定为
 ## Turn与执行
 
 **Turn**：
-一次用户意图执行，从live Input UserMessage开始，到Completed/Interrupted/Failed terminal结束。一个Session同时最多一个Running Turn。
+一次current-process用户意图执行，从live Input UserMessage开始，到Completed/Interrupted/Failed terminal结束。一个Session同时最多一个Running Turn。JSONL只用TurnId分组conversation facts，不保存Turn lifecycle。
 
 **TurnExecutionContext**：
 Turn admission时捕获的immutable execution binding，固定AgentRevisionRef、SessionDefinitionRevision、WorkspaceSnapshot、PromptSet、ToolSet、SkillView和TurnModelSnapshot。
@@ -96,7 +96,7 @@ ActiveTurnTask中的普通async Model→Tool→Model流程。first-party MiniCor
 等待当前Turn结束后创建新Turn的process-local FIFO输入。新Turn重新capture TurnExecutionContext。
 
 **CancelAccepted**：
-确认sticky cancel epoch已发布。它不等待Tool settlement、Turn terminal或Session recording。
+确认sticky cancel epoch已发布。Starting阶段保持`Submit CommandId` target：Input live apply前取消candidate，apply后绑定同一Turn并阻止ActiveTurnTask spawn；response publication后使用TurnId。它不等待Tool settlement、Turn terminal或Session recording。
 
 **SecurityRevoked**：
 WorkspaceAuthority/host发布的process-local emergency signal。阻止新Model/Tool/source operation；Running Tooltruthful settle，Turn结束后重新resolve Workspace。
@@ -169,7 +169,7 @@ Item执行期间MiniCore发起的ToolApproval或UserQuestion。request先apply l
 公开UI-safe request/resolution view。Presentation Adapter不能创建虚假Pending Interaction或持有Tool waiter。
 
 **StateEvent**：
-当前subscription内按序交付的live observer record。final domain event从live mutation派生，可以领先recorded history；restart后不重放。
+当前subscription内按序交付的live observer record。final domain event从live mutation派生，可以领先recorded history；Turn terminal StateEvent不进入JSONL，restart后不重放。
 
 **ProgressEvent**：
 可合并/丢弃的streaming、Tool output或retry update。它不进入LiveConversation或SessionRecorder。
@@ -178,7 +178,7 @@ Item执行期间MiniCore发起的ToolApproval或UserQuestion。request先apply l
 一个loaded Session的live observer baseline，包含execution、current Turn、live Items、Pending Interaction、queues、usage、recording health和diagnostics。它不是durable checkpoint。
 
 **Snapshot-first subscription**：
-订阅第一帧返回完整Snapshot，随后交付实时event。断线或背压后重新subscribe；restart后的新Snapshot只基于recorded prefix和new live state。
+订阅第一帧返回完整Snapshot，随后交付实时event。断线或背压后重新subscribe；restart后的新Snapshot只基于recorded conversation prefix和new live state，`current_turn`为空。
 
 ## 生命周期与Workspace
 
@@ -219,7 +219,7 @@ Host从`SessionSnapshot.recording.state = degraded`知道当前Session已停止�
 
 ## 已删除术语
 
-以下名称只属于ADR 0126之前的设计，不得用于新实现：
+以下名称或语义已经被ADR 0126/0127删除，不得用于新实现：
 
 ```text
 AgentLoop
@@ -238,14 +238,17 @@ ConversationCheckpoint as live proof
 Transcript-First
 append/apply commit barrier
 writer-poisoned Session Unavailable
+StoredTurnStart
+StoredTurnTerminal
+HistoricalFork terminal closure
+cold recovery Turn terminalization
 ```
 
 ## 当前开放问题
 
-- wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredTurnStart/StoredCompaction；
+- wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction；
 - Prompt Q1/Q4：PromptContent representation与contribution stamp字段；
 - EntryId算法与public文本wire；
-- cold recovery closure是否record；
 - Rig 0.40.0 provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

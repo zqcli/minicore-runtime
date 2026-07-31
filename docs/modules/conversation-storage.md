@@ -1,7 +1,7 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（ADR 0127后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -13,6 +13,7 @@
 - `SessionRecorder`把live mutation顺序inline append为可恢复的best-effort前缀；
 - append outcome不作为Model、Tool、Interaction或StateEvent的durable correctness proof；
 - cold replay只恢复已经record的完整行；
+- JSONL不记录Turn start、terminal或其他execution lifecycle；
 - replay仍必须构造provider-valid sanitized conversation。
 
 本文不定义Model/Tool scheduling、Prompt assembly、Tool sandbox或Runtime wire schema。
@@ -36,12 +37,13 @@ MiniCore采用同类产品的live-first语义，同时保留typed JSONL、tree i
 - Recorder不使用后台task、channel或process-local queue；
 - encode或physical write失败不回滚live state；
 - first recording failure后停止该loaded Session后续记录；
-- 文件最多是live event stream的一个合法前缀；
+- 文件最多是recordable conversation facts的一个合法前缀；
 - cold replay宽容skip/isolate局部坏记录；
 - incomplete/orphan/abandoned-first Tool exchange不进入模型conversation；
 - EntryId继续用于recorded tree、fork和history query；
 - `ConversationRevision`取代EntryId checkpoint作为live execution basis；
-- restart不恢复未record tail或旧execution objects。
+- TurnId只承担conversation correlation，不表达durable TurnStatus；
+- restart不恢复未record tail、旧execution objects或旧TurnStatus。
 
 ## Ownership
 
@@ -96,7 +98,7 @@ UUID/ULID算法、文本编码和serde wire由后续ID schema freeze决定。Rec
 **Canonical cross-module invariant: INV-001.**
 
 ```text
-validate live mutation
+validate recordable conversation mutation
 → LiveSessionState.EntryIdGenerator.allocate + bind parent_id
 → apply LiveSessionState
 → increment ConversationRevision when model-visible
@@ -115,7 +117,7 @@ pub(crate) enum RecordOutcome {
 
 `Written`只表示该JSONL line的`write_all`成功，不表示flush、fsync或power-loss durability。调用方不能把outcome当成execution permit，也不能因`NotRecorded`重新执行Model或Tool。
 
-Live mutation失败时不record、不publish。Live mutation成功后recording失败不回滚。record await期间不得持有`LiveSessionState` guard。
+recordable mutation失败时不record、不publish。mutation成功后recording失败不回滚。record await期间不得持有`LiveSessionState` guard。Turn terminal state mutation没有对应`StoredSessionEntry`：它只apply live并发布StateEvent，不经过Recorder。
 
 ## ConversationRevision
 
@@ -191,7 +193,7 @@ recording failure：
 
 - 发布redacted diagnostic/health update；
 - 不使Session execution Unavailable；
-- 不阻止Submit、Model、Tool、Interaction、Compaction或terminal；
+- 不阻止Submit、Model、Tool、Interaction、Compaction或live terminal settlement/publication；
 - 不自动切换到第二文件或新segment；
 - 不尝试追溯补写已经unrecorded的live gap；
 - 存储恢复后当前loaded Session仍保持Degraded，后续`record()`继续返回`NotRecorded`。
@@ -323,23 +325,11 @@ pub struct StoredUserMessage {
     pub item_id: ItemId,
     pub source: UserMessageSource,
     pub content: CanonicalUserMessage,
-    pub turn_start: Option<StoredTurnStart>,
     pub contribution_stamps: Arc<[StoredPromptContributionStamp]>,
 }
 ```
 
-Input UserMessage要求`turn_start = Some(...)`；Steer要求`None`。
-
-```rust
-pub struct StoredTurnStart {
-    pub agent: AgentRevisionRef,
-    pub session_revision: SessionDefinitionRevision,
-    pub model: ModelSelectionSummary,
-    pub started_at: Timestamp,
-}
-```
-
-StoredTurnStart只用于历史说明。cold replay不要求旧Workspace/Prompt/Skill/Tool/Model对象仍可解析。
+Input与Steer通过`StoredSessionEntry.turn_id`和`UserMessageSource`区分。TurnId只用于history grouping和Item/Tool correlation；replay不从它重建TurnStatus。实际响应模型保存在对应`StoredAssistantMessage.model`，future Turn配置从current durable Session/Agent definition重新capture。
 
 ```rust
 pub struct StoredAssistantMessage {
@@ -385,13 +375,12 @@ Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId�
 pub enum StoredEvent {
     InteractionRequested(StoredInteractionRequest),
     InteractionResolved(StoredInteractionResolution),
-    TurnCompleted(StoredTurnTerminal),
-    TurnInterrupted(StoredTurnTerminal),
-    TurnFailed(StoredTurnTerminal),
     SessionDefinitionChanged(StoredSessionDefinitionChange),
     SessionLifecycleChanged(StoredSessionLifecycleChange),
 }
 ```
+
+JSONL不保存`TurnStarted`、`TurnCompleted`、`TurnInterrupted`、`TurnFailed`或`StoredTurnTerminal`。Final Assistant是稳定conversation fact；Interrupted/Failed只属于当前loaded execution的StateEvent/Snapshot。
 
 不记录：
 
@@ -399,6 +388,7 @@ pub enum StoredEvent {
 - `ToolRoundCompleted`；
 - `RunningOperation`；
 - ActiveTurn phase；
+- TurnStatus和Turn terminal reason；
 - provider stream delta；
 - retry timer；
 - recorder health changes；
@@ -451,7 +441,7 @@ cold projector维护每个assistant response的expected ordered ToolCalls：
 - ToolResult与ToolAbandoned冲突first terminal wins；
 - 全部first terminal outcome均为matching truthful ToolResult时，exchange model-visible；
 - abandoned-first、missing、orphan或identity-conflicting exchange不进入模型conversation；
-- 下一条合法User、Assistant、Compaction或Turn terminal关闭未完成exchange；
+- 下一条合法User、Assistant或Compaction关闭未完成exchange；EOF处仍未完成的exchange直接排除；
 - closure后迟到result视为orphan；
 - 后续合法conversation可以继续恢复。
 
@@ -506,7 +496,7 @@ anchor解析和selected path必须来自同一个snapshot。capture前已经appl
 
 RecordedHistory从tolerant replay得到的selected recorded path复制。两种source都保留复制历史的Entry/Turn/Item/Request/ToolCall IDs，只分配新SessionId；future entry使用fresh ID。
 
-target使用staging + atomic publication建立完整新record stream。selected path未全部materialize或replay validation失败时Fork返回typed error且不发布child；这一步是Fork publication前的完整copy，不是已发布Session上的best-effort suffix recording。child后续和其他Session一样始终尝试记录。selected path包含non-terminal tail时，child按`HistoricalFork`规则追加closure后才发布。
+target使用staging + atomic publication建立完整新record stream。selected path未全部materialize或replay validation失败时Fork返回typed error且不发布child；这一步是Fork publication前的完整copy，不是已发布Session上的best-effort suffix recording。child后续和其他Session一样始终尝试记录。selected path可以在任意公开message anchor结束；child不继承source active Turn状态，发布后保持Unloaded，未来Load得到Idle conversation view。
 
 child durable provenance至少保存：
 
@@ -529,13 +519,12 @@ open file and attempt writable lease
 → create LiveSessionState from replay
 → sanitize incomplete exchange
 → initialize new inline recorder at replayed recorded head
-→ mark recorded unfinished Turn InterruptedByRestart in live recovery view
-→ optional Q10 closure attempt only after recorder initialization
 → resolve current Workspace/Agent definition
+→ current_turn = None
 → SessionExecutor Idle or WorkspaceUnavailable
 ```
 
-recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail。是否record cold recovery closure仍由Q10决定；任何optional attempt必须发生在Recorder初始化之后，且失败不能阻止admission。
+recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail和旧TurnStatus。Load不推断旧Turn outcome、不创建restart interruption，也不执行recovery append。
 
 Tail处理只允许截断final unterminated partial line。完整newline-terminated entry即使来自先前outcome-unknown write，只要typed replay有效就必须保留；malformed中段行继续由tolerant replay隔离，不执行repair、reparent或gap marker synthesis。
 
@@ -561,7 +550,7 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - Degraded状态继续分配ID且不复用未publish ID；
 - recorder按live mutation顺序inline写出；
 - encode/write failure后停止suffix，replay保持有效完整行前缀；
-- recording failure不阻止Model/Tool/Interaction/terminal；
+- recording failure不阻止Model/Tool/Interaction或live terminal settlement/publication；
 - crash或failed write留下partial tail时read-only replay安全忽略，writable Load只截断final unterminated tail；
 - Degraded后即使storage恢复，当前loaded Session仍不写新entry；
 - Unload/Load只恢复recorded prefix并可建立新的Healthy Recorder；
@@ -574,10 +563,12 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - live mutation apply后、record attempt返回前Fork仍使用LiveSnapshot包含该mutation；
 - Fork与Unload竞态产生稳定且公开的LiveSnapshot或RecordedHistory source；
 - live Fork staging失败不发布partial child；
+- Fork不追加fork-specific terminal，child不继承source current Turn；
 - restart不恢复execution objects；
+- restart后current_turn为空且不合成Turn terminal；
 - bounded redacted diagnostics；
 - LiveConversation与无corruption replay产生相同sanitized messages。
 
 ## 开放问题
 
-EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Recording state wire由Q2关闭，Degraded recovery由Q5关闭，Fork source由Q6关闭，强制记录且无Disabled policy由Q7关闭；Recorder其余问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

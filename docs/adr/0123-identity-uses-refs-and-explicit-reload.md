@@ -1,7 +1,9 @@
 # ADR 0123：执行一致性使用Exact Ref、不可变快照与显式Reload
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-28
+
+> 2026-07-31：exact refs、immutable capture和explicit reload继续有效；ADR 0127删除`StoredTurnStart`，Agent/Session/Workspace/Model execution metadata不再随Input记录。
 
 > 2026-07-30：exact refs、immutable capture和explicit reload保留；`ConversationCheckpoint.entry_id`不再是live execution proof，改用process-local `ConversationRevision`。
 

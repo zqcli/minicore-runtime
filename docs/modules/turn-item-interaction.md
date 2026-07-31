@@ -1,7 +1,7 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（ADR 0127后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -16,7 +16,7 @@ Session
       └─ Interaction*
 ```
 
-Turn/Item/Interaction首先存在于`LiveSessionState`，随后由SessionRecorder inline best-effort append。StateEvent表示current-process state，不表示flush、fsync或power-loss durability。
+Turn/Item/Interaction首先存在于`LiveSessionState`。SessionRecorder只inline best-effort append稳定conversation facts；TurnStatus和terminal reason不进入JSONL。StateEvent表示current-process state，不表示flush、fsync或power-loss durability。
 
 ## Turn
 
@@ -34,7 +34,7 @@ Turn开始：
 ```text
 Input validated/composed
 → apply live UserMessage + Turn Running
-→ await inline record Input/StoredTurnStart attempt
+→ await inline record Input UserMessage attempt
 → publish TurnStarted
 → ActiveTurnTask begins
 ```
@@ -42,13 +42,17 @@ Input validated/composed
 Turn结束：
 
 ```text
-apply live Final Assistant or terminal event
-→ await inline record attempt
-→ publish terminal StateEvent
+Completed: apply Final Assistant + live TurnCompleted
+→ await inline record Final Assistant attempt
+→ publish ItemCompleted + TurnCompleted
+
+Interrupted/Failed: settle recordable Tool/Interaction facts
+→ apply live terminal
+→ publish TurnInterrupted / TurnFailed
 → ActiveTurnTask returns outcome
 ```
 
-recording失败不改变live TurnStatus。一个Session同时最多一个Running Turn。
+recording失败不改变live TurnStatus。一个Session同时最多一个Running Turn。restart后不恢复旧TurnStatus，recorded TurnId只用于conversation grouping。
 
 ## Item
 
@@ -195,7 +199,7 @@ Replay对旧或损坏记录采用：
 
 - duplicate result first valid wins并告警；
 - ToolResult/ToolAbandoned conflict first terminal wins；
-- 下一条合法User、Assistant、Compaction或Turn terminal关闭incomplete exchange；
+- 下一条合法User、Assistant或Compaction关闭incomplete exchange；EOF处仍未完成的exchange直接排除；
 - closure后迟到result视为orphan；
 - incomplete exchange排除后，后续合法conversation仍可恢复。
 
@@ -285,7 +289,7 @@ crash可能发生：
 - resolution已生效但未record；
 - request record存在但resolution缺失。
 
-restart不恢复waiter；recorded Pending Interaction投影为cancelled/interrupted recovery view。
+restart不恢复waiter，也不把recorded request投影为active Pending Interaction。缺少matching resolution的request保留为historical fact/diagnostic，不合成Cancelled resolution或Turn terminal。
 
 ## Tool Approval
 
@@ -325,7 +329,7 @@ Cancel/SecurityRevoked后：
 - Running Tooltruthful settle；
 - incomplete exchange不进入model conversation；
 - apply live TurnInterrupted；
-- await inline record各terminal facts；
+- 完成recordable Tool/Interaction settlement facts的inline record attempts；
 - publish final StateEvent；
 - recording failure不阻止settlement，正常本地append latency由同Session settlement承担。
 
@@ -338,7 +342,7 @@ Cancel/SecurityRevoked后：
 | recording failure | continue live | 未record tail不可见 |
 | incomplete exchange | block next Model | exclude from model view |
 | pending waiter | await current oneshot | never restore |
-| terminal missing | live task仍可结束 | mark restart interruption |
+| Turn terminal | publish current-process StateEvent | never record or reconstruct |
 
 ## UI与Snapshot
 
@@ -356,5 +360,5 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - ToolStartGate vs Cancel/SecurityRevoked；
 - Interaction request/resolution ordering与idempotency；
 - recording degraded时Tool/Interaction继续；
-- crash造成request/result/terminal缺失后的replay；
+- crash造成request/result缺失后的replay，且不合成Turn terminal；
 - Cancel settlement与FollowUp handoff。

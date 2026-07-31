@@ -1,7 +1,7 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（ADR 0127后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -139,7 +139,7 @@ pub enum SessionExecutionState {
 ```
 
 - `Idle`：没有ActiveTurnTask，可admit Submit/FollowUp或更新Workspace definition；
-- `Starting`：正在capture context和安装live Input；
+- `Starting`：正在capture context、安装live Input、等待其record attempt或发布`TurnStarted`；
 - `Running`：ActiveTurnTask存在；
 - `Finishing`：task已停止新逻辑推进，正在settle Running Tool/Interaction并返回outcome。
 
@@ -164,7 +164,7 @@ Submit accepted by control actor
 → capture TurnExecutionContext
 → compose CanonicalUserMessage
 → LiveSessionState validates + allocates EntryId + binds parent_id
-→ apply live Input + StoredTurnStart
+→ apply live Input + Turn Running
 → await SessionRecorder.record(entry)
 → publish TurnStarted
 → spawn ActiveTurnTask
@@ -172,6 +172,8 @@ Submit accepted by control actor
 ```
 
 Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
+
+`Starting`期间`Cancel(Submit(command_id))`持续有效，包括Input已经live apply但`TurnStarted`尚未发布的窗口。此时Cancel绑定已经分配的同一TurnId、发布sticky epoch并阻止ActiveTurnTask spawn；Input record attempt返回后仍先发布`TurnStarted`，随后完成live `TurnInterrupted(UserCancelled)` settlement。调用方收到`TurnStarted`后改用`Cancel(TurnId)`。
 
 capture、Workspace、Prompt composition或live validation失败时不创建Turn。encode/write失败发生在live apply之后，只降低recording health，不把Submit改成失败。
 
@@ -216,7 +218,7 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
 
 ## Live Mutation与Recording
 
-每个domain mutation使用同一局部顺序：
+每个recordable conversation mutation使用同一局部顺序：
 
 ```text
 validate Turn/control_generation/conversation_revision
@@ -226,7 +228,7 @@ validate Turn/control_generation/conversation_revision
 → publish final StateEvent or continue protocol
 ```
 
-`record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error使Recorder Degraded。mutation不回滚，Turn不失败。
+`record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error使Recorder Degraded。mutation不回滚，Turn不失败。TurnStatus mutation不属于recordable conversation：Completed与Final Assistant在同一live decision中形成，Interrupted/Failed只发布live terminal StateEvent。
 
 禁止：
 
@@ -357,7 +359,7 @@ FollowUp由SessionExecutor保存，Running/Finishing期间可以排队。ActiveT
 ```text
 actor clears active task
 → state Idle
-→ apply/publish terminal if task尚未完成
+→ apply/publish live terminal if task尚未完成
 → admission arbitration
 → optional FollowUp starts new Turn with new context
 ```
@@ -370,25 +372,25 @@ FollowUp不复用旧TurnExecutionContext、Tool state、retry state或conversati
 Cancel(target)
 → validate active command/Turn
 → publish sticky cancel epoch
-→ signal ActiveTurnTask and Tool cancellation handles
+→ signal candidate / ActiveTurnTask / Tool cancellation handles
 → return CancelAccepted
 ```
 
-ActiveTurnTask随后：
+Starting candidate尚未spawn ActiveTurnTask时，accepted Cancel阻止spawn，并在已经live apply的Input完成record attempt与`TurnStarted` publication后直接进入live interruption settlement。ActiveTurnTask已经存在时随后：
 
 - 停止新Model、Tool、Compaction和Steer消费；
 - Prepared Tool不启动；
 - Running Toolbest-effort cancel并等待truthful outcome或Abandoned；
 - Pending Interaction在live state中Cancelled并resume waiter；
 - apply live TurnInterrupted(UserCancelled)；
-- await inline record terminal attempt；
+- publish TurnInterrupted StateEvent；
 - return Interrupted outcome。
 
 Cancel response不等待recording或settlement。
 
 ## SecurityRevoked
 
-SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。task结束后SessionExecutor使用current definition/authority重新resolveWorkspace；失败时进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。
+SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。Starting阶段在Input live apply前取消candidate且不创建Turn；Input已apply时绑定同一Turn、阻止task spawn，并在Input publication后完成live `TurnInterrupted(SecurityRevoked)`。task结束后SessionExecutor使用current definition/authority重新resolveWorkspace；失败时进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。
 
 recording failure不会产生Unavailable。
 
@@ -411,18 +413,24 @@ record marker丢失时当前process继续使用summary；restart恢复旧convers
 
 ## Terminal与Failure
 
-Terminal mutation先进入live state，再完成inline record attempt并publish：
+Turn terminal只属于current-process live state：
 
 ```text
-apply Final Assistant / TurnInterrupted / TurnFailed
-→ await inline record attempt
+Completed
+→ apply Final Assistant + TurnCompleted live
+→ await inline record Final Assistant attempt
+→ publish ItemCompleted + TurnCompleted
+
+Interrupted / Failed
+→ finish recordable Tool/Interaction settlement facts
+→ apply live TurnInterrupted / TurnFailed
 → publish terminal StateEvent
 → task returns TurnTaskOutcome
 ```
 
-Model/Prompt/Tool invariant failure可以使Turn Failed/Interrupted。Session recording first failure原子更新internal `RecordingHealth`、公开`SessionRecordingState::Degraded`和当前脱敏diagnostic；Turn继续。当前domain StateEvent先携带Degraded Snapshot发布，随后补发一次`session_recording_changed`。后续`NotRecorded`不重复发布state event。
+Model/Prompt/Tool invariant failure可以使Turn Failed/Interrupted，但不会创建synthetic Session entry。Session recording first failure原子更新internal `RecordingHealth`、公开`SessionRecordingState::Degraded`和当前脱敏diagnostic；Turn继续。触发该record attempt的conversation StateEvent先携带Degraded Snapshot发布，随后补发一次`session_recording_changed`。后续`NotRecorded`不重复发布state event。
 
-如果ActiveTurnTask panic或channel异常退出，SessionExecutor把live Turn标记`Interrupted(RuntimeFailure)`，inline best-effort record并进入Idle或按Workspace readiness进入Unavailable。
+如果ActiveTurnTask panic或channel异常退出，SessionExecutor把live Turn标记`Interrupted(RuntimeFailure)`，发布terminal StateEvent并进入Idle或按Workspace readiness进入Unavailable。JSONL不追加RuntimeFailure terminal。
 
 ## Snapshot与Events
 
@@ -447,9 +455,8 @@ open recorded Session and attempt writable lease
 → construct LiveSessionState from recorded prefix
 → sanitize incomplete Tool exchanges
 → initialize new inline SessionRecorder at replayed recorded head
-→ mark recorded unfinished Turn InterruptedByRestart in live recovery view
-→ optional Q10 closure attempt only after Recorder initialization
 → capture current Workspace/readiness
+→ current_turn = None
 → start SessionExecutor Idle or Unavailable
 ```
 
@@ -463,7 +470,7 @@ open recorded Session and attempt writable lease
 - retry timer；
 - old Recorder object或in-flight append。
 
-是否record recovery closure仍由Q10决定；本模块只冻结任何optional closure attempt必须发生在new Recorder初始化之后，且失败不能阻止admission。同一loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始并重新尝试初始化Recorder，结果为Healthy或Degraded；旧unrecorded live tail永久丢失。
+Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery append。recorded `TurnId`只用于conversation history grouping。当前loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始并重新尝试初始化Recorder，结果为Healthy或Degraded；旧unrecorded live tail和旧TurnStatus永久丢失。
 
 ## 测试要求
 
@@ -481,8 +488,8 @@ open recorded Session and attempt writable lease
 - Degraded后修复storage不会使当前loaded instance重新写入；
 - Unload/Load可建立新Healthy Recorder，但只恢复recorded prefix；
 - task panic收口；
-- restart只恢复recorded prefix。
+- restart只恢复recorded conversation prefix，current_turn为空且无synthetic terminal。
 
 ## 开放问题
 
-RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭，所有Session强制尝试记录且无Disabled policy已由Q7关闭，EntryId owner已由Q9关闭。其余策略见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。
+RecordingHealth wire形状已由Q2关闭，Degraded recovery已由Q5关闭，所有Session强制尝试记录且无Disabled policy已由Q7关闭，EntryId owner已由Q9关闭，Turn lifecycle omission与无closure Load已由Q10/ADR 0127关闭。Recorder问题Q1–Q10均已关闭，结论见[Async Loop与Best-Effort Session Recording开放问题](../review/async-loop-best-effort-recording-open-questions.md)。

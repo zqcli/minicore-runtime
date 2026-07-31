@@ -1,8 +1,8 @@
 # Runtime Interface 与公开协议架构设计
 
-日期：2026-07-30
+日期：2026-07-31
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
+状态：当前权威架构（ADR 0127后，生产实现待启动）
 
 ## 目的
 
@@ -364,10 +364,10 @@ pub enum ForkAnchor {
 
 Runtime在已确定的Fork source内解析公开anchor：loaded source在同一个LiveSnapshot内解析anchor并复制selected path，unloaded source在RecordedHistory中解析。解析结果是target staging的合法path end：
 
-- `BeforeUserMessage(Input/Steer)`解析到该message的parent；Input的`StoredTurnStart`与UserMessage同entry，因此一起排除；
+- `BeforeUserMessage(Input/Steer)`解析到该message的parent；
 - `AfterUserMessage`包含source中的对应UserMessage；该Item已live apply即可，不要求source record attempt已经成功；
 - `Before/AfterFinalAgentMessage`只接受source中`phase = Final`的AgentMessage Item；
-- anchor产生non-terminal tail Turn时，fork staging按`HistoricalFork`规则关闭；
+- anchor可以产生没有Final AgentMessage的conversation tail；fork原样复制该path，child不继承source current Turn；
 - intermediate AgentMessage、Reasoning、ToolInvocation、Interaction和裸ToolResult不作为普通UI anchor；
 - cross-session、stale或kind不匹配的ItemId返回typed error。
 
@@ -411,8 +411,8 @@ pub enum PublicCancelTarget {
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
-- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Turn创建后调用方使用`TurnId`取消；
-- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal recording；stale target不影响新Turn；
+- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Starting持续到Input record attempt与`TurnStarted` publication完成，因此Input已live apply但response尚未发布时仍可按CommandId取消。该Cancel绑定同一Turn、阻止ActiveTurnTask spawn，并在Input publication后完成live interruption；调用方收到`TurnStarted`后使用`TurnId`取消；
+- `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal publication；stale target不影响新Turn；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
 
@@ -533,9 +533,9 @@ pub enum CommandOutcome {
 Command response不是完整业务完成流：
 
 - `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
-- `TurnStarted`只表示领域Turn已由initiating UserMessage append创建；
+- `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `CancelAccepted`只表示active target仍可取消且sticky cancel epoch已经发布；它与initiating/final append reservation first-wins，accepted后对应Started/Completed commit不得再赢；Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
+- `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
 - `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
 - `SessionLoaded`在load/recovery完成并原子发布latest SessionSnapshot后返回；recording health从随后显式`Snapshot(Session)`或subscription首帧读取，不内联进unit outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
@@ -790,6 +790,8 @@ non-fork Session的`GetSessionForkProvenance`返回`None`；fork child返回dura
 
 History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessionEntry、recorder internals或physical recorded head。`GetHistoryTree`首版从owner一次性捕获完整compact branch topology，不内联Turn Item bodies，也不分页；它可以标注orphan root、ignored entry和replay warning，服务fork/navigation与损坏历史检查，不代替聊天timeline读取，因此不需要额外history revision或generation。
 
+`ListTurns`与`GetTurn`中的历史Turn只是按recorded `TurnId`分组的conversation segment。它们可以返回User/Assistant/Tool/Interaction Items、timestamps和是否存在Final AgentMessage等稳定内容事实，但不返回`Running | Completed | Interrupted | Failed` execution status。current loaded Turn状态只从`SessionSnapshot.current_turn`和实时StateEvent读取。
+
 MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
 ### CommandSurfaceQuery
@@ -946,7 +948,7 @@ Runtime与每个Session使用独立owner和Snapshot，不存在跨scope可比较
 
 单独调用`snapshot()`只读取调用时的当前view。用于持续观察时，host调用`subscribe(scope)`：owner必须在同一publication synchronization内注册subscriber并捕获初始Snapshot，EventStream第一帧返回该Snapshot，随后只发送该点之后的实时事件。禁止用非原子的“先snapshot再subscribe”或“先subscribe再snapshot”替代。
 
-断线、subscriber背压或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。Runtime process restart时只从JSONL recorded prefix replay并执行conservative recovery；未record的live tail消失。之后的新Snapshot只反映该恢复结果。
+断线、subscriber背压或publisher关闭后，旧stream直接结束；host重新subscribe并从新的首帧Snapshot恢复，不重放缺失事件。Runtime process restart时只从JSONL recorded conversation prefix replay；未record的live tail和旧TurnStatus消失。新Snapshot的`current_turn`为空，不合成recovery terminal。
 
 ## Event
 
@@ -1082,7 +1084,7 @@ StateEvent本身始终是非durable observer record，不因payload来源不同�
 
 | 来源 | 例子 | restart后的恢复 |
 | --- | --- | --- |
-| live domain state | Turn/Item terminal、Interaction request/resolution、active conversation | 当前process立即可见；只有已record部分能在restart后重建 |
+| live domain state | Turn terminal、Item、Interaction request/resolution、active conversation | 当前process立即可见；TurnStatus不恢复，只有recorded conversation facts能在restart后重建 |
 | process-local control | load/readiness、execution/phase、queue、settled、recording health、diagnostics | restart后消失、重置或由新状态替代 |
 
 StateEvent规则：
@@ -1091,7 +1093,7 @@ StateEvent规则：
 - 同一subscription lifetime内，StateEvent按publisher发送顺序交付；
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
-- final domain StateEvent必须从成功live mutation派生，并在发送前完成inline record attempt；record outcome不提供durable acknowledgement；
+- final domain StateEvent必须从成功live mutation派生。对应recordable conversation fact时，发送前完成inline record attempt；`TurnInterrupted`/`TurnFailed`没有record attempt，等待recordable settlement facts完成后发布；record outcome不提供durable acknowledgement；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
@@ -1142,7 +1144,7 @@ command_catalog_invalidated
 
 `session_forked`是Runtime-scope membership invalidation；command caller直接读取`SessionForked.source`，其他subscriber通过`GetSessionForkProvenance`查询durable source，不在Runtime event detail中重复该字段。
 
-failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved、Compaction或terminal路径，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。这样领域事件不会被health event抢先，同时实时subscriber仍得到显式transition signal。
+failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved或Compaction record path，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。Turn terminal本身不触发recording failure，但会携带当时最新recording state。
 
 MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；wire adapter不得另行折叠成未定义的`turn_finished`形状。Rust领域payload保持`Completed | Interrupted | Failed` typed union。
 
@@ -1302,7 +1304,7 @@ UI不能：
 
 公开能力：
 
-- 读取完整compact history tree以及Turn/Item read model；长期Session的`ListTurns`使用分页，`GetTurn`和turn-scoped `ListItems`首版完整返回；
+- 读取完整compact history tree以及按TurnId分组的conversation/Item read model；历史查询不返回execution status，长期Session的`ListTurns`使用分页，`GetTurn`和turn-scoped `ListItems`首版完整返回；
 - 使用Genesis、UserMessage或FinalAgentMessage anchor创建Fork Session；
 - 查询fork provenance；
 - 在新Session继续future Turn。
@@ -1394,7 +1396,7 @@ CLI / TUI / Tauri backend
 → PromptService.for_turn()
 → TurnExecutionContext
 → PromptSet.compose_user_message()
-→ LiveSessionState.apply(UserMessage source=Input + StoredTurnStart)
+→ LiveSessionState.apply(UserMessage source=Input + Turn Running)
 → await SessionRecorder.record
 → CommandResponse::TurnStarted { turn_id }
 → ActiveTurnTask async loop
@@ -1406,7 +1408,8 @@ CLI / TUI / Tauri backend
 → OpenAI Responses / Anthropic Messages / other provider
 → ModelCallResult
 → ActiveTurnTask validates SessionId + TurnId + control_generation + ConversationRevision
-→ apply live AgentMessage、Tool result或Turn terminal + await inline record attempt
+→ apply live recordable AgentMessage/Tool result + await inline record attempt
+→ apply/publish live Turn terminal without terminal entry
 → StateEvent + optional ProgressEvent
 → host reducer/UI
 ```
@@ -1616,12 +1619,12 @@ Public interface是 contract test surface。
 - Submit只在UserMessage成功live apply并完成inline record attempt后返回TurnStarted；
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
 - 相同CommandId携带不同command返回CommandConflict；
-- Cancel(Submit CommandId)关闭排队或Starting admission，target退休或restart后返回NotFound且不影响future Turn；
+- Cancel(Submit CommandId)关闭排队或Starting admission；Input已live apply但TurnStarted尚未发布时仍绑定同一Turn并阻止task spawn，target退休或restart后返回NotFound且不影响future Turn；
 - Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
 - valid Cancel立即返回`CancelAccepted`且不等待Tool settlement；duplicate返回同一target/epoch；
-- Cancel与initiating/final live arbitration first-wins，不能accepted后再提交Started/Completed；
+- Cancel在Input live apply前取消candidate，apply后绑定同一Turn；cancel epoch与live Completed decision first-wins，不能accepted后再提交Completed；
 - Cancel清理current Turn Steer但保留FollowUp，Finishing期间新FollowUp仍可Queued；
 - CancelAccepted后execution snapshot/event进入Finishing，最终TurnInterrupted另行发布；
 - stale Cancel TurnId不取消新的active Turn；
@@ -1643,6 +1646,7 @@ Public interface是 contract test surface。
 - GetHistoryTree由owner一次性捕获并返回自洽的完整compact branch topology，不内联Item bodies、不分页、也不返回额外history revision；
 - history tree不暴露internal entry/event；
 - 长期Session的ListTurns分页可用于首次加载最近历史和向上滚动，cursor绑定sort与revision；
+- historical ListTurns/GetTurn按TurnId分组conversation且不返回execution status；
 - GetTurn、turn-scoped ListItems和active_items首版不分页；
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - RuntimeSnapshot不等待所有SessionExecutor；
@@ -1670,7 +1674,7 @@ Public interface是 contract test surface。
 - assistant content创建事件按Reasoning/Text/ToolCall顺序发布；
 - parallel Tool逆序完成只更新各自原位置，不改变call order；
 - Snapshot替换有序live Items并清空provisional Items；
-- Runtime restart从JSONL tolerant replay和conservative recovery开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现，不把Snapshot当作execution checkpoint；
+- Runtime restart从JSONL tolerant replay开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现；旧TurnStatus不恢复，也不把Snapshot当作execution checkpoint；
 - Interaction request live apply/record-attempt-before-notify和resolution live apply/record-attempt-before-resume；
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带UI-safe view，UI提交UserAnswer后恢复同一Turn而不是创建UserMessage；

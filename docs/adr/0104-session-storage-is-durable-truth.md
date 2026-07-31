@@ -5,6 +5,8 @@
 
 > 2026-07-30：ADR 0126删除SessionStorage durable truth、`SessionWriter`和physical commit barrier。JSONL tree与tolerant replay继续保留，但只记录live事件流的best-effort前缀。
 
+> 2026-07-31：ADR 0127进一步把JSONL限定为conversation/configuration facts的best-effort前缀；Turn start/terminal与cold recovery closure均不记录。
+
 > 2026-07-29修订：ADR 0124保留SessionStorage作为已写入conversation/message/lifecycle history的单一durable owner和唯一write seam；删除完整execution-ledger、shared strict append/replay validator、ToolExecutionStarted/ToolRoundCompleted证明链和Fork identity remap。cold replay改为局部skip/isolate并返回diagnostics。
 
 ## 背景

@@ -1,9 +1,9 @@
 # V2设计评审工作交接
 
-日期：2026-07-30
-状态：async loop / inline best-effort Session recording refactor分支
+日期：2026-07-31
+状态：async loop / conversation-only best-effort recording refactor分支
 
-架构事实以`docs/architecture.md`、`docs/modules/`和ADR 0126为权威。本文记录恢复入口与剩余工作。
+架构事实以`docs/architecture.md`、`docs/modules/`、ADR 0126和ADR 0127为权威。本文记录恢复入口与剩余工作。
 
 ## 当前分支
 
@@ -38,7 +38,8 @@ LiveSessionState
 → current-process truth
 
 SessionRecorder
-→ ordered inline best-effort JSONL append
+→ ordered inline best-effort conversation JSONL append
+→ no StoredTurnStart / Turn terminal
 ```
 
 ## 2026-07-30完成内容
@@ -56,18 +57,29 @@ SessionRecorder
 - writable Load只截断final unterminated partial tail，不修改完整行或中段内容；
 - 完成current Markdown链接、代码围栏、旧术语、9条INV owner和`git diff --check`验证。
 
+## 2026-07-31完成内容
+
+- checkpoint提交`aa32511 docs: define live EntryId ownership`；
+- 接受ADR 0127：Session JSONL只保存稳定conversation facts与必要解释元数据；
+- 删除`StoredTurnStart`、`StoredTurnTerminal`和三个recorded Turn terminal variants；
+- TurnStatus与`TurnStarted/Completed/Interrupted/Failed`继续作为current-process live interface；
+- Q10关闭为Not Applicable：Load不推断旧Turn outcome、不追加closure，`current_turn = None`；
+- Fork原样复制selected conversation path，不追加fork-specific terminal；
+- historical `ListTurns/GetTurn`按TurnId分组conversation且不返回execution status。
+
 ## 恢复顺序
 
 1. [ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
-2. [架构总览](../architecture.md)
-3. [Session Execution](../modules/session-execution.md)
-4. [Conversation Recording与Replay](../modules/conversation-storage.md)
-5. [Turn Execution Context](../modules/turn-execution-context.md)
-6. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
-7. [Compaction](../modules/compaction.md)
-8. [Async/Best-Effort Recording开放问题](async-loop-best-effort-recording-open-questions.md)
-9. [第三轮评审关闭记录](v2-design-review-3.md)
-10. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
+2. [ADR 0127](../adr/0127-session-recording-omits-turn-lifecycle.md)
+3. [架构总览](../architecture.md)
+4. [Session Execution](../modules/session-execution.md)
+5. [Conversation Recording与Replay](../modules/conversation-storage.md)
+6. [Turn Execution Context](../modules/turn-execution-context.md)
+7. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
+8. [Compaction](../modules/compaction.md)
+9. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
+10. [第三轮评审关闭记录](v2-design-review-3.md)
+11. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
 
 ## 已冻结决策
 
@@ -78,8 +90,10 @@ SessionRecorder
 - LiveSessionState是current-process truth；
 - LiveConversation reducer拥有complete Tool exchange和ConversationRevision；
 - LiveSessionState私有持有唯一Session-scoped EntryIdGenerator；replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
-- SessionRecorder通过inline `record().await`顺序append，不使用后台queue，也不提供durable commit receipt；
-- live mutation成功后完成inline record attempt，再publish final event或推进协议；
+- SessionRecorder通过inline `record().await`顺序append稳定conversation facts，不使用后台queue，也不提供durable commit receipt；
+- recordable conversation mutation成功后完成inline record attempt，再publish final event或推进协议；
+- JSONL不保存StoredTurnStart或Turn terminal；TurnId只用于conversation correlation；
+- Turn creation在Input live apply时线性化，Agent lifecycle gate不跨Recorder await；Starting期间Submit CommandId持续作为Cancel target；
 - recorder first encode/write failure后Degraded并停止后续suffix；
 - public recording wire固定为`{ state: healthy | degraded }`；first degradation发布`session_recording_changed`并保留当前脱敏diagnostic；
 - Create严格stage SessionHeader后发布Unloaded Session；Load始终尝试初始化Recorder；不提供recording policy、Disabled或ephemeral Session；
@@ -87,9 +101,9 @@ SessionRecorder
 - writable Load只截断final unterminated partial tail，不修改完整行或中段内容；
 - recording failure不终止Turn、不产生SessionUnavailable；
 - recording Degraded或process crash时StateEvent/Snapshot可以领先可恢复recorded prefix；Healthy状态无后台queue lag；
-- cold replay只恢复recorded prefix，未record tail丢失；
+- cold replay只恢复recorded conversation prefix，未record tail和旧TurnStatus丢失；Load后current_turn为空；
 - loaded Fork可以把snapshot capture前已apply的unrecorded tail写入独立child record stream；unloaded Fork只复制RecordedHistory；
-- ForkSourceKind进入SessionForked outcome和child durable provenance；target staging失败不发布partial child；
+- ForkSourceKind进入SessionForked outcome和child durable provenance；target staging失败不发布partial child；Fork不追加terminal；
 - restart不恢复task、stream、Tool process、waiter、queue或retry timer；
 - Interaction request/resolution使用live apply + record attempt + oneshot；
 - logical retry使用same Arc<ModelCallRequest>、control generation和ConversationRevision；
@@ -100,7 +114,7 @@ SessionRecorder
 ## 跨模块不变量
 
 ```text
-INV-001 live owner allocates EntryId/parent → apply → inline record attempt → final publish/continue
+INV-001 recordable conversation fact: allocate EntryId/parent → apply → inline record attempt → publish/continue；TurnStatus only live
 INV-002 tolerant replay of recorded prefix
 INV-003 complete Tool exchange before model visibility
 INV-004 loaded Fork LiveSnapshot / unloaded Fork RecordedHistory
@@ -126,28 +140,26 @@ WaitForModelRetry slot
 sync sans-I/O AgentLoop
 Transcript-First guarantee
 writer-poisoned/read-only execution admission
+StoredTurnStart / StoredTurnTerminal
+cold recovery Turn terminalization
+HistoricalFork terminal closure
 ```
 
-旧ADR正文作为历史保留，顶部状态已指向ADR 0126。
+旧ADR正文作为历史保留，顶部状态与修订说明指向ADR 0126/0127。
 
 ## 当前开放问题
 
-详见[独立review](async-loop-best-effort-recording-open-questions.md)：
-
-- cold recovery closure是否best-effort record。
-
-Q1 queue容量、Q2 RecordingHealth wire、Q3 Flush、Q4 drain deadline、Q5 Degraded recovery、Q6 Fork source、Q7 recording policy、Q8 event/record顺序和Q9 EntryId owner已经关闭。其余问题不重新打开async loop和inline best-effort recording的核心方向。
+Recorder review的Q1–Q10已经全部关闭，详见[独立review](async-loop-best-effort-recording-open-questions.md)。Q10由ADR 0127确定conversation-only schema和无closure Load。
 
 ## 下一步
 
-1. 关闭Q10 cold recovery closure；
-2. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money、StoredTurnStart/StoredCompaction；
-3. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
-4. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
-5. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
-6. 实现Interaction、Cancel、logical retry和Compaction async paths；
-7. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
-8. production Tool/Sandbox adapter前关闭O1/R7。
+1. 冻结剩余wire/schema：通用serde casing、EntryId算法/文本格式、其他public ID、Timestamp/Money、StoredCompaction；
+2. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
+3. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
+4. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
+5. 实现Interaction、Cancel、logical retry和Compaction async paths；
+6. 完成Rig 0.40.0 OpenAI/Anthropic provider spike；
+7. production Tool/Sandbox adapter前关闭O1/R7。
 
 ## Review状态
 
@@ -161,4 +173,4 @@ R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应先关闭Q10，不要按旧同步AgentLoop、后台Recorder queue或durable SessionWriter开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成的是目标架构与review收口，不包含Rust生产实现。下一台电脑应从ADR 0126/0127开始，不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter或Turn terminal ledger开始编码。
