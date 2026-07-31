@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0129后，生产实现待启动）
+状态：当前权威架构（ADR 0131后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -13,7 +13,7 @@
 - `SessionRecorder`把live mutation顺序inline append为可恢复的best-effort前缀；
 - append outcome不作为Model、Tool、Interaction或StateEvent的durable correctness proof；
 - cold replay只恢复已经record的完整行；
-- JSONL不记录Turn start、terminal或其他execution lifecycle；
+- JSONL不记录Turn start/terminal、Session definition/metadata或Session lifecycle；
 - replay仍必须构造provider-valid sanitized conversation。
 
 本文不定义Model/Tool scheduling、Prompt assembly、Tool sandbox或Runtime wire schema。
@@ -38,6 +38,7 @@ MiniCore采用同类产品的live-first语义，同时保留typed JSONL、tree i
 - encode或physical write失败不回滚live state；
 - first recording failure后停止该loaded Session后续记录；
 - 文件最多是recordable conversation facts的一个合法前缀；
+- Agent/Session durable configuration与lifecycle由entity owner保存，不进入conversation EntryId tree；
 - cold replay宽容skip/isolate局部坏记录；
 - incomplete/orphan/abandoned-first Tool exchange不进入模型conversation；
 - EntryId继续用于recorded tree、fork和history query；
@@ -253,6 +254,8 @@ pub(crate) struct OpenedSession {
 
 `stage_create()`写入initial SessionHeader但不创建SessionRecorder；Agent/Session lifecycle只在该staging与SessionDefinition都成功后原子发布`Open + Unloaded`Session。header staging失败使Create失败，partial staging target不进入catalog。
 
+SessionHeader中的initial Agent/definition refs只承担file identity和creation provenance。Header没有EntryId，不是Session definition/lifecycle change log、current authorization proof或old execution recovery source；Load仍从Agent/Session durable owner读取current head。
+
 `open()`始终尝试初始化Recorder；lease或初始化失败返回`RecordingHealth::Degraded`的loaded Session。history可读且Workspace/definition可用时仍允许Turn admission。Recorder初始化和header append都不创建后台worker。
 
 不提供：
@@ -378,10 +381,19 @@ Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId�
 pub enum StoredEvent {
     InteractionRequested(StoredInteractionRequest),
     InteractionResolved(StoredInteractionResolution),
-    SessionDefinitionChanged(StoredSessionDefinitionChange),
-    SessionLifecycleChanged(StoredSessionLifecycleChange),
 }
 ```
+
+StoredEvent只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的Interaction facts。Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
+
+```text
+Agent/Session durable owner updates head/revision/lifecycle
+→ update Runtime query/snapshot/typed event observer surface
+→ no LiveSessionState EntryId allocation
+→ no SessionRecorder call
+```
+
+Runtime observer output不是durable transition log。restart从entity durable head恢复current Agent/Session state，从JSONL恢复conversation；两者按owner组合，不从conversation反推configuration timeline。metadata专用event shape仍属于Runtime public protocol freeze，不影响本节的no-JSONL owner规则。
 
 JSONL不保存`TurnStarted`、`TurnCompleted`、`TurnInterrupted`、`TurnFailed`或`StoredTurnTerminal`。Final Assistant是稳定conversation fact；Interrupted/Failed只属于当前loaded execution的StateEvent/Snapshot。
 
@@ -514,6 +526,8 @@ pub struct SessionForkProvenance {
 
 Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object或in-flight append。
 
+Fork也不复制source Session definition/metadata/lifecycle timeline。child current definition由Agent/Session lifecycle staging从source durable definition构造child-local revision；selected path只包含conversation、Interaction和Compaction facts。
+
 ## Recovery
 
 ```text
@@ -523,7 +537,7 @@ open file and attempt writable lease
 → create LiveSessionState from replay
 → sanitize incomplete exchange
 → initialize new inline recorder at replayed recorded head
-→ resolve current Workspace/Agent definition
+→ read current Agent/Session durable heads and resolve current Workspace definition
 → current_turn = None
 → SessionExecutor Idle or WorkspaceUnavailable
 ```
@@ -548,6 +562,7 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 ## 测试要求
 
 - Create的SessionHeader staging失败或publication前crash不产生catalog-visible Session；
+- Create只写SessionHeader；definition/metadata/lifecycle mutation不生成StoredSessionEntry；
 - Load始终尝试初始化Recorder，失败得到Degraded而不是Disabled；
 - live owner在apply前分配EntryId，Recorder观察到exact same ID；
 - replay与Fork copied IDs正确seed collision guard，future ID不碰撞；
@@ -568,6 +583,7 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 - live mutation apply后、record attempt返回前Fork仍使用LiveSnapshot包含该mutation；
 - Fork与Unload竞态产生稳定且公开的LiveSnapshot或RecordedHistory source；
 - live Fork staging失败不发布partial child；
+- loaded/unloaded Fork不复制source definition或lifecycle timeline；child definition来自独立lifecycle staging；
 - Fork不追加fork-specific terminal，child不继承source current Turn；
 - restart不恢复execution objects；
 - restart后current_turn为空且不合成Turn terminal；
@@ -576,4 +592,4 @@ Diagnostics必须有数量上限、聚合重复错误、限制字符串长度，
 
 ## 开放问题
 
-EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+EntryId算法/文本wire、max entry bytes、diagnostic总量上限和format migration仍需freeze。EntryId owner由Q9关闭，Turn lifecycle omission与无closure recovery由Q10/ADR 0127关闭，Session definition/lifecycle event ownership由ADR 0131关闭，Prompt contribution schema由ADR 0129关闭；Recorder Q1–Q10均已关闭，结论见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

@@ -200,16 +200,18 @@ Starting candidate在await前安装CommandId target与observed emergency epoch�
 
 ## V4-P0-4 · conversation JSONL含无合法writer owner的configuration/lifecycle events
 
-### 发生场景
+状态：Closed（2026-07-31；ADR 0131）。StoredEvent现只含InteractionRequested/Resolved；Agent/Session definition、metadata和lifecycle由entity durable owner保存，Create/Archive/Delete与loaded update均不调用Recorder。
 
-`docs/modules/conversation-storage.md:378-382`仍定义：
+### 关闭前场景
+
+关闭前Conversation Storage定义：
 
 ```rust
 StoredEvent::SessionDefinitionChanged(...)
 StoredEvent::SessionLifecycleChanged(...)
 ```
 
-当前ownership无法写入这些variants：
+关闭前ownership无法写入这些variants：
 
 - ADR 0127第2条明确Session/Agent definition由各自durable owner保存；
 - SessionRecorder只在loaded Session存在，Create发布`Open + Unloaded`时不创建Recorder；
@@ -228,9 +230,9 @@ StoredEvent::SessionLifecycleChanged(...)
 - 只在部分状态记录，形成无法解释的不完整configuration timeline；
 - Fork复制source configuration/lifecycle events到child conversation tree，产生source/child ownership歧义。
 
-### 推荐决议
+### 已采纳决议
 
-MVP从conversation JSONL删除`SessionDefinitionChanged`和`SessionLifecycleChanged`。Agent/Session durable owner保存current head/revision/lifecycle；Runtime StateEvent负责current-process观察。Conversation JSONL只保留：
+MVP从conversation JSONL删除`SessionDefinitionChanged`和`SessionLifecycleChanged`。Agent/Session durable owner保存current head/revision/lifecycle；Runtime query/snapshot/typed event surface负责current观察，metadata专用event仍由V4-P1-1冻结。Conversation JSONL只保留：
 
 ```text
 User / Assistant / Tool conversation messages
@@ -240,7 +242,7 @@ StoredCompaction
 
 若未来需要configuration audit，应建立独立durable audit/definition history seam，使用该owner自己的revision和原子store，不借用LiveSessionState EntryId tree。
 
-### 关闭条件
+### 关闭验证
 
 - `StoredEvent`不存在无loaded recorder也必须写入的variant；
 - 所有StoredSessionEntry都有唯一EntryId分配owner；

@@ -5,6 +5,8 @@
 
 > 2026-07-31：tolerant replay、minimal links与Tool exchange sanitizer继续保留；ADR 0127删除`StoredTurnStart`、Turn terminal entries、restart/fork closure。Replay只重建conversation facts，Load后的`current_turn`为空。
 
+> 2026-07-31：[ADR 0131](0131-conversation-recording-excludes-session-definition-and-lifecycle.md)取代本文“durable lifecycle event进入SessionStorage”的旧表述。current JSONL只保存conversation、Interaction与Compaction；Agent/Session definition和lifecycle从entity durable owner恢复。
+
 > 2026-07-30：tolerant replay、minimal durable links和Tool exchange sanitizer保留；strict `SessionWriter`、committed typed delta、append-before-model-visible和read-only writer admission由ADR 0126取代。EntryId generation owner由ADR 0126/Q9固定为`LiveSessionState` private Session-scoped generator；Recorder不得创建或改写ID。
 
 ## 背景
