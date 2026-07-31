@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0133后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -864,15 +864,19 @@ Workspace unavailable 时：
 
 ```text
 expected SessionLifecycle = Open
-+ expected SessionDefinitionRevision + WorkspaceRevision
++ expected SessionDefinitionRevision
++ WorkspaceDefinitionInput（不含WorkspaceRevision）
 → loaded Session要求SessionExecutionState = Idle；否则SessionBusy
 → 在per-session lifecycle serialization内构造并resolve Workspace candidate
 → PromptService/SkillService捕获candidate授权的Workspace-bound sources
 → candidate.finish得到complete immutable WorkspaceSnapshot
-→ durable commit新SessionDefinitionRevision与WorkspaceRevision
+→ Workspace owner为canonical changed Workspace分配new WorkspaceRevision
+→ durable commit包含该Workspace的new SessionDefinitionRevision
 → publish Ready(new WorkspaceSnapshot)
 → 最后确认update success
 ```
+
+public CAS只使用外层`SessionDefinitionRevision`，因为它已经原子覆盖Workspace、Model和Prompt selection；再要求caller提交WorkspaceRevision会产生两份可能冲突的stale proof。WorkspaceRevision是definition内owner-assigned component revision，用于内部candidate/snapshot correlation，不进入`SessionCommand::UpdateDefinition`。权威public shape是[Runtime Interface的SessionDefinitionPatch与WorkspaceDefinitionInput](runtime-interface.md#sessioncommand)。
 
 resolve或durable commit失败时旧definition和旧Snapshot保持current。这样不会出现：
 
@@ -1238,7 +1242,9 @@ upload / telemetry
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；
 - loaded Session非Idle时Workspace update/reload返回SessionBusy且不排队；
+- Idle Workspace update只提交expected SessionDefinitionRevision；WorkspaceRevision由owner分配且不进入public command；
 - Idle Workspace update成功durable commit revision并原子发布新Snapshot；
+- WorkspaceUnavailable公开映射为SessionNotReady + UserActionRequired，DurableStateCorrupt使用专用code；diagnostic只使用Workspace owner allowlist；
 - candidate resolve或commit失败时旧definition/Snapshot保持current；
 - SecurityRevoked触发Finishing、truthful Tool settlement和TurnInterrupted；
 - Idle SecurityRevoked立即失效old Snapshot并重新resolve，不创建TurnInterrupted；
@@ -1257,9 +1263,8 @@ upload / telemetry
 1. `WorkspaceRelativePath` 和 `CanonicalWorkspacePath` 的跨平台编码细节。
 2. WorkspaceAuthority 的 persisted trust、managed policy 和 headless adapter 形状。
 3. Workspace source adapter和Sandbox在各平台如何实现handle-relative open以防止TOCTOU；该问题属于O1 enforcement，不提供动态handle revocation。
-4. Session Workspace Idle-only update的最终command payload。
-5. Workspace unavailable reason与SessionReadiness/公开diagnostics的最终映射。
-6. future remote backend出现后，是否引入Workspace locator/backend seam。
+4. Workspace unavailable的细分diagnostic code allowlist；SessionReadiness与RetryAdvice映射已由Runtime Interface冻结。
+5. future remote backend出现后，是否引入Workspace locator/backend seam。
 
 ## 设计进度
 
@@ -1275,5 +1280,7 @@ upload / telemetry
 - [x] 定义同根多 Session 的隔离语义。
 - [x] 按ADR 0123删除Workspace及view命名指纹；执行一致性由不可变Snapshot、私有投影和显式reload/re-resolve保证。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
-- [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
+- [x] 冻结Idle-only public update payload：只CAS SessionDefinitionRevision，WorkspaceDefinitionInput不携带WorkspaceRevision（ADR 0133）。
+- [x] 冻结WorkspaceUnavailable → SessionNotReady/UserActionRequired公开映射；
+- [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义；
 - [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。
