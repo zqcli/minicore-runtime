@@ -1,7 +1,9 @@
 # ADR 0114: Runtime观察协议使用Snapshot-First实时流
 
-状态：Partially Superseded by ADR 0126
+状态：Partially Superseded by ADRs 0126 and 0127
 日期：2026-07-26
+
+> 2026-07-31：snapshot-first与非durable observer stream保留；ADR 0127删除restart conservative terminalization。Turn terminal StateEvent只在current process可见，新Runtime从conversation prefix建立无current Turn的Snapshot。
 
 > 2026-07-30：snapshot-first、StateEvent/ProgressEvent分离和非durable observer stream保留；final StateEvent从live mutation派生，并在inline record attempt返回后发布。recording Degraded或process crash时，observer state仍可领先可恢复的recorded prefix。
 

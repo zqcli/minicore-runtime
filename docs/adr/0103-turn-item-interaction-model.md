@@ -1,7 +1,9 @@
 # ADR 0103: Turn / Item / Interaction 模型
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-24
+
+> 2026-07-31：live Turn/Item/Interaction identity与terminal StateEvent保留；ADR 0127删除durable Turn boundary、`StoredTurnStart`和Turn terminal entries。Recorded Turn只表示按TurnId分组的conversation segment。
 
 > 2026-07-30：Turn/Item/Interaction identity与lifecycle保留；它们先进入LiveSessionState再best-effort record，storage committed delta和append-before-event条款失效。
 

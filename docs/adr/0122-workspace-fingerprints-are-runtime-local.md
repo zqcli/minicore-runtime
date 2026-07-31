@@ -5,6 +5,8 @@
 
 > 历史说明：本ADR正文保留为被取代的O12决策记录。当前V2架构不再定义`WorkspaceFingerprint`或任何Workspace view fingerprint，也不新增WorkspaceResolutionId/generation等替代identity；执行一致性以[ADR 0123](0123-identity-uses-refs-and-explicit-reload.md)的exact refs、immutable `Arc`、explicit reload和structural validation为准。
 
+> 2026-07-31：ADR 0127删除restart时的HostRestart/RecoveryContextUnavailable Turn closure；conversation replay不恢复旧WorkspaceSnapshot或旧TurnStatus。
+
 ## 背景
 
 O12要求冻结`WorkspaceFingerprint`及各Workspace view fingerprint在Runtime重启、Session reload和fork后的恢复策略。旧建议倾向从durable definition、authority policy和canonicalization algorithm确定性重建，并为跨进程相等性建立versioned canonical encoding与golden vectors。

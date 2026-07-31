@@ -1,8 +1,8 @@
 # Async Loop 与 Best-Effort Session Recording 开放问题
 
-日期：2026-07-30
-状态：逐项Review中；不阻塞ADR 0126的核心实现
-关联：[ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)
+日期：2026-07-31
+状态：Q1–Q10全部Closed
+关联：[ADR 0126](../adr/0126-turn-execution-is-async-and-session-recording-is-best-effort.md)、[ADR 0127](../adr/0127-session-recording-omits-turn-lifecycle.md)
 
 ## 已冻结基线
 
@@ -12,7 +12,8 @@
 - 第一次encode/write失败后Degraded并停止后续记录，replay最多恢复有效完整行前缀；
 - recording failure不回滚live state、不终止Turn、不使Session Unavailable；
 - successful write不表示flush、fsync或power-loss durability；
-- cold replay只恢复recorded prefix；
+- cold replay只恢复recorded conversation prefix；
+- JSONL不保存Turn start/terminal，Load后的`current_turn`为空；
 - 不恢复旧task、waiter、provider stream、Tool process或in-flight append；
 - complete Tool exchange仍是下一次Model的硬协议门禁，但由live reducer拥有；
 - Rig仍只实现ModelGateway private provider attempt。
@@ -99,13 +100,13 @@ target通过staging建立完整新record stream；selected path未全部material
 
 状态：Closed。
 
-Final domain状态统一采用：
+Recordable conversation fact统一采用：
 
 ```text
 apply live state → await inline record attempt → publish final StateEvent / resume waiter / continue protocol
 ```
 
-record failure更新RecordingHealth并继续publication/protocol。successful write不表示flush或fsync。ProgressEvent不进入SessionRecorder，不受该顺序约束；Cancel和SecurityRevoked sticky emergency publication也不等待recording。
+TurnInterrupted/TurnFailed只apply live并在recordable settlement facts完成后发布terminal StateEvent，不创建terminal entry。record failure更新RecordingHealth并继续publication/protocol。successful write不表示flush或fsync。ProgressEvent不进入SessionRecorder，不受该顺序约束；Cancel和SecurityRevoked sticky emergency publication也不等待recording。
 
 ## Q9：EntryId分配owner
 
@@ -124,6 +125,17 @@ record failure更新RecordingHealth并继续publication/protocol。successful wr
 
 ## Q10：Cold recovery closure
 
-待定：recorded unfinished Turn在load时仅投影为`InterruptedByRestart`，还是同时best-effort追加terminal entry。
+状态：Closed。
 
-已冻结前置：new Recorder必须在任何optional closure attempt之前初始化；live recovery view必须立即标记Interrupted。是否追加closure，以及attempt与Ready/admission publication的精确顺序，仍由本问题决定。
+决议：采用ADR 0127方案A。Session JSONL只记录稳定conversation facts与必要解释元数据，不保存`StoredTurnStart`或Turn terminal。cold Load不投影`InterruptedByRestart`，不推断旧Turn outcome，也不执行recovery append；replay sanitization后设置`current_turn = None`并进入Idle或WorkspaceUnavailable。
+
+关联规则：
+
+- `StoredSessionEntry.turn_id`只用于conversation grouping和Item/Tool correlation；
+- Final Assistant是正常响应的conversation fact，不额外记录`TurnCompleted`；
+- Interrupted/Failed保留current-process typed StateEvent，不进入JSONL；
+- incomplete Tool exchange继续排除，不合成ToolResult；
+- Fork复制selected conversation path，不追加fork-specific terminal；
+- `ListTurns/GetTurn`的recorded历史不返回execution status。
+
+Q10因此关闭为Not Applicable；此前“先初始化Recorder再尝试closure”和“live recovery view必须标记Interrupted”的前置规则一并撤销。

@@ -1,7 +1,9 @@
 # ADR 0124：Session Replay宽容恢复并收窄持久化引用链
 
-状态：Partially Superseded by ADR 0126
+状态：Partially Superseded by ADRs 0126 and 0127
 日期：2026-07-29
+
+> 2026-07-31：tolerant replay、minimal links与Tool exchange sanitizer继续保留；ADR 0127删除`StoredTurnStart`、Turn terminal entries、restart/fork closure。Replay只重建conversation facts，Load后的`current_turn`为空。
 
 > 2026-07-30：tolerant replay、minimal durable links和Tool exchange sanitizer保留；strict `SessionWriter`、committed typed delta、append-before-model-visible和read-only writer admission由ADR 0126取代。EntryId generation owner由ADR 0126/Q9固定为`LiveSessionState` private Session-scoped generator；Recorder不得创建或改写ID。
 

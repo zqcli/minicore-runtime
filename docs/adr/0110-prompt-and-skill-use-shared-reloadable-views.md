@@ -1,7 +1,9 @@
 # ADR 0110: Prompt 与 Skill 使用共享、可替换 View
 
-状态：Accepted
+状态：Partially Superseded by ADR 0127
 日期：2026-07-24
+
+> 2026-07-31：Prompt/Skill shared immutable views、explicit reload和future-Turn生效规则继续有效；ADR 0127删除restart时的unfinished Turn terminalization，Load只恢复conversation并清空current Turn。
 
 ## 背景
 

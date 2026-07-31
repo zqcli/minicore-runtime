@@ -1,7 +1,7 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
-日期：2026-07-30
+状态：当前权威架构（ADR 0127后，生产实现待启动）
+日期：2026-07-31
 
 ## 目的
 
@@ -959,13 +959,13 @@ managed hard deny、trust/policy store降级或host安全事件可以在active T
 
 1. WorkspaceAuthority或host发布current authority/policy事实；
 2. Runtime通过current loaded map向对应`SessionExecutionHandle`设置sticky `EmergencyControl::SecurityRevoked`，存在candidate/current Turn时同时绑定current active target；
-3. SessionExecutor停止new admission；Idle直接进入resolve，Starting取消candidate，Running/Finishing向ActiveTurnTask发布SecurityRevoked并进入或保持Finishing；
+3. SessionExecutor停止new admission；Idle直接进入resolve；Starting在Input live apply前取消candidate，apply后绑定同一Turn、阻止task spawn并进入Finishing；Running/Finishing向ActiveTurnTask发布SecurityRevoked并进入或保持Finishing；
 4. 已取得ToolStartPermit并进入Running的Tool保存exact outcome或`ToolAbandoned`；Prepared Tool不再启动；
-5. 有active Turn时apply live `TurnInterrupted(SecurityRevoked)`、完成inline record attempt并释放Turn；
+5. 有active Turn时apply live `TurnInterrupted(SecurityRevoked)`、发布terminal StateEvent并释放Turn；JSONL不记录该terminal；
 6. candidate清理或Turn terminal后，使用durable current `SessionDefinition.workspace`和current authority重新resolve，并捕获new candidate授权的Workspace-bound Prompt/Skill sources；
 7. success时retire signal、Ready并发布new Snapshot及captured source values，failure时Unavailable且future admission fail closed。
 
-FollowUp可以在Finishing期间排队，但terminal和重新resolve完成前不得启动；resolve失败时明确拒绝。Security signal是process-local control fact，不跨restart恢复；recovery只有在durable evidence足够时才可使用SecurityRevoked，否则使用HostRestart或RecoveryContextUnavailable。
+FollowUp可以在Finishing期间排队，但terminal和重新resolve完成前不得启动；resolve失败时明确拒绝。Security signal是process-local control fact，不跨restart恢复；Load不推断历史security cause或旧Turn terminal。
 
 如果security event发生在provider request、kernel syscall、子进程或remote side effect开始之后，MiniCore无法撤回已经看到或发生的内容。它只保证signal获胜后不启动新的sanctioned operation，并对in-flight work执行truthful settlement。已打开OS handle不会被动态撤销，该限制不再作为Workspace feature承诺。
 
@@ -1240,10 +1240,10 @@ upload / telemetry
 - candidate resolve或commit失败时旧definition/Snapshot保持current；
 - SecurityRevoked触发Finishing、truthful Tool settlement和TurnInterrupted；
 - Idle SecurityRevoked立即失效old Snapshot并重新resolve，不创建TurnInterrupted；
-- Starting SecurityRevoked取消candidate后重新resolve，不创建领域Turn；
+- Starting SecurityRevoked在Input live apply前取消candidate且不创建Turn；apply后绑定同一Turn、阻止task spawn，并在Input publication后发布live TurnInterrupted；
 - terminal后使用current definition/current authority重新resolve，success Ready、failure Unavailable；
 - security signal先赢时迟到model/tool/source结果不进入后续LiveConversation；
-- crash无法证明security cause时使用HostRestart/RecoveryContextUnavailable；
+- crash后不恢复security cause或旧TurnStatus；
 - 同root两个Session的cwd/grant和security operation basis隔离；
 - WorkspacePromptContext、WorkspaceSkillContext、WorkspaceAccessView和WorkspaceToolContext只能由同一个`Arc<WorkspaceSnapshot>`私有投影，不能跨Snapshot拼接；
 - Runtime restart或重新resolve后使用新解析出的不可变Snapshot，旧authorization-sensitive cache不可复用；
@@ -1273,4 +1273,4 @@ upload / telemetry
 - [x] 按ADR 0123删除Workspace及view命名指纹；执行一致性由不可变Snapshot、私有投影和显式reload/re-resolve保证。
 - [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义。
-- [x] StoredTurnStart只保存model-safe Workspace摘要；不保存historical WorkspaceSnapshotRef或WorkspaceRevision execution binding。
+- [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。

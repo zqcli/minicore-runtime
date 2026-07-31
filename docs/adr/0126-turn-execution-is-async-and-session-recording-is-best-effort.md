@@ -1,7 +1,9 @@
 # ADR 0126：Turn执行使用async loop，Session记录采用inline best-effort append
 
-状态：Accepted
+状态：Partially Superseded by ADR 0127
 日期：2026-07-30
+
+> 2026-07-31：async Turn loop、LiveSessionState truth、inline best-effort conversation recording与Degraded semantics保留。ADR 0127删除`StoredTurnStart`、recorded Turn terminal、cold recovery closure和fork closure；TurnStatus/terminal StateEvent改为current-process only。
 
 ## 背景
 
@@ -196,8 +198,8 @@ Cold load只恢复recorded JSONL完整行：
 - replay继续容忍malformed、duplicate、orphan和invalid relation；
 - model view继续排除不完整Tool exchange；
 - 未记录的live tail永久丢失；
-- recorded Running Turn在新进程中投影为Interrupted/Incomplete；
-- 是否追加`HostRestart` closure仍由Q10决定；任何closure attempt都必须发生在new Recorder初始化之后，且不能成为读取或new Turn admission的correctness gate；
+- JSONL不保存Turn lifecycle，recorded TurnId只用于conversation grouping；
+- Load不推断旧Turn outcome、不追加closure，并设置`current_turn = None`；
 - Workspace/Prompt/Skill/Tool/Model execution objects仍按current definitions重新capture；
 - new loaded instance始终尝试初始化Recorder，并根据storage结果建立Healthy或Degraded，不继承旧health object；
 - Unload/Load永久丢弃旧unrecorded live tail，不记录gap marker。
@@ -217,13 +219,13 @@ Fork在source Session的residency/lifecycle synchronization内确定source kind�
 
 LiveSnapshot必须在一次短live-state critical section内同时解析anchor并复制immutable selected path。live mutation在snapshot捕获前已apply时，即使对应`record().await`仍在执行，该事实也进入fork；捕获后才apply的mutation不进入。stream draft、ProgressEvent和其他未apply状态不进入snapshot。
 
-Fork释放source guard后再创建target staging record stream。selected path必须完整写入并通过tolerant replay验证后才能原子发布child；staging失败不发布部分child。non-terminal tail在child中以`HistoricalFork`关闭。Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object、in-flight append或authorization capability。
+Fork释放source guard后再创建target staging record stream。selected path必须完整写入并通过tolerant replay验证后才能原子发布child；staging失败不发布部分child。conversation tail原样复制，child不继承source current Turn，也不追加fork terminal。Fork不复制ActiveTurnTask、Tool process、Interaction waiter、Steer/FollowUp queue、CancellationToken、Recorder object、in-flight append或authorization capability。
 
 `ForkSourceKind::LiveSnapshot | RecordedHistory`进入child durable fork provenance和`SessionForked`command outcome。Host不需要根据recording health推断Fork是否包含live tail。
 
 ## 跨模块不变量变更
 
-- `INV-001`改为live owner在apply前分配稳定EntryId并绑定parent，live mutation先apply，再完成inline record attempt，随后final publication/protocol continuation；Recorder不得改写identity；
+- `INV-001`改为live owner为recordable conversation fact在apply前分配稳定EntryId并绑定parent，apply后完成inline record attempt再publication/protocol continuation；TurnStatus只apply/publish live；Recorder不得改写identity；
 - `INV-002`保留tolerant replay，并明确只恢复recorded prefix；
 - `INV-003`canonical owner移动到live conversation reducer，cold projector只负责恢复期sanitization；
 - `INV-004`新增Fork source规则：loaded使用同一LiveSnapshot解析anchor并复制path，unloaded使用RecordedHistory，source kind进入durable provenance和command outcome；
@@ -252,10 +254,10 @@ Fork释放source guard后再创建target staging record stream。selected path�
 
 代价：
 
-- 每次final domain mutation承担一次本地JSONL encode和append延迟；
-- 同Session的final event和下一protocol step等待该append attempt返回；
+- 每次recordable conversation mutation承担一次本地JSONL encode和append延迟；
+- 同Session对应final event和下一protocol step等待该append attempt返回；TurnInterrupted/TurnFailed没有terminal append；
 - Host观察到的live状态仍可能因Degraded、partial write或process crash无法完整恢复；
-- Tool副作用、Interaction和terminal记录可能缺失；
+- Tool副作用与Interaction conversation facts可能缺失；Turn terminal本来就不记录；
 - source Session的crash resume仍只恢复recorded prefix；显式loaded Fork可以把已apply但未record的live tail写入独立child record stream；
 - live fork需要捕获并materialize完整selected path，target staging失败时整个Fork失败；
 - MiniCore不再宣称Transcript-First或“已观察事实必可恢复”。

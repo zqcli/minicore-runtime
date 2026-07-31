@@ -1,8 +1,8 @@
 # ModelGateway架构设计
 
-日期：2026-07-30
+日期：2026-07-31
 
-状态：当前权威架构（ADR 0126后，生产实现待启动）
+状态：当前权威架构（ADR 0127后，生产实现待启动）
 
 ## 目的
 
@@ -445,8 +445,8 @@ TurnModelSnapshot语义：
 - Steer不重新resolve Model；
 - provider catalog reload只影响future Turn；
 - definition已从catalog current head移除时，Gateway仍可使用Snapshot持有的retained exact definition；
-- process restart不恢复unfinished Turn，因此不承诺跨进程继续旧Snapshot；
-- Input UserMessage内联的`StoredTurnStart`只保存safe provider/model descriptor和generation settings，不保存`ModelDefinitionVersion`或execution_ref。
+- process restart不恢复active Turn，因此不承诺跨进程继续旧Snapshot；
+- Input UserMessage不保存Turn-start model snapshot；实际响应使用的safe provider/model descriptor和generation metadata只随`StoredAssistantMessage`记录，不保存`ModelDefinitionVersion`或execution_ref。
 
 ### ResolveTurnModelRequest
 
@@ -1523,7 +1523,7 @@ partial draft
 single-attempt state
 ```
 
-unfinished Turn按Session recovery规则终止。下一Turn从recorded prefix重建sanitized live context并建立新provider request；未record tail不可恢复。
+process restart直接丢弃active Turn与旧TurnStatus。下一Turn从recorded conversation prefix重建sanitized live context并建立新provider request；未record tail不可恢复。
 
 ### Outcome Ambiguity
 
@@ -1552,7 +1552,7 @@ encode/write失败时，assistant live mutation保留，recording health转为De
 
 ## Recording Contract
 
-SessionRecorder可以保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；unfinished Turn也不跨restart恢复旧TurnModelSnapshot。
+SessionRecorder可以在`StoredAssistantMessage`中保存safe `StoredModelDescriptor`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
 
 实际record成功的assistant entry保存：
 

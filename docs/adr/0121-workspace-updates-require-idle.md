@@ -1,7 +1,9 @@
 # ADR 0121：Workspace定义只在Idle更新，安全撤权中断当前Turn
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-27
+
+> 2026-07-31：Idle-only update、SecurityRevoked、truthful Tool settlement和terminal后重新resolve继续有效；ADR 0127删除TurnInterrupted recording与restart interruption reason reconstruction。
 
 > 2026-07-30：Workspace Idle-only update、SecurityRevoked和Tool settlement保留；TurnInterrupted先apply live并best-effort record，recording failure不影响Workspace readiness。
 

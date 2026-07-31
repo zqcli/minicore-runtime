@@ -1,7 +1,9 @@
 # ADR 0111: SessionIngress 分离控制与工作 lane
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-25
+
+> 2026-07-31：semantic lanes、sticky emergency、live terminal handoff与Unload settlement继续有效；ADR 0127删除terminal append，Unload等待live settlement和当前recordable conversation attempts。
 
 > 2026-07-30：semantic lanes、sticky emergency和control responsiveness保留；状态owner改为SessionExecutor control actor + ActiveTurnTask，删除SessionWriter/committed projection gate。
 

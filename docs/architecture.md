@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort Session recording；生产实现待启动。 |
+| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为不含Turn lifecycle的conversation transcript；生产实现待启动。 |
 
 权威顺序：本文与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -15,7 +15,7 @@
 
 MiniCore采用Codex式执行结构：每个loaded Session有一个`SessionExecutor` control actor和最多一个`ActiveTurnTask`。ActiveTurnTask使用普通async loop顺序编排Model、Tool、Interaction、logical retry和Compaction；不再实现同步sans-I/O `AgentLoop`、`next_action()`或`RunningOperation` effect协议。
 
-Session的当前进程事实由`LiveSessionState`拥有。`SessionRecorder`在live mutation后inline await当前JSONL line的best-effort append；成功不表示flush或fsync，失败不回滚live state或重放外部操作。process crash后只恢复实际留下的完整行前缀。
+Session的当前进程事实由`LiveSessionState`拥有。`SessionRecorder`只为稳定conversation facts inline await当前JSONL line的best-effort append；成功不表示flush或fsync，失败不回滚live state或重放外部操作。TurnStatus与terminal StateEvent只属于loaded execution。process crash后只恢复实际留下的conversation完整行前缀。
 
 Rig只实现`ModelGateway` private `ProviderAdapter`的单次provider attempt。Model resolution、request validation、credential、response validation和provider-neutral terminal result仍由ModelGateway拥有；logical retry由ActiveTurnTask拥有。
 
@@ -82,17 +82,17 @@ MiniCoreRuntime
 
 ## Session Recording
 
-live mutation顺序：
+recordable conversation mutation顺序：
 
 ```text
-validate domain mutation
+validate recordable mutation
 → LiveSessionState.EntryIdGenerator allocates EntryId and binds parent_id
 → apply LiveSessionState / LiveConversation
 → await SessionRecorder.record(entry)
 → publish final StateEvent / resume waiter / continue loop
 ```
 
-EntryId由`LiveSessionState`私有Session-scoped generator在apply前分配；Recorder不得创建或改写identity。`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。
+EntryId由`LiveSessionState`私有Session-scoped generator在apply前分配；Recorder不得创建或改写identity。`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。Interrupted/Failed terminal没有record attempt，Completed通过Final Assistant conversation entry留下内容事实。
 
 Cold replay：
 
@@ -100,9 +100,10 @@ Cold replay：
 - skip malformed/duplicate并隔离orphan或invalid relation；
 - 重建recorded history和sanitized model conversation；
 - incomplete Tool exchange不进入模型conversation；
-- recorded unfinished Turn在新进程中按restart interruption处理；
+- 不从recorded TurnId重建旧TurnStatus，不追加restart closure；
 - writable Load只截断final unterminated partial tail，再从replayed recorded head初始化新Recorder；
-- Unload/Load只恢复recorded prefix，未record的live tail永久丢失。
+- Load完成后`current_turn = None`并进入Idle或Unavailable；
+- Unload/Load只恢复recorded conversation prefix，未record的live tail永久丢失。
 
 ## Turn执行
 
@@ -121,6 +122,8 @@ Submit admission
 → return TurnTaskOutcome
 → SessionExecutor settles lifecycle and FollowUp
 ```
+
+Turn creation在Input live apply时线性化，Agent lifecycle/admission permit在Recorder await前释放；`Starting`持续到Input record attempt和`TurnStarted` publication完成。该窗口内`Cancel(Submit(command_id))`继续有效，Input已apply时绑定同一Turn并阻止task spawn。
 
 同Session只有一个ActiveTurnTask。多个Session可以同时调用共享ModelGateway；Gateway没有本地模型调用permit。
 
@@ -197,7 +200,7 @@ ActiveTurnTask从sanitized live conversation构建plan，使用同一PromptSet/M
 
 | ID | 不变量摘要 | Canonical Owner |
 | --- | --- | --- |
-| INV-001 | live owner在apply前分配稳定EntryId并绑定parent，live mutation先apply，再完成inline record attempt，随后publish final state或推进协议；Recorder不得改写identity | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
+| INV-001 | live owner为recordable conversation fact在apply前分配稳定EntryId并绑定parent，apply后完成inline record attempt再publish/推进；TurnStatus只apply/publish live，Recorder不得创建identity或terminal | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
 | INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |

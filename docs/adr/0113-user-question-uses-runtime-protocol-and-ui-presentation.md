@@ -1,7 +1,9 @@
 # ADR 0113: UserQuestion 使用 MiniCore 交互协议与 UI 展示 Adapter
 
-状态：Partially Superseded by ADRs 0124 and 0126
+状态：Partially Superseded by ADRs 0124, 0126 and 0127
 日期：2026-07-25
+
+> 2026-07-31：typed Interaction、MiniCore-owned live request/resolution与Presentation Adapter职责继续有效；ADR 0127规定restart不恢复Pending waiter/state，也不合成Cancelled resolution或Turn terminal。Recorded request/resolution只作为historical facts。
 
 > 2026-07-30：typed Interaction、Presentation Adapter和oneshot等待保留；request/resolution改为live apply + inline best-effort append attempt，record failure不阻止notify/resume。
 
