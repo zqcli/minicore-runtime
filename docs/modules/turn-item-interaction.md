@@ -277,7 +277,7 @@ pub(crate) enum InteractionState {
     },
 }
 
-pub struct InteractionResolutionKey(/* opaque random 128-bit value */);
+pub struct InteractionResolutionKey([u8; 16]);
 ```
 
 ```rust
@@ -292,6 +292,8 @@ pub(crate) enum InteractionResolution {
     Cancelled(InteractionCancelReason),
 }
 ```
+
+`InteractionResolutionKey`的bytes由Presentation Adapter使用CSPRNG生成；field保持private，public constructor校验/接受exact 16 bytes，Debug/Display不得输出raw value。V4-P1-2只冻结其wire text encoding，不改变128-bit carrier或request scope。
 
 `resolution_key = Some`只用于host `InteractionCommand::Resolve`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
 

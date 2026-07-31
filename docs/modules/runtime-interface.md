@@ -240,6 +240,18 @@ pub enum RuntimeLifecycleCommand {
 
 `ReloadSharedResources`对应`/reload`，发布新的共享Prompt/Skill/Tool/Model immutable objects；它不修改任何SessionDefinitionRevision，也不更新active/completed Turn。
 
+`RuntimeCommand`只组合public protocol DTO和各domain owner公开的safe semantic leaf type。protocol crate从canonical owner re-export以下leaf，不在Runtime Interface复制第二套定义：
+
+| Public leaf | Canonical owner |
+| --- | --- |
+| `AgentPromptSelection`、`SessionPromptSelection`、`PromptBodyIntent`、`TextIntent`、`SkillIntent` | [Prompt](prompt.md) |
+| `WorkspaceRootSpec`、`WorkspaceCwdSpec`、`RequestedFilesystemAccess`、`WorkspaceSourcePolicy` | [Workspace](workspace.md) |
+| `SessionModelConfig` | [Agent/Session Lifecycle](agent-session-lifecycle.md)；其中Model leaf由[ModelGateway](model-gateway.md)拥有 |
+| `ToolApprovalDecisionInput`、`UserQuestionAnswer`及question value types | [Tools](tools.md#approval-and-question-types) |
+| `InteractionResolutionKey` | [Turn / Item / Interaction](turn-item-interaction.md#interaction) |
+
+这些owner公开的是同一个Rust semantic type，不是Runtime-local shadow DTO。owner-assigned ID/revision/timestamp、private PermissionSet、source authorization和executor handle仍不能经这些leaf进入command。ProviderId/ModelId等base identity carrier与Workspace path的wire text encoding属于V4-P1-2；这里已经冻结其domain owner与field relation，不抢先复制或编码。
+
 ### AgentCommand
 
 ```rust
@@ -268,9 +280,38 @@ pub enum AgentCommand {
         expected_status: AgentStatus,
     },
 }
+
+pub enum AgentUsableStatus {
+    Enabled,
+    Disabled,
+}
+
+pub struct NewAgentDefinition {
+    pub prompts: AgentPromptSelection,
+}
+
+pub struct AgentDefinitionPatch {
+    pub prompts: Option<AgentPromptSelection>,
+}
+
+pub struct NewAgentMetadata {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+pub struct AgentMetadataPatch {
+    pub name: Option<String>,
+    pub description: OptionalTextPatch,
+}
+
+pub enum OptionalTextPatch {
+    Keep,
+    Set(String),
+    Clear,
+}
 ```
 
-`AgentUsableStatus`只允许`Enabled | Disabled`。`AgentStatus::Deleted`只能通过`Delete`进入，Deleted identity不复用。
+`AgentUsableStatus`只允许`Enabled | Disabled`。`AgentStatus::Deleted`只能通过`Delete`进入，Deleted identity不复用。`NewAgentDefinition`不接受AgentId/revision/timestamp；owner在Create时分配。patch至少包含一个非`None/Keep`字段，否则在CAS成功后归约为`NoChange`。name必须non-empty；description的Keep/Set/Clear避免用嵌套Option猜测“未修改”和“清空”。所有strings/collection受ProtocolLimits约束。
 
 ### SessionCommand
 
@@ -319,7 +360,37 @@ pub enum SessionCommand {
         anchor: ForkAnchor,
     },
 }
+
+pub struct NewSessionDefinition {
+    pub workspace: WorkspaceDefinitionInput,
+    pub model: SessionModelConfig,
+    pub prompts: SessionPromptSelection,
+}
+
+pub struct SessionDefinitionPatch {
+    pub workspace: Option<WorkspaceDefinitionInput>,
+    pub model: Option<SessionModelConfig>,
+    pub prompts: Option<SessionPromptSelection>,
+}
+
+pub struct WorkspaceDefinitionInput {
+    pub primary_root: WorkspaceRootSpec,
+    pub additional_roots: Vec<WorkspaceRootSpec>,
+    pub cwd: WorkspaceCwdSpec,
+}
+
+pub struct NewSessionMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+}
+
+pub struct SessionMetadataPatch {
+    pub name: OptionalTextPatch,
+    pub description: OptionalTextPatch,
+}
 ```
+
+`WorkspaceDefinitionInput`没有WorkspaceRevision；Session owner规范化并分配new Workspace revision。root key/path/cwd containment、duplicate roots、requested access和source policy由Workspace owner验证。`SessionDefinitionPatch`为空时在CAS成功后为`NoChange`；Workspace/Model/Prompt字段各自是complete replacement candidate，不使用partial nested patch。metadata OptionalTextPatch同样区分Keep/Set/Clear。
 
 `ReloadSharedResources`对应`/reload`：Runtime完整build Prompt/Skill/Tool/Model candidates，validate所有required candidates，然后在短publication gate下原子替换current immutable objects；任一required candidate失败时保留全部old current values并返回`ReloadValidationFailed`，不发布`RuntimeReloaded`或`shared_resources_reloaded`。active/completed Turn不更新，future Turn捕获reload后的objects。
 
@@ -408,7 +479,6 @@ pub enum TurnCommand {
     Cancel {
         session_id: SessionId,
         target: PublicCancelTarget,
-        reason: UserCancelReason,
     },
 }
 
@@ -488,6 +558,28 @@ pub enum CommandSurfaceCommand {
     },
 }
 
+pub struct CommandSelection {
+    pub path: Vec<String>,
+}
+
+pub struct CommandArgs {
+    pub values: Vec<CommandArgInput>,
+}
+
+pub enum CommandArgInput {
+    Positional(CommandArgumentValueInput),
+    Named {
+        name: String,
+        value: CommandArgumentValueInput,
+    },
+}
+
+pub enum CommandArgumentValueInput {
+    Text(String),
+    Boolean(bool),
+    Choice(String),
+}
+
 pub enum CommandPromptDelivery {
     Submit,
     Steer {
@@ -496,6 +588,8 @@ pub enum CommandPromptDelivery {
     FollowUp,
 }
 ```
+
+`CommandSelection.path`必须与current safe catalog中的exact command path匹配；它不是internal handler ID。`CommandArgs`保留ordered positional/named typed values，`Choice(String)`必须匹配catalog allowlist；不能嵌入RuntimeCommand、arbitrary JSON或credential。Runtime在execution时重新materialize catalog、re-resolve path并按command-specific schema验证name/order/count/type/value；所有文本和数量受ProtocolLimits约束。
 
 `delivery`只对产生PromptIntent的command生效。`/status`、`/help`、`/model`等command忽略该字段。
 
@@ -707,9 +801,58 @@ pub enum RuntimeDispatchError {
     RuntimeClosed,
     InternalDispatchUnavailable,
 }
+
+pub struct QueryError {
+    pub code: QueryErrorCode,
+    pub message: String,
+    pub retry: RetryAdvice,
+    pub subject: Option<PublicSubject>,
+}
+
+pub enum QueryErrorCode {
+    InvalidArgument,
+    NotFound,
+    SessionNotLoaded,
+    StaleCursor,
+    ResultTooLarge,
+    Unavailable,
+    DurableStateCorrupt,
+    RuntimeClosing,
+}
+
+pub struct SnapshotError {
+    pub code: SnapshotErrorCode,
+    pub message: String,
+    pub retry: RetryAdvice,
+    pub subject: Option<PublicSubject>,
+}
+
+pub enum SnapshotErrorCode {
+    NotFound,
+    SessionNotLoaded,
+    Unavailable,
+    RuntimeClosing,
+}
+
+pub struct SubscriptionError {
+    pub code: SubscriptionErrorCode,
+    pub message: String,
+    pub retry: RetryAdvice,
+    pub subject: Option<PublicSubject>,
+}
+
+pub enum SubscriptionErrorCode {
+    UnsupportedScope,
+    NotFound,
+    SessionNotLoaded,
+    PublisherUnavailable,
+    RuntimeClosing,
+}
 ```
 
 同一in-flight CommandId携带不同command已经进入dedup owner，因此返回`CommandCompletion::Rejected(CommandError { code: CommandConflict, ... })`；不是transport error。
+
+Query/Snapshot/Subscription error同样只携带closed code、bounded redacted message、RetryAdvice和optional subject。`StaleCursor`表示cursor与query family/filter/sort/captured immutable snapshot不匹配，或其snapshot已因restart、bounded eviction或scope unload不可用；调用方必须从first page重启。`ResultTooLarge`用于首版明确不分页的完整read model超过ProtocolLimits，不能静默截断破坏自洽性。Snapshot/Subscription的SessionNotLoaded不会隐式Load。publisher关闭或subscriber背压造成当前stream终止后，host重新subscribe获取new Snapshot；不能用旧SubscriptionError恢复event cursor。
 
 ## CommandSurface
 
@@ -841,39 +984,89 @@ pub enum RuntimeQuery {
     Usage(UsageQuery),
     Diagnostics(DiagnosticsQuery),
 }
+
+pub struct PageRequest {
+    pub cursor: Option<PageCursor>,
+    pub limit: NonZeroU32,
+}
 ```
 
 ### RuntimeReadQuery
 
-```text
-GetCapabilities
-GetRuntimeInfo
-ListLoadedSessions
+```rust
+pub enum RuntimeReadQuery {
+    GetCapabilities,
+    GetRuntimeInfo,
+    ListLoadedSessions,
+}
 ```
 
 ### AgentQuery
 
-```text
-ListAgents
-GetAgent
-ListAgentRevisions
-GetAgentRevision
+```rust
+pub enum AgentQuery {
+    ListAgents {
+        page: PageRequest,
+        include_deleted: bool,
+    },
+    GetAgent {
+        agent_id: AgentId,
+    },
+    ListAgentRevisions {
+        agent_id: AgentId,
+        page: PageRequest,
+    },
+    GetAgentRevision {
+        agent: AgentRevisionRef,
+    },
+}
 ```
 
 ### SessionQuery
 
-```text
-ListSessions
-GetSession
-GetSessionDefinition
-GetSessionReadiness
-GetSessionForkProvenance
-GetHistoryTree
-ListTurns
-GetTurn
-ListItems { turn_id }
-GetItem
-ListPendingInteractions
+```rust
+pub enum SessionQuery {
+    ListSessions {
+        page: PageRequest,
+        include_archived: bool,
+    },
+    GetSession {
+        session_id: SessionId,
+    },
+    GetSessionDefinition {
+        session_id: SessionId,
+        revision: Option<SessionDefinitionRevision>,
+    },
+    GetSessionReadiness {
+        session_id: SessionId,
+    },
+    GetSessionForkProvenance {
+        session_id: SessionId,
+    },
+    GetHistoryTree {
+        session_id: SessionId,
+    },
+    ListTurns {
+        session_id: SessionId,
+        page: PageRequest,
+    },
+    GetTurn {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+    ListItems {
+        session_id: SessionId,
+        turn_id: TurnId,
+    },
+    GetItem {
+        session_id: SessionId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    },
+    ListPendingInteractions {
+        session_id: SessionId,
+    },
+}
 ```
 
 `GetHistoryTree`返回公开read model：
@@ -917,22 +1110,48 @@ History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessio
 
 History query不返回或重放Session definition/metadata/lifecycle transition timeline。`GetAgent/GetAgentRevision/GetSession/GetSessionDefinition`从各自durable entity owner读取current或exact revision；conversation JSONL只提供message、Interaction和Compaction history。
 
-MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
+MVP只要求真正可能持续增长的`ListAgents`、`ListAgentRevisions`、`ListSessions`、`ListTurns`和Prompt/Skill/Tool/Provider/Model catalog支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`、`GetHistoryTree`和`SessionSnapshot.active_items`首版完整返回，但仍受ProtocolLimits总量约束。canonical sort固定为：Agent与Prompt/Skill/Tool/Provider按stable ID升序，Agent revisions按revision降序，Session按`created_at desc + SessionId`，historical Turn按`last_timestamp desc + TurnId`，Model按`ProviderId + ModelId`。PageCursor绑定query family、filter、sort和captured immutable query snapshot；调用方不能跨family/filter/snapshot复用或拼接page。
 
 ### CommandSurfaceQuery
 
-```text
-GetCatalog { session_id? }
-Suggest { session_id?, input, cursor_position }
-GetHelp { session_id?, command_path }
+```rust
+pub enum CommandSurfaceQuery {
+    GetCatalog {
+        session_id: Option<SessionId>,
+    },
+    Suggest {
+        session_id: Option<SessionId>,
+        input: String,
+        cursor: CommandCursorPosition,
+    },
+    GetHelp {
+        session_id: Option<SessionId>,
+        command_path: Vec<String>,
+    },
+}
+
+pub struct CommandCursorPosition {
+    pub utf8_byte_offset: u32,
+}
 ```
+
+`CommandCursorPosition`必须落在input的UTF-8 code-point boundary且不大于input byte length；否则QueryError::InvalidArgument。这样in-process Rust和future wire adapter共享一个无歧义位置语义。
 
 ### ModelQuery
 
-```text
-ListProviders
-ListModels { provider_id? }
-GetModelCapabilities
+```rust
+pub enum ModelQuery {
+    ListProviders {
+        page: PageRequest,
+    },
+    ListModels {
+        provider_id: Option<ProviderId>,
+        page: PageRequest,
+    },
+    GetModelCapabilities {
+        selection: ModelSelection,
+    },
+}
 ```
 
 只返回safe model identity、display metadata、availability、context limit和capabilities。Endpoint、auth reference、credential和provider client不公开。
@@ -941,13 +1160,56 @@ GetModelCapabilities
 
 只提供UI-safe catalog和diagnostics：
 
-```text
-Prompt: ListPrompts / GetPromptSummary
-Skill:  ListSkills / GetSkillSummary
-Tool:   ListTools / GetToolSummary
+```rust
+pub enum PromptQuery {
+    ListPrompts {
+        page: PageRequest,
+    },
+    GetPromptSummary {
+        prompt_id: PromptId,
+    },
+}
+
+pub enum SkillQuery {
+    ListSkills {
+        session_id: Option<SessionId>,
+        page: PageRequest,
+    },
+    GetSkillSummary {
+        session_id: Option<SessionId>,
+        skill_id: SkillId,
+    },
+}
+
+pub enum ToolQuery {
+    ListTools {
+        session_id: Option<SessionId>,
+        page: PageRequest,
+    },
+    GetToolSummary {
+        session_id: Option<SessionId>,
+        tool_name: ToolName,
+    },
+}
+
+pub enum UsageQuery {
+    GetSessionUsage {
+        session_id: SessionId,
+    },
+}
+
+pub enum DiagnosticsQuery {
+    GetRuntimeDiagnostics,
+    GetSessionDiagnostics {
+        session_id: SessionId,
+    },
+    GetLoadedSessionDiagnostics,
+}
 ```
 
-正文默认不进入普通Query。后续privileged debug interface必须独立授权。
+Prompt catalog是shared current root；Skill/Tool query的`session_id = Some`使用loaded Session current safe view，`None`使用shared/global safe catalog并省略Workspace-bound或Session-filtered entries。它们不隐式Load Session。Diagnostics只返回bounded current safe projections；`GetLoadedSessionDiagnostics`不扫描unloaded durable catalogs。
+
+Prompt/Skill正文和Tool private schema/route默认不进入普通Query。后续privileged debug interface必须独立授权。
 
 ### Query Response
 
@@ -961,7 +1223,7 @@ pub struct Page<T> {
     pub next_cursor: Option<PageCursor>,
 }
 
-pub struct PageCursor(/* opaque */);
+pub struct PageCursor(String);
 
 pub enum QueryResult {
     Runtime(RuntimeQueryResult),
@@ -1030,9 +1292,13 @@ pub enum ToolQueryResult {
     Tool(ToolSummaryView),
 }
 
-pub struct DiagnosticsQueryResult {
-    pub runtime: Vec<RuntimeDiagnosticView>,
-    pub sessions: Vec<SessionDiagnosticsView>,
+pub enum DiagnosticsQueryResult {
+    Runtime(Vec<RuntimeDiagnosticView>),
+    Session(SessionDiagnosticsView),
+    Loaded {
+        runtime: Vec<RuntimeDiagnosticView>,
+        sessions: Vec<SessionDiagnosticsView>,
+    },
 }
 
 pub struct SessionDiagnosticsView {
@@ -1041,7 +1307,7 @@ pub struct SessionDiagnosticsView {
 }
 ```
 
-Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Submit/Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot。domain CAS revision直接存在于`AgentSummary`、`SessionSummary`或definition result中，不再增加未定义generic `QueryRevision`。pagination cursor绑定query family、filter、sort和captured durable catalog revision；wire encoding由V4-P1-2冻结。
+Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Submit/Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot。每个request variant只能返回同family中matching result variant；mismatch是Runtime invariant failure，不降级为空值。domain CAS revision直接存在于`AgentSummary`、`SessionSummary`或definition result中，不再增加未定义generic `QueryRevision`。`PageCursor`是Runtime生成、caller只能原样回传的bounded opaque string carrier，绑定exact query family/filter/sort和捕获时immutable query snapshot：durable catalog query绑定captured owner revision，shared或Session-scoped resource query绑定captured immutable resource view。它不公开reload generation/fingerprint；Runtime可以在cursor内认证编码或使用bounded process-local cursor store，具体wire由V4-P1-2冻结。cursor在restart、eviction或scope unload后返回StaleCursor。`PageRequest.limit`超过ProtocolLimits时返回InvalidArgument。
 
 ### Common Read Views
 
@@ -1143,11 +1409,33 @@ pub struct CommandCatalogEntryView {
     pub title: String,
     pub description: Option<String>,
     pub accepts_prompt: bool,
+    pub arguments: Vec<CommandArgumentView>,
+}
+
+pub struct CommandArgumentView {
+    pub name: String,
+    pub required: bool,
+    pub position: Option<u32>,
+    pub value: CommandArgumentValueView,
+}
+
+pub enum CommandArgumentValueView {
+    Text,
+    Boolean,
+    Choice {
+        values: Vec<String>,
+    },
 }
 
 pub struct CommandSuggestionView {
+    pub replace: CommandTextRange,
     pub replacement: String,
     pub display: String,
+}
+
+pub struct CommandTextRange {
+    pub start_utf8_byte_offset: u32,
+    pub end_utf8_byte_offset: u32,
 }
 
 pub struct ProviderSummaryView {
@@ -1443,6 +1731,8 @@ Host展示语义：`Healthy`不提示；`Degraded`持续显示“后续内容无
 InteractionControl、ToolControl、emergency/lifecycle waiter和SnapshotMailbox深度属于internal diagnostics，不进入普通公开协议。
 
 Cancel被Executor接受后，`SessionExecutionView`必须立即反映`Finishing`并发布`session_execution_changed`。当execution为Finishing时，host优先显示Stopping/Finishing；`CurrentTurnView.phase`保留Cancel前最后工作位置供diagnostic，不建立`TurnExecutionPhase::Cancelling`。Finishing期间host可以继续发送FollowUp并收到`FollowUpQueued`，普通Submit仍返回SessionBusy。
+
+Catalog argument schema只描述safe host input affordance，不包含handler ID、permission object或hidden defaults。`position = Some`的arguments按连续position构造Positional input；`None`使用Named input。Runtime仍必须按current rematerialized catalog重验全部值。Suggestion的`replace`是原input上的half-open UTF-8 byte range，两个端点必须是code-point boundary且满足`start <= end <= input.len()`；host只替换该span，不猜whole-input/token semantics。
 
 ### Snapshot Consistency
 
@@ -2256,6 +2546,9 @@ Public interface是 contract test surface。
 ### Command Tests
 
 - Agent/Session definition revision与metadata revision独立CAS；Create同时返回两个revision 1；
+- Agent/Session create/definition/metadata DTO不接受owner-assigned ID/revision/timestamp；OptionalTextPatch正确区分Keep/Set/Clear，empty/equivalent patch在CAS后NoChange；
+- WorkspaceDefinitionInput分配new WorkspaceRevision并拒绝duplicate root key、cwd escape和oversized roots；
+- ExecuteCatalog selection只用safe path/ordered typed args，Text/Boolean/Choice必须匹配current schema，Runtime重验且不能通过catalog注入RuntimeCommand/credential；
 - metadata stale expected token失败，canonical no-op保持token且不发布event，successful update返回new metadata revision；
 - Agent/Session metadata update不写conversation JSONL，archive/delete竞态按entity lifecycle synchronization线性化；
 - Create Session只有在SessionDefinition与SessionHeader staging成功后返回SessionCreated；失败不发布partial Session；
@@ -2299,6 +2592,9 @@ Public interface是 contract test surface。
 ### Query/Snapshot Tests
 
 - Query只读且不发布Event；
+- 每个concrete nested Query variant只返回matching QueryResult variant，family mismatch触发invariant failure而非空payload；
+- PageRequest limit、stale/cross-family/cross-snapshot cursor、canonical sort、UTF-8 command cursor boundary和suggestion half-open replacement range；
+- Query/Snapshot/Subscription closed error code、retry和subject vectors；
 - QueryResponse所有family使用closed QueryResult variant，domain CAS token内联在对应summary/definition，不存在generic QueryRevision；
 - session list不加载SessionExecutor；
 - GetHistoryTree由owner一次性捕获并返回自洽的完整compact branch topology，不内联Item bodies、不分页、也不返回额外history revision；
@@ -2350,6 +2646,7 @@ Public interface是 contract test surface。
 - catalog/query/snapshot/event不包含credential；
 - SessionDefinitionSummary不包含Workspace absolute path；ItemView不包含Skill/Workspace注入正文、raw Tool args/result或hidden reasoning；
 - renderer不能提交raw internal command；
+- Runtime没有generic command/query map、arbitrary JSON args或未定义nested public request variant；
 - renderer不能直接持有Tool waiter、SessionRecorder或伪造MiniCore未请求的Pending Interaction；
 - approval view不包含raw arguments/private PermissionSet map；unknown option不能扩大权限；
 - UserQuestion request/answer没有secret variant，credential/password/token不得进入Interaction/JSONL/ToolResult/model；

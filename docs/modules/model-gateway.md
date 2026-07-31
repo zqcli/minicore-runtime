@@ -448,6 +448,20 @@ TurnModelSnapshot语义：
 - process restart不恢复active Turn，因此不承诺跨进程继续旧Snapshot；
 - Input UserMessage不保存Turn-start model snapshot；实际响应使用的safe provider/model descriptor和generation metadata只随`StoredAssistantMessage`记录，不保存`ModelDefinitionVersion`或execution_ref。
 
+### ReasoningPreference
+
+```rust
+pub enum ReasoningPreference {
+    Auto,
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+```
+
+`Auto`使用model definition validated default；其他variant是provider-neutral explicit preference。unsupported Disabled/effort在Turn model resolution时返回typed capability error，不由adapter silent downgrade；provider-specific effort name或extra level不能进入SessionDefinition。P1-3负责把这些closed values映射到首版provider protocol。
+
 ### ResolveTurnModelRequest
 
 ```rust
@@ -1664,7 +1678,7 @@ opaque encrypted reasoning
 - catalog重新发布时active Snapshot保持旧definition；
 - future Turn取得新definition；
 - capability/limit validation；
-- reasoning preference映射；
+- reasoning preference Auto/Disabled/Low/Medium/High mapping，unsupported explicit value在resolution fail且adapter不silent downgrade；
 - unknown limits保持None；
 - effective TokenEstimateRate进入ModelDefinitionVersion，rate/catalog更新只影响future Turn；
 - definition未声明rate时使用保守默认并产生diagnostic；
