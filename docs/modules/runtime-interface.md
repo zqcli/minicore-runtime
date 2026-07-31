@@ -384,7 +384,7 @@ pub struct PromptIntentInput {
 }
 ```
 
-`PromptIntentInput`没有独立Skill或Composite variant。SkillIntent只携带SkillId；slash name和GUI catalog selection必须先resolve为SkillId。Runtime边界执行shape/size与重复SkillId校验；exact Skill存在性、captured source读取与authorization由TurnExecutionContext在Submit admission或Steer safe point完成。任一composition失败都不apply部分UserMessage；具体PromptError到command/event的映射仍属于Prompt error mapping，不由ADR 0129扩大。serde tag/casing由通用wire freeze统一决定。
+`PromptIntentInput`没有独立Skill、Composite或Template variant。MVP body只允许`Empty | Text(TextIntent)`；Text必须在boundary normalization后non-empty并满足ProtocolLimits。SkillIntent只携带SkillId；slash name和GUI catalog selection必须先resolve为SkillId。Runtime边界执行shape/size与重复SkillId校验；exact Skill存在性、captured source读取与authorization由TurnExecutionContext在Submit admission或Steer safe point完成。任一composition失败都不apply部分UserMessage；具体PromptError到command/event的映射使用本module canonical table。serde tag/casing由通用wire freeze统一决定。
 
 ```rust
 pub enum TurnCommand {
@@ -942,7 +942,7 @@ GetModelCapabilities
 只提供UI-safe catalog和diagnostics：
 
 ```text
-Prompt: ListPromptTemplates / GetPromptTemplateSummary
+Prompt: ListPrompts / GetPromptSummary
 Skill:  ListSkills / GetSkillSummary
 Tool:   ListTools / GetToolSummary
 ```
@@ -2149,7 +2149,7 @@ Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力
 - API key、OAuth token、auth header；
 - provider endpoint secret和raw response body；
 - PromptSet完整System sections和前置User context；
-- Skill正文和Prompt template正文；
+- Skill正文和PromptDefinition正文；
 - Tool executor handle、prepared private args和sandbox internals；
 - WorkspaceSnapshot、EmergencyControl signal或security target；
 - SessionRecorder file/health internals、replay internals；
@@ -2287,7 +2287,8 @@ Public interface是 contract test surface。
 - Fork与Unload竞态的source kind和复制path来自同一linearization decision；
 - live Fork staging失败不发布SessionForked或partial child；
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
-- `/skill code-review task`解析为Text body加一个SkillId selection，不产生Skill/Composite variant；
+- `/skill code-review task`解析为Text body加一个SkillId selection，不产生Skill/Composite/Template variant；
+- Template body variant在MVP不可构造/不可decode；future template需协商new capability和完整typed contract；
 - duplicate SkillId在边界拒绝，exact captured Skill失败不apply部分UserMessage；
 - Submit与Steer共享async captured Skill resolve；reload期间Steer继续使用old bytes，resolve await不持有ordinary state guard；
 - TurnStarted后的Prompt/Model/Compaction failure发布TurnFailed而不改变原Submit completion；Tool failure走truthful ToolResult/Abandoned，Recorder failure只改变recording health；

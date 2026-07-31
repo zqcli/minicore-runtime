@@ -463,7 +463,10 @@ pub struct PromptIntent {
 pub enum PromptBodyIntent {
     Empty,
     Text(TextIntent),
-    Template(PromptTemplateIntent),
+}
+
+pub struct TextIntent {
+    pub text: String,
 }
 
 pub struct SkillIntent {
@@ -471,7 +474,7 @@ pub struct SkillIntent {
 }
 ```
 
-用户body与Skill选择正交；不再定义`PromptIntent::Skill`、`PromptIntent::Composite`或`CompositePromptIntent`。多个Skill按`skills`中的声明顺序表达，重复`SkillId`在正文I/O或live apply前失败。`SkillIntent`只保存稳定`SkillId`，不能携带name、path、source ref或authorization。Runtime command input使用同样的逻辑形状；slash name和GUI catalog selection必须先解析为SkillId，queue保存intent而不提前展开正文。
+用户body与Skill选择正交；不再定义`PromptIntent::Skill`、`PromptIntent::Composite`、`CompositePromptIntent`或未实现的Template variant。多个Skill按`skills`中的声明顺序表达，重复`SkillId`在正文I/O或live apply前失败。`TextIntent`是non-empty user-authored text value；normalization/size limits由Runtime boundary与V4-P1-2冻结。`SkillIntent`只保存稳定`SkillId`，不能携带name、path、source ref或authorization。Runtime command input使用同样的逻辑形状；slash name和GUI catalog selection必须先解析为SkillId，queue保存intent而不提前展开正文。
 
 TurnExecutionContext使用本Turncaptured对象解析intent后，PromptSet把PromptIntent和已经授权的typed contributions原子规范化为唯一用户消息：
 
@@ -814,7 +817,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 ## 后续问题
 
 3. PromptResourceView candidate build和content cache eviction实现。
-4. Prompt template 是否属于 PromptDefinition kind，还是独立 helper。
+4. Prompt template整体后置：MVP `PromptBodyIntent`只有Empty/Text。future feature必须同时定义stable PromptTemplateId、argument grammar、materialized render、limits、reload/capture和protocol capability，不能只恢复一个未定义enum variant。
 5. 未来若ToolSpec description无法表达真实per-tool使用约束，是否新增typed guidelines；MVP不支持独立guidelines字段。
 6. Historical PromptSet审计格式；MVP不用于Turn cold resume。
 7. Prompt content cache 的 key、eviction 和失效策略。

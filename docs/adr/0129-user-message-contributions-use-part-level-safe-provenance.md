@@ -5,6 +5,8 @@
 
 > [ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)进一步冻结本ADR的执行seam：TurnExecutionContext异步加载captured Skill并构造composition input，PromptSet同步原子规范化，Session Execution处理Starting/Steer cancellation与await后重验。
 
+> 2026-07-31：V4-P1-1 public payload freeze删除未定义的`PromptBodyIntent::Template`。MVP body只支持Empty/Text；本ADR的`body + ordered skills[]`、part boundary与safe provenance决策保持。future template必须另行定义TemplateId、arguments、materialized render、limits、reload和capability。
+
 ## 背景
 
 Prompt Q4尚未冻结`SkillIntent`、`UserMessageCompositionInput`和recorded contribution stamp的精确字段。旧草案把Text、Template、Skill和Composite放在同一个递归`PromptIntent` enum中，并用字符offset把Skill/Workspace来源关联到最终正文。
@@ -32,7 +34,10 @@ pub struct PromptIntent {
 pub enum PromptBodyIntent {
     Empty,
     Text(TextIntent),
-    Template(PromptTemplateIntent),
+}
+
+pub struct TextIntent {
+    pub text: String,
 }
 
 pub struct SkillIntent {
@@ -40,7 +45,7 @@ pub struct SkillIntent {
 }
 ```
 
-删除`PromptIntent::Skill`、`PromptIntent::Composite`和`CompositePromptIntent`。`SkillIntent`只保存稳定`SkillId`；name只用于发现/展示，path、source ref和authorization不能进入public intent。多个Skill按`skills`中的声明顺序表达；重复`SkillId`在任何正文I/O或live apply前返回typed invalid-intent error。
+删除`PromptIntent::Skill`、`PromptIntent::Composite`和`CompositePromptIntent`。MVP也不保留未定义Template variant。`TextIntent`保存用户显式non-empty text；`SkillIntent`只保存稳定`SkillId`；name只用于发现/展示，path、source ref和authorization不能进入public intent。多个Skill按`skills`中的声明顺序表达；重复`SkillId`在任何正文I/O或live apply前返回typed invalid-intent error。
 
 Runtime边界的`PromptIntentInput`使用同样的`body + skills[]`逻辑形状，并在进入Session ingress前规范化为`PromptIntent`。slash command或GUI可以先按name/catalog selection解析，但成功输出必须是`SkillId`；queue保存intent，不提前展开Skill正文。exact serde tag/casing仍由通用wire freeze决定。
 
