@@ -2515,14 +2515,14 @@ Runtime Interface只拥有public projection，不把module error迁移到全局e
 
 | Internal condition | Public code | RetryAdvice |
 | --- | --- | --- |
-| invalid envelope/shape/size、duplicate SkillId、`PromptErrorKind::InvalidIntent`或`InvalidContribution` | `InvalidArgument` | `DoNotRetry` |
+| accepted typed command的semantic shape/value invalid、duplicate SkillId、`PromptErrorKind::InvalidIntent`或`InvalidContribution` | `InvalidArgument` | `DoNotRetry` |
 | missing Agent/Session/Skill/Item/Request | `NotFound` | `RefreshAndRetry` |
 | same CommandId或Interaction resolution key携带different canonical payload | `CommandConflict` | `DoNotRetry` |
 | Agent/Session definition或metadata CAS mismatch | `StaleRevision` | `RefreshAndRetry` |
 | Agent disabled / deleted | `AgentDisabled` / `AgentDeleted` | `UserActionRequired` / `DoNotRetry` |
 | Session archived / deleted | `SessionArchived` / `SessionDeleted` | `UserActionRequired` / `DoNotRetry` |
 | loaded executor不存在 | `SessionNotLoaded` | `UserActionRequired` |
-| Workspace/Agent/model/required Prompt使loaded Session当前不可admit | `SessionNotReady` | typed cause决定`RetryWithBackoff`或`UserActionRequired` |
+| loaded Session readiness为Preparing或Unavailable且没有更具体public code | `SessionNotReady` | 按下表exact cause |
 | Starting/Running/Finishing conflict | `SessionBusy` | `RefreshAndRetry` |
 | reload candidate validation失败 | `ReloadValidationFailed` | `UserActionRequired` |
 | bounded public work lane满 | `IngressLaneFull { lane }` | `RetryWithBackoff` |
@@ -2538,6 +2538,29 @@ Runtime Interface只拥有public projection，不把module error迁移到全局e
 | required durable entity/history损坏 | `DurableStateCorrupt` | `UserActionRequired` |
 | admitted command遇Runtime shutdown | `RuntimeClosing` | `RetryWithBackoff` |
 | internal invariant/channel failure发生在command seam | `Unavailable` | `DoNotRetry` + redacted diagnostic |
+
+Envelope/runtime入口失败不进入上述Command table：
+
+| Pre-command condition | Outer result |
+| --- | --- |
+| 无法decode/validate `CommandRequest` envelope | `RuntimeDispatchError::InvalidEnvelope` |
+| frame/request超过outer transport/runtime request limit | `RuntimeDispatchError::RequestTooLarge` |
+| Runtime已经closed | `RuntimeDispatchError::RuntimeClosed` |
+| command dedup/router在接纳前不可用 | `RuntimeDispatchError::InternalDispatchUnavailable` |
+
+一旦CommandId与typed RuntimeCommand已经被dedup owner接纳，后续field/domain size或semantic validation只能完成为`CommandCompletion::Rejected(CommandError)`，不能再返回outer error。
+
+`SessionNotReady`的RetryAdvice固定映射：
+
+| Readiness cause | RetryAdvice / override |
+| --- | --- |
+| `Preparing` | `RetryWithBackoff` |
+| `Unavailable(AgentUnavailable)` | `UserActionRequired` |
+| `Unavailable(WorkspaceUnavailable)` | `UserActionRequired` |
+| `Unavailable(ModelUnavailable)` | `UserActionRequired` |
+| `Unavailable(PromptUnavailable)` | `UserActionRequired` |
+| `Unavailable(RuntimeDependencyUnavailable)` | `RetryWithBackoff` |
+| `Unavailable(DurableStateCorrupt)` | override code为`DurableStateCorrupt` + `UserActionRequired`，不使用`SessionNotReady` |
 
 stage规则：
 
@@ -2569,7 +2592,8 @@ Public interface是 contract test surface。
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
 - user Cancel在Input apply前使所有joined Submit caller得到同一SubmitCancelled completion；Input apply先赢时全部得到同一TurnStarted；
 - 相同CommandId携带不同command返回Rejected CommandError(code=CommandConflict)；
-- invalid envelope/request-too-large/closed runtime使用outer RuntimeDispatchError，所有领域/admission拒绝保留CommandId进入CommandCompletion::Rejected；
+- invalid envelope/request-too-large/closed runtime使用outer RuntimeDispatchError；accepted typed command的field/domain invalid保留CommandId进入CommandCompletion::Rejected(InvalidArgument)；
+- SessionNotReady每个Preparing/Unavailable cause按canonical table产生exact retry，DurableStateCorrupt使用专用code；
 - CommandOutput只允许bounded redacted plain text；
 - Cancel(Submit CommandId)关闭排队或Starting admission；Input apply前user Cancel使原Submit完成SubmitCancelled且无Turn，Input已live apply但TurnStarted尚未发布时原Submit仍完成TurnStarted并阻止task spawn；target退休或restart后返回NotFound，已发布Turn target返回SubmitNotCancellable且不影响future Turn；
 - Starting async Skill load期间user Cancel使原Submit为SubmitCancelled；SecurityRevoked使原Submit Rejected(Unauthorized)；两者在Input apply前先赢时均无Turn/task，apply后保持TurnStarted→Interrupted顺序；
