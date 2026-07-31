@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0131后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -228,6 +228,8 @@ expected current AgentRevision
 允许在Enabled或Disabled状态更新；Deleted返回terminal lifecycle error。definition/metadata update必须在Agent lifecycle synchronization内同时CAS expected AgentRevision和`status != Deleted`，因此不能在Delete线性化后发布迟到revision。
 
 Agent update 不 fan-out 修改 Session，也不替换 active Turn Context。
+
+Agent definition、metadata和status mutation只写Agent durable owner并更新Runtime read/observer surface；它们不写任一Session conversation JSONL，也不分配Session EntryId。metadata专用event kind仍由Runtime public protocol freeze决定。
 
 ### Update Agent Metadata
 
@@ -712,6 +714,8 @@ active Turn不受允许提交的future-only definition update影响。FollowUp�
 
 metadata update与definition update分开，避免改标题导致future Turn execution definition变化。metadata update可以作用于Open或Archived，但必须在per-session lifecycle synchronization内CAS `lifecycle != Deleted`和metadata version。
 
+Session definition/metadata update只写Session durable owner。loaded Session可以收到future-readiness/current-definition observer update或private invalidation，但该mutation不调用SessionRecorder、不生成StoredSessionEntry，也不与ActiveTurnTask竞争record order；metadata专用event kind仍由Runtime public protocol freeze决定。完整conversation scope见[ADR 0131](../adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)。
+
 ## Explicit Reload
 
 共享Prompt/Skill/Tool/Model资源不属于durable Agent或Session definition。Runtime初始化后，它们只通过显式`/reload`替换current immutable objects；filesystem/config watcher最多标记dirty diagnostic，不自动publication。
@@ -809,7 +813,7 @@ Open + Unloaded
 → Archived
 ```
 
-archive 不隐式 unload，也不取消 Turn。
+archive 不隐式 unload，也不取消 Turn。Archive只更新Session durable lifecycle并发布current Runtime StateEvent；它不需要Recorder或LiveSessionState EntryIdGenerator，也不写conversation entry。
 
 ### Unarchive
 
@@ -818,7 +822,7 @@ Archived
 → Open + Unloaded
 ```
 
-Workspace 和 exact Agent revision 在后续 load/admission 时重新验证。
+Workspace 和 exact Agent revision 在后续 load/admission 时重新验证。Unarchive只更新Session durable lifecycle，不写conversation entry。
 
 ### Delete
 
@@ -827,7 +831,7 @@ Archived + Unloaded
 → Deleted
 ```
 
-delete 不级联删除 Agent、Workspace files、fork children 或 sibling Sessions。
+delete 不级联删除 Agent、Workspace files、fork children 或 sibling Sessions。Delete只更新logical durable lifecycle；physical conversation file retention/purge是独立operations问题，不追加lifecycle terminal到JSONL。
 
 ## Fork Session
 
@@ -895,6 +899,8 @@ pending Interaction / 任何process-local SessionIngress lane
 ```
 
 fork使用staging + atomic publication。复制完成后执行tolerant replay并验证selected conversation path；不创建fork-specific terminal，也不合成ToolResult。selected path完整materialize后才能发布child；发布后的future recording failure不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。child发布为`Open + Unloaded`，future Load从copied transcript建立Idle view。
+
+child definition由本lifecycle owner从source durable SessionDefinition构造revision 1；conversation copy只包含selected User/Assistant/Tool、Interaction和Compaction facts，不复制source definition/metadata/lifecycle transition timeline。
 
 Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。具体ID算法和文本wire后续冻结。完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
@@ -1130,6 +1136,7 @@ Agent release channel
 - SessionDefinitionRevision原子绑定AgentRevisionRef、Workspace、SessionModelConfig和SessionPromptSelection；
 - Session 不持有 Runtime Service handle；
 - Session durable lifecycle 与 load/readiness/execution state 分离；
+- Agent/Session definition、metadata与durable lifecycle不写conversation JSONL；
 - Open 不等于 Loaded；Loaded 不等于 Ready；Ready 不等于 Running；
 - Deleted 是逻辑删除，Purge 才是物理清除；
 - archive/unload/delete 不使用同一个 close 语义；
@@ -1162,8 +1169,10 @@ Agent release channel
 - explicit Session Agent upgrade；
 - upgrade AgentId mismatch；
 - SessionDefinition update CAS；
+- loaded/unloaded definition与metadata update均不append conversation entry；
 - Workspace update 同时改变 WorkspaceRevision 和 SessionDefinitionRevision；
 - Open/Archived/Deleted transition；
+- Archive/Unarchive/Delete不需要Recorder或EntryIdGenerator，且不append lifecycle event；
 - archive loaded Session 返回 conflict；
 - delete 非 Archived/loaded Session 返回 conflict；
 - load single-flight，且 definition update 先赢时旧 load publication CAS 失败；
@@ -1196,6 +1205,7 @@ Agent release channel
 - fork不复制Snapshot/security signal/ToolSet/PromptSet/SkillView；
 - fork copied EntryId seed child collision guard，future EntryId由child live owner分配且不碰撞；
 - fork staging crash不发布target；conversation tail fork不恢复source执行状态或追加terminal；
+- fork只复制conversation path，child definition来自durable lifecycle staging且不含source lifecycle timeline；
 - loaded Session非Idle时Workspace definition update返回SessionBusy且不排队；
 - Idle Workspace update成功同时改变WorkspaceRevision和SessionDefinitionRevision并发布new Snapshot；
 - Workspace candidate resolve/commit失败保留old definition/Snapshot；
@@ -1240,5 +1250,6 @@ Agent release channel
 - [x] 定义 conservative crash recovery。
 - [x] 完成operation-centric Item、live Interaction和terminal cleanup类型。
 - [x] 完成Session ledger identity、entry parent tree、Fork保留历史ID、strict append与tolerant replay contract。
+- [x] 明确Agent/Session definition、metadata和lifecycle不进入conversation JSONL（ADR 0131）。
 - [x] 完成SessionExecutor owner和crate-private request interface。
 - [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。

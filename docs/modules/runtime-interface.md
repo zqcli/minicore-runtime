@@ -809,6 +809,8 @@ History node使用Turn/Item/message语义，不向普通UI暴露raw StoredSessio
 
 `ListTurns`与`GetTurn`中的历史Turn只是按recorded `TurnId`分组的conversation segment。它们可以返回User/Assistant/Tool/Interaction Items、timestamps和是否存在Final AgentMessage等稳定内容事实，但不返回`Running | Completed | Interrupted | Failed` execution status。current loaded Turn状态只从`SessionSnapshot.current_turn`和实时StateEvent读取。
 
+History query不返回或重放Session definition/metadata/lifecycle transition timeline。`GetAgent/GetAgentRevision/GetSession/GetSessionDefinition`从各自durable entity owner读取current或exact revision；conversation JSONL只提供message、Interaction和Compaction history。
+
 MVP只要求真正可能持续增长的`ListSessions`、`ListTurns`和大型catalog query支持分页。实际场景是长期Session包含数千个Turn，UI首次加载最近一段历史、向上滚动时继续读取；`GetTurn`、turn-scoped `ListItems`和`SessionSnapshot.active_items`首版完整返回，不为单个active Turn增加分页。分页Cursor保持opaque并绑定query family、filter、明确sort和revision；调用方不能把不同revision的page任意拼接。
 
 ### CommandSurfaceQuery
@@ -1101,6 +1103,7 @@ StateEvent本身始终是非durable observer record，不因payload来源不同�
 
 | 来源 | 例子 | restart后的恢复 |
 | --- | --- | --- |
+| durable entity owner | Agent/Session definition、metadata、Open/Archived/Deleted | 从entity head/revision恢复；旧StateEvent不回放，conversation JSONL不参与 |
 | live domain state | Turn terminal、Item、Interaction request/resolution、active conversation | 当前process立即可见；TurnStatus不恢复，只有recorded conversation facts能在restart后重建 |
 | process-local control | load/readiness、execution/phase、queue、settled、recording health、diagnostics | restart后消失、重置或由新状态替代 |
 
@@ -1111,6 +1114,7 @@ StateEvent规则：
 - subscriber queue无法继续、transport断开或publisher restart时发送Closed或直接终止stream，调用方重新subscribe并从新Snapshot恢复；
 - 不缓存StateEvent用于公开replay，也不接受caller-provided offset；
 - final domain StateEvent必须从成功live mutation派生。对应recordable conversation fact时，发送前完成inline record attempt；`TurnInterrupted`/`TurnFailed`没有record attempt，等待recordable settlement facts完成后发布；record outcome不提供durable acknowledgement；
+- Agent/Session definition与lifecycle StateEvent从对应durable entity mutation派生，不调用SessionRecorder，也不携带conversation EntryId；metadata专用event kind仍待本module public protocol freeze，但metadata同样不得写conversation JSONL；
 - process-local load/readiness/execution/phase/queue事实必须能从当前Runtime的对应Snapshot读取，但不承诺跨restart恢复；
 - `shared_resources_reloaded`和`command_catalog_invalidated`是query invalidation signal，不是独立状态；host收到后重新执行对应safe catalog query。若signal在断线期间丢失，新的Runtime Snapshot本身要求host按需重新query catalogs；
 - payload包含完整final view，能够校正之前丢失的ProgressEvent。
@@ -1671,6 +1675,7 @@ Public interface是 contract test surface。
 - history tree不暴露internal entry/event；
 - 长期Session的ListTurns分页可用于首次加载最近历史和向上滚动，cursor绑定sort与revision；
 - historical ListTurns/GetTurn按TurnId分组conversation且不返回execution status；
+- history query不从conversation JSONL返回Session definition/metadata/lifecycle timeline；
 - GetTurn、turn-scoped ListItems和active_items首版不分页；
 - SessionSnapshot读取immutable published view，active_items保持canonical Item顺序；
 - RuntimeSnapshot不等待所有SessionExecutor；
