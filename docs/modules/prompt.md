@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（ADR 0129后，生产实现待启动）
+状态：当前权威架构（ADR 0130后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -48,7 +48,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - PromptService 可以加载 Prompt-specific source，但不拥有 Workspace 生命周期或 trust 状态；
 - PromptService 不主动调用 ToolService 或 SkillService；
 - Session execution先取得`PromptResourceView`、`ToolPromptView`和`SkillPromptView`，再交给PromptService；
-- PromptSet 负责 `PromptIntent → CanonicalUserMessage`；
+- TurnExecutionContext异步解析captured Skill/Workspace contributions，PromptSet同步负责`UserMessageCompositionInput → CanonicalUserMessage`；
 - PromptSet 负责每次模型调用的最终 provider-neutral context assembly；
 - PromptSet在创建时绑定这些view，assembly时不再接受任意替代view；
 - 执行中变化的模型可见事实必须先进入sanitized live conversation，不保留arbitrary current-call contribution lane；
@@ -79,11 +79,16 @@ Turn execution orchestration
 ├─ SkillView.prompt_view()       → SkillPromptView
 └─ PromptService::for_turn(PromptTurnContext)
    └─ Arc<PromptSet>
-      ├─ compose_user_message(UserMessageCompositionInput)
-      │  └─ CanonicalUserMessage
-      └─ assemble(PromptAssemblyInput)
-         └─ AssembledModelContext
-            └─ ModelGateway
+
+User message resolution
+└─ await TurnExecutionContext.resolve_user_message(PromptIntent)
+   └─ PromptSet.compose_user_message(UserMessageCompositionInput)
+      └─ CanonicalUserMessage
+
+Model call assembly
+└─ PromptSet.assemble(PromptAssemblyInput)
+   └─ AssembledModelContext
+      └─ ModelGateway
 ```
 
 ## MiniCoreRuntime
@@ -398,6 +403,8 @@ impl PromptSet {
 
 PromptSet 在同一个 Turn 中不原地修改。shared Prompt source只能通过显式`/reload`发布新content；Workspace-bound Prompt source只能通过Session load、Idle definition update或显式`/reload workspace`发布。两者都只影响future PromptSet。`for_turn()`和`assemble()`只读取已经materialize的PromptContent，不访问filesystem/network、不按source locator或cache key查找正文。
 
+`compose_user_message()`同样是同步、确定、纯内存operation。它只接收TurnExecutionContext已经异步resolve并完成exact authorization的private input；不得调用SkillService、await source loader、读取current path或处理candidate cancellation。Cancel/SecurityRevoked与await后basis重验由Session Execution拥有。
+
 ## PromptProfile
 
 ```rust
@@ -507,7 +514,7 @@ impl PromptContributionStamp {
 
 CanonicalUserMessage、UserMessageCompositionInput和PromptContributionStamp字段/constructor保持private。CanonicalUserMessage只能由PromptSet成功规范化后创建，是可以进入live conversation并被best-effort record的标准值；它不是裸字符串，也不是与MessageRecord并列的第二份消息状态。live与storage共同使用同一个PromptContributionStamp类型，不定义`StoredPromptContributionStamp`。
 
-SkillIntent的完整Skill内容必须先由TurnExecutionContext使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。TurnExecutionContext确认全部required Workspace contributions成功后才构造composition input。PromptSet不读取Skill文件；它把SkillIntent与Skill contributions一一匹配，验证全部supplied Workspace contributions并规范化进MessageRecord。Skill缺失、stale selection、重复Skill、额外Skill contribution、required Workspace contribution失败或source mismatch时，整条composition在live apply前失败；不能创建部分用户消息。
+SkillIntent的完整Skill内容必须先由TurnExecutionContext的async `resolve_user_message()`使用本Turn捕获的SkillView entry调用SkillService加载，并经SkillInjector转换为PromptContribution。TurnExecutionContext确认全部required Workspace contributions成功后才构造composition input。PromptSet不读取Skill文件；它把SkillIntent与Skill contributions一一匹配，验证全部supplied Workspace contributions并规范化进MessageRecord。Skill缺失、stale selection、重复Skill、额外Skill contribution、required Workspace contribution失败或source mismatch时，整条composition在live apply前失败；不能创建部分用户消息。
 
 canonical content顺序固定为：非空body产生的顶层parts在前；Skill contributions按intent顺序；Workspace contributions按`(WorkspaceRootKey, WorkspaceRelativePath)`排序。每个contribution形成一个独立顶层`MessageContent` part，且恰有一个stamp。`content_part_index`是`MessageRecord.content`顶层part数组的零基`u32`索引，不是byte、Unicode scalar、grapheme或rendered text offset；body part不带contribution stamp。`body = Empty`只在至少存在一个合法contribution时有效。
 
@@ -669,7 +676,7 @@ MiniCoreRuntime 启动
 
 candidate Turn admission
 ├─ shared publication gate克隆PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
-├─ SkillService.for_turn(captured resources, context) → Arc<SkillView> → SkillPromptView
+├─ SkillService.for_turn(captured resources, Arc<SkillViewContext>) → Arc<SkillView> → SkillPromptView
 └─ ToolService.for_turn(captured tool resources, context) → Arc<ToolSet> → ToolPromptView
 
 三个view均就绪
@@ -677,10 +684,10 @@ candidate Turn admission
 → Arc<PromptSet>
 
 用户输入
-→ TurnExecutionContext.compose_input/compose_steer(PromptIntent)
-→ 内部按需load Skill / SkillInjector.build
+→ await TurnExecutionContext.resolve_user_message(PromptIntent)
+→ 从captured SkillView按需load / SkillInjector.build
 → 构造crate-private UserMessageCompositionInput
-→ PromptSet.compose_user_message(...)
+→ PromptSet.compose_user_message(...)（同步纯内存）
 → CanonicalUserMessage
 → apply live initiating UserMessage + inline record attempt
 
@@ -737,7 +744,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 | Arc<PromptSet> | Turn 执行上下文 |
 | ToolPromptView | ToolSet 投影 |
 | SkillPromptView | SkillView 投影 |
-| LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext保证view来源和读取授权 |
+| LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext async resolve保证view来源和读取授权 |
 | PromptContribution → live MessageRecord | PromptSet 输入规范化 |
 | conversation | Session conversation owner |
 | CanonicalUserMessage / final context assembly | PromptSet |
@@ -756,6 +763,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - PromptSet在创建时固定PromptResourceView、ToolPromptView和渲染后的SkillPromptView metadata；
 - PromptService 不主动调用 ToolService、SkillService 或 ModelGateway；
 - PromptSet 不执行 Tool、不加载 Skill、不读写 conversation storage；
+- PromptSet compose/assemble均同步纯内存；async contribution resolve与cancel/revalidation不进入Prompt module；
 - Runtime required policy不进入selection，不可被Agent或Session关闭；
 - Prompt role只保留System和User；Runtime/Agent可信行为进入System，Session/Workspace/Skill进入User；
 - Workspace file readable 不等于可作为 Prompt source；
@@ -778,6 +786,7 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Text body + one Skill、empty body + one Skill和ordered multiple Skills产生稳定part顺序；
 - duplicate SkillId、captured Skill缺失/删除、source mismatch或required Workspace contribution失败时不apply部分UserMessage；
 - reload发生在active Turn期间时，Steer继续从captured SkillView加载旧entry；future Turn使用new view；
+- resolve等待Skill load时Cancel/SecurityRevoked由Session execution终止caller，迟到cache结果不能进入PromptSet/live conversation；
 - Workspace contributions按`WorkspaceRootKey + WorkspaceRelativePath`稳定排序；
 - Unicode正文、emoji和Image等结构化part不影响`content_part_index`关联；
 - stamp不包含绝对路径、canonical root、trust、authorization、hash、cache key或正文引用；

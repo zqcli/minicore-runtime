@@ -955,6 +955,8 @@ Host希望在长Turn中修改Workspace时，显式执行`Cancel → wait session
 
 Tool start与SecurityRevoked的first-wins/settlement合同由[INV-401](../architecture.md#跨模块不变量索引)定义；Workspace只拥有authority fact、Snapshot invalidation和重新resolve。本节不重复ToolOperationSlot状态机。
 
+Starting/Steer composition正在await captured Skill parse时，SecurityRevoked使对应candidate/active basis失效。SkillService可以完成cache parse，但Session Execution在live apply前必须丢弃迟到`CanonicalUserMessage`；old authority不能通过已完成的async result绕过hard restriction。
+
 managed hard deny、trust/policy store降级或host安全事件可以在active Turn期间触发`SecurityRevoked`，但它不是definition patch，也不创建假的WorkspaceRevision或SessionDefinitionRevision：
 
 1. WorkspaceAuthority或host发布current authority/policy事实；
@@ -1243,6 +1245,7 @@ upload / telemetry
 - Starting SecurityRevoked在Input live apply前取消candidate且不创建Turn；apply后绑定同一Turn、阻止task spawn，并在Input publication后发布live TurnInterrupted；
 - terminal后使用current definition/current authority重新resolve，success Ready、failure Unavailable；
 - security signal先赢时迟到model/tool/source结果不进入后续LiveConversation；
+- security signal先赢时迟到Input/Steer composition result不apply UserMessage或spawn task；
 - crash后不恢复security cause或旧TurnStatus；
 - 同root两个Session的cwd/grant和security operation basis隔离；
 - WorkspacePromptContext、WorkspaceSkillContext、WorkspaceAccessView和WorkspaceToolContext只能由同一个`Arc<WorkspaceSnapshot>`私有投影，不能跨Snapshot拼接；

@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0127后，生产实现待启动）
+状态：当前权威架构（ADR 0130后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -25,6 +25,8 @@
 - `LiveSessionState`是current-process live truth；
 - `SessionRecorder`顺序inline append有序best-effort前缀；
 - complete Tool exchange由live conversation reducer判定；
+- Starting capture/composition由control actor拥有的可取消future驱动，不创建第二个execution owner；
+- Input与Steer共享TurnExecutionContext async `resolve_user_message()`，PromptSet normalize保持同步；
 - Steer只在safe point消费；FollowUp只在旧task结束后启动；
 - Cancel立即ack，Running Tool继续truthful settle；
 - logical retry和backoff是task-local状态；
@@ -143,6 +145,17 @@ pub enum SessionExecutionState {
 }
 ```
 
+```rust
+pub(crate) struct StartingCandidate {
+    command_id: CommandId,
+    turn_id: TurnId,
+    control_generation: u64,
+    observed_emergency_epoch: u64,
+}
+```
+
+`StartingCandidate`只是control actor私有target/basis，不是领域Turn、后台task或durable record。candidate在任何async capture/composition前安装，使`Cancel(Submit(command_id))`覆盖整个Starting窗口。
+
 - `Idle`：没有ActiveTurnTask，可admit Submit/FollowUp或更新Workspace definition；
 - `Starting`：正在capture context、安装live Input、等待其record attempt或发布`TurnStarted`；
 - `Running`：ActiveTurnTask存在；
@@ -166,9 +179,11 @@ phase只用于live Snapshot/Progress，不持久化。
 ```text
 Submit accepted by control actor
 → reserve TurnId and control_generation
+→ install StartingCandidate + Submit CommandId emergency target
 → create Turn-scoped Tool execution control handle
-→ capture TurnExecutionContext with same control handle + SessionFileMutationQueue
-→ compose CanonicalUserMessage
+→ pin async capture TurnExecutionContext + resolve_user_message(intent) future
+→ Starting subloop selects future / Cancel / SecurityRevoked / Lifecycle
+→ future wins: revalidate candidate target + control_generation + emergency epoch + current authority
 → LiveSessionState validates + allocates EntryId + binds parent_id
 → apply live Input + Turn Running
 → await SessionRecorder.record(entry)
@@ -176,6 +191,10 @@ Submit accepted by control actor
 → spawn ActiveTurnTask
 → return SubmitAccepted { turn_id }
 ```
+
+control actor在Starting subloop中继续处理out-of-band Emergency/Lifecycle signals，不持有live-state、Agent/Session lifecycle、Workspace或publication guard跨await。Cancel/SecurityRevoked在Input apply前先赢时，actor drop capture/composition future、退休candidate并完成原Submit内部cancel/revoked settlement；不创建领域Turn，也不spawn ActiveTurnTask。其public typed response映射由Runtime protocol freeze单独定义。
+
+resolve future返回不授予apply权。actor必须重新确认same `command_id + turn_id + control_generation`、observed emergency epoch仍current、Agent/Session仍可执行且Workspace authority未被hard-revoke；任一不匹配直接丢弃结果。SkillService shared cache parse可以继续，但不能反向发布UserMessage。
 
 Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
 
@@ -354,7 +373,9 @@ ActiveTurnTask只在以下safe point消费一条FIFO Steer：
 
 ```text
 pop one Steer
-→ resolve全部intent contributions并compose CanonicalUserMessage
+→ capture active TurnId/control_generation/ConversationRevision basis
+→ select Emergency/Lifecycle vs context.resolve_user_message(intent)
+→ resolve wins: revalidate same basis and captured Context
 → composition失败时不apply部分Steer
 → success才apply live UserMessage(source=Steer)
 → await inline record attempt
@@ -362,6 +383,8 @@ pop one Steer
 ```
 
 WaitingApproval、WaitingForUserInput、Sampling和Running Tool期间不消费。
+
+Steer resolve期间control actor仍可接收后续Steer/FollowUp/Interaction与sticky emergency signal。shared/Workspace reload不替换active Context；successful resolve只使用old captured Skill bytes。Cancel/SecurityRevoked先赢或basis改变时drop result，不apply部分Steer，也不把该intent重新排到队尾。
 
 candidate final与Steer admission通过control actor的owner-local arbitration排序。该线性化点是内存control decision，不是Session record。
 
@@ -401,9 +424,11 @@ Starting candidate尚未spawn ActiveTurnTask时，accepted Cancel阻止spawn，�
 
 Cancel response不等待recording或settlement。
 
+若Cancel在Starting capture/composition await期间、Input apply前先赢，control actor立即drop该future并退休candidate；Skill load/cache的迟到结果没有apply capability。若Input已apply，则继续使用上一段的`TurnStarted`后interruption顺序。
+
 ## SecurityRevoked
 
-SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。Starting阶段在Input live apply前取消candidate且不创建Turn；Input已apply时绑定同一Turn、阻止task spawn，并在Input publication后完成live `TurnInterrupted(SecurityRevoked)`。task结束后SessionExecutor使用current definition/authority重新resolveWorkspace；失败时进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。
+SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。Starting capture/composition await阶段在Input live apply前取消candidate、drop future且不创建Turn；Input已apply时绑定同一Turn、阻止task spawn，并在Input publication后完成live `TurnInterrupted(SecurityRevoked)`。task结束后SessionExecutor使用current definition/authority重新resolveWorkspace；失败时进入`SessionReadiness::Unavailable(WorkspaceUnavailable)`。
 
 recording failure不会产生Unavailable。
 
@@ -498,6 +523,11 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - 同一Session same-file FIFO、different-file parallel，跨Session同physical target不协调；
 - Steer safe-point和final arbitration；
 - Interaction oneshot与Cancel；
+- Starting async Skill load期间Cancel/SecurityRevoked先赢时无live Input、无Turn、无task spawn；
+- resolve返回后candidate/control/emergency/authority任一stale都丢弃结果；
+- Input已apply后的Starting Cancel仍先发布TurnStarted再Interrupted；
+- Steer resolve期间reload不改变captured bytes，Cancel/SecurityRevoked或revision变化使结果失效；
+- composition await不持有live/lifecycle/Workspace guard；
 - retry backoff被Cancel/SecurityRevoked打断；
 - slow append只延迟同Session finalization，其他Session与sticky EmergencyControl仍可推进；
 - recording failure后Snapshot/StateEvent仍反映live state；

@@ -3,6 +3,8 @@
 状态：Accepted
 日期：2026-07-31
 
+> [ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)进一步冻结本ADR的执行seam：TurnExecutionContext异步加载captured Skill并构造composition input，PromptSet同步原子规范化，Session Execution处理Starting/Steer cancellation与await后重验。
+
 ## 背景
 
 Prompt Q4尚未冻结`SkillIntent`、`UserMessageCompositionInput`和recorded contribution stamp的精确字段。旧草案把Text、Template、Skill和Composite放在同一个递归`PromptIntent` enum中，并用字符offset把Skill/Workspace来源关联到最终正文。

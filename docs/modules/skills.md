@@ -1,6 +1,6 @@
 # Skill 子系统架构设计
 
-状态：当前权威架构（ADR 0129后，生产实现待启动）
+状态：当前权威架构（ADR 0130后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -41,6 +41,7 @@ Injection 层把已加载 Skill 转换为本轮 Prompt contribution
 - Turn 对象不保存任何 Skill 字段；
 - 哪一个 Turn 在执行期间需要哪个 Skill，由 Turn execution 决定；
 - TurnExecutionContext使用捕获的SkillView及其context通过SkillService请求Skill；
+- Input/Steer的async resolve只发生在TurnExecutionContext，PromptSet保持同步纯内存；
 - `SkillInjector` 只负责把已经加载的 Skill 转换成 Prompt contribution；
 - Prompt 负责把 Skill contribution 与其他输入组装成最终模型上下文；
 - 已加载 Skill 内容是不可变值；
@@ -64,9 +65,10 @@ loaded Session execution
 └─ Runtime 注入 Arc<SkillService>
 
 TurnExecutionContext
-├─ SkillViewContext
+├─ Arc<SkillService>
+├─ Arc<SkillViewContext>
 ├─ Arc<SkillView>
-└─ SkillService::load(&context, &entry)
+└─ SkillService::load(&view, &entry)
       └─ Arc<LoadedSkill>
          └─ SkillInjector
             └─ PromptContribution
@@ -186,12 +188,12 @@ impl SkillService {
     pub(crate) async fn for_turn(
         &self,
         resources: Arc<SkillResourceView>,
-        context: SkillViewContext,
+        context: Arc<SkillViewContext>,
     ) -> Result<Arc<SkillView>, SkillError>;
 
-    pub async fn load(
+    pub(crate) async fn load(
         &self,
-        context: &SkillViewContext,
+        view: &SkillView,
         entry: &SkillEntry,
     ) -> Result<Arc<LoadedSkill>, SkillLoadError>;
 
@@ -202,11 +204,11 @@ impl SkillService {
 
 `capture_workspace_sources()`只接受Workspace candidate私有投影出的`WorkspaceSkillCaptureContext`，只能在其中authorized Skill roots内discover/read并返回immutable captured values。它不发布SkillView或WorkspaceSnapshot；Session lifecycle负责在Workspace resolve、Prompt capture和Skill capture全部成功后一次发布new Snapshot。
 
-`load()`必须：
+`for_turn()`把exact `Arc<SkillViewContext>`私有绑定进返回的SkillView。`load()`必须：
 
 - 使用Turn捕获的`SkillEntry.location`定位source；
-- 使用与该view相同的`SkillViewContext`；
-- 在lazy parse前校验entry属于传入的captured SkillViewContext且source authorization/provenance一致；
+- 使用传入SkillView绑定的exact `SkillViewContext`；
+- 在lazy parse前校验entry确实属于传入的captured SkillView，且source authorization/provenance一致；
 - 不查询reload后的shared root或future SkillView；
 - 不按path重新读取current file。
 
@@ -292,6 +294,7 @@ SkillView是渐进披露的第一阶段：模型可见部分只包含轻量metad
 
 ```rust
 pub struct SkillView {
+    context: Arc<SkillViewContext>,
     entries: Arc<[SkillEntry]>,
 }
 
@@ -307,9 +310,14 @@ pub struct SkillMetadata {
     pub path: PathBuf,
     pub scope: SkillScope,
 }
+
+impl SkillView {
+    pub(crate) fn context(&self) -> &Arc<SkillViewContext>;
+    pub fn entries(&self) -> &[SkillEntry];
+}
 ```
 
-`SkillView::entries()`返回不可变entry。Turn捕获`Arc<SkillView>`后不再查询shared current root或构建future view；模型可见projection只暴露必要metadata，省略location、authorization和captured bytes。
+`SkillView::entries()`返回不可变entry；crate-private `context()`返回创建该view的exact context Arc。Turn捕获`Arc<SkillView>`后不再查询shared current root或构建future view；模型可见projection只暴露必要metadata，省略location、authorization和captured bytes。
 
 `SkillScope` 只作为 metadata 和 filtering 输入，不定义层级、覆盖或优先级语义：
 
@@ -420,7 +428,8 @@ cache 规则：
 
 - 同一个 key 返回同一个或等价的不可变 `Arc<SkillContent>`；
 - content cache不保存process-local cancellation/security signal；
-- 每次`load()`都校验entry来源与exact authorization/provenance，再从captured bytes解析或读取cache并包装新的`LoadedSkill`；TurnExecutionContext在await前后验证current Turn、execution_version、current operation和TurnControl basis；
+- 每次`load()`都校验entry属于传入SkillView且source authorization/provenance一致，再从captured bytes解析或读取cache并包装新的`LoadedSkill`；SessionExecutor/ActiveTurnTask在resolve await后验证candidate或active Turn target、control_generation、ConversationRevision和EmergencyControl basis；
+- drop某个load waiter不发布部分LoadedSkill；shared parse/cache工作可以继续，但只有仍current且通过owner重验的resolve caller可以使用结果；
 - 不同Session或source grant可以共享相同正文bytes，但不能共享错误provenance；
 - cache不改变SkillMetadata或已经返回的SkillView；
 - cache eviction不改变任何已返回view；
@@ -489,19 +498,19 @@ MiniCoreRuntime 启动
 → 捕获authorized source bytes并解析轻量 metadata
 
 Turn admission
-→ 使用pinned WorkspaceSkillContext构造SkillViewContext
-→ SkillService.for_turn(captured SkillResourceView, ...)
+→ 使用pinned WorkspaceSkillContext构造Arc<SkillViewContext>
+→ SkillService.for_turn(captured SkillResourceView, context.clone())
 → 得到Arc<SkillView>
-→ TurnExecutionContext捕获view和context
+→ TurnExecutionContext捕获SkillService、view和同一个context Arc
 
 输入规范化需要 Skill
 → PromptIntent.skills[]提供ordered SkillId
 → TurnExecutionContext从捕获的SkillView取得exact SkillEntry
-→ SkillService.load(&context, &entry)
+→ await SkillService.load(&view, &entry)
 → cache hit，或从captured bytes解析并缓存完整内容
 → SkillInjector.build(loaded_skill)
 → 构造UserMessageCompositionInput
-→ PromptSet验证一一匹配并compose_user_message(...)
+→ PromptSet同步验证一一匹配并compose_user_message(...)
 → live UserMessage / Steer + record attempt
 
 模型触发的 Skill Tool
@@ -572,7 +581,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 | Skill discovery/filter/cache/invalidation | SkillService |
 | SkillResourceView candidate build/validation、SkillView创建和cache | SkillService |
 | complete SharedResourceRoots publication | MiniCoreRuntime |
-| 本Turn捕获的SkillView | TurnExecutionContext |
+| 本Turn捕获的SkillService/SkillViewContext/SkillView binding | TurnExecutionContext |
 | Skill metadata | SkillService / SkillView |
 | 完整Skill内容 | SkillService content cache |
 | 某次执行选择哪个Skill | Turn execution |
@@ -589,11 +598,12 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - SkillView的模型可见投影不包含完整正文；entry私有持有captured source bytes；
 - 完整正文只能通过SkillService从captured bytes按需解析；
 - Turn execution不能直接读取Skill文件；
-- TurnExecutionContext捕获SkillViewContext和`Arc<SkillView>`；
+- TurnExecutionContext捕获`Arc<SkillService>`、`Arc<SkillViewContext>`和绑定该context的`Arc<SkillView>`；
 - Workspace Skill的capture只能通过携带该context的source adapter seam，load只能解析captured entry bytes；
 - SkillInjector不能决定选择哪个Skill；
 - SkillContributionRef把SkillId和exact source authorization贯穿到composition前校验；PromptSet只把SkillId投影为safe part-level stamp；
 - Prompt 不能执行 Skill discovery 或 load；
+- Input与Steer只通过TurnExecutionContext async `resolve_user_message()`加载Skill；PromptSet composition保持同步纯内存；
 - 用户侧显式SkillIntent/SkillInjection必须进入live UserMessage或Steer并完成inline record attempt，不创建独立Item；模型触发的Skill Tool创建ToolInvocation Item，输出进入live role=tool message，并在同一assistant全部ToolCall拥有matching result后随complete exchange进入conversation，不能作为current-call旁路；
 - SkillService 不决定哪个 Turn 使用哪个 Skill；
 - cache和load state不进入领域对象；
@@ -604,6 +614,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 
 5. **Skill invocation与Item边界已由ADR 0129关闭**：用户显式Skill选择属于UserMessage/Steer规范化，不创建Item；模型触发的Skill Tool继续创建ToolInvocation Item。
 6. **SkillInjection、UserMessageCompositionInput和recorded stamp格式已由ADR 0129关闭**：SkillIntent只保存SkillId；exact source ref只做process-local校验；每个contribution对应一个顶层part和safe stamp。
+7. **async composition seam已由ADR 0130关闭**：TurnExecutionContext绑定SkillService/context/view，Session execution在Starting/Steer await前后处理Cancel、SecurityRevoked和basis重验，PromptSet不执行load。
 
 ## 后续问题
 
@@ -625,7 +636,7 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - [x] 确定完整 Skill 内容由 SkillService 按需加载、解析和缓存。
 - [x] 确定 SkillService 管理 discovery、filtering、cache、invalidation 和 diagnostics。
 - [x] 确定 Turn execution 决定本次执行使用哪个 Skill。
-- [x] 确定TurnExecutionContext捕获SkillViewContext和Arc<SkillView>。
+- [x] 确定TurnExecutionContext捕获SkillService、Arc<SkillViewContext>和绑定该context的Arc<SkillView>。
 - [x] 确定 SkillInjector 只负责 LoadedSkill 到 PromptContribution 的转换。
 - [x] 确定用户侧Skill contribution必须固化到User/Steer entry；Skill Tool输出通过tool message和complete Tool exchange进入conversation。
 - [x] 确定reload和cache eviction不修改已经返回的不可变LoadedSkill。
@@ -637,4 +648,5 @@ SkillService保存结构化diagnostics。SkillView可以包含有效entries并�
 - [ ] 定义 SkillScope。
 - [ ] 定义 SkillName 冲突和 namespace 规则。
 - [x] 定义用户显式Skill invocation不创建Item、模型Skill Tool创建ToolInvocation Item，以及UserMessageCompositionInput和safe part-level PromptContribution stamp最终形状。
+- [x] 定义Input/Steer共享async resolve seam、load waiter cancellation与await后owner重验（ADR 0130）。
 - [ ] 定义 watcher、reload、cache eviction 和失败重试策略。

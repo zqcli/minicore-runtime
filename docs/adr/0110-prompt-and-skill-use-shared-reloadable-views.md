@@ -9,6 +9,8 @@
 
 > 2026-07-31：[ADR 0129](0129-user-message-contributions-use-part-level-safe-provenance.md)关闭Prompt Q4：用户body与ordered SkillIntent正交；exact source authorization只用于composition前校验，conversation只保留safe part-level provenance。
 
+> 2026-07-31：[ADR 0130](0130-user-message-composition-resolves-skills-asynchronously.md)冻结async composition seam：TurnExecutionContext绑定SkillService/context/view并异步解析captured Skill；PromptSet保持同步纯内存，Starting/Steer cancellation与await后重验由Session Execution拥有。
+
 ## 背景
 
 V2评审C1、C2、C4暴露了三处不必要复杂度：PromptDefinition被复制到Agent/Session scope并通过多层override解析；Prompt同时保留三种instruction role；SkillCatalog使用revision、version和exact content hash承担严格漂移恢复。

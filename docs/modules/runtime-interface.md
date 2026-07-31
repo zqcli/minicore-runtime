@@ -422,7 +422,7 @@ pub enum PublicCancelTarget {
 - `Steer`只作用于expected Running Turn；成功进入该Turn的bounded `SteerQueue<TurnId>`后返回`Queued`；
 - `FollowUp`进入bounded process-local FIFO；返回`Queued`；
 - `CancelQueuedMessage`只删除尚在Steer/FollowUp FIFO中的目标消息；未找到统一返回typed `QueuedMessageNotQueued`，不区分从未排队与已经出队，消息不会重新入队；
-- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Starting持续到Input record attempt与`TurnStarted` publication完成，因此Input已live apply但response尚未发布时仍可按CommandId取消。该Cancel绑定同一Turn、阻止ActiveTurnTask spawn，并在Input publication后完成live interruption；调用方收到`TurnStarted`后使用`TurnId`取消；
+- `Cancel(Submit(command_id))`允许取消该CommandId对应、尚处于排队或Starting admission的Submit；Starting覆盖async context capture/Skill composition、Input live apply、record attempt与`TurnStarted` publication。Input apply前Cancel使candidate resolve future失效且不创建Turn；Input已live apply但response尚未发布时仍绑定同一Turn、阻止ActiveTurnTask spawn，并在Input publication后完成live interruption；调用方收到`TurnStarted`后使用`TurnId`取消；
 - `Cancel(TurnId)`通过per-session target-scoped sticky`EmergencyControl`校验active Turn target并发布cancel epoch；成功后立即返回typed`CancelAccepted`，不等待普通work lane、Tool settlement或terminal publication；stale target不影响新Turn；
 - Cancel current Turn清理该Turn尚未append的Steer，默认保留FollowUp，并在Finishing期间继续允许新的FollowUp进入bounded FIFO；停止全部queued work需要未来显式`StopAll`/`ClearQueuedMessages`能力；
 - Turn terminal后迟到Steer或Cancel返回typed stale/terminal outcome。
@@ -546,7 +546,7 @@ Command response不是完整业务完成流：
 - `SessionForked.source`精确报告该Fork使用`LiveSnapshot`还是`RecordedHistory`；同一值保存在child durable provenance；
 - `TurnStarted`只表示initiating UserMessage已live apply并完成当前record attempt，领域Turn已在当前loaded Session创建；它不是durable Turn-start receipt；
 - Turn最终`Completed | Interrupted | Failed`由StateEvent发布；
-- `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
+- `CancelAccepted`只表示target仍可取消且sticky cancel epoch已经发布。Input live apply前它使正在进行的capture/composition future失效并取消candidate；Input已apply但`TurnStarted`尚未发布时，它绑定同一Turn并阻止task spawn；active Turn中则与live Completed decision first-wins，accepted后Completed不得再赢。Tool清理和Turn terminal通过后续StateEvent/Snapshot观察；
 - `SteerQueued`和`FollowUpQueued`只表示当前Runtime的对应SessionIngress lane已接收，不承诺crash-safe delivery；restart后未append的消息消失，host以新Snapshot为准；真正append通过普通UserMessage/Turn StateEvent观察；
 - `SessionLoaded`在load/recovery完成并原子发布latest SessionSnapshot后返回；recording health从随后显式`Snapshot(Session)`或subscription首帧读取，不内联进unit outcome；
 - slash command的display-neutral结果可以直接放入`CommandOutput`；
@@ -565,7 +565,7 @@ Command response不是完整业务完成流：
 | Load Session | single-flight load/recovery完成并发布readiness |
 | Reload Workspace | Session Idle校验、Workspace resolve和Workspace-bound Prompt/Skill source capture全部完成后替换Snapshot；非Idle返回SessionBusy |
 | Unload Session | LifecycleControl完成grace/fail-closed task settlement并从loaded map移除；Recorder无后台drain |
-| Submit | initiating UserMessage live apply与inline record attempt |
+| Submit | async captured contribution resolve完成并通过candidate/control/emergency/authority重验后，initiating UserMessage live apply与inline record attempt |
 | Steer Queued | target Turn的SteerQueue admission |
 | FollowUp | FollowUpQueue admission |
 | CancelQueuedMessage | target仍在任一FIFO时remove；否则返回QueuedMessageNotQueued |
@@ -1404,15 +1404,17 @@ CLI / TUI / Tauri backend
 → Runtime校验exact Agent status和SessionDefinitionRevision
 → SessionExecutionHandle
 → per-session SessionIngress.TurnAdmissionQueue
-→ SessionExecutor reserves candidate Turn
+→ SessionExecutor installs Starting candidate/Submit emergency target
 → WorkspaceResolver.resolve()
 → shared publication gate克隆PromptResourceView / SkillResourceView / ToolResourceView / ModelCatalogView
 → ModelGateway.resolve_for_turn(captured catalog)
-→ SkillService.for_turn(captured resources)
+→ create Arc<SkillViewContext>
+→ SkillService.for_turn(captured resources, context.clone())
 → ToolService.for_turn(captured tool resources)
 → PromptService.for_turn()
 → TurnExecutionContext
-→ PromptSet.compose_user_message()
+→ await TurnExecutionContext.resolve_user_message()（内部同步调用PromptSet.compose_user_message）
+→ revalidate candidate/control/emergency/authority basis
 → LiveSessionState.apply(UserMessage source=Input + Turn Running)
 → await SessionRecorder.record
 → CommandResponse::TurnStarted { turn_id }
@@ -1637,6 +1639,7 @@ Public interface是 contract test surface。
 - duplicate in-flight Submit使用相同CommandId加入同一completion，不创建第二个candidate；
 - 相同CommandId携带不同command返回CommandConflict；
 - Cancel(Submit CommandId)关闭排队或Starting admission；Input已live apply但TurnStarted尚未发布时仍绑定同一Turn并阻止task spawn，target退休或restart后返回NotFound且不影响future Turn；
+- Starting async Skill load期间Cancel/SecurityRevoked使迟到composition result失效；Input apply前无Turn/task，apply后保持TurnStarted→Interrupted顺序；
 - Steer expected TurnId与per-Turn FIFO Queued；CancelQueuedMessage只remove一条/NotQueued；
 - FollowUp bounded queue和restart loss；
 - 普通work lane满时Cancel仍可进入EmergencyControl并触发取消；
@@ -1656,6 +1659,7 @@ Public interface是 contract test surface。
 - `/model`和`/thinking`生成new SessionDefinitionRevision；
 - `/skill code-review task`解析为Text body加一个SkillId selection，不产生Skill/Composite variant；
 - duplicate SkillId在边界拒绝，exact captured Skill失败不apply部分UserMessage；
+- Submit与Steer共享async captured Skill resolve；reload期间Steer继续使用old bytes，resolve await不持有ordinary state guard；
 - 用户显式Skill选择不创建Item，模型Skill Tool仍创建ToolInvocation Item；
 - `/compact`不在catalog。
 
