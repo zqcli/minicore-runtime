@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129已冻结用户消息contribution与safe part-level provenance；仓库仍无Rust生产实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；仓库仍无Rust生产实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -30,7 +30,7 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 - [Conversation Recording与Replay](conversation-storage.md)：SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork。
 - [Session执行](session-execution.md)：SessionExecutor actor、ActiveTurnTask、async run loop、Steer/FollowUp/Cancel。
 - [ModelGateway](model-gateway.md)：TurnModelSnapshot、single provider attempt、stream、usage和typed errors。
-- [Compaction](compaction.md)：live rolling summary、single marker和best-effort recording。
+- [Compaction](compaction.md)：revision-bound stable units、Runtime settings、source+cut marker、summary budget与best-effort recording。
 
 ## 权威归属
 
@@ -51,13 +51,12 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)中剩余的V4-P0-5 Compaction stable-unit/settings/provenance contract；P0-1至P0-4与P1-4已关闭；
-2. 冻结public/runtime/storage wire schema与必要MVP限制；
-3. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
-4. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
-5. 加入recording slow-write/failure与cold replay fixtures；
-6. 实现overflow → CompactionSummary → live Replace → inline best-effort record；
-7. 完成Rig 0.40.0 provider spike和mock-server tests；
-8. production Tool/Sandbox adapter前关闭O1/R7。
+1. 联合关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-1/V4-P1-2，冻结Runtime public payload与wire/storage format v1；全部V4-P0与P1-4已关闭；
+2. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
+3. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
+4. 加入recording slow-write/failure与cold replay fixtures；
+5. 实现overflow → CompactionSummary → live Replace → inline best-effort record；
+6. 关闭V4-P1-3并完成Rig 0.40.0 provider spike和mock-server tests；
+7. production Tool/Sandbox adapter前关闭O1/R7。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

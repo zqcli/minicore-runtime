@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract。
 
 权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -44,6 +44,12 @@ loaded Session的current-process truth，保存live conversation、Turn、Item�
 
 **LiveConversationView**：
 PromptSet可消费的sanitized只读view。只包含provider-valid messages；incomplete、orphan或abandoned-first Tool exchange被排除。
+
+**LiveCompactionSourceView**：
+Live reducer额外提供的crate-private immutable Compaction projection。绑定SessionId与ConversationRevision，并把User、无ToolCall Assistant、完整Tool exchange和leading rolling summary分组成EntryId-bearing stable units；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。它不携带token estimate或settings。
+
+**CompactionSettingsSnapshot**：
+Turn admission从Runtime-global validated CompactionSettings捕获的immutable policy。MVP无hot reload或per-Session override；默认pressure reserve 4096、summary output 512–2048、minimum reclaim 2048、每Turn最多4次Compaction、summary safety reserve 512。
 
 **ConversationRevision**：
 process-local单调版本，每次model-visible live mutation递增。ModelCallRequest、logical retry和CompactionPlan使用它验证stale result。它不持久化，不跨restart比较。
@@ -164,7 +170,7 @@ Gateway的一次terminal success或typed failure。ActiveTurnTask验证live basi
 Model stream的process-local AgentMessage/Reasoning累积buffer。ProgressEvent使用stable ItemId；provider final成功后apply为live Item并完成inline record attempt。
 
 **CompactionPlan**：
-从sanitized LiveConversation和ConversationRevision构建的immutable plan。summary成功后先Replace live conversation，再best-effort record StoredCompaction。
+从exact `LiveCompactionSourceView`、Turn-captured settings、Prompt assembly bases和TurnModelSnapshot basis构建的immutable plan。只保存source + stable-unit cut，summary prefix、retained suffix和`first_kept_entry_id`均由cut派生；summary成功后先分配Compaction EntryId并Replace live conversation，再best-effort record StoredCompaction。automatic model-call provenance始终为Some。
 
 ## Turn、Item与Interaction
 
@@ -255,9 +261,9 @@ cold recovery Turn terminalization
 
 ## 当前开放问题
 
-- 第四轮评审：V4-P0-1至P0-4与V4-P1-4已关闭；当前唯一未关闭P0是Compaction stable-unit source/settings/provenance（V4-P0-5）；
-- V4-P1-1至P1-3仍开放：Runtime public payload、wire/storage envelope和production provider scope/Rig现实映射；
-- wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction；
+- 第四轮评审：全部V4-P0与V4-P1-4已关闭；V4-P1-1至P1-3仍开放；
+- V4-P1-1至P1-3：Runtime public payload、wire/storage envelope和production provider scope/Rig现实映射；
+- wire/schema freeze：serde casing、public IDs、Timestamp/Money、StoredCompaction format-v1；
 - EntryId算法与public文本wire；
 - Rig 0.40.0 provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。

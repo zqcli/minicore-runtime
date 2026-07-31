@@ -2,14 +2,14 @@
 
 状态：Open；Rust实现前需关闭本文对应门禁
 日期：2026-07-31
-范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0129、migration、research和前三轮review/handoff
+范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0132、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
-关闭进度：V4-P0-1至P0-4与V4-P1-4 Closed；V4-P0-5、V4-P1-1至P1-3和V4-C0-1 Open。ADR 0130/0131是本review关闭过程中新增的Accepted决议。
+关闭进度：V4-P0-1至P0-5与V4-P1-4 Closed；V4-P1-1至P1-3和V4-C0-1 Open。ADR 0130–0132是本review关闭过程中新增的Accepted决议。
 
 ## 总体结论
 
-ADR 0126–0131确定的主方向继续成立：
+ADR 0126–0132确定的主方向继续成立：
 
 ```text
 SessionExecutor control actor
@@ -23,7 +23,7 @@ Rig = ModelGateway private ProviderAdapter
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-本review创建时识别出五个P0；当前前四项已经关闭。剩余P0是Compaction无法从current source view产生可重放marker，settings与model-call provenance仍未闭合；P1仍集中在Runtime public payload、wire/storage envelope和production provider scope。
+本review创建时识别出的五个P0现已全部关闭。剩余P1集中在Runtime public payload、wire/storage envelope和production provider scope；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
 
 严重度定义：
 
@@ -39,7 +39,7 @@ Rig = ModelGateway private ProviderAdapter
 | V4-P0-2 | P0 | Closed | Tool call/outcome/start state与mutation queue contract未统一 | complete Tool exchange前 |
 | V4-P0-3 | P0 | Closed | Prompt/Skill composition的sync/async与capture ownership无法闭合 | Submit/Steer Skill path前 |
 | V4-P0-4 | P0 | Closed | conversation JSONL仍含无合法single-producer owner的Session definition/lifecycle events | storage schema前 |
-| V4-P0-5 | P0 | Open | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
+| V4-P0-5 | P0 | Closed | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
 | V4-P1-1 | P1 | Open | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
 | V4-P1-2 | P1 | Open | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
 | V4-P1-3 | P1 | Open | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
@@ -253,7 +253,9 @@ StoredCompaction
 
 ## V4-P0-5 · Compaction source/settings/provenance contract未闭合
 
-### 发生场景
+状态：Closed（2026-07-31）。ADR 0132冻结reducer-owned revision-bound stable units、Runtime-global Turn-captured settings、完整Pressure/Plan input、source+cut marker derivation和automatic model-call provenance。
+
+### 关闭前场景
 
 Compaction planner从sanitized live conversation选择prefix cut，并保存summary后的第一个exact retained entry：
 
@@ -261,7 +263,7 @@ Compaction planner从sanitized live conversation选择prefix cut，并保存summ
 first_kept_entry_id: Option<EntryId>
 ```
 
-current source无法提供该值：
+关闭前source无法提供该值：
 
 - `docs/modules/compaction.md:95-105`要求plan包含`first_kept_entry_id`；
 - `docs/modules/compaction.md:109-115`声明source只来自`LiveConversationView`；
@@ -282,7 +284,7 @@ current source无法提供该值：
 - settings来源不同会使同一Turn的trigger、budget和retry上限漂移；
 - StoredCompaction encoder/decoder与ModelGateway无法共享唯一schema。
 
-### 推荐决议
+### 已采纳决议
 
 1. LiveConversation提供private compaction source projection，按provider-valid stable unit携带exact origin：
 
@@ -291,28 +293,29 @@ struct LiveCompactionUnit {
     first_entry_id: EntryId,
     messages: Arc<[ModelMessage]>,
     kind: CompactionUnitKind,
-    estimated_tokens: u64,
 }
 
 struct LiveCompactionSourceView {
+    session_id: SessionId,
     revision: ConversationRevision,
     units: Arc<[LiveCompactionUnit]>,
 }
 ```
 
-complete Tool exchange必须是一个unit；rolling summary unit的origin是对应StoredCompaction entry。Compaction从unit boundary直接取得marker，不从ModelMessage反查。
+complete Tool exchange是一个unit；rolling summary unit的origin是对应StoredCompaction outer entry。Compaction从`source + summarized_unit_count`派生marker，不从ModelMessage反查。review草案中的`estimated_tokens`没有进入reducer view：estimate改由Compaction使用Turn-pinned TokenEstimator计算并保存在plan proof中，避免conversation projection变成model-specific state。
 
-2. 在Compaction canonical owner定义Runtime-global `CompactionSettings`及Turn-captured immutable snapshot，至少冻结enable/pressure reserve、summary min/max output、minimum reclaimed tokens、max compactions per turn和safety reserve的类型/default。
-3. 定义唯一`StoredCompactionModelCall`，覆盖ADR 0123与ModelGateway列出的safe字段。Conversation Storage只引用，不复制第二定义。
-4. `CompactionPressureInput`、`CompactionPlanInput`和`LiveCompactionSourceView`给出完整private shape。
+2. `CompactionSettings`是validated Runtime startup config，Turn admission捕获immutable snapshot。默认值冻结为enabled=true、pressure reserve=4096、summary min/max=512/2048、minimum reclaimed=2048、max Compactions per Turn=4、summary safety reserve=512。
+3. `CompactionPressureInput`与`CompactionPlanInput`完整携带exact source、captured settings、Prompt AgentRun/Summary bases、Turn model basis、trigger和per-Turn count；cut同时验证summary-call budget、post-Replace headroom和minimum reclaim。
+4. Compaction唯一拥有`StoredCompactionModelCall` semantic schema：model、response ID、usage、finish reason、requested max output、logical retry count和allowlisted provider metadata。automatic path总是`Some`。
+5. 新增INV-005：apply要求exact Session/control/plan/request/revision，LiveSessionState在record前分配Compaction EntryId并安装new rolling-summary origin；cold replay只接受stable-unit first-entry marker。权威决议见[ADR 0132](../adr/0132-compaction-derives-markers-from-live-stable-units.md)与[Compaction](../modules/compaction.md)。
 
-### 关闭条件
+### 关闭验证
 
-- 重复文本消息fixture仍产生exact marker；
-- complete Tool exchange无法被cut或marker切开；
-- settings从Runtime config capture到Turn的路径唯一；
-- automatic StoredCompaction `model_call = Some`且encoder/decoder字段与ModelGateway一致；
-- marker missing/orphan/ignored replay fixtures继续通过。
+- [x] 重复文本消息fixture按不同EntryId产生exact marker；
+- [x] complete Tool exchange是不可拆unit，marker不能指向ToolResult；
+- [x] settings从Runtime config到Turn snapshot只有一条capture路径；
+- [x] automatic StoredCompaction `model_call = Some`且semantic fields与ModelGateway一致；
+- [x] marker missing/orphan/ignored/first-unit与later-valid replay fixtures进入canonical Test Matrix。
 
 ## V4-P1-1 · Runtime public protocol缺少可恢复、可操作的完整payload
 
@@ -460,7 +463,7 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 
 ## V4-C0-1 · Sandbox enforcement条件性P0继续有效
 
-这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0131关闭。
+这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0132关闭。
 
 production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capability classes。最终PermissionSet要求与adapter enforceable capabilities的差集非空时，必须生成PreExecution Denied ToolResult并拒绝side effect。approval不能把不可强制限制转换为裸执行许可，Sandbox失败也不能静默fallback到无Sandbox执行。
 
@@ -483,13 +486,12 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 ## 当前继续顺序
 
-已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5。
 
-1. V4-P0-5：冻结Compaction stable-unit source、settings和StoredCompaction provenance。
-2. V4-P1-1/V4-P1-2：一次完成public protocol与wire/schema freeze。
-3. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
-4. V4-P1-3：执行Rig spike并冻结production provider scope。
-5. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
+1. V4-P1-1/V4-P1-2：一次完成public protocol与wire/schema freeze。
+2. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
+3. V4-P1-3：执行Rig spike并冻结production provider scope。
+4. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
 
 ## 第四轮关闭定义
 
