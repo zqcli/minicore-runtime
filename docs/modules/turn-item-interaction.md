@@ -1,6 +1,6 @@
 # Turn、Item 与 Interaction 架构设计
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 日期：2026-07-31
 
 ## 目的
@@ -150,7 +150,7 @@ rules：
 - Reasoning只返回provider允许display的summary，不返回encrypted/signature/hidden chain-of-thought；
 - Tool arguments/result由Tool-owned redaction policy产生bounded summary，不返回prepared args、raw details、credential或sandbox internals；
 - public summary construction失败时使用typed redacted placeholder，不fallback raw payload；
-- string/count limits和serde shape由V4-P1-2冻结。
+- string/count/aggregate limits和serde shape由[Wire Schema](wire-schema.md#protocollimits-v10)拥有；
 
 Item顺序由live conversation顺序和assistant content顺序决定；不增加DisplaySequence。
 
@@ -305,9 +305,20 @@ pub(crate) enum InteractionResolution {
     UserAnswer(UserQuestionAnswer),
     Cancelled(InteractionCancelReason),
 }
+
+pub enum InteractionCancelReason {
+    HostCancelled,
+    TurnCancelled,
+    SecurityRevoked,
+    SessionUnloaded,
+    RuntimeClosing,
+    TurnTerminal,
+}
 ```
 
-`InteractionResolutionKey`的bytes由Presentation Adapter使用CSPRNG生成；field保持private，public constructor校验/接受exact 16 bytes，Debug/Display不得输出raw value。V4-P1-2只冻结其wire text encoding，不改变128-bit carrier或request scope。
+`InteractionResolutionKey`的bytes由Presentation Adapter使用CSPRNG生成；field保持private，public constructor校验exact 16 bytes，Debug/Display不得输出raw value；wire使用[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)的`irk_<32 hex>`。
+
+`InteractionCancelReason`是live/storage-safe closed taxonomy；subscriber disconnect、elapsed time和user silence没有variant，因为它们不自动resolve。public `InteractionResolutionInput::Cancelled`映射HostCancelled；其他variants只能由对应control/lifecycle owner产生。
 
 `resolution_key = Some`只用于host `InteractionCommand::Resolve`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
 
@@ -425,6 +436,7 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - incomplete/abandoned/duplicate/conflicting exchange；
 - ToolStartGate vs Cancel/SecurityRevoked；
 - Interaction request/resolution ordering与host-generated resolution key idempotency/conflict；
+- InteractionCancelReason只允许Host/Turn/Security/Unload/Runtime/Terminal owner causes，silence/disconnect不产生reason；
 - non-secret Text/SingleChoice validation，secret/password variant不可构造；
 - recording degraded时Tool/Interaction继续；
 - crash造成request/result缺失后的replay，且不合成Turn terminal；

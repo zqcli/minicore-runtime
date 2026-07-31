@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 
 ## 目的
 
@@ -458,9 +458,26 @@ pub enum ReasoningPreference {
     Medium,
     High,
 }
+
+pub struct ModelResponseSummary {
+    pub provider_id: ProviderId,
+    pub model_id: ModelId,
+    pub reasoning: ModelReasoningSummary,
+    pub service_class: ModelServiceClass,
+}
+
+pub enum ModelReasoningSummary {
+    ProviderDefault,
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
 ```
 
-`Auto`使用model definition validated default；其他variant是provider-neutral explicit preference。unsupported Disabled/effort在Turn model resolution时返回typed capability error，不由adapter silent downgrade；provider-specific effort name或extra level不能进入SessionDefinition。P1-3负责把这些closed values映射到首版provider protocol。
+`Auto`使用model definition validated default；其他variant是provider-neutral explicit preference。unsupported Disabled/effort在Turn model resolution时返回typed capability error，不由adapter silent downgrade；provider-specific effort name或extra level不能进入SessionDefinition。
+
+`ModelResponseSummary`是普通Assistant与Compaction provenance共用的唯一portable actual-model descriptor。它保存实际ProviderId/ModelId、effective reasoning和service class，不保存ModelDefinitionVersion、endpoint、auth、client、catalog generation或private execution ref。provider-specific extra effort无法映射closed summary时model definition不可用于portable recording，不能塞进metadata raw map。P1-3负责把这些closed values映射到首版provider protocol。
 
 ### ResolveTurnModelRequest
 
@@ -659,9 +676,21 @@ pub enum OutputContract {
     NoToolCalls,
     Structured(StructuredOutputContract),
 }
+
+pub struct StructuredOutputContract {
+    name: Option<String>,
+    schema: BoundedJsonSchema,
+}
+
+impl StructuredOutputContract {
+    pub fn name(&self) -> Option<&str>;
+    pub fn schema(&self) -> &BoundedJsonSchema;
+}
 ```
 
 `NoToolCalls`不是普通prompt text。请求中的`tools`必须为空；provider支持显式tool-choice/allowed-tools禁用时adapter同时设置该字段。若provider允许在未声明Tool时仍返回可执行ToolCall，Gateway必须返回`UnexpectedToolCall`，不能把它交给ActiveTurnTask执行。
+
+`StructuredOutputContract` constructor要求optional name满足[stable symbolic key](wire-schema.md#stable-symbolic-keys)共同floor并进一步限制为1..64 bytes；schema必须通过BoundedJsonSchema、ModelGateway supported-keyword validation，并与exact TurnModelSnapshot `max_schema_bytes`取更小cap。schema root必须是object schema；remote ref、network lookup、unbounded regex与provider-only raw option不能进入contract。
 
 `Structured`在MVP中同样要求`tools`为空。provider-native strict schema只是第一层约束；Gateway仍必须对terminal text执行exact JSON parse和本地schema validation。MVP不做JSON repair、type coercion或Markdown code-fence extraction。需要Tool的AgentRun先完成普通ToolRound，之后再使用新的Structured `ModelCallRequest`取得terminal structured response。
 
@@ -947,7 +976,7 @@ pub struct FinalizedAssistantResponse {
 
 ```rust
 pub enum FinalizedAssistantContent {
-    Reasoning(FinalizedReasoning),
+    Reasoning(ReasoningContent),
     Text {
         text: Arc<str>,
     },
@@ -955,7 +984,7 @@ pub enum FinalizedAssistantContent {
         provider_item_id: Option<ProviderItemId>,
         tool_call_id: ToolCallId,
         name: ToolName,
-        arguments: Value,
+        arguments: BoundedJsonObject,
         index: u32,
     },
 }
@@ -990,7 +1019,7 @@ ToolCall仅在`output_contract = None`且request tools非空时允许。validati
 7. `Structured`必须规范化为exact一个非空Text block（Reasoning可另存），该Text可直接解析为JSON并满足schema；否则返回`InvalidStructuredOutput`；
 8. `Unknown`只用于adapter已经证明该provider无法可靠提供native finish reason的情况；若协议要求finish但wire缺失，必须返回`InvalidProviderResponse`。
 
-可解析为JSON `Value`但不符合matching `ToolSpec` schema的arguments不是Response Validation error。该ToolCall在允许Tool的调用中保持valid model action，随后由ToolSet preflight形成failed ToolResult；Gateway不得把它改写为`InvalidProviderResponse`或`InvalidStructuredOutput`。
+可解析为BoundedJsonObject但不符合matching `ToolSpec` schema的arguments不是Response Validation error。该ToolCall在允许Tool的调用中保持valid model action，随后由ToolSet preflight形成failed ToolResult；Gateway不得把它改写为`InvalidProviderResponse`或`InvalidStructuredOutput`。
 
 规范决策表如下；若同时命中多行，按上述validation顺序选择更早的error：
 
@@ -1009,19 +1038,29 @@ ToolCall仅在`output_contract = None`且request tools非空时允许。validati
 
 通过validation后，ToolCall presence决定ActiveTurnTask进入Tool path还是candidate arbitration。ModelGateway不执行Tool，也不决定Turn terminal。
 
-### FinalizedReasoning
+### ReasoningContent
 
 ```rust
-pub struct FinalizedReasoning {
-    pub text: Option<Arc<str>>,
-    pub summary: Option<Arc<str>>,
-    pub encrypted: Option<Arc<str>>,
-    pub signature: Option<Arc<str>>,
-    pub provider_item_id: Option<ProviderItemId>,
+pub struct ReasoningContent {
+    text: Option<Arc<str>>,
+    summary: Option<Arc<str>>,
+    encrypted: Option<Arc<str>>,
+    signature: Option<Arc<str>>,
+    provider_item_id: Option<ProviderItemId>,
+}
+
+impl ReasoningContent {
+    pub fn text(&self) -> Option<&str>;
+    pub fn summary(&self) -> Option<&str>;
+    pub fn encrypted(&self) -> Option<&str>;
+    pub fn signature(&self) -> Option<&str>;
+    pub fn provider_item_id(&self) -> Option<&ProviderItemId>;
 }
 ```
 
-只保存provider实际返回且允许replay/display的artifact。不得：
+`ReasoningContent`在ModelGateway validation后就是唯一live/storage-safe reasoning artifact shape；fields/constructor保持private，Conversation Storage直接复用该type，不定义`StoredReasoning` shadow DTO。`text | summary | encrypted | signature`至少一个为Some；provider_item_id只是auxiliary correlation，不能单独构成content。text<=262,144 bytes、summary<=131,072、encrypted<=262,144、signature<=16,384，provider_item_id遵守opaque ID limit。
+
+不得：
 
 - 保存hidden chain-of-thought；
 - 根据token usage生成reasoning text；
@@ -1080,6 +1119,8 @@ pub struct ModelUsage {
     pub reported_cost: Option<Money>,
 }
 ```
+
+`Money`使用[Wire Schema Money](wire-schema.md#money)，all u64 token/count carrier使用[Wire Schema u64 rule](wire-schema.md#revisions)；`reported_cost`必须non-negative。
 
 规则：
 
@@ -1573,7 +1614,7 @@ encode/write失败时，assistant live mutation保留，recording health转为De
 
 ## Recording Contract
 
-SessionRecorder可以在`StoredAssistantMessage`中保存safe `ModelResponseSummary`：实际`ProviderId + ModelId`、必要generation settings和allowlisted provider metadata。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
+SessionRecorder可以在`StoredAssistantMessage`中保存safe `ModelResponseSummary`：actual `ProviderId + ModelId + ModelReasoningSummary + ModelServiceClass`。response ID、finish reason、effective max output、usage、logical retry和allowlisted ProviderResponseMetadata是StoredAssistantMessage的独立fields，不属于ModelResponseSummary。它用于recorded history显示和reasoning artifact解释，不要求old `ModelDefinitionVersion`或retained catalog definition在cold replay时仍可解析；active Turn和旧TurnModelSnapshot不跨restart恢复。
 
 实际record成功的assistant entry保存：
 
@@ -1695,8 +1736,12 @@ opaque encrypted reasoning
 - unsupported role fail closed；
 - User/Assistant/Tool order保持；
 - reasoning/text/tool call content order保持；
+- ReasoningContent至少一个field且各artifact byte/opaque ID limits；
+- ModelResponseSummary只含portable actual provider/model/reasoning/service class；
 - orphan ToolResult拒绝；
 - ToolSpec schema/name mapping；
+- BoundedJsonSchema exact byte/depth/node/ref/keyword boundary，remote ref拒绝；
+- finalized ToolCall arguments必须是BoundedJsonObject且超limit在ModelGateway validation失败；
 - ToolChoice None/Auto/Required/Specific；
 - JSON schema/output contract；
 - NoToolCalls和Structured携带非空tools时constructor拒绝；

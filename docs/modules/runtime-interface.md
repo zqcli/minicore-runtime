@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0133后，生产实现待启动）
+状态：当前权威架构（ADR 0134后，生产实现待启动）
 
 ## 目的
 
@@ -165,6 +165,8 @@ MiniCoreRuntime
 - `EntryId`：Session history tree identity，由`LiveSessionState` private Session-scoped generator在apply前分配并由Recorder原样保存；默认不作为普通UI mutation input；Fork复制历史EntryId，因此其唯一性scope是Session；
 - `CommandId`：public command correlation和in-flight dedup identity；Submit的CommandId同时标识领域Turn创建前的process-local admission candidate；
 
+ID/revision的exact typed-prefix carrier、scope-preserving decode和Timestamp/u64规则由[Wire Schema](wire-schema.md#shared-scalar-carriers)统一拥有。public Rust newtype仍使cross-type value无法构造；wire prefix在JSON boundary提供第二层检查。
+
 不公开：
 
 - `RunId`；
@@ -204,7 +206,7 @@ pub enum EventRoute {
 }
 ```
 
-Rust内部优先使用route enum，使非法坐标组合无法构造。Wire adapter可以投影为flat fields，但必须保持单一权威route。
+Rust内部优先使用route enum，使非法坐标组合无法构造。Wire严格使用[ADR 0134 adjacent-tagged enum](wire-schema.md#enum-representation)，不得由adapter改投影为另一套flat route fields。
 
 ## Command
 
@@ -248,9 +250,9 @@ pub enum RuntimeLifecycleCommand {
 | `WorkspaceRootSpec`、`WorkspaceCwdSpec`、`RequestedFilesystemAccess`、`WorkspaceSourcePolicy` | [Workspace](workspace.md) |
 | `SessionModelConfig` | [Agent/Session Lifecycle](agent-session-lifecycle.md)；其中Model leaf由[ModelGateway](model-gateway.md)拥有 |
 | `ToolApprovalDecisionInput`、`UserQuestionAnswer`及question value types | [Tools](tools.md#approval-and-question-types) |
-| `InteractionResolutionKey` | [Turn / Item / Interaction](turn-item-interaction.md#interaction) |
+| `InteractionResolutionKey`、`InteractionCancelReason` | [Turn / Item / Interaction](turn-item-interaction.md#interaction) |
 
-这些owner公开的是同一个Rust semantic type，不是Runtime-local shadow DTO。owner-assigned ID/revision/timestamp、private PermissionSet、source authorization和executor handle仍不能经这些leaf进入command。ProviderId/ModelId等base identity carrier与Workspace path的wire text encoding属于V4-P1-2；这里已经冻结其domain owner与field relation，不抢先复制或编码。
+这些owner公开的是同一个Rust semantic type，不是Runtime-local shadow DTO。owner-assigned ID/revision/timestamp、private PermissionSet、source authorization和executor handle仍不能经这些leaf进入command。ProviderId/ModelId等base identity carrier与Workspace path的exact wire text由[Wire Schema](wire-schema.md#shared-scalar-carriers)统一拥有。
 
 ### AgentCommand
 
@@ -455,7 +457,7 @@ pub struct PromptIntentInput {
 }
 ```
 
-`PromptIntentInput`没有独立Skill、Composite或Template variant。MVP body只允许`Empty | Text(TextIntent)`；Text必须在boundary normalization后non-empty并满足ProtocolLimits。SkillIntent只携带SkillId；slash name和GUI catalog selection必须先resolve为SkillId。Runtime边界执行shape/size与重复SkillId校验；exact Skill存在性、captured source读取与authorization由TurnExecutionContext在Submit admission或Steer safe point完成。任一composition失败都不apply部分UserMessage；具体PromptError到command/event的映射使用本module canonical table。serde tag/casing由通用wire freeze统一决定。
+`PromptIntentInput`没有独立Skill、Composite或Template variant。MVP body只允许`Empty | Text(TextIntent)`；Text必须在boundary normalization后non-empty并满足ProtocolLimits。SkillIntent只携带SkillId；slash name和GUI catalog selection必须先resolve为SkillId。Runtime边界执行shape/size与重复SkillId校验；exact Skill存在性、captured source读取与authorization由TurnExecutionContext在Submit admission或Steer safe point完成。任一composition失败都不apply部分UserMessage；具体PromptError到command/event的映射使用本module canonical table。serde tag/casing使用[Wire Schema JSON v1](wire-schema.md#json-v1-conventions)。
 
 ```rust
 pub enum TurnCommand {
@@ -616,7 +618,7 @@ pub struct CommandOutput {
 }
 ```
 
-MVP `CommandOutput`只承载bounded、redacted plain text；不承载HTML、ANSI escape、Markdown action、embedded RuntimeCommand或credential。rich catalog/help数据使用typed QueryResult。string limit与wire encoding由V4-P1-2冻结。
+MVP `CommandOutput`只承载bounded、redacted plain text；不承载HTML、ANSI escape、Markdown action、embedded RuntimeCommand或credential。rich catalog/help数据使用typed QueryResult。exact 65,536-byte limit与safe-text wire由[Wire Schema ProtocolLimits](wire-schema.md#protocollimits-v10)拥有。
 
 ```rust
 pub enum CommandOutcome {
@@ -1307,7 +1309,7 @@ pub struct SessionDiagnosticsView {
 }
 ```
 
-Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Submit/Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot。每个request variant只能返回同family中matching result variant；mismatch是Runtime invariant failure，不降级为空值。domain CAS revision直接存在于`AgentSummary`、`SessionSummary`或definition result中，不再增加未定义generic `QueryRevision`。`PageCursor`是Runtime生成、caller只能原样回传的bounded opaque string carrier，绑定exact query family/filter/sort和捕获时immutable query snapshot：durable catalog query绑定captured owner revision，shared或Session-scoped resource query绑定captured immutable resource view。它不公开reload generation/fingerprint；Runtime可以在cursor内认证编码或使用bounded process-local cursor store，具体wire由V4-P1-2冻结。cursor在restart、eviction或scope unload后返回StaleCursor。`PageRequest.limit`超过ProtocolLimits时返回InvalidArgument。
+Query不发布Event、不创建Turn、不加载完整SessionExecutor来读取持久化目录，也不消费Submit/Steer/FollowUp queue。Query的多个独立调用不承诺形成跨调用原子Snapshot。每个request variant只能返回同family中matching result variant；mismatch是Runtime invariant failure，不降级为空值。domain CAS revision直接存在于`AgentSummary`、`SessionSummary`或definition result中，不再增加未定义generic `QueryRevision`。`PageCursor`使用[Wire Schema exact `pc1_` carrier与4096-entry/15-minute bounded store](wire-schema.md#interaction-key与cursor)，绑定exact family/filter/sort/captured immutable snapshot；restart、expiry、eviction或scope unload返回StaleCursor。`PageRequest.limit`超过ProtocolLimits时返回InvalidArgument。
 
 ### Common Read Views
 
@@ -1641,7 +1643,7 @@ pub struct SessionUsageView {
     pub reasoning_tokens: Option<u64>,
     pub cache_read_tokens: Option<u64>,
     pub cache_write_tokens: Option<u64>,
-    pub reported_cost: Option<Money>,
+    pub reported_costs: Vec<Money>,
 }
 
 pub struct SessionQueueView {
@@ -1680,6 +1682,8 @@ pub enum SessionRecordingState {
     Degraded,
 }
 ```
+
+`reported_costs`按currency升序，每currency最多一个checked aggregate，最多8项。不同currency不能coerce为一个Money；某currency decimal overflow时省略该currency并产生bounded usage diagnostic。若出现超过8种currency，确定性保留lexicographically first 8并产生`usage_currency_limit_exceeded` diagnostic。`model_calls`和`compaction_calls`受JSONL 1,000,000-entry hard cap约束并用checked increment，因此始终可表示；每个optional token aggregate发生u64 overflow时该field变None并产生diagnostic，其他fields仍保留。所有u64 wire使用[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md) canonical decimal string。
 
 wire固定为object + string state：
 
@@ -1938,7 +1942,7 @@ StateEvent规则：
 
 上述kind enum是主要event family的typed schema。每条StateEvent携带该scope mutation后的完整scope Snapshot；Runtime durable catalog mutation额外携带single changed entity summary，SessionEventDetail只承载SessionSnapshot无法表达但对本次transition有用的safe correlation信息。
 
-event semantic labels（lowercase rendering is provisional until V4-P1-2 fixes enum tagging/casing）：
+event semantic labels（ADR 0134 exact snake_case values）：
 
 ```text
 agent_created
@@ -1985,7 +1989,7 @@ command_catalog_invalidated
 
 failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved或Compaction record path，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。Turn terminal本身不触发recording failure，但会携带当时最新recording state。
 
-MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；V4-P1-2必须把它们映射为三个distinct wire variants，不得折叠成未定义的`turn_finished`形状。Rust semantic payload保持`Completed | Interrupted | Failed` typed union。
+MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；ADR 0134把它们编码为三个distinct snake_case wire variants，不得折叠成未定义的`turn_finished`形状。Rust semantic payload保持`Completed | Interrupted | Failed` typed union。
 
 ### ProgressEvent
 
@@ -2103,7 +2107,9 @@ pub enum InteractionRequestView {
 pub enum InteractionResolutionView {
     ToolApproval(ToolApprovalResolutionView),
     UserAnswer(UserQuestionAnswer),
-    Cancelled,
+    Cancelled {
+        reason: InteractionCancelReason,
+    },
 }
 
 pub enum ToolApprovalResolutionView {
@@ -2403,24 +2409,9 @@ Transport request id不能替代CommandId、TurnId或RequestId。
 
 ## Version 与 Capability
 
-Rust public types使用一个明确protocol major。Wire adapter初始化时交换：
+ProtocolHello、ProtocolWelcome、ProtocolReject、version selection、capability token和nested ProtocolLimits的唯一wire shape位于[Wire Schema · Public Protocol V1.0](wire-schema.md#public-protocol-v10)。Runtime Interface只拥有capability的业务可用性，不复制第二套bootstrap DTO或serde规则。
 
-```rust
-pub struct ProtocolHello {
-    pub supported_versions: Vec<ProtocolVersion>,
-    pub client: ClientInfo,
-    pub capabilities: ClientCapabilities,
-}
-
-pub struct ProtocolWelcome {
-    pub selected_version: ProtocolVersion,
-    pub runtime: RuntimeInfo,
-    pub capabilities: RuntimeCapabilities,
-    pub limits: ProtocolLimits,
-}
-```
-
-MVP capability示例：
+MVP exact version为`1.0`，capabilities为：
 
 ```text
 state_events
@@ -2435,11 +2426,10 @@ session_fork
 
 兼容规则：
 
-- major改变允许breaking payload change；
-- minor只做additive field、event或capability；
-- optional feature必须通过capability协商；
-- adapter不能根据runtime version字符串猜测字段；
-- deprecated字段先标记并至少保留一个明确兼容周期；
+- adapter按Wire Schema选择highest mutually supported exact version，无交集typed reject，不silent downgrade；
+- Runtime只发送selected minor声明的fields/variants；client defensively忽略unknown output field，但unknown variant是protocol error；
+- optional feature必须通过capability intersection；
+- adapter不能根据runtime implementation version字符串猜测字段；
 - experimental capability不进入stable default surface。
 
 Core in-process interface通过`RuntimeQuery::GetCapabilities`读取同一能力视图，不额外要求transport handshake。
@@ -2644,6 +2634,7 @@ Public interface是 contract test surface。
 - Snapshot中每个Submit entry可用Cancel(Submit)定位，每个Steer/FollowUp可用CancelQueuedMessage定位；Starting转TurnStarted后Submit CommandId消失并由current TurnId成为cancel target；
 - RuntimeSnapshot不等待所有SessionExecutor；每个new Runtime Snapshot后host必须重新分页ListAgents/ListSessions，恢复断线期间durable catalog变化；
 - pending Interaction可从SessionSnapshot恢复，request足以完整渲染并构造合法Resolve；private approval option map不进入Snapshot；
+- usage replay按currency分组、mixed currency不合并、decimal/u64 overflow产生bounded diagnostic且不wrap；
 - Healthy/Degraded两态JSON wire稳定，Create无recording opt-out且每次Load都尝试初始化Recorder；
 - Degraded Snapshot始终携带至少一条当前脱敏recording diagnostic；
 - snapshot-first subscription的首帧Snapshot与后续事件无缺口、无旧事件回放。
@@ -2671,7 +2662,7 @@ Public interface是 contract test surface。
 - Snapshot替换有序live Items并清空provisional Items；
 - Runtime restart从JSONL tolerant replay开始，局部坏行/orphan/不完整Tool exchange通过diagnostic呈现；旧TurnStatus不恢复，也不把Snapshot当作execution checkpoint；
 - Interaction request live apply/record-attempt-before-notify和resolution live apply/record-attempt-before-resume；
-- InteractionResolved携带safe resolution detail；same-key idempotent retry不发布第二event；
+- InteractionResolved携带safe resolution detail，包括closed cancellation reason；same-key idempotent retry不发布第二event；
 - elapsed time和subscriber缺失不产生Interaction resolution；
 - UserQuestion event只携带non-secret Text/SingleChoice request；UI提交validated UserAnswer后恢复同一Turn而不是创建UserMessage；
 - Pending UserQuestion可由SessionSnapshot重建展示，Session A等待不影响Session B事件推进；
