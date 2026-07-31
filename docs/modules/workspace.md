@@ -1226,7 +1226,7 @@ upload / telemetry
 - Tool write request 被 Workspace read-only ceiling 拒绝；
 - Tool approval不能扩大WorkspaceAccessView；
 - Tool executor 不能访问 WorkspaceAccessView 或为未声明 path 重新授权；
-- 不同 Session 使用不同 root anchor 指向同一目标时仍竞争同一文件锁；
+- 不同Session即使通过不同root anchor指向同一physical target也使用各自的SessionFileMutationQueue，不互相等待；fixture明确展示可能并发与lost update；
 - create/rename target 使用 nearest-existing-ancestor 校验，并覆盖 symlink race；
 - cwd 位于 source-denied root 时不自动获得 Prompt/Skill source grant；
 - Workspace Prompt source在Session load、Idle definition update或`/reload workspace`时捕获immutable content；SecurityRevoked后重新resolve时不复用不匹配的新authority basis；

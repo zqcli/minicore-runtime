@@ -5,6 +5,8 @@
 
 > 2026-07-30：failure taxonomy与owner-local recovery保留；StateEvent和Turn progression从live state派生，Session recording failure降级health而不终止Turn。
 
+> 2026-07-31：`ToolExecutionError`收缩为Tools implementation内部分类；跨module只返回唯一`ToolExecutionOutcome`。pre-execution exact failure映射为truthful ToolResult，post-start outcome unknown映射为Abandoned。
+
 ## 背景
 
 MiniCore已经为Model、Tool、Storage、Workspace、Prompt、Skill和Compaction定义了局部typed error或truthful outcome，但缺少一条统一的跨模块规则，说明raw external failure、module error、Session recovery、durable terminal和public projection如何衔接。Issue O9首先暴露了该问题：Provider返回unexpected ToolCall、invalid structured output或finish/content不一致时，可能被分别解释成request error、provider protocol error或transient retry。

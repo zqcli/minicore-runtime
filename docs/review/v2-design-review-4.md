@@ -96,27 +96,28 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 
 ## V4-P0-2 · Tool contract未统一
 
-### 发生场景
+状态：Closed（2026-07-31）。Tools现为ToolCall/Request/Outcome唯一owner，Session Execution拥有唯一ToolOperationSlot与SessionFileMutationQueue，Turn/Item只保留投影和complete exchange；所有pre-execution exact outcome统一生成truthful ToolResult。
 
-模型返回一个schema-invalid call、approval deny或Cancel-before-start。ToolSet必须产生truthful pre-execution ToolResult，使complete exchange可以闭合。current modules给出互斥表示：
+### 关闭前场景
 
-- `docs/modules/tools.md:176-204`：
+模型返回一个schema-invalid call、approval deny或Cancel-before-start。ToolSet必须产生truthful pre-execution ToolResult，使complete exchange可以闭合。关闭前modules给出互斥表示：
+
+- Tools旧定义：
   - `ToolCall { id, name, arguments, index }`；
   - `ToolExecutionOutcome::Completed { item_id, call_id, source, result } | Abandoned { ... }`。
-- `docs/modules/turn-item-interaction.md:115-121`：
+- Turn/Item旧ToolCall定义：
   - `ToolCall { item_id, tool_call_id, name, arguments }`。
-- `docs/modules/turn-item-interaction.md:209-214`：
+- Turn/Item旧outcome定义：
   - `Completed(ToolResult) | PreExecutionFailed(...) | CancelledBeforeStart | Abandoned(...)`。
-- `docs/modules/tools.md:390-405`明确pre-execution deny/failure/cancel返回`Completed { source = PreExecution, result.disposition = Failed | Denied | Cancelled }`。
+- Tools原有pre-execution规则明确deny/failure/cancel返回`Completed { source = PreExecution, result.disposition = Failed | Denied | Cancelled }`。
 
 第二套outcome把pre-execution failure与cancel表达成无`ToolResult`的独立variant，无法直接满足`INV-003`“全部matching truthful ToolResult后才model-visible”。
 
-邻接状态也未闭合：
+关闭前邻接状态也未闭合：
 
-- `docs/modules/turn-item-interaction.md:138-155`定义`ToolOperationState`；
-- `docs/modules/session-execution.md:295-299`定义另一套`ToolOperationSlot`；
+- Turn/Item定义`ToolOperationState`，Session Execution定义另一套`ToolOperationSlot`；
 - ADR 0116要求SessionExecutor拥有`SessionFileMutationQueue`并让ToolSet持共享引用；
-- current `SessionExecutor`字段（`session-execution.md:78-87`）和`ToolTurnContext`字段（`tools.md:233-241`）都没有mutation queue注入点；
+- `SessionExecutor`和`ToolTurnContext`都没有mutation queue注入点；
 - `ToolTurnContext.execution_control`写为由ActiveTurnTask注入，但ToolSet在ActiveTurnTask spawn前的Turn capture期间构造。
 
 ### 影响
@@ -127,7 +128,7 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 - Tool start/Cancellation的first-wins状态会在两个enum中漂移；
 - Session-local mutation FIFO无法接入真实ToolSet，ADR 0116无法实施。
 
-### 推荐决议
+### 已采纳决议
 
 1. Tools拥有唯一execution input/output类型；Turn/Item模块只消费并投影，不重新定义。
 2. pre-execution所有exact outcome统一返回`Completed { source = PreExecution, result }`；`Abandoned`只表示已经无法得到truthful ToolResult的outcome unknown。
@@ -136,7 +137,7 @@ Turn Execution Context只说明它如何调用private constructor并链接ModelG
 5. SessionExecutor显式拥有`Arc<SessionFileMutationQueue>`。ToolSet capture通过private `ToolTurnContext`取得queue和actor-owned `ToolExecutionControl` handle，或在`execute()`时接收一个统一execution context；不得依赖ActiveTurnTask尚未存在时“由task注入”。
 6. `ToolExecutionError`只作为Tools内部分类，并明确映射到PreExecution ToolResult、Executed ToolResult或Abandoned，不能与`ToolExecutionOutcome`并列成为caller必须二选一的terminal事实。
 
-### 关闭条件
+### 关闭验证
 
 - ToolCall、ToolExecutionOutcome和ToolOperationSlot各只有一个canonical owner；
 - unknown/schema-invalid/approval-deny/cancel-before-start均生成matching truthful ToolResult；
@@ -424,15 +425,17 @@ ModelGateway current文档仍有被ADR 0125/0126取代的现行措辞：
 
 ## V4-P1-4 · Workspace Test Matrix与跨Session规则相反
 
+状态：Closed（2026-07-31）。Workspace Test Matrix现明确不同Session使用独立queue、互不等待；同Sessionalias仍按canonical `FileMutationKey`进入同一FIFO。
+
 ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutation queue；两个Session即使写同一physical file也不共享锁，可能并发，host/user负责worktree或外部隔离。
 
-`docs/modules/workspace.md:1229`仍要求：
+关闭前Workspace Test Matrix要求：
 
 > 不同 Session 使用不同 root anchor 指向同一目标时仍竞争同一文件锁
 
 这会让Workspace/Tool测试实现与ADR 0116、`tools.md:382`和`:573`相反。
 
-推荐把测试改为：
+已采纳测试规则：
 
 ```text
 两个Session指向同一physical target
@@ -443,7 +446,7 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 
 同一Session的symlink/absolute/relative alias仍必须canonicalize到同一`FileMutationKey`并竞争同一个queue。
 
-### 关闭条件
+### 关闭验证
 
 - current Test Matrix只要求同Sessionalias归一后互斥；
 - cross-Session fixture明确验证无协调；

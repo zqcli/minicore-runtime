@@ -107,7 +107,7 @@ Context不拥有：
 
 - LiveSessionState或SessionRecorder；
 - ActiveTurnTask/control actor；
-- queue、waiter或CancellationToken；
+- Session ingress/work queue、Interaction waiter或provider CancellationToken；Session-local file mutation queue只经captured ToolSet窄接口使用；
 - provider stream；
 - mutable Workspace/Prompt/Tool/Skill root；
 - public event publisher。
@@ -200,7 +200,9 @@ PromptSet看到的ToolSpec和ActiveTurnTask执行的Tool route来自同一个`Ar
 ```text
 TurnExecutionContext.tool_set
 ├─ ToolPromptView used by PromptSet
-└─ execution route used by ActiveTurnTask
+├─ execution route used by ActiveTurnTask
+├─ Turn-scoped ToolExecutionControl captured before task spawn
+└─ Session-local mutation queue shared from SessionExecutor
 ```
 
 active Turn内禁止重新读取current Tool registry。Tool side-effect start由ToolStartGate/EmergencyControl保护，与Session recording无关。

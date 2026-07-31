@@ -9,6 +9,8 @@
 
 > 2026-07-29修订：Turn/Item/Interaction identity、ToolInvocation合并模型和durable Interaction保持有效。ADR 0124删除ToolRoundCompleted和durable ToolExecutionStarted；complete Tool exchange由有效matching ToolResult集合自动形成，cold replay允许局部不闭合并产生diagnostics。
 
+> 2026-07-31：Tools唯一拥有`ToolCall`、`ToolExecutionRequest`和`ToolExecutionOutcome`；Session Execution唯一拥有`ToolOperationSlot`。pre-execution deny/failure/cancel统一产生truthful ToolResult，Turn/Item只拥有Item投影与complete exchange gate。
+
 ## 背景
 
 MiniCore 需要一个精确的领域模型来定义「一次用户意图」的 durable 边界、其内部语义单元，以及与外部 host 的 durable 请求/回答。同类产品在这三点上形状分裂：Turn 有时等于一次模型调用加 Tool round（pi），ToolCall 与 ToolResult 有时是分离的两条消息，approval 有时是 ephemeral 的内存 waiter（pi、Grok Build 的部分 interaction）。若照搬其中任意一种，会破坏 MiniCore 对 crash recovery、reconnect 与 durable Interaction 的要求；若把 stream delta、retry、progress、phase 等都建模为领域 entity，又会让领域 identity 泛滥。

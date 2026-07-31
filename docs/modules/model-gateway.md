@@ -946,6 +946,8 @@ pub enum FinalizedAssistantContent {
 
 `content[]`保持provider finalized semantic order。`ModelProgressEvent::ContentDelta.content_index`是该terminal `content[]`的zero-based位置，不是ToolCall内部`index`；adapter必须保证stream与terminal normalization使用同一位置语义，无法关联时返回`InvalidProviderResponse`。SessionExecutor随后分配或关联ItemId并构造assistant entry。
 
+Session Execution把validated `content[]`中ToolCall variants的出现顺序规范化为Tools-owned `ToolCall.call_index`。上面的adapter `index`只服务provider ToolCall delta/final关联，不作为Session-local mutation FIFO或model-visible ordering的第二事实源。
+
 `ToolCallId`由ProviderAdapter归一化：provider提供native call ID时原样保留；协议没有call ID时生成只需在当前assistant response内唯一的opaque ID。native ID在同一response内重复、stream/final映射不一致或无法按provider协议回填ToolResult时返回`InvalidProviderResponse`。ToolCallId不要求Session-wide唯一，durable层使用`TurnId + ItemId + ToolCallId`关联。
 
 ### Response Validation

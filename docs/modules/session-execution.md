@@ -41,6 +41,7 @@ MiniCoreRuntime
       ├─ SessionIngress
       ├─ Arc<LiveSessionStateHandle>
       ├─ Arc<SessionRecorder>
+      ├─ Arc<SessionFileMutationQueue>
       ├─ SessionSnapshot publisher
       ├─ FollowUpQueue
       └─ Option<ActiveTurnHandle>
@@ -55,7 +56,8 @@ MiniCoreRuntime
 - Cancel、SecurityRevoked、Unload和Shutdown路由；
 - Interaction resolution入口；
 - snapshot-first subscription和StateEvent publication；
-- recording health、current diagnostic和`session_recording_changed` publication。
+- recording health、current diagnostic和`session_recording_changed` publication；
+- loaded Session-scoped `Arc<SessionFileMutationQueue>`与Turn-scoped Tool execution control handle构造。
 
 `ActiveTurnTask`拥有：
 
@@ -80,12 +82,15 @@ pub(crate) struct SessionExecutor {
     ingress: SessionIngress,
     live_state: LiveSessionStateHandle,
     recorder: Arc<SessionRecorder>,
+    file_mutation_queue: Arc<SessionFileMutationQueue>,
     state: SessionExecutionState,
     active_turn: Option<ActiveTurnHandle>,
     follow_up: FollowUpQueue,
     published_snapshot: ArcSwap<SessionSnapshot>,
 }
 ```
+
+SessionExecutor在Starting candidate reservation时创建绑定`TurnId + control_generation + EmergencyControl`的Turn-scoped Tool execution control handle，并与`file_mutation_queue.clone()`一起进入`ToolTurnContext`。该handle先于ToolSet/TurnExecutionContext构造，随后由同一个ActiveTurnTask消费；不依赖task创建后的late injection。
 
 ```rust
 pub(crate) struct ActiveTurnHandle {
@@ -161,7 +166,8 @@ phase只用于live Snapshot/Progress，不持久化。
 ```text
 Submit accepted by control actor
 → reserve TurnId and control_generation
-→ capture TurnExecutionContext
+→ create Turn-scoped Tool execution control handle
+→ capture TurnExecutionContext with same control handle + SessionFileMutationQueue
 → compose CanonicalUserMessage
 → LiveSessionState validates + allocates EntryId + binds parent_id
 → apply live Input + Turn Running
@@ -278,10 +284,11 @@ Steer在RetryBackoff期间只排队，不改变conversation revision；Cancel/Se
 ## Tool Execution
 
 ```text
-validated assistant ToolCalls
-→ apply Assistant(intermediate) live
+validated assistant ToolCall content
+→ normalize Tools-owned ToolCalls + allocate ItemIds + build ToolExecutionRequests
+→ owner-local apply Assistant(intermediate) + Started Items + expected call set
+→ install matching Prepared ToolOperationSlots in the same no-await step
 → await inline record assistant attempt
-→ build expected call set
 → phase ExecutingTools
 → execute calls through captured ToolSet
 → each truthful result applies live + await inline record attempt
@@ -295,14 +302,17 @@ Tool futures可以并行，但属于同一个ActiveTurnTask。它们不能直接
 
 ```rust
 pub(crate) enum ToolOperationSlot {
-    Prepared { call: ToolCall },
-    Running { call: ToolCall, cancellation: ToolCancellationHandle },
-    Settling { call: ToolCall },
-    Terminal,
+    Prepared { request: ToolExecutionRequest },
+    Running {
+        request: ToolExecutionRequest,
+        cancellation: ToolCancellationHandle,
+    },
+    Settling { request: ToolExecutionRequest },
+    Terminal { outcome: ToolExecutionOutcome },
 }
 ```
 
-Tool start遵守INV-401。recording不是Tool start marker。
+Session Execution是`ToolOperationSlot`的唯一type owner。Turn/Item只投影`Started | Completed | Abandoned`，Tools通过Turn-scoped `ToolExecutionControl`请求`Prepared → Running` first-wins reservation；ActiveTurnTask随后推进`Settling → Terminal`。pre-execution exact outcome允许`Prepared → Terminal(Completed)`，只有possible-start且outcome unknown才能进入`Terminal(Abandoned)`。Tool start遵守INV-401，recording不是Tool start marker。
 
 ## Interaction
 
@@ -483,6 +493,9 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - 所有recordable mutation由同一LiveSessionState generator分配EntryId；
 - Degraded继续分配ID，Recorder看到的ID与live Item/Interaction/Compaction一致；
 - parallel Tool completion与ordered complete exchange；
+- ToolSet在ActiveTurnTask spawn前可用exact control handle和SessionFileMutationQueue构造；
+- Prepared slot与Cancel/SecurityRevoked first-wins，cancel-before-start产出matching ToolResult；
+- 同一Session same-file FIFO、different-file parallel，跨Session同physical target不协调；
 - Steer safe-point和final arbitration；
 - Interaction oneshot与Cancel；
 - retry backoff被Cancel/SecurityRevoked打断；
