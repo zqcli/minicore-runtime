@@ -395,7 +395,7 @@ Automatic example：
 
 规则：
 
-- summary non-empty safe text<=65,536 bytes；
+- summary non-empty safe text<=65,536 bytes；decoded summary payload中的CR是非法control，不做CR/CRLF→LF修复；reader接受physical JSONL line的CRLF只属于scanner framing；
 - automatic active-Turn path modelCall required non-null；
 - model_call finishReason只允许stop/unknown；
 - requestedMaxOutputTokens non-zero；

@@ -1,3 +1,4 @@
+pub(crate) mod compaction;
 pub mod model_gateway;
 pub mod prompt;
 pub mod skills;
