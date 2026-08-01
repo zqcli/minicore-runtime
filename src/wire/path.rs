@@ -6,9 +6,14 @@ use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-const MAX_FILE_URI_BYTES: usize = 8_192;
-const MAX_RELATIVE_PATH_BYTES: usize = 4_096;
-const MAX_RELATIVE_PATH_SEGMENTS: usize = 256;
+use super::limits::ProtocolLimits;
+
+const MAX_FILE_URI_BYTES: usize =
+    ProtocolLimits::v1_0().workspace.max_absolute_path_uri_bytes as usize;
+const MAX_RELATIVE_PATH_BYTES: usize =
+    ProtocolLimits::v1_0().workspace.max_relative_path_bytes as usize;
+const MAX_RELATIVE_PATH_SEGMENTS: usize =
+    ProtocolLimits::v1_0().workspace.max_relative_path_segments as usize;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum FileUriFamily {

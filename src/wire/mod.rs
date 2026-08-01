@@ -1,7 +1,14 @@
+mod limits;
 mod path;
 mod scalar;
 mod value;
 
+pub use limits::{
+    CapabilityToken, CapabilityTokenError, CatalogLimits, ClientInfo, EmbeddedJsonLimits,
+    InteractionLimits, JsonSchemaLimits, JsonValueLimits, ObservationLimits, PagingLimits,
+    PromptWireLimits, ProtocolHello, ProtocolLimits, ProtocolRejectReason, ProtocolVersion,
+    QueueLimits, TextLimits, TransportLimits, WorkspaceWireLimits,
+};
 pub use path::{CanonicalFileUri, FileUriFamily, PathWireError, WorkspaceRelativePath};
 pub use scalar::{
     AgentId, AgentMetadataRevision, AgentRevision, CanonicalU64, CommandId, EntryId,
