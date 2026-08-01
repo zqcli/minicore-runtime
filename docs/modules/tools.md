@@ -456,6 +456,8 @@ approval invariants：
 - resolution后再次执行Workspace/policy/Sandbox enforceability与ToolStartGate revalidation，approval从不替代enforcement；
 - exact private option map只存在于Pending Interaction/live waiter，不进入普通Snapshot、event或diagnostic；recorded history只保存safe option view与selected decision kind。
 
+Implementation staging：M1.5的safe view/replay carrier可以表示`Restricted`，但live executable request只允许`AsRequested → AllowOnce`与`Deny`；在M8定义可执行、可复验且不宽于requested/effective ceiling的exact `ToolPermissionSet`前，任何把`Restricted`提升为live authorization的尝试都必须fail closed，不得使用placeholder permission。production Tool/Sandbox adapter仍受V4-C0-1门禁约束。
+
 UserQuestion首版是显式non-secret、recordable、model-visible的结构化表单：
 
 ```rust
