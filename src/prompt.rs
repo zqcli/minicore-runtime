@@ -198,7 +198,11 @@ impl PromptContributionStamp {
             relative_location, ..
         } = &origin
         {
-            validate_prompt_text(relative_location.as_str(), 4_096, true)?;
+            validate_prompt_text(
+                relative_location.as_str(),
+                ProtocolLimits::v1_0().workspace.max_relative_path_bytes as usize,
+                true,
+            )?;
         }
         Ok(Self {
             content_part_index,
