@@ -2,7 +2,10 @@
   "version": 1,
   "vectors": [
     {"path":"valid/protocol-hello.json","target":"ProtocolHello","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
+    {"path":"valid/protocol-hello-capability-subset.json","target":"ProtocolHello","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
+    {"path":"valid/protocol-hello-unsupported-version.json","target":"ProtocolHello","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"valid/protocol-welcome.json","target":"ProtocolBootstrapResponse","direction":"runtime_to_client","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
+    {"path":"valid/protocol-welcome-capability-intersection.json","target":"ProtocolBootstrapResponse","direction":"runtime_to_client","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"valid/protocol-reject.json","target":"ProtocolBootstrapResponse","direction":"runtime_to_client","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"valid/submit-command.json","target":"CommandRequest","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"valid/create-session-file-uri-command.json","target":"CommandRequest","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
@@ -29,6 +32,7 @@
     {"path":"valid/closed-frame.json","target":"EventFrame","direction":"runtime_to_client","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"valid/session-subscription-request.json","target":"SubscriptionRequest","direction":"client_to_runtime","expected":{"decode":"accepted","canonicalReencode":"same_bytes"}},
     {"path":"carriers/file-uri.json","target":"CanonicalFileUriVectorSet","direction":"bidirectional","expected":{"decode":"vector_set","validRoundTrip":"same_wire","invalid":"typed_reject"}},
+    {"path":"protocol-negotiation-cases.json","target":"ProtocolNegotiationCaseSet","direction":"bidirectional","expected":{"decode":"case_set","assert":"highest_exact_version_and_capability_intersection"}},
     {"path":"invalid/input/duplicate-key.json","target":"CommandRequest","direction":"client_to_runtime","expected":{"decode":"rejected","stage":"json_structure","code":"duplicate_key"}},
     {"path":"invalid/input/hello-unknown-field.json","target":"ProtocolHello","direction":"client_to_runtime","expected":{"decode":"rejected","stage":"selected_schema","code":"unknown_input_field"}},
     {"path":"invalid/input/id-number-not-string.json","target":"CommandRequest","direction":"client_to_runtime","expected":{"decode":"rejected","stage":"typed_scalar","code":"wrong_json_type"}},

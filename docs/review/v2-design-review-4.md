@@ -1,15 +1,15 @@
 # MiniCore V2 设计评审（第四轮）
 
-状态：Open；Rust实现前需关闭本文对应门禁
+状态：Open；Rust internal spine所需P0与P1-1/P1-2/P1-4已关闭，剩余P1-3/C0-1分别门禁production ProviderAdapter与Tool/Sandbox adapter
 日期：2026-07-31
-范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、12篇module设计、ADR 0100–0133、migration、research和前三轮review/handoff
+范围：全部current、非归档V2文档，包括`README.md`、`CONTEXT.md`、`docs/architecture.md`、module设计、ADR 0100–0134、migration、research和前三轮review/handoff
 方式：主审逐份通读并交叉核对canonical owner；subagent结论仅作查漏线索，本文finding均由主审在current文档中独立复现
 
-关闭进度：V4-P0-1至P0-5、V4-P1-1与V4-P1-4 Closed；V4-P1-2、V4-P1-3和V4-C0-1 Open。ADR 0130–0133是本review关闭过程中新增的Accepted决议。
+关闭进度：V4-P0-1至P0-5、V4-P1-1、V4-P1-2与V4-P1-4 Closed；V4-P1-3和V4-C0-1 Open。ADR 0130–0134是本review关闭过程中新增的Accepted决议。
 
 ## 总体结论
 
-ADR 0126–0133确定的主方向继续成立：
+ADR 0126–0134确定的主方向继续成立：
 
 ```text
 SessionExecutor control actor
@@ -23,7 +23,7 @@ Rig = ModelGateway private ProviderAdapter
 
 本轮没有发现需要恢复同步AgentLoop、SessionWriter durable commit barrier、Turn lifecycle JSONL、PromptContent resolver或字符offset provenance的理由。
 
-本review创建时识别出的五个P0现已全部关闭。剩余P1集中在wire/storage envelope和production provider scope；Runtime public payload已由ADR 0133闭合，Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
+本review创建时识别出的五个P0现已全部关闭。V4-P1-1/2/4也已关闭，剩余P1只在production provider scope；Sandbox enforcement继续作为首个production Tool/Sandbox adapter前的条件性P0。
 
 严重度定义：
 
@@ -41,7 +41,7 @@ Rig = ModelGateway private ProviderAdapter
 | V4-P0-4 | P0 | Closed | conversation JSONL仍含无合法single-producer owner的Session definition/lifecycle events | storage schema前 |
 | V4-P0-5 | P0 | Closed | Compaction source无法产生`first_kept_entry_id`，settings/provenance schema也未闭合 | Compaction vertical slice前 |
 | V4-P1-1 | P1 | Closed | Runtime public protocol缺少可恢复、可操作的完整payload | public protocol crate前 |
-| V4-P1-2 | P1 | Open | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
+| V4-P1-2 | P1 | Closed | 通用wire/storage envelope与限制未冻结 | serde fixture与format v1前 |
 | V4-P1-3 | P1 | Open | Provider首版scope、Rig现实映射和旧permit/retry措辞未统一 | production ProviderAdapter前 |
 | V4-P1-4 | P1 | Closed | Workspace Test Matrix要求与ADR 0116相反的跨Session文件锁 | Workspace/Tool tests前 |
 | V4-C0-1 | 条件性P0 | Open | Sandbox不可强制capability时的pre-execution fail-closed门禁 | production Tool/Sandbox adapter前 |
@@ -335,7 +335,7 @@ complete Tool exchange是一个unit；rolling summary unit的origin是对应Stor
 - `4fee962`：Workspace public update只CAS outer SessionDefinitionRevision，删除第二个WorkspaceRevision proof；
 - `d5ae19a`：补齐UserMessageSource、AssistantDisposition和ToolResultDisposition closed Item semantics。
 
-因此重新subscribe后的host可以只用Snapshot恢复全部current public cancel/resolve action；secret input fail closed；metadata和Submit completion可进行typed contract test；public enums无未定义future payload。具体serde casing、ID/Timestamp/Money与byte/count limits仍属于V4-P1-2。
+因此重新subscribe后的host可以只用Snapshot恢复全部current public cancel/resolve action；secret input fail closed；metadata和Submit completion可进行typed contract test；public enums无未定义future payload。exact serde casing、ID/Timestamp/Money与byte/count limits现由ADR 0134、Wire Schema和Format V1冻结。
 
 ### 关闭前问题
 
@@ -378,7 +378,7 @@ Cancel可在Input apply前关闭pre-Turn Submit。`runtime-interface.md:573`要�
 ### 关闭条件
 
 - 重新subscribe后host能对所有public queue和Pending Interaction执行合法command；
-- Interaction request/resolution semantic payload完整且secret policy fail closed；exact wire DTO/casing/limits由V4-P1-2冻结；
+- Interaction request/resolution semantic payload完整且secret policy fail closed；exact wire DTO/casing/limits由ADR 0134与Wire Schema冻结；
 - metadata update有独立CAS token、outcome和event；
 - pre-Turn Submit cancel有typed completion；
 - public error mapping有contract table；
@@ -386,7 +386,19 @@ Cancel可在Input apply前关闭pre-Turn Submit。`runtime-interface.md:573`要�
 
 ## V4-P1-2 · 通用wire/storage envelope与限制未冻结
 
-current modules显式保留以下开放项：
+状态：Closed（2026-07-31）。[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Wire Schema](../modules/wire-schema.md)冻结public/storage JSON v1、typed scalar carriers、ProtocolLimits、bounded JSON和scanner；[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)冻结Header、六种Stored body、field order、relation/replay与Compaction projection；[Wire V1 Fixtures](../fixtures/wire-v1/README.md)提供public manifest、golden/corruption vectors、all-limit recipes和structural verifier。
+
+关闭映射：
+
+- `e1f916f`：ADR 0134与bounded wire v1 foundation；
+- `367ad25`：wire-reachable Prompt/Tool/Model/Interaction/usage/path semantic leaves；
+- `cd6b5cb`：exact conversation JSONL format v1及全部consumer同步；
+- `4a56937`：public/storage conformance vectors、bounded recipes和replay diagnostic/selection contracts；
+- 本closure change：补齐capability-intersection negotiation cases并同步review/handoff/migration状态。
+
+### 关闭前问题
+
+关闭前modules显式保留以下开放项：
 
 - `conversation-storage.md:579`：EntryId算法/文本wire、max entry bytes、diagnostic总量上限、format migration；
 - `compaction.md:270`：StoredCompaction wire；
@@ -406,12 +418,20 @@ current modules显式保留以下开放项：
 
 推荐建立一个小型wire/schema ADR或canonical基础类型module，不建设通用domain“Common”大杂烩。该决议只拥有serialization和bounded decode，不拥有各module业务语义。
 
+### 已采纳决议
+
+Wire Schema只拥有representation、bounded decode、canonical dynamic JSON和limits，不成为domain Common registry。v1固定：camelCase fields、snake_case variants、adjacent `type/data` tagging；MiniCore IDs使用typed prefix + 128-bit lowercase hex，revision/u64/Timestamp/Duration/Money/path/cursor均有exact carrier；client input fail closed，Runtime output selected-minor only，entry additive field tolerant但unknown fact skip；duplicate key全层拒绝。
+
+Conversation JSONL首行strict Header，后续entry required SessionId/TurnId并使用六种flat body。Header 64 KiB、entry 1 MiB、file 1 GiB/1,000,000 entries；whole-file cap先于tail truncation。Replay以first canonical root + physical-last eligible leaf选择path，session mismatch不poison EntryId collision guard，Tool exchange/Interaction/Compaction关系按closed diagnostics隔离。public Snapshot/Query diagnostics按50/100 limits重新投影typed replay totals。
+
 ### 关闭条件
 
-- format v1有golden JSONL和public protocol vectors；
-- oversized/malformed/unknown variant不会无界分配或brick可恢复prefix；
-- writer与tolerant decoder共享同一tag/casing/ID representation；
--所有当前Stored*引用都有唯一type owner。
+- [x] format v1有byte-exact golden JSONL和public protocol manifest/vectors；
+- [x] oversized/malformed/unknown variant使用bounded scanner，不无界分配或brick later recoverable prefix；
+- [x] writer与tolerant decoder共享同一tag/casing/ID/canonical dynamic JSON representation；
+- [x] 全部Stored* semantic types有唯一module owner；Format V1只声明exact representation projection，non-owner module不复制semantic declaration；
+- [x] Header/entry/file/count、ProtocolLimits、BoundedJson/Schema boundary/+1 recipes已冻结；
+- [x] `python3 docs/fixtures/wire-v1/verify.py`、Markdown link/fence与`git diff --check`通过。
 
 ## V4-P1-3 · Provider首版scope、Rig映射和旧措辞未统一
 
@@ -483,7 +503,7 @@ ADR 0116和Tools canonical规则明确：每个loaded Session拥有独立mutatio
 
 ## V4-C0-1 · Sandbox enforcement条件性P0继续有效
 
-这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0133关闭。
+这是第一轮O1、第二轮R7的同一问题，未被ADR 0126–0134关闭。
 
 production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capability classes。最终PermissionSet要求与adapter enforceable capabilities的差集非空时，必须生成PreExecution Denied ToolResult并拒绝side effect。approval不能把不可强制限制转换为裸执行许可，Sandbox失败也不能静默fallback到无Sandbox执行。
 
@@ -506,10 +526,10 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 ## 当前继续顺序
 
-已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2。
 
-1. V4-P1-2：冻结public wire与conversation storage format v1。
-2. 创建Rust crate，用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay fixtures。
+1. 创建Rust crate，先实现typed IDs/revisions、bounded public/storage codec、fixture runner和LiveConversation reducer。
+2. 用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay vertical slice。
 3. V4-P1-3：执行Rig spike并冻结production provider scope。
 4. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
 

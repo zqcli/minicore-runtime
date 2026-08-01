@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134冻结bounded public/storage wire v1基础；仓库仍无Rust生产实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1；仓库仍无Rust生产实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -20,6 +20,7 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 ## 模块索引
 
 - [Wire Schema与Bounded Decode](wire-schema.md)：public JSON v1、shared scalar carriers、ProtocolLimits、bounded JSON和JSONL scanner floor。
+- [Wire V1 Conformance Fixtures](../fixtures/wire-v1/README.md)：public manifest、byte-exact JSON/JSONL、corruption expectations、all-limit recipes与structural verifier。
 - [Runtime公开协议](runtime-interface.md)：`dispatch / query / snapshot / subscribe`、公开identity和live observer语义。
 - [Agent与Session生命周期](agent-session-lifecycle.md)：definition/revision、create/load/unload/archive/fork与readiness。
 - [Workspace](workspace.md)：Session-owned Workspace、trust、authorization和immutable snapshot。
@@ -55,8 +56,8 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-1. 关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-2，冻结public wire与conversation storage format v1；全部V4-P0、V4-P1-1与P1-4已关闭；
-2. 建立Rust crate和`LiveConversation`/`SessionRecorder`基础类型；
+1. 创建Rust crate，实现typed IDs/revisions、bounded public/storage codecs并消费Wire V1 fixtures；全部V4-P0、V4-P1-1、P1-2与P1-4已关闭；
+2. 实现LiveConversation reducer、ScriptedProviderAdapter、SessionExecutor control actor与ActiveTurnTask；
 3. 通过`ScriptedProviderAdapter`实现async ordinary AgentRun与complete Tool exchange；
 4. 加入recording slow-write/failure与cold replay fixtures；
 5. 实现overflow → CompactionSummary → live Replace → inline best-effort record；

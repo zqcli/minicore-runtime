@@ -9,6 +9,8 @@
 
 > 2026-07-31：Prompt Q1/Q4已分别由[ADR 0128](../adr/0128-prompt-content-is-materialized-before-publication.md)和[ADR 0129](../adr/0129-user-message-contributions-use-part-level-safe-provenance.md)关闭：正文在candidate build期间materialize；用户body与SkillIntent正交；contribution使用safe part-level stamp。下文Q1/Q4门禁均已关闭。
 
+> 2026-07-31：[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)、[Wire Schema](../modules/wire-schema.md)、[Format V1](../formats/conversation-jsonl-v1.md)与Wire V1 fixtures已关闭本文present-tense wire/schema、ID、Timestamp、Money与golden-vector门禁；internally-tagged等旧推荐被adjacent `type/data`取代。当前下一入口是Rust codec/reducer实现，非继续设计wire freeze。
+
 ## 总体判断
 
 核心 seam 与不变量体系在决议回写后仍然自洽：append/apply 线性化、SessionStorage 唯一 durable truth、exact pin 纪律、PromptSet 唯一组装 seam、OutcomeUnknown 保守终结（A1 后语义）在全部文档中一致。第一轮的重大问题没有复发。

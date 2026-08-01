@@ -80,4 +80,4 @@ ADR 0133冻结了Runtime public semantic payload，ADR 0124/0126/0131/0132冻结
 
 ## 修订关系
 
-本ADR完成ADR 0133明确后置的public wire/limits工作，并为ADR 0124、0129、0131和0132的conversation JSONL encoding提供共同基础。各Stored DTO的semantic owner与exact format-v1 projection仍在对应canonical module和Conversation Storage中定义；不得从本ADR反向推导执行语义。
+本ADR完成ADR 0133明确后置的public wire/limits工作，并为ADR 0124、0129、0131和0132的conversation JSONL encoding提供共同基础。各Stored DTO的semantic owner位于对应canonical module，exact format-v1 representation由[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)拥有，Conversation Storage负责record/replay消费；不得从本ADR反向推导执行语义。

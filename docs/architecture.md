@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128/0129/0130冻结Prompt content与async contribution composition；ADR 0131冻结conversation-only owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134冻结bounded public/storage wire v1基础；生产实现待启动。 |
+| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128/0129/0130冻结Prompt content与async contribution composition；ADR 0131冻结conversation-only owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1；生产实现待启动。 |
 
 权威顺序：本文与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -218,7 +218,8 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 
 ## 模块地图
 
-- [Wire Schema与Bounded Decode](modules/wire-schema.md)：public/storage JSON v1、typed scalar carrier、ProtocolLimits和bounded scanner。
+- [Wire Schema与Bounded Decode](modules/wire-schema.md)：public/storage JSON v1、typed scalar carrier、ProtocolLimits、canonical dynamic JSON和bounded scanner。
+- [Wire V1 Conformance Fixtures](fixtures/wire-v1/README.md)：public manifest、golden/corruption vectors、boundary recipes与structural verifier。
 - [Runtime公开协议](modules/runtime-interface.md)：dispatch/query/snapshot/subscribe和live observer语义。
 - [Agent与Session生命周期](modules/agent-session-lifecycle.md)：definition、revision、load/unload/archive/fork。
 - [Workspace](modules/workspace.md)：Session-owned Workspace、authority和immutable snapshot。

@@ -26,7 +26,7 @@
 
 inline append会延迟同Session的final StateEvent或下一protocol step，但不持有LiveSessionState guard，不使用Runtime-global lock，也不串行化其他Session。recording failure转为Degraded后立即返回，live流程继续。
 
-`max_entry_bytes`仍作为独立wire/storage限制继续freeze；它约束单条StoredSessionEntry和文件膨胀，不承担queue memory治理。
+`max_entry_bytes`现由ADR 0134/Wire Schema冻结为1,048,576 bytes（excluding LF），约束单条StoredSessionEntry和文件膨胀，不承担queue memory治理。
 
 ## Q2：公开RecordingHealth形状
 

@@ -1,6 +1,6 @@
 # MiniCore V1 → V2 版本迁移记录
 
-状态：V2目标架构已推进至ADR 0133；全部V4-P0、V4-P1-1与P1-4已关闭，P1-2/P1-3待关闭，生产实现未启动
+状态：V2目标架构已推进至ADR 0134；全部V4-P0、V4-P1-1、P1-2与P1-4已关闭，P1-3待关闭，生产实现未启动
 日期：2026-07-31
 
 ## 目的
@@ -92,7 +92,9 @@ TurnStatus和terminal StateEvent继续服务current loaded execution。Replay只
 
 ADR 0132关闭Compaction实现门禁：Live reducer发布Session/revision-bound EntryId-bearing stable units；Runtime settings在Turn admission capture；Compaction从source+cut派生marker并使用Prompt/Model exact basis闭合pressure与summary budget；automatic StoredCompaction保存完整safe model-call provenance。
 
-ADR 0133关闭Runtime public payload门禁：CommandCompletion/error mapping、metadata CAS、queued command Snapshot、concrete Query/Snapshot/Item views和safe Interaction形成closed protocol；MVP Prompt body只保留Empty/Text。semantic payload已冻结，wire casing/ID/Timestamp/Money/limits仍由V4-P1-2完成。
+ADR 0133关闭Runtime public payload门禁：CommandCompletion/error mapping、metadata CAS、queued command Snapshot、concrete Query/Snapshot/Item views和safe Interaction形成closed protocol；MVP Prompt body只保留Empty/Text。
+
+ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typed IDs/revisions、Timestamp/Duration/Money/path/cursor、ProtocolLimits、canonical BoundedJson与bounded scanner；Conversation JSONL Format V1冻结strict Header、六种flat Stored body、field order、replay relation与Compaction projection；Wire V1 Fixtures冻结public manifest、golden/corruption expectations与boundary/+1 recipes。
 
 ## 迁移原则
 
@@ -121,7 +123,7 @@ ADR 0133关闭Runtime public payload门禁：CommandCompletion/error mapping、m
 
 ### 阶段2：Runtime公开协议
 
-状态：semantic payload目标设计完成，wire/schema待冻结。
+状态：semantic payload与wire/schema contract完成，生产实现未开始。
 
 - `dispatch / query / snapshot / subscribe`；
 - Command/Query/StateEvent/ProgressEvent分离；
@@ -134,12 +136,15 @@ ADR 0133关闭Runtime public payload门禁：CommandCompletion/error mapping、m
 - UserQuestion仅支持non-secret Text/SingleChoice，approval只提交request-scoped option index；
 - Query/Snapshot/Item read models为closed concrete payload，MVP Prompt body只有Empty/Text。
 
-待完成：
+已冻结：
 
-- serde casing/tag；
-- public ID文本格式；
-- Timestamp/Money；
-- format-v1 Stored DTO：ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution和StoredCompaction。
+- camelCase field、snake_case variant与adjacent `type/data`；
+- typed public/storage IDs、revision、u64、Timestamp、Duration、Money、PageCursor与file URI；
+- ProtocolLimits、BoundedJson/Schema canonicalization与public diagnostic projection limits；
+- format-v1 Stored DTO：ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution和StoredCompaction；
+- public manifest、JSON/JSONL golden/corruption vectors和all-limit boundary recipes。
+
+首个Rust crate必须消费`docs/fixtures/wire-v1/`，不能重新发明第二套serde defaults。
 
 ### 阶段3：Conversation Recording与Replay
 
@@ -220,9 +225,9 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-开始下列实现前，先关闭[第四轮设计评审](../review/v2-design-review-4.md)的V4-P1-2 wire/storage format门禁；全部P0、P1-1与P1-4已关闭。V4-P1-3在production ProviderAdapter前通过Rig spike关闭。
+开始下列实现时，V4-P1-2 wire/storage format门禁已经关闭；全部P0、P1-1、P1-2与P1-4已关闭。V4-P1-3在production ProviderAdapter前通过Rig spike关闭。
 
-1. 创建Rust crate与基础ID/error types；
+1. 创建Rust crate与基础ID/error/wire types，先让public manifest、canonical codec和storage scanner fixtures通过；
 2. 实现LiveConversation reducer和ScriptedProviderAdapter；
 3. 实现SessionExecutor control actor与ActiveTurnTask；
 4. ordinary AgentRun：Submit → Model → final candidate；
@@ -267,8 +272,8 @@ Recorder问题见[`docs/review/async-loop-best-effort-recording-open-questions.m
 
 其他门禁：
 
-- 第四轮V4-P1-2/P1-3 wire/storage envelope和provider scope；全部V4-P0、V4-P1-1与P1-4已关闭；
-- wire/schema freeze（serde casing、public IDs/path、Timestamp/Money、ProtocolLimits、全部format-v1 Stored DTO）；
+- 第四轮V4-P1-3 provider scope/Rig现实映射仍开放；全部V4-P0、V4-P1-1、P1-2与P1-4已关闭；
+- 首个Rust crate消费ADR 0134/Format V1/Wire V1 fixtures并实现semantic conformance runner；
 - Rig provider spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 
@@ -285,7 +290,7 @@ canonical owner
 → rg old terminology scan
 ```
 
-ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124和0129被部分修订；ADR 0130–0133分别冻结async Skill composition、conversation JSONL configuration/lifecycle边界、Compaction stable-unit/settings/provenance和snapshot-recoverable Runtime public payload。历史正文保留，但实现必须以current modules与最新Accepted ADR为准。
+ADR 0104、0115已被0126取代。0105、0108、0109、0113、0114、0117、0118、0119、0120、0121、0123、0124和0129被部分修订；ADR 0130–0134分别冻结async Skill composition、conversation JSONL configuration/lifecycle边界、Compaction stable-unit/settings/provenance、snapshot-recoverable Runtime public payload和bounded public/storage wire v1。历史正文保留，但实现必须以current modules与最新Accepted ADR为准。
 
 ## 完成定义
 

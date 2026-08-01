@@ -22,6 +22,6 @@ MiniCoreRuntime.subscribe(SubscriptionRequest) -> EventStream
 → [docs/research/](docs/research/)
 → [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
 
-V1已归档，仅用于历史参考；V2是当前权威架构。第四轮评审的全部P0、V4-P1-1与P1-4已关闭，生产实现仍待启动；当前暂停点是关闭[第四轮设计评审](docs/review/v2-design-review-4.md)的V4-P1-2 wire/storage format v1，随后创建Rust crate并启动阶段6–8 async vertical slice。完整换机进度见[设计评审工作交接](docs/review/v2-design-review-handoff.md)。
+V1已归档，仅用于历史参考；V2是当前权威架构。第四轮评审的全部P0、V4-P1-1、P1-2与P1-4已关闭，ADR 0134、exact Conversation JSONL v1和wire conformance vectors已冻结；生产实现仍待启动。当前入口是创建Rust crate并用`ScriptedProviderAdapter`启动阶段6–8 async vertical slice，production ProviderAdapter前再关闭V4-P1-3。完整换机进度见[设计评审工作交接](docs/review/v2-design-review-handoff.md)。
 
 跨机器恢复当前设计评审工作时，从[设计评审工作交接](docs/review/v2-design-review-handoff.md)开始。

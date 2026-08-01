@@ -1,0 +1,23 @@
+{
+  "runtimeSupportedVersions": [{"major":1,"minor":0}],
+  "runtimeCapabilities": ["state_events","progress_events","runtime_snapshot","session_snapshot","paged_queries","command_catalog","interaction_resolution","session_fork"],
+  "cases": [
+    {
+      "helloPath": "valid/protocol-hello.json",
+      "expectedResponsePath": "valid/protocol-welcome.json",
+      "expectedSelectedVersion": {"major":1,"minor":0},
+      "expectedCapabilities": ["state_events","progress_events","runtime_snapshot","session_snapshot","paged_queries","command_catalog","interaction_resolution","session_fork"]
+    },
+    {
+      "helloPath": "valid/protocol-hello-capability-subset.json",
+      "expectedResponsePath": "valid/protocol-welcome-capability-intersection.json",
+      "expectedSelectedVersion": {"major":1,"minor":0},
+      "expectedCapabilities": ["state_events","session_snapshot"]
+    },
+    {
+      "helloPath": "valid/protocol-hello-unsupported-version.json",
+      "expectedResponsePath": "valid/protocol-reject.json",
+      "expectedRejectReason": "unsupported_protocol_version"
+    }
+  ]
+}

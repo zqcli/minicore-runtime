@@ -1,0 +1,1 @@
+{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"subset-host","version":"1.0.0"},"capabilities":{"values":["state_events","session_snapshot","future_capability"]}}

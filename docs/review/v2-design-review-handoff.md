@@ -1,9 +1,9 @@
 # V2设计评审工作交接
 
 日期：2026-07-31
-状态：换机handover；全部V4-P0、V4-P1-1与V4-P1-4已关闭，V4-P1-2/P1-3仍开放
+状态：换机handover；全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭，V4-P1-3仍开放
 
-架构事实以`docs/architecture.md`、`docs/modules/`和Accepted ADR 0126–0133为权威。本文记录恢复入口、已推送进度与剩余工作。
+架构事实以`docs/architecture.md`、`docs/modules/`和Accepted ADR 0126–0134为权威。本文记录恢复入口、已推送进度与剩余工作。
 
 ## 当前分支
 
@@ -23,6 +23,12 @@ b364461 docs: carry metadata revisions in runtime events
 0c4a0ce docs: make runtime error mapping deterministic
 4fee962 docs: align workspace update payload
 d5ae19a docs: define item disposition enums
+
+latest completed Wire/Storage commits:
+e1f916f docs: define bounded wire v1 foundation
+367ad25 docs: define wire-reachable semantic types
+cd6b5cb docs: freeze conversation JSONL format v1
+4a56937 docs: add wire v1 conformance fixtures
 ```
 
 分支名保留创建时的`eventual-session-log`历史命名；当前权威设计已经收窄为inline best-effort append，以ADR 0126和current modules为准。
@@ -86,7 +92,7 @@ SessionRecorder
 
 ## 2026-07-31第四轮完整复审与门禁收口
 
-- 主审逐份通读当时全部55个current、非归档Markdown；ADR 0130–0133加入后当前为59个；subagent输出仅作查漏线索；
+- 主审逐份通读第四轮开始时全部current、非归档Markdown；随后ADR 0130–0134、Format V1和fixture contracts加入并逐项复审；subagent输出仅作查漏线索；
 - 新增[第四轮设计评审](v2-design-review-4.md)，确认5个P0、4个P1和1个既有条件性Sandbox P0；
 - `699b938`关闭V4-P0-1：ModelGateway唯一拥有`ModelCallRequest`，Turn Execution Context删除第二份struct；
 - `6e2f428`关闭V4-P0-2和V4-P1-4：Tools唯一拥有Tool execution input/outcome，Session Execution拥有ToolOperationSlot/queue，Workspace明确跨Session不协调；
@@ -101,8 +107,11 @@ SessionRecorder
 - SessionSnapshot列出current可取消Submit/Steer/FollowUp CommandId和Pending Interaction safe request；Query/Snapshot/Item/terminal/usage/diagnostic使用concrete bounded read models；
 - Tool approval只接受request-scoped option index或Deny，UserQuestion仅支持non-secret Text/SingleChoice；resolution key的random/scope/retry/conflict语义已冻结；
 - MVP Prompt body删除未定义Template，只保留Empty/Text；future template和secret input必须通过新typed capability；
-- V4-P1-2/P1-3仍Open；V4-C0-1仍是production Tool/Sandbox adapter前的条件性P0；
-- ADR 0126–0133主方向保持，不恢复同步AgentLoop、durable SessionWriter、Turn lifecycle JSONL、Prompt resolver、flat-message Compaction marker或未定义public payload；
+- ADR 0134关闭V4-P1-2：public/storage JSON v1统一使用camelCase、snake_case和adjacent type/data；typed IDs/revisions、Timestamp/Duration/Money/path/cursor、ProtocolLimits、canonical BoundedJson/Schema与scanner均冻结；
+- Conversation JSONL Format V1固定strict Header、required SessionId/TurnId、六种flat body、stable field order、Tool/Interaction/Compaction projection和tolerant replay precedence；
+- Wire V1 Fixtures提供public manifest、active/terminal/queue/Interaction/path vectors、conversation golden/corruption expectations、all-limit recipes和structural verifier；
+- V4-P1-3仍Open；V4-C0-1仍是production Tool/Sandbox adapter前的条件性P0；
+- ADR 0126–0134主方向保持，不恢复同步AgentLoop、durable SessionWriter、Turn lifecycle JSONL、Prompt resolver、flat-message Compaction marker、unbounded/raw JSON或未定义public payload；
 
 ## 恢复顺序
 
@@ -114,18 +123,22 @@ SessionRecorder
 6. [ADR 0131](../adr/0131-conversation-recording-excludes-session-definition-and-lifecycle.md)
 7. [ADR 0132](../adr/0132-compaction-derives-markers-from-live-stable-units.md)
 8. [ADR 0133](../adr/0133-runtime-public-payload-is-snapshot-recoverable.md)
-9. [第四轮完整设计评审与实施门禁](v2-design-review-4.md)
-10. [架构总览](../architecture.md)
-11. [Runtime Interface](../modules/runtime-interface.md)
-12. [Prompt](../modules/prompt.md)
-13. [Session Execution](../modules/session-execution.md)
-14. [Conversation Recording与Replay](../modules/conversation-storage.md)
-15. [Turn Execution Context](../modules/turn-execution-context.md)
-16. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
-17. [Compaction](../modules/compaction.md)
-18. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
-19. [第三轮评审关闭记录](v2-design-review-3.md)
-20. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
+9. [ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)
+10. [Wire Schema](../modules/wire-schema.md)
+11. [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)
+12. [Wire V1 Fixtures](../fixtures/wire-v1/README.md)
+13. [第四轮完整设计评审与实施门禁](v2-design-review-4.md)
+14. [架构总览](../architecture.md)
+15. [Runtime Interface](../modules/runtime-interface.md)
+16. [Prompt](../modules/prompt.md)
+17. [Session Execution](../modules/session-execution.md)
+18. [Conversation Recording与Replay](../modules/conversation-storage.md)
+19. [Turn Execution Context](../modules/turn-execution-context.md)
+20. [Turn / Item / Interaction](../modules/turn-item-interaction.md)
+21. [Compaction](../modules/compaction.md)
+22. [Async/Best-Effort Recording问题关闭记录](async-loop-best-effort-recording-open-questions.md)
+23. [第三轮评审关闭记录](v2-design-review-3.md)
+24. [AgentLoop跨项目研究](../research/agent-loop-execution-model-study.md)
 
 ## 已冻结决策
 
@@ -165,7 +178,7 @@ SessionRecorder
 - 用户显式Skill选择不创建Item，模型触发Skill Tool继续使用ToolInvocation Item；
 - ModelGateway唯一拥有`ModelCallRequest`；ordinary/Structured/Compaction和logical retry使用同一immutable request type；
 - Tools唯一拥有`ToolCall`、`ToolExecutionRequest`、`ToolExecutionOutcome`；Session Execution唯一拥有`ToolOperationSlot`和SessionFileMutationQueue；
-- pre-execution deny/failure/cancel-before-start统一产生matching truthful ToolResult；
+- pre-execution deny/failure/cancel-before-start统一产生matching truthful ToolResult；ask-user合法answer产生`PreExecution + Succeeded`；
 - TurnExecutionContext绑定SkillService/SkillViewContext/SkillView，Input与Steer共享async `resolve_user_message()`；PromptSet compose/assemble保持同步纯内存；
 - Starting control actor拥有可取消candidate future；Input apply前Cancel/SecurityRevoked不创建Turn，apply后保持TurnStarted→Interrupted且不spawn task；
 - conversation JSONL只保存User/Assistant/Tool、Interaction和StoredCompaction；Session definition/metadata/lifecycle由entity durable owner保存；
@@ -176,7 +189,13 @@ SessionRecorder
 - Input apply前user Cancel使original Submit完成SubmitCancelled且无Turn；apply后保持TurnStarted并随后Interrupted；
 - Tool approval选择request-scoped safe option index，host不能提交PermissionSet；UserQuestion只有non-secret Text/SingleChoice；
 - InteractionResolutionKey为host-generated random request-scoped idempotency key；same key/same payload不重复record/event/resume；
-- MVP PromptBodyIntent只有Empty/Text，未定义Template不进入public enum/query/decoder。
+- MVP PromptBodyIntent只有Empty/Text，未定义Template不进入public enum/query/decoder；
+- Wire Schema唯一拥有public/storage representation：typed DTO declaration order、dynamic BoundedJson key/number canonicalization、duplicate-key rejection与bounded decode；
+- public v1使用camelCase fields、snake_case variants、adjacent type/data；client input unknown reject，Runtime selected-minor output only，valid Header后的entry additive field bounded-ignore；
+- MiniCore IDs/revisions、u64、Timestamp、Duration、Money、PageCursor与platform-independent file URI已有exact carriers；
+- Conversation JSONL v1首行strict Header，entry required SessionId/TurnId并只含六种flat conversation bodies；Header/entry/file/count hard caps与tail precedence固定；
+- replay session match先于EntryId reservation，first valid root + physical-last eligible leaf选择recorded head，orphan/multiple root/invalid relation按typed diagnostics隔离；
+- public manifest、golden/corruption expected metadata与boundary recipes位于`docs/fixtures/wire-v1/`，Rust实现必须消费而不能重新定义。
 
 ## 跨模块不变量
 
@@ -221,7 +240,7 @@ StoredPromptContributionStamp
 exact source authorization in JSONL
 ```
 
-旧ADR正文作为历史保留，顶部状态与修订说明指向ADR 0126–0133。
+旧ADR正文作为历史保留，顶部状态与修订说明指向ADR 0126–0134。
 
 ## 当前开放问题
 
@@ -229,19 +248,20 @@ Recorder review的Q1–Q10已经全部关闭，详见[独立review](async-loop-b
 
 Prompt Q1/Q4已分别由ADR 0128/0129关闭；ADR 0133进一步把Prompt template整体后置，MVP public body只有Empty/Text。cache/hook等问题不阻塞首个vertical slice。
 
-第四轮当前状态：V4-P0-1至P0-5 Closed；V4-P1-1 Closed，V4-P1-2/P1-3 Open，V4-P1-4 Closed；V4-C0-1条件性Open。
+第四轮当前状态：V4-P0-1至P0-5 Closed；V4-P1-1、P1-2与P1-4 Closed，V4-P1-3 Open；V4-C0-1条件性Open。
 
-下一恢复入口：处理V4-P1-2。先读`runtime-interface.md`、`conversation-storage.md`、`model-gateway.md`、`compaction.md`、ADR 0133和第四轮review对应段落，冻结serde casing/tag、ID/Timestamp/Money、ProtocolLimits、format-v1 Stored DTO、unknown variant/oversized line policy与golden vectors。
+下一恢复入口：创建Rust crate。先读ADR 0134、Wire Schema、Format V1和Wire V1 Fixtures，实现typed carriers、canonical/bounded JSON、public DTO codec、JSONL scanner/codec和fixture runner；随后实现LiveConversation与SessionRecorder。不要先接Rig或production Tool adapter。
 
 ## 下一步
 
-1. 关闭V4-P1-2并冻结通用serde casing、ID文本格式、Timestamp/Money、size/count limits和conversation format v1；
-2. 创建Rust crate，先实现LiveConversation reducer与inline SessionRecorder；
-3. 使用ScriptedProviderAdapter闭环async ordinary AgentRun与complete Tool exchange；
-4. 增加recorder slow-write/failure/crash/reload-prefix fixtures；
-5. 实现Interaction、Cancel、logical retry和Compaction async paths；
-6. 关闭V4-P1-3并完成Rig 0.40.0 OpenAI/Anthropic provider spike；
-7. production Tool/Sandbox adapter前关闭O1/R7。
+1. 创建Rust crate与workspace/package metadata；
+2. 实现typed IDs/revisions、Timestamp/Duration/Money/path/PageCursor和canonical BoundedJson/Schema；
+3. 实现public protocol DTO codec与`public/manifest.json` conformance runner；
+4. 实现Conversation JSONL Header/entry codec、bounded scanner和golden/corruption replay runner；
+5. 实现LiveConversation reducer、ScriptedProviderAdapter、SessionExecutor与ActiveTurnTask；
+6. 闭环ordinary AgentRun、complete Tool exchange、Interaction、Cancel、logical retry、recording/replay与Compaction；
+7. 关闭V4-P1-3并完成Rig 0.40.0 OpenAI/Anthropic provider spike；
+8. production Tool/Sandbox adapter前关闭O1/R7。
 
 ## Review状态
 
@@ -249,11 +269,11 @@ Prompt Q1/Q4已分别由ADR 0128/0129关闭；ADR 0133进一步把Prompt templat
 第一轮 O2–O18   原设计下已关闭；O1 Sandbox条件性开放
 第二轮 R1–R6   原设计下已关闭；R7 = O1
 第三轮 L1–L5   已关闭或被ADR 0126取代
-第四轮 V4-*    P0-1..5 Closed；P1-1/P1-4 Closed；P1-2/P1-3 Open；C0-1 conditional Open
+第四轮 V4-*    P0-1..5 Closed；P1-1/P1-2/P1-4 Closed；P1-3 Open；C0-1 conditional Open
 ```
 
 R6 canonical owner/link纪律继续适用。新横切决策的回写顺序仍是：canonical owner → interface consumers → review/handoff → supersession notes → `rg` residue scan。
 
 ## 生产实现状态
 
-仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成Recorder/Prompt/Compaction主架构、ADR 0130–0133、全部第四轮P0、P1-1和P1-4收口，不包含Rust生产实现。下一台电脑从V4-P1-2 wire/storage freeze继续；不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter、Turn terminal ledger、PromptContent resolver、flat-message Compaction marker lookup、recursive Skill/Composite/Template intent、字符offset provenance、第二份ModelCallRequest、无ToolResult的pre-execution outcome或placeholder public payload开始编码。
+仓库仍无`Cargo.toml`、`src/`或`tests/`。本分支当前完成Recorder/Prompt/Compaction主架构、ADR 0130–0134、全部第四轮P0、P1-1、P1-2和P1-4收口，不包含Rust生产实现。下一台电脑从Rust crate + wire/storage codec fixture runner开始；不要按旧同步AgentLoop、后台Recorder queue、durable SessionWriter、Turn terminal ledger、PromptContent resolver、flat-message Compaction marker lookup、recursive Skill/Composite/Template intent、字符offset provenance、raw `serde_json::Value` seam、第二份ModelCallRequest、无ToolResult的pre-execution outcome或placeholder public payload开始编码。
