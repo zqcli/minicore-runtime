@@ -265,7 +265,7 @@ pub enum ToolAbandonReason {
 }
 ```
 
-`ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。structured executor payload必须由Tool owner确定性render为Text；raw JSON可在bounded `details`中供current-process trusted debug projection使用，但不自动进入模型，且[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#tool-message)明确不记录details。
+`ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。它是external Tool text carrier，payload中的CR/CRLF不做silent normalization；owner只能fail closed，或在构造前显式替换为U+FFFD并记录bounded diagnostic。structured executor payload必须由Tool owner确定性render为Text；raw JSON可在bounded `details`中供current-process trusted debug projection使用，但不自动进入模型，且[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#tool-message)明确不记录details。
 
 `Succeeded`要求Tool owner产生exact successful business result：ordinary Tool来自executor exact success；ask-user等built-in control Tool可以在不启动side effect/executor的情况下由合法Interaction resolution产生truthful success。`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
 

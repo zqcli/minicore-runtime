@@ -743,7 +743,7 @@ impl ToolResultContent {
         let mut aggregate = 0_usize;
         let mut validated = Vec::with_capacity(parts.len());
         for part in parts {
-            let text = normalize_and_validate_text(&part, 65_536, true)?;
+            let text = validate_external_text(&part, 65_536, true)?;
             aggregate = aggregate
                 .checked_add(text.len())
                 .ok_or(ToolValueError::ResultContentTooLarge)?;
@@ -1886,6 +1886,15 @@ fn normalize_and_validate_text(
     let value = normalize_newlines(value);
     validate_safe_text(&value, maximum, allow_empty).map_err(|_| ToolValueError::InvalidText)?;
     Ok(value)
+}
+
+fn validate_external_text(
+    value: &str,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<String, ToolValueError> {
+    validate_safe_text(value, maximum, allow_empty).map_err(|_| ToolValueError::InvalidText)?;
+    Ok(value.to_owned())
 }
 
 #[allow(
