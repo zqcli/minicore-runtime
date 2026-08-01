@@ -13,7 +13,7 @@ MiniCoreRuntime.snapshot(SnapshotRequest)
 MiniCoreRuntime.subscribe(SubscriptionRequest) -> EventStream
 ```
 
-架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)；分阶段交付、依赖与验收条件见 [MiniCore V2开发计划](docs/development-plan.md)。
+文档入口见 [docs/README.md](docs/README.md)；架构说明见 [docs/architecture.md](docs/architecture.md) 和 [docs/modules/README.md](docs/modules/README.md)，分阶段交付、依赖与验收条件见 [MiniCore V2开发计划](docs/development-plan.md)。
 
 ## 文档权威顺序
 
