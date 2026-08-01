@@ -1,7 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use minicore_runtime::wire::{BoundedJsonSchema, BoundedJsonSchemaError, ProtocolLimits};
+use minicore_runtime::wire::{
+    BoundedJsonError, BoundedJsonSchema, BoundedJsonSchemaError, ProtocolLimits,
+};
 
 const DRAFT: &str = "https://json-schema.org/draft/2020-12/schema";
 
@@ -22,6 +24,28 @@ fn bounded_schema_is_a_canonical_draft_2020_12_object_carrier() {
     assert_eq!(schema, equivalent);
     assert_eq!(hash(&schema), hash(&equivalent));
     assert!(!format!("{schema:?}").contains("^[a-z]+$"));
+}
+
+#[test]
+fn bounded_schema_retains_exact_dynamic_number_limits() {
+    let coefficient = "1".repeat(60);
+    let boundary = format!(r#"{{"type":"object","minimum":{coefficient}e000}}"#);
+    assert!(BoundedJsonSchema::from_slice(boundary.as_bytes()).is_ok());
+
+    let oversized = format!(r#"{{"type":"object","minimum":{coefficient}e0000}}"#);
+    assert_eq!(
+        BoundedJsonSchema::from_slice(oversized.as_bytes()),
+        Err(BoundedJsonSchemaError::Json(
+            BoundedJsonError::NumberLiteralLimit
+        ))
+    );
+    assert!(BoundedJsonSchema::from_slice(br#"{"type":"object","minimum":1e1000000}"#).is_ok());
+    assert_eq!(
+        BoundedJsonSchema::from_slice(br#"{"type":"object","minimum":1e1000001}"#),
+        Err(BoundedJsonSchemaError::Json(
+            BoundedJsonError::NumberExponentLimit
+        ))
+    );
 }
 
 #[test]

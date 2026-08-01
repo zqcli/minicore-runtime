@@ -354,6 +354,8 @@ Dynamic JSON number不降为`f64`，而是解析为exact decimal并按下列算�
 
 因此`1`、`1.0`、`1e0`归一为`1`，`-0`归一为`0`，object key order与number spelling都不会制造第二个semantic encoding。provider若需要有限精度numeric type，adapter必须显式checked lowering；不得静默round后改写conversation/tool arguments。
 
+上述64-byte/exponent/canonical cap只属于`BoundedJsonValue/Object/Schema` dynamic carrier。public typed frame的structural preflight对所有number执行JSON grammar与transport frame/depth/member bounds，但不能把embedded-number cap施加到将被selected-version output decoder忽略的unknown additive field；known typed numeric field随后仍按ordinary integer或owner scalar规则严格验证。该分离只提供receiver forward tolerance，Runtime encoder仍不得发送selected V1.0未声明的field。
+
 constructor在分配完整semantic value前执行streaming/bounded validation。ordinary embedded JSON limits：
 
 | Limit | Value |
