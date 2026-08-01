@@ -1,3 +1,4 @@
+mod json_number;
 mod limits;
 mod path;
 mod scalar;
