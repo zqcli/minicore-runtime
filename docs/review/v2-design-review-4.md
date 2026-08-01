@@ -526,12 +526,9 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 ## 当前继续顺序
 
-已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2。
+已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2；Rust crate与typed scalar/value/path carriers已经建立。
 
-1. 创建Rust crate，先实现typed IDs/revisions、bounded public/storage codec、fixture runner和LiveConversation reducer。
-2. 用ScriptedProviderAdapter完成ordinary AgentRun、complete Tool exchange、Interaction、Cancel、retry、Compaction和recording/replay vertical slice。
-3. V4-P1-3：执行Rig spike并冻结production provider scope。
-4. V4-C0-1：production Tool/Sandbox adapter前关闭enforcement gate。
+后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：先完成M0文档收敛与质量门禁，再完成bounded public/storage codec、fixture runner、LiveConversation reducer和ScriptedProvider vertical slice。V4-P1-3继续门禁production ProviderAdapter；V4-C0-1继续门禁production Tool/Sandbox adapter。
 
 ## 第四轮关闭定义
 

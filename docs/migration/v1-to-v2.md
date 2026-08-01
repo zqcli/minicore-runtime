@@ -123,7 +123,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 
 ### 阶段2：Runtime公开协议
 
-状态：semantic payload与wire/schema contract完成，生产实现未开始。
+状态：semantic payload与wire/schema contract完成；Rust typed scalar/value/path carriers已实现，Runtime协议行为尚未实现。
 
 - `dispatch / query / snapshot / subscribe`；
 - Command/Query/StateEvent/ProgressEvent分离；
@@ -144,7 +144,7 @@ ADR 0134关闭wire/storage format门禁：Wire Schema冻结JSON casing/tag、typ
 - format-v1 Stored DTO：ModelResponseSummary、StoredToolOutcome、StoredInteraction request/resolution和StoredCompaction；
 - public manifest、JSON/JSONL golden/corruption vectors和all-limit boundary recipes。
 
-首个Rust crate必须消费`docs/fixtures/wire-v1/`，不能重新发明第二套serde defaults。
+当前Rust crate必须继续消费`docs/fixtures/wire-v1/`，不能重新发明第二套serde defaults。
 
 ### 阶段3：Conversation Recording与Replay
 
@@ -225,18 +225,7 @@ SessionExecutor admits Turn
 
 实现顺序：
 
-开始下列实现时，V4-P1-2 wire/storage format门禁已经关闭；全部P0、P1-1、P1-2与P1-4已关闭。V4-P1-3在production ProviderAdapter前通过Rig spike关闭。
-
-1. 创建Rust crate与基础ID/error/wire types，先让public manifest、canonical codec和storage scanner fixtures通过；
-2. 实现LiveConversation reducer和ScriptedProviderAdapter；
-3. 实现SessionExecutor control actor与ActiveTurnTask；
-4. ordinary AgentRun：Submit → Model → final candidate；
-5. complete Tool exchange：Model → parallel Tools → Model；
-6. Interaction oneshot、Cancel和ToolStartGate；
-7. logical retry：same request + ConversationRevision；
-8. SessionRecorder slow-write/failure/crash fixtures；
-9. ContextOverflow → CompactionSummary → live Replace → next AgentRun；
-10. RigProviderAdapter与mock-server contract tests。
+V4-P1-2 wire/storage format门禁已经关闭；全部P0、P1-1、P1-2与P1-4已关闭。Rust typed carriers已经进入`dev`。后续阶段、依赖、测试分层与production gate以[MiniCore V2开发计划](../development-plan.md)为准；V4-P1-3在production ProviderAdapter前关闭，V4-C0-1在production Tool/Sandbox adapter开始前关闭。
 
 共同完成门槛：
 

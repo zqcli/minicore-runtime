@@ -275,7 +275,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- 下一实现入口：创建Rust crate，消费Wire V1 manifest/golden/corruption/boundary recipes并实现typed codec、LiveConversation与SessionRecorder；
+- Rust Wire基础已实现typed scalar/value/path carriers；下一实施入口按`docs/development-plan.md`先完成M0文档收敛与质量门禁，再实现BoundedJson/Schema、public/storage codec、LiveConversation与SessionRecorder；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 
