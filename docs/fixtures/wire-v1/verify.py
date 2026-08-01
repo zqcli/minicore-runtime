@@ -334,6 +334,39 @@ def check_public() -> None:
     for case in file_uris["invalid"]:
         assert list(case) == ["wire", "reason"] and case["reason"], case
 
+    negotiation = decode((ROOT / "public" / "protocol-negotiation-cases.json").read_bytes())
+    runtime_versions = {
+        (version["major"], version["minor"])
+        for version in negotiation["runtimeSupportedVersions"]
+    }
+    runtime_capabilities = negotiation["runtimeCapabilities"]
+    for case in negotiation["cases"]:
+        hello = decode((ROOT / "public" / case["helloPath"]).read_bytes())
+        response = decode((ROOT / "public" / case["expectedResponsePath"]).read_bytes())
+        client_versions = {
+            (version["major"], version["minor"])
+            for version in hello["supportedVersions"]
+        }
+        common = sorted(runtime_versions & client_versions)
+        if not common:
+            assert response["type"] == "reject"
+            assert response["data"]["reason"] == case["expectedRejectReason"]
+            assert response["data"]["supportedVersions"] == negotiation["runtimeSupportedVersions"]
+            continue
+        selected = {"major": common[-1][0], "minor": common[-1][1]}
+        client_capabilities = set(hello["capabilities"]["values"])
+        expected_capabilities = [
+            capability
+            for capability in runtime_capabilities
+            if capability in client_capabilities
+        ]
+        assert selected == case["expectedSelectedVersion"]
+        assert expected_capabilities == case["expectedCapabilities"]
+        assert response["type"] == "welcome"
+        assert response["data"]["selectedVersion"] == selected
+        assert response["data"]["runtime"]["protocolVersion"] == selected
+        assert response["data"]["capabilities"]["values"] == expected_capabilities
+
 
 def iter_complete_lines(path: Path) -> list[bytes]:
     raw = path.read_bytes()

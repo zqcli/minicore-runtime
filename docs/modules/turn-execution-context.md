@@ -321,4 +321,4 @@ restart后：
 
 ## 开放问题
 
-Prompt Q1/Q4已分别由ADR 0128/0129关闭，async Skill composition由ADR 0130关闭。剩余serde casing与public ID格式进入通用wire/schema freeze。Async loop/recording策略问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。
+Prompt Q1/Q4已分别由ADR 0128/0129关闭，async Skill composition由ADR 0130关闭。serde casing与public ID格式现由ADR 0134/Wire Schema冻结。Async loop/recording策略问题见[独立review](../review/async-loop-best-effort-recording-open-questions.md)。

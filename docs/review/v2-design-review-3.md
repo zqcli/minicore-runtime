@@ -111,4 +111,4 @@ async设计需要覆盖的新风险：
 | L4 | 原接口删除；async loop直接消费Steer/应用Compaction |
 | L5 | 保持关闭；Rig provider-only |
 | AgentLoop编码门禁 | 已消失 |
-| 当前编码前门禁 | wire/schema freeze、Recorder MVP参数、Rig provider spike |
+| 当前编码前门禁 | wire/schema与Recorder MVP参数已关闭；可创建Rust crate，Rig provider spike仅门禁production ProviderAdapter |

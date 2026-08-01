@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环；ADR 0134、exact Conversation JSONL v1与conformance vectors冻结bounded public/storage wire。
 
 权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -14,6 +14,12 @@
 
 **Runtime Interface**：
 由RuntimeCommand/CommandResponse、RuntimeQuery/QueryResponse、RuntimeSnapshot/SessionSnapshot和StateEvent/ProgressEvent组成的transport-neutral interface。
+
+**Wire Schema**：
+public/storage representation唯一owner。v1固定camelCase fields、snake_case variants、adjacent `type/data`、typed IDs/revisions、Timestamp/Duration/Money/path/cursor、ProtocolLimits、canonical BoundedJson和bounded scanner；不拥有domain business semantics。
+
+**Wire V1 Fixtures**：
+`docs/fixtures/wire-v1/`中的public target manifest、byte-exact JSON/JSONL、corruption expectations、boundary recipes和structural verifier。首个Rust codec/storage crate必须消费这些assets。
 
 **Runtime-owned共享module**：
 `PromptService`、`ToolService`、`SkillService`和`ModelGateway`。四个current immutable resource roots只在initialize或显式reload成功后整体publication。
@@ -70,13 +76,13 @@ Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严
 负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
-SessionRecorder可能写入的一条immutable conversation JSONL record。使用EntryId和parent_id形成recorded history tree；TurnId只承担conversation correlation。EntryId由live owner在apply前分配，Recorder不能创建或改写。
+SessionRecorder可能写入的一条immutable Format V1 conversation entry。exact wire fields依次为`entryId`、`parentId`、`sessionId`、`turnId`、`timestamp`和`body`；body是User/Assistant/Tool/InteractionRequested/InteractionResolved/Compaction六种snake_case flat variants。EntryId由live owner在apply前分配，Recorder不能创建或改写。
 
 **Recorded prefix**：
 process crash或recording degradation后实际留在JSONL中的完整行前缀。restart只能恢复该prefix，未record live tail永久丢失。
 
 **Tolerant replay**：
-顺序读取recorded完整行，skip malformed/duplicate，隔离orphan/invalid relation，排除incomplete Tool exchange并返回bounded diagnostics。不恢复ActiveTurnTask、provider stream、Tool task、waiter、queue、retry timer或旧TurnStatus；Load后的current Turn为空。
+顺序bounded读取recorded完整行，strict Header；session match先于EntryId collision reservation，随后skip duplicate并隔离orphan/invalid relation。first valid root建立canonical component，component内physical-last accepted leaf决定selected path；排除incomplete Tool exchange并返回typed bounded diagnostics。不恢复ActiveTurnTask、provider stream、Tool task、waiter、queue、retry timer或旧TurnStatus；Load后的current Turn为空。
 
 **ForkSourceKind**：
 Fork在source linearization point选择的事实来源：loaded Session固定为`LiveSnapshot`，unloaded Session固定为`RecordedHistory`。该值进入child durable fork provenance和`SessionForked`结果。
@@ -268,11 +274,9 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 
 ## 当前开放问题
 
-- 第四轮评审：全部V4-P0、V4-P1-1与V4-P1-4已关闭；V4-P1-2、V4-P1-3仍开放；
-- V4-P1-2/P1-3：wire/storage envelope与production provider scope/Rig现实映射；
-- wire/schema freeze：serde casing、public IDs/path、Timestamp/Money、ProtocolLimits和format-v1 Stored DTO（ModelResponseSummary、StoredToolOutcome、StoredInteraction、StoredCompaction）；
-- EntryId算法与public文本wire；
-- Rig 0.40.0 provider spike；
+- 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
+- 下一实现入口：创建Rust crate，消费Wire V1 manifest/golden/corruption/boundary recipes并实现typed codec、LiveConversation与SessionRecorder；
+- V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 
 Recorder特有问题见`docs/review/async-loop-best-effort-recording-open-questions.md`。

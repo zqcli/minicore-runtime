@@ -1510,7 +1510,7 @@ pub struct ToolSummaryView {
 }
 ```
 
-catalog views不包含Prompt/Skill正文、Tool schema/private route、provider endpoint/auth或Workspace absolute path。每个owner负责构造safe summary；P1-2只冻结wire/limits，不重新定义业务字段。
+catalog views不包含Prompt/Skill正文、Tool schema/private route、provider endpoint/auth或Workspace absolute path。每个owner负责构造safe summary；ADR 0134只冻结wire/limits，不重新定义业务字段。
 
 ## Snapshot
 

@@ -23,7 +23,7 @@ python3 docs/fixtures/wire-v1/verify.py
 
 ## Public Coverage
 
-- ProtocolHello/Welcome与全部ProtocolLimits；
+- ProtocolHello/Welcome/Reject、MVP exact 1.0 overlap/no-overlap、capability intersection（unknown capability drop）及全部ProtocolLimits；
 - nested RuntimeCommand、CommandCompletion、CommandError；
 - Snapshot/State/Progress/Closed EventFrame；
 - typed IDs/revisions、u64 decimal strings、Timestamp、Money、nullable fields；
@@ -37,7 +37,7 @@ python3 docs/fixtures/wire-v1/verify.py
 - malformed middle line、unknown body variant、duplicate EntryId、orphan relation和final partial tail；
 - Header/entry line/file size与complete-entry count boundary/+1 recipes。
 
-`verify.py`只做不复制协议实现的structural checks：JSON duplicate/compact byte stability、explicit Header/Entry declaration order、known dynamic arguments key order、fixture manifest completeness、key-scoped Runtime ID、revision grammar、canonical PageCursor bytes、JSONL field order/session identity、Welcome constants、LF/CRLF与partial-tail offset。dynamic decimal canonicalization的exact execution由Rust codec消费literal recipes。semantic decode/replay、negative stage/code和boundary recipe execution由紧接V4-P1-2后的Rust wire/storage conformance tests消费；不得另写一套Python domain decoder成为第二schema owner。
+`verify.py`只做不复制协议实现的structural checks：JSON duplicate/compact byte stability、explicit Header/Entry declaration order、known dynamic arguments key order、fixture manifest completeness、key-scoped Runtime ID、revision grammar、canonical PageCursor bytes、JSONL field order/session identity、Welcome constants、cross-fixture exact-version/capability negotiation、LF/CRLF与partial-tail offset。dynamic decimal canonicalization的exact execution由Rust codec消费literal recipes。semantic decode/replay、negative stage/code和boundary recipe execution由P1-2 closure后的首个Rust wire/storage conformance tests消费；不得另写一套Python domain decoder成为第二schema owner。
 
 `conversation/corruption/*.expected.json`是fixture-harness metadata，不是Runtime public wire。共同required fields：`load`、`acceptedEntryIds`、`selectedPath`、`sanitizedModelMessages`、`historicalItemIds`、`diagnostics`或`diagnosticsByMode`、`tail`；strict Header failure还必须含`openedSessionId`与typed storage `error`，其四个projection arrays仍显式为空。`acceptedEntryIds`表示required body/typed scalar decode成功、session匹配Header并进入collision guard/history graph的IDs；session mismatch/unknown variant/malformed line不reserve identity，parent或domain relation invalid的entry仍可在其中但不得污染sanitized model projection。`truncateOffset`是从file start起、保留最后一个complete LF后的zero-based byte offset。
 

@@ -461,15 +461,9 @@ JSONL不保存`TurnStarted`、`TurnCompleted`、`TurnInterrupted`、`TurnFailed`
 
 ## StoredCompaction
 
-```rust
-pub struct StoredCompaction {
-    pub summary: String,
-    pub first_kept_entry_id: Option<EntryId>,
-    pub model_call: Option<StoredCompactionModelCall>,
-}
-```
+Conversation Storage引用[Compaction-owned `StoredCompaction`与`StoredCompactionModelCall`](compaction.md#summary-validation与provenance)，只把该validated value装入`StoredEntryBody::Compaction`并按[Format V1 projection](../formats/conversation-jsonl-v1.md#compaction)serialize/replay。它不维护第二份Rust declaration或provenance semantic type。
 
-`StoredCompactionModelCall`的唯一semantic定义位于[Compaction](compaction.md#summary-validation与provenance)。automatic SummaryModel路径始终为`Some`；Conversation Storage只负责[format-v1 projection](../formats/conversation-jsonl-v1.md#compaction)，不复制第二份provenance semantic type。summary<=65,536 bytes，finish/retry/request max/metadata使用Format v1 exact limits。
+automatic SummaryModel路径始终`model_call = Some`；summary<=65,536 bytes，finish/retry/request max/metadata使用Format v1 exact limits。
 
 recorded marker只影响future replay。live Replace在inline record attempt前已经生效。marker缺失时restart恢复旧conversation；marker存在但无法在当前effective stable-unit projection上匹配index大于0的unit `first_entry_id`时，replay忽略并报告diagnostic。`None`只在当前effective conversation非空时表示覆盖全部units。
 
