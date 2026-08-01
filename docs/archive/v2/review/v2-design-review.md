@@ -240,7 +240,7 @@ initiating UserMessage 之后全部 committed model-visible history 被 hard-pro
 - **E1/E2**：**已关闭**。ADR 0112曾采用active-Turn checkpoint；ADR 0124取代该形状，允许旧Input/Steer进入rolling summary并使用single marker。模型感知summary budget继续保留。
 - **E3（UserQuestion producer与UI/Runtime职责）**：**已关闭**，由[ADR 0113](../../../adr/0113-user-question-uses-runtime-protocol-and-ui-presentation.md)记录。`request_user_question`是Turn-scoped crate-internal producer seam；首版ask-user route独占、pre-execution且不持锁，`WaitingForUserInput`保持Turn/Session execution Running。Presentation Adapter只拥有presentation，MiniCore拥有Interaction protocol、durable state、resolution校验、无限等待、Cancel/Unload、幂等和recovery；UserQuestion等待不影响其他Session。后续review只需验证实现是否遵守该协议，不再把“UI自行提问”作为可选首版方案。
 
-针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../../../migration/v1-to-v2.md#阶段-6-8-模型调用协同交付束)：
+针对F组已作决定并落盘到[迁移记录的阶段6–8协同交付束](../../../migration/v1-to-v2.md)：
 
 - **F1（SessionExecutor / ModelGateway / Compaction实现顺序）**：**已关闭**。三个模块保持既有职责边界，但不再按6→7→8独立串行验收。首个实现里程碑使用`ScriptedProviderAdapter`通过真实`PromptSet → ModelCallRequest::new → ModelGateway → ProviderAdapter`路径闭环普通AgentRun与overflow→CompactionSummary→append/apply→reassemble→AgentRun；Rig 0.40.0 spike并行提前执行，并在production provider adapter冻结前作为门禁。
 

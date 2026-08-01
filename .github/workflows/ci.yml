@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Rust ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.85.0", "stable"]
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        run: rustup toolchain install "${{ matrix.rust }}" --profile minimal --component rustfmt --component clippy
+      - name: Select Rust toolchain
+        run: rustup override set "${{ matrix.rust }}"
+      - name: Run stable quality gate
+        if: matrix.rust == 'stable'
+        run: ./scripts/check.sh
+      - name: Verify MSRV
+        if: matrix.rust == '1.85.0'
+        env:
+          MSRV_TOOLCHAIN: 1.85.0
+        run: ./scripts/check-msrv.sh
