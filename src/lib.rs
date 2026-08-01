@@ -1,3 +1,4 @@
+pub mod model_gateway;
 pub mod prompt;
 pub mod skills;
 pub mod tools;
