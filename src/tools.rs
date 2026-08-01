@@ -982,6 +982,15 @@ impl ToolRequirementSummaryView {
         })
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        filesystem: Option<String>,
+        network: Option<String>,
+        process: Option<String>,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(filesystem, network, process)
+    }
+
     pub fn filesystem(&self) -> Option<&str> {
         self.filesystem.as_deref()
     }
@@ -1029,6 +1038,16 @@ impl ToolApprovalOptionView {
             label: label.into(),
             effective_requirements,
         })
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        option_index: u32,
+        kind: ToolApprovalOptionKindView,
+        label: impl AsRef<str>,
+        effective_requirements: ToolRequirementSummaryView,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(option_index, kind, label, effective_requirements)
     }
 
     pub const fn option_index(&self) -> u32 {
@@ -1105,6 +1124,17 @@ impl ToolApprovalRequestView {
         Ok(request)
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        tool_name: ToolName,
+        arguments_summary: impl AsRef<str>,
+        reason: impl AsRef<str>,
+        requirements: ToolRequirementSummaryView,
+        options: Vec<ToolApprovalOptionView>,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(tool_name, arguments_summary, reason, requirements, options)
+    }
+
     pub const fn tool_name(&self) -> &ToolName {
         &self.tool_name
     }
@@ -1125,26 +1155,23 @@ impl ToolApprovalRequestView {
         &self.options
     }
 
-    pub fn resolve(
+    #[allow(dead_code, reason = "consumed by Conversation replay in M3")]
+    pub(crate) fn validate_recorded_resolution(
         &self,
-        decision: ToolApprovalDecisionInput,
+        resolution: ToolApprovalResolution,
     ) -> Result<ToolApprovalResolution, ToolValueError> {
-        match decision {
-            ToolApprovalDecisionInput::Deny => Ok(ToolApprovalResolution {
-                kind: ToolApprovalResolutionKind::Denied,
-            }),
-            ToolApprovalDecisionInput::Allow { option_index } => {
+        match resolution.as_ref() {
+            ToolApprovalResolutionRef::Denied => Ok(resolution),
+            ToolApprovalResolutionRef::Allowed { option_index, kind } => {
                 let option = self
                     .options()
                     .iter()
                     .find(|option| option.option_index() == option_index)
                     .ok_or(ToolValueError::InvalidApproval)?;
-                Ok(ToolApprovalResolution {
-                    kind: ToolApprovalResolutionKind::Allowed {
-                        option_index,
-                        kind: option.kind(),
-                    },
-                })
+                if option.kind() != kind {
+                    return Err(ToolValueError::InvalidApproval);
+                }
+                Ok(resolution)
             }
         }
     }
@@ -1162,6 +1189,10 @@ pub struct ToolApprovalResolution {
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "constructed by live approval and Conversation replay"
+)]
 enum ToolApprovalResolutionKind {
     Allowed {
         option_index: u32,
@@ -1188,12 +1219,175 @@ impl ToolApprovalResolution {
             ToolApprovalResolutionKind::Denied => ToolApprovalResolutionRef::Denied,
         }
     }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) const fn reconstruct_allowed(
+        option_index: u32,
+        kind: ToolApprovalOptionKindView,
+    ) -> Self {
+        Self {
+            kind: ToolApprovalResolutionKind::Allowed { option_index, kind },
+        }
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) const fn reconstruct_denied() -> Self {
+        Self {
+            kind: ToolApprovalResolutionKind::Denied,
+        }
+    }
 }
 
 impl fmt::Debug for ToolApprovalResolution {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_ref().fmt(formatter)
     }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+#[allow(dead_code, reason = "consumed by Tool execution control in M8")]
+pub(crate) enum ToolApprovalDecision {
+    AllowOnce,
+    Deny,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct ToolApprovalOption {
+    view: ToolApprovalOptionView,
+    decision: ToolApprovalDecision,
+}
+
+impl ToolApprovalOption {
+    #[allow(
+        dead_code,
+        reason = "constructed by ToolSet approval preparation in M8"
+    )]
+    fn new(
+        view: ToolApprovalOptionView,
+        decision: ToolApprovalDecision,
+    ) -> Result<Self, ToolValueError> {
+        let compatible = matches!(
+            (view.kind(), &decision),
+            (
+                ToolApprovalOptionKindView::AsRequested,
+                ToolApprovalDecision::AllowOnce
+            )
+        );
+        if !compatible {
+            return Err(ToolValueError::InvalidApproval);
+        }
+        Ok(Self { view, decision })
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ToolApprovalRequest {
+    view: ToolApprovalRequestView,
+    options: Arc<[ToolApprovalOption]>,
+}
+
+impl ToolApprovalRequest {
+    #[allow(
+        dead_code,
+        reason = "constructed by ToolSet approval preparation in M8"
+    )]
+    fn new(
+        view: ToolApprovalRequestView,
+        options: Vec<ToolApprovalOption>,
+    ) -> Result<Self, ToolValueError> {
+        if options.len() != view.options().len()
+            || options
+                .iter()
+                .zip(view.options())
+                .any(|(option, view)| &option.view != view)
+        {
+            return Err(ToolValueError::InvalidApproval);
+        }
+        Ok(Self {
+            view,
+            options: options.into(),
+        })
+    }
+
+    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    pub(crate) const fn view(&self) -> &ToolApprovalRequestView {
+        &self.view
+    }
+
+    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    pub(crate) fn resolve(
+        &self,
+        input: ToolApprovalDecisionInput,
+    ) -> Result<ResolvedToolApproval, ToolValueError> {
+        match input {
+            ToolApprovalDecisionInput::Deny => Ok(ResolvedToolApproval {
+                decision: ToolApprovalDecision::Deny,
+                resolution: ToolApprovalResolution::reconstruct_denied(),
+            }),
+            ToolApprovalDecisionInput::Allow { option_index } => {
+                let option = self
+                    .options
+                    .iter()
+                    .find(|option| option.view.option_index() == option_index)
+                    .ok_or(ToolValueError::InvalidApproval)?;
+                Ok(ResolvedToolApproval {
+                    decision: option.decision.clone(),
+                    resolution: ToolApprovalResolution::reconstruct_allowed(
+                        option_index,
+                        option.view.kind(),
+                    ),
+                })
+            }
+        }
+    }
+}
+
+#[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+pub(crate) struct ResolvedToolApproval {
+    decision: ToolApprovalDecision,
+    resolution: ToolApprovalResolution,
+}
+
+impl ResolvedToolApproval {
+    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    pub(crate) const fn decision(&self) -> &ToolApprovalDecision {
+        &self.decision
+    }
+
+    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    pub(crate) const fn resolution(&self) -> &ToolApprovalResolution {
+        &self.resolution
+    }
+
+    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    pub(crate) fn into_parts(self) -> (ToolApprovalDecision, ToolApprovalResolution) {
+        (self.decision, self.resolution)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
+    let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
+    let option = ToolApprovalOptionView::new(
+        0,
+        ToolApprovalOptionKindView::AsRequested,
+        "Allow once",
+        requirements.clone(),
+    )
+    .unwrap();
+    let view = ToolApprovalRequestView::new(
+        "write_file".parse().unwrap(),
+        "path: src/lib.rs",
+        "write requested",
+        requirements,
+        vec![option.clone()],
+    )
+    .unwrap();
+    ToolApprovalRequest::new(
+        view,
+        vec![ToolApprovalOption::new(option, ToolApprovalDecision::AllowOnce).unwrap()],
+    )
+    .unwrap()
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1215,6 +1409,14 @@ impl UserQuestionChoice {
             option_index,
             label: label.into(),
         })
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        option_index: u32,
+        label: impl AsRef<str>,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(option_index, label)
     }
 
     pub const fn option_index(&self) -> u32 {
@@ -1271,6 +1473,16 @@ impl UserQuestionField {
         })
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        question_index: u32,
+        prompt: impl AsRef<str>,
+        required: bool,
+        input: UserQuestionInput,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(question_index, prompt, required, input)
+    }
+
     pub const fn question_index(&self) -> u32 {
         self.question_index
     }
@@ -1323,6 +1535,14 @@ impl UserQuestionRequest {
             return Err(ToolValueError::InvalidQuestion);
         }
         Ok(request)
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        title: Option<String>,
+        questions: Vec<UserQuestionField>,
+    ) -> Result<Self, ToolValueError> {
+        Self::new(title, questions)
     }
 
     pub fn title(&self) -> Option<&str> {
@@ -1908,34 +2128,87 @@ mod tests {
             requirements.clone(),
         )
         .unwrap();
-        let approval = ToolApprovalRequestView::new(
+        let approval_view = ToolApprovalRequestView::new(
             "write_file".parse().unwrap(),
             "path: src/lib.rs",
             "write requested",
             requirements,
-            vec![option],
+            vec![option.clone()],
         )
         .unwrap();
+        let approval = ToolApprovalRequest::new(
+            approval_view.clone(),
+            vec![ToolApprovalOption::new(option, ToolApprovalDecision::AllowOnce).unwrap()],
+        )
+        .unwrap();
+        let allowed = approval
+            .resolve(ToolApprovalDecisionInput::Allow { option_index: 0 })
+            .unwrap();
         assert!(matches!(
-            approval
-                .resolve(ToolApprovalDecisionInput::Allow { option_index: 0 })
-                .unwrap()
-                .as_ref(),
+            allowed.decision(),
+            ToolApprovalDecision::AllowOnce
+        ));
+        assert!(matches!(
+            allowed.resolution().as_ref(),
             ToolApprovalResolutionRef::Allowed {
                 option_index: 0,
                 kind: ToolApprovalOptionKindView::AsRequested,
             }
         ));
-        assert_eq!(
+        assert!(matches!(
             approval.resolve(ToolApprovalDecisionInput::Allow { option_index: 1 }),
             Err(ToolValueError::InvalidApproval)
-        );
+        ));
         assert!(matches!(
             approval
                 .resolve(ToolApprovalDecisionInput::Deny)
                 .unwrap()
+                .resolution()
                 .as_ref(),
             ToolApprovalResolutionRef::Denied
+        ));
+        assert!(
+            approval_view
+                .validate_recorded_resolution(ToolApprovalResolution::reconstruct_allowed(
+                    0,
+                    ToolApprovalOptionKindView::AsRequested,
+                ))
+                .is_ok()
+        );
+        assert!(matches!(
+            approval_view.validate_recorded_resolution(
+                ToolApprovalResolution::reconstruct_allowed(
+                    0,
+                    ToolApprovalOptionKindView::Restricted,
+                )
+            ),
+            Err(ToolValueError::InvalidApproval)
+        ));
+        assert!(matches!(
+            approval_view.validate_recorded_resolution(
+                ToolApprovalResolution::reconstruct_allowed(
+                    1,
+                    ToolApprovalOptionKindView::AsRequested,
+                )
+            ),
+            Err(ToolValueError::InvalidApproval)
+        ));
+        assert!(
+            approval_view
+                .validate_recorded_resolution(ToolApprovalResolution::reconstruct_denied())
+                .is_ok()
+        );
+
+        let restricted_view = ToolApprovalOptionView::new(
+            0,
+            ToolApprovalOptionKindView::Restricted,
+            "Restricted",
+            ToolRequirementSummaryView::new(None, None, None).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            ToolApprovalOption::new(restricted_view, ToolApprovalDecision::AllowOnce),
+            Err(ToolValueError::InvalidApproval)
         ));
 
         let large_requirements = ToolRequirementSummaryView::new(
