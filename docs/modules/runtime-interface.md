@@ -1401,6 +1401,28 @@ pub struct SessionDiagnosticView {
 
 diagnostic view没有global severity。code由owning module allowlist投影，message bounded/redacted；raw provider/storage/OS text不公开。
 
+### Diagnostic Projection Limits
+
+owner先维护ordered diagnostic facts与per-code totals，public Vec再按target surface投影；禁止直接把Conversation Replay的`100 Detail + Truncated`内部records复制进Snapshot：
+
+```text
+SessionSnapshot.diagnostics             limit = 50
+GetSessionDiagnostics / each scope      limit = 100
+Runtime diagnostics query/snapshot      matching advertised scope limit
+```
+
+通用`project_diagnostics(limit)`规则：
+
+1. synthetic internal `Truncated`不算source fact；source fact total和per-code totals来自owner typed counters；
+2. 若全部source facts都有detail且`total <= limit`，按owner order返回全部detail，不创建summary；
+3. 否则保留owner order前`limit - 1`条available detail，并以最后一个slot返回`code = diagnostics_truncated` summary；
+4. public summary的`omitted_detail_count = total_source_fact_count - returned_detail_count`，per-code totals覆盖全部source facts并按code bytes升序；summary自身不回增total；
+5. summary message固定bounded format `omitted <N> diagnostic details; totals: <code>=<count>,...`，仅供人读，consumer不得解析message；machine totals保留在owner/query harness，不新增generic public aggregate DTO。
+
+Session Snapshot有一个额外current-state rule：当`recording.state = degraded`时，matching latest recording diagnostic固定为`diagnostics[0]`且只占一个slot；随后对排除该fact的其余ordered facts调用`project_diagnostics(49)`。若Healthy则对全部facts调用`project_diagnostics(50)`。这样Snapshot始终满足recording warning invariant且总count<=50。Session diagnostics Query不做该重排，按owner order使用limit 100。
+
+101条同code replay facts因此得到：internal 100 Detail + typed Truncated；Session Query返回99 detail + summary（omitted=2、total=101）；Healthy Snapshot返回49 detail + summary（omitted=52、total=101）。
+
 ### Catalog Read Views
 
 ```rust

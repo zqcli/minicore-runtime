@@ -1,0 +1,1 @@
+{"type":"state","data":{"timestamp":"2026-07-31T12:00:02.000Z","commandId":null,"route":{"type":"runtime"},"msg":{"type":"runtime","data":{"kind":"command_catalog_invalidated","snapshot":{"runtime":{"status":"running"},"loadedSessions":[],"diagnostics":[]},"detail":null}},"futureField":{"nested":[1,2,3]}}}

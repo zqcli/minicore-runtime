@@ -171,7 +171,7 @@ pub struct WorkspaceCwdSpec {
 }
 ```
 
-`WorkspaceRootSpec.path`的public wire使用[Wire Schema canonical RFC 8089 file URI](wire-schema.md#workspace-paths)，v1只接受lossless UTF-8 native path；内部仍立即转换/validate为platform PathBuf。`WorkspaceRelativePath` wire使用同节的forward-slash carrier。wire lexical validation不替代以下Workspace semantic约束：
+`WorkspaceRootSpec.path`的public wire使用[Wire Schema platform-independent canonical RFC 8089 file URI](wire-schema.md#workspace-paths)。adapter先decode为family-tagged CanonicalFileUri，再由Workspace checked-convert为current-host PathBuf；不允许直接调用ambient platform URI/path parser决定wire canonicality。v1只接受lossless UTF-8 native path；family不受host支持时typed reject。`WorkspaceRelativePath` wire使用同节的forward-slash carrier。wire lexical validation不替代以下Workspace semantic约束：
 
 - 不是绝对路径；
 - 不含平台 path prefix；

@@ -1,9 +1,9 @@
 # ADR 0124：Session Replay宽容恢复并收窄持久化引用链
 
-状态：Partially Superseded by ADRs 0126, 0127, 0131 and 0132
+状态：Partially Superseded by ADRs 0126, 0127, 0131, 0132 and 0134
 日期：2026-07-29
 
-> 2026-07-31：[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)与[Format V1](../formats/conversation-jsonl-v1.md)冻结typed ID/revision、strict Header、bounded scanner、oversized complete line、partial-tail truncation precedence和exact Stored DTO。tolerant replay/minimal links语义保持。
+> 2026-07-31：[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)、[Format V1](../formats/conversation-jsonl-v1.md)与current Conversation Storage冻结typed ID/revision、strict Header、bounded scanner、selected-root/physical-last-leaf规则、session-before-collision precedence、oversized complete line和partial-tail truncation。本文“orphan重启selected path”被取代为isolated history node。
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化single prefix marker：`first_kept_entry_id`必须由live reducer发布的provider-valid stable-unit source与cut派生；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
 
@@ -72,10 +72,10 @@ cold replay不再承诺和append使用相同拒绝规则，也不因一条坏记
 - 最后一个未换行partial line：read-only open忽略并报告；writable open取得exclusive lease后截断；
 - newline-terminated invalid JSON或unknown core variant：跳过该行并记录line/byte offset diagnostic；
 - duplicate EntryId：first valid occurrence wins，后续重复行跳过；
-- missing parent：保留该entry为orphan root，selected path从该entry重新开始；
+- missing parent：保留该entry为isolated orphan history node，不进入canonical root component或selected path；
 - invalid cross-entry reference：对应projection忽略该关系或entry，其他projection和后续有效记录继续；
 - malformed/incomplete Tool exchange：不进入模型conversation，历史/UI仍可显示能够解释的独立事实；
-- terminal或Interaction closure不完整：load继续，writable recovery尽力追加明确closure，失败时Session history仍可读但Turn admission可以Unavailable。
+- terminal或Interaction closure不完整：load继续并隔离invalid relation；ADR 0127/0131后recovery不追加closure、不恢复waiter或旧Turn；
 
 每次load返回结构化`SessionReplayDiagnostics`。普通load不修改中段内容，不猜测parent、不合成缺失ToolResult、不重写用户历史。
 

@@ -267,16 +267,16 @@ pub enum ToolAbandonReason {
 
 `ToolResultContent`是唯一model-visible/stored result body；MVP只支持1..32个safe Text parts，每part<=65,536 bytes、aggregate<=262,144 bytes。structured executor payload必须由Tool owner确定性render为Text；raw JSON可在bounded `details`中供current-process trusted debug projection使用，但不自动进入模型，且[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#tool-message)明确不记录details。
 
-`Succeeded`要求executor产生exact successful business result；`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
+`Succeeded`要求Tool owner产生exact successful business result：ordinary Tool来自executor exact success；ask-user等built-in control Tool可以在不启动side effect/executor的情况下由合法Interaction resolution产生truthful success。`Failed`表示有truthful Tool/preflight error（例如unknown Tool、invalid arguments、Hook或exact executor failure）；`Denied`表示policy、approval、Workspace authority或Sandbox capability的pre-execution fail-closed拒绝；`Cancelled`只在能证明side effect未开始或executor返回exact cancellation result时使用。outcome unknown不能伪造成上述任一disposition，必须使用`ToolExecutionOutcome::Abandoned`，其reason只能是`OutcomeUnknown`或`RuntimeFailure`。raw internal error不能进入reason。
 
 source/disposition valid matrix：
 
 | Source | Allowed dispositions |
 | --- | --- |
-| PreExecution | Failed、Denied、Cancelled |
+| PreExecution | Succeeded、Failed、Denied、Cancelled |
 | Executed | Succeeded、Failed、Cancelled |
 
-Executed Denied与PreExecution Succeeded invalid；unknown outcome使用Abandoned，不伪造Completed。
+PreExecution Succeeded用于ask-user等无需executor side effect即可truthfully完成的built-in Tool；Executed Denied invalid。unknown outcome使用Abandoned，不伪造Completed。
 
 这三个execution类型、`ToolResultContent`、`ToolResultDisposition`和`ToolAbandonReason`的完整shape只在Tools定义。`ToolCall`不保存ItemId；ActiveTurnTask在assistant response live apply前按同一candidate分配ItemId并构造`ToolExecutionRequest`，随后把Assistant、Started Items和expected set作为一个owner-local no-await mutation应用。`call_index`是validated assistant response中ToolCall的zero-based稳定顺序，由Session Execution按finalized content order规范化；provider adapter用于stream/final关联的内部index不作为mutation queue顺序来源。Turn/Item和storage可以投影`ItemId + ToolCallId`，但不得定义第二个execution input/outcome。
 
@@ -578,6 +578,7 @@ schema invalid
 hook deny/failure
 policy deny
 approval deny
+ask-user合法answer完成
 Sandbox unavailable
 EmergencyControl wins before start
 ```
@@ -587,11 +588,11 @@ EmergencyControl wins before start
 ```text
 Completed {
   source = PreExecution,
-  result.disposition = Failed | Denied | Cancelled
+  result.disposition = Succeeded | Failed | Denied | Cancelled
 }
 ```
 
-`CancelledBeforeStart`不是独立terminal outcome variant。只要start reservation尚未获胜且可以证明没有side effect，Cancel/SecurityRevoked也返回`Completed { source = PreExecution, result.disposition = Cancelled }`。ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
+`PreExecution + Succeeded`只用于ask-user等built-in control route已经truthfully完成且没有executor side effect的结果；普通Tool不得用它绕过executor。`CancelledBeforeStart`不是独立terminal outcome variant。只要start reservation尚未获胜且可以证明没有side effect，Cancel/SecurityRevoked也返回`Completed { source = PreExecution, result.disposition = Cancelled }`。ActiveTurnTask把truthful outcome apply为live role=tool message，并完成inline record attempt。
 
 ### Executed Result
 

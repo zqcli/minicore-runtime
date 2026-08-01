@@ -1,0 +1,1 @@
+{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"fixture-host","version":"1.0.0"},"capabilities":{"values":["state_events","progress_events","runtime_snapshot","session_snapshot","paged_queries","command_catalog","interaction_resolution","session_fork"]}}

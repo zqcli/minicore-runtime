@@ -56,7 +56,7 @@ ADR 0133冻结了Runtime public semantic payload，ADR 0124/0126/0131/0132冻结
 
 13. Recorder在触碰file前完成semantic validation和bounded in-memory encoding。encode/size/write/partial-or-unknown-write failure按ADR 0126令Recorder Degraded，不retry、不写later suffix。domain producer必须在live apply前把可能超limit的Model/Tool/Interaction/Compaction payload归约为truthful bounded semantic result；不能依赖Recorder late failure维持public Snapshot bounds。
 
-14. diagnostics只使用owner allowlisted code与bounded redacted message。不得包含raw line、absolute path、raw OS/provider error、headers/body、Tool raw output、credential或hidden reasoning。每次replay最多保留100条detail，额外事实按code aggregate并追加一个truncated summary。
+14. diagnostics只使用owner allowlisted code与bounded redacted message。不得包含raw line、absolute path、raw OS/provider error、headers/body、Tool raw output、credential或hidden reasoning。每次replay对每个fact先递增per-code total counter，只保留physical order前100条detail；若有detail被省略，再追加一个`diagnostics_truncated` summary，携带omitted detail总数与全部observed facts的per-code totals。
 
 15. exact wire、format和corruption behavior必须有byte-exact golden vectors、schema validation、round-trip semantic equality与boundary-plus-one negative vectors。object member order只用于canonical encoder fixture，不成为decoder compatibility requirement。
 

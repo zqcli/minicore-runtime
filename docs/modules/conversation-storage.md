@@ -479,7 +479,16 @@ recorded marker只影响future replay。live Replace在inline record attempt前�
 
 cold file仍可能因手工编辑、旧bug或partial migration包含orphan；replay隔离而不是brick全部history。
 
-不建立Branch entity。selected path由root到chosen leaf确定。
+不建立Branch entity。Replay按下列规则唯一选择effective path：
+
+1. physical scan中第一个accepted且`parent_id = None`的entry成为canonical root；在它之前若无accepted entry则继续等待；
+2. 后续`parent_id = None` entry不创建第二个current root，保留为isolated history node并产生`invalid_relation`；missing-parent orphan同样不属于canonical component；
+3. accepted entry仅在其parent已经位于canonical component时加入该component；branch本身合法并保留；
+4. chosen leaf是canonical component内physical scan ordinal最大的accepted entry。parent必须引用更早line，因此该entry在component内必为leaf；timestamp、EntryId lexical order和ItemId不参与；
+5. selected path是canonical root到chosen leaf的唯一parent chain；`recorded_head = chosen_leaf`，new Recorder append、RecordedHistory Fork与sanitized projection都使用它；非selected branches仍可由history tree query观察；
+6. 无accepted root时selected path与recorded_head均为空。collision guard仍seed全部first-valid accepted EntryId，包括isolated root/orphan/非selected branch，防止future identity reuse。
+
+exact selection vectors见[branch-last-leaf](../fixtures/wire-v1/conversation/corruption/branch-last-leaf.jsonl)与[multiple-root-isolation](../fixtures/wire-v1/conversation/corruption/multiple-root-isolation.jsonl)。
 
 ## Tolerant Replay
 
@@ -490,14 +499,63 @@ replay按[Format V1 bounded decode](../formats/conversation-jsonl-v1.md#bounded-
 1. 检查whole-file physical byte cap；超过1 GiB返回HistoryTooLarge，不truncate tail；
 2. strict解析Header；oversized/malformed/invalid UTF-8/unsupported version立即fail Load；
 3. 以bounded scanner读取newline-terminated entries并在scan中执行1,000,000 complete-entry cap；oversized line stream-discard到LF，invalid UTF-8/malformed/unknown variant skip + diagnostic；
-4. UserMessage正文与解释性contribution stamps独立校验；未知origin、malformed stamp或越界`content_part_index`直接丢弃；同一part first valid stamp wins；合法正文保留；
-5. duplicate EntryId使用first valid wins并告警；
-6. missing parent形成isolated orphan root；
-7. invalid Session/Turn/Item/Tool/Interaction relation只隔离对应projection；
-8. invalid Compaction marker忽略该effect并diagnose；
-9. whole-file cap已通过时，最后unterminated bytes作为partial tail忽略；
-10. 构建recorded tree、history view和sanitized conversation；
-11. 保留最多100条redacted diagnostic detail，额外按code aggregate并追加truncated summary。
+4. required envelope/body/typed scalar decode完成后先校验Entry.session_id == Header.session_id；session mismatch line不进入collision guard、不能满足later parent；
+5. 对session-valid candidate执行EntryId first-valid wins并立即seed collision guard；从此即使parent/Item/Tool/Interaction relation后来被隔离，该ID也不得复用；
+6. UserMessage正文与解释性contribution stamps独立校验；未知origin、malformed stamp或越界`content_part_index`直接丢弃；同一part first valid stamp wins；合法正文保留；
+7. missing parent形成isolated orphan root；
+8. invalid Turn/Item/Tool/Interaction relation只隔离对应projection；
+9. invalid Compaction marker忽略该effect并diagnose；
+10. whole-file cap已通过时，最后unterminated bytes作为partial tail忽略；
+11. 按History Tree规则选择recorded head，构建history view和sanitized conversation；
+12. 每个diagnostic fact先递增per-code total；只保留前100条redacted detail，若有省略则追加`diagnostics_truncated` summary，记录omitted detail count与包含已保留facts在内的per-code totals。
+
+Conversation Storage拥有closed replay diagnostic taxonomy，并与Wire Schema required codes使用同一exact snake_case strings；public `SessionDiagnosticView.code`不能透传parser/OS/provider text：
+
+```rust
+pub enum SessionReplayDiagnosticCode {
+    PartialTail,
+    OversizedLine,
+    InvalidUtf8,
+    MalformedJson,
+    InvalidEntry,
+    UnknownRecordVariant,
+    UnknownEntryVariant,
+    DuplicateEntryId,
+    MissingParent,
+    SessionMismatch,
+    InvalidRelation,
+    InvalidContributionStamp,
+    DuplicateContributionStamp,
+    InvalidToolExchange,
+    InvalidInteractionRelation,
+    InvalidCompactionMarker,
+    DiagnosticsTruncated,
+    HistoryTooLarge,
+}
+```
+
+```text
+partial_tail
+oversized_line
+invalid_utf8
+malformed_json
+invalid_entry
+unknown_record_variant
+unknown_entry_variant
+duplicate_entry_id
+missing_parent
+session_mismatch
+invalid_relation
+invalid_contribution_stamp
+duplicate_contribution_stamp
+invalid_tool_exchange
+invalid_interaction_relation
+invalid_compaction_marker
+diagnostics_truncated
+history_too_large
+```
+
+Unknown additive object fields在structural caps内bounded skip且不产生diagnostic。每个complete line按scanner → bounded schema/variant → Header session match → duplicate identity → parent/domain relation → projection顺序确定primary code；同一失败stage不凭hash-map iteration选择code。一个line最多产生一个primary code，合法User body内独立drop的stamp分别归并为`invalid_contribution_stamp`或`duplicate_contribution_stamp`。Tool/Interaction/Compaction projection可以在entry被accepted为historical node后额外产生owning projection code。read-only ignore与exclusive-writable truncate都使用`partial_tail`，action只存在于typed internal detail；前100条detail之外追加一次`diagnostics_truncated` summary，aggregate counter表示全部observed facts而非仅omitted suffix。exact fixture expectations见[Wire V1 Fixtures](../fixtures/wire-v1/README.md)。
 
 Replay不恢复任何process-local执行对象，也不根据stamp重新加载Skill/Workspace正文、重新授权source或重建旧PromptSet。conversation正文是恢复正确性的事实，stamp只承担安全解释作用。
 
@@ -614,13 +672,30 @@ Tail处理只允许在valid v1 Header、exclusive writable lease且whole-file ca
 ## Diagnostics
 
 ```rust
-pub struct SessionReplayDiagnostic {
+pub enum SessionReplayDiagnostic {
+    Detail(SessionReplayDiagnosticDetail),
+    Truncated(SessionReplayDiagnosticsTruncated),
+}
+
+pub struct SessionReplayDiagnosticDetail {
     pub code: SessionReplayDiagnosticCode,
     pub entry_id: Option<EntryId>,
     pub line_number: Option<u64>,
     pub redacted_detail: Option<String>,
 }
+
+pub struct SessionReplayDiagnosticsTruncated {
+    pub omitted_detail_count: u64,
+    pub totals: Arc<[SessionReplayDiagnosticCount]>,
+}
+
+pub struct SessionReplayDiagnosticCount {
+    pub code: SessionReplayDiagnosticCode,
+    pub count: u64,
+}
 ```
+
+`Detail`最多100条并保持physical/emission order。`Truncated`仅在`omitted_detail_count > 0`时作为最后一个record存在；`totals`按exact snake_case code bytes升序、每code恰一项，count覆盖全部observed source facts（含前100条detail）。synthetic `Truncated` record本身不递增`diagnostics_truncated`或任何total。它是owner-side aggregate source，不得一对一append到public Vec；[Runtime Interface diagnostic projection](runtime-interface.md#diagnostic-projection-limits)按Snapshot/Query limit重新计算returned detail、omitted count和最后一个`diagnostics_truncated` view。u64 count使用checked increment；在1,000,000-entry/record structural caps下overflow是invariant failure。
 
 Diagnostics exact code、100-detail cap、512-byte redacted message和aggregate规则由[Wire Schema](wire-schema.md#diagnostics)与[Format V1](../formats/conversation-jsonl-v1.md#bounded-decode与replay)拥有。禁止暴露raw line、credential、绝对敏感路径、完整Tool output、OS error或provider payload。
 

@@ -1,0 +1,707 @@
+{
+  "version": 1,
+  "lineEndingBytesExcludedFromLineCaps": true,
+  "cases": [
+    {
+      "name": "header_line_boundary",
+      "scope": "conversation_header_line",
+      "targetBytesExcludingLineEnding": 65536,
+      "generator": {
+        "kind": "headerWithTrailingWhitespace",
+        "lineEnding": "lf"
+      },
+      "expected": {
+        "load": "succeeds"
+      }
+    },
+    {
+      "name": "header_line_oversized",
+      "scope": "conversation_header_line",
+      "targetBytesExcludingLineEnding": 65537,
+      "generator": {
+        "kind": "headerWithTrailingWhitespace",
+        "lineEnding": "lf"
+      },
+      "expected": {
+        "load": "fails",
+        "error": "HeaderCorrupt",
+        "truncate": false
+      }
+    },
+    {
+      "name": "entry_line_boundary",
+      "scope": "conversation_entry_line",
+      "targetBytesExcludingLineEnding": 1048576,
+      "generator": {
+        "kind": "entryWithBoundedUnknownPadding",
+        "lineEnding": "lf"
+      },
+      "expected": {
+        "lineAccepted": true
+      }
+    },
+    {
+      "name": "entry_line_oversized",
+      "scope": "conversation_entry_line",
+      "targetBytesExcludingLineEnding": 1048577,
+      "generator": {
+        "kind": "entryWithBoundedUnknownPaddingThenCanonicalEntry",
+        "lineEnding": "lf"
+      },
+      "expected": {
+        "lineAccepted": false,
+        "diagnostic": "oversized_line",
+        "scanContinuesAfterLf": true,
+        "followingCanonicalEntryAccepted": true
+      }
+    },
+    {
+      "name": "file_boundary",
+      "scope": "conversation_file",
+      "targetBytes": 1073741824,
+      "generator": {
+        "kind": "canonicalHeaderAndOneEntryThenAsciiPartialTail",
+        "exactPhysicalBytes": true
+      },
+      "expected": {
+        "loadMayProceedToEntryCountRule": true,
+        "tailTruncationEvaluatedAfterFileCap": true
+      }
+    },
+    {
+      "name": "file_oversized",
+      "scope": "conversation_file",
+      "targetBytes": 1073741825,
+      "generator": {
+        "kind": "canonicalHeaderAndOneEntryThenAsciiPartialTail",
+        "exactPhysicalBytes": true
+      },
+      "expected": {
+        "load": "fails",
+        "error": "HistoryTooLarge",
+        "truncate": false
+      }
+    },
+    {
+      "name": "complete_entry_count_boundary",
+      "scope": "conversation_complete_entries",
+      "targetCount": 1000000,
+      "generator": {
+        "kind": "streamCanonicalEntryChain",
+        "uniqueEntryIds": true
+      },
+      "expected": {
+        "countAccepted": true
+      }
+    },
+    {
+      "name": "complete_entry_count_oversized",
+      "scope": "conversation_complete_entries",
+      "targetCount": 1000001,
+      "generator": {
+        "kind": "streamCanonicalEntryChain",
+        "uniqueEntryIds": true
+      },
+      "expected": {
+        "load": "fails",
+        "error": "HistoryTooLarge",
+        "failureAtEntry": 1000001
+      }
+    },
+    {
+      "name": "invalid_utf8_entry",
+      "scope": "conversation_entry_line",
+      "generator": {
+        "kind": "rawBytesThenCanonicalEntry",
+        "hex": "ff0a"
+      },
+      "expected": {
+        "lineAccepted": false,
+        "diagnostic": "invalid_utf8",
+        "scanContinuesAfterLf": true,
+        "followingCanonicalEntryAccepted": true
+      }
+    },
+    {
+      "name": "record_depth_boundary",
+      "scope": "conversation_record_structure",
+      "targetDepth": 64,
+      "generator": {
+        "kind": "entryUnknownAdditiveNestedArrays"
+      },
+      "expected": {
+        "entryAccepted": true
+      }
+    },
+    {
+      "name": "record_depth_oversized",
+      "scope": "conversation_record_structure",
+      "targetDepth": 65,
+      "generator": {
+        "kind": "entryUnknownAdditiveNestedArrays"
+      },
+      "expected": {
+        "entryAccepted": false,
+        "diagnostic": "invalid_entry"
+      }
+    },
+    {
+      "name": "record_object_members_boundary",
+      "scope": "conversation_record_structure",
+      "targetObjectMembers": 256,
+      "generator": {
+        "kind": "entryUnknownAdditiveObject"
+      },
+      "expected": {
+        "entryAccepted": true
+      }
+    },
+    {
+      "name": "record_object_members_oversized",
+      "scope": "conversation_record_structure",
+      "targetObjectMembers": 257,
+      "generator": {
+        "kind": "entryUnknownAdditiveObject"
+      },
+      "expected": {
+        "entryAccepted": false,
+        "diagnostic": "invalid_entry"
+      }
+    },
+    {
+      "name": "record_array_items_boundary",
+      "scope": "conversation_record_structure",
+      "targetArrayItems": 4096,
+      "generator": {
+        "kind": "entryUnknownAdditiveArray"
+      },
+      "expected": {
+        "entryAccepted": true
+      }
+    },
+    {
+      "name": "record_array_items_oversized",
+      "scope": "conversation_record_structure",
+      "targetArrayItems": 4097,
+      "generator": {
+        "kind": "entryUnknownAdditiveArray"
+      },
+      "expected": {
+        "entryAccepted": false,
+        "diagnostic": "invalid_entry"
+      }
+    },
+    {
+      "name": "record_total_nodes_boundary",
+      "scope": "conversation_record_structure",
+      "targetTotalNodes": 16384,
+      "generator": {
+        "kind": "entryUnknownAdditiveTree"
+      },
+      "expected": {
+        "entryAccepted": true
+      }
+    },
+    {
+      "name": "record_total_nodes_oversized",
+      "scope": "conversation_record_structure",
+      "targetTotalNodes": 16385,
+      "generator": {
+        "kind": "entryUnknownAdditiveTree"
+      },
+      "expected": {
+        "entryAccepted": false,
+        "diagnostic": "invalid_entry"
+      }
+    },
+    {
+      "name": "record_string_boundary",
+      "scope": "conversation_record_structure",
+      "targetDecodedStringBytes": 524288,
+      "generator": {
+        "kind": "entryUnknownAdditiveString",
+        "fill": "x"
+      },
+      "expected": {
+        "entryAccepted": true
+      }
+    },
+    {
+      "name": "record_string_oversized",
+      "scope": "conversation_record_structure",
+      "targetDecodedStringBytes": 524289,
+      "generator": {
+        "kind": "entryUnknownAdditiveString",
+        "fill": "x"
+      },
+      "expected": {
+        "entryAccepted": false,
+        "diagnostic": "invalid_entry"
+      }
+    },
+    {
+      "name": "bounded_json_canonicalization",
+      "scope": "embedded_json_value",
+      "inputUtf8": "{\"z\":1.0,\"a\":1e0,\"m\":-0}",
+      "expectedCanonicalUtf8": "{\"a\":1,\"m\":0,\"z\":1}",
+      "expected": {
+        "valueAccepted": true,
+        "semanticRoundTripEqual": true
+      }
+    },
+    {
+      "name": "bounded_json_exponent_oversized",
+      "scope": "embedded_json_value",
+      "inputUtf8": "{\"value\":1e1000001}",
+      "expected": {
+        "valueAccepted": false
+      }
+    },
+    {
+      "name": "bounded_json_input_bytes_boundary",
+      "scope": "embedded_json_value",
+      "targetRawInputBytes": 65536,
+      "generator": {
+        "kind": "boundedJsonRawInputWithWhitespace",
+        "canonicalOutputBelowBytes": 65536
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_input_bytes_oversized",
+      "scope": "embedded_json_value",
+      "targetRawInputBytes": 65537,
+      "generator": {
+        "kind": "boundedJsonRawInputWithWhitespace",
+        "canonicalOutputBelowBytes": 65536
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "raw_input_bytes"
+      }
+    },
+    {
+      "name": "bounded_json_output_bytes_boundary",
+      "scope": "embedded_json_value",
+      "targetCanonicalEncodedBytes": 65536,
+      "maxRawInputBytes": 65536,
+      "generator": {
+        "kind": "boundedJsonObjectCanonicalExpansion"
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_output_bytes_oversized",
+      "scope": "embedded_json_value",
+      "targetCanonicalEncodedBytes": 65537,
+      "maxRawInputBytes": 65536,
+      "generator": {
+        "kind": "boundedJsonObjectCanonicalExpansion"
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "canonical_output_bytes"
+      }
+    },
+    {
+      "name": "bounded_json_depth_boundary",
+      "scope": "embedded_json_value",
+      "targetDepth": 32,
+      "generator": {
+        "kind": "boundedJsonObjectWithNestedArrays"
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_depth_oversized",
+      "scope": "embedded_json_value",
+      "targetDepth": 33,
+      "generator": {
+        "kind": "boundedJsonObjectWithNestedArrays"
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "owning_limit"
+      }
+    },
+    {
+      "name": "bounded_json_members_boundary",
+      "scope": "embedded_json_value",
+      "targetObjectMembers": 256,
+      "generator": {
+        "kind": "boundedJsonObject",
+        "canonicalKeys": true
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_members_oversized",
+      "scope": "embedded_json_value",
+      "targetObjectMembers": 257,
+      "generator": {
+        "kind": "boundedJsonObject",
+        "canonicalKeys": true
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "owning_limit"
+      }
+    },
+    {
+      "name": "bounded_json_array_boundary",
+      "scope": "embedded_json_value",
+      "targetArrayItems": 256,
+      "generator": {
+        "kind": "boundedJsonObjectWithArray"
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_array_oversized",
+      "scope": "embedded_json_value",
+      "targetArrayItems": 257,
+      "generator": {
+        "kind": "boundedJsonObjectWithArray"
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "owning_limit"
+      }
+    },
+    {
+      "name": "bounded_json_string_boundary",
+      "scope": "embedded_json_value",
+      "targetDecodedStringBytes": 16384,
+      "generator": {
+        "kind": "boundedJsonObjectWithString",
+        "fill": "x"
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_string_oversized",
+      "scope": "embedded_json_value",
+      "targetDecodedStringBytes": 16385,
+      "generator": {
+        "kind": "boundedJsonObjectWithString",
+        "fill": "x"
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "owning_limit"
+      }
+    },
+    {
+      "name": "bounded_json_number_boundary",
+      "scope": "embedded_json_value",
+      "targetNumberLiteralBytes": 64,
+      "generator": {
+        "kind": "boundedJsonObjectWithNumber"
+      },
+      "expected": {
+        "valueAccepted": true
+      }
+    },
+    {
+      "name": "bounded_json_number_oversized",
+      "scope": "embedded_json_value",
+      "targetNumberLiteralBytes": 65,
+      "generator": {
+        "kind": "boundedJsonObjectWithNumber"
+      },
+      "expected": {
+        "valueAccepted": false,
+        "failure": "owning_limit"
+      }
+    },
+    {
+      "name": "bounded_schema_input_bytes_boundary",
+      "scope": "embedded_json_schema",
+      "targetRawInputBytes": 65536,
+      "generator": {
+        "kind": "schemaRawInputWithWhitespace",
+        "canonicalOutputBelowBytes": 65536
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_input_bytes_oversized",
+      "scope": "embedded_json_schema",
+      "targetRawInputBytes": 65537,
+      "generator": {
+        "kind": "schemaRawInputWithWhitespace",
+        "canonicalOutputBelowBytes": 65536
+      },
+      "expected": {
+        "schemaAccepted": false,
+        "failure": "raw_input_bytes"
+      }
+    },
+    {
+      "name": "bounded_schema_output_bytes_boundary",
+      "scope": "embedded_json_schema",
+      "targetCanonicalEncodedBytes": 65536,
+      "maxRawInputBytes": 65536,
+      "generator": {
+        "kind": "schemaCanonicalExpansion"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_output_bytes_oversized",
+      "scope": "embedded_json_schema",
+      "targetCanonicalEncodedBytes": 65537,
+      "maxRawInputBytes": 65536,
+      "generator": {
+        "kind": "schemaCanonicalExpansion"
+      },
+      "expected": {
+        "schemaAccepted": false,
+        "failure": "canonical_output_bytes"
+      }
+    },
+    {
+      "name": "bounded_schema_depth_boundary",
+      "scope": "embedded_json_schema",
+      "targetDepth": 32,
+      "generator": {
+        "kind": "nestedLocalDraft202012Schema"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_depth_oversized",
+      "scope": "embedded_json_schema",
+      "targetDepth": 33,
+      "generator": {
+        "kind": "nestedLocalDraft202012Schema"
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_properties_boundary",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 256,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "properties"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_properties_oversized",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 257,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "properties"
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_required_boundary",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 256,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "required"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_required_oversized",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 257,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "required"
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_enum_boundary",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 256,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "enum"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_enum_oversized",
+      "scope": "embedded_json_schema",
+      "targetPropertiesRequiredOrEnumItems": 257,
+      "generator": {
+        "kind": "localDraft202012Schema",
+        "collection": "enum"
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_nodes_boundary",
+      "scope": "embedded_json_schema",
+      "targetNodes": 4096,
+      "generator": {
+        "kind": "localDraft202012Schema"
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_nodes_oversized",
+      "scope": "embedded_json_schema",
+      "targetNodes": 4097,
+      "generator": {
+        "kind": "localDraft202012Schema"
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_regex_boundary",
+      "scope": "embedded_json_schema",
+      "targetRegexBytes": 1024,
+      "generator": {
+        "kind": "localPatternSchema",
+        "safeNonBacktrackingPattern": true
+      },
+      "expected": {
+        "schemaAccepted": true
+      }
+    },
+    {
+      "name": "bounded_schema_regex_oversized",
+      "scope": "embedded_json_schema",
+      "targetRegexBytes": 1025,
+      "generator": {
+        "kind": "localPatternSchema",
+        "safeNonBacktrackingPattern": true
+      },
+      "expected": {
+        "schemaAccepted": false
+      }
+    },
+    {
+      "name": "bounded_schema_remote_ref",
+      "scope": "embedded_json_schema",
+      "generator": {
+        "kind": "schemaWithRef",
+        "ref": "https://example.invalid/schema.json"
+      },
+      "expected": {
+        "schemaAccepted": false,
+        "networkAccess": false
+      }
+    },
+    {
+      "name": "public_request_boundary",
+      "scope": "public_request",
+      "targetBytes": 1048576,
+      "generator": {
+        "kind": "requestWithUnknownPadding",
+        "exactDocumentBytes": true
+      },
+      "expected": {
+        "physicalSizeAccepted": true,
+        "schemaRejectedForUnknownInputField": true
+      }
+    },
+    {
+      "name": "public_request_oversized",
+      "scope": "public_request",
+      "targetBytes": 1048577,
+      "generator": {
+        "kind": "requestWithUnknownPadding",
+        "exactDocumentBytes": true
+      },
+      "expected": {
+        "rejectedBeforeJsonDecode": true
+      }
+    },
+    {
+      "name": "progress_event_boundary",
+      "scope": "progress_event",
+      "targetBytes": 65536,
+      "generator": {
+        "kind": "itemDeltaFrame",
+        "adjustAsciiDeltaToExactDocumentBytes": true
+      },
+      "expected": {
+        "physicalSizeAccepted": true
+      }
+    },
+    {
+      "name": "progress_event_oversized",
+      "scope": "progress_event",
+      "targetBytes": 65537,
+      "generator": {
+        "kind": "itemDeltaFrame",
+        "adjustAsciiDeltaToExactDocumentBytes": true
+      },
+      "expected": {
+        "frameNotSent": true
+      }
+    },
+    {
+      "name": "diagnostic_detail_cap",
+      "scope": "conversation_replay_diagnostics",
+      "malformedCompleteLines": 101,
+      "generator": {
+        "kind": "headerThenMalformedLinesThenCanonicalEntry"
+      },
+      "expected": {
+        "load": "succeeds",
+        "retainedDetailCount": 100,
+        "omittedDetailCount": 1,
+        "totals": [
+          {
+            "code": "malformed_json",
+            "count": 101
+          }
+        ],
+        "summaryCode": "diagnostics_truncated",
+        "publicProjection": {
+          "sessionQuery": {"returnedDetailCount": 99, "summaryCount": 1, "omittedDetailCount": 2, "totalViewCount": 100},
+          "healthySnapshot": {"returnedDetailCount": 49, "summaryCount": 1, "omittedDetailCount": 52, "totalViewCount": 50},
+          "degradedSnapshotWithPinnedRecordingDiagnostic": {"returnedReplayDetailCount": 48, "replaySummaryCount": 1, "pinnedRecordingCount": 1, "omittedReplayDetailCount": 53, "totalViewCount": 50}
+        },
+        "followingCanonicalEntryAccepted": true
+      }
+    }
+  ]
+}
