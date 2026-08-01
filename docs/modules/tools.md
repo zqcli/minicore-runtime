@@ -137,7 +137,7 @@ pub struct ToolDefinition {
 }
 ```
 
-ToolName是stable selection/protocol key。同一个ToolResourceView内duplicate ToolName拒绝candidate publication。constructor验证[Wire Schema](wire-schema.md#stable-symbolic-keys)共同floor以及provider/tool-name更窄grammar；field保持private，不能用任意String绕过。
+ToolName是stable selection/protocol key。同一个ToolResourceView内duplicate ToolName拒绝candidate publication。constructor先验证[Wire Schema](wire-schema.md#stable-symbolic-keys)共同floor，再要求portable provider grammar exact `[A-Za-z0-9_-]{1,64}`；field保持private，不能用任意String绕过。该grammar是OpenAI/Anthropic首版adapter的共同可表达子集，future provider不得在adapter内改名或放宽同一wire version。
 
 `ToolInputSchema`只能从BoundedJsonSchema构造。MVP semantic subset支持object root、type/properties/required/additionalProperties/items/enum/const、numeric/string/array bounds、description/title、allOf/anyOf/oneOf与local `$defs/$ref`；拒绝remote ref、patternProperties、dynamic/recursive ref、network lookup和owner未支持keyword。schema candidate必须同时通过bounded wire validation与Tool schema semantic validation。
 

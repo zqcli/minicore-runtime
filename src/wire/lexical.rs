@@ -27,7 +27,6 @@ pub(crate) fn validate_stable_symbolic_key(
     Ok(())
 }
 
-#[allow(dead_code, reason = "consumed by Tools and ModelGateway semantic IDs")]
 pub(crate) fn validate_opaque_ascii(value: &str, maximum_bytes: usize) -> Result<(), LexicalError> {
     if value.is_empty() {
         return Err(LexicalError::Empty);
@@ -68,4 +67,17 @@ pub(crate) fn validate_safe_text(
 
 pub(crate) fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+pub(crate) fn canonical_json_string_len(value: &str) -> Option<usize> {
+    let mut length = 2_usize;
+    for character in value.chars() {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        length = length.checked_add(encoded)?;
+    }
+    Some(length)
 }
