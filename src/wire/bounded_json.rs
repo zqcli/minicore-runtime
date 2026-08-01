@@ -55,6 +55,20 @@ impl JsonNode {
             _ => None,
         }
     }
+
+    pub(super) fn as_array(&self) -> Option<&[JsonNode]> {
+        match self {
+            Self::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -79,12 +93,22 @@ impl JsonParseLimits {
             max_nodes: None,
         }
     }
+
+    pub(super) fn schema() -> Self {
+        let limits = ProtocolLimits::v1_0().embedded_json.schema;
+        Self {
+            max_encoded_bytes: WireLimit::new(limits.max_encoded_bytes as usize),
+            max_depth: WireLimit::new(limits.max_depth as usize),
+            max_array_items: WireLimit::new(limits.max_nodes as usize),
+            max_object_members: WireLimit::new(limits.max_nodes as usize),
+            max_string_bytes: WireLimit::new(limits.max_encoded_bytes as usize),
+            max_nodes: Some(WireLimit::new(limits.max_nodes as usize)),
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct BoundedJsonValue {
-    #[allow(dead_code, reason = "consumed by M1.3 schema carrier")]
-    node: JsonNode,
     canonical: Box<str>,
 }
 
@@ -116,7 +140,6 @@ impl BoundedJsonValue {
         let mut encoder = CanonicalEncoder::new(output_limit);
         encoder.encode_node(&node)?;
         Ok(Self {
-            node,
             canonical: encoder.finish().into(),
         })
     }
@@ -210,7 +233,10 @@ impl PartialEq for BoundedJsonObject {
 
 impl Eq for BoundedJsonObject {}
 
-fn parse_node(input: &[u8], limits: JsonParseLimits) -> Result<JsonNode, BoundedJsonError> {
+pub(super) fn parse_node(
+    input: &[u8],
+    limits: JsonParseLimits,
+) -> Result<JsonNode, BoundedJsonError> {
     limits
         .max_encoded_bytes
         .validate_bytes(input)

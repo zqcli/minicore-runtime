@@ -3,6 +3,7 @@ mod json_number;
 mod limits;
 mod path;
 mod scalar;
+mod schema;
 mod value;
 
 pub use bounded_json::{BoundedJsonError, BoundedJsonObject, BoundedJsonValue};
@@ -19,4 +20,5 @@ pub use scalar::{
     SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId, WireScalarError,
     WorkspaceRevision,
 };
+pub use schema::{BoundedJsonSchema, BoundedJsonSchemaError};
 pub use value::{CurrencyCode, Duration, Money, MoneyAmount, Timestamp, WireValueError};
