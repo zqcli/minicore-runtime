@@ -275,7 +275,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- Rust Wire基础已实现typed scalar/value/path carriers，M0文档收敛与质量门禁已完成；当前暂停，下一实施入口是`docs/development-plan.md`的M1.1 ProtocolLimits/bounded counters，随后实现BoundedJson/Schema、public/storage codec、LiveConversation与SessionRecorder；
+- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；当前暂停于M2前等待review，后续依次实现incremental public codec、Conversation codec/scanner与LiveConversation，再关闭M5.0 durable foundations gate后实现SessionRecorder/replay；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

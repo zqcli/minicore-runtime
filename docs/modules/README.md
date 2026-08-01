@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1。Rust Wire基础已实现typed scalar/value/path carriers；Runtime、Session、Conversation与provider尚未实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1。M1 Wire foundation与owner semantic spine已实现；Runtime、Session、Conversation reducer/recording与provider行为尚未实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -56,6 +56,6 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0文档收敛/质量门禁已经完成，当前暂停于M1.1前；随后依次完成bounded Wire core、public/storage conformance、LiveConversation与ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0与M1已经完成，当前暂停于M2前等待review；随后依次完成incremental public codec、Conversation codec/scanner与LiveConversation，关闭M5.0 durable foundations gate并完成Recorder/replay与M6 resources后，才进入ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。
