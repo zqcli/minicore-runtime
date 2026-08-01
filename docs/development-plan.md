@@ -163,9 +163,9 @@ M12 + M13 ──> M14 Production Adapters ──> M15 Hardening + Release
 - byte/depth/node/member/item/string/number的checked counter；
 - bounded string/list/map helper，不把limit magic number复制到各wrapper；
 - protocol negotiation exact pair与capability intersection；
-- boundary recipe runner的small/heavy分类基础。
+- boundary recipe runner的small/heavy分类基础与validator-selector registry。M1.1只冻结每个leaf的exact value、selector和generic boundary floor；真实owner在对应milestone落地时必须消费该field并执行owner-level boundary/+1，完整`protocol-limit-cases.json`关闭属于M11。
 
-退出条件：`protocol-limit-cases.json`和negotiation vectors全部通过，BoundedJson/Schema只通过typed limit view取值。
+退出条件：limits tree与selector registry完整匹配`protocol-limit-cases.json`，negotiation vectors通过；现有Workspace owner和后续BoundedJson/Schema只通过typed limit view取值，不保留重复magic number。
 
 建议提交：`feat: add wire protocol limits`。
 

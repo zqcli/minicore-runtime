@@ -1,6 +1,8 @@
 use std::str::FromStr;
 
-use minicore_runtime::wire::{CanonicalFileUri, FileUriFamily, WorkspaceRelativePath};
+use minicore_runtime::wire::{
+    CanonicalFileUri, FileUriFamily, ProtocolLimits, WorkspaceRelativePath,
+};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -69,8 +71,9 @@ fn canonical_file_uri_matches_authoritative_vectors() {
             vector.reason
         );
     }
-    let max_uri = format!("file:///{}", "x".repeat(8_184));
-    assert_eq!(max_uri.len(), 8_192);
+    let max_uri_bytes = ProtocolLimits::v1_0().workspace.max_absolute_path_uri_bytes as usize;
+    let max_uri = format!("file:///{}", "x".repeat(max_uri_bytes - "file:///".len()));
+    assert_eq!(max_uri.len(), max_uri_bytes);
     assert!(CanonicalFileUri::from_str(&max_uri).is_ok());
     assert!(CanonicalFileUri::from_str(&format!("{max_uri}x")).is_err());
     assert_eq!(
@@ -125,18 +128,27 @@ fn relative_workspace_path_is_forward_slash_utf8_without_traversal() {
         );
     }
 
-    let max_bytes = "x".repeat(4_096);
+    let limits = ProtocolLimits::v1_0().workspace;
+    let max_bytes = "x".repeat(limits.max_relative_path_bytes as usize);
     assert!(WorkspaceRelativePath::from_str(&max_bytes).is_ok());
     assert!(WorkspaceRelativePath::from_str(&format!("{max_bytes}x")).is_err());
 
-    let max_multibyte_bytes = "é".repeat(2_048);
-    assert_eq!(max_multibyte_bytes.len(), 4_096);
+    let max_multibyte_bytes = "é".repeat(limits.max_relative_path_bytes as usize / 2);
+    assert_eq!(
+        max_multibyte_bytes.len(),
+        limits.max_relative_path_bytes as usize
+    );
     assert!(WorkspaceRelativePath::from_str(&max_multibyte_bytes).is_ok());
     assert!(WorkspaceRelativePath::from_str(&format!("{max_multibyte_bytes}é")).is_err());
 
-    let max_segments = std::iter::repeat_n("x", 256).collect::<Vec<_>>().join("/");
+    let max_segments = std::iter::repeat_n("x", limits.max_relative_path_segments as usize)
+        .collect::<Vec<_>>()
+        .join("/");
     assert!(WorkspaceRelativePath::from_str(&max_segments).is_ok());
-    let too_many_segments = std::iter::repeat_n("x", 257).collect::<Vec<_>>().join("/");
+    let too_many_segments =
+        std::iter::repeat_n("x", limits.max_relative_path_segments as usize + 1)
+            .collect::<Vec<_>>()
+            .join("/");
     assert!(WorkspaceRelativePath::from_str(&too_many_segments).is_err());
 
     let json = serde_json::to_string(&max_bytes).unwrap();
@@ -149,7 +161,8 @@ fn relative_workspace_path_is_forward_slash_utf8_without_traversal() {
     assert!(serde_json::from_str::<WorkspaceRelativePath>("1").is_err());
     assert!(
         serde_json::from_str::<WorkspaceRelativePath>(
-            &serde_json::to_string(&"x".repeat(4097)).unwrap()
+            &serde_json::to_string(&"x".repeat(limits.max_relative_path_bytes as usize + 1))
+                .unwrap()
         )
         .is_err()
     );
