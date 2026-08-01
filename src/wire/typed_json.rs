@@ -9,7 +9,7 @@ use super::bounded_json::{BoundedJsonError, JsonNode, JsonParseLimits, parse_nod
 use super::limits::{
     CapabilityToken, ClientInfo, ProtocolBootstrapResponse, ProtocolHello, ProtocolLimits,
     ProtocolReject, ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, RuntimeCapabilities,
-    RuntimeInfo, is_v1_runtime_capability,
+    RuntimeInfo, is_v1_runtime_capability, protocol_hello_is_valid,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +149,9 @@ pub fn decode_protocol_hello_v1(input: &[u8]) -> Result<ProtocolHello, TypedJson
 }
 
 pub fn encode_protocol_hello_v1(hello: &ProtocolHello) -> Result<Vec<u8>, TypedJsonError> {
+    if !protocol_hello_is_valid(hello) {
+        return Err(TypedJsonError::TypedShape);
+    }
     let output = ProtocolHelloOutput {
         supported_versions: hello.supported_versions(),
         client: ClientInfoOutput {
@@ -607,6 +610,7 @@ impl Write for BoundedVecWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::limits::{ProtocolNegotiation, negotiate_protocol};
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -653,6 +657,22 @@ mod tests {
             codec.encode(PublicJsonKind::Request, &decoded).unwrap(),
             br#"{"state":{"type":"idle"},"note":null}"#
         );
+    }
+
+    #[test]
+    fn semantic_invalid_hello_remains_raw_until_negotiation() {
+        for input in [
+            br#"{"supportedVersions":[{"major":1,"minor":0},{"major":1,"minor":0}],"client":{"name":"host","version":"1"},"capabilities":{"values":[]}}"#.as_slice(),
+            br#"{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"host","version":"1"},"capabilities":{"values":["Future-Capability"]}}"#.as_slice(),
+        ] {
+            let hello = decode_protocol_hello_v1(input).unwrap();
+            assert_eq!(
+                negotiate_protocol(&hello),
+                ProtocolNegotiation::Rejected {
+                    reason: ProtocolRejectReason::InvalidHello,
+                }
+            );
+        }
     }
 
     #[test]

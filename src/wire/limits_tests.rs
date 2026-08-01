@@ -139,11 +139,12 @@ fn negotiation_matches_vectors_and_maps_invalid_hello_to_typed_reject() {
     let root = fixture_root();
     let vectors: NegotiationVectors =
         read_json(&root.join("public/protocol-negotiation-cases.json"));
-    let runtime_capabilities = vectors
+    let runtime_capabilities: Vec<CapabilityToken> = vectors
         .runtime_capabilities
         .iter()
         .map(|value| value.parse().unwrap())
         .collect::<Vec<_>>();
+    assert_eq!(vectors.runtime_supported_versions, [ProtocolVersion::V1_0]);
     assert_eq!(runtime_capabilities, v1_runtime_capabilities());
 
     for case in vectors.cases {
@@ -153,11 +154,7 @@ fn negotiation_matches_vectors_and_maps_invalid_hello_to_typed_reject() {
             ClientInfo::new(raw.client.name, raw.client.version),
             raw.capabilities.values,
         );
-        match negotiate_protocol(
-            &hello,
-            &vectors.runtime_supported_versions,
-            &runtime_capabilities,
-        ) {
+        match negotiate_protocol(&hello) {
             ProtocolNegotiation::Selected {
                 version,
                 capabilities,
@@ -165,6 +162,7 @@ fn negotiation_matches_vectors_and_maps_invalid_hello_to_typed_reject() {
                 assert_eq!(Some(version), case.expected_selected_version);
                 assert_eq!(
                     capabilities
+                        .values()
                         .iter()
                         .map(CapabilityToken::as_str)
                         .collect::<Vec<_>>(),
@@ -187,11 +185,7 @@ fn negotiation_matches_vectors_and_maps_invalid_hello_to_typed_reject() {
         vec!["state_events".to_owned()],
     );
     assert_eq!(
-        negotiate_protocol(
-            &duplicate,
-            &[ProtocolVersion::V1_0],
-            &v1_runtime_capabilities(),
-        ),
+        negotiate_protocol(&duplicate),
         ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::InvalidHello,
         }
@@ -210,7 +204,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         capabilities.clone(),
     );
     assert!(matches!(
-        negotiate_protocol(&safe, &[ProtocolVersion::V1_0], &[]),
+        negotiate_protocol(&safe),
         ProtocolNegotiation::Selected { .. }
     ));
 
@@ -249,7 +243,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         oversized_version,
     ] {
         assert_eq!(
-            negotiate_protocol(&invalid, &[ProtocolVersion::V1_0], &[]),
+            negotiate_protocol(&invalid),
             ProtocolNegotiation::Rejected {
                 reason: ProtocolRejectReason::InvalidHello,
             }
@@ -265,7 +259,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         ] {
             let hello = ProtocolHello::new(vec![ProtocolVersion::V1_0], client, vec![]);
             assert_eq!(
-                negotiate_protocol(&hello, &[ProtocolVersion::V1_0], &[]),
+                negotiate_protocol(&hello),
                 ProtocolNegotiation::Rejected {
                     reason: ProtocolRejectReason::InvalidHello,
                 },
@@ -278,38 +272,26 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
     let max_client = "é".repeat(64);
     let oversized_client = format!("{max_client}x");
     assert!(matches!(
-        negotiate_protocol(
-            &ProtocolHello::new(
-                vec![ProtocolVersion::V1_0],
-                ClientInfo::new(max_client, ""),
-                vec![],
-            ),
-            &[ProtocolVersion::V1_0],
-            &[],
-        ),
+        negotiate_protocol(&ProtocolHello::new(
+            vec![ProtocolVersion::V1_0],
+            ClientInfo::new(max_client, ""),
+            vec![],
+        )),
         ProtocolNegotiation::Selected { .. }
     ));
     assert_eq!(
-        negotiate_protocol(
-            &ProtocolHello::new(
-                vec![ProtocolVersion::V1_0],
-                ClientInfo::new(oversized_client, "1"),
-                vec![],
-            ),
-            &[ProtocolVersion::V1_0],
-            &[],
-        ),
+        negotiate_protocol(&ProtocolHello::new(
+            vec![ProtocolVersion::V1_0],
+            ClientInfo::new(oversized_client, "1"),
+            vec![],
+        )),
         ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::InvalidHello,
         }
     );
 
     assert_eq!(
-        negotiate_protocol(
-            &ProtocolHello::new(vec![], ClientInfo::new("", ""), vec![]),
-            &[ProtocolVersion::V1_0],
-            &[],
-        ),
+        negotiate_protocol(&ProtocolHello::new(vec![], ClientInfo::new("", ""), vec![],)),
         ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::UnsupportedProtocolVersion,
         }
@@ -317,7 +299,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
 }
 
 #[test]
-fn negotiation_selects_highest_exact_version_and_runtime_capability_order() {
+fn negotiation_selects_exact_v1_and_runtime_capability_order() {
     let hello = ProtocolHello::new(
         vec![
             ProtocolVersion::new(1, 0),
@@ -328,21 +310,14 @@ fn negotiation_selects_highest_exact_version_and_runtime_capability_order() {
         vec!["session_snapshot".to_owned(), "state_events".to_owned()],
     );
     assert_eq!(
-        negotiate_protocol(
-            &hello,
-            &[ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 1)],
-            &[
-                "state_events".parse().unwrap(),
-                "progress_events".parse().unwrap(),
-                "session_snapshot".parse().unwrap(),
-            ],
-        ),
+        negotiate_protocol(&hello),
         ProtocolNegotiation::Selected {
-            version: ProtocolVersion::new(1, 1),
-            capabilities: vec![
+            version: ProtocolVersion::V1_0,
+            capabilities: RuntimeCapabilities::from_v1_negotiated(vec![
                 "state_events".parse().unwrap(),
                 "session_snapshot".parse().unwrap(),
-            ],
+            ])
+            .unwrap(),
         }
     );
 }
