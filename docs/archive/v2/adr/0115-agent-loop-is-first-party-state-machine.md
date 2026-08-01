@@ -1,0 +1,85 @@
+# ADR 0115：AgentLoop 使用自研协议状态机（Rig 收窄为 provider adapter）
+
+状态：Superseded by ADR 0126
+日期：2026-07-27
+
+> 2026-07-30：同步sans-I/O AgentLoop、`next_action()`和`accept_*()`已删除，Turn执行改为MiniCore first-party `ActiveTurnTask` async loop。Rig provider-only边界继续保留。
+
+> 2026-07-29修订：自研同步sans-I/O AgentLoop与Rig provider-only职责保持有效。`accept_committed_tool_round`改为`accept_committed_tool_results(CommittedToolExchangeDelta)`；coverage来自matching ToolResult集合，不再依赖durable ToolRoundCompleted marker。
+
+## 背景
+
+Turn execution 内部的 AgentLoop 是 sans-I/O 推理协议状态机，只在 `NeedModel | NeedTools | Finished` 之间推进；Prompt assembly、Tool 执行、模型调用、持久化、Steer/FollowUp、Interaction、Compaction 和 terminal arbitration 全部由设计明确外置给 SessionExecutor 与各深模块（ADR 0105、`session-execution.md`、`turn-execution-context.md`）。
+
+既有文档为 AgentLoop 保留了两条实现路径：「AgentLoop 可以使用 Rig 或其他 SDK 作为 private adapter」；`architecture.md` 曾表述「Rig 拥有 agent loop 的协议级状态机」。同时为 Rig 可能只支持 monolithic async run 的情况保留了 private adapter task 例外（"强制 two-owner execution" 否决条款的但书）。
+
+本 ADR 关闭该开放分支：AgentLoop 自研，Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter。
+
+## 同类项目依据
+
+| 项目 | agent loop 实现 | 观察 |
+| --- | --- | --- |
+| pi | 自研 `pi-agent-core` AgentLoop；provider 调用走独立 `pi-ai` | loop 本身很小；steering/followup/持久化在 loop 之外 |
+| Codex | 自研 turn/task 事件循环；`ModelClient` 只负责 provider | loop 与 provider client 是两个 seam，从不共用一个 SDK |
+| Claude Code | 自研 | 未公开内部，但可观察行为表明 loop 是产品自有编排 |
+| Grok Build | 自研 actor 式 loop；sampler 独立 crate | loop 与 sampling 分离，与 MiniCore 的 Executor/Gateway 分界同构 |
+| OpenHands | 自研 agent controller loop | SDK 层与 loop 层分离 |
+
+跨项目共识：**认真做 harness 的产品无一例外自研 loop**。SDK内置agent loop（Rig `Agent`/AgentRun、LangChain agents等）服务于轻量集成场景，其loop通常自持conversation history、tool注册与调用编排——这三点分别与MiniCore的committed/sanitized conversation、ToolService统一治理和SessionExecutor-owned Tool exchange completion直接冲突。
+
+## 决定
+
+1. **AgentLoop 是 MiniCore 自研的 crate-private 同步 sans-I/O 状态机**，不由 Rig 或其他 SDK 驱动。
+2. **Rig 的使用范围收窄为 ModelGateway 的 private ProviderAdapter**：它只编码并执行一个由ModelGateway规划好的provider attempt，桥接stream/cancellation，并提取finish reason、usage和allowlisted metadata；SDK automatic retry固定为0。model resolution、request validation、auth policy与credential resolution、cache/continuation policy、错误分类和最终`ModelCallResult`由ModelGateway拥有，logical retry由SessionExecutor拥有（ADR 0119）。Rig 0.40.0 spike 的门禁范围同步收窄为provider mapping验证，不再评估Rig sans-I/O AgentRun。
+3. **crate-private interface维持窄typed形状**：`next_action()`、`accept_model_response()`、`accept_committed_tool_results()`、`accept_committed_steer()`与`AgentLoopAction { NeedModel | NeedTools | Finished }`。不新建public trait、`AgentLoopFactory`或registry；「第二个真实实现出现才建立稳定seam」的既有原则不变。
+4. **内部状态机冻结为三态**：
+
+```text
+AwaitingModel { output_contract }
+  ← ConversationSeed 构造 / accept_committed_tool_results / accept_committed_steer
+  → accept_model_response(validated FinalizedAssistantResponse)
+     ├─ content 含 ToolCall → PendingToolExchange { expected: ordered ToolCallIds }
+     └─ content 无 ToolCall → EmittedCandidate（next_action 返回 Finished candidate）
+
+PendingToolExchange
+  → next_action 返回 NeedTools { response, calls }
+  → accept_committed_tool_results(trusted CommittedToolExchangeDelta)
+     └─ 验证delta覆盖exact expected calls → AwaitingModel
+
+EmittedCandidate
+  → SessionExecutor 仲裁：Steer FIFO 为空 → Assistant(Final)，Turn Completed
+     Steer FIFO 非空 → Assistant(Continue) append/apply
+     → accept_committed_steer回到AwaitingModel（方法内部可等价重建segment）
+```
+
+ADR 0120关闭了原L1 finish-reason歧义：ModelGateway在构造`ModelCallResult`前已经校验`ModelFinishReason × ToolCall presence × OutputContract`。UnexpectedToolCall、invalid Structured output、finish/content不一致、Length、ContentFiltered和empty terminal response均返回`ModelCallError`，不进入AgentLoop。AgentLoop只对validated response按ToolCall presence做上述二路转换；non-empty Refused是合法无ToolCall candidate。
+
+5. **Steer原地推进为默认路径**：SessionExecutor固定调用`accept_committed_steer`；该方法消费trusted delta后回到`AwaitingModel`，其内部可以增量推进或经private helper从ConversationSeed等价重建segment。**Compaction Replace 后必须重建 segment**（committed conversation 被整体替换），该规则不变。原为"adapter 不支持原地注入 Steer"和"provider/SDK rollover"保留的重建理由随本 ADR 删除。
+6. **状态机校验归loop**：状态错配、Tool exchange coverage与expected calls不匹配、candidate重复消费都返回typed `AgentLoopError`，由SessionExecutor按invariant failure规则处理（停止执行、replay或Unavailable）。Provider response错误归ModelGateway，不使用AgentLoop error表达。AgentLoop具体error reason随第三轮L2冻结，不由ADR 0120提前决定。
+7. **禁令清单不变**：不读写SessionStorage、不调用PromptService/ToolService/SkillService/ModelGateway、不读取current Workspace/definition、不拼接prompt、不接收execution-local或incomplete ToolResult集合、不处理approval、不发布事件、不决定terminal。
+8. **删除 monolithic adapter task 例外**：自研状态机是同步纯逻辑，由 SessionExecutor 主循环直接方法调用；`session-execution.md`"强制 two-owner execution"否决条款中为 Rig monolithic future 保留的 private adapter task 但书随本 ADR 删除。
+
+## 理由
+
+- **深度错配，adapter 不通过 deletion test**。Rig AgentRun 的价值（loop 编排、内建 tool 调用、history 管理）恰好是 MiniCore 明确外置或禁止的部分；采用 Rig 后仍需一个把 Rig 消息/历史类型翻译为 `FinalizedAssistantResponse` / `CommittedConversationDelta` 的双向 adapter，其体量与复杂度不低于自研 loop 本身——loop 的剩余职责只是三态推进加 coverage 校验（估计 200–400 行纯逻辑）。删除 Rig loop 不会让复杂性散落；删除翻译 adapter 反而消除一整层。
+- **一致性净化**。自研消除三处特判：monolithic future 例外（two-owner 风险源）、Steer rollover 的 adapter 行为差异、Rig 版本升级对 loop 语义的耦合。sans-I/O 纯逻辑可直接 property test（任意合法 delta 序列驱动状态机，验证动作序列与协议不变量），无需 mock SDK。
+- **风险有界**。放弃的是 Rig 未来 loop 侧能力（multi-step conveniences、structured extraction helper 等），但这些能力以 SDK 自持状态为前提，与 Transcript-First 冲突，在 MiniCore 中本就不可用——无净损失。Rig 在 provider 侧的真实价值（多 provider 协议、streaming、typed usage）完整保留。
+
+## 后果
+
+- `architecture.md`：设计定位与核心边界改写——Rig 从「原生 Agent SDK」收窄为只执行单次provider attempt映射与调用的`RigProviderAdapter`；ModelGateway继续拥有模型调用编排与terminal语义，AgentLoop归MiniCore自研。
+- `session-execution.md`：AgentLoop Interface 表述改为自研 concrete implementation；删除 monolithic adapter task 例外。
+- `turn-execution-context.md`：AgentLoop Contract 删除 SDK adapter 措辞；segment 重建理由收窄为 Compaction Replace；后续问题 1（Rig sans-I/O adapter 形状）关闭。
+- `CONTEXT.md`：「Driver（AgentLoop 适配器）」条目改写为自研状态机描述，Driver 旧称废弃。
+- `README.md`、`docs/migration/v1-to-v2.md`：Rig 集成表述与 spike 验收范围同步收窄为 provider adapter。
+- 不建立：public AgentLoop trait、`AgentLoopFactory`、loop 插件机制、推理策略框架（ReAct/Plan-and-Execute 等）、多 agent 编排——AgentLoop 是协议状态机，不是推理框架；这些能力若未来出现，属于独立设计，不进入本状态机。
+
+## 测试要求
+
+- 三态转换全覆盖：合法序列产生确定动作序列；每个非法转换返回typed AgentLoop error；具体reason随L2/L3冻结；
+- ModelGateway response decision table全覆盖；UnexpectedToolCall、InvalidStructuredOutput、InvalidProviderResponse和IncompleteResponse永不进入AgentLoop；
+- Tool exchange coverage：missing/duplicate/跨Turn coverage或非canonical assistant call order均拒绝；
+- candidate 幂等：EmittedCandidate 只能被消费一次；Continue 后状态机可继续；
+- Compaction Replace 后旧 segment 不可继续使用，新 seed 重建后行为与全量 replay 等价；
+- property test：任意合法 committed delta 序列驱动，loop 动作与 conversation 协议不变量（无孤立 ToolCall、无未覆盖 round 进入 NeedModel）恒成立；
+- loop 不产生任何 I/O、不持有任何 `Arc<Service>`（编译期由字段类型保证）。
