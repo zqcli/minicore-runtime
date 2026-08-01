@@ -483,7 +483,7 @@ Compaction是`StoredCompactionModelCall`的唯一semantic owner；Conversation S
 
 - result model exact匹配plan的TurnModelRef；
 - finish reason只能是`Stop | Unknown`；
-- finalized response在adapter normalization后包含exact一个non-empty Text block；
+- finalized response在adapter normalization后包含exact一个non-empty Text block；summary按external provider text规则校验，payload中的CR/CRLF不做owner normalization并fail closed；这与JSONL physical line接受CRLF无关；
 - optional Reasoning不写入portable summary；
 - ToolCall、Refused、empty/reasoning-only output拒绝；
 - `logical_retry_count <= 1`；

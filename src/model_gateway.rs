@@ -192,6 +192,16 @@ impl ModelResponseSummary {
         }
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        provider_id: ProviderId,
+        model_id: ModelId,
+        reasoning: ModelReasoningSummary,
+        service_class: ModelServiceClass,
+    ) -> Self {
+        Self::new(provider_id, model_id, reasoning, service_class)
+    }
+
     pub const fn provider_id(&self) -> &ProviderId {
         &self.provider_id
     }
@@ -254,6 +264,17 @@ impl ReasoningContent {
             signature,
             provider_item_id,
         })
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        text: Option<String>,
+        summary: Option<String>,
+        encrypted: Option<String>,
+        signature: Option<String>,
+        provider_item_id: Option<ProviderItemId>,
+    ) -> Result<Self, ModelValueError> {
+        Self::new(text, summary, encrypted, signature, provider_item_id)
     }
 
     pub fn text(&self) -> Option<&str> {
@@ -327,6 +348,15 @@ impl ProviderResponseMetadata {
         }
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        provider_request_id: Option<ProviderRequestId>,
+        raw_finish_code: Option<RedactedProviderCode>,
+        service_tier: Option<RedactedProviderCode>,
+    ) -> Self {
+        Self::new(provider_request_id, raw_finish_code, service_tier)
+    }
+
     pub const fn provider_request_id(&self) -> Option<&ProviderRequestId> {
         self.provider_request_id.as_ref()
     }
@@ -392,6 +422,31 @@ impl ModelUsage {
             provider_total_tokens,
             reported_cost,
         }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fields mirror the closed provider usage shape"
+    )]
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        provider_total_tokens: Option<u64>,
+        reported_cost: Option<Money>,
+    ) -> Self {
+        Self::new(
+            input_tokens,
+            output_tokens,
+            reasoning_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            provider_total_tokens,
+            reported_cost,
+        )
     }
 
     pub const fn input_tokens(&self) -> Option<u64> {
