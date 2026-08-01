@@ -1,9 +1,11 @@
+mod bounded_json;
 mod json_number;
 mod limits;
 mod path;
 mod scalar;
 mod value;
 
+pub use bounded_json::{BoundedJsonError, BoundedJsonObject, BoundedJsonValue};
 pub use limits::{
     CapabilityToken, CapabilityTokenError, CatalogLimits, ClientInfo, EmbeddedJsonLimits,
     InteractionLimits, JsonSchemaLimits, JsonValueLimits, ObservationLimits, PagingLimits,
