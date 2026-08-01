@@ -42,10 +42,26 @@ pub enum BoundedJsonError {
 pub(super) enum JsonNode {
     Null,
     Bool(bool),
-    Number(CanonicalJsonNumber),
+    Number(ParsedJsonNumber),
     String(Box<str>),
     Array(Vec<JsonNode>),
     Object(BTreeMap<Box<str>, JsonNode>),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct ParsedJsonNumber {
+    raw: Box<str>,
+    canonical: CanonicalJsonNumber,
+}
+
+impl ParsedJsonNumber {
+    pub(super) fn raw(&self) -> &str {
+        &self.raw
+    }
+
+    fn canonical(&self) -> &CanonicalJsonNumber {
+        &self.canonical
+    }
 }
 
 impl JsonNode {
@@ -66,6 +82,13 @@ impl JsonNode {
     pub(super) fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_number(&self) -> Option<&ParsedJsonNumber> {
+        match self {
+            Self::Number(value) => Some(value),
             _ => None,
         }
     }
@@ -90,6 +113,17 @@ impl JsonParseLimits {
             max_array_items: WireLimit::new(limits.max_array_items as usize),
             max_object_members: WireLimit::new(limits.max_object_members as usize),
             max_string_bytes: WireLimit::new(limits.max_string_bytes as usize),
+            max_nodes: None,
+        }
+    }
+
+    pub(super) fn public(max_encoded_bytes: usize, limits: ProtocolLimits) -> Self {
+        Self {
+            max_encoded_bytes: WireLimit::new(max_encoded_bytes),
+            max_depth: WireLimit::new(limits.transport.max_json_depth as usize),
+            max_array_items: WireLimit::new(limits.transport.max_array_items as usize),
+            max_object_members: WireLimit::new(limits.transport.max_object_members as usize),
+            max_string_bytes: WireLimit::new(limits.transport.max_string_bytes as usize),
             max_nodes: None,
         }
     }
@@ -437,18 +471,22 @@ impl<'a> Parser<'a> {
         Ok(value)
     }
 
-    fn parse_number(&mut self) -> Result<CanonicalJsonNumber, BoundedJsonError> {
+    fn parse_number(&mut self) -> Result<ParsedJsonNumber, BoundedJsonError> {
         let start = self.position;
         while matches!(self.peek(), Some(byte) if !is_value_delimiter(byte)) {
             self.position += 1;
         }
         let literal = &self.input[start..self.position];
-        CanonicalJsonNumber::parse(literal).map_err(|error| match error {
+        let canonical = CanonicalJsonNumber::parse(literal).map_err(|error| match error {
             JsonNumberError::InvalidSyntax => BoundedJsonError::InvalidSyntax,
             JsonNumberError::RawLiteralTooLong | JsonNumberError::CanonicalLiteralTooLong => {
                 BoundedJsonError::NumberLiteralLimit
             }
             JsonNumberError::ExponentOutOfRange => BoundedJsonError::NumberExponentLimit,
+        })?;
+        Ok(ParsedJsonNumber {
+            raw: literal.into(),
+            canonical,
         })
     }
 
@@ -527,7 +565,7 @@ impl CanonicalEncoder {
         match node {
             JsonNode::Null => self.push_str("null"),
             JsonNode::Bool(value) => self.push_str(if *value { "true" } else { "false" }),
-            JsonNode::Number(value) => self.push_str(value.as_str()),
+            JsonNode::Number(value) => self.push_str(value.canonical().as_str()),
             JsonNode::String(value) => self.encode_string(value),
             JsonNode::Array(values) => {
                 self.push_char('[')?;

@@ -199,6 +199,27 @@ impl ProtocolLimits {
             },
         }
     }
+
+    pub(crate) const fn is_within_v1_hard_maxima(self) -> bool {
+        let maximum = Self::v1_0();
+        self.transport.is_within(maximum.transport)
+            && self.text.is_within(maximum.text)
+            && self.catalog.is_within(maximum.catalog)
+            && self.paging.is_within(maximum.paging)
+            && self.prompt.is_within(maximum.prompt)
+            && self.workspace.is_within(maximum.workspace)
+            && self.queues.is_within(maximum.queues)
+            && self.interaction.is_within(maximum.interaction)
+            && self.observation.is_within(maximum.observation)
+            && self
+                .embedded_json
+                .value
+                .is_within(maximum.embedded_json.value)
+            && self
+                .embedded_json
+                .schema
+                .is_within(maximum.embedded_json.schema)
+    }
 }
 
 macro_rules! limit_struct {
@@ -207,6 +228,13 @@ macro_rules! limit_struct {
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         pub struct $name {
             $(pub $field: $type),+
+        }
+
+
+        impl $name {
+            const fn is_within(self, maximum: Self) -> bool {
+                true $(&& self.$field <= maximum.$field)+
+            }
         }
     };
 }
@@ -283,10 +311,12 @@ limit_struct!(ObservationLimits {
     max_query_diagnostics_per_scope: u16,
 });
 
-limit_struct!(EmbeddedJsonLimits {
-    value: JsonValueLimits,
-    schema: JsonSchemaLimits,
-});
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EmbeddedJsonLimits {
+    pub value: JsonValueLimits,
+    pub schema: JsonSchemaLimits,
+}
 
 limit_struct!(JsonValueLimits {
     max_encoded_bytes: u32,
@@ -879,10 +909,132 @@ fn validate_hello(hello: &ProtocolHello) -> Result<ValidatedHello, HelloValidati
     Ok(ValidatedHello { capabilities })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProtocolRejectReason {
     UnsupportedProtocolVersion,
     InvalidHello,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeInfo {
+    protocol_version: ProtocolVersion,
+    implementation: Box<str>,
+    implementation_version: Box<str>,
+}
+
+impl RuntimeInfo {
+    pub fn new(
+        protocol_version: ProtocolVersion,
+        implementation: impl Into<Box<str>>,
+        implementation_version: impl Into<Box<str>>,
+    ) -> Self {
+        Self {
+            protocol_version,
+            implementation: implementation.into(),
+            implementation_version: implementation_version.into(),
+        }
+    }
+
+    pub const fn protocol_version(&self) -> ProtocolVersion {
+        self.protocol_version
+    }
+
+    pub fn implementation(&self) -> &str {
+        &self.implementation
+    }
+
+    pub fn implementation_version(&self) -> &str {
+        &self.implementation_version
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RuntimeCapabilities {
+    values: Vec<CapabilityToken>,
+}
+
+impl RuntimeCapabilities {
+    pub fn new(values: Vec<CapabilityToken>) -> Self {
+        Self { values }
+    }
+
+    pub fn values(&self) -> &[CapabilityToken] {
+        &self.values
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolWelcome {
+    selected_version: ProtocolVersion,
+    runtime: RuntimeInfo,
+    capabilities: RuntimeCapabilities,
+    limits: Box<ProtocolLimits>,
+}
+
+impl ProtocolWelcome {
+    pub fn new(
+        selected_version: ProtocolVersion,
+        runtime: RuntimeInfo,
+        capabilities: RuntimeCapabilities,
+        limits: ProtocolLimits,
+    ) -> Self {
+        Self {
+            selected_version,
+            runtime,
+            capabilities,
+            limits: Box::new(limits),
+        }
+    }
+
+    pub const fn selected_version(&self) -> ProtocolVersion {
+        self.selected_version
+    }
+
+    pub const fn runtime(&self) -> &RuntimeInfo {
+        &self.runtime
+    }
+
+    pub const fn capabilities(&self) -> &RuntimeCapabilities {
+        &self.capabilities
+    }
+
+    pub fn limits(&self) -> ProtocolLimits {
+        *self.limits
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolReject {
+    reason: ProtocolRejectReason,
+    supported_versions: Vec<ProtocolVersion>,
+}
+
+impl ProtocolReject {
+    pub fn new(reason: ProtocolRejectReason, supported_versions: Vec<ProtocolVersion>) -> Self {
+        Self {
+            reason,
+            supported_versions,
+        }
+    }
+
+    pub const fn reason(&self) -> ProtocolRejectReason {
+        self.reason
+    }
+
+    pub fn supported_versions(&self) -> &[ProtocolVersion] {
+        &self.supported_versions
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ProtocolBootstrapResponse {
+    Welcome(ProtocolWelcome),
+    Reject(ProtocolReject),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
