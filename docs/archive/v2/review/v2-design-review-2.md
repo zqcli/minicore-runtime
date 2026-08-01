@@ -97,7 +97,7 @@
 
 把 `migration/v1-to-v2.md` 阶段 2 中的整段 capture 依赖图代码块替换为：
 
-> capture 依赖图以 [`../modules/turn-execution-context.md`](../../../modules/turn-execution-context.md#capture-依赖图) 为唯一权威版本，本文不维护副本。要点：exact SessionDefinitionRevision 展开 Agent/Prompt/Model/Workspace，SkillView 与 ToolSet 可并行捕获，PromptSet 在三个 view 就绪后创建，最终校验后组成 TurnExecutionContext。
+> capture 依赖图以 [`../modules/turn-execution-context.md`](../../../modules/turn-execution-context.md) 为唯一权威版本，本文不维护副本。要点：exact SessionDefinitionRevision 展开 Agent/Prompt/Model/Workspace，SkillView 与 ToolSet 可并行捕获，PromptSet 在三个 view 就绪后创建，最终校验后组成 TurnExecutionContext。
 
 理由：迁移记录是排期文档，不是技术规范；其中的技术图副本没有独立价值，只有漂移风险（本次 `execution_mode` / `provider: model.capabilities()` 残留即为实证）。这也是 R6 原则的第一个落地样例。若坚持保留内联图，则最低限度修正两处：删除 `execution_mode`，`provider: model.capabilities()` 改为 `tool_calling: model.capabilities().tool_calling`。
 
