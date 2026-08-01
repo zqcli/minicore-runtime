@@ -1,8 +1,8 @@
 # MiniCore V2 开发计划
 
-状态：Proposed，等待review后恢复实现
+状态：Active；M0已完成，按用户要求暂停于M1.1前
 
-基线：`dev` at `144039a`
+初始实现基线：`dev` at `144039a`
 
 范围：从当前Wire基础到可验证的ScriptedProvider vertical slice，再到production Provider与Tool/Sandbox gate
 
@@ -100,6 +100,10 @@ M12 + M13 ──> M14 Production Adapters ──> M15 Hardening + Release
 `M2`按行为slice增量扩展，不再先横向实现全部DTO；`M3`只关闭line codec与physical scanner，semantic corruption sidecar由`M5`关闭。`M7`必须同时等待minimal public DTO、reducer、record/replay和Turn resources。M13正式关闭前不得开始production Tool/Sandbox adapter。
 
 ## M0 · 文档收敛、Baseline与质量门禁
+
+状态：Completed。
+
+已建立current文档入口、ADR/review/research索引、V2 archive与默认搜索隔离；fully superseded ADR和closed reviews已归档并保留redirect stubs。Fast、MSRV 1.85、heavy boundary三套gate与双toolchain CI已经可执行。
 
 目标：让开发者和AI默认只读取当前权威合同，并让每次后续提交都在同一最小质量基线上验证。历史资料保留，但不得继续污染current搜索和实施判断。
 
@@ -637,12 +641,10 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 ## 首轮恢复顺序
 
-计划review通过后，只恢复下列task，不提前进入Session执行：
+M0已完成，当前暂停。下一次经review确认恢复后，只执行下列task，不提前进入Session执行：
 
-1. `M0.1`：收敛current文档面并归档fully superseded V2资料；
-2. `M0.2`：统一Rust质量检查入口；
-3. `M1.1`：实现ProtocolLimits与bounded counters；
-4. `M1.2`：从测试重新实现bounded dynamic JSON专用parser/encoder；
-5. `M1.3`：实现BoundedJsonSchema carrier。
+1. `M1.1`：实现ProtocolLimits与bounded counters；
+2. `M1.2`：从测试重新实现bounded dynamic JSON专用parser/encoder；
+3. `M1.3`：实现BoundedJsonSchema carrier。
 
 `M1.2`必须重新审视任何本地未提交草稿，不得因为已有代码存在而跳过positive exponent、pre-allocation limit和Unicode linearity测试。完成每个task后立即单独commit并汇报验证结果。

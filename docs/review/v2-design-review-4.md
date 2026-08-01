@@ -528,7 +528,7 @@ production Tool/Sandbox adapter必须在ToolStartGate前声明可强制的capabi
 
 已完成：V4-P0-1 → P0-2/P1-4 → P0-3 → P0-4 → P0-5 → P1-1 → P1-2；Rust crate与typed scalar/value/path carriers已经建立。
 
-后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：先完成M0文档收敛与质量门禁，再完成bounded public/storage codec、fixture runner、LiveConversation reducer和ScriptedProvider vertical slice。V4-P1-3继续门禁production ProviderAdapter；V4-C0-1继续门禁production Tool/Sandbox adapter。
+后续以[MiniCore V2开发计划](../development-plan.md)为实施入口：M0文档收敛与质量门禁已经完成，当前暂停于M1.1前；恢复后再完成bounded public/storage codec、fixture runner、LiveConversation reducer和ScriptedProvider vertical slice。V4-P1-3继续门禁production ProviderAdapter；V4-C0-1继续门禁production Tool/Sandbox adapter。
 
 ## 第四轮关闭定义
 
