@@ -1,9 +1,11 @@
 # V2设计评审工作交接
 
 日期：2026-07-31
-状态：换机handover；全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭，V4-P1-3仍开放
+状态：Historical checkpoint；原分支已在`144039a` fast-forward合入`dev`
 
-架构事实以`docs/architecture.md`、`docs/modules/`和Accepted ADR 0126–0134为权威。本文记录恢复入口、已推送进度与剩余工作。
+> 当前实施入口已经迁移到[MiniCore V2开发计划](../development-plan.md)。本文保留合并前的设计评审与换机上下文，其中“尚无Rust crate”等状态描述不再代表当前仓库。
+
+架构事实以`docs/architecture.md`、`docs/modules/`和Accepted ADR 0126–0134为权威。本文记录当时的恢复入口、已推送进度与剩余工作。
 
 ## 当前分支
 

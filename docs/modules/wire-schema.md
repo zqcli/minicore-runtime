@@ -1,6 +1,6 @@
 # Wire Schema 与 Bounded Decode
 
-状态：当前权威架构（ADR 0134，生产实现待启动）
+状态：当前权威架构（ADR 0134；typed scalar/value/path carriers已实现，bounded codec待实现）
 日期：2026-07-31
 
 ## 目的
