@@ -118,6 +118,51 @@ fn runtime_output_ignores_unknown_fields_but_never_unknown_variants() {
 }
 
 #[test]
+fn runtime_output_ignores_unknown_capabilities_without_readvertising_them() {
+    let canonical = read_fixture("public/valid/protocol-welcome.json");
+    let mut compatible: Value = serde_json::from_slice(&canonical).unwrap();
+    let values = compatible["data"]["capabilities"]["values"]
+        .as_array_mut()
+        .unwrap();
+    values.reverse();
+    values.push(Value::String("future_capability".to_owned()));
+    let decoded =
+        decode_protocol_bootstrap_response_v1(&serde_json::to_vec(&compatible).unwrap()).unwrap();
+    assert_eq!(
+        encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
+        canonical
+    );
+
+    let duplicate_unknown =
+        read_fixture("public/compat/protocol-welcome-unknown-capabilities.json");
+    let decoded = decode_protocol_bootstrap_response_v1(&duplicate_unknown).unwrap();
+    assert_eq!(
+        encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
+        canonical
+    );
+
+    let mut duplicate: Value = serde_json::from_slice(&canonical).unwrap();
+    duplicate["data"]["capabilities"]["values"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("state_events".to_owned()));
+    assert_eq!(
+        decode_protocol_bootstrap_response_v1(&serde_json::to_vec(&duplicate).unwrap()),
+        Err(TypedJsonError::TypedShape)
+    );
+
+    let mut malformed: Value = serde_json::from_slice(&canonical).unwrap();
+    malformed["data"]["capabilities"]["values"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("Future-Capability".to_owned()));
+    assert_eq!(
+        decode_protocol_bootstrap_response_v1(&serde_json::to_vec(&malformed).unwrap()),
+        Err(TypedJsonError::TypedShape)
+    );
+}
+
+#[test]
 fn public_frame_preflight_uses_selected_v1_limits() {
     let codec = WireV1Codec::v1_0();
     let maximum = ProtocolLimits::v1_0().transport.max_progress_event_bytes as usize;
@@ -174,7 +219,7 @@ fn effective_limits_may_shrink_but_never_exceed_v1_hard_maxima() {
     let invalid = ProtocolBootstrapResponse::Welcome(ProtocolWelcome::new(
         ProtocolVersion::V1_0,
         RuntimeInfo::new(ProtocolVersion::V1_0, "minicore-runtime", "0.1.0"),
-        RuntimeCapabilities::new(Vec::new()),
+        RuntimeCapabilities::empty(),
         inflated,
     ));
     assert_eq!(

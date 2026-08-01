@@ -42,6 +42,7 @@
     {"path":"invalid/input/unknown-input-field.json","target":"CommandRequest","direction":"client_to_runtime","expected":{"decode":"rejected","stage":"selected_schema","code":"unknown_input_field"}},
     {"path":"invalid/output/duration-over-limit.json","target":"CommandResponse","direction":"runtime_to_client","expected":{"decode":"protocol_error","stage":"typed_scalar","code":"duration_out_of_range","runtimeEncoder":"must_not_send"}},
     {"path":"invalid/output/unknown-event-frame-variant.json","target":"EventFrame","direction":"runtime_to_client","expected":{"decode":"protocol_error","stage":"selected_schema","code":"unknown_output_variant","runtimeEncoder":"must_not_send"}},
-    {"path":"compat/output-unknown-field.json","target":"EventFrame","direction":"runtime_to_client","expected":{"decode":"accepted","ignoredJsonPointers":["/data/futureField"],"canonicalReencodePath":"valid/runtime-state-frame.json","runtimeEncoder":"must_not_send_in_1_0"}}
+    {"path":"compat/output-unknown-field.json","target":"EventFrame","direction":"runtime_to_client","expected":{"decode":"accepted","ignoredJsonPointers":["/data/futureField"],"canonicalReencodePath":"valid/runtime-state-frame.json","runtimeEncoder":"must_not_send_in_1_0"}},
+    {"path":"compat/protocol-welcome-unknown-capabilities.json","target":"ProtocolBootstrapResponse","direction":"runtime_to_client","expected":{"decode":"accepted","ignoredJsonPointers":["/data/capabilities/values/9","/data/capabilities/values/8"],"canonicalReencodePath":"valid/protocol-welcome.json","runtimeEncoder":"must_not_send_in_1_0"}}
   ]
 }

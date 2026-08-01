@@ -347,6 +347,34 @@ fn negotiation_selects_highest_exact_version_and_runtime_capability_order() {
     );
 }
 
+#[test]
+fn runtime_capability_outputs_are_known_unique_and_canonically_ordered() {
+    let capabilities = RuntimeCapabilities::from_v1_negotiated(vec![
+        "session_snapshot".parse().unwrap(),
+        "state_events".parse().unwrap(),
+    ])
+    .unwrap();
+    assert_eq!(
+        capabilities
+            .values()
+            .iter()
+            .map(CapabilityToken::as_str)
+            .collect::<Vec<_>>(),
+        ["state_events", "session_snapshot"]
+    );
+    assert_eq!(
+        RuntimeCapabilities::from_v1_negotiated(vec![
+            "state_events".parse().unwrap(),
+            "state_events".parse().unwrap(),
+        ]),
+        Err(RuntimeCapabilitiesError::DuplicateCapability)
+    );
+    assert_eq!(
+        RuntimeCapabilities::from_v1_negotiated(vec!["future_capability".parse().unwrap()]),
+        Err(RuntimeCapabilitiesError::UnknownCapability)
+    );
+}
+
 fn expected_validator<'a>(recipe: &'a LimitRecipe, path: &str) -> &'a str {
     if let Some(validator) = recipe
         .special_cases
