@@ -42,6 +42,10 @@ impl CanonicalJsonNumber {
     }
 }
 
+pub(crate) fn validate_json_number_syntax(literal: &str) -> Result<(), JsonNumberError> {
+    ParsedNumberSyntax::parse(literal).map(|_| ())
+}
+
 impl fmt::Debug for CanonicalJsonNumber {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -55,7 +59,15 @@ struct ParsedNumber<'a> {
     exponent: i32,
 }
 
-impl<'a> ParsedNumber<'a> {
+struct ParsedNumberSyntax<'a> {
+    negative: bool,
+    integer: &'a str,
+    fraction: &'a str,
+    exponent_negative: bool,
+    exponent_digits: &'a str,
+}
+
+impl<'a> ParsedNumberSyntax<'a> {
     fn parse(literal: &'a str) -> Result<Self, JsonNumberError> {
         let bytes = literal.as_bytes();
         let mut position = 0;
@@ -86,32 +98,23 @@ impl<'a> ParsedNumber<'a> {
             fraction = &literal[fraction_start..position];
         }
 
-        let mut exponent = 0_i32;
+        let mut exponent_negative = false;
+        let mut exponent_digits = "";
         if matches!(bytes.get(position), Some(b'e' | b'E')) {
             position += 1;
-            let exponent_negative = if consume(bytes, &mut position, b'+') {
+            exponent_negative = if consume(bytes, &mut position, b'+') {
                 false
             } else {
                 consume(bytes, &mut position, b'-')
             };
             let exponent_start = position;
             while matches!(bytes.get(position), Some(b'0'..=b'9')) {
-                let digit = i32::from(bytes[position] - b'0');
-                exponent = exponent
-                    .checked_mul(10)
-                    .and_then(|value| value.checked_add(digit))
-                    .ok_or(JsonNumberError::ExponentOutOfRange)?;
-                if exponent > 1_000_000 {
-                    return Err(JsonNumberError::ExponentOutOfRange);
-                }
                 position += 1;
             }
             if exponent_start == position {
                 return Err(JsonNumberError::InvalidSyntax);
             }
-            if exponent_negative {
-                exponent = -exponent;
-            }
+            exponent_digits = &literal[exponent_start..position];
         }
 
         if position != bytes.len() {
@@ -121,6 +124,35 @@ impl<'a> ParsedNumber<'a> {
             negative,
             integer: &literal[integer_start..integer_end],
             fraction,
+            exponent_negative,
+            exponent_digits,
+        })
+    }
+}
+
+impl<'a> ParsedNumber<'a> {
+    fn parse(literal: &'a str) -> Result<Self, JsonNumberError> {
+        let syntax = ParsedNumberSyntax::parse(literal)?;
+        let mut exponent = 0_i32;
+        if !syntax.exponent_digits.is_empty() {
+            for byte in syntax.exponent_digits.bytes() {
+                let digit = i32::from(byte - b'0');
+                exponent = exponent
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add(digit))
+                    .ok_or(JsonNumberError::ExponentOutOfRange)?;
+                if exponent > 1_000_000 {
+                    return Err(JsonNumberError::ExponentOutOfRange);
+                }
+            }
+            if syntax.exponent_negative {
+                exponent = -exponent;
+            }
+        }
+        Ok(Self {
+            negative: syntax.negative,
+            integer: syntax.integer,
+            fraction: syntax.fraction,
             exponent,
         })
     }

@@ -1,4 +1,4 @@
-use super::{CanonicalJsonNumber, JsonNumberError};
+use super::{CanonicalJsonNumber, JsonNumberError, validate_json_number_syntax};
 
 #[test]
 fn exact_decimal_numbers_have_one_canonical_spelling() {
@@ -78,6 +78,18 @@ fn invalid_json_number_grammar_is_rejected_without_float_lowering() {
         CanonicalJsonNumber::parse(&canonical_too_long),
         Err(JsonNumberError::CanonicalLiteralTooLong)
     );
+}
+
+#[test]
+fn grammar_only_validation_has_no_embedded_json_decimal_caps() {
+    assert!(validate_json_number_syntax(&"1".repeat(65)).is_ok());
+    assert!(validate_json_number_syntax("1e999999999999999999999999").is_ok());
+    for invalid in ["01", "1.", "1e+", "+1"] {
+        assert_eq!(
+            validate_json_number_syntax(invalid),
+            Err(JsonNumberError::InvalidSyntax)
+        );
+    }
 }
 
 #[test]

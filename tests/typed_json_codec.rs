@@ -44,6 +44,15 @@ fn protocol_hello_is_strict_after_bounded_duplicate_aware_preflight() {
             Err(TypedJsonError::TypedShape)
         );
     }
+    for oversized_integer in ["65536".to_owned(), "1".repeat(65)] {
+        let input = format!(
+            r#"{{"supportedVersions":[{{"major":{oversized_integer},"minor":0}}],"client":{{"name":"a","version":"1"}},"capabilities":{{"values":[]}}}}"#
+        );
+        assert_eq!(
+            decode_protocol_hello_v1(input.as_bytes()),
+            Err(TypedJsonError::TypedShape)
+        );
+    }
 
     for nested_unknown in [
         br#"{"supportedVersions":[{"major":1,"minor":0,"future":1}],"client":{"name":"a","version":"1"},"capabilities":{"values":[]}}"#.as_slice(),
@@ -134,6 +143,35 @@ fn runtime_output_ignores_unknown_fields_but_never_unknown_variants() {
 
     let decoded =
         decode_protocol_bootstrap_response_v1(&serde_json::to_vec(&compatible).unwrap()).unwrap();
+    assert_eq!(
+        encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
+        canonical
+    );
+
+    let long_unknown_number =
+        read_fixture("public/compat/protocol-welcome-long-unknown-number.json");
+    let decoded = decode_protocol_bootstrap_response_v1(&long_unknown_number).unwrap();
+    assert_eq!(
+        encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
+        canonical
+    );
+
+    let mut huge_unknown_exponent = Vec::new();
+    huge_unknown_exponent.extend_from_slice(br#"{"futureNumber":1e999999999999999999999999,"#);
+    huge_unknown_exponent.extend_from_slice(&canonical[1..]);
+    let decoded = decode_protocol_bootstrap_response_v1(&huge_unknown_exponent).unwrap();
+    assert_eq!(
+        encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
+        canonical
+    );
+
+    let nested_unknown_exponent = std::str::from_utf8(&canonical).unwrap().replacen(
+        r#""limits":{"#,
+        r#""limits":{"futureNumber":1e999999999999999999999999,"#,
+        1,
+    );
+    let decoded =
+        decode_protocol_bootstrap_response_v1(nested_unknown_exponent.as_bytes()).unwrap();
     assert_eq!(
         encode_protocol_bootstrap_response_v1(&decoded).unwrap(),
         canonical

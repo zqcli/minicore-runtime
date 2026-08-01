@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use super::json_number::{CanonicalJsonNumber, JsonNumberError};
+use super::json_number::{CanonicalJsonNumber, JsonNumberError, validate_json_number_syntax};
 use super::limits::{CheckedLimitCounter, ProtocolLimits, WireLimit};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -51,7 +51,7 @@ pub(super) enum JsonNode {
 #[derive(Clone, Eq, PartialEq)]
 pub(super) struct ParsedJsonNumber {
     raw: Box<str>,
-    canonical: CanonicalJsonNumber,
+    canonical: Option<CanonicalJsonNumber>,
 }
 
 impl ParsedJsonNumber {
@@ -59,8 +59,10 @@ impl ParsedJsonNumber {
         &self.raw
     }
 
-    fn canonical(&self) -> &CanonicalJsonNumber {
-        &self.canonical
+    fn canonical(&self) -> Result<&CanonicalJsonNumber, BoundedJsonError> {
+        self.canonical
+            .as_ref()
+            .ok_or(BoundedJsonError::InvalidSyntax)
     }
 }
 
@@ -102,6 +104,7 @@ pub(super) struct JsonParseLimits {
     pub max_object_members: WireLimit,
     pub max_string_bytes: WireLimit,
     pub max_nodes: Option<WireLimit>,
+    canonicalize_numbers: bool,
 }
 
 impl JsonParseLimits {
@@ -114,6 +117,7 @@ impl JsonParseLimits {
             max_object_members: WireLimit::new(limits.max_object_members as usize),
             max_string_bytes: WireLimit::new(limits.max_string_bytes as usize),
             max_nodes: None,
+            canonicalize_numbers: true,
         }
     }
 
@@ -125,6 +129,7 @@ impl JsonParseLimits {
             max_object_members: WireLimit::new(limits.transport.max_object_members as usize),
             max_string_bytes: WireLimit::new(limits.transport.max_string_bytes as usize),
             max_nodes: None,
+            canonicalize_numbers: false,
         }
     }
 
@@ -137,6 +142,7 @@ impl JsonParseLimits {
             max_object_members: WireLimit::new(limits.max_nodes as usize),
             max_string_bytes: WireLimit::new(limits.max_encoded_bytes as usize),
             max_nodes: Some(WireLimit::new(limits.max_nodes as usize)),
+            canonicalize_numbers: true,
         }
     }
 }
@@ -477,13 +483,21 @@ impl<'a> Parser<'a> {
             self.position += 1;
         }
         let literal = &self.input[start..self.position];
-        let canonical = CanonicalJsonNumber::parse(literal).map_err(|error| match error {
-            JsonNumberError::InvalidSyntax => BoundedJsonError::InvalidSyntax,
-            JsonNumberError::RawLiteralTooLong | JsonNumberError::CanonicalLiteralTooLong => {
-                BoundedJsonError::NumberLiteralLimit
-            }
-            JsonNumberError::ExponentOutOfRange => BoundedJsonError::NumberExponentLimit,
-        })?;
+        let canonical = if self.limits.canonicalize_numbers {
+            Some(
+                CanonicalJsonNumber::parse(literal).map_err(|error| match error {
+                    JsonNumberError::InvalidSyntax => BoundedJsonError::InvalidSyntax,
+                    JsonNumberError::RawLiteralTooLong
+                    | JsonNumberError::CanonicalLiteralTooLong => {
+                        BoundedJsonError::NumberLiteralLimit
+                    }
+                    JsonNumberError::ExponentOutOfRange => BoundedJsonError::NumberExponentLimit,
+                })?,
+            )
+        } else {
+            validate_json_number_syntax(literal).map_err(|_| BoundedJsonError::InvalidSyntax)?;
+            None
+        };
         Ok(ParsedJsonNumber {
             raw: literal.into(),
             canonical,
@@ -565,7 +579,7 @@ impl CanonicalEncoder {
         match node {
             JsonNode::Null => self.push_str("null"),
             JsonNode::Bool(value) => self.push_str(if *value { "true" } else { "false" }),
-            JsonNode::Number(value) => self.push_str(value.canonical().as_str()),
+            JsonNode::Number(value) => self.push_str(value.canonical()?.as_str()),
             JsonNode::String(value) => self.encode_string(value),
             JsonNode::Array(values) => {
                 self.push_char('[')?;
