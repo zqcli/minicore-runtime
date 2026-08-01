@@ -16,6 +16,8 @@ pub use limits::{
     ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, QueueLimits, RuntimeCapabilities,
     RuntimeInfo, TextLimits, TransportLimits, WorkspaceWireLimits,
 };
+#[allow(unused_imports, reason = "crate-private M2 Runtime negotiation seam")]
+pub(crate) use limits::{ProtocolNegotiation, negotiate_protocol, v1_runtime_capabilities};
 pub use path::{CanonicalFileUri, FileUriFamily, PathWireError, WorkspaceRelativePath};
 pub use scalar::{
     AgentId, AgentMetadataRevision, AgentRevision, CanonicalU64, CommandId, EntryId,
