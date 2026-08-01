@@ -1,4 +1,5 @@
 mod scalar;
+mod value;
 
 pub use scalar::{
     AgentId, AgentMetadataRevision, AgentRevision, CanonicalU64, CommandId, EntryId,
@@ -6,3 +7,4 @@ pub use scalar::{
     SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId, WireScalarError,
     WorkspaceRevision,
 };
+pub use value::{CurrencyCode, Duration, Money, MoneyAmount, Timestamp, WireValueError};
