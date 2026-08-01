@@ -1,5 +1,6 @@
 mod bounded_json;
 mod json_number;
+pub(crate) mod lexical;
 mod limits;
 mod path;
 mod scalar;
