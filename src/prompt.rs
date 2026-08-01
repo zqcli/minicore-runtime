@@ -121,6 +121,11 @@ impl MessageContent {
         Ok(Self::Text(MessageText(text.into())))
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct_text(text: impl AsRef<str>) -> Result<Self, PromptValueError> {
+        Self::text(text)
+    }
+
     pub fn as_text(&self) -> &str {
         match self {
             Self::Text(text) => text.as_str(),
@@ -154,6 +159,11 @@ impl MessageRecord {
         Ok(Self {
             content: content.into(),
         })
+    }
+
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(content: Vec<MessageContent>) -> Result<Self, PromptValueError> {
+        Self::new(content)
     }
 
     pub fn content(&self) -> &[MessageContent] {
@@ -196,6 +206,14 @@ impl PromptContributionStamp {
         })
     }
 
+    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
+    pub(crate) fn reconstruct(
+        content_part_index: u32,
+        origin: PromptContributionOrigin,
+    ) -> Result<Self, PromptValueError> {
+        Self::new(content_part_index, origin)
+    }
+
     pub const fn content_part_index(&self) -> u32 {
         self.content_part_index
     }
@@ -217,29 +235,22 @@ impl CanonicalUserMessage {
         message: MessageRecord,
         contribution_stamps: Vec<PromptContributionStamp>,
     ) -> Result<Self, PromptValueError> {
-        if contribution_stamps.len() > message.content().len() {
-            return Err(PromptValueError::InvalidContributionStamp);
-        }
-        let mut indices = BTreeSet::new();
-        let mut origins = BTreeSet::new();
-        let mut previous_index = None;
-        for stamp in &contribution_stamps {
-            let index = stamp.content_part_index() as usize;
-            if index >= message.content().len()
-                || previous_index.is_some_and(|previous| index <= previous)
-                || !indices.insert(index)
-                || !origins.insert(stamp.origin())
-            {
-                return Err(PromptValueError::InvalidContributionStamp);
-            }
-            previous_index = Some(index);
-        }
-        let unstamped = (0..message.content().len())
-            .filter(|index| !indices.contains(index))
-            .collect::<Vec<_>>();
-        if unstamped.len() > 1 || unstamped.first().is_some_and(|index| *index != 0) {
-            return Err(PromptValueError::InvalidContributionStamp);
-        }
+        validate_contribution_stamps(&message, &contribution_stamps, true)?;
+        Ok(Self {
+            message,
+            contribution_stamps: contribution_stamps.into(),
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by tolerant Conversation replay in M3/M5"
+    )]
+    pub(crate) fn reconstruct(
+        message: MessageRecord,
+        contribution_stamps: Vec<PromptContributionStamp>,
+    ) -> Result<Self, PromptValueError> {
+        validate_contribution_stamps(&message, &contribution_stamps, false)?;
         Ok(Self {
             message,
             contribution_stamps: contribution_stamps.into(),
@@ -253,6 +264,39 @@ impl CanonicalUserMessage {
     pub fn contribution_stamps(&self) -> &[PromptContributionStamp] {
         &self.contribution_stamps
     }
+}
+
+fn validate_contribution_stamps(
+    message: &MessageRecord,
+    contribution_stamps: &[PromptContributionStamp],
+    require_complete_provenance: bool,
+) -> Result<(), PromptValueError> {
+    if contribution_stamps.len() > message.content().len() {
+        return Err(PromptValueError::InvalidContributionStamp);
+    }
+    let mut indices = BTreeSet::new();
+    let mut origins = BTreeSet::new();
+    let mut previous_index = None;
+    for stamp in contribution_stamps {
+        let index = stamp.content_part_index() as usize;
+        if index >= message.content().len()
+            || previous_index.is_some_and(|previous| index <= previous)
+            || !indices.insert(index)
+            || !origins.insert(stamp.origin())
+        {
+            return Err(PromptValueError::InvalidContributionStamp);
+        }
+        previous_index = Some(index);
+    }
+    if require_complete_provenance {
+        let unstamped = (0..message.content().len())
+            .filter(|index| !indices.contains(index))
+            .collect::<Vec<_>>();
+        if unstamped.len() > 1 || unstamped.first().is_some_and(|index| *index != 0) {
+            return Err(PromptValueError::InvalidContributionStamp);
+        }
+    }
+    Ok(())
 }
 
 impl fmt::Debug for CanonicalUserMessage {
@@ -331,6 +375,71 @@ mod tests {
             ),
             Err(PromptValueError::InvalidContributionStamp)
         );
+    }
+
+    #[test]
+    fn replay_reconstruction_preserves_text_after_stamp_degradation() {
+        let message = MessageRecord::reconstruct(vec![
+            MessageContent::reconstruct_text("body").unwrap(),
+            MessageContent::reconstruct_text("unstamped contribution").unwrap(),
+            MessageContent::reconstruct_text("valid contribution").unwrap(),
+        ])
+        .unwrap();
+        let surviving_stamp = PromptContributionStamp::reconstruct(
+            2,
+            PromptContributionOrigin::Skill {
+                skill_id: SkillId::from_str("review").unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            CanonicalUserMessage::new(message.clone(), vec![surviving_stamp.clone()]),
+            Err(PromptValueError::InvalidContributionStamp)
+        );
+        let out_of_range = PromptContributionStamp::reconstruct(
+            3,
+            PromptContributionOrigin::Skill {
+                skill_id: SkillId::from_str("other").unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalUserMessage::reconstruct(message.clone(), vec![out_of_range]),
+            Err(PromptValueError::InvalidContributionStamp)
+        );
+        let earlier_stamp = PromptContributionStamp::reconstruct(
+            1,
+            PromptContributionOrigin::Skill {
+                skill_id: SkillId::from_str("other").unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CanonicalUserMessage::reconstruct(
+                message.clone(),
+                vec![surviving_stamp.clone(), earlier_stamp]
+            ),
+            Err(PromptValueError::InvalidContributionStamp)
+        );
+        let duplicate_origin =
+            PromptContributionStamp::reconstruct(1, surviving_stamp.origin().clone()).unwrap();
+        assert_eq!(
+            CanonicalUserMessage::reconstruct(
+                message.clone(),
+                vec![duplicate_origin, surviving_stamp.clone()]
+            ),
+            Err(PromptValueError::InvalidContributionStamp)
+        );
+
+        let reconstructed =
+            CanonicalUserMessage::reconstruct(message, vec![surviving_stamp]).unwrap();
+        assert_eq!(reconstructed.message().content().len(), 3);
+        assert_eq!(
+            reconstructed.message().content()[1].as_text(),
+            "unstamped contribution"
+        );
+        assert_eq!(reconstructed.contribution_stamps().len(), 1);
     }
 
     #[test]
