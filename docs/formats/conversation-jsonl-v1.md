@@ -102,8 +102,8 @@ Exact envelope：
 Entry关系：
 
 - entryId由LiveSessionState在apply前分配；
-- first valid EntryId wins；duplicate later line skip + diagnostic；
-- sessionId必须等于Header；
+- sessionId必须等于Header；mismatch line不reserve EntryId、不满足later parent；
+- first valid EntryId wins；这里valid表示required envelope/body/typed scalar decode成功且session匹配Header。ID在parent/Turn/Item/Tool/Interaction relation projection前seed collision guard，duplicate later line skip + diagnostic；
 - parentId为null表示root，否则必须引用当前file中更早的first-valid EntryId；
 - valid branch parent不要求是physical previous line；
 - orphan/invalid relation line可以作为diagnosed history node隔离，但不能进入selected model conversation；
@@ -283,7 +283,7 @@ ToolAbandonReason：`outcome_unknown | runtime_failure`。
 规则：
 
 - Stored outcome不保存ToolResult.details；private/debug JSON不是conversation fact；
-- PreExecution只允许failed/denied/cancelled，Executed只允许succeeded/failed/cancelled；
+- PreExecution允许succeeded/failed/denied/cancelled（ask-user answer是Succeeded），Executed只允许succeeded/failed/cancelled；
 - Completed content使用Tools-owned ToolResultContent，1..32 Text parts、aggregate<=262,144 bytes；
 - Abandoned不创建provider-visible ToolResult，complete exchange sanitizer隔离该exchange；
 - itemId/toolCallId必须匹配更早assistant ToolCall；
@@ -463,13 +463,14 @@ Writable open只truncatefinal unterminated tail。完整malformed/oversized/unkn
 - unknown additive field；
 - unknown body variant；
 - malformed/duplicate/out-of-range stamp；
-- invalid UTF-8, malformed JSON, duplicate EntryId, missing parent, Session mismatch；
+- invalid UTF-8, malformed JSON, duplicate EntryId, missing parent, Session mismatch + later same-ID reuse；
+- branch physical-last-leaf selection与multiple-root isolation；
 - incomplete/abandoned Tool exchange；
 - invalid Interaction relation；
 - invalid Compaction marker；
 - final partial tail + exact truncation offset；
 - oversized complete line followed by valid recoverable line；
-- Header/entry/file/count/depth/member/string exact boundary and boundary+1 recipes；
+- Header/entry/file/count/depth/member/string exact independently-reachable boundary（或更窄enclosing cap下的effective boundary）与boundary+1 recipes；
 - diagnostics 100 + aggregate truncation。
 
-Expected fixture metadata至少保存accepted EntryIds、selected path、sanitized ModelMessages、historical Items、diagnostic codes/counts与writable truncation offset。
+Expected fixture metadata至少保存accepted EntryIds、selected path、sanitized ModelMessages、historical Items、diagnostic codes/counts与writable truncation offset。仓库内authoritative vectors与non-blob boundary recipes位于[Wire V1 Fixtures](../fixtures/wire-v1/README.md)。

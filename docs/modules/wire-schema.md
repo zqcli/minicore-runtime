@@ -49,7 +49,7 @@ Wire codec不得：
 - canonical encoder输出compact JSON，无非必要whitespace；
 - object field使用`camelCase`；
 - enum/type token使用`snake_case`；
-- object member order无语义；canonical encoder按schema declaration order输出，便于byte-exact fixture；
+- object member order无语义；typed schema object由canonical encoder按Rust field declaration order输出，dynamic `BoundedJson*` object按后文decoded-key UTF-8 byte order输出；
 - decoder在任意深度拒绝duplicate member name；
 - empty collection输出`[]`或`{}`，不输出`null`；
 - 所有known `Option<T>` field由canonical encoder显式输出value或`null`；decoder接受field missing或`null`并统一为None；
@@ -59,8 +59,8 @@ Wire codec不得：
 
 Canonical string escaping：
 
-- 必须escape quote、backslash和JSON-required control；
-- 非ASCII Unicode默认原样输出，不强制`\u`；
+- quote编码`\"`、backslash编码`\\`；U+0008/U+0009/U+000A/U+000C/U+000D分别编码`\b/\t/\n/\f/\r`；其他U+0000..U+001F使用lowercase `\u00xx`；
+- solidus不escape；其余Unicode scalar直接输出UTF-8，不使用可选`\u` escape；
 - lone surrogate不构成有效Unicode scalar，拒绝；
 - human/model-visible safe text不得含NUL、ESC、DEL、C1 control或除HT/LF外的C0 control；
 - TextIntent/source text在owner boundary把CRLF/CR规范化为LF；external provider/Tool text中的forbidden control由owner在live apply前reject或替换为U+FFFD，并记录bounded diagnostic，wire adapter不得接收raw后自行redact。
@@ -107,7 +107,7 @@ Nested family保持nested：
 | --- | --- | --- | --- |
 | client → Runtime input | reject | reject | reject |
 | Runtime → client output | client defensively ignore field；Runtime仍必须只发送selected minor声明的fields | protocol error unless selected minor/capability declares it | reject malformed frame |
-| conversation JSONL v1 | ignore additive field | skip owning complete line + diagnostic | skip owning complete line + diagnostic |
+| conversation JSONL v1 entry（valid Header之后） | ignore additive field | skip owning complete line + diagnostic | skip owning complete line + diagnostic |
 
 unknown capability token是唯一通用例外：receiver忽略不认识的token。不能使用generic `Unknown`替代Turn terminal、Tool outcome、Interaction resolution或conversation fact。Runtime encoder必须严格输出selected minor schema；client ignore unknown output field只是防御性forward tolerance，不授权sender在1.0 frame偷发1.1 field，也不能据unknown field改变state。
 
@@ -291,20 +291,35 @@ Wire：
 
 ### Workspace Paths
 
-Absolute Workspace input path编码canonical RFC 8089 file URI：
+Absolute Workspace input path编码platform-independent canonical RFC 8089 `file:` URI。wire decoder先生成private `CanonicalFileUri { family, authority: Option<String>, decoded_utf8_path }`，完成全部lexical validation后才由Workspace按host family checked-convert为`PathBuf`；在macOS解析Windows/UNC carrier不得改变wire bytes或借用host path parser猜语义。
+
+Canonical examples：
 
 ```text
 file:///Users/alice/project
+file:///Users/alice/%E9%A1%B9%E7%9B%AE
 file:///C:/work/project
 file://server/share/project
 ```
 
-- scheme lowercase `file`；
-- 无userinfo/query/fragment；
-- percent escapes uppercase hex；
-- path必须absolute；
-- encoded URI最多8192 bytes；
-- v1拒绝无法lossless表示为UTF-8 URI的native path。
+共同规则：
+
+- wire必须使用hierarchical `file://<authority><path>` spelling；scheme exact lowercase `file`；无userinfo、port、query或fragment；禁止`file://localhost/...` alias；
+- percent triplet使用uppercase hex；连续triplet先还原bytes再strict UTF-8 decode；NUL、encoded `/` (`%2F`)与encoded backslash (`%5C`)拒绝；
+- RFC 3986 unreserved与ASCII `pchar`（除`%`）通常必须literal；percent-encoded unreserved/pchar拒绝。唯一disambiguation例外是POSIX path首segment形如ASCII letter + colon时，colon必须编码`%3A`，以区别drive family；
+- non-ASCII scalar按UTF-8 bytes逐byte `%HH`；literal `%`编码`%25`，space/`?`/`#`分别编码`%20/%3F/%23`；
+- decoded separator仅`/`；禁止backslash、repeated separator、`.`/`..` segment和非root trailing slash；emitter不执行Unicode normalization或filesystem canonicalization；
+- encoded URI最多8192 bytes；v1拒绝无法lossless表示为UTF-8 URI的native path。
+
+empty-authority classification precedence固定：literal path prefix `/[A-Za-z]:`先按drive candidate解析并要求drive uppercase；first segment中的`%3A`只作为POSIX disambiguator并decode为colon；其余single-leading-slash path为POSIX。由此native POSIX `/C:/work` canonical为`file:///C%3A/work`，而drive `C:/work` canonical为`file:///C:/work`。
+
+Family规则：
+
+- POSIX：`authority = None`，decoded path以single `/`开头；`file:///`是root；preserve segment case；
+- drive：`authority = None`，URI path exact `/[A-Z]:/segment...`，decoded path去掉URI-specific leading slash后为`C:/segment...`；drive letter uppercase，colon literal；drive root exact `file:///C:/`；
+- UNC：`authority = Some(lowercase_host)`；authority是total<=253 bytes的一到多个lowercase ASCII labels；labels以`.`分隔，每label 1..63 bytes，单字符label为`[a-z0-9]`，多字符label首尾为`[a-z0-9]`且中间只允许`[a-z0-9-]`；authority不能是`localhost`；decoded path不含leading slash且至少含non-empty share segment；share/segment case preserve；share root无trailing slash。
+
+Decoder只接受上述canonical spelling，不自动lowercase host/drive、不移除dot segment、不decode platform alias。Workspace在lexical decode后若family不被current host支持，返回typed invalid/unavailable workspace input，而不是把URI交给ambient `PathBuf` parser重解释。exact cross-platform vectors见[Wire V1 file URI carriers](../fixtures/wire-v1/public/carriers/file-uri.json)。
 
 WorkspaceRelativePath使用forward slash：
 
@@ -320,6 +335,24 @@ pub struct BoundedJsonValue(/* private */);
 pub struct BoundedJsonObject(/* private root object */);
 pub struct BoundedJsonSchema(/* private root object */);
 ```
+
+`BoundedJsonValue/Object/Schema`使用独立于typed DTO field order的canonical dynamic JSON：
+
+- array保持输入semantic order；object递归按decoded member-name的UTF-8 bytes升序输出；相同decoded key是duplicate并拒绝；
+- string使用本章唯一escaping规则；key不执行Unicode normalization，byte-distinct key保持distinct；
+- input与canonical output都必须分别满足encoded-byte cap；不能靠canonicalization接纳oversized input；
+- semantic equality、hash/idempotency和byte-exact golden均比较canonical bytes；不得依赖parser map insertion order；
+- Schema的`properties`等dynamic objects同样排序；`required`、`enum`和ordinary arrays保持声明顺序。
+
+Dynamic JSON number不降为`f64`，而是解析为exact decimal并按下列算法产生唯一literal：
+
+1. input必须符合JSON number grammar、literal<=64 bytes，显式base-10 exponent绝对值<=1,000,000；
+2. 合并integer/fraction digits为coefficient，去leading zero；zero（包括`-0`与`0e...`）canonical为`0`；
+3. `decimal_exponent = explicit_exponent - fraction_digit_count`；反复移除coefficient trailing zero并递增decimal_exponent；
+4. `adjusted_exponent = decimal_exponent + coefficient_digit_count - 1`；当`-6 <= adjusted_exponent < 21`时输出plain decimal，否则输出`first_digit[.remaining_digits]e<adjusted_exponent>`；positive exponent不带`+`或leading zero；
+5. non-zero negative value加`-`；canonical literal仍须<=64 bytes，否则拒绝。
+
+因此`1`、`1.0`、`1e0`归一为`1`，`-0`归一为`0`，object key order与number spelling都不会制造第二个semantic encoding。provider若需要有限精度numeric type，adapter必须显式checked lowering；不得静默round后改写conversation/tool arguments。
 
 constructor在分配完整semantic value前执行streaming/bounded validation。ordinary embedded JSON limits：
 
@@ -343,6 +376,8 @@ BoundedJsonSchema使用JSON Schema Draft 2020-12 object form：
 | total nodes | 4,096 |
 | properties / required / enum items | 256 |
 | regex text bytes | 1,024 |
+
+所有JSON depth都以root value depth=1，直接child depth=parent+1；object member name不另算node。Schema `total nodes`计算root在内的每个object、array和scalar value各1个node；member name不计。`max_properties_required_or_enum_items = 256`分别限制任一`properties` object的direct members、任一`required` array items和任一`enum` array items，不对三类跨collection求和。ordinary BoundedJson的object/array limit同样是每个container的direct members/items。
 
 v1允许local fragment `$ref`，拒绝remote/network ref。schema owner必须使用bounded/non-backtracking regex implementation；不能在decode或validation期间访问network/filesystem。Tool与Model owner定义支持keyword subset、provider lowering和semantic validation；wire owner只保证bounded object。
 
@@ -546,7 +581,7 @@ record 2+ {"type":"entry","data":{...}} LF
 - Header最多65,536 bytes excluding line ending；
 - each entry最多1,048,576 bytes excluding line ending；
 - file最多1,073,741,824 bytes且最多1,000,000 complete entry records；file byte cap包含final unterminated tail；
-- canonical writer使用本模块JSON rules与stable field order；
+- canonical writer使用本模块JSON rules与stable field order；reader的strict Header指schema/version/typed scalar strict，不要求input为compact canonical bytes，JSON grammar允许的insignificant whitespace与member order在line cap内可接受；
 - header unknown version、malformed、oversized或invalid UTF-8使Load fail closed，禁止append/truncate；
 - writer v1绝不向higher-version file append。
 
@@ -566,15 +601,16 @@ scanner不得使用unbounded `read_line`/`read_until`。open首先对包含tail�
 
 ### Diagnostics
 
-每次Load最多保留100条ordered detail。超过后只按allowlisted code累加checked counter，并追加一个`diagnostics_truncated` summary。每条message最多512 bytes；不含raw line、absolute path、raw OS error、provider body/header、Tool output、credential或hidden reasoning。
+每次Load对每个diagnostic fact先checked-increment其per-code total counter，并只保留physical order前100条ordered detail。若至少一条detail被省略，再追加一个`diagnostics_truncated` summary；summary记录`omitted_detail_count`以及全部observed source facts（含已保留100条）的per-code total counts；synthetic summary自身不递增`diagnostics_truncated` total。因此101条`malformed_json`的aggregate是101、omitted detail是1，而不是aggregate 1。每条detail/summary message最多512 bytes；不含raw line、absolute path、raw OS error、provider body/header、Tool output、credential或hidden reasoning。
 
-Required codes至少包括：
+V1 exact code set如下；semantic emission precedence由[Conversation Storage](conversation-storage.md#tolerant-replay)拥有：
 
 ```text
 partial_tail
 oversized_line
 invalid_utf8
 malformed_json
+invalid_entry
 unknown_record_variant
 unknown_entry_variant
 duplicate_entry_id
@@ -657,7 +693,7 @@ Storage：
 - diagnostics cap/aggregate；
 - expected accepted EntryIds、sanitized conversation、diagnostics和writable truncation offset。
 
-Oversized fixture使用recipe在test生成，不提交1 MiB/1 GiB blob。Decoder assertions比较semantic result，不比较input member order；canonical encoder golden比较exact bytes。
+Oversized fixture使用recipe在test生成，不提交1 MiB/1 GiB blob。Decoder assertions比较semantic result，不比较input member order；canonical encoder golden比较exact bytes。authoritative vectors、public target/expectation manifest、conversation replay expectations和all-limit recipes位于[Wire V1 Fixtures](../fixtures/wire-v1/README.md)；`verify.py`只校验资产结构，首个Rust protocol/storage crate必须执行semantic conformance。
 
 ## Test Matrix
 

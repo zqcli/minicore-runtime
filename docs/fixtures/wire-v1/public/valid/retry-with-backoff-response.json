@@ -1,0 +1,1 @@
+{"commandId":"cmd_11111111111111111111111111111111","completion":{"type":"rejected","data":{"code":{"type":"ingress_lane_full","data":{"lane":"turn_admission"}},"message":"turn admission queue is full","retry":{"type":"retry_with_backoff","data":{"retryAfter":2000}},"subject":{"type":"session","data":"ses_22222222222222222222222222222222"}}}}

@@ -1,0 +1,23 @@
+{
+  "assertions": {
+    "askUserExclusiveFirst": {
+      "assistantEntryId": "ent_c0000000000000000000000000000002",
+      "askUserToolCallId": "call_cancel_question",
+      "requestEntryId": "ent_c0000000000000000000000000000009",
+      "resolutionEntryId": "ent_c0000000000000000000000000000010",
+      "toolTerminalEntryId": "ent_c0000000000000000000000000000011",
+      "firstSiblingInteractionEntryId": "ent_c0000000000000000000000000000003",
+      "requiredPhysicalOrder": [
+        "ent_c0000000000000000000000000000009",
+        "ent_c0000000000000000000000000000010",
+        "ent_c0000000000000000000000000000011",
+        "ent_c0000000000000000000000000000003"
+      ],
+      "noSiblingInteractionBeforeAskUserTerminal": true
+    },
+    "toolOrdering": {
+      "physicalTerminalOrder": ["call_cancel_question", "call_allow", "call_deny"],
+      "modelVisibleOrder": ["call_allow", "call_deny", "call_cancel_question"]
+    }
+  }
+}
