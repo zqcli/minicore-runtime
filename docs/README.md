@@ -28,7 +28,7 @@ architecture.md + modules/
 
 Rust crate与Wire typed scalar/value/path carriers已经进入`dev`。BoundedJson/Schema、public/storage codec、LiveConversation、SessionRecorder、SessionExecutor、ActiveTurnTask和provider尚未实现。
 
-当前先执行开发计划M0；后续主要门禁：
+开发计划M0已经完成，当前暂停于M1.1前；后续主要门禁：
 
 - M5.0：冻结single-process durable entity store、CAS与跨entity/conversation staging协议；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；

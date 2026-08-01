@@ -56,6 +56,6 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。当前从M0文档收敛/质量门禁开始，随后完成bounded Wire core、public/storage conformance、LiveConversation与ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0文档收敛/质量门禁已经完成，当前暂停于M1.1前；随后依次完成bounded Wire core、public/storage conformance、LiveConversation与ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。
