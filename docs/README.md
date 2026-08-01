@@ -26,9 +26,9 @@ architecture.md + modules/
 
 ## 当前状态
 
-Rust crate与Wire typed scalar/value/path carriers已经进入`dev`。BoundedJson/Schema、public/storage codec、LiveConversation、SessionRecorder、SessionExecutor、ActiveTurnTask和provider尚未实现。
+Rust crate的M1 Wire foundation与owner semantic spine已经进入`dev`：ProtocolLimits/counters、bounded dynamic JSON、bounded JSON Schema、typed bootstrap codec，以及Prompt/Tools/Model/Turn/Interaction semantic values与Compaction stored-provenance/stable-kind leaves均已实现并通过Fast、MSRV与heavy gates。完整public/storage codec、LiveConversation、SessionRecorder、SessionExecutor、ActiveTurnTask和provider行为尚未实现。
 
-开发计划M0已经完成，当前暂停于M1.1前；后续主要门禁：
+开发计划M0与M1已经完成，当前暂停于M2前等待review；后续主要门禁：
 
 - M5.0：冻结single-process durable entity store、CAS与跨entity/conversation staging协议；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；

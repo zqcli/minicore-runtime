@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0已完成，按用户要求暂停于M1.1前
+状态：Active；M0与M1已完成，按用户要求暂停于M2前等待review
 
 初始实现基线：`dev` at `144039a`
 
@@ -41,22 +41,22 @@ production Rig ProviderAdapter和OS/network/process Tool不属于上述internal 
 
 ## 当前基线
 
-已经提交并通过单元测试、`rustfmt`与Clippy的Rust基础：
+M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 
-- `c06042a`：typed IDs/revisions、`CanonicalU64`、`PageCursor`、`InteractionResolutionKey`；
-- `7071e77`：exact-millisecond `Timestamp`、bounded `Duration`、canonical `Money/Currency`；
-- `144039a`：platform-independent `CanonicalFileUri`与`WorkspaceRelativePath`；
-- authoritative file URI vectors由Rust测试直接消费；
-- crate仍保持单package，尚无Runtime、Session、Conversation、storage或provider实现。
+- exact V1.0 `ProtocolLimits`、checked counters、exact-version negotiation与sealed Runtime capability intersection；
+- byte-oriented duplicate-aware `BoundedJsonValue/Object`与exact decimal canonicalization；
+- bounded Draft 2020-12 `BoundedJsonSchema`、local-ref/regex/node safety；
+- duplicate-aware typed bootstrap codec、bounded encoder与selected-version sender/receiver rules；
+- Prompt/Skill/Workspace、Tools、ModelGateway、Turn/Item/Interaction和Compaction-owned semantic spine及M3 replay reconstruction seams；
+- authoritative limits/JSON/Schema/public compatibility vectors由Rust tests直接消费；
+- crate继续保持单package，M1没有实现Session、Recorder、provider attempt、Tool execution、Compaction planning或live reducer行为。
 
 当前不能视为已完成：
 
-- `BoundedJsonValue/Object/Schema`；
-- public DTO与manifest runner；
-- Conversation JSONL codec/scanner/replay；
-- LiveConversation reducer；
-- SessionRecorder、SessionExecutor和ActiveTurnTask；
-- Prompt/Skill/Tool/ModelGateway实现；
+- M2 public protocol route/DTO families与完整manifest closure；
+- Conversation JSONL line codec、scanner与semantic replay；
+- `ConversationRevision`、`ModelMessage`和LiveConversation reducer，包括M4的`LiveCompactionSourceView` aggregate；
+- SessionRecorder、SessionExecutor、ActiveTurnTask和ScriptedProvider vertical slice；
 - production provider与sandbox adapter。
 
 ## 实施原则
@@ -154,6 +154,10 @@ M12 + M13 ──> M14 Production Adapters ──> M15 Hardening + Release
 建议提交：`build: establish rust quality gate`。
 
 ## M1 · Wire Foundations与Owner Semantic Spine
+
+状态：Completed。
+
+M1.1–M1.5已按owner拆分提交；最终review确认无correctness/security/spec blocker。`./scripts/check.sh`、`./scripts/check-msrv.sh`和`./scripts/check-heavy.sh`全部通过。M1只建立Wire foundation与pure semantic values；`LiveCompactionSourceView`/`LiveCompactionUnit`因依赖尚未实现的`ConversationRevision`与canonical `ModelMessage`，按本计划保留到M4，不以placeholder或shadow DTO提前实现。
 
 ### M1.1 ProtocolLimits与bounded counters
 
@@ -305,6 +309,7 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 任务：
 
 - Session-scoped `EntryIdGenerator`与collision guard；
+- 在构造任何stable-unit view前，按Prompt canonical owner实现provider-neutral `ModelMessage`；若current Prompt/Model合同不足以冻结exact shape，先停止并更新canonical module，不得引入Compaction-owned shadow DTO；
 - User/Assistant/Tool/Interaction/Compaction typed apply methods；
 - `ConversationRevision` checked increment；
 - ItemId、ToolCallId和relation validation；
@@ -639,12 +644,13 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 | full protocol拖慢主闭环 | DTO批量实现长期没有运行场景 | 保持manifest family小提交，但不得跳过最终conformance gate |
 | superseded文档污染实施判断 | current搜索命中旧AgentLoop、durable writer或错误实施状态 | 先完成M0归档和导航，不靠口头权威顺序长期兜底 |
 
-## 首轮恢复顺序
+## 下一轮恢复顺序
 
-M0已完成，当前暂停。下一次经review确认恢复后，只执行下列task，不提前进入Session执行：
+M0与M1已完成，当前按用户要求暂停于M2前。下一次经review确认恢复后，只执行下列task，不提前进入Session执行：
 
-1. `M1.1`：实现ProtocolLimits与bounded counters；
-2. `M1.2`：从测试重新实现bounded dynamic JSON专用parser/encoder；
-3. `M1.3`：实现BoundedJsonSchema carrier。
+1. `M2`基于现有typed bootstrap codec实现bootstrap routing、outer request/response/frame envelope与route skeleton；
+2. `M3.1` exact Conversation Header/Entry codec并直接消费golden fixtures；
+3. `M3.2` bounded physical JSONL scanner；
+4. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`。
 
-`M1.2`必须重新审视任何本地未提交草稿，不得因为已有代码存在而跳过positive exponent、pre-allocation limit和Unicode linearity测试。完成每个task后立即单独commit并汇报验证结果。
+在M2–M6 prerequisites关闭前不得进入M7 ordinary behavior slice；production Provider与Tool/Sandbox继续分别受V4-P1-3和V4-C0-1门禁约束。
