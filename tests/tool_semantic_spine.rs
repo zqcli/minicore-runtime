@@ -28,14 +28,16 @@ fn tool_name_and_call_id_use_distinct_owner_grammars() {
 }
 
 #[test]
-fn tool_result_content_is_bounded_normalized_and_debug_redacted() {
+fn tool_result_content_is_bounded_preserved_and_debug_redacted() {
     let content =
-        ToolResultContent::from_text_parts(vec!["SECRET-MARKER\r\nnext".to_owned()]).unwrap();
+        ToolResultContent::from_text_parts(vec!["SECRET-MARKER\nnext".to_owned()]).unwrap();
     assert_eq!(content.parts()[0].as_text(), "SECRET-MARKER\nnext");
     assert!(!format!("{content:?}").contains("SECRET-MARKER"));
 
     assert!(ToolResultContent::from_text_parts(Vec::new()).is_err());
     assert!(ToolResultContent::from_text_parts(vec![String::new()]).is_ok());
+    assert!(ToolResultContent::from_text_parts(vec!["bad\r\ntext".to_owned()]).is_err());
+    assert!(ToolResultContent::from_text_parts(vec!["bad\rtext".to_owned()]).is_err());
     assert!(ToolResultContent::from_text_parts(vec!["x".repeat(65_537)]).is_err());
     assert!(ToolResultContent::from_text_parts(vec!["bad\u{001b}".to_owned()]).is_err());
 }
