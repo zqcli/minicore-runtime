@@ -7,10 +7,12 @@
     {"wire":"file:///Users/alice/%E9%A1%B9%E7%9B%AE","family":"posix","authority":null,"decodedPath":"/Users/alice/项目"},
     {"wire":"file:///Users/alice/a%20b%3Fc%23d%25","family":"posix","authority":null,"decodedPath":"/Users/alice/a b?c#d%"},
     {"wire":"file:///C%3A/work","family":"posix","authority":null,"decodedPath":"/C:/work"},
+    {"wire":"file:///C%3Afoo","family":"posix","authority":null,"decodedPath":"/C:foo"},
     {"wire":"file:///c%3A/work","family":"posix","authority":null,"decodedPath":"/c:/work"},
     {"wire":"file:///C:/","family":"drive","authority":null,"decodedPath":"C:/"},
     {"wire":"file:///C:/work/project","family":"drive","authority":null,"decodedPath":"C:/work/project"},
     {"wire":"file://server/share","family":"unc","authority":"server","decodedPath":"share"},
+    {"wire":"file://server/C:/share","family":"unc","authority":"server","decodedPath":"C:/share"},
     {"wire":"file://build-01.example/share/project","family":"unc","authority":"build-01.example","decodedPath":"share/project"}
   ],
   "invalid": [
@@ -29,6 +31,25 @@
     {"wire":"file://server/","reason":"unc_share_missing"},
     {"wire":"file:///Users/alice/project?x=1","reason":"query_forbidden"},
     {"wire":"file:///Users/alice/project#x","reason":"fragment_forbidden"},
-    {"wire":"file:///Users/alice/%FF","reason":"invalid_utf8"}
+    {"wire":"file:///Users/alice/%FF","reason":"invalid_utf8"},
+    {"wire":"file://server/C%3A/share","reason":"encoded_pchar_outside_posix_disambiguator"},
+    {"wire":"file:///C:","reason":"ambiguous_literal_drive_prefix"},
+    {"wire":"file:///C:x","reason":"ambiguous_literal_drive_prefix"},
+    {"wire":"file:///Users/alice/a/../b","reason":"dot_segment"},
+    {"wire":"file:///C:/work//project","reason":"repeated_separator"},
+    {"wire":"file://server/share/","reason":"unc_trailing_separator"},
+    {"wire":"file:///Users/alice/%","reason":"truncated_percent"},
+    {"wire":"file:///Users/alice/%0","reason":"truncated_percent"},
+    {"wire":"file:///Users/alice/%GG","reason":"invalid_percent_hex"},
+    {"wire":"file:///Users/alice/%00","reason":"nul_forbidden"},
+    {"wire":"file:///Users/alice/%2E","reason":"encoded_pchar"},
+    {"wire":"file:///Users/alice\\project","reason":"raw_backslash"},
+    {"wire":"file:///Users/alice/项目","reason":"raw_non_ascii"},
+    {"wire":"file:///Users/alice/%ED%A0%80","reason":"surrogate_utf8"},
+    {"wire":"file:///Users/alice/%C0%AF","reason":"overlong_utf8"},
+    {"wire":"file:///Users/alice/%E2%82","reason":"truncated_utf8"},
+    {"wire":"file://-server/share","reason":"authority_label_start"},
+    {"wire":"file://server-/share","reason":"authority_label_end"},
+    {"wire":"file://server..example/share","reason":"authority_empty_label"}
   ]
 }
