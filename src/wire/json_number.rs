@@ -5,10 +5,6 @@ use thiserror::Error;
 use super::limits::ProtocolLimits;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by M1.2 bounded JSON parser")
-)]
 pub enum JsonNumberError {
     #[error("invalid JSON number syntax")]
     InvalidSyntax,
@@ -21,16 +17,8 @@ pub enum JsonNumberError {
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by M1.2 bounded JSON parser")
-)]
 pub struct CanonicalJsonNumber(Box<str>);
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by M1.2 bounded JSON parser")
-)]
 impl CanonicalJsonNumber {
     pub fn parse(literal: &str) -> Result<Self, JsonNumberError> {
         let limit = ProtocolLimits::v1_0()
