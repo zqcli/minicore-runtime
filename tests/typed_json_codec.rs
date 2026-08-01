@@ -55,6 +55,34 @@ fn protocol_hello_is_strict_after_bounded_duplicate_aware_preflight() {
             Err(TypedJsonError::TypedShape)
         );
     }
+
+    for invalid in [
+        minicore_runtime::wire::ProtocolHello::new(
+            vec![ProtocolVersion::V1_0, ProtocolVersion::V1_0],
+            minicore_runtime::wire::ClientInfo::new("host", "1"),
+            vec![],
+        ),
+        minicore_runtime::wire::ProtocolHello::new(
+            vec![ProtocolVersion::V1_0],
+            minicore_runtime::wire::ClientInfo::new("bad\rclient", "1"),
+            vec![],
+        ),
+        minicore_runtime::wire::ProtocolHello::new(
+            vec![ProtocolVersion::V1_0],
+            minicore_runtime::wire::ClientInfo::new("host", "1"),
+            vec!["state_events".to_owned(), "state_events".to_owned()],
+        ),
+        minicore_runtime::wire::ProtocolHello::new(
+            vec![ProtocolVersion::V1_0],
+            minicore_runtime::wire::ClientInfo::new("host", "1"),
+            vec!["Future-Capability".to_owned()],
+        ),
+    ] {
+        assert_eq!(
+            encode_protocol_hello_v1(&invalid),
+            Err(TypedJsonError::TypedShape)
+        );
+    }
 }
 
 #[test]

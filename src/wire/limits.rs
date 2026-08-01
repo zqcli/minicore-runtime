@@ -909,6 +909,10 @@ fn validate_hello(hello: &ProtocolHello) -> Result<ValidatedHello, HelloValidati
     Ok(ValidatedHello { capabilities })
 }
 
+pub(crate) fn protocol_hello_is_valid(hello: &ProtocolHello) -> bool {
+    validate_hello(hello).is_ok()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolRejectReason {
@@ -1073,7 +1077,7 @@ pub enum ProtocolBootstrapResponse {
 pub enum ProtocolNegotiation {
     Selected {
         version: ProtocolVersion,
-        capabilities: Vec<CapabilityToken>,
+        capabilities: RuntimeCapabilities,
     },
     Rejected {
         reason: ProtocolRejectReason,
@@ -1084,40 +1088,32 @@ pub enum ProtocolNegotiation {
     not(test),
     allow(dead_code, reason = "consumed by M2 bootstrap routing")
 )]
-pub fn negotiate_protocol(
-    hello: &ProtocolHello,
-    runtime_supported_versions: &[ProtocolVersion],
-    runtime_capabilities: &[CapabilityToken],
-) -> ProtocolNegotiation {
+pub fn negotiate_protocol(hello: &ProtocolHello) -> ProtocolNegotiation {
     let Ok(validated) = validate_hello(hello) else {
         return ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::InvalidHello,
         };
     };
-    let runtime_versions = runtime_supported_versions
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     let selected = hello
         .supported_versions()
         .iter()
         .copied()
-        .filter(|version| runtime_versions.contains(version))
-        .max();
-    let Some(version) = selected else {
+        .any(|version| version == ProtocolVersion::V1_0);
+    if !selected {
         return ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::UnsupportedProtocolVersion,
         };
-    };
+    }
 
     let client_capabilities = validated.capabilities.iter().collect::<BTreeSet<_>>();
-    let capabilities = runtime_capabilities
-        .iter()
+    let capabilities = v1_runtime_capabilities()
+        .into_iter()
         .filter(|capability| client_capabilities.contains(capability))
-        .cloned()
-        .collect();
+        .collect::<Vec<_>>();
+    let capabilities = RuntimeCapabilities::from_v1_negotiated(capabilities)
+        .expect("built-in V1 capability intersection must be valid");
     ProtocolNegotiation::Selected {
-        version,
+        version: ProtocolVersion::V1_0,
         capabilities,
     }
 }
