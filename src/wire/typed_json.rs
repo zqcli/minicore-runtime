@@ -9,7 +9,7 @@ use super::bounded_json::{BoundedJsonError, JsonNode, JsonParseLimits, parse_nod
 use super::limits::{
     CapabilityToken, ClientInfo, ProtocolBootstrapResponse, ProtocolHello, ProtocolLimits,
     ProtocolReject, ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, RuntimeCapabilities,
-    RuntimeInfo,
+    RuntimeInfo, is_v1_runtime_capability,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -473,7 +473,13 @@ impl RuntimeCapabilitiesInput {
             .map(|value| value.parse::<CapabilityToken>())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| TypedJsonError::TypedShape)?;
-        Ok(RuntimeCapabilities::new(values))
+        RuntimeCapabilities::from_v1_negotiated(
+            values
+                .into_iter()
+                .filter(is_v1_runtime_capability)
+                .collect(),
+        )
+        .map_err(|_| TypedJsonError::TypedShape)
     }
 }
 

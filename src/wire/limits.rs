@@ -955,9 +955,37 @@ pub struct RuntimeCapabilities {
     values: Vec<CapabilityToken>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum RuntimeCapabilitiesError {
+    #[error("runtime capability is not declared by protocol v1.0")]
+    UnknownCapability,
+    #[error("runtime capability set contains a duplicate token")]
+    DuplicateCapability,
+}
+
 impl RuntimeCapabilities {
-    pub fn new(values: Vec<CapabilityToken>) -> Self {
-        Self { values }
+    pub fn empty() -> Self {
+        Self { values: Vec::new() }
+    }
+
+    pub(crate) fn from_v1_negotiated(
+        values: Vec<CapabilityToken>,
+    ) -> Result<Self, RuntimeCapabilitiesError> {
+        let selected = values.iter().cloned().collect::<BTreeSet<_>>();
+        if selected.len() != values.len() {
+            return Err(RuntimeCapabilitiesError::DuplicateCapability);
+        }
+        if selected
+            .iter()
+            .any(|capability| !is_v1_runtime_capability(capability))
+        {
+            return Err(RuntimeCapabilitiesError::UnknownCapability);
+        }
+        let values = v1_runtime_capabilities()
+            .into_iter()
+            .filter(|capability| selected.contains(capability))
+            .collect();
+        Ok(Self { values })
     }
 
     pub fn values(&self) -> &[CapabilityToken] {
@@ -1099,24 +1127,30 @@ pub fn negotiate_protocol(
     allow(dead_code, reason = "consumed by M2 bootstrap routing")
 )]
 pub fn v1_runtime_capabilities() -> Vec<CapabilityToken> {
-    [
-        "state_events",
-        "progress_events",
-        "runtime_snapshot",
-        "session_snapshot",
-        "paged_queries",
-        "command_catalog",
-        "interaction_resolution",
-        "session_fork",
-    ]
-    .into_iter()
-    .map(|value| {
-        value
-            .parse()
-            .expect("built-in capability token must be valid")
-    })
-    .collect()
+    V1_RUNTIME_CAPABILITY_TOKENS
+        .into_iter()
+        .map(|value| {
+            value
+                .parse()
+                .expect("built-in capability token must be valid")
+        })
+        .collect()
 }
+
+pub(crate) fn is_v1_runtime_capability(capability: &CapabilityToken) -> bool {
+    V1_RUNTIME_CAPABILITY_TOKENS.contains(&capability.as_str())
+}
+
+const V1_RUNTIME_CAPABILITY_TOKENS: [&str; 8] = [
+    "state_events",
+    "progress_events",
+    "runtime_snapshot",
+    "session_snapshot",
+    "paged_queries",
+    "command_catalog",
+    "interaction_resolution",
+    "session_fork",
+];
 
 #[cfg(test)]
 #[path = "limits_tests.rs"]
