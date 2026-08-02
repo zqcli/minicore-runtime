@@ -960,7 +960,7 @@ pub struct RuntimeCapabilities {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum RuntimeCapabilitiesError {
+pub enum RuntimeCapabilitiesError {
     #[error("runtime capability is not declared by protocol v1.0")]
     UnknownCapability,
     #[error("runtime capability set contains a duplicate token")]
@@ -972,9 +972,7 @@ impl RuntimeCapabilities {
         Self { values: Vec::new() }
     }
 
-    pub(crate) fn from_v1_negotiated(
-        values: Vec<CapabilityToken>,
-    ) -> Result<Self, RuntimeCapabilitiesError> {
+    pub fn for_v1(values: Vec<CapabilityToken>) -> Result<Self, RuntimeCapabilitiesError> {
         let selected = values.iter().cloned().collect::<BTreeSet<_>>();
         if selected.len() != values.len() {
             return Err(RuntimeCapabilitiesError::DuplicateCapability);
@@ -1088,7 +1086,10 @@ pub enum ProtocolNegotiation {
     not(test),
     allow(dead_code, reason = "consumed by M2 bootstrap routing")
 )]
-pub fn negotiate_protocol(hello: &ProtocolHello) -> ProtocolNegotiation {
+pub fn negotiate_protocol(
+    hello: &ProtocolHello,
+    implemented_capabilities: &RuntimeCapabilities,
+) -> ProtocolNegotiation {
     let Ok(validated) = validate_hello(hello) else {
         return ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::InvalidHello,
@@ -1106,12 +1107,14 @@ pub fn negotiate_protocol(hello: &ProtocolHello) -> ProtocolNegotiation {
     }
 
     let client_capabilities = validated.capabilities.iter().collect::<BTreeSet<_>>();
-    let capabilities = v1_runtime_capabilities()
-        .into_iter()
+    let capabilities = implemented_capabilities
+        .values()
+        .iter()
         .filter(|capability| client_capabilities.contains(capability))
+        .cloned()
         .collect::<Vec<_>>();
-    let capabilities = RuntimeCapabilities::from_v1_negotiated(capabilities)
-        .expect("built-in V1 capability intersection must be valid");
+    let capabilities = RuntimeCapabilities::for_v1(capabilities)
+        .expect("subset of a validated V1 capability set must remain valid");
     ProtocolNegotiation::Selected {
         version: ProtocolVersion::V1_0,
         capabilities,

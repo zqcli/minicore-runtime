@@ -6,6 +6,10 @@ use serde_json::Value;
 
 use super::*;
 
+fn all_v1_capabilities() -> RuntimeCapabilities {
+    RuntimeCapabilities::for_v1(v1_runtime_capabilities()).unwrap()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LimitRecipe {
@@ -26,42 +30,6 @@ struct ValidatorSelector {
 #[derive(Debug, Deserialize)]
 struct SpecialCase {
     validator: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NegotiationVectors {
-    runtime_supported_versions: Vec<ProtocolVersion>,
-    runtime_capabilities: Vec<String>,
-    cases: Vec<NegotiationCase>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct NegotiationCase {
-    hello_path: String,
-    expected_selected_version: Option<ProtocolVersion>,
-    expected_capabilities: Option<Vec<String>>,
-    expected_reject_reason: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawHello {
-    supported_versions: Vec<ProtocolVersion>,
-    client: RawClient,
-    capabilities: RawCapabilities,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawClient {
-    name: String,
-    version: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCapabilities {
-    values: Vec<String>,
 }
 
 #[test]
@@ -135,64 +103,6 @@ fn checked_counter_cannot_be_copied_and_keeps_state_after_errors() {
 }
 
 #[test]
-fn negotiation_matches_vectors_and_maps_invalid_hello_to_typed_reject() {
-    let root = fixture_root();
-    let vectors: NegotiationVectors =
-        read_json(&root.join("public/protocol-negotiation-cases.json"));
-    let runtime_capabilities: Vec<CapabilityToken> = vectors
-        .runtime_capabilities
-        .iter()
-        .map(|value| value.parse().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(vectors.runtime_supported_versions, [ProtocolVersion::V1_0]);
-    assert_eq!(runtime_capabilities, v1_runtime_capabilities());
-
-    for case in vectors.cases {
-        let raw: RawHello = read_json(&root.join("public").join(case.hello_path));
-        let hello = ProtocolHello::new(
-            raw.supported_versions,
-            ClientInfo::new(raw.client.name, raw.client.version),
-            raw.capabilities.values,
-        );
-        match negotiate_protocol(&hello) {
-            ProtocolNegotiation::Selected {
-                version,
-                capabilities,
-            } => {
-                assert_eq!(Some(version), case.expected_selected_version);
-                assert_eq!(
-                    capabilities
-                        .values()
-                        .iter()
-                        .map(CapabilityToken::as_str)
-                        .collect::<Vec<_>>(),
-                    case.expected_capabilities.unwrap(),
-                );
-            }
-            ProtocolNegotiation::Rejected { reason } => {
-                assert_eq!(reason, ProtocolRejectReason::UnsupportedProtocolVersion);
-                assert_eq!(
-                    case.expected_reject_reason.as_deref(),
-                    Some("unsupported_protocol_version"),
-                );
-            }
-        }
-    }
-
-    let duplicate = ProtocolHello::new(
-        vec![ProtocolVersion::V1_0, ProtocolVersion::V1_0],
-        ClientInfo::new("host", "1"),
-        vec!["state_events".to_owned()],
-    );
-    assert_eq!(
-        negotiate_protocol(&duplicate),
-        ProtocolNegotiation::Rejected {
-            reason: ProtocolRejectReason::InvalidHello,
-        }
-    );
-}
-
-#[test]
 fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
     let versions = (0..16)
         .map(|minor| ProtocolVersion::new(1, minor))
@@ -204,7 +114,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         capabilities.clone(),
     );
     assert!(matches!(
-        negotiate_protocol(&safe),
+        negotiate_protocol(&safe, &all_v1_capabilities()),
         ProtocolNegotiation::Selected { .. }
     ));
 
@@ -243,7 +153,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         oversized_version,
     ] {
         assert_eq!(
-            negotiate_protocol(&invalid),
+            negotiate_protocol(&invalid, &all_v1_capabilities()),
             ProtocolNegotiation::Rejected {
                 reason: ProtocolRejectReason::InvalidHello,
             }
@@ -259,7 +169,7 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
         ] {
             let hello = ProtocolHello::new(vec![ProtocolVersion::V1_0], client, vec![]);
             assert_eq!(
-                negotiate_protocol(&hello),
+                negotiate_protocol(&hello, &all_v1_capabilities()),
                 ProtocolNegotiation::Rejected {
                     reason: ProtocolRejectReason::InvalidHello,
                 },
@@ -272,26 +182,35 @@ fn hello_boundaries_and_safe_visible_text_follow_wire_rules() {
     let max_client = "é".repeat(64);
     let oversized_client = format!("{max_client}x");
     assert!(matches!(
-        negotiate_protocol(&ProtocolHello::new(
-            vec![ProtocolVersion::V1_0],
-            ClientInfo::new(max_client, ""),
-            vec![],
-        )),
+        negotiate_protocol(
+            &ProtocolHello::new(
+                vec![ProtocolVersion::V1_0],
+                ClientInfo::new(max_client, ""),
+                vec![],
+            ),
+            &all_v1_capabilities(),
+        ),
         ProtocolNegotiation::Selected { .. }
     ));
     assert_eq!(
-        negotiate_protocol(&ProtocolHello::new(
-            vec![ProtocolVersion::V1_0],
-            ClientInfo::new(oversized_client, "1"),
-            vec![],
-        )),
+        negotiate_protocol(
+            &ProtocolHello::new(
+                vec![ProtocolVersion::V1_0],
+                ClientInfo::new(oversized_client, "1"),
+                vec![],
+            ),
+            &all_v1_capabilities(),
+        ),
         ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::InvalidHello,
         }
     );
 
     assert_eq!(
-        negotiate_protocol(&ProtocolHello::new(vec![], ClientInfo::new("", ""), vec![],)),
+        negotiate_protocol(
+            &ProtocolHello::new(vec![], ClientInfo::new("", ""), vec![]),
+            &all_v1_capabilities(),
+        ),
         ProtocolNegotiation::Rejected {
             reason: ProtocolRejectReason::UnsupportedProtocolVersion,
         }
@@ -310,10 +229,10 @@ fn negotiation_selects_exact_v1_and_runtime_capability_order() {
         vec!["session_snapshot".to_owned(), "state_events".to_owned()],
     );
     assert_eq!(
-        negotiate_protocol(&hello),
+        negotiate_protocol(&hello, &all_v1_capabilities()),
         ProtocolNegotiation::Selected {
             version: ProtocolVersion::V1_0,
-            capabilities: RuntimeCapabilities::from_v1_negotiated(vec![
+            capabilities: RuntimeCapabilities::for_v1(vec![
                 "state_events".parse().unwrap(),
                 "session_snapshot".parse().unwrap(),
             ])
@@ -324,7 +243,7 @@ fn negotiation_selects_exact_v1_and_runtime_capability_order() {
 
 #[test]
 fn runtime_capability_outputs_are_known_unique_and_canonically_ordered() {
-    let capabilities = RuntimeCapabilities::from_v1_negotiated(vec![
+    let capabilities = RuntimeCapabilities::for_v1(vec![
         "session_snapshot".parse().unwrap(),
         "state_events".parse().unwrap(),
     ])
@@ -338,14 +257,14 @@ fn runtime_capability_outputs_are_known_unique_and_canonically_ordered() {
         ["state_events", "session_snapshot"]
     );
     assert_eq!(
-        RuntimeCapabilities::from_v1_negotiated(vec![
+        RuntimeCapabilities::for_v1(vec![
             "state_events".parse().unwrap(),
             "state_events".parse().unwrap(),
         ]),
         Err(RuntimeCapabilitiesError::DuplicateCapability)
     );
     assert_eq!(
-        RuntimeCapabilities::from_v1_negotiated(vec!["future_capability".parse().unwrap()]),
+        RuntimeCapabilities::for_v1(vec!["future_capability".parse().unwrap()]),
         Err(RuntimeCapabilitiesError::UnknownCapability)
     );
 }

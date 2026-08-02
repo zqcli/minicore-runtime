@@ -22,6 +22,6 @@ MiniCoreRuntime.subscribe(SubscriptionRequest) -> EventStream
 → [docs/research/](docs/research/)
 → [docs/archive/v1/](docs/archive/v1/README.md)（非权威，仅历史参考）
 
-V1已归档，仅用于历史参考；V2是当前权威架构。第四轮评审的全部P0、V4-P1-1、P1-2与P1-4已关闭，ADR 0134、exact Conversation JSONL v1和wire conformance vectors已冻结。M0文档/质量基线与M1 Wire foundation/owner semantic spine已经完成并通过Fast、MSRV与heavy gates；Runtime、Session、Conversation reducer/recording与provider行为尚未实现。当前按计划暂停于M2前等待review；production ProviderAdapter前关闭V4-P1-3，production Tool/Sandbox adapter前关闭V4-C0-1。
+V1已归档，仅用于历史参考；V2是当前权威架构。第四轮评审的全部P0、V4-P1-1、P1-2与P1-4已关闭，ADR 0134、exact Conversation JSONL v1和wire conformance vectors已冻结。M0文档/质量基线与M1 Wire foundation/owner semantic spine已经完成并通过Fast、MSRV与heavy gates；M2正在实施，Protocol V1 bootstrap router与incremental public manifest gate已完成，outer Runtime routes、Session、Conversation reducer/recording与provider行为尚未实现。production ProviderAdapter前关闭V4-P1-3，production Tool/Sandbox adapter前关闭V4-C0-1。
 
 当前开发从[MiniCore V2开发计划](docs/development-plan.md)恢复；[设计评审工作交接](docs/review/v2-design-review-handoff.md)仅保留为合并前历史checkpoint。
