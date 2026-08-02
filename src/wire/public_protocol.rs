@@ -1,16 +1,23 @@
+use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::runtime_interface::{
-    CommandRequest, QueryResponse, QueryResult, RuntimeCapabilities, RuntimeCommand,
-    RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeRequest, SnapshotRequest, SubscriptionRequest, SubscriptionScope,
+use crate::prompt::{
+    PromptBodyIntent, PromptIntent, PromptValueError, SkillIntent, TextIntent,
+    normalize_text_intent, validate_skill_intent_count,
 };
+use crate::runtime_interface::{
+    CommandRequest, PublicCancelTarget, QueryResponse, QueryResult, RuntimeCapabilities,
+    RuntimeCommand, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, SessionCommand, SnapshotRequest,
+    SubscriptionRequest, SubscriptionScope, TurnCommand,
+};
+use crate::skills::SkillId;
 
 use super::bounded_json::JsonNode;
-use super::limits::{CapabilityToken, runtime_capability_from_token};
-use super::scalar::{CommandId, SessionId};
+use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
+use super::scalar::{CommandId, SessionId, TurnId};
 use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
     WireV1Codec,
@@ -127,14 +134,13 @@ fn decode_command_request(
     codec: &WireV1Codec,
     input: &[u8],
 ) -> Result<CommandRequest, TypedJsonError> {
-    let decoded: CommandRequestInput = codec.decode_with_shape(
-        PublicJsonKind::Request,
-        input,
-        validate_command_request_shape,
-    )?;
+    let decoded: CommandRequestInput =
+        codec.decode_with_shape(PublicJsonKind::Request, input, |node| {
+            validate_command_request_shape(node, codec.limits())
+        })?;
     Ok(CommandRequest::new(
         decoded.command_id,
-        decoded.command.into_semantic(),
+        decoded.command.into_semantic(codec.limits())?,
     ))
 }
 
@@ -142,6 +148,7 @@ fn encode_command_request(
     codec: &WireV1Codec,
     request: &CommandRequest,
 ) -> Result<Vec<u8>, TypedJsonError> {
+    validate_command_semantic_limits(request.command(), codec.limits())?;
     codec.encode(
         PublicJsonKind::Request,
         &CommandRequestOutput {
@@ -252,15 +259,39 @@ struct CommandRequestInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeCommandInput {
     Runtime(RuntimeLifecycleCommandInput),
+    Session(SessionCommandInput),
+    Turn(TurnCommandInput),
 }
 
 impl RuntimeCommandInput {
-    fn into_semantic(self) -> RuntimeCommand {
-        match self {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<RuntimeCommand, TypedJsonError> {
+        Ok(match self {
             Self::Runtime(RuntimeLifecycleCommandInput::ReloadSharedResources) => {
                 RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources)
             }
-        }
+            Self::Session(SessionCommandInput::Load(value)) => {
+                RuntimeCommand::Session(SessionCommand::Load {
+                    session_id: value.session_id,
+                })
+            }
+            Self::Session(SessionCommandInput::Unload(value)) => {
+                RuntimeCommand::Session(SessionCommand::Unload {
+                    session_id: value.session_id,
+                })
+            }
+            Self::Turn(TurnCommandInput::Submit(value)) => {
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id: value.session_id,
+                    intent: value.intent.into_semantic(limits)?,
+                })
+            }
+            Self::Turn(TurnCommandInput::Cancel(value)) => {
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id: value.session_id,
+                    target: value.target.into_semantic(),
+                })
+            }
+        })
     }
 }
 
@@ -270,24 +301,150 @@ enum RuntimeLifecycleCommandInput {
     ReloadSharedResources,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionCommandInput {
+    Load(SessionIdInput),
+    Unload(SessionIdInput),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum TurnCommandInput {
+    Submit(SubmitCommandInput),
+    Cancel(CancelCommandInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubmitCommandInput {
+    session_id: SessionId,
+    intent: PromptIntentWireInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PromptIntentWireInput {
+    body: PromptBodyIntentInput,
+    skills: Vec<SkillIntentInput>,
+}
+
+impl PromptIntentWireInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<PromptIntent, TypedJsonError> {
+        let body = match self.body {
+            PromptBodyIntentInput::Empty => PromptBodyIntent::Empty,
+            PromptBodyIntentInput::Text(value) => PromptBodyIntent::Text(
+                TextIntent::new_with_maximum(
+                    value.text,
+                    limits.text.max_text_intent_bytes as usize,
+                )
+                .map_err(map_prompt_value_error)?,
+            ),
+        };
+        let skills = self
+            .skills
+            .into_iter()
+            .map(|value| {
+                value
+                    .skill_id
+                    .parse::<SkillId>()
+                    .map(SkillIntent::new)
+                    .map_err(|_| invalid_scalar())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        PromptIntent::new_with_maximum_skills(
+            body,
+            skills,
+            limits.prompt.max_skills_per_intent as usize,
+        )
+        .map_err(map_prompt_value_error)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PromptBodyIntentInput {
+    Empty,
+    Text(TextIntentInput),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextIntentInput {
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillIntentInput {
+    skill_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelCommandInput {
+    session_id: SessionId,
+    target: PublicCancelTargetInput,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PublicCancelTargetInput {
+    Submit(CommandId),
+    Turn(TurnId),
+}
+
+impl PublicCancelTargetInput {
+    const fn into_semantic(self) -> PublicCancelTarget {
+        match self {
+            Self::Submit(command_id) => PublicCancelTarget::Submit(command_id),
+            Self::Turn(turn_id) => PublicCancelTarget::Turn(turn_id),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct CommandRequestOutput {
+struct CommandRequestOutput<'a> {
     command_id: CommandId,
-    command: RuntimeCommandOutput,
+    command: RuntimeCommandOutput<'a>,
 }
 
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum RuntimeCommandOutput {
+enum RuntimeCommandOutput<'a> {
     Runtime(RuntimeLifecycleCommandOutput),
+    Session(SessionCommandOutput),
+    Turn(TurnCommandOutput<'a>),
 }
 
-impl RuntimeCommandOutput {
-    fn from_semantic(value: &RuntimeCommand) -> Self {
+impl<'a> RuntimeCommandOutput<'a> {
+    fn from_semantic(value: &'a RuntimeCommand) -> Self {
         match value {
             RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources) => {
                 Self::Runtime(RuntimeLifecycleCommandOutput::ReloadSharedResources)
+            }
+            RuntimeCommand::Session(SessionCommand::Load { session_id }) => {
+                Self::Session(SessionCommandOutput::Load(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
+            RuntimeCommand::Session(SessionCommand::Unload { session_id }) => {
+                Self::Session(SessionCommandOutput::Unload(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
+            RuntimeCommand::Turn(TurnCommand::Submit { session_id, intent }) => {
+                Self::Turn(TurnCommandOutput::Submit(SubmitCommandOutput {
+                    session_id: *session_id,
+                    intent: PromptIntentWireOutput::from_semantic(intent),
+                }))
+            }
+            RuntimeCommand::Turn(TurnCommand::Cancel { session_id, target }) => {
+                Self::Turn(TurnCommandOutput::Cancel(CancelCommandOutput {
+                    session_id: *session_id,
+                    target: PublicCancelTargetOutput::from_semantic(*target),
+                }))
             }
         }
     }
@@ -297,6 +454,93 @@ impl RuntimeCommandOutput {
 #[serde(rename_all = "snake_case")]
 enum RuntimeLifecycleCommandOutput {
     ReloadSharedResources,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionCommandOutput {
+    Load(SessionIdOutput),
+    Unload(SessionIdOutput),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum TurnCommandOutput<'a> {
+    Submit(SubmitCommandOutput<'a>),
+    Cancel(CancelCommandOutput),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitCommandOutput<'a> {
+    session_id: SessionId,
+    intent: PromptIntentWireOutput<'a>,
+}
+
+#[derive(Serialize)]
+struct PromptIntentWireOutput<'a> {
+    body: PromptBodyIntentOutput<'a>,
+    skills: Vec<SkillIntentOutput<'a>>,
+}
+
+impl<'a> PromptIntentWireOutput<'a> {
+    fn from_semantic(value: &'a PromptIntent) -> Self {
+        let body = match value.body() {
+            PromptBodyIntent::Empty => PromptBodyIntentOutput::Empty,
+            PromptBodyIntent::Text(text) => {
+                PromptBodyIntentOutput::Text(TextIntentOutput { text: text.text() })
+            }
+        };
+        let skills = value
+            .skills()
+            .iter()
+            .map(|skill| SkillIntentOutput {
+                skill_id: skill.skill_id().as_str(),
+            })
+            .collect();
+        Self { body, skills }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PromptBodyIntentOutput<'a> {
+    Empty,
+    Text(TextIntentOutput<'a>),
+}
+
+#[derive(Serialize)]
+struct TextIntentOutput<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillIntentOutput<'a> {
+    skill_id: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelCommandOutput {
+    session_id: SessionId,
+    target: PublicCancelTargetOutput,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PublicCancelTargetOutput {
+    Submit(CommandId),
+    Turn(TurnId),
+}
+
+impl PublicCancelTargetOutput {
+    const fn from_semantic(value: PublicCancelTarget) -> Self {
+        match value {
+            PublicCancelTarget::Submit(command_id) => Self::Submit(command_id),
+            PublicCancelTarget::Turn(turn_id) => Self::Turn(turn_id),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -515,7 +759,29 @@ enum RuntimeQueryResultOutput<'a> {
     Capabilities(&'a RuntimeCapabilities),
 }
 
-fn validate_command_request_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
+fn validate_command_semantic_limits(
+    command: &RuntimeCommand,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let RuntimeCommand::Turn(TurnCommand::Submit { intent, .. }) = command else {
+        return Ok(());
+    };
+    validate_skill_intent_count(
+        intent.skills().len(),
+        limits.prompt.max_skills_per_intent as usize,
+    )
+    .map_err(map_prompt_value_error)?;
+    if let PromptBodyIntent::Text(text) = intent.body() {
+        normalize_text_intent(text.text(), limits.text.max_text_intent_bytes as usize)
+            .map_err(map_prompt_value_error)?;
+    }
+    Ok(())
+}
+
+fn validate_command_request_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
     let object = input_object(node)?;
     reject_unknown_fields(object.keys().map(AsRef::as_ref), &["commandId", "command"])?;
     validate_id::<CommandId>(required(object, "commandId")?)?;
@@ -531,11 +797,125 @@ fn validate_command_request_shape(node: &JsonNode) -> Result<(), TypedJsonError>
             }
             Ok(())
         }
-        "agent" | "session" | "turn" | "interaction" | "command_surface" => {
-            Err(TypedJsonError::PendingPublicTarget)
+        "session" => validate_session_command(data.ok_or_else(missing_required_field)?),
+        "turn" => validate_turn_command(data.ok_or_else(missing_required_field)?, limits),
+        "agent" => validate_pending_command_family(
+            data,
+            &[
+                "create",
+                "update_definition",
+                "update_metadata",
+                "set_status",
+                "delete",
+            ],
+        ),
+        "interaction" => validate_pending_command_family(data, &["resolve"]),
+        "command_surface" => {
+            validate_pending_command_family(data, &["execute_text", "execute_catalog"])
         }
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_session_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "load" | "unload" => validate_session_id_object(data.ok_or_else(missing_required_field)?),
+        "create"
+        | "update_definition"
+        | "upgrade_agent_revision"
+        | "update_metadata"
+        | "reload_workspace"
+        | "archive"
+        | "unarchive"
+        | "delete"
+        | "fork" => pending_object(data),
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_turn_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "submit" => validate_submit_command(data.ok_or_else(missing_required_field)?, limits),
+        "cancel" => validate_cancel_command(data.ok_or_else(missing_required_field)?),
+        "steer" | "follow_up" | "cancel_queued_message" => pending_object(data),
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_submit_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["sessionId", "intent"])?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_prompt_intent(required(object, "intent")?, limits)
+}
+
+fn validate_prompt_intent(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["body", "skills"])?;
+    validate_adjacent_input(required(object, "body")?, |kind, data| match kind {
+        "empty" if data.is_none() => Ok(()),
+        "empty" => Err(selected_wrong_json_type()),
+        "text" => {
+            let object = input_object(data.ok_or_else(missing_required_field)?)?;
+            reject_unknown_fields(object.keys().map(AsRef::as_ref), &["text"])?;
+            let text = required(object, "text")?
+                .as_str()
+                .ok_or_else(typed_wrong_json_type)?;
+            normalize_text_intent(text, limits.text.max_text_intent_bytes as usize)
+                .map_err(map_prompt_value_error)?;
+            Ok(())
+        }
+        _ => Err(unknown_input_variant()),
+    })?;
+    let skills = required(object, "skills")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    validate_skill_intent_count(skills.len(), limits.prompt.max_skills_per_intent as usize)
+        .map_err(map_prompt_value_error)?;
+    let mut unique = BTreeSet::new();
+    for skill in skills {
+        let object = input_object(skill)?;
+        reject_unknown_fields(object.keys().map(AsRef::as_ref), &["skillId"])?;
+        let skill_id = required(object, "skillId")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?;
+        skill_id.parse::<SkillId>().map_err(|_| invalid_scalar())?;
+        if !unique.insert(skill_id) {
+            return Err(duplicate_value());
+        }
+    }
+    Ok(())
+}
+
+fn validate_cancel_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["sessionId", "target"])?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_adjacent_input(required(object, "target")?, |kind, data| match kind {
+        "submit" => validate_id::<CommandId>(data.ok_or_else(missing_required_field)?),
+        "turn" => validate_id::<TurnId>(data.ok_or_else(missing_required_field)?),
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_pending_command_family(
+    data: Option<&JsonNode>,
+    variants: &[&str],
+) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(data.ok_or_else(missing_required_field)?, |kind, data| {
+        if variants.contains(&kind) {
+            pending_object(data)
+        } else {
+            Err(unknown_input_variant())
+        }
+    })
+}
+
+fn pending_object(data: Option<&JsonNode>) -> Result<(), TypedJsonError> {
+    data.ok_or_else(missing_required_field)?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    Err(TypedJsonError::PendingPublicTarget)
 }
 
 fn validate_runtime_query_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
@@ -716,6 +1096,19 @@ fn duplicate_value() -> TypedJsonError {
         PublicDecodeStage::SelectedSchema,
         PublicDecodeCode::DuplicateValue,
     )
+}
+
+fn map_prompt_value_error(error: PromptValueError) -> TypedJsonError {
+    match error {
+        PromptValueError::DuplicateSkill => duplicate_value(),
+        PromptValueError::EmptyText
+        | PromptValueError::TextTooLong
+        | PromptValueError::UnsafeText
+        | PromptValueError::TooManySkills => invalid_scalar(),
+        PromptValueError::InvalidPartCount | PromptValueError::InvalidContributionStamp => {
+            TypedJsonError::EncodingInvariant
+        }
+    }
 }
 
 fn unknown_input_variant() -> TypedJsonError {

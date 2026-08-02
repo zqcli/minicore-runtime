@@ -32,9 +32,15 @@ pub struct TextIntent(Box<str>);
 
 impl TextIntent {
     pub fn new(text: impl AsRef<str>) -> Result<Self, PromptValueError> {
-        let text = normalize_newlines(text.as_ref());
         let maximum = ProtocolLimits::v1_0().text.max_text_intent_bytes as usize;
-        validate_prompt_text(&text, maximum, false)?;
+        Self::new_with_maximum(text, maximum)
+    }
+
+    pub(crate) fn new_with_maximum(
+        text: impl AsRef<str>,
+        maximum: usize,
+    ) -> Result<Self, PromptValueError> {
+        let text = normalize_text_intent(text.as_ref(), maximum)?;
         Ok(Self(text.into()))
     }
 
@@ -73,9 +79,15 @@ pub struct PromptIntent {
 impl PromptIntent {
     pub fn new(body: PromptBodyIntent, skills: Vec<SkillIntent>) -> Result<Self, PromptValueError> {
         let maximum = ProtocolLimits::v1_0().prompt.max_skills_per_intent as usize;
-        if skills.len() > maximum {
-            return Err(PromptValueError::TooManySkills);
-        }
+        Self::new_with_maximum_skills(body, skills, maximum)
+    }
+
+    pub(crate) fn new_with_maximum_skills(
+        body: PromptBodyIntent,
+        skills: Vec<SkillIntent>,
+        maximum: usize,
+    ) -> Result<Self, PromptValueError> {
+        validate_skill_intent_count(skills.len(), maximum)?;
         let unique = skills
             .iter()
             .map(SkillIntent::skill_id)
@@ -96,6 +108,25 @@ impl PromptIntent {
     pub fn skills(&self) -> &[SkillIntent] {
         &self.skills
     }
+}
+
+pub(crate) fn validate_skill_intent_count(
+    count: usize,
+    maximum: usize,
+) -> Result<(), PromptValueError> {
+    if count > maximum {
+        return Err(PromptValueError::TooManySkills);
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_text_intent(
+    text: &str,
+    maximum: usize,
+) -> Result<String, PromptValueError> {
+    let text = normalize_newlines(text);
+    validate_prompt_text(&text, maximum, false)?;
+    Ok(text)
 }
 
 #[derive(Clone, Eq, PartialEq)]

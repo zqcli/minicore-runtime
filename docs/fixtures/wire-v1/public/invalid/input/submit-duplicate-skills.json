@@ -1,0 +1,1 @@
+{"commandId":"cmd_11111111111111111111111111111111","command":{"type":"turn","data":{"type":"submit","data":{"sessionId":"ses_22222222222222222222222222222222","intent":{"body":{"type":"text","data":{"text":"hello"}},"skills":[{"skillId":"code-review"},{"skillId":"code-review"}]}}}}}

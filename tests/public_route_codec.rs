@@ -234,11 +234,12 @@ fn command_root_reports_manifest_stable_decode_faults() {
 fn selected_v1_vectors_in_later_slices_are_not_reported_as_unknown_variants() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     for input in [
-        include_bytes!("../docs/fixtures/wire-v1/public/valid/submit-command.json").as_slice(),
         include_bytes!(
             "../docs/fixtures/wire-v1/public/valid/create-session-file-uri-command.json"
         )
         .as_slice(),
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/resolve-interaction-command.json")
+            .as_slice(),
     ] {
         assert!(
             protocol

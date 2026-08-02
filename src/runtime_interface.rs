@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
+use std::fmt;
 
 use thiserror::Error;
 
-use crate::wire::{CommandId, SessionId};
+use crate::prompt::PromptIntent;
+use crate::wire::{CommandId, SessionId, TurnId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
@@ -84,10 +86,67 @@ pub enum RuntimeLifecycleCommand {
     ReloadSharedResources,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+pub type PromptIntentInput = PromptIntent;
+
+#[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeCommand {
     Runtime(RuntimeLifecycleCommand),
+    Session(SessionCommand),
+    Turn(TurnCommand),
+}
+
+impl fmt::Debug for RuntimeCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Runtime(command) => formatter.debug_tuple("Runtime").field(command).finish(),
+            Self::Session(command) => formatter.debug_tuple("Session").field(command).finish(),
+            Self::Turn(command) => formatter.debug_tuple("Turn").field(command).finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum SessionCommand {
+    Load { session_id: SessionId },
+    Unload { session_id: SessionId },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TurnCommand {
+    Submit {
+        session_id: SessionId,
+        intent: PromptIntentInput,
+    },
+    Cancel {
+        session_id: SessionId,
+        target: PublicCancelTarget,
+    },
+}
+
+impl fmt::Debug for TurnCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Submit { session_id, .. } => formatter
+                .debug_struct("Submit")
+                .field("session_id", session_id)
+                .field("intent", &"<redacted>")
+                .finish(),
+            Self::Cancel { session_id, target } => formatter
+                .debug_struct("Cancel")
+                .field("session_id", session_id)
+                .field("target", target)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PublicCancelTarget {
+    Submit(CommandId),
+    Turn(TurnId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
