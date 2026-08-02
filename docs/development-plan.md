@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0与M1已完成，按用户要求暂停于M2前等待review
+状态：Active；M0与M1已完成，M2进行中
 
 初始实现基线：`dev` at `144039a`
 
@@ -248,6 +248,8 @@ M1.1–M1.5已按owner拆分提交；最终review确认无correctness/security/s
 ## M2 · Incremental Public Protocol Codec
 
 目标：每个行为vertical slice同时获得对应public DTO，不在Runtime行为前横向实现全部协议，也不等到M11才第一次接facade。
+
+当前进度：Protocol V1 bootstrap已通过exported byte-level router完成Hello decode、runtime capability intersection、Welcome/Reject生成与selected codec建立；public manifest已增加immutable owning slice和`active | pending`状态，Rust conformance runner只允许active target经exported production seam执行。outer route skeleton及M7 DTO仍未完成。
 
 任务顺序：
 
@@ -644,11 +646,11 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 | full protocol拖慢主闭环 | DTO批量实现长期没有运行场景 | 保持manifest family小提交，但不得跳过最终conformance gate |
 | superseded文档污染实施判断 | current搜索命中旧AgentLoop、durable writer或错误实施状态 | 先完成M0归档和导航，不靠口头权威顺序长期兜底 |
 
-## 下一轮恢复顺序
+## 后续实施顺序
 
-M0与M1已完成，当前按用户要求暂停于M2前。下一次经review确认恢复后，只执行下列task，不提前进入Session执行：
+M0与M1已完成，M2已开始且bootstrap routing与incremental manifest gate已经落地。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M2`基于现有typed bootstrap codec实现bootstrap routing、outer request/response/frame envelope与route skeleton；
+1. `M2`基于现有bootstrap router实现outer request/response/frame envelope、route skeleton与M7 public DTO；
 2. `M3.1` exact Conversation Header/Entry codec并直接消费golden fixtures；
 3. `M3.2` bounded physical JSONL scanner；
 4. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`。

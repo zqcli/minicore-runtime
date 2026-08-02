@@ -2,32 +2,17 @@ use std::path::{Path, PathBuf};
 
 use minicore_runtime::wire::{
     BoundedJsonError, ProtocolBootstrapResponse, ProtocolLimits, ProtocolRejectReason,
-    ProtocolVersion, ProtocolWelcome, PublicJsonKind, RuntimeCapabilities, RuntimeInfo,
-    TypedJsonError, WireV1Codec, decode_protocol_bootstrap_response_v1, decode_protocol_hello_v1,
+    ProtocolVersion, ProtocolWelcome, PublicDecodeCode, PublicDecodeStage, PublicJsonKind,
+    RuntimeCapabilities, RuntimeInfo, TypedJsonError, WireV1Codec,
+    decode_protocol_bootstrap_response_v1, decode_protocol_hello_v1,
     encode_protocol_bootstrap_response_v1, encode_protocol_hello_v1,
 };
 use serde_json::Value;
 
 #[test]
-fn protocol_hello_fixtures_decode_and_reencode_exactly() {
-    for name in [
-        "protocol-hello.json",
-        "protocol-hello-capability-subset.json",
-        "protocol-hello-unsupported-version.json",
-    ] {
-        let bytes = read_fixture(&format!("public/valid/{name}"));
-        let hello = decode_protocol_hello_v1(&bytes).unwrap();
-        assert_eq!(encode_protocol_hello_v1(&hello).unwrap(), bytes, "{name}");
-    }
-}
-
-#[test]
 fn protocol_hello_is_strict_after_bounded_duplicate_aware_preflight() {
     let unknown = read_fixture("public/invalid/input/hello-unknown-field.json");
-    assert_eq!(
-        decode_protocol_hello_v1(&unknown),
-        Err(TypedJsonError::TypedShape)
-    );
+    assert_unknown_input_field(&unknown);
 
     let duplicate = br#"{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"a","\u006eame":"b","version":"1"},"capabilities":{"values":[]}}"#;
     assert_eq!(
@@ -59,10 +44,7 @@ fn protocol_hello_is_strict_after_bounded_duplicate_aware_preflight() {
         br#"{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"a","version":"1","future":1},"capabilities":{"values":[]}}"#.as_slice(),
         br#"{"supportedVersions":[{"major":1,"minor":0}],"client":{"name":"a","version":"1"},"capabilities":{"values":[],"future":1}}"#.as_slice(),
     ] {
-        assert_eq!(
-            decode_protocol_hello_v1(nested_unknown),
-            Err(TypedJsonError::TypedShape)
-        );
+        assert_unknown_input_field(nested_unknown);
     }
 
     for invalid in [
@@ -94,22 +76,15 @@ fn protocol_hello_is_strict_after_bounded_duplicate_aware_preflight() {
     }
 }
 
-#[test]
-fn bootstrap_response_fixtures_decode_and_reencode_exactly() {
-    for name in [
-        "protocol-welcome.json",
-        "protocol-welcome-capability-intersection.json",
-        "protocol-reject.json",
-    ] {
-        let bytes = read_fixture(&format!("public/valid/{name}"));
-        let response = decode_protocol_bootstrap_response_v1(&bytes).unwrap();
-        assert_eq!(
-            encode_protocol_bootstrap_response_v1(&response).unwrap(),
-            bytes,
-            "{name}"
-        );
-    }
+fn assert_unknown_input_field(input: &[u8]) {
+    let error = decode_protocol_hello_v1(input).unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
+    assert_eq!(fault.code(), PublicDecodeCode::UnknownInputField);
+}
 
+#[test]
+fn protocol_reject_has_a_typed_reason() {
     let reject =
         decode_protocol_bootstrap_response_v1(&read_fixture("public/valid/protocol-reject.json"))
             .unwrap();

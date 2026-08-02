@@ -280,6 +280,7 @@ def check_public() -> None:
             json.loads(path.read_bytes())
 
     manifest = decode((ROOT / "public" / "manifest.json").read_bytes())
+    assert manifest["version"] == 2
     vectors = manifest["vectors"]
     paths = [vector["path"] for vector in vectors]
     assert len(paths) == len(set(paths)), "duplicate public manifest path"
@@ -290,7 +291,19 @@ def check_public() -> None:
     }
     assert set(paths) == actual, (set(paths) - actual, actual - set(paths))
 
+    allowed_statuses = {"active", "pending"}
+    allowed_slices = {"foundation", "m1", "m2_initial", "m8", "m9", "m10", "m11"}
+    active = 0
+    pending = 0
+
     for vector in vectors:
+        assert set(vector) == {"path", "target", "direction", "status", "slice", "expected"}, vector
+        assert vector["status"] in allowed_statuses, vector
+        assert vector["slice"] in allowed_slices, vector
+        if vector["status"] == "active":
+            active += 1
+        else:
+            pending += 1
         path = ROOT / "public" / vector["path"]
         expected = vector["expected"]
         assert path.exists(), path
@@ -307,6 +320,9 @@ def check_public() -> None:
             canonical = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
             target = ROOT / "public" / expected["canonicalReencodePath"]
             assert canonical == target.read_bytes(), (path, target)
+
+    assert active > 0
+    assert active + pending == len(vectors)
 
     welcome = decode((ROOT / "public" / "valid" / "protocol-welcome.json").read_bytes())
     assert welcome["type"] == "welcome"

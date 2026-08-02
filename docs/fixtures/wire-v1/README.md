@@ -13,7 +13,7 @@ python3 docs/fixtures/wire-v1/verify.py
 - `public/invalid/output/*.json`：模拟收到非法Runtime frame时必须报protocol error；Runtime encoder/preflight也不得发送这些bytes。
 - `public/compat/*.json`：防御性forward-tolerance输入；按`public/manifest.json`删除ignored pointers后必须canonical re-encode到指定v1 target，Runtime v1 sender仍不得主动发送future field。
 - `public/carriers/*.json`：shared scalar/path的valid canonical round-trip与typed rejection sets；每个set在manifest声明target，Rust runner逐条执行。
-- `public/manifest.json`：为每个public vector声明target DTO、direction、decode stage/code与canonical target；未来Rust conformance runner必须逐项消费。
+- `public/manifest.json`：为每个public vector声明target DTO、direction、decode stage/code、canonical target，以及incremental implementation `status = active | pending`与first owning `slice`。Rust runner必须处理全部active vectors；pending vectors保持可见并归属M2/M8/M9/M10/M11，M11要求pending数量归零。
 - `conversation/golden/*.jsonl`：每个complete line必须decode并canonical re-encode为相同bytes；最后一行必须以LF结束。
 - optional `conversation/golden/<name>.expected.json`：声明跨行ordering/protocol assertions；存在sidecar时Rust runner必须执行，不能只做per-line codec round-trip。
 - `conversation/corruption/*.jsonl`：按同名`.expected.json`验证strict Header、tolerant entry scan、diagnostic和tail policy；这些输入不能被canonical re-encode覆盖。

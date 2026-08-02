@@ -42,6 +42,8 @@ pub enum TypedJsonError {
     UnsupportedSelectedVersion,
     #[error("bounded JSON preflight failed")]
     Json(#[from] BoundedJsonError),
+    #[error("public JSON decode failed")]
+    PublicDecode(#[from] PublicDecodeError),
     #[error("typed JSON shape is invalid")]
     TypedShape,
     #[error("typed JSON output exceeds its frame limit")]
@@ -52,6 +54,88 @@ pub enum TypedJsonError {
     SelectedVersionMismatch,
     #[error("effective protocol limits exceed the selected version hard maxima")]
     InvalidProtocolLimits,
+}
+
+impl TypedJsonError {
+    pub const fn public_decode_error(self) -> Option<PublicDecodeError> {
+        match self {
+            Self::Json(BoundedJsonError::DuplicateKey) => Some(PublicDecodeError::new(
+                PublicDecodeStage::JsonStructure,
+                PublicDecodeCode::DuplicateKey,
+            )),
+            Self::PublicDecode(error) => Some(error),
+            Self::UnsupportedSelectedVersion
+            | Self::Json(_)
+            | Self::TypedShape
+            | Self::FrameTooLarge
+            | Self::EncodingInvariant
+            | Self::SelectedVersionMismatch
+            | Self::InvalidProtocolLimits => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PublicDecodeStage {
+    JsonStructure,
+    SelectedSchema,
+    TypedScalar,
+}
+
+impl PublicDecodeStage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::JsonStructure => "json_structure",
+            Self::SelectedSchema => "selected_schema",
+            Self::TypedScalar => "typed_scalar",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PublicDecodeCode {
+    DuplicateKey,
+    UnknownInputField,
+    UnknownInputVariant,
+    UnknownOutputVariant,
+    WrongJsonType,
+    NoncanonicalId,
+    DurationOutOfRange,
+}
+
+impl PublicDecodeCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuplicateKey => "duplicate_key",
+            Self::UnknownInputField => "unknown_input_field",
+            Self::UnknownInputVariant => "unknown_input_variant",
+            Self::UnknownOutputVariant => "unknown_output_variant",
+            Self::WrongJsonType => "wrong_json_type",
+            Self::NoncanonicalId => "noncanonical_id",
+            Self::DurationOutOfRange => "duration_out_of_range",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, Hash, PartialEq)]
+#[error("public JSON value violates the selected schema")]
+pub struct PublicDecodeError {
+    stage: PublicDecodeStage,
+    code: PublicDecodeCode,
+}
+
+impl PublicDecodeError {
+    pub(crate) const fn new(stage: PublicDecodeStage, code: PublicDecodeCode) -> Self {
+        Self { stage, code }
+    }
+
+    pub const fn stage(self) -> PublicDecodeStage {
+        self.stage
+    }
+
+    pub const fn code(self) -> PublicDecodeCode {
+        self.code
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -255,12 +339,43 @@ fn validate_adjacent_enum(
 
 fn validate_protocol_hello_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or(TypedJsonError::TypedShape)?;
+    reject_unknown_input_fields(
+        object.keys().map(AsRef::as_ref),
+        &["supportedVersions", "client", "capabilities"],
+    )?;
     let versions = object
         .get("supportedVersions")
         .and_then(JsonNode::as_array)
         .ok_or(TypedJsonError::TypedShape)?;
     for version in versions {
-        validate_protocol_version_shape(version)?;
+        let version = version.as_object().ok_or(TypedJsonError::TypedShape)?;
+        reject_unknown_input_fields(version.keys().map(AsRef::as_ref), &["major", "minor"])?;
+        validate_unsigned_integer(version.get("major").ok_or(TypedJsonError::TypedShape)?)?;
+        validate_unsigned_integer(version.get("minor").ok_or(TypedJsonError::TypedShape)?)?;
+    }
+    let client = object
+        .get("client")
+        .and_then(JsonNode::as_object)
+        .ok_or(TypedJsonError::TypedShape)?;
+    reject_unknown_input_fields(client.keys().map(AsRef::as_ref), &["name", "version"])?;
+    let capabilities = object
+        .get("capabilities")
+        .and_then(JsonNode::as_object)
+        .ok_or(TypedJsonError::TypedShape)?;
+    reject_unknown_input_fields(capabilities.keys().map(AsRef::as_ref), &["values"])?;
+    Ok(())
+}
+
+fn reject_unknown_input_fields<'a>(
+    fields: impl IntoIterator<Item = &'a str>,
+    allowed: &[&str],
+) -> Result<(), TypedJsonError> {
+    if fields.into_iter().any(|field| !allowed.contains(&field)) {
+        return Err(PublicDecodeError::new(
+            PublicDecodeStage::SelectedSchema,
+            PublicDecodeCode::UnknownInputField,
+        )
+        .into());
     }
     Ok(())
 }
@@ -476,7 +591,7 @@ impl RuntimeCapabilitiesInput {
             .map(|value| value.parse::<CapabilityToken>())
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| TypedJsonError::TypedShape)?;
-        RuntimeCapabilities::from_v1_negotiated(
+        RuntimeCapabilities::for_v1(
             values
                 .into_iter()
                 .filter(is_v1_runtime_capability)
@@ -610,7 +725,7 @@ impl Write for BoundedVecWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::limits::{ProtocolNegotiation, negotiate_protocol};
+    use crate::wire::limits::{ProtocolNegotiation, negotiate_protocol, v1_runtime_capabilities};
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -667,7 +782,10 @@ mod tests {
         ] {
             let hello = decode_protocol_hello_v1(input).unwrap();
             assert_eq!(
-                negotiate_protocol(&hello),
+                negotiate_protocol(
+                    &hello,
+                    &RuntimeCapabilities::for_v1(v1_runtime_capabilities()).unwrap(),
+                ),
                 ProtocolNegotiation::Rejected {
                     reason: ProtocolRejectReason::InvalidHello,
                 }
