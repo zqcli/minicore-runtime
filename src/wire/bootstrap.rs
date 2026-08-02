@@ -1,9 +1,11 @@
 use thiserror::Error;
 
+use crate::runtime_interface::RuntimeCapabilities;
+
 use super::lexical::validate_safe_text;
 use super::limits::{
     ProtocolBootstrapResponse, ProtocolLimits, ProtocolNegotiation, ProtocolReject,
-    ProtocolVersion, ProtocolWelcome, RuntimeCapabilities, RuntimeInfo, negotiate_protocol,
+    ProtocolVersion, ProtocolWelcome, RuntimeInfo, negotiate_protocol,
 };
 use super::typed_json::{TypedJsonError, WireV1Codec, decode_protocol_hello_v1};
 

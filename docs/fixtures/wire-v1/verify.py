@@ -230,7 +230,7 @@ def remove_pointer(value: Any, pointer: str) -> None:
         del current[final]
 
 
-def check_declared_public_fault(path: Path, expected: dict[str, Any]) -> None:
+def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any]) -> None:
     code = expected.get("code")
     raw = path.read_bytes()
     if code == "duplicate_key":
@@ -245,7 +245,12 @@ def check_declared_public_fault(path: Path, expected: dict[str, Any]) -> None:
         markers = {"future", "futureField", "extra"}
         assert any(marker.encode() in raw for marker in markers), path
     elif code == "wrong_json_type":
-        assert not isinstance(value["commandId"], str), path
+        if target == "CommandRequest":
+            assert not isinstance(value["commandId"], str), path
+        elif target == "SnapshotRequest":
+            assert value == {"type": "runtime", "data": None}, path
+        else:
+            raise AssertionError(f"unverified wrong-type target {target}: {path}")
     elif code == "noncanonical_id":
         assert isinstance(value["commandId"], str)
         assert not RUNTIME_ID.fullmatch(value["commandId"]), path
@@ -255,7 +260,21 @@ def check_declared_public_fault(path: Path, expected: dict[str, Any]) -> None:
         retry_after = value["completion"]["data"]["retry"]["data"]["retryAfter"]
         assert retry_after > 86_400_000, path
     elif code == "unknown_output_variant":
-        assert value["type"] == "future_frame", path
+        if target == "EventFrame":
+            assert value["type"] == "future_frame", path
+        elif target == "QueryResponse":
+            assert value["data"]["type"] == "future_query_result", path
+        else:
+            raise AssertionError(f"unverified unknown-output target {target}: {path}")
+    elif code == "missing_required_field":
+        if target == "CommandRequest":
+            assert value["command"] == {"type": "runtime"}, path
+        elif target == "RuntimeQuery":
+            assert value == {"type": "runtime"}, path
+        elif target == "QueryResponse":
+            assert value["data"]["data"] == {"type": "capabilities"}, path
+        else:
+            raise AssertionError(f"unverified missing-field target {target}: {path}")
     else:
         raise AssertionError(f"unverified declared public fault {code}: {path}")
 
@@ -308,7 +327,7 @@ def check_public() -> None:
         expected = vector["expected"]
         assert path.exists(), path
         if expected.get("decode") in {"rejected", "protocol_error"}:
-            check_declared_public_fault(path, expected)
+            check_declared_public_fault(path, vector["target"], expected)
         if expected.get("canonicalReencode") == "same_bytes":
             value = decode(path.read_bytes())
             canonical = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode()

@@ -1,6 +1,7 @@
 pub(crate) mod compaction;
 pub mod model_gateway;
 pub mod prompt;
+pub mod runtime_interface;
 pub mod skills;
 pub mod tools;
 pub mod turn_item_interaction;

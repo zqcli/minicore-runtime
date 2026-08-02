@@ -56,6 +56,6 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0与M1已经完成，M2正在实施且Protocol V1 bootstrap router与incremental manifest gate已完成；随后完成outer Runtime routes与M7 public DTO、Conversation codec/scanner与LiveConversation，关闭M5.0 durable foundations gate并完成Recorder/replay与M6 resources后，才进入ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0与M1已经完成，M2正在实施且Protocol V1 bootstrap router、incremental manifest gate和initial typed Wire roots已完成；随后完成M7 Session/Turn public DTO与behavioral Runtime facade、Conversation codec/scanner与LiveConversation，关闭M5.0 durable foundations gate并完成Recorder/replay与M6 resources后，才进入ScriptedProvider vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

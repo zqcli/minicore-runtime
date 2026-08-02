@@ -275,7 +275,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2已开始并完成Protocol V1 bootstrap router与incremental public manifest conformance gate，下一步实现outer route skeleton及M7 public DTO，之后依次实现Conversation codec/scanner与LiveConversation，再关闭M5.0 durable foundations gate后实现SessionRecorder/replay；
+- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2已开始并完成Protocol V1 bootstrap router、incremental public manifest conformance gate与initial typed Wire roots，下一步实现M7 Session/Turn command、completion、SnapshotResponse与EventFrame DTO，之后依次实现Conversation codec/scanner与LiveConversation，再关闭M5.0 durable foundations gate后实现SessionRecorder/replay；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

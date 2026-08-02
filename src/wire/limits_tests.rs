@@ -4,10 +4,12 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::runtime_interface::{RuntimeCapabilities, RuntimeCapabilitiesError, RuntimeCapability};
+
 use super::*;
 
 fn all_v1_capabilities() -> RuntimeCapabilities {
-    RuntimeCapabilities::for_v1(v1_runtime_capabilities()).unwrap()
+    RuntimeCapabilities::all_v1()
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,8 +235,8 @@ fn negotiation_selects_exact_v1_and_runtime_capability_order() {
         ProtocolNegotiation::Selected {
             version: ProtocolVersion::V1_0,
             capabilities: RuntimeCapabilities::for_v1(vec![
-                "state_events".parse().unwrap(),
-                "session_snapshot".parse().unwrap(),
+                RuntimeCapability::StateEvents,
+                RuntimeCapability::SessionSnapshot,
             ])
             .unwrap(),
         }
@@ -244,28 +246,23 @@ fn negotiation_selects_exact_v1_and_runtime_capability_order() {
 #[test]
 fn runtime_capability_outputs_are_known_unique_and_canonically_ordered() {
     let capabilities = RuntimeCapabilities::for_v1(vec![
-        "session_snapshot".parse().unwrap(),
-        "state_events".parse().unwrap(),
+        RuntimeCapability::SessionSnapshot,
+        RuntimeCapability::StateEvents,
     ])
     .unwrap();
     assert_eq!(
-        capabilities
-            .values()
-            .iter()
-            .map(CapabilityToken::as_str)
-            .collect::<Vec<_>>(),
-        ["state_events", "session_snapshot"]
+        capabilities.values().to_vec(),
+        [
+            RuntimeCapability::StateEvents,
+            RuntimeCapability::SessionSnapshot,
+        ]
     );
     assert_eq!(
         RuntimeCapabilities::for_v1(vec![
-            "state_events".parse().unwrap(),
-            "state_events".parse().unwrap(),
+            RuntimeCapability::StateEvents,
+            RuntimeCapability::StateEvents,
         ]),
         Err(RuntimeCapabilitiesError::DuplicateCapability)
-    );
-    assert_eq!(
-        RuntimeCapabilities::for_v1(vec!["future_capability".parse().unwrap()]),
-        Err(RuntimeCapabilitiesError::UnknownCapability)
     );
 }
 

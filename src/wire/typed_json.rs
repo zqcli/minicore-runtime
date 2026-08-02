@@ -5,11 +5,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::runtime_interface::RuntimeCapabilities;
+
 use super::bounded_json::{BoundedJsonError, JsonNode, JsonParseLimits, parse_node};
 use super::limits::{
     CapabilityToken, ClientInfo, ProtocolBootstrapResponse, ProtocolHello, ProtocolLimits,
-    ProtocolReject, ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, RuntimeCapabilities,
-    RuntimeInfo, is_v1_runtime_capability, protocol_hello_is_valid,
+    ProtocolReject, ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, RuntimeInfo,
+    protocol_hello_is_valid, runtime_capability_from_token,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +46,9 @@ pub enum TypedJsonError {
     Json(#[from] BoundedJsonError),
     #[error("public JSON decode failed")]
     PublicDecode(#[from] PublicDecodeError),
+    /// The bytes name a selected-V1 target whose owning behavior slice is not implemented yet.
+    #[error("public protocol target is not implemented by the current incremental slice")]
+    PendingPublicTarget,
     #[error("typed JSON shape is invalid")]
     TypedShape,
     #[error("typed JSON output exceeds its frame limit")]
@@ -66,12 +71,17 @@ impl TypedJsonError {
             Self::PublicDecode(error) => Some(error),
             Self::UnsupportedSelectedVersion
             | Self::Json(_)
+            | Self::PendingPublicTarget
             | Self::TypedShape
             | Self::FrameTooLarge
             | Self::EncodingInvariant
             | Self::SelectedVersionMismatch
             | Self::InvalidProtocolLimits => None,
         }
+    }
+
+    pub const fn is_pending_public_target(self) -> bool {
+        matches!(self, Self::PendingPublicTarget)
     }
 }
 
@@ -101,6 +111,9 @@ pub enum PublicDecodeCode {
     WrongJsonType,
     NoncanonicalId,
     DurationOutOfRange,
+    MissingRequiredField,
+    InvalidScalar,
+    DuplicateValue,
 }
 
 impl PublicDecodeCode {
@@ -113,6 +126,9 @@ impl PublicDecodeCode {
             Self::WrongJsonType => "wrong_json_type",
             Self::NoncanonicalId => "noncanonical_id",
             Self::DurationOutOfRange => "duration_out_of_range",
+            Self::MissingRequiredField => "missing_required_field",
+            Self::InvalidScalar => "invalid_scalar",
+            Self::DuplicateValue => "duplicate_value",
         }
     }
 }
@@ -186,7 +202,7 @@ impl WireV1Codec {
         parse_node(input, limits).map_err(Into::into)
     }
 
-    fn decode_with_shape<T: DeserializeOwned>(
+    pub(super) fn decode_with_shape<T: DeserializeOwned>(
         &self,
         kind: PublicJsonKind,
         input: &[u8],
@@ -198,7 +214,7 @@ impl WireV1Codec {
         serde_json::from_slice(input).map_err(|_| TypedJsonError::TypedShape)
     }
 
-    fn encode<T: Serialize>(
+    pub(super) fn encode<T: Serialize>(
         &self,
         kind: PublicJsonKind,
         value: &T,
@@ -593,8 +609,8 @@ impl RuntimeCapabilitiesInput {
             .map_err(|_| TypedJsonError::TypedShape)?;
         RuntimeCapabilities::for_v1(
             values
-                .into_iter()
-                .filter(is_v1_runtime_capability)
+                .iter()
+                .filter_map(runtime_capability_from_token)
                 .collect(),
         )
         .map_err(|_| TypedJsonError::TypedShape)
@@ -725,7 +741,7 @@ impl Write for BoundedVecWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::limits::{ProtocolNegotiation, negotiate_protocol, v1_runtime_capabilities};
+    use crate::wire::limits::{ProtocolNegotiation, negotiate_protocol};
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -784,7 +800,7 @@ mod tests {
             assert_eq!(
                 negotiate_protocol(
                     &hello,
-                    &RuntimeCapabilities::for_v1(v1_runtime_capabilities()).unwrap(),
+                    &RuntimeCapabilities::all_v1(),
                 ),
                 ProtocolNegotiation::Rejected {
                     reason: ProtocolRejectReason::InvalidHello,

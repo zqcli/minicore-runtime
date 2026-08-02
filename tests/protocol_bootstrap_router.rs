@@ -1,14 +1,12 @@
 use minicore_runtime::wire::{
-    CapabilityToken, ProtocolBootstrapResponse, ProtocolBootstrapRouter,
-    ProtocolBootstrapRouterError, ProtocolLimits, ProtocolRejectReason, ProtocolVersion,
-    PublicDecodeCode, PublicDecodeStage, RuntimeCapabilities,
+    ProtocolBootstrapResponse, ProtocolBootstrapRouter, ProtocolBootstrapRouterError,
+    ProtocolLimits, ProtocolRejectReason, ProtocolVersion, PublicDecodeCode, PublicDecodeStage,
+    RuntimeCapabilities, RuntimeCapability,
 };
 
 #[test]
 fn bootstrap_advertises_only_runtime_implemented_capabilities() {
-    let capabilities =
-        RuntimeCapabilities::for_v1(vec!["state_events".parse::<CapabilityToken>().unwrap()])
-            .unwrap();
+    let capabilities = RuntimeCapabilities::for_v1(vec![RuntimeCapability::StateEvents]).unwrap();
     let router = ProtocolBootstrapRouter::new("minicore-runtime", "0.1.0", capabilities).unwrap();
     let route = router
         .route(include_bytes!(
@@ -21,13 +19,8 @@ fn bootstrap_advertises_only_runtime_implemented_capabilities() {
     };
     assert_eq!(welcome.selected_version(), ProtocolVersion::V1_0);
     assert_eq!(
-        welcome
-            .capabilities()
-            .values()
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["state_events"],
+        welcome.capabilities().values().to_vec(),
+        [RuntimeCapability::StateEvents],
     );
     assert_eq!(welcome.limits(), ProtocolLimits::v1_0());
     let codec = route.codec().expect("selected route must carry its codec");
