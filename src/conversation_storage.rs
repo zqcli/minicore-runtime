@@ -37,6 +37,36 @@ pub(crate) enum StoredValueError {
     InteractionResolution,
 }
 
+/// Opaque evidence that Conversation Storage opened one physical conversation file for exclusive
+/// writable use.
+///
+/// This is deliberately only a file-binding capability: it records the Session identity and the
+/// physical length observed while opening the file. It does not acquire, hold, or emulate an OS
+/// lock. M5.0 will add the owning storage path that can create this proof after it has acquired a
+/// real lease.
+pub(crate) struct ExclusiveWritableConversationLease {
+    session_id: SessionId,
+    declared_file_bytes: u64,
+}
+
+impl ExclusiveWritableConversationLease {
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn declared_file_bytes(&self) -> u64 {
+        self.declared_file_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_scanner_test(session_id: SessionId, declared_file_bytes: u64) -> Self {
+        Self {
+            session_id,
+            declared_file_bytes,
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct SessionHeader {
     format_version: u32,

@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event与M3.1已完成；M3.2为下一任务
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1与M3.2已完成；M4为下一任务
 
 初始实现基线：`dev` at `144039a`
 
@@ -54,7 +54,7 @@ M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 当前不能视为已完成：
 
 - M2 public protocol route/DTO families与完整manifest closure；
-- physical bounded JSONL scanner，以及M5 semantic replay/corruption sidecars；
+- M5 semantic replay/corruption sidecars；
 - `ConversationRevision`、`ModelMessage`和LiveConversation reducer，包括M4的`LiveCompactionSourceView` aggregate；
 - SessionRecorder、SessionExecutor、ActiveTurnTask和ScriptedProvider vertical slice；
 - production provider与sandbox adapter。
@@ -295,7 +295,7 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 
 ### M3.2 Physical scanner
 
-状态：Next。
+状态：Completed。已实现bounded streaming scanner：对known size和stat unavailable input均执行1 GiB cap，支持LF/CRLF、strict Header、line/count limits、complete-entry fault recovery，并仅在exclusive writable lease下返回final partial-tail truncation action/offset；scanner本身不修改文件，heavy recipes已覆盖。
 
 实现：
 
@@ -658,11 +658,10 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 ## 后续实施顺序
 
-M0与M1已完成；M2 minimal Snapshot/Event已落地，M3.1 exact Conversation Header/Entry per-line codec已完成。继续按下列顺序执行，不提前进入Session执行：
+M0与M1已完成；M2 minimal Snapshot/Event已落地，M3.1 exact Conversation Header/Entry per-line codec与M3.2 bounded physical JSONL scanner已完成。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M3.2` bounded physical JSONL scanner；
-2. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`；
-3. `M5.0` durable foundations gate，随后实现SessionRecorder、semantic replay与corruption sidecars；
-4. M8–M10随owning behavior补齐non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
+1. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`；
+2. `M5.0` durable foundations gate，随后实现SessionRecorder、semantic replay与corruption sidecars；
+3. M8–M10随owning behavior补齐non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
 
 在M2–M6 prerequisites关闭前不得进入M7 ordinary behavior slice；production Provider与Tool/Sandbox继续分别受V4-P1-3和V4-C0-1门禁约束。

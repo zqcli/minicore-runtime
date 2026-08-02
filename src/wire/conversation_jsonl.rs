@@ -51,12 +51,16 @@ pub(crate) enum ConversationCodecError {
     LineTooLarge,
     #[error("conversation header exceeds the V1 limit")]
     HeaderTooLarge,
-    #[error("conversation line fails bounded JSON preflight")]
-    InvalidJson,
+    #[error("conversation line has invalid JSON syntax")]
+    JsonSyntax,
+    #[error("conversation line violates JSON structural limits")]
+    JsonStructure,
     #[error("conversation record has an unknown variant")]
     UnknownRecordVariant,
     #[error("conversation entry body has an unknown variant")]
     UnknownBodyVariant,
+    #[error("conversation entry leaf has an unknown variant")]
+    UnknownLeafVariant,
     #[error("conversation record does not have the required V1 shape")]
     InvalidShape,
     #[error("conversation record is missing a required field")]
@@ -201,12 +205,15 @@ fn preflight_record(input: &[u8]) -> Result<RecordPreflight, ConversationCodecEr
     }
 
     let mut tool_call_arguments = Vec::new();
-    if root_fields
-        .as_ref()
-        .is_some_and(|fields| raw_strings_include(input, &fields[0], "entry"))
-    {
-        for data in &root_fields.expect("checked above")[1] {
-            collect_assistant_tool_call_arguments(input, data.clone(), &mut tool_call_arguments)?;
+    if let Some(root_fields) = root_fields.as_ref() {
+        if raw_strings_include(input, &root_fields[0], "entry") {
+            for data in &root_fields[1] {
+                collect_assistant_tool_call_arguments(
+                    input,
+                    data.clone(),
+                    &mut tool_call_arguments,
+                )?;
+            }
         }
     }
 
@@ -311,14 +318,14 @@ fn raw_object_fields(
         return scanner
             .is_complete()
             .then_some(Some(fields))
-            .ok_or(ConversationCodecError::InvalidJson);
+            .ok_or(ConversationCodecError::JsonSyntax);
     }
 
     let mut member_count = 0_usize;
     loop {
         member_count = member_count
             .checked_add(1)
-            .ok_or(ConversationCodecError::InvalidJson)?;
+            .ok_or(ConversationCodecError::JsonStructure)?;
         scanner.validate_object_members(member_count)?;
         scanner.skip_whitespace();
         let key = scanner.parse_string()?;
@@ -341,7 +348,7 @@ fn raw_object_fields(
     scanner
         .is_complete()
         .then_some(Some(fields))
-        .ok_or(ConversationCodecError::InvalidJson)
+        .ok_or(ConversationCodecError::JsonSyntax)
 }
 
 fn raw_array_values(
@@ -360,7 +367,7 @@ fn raw_array_values(
         return scanner
             .is_complete()
             .then_some(Some(values))
-            .ok_or(ConversationCodecError::InvalidJson);
+            .ok_or(ConversationCodecError::JsonSyntax);
     }
 
     loop {
@@ -376,7 +383,7 @@ fn raw_array_values(
     scanner
         .is_complete()
         .then_some(Some(values))
-        .ok_or(ConversationCodecError::InvalidJson)
+        .ok_or(ConversationCodecError::JsonSyntax)
 }
 
 struct RawJsonScanner<'input> {
@@ -387,7 +394,7 @@ struct RawJsonScanner<'input> {
 
 impl<'input> RawJsonScanner<'input> {
     fn new(input: &'input [u8]) -> Result<Self, ConversationCodecError> {
-        std::str::from_utf8(input).map_err(|_| ConversationCodecError::InvalidJson)?;
+        std::str::from_utf8(input).map_err(|_| ConversationCodecError::JsonSyntax)?;
         Ok(Self {
             input,
             position: 0,
@@ -401,24 +408,24 @@ impl<'input> RawJsonScanner<'input> {
         if scanner.is_complete() {
             Ok(span)
         } else {
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonSyntax)
         }
     }
 
     fn parse_value(&mut self, depth: usize) -> Result<Range<usize>, ConversationCodecError> {
         if depth > 64 {
-            return Err(ConversationCodecError::InvalidJson);
+            return Err(ConversationCodecError::JsonStructure);
         }
         self.node_count = self
             .node_count
             .checked_add(1)
-            .ok_or(ConversationCodecError::InvalidJson)?;
+            .ok_or(ConversationCodecError::JsonStructure)?;
         if self.node_count > 16_384 {
-            return Err(ConversationCodecError::InvalidJson);
+            return Err(ConversationCodecError::JsonStructure);
         }
         self.skip_whitespace();
         let start = self.position;
-        match self.peek().ok_or(ConversationCodecError::InvalidJson)? {
+        match self.peek().ok_or(ConversationCodecError::JsonSyntax)? {
             b'n' => self.parse_literal(b"null")?,
             b't' => self.parse_literal(b"true")?,
             b'f' => self.parse_literal(b"false")?,
@@ -428,7 +435,7 @@ impl<'input> RawJsonScanner<'input> {
             b'[' => self.parse_array(depth)?,
             b'{' => self.parse_object(depth)?,
             b'-' | b'0'..=b'9' => self.parse_number()?,
-            _ => return Err(ConversationCodecError::InvalidJson),
+            _ => return Err(ConversationCodecError::JsonSyntax),
         }
         Ok(start..self.position)
     }
@@ -443,7 +450,7 @@ impl<'input> RawJsonScanner<'input> {
         loop {
             member_count = member_count
                 .checked_add(1)
-                .ok_or(ConversationCodecError::InvalidJson)?;
+                .ok_or(ConversationCodecError::JsonStructure)?;
             self.validate_object_members(member_count)?;
             self.skip_whitespace();
             self.parse_string()?;
@@ -468,7 +475,7 @@ impl<'input> RawJsonScanner<'input> {
         loop {
             item_count = item_count
                 .checked_add(1)
-                .ok_or(ConversationCodecError::InvalidJson)?;
+                .ok_or(ConversationCodecError::JsonStructure)?;
             self.validate_array_items(item_count)?;
             self.parse_value(depth + 1)?;
             self.skip_whitespace();
@@ -483,18 +490,18 @@ impl<'input> RawJsonScanner<'input> {
         let start = self.position;
         self.expect_exact(b'"')?;
         loop {
-            let byte = self.next().ok_or(ConversationCodecError::InvalidJson)?;
+            let byte = self.next().ok_or(ConversationCodecError::JsonSyntax)?;
             match byte {
                 b'"' => return Ok(start..self.position),
                 b'\\' => self.parse_escape()?,
-                0x00..=0x1f => return Err(ConversationCodecError::InvalidJson),
+                0x00..=0x1f => return Err(ConversationCodecError::JsonSyntax),
                 _ => {}
             }
         }
     }
 
     fn parse_escape(&mut self) -> Result<(), ConversationCodecError> {
-        match self.next().ok_or(ConversationCodecError::InvalidJson)? {
+        match self.next().ok_or(ConversationCodecError::JsonSyntax)? {
             b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => Ok(()),
             b'u' => {
                 let first = self.parse_hex_u16()?;
@@ -503,25 +510,25 @@ impl<'input> RawJsonScanner<'input> {
                     self.expect_exact(b'u')?;
                     let second = self.parse_hex_u16()?;
                     if !(0xdc00..=0xdfff).contains(&second) {
-                        return Err(ConversationCodecError::InvalidJson);
+                        return Err(ConversationCodecError::JsonSyntax);
                     }
                 } else if (0xdc00..=0xdfff).contains(&first) {
-                    return Err(ConversationCodecError::InvalidJson);
+                    return Err(ConversationCodecError::JsonSyntax);
                 }
                 Ok(())
             }
-            _ => Err(ConversationCodecError::InvalidJson),
+            _ => Err(ConversationCodecError::JsonSyntax),
         }
     }
 
     fn parse_hex_u16(&mut self) -> Result<u16, ConversationCodecError> {
         let mut value = 0_u16;
         for _ in 0..4 {
-            let digit = match self.next().ok_or(ConversationCodecError::InvalidJson)? {
+            let digit = match self.next().ok_or(ConversationCodecError::JsonSyntax)? {
                 byte @ b'0'..=b'9' => byte - b'0',
                 byte @ b'a'..=b'f' => byte - b'a' + 10,
                 byte @ b'A'..=b'F' => byte - b'A' + 10,
-                _ => return Err(ConversationCodecError::InvalidJson),
+                _ => return Err(ConversationCodecError::JsonSyntax),
             };
             value = (value << 4) | u16::from(digit);
         }
@@ -537,20 +544,20 @@ impl<'input> RawJsonScanner<'input> {
             self.position += 1;
         }
         let literal = std::str::from_utf8(&self.input[start..self.position])
-            .map_err(|_| ConversationCodecError::InvalidJson)?;
-        validate_json_number_syntax(literal).map_err(|_| ConversationCodecError::InvalidJson)
+            .map_err(|_| ConversationCodecError::JsonSyntax)?;
+        validate_json_number_syntax(literal).map_err(|_| ConversationCodecError::JsonSyntax)
     }
 
     fn parse_literal(&mut self, literal: &[u8]) -> Result<(), ConversationCodecError> {
         if self.input.get(self.position..self.position + literal.len()) != Some(literal) {
-            return Err(ConversationCodecError::InvalidJson);
+            return Err(ConversationCodecError::JsonSyntax);
         }
         self.position += literal.len();
         if self
             .peek()
             .is_some_and(|byte| !is_raw_value_delimiter(byte))
         {
-            return Err(ConversationCodecError::InvalidJson);
+            return Err(ConversationCodecError::JsonSyntax);
         }
         Ok(())
     }
@@ -558,13 +565,13 @@ impl<'input> RawJsonScanner<'input> {
     fn validate_object_members(&self, count: usize) -> Result<(), ConversationCodecError> {
         (count <= 256)
             .then_some(())
-            .ok_or(ConversationCodecError::InvalidJson)
+            .ok_or(ConversationCodecError::JsonStructure)
     }
 
     fn validate_array_items(&self, count: usize) -> Result<(), ConversationCodecError> {
         (count <= 4_096)
             .then_some(())
-            .ok_or(ConversationCodecError::InvalidJson)
+            .ok_or(ConversationCodecError::JsonStructure)
     }
 
     fn skip_whitespace(&mut self) {
@@ -577,7 +584,7 @@ impl<'input> RawJsonScanner<'input> {
         if self.consume_if(expected) {
             Ok(())
         } else {
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonSyntax)
         }
     }
 
@@ -610,8 +617,23 @@ fn is_raw_value_delimiter(byte: u8) -> bool {
     matches!(byte, b' ' | b'\n' | b'\r' | b'\t' | b',' | b']' | b'}')
 }
 
-fn map_json_error(_: BoundedJsonError) -> ConversationCodecError {
-    ConversationCodecError::InvalidJson
+fn map_json_error(error: BoundedJsonError) -> ConversationCodecError {
+    match error {
+        BoundedJsonError::InvalidUtf8 | BoundedJsonError::InvalidSyntax => {
+            ConversationCodecError::JsonSyntax
+        }
+        BoundedJsonError::RawInputTooLarge
+        | BoundedJsonError::CanonicalOutputTooLarge
+        | BoundedJsonError::DepthLimit
+        | BoundedJsonError::ArrayItemsLimit
+        | BoundedJsonError::ObjectMembersLimit
+        | BoundedJsonError::StringBytesLimit
+        | BoundedJsonError::NumberLiteralLimit
+        | BoundedJsonError::NumberExponentLimit
+        | BoundedJsonError::DuplicateKey
+        | BoundedJsonError::NodeLimit
+        | BoundedJsonError::RootObjectRequired => ConversationCodecError::JsonStructure,
+    }
 }
 
 fn decode_record_node(
@@ -723,7 +745,7 @@ fn decode_user_message(node: &JsonNode) -> Result<StoredUserMessage, Conversatio
     let source = match string(required(object, "source")?)? {
         "input" => UserMessageSource::Input,
         "steer" => UserMessageSource::Steer,
-        _ => return Err(ConversationCodecError::InvalidScalar),
+        _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
     let content = decode_user_content(required(object, "content")?)?;
     Ok(StoredUserMessage::reconstruct(item_id, source, content))
@@ -803,7 +825,7 @@ fn decode_assistant_message(
     let disposition = match string(required(object, "disposition")?)? {
         "intermediate" => AssistantDisposition::Intermediate,
         "final" => AssistantDisposition::Final,
-        _ => return Err(ConversationCodecError::InvalidScalar),
+        _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
     let content = array(required(object, "content")?)?
         .iter()
@@ -894,14 +916,14 @@ fn decode_tool_outcome(node: &JsonNode) -> Result<StoredToolOutcome, Conversatio
             let source = match string(required(data, "source")?)? {
                 "pre_execution" => ToolOutcomeSource::PreExecution,
                 "executed" => ToolOutcomeSource::Executed,
-                _ => return Err(ConversationCodecError::InvalidScalar),
+                _ => return Err(ConversationCodecError::UnknownLeafVariant),
             };
             let disposition = match string(required(data, "disposition")?)? {
                 "succeeded" => ToolResultDisposition::Succeeded,
                 "failed" => ToolResultDisposition::Failed,
                 "denied" => ToolResultDisposition::Denied,
                 "cancelled" => ToolResultDisposition::Cancelled,
-                _ => return Err(ConversationCodecError::InvalidScalar),
+                _ => return Err(ConversationCodecError::UnknownLeafVariant),
             };
             let content = decode_tool_content(required(data, "content")?)?;
             StoredToolOutcome::completed(source, disposition, content)
@@ -912,7 +934,7 @@ fn decode_tool_outcome(node: &JsonNode) -> Result<StoredToolOutcome, Conversatio
             let reason = match string(required(data, "reason")?)? {
                 "outcome_unknown" => ToolAbandonReason::OutcomeUnknown,
                 "runtime_failure" => ToolAbandonReason::RuntimeFailure,
-                _ => return Err(ConversationCodecError::InvalidScalar),
+                _ => return Err(ConversationCodecError::UnknownLeafVariant),
             };
             Ok(StoredToolOutcome::Abandoned { reason })
         }
@@ -1000,7 +1022,7 @@ fn decode_approval_option(
     let kind = match string(required(object, "kind")?)? {
         "as_requested" => ToolApprovalOptionKindView::AsRequested,
         "restricted" => ToolApprovalOptionKindView::Restricted,
-        _ => return Err(ConversationCodecError::InvalidScalar),
+        _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
     ToolApprovalOptionView::reconstruct(
         u32_value(required(object, "optionIndex")?)?,
@@ -1100,7 +1122,7 @@ fn decode_approval_resolution(
             let kind = match string(required(data, "kind")?)? {
                 "as_requested" => ToolApprovalOptionKindView::AsRequested,
                 "restricted" => ToolApprovalOptionKindView::Restricted,
-                _ => return Err(ConversationCodecError::InvalidScalar),
+                _ => return Err(ConversationCodecError::UnknownLeafVariant),
             };
             Ok(ToolApprovalResolution::reconstruct_allowed(
                 u32_value(required(data, "optionIndex")?)?,
@@ -1163,7 +1185,7 @@ fn decode_cancel_reason(
         "session_unloaded" => Ok(InteractionCancelReason::SessionUnloaded),
         "runtime_closing" => Ok(InteractionCancelReason::RuntimeClosing),
         "turn_terminal" => Ok(InteractionCancelReason::TurnTerminal),
-        _ => Err(ConversationCodecError::InvalidScalar),
+        _ => Err(ConversationCodecError::UnknownLeafVariant),
     }
 }
 
@@ -1224,12 +1246,12 @@ fn decode_model_summary(node: &JsonNode) -> Result<ModelResponseSummary, Convers
         "low" => ModelReasoningSummary::Low,
         "medium" => ModelReasoningSummary::Medium,
         "high" => ModelReasoningSummary::High,
-        _ => return Err(ConversationCodecError::InvalidScalar),
+        _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
     let service_class = match string(required(object, "serviceClass")?)? {
         "standard" => ModelServiceClass::Standard,
         "priority" => ModelServiceClass::Priority,
-        _ => return Err(ConversationCodecError::InvalidScalar),
+        _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
     Ok(ModelResponseSummary::reconstruct(
         scalar(required(object, "providerId")?)?,
@@ -1247,7 +1269,7 @@ fn decode_finish_reason(node: &JsonNode) -> Result<ModelFinishReason, Conversati
         "content_filtered" => Ok(ModelFinishReason::ContentFiltered),
         "refused" => Ok(ModelFinishReason::Refused),
         "unknown" => Ok(ModelFinishReason::Unknown),
-        _ => Err(ConversationCodecError::InvalidScalar),
+        _ => Err(ConversationCodecError::UnknownLeafVariant),
     }
 }
 
@@ -2325,6 +2347,38 @@ impl JsonWriter {
 mod tests {
     use super::*;
 
+    type PureUnitLeafCase = (
+        &'static str,
+        &'static [u8],
+        usize,
+        &'static str,
+        &'static str,
+        &'static str,
+    );
+
+    fn fixture_entry_line(fixture: &[u8], physical_line: usize) -> Vec<u8> {
+        fixture
+            .split(|byte| *byte == b'\n')
+            .nth(physical_line)
+            .unwrap_or_else(|| panic!("fixture has physical line {physical_line}"))
+            .to_vec()
+    }
+
+    fn replaced_fixture_entry_line(
+        fixture: &[u8],
+        physical_line: usize,
+        known: &str,
+        replacement: &str,
+    ) -> Vec<u8> {
+        let line = String::from_utf8(fixture_entry_line(fixture, physical_line))
+            .expect("golden entry is UTF-8");
+        assert!(
+            line.contains(known),
+            "fixture line must contain the known scalar"
+        );
+        line.replacen(known, replacement, 1).into_bytes()
+    }
+
     fn tool_call_assistant_line(arguments: &str) -> Vec<u8> {
         let assistant =
             include_bytes!("../../docs/fixtures/wire-v1/conversation/golden/tool-exchange.jsonl")
@@ -2453,7 +2507,7 @@ mod tests {
             ("fraction", "1.0", ConversationCodecError::InvalidScalar),
             ("exponent", "1e0", ConversationCodecError::InvalidScalar),
             ("negative zero", "-0", ConversationCodecError::InvalidScalar),
-            ("noncanonical", "01", ConversationCodecError::InvalidJson),
+            ("noncanonical", "01", ConversationCodecError::JsonSyntax),
             (
                 "overflow",
                 "4294967296",
@@ -2481,6 +2535,149 @@ mod tests {
     }
 
     #[test]
+    fn unknown_pure_unit_entry_leaves_are_distinct_from_invalid_scalars_and_redacted() {
+        let tool_exchange =
+            include_bytes!("../../docs/fixtures/wire-v1/conversation/golden/tool-exchange.jsonl");
+        let tool_outcomes = include_bytes!(
+            "../../docs/fixtures/wire-v1/conversation/golden/tool-outcome-variants.jsonl"
+        );
+        let interaction_variants = include_bytes!(
+            "../../docs/fixtures/wire-v1/conversation/golden/interaction-variants.jsonl"
+        );
+        let pure_unit_cases: [PureUnitLeafCase; 11] = [
+            (
+                "user source",
+                tool_exchange,
+                1,
+                r#""source":"input""#,
+                r#""source":"future_user_source""#,
+                "future_user_source",
+            ),
+            (
+                "assistant disposition",
+                tool_exchange,
+                2,
+                r#""disposition":"intermediate""#,
+                r#""disposition":"future_assistant_disposition""#,
+                "future_assistant_disposition",
+            ),
+            (
+                "tool outcome source",
+                tool_exchange,
+                3,
+                r#""source":"executed""#,
+                r#""source":"future_tool_source""#,
+                "future_tool_source",
+            ),
+            (
+                "tool result disposition",
+                tool_exchange,
+                3,
+                r#""disposition":"succeeded""#,
+                r#""disposition":"future_tool_disposition""#,
+                "future_tool_disposition",
+            ),
+            (
+                "tool abandon reason",
+                tool_outcomes,
+                7,
+                r#""reason":"outcome_unknown""#,
+                r#""reason":"future_abandon_reason""#,
+                "future_abandon_reason",
+            ),
+            (
+                "approval option kind",
+                interaction_variants,
+                6,
+                r#""kind":"as_requested""#,
+                r#""kind":"future_approval_option""#,
+                "future_approval_option",
+            ),
+            (
+                "approval resolution kind",
+                interaction_variants,
+                7,
+                r#""kind":"as_requested""#,
+                r#""kind":"future_approval_resolution""#,
+                "future_approval_resolution",
+            ),
+            (
+                "interaction cancel reason",
+                interaction_variants,
+                4,
+                r#""data":"host_cancelled""#,
+                r#""data":"future_cancel_reason""#,
+                "future_cancel_reason",
+            ),
+            (
+                "model reasoning",
+                tool_exchange,
+                2,
+                r#""reasoning":"provider_default""#,
+                r#""reasoning":"future_reasoning""#,
+                "future_reasoning",
+            ),
+            (
+                "model service class",
+                tool_exchange,
+                2,
+                r#""serviceClass":"standard""#,
+                r#""serviceClass":"future_service_class""#,
+                "future_service_class",
+            ),
+            (
+                "model finish reason",
+                tool_exchange,
+                4,
+                r#""finishReason":"stop""#,
+                r#""finishReason":"future_finish_reason""#,
+                "future_finish_reason",
+            ),
+        ];
+
+        for (name, fixture, physical_line, known, replacement, secret) in pure_unit_cases {
+            let line = replaced_fixture_entry_line(fixture, physical_line, known, replacement);
+            let error = ConversationLineCodec::decode_record(&line).unwrap_err();
+            assert_eq!(
+                error,
+                ConversationCodecError::UnknownLeafVariant,
+                "{name} must be an unknown entry leaf"
+            );
+            assert!(
+                !format!("{error:?}").contains(secret) && !error.to_string().contains(secret),
+                "{name} must not expose the unknown token"
+            );
+        }
+
+        for (name, line) in [
+            (
+                "wrong leaf JSON type",
+                replaced_fixture_entry_line(
+                    tool_exchange,
+                    1,
+                    r#""source":"input""#,
+                    r#""source":null"#,
+                ),
+            ),
+            (
+                "noncanonical entry identifier scalar",
+                replaced_fixture_entry_line(
+                    tool_exchange,
+                    1,
+                    "ent_00000000000000000000000000000001",
+                    "ent_00000000000000000000000000000000",
+                ),
+            ),
+        ] {
+            assert_eq!(
+                ConversationLineCodec::decode_record(&line),
+                Err(ConversationCodecError::InvalidScalar),
+                "{name} must remain an invalid scalar"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_duplicate_required_unknown_and_identity_failures_without_echoing_input() {
         let header =
             include_bytes!("../../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl")
@@ -2489,12 +2686,12 @@ mod tests {
         let duplicated = br#"{"type":"session_header","data":{"formatVersion":1,"formatVersion":1,"sessionId":"ses_11111111111111111111111111111111","createdAt":"2026-07-31T12:00:00.000Z","initialAgent":{"agentId":"agt_22222222222222222222222222222222","revision":"ar_1"},"initialDefinitionRevision":"sdr_1"}}"#;
         assert_eq!(
             ConversationLineCodec::decode_record(duplicated),
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonStructure)
         );
         let duplicate_entry = br#"{"type":"entry","data":{"entryId":"ent_11111111111111111111111111111111","entryId":"ent_22222222222222222222222222222222","parentId":null,"sessionId":"ses_11111111111111111111111111111111","turnId":"trn_11111111111111111111111111111111","timestamp":"2026-07-31T12:00:00.000Z","body":{"type":"compaction","data":{"summary":"safe","firstKeptEntryId":null,"modelCall":null}}}}"#;
         assert_eq!(
             ConversationLineCodec::decode_record(duplicate_entry),
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonStructure)
         );
         assert_eq!(
             ConversationLineCodec::decode_record(br#"{"type":"future_record","data":{}}"#),
@@ -2524,7 +2721,7 @@ mod tests {
             ConversationLineCodec::decode_record(invalid_header_id.as_bytes()),
             Err(ConversationCodecError::InvalidScalar)
         );
-        assert!(!format!("{:?}", ConversationCodecError::InvalidJson).contains("future_record"));
+        assert!(!format!("{:?}", ConversationCodecError::JsonSyntax).contains("future_record"));
     }
 
     #[test]
@@ -2699,7 +2896,7 @@ mod tests {
         assert!(whitespace_arguments.len() > 65_536);
         assert_eq!(
             ConversationLineCodec::decode_record(&tool_call_assistant_line(&whitespace_arguments)),
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonStructure)
         );
 
         let escaped_arguments = format!(r#"{{"value":"{}"}}"#, r#"\u0061"#.repeat(11_000));
@@ -2707,7 +2904,7 @@ mod tests {
         assert!(r#"{"value":"{}"}"#.len() + 11_000 < 65_536);
         assert_eq!(
             ConversationLineCodec::decode_record(&tool_call_assistant_line(&escaped_arguments)),
-            Err(ConversationCodecError::InvalidJson)
+            Err(ConversationCodecError::JsonStructure)
         );
 
         for arguments in [
@@ -2719,7 +2916,7 @@ mod tests {
         ] {
             assert_eq!(
                 ConversationLineCodec::decode_record(&tool_call_assistant_line(&arguments)),
-                Err(ConversationCodecError::InvalidJson)
+                Err(ConversationCodecError::JsonStructure)
             );
         }
 
