@@ -271,3 +271,130 @@ impl fmt::Debug for WorkspaceDefinitionInput {
             .finish()
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRootSummaryView {
+    key: WorkspaceRootKey,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+impl WorkspaceRootSummaryView {
+    pub const fn new(
+        key: WorkspaceRootKey,
+        requested_access: RequestedFilesystemAccess,
+        sources: WorkspaceSourcePolicy,
+    ) -> Self {
+        Self {
+            key,
+            requested_access,
+            sources,
+        }
+    }
+
+    pub const fn key(&self) -> &WorkspaceRootKey {
+        &self.key
+    }
+
+    pub const fn requested_access(&self) -> RequestedFilesystemAccess {
+        self.requested_access
+    }
+
+    pub const fn sources(&self) -> WorkspaceSourcePolicy {
+        self.sources
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WorkspaceSummaryError {
+    #[error("workspace summary has too many roots")]
+    TooManyRoots,
+    #[error("workspace summary contains a duplicate root key")]
+    DuplicateRootKey,
+    #[error("workspace summary cwd references an unknown root")]
+    UnknownCwdRoot,
+    #[error("workspace summary relative path exceeds its selected byte limit")]
+    RelativePathTooLong,
+    #[error("workspace summary relative path exceeds its selected segment limit")]
+    TooManyRelativePathSegments,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct WorkspaceDefinitionSummaryView {
+    roots: Vec<WorkspaceRootSummaryView>,
+    cwd: WorkspaceCwdSpec,
+}
+
+impl WorkspaceDefinitionSummaryView {
+    pub fn new(
+        primary_root: WorkspaceRootSummaryView,
+        additional_roots: Vec<WorkspaceRootSummaryView>,
+        cwd: WorkspaceCwdSpec,
+    ) -> Result<Self, WorkspaceSummaryError> {
+        Self::new_with_limits(primary_root, additional_roots, cwd, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn new_with_limits(
+        primary_root: WorkspaceRootSummaryView,
+        additional_roots: Vec<WorkspaceRootSummaryView>,
+        cwd: WorkspaceCwdSpec,
+        limits: ProtocolLimits,
+    ) -> Result<Self, WorkspaceSummaryError> {
+        let mut roots = Vec::with_capacity(additional_roots.len().saturating_add(1));
+        roots.push(primary_root);
+        roots.extend(additional_roots);
+        if roots.len() > usize::from(limits.workspace.max_workspace_roots) {
+            return Err(WorkspaceSummaryError::TooManyRoots);
+        }
+        let mut keys = BTreeSet::new();
+        for root in &roots {
+            if !keys.insert(root.key.clone()) {
+                return Err(WorkspaceSummaryError::DuplicateRootKey);
+            }
+        }
+        if !keys.contains(cwd.root()) {
+            return Err(WorkspaceSummaryError::UnknownCwdRoot);
+        }
+        let relative = cwd.relative_path().as_str();
+        if relative.len()
+            > usize::try_from(limits.workspace.max_relative_path_bytes).unwrap_or(usize::MAX)
+        {
+            return Err(WorkspaceSummaryError::RelativePathTooLong);
+        }
+        let segment_count = if relative.is_empty() {
+            0
+        } else {
+            relative.split('/').count()
+        };
+        if segment_count > usize::from(limits.workspace.max_relative_path_segments) {
+            return Err(WorkspaceSummaryError::TooManyRelativePathSegments);
+        }
+        Ok(Self { roots, cwd })
+    }
+
+    pub fn roots(&self) -> &[WorkspaceRootSummaryView] {
+        &self.roots
+    }
+
+    pub fn primary_root(&self) -> &WorkspaceRootSummaryView {
+        &self.roots[0]
+    }
+
+    pub fn additional_roots(&self) -> &[WorkspaceRootSummaryView] {
+        &self.roots[1..]
+    }
+
+    pub const fn cwd(&self) -> &WorkspaceCwdSpec {
+        &self.cwd
+    }
+}
+
+impl fmt::Debug for WorkspaceDefinitionSummaryView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceDefinitionSummaryView")
+            .field("roots", &self.roots)
+            .field("cwd", &self.cwd)
+            .finish()
+    }
+}

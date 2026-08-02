@@ -3,8 +3,10 @@ use std::str::FromStr;
 
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
-    CommandCompletion, CommandErrorCode, CommandOutcome, PublicCancelTarget, PublicSubject,
-    RetryAdvice, RuntimeCommand, RuntimeRequest, SessionCommand, TurnCommand,
+    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
+    PublicCancelTarget, PublicSubject, RetryAdvice, RuntimeCommand, RuntimeRequest,
+    RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionStateEventKind,
+    SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView, TurnTerminalView,
 };
 use minicore_runtime::wire::{
     CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
@@ -162,9 +164,94 @@ fn run_active_vector(vector: &PublicVector) {
         "SubscriptionRequest" => run_request(vector, RuntimeRequestKind::Subscribe),
         "QueryResponse" => run_query_response(vector),
         "RuntimeDispatchError" => run_runtime_dispatch_error(vector),
+        "EventFrame" => run_event_frame(vector),
         "CanonicalFileUriVectorSet" => run_file_uri_vectors(vector),
         "ProtocolNegotiationCaseSet" => run_negotiation_vectors(vector),
         target => panic!("active manifest target has no Rust handler: {target}"),
+    }
+}
+
+fn run_event_frame(vector: &PublicVector) {
+    assert_eq!(vector.direction, VectorDirection::RuntimeToClient);
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    match vector.expected.decode.as_str() {
+        "accepted" => {
+            let frame = protocol.decode_event_frame(&raw).unwrap();
+            assert_event_frame_semantics(vector, &frame);
+            assert_eq!(
+                protocol.encode_event_frame(&frame).unwrap(),
+                canonical_target(vector, &raw),
+                "{}",
+                vector.path,
+            );
+        }
+        "protocol_error" => {
+            assert_eq!(
+                vector.expected.runtime_encoder.as_deref(),
+                Some("must_not_send")
+            );
+            let error = protocol.decode_event_frame(&raw).unwrap_err();
+            assert_manifest_fault(vector, error);
+        }
+        decode => panic!("unsupported EventFrame expectation {decode}"),
+    }
+}
+
+fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
+    match (vector.expected.assert.as_deref(), frame) {
+        (
+            Some("idle_session_snapshot"),
+            EventFrame::Snapshot(SnapshotResponse::Session(snapshot)),
+        ) => {
+            assert_eq!(
+                snapshot.session_id().to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            assert_eq!(snapshot.definition().revision().get(), 1);
+            assert_eq!(snapshot.definition().workspace().roots().len(), 1);
+            assert_eq!(snapshot.usage().unwrap().model_calls(), 0);
+        }
+        (Some("runtime_catalog_invalidated_state"), EventFrame::State(event)) => {
+            assert_eq!(event.route(), EventRoute::Runtime);
+            let StateEventMsg::Runtime { kind, snapshot } = event.msg() else {
+                panic!("runtime state assertion requires a Runtime message");
+            };
+            assert_eq!(*kind, RuntimeStateEventKind::CommandCatalogInvalidated);
+            assert!(snapshot.loaded_sessions().is_empty());
+        }
+        (Some("turn_completed_state"), EventFrame::State(event)) => {
+            assert_turn_terminal_event(event.msg(), SessionStateEventKind::TurnCompleted, None);
+        }
+        (Some("turn_failed_model_state"), EventFrame::State(event)) => {
+            assert_turn_terminal_event(
+                event.msg(),
+                SessionStateEventKind::TurnFailed,
+                Some(TurnFailureView::Model),
+            );
+        }
+        (assertion, frame) => panic!("event assertion {assertion:?} does not match {frame:?}"),
+    }
+}
+
+fn assert_turn_terminal_event(
+    msg: &StateEventMsg,
+    expected_kind: SessionStateEventKind,
+    expected_failure: Option<TurnFailureView>,
+) {
+    let StateEventMsg::Session { kind, detail, .. } = msg else {
+        panic!("turn terminal assertion requires a Session message");
+    };
+    assert_eq!(*kind, expected_kind);
+    let Some(SessionEventDetail::TurnTerminal { terminal, .. }) = detail else {
+        panic!("turn terminal assertion requires terminal detail");
+    };
+    match (terminal, expected_failure) {
+        (TurnTerminalView::Completed { .. }, None) => {}
+        (TurnTerminalView::Failed { reason, .. }, Some(expected)) => {
+            assert_eq!(*reason, expected);
+        }
+        value => panic!("unexpected terminal {value:?}"),
     }
 }
 
