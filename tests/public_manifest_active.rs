@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use minicore_runtime::prompt::PromptBodyIntent;
+use minicore_runtime::runtime_interface::{
+    PublicCancelTarget, RuntimeCommand, RuntimeRequest, SessionCommand, TurnCommand,
+};
 use minicore_runtime::wire::{
     CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
     ProtocolBootstrapRouter, ProtocolRejectReason, ProtocolVersion, RuntimeCapabilities,
@@ -169,6 +173,7 @@ fn run_request(vector: &PublicVector, kind: RuntimeRequestKind) {
     match vector.expected.decode.as_str() {
         "accepted" => {
             let request = protocol.decode_request(kind, &raw).unwrap();
+            assert_request_semantics(vector, &request);
             assert_eq!(
                 protocol.encode_request(&request).unwrap(),
                 canonical_target(vector, &raw),
@@ -181,6 +186,67 @@ fn run_request(vector: &PublicVector, kind: RuntimeRequestKind) {
             assert_manifest_fault(vector, error);
         }
         decode => panic!("unsupported request expectation {decode}"),
+    }
+}
+
+fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
+    let Some(assertion) = vector.expected.assert.as_deref() else {
+        return;
+    };
+    let RuntimeRequest::Dispatch(request) = request else {
+        panic!("request assertion {assertion} requires a dispatch root");
+    };
+    match (assertion, request.command()) {
+        (
+            "runtime_reload_shared_resources",
+            RuntimeCommand::Runtime(
+                minicore_runtime::runtime_interface::RuntimeLifecycleCommand::ReloadSharedResources,
+            ),
+        ) => {}
+        ("session_load", RuntimeCommand::Session(SessionCommand::Load { session_id })) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+        }
+        ("session_unload", RuntimeCommand::Session(SessionCommand::Unload { session_id })) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+        }
+        (
+            "turn_cancel_turn",
+            RuntimeCommand::Turn(TurnCommand::Cancel {
+                target: PublicCancelTarget::Turn(turn_id),
+                ..
+            }),
+        ) => {
+            assert_eq!(turn_id.to_string(), "trn_66666666666666666666666666666666");
+        }
+        (
+            "turn_cancel_submit",
+            RuntimeCommand::Turn(TurnCommand::Cancel {
+                target: PublicCancelTarget::Submit(command_id),
+                ..
+            }),
+        ) => {
+            assert_eq!(
+                command_id.to_string(),
+                "cmd_88888888888888888888888888888888"
+            );
+        }
+        ("turn_submit_text_skill", RuntimeCommand::Turn(TurnCommand::Submit { intent, .. })) => {
+            let PromptBodyIntent::Text(text) = intent.body() else {
+                panic!("submit assertion requires text body");
+            };
+            assert_eq!(text.text(), "hello");
+            assert_eq!(intent.skills().len(), 1);
+            assert_eq!(intent.skills()[0].skill_id().as_str(), "code-review");
+        }
+        (assertion, command) => {
+            panic!("request assertion {assertion} does not match {command:?}")
+        }
     }
 }
 

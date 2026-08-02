@@ -246,16 +246,33 @@ def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any
         assert any(marker.encode() in raw for marker in markers), path
     elif code == "wrong_json_type":
         if target == "CommandRequest":
-            assert not isinstance(value["commandId"], str), path
+            if not isinstance(value["commandId"], str):
+                pass
+            else:
+                nested = value["command"]["data"]
+                assert nested in [
+                    {"type": "load", "data": None},
+                    {"type": "create", "data": None},
+                ], path
         elif target == "SnapshotRequest":
             assert value == {"type": "runtime", "data": None}, path
         else:
             raise AssertionError(f"unverified wrong-type target {target}: {path}")
     elif code == "noncanonical_id":
         assert isinstance(value["commandId"], str)
-        assert not RUNTIME_ID.fullmatch(value["commandId"]), path
+        if not RUNTIME_ID.fullmatch(value["commandId"]):
+            pass
+        else:
+            target_value = value["command"]["data"]["data"]["target"]
+            assert target_value["type"] == "turn", path
+            assert target_value["data"].startswith("cmd_"), path
     elif code == "unknown_input_variant":
-        assert value["command"]["type"] == "future_command", path
+        command = value["command"]
+        if command["type"] == "future_command":
+            pass
+        else:
+            assert command["type"] == "interaction", path
+            assert command["data"]["type"] == "future_interaction", path
     elif code == "duration_out_of_range":
         retry_after = value["completion"]["data"]["retry"]["data"]["retryAfter"]
         assert retry_after > 86_400_000, path
@@ -268,13 +285,24 @@ def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any
             raise AssertionError(f"unverified unknown-output target {target}: {path}")
     elif code == "missing_required_field":
         if target == "CommandRequest":
-            assert value["command"] == {"type": "runtime"}, path
+            command = value["command"]
+            if command == {"type": "runtime"}:
+                pass
+            else:
+                assert command["type"] == "session", path
+                assert command["data"] == {"type": "create"}, path
         elif target == "RuntimeQuery":
             assert value == {"type": "runtime"}, path
         elif target == "QueryResponse":
             assert value["data"]["data"] == {"type": "capabilities"}, path
         else:
             raise AssertionError(f"unverified missing-field target {target}: {path}")
+    elif code == "duplicate_value":
+        skills = value["command"]["data"]["data"]["intent"]["skills"]
+        assert len(skills) != len({skill["skillId"] for skill in skills}), path
+    elif code == "invalid_scalar":
+        skills = value["command"]["data"]["data"]["intent"]["skills"]
+        assert any(not skill["skillId"].islower() for skill in skills), path
     else:
         raise AssertionError(f"unverified declared public fault {code}: {path}")
 
