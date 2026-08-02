@@ -285,6 +285,65 @@ pub(super) fn parse_node(
     Parser::new(input, limits).parse()
 }
 
+pub(super) fn decode_json_string_token(
+    input: &[u8],
+    maximum_decoded_bytes: usize,
+) -> Result<Box<str>, BoundedJsonError> {
+    let input = std::str::from_utf8(input).map_err(|_| BoundedJsonError::InvalidUtf8)?;
+    let limits = JsonParseLimits {
+        max_encoded_bytes: WireLimit::new(input.len()),
+        max_depth: WireLimit::new(1),
+        max_array_items: WireLimit::new(0),
+        max_object_members: WireLimit::new(0),
+        max_string_bytes: WireLimit::new(maximum_decoded_bytes),
+        max_nodes: None,
+        canonicalize_numbers: false,
+    };
+    let mut parser = Parser::new(input, limits);
+    let value = parser.parse_string()?;
+    if parser.position != parser.bytes.len() {
+        return Err(BoundedJsonError::InvalidSyntax);
+    }
+    Ok(value)
+}
+
+pub(super) fn public_node_encoded_len(node: &JsonNode) -> Option<usize> {
+    fn add(total: &mut usize, value: usize) -> Option<()> {
+        *total = total.checked_add(value)?;
+        Some(())
+    }
+
+    match node {
+        JsonNode::Null => Some(4),
+        JsonNode::Bool(true) => Some(4),
+        JsonNode::Bool(false) => Some(5),
+        JsonNode::Number(value) => Some(value.raw().len()),
+        JsonNode::String(value) => super::lexical::canonical_json_string_len(value),
+        JsonNode::Array(values) => {
+            let mut length = 2_usize;
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    add(&mut length, 1)?;
+                }
+                add(&mut length, public_node_encoded_len(value)?)?;
+            }
+            Some(length)
+        }
+        JsonNode::Object(values) => {
+            let mut length = 2_usize;
+            for (index, (key, value)) in values.iter().enumerate() {
+                if index != 0 {
+                    add(&mut length, 1)?;
+                }
+                add(&mut length, super::lexical::canonical_json_string_len(key)?)?;
+                add(&mut length, 1)?;
+                add(&mut length, public_node_encoded_len(value)?)?;
+            }
+            Some(length)
+        }
+    }
+}
+
 struct Parser<'a> {
     input: &'a str,
     bytes: &'a [u8],

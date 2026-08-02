@@ -1,6 +1,27 @@
 use std::num::NonZeroU32;
 
 use crate::model_gateway::{ModelSelection, ReasoningPreference};
+use crate::wire::{AgentId, AgentRevision};
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AgentRevisionRef {
+    agent_id: AgentId,
+    revision: AgentRevision,
+}
+
+impl AgentRevisionRef {
+    pub const fn new(agent_id: AgentId, revision: AgentRevision) -> Self {
+        Self { agent_id, revision }
+    }
+
+    pub const fn agent_id(self) -> AgentId {
+        self.agent_id
+    }
+
+    pub const fn revision(self) -> AgentRevision {
+        self.revision
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionModelConfig {

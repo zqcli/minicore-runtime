@@ -7,7 +7,9 @@ use thiserror::Error;
 
 use crate::runtime_interface::RuntimeCapabilities;
 
-use super::bounded_json::{BoundedJsonError, JsonNode, JsonParseLimits, parse_node};
+use super::bounded_json::{
+    BoundedJsonError, JsonNode, JsonParseLimits, decode_json_string_token, parse_node,
+};
 use super::limits::{
     CapabilityToken, ClientInfo, ProtocolBootstrapResponse, ProtocolHello, ProtocolLimits,
     ProtocolReject, ProtocolRejectReason, ProtocolVersion, ProtocolWelcome, RuntimeInfo,
@@ -214,6 +216,15 @@ impl WireV1Codec {
         serde_json::from_slice(input).map_err(|_| TypedJsonError::TypedShape)
     }
 
+    pub(super) fn decode_event_frame_with_shape<T: DeserializeOwned>(
+        &self,
+        input: &[u8],
+        validate_shape: impl FnOnce(&JsonNode) -> Result<(), TypedJsonError>,
+    ) -> Result<T, TypedJsonError> {
+        let kind = classify_event_frame_kind(input, self.limits)?;
+        self.decode_with_shape(kind, input, validate_shape)
+    }
+
     pub(super) fn encode<T: Serialize>(
         &self,
         kind: PublicJsonKind,
@@ -228,6 +239,375 @@ impl WireV1Codec {
         self.preflight(kind, &writer.bytes)
             .map_err(|_| TypedJsonError::EncodingInvariant)?;
         Ok(writer.bytes)
+    }
+}
+
+fn classify_event_frame_kind(
+    input: &[u8],
+    limits: ProtocolLimits,
+) -> Result<PublicJsonKind, TypedJsonError> {
+    let maximum = [
+        PublicJsonKind::Response,
+        PublicJsonKind::RuntimeSnapshot,
+        PublicJsonKind::SessionSnapshot,
+        PublicJsonKind::StateEvent,
+        PublicJsonKind::ProgressEvent,
+    ]
+    .into_iter()
+    .map(|kind| kind.maximum_bytes(limits))
+    .max()
+    .unwrap_or(0);
+    if input.len() > maximum {
+        return Err(BoundedJsonError::RawInputTooLarge.into());
+    }
+
+    let mut scanner = EventDiscriminatorScanner::new(input, limits)?;
+    let discriminator = scanner.scan()?;
+    Ok(match discriminator.frame_type.as_string() {
+        Some("snapshot") => match discriminator.snapshot_type.as_deref() {
+            Some("runtime") => PublicJsonKind::RuntimeSnapshot,
+            Some("session") => PublicJsonKind::SessionSnapshot,
+            _ => PublicJsonKind::Response,
+        },
+        Some("state") => PublicJsonKind::StateEvent,
+        Some("progress") => PublicJsonKind::ProgressEvent,
+        Some("closed") | None | Some(_) => PublicJsonKind::Response,
+    })
+}
+
+struct EventDiscriminator {
+    frame_type: ScannedDiscriminator,
+    snapshot_type: Option<Box<str>>,
+}
+
+enum ScannedDiscriminator {
+    Missing,
+    NonString,
+    String(Box<str>),
+}
+
+impl ScannedDiscriminator {
+    fn as_string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            Self::Missing | Self::NonString => None,
+        }
+    }
+}
+
+struct EventDiscriminatorScanner<'a> {
+    input: &'a [u8],
+    index: usize,
+    max_depth: usize,
+    max_object_members: usize,
+    max_array_items: usize,
+    max_string_bytes: usize,
+}
+
+impl<'a> EventDiscriminatorScanner<'a> {
+    fn new(input: &'a [u8], limits: ProtocolLimits) -> Result<Self, TypedJsonError> {
+        if input.starts_with(&[0xef, 0xbb, 0xbf]) {
+            return Err(BoundedJsonError::InvalidSyntax.into());
+        }
+        std::str::from_utf8(input).map_err(|_| BoundedJsonError::InvalidUtf8)?;
+        Ok(Self {
+            input,
+            index: 0,
+            max_depth: usize::from(limits.transport.max_json_depth),
+            max_object_members: usize::from(limits.transport.max_object_members),
+            max_array_items: usize::try_from(limits.transport.max_array_items)
+                .unwrap_or(usize::MAX),
+            max_string_bytes: usize::try_from(limits.transport.max_string_bytes)
+                .unwrap_or(usize::MAX),
+        })
+    }
+
+    fn scan(&mut self) -> Result<EventDiscriminator, TypedJsonError> {
+        self.skip_whitespace();
+        if self.peek() != Some(b'{') {
+            return Ok(EventDiscriminator {
+                frame_type: ScannedDiscriminator::Missing,
+                snapshot_type: None,
+            });
+        }
+        self.expect(b'{')?;
+        let mut frame_type = ScannedDiscriminator::Missing;
+        let mut seen_frame_type = false;
+        let mut snapshot_type = None;
+        let mut seen_data = false;
+        let mut members = 0_usize;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Ok(EventDiscriminator {
+                frame_type,
+                snapshot_type,
+            });
+        }
+        loop {
+            members = members.saturating_add(1);
+            if members > self.max_object_members {
+                return Err(BoundedJsonError::ObjectMembersLimit.into());
+            }
+            let key = self.scan_string_token()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if self.string_token_equals(key, "type")? {
+                if seen_frame_type {
+                    return Err(BoundedJsonError::DuplicateKey.into());
+                }
+                seen_frame_type = true;
+                frame_type = self.parse_discriminator_value(2)?;
+            } else if self.string_token_equals(key, "data")? {
+                if seen_data {
+                    return Err(BoundedJsonError::DuplicateKey.into());
+                }
+                seen_data = true;
+                if self.peek() == Some(b'{') {
+                    snapshot_type = self.scan_direct_type_object(2)?;
+                } else {
+                    self.skip_value(2)?;
+                }
+            } else {
+                self.skip_value(2)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+        self.skip_whitespace();
+        if self.index != self.input.len() {
+            return Err(BoundedJsonError::InvalidSyntax.into());
+        }
+        Ok(EventDiscriminator {
+            frame_type,
+            snapshot_type,
+        })
+    }
+
+    fn scan_direct_type_object(
+        &mut self,
+        depth: usize,
+    ) -> Result<Option<Box<str>>, TypedJsonError> {
+        self.check_depth(depth)?;
+        self.expect(b'{')?;
+        let mut value = None;
+        let mut seen_type = false;
+        let mut members = 0_usize;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Ok(value);
+        }
+        loop {
+            members = members.saturating_add(1);
+            if members > self.max_object_members {
+                return Err(BoundedJsonError::ObjectMembersLimit.into());
+            }
+            let key = self.scan_string_token()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if self.string_token_equals(key, "type")? {
+                if seen_type {
+                    return Err(BoundedJsonError::DuplicateKey.into());
+                }
+                seen_type = true;
+                match self.parse_discriminator_value(depth + 1)? {
+                    ScannedDiscriminator::String(discriminator) => value = Some(discriminator),
+                    ScannedDiscriminator::Missing | ScannedDiscriminator::NonString => {}
+                }
+            } else {
+                self.skip_value(depth + 1)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Ok(value);
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Result<(), TypedJsonError> {
+        self.check_depth(depth)?;
+        self.skip_whitespace();
+        match self.peek() {
+            Some(b'{') => self.skip_object(depth),
+            Some(b'[') => self.skip_array(depth),
+            Some(b'"') => {
+                self.scan_string_token()?;
+                Ok(())
+            }
+            Some(b't') => self.expect_literal(b"true"),
+            Some(b'f') => self.expect_literal(b"false"),
+            Some(b'n') => self.expect_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
+            _ => Err(BoundedJsonError::InvalidSyntax.into()),
+        }
+    }
+
+    fn skip_object(&mut self, depth: usize) -> Result<(), TypedJsonError> {
+        self.expect(b'{')?;
+        let mut members = 0_usize;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Ok(());
+        }
+        loop {
+            members = members.saturating_add(1);
+            if members > self.max_object_members {
+                return Err(BoundedJsonError::ObjectMembersLimit.into());
+            }
+            self.scan_string_token()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_array(&mut self, depth: usize) -> Result<(), TypedJsonError> {
+        self.expect(b'[')?;
+        let mut items = 0_usize;
+        self.skip_whitespace();
+        if self.consume(b']') {
+            return Ok(());
+        }
+        loop {
+            items = items.saturating_add(1);
+            if items > self.max_array_items {
+                return Err(BoundedJsonError::ArrayItemsLimit.into());
+            }
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_number(&mut self) -> Result<(), TypedJsonError> {
+        let start = self.index;
+        while matches!(
+            self.peek(),
+            Some(b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+        ) {
+            self.index += 1;
+        }
+        if self.index == start {
+            return Err(BoundedJsonError::InvalidSyntax.into());
+        }
+        Ok(())
+    }
+
+    fn parse_string_value(&mut self) -> Result<Box<str>, TypedJsonError> {
+        let token = self.scan_string_token()?;
+        decode_json_string_token(&self.input[token.0..token.1], self.max_string_bytes)
+            .map_err(Into::into)
+    }
+
+    fn parse_discriminator_value(
+        &mut self,
+        depth: usize,
+    ) -> Result<ScannedDiscriminator, TypedJsonError> {
+        if self.peek() == Some(b'"') {
+            self.parse_string_value().map(ScannedDiscriminator::String)
+        } else {
+            self.skip_value(depth)?;
+            Ok(ScannedDiscriminator::NonString)
+        }
+    }
+
+    fn string_token_equals(
+        &self,
+        token: (usize, usize),
+        expected: &str,
+    ) -> Result<bool, TypedJsonError> {
+        let raw = &self.input[token.0 + 1..token.1 - 1];
+        if !raw.contains(&b'\\') {
+            return Ok(raw == expected.as_bytes());
+        }
+        let decoded =
+            decode_json_string_token(&self.input[token.0..token.1], self.max_string_bytes)?;
+        Ok(decoded.as_ref() == expected)
+    }
+
+    fn scan_string_token(&mut self) -> Result<(usize, usize), TypedJsonError> {
+        let start = self.index;
+        self.expect(b'"')?;
+        let mut escaped = false;
+        while let Some(byte) = self.peek() {
+            self.index += 1;
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => return Ok((start, self.index)),
+                0x00..=0x1f => return Err(BoundedJsonError::InvalidSyntax.into()),
+                _ => {}
+            }
+        }
+        Err(BoundedJsonError::InvalidSyntax.into())
+    }
+
+    fn expect_literal(&mut self, literal: &[u8]) -> Result<(), TypedJsonError> {
+        if self
+            .input
+            .get(self.index..self.index.saturating_add(literal.len()))
+            == Some(literal)
+        {
+            self.index += literal.len();
+            Ok(())
+        } else {
+            Err(BoundedJsonError::InvalidSyntax.into())
+        }
+    }
+
+    fn check_depth(&self, depth: usize) -> Result<(), TypedJsonError> {
+        if depth > self.max_depth {
+            Err(BoundedJsonError::DepthLimit.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.index += 1;
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), TypedJsonError> {
+        if self.consume(expected) {
+            Ok(())
+        } else {
+            Err(BoundedJsonError::InvalidSyntax.into())
+        }
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.index).copied()
     }
 }
 

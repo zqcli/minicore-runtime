@@ -1351,28 +1351,20 @@ pub struct SessionDefinitionSummary {
     pub revision: SessionDefinitionRevision,
     pub agent: AgentRevisionRef,
     pub workspace: WorkspaceDefinitionSummaryView,
-    pub model: SessionModelSummaryView,
-    pub prompt_ids: Vec<PromptId>,
+    pub model: SessionModelConfig,
+    pub prompts: SessionPromptSelection,
     pub created_at: Timestamp,
 }
 
 pub struct WorkspaceDefinitionSummaryView {
     pub roots: Vec<WorkspaceRootSummaryView>,
-    pub cwd_root: WorkspaceRootKey,
-    pub cwd_relative: WorkspaceRelativePath,
+    pub cwd: WorkspaceCwdSpec,
 }
 
 pub struct WorkspaceRootSummaryView {
     pub key: WorkspaceRootKey,
     pub requested_access: RequestedFilesystemAccess,
-    pub prompt_source: bool,
-    pub skill_source: bool,
-}
-
-pub struct SessionModelSummaryView {
-    pub selection: ModelSelection,
-    pub reasoning: ReasoningPreference,
-    pub max_output_tokens: Option<NonZeroU32>,
+    pub sources: WorkspaceSourcePolicy,
 }
 
 pub struct HistoricalTurnSummaryView {
@@ -1401,7 +1393,9 @@ pub struct SessionDiagnosticView {
 }
 ```
 
-diagnostic view没有global severity。code由owning module allowlist投影，message bounded/redacted；raw provider/storage/OS text不公开。
+`SessionDefinitionSummary`复用lifecycle-owned `SessionModelConfig`与Prompt-owned `SessionPromptSelection`，Wire分别投影为`model`与`promptIds`；不得再声明shadow summary DTO。`WorkspaceDefinitionSummaryView.roots[0]`固定为primary root，其余按definition order为additional roots；validated constructor显式分开`primary_root`与`additional_roots`后再形成wire Vec。
+
+diagnostic view没有global severity。code由owning module allowlist投影，message bounded/redacted；raw provider/storage/OS text不公开。Runtime Interface不暴露可接受任意code/message的public constructor；只有owner-controlled safe projection与bounded receiver-side decode可以形成这些值。
 
 ### Diagnostic Projection Limits
 
@@ -1528,9 +1522,11 @@ pub enum SnapshotRequest {
 
 pub enum SnapshotResponse {
     Runtime(RuntimeSnapshot),
-    Session(SessionSnapshot),
+    Session(Box<SessionSnapshot>),
 }
 ```
+
+`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。M2 incremental codec当前只materialize `Open + Loaded + Ready + Idle`、`currentTurn = null`、empty Item/Interaction/queue、`Healthy` recording、zero/none usage与empty diagnostics的safe baseline；Starting/Running/Finishing、non-empty observation collections、Degraded recording、non-zero usage与diagnostic projection由M8–M10 owners补齐，在此之前作为known pending target处理。
 
 ### RuntimeSnapshot
 
@@ -1561,6 +1557,8 @@ pub struct LoadedSessionSummary {
 `RuntimeSnapshot`只恢复current-process Runtime状态与loaded membership，不无界内联durable Agent/Session catalog。host每次收到新的Runtime Snapshot（首次subscribe、reconnect或publisher restart）都必须丢弃本地Agent/Session catalog cache并重新执行paged `ListAgents`与`ListSessions`；随后当前subscription内的typed Runtime StateEvent用于增量失效/刷新。该两步规则使断线期间丢失的create/archive/delete可以恢复，又不建立all-catalog stop-the-world Snapshot。
 
 `RuntimeSnapshot`不包含所有loaded Session的完整message、current Items、Pending Interaction或大型Prompt/Skill/Tool/Model/Command catalogs。它只负责Runtime scope状态和loaded membership；host收到每个新的Runtime Snapshot后按需重新执行safe catalog queries，不使用catalog revision判断本地cache是否仍有效。
+
+`LoadedSessionSummary` legal matrix固定为：`Ready + Idle|Starting|Running|Finishing`，或`Preparing|Unavailable + Idle`；其他cross-product不能构造或编码。
 
 ### SessionSnapshot
 
@@ -1846,7 +1844,7 @@ pub enum StateEventMsg {
     },
     Session {
         kind: SessionStateEventKind,
-        snapshot: SessionSnapshot,
+        snapshot: Box<SessionSnapshot>,
         detail: Option<SessionEventDetail>,
     },
 }
@@ -1940,6 +1938,8 @@ pub enum QueueUpdateReason {
     PrepareForUnload,
 }
 ```
+
+M2 minimal State codec只materializeRuntime `command_catalog_invalidated`以及Session `turn_completed | turn_failed` + matching `TurnTerminal`；`turn_interrupted`、Item/Interaction/queue kinds、Progress和Closed继续返回known `PendingPublicTarget`。Box同样只控制enum尺寸。
 
 StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
 
