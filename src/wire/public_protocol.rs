@@ -8,16 +8,19 @@ use crate::prompt::{
     normalize_text_intent, validate_skill_intent_count,
 };
 use crate::runtime_interface::{
-    CommandRequest, PublicCancelTarget, QueryResponse, QueryResult, RuntimeCapabilities,
-    RuntimeCommand, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
-    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, SessionCommand, SnapshotRequest,
-    SubscriptionRequest, SubscriptionScope, TurnCommand,
+    CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
+    CommandRequest, CommandResponse, PublicCancelTarget, PublicIngressLane, PublicSubject,
+    QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
+    RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
+    RuntimeReadQuery, RuntimeRequest, SessionCommand, SnapshotRequest, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, command_error_code_allows_retry_with_backoff,
+    validate_command_error_contract, validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
 
 use super::bounded_json::JsonNode;
 use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
-use super::scalar::{CommandId, SessionId, TurnId};
+use super::scalar::{AgentId, CommandId, ItemId, RequestId, SessionId, TurnId};
 use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
     WireV1Codec,
@@ -80,6 +83,17 @@ impl IncrementalRuntimeProtocolV1 {
 
     pub fn decode_query_response(&self, input: &[u8]) -> Result<QueryResponse, TypedJsonError> {
         decode_query_response(&self.codec, input)
+    }
+
+    pub fn decode_command_response(&self, input: &[u8]) -> Result<CommandResponse, TypedJsonError> {
+        decode_command_response(&self.codec, input)
+    }
+
+    pub fn encode_command_response(
+        &self,
+        response: &CommandResponse,
+    ) -> Result<Vec<u8>, TypedJsonError> {
+        encode_command_response(&self.codec, response)
     }
 
     pub fn encode_query_response(
@@ -155,6 +169,28 @@ fn encode_command_request(
             command_id: request.command_id(),
             command: RuntimeCommandOutput::from_semantic(request.command()),
         },
+    )
+}
+
+fn decode_command_response(
+    codec: &WireV1Codec,
+    input: &[u8],
+) -> Result<CommandResponse, TypedJsonError> {
+    let decoded: CommandResponseInput =
+        codec.decode_with_shape(PublicJsonKind::Response, input, |node| {
+            validate_command_response_shape(node, codec.limits())
+        })?;
+    decoded.into_semantic(codec.limits())
+}
+
+fn encode_command_response(
+    codec: &WireV1Codec,
+    response: &CommandResponse,
+) -> Result<Vec<u8>, TypedJsonError> {
+    validate_command_response_semantic_limits(response, codec.limits())?;
+    codec.encode(
+        PublicJsonKind::Response,
+        &CommandResponseOutput::from_semantic(response),
     )
 }
 
@@ -544,6 +580,529 @@ impl PublicCancelTargetOutput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandResponseInput {
+    command_id: CommandId,
+    completion: CommandCompletionInput,
+}
+
+impl CommandResponseInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<CommandResponse, TypedJsonError> {
+        let completion = match self.completion {
+            CommandCompletionInput::Completed(value) => CommandCompletion::Completed {
+                outcome: value.outcome.into_semantic(),
+                output: value
+                    .output
+                    .map(|output| {
+                        CommandOutput::new_with_maximum(
+                            output.text,
+                            limits.text.max_command_output_bytes as usize,
+                        )
+                        .map_err(|_| invalid_scalar())
+                    })
+                    .transpose()?,
+            },
+            CommandCompletionInput::Rejected(value) => {
+                CommandCompletion::Rejected(value.into_semantic(limits)?)
+            }
+        };
+        CommandResponse::new(self.command_id, completion).map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum CommandCompletionInput {
+    Completed(CompletedCommandInput),
+    Rejected(CommandErrorInput),
+}
+
+#[derive(Deserialize)]
+struct CompletedCommandInput {
+    outcome: CommandOutcomeInput,
+    output: Option<CommandOutputInput>,
+}
+
+#[derive(Deserialize)]
+struct CommandOutputInput {
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum CommandOutcomeInput {
+    TurnStarted(TurnIdInput),
+    CommandOutput,
+}
+
+impl CommandOutcomeInput {
+    const fn into_semantic(self) -> CommandOutcome {
+        match self {
+            Self::TurnStarted(value) => CommandOutcome::TurnStarted {
+                turn_id: value.turn_id,
+            },
+            Self::CommandOutput => CommandOutcome::CommandOutput,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnIdInput {
+    turn_id: TurnId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandErrorInput {
+    code: CommandErrorCodeInput,
+    message: String,
+    retry: RetryAdviceInput,
+    subject: Option<PublicSubjectInput>,
+}
+
+impl CommandErrorInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<CommandError, TypedJsonError> {
+        CommandError::new_with_maximum_message(
+            self.code.into_semantic()?,
+            self.message,
+            self.retry.into_semantic()?,
+            self.subject
+                .map(PublicSubjectInput::into_semantic)
+                .transpose()?,
+            limits.text.max_diagnostic_message_bytes as usize,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+struct CommandErrorCodeInput {
+    #[serde(rename = "type")]
+    kind: String,
+    data: Option<IngressLaneFullInput>,
+}
+
+impl CommandErrorCodeInput {
+    fn into_semantic(self) -> Result<CommandErrorCode, TypedJsonError> {
+        let code = match self.kind.as_str() {
+            "invalid_argument" => CommandErrorCode::InvalidArgument,
+            "not_found" => CommandErrorCode::NotFound,
+            "command_conflict" => CommandErrorCode::CommandConflict,
+            "stale_revision" => CommandErrorCode::StaleRevision,
+            "agent_disabled" => CommandErrorCode::AgentDisabled,
+            "agent_deleted" => CommandErrorCode::AgentDeleted,
+            "session_archived" => CommandErrorCode::SessionArchived,
+            "session_deleted" => CommandErrorCode::SessionDeleted,
+            "session_not_loaded" => CommandErrorCode::SessionNotLoaded,
+            "session_not_ready" => CommandErrorCode::SessionNotReady,
+            "session_busy" => CommandErrorCode::SessionBusy,
+            "reload_validation_failed" => CommandErrorCode::ReloadValidationFailed,
+            "ingress_lane_full" => CommandErrorCode::IngressLaneFull {
+                lane: self
+                    .data
+                    .ok_or_else(missing_required_field)?
+                    .lane
+                    .into_semantic(),
+            },
+            "queued_message_not_queued" => CommandErrorCode::QueuedMessageNotQueued,
+            "submit_not_cancellable" => CommandErrorCode::SubmitNotCancellable,
+            "expected_turn_mismatch" => CommandErrorCode::ExpectedTurnMismatch,
+            "turn_not_running" => CommandErrorCode::TurnNotRunning,
+            "turn_cancelling" => CommandErrorCode::TurnCancelling,
+            "turn_terminal" => CommandErrorCode::TurnTerminal,
+            "interaction_not_found" => CommandErrorCode::InteractionNotFound,
+            "interaction_already_resolved" => CommandErrorCode::InteractionAlreadyResolved,
+            "interaction_family_mismatch" => CommandErrorCode::InteractionFamilyMismatch,
+            "invalid_fork_anchor" => CommandErrorCode::InvalidForkAnchor,
+            "unauthorized" => CommandErrorCode::Unauthorized,
+            "unavailable" => CommandErrorCode::Unavailable,
+            "durable_state_corrupt" => CommandErrorCode::DurableStateCorrupt,
+            "durable_state_too_large" => CommandErrorCode::DurableStateTooLarge,
+            "runtime_closing" => CommandErrorCode::RuntimeClosing,
+            _ => return Err(unknown_output_variant()),
+        };
+        Ok(code)
+    }
+}
+
+#[derive(Deserialize)]
+struct IngressLaneFullInput {
+    lane: PublicIngressLaneInput,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicIngressLaneInput {
+    TurnAdmission,
+    Steer,
+    FollowUp,
+    InteractionControl,
+    ToolControl,
+}
+
+impl PublicIngressLaneInput {
+    const fn into_semantic(self) -> PublicIngressLane {
+        match self {
+            Self::TurnAdmission => PublicIngressLane::TurnAdmission,
+            Self::Steer => PublicIngressLane::Steer,
+            Self::FollowUp => PublicIngressLane::FollowUp,
+            Self::InteractionControl => PublicIngressLane::InteractionControl,
+            Self::ToolControl => PublicIngressLane::ToolControl,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RetryAdviceInput {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+impl RetryAdviceInput {
+    fn into_semantic(self) -> Result<RetryAdvice, TypedJsonError> {
+        Ok(match self.kind.as_str() {
+            "do_not_retry" => RetryAdvice::DoNotRetry,
+            "refresh_and_retry" => RetryAdvice::RefreshAndRetry,
+            "user_action_required" => RetryAdvice::UserActionRequired,
+            "retry_with_backoff" => return Err(TypedJsonError::PendingPublicTarget),
+            _ => return Err(unknown_output_variant()),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PublicSubjectInput {
+    Runtime,
+    Command(CommandId),
+    Agent(AgentId),
+    Session(SessionId),
+    Turn(TurnSubjectInput),
+    Item(ItemSubjectInput),
+    Interaction(InteractionSubjectInput),
+    Skill(String),
+}
+
+impl PublicSubjectInput {
+    fn into_semantic(self) -> Result<PublicSubject, TypedJsonError> {
+        Ok(match self {
+            Self::Runtime => PublicSubject::Runtime,
+            Self::Command(command_id) => PublicSubject::Command(command_id),
+            Self::Agent(agent_id) => PublicSubject::Agent(agent_id),
+            Self::Session(session_id) => PublicSubject::Session(session_id),
+            Self::Turn(value) => PublicSubject::Turn {
+                session_id: value.session_id,
+                turn_id: value.turn_id,
+            },
+            Self::Item(value) => PublicSubject::Item {
+                session_id: value.session_id,
+                turn_id: value.turn_id,
+                item_id: value.item_id,
+            },
+            Self::Interaction(value) => PublicSubject::Interaction {
+                session_id: value.session_id,
+                turn_id: value.turn_id,
+                item_id: value.item_id,
+                request_id: value.request_id,
+            },
+            Self::Skill(value) => {
+                PublicSubject::Skill(value.parse::<SkillId>().map_err(|_| invalid_scalar())?)
+            }
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnSubjectInput {
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemSubjectInput {
+    session_id: SessionId,
+    turn_id: TurnId,
+    item_id: ItemId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionSubjectInput {
+    session_id: SessionId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request_id: RequestId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandResponseOutput<'a> {
+    command_id: CommandId,
+    completion: CommandCompletionOutput<'a>,
+}
+
+impl<'a> CommandResponseOutput<'a> {
+    fn from_semantic(value: &'a CommandResponse) -> Self {
+        Self {
+            command_id: value.command_id(),
+            completion: CommandCompletionOutput::from_semantic(value.completion()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum CommandCompletionOutput<'a> {
+    Completed(CompletedCommandOutput<'a>),
+    Rejected(CommandErrorOutput<'a>),
+}
+
+impl<'a> CommandCompletionOutput<'a> {
+    fn from_semantic(value: &'a CommandCompletion) -> Self {
+        match value {
+            CommandCompletion::Completed { outcome, output } => {
+                Self::Completed(CompletedCommandOutput {
+                    outcome: CommandOutcomeOutput::from_semantic(outcome),
+                    output: output.as_ref().map(|output| CommandOutputOutput {
+                        text: output.text(),
+                    }),
+                })
+            }
+            CommandCompletion::Rejected(error) => {
+                Self::Rejected(CommandErrorOutput::from_semantic(error))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CompletedCommandOutput<'a> {
+    outcome: CommandOutcomeOutput,
+    output: Option<CommandOutputOutput<'a>>,
+}
+
+#[derive(Serialize)]
+struct CommandOutputOutput<'a> {
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum CommandOutcomeOutput {
+    TurnStarted(TurnIdOutput),
+    CommandOutput,
+}
+
+impl CommandOutcomeOutput {
+    fn from_semantic(value: &CommandOutcome) -> Self {
+        match value {
+            CommandOutcome::TurnStarted { turn_id } => {
+                Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
+            }
+            CommandOutcome::CommandOutput => Self::CommandOutput,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnIdOutput {
+    turn_id: TurnId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandErrorOutput<'a> {
+    code: CommandErrorCodeOutput,
+    message: &'a str,
+    retry: RetryAdviceOutput,
+    subject: Option<PublicSubjectOutput<'a>>,
+}
+
+impl<'a> CommandErrorOutput<'a> {
+    fn from_semantic(value: &'a CommandError) -> Self {
+        Self {
+            code: CommandErrorCodeOutput::from_semantic(value.code()),
+            message: value.message(),
+            retry: RetryAdviceOutput::from_semantic(value.retry()),
+            subject: value.subject().map(PublicSubjectOutput::from_semantic),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CommandErrorCodeOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<IngressLaneFullOutput>,
+}
+
+impl CommandErrorCodeOutput {
+    fn from_semantic(value: CommandErrorCode) -> Self {
+        let (kind, data) = match value {
+            CommandErrorCode::InvalidArgument => ("invalid_argument", None),
+            CommandErrorCode::NotFound => ("not_found", None),
+            CommandErrorCode::CommandConflict => ("command_conflict", None),
+            CommandErrorCode::StaleRevision => ("stale_revision", None),
+            CommandErrorCode::AgentDisabled => ("agent_disabled", None),
+            CommandErrorCode::AgentDeleted => ("agent_deleted", None),
+            CommandErrorCode::SessionArchived => ("session_archived", None),
+            CommandErrorCode::SessionDeleted => ("session_deleted", None),
+            CommandErrorCode::SessionNotLoaded => ("session_not_loaded", None),
+            CommandErrorCode::SessionNotReady => ("session_not_ready", None),
+            CommandErrorCode::SessionBusy => ("session_busy", None),
+            CommandErrorCode::ReloadValidationFailed => ("reload_validation_failed", None),
+            CommandErrorCode::IngressLaneFull { lane } => (
+                "ingress_lane_full",
+                Some(IngressLaneFullOutput {
+                    lane: PublicIngressLaneOutput::from_semantic(lane),
+                }),
+            ),
+            CommandErrorCode::QueuedMessageNotQueued => ("queued_message_not_queued", None),
+            CommandErrorCode::SubmitNotCancellable => ("submit_not_cancellable", None),
+            CommandErrorCode::ExpectedTurnMismatch => ("expected_turn_mismatch", None),
+            CommandErrorCode::TurnNotRunning => ("turn_not_running", None),
+            CommandErrorCode::TurnCancelling => ("turn_cancelling", None),
+            CommandErrorCode::TurnTerminal => ("turn_terminal", None),
+            CommandErrorCode::InteractionNotFound => ("interaction_not_found", None),
+            CommandErrorCode::InteractionAlreadyResolved => ("interaction_already_resolved", None),
+            CommandErrorCode::InteractionFamilyMismatch => ("interaction_family_mismatch", None),
+            CommandErrorCode::InvalidForkAnchor => ("invalid_fork_anchor", None),
+            CommandErrorCode::Unauthorized => ("unauthorized", None),
+            CommandErrorCode::Unavailable => ("unavailable", None),
+            CommandErrorCode::DurableStateCorrupt => ("durable_state_corrupt", None),
+            CommandErrorCode::DurableStateTooLarge => ("durable_state_too_large", None),
+            CommandErrorCode::RuntimeClosing => ("runtime_closing", None),
+        };
+        Self { kind, data }
+    }
+}
+
+#[derive(Serialize)]
+struct IngressLaneFullOutput {
+    lane: PublicIngressLaneOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PublicIngressLaneOutput {
+    TurnAdmission,
+    Steer,
+    FollowUp,
+    InteractionControl,
+    ToolControl,
+}
+
+impl PublicIngressLaneOutput {
+    const fn from_semantic(value: PublicIngressLane) -> Self {
+        match value {
+            PublicIngressLane::TurnAdmission => Self::TurnAdmission,
+            PublicIngressLane::Steer => Self::Steer,
+            PublicIngressLane::FollowUp => Self::FollowUp,
+            PublicIngressLane::InteractionControl => Self::InteractionControl,
+            PublicIngressLane::ToolControl => Self::ToolControl,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RetryAdviceOutput {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl RetryAdviceOutput {
+    const fn from_semantic(value: RetryAdvice) -> Self {
+        let kind = match value {
+            RetryAdvice::DoNotRetry => "do_not_retry",
+            RetryAdvice::RefreshAndRetry => "refresh_and_retry",
+            RetryAdvice::UserActionRequired => "user_action_required",
+        };
+        Self { kind }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PublicSubjectOutput<'a> {
+    Runtime,
+    Command(CommandId),
+    Agent(AgentId),
+    Session(SessionId),
+    Turn(TurnSubjectOutput),
+    Item(ItemSubjectOutput),
+    Interaction(InteractionSubjectOutput),
+    Skill(&'a str),
+}
+
+impl<'a> PublicSubjectOutput<'a> {
+    fn from_semantic(value: &'a PublicSubject) -> Self {
+        match value {
+            PublicSubject::Runtime => Self::Runtime,
+            PublicSubject::Command(command_id) => Self::Command(*command_id),
+            PublicSubject::Agent(agent_id) => Self::Agent(*agent_id),
+            PublicSubject::Session(session_id) => Self::Session(*session_id),
+            PublicSubject::Turn {
+                session_id,
+                turn_id,
+            } => Self::Turn(TurnSubjectOutput {
+                session_id: *session_id,
+                turn_id: *turn_id,
+            }),
+            PublicSubject::Item {
+                session_id,
+                turn_id,
+                item_id,
+            } => Self::Item(ItemSubjectOutput {
+                session_id: *session_id,
+                turn_id: *turn_id,
+                item_id: *item_id,
+            }),
+            PublicSubject::Interaction {
+                session_id,
+                turn_id,
+                item_id,
+                request_id,
+            } => Self::Interaction(InteractionSubjectOutput {
+                session_id: *session_id,
+                turn_id: *turn_id,
+                item_id: *item_id,
+                request_id: *request_id,
+            }),
+            PublicSubject::Skill(skill_id) => Self::Skill(skill_id.as_str()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnSubjectOutput {
+    session_id: SessionId,
+    turn_id: TurnId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemSubjectOutput {
+    session_id: SessionId,
+    turn_id: TurnId,
+    item_id: ItemId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionSubjectOutput {
+    session_id: SessionId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request_id: RequestId,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeQueryInput {
     Runtime(RuntimeReadQueryInput),
@@ -776,6 +1335,313 @@ fn validate_command_semantic_limits(
             .map_err(map_prompt_value_error)?;
     }
     Ok(())
+}
+
+fn validate_command_response_semantic_limits(
+    response: &CommandResponse,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    match response.completion() {
+        CommandCompletion::Completed {
+            output: Some(output),
+            ..
+        } => validate_command_output(output.text(), limits.text.max_command_output_bytes as usize)
+            .map_err(|_| invalid_scalar()),
+        CommandCompletion::Rejected(error) => validate_command_error_message(
+            error.message(),
+            limits.text.max_diagnostic_message_bytes as usize,
+        )
+        .map_err(|_| invalid_scalar()),
+        CommandCompletion::Completed { output: None, .. } => Ok(()),
+    }
+}
+
+fn validate_command_response_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    validate_id::<CommandId>(required(object, "commandId")?)?;
+    validate_adjacent_output(required(object, "completion")?, |kind, data| match kind {
+        "completed" => validate_completed_command(data.ok_or_else(missing_required_field)?, limits),
+        "rejected" => validate_command_error(data.ok_or_else(missing_required_field)?, limits),
+        _ => Err(unknown_output_variant()),
+    })
+}
+
+fn validate_completed_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let outcome = required(object, "outcome")?;
+    let pending_outcome = match validate_command_outcome(outcome) {
+        Err(TypedJsonError::PendingPublicTarget) => true,
+        Err(error) => return Err(error),
+        Ok(()) => false,
+    };
+    let expects_output = outcome
+        .as_object()
+        .and_then(|value| value.get("type"))
+        .and_then(JsonNode::as_str)
+        == Some("command_output");
+    let mut has_output = false;
+    if let Some(output) = object.get("output") {
+        match output {
+            JsonNode::Null => {}
+            JsonNode::Object(output) => {
+                has_output = true;
+                let text = required(output, "text")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?;
+                validate_command_output(text, limits.text.max_command_output_bytes as usize)
+                    .map_err(|_| invalid_scalar())?;
+            }
+            _ => return Err(selected_wrong_json_type()),
+        }
+    }
+    if expects_output != has_output {
+        return Err(invalid_scalar());
+    }
+    if pending_outcome {
+        Err(TypedJsonError::PendingPublicTarget)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
+    validate_adjacent_output(node, |kind, data| match kind {
+        "turn_started" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_id::<TurnId>(required(object, "turnId")?)
+        }
+        "command_output" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "agent_created"
+        | "agent_definition_updated"
+        | "agent_metadata_updated"
+        | "agent_status_changed"
+        | "session_created"
+        | "session_definition_updated"
+        | "session_metadata_updated"
+        | "session_forked"
+        | "steer_queued"
+        | "cancel_accepted" => pending_output_object(data),
+        "agent_deleted"
+        | "session_loaded"
+        | "session_unloaded"
+        | "session_archived"
+        | "session_unarchived"
+        | "session_deleted"
+        | "runtime_reloaded"
+        | "workspace_reloaded"
+        | "submit_cancelled"
+        | "follow_up_queued"
+        | "queued_message_cancelled"
+        | "interaction_resolved"
+        | "no_change" => pending_output_unit(data),
+        _ => Err(unknown_output_variant()),
+    })
+}
+
+fn validate_command_error(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let code = validate_command_error_code(required(object, "code")?)?;
+    let message = required(object, "message")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    validate_command_error_message(message, limits.text.max_diagnostic_message_bytes as usize)
+        .map_err(|_| invalid_scalar())?;
+    let pending_retry = match validate_retry_advice(required(object, "retry")?)? {
+        ValidatedRetryAdvice::Current(retry) => {
+            validate_command_error_contract(code, retry).map_err(|_| invalid_scalar())?;
+            false
+        }
+        ValidatedRetryAdvice::RetryWithBackoff => {
+            if !command_error_code_allows_retry_with_backoff(code) {
+                return Err(invalid_scalar());
+            }
+            true
+        }
+    };
+    if let Some(subject) = object.get("subject") {
+        if !matches!(subject, JsonNode::Null) {
+            validate_public_subject(subject)?;
+        }
+    }
+    if pending_retry {
+        Err(TypedJsonError::PendingPublicTarget)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_command_error_code(node: &JsonNode) -> Result<CommandErrorCode, TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let kind = required(object, "type")?
+        .as_str()
+        .ok_or_else(selected_wrong_json_type)?;
+    let data = object.get("data");
+    let code = match kind {
+        "ingress_lane_full" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            let lane = parse_ingress_lane(
+                required(object, "lane")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?,
+            )?;
+            CommandErrorCode::IngressLaneFull { lane }
+        }
+        "invalid_argument" => CommandErrorCode::InvalidArgument,
+        "not_found" => CommandErrorCode::NotFound,
+        "command_conflict" => CommandErrorCode::CommandConflict,
+        "stale_revision" => CommandErrorCode::StaleRevision,
+        "agent_disabled" => CommandErrorCode::AgentDisabled,
+        "agent_deleted" => CommandErrorCode::AgentDeleted,
+        "session_archived" => CommandErrorCode::SessionArchived,
+        "session_deleted" => CommandErrorCode::SessionDeleted,
+        "session_not_loaded" => CommandErrorCode::SessionNotLoaded,
+        "session_not_ready" => CommandErrorCode::SessionNotReady,
+        "session_busy" => CommandErrorCode::SessionBusy,
+        "reload_validation_failed" => CommandErrorCode::ReloadValidationFailed,
+        "queued_message_not_queued" => CommandErrorCode::QueuedMessageNotQueued,
+        "submit_not_cancellable" => CommandErrorCode::SubmitNotCancellable,
+        "expected_turn_mismatch" => CommandErrorCode::ExpectedTurnMismatch,
+        "turn_not_running" => CommandErrorCode::TurnNotRunning,
+        "turn_cancelling" => CommandErrorCode::TurnCancelling,
+        "turn_terminal" => CommandErrorCode::TurnTerminal,
+        "interaction_not_found" => CommandErrorCode::InteractionNotFound,
+        "interaction_already_resolved" => CommandErrorCode::InteractionAlreadyResolved,
+        "interaction_family_mismatch" => CommandErrorCode::InteractionFamilyMismatch,
+        "invalid_fork_anchor" => CommandErrorCode::InvalidForkAnchor,
+        "unauthorized" => CommandErrorCode::Unauthorized,
+        "unavailable" => CommandErrorCode::Unavailable,
+        "durable_state_corrupt" => CommandErrorCode::DurableStateCorrupt,
+        "durable_state_too_large" => CommandErrorCode::DurableStateTooLarge,
+        "runtime_closing" => CommandErrorCode::RuntimeClosing,
+        _ => return Err(unknown_output_variant()),
+    };
+    if !matches!(code, CommandErrorCode::IngressLaneFull { .. }) && data.is_some() {
+        return Err(selected_wrong_json_type());
+    }
+    Ok(code)
+}
+
+enum ValidatedRetryAdvice {
+    Current(RetryAdvice),
+    RetryWithBackoff,
+}
+
+fn validate_retry_advice(node: &JsonNode) -> Result<ValidatedRetryAdvice, TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let kind = required(object, "type")?
+        .as_str()
+        .ok_or_else(selected_wrong_json_type)?;
+    let data = object.get("data");
+    let retry = match kind {
+        "do_not_retry" => ValidatedRetryAdvice::Current(RetryAdvice::DoNotRetry),
+        "refresh_and_retry" => ValidatedRetryAdvice::Current(RetryAdvice::RefreshAndRetry),
+        "user_action_required" => ValidatedRetryAdvice::Current(RetryAdvice::UserActionRequired),
+        "retry_with_backoff" => {
+            data.ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            return Ok(ValidatedRetryAdvice::RetryWithBackoff);
+        }
+        _ => return Err(unknown_output_variant()),
+    };
+    if data.is_some() {
+        return Err(selected_wrong_json_type());
+    }
+    Ok(retry)
+}
+
+fn parse_ingress_lane(value: &str) -> Result<PublicIngressLane, TypedJsonError> {
+    Ok(match value {
+        "turn_admission" => PublicIngressLane::TurnAdmission,
+        "steer" => PublicIngressLane::Steer,
+        "follow_up" => PublicIngressLane::FollowUp,
+        "interaction_control" => PublicIngressLane::InteractionControl,
+        "tool_control" => PublicIngressLane::ToolControl,
+        _ => return Err(unknown_output_variant()),
+    })
+}
+
+fn validate_public_subject(node: &JsonNode) -> Result<(), TypedJsonError> {
+    validate_adjacent_output(node, |kind, data| match kind {
+        "runtime" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "command" => validate_id::<CommandId>(data.ok_or_else(missing_required_field)?),
+        "agent" => validate_id::<AgentId>(data.ok_or_else(missing_required_field)?),
+        "session" => validate_id::<SessionId>(data.ok_or_else(missing_required_field)?),
+        "turn" => validate_subject_ids(
+            data.ok_or_else(missing_required_field)?,
+            &["sessionId", "turnId"],
+        ),
+        "item" => validate_subject_ids(
+            data.ok_or_else(missing_required_field)?,
+            &["sessionId", "turnId", "itemId"],
+        ),
+        "interaction" => validate_subject_ids(
+            data.ok_or_else(missing_required_field)?,
+            &["sessionId", "turnId", "itemId", "requestId"],
+        ),
+        "skill" => {
+            let value = data
+                .ok_or_else(missing_required_field)?
+                .as_str()
+                .ok_or_else(typed_wrong_json_type)?;
+            value.parse::<SkillId>().map_err(|_| invalid_scalar())?;
+            Ok(())
+        }
+        _ => Err(unknown_output_variant()),
+    })
+}
+
+fn validate_subject_ids(node: &JsonNode, fields: &[&str]) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    for field in fields {
+        let value = required(object, field)?;
+        match *field {
+            "sessionId" => validate_id::<SessionId>(value)?,
+            "turnId" => validate_id::<TurnId>(value)?,
+            "itemId" => validate_id::<ItemId>(value)?,
+            "requestId" => validate_id::<RequestId>(value)?,
+            _ => return Err(TypedJsonError::EncodingInvariant),
+        }
+    }
+    Ok(())
+}
+
+fn pending_output_object(data: Option<&JsonNode>) -> Result<(), TypedJsonError> {
+    data.ok_or_else(missing_required_field)?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    Err(TypedJsonError::PendingPublicTarget)
+}
+
+fn pending_output_unit(data: Option<&JsonNode>) -> Result<(), TypedJsonError> {
+    if data.is_some() {
+        return Err(selected_wrong_json_type());
+    }
+    Err(TypedJsonError::PendingPublicTarget)
 }
 
 fn validate_command_request_shape(
