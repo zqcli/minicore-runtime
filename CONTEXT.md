@@ -281,7 +281,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2已开始并完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；下一步实现Conversation codec/scanner与LiveConversation，再关闭M5.0 durable foundations gate后实现SessionRecorder/replay；later Snapshot/Interaction/Progress/Closed DTO随M8–M10 owning slices增量激活；
+- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2仍按slice增量推进，已完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；M3.1已完成strict Header、六种flat body的exact Conversation Header/Entry per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap、owner/writer invariants和全部conversation golden的byte-exact round-trip；下一任务是M3.2 physical bounded JSONL scanner。LiveConversation reducer、SessionRecorder、M5 semantic replay/corruption sidecars仍待实现；later Snapshot/Interaction/Progress/Closed DTO随M8–M10 owning slices增量激活；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

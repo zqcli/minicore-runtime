@@ -1,5 +1,10 @@
 mod bootstrap;
 mod bounded_json;
+#[allow(
+    dead_code,
+    reason = "M3 line codec is consumed by future storage and recorder slices"
+)]
+pub(crate) mod conversation_jsonl;
 mod json_number;
 pub(crate) mod lexical;
 mod limits;

@@ -158,6 +158,10 @@ impl InteractionResolutionKey {
     pub fn generate() -> Result<Self, IdGenerationError> {
         random_nonzero_bytes().map(Self)
     }
+
+    pub(crate) fn encoded(&self) -> String {
+        encode_prefixed_hex("irk_", &self.0)
+    }
 }
 
 impl FromStr for InteractionResolutionKey {
