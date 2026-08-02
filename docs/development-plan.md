@@ -249,7 +249,7 @@ M1.1–M1.5已按owner拆分提交；最终review确认无correctness/security/s
 
 目标：每个行为vertical slice同时获得对应public DTO，不在Runtime行为前横向实现全部协议，也不等到M11才第一次接facade。
 
-当前进度：Protocol V1 bootstrap已通过exported byte-level router完成Hello decode、runtime capability intersection、Welcome/Reject生成与selected codec建立；public manifest已增加immutable owning slice和`active | pending`状态，Rust conformance runner只允许active target经exported production seam执行。`IncrementalRuntimeProtocolV1`为四个transport entry提供不含generic JSON envelope的typed root router；当前已激活Runtime reload、Session Load/Unload、Turn Submit/Cancel、TurnStarted/CommandOutput/typed Rejected completion、capabilities query/response、Runtime/Session SnapshotRequest、SubscriptionRequest和RuntimeDispatchError。Submit复用Prompt owner values并消费selected effective text/skill limits；CommandError强制canonical code/retry machine contract并对message/output执行selected limits。selected V1中尚属pending slice的known target返回独立`PendingPublicTarget`，不能伪报为unknown variant。M7 Create、SnapshotResponse与EventFrame DTO仍未完成。
+当前进度：Protocol V1 bootstrap已通过exported byte-level router完成Hello decode、runtime capability intersection、Welcome/Reject生成与selected codec建立；public manifest已增加immutable owning slice和`active | pending`状态，Rust conformance runner只允许active target经exported production seam执行。`IncrementalRuntimeProtocolV1`为四个transport entry提供不含generic JSON envelope的typed root router；当前已激活Runtime reload、Session Load/Unload、Turn Submit/Cancel、TurnStarted/CommandOutput/typed Rejected completion、capabilities query/response、Runtime/Session SnapshotRequest、SubscriptionRequest和RuntimeDispatchError。Submit复用Prompt owner values并消费selected effective text/skill limits；CommandError强制canonical code/retry machine contract并对message/output执行selected limits。selected V1中尚属pending slice的known target返回独立`PendingPublicTarget`，不能伪报为unknown variant。ADR 0135已冻结Create的host-neutral `WorkspaceRootInput { path: CanonicalFileUri }` seam；M7 Create codec、SnapshotResponse与EventFrame DTO仍未完成。
 
 任务顺序：
 
@@ -264,6 +264,7 @@ M1.1–M1.5已按owner拆分提交；最终review确认无correctness/security/s
 实现约束：
 
 - DTO语义由`runtime-interface.md`拥有，Wire只投影representation；
+- Create/Update Workspace public input使用Workspace-owned `WorkspaceDefinitionInput`与`WorkspaceRootInput { path: CanonicalFileUri }`；M2只关闭host-neutral codec，checked URI→`WorkspaceRootSpec { path: PathBuf }` lowering属于M7 command application（ADR 0135）；
 - Command accepted failure不能混入outer dispatch error；
 - Snapshot不得因size临时截断actionable state；超限按owner合同fail closed；
 - Interaction request/resolution不得泄露private Tool args、secret或resolution key；
@@ -414,6 +415,7 @@ provider-neutral request/result seam稳定后立即并行运行private Rig reali
 实现：
 
 - minimal Agent/Session durable definitions与revision CAS；
+- Session Create先把host-neutral `WorkspaceDefinitionInput` checked-lower为durable `WorkspaceRootSpec { path: PathBuf }`；unsupported host family返回accepted command的`InvalidArgument + DoNotRetry`且不开始staging；
 - Session Create严格stage Header后publish `Open + Unloaded`；
 - Load初始化replay、LiveSessionState和Recorder；
 - 每loaded Session一个SessionExecutor control actor；

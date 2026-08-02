@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
 
 ## 目的
 
@@ -247,7 +247,7 @@ pub enum RuntimeLifecycleCommand {
 | Public leaf | Canonical owner |
 | --- | --- |
 | `AgentPromptSelection`、`SessionPromptSelection`、`PromptBodyIntent`、`TextIntent`、`SkillIntent` | [Prompt](prompt.md) |
-| `WorkspaceRootSpec`、`WorkspaceCwdSpec`、`RequestedFilesystemAccess`、`WorkspaceSourcePolicy` | [Workspace](workspace.md) |
+| `WorkspaceDefinitionInput`、`WorkspaceRootInput`、`WorkspaceCwdSpec`、`RequestedFilesystemAccess`、`WorkspaceSourcePolicy` | [Workspace](workspace.md) |
 | `SessionModelConfig` | [Agent/Session Lifecycle](agent-session-lifecycle.md)；其中Model leaf由[ModelGateway](model-gateway.md)拥有 |
 | `ToolApprovalDecisionInput`、`UserQuestionAnswer`及question value types | [Tools](tools.md#approval-and-question-types) |
 | `InteractionResolutionKey`、`InteractionCancelReason` | [Turn / Item / Interaction](turn-item-interaction.md#interaction) |
@@ -376,9 +376,9 @@ pub struct SessionDefinitionPatch {
 }
 
 pub struct WorkspaceDefinitionInput {
-    pub primary_root: WorkspaceRootSpec,
-    pub additional_roots: Vec<WorkspaceRootSpec>,
-    pub cwd: WorkspaceCwdSpec,
+    primary_root: WorkspaceRootInput,
+    additional_roots: Vec<WorkspaceRootInput>,
+    cwd: WorkspaceCwdSpec,
 }
 
 pub struct NewSessionMetadata {
@@ -392,7 +392,7 @@ pub struct SessionMetadataPatch {
 }
 ```
 
-`WorkspaceDefinitionInput`没有WorkspaceRevision；Session owner规范化并分配new Workspace revision。root key/path/cwd containment、duplicate roots、requested access和source policy由Workspace owner验证。`SessionDefinitionPatch`为空时在CAS成功后为`NoChange`；Workspace/Model/Prompt字段各自是complete replacement candidate，不使用partial nested patch。metadata OptionalTextPatch同样区分Keep/Set/Clear。
+`WorkspaceDefinitionInput`没有WorkspaceRevision；它是Workspace-owned、host-neutral的command intent，root path保存Wire-owned typed `CanonicalFileUri` carrier，不保存native `PathBuf`。Wire完成URI lexical validation，Workspace constructor随后验证root count、duplicate key/URI、cwd引用、requested access和source policy等host-neutral invariant；这些失败表示typed command尚未形成，按input decode failure处理。typed command进入Runtime后，Workspace在Create/Update candidate validation中按current host family checked-lower为durable `WorkspaceRootSpec { path: PathBuf }`。unsupported host family或无法lossless形成native path返回`CommandError::InvalidArgument + DoNotRetry`，不是outer `RuntimeDispatchError`。native path、containment与authority invariant由Workspace lowering/resolution拥有。Session owner只在lowering成功后分配new Workspace revision。`SessionDefinitionPatch`为空时在CAS成功后为`NoChange`；Workspace/Model/Prompt字段各自是complete replacement candidate，不使用partial nested patch。metadata OptionalTextPatch同样区分Keep/Set/Clear。
 
 `ReloadSharedResources`对应`/reload`：Runtime完整build Prompt/Skill/Tool/Model candidates，validate所有required candidates，然后在短publication gate下原子替换current immutable objects；任一required candidate失败时保留全部old current values并返回`ReloadValidationFailed`，不发布`RuntimeReloaded`或`shared_resources_reloaded`。active/completed Turn不更新，future Turn捕获reload后的objects。
 
@@ -2591,7 +2591,8 @@ Public interface是 contract test surface。
 
 - Agent/Session definition revision与metadata revision独立CAS；Create同时返回两个revision 1；
 - Agent/Session create/definition/metadata DTO不接受owner-assigned ID/revision/timestamp；OptionalTextPatch正确区分Keep/Set/Clear，empty/equivalent patch在CAS后NoChange；
-- WorkspaceDefinitionInput分配new WorkspaceRevision并拒绝duplicate root key、cwd escape和oversized roots；
+- pre-command `WorkspaceDefinitionInput` constructor按selected limits拒绝duplicate root key/URI、unknown cwd root、cwd escape和oversized roots，失败时没有typed command或WorkspaceRevision；
+- admitted Create/Update使用显式`WorkspacePathTarget`执行host lowering：supported family成功形成private `WorkspaceRootSpec { path: PathBuf }`，unsupported family完成为`Rejected(InvalidArgument + DoNotRetry)`；只有lowering成功后才分配new WorkspaceRevision；
 - ExecuteCatalog selection只用safe path/ordered typed args，Text/Boolean/Choice必须匹配current schema，Runtime重验且不能通过catalog注入RuntimeCommand/credential；
 - metadata stale expected token失败，canonical no-op保持token且不发布event，successful update返回new metadata revision；
 - Agent/Session metadata update不写conversation JSONL，archive/delete竞态按entity lifecycle synchronization线性化；
