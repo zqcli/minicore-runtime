@@ -59,6 +59,8 @@ impl CanonicalFileUri {
         &self.decoded_path
     }
 
+    /// Returns the exact canonical wire value; unlike `Debug` and `Display`, this may expose an
+    /// absolute path and should only be used at an explicit serialization or path-handling seam.
     pub fn as_str(&self) -> &str {
         &self.wire
     }
@@ -141,7 +143,7 @@ impl FromStr for CanonicalFileUri {
 
 impl fmt::Display for CanonicalFileUri {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.wire)
+        write!(formatter, "<canonical-file-uri:{:?}>", self.family)
     }
 }
 
@@ -339,7 +341,15 @@ fn validate_segments(path: &str) -> Result<(), PathWireError> {
 #[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct WorkspaceRelativePath(Box<str>);
 
+impl Default for WorkspaceRelativePath {
+    fn default() -> Self {
+        Self("".into())
+    }
+}
+
 impl WorkspaceRelativePath {
+    /// Returns the exact relative path; unlike `Debug` and `Display`, this may expose
+    /// client-supplied path text and should only be used at an explicit path-handling seam.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -355,6 +365,7 @@ impl FromStr for WorkspaceRelativePath {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         if value.len() > MAX_RELATIVE_PATH_BYTES
             || value.contains(['\\', '\0'])
+            || value.chars().any(char::is_control)
             || value.starts_with('/')
             || value.ends_with('/')
         {
@@ -386,7 +397,7 @@ impl FromStr for WorkspaceRelativePath {
 
 impl fmt::Display for WorkspaceRelativePath {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str("<workspace-relative-path>")
     }
 }
 

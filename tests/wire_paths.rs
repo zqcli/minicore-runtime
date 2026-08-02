@@ -56,7 +56,7 @@ fn canonical_file_uri_matches_authoritative_vectors() {
             vector.wire
         );
         assert_eq!(uri.decoded_path(), vector.decoded_path, "{}", vector.wire);
-        assert_eq!(uri.to_string(), vector.wire);
+        assert_eq!(uri.as_str(), vector.wire);
         assert_eq!(
             serde_json::to_string(&uri).unwrap(),
             format!("\"{}\"", vector.wire)
@@ -121,12 +121,20 @@ fn relative_workspace_path_is_forward_slash_utf8_without_traversal() {
         "C:/work",
         "//server/share",
         "nul\0byte",
+        "line\nbreak",
+        "tab\tpath",
+        "delete\u{007f}path",
+        "c1\u{0085}path",
     ] {
         assert!(
             WorkspaceRelativePath::from_str(invalid).is_err(),
             "accepted {invalid:?}"
         );
     }
+
+    let redacted = WorkspaceRelativePath::from_str("private/source").unwrap();
+    assert!(!format!("{redacted}").contains("private/source"));
+    assert!(!format!("{redacted:?}").contains("private/source"));
 
     let limits = ProtocolLimits::v1_0().workspace;
     let max_bytes = "x".repeat(limits.max_relative_path_bytes as usize);

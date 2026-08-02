@@ -316,12 +316,30 @@ def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any
         else:
             raise AssertionError(f"unverified missing-field target {target}: {path}")
     elif code == "duplicate_value":
-        skills = value["command"]["data"]["data"]["intent"]["skills"]
-        assert len(skills) != len({skill["skillId"] for skill in skills}), path
+        command = value["command"]["data"]
+        if command["type"] == "create":
+            workspace = command["data"]["definition"]["workspace"]
+            roots = [workspace["primaryRoot"], *workspace["additionalRoots"]]
+            assert len(roots) != len({root["key"] for root in roots}), path
+        else:
+            skills = command["data"]["intent"]["skills"]
+            assert len(skills) != len({skill["skillId"] for skill in skills}), path
     elif code == "invalid_scalar":
         if target == "CommandRequest":
-            skills = value["command"]["data"]["data"]["intent"]["skills"]
-            assert any(not skill["skillId"].islower() for skill in skills), path
+            command = value["command"]["data"]
+            if command["type"] == "create":
+                create = command["data"]
+                workspace = create["definition"]["workspace"]
+                keys = {
+                    workspace["primaryRoot"]["key"],
+                    *(root["key"] for root in workspace["additionalRoots"]),
+                }
+                cwd_unknown = workspace["cwd"]["root"] not in keys
+                exponent_integer = '"maxOutputTokens":1e3' in path.read_text()
+                assert cwd_unknown or exponent_integer, path
+            else:
+                skills = command["data"]["intent"]["skills"]
+                assert any(not skill["skillId"].islower() for skill in skills), path
         elif target == "CommandResponse":
             data = value["completion"]["data"]
             if "\x00" in data.get("message", ""):

@@ -1,22 +1,30 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent_session_lifecycle::SessionModelConfig;
+use crate::model_gateway::{ModelId, ModelSelection, ProviderId, ReasoningPreference};
 use crate::prompt::{
-    PromptBodyIntent, PromptIntent, PromptValueError, SkillIntent, TextIntent,
-    normalize_text_intent, validate_skill_intent_count,
+    PromptBodyIntent, PromptId, PromptIntent, PromptValueError, SessionPromptSelection,
+    SkillIntent, TextIntent, normalize_text_intent, validate_skill_intent_count,
 };
 use crate::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandRequest, CommandResponse, PublicCancelTarget, PublicIngressLane, PublicSubject,
-    QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
-    RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeRequest, SessionCommand, SnapshotRequest, SubscriptionRequest,
-    SubscriptionScope, TurnCommand, command_error_code_allows_retry_with_backoff,
-    validate_command_error_contract, validate_command_error_message, validate_command_output,
+    CommandRequest, CommandResponse, NewSessionDefinition, NewSessionMetadata, PublicCancelTarget,
+    PublicIngressLane, PublicSubject, QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities,
+    RuntimeCommand, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, SessionCommand, SnapshotRequest,
+    SubscriptionRequest, SubscriptionScope, TurnCommand,
+    command_error_code_allows_retry_with_backoff, validate_command_error_contract,
+    validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
+use crate::workspace::{
+    RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspaceRootInput,
+    WorkspaceRootKey, WorkspaceSourcePolicy,
+};
 
 use super::bounded_json::JsonNode;
 use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
@@ -25,6 +33,7 @@ use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
     WireV1Codec,
 };
+use super::{CanonicalFileUri, WorkspaceRelativePath};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeRequestKind {
@@ -305,6 +314,9 @@ impl RuntimeCommandInput {
             Self::Runtime(RuntimeLifecycleCommandInput::ReloadSharedResources) => {
                 RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources)
             }
+            Self::Session(SessionCommandInput::Create(value)) => {
+                RuntimeCommand::Session(value.into_semantic(limits)?)
+            }
             Self::Session(SessionCommandInput::Load(value)) => {
                 RuntimeCommand::Session(SessionCommand::Load {
                     session_id: value.session_id,
@@ -340,8 +352,238 @@ enum RuntimeLifecycleCommandInput {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum SessionCommandInput {
+    Create(Box<CreateSessionCommandInput>),
     Load(SessionIdInput),
     Unload(SessionIdInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateSessionCommandInput {
+    agent_id: AgentId,
+    definition: NewSessionDefinitionInput,
+    metadata: NewSessionMetadataInput,
+}
+
+impl CreateSessionCommandInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionCommand, TypedJsonError> {
+        Ok(SessionCommand::Create {
+            agent_id: self.agent_id,
+            definition: Box::new(self.definition.into_semantic(limits)?),
+            metadata: self.metadata.into_semantic(limits)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewSessionDefinitionInput {
+    workspace: WorkspaceDefinitionWireInput,
+    model: SessionModelConfigInput,
+    prompts: SessionPromptSelectionInput,
+}
+
+impl NewSessionDefinitionInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<NewSessionDefinition, TypedJsonError> {
+        Ok(NewSessionDefinition::new(
+            self.workspace.into_semantic(limits)?,
+            self.model.into_semantic()?,
+            self.prompts.into_semantic(limits)?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceDefinitionWireInput {
+    primary_root: WorkspaceRootWireInput,
+    additional_roots: Vec<WorkspaceRootWireInput>,
+    cwd: WorkspaceCwdWireInput,
+}
+
+impl WorkspaceDefinitionWireInput {
+    fn into_semantic(
+        self,
+        limits: ProtocolLimits,
+    ) -> Result<WorkspaceDefinitionInput, TypedJsonError> {
+        WorkspaceDefinitionInput::new_with_limits(
+            self.primary_root.into_semantic()?,
+            self.additional_roots
+                .into_iter()
+                .map(WorkspaceRootWireInput::into_semantic)
+                .collect::<Result<Vec<_>, _>>()?,
+            self.cwd.into_semantic()?,
+            limits,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceRootWireInput {
+    key: String,
+    path: CanonicalFileUri,
+    requested_access: RequestedFilesystemAccessInput,
+    sources: WorkspaceSourcePolicyInput,
+}
+
+impl WorkspaceRootWireInput {
+    fn into_semantic(self) -> Result<WorkspaceRootInput, TypedJsonError> {
+        Ok(WorkspaceRootInput::new(
+            self.key
+                .parse::<WorkspaceRootKey>()
+                .map_err(|_| invalid_scalar())?,
+            self.path,
+            self.requested_access.into_semantic(),
+            self.sources.into_semantic(),
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestedFilesystemAccessInput {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl RequestedFilesystemAccessInput {
+    const fn into_semantic(self) -> RequestedFilesystemAccess {
+        match self {
+            Self::ReadOnly => RequestedFilesystemAccess::ReadOnly,
+            Self::ReadWrite => RequestedFilesystemAccess::ReadWrite,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceSourcePolicyInput {
+    prompt: bool,
+    skill: bool,
+}
+
+impl WorkspaceSourcePolicyInput {
+    const fn into_semantic(self) -> WorkspaceSourcePolicy {
+        WorkspaceSourcePolicy::new(self.prompt, self.skill)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceCwdWireInput {
+    root: String,
+    relative_path: WorkspaceRelativePath,
+}
+
+impl WorkspaceCwdWireInput {
+    fn into_semantic(self) -> Result<WorkspaceCwdSpec, TypedJsonError> {
+        Ok(WorkspaceCwdSpec::new(
+            self.root
+                .parse::<WorkspaceRootKey>()
+                .map_err(|_| invalid_scalar())?,
+            self.relative_path,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionModelConfigInput {
+    selection: ModelSelectionInput,
+    reasoning: ReasoningPreferenceInput,
+    max_output_tokens: Option<NonZeroU32>,
+}
+
+impl SessionModelConfigInput {
+    fn into_semantic(self) -> Result<SessionModelConfig, TypedJsonError> {
+        Ok(SessionModelConfig::new(
+            self.selection.into_semantic()?,
+            self.reasoning.into_semantic(),
+            self.max_output_tokens,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ModelSelectionInput {
+    provider_id: String,
+    model_id: String,
+}
+
+impl ModelSelectionInput {
+    fn into_semantic(self) -> Result<ModelSelection, TypedJsonError> {
+        Ok(ModelSelection::new(
+            self.provider_id
+                .parse::<ProviderId>()
+                .map_err(|_| invalid_scalar())?,
+            self.model_id
+                .parse::<ModelId>()
+                .map_err(|_| invalid_scalar())?,
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReasoningPreferenceInput {
+    Auto,
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningPreferenceInput {
+    const fn into_semantic(self) -> ReasoningPreference {
+        match self {
+            Self::Auto => ReasoningPreference::Auto,
+            Self::Disabled => ReasoningPreference::Disabled,
+            Self::Low => ReasoningPreference::Low,
+            Self::Medium => ReasoningPreference::Medium,
+            Self::High => ReasoningPreference::High,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionPromptSelectionInput {
+    enabled: Vec<String>,
+}
+
+impl SessionPromptSelectionInput {
+    fn into_semantic(
+        self,
+        limits: ProtocolLimits,
+    ) -> Result<SessionPromptSelection, TypedJsonError> {
+        let enabled = self
+            .enabled
+            .into_iter()
+            .map(|value| value.parse::<PromptId>().map_err(|_| invalid_scalar()))
+            .collect::<Result<Vec<_>, _>>()?;
+        SessionPromptSelection::new_with_maximum(
+            enabled,
+            usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX),
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewSessionMetadataInput {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+impl NewSessionMetadataInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<NewSessionMetadata, TypedJsonError> {
+        NewSessionMetadata::new_with_limits(self.name, self.description, limits)
+            .map_err(|_| invalid_scalar())
+    }
 }
 
 #[derive(Deserialize)]
@@ -450,7 +692,7 @@ struct CommandRequestOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeCommandOutput<'a> {
     Runtime(RuntimeLifecycleCommandOutput),
-    Session(SessionCommandOutput),
+    Session(SessionCommandOutput<'a>),
     Turn(TurnCommandOutput<'a>),
 }
 
@@ -460,6 +702,15 @@ impl<'a> RuntimeCommandOutput<'a> {
             RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources) => {
                 Self::Runtime(RuntimeLifecycleCommandOutput::ReloadSharedResources)
             }
+            RuntimeCommand::Session(SessionCommand::Create {
+                agent_id,
+                definition,
+                metadata,
+            }) => Self::Session(SessionCommandOutput::Create(CreateSessionCommandOutput {
+                agent_id: *agent_id,
+                definition: NewSessionDefinitionOutput::from_semantic(definition),
+                metadata: NewSessionMetadataOutput::from_semantic(metadata),
+            })),
             RuntimeCommand::Session(SessionCommand::Load { session_id }) => {
                 Self::Session(SessionCommandOutput::Load(SessionIdOutput {
                     session_id: *session_id,
@@ -494,9 +745,210 @@ enum RuntimeLifecycleCommandOutput {
 
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
-enum SessionCommandOutput {
+enum SessionCommandOutput<'a> {
+    Create(CreateSessionCommandOutput<'a>),
     Load(SessionIdOutput),
     Unload(SessionIdOutput),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionCommandOutput<'a> {
+    agent_id: AgentId,
+    definition: NewSessionDefinitionOutput<'a>,
+    metadata: NewSessionMetadataOutput<'a>,
+}
+
+#[derive(Serialize)]
+struct NewSessionDefinitionOutput<'a> {
+    workspace: WorkspaceDefinitionOutput<'a>,
+    model: SessionModelConfigOutput<'a>,
+    prompts: SessionPromptSelectionOutput<'a>,
+}
+
+impl<'a> NewSessionDefinitionOutput<'a> {
+    fn from_semantic(value: &'a NewSessionDefinition) -> Self {
+        Self {
+            workspace: WorkspaceDefinitionOutput::from_semantic(value.workspace()),
+            model: SessionModelConfigOutput::from_semantic(value.model()),
+            prompts: SessionPromptSelectionOutput::from_semantic(value.prompts()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceDefinitionOutput<'a> {
+    primary_root: WorkspaceRootOutput<'a>,
+    additional_roots: Vec<WorkspaceRootOutput<'a>>,
+    cwd: WorkspaceCwdOutput<'a>,
+}
+
+impl<'a> WorkspaceDefinitionOutput<'a> {
+    fn from_semantic(value: &'a WorkspaceDefinitionInput) -> Self {
+        Self {
+            primary_root: WorkspaceRootOutput::from_semantic(value.primary_root()),
+            additional_roots: value
+                .additional_roots()
+                .iter()
+                .map(WorkspaceRootOutput::from_semantic)
+                .collect(),
+            cwd: WorkspaceCwdOutput::from_semantic(value.cwd()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceRootOutput<'a> {
+    key: &'a str,
+    path: &'a CanonicalFileUri,
+    requested_access: RequestedFilesystemAccessOutput,
+    sources: WorkspaceSourcePolicyOutput,
+}
+
+impl<'a> WorkspaceRootOutput<'a> {
+    fn from_semantic(value: &'a WorkspaceRootInput) -> Self {
+        Self {
+            key: value.key().as_str(),
+            path: value.path(),
+            requested_access: RequestedFilesystemAccessOutput::from_semantic(
+                value.requested_access(),
+            ),
+            sources: WorkspaceSourcePolicyOutput::from_semantic(value.sources()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestedFilesystemAccessOutput {
+    ReadOnly,
+    ReadWrite,
+}
+
+impl RequestedFilesystemAccessOutput {
+    const fn from_semantic(value: RequestedFilesystemAccess) -> Self {
+        match value {
+            RequestedFilesystemAccess::ReadOnly => Self::ReadOnly,
+            RequestedFilesystemAccess::ReadWrite => Self::ReadWrite,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WorkspaceSourcePolicyOutput {
+    prompt: bool,
+    skill: bool,
+}
+
+impl WorkspaceSourcePolicyOutput {
+    const fn from_semantic(value: WorkspaceSourcePolicy) -> Self {
+        Self {
+            prompt: value.prompt(),
+            skill: value.skill(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCwdOutput<'a> {
+    root: &'a str,
+    relative_path: &'a WorkspaceRelativePath,
+}
+
+impl<'a> WorkspaceCwdOutput<'a> {
+    fn from_semantic(value: &'a WorkspaceCwdSpec) -> Self {
+        Self {
+            root: value.root().as_str(),
+            relative_path: value.relative_path(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionModelConfigOutput<'a> {
+    selection: ModelSelectionOutput<'a>,
+    reasoning: ReasoningPreferenceOutput,
+    max_output_tokens: Option<NonZeroU32>,
+}
+
+impl<'a> SessionModelConfigOutput<'a> {
+    fn from_semantic(value: &'a SessionModelConfig) -> Self {
+        Self {
+            selection: ModelSelectionOutput::from_semantic(value.selection()),
+            reasoning: ReasoningPreferenceOutput::from_semantic(value.reasoning()),
+            max_output_tokens: value.max_output_tokens(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelSelectionOutput<'a> {
+    provider_id: &'a str,
+    model_id: &'a str,
+}
+
+impl<'a> ModelSelectionOutput<'a> {
+    fn from_semantic(value: &'a ModelSelection) -> Self {
+        Self {
+            provider_id: value.provider_id().as_str(),
+            model_id: value.model_id().as_str(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReasoningPreferenceOutput {
+    Auto,
+    Disabled,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningPreferenceOutput {
+    const fn from_semantic(value: ReasoningPreference) -> Self {
+        match value {
+            ReasoningPreference::Auto => Self::Auto,
+            ReasoningPreference::Disabled => Self::Disabled,
+            ReasoningPreference::Low => Self::Low,
+            ReasoningPreference::Medium => Self::Medium,
+            ReasoningPreference::High => Self::High,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SessionPromptSelectionOutput<'a> {
+    enabled: Vec<&'a str>,
+}
+
+impl<'a> SessionPromptSelectionOutput<'a> {
+    fn from_semantic(value: &'a SessionPromptSelection) -> Self {
+        Self {
+            enabled: value.enabled().iter().map(PromptId::as_str).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NewSessionMetadataOutput<'a> {
+    name: Option<&'a str>,
+    description: Option<&'a str>,
+}
+
+impl<'a> NewSessionMetadataOutput<'a> {
+    fn from_semantic(value: &'a NewSessionMetadata) -> Self {
+        Self {
+            name: value.name(),
+            description: value.description(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1322,17 +1774,56 @@ fn validate_command_semantic_limits(
     command: &RuntimeCommand,
     limits: ProtocolLimits,
 ) -> Result<(), TypedJsonError> {
-    let RuntimeCommand::Turn(TurnCommand::Submit { intent, .. }) = command else {
-        return Ok(());
-    };
-    validate_skill_intent_count(
-        intent.skills().len(),
-        limits.prompt.max_skills_per_intent as usize,
-    )
-    .map_err(map_prompt_value_error)?;
-    if let PromptBodyIntent::Text(text) = intent.body() {
-        normalize_text_intent(text.text(), limits.text.max_text_intent_bytes as usize)
+    match command {
+        RuntimeCommand::Turn(TurnCommand::Submit { intent, .. }) => {
+            validate_skill_intent_count(
+                intent.skills().len(),
+                limits.prompt.max_skills_per_intent as usize,
+            )
             .map_err(map_prompt_value_error)?;
+            if let PromptBodyIntent::Text(text) = intent.body() {
+                normalize_text_intent(text.text(), limits.text.max_text_intent_bytes as usize)
+                    .map_err(map_prompt_value_error)?;
+            }
+        }
+        RuntimeCommand::Session(SessionCommand::Create {
+            definition,
+            metadata,
+            ..
+        }) => {
+            let workspace = definition.workspace();
+            let root_count = workspace.additional_roots().len().saturating_add(1);
+            if root_count > usize::from(limits.workspace.max_workspace_roots) {
+                return Err(invalid_scalar());
+            }
+            for root in
+                std::iter::once(workspace.primary_root()).chain(workspace.additional_roots())
+            {
+                if root.path().as_str().len()
+                    > usize::try_from(limits.workspace.max_absolute_path_uri_bytes)
+                        .unwrap_or(usize::MAX)
+                {
+                    return Err(invalid_scalar());
+                }
+            }
+            let relative = workspace.cwd().relative_path().as_str();
+            let relative_segments = if relative.is_empty() {
+                0
+            } else {
+                relative.split('/').count()
+            };
+            if relative.len()
+                > usize::try_from(limits.workspace.max_relative_path_bytes).unwrap_or(usize::MAX)
+                || relative_segments > usize::from(limits.workspace.max_relative_path_segments)
+                || definition.prompts().enabled().len()
+                    > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX)
+            {
+                return Err(invalid_scalar());
+            }
+            NewSessionMetadata::new_with_limits(metadata.name(), metadata.description(), limits)
+                .map_err(|_| invalid_scalar())?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1663,7 +2154,7 @@ fn validate_command_request_shape(
             }
             Ok(())
         }
-        "session" => validate_session_command(data.ok_or_else(missing_required_field)?),
+        "session" => validate_session_command(data.ok_or_else(missing_required_field)?, limits),
         "turn" => validate_turn_command(data.ok_or_else(missing_required_field)?, limits),
         "agent" => validate_pending_command_family(
             data,
@@ -1683,11 +2174,13 @@ fn validate_command_request_shape(
     })
 }
 
-fn validate_session_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+fn validate_session_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
     validate_adjacent_input(node, |kind, data| match kind {
         "load" | "unload" => validate_session_id_object(data.ok_or_else(missing_required_field)?),
-        "create"
-        | "update_definition"
+        "create" => {
+            validate_create_session_command(data.ok_or_else(missing_required_field)?, limits)
+        }
+        "update_definition"
         | "upgrade_agent_revision"
         | "update_metadata"
         | "reload_workspace"
@@ -1697,6 +2190,236 @@ fn validate_session_command(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "fork" => pending_object(data),
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_create_session_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["agentId", "definition", "metadata"],
+    )?;
+    validate_id::<AgentId>(required(object, "agentId")?)?;
+    validate_new_session_definition(required(object, "definition")?, limits)?;
+    validate_new_session_metadata(required(object, "metadata")?, limits)
+}
+
+fn validate_new_session_definition(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["workspace", "model", "prompts"],
+    )?;
+    validate_workspace_definition(required(object, "workspace")?, limits)?;
+    validate_session_model_config(required(object, "model")?)?;
+    validate_session_prompt_selection(required(object, "prompts")?, limits)
+}
+
+fn validate_workspace_definition(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["primaryRoot", "additionalRoots", "cwd"],
+    )?;
+    let additional = required(object, "additionalRoots")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    if additional.len().saturating_add(1) > usize::from(limits.workspace.max_workspace_roots) {
+        return Err(invalid_scalar());
+    }
+
+    let mut keys = BTreeSet::new();
+    let mut uris = BTreeSet::new();
+    let (primary_key, primary_uri) =
+        validate_workspace_root(required(object, "primaryRoot")?, limits)?;
+    keys.insert(primary_key);
+    uris.insert(primary_uri);
+    for root in additional {
+        let (key, uri) = validate_workspace_root(root, limits)?;
+        if !keys.insert(key) || !uris.insert(uri) {
+            return Err(duplicate_value());
+        }
+    }
+    let cwd_root = validate_workspace_cwd(required(object, "cwd")?, limits)?;
+    if !keys.contains(cwd_root) {
+        return Err(invalid_scalar());
+    }
+    Ok(())
+}
+
+fn validate_workspace_root(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(&str, &str), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["key", "path", "requestedAccess", "sources"],
+    )?;
+    let key = required(object, "key")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    key.parse::<WorkspaceRootKey>()
+        .map_err(|_| invalid_scalar())?;
+    let path = required(object, "path")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    if path.len()
+        > usize::try_from(limits.workspace.max_absolute_path_uri_bytes).unwrap_or(usize::MAX)
+    {
+        return Err(invalid_scalar());
+    }
+    path.parse::<CanonicalFileUri>()
+        .map_err(|_| invalid_scalar())?;
+    match required(object, "requestedAccess")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "read_only" | "read_write" => {}
+        _ => return Err(unknown_input_variant()),
+    }
+    let sources = input_object(required(object, "sources")?)?;
+    reject_unknown_fields(sources.keys().map(AsRef::as_ref), &["prompt", "skill"])?;
+    for field in ["prompt", "skill"] {
+        if !matches!(required(sources, field)?, JsonNode::Bool(_)) {
+            return Err(typed_wrong_json_type());
+        }
+    }
+    Ok((key, path))
+}
+
+fn validate_workspace_cwd(node: &JsonNode, limits: ProtocolLimits) -> Result<&str, TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["root", "relativePath"])?;
+    let root = required(object, "root")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    root.parse::<WorkspaceRootKey>()
+        .map_err(|_| invalid_scalar())?;
+    let relative = required(object, "relativePath")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    if relative.len()
+        > usize::try_from(limits.workspace.max_relative_path_bytes).unwrap_or(usize::MAX)
+        || (!relative.is_empty()
+            && relative.split('/').count()
+                > usize::from(limits.workspace.max_relative_path_segments))
+    {
+        return Err(invalid_scalar());
+    }
+    relative
+        .parse::<WorkspaceRelativePath>()
+        .map_err(|_| invalid_scalar())?;
+    Ok(root)
+}
+
+fn validate_session_model_config(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["selection", "reasoning", "maxOutputTokens"],
+    )?;
+    let selection = input_object(required(object, "selection")?)?;
+    reject_unknown_fields(
+        selection.keys().map(AsRef::as_ref),
+        &["providerId", "modelId"],
+    )?;
+    required(selection, "providerId")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<ProviderId>()
+        .map_err(|_| invalid_scalar())?;
+    required(selection, "modelId")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<ModelId>()
+        .map_err(|_| invalid_scalar())?;
+    match required(object, "reasoning")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "auto" | "disabled" | "low" | "medium" | "high" => {}
+        _ => return Err(unknown_input_variant()),
+    }
+    match object.get("maxOutputTokens") {
+        None | Some(JsonNode::Null) => Ok(()),
+        Some(node) => validate_nonzero_u32(node),
+    }
+}
+
+fn validate_nonzero_u32(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let literal = node
+        .as_number()
+        .map(|number| number.raw())
+        .ok_or_else(typed_wrong_json_type)?;
+    if !literal.bytes().all(|byte| byte.is_ascii_digit())
+        || literal
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .is_none()
+    {
+        return Err(invalid_scalar());
+    }
+    Ok(())
+}
+
+fn validate_session_prompt_selection(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["enabled"])?;
+    let enabled = required(object, "enabled")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    if enabled.len() > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX) {
+        return Err(invalid_scalar());
+    }
+    let mut unique = BTreeSet::new();
+    for prompt in enabled {
+        let prompt = prompt.as_str().ok_or_else(typed_wrong_json_type)?;
+        prompt.parse::<PromptId>().map_err(|_| invalid_scalar())?;
+        if !unique.insert(prompt) {
+            return Err(duplicate_value());
+        }
+    }
+    Ok(())
+}
+
+fn validate_new_session_metadata(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["name", "description"])?;
+    let name = object
+        .get("name")
+        .map(nullable_string)
+        .transpose()?
+        .flatten();
+    let description = object
+        .get("description")
+        .map(nullable_string)
+        .transpose()?
+        .flatten();
+    NewSessionMetadata::new_with_limits(name, description, limits).map_err(|_| invalid_scalar())?;
+    Ok(())
+}
+
+fn nullable_string(node: &JsonNode) -> Result<Option<&str>, TypedJsonError> {
+    match node {
+        JsonNode::Null => Ok(None),
+        _ => node.as_str().map(Some).ok_or_else(typed_wrong_json_type),
+    }
 }
 
 fn validate_turn_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {

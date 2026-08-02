@@ -266,6 +266,22 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
                 minicore_runtime::runtime_interface::RuntimeLifecycleCommand::ReloadSharedResources,
             ),
         ) => {}
+        (
+            "session_create_file_uri",
+            RuntimeCommand::Session(SessionCommand::Create {
+                agent_id,
+                definition,
+                metadata,
+            }),
+        ) => {
+            assert_eq!(agent_id.to_string(), "agt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+            let root = definition.workspace().primary_root();
+            assert_eq!(root.key().as_str(), "repo");
+            assert_eq!(root.path().as_str(), "file:///Users/alice/project");
+            assert_eq!(root.path().family(), FileUriFamily::Posix);
+            assert_eq!(definition.workspace().cwd().relative_path().as_str(), "src");
+            assert!(metadata.name().is_none());
+        }
         ("session_load", RuntimeCommand::Session(SessionCommand::Load { session_id })) => {
             assert_eq!(
                 session_id.to_string(),
@@ -401,7 +417,7 @@ fn run_file_uri_vectors(vector: &PublicVector) {
         assert_eq!(uri.family(), family, "{}", case.wire);
         assert_eq!(uri.authority(), case.authority.as_deref(), "{}", case.wire);
         assert_eq!(uri.decoded_path(), case.decoded_path, "{}", case.wire);
-        assert_eq!(uri.to_string(), case.wire);
+        assert_eq!(uri.as_str(), case.wire);
     }
     for case in vectors.invalid {
         assert!(
@@ -514,11 +530,10 @@ fn canonical_target(vector: &PublicVector, raw: &[u8]) -> Vec<u8> {
         .as_deref()
         .unwrap_or_else(|| panic!("missing canonical target for {}", vector.path));
     let target = read_fixture(path);
-    let pointers = vector
-        .expected
-        .ignored_json_pointers
-        .as_deref()
-        .unwrap_or_else(|| panic!("missing ignored pointers for {}", vector.path));
+    let Some(pointers) = vector.expected.ignored_json_pointers.as_deref() else {
+        assert!(vector.expected.runtime_encoder.is_none(), "{}", vector.path);
+        return without_final_lf(&target);
+    };
     assert_eq!(
         vector.expected.runtime_encoder.as_deref(),
         Some("must_not_send_in_1_0"),
