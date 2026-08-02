@@ -5,6 +5,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
+use crate::runtime_interface::{RuntimeCapabilities, RuntimeCapability};
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[cfg_attr(
     not(test),
@@ -954,44 +956,25 @@ impl RuntimeInfo {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct RuntimeCapabilities {
-    values: Vec<CapabilityToken>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum RuntimeCapabilitiesError {
-    #[error("runtime capability is not declared by protocol v1.0")]
-    UnknownCapability,
-    #[error("runtime capability set contains a duplicate token")]
-    DuplicateCapability,
-}
-
-impl RuntimeCapabilities {
-    pub fn empty() -> Self {
-        Self { values: Vec::new() }
-    }
-
-    pub fn for_v1(values: Vec<CapabilityToken>) -> Result<Self, RuntimeCapabilitiesError> {
-        let selected = values.iter().cloned().collect::<BTreeSet<_>>();
-        if selected.len() != values.len() {
-            return Err(RuntimeCapabilitiesError::DuplicateCapability);
+impl Serialize for RuntimeCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        #[derive(Serialize)]
+        struct RuntimeCapabilitiesOutput<'a> {
+            values: Vec<&'a str>,
         }
-        if selected
-            .iter()
-            .any(|capability| !is_v1_runtime_capability(capability))
-        {
-            return Err(RuntimeCapabilitiesError::UnknownCapability);
-        }
-        let values = v1_runtime_capabilities()
-            .into_iter()
-            .filter(|capability| selected.contains(capability))
-            .collect();
-        Ok(Self { values })
-    }
 
-    pub fn values(&self) -> &[CapabilityToken] {
-        &self.values
+        RuntimeCapabilitiesOutput {
+            values: self
+                .values()
+                .iter()
+                .copied()
+                .map(runtime_capability_name)
+                .collect(),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -1110,8 +1093,12 @@ pub fn negotiate_protocol(
     let capabilities = implemented_capabilities
         .values()
         .iter()
-        .filter(|capability| client_capabilities.contains(capability))
-        .cloned()
+        .filter(|capability| {
+            client_capabilities
+                .iter()
+                .any(|token| token.as_str() == runtime_capability_name(**capability))
+        })
+        .copied()
         .collect::<Vec<_>>();
     let capabilities = RuntimeCapabilities::for_v1(capabilities)
         .expect("subset of a validated V1 capability set must remain valid");
@@ -1121,35 +1108,34 @@ pub fn negotiate_protocol(
     }
 }
 
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "consumed by M2 bootstrap routing")
-)]
-pub fn v1_runtime_capabilities() -> Vec<CapabilityToken> {
-    V1_RUNTIME_CAPABILITY_TOKENS
-        .into_iter()
-        .map(|value| {
-            value
-                .parse()
-                .expect("built-in capability token must be valid")
-        })
-        .collect()
+pub(crate) fn runtime_capability_from_token(
+    capability: &CapabilityToken,
+) -> Option<RuntimeCapability> {
+    Some(match capability.as_str() {
+        "state_events" => RuntimeCapability::StateEvents,
+        "progress_events" => RuntimeCapability::ProgressEvents,
+        "runtime_snapshot" => RuntimeCapability::RuntimeSnapshot,
+        "session_snapshot" => RuntimeCapability::SessionSnapshot,
+        "paged_queries" => RuntimeCapability::PagedQueries,
+        "command_catalog" => RuntimeCapability::CommandCatalog,
+        "interaction_resolution" => RuntimeCapability::InteractionResolution,
+        "session_fork" => RuntimeCapability::SessionFork,
+        _ => return None,
+    })
 }
 
-pub(crate) fn is_v1_runtime_capability(capability: &CapabilityToken) -> bool {
-    V1_RUNTIME_CAPABILITY_TOKENS.contains(&capability.as_str())
+pub(crate) const fn runtime_capability_name(capability: RuntimeCapability) -> &'static str {
+    match capability {
+        RuntimeCapability::StateEvents => "state_events",
+        RuntimeCapability::ProgressEvents => "progress_events",
+        RuntimeCapability::RuntimeSnapshot => "runtime_snapshot",
+        RuntimeCapability::SessionSnapshot => "session_snapshot",
+        RuntimeCapability::PagedQueries => "paged_queries",
+        RuntimeCapability::CommandCatalog => "command_catalog",
+        RuntimeCapability::InteractionResolution => "interaction_resolution",
+        RuntimeCapability::SessionFork => "session_fork",
+    }
 }
-
-const V1_RUNTIME_CAPABILITY_TOKENS: [&str; 8] = [
-    "state_events",
-    "progress_events",
-    "runtime_snapshot",
-    "session_snapshot",
-    "paged_queries",
-    "command_catalog",
-    "interaction_resolution",
-    "session_fork",
-];
 
 #[cfg(test)]
 #[path = "limits_tests.rs"]

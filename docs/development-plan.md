@@ -249,7 +249,7 @@ M1.1–M1.5已按owner拆分提交；最终review确认无correctness/security/s
 
 目标：每个行为vertical slice同时获得对应public DTO，不在Runtime行为前横向实现全部协议，也不等到M11才第一次接facade。
 
-当前进度：Protocol V1 bootstrap已通过exported byte-level router完成Hello decode、runtime capability intersection、Welcome/Reject生成与selected codec建立；public manifest已增加immutable owning slice和`active | pending`状态，Rust conformance runner只允许active target经exported production seam执行。outer route skeleton及M7 DTO仍未完成。
+当前进度：Protocol V1 bootstrap已通过exported byte-level router完成Hello decode、runtime capability intersection、Welcome/Reject生成与selected codec建立；public manifest已增加immutable owning slice和`active | pending`状态，Rust conformance runner只允许active target经exported production seam执行。`IncrementalRuntimeProtocolV1`为四个transport entry提供不含generic JSON envelope的typed root router；当前已激活Runtime reload command、capabilities query/response、Runtime/Session SnapshotRequest、SubscriptionRequest和RuntimeDispatchError。selected V1中尚属pending slice的known target返回独立`PendingPublicTarget`，不能伪报为unknown variant。M7 Session/Turn command、completion、SnapshotResponse与EventFrame DTO仍未完成。
 
 任务顺序：
 
@@ -650,7 +650,7 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 M0与M1已完成，M2已开始且bootstrap routing与incremental manifest gate已经落地。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M2`基于现有bootstrap router实现outer request/response/frame envelope、route skeleton与M7 public DTO；
+1. `M2`继续实现M7 Session/Turn command、completion、SnapshotResponse与EventFrame DTO，并把对应manifest targets切为active；
 2. `M3.1` exact Conversation Header/Entry codec并直接消费golden fixtures；
 3. `M3.2` bounded physical JSONL scanner；
 4. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`。

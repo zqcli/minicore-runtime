@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use minicore_runtime::wire::{
-    CanonicalFileUri, FileUriFamily, ProtocolBootstrapResponse, ProtocolBootstrapRouter,
-    ProtocolRejectReason, ProtocolVersion, RuntimeCapabilities, TypedJsonError,
-    decode_protocol_bootstrap_response_v1, decode_protocol_hello_v1,
-    encode_protocol_bootstrap_response_v1, encode_protocol_hello_v1,
+    CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
+    ProtocolBootstrapRouter, ProtocolRejectReason, ProtocolVersion, RuntimeCapabilities,
+    RuntimeCapability, RuntimeRequestKind, TypedJsonError, decode_protocol_bootstrap_response_v1,
+    decode_protocol_hello_v1, encode_protocol_bootstrap_response_v1, encode_protocol_hello_v1,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -150,10 +150,78 @@ fn run_active_vector(vector: &PublicVector) {
     match vector.target.as_str() {
         "ProtocolHello" => run_protocol_hello(vector),
         "ProtocolBootstrapResponse" => run_bootstrap_response(vector),
+        "CommandRequest" => run_request(vector, RuntimeRequestKind::Dispatch),
+        "RuntimeQuery" => run_request(vector, RuntimeRequestKind::Query),
+        "SnapshotRequest" => run_request(vector, RuntimeRequestKind::Snapshot),
+        "SubscriptionRequest" => run_request(vector, RuntimeRequestKind::Subscribe),
+        "QueryResponse" => run_query_response(vector),
+        "RuntimeDispatchError" => run_runtime_dispatch_error(vector),
         "CanonicalFileUriVectorSet" => run_file_uri_vectors(vector),
         "ProtocolNegotiationCaseSet" => run_negotiation_vectors(vector),
         target => panic!("active manifest target has no Rust handler: {target}"),
     }
+}
+
+fn run_request(vector: &PublicVector, kind: RuntimeRequestKind) {
+    assert_eq!(vector.direction, VectorDirection::ClientToRuntime);
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    match vector.expected.decode.as_str() {
+        "accepted" => {
+            let request = protocol.decode_request(kind, &raw).unwrap();
+            assert_eq!(
+                protocol.encode_request(&request).unwrap(),
+                canonical_target(vector, &raw),
+                "{}",
+                vector.path,
+            );
+        }
+        "rejected" => {
+            let error = protocol.decode_request(kind, &raw).unwrap_err();
+            assert_manifest_fault(vector, error);
+        }
+        decode => panic!("unsupported request expectation {decode}"),
+    }
+}
+
+fn run_query_response(vector: &PublicVector) {
+    assert_eq!(vector.direction, VectorDirection::RuntimeToClient);
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    match vector.expected.decode.as_str() {
+        "accepted" => {
+            let response = protocol.decode_query_response(&raw).unwrap();
+            assert_eq!(
+                protocol.encode_query_response(&response).unwrap(),
+                canonical_target(vector, &raw),
+                "{}",
+                vector.path,
+            );
+        }
+        "protocol_error" => {
+            assert_eq!(
+                vector.expected.runtime_encoder.as_deref(),
+                Some("must_not_send")
+            );
+            let error = protocol.decode_query_response(&raw).unwrap_err();
+            assert_manifest_fault(vector, error);
+        }
+        decode => panic!("unsupported QueryResponse expectation {decode}"),
+    }
+}
+
+fn run_runtime_dispatch_error(vector: &PublicVector) {
+    assert_eq!(vector.direction, VectorDirection::RuntimeToClient);
+    assert_eq!(vector.expected.decode, "accepted");
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let error = protocol.decode_runtime_dispatch_error(&raw).unwrap();
+    assert_eq!(
+        protocol.encode_runtime_dispatch_error(error).unwrap(),
+        canonical_target(vector, &raw),
+        "{}",
+        vector.path,
+    );
 }
 
 fn run_protocol_hello(vector: &PublicVector) {
@@ -225,14 +293,15 @@ fn run_negotiation_vectors(vector: &PublicVector) {
     );
     let vectors: NegotiationVectors = read_json(&fixture_root().join("public").join(&vector.path));
     assert_eq!(vectors.runtime_supported_versions, [ProtocolVersion::V1_0]);
-    let capabilities = RuntimeCapabilities::for_v1(
+    let capabilities = RuntimeCapabilities::all_v1();
+    assert_eq!(
         vectors
             .runtime_capabilities
             .iter()
-            .map(|value| value.parse().unwrap())
-            .collect(),
-    )
-    .unwrap();
+            .map(|value| runtime_capability(value))
+            .collect::<Vec<_>>(),
+        capabilities.values(),
+    );
     let router = ProtocolBootstrapRouter::new("minicore-runtime", "0.1.0", capabilities).unwrap();
 
     for case in vectors.cases {
@@ -254,13 +323,12 @@ fn run_negotiation_vectors(vector: &PublicVector) {
                     case.expected_selected_version
                 );
                 assert_eq!(
-                    welcome
-                        .capabilities()
-                        .values()
+                    welcome.capabilities().values().to_vec(),
+                    case.expected_capabilities
+                        .unwrap()
                         .iter()
-                        .map(ToString::to_string)
+                        .map(|value| runtime_capability(value))
                         .collect::<Vec<_>>(),
-                    case.expected_capabilities.unwrap(),
                 );
                 assert!(case.expected_reject_reason.is_none());
             }
@@ -276,6 +344,20 @@ fn run_negotiation_vectors(vector: &PublicVector) {
                 );
             }
         }
+    }
+}
+
+fn runtime_capability(value: &str) -> RuntimeCapability {
+    match value {
+        "state_events" => RuntimeCapability::StateEvents,
+        "progress_events" => RuntimeCapability::ProgressEvents,
+        "runtime_snapshot" => RuntimeCapability::RuntimeSnapshot,
+        "session_snapshot" => RuntimeCapability::SessionSnapshot,
+        "paged_queries" => RuntimeCapability::PagedQueries,
+        "command_catalog" => RuntimeCapability::CommandCatalog,
+        "interaction_resolution" => RuntimeCapability::InteractionResolution,
+        "session_fork" => RuntimeCapability::SessionFork,
+        capability => panic!("unknown fixture runtime capability {capability}"),
     }
 }
 

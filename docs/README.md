@@ -26,7 +26,7 @@ architecture.md + modules/
 
 ## 当前状态
 
-Rust crate的M1 Wire foundation与owner semantic spine已经进入`dev`：ProtocolLimits/counters、bounded dynamic JSON、bounded JSON Schema、typed bootstrap codec，以及Prompt/Tools/Model/Turn/Interaction semantic values与Compaction stored-provenance/stable-kind leaves均已实现并通过Fast、MSRV与heavy gates。M2正在实施，Protocol V1 bootstrap router与incremental public manifest gate已完成；outer Runtime routes、完整public/storage codec、LiveConversation、SessionRecorder、SessionExecutor、ActiveTurnTask和provider行为尚未实现。
+Rust crate的M1 Wire foundation与owner semantic spine已经进入`dev`：ProtocolLimits/counters、bounded dynamic JSON、bounded JSON Schema、typed bootstrap codec，以及Prompt/Tools/Model/Turn/Interaction semantic values与Compaction stored-provenance/stable-kind leaves均已实现并通过Fast、MSRV与heavy gates。M2正在实施，Protocol V1 bootstrap router、incremental public manifest gate和initial typed Wire roots已完成；M7 Session/Turn DTO、behavioral Runtime facade、完整public/storage codec、LiveConversation、SessionRecorder、SessionExecutor、ActiveTurnTask和provider行为尚未实现。
 
 开发计划M0与M1已经完成，M2进行中；后续主要门禁：
 

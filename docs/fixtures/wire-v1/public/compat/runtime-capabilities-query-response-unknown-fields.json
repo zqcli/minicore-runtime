@@ -1,0 +1,1 @@
+{"data":{"type":"runtime","data":{"type":"capabilities","data":{"values":["state_events","progress_events","runtime_snapshot","session_snapshot","paged_queries","command_catalog","interaction_resolution","session_fork"],"futureLeaf":true},"futureResult":0},"futureFamily":0},"futureEnvelope":0}
