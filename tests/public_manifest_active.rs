@@ -3,7 +3,8 @@ use std::str::FromStr;
 
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
-    PublicCancelTarget, RuntimeCommand, RuntimeRequest, SessionCommand, TurnCommand,
+    CommandCompletion, CommandErrorCode, CommandOutcome, PublicCancelTarget, PublicSubject,
+    RetryAdvice, RuntimeCommand, RuntimeRequest, SessionCommand, TurnCommand,
 };
 use minicore_runtime::wire::{
     CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
@@ -155,6 +156,7 @@ fn run_active_vector(vector: &PublicVector) {
         "ProtocolHello" => run_protocol_hello(vector),
         "ProtocolBootstrapResponse" => run_bootstrap_response(vector),
         "CommandRequest" => run_request(vector, RuntimeRequestKind::Dispatch),
+        "CommandResponse" => run_command_response(vector),
         "RuntimeQuery" => run_request(vector, RuntimeRequestKind::Query),
         "SnapshotRequest" => run_request(vector, RuntimeRequestKind::Snapshot),
         "SubscriptionRequest" => run_request(vector, RuntimeRequestKind::Subscribe),
@@ -163,6 +165,67 @@ fn run_active_vector(vector: &PublicVector) {
         "CanonicalFileUriVectorSet" => run_file_uri_vectors(vector),
         "ProtocolNegotiationCaseSet" => run_negotiation_vectors(vector),
         target => panic!("active manifest target has no Rust handler: {target}"),
+    }
+}
+
+fn run_command_response(vector: &PublicVector) {
+    assert_eq!(vector.direction, VectorDirection::RuntimeToClient);
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    match vector.expected.decode.as_str() {
+        "accepted" => {
+            let response = protocol.decode_command_response(&raw).unwrap();
+            assert_command_response_semantics(vector, &response);
+            assert_eq!(
+                protocol.encode_command_response(&response).unwrap(),
+                canonical_target(vector, &raw),
+                "{}",
+                vector.path,
+            );
+        }
+        "protocol_error" => {
+            assert_eq!(
+                vector.expected.runtime_encoder.as_deref(),
+                Some("must_not_send")
+            );
+            let error = protocol.decode_command_response(&raw).unwrap_err();
+            assert_manifest_fault(vector, error);
+        }
+        decode => panic!("unsupported CommandResponse expectation {decode}"),
+    }
+}
+
+fn assert_command_response_semantics(
+    vector: &PublicVector,
+    response: &minicore_runtime::runtime_interface::CommandResponse,
+) {
+    match (vector.expected.assert.as_deref(), response.completion()) {
+        (
+            Some("turn_started_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::TurnStarted { turn_id },
+                output: None,
+            },
+        ) => {
+            assert_eq!(turn_id.to_string(), "trn_33333333333333333333333333333333");
+        }
+        (Some("session_busy_rejection"), CommandCompletion::Rejected(error)) => {
+            assert_eq!(error.code(), CommandErrorCode::SessionBusy);
+            assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
+            assert!(matches!(error.subject(), Some(PublicSubject::Session(_))));
+        }
+        (
+            Some("command_output_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::CommandOutput,
+                output: Some(output),
+            },
+        ) => {
+            assert_eq!(output.text(), "status ok");
+        }
+        (assertion, completion) => {
+            panic!("response assertion {assertion:?} does not match {completion:?}")
+        }
     }
 }
 
