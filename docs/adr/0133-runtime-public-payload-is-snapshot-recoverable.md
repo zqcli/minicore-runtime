@@ -1,9 +1,11 @@
 # ADR 0133：Runtime Public Payload必须可从Snapshot恢复并安全操作
 
-状态：Accepted
+状态：Partially Superseded by ADR 0135
 日期：2026-07-31
 
 > [ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)冻结本ADR后置的public JSON v1、typed scalar carriers、ProtocolLimits、bounded JSON与conversation JSONL scanner基础；各semantic payload owner保持不变，Stored DTO/format projection继续由对应module同步。
+
+> [ADR 0135](0135-workspace-public-input-is-host-neutral.md)把本ADR示例中的Workspace public root从durable `WorkspaceRootSpec { path: PathBuf }`细化为Workspace-owned `WorkspaceRootInput { path: CanonicalFileUri }`；JSON V1 shape不变，checked native-path lowering发生在typed command admission之后。
 
 ## 背景
 

@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
 日期：2026-07-31
 
 ## 目的
@@ -139,14 +139,46 @@ pub struct Workspace {
 }
 ```
 
-它表达 Session **请求使用什么目录和 source**，不直接授予权限。
+durable `Workspace`表达Session已经按创建host验证并保存的native目录请求，不直接授予权限。public Create/Update命令先使用host-neutral input：
+
+```rust
+pub struct WorkspaceDefinitionInput {
+    primary_root: WorkspaceRootInput,
+    additional_roots: Vec<WorkspaceRootInput>,
+    cwd: WorkspaceCwdSpec,
+}
+
+pub struct WorkspaceRootInput {
+    key: WorkspaceRootKey,
+    path: CanonicalFileUri,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+pub enum WorkspaceInputError {
+    TooManyRoots,
+    DuplicateRootKey,
+    DuplicateRootUri,
+    UnknownCwdRoot,
+}
+```
+
+`WorkspaceRootInput::new(...)`与`WorkspaceDefinitionInput::new(primary, additional, cwd, selected_limits)`是公开validated constructors，fields只通过read-only accessors暴露。`CanonicalFileUri`是Wire-owned shared typed carrier；两个input type仍由Workspace owner构造并验证。它们不是Wire shadow DTO，也不进入durable SessionDefinition。aggregate constructor验证root count、duplicate key、duplicate canonical URI和cwd root引用；不访问filesystem。constructor失败时typed `RuntimeCommand`尚未形成，属于input decode/validation failure；它不产生`CommandCompletion::Rejected`。
+
+checked command application把input lowering为durable spec：
 
 ```rust
 pub struct WorkspaceRootSpec {
-    pub key: WorkspaceRootKey,
-    pub path: PathBuf,
-    pub requested_access: RequestedFilesystemAccess,
-    pub sources: WorkspaceSourcePolicy,
+    key: WorkspaceRootKey,
+    path: PathBuf,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+pub enum WorkspaceInputLoweringError {
+    UnsupportedHostFamily,
+    NativePathNotLossless,
+    InvalidNativePath,
 }
 
 pub enum RequestedFilesystemAccess {
@@ -166,17 +198,37 @@ cwd 使用 root-relative 表达，避免使用进程 ambient cwd：
 
 ```rust
 pub struct WorkspaceCwdSpec {
-    pub root: WorkspaceRootKey,
-    pub relative_path: WorkspaceRelativePath,
+    root: WorkspaceRootKey,
+    relative_path: WorkspaceRelativePath,
 }
 ```
 
-`WorkspaceRootSpec.path`的public wire使用[Wire Schema platform-independent canonical RFC 8089 file URI](wire-schema.md#workspace-paths)。adapter先decode为family-tagged CanonicalFileUri，再由Workspace checked-convert为current-host PathBuf；不允许直接调用ambient platform URI/path parser决定wire canonicality。v1只接受lossless UTF-8 native path；family不受host支持时typed reject。`WorkspaceRelativePath` wire使用同节的forward-slash carrier。wire lexical validation不替代以下Workspace semantic约束：
+`WorkspaceCwdSpec::new(...)`与read-only accessors公开；`WorkspaceRootSpec`只允许Workspace lowering与trusted native helper在crate内构造，public caller不能绕过host-family checks直接写`PathBuf` fields。
+
+`WorkspaceRootInput.path`的public wire使用[Wire Schema platform-independent canonical RFC 8089 file URI](wire-schema.md#workspace-paths)。Wire先decode为family-tagged `CanonicalFileUri`并形成typed command；Workspace随后在Create/Update candidate validation中checked-convert为current-host `PathBuf`，生成private-construction `WorkspaceRootSpec`。不允许直接调用ambient platform URI/path parser决定wire canonicality。v1只接受lossless UTF-8 native path；family不受host支持时command完成为`InvalidArgument + DoNotRetry`，不是wire decode failure。`WorkspaceRelativePath` wire使用同节的forward-slash carrier；其Workspace semantic约束为：
 
 - 不是绝对路径；
 - 不含平台 path prefix；
 - 规范化后不含 `..` 逃逸；
 - 空路径表示 root 本身。
+
+checked lowering使用crate-private trusted target，不接受public caller选择：
+
+```rust
+pub(crate) enum WorkspacePathTarget {
+    Posix,   // Linux/macOS
+    Windows,
+}
+```
+
+normative matrix：
+
+| WorkspacePathTarget | POSIX URI family | drive URI family | UNC URI family |
+| --- | --- | --- | --- |
+| Posix | lower成功 | UnsupportedHostFamily | UnsupportedHostFamily |
+| Windows | UnsupportedHostFamily | lower成功 | lower成功 |
+
+测试矩阵分层固定为：M2在每个host上对POSIX/drive/UNC canonical bytes执行相同`WorkspaceRootInput` decode/re-encode；M7使用显式`WorkspacePathTarget`测试上表，不能依赖运行测试的ambient OS来改变Wire vector validity。Windows drive letter与UNC authority/path按Wire carrier已解码parts构造native path；POSIX target只接收absolute POSIX parts。
 
 默认 Workspace 可以通过 helper 创建：
 
@@ -836,6 +888,22 @@ pub enum SessionWorkspaceState {
 
 ### 创建与加载
 
+Create/Update在任何durable publication前分两阶段执行：
+
+```text
+public bytes / in-process fields
+→ CanonicalFileUri与Workspace host-neutral aggregate validation
+→ typed WorkspaceDefinitionInput / RuntimeCommand形成
+→ command进入Runtime completion owner
+→ Workspace checked host-family lowering
+→ WorkspaceRootSpec { path: PathBuf } + WorkspaceCwdSpec
+→ owner分配WorkspaceRevision并形成durable Workspace candidate
+```
+
+host-neutral constructor失败时command尚未形成。admission后的unsupported host family或无法lossless转换的native path返回`InvalidArgument + DoNotRetry`；此时没有Session/definition/Header staging。filesystem existence、symlink/junction canonicalization、trust与source authorization仍由后续resolve负责。
+
+Create完成lowering或加载已有durable definition后，resolve流程为：
+
 ```text
 创建或加载 Session
 → capture exact SessionDefinitionRevision / WorkspaceRevision
@@ -865,7 +933,8 @@ Workspace unavailable 时：
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision
-+ WorkspaceDefinitionInput（不含WorkspaceRevision）
++ WorkspaceDefinitionInput（CanonicalFileUri roots，不含WorkspaceRevision）
+→ Workspace host-neutral validation与checked host-family lowering
 → loaded Session要求SessionExecutionState = Idle；否则SessionBusy
 → 在per-session lifecycle serialization内构造并resolve Workspace candidate
 → PromptService/SkillService捕获candidate授权的Workspace-bound sources
@@ -1281,7 +1350,7 @@ upload / telemetry
 - [x] 将 WorkspaceSnapshot 纳入 TurnExecutionContext capture DAG，并固定字段私有。
 - [x] 定义同根多 Session 的隔离语义。
 - [x] 按ADR 0123删除Workspace及view命名指纹；执行一致性由不可变Snapshot、私有投影和显式reload/re-resolve保证。
-- [ ] 定义跨平台 path 类型和 authority adapters 的最终字段。
+- [x] 区分host-neutral `WorkspaceRootInput { path: CanonicalFileUri }`与durable `WorkspaceRootSpec { path: PathBuf }`，冻结typed command admission后的checked host-family lowering seam（ADR 0135）；各平台authority adapter最终字段留到M7实现。
 - [x] 冻结Idle-only public update payload：只CAS SessionDefinitionRevision，WorkspaceDefinitionInput不携带WorkspaceRevision（ADR 0133）。
 - [x] 冻结WorkspaceUnavailable → SessionNotReady/UserActionRequired公开映射；
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义；

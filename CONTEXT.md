@@ -1,6 +1,6 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环；ADR 0134、exact Conversation JSONL v1与conformance vectors冻结bounded public/storage wire。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环；ADR 0134、exact Conversation JSONL v1与conformance vectors冻结bounded public/storage wire；ADR 0135区分host-neutral Workspace public input与durable native Workspace root。
 
 权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -205,6 +205,12 @@ Item执行期间MiniCore发起的ToolApproval或UserQuestion。request先apply l
 
 **Workspace**：
 `SessionDefinition.workspace`中的Session-owned definition。没有WorkspaceId或Runtime-global registry。
+
+**WorkspaceRootInput**：
+public Create/Update命令中的host-neutral Workspace root intent，具体字段为`path: CanonicalFileUri`；它不是durable native path。typed command进入Runtime后由Workspace按current host checked-lower为`WorkspaceRootSpec { path: PathBuf }`；unsupported family是accepted command的InvalidArgument，不是wire decode failure。
+
+**WorkspaceRootSpec**：
+durable `Workspace`中的current-host native root definition。只能由Workspace checked lowering或trusted native constructor形成，不越过public input seam。
 
 **WorkspaceSnapshot**：
 Turn admission时resolve的immutable Workspace结果。active Turn不读取future Workspace definition。

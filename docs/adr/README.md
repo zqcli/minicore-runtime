@@ -16,8 +16,7 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0130](0130-user-message-composition-resolves-skills-asynchronously.md) | 用户消息异步解析captured Skill |
 | [0131](0131-conversation-recording-excludes-session-definition-and-lifecycle.md) | Conversation recording排除Session definition/lifecycle |
 | [0132](0132-compaction-derives-markers-from-live-stable-units.md) | Compaction从live stable units派生marker |
-| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | Runtime public payload可从Snapshot恢复并操作 |
-| [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | Public/storage wire使用bounded V1 schema |
+| [0135](0135-workspace-public-input-is-host-neutral.md) | Workspace public input在command application前保持host-neutral |
 
 ## Current With Later Refinements
 
@@ -43,6 +42,8 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132 |
 | [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134 |
 | [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132 |
+| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135 |
+| [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | ADR 0135 |
 
 ## Historical / Superseded
 

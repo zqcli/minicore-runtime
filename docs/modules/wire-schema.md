@@ -1,6 +1,6 @@
 # Wire Schema 与 Bounded Decode
 
-状态：当前权威架构（ADR 0134；Wire foundations、bootstrap router与initial incremental public roots已实现，完整public/storage manifest仍按M2–M11增量关闭）
+状态：当前权威架构（ADR 0134/0135；Wire foundations、bootstrap router与initial incremental public roots已实现，完整public/storage manifest仍按M2–M11增量关闭）
 日期：2026-07-31
 
 ## 目的
@@ -291,7 +291,7 @@ Wire：
 
 ### Workspace Paths
 
-Absolute Workspace input path编码platform-independent canonical RFC 8089 `file:` URI。wire decoder先生成private `CanonicalFileUri { family, authority: Option<String>, decoded_utf8_path }`，完成全部lexical validation后才由Workspace按host family checked-convert为`PathBuf`；在macOS解析Windows/UNC carrier不得改变wire bytes或借用host path parser猜语义。
+Absolute Workspace input path编码platform-independent canonical RFC 8089 `file:` URI。Wire decoder先生成fields private的shared typed carrier `CanonicalFileUri { family, authority: Option<String>, decoded_utf8_path }`，并把它交给Workspace-owned `WorkspaceRootInput`形成host-neutral typed command。只有command进入Runtime completion owner后，Workspace才按host family checked-convert为durable `WorkspaceRootSpec { path: PathBuf }`；在macOS接收Windows/UNC carrier仍必须完成typed decode且不得改变wire bytes或借用host path parser猜语义。unsupported host family在Workspace command application阶段返回`InvalidArgument + DoNotRetry`，不是`TypedJsonError`或outer `RuntimeDispatchError`。
 
 Canonical examples：
 
@@ -319,7 +319,7 @@ Family规则：
 - drive：`authority = None`，URI path exact `/[A-Z]:/segment...`，decoded path去掉URI-specific leading slash后为`C:/segment...`；drive letter uppercase，colon literal；drive root exact `file:///C:/`；
 - UNC：`authority = Some(lowercase_host)`；authority是total<=253 bytes的一到多个lowercase ASCII labels；labels以`.`分隔，每label 1..63 bytes，单字符label为`[a-z0-9]`，多字符label首尾为`[a-z0-9]`且中间只允许`[a-z0-9-]`；authority不能是`localhost`；decoded path不含leading slash且至少含non-empty share segment；share/segment case preserve；share root无trailing slash。
 
-Decoder只接受上述canonical spelling，不自动lowercase host/drive、不移除dot segment、不decode platform alias。Workspace在lexical decode后若family不被current host支持，返回typed invalid/unavailable workspace input，而不是把URI交给ambient `PathBuf` parser重解释。exact cross-platform vectors见[Wire V1 file URI carriers](../fixtures/wire-v1/public/carriers/file-uri.json)。
+Decoder只接受上述canonical spelling，不自动lowercase host/drive、不移除dot segment、不decode platform alias，并在所有host上接受全部canonical family进入`WorkspaceRootInput`。Workspace在typed command application时若family不被current host支持，返回`InvalidArgument + DoNotRetry`，而不是把URI交给ambient `PathBuf` parser重解释。exact cross-platform vectors见[Wire V1 file URI carriers](../fixtures/wire-v1/public/carriers/file-uri.json)。
 
 WorkspaceRelativePath使用forward slash：
 

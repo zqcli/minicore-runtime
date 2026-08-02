@@ -1,7 +1,9 @@
 # ADR 0134：Public Protocol与Conversation Recording使用Bounded V1 Wire Schema
 
-状态：Accepted
+状态：Partially Superseded by ADR 0135
 日期：2026-07-31
+
+> [ADR 0135](0135-workspace-public-input-is-host-neutral.md)澄清第8条：`CanonicalFileUri`可以作为shared typed carrier嵌入Workspace-owned public input；unsupported host family属于typed command application failure，不是wire lexical failure。
 
 ## 背景
 

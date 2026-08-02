@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
 日期：2026-07-31
 
 ## 目的
@@ -735,7 +735,8 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 ## Create Session
 
 ```text
-验证Workspace / Model / SessionPromptSelection candidate
+验证host-neutral WorkspaceDefinitionInput / Model / SessionPromptSelection candidate
+→ Workspace checked host-family lowering为durable WorkspaceRootSpec { path: PathBuf }
 → 获取Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在同一synchronization内读取current AgentRevisionRef
@@ -751,6 +752,8 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 
 create 的 baseline 结果是 `Open + Unloaded`，不创建SessionExecutor或SessionRecorder。SessionHeader staging失败时Create失败且target不进入Session catalog；create-and-load是上层组合，不改变create的durable语义。
 
+`WorkspaceDefinitionInput`保存`CanonicalFileUri` carrier而非native path。URI lexical-invalid时请求不能进入Runtime；canonical URI family不受current host支持时请求已经是typed command，由Workspace lowering返回`InvalidArgument + DoNotRetry`，且不得获取Agent synchronization、分配revision或开始Session/Header staging。
+
 create使用预分配SessionId和外层`CommandId`。outcome unknown时必须查询已发布target，不能创建重复Session。
 
 ## Update Session Definition
@@ -762,7 +765,9 @@ create使用预分配SessionId和外层`CommandId`。outcome unknown时必须查
 ```text
 expected SessionLifecycle = Open
 + expected SessionDefinitionRevision
-+ complete candidate definition
++ SessionDefinitionPatch（optional WorkspaceDefinitionInput仍为CanonicalFileUri roots）
+→ 若含Workspace input，先checked host-family lowering为WorkspaceRootSpec { path: PathBuf }
+→ lowering成功后形成complete candidate definition
 → 在per-session lifecycle synchronization内validate / CAS
 → publish revision N+1
 ```
