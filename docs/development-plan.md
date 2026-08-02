@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0与M1已完成，M2进行中
+状态：Active；M0、M1、M2 minimal Snapshot/Event与M3.1已完成；M3.2为下一任务
 
 初始实现基线：`dev` at `144039a`
 
@@ -54,7 +54,7 @@ M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 当前不能视为已完成：
 
 - M2 public protocol route/DTO families与完整manifest closure；
-- Conversation JSONL line codec、scanner与semantic replay；
+- physical bounded JSONL scanner，以及M5 semantic replay/corruption sidecars；
 - `ConversationRevision`、`ModelMessage`和LiveConversation reducer，包括M4的`LiveCompactionSourceView` aggregate；
 - SessionRecorder、SessionExecutor、ActiveTurnTask和ScriptedProvider vertical slice；
 - production provider与sandbox adapter。
@@ -278,6 +278,8 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 
 ### M3.1 Exact Header/Entry codec
 
+状态：Completed。已实现strict Header、六种flat body的exact per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap，并在owner/writer invariants下完成全部conversation golden的byte-exact round-trip。
+
 实现：
 
 - strict `SessionHeader`；
@@ -286,10 +288,14 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 - exact field/tag/null order；
 - Tool outcome truth matrix与Compaction model-call projection；
 - Header/session/catalog identity validation。
+- bounded duplicate-aware preflight与raw ToolCall `arguments` cap；
+- owner/writer invariants。
 
-退出条件：全部conversation golden complete line可byte-exact round-trip；跨行selected path、sanitized messages和relation assertions留给M5 semantic replay。
+退出条件：全部conversation golden complete line已通过byte-exact round-trip；跨行selected path、sanitized messages和relation assertions及corruption sidecars仍留给M5 semantic replay。
 
 ### M3.2 Physical scanner
+
+状态：Next。
 
 实现：
 
@@ -336,6 +342,8 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 建议提交：`feat: add live conversation reducer`、`feat: expose compaction stable units`。
 
 ## M5 · Durable Foundations、Recording与Replay
+
+状态：Pending。M5.0 durable foundations gate、SessionRecorder、semantic replay与corruption sidecars均未实现。
 
 ### M5.0 Entity store与async test seam gate
 
@@ -650,11 +658,11 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 ## 后续实施顺序
 
-M0与M1已完成，M2已开始且bootstrap routing与incremental manifest gate已经落地。继续按下列顺序执行，不提前进入Session执行：
+M0与M1已完成；M2 minimal Snapshot/Event已落地，M3.1 exact Conversation Header/Entry per-line codec已完成。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M3.1` exact Conversation Header/Entry codec并直接消费golden fixtures；
-2. `M3.2` bounded physical JSONL scanner；
-3. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`；
+1. `M3.2` bounded physical JSONL scanner；
+2. `M4` Prompt-owned canonical `ModelMessage`、LiveConversation reducer、`ConversationRevision`与stable-unit `LiveCompactionSourceView`；
+3. `M5.0` durable foundations gate，随后实现SessionRecorder、semantic replay与corruption sidecars；
 4. M8–M10随owning behavior补齐non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
 
 在M2–M6 prerequisites关闭前不得进入M7 ordinary behavior slice；production Provider与Tool/Sandbox继续分别受V4-P1-3和V4-C0-1门禁约束。

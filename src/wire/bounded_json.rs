@@ -133,6 +133,18 @@ impl JsonParseLimits {
         }
     }
 
+    pub(super) const fn conversation(max_encoded_bytes: usize) -> Self {
+        Self {
+            max_encoded_bytes: WireLimit::new(max_encoded_bytes),
+            max_depth: WireLimit::new(64),
+            max_array_items: WireLimit::new(4_096),
+            max_object_members: WireLimit::new(256),
+            max_string_bytes: WireLimit::new(524_288),
+            max_nodes: Some(WireLimit::new(16_384)),
+            canonicalize_numbers: false,
+        }
+    }
+
     pub(super) fn schema() -> Self {
         let limits = ProtocolLimits::v1_0().embedded_json.schema;
         Self {

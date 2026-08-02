@@ -386,6 +386,10 @@ impl CanonicalUserMessage {
     pub fn contribution_stamps(&self) -> &[PromptContributionStamp] {
         &self.contribution_stamps
     }
+
+    pub(crate) fn validate_for_wire(&self) -> Result<(), PromptValueError> {
+        validate_contribution_stamps(&self.message, &self.contribution_stamps, true)
+    }
 }
 
 fn validate_contribution_stamps(
