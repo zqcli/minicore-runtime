@@ -325,7 +325,7 @@ WorkspaceRelativePath使用forward slash：
 
 - empty string表示root；
 - 最多4096 UTF-8 bytes、256 segments；
-- 禁止leading/trailing slash、backslash、NUL、empty segment、`.`、`..`、drive/UNC/platform prefix；
+- 禁止leading/trailing slash、backslash、全部C0/C1 control、empty segment、`.`、`..`、drive/UNC/platform prefix；
 - wire lexical validation不替代Workspace containment/canonicalization。
 
 ## Bounded JSON与Schema

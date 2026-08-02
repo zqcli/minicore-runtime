@@ -8,7 +8,7 @@ python3 docs/fixtures/wire-v1/verify.py
 
 ## Harness Contract
 
-- `public/valid/*.json`：必须通过duplicate-key-aware、bounded、selected-version `1.0` decoder；decode后re-encode必须byte-for-byte等于原文件去除最后一个LF后的bytes。
+- `public/valid/*.json`：必须通过duplicate-key-aware、bounded、selected-version `1.0` decoder。canonical vector的decode/re-encode必须byte-for-byte等于原文件去除最后一个LF后的bytes；V1明确接受的noncanonical representation（例如known Option field missing）必须在manifest声明`canonicalReencodePath`，encoder输出该canonical target。
 - `public/invalid/input/*.json`：必须在domain dispatch前拒绝；filename给出首要拒绝原因。
 - `public/invalid/output/*.json`：模拟收到非法Runtime frame时必须报protocol error；Runtime encoder/preflight也不得发送这些bytes。
 - `public/compat/*.json`：防御性forward-tolerance输入；按`public/manifest.json`删除ignored pointers后必须canonical re-encode到指定v1 target，Runtime v1 sender仍不得主动发送future field。

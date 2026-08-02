@@ -3,10 +3,12 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::prompt::PromptIntent;
+use crate::agent_session_lifecycle::SessionModelConfig;
+use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
-use crate::wire::lexical::validate_safe_text;
+use crate::wire::lexical::{normalize_newlines, validate_safe_text};
 use crate::wire::{AgentId, CommandId, ItemId, ProtocolLimits, RequestId, SessionId, TurnId};
+use crate::workspace::WorkspaceDefinitionInput;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
@@ -91,6 +93,139 @@ pub enum RuntimeLifecycleCommand {
 pub type PromptIntentInput = PromptIntent;
 
 #[derive(Clone, Eq, PartialEq)]
+pub struct NewSessionDefinition {
+    workspace: WorkspaceDefinitionInput,
+    model: SessionModelConfig,
+    prompts: SessionPromptSelection,
+}
+
+impl NewSessionDefinition {
+    pub const fn new(
+        workspace: WorkspaceDefinitionInput,
+        model: SessionModelConfig,
+        prompts: SessionPromptSelection,
+    ) -> Self {
+        Self {
+            workspace,
+            model,
+            prompts,
+        }
+    }
+
+    pub const fn workspace(&self) -> &WorkspaceDefinitionInput {
+        &self.workspace
+    }
+
+    pub const fn model(&self) -> &SessionModelConfig {
+        &self.model
+    }
+
+    pub const fn prompts(&self) -> &SessionPromptSelection {
+        &self.prompts
+    }
+}
+
+impl fmt::Debug for NewSessionDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewSessionDefinition")
+            .field("workspace", &self.workspace)
+            .field("model", &self.model)
+            .field("prompts", &self.prompts)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum NewSessionMetadataError {
+    #[error("session name must be non-empty")]
+    EmptyName,
+    #[error("session metadata exceeds its selected text limit")]
+    TextTooLong,
+    #[error("session metadata contains an unsafe control character")]
+    UnsafeText,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct NewSessionMetadata {
+    name: Option<Box<str>>,
+    description: Option<Box<str>>,
+}
+
+impl NewSessionMetadata {
+    pub fn new<N, D>(
+        name: Option<N>,
+        description: Option<D>,
+    ) -> Result<Self, NewSessionMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        Self::new_with_limits(name, description, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn new_with_limits<N, D>(
+        name: Option<N>,
+        description: Option<D>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, NewSessionMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        let name =
+            normalize_metadata_text(name, usize::from(limits.text.max_display_name_bytes), true)?;
+        let description = normalize_metadata_text(
+            description,
+            usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
+            false,
+        )?;
+        Ok(Self { name, description })
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+impl fmt::Debug for NewSessionMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewSessionMetadata")
+            .field("name_present", &self.name.is_some())
+            .field("description_present", &self.description.is_some())
+            .finish()
+    }
+}
+
+fn normalize_metadata_text<T>(
+    value: Option<T>,
+    maximum: usize,
+    require_non_empty: bool,
+) -> Result<Option<Box<str>>, NewSessionMetadataError>
+where
+    T: AsRef<str>,
+{
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let normalized = normalize_newlines(value.as_ref());
+    if require_non_empty && normalized.is_empty() {
+        return Err(NewSessionMetadataError::EmptyName);
+    }
+    if normalized.len() > maximum {
+        return Err(NewSessionMetadataError::TextTooLong);
+    }
+    validate_safe_text(&normalized, maximum, !require_non_empty)
+        .map_err(|_| NewSessionMetadataError::UnsafeText)?;
+    Ok(Some(normalized.into()))
+}
+
+#[derive(Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeCommand {
     Runtime(RuntimeLifecycleCommand),
@@ -108,11 +243,20 @@ impl fmt::Debug for RuntimeCommand {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SessionCommand {
-    Load { session_id: SessionId },
-    Unload { session_id: SessionId },
+    Create {
+        agent_id: AgentId,
+        definition: Box<NewSessionDefinition>,
+        metadata: NewSessionMetadata,
+    },
+    Load {
+        session_id: SessionId,
+    },
+    Unload {
+        session_id: SessionId,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]

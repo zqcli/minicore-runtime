@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::skills::SkillId;
-use crate::wire::lexical::{normalize_newlines, validate_safe_text};
+use crate::wire::lexical::{
+    LexicalError, normalize_newlines, validate_safe_text, validate_stable_symbolic_key,
+};
 use crate::wire::{ProtocolLimits, WorkspaceRelativePath};
 use crate::workspace::WorkspaceRootKey;
 
@@ -25,6 +28,90 @@ pub enum PromptValueError {
     InvalidPartCount,
     #[error("prompt contribution stamp is invalid")]
     InvalidContributionStamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum PromptIdError {
+    #[error("prompt id must be 1..=128 bytes")]
+    InvalidLength,
+    #[error("prompt id violates the stable symbolic key grammar")]
+    InvalidGrammar,
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PromptId(Box<str>);
+
+impl PromptId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for PromptId {
+    type Err = PromptIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        validate_stable_symbolic_key(value, 128, false).map_err(|error| match error {
+            LexicalError::Empty | LexicalError::TooLong => PromptIdError::InvalidLength,
+            LexicalError::InvalidGrammar | LexicalError::UnsafeText => {
+                PromptIdError::InvalidGrammar
+            }
+        })?;
+        Ok(Self(value.into()))
+    }
+}
+
+impl fmt::Display for PromptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for PromptId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SessionPromptSelectionError {
+    #[error("session prompt selection has too many entries")]
+    TooManyPrompts,
+    #[error("session prompt selection contains a duplicate prompt")]
+    DuplicatePrompt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionPromptSelection {
+    enabled: BTreeSet<PromptId>,
+}
+
+impl SessionPromptSelection {
+    pub fn new(enabled: Vec<PromptId>) -> Result<Self, SessionPromptSelectionError> {
+        Self::new_with_maximum(
+            enabled,
+            usize::try_from(ProtocolLimits::v1_0().transport.max_array_items).unwrap_or(usize::MAX),
+        )
+    }
+
+    pub(crate) fn new_with_maximum(
+        enabled: Vec<PromptId>,
+        maximum: usize,
+    ) -> Result<Self, SessionPromptSelectionError> {
+        if enabled.len() > maximum {
+            return Err(SessionPromptSelectionError::TooManyPrompts);
+        }
+        let original_len = enabled.len();
+        let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
+        if enabled.len() != original_len {
+            return Err(SessionPromptSelectionError::DuplicatePrompt);
+        }
+        Ok(Self { enabled })
+    }
+
+    pub fn enabled(&self) -> &BTreeSet<PromptId> {
+        &self.enabled
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -514,17 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_stamp_requires_a_model_safe_relative_location() {
-        let unsafe_path = WorkspaceRelativePath::from_str("src/\u{001b}[31m").unwrap();
-        assert!(matches!(
-            PromptContributionStamp::new(
-                0,
-                PromptContributionOrigin::Workspace {
-                    root_key: WorkspaceRootKey::from_str("repo").unwrap(),
-                    relative_location: unsafe_path,
-                },
-            ),
-            Err(PromptValueError::UnsafeText)
-        ));
+    fn workspace_relative_path_rejects_unsafe_location_before_prompt_stamping() {
+        assert!(WorkspaceRelativePath::from_str("src/\u{001b}[31m").is_err());
     }
 }
