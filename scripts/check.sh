@@ -9,6 +9,7 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --all-features --locked -- -D warnings
 python3 scripts/check_docs.py
 python3 docs/fixtures/wire-v1/verify.py
+python3 docs/fixtures/durable-store-v1/verify.py
 
 if ! command -v rg >/dev/null 2>&1; then
   echo "rg is required by the quality gate" >&2

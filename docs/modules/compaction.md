@@ -328,7 +328,7 @@ pub(crate) enum CompactionPressure {
 }
 ```
 
-pressure不读取current Runtime config、filesystem、SessionStorage或provider。
+pressure不读取current Runtime config、filesystem、Conversation Storage或provider。
 
 ### Plan Input
 

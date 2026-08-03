@@ -7,15 +7,17 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126已把执行模型重构为async Turn loop与inline best-effort recording；ADR 0127把JSONL收口为conversation transcript；ADR 0128/0129/0130冻结Prompt content与async contribution composition；ADR 0131冻结conversation-only owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1；M1 Wire foundation与owner semantic spine已完成，M2已开始并完成Protocol V1 bootstrap router、incremental manifest gate和initial typed Wire roots，后续实施见[开发计划](development-plan.md)。 |
+| V2 | 当前权威架构。ADR 0126–0135冻结async execution、conversation/wire与public payload基础；ADR 0136冻结DurableState/Store V1/root lease（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new），ADR 0137冻结Tokio owner-tracked foundation。M5.0 design gate已完成，foundation implementation待开始；后续实施见[开发计划](development-plan.md)。 |
 
-权威顺序：本文与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
+权威顺序：本文与`docs/modules/` → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
 ## 设计定位
 
 MiniCore采用Codex式执行结构：每个loaded Session有一个`SessionExecutor` control actor和最多一个`ActiveTurnTask`。ActiveTurnTask使用普通async loop顺序编排Model、Tool、Interaction、logical retry和Compaction；不再实现同步sans-I/O `AgentLoop`、`next_action()`或`RunningOperation` effect协议。
 
-Session的当前进程事实由`LiveSessionState`拥有。`SessionRecorder`只为稳定conversation facts inline await当前JSONL line的best-effort append；成功不表示flush或fsync，失败不回滚live state或重放外部操作。TurnStatus与terminal StateEvent只属于loaded execution。process crash后只恢复实际留下的conversation完整行前缀。
+`DurableState`是Agent/Session entity physical truth的private deep module：它以root lease、permanent reservations、immutable Store V1 generations、COMMITTED/PUBLISHED readback和single actor管理catalog；caller永不看到staging/path/generation/marker。新entity Create/Fork publication是complete-or-invisible；existing-head update则在reopen时是完整old generation或完整new generation。`CommandId`不持久化，Create/Fork response loss可能留下host未知但catalog-visible的generated ID，host需重新page/query且blind retry可能duplicate。
+
+Session的当前进程事实由`LiveSessionState`拥有。`SessionRecorder`只做ordered best-effort inline JSONL append；成功不表示flush或fsync，失败不回滚live state或重放外部操作。`ConversationStorage` owns the recorded tree, replay, and Fork semantic seed; `DurableState` owns the physical target, Fork sink, and publication; lifecycle/Runtime orchestrates them. TurnStatus与terminal StateEvent只属于loaded execution。process crash后只恢复实际留下的conversation完整行前缀。
 
 Rig只实现`ModelGateway` private `ProviderAdapter`的单次provider attempt。Model resolution、request validation、credential、response validation和provider-neutral terminal result仍由ModelGateway拥有；logical retry由ActiveTurnTask拥有。
 
@@ -214,8 +216,9 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 | INV-001 | live owner为recordable conversation fact在apply前分配稳定EntryId并绑定parent，apply后完成inline record attempt再publish/推进；TurnStatus只apply/publish live，Recorder不得创建identity或terminal | [Conversation Recording · Live Mutation](modules/conversation-storage.md#live-mutation-and-recording) |
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
-| INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
+| INV-004 | loaded Fork从同一LiveSnapshot解析anchor并 semantic-stream-re-encodes selected path；unloaded Fork使用RecordedHistory lease；child Header is new and only entry SessionId rebinds while historical IDs/body/order persist; source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
 | INV-005 | Compaction source由live reducer发布EntryId-bearing stable units；`has_same_stable_identity()`比较Session/revision/unit count/ordered unit identity，cut派生marker；M4以opaque CompactionReplacement关闭source/cut/marker/no-I/O reducer subset，M10才关闭exact control/plan/request、summary validation、recording与publication | [Compaction · M10 Live Replace与Recording](modules/compaction.md#m10-live-replace与recording) |
+| INV-006 | DurableState root lease下，新entity Create/Fork publication是complete-or-invisible，caller永不取得staging/path/generation/marker；existing-head update在reopen时只能是完整old或完整new generation。`PUBLISHED`是新entity唯一catalog root，marker ambiguity以exact readback决定Published或poison/Runtime close | [DurableState · CAS, generations and publication](modules/durable-state.md#cas-generations-and-publication) |
 | INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
 | INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
 | INV-103 | SessionSnapshot完整列出当前process所有public cancelable Submit admission、Steer和FollowUp CommandId；lane内FIFO，不公开queued intent正文，不从event/count重建 | [Runtime Interface · SessionSnapshot](modules/runtime-interface.md#sessionsnapshot) |
@@ -238,6 +241,9 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 - [Turn执行上下文](modules/turn-execution-context.md)：immutable capture和ConversationRevision basis。
 - [Turn / Item / Interaction](modules/turn-item-interaction.md)：live lifecycle、Tool exchange和Interaction。
 - [Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field/tag、limits和corruption behavior。
+- [Durable Store V1](formats/durable-store-v1.md)：exact local entity layout、generation/head bytes、markers、scanner/recovery precedence。
+- [Durable Store V1 Fixtures](fixtures/durable-store-v1/README.md)：head/definition golden、closed crash taxonomy与structural verifier。
+- [DurableState](modules/durable-state.md)：private store actor、reservation/lease/CAS/publication/recovery/fault seam。
 - [Conversation Recording与Replay](modules/conversation-storage.md)：JSONL recorder、recording health、tolerant replay和fork。
 - [Session执行](modules/session-execution.md)：control actor、ActiveTurnTask、async loop和queues。
 - [ModelGateway](modules/model-gateway.md)：single provider attempt和response taxonomy。
@@ -247,6 +253,8 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 
 核心当前决策：
 
+- [ADR 0137：Tokio owner-tracked async foundation与deterministic persistent seams](adr/0137-tokio-owner-tracked-async-foundation.md)
+- [ADR 0136：DurableState使用operation-owned immutable generations、permanent reservations与root lease](adr/0136-durablestate-operation-owned-generations.md)
 - [ADR 0134：Public Protocol与Conversation Recording使用bounded v1 wire schema](adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)
 - [ADR 0133：Runtime public payload必须可从Snapshot恢复并安全操作](adr/0133-runtime-public-payload-is-snapshot-recoverable.md)
 - [ADR 0132：Compaction从revision-bound stable units派生marker](adr/0132-compaction-derives-markers-from-live-stable-units.md)

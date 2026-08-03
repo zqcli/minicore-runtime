@@ -596,7 +596,7 @@ scanner不得使用unbounded `read_line`/`read_until`。open首先对包含tail�
 - record 1是strict Header exception：oversized/malformed/invalid UTF-8/unknown type或unsupported version立即fail Load，禁止应用entry-line skip-and-continue；
 - entry line在newline前超过limit：停止增长buffer，stream-discard到LF；若完整line结束则记录oversized_line diagnostic并继续；
 - complete malformed/invalid UTF-8/unknown variant line：skip + diagnostic，继续；
-- final bytes没有LF且whole file未超cap：无论是否构成valid JSON都视为partial tail；read-only replay忽略，writable open在valid v1 header和exclusive lease下只truncate到last LF；
+- final bytes没有LF且whole file未超cap：无论是否构成valid JSON都视为partial tail；read-only replay忽略，writable open在valid v1 Header和DurableState签发的root-lease-derived writable proof下只truncate到last LF；
 - newline-terminated malformed/oversized/unknown line永不truncate或rewrite；
 - later valid line可以成为orphan root并按Conversation Storage规则隔离；
 - replay在准备接受第1,000,001个complete entry时由Conversation Storage返回`HistoryTooLarge`；不能把未扫描suffix误报为普通complete history。

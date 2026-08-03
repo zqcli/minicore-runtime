@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0130后，生产实现待启动）
+状态：当前权威架构（ADR 0137后；M5.0 async foundation 已冻结，implementation pending）
 日期：2026-07-31
 
 ## 目的
@@ -134,6 +134,14 @@ Snapshot                 immutable published view
 - Snapshot读取不等待Model/Tool future；
 - control actor不得await整个Turn完成来处理Cancel或Interaction resolution。
 
+## Durable gates, publication permit, and shutdown
+
+No SessionExecutor caller holds an Agent or durable Session lifecycle/mutation gate while awaiting `DurableStateActor`; DurableStateActor alone takes private durable cross-entity gates in `Agent → Session` order and owns the mutation slot. Turn admission may hold `AgentAdmissionPermit` only through its no-I/O final Enabled check and Input live apply; it sends no DurableState request under that permit and releases it before `SessionRecorder.record().await`.
+
+For a loaded Workspace definition update, SessionExecutor creates and owner-registers one `SessionDefinitionPublicationTask` with shared completion. That task—not the dispatch waiter—owns the distinct `SessionDefinitionPublicationPermit`, the prebuilt `WorkspaceSnapshot`, the DurableState actor request, and final infallible Snapshot installation. The permit excludes Starting/admission from the successful Idle check through durable publication and installation; DurableStateActor does not reacquire it. Caller/transport drop only drops a waiter and never cancels the owner task. Before `DurableCommitBarrier`, shutdown may settle the command as `Rejected(RuntimeClosing)` and release the permit; after the barrier, the task must settle durable publication plus Snapshot installation. Panic or invariant failure after possible commit resolves joined dispatch waiters with existing `RuntimeDispatchError::InternalDispatchUnavailable` and integrity-closes Runtime. This permit is process-local and is not a durable lifecycle gate.
+
+`MiniCoreRuntime::shutdown().await` is the host-only, non-wire lifecycle seam; it does not add a fifth protocol entry point. It idempotently transitions Closing and rejects new admission, settles already accepted work by `EntityReservationBarrier`, `DurableCommitBarrier`, and `RecorderWriteBarrier`, stops/unloads SessionExecutors and joins their Recorder/publication jobs, joins DurableState staging/blocking jobs and stops the actor, closes conversation handles, releases the root lease, and marks Closed. Facade `Drop` sends only a best-effort Closing signal and never blocks; owner-registry self-Arcs keep tracked handles from detaching. Hosts must await shutdown before Tokio teardown to observe graceful completion and root-lease release.
+
 ## Session State
 
 ```rust
@@ -195,11 +203,11 @@ Submit accepted by control actor
 → complete original Submit as TurnStarted { turn_id }
 ```
 
-control actor在Starting subloop中继续处理out-of-band Emergency/Lifecycle signals，不持有live-state、Agent/Session lifecycle、Workspace或publication guard跨await。user Cancel在Input apply前先赢时，actor drop capture/composition future、退休candidate，不创建领域Turn或task，并把原Submit完成为`SubmitCancelled`；SecurityRevoked/Lifecycle/Runtime shutdown使用对应typed rejection。
+control actor在Starting subloop中继续处理out-of-band Emergency/Lifecycle signals，不持有live-state、Agent/Session lifecycle、Workspace、SessionDefinitionPublicationPermit或publication guard跨await。user Cancel在Input apply前先赢时，actor drop capture/composition future、退休candidate，不创建领域Turn或task，并把原Submit完成为`SubmitCancelled`；SecurityRevoked/Lifecycle/Runtime shutdown使用对应typed rejection。
 
 resolve future返回不授予apply权。actor必须重新确认same `command_id + turn_id + control_generation`、observed emergency epoch仍current、Agent/Session仍可执行且Workspace authority未被hard-revoke；任一不匹配直接丢弃结果。SkillService shared cache parse可以继续，但不能反向发布UserMessage。
 
-Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。
+Submit在当前inline record attempt返回后发布`TurnStarted`并响应。Recorder已经Degraded时`record()`立即返回`NotRecorded`，Turn仍可开始；Snapshot必须暴露相应recording health。Input live apply一旦成功，Runtime shutdown不能再把原Submit改成`Rejected(RuntimeClosing)`：若shutdown在physical `RecorderWriteBarrier`前获胜，Recorder返回`NotRecorded`并进入/保持Degraded，owner仍发布/完成`TurnStarted`，随后把shutdown/cancel绑定到同一Turn并settle interruption/close。
 
 `Starting`期间`Cancel(Submit(command_id))`持续有效，包括Input已经live apply但`TurnStarted`尚未发布的窗口。Input apply前user Cancel使原Submit完成`SubmitCancelled`；Input已apply时Cancel绑定已经分配的同一TurnId、发布sticky epoch并阻止ActiveTurnTask spawn，Input record attempt返回后仍先发布/完成`TurnStarted`，随后完成live `TurnInterrupted(UserCancelled)` settlement。调用方收到`TurnStarted`后改用`Cancel(TurnId)`。
 
@@ -256,7 +264,7 @@ validate Turn/control_generation/conversation_revision and prepare all body proj
 
 all normal-result fallible validation/projection/candidate preparation finishes before allocation. revision overflow and typed EntryId allocation failure both return before any state/head mutation; after allocation exact entry-Arc construction, prepared-unit binding, commit, same-Arc path append and revision installation are infallible (ordinary allocation panic is outside Result), so a returned error never consumes an ID and state never applies before its entry Arc exists. allocation is CSPRNG-backed, reserves a unique candidate before return with at most 32 collision attempts, never a panic/fatal path.
 
-`record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error使Recorder Degraded。mutation不回滚，Turn不失败。TurnStatus mutation不属于recordable conversation：Completed与Final Assistant在同一live decision中形成，Interrupted/Failed只发布live terminal StateEvent。
+`record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error with the root lease intact makes Recorder Degraded, while root lease/lock-file identity loss is global poison/close. Recorder owns/registers one in-flight blocking job before spawn; `record().await` and panic/unload finalization await its shared settlement after releasing any raw guard. mutation不回滚，Turn不失败。TurnStatus mutation不属于recordable conversation：Completed与Final Assistant在同一live decision中形成，Interrupted/Failed只发布live terminal StateEvent。
 
 禁止：
 
@@ -513,7 +521,7 @@ recording Degraded或process crash时，Snapshot/StateEvent可能领先可恢复
 ## Recovery
 
 ```text
-open recorded Session and attempt writable lease
+open DurableState PublishedConversationTarget with optional root-lease-derived writable proof
 → tolerant replay complete lines
 → writable Load truncates only final unterminated partial tail
 → construct LiveSessionState from recorded prefix
@@ -535,6 +543,12 @@ open recorded Session and attempt writable lease
 - old Recorder object或in-flight append。
 
 Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery append。recorded `TurnId`只用于conversation history grouping。当前loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始并重新尝试初始化Recorder，结果为Healthy或Degraded；旧unrecorded live tail和旧TurnStatus永久丢失。
+
+## Tokio运行时、blocking work与deterministic seams
+
+This module consumes [ADR 0137](../adr/0137-tokio-owner-tracked-async-foundation.md) and [DurableState](durable-state.md); it does not restate their dependency-version, filesystem-adapter, or physical-publication taxonomy. Host construction explicitly injects one cloned Tokio `Handle` into MiniCore; Session execution receives only the internal verified `RuntimeTaskContext`, never `Handle::current()` or other ambient context, and MiniCore does not construct/nest a runtime. The Session-specific obligations are: ordinary guards never cross await; `RuntimeTaskContext` owns/tracks/joins each Recorder and SessionDefinitionPublication job; caller drop never detaches a started append/publication; panic/unload finalizers await shared settlement before releasing the loaded owner; and no persistent worker/background queue exists.
+
+Cancellation only wins before the named barriers. A `RecorderWriteBarrier` crossing makes append settlement mandatory; `DurableCommitBarrier` is owned by DurableState. `CancellationToken` wakes work but owner state/epoch determines first-wins. Injectable clocks, named fault coordinates, and joins—not Tokio time advance—prove settlement. Raw guard linting and the narrow documented typed-permit exceptions are governed by ADR 0137.
 
 ## 测试要求
 

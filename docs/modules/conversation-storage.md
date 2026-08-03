@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2完成，M5 implementation pending）
 日期：2026-07-31
 
 ## 目的
@@ -34,7 +34,7 @@ MiniCore采用同类产品的live-first语义，同时保留typed JSONL、tree i
 - 一个Session一个header + by-entry JSONL文件；
 - Live reducer分配EntryId并先更新current-process state；
 - `SessionRecorder::record(entry).await`顺序encode并append当前JSONL line；
-- Recorder不使用后台task、channel或process-local queue；
+- Recorder不使用persistent worker、channel或process-local background queue；每次append只使用一个owner-tracked blocking job；
 - encode或physical write失败不回滚live state；
 - first recording failure后停止该loaded Session后续记录；
 - 文件最多是recordable conversation facts的一个合法前缀；
@@ -56,16 +56,19 @@ SessionExecutor / ActiveTurnTask
 │  ├─ ConversationRevision
 │  └─ EntryIdGenerator
 └─ SessionRecorder
-   ├─ single-Session async append serialization
+   ├─ ordered best-effort append only
    ├─ JSONL encoder
-   ├─ exclusive recorder lease when available
    └─ RecordingHealth
 
-SessionStorage
-├─ create/open recorded file
-├─ tolerant replay
-├─ history tree/query
-└─ stage recorded-path or live-snapshot Fork
+ConversationStorage
+├─ Header/entry rewrite and validation
+├─ tolerant replay and recorded tree/query
+└─ LiveForkConversationSeed / RecordedForkConversationLease semantic seed
+
+DurableState
+└─ physical target/Fork sink, root lease, final publication and cleanup
+
+Lifecycle and Runtime orchestrate these owners; Recorder does not own replay/tree/fork publication, and ConversationStorage never owns an entity path or publication marker.
 ```
 
 Live reducer拥有domain validation、EntryId allocation和当前进程conversation。Recorder只接受private constructors创建的immutable `StoredSessionEntry`，不重新决定Model/Tool协议或identity。
@@ -359,8 +362,14 @@ impl CapturedConversationViews {
 ```rust
 pub(crate) struct SessionRecorder {
     session_id: SessionId,
-    state: tokio::sync::Mutex<SessionRecorderState>,
+    state: std::sync::Mutex<SessionRecorderState>,
     health: ArcSwap<RecordingHealth>,
+}
+
+pub(crate) enum SessionRecorderState {
+    Ready { file: std::fs::File },
+    InFlight { settlement: Arc<RecorderSettlement> },
+    Degraded,
 }
 
 impl SessionRecorder {
@@ -387,7 +396,7 @@ pub enum RecordingHealth {
 
 - internal reason和failed EntryId不进入普通Snapshot；
 - Runtime把reason映射为allowlisted recording diagnostic code；
-- 每次Load都尝试初始化Recorder；初始化、lease、权限、磁盘、encode或write failure进入`Degraded`；
+- 每次Load都尝试初始化Recorder；ordinary conversation capability/open/permission/disk/encode/write failure while the root lease remains intact enters `Degraded`; root lease or lock-file identity loss is global poison/close, never this health state；
 - 同一loaded Session只允许`Healthy → Degraded`，Recorder不会在当前load中自动恢复Healthy；
 - Degraded后不自动probe/retry、不创建新segment、不保留或backfill unrecorded suffix；
 - Health与当前recording diagnostic通过同一次immutable Snapshot publication对host可见。
@@ -396,10 +405,10 @@ pub enum RecordingHealth {
 
 MVP的recordable domain mutation保持单producer ownership：Starting/Idle mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction routing只在对应task等待期间完成request/resolution mutation。不得让两个独立caller并发apply可记录的live mutation，再依赖Recorder mutex acquisition决定history顺序。未来出现真实multi-producer需求时必须引入显式domain sequencing，不能静默依赖scheduler顺序。
 
-Recorder的async mutex只保护单文件handle和append原子串行化。`health`通过独立immutable publication读取，Snapshot不等待当前file write。Recorder按单Session顺序处理当前entry。以下任一情况首次发生后进入Degraded并停止后续append：
+Recorder的短`std::sync::Mutex`只保护handle-transfer state，绝不保护异步append。state machine固定为：同步lock后从`Ready`移出`std::fs::File`；调用`RuntimeTaskContext::spawn_blocking_tracked`先原子预留owner-registry slot，再spawn write job；RuntimeTaskContext registry拥有实际job slot/raw `JoinHandle`，Recorder只安装其shared `RecorderSettlement`为`InFlight`，然后释放guard并在guard外await。spawn不能启动时settlement exactly-once完成，file被确定性restore或关闭并Degraded，不允许留下永远pending的`InFlight`。settlement在`Written`时同步取lock并返回/restore file到`Ready`；在write/join/panic/unknown outcome时安装terminal `Degraded`、关闭该handle并发布health。panic/unload finalizer遇到`InFlight`时clone并await同一个shared settlement；它不创建第二个job。任何raw guard都不得跨await，且没有persistent worker/background queue。`health`通过独立immutable publication读取，Snapshot不等待当前file write。Recorder按单Session顺序处理当前entry。以下任一情况首次发生后进入Degraded并停止后续append：
 
 - encode失败；
-- lease丢失；
+- root lease intact时的ordinary conversation capability/open failure；
 - create/append I/O失败；
 - partial write或outcome unknown。
 
@@ -416,99 +425,68 @@ recording failure：
 - 不尝试追溯补写已经unrecorded的live gap；
 - 存储恢复后当前loaded Session仍保持Degraded，后续`record()`继续返回`NotRecorded`。
 
-Recorder没有后台queue、flush watermark或drain operation。graceful unload等待或取消ActiveTurnTask；task结束后不存在待写record tail。Host可以继续unsaved execution，或显式`Unload + Load`从recorded prefix创建新的loaded instance。显式Fork在source已loaded时使用LiveSnapshot，因此可以把snapshot捕获前已apply的unrecorded tail写入独立child record stream。
+`RecorderWriteBarrier` is after encode/size validation and immediately before the first physical write. Before it, shutdown may skip the physical attempt only as truthful `NotRecorded` plus a Healthy→Degraded transition; it may reject the owning command with `RuntimeClosing` only if that command's corresponding live mutation has not occurred. In particular, after Submit Input live apply the original Submit still completes `TurnStarted`, then shutdown/cancel settles that same Turn. After the barrier, caller drop, Cancel, Unload, and shutdown cannot abandon the append: the shared job settles and the health transition is installed. Recorder没有background queue、flush watermark或drain operation。graceful unload waits or cancels ActiveTurnTask and then awaits the Recorder settlement; task结束后不存在待写record tail。Host可以继续unsaved execution，或显式`Unload + Load`从recorded prefix创建新的loaded instance。显式Fork在source已loaded时使用LiveSnapshot，因此可以把snapshot捕获前已apply的unrecorded tail semantic-re-encode into an independent child record stream。
 
-## SessionStorage Interface
+## DurableState Boundary
 
-当前只有一个backend，不建立public adapter hierarchy。
-
-```rust
-pub(crate) struct SessionStorage {
-    // root/index/config
-}
-
-impl SessionStorage {
-    pub async fn stage_create(
-        &self,
-        request: CreateSessionStorage,
-    ) -> Result<StagedSessionStorage, SessionStorageError>;
-
-    pub async fn open(
-        &self,
-        session_id: SessionId,
-    ) -> Result<OpenedSession, SessionStorageError>;
-
-    pub async fn replay_at(
-        &self,
-        session_id: SessionId,
-        entry_id: EntryId,
-    ) -> Result<ReplayedSession, SessionStorageError>;
-
-    pub async fn fork_recorded(
-        &self,
-        request: ForkRecordedSession,
-    ) -> Result<StagedSessionStorage, SessionStorageError>;
-
-    pub async fn fork_live(
-        &self,
-        request: ForkLiveSession,
-    ) -> Result<StagedSessionStorage, SessionStorageError>;
-}
-```
+DurableState owns the root, final entity path, initial materialization, publication and writable physical observation. Conversation Storage owns only the semantic JSONL work behind opaque capabilities issued by DurableState; it has no `SessionStorage` backend hierarchy and no caller-visible staging type.
 
 ```rust
-pub(crate) enum SessionStorageErrorKind {
-    UnsupportedFormatVersion,
-    HeaderCorrupt,
-    HistoryTooLarge,
-    StorageUnavailable,
-    InvariantViolation,
+pub(crate) struct PublishedConversationTarget {
+    // private SessionId + DurableState-issued immutable file observation
 }
 
-pub(crate) struct SessionStorageError {
-    pub kind: SessionStorageErrorKind,
-    // private source; public projection is typed/redacted
+pub(crate) struct LiveForkConversationSeed {
+    // opaque captured selected entries; no long file lease after capture
 }
 
-pub(crate) struct StagedSessionStorage {
-    // unpublished target and validated initial SessionHeader
+pub(crate) struct RecordedForkConversationLease {
+    // opaque selected recorded history/file observation; blocks Load/append/tail truncate
 }
 
-pub(crate) struct OpenedSession {
-    pub replay: ReplayedSession,
-    pub recorder: Arc<SessionRecorder>,
+pub(crate) struct ExclusiveWritableConversationLease {
+    // private SessionId + same-open-file proof issued by DurableState under root lease
+}
+
+pub(crate) struct ConversationStorage;
+
+impl ConversationStorage {
+    pub(crate) fn initial_header(
+        seed: InitialConversationSeed,
+    ) -> Result<CanonicalSessionHeader, ConversationStorageError>;
+
+    pub(crate) async fn open(
+        target: PublishedConversationTarget,
+        writable: Option<ExclusiveWritableConversationLease>,
+    ) -> Result<OpenedConversation, ConversationStorageError>;
+
+    pub(crate) async fn recorded_fork_seed(
+        lease: RecordedForkConversationLease,
+        anchor: ForkAnchor,
+    ) -> Result<RecordedForkConversationSeed, ConversationStorageError>;
+
+    pub(crate) async fn stream_reencode_for_child(
+        seed: ForkConversationSeed,
+        child_session_id: SessionId,
+        sink: &mut ForkConversationSink,
+    ) -> Result<PreparedConversationProof, ConversationStorageError>;
 }
 ```
 
-Header strict failure映射HeaderCorrupt或UnsupportedFormatVersion；1 GiB/1,000,000-entry hard cap映射HistoryTooLarge；ordinary recorder initialization/lease failure仍可以创建Degraded loaded Session。Runtime public mapping分别使用DurableStateCorrupt、DurableStateTooLarge或Unavailable，不能解析private source string。
+`ForkConversationSeed` is closed over `LiveForkConversationSeed | RecordedForkConversationSeed`; both feed the **one semantic streaming re-encode operation**. DurableState/source-residency ownership is the sole issuer of the physical `RecordedForkConversationLease`: it binds the exact source Session/file observation and blocks Load, append and tail truncate. Conversation Storage consumes that lease to replay/resolve the anchor and create a semantic recorded seed that retains the physical lease until streaming/readback completes. `PublishedConversationTarget` and `ExclusiveWritableConversationLease` have no public or caller-visible constructor. DurableState is the sole future production issuer/factory of the latter after it binds SessionId and same-open-file observation under its held root lease; the existing `#[cfg(test)]` constructor remains M3-only until implementation. They expose neither a path nor a raw file handle to lifecycle callers. A live immutable seed needs no long file lease after capture. `ForkConversationSink` is DurableState actor-owned/tracked markerless final-path work, not a caller staging path. `PreparedConversationProof` is opaque and binds child SessionId, same file identity/length, strict Header and fully reread selected semantic path; it is checked again at PUBLISHED without allocating or rereading 1 GiB a second time.
 
-`StagedSessionStorage`只能由Agent/Session lifecycle publication路径消费，不能被query、Load或Turn admission观察。
+Header strict failure maps to `HeaderCorrupt`/unsupported version and the 1 GiB/1,000,000-entry cap maps to `HistoryTooLarge`. Runtime projects those as `DurableStateCorrupt`/`DurableStateTooLarge`. Every blocking `open`/scan/replay/recorded-lease read/streamed re-encode/readback runs in an owner-tracked `RuntimeTaskContext` job; none runs directly on a current-thread Tokio worker, and caller drop cannot outlive shutdown ownership. Ordinary Recorder initialization/open/write failure is only the loaded Session's `RecordingHealth::Degraded`; it neither loses the root lease nor poisons DurableState.
 
-`stage_create()`写入initial SessionHeader但不创建SessionRecorder；Agent/Session lifecycle只在该staging与SessionDefinition都成功后原子发布`Open + Unloaded`Session。header staging失败使Create失败，partial staging target不进入catalog。
+DurableState creates/syncs the canonical Header before generation-1 `COMMITTED`, then creates `PUBLISHED` last. For ordinary Create, `InitialConversationSeed` is constructible only by DurableStateActor after it holds the Agent gate, reads the current Enabled exact ref, and constructs the final SessionDefinition/Header/head together; no pre-gate or already-`COMMITTED` stale Header is accepted. Conversation Storage never publishes an entity, creates a generation marker, selects a Session directory, or returns a physical commit receipt. The Header remains creation provenance and file identity, not a definition/lifecycle log, current authorization proof or old execution recovery source.
 
-SessionHeader中的initial Agent/definition refs只承担file identity和creation provenance。Header没有EntryId，不是Session definition/lifecycle change log、current authorization proof或old execution recovery source；Load仍从Agent/Session durable owner读取current head。
-
-`open()`始终尝试初始化Recorder；lease或初始化失败返回`RecordingHealth::Degraded`的loaded Session。history可读且Workspace/definition可用时仍允许Turn admission。Recorder初始化和header append都不创建后台worker。
-
-不提供：
-
-```text
-SessionWriter::append
-append_raw_json
-caller-provided projection delta
-repair middle line
-recording failure rollback
-ResumeSessionRecording / StartRecordingSegment
-unrecorded suffix backfill
-physical commit receipt as execution permit
-```
+No API provides `SessionWriter::append`, raw JSON append, caller-provided projection delta, middle-line repair, recording-failure rollback, segment resume, unrecorded-tail backfill or an execution permit derived from physical commit.
 
 ## 物理文件
 
 物理encoding、field order、limits和bounded scanner的exact owner是[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)。semantic overview：
 
 ```text
-sessions/<SessionId>.jsonl
+sessions/<SessionId>/conversation.jsonl
 line 1   session_header
 line 2+  entry
 ```
@@ -848,9 +826,11 @@ resolve public ForkAnchor
 
 anchor解析和selected path必须来自同一个snapshot。capture前已经apply的live mutation会被复制，即使对应`SessionRecorder.record().await`仍在执行；capture后才apply的mutation不会被复制。stream draft、ProgressEvent、pending queue value和其他未apply状态不属于snapshot。source guard必须在target staging I/O前释放。
 
-RecordedHistory从tolerant replay得到的selected recorded path复制。两种source都保留复制历史的Entry/Turn/Item/Request/ToolCall IDs，只分配新SessionId；future entry使用fresh ID。
+RecordedHistory is captured as `RecordedForkConversationLease` from the tolerant replay selected path; it blocks Load, append, and tail truncate while the semantic stream runs. Both source forms preserve copied historical EntryId, parentId, TurnId, ItemId, RequestId, ToolCallId, timestamp, body, and selected order; only the child SessionId is new, and future entries use fresh IDs.
 
-target使用staging + atomic publication建立完整新record stream。selected path未全部materialize或replay validation失败时Fork返回typed error且不发布child；这一步是Fork publication前的完整copy，不是已发布Session上的best-effort suffix recording。child后续和其他Session一样始终尝试记录。selected path可以在任意公开message anchor结束；child不继承source active Turn状态，发布后保持Unloaded，未来Load得到Idle conversation view。
+`stream_reencode_for_child(child_session_id, sink)` is never a raw source JSONL byte copy. Conversation Storage emits a new child Header and, for every selected `StoredSessionEntry`, validates and re-encodes its canonical JSONL with `session_id = child_session_id`; EntryId, parentId, TurnId, ItemId, RequestId, ToolCallId, timestamp, body, and selected order remain exactly preserved. DurableState owns the sink and publication; Conversation Storage owns Header/entry rewrite and validation. The canonical rule preserves every historical field. The ordinary durable fixture byte-compares every field actually present after only SessionId rebinding; because its two copied entries are User messages, it does **not** itself prove RequestId/ToolCallId handling. Wire conversation fixtures cover those body variants.
+
+target使用final-path markerless staging + marker publication建立完整新record stream。Conversation Storage在`DurableCommitBarrier`前完成最多1 GiB的streaming re-encode、sync和bounded-memory full reread validation，返回`PreparedConversationProof`；selected path未全部materialize或replay validation失败时Fork返回typed error且不发布child，并清理exact markerless target。这一步是Fork publication前的完整semantic re-encode，不是已发布Session上的best-effort suffix recording。child后续和其他Session一样始终尝试记录。selected path可以在任意公开message anchor结束；child不继承source active Turn状态，发布后保持Unloaded，未来Load得到Idle conversation view。
 
 child durable provenance至少保存：
 
@@ -869,7 +849,7 @@ Fork也不复制source Session definition/metadata/lifecycle timeline。child cu
 ## Recovery
 
 ```text
-open file and attempt writable lease
+receive DurableState PublishedConversationTarget and optional root-lease-derived writable proof
 → tolerant replay recorded prefix
 → writable open truncates only final unterminated partial tail ignored by replay
 → create LiveSessionState from replay
@@ -882,7 +862,7 @@ open file and attempt writable lease
 
 recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail和旧TurnStatus。Load不推断旧Turn outcome、不创建restart interruption，也不执行recovery append。
 
-Tail处理只允许在valid v1 Header、exclusive writable lease且whole-file cap通过后，截断final unterminated partial line到last LF。完整newline-terminated entry即使oversized、malformed、unknown或来自先前outcome-unknown write，也必须保留physical bytes；typed replay决定接受或隔离，不执行middle repair、reparent或gap marker synthesis。
+Tail处理只允许在valid v1 Header、whole-file cap通过且DurableState签发root-lease-derived `ExclusiveWritableConversationLease`后，截断final unterminated partial line到last LF。完整newline-terminated entry即使oversized、malformed、unknown或来自先前outcome-unknown write，也必须保留physical bytes；typed replay决定接受或隔离，不执行middle repair、reparent或gap marker synthesis。
 
 ## Diagnostics
 

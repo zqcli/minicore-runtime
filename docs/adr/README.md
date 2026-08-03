@@ -17,6 +17,8 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0131](0131-conversation-recording-excludes-session-definition-and-lifecycle.md) | Conversation recording排除Session definition/lifecycle |
 | [0132](0132-compaction-derives-markers-from-live-stable-units.md) | Compaction从live stable units派生marker |
 | [0135](0135-workspace-public-input-is-host-neutral.md) | Workspace public input在command application前保持host-neutral |
+| [0136](0136-durablestate-operation-owned-generations.md) | DurableState使用operation-owned immutable generations、permanent reservations与root lease；read with ADR 0137 |
+| [0137](0137-tokio-owner-tracked-async-foundation.md) | Tokio owner-tracked async foundation与deterministic persistent seams；refines ADR 0117 and supports ADR 0136 |
 
 ## Current With Later Refinements
 
@@ -34,15 +36,15 @@ ADR记录决策理由；当前行为仍以[`architecture.md`](../architecture.md
 | [0113](0113-user-question-uses-runtime-protocol-and-ui-presentation.md) | ADR 0124、0126、0127、0133 |
 | [0114](0114-runtime-observation-uses-snapshot-first-streams.md) | ADR 0126、0127、0133 |
 | [0116](0116-file-mutations-use-session-local-queues.md) | ADR 0126 |
-| [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127 |
+| [0117](0117-async-synchronization-uses-single-owner-and-typed-permits.md) | ADR 0124、0125、0126、0127、0136、0137 |
 | [0118](0118-cancel-acknowledges-immediately-and-followup-waits-for-settlement.md) | ADR 0124、0126、0127、0133 |
 | [0119](0119-model-calls-use-session-logical-retries.md) | ADR 0126 |
 | [0120](0120-failures-stay-with-owning-modules.md) | ADR 0126 |
 | [0121](0121-workspace-updates-require-idle.md) | ADR 0124、0126、0127 |
 | [0123](0123-identity-uses-refs-and-explicit-reload.md) | ADR 0124、0126、0127、0129、0132 |
-| [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134 |
-| [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132 |
-| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135 |
+| [0124](0124-session-replay-is-tolerant-and-links-are-minimal.md) | ADR 0126、0127、0131、0132、0134、0136、0137 |
+| [0126](0126-turn-execution-is-async-and-session-recording-is-best-effort.md) | ADR 0127、0130、0132、0136、0137 |
+| [0133](0133-runtime-public-payload-is-snapshot-recoverable.md) | ADR 0135、0136、0137 |
 | [0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md) | ADR 0135 |
 
 ## Historical / Superseded

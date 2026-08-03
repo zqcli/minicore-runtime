@@ -57,7 +57,7 @@
 - ModelGateway不执行transparent retry、401 refresh-and-resend或WebSocket → HTTP transport fallback；
 - ActiveTurnTask只对同一个immutable request执行最多3次AgentRun logical retry；CompactionSummary最多1次；
 - cross-model fallback不是ModelGateway transparent behavior；
-- streaming progress是process-local observer data，不进入SessionStorage；
+- streaming progress是process-local observer data，不进入Conversation Storage；
 - finalized response或typed error是一次gateway调用唯一terminal result；
 - provider-reported usage随成功assistant response进入live state并成为record candidate；recording degraded时可能无法跨restart恢复；失败attempt usage只属于ModelGateway internal telemetry；
 - authentication secret、raw headers、raw request/response body和provider SDK类型不越过ModelGateway seam；
@@ -321,7 +321,7 @@ ActiveTurnTask
 - Runtime公开model query以后通过MiniCoreRuntime facade取得safe catalog view；
 - ActiveTurnTask不直接resolve auth、base URL、API model name或provider protocol；
 - ToolService、PromptService和SkillService不调用ModelGateway；
-- ModelGateway不读SessionStorage，不append entry，不发布Runtime durable event；
+- ModelGateway不读Conversation Storage，不append entry，不发布Runtime durable event；
 - ModelGateway没有current Session、current Turn、current cwd或current model字段。
 
 ## External Interface
@@ -704,7 +704,7 @@ ModelGateway可以：
 ModelGateway不能：
 
 - 删除、增加或重新排序model-visible content；
-- 从SessionStorage重新加载messages；
+- 从Conversation Storage重新加载messages；
 - 根据provider限制自行摘要或截断conversation；
 - 把diagnostic变成prompt text；
 - 把ToolSpec描述与ToolSet executor重新join；
@@ -1133,7 +1133,7 @@ pub struct ModelUsage {
 - Session total usage由assistant/compaction entries replay重建；
 - 每次Gateway operation最多一个provider attempt；usage是否出现不能代替delivery-state分类，也不能把不确定outcome降级成普通transient error；
 - provider若为失败attempt报告usage，该事实只进入ModelGateway internal telemetry；不放入ModelCallError、不进入Session aggregate，也不创建synthetic assistant或独立Usage entry；
-- 因此MiniCore SessionStorage不是provider billing ledger。
+- 因此MiniCore Conversation Storage不是provider billing ledger。
 
 StoredAssistantMessage的`logical_retry_count`定义为ActiveTurnTask对同一logical call执行的logical retry数量。Gateway没有transparent retry count。
 
@@ -1397,7 +1397,7 @@ AssembledModelContext
 ModelProgressEvent
 ModelCallResult
 ModelCallError
-SessionStorage
+ConversationStorage
 Runtime event/snapshot
 Prompt/Tool/Skill
 logs或Debug output
@@ -1708,7 +1708,7 @@ opaque encrypted reasoning
 
 - 只有`resolve_for_turn`和`generate_model_turn`进入Session execution；
 - ActiveTurnTask/SessionExecutor不import Rig provider类型；
-- ModelGateway不能读取SessionStorage或Prompt definitions；
+- ModelGateway不能读取Conversation Storage或Prompt definitions；
 - ProviderAdapter不能append Session entry；
 - shared Gateway并发处理多个Session；
 - 没有global current Session/model。

@@ -688,7 +688,7 @@ mutation ticket
 approval/UserQuestion waiter
 ```
 
-SessionStorage replay：
+Conversation Storage replay：
 
 - existingToolResult保留；
 - complete exchange继续model-visible；

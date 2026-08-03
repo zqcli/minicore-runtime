@@ -3,6 +3,8 @@
 状态：Partially Superseded by ADRs 0126, 0127, 0131, 0132 and 0134
 日期：2026-07-29
 
+> 2026-08-03 refinement: ADR 0136 and the current Conversation Storage module make DurableState the future sole production issuer of the opaque writable conversation lease; the retained historical decision below is unchanged. The exact M5 fork re-encode and replay/open rules live in those current owners.
+>
 > 2026-07-31：[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)、[Format V1](../formats/conversation-jsonl-v1.md)与current Conversation Storage冻结typed ID/revision、strict Header、bounded scanner、selected-root/physical-last-leaf规则、session-before-collision precedence、oversized complete line和partial-tail truncation。本文“orphan重启selected path”被取代为isolated history node。
 
 > 2026-07-31：[ADR 0132](0132-compaction-derives-markers-from-live-stable-units.md)细化single prefix marker：`first_kept_entry_id`必须由live reducer发布的provider-valid stable-unit source与cut派生；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。

@@ -7,6 +7,8 @@
 
 关闭进度：V4-P0-1至P0-5、V4-P1-1、V4-P1-2与V4-P1-4 Closed；V4-P1-3和V4-C0-1 Open。ADR 0130–0134是本review关闭过程中新增的Accepted决议。
 
+> 进度说明（2026-08-03）：本文后续里程碑/暂停措辞是第四轮评审当时的dated snapshot；当前实施状态以[Development Plan](../development-plan.md)为准。当前仍具约束力的open gate只有V4-P1-3与conditional V4-C0-1。
+
 ## 总体结论
 
 ADR 0126–0134确定的主方向继续成立：
