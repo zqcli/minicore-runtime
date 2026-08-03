@@ -85,12 +85,17 @@ MiniCoreRuntime
 recordable conversation mutation顺序：
 
 ```text
-validate recordable mutation
-→ LiveSessionState.EntryIdGenerator allocates EntryId and binds parent_id
-→ apply LiveSessionState / LiveConversation
-→ await SessionRecorder.record(entry)
+complete all relation/value validation, Prompt projection and candidate preparation
+→ preflight ConversationRevision.checked_next() when delta is +1
+→ LiveSessionState.EntryIdGenerator.allocate()? and bind parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind any prepared new-origin stable unit, commit prepared LiveSessionState / LiveConversation delta
+→ append the same Arc to the full selected path and install the preflighted revision
+→ await SessionRecorder.record(the same Arc)
 → publish final StateEvent / resume waiter / continue loop
 ```
+
+所有normal-result fallible validation/projection/preparation（包括`PreparedLiveCompactionUnit`）都在allocation前完成；revision overflow与EntryId allocation failure都在state/head mutation前返回typed failure。allocation后先构造exact entry Arc，才bind prepared unit、commit state、append same Arc和install revision；这些步骤不会返回错误（ordinary allocation panic在Result contract外），所以returned error绝不消耗ID。EntryId使用CSPRNG、success前reserve和32次bounded collision retry，不能panic或从revision/ordinal/time派生。
 
 EntryId由`LiveSessionState`私有Session-scoped generator在apply前分配；Recorder不得创建或改写identity。`record().await`顺序encode并执行当前JSONL line的`write_all`，不使用后台queue。成功不表示flush、fsync或power-loss durability。第一次encode/write失败后Recorder进入`Degraded`并停止该loaded Session的后续记录；Turn继续运行。Degraded在同一load内为终态，不retry、不创建segment、不backfill。Interrupted/Failed terminal没有record attempt，Completed通过Final Assistant conversation entry留下内容事实。
 
@@ -140,7 +145,7 @@ Assistant(tool calls A/B/C) applied live
 → next Model allowed
 ```
 
-complete exchange门禁保留，但owner是live conversation reducer。SessionRecorder或cold projector不再向执行loop签发`CommittedToolExchangeDelta`。
+complete exchange门禁保留，但owner是live conversation reducer。SessionRecorder或cold projector不再向执行loop签发`CommittedToolExchangeDelta`。accepted Assistant（包括含ToolCalls、仍被gate隐藏者）使`ConversationRevision +1`；所有expected calls的first truthful `Completed` result才使complete exchange promotion再`+1`，partial/abandoned/non-visible settlement为`+0`。
 
 每个assistant或ToolResult live mutation在启动下一protocol step前完成inline record attempt。crash或Degraded仍可能只留下assistant ToolCall或部分结果；replay sanitizer排除整个不完整exchange。Tool不会因记录缺失自动重跑。
 
@@ -157,6 +162,10 @@ apply Pending Interaction live
 ```
 
 recording failure不阻止Interaction。request/resolution可能在crash后缺失；restart不恢复waiter。
+
+`Interaction` fields/raw state只属于`LiveSessionState`；only its request/resolution transition methods construct、resolve或match该state，sibling只能读safe pending/event/storage projection。`InteractionResolutionCandidate::host(...) -> Result<_, InteractionCandidateError>`只接受ToolApproval、UserAnswer或`Cancelled(HostCancelled)`并seal Some key；`owner_cancellation(...) -> Result<_, InteractionCandidateError>`只接受non-Host `Cancelled`并seal None。wrong origin在reducer apply与EntryId allocation前被redacted candidate error拒绝。
+
+同一Interaction的same key + same canonical payload resolution是live reducer idempotent outcome：不分配EntryId、不构造entry、不record或发第二event；same key + different payload保持typed conflict。
 
 ## Cancel与Security
 
@@ -183,9 +192,9 @@ retryable terminal ModelCallError
 
 ## Compaction
 
-ActiveTurnTask从live reducer在同一revision取得ordinary `LiveConversationView`和额外的`LiveCompactionSourceView`。后者按EntryId-bearing provider-valid stable units表达User、Assistant、complete Tool exchange和leading rolling summary；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
+ActiveTurnTask从`LiveSessionState::capture_conversation_views()`在同一revision取得ordinary `LiveConversationView`、额外的`LiveCompactionSourceView`、由state完整immutable selected path末项派生的selected head和private Item/Pending Interaction facts。M4 aggregate只读该head；state保留full `Arc<StoredSessionEntry>` path给future LiveSnapshot/Fork。后者按EntryId-bearing provider-valid stable units表达User、Assistant、complete Tool exchange和leading rolling summary；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。
 
-Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summary assembly bases和同一TurnModelSnapshot estimator/limits，从`source + cut index`派生summary prefix、retained suffix和single `first_kept_entry_id`，不按message equality反查。summary调用仍经过PromptSet/ModelGateway；automatic marker保存完整safe model-call provenance。验证后先分配Compaction EntryId并Replace live conversation，再inline attempt record `StoredCompaction`。marker未写入时restart恢复未压缩旧conversation；这是best-effort recording允许的降级。
+Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summary assembly bases和同一TurnModelSnapshot estimator/limits，从`source + cut index`派生summary prefix、retained suffix和single `first_kept_entry_id`，不按message equality反查。`ModelMessage`/`ModelAssistantContent`和`LiveCompactionUnit`/source view都是immutable `Clone` values/handles；Compaction estimator/reduction只读transcript refs。Compaction owns fallible `PreparedLiveCompactionUnit` construction before an origin exists and source factories return its redacted structural error（empty unit、duplicate origin、misplaced rolling summary）；only `LiveSessionState` maps it to an owner-local live error, so Compaction never depends on `LiveConversationError`. **M4只关闭reducer subset**：apply接收orchestration-supplied `TurnId + Timestamp`，创建fresh current source，以`source.has_same_stable_identity(&fresh_current_source)`验证exact SessionId/revision/unit-count/ordered `(first_entry_id, kind)` basis，连同nonzero cut和opaque `CompactionReplacement` proof验证derived marker。M4 proof only has `#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>` and consuming exact `into_parts()`; it has no production `ValidatedCompactionSummary` constructor. Reducer consumes its exact values, may clone the prebuilt summary into leading unit and flattened LiveConversationView, and prepares the summary unit before all validation/projection/candidate preparation and `checked_next()`. Only then it allocates a new rolling-summary origin, constructs the exact entry Arc, binds the prepared unit, clones only the retained unit handles from the fresh current suffix, commits state, appends that same Arc and installs the preflighted revision; it never reconstructs borrowed messages or a caller suffix. M10 will add production construction from `ValidatedCompactionSummary` when those types exist. M5对recorded bad marker只ignore/diagnose。summary调用、full plan/request/control validation、model validation/retry、recorder ordering与publication仍是M10；marker未写入时restart恢复未压缩旧conversation是该best-effort M10路径的降级。
 
 ## 状态与观察
 
@@ -206,7 +215,7 @@ Compaction使用Turn-captured Runtime settings、同一PromptSet的AgentRun/Summ
 | INV-002 | cold replay只恢复recorded完整行前缀，局部skip/isolate并返回diagnostics，不恢复process-local对象 | [Conversation Recording · Tolerant Replay](modules/conversation-storage.md#tolerant-replay) |
 | INV-003 | 含ToolCall的assistant只有在全部matching truthful results形成provider-valid complete exchange后才model-visible | [Turn / Item / Interaction · Complete Tool Exchange](modules/turn-item-interaction.md#complete-tool-exchange) |
 | INV-004 | loaded Fork从同一LiveSnapshot解析anchor并复制selected path；unloaded Fork使用RecordedHistory；source kind进入durable provenance与command outcome | [Conversation Recording · Fork](modules/conversation-storage.md#fork) |
-| INV-005 | Compaction source由live reducer按Session/revision发布EntryId-bearing stable units；plan从source+cut派生marker，apply要求exact control/plan/request/revision并在record前安装new summary origin | [Compaction · Live Replace与Recording](modules/compaction.md#live-replace与recording) |
+| INV-005 | Compaction source由live reducer发布EntryId-bearing stable units；`has_same_stable_identity()`比较Session/revision/unit count/ordered unit identity，cut派生marker；M4以opaque CompactionReplacement关闭source/cut/marker/no-I/O reducer subset，M10才关闭exact control/plan/request、summary validation、recording与publication | [Compaction · M10 Live Replace与Recording](modules/compaction.md#m10-live-replace与recording) |
 | INV-101 | 每个loaded Session只有一个control actor和最多一个ActiveTurnTask；同Session不得并行运行两个Turn task | [Session Execution · Ownership](modules/session-execution.md#ownership) |
 | INV-102 | Steer只在完整assistant/tool step后、下一次Model前FIFO消费 | [Session Execution · Steer](modules/session-execution.md#steer) |
 | INV-103 | SessionSnapshot完整列出当前process所有public cancelable Submit admission、Steer和FollowUp CommandId；lane内FIFO，不公开queued intent正文，不从event/count重建 | [Runtime Interface · SessionSnapshot](modules/runtime-interface.md#sessionsnapshot) |

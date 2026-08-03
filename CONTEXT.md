@@ -43,25 +43,28 @@ Runtime内部路由到SessionExecutor的cloneable handle。下游host不能取�
 SessionExecutor向ActiveTurnTask发送Steer、Interaction resolution、Cancel、SecurityRevoked和Lifecycle signal的crate-private channels/tokens。
 
 **LiveSessionState**：
-loaded Session的current-process truth，保存live conversation、Turn、Item、Interaction、usage和read model。它通过private typed methods修改；任何lock guard不得跨await。
+loaded Session的current-process truth，保存live conversation、Turn、Item、Interaction、usage和read model。它保留完整`Vec<Arc<StoredSessionEntry>>` selected path、由末项导出selected head；EntryId-only不能materialize unrecorded live tail供future LiveSnapshot/Fork。all fallible preparation结束后才allocate；allocation后先construct exact entry Arc、再bind prepared new-origin stable unit、commit state、append returned `AppliedConversationFact`的**same Arc**到path并install preflighted revision，绝不在entry construction前apply state。它通过private typed methods修改；`Interaction` fields/raw state只由其request/resolution transition methods构造和改变，sibling只读safe projection；任何lock guard不得跨await。
 
 **LiveConversation**：
-模型协议安全的current-process conversation reducer。它拥有expected ToolCalls、first terminal result、complete exchange、Compaction Replace和ConversationRevision。
+模型协议安全的current-process conversation reducer。它拥有expected ToolCalls、first terminal result、complete exchange、Compaction Replace和ConversationRevision；`ModelMessage`构造/provider projection仍只调用Prompt-owned constructors。
 
 **LiveConversationView**：
-PromptSet可消费的sanitized只读view。只包含provider-valid messages；incomplete、orphan或abandoned-first Tool exchange被排除。
+PromptSet可消费的sanitized只读view。private fields，只有crate-private revision/messages getter；LiveSessionState在`capture_conversation_views()`中构造。只包含provider-valid messages；incomplete、orphan或abandoned-first Tool exchange被排除。M4没有generic live/replay trait或public DTO。
 
 **LiveCompactionSourceView**：
-Live reducer额外提供的crate-private immutable Compaction projection。绑定SessionId与ConversationRevision，并把User、无ToolCall Assistant、完整Tool exchange和leading rolling summary分组成EntryId-bearing stable units；Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId。它不携带token estimate或settings。
+Live reducer额外提供的crate-private immutable Compaction projection。`LiveCompactionUnit`与source view是private-field Arc-backed `Clone` handles，clone保持origin/kind/order/message semantic identity，不重建unit。Compaction语义拥有`PreparedLiveCompactionUnit::for_live_reducer(kind, messages) -> Result<_, CompactionSourceError>`和infallible `bind_origin(self, EntryId) -> LiveCompactionUnit`，以及source factory/read getters和唯一deep `has_same_stable_identity(&self, other: &Self) -> bool` method；preparation在new ID allocation前完成all message/kind validation，source factory仍返回own redacted `CompactionSourceError { EmptyUnitMessages | DuplicateUnitOrigin | MisplacedRollingSummary }`。它绝不返回或依赖`LiveConversationError`。LiveSessionState仍是canonical producer，并在factory caller boundary映射该error到own typed live error。该method精确比较Session/revision、unit count与ordered`(first_entry_id, kind)` sequence，绝不比较message value；source不存储或暴露identity DTO。Tool exchange不可拆，rolling summary origin是对应StoredCompaction outer EntryId；retained suffix只clone fresh current source units。它不携带token estimate或settings。
+
+**CapturedConversationViews**：
+`LiveSessionState::capture_conversation_views()`一次短capture返回`Result`的crate-private aggregate：同一revision的LiveConversationView、`Arc<LiveCompactionSourceView>`、从full state path末项导出的selected head、`Arc<[ItemRelation]>`和RequestId/TurnId/ItemId + safe request view的`Arc<[PendingInteractionFact]>`。M4 read scope只暴露head；state保留full applied facts给future LiveSnapshot/Fork。private fields/getters only；不是M8 public Snapshot，也不是Fork LiveSnapshot。
 
 **CompactionSettingsSnapshot**：
 Turn admission从Runtime-global validated CompactionSettings捕获的immutable policy。MVP无hot reload或per-Session override；默认pressure reserve 4096、summary output 512–2048、minimum reclaim 2048、每Turn最多4次Compaction、summary safety reserve 512。
 
 **ConversationRevision**：
-process-local单调版本，每次model-visible live mutation递增。ModelCallRequest、logical retry和CompactionPlan使用它验证stale result。它不持久化，不跨restart比较。
+process-local单调live-conversation operation basis，不是当前可见消息的hash/version。Input/Steer与每个accepted Assistant（含hidden ToolCalls）各`+1`；complete exchange在所有expected calls first truthful Completed时再`+1`；partial/abandoned/non-visible settlement、Interaction、progress/usage/recording与failed/idempotent apply均`+0`；Compaction Replace `+1`。checked overflow先于EntryId allocation/state mutation失败。ModelCallRequest、logical retry和Compaction source/plan使用它验证stale result；它不持久化，不跨restart比较。
 
 **EntryIdGenerator**：
-`LiveSessionState`私有持有的Session-scoped identity generator。domain validation后、live apply前分配EntryId并绑定parent_id；replay/Fork copied IDs用于collision guard。Degraded不影响分配，Recorder不能创建或改写ID。
+`LiveSessionState`私有持有的Session-scoped identity generator。`allocate()`是typed fallible operation：16 CSPRNG-byte candidate最多32次、unique candidate在return前reserve；entropy或collision exhaustion是owner-local redacted error，不panic且不改变state/head/revision。domain validation和revision overflow preflight后、live apply前分配并绑定parent_id；replay/Fork全部reserved copied IDs seed collision guard。Degraded不影响分配，Recorder不能创建或改写ID，也不得从revision/ordinal/time派生ID。
 
 **SessionRecorder**：
 每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append稳定conversation fact，不使用后台task或queue，也不提供durable commit receipt。TurnStatus与terminal reason不进入Recorder。
@@ -142,8 +145,11 @@ Skill/Workspace等module产生的typed User内容。exact source authorization�
 **PromptContributionStamp**：
 通过`content_part_index`关联一个顶层content part的安全解释元数据。只保存SkillId或WorkspaceRootKey加relative location；不保存字符offset、绝对路径、authorization或正文引用。
 
+**ModelMessage**：
+Prompt拥有的crate-private opaque唯一provider-neutral transcript；Prompt alone construct/destructure private kinds。`ModelMessage`与`ModelAssistantContent`是immutable Arc-backed `Clone` values，clone保持semantic identity/order/provenance，是将同一message投影到stable unit和flattened LiveConversationView的唯一方式。read-ref enums和`as_ref()`都不是external API；ProviderAdapter、Compaction estimator/reduction及Prompt assembly/tests等authorized consumers只能inspect `ModelMessageRef`/`ModelAssistantContentRef`：`ModelMessageRef::User { content: &[MessageContent] }`不含stamp，且stamp通过refs不可能访问；Assistant是ordered opaque content；Tool是`ToolCallId + ToolResultContent`。`ModelAssistantContentRef`只读Reasoning、Text或`{ tool_call_id, name, arguments }`。完整ReasoningContent含portable `provider_item_id`这一明确允许的fixture/storage exception；response ID、stream/final index/order bookkeeping、metadata、usage等provider-attempt facts禁止进入。public `PromptValueError`保持不变；transcript constructors返回private redacted `ModelMessageError { EmptyText | UnsafeText | TextTooLong | EmptyAssistantContent | DuplicateToolCallId }`。`rolling_summary()`只可达text reasons（含任意CR或CRLF、无normalization），accepted summary恰为一条unstamped verbatim User/Text，无label/envelope/stamp；assistant constructor独立覆盖empty/duplicate reasons。`unstamped_user_text()`保持独立静态context规则。Storage/Wire/Compaction不得定义shadow transcript。
+
 **AssembledModelContext**：
-PromptSet产生的唯一provider-neutral模型输入，包含ordered System sections、User context、sanitized messages、ToolSpec、OutputContract和assembly proof。
+PromptSet产生的唯一provider-neutral模型输入，包含ordered System sections、User context、sanitized messages、ToolSpec、OutputContract和assembly proof；没有flat contribution_stamps。stamp只留在各User ModelMessage，既非provider payload/cache-control input，也非source locator/authorization。
 
 **ToolService / ToolSet**：
 ToolService拥有definition/registry/policy/sandbox/executor；每Turn构造immutable ToolSet。ToolSet只返回ToolExecutionOutcome，不修改LiveSessionState、不写SessionRecorder、不推进async loop。
@@ -176,7 +182,7 @@ Gateway的一次terminal success或typed failure。ActiveTurnTask验证live basi
 Model stream的process-local AgentMessage/Reasoning累积buffer。ProgressEvent使用stable ItemId；provider final成功后apply为live Item并完成inline record attempt。
 
 **CompactionPlan**：
-从exact `LiveCompactionSourceView`、Turn-captured settings、Prompt assembly bases和TurnModelSnapshot basis构建的immutable plan。只保存source + stable-unit cut，summary prefix、retained suffix和`first_kept_entry_id`均由cut派生；summary成功后先分配Compaction EntryId并Replace live conversation，再best-effort record StoredCompaction。automatic model-call provenance始终为Some。
+M10从exact `LiveCompactionSourceView`、Turn-captured settings、Prompt assembly bases和TurnModelSnapshot basis构建的immutable plan。只保存source + stable-unit cut，summary prefix、retained suffix和`first_kept_entry_id`均由cut派生；M4 `CompactionReplacement`只有crate-test factory和consuming exact `into_parts()`，M10才在`ValidatedCompactionSummary`存在时增加production construction。reducer consume后可clone the prebuilt immutable rolling summary into leading unit/flattened view，retained units只clone from fresh current source，均不重建borrowed message或caller suffix。all fallible preparation/checked-next preflight先于allocation；之后construct exact entry Arc → bind prepared rolling-summary origin → commit Replace → append same Arc → install revision → best-effort record. M4只关闭无await/no-I/O reducer subset（CompactionReplacement + source + cut + orchestration-supplied TurnId/Timestamp）；M5拥有bad recorded marker ignore/diagnose；automatic M10 model-call provenance始终为Some。
 
 ## Turn、Item与Interaction
 
@@ -184,7 +190,7 @@ Model stream的process-local AgentMessage/Reasoning累积buffer。ProgressEvent�
 Turn内稳定可观察对象：UserMessage、AgentMessage、Reasoning或ToolInvocation。final live mutation产生authoritative Item，随后完成inline record attempt。
 
 **Interaction**：
-Item执行期间MiniCore发起的ToolApproval或UserQuestion。request先apply live、完成inline record attempt再notify；resolution先apply live、完成inline record attempt再resume。record failure不阻止notify或resume。
+Item执行期间MiniCore发起的ToolApproval或UserQuestion。ordinary message apply只收valid-by-construction Stored User/Assistant/Tool body，连同orchestration-supplied `TurnId + Timestamp`，不定义message candidate；Interaction是唯一private-candidate exception：request为RequestId + ItemId + owner `InteractionRequest`，连同`TurnId + Timestamp`，resolution为RequestId + optional host key + opaque owner `ResolvedInteraction`，只另收`Timestamp`。`Interaction` fields/raw state只属于LiveSessionState；its transition methods alone construct/resolve it，siblings只读safe projection。`host(...) -> Result<_, InteractionCandidateError>`只接受ToolApproval/UserAnswer或Cancelled(HostCancelled)并seal Some key；`owner_cancellation(...) -> Result<_, InteractionCandidateError>`只接受Cancelled non-Host并seal None，wrong origin在apply/EntryId allocation前拒绝。reducer从exact stored pending request导出resolution的TurnId/Item/family、safe stored body并保留private resolution。reducer绑定SessionId/EntryId/parent并验证supplied TurnId的current/start semantics；Timestamp是Session/Turn orchestration提供的typed fact，绝不读ambient clock，Input start之前也不宣称TurnId/timestamp可从state导出。每Item最多一个Pending Interaction；terminal resolution后允许顺序later interaction。request/resolution先apply live、完成inline record attempt再notify/resume，但它们model-invisible且ConversationRevision `+0`。same-key/same-payload resolution是no-ID/no-entry/no-record/no-event的idempotent outcome。record failure不阻止notify或resume。
 
 **InteractionView**：
 公开UI-safe request/resolution view。Presentation Adapter不能创建虚假Pending Interaction或持有Tool waiter。
@@ -281,7 +287,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2仍按slice增量推进，已完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；M3.1已完成strict Header、六种flat body的exact Conversation Header/Entry per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap、owner/writer invariants和全部conversation golden的byte-exact round-trip；M3.2已完成bounded streaming scanner（known size/stat unavailable 1 GiB cap、LF/CRLF、strict Header、line/count limits、recovery、exclusive writable lease下返回final partial-tail truncation action/offset，以及heavy recipes）；下一任务是M4的Prompt-owned canonical `ModelMessage`与LiveConversation reducer。LiveConversation reducer、SessionRecorder、M5 semantic replay/corruption sidecars仍待实现；later Snapshot/Interaction/Progress/Closed DTO随M8–M10 owning slices增量激活；
+- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2仍按slice增量推进，已完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；M3.1已完成strict Header、六种flat body的exact Conversation Header/Entry per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap、owner/writer invariants和全部conversation golden的byte-exact round-trip；M3.2已完成bounded streaming scanner（known size/stat unavailable 1 GiB cap、LF/CRLF、strict Header、line/count limits、recovery、exclusive writable lease下返回final partial-tail truncation action/offset，以及heavy recipes）；下一任务是M4的Prompt-owned canonical `ModelMessage`、exact ConversationRevision/EntryIdGenerator与LiveConversation reducer；它只关闭INV-003和INV-005 reducer subset（source/cut/marker/no-I/O）。M5拥有tolerant recorded-marker replay，M10才完成full Compaction；M4 read scope仍为crate-private snapshot，public Item/Interaction DTO随M8激活；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 
