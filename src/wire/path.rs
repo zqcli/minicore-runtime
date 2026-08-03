@@ -64,6 +64,76 @@ impl CanonicalFileUri {
     pub fn as_str(&self) -> &str {
         &self.wire
     }
+
+    #[allow(
+        dead_code,
+        reason = "Workspace durable store encoding will use this crate-private wire seam"
+    )]
+    pub(crate) fn from_decoded_parts(
+        family: FileUriFamily,
+        authority: Option<&str>,
+        decoded_path: &str,
+    ) -> Result<Self, PathWireError> {
+        if decoded_path.contains(['\\', '\0']) {
+            return Err(PathWireError::InvalidPath);
+        }
+
+        match family {
+            FileUriFamily::Posix => {
+                if authority.is_some() {
+                    return Err(PathWireError::InvalidFileUri);
+                }
+                validate_posix_path(decoded_path)?;
+            }
+            FileUriFamily::Drive => {
+                if authority.is_some() {
+                    return Err(PathWireError::InvalidFileUri);
+                }
+                validate_drive_path(decoded_path)?;
+            }
+            FileUriFamily::Unc => {
+                let authority = authority.ok_or(PathWireError::InvalidFileUri)?;
+                validate_unc_authority(authority)?;
+                validate_unc_path(decoded_path)?;
+            }
+        }
+
+        let raw_path = encode_decoded_path(family, decoded_path);
+        let mut wire =
+            String::with_capacity("file://".len() + authority.map_or(0, str::len) + raw_path.len());
+        wire.push_str("file://");
+        if let Some(authority) = authority {
+            wire.push_str(authority);
+        }
+        if matches!(family, FileUriFamily::Drive | FileUriFamily::Unc) {
+            wire.push('/');
+        }
+        wire.push_str(&raw_path);
+        wire.parse()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "Workspace durable store encoding will use this crate-private wire seam"
+)]
+fn encode_decoded_path(family: FileUriFamily, path: &str) -> String {
+    let bytes = path.as_bytes();
+    let escape_posix_drive_colon = family == FileUriFamily::Posix
+        && bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':';
+    let mut encoded = String::with_capacity(path.len());
+    for (index, byte) in path.bytes().enumerate() {
+        if byte == b'/' || (is_pchar(byte) && !(escape_posix_drive_colon && index == 2)) {
+            encoded.push(char::from(byte));
+        } else {
+            use fmt::Write as _;
+            write!(encoded, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    encoded
 }
 
 impl FromStr for CanonicalFileUri {
@@ -467,4 +537,129 @@ where
     T::Err: fmt::Display,
 {
     deserializer.deserialize_str(FromStrVisitor(PhantomData))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CanonicalFileUri, FileUriFamily, PathWireError};
+
+    #[test]
+    fn decoded_parts_emit_a_canonical_posix_uri() {
+        let uri = CanonicalFileUri::from_decoded_parts(FileUriFamily::Posix, None, "/work/project")
+            .unwrap();
+
+        assert_eq!(uri.as_str(), "file:///work/project");
+    }
+
+    #[test]
+    fn decoded_parts_emit_exact_canonical_file_uri_literals() {
+        for (family, authority, decoded_path, expected) in [
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work/a b",
+                "file:///work/a%20b",
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/项目/资料",
+                "file:///%E9%A1%B9%E7%9B%AE/%E8%B5%84%E6%96%99",
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work/100%",
+                "file:///work/100%25",
+            ),
+            (FileUriFamily::Posix, None, "/C:/repo", "file:///C%3A/repo"),
+            (
+                FileUriFamily::Drive,
+                None,
+                "C:/work/project",
+                "file:///C:/work/project",
+            ),
+            (
+                FileUriFamily::Unc,
+                Some("server"),
+                "share/project",
+                "file://server/share/project",
+            ),
+        ] {
+            let uri = CanonicalFileUri::from_decoded_parts(family, authority, decoded_path)
+                .unwrap_or_else(|error| panic!("rejected {decoded_path:?}: {error}"));
+            assert_eq!(uri.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn decoded_parts_reject_invalid_family_shapes_and_paths() {
+        for (family, authority, decoded_path, expected) in [
+            (
+                FileUriFamily::Posix,
+                Some("server"),
+                "/work",
+                PathWireError::InvalidFileUri,
+            ),
+            (
+                FileUriFamily::Drive,
+                Some("server"),
+                "C:/work",
+                PathWireError::InvalidFileUri,
+            ),
+            (
+                FileUriFamily::Unc,
+                None,
+                "share",
+                PathWireError::InvalidFileUri,
+            ),
+            (
+                FileUriFamily::Unc,
+                Some("Server"),
+                "share",
+                PathWireError::InvalidAuthority,
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work\\project",
+                PathWireError::InvalidPath,
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work\0project",
+                PathWireError::InvalidPath,
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work//project",
+                PathWireError::InvalidPath,
+            ),
+            (
+                FileUriFamily::Posix,
+                None,
+                "/work/.",
+                PathWireError::InvalidPath,
+            ),
+            (
+                FileUriFamily::Drive,
+                None,
+                "C:/work/",
+                PathWireError::InvalidPath,
+            ),
+            (
+                FileUriFamily::Unc,
+                Some("server"),
+                "share/",
+                PathWireError::InvalidPath,
+            ),
+        ] {
+            assert_eq!(
+                CanonicalFileUri::from_decoded_parts(family, authority, decoded_path),
+                Err(expected),
+            );
+        }
+    }
 }
