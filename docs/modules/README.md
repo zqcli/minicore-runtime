@@ -1,8 +1,8 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1。M1 Wire foundation与owner semantic spine及M4 Prompt-owned opaque `ModelMessage`、LiveSessionState reducer已经实现；Runtime、Session、Recorder/replay、SessionExecutor/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0135冻结async conversation/public wire基础；ADR 0136冻结DurableState、Durable Store V1、root lease、reservation与new-entity Create/Fork complete-or-invisible / existing-head update old-or-new publication；ADR 0137冻结Tokio owner-tracked deterministic foundation。M5.0 design gate已完成；DurableState foundation、Runtime、Session、Recorder/replay、SessionExecutor/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
 
-权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
+权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
 ## 领域关系
 
@@ -30,7 +30,10 @@ MiniCoreRuntime
 - [Turn执行上下文](turn-execution-context.md)：immutable capture、ConversationRevision和ModelCallRequest basis。
 - [Turn / Item / Interaction](turn-item-interaction.md)：live lifecycle、complete Tool exchange、Interaction和Tool start gate。
 - [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md)：exact Stored DTO envelope、field order、limits与corruption vectors。
-- [Conversation Recording与Replay](conversation-storage.md)：LiveSessionState reducer transaction/capture、SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork。
+- [Durable Store V1](../formats/durable-store-v1.md)：exact local entity layout、head/definition bytes、markers与strict recovery。
+- [Durable Store V1 Fixtures](../fixtures/durable-store-v1/README.md)：golden documents、crash taxonomy与structural verifier。
+- [DurableState](durable-state.md)：private actor、reservation/root lease/CAS/generation/publication/recovery/fault seam。
+- [Conversation Recording与Replay](conversation-storage.md)：LiveSessionState reducer transaction/capture、SessionRecorder、best-effort JSONL prefix、RecordingHealth、tolerant replay和fork semantic seed。
 - [Session执行](session-execution.md)：SessionExecutor actor、ActiveTurnTask、async run loop、Steer/FollowUp/Cancel。
 - [ModelGateway](model-gateway.md)：TurnModelSnapshot、single provider attempt、stream、usage和typed errors。
 - [Compaction](compaction.md)：revision-bound stable units、Runtime settings、source+cut marker、summary budget与best-effort recording。
@@ -49,6 +52,7 @@ MiniCoreRuntime
 | immutable Turn capture与live execution basis | [Turn执行上下文](turn-execution-context.md) |
 | Turn/Item/Interaction与Tool exchange | [Turn / Item / Interaction](turn-item-interaction.md) |
 | exact conversation JSONL v1 envelope与Stored DTO projection | [Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md) |
+| local entity physical layout、root lease、reservation/generation/marker publication、catalog recovery | [DurableState](durable-state.md) / [Durable Store V1](../formats/durable-store-v1.md) |
 | Live reducer transaction/capture、JSONL semantic recording、RecordingHealth与cold replay | [Conversation Recording与Replay](conversation-storage.md) |
 | control actor、ActiveTurnTask与async loop | [Session执行](session-execution.md) |
 | provider attempt与response validation | [ModelGateway](model-gateway.md) |
@@ -56,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1 exact Conversation line codec、M3.2 bounded physical scanner与M4 Prompt-owned opaque `ModelMessage`/LiveConversation reducer已经完成；Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。下一任务是M5.0 durable entity/async foundations design gate，随后M5 Recorder/semantic replay，再进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4与M5.0 durable entity/async design gate已完成。M3.2 only implemented the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its future sole production issuer and does not claim root-lease production implementation. M5.0 foundation implementation是下一任务，随后是M5.1 Recorder与M5.2 semantic replay，再进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

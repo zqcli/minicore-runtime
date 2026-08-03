@@ -1,8 +1,8 @@
 # MiniCore Agent Runtime
 
-本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环；ADR 0134、exact Conversation JSONL v1与conformance vectors冻结bounded public/storage wire；ADR 0135区分host-neutral Workspace public input与durable native Workspace root。
+本上下文描述MiniCore V2当前架构。ADR 0126已经把Turn执行重构为async loop并把Session持久化降级为inline best-effort recording；ADR 0127进一步将JSONL收口为不含Turn lifecycle的conversation recording；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload、安全Interaction和metadata/command completion闭环；ADR 0134/0135冻结bounded wire与host-neutral Workspace input；ADR 0136冻结DurableState/Store V1/root lease（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new），ADR 0137冻结Tokio owner-tracked deterministic foundation。M5.0 design gate已完成，foundation implementation pending。
 
-权威顺序：`docs/architecture.md`与`docs/modules/` → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
+权威顺序：`docs/architecture.md`与`docs/modules/` → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
 ## 核心术语
 
@@ -67,7 +67,7 @@ process-local单调live-conversation operation basis，不是当前可见消息�
 `LiveSessionState`私有持有的Session-scoped identity generator。`allocate()`是typed fallible operation：16 CSPRNG-byte candidate最多32次、unique candidate在return前reserve；entropy或collision exhaustion是owner-local redacted error，不panic且不改变state/head/revision。domain validation和revision overflow preflight后、live apply前分配并绑定parent_id；replay/Fork全部reserved copied IDs seed collision guard。Degraded不影响分配，Recorder不能创建或改写ID，也不得从revision/ordinal/time派生ID。
 
 **SessionRecorder**：
-每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append稳定conversation fact，不使用后台task或queue，也不提供durable commit receipt。TurnStatus与terminal reason不进入Recorder。
+每个loaded Session一个的有序inline best-effort记录器。`record(entry).await`顺序encode并append稳定conversation fact，不使用background queue或durable commit receipt。其filesystem blocking job由owner追踪/join；started append不因Cancel/Unload/drop而detach，terminal/unload等待settlement。TurnStatus与terminal reason不进入Recorder。
 
 **RecordingHealth**：
 Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严格stage initial SessionHeader；每次Load都尝试初始化Recorder。Recorder第一次initialize/encode/write失败后Degraded并停止后续记录，replay最多恢复此前有效完整行前缀。Degraded在同一loaded instance内为终态，不retry、不创建segment、不backfill；recording failure不终止Turn、不使Session execution Unavailable。
@@ -75,8 +75,11 @@ Recorder内部状态`Healthy | Degraded { reason, failed_entry_id }`。Create严
 **SessionRecordingView**：
 公开`SessionSnapshot.recording`使用`{ state: healthy | degraded }`。first `Healthy → Degraded`发布一次`session_recording_changed`，同一Snapshot保留至少一条当前脱敏recording diagnostic。raw I/O error、路径和entry内容不公开。
 
-**SessionStorage**：
-负责create/open recorded JSONL、tolerant replay、history tree/query，以及从RecordedHistory或LiveSnapshot staging Fork。它不再是loaded conversation truth，也不向async loop签发committed delta。
+**DurableState**：
+private deep module，拥有local Store V1、permanent ID reservation、root lease、single actor、generation/CAS/marker publication/readback、catalog recovery/cleanup、poison和filesystem fault seam。它不暴露staging/path/generation/marker；`CommandId`不进入它。
+
+**ConversationStorage**：
+拥有SessionHeader/JSONL、tolerant replay、history tree/query和Fork semantic seed。它通过DurableState-issued opaque published target、RecordedHistory lease和root-lease-derived writable proof工作，不拥有entity path/publication，也不向async loop签发committed delta。
 
 **StoredSessionEntry**：
 SessionRecorder可能写入的一条immutable Format V1 conversation entry。exact wire fields依次为`entryId`、`parentId`、`sessionId`、`turnId`、`timestamp`和`body`；body是User/Assistant/Tool/InteractionRequested/InteractionResolved/Compaction六种snake_case flat variants。EntryId由live owner在apply前分配，Recorder不能创建或改写。
@@ -287,7 +290,7 @@ PromptIntent::Skill / PromptIntent::Composite / PromptBodyIntent::Template
 ## 当前开放问题
 
 - 第四轮评审：全部V4-P0、V4-P1-1、V4-P1-2与V4-P1-4已关闭；V4-P1-3仍开放；
-- M0文档/质量基线与M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2仍按slice增量推进，已完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；M3.1已完成strict Header、六种flat body的exact Conversation Header/Entry per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap、owner/writer invariants和全部conversation golden的byte-exact round-trip；M3.2已完成bounded streaming scanner（known size/stat unavailable 1 GiB cap、LF/CRLF、strict Header、line/count limits、recovery、exclusive writable lease下返回final partial-tail truncation action/offset，以及heavy recipes）；M4已完成Prompt-owned opaque `ModelMessage`、exact `ConversationRevision`/`EntryIdGenerator`、`LiveSessionState`的User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset，关闭INV-003和INV-005 reducer subset（source/cut/marker/no-I/O）；Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。下一任务是M5.0 durable entity/async foundations design gate，随后M5 Recorder/semantic replay；M5拥有tolerant recorded-marker replay，M10才完成full Compaction；M4 read scope仍为crate-private snapshot，public Item/Interaction DTO随M8激活；
+- M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成；M1 Wire foundation/owner semantic spine已完成并通过Fast、MSRV与heavy gates；M2仍按slice增量推进，已完成Protocol V1 bootstrap router、incremental public manifest conformance gate、initial typed Wire roots、M7 Create/Load/Unload/Submit/Cancel command codec、TurnStarted/CommandOutput/typed rejection completion，以及minimal loaded-ready-idle SessionSnapshot与Runtime/Turn terminal StateEvent codec；M3.1已完成strict Header、六种flat body的exact Conversation Header/Entry per-line codec、bounded duplicate-aware preflight与raw ToolCall `arguments` cap、owner/writer invariants和全部conversation golden的byte-exact round-trip；M3.2仅完成bounded streaming scanner（known size/stat unavailable 1 GiB cap、LF/CRLF、strict Header、line/count limits、recovery，以及要求opaque `ExclusiveWritableConversationLease`才返回final partial-tail truncation action/offset）；M5.0 design now makes DurableState its future sole production issuer，且不宣称root lease已有production implementation；M4已完成Prompt-owned opaque `ModelMessage`、exact `ConversationRevision`/`EntryIdGenerator`、`LiveSessionState`的User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset，关闭INV-003和INV-005 reducer subset（source/cut/marker/no-I/O）；Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。M5.0 durable entity/async design gate已完成；下一任务是M5.0 foundation implementation，随后M5.1 Recorder与M5.2 semantic replay；M5拥有tolerant recorded-marker replay，M10才完成full Compaction；M4 read scope仍为crate-private snapshot，public Item/Interaction DTO随M8激活；
 - V4-P1-3：production provider scope与Rig 0.40.0 reality/mock-server spike；
 - production Tool/Sandbox adapter前关闭O1/R7。
 

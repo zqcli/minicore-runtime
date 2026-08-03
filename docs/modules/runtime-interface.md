@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
+状态：当前权威架构（ADR 0136/0137；M5.0 design gate 已冻结，foundation implementation pending）
 
 ## 目的
 
@@ -12,7 +12,7 @@
 - Command、Query、Snapshot 和 Event 各自负责什么；
 - Agent、Session、Turn、Item 和 Interaction 如何进入公开 payload；
 - Command 何时返回、异步业务完成如何通知；
-- SessionStorage message tree 如何通过 Runtime 读取和操作；
+- Conversation Storage message tree 如何通过 Runtime 读取和操作；
 - streaming progress 与可靠状态变化如何分离；
 - 多 loaded Session 如何订阅、恢复和避免全 Runtime snapshot barrier；
 - slash command 和 GUI command palette 如何共享 CommandSurface；
@@ -24,7 +24,7 @@
 - [MiniCore 领域模型](../architecture.md)
 - [Agent 与 Session 生命周期](agent-session-lifecycle.md)
 - [Turn、Item 与 Interaction](turn-item-interaction.md)
-- [Conversation 与 SessionStorage](conversation-storage.md)
+- [Conversation Recording 与 Replay](conversation-storage.md)
 - [Session Execution](session-execution.md)
 - [ModelGateway](model-gateway.md)
 - [Compaction](compaction.md)
@@ -36,7 +36,7 @@
 - CLI、TUI、Vue、Tauri command 或 widget 的具体实现；
 - JSON-RPC、WebSocket、Tauri IPC 的完整 wire schema；
 - 独立 daemon、跨进程长期 event replay 或 multi-client authorization；
-- provider、Rig、Tool executor、PromptSet 或 SessionStorage 的公开调用入口；
+- provider、Rig、Tool executor、PromptSet 或 Conversation Storage 的公开调用入口；
 - UI selected Session、输入框草稿、滚动位置、窗口布局或折叠状态；
 - standalone/manual `CompactSession`；
 - Extension / Plugin 协议。
@@ -62,7 +62,8 @@
 - 同一 Session 内不提供原地 checkout/navigation mutation；
 - CommandSurface 是 MiniCoreRuntime 内部无状态命令解释模块；slash command 只是 command text 的一种语法；
 - 所有改变 Runtime 事实的 UI 操作都经过 MiniCoreRuntime；纯 UI 状态留在 adapter；
-- 公开 interface 是 in-process Rust interface 和 transport-neutral serde types；具体 transport 使用薄 adapter。
+- 公开 interface 是 in-process Rust interface 和 transport-neutral serde types；具体 transport 使用薄 adapter；
+- host构造MiniCore时显式注入一个clone的`tokio::runtime::Handle`，不使用ambient `Handle::current()`；这不是第五个wire entry point。
 
 ## 同类产品取舍
 
@@ -85,7 +86,7 @@ External host
    └─ subscribe(SubscriptionRequest)
 
 MiniCoreRuntime private implementation
-├─ Agent / Session durable owners
+├─ DurableStateActor / immutable Agent / Session durable catalog
 ├─ LoadedSessionExecutors
 ├─ CommandManager
 ├─ PromptService
@@ -93,7 +94,7 @@ MiniCoreRuntime private implementation
 ├─ SkillService
 ├─ ModelGateway
 ├─ WorkspaceResolver / WorkspaceAuthority adapters
-├─ SessionStorage / SessionRecorder
+├─ DurableState / ConversationStorage / SessionRecorder
 ├─ runtime state publisher
 └─ per-session state/progress publishers
 ```
@@ -129,9 +130,31 @@ pub trait MiniCoreRuntimeInterface: Send + Sync {
 }
 ```
 
-四个 entry point 是同一个深模块的公开 interface。它们共享 identity、error、view、revision 和 redaction 类型，但职责不重叠。
+四个 entry point 是同一个深模块的公开 interface。它们共享 identity、error、view、revision 和 redaction 类型，但职责不重叠。Host-only lifecycle API固定为：
 
-`dispatch()`的外层`Err(RuntimeDispatchError)`只表示请求无法进入Runtime/dedup completion owner；一旦进入，领域成功、typed rejection和user pre-Turn cancellation都通过`Ok(CommandResponse { command_id, completion })`返回。这样每个accepted envelope恰好有一个可correlate completion。
+```rust
+impl MiniCoreRuntime {
+    pub async fn open(
+        config: MiniCoreRuntimeConfig,
+        handle: tokio::runtime::Handle,
+    ) -> Result<Self, RuntimeInitializationError>;
+
+    pub async fn shutdown(&self);
+}
+
+pub enum RuntimeInitializationError {
+    RuntimeDependencyUnavailable,
+    StoreInUse,
+    UnsupportedStoreFormat,
+    DurableStateCorrupt,
+    DurableStateTooLarge,
+    StorageUnavailable,
+}
+```
+
+`MiniCoreRuntimeConfig`包含host配置的dedicated durable root与现有runtime options；它不是wire DTO。`open`只使用显式传入的cloned Handle，不调用`Handle::current()`；owner-tracked timer probe把missing runtime/time driver panic或join failure映射为`RuntimeDependencyUnavailable`，其余variants一对一映射DurableState open分类。`RuntimeInitializationError`的`Debug`/`Display`同样redacted，不暴露path、OS source或durable bytes。`shutdown`是idempotent host-only non-wire seam，不是第五个protocol entry point。Facade `Drop`只发best-effort Closing signal且不阻塞；host必须await shutdown才能观察全部join、root lease release与Closed。
+
+`dispatch()`的外层`Err(RuntimeDispatchError)`通常只表示请求无法进入Runtime/dedup completion owner；一旦进入，领域成功、typed rejection和user pre-Turn cancellation都通过`Ok(CommandResponse { command_id, completion })`返回。 The sole post-admission integrity-fatal outer result is the existing `RuntimeDispatchError::InternalDispatchUnavailable`: DurableState `CommittedCorruptPoisoned`/`IndeterminatePoisoned`, or a post-commit required live-publication invariant poison such as owner-settled loaded Workspace installation failure, settles all joined in-process dispatch waiters with that `Err`. It does not claim mutation absence or rejection. Transport sends it if possible then closes, otherwise closes the connection; hosts query/reopen and must not blind-retry Create/Fork. `RuntimeClosed` is for later requests after close. If marker plus exact payload proves Published but a post-marker sync fails, DurableState first installs catalog and fulfills all waiters with Completed, then enters Closing/shutdown—failure-induced Closing cannot overtake completion. If host shutdown is already Closing, its durable-job settlement phase cannot pass until that Published completion has been fulfilled. No new wire outcome, variant, or code exists; see [ADR 0136](../adr/0136-durablestate-operation-owned-generations.md).
 
 ### Capability Matrix
 
@@ -221,7 +244,7 @@ pub struct CommandRequest {
 }
 ```
 
-`CommandId`由调用adapter在dispatch前生成，必须使用不可预测随机值且不得复用于另一条命令。当前Runtime内原命令仍in-flight时，相同`CommandId + exact typed command`重试加入同一completion；同一in-flight CommandId携带不同command返回`CommandCompletion::Rejected(CommandError { code: CommandConflict, ... })`。CommandId不持久化，restart后旧命令不能靠它重放或恢复；调用方改用Snapshot/Query确认durable结果，并为新命令生成新ID。每个Command使用语义明确的expected revision、expected status或expected TurnId表达乐观并发。
+`CommandId`由调用adapter在dispatch前生成，必须使用不可预测随机值且不得复用于另一条命令。当前Runtime内原命令仍in-flight时，相同`CommandId + exact typed command`重试加入同一completion；同一in-flight CommandId携带不同command返回`CommandCompletion::Rejected(CommandError { code: CommandConflict, ... })`。它只属于process-local/in-flight dedup：不持久化、不传给DurableState、不提供completed cache或durable-outcome query，restart后也不能重放/恢复。Create/Fork publication后若crash或response loss，generated ID可能catalog-visible但host未收到且无法唯一关联；host必须重新page/query catalog，blind retry可能创建duplicate。这是V1明确不提供restart exactly-once Create/Fork的限制。每个Command仍使用expected revision/status/TurnId表达乐观并发。
 
 ### RuntimeCommand
 
@@ -439,7 +462,9 @@ pub enum ForkAnchor {
 }
 ```
 
-Runtime在已确定的Fork source内解析公开anchor：loaded source在同一个LiveSnapshot内解析anchor并复制selected path，unloaded source在RecordedHistory中解析。解析结果是target staging的合法path end：
+Wire uses the mixed-enum rule from Wire Schema: `ForkAnchor::Genesis` is exactly `{"type":"genesis"}` with `data` omitted; `data:null` and `data:{}` are invalid. Every payload anchor is exactly `{"type":"...","data":{"itemId":"..."}}`.
+
+Runtime在已确定的Fork source内解析公开anchor：loaded source在同一个LiveSnapshot内解析anchor并 semantic-re-encodes selected path, unloaded source在RecordedHistory中解析。解析结果是target staging的合法path end：
 
 - `BeforeUserMessage(Input/Steer)`解析到该message的parent；
 - `AfterUserMessage`包含source中的对应UserMessage；该Item已live apply即可，不要求source record attempt已经成功；
@@ -682,7 +707,7 @@ pub enum CommandOutcome {
 
 Command completion不是完整业务完成流：
 
-- command一旦通过envelope validation进入Runtime，所有领域/admission成功或拒绝都通过同一个`CommandResponse.command_id`完成；`RuntimeDispatchError`不承载普通Stale/Busy/NotFound；
+- command一旦通过envelope validation进入Runtime，领域/admission成功或拒绝都通过同一个`CommandResponse.command_id`完成；`RuntimeDispatchError`不承载普通Stale/Busy/NotFound。Only an integrity-fatal post-admission failure settles joined waiters as existing `InternalDispatchUnavailable`: DurableState poison or post-commit required live-publication invariant poison, with no semantic completion and no new public wire outcome. Published plus valid readback followed by a sync failure instead completes all waiters before Closing；
 - `Completed.output`只有`outcome = CommandOutput`时为Some，其他outcome为None；`Rejected`没有CommandOutput；
 - Agent/Session create返回definition与metadata两个独立revision；definition、metadata、status/lifecycle mutation使用不同outcome，caller不能把metadata token误当execution revision；
 - metadata canonical no-op返回`NoChange`并保持原token，不发布metadata event；
@@ -700,10 +725,10 @@ Command completion不是完整业务完成流：
 
 | Command | Response线性化点 |
 | --- | --- |
-| Create Agent | Agent definition、metadata与head（definition revision 1、metadata revision 1）原子durable publication |
+| Create Agent | DurableState establishes complete publication and installs immutable catalog; response loss may leave the published ID unknown. |
 | Update Agent Definition | expected AgentRevision/status CAS成功，返回new definition revision或NoChange |
 | Update Agent Metadata | expected AgentMetadataRevision/status CAS成功，返回new metadata revision或NoChange |
-| Create Session | SessionDefinition、metadata与initial SessionHeader staging成功后原子发布Open + Unloaded Session；definition/metadata revision均为1，不启动Recorder |
+| Create Session | DurableState establishes complete publication-time Agent pin and immutable Open + Unloaded catalog; response loss may leave the published ID unknown. |
 | Update SessionDefinition（non-Workspace或unloaded Workspace） | new definition revision durable publication |
 | Update Session Metadata | expected SessionMetadataRevision/lifecycle CAS成功，返回new metadata revision或NoChange |
 | Update loaded Session Workspace | Idle校验、new revision durable publication和new WorkspaceSnapshot Ready publication全部完成 |
@@ -718,7 +743,7 @@ Command completion不是完整业务完成流：
 | Resolve Interaction | InteractionResolved live apply与inline record attempt |
 | Cancel Submit(CommandId) | active target仍可取消且sticky cancel epoch发布；user Cancel在Input apply前先赢时原Submit完成`SubmitCancelled`，Input apply先赢时原Submit完成`TurnStarted`并随后TurnInterrupted；target已转换为published Turn时返回SubmitNotCancellable |
 | Cancel Turn | active target仍可取消且sticky cancel epoch发布；live final arbitration先完成时返回typed terminal/transition error；最终TurnInterrupted由StateEvent/Snapshot表达 |
-| Fork Session | source kind与immutable path已捕获，target staging完整materialize并验证后原子发布 |
+| Fork Session | source kind/semantic seed is captured, actor-owned semantic re-encode fully materializes/validates the child, and DurableState establishes complete publication and immutable catalog; response loss may leave the child ID unknown. |
 
 ### Command Error
 
@@ -797,7 +822,7 @@ pub enum PublicSubject {
 
 `message`是bounded、redacted、仅供人读的补充；外部调用方不能解析它决定retry。`code + retry + subject`是唯一machine contract。`IngressLaneFull`只允许上面的五个public work lane；EmergencyControl、LifecycleControl和SnapshotMailbox不产生该错误。
 
-`RuntimeDispatchError`只用于无法形成command completion的envelope/runtime入口故障：
+`RuntimeDispatchError`通常用于无法形成command completion的envelope/runtime入口故障；唯一例外是既有`InternalDispatchUnavailable`也承载post-admission integrity-fatal settlement：
 
 ```rust
 pub enum RuntimeDispatchError {
@@ -909,7 +934,7 @@ pub enum ResolvedCommandAction {
 Handler不能：
 
 - 直接修改SessionExecutor；
-- 直接写SessionStorage；
+- 直接写Conversation Storage；
 - 直接调用ModelGateway或Tool executor；
 - 携带完整高权限RuntimeCommand进入UI catalog；
 - 读取credential、raw provider payload、Skill正文或完整Prompt正文。
@@ -2153,7 +2178,7 @@ LiveSessionState
 SessionRecorder
 └─ validates immutable entry identity/relation, then encode/append without rewriting ID
 
-SessionStorage
+ConversationStorage
 ├─ owns recorded EntryId + parent_id tree, tolerant replay and fork staging
 ├─ isolates invalid replay references and emits diagnostics
 └─ produces recorded history/read projections
@@ -2161,7 +2186,7 @@ SessionStorage
 SessionExecutor / ActiveTurnTask
 ├─ invokes LiveSessionState private mutation methods
 ├─ owns active Turn mutation ordering
-└─ requests SessionStorage history/fork operations
+└─ requests ConversationStorage history/fork operations
 
 MiniCoreRuntime
 ├─ exposes SessionQuery::GetHistoryTree / ListTurns / ListItems
@@ -2483,7 +2508,7 @@ SkillService / SkillView / LoadedSkill
 WorkspaceSnapshot / EmergencyControl signal
 ModelGateway / TurnModelSnapshot private execution ref
 ProviderAdapter / AuthStore
-SessionRecorder / SessionStorage implementation
+SessionRecorder / ConversationStorage implementation
 LiveSessionState / LiveConversation reducer
 ToolExecutionControl / ToolStartPermit
 ```
@@ -2494,7 +2519,7 @@ ToolExecutionControl / ToolStartPermit
 
 ```text
 RuntimeDispatchError
-  协议请求无法进入Runtime，例如RuntimeClosed、invalid envelope、fatal unavailable
+  接纳前请求无法进入Runtime，或唯一的post-admission integrity-fatal `InternalDispatchUnavailable`（DurableState poison / required live-publication poison）；later closed requests use RuntimeClosed
 
 CommandError
   命令在领域或admission处被拒绝
@@ -2542,7 +2567,7 @@ Runtime Interface只拥有public projection，不把module error迁移到全局e
 | temporary source/storage/model resolution unavailable before admission | `Unavailable` | `RetryWithBackoff` |
 | required durable entity/history损坏 | `DurableStateCorrupt` | `UserActionRequired` |
 | valid durable history超过v1 1 GiB/1,000,000-entry hard cap | `DurableStateTooLarge` | `UserActionRequired` |
-| admitted command遇Runtime shutdown | `RuntimeClosing` | `RetryWithBackoff` |
+| request rejected before its relevant named barrier because Runtime is Closing | `RuntimeClosing` | `RetryWithBackoff` |
 | internal invariant/channel failure发生在command seam | `Unavailable` | `DoNotRetry` + redacted diagnostic |
 
 Envelope/runtime入口失败不进入上述Command table：
@@ -2552,7 +2577,7 @@ Envelope/runtime入口失败不进入上述Command table：
 | 无法decode/validate `CommandRequest` envelope | `RuntimeDispatchError::InvalidEnvelope` |
 | frame/request超过outer transport/runtime request limit | `RuntimeDispatchError::RequestTooLarge` |
 | Runtime已经closed | `RuntimeDispatchError::RuntimeClosed` |
-| command dedup/router在接纳前不可用 | `RuntimeDispatchError::InternalDispatchUnavailable` |
+| command dedup/router在接纳前不可用，或joined post-admission waiters观察到DurableState poison / post-commit required live-publication invariant poison | `RuntimeDispatchError::InternalDispatchUnavailable` |
 
 一旦CommandId与typed RuntimeCommand已经被dedup owner接纳，后续field/domain size或semantic validation只能完成为`CommandCompletion::Rejected(CommandError)`，不能再返回outer error。
 
@@ -2573,7 +2598,7 @@ stage规则：
 
 - Prompt/Skill/Workspace/Agent/model resolution发生在initiating Input live apply前时，可以`Rejected(CommandError)`；Input没有部分apply；
 - user Cancel在Input apply前获胜是`Completed(SubmitCancelled)`，不是`CommandErrorCode`；
-- Input live apply后原Submit已经成功，后续Prompt assembly、Model、Compaction或loop invariant failure只能发布`TurnFailed` StateEvent/Snapshot，不得retroactively Reject Submit；
+- Input live apply后原Submit已经成功，后续Prompt assembly、Model、Compaction或ordinary loop failure只能发布`TurnFailed` StateEvent/Snapshot，不得retroactively Reject Submit；若shutdown在Recorder physical barrier前先赢，record attempt truthful返回`NotRecorded`/Degraded，owner仍完成`TurnStarted`并随后settle同一Turn interruption。只有post-commit required live-publication integrity poison使用outer `InternalDispatchUnavailable`；
 - Tool unknown/schema/policy/approval/sandbox/cancel-before-start形成truthful PreExecution ToolResult；Running后outcome unknown形成Abandoned。它们不是CommandError；
 - Interaction `Resolve`自身的route/family/idempotency错误仍是CommandError；被接受后Tool后续失败走ToolResult/Turn terminal；
 - SessionRecorder failure只把recording投影为Degraded，不改变command outcome、Turn terminal reason或retry advice；

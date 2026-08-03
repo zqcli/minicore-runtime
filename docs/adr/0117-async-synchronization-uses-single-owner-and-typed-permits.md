@@ -1,8 +1,10 @@
 # ADR 0117：异步同步使用单 Owner、短临界区与 Typed Permit
 
-状态：Partially Superseded by ADRs 0124, 0125, 0126 and 0127
+状态：Partially Superseded by ADRs 0124, 0125, 0126, 0127 and 0137
 日期：2026-07-27
 
+> 2026-08-03 refinement: ADR 0137 owns the current Tokio owner-tracked job, barrier, shutdown, and permit details; ADR 0136 owns durable-root publication. Read those current ADRs and their canonical modules for any current rule. The historical decision below is retained unchanged.
+>
 > 2026-07-31：single owner、短guard、ToolStartGate、file mutation permit和release-before-fan-out继续有效。ADR 0127把Turn start线性化点收缩为final Enabled check + Input live apply；Agent lifecycle permit不跨SessionRecorder await，旧start-commit/controlled terminal append语义删除。
 
 > 2026-07-30：短guard、no-lock-across-await、ToolStartGate和release-before-fan-out保留；single mutable Executor owner与controlled append permit由control actor + ActiveTurnTask + live mutation取代。

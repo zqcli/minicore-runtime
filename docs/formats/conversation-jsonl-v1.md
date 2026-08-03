@@ -1,6 +1,6 @@
 # Conversation JSONL Format V1
 
-状态：当前权威format specification（ADR 0134，生产实现待启动）
+状态：当前权威format specification（ADR 0134；M3.1 exact line codec与M3.2 scanner已完成，M5 Recorder/replay implementation pending）
 日期：2026-07-31
 
 ## Scope
@@ -21,7 +21,7 @@
 ## Physical File
 
 ```text
-sessions/<SessionId>.jsonl
+sessions/<SessionId>/conversation.jsonl
 ```
 
 ```text
@@ -66,7 +66,7 @@ Exact wire：
 - Header.sessionId必须匹配caller打开的catalog/path SessionId；
 - Header没有EntryId/parent/TurnId；
 - Header只证明file identity与creation provenance，不是current definition/authorization；
-- writable open只有在valid v1 Header与exclusive lease后才可truncate final partial tail；
+- M3.2 scanner only returns a final partial-tail truncation action after a valid v1 Header and opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its future sole production issuer after held-root-lease SessionId/same-open-file binding, while the current `#[cfg(test)]` constructor remains M3-only until implementation；
 - v1 writer不向higher version file append。
 
 ## Entry Envelope

@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
+状态：当前权威架构（ADR 0136/0137；M5.0 design gate 已冻结，foundation implementation pending）
 日期：2026-07-31
 
 ## 目的
@@ -19,9 +19,9 @@
 
 本文不提前冻结：
 
-- Agent/Session durable store的具体实现类型；
+- DurableState physical store、root lease、immutable generation和publication由[DurableState](durable-state.md)与[Durable Store V1](../formats/durable-store-v1.md)冻结；本模块不复制其实现接口；
 - Runtime command、query、event 和 transport payload；
-- SessionStorage entry tree与fork copy语义的重复定义；这些以 [Conversation 与 SessionStorage 架构设计](conversation-storage.md) 为权威；
+- Conversation Storage的Header/JSONL entry tree、replay和fork semantic seed；这些以 [Conversation Recording 与 Replay](conversation-storage.md) 为权威；
 - loaded Session的SessionExecutor具体scheduler/runtime实现；其ownership以[Session Execution架构设计](session-execution.md)为权威；
 - Agent definition 的 Tool/Skill/Model 等未来完整字段；
 - physical purge、retention 和 revision GC 策略。
@@ -76,7 +76,7 @@ Session
 │  ├─ Workspace
 │  ├─ SessionModelConfig
 │  └─ SessionPromptSelection
-└─ SessionStorage conversation
+└─ Conversation Storage JSONL semantic history
 
 loaded Session execution
 ├─ exact SessionDefinition
@@ -102,7 +102,7 @@ pub struct Agent {
     pub name: String,
     pub description: Option<String>,
     pub created_at: Timestamp,
-    pub updated_at: Timestamp,
+    pub metadata_updated_at: Timestamp,
 }
 ```
 
@@ -233,18 +233,14 @@ candidate admission在initiating UserMessage live apply前必须经过短Agent l
 ### Create Agent
 
 ```text
-验证 AgentId 未使用
-→ 验证 initial AgentDefinition与metadata
-→ durable 写入 AgentRevision(1)
-→ durable 发布 Agent head {
-     Enabled,
-     current_revision = 1,
-     metadata_revision = 1,
-     initial metadata
-   }
+验证 initial AgentDefinition与metadata
+→ lifecycle owner从CSPRNG取得sealed AgentId candidate
+→ DurableState create_new permanent reservation（最多32次definite collision）
+→ DurableState establishes complete generation-1 publication and installs immutable catalog
+→ catalog { Enabled, definition revision 1, metadata revision 1 } becomes visible
 ```
 
-create 必须原子可见。失败或 crash 的 staging definition 不进入 Agent catalog。
+create 必须complete-or-invisible。reservation成功后ID永不更换或复用；失败/crash的invisible staging可清理但reservation保留。DurableState alone establishes complete publication and installs the immutable catalog; physical paths、markers和generation不离开DurableState。
 
 ### Update Agent Definition
 
@@ -278,9 +274,9 @@ metadata update不产生AgentRevision，也不改变active/future Turn execution
 ### Disable / Enable / Delete
 
 - Disable、Enable和Delete使用Agent lifecycle synchronization；
-- 重复进入相同状态幂等；
-- Deleted 不允许 Enable；
-- command outcome unknown时按`CommandId`查询durable head，不能重复创建其他状态事实；
+- repeated Disable while Disabled / Enable while Enabled returns `NoChange`，不写generation、不递增revision且无event；
+- Delete against already Deleted returns typed `AgentDeleted`，不写generation；Deleted 不允许 Enable；
+- `CommandId`只在当前Runtime内作in-flight correlation；它不查询durable head、不跨restart恢复。Create/Fork response loss后host重新page/query catalog，blind retry可能产生新实体；
 - loaded Sessions可以接收readiness invalidation，但initiating UserMessage live apply前的durable AgentStatus validation才是authoritative决策点。
 
 ## Session
@@ -297,7 +293,7 @@ pub struct Session {
     pub name: Option<String>,
     pub description: Option<String>,
     pub created_at: Timestamp,
-    pub updated_at: Timestamp,
+    pub metadata_updated_at: Timestamp,
 }
 ```
 
@@ -419,7 +415,7 @@ authority/host hard restriction
 → SessionDefinitionRevision 不变
 ```
 
-Workspace candidate resolve或durable commit失败时，旧definition与旧Snapshot保持current，不存在“已撤权但未提交”的状态。SecurityRevoked不承诺撤销已经打开的OS handle或回滚已进入kernel/provider的operation；started Tool使用Cancel相同的truthful settlement规则。
+Loaded Workspace update uses one SessionExecutor-owned `SessionDefinitionPublicationTask` with shared completion. The task—not the dispatch waiter—owns a distinct `SessionDefinitionPublicationPermit`, the prebuilt `WorkspaceSnapshot`, the DurableState actor request and final installation. It excludes Starting/admission from the successful Idle check through durable publication and installation; DurableStateActor does **not** reacquire this process-local permit. Caller/transport drop cannot cancel the owner task. Before `DurableCommitBarrier`, shutdown may reject and release; after it, the task must settle commit plus installation. If a post-commit install panic/invariant failure occurs, joined waiters receive existing outer `RuntimeDispatchError::InternalDispatchUnavailable` and Runtime integrity-closes rather than exposing a committed definition with no matching snapshot. Workspace candidate resolve或pre-barrier durable failure时，旧definition与旧Snapshot保持current，不存在“已撤权但未提交”的状态。SecurityRevoked不承诺撤销已经打开的OS handle或回滚已进入kernel/provider的operation；started Tool使用Cancel相同的truthful settlement规则。
 
 ## Session Pin Agent Revision
 
@@ -737,30 +733,27 @@ WaitingApproval或WaitingForUserInput中到达的Steer只进入该Turn的FIFO，
 ```text
 验证host-neutral WorkspaceDefinitionInput / Model / SessionPromptSelection candidate
 → Workspace checked host-family lowering为durable WorkspaceRootSpec { path: PathBuf }
-→ 获取Agent lifecycle synchronization
-→ 最终检查 AgentStatus = Enabled
-→ 在同一synchronization内读取current AgentRevisionRef
-→ durable staging SessionDefinitionRevision(1) + initial SessionHeader
-→ 原子发布 Session {
-     Open,
-     current_revision = 1,
-     metadata_revision = 1,
-     initial metadata
-   }及conversation storage target
-→ 确认publication outcome后释放synchronization
+→ lifecycle owner从CSPRNG取得sealed SessionId candidate
+→ DurableState create_new permanent reservation（最多32次definite collision）
+→ actor gate之前只可准备不含assigned SessionId和AgentRevisionRef的parent-independent semantic/canonical candidate fragments
+→ DurableStateActor获取Agent gate，读取current Enabled exact AgentRevisionRef
+→ 在同一gate内构造final SessionDefinition(1)、SessionHeader和generation-1 head bytes
+→ 写入/sync/exact-readback final markerless generation/entity payload
+→ cross DurableCommitBarrier immediately before COMMITTED
+→ 保持该gate直到complete PUBLISHED/readback后才install immutable catalog
 ```
 
-create 的 baseline 结果是 `Open + Unloaded`，不创建SessionExecutor或SessionRecorder。SessionHeader staging失败时Create失败且target不进入Session catalog；create-and-load是上层组合，不改变create的durable语义。
+create 的 baseline 结果是 `Open + Unloaded`，不创建SessionExecutor或SessionRecorder。Create的Agent gate跨final definition/Header/head construction、`DurableCommitBarrier`、`PUBLISHED`与complete readback，但绝不覆盖Recorder、SessionExecutor、event/fan-out或host callback。pre-gate fragment或已经`COMMITTED`的Header只要含stale Agent ref都不得被接受；publication末尾的“final checks”只是同一持续持有gate内的rechecks。SessionHeader/target staging失败或publication前crash只留下invisible removable staging，reservation仍烧毁；lifecycle caller不接收staging/path/generation/marker。create-and-load是上层组合，不改变create durable语义。
 
 `WorkspaceDefinitionInput`保存`CanonicalFileUri` carrier而非native path。URI lexical-invalid时请求不能进入Runtime；canonical URI family不受current host支持时请求已经是typed command，由Workspace lowering返回`InvalidArgument + DoNotRetry`，且不得获取Agent synchronization、分配revision或开始Session/Header staging。
 
-create使用预分配SessionId和外层`CommandId`。outcome unknown时必须查询已发布target，不能创建重复Session。
+Create在host-neutral validation/lowering成功后由lifecycle owner取得CSPRNG SessionId candidate，并由DurableState永久reservation；成功reservation后sealed attempt绝不换ID。`CommandId`不进入该路径也不能查询其durable outcome。响应丢失或进程崩溃可能留下已发布、但host未知的Session；host必须重新page/query catalog，blind retry可能创建duplicate。这是V1有意不提供restart exactly-once Create的限制。
 
 ## Update Session Definition
 
 只允许Open Session。普通definition update只能改变Workspace、Model或SessionPromptSelection；`AgentRevisionRef`变化必须走显式Agent upgrade路径，不能绕过Agent lifecycle synchronization。
 
-若candidate改变Workspace且Session已loaded，额外要求`SessionExecutionState::Idle`；Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel。Model或SessionPromptSelection的future-only update仍可在active Turn期间提交，因为它们不会改变current Turn captured Context。
+若candidate改变Workspace且Session已loaded，额外要求`SessionExecutionState::Idle`；Starting/Running/Finishing返回`SessionBusy`，不排队、不隐式Cancel。successful loaded-Workspace path uses the SessionExecutor-owned `SessionDefinitionPublicationTask` described above: it owns the permit/shared completion across durable commit and infallible prebuilt `WorkspaceSnapshot` installation, independent of the dispatch waiter. Model或SessionPromptSelection的future-only update仍可在active Turn期间提交，因为它们不会改变current Turn captured Context。
 
 ```text
 expected SessionLifecycle = Open
@@ -768,8 +761,10 @@ expected SessionLifecycle = Open
 + SessionDefinitionPatch（optional WorkspaceDefinitionInput仍为CanonicalFileUri roots）
 → 若含Workspace input，先checked host-family lowering为WorkspaceRootSpec { path: PathBuf }
 → lowering成功后形成complete candidate definition
-→ 在per-session lifecycle synchronization内validate / CAS
-→ publish revision N+1
+→ for loaded Workspace, owner-register SessionDefinitionPublicationTask after successful Idle check
+→ task acquires permit, awaits DurableState durable commit, then infallibly installs prebuilt WorkspaceSnapshot
+→ settle shared completion and release permit only after installation
+→ for other definition changes, DurableState establishes complete publication and installs immutable catalog for revision N+1
 ```
 
 active Turn不受允许提交的future-only definition update影响。FollowUp在真正admission时读取update后的current revision。Workspace patch只有Idle时可提交，并在resolve与Workspace-bound Prompt/Skill source capture全部成功后发布new Snapshot。definition owner的CAS成功后更新loaded definition view；conversation Recorder health不参与该操作。
@@ -807,7 +802,7 @@ load 语义：
 → 读取 Agent durable head / AgentStatus
 → 读取 exact AgentRevisionRef 对应的 AgentDefinition
 → replay recorded conversation prefix
-→ writable recording open尝试取得exclusive lease；失败建立Degraded health，成功时只截断final unterminated partial tail
+→ DurableState提供root-lease-derived writable conversation proof时才允许tail truncate；ordinary recorder open/init失败建立Degraded health
 → 从replayed recorded head构建sanitized live state与new Recorder health
 → WorkspaceResolver::resolve(definition.workspace)得到candidate
 → PromptService/SkillService捕获candidate授权的Workspace-bound sources
@@ -886,7 +881,7 @@ Open + Unloaded
 → Archived
 ```
 
-archive 不隐式 unload，也不取消 Turn。Archive只更新Session durable lifecycle并发布current Runtime StateEvent；它不需要Recorder或LiveSessionState EntryIdGenerator，也不写conversation entry。
+archive 不隐式 unload，也不取消 Turn。Archive只更新Session durable lifecycle并发布current Runtime StateEvent；它不需要Recorder或LiveSessionState EntryIdGenerator，也不写conversation entry。对已经Archived的Session重复Archive返回`NoChange`，不写generation且无第二event。
 
 ### Unarchive
 
@@ -895,7 +890,7 @@ Archived
 → Open + Unloaded
 ```
 
-Workspace 和 exact Agent revision 在后续 load/admission 时重新验证。Unarchive只更新Session durable lifecycle，不写conversation entry。
+Workspace 和 exact Agent revision 在后续 load/admission 时重新验证。Unarchive只更新Session durable lifecycle，不写conversation entry。对已经Open的Session重复Unarchive返回`NoChange`，不写generation且无event。
 
 ### Delete
 
@@ -904,7 +899,7 @@ Archived + Unloaded
 → Deleted
 ```
 
-delete 不级联删除 Agent、Workspace files、fork children 或 sibling Sessions。Delete只更新logical durable lifecycle；physical conversation file retention/purge是独立operations问题，不追加lifecycle terminal到JSONL。
+delete 不级联删除 Agent、Workspace files、fork children 或 sibling Sessions。Delete只更新logical durable lifecycle；physical conversation file retention/purge是独立operations问题，不追加lifecycle terminal到JSONL。Delete against already Deleted returns typed `SessionDeleted` and writes nothing；Open→Deleted仍是invalid lifecycle transition。
 
 ## Fork Session
 
@@ -942,22 +937,20 @@ source SessionDefinition at fork linearization point
 + durable SessionForkProvenance
 ```
 
-source kind由同一residency/lifecycle synchronization决定。source在该linearization point已loaded时必须使用`LiveSnapshot`，即使Recorder已经Degraded或当前entry的record attempt尚未返回；source未loaded时使用`RecordedHistory`。Unload先赢则走RecordedHistory，Fork先完成snapshot capture则后续Unload不改变该Fork。不得从loaded source静默fallback到RecordedHistory，因为这会丢失用户当前可见的unrecorded tail。
+source kind由同一residency/lifecycle synchronization决定。source在该linearization point已loaded时必须使用`LiveSnapshot`，即使Recorder已经Degraded或当前entry的record attempt尚未返回；source未loaded时由DurableState/source-residency owner签发typed immutable `RecordedForkConversationLease`，绑定exact source Session/file observation并令source Load、append与tail truncate等待整个streamed copy。Conversation Storage消费该lease来replay、resolve anchor并形成semantic seed。Unload先赢则走RecordedHistory，Fork先完成capture/lease则后续Unload不改变该Fork。不得从loaded source静默fallback到RecordedHistory，因为这会丢失用户当前可见的unrecorded tail。
 
-LiveSnapshot在短live-state critical section内同时解析anchor并复制immutable selected path，随后释放guard再执行target staging I/O。capture前已apply的事实进入child，capture后apply的事实不进入；stream draft和process-local queue不进入。target selected path未完整materialize并通过replay validation时不发布child。
+LiveSnapshot在短live-state critical section内同时解析anchor并复制immutable selected path；RecordedHistory先在短residency/lifecycle guard内取得typed physical lease。短guard都在target I/O前释放；recorded physical lease继续覆盖整个copy/readback，完成后释放，且绝不与最终Agent permit重叠。capture前已apply的事实进入child，capture后apply的事实不进入；stream draft和process-local queue不进入。copy runs as ConversationStorage semantic streaming re-encode in an actor-owned/tracked job up to the 1 GiB cap: it emits a child Header and rebinds only every selected entry's SessionId, never raw-copies source JSONL bytes. target selected path未完整materialize并通过replay validation时不发布child。
 
 child：
 
 ```text
-new SessionId
-SessionDefinitionRevision(1)
-exact copy of source AgentRevisionRef
-copy Workspace semantic fields，但分配 child-local WorkspaceRevision(1)
-copy source Model / SessionPromptSelection
-Open + Unloaded
-independent future revisions
-independent WorkspaceSnapshot / process-local security signal
-independent conversation branch
+new permanently reserved SessionId
+SessionDefinitionRevision(1) / WorkspaceRevision(1)
+exact copy of captured source AgentRevisionRef（final publication仍验证definition存在且Agent Enabled）
+copy Workspace semantic fields、source Model / SessionPromptSelection
+name = None, description = None, SessionMetadataRevision(1), child-local timestamps
+Open + Unloaded with durable Fork provenance
+independent future revisions / WorkspaceSnapshot / process-local security signal / conversation branch
 ```
 
 不复制：
@@ -971,11 +964,11 @@ provider session
 pending Interaction / 任何process-local SessionIngress lane
 ```
 
-fork使用staging + atomic publication。复制完成后执行tolerant replay并验证selected conversation path；不创建fork-specific terminal，也不合成ToolResult。selected path完整materialize后才能发布child；发布后的future recording failure不使child Unavailable。child publication在Agent lifecycle gate内最终检查AgentStatus = Enabled，并与Agent disable/delete线性化；失败或crash的staging target不进入Session catalog。child发布为`Open + Unloaded`，future Load从copied transcript建立Idle view。
+fork由DurableState operation-owned immutable generation/publication完成。Conversation Storage在final markerless child path完成streaming re-encode、sync、full bounded-memory reread并产生`PreparedConversationProof`；不创建fork-specific terminal，也不合成ToolResult。selected path完整materialize后，actor才取得Agent gate，检查captured exact Agent definition仍存在且AgentStatus = Enabled，cross `DurableCommitBarrier`，并保持该gate直到`COMMITTED`/`PUBLISHED`/complete readback。它与Agent disable/delete线性化；失败或crash的invisible target不进入Session catalog、reservation不回收。provenance source ID必须等于实际captured lease/seed source且不能等于child。child发布为`Open + Unloaded`，future Load从copied transcript建立Idle view。
 
 child definition由本lifecycle owner从source durable SessionDefinition构造revision 1；conversation copy只包含selected User/Assistant/Tool、Interaction和Compaction facts，不复制source definition/metadata/lifecycle transition timeline。
 
-Conversation/SessionStorage使用`EntryId + parent_id` entry tree；fork deep-copy selected path并保留复制历史的EntryId、TurnId、ItemId、RequestId和ToolCallId，只为child分配新SessionId。target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。exact typed ID carrier由[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)冻结；完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
+Conversation Storage使用`EntryId + parent_id` entry tree；Fork semantic streaming re-encode preserves selected historical EntryId、parentId、TurnId、ItemId、RequestId、ToolCallId、timestamp、body和order，writes a new child Header, and rebinds only `sessionId` to the child; raw source JSONL byte-copy is prohibited. target materialize完成后用全部copied EntryId初始化child `LiveSessionState` collision guard；future EntryId由child私有Session-scoped generator分配，不执行nested remap。exact typed ID carrier由[ADR 0134](../adr/0134-public-and-conversation-wire-use-bounded-v1-schemas.md)冻结；完整storage规则见[Conversation Recording与Replay](conversation-storage.md)，公开Genesis/UserMessage/FinalAgentMessage anchor payload见[Runtime Interface](runtime-interface.md)。
 
 ## Turn Admission Basis
 
@@ -1001,8 +994,8 @@ Session lifecycle/load/readiness/execution validation
 → 获取短Agent lifecycle synchronization
 → 最终检查 AgentStatus = Enabled
 → 在gate内apply Input UserMessage + Turn Running
-→ release Agent lifecycle gate
-→ 完成当前Input record attempt并publish TurnStarted
+→ release `AgentAdmissionPermit` before any DurableState actor request or Recorder await
+→ complete current Input record attempt and publish TurnStarted
 ```
 
 Input entry只保存conversation内容、TurnId相关性和safe part-level contribution stamps，不内联Turn-start execution snapshot或source authorization。actual response model由后续`StoredAssistantMessage.model`说明；AgentRevisionRef、SessionDefinitionRevision和Workspace配置由各自durable owner保存，restart不据此重建旧execution environment。
@@ -1044,7 +1037,7 @@ initiating UserMessage live apply先赢
 → Turn使用pinned Context继续；后续record attempt不改变胜负
 ```
 
-Agent lifecycle gate从final Enabled check持有到initiating UserMessage live apply outcome确认，随后在SessionRecorder await前释放；active Turn不持续持有该gate。CreateSession、Session Agent upgrade和Fork child publication也使用同一gate，保证disable/delete先赢时不会发布新的可执行引用。
+Turn admission may hold an `AgentAdmissionPermit` from final Enabled check through initiating UserMessage live apply, but performs no DurableState actor request while holding it and releases it before the Recorder await; active Turn never retains it. That permit and DurableStateActor's exclusive status-mutation gate are two sides of the same private per-Agent `AgentLifecycleGate`/epoch, so Disable/Delete and Input apply have one explicit linearization point. No caller holds an Agent or durable Session lifecycle/mutation gate while awaiting DurableStateActor. CreateSession, Session Agent upgrade, and Fork child final publication acquire required private durable gates inside the actor in `Agent → Session` order. For CreateSession, the actor reads the current Enabled exact ref, builds and markerless-writes/readbacks the final definition/Header/generation-1 head under one Agent gate, crosses `DurableCommitBarrier` immediately before COMMITTED, then holds through `PUBLISHED`/complete readback; any final checks are rechecks under that same gate. Fork completes its large markerless copy first, then acquires/holds the Agent gate from exact final Enabled check through markers/readback. The actor may hold the Agent gate through bounded-size but potentially unbounded-latency local publication I/O (an explicit head-of-line tradeoff), but never across Recorder, SessionExecutor, event/fan-out, or host callback.
 
 ### Session Definition/Metadata Update vs Archive/Delete
 
@@ -1052,7 +1045,7 @@ Session definition update必须在per-session lifecycle synchronization内同时
 
 跨Agent/Session操作使用固定synchronization顺序`Agent lifecycle → Session lifecycle`，避免Agent disable、Session upgrade/fork和archive之间形成锁环。
 
-该顺序只适用于短durable state synchronization。实现不得在持有Agent lifecycle guard/permit时等待SessionRecorder、SessionExecutor、Unload completion、event subscriber或host callback；status/revision mutation完成后先释放gate，再向loaded Sessions fan-out readiness invalidation。普通Mutex/RwLock guard不得跨`.await`；initiating Input的final Enabled check与live apply由不跨I/O的typed admission permit和私有组合操作收口（ADR 0117）。
+该顺序只适用于private durable state synchronization inside DurableStateActor. Callers must not await the actor while holding an Agent or durable Session lifecycle/mutation gate. The actor does not take SessionExecutor's process-local `SessionDefinitionPublicationPermit`; the owner-registered `SessionDefinitionPublicationTask` retains that permit, prebuilt Snapshot and shared completion across Idle check、durable commit与infallible install，dispatch waiter drop不取消它。实现不得在持有Agent lifecycle guard/permit时等待SessionRecorder、SessionExecutor、Unload completion、event subscriber或host callback；status/revision mutation完成后先释放gate，再向loaded Sessions fan-out readiness invalidation。普通Mutex/RwLock guard不得跨`.await`；initiating Input的final Enabled check与live apply由不跨I/O的typed admission permit和私有组合操作收口（ADR 0137）。
 
 ### Load vs Load
 
@@ -1121,12 +1114,15 @@ RevisionUnavailable
 InvalidLifecycleTransition
 RecordedStateCorrupt
 IdConflict
-OutcomeUnknown
+StoreInUse
+DurableStateCorrupt
+DurableStateTooLarge
+RuntimeClosing
 ```
 
 重试建议：
 
-- stale/busy/outcome unknown：重新读取对应definition owner或recorded prefix后决定；
+- stale/busy：重新读取对应definition owner或recorded prefix后决定；durable publication certainty indeterminate会poison/close，不作为可按CommandId查询或普通retry的`OutcomeUnknown`；
 - disabled/archived：需要显式 enable/unarchive；
 - deleted/invalid transition：普通流程不可恢复；
 - unavailable/current definition revision missing：修复Workspace/dependency或definition retention后retry admission/load；
@@ -1232,6 +1228,11 @@ Agent release channel
 
 至少覆盖：
 
+- DurableState permanent reservation、32 definite collision cap、reservation-after-crash/no-ID-reuse与no durable CommandId correlation；
+- root lease StoreInUse/reacquire/invalid identity、strict case/link/reparse namespace rejection、cap+1 scanner、exact staging cleanup failure blocks open；
+- Agent/Session create/update/fork generation CAS/no-op、DurableState complete-publication boundary、Completed-before-Closing、committed-corrupt与indeterminate poison；
+- child metadata为None/metadata revision 1、source LiveSnapshot/RecordedHistory lease blocks append/load/tail truncate、source later mutation不改变captured child；
+- Create/Fork response loss：host re-page/query catalog，blind retry may duplicate，不宣称restart exactly-once；
 - create Agent 发布 revision 1；
 - Agent definition no-op update 不递增；
 - concurrent Agent update stale revision；
@@ -1247,7 +1248,7 @@ Agent release channel
 - Agent/Session metadata independent CAS、readback、no-op与delete/archive竞态；
 - loaded/unloaded definition与metadata update均不append conversation entry；
 - Workspace update 同时改变 WorkspaceRevision 和 SessionDefinitionRevision；
-- Open/Archived/Deleted transition；
+- Open/Archived/Deleted transition；repeated Enable/Disable/Archive/Unarchive exact `NoChange`，repeated Delete exact typed Deleted且都不写generation/event；
 - Archive/Unarchive/Delete不需要Recorder或EntryIdGenerator，且不append lifecycle event；
 - archive loaded Session 返回 conflict；
 - delete 非 Archived/loaded Session 返回 conflict；
@@ -1300,14 +1301,10 @@ Agent release channel
 ## 后续问题
 
 1. AgentDefinition 未来是否持有 Tool/Skill/Model constraints。
-2. Agent/Session immutable definition 的具体 persistence schema。
-3. Agent/Session entity head 的CommandId correlation、CAS和durable store形状。
-4. Session list 如何投影 load/readiness/execution state。
-5. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
-6. physical purge、retention 和 revision reachability GC。
-7. 多进程同时操作同一个 Agent/Session store 的并发实现。
-8. public protocol实现中的Agent/Session durable store schema和transaction adapter。
-9. auto-unload与per-session subscription residency policy的具体默认值。
+2. Session list 如何投影 load/readiness/execution state。
+3. auto-unload policy、idle timeout 和 subscription 对 residency 的影响。
+4. future physical purge、retention、revision reachability GC和durable idempotency-key design（均不属于V1）。
+5. auto-unload与per-session subscription residency policy的具体默认值。
 
 ## 设计进度
 
@@ -1329,3 +1326,4 @@ Agent release channel
 - [x] 明确Agent/Session definition、metadata和lifecycle不进入conversation JSONL（ADR 0131）。
 - [x] 完成SessionExecutor owner和crate-private request interface。
 - [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。
+- [x] M5.0冻结DurableState、Durable Store V1、root lease、permanent reservations（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new）与Tokio/deterministic test seams；foundation implementation仍pending。

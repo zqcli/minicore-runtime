@@ -10,7 +10,7 @@
 2. [架构总览](architecture.md)：领域模型、执行结构与跨模块不变量；
 3. [模块总览](modules/README.md)：canonical owner与具体接口合同；
 4. [ADR索引](adr/README.md)：current、refined与historical决策分类；
-5. [Wire Schema](modules/wire-schema.md)、[Conversation JSONL V1](formats/conversation-jsonl-v1.md)和[Wire V1 Fixtures](fixtures/wire-v1/README.md)：public/storage representation；
+5. [Wire Schema](modules/wire-schema.md)、[Conversation JSONL V1](formats/conversation-jsonl-v1.md)、[Wire V1 fixtures](fixtures/wire-v1/README.md)、[Durable Store V1](formats/durable-store-v1.md)及其[Durable Store V1 fixtures](fixtures/durable-store-v1/README.md)：public/storage representation；
 6. [第四轮设计评审](review/v2-design-review-4.md)：尚未关闭的production gates。
 
 权威顺序：
@@ -26,19 +26,19 @@ architecture.md + modules/
 
 ## 当前状态
 
-Rust crate的M1 Wire foundation与owner semantic spine已经进入`dev`：ProtocolLimits/counters、bounded dynamic JSON、bounded JSON Schema、typed bootstrap codec，以及Prompt/Tools/Model/Turn/Interaction semantic values与Compaction stored-provenance/stable-kind leaves均已实现并通过Fast、MSRV与heavy gates。M2正在实施，Protocol V1 bootstrap router、incremental public manifest gate和initial typed Wire roots已完成；M4已实现Prompt-owned opaque `ModelMessage`、`ConversationRevision`/`EntryIdGenerator`、`LiveSessionState` User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset。Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。下一任务是M5.0 durable entity/async foundations design gate，随后M5 Recorder/semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
+M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M3.2 implemented only the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design now makes DurableState its future sole production issuer, without claiming a root-lease production implementation. M5.0 durable entity/async design gate现已冻结DurableState、Durable Store V1、permanent reservations（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new）与Tokio deterministic seams；foundation implementation pending。下一任务是M5.0 foundation implementation，随后M5.1 SessionRecorder与M5.2 semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
 
 开发计划M0与M1已经完成，M2进行中；后续主要门禁：
 
-- M5.0：冻结single-process durable entity store、CAS与跨entity/conversation staging协议；
+- M5.0：design已完成；实现single-process DurableState actor、Store V1/root lease/CAS/publication与Tokio deterministic foundation；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；
 - V4-C0-1：production Tool/Sandbox adapter开始前关闭enforcement fail-closed合同。
 
 ## 目录角色
 
-- `modules/`：当前semantic contract与canonical owner；
+- `modules/`：当前semantic contract与canonical owner；`DurableState`是local entity-store physical operation owner；
 - `adr/`：决策理由与successor关系，分类见[ADR索引](adr/README.md)；
-- `formats/`、`fixtures/`：exact wire/storage format与测试资产；
+- `formats/`、`fixtures/`：exact wire/storage format与测试资产（含Durable Store V1 golden/crash matrix）；
 - `review/`：仍开放的评审finding；
 - `research/`：非权威研究证据，见[Research索引](research/README.md)；
 - `migration/`：V1到V2概念迁移说明；

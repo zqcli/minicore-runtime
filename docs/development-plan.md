@@ -1,12 +1,12 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2与M4已完成；下一任务是M5.0 durable entity/async foundations design gate，随后M5 Recorder/semantic replay
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation implementation pending，随后M5.1 Recorder与M5.2 semantic replay
 
 初始实现基线：`dev` at `144039a`
 
 范围：从当前Wire基础到可验证的ScriptedProvider vertical slice，再到production Provider与Tool/Sandbox gate
 
-本文只定义实施顺序、依赖、交付物和验收条件，不重新定义领域语义。设计权威仍是[`architecture.md`](architecture.md)、[`modules/`](modules/README.md)、架构总览引用的current/refined ADR、[Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)与[Wire V1 Fixtures](fixtures/wire-v1/README.md)。发生冲突时必须先修canonical owner文档或新增ADR，不能在实现计划中暗改合同。M0完成后由`docs/adr/README.md`唯一索引current、refined与historical ADR。
+本文只定义实施顺序、依赖、交付物和验收条件，不重新定义领域语义。设计权威仍是[`architecture.md`](architecture.md)、[`modules/`](modules/README.md)、架构总览引用的current/refined ADR、[Conversation JSONL Format V1](formats/conversation-jsonl-v1.md)、[Wire V1 Fixtures](fixtures/wire-v1/README.md)、[Durable Store V1](formats/durable-store-v1.md)与[Durable Store V1 Fixtures](fixtures/durable-store-v1/README.md)。发生冲突时必须先修canonical owner文档或新增ADR，不能在实现计划中暗改合同。M0完成后由`docs/adr/README.md`唯一索引current、refined与historical ADR。
 
 ## 目标
 
@@ -83,8 +83,8 @@ M0 Documentation Convergence + Quality Baseline
    ├─ M4 LiveConversation Reducer
    └─ M6 Minimal Turn Resources + Scripted Gateway
 
-M3 + M4 + M5.0 Durable Entity/Async Foundations
-└─ M5 Recorder + Semantic Replay
+M3 + M4 + M5.0 Durable Entity/Async Foundations implementation
+└─ M5.1 Recorder + M5.2 Semantic Replay
 
 M2(minimal) + M4 + M5 + M6
 └─ M7 Create/Load/Submit/Snapshot/Unload Ordinary Slice
@@ -296,7 +296,7 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 
 ### M3.2 Physical scanner
 
-状态：Completed。已实现bounded streaming scanner：对known size和stat unavailable input均执行1 GiB cap，支持LF/CRLF、strict Header、line/count limits、complete-entry fault recovery，并仅在exclusive writable lease下返回final partial-tail truncation action/offset；scanner本身不修改文件，heavy recipes已覆盖。
+状态：Completed。已实现bounded streaming scanner：对known size和stat unavailable input均执行1 GiB cap，支持LF/CRLF、strict Header、line/count limits、complete-entry fault recovery，并仅在DurableState root-lease-derived writable proof下返回final partial-tail truncation action/offset；scanner本身不修改文件，heavy recipes已覆盖。
 
 实现：
 
@@ -305,7 +305,7 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 - complete entry count 1,000,000合法，第1,000,001个失败；
 - LF/CRLF处理；
 - malformed/unknown/oversized complete line可skip并继续；
-- 仅final unterminated tail在exclusive writable lease下可truncate；
+- 仅final unterminated tail在DurableState root-lease-derived writable proof下可truncate；
 - scanner在读取完整oversized line前保持bounded allocation。
 
 退出条件：scanner层的UTF-8、newline、Header/line/file/count、partial tail和oversized-line recovery assertions通过；semantic corruption `.expected.json` sidecar留给M5。1 GiB测试使用streaming generator并归入heavy test tier。
@@ -359,28 +359,29 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：Pending。M5.0 durable foundations gate、SessionRecorder、semantic replay与corruption sidecars均未实现。
+状态：M5.0 design gate Completed；M5.0 foundation implementation、M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
 
-### M5.0 Entity store与async test seam gate
+### M5.0 DurableState / async foundation implementation
 
-`agent-session-lifecycle.md`仍未冻结durable entity-head/CAS store和跨entity/conversation staging协议。开始Session Create/Fork前必须先关闭该实现门禁：
+设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。下一任务精确交付：
 
-- 定义MVP single-process durable store、Agent/Session immutable definition head、metadata head和CAS shape；
-- 定义SessionDefinition、initial SessionHeader、fork provenance与catalog visibility的staging/atomic publication协议；
-- 列出crash point、cleanup/retry和exclusive lease语义；
-- 通过canonical module更新或Accepted ADR冻结，不在storage implementation中即兴决定；
-- 选择async runtime，并为clock/sleep、spawn/join、cancellation、controlled writer/filesystem fault和deterministic barrier建立crate-private test seams；
-- 配置Clippy `await_holding_invalid_type`覆盖选定runtime的lock guards。
+- private `DurableStateActor`、immutable catalog snapshots/capabilities、poison/closing state和all mutation/catalog-head serialization；
+- permanent CSPRNG-ID reservation (`create_new`，32 definite collision cap)、root `.minicore.lock` fs4 exclusive lease、strict user-private local filesystem validation和no-follow link/reparse/case-alias handling；
+- Store V1 create/open/scanner/cleanup, capped enumeration, canonical head/definition encoder/decoder, contiguous immutable generations, CAS recheck/no-op, markerless final-path staging, `DurableCommitBarrier` immediately before COMMITTED, and exact COMMITTED/PUBLISHED payload readback publication; no caller staging/path/generation/marker API;
+- initial Agent/Session and streamed Fork semantic re-encode/publication, publication-time Agent Enabled/current-ref check, opaque conversation target/`RecordedForkConversationLease`/writable proof, and closed publication-certainty/Runtime-close behavior;
+- host-only `MiniCoreRuntime::open(config, Handle)` / `shutdown(&self)` and closed redacted initialization errors; initialization owner-tracks/joins a timer probe rather than allowing a missing-driver panic; DurableState/ConversationStorage/Recorder receive only internal `RuntimeTaskContext`; `spawn_blocking_tracked` pre-registers every owner-retained JoinHandle/shared settlement, plus cancellation barriers, clocks and the two real filesystem adapters;
+- future manifest dependency/lock update only in this implementation task: Tokio 1.53.1 caret with `default-features = false`, production features only `macros,rt,sync,time`, dev `rt-multi-thread,test-util`; tokio-util 0.7.19 `default-features = false` + `rt`; fs4 0.13.1 sync; no Tokio fs/io-util without consumer; clippy lock lint config/smoke test on Rust 1.85/current;
+- consume `docs/fixtures/durable-store-v1/`, including native Linux/macOS/Windows process tests for lock contention/reacquire, create_new, aliases, links/reparse, holder death, cleanup/open-handle and deterministic crash matrix points.
 
-退出条件：Create/Fork能够写出确定性crash matrix；M5/M7不依赖未定义的跨文件事务。
+退出条件：Store V1 opens only after strict cleanup; new-entity Create/Fork is actor-owned complete-or-invisible, while an existing-head update reopens as complete old or complete new generation; no detached job remains; **every** Durable Store fixture case with `slice = m5_0 | platform_m5_0` passes. Native macOS/Windows CI remains an implementation exit condition and is not changed by this design pass. This task deliberately does **not** implement Recorder append semantics or tolerant semantic replay.
 
-建议提交：先提交design gate，再提交`build: add deterministic async test seams`。
+建议提交：`feat: implement DurableState foundations`，并在同一implementation series中以测试证明deterministic async seams。
 
 ### M5.1 SessionRecorder
 
 实现：
 
-- staged Header creation；
+- open/use M5.0已经发布的valid Header与writable conversation proof；initial Header creation属于M5.0；
 - single ordered `record(entry).await`；
 - encode完成且size合法后才进行第一次write；
 - `write_all`语义与partial/unknown write failure；
@@ -388,7 +389,9 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - 不retry、不segment、不backfill、不回滚live mutation；
 - diagnostic只保留allowlisted code与redacted bounded message。
 
-### M5.2 Tolerant replay
+退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个job、panic/unload finalizer复用shared settlement、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
+
+### M5.2 Tolerant semantic replay
 
 实现：
 
@@ -451,7 +454,8 @@ provider-neutral request/result seam稳定后立即并行运行private Rig reali
 - spawn one ActiveTurnTask；
 - Prompt assemble → ModelGateway → final Assistant apply/record；
 - Turn Completed live settlement与Snapshot/StateEvent；
-- Unload不恢复task或旧TurnStatus。
+- Unload不恢复task或旧TurnStatus；
+- 激活loaded Workspace definition publication时使用owner-registered `SessionDefinitionPublicationTask`，并消费Durable fixture `slice = m7`的post-commit install failure坐标；dispatch waiter drop不得取消task。
 
 端到端测试：
 
@@ -461,7 +465,7 @@ Create → Load → Submit(Text) → Model(final text)
 → recorded User/Assistant restored, current_turn = None
 ```
 
-退出条件：INV-001、INV-002、INV-101和INV-201在真实async integration test成立；任何guard不跨await；Recorder failure不导致同一Model request被重复调用。
+退出条件：INV-001、INV-002、INV-101和INV-201在真实async integration test成立；任何guard不跨await；Recorder failure不导致同一Model request被重复调用；全部Durable fixture `slice = m7` case通过。
 
 建议提交：`feat: run ordinary scripted agent turn`。
 
@@ -680,8 +684,9 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 M0与M1已完成；M2 minimal Snapshot/Event已落地，M3.1 exact Conversation Header/Entry per-line codec、M3.2 bounded physical JSONL scanner与M4 LiveConversation reducer已完成。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M5.0` durable entity/async foundations design gate；
-2. `M5` Recorder/semantic replay与corruption sidecars；
-3. M6–M10随owning behavior补齐resources、behavioral Runtime slice、non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
+1. `M5.0` DurableState/async foundations implementation；
+2. `M5.1` SessionRecorder；
+3. `M5.2` tolerant semantic replay与corruption sidecars；
+4. M6–M10随owning behavior补齐resources、behavioral Runtime slice、non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
 
 在M2–M6 prerequisites关闭前不得进入M7 ordinary behavior slice；production Provider与Tool/Sandbox继续分别受V4-P1-3和V4-C0-1门禁约束。
