@@ -150,6 +150,14 @@ impl RuntimeTaskContext {
         TrackedBlockingJob::new(settlement, key)
     }
 
+    /// Synchronously rejects future admissions without claiming the active shutdown leader.
+    ///
+    /// Runtime facade drop uses this best-effort signal. A later explicit shutdown can still
+    /// become the leader that joins already accepted work.
+    pub(crate) fn request_closing(&self) {
+        self.owner.request_closing();
+    }
+
     /// Closes admission and joins every operation reserved while the owner was open.
     pub(crate) async fn shutdown(&self) {
         let leader = self.owner.begin_shutdown();
@@ -265,14 +273,23 @@ impl RuntimeTaskOwner {
         self.registry_changed.notify_waiters();
     }
 
-    fn begin_shutdown(&self) -> bool {
+    fn request_closing(&self) {
         let mut registry = lock(&self.registry);
         if registry.phase == OwnerPhase::Open {
             registry.phase = OwnerPhase::Closing;
-            true
-        } else {
-            false
         }
+        drop(registry);
+        self.cancellation.cancel();
+    }
+
+    fn begin_shutdown(&self) -> bool {
+        let mut registry = lock(&self.registry);
+        if registry.phase == OwnerPhase::Closed || registry.shutdown_active {
+            return false;
+        }
+        registry.phase = OwnerPhase::Closing;
+        registry.shutdown_active = true;
+        true
     }
 
     async fn finish_shutdown(&self) {
@@ -319,6 +336,7 @@ impl RegistryKey {
 
 struct Registry {
     phase: OwnerPhase,
+    shutdown_active: bool,
     next_key: u64,
     starting: BTreeSet<RegistryKey>,
     probes: BTreeMap<RegistryKey, JoinHandle<()>>,
@@ -329,6 +347,7 @@ impl Registry {
     fn new() -> Self {
         Self {
             phase: OwnerPhase::Open,
+            shutdown_active: false,
             next_key: 1,
             starting: BTreeSet::new(),
             probes: BTreeMap::new(),
@@ -623,6 +642,17 @@ mod tests {
         first_shutdown.await;
         second_shutdown.await;
         assert_eq!(admitted.wait().await, Ok(()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closing_request_does_not_consume_the_later_shutdown_leadership() {
+        let context = initialized_context().await;
+
+        context.request_closing();
+        let rejected = context.spawn_blocking_tracked(|| 3_u8);
+        assert_eq!(rejected.wait().await, Err(RuntimeTaskError::OwnerClosing));
+
+        context.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
