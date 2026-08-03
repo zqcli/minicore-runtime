@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1。M1 Wire foundation与owner semantic spine已实现；Runtime、Session、Conversation reducer/recording与provider行为尚未实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126已将执行模型更新为async Turn loop与inline best-effort Session recording；ADR 0129/0130已冻结用户消息contribution与async captured-Skill composition；ADR 0131冻结conversation-only recording owner；ADR 0132冻结Compaction stable-unit/settings/provenance contract；ADR 0133冻结snapshot-recoverable Runtime public payload；ADR 0134、exact Format V1与conformance vectors冻结bounded public/storage wire v1。M1 Wire foundation与owner semantic spine及M4 Prompt-owned opaque `ModelMessage`、LiveSessionState reducer已经实现；Runtime、Session、Recorder/replay、SessionExecutor/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → Accepted ADR → `docs/research/` → `docs/archive/v1/`。
 
@@ -15,7 +15,7 @@ MiniCoreRuntime
             └─ Interaction*
 ```
 
-Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`四个共享深module。每个loaded Session由`SessionExecutor` control actor管理，并最多运行一个`ActiveTurnTask`。当前进程的`LiveSessionState`驱动Model、Tool和UI；`SessionRecorder`异步记录可恢复前缀。
+目标Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`四个共享深module。后续行为slice中，每个loaded Session将由`SessionExecutor` control actor管理，并最多运行一个`ActiveTurnTask`。M4的`LiveSessionState` reducer提供current-process conversation truth；`SessionRecorder`与可恢复前缀属于M5。
 
 ## 模块索引
 
@@ -56,6 +56,6 @@ Runtime持有`PromptService`、`ToolService`、`SkillService`和`ModelGateway`�
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1 exact Conversation line codec与M3.2 bounded physical scanner已经完成；下一任务是M4 Prompt-owned canonical `ModelMessage`与LiveConversation reducer，随后关闭M5.0 durable foundations gate并完成Recorder/replay与M6 resources，再进入behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1 exact Conversation line codec、M3.2 bounded physical scanner与M4 Prompt-owned opaque `ModelMessage`/LiveConversation reducer已经完成；Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。下一任务是M5.0 durable entity/async foundations design gate，随后M5 Recorder/semantic replay，再进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。
