@@ -206,6 +206,72 @@ impl InteractionRequest {
             _ => Err(InteractionValueError::FamilyMismatch),
         }
     }
+
+    /// Validates an opaque terminal value against this exact pending request.
+    ///
+    /// `ResolvedInteraction` carries the private execution decision beside its safe view. The
+    /// reducer must use this owner check rather than trusting or rebuilding a value from the
+    /// safe projection, which cannot prove the approval option's private mapping.
+    pub(crate) fn validate_exact_resolution(
+        &self,
+        resolution: &ResolvedInteraction,
+    ) -> Result<(), InteractionValueError> {
+        match self {
+            Self::ToolApproval(request) => match resolution.live() {
+                InteractionResolution::ToolApproval(decision) => {
+                    let InteractionResolutionViewRef::ToolApproval(view) =
+                        resolution.view().as_ref()
+                    else {
+                        return Err(InteractionValueError::InvalidResolution);
+                    };
+                    request
+                        .validate_exact_resolution(decision, view)
+                        .map_err(|_| InteractionValueError::InvalidResolution)
+                }
+                InteractionResolution::Cancelled(reason) => {
+                    Self::validate_cancelled_resolution(*reason, resolution.view())
+                }
+                InteractionResolution::UserAnswer(_) => Err(InteractionValueError::FamilyMismatch),
+            },
+            Self::UserQuestion(request) => match resolution.live() {
+                InteractionResolution::UserAnswer(answer) => {
+                    let InteractionResolutionViewRef::UserAnswer(view) = resolution.view().as_ref()
+                    else {
+                        return Err(InteractionValueError::InvalidResolution);
+                    };
+                    if answer != view {
+                        return Err(InteractionValueError::InvalidResolution);
+                    }
+                    request
+                        .validate_answer(answer.clone())
+                        .map(|_| ())
+                        .map_err(|_| InteractionValueError::InvalidResolution)
+                }
+                InteractionResolution::Cancelled(reason) => {
+                    Self::validate_cancelled_resolution(*reason, resolution.view())
+                }
+                InteractionResolution::ToolApproval(_) => {
+                    Err(InteractionValueError::FamilyMismatch)
+                }
+            },
+        }
+    }
+
+    fn validate_cancelled_resolution(
+        reason: InteractionCancelReason,
+        view: &InteractionResolutionView,
+    ) -> Result<(), InteractionValueError> {
+        match view.as_ref() {
+            InteractionResolutionViewRef::Cancelled {
+                reason: view_reason,
+            } if reason == view_reason => Ok(()),
+            InteractionResolutionViewRef::Cancelled { .. }
+            | InteractionResolutionViewRef::ToolApproval(_)
+            | InteractionResolutionViewRef::UserAnswer(_) => {
+                Err(InteractionValueError::InvalidResolution)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -363,6 +429,16 @@ impl ResolvedInteraction {
     pub(crate) const fn view(&self) -> &InteractionResolutionView {
         &self.view
     }
+
+    /// Clones both the opaque execution value and its safe projection for owner tests without
+    /// broadening the production construction surface.
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> Self {
+        Self {
+            live: self.live.clone(),
+            view: self.view.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +530,72 @@ mod tests {
             )),
             Err(InteractionValueError::InvalidResolution)
         ));
+    }
+
+    #[test]
+    fn exact_resolution_validation_rechecks_request_family_answer_and_live_view_coherence() {
+        let request = InteractionRequest::user_question(
+            UserQuestionRequest::reconstruct(
+                None,
+                vec![
+                    UserQuestionField::reconstruct(
+                        0,
+                        "Continue?",
+                        true,
+                        UserQuestionInput::Text { multiline: false },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let valid_answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
+                .unwrap();
+        let valid = request
+            .resolve_host(InteractionHostResolutionInput::UserAnswer(valid_answer))
+            .unwrap();
+        assert!(request.validate_exact_resolution(&valid).is_ok());
+
+        let different_request = InteractionRequest::user_question(
+            UserQuestionRequest::reconstruct(
+                None,
+                vec![
+                    UserQuestionField::reconstruct(
+                        1,
+                        "A different question",
+                        true,
+                        UserQuestionInput::Text { multiline: false },
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap(),
+        );
+        let different = different_request
+            .resolve_host(InteractionHostResolutionInput::UserAnswer(
+                UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(1, "answer").unwrap()])
+                    .unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(
+            request.validate_exact_resolution(&different),
+            Err(InteractionValueError::InvalidResolution)
+        );
+
+        let incoherent_cancel = ResolvedInteraction {
+            live: InteractionResolution::Cancelled(InteractionCancelReason::TurnCancelled),
+            view: InteractionResolutionView::cancelled(InteractionCancelReason::SecurityRevoked),
+        };
+        assert_eq!(
+            request.validate_exact_resolution(&incoherent_cancel),
+            Err(InteractionValueError::InvalidResolution)
+        );
+        let approval = InteractionRequest::tool_approval(live_approval_request_fixture());
+        assert_eq!(
+            approval.validate_exact_resolution(&valid),
+            Err(InteractionValueError::FamilyMismatch)
+        );
     }
 
     #[test]

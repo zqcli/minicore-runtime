@@ -236,6 +236,20 @@ impl StoredCompaction {
         Self::new(summary, first_kept_entry_id, model_call)
     }
 
+    /// Constructs an otherwise ordinary stored fact with a deliberately unchecked summary so
+    /// the M4 replacement seam can prove its own pre-reducer validation boundary.
+    #[cfg(test)]
+    pub(crate) fn with_unchecked_summary_for_m4_test(
+        summary: Arc<str>,
+        first_kept_entry_id: Option<EntryId>,
+    ) -> Self {
+        Self {
+            summary,
+            first_kept_entry_id,
+            model_call: None,
+        }
+    }
+
     #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub fn summary(&self) -> &str {
         &self.summary

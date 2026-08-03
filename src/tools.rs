@@ -1340,6 +1340,37 @@ impl ToolApprovalRequest {
             }
         }
     }
+
+    /// Validates that both halves of an approval settlement came from this exact request.
+    ///
+    /// The safe resolution alone is deliberately insufficient for an allow: the private
+    /// decision must be the mapping attached to the exact selected option. This keeps the
+    /// mapping private to Tools while allowing the interaction owner to validate an opaque
+    /// `ResolvedInteraction` before it projects storage facts.
+    pub(crate) fn validate_exact_resolution(
+        &self,
+        decision: &ToolApprovalDecision,
+        resolution: &ToolApprovalResolution,
+    ) -> Result<(), ToolValueError> {
+        match (decision, resolution.as_ref()) {
+            (ToolApprovalDecision::Deny, ToolApprovalResolutionRef::Denied) => Ok(()),
+            (
+                ToolApprovalDecision::AllowOnce,
+                ToolApprovalResolutionRef::Allowed { option_index, kind },
+            ) => {
+                let option = self
+                    .options
+                    .iter()
+                    .find(|option| option.view.option_index() == option_index)
+                    .ok_or(ToolValueError::InvalidApproval)?;
+                if option.view.kind() != kind || &option.decision != decision {
+                    return Err(ToolValueError::InvalidApproval);
+                }
+                Ok(())
+            }
+            _ => Err(ToolValueError::InvalidApproval),
+        }
+    }
 }
 
 #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
@@ -2125,6 +2156,48 @@ mod tests {
                 ..
             } if actual_item_id == item_id && actual_call_id == &call_id
         ));
+    }
+
+    #[test]
+    fn approval_owner_validates_the_private_decision_and_safe_resolution_as_one_exact_pair() {
+        let request = live_approval_request_fixture();
+        let allowed =
+            ToolApprovalResolution::reconstruct_allowed(0, ToolApprovalOptionKindView::AsRequested);
+        let denied = ToolApprovalResolution::reconstruct_denied();
+
+        assert!(
+            request
+                .validate_exact_resolution(&ToolApprovalDecision::AllowOnce, &allowed)
+                .is_ok()
+        );
+        assert!(
+            request
+                .validate_exact_resolution(&ToolApprovalDecision::Deny, &denied)
+                .is_ok()
+        );
+        for (decision, resolution) in [
+            (
+                ToolApprovalDecision::AllowOnce,
+                ToolApprovalResolution::reconstruct_allowed(
+                    1,
+                    ToolApprovalOptionKindView::AsRequested,
+                ),
+            ),
+            (
+                ToolApprovalDecision::AllowOnce,
+                ToolApprovalResolution::reconstruct_allowed(
+                    0,
+                    ToolApprovalOptionKindView::Restricted,
+                ),
+            ),
+            (ToolApprovalDecision::AllowOnce, denied),
+            (ToolApprovalDecision::Deny, allowed),
+        ] {
+            assert_eq!(
+                request.validate_exact_resolution(&decision, &resolution),
+                Err(ToolValueError::InvalidApproval)
+            );
+        }
     }
 
     #[test]

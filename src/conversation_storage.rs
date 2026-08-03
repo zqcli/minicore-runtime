@@ -25,6 +25,17 @@ use crate::wire::{
     SessionDefinitionRevision, SessionId, Timestamp, TurnId,
 };
 
+#[path = "live_conversation.rs"]
+pub(crate) mod live_conversation;
+
+// Conversation Storage exposes only its immutable read projection. The reducer module remains
+// the sole owner of the projection constructor and of all mutable live state.
+#[allow(
+    unused_imports,
+    reason = "the read-only projection is re-exported for Conversation Storage consumers"
+)]
+pub(crate) use live_conversation::LiveConversationView;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum StoredValueError {
     #[error("stored user message violates its closed semantic contract")]

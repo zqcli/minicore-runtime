@@ -5,11 +5,8 @@ pub(crate) mod compaction;
     reason = "M3 storage semantic values are consumed by the line codec"
 )]
 pub(crate) mod conversation_storage;
-#[allow(
-    dead_code,
-    reason = "M4 live-conversation foundations are extended by the reducer"
-)]
-pub(crate) mod live_conversation;
+// Preserve the established crate path while making the reducer a descendant of its storage owner.
+pub(crate) use conversation_storage::live_conversation;
 pub mod model_gateway;
 pub mod prompt;
 pub mod runtime_interface;
