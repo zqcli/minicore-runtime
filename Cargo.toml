@@ -18,6 +18,12 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["arbitrary_precision", "raw_value"] }
 thiserror = "2.0.12"
 time = { version = "0.3.41", features = ["formatting", "parsing"] }
+tokio = { version = "1.53.1", default-features = false, features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7.19", default-features = false, features = ["rt"] }
+fs4 = { version = "0.13.1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "test-util"] }
 
 
 [[test]]
@@ -27,3 +33,7 @@ required-features = ["heavy-tests"]
 
 [lints.rust]
 unsafe_code = "forbid"
+
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_invalid_type = "deny"
