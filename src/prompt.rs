@@ -83,6 +83,14 @@ pub enum SessionPromptSelectionError {
     DuplicatePrompt,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum AgentPromptSelectionError {
+    #[error("agent prompt selection has too many entries")]
+    TooManyPrompts,
+    #[error("agent prompt selection contains a duplicate prompt")]
+    DuplicatePrompt,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPromptSelection {
     enabled: BTreeSet<PromptId>,
@@ -100,20 +108,79 @@ impl SessionPromptSelection {
         enabled: Vec<PromptId>,
         maximum: usize,
     ) -> Result<Self, SessionPromptSelectionError> {
-        if enabled.len() > maximum {
-            return Err(SessionPromptSelectionError::TooManyPrompts);
-        }
-        let original_len = enabled.len();
-        let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
-        if enabled.len() != original_len {
-            return Err(SessionPromptSelectionError::DuplicatePrompt);
-        }
-        Ok(Self { enabled })
+        prompt_selection_set(enabled, maximum)
+            .map_err(|error| match error {
+                PromptSelectionError::TooManyPrompts => SessionPromptSelectionError::TooManyPrompts,
+                PromptSelectionError::DuplicatePrompt => {
+                    SessionPromptSelectionError::DuplicatePrompt
+                }
+            })
+            .map(|enabled| Self { enabled })
     }
 
     pub fn enabled(&self) -> &BTreeSet<PromptId> {
         &self.enabled
     }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentPromptSelection {
+    enabled: BTreeSet<PromptId>,
+}
+
+impl AgentPromptSelection {
+    pub fn new(enabled: Vec<PromptId>) -> Result<Self, AgentPromptSelectionError> {
+        Self::new_with_maximum(
+            enabled,
+            usize::try_from(ProtocolLimits::v1_0().transport.max_array_items).unwrap_or(usize::MAX),
+        )
+    }
+
+    pub(crate) fn new_with_maximum(
+        enabled: Vec<PromptId>,
+        maximum: usize,
+    ) -> Result<Self, AgentPromptSelectionError> {
+        prompt_selection_set(enabled, maximum)
+            .map_err(|error| match error {
+                PromptSelectionError::TooManyPrompts => AgentPromptSelectionError::TooManyPrompts,
+                PromptSelectionError::DuplicatePrompt => AgentPromptSelectionError::DuplicatePrompt,
+            })
+            .map(|enabled| Self { enabled })
+    }
+
+    pub fn enabled(&self) -> &BTreeSet<PromptId> {
+        &self.enabled
+    }
+}
+
+impl fmt::Debug for AgentPromptSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentPromptSelection")
+            .field("enabled_count", &self.enabled.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PromptSelectionError {
+    TooManyPrompts,
+    DuplicatePrompt,
+}
+
+fn prompt_selection_set(
+    enabled: Vec<PromptId>,
+    maximum: usize,
+) -> Result<BTreeSet<PromptId>, PromptSelectionError> {
+    if enabled.len() > maximum {
+        return Err(PromptSelectionError::TooManyPrompts);
+    }
+    let original_len = enabled.len();
+    let enabled = enabled.into_iter().collect::<BTreeSet<_>>();
+    if enabled.len() != original_len {
+        return Err(PromptSelectionError::DuplicatePrompt);
+    }
+    Ok(enabled)
 }
 
 #[derive(Clone, Eq, PartialEq)]

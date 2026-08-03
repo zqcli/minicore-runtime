@@ -6,6 +6,11 @@ mod bounded_json;
 )]
 pub(crate) mod conversation_jsonl;
 mod conversation_jsonl_scanner;
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 Agent documents are consumed by future DurableState recovery"
+)]
+mod durable_store;
 
 #[cfg(feature = "heavy-tests")]
 #[doc(hidden)]
