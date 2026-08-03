@@ -1,0 +1,15 @@
+await-holding-invalid-types = [
+    "std::sync::MutexGuard",
+    "std::sync::RwLockReadGuard",
+    "std::sync::RwLockWriteGuard",
+    "tokio::sync::MutexGuard",
+    "tokio::sync::OwnedMutexGuard",
+    "tokio::sync::MappedMutexGuard",
+    "tokio::sync::OwnedMappedMutexGuard",
+    "tokio::sync::RwLockReadGuard",
+    "tokio::sync::OwnedRwLockReadGuard",
+    "tokio::sync::RwLockWriteGuard",
+    "tokio::sync::OwnedRwLockWriteGuard",
+    "tokio::sync::RwLockMappedWriteGuard",
+    "tokio::sync::OwnedRwLockMappedWriteGuard",
+]

@@ -10,6 +10,11 @@ pub(crate) use conversation_storage::live_conversation;
 pub mod model_gateway;
 pub mod prompt;
 pub mod runtime_interface;
+#[allow(
+    dead_code,
+    reason = "M5.0 owner-tracked foundation is consumed by later durable owner slices"
+)]
+pub(crate) mod runtime_task;
 pub mod skills;
 pub mod tools;
 pub mod turn_item_interaction;
