@@ -1,11 +1,14 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use thiserror::Error;
 
 use crate::wire::lexical::{LexicalError, validate_stable_symbolic_key};
-use crate::wire::{CanonicalFileUri, ProtocolLimits, WorkspaceRelativePath};
+use crate::wire::{
+    CanonicalFileUri, FileUriFamily, ProtocolLimits, WorkspaceRelativePath, WorkspaceRevision,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum WorkspaceRootKeyError {
@@ -272,6 +275,327 @@ impl fmt::Debug for WorkspaceDefinitionInput {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct WorkspaceRootSpec {
+    key: WorkspaceRootKey,
+    path: PathBuf,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+impl WorkspaceRootSpec {
+    pub fn key(&self) -> &WorkspaceRootKey {
+        &self.key
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub const fn requested_access(&self) -> RequestedFilesystemAccess {
+        self.requested_access
+    }
+
+    pub const fn sources(&self) -> WorkspaceSourcePolicy {
+        self.sources
+    }
+}
+
+impl fmt::Debug for WorkspaceRootSpec {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceRootSpec")
+            .field("key_present", &true)
+            .field("requested_access", &self.requested_access)
+            .field("sources", &self.sources)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct Workspace {
+    revision: WorkspaceRevision,
+    primary_root: WorkspaceRootSpec,
+    additional_roots: Vec<WorkspaceRootSpec>,
+    cwd: WorkspaceCwdSpec,
+}
+
+impl Workspace {
+    #[allow(
+        dead_code,
+        reason = "future durable Session construction creates Workspace through this checked seam"
+    )]
+    pub(crate) fn new(
+        revision: WorkspaceRevision,
+        primary_root: WorkspaceRootSpec,
+        additional_roots: Vec<WorkspaceRootSpec>,
+        cwd: WorkspaceCwdSpec,
+    ) -> Result<Self, WorkspaceConstructionError> {
+        let root_count = additional_roots.len().saturating_add(1);
+        if root_count > usize::from(ProtocolLimits::v1_0().workspace.max_workspace_roots) {
+            return Err(WorkspaceConstructionError::TooManyRoots);
+        }
+
+        let mut keys = BTreeSet::new();
+        let mut paths = BTreeSet::new();
+        for root in std::iter::once(&primary_root).chain(&additional_roots) {
+            if !keys.insert(root.key.clone()) {
+                return Err(WorkspaceConstructionError::DuplicateRootKey);
+            }
+            if !paths.insert(root.path.clone()) {
+                return Err(WorkspaceConstructionError::DuplicateNativePath);
+            }
+        }
+        if !keys.contains(cwd.root()) {
+            return Err(WorkspaceConstructionError::UnknownCwdRoot);
+        }
+
+        Ok(Self {
+            revision,
+            primary_root,
+            additional_roots,
+            cwd,
+        })
+    }
+
+    pub const fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    pub fn primary_root(&self) -> &WorkspaceRootSpec {
+        &self.primary_root
+    }
+
+    pub fn additional_roots(&self) -> &[WorkspaceRootSpec] {
+        &self.additional_roots
+    }
+
+    pub const fn cwd(&self) -> &WorkspaceCwdSpec {
+        &self.cwd
+    }
+}
+
+impl fmt::Debug for Workspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Workspace")
+            .field("revision", &self.revision)
+            .field("root_count", &self.additional_roots.len().saturating_add(1))
+            .field("additional_root_count", &self.additional_roots.len())
+            .field("cwd_is_workspace_root", &self.cwd.relative_path().is_root())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum WorkspaceInputLoweringError {
+    #[error("workspace input uses an unsupported host path family")]
+    UnsupportedHostFamily,
+    #[error("workspace native path is not losslessly representable")]
+    NativePathNotLossless,
+    #[error("workspace native path is invalid")]
+    InvalidNativePath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "future durable Session construction reports this crate-private checked construction error"
+)]
+pub(crate) enum WorkspaceConstructionError {
+    #[error("workspace has too many roots")]
+    TooManyRoots,
+    #[error("workspace contains a duplicate root key")]
+    DuplicateRootKey,
+    #[error("workspace contains a duplicate native path")]
+    DuplicateNativePath,
+    #[error("workspace cwd references an unknown root")]
+    UnknownCwdRoot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkspacePathTarget {
+    Posix,
+    Windows,
+}
+
+impl WorkspacePathTarget {
+    #[allow(
+        dead_code,
+        reason = "future runtime lowering selects the current host target"
+    )]
+    pub(crate) const fn current() -> Self {
+        if cfg!(target_family = "windows") {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "future runtime command application uses this Workspace lowering seam"
+)]
+pub(crate) fn lower_workspace(
+    input: WorkspaceDefinitionInput,
+    revision: WorkspaceRevision,
+    target: WorkspacePathTarget,
+) -> Result<Workspace, WorkspaceInputLoweringError> {
+    let WorkspaceDefinitionInput {
+        primary_root,
+        additional_roots,
+        cwd,
+    } = input;
+    let primary_root = lower_root(primary_root, target)?;
+    let additional_roots = additional_roots
+        .into_iter()
+        .map(|root| lower_root(root, target))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Workspace::new(revision, primary_root, additional_roots, cwd)
+        .map_err(|_| WorkspaceInputLoweringError::InvalidNativePath)
+}
+
+#[allow(
+    dead_code,
+    reason = "future Store decode uses this trusted native Workspace construction seam"
+)]
+pub(crate) fn spec_from_native(
+    key: WorkspaceRootKey,
+    path: PathBuf,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+    target: WorkspacePathTarget,
+) -> Result<WorkspaceRootSpec, WorkspaceInputLoweringError> {
+    let uri = checked_native_uri(&path, target)?;
+    let path = lower_uri(&uri, target)?;
+    Ok(WorkspaceRootSpec {
+        key,
+        path,
+        requested_access,
+        sources,
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "future Store encode uses this exact Workspace URI emission seam"
+)]
+pub(crate) fn uri_from_spec(
+    spec: &WorkspaceRootSpec,
+    target: WorkspacePathTarget,
+) -> Result<CanonicalFileUri, WorkspaceInputLoweringError> {
+    checked_native_uri(&spec.path, target)
+}
+
+#[allow(
+    dead_code,
+    reason = "future runtime command application uses this Workspace lowering helper"
+)]
+fn lower_root(
+    root: WorkspaceRootInput,
+    target: WorkspacePathTarget,
+) -> Result<WorkspaceRootSpec, WorkspaceInputLoweringError> {
+    Ok(WorkspaceRootSpec {
+        key: root.key,
+        path: lower_uri(&root.path, target)?,
+        requested_access: root.requested_access,
+        sources: root.sources,
+    })
+}
+
+#[allow(
+    dead_code,
+    reason = "future Workspace Store and command paths use this checked lowering helper"
+)]
+fn lower_uri(
+    uri: &CanonicalFileUri,
+    target: WorkspacePathTarget,
+) -> Result<PathBuf, WorkspaceInputLoweringError> {
+    match (target, uri.family()) {
+        (WorkspacePathTarget::Posix, FileUriFamily::Posix) => Ok(PathBuf::from(uri.decoded_path())),
+        (WorkspacePathTarget::Windows, FileUriFamily::Drive) => {
+            Ok(PathBuf::from(uri.decoded_path().replace('/', "\\")))
+        }
+        (WorkspacePathTarget::Windows, FileUriFamily::Unc) => {
+            let authority = uri
+                .authority()
+                .ok_or(WorkspaceInputLoweringError::InvalidNativePath)?;
+            Ok(PathBuf::from(format!(
+                "\\\\{authority}\\{}",
+                uri.decoded_path().replace('/', "\\")
+            )))
+        }
+        _ => Err(WorkspaceInputLoweringError::UnsupportedHostFamily),
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "future Workspace Store paths use this checked native URI helper"
+)]
+fn checked_native_uri(
+    path: &Path,
+    target: WorkspacePathTarget,
+) -> Result<CanonicalFileUri, WorkspaceInputLoweringError> {
+    let path = path
+        .to_str()
+        .ok_or(WorkspaceInputLoweringError::NativePathNotLossless)?;
+    let uri = uri_from_native_path(path, target)?;
+    if lower_uri(&uri, target)?.as_path() != Path::new(path) {
+        return Err(WorkspaceInputLoweringError::InvalidNativePath);
+    }
+    Ok(uri)
+}
+
+#[allow(
+    dead_code,
+    reason = "future Workspace Store paths use this native URI helper"
+)]
+fn uri_from_native_path(
+    path: &str,
+    target: WorkspacePathTarget,
+) -> Result<CanonicalFileUri, WorkspaceInputLoweringError> {
+    let uri = match target {
+        WorkspacePathTarget::Posix => {
+            if !path.starts_with('/') || path.contains('\\') {
+                return Err(WorkspaceInputLoweringError::InvalidNativePath);
+            }
+            CanonicalFileUri::from_decoded_parts(FileUriFamily::Posix, None, path)
+        }
+        WorkspacePathTarget::Windows => windows_native_uri(path),
+    };
+    uri.map_err(|_| WorkspaceInputLoweringError::InvalidNativePath)
+}
+
+#[allow(
+    dead_code,
+    reason = "future Workspace Store paths use this deterministic Windows helper"
+)]
+fn windows_native_uri(path: &str) -> Result<CanonicalFileUri, crate::wire::PathWireError> {
+    if path.contains('/') {
+        return Err(crate::wire::PathWireError::InvalidPath);
+    }
+    if let Some(unc) = path.strip_prefix("\\\\") {
+        let (authority, native_path) = unc
+            .split_once('\\')
+            .ok_or(crate::wire::PathWireError::InvalidPath)?;
+        return CanonicalFileUri::from_decoded_parts(
+            FileUriFamily::Unc,
+            Some(authority),
+            &native_path.replace('\\', "/"),
+        );
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_uppercase() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return Err(crate::wire::PathWireError::InvalidPath);
+    }
+    let decoded_path = format!("{}/{}", &path[..2], path[3..].replace('\\', "/"));
+    CanonicalFileUri::from_decoded_parts(FileUriFamily::Drive, None, &decoded_path)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRootSummaryView {
     key: WorkspaceRootKey,
@@ -396,5 +720,324 @@ impl fmt::Debug for WorkspaceDefinitionSummaryView {
             .field("roots", &self.roots)
             .field("cwd", &self.cwd)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        RequestedFilesystemAccess, Workspace, WorkspaceConstructionError, WorkspaceCwdSpec,
+        WorkspaceDefinitionInput, WorkspaceInputLoweringError, WorkspacePathTarget,
+        WorkspaceRootInput, WorkspaceRootSpec, WorkspaceSourcePolicy, lower_workspace,
+        spec_from_native, uri_from_spec,
+    };
+    use crate::wire::{CanonicalFileUri, WorkspaceRelativePath, WorkspaceRevision};
+
+    #[test]
+    fn explicit_posix_target_lowers_and_roundtrips_a_canonical_root() {
+        let root = WorkspaceRootInput::new(
+            "repo".parse().unwrap(),
+            "file:///work/project".parse::<CanonicalFileUri>().unwrap(),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(true, true),
+        );
+        let input = WorkspaceDefinitionInput::new(
+            root,
+            Vec::new(),
+            WorkspaceCwdSpec::new("repo".parse().unwrap(), WorkspaceRelativePath::default()),
+        )
+        .unwrap();
+
+        let workspace = lower_workspace(
+            input,
+            "wr_1".parse::<WorkspaceRevision>().unwrap(),
+            WorkspacePathTarget::Posix,
+        )
+        .unwrap();
+
+        assert_eq!(workspace.primary_root().path(), Path::new("/work/project"));
+        assert_eq!(
+            uri_from_spec(workspace.primary_root(), WorkspacePathTarget::Posix)
+                .unwrap()
+                .as_str(),
+            "file:///work/project"
+        );
+    }
+
+    #[test]
+    fn explicit_windows_target_lowers_drive_and_unc_roots_and_roundtrips() {
+        let input = WorkspaceDefinitionInput::new(
+            root_input("drive", "file:///C:/work/project"),
+            vec![root_input("unc", "file://server/share/project")],
+            cwd("unc", "src"),
+        )
+        .unwrap();
+
+        let workspace = lower_workspace(input, revision(), WorkspacePathTarget::Windows).unwrap();
+
+        assert_eq!(
+            workspace.primary_root().path(),
+            Path::new(r"C:\work\project")
+        );
+        assert_eq!(
+            workspace.additional_roots()[0].path(),
+            Path::new(r"\\server\share\project")
+        );
+        assert_eq!(
+            uri_from_spec(workspace.primary_root(), WorkspacePathTarget::Windows)
+                .unwrap()
+                .as_str(),
+            "file:///C:/work/project"
+        );
+        assert_eq!(
+            uri_from_spec(
+                &workspace.additional_roots()[0],
+                WorkspacePathTarget::Windows,
+            )
+            .unwrap()
+            .as_str(),
+            "file://server/share/project"
+        );
+    }
+
+    #[test]
+    fn explicit_targets_reject_unsupported_uri_families() {
+        assert_eq!(
+            lower_workspace(
+                input_with_primary("file:///work/project"),
+                revision(),
+                WorkspacePathTarget::Windows,
+            ),
+            Err(WorkspaceInputLoweringError::UnsupportedHostFamily),
+        );
+        assert_eq!(
+            lower_workspace(
+                input_with_primary("file:///C:/work/project"),
+                revision(),
+                WorkspacePathTarget::Posix,
+            ),
+            Err(WorkspaceInputLoweringError::UnsupportedHostFamily),
+        );
+        assert_eq!(
+            lower_workspace(
+                input_with_primary("file://server/share/project"),
+                revision(),
+                WorkspacePathTarget::Posix,
+            ),
+            Err(WorkspaceInputLoweringError::UnsupportedHostFamily),
+        );
+    }
+
+    #[test]
+    fn posix_lowering_roundtrips_spaces_unicode_percent_and_drive_disambiguation() {
+        for (uri, native_path) in [
+            (
+                "file:///work/a%20b/%E9%A1%B9%E7%9B%AE/100%25",
+                "/work/a b/项目/100%",
+            ),
+            ("file:///C%3A/repo", "/C:/repo"),
+        ] {
+            let workspace = lower_workspace(
+                input_with_primary(uri),
+                revision(),
+                WorkspacePathTarget::Posix,
+            )
+            .unwrap();
+            assert_eq!(workspace.primary_root().path(), Path::new(native_path));
+            assert_eq!(
+                uri_from_spec(workspace.primary_root(), WorkspacePathTarget::Posix)
+                    .unwrap()
+                    .as_str(),
+                uri
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_native_specs_reject_invalid_paths() {
+        for (target, native_path) in [
+            (WorkspacePathTarget::Posix, "work/project"),
+            (WorkspacePathTarget::Posix, "C:/work/project"),
+            (WorkspacePathTarget::Posix, "/work\\project"),
+            (WorkspacePathTarget::Posix, "/work//project"),
+            (WorkspacePathTarget::Posix, "/work/./project"),
+            (WorkspacePathTarget::Posix, "/work/../project"),
+            (WorkspacePathTarget::Posix, "/work/project/"),
+            (WorkspacePathTarget::Posix, "/work\0project"),
+            (WorkspacePathTarget::Windows, "work\\project"),
+            (WorkspacePathTarget::Windows, "C:/work/project"),
+            (WorkspacePathTarget::Windows, "c:\\work\\project"),
+            (WorkspacePathTarget::Windows, "C:\\work\\\\project"),
+            (WorkspacePathTarget::Windows, "C:\\work\\.\\project"),
+            (WorkspacePathTarget::Windows, "C:\\work\\..\\project"),
+            (WorkspacePathTarget::Windows, "C:\\work\\project\\"),
+            (WorkspacePathTarget::Windows, "\\server\\share"),
+            (WorkspacePathTarget::Windows, "\\\\Server\\share"),
+            (WorkspacePathTarget::Windows, "\\\\server\\share\\"),
+            (WorkspacePathTarget::Windows, "C:\\work\0project"),
+        ] {
+            assert_eq!(
+                spec_from_native(
+                    "repo".parse().unwrap(),
+                    PathBuf::from(native_path),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(true, true),
+                    target,
+                ),
+                Err(WorkspaceInputLoweringError::InvalidNativePath),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_native_specs_reject_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        assert_eq!(
+            spec_from_native(
+                "repo".parse().unwrap(),
+                PathBuf::from(OsString::from_vec(vec![b'/', b'w', 0xFF])),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+                WorkspacePathTarget::Posix,
+            ),
+            Err(WorkspaceInputLoweringError::NativePathNotLossless),
+        );
+    }
+
+    #[test]
+    fn workspace_aggregate_keeps_revision_order_and_cwd_and_rejects_invalid_construction() {
+        let workspace = Workspace::new(
+            revision(),
+            native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+            vec![
+                native_spec("first", "/work/first", WorkspacePathTarget::Posix),
+                native_spec("second", "/work/second", WorkspacePathTarget::Posix),
+            ],
+            cwd("second", "nested"),
+        )
+        .unwrap();
+        assert_eq!(workspace.revision(), "wr_1".parse().unwrap());
+        assert_eq!(workspace.primary_root().key().as_str(), "primary");
+        assert_eq!(workspace.additional_roots()[0].key().as_str(), "first");
+        assert_eq!(workspace.additional_roots()[1].key().as_str(), "second");
+        assert_eq!(workspace.cwd().root().as_str(), "second");
+        assert_eq!(workspace.cwd().relative_path().as_str(), "nested");
+
+        assert_eq!(
+            Workspace::new(
+                revision(),
+                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                vec![native_spec(
+                    "primary",
+                    "/work/other",
+                    WorkspacePathTarget::Posix
+                )],
+                cwd("primary", ""),
+            ),
+            Err(WorkspaceConstructionError::DuplicateRootKey),
+        );
+        assert_eq!(
+            Workspace::new(
+                revision(),
+                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                vec![native_spec(
+                    "other",
+                    "/work/primary",
+                    WorkspacePathTarget::Posix
+                )],
+                cwd("primary", ""),
+            ),
+            Err(WorkspaceConstructionError::DuplicateNativePath),
+        );
+        assert_eq!(
+            Workspace::new(
+                revision(),
+                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                Vec::new(),
+                cwd("missing", ""),
+            ),
+            Err(WorkspaceConstructionError::UnknownCwdRoot),
+        );
+        assert_eq!(
+            Workspace::new(
+                revision(),
+                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                (1..=16)
+                    .map(|index| {
+                        native_spec(
+                            &format!("root-{index}"),
+                            &format!("/work/{index}"),
+                            WorkspacePathTarget::Posix,
+                        )
+                    })
+                    .collect(),
+                cwd("primary", ""),
+            ),
+            Err(WorkspaceConstructionError::TooManyRoots),
+        );
+    }
+
+    #[test]
+    fn durable_workspace_debug_and_errors_do_not_expose_root_text() {
+        let workspace = lower_workspace(
+            input_with_primary("file:///root-secret/private-uri-secret"),
+            revision(),
+            WorkspacePathTarget::Posix,
+        )
+        .unwrap();
+        let debug = format!("{workspace:?} {:?}", workspace.primary_root());
+        assert!(debug.contains("root_count"));
+        assert!(debug.contains("cwd_is_workspace_root"));
+        assert!(!debug.contains("root-secret"));
+        assert!(!debug.contains("private-uri-secret"));
+        assert!(!debug.contains("file:///"));
+
+        let error = lower_workspace(
+            input_with_primary("file:///root-secret/private-uri-secret"),
+            revision(),
+            WorkspacePathTarget::Windows,
+        )
+        .unwrap_err();
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("root-secret"));
+        assert!(!error_text.contains("private-uri-secret"));
+        assert!(!error_text.contains("file:///"));
+    }
+
+    fn revision() -> WorkspaceRevision {
+        "wr_1".parse().unwrap()
+    }
+
+    fn root_input(key: &str, uri: &str) -> WorkspaceRootInput {
+        WorkspaceRootInput::new(
+            key.parse().unwrap(),
+            uri.parse::<CanonicalFileUri>().unwrap(),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(true, true),
+        )
+    }
+
+    fn input_with_primary(uri: &str) -> WorkspaceDefinitionInput {
+        WorkspaceDefinitionInput::new(root_input("repo", uri), Vec::new(), cwd("repo", "")).unwrap()
+    }
+
+    fn cwd(root: &str, relative_path: &str) -> WorkspaceCwdSpec {
+        WorkspaceCwdSpec::new(root.parse().unwrap(), relative_path.parse().unwrap())
+    }
+
+    fn native_spec(key: &str, path: &str, target: WorkspacePathTarget) -> WorkspaceRootSpec {
+        spec_from_native(
+            key.parse().unwrap(),
+            PathBuf::from(path),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(true, true),
+            target,
+        )
+        .unwrap()
     }
 }
