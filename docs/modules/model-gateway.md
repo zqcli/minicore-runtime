@@ -20,7 +20,7 @@
 
 本文不定义：
 
-- Prompt内容、conversation visibility或`MessageRecord → ModelMessage`转换；
+- Prompt transcript construction、conversation visibility或canonical live/stored facts → `ModelMessage` conversion；
 - ActiveTurnTask logical retry、compaction orchestration或Turn terminal规则；本文只摘要Gateway terminal error与该policy的边界，具体规则以Session Execution和ADR 0119为权威；
 - Tool execution、approval或ToolResult持久化；
 - Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
@@ -653,19 +653,17 @@ model definition未声明rate时，validated definition使用Runtime保守默认
 PromptSet是唯一producer。assembled shape显式分开有序System sections与conversation messages：
 
 ```rust
-pub struct AssembledModelContext {
-    pub system: Arc<[PromptSection]>,
-    pub messages: Arc<[ModelMessage]>,
-    pub tools: Arc<[ToolSpec]>,
-    pub output_contract: Option<OutputContract>,
-    pub contribution_stamps: Arc<[PromptContributionStamp]>,
-    pub diagnostics: Arc<[PromptDiagnostic]>,
-    pub(crate) assembly_proof: PromptAssemblyProof,
+pub(crate) struct AssembledModelContext {
+    system: Arc<[PromptSection]>,
+    messages: Arc<[ModelMessage]>,
+    tools: Arc<[ToolSpec]>,
+    output_contract: Option<OutputContract>,
+    diagnostics: Arc<[PromptDiagnostic]>,
+    assembly_proof: PromptAssemblyProof,
 }
-
 ```
 
-PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。`contribution_stamps`是从sanitized conversation复制的safe part-level解释元数据，不是provider payload、source locator或authorization；adapter不得据此重新读取Skill/Workspace正文。
+`AssembledModelContext` fields are private; this module consumes only the crate-private narrow getters frozen in Prompt. PromptSet System sections、前置User context和ToolSpec在active Turn内天然稳定；Gateway可以利用canonical section/message/tool boundaries选择cache breakpoint，不需要额外stability flag。ProviderAdapter是Prompt授权read-ref consumers之一；for every transcript message it must use Prompt's crate-private `ModelMessage::as_ref()` / `ModelAssistantContent::as_ref()` rather than destructuring a storage kind or private transcript kind. `AssembledModelContext`没有flat `contribution_stamps`：stamp只保存在各个User `ModelMessage`内部，任何read ref都不提供它。stamp不是provider payload、cache-control input、source locator或authorization；adapter不得据此重新读取Skill/Workspace正文或影响cache choice。
 
 `PromptAssemblyProof`是PromptSet生成的crate-private consistency proof，绑定ModelCallPurpose、exact TurnModelRef、OutputContract结构值和optional CompactionSummaryBudget proof。它不提供第二个caller-controlled purpose；ModelCallRequest constructor必须校验proof与request一致。
 
@@ -1059,6 +1057,8 @@ impl ReasoningContent {
 ```
 
 `ReasoningContent`在ModelGateway validation后就是唯一live/storage-safe reasoning artifact shape；fields/constructor保持private，Conversation Storage直接复用该type，不定义`StoredReasoning` shadow DTO。`text | summary | encrypted | signature`至少一个为Some；provider_item_id只是auxiliary correlation，不能单独构成content。text<=262,144 bytes、summary<=131,072、encrypted<=262,144、signature<=16,384，provider_item_id遵守opaque ID limit。
+
+`ReasoningContent`完整保留上述五个fields，包括portable `provider_item_id`，是fixtures/storage冻结的唯一reasoning artifact shape。这个ID是Prompt transcript唯一允许的portable provider exception；它随`ModelAssistantContentRef::Reasoning`可读，但不让adapter制造request/response attempt identity。response ID、stream/final content index、provider ordering bookkeeping、metadata、usage及所有其他provider-attempt facts绝不进入`ReasoningContent`、`ModelMessage`或its read refs。ToolCall terminal normalization中的provider item ID/index只用于Gateway stream/final reconciliation，投影到Prompt transcript时必须丢弃。
 
 不得：
 

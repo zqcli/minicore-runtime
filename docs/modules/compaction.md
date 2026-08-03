@@ -21,7 +21,7 @@ Compaction在模型上下文接近上限时，把sanitized live conversation的�
 ## 决策摘要
 
 - Compaction是crate-private planning/validation deep module；
-- ActiveTurnTask拥有trigger、model call、logical retry和live Replace；
+- M10 ActiveTurnTask拥有trigger、model call、logical retry、control arbitration与record/publication；LiveSessionState reducer拥有atomic live Replace；
 - ordinary Prompt继续消费`LiveConversationView`；Compaction额外消费reducer-owned `LiveCompactionSourceView`；
 - source按provider-valid stable unit携带exact EntryId origin；
 - plan持有source + cut，marker只能从cut派生；
@@ -31,6 +31,17 @@ Compaction在模型上下文接近上限时，把sanitized live conversation的�
 - automatic StoredCompaction始终保存完整safe model-call provenance；
 - summary成功后先Replace live conversation，再inline attempt record marker；
 - cold replay无法应用marker时忽略并报告diagnostic。
+
+## M4、M5 与 M10 闭合边界
+
+**INV-005是整体不变量，完整闭合属于M10。** M4只闭合其中synchronous/no-await live-reducer subset，且不启动Compaction orchestration：
+
+- reducer apply接受immutable `LiveCompactionSourceView`、nonzero且in-range的cut、Compaction-owned opaque `CompactionReplacement` proof，以及owning Session/Turn orchestration提供的`TurnId + Timestamp`；它从`source + cut`自行派生唯一marker，并只比较replacement内exact `StoredCompaction` marker，绝不接受raw replacement messages、raw retained suffix、planner output或模型调用输入；
+- apply前在同一个无await operation创建fresh current source，调用`source.has_same_stable_identity(&fresh_current_source)`验证其`SessionId`、revision和stable-unit identity完全匹配，确认没有pending exchange并验证replacement marker等于derived marker；cross-session、stale、mismatched source/marker和pending-exchange一律拒绝；
+- reducer先consume `replacement.into_parts()`，并以exact rolling-summary `ModelMessage`完成`PreparedLiveCompactionUnit` preparation；随后可将prebuilt immutable summary clone到leading unit和flattened `LiveConversationView`。所有上述验证（包括nonzero/in-range cut）、replacement/source projection、prepared unit与`ConversationRevision::checked_next()`都在EntryId allocation之前完成。成功时新Compaction EntryId是rolling-summary origin：reducer先construct exact `Arc<StoredSessionEntry>`、infallibly bind prepared summary unit、commit prepared Replace state、append同一Arc到full selected path并install preflighted revision；它只clone fresh current units中的**exact suffix**。整个M4 operation无await、无I/O且不调用Model/Recorder；
+- M4不实现pressure/planner/token/budget/summary-model call、`Arc<CompactionPlan>`、`Arc<ModelCallRequest>`、retry、recorder ordering或publication。它只证明INV-003和INV-005的reducer-owned subset。
+
+M5拥有recorded marker的tolerant replay：无效、过期或无法定位的recorded marker只ignore并diagnose，不能由M4 live reducer吞掉或解释。M10才完成INV-005剩余的exact Turn/control arbitration、`Arc<CompactionPlan>`与`Arc<ModelCallRequest>` identity、summary-model validation、orchestration/retry、inline recorder ordering和publication。下文的planning、summary call与recording flow均描述该M10完整合同，除非明确标为M4。
 
 ## Ownership
 
@@ -53,7 +64,7 @@ Compaction
 ├─ deterministic summary-source reduction
 ├─ prefix cut and budget
 ├─ summary validation
-└─ StoredCompaction payload/provenance candidate
+└─ CompactionReplacement proof around StoredCompaction payload
 
 ActiveTurnTask
 ├─ current plan/request ownership
@@ -62,7 +73,7 @@ ActiveTurnTask
 ├─ live Replace request
 └─ inline SessionRecorder attempt
 
-Cold replay projector
+M5 cold replay projector
 └─ applies or ignores recorded marker
 ```
 
@@ -70,39 +81,80 @@ Compaction不拥有ModelGateway、SessionRecorder、LiveSessionState、retry pol
 
 ## Stable-Unit Source
 
-`LiveConversationView`保持ordinary Prompt所需的最小shape：
+`LiveConversationView`的canonical definition/constructor属于[Conversation Storage](conversation-storage.md#live与cold-conversation)，ordinary Prompt只通过its getters读取它。Live reducer额外提供Compaction-specific immutable projection；type语义、deep stable-identity method和validated factory属于Compaction，canonical producer仍是`LiveSessionState`：
 
 ```rust
-pub(crate) struct LiveConversationView {
-    revision: ConversationRevision,
-    messages: Arc<[ModelMessage]>,
-}
-```
-
-Live reducer额外提供Compaction-specific immutable projection：
-
-```rust
+#[derive(Clone)]
 pub(crate) struct LiveCompactionSourceView {
     session_id: SessionId,
     revision: ConversationRevision,
     units: Arc<[LiveCompactionUnit]>,
 }
 
+#[derive(Clone)]
 pub(crate) struct LiveCompactionUnit {
     first_entry_id: EntryId,
     kind: CompactionUnitKind,
     messages: Arc<[ModelMessage]>,
 }
 
+pub(crate) struct PreparedLiveCompactionUnit {
+    kind: CompactionUnitKind,
+    messages: Arc<[ModelMessage]>,
+}
+
+pub(crate) struct CompactionSourceError {
+    reason: CompactionSourceErrorReason,
+}
+
+pub(crate) enum CompactionSourceErrorReason {
+    EmptyUnitMessages,
+    DuplicateUnitOrigin,
+    MisplacedRollingSummary,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum CompactionUnitKind {
     RollingSummary,
     UserMessage,
     AssistantMessage,
     ToolExchange,
 }
+
+impl PreparedLiveCompactionUnit {
+    pub(crate) fn for_live_reducer(
+        kind: CompactionUnitKind,
+        messages: Arc<[ModelMessage]>,
+    ) -> Result<Self, CompactionSourceError>;
+
+    pub(crate) fn bind_origin(self, first_entry_id: EntryId) -> LiveCompactionUnit;
+}
+
+impl LiveCompactionUnit {
+    pub(crate) fn first_entry_id(&self) -> &EntryId;
+    pub(crate) fn kind(&self) -> CompactionUnitKind;
+    pub(crate) fn messages(&self) -> &[ModelMessage];
+}
+
+impl LiveCompactionSourceView {
+    pub(crate) fn for_live_reducer(
+        session_id: SessionId,
+        revision: ConversationRevision,
+        units: Arc<[LiveCompactionUnit]>,
+    ) -> Result<Self, CompactionSourceError>;
+
+    pub(crate) fn session_id(&self) -> &SessionId;
+    pub(crate) fn revision(&self) -> &ConversationRevision;
+    pub(crate) fn units(&self) -> &[LiveCompactionUnit];
+    pub(crate) fn has_same_stable_identity(&self, other: &Self) -> bool;
+}
 ```
 
-fields与constructors保持private。`LiveConversation`/`LiveSessionState`是唯一producer，Compaction只读消费。
+fields保持private。`PreparedLiveCompactionUnit::for_live_reducer(kind, messages)`是专为live reducer准备的narrow crate-private validated factory；它在尚无新EntryId时完成该unit的全部message/kind validation，至少要求`messages` non-empty，并在成功后保存exact message Arc。`bind_origin(self, EntryId)`只把already-validated prepared value绑定为`LiveCompactionUnit`，无`Result`、无重新验证且不clone message。`LiveCompactionUnit`与`LiveCompactionSourceView`是immutable `Clone` handles：clone共享其Arc-backed messages/units，并保持exact entry origin、kind、order和message semantic identity；它不重建borrowed message或重新推断unit。它不要求Rust caller sealing，但canonical producer始终是`LiveSessionState`，Compaction只读消费。Compaction estimator/reduction是Prompt授权的read-ref consumer：它只经`ModelMessageRef`/`ModelAssistantContentRef`读取unit message，绝不destructure private transcript kind，也永远看不到stamp。`CompactionSourceError`也是Compaction-owned、private-field/redacted typed error：它只冻结`EmptyUnitMessages`、`DuplicateUnitOrigin`和`MisplacedRollingSummary`三种structural reason，`Debug`不得显示entry ID、message或其他source contents。prepared factory负责unit-local nonempty message/kind validation；source factory仍负责source-wide `first_entry_id` unique及`RollingSummary`至多一个且只能位于index 0。两者都不尝试从arbitrary messages推断完整Tool exchange：User/Assistant/Tool semantic grouping仍是reducer责任，并由reducer tests覆盖。
+
+因此new User、ordinary Assistant和rolling summary都先得到`PreparedLiveCompactionUnit`，只在new entry ID allocation成功后立即`bind_origin(new_entry_id)`；此binding不可能再失败。complete Tool exchange在当前Tool entry allocation前已经有Assistant origin：reducer先用existing Assistant entry ID bind prepared exchange unit，再allocation当前Tool entry。无论哪一种，任何Prompt/message/kind validation都不跨越新EntryId allocation。
+
+Compaction不导入、构造或返回`LiveConversationError`。作为factory caller的`LiveSessionState`在自己的integration boundary把`CompactionSourceError`映射为其own typed/redacted live-state error；它不把Compaction error包进public/source chain，也不要求Compaction知道LiveSessionState，从而不形成conceptual module error cycle。
 
 source invariants：
 
@@ -117,6 +169,8 @@ source invariants：
 - Interaction、progress、stream draft、usage-only和recording health不进入source；
 - 每个unit的`first_entry_id`在该source内唯一；
 - identical message values不合并，也不参与marker lookup。
+
+`LiveCompactionSourceView::has_same_stable_identity()`是唯一公开的deep identity operation；source不保存、暴露或返回identity DTO。它**exactly**比较bound `SessionId + ConversationRevision`、unit count和ordered `(first_entry_id, CompactionUnitKind)` sequence，绝不比较`ModelMessage`或ToolResult value。M4 apply创建fresh current source并调用`source.has_same_stable_identity(&fresh_current_source)`；匹配后只从**fresh current** `units()[cut..]` clone retained unit handles，作为retained suffix。它绝不从borrowed messages、caller source raw messages或caller-supplied suffix重建unit。
 
 source不携带：
 
@@ -220,6 +274,8 @@ pub(crate) struct CompactionModelBasis {
 `agent_run_output_reserve_tokens`是TurnModelSnapshot在ordinary `ModelCallRequest.max_output_tokens = None`时使用的effective generation reservation，不是provider-advertised context limit。Compaction验证两个Prompt basis与model basis使用相同TokenEstimator；TurnExecutionContext private constructor保证它们来自同一次capture。
 
 ## Module Interface
+
+以下`pressure/plan/validate_summary` interface是M10 planning/validation module；M4不构造或接受它的任何input/output，只调用前述reducer-owned `CompactionReplacement` apply。
 
 ```rust
 pub(crate) struct Compaction;
@@ -379,13 +435,12 @@ summary request representation可以缩减大ToolResult，但必须保留：
 ```text
 tool name
 ToolCallId
-truthful outcome kind
 head/tail content
 original byte count
 omitted byte count
 ```
 
-reduction由versioned `CompactionSummaryFormatVersion`固定，输入相同则输出相同。它只修改`CompactionSummarySourceView`，不改写live/durable ToolResult，也不拆开Tool exchange。首版不把无摘要的truncation直接安装为conversation result。
+`ModelMessageRef::Tool`故意只含`ToolCallId + ToolResultContent`，不泄漏Tools execution disposition；summary reduction不得重新索取或伪造一个“outcome kind”。reduction由versioned `CompactionSummaryFormatVersion`固定，输入相同则输出相同。它只修改`CompactionSummarySourceView`，不改写live/durable ToolResult，也不拆开Tool exchange。首版不把无摘要的truncation直接安装为conversation result。
 
 ### Summary Budget
 
@@ -479,6 +534,36 @@ pub struct StoredCompactionModelCall {
 
 Compaction是`StoredCompactionModelCall`的唯一semantic owner；Conversation Storage只引用和serialize该type，ModelGateway只提供normalized source fields。
 
+```rust
+pub(crate) struct CompactionReplacement {
+    stored: StoredCompaction,
+    rolling_summary: ModelMessage,
+}
+
+pub(crate) struct CompactionReplacementError {
+    reason: CompactionReplacementErrorReason,
+}
+
+pub(crate) enum CompactionReplacementErrorReason {
+    InvalidRollingSummary,
+}
+
+impl CompactionReplacement {
+    #[cfg(test)]
+    pub(crate) fn for_m4_test(
+        stored: StoredCompaction,
+    ) -> Result<Self, CompactionReplacementError>;
+
+    pub(crate) fn into_parts(self) -> (StoredCompaction, ModelMessage);
+}
+```
+
+`CompactionReplacement`是M4 apply接受的唯一summary proof，fields private and `Debug` redacts the summary and all model provenance. `CompactionReplacementError` has private fields; its `Debug`、`Display` and source chain redact summary text, `ModelMessageError` detail and model provenance. **M4 interface只提供上述`#[cfg(test)] for_m4_test` construction seam。** It materializes no caller-supplied transcript: factory takes an exact test `StoredCompaction`, calls Prompt's fallible `ModelMessage::rolling_summary()` once, and maps only that constructor's reachable `ModelMessageErrorReason::{EmptyText, UnsafeText, TextTooLong}` to the one redacted M4 reason `CompactionReplacementErrorReason::InvalidRollingSummary`. Empty assistant content and duplicate ToolCallId are unreachable here and are covered by separate assistant-constructor tests. This is intentionally the complete M4 replacement-error taxonomy; it does not expose text, size, CR, model provenance or a foreign source error. `into_parts(self)` is consuming and returns the exact owned `(StoredCompaction, ModelMessage)` values. The reducer consumes them before allocation; it may then clone the prebuilt immutable rolling-summary `ModelMessage` into the leading stable unit and flattened `LiveConversationView`. That is the documented shared-value projection, not an undocumented seam or a reconstruction of either value.
+
+M4 has no production replacement constructor and does not name or depend on `ValidatedCompactionSummary`. **M10 will add** production construction from `ValidatedCompactionSummary` when that M10 type and its validation-error contract exist: it will materialize exact `StoredCompaction`, call the same Prompt constructor, and seal the result before live apply. That M10 addition belongs to summary validation/provenance, not to this M4 interface.
+
+The wrapper proves summary/message construction has completed, not that M4 independently validated model provenance. M4 only validates the source/cut/marker/live-state conditions. Raw decoded or replay `StoredCompaction::reconstruct` is an M5 cold-projector operation: it invokes the same fallible Prompt rolling-summary constructor only to build replay projection, or ignore/diagnose a bad marker/text, but can never create `CompactionReplacement` or call the live reducer directly.
+
 `validate_summary()`要求：
 
 - result model exact匹配plan的TurnModelRef；
@@ -498,28 +583,29 @@ plan-derived first_kept_entry_id
 Some(StoredCompactionModelCall)
 ```
 
-首版automatic SummaryModel Compaction始终`model_call = Some`。`None`仅为future显式设计的deterministic maintenance/import路径保留，不是automatic overflow fallback。[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#compaction)冻结camelCase fields、null、summary<=65,536 bytes、finish/retry/request-max/metadata和marker encoding；不改变这里的semantic owner。
+首版automatic SummaryModel Compaction始终`model_call = Some`。M10 summary validation完成时才会新增`ValidatedCompactionSummary → CompactionReplacement` production construction，并只以其sealed result请求LiveSessionState apply；no raw `StoredCompaction` is a live-reducer input. `None`仅为future显式设计的deterministic maintenance/import路径保留，不是automatic overflow fallback。[Conversation JSONL Format V1](../formats/conversation-jsonl-v1.md#compaction)冻结camelCase fields、null、summary<=65,536 bytes、finish/retry/request-max/metadata和marker encoding；不改变这里的semantic owner。
 
-## Live Replace与Recording
+## M10 Live Replace与Recording
 
 **Canonical cross-module invariant: INV-005.**
 
+After `validate_summary()` succeeds, M10's production construction seals `CompactionReplacement` **before** it calls `LiveSessionState::apply_compaction(...)`. ActiveTurnTask first performs its final exact Turn/control/emergency and `Arc<CompactionPlan>`/`Arc<ModelCallRequest>` arbitration; it then delegates the unchanged M4 source/cut/marker transaction to the reducer. That no-await reducer operation receives an already sealed wrapper and never constructs a summary message itself:
+
 ```text
-validate current TurnId/control_generation/EmergencyControl
-→ validate exact current Arc<CompactionPlan> + Arc<ModelCallRequest>
-→ validate plan.session_id == loaded SessionId
-→ validate current ConversationRevision == plan.source.revision
-→ validate plan-derived marker仍是current stable-unit boundary
-→ LiveSessionState.EntryIdGenerator allocates Compaction EntryId + binds parent_id
-→ apply live Replace:
-     RollingSummary(origin = new Compaction EntryId)
-     + exact current retained units
-→ increment ConversationRevision once
-→ await SessionRecorder.record(the same StoredSessionEntry)
+receive prebuilt CompactionReplacement from M10 ValidatedCompactionSummary construction
+→ reducer consumes replacement.into_parts(); prepares rolling-summary stable unit
+→ create fresh current source; validate `source.has_same_stable_identity(&fresh_current_source)` and plan-derived marker boundary
+→ validate/projection/candidate preparation, then ConversationRevision.checked_next()
+→ LiveSessionState.EntryIdGenerator.allocate()? + binds parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind prepared RollingSummary to new Compaction EntryId
+→ commit prepared Replace state with retained unit handles cloned only from fresh current source
+→ append the same Arc to full selected path and install the preflighted revision
+→ await SessionRecorder.record(the same Arc<StoredSessionEntry>)
 → publish usage/conversation update and continue Turn
 ```
 
-validation和EntryId allocation发生在同一个无await live-owner operation中；失败不消耗可观察EntryId或apply部分Replace。live reducer不接受raw replacement messages。
+validation、projection/candidate preparation、checked revision preflight和EntryId allocation发生在同一个无await live-owner operation中；returned error never consumes an ID or applies partial Replace. After allocation, exact entry-Arc construction, prepared-unit binding, state commit, same-Arc path append and revision install are infallible (ordinary allocation panic is outside the Result contract). State is never applied before entry construction. live reducer不接受raw replacement messages。M4以同样的allocation-after-validation纪律执行其source/cut/`CompactionReplacement`/`TurnId`/`Timestamp` subset；TurnId按current/start semantics验证，Timestamp是typed orchestration fact而非ambient clock，且没有Recorder、control/request或publication步骤。
 
 queued Steer不改变revision，不使in-flight Compaction失效。只有safe point实际apply的Steer、Assistant、complete Tool exchange、Input或另一Compaction Replace递增revision。Cancel/SecurityRevoked/Lifecycle可以在revision未变时通过control arbitration拒绝result。
 
@@ -531,7 +617,7 @@ record outcome不参与Replace validity。Recorder failure时：
 - restart只恢复recorded旧conversation；
 - 不重新调用summary model来补偿recording failure。
 
-## Cold Replay
+## M5 Cold Replay
 
 遇到StoredCompaction时，projector先从当前selected recorded path构造effective provider-valid stable units，再解释marker：
 
@@ -544,11 +630,11 @@ record outcome不参与Replace validity。Recorder failure时：
 
 Replay不恢复plan、settings、TokenEstimator、source revision、ActiveTurnTask或ModelCallRequest，也不重新验证当时summary预算。
 
-## Async Execution
+## M10 Async Execution
 
 ```text
 exact next AgentRun pressure/ContextOverflow
-→ capture LiveCompactionSourceView + Turn bases
+→ capture CapturedConversationViews (including LiveCompactionSourceView) + Turn bases
 → Compaction::pressure
 → Compaction::plan
 → assemble CompactionSummary + immutable ModelCallRequest
@@ -558,7 +644,11 @@ exact next AgentRun pressure/ContextOverflow
 → optional one logical retry with same request
 → validate same Turn/control/session/revision/plan/request
 → Compaction::validate_summary
-→ live Replace + revision increment
+→ M10 adds production ValidatedCompactionSummary → CompactionReplacement construction
+  (typed failure before live apply)
+→ final no-await ActiveTurnTask arbitration of exact Turn/control/emergency
+  + Arc<CompactionPlan>/Arc<ModelCallRequest>/Session/revision immediately before reducer apply
+→ live Replace with preflighted revision
 → await inline record StoredCompaction attempt
 → consume safe-point Steer or reassemble AgentRun
 ```
@@ -597,6 +687,18 @@ exact next AgentRun pressure/ContextOverflow
 - rolling summary可以再次摘要且只保留一个leading summary；
 - all units summarized产生`first_kept_entry_id = None`；
 - cross-Session source即使revision/EntryId相同也被拒绝。
+- live-reducer unit/source factories reject empty unit messages, duplicate origins and RollingSummary outside index zero; complete Tool-exchange grouping remains reducer-tested rather than factory-inferred.
+- `has_same_stable_identity()` uses SessionId/revision/unit count/ordered `(first_entry_id, kind)`, not equal ModelMessage values.
+
+### M4 Reducer Subset
+
+- M4 creates a fresh current source and `source.has_same_stable_identity(&fresh_current_source)` verifies SessionId、revision、unit count和ordered stable-unit identity；
+- nonzero/in-range cut唯一派生marker；`CompactionReplacement` consumption/prepared rolling-summary unit、marker不匹配、source stale/cross-session、`has_same_stable_identity()`不匹配或存在pending exchange都在EntryId allocation前完成或拒绝；
+- apply消费exact replacement parts并在allocation前prepare unit；可clone prebuilt immutable summary进入leading unit/flattened view；以new Compaction EntryId为origin并只clone fresh current units中的exact retained suffix，先`checked_next()`再allocation、最后依序infallibly construct exact entry Arc、bind prepared unit、commit Replace、append同一Arc到full path并install preflighted revision；拒绝路径不改变EntryId/head/revision/state且不做I/O；
+- reducer不接收raw replacement messages/suffix/marker或raw `StoredCompaction`，不构造plan/request、不验证provider provenance、不估算token/budget、不调用模型或Recorder；
+- M4 only has `#[cfg(test)] CompactionReplacement::for_m4_test(...) -> Result<_, CompactionReplacementError>`; M10 will later add production `ValidatedCompactionSummary → CompactionReplacement` construction. raw/replay StoredCompaction reconstruction never calls the reducer;
+- M4 stale tests使用stale/cross-session source与cut/marker mismatch，不使用不存在的plan/request staleness。
+- all M4 rejection tests participate in the [deterministic sentinel/no-ID matrix](../development-plan.md#m4-liveconversation-reducer): source factory/stale/cross-session/identity、out-of-range nonzero cut、marker mismatch和pending exchange leave head/full path/revision/all state unchanged and leave the same first candidate for the next successful allocation; zero is separately rejected before reducer invocation, and prepared-unit failure is likewise pre-allocation.
 
 ### Settings与Planning
 
@@ -611,7 +713,7 @@ exact next AgentRun pressure/ContextOverflow
 - checked arithmetic overflow；
 - max Compactions per Turn计operation、不计logical retry。
 
-### Request、Apply与Replay
+### M10 Request、Apply与Replay；M5 Recorded-Marker Replay
 
 - plan budget等于Prompt proof与ModelCallRequest max output；
 - summary retry复用same plan/request；

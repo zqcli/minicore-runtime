@@ -239,6 +239,8 @@ Live reducer拥有：
 
 Assistant response含ToolCall时，完整exchange形成前，assistant和results都不能进入下一次Model input。UI仍可以显示Started/Completed Tool Item。
 
+`ConversationRevision`按[Conversation Storage的exact delta matrix](conversation-storage.md#conversationrevision)计数，而不按当前可见messages计数：accepted ToolCall Assistant在仍被complete gate隐藏时即`+1`；只有全部expected calls都有first truthful `Completed` result、整个exchange promotion时再`+1`。partial terminal、Abandoned或其他未进入模型的settlement均为`+0`。这使同一hidden exchange的先后accepted/projection operation不能被in-flight request误当成同一basis。
+
 以下exchange不能进入模型conversation：
 
 - missing result；
@@ -272,20 +274,20 @@ Replay对旧或损坏记录采用：
 
 ```rust
 pub(crate) struct Interaction {
-    pub request_id: RequestId,
-    pub session_id: SessionId,
-    pub turn_id: TurnId,
-    pub item_id: ItemId,
-    pub request: InteractionRequest,
-    pub state: InteractionState,
+    request_id: RequestId,
+    session_id: SessionId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request: InteractionRequest,
+    state: InteractionState,
 }
 ```
 
 ```rust
-pub(crate) enum InteractionState {
+enum InteractionState {
     Pending,
     Resolved {
-        resolution: InteractionResolution,
+        resolution: ResolvedInteraction,
         resolved_at: Timestamp,
         resolution_key: Option<InteractionResolutionKey>,
     },
@@ -306,6 +308,16 @@ pub(crate) enum InteractionResolution {
     Cancelled(InteractionCancelReason),
 }
 
+pub(crate) struct ResolvedInteraction {
+    live: InteractionResolution,
+    view: InteractionResolutionView,
+}
+
+impl ResolvedInteraction {
+    pub(crate) fn live(&self) -> &InteractionResolution;
+    pub(crate) fn view(&self) -> &InteractionResolutionView;
+}
+
 pub enum InteractionCancelReason {
     HostCancelled,
     TurnCancelled,
@@ -320,9 +332,15 @@ pub enum InteractionCancelReason {
 
 `InteractionCancelReason`是live/storage-safe closed taxonomy；subscriber disconnect、elapsed time和user silence没有variant，因为它们不自动resolve。public `InteractionResolutionInput::Cancelled`映射HostCancelled；其他variants只能由对应control/lifecycle owner产生。[Format V1](../formats/conversation-jsonl-v1.md#interaction-resolved)保存exact reason与optional host resolution key。
 
-`resolution_key = Some`只用于host `InteractionCommand::Resolve`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
+`resolution_key = Some`只用于host `InteractionCommand::Resolve`，包括public `Cancelled → HostCancelled`；Cancel/SecurityRevoked/Unload/terminal owner-driven closure使用`None`，只能产生对应的non-Host cancellation reason，并由single owner first-wins保证。key不授权Tool execution，只提供exact public resolution retry去重。
+
+`Interaction`的fields和`InteractionState`都是`LiveSessionState` owner-module private state。只有`LiveSessionState::apply_interaction_request()`构造Pending Interaction，且只有`LiveSessionState::apply_interaction_resolution()`完成first-wins resolution/terminal transition；不存在crate-wide `Interaction` constructor、`state()` getter、mutable reference或可match的raw state enum。sibling module只能通过`CapturedConversationViews`中的`PendingInteractionFact`和public-safe event/storage view读取需要的事实，不能mutate或match raw Interaction state。
+
+`InteractionRequest`和`ResolvedInteraction`是owner-private executable/live values：前者可含ToolApproval private option→PermissionSet map；后者是**opaque struct**，private `InteractionResolution`保留ToolApproval decision、UserAnswer或Cancelled reason，同时持有safe `InteractionResolutionView`。它不是enum，也不能由storage/public caller destructure或重建。它只经narrow safe `view()`与owner-only private-live `live()` access进入对应owner；它及其view的`Debug`都必须redact resolution payload、private permission与key material。live reducer从owner value导出safe `StoredInteractionRequest`/`StoredInteractionResolution`和event projection，但不接受caller预先投影的safe/durable body。resolved state保留exact private `ResolvedInteraction`，以便only owner routes the waiter；safe durable resolution不反向恢复private authorization.
 
 MiniCore拥有RequestId、live state、Cancel、terminal cleanup和waiter routing。Presentation Adapter只展示并提交typed resolution。
+
+每个Item最多同时有一个`Pending` Interaction；这不是“一生只能一个Interaction”：该request以terminal resolution结束后，同一Item可以顺序创建后续Interaction。request和resolution都是model-invisible live mutation，`ConversationRevision`一律`+0`；failed或same-key/same-payload idempotent resolution同样不改变revision。
 
 ## Interaction Ordering
 
@@ -420,6 +438,8 @@ Cancel/SecurityRevoked后：
 
 SessionSnapshot包含live Turn、Items、Pending Interaction和phase。recording Degraded或process crash时，它可以领先可恢复的recorded prefix。StateEvent不作为flush/fsync receipt。
 
+M4 reader只使用`LiveSessionState::capture_conversation_views()`返回的crate-private `CapturedConversationViews`：同一revision的conversation/source/derived selected head/relations，以及`PendingInteractionFact { RequestId, TurnId, ItemId, safe InteractionRequestView }` array。aggregate不暴露完整path；state仍保留exact `Arc<StoredSessionEntry>` path给future LiveSnapshot/Fork。它不是M8 public Item/Interaction DTO、Runtime protocol activation或Fork LiveSnapshot。M4只需保持上述“一Item至多一个Pending、terminal后可顺序再请求”的live invariant，公开view、events与host interaction routing仍由M8关闭。
+
 ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。restart后的Snapshot只能基于recorded prefix重新构建。
 
 ## 测试要求
@@ -435,7 +455,9 @@ ProgressEvent可以丢弃；Snapshot和final StateEvent校正当前进程view。
 - parallel result completion与canonical order；
 - incomplete/abandoned/duplicate/conflicting exchange；
 - ToolStartGate vs Cancel/SecurityRevoked；
-- Interaction request/resolution ordering与host-generated resolution key idempotency/conflict；
+- Interaction fields/raw state只可由LiveSessionState transition methods construct/resolve；sibling只能读取safe Pending/event/storage projection，不能mutate或match raw state；
+- `InteractionResolutionCandidate::host`仅接受ToolApproval/UserAnswer/HostCancelled且seal Some key，`owner_cancellation`仅接受non-Host Cancelled且seal None；wrong origin在reducer/EntryId allocation前以redacted candidate error拒绝；
+- 同一Item拒绝第二个concurrent Pending Interaction，但terminal resolution后允许顺序later interaction；Interaction mutation与idempotent/failing resolution均保持revision `+0`；
 - StoredInteraction request/resolution format-v1 round-trip、family/reason/key relation和unknown variant isolation；
 - InteractionCancelReason只允许Host/Turn/Security/Unload/Runtime/Terminal owner causes，silence/disconnect不产生reason；
 - non-secret Text/SingleChoice validation，secret/password variant不可构造；

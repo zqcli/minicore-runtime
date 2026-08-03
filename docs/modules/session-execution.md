@@ -184,9 +184,12 @@ Submit accepted by control actor
 → pin async capture TurnExecutionContext + resolve_user_message(intent) future
 → Starting subloop selects future / Cancel / SecurityRevoked / Lifecycle
 → future wins: revalidate candidate target + control_generation + emergency epoch + current authority
-→ LiveSessionState validates + allocates EntryId + binds parent_id
-→ apply live Input + Turn Running
-→ await SessionRecorder.record(entry)
+→ LiveSessionState validates/projects candidate + preflights ConversationRevision.checked_next()
+→ allocates EntryId + binds parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind prepared Input unit, commit live Input + Turn Running,
+  append that same Arc to full selected path and install preflighted revision
+→ await SessionRecorder.record(the same Arc)
 → publish TurnStarted
 → spawn ActiveTurnTask
 → complete original Submit as TurnStarted { turn_id }
@@ -212,8 +215,8 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
         turn.check_emergency()?;
         turn.consume_one_safe_point_steer().await?;
 
-        let conversation = turn.live_conversation.sanitized_view();
-        let request = turn.build_agent_run_request(&conversation)?;
+        let views = turn.live_state.capture_conversation_views()?;
+        let request = turn.build_agent_run_request(views.conversation())?;
         let response = turn.call_model_with_logical_retry(request).await?;
 
         if response.has_tool_calls() {
@@ -241,12 +244,17 @@ async fn run_turn(mut turn: ActiveTurnExecution) -> TurnTaskOutcome {
 每个recordable conversation mutation使用同一局部顺序：
 
 ```text
-validate Turn/control_generation/conversation_revision
-→ LiveSessionState allocates EntryId and binds parent_id
-→ apply LiveSessionMutation
-→ await recorder.record(StoredSessionEntry)
+validate Turn/control_generation/conversation_revision and prepare all body projections/candidates
+→ determine revision delta; when +1, ConversationRevision.checked_next()
+→ LiveSessionState.EntryIdGenerator.allocate()? and bind parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind any prepared new-origin stable unit and commit prepared LiveSessionMutation
+→ append that same Arc to full selected path and install preflighted revision
+→ await recorder.record(the same Arc)
 → publish final StateEvent or continue protocol
 ```
+
+all normal-result fallible validation/projection/candidate preparation finishes before allocation. revision overflow and typed EntryId allocation failure both return before any state/head mutation; after allocation exact entry-Arc construction, prepared-unit binding, commit, same-Arc path append and revision installation are infallible (ordinary allocation panic is outside Result), so a returned error never consumes an ID and state never applies before its entry Arc exists. allocation is CSPRNG-backed, reserves a unique candidate before return with at most 32 collision attempts, never a panic/fatal path.
 
 `record().await`是inline non-durable append attempt。`Written`不表示flush或fsync；encode或writer error使Recorder Degraded。mutation不回滚，Turn不失败。TurnStatus mutation不属于recordable conversation：Completed与Final Assistant在同一live decision中形成，Interrupted/Failed只发布live terminal StateEvent。
 
@@ -310,7 +318,7 @@ validated assistant ToolCall content
 → complete: consume safe-point Steer or next Model
 ```
 
-Tool futures可以并行，但属于同一个ActiveTurnTask。它们不能直接修改LiveSessionState或发布final StateEvent，只返回typed outcomes给task。
+Tool futures可以并行，但属于同一个ActiveTurnTask。它们不能直接修改LiveSessionState或发布final StateEvent，只返回typed outcomes给task。accepted ToolCall Assistant即使仍被complete gate隐藏也使`ConversationRevision +1`；最后一个matching first truthful `Completed` result promotion完整exchange时再`+1`，partial/abandoned settlement保持`+0`。
 
 ### Tool Operation Slot
 
@@ -346,7 +354,7 @@ task sends InteractionRequestCommand
 → complete oneshot
 ```
 
-等待期间不持有live state lock、file mutation permit或ToolStartGate。recording degraded时Interaction仍正常运行。
+等待期间不持有live state lock、file mutation permit或ToolStartGate。每Item至多一个Pending Interaction；terminal resolution后允许顺序later interaction。request/resolution、失败和idempotent resolution都model-invisible且revision `+0`；recording degraded时Interaction仍正常运行。
 
 ## Steer
 
@@ -427,12 +435,15 @@ SecurityRevoked使用同一EmergencyControl机制，terminal reason不同。Star
 
 recording failure不会产生Unavailable。
 
-## Compaction
+## M10 Compaction
+
+M4只实现source/cut/marker/no-I/O的live-reducer subset：apply还接收Session/Turn orchestration提供的`TurnId + Timestamp`。它创建fresh current source，`CompactionReplacement`必须匹配该source derived marker，且pending/cross-session/stale或`source.has_same_stable_identity(&fresh_current_source)`不匹配时在EntryId allocation前拒绝；it consumes exact replacement parts and prepares the rolling-summary stable unit before allocation, then retains suffix only from fresh current source. M4 replacement construction is only `#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>`; M10 will add production construction from `ValidatedCompactionSummary` when those types exist. M4不构造plan/request、不验证model provenance、不调用model/Recorder或发布。M5负责recorded bad-marker ignore/diagnose。以下是M10 full Compaction flow：
 
 ```text
 exact next AgentRun pressure/Prompt ContextOverflow/provider ContextOverflow
 → short live-state capture:
-     LiveConversationView + Arc<LiveCompactionSourceView> at one revision
+     CapturedConversationViews at one revision
+     (LiveConversationView + Arc<LiveCompactionSourceView> + private read facts)
 → release live-state guard
 → context.compaction_pressure(source, trigger, compactions_started)
 → context.plan_compaction(exact source, trigger, compactions_started)
@@ -443,13 +454,18 @@ exact next AgentRun pressure/Prompt ContextOverflow/provider ContextOverflow
 → call ModelGateway with at most one logical retry using same request
 → verify exact Turn/control/session/revision/plan/request and no winning emergency
 → Compaction validates summary + complete automatic provenance
+→ M10 constructs CompactionReplacement from ValidatedCompactionSummary
+→ final no-await verify exact Turn/control/session/revision/plan/request and no winning emergency
 → one no-await live-owner operation:
-     derive marker from plan cut
+     consume exact replacement parts; prepare rolling-summary stable unit
+     create fresh current source; validate `source.has_same_stable_identity(&fresh_current_source)` + derive marker from plan cut
+     prepare exact current-suffix Replace + ConversationRevision.checked_next()
      allocate Compaction EntryId + bind parent
-     Replace with new rolling-summary origin + exact retained units
-     increment ConversationRevision once
-     return same StoredSessionEntry record candidate
-→ await inline SessionRecorder.record attempt
+     infallibly construct exact entry Arc, bind new rolling-summary origin,
+       commit Replace with exact retained units, append same Arc to full path,
+       and install preflighted revision
+     return exact AppliedConversationFact record candidate
+→ await inline SessionRecorder.record(the same Arc) attempt
 → consume one safe-point Steer or reassemble AgentRun
 ```
 
@@ -543,7 +559,7 @@ Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery a
 - recording failure后Snapshot/StateEvent仍反映live state；
 - Degraded后修复storage不会使当前loaded instance重新写入；
 - Unload/Load可建立新Healthy Recorder，但只恢复recorded prefix；
-- Compaction source与ordinary LiveConversationView在同一revision snapshot产生，guard在planning/await前释放；
+- `capture_conversation_views()`将Compaction source、ordinary LiveConversationView、从full selected `Arc<StoredSessionEntry>` path派生的head、relations与safe Pending facts在同一revision aggregate产生；M4只读head，future LiveSnapshot/Fork保留full path，guard在planning/await前释放；
 - duplicate message和complete Tool exchange只能在stable-unit boundary派生marker；
 - Compaction settings、Prompt bases和model basis来自同一TurnExecutionContext；
 - Compaction budget等于Prompt proof和ModelCallRequest max output；

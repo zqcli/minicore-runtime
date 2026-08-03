@@ -2131,16 +2131,12 @@ pub enum InteractionRequestView {
     UserQuestion(UserQuestionRequest),
 }
 
-pub enum InteractionResolutionView {
-    ToolApproval(ToolApprovalResolution),
-    UserAnswer(UserQuestionAnswer),
-    Cancelled {
-        reason: InteractionCancelReason,
-    },
+pub struct InteractionResolutionView {
+    // owner-private safe projection; no public enum discriminant
 }
 ```
 
-prepared Tool args、executor handle、private option→PermissionSet map、sandbox internals和credential不进入event。`pending_interactions`只含Pending request；resolved request从Snapshot移除，并通过`InteractionResolved` event detail传递safe resolution。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity、option/question indices和first-wins状态。
+`InteractionResolutionView`是Turn/Interaction owner提供的safe opaque projection，不是Runtime-local enum or shadow DTO；owner以narrow safe view/ref access表达ToolApproval、UserAnswer或Cancelled。prepared Tool args、executor handle、private option→PermissionSet map、sandbox internals和credential不进入event。`pending_interactions`只含Pending request；resolved request从Snapshot移除，并通过`InteractionResolved` event detail传递safe resolution。Host回答时必须回传SessionId、expected TurnId、ItemId、RequestId和resolution key。UI可以执行本地required-field/choice校验，但MiniCore仍要校验resolution family、identity、option/question indices和first-wins状态。
 
 UserQuestion request/answer是non-secret recordable data；它们可以进入event/history/ToolResult。Presentation Adapter必须提示不能输入credential。Runtime没有`secret` field，Transport Adapter也不能私自把某个Text answer当作secure channel。
 
@@ -2150,7 +2146,7 @@ Session message/history tree由MiniCore内部管理：
 
 ```text
 LiveSessionState
-├─ owns Session-scoped EntryIdGenerator and current live selected head
+├─ owns Session-scoped EntryIdGenerator, full immutable selected entry path, and its derived current head
 ├─ validates domain mutation and binds EntryId + parent_id before apply
 └─ preserves identity when recording is Degraded
 

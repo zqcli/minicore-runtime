@@ -26,7 +26,7 @@ TurnExecutionContext
 - 不再存在同步AgentLoop或committed delta interface；
 - PromptSet从sanitized `LiveConversationView`组装模型输入；
 - `ModelCallRequest`由ModelGateway唯一拥有，Context只调用其private constructor；
-- `ConversationRevision`是current-process model-visible basis；
+- `ConversationRevision`是current-process monotonic live-conversation operation basis，而非当前可见消息的hash/version；
 - SessionRecorder不参与context correctness；
 - Steer复用同一TurnExecutionContext；
 - FollowUp创建新Turn和新Context；
@@ -85,31 +85,38 @@ pub(crate) struct TurnExecutionContext {
 
 ```rust
 impl TurnExecutionContext {
-    pub async fn resolve_user_message(
+    pub(crate) async fn resolve_user_message(
         &self,
         intent: PromptIntent,
     ) -> Result<CanonicalUserMessage, PromptError>;
 
-    pub fn assemble_agent_run(
+    pub(crate) fn assemble_agent_run(
         &self,
         conversation: &LiveConversationView,
     ) -> Result<Arc<AssembledModelContext>, PromptError>;
 
-    pub fn compaction_pressure(
+}
+```
+
+M10 adds the following crate-private extension only when planning/orchestration is implemented; it is not M4's Context surface:
+
+```rust
+impl TurnExecutionContext {
+    pub(crate) fn compaction_pressure(
         &self,
         source: &LiveCompactionSourceView,
         trigger: CompactionTrigger,
         compactions_started: u8,
     ) -> CompactionPressure;
 
-    pub fn plan_compaction(
+    pub(crate) fn plan_compaction(
         &self,
         source: Arc<LiveCompactionSourceView>,
         trigger: CompactionTrigger,
         compactions_started: u8,
     ) -> Result<Arc<CompactionPlan>, CompactionError>;
 
-    pub fn assemble_compaction(
+    pub(crate) fn assemble_compaction(
         &self,
         plan: &Arc<CompactionPlan>,
     ) -> Result<Arc<AssembledModelContext>, PromptError>;
@@ -137,9 +144,11 @@ SessionExecutor reserves candidate TurnId/control_generation
 → capture TurnExecutionContext
 → await context.resolve_user_message(Input intent) in Starting select loop
 → revalidate candidate/control/emergency/authority basis
-→ LiveSessionState validates start + allocates EntryId + binds parent_id
-→ apply start_turn(...) and increment ConversationRevision
-→ await SessionRecorder.record(Input UserMessage)
+→ LiveSessionState validates/projects start candidate + `ConversationRevision::checked_next()`
+→ allocates EntryId + binds parent_id
+→ infallibly construct exact Input entry Arc, bind prepared new-origin unit,
+  commit start_turn, append same Arc to full path and install preflighted revision
+→ await SessionRecorder.record(the same Input entry Arc)
 → publish TurnStarted
 → spawn ActiveTurnTask with same Arc<TurnExecutionContext>
 ```
@@ -148,14 +157,7 @@ recording failure不撤销已开始的live Turn。capture或live validation失�
 
 ## Live Conversation Basis
 
-```rust
-pub(crate) struct LiveConversationView {
-    revision: ConversationRevision,
-    messages: Arc<[ModelMessage]>,
-}
-```
-
-`LiveConversationView`只能由live conversation reducer产生，保证：
+`LiveConversationView`的canonical crate-private definition、private fields、LiveSessionState-owned factory and `revision()/messages()` getters位于[Conversation Storage](conversation-storage.md#live与cold-conversation)。它只能由live conversation reducer产生，保证：
 
 - canonical User/Assistant/Tool role；
 - complete Tool exchange；
@@ -163,9 +165,11 @@ pub(crate) struct LiveConversationView {
 - Compaction Replace已经应用；
 - deterministic ordering。
 
-PromptSet不要求消息已经physical record。Model-visible mutation先更新LiveConversation并递增revision。
+PromptSet不要求消息已经physical record。revision遵守[Conversation Storage的exact delta matrix](conversation-storage.md#conversationrevision)：accepted ToolCall Assistant在尚未可见时已改变basis，complete exchange promotion再改变一次；Interaction、partial/abandoned settlement、progress/usage/recording不改变basis。所有`+1`的checked overflow在EntryId allocation与state mutation前失败。
 
-Compaction使用同一个reducer在同一短guard内产生的`Arc<LiveCompactionSourceView>`。该view额外携带SessionId、revision和EntryId-bearing stable units，但不携带token estimate或settings。TurnExecutionContext不构造stable units；它只验证source Session/revision并用captured PromptSet、model和settings构造[Compaction完整private input](compaction.md#module-interface)。ordinary assembly仍只看到`LiveConversationView`。
+M4 reader必须调用fallible `LiveSessionState::capture_conversation_views()`并持有返回的单一`CapturedConversationViews` aggregate；它在同一次live state/revision capture中提供此view、Compaction source、从full state path末项派生的selected head、`Arc<[ItemRelation]>`和safe `Arc<[PendingInteractionFact]>`。M4 aggregate不公开path；state保留full immutable entries给future Fork `LiveSnapshot`。它不是M8 public `SessionSnapshot`/Item/Interaction DTO或Fork `LiveSnapshot` activation。每Item至多一个Pending Interaction；terminal resolution后允许顺序later interaction，且这些Interaction mutation一律revision `+0`。
+
+Compaction使用同一个aggregate中的`Arc<LiveCompactionSourceView>`。该view额外携带SessionId、revision和EntryId-bearing stable units，但不携带token estimate或settings；source/unit是immutable `Clone` handles。TurnExecutionContext不构造stable units；M4 reducer uses Compaction-owned `PreparedLiveCompactionUnit` to complete message/kind validation before any new origin allocation, then binds it infallibly after a new origin (or, for complete Tool exchange, with its existing Assistant origin before current Tool allocation). It creates a fresh current source and calls `source.has_same_stable_identity(&fresh_current_source)` before it accepts apply, then clones retained unit handles only from that fresh current source. After consuming `CompactionReplacement::into_parts()`, it may clone the prebuilt immutable rolling-summary message into the leading unit and flattened `LiveConversationView`; neither path reconstructs borrowed messages or a caller suffix. M10 adds only planning/model/control/plan/request arbitration around that reducer subset. Context only uses its captured source to form [Compaction完整private input](compaction.md#module-interface)。ordinary assembly仍只看到`LiveConversationView`。
 
 ## ModelCallRequest Binding
 
@@ -252,10 +256,11 @@ Interaction request绑定Context中的exact ToolSet和Workspace policy，但Pend
 
 ## Compaction
 
-ActiveTurnTask从LiveSessionState取得revision-bound stable-unit source，但不直接拼装settings/model/Prompt scalar。它只把source、trigger和本Turn`compactions_started`交给同一个Context：
+M10 ActiveTurnTask从`LiveSessionState::capture_conversation_views()`取得revision-bound stable-unit source，但不直接拼装settings/model/Prompt scalar。它只把source、trigger和本Turn`compactions_started`交给同一个Context：
 
 ```text
-LiveSessionState.compaction_source_view()
+LiveSessionState.capture_conversation_views()
+→ CapturedConversationViews.compaction_source()
 → context.compaction_pressure(source, trigger, count)
 → context.plan_compaction(source, trigger, count)
    ├─ captured CompactionSettingsSnapshot
@@ -265,11 +270,15 @@ LiveSessionState.compaction_source_view()
 → ModelCallRequest::new(CompactionSummary)
 → await ModelGateway
 → validate same Turn/control/session/revision/plan/request
-→ live owner applies plan-derived Replace
-→ await inline record StoredCompaction attempt
+→ Compaction validates summary; M10 constructs sealed CompactionReplacement
+→ final ActiveTurnTask arbitration, then live reducer applies plan-derived Replace
+   with its unchanged M4 source/cut/marker/prepared-unit transaction
+→ await inline record the same applied StoredCompaction entry Arc
 ```
 
-`compaction_pressure()`和`plan_compaction()`是exact capture façade：内部构造Compaction canonical `PressureInput/PlanInput`，不向ActiveTurnTask暴露可跨Context拼接的basis fields。plan marker只能由stable-unit cut派生。recording marker不是Replace生效条件；Compaction后继续使用同一TurnExecutionContext，不需要rebuild loop。
+`compaction_pressure()`和`plan_compaction()`是exact capture façade：内部构造Compaction canonical `CompactionPressureInput/CompactionPlanInput`，不向ActiveTurnTask暴露可跨Context拼接的basis fields。plan marker只能由stable-unit cut派生。recording marker不是Replace生效条件；Compaction后继续使用同一TurnExecutionContext，不需要rebuild loop。
+
+上述pressure/plan/summary-request façade属于M10完整Compaction。M4只把source、nonzero cut、`CompactionReplacement`以及Session/Turn orchestration提供的`TurnId + Timestamp`交给live reducer，以验证derived marker并安装prebuilt summary；它不经TurnExecutionContext实现planner、budget、model request或orchestration。
 
 ## Cancel与SecurityRevoked
 

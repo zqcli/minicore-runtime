@@ -313,31 +313,44 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 
 ## M4 · LiveConversation Reducer
 
-目标：先证明conversation协议正确性，再编排async执行。
+状态：Next。M4先在纯内存中证明conversation protocol与**INV-005 reducer-owned subset**；它不提前实现async execution或full Compaction。
 
 任务：
 
-- Session-scoped `EntryIdGenerator`与collision guard；
-- 在构造任何stable-unit view前，按Prompt canonical owner实现provider-neutral `ModelMessage`；若current Prompt/Model合同不足以冻结exact shape，先停止并更新canonical module，不得引入Compaction-owned shadow DTO；
-- User/Assistant/Tool/Interaction/Compaction typed apply methods；
-- `ConversationRevision` checked increment；
-- ItemId、ToolCallId和relation validation；
-- first truthful ToolResult与duplicate/conflicting terminal处理；
-- incomplete Tool exchange不进入`LiveConversationView`；
-- complete exchange按assistant call order投影，不按completion order；
-- stable-unit `LiveCompactionSourceView`；
-- Compaction Replace exact revision/source/marker验证；
-- Snapshot/read-model projection从同一live state派生。
+- Session-scoped `EntryIdGenerator`与collision guard：`allocate()` typed fallible、16-byte CSPRNG candidate、success前reserve、最多32次collision retry；entropy/exhaustion redacted error不panic，且不改变state/head/revision；replay/Fork reserved IDs均seed guard；
+- 在构造任何stable-unit view前，按Prompt canonical owner冻结crate-private opaque exact provider-neutral `ModelMessage`、`ModelAssistantContent`及borrowed refs；Prompt alone construct/destructure private transcript kinds。二者是immutable Arc-backed `Clone` values：clone保持semantic identity/order/provenance，可将同一message投影到stable unit和flattened LiveConversationView，绝不从borrowed message或raw suffix重建。它们和`as_ref()`不是Runtime external API；ProviderAdapter、Compaction estimator/reduction及Prompt assembly/tests等authorized consumers只能inspect `ModelMessageRef`/`ModelAssistantContentRef`。User projection精确为`ModelMessageRef::User { content: &[MessageContent] }`且stamp通过refs不可能访问，Assistant只含ordered Reasoning/Text/ToolCall，Tool只含ToolCallId + ToolResultContent；完整ReasoningContent及portable provider_item_id保留，response ID/index/order/metadata/usage等attempt facts禁止。public `PromptValueError`保持不变；transcript constructors返回crate-private redacted `ModelMessageError { EmptyText | UnsafeText | TextTooLong | EmptyAssistantContent | DuplicateToolCallId }`。rolling summary只可达前三个text reason（含任意CR/CRLF，绝不normalization）；assistant constructor独立覆盖后两个reason。accepted summary text verbatim且无label/envelope/stamp；live reducer只能调用Prompt crate constructors，不得引入Compaction/Storage/Wire shadow DTO；
+- User/Assistant/Tool/Interaction typed apply与ItemId、ToolCallId/relation validation；`ConversationRevision::checked_next()`按exact matrix preflight：Input/Steer、每个accepted Assistant（含hidden ToolCalls）、complete-exchange promotion、Compaction Replace各`+1`；partial/abandoned/non-visible settlement、Interaction、progress/usage/recording、failed/idempotent apply均`+0`；overflow先于EntryId allocation/state mutation；
+- first truthful ToolResult与duplicate/conflicting terminal处理；incomplete Tool exchange不进入`LiveConversationView`；complete exchange按assistant call order投影，不按completion order；
+- stable-unit `LiveCompactionSourceView`与`LiveCompactionUnit`是private-field immutable `Clone` handles；clone共享Arc-backed units/messages并保持origin/kind/order，不重建unit。source fields之外只冻结`has_same_stable_identity(&self, other: &Self) -> bool`：它比较SessionId/revision/unit count/ordered `(first_entry_id, kind)`，绝不比较`ModelMessage`，且不存储或暴露identity DTO。Compaction-owned `PreparedLiveCompactionUnit::for_live_reducer(kind, messages) -> Result<_, CompactionSourceError>`完成all message/kind validation而不需要origin；`bind_origin(self, EntryId) -> LiveCompactionUnit` infallible。new User/ordinary Assistant/rolling summary只在new ID allocation后bind；complete Tool exchange用already-existing Assistant origin在current Tool allocation前bind。source factory仍返回redacted `CompactionSourceError { EmptyUnitMessages | DuplicateUnitOrigin | MisplacedRollingSummary }`，强制nonempty messages、unique origins和leading-only RollingSummary；`LiveSessionState`只在factory caller boundary映射该error到own typed live error，Compaction绝不依赖`LiveConversationError`；reducer负责完整Tool exchange grouping；
+- M4 Compaction Replace只接受immutable source、nonzero/in-range cut、opaque `CompactionReplacement` (exact StoredCompaction + prebuilt Prompt rolling summary)和orchestration-supplied `TurnId + Timestamp`。M4 replacement interface只有`#[cfg(test)] for_m4_test(StoredCompaction) -> Result<_, CompactionReplacementError>`，其narrow/redacted唯一reason为`InvalidRollingSummary`；the consuming `into_parts(self) -> (StoredCompaction, ModelMessage)` supplies exact owned values. M4没有production constructor或`ValidatedCompactionSummary` dependency；M10才在those types exist时新增production construction。M4创建fresh current source，调用`source.has_same_stable_identity(&fresh_current_source)`，从source+cut派生marker，并consume replacement to prepare its rolling unit；之后可clone prebuilt immutable rolling summary into the leading unit and flattened LiveConversationView。拒绝pending exchange、cross-session、stale或mismatched source/marker，完成all fallible validation/projection/candidate preparation和`checked_next()`后才分配new rolling-summary origin。allocation后依序infallibly construct exact entry Arc、bind prepared summary origin、commit Replace、只clone fresh current source中的retained units作为exact suffix、append同一Arc到full selected path并install preflighted revision；不从borrowed message或caller replacement suffix重建，不接受raw replacement messages/suffix/marker/StoredCompaction，且不做I/O/provenance validation；
+- `LiveSessionState` ordinary typed apply只接收existing valid-by-construction `StoredUserMessage`、`StoredAssistantMessage`或`StoredToolMessage` body加`TurnId + Timestamp`，不定义User/Assistant/Tool candidate types，也不接受prebuilt StoredSessionEntry或caller entry envelope identity；state绑定SessionId、EntryId与parent并返回exact `AppliedConversationFact` Arc。all fallible steps finish before allocation; after allocation it constructs the exact Arc before any state change, binds any prepared new-origin unit, commits state, appends that same Arc to the full selected path, and installs the preflighted revision. It verifies supplied TurnId current/start semantics；Timestamp是owning Session/Turn orchestration提供的typed fact，绝不读ambient clock，Input start之前也不从state导出TurnId/timestamp。Interaction是唯一exception：fields/raw `InteractionState`只属于LiveSessionState；its request/resolution apply methods alone construct/transition it，siblings只读safe facts而不能mutate/match raw state。private request candidate仅`RequestId + ItemId + InteractionRequest`，再传`TurnId + Timestamp`；resolution candidate仅`RequestId + optional host key + opaque ResolvedInteraction`，只再传`Timestamp`。`host(...) -> Result<_, InteractionCandidateError>`只接受ToolApproval/UserAnswer或Cancelled(HostCancelled)并seal Some key；`owner_cancellation(...) -> Result<_, InteractionCandidateError>`只接受Cancelled non-Host并seal None，wrong origin在apply/EntryId allocation前拒绝。reducer从exact stored pending request导出TurnId/Item/family、safe stored request/resolution并保留private live resolution。`capture_conversation_views()`从同一state/revision生成LiveConversationView、source、derived selected head、relations和safe pending facts的一份crate-private aggregate；M4只读head，state保留full path给future LiveSnapshot/Fork。不激活M8 public DTO。每Item最多一个Pending Interaction，terminal resolution后允许顺序later interaction，same-key/same-payload idempotent resolution不分配ID且保持`+0`。
+
+M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPlan>`、`Arc<ModelCallRequest>`、summary validation、orchestration/retry、Recorder ordering或publication；M5拥有tolerant recorded-marker ignore/diagnose，M10才完成完整INV-005。
 
 测试：
 
-- property tests覆盖任意Tool completion permutation；
+- property tests覆盖任意Tool completion permutation与revision delta matrix；
 - duplicate text但不同EntryId的marker identity；
-- incomplete/orphan/abandoned exchange；
-- stale revision/plan rejection；
+- incomplete/orphan/abandoned exchange与hidden Assistant/complete promotion的两次basis变化；
+
+- M4 **no-ID contract** uses a deterministic candidate source with one unreserved sentinel `EntryId` `S`. Each table-driven rejection case snapshots selected head, the full selected path (including exact Arc identities), revision, relations, interactions, pending/exchange state and stable units; it must return with that entire snapshot unchanged. After every returned `Err`, disable the scripted failure and execute a known-valid apply: its first allocation must receive `S`. Validation cases assert zero allocation calls; scripted `EntropyUnavailable` and `CollisionAttemptsExhausted` may enter `allocate()` but neither reserves nor advances the sentinel, so the same `S` is returned by the next successful allocation. This is an observable no-reservation contract, not merely a no-visible-entry assertion. The table is the complete M4 returned-apply-error matrix, not a sample of cases:
+
+  | Table-driven returned apply class | Required cases |
+  | --- | --- |
+  | revision / allocation | `RevisionOverflow`; `EntropyUnavailable`; collision-attempt exhaustion |
+  | body / relation / Turn | invalid body-relation combination; invalid current/start `TurnId`; duplicate ToolResult; cross-Turn result; mismatched Item/ToolCall identity; conflicting terminal result |
+  | ordinary Prompt projection | every reducer-reachable `ModelMessageError` while projecting User/Assistant/Tool canonical facts; assistant constructor coverage remains separate from replacement construction |
+  | Compaction source | prepared/source factory error; stale, cross-session and `has_same_stable_identity()` mismatch |
+  | Compaction boundary | out-of-range nonzero cut; derived-marker mismatch; pending Tool exchange |
+  | Interaction | second Pending conflict; terminal/same-key conflict; resolution key mismatch; request/resolution family mismatch |
+
+  Zero-cut boundary construction is separately tested before `apply_compaction` is invoked; it proves zero reducer/allocation calls and the unchanged snapshot. Test-only `CompactionReplacement::for_m4_test` covers only rolling-summary's reachable `ModelMessageErrorReason::{EmptyText, UnsafeText, TextTooLong}` and proves its redacted `InvalidRollingSummary` construction failure occurs before `apply_compaction`, preserves the snapshot and leaves `S`; it is not misclassified as a reducer-returned Prompt projection error. Separate assistant constructor tests cover `EmptyAssistantContent` and `DuplicateToolCallId`; they are not impossible replacement-factory cases. `InteractionResolutionCandidate::host`/`owner_cancellation` wrong-origin cases likewise fail before reducer invocation or allocation. Same-key/same-payload Interaction resolution is additionally table-tested as `Idempotent`: it performs zero allocation calls, produces no entry/path append, preserves the whole snapshot and leaves `S` for the next successful recordable apply.
+- successful recordable applies reserve exactly one `S`, construct/return/append the same Arc, retain full selected path, and only then use the next candidate; each prepared-unit error is before allocation, while bind-origin and post-allocation commit are infallible. M4 does not invoke or test Recorder ordering;
+- stale/cross-session `has_same_stable_identity()`、nonzero/in-range cut和derived-marker/replacement mismatch rejection（不测plan/request staleness）；
+- 每Item一个Pending、terminal后顺序Interaction/same-key idempotence，以及同一revision `CapturedConversationViews` aggregate；
 - reducer方法同步执行，不持锁或执行I/O。
 
-退出条件：INV-003与INV-005在纯内存测试中成立。
+退出条件：INV-003与仅限reducer-owned的INV-005在纯内存测试中成立；完整INV-005仍为M10。
 
 建议提交：`feat: add live conversation reducer`、`feat: expose compaction stable units`。
 
@@ -381,6 +394,7 @@ M2初始退出条件：M7所需public路径有真实codec与route skeleton，不
 - duplicate/orphan/invalid relation隔离；
 - first valid root + physical-last eligible leaf选择path；
 - incomplete Tool exchange排除；
+- recorded Compaction marker无法应用时由M5 tolerant ignore并产生bounded diagnostic；
 - bounded diagnostic detail、aggregate与truncation summary；
 - cold state的`current_turn = None`。
 
@@ -508,6 +522,8 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 
 ## M10 · Compaction
 
+M10完成完整INV-005；M4已经提供source/cut/marker/no-I/O reducer subset，M5已经提供recorded-marker tolerant replay。
+
 实现：
 
 - Runtime-global validated settings与Turn snapshot；
@@ -516,8 +532,9 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 - plan只保存source+cut并派生summary prefix、retained suffix和marker；
 - Summary Prompt仍经过PromptSet和ModelGateway；
 - automatic model-call provenance始终`Some`；
-- stale plan/result按exact Session/control/request/revision拒绝；
--先分配Compaction EntryId并Replace live，再inline record marker；
+- exact Turn/control、`Arc<CompactionPlan>`与`Arc<ModelCallRequest>` identity、source revision/session的stale plan/result拒绝；
+- validated summary、orchestration、at-most-one logical retry、inline recorder ordering与publication；
+- M10在`ValidatedCompactionSummary`及its validation-error contract存在时新增production `CompactionReplacement` construction；all fallible source/candidate/projection/prepared-unit checks和`checked_next()`先于Compaction EntryId allocation，随后依序infallibly construct exact entry Arc、bind prepared summary origin、commit Replace、append同一Arc到full selected path并install preflighted revision，再inline record the same Arc marker；
 - marker record失败时restart恢复旧recorded conversation。
 
 退出条件：overflow → summary → Replace → next AgentRun，以及Degraded/crash/replay marker矩阵全部通过；每Turn最多4次和minimum reclaim生效。

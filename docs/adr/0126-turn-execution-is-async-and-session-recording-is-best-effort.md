@@ -69,12 +69,17 @@ Rig继续只实现`ModelGateway` private `ProviderAdapter`的单次provider atte
 
 ```text
 validate live mutation
-→ LiveSessionState.EntryIdGenerator allocates EntryId and binds parent_id
-→ apply to LiveSessionState
-→ build immutable StoredSessionEntry
-→ await SessionRecorder.record(entry)
+→ determine revision delta; when +1, ConversationRevision::checked_next() preflight
+→ LiveSessionState.EntryIdGenerator.allocate()? and bind parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind any prepared new-origin stable unit
+→ commit prepared LiveSessionState delta
+→ append that same Arc to the full selected path and install preflighted revision
+→ await SessionRecorder.record(the same Arc)
 → publish / resume / continue async loop
 ```
+
+revision overflow必须在EntryId allocation与任何state mutation前失败；allocation failure也不改变state/head/revision。all normal `Result` validation/projection/preparation（包括stable-unit preparation）完成于allocation前；allocation后entry Arc construction、prepared-unit binding、state commit、same-Arc path append和revision install均infallible，故returned error不消耗ID，且绝不在entry construction前apply state。
 
 `record().await`顺序encode并把一条完整JSONL line交给单Session file append。它不使用后台task、channel或process-local recording queue，也不执行per-entry `fsync`或`sync_data`。
 
@@ -111,7 +116,7 @@ MVP不提供recording policy、`Disabled`或ephemeral Session。Session Create�
 
 MVP保持单producer domain ownership：Starting/Idle recordable mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction request/resolution发生在对应task等待期间。所有路径都必须通过同一个`LiveSessionState` private mutation seam分配EntryId；SessionExecutor和ActiveTurnTask不能各自保存generator。新增并发record producer前必须设计显式domain sequencing，不能用async mutex acquisition顺序定义history。
 
-Replay以文件中全部first-valid EntryId初始化collision guard；loaded Fork target以全部copied EntryId初始化child generator。Degraded不停止ID分配，EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)现冻结CSPRNG typed-prefix ID与exact text wire。
+Replay以文件中全部first-valid EntryId初始化collision guard；loaded Fork target以全部copied EntryId初始化child generator。`allocate()`是typed fallible operation：16 CSPRNG-byte candidates在return前reserve，最多32次collision attempts；entropy failure或exhaustion是owner-local redacted error，不panic，也不改变state/head/revision。Degraded不停止ID分配，EntryId不从JSONL line number、storage ordinal、ConversationRevision或time派生。[ADR 0134](0134-public-and-conversation-wire-use-bounded-v1-schemas.md)现冻结CSPRNG typed-prefix ID与exact text wire。
 
 ### 4. Observe与记录顺序
 
@@ -179,16 +184,13 @@ terminal retryable ModelCallError
 
 ### 10. Conversation revision
 
-`ConversationCheckpoint`不再作为live execution proof。loaded Session维护process-local单调`ConversationRevision`：
-
-- 每次model-visible live conversation mutation递增；
-- ModelCallRequest、CompactionPlan和retry捕获exact revision；
-- Steer、assistant、Tool exchange completion和Compaction Replace使旧basis失效；
-- EntryId只用于recorded history identity和tree relation，不用于当前operation线性化。
+`ConversationCheckpoint`不再作为live execution proof。`ConversationRevision`是process-local单调live-conversation **operation basis**，不是当前可见消息的hash/version；ModelCallRequest、Compaction source/plan和retry捕获exact revision，EntryId只用于history identity/tree relation，不参与当前operation线性化。exact delta由[Conversation Storage](../modules/conversation-storage.md#conversationrevision)拥有：Input/Steer User `+1`；每个accepted Assistant（包括隐藏ToolCalls）`+1`；全部expected calls的first truthful `Completed` result令complete exchange promotion `+1`；partial/abandoned/non-visible settlement、Interaction、progress/usage/recording `+0`；Compaction Replace `+1`；failed/idempotent apply `+0`。所以ToolCall Assistant在未可见时已使basis失效，complete exchange稍后promotion时再次使basis失效。
 
 ### 11. Compaction
 
-ActiveTurnTask从sanitized `LiveConversationView`规划Compaction并调用ModelGateway。summary验证成功后先Replace live conversation，再inline attempt record `StoredCompaction`。record失败时当前进程继续使用summary；restart会恢复较长的旧conversation。tolerant replay遇到坏marker继续忽略该Compaction。
+M4只实现无await/no-I/O reducer subset：apply接收owning Session/Turn orchestration提供的`TurnId + Timestamp`，创建fresh current source，并调用`source.has_same_stable_identity(&fresh_current_source)`验证immutable source的SessionId/revision/unit-count/ordered stable-unit basis，结合nonzero/in-range cut派生并匹配`CompactionReplacement` marker；source factory has its own redacted Compaction error (empty unit/duplicate origin/misplaced rolling summary), which only LiveSessionState maps to a live error。`PreparedLiveCompactionUnit::for_live_reducer(kind, messages)`先完成message/kind validation，之后才以infallible `bind_origin`绑定origin。`ModelMessage`/`ModelAssistantContent`与stable unit/source are immutable Clone values; Compaction only reads transcript refs. M4 `CompactionReplacement`没有production constructor：仅`#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>`，并以one redacted `InvalidRollingSummary` reason包住same Prompt rolling-summary construction；reducer consuming `into_parts()`取得exact StoredCompaction/ModelMessage后，可clone prebuilt summary进入leading unit和flattened LiveConversationView。拒绝pending exchange、cross-session、stale或mismatched source/marker，完成全部validation/projection/prepared-unit/candidate preparation和`ConversationRevision::checked_next()`后才allocate EntryId；随后依序infallibly construct exact entry Arc、bind summary origin、commit Replace、只clone fresh current source中的retained units作为exact suffix、append same Arc to full path并install preflighted revision；不从borrowed message或caller suffix重建。它不做planner/token/budget/model call、request/plan identity、provider provenance validation、retry、recorder ordering或publication，也不接受raw replacement messages/suffix/marker/StoredCompaction。M5 raw/replay reconstruction永不直接调用live reducer。M10才在`ValidatedCompactionSummary`及its types存在时增加production construction。
+
+M5 tolerant replay遇到坏marker只ignore并diagnose。M10才由ActiveTurnTask从`capture_conversation_views()`取得`LiveCompactionSourceView`规划Compaction、调用ModelGateway，并以exact Turn/control/plan/request arbitration完成summary validation、prebuild `CompactionReplacement`、Replace、inline record与publication。record失败时当前进程继续使用summary；restart会恢复较长的旧conversation。
 
 不再重建AgentLoop segment。
 
@@ -272,6 +274,8 @@ Fork释放source guard后再创建target staging record stream。selected path�
 - 每次Load都尝试初始化Recorder，初始化失败建立Degraded loaded Session；
 - ordinary async Model→Tool→Model loop；
 - live owner在apply前分配EntryId，Recorder观察exact same ID；
+- EntryId CSPRNG unique candidate在return前reserve、32-attempt collision bound与entropy/exhaustion typed redacted failure；失败不panic、不改变state/head/revision，replay/Fork copied IDs seed collision guard；
+- ConversationRevision逐项验证Input/Steer、hidden ToolCall Assistant、complete-exchange promotion、partial/abandoned settlement、Interaction、progress/usage/recording、Compaction以及failed/idempotent delta，且overflow先于EntryId allocation；
 - replay/Fork copied IDs seed collision guard，Degraded继续分配fresh ID；
 - parallel Tool completion形成ordered complete exchange；
 - incomplete exchange永不进入下一次Model；
@@ -287,6 +291,7 @@ Fork释放source guard后再创建target staging record stream。selected path�
 - Cancel、SecurityRevoked与ToolStartGate first-wins；
 - Interaction request/resolution在recording degraded时仍可完成；
 - retry sleep可被Cancel打断并复用exact request；
+- M4 reducer tests use the deterministic sentinel/no-ID matrix in [Development Plan M4](../development-plan.md#m4-liveconversation-reducer): every returned apply error class—including revision/allocation, body/relation/Turn, Prompt projection, source factory/stale/cross-session/identity, cut/marker/pending exchange and Interaction conflict/key/family—preserves head/full path/revision/state and leaves the same first candidate for a later successful allocation. M5坏marker ignore/diagnose；M10再验证plan/request/control/recording全路径；
 - Compaction record丢失后replay恢复旧conversation而不brick；
 - Snapshot以`healthy | degraded`暴露recording health，不能被解释为fsync acknowledgement；
 - first failure的domain event先携带Degraded Snapshot，随后只发布一次`session_recording_changed`，Snapshot保留当前脱敏diagnostic；

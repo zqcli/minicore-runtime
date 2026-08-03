@@ -74,40 +74,51 @@ Live reducer拥有domain validation、EntryId allocation和当前进程conversat
 
 ```rust
 pub(crate) struct EntryIdGenerator {
-    // private algorithm + collision guard
+    // private CSPRNG + collision guard
 }
 
 impl EntryIdGenerator {
-    pub fn allocate(&mut self) -> EntryId;
+    pub(crate) fn allocate(&mut self) -> Result<EntryId, EntryIdAllocationError>;
+}
+
+pub(crate) enum EntryIdAllocationError {
+    EntropyUnavailable,
+    CollisionAttemptsExhausted,
 }
 ```
 
-`EntryIdGenerator`由`LiveSessionState`私有持有，不暴露给SessionRecorder、Tool、ModelGateway、Prompt或Runtime adapter。owner规则：
+`EntryIdGenerator`由`LiveSessionState`私有持有，不暴露给SessionRecorder、Tool、ModelGateway、Prompt或Runtime adapter。`EntryIdAllocationError`是owner-local typed/redacted error：不得携带raw entropy/OS source，`Debug`与public diagnostic不得泄漏其内部原因。它不是panic/fatal assumption，owner把失败作为普通typed mutation failure处理。owner规则：
 
 - domain validation成功后、live apply之前分配EntryId；
 - ordinary mutation的`parent_id`同时绑定当前live selected head；
-- generated ID立即登记到collision guard，同一loaded instance内不复用；
+- `allocate()`每次从16 CSPRNG bytes形成candidate，最多尝试32次；只有unique candidate才在return前立即reserve到collision guard，同一loaded instance内不复用；
+- entropy失败返回`EntropyUnavailable`，32次均碰撞返回`CollisionAttemptsExhausted`；两种失败都不改变live state、selected head或ConversationRevision；
 - replay初始化时用文件中全部first-valid EntryId seed guard，不只使用selected model-visible path；
 - loaded Fork child用已经materialize到target的全部copied EntryId seed guard，future entry分配fresh ID；
 - Degraded时generator继续工作，recording failure不改变已经进入live Item/Interaction/Compaction的identity；
-- EntryId不从JSONL line number、storage ordinal或ConversationRevision派生。
+- EntryId不从JSONL line number、storage ordinal、ConversationRevision或time派生。
 
-EntryId exact wire由[Wire Schema typed carrier](wire-schema.md#runtime-generated-ids)冻结为`ent_<32 lowercase hex>`；generator使用16 CSPRNG bytes且不承载时间/顺序。Recorder只验证entry identity已经存在且relation合法，不能创建、替换或规范化EntryId。
+EntryId exact wire由[Wire Schema typed carrier](wire-schema.md#runtime-generated-ids)冻结为`ent_<32 lowercase hex>`；generator使用16 CSPRNG bytes且不承载时间/顺序。CSPRNG failure或collision exhaustion不能退化为revision/ordinal/time-derived ID，也不能panic。Recorder只验证entry identity已经存在且relation合法，不能创建、替换或规范化EntryId。
 
 ## Live Mutation And Recording
 
 **Canonical cross-module invariant: INV-001.**
 
 ```text
-validate recordable conversation mutation
-→ LiveSessionState.EntryIdGenerator.allocate + bind parent_id
-→ apply LiveSessionState
-→ increment ConversationRevision when model-visible
-→ await SessionRecorder.record(entry)
+validate relation/value and project Prompt/body value
+→ prepare complete infallible state delta + StoredSessionEntry body
+→ determine ConversationRevision delta; when +1, ConversationRevision.checked_next()
+→ LiveSessionState.EntryIdGenerator.allocate()? + bind current parent_id
+→ infallibly construct exact Arc<StoredSessionEntry>
+→ infallibly bind any new-origin PreparedLiveCompactionUnit
+→ commit prepared state delta
+→ append that same Arc to the full selected path
+→ install preflighted ConversationRevision when delta is +1
+→ await SessionRecorder.record(the same Arc)
 → publish final StateEvent / resume waiter / continue protocol
 ```
 
-`record().await`返回：
+All ordinary `Result`-returning validation, projection and candidate preparation finishes before allocation. This includes `PreparedLiveCompactionUnit` construction; a new User, ordinary Assistant or rolling summary binds its prepared unit only after its new ID exists, while a complete exchange may bind with its already-existing Assistant origin before the current Tool entry allocation. checked revision overflow必须在任何EntryId allocation或state mutation前失败。EntryId allocation失败同样不改变state/head/revision；only a successfully returned ID is reserved. After allocation the normal path cannot return an error: exact entry-Arc construction, new-origin prepared-unit binding, state commit, same-Arc path append and preflighted revision installation are infallible, while ordinary process allocation panic is outside the Result contract. **State is never applied before its exact entry Arc is constructed.** Therefore a returned error never consumes an ID. `record().await`返回：
 
 ```rust
 pub(crate) enum RecordOutcome {
@@ -123,19 +134,225 @@ recordable mutation失败时不record、不publish。mutation成功后recording�
 ## ConversationRevision
 
 ```rust
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct ConversationRevision(u64);
+
+pub(crate) struct LiveConversationError {
+    reason: LiveConversationErrorReason,
+    // private redacted state context
+}
+
+pub(crate) enum LiveConversationErrorReason {
+    RevisionOverflow,
+    EntryIdAllocation,
+    InvalidRelation,
+    InvalidTurn,
+    InvalidPromptProjection,
+    InvalidCompactionSource,
+    StaleCompactionSource,
+    InvalidCompactionCut,
+    CompactionMarkerMismatch,
+    PendingToolExchange,
+    InteractionConflict,
+}
+
+impl ConversationRevision {
+    pub(crate) fn checked_next(self) -> Result<Self, LiveConversationError>;
+}
 ```
 
-规则：
+`LiveConversationError` is owner-local typed/redacted error; fields/source and `Debug` must not disclose Prompt body, Tool result, reasoning, provider payload or entropy detail. `InvalidRelation` covers an invalid canonical body/relation combination; `InvalidTurn` covers current/start Turn semantics; `InvalidPromptProjection` privately maps any transcript `ModelMessageError` needed to project an otherwise canonical fact. Public `PromptValueError` is not extended or wrapped for M4 transcript construction. `InvalidCompactionCut` distinguishes an out-of-range nonzero cut from a valid cut with a wrong marker; zero is rejected by the `NonZeroUsize` API boundary before reducer apply. `LiveSessionState` privately maps each Compaction-owned `CompactionSourceError` from source construction to its own `InvalidCompactionSource` reason; it neither returns/wraps that foreign error nor asks Compaction to depend on this type. `ConversationRevision`是process-local、单调的**live-conversation operation basis**，不是当前可见`ModelMessage`集合的hash、版本或计数。loaded Session从0开始，ModelCallRequest、logical retry和Compaction source/plan捕获exact值；它不写入JSONL，也不跨restart比较。`checked_next()`是唯一normal-result overflow seam：它在所有`+1` mutation的EntryId allocation前运行，overflow返回`LiveConversationError`，不能wrap、saturate、mutate state或消耗identity。
 
-- loaded Session初始化时从0开始；
-- 每次model-visible live mutation递增；
-- Input/Steer UserMessage、Assistant、complete Tool exchange和Compaction Replace会改变revision；
-- progress、Interaction、usage-only或recording health变化不改变model conversation revision；
-- ModelCallRequest和CompactionPlan捕获exact revision；
-- revision是process-local执行basis，不写入JSONL，不跨restart比较。
+精确delta矩阵：
 
-EntryId继续存在，但只承担history identity和引用。ConversationRevision承担process-local model-visible basis；两者不能互相派生。
+| 成功live apply | revision delta |
+| --- | ---: |
+| accepted Input UserMessage或Steer UserMessage | +1 |
+| every accepted Assistant，包括含ToolCalls但尚未model-visible的Assistant | +1 |
+| 在每个expected call都得到first truthful `Completed` result时，complete Tool exchange promotion | +1 |
+| partial Tool terminal、abandoned或其他non-visible exchange settlement | +0 |
+| Interaction request/resolution | +0 |
+| progress、usage-only或recording-health change | +0 |
+| Compaction Replace | +1 |
+| failed apply或idempotent apply | +0 |
+
+因此含ToolCalls的Assistant在模型仍看不见它时已经改变operation basis；稍后全部matching `Completed` result把完整exchange提升为model-visible时又改变一次。该双增量防止in-flight Model/Compaction/retry把hidden assistant或刚promotion的exchange误当成同一操作基础。所有`+1`先执行checked increment；overflow在EntryId allocation与任何state mutation前失败，不能wrap、saturate或消耗identity。
+
+EntryId继续存在，但只承担history identity和引用。ConversationRevision承担process-local live-conversation operation basis；两者不能互相派生。
+
+## Live Reducer Transaction 与Read Interface
+
+`LiveSessionState`是recordable conversation mutation的唯一transaction owner。它私有拥有loaded `SessionId`、完整immutable selected path、`EntryIdGenerator`、`ConversationRevision`、Item relation、Pending Interaction和reducer-maintained stable units；EntryId-only path不足以materialize unrecorded live tail，因此不能服务future loaded `LiveSnapshot`/Fork。caller不能提交或替换其中任一envelope/identity value：
+
+```rust
+pub(crate) struct LiveSessionState {
+    session_id: SessionId,
+    selected_path: Vec<Arc<StoredSessionEntry>>,
+    entry_ids: EntryIdGenerator,
+    revision: ConversationRevision,
+    relations: Vec<ItemRelation>,
+    interactions: Vec<Interaction>,
+    stable_units: Vec<LiveCompactionUnit>,
+    // private live conversation, expected-exchange and Item state
+}
+
+pub(crate) struct AppliedConversationFact {
+    entry: Arc<StoredSessionEntry>,
+    revision: ConversationRevision,
+}
+
+impl AppliedConversationFact {
+    pub(crate) fn entry(&self) -> &Arc<StoredSessionEntry>;
+    pub(crate) fn revision(&self) -> ConversationRevision;
+}
+
+impl LiveSessionState {
+    fn selected_head(&self) -> Option<&EntryId> {
+        self.selected_path.last().map(|entry| &entry.entry_id)
+    }
+}
+
+pub(crate) enum InteractionResolutionApplyOutcome {
+    Applied(AppliedConversationFact),
+    Idempotent { revision: ConversationRevision },
+}
+
+impl LiveSessionState {
+    pub(crate) fn apply_user_message(
+        &mut self,
+        body: StoredUserMessage,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError>;
+
+    pub(crate) fn apply_assistant_message(
+        &mut self,
+        body: StoredAssistantMessage,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError>;
+
+    pub(crate) fn apply_tool_message(
+        &mut self,
+        body: StoredToolMessage,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError>;
+
+    pub(crate) fn apply_interaction_request(
+        &mut self,
+        candidate: InteractionRequestCandidate,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError>;
+
+    pub(crate) fn apply_interaction_resolution(
+        &mut self,
+        candidate: InteractionResolutionCandidate,
+        timestamp: Timestamp,
+    ) -> Result<InteractionResolutionApplyOutcome, LiveConversationError>;
+
+    pub(crate) fn apply_compaction(
+        &mut self,
+        source: Arc<LiveCompactionSourceView>,
+        cut: NonZeroUsize,
+        replacement: CompactionReplacement,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError>;
+
+    pub(crate) fn capture_conversation_views(
+        &self,
+    ) -> Result<CapturedConversationViews, LiveConversationError>;
+}
+```
+
+不定义`UserMessageCandidate`、`AssistantMessageCandidate`或`ToolMessageCandidate`，也没有generic candidate abstraction。ordinary apply只消费existing valid-by-construction `StoredUserMessage`、`StoredAssistantMessage`或`StoredToolMessage` body；raw replay reconstruction不是这些live apply的入口。reducer在allocation前仅经Prompt-owned constructors从这些canonical body facts完成所需provider-neutral projection。任何apply都不接受prebuilt `StoredSessionEntry`或caller-selected entry envelope identity：`LiveSessionState`绑定`SessionId`、current parent和`EntryId`；caller显式提供typed `TurnId`与`Timestamp`。reducer按current/start semantics验证supplied `TurnId`，所以尤其在Input start之前不得声称它能从state导出TurnId或timestamp。`Timestamp`是owning Session/Turn orchestration提供的typed fact，reducer不读取ambient clock。
+
+Interaction是唯一必要的private-candidate exception，因为safe durable projection必须与private live request/resolution共存：
+
+```rust
+pub(crate) struct InteractionRequestCandidate {
+    request_id: RequestId,
+    item_id: ItemId,
+    request: InteractionRequest,
+}
+
+impl InteractionRequestCandidate {
+    pub(crate) fn new(
+        request_id: RequestId,
+        item_id: ItemId,
+        request: InteractionRequest,
+    ) -> Self;
+}
+
+pub(crate) struct InteractionResolutionCandidate {
+    request_id: RequestId,
+    resolution_key: Option<InteractionResolutionKey>,
+    resolution: ResolvedInteraction,
+}
+
+pub(crate) struct InteractionCandidateError {
+    reason: InteractionCandidateErrorReason,
+}
+
+pub(crate) enum InteractionCandidateErrorReason {
+    InvalidResolutionOrigin,
+}
+
+impl InteractionResolutionCandidate {
+    pub(crate) fn host(
+        request_id: RequestId,
+        resolution_key: InteractionResolutionKey,
+        resolution: ResolvedInteraction,
+    ) -> Result<Self, InteractionCandidateError>;
+
+    pub(crate) fn owner_cancellation(
+        request_id: RequestId,
+        resolution: ResolvedInteraction,
+    ) -> Result<Self, InteractionCandidateError>;
+}
+```
+
+Both candidate fields are private and their `Debug` redacts the request, resolved value and host key. `InteractionCandidateError` and its private reason are crate-private/redacted; `Debug`、`Display` and its source chain disclose neither resolution payload nor key material. `InteractionRequestCandidate::new()` accepts only the owner `InteractionRequest`, never a caller-built `StoredInteractionRequest`/safe view. `host()` is fallible: it seals `Some(key)` only for ToolApproval, UserAnswer or `Cancelled(HostCancelled)`. `owner_cancellation()` is fallible: it seals `None` only for `Cancelled` with a non-Host reason. Each constructor checks the opaque `ResolvedInteraction`'s private live resolution and rejects a wrong origin as `InvalidResolutionOrigin` **before `LiveSessionState::apply_interaction_resolution()` and therefore before any EntryId allocation**. Request apply receives the candidate plus caller-supplied `TurnId` and `Timestamp`. Resolution apply receives only the candidate plus `Timestamp`: it loads the exact stored pending request, derives its TurnId, ItemId and request/resolution family, validates the key/family matrix, derives the safe `StoredInteractionResolution` body itself, and retains the candidate's owner `ResolvedInteraction` for live waiter routing. Thus a resolution caller never resupplies TurnId or ItemId. It accepts neither a caller-built stored interaction body nor any entry envelope identity; timestamp remains a typed orchestration fact rather than ambient clock access.
+
+Every normal-result fallible step—relation/value validation, Prompt projection, interaction/source checks, `ConversationRevision::checked_next()`, `PreparedLiveCompactionUnit` construction and prepared state-delta construction—finishes **before** `EntryIdGenerator::allocate()`. After allocation, it first constructs the exact `Arc<StoredSessionEntry>`, then infallibly binds any new-origin prepared stable unit, commits the already-prepared in-memory delta, appends that same Arc to `selected_path`, and installs the preflighted revision. For Compaction Replace, the reducer has already consumed `CompactionReplacement::into_parts()`; it may clone that prebuilt immutable rolling-summary message into the leading unit and flattened `LiveConversationView`, and clones retained unit handles only from the fresh current source. It never reconstructs either from borrowed messages or a caller suffix. None of those steps returns an error; ordinary process allocation panic is outside this `Result` contract. State is never committed before the entry Arc exists. Therefore a returned error never consumes an ID. Every successful recordable apply returns and appends the **exact same** `Arc<StoredSessionEntry>` in `AppliedConversationFact`; a Recorder receives that same Arc, never a rebuilt or merely equal entry.
+
+Interaction same-key/same-canonical-payload resolution returns `InteractionResolutionApplyOutcome::Idempotent` without allocation, entry, record attempt or event. Same-key/different-payload and terminal/different-key failures return typed errors; only the first successful resolution returns `Applied`.
+
+```rust
+pub(crate) struct PendingInteractionFact {
+    request_id: RequestId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request: InteractionRequestView,
+}
+
+impl PendingInteractionFact {
+    pub(crate) fn request_id(&self) -> &RequestId;
+    pub(crate) fn turn_id(&self) -> &TurnId;
+    pub(crate) fn item_id(&self) -> &ItemId;
+    pub(crate) fn request(&self) -> &InteractionRequestView;
+}
+
+pub(crate) struct CapturedConversationViews {
+    conversation: LiveConversationView,
+    compaction_source: Arc<LiveCompactionSourceView>,
+    selected_head: Option<EntryId>,
+    relations: Arc<[ItemRelation]>,
+    pending_interactions: Arc<[PendingInteractionFact]>,
+}
+
+impl CapturedConversationViews {
+    pub(crate) fn conversation(&self) -> &LiveConversationView;
+    pub(crate) fn compaction_source(&self) -> &Arc<LiveCompactionSourceView>;
+    pub(crate) fn selected_head(&self) -> Option<&EntryId>;
+    pub(crate) fn relations(&self) -> &[ItemRelation];
+    pub(crate) fn pending_interactions(&self) -> &[PendingInteractionFact];
+}
+```
+
+`capture_conversation_views()` performs one short immutable capture from the same state and exact revision, maps any Compaction-owned source-factory error to `LiveConversationError`, then returns this one crate-private aggregate. `conversation`, Compaction source, selected head, relations and safe Pending Interaction request views cannot be mixed from separate captures. `CapturedConversationViews` deliberately exposes only the head derived from `selected_path.last()` because M4 read scope is narrow; `LiveSessionState` still retains the full `Vec<Arc<StoredSessionEntry>>` applied facts for a later loaded `LiveSnapshot`/Fork capture. It is neither M8's public `SessionSnapshot`/Item/Interaction DTO nor Fork's `LiveSnapshot`; M4 exposes no public read DTO. `LiveSessionState` uses Compaction-owned validated factories to form the source/unit portion, but remains the canonical producer.
 
 ## SessionRecorder
 
@@ -402,6 +619,8 @@ pub enum StoredToolOutcome {
 
 Conversation Storage直接复用Wire-owned BoundedJsonObject、ModelGateway-owned ReasoningContent/ModelResponseSummary/usage/finish/metadata，以及Tools-owned ToolOutcomeSource/ToolResultContent/ToolResultDisposition/ToolAbandonReason；不定义StoredReasoning、unbounded JsonValue或第二套Tool disposition。ToolResult.details是process-local/private debug value，format v1不记录。
 
+`StoredUserMessage`、`StoredAssistantContent`和`StoredToolMessage`是durable facts，不是`ModelMessage`或shadow transcript definitions。Storage只按其owning format保存/replay这些facts；live reducer和M5 projector必须调用Prompt-owned constructors/projections形成provider-neutral messages，不能在Storage/Wire内复制该shape。
+
 Tool durable correlation继续使用`TurnId + ItemId + ToolCallId`。ToolCallId只要求同一assistant response内唯一。
 
 ## Stored Interactions
@@ -432,7 +651,7 @@ pub enum StoredInteractionResolutionBody {
 }
 ```
 
-Stored interactions只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的facts。request/resolution使用Runtime public view同源的bounded safe types：Tool approval只保存redacted summary、safe options与selected index/kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer；Cancelled保存closed InteractionCancelReason。任意host Resolve的resolution_key为Some，owner-driven closure为None。exact relation/wire见Format V1的[request](../formats/conversation-jsonl-v1.md#interaction-requested)与[resolution](../formats/conversation-jsonl-v1.md#interaction-resolved)。format v1没有secret/password/credential variant，raw secret不得进入JSONL。
+Stored interactions只保留loaded execution中具有合法single producer、EntryId owner和historical conversation意义的facts。request/resolution使用Runtime public view同源的bounded safe types：Tool approval只保存redacted summary、safe options与selected index/kind，不保存private option→PermissionSet map；UserQuestion只保存non-secret Text/SingleChoice request和answer；Cancelled保存closed InteractionCancelReason。live reducer only derives these stored values from owner `InteractionRequest`/`ResolvedInteraction`; it never accepts a caller-built stored interaction body. 任意host Resolve（含HostCancelled）的resolution_key为Some，owner-driven closure为None。exact relation/wire见Format V1的[request](../formats/conversation-jsonl-v1.md#interaction-requested)与[resolution](../formats/conversation-jsonl-v1.md#interaction-resolved)。format v1没有secret/password/credential variant，raw secret不得进入JSONL。
 
 Agent/Session definition、metadata、Open/Archived/Deleted transition和load/readiness变化不写JSONL：
 
@@ -571,9 +790,21 @@ cold projector维护每个assistant response的expected ordered ToolCalls：
 ## Live与Cold Conversation
 
 ```rust
+#[derive(Clone)]
 pub(crate) struct LiveConversationView {
     revision: ConversationRevision,
     messages: Arc<[ModelMessage]>,
+}
+
+impl LiveConversationView {
+    // Private to this owner module; called only by LiveSessionState.
+    fn from_live_state(
+        revision: ConversationRevision,
+        messages: Arc<[ModelMessage]>,
+    ) -> Self;
+
+    pub(crate) fn revision(&self) -> ConversationRevision;
+    pub(crate) fn messages(&self) -> &[ModelMessage];
 }
 
 pub(crate) struct ReplayedConversationView {
@@ -583,19 +814,9 @@ pub(crate) struct ReplayedConversationView {
 }
 ```
 
-PromptSet可消费两者共同实现的private sanitized view interface。它们都保证provider-valid Tool exchange，但只有Live view参与当前Turn execution。
+`LiveConversationView`是immutable `Clone` value：clone共享Arc-backed flattened message sequence，并保持revision、message semantic identity、order和provenance，不重建message。LiveSessionState只从canonical facts/stable units的immutable `ModelMessage` clones形成flattened view；它不从borrowed messages或caller-provided suffix重新投影。fields和`from_live_state()` constructor保持owner-module private；only `revision()` and `messages()` are exposed crate-wide. M4没有live/replay common trait：ordinary Prompt assembly consumes this live view only. `ReplayedConversationView` is an M5 storage reconstruction value, not a second M4 producer or Prompt input; M5 must define any second-producer interface explicitly before a generic trait exists.
 
-Compaction通过同一个live reducer取得额外的crate-private projection：
-
-```rust
-impl LiveSessionState {
-    pub(crate) fn compaction_source_view(
-        &self,
-    ) -> Arc<LiveCompactionSourceView>;
-}
-```
-
-`LiveCompactionSourceView`及stable-unit shape由[Compaction](compaction.md#stable-unit-source)唯一拥有。reducer负责把ordinary User、无ToolCall Assistant、完整Assistant+ToolResults exchange和leading rolling summary分组成exact EntryId-bearing units；Compaction负责估算和cut。每个rolling summary unit的origin是安装它的外层StoredCompaction entry ID，Tool exchange只能以Assistant entry作为marker boundary。该projection与ordinary `LiveConversationView`在同一次短guard内从同一revision构造，guard在planning或任何await前释放。
+`LiveCompactionSourceView`及stable-unit shape由[Compaction](compaction.md#stable-unit-source)语义拥有。`capture_conversation_views()`是唯一current live read seam，LiveSessionState在同一短guard内使用Compaction-owned validated factories形成source；factory的`CompactionSourceError`只在此caller boundary映射为owner-local `LiveConversationError`，而不会反向进入Compaction API，并同时形成ordinary `LiveConversationView`。reducer负责把ordinary User、无ToolCall Assistant、完整Assistant+ToolResults exchange和leading rolling summary分组成exact EntryId-bearing units；Compaction负责估算和cut。每个rolling summary unit的origin是安装它的外层StoredCompaction entry ID，Tool exchange只能以Assistant entry作为marker boundary。capture guard在planning或任何await前释放。
 
 不再存在`CommittedConversationView`或storage签发的推进permit。
 
@@ -617,7 +838,7 @@ unloaded at source linearization point
 
 loaded source始终使用LiveSnapshot，不根据Recorder是Healthy、Degraded或某条entry是否已经写入而切换到RecordedHistory。Unload先完成时按unloaded路径读取RecordedHistory；Fork先完成snapshot capture时保持LiveSnapshot，后续Unload不改变已捕获source。
 
-LiveSnapshot在一次短live-state critical section内完成：
+LiveSnapshot在一次短live-state critical section内完成：它从`LiveSessionState`保留的完整`Vec<Arc<StoredSessionEntry>>`捕获path，而不是从EntryId重查或重建entry：
 
 ```text
 resolve public ForkAnchor
@@ -695,10 +916,13 @@ Diagnostics exact code、100-detail cap、512-byte redacted message和aggregate�
 
 ## 测试要求
 
+- M4 reducer uses the deterministic sentinel/no-ID table in [Development Plan](../development-plan.md#m4-liveconversation-reducer): for every returned apply error class—revision overflow; entropy/collision; invalid body/relation/Turn; Prompt projection; source factory/stale/cross-session/identity; cut/marker/pending exchange; and Interaction conflict/key/family—snapshot and prove unchanged selected head, full path/Arc identities, revision and all reducer state, then prove the next valid apply receives the same first candidate. Pre-allocation validation asserts zero allocation calls; entropy/collision failure may call allocator but cannot reserve or advance the sentinel. `InteractionResolutionCandidate::host` rejects non-host origin and `owner_cancellation` rejects HostCancelled/non-cancellation before reducer invocation or allocation. Same-key/same-payload resolution separately proves zero calls/no entry/no path append and preserves that sentinel.
 - Create的SessionHeader staging失败或publication前crash不产生catalog-visible Session；
 - Create只写SessionHeader；definition/metadata/lifecycle mutation不生成StoredSessionEntry；
 - Load始终尝试初始化Recorder，失败得到Degraded而不是Disabled；
 - live owner在apply前分配EntryId，Recorder观察到exact same ID；
+- EntryId allocation使用CSPRNG、unique candidate在return前reserve、最多32次collision retry；entropy/collision exhaustion返回redacted typed error，不panic且不改变state/head/revision；replay/Fork copied IDs均seed guard；
+- `ConversationRevision`逐项覆盖Input/Steer、hidden ToolCall Assistant、complete-exchange promotion、partial/abandoned settlement、Interaction、progress/usage/recording、Compaction、failed/idempotent apply；checked overflow先于EntryId allocation；
 - replay与Fork copied IDs正确seed collision guard，future ID不碰撞；
 - Degraded状态继续分配ID且不复用未publish ID；
 - recorder按live mutation顺序inline写出；

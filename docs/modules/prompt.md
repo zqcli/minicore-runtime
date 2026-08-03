@@ -52,7 +52,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - PromptSet 负责每次模型调用的最终 provider-neutral context assembly；
 - PromptSet在创建时绑定这些view，assembly时不再接受任意替代view；
 - 执行中变化的模型可见事实必须先进入sanitized live conversation，不保留arbitrary current-call contribution lane；
-- `MessageRecord → ModelMessage` 的唯一转换发生在 Prompt 子系统；
+- `ModelMessage` 的构造与provider-facing projection只属于Prompt；PromptSet仍是最终context assembly seam，但构造不限定在`PromptSet::assemble()`内；
 - 相同输入必须产生相同排序和输出；
 - PromptService 和 PromptSet 都不执行 Tool、不加载 Skill、不保存 conversation，也不调用模型。
 
@@ -378,7 +378,7 @@ Turn mutable state
 PromptSet 是某个 Turn 的不可变有效 Prompt 快照，由 PromptService private constructor 创建并以 `Arc<PromptSet>` 交给 TurnExecutionContext：
 
 ```rust
-pub struct PromptSet {
+pub(crate) struct PromptSet {
     resources: Arc<PromptResourceView>,
     profile: PromptProfile,
     definitions: Arc<[EffectivePromptDefinition]>,
@@ -389,12 +389,12 @@ pub struct PromptSet {
 
 ```rust
 impl PromptSet {
-    pub fn compose_user_message(
+    pub(crate) fn compose_user_message(
         &self,
         input: UserMessageCompositionInput,
     ) -> Result<CanonicalUserMessage, PromptError>;
 
-    pub fn assemble(
+    pub(crate) fn assemble(
         &self,
         input: PromptAssemblyInput<'_>,
     ) -> Result<AssembledModelContext, PromptError>;
@@ -539,6 +539,99 @@ canonical content顺序固定为：非空body产生的顶层parts在前；Skill 
 
 同样的规范化规则可以服务于 Steer control fact，但 storage/domain fact kind 决定它是否开启新 Turn；模型 role 不能反向决定领域 Turn 边界。
 
+## Provider-neutral `ModelMessage`
+
+`ModelMessage`是Prompt拥有的唯一provider-neutral transcript shape。它是**crate-private opaque immutable value**，不是Storage/Wire/Compaction DTO、Runtime external API或public protocol value，也不携带UI、durability、执行或禁止的provider-attempt事实。owned `ModelMessageKind`/`ModelAssistantContentKind` variants、fields和constructors保持Prompt private；**只有Prompt construct/destructure private transcript kinds**。crate-private borrowed read-ref enums是唯一的读取例外：被授权的canonical consumer——ModelGateway的ProviderAdapter、Compaction estimator/reduction，以及Prompt assembly/tests——只能经`ModelMessageRef`/`ModelAssistantContentRef` inspect，不能match private kind、读取field或构造替代transcript。refs从不提供stamp；stamp通过refs仍不可能访问：
+
+```rust
+#[derive(Clone)]
+pub(crate) struct ModelMessage {
+    kind: ModelMessageKind,
+}
+
+#[derive(Clone)]
+enum ModelMessageKind {
+    User { message: CanonicalUserMessage },
+    Assistant { content: Arc<[ModelAssistantContent]> },
+    Tool { tool_call_id: ToolCallId, content: ToolResultContent },
+}
+
+#[derive(Clone)]
+pub(crate) struct ModelAssistantContent {
+    kind: ModelAssistantContentKind,
+}
+
+#[derive(Clone)]
+enum ModelAssistantContentKind {
+    Reasoning(ReasoningContent),
+    Text(Arc<str>),
+    ToolCall {
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+    },
+}
+
+pub(crate) enum ModelMessageRef<'a> {
+    User { content: &'a [MessageContent] },
+    Assistant { content: &'a [ModelAssistantContent] },
+    Tool {
+        tool_call_id: &'a ToolCallId,
+        content: &'a ToolResultContent,
+    },
+}
+
+pub(crate) enum ModelAssistantContentRef<'a> {
+    Reasoning(&'a ReasoningContent),
+    Text(&'a str),
+    ToolCall {
+        tool_call_id: &'a ToolCallId,
+        name: &'a ToolName,
+        arguments: &'a BoundedJsonObject,
+    },
+}
+
+impl ModelMessage {
+    pub(crate) fn canonical_user(message: CanonicalUserMessage) -> Self;
+    pub(crate) fn unstamped_user_text(text: Arc<str>) -> Result<Self, ModelMessageError>;
+    pub(crate) fn rolling_summary(summary: Arc<str>) -> Result<Self, ModelMessageError>;
+    pub(crate) fn assistant(
+        content: Arc<[ModelAssistantContent]>,
+    ) -> Result<Self, ModelMessageError>;
+    pub(crate) fn tool_result(tool_call_id: ToolCallId, content: ToolResultContent) -> Self;
+
+    pub(crate) fn as_ref(&self) -> ModelMessageRef<'_>;
+}
+
+impl ModelAssistantContent {
+    pub(crate) fn reasoning(content: ReasoningContent) -> Self;
+    pub(crate) fn text(text: Arc<str>) -> Result<Self, ModelMessageError>;
+    pub(crate) fn tool_call(
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+    ) -> Self;
+
+    pub(crate) fn as_ref(&self) -> ModelAssistantContentRef<'_>;
+}
+```
+
+`ModelMessage`与`ModelAssistantContent`都是immutable `Clone` values：其variable content由immutable `Arc`-backed value承载，clone不改变semantic identity、content order或provenance，也不重新校验、重排或生成新事实。clone是唯一documented projection：LiveSessionState可以把同一semantic message clone到stable unit和flattened `LiveConversationView`，而不是从borrowed message、raw text或caller suffix重建它。该shared-value规则不放宽private kinds；任何上述authorized consumer仍只能inspect refs。
+
+`rolling_summary()`只可由M4 crate-test-only `CompactionReplacement::for_m4_test()`、M10届时新增的production `ValidatedCompactionSummary → CompactionReplacement` construction，或M5 cold projector从recorded `StoredCompaction`构造replay projection时调用；M5 call永不创建`CompactionReplacement`或调用live reducer。它仍是独立的fallible Prompt constructor，返回redacted `ModelMessageError`：empty为`ModelMessageErrorReason::EmptyText`，UTF-8 byte length超过65,536为`TextTooLong`，unsafe text（包括任意CR或CRLF）为`UnsafeText`。它绝不把CR/CRLF normalize成LF；accepted text逐字保留。rolling summary仍是**恰好一条**unstamped User/Text消息，不加入label、envelope或stamp。
+
+`unstamped_user_text()`只服务PromptSet静态User context，并继续执行它自己的普通safe-text validation；它不复用或暗中继承rolling-summary的65,536-byte/CR规则。两条constructor保持分离。
+
+精确规则：
+
+- User内部保存完整`CanonicalUserMessage`，因此每条User消息的`PromptContributionStamp`仍与该消息局部关联；`ModelMessageRef::User`对任何authorized consumer**只能**给出`content: &[MessageContent]`，没有stamp或任何平行provenance view。
+- Assistant只保存上述有序、Prompt-owned `ModelAssistantContent`。`assistant()`拒绝empty content为`ModelMessageErrorReason::EmptyAssistantContent`、duplicate `ToolCallId`为`ModelMessageErrorReason::DuplicateToolCallId`，并保留已validated finalized content order，不重排、合并或制造content block。`ModelAssistantContent::text()`的empty/too-long/unsafe text分别返回`EmptyText`、`TextTooLong`、`UnsafeText`。它不得保存`ItemId`、`EntryId`、`TurnId`、assistant disposition、model、usage、response ID、stream/final index、provider ordering bookkeeping、metadata或Tools-owned `call_index`。
+- Tool只保存`ToolCallId + ToolResultContent`；`ItemId`、outcome disposition、entry/turn identity和执行细节不进入它。
+- `ModelAssistantContentRef`是Assistant内容的唯一read projection。ToolCall只暴露`tool_call_id`、`name`和`arguments`；它不投影adapter的provider item ID、stream/final index或call-order bookkeeping。
+- 完整`ReasoningContent`（`text`、`summary`、`encrypted`、`signature`以及portable `provider_item_id`）作为fixture/storage冻结的reasoning artifact保留。`provider_item_id`是唯一明示允许的portable provider exception：它不是response ID、attempt identity或ordering fact，且只随ReasoningContent作为opaque correlation artifact保留。response IDs、stream/final indices、provider ordering bookkeeping、metadata、usage和所有其他provider-attempt facts禁止进入ModelMessage/ModelAssistantContent。
+
+所有`ModelMessage`、`ModelAssistantContent`、read-ref和Prompt transcript factory的`Debug`必须redact正文、reasoning artifact、arguments、Tool result和stamp provenance。Live reducer与M5 replay只能调用上述Prompt-owned constructors，从canonical live/stored facts建立或投影`ModelMessage`；Compaction、Conversation Storage和Wire可以保存各自的事实，但不得定义shadow transcript type、construct/destructure private kinds或自行转换provider消息。
+
 ## PromptContribution
 
 PromptContribution 表示在输入规范化前由其他深模块产生的 typed 模型材料。它不是每次模型调用都可以临时追加的旁路：
@@ -600,7 +693,11 @@ Turn-static Workspace Prompt、ToolPromptView和SkillView metadata在PromptSet�
 每次模型调用的输入只包含sanitized live conversation和typed call policy：
 
 ```rust
-pub enum PromptAssemblyInput<'a> {
+pub(crate) struct PromptAssemblyInput<'a> {
+    kind: PromptAssemblyInputKind<'a>,
+}
+
+enum PromptAssemblyInputKind<'a> {
     AgentRun {
         conversation: &'a LiveConversationView,
         output_contract: Option<&'a OutputContract>,
@@ -610,9 +707,21 @@ pub enum PromptAssemblyInput<'a> {
         directive: &'a CompactionSummaryDirective,
     },
 }
+
+impl<'a> PromptAssemblyInput<'a> {
+    pub(crate) fn agent_run(
+        conversation: &'a LiveConversationView,
+        output_contract: Option<&'a OutputContract>,
+    ) -> Self;
+
+    pub(crate) fn compaction_summary(
+        source: &'a CompactionSummarySourceView,
+        directive: &'a CompactionSummaryDirective,
+    ) -> Self;
+}
 ```
 
-variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。`LiveConversationView`只能由live conversation reducer构造，并已隔离orphan/incomplete Tool exchange；cold replay产生的sanitized view通过同一个private只读interface进入future Turn。`CompactionSummarySourceView`只能由exact `CompactionPlan`从reducer-owned stable-unit prefix派生，包含待摘要prefix的确定性reduced representation，不包含retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，stable units、cut与marker规则见[Compaction](compaction.md#stable-unit-source)。
+`PromptAssemblyInput`、its private kind and both constructors are crate-private. variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。M4的AgentRun只接受由live state构造的`LiveConversationView`，它已隔离orphan/incomplete Tool exchange；不在M4定义generic live/replay trait。M5若出现第二producer，必须先定义独立explicit input/projection contract，不能retrofit caller-provided transcript trait。`CompactionSummarySourceView`只能由exact `CompactionPlan`从reducer-owned stable-unit prefix派生，包含待摘要prefix的确定性reduced representation，不包含retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，stable units、cut与marker规则见[Compaction](compaction.md#stable-unit-source)。
 
 `CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和sanitized reduced prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 
@@ -650,33 +759,56 @@ impl PromptSet {
 最终输出：
 
 ```rust
-pub struct AssembledModelContext {
-    pub system: Arc<[PromptSection]>,
-    pub messages: Arc<[ModelMessage]>,
-    pub tools: Arc<[ToolSpec]>,
-    pub output_contract: Option<OutputContract>,
-    pub contribution_stamps: Arc<[PromptContributionStamp]>,
-    pub diagnostics: Arc<[PromptDiagnostic]>,
-    pub(crate) assembly_proof: PromptAssemblyProof,
+pub(crate) struct AssembledModelContext {
+    system: Arc<[PromptSection]>,
+    messages: Arc<[ModelMessage]>,
+    tools: Arc<[ToolSpec]>,
+    output_contract: Option<OutputContract>,
+    diagnostics: Arc<[PromptDiagnostic]>,
+    assembly_proof: PromptAssemblyProof,
+}
+
+impl AssembledModelContext {
+    pub(crate) fn system(&self) -> &[PromptSection];
+    pub(crate) fn messages(&self) -> &[ModelMessage];
+    pub(crate) fn tools(&self) -> &[ToolSpec];
+    pub(crate) fn output_contract(&self) -> Option<&OutputContract>;
+    pub(crate) fn diagnostics(&self) -> &[PromptDiagnostic];
+    pub(crate) fn assembly_proof(&self) -> &PromptAssemblyProof;
 }
 
 pub(crate) struct PromptAssemblyProof {
-    pub purpose: ModelCallPurpose,
-    pub turn_model: TurnModelRef,
-    pub source_revision: ConversationRevision,
-    pub output_contract: Option<OutputContract>,
-    pub compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
+    purpose: ModelCallPurpose,
+    turn_model: TurnModelRef,
+    source_revision: ConversationRevision,
+    output_contract: Option<OutputContract>,
+    compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
+}
+
+impl PromptAssemblyProof {
+    pub(crate) fn purpose(&self) -> ModelCallPurpose;
+    pub(crate) fn turn_model(&self) -> &TurnModelRef;
+    pub(crate) fn source_revision(&self) -> ConversationRevision;
+    pub(crate) fn output_contract(&self) -> Option<&OutputContract>;
+    pub(crate) fn compaction_summary_budget(
+        &self,
+    ) -> Option<&CompactionSummaryBudgetProof>;
 }
 
 pub(crate) struct CompactionSummaryBudgetProof {
-    pub max_output_tokens: NonZeroU32,
-    pub budget: CompactionSummaryBudget,
+    max_output_tokens: NonZeroU32,
+    budget: CompactionSummaryBudget,
+}
+
+impl CompactionSummaryBudgetProof {
+    pub(crate) fn max_output_tokens(&self) -> NonZeroU32;
+    pub(crate) fn budget(&self) -> &CompactionSummaryBudget;
 }
 ```
 
-AssembledModelContext是唯一允许进入ModelGateway的provider-neutral Prompt输出。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用它校验purpose、exact `TurnModelRef`、source ConversationRevision、OutputContract binding，以及CompactionSummary request max output与exact budget values。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
+AssembledModelContext是唯一允许进入ModelGateway的crate-private provider-neutral Prompt输出。所有fields保持private；ModelGateway只经上述narrow crate-private getters读取，provider adapter再经`ModelMessage::as_ref()`读取transcript。`system`只保存有序System section；Session/Workspace/Skill等User context已经确定性地位于`messages`前部。它没有unscoped flat `contribution_stamps`字段：stamp只留在各个User `ModelMessage`内部，且不是provider payload、cache-control input、source locator或authorization。`assembly_proof`是crate-private consistency proof，不是第二个caller-controlled purpose；`ModelCallRequest::new(...)`用getter校验purpose、exact `TurnModelRef`、source ConversationRevision、OutputContract binding，以及CompactionSummary request max output与exact budget values。AgentRun的`compaction_summary_budget = None`，CompactionSummary必须为`Some`。provider原生System字段、User message和cache-control encoding由[ModelGateway](model-gateway.md)处理。
 
-`MessageRecord → ModelMessage` 的唯一转换发生在 `PromptSet::assemble()` 内。
+`ModelMessage`的构造和provider read projection只由Prompt提供；`PromptSet::assemble()`只负责把已经canonical的transcript与本Turn静态context组装成最终`AssembledModelContext`，不垄断构造时机。
 
 ## 最终校验
 
@@ -743,6 +875,24 @@ Claude Code使用managed、user、project、local和path-scoped instructions，�
 
 ## 错误和 Diagnostics
 
+`PromptValueError`是既有的**public** value error，不是PromptService/assembly的宽泛`PromptError`替代；M4不得为transcript construction向它添加variant，也不得改变其既有contract。transcript专用错误是crate-private、private-field/redacted的`ModelMessageError`：
+
+```rust
+pub(crate) struct ModelMessageError {
+    reason: ModelMessageErrorReason,
+}
+
+pub(crate) enum ModelMessageErrorReason {
+    EmptyText,
+    UnsafeText,
+    TextTooLong,
+    EmptyAssistantContent,
+    DuplicateToolCallId,
+}
+```
+
+这是M4 transcript construction的完整且最小reason taxonomy。`Debug`、`Display`和source chain均不得回显transcript、ToolCallId、arguments、Tool result或summary text。`ModelMessage::{unstamped_user_text, rolling_summary, assistant}`和`ModelAssistantContent::text`一律返回`Result<_, ModelMessageError>`：replacement/rolling-summary factory只有text input，因此只能达到`EmptyText | UnsafeText | TextTooLong`；assistant constructor独立达到`EmptyAssistantContent | DuplicateToolCallId`。不定义`PromptTranscriptError`、Compaction-owned Prompt error shadow type或任何新的public PromptValueError variant。
+
 基础错误分类：
 
 ```rust
@@ -780,7 +930,8 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 | LoadedSkill → PromptContribution | SkillInjector；由TurnExecutionContext async resolve保证view来源和读取授权 |
 | PromptContribution → live MessageRecord | PromptSet 输入规范化 |
 | conversation | Session conversation owner |
-| CanonicalUserMessage / final context assembly | PromptSet |
+| CanonicalUserMessage composition / final context assembly | PromptSet |
+| `ModelMessage` construction与provider-facing projection | Prompt（PromptSet只执行final assembly） |
 | provider payload encoding | ModelGateway |
 
 ## 基础不变量
@@ -804,8 +955,8 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Workspace project instruction在composition前必须保留typed WorkspaceSourceRef/source authorization provenance和captured content，cache不能只按path复用；成功后conversation只保存root-relative safe origin；
 - Prompt baseline使用固定信任层顺序；层内使用stable typed keys全序，不存在caller-controlled priority；
 - 同一固定层内重复PromptKey fail closed；
-- `MessageRecord → ModelMessage` 只有一个转换入口；
-- assembly只接受live/replayed reducer提供的sanitized full view或CompactionPlan提供的reduced stable-prefix view，不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
+- `ModelMessage`构造/provider projection只有Prompt-owned入口；PromptSet只有最终assembly职责；
+- M4 AgentRun assembly只接受LiveSessionState owner-created sanitized `LiveConversationView`，CompactionSummary只接受CompactionPlan提供的reduced stable-prefix view；M5 must add any replay producer explicitly before a generic shared view exists。两者都不接受任意Tool view、orphan/incomplete Tool exchange或current-call contribution；
 - AssembledModelContext 是进入 ModelGateway 的唯一 Prompt 输出；
 - 相同输入产生相同排序和输出；
 - Prompt reload先构建candidate PromptResourceView，四个shared candidates全部成功后在Runtime publication gate内替换current root；不原地修改active PromptSet。
@@ -826,6 +977,11 @@ PromptService保存source/load/reload diagnostics；PromptSet保存本Turn的sel
 - Unicode正文、emoji和Image等结构化part不影响`content_part_index`关联；
 - stamp不包含绝对路径、canonical root、trust、authorization、hash、cache key或正文引用；
 - CanonicalUserMessage与StoredUserMessage之间没有第二份stamp类型或重复字段。
+- User/Assistant/Tool和rolling-summary `ModelMessage`只可通过Prompt-owned constructors构造；private kind只能由Prompt destructure。`ModelMessage`与`ModelAssistantContent`是immutable Arc-backed `Clone` values；clone保持semantic identity/order/provenance，可将同一message投影到stable unit和flattened `LiveConversationView`，但不允许reconstruction。所有transcript structs、read-ref enums和`as_ref()`均是`pub(crate)`，不是Runtime/external API；ProviderAdapter、Compaction estimator/reduction和Prompt assembly/tests仅经refs读取。`ModelMessageRef`/`ModelAssistantContentRef`精确投影role/content/ToolCallId/ToolResultContent，User没有stamp且stamp不能通过refs取得；ReasoningContent只允许portable provider_item_id exception，response ID、stream/final index/order、metadata和usage均不泄漏，Debug保持redacted。
+- `PromptValueError`维持原有public variants不变。transcript constructors返回private redacted `ModelMessageError`；replacement/rolling-summary tests只覆盖reachable `EmptyText | UnsafeText | TextTooLong`（含CR/CRLF、绝不normalize），并证明accepted summary verbatim且无label/envelope/stamp；assistant constructor tests独立覆盖`EmptyAssistantContent | DuplicateToolCallId`。
+- 每条User `ModelMessage`保留自己的stamp；静态PromptSet User context与rolling summary均unstamped，provider payload/cache-control不能读取stamp。
+- Live reducer与M5 replay使用Prompt constructors投影canonical facts；Compaction/Storage/Wire不定义shadow transcript或自行做`ModelMessage`转换。
+- `PromptAssemblyInput`、`PromptSet::assemble`、`AssembledModelContext`和assembly proofs均为crate-private、private-field interface；ModelGateway只经narrow getters和message read refs消费它们。
 
 ## 已关闭问题
 
