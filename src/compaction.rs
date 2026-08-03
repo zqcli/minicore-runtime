@@ -1,15 +1,19 @@
+use std::collections::BTreeSet;
+use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::live_conversation::ConversationRevision;
 use crate::model_gateway::{
     ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
     ProviderResponseMetadata,
 };
-use crate::wire::EntryId;
+use crate::prompt::ModelMessage;
 use crate::wire::lexical::validate_safe_text;
+use crate::wire::{EntryId, SessionId};
 
 pub(crate) const MAX_STORED_COMPACTION_SUMMARY_BYTES: usize = 65_536;
 
@@ -30,6 +34,162 @@ pub(crate) enum CompactionUnitKind {
     UserMessage,
     AssistantMessage,
     ToolExchange,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+#[derive(Clone)]
+pub(crate) struct LiveCompactionSourceView {
+    session_id: SessionId,
+    revision: ConversationRevision,
+    units: Arc<[LiveCompactionUnit]>,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+#[derive(Clone)]
+pub(crate) struct LiveCompactionUnit {
+    first_entry_id: EntryId,
+    kind: CompactionUnitKind,
+    messages: Arc<[ModelMessage]>,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+pub(crate) struct PreparedLiveCompactionUnit {
+    kind: CompactionUnitKind,
+    messages: Arc<[ModelMessage]>,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionSourceErrorReason {
+    EmptyUnitMessages,
+    DuplicateUnitOrigin,
+    MisplacedRollingSummary,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CompactionSourceError {
+    reason: CompactionSourceErrorReason,
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+impl CompactionSourceError {
+    const fn new(reason: CompactionSourceErrorReason) -> Self {
+        Self { reason }
+    }
+}
+
+impl fmt::Debug for CompactionSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactionSourceError")
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+impl fmt::Display for CompactionSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid live compaction source")
+    }
+}
+
+impl Error for CompactionSourceError {}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+impl PreparedLiveCompactionUnit {
+    pub(crate) fn for_live_reducer(
+        kind: CompactionUnitKind,
+        messages: Arc<[ModelMessage]>,
+    ) -> Result<Self, CompactionSourceError> {
+        if messages.is_empty() {
+            return Err(CompactionSourceError::new(
+                CompactionSourceErrorReason::EmptyUnitMessages,
+            ));
+        }
+        Ok(Self { kind, messages })
+    }
+
+    pub(crate) fn bind_origin(self, first_entry_id: EntryId) -> LiveCompactionUnit {
+        LiveCompactionUnit {
+            first_entry_id,
+            kind: self.kind,
+            messages: self.messages,
+        }
+    }
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+impl LiveCompactionUnit {
+    pub(crate) const fn first_entry_id(&self) -> &EntryId {
+        &self.first_entry_id
+    }
+
+    pub(crate) const fn kind(&self) -> CompactionUnitKind {
+        self.kind
+    }
+
+    pub(crate) fn messages(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+impl LiveCompactionSourceView {
+    pub(crate) fn for_live_reducer(
+        session_id: SessionId,
+        revision: ConversationRevision,
+        units: Arc<[LiveCompactionUnit]>,
+    ) -> Result<Self, CompactionSourceError> {
+        let mut origins = BTreeSet::new();
+        for (index, unit) in units.iter().enumerate() {
+            if unit.messages().is_empty() {
+                return Err(CompactionSourceError::new(
+                    CompactionSourceErrorReason::EmptyUnitMessages,
+                ));
+            }
+            if !origins.insert(*unit.first_entry_id()) {
+                return Err(CompactionSourceError::new(
+                    CompactionSourceErrorReason::DuplicateUnitOrigin,
+                ));
+            }
+            if unit.kind() == CompactionUnitKind::RollingSummary && index != 0 {
+                return Err(CompactionSourceError::new(
+                    CompactionSourceErrorReason::MisplacedRollingSummary,
+                ));
+            }
+        }
+        Ok(Self {
+            session_id,
+            revision,
+            units,
+        })
+    }
+
+    pub(crate) const fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(crate) const fn revision(&self) -> &ConversationRevision {
+        &self.revision
+    }
+
+    pub(crate) fn units(&self) -> &[LiveCompactionUnit] {
+        &self.units
+    }
+
+    pub(crate) fn has_same_stable_identity(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.revision == other.revision
+            && self.units.len() == other.units.len()
+            && self
+                .units
+                .iter()
+                .zip(other.units.iter())
+                .all(|(left, right)| {
+                    left.first_entry_id == right.first_entry_id && left.kind == right.kind
+                })
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -103,6 +263,84 @@ impl fmt::Debug for StoredCompaction {
             )
             .field("has_model_call", &self.model_call.is_some())
             .finish()
+    }
+}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+pub(crate) struct CompactionReplacement {
+    stored: StoredCompaction,
+    rolling_summary: ModelMessage,
+}
+
+#[allow(
+    dead_code,
+    reason = "used by the test-only M4 replacement construction seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionReplacementErrorReason {
+    InvalidRollingSummary,
+}
+
+#[allow(
+    dead_code,
+    reason = "used by the test-only M4 replacement construction seam"
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CompactionReplacementError {
+    reason: CompactionReplacementErrorReason,
+}
+
+#[allow(
+    dead_code,
+    reason = "used by the test-only M4 replacement construction seam"
+)]
+impl CompactionReplacementError {
+    const fn invalid_rolling_summary() -> Self {
+        Self {
+            reason: CompactionReplacementErrorReason::InvalidRollingSummary,
+        }
+    }
+}
+
+impl fmt::Debug for CompactionReplacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactionReplacementError")
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+impl fmt::Display for CompactionReplacementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid compaction replacement")
+    }
+}
+
+impl Error for CompactionReplacementError {}
+
+#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
+impl CompactionReplacement {
+    #[cfg(test)]
+    pub(crate) fn for_m4_test(
+        stored: StoredCompaction,
+    ) -> Result<Self, CompactionReplacementError> {
+        let rolling_summary = ModelMessage::rolling_summary(stored.summary.clone())
+            .map_err(|_| CompactionReplacementError::invalid_rolling_summary())?;
+        Ok(Self {
+            stored,
+            rolling_summary,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (StoredCompaction, ModelMessage) {
+        (self.stored, self.rolling_summary)
+    }
+}
+
+impl fmt::Debug for CompactionReplacement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompactionReplacement(<redacted>)")
     }
 }
 
@@ -234,6 +472,38 @@ impl fmt::Debug for StoredCompactionModelCall {
 mod tests {
     use super::*;
     use crate::model_gateway::{ModelReasoningSummary, ModelServiceClass};
+    use crate::prompt::ModelMessageRef;
+
+    fn entry_id(value: &str) -> EntryId {
+        value.parse().expect("test entry IDs are valid")
+    }
+
+    fn session_id(value: &str) -> SessionId {
+        value.parse().expect("test session IDs are valid")
+    }
+
+    fn model_message(text: &str) -> ModelMessage {
+        ModelMessage::unstamped_user_text(Arc::from(text)).expect("test model messages are valid")
+    }
+
+    fn unit(first_entry_id: EntryId, kind: CompactionUnitKind, text: &str) -> LiveCompactionUnit {
+        PreparedLiveCompactionUnit::for_live_reducer(kind, Arc::from([model_message(text)]))
+            .expect("test unit is valid")
+            .bind_origin(first_entry_id)
+    }
+
+    fn source(session_id: SessionId, units: Arc<[LiveCompactionUnit]>) -> LiveCompactionSourceView {
+        source_at_revision(session_id, ConversationRevision::default(), units)
+    }
+
+    fn source_at_revision(
+        session_id: SessionId,
+        revision: ConversationRevision,
+        units: Arc<[LiveCompactionUnit]>,
+    ) -> LiveCompactionSourceView {
+        LiveCompactionSourceView::for_live_reducer(session_id, revision, units)
+            .expect("test source is valid")
+    }
 
     fn model_call(
         finish_reason: ModelFinishReason,
@@ -382,6 +652,300 @@ mod tests {
         assert_eq!(kinds.len(), 4);
         for (index, kind) in kinds.iter().enumerate() {
             assert!(!kinds[..index].contains(kind));
+        }
+    }
+
+    #[test]
+    fn live_compaction_unit_and_source_factories_validate_structural_invariants() {
+        let empty: Arc<[ModelMessage]> = Arc::from([]);
+        let Err(error) =
+            PreparedLiveCompactionUnit::for_live_reducer(CompactionUnitKind::UserMessage, empty)
+        else {
+            panic!("empty unit messages unexpectedly succeeded");
+        };
+        assert_eq!(error.reason, CompactionSourceErrorReason::EmptyUnitMessages);
+
+        let duplicate = entry_id("ent_11111111111111111111111111111111");
+        let Err(error) = LiveCompactionSourceView::for_live_reducer(
+            session_id("ses_11111111111111111111111111111111"),
+            ConversationRevision::default(),
+            Arc::from([
+                unit(duplicate, CompactionUnitKind::UserMessage, "SECRET-FIRST"),
+                unit(
+                    duplicate,
+                    CompactionUnitKind::AssistantMessage,
+                    "SECRET-SECOND",
+                ),
+            ]),
+        ) else {
+            panic!("duplicate unit origin unexpectedly succeeded");
+        };
+        assert_eq!(
+            error.reason,
+            CompactionSourceErrorReason::DuplicateUnitOrigin
+        );
+        for output in [format!("{error:?}"), error.to_string()] {
+            assert!(!output.contains("SECRET-FIRST"));
+            assert!(!output.contains("SECRET-SECOND"));
+            assert!(!output.contains(&duplicate.to_string()));
+        }
+        assert!(std::error::Error::source(&error).is_none());
+
+        let Err(error) = LiveCompactionSourceView::for_live_reducer(
+            session_id("ses_11111111111111111111111111111111"),
+            ConversationRevision::default(),
+            Arc::from([
+                unit(
+                    entry_id("ent_22222222222222222222222222222222"),
+                    CompactionUnitKind::UserMessage,
+                    "ordinary",
+                ),
+                unit(
+                    entry_id("ent_33333333333333333333333333333333"),
+                    CompactionUnitKind::RollingSummary,
+                    "summary",
+                ),
+            ]),
+        ) else {
+            panic!("misplaced rolling summary unexpectedly succeeded");
+        };
+        assert_eq!(
+            error.reason,
+            CompactionSourceErrorReason::MisplacedRollingSummary
+        );
+    }
+
+    #[test]
+    fn live_compaction_source_factory_rejects_forged_empty_unit_messages() {
+        let forged_origin = entry_id("ent_11111111111111111111111111111111");
+        let forged = LiveCompactionUnit {
+            first_entry_id: forged_origin,
+            kind: CompactionUnitKind::UserMessage,
+            messages: Arc::from([]),
+        };
+
+        let Err(error) = LiveCompactionSourceView::for_live_reducer(
+            session_id("ses_11111111111111111111111111111111"),
+            ConversationRevision::default(),
+            Arc::from([forged]),
+        ) else {
+            panic!("forged empty unit messages unexpectedly succeeded");
+        };
+
+        assert_eq!(error.reason, CompactionSourceErrorReason::EmptyUnitMessages);
+        for output in [format!("{error:?}"), error.to_string()] {
+            assert!(!output.contains(&forged_origin.to_string()));
+        }
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn stable_identity_uses_session_revision_and_unit_origins_not_message_values() {
+        let session = session_id("ses_11111111111111111111111111111111");
+        let first = entry_id("ent_11111111111111111111111111111111");
+        let second = entry_id("ent_22222222222222222222222222222222");
+        let third = entry_id("ent_33333333333333333333333333333333");
+        let original = source(
+            session,
+            Arc::from([
+                unit(first, CompactionUnitKind::UserMessage, "original user"),
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "original assistant",
+                ),
+            ]),
+        );
+        let changed_messages = source(
+            session,
+            Arc::from([
+                unit(first, CompactionUnitKind::UserMessage, "different user"),
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "different assistant",
+                ),
+            ]),
+        );
+        let other_revision = source_at_revision(
+            session,
+            ConversationRevision::default().checked_next().unwrap(),
+            Arc::from([
+                unit(first, CompactionUnitKind::UserMessage, "original user"),
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "original assistant",
+                ),
+            ]),
+        );
+        let fewer_units = source(
+            session,
+            Arc::from([unit(
+                first,
+                CompactionUnitKind::UserMessage,
+                "original user",
+            )]),
+        );
+        let reordered_units = source(
+            session,
+            Arc::from([
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "original assistant",
+                ),
+                unit(first, CompactionUnitKind::UserMessage, "original user"),
+            ]),
+        );
+        let changed_first_entry_id = source(
+            session,
+            Arc::from([
+                unit(third, CompactionUnitKind::UserMessage, "original user"),
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "original assistant",
+                ),
+            ]),
+        );
+        let changed_kind = source(
+            session,
+            Arc::from([
+                unit(first, CompactionUnitKind::UserMessage, "original user"),
+                unit(
+                    second,
+                    CompactionUnitKind::ToolExchange,
+                    "original assistant",
+                ),
+            ]),
+        );
+        let other_session = source(
+            session_id("ses_22222222222222222222222222222222"),
+            Arc::from([
+                unit(first, CompactionUnitKind::UserMessage, "original user"),
+                unit(
+                    second,
+                    CompactionUnitKind::AssistantMessage,
+                    "original assistant",
+                ),
+            ]),
+        );
+
+        assert!(original.has_same_stable_identity(&changed_messages));
+        assert!(!original.has_same_stable_identity(&other_revision));
+        assert!(!original.has_same_stable_identity(&fewer_units));
+        assert!(!original.has_same_stable_identity(&reordered_units));
+        assert!(!original.has_same_stable_identity(&changed_first_entry_id));
+        assert!(!original.has_same_stable_identity(&changed_kind));
+        assert!(!original.has_same_stable_identity(&other_session));
+        assert_eq!(original.session_id(), &session);
+        assert_eq!(original.revision(), &ConversationRevision::default());
+        assert_eq!(original.units()[0].first_entry_id(), &first);
+        assert_eq!(original.units()[0].kind(), CompactionUnitKind::UserMessage);
+    }
+
+    #[test]
+    fn compaction_source_clone_and_origin_binding_preserve_arc_backed_values() {
+        let messages: Arc<[ModelMessage]> = Arc::from([model_message("arc preserved")]);
+        let prepared = PreparedLiveCompactionUnit::for_live_reducer(
+            CompactionUnitKind::UserMessage,
+            messages.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(&prepared.messages, &messages));
+
+        let unit = prepared.bind_origin(entry_id("ent_11111111111111111111111111111111"));
+        assert!(Arc::ptr_eq(&unit.messages, &messages));
+        assert!(std::ptr::eq(&unit.messages()[0], &messages[0]));
+        let unit_clone = unit.clone();
+        assert!(Arc::ptr_eq(&unit.messages, &unit_clone.messages));
+        assert!(std::ptr::eq(&unit.messages()[0], &unit_clone.messages()[0],));
+
+        let source = source(
+            session_id("ses_11111111111111111111111111111111"),
+            Arc::from([unit]),
+        );
+        let clone = source.clone();
+        assert!(Arc::ptr_eq(&source.units, &clone.units));
+        assert!(std::ptr::eq(
+            &source.units()[0].messages()[0],
+            &clone.units()[0].messages()[0],
+        ));
+    }
+
+    #[test]
+    fn m4_replacement_is_consuming_and_redacts_summary_validation_details() {
+        let marker = entry_id("ent_11111111111111111111111111111111");
+        let stored = StoredCompaction::from_automatic(
+            "SECRET-ROLLING-SUMMARY",
+            Some(marker),
+            model_call(ModelFinishReason::Stop, 0).unwrap(),
+        )
+        .unwrap();
+        let replacement = CompactionReplacement::for_m4_test(stored.clone()).unwrap();
+        let debug = format!("{replacement:?}");
+        assert_eq!(debug, "CompactionReplacement(<redacted>)");
+        assert!(!debug.contains("SECRET-ROLLING-SUMMARY"));
+        assert!(!debug.contains(&marker.to_string()));
+        assert!(!debug.contains("SECRET-RESPONSE-ID"));
+        assert!(!debug.contains("SECRET-PROVIDER-REQUEST-ID"));
+
+        let (returned_stored, rolling_summary) = replacement.into_parts();
+        assert_eq!(returned_stored, stored);
+        assert!(Arc::ptr_eq(&returned_stored.summary, &stored.summary));
+        let ModelMessageRef::User { content } = rolling_summary.as_ref() else {
+            panic!("replacement did not materialize a user-role rolling summary");
+        };
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0].as_text(), "SECRET-ROLLING-SUMMARY");
+        assert_eq!(
+            content[0].as_text().as_ptr(),
+            returned_stored.summary().as_ptr()
+        );
+
+        let too_long_summary: Arc<str> = format!(
+            "SECRET-TOO-LONG-{}",
+            "x".repeat(MAX_STORED_COMPACTION_SUMMARY_BYTES + 1 - "SECRET-TOO-LONG-".len())
+        )
+        .into();
+        assert_eq!(
+            too_long_summary.len(),
+            MAX_STORED_COMPACTION_SUMMARY_BYTES + 1
+        );
+        let forged_summaries: [(&str, Arc<str>); 3] = [
+            ("EmptyText", Arc::from("")),
+            ("UnsafeText", Arc::from("SECRET-UNSAFE\r\nSUMMARY")),
+            ("TextTooLong", too_long_summary),
+        ];
+
+        for (case, summary) in forged_summaries {
+            let Err(error) = CompactionReplacement::for_m4_test(StoredCompaction {
+                summary,
+                first_kept_entry_id: Some(marker),
+                model_call: Some(model_call(ModelFinishReason::Stop, 0).unwrap()),
+            }) else {
+                panic!("{case} rolling summary unexpectedly succeeded");
+            };
+            assert_eq!(
+                error.reason,
+                CompactionReplacementErrorReason::InvalidRollingSummary,
+                "{case} rolling summary mapped to the wrong error"
+            );
+            assert_eq!(
+                format!("{error:?}"),
+                "CompactionReplacementError { reason: InvalidRollingSummary }",
+                "{case} rolling summary debug output leaked validation details"
+            );
+            assert_eq!(
+                error.to_string(),
+                "invalid compaction replacement",
+                "{case} rolling summary display output leaked validation details"
+            );
+            assert!(
+                std::error::Error::source(&error).is_none(),
+                "{case} rolling summary unexpectedly retained a source error"
+            );
         }
     }
 }
