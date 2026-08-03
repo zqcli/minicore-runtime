@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -5,7 +6,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
 
+use crate::agent_session_lifecycle::{AgentMetadata, AgentStatus};
 use crate::runtime_task::RuntimeTaskContext;
+use crate::wire::{AgentId, AgentRevision, Timestamp};
 
 const LOCK_FILE: &str = ".minicore.lock";
 const FORMAT_MARKER: &str = "MINICORE_STORE_V1";
@@ -14,6 +17,169 @@ const AGENTS_DIRECTORY: &str = "agents";
 const SESSIONS_DIRECTORY: &str = "sessions";
 const ROOT_ENTRY_CAP: usize = 5;
 const RESERVATIONS_ENTRY_CAP: usize = 2;
+
+/// The private physical generation ordinal used only by Store V1 documents and paths.
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct StorageGeneration(u32);
+
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+impl StorageGeneration {
+    pub(crate) const fn new(value: u32) -> Option<Self> {
+        if value == 0 || value > 1_000_000 {
+            None
+        } else {
+            Some(Self(value))
+        }
+    }
+
+    pub(crate) const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub(crate) fn directory_name(self) -> String {
+        format!("{:020}", self.0)
+    }
+}
+
+impl fmt::Debug for StorageGeneration {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("StorageGeneration")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+/// The closed, redacted construction failure for one physical Agent head document.
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableAgentHeadError {
+    InvalidInvariant,
+}
+
+impl fmt::Display for DurableAgentHeadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid durable agent head")
+    }
+}
+
+impl std::error::Error for DurableAgentHeadError {}
+
+/// The physical Store V1 Agent head representation. Adjacent-generation semantics remain with
+/// DurableState recovery; this value validates only facts available in one document.
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DurableAgentHead {
+    agent_id: AgentId,
+    storage_generation: StorageGeneration,
+    previous_storage_generation: Option<StorageGeneration>,
+    current_definition_revision: AgentRevision,
+    current_definition_storage_generation: StorageGeneration,
+    metadata: AgentMetadata,
+    status: AgentStatus,
+    created_at: Timestamp,
+}
+
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+impl DurableAgentHead {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Store V1 head has eight fixed facts"
+    )]
+    pub(crate) fn new(
+        agent_id: AgentId,
+        storage_generation: StorageGeneration,
+        previous_storage_generation: Option<StorageGeneration>,
+        current_definition_revision: AgentRevision,
+        current_definition_storage_generation: StorageGeneration,
+        metadata: AgentMetadata,
+        status: AgentStatus,
+        created_at: Timestamp,
+    ) -> Result<Self, DurableAgentHeadError> {
+        let expected_previous = storage_generation
+            .get()
+            .checked_sub(1)
+            .and_then(StorageGeneration::new);
+        if previous_storage_generation != expected_previous
+            || current_definition_storage_generation > storage_generation
+        {
+            return Err(DurableAgentHeadError::InvalidInvariant);
+        }
+        Ok(Self {
+            agent_id,
+            storage_generation,
+            previous_storage_generation,
+            current_definition_revision,
+            current_definition_storage_generation,
+            metadata,
+            status,
+            created_at,
+        })
+    }
+
+    pub(crate) const fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
+    pub(crate) const fn storage_generation(&self) -> StorageGeneration {
+        self.storage_generation
+    }
+
+    pub(crate) const fn previous_storage_generation(&self) -> Option<StorageGeneration> {
+        self.previous_storage_generation
+    }
+
+    pub(crate) const fn current_definition_revision(&self) -> AgentRevision {
+        self.current_definition_revision
+    }
+
+    pub(crate) const fn current_definition_storage_generation(&self) -> StorageGeneration {
+        self.current_definition_storage_generation
+    }
+
+    pub(crate) const fn metadata(&self) -> &AgentMetadata {
+        &self.metadata
+    }
+
+    pub(crate) const fn status(&self) -> AgentStatus {
+        self.status
+    }
+
+    pub(crate) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+impl fmt::Debug for DurableAgentHead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableAgentHead")
+            .field("storage_generation", &self.storage_generation)
+            .field(
+                "current_definition_storage_generation",
+                &self.current_definition_storage_generation,
+            )
+            .field("metadata", &"redacted")
+            .field("status", &self.status)
+            .finish()
+    }
+}
 
 /// The closed, redacted failure taxonomy for the empty Store V1 opener.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

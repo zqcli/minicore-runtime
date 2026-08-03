@@ -211,8 +211,8 @@ def exact_bool(value: Any, label: str) -> bool:
     return value
 
 
-def check_safe_text(value: str, label: str) -> None:
-    exact_string(value, label)
+def check_safe_text(value: str, label: str, *, allow_empty: bool = False) -> None:
+    assert type(value) is str and (allow_empty or value), f"{label}: expected safe text"
     for char in value:
         code = ord(char)
         assert not (code == 0 or code == 0x1B or code == 0x7F or 0x80 <= code <= 0x9F), label
@@ -287,7 +287,7 @@ def check_metadata(value: Any, kind: str, *, agent: bool) -> dict[str, Any]:
             check_safe_text(value["name"], "metadata.name")
     assert value["description"] is None or type(value["description"]) is str
     if type(value["description"]) is str:
-        check_safe_text(value["description"], "metadata.description")
+        check_safe_text(value["description"], "metadata.description", allow_empty=True)
     check_timestamp(value["updatedAt"], "metadata.updatedAt")
     return value
 
