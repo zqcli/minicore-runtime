@@ -51,6 +51,59 @@ fn create_existing_private_root(path: &Path) {
     }
 }
 
+fn create_private_directory(path: &Path) {
+    fs::create_dir(path).expect("the Store V1 directory is created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("the Store V1 directory receives its private mode");
+    }
+}
+
+fn create_private_file(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).expect("the Store V1 file is created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("the Store V1 file receives its private mode");
+    }
+}
+
+fn create_published_g1_agent_store(root: &Path) {
+    const AGENT_ID: &str = "agt_11111111111111111111111111111111";
+    const GENERATION_ONE: &str = "00000000000000000001";
+
+    create_existing_private_root(root);
+    create_private_file(&root.join(".minicore.lock"), b"");
+    create_private_file(&root.join("MINICORE_STORE_V1"), b"");
+    create_private_directory(&root.join("reservations"));
+    create_private_directory(&root.join("reservations/agents"));
+    create_private_directory(&root.join("reservations/sessions"));
+    create_private_file(&root.join("reservations/agents").join(AGENT_ID), b"");
+    create_private_directory(&root.join("agents"));
+    create_private_directory(&root.join("sessions"));
+
+    let entity = root.join("agents").join(AGENT_ID);
+    create_private_directory(&entity);
+    create_private_file(&entity.join("PUBLISHED"), b"");
+    create_private_directory(&entity.join("generations"));
+    let generation = entity.join("generations").join(GENERATION_ONE);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head.json"),
+    );
+    create_private_file(
+        &generation.join("definition.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-definition.json"),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn nonexistent_root_opens_shuts_down_and_reopens() {
     let root = TempRoot::new();
@@ -73,6 +126,28 @@ async fn nonexistent_root_opens_shuts_down_and_reopens() {
     )
     .await
     .expect("the closed store reopens");
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn published_committed_g1_agent_store_opens_shuts_down_and_reopens() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the published G1 Agent store opens through the public runtime");
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the recovered G1 Agent store reopens after shutdown");
     reopened.shutdown().await;
 }
 

@@ -66,7 +66,7 @@ impl fmt::Display for RuntimeInitializationError {
 
 impl Error for RuntimeInitializationError {}
 
-/// The host lifecycle facade for an empty Store V1 runtime.
+/// The host lifecycle facade for the currently supported Store V1 runtime foundation.
 pub struct MiniCoreRuntime {
     inner: Arc<RuntimeInner>,
 }

@@ -1,15 +1,22 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
 
 use crate::agent_session_lifecycle::{
-    AgentMetadata, AgentStatus, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+    AgentDefinition, AgentMetadata, AgentStatus, SessionForkProvenance, SessionLifecycle,
+    SessionMetadata,
 };
 use crate::runtime_task::RuntimeTaskContext;
+use crate::wire::durable_store::{
+    DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
+};
 use crate::wire::{AgentId, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp};
 
 const LOCK_FILE: &str = ".minicore.lock";
@@ -19,6 +26,13 @@ const AGENTS_DIRECTORY: &str = "agents";
 const SESSIONS_DIRECTORY: &str = "sessions";
 const ROOT_ENTRY_CAP: usize = 5;
 const RESERVATIONS_ENTRY_CAP: usize = 2;
+const AGENT_RESERVATION_ENTRY_CAP: usize = 1_000_000;
+const SESSION_RESERVATION_ENTRY_CAP: usize = 1_000_000;
+const AGENT_ENTITY_ENTRY_CAP: usize = 2;
+const ROOT_AGENT_ENTRY_CAP: usize = 1_000_000;
+const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
+const GENERATION_ENTRY_CAP: usize = 1_000_000;
+const GENERATION_PAYLOAD_ENTRY_CAP: usize = 3;
 
 /// The private physical generation ordinal used only by Store V1 documents and paths.
 #[allow(
@@ -27,6 +41,20 @@ const RESERVATIONS_ENTRY_CAP: usize = 2;
 )]
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct StorageGeneration(u32);
+
+/// The closed, redacted failure for a physical Store V1 generation directory name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageGenerationDirectoryNameError {
+    InvalidDirectoryName,
+}
+
+impl fmt::Display for StorageGenerationDirectoryNameError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid storage generation directory name")
+    }
+}
+
+impl std::error::Error for StorageGenerationDirectoryNameError {}
 
 #[allow(
     dead_code,
@@ -47,6 +75,33 @@ impl StorageGeneration {
 
     pub(crate) fn directory_name(self) -> String {
         format!("{:020}", self.0)
+    }
+
+    pub(crate) fn parse_directory_name(
+        value: &OsStr,
+    ) -> Result<Self, StorageGenerationDirectoryNameError> {
+        value
+            .to_str()
+            .ok_or(StorageGenerationDirectoryNameError::InvalidDirectoryName)
+            .and_then(Self::parse_directory_name_str)
+    }
+
+    pub(crate) fn parse_directory_name_str(
+        value: &str,
+    ) -> Result<Self, StorageGenerationDirectoryNameError> {
+        let bytes = value.as_bytes();
+        if bytes.len() != 20 || !bytes.iter().all(u8::is_ascii_digit) {
+            return Err(StorageGenerationDirectoryNameError::InvalidDirectoryName);
+        }
+        let generation = value
+            .parse::<u32>()
+            .ok()
+            .and_then(Self::new)
+            .ok_or(StorageGenerationDirectoryNameError::InvalidDirectoryName)?;
+        if generation.directory_name() != value {
+            return Err(StorageGenerationDirectoryNameError::InvalidDirectoryName);
+        }
+        Ok(generation)
     }
 }
 
@@ -328,24 +383,30 @@ pub(crate) enum DurableOpenError {
     StorageUnavailable,
 }
 
-/// The private owner of the root lease for the empty Store V1 bootstrap slice.
+/// The private owner of the Store V1 root lease and recovered immutable catalog.
 pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
     lease: Arc<RootLease>,
+    #[allow(
+        dead_code,
+        reason = "G1 recovery catalog is consumed by later runtime read paths"
+    )]
+    agents: Arc<BTreeMap<AgentId, Arc<DurableAgentHead>>>,
 }
 
 impl DurableState {
-    /// Opens an empty Store V1 root. Every filesystem operation is contained in one tracked
-    /// blocking job so it never runs on a current-thread Tokio worker.
+    /// Opens a Store V1 root and recovers the currently supported immutable catalog slice.
+    /// Every filesystem operation runs in one tracked blocking job, never on a Tokio worker.
     pub(crate) async fn open(
         root: PathBuf,
         task_context: RuntimeTaskContext,
     ) -> Result<Self, DurableOpenError> {
         let job = task_context.spawn_blocking_tracked(move || open_root(root));
         match job.wait().await {
-            Ok(Ok(lease)) => Ok(Self {
+            Ok(Ok(opened)) => Ok(Self {
                 task_context,
-                lease,
+                lease: opened.lease,
+                agents: opened.agents,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(DurableOpenError::StorageUnavailable),
@@ -357,10 +418,24 @@ impl DurableState {
         self.task_context.shutdown().await;
         self.lease.release();
     }
+
+    #[allow(
+        dead_code,
+        reason = "G1 recovery catalog is consumed by later runtime read paths"
+    )]
+    pub(crate) fn agent_head(&self, agent_id: AgentId) -> Option<Arc<DurableAgentHead>> {
+        self.agents.get(&agent_id).cloned()
+    }
 }
 
 struct RootLease {
     file: Mutex<Option<File>>,
+}
+
+#[derive(Clone)]
+struct OpenRoot {
+    lease: Arc<RootLease>,
+    agents: Arc<BTreeMap<AgentId, Arc<DurableAgentHead>>>,
 }
 
 impl RootLease {
@@ -385,7 +460,7 @@ enum DirectorySync {
     Unsupported,
 }
 
-fn open_root(root: PathBuf) -> Result<Arc<RootLease>, DurableOpenError> {
+fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
     prepare_root(&root)?;
     let marker_was_present = format_marker_exists(&root)?;
     let lock_file = open_lock_file(&root, marker_was_present)?;
@@ -402,15 +477,19 @@ fn open_root(root: PathBuf) -> Result<Arc<RootLease>, DurableOpenError> {
     let root_entries = read_entries_bounded(&root, ROOT_ENTRY_CAP)?;
     let marker_present = contains_named_entry(&root_entries, FORMAT_MARKER);
 
-    if marker_present {
-        validate_marked_root(&root, &root_entries)?;
+    let agents = if marker_present {
+        recover_marked_root(&root, &root_entries)?
     } else {
         validate_markerless_root(&root_entries)?;
         complete_markerless_scaffold(&root, directory_sync)?;
         create_format_marker(&root, directory_sync)?;
-    }
+        BTreeMap::new()
+    };
 
-    Ok(Arc::new(RootLease::new(lock_file)))
+    Ok(OpenRoot {
+        lease: Arc::new(RootLease::new(lock_file)),
+        agents: Arc::new(agents),
+    })
 }
 
 fn prepare_root(root: &Path) -> Result<(), DurableOpenError> {
@@ -525,7 +604,7 @@ fn validate_open_regular_file(
     let path_metadata = metadata_without_following(path)?;
     validate_existing_regular_file(&handle_metadata, error)?;
     validate_existing_regular_file(&path_metadata, error)?;
-    Ok(())
+    validate_same_file_identity(&handle_metadata, &path_metadata)
 }
 
 fn classify_directory_sync(root: &Path) -> Result<DirectorySync, DurableOpenError> {
@@ -628,7 +707,37 @@ fn create_format_marker(
     validate_zero_regular_file(&marker)
 }
 
-fn validate_marked_root(root: &Path, entries: &[DirEntry]) -> Result<(), DurableOpenError> {
+#[derive(Clone, Copy)]
+struct RecoveryCaps {
+    agent_reservations: usize,
+    session_reservations: usize,
+    root_agents: usize,
+    root_sessions: usize,
+    generations: usize,
+}
+
+impl RecoveryCaps {
+    const PRODUCTION: Self = Self {
+        agent_reservations: AGENT_RESERVATION_ENTRY_CAP,
+        session_reservations: SESSION_RESERVATION_ENTRY_CAP,
+        root_agents: ROOT_AGENT_ENTRY_CAP,
+        root_sessions: ROOT_SESSION_ENTRY_CAP,
+        generations: GENERATION_ENTRY_CAP,
+    };
+}
+
+fn recover_marked_root(
+    root: &Path,
+    entries: &[DirEntry],
+) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
+    recover_marked_root_with_caps(root, entries, RecoveryCaps::PRODUCTION)
+}
+
+fn recover_marked_root_with_caps(
+    root: &Path,
+    entries: &[DirEntry],
+    caps: RecoveryCaps,
+) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
     let mut has_lock = false;
     let mut has_marker = false;
     let mut has_reservations = false;
@@ -661,18 +770,20 @@ fn validate_marked_root(root: &Path, entries: &[DirEntry]) -> Result<(), Durable
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
-    validate_empty_directory(
+    let reservations = recover_marked_reservations(&root.join(RESERVATIONS_DIRECTORY), caps)?;
+    validate_required_empty_directory(&root.join(SESSIONS_DIRECTORY), caps.root_sessions)?;
+    recover_agents(
         &root.join(AGENTS_DIRECTORY),
-        DurableOpenError::DurableStateCorrupt,
-    )?;
-    validate_empty_directory(
-        &root.join(SESSIONS_DIRECTORY),
-        DurableOpenError::DurableStateCorrupt,
-    )?;
-    validate_marked_reservations(&root.join(RESERVATIONS_DIRECTORY))
+        &reservations,
+        caps.root_agents,
+        caps.generations,
+    )
 }
 
-fn validate_marked_reservations(path: &Path) -> Result<(), DurableOpenError> {
+fn recover_marked_reservations(
+    path: &Path,
+    caps: RecoveryCaps,
+) -> Result<BTreeSet<AgentId>, DurableOpenError> {
     let entries = read_entries_bounded(path, RESERVATIONS_ENTRY_CAP)?;
     let mut has_agents = false;
     let mut has_sessions = false;
@@ -691,21 +802,182 @@ fn validate_marked_reservations(path: &Path) -> Result<(), DurableOpenError> {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
-    validate_empty_directory(
-        &path.join(AGENTS_DIRECTORY),
-        DurableOpenError::DurableStateCorrupt,
-    )?;
-    validate_empty_directory(
-        &path.join(SESSIONS_DIRECTORY),
-        DurableOpenError::DurableStateCorrupt,
-    )
+    let agents = scan_agent_reservations(&path.join(AGENTS_DIRECTORY), caps.agent_reservations)?;
+    validate_required_empty_directory(&path.join(SESSIONS_DIRECTORY), caps.session_reservations)?;
+    Ok(agents)
 }
 
-fn validate_empty_directory(path: &Path, error: DurableOpenError) -> Result<(), DurableOpenError> {
+fn scan_agent_reservations(
+    path: &Path,
+    maximum: usize,
+) -> Result<BTreeSet<AgentId>, DurableOpenError> {
     let metadata = metadata_without_following(path)?;
-    validate_existing_directory(&metadata, error)?;
-    if !directory_is_empty(path)? {
-        return Err(error);
+    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut reservation_paths = BTreeMap::new();
+    for entry in entries {
+        let agent_id = parse_agent_id_name(&entry.file_name())?;
+        if reservation_paths.insert(agent_id, entry.path()).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    for path in reservation_paths.values() {
+        validate_zero_regular_file(path)?;
+    }
+    Ok(reservation_paths.into_keys().collect())
+}
+
+fn validate_required_empty_directory(path: &Path, maximum: usize) -> Result<(), DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
+    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    if read_entries_bounded(path, maximum)?.is_empty() {
+        Ok(())
+    } else {
+        Err(DurableOpenError::DurableStateCorrupt)
+    }
+}
+
+fn recover_agents(
+    path: &Path,
+    reservations: &BTreeSet<AgentId>,
+    maximum: usize,
+    generation_maximum: usize,
+) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
+    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut entity_paths = BTreeMap::new();
+    for entry in entries {
+        let agent_id = parse_agent_id_name(&entry.file_name())?;
+        if entity_paths.insert(agent_id, entry.path()).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    let mut agents = BTreeMap::new();
+    for (agent_id, entity_path) in entity_paths {
+        let metadata = metadata_without_following(&entity_path)?;
+        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+        if !reservations.contains(&agent_id) {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        let head = recover_agent_entity(&entity_path, agent_id, generation_maximum)?;
+        if agents.insert(agent_id, Arc::new(head)).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    Ok(agents)
+}
+
+fn recover_agent_entity(
+    path: &Path,
+    agent_id: AgentId,
+    generation_maximum: usize,
+) -> Result<DurableAgentHead, DurableOpenError> {
+    let entries = read_entries_bounded(path, AGENT_ENTITY_ENTRY_CAP)?;
+    let mut published = false;
+    let mut generations = None;
+    for entry in entries {
+        if entry_has_name(&entry, "PUBLISHED") {
+            validate_zero_regular_file(&entry.path())?;
+            published = true;
+        } else if entry_has_name(&entry, "generations") {
+            validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
+            generations = Some(entry.path());
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    let Some(generations) = generations else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if !published {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    recover_agent_generation_one(&generations, agent_id, generation_maximum)
+}
+
+fn recover_agent_generation_one(
+    path: &Path,
+    agent_id: AgentId,
+    maximum: usize,
+) -> Result<DurableAgentHead, DurableOpenError> {
+    let entries = read_entries_bounded(path, maximum)?;
+    if entries.len() != 1 {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    let generation_entry = &entries[0];
+    let generation = StorageGeneration::parse_directory_name(&generation_entry.file_name())
+        .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+    if generation.get() != 1 {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    validate_directory_entry(generation_entry, DurableOpenError::DurableStateCorrupt)?;
+    recover_agent_generation_payload(&generation_entry.path(), agent_id, generation)
+}
+
+fn recover_agent_generation_payload(
+    path: &Path,
+    agent_id: AgentId,
+    generation: StorageGeneration,
+) -> Result<DurableAgentHead, DurableOpenError> {
+    let entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    let mut head_path = None;
+    let mut definition_path = None;
+    let mut committed = false;
+    for entry in entries {
+        if entry_has_name(&entry, "head.json") {
+            head_path = Some(entry.path());
+        } else if entry_has_name(&entry, "definition.json") {
+            definition_path = Some(entry.path());
+        } else if entry_has_name(&entry, "COMMITTED") {
+            validate_zero_regular_file(&entry.path())?;
+            committed = true;
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    let (Some(head_path), Some(definition_path)) = (head_path, definition_path) else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if !committed {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    let head = decode_agent_head_document(&head_path)?;
+    let definition = decode_agent_definition_document(&definition_path)?;
+    validate_generation_one_agent_semantics(agent_id, generation, &head, &definition)?;
+    Ok(head)
+}
+
+fn parse_agent_id_name(name: &OsStr) -> Result<AgentId, DurableOpenError> {
+    let value = name.to_str().ok_or(DurableOpenError::DurableStateCorrupt)?;
+    let agent_id = AgentId::from_str(value).map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+    if agent_id.to_string() != value {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(agent_id)
+}
+
+fn validate_generation_one_agent_semantics(
+    path_agent_id: AgentId,
+    path_generation: StorageGeneration,
+    head: &DurableAgentHead,
+    definition: &AgentDefinition,
+) -> Result<(), DurableOpenError> {
+    if head.agent_id() != path_agent_id
+        || definition.agent_id() != path_agent_id
+        || head.storage_generation() != path_generation
+        || head.storage_generation().get() != 1
+        || head.previous_storage_generation().is_some()
+        || head.current_definition_revision().get() != 1
+        || head.current_definition_storage_generation() != path_generation
+        || definition.revision().get() != 1
+        || head.metadata().revision().get() != 1
+        || head.status() != AgentStatus::Enabled
+        || head.created_at() != definition.created_at()
+        || head.created_at() != head.metadata().updated_at()
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
     }
     Ok(())
 }
@@ -726,14 +998,145 @@ fn validate_directory_entry(
     validate_existing_directory(&metadata, error)
 }
 
+fn decode_agent_head_document(path: &Path) -> Result<DurableAgentHead, DurableOpenError> {
+    let bytes = read_durable_document(path)?;
+    DurableStoreV1Codec::decode_agent_head(&bytes).map_err(map_durable_document_codec_error)
+}
+
+fn decode_agent_definition_document(path: &Path) -> Result<AgentDefinition, DurableOpenError> {
+    let bytes = read_durable_document(path)?;
+    DurableStoreV1Codec::decode_agent_definition(&bytes).map_err(map_durable_document_codec_error)
+}
+
+fn map_durable_document_codec_error(error: DurableStoreCodecError) -> DurableOpenError {
+    match error {
+        DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure => {
+            DurableOpenError::DurableStateTooLarge
+        }
+        DurableStoreCodecError::InvalidDocument
+        | DurableStoreCodecError::InvalidShape
+        | DurableStoreCodecError::InvalidScalar
+        | DurableStoreCodecError::InvalidSemantic
+        | DurableStoreCodecError::Noncanonical => DurableOpenError::DurableStateCorrupt,
+    }
+}
+
+/// Reads one Store V1 document while retaining a bounded, same-open physical observation.
+/// Paths, lengths, and OS errors deliberately remain within this private bridge.
+fn read_durable_document(path: &Path) -> Result<Vec<u8>, DurableOpenError> {
+    let initial_path_metadata = metadata_without_following(path)?;
+    validate_existing_regular_file(
+        &initial_path_metadata,
+        DurableOpenError::DurableStateCorrupt,
+    )?;
+    if initial_path_metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+
+    let mut file = File::open(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let opened_path_metadata = metadata_without_following(path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &handle_metadata,
+        &opened_path_metadata,
+    )?;
+
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 8_192];
+    let maximum_read = MAX_DURABLE_DOCUMENT_BYTES + 1;
+    while bytes.len() < maximum_read {
+        let remaining = maximum_read - bytes.len();
+        let request_length = remaining.min(buffer.len());
+        let read = file
+            .read(&mut buffer[..request_length])
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+
+    let final_handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let final_path_metadata = metadata_without_following(path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &final_handle_metadata,
+        &final_path_metadata,
+    )?;
+    let expected_length = usize::try_from(initial_path_metadata.len())
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    if bytes.len() != expected_length {
+        return Err(DurableOpenError::StorageUnavailable);
+    }
+    if bytes.len() > MAX_DURABLE_DOCUMENT_BYTES {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+    Ok(bytes)
+}
+
+fn validate_open_file_observation(
+    initial_path_metadata: &fs::Metadata,
+    handle_metadata: &fs::Metadata,
+    path_metadata: &fs::Metadata,
+) -> Result<(), DurableOpenError> {
+    validate_existing_regular_file(handle_metadata, DurableOpenError::StorageUnavailable)?;
+    validate_existing_regular_file(path_metadata, DurableOpenError::StorageUnavailable)?;
+    if initial_path_metadata.len() != handle_metadata.len()
+        || initial_path_metadata.len() != path_metadata.len()
+    {
+        return Err(DurableOpenError::StorageUnavailable);
+    }
+    validate_same_file_identity(initial_path_metadata, handle_metadata)?;
+    validate_same_file_identity(handle_metadata, path_metadata)
+}
+
+#[cfg(unix)]
+fn validate_same_file_identity(
+    first: &fs::Metadata,
+    second: &fs::Metadata,
+) -> Result<(), DurableOpenError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if first.dev() != second.dev() || first.ino() != second.ino() {
+        return Err(DurableOpenError::StorageUnavailable);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_same_file_identity(
+    _first: &fs::Metadata,
+    _second: &fs::Metadata,
+) -> Result<(), DurableOpenError> {
+    Ok(())
+}
+
 fn validate_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
-    let metadata = metadata_without_following(path)?;
-    validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    if metadata.len() != 0 {
+    let initial_path_metadata = metadata_without_following(path)?;
+    validate_existing_regular_file(
+        &initial_path_metadata,
+        DurableOpenError::DurableStateCorrupt,
+    )?;
+    if initial_path_metadata.len() != 0 {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
     let mut file = File::open(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let opened_path_metadata = metadata_without_following(path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &handle_metadata,
+        &opened_path_metadata,
+    )?;
+
     let mut byte = [0_u8; 1];
     if file
         .read(&mut byte)
@@ -742,7 +1145,16 @@ fn validate_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
     {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    Ok(())
+
+    let final_handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let final_path_metadata = metadata_without_following(path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &final_handle_metadata,
+        &final_path_metadata,
+    )
 }
 
 fn create_private_directory(path: &Path) -> Result<(), DurableOpenError> {
@@ -898,7 +1310,7 @@ fn directory_is_empty(path: &Path) -> Result<bool, DurableOpenError> {
 
 fn read_entries_bounded(path: &Path, maximum: usize) -> Result<Vec<DirEntry>, DurableOpenError> {
     let entries = fs::read_dir(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
-    let mut bounded = Vec::with_capacity(maximum);
+    let mut bounded = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|_| DurableOpenError::StorageUnavailable)?;
         if bounded.len() == maximum {
@@ -929,21 +1341,23 @@ mod tests {
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use tokio::runtime::Handle;
 
     use super::{
         AGENTS_DIRECTORY, DurableOpenError, DurableSessionHead, DurableState, FORMAT_MARKER,
-        LOCK_FILE, RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP,
-        SESSIONS_DIRECTORY, StorageGeneration,
+        GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE, RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP,
+        ROOT_ENTRY_CAP, RecoveryCaps, SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name,
+        read_durable_document, read_entries_bounded, recover_marked_root_with_caps,
     };
     use crate::agent_session_lifecycle::{
         ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle, SessionMetadata,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{
-        ItemId, SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
+        AgentId, ItemId, SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
     };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -1148,6 +1562,75 @@ mod tests {
         create_directory(&root.join(RESERVATIONS_DIRECTORY).join(SESSIONS_DIRECTORY));
         create_directory(&root.join(AGENTS_DIRECTORY));
         create_directory(&root.join(SESSIONS_DIRECTORY));
+    }
+
+    const AGENT_ONE: &str = "agt_11111111111111111111111111111111";
+    const AGENT_TWO: &str = "agt_22222222222222222222222222222222";
+    const GENERATION_ONE: &str = "00000000000000000001";
+
+    fn agent_head_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head.json")
+    }
+
+    fn agent_definition_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-definition.json")
+    }
+
+    fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let input = std::str::from_utf8(input).expect("fixture bytes are UTF-8");
+        assert_eq!(
+            input.matches(from).count(),
+            1,
+            "fixture replacement must be fixed and unique"
+        );
+        input.replacen(from, to, 1).into_bytes()
+    }
+
+    fn agent_path(root: &Path, agent_id: &str) -> PathBuf {
+        root.join(AGENTS_DIRECTORY).join(agent_id)
+    }
+
+    fn generation_path(root: &Path, agent_id: &str) -> PathBuf {
+        agent_path(root, agent_id)
+            .join("generations")
+            .join(GENERATION_ONE)
+    }
+
+    fn create_exact_g1_agent(root: &Path, agent_id: &str, head: &[u8], definition: &[u8]) {
+        create_file(
+            &root
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(agent_id),
+            b"",
+        );
+        let entity = agent_path(root, agent_id);
+        create_directory(&entity);
+        create_file(&entity.join("PUBLISHED"), b"");
+        let generations = entity.join("generations");
+        create_directory(&generations);
+        let generation = generations.join(GENERATION_ONE);
+        create_directory(&generation);
+        create_file(&generation.join("head.json"), head);
+        create_file(&generation.join("definition.json"), definition);
+        create_file(&generation.join("COMMITTED"), b"");
+    }
+
+    fn create_valid_g1_agent(root: &Path) {
+        create_exact_g1_agent(
+            root,
+            AGENT_ONE,
+            agent_head_fixture(),
+            agent_definition_fixture(),
+        );
+    }
+
+    fn assert_corrupt(result: Result<DurableState, DurableOpenError>) {
+        assert!(matches!(result, Err(DurableOpenError::DurableStateCorrupt)));
+    }
+
+    fn marked_entries(root: &Path) -> Vec<std::fs::DirEntry> {
+        read_entries_bounded(root, ROOT_ENTRY_CAP).expect("the fixed root is bounded")
     }
 
     #[test]
@@ -1514,5 +1997,769 @@ mod tests {
             reservations.join("foreign-0").exists(),
             "the oversized unsupported scaffold remains untouched"
         );
+    }
+
+    #[test]
+    fn storage_generation_directory_names_are_exact_and_redacted() {
+        for value in [1, 1_000_000] {
+            let generation = StorageGeneration::new(value).expect("the boundary is valid");
+            assert_eq!(
+                StorageGeneration::parse_directory_name(std::ffi::OsStr::new(
+                    &generation.directory_name(),
+                ))
+                .expect("the canonical name parses"),
+                generation
+            );
+            assert_eq!(
+                StorageGeneration::parse_directory_name_str(&generation.directory_name())
+                    .expect("the canonical UTF-8 name parses"),
+                generation
+            );
+        }
+
+        for invalid in [
+            "00000000000000000000",
+            "00000000000001000001",
+            "1",
+            "0000000000000000001",
+            "+0000000000000000001",
+            "000000000000000000001",
+            "0000000000000000001１",
+        ] {
+            assert!(StorageGeneration::parse_directory_name_str(invalid).is_err());
+        }
+        let error = StorageGeneration::parse_directory_name_str("not-a-secret").unwrap_err();
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("not-a-secret"));
+        assert!(!format!("{error}").contains("not-a-secret"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+
+            let non_utf8 = std::ffi::OsStr::from_bytes(b"agt_\xff");
+            assert!(matches!(
+                parse_agent_id_name(non_utf8),
+                Err(DurableOpenError::DurableStateCorrupt)
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn marked_empty_store_opens_with_an_empty_private_agent_catalog() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+
+        let state = open(root.path())
+            .await
+            .expect("the marked empty store opens");
+        let unknown = AgentId::from_str(AGENT_ONE).expect("the fixture ID is valid");
+        assert!(state.agent_head(unknown).is_none());
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_published_committed_g1_agent_recovers_as_the_same_arc() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+
+        let state = open(root.path()).await.expect("the exact G1 Agent opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).expect("the fixture ID is valid");
+        let first = state.agent_head(agent_id).expect("the head is catalogued");
+        let second = state
+            .agent_head(agent_id)
+            .expect("the same head is catalogued");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.agent_id(), agent_id);
+        assert_eq!(first.storage_generation().get(), 1);
+        assert_eq!(first.current_definition_revision().get(), 1);
+        assert_eq!(first.current_definition_storage_generation().get(), 1);
+        assert_eq!(first.metadata().revision().get(), 1);
+        assert_eq!(
+            first.status(),
+            crate::agent_session_lifecycle::AgentStatus::Enabled
+        );
+        assert!(
+            state
+                .agent_head(AgentId::from_str(AGENT_TWO).expect("a fixed second ID is valid"))
+                .is_none()
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_distinct_exact_g1_agents_recover_and_an_orphan_remains_invisible() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_exact_g1_agent(
+            root.path(),
+            AGENT_TWO,
+            &replace_fixture(agent_head_fixture(), AGENT_ONE, AGENT_TWO),
+            &replace_fixture(agent_definition_fixture(), AGENT_ONE, AGENT_TWO),
+        );
+        let orphan = "agt_33333333333333333333333333333333";
+        create_file(
+            &root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(orphan),
+            b"",
+        );
+
+        let state = open(root.path()).await.expect("both exact Agents open");
+        assert!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).expect("fixture ID is valid"))
+                .is_some()
+        );
+        assert!(
+            state
+                .agent_head(AgentId::from_str(AGENT_TWO).expect("fixture ID is valid"))
+                .is_some()
+        );
+        assert!(
+            state
+                .agent_head(AgentId::from_str(orphan).expect("orphan ID is valid"))
+                .is_none()
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_agent_requires_its_exact_permanent_reservation() {
+        let missing = TempRoot::existing();
+        create_marked_empty_store(missing.path());
+        create_valid_g1_agent(missing.path());
+        fs::remove_file(
+            missing
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+        )
+        .expect("the matching reservation is removed");
+        assert_corrupt(open(missing.path()).await);
+
+        let mismatched = TempRoot::existing();
+        create_marked_empty_store(mismatched.path());
+        create_valid_g1_agent(mismatched.path());
+        fs::rename(
+            mismatched
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+            mismatched
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_TWO),
+        )
+        .expect("the reservation becomes a different canonical ID");
+        assert_corrupt(open(mismatched.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_agent_reservations_are_corrupt() {
+        let invalid_name = TempRoot::existing();
+        create_marked_empty_store(invalid_name.path());
+        create_file(
+            &invalid_name
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join("not-an-agent"),
+            b"",
+        );
+        assert_corrupt(open(invalid_name.path()).await);
+
+        let nonzero = TempRoot::existing();
+        create_marked_empty_store(nonzero.path());
+        create_file(
+            &nonzero
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+            b"not-zero",
+        );
+        assert_corrupt(open(nonzero.path()).await);
+
+        let directory = TempRoot::existing();
+        create_marked_empty_store(directory.path());
+        create_directory(
+            &directory
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+        );
+        assert_corrupt(open(directory.path()).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn linked_or_wrong_mode_agent_reservations_are_corrupt() {
+        use std::os::unix::fs::symlink;
+
+        let linked = TempRoot::existing();
+        create_marked_empty_store(linked.path());
+        let target_root = TempRoot::existing();
+        let target = target_root.path().join("reservation-target");
+        create_file(&target, b"");
+        symlink(
+            &target,
+            linked
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+        )
+        .expect("the test creates a symlink");
+        assert_corrupt(open(linked.path()).await);
+
+        let wrong_mode = TempRoot::existing();
+        create_marked_empty_store(wrong_mode.path());
+        let reservation = wrong_mode
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(AGENT_ONE);
+        create_file(&reservation, b"");
+        set_unix_mode(&reservation, 0o644);
+        assert_corrupt(open(wrong_mode.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_path_head_and_definition_ids_must_agree() {
+        let path_mismatch = TempRoot::existing();
+        create_marked_empty_store(path_mismatch.path());
+        create_valid_g1_agent(path_mismatch.path());
+        fs::rename(
+            path_mismatch
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+            path_mismatch
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_TWO),
+        )
+        .expect("the matching reservation is renamed");
+        fs::rename(
+            agent_path(path_mismatch.path(), AGENT_ONE),
+            agent_path(path_mismatch.path(), AGENT_TWO),
+        )
+        .expect("the entity path is renamed");
+        assert_corrupt(open(path_mismatch.path()).await);
+
+        let head_mismatch = TempRoot::existing();
+        create_marked_empty_store(head_mismatch.path());
+        create_exact_g1_agent(
+            head_mismatch.path(),
+            AGENT_ONE,
+            &replace_fixture(agent_head_fixture(), AGENT_ONE, AGENT_TWO),
+            agent_definition_fixture(),
+        );
+        assert_corrupt(open(head_mismatch.path()).await);
+
+        let definition_mismatch = TempRoot::existing();
+        create_marked_empty_store(definition_mismatch.path());
+        create_exact_g1_agent(
+            definition_mismatch.path(),
+            AGENT_ONE,
+            agent_head_fixture(),
+            &replace_fixture(agent_definition_fixture(), AGENT_ONE, AGENT_TWO),
+        );
+        assert_corrupt(open(definition_mismatch.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_entity_shape_is_exact_and_entity_cap_precedes_classification() {
+        let missing_published = TempRoot::existing();
+        create_marked_empty_store(missing_published.path());
+        create_valid_g1_agent(missing_published.path());
+        fs::remove_file(agent_path(missing_published.path(), AGENT_ONE).join("PUBLISHED"))
+            .expect("the visibility marker is removed");
+        assert_corrupt(open(missing_published.path()).await);
+
+        let wrong_published = TempRoot::existing();
+        create_marked_empty_store(wrong_published.path());
+        create_valid_g1_agent(wrong_published.path());
+        let published = agent_path(wrong_published.path(), AGENT_ONE).join("PUBLISHED");
+        fs::remove_file(&published).expect("the marker is removed before replacing its type");
+        create_directory(&published);
+        assert_corrupt(open(wrong_published.path()).await);
+
+        let nonzero_published = TempRoot::existing();
+        create_marked_empty_store(nonzero_published.path());
+        create_valid_g1_agent(nonzero_published.path());
+        create_file(
+            &agent_path(nonzero_published.path(), AGENT_ONE).join("PUBLISHED"),
+            b"not-zero",
+        );
+        assert_corrupt(open(nonzero_published.path()).await);
+
+        let generations_not_directory = TempRoot::existing();
+        create_marked_empty_store(generations_not_directory.path());
+        create_valid_g1_agent(generations_not_directory.path());
+        let generations =
+            agent_path(generations_not_directory.path(), AGENT_ONE).join("generations");
+        fs::remove_dir_all(&generations).expect("the generations directory is removed");
+        create_file(&generations, b"");
+        assert_corrupt(open(generations_not_directory.path()).await);
+
+        let too_many = TempRoot::existing();
+        create_marked_empty_store(too_many.path());
+        create_valid_g1_agent(too_many.path());
+        create_file(
+            &agent_path(too_many.path(), AGENT_ONE).join("invalid-third"),
+            b"",
+        );
+        assert!(matches!(
+            open(too_many.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn g1_generation_namespace_is_exact_without_adjacent_recovery() {
+        let unpadded = TempRoot::existing();
+        create_marked_empty_store(unpadded.path());
+        create_valid_g1_agent(unpadded.path());
+        fs::rename(
+            generation_path(unpadded.path(), AGENT_ONE),
+            agent_path(unpadded.path(), AGENT_ONE)
+                .join("generations")
+                .join("1"),
+        )
+        .expect("the generation is made unpadded");
+        assert_corrupt(open(unpadded.path()).await);
+
+        let g2 = TempRoot::existing();
+        create_marked_empty_store(g2.path());
+        create_valid_g1_agent(g2.path());
+        fs::rename(
+            generation_path(g2.path(), AGENT_ONE),
+            agent_path(g2.path(), AGENT_ONE)
+                .join("generations")
+                .join("00000000000000000002"),
+        )
+        .expect("the lone generation becomes G2");
+        assert_corrupt(open(g2.path()).await);
+
+        let multiple = TempRoot::existing();
+        create_marked_empty_store(multiple.path());
+        create_valid_g1_agent(multiple.path());
+        create_directory(
+            &agent_path(multiple.path(), AGENT_ONE)
+                .join("generations")
+                .join("00000000000000000002"),
+        );
+        assert_corrupt(open(multiple.path()).await);
+
+        let missing = TempRoot::existing();
+        create_marked_empty_store(missing.path());
+        create_valid_g1_agent(missing.path());
+        fs::remove_dir_all(generation_path(missing.path(), AGENT_ONE))
+            .expect("the only generation is removed");
+        assert_corrupt(open(missing.path()).await);
+
+        let extra = TempRoot::existing();
+        create_marked_empty_store(extra.path());
+        create_valid_g1_agent(extra.path());
+        create_directory(
+            &agent_path(extra.path(), AGENT_ONE)
+                .join("generations")
+                .join("foreign"),
+        );
+        assert_corrupt(open(extra.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn g1_payload_is_exact_and_payload_cap_precedes_classification() {
+        let missing = TempRoot::existing();
+        create_marked_empty_store(missing.path());
+        create_valid_g1_agent(missing.path());
+        fs::remove_file(generation_path(missing.path(), AGENT_ONE).join("head.json"))
+            .expect("the required head is removed");
+        assert_corrupt(open(missing.path()).await);
+
+        let missing_definition = TempRoot::existing();
+        create_marked_empty_store(missing_definition.path());
+        create_valid_g1_agent(missing_definition.path());
+        fs::remove_file(
+            generation_path(missing_definition.path(), AGENT_ONE).join("definition.json"),
+        )
+        .expect("the required definition is removed");
+        assert_corrupt(open(missing_definition.path()).await);
+
+        let missing_committed = TempRoot::existing();
+        create_marked_empty_store(missing_committed.path());
+        create_valid_g1_agent(missing_committed.path());
+        fs::remove_file(generation_path(missing_committed.path(), AGENT_ONE).join("COMMITTED"))
+            .expect("the required committed marker is removed");
+        assert_corrupt(open(missing_committed.path()).await);
+
+        let wrong_marker = TempRoot::existing();
+        create_marked_empty_store(wrong_marker.path());
+        create_valid_g1_agent(wrong_marker.path());
+        let committed = generation_path(wrong_marker.path(), AGENT_ONE).join("COMMITTED");
+        fs::remove_file(&committed).expect("the marker is removed before replacement");
+        create_directory(&committed);
+        assert_corrupt(open(wrong_marker.path()).await);
+
+        let nonzero_marker = TempRoot::existing();
+        create_marked_empty_store(nonzero_marker.path());
+        create_valid_g1_agent(nonzero_marker.path());
+        create_file(
+            &generation_path(nonzero_marker.path(), AGENT_ONE).join("COMMITTED"),
+            b"not-zero",
+        );
+        assert_corrupt(open(nonzero_marker.path()).await);
+
+        let wrong_document_type = TempRoot::existing();
+        create_marked_empty_store(wrong_document_type.path());
+        create_valid_g1_agent(wrong_document_type.path());
+        let definition =
+            generation_path(wrong_document_type.path(), AGENT_ONE).join("definition.json");
+        fs::remove_file(&definition).expect("the document is removed before type replacement");
+        create_directory(&definition);
+        assert_corrupt(open(wrong_document_type.path()).await);
+
+        let too_many = TempRoot::existing();
+        create_marked_empty_store(too_many.path());
+        create_valid_g1_agent(too_many.path());
+        create_file(
+            &generation_path(too_many.path(), AGENT_ONE).join("invalid-fourth"),
+            b"",
+        );
+        assert_eq!(GENERATION_PAYLOAD_ENTRY_CAP, 3);
+        assert!(matches!(
+            open(too_many.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn g1_payload_wrong_unix_mode_is_corrupt() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let head = generation_path(root.path(), AGENT_ONE).join("head.json");
+        set_unix_mode(&head, 0o644);
+        assert_corrupt(open(root.path()).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn g1_payload_symlink_is_corrupt() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let head = generation_path(root.path(), AGENT_ONE).join("head.json");
+        fs::remove_file(&head).expect("the head is removed before linking");
+        let target_root = TempRoot::existing();
+        let target = target_root.path().join("head-target");
+        create_file(&target, agent_head_fixture());
+        symlink(&target, &head).expect("the payload symlink is created");
+        assert_corrupt(open(root.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn g1_semantic_matrix_rejects_noninitial_revisions_status_pointer_and_timestamps() {
+        let cases: [(&str, Vec<u8>, Vec<u8>); 8] = [
+            (
+                "head agent revision",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"revision\":\"ar_1\",\"storageGeneration\":1",
+                    "\"revision\":\"ar_2\",\"storageGeneration\":1",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "definition agent revision",
+                agent_head_fixture().to_vec(),
+                replace_fixture(
+                    agent_definition_fixture(),
+                    "\"revision\":\"ar_1\"",
+                    "\"revision\":\"ar_2\"",
+                ),
+            ),
+            (
+                "metadata revision",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"revision\":\"amr_1\"",
+                    "\"revision\":\"amr_2\"",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "disabled",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"status\":\"enabled\"",
+                    "\"status\":\"disabled\"",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "deleted",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"status\":\"enabled\"",
+                    "\"status\":\"deleted\"",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "definition pointer",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"currentDefinition\":{\"revision\":\"ar_1\",\"storageGeneration\":1}",
+                    "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":1}",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "created timestamp",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"createdAt\":\"2026-08-03T10:00:00.123Z\"",
+                    "\"createdAt\":\"2026-08-03T10:00:00.124Z\"",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+            (
+                "metadata timestamp",
+                replace_fixture(
+                    agent_head_fixture(),
+                    "\"updatedAt\":\"2026-08-03T10:00:00.123Z\"",
+                    "\"updatedAt\":\"2026-08-03T10:00:00.124Z\"",
+                ),
+                agent_definition_fixture().to_vec(),
+            ),
+        ];
+
+        for (name, head, definition) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_exact_g1_agent(root.path(), AGENT_ONE, &head, &definition);
+            assert!(
+                matches!(
+                    open(root.path()).await,
+                    Err(DurableOpenError::DurableStateCorrupt)
+                ),
+                "{name} must not be accepted as G1"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_and_structurally_oversized_documents_map_to_the_closed_errors() {
+        let malformed = TempRoot::existing();
+        create_marked_empty_store(malformed.path());
+        create_exact_g1_agent(
+            malformed.path(),
+            AGENT_ONE,
+            b"not JSON\n",
+            agent_definition_fixture(),
+        );
+        assert_corrupt(open(malformed.path()).await);
+
+        let structural = TempRoot::existing();
+        create_marked_empty_store(structural.path());
+        let mut deeply_nested = b"{\"x\":".repeat(65);
+        deeply_nested.push(b'0');
+        deeply_nested.extend(std::iter::repeat_n(b'}', 65));
+        deeply_nested.push(b'\n');
+        create_exact_g1_agent(
+            structural.path(),
+            AGENT_ONE,
+            agent_head_fixture(),
+            &deeply_nested,
+        );
+        assert!(matches!(
+            open(structural.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+
+        let too_large = TempRoot::existing();
+        create_marked_empty_store(too_large.path());
+        let oversized = vec![b'x'; super::MAX_DURABLE_DOCUMENT_BYTES + 1];
+        create_exact_g1_agent(
+            too_large.path(),
+            AGENT_ONE,
+            agent_head_fixture(),
+            &oversized,
+        );
+        assert!(matches!(
+            open(too_large.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[test]
+    fn physical_document_reader_is_bounded_and_redacts_its_failures() {
+        let root = TempRoot::existing();
+        let exact = root.path().join("private-document-name");
+        let exact_bytes = vec![b'x'; super::MAX_DURABLE_DOCUMENT_BYTES];
+        create_file(&exact, &exact_bytes);
+        assert_eq!(
+            read_durable_document(&exact)
+                .expect("an exact-cap regular document is accepted")
+                .len(),
+            super::MAX_DURABLE_DOCUMENT_BYTES
+        );
+
+        let plus_one = root.path().join("private-document-name-plus-one");
+        create_file(
+            &plus_one,
+            &vec![b'x'; super::MAX_DURABLE_DOCUMENT_BYTES + 1],
+        );
+        let error = read_durable_document(&plus_one).unwrap_err();
+        assert_eq!(error, DurableOpenError::DurableStateTooLarge);
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("private-document-name"));
+        assert!(!debug.contains("1048577"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sessions_are_required_empty_and_small_caps_take_precedence() {
+        let root_sessions = TempRoot::existing();
+        create_marked_empty_store(root_sessions.path());
+        create_file(
+            &root_sessions
+                .path()
+                .join(SESSIONS_DIRECTORY)
+                .join("invalid"),
+            b"",
+        );
+        assert_corrupt(open(root_sessions.path()).await);
+
+        let reservation_sessions = TempRoot::existing();
+        create_marked_empty_store(reservation_sessions.path());
+        create_file(
+            &reservation_sessions
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join("invalid"),
+            b"",
+        );
+        assert_corrupt(open(reservation_sessions.path()).await);
+
+        let cap_root_sessions = TempRoot::existing();
+        create_marked_empty_store(cap_root_sessions.path());
+        create_file(
+            &cap_root_sessions
+                .path()
+                .join(SESSIONS_DIRECTORY)
+                .join("invalid-one"),
+            b"",
+        );
+        create_file(
+            &cap_root_sessions
+                .path()
+                .join(SESSIONS_DIRECTORY)
+                .join("invalid-two"),
+            b"",
+        );
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                cap_root_sessions.path(),
+                &marked_entries(cap_root_sessions.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+
+        let cap_reservation_sessions = TempRoot::existing();
+        create_marked_empty_store(cap_reservation_sessions.path());
+        let sessions = cap_reservation_sessions
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(SESSIONS_DIRECTORY);
+        create_file(&sessions.join("invalid-one"), b"");
+        create_file(&sessions.join("invalid-two"), b"");
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                cap_reservation_sessions.path(),
+                &marked_entries(cap_reservation_sessions.path()),
+                caps,
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[test]
+    fn recovery_collection_caps_precede_agent_name_or_shape_classification() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        let reservations = TempRoot::existing();
+        create_marked_empty_store(reservations.path());
+        let reservation_directory = reservations
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY);
+        create_file(&reservation_directory.join("invalid-one"), b"");
+        create_file(&reservation_directory.join("invalid-two"), b"");
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                reservations.path(),
+                &marked_entries(reservations.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+
+        let entities = TempRoot::existing();
+        create_marked_empty_store(entities.path());
+        create_directory(&entities.path().join(AGENTS_DIRECTORY).join("invalid-one"));
+        create_directory(&entities.path().join(AGENTS_DIRECTORY).join("invalid-two"));
+        assert!(matches!(
+            recover_marked_root_with_caps(entities.path(), &marked_entries(entities.path()), caps),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+
+        let generations = TempRoot::existing();
+        create_marked_empty_store(generations.path());
+        create_valid_g1_agent(generations.path());
+        create_directory(
+            &agent_path(generations.path(), AGENT_ONE)
+                .join("generations")
+                .join("invalid-second"),
+        );
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                generations.path(),
+                &marked_entries(generations.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
     }
 }
