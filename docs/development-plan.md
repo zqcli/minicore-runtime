@@ -72,6 +72,8 @@ M4已完成Prompt-owned opaque `ModelMessage`、`ConversationRevision`/`EntryIdG
 8. **错误留在owner**：不建立全局Error/Common registry；跨边界只做文档已冻结的确定性映射。
 9. **不顺带扩展MVP**：不实现durable Turn lifecycle、same-Turn restart、recording retry/backfill、remote Workspace、secret UserQuestion、event replay或跨Session文件锁。
 10. **合同变化先停工**：测试暴露文档矛盾时，先记录最小场景并回到canonical owner review；不能用implementation-only exception绕过。
+11. **Coding-agent主路径优先**：行为里程碑只实现coding-agent纵向闭环直接需要的产品能力。非coding-agent的独立主体、persona、编排或通用工作流不做专门实现；只有当共享Agent/Session语义、durable format或当前coding-agent流程明确依赖时，才实现对应的共同基础。
+12. **只建立当前可消费的最小seam**：文档中的representative interface用于说明owner边界，不等于必须提前创建所有production API。过渡slice只实现当前行为或下一紧邻slice确实消费的最小concrete code；不得为了测试或未来灵活性固化standalone production API、receipt/token、generic source/adapter/transaction abstraction或成套dead-code路径。确定性注入优先保持`#[cfg(test)]`私有，并在真实production consumer出现时再提升为production seam。
 
 ## 依赖图
 
