@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "M3 physical scanner is consumed by future storage and recorder slices"
-)]
-
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -27,6 +22,7 @@ const SCANNER_CHUNK_BYTES: usize = 65_536;
 
 /// Scan access is read-only unless the caller borrows a storage-owned proof for this exact
 /// physical file observation. The scanner never acquires an OS lock and never mutates the file.
+#[allow(dead_code, reason = "writable lease access remains a storage seam")]
 pub(crate) enum ConversationScanAccess<'lease> {
     ReadOnly,
     /// The caller has already established exclusive writable access. The scanner does not create
@@ -67,6 +63,7 @@ pub(crate) struct ConversationPhysicalLocation {
     offset: u64,
 }
 
+#[allow(dead_code, reason = "locations remain a scanner consumer seam")]
 impl ConversationPhysicalLocation {
     const fn new(line_number: u64, offset: u64) -> Self {
         Self {
@@ -124,16 +121,6 @@ pub(crate) enum ConversationScanEvent {
         location: ConversationPhysicalLocation,
         action: ConversationPartialTailAction,
     },
-}
-
-impl ConversationScanEvent {
-    pub(crate) const fn location(&self) -> ConversationPhysicalLocation {
-        match self {
-            Self::Entry { location, .. }
-            | Self::Fault { location, .. }
-            | Self::PartialTail { location, .. } => *location,
-        }
-    }
 }
 
 impl fmt::Debug for ConversationScanEvent {
@@ -213,9 +200,7 @@ enum PhysicalLineRead {
         offset: u64,
         oversized: bool,
     },
-    Oversized {
-        offset: u64,
-    },
+    Oversized,
     End,
 }
 
@@ -260,6 +245,10 @@ impl<R> fmt::Debug for ConversationJsonlScanner<'_, R> {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "scanner seams remain consumed by storage integrations"
+)]
 impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
     pub(crate) fn open(
         reader: R,
@@ -345,7 +334,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                 }
                 (offset, exact_lf)
             }
-            PhysicalLineRead::Oversized { .. } => {
+            PhysicalLineRead::Oversized => {
                 return Err(scanner.header_error(ConversationCodecError::HeaderTooLarge));
             }
             PhysicalLineRead::Partial {
@@ -380,10 +369,6 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
         self.header
             .as_ref()
             .ok_or(ConversationScanError::InvariantViolation)
-    }
-
-    pub(crate) const fn declared_file_bytes(&self) -> Option<u64> {
-        self.declared_file_bytes
     }
 
     pub(crate) const fn complete_entry_records(&self) -> u64 {
@@ -467,7 +452,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                     })),
                 }
             }
-            PhysicalLineRead::Oversized { .. } => Err(ConversationScanError::InvariantViolation),
+            PhysicalLineRead::Oversized => Err(ConversationScanError::InvariantViolation),
         }
     }
 
@@ -555,7 +540,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                 } else {
                     oversized = true;
                     if stop_on_oversize {
-                        return Ok(PhysicalLineRead::Oversized { offset });
+                        return Ok(PhysicalLineRead::Oversized);
                     }
                 }
             }
@@ -614,60 +599,12 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
             .ok_or(ConversationScanError::CounterOverflow)?;
         Ok(Some(byte))
     }
-
-    #[cfg(test)]
-    fn open_with_entry_record_limit_for_test(
-        reader: R,
-        declared_file_bytes: u64,
-        opened_session_id: SessionId,
-        access: ConversationScanAccess<'lease>,
-        entry_records: u64,
-    ) -> Result<Self, ConversationScanError> {
-        Self::open_with_limits(
-            reader,
-            Some(declared_file_bytes),
-            opened_session_id,
-            access,
-            ConversationScanLimits {
-                entry_records,
-                ..ConversationScanLimits::V1
-            },
-        )
-    }
-
-    #[cfg(test)]
-    fn open_with_limits_for_test(
-        reader: R,
-        declared_file_bytes: u64,
-        opened_session_id: SessionId,
-        access: ConversationScanAccess<'lease>,
-        limits: ConversationScanLimits,
-    ) -> Result<Self, ConversationScanError> {
-        Self::open_with_limits(
-            reader,
-            Some(declared_file_bytes),
-            opened_session_id,
-            access,
-            limits,
-        )
-    }
-
-    #[cfg(test)]
-    fn open_read_only_without_metadata_with_limits_for_test(
-        reader: R,
-        opened_session_id: SessionId,
-        limits: ConversationScanLimits,
-    ) -> Result<Self, ConversationScanError> {
-        Self::open_with_limits(
-            reader,
-            None,
-            opened_session_id,
-            ConversationScanAccess::ReadOnly,
-            limits,
-        )
-    }
 }
 
+#[allow(
+    dead_code,
+    reason = "file scanner seam remains consumed by storage integrations"
+)]
 impl<'lease> ConversationJsonlScanner<'lease, File> {
     pub(crate) fn open_file(
         file: File,
@@ -1771,14 +1708,14 @@ mod tests {
             file_bytes: exact_file_bytes,
             ..ConversationScanLimits::V1
         };
-        let mut exact_scanner =
-            ConversationJsonlScanner::open_read_only_without_metadata_with_limits_for_test(
-                ChunkBoundedReader::new(exact_bytes),
-                session_id(),
-                limits,
-            )
-            .expect("metadata-unavailable input exactly at the file cap must scan");
-        assert_eq!(exact_scanner.declared_file_bytes(), None);
+        let mut exact_scanner = ConversationJsonlScanner::open_with_limits(
+            ChunkBoundedReader::new(exact_bytes),
+            None,
+            session_id(),
+            ConversationScanAccess::ReadOnly,
+            limits,
+        )
+        .expect("metadata-unavailable input exactly at the file cap must scan");
         assert!(matches!(
             drain(&mut exact_scanner).as_slice(),
             [ConversationScanEvent::Entry { .. }]
@@ -1787,9 +1724,11 @@ mod tests {
         let mut over_cap_bytes = file_with_lines(&[entry_line()]);
         over_cap_bytes.push(b'x');
         assert_open_error(
-            ConversationJsonlScanner::open_read_only_without_metadata_with_limits_for_test(
+            ConversationJsonlScanner::open_with_limits(
                 ChunkBoundedReader::new(over_cap_bytes),
+                None,
                 session_id(),
+                ConversationScanAccess::ReadOnly,
                 limits,
             ),
             ConversationScanError::FileTooLarge,
@@ -1804,13 +1743,14 @@ mod tests {
             file_bytes: u64::try_from(bytes.len()).unwrap(),
             ..ConversationScanLimits::V1
         };
-        let mut scanner =
-            ConversationJsonlScanner::open_read_only_without_metadata_with_limits_for_test(
-                ChunkBoundedReader::new(bytes),
-                session_id(),
-                limits,
-            )
-            .expect("metadata-unavailable read-only input must decode its Header");
+        let mut scanner = ConversationJsonlScanner::open_with_limits(
+            ChunkBoundedReader::new(bytes),
+            None,
+            session_id(),
+            ConversationScanAccess::ReadOnly,
+            limits,
+        )
+        .expect("metadata-unavailable read-only input must decode its Header");
         assert!(matches!(
             drain(&mut scanner).as_slice(),
             [
@@ -1836,9 +1776,9 @@ mod tests {
         let lease =
             ExclusiveWritableConversationLease::for_scanner_test(wrong_session, file_bytes + 1);
         assert_open_error(
-            ConversationJsonlScanner::open_with_limits_for_test(
+            ConversationJsonlScanner::open_with_limits(
                 PanicOnRead,
-                file_bytes + 1,
+                Some(file_bytes + 1),
                 session_id(),
                 ConversationScanAccess::ExclusiveWritable(&lease),
                 limits,
@@ -1857,9 +1797,9 @@ mod tests {
             ..ConversationScanLimits::V1
         };
         assert_open_error(
-            ConversationJsonlScanner::open_with_limits_for_test(
+            ConversationJsonlScanner::open_with_limits(
                 ChunkBoundedReader::new(bytes),
-                file_bytes - 1,
+                Some(file_bytes - 1),
                 session_id(),
                 ConversationScanAccess::ReadOnly,
                 limits,
@@ -2052,9 +1992,9 @@ mod tests {
             .and_then(|value| value.checked_add(u64::try_from(entry_line().len()).unwrap()))
             .and_then(|value| value.checked_add(1))
             .unwrap();
-        let mut scanner = ConversationJsonlScanner::open_with_limits_for_test(
+        let mut scanner = ConversationJsonlScanner::open_with_limits(
             StreamingOversizedLine::new(entry_bytes),
-            declared_file_bytes,
+            Some(declared_file_bytes),
             session_id(),
             ConversationScanAccess::ReadOnly,
             ConversationScanLimits {
@@ -2081,12 +2021,15 @@ mod tests {
         let mut bytes = file_with_lines(&[entry_line()]);
         bytes.extend_from_slice(b"\xff\n");
         let length = u64::try_from(bytes.len()).unwrap();
-        let mut scanner = ConversationJsonlScanner::open_with_entry_record_limit_for_test(
+        let mut scanner = ConversationJsonlScanner::open_with_limits(
             Cursor::new(bytes),
-            length,
+            Some(length),
             session_id(),
             ConversationScanAccess::ReadOnly,
-            1,
+            ConversationScanLimits {
+                entry_records: 1,
+                ..ConversationScanLimits::V1
+            },
         )
         .unwrap();
         assert!(matches!(

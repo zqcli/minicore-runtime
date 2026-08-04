@@ -156,6 +156,7 @@ impl LiveCompactionSourceView {
         })
     }
 
+    #[cfg(test)]
     pub(crate) const fn session_id(&self) -> &SessionId {
         &self.session_id
     }

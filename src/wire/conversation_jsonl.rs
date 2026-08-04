@@ -176,6 +176,7 @@ impl ConversationLineCodec {
         writer.finish()
     }
 
+    #[cfg(test)]
     pub(crate) fn encode_record(
         record: &ConversationRecord,
     ) -> Result<Vec<u8>, ConversationCodecError> {
@@ -1087,7 +1088,6 @@ fn decode_interaction_resolution(
     let item_id = scalar(required(object, "itemId")?)?;
     let resolution = decode_interaction_resolution_body(required(object, "resolution")?)?;
     let resolution_key = optional_scalar(object.get("resolutionKey"))?;
-    validate_resolution_key(&resolution, resolution_key.as_ref())?;
     StoredInteractionResolution::reconstruct(request_id, item_id, resolution, resolution_key)
         .map_err(|_| ConversationCodecError::InvalidSemantic)
 }
@@ -1187,22 +1187,6 @@ fn decode_cancel_reason(
         "turn_terminal" => Ok(InteractionCancelReason::TurnTerminal),
         _ => Err(ConversationCodecError::UnknownLeafVariant),
     }
-}
-
-fn validate_resolution_key(
-    resolution: &StoredInteractionResolutionBody,
-    resolution_key: Option<&InteractionResolutionKey>,
-) -> Result<(), ConversationCodecError> {
-    let expected_key = match resolution {
-        StoredInteractionResolutionBody::ToolApproval(_)
-        | StoredInteractionResolutionBody::UserAnswer(_) => true,
-        StoredInteractionResolutionBody::Cancelled(InteractionCancelReason::HostCancelled) => true,
-        StoredInteractionResolutionBody::Cancelled(_) => false,
-    };
-    if expected_key != resolution_key.is_some() {
-        return Err(ConversationCodecError::InvalidSemantic);
-    }
-    Ok(())
 }
 
 fn decode_compaction(node: &JsonNode) -> Result<StoredCompaction, ConversationCodecError> {

@@ -275,7 +275,6 @@ Replay对旧或损坏记录采用：
 ```rust
 pub(crate) struct Interaction {
     request_id: RequestId,
-    session_id: SessionId,
     turn_id: TurnId,
     item_id: ItemId,
     request: InteractionRequest,
@@ -288,13 +287,14 @@ enum InteractionState {
     Pending,
     Resolved {
         resolution: ResolvedInteraction,
-        resolved_at: Timestamp,
         resolution_key: Option<InteractionResolutionKey>,
     },
 }
 
 pub struct InteractionResolutionKey([u8; 16]);
 ```
+
+`LiveSessionState`已绑定唯一SessionId，私有`Interaction`不重复保存该事实；resolution的exact timestamp属于同一条`StoredSessionEntry`，Interaction state只保留当前resolution与幂等key。
 
 ```rust
 pub(crate) enum InteractionRequest {
