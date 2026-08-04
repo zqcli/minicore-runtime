@@ -434,6 +434,77 @@ struct RecoveredCatalog {
     sessions: BTreeMap<SessionId, DurableSessionCatalogEntry>,
 }
 
+/// A fully validated recovery result. The catalog cannot become observable until its optional
+/// cleanup has completed under the still-held root lease.
+struct RecoveryCandidate {
+    catalog: RecoveredCatalog,
+    cleanup: Option<DeferredGenerationCleanup>,
+}
+
+/// The physical files which make up a committed generation. These paths are deliberately
+/// private scanner output: callers only use them for the existing domain decode/fold pass.
+struct CommittedGenerationFiles {
+    generation: StorageGeneration,
+    head_path: PathBuf,
+    definition_path: Option<PathBuf>,
+}
+
+/// A markerless generation's exact, non-semantic physical shape. Its documents must never be
+/// decoded because each allowed subset can be an interrupted write or an interrupted cleanup.
+struct MarkerlessGenerationFiles {
+    generation: StorageGeneration,
+    generation_path: PathBuf,
+    generations_parent: PathBuf,
+    has_head: bool,
+    has_definition: bool,
+}
+
+struct PhysicalGenerationScan {
+    committed: Vec<CommittedGenerationFiles>,
+    markerless: Option<MarkerlessGenerationFiles>,
+}
+
+enum PhysicalGenerationPayload {
+    Committed(CommittedGenerationFiles),
+    Markerless(MarkerlessGenerationFiles),
+}
+
+/// Owned revalidation data for the sole deferred destructive action allowed during one open.
+/// It contains no iterator, directory entry, or open file handle, and its Debug form deliberately
+/// suppresses the store-local paths.
+struct DeferredGenerationCleanup {
+    generation_path: PathBuf,
+    generations_parent: PathBuf,
+    reservation_path: PathBuf,
+    published_path: PathBuf,
+    has_head: bool,
+    has_definition: bool,
+}
+
+impl fmt::Debug for DeferredGenerationCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredGenerationCleanup")
+            .field("generation_path", &"redacted")
+            .field("generations_parent", &"redacted")
+            .field("reservation_path", &"redacted")
+            .field("published_path", &"redacted")
+            .field("has_head", &self.has_head)
+            .field("has_definition", &self.has_definition)
+            .finish()
+    }
+}
+
+struct RecoveredAgentGenerationChain {
+    entry: DurableAgentCatalogEntry,
+    markerless: Option<MarkerlessGenerationFiles>,
+}
+
+struct RecoveredSessionGenerationChain {
+    entry: DurableSessionCatalogEntry,
+    markerless: Option<MarkerlessGenerationFiles>,
+}
+
 /// The private owner of the Store V1 root lease and recovered immutable catalog.
 pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
@@ -564,13 +635,21 @@ impl RootLease {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectorySync {
     Supported,
     Unsupported,
 }
 
 fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
+    let filesystem = LocalFilesystem;
+    open_root_with_cleanup_filesystem(root, &filesystem)
+}
+
+fn open_root_with_cleanup_filesystem(
+    root: PathBuf,
+    filesystem: &dyn CleanupFilesystem,
+) -> Result<OpenRoot, DurableOpenError> {
     prepare_root(&root)?;
     let marker_was_present = format_marker_exists(&root)?;
     let lock_file = open_lock_file(&root, marker_was_present)?;
@@ -588,9 +667,17 @@ fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
     let marker_present = contains_named_entry(&root_entries, FORMAT_MARKER);
 
     let catalog = if marker_present {
-        recover_marked_root(&root, &root_entries)?
+        let RecoveryCandidate { catalog, cleanup } = recover_marked_root(&root, &root_entries)?;
+        // No read iterator, DirEntry, or document File may outlive recovery into a destructive
+        // step. The cleanup plan above owns only paths and boolean shape facts.
+        drop(root_entries);
+        if let Some(cleanup) = cleanup {
+            finalize_deferred_generation_cleanup(&cleanup, directory_sync, filesystem)?;
+        }
+        catalog
     } else {
         validate_markerless_root(&root_entries)?;
+        drop(root_entries);
         complete_markerless_scaffold(&root, directory_sync)?;
         create_format_marker(&root, directory_sync)?;
         RecoveredCatalog {
@@ -843,7 +930,7 @@ impl RecoveryCaps {
 fn recover_marked_root(
     root: &Path,
     entries: &[DirEntry],
-) -> Result<RecoveredCatalog, DurableOpenError> {
+) -> Result<RecoveryCandidate, DurableOpenError> {
     recover_marked_root_with_caps(root, entries, RecoveryCaps::PRODUCTION)
 }
 
@@ -851,7 +938,7 @@ fn recover_marked_root_with_caps(
     root: &Path,
     entries: &[DirEntry],
     caps: RecoveryCaps,
-) -> Result<RecoveredCatalog, DurableOpenError> {
+) -> Result<RecoveryCandidate, DurableOpenError> {
     let mut has_lock = false;
     let mut has_marker = false;
     let mut has_reservations = false;
@@ -904,9 +991,19 @@ fn recover_marked_root_with_caps(
     for (session_id, entity_path) in session_entities {
         session_generations.insert(session_id, scan_session_entity(&entity_path)?);
     }
-    let agents = recover_agents(agent_generations, caps.generations)?;
-    let sessions = recover_sessions(session_generations, &agents, caps.generations)?;
-    Ok(RecoveredCatalog { agents, sessions })
+    let mut cleanup = None;
+    let agents = recover_agents(agent_generations, caps.generations, root, &mut cleanup)?;
+    let sessions = recover_sessions(
+        session_generations,
+        &agents,
+        caps.generations,
+        root,
+        &mut cleanup,
+    )?;
+    Ok(RecoveryCandidate {
+        catalog: RecoveredCatalog { agents, sessions },
+        cleanup,
+    })
 }
 
 fn recover_marked_reservations(
@@ -1062,10 +1159,19 @@ fn scan_session_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
 fn recover_agents(
     entity_generations: BTreeMap<AgentId, PathBuf>,
     generation_maximum: usize,
+    root: &Path,
+    cleanup: &mut Option<DeferredGenerationCleanup>,
 ) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
     let mut agents = BTreeMap::new();
     for (agent_id, generations) in entity_generations {
-        let entry = recover_agent_generation_chain(&generations, agent_id, generation_maximum)?;
+        let RecoveredAgentGenerationChain { entry, markerless } =
+            recover_agent_generation_chain(&generations, agent_id, generation_maximum)?;
+        if let Some(markerless) = markerless {
+            register_deferred_generation_cleanup(
+                cleanup,
+                deferred_agent_generation_cleanup(root, agent_id, markerless),
+            )?;
+        }
         if agents.insert(agent_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
@@ -1080,11 +1186,19 @@ fn recover_sessions(
     entity_generations: BTreeMap<SessionId, PathBuf>,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
     generation_maximum: usize,
+    root: &Path,
+    cleanup: &mut Option<DeferredGenerationCleanup>,
 ) -> Result<BTreeMap<SessionId, DurableSessionCatalogEntry>, DurableOpenError> {
     let mut sessions = BTreeMap::new();
     for (session_id, generations) in entity_generations {
-        let entry =
+        let RecoveredSessionGenerationChain { entry, markerless } =
             recover_session_generation_chain(&generations, session_id, agents, generation_maximum)?;
+        if let Some(markerless) = markerless {
+            register_deferred_generation_cleanup(
+                cleanup,
+                deferred_session_generation_cleanup(root, session_id, markerless),
+            )?;
+        }
         if sessions.insert(session_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
@@ -1098,35 +1212,24 @@ fn recover_session_generation_chain(
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
     maximum: usize,
-) -> Result<DurableSessionCatalogEntry, DurableOpenError> {
-    let entries = read_entries_bounded(path, maximum)?;
-    let mut generation_entries = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
-            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
-        generation_entries.push((generation, entry));
-    }
-    generation_entries.sort_unstable_by_key(|(generation, _)| *generation);
-    for (_, entry) in &generation_entries {
-        validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
-    }
-
-    let mut generations = generation_entries.into_iter();
-    let Some((first_generation, first_entry)) = generations.next() else {
+) -> Result<RecoveredSessionGenerationChain, DurableOpenError> {
+    let PhysicalGenerationScan {
+        committed,
+        markerless,
+    } = scan_physical_generation_chain(path, maximum)?;
+    let mut generations = committed.into_iter();
+    let Some(first_generation) = generations.next() else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
-    if first_generation.get() != 1 {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    }
 
     let (first_head, Some(first_definition)) =
-        recover_session_generation_payload(&first_entry.path())?
+        recover_session_generation_payload(&first_generation)?
     else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
     validate_session_generation_one(
         session_id,
-        first_generation,
+        first_generation.generation,
         &first_head,
         &first_definition,
         agents,
@@ -1134,8 +1237,8 @@ fn recover_session_generation_chain(
 
     let mut current_head = first_head;
     let mut current_definition = first_definition;
-    for (generation, generation_entry) in generations {
-        if generation.get()
+    for generation in generations {
+        if generation.generation.get()
             != current_head
                 .storage_generation()
                 .get()
@@ -1144,10 +1247,10 @@ fn recover_session_generation_chain(
         {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
-        let (head, definition) = recover_session_generation_payload(&generation_entry.path())?;
+        let (head, definition) = recover_session_generation_payload(&generation)?;
         validate_session_generation_transition(
             session_id,
-            generation,
+            generation.generation,
             &current_head,
             &current_definition,
             &head,
@@ -1160,43 +1263,28 @@ fn recover_session_generation_chain(
         current_head = head;
     }
 
-    Ok(DurableSessionCatalogEntry {
-        current_head: Arc::new(current_head),
-        current_definition: Arc::new(current_definition),
+    if markerless.is_some() && current_head.lifecycle() == SessionLifecycle::Deleted {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    Ok(RecoveredSessionGenerationChain {
+        entry: DurableSessionCatalogEntry {
+            current_head: Arc::new(current_head),
+            current_definition: Arc::new(current_definition),
+        },
+        markerless,
     })
 }
 
 fn recover_session_generation_payload(
-    path: &Path,
+    files: &CommittedGenerationFiles,
 ) -> Result<(DurableSessionHead, Option<SessionDefinition>), DurableOpenError> {
-    let mut entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
-    entries.sort_unstable_by_key(|entry| entry.file_name());
-    let mut head_path = None;
-    let mut definition_path = None;
-    let mut committed = false;
-    for entry in entries {
-        if entry_has_name(&entry, "head.json") {
-            head_path = Some(entry.path());
-        } else if entry_has_name(&entry, "definition.json") {
-            definition_path = Some(entry.path());
-        } else if entry_has_name(&entry, "COMMITTED") {
-            validate_zero_regular_file(&entry.path())?;
-            committed = true;
-        } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
-        }
-    }
-    let Some(head_path) = head_path else {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    };
-    if !committed {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    }
-    let definition = definition_path
+    let definition = files
+        .definition_path
         .as_deref()
         .map(decode_session_definition_document)
         .transpose()?;
-    Ok((decode_session_head_document(&head_path)?, definition))
+    Ok((decode_session_head_document(&files.head_path)?, definition))
 }
 
 fn validate_session_generation_one(
@@ -1424,41 +1512,215 @@ fn scan_agent_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
     Ok(generations)
 }
 
-/// Recovers a fully committed, contiguous Agent generation chain. Markerless trailing
-/// generations are deliberately rejected here: staging cleanup remains a later slice.
+/// Scans the shared physical generation layout before either domain's decode/fold pass. A
+/// COMMITTED name is authoritative: once observed it must be a valid marker and a complete
+/// committed payload; it can never be reclassified as removable staging.
+fn scan_physical_generation_chain(
+    path: &Path,
+    maximum: usize,
+) -> Result<PhysicalGenerationScan, DurableOpenError> {
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut generation_paths = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
+            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+        generation_paths.push((generation, entry.path()));
+    }
+    generation_paths.sort_unstable_by_key(|(generation, _)| *generation);
+
+    let mut committed = Vec::with_capacity(generation_paths.len());
+    let mut markerless = None;
+    let mut highest_committed = None;
+    for (generation, generation_path) in generation_paths {
+        let metadata = metadata_without_following(&generation_path)?;
+        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+        let payload = scan_physical_generation_payload(generation, generation_path, path)?;
+        match payload {
+            PhysicalGenerationPayload::Committed(files) => {
+                let expected = highest_committed
+                    .map(|previous: StorageGeneration| {
+                        previous
+                            .get()
+                            .checked_add(1)
+                            .and_then(StorageGeneration::new)
+                    })
+                    .unwrap_or_else(|| StorageGeneration::new(1));
+                if markerless.is_some() || expected != Some(files.generation) {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+                highest_committed = Some(files.generation);
+                committed.push(files);
+            }
+            PhysicalGenerationPayload::Markerless(files) => {
+                let expected = highest_committed
+                    .and_then(|previous| {
+                        previous
+                            .get()
+                            .checked_add(1)
+                            .and_then(StorageGeneration::new)
+                    })
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?;
+                if markerless.is_some() || files.generation != expected {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+                markerless = Some(files);
+            }
+        }
+    }
+
+    if committed.is_empty() {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(PhysicalGenerationScan {
+        committed,
+        markerless,
+    })
+}
+
+fn scan_physical_generation_payload(
+    generation: StorageGeneration,
+    generation_path: PathBuf,
+    generations_parent: &Path,
+) -> Result<PhysicalGenerationPayload, DurableOpenError> {
+    let mut entries = read_entries_bounded(&generation_path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut head_path = None;
+    let mut definition_path = None;
+    let mut committed_path = None;
+
+    for entry in entries {
+        let slot = if entry_has_name(&entry, "head.json") {
+            &mut head_path
+        } else if entry_has_name(&entry, "definition.json") {
+            &mut definition_path
+        } else if entry_has_name(&entry, "COMMITTED") {
+            &mut committed_path
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        };
+        if slot.replace(entry.path()).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+
+    if let Some(committed_path) = committed_path {
+        validate_zero_regular_file(&committed_path)?;
+        let head_path = head_path.ok_or(DurableOpenError::DurableStateCorrupt)?;
+        validate_generation_document_physical_shape(&head_path)?;
+        if let Some(definition_path) = &definition_path {
+            validate_generation_document_physical_shape(definition_path)?;
+        }
+        return Ok(PhysicalGenerationPayload::Committed(
+            CommittedGenerationFiles {
+                generation,
+                head_path,
+                definition_path,
+            },
+        ));
+    }
+
+    if let Some(head_path) = &head_path {
+        validate_generation_document_physical_shape(head_path)?;
+    }
+    if let Some(definition_path) = &definition_path {
+        validate_generation_document_physical_shape(definition_path)?;
+    }
+    Ok(PhysicalGenerationPayload::Markerless(
+        MarkerlessGenerationFiles {
+            generation,
+            generation_path,
+            generations_parent: generations_parent.to_owned(),
+            has_head: head_path.is_some(),
+            has_definition: definition_path.is_some(),
+        },
+    ))
+}
+
+fn validate_generation_document_physical_shape(path: &Path) -> Result<(), DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
+    validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+    Ok(())
+}
+
+fn deferred_agent_generation_cleanup(
+    root: &Path,
+    agent_id: AgentId,
+    markerless: MarkerlessGenerationFiles,
+) -> DeferredGenerationCleanup {
+    DeferredGenerationCleanup {
+        generation_path: markerless.generation_path,
+        generations_parent: markerless.generations_parent,
+        reservation_path: root
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(agent_id.to_string()),
+        published_path: root
+            .join(AGENTS_DIRECTORY)
+            .join(agent_id.to_string())
+            .join("PUBLISHED"),
+        has_head: markerless.has_head,
+        has_definition: markerless.has_definition,
+    }
+}
+
+fn deferred_session_generation_cleanup(
+    root: &Path,
+    session_id: SessionId,
+    markerless: MarkerlessGenerationFiles,
+) -> DeferredGenerationCleanup {
+    DeferredGenerationCleanup {
+        generation_path: markerless.generation_path,
+        generations_parent: markerless.generations_parent,
+        reservation_path: root
+            .join(RESERVATIONS_DIRECTORY)
+            .join(SESSIONS_DIRECTORY)
+            .join(session_id.to_string()),
+        published_path: root
+            .join(SESSIONS_DIRECTORY)
+            .join(session_id.to_string())
+            .join("PUBLISHED"),
+        has_head: markerless.has_head,
+        has_definition: markerless.has_definition,
+    }
+}
+
+fn register_deferred_generation_cleanup(
+    cleanup: &mut Option<DeferredGenerationCleanup>,
+    candidate: DeferredGenerationCleanup,
+) -> Result<(), DurableOpenError> {
+    if cleanup.is_some() {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    *cleanup = Some(candidate);
+    Ok(())
+}
+
+/// Recovers the committed Agent prefix while retaining one exact trailing markerless staging
+/// candidate for deferred cleanup after complete-store validation.
 fn recover_agent_generation_chain(
     path: &Path,
     agent_id: AgentId,
     maximum: usize,
-) -> Result<DurableAgentCatalogEntry, DurableOpenError> {
-    let entries = read_entries_bounded(path, maximum)?;
-    let mut generation_entries = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
-            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
-        generation_entries.push((generation, entry));
-    }
-    generation_entries.sort_unstable_by_key(|(generation, _)| *generation);
-    for (_, entry) in &generation_entries {
-        validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
-    }
-
-    let mut generations = generation_entries.into_iter();
-    let Some((first_generation, first_entry)) = generations.next() else {
+) -> Result<RecoveredAgentGenerationChain, DurableOpenError> {
+    let PhysicalGenerationScan {
+        committed,
+        markerless,
+    } = scan_physical_generation_chain(path, maximum)?;
+    let mut generations = committed.into_iter();
+    let Some(first_generation) = generations.next() else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
-    if first_generation.get() != 1 {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    }
 
-    let (first_head, Some(first_definition)) =
-        recover_agent_generation_payload(&first_entry.path())?
+    let (first_head, Some(first_definition)) = recover_agent_generation_payload(&first_generation)?
     else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
     validate_generation_one_agent_semantics(
         agent_id,
-        first_generation,
+        first_generation.generation,
         &first_head,
         &first_definition,
     )?;
@@ -1467,14 +1729,14 @@ fn recover_agent_generation_chain(
     let mut current_definition = first_definition;
     let mut definition_index = BTreeMap::new();
     if definition_index
-        .insert(current_definition.revision(), first_generation)
+        .insert(current_definition.revision(), first_generation.generation)
         .is_some()
     {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
-    for (generation, generation_entry) in generations {
-        if generation.get()
+    for generation in generations {
+        if generation.generation.get()
             != current_head
                 .storage_generation()
                 .get()
@@ -1483,10 +1745,10 @@ fn recover_agent_generation_chain(
         {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
-        let (head, definition) = recover_agent_generation_payload(&generation_entry.path())?;
+        let (head, definition) = recover_agent_generation_payload(&generation)?;
         validate_agent_generation_transition(
             agent_id,
-            generation,
+            generation.generation,
             &current_head,
             &current_definition,
             &head,
@@ -1494,7 +1756,7 @@ fn recover_agent_generation_chain(
         )?;
         if let Some(definition) = definition {
             if definition_index
-                .insert(definition.revision(), generation)
+                .insert(definition.revision(), generation.generation)
                 .is_some()
             {
                 return Err(DurableOpenError::DurableStateCorrupt);
@@ -1504,42 +1766,26 @@ fn recover_agent_generation_chain(
         current_head = head;
     }
 
-    Ok(DurableAgentCatalogEntry {
-        current_head: Arc::new(current_head),
-        current_definition: Arc::new(current_definition),
-        definition_index,
+    if markerless.is_some() && current_head.status() == AgentStatus::Deleted {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    Ok(RecoveredAgentGenerationChain {
+        entry: DurableAgentCatalogEntry {
+            current_head: Arc::new(current_head),
+            current_definition: Arc::new(current_definition),
+            definition_index,
+        },
+        markerless,
     })
 }
 
 fn recover_agent_generation_payload(
-    path: &Path,
+    files: &CommittedGenerationFiles,
 ) -> Result<(DurableAgentHead, Option<AgentDefinition>), DurableOpenError> {
-    let mut entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
-    entries.sort_unstable_by_key(|entry| entry.file_name());
-    let mut head_path = None;
-    let mut definition_path = None;
-    let mut committed = false;
-    for entry in entries {
-        if entry_has_name(&entry, "head.json") {
-            head_path = Some(entry.path());
-        } else if entry_has_name(&entry, "definition.json") {
-            definition_path = Some(entry.path());
-        } else if entry_has_name(&entry, "COMMITTED") {
-            validate_zero_regular_file(&entry.path())?;
-            committed = true;
-        } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
-        }
-    }
-    let Some(head_path) = head_path else {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    };
-    if !committed {
-        return Err(DurableOpenError::DurableStateCorrupt);
-    }
-
-    let head = decode_agent_head_document(&head_path)?;
-    let definition = definition_path
+    let head = decode_agent_head_document(&files.head_path)?;
+    let definition = files
+        .definition_path
         .as_deref()
         .map(decode_agent_definition_document)
         .transpose()?;
@@ -2007,6 +2253,181 @@ fn sync_directory(path: &Path, directory_sync: DirectorySync) -> Result<(), Dura
         .map_err(|_| DurableOpenError::StorageUnavailable)
 }
 
+/// The intentionally small private destructive-I/O seam. Store scanning always uses the local
+/// standard-library read path; only deferred cleanup needs injectable remove/sync behavior.
+trait CleanupFilesystem {
+    fn remove_file(&self, path: &Path) -> Result<(), ()>;
+    fn remove_dir(&self, path: &Path) -> Result<(), ()>;
+    fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()>;
+}
+
+struct LocalFilesystem;
+
+impl CleanupFilesystem for LocalFilesystem {
+    fn remove_file(&self, path: &Path) -> Result<(), ()> {
+        fs::remove_file(path).map_err(|_| ())
+    }
+
+    fn remove_dir(&self, path: &Path) -> Result<(), ()> {
+        fs::remove_dir(path).map_err(|_| ())
+    }
+
+    fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()> {
+        sync_directory(path, directory_sync).map_err(|_| ())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CleanupPayloadSubset {
+    has_head: bool,
+    has_definition: bool,
+}
+
+/// Revalidates every still-destructive precondition after all namespace and semantic recovery
+/// handles have ended. A changed marker, child, or payload subset is corruption, never an excuse
+/// to remove the candidate recursively or to fall back to the old catalog.
+fn revalidate_deferred_generation_cleanup(
+    cleanup: &DeferredGenerationCleanup,
+) -> Result<CleanupPayloadSubset, DurableOpenError> {
+    validate_cleanup_zero_regular_file(&cleanup.reservation_path)?;
+    validate_cleanup_zero_regular_file(&cleanup.published_path)?;
+
+    let parent_metadata = cleanup_metadata_without_following(&cleanup.generations_parent)?;
+    validate_existing_directory(&parent_metadata, DurableOpenError::DurableStateCorrupt)?;
+    let generation_metadata = cleanup_metadata_without_following(&cleanup.generation_path)?;
+    validate_existing_directory(&generation_metadata, DurableOpenError::DurableStateCorrupt)?;
+
+    let mut entries =
+        read_cleanup_entries_bounded(&cleanup.generation_path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut has_head = false;
+    let mut has_definition = false;
+    for entry in entries {
+        if entry_has_name(&entry, "COMMITTED") {
+            // The marker's name alone makes this a committed candidate. Never inspect it as a
+            // fallback staging shape and never delete after seeing it.
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        let present = if entry_has_name(&entry, "head.json") {
+            &mut has_head
+        } else if entry_has_name(&entry, "definition.json") {
+            &mut has_definition
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        };
+        if *present {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        validate_cleanup_generation_document(&entry.path())?;
+        *present = true;
+    }
+
+    if has_head != cleanup.has_head || has_definition != cleanup.has_definition {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    Ok(CleanupPayloadSubset {
+        has_head,
+        has_definition,
+    })
+}
+
+fn finalize_deferred_generation_cleanup(
+    cleanup: &DeferredGenerationCleanup,
+    directory_sync: DirectorySync,
+    filesystem: &dyn CleanupFilesystem,
+) -> Result<(), DurableOpenError> {
+    // A partial prior cleanup is retried only after the next open scans anew and creates a new
+    // plan. This plan never accepts a payload-shape change from its initial scan.
+    let contents = revalidate_deferred_generation_cleanup(cleanup)?;
+    if contents.has_definition {
+        filesystem
+            .remove_file(&cleanup.generation_path.join("definition.json"))
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if contents.has_head {
+        filesystem
+            .remove_file(&cleanup.generation_path.join("head.json"))
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if directory_sync == DirectorySync::Supported {
+        filesystem
+            .sync_directory(&cleanup.generation_path, directory_sync)
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if filesystem.remove_dir(&cleanup.generation_path).is_err()
+        && !cleanup_candidate_is_absent_after_remove_dir_error(&cleanup.generation_path)
+    {
+        return Err(DurableOpenError::StorageUnavailable);
+    }
+    if directory_sync == DirectorySync::Supported {
+        filesystem
+            .sync_directory(&cleanup.generations_parent, directory_sync)
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    Ok(())
+}
+
+/// Reconciles only the ambiguous `remove_dir` result immediately after its error. Any existing
+/// entry or unreadable observation remains unavailable; initial revalidation never accepts this
+/// absence.
+fn cleanup_candidate_is_absent_after_remove_dir_error(path: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn cleanup_metadata_without_following(path: &Path) -> Result<fs::Metadata, DurableOpenError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(DurableOpenError::DurableStateCorrupt)
+        }
+        Err(_) => Err(DurableOpenError::StorageUnavailable),
+    }
+}
+
+fn validate_cleanup_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
+    let metadata = cleanup_metadata_without_following(path)?;
+    validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    if metadata.len() != 0 {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(())
+}
+
+fn validate_cleanup_generation_document(path: &Path) -> Result<(), DurableOpenError> {
+    let metadata = cleanup_metadata_without_following(path)?;
+    validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+    Ok(())
+}
+
+fn read_cleanup_entries_bounded(
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<DirEntry>, DurableOpenError> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        Err(_) => return Err(DurableOpenError::StorageUnavailable),
+    };
+    let mut bounded = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| DurableOpenError::StorageUnavailable)?;
+        if bounded.len() == maximum {
+            return Err(DurableOpenError::DurableStateTooLarge);
+        }
+        bounded.push(entry);
+    }
+    Ok(bounded)
+}
+
 fn metadata_without_following(path: &Path) -> Result<fs::Metadata, DurableOpenError> {
     fs::symlink_metadata(path).map_err(|_| DurableOpenError::StorageUnavailable)
 }
@@ -2056,6 +2477,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(unix)]
+    use std::collections::VecDeque;
+    #[cfg(unix)]
+    use std::sync::Mutex;
+
     use tokio::runtime::Handle;
 
     use super::{
@@ -2063,6 +2489,11 @@ mod tests {
         GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE, RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP,
         ROOT_ENTRY_CAP, RecoveryCaps, SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name,
         read_durable_document, read_entries_bounded, recover_marked_root_with_caps,
+    };
+    #[cfg(unix)]
+    use super::{
+        CleanupFilesystem, DirectorySync, classify_directory_sync, open_root,
+        open_root_with_cleanup_filesystem,
     };
     use crate::agent_session_lifecycle::{
         AgentStatus, ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle,
@@ -2113,6 +2544,110 @@ mod tests {
             if self.path.exists() {
                 fs::remove_dir_all(&self.path).expect("the test root is removed deterministically");
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CleanupOperation {
+        RemoveDefinition,
+        RemoveHead,
+        SyncCandidateDirectory,
+        RemoveCandidateDirectory,
+        SyncGenerationsDirectory,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CleanupFault {
+        Before(CleanupOperation),
+        After(CleanupOperation),
+    }
+
+    /// A deliberately narrow persistent fault adapter: it performs the real cleanup operation
+    /// against the same temporary root, then can report failure before or after that effect.
+    #[cfg(unix)]
+    struct DeterministicPersistentFaultFilesystem {
+        faults: Mutex<VecDeque<CleanupFault>>,
+        operations: Mutex<Vec<CleanupOperation>>,
+    }
+
+    #[cfg(unix)]
+    impl DeterministicPersistentFaultFilesystem {
+        fn new(faults: impl IntoIterator<Item = CleanupFault>) -> Self {
+            Self {
+                faults: Mutex::new(faults.into_iter().collect()),
+                operations: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn operations(&self) -> Vec<CleanupOperation> {
+            super::lock(&self.operations).clone()
+        }
+
+        fn perform(
+            &self,
+            operation: CleanupOperation,
+            action: impl FnOnce() -> std::io::Result<()>,
+        ) -> Result<(), ()> {
+            super::lock(&self.operations).push(operation);
+            let fault = {
+                let mut faults = super::lock(&self.faults);
+                match faults.front().copied() {
+                    Some(fault @ CleanupFault::Before(expected))
+                    | Some(fault @ CleanupFault::After(expected))
+                        if expected == operation =>
+                    {
+                        faults.pop_front();
+                        Some(fault)
+                    }
+                    _ => None,
+                }
+            };
+            if matches!(fault, Some(CleanupFault::Before(_))) {
+                return Err(());
+            }
+            action().map_err(|_| ())?;
+            if matches!(fault, Some(CleanupFault::After(_))) {
+                return Err(());
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    impl CleanupFilesystem for DeterministicPersistentFaultFilesystem {
+        fn remove_file(&self, path: &Path) -> Result<(), ()> {
+            let operation = match path.file_name().and_then(|name| name.to_str()) {
+                Some("definition.json") => CleanupOperation::RemoveDefinition,
+                Some("head.json") => CleanupOperation::RemoveHead,
+                _ => return Err(()),
+            };
+            self.perform(operation, || fs::remove_file(path))
+        }
+
+        fn remove_dir(&self, path: &Path) -> Result<(), ()> {
+            self.perform(CleanupOperation::RemoveCandidateDirectory, || {
+                fs::remove_dir(path)
+            })
+        }
+
+        fn sync_directory(&self, path: &Path, _directory_sync: DirectorySync) -> Result<(), ()> {
+            let operation = match path.file_name().and_then(|name| name.to_str()) {
+                Some("generations") => CleanupOperation::SyncGenerationsDirectory,
+                _ => CleanupOperation::SyncCandidateDirectory,
+            };
+            self.perform(operation, || {
+                #[cfg(unix)]
+                {
+                    std::fs::File::open(path).and_then(|directory| directory.sync_all())
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Ok(())
+                }
+            })
         }
     }
 
@@ -2636,6 +3171,54 @@ mod tests {
             create_file(&path.join("definition.json"), definition);
         }
         create_file(&path.join("COMMITTED"), b"");
+    }
+
+    fn create_markerless_agent_generation(
+        root: &Path,
+        agent_id: &str,
+        generation: &str,
+        head: Option<&[u8]>,
+        definition: Option<&[u8]>,
+    ) -> PathBuf {
+        let path = generation_path_named(root, agent_id, generation);
+        create_directory(&path);
+        if let Some(head) = head {
+            create_file(&path.join("head.json"), head);
+        }
+        if let Some(definition) = definition {
+            create_file(&path.join("definition.json"), definition);
+        }
+        path
+    }
+
+    fn create_markerless_session_generation(
+        root: &Path,
+        session_id: &str,
+        generation: &str,
+        head: Option<&[u8]>,
+        definition: Option<&[u8]>,
+    ) -> PathBuf {
+        let path = session_generation_path_named(root, session_id, generation);
+        create_directory(&path);
+        if let Some(head) = head {
+            create_file(&path.join("head.json"), head);
+        }
+        if let Some(definition) = definition {
+            create_file(&path.join("definition.json"), definition);
+        }
+        path
+    }
+
+    fn create_agent_both_payload_staging(root: &Path) -> PathBuf {
+        create_marked_empty_store(root);
+        create_valid_g1_agent(root);
+        create_markerless_agent_generation(
+            root,
+            AGENT_ONE,
+            GENERATION_TWO,
+            Some(b"interrupted head JSON"),
+            Some(b"interrupted definition JSON"),
+        )
     }
 
     fn g3_deleted_status_head() -> Vec<u8> {
@@ -3692,15 +4275,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn pending_markerless_trailing_generation_fails_closed_until_cleanup_is_implemented() {
+    async fn published_agent_markerless_trailing_generation_is_cleaned_before_catalog_install() {
         let root = TempRoot::existing();
         create_marked_empty_store(root.path());
         create_valid_g1_agent(root.path());
         let pending = generation_path_named(root.path(), AGENT_ONE, GENERATION_TWO);
         create_directory(&pending);
-        create_file(&pending.join("head.json"), agent_head_metadata_g2_fixture());
+        // A markerless payload is deliberately not decoded: this partial JSON may be an
+        // interrupted write and the prior committed G1 remains the recovered head.
+        create_file(&pending.join("head.json"), b"partial JSON is never decoded");
 
-        assert_corrupt(open(root.path()).await);
+        let state = open(root.path())
+            .await
+            .expect("the trailing uncommitted generation is deferred-cleaned");
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            1
+        );
+        assert!(
+            !pending.exists(),
+            "cleanup completes before the recovered catalog is installed"
+        );
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4081,7 +4681,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn generation_chain_namespace_requires_canonical_names_and_a_contiguous_g1_start() {
+    async fn generation_chain_namespace_requires_canonical_names_a_committed_g1_and_one_trailing_markerless_directory()
+     {
         let unpadded = TempRoot::existing();
         create_marked_empty_store(unpadded.path());
         create_valid_g1_agent(unpadded.path());
@@ -4114,7 +4715,20 @@ mod tests {
                 .join("generations")
                 .join("00000000000000000002"),
         );
-        assert_corrupt(open(multiple.path()).await);
+        let markerless = generation_path_named(multiple.path(), AGENT_ONE, GENERATION_TWO);
+        let state = open(multiple.path())
+            .await
+            .expect("one empty G2 staging directory is safely deferred-cleaned");
+        assert!(!markerless.exists());
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            1
+        );
+        state.close().await;
 
         let missing = TempRoot::existing();
         create_marked_empty_store(missing.path());
@@ -4832,7 +5446,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_g1_and_fork_recover_but_markerless_staging_fails_closed() {
+    async fn session_g1_and_fork_recover_and_markerless_staging_is_deferred_cleaned() {
         let fork = TempRoot::existing();
         create_marked_empty_store(fork.path());
         create_valid_g1_agent(fork.path());
@@ -4924,11 +5538,26 @@ mod tests {
         create_directory(&generation);
         create_file(
             &generation.join("head.json"),
-            b"markerless trailing bytes survive",
+            b"markerless partial JSON is never decoded",
         );
         let before = fs::read(generation.join("head.json")).unwrap();
-        assert_corrupt(open(markerless.path()).await);
-        assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+        let conversation = session_path(markerless.path(), SESSION_ONE).join("conversation.jsonl");
+        let conversation_before = fs::read(&conversation).unwrap();
+        let state = open(markerless.path())
+            .await
+            .expect("a published Session's trailing staging is deferred-cleaned");
+        assert_eq!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            1
+        );
+        assert!(!generation.exists());
+        assert_eq!(before, b"markerless partial JSON is never decoded");
+        assert_eq!(fs::read(&conversation).unwrap(), conversation_before);
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6258,5 +6887,856 @@ mod tests {
             ),
             Err(DurableOpenError::DurableStateTooLarge)
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_agent_all_markerless_payload_subsets_cleanup_and_reopen() {
+        for (name, has_head, has_definition) in [
+            ("empty", false, false),
+            ("head only", true, false),
+            ("definition only", false, true),
+            ("both", true, true),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let staging = create_markerless_agent_generation(
+                root.path(),
+                AGENT_ONE,
+                GENERATION_TWO,
+                has_head.then_some(b"partial Agent head JSON".as_slice()),
+                has_definition.then_some(b"partial Agent definition JSON".as_slice()),
+            );
+            let reservation = root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE);
+            let published = agent_path(root.path(), AGENT_ONE).join("PUBLISHED");
+            let committed = generation_path(root.path(), AGENT_ONE);
+
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} trailing Agent subset opens: {error:?}"));
+            assert_eq!(
+                state
+                    .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                    .unwrap()
+                    .storage_generation()
+                    .get(),
+                1
+            );
+            assert!(
+                !staging.exists(),
+                "{name} staging is gone before catalog install"
+            );
+            assert!(reservation.is_file(), "the permanent reservation survives");
+            assert!(published.is_file(), "PUBLISHED survives");
+            assert!(
+                committed.join("COMMITTED").is_file(),
+                "G1 remains committed"
+            );
+            state.close().await;
+
+            let reopened = open(root.path()).await.unwrap_or_else(|error| {
+                panic!("{name} cleanup leaves a reopenable store: {error:?}")
+            });
+            assert_eq!(
+                reopened
+                    .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                    .unwrap()
+                    .storage_generation()
+                    .get(),
+                1
+            );
+            reopened.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_session_all_markerless_payload_subsets_cleanup_without_touching_conversation()
+     {
+        for (name, has_head, has_definition) in [
+            ("empty", false, false),
+            ("head only", true, false),
+            ("definition only", false, true),
+            ("both", true, true),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let conversation = b"opaque Session conversation bytes must survive";
+            create_valid_g1_session(root.path(), conversation);
+            let conversation_path =
+                session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+            let before = fs::read(&conversation_path).unwrap();
+            let staging = create_markerless_session_generation(
+                root.path(),
+                SESSION_ONE,
+                GENERATION_TWO,
+                has_head.then_some(b"partial Session head JSON".as_slice()),
+                has_definition.then_some(b"partial Session definition JSON".as_slice()),
+            );
+
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} trailing Session subset opens: {error:?}"));
+            assert_eq!(
+                state
+                    .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                    .unwrap()
+                    .storage_generation()
+                    .get(),
+                1
+            );
+            assert!(!staging.exists(), "{name} Session staging is removed");
+            assert_eq!(fs::read(&conversation_path).unwrap(), before);
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn committed_g1_g2_prefix_recovers_old_head_after_g3_staging_for_agent_and_session() {
+        let agent_root = TempRoot::existing();
+        create_marked_empty_store(agent_root.path());
+        create_valid_g1_agent(agent_root.path());
+        create_agent_generation(
+            agent_root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_metadata_g2_fixture(),
+            None,
+        );
+        let agent_staging = create_markerless_agent_generation(
+            agent_root.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            Some(b"G3 partial Agent head"),
+            Some(b"G3 partial Agent definition"),
+        );
+        let state = open(agent_root.path())
+            .await
+            .expect("the committed Agent G1/G2 prefix survives G3 staging");
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            2
+        );
+        assert!(!agent_staging.exists());
+        assert!(
+            generation_path_named(agent_root.path(), AGENT_ONE, GENERATION_TWO)
+                .join("COMMITTED")
+                .is_file()
+        );
+        state.close().await;
+
+        let session_root = TempRoot::existing();
+        create_marked_empty_store(session_root.path());
+        create_valid_g1_agent(session_root.path());
+        create_valid_g1_session(session_root.path(), b"opaque committed Session bytes");
+        create_session_generation(
+            session_root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_metadata_g2_fixture(),
+            None,
+        );
+        let session_staging = create_markerless_session_generation(
+            session_root.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            Some(b"G3 partial Session head"),
+            None,
+        );
+        let state = open(session_root.path())
+            .await
+            .expect("the committed Session G1/G2 prefix survives G3 staging");
+        assert_eq!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .storage_generation()
+                .get(),
+            2
+        );
+        assert!(!session_staging.exists());
+        assert!(
+            session_generation_path_named(session_root.path(), SESSION_ONE, GENERATION_TWO)
+                .join("COMMITTED")
+                .is_file()
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_conversation_bytes_are_untouched_by_child_markerless_generation_cleanup() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"source opaque bytes");
+        let child_definition = fork_session_definition_fixture();
+        create_exact_g1_session(
+            root.path(),
+            SESSION_TWO,
+            fork_session_head_fixture(),
+            &child_definition,
+            b"child opaque bytes",
+        );
+        let source_conversation = session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+        let child_conversation = session_path(root.path(), SESSION_TWO).join("conversation.jsonl");
+        let source_before = fs::read(&source_conversation).unwrap();
+        let child_before = fs::read(&child_conversation).unwrap();
+        let staging = create_markerless_session_generation(
+            root.path(),
+            SESSION_TWO,
+            GENERATION_TWO,
+            Some(b"child partial JSON"),
+            Some(b"child partial JSON"),
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("the child tail does not make the Fork conversation writable or readable");
+        assert!(!staging.exists());
+        assert_eq!(fs::read(&source_conversation).unwrap(), source_before);
+        assert_eq!(fs::read(&child_conversation).unwrap(), child_before);
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn markerless_generation_order_and_committed_marker_fail_closed_without_cleanup() {
+        let gap = TempRoot::existing();
+        create_marked_empty_store(gap.path());
+        create_valid_g1_agent(gap.path());
+        let gap_staging =
+            create_markerless_agent_generation(gap.path(), AGENT_ONE, GENERATION_THREE, None, None);
+        assert_corrupt(open(gap.path()).await);
+        assert!(gap_staging.exists(), "a G3 gap is never removed");
+
+        let multiple = TempRoot::existing();
+        create_marked_empty_store(multiple.path());
+        create_valid_g1_agent(multiple.path());
+        let first = create_markerless_agent_generation(
+            multiple.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        let second = create_markerless_agent_generation(
+            multiple.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            None,
+            None,
+        );
+        assert_corrupt(open(multiple.path()).await);
+        assert!(
+            first.exists() && second.exists(),
+            "multiple tails are never partly removed"
+        );
+
+        let after_markerless = TempRoot::existing();
+        create_marked_empty_store(after_markerless.path());
+        create_valid_g1_agent(after_markerless.path());
+        let staging = create_markerless_agent_generation(
+            after_markerless.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        create_agent_generation(
+            after_markerless.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            b"a later committed payload must not be decoded as fallback",
+            None,
+        );
+        assert_corrupt(open(after_markerless.path()).await);
+        assert!(
+            staging.exists(),
+            "a committed generation after staging prevents cleanup"
+        );
+
+        for (name, head) in [
+            ("missing committed payload", None),
+            (
+                "invalid committed payload",
+                Some(b"not canonical JSON".as_slice()),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let committed = create_markerless_agent_generation(
+                root.path(),
+                AGENT_ONE,
+                GENERATION_TWO,
+                head,
+                None,
+            );
+            create_file(&committed.join("COMMITTED"), b"");
+            assert_corrupt(open(root.path()).await);
+            assert!(committed.exists(), "{name} stays in place for diagnosis");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn markerless_shape_missing_visibility_and_terminal_heads_fail_closed_without_cleanup() {
+        let unknown = TempRoot::existing();
+        create_marked_empty_store(unknown.path());
+        create_valid_g1_agent(unknown.path());
+        let staging = create_markerless_agent_generation(
+            unknown.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        create_file(&staging.join("unknown"), b"");
+        assert_corrupt(open(unknown.path()).await);
+        assert!(staging.exists());
+
+        let type_mismatch = TempRoot::existing();
+        create_marked_empty_store(type_mismatch.path());
+        create_valid_g1_agent(type_mismatch.path());
+        let staging = create_markerless_agent_generation(
+            type_mismatch.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        create_directory(&staging.join("head.json"));
+        assert_corrupt(open(type_mismatch.path()).await);
+        assert!(staging.exists());
+
+        let oversized = TempRoot::existing();
+        create_marked_empty_store(oversized.path());
+        create_valid_g1_agent(oversized.path());
+        let staging = create_markerless_agent_generation(
+            oversized.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            Some(&vec![b'x'; super::MAX_DURABLE_DOCUMENT_BYTES + 1]),
+            None,
+        );
+        assert!(matches!(
+            open(oversized.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(staging.exists());
+
+        let missing_reservation = TempRoot::existing();
+        create_marked_empty_store(missing_reservation.path());
+        create_valid_g1_agent(missing_reservation.path());
+        let staging = create_markerless_agent_generation(
+            missing_reservation.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        fs::remove_file(
+            missing_reservation
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+        )
+        .unwrap();
+        assert_corrupt(open(missing_reservation.path()).await);
+        assert!(staging.exists());
+
+        let missing_published = TempRoot::existing();
+        create_marked_empty_store(missing_published.path());
+        create_valid_g1_agent(missing_published.path());
+        let staging = create_markerless_agent_generation(
+            missing_published.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        fs::remove_file(agent_path(missing_published.path(), AGENT_ONE).join("PUBLISHED")).unwrap();
+        assert_corrupt(open(missing_published.path()).await);
+        assert!(staging.exists());
+
+        let deleted_agent = TempRoot::existing();
+        create_marked_empty_store(deleted_agent.path());
+        create_valid_g1_agent(deleted_agent.path());
+        create_agent_generation(
+            deleted_agent.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"status\":\"disabled\"",
+                "\"status\":\"deleted\"",
+            ),
+            None,
+        );
+        let staging = create_markerless_agent_generation(
+            deleted_agent.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            None,
+            None,
+        );
+        assert_corrupt(open(deleted_agent.path()).await);
+        assert!(staging.exists());
+
+        let deleted_session = TempRoot::existing();
+        create_marked_empty_store(deleted_session.path());
+        create_ordinary_session_chain_through_g3_deleted(deleted_session.path());
+        let staging = create_markerless_session_generation(
+            deleted_session.path(),
+            SESSION_ONE,
+            GENERATION_FOUR,
+            None,
+            None,
+        );
+        assert_corrupt(open(deleted_session.path()).await);
+        assert!(staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn markerless_link_and_wrong_mode_are_corrupt_without_cleanup() {
+        use std::os::unix::fs::symlink;
+
+        let linked = TempRoot::existing();
+        create_marked_empty_store(linked.path());
+        create_valid_g1_agent(linked.path());
+        let staging = create_markerless_agent_generation(
+            linked.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        let target_root = TempRoot::existing();
+        let target = target_root.path().join("markerless-head-target");
+        create_file(&target, b"partial");
+        symlink(&target, staging.join("head.json")).unwrap();
+        assert_corrupt(open(linked.path()).await);
+        assert!(staging.exists());
+
+        let wrong_mode = TempRoot::existing();
+        create_marked_empty_store(wrong_mode.path());
+        create_valid_g1_agent(wrong_mode.path());
+        let staging = create_markerless_agent_generation(
+            wrong_mode.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            Some(b"partial"),
+            None,
+        );
+        set_unix_mode(&staging.join("head.json"), 0o644);
+        assert_corrupt(open(wrong_mode.path()).await);
+        assert!(staging.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_staging_or_later_semantic_corruption_prevents_all_cleanup() {
+        let multiple = TempRoot::existing();
+        create_marked_empty_store(multiple.path());
+        create_valid_g1_agent(multiple.path());
+        create_exact_g1_agent(
+            multiple.path(),
+            AGENT_TWO,
+            &replace_fixture(agent_head_fixture(), AGENT_ONE, AGENT_TWO),
+            &replace_fixture(agent_definition_fixture(), AGENT_ONE, AGENT_TWO),
+        );
+        let first = create_markerless_agent_generation(
+            multiple.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        let second = create_markerless_agent_generation(
+            multiple.path(),
+            AGENT_TWO,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        assert_corrupt(open(multiple.path()).await);
+        assert!(first.exists() && second.exists());
+
+        let later_semantic_corruption = TempRoot::existing();
+        create_marked_empty_store(later_semantic_corruption.path());
+        create_valid_g1_agent(later_semantic_corruption.path());
+        let first = create_markerless_agent_generation(
+            later_semantic_corruption.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        create_exact_g1_agent(
+            later_semantic_corruption.path(),
+            AGENT_TWO,
+            b"invalid later Agent head",
+            &replace_fixture(agent_definition_fixture(), AGENT_ONE, AGENT_TWO),
+        );
+        assert_corrupt(open(later_semantic_corruption.path()).await);
+        assert!(
+            first.exists(),
+            "the first candidate remains when a later entity fails semantic recovery"
+        );
+    }
+
+    #[test]
+    fn cleanup_revalidation_rejects_marker_child_and_payload_shape_changes_without_deleting() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let staging =
+            create_markerless_agent_generation(root.path(), AGENT_ONE, GENERATION_TWO, None, None);
+        let root_entries = read_entries_bounded(root.path(), ROOT_ENTRY_CAP).unwrap();
+        let cleanup = super::recover_marked_root(root.path(), &root_entries)
+            .unwrap()
+            .cleanup
+            .expect("the empty staging directory produces a cleanup plan");
+        drop(root_entries);
+        assert!(!cleanup.has_head && !cleanup.has_definition);
+        let debug = format!("{cleanup:?}");
+        assert!(!debug.contains("minicore-durable-state-"));
+        assert!(!debug.contains(AGENT_ONE));
+
+        create_file(&staging.join("COMMITTED"), b"");
+        assert!(matches!(
+            super::finalize_deferred_generation_cleanup(
+                &cleanup,
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(staging.exists(), "a newly observed marker is never deleted");
+
+        fs::remove_file(staging.join("COMMITTED")).unwrap();
+        create_file(&staging.join("unknown"), b"");
+        assert!(matches!(
+            super::finalize_deferred_generation_cleanup(
+                &cleanup,
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            staging.exists(),
+            "a malformed revalidation shape is never deleted"
+        );
+
+        fs::remove_file(staging.join("unknown")).unwrap();
+        create_file(&staging.join("head.json"), agent_head_metadata_g2_fixture());
+        assert!(matches!(
+            super::finalize_deferred_generation_cleanup(
+                &cleanup,
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            staging.join("head.json").is_file(),
+            "a legal head added after an empty scan is never deleted"
+        );
+
+        fs::remove_file(staging.join("head.json")).unwrap();
+        create_file(&staging.join("head.json"), agent_head_metadata_g2_fixture());
+        create_file(
+            &staging.join("definition.json"),
+            agent_definition_g2_fixture(),
+        );
+        let root_entries = read_entries_bounded(root.path(), ROOT_ENTRY_CAP).unwrap();
+        let both_cleanup = super::recover_marked_root(root.path(), &root_entries)
+            .unwrap()
+            .cleanup
+            .expect("the complete staging subset produces a cleanup plan");
+        drop(root_entries);
+        assert!(both_cleanup.has_head && both_cleanup.has_definition);
+        fs::remove_file(staging.join("head.json")).unwrap();
+        assert!(matches!(
+            super::finalize_deferred_generation_cleanup(
+                &both_cleanup,
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            staging.exists(),
+            "a changed both-payload plan is never deleted"
+        );
+        assert!(
+            staging.join("definition.json").is_file(),
+            "the remaining legal child is never deleted after shape drift"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_faults_are_persistent_ordered_and_retryable() {
+        let before_definition = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(before_definition.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::Before(
+            CleanupOperation::RemoveDefinition,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(before_definition.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(staging.join("definition.json").exists());
+        assert!(staging.join("head.json").exists());
+        assert_eq!(
+            filesystem.operations(),
+            [CleanupOperation::RemoveDefinition]
+        );
+
+        let after_definition = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(after_definition.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::After(
+            CleanupOperation::RemoveDefinition,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(after_definition.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(!staging.join("definition.json").exists());
+        assert!(staging.join("head.json").exists());
+        assert_eq!(
+            filesystem.operations(),
+            [CleanupOperation::RemoveDefinition]
+        );
+        let reopened = open_root(after_definition.path().to_owned())
+            .expect("LocalFilesystem retries the post-effect partial cleanup");
+        assert!(!staging.exists());
+        drop(reopened);
+
+        let before_head = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(before_head.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::Before(
+            CleanupOperation::RemoveHead,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(before_head.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(!staging.join("definition.json").exists());
+        assert!(staging.join("head.json").exists());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead
+            ]
+        );
+        drop(open_root(before_head.path().to_owned()).expect("head-removal retry opens"));
+        assert!(!staging.exists());
+
+        let after_head = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(after_head.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::After(
+            CleanupOperation::RemoveHead,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(after_head.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(!staging.join("definition.json").exists());
+        assert!(!staging.join("head.json").exists());
+        assert!(staging.is_dir());
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+            ]
+        );
+        drop(open_root(after_head.path().to_owned()).expect("post-head-removal retry opens"));
+        assert!(!staging.exists());
+
+        let before_remove_dir = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(before_remove_dir.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::Before(
+            CleanupOperation::RemoveCandidateDirectory,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(before_remove_dir.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(staging.is_dir());
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+            ]
+        );
+        drop(open_root(before_remove_dir.path().to_owned()).expect("remove-dir retry opens"));
+        assert!(!staging.exists());
+
+        let before_sync = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(before_sync.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::Before(
+            CleanupOperation::SyncCandidateDirectory,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(before_sync.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(staging.is_dir());
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+            ]
+        );
+        drop(open_root(before_sync.path().to_owned()).expect("sync retry opens"));
+        assert!(!staging.exists());
+
+        let after_sync_candidate = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(after_sync_candidate.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::After(
+            CleanupOperation::SyncCandidateDirectory,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(after_sync_candidate.path().to_owned(), &filesystem),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(staging.is_dir());
+        assert!(fs::read_dir(&staging).unwrap().next().is_none());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+            ]
+        );
+        drop(
+            open_root(after_sync_candidate.path().to_owned())
+                .expect("post-candidate-sync retry opens"),
+        );
+        assert!(!staging.exists());
+
+        let after_remove_dir = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(after_remove_dir.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::After(
+            CleanupOperation::RemoveCandidateDirectory,
+        )]);
+        let opened =
+            open_root_with_cleanup_filesystem(after_remove_dir.path().to_owned(), &filesystem)
+                .expect("an absent readback reconciles the post-effect remove-dir failure");
+        assert!(!staging.exists());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+            ]
+        );
+        drop(opened);
+        drop(
+            open_root(after_remove_dir.path().to_owned())
+                .expect("reconciled remove-dir cleanup leaves a reopenable store"),
+        );
+
+        let before_generations_sync = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(before_generations_sync.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::Before(
+            CleanupOperation::SyncGenerationsDirectory,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(
+                before_generations_sync.path().to_owned(),
+                &filesystem,
+            ),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(!staging.exists());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+            ]
+        );
+        drop(
+            open_root(before_generations_sync.path().to_owned())
+                .expect("missing candidate after pre-sync failure reopens"),
+        );
+
+        let after_generations_sync = TempRoot::existing();
+        let staging = create_agent_both_payload_staging(after_generations_sync.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([CleanupFault::After(
+            CleanupOperation::SyncGenerationsDirectory,
+        )]);
+        assert!(matches!(
+            open_root_with_cleanup_filesystem(
+                after_generations_sync.path().to_owned(),
+                &filesystem,
+            ),
+            Err(DurableOpenError::StorageUnavailable)
+        ));
+        assert!(!staging.exists());
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+            ]
+        );
+        drop(
+            open_root(after_generations_sync.path().to_owned())
+                .expect("missing candidate after post-sync failure reopens"),
+        );
+
+        let ordered = TempRoot::existing();
+        create_agent_both_payload_staging(ordered.path());
+        let filesystem = DeterministicPersistentFaultFilesystem::new([]);
+        let opened = open_root_with_cleanup_filesystem(ordered.path().to_owned(), &filesystem)
+            .expect("the faultless cleanup succeeds");
+        drop(opened);
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+            ]
+        );
+        assert_eq!(
+            classify_directory_sync(ordered.path()).unwrap(),
+            DirectorySync::Supported,
+            "the Unix deterministic adapter verifies both required directory sync points"
+        );
     }
 }
