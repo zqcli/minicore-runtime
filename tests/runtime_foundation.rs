@@ -173,6 +173,31 @@ fn create_published_g1_session(root: &Path, conversation: &[u8]) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
+fn create_published_g1_fork_session(root: &Path, conversation: &[u8]) {
+    const SESSION_ID: &str = "ses_33333333333333333333333333333333";
+    const GENERATION_ONE: &str = "00000000000000000001";
+
+    create_private_file(&root.join("reservations/sessions").join(SESSION_ID), b"");
+    let entity = root.join("sessions").join(SESSION_ID);
+    create_private_directory(&entity);
+    create_private_file(&entity.join("PUBLISHED"), b"");
+    create_private_file(&entity.join("conversation.jsonl"), conversation);
+    create_private_directory(&entity.join("generations"));
+    let generation = entity.join("generations").join(GENERATION_ONE);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-session-head.json"),
+    );
+    create_private_file(
+        &generation.join("definition.json"),
+        &session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/fork-session-definition.json"
+        )),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 fn create_published_g2_session_definition_generation(root: &Path) {
     const SESSION_ID: &str = "ses_22222222222222222222222222222222";
     const GENERATION_TWO: &str = "00000000000000000002";
@@ -313,6 +338,87 @@ async fn public_runtime_recovers_an_ordinary_g1_session_and_preserves_invalid_co
         before,
         "store recovery leaves all conversation bytes untouched"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_recovers_fork_without_touching_invalid_conversations() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    let source_conversation = b"\xff source invalid conversation bytes\x00\n";
+    let child_conversation = b"\xfe child invalid conversation bytes\x00\n";
+    create_published_g1_session(root.path(), source_conversation);
+    create_published_g1_fork_session(root.path(), child_conversation);
+    let source_path = root
+        .path()
+        .join("sessions/ses_22222222222222222222222222222222/conversation.jsonl");
+    let child_path = root
+        .path()
+        .join("sessions/ses_33333333333333333333333333333333/conversation.jsonl");
+    let source_before = fs::read(&source_path).expect("the source conversation is readable");
+    let child_before = fs::read(&child_path).expect("the child conversation is readable");
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the public runtime recovers the ordinary source and Fork child");
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the recovered source and Fork child reopen publicly");
+    reopened.shutdown().await;
+
+    assert_eq!(
+        fs::read(source_path).expect("the source conversation remains readable"),
+        source_before
+    );
+    assert_eq!(
+        fs::read(child_path).expect("the child conversation remains readable"),
+        child_before
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_redacts_a_fork_with_a_missing_published_source() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_private_file(
+        &root
+            .path()
+            .join("reservations/sessions/ses_22222222222222222222222222222222"),
+        b"",
+    );
+    create_published_g1_fork_session(
+        root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl"),
+    );
+    let private_root = root.path().to_string_lossy();
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a Fork source reservation is not a published Session catalog entry");
+
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+    for secret in [
+        private_root.as_ref(),
+        "ses_22222222222222222222222222222222",
+        "ses_33333333333333333333333333333333",
+        "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "session-notes",
+        "hello",
+    ] {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+    assert!(Error::source(&error).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
