@@ -363,7 +363,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ### M5.0 DurableState / async foundation implementation
 
-设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。下一任务精确交付：
+设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。过渡性的 reservation-only implementation/test 只能证明永久 reservation phase 的基础，不得宣称完整 Create/Fork crash matrix 或 complete-or-invisible 行已经通过。下一任务精确交付：
 
 - private `DurableStateActor`、immutable catalog snapshots/capabilities、poison/closing state和all mutation/catalog-head serialization；
 - permanent CSPRNG-ID reservation (`create_new`，32 definite collision cap)、root `.minicore.lock` fs4 exclusive lease、strict user-private local filesystem validation和no-follow link/reparse/case-alias handling；
