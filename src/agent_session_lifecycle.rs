@@ -10,7 +10,7 @@ use crate::wire::{
     AgentId, AgentMetadataRevision, AgentRevision, ItemId, ProtocolLimits,
     SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
 };
-use crate::workspace::Workspace;
+use crate::workspace::{Workspace, workspaces_have_same_semantic_content};
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AgentDefinition {
@@ -336,6 +336,19 @@ impl fmt::Debug for SessionDefinition {
     }
 }
 
+/// Compares the execution-affecting content of Session definitions. Session identity,
+/// definition revision, WorkspaceRevision, and definition timestamp are owner/version facts,
+/// deliberately excluded from canonical no-op detection.
+pub(crate) fn session_definitions_have_same_canonical_execution_content(
+    first: &SessionDefinition,
+    second: &SessionDefinition,
+) -> bool {
+    first.agent() == second.agent()
+        && workspaces_have_same_semantic_content(first.workspace(), second.workspace())
+        && first.model() == second.model()
+        && first.prompts() == second.prompts()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SessionMetadataError {
     #[error("session metadata name must be non-empty")]
@@ -419,6 +432,15 @@ impl fmt::Debug for SessionMetadata {
     }
 }
 
+/// Compares canonical Session metadata content while excluding its independent CAS revision and
+/// millisecond-truncated update timestamp.
+pub(crate) fn session_metadata_has_same_canonical_content(
+    first: &SessionMetadata,
+    second: &SessionMetadata,
+) -> bool {
+    first.name() == second.name() && first.description() == second.description()
+}
+
 fn normalize_session_metadata_text(
     value: &str,
     maximum: usize,
@@ -436,6 +458,22 @@ pub enum SessionLifecycle {
     Open,
     Archived,
     Deleted,
+}
+
+/// Returns whether one persisted ordinary Session lifecycle may directly follow another.
+/// `Deleted` is terminal and same-lifecycle writes are canonical no-ops.
+pub(crate) const fn is_legal_session_lifecycle_transition(
+    previous: SessionLifecycle,
+    next: SessionLifecycle,
+) -> bool {
+    matches!(
+        (previous, next),
+        (SessionLifecycle::Open, SessionLifecycle::Archived)
+            | (
+                SessionLifecycle::Archived,
+                SessionLifecycle::Open | SessionLifecycle::Deleted
+            )
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

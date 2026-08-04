@@ -387,6 +387,27 @@ impl fmt::Debug for Workspace {
     }
 }
 
+/// Compares only the durable Workspace definition content. `WorkspaceRevision` is an owner
+/// version, not part of the semantic value it versions.
+pub(crate) fn workspaces_have_same_semantic_content(first: &Workspace, second: &Workspace) -> bool {
+    first.primary_root() == second.primary_root()
+        && first.additional_roots() == second.additional_roots()
+        && first.cwd() == second.cwd()
+}
+
+/// Validates the typed Workspace owner transition: unchanged semantic content retains exactly
+/// its revision, while changed content advances it by exactly one.
+pub(crate) fn workspace_revision_transition_is_valid(
+    previous: &Workspace,
+    next: &Workspace,
+) -> bool {
+    if workspaces_have_same_semantic_content(previous, next) {
+        previous.revision() == next.revision()
+    } else {
+        previous.revision().get().checked_add(1) == Some(next.revision().get())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum WorkspaceInputLoweringError {
     #[error("workspace input uses an unsupported host path family")]

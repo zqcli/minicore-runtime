@@ -13,14 +13,19 @@ use crate::agent_session_lifecycle::{
     AgentDefinition, AgentMetadata, AgentStatus, SessionDefinition, SessionForkProvenance,
     SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
+    is_legal_session_lifecycle_transition,
+    session_definitions_have_same_canonical_execution_content,
+    session_metadata_has_same_canonical_content,
 };
 use crate::runtime_task::RuntimeTaskContext;
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
 };
 use crate::wire::{
-    AgentId, AgentMetadataRevision, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp,
+    AgentId, AgentMetadataRevision, AgentRevision, SessionDefinitionRevision, SessionId,
+    SessionMetadataRevision, Timestamp,
 };
+use crate::workspace::workspace_revision_transition_is_valid;
 
 const LOCK_FILE: &str = ".minicore.lock";
 const FORMAT_MARKER: &str = "MINICORE_STORE_V1";
@@ -406,8 +411,9 @@ impl fmt::Debug for DurableAgentCatalogEntry {
     }
 }
 
-/// One recovered Session's immutable current facts. This initial recovery slice supports only
-/// ordinary generation one Sessions, so no historical Session-definition index is needed yet.
+/// One recovered Session's immutable current facts. Rolling adjacent-generation validation
+/// carries the current definition forward, and Store V1 has no separately addressable durable
+/// historical Session reference, so the catalog deliberately needs no historical Session index.
 struct DurableSessionCatalogEntry {
     current_head: Arc<DurableSessionHead>,
     current_definition: Arc<SessionDefinition>,
@@ -1067,10 +1073,9 @@ fn recover_agents(
     Ok(agents)
 }
 
-/// Recovers the initially-supported catalog of ordinary, committed generation-one Sessions.
-/// Agent recovery is deliberately complete before this function runs so each Session pin can be
-/// checked against the retained Agent definition index rather than an Agent's mutable current
-/// definition or status.
+/// Recovers ordinary, committed Session chains. Agent recovery is deliberately complete before
+/// this function runs so every Session pin can be checked against the retained exact Agent
+/// definition index rather than an Agent's mutable current definition or status.
 fn recover_sessions(
     entity_generations: BTreeMap<SessionId, PathBuf>,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
@@ -1078,8 +1083,12 @@ fn recover_sessions(
 ) -> Result<BTreeMap<SessionId, DurableSessionCatalogEntry>, DurableOpenError> {
     let mut sessions = BTreeMap::new();
     for (session_id, generations) in entity_generations {
-        let entry =
-            recover_ordinary_session_g1(&generations, session_id, agents, generation_maximum)?;
+        let entry = recover_ordinary_session_generation_chain(
+            &generations,
+            session_id,
+            agents,
+            generation_maximum,
+        )?;
         if sessions.insert(session_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
@@ -1087,7 +1096,7 @@ fn recover_sessions(
     Ok(sessions)
 }
 
-fn recover_ordinary_session_g1(
+fn recover_ordinary_session_generation_chain(
     path: &Path,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
@@ -1105,24 +1114,64 @@ fn recover_ordinary_session_g1(
         validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
     }
 
-    let [(generation, entry)] = generation_entries.as_slice() else {
+    let mut generations = generation_entries.into_iter();
+    let Some((first_generation, first_entry)) = generations.next() else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
-    if generation.get() != 1 {
+    if first_generation.get() != 1 {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    let (head, definition) = recover_session_generation_payload(&entry.path())?;
-    validate_ordinary_session_generation_one(session_id, *generation, &head, &definition, agents)?;
+
+    let (first_head, Some(first_definition)) =
+        recover_session_generation_payload(&first_entry.path())?
+    else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    validate_ordinary_session_generation_one(
+        session_id,
+        first_generation,
+        &first_head,
+        &first_definition,
+        agents,
+    )?;
+
+    let mut current_head = first_head;
+    let mut current_definition = first_definition;
+    for (generation, generation_entry) in generations {
+        if generation.get()
+            != current_head
+                .storage_generation()
+                .get()
+                .checked_add(1)
+                .ok_or(DurableOpenError::DurableStateCorrupt)?
+        {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        let (head, definition) = recover_session_generation_payload(&generation_entry.path())?;
+        validate_ordinary_session_generation_transition(
+            session_id,
+            generation,
+            &current_head,
+            &current_definition,
+            &head,
+            definition.as_ref(),
+            agents,
+        )?;
+        if let Some(definition) = definition {
+            current_definition = definition;
+        }
+        current_head = head;
+    }
 
     Ok(DurableSessionCatalogEntry {
-        current_head: Arc::new(head),
-        current_definition: Arc::new(definition),
+        current_head: Arc::new(current_head),
+        current_definition: Arc::new(current_definition),
     })
 }
 
 fn recover_session_generation_payload(
     path: &Path,
-) -> Result<(DurableSessionHead, SessionDefinition), DurableOpenError> {
+) -> Result<(DurableSessionHead, Option<SessionDefinition>), DurableOpenError> {
     let mut entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
     entries.sort_unstable_by_key(|entry| entry.file_name());
     let mut head_path = None;
@@ -1140,16 +1189,17 @@ fn recover_session_generation_payload(
             return Err(DurableOpenError::DurableStateCorrupt);
         }
     }
-    let (Some(head_path), Some(definition_path)) = (head_path, definition_path) else {
+    let Some(head_path) = head_path else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
     if !committed {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    Ok((
-        decode_session_head_document(&head_path)?,
-        decode_session_definition_document(&definition_path)?,
-    ))
+    let definition = definition_path
+        .as_deref()
+        .map(decode_session_definition_document)
+        .transpose()?;
+    Ok((decode_session_head_document(&head_path)?, definition))
 }
 
 fn validate_ordinary_session_generation_one(
@@ -1182,6 +1232,120 @@ fn validate_ordinary_session_generation_one(
         return Err(DurableOpenError::DurableStateCorrupt);
     }
     Ok(())
+}
+
+fn validate_ordinary_session_generation_transition(
+    path_session_id: SessionId,
+    path_generation: StorageGeneration,
+    previous_head: &DurableSessionHead,
+    current_definition: &SessionDefinition,
+    head: &DurableSessionHead,
+    definition: Option<&SessionDefinition>,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+) -> Result<(), DurableOpenError> {
+    if head.session_id() != path_session_id
+        || head.storage_generation() != path_generation
+        || head.previous_storage_generation() != Some(previous_head.storage_generation())
+        || previous_head.lifecycle() == SessionLifecycle::Deleted
+        || previous_head.fork_provenance().is_some()
+        || head.fork_provenance().is_some()
+        || head.created_at() != previous_head.created_at()
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    match definition {
+        Some(definition) => validate_session_definition_transition(
+            path_session_id,
+            path_generation,
+            previous_head,
+            current_definition,
+            head,
+            definition,
+            agents,
+        ),
+        None if session_metadata_transition_is_valid(previous_head, head) => Ok(()),
+        None if session_lifecycle_transition_is_valid(previous_head, head) => Ok(()),
+        None => Err(DurableOpenError::DurableStateCorrupt),
+    }
+}
+
+fn validate_session_definition_transition(
+    path_session_id: SessionId,
+    path_generation: StorageGeneration,
+    previous_head: &DurableSessionHead,
+    current_definition: &SessionDefinition,
+    head: &DurableSessionHead,
+    definition: &SessionDefinition,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+) -> Result<(), DurableOpenError> {
+    let agent = definition.agent();
+    let retained_agent_definition = agents
+        .get(&agent.agent_id())
+        .is_some_and(|entry| entry.definition_index.contains_key(&agent.revision()));
+    if previous_head.lifecycle() != SessionLifecycle::Open
+        || current_definition.session_id() != path_session_id
+        || current_definition.revision() != previous_head.current_definition_revision()
+        || definition.session_id() != path_session_id
+        || definition.agent().agent_id() != current_definition.agent().agent_id()
+        || !retained_agent_definition
+        || !is_exact_next_session_definition_revision(
+            previous_head.current_definition_revision(),
+            head.current_definition_revision(),
+        )
+        || definition.revision() != head.current_definition_revision()
+        || head.current_definition_storage_generation() != path_generation
+        || !workspace_revision_transition_is_valid(
+            current_definition.workspace(),
+            definition.workspace(),
+        )
+        || session_definitions_have_same_canonical_execution_content(current_definition, definition)
+        || head.metadata() != previous_head.metadata()
+        || head.lifecycle() != previous_head.lifecycle()
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(())
+}
+
+fn session_metadata_transition_is_valid(
+    previous_head: &DurableSessionHead,
+    head: &DurableSessionHead,
+) -> bool {
+    head.current_definition_revision() == previous_head.current_definition_revision()
+        && head.current_definition_storage_generation()
+            == previous_head.current_definition_storage_generation()
+        && is_exact_next_session_metadata_revision(
+            previous_head.metadata().revision(),
+            head.metadata().revision(),
+        )
+        && !session_metadata_has_same_canonical_content(previous_head.metadata(), head.metadata())
+        && head.lifecycle() == previous_head.lifecycle()
+}
+
+fn session_lifecycle_transition_is_valid(
+    previous_head: &DurableSessionHead,
+    head: &DurableSessionHead,
+) -> bool {
+    head.current_definition_revision() == previous_head.current_definition_revision()
+        && head.current_definition_storage_generation()
+            == previous_head.current_definition_storage_generation()
+        && head.metadata() == previous_head.metadata()
+        && is_legal_session_lifecycle_transition(previous_head.lifecycle(), head.lifecycle())
+}
+
+fn is_exact_next_session_definition_revision(
+    previous: SessionDefinitionRevision,
+    next: SessionDefinitionRevision,
+) -> bool {
+    previous.get().checked_add(1) == Some(next.get())
+}
+
+fn is_exact_next_session_metadata_revision(
+    previous: SessionMetadataRevision,
+    next: SessionMetadataRevision,
+) -> bool {
+    previous.get().checked_add(1) == Some(next.get())
 }
 
 fn scan_agent_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
@@ -2100,18 +2264,28 @@ mod tests {
         include_bytes!("../docs/fixtures/durable-store-v1/session-head.json")
     }
 
-    fn session_definition_fixture() -> Vec<u8> {
-        let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition.json");
+    #[cfg(windows)]
+    fn current_host_session_fixture_uri() -> &'static str {
+        "file:///C:/work/project"
+    }
+
+    fn session_definition_fixture_from(fixture: &[u8]) -> Vec<u8> {
         #[cfg(windows)]
         {
             return replace_fixture(
                 fixture,
                 "file:///Users/example/project",
-                "file:///C:/work/project",
+                current_host_session_fixture_uri(),
             );
         }
         #[cfg(not(windows))]
         fixture.to_vec()
+    }
+
+    fn session_definition_fixture() -> Vec<u8> {
+        session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/session-definition.json"
+        ))
     }
 
     fn session_head_definition_g2_fixture() -> &'static [u8] {
@@ -2119,17 +2293,35 @@ mod tests {
     }
 
     fn session_definition_g2_fixture() -> Vec<u8> {
-        let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition-2.json");
-        #[cfg(windows)]
-        {
-            return replace_fixture(
-                fixture,
-                "file:///Users/example/project",
-                "file:///C:/work/project",
-            );
-        }
-        #[cfg(not(windows))]
-        fixture.to_vec()
+        session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/session-definition-2.json"
+        ))
+    }
+
+    fn session_head_workspace_definition_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-workspace-definition.json")
+    }
+
+    fn session_definition_workspace_g2_fixture() -> Vec<u8> {
+        session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/session-definition-2-workspace.json"
+        ))
+    }
+
+    fn session_head_metadata_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-metadata.json")
+    }
+
+    fn session_head_archived_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-lifecycle.json")
+    }
+
+    fn session_head_unarchived_g3_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-3-unarchive.json")
+    }
+
+    fn session_head_deleted_g3_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-3-deleted.json")
     }
 
     fn fork_session_head_fixture() -> &'static [u8] {
@@ -2137,18 +2329,9 @@ mod tests {
     }
 
     fn fork_session_definition_fixture() -> Vec<u8> {
-        let fixture =
-            include_bytes!("../docs/fixtures/durable-store-v1/fork-session-definition.json");
-        #[cfg(windows)]
-        {
-            return replace_fixture(
-                fixture,
-                "file:///Users/example/project",
-                "file:///C:/work/project",
-            );
-        }
-        #[cfg(not(windows))]
-        fixture.to_vec()
+        session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/fork-session-definition.json"
+        ))
     }
 
     fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
@@ -2216,6 +2399,12 @@ mod tests {
             .join(GENERATION_ONE)
     }
 
+    fn session_generation_path_named(root: &Path, session_id: &str, generation: &str) -> PathBuf {
+        session_path(root, session_id)
+            .join("generations")
+            .join(generation)
+    }
+
     fn create_exact_g1_session(
         root: &Path,
         session_id: &str,
@@ -2252,6 +2441,22 @@ mod tests {
             &definition,
             conversation,
         );
+    }
+
+    fn create_session_generation(
+        root: &Path,
+        session_id: &str,
+        generation: &str,
+        head: &[u8],
+        definition: Option<&[u8]>,
+    ) {
+        let path = session_generation_path_named(root, session_id, generation);
+        create_directory(&path);
+        create_file(&path.join("head.json"), head);
+        if let Some(definition) = definition {
+            create_file(&path.join("definition.json"), definition);
+        }
+        create_file(&path.join("COMMITTED"), b"");
     }
 
     fn create_agent_generation(
@@ -2303,6 +2508,34 @@ mod tests {
 
     fn assert_corrupt(result: Result<DurableState, DurableOpenError>) {
         assert!(matches!(result, Err(DurableOpenError::DurableStateCorrupt)));
+    }
+
+    async fn assert_ordinary_session_g2_is_corrupt(head: &[u8], definition: Option<&[u8]>) {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"conversation is opaque during store recovery");
+        create_session_generation(root.path(), SESSION_ONE, GENERATION_TWO, head, definition);
+        assert_corrupt(open(root.path()).await);
+    }
+
+    fn create_ordinary_session_chain_through_g3_deleted(root: &Path) {
+        create_valid_g1_agent(root);
+        create_valid_g1_session(root, b"conversation is opaque during store recovery");
+        create_session_generation(
+            root,
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_archived_g2_fixture(),
+            None,
+        );
+        create_session_generation(
+            root,
+            SESSION_ONE,
+            GENERATION_THREE,
+            session_head_deleted_g3_fixture(),
+            None,
+        );
     }
 
     fn marked_entries(root: &Path) -> Vec<std::fs::DirEntry> {
@@ -4445,7 +4678,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_forks_g2_and_markerless_trailing_generations_fail_closed_without_mutation() {
+    async fn ordinary_session_g2_recovers_while_forks_and_markerless_trailing_generations_fail_closed_without_mutation()
+     {
         let fork = TempRoot::existing();
         create_marked_empty_store(fork.path());
         create_valid_g1_agent(fork.path());
@@ -4477,9 +4711,22 @@ mod tests {
         let g2_definition = session_definition_g2_fixture();
         create_file(&generation.join("definition.json"), &g2_definition);
         create_file(&generation.join("COMMITTED"), b"");
-        let before = fs::read(generation.join("head.json")).unwrap();
-        assert_corrupt(open(g2.path()).await);
-        assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+        let state = open(g2.path())
+            .await
+            .expect("a valid committed ordinary G2 definition is recovered");
+        let head = state
+            .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+            .expect("the G2 Session head is catalogued");
+        assert_eq!(head.storage_generation().get(), 2);
+        assert_eq!(
+            state
+                .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
 
         let markerless = TempRoot::existing();
         create_marked_empty_store(markerless.path());
@@ -4496,6 +4743,683 @@ mod tests {
         let before = fs::read(generation.join("head.json")).unwrap();
         assert_corrupt(open(markerless.path()).await);
         assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authoritative_ordinary_session_definition_metadata_and_lifecycle_chains_recover() {
+        let definition = TempRoot::existing();
+        create_marked_empty_store(definition.path());
+        create_valid_g1_agent(definition.path());
+        create_valid_g1_session(definition.path(), b"conversation remains opaque");
+        let definition_g2 = session_definition_g2_fixture();
+        create_session_generation(
+            definition.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&definition_g2),
+        );
+        let state = open(definition.path())
+            .await
+            .expect("the authoritative model definition G2 chain opens");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .session_head(session_id)
+                .unwrap()
+                .storage_generation()
+                .get(),
+            2
+        );
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
+
+        let direct_metadata = TempRoot::existing();
+        create_marked_empty_store(direct_metadata.path());
+        create_valid_g1_agent(direct_metadata.path());
+        create_valid_g1_session(direct_metadata.path(), b"conversation remains opaque");
+        create_session_generation(
+            direct_metadata.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_metadata_g2_fixture(),
+            None,
+        );
+        let state = open(direct_metadata.path())
+            .await
+            .expect("the authoritative metadata G2 chain opens");
+        assert_eq!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .metadata()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
+
+        let same_metadata_timestamp = TempRoot::existing();
+        create_marked_empty_store(same_metadata_timestamp.path());
+        create_valid_g1_agent(same_metadata_timestamp.path());
+        create_valid_g1_session(
+            same_metadata_timestamp.path(),
+            b"conversation remains opaque",
+        );
+        let unchanged_timestamp_metadata = replace_fixture(
+            session_head_metadata_g2_fixture(),
+            "\"updatedAt\":\"2026-08-03T10:01:05.000Z\"",
+            "\"updatedAt\":\"2026-08-03T10:01:00.456Z\"",
+        );
+        create_session_generation(
+            same_metadata_timestamp.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            &unchanged_timestamp_metadata,
+            None,
+        );
+        let state = open(same_metadata_timestamp.path())
+            .await
+            .expect("changed metadata may retain its millisecond-truncated timestamp");
+        state.close().await;
+
+        let workspace = TempRoot::existing();
+        create_marked_empty_store(workspace.path());
+        create_valid_g1_agent(workspace.path());
+        create_valid_g1_session(workspace.path(), b"conversation remains opaque");
+        let workspace_g2 = session_definition_workspace_g2_fixture();
+        create_session_generation(
+            workspace.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_workspace_definition_g2_fixture(),
+            Some(&workspace_g2),
+        );
+        let state = open(workspace.path())
+            .await
+            .expect("the authoritative Workspace-changing definition G2 chain opens");
+        assert_eq!(
+            state
+                .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .workspace()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
+
+        let metadata = TempRoot::existing();
+        create_marked_empty_store(metadata.path());
+        create_valid_g1_agent(metadata.path());
+        create_valid_g1_session(metadata.path(), b"conversation remains opaque");
+        let definition_g2 = session_definition_g2_fixture();
+        create_session_generation(
+            metadata.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&definition_g2),
+        );
+        let metadata_g3 = replace_fixture(
+            &replace_fixture(
+                session_head_metadata_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"currentDefinition\":{\"revision\":\"sdr_1\",\"storageGeneration\":1}",
+            "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":2}",
+        );
+        create_session_generation(
+            metadata.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            &metadata_g3,
+            None,
+        );
+        let state = open(metadata.path())
+            .await
+            .expect("metadata after a definition retains the current definition");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .session_head(session_id)
+                .unwrap()
+                .storage_generation()
+                .get(),
+            3
+        );
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
+
+        for (name, final_head, lifecycle) in [
+            (
+                "unarchive",
+                session_head_unarchived_g3_fixture(),
+                SessionLifecycle::Open,
+            ),
+            (
+                "delete",
+                session_head_deleted_g3_fixture(),
+                SessionLifecycle::Deleted,
+            ),
+        ] {
+            let lifecycle_root = TempRoot::existing();
+            create_marked_empty_store(lifecycle_root.path());
+            create_valid_g1_agent(lifecycle_root.path());
+            create_valid_g1_session(lifecycle_root.path(), b"conversation remains opaque");
+            // Materialize G3 before G2: recovery must sort canonical numeric generations.
+            create_session_generation(
+                lifecycle_root.path(),
+                SESSION_ONE,
+                GENERATION_THREE,
+                final_head,
+                None,
+            );
+            create_session_generation(
+                lifecycle_root.path(),
+                SESSION_ONE,
+                GENERATION_TWO,
+                session_head_archived_g2_fixture(),
+                None,
+            );
+            let state = open(lifecycle_root.path())
+                .await
+                .unwrap_or_else(|_| panic!("the authoritative {name} G3 chain opens"));
+            let head = state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap();
+            assert_eq!(head.storage_generation().get(), 3);
+            assert_eq!(head.lifecycle(), lifecycle);
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_definition_changes_allow_same_agent_retained_revision_upgrade_and_rollback() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(root.path(), b"conversation remains opaque");
+
+        let upgrade = replace_fixture(
+            &replace_fixture(
+                &replace_fixture(
+                    &session_definition_fixture(),
+                    "\"revision\":\"sdr_1\"",
+                    "\"revision\":\"sdr_2\"",
+                ),
+                "\"revision\":\"ar_1\"",
+                "\"revision\":\"ar_2\"",
+            ),
+            "\"createdAt\":\"2026-08-03T10:01:00.456Z\"",
+            "\"createdAt\":\"2026-08-03T10:01:01.000Z\"",
+        );
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&upgrade),
+        );
+        let state = open(root.path())
+            .await
+            .expect("a retained same-Agent revision may be pinned directly");
+        let upgraded = state
+            .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+            .unwrap();
+        assert_eq!(upgraded.revision().get(), 2);
+        assert_eq!(upgraded.agent().revision().get(), 2);
+        state.close().await;
+
+        let rollback_head = replace_fixture(
+            &replace_fixture(
+                session_head_definition_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":2}",
+            "\"currentDefinition\":{\"revision\":\"sdr_3\",\"storageGeneration\":3}",
+        );
+        let rollback_definition = replace_fixture(
+            &session_definition_fixture(),
+            "\"revision\":\"sdr_1\"",
+            "\"revision\":\"sdr_3\"",
+        );
+        // Definition timestamps are wall-clock facts, not monotonic generation-order proofs.
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            &rollback_head,
+            Some(&rollback_definition),
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("same-Agent retained revision upgrade and rollback are legal");
+        let definition = state
+            .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+            .unwrap();
+        assert_eq!(definition.revision().get(), 3);
+        assert_eq!(definition.agent().revision().get(), 1);
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_session_definition_may_reference_retained_agent_content_when_current_agent_is_disabled_or_deleted()
+     {
+        for (name, agent_head) in [
+            ("disabled", agent_head_status_g2_fixture().to_vec()),
+            (
+                "deleted",
+                replace_fixture(
+                    agent_head_status_g2_fixture(),
+                    "\"status\":\"disabled\"",
+                    "\"status\":\"deleted\"",
+                ),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_agent_generation(root.path(), AGENT_ONE, GENERATION_TWO, &agent_head, None);
+            create_valid_g1_session(root.path(), b"conversation remains opaque");
+            let definition = session_definition_g2_fixture();
+            create_session_generation(
+                root.path(),
+                SESSION_ONE,
+                GENERATION_TWO,
+                session_head_definition_g2_fixture(),
+                Some(&definition),
+            );
+
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|_| panic!("a retained Agent definition remains usable in {name}"));
+            assert_eq!(
+                state
+                    .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+                    .unwrap()
+                    .revision()
+                    .get(),
+                2
+            );
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_session_definition_and_workspace_no_ops_mismatches_and_cross_agent_rebinds_are_corrupt()
+     {
+        let definition_no_op = replace_fixture(
+            &session_definition_g2_fixture(),
+            "\"maxOutputTokens\":8192",
+            "\"maxOutputTokens\":4096",
+        );
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_definition_g2_fixture(),
+            Some(&definition_no_op),
+        )
+        .await;
+
+        let workspace_unchanged_bumped = replace_fixture(
+            &session_definition_g2_fixture(),
+            "\"revision\":\"wr_1\"",
+            "\"revision\":\"wr_2\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_definition_g2_fixture(),
+            Some(&workspace_unchanged_bumped),
+        )
+        .await;
+
+        let workspace_changed_same_revision = replace_fixture(
+            &session_definition_workspace_g2_fixture(),
+            "\"revision\":\"wr_2\"",
+            "\"revision\":\"wr_1\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_workspace_definition_g2_fixture(),
+            Some(&workspace_changed_same_revision),
+        )
+        .await;
+
+        let workspace_changed_jump = replace_fixture(
+            &session_definition_workspace_g2_fixture(),
+            "\"revision\":\"wr_2\"",
+            "\"revision\":\"wr_3\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_workspace_definition_g2_fixture(),
+            Some(&workspace_changed_jump),
+        )
+        .await;
+
+        let missing_exact_agent_revision = replace_fixture(
+            &session_definition_g2_fixture(),
+            "\"revision\":\"ar_1\"",
+            "\"revision\":\"ar_2\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_definition_g2_fixture(),
+            Some(&missing_exact_agent_revision),
+        )
+        .await;
+
+        let cross_agent = TempRoot::existing();
+        create_marked_empty_store(cross_agent.path());
+        create_valid_g1_agent(cross_agent.path());
+        create_exact_g1_agent(
+            cross_agent.path(),
+            AGENT_TWO,
+            &replace_fixture(agent_head_fixture(), AGENT_ONE, AGENT_TWO),
+            &replace_fixture(agent_definition_fixture(), AGENT_ONE, AGENT_TWO),
+        );
+        create_valid_g1_session(cross_agent.path(), b"conversation remains opaque");
+        let rebind = replace_fixture(&session_definition_g2_fixture(), AGENT_ONE, AGENT_TWO);
+        create_session_generation(
+            cross_agent.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&rebind),
+        );
+        assert_corrupt(open(cross_agent.path()).await);
+
+        let mixed_definition_lifecycle = replace_fixture(
+            session_head_definition_g2_fixture(),
+            "\"lifecycle\":\"open\"",
+            "\"lifecycle\":\"archived\"",
+        );
+        let definition = session_definition_g2_fixture();
+        assert_ordinary_session_g2_is_corrupt(&mixed_definition_lifecycle, Some(&definition)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_session_metadata_and_lifecycle_no_ops_mixed_changes_and_invalid_edges_are_corrupt()
+     {
+        let metadata_no_op = replace_fixture(
+            session_head_metadata_g2_fixture(),
+            "\"name\":\"Project session\"",
+            "\"name\":null",
+        );
+        assert_ordinary_session_g2_is_corrupt(&metadata_no_op, None).await;
+
+        let metadata_revision_jump = replace_fixture(
+            session_head_metadata_g2_fixture(),
+            "\"revision\":\"smr_2\"",
+            "\"revision\":\"smr_3\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(&metadata_revision_jump, None).await;
+
+        let mixed_metadata_lifecycle = replace_fixture(
+            session_head_metadata_g2_fixture(),
+            "\"lifecycle\":\"open\"",
+            "\"lifecycle\":\"archived\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(&mixed_metadata_lifecycle, None).await;
+
+        let same_lifecycle = replace_fixture(
+            session_head_archived_g2_fixture(),
+            "\"lifecycle\":\"archived\"",
+            "\"lifecycle\":\"open\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(&same_lifecycle, None).await;
+
+        let open_to_deleted = replace_fixture(
+            session_head_archived_g2_fixture(),
+            "\"lifecycle\":\"archived\"",
+            "\"lifecycle\":\"deleted\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(&open_to_deleted, None).await;
+
+        let archived_definition = TempRoot::existing();
+        create_marked_empty_store(archived_definition.path());
+        create_valid_g1_agent(archived_definition.path());
+        create_valid_g1_session(archived_definition.path(), b"conversation remains opaque");
+        create_session_generation(
+            archived_definition.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_archived_g2_fixture(),
+            None,
+        );
+        let archived_definition_head = replace_fixture(
+            &replace_fixture(
+                session_head_definition_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"lifecycle\":\"open\"",
+            "\"lifecycle\":\"archived\"",
+        );
+        let definition = session_definition_g2_fixture();
+        create_session_generation(
+            archived_definition.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            &archived_definition_head,
+            Some(&definition),
+        );
+        assert_corrupt(open(archived_definition.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleted_ordinary_session_rejects_every_later_category() {
+        let definition = TempRoot::existing();
+        create_marked_empty_store(definition.path());
+        create_ordinary_session_chain_through_g3_deleted(definition.path());
+        let definition_head = replace_fixture(
+            &replace_fixture(
+                &replace_fixture(
+                    session_head_definition_g2_fixture(),
+                    "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                    "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+                ),
+                "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":2}",
+                "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":4}",
+            ),
+            "\"lifecycle\":\"open\"",
+            "\"lifecycle\":\"deleted\"",
+        );
+        let definition_payload = session_definition_g2_fixture();
+        create_session_generation(
+            definition.path(),
+            SESSION_ONE,
+            GENERATION_FOUR,
+            &definition_head,
+            Some(&definition_payload),
+        );
+        assert_corrupt(open(definition.path()).await);
+
+        let metadata = TempRoot::existing();
+        create_marked_empty_store(metadata.path());
+        create_ordinary_session_chain_through_g3_deleted(metadata.path());
+        let metadata_head = replace_fixture(
+            &replace_fixture(
+                session_head_metadata_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+            ),
+            "\"lifecycle\":\"open\"",
+            "\"lifecycle\":\"deleted\"",
+        );
+        create_session_generation(
+            metadata.path(),
+            SESSION_ONE,
+            GENERATION_FOUR,
+            &metadata_head,
+            None,
+        );
+        assert_corrupt(open(metadata.path()).await);
+
+        let lifecycle = TempRoot::existing();
+        create_marked_empty_store(lifecycle.path());
+        create_ordinary_session_chain_through_g3_deleted(lifecycle.path());
+        let lifecycle_head = replace_fixture(
+            session_head_deleted_g3_fixture(),
+            "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+        );
+        create_session_generation(
+            lifecycle.path(),
+            SESSION_ONE,
+            GENERATION_FOUR,
+            &lifecycle_head,
+            None,
+        );
+        assert_corrupt(open(lifecycle.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_session_chain_payload_provenance_generation_and_pointer_mismatches_fail_closed_without_fallback()
+     {
+        assert_ordinary_session_g2_is_corrupt(session_head_definition_g2_fixture(), None).await;
+        let unexpected_definition = session_definition_g2_fixture();
+        assert_ordinary_session_g2_is_corrupt(
+            session_head_metadata_g2_fixture(),
+            Some(&unexpected_definition),
+        )
+        .await;
+
+        let storage_generation_mismatch = replace_fixture(
+            session_head_archived_g2_fixture(),
+            "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+            "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+        );
+        assert_ordinary_session_g2_is_corrupt(&storage_generation_mismatch, None).await;
+
+        let pointer_mismatch = replace_fixture(
+            session_head_definition_g2_fixture(),
+            "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":2}",
+            "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":1}",
+        );
+        let definition = session_definition_g2_fixture();
+        assert_ordinary_session_g2_is_corrupt(&pointer_mismatch, Some(&definition)).await;
+
+        let revision_mismatch = replace_fixture(
+            session_head_definition_g2_fixture(),
+            "\"currentDefinition\":{\"revision\":\"sdr_2\",\"storageGeneration\":2}",
+            "\"currentDefinition\":{\"revision\":\"sdr_3\",\"storageGeneration\":2}",
+        );
+        let revision_payload = replace_fixture(
+            &session_definition_g2_fixture(),
+            "\"revision\":\"sdr_2\"",
+            "\"revision\":\"sdr_3\"",
+        );
+        assert_ordinary_session_g2_is_corrupt(&revision_mismatch, Some(&revision_payload)).await;
+
+        let g2_alone = TempRoot::existing();
+        create_marked_empty_store(g2_alone.path());
+        create_valid_g1_agent(g2_alone.path());
+        create_valid_g1_session(g2_alone.path(), b"conversation remains opaque");
+        fs::rename(
+            session_generation_path(g2_alone.path(), SESSION_ONE),
+            session_generation_path_named(g2_alone.path(), SESSION_ONE, GENERATION_TWO),
+        )
+        .unwrap();
+        assert_corrupt(open(g2_alone.path()).await);
+
+        let gap = TempRoot::existing();
+        create_marked_empty_store(gap.path());
+        create_valid_g1_agent(gap.path());
+        create_valid_g1_session(gap.path(), b"conversation remains opaque");
+        create_session_generation(
+            gap.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            session_head_unarchived_g3_fixture(),
+            None,
+        );
+        assert_corrupt(open(gap.path()).await);
+
+        let corrupt_highest = TempRoot::existing();
+        create_marked_empty_store(corrupt_highest.path());
+        create_valid_g1_agent(corrupt_highest.path());
+        create_valid_g1_session(corrupt_highest.path(), b"conversation remains opaque");
+        create_session_generation(
+            corrupt_highest.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            b"not canonical JSON\n",
+            None,
+        );
+        assert_corrupt(open(corrupt_highest.path()).await);
+
+        let corrupt_after_valid_generation = TempRoot::existing();
+        create_marked_empty_store(corrupt_after_valid_generation.path());
+        create_valid_g1_agent(corrupt_after_valid_generation.path());
+        create_valid_g1_session(
+            corrupt_after_valid_generation.path(),
+            b"conversation remains opaque",
+        );
+        create_session_generation(
+            corrupt_after_valid_generation.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_archived_g2_fixture(),
+            None,
+        );
+        create_session_generation(
+            corrupt_after_valid_generation.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            b"not canonical JSON\n",
+            None,
+        );
+        assert_corrupt(open(corrupt_after_valid_generation.path()).await);
+
+        let provenance = TempRoot::existing();
+        create_marked_empty_store(provenance.path());
+        create_valid_g1_agent(provenance.path());
+        create_valid_g1_session(provenance.path(), b"conversation remains opaque");
+        let intermediate_provenance = replace_fixture(
+            session_head_archived_g2_fixture(),
+            "\"forkProvenance\":null",
+            "\"forkProvenance\":{\"sourceSessionId\":\"ses_33333333333333333333333333333333\",\"source\":\"recorded_history\",\"anchor\":{\"type\":\"genesis\"}}",
+        );
+        create_session_generation(
+            provenance.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            &intermediate_provenance,
+            None,
+        );
+        create_session_generation(
+            provenance.path(),
+            SESSION_ONE,
+            GENERATION_THREE,
+            session_head_unarchived_g3_fixture(),
+            None,
+        );
+        let final_head =
+            session_generation_path_named(provenance.path(), SESSION_ONE, GENERATION_THREE)
+                .join("head.json");
+        let before = fs::read(&final_head).unwrap();
+        assert_corrupt(open(provenance.path()).await);
+        assert_eq!(fs::read(final_head).unwrap(), before);
     }
 
     #[tokio::test(flavor = "current_thread")]

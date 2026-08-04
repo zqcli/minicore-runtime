@@ -125,21 +125,29 @@ fn create_published_g2_definition_generation(root: &Path) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
-fn session_definition_fixture() -> Vec<u8> {
-    let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition.json");
+#[cfg(windows)]
+fn current_host_session_fixture_uri() -> &'static str {
+    "file:///C:/work/project"
+}
+
+fn session_definition_fixture_from(fixture: &[u8]) -> Vec<u8> {
     #[cfg(windows)]
     {
         let fixture = std::str::from_utf8(fixture).expect("the authoritative fixture is UTF-8");
+        let source = "file:///Users/example/project";
+        assert_eq!(fixture.matches(source).count(), 1);
         return fixture
-            .replacen(
-                "file:///Users/example/project",
-                "file:///C:/work/project",
-                1,
-            )
+            .replace(source, current_host_session_fixture_uri())
             .into_bytes();
     }
     #[cfg(not(windows))]
     fixture.to_vec()
+}
+
+fn session_definition_fixture() -> Vec<u8> {
+    session_definition_fixture_from(include_bytes!(
+        "../docs/fixtures/durable-store-v1/session-definition.json"
+    ))
 }
 
 fn create_published_g1_session(root: &Path, conversation: &[u8]) {
@@ -162,6 +170,48 @@ fn create_published_g1_session(root: &Path, conversation: &[u8]) {
         &generation.join("definition.json"),
         &session_definition_fixture(),
     );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
+fn create_published_g2_session_definition_generation(root: &Path) {
+    const SESSION_ID: &str = "ses_22222222222222222222222222222222";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("sessions")
+        .join(SESSION_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-definition.json"),
+    );
+    create_private_file(
+        &generation.join("definition.json"),
+        &session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/session-definition-2.json"
+        )),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
+fn create_corrupt_g2_session_same_lifecycle_generation(root: &Path) {
+    const SESSION_ID: &str = "ses_22222222222222222222222222222222";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("sessions")
+        .join(SESSION_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    let head = std::str::from_utf8(include_bytes!(
+        "../docs/fixtures/durable-store-v1/session-head-2-lifecycle.json"
+    ))
+    .expect("the authoritative fixture is UTF-8")
+    .replace("\"lifecycle\":\"archived\"", "\"lifecycle\":\"open\"");
+    create_private_file(&generation.join("head.json"), head.as_bytes());
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
@@ -263,6 +313,65 @@ async fn public_runtime_recovers_an_ordinary_g1_session_and_preserves_invalid_co
         before,
         "store recovery leaves all conversation bytes untouched"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_recovers_an_authoritative_ordinary_g1_g2_definition_session_chain() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    let conversation =
+        b"\xff arbitrary conversation bytes remain a Store-open opaque payload\x00\n";
+    create_published_g1_session(root.path(), conversation);
+    create_published_g2_session_definition_generation(root.path());
+    let conversation_path = root
+        .path()
+        .join("sessions/ses_22222222222222222222222222222222/conversation.jsonl");
+    let before = fs::read(&conversation_path).expect("the physical conversation is readable");
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the authoritative ordinary G1/G2 definition chain opens publicly");
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the recovered ordinary G1/G2 definition chain reopens publicly");
+    reopened.shutdown().await;
+
+    assert_eq!(
+        fs::read(conversation_path).expect("the physical conversation remains readable"),
+        before,
+        "public Store recovery leaves invalid conversation bytes untouched"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_maps_a_corrupt_g2_session_to_a_redacted_error() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g1_session(root.path(), b"opaque conversation bytes");
+    create_corrupt_g2_session_same_lifecycle_generation(root.path());
+    let private_root = root.path().to_string_lossy();
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a committed same-lifecycle Session generation is corrupt");
+
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+    for secret in [private_root.as_ref(), "session-notes", "Project session"] {
+        assert!(!format!("{error:?}").contains(secret));
+        assert!(!error.to_string().contains(secret));
+    }
+    assert!(Error::source(&error).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]
