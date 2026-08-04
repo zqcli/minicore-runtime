@@ -5,7 +5,7 @@ mod bounded_json;
     reason = "M3 line codec is consumed by future storage and recorder slices"
 )]
 pub(crate) mod conversation_jsonl;
-mod conversation_jsonl_scanner;
+pub(crate) mod conversation_jsonl_scanner;
 #[allow(
     dead_code,
     reason = "M5 Store V1 entity documents are consumed by DurableState recovery"
