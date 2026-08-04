@@ -91,7 +91,7 @@ pub enum AgentPromptSelectionError {
     DuplicatePrompt,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SessionPromptSelection {
     enabled: BTreeSet<PromptId>,
 }
@@ -120,6 +120,15 @@ impl SessionPromptSelection {
 
     pub fn enabled(&self) -> &BTreeSet<PromptId> {
         &self.enabled
+    }
+}
+
+impl fmt::Debug for SessionPromptSelection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionPromptSelection")
+            .field("enabled_count", &self.enabled.len())
+            .finish()
     }
 }
 

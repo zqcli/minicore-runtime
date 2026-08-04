@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
 
-use crate::agent_session_lifecycle::{AgentMetadata, AgentStatus};
+use crate::agent_session_lifecycle::{
+    AgentMetadata, AgentStatus, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+};
 use crate::runtime_task::RuntimeTaskContext;
-use crate::wire::{AgentId, AgentRevision, Timestamp};
+use crate::wire::{AgentId, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp};
 
 const LOCK_FILE: &str = ".minicore.lock";
 const FORMAT_MARKER: &str = "MINICORE_STORE_V1";
@@ -177,6 +179,141 @@ impl fmt::Debug for DurableAgentHead {
             )
             .field("metadata", &"redacted")
             .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// The closed, redacted construction failure for one physical Session head document.
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DurableSessionHeadError {
+    InvalidInvariant,
+}
+
+impl fmt::Display for DurableSessionHeadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid durable session head")
+    }
+}
+
+impl std::error::Error for DurableSessionHeadError {}
+
+/// The physical Store V1 Session head representation. Recovery alone validates adjacent
+/// generation semantics; this value checks only invariants observable in one document.
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct DurableSessionHead {
+    session_id: SessionId,
+    storage_generation: StorageGeneration,
+    previous_storage_generation: Option<StorageGeneration>,
+    current_definition_revision: SessionDefinitionRevision,
+    current_definition_storage_generation: StorageGeneration,
+    metadata: SessionMetadata,
+    lifecycle: SessionLifecycle,
+    fork_provenance: Option<SessionForkProvenance>,
+    created_at: Timestamp,
+}
+
+#[allow(
+    dead_code,
+    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
+)]
+impl DurableSessionHead {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Store V1 Session head has nine fixed facts"
+    )]
+    pub(crate) fn new(
+        session_id: SessionId,
+        storage_generation: StorageGeneration,
+        previous_storage_generation: Option<StorageGeneration>,
+        current_definition_revision: SessionDefinitionRevision,
+        current_definition_storage_generation: StorageGeneration,
+        metadata: SessionMetadata,
+        lifecycle: SessionLifecycle,
+        fork_provenance: Option<SessionForkProvenance>,
+        created_at: Timestamp,
+    ) -> Result<Self, DurableSessionHeadError> {
+        let expected_previous = storage_generation
+            .get()
+            .checked_sub(1)
+            .and_then(StorageGeneration::new);
+        if previous_storage_generation != expected_previous
+            || current_definition_storage_generation > storage_generation
+            || fork_provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.source_session_id() == session_id)
+        {
+            return Err(DurableSessionHeadError::InvalidInvariant);
+        }
+        Ok(Self {
+            session_id,
+            storage_generation,
+            previous_storage_generation,
+            current_definition_revision,
+            current_definition_storage_generation,
+            metadata,
+            lifecycle,
+            fork_provenance,
+            created_at,
+        })
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn storage_generation(&self) -> StorageGeneration {
+        self.storage_generation
+    }
+
+    pub(crate) const fn previous_storage_generation(&self) -> Option<StorageGeneration> {
+        self.previous_storage_generation
+    }
+
+    pub(crate) const fn current_definition_revision(&self) -> SessionDefinitionRevision {
+        self.current_definition_revision
+    }
+
+    pub(crate) const fn current_definition_storage_generation(&self) -> StorageGeneration {
+        self.current_definition_storage_generation
+    }
+
+    pub(crate) const fn metadata(&self) -> &SessionMetadata {
+        &self.metadata
+    }
+
+    pub(crate) const fn lifecycle(&self) -> SessionLifecycle {
+        self.lifecycle
+    }
+
+    pub(crate) const fn fork_provenance(&self) -> Option<&SessionForkProvenance> {
+        self.fork_provenance.as_ref()
+    }
+
+    pub(crate) const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+impl fmt::Debug for DurableSessionHead {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableSessionHead")
+            .field("storage_generation", &self.storage_generation)
+            .field(
+                "current_definition_storage_generation",
+                &self.current_definition_storage_generation,
+            )
+            .field("metadata", &"redacted")
+            .field("lifecycle", &self.lifecycle)
+            .field("fork_provenance", &"redacted")
             .finish()
     }
 }
@@ -789,16 +926,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
+    use std::str::FromStr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use tokio::runtime::Handle;
 
     use super::{
-        AGENTS_DIRECTORY, DurableOpenError, DurableState, FORMAT_MARKER, LOCK_FILE,
-        RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, SESSIONS_DIRECTORY,
+        AGENTS_DIRECTORY, DurableOpenError, DurableSessionHead, DurableState, FORMAT_MARKER,
+        LOCK_FILE, RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP,
+        SESSIONS_DIRECTORY, StorageGeneration,
+    };
+    use crate::agent_session_lifecycle::{
+        ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle, SessionMetadata,
     };
     use crate::runtime_task::RuntimeTaskContext;
+    use crate::wire::{
+        ItemId, SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
+    };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -1002,6 +1148,92 @@ mod tests {
         create_directory(&root.join(RESERVATIONS_DIRECTORY).join(SESSIONS_DIRECTORY));
         create_directory(&root.join(AGENTS_DIRECTORY));
         create_directory(&root.join(SESSIONS_DIRECTORY));
+    }
+
+    #[test]
+    fn private_session_head_enforces_only_single_document_invariants_and_redacts_debug() {
+        let child = SessionId::from_str("ses_22222222222222222222222222222222").unwrap();
+        let source = SessionId::from_str("ses_33333333333333333333333333333333").unwrap();
+        let timestamp = Timestamp::from_str("2026-08-03T10:01:00.456Z").unwrap();
+        let metadata = SessionMetadata::new(
+            SessionMetadataRevision::new(NonZeroU64::new(1).unwrap()),
+            Some("session secret"),
+            Some("description secret"),
+            timestamp,
+        )
+        .unwrap();
+        let revision = SessionDefinitionRevision::new(NonZeroU64::new(1).unwrap());
+        let generation_one = StorageGeneration::new(1).unwrap();
+        let head = DurableSessionHead::new(
+            child,
+            generation_one,
+            None,
+            revision,
+            generation_one,
+            metadata.clone(),
+            SessionLifecycle::Open,
+            Some(SessionForkProvenance::new(
+                source,
+                ForkSourceKind::RecordedHistory,
+                ForkAnchor::AfterUserMessage {
+                    item_id: ItemId::from_str("itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                },
+            )),
+            timestamp,
+        )
+        .unwrap();
+        assert_eq!(head.session_id(), child);
+        assert_eq!(head.storage_generation(), generation_one);
+        assert_eq!(head.previous_storage_generation(), None);
+        assert_eq!(head.current_definition_revision(), revision);
+        assert_eq!(head.current_definition_storage_generation(), generation_one);
+        assert_eq!(head.metadata(), &metadata);
+        assert_eq!(head.lifecycle(), SessionLifecycle::Open);
+        assert_eq!(head.created_at(), timestamp);
+
+        assert!(
+            DurableSessionHead::new(
+                child,
+                generation_one,
+                Some(generation_one),
+                revision,
+                generation_one,
+                metadata.clone(),
+                SessionLifecycle::Open,
+                None,
+                timestamp,
+            )
+            .is_err()
+        );
+        assert!(
+            DurableSessionHead::new(
+                child,
+                generation_one,
+                None,
+                revision,
+                generation_one,
+                metadata,
+                SessionLifecycle::Open,
+                Some(SessionForkProvenance::new(
+                    child,
+                    ForkSourceKind::LiveSnapshot,
+                    ForkAnchor::Genesis,
+                )),
+                timestamp,
+            )
+            .is_err()
+        );
+
+        let debug = format!("{head:?}");
+        for secret in [
+            "ses_22222222222222222222222222222222",
+            "ses_33333333333333333333333333333333",
+            "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "session secret",
+            "description secret",
+        ] {
+            assert!(!debug.contains(secret), "head debug leaked {secret:?}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
