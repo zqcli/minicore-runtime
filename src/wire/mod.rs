@@ -8,9 +8,9 @@ pub(crate) mod conversation_jsonl;
 mod conversation_jsonl_scanner;
 #[allow(
     dead_code,
-    reason = "M5 Store V1 entity documents are consumed by future DurableState recovery"
+    reason = "M5 Store V1 entity documents are consumed by DurableState recovery"
 )]
-mod durable_store;
+pub(crate) mod durable_store;
 
 #[cfg(feature = "heavy-tests")]
 #[doc(hidden)]
