@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2完成，M5 implementation pending）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2完成，M5 Store recovery foundation implementation in progress）
 日期：2026-07-31
 
 ## 目的
@@ -478,6 +478,8 @@ impl ConversationStorage {
 Header strict failure maps to `HeaderCorrupt`/unsupported version and the 1 GiB/1,000,000-entry cap maps to `HistoryTooLarge`. Runtime projects those as `DurableStateCorrupt`/`DurableStateTooLarge`. Every blocking `open`/scan/replay/recorded-lease read/streamed re-encode/readback runs in an owner-tracked `RuntimeTaskContext` job; none runs directly on a current-thread Tokio worker, and caller drop cannot outlive shutdown ownership. Ordinary Recorder initialization/open/write failure is only the loaded Session's `RecordingHealth::Degraded`; it neither loses the root lease nor poisons DurableState.
 
 DurableState creates/syncs the canonical Header before generation-1 `COMMITTED`, then creates `PUBLISHED` last. For ordinary Create, `InitialConversationSeed` is constructible only by DurableStateActor after it holds the Agent gate, reads the current Enabled exact ref, and constructs the final SessionDefinition/Header/head together; no pre-gate or already-`COMMITTED` stale Header is accepted. Conversation Storage never publishes an entity, creates a generation marker, selects a Session directory, or returns a physical commit receipt. The Header remains creation provenance and file identity, not a definition/lifecycle log, current authorization proof or old execution recovery source.
+
+On Store V1 restart, a missing `PUBLISHED` Session with an exact G1 staging shape is not a published Conversation Storage target. Before G1 `COMMITTED`, DurableState may check only the private regular-file/non-link/1-GiB physical metadata and must not parse opaque conversation bytes. With G1 `COMMITTED`, DurableState reconstructs the expected Header from the durable G1 head/definition and passes the already same-open observed `File` plus declared length to `validate_unpublished_conversation_for_recovery`: ordinary Sessions are Header-only; Fork children are canonical linear files, including Header-only. After the classifier returns, DurableState re-observes both the held handle and path and applies the same-open identity/length check, so the full classifier cannot silently accept a replaced or length-drifting conversation file. `TooLarge`, `Corrupt`, and `Unavailable` map back to the corresponding durable-open failures. These are current platform-observable facts; full Windows/NTFS identity, reparse, and native-process coverage remains the separate M5.0 pending platform gate. This strict restart classifier does not bind a source seed, validate an anchor against source bytes, make the unpublished child catalog-visible, or create or substitute for `PreparedConversationProof`; the latter remains only the publication readback proof for a newly written child.
 
 No API provides `SessionWriter::append`, raw JSON append, caller-provided projection delta, middle-line repair, recording-failure rollback, segment resume, unrecorded-tail backfill or an execution permit derived from physical commit.
 
