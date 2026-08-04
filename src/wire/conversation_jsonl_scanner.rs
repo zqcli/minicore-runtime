@@ -101,10 +101,19 @@ pub(crate) enum ConversationPartialTailAction {
     TruncateTo { offset: u64 },
 }
 
+/// Whether a successfully decoded physical JSONL record exactly matches the V1 writer form.
+/// This is a bounded fact only: the scanner never retains or exposes the physical line itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationLineCanonicality {
+    Canonical,
+    NonCanonical,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ConversationScanEvent {
     Entry {
         location: ConversationPhysicalLocation,
+        canonicality: ConversationLineCanonicality,
         entry: Box<StoredSessionEntry>,
     },
     Fault {
@@ -130,9 +139,14 @@ impl ConversationScanEvent {
 impl fmt::Debug for ConversationScanEvent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Entry { location, .. } => formatter
+            Self::Entry {
+                location,
+                canonicality,
+                ..
+            } => formatter
                 .debug_struct("ConversationScanEvent::Entry")
                 .field("location", location)
+                .field("canonicality", canonicality)
                 .finish(),
             Self::Fault { location, fault } => formatter
                 .debug_struct("ConversationScanEvent::Fault")
@@ -190,9 +204,18 @@ impl ConversationScanLimits {
 }
 
 enum PhysicalLineRead {
-    Complete { offset: u64, oversized: bool },
-    Partial { offset: u64, oversized: bool },
-    Oversized { offset: u64 },
+    Complete {
+        offset: u64,
+        oversized: bool,
+        exact_lf: bool,
+    },
+    Partial {
+        offset: u64,
+        oversized: bool,
+    },
+    Oversized {
+        offset: u64,
+    },
     End,
 }
 
@@ -208,6 +231,7 @@ pub(crate) struct ConversationJsonlScanner<'lease, R> {
     access: ConversationScanAccess<'lease>,
     limits: ConversationScanLimits,
     header: Option<SessionHeader>,
+    header_is_canonical: bool,
     chunk: [u8; SCANNER_CHUNK_BYTES],
     chunk_position: usize,
     chunk_length: usize,
@@ -291,6 +315,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
             access,
             limits,
             header: None,
+            header_is_canonical: false,
             chunk: [0; SCANNER_CHUNK_BYTES],
             chunk_position: 0,
             chunk_length: 0,
@@ -309,12 +334,16 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
         };
 
         let header_read = scanner.read_physical_line(limits.header_bytes, true)?;
-        let header_offset = match header_read {
-            PhysicalLineRead::Complete { offset, oversized } => {
+        let (header_offset, header_exact_lf) = match header_read {
+            PhysicalLineRead::Complete {
+                offset,
+                oversized,
+                exact_lf,
+            } => {
                 if oversized {
                     return Err(scanner.header_error(ConversationCodecError::HeaderTooLarge));
                 }
-                offset
+                (offset, exact_lf)
             }
             PhysicalLineRead::Oversized { .. } => {
                 return Err(scanner.header_error(ConversationCodecError::HeaderTooLarge));
@@ -334,13 +363,15 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
         if header_offset != 0 {
             return Err(ConversationScanError::InvariantViolation);
         }
-        scanner.header = Some(
-            ConversationLineCodec::decode_header_for_catalog(
-                &scanner.line_buffer,
-                opened_session_id,
-            )
-            .map_err(|error| scanner.header_error(error))?,
-        );
+        let header = ConversationLineCodec::decode_header_for_catalog(
+            &scanner.line_buffer,
+            opened_session_id,
+        )
+        .map_err(|error| scanner.header_error(error))?;
+        scanner.header_is_canonical = header_exact_lf
+            && ConversationLineCodec::encode_header(&header)
+                .is_ok_and(|encoded| encoded == scanner.line_buffer);
+        scanner.header = Some(header);
         scanner.next_line_number = 2;
         Ok(scanner)
     }
@@ -357,6 +388,11 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
 
     pub(crate) const fn complete_entry_records(&self) -> u64 {
         self.complete_entry_records
+    }
+
+    /// Physical canonicality of the successfully decoded Header. It contains no Header fields.
+    pub(crate) const fn header_is_canonical(&self) -> bool {
+        self.header_is_canonical
     }
 
     pub(crate) fn next_event(
@@ -387,7 +423,11 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                     action,
                 }))
             }
-            PhysicalLineRead::Complete { offset, oversized } => {
+            PhysicalLineRead::Complete {
+                offset,
+                oversized,
+                exact_lf,
+            } => {
                 let location = self.current_location(offset)?;
                 self.advance_complete_entry_record()?;
                 if oversized {
@@ -406,10 +446,21 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                     &self.line_buffer,
                     self.header()?.session_id(),
                 ) {
-                    Ok(entry) => Ok(Some(ConversationScanEvent::Entry {
-                        location,
-                        entry: Box::new(entry),
-                    })),
+                    Ok(entry) => {
+                        let canonicality = if exact_lf
+                            && ConversationLineCodec::encode_entry(&entry)
+                                .is_ok_and(|encoded| encoded == self.line_buffer)
+                        {
+                            ConversationLineCanonicality::Canonical
+                        } else {
+                            ConversationLineCanonicality::NonCanonical
+                        };
+                        Ok(Some(ConversationScanEvent::Entry {
+                            location,
+                            canonicality,
+                            entry: Box::new(entry),
+                        }))
+                    }
                     Err(error) => Ok(Some(ConversationScanEvent::Fault {
                         location,
                         fault: entry_fault(error),
@@ -486,12 +537,14 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
             };
             if byte == b'\n' {
                 self.last_lf_end_offset = self.consumed_bytes;
+                let exact_lf = self.line_buffer.last() != Some(&b'\r');
                 if !oversized && self.line_buffer.last() == Some(&b'\r') {
                     self.line_buffer.pop();
                 }
                 return Ok(PhysicalLineRead::Complete {
                     offset,
                     oversized: oversized || self.line_buffer.len() > maximum_content_bytes,
+                    exact_lf,
                 });
             }
 
@@ -1134,6 +1187,66 @@ mod tests {
             [ConversationScanEvent::Entry { location, .. }]
                 if location.line_number() == 2
                 && location.offset() == 264
+        ));
+    }
+
+    #[test]
+    fn canonical_line_facts_distinguish_lf_crlf_and_reencode_mismatches() {
+        let mut canonical = scanner(
+            file_with_lines(&[entry_line()]),
+            ConversationScanAccess::ReadOnly,
+        );
+        assert!(canonical.header_is_canonical());
+        assert!(matches!(
+            canonical.next_event(),
+            Ok(Some(ConversationScanEvent::Entry {
+                canonicality: ConversationLineCanonicality::Canonical,
+                ..
+            }))
+        ));
+
+        // Header and Entry canonicality are independent per physical line.
+        let mut mixed_line_endings = HEADER.to_vec();
+        mixed_line_endings.extend_from_slice(entry_line());
+        mixed_line_endings.extend_from_slice(b"\r\n");
+        let mut mixed_line_endings = scanner(mixed_line_endings, ConversationScanAccess::ReadOnly);
+        assert!(mixed_line_endings.header_is_canonical());
+        assert!(matches!(
+            mixed_line_endings.next_event(),
+            Ok(Some(ConversationScanEvent::Entry {
+                canonicality: ConversationLineCanonicality::NonCanonical,
+                ..
+            }))
+        ));
+
+        let mut crlf = HEADER
+            .strip_suffix(b"\n")
+            .expect("authoritative Header has LF")
+            .to_vec();
+        crlf.extend_from_slice(b"\r\n");
+        crlf.extend_from_slice(entry_line());
+        crlf.extend_from_slice(b"\r\n");
+        let mut crlf = scanner(crlf, ConversationScanAccess::ReadOnly);
+        assert!(!crlf.header_is_canonical());
+        assert!(matches!(
+            crlf.next_event(),
+            Ok(Some(ConversationScanEvent::Entry {
+                canonicality: ConversationLineCanonicality::NonCanonical,
+                ..
+            }))
+        ));
+
+        let mut additive = scanner(
+            file_with_lines(&[&entry_with_future_value(b"true")]),
+            ConversationScanAccess::ReadOnly,
+        );
+        assert!(additive.header_is_canonical());
+        assert!(matches!(
+            additive.next_event(),
+            Ok(Some(ConversationScanEvent::Entry {
+                canonicality: ConversationLineCanonicality::NonCanonical,
+                ..
+            }))
         ));
     }
 

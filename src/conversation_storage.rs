@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::io::Read;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -19,6 +20,12 @@ use crate::tools::{
 };
 use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, UserMessageSource,
+};
+use crate::wire::conversation_jsonl::ConversationCodecError;
+use crate::wire::conversation_jsonl_scanner::{
+    ConversationJsonlScanner, ConversationLineCanonicality, ConversationLineFault,
+    ConversationScanAccess, ConversationScanError, ConversationScanEvent,
+    MAX_CONVERSATION_ENTRY_RECORDS,
 };
 use crate::wire::{
     BoundedJsonObject, EntryId, InteractionResolutionKey, ItemId, RequestId,
@@ -138,6 +145,133 @@ impl fmt::Debug for SessionHeader {
                 &self.initial_definition_revision,
             )
             .finish()
+    }
+}
+
+/// A complete unpublished-conversation shape accepted for restart cleanup classification.
+///
+/// This is deliberately narrower than tolerant replay: an ordinary Session has only a Header,
+/// while a Fork has one canonical root-to-leaf path (which may be empty). It is only used for
+/// restart cleanup classification; it does not bind a source seed, provenance anchor, or expected
+/// entry sequence, and it does not create or substitute for a future `PreparedConversationProof`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnpublishedConversationRecoveryShape {
+    OrdinaryHeaderOnly,
+    ForkCanonicalLinearFile,
+}
+
+/// Redacted result of strict readback classification for an unpublished conversation.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum UnpublishedConversationRecoveryError {
+    #[error("unpublished conversation recovery input exceeds a storage limit")]
+    TooLarge,
+    #[error("unpublished conversation recovery input is corrupt")]
+    Corrupt,
+    #[error("unpublished conversation recovery input is unavailable")]
+    Unavailable,
+}
+
+/// Strictly classifies the full physical readback of one unpublished conversation for recovery.
+///
+/// The caller supplies only a readable input, its already-observed byte length, the exact Header
+/// expected for that input, and its closed expected shape. This does not open files, resolve
+/// paths, or alter the tolerant replay contract for published Sessions. It is only for restart
+/// cleanup classification: it does not bind a source seed, provenance anchor, or expected entry
+/// sequence, and it does not create or substitute for a future `PreparedConversationProof`.
+pub(crate) fn validate_unpublished_conversation_for_recovery<R: Read>(
+    reader: R,
+    declared_file_bytes: u64,
+    expected_header: &SessionHeader,
+    expected_shape: UnpublishedConversationRecoveryShape,
+) -> Result<(), UnpublishedConversationRecoveryError> {
+    let mut scanner = ConversationJsonlScanner::open(
+        reader,
+        declared_file_bytes,
+        expected_header.session_id(),
+        ConversationScanAccess::ReadOnly,
+    )
+    .map_err(map_unpublished_conversation_recovery_scan_error)?;
+
+    if scanner
+        .header()
+        .map_err(map_unpublished_conversation_recovery_scan_error)?
+        != expected_header
+        || !scanner.header_is_canonical()
+    {
+        return Err(UnpublishedConversationRecoveryError::Corrupt);
+    }
+
+    // The production scanner applies the same fixed V1 complete-entry cap before yielding an
+    // Event. The explicit bound keeps this identity set bounded if scanner internals evolve.
+    let maximum_recovery_entry_ids = usize::try_from(MAX_CONVERSATION_ENTRY_RECORDS)
+        .map_err(|_| UnpublishedConversationRecoveryError::TooLarge)?;
+    let mut seen_entry_ids = BTreeSet::new();
+    let mut previous_entry_id = None;
+
+    loop {
+        match scanner
+            .next_event()
+            .map_err(map_unpublished_conversation_recovery_scan_error)?
+        {
+            None => return Ok(()),
+            Some(ConversationScanEvent::Fault {
+                fault: ConversationLineFault::OversizedLine,
+                ..
+            }) => return Err(UnpublishedConversationRecoveryError::TooLarge),
+            Some(
+                ConversationScanEvent::Fault { .. } | ConversationScanEvent::PartialTail { .. },
+            ) => {
+                return Err(UnpublishedConversationRecoveryError::Corrupt);
+            }
+            Some(ConversationScanEvent::Entry {
+                canonicality,
+                entry,
+                ..
+            }) => {
+                if canonicality != ConversationLineCanonicality::Canonical {
+                    return Err(UnpublishedConversationRecoveryError::Corrupt);
+                }
+                if expected_shape == UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly {
+                    return Err(UnpublishedConversationRecoveryError::Corrupt);
+                }
+                if seen_entry_ids.len() >= maximum_recovery_entry_ids {
+                    return Err(UnpublishedConversationRecoveryError::TooLarge);
+                }
+                if !seen_entry_ids.insert(entry.entry_id()) {
+                    return Err(UnpublishedConversationRecoveryError::Corrupt);
+                }
+                if match previous_entry_id {
+                    None => entry.parent_id().is_none(),
+                    Some(previous_entry_id) => entry.parent_id() == Some(previous_entry_id),
+                } {
+                    previous_entry_id = Some(entry.entry_id());
+                } else {
+                    return Err(UnpublishedConversationRecoveryError::Corrupt);
+                }
+            }
+        }
+    }
+}
+
+fn map_unpublished_conversation_recovery_scan_error(
+    error: ConversationScanError,
+) -> UnpublishedConversationRecoveryError {
+    match error {
+        ConversationScanError::FileTooLarge
+        | ConversationScanError::HistoryTooLarge
+        | ConversationScanError::HeaderCorrupt {
+            code: ConversationCodecError::HeaderTooLarge,
+        } => UnpublishedConversationRecoveryError::TooLarge,
+        ConversationScanError::HeaderCorrupt { .. }
+        | ConversationScanError::UnsupportedFormatVersion
+        | ConversationScanError::MissingHeader => UnpublishedConversationRecoveryError::Corrupt,
+        ConversationScanError::LeaseMismatch
+        | ConversationScanError::InputChanged
+        | ConversationScanError::InputUnavailable
+        | ConversationScanError::CounterOverflow
+        | ConversationScanError::InvariantViolation => {
+            UnpublishedConversationRecoveryError::Unavailable
+        }
     }
 }
 
@@ -828,12 +962,522 @@ impl fmt::Debug for StoredInteractionResolutionBody {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, Cursor, Read};
+
     use super::*;
+    use crate::agent_session_lifecycle::AgentRevisionRef;
     use crate::model_gateway::{
         ModelId, ModelReasoningSummary, ModelServiceClass, ProviderId, ProviderResponseMetadata,
     };
     use crate::tools::{ToolApprovalResolutionRef, UserQuestionFieldAnswer};
-    use crate::wire::conversation_jsonl::ConversationLineCodec;
+    use crate::wire::conversation_jsonl::{
+        ConversationLineCodec, MAX_CONVERSATION_ENTRY_BYTES, MAX_CONVERSATION_HEADER_BYTES,
+    };
+
+    const HEADER_ONLY: &[u8] =
+        include_bytes!("../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl");
+    const FORK_CHILD: &[u8] = include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl");
+
+    fn header(session_id: &str, created_at: &str, agent_id: &str) -> SessionHeader {
+        SessionHeader::reconstruct(
+            1,
+            session_id
+                .parse()
+                .expect("worked-example Session ID is valid"),
+            created_at
+                .parse()
+                .expect("worked-example timestamp is valid"),
+            AgentRevisionRef::new(
+                agent_id.parse().expect("worked-example Agent ID is valid"),
+                "ar_1"
+                    .parse()
+                    .expect("worked-example Agent revision is valid"),
+            ),
+            "sdr_1"
+                .parse()
+                .expect("worked-example Session definition revision is valid"),
+        )
+    }
+
+    fn standard_header() -> SessionHeader {
+        header(
+            "ses_11111111111111111111111111111111",
+            "2026-07-31T12:00:00.000Z",
+            "agt_22222222222222222222222222222222",
+        )
+    }
+
+    fn fork_header() -> SessionHeader {
+        header(
+            "ses_33333333333333333333333333333333",
+            "2026-08-03T10:02:00.789Z",
+            "agt_11111111111111111111111111111111",
+        )
+    }
+
+    fn classify_for_restart_cleanup(
+        bytes: &[u8],
+        expected_header: &SessionHeader,
+        expected_shape: UnpublishedConversationRecoveryShape,
+    ) -> Result<(), UnpublishedConversationRecoveryError> {
+        validate_unpublished_conversation_for_recovery(
+            Cursor::new(bytes.to_vec()),
+            u64::try_from(bytes.len()).expect("worked-example file length fits u64"),
+            expected_header,
+            expected_shape,
+        )
+    }
+
+    fn lines_after_standard_header(lines: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = HEADER_ONLY.to_vec();
+        for line in lines {
+            bytes.extend_from_slice(line);
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn fork_line(line_number: usize) -> Vec<u8> {
+        FORK_CHILD
+            .split(|byte| *byte == b'\n')
+            .nth(line_number)
+            .unwrap_or_else(|| panic!("authoritative Fork fixture has line {line_number}"))
+            .to_vec()
+    }
+
+    fn fork_with_entries(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = fork_line(0);
+        bytes.push(b'\n');
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn additive_entry(line: &[u8]) -> Vec<u8> {
+        assert!(line.ends_with(b"}}"), "canonical entry has closing braces");
+        let mut output = line[..line.len() - 2].to_vec();
+        output.extend_from_slice(b",\"futureField\":true}}");
+        output
+    }
+
+    fn replace_once(line: &[u8], expected: &str, replacement: &str) -> Vec<u8> {
+        let line = std::str::from_utf8(line).expect("worked-example line is UTF-8");
+        assert!(
+            line.contains(expected),
+            "worked-example line contains its replacement target"
+        );
+        line.replacen(expected, replacement, 1).into_bytes()
+    }
+
+    fn assert_canonical_fork_entry(
+        line: &[u8],
+        expected_entry_id: &str,
+        expected_parent_id: Option<&str>,
+    ) {
+        let entry =
+            ConversationLineCodec::decode_entry_for_session(line, fork_header().session_id())
+                .expect("rewritten Fork line remains a production-codec accepted Entry");
+        assert_eq!(
+            ConversationLineCodec::encode_entry(&entry)
+                .expect("production codec can re-encode accepted Fork Entry"),
+            line,
+            "rewritten Fork line remains byte-for-byte canonical"
+        );
+        assert_eq!(
+            entry.entry_id(),
+            expected_entry_id
+                .parse::<EntryId>()
+                .expect("expected Entry ID is valid")
+        );
+        assert_eq!(
+            entry.parent_id(),
+            expected_parent_id.map(|parent_id| {
+                parent_id
+                    .parse::<EntryId>()
+                    .expect("expected parent Entry ID is valid")
+            })
+        );
+    }
+
+    struct UnavailableReader;
+
+    impl Read for UnavailableReader {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("private read failure"))
+        }
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_accepts_the_canonical_header_only_shapes() {
+        let expected_header = standard_header();
+        for expected_shape in [
+            UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+        ] {
+            assert_eq!(
+                classify_for_restart_cleanup(HEADER_ONLY, &expected_header, expected_shape),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_accepts_the_authoritative_canonical_fork_child() {
+        assert_eq!(
+            classify_for_restart_cleanup(
+                FORK_CHILD,
+                &fork_header(),
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_accepts_an_authoritative_fork_header_and_first_entry_prefix_for_cleanup_only()
+     {
+        let first_entry_prefix = fork_with_entries(&[fork_line(1)]);
+        // This says the prefix can be safely classified for restart cleanup only; it does not
+        // prove that the original Fork fully materialized.
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &first_entry_prefix,
+                &fork_header(),
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_rejects_entries_for_an_ordinary_header_only_session() {
+        let first_fork_entry = fork_line(1);
+        let bytes = lines_after_standard_header(&[&replace_once(
+            &first_fork_entry,
+            "ses_33333333333333333333333333333333",
+            "ses_11111111111111111111111111111111",
+        )]);
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &bytes,
+                &standard_header(),
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_rejects_an_expected_header_mismatch() {
+        let different_expected_header = header(
+            "ses_11111111111111111111111111111111",
+            "2026-07-31T12:00:01.000Z",
+            "agt_22222222222222222222222222222222",
+        );
+        assert_eq!(
+            classify_for_restart_cleanup(
+                HEADER_ONLY,
+                &different_expected_header,
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_classifies_header_failures_as_corrupt() {
+        let expected_header = standard_header();
+        for bytes in [
+            b"".as_slice(),
+            b"not JSON\n".as_slice(),
+            include_bytes!(
+                "../docs/fixtures/wire-v1/conversation/corruption/duplicate-header-key.jsonl"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../docs/fixtures/wire-v1/conversation/corruption/unsupported-version-header.jsonl"
+            )
+            .as_slice(),
+            include_bytes!(
+                "../docs/fixtures/wire-v1/conversation/corruption/wrong-session-header.jsonl"
+            )
+            .as_slice(),
+        ] {
+            assert_eq!(
+                classify_for_restart_cleanup(
+                    bytes,
+                    &expected_header,
+                    UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+                ),
+                Err(UnpublishedConversationRecoveryError::Corrupt)
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_rejects_noncanonical_header_and_accepted_entry_lines() {
+        let expected_header = standard_header();
+        let mut crlf_header = HEADER_ONLY
+            .strip_suffix(b"\n")
+            .expect("authoritative header has LF")
+            .to_vec();
+        crlf_header.extend_from_slice(b"\r\n");
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &crlf_header,
+                &expected_header,
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+
+        let mut header_with_trailing_whitespace = HEADER_ONLY
+            .strip_suffix(b"\n")
+            .expect("authoritative header has LF")
+            .to_vec();
+        header_with_trailing_whitespace.extend_from_slice(b" \n");
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &header_with_trailing_whitespace,
+                &expected_header,
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+
+        let entry = replace_once(
+            &fork_line(1),
+            "ses_33333333333333333333333333333333",
+            "ses_11111111111111111111111111111111",
+        );
+        let mut crlf_entry = HEADER_ONLY.to_vec();
+        crlf_entry.extend_from_slice(&entry);
+        crlf_entry.extend_from_slice(b"\r\n");
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &crlf_entry,
+                &expected_header,
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+
+        let additive = additive_entry(&entry);
+        let additive = lines_after_standard_header(&[&additive]);
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &additive,
+                &expected_header,
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+
+        let salvage = include_bytes!(
+            "../docs/fixtures/wire-v1/conversation/corruption/contribution-stamp-salvage.jsonl"
+        );
+        let salvage_header = header(
+            "ses_16161616161616161616161616161616",
+            "2026-07-31T18:00:00.000Z",
+            "agt_27272727272727272727272727272727",
+        );
+        assert_eq!(
+            classify_for_restart_cleanup(
+                salvage,
+                &salvage_header,
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_classifies_complete_faults_tails_and_caps() {
+        for line in [
+            b"not JSON".as_slice(),
+            b"{\"type\":\"future_record\",\"data\":{}}".as_slice(),
+        ] {
+            let bytes = lines_after_standard_header(&[line]);
+            assert_eq!(
+                classify_for_restart_cleanup(
+                    &bytes,
+                    &standard_header(),
+                    UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+                ),
+                Err(UnpublishedConversationRecoveryError::Corrupt)
+            );
+        }
+
+        let mut partial_tail = HEADER_ONLY.to_vec();
+        partial_tail.extend_from_slice(b"partial record");
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &partial_tail,
+                &standard_header(),
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Err(UnpublishedConversationRecoveryError::Corrupt)
+        );
+
+        let mut oversized_entry = HEADER_ONLY.to_vec();
+        oversized_entry.extend(std::iter::repeat_n(b' ', MAX_CONVERSATION_ENTRY_BYTES + 1));
+        oversized_entry.push(b'\n');
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &oversized_entry,
+                &standard_header(),
+                UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+            ),
+            Err(UnpublishedConversationRecoveryError::TooLarge)
+        );
+
+        let header_without_lf = HEADER_ONLY
+            .strip_suffix(b"\n")
+            .expect("authoritative header has LF");
+        let mut oversized_header = header_without_lf.to_vec();
+        oversized_header.extend(std::iter::repeat_n(
+            b' ',
+            MAX_CONVERSATION_HEADER_BYTES - header_without_lf.len() + 1,
+        ));
+        oversized_header.push(b'\n');
+        assert_eq!(
+            classify_for_restart_cleanup(
+                &oversized_header,
+                &standard_header(),
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_rejects_canonical_fork_second_root_orphan_nonlinear_and_duplicate_entries()
+     {
+        let root = fork_line(1);
+        let child = fork_line(2);
+        let second_root = replace_once(
+            &child,
+            "\"parentId\":\"ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            "\"parentId\":null",
+        );
+        let orphan = replace_once(
+            &child,
+            "ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ent_cccccccccccccccccccccccccccccccc",
+        );
+        let third_from_root = replace_once(
+            &child,
+            "ent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ent_cccccccccccccccccccccccccccccccc",
+        );
+        let duplicate_id = replace_once(
+            &child,
+            "ent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        // Attribute each rejection to relationship or identity rules, rather than a replacement
+        // mistake or a codec failure: every rewritten line remains canonical and accepted by the
+        // production Entry codec before recovery classification.
+        assert_canonical_fork_entry(&second_root, "ent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", None);
+        assert_canonical_fork_entry(
+            &orphan,
+            "ent_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            Some("ent_cccccccccccccccccccccccccccccccc"),
+        );
+        assert_canonical_fork_entry(
+            &third_from_root,
+            "ent_cccccccccccccccccccccccccccccccc",
+            Some("ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        assert_canonical_fork_entry(
+            &duplicate_id,
+            "ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            Some("ent_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+
+        for (case, entries) in [
+            ("second root", vec![root.clone(), second_root]),
+            ("orphan", vec![root.clone(), orphan]),
+            (
+                "nonlinear third entry from root",
+                vec![root.clone(), child.clone(), third_from_root],
+            ),
+            ("duplicate entry ID", vec![root, duplicate_id]),
+        ] {
+            let bytes = fork_with_entries(&entries);
+            assert_eq!(
+                classify_for_restart_cleanup(
+                    &bytes,
+                    &fork_header(),
+                    UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+                ),
+                Err(UnpublishedConversationRecoveryError::Corrupt),
+                "canonical Fork {case} is corrupt for recovery classification"
+            );
+        }
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_maps_input_availability_without_details() {
+        let expected_header = standard_header();
+        assert_eq!(
+            validate_unpublished_conversation_for_recovery(
+                UnavailableReader,
+                u64::try_from(HEADER_ONLY.len()).expect("fixture length fits u64"),
+                &expected_header,
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Unavailable)
+        );
+        assert_eq!(
+            validate_unpublished_conversation_for_recovery(
+                Cursor::new(HEADER_ONLY.to_vec()),
+                u64::try_from(HEADER_ONLY.len() + 1).expect("fixture length fits u64"),
+                &expected_header,
+                UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
+            ),
+            Err(UnpublishedConversationRecoveryError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_maps_scanner_counter_overflow_to_unavailable() {
+        assert_eq!(
+            map_unpublished_conversation_recovery_scan_error(
+                ConversationScanError::CounterOverflow
+            ),
+            UnpublishedConversationRecoveryError::Unavailable
+        );
+    }
+
+    #[test]
+    fn unpublished_conversation_recovery_errors_are_redacted() {
+        let bytes = lines_after_standard_header(&[
+            b"secret conversation text /private/path ent_99999999999999999999999999999999",
+        ]);
+        let error = classify_for_restart_cleanup(
+            &bytes,
+            &standard_header(),
+            UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile,
+        )
+        .expect_err("complete malformed entry is corrupt");
+        for secret in [
+            "ses_11111111111111111111111111111111",
+            "ent_99999999999999999999999999999999",
+            "secret conversation text",
+            "/private/path",
+            "MalformedJson",
+            "HeaderCorrupt",
+        ] {
+            assert!(
+                !format!("{error:?}").contains(secret) && !error.to_string().contains(secret),
+                "unpublished conversation recovery error leaked {secret}"
+            );
+        }
+    }
 
     fn model() -> ModelResponseSummary {
         ModelResponseSummary::reconstruct(
