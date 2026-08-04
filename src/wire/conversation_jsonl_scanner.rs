@@ -1,4 +1,5 @@
 use std::fmt;
+#[cfg(feature = "heavy-tests")]
 use std::fs::File;
 use std::io::Read;
 
@@ -245,10 +246,6 @@ impl<R> fmt::Debug for ConversationJsonlScanner<'_, R> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "scanner seams remain consumed by storage integrations"
-)]
 impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
     pub(crate) fn open(
         reader: R,
@@ -269,6 +266,10 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
     ///
     /// This seam intentionally accepts no scan access: metadata-unavailable input is always
     /// read-only, so it cannot manufacture authorization to truncate a partial tail.
+    #[allow(
+        dead_code,
+        reason = "M3.2 production scanner contract supports stat-unavailable read-only inputs"
+    )]
     pub(crate) fn open_read_only_without_metadata(
         reader: R,
         opened_session_id: SessionId,
@@ -371,6 +372,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
             .ok_or(ConversationScanError::InvariantViolation)
     }
 
+    #[cfg(any(test, feature = "heavy-tests"))]
     pub(crate) const fn complete_entry_records(&self) -> u64 {
         self.complete_entry_records
     }
@@ -601,10 +603,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "file scanner seam remains consumed by storage integrations"
-)]
+#[cfg(feature = "heavy-tests")]
 impl<'lease> ConversationJsonlScanner<'lease, File> {
     pub(crate) fn open_file(
         file: File,
