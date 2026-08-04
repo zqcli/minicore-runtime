@@ -135,6 +135,10 @@ impl DurableStoreV1Codec {
         Self::decode_session_definition_for_target(input, WorkspacePathTarget::current())
     }
 
+    #[allow(
+        dead_code,
+        reason = "the next M5 publication slice writes current-target Session definitions"
+    )]
     pub(crate) fn encode_session_definition(
         definition: &SessionDefinition,
     ) -> Result<Vec<u8>, DurableStoreCodecError> {

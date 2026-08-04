@@ -32,6 +32,10 @@ use crate::wire::{
 };
 
 #[path = "live_conversation.rs"]
+#[allow(
+    dead_code,
+    reason = "the completed M4 live reducer is consumed by the pending M7 and M5.2 slices"
+)]
 pub(crate) mod live_conversation;
 
 // Conversation Storage exposes only its immutable read projection. The reducer module remains

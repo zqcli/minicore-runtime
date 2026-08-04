@@ -1,15 +1,7 @@
 mod bootstrap;
 mod bounded_json;
-#[allow(
-    dead_code,
-    reason = "M3 line codec is consumed by future storage and recorder slices"
-)]
 pub(crate) mod conversation_jsonl;
 pub(crate) mod conversation_jsonl_scanner;
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 entity documents are consumed by DurableState recovery"
-)]
 pub(crate) mod durable_store;
 
 #[cfg(feature = "heavy-tests")]
