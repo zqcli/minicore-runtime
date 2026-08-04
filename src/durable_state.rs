@@ -11,13 +11,16 @@ use fs4::fs_std::FileExt;
 
 use crate::agent_session_lifecycle::{
     AgentDefinition, AgentMetadata, AgentStatus, SessionForkProvenance, SessionLifecycle,
-    SessionMetadata,
+    SessionMetadata, agent_definitions_have_same_canonical_execution_content,
+    agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
 };
 use crate::runtime_task::RuntimeTaskContext;
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
 };
-use crate::wire::{AgentId, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp};
+use crate::wire::{
+    AgentId, AgentMetadataRevision, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp,
+};
 
 const LOCK_FILE: &str = ".minicore.lock";
 const FORMAT_MARKER: &str = "MINICORE_STORE_V1";
@@ -383,19 +386,38 @@ pub(crate) enum DurableOpenError {
     StorageUnavailable,
 }
 
+/// One recovered Agent's immutable current facts. Historical heads are folded away after
+/// validation; retained definitions remain privately addressable through a compact index.
+struct DurableAgentCatalogEntry {
+    current_head: Arc<DurableAgentHead>,
+    current_definition: Arc<AgentDefinition>,
+    definition_index: BTreeMap<AgentRevision, StorageGeneration>,
+}
+
+impl fmt::Debug for DurableAgentCatalogEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableAgentCatalogEntry")
+            .field("current_head", &"redacted")
+            .field("current_definition", &"redacted")
+            .field("definition_index", &"redacted")
+            .finish()
+    }
+}
+
 /// The private owner of the Store V1 root lease and recovered immutable catalog.
 pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
     lease: Arc<RootLease>,
     #[allow(
         dead_code,
-        reason = "G1 recovery catalog is consumed by later runtime read paths"
+        reason = "recovery catalog is consumed by later runtime read paths"
     )]
-    agents: Arc<BTreeMap<AgentId, Arc<DurableAgentHead>>>,
+    agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
 }
 
 impl DurableState {
-    /// Opens a Store V1 root and recovers the currently supported immutable catalog slice.
+    /// Opens a Store V1 root and recovers the currently supported committed Agent chains.
     /// Every filesystem operation runs in one tracked blocking job, never on a Tokio worker.
     pub(crate) async fn open(
         root: PathBuf,
@@ -421,10 +443,39 @@ impl DurableState {
 
     #[allow(
         dead_code,
-        reason = "G1 recovery catalog is consumed by later runtime read paths"
+        reason = "recovery catalog is consumed by later runtime read paths"
     )]
     pub(crate) fn agent_head(&self, agent_id: AgentId) -> Option<Arc<DurableAgentHead>> {
-        self.agents.get(&agent_id).cloned()
+        self.agents
+            .get(&agent_id)
+            .map(|entry| Arc::clone(&entry.current_head))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "recovery catalog is consumed by later Agent revision resolution"
+    )]
+    pub(crate) fn agent_current_definition(
+        &self,
+        agent_id: AgentId,
+    ) -> Option<Arc<AgentDefinition>> {
+        self.agents
+            .get(&agent_id)
+            .map(|entry| Arc::clone(&entry.current_definition))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "recovery catalog is consumed by later Agent revision resolution"
+    )]
+    pub(crate) fn contains_agent_definition(
+        &self,
+        agent_id: AgentId,
+        revision: AgentRevision,
+    ) -> bool {
+        self.agents
+            .get(&agent_id)
+            .is_some_and(|entry| entry.definition_index.contains_key(&revision))
     }
 }
 
@@ -435,7 +486,7 @@ struct RootLease {
 #[derive(Clone)]
 struct OpenRoot {
     lease: Arc<RootLease>,
-    agents: Arc<BTreeMap<AgentId, Arc<DurableAgentHead>>>,
+    agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
 }
 
 impl RootLease {
@@ -729,7 +780,7 @@ impl RecoveryCaps {
 fn recover_marked_root(
     root: &Path,
     entries: &[DirEntry],
-) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
+) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
     recover_marked_root_with_caps(root, entries, RecoveryCaps::PRODUCTION)
 }
 
@@ -737,7 +788,7 @@ fn recover_marked_root_with_caps(
     root: &Path,
     entries: &[DirEntry],
     caps: RecoveryCaps,
-) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
+) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
     let mut has_lock = false;
     let mut has_marker = false;
     let mut has_reservations = false;
@@ -842,7 +893,7 @@ fn recover_agents(
     reservations: &BTreeSet<AgentId>,
     maximum: usize,
     generation_maximum: usize,
-) -> Result<BTreeMap<AgentId, Arc<DurableAgentHead>>, DurableOpenError> {
+) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
     let metadata = metadata_without_following(path)?;
     validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
     let entries = read_entries_bounded(path, maximum)?;
@@ -860,8 +911,8 @@ fn recover_agents(
         if !reservations.contains(&agent_id) {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
-        let head = recover_agent_entity(&entity_path, agent_id, generation_maximum)?;
-        if agents.insert(agent_id, Arc::new(head)).is_some() {
+        let entry = recover_agent_entity(&entity_path, agent_id, generation_maximum)?;
+        if agents.insert(agent_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
     }
@@ -872,7 +923,7 @@ fn recover_agent_entity(
     path: &Path,
     agent_id: AgentId,
     generation_maximum: usize,
-) -> Result<DurableAgentHead, DurableOpenError> {
+) -> Result<DurableAgentCatalogEntry, DurableOpenError> {
     let entries = read_entries_bounded(path, AGENT_ENTITY_ENTRY_CAP)?;
     let mut published = false;
     let mut generations = None;
@@ -893,34 +944,101 @@ fn recover_agent_entity(
     if !published {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    recover_agent_generation_one(&generations, agent_id, generation_maximum)
+    recover_agent_generation_chain(&generations, agent_id, generation_maximum)
 }
 
-fn recover_agent_generation_one(
+/// Recovers a fully committed, contiguous Agent generation chain. Markerless trailing
+/// generations are deliberately rejected here: staging cleanup remains a later slice.
+fn recover_agent_generation_chain(
     path: &Path,
     agent_id: AgentId,
     maximum: usize,
-) -> Result<DurableAgentHead, DurableOpenError> {
+) -> Result<DurableAgentCatalogEntry, DurableOpenError> {
     let entries = read_entries_bounded(path, maximum)?;
-    if entries.len() != 1 {
+    let mut generation_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
+            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+        generation_entries.push((generation, entry));
+    }
+    generation_entries.sort_unstable_by_key(|(generation, _)| *generation);
+    for (_, entry) in &generation_entries {
+        validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
+    }
+
+    let mut generations = generation_entries.into_iter();
+    let Some((first_generation, first_entry)) = generations.next() else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if first_generation.get() != 1 {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    let generation_entry = &entries[0];
-    let generation = StorageGeneration::parse_directory_name(&generation_entry.file_name())
-        .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
-    if generation.get() != 1 {
+
+    let (first_head, Some(first_definition)) =
+        recover_agent_generation_payload(&first_entry.path())?
+    else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    validate_generation_one_agent_semantics(
+        agent_id,
+        first_generation,
+        &first_head,
+        &first_definition,
+    )?;
+
+    let mut current_head = first_head;
+    let mut current_definition = first_definition;
+    let mut definition_index = BTreeMap::new();
+    if definition_index
+        .insert(current_definition.revision(), first_generation)
+        .is_some()
+    {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    validate_directory_entry(generation_entry, DurableOpenError::DurableStateCorrupt)?;
-    recover_agent_generation_payload(&generation_entry.path(), agent_id, generation)
+
+    for (generation, generation_entry) in generations {
+        if generation.get()
+            != current_head
+                .storage_generation()
+                .get()
+                .checked_add(1)
+                .ok_or(DurableOpenError::DurableStateCorrupt)?
+        {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        let (head, definition) = recover_agent_generation_payload(&generation_entry.path())?;
+        validate_agent_generation_transition(
+            agent_id,
+            generation,
+            &current_head,
+            &current_definition,
+            &head,
+            definition.as_ref(),
+        )?;
+        if let Some(definition) = definition {
+            if definition_index
+                .insert(definition.revision(), generation)
+                .is_some()
+            {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            current_definition = definition;
+        }
+        current_head = head;
+    }
+
+    Ok(DurableAgentCatalogEntry {
+        current_head: Arc::new(current_head),
+        current_definition: Arc::new(current_definition),
+        definition_index,
+    })
 }
 
 fn recover_agent_generation_payload(
     path: &Path,
-    agent_id: AgentId,
-    generation: StorageGeneration,
-) -> Result<DurableAgentHead, DurableOpenError> {
-    let entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+) -> Result<(DurableAgentHead, Option<AgentDefinition>), DurableOpenError> {
+    let mut entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
     let mut head_path = None;
     let mut definition_path = None;
     let mut committed = false;
@@ -936,7 +1054,7 @@ fn recover_agent_generation_payload(
             return Err(DurableOpenError::DurableStateCorrupt);
         }
     }
-    let (Some(head_path), Some(definition_path)) = (head_path, definition_path) else {
+    let Some(head_path) = head_path else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
     if !committed {
@@ -944,9 +1062,11 @@ fn recover_agent_generation_payload(
     }
 
     let head = decode_agent_head_document(&head_path)?;
-    let definition = decode_agent_definition_document(&definition_path)?;
-    validate_generation_one_agent_semantics(agent_id, generation, &head, &definition)?;
-    Ok(head)
+    let definition = definition_path
+        .as_deref()
+        .map(decode_agent_definition_document)
+        .transpose()?;
+    Ok((head, definition))
 }
 
 fn parse_agent_id_name(name: &OsStr) -> Result<AgentId, DurableOpenError> {
@@ -980,6 +1100,101 @@ fn validate_generation_one_agent_semantics(
         return Err(DurableOpenError::DurableStateCorrupt);
     }
     Ok(())
+}
+
+fn validate_agent_generation_transition(
+    path_agent_id: AgentId,
+    path_generation: StorageGeneration,
+    previous_head: &DurableAgentHead,
+    current_definition: &AgentDefinition,
+    head: &DurableAgentHead,
+    definition: Option<&AgentDefinition>,
+) -> Result<(), DurableOpenError> {
+    if head.agent_id() != path_agent_id
+        || head.storage_generation() != path_generation
+        || head.previous_storage_generation() != Some(previous_head.storage_generation())
+        || previous_head.status() == AgentStatus::Deleted
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    match definition {
+        Some(definition) => validate_agent_definition_transition(
+            path_agent_id,
+            path_generation,
+            previous_head,
+            current_definition,
+            head,
+            definition,
+        ),
+        None if agent_metadata_transition_is_valid(previous_head, head) => Ok(()),
+        None if agent_status_transition_is_valid(previous_head, head) => Ok(()),
+        None => Err(DurableOpenError::DurableStateCorrupt),
+    }
+}
+
+fn validate_agent_definition_transition(
+    path_agent_id: AgentId,
+    path_generation: StorageGeneration,
+    previous_head: &DurableAgentHead,
+    current_definition: &AgentDefinition,
+    head: &DurableAgentHead,
+    definition: &AgentDefinition,
+) -> Result<(), DurableOpenError> {
+    if definition.agent_id() != path_agent_id
+        || !is_exact_next_agent_revision(
+            previous_head.current_definition_revision(),
+            head.current_definition_revision(),
+        )
+        || definition.revision() != head.current_definition_revision()
+        || head.current_definition_storage_generation() != path_generation
+        || head.metadata() != previous_head.metadata()
+        || head.status() != previous_head.status()
+        || head.created_at() != previous_head.created_at()
+        || agent_definitions_have_same_canonical_execution_content(current_definition, definition)
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(())
+}
+
+fn agent_metadata_transition_is_valid(
+    previous_head: &DurableAgentHead,
+    head: &DurableAgentHead,
+) -> bool {
+    head.current_definition_revision() == previous_head.current_definition_revision()
+        && head.current_definition_storage_generation()
+            == previous_head.current_definition_storage_generation()
+        && is_exact_next_agent_metadata_revision(
+            previous_head.metadata().revision(),
+            head.metadata().revision(),
+        )
+        && !agent_metadata_has_same_canonical_content(previous_head.metadata(), head.metadata())
+        && head.status() == previous_head.status()
+        && head.created_at() == previous_head.created_at()
+}
+
+fn agent_status_transition_is_valid(
+    previous_head: &DurableAgentHead,
+    head: &DurableAgentHead,
+) -> bool {
+    head.current_definition_revision() == previous_head.current_definition_revision()
+        && head.current_definition_storage_generation()
+            == previous_head.current_definition_storage_generation()
+        && head.metadata() == previous_head.metadata()
+        && head.created_at() == previous_head.created_at()
+        && is_legal_agent_status_transition(previous_head.status(), head.status())
+}
+
+fn is_exact_next_agent_revision(previous: AgentRevision, next: AgentRevision) -> bool {
+    previous.get().checked_add(1) == Some(next.get())
+}
+
+fn is_exact_next_agent_metadata_revision(
+    previous: AgentMetadataRevision,
+    next: AgentMetadataRevision,
+) -> bool {
+    previous.get().checked_add(1) == Some(next.get())
 }
 
 fn validate_regular_entry(
@@ -1353,11 +1568,13 @@ mod tests {
         read_durable_document, read_entries_bounded, recover_marked_root_with_caps,
     };
     use crate::agent_session_lifecycle::{
-        ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+        AgentStatus, ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle,
+        SessionMetadata,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{
-        AgentId, ItemId, SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
+        AgentId, AgentRevision, ItemId, SessionDefinitionRevision, SessionId,
+        SessionMetadataRevision, Timestamp,
     };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -1567,6 +1784,9 @@ mod tests {
     const AGENT_ONE: &str = "agt_11111111111111111111111111111111";
     const AGENT_TWO: &str = "agt_22222222222222222222222222222222";
     const GENERATION_ONE: &str = "00000000000000000001";
+    const GENERATION_TWO: &str = "00000000000000000002";
+    const GENERATION_THREE: &str = "00000000000000000003";
+    const GENERATION_FOUR: &str = "00000000000000000004";
 
     fn agent_head_fixture() -> &'static [u8] {
         include_bytes!("../docs/fixtures/durable-store-v1/agent-head.json")
@@ -1574,6 +1794,22 @@ mod tests {
 
     fn agent_definition_fixture() -> &'static [u8] {
         include_bytes!("../docs/fixtures/durable-store-v1/agent-definition.json")
+    }
+
+    fn agent_head_definition_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-definition.json")
+    }
+
+    fn agent_definition_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-definition-2.json")
+    }
+
+    fn agent_head_metadata_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-metadata.json")
+    }
+
+    fn agent_head_status_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-status.json")
     }
 
     fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
@@ -1594,6 +1830,12 @@ mod tests {
         agent_path(root, agent_id)
             .join("generations")
             .join(GENERATION_ONE)
+    }
+
+    fn generation_path_named(root: &Path, agent_id: &str, generation: &str) -> PathBuf {
+        agent_path(root, agent_id)
+            .join("generations")
+            .join(generation)
     }
 
     fn create_exact_g1_agent(root: &Path, agent_id: &str, head: &[u8], definition: &[u8]) {
@@ -1622,6 +1864,53 @@ mod tests {
             AGENT_ONE,
             agent_head_fixture(),
             agent_definition_fixture(),
+        );
+    }
+
+    fn create_agent_generation(
+        root: &Path,
+        agent_id: &str,
+        generation: &str,
+        head: &[u8],
+        definition: Option<&[u8]>,
+    ) {
+        let path = generation_path_named(root, agent_id, generation);
+        create_directory(&path);
+        create_file(&path.join("head.json"), head);
+        if let Some(definition) = definition {
+            create_file(&path.join("definition.json"), definition);
+        }
+        create_file(&path.join("COMMITTED"), b"");
+    }
+
+    fn g3_deleted_status_head() -> Vec<u8> {
+        let top_level = replace_fixture(
+            agent_head_status_g2_fixture(),
+            "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+            "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+        );
+        replace_fixture(
+            &top_level,
+            "\"status\":\"disabled\"",
+            "\"status\":\"deleted\"",
+        )
+    }
+
+    fn create_chain_through_g3_deleted(root: &Path) {
+        create_valid_g1_agent(root);
+        create_agent_generation(
+            root,
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_status_g2_fixture(),
+            None,
+        );
+        create_agent_generation(
+            root,
+            AGENT_ONE,
+            GENERATION_THREE,
+            &g3_deleted_status_head(),
+            None,
         );
     }
 
@@ -2080,10 +2369,691 @@ mod tests {
             first.status(),
             crate::agent_session_lifecycle::AgentStatus::Enabled
         );
+        let definition = state
+            .agent_current_definition(agent_id)
+            .expect("the G1 current definition is retained");
+        let same_definition = state
+            .agent_current_definition(agent_id)
+            .expect("the same G1 current definition is retained");
+        assert!(Arc::ptr_eq(&definition, &same_definition));
+        assert_eq!(definition.revision().get(), 1);
+        assert!(
+            state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(1).unwrap())
+            )
+        );
+        assert!(
+            !state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(2).unwrap())
+            )
+        );
+        let catalog_debug = format!("{:?}", state.agents.get(&agent_id).unwrap());
+        for secret in [AGENT_ONE, "base", "safety"] {
+            assert!(
+                !catalog_debug.contains(secret),
+                "catalog debug leaked {secret:?}"
+            );
+        }
         assert!(
             state
                 .agent_head(AgentId::from_str(AGENT_TWO).expect("a fixed second ID is valid"))
                 .is_none()
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_g2_metadata_fixture_retains_the_g1_current_definition() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_metadata_g2_fixture(),
+            None,
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("the authoritative G1/G2 metadata chain opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let head = state.agent_head(agent_id).unwrap();
+        assert_eq!(head.storage_generation().get(), 2);
+        assert_eq!(head.metadata().revision().get(), 2);
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        assert!(
+            state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(1).unwrap())
+            )
+        );
+        assert!(
+            !state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(2).unwrap())
+            )
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_g2_status_fixture_retains_the_g1_current_definition() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_status_g2_fixture(),
+            None,
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("the authoritative G1/G2 status chain opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let head = state.agent_head(agent_id).unwrap();
+        assert_eq!(head.storage_generation().get(), 2);
+        assert_eq!(head.status(), AgentStatus::Disabled);
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn metadata_after_definition_retains_the_latest_definition_and_complete_index() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let g3_metadata = replace_fixture(
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"currentDefinition\":{\"revision\":\"ar_1\",\"storageGeneration\":1}",
+            "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+        );
+        create_agent_generation(root.path(), AGENT_ONE, GENERATION_THREE, &g3_metadata, None);
+
+        let state = open(root.path())
+            .await
+            .expect("metadata after a definition change retains the G2 definition");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let head = state.agent_head(agent_id).unwrap();
+        assert_eq!(head.storage_generation().get(), 3);
+        assert_eq!(head.metadata().revision().get(), 2);
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        for revision in 1..=2 {
+            assert!(state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(revision).unwrap())
+            ));
+        }
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_g3_status_chain_uses_numeric_generation_order_not_creation_order() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        // Materialize G3 before G2 so recovery cannot accidentally trust read_dir order.
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            &g3_deleted_status_head(),
+            None,
+        );
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_status_g2_fixture(),
+            None,
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("the numeric G1/G2/G3 status chain opens");
+        let head = state
+            .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+            .unwrap();
+        assert_eq!(head.storage_generation().get(), 3);
+        assert_eq!(head.status(), AgentStatus::Deleted);
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn direct_delete_and_reenable_status_edges_are_valid() {
+        let direct_delete = TempRoot::existing();
+        create_marked_empty_store(direct_delete.path());
+        create_valid_g1_agent(direct_delete.path());
+        create_agent_generation(
+            direct_delete.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"status\":\"disabled\"",
+                "\"status\":\"deleted\"",
+            ),
+            None,
+        );
+        let state = open(direct_delete.path())
+            .await
+            .expect("an Enabled Agent may become Deleted directly");
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .status(),
+            AgentStatus::Deleted
+        );
+        state.close().await;
+
+        let reenable = TempRoot::existing();
+        create_marked_empty_store(reenable.path());
+        create_valid_g1_agent(reenable.path());
+        create_agent_generation(
+            reenable.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_status_g2_fixture(),
+            None,
+        );
+        let g3_enabled = replace_fixture(
+            &replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"status\":\"disabled\"",
+            "\"status\":\"enabled\"",
+        );
+        create_agent_generation(
+            reenable.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            &g3_enabled,
+            None,
+        );
+        let state = open(reenable.path())
+            .await
+            .expect("a Disabled Agent may become Enabled again");
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .status(),
+            AgentStatus::Enabled
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn definition_rollback_to_nonadjacent_content_is_valid_when_it_changes_from_current() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let g3_head = replace_fixture(
+            &replace_fixture(
+                agent_head_definition_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+            ),
+            "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+            "\"currentDefinition\":{\"revision\":\"ar_3\",\"storageGeneration\":3}",
+        );
+        let g3_definition = replace_fixture(
+            &replace_fixture(
+                agent_definition_fixture(),
+                "\"revision\":\"ar_1\"",
+                "\"revision\":\"ar_3\"",
+            ),
+            "\"createdAt\":\"2026-08-03T10:00:00.123Z\"",
+            "\"createdAt\":\"2026-08-03T10:00:06.000Z\"",
+        );
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            &g3_head,
+            Some(&g3_definition),
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("a definition may roll back to earlier nonadjacent execution content");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            3
+        );
+        for revision in 1..=3 {
+            assert!(state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(revision).unwrap())
+            ));
+        }
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn definition_metadata_and_status_canonical_no_ops_are_corrupt() {
+        let definition_no_op = TempRoot::existing();
+        create_marked_empty_store(definition_no_op.path());
+        create_valid_g1_agent(definition_no_op.path());
+        let repeated_execution_content = replace_fixture(
+            &replace_fixture(
+                agent_definition_fixture(),
+                "\"revision\":\"ar_1\"",
+                "\"revision\":\"ar_2\"",
+            ),
+            "\"createdAt\":\"2026-08-03T10:00:00.123Z\"",
+            "\"createdAt\":\"2026-08-03T10:00:01.000Z\"",
+        );
+        create_agent_generation(
+            definition_no_op.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(&repeated_execution_content),
+        );
+        assert_corrupt(open(definition_no_op.path()).await);
+
+        let metadata_no_op = TempRoot::existing();
+        create_marked_empty_store(metadata_no_op.path());
+        create_valid_g1_agent(metadata_no_op.path());
+        let repeated_metadata_content = replace_fixture(
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"name\":\"Planner revised\"",
+                "\"name\":\"Planner\"",
+            ),
+            "\"updatedAt\":\"2026-08-03T10:00:00.123Z\"",
+            "\"updatedAt\":\"2026-08-03T10:00:01.000Z\"",
+        );
+        create_agent_generation(
+            metadata_no_op.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &repeated_metadata_content,
+            None,
+        );
+        assert_corrupt(open(metadata_no_op.path()).await);
+
+        let same_status = TempRoot::existing();
+        create_marked_empty_store(same_status.path());
+        create_valid_g1_agent(same_status.path());
+        create_agent_generation(
+            same_status.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"status\":\"disabled\"",
+                "\"status\":\"enabled\"",
+            ),
+            None,
+        );
+        assert_corrupt(open(same_status.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_categories_revision_reuse_and_pointer_or_payload_mismatches_are_corrupt() {
+        let mixed = TempRoot::existing();
+        create_marked_empty_store(mixed.path());
+        create_valid_g1_agent(mixed.path());
+        create_agent_generation(
+            mixed.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_definition_g2_fixture(),
+                "\"status\":\"enabled\"",
+                "\"status\":\"disabled\"",
+            ),
+            Some(agent_definition_g2_fixture()),
+        );
+        assert_corrupt(open(mixed.path()).await);
+
+        let mixed_metadata_status = TempRoot::existing();
+        create_marked_empty_store(mixed_metadata_status.path());
+        create_valid_g1_agent(mixed_metadata_status.path());
+        create_agent_generation(
+            mixed_metadata_status.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"status\":\"enabled\"",
+                "\"status\":\"disabled\"",
+            ),
+            None,
+        );
+        assert_corrupt(open(mixed_metadata_status.path()).await);
+
+        let revision_jump = TempRoot::existing();
+        create_marked_empty_store(revision_jump.path());
+        create_valid_g1_agent(revision_jump.path());
+        create_agent_generation(
+            revision_jump.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_definition_g2_fixture(),
+                "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+                "\"currentDefinition\":{\"revision\":\"ar_3\",\"storageGeneration\":2}",
+            ),
+            Some(&replace_fixture(
+                agent_definition_g2_fixture(),
+                "\"revision\":\"ar_2\"",
+                "\"revision\":\"ar_3\"",
+            )),
+        );
+        assert_corrupt(open(revision_jump.path()).await);
+
+        let metadata_revision_reuse = TempRoot::existing();
+        create_marked_empty_store(metadata_revision_reuse.path());
+        create_valid_g1_agent(metadata_revision_reuse.path());
+        create_agent_generation(
+            metadata_revision_reuse.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"revision\":\"amr_2\"",
+                "\"revision\":\"amr_1\"",
+            ),
+            None,
+        );
+        assert_corrupt(open(metadata_revision_reuse.path()).await);
+
+        let pointer_mismatch = TempRoot::existing();
+        create_marked_empty_store(pointer_mismatch.path());
+        create_valid_g1_agent(pointer_mismatch.path());
+        create_agent_generation(
+            pointer_mismatch.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_definition_g2_fixture(),
+                "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+                "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":1}",
+            ),
+            Some(agent_definition_g2_fixture()),
+        );
+        assert_corrupt(open(pointer_mismatch.path()).await);
+
+        let pointer_without_definition = TempRoot::existing();
+        create_marked_empty_store(pointer_without_definition.path());
+        create_valid_g1_agent(pointer_without_definition.path());
+        create_agent_generation(
+            pointer_without_definition.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"currentDefinition\":{\"revision\":\"ar_1\",\"storageGeneration\":1}",
+                "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+            ),
+            None,
+        );
+        assert_corrupt(open(pointer_without_definition.path()).await);
+
+        let missing_definition = TempRoot::existing();
+        create_marked_empty_store(missing_definition.path());
+        create_valid_g1_agent(missing_definition.path());
+        create_agent_generation(
+            missing_definition.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            None,
+        );
+        assert_corrupt(open(missing_definition.path()).await);
+
+        let unexpected_definition = TempRoot::existing();
+        create_marked_empty_store(unexpected_definition.path());
+        create_valid_g1_agent(unexpected_definition.path());
+        create_agent_generation(
+            unexpected_definition.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_metadata_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        assert_corrupt(open(unexpected_definition.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn generation_gap_g2_alone_and_corrupt_highest_generation_never_fall_back() {
+        let gap = TempRoot::existing();
+        create_marked_empty_store(gap.path());
+        create_valid_g1_agent(gap.path());
+        create_agent_generation(
+            gap.path(),
+            AGENT_ONE,
+            GENERATION_THREE,
+            &g3_deleted_status_head(),
+            None,
+        );
+        assert_corrupt(open(gap.path()).await);
+
+        let g2_alone = TempRoot::existing();
+        create_marked_empty_store(g2_alone.path());
+        create_valid_g1_agent(g2_alone.path());
+        fs::rename(
+            generation_path(g2_alone.path(), AGENT_ONE),
+            generation_path_named(g2_alone.path(), AGENT_ONE, GENERATION_TWO),
+        )
+        .unwrap();
+        assert_corrupt(open(g2_alone.path()).await);
+
+        let corrupt_highest = TempRoot::existing();
+        create_marked_empty_store(corrupt_highest.path());
+        create_valid_g1_agent(corrupt_highest.path());
+        create_agent_generation(
+            corrupt_highest.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            b"not canonical JSON\n",
+            None,
+        );
+        assert_corrupt(open(corrupt_highest.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_markerless_trailing_generation_fails_closed_until_cleanup_is_implemented() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let pending = generation_path_named(root.path(), AGENT_ONE, GENERATION_TWO);
+        create_directory(&pending);
+        create_file(&pending.join("head.json"), agent_head_metadata_g2_fixture());
+
+        assert_corrupt(open(root.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleted_agent_rejects_every_later_definition_metadata_or_status_generation() {
+        let definition = TempRoot::existing();
+        create_marked_empty_store(definition.path());
+        create_chain_through_g3_deleted(definition.path());
+        let definition_after_deleted = replace_fixture(
+            &replace_fixture(
+                agent_head_definition_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+            ),
+            "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":2}",
+            "\"currentDefinition\":{\"revision\":\"ar_2\",\"storageGeneration\":4}",
+        );
+        let definition_after_deleted = replace_fixture(
+            &definition_after_deleted,
+            "\"status\":\"enabled\"",
+            "\"status\":\"deleted\"",
+        );
+        create_agent_generation(
+            definition.path(),
+            AGENT_ONE,
+            GENERATION_FOUR,
+            &definition_after_deleted,
+            Some(agent_definition_g2_fixture()),
+        );
+        assert_corrupt(open(definition.path()).await);
+
+        let metadata = TempRoot::existing();
+        create_marked_empty_store(metadata.path());
+        create_chain_through_g3_deleted(metadata.path());
+        let metadata_after_deleted = replace_fixture(
+            &replace_fixture(
+                agent_head_metadata_g2_fixture(),
+                "\"storageGeneration\":2,\"previousStorageGeneration\":1",
+                "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+            ),
+            "\"status\":\"enabled\"",
+            "\"status\":\"deleted\"",
+        );
+        create_agent_generation(
+            metadata.path(),
+            AGENT_ONE,
+            GENERATION_FOUR,
+            &metadata_after_deleted,
+            None,
+        );
+        assert_corrupt(open(metadata.path()).await);
+
+        let status = TempRoot::existing();
+        create_marked_empty_store(status.path());
+        create_chain_through_g3_deleted(status.path());
+        let status_after_deleted = replace_fixture(
+            &replace_fixture(
+                &g3_deleted_status_head(),
+                "\"storageGeneration\":3,\"previousStorageGeneration\":2",
+                "\"storageGeneration\":4,\"previousStorageGeneration\":3",
+            ),
+            "\"status\":\"deleted\"",
+            "\"status\":\"disabled\"",
+        );
+        create_agent_generation(
+            status.path(),
+            AGENT_ONE,
+            GENERATION_FOUR,
+            &status_after_deleted,
+            None,
+        );
+        assert_corrupt(open(status.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn valid_g2_definition_recovers_the_current_definition_and_complete_revision_index() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let generation = agent_path(root.path(), AGENT_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        create_directory(&generation);
+        create_file(
+            &generation.join("head.json"),
+            agent_head_definition_g2_fixture(),
+        );
+        create_file(
+            &generation.join("definition.json"),
+            agent_definition_g2_fixture(),
+        );
+        create_file(&generation.join("COMMITTED"), b"");
+
+        let state = open(root.path())
+            .await
+            .expect("the authoritative G1/G2 definition chain opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).expect("the fixture ID is valid");
+        let head = state
+            .agent_head(agent_id)
+            .expect("the latest head is catalogued");
+        assert_eq!(head.storage_generation().get(), 2);
+        assert_eq!(head.current_definition_revision().get(), 2);
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .expect("the current definition is retained")
+                .revision()
+                .get(),
+            2
+        );
+        assert!(
+            state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(1).unwrap())
+            )
+        );
+        assert!(
+            state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(2).unwrap())
+            )
+        );
+        let index = &state.agents.get(&agent_id).unwrap().definition_index;
+        assert_eq!(index.len(), 2);
+        assert_eq!(
+            index
+                .get(&AgentRevision::new(NonZeroU64::new(1).unwrap()))
+                .unwrap()
+                .get(),
+            1
+        );
+        assert_eq!(
+            index
+                .get(&AgentRevision::new(NonZeroU64::new(2).unwrap()))
+                .unwrap()
+                .get(),
+            2
         );
         state.close().await;
     }
@@ -2328,7 +3298,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn g1_generation_namespace_is_exact_without_adjacent_recovery() {
+    async fn generation_chain_namespace_requires_canonical_names_and_a_contiguous_g1_start() {
         let unpadded = TempRoot::existing();
         create_marked_empty_store(unpadded.path());
         create_valid_g1_agent(unpadded.path());
