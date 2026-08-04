@@ -11,7 +11,6 @@ use time::OffsetDateTime;
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
 
 use crate::wire::Timestamp;
 
@@ -83,31 +82,17 @@ impl RuntimeTaskContext {
     /// Validates an injected host handle before making the owner available to other modules.
     pub(crate) async fn new(handle: Handle) -> Result<Self, RuntimeDependencyUnavailable> {
         let owner = Arc::new(RuntimeTaskOwner::new(handle));
-        let key = owner
-            .reserve_start()
-            .map_err(|_| RuntimeDependencyUnavailable)?;
-        let probe = catch_unwind(AssertUnwindSafe(|| {
-            owner.handle.spawn(async {
+        let context = Self { owner };
+        let probe = context
+            .spawn_tracked(async {
                 tokio::time::sleep(std::time::Duration::ZERO).await;
             })
-        }));
-        let probe = match probe {
-            Ok(probe) => probe,
-            Err(_) => {
-                owner.fail_start(key);
-                return Err(RuntimeDependencyUnavailable);
-            }
-        };
-
-        owner.install_probe(key, probe);
-        let Some(probe) = owner.take_probe(key) else {
-            return Err(RuntimeDependencyUnavailable);
-        };
-        if probe.await.is_err() {
+            .map_err(|_| RuntimeDependencyUnavailable)?;
+        if probe.join_registered().await.is_err() {
             return Err(RuntimeDependencyUnavailable);
         }
 
-        Ok(Self { owner })
+        Ok(context)
     }
 
     /// Starts owner-retained blocking work. The raw Tokio handle remains in the owner registry.
@@ -142,7 +127,7 @@ impl RuntimeTaskContext {
             Ok(handle) => {
                 let join_failure_settlement: Arc<dyn JoinFailureSettlement> = settlement.clone();
                 self.owner
-                    .install_blocking(key, handle, join_failure_settlement);
+                    .install_task(key, handle, join_failure_settlement);
             }
             Err(_) => {
                 self.owner.fail_start(key);
@@ -178,8 +163,8 @@ impl RuntimeTaskContext {
             Ok(handle) => {
                 let join_failure_settlement: Arc<dyn JoinFailureSettlement> = settlement.clone();
                 self.owner
-                    .install_async(key, handle, join_failure_settlement);
-                Ok(TrackedTask::new(settlement))
+                    .install_task(key, handle, join_failure_settlement);
+                Ok(TrackedTask::new(Arc::clone(&self.owner), key, settlement))
             }
             Err(_) => {
                 self.owner.fail_start(key);
@@ -212,7 +197,6 @@ impl RuntimeTaskContext {
 
     /// Closes admission and joins every operation reserved while the owner was open.
     pub(crate) async fn shutdown(&self) {
-        self.owner.cancellation.cancel();
         loop {
             // Register before inspecting leadership so a cancelled leader cannot clear its
             // claim between our inspection and this wait.
@@ -236,12 +220,41 @@ impl RuntimeTaskContext {
 /// Opaque caller-side access to one owner-tracked asynchronous operation.
 #[derive(Clone)]
 pub(crate) struct TrackedTask {
+    owner: Arc<RuntimeTaskOwner>,
+    key: RegistryKey,
     settlement: Arc<Settlement<()>>,
 }
 
 impl TrackedTask {
-    fn new(settlement: Arc<Settlement<()>>) -> Self {
-        Self { settlement }
+    fn new(
+        owner: Arc<RuntimeTaskOwner>,
+        key: RegistryKey,
+        settlement: Arc<Settlement<()>>,
+    ) -> Self {
+        Self {
+            owner,
+            key,
+            settlement,
+        }
+    }
+
+    /// Joins this task's exact owner registration before observing its shared settlement.
+    ///
+    /// This is intentionally private: normal callers wait on settlement, while initialization
+    /// must also observe a task that was cancelled or panicked before its first poll.
+    async fn join_registered(&self) -> Result<(), RuntimeTaskError> {
+        let task = self
+            .owner
+            .take_registered(self.key)
+            .ok_or(RuntimeTaskError::WorkerUnavailable)?;
+        let mut join = SingleRegisteredTaskJoinGuard::new(Arc::clone(&self.owner), self.key, task);
+        let join_failed = join.join().await.is_err();
+        let task = join.finish();
+        if join_failed {
+            task.settlement.settle_join_failure();
+        }
+        drop(task);
+        self.settlement.wait().await
     }
 
     pub(crate) async fn wait(&self) -> Result<(), RuntimeTaskError> {
@@ -288,7 +301,6 @@ where
 
 struct RuntimeTaskOwner {
     handle: Handle,
-    cancellation: CancellationToken,
     registry: Mutex<Registry>,
     registry_changed: Notify,
 }
@@ -297,7 +309,6 @@ impl RuntimeTaskOwner {
     fn new(handle: Handle) -> Self {
         Self {
             handle,
-            cancellation: CancellationToken::new(),
             registry: Mutex::new(Registry::new()),
             registry_changed: Notify::new(),
         }
@@ -317,37 +328,6 @@ impl RuntimeTaskOwner {
         Ok(key)
     }
 
-    fn install_probe(&self, key: RegistryKey, handle: JoinHandle<()>) {
-        let mut registry = lock(&self.registry);
-        registry.starting.remove(&key);
-        registry.probes.insert(key, handle);
-        drop(registry);
-        self.registry_changed.notify_waiters();
-    }
-
-    fn take_probe(&self, key: RegistryKey) -> Option<JoinHandle<()>> {
-        let mut registry = lock(&self.registry);
-        registry.probes.remove(&key)
-    }
-
-    fn install_blocking(
-        &self,
-        key: RegistryKey,
-        handle: JoinHandle<()>,
-        settlement: Arc<dyn JoinFailureSettlement>,
-    ) {
-        self.install_task(key, handle, settlement);
-    }
-
-    fn install_async(
-        &self,
-        key: RegistryKey,
-        handle: JoinHandle<()>,
-        settlement: Arc<dyn JoinFailureSettlement>,
-    ) {
-        self.install_task(key, handle, settlement);
-    }
-
     fn install_task(
         &self,
         key: RegistryKey,
@@ -361,6 +341,11 @@ impl RuntimeTaskOwner {
             .insert(key, RegisteredTask { handle, settlement });
         drop(registry);
         self.registry_changed.notify_waiters();
+    }
+
+    fn take_registered(&self, key: RegistryKey) -> Option<RegisteredTask> {
+        let mut registry = lock(&self.registry);
+        registry.tasks.remove(&key)
     }
 
     fn fail_start(&self, key: RegistryKey) {
@@ -377,7 +362,6 @@ impl RuntimeTaskOwner {
             registry.phase = OwnerPhase::Closing;
         }
         drop(registry);
-        self.cancellation.cancel();
         if changed {
             self.registry_changed.notify_waiters();
         }
@@ -559,7 +543,6 @@ struct Registry {
     shutdown_active: bool,
     next_key: u64,
     starting: BTreeSet<RegistryKey>,
-    probes: BTreeMap<RegistryKey, JoinHandle<()>>,
     tasks: BTreeMap<RegistryKey, RegisteredTask>,
 }
 
@@ -570,7 +553,6 @@ impl Registry {
             shutdown_active: false,
             next_key: 1,
             starting: BTreeSet::new(),
-            probes: BTreeMap::new(),
             tasks: BTreeMap::new(),
         }
     }
@@ -586,6 +568,59 @@ enum OwnerPhase {
 struct RegisteredTask {
     handle: JoinHandle<()>,
     settlement: Arc<dyn JoinFailureSettlement>,
+}
+
+/// Owns one exact registered task while its raw join handle is being awaited.
+///
+/// Dropping this guard while the join is still pending restores the same raw handle and
+/// settlement to the same registry key, so cancellation cannot detach or orphan the operation.
+struct SingleRegisteredTaskJoinGuard {
+    owner: Arc<RuntimeTaskOwner>,
+    key: RegistryKey,
+    task: Option<RegisteredTask>,
+}
+
+impl SingleRegisteredTaskJoinGuard {
+    fn new(owner: Arc<RuntimeTaskOwner>, key: RegistryKey, task: RegisteredTask) -> Self {
+        Self {
+            owner,
+            key,
+            task: Some(task),
+        }
+    }
+
+    async fn join(&mut self) -> Result<(), tokio::task::JoinError> {
+        Pin::new(
+            &mut self
+                .task
+                .as_mut()
+                .expect("a single join guard owns one registered task")
+                .handle,
+        )
+        .await
+    }
+
+    fn finish(&mut self) -> RegisteredTask {
+        self.task
+            .take()
+            .expect("a single registered task join finishes only once")
+    }
+}
+
+impl Drop for SingleRegisteredTaskJoinGuard {
+    fn drop(&mut self) {
+        let Some(task) = self.task.take() else {
+            return;
+        };
+        let mut registry = lock(&self.owner.registry);
+        let previous = registry.tasks.insert(self.key, task);
+        debug_assert!(
+            previous.is_none(),
+            "an in-flight owner task has one exact registry slot"
+        );
+        drop(registry);
+        self.owner.registry_changed.notify_waiters();
+    }
 }
 
 trait JoinFailureSettlement: Send + Sync {
@@ -700,7 +735,7 @@ mod tests {
 
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
-        F: Future<Output = ()>,
+        F: Future,
     {
         poll_fn(|context| {
             std::task::Poll::Ready(matches!(
@@ -735,6 +770,32 @@ mod tests {
         }));
 
         assert!(matches!(result, Ok(Err(RuntimeDependencyUnavailable))));
+    }
+
+    #[test]
+    fn closed_injected_handle_returns_a_typed_error_without_pending_forever() {
+        let closed_runtime = Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("the closed-handle runtime builds");
+        let closed_handle = closed_runtime.handle().clone();
+        closed_runtime.shutdown_background();
+
+        let driver = Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("the driver runtime builds");
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            driver.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    RuntimeTaskContext::new(closed_handle),
+                )
+                .await
+            })
+        }));
+
+        assert!(matches!(result, Ok(Ok(Err(RuntimeDependencyUnavailable)))));
     }
 
     #[test]
@@ -792,6 +853,38 @@ mod tests {
         assert_eq!(task.wait().await, Ok(()));
         assert!(completed.load(Ordering::SeqCst));
         context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_registered_join_restores_the_exact_task_for_owner_shutdown() {
+        let context = initialized_context().await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let entered_by_task = Arc::clone(&entered);
+        let release_by_task = Arc::clone(&release);
+        let task = context
+            .spawn_tracked(async move {
+                entered_by_task.notify_one();
+                release_by_task.notified().await;
+            })
+            .expect("an open owner admits asynchronous work");
+        entered.notified().await;
+
+        let mut join = Box::pin(task.join_registered());
+        assert!(poll_once_pending(join.as_mut()).await);
+        drop(join);
+
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert!(
+                registry.tasks.contains_key(&task.key),
+                "cancelling a registered join restores its exact owner slot"
+            );
+        }
+
+        release.notify_one();
+        context.shutdown().await;
+        assert_eq!(task.wait().await, Ok(()));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -862,7 +955,7 @@ mod tests {
             registry
                 .tasks
                 .values()
-                .next()
+                .next_back()
                 .expect("the raw handle is retained only in the owner registry")
                 .handle
                 .abort();
@@ -1104,7 +1197,7 @@ mod tests {
         let join_failure_settlement: Arc<dyn super::JoinFailureSettlement> = settlement.clone();
         context
             .owner
-            .install_async(key, handle, join_failure_settlement);
+            .install_task(key, handle, join_failure_settlement);
         entered.notified().await;
         assert!(poll_once_pending(shutdown.as_mut()).await);
         release.notify_one();

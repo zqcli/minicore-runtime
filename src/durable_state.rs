@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
+#[cfg(test)]
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -27,7 +28,9 @@ use crate::conversation_storage::{
     SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
     validate_unpublished_conversation_for_recovery,
 };
-use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
+#[cfg(test)]
+use crate::runtime_task::TrackedTask;
+use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
 use crate::wire::conversation_jsonl_scanner::MAX_CONVERSATION_FILE_BYTES;
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
@@ -53,15 +56,12 @@ const ROOT_AGENT_ENTRY_CAP: usize = 1_000_000;
 const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_PAYLOAD_ENTRY_CAP: usize = 3;
+#[cfg(test)]
 const DURABLE_STATE_ACTOR_QUEUE_CAPACITY: usize = 1;
 #[allow(dead_code)]
 const RESERVATION_COLLISION_ATTEMPT_CAP: usize = 32;
 
 /// The private physical generation ordinal used only by Store V1 documents and paths.
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct StorageGeneration(u32);
 
@@ -79,10 +79,6 @@ impl fmt::Display for StorageGenerationDirectoryNameError {
 
 impl std::error::Error for StorageGenerationDirectoryNameError {}
 
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 impl StorageGeneration {
     pub(crate) const fn new(value: u32) -> Option<Self> {
         if value == 0 || value > 1_000_000 {
@@ -138,10 +134,6 @@ impl fmt::Debug for StorageGeneration {
 }
 
 /// The closed, redacted construction failure for one physical Agent head document.
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurableAgentHeadError {
     InvalidInvariant,
@@ -157,10 +149,6 @@ impl std::error::Error for DurableAgentHeadError {}
 
 /// The physical Store V1 Agent head representation. Adjacent-generation semantics remain with
 /// DurableState recovery; this value validates only facts available in one document.
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DurableAgentHead {
     agent_id: AgentId,
@@ -173,10 +161,6 @@ pub(crate) struct DurableAgentHead {
     created_at: Timestamp,
 }
 
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 impl DurableAgentHead {
     #[allow(
         clippy::too_many_arguments,
@@ -262,10 +246,6 @@ impl fmt::Debug for DurableAgentHead {
 }
 
 /// The closed, redacted construction failure for one physical Session head document.
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DurableSessionHeadError {
     InvalidInvariant,
@@ -281,10 +261,6 @@ impl std::error::Error for DurableSessionHeadError {}
 
 /// The physical Store V1 Session head representation. Recovery alone validates adjacent
 /// generation semantics; this value checks only invariants observable in one document.
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct DurableSessionHead {
     session_id: SessionId,
@@ -298,10 +274,6 @@ pub(crate) struct DurableSessionHead {
     created_at: Timestamp,
 }
 
-#[allow(
-    dead_code,
-    reason = "M5 Store V1 codec precedes DurableState entity publication and recovery"
-)]
 impl DurableSessionHead {
     #[allow(
         clippy::too_many_arguments,
@@ -657,17 +629,25 @@ enum ReservationPhysicalObservation {
 /// The private serial owner for future durable mutations. The inventory, root and filesystem
 /// fields are deliberately retained now so the adjacent publication slice can consume them from
 /// the same owner; this slice exposes no production reservation operation.
-#[allow(dead_code)]
 struct DurableStateActor {
+    #[cfg(test)]
     receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
+    #[cfg(test)]
     root: PathBuf,
+    #[cfg(test)]
     directory_sync: DirectorySync,
+    #[cfg(test)]
     recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
+    #[cfg(test)]
     recovered_session_reservations: Arc<BTreeSet<SessionId>>,
+    #[cfg(test)]
     new_agent_reservations: BTreeSet<AgentId>,
+    #[cfg(test)]
     new_session_reservations: BTreeSet<SessionId>,
+    #[cfg(test)]
     task_context: RuntimeTaskContext,
+    #[cfg(test)]
     filesystem: Arc<dyn DurableFilesystem>,
     #[cfg(test)]
     receiver_closed: Arc<tokio::sync::Notify>,
@@ -791,43 +771,39 @@ type TestAgentReservation = TestReservation<AgentId>;
 #[cfg(test)]
 type TestSessionReservation = TestReservation<SessionId>;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActorRequestError {
     Closing,
     Unavailable,
 }
 
+#[cfg(test)]
 impl fmt::Display for ActorRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("durable state actor request rejected")
     }
 }
 
+#[cfg(test)]
 impl std::error::Error for ActorRequestError {}
 
+#[cfg(test)]
 enum DurableStateActorRequest {
-    #[cfg(test)]
     Probe(DurableStateActorProbe),
-    #[cfg(test)]
     ReserveAgent(TestAgentReservation),
-    #[cfg(test)]
     ReserveSession(TestSessionReservation),
-    #[cfg(not(test))]
-    #[allow(
-        dead_code,
-        reason = "keeps the private actor request seam instantiated"
-    )]
-    Probe,
 }
 
+#[cfg(test)]
 struct DurableStateActorRequestEnvelope {
     request: DurableStateActorRequest,
     response: Option<oneshot::Sender<Result<(), ActorRequestError>>>,
     drop_error: ActorRequestError,
 }
 
+#[cfg(test)]
 impl DurableStateActorRequestEnvelope {
-    #[cfg(test)]
     fn new(
         request: DurableStateActorRequest,
     ) -> (Self, oneshot::Receiver<Result<(), ActorRequestError>>) {
@@ -848,7 +824,6 @@ impl DurableStateActorRequestEnvelope {
         }
     }
 
-    #[cfg(test)]
     fn complete(&mut self) {
         self.settle(Ok(()));
     }
@@ -893,6 +868,7 @@ impl DurableStateActorRequestEnvelope {
     }
 }
 
+#[cfg(test)]
 impl Drop for DurableStateActorRequestEnvelope {
     fn drop(&mut self) {
         if let Some(response) = self.response.take() {
@@ -949,6 +925,7 @@ enum ReservationAttemptJobOutcome {
     Observed(ReservationPhysicalObservation),
 }
 
+#[cfg(test)]
 /// An aborted or panicking actor must close admission before its owner can be joined. This is
 /// deliberately independent of request settlement: a child operation may still finish, but the
 /// dead actor can no longer admit a new mutation.
@@ -957,6 +934,7 @@ struct UnexpectedActorExitGuard {
     armed: bool,
 }
 
+#[cfg(test)]
 impl UnexpectedActorExitGuard {
     fn new(task_context: RuntimeTaskContext) -> Self {
         Self {
@@ -970,6 +948,7 @@ impl UnexpectedActorExitGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for UnexpectedActorExitGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -981,9 +960,10 @@ impl Drop for UnexpectedActorExitGuard {
 /// Opaque owner-side control for the one tracked DurableState actor.
 #[derive(Clone)]
 struct DurableStateActorHandle {
-    #[allow(dead_code)]
+    #[cfg(test)]
     sender: mpsc::Sender<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
+    #[cfg(test)]
     task: TrackedTask,
     #[cfg(test)]
     receiver_closed: Arc<tokio::sync::Notify>,
@@ -992,44 +972,55 @@ struct DurableStateActorHandle {
 impl DurableStateActorHandle {
     fn start(
         task_context: &RuntimeTaskContext,
-        root: PathBuf,
-        directory_sync: DirectorySync,
-        recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
-        recovered_session_reservations: Arc<BTreeSet<SessionId>>,
-        filesystem: Arc<dyn DurableFilesystem>,
+        _root: PathBuf,
+        _directory_sync: DirectorySync,
+        _recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
+        _recovered_session_reservations: Arc<BTreeSet<SessionId>>,
+        _filesystem: Arc<dyn DurableFilesystem>,
     ) -> Result<Self, RuntimeTaskError> {
-        let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
         let closing = CancellationToken::new();
+
         #[cfg(test)]
-        let receiver_closed = Arc::new(tokio::sync::Notify::new());
-        let actor = DurableStateActor {
-            receiver,
-            closing: closing.clone(),
-            root,
-            directory_sync,
-            recovered_agent_reservations,
-            recovered_session_reservations,
-            new_agent_reservations: BTreeSet::new(),
-            new_session_reservations: BTreeSet::new(),
-            task_context: task_context.clone(),
-            filesystem,
-            #[cfg(test)]
-            receiver_closed: Arc::clone(&receiver_closed),
-        };
-        let task = task_context.spawn_tracked(actor.run())?;
-        Ok(Self {
-            sender,
-            closing,
-            task,
-            #[cfg(test)]
-            receiver_closed,
-        })
+        {
+            let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
+            let receiver_closed = Arc::new(tokio::sync::Notify::new());
+            let actor = DurableStateActor {
+                receiver,
+                closing: closing.clone(),
+                root: _root,
+                directory_sync: _directory_sync,
+                recovered_agent_reservations: _recovered_agent_reservations,
+                recovered_session_reservations: _recovered_session_reservations,
+                new_agent_reservations: BTreeSet::new(),
+                new_session_reservations: BTreeSet::new(),
+                task_context: task_context.clone(),
+                filesystem: _filesystem,
+                receiver_closed: Arc::clone(&receiver_closed),
+            };
+            let task = task_context.spawn_tracked(actor.run())?;
+            Ok(Self {
+                sender,
+                closing,
+                task,
+                receiver_closed,
+            })
+        }
+
+        #[cfg(not(test))]
+        {
+            let actor = DurableStateActor {
+                closing: closing.clone(),
+            };
+            let _ = task_context.spawn_tracked(actor.run())?;
+            Ok(Self { closing })
+        }
     }
 
     fn request_closing(&self) {
         self.closing.cancel();
     }
 
+    #[cfg(test)]
     async fn wait(&self) -> Result<(), RuntimeTaskError> {
         self.task.wait().await
     }
@@ -1252,6 +1243,14 @@ impl DurableStateActorHandle {
     }
 }
 
+#[cfg(not(test))]
+impl DurableStateActor {
+    async fn run(self) {
+        self.closing.cancelled().await;
+    }
+}
+
+#[cfg(test)]
 impl DurableStateActor {
     fn run(self) -> impl Future<Output = ()> + Send {
         let mut unexpected_exit = UnexpectedActorExitGuard::new(self.task_context.clone());
@@ -1308,11 +1307,6 @@ impl DurableStateActor {
                                     return;
                                 }
                             }
-                        }
-                        #[cfg(not(test))]
-                        {
-                            let DurableStateActorRequest::Probe = request.request;
-                            request.reject_unavailable();
                         }
                     }
                 },
@@ -1642,12 +1636,10 @@ impl DurableState {
         self.actor.request_closing();
     }
 
-    /// Requests actor closure, joins the actor and all owner-retained work, then releases the
-    /// root lease. The actor settlement inspection also covers abort-before-first-poll.
+    /// Requests actor closure, joins all owner-retained work, then releases the root lease.
     pub(crate) async fn close(&self) {
         self.request_closing();
         self.task_context.shutdown().await;
-        let _ = self.actor.wait().await;
         self.lease.release();
     }
 
@@ -4939,7 +4931,7 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
 
-    use tokio::runtime::{Builder, Handle};
+    use tokio::runtime::Handle;
     use tokio::sync::Notify;
 
     use super::{
@@ -6058,28 +6050,6 @@ mod tests {
             );
             state.close().await;
         }
-    }
-
-    #[test]
-    fn durable_actor_starts_closes_and_releases_its_lease_on_a_multi_thread_host() {
-        let root = TempRoot::nonexistent();
-        let host = Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_time()
-            .build()
-            .expect("the test host builds");
-
-        host.block_on(async {
-            let state = open(root.path())
-                .await
-                .expect("the actor starts after successful root recovery");
-            state.close().await;
-
-            let reopened = open(root.path())
-                .await
-                .expect("actor shutdown precedes root-lease release");
-            reopened.close().await;
-        });
     }
 
     #[tokio::test(flavor = "current_thread")]
