@@ -2,14 +2,13 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use serde_json::Value;
 use thiserror::Error;
 
+use crate::wire::ProtocolLimits;
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_opaque_ascii,
     validate_safe_text, validate_stable_symbolic_key,
 };
-use crate::wire::{BoundedJsonObject, BoundedJsonSchema, BoundedJsonValue, ItemId, ProtocolLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
@@ -105,607 +104,16 @@ impl fmt::Debug for ToolCallId {
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolValueError {
-    #[error("tool input schema uses an unsupported or malformed keyword")]
-    InvalidSchema,
     #[error("tool text is empty, unsafe, or exceeds its limit")]
     InvalidText,
     #[error("tool result content part count is outside 1..=32")]
     InvalidResultPartCount,
     #[error("tool result content exceeds its aggregate byte limit")]
     ResultContentTooLarge,
-    #[error("tool outcome source and disposition are incompatible")]
-    InvalidOutcome,
     #[error("tool approval request is invalid")]
     InvalidApproval,
     #[error("user question request or answer is invalid")]
     InvalidQuestion,
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct ToolInputSchema {
-    schema: BoundedJsonSchema,
-}
-
-impl ToolInputSchema {
-    #[allow(
-        dead_code,
-        reason = "semantic subset validation is consumed by ToolService in M8"
-    )]
-    fn new(schema: BoundedJsonSchema) -> Result<Self, ToolValueError> {
-        let value: Value = serde_json::from_slice(schema.canonical_bytes())
-            .map_err(|_| ToolValueError::InvalidSchema)?;
-        if !validate_tool_schema(&value) {
-            return Err(ToolValueError::InvalidSchema);
-        }
-        Ok(Self { schema })
-    }
-
-    pub const fn schema(&self) -> &BoundedJsonSchema {
-        &self.schema
-    }
-}
-
-fn validate_tool_schema(value: &Value) -> bool {
-    let Some((nodes, root)) = build_tool_schema_graph(value) else {
-        return false;
-    };
-    let Some(order) = schema_topological_order(&nodes) else {
-        return false;
-    };
-    schema_declares_object(&nodes, &order, root)
-}
-
-#[derive(Default)]
-struct ToolSchemaNode {
-    edges: Vec<usize>,
-    reference: Option<Box<str>>,
-    reference_target: Option<usize>,
-    direct_object: bool,
-    all_of: Vec<usize>,
-    any_of: Vec<usize>,
-    one_of: Vec<usize>,
-}
-
-fn build_tool_schema_graph(
-    value: &Value,
-) -> Option<(std::collections::BTreeMap<usize, ToolSchemaNode>, usize)> {
-    let root = schema_node_key(value);
-    let maximum = ProtocolLimits::v1_0().embedded_json.schema.max_nodes as usize;
-    let mut nodes = std::collections::BTreeMap::new();
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        let key = schema_node_key(value);
-        if nodes.contains_key(&key) {
-            continue;
-        }
-        if nodes.len() >= maximum {
-            return None;
-        }
-        let mut node = ToolSchemaNode::default();
-        if value.is_boolean() {
-            nodes.insert(key, node);
-            continue;
-        }
-        let object = value.as_object()?;
-        if !valid_integer_bound_pair(object, "minLength", "maxLength")
-            || !valid_integer_bound_pair(object, "minItems", "maxItems")
-        {
-            return None;
-        }
-        for (keyword, value) in object {
-            match keyword.as_str() {
-                "$schema" => {
-                    if value.as_str() != Some("https://json-schema.org/draft/2020-12/schema") {
-                        return None;
-                    }
-                }
-                "$ref" => node.reference = Some(value.as_str()?.into()),
-                "$defs" | "properties" => {
-                    for schema in value.as_object()?.values() {
-                        add_schema_child(&mut node.edges, &mut pending, schema);
-                    }
-                }
-                "required" => {
-                    let values = value.as_array()?;
-                    if !values.iter().all(Value::is_string)
-                        || values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .len()
-                            != values.len()
-                    {
-                        return None;
-                    }
-                }
-                "additionalProperties" | "items" => {
-                    add_schema_child(&mut node.edges, &mut pending, value);
-                }
-                "enum" => {
-                    let values = value.as_array()?;
-                    if values.is_empty()
-                        || !values.iter().enumerate().all(|(index, value)| {
-                            !values[index + 1..].iter().any(|other| other == value)
-                        })
-                    {
-                        return None;
-                    }
-                }
-                "const" => {}
-                "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" => {
-                    if !value.is_number() {
-                        return None;
-                    }
-                }
-                "multipleOf" => {
-                    if !value.as_number().is_some_and(positive_json_number) {
-                        return None;
-                    }
-                }
-                "minLength" | "maxLength" | "minItems" | "maxItems" => {
-                    exact_nonnegative_integer(value.as_number()?)?;
-                }
-                "description" => {
-                    if !value.as_str().is_some_and(|text| {
-                        validate_safe_text(
-                            text,
-                            ProtocolLimits::v1_0().text.max_description_bytes as usize,
-                            true,
-                        )
-                        .is_ok()
-                    }) {
-                        return None;
-                    }
-                }
-                "title" => {
-                    if !value.as_str().is_some_and(|text| {
-                        validate_safe_text(
-                            text,
-                            ProtocolLimits::v1_0().text.max_display_name_bytes as usize,
-                            true,
-                        )
-                        .is_ok()
-                    }) {
-                        return None;
-                    }
-                }
-                "allOf" | "anyOf" | "oneOf" => {
-                    let schemas = value.as_array()?;
-                    if schemas.is_empty() {
-                        return None;
-                    }
-                    let group = match keyword.as_str() {
-                        "allOf" => &mut node.all_of,
-                        "anyOf" => &mut node.any_of,
-                        "oneOf" => &mut node.one_of,
-                        _ => unreachable!(),
-                    };
-                    for schema in schemas {
-                        let child = schema_node_key(schema);
-                        group.push(child);
-                        add_schema_child(&mut node.edges, &mut pending, schema);
-                    }
-                }
-                "type" => {
-                    let value = value.as_str()?;
-                    if !matches!(
-                        value,
-                        "null" | "boolean" | "object" | "array" | "number" | "integer" | "string"
-                    ) {
-                        return None;
-                    }
-                    node.direct_object = value == "object";
-                }
-                _ => return None,
-            }
-        }
-        nodes.insert(key, node);
-    }
-
-    let references = nodes
-        .iter()
-        .filter_map(|(key, node)| {
-            node.reference
-                .as_deref()
-                .map(|reference| (*key, reference.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    for (key, reference) in references {
-        let target = resolve_reference(value, &reference)?;
-        let target = schema_node_key(target);
-        if !nodes.contains_key(&target) {
-            return None;
-        }
-        let node = nodes.get_mut(&key)?;
-        node.reference_target = Some(target);
-        node.edges.push(target);
-    }
-    Some((nodes, root))
-}
-
-fn add_schema_child<'a>(edges: &mut Vec<usize>, pending: &mut Vec<&'a Value>, value: &'a Value) {
-    edges.push(schema_node_key(value));
-    pending.push(value);
-}
-
-fn schema_node_key(value: &Value) -> usize {
-    std::ptr::from_ref(value) as usize
-}
-
-fn schema_topological_order(
-    nodes: &std::collections::BTreeMap<usize, ToolSchemaNode>,
-) -> Option<Vec<usize>> {
-    let mut colors = std::collections::BTreeMap::<usize, u8>::new();
-    let mut order = Vec::with_capacity(nodes.len());
-    for start in nodes.keys().copied() {
-        if colors.get(&start) == Some(&2) {
-            continue;
-        }
-        colors.insert(start, 1);
-        let mut stack = vec![(start, 0_usize)];
-        while let Some((node, edge_index)) = stack.last().copied() {
-            let edges = &nodes.get(&node)?.edges;
-            if edge_index < edges.len() {
-                stack.last_mut()?.1 += 1;
-                let target = edges[edge_index];
-                match colors.get(&target).copied().unwrap_or(0) {
-                    0 => {
-                        colors.insert(target, 1);
-                        stack.push((target, 0));
-                    }
-                    1 => return None,
-                    2 => {}
-                    _ => return None,
-                }
-            } else {
-                stack.pop();
-                colors.insert(node, 2);
-                order.push(node);
-            }
-        }
-    }
-    Some(order)
-}
-
-fn schema_declares_object(
-    nodes: &std::collections::BTreeMap<usize, ToolSchemaNode>,
-    order: &[usize],
-    root: usize,
-) -> bool {
-    let mut object_nodes = std::collections::BTreeSet::new();
-    for key in order {
-        let Some(node) = nodes.get(key) else {
-            return false;
-        };
-        let declares = node.direct_object
-            || node
-                .reference_target
-                .is_some_and(|target| object_nodes.contains(&target))
-            || node.all_of.iter().any(|child| object_nodes.contains(child))
-            || (!node.any_of.is_empty()
-                && node.any_of.iter().all(|child| object_nodes.contains(child)))
-            || (!node.one_of.is_empty()
-                && node.one_of.iter().all(|child| object_nodes.contains(child)));
-        if declares {
-            object_nodes.insert(*key);
-        }
-    }
-    object_nodes.contains(&root)
-}
-
-fn resolve_reference<'a>(root: &'a Value, reference: &str) -> Option<&'a Value> {
-    let pointer = decode_local_json_pointer(reference)?;
-    if pointer.is_empty() {
-        Some(root)
-    } else {
-        root.pointer(&pointer)
-    }
-}
-
-fn decode_local_json_pointer(reference: &str) -> Option<String> {
-    let fragment = reference.strip_prefix('#')?;
-    let bytes = fragment.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = decode_hex(*bytes.get(index + 1)?)?;
-            let low = decode_hex(*bytes.get(index + 2)?)?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            if !is_uri_fragment_byte(bytes[index]) {
-                return None;
-            }
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    let pointer = String::from_utf8(decoded).ok()?;
-    if !pointer.is_empty() && !pointer.starts_with('/') {
-        return None;
-    }
-    let bytes = pointer.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'~' {
-            if !matches!(bytes.get(index + 1), Some(b'0' | b'1')) {
-                return None;
-            }
-            index += 2;
-        } else {
-            index += 1;
-        }
-    }
-    Some(pointer)
-}
-
-fn decode_hex(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn is_uri_fragment_byte(value: u8) -> bool {
-    value.is_ascii_alphanumeric()
-        || matches!(
-            value,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b';'
-                | b'='
-                | b':'
-                | b'@'
-                | b'/'
-                | b'?'
-        )
-}
-
-fn valid_integer_bound_pair(
-    object: &serde_json::Map<String, Value>,
-    minimum: &str,
-    maximum: &str,
-) -> bool {
-    match (object.get(minimum), object.get(maximum)) {
-        (Some(minimum), Some(maximum)) => minimum
-            .as_number()
-            .and_then(exact_nonnegative_integer)
-            .zip(maximum.as_number().and_then(exact_nonnegative_integer))
-            .is_some_and(|(minimum, maximum)| compare_exact_integers(&minimum, &maximum).is_le()),
-        _ => true,
-    }
-}
-
-struct ExactNonnegativeInteger {
-    digits: Box<str>,
-    trailing_zeros: usize,
-}
-
-fn exact_nonnegative_integer(number: &serde_json::Number) -> Option<ExactNonnegativeInteger> {
-    let value = number.to_string();
-    if value.starts_with('-') {
-        return None;
-    }
-    let (coefficient, exponent) = if let Some(index) = value.find(['e', 'E']) {
-        (&value[..index], value[index + 1..].parse::<i64>().ok()?)
-    } else {
-        (value.as_str(), 0)
-    };
-    let mut digits = String::with_capacity(coefficient.len());
-    let mut fractional_digits = 0_i64;
-    let mut after_decimal = false;
-    for byte in coefficient.bytes() {
-        match byte {
-            b'.' if !after_decimal => after_decimal = true,
-            b'0'..=b'9' => {
-                digits.push(char::from(byte));
-                if after_decimal {
-                    fractional_digits += 1;
-                }
-            }
-            _ => return None,
-        }
-    }
-    let shift = exponent.checked_sub(fractional_digits)?;
-    let trailing_zeros = if shift >= 0 {
-        usize::try_from(shift).ok()?
-    } else {
-        let remove = usize::try_from(shift.checked_neg()?).ok()?;
-        if remove > digits.len() {
-            if digits.bytes().any(|byte| byte != b'0') {
-                return None;
-            }
-            digits.clear();
-        } else {
-            if digits.as_bytes()[digits.len() - remove..]
-                .iter()
-                .any(|byte| *byte != b'0')
-            {
-                return None;
-            }
-            digits.truncate(digits.len() - remove);
-        }
-        0
-    };
-    let first_nonzero = digits.bytes().position(|byte| byte != b'0');
-    let Some(first_nonzero) = first_nonzero else {
-        return Some(ExactNonnegativeInteger {
-            digits: "0".into(),
-            trailing_zeros: 0,
-        });
-    };
-    Some(ExactNonnegativeInteger {
-        digits: digits[first_nonzero..].into(),
-        trailing_zeros,
-    })
-}
-
-fn compare_exact_integers(
-    left: &ExactNonnegativeInteger,
-    right: &ExactNonnegativeInteger,
-) -> std::cmp::Ordering {
-    let left_len = left.digits.len() + left.trailing_zeros;
-    let right_len = right.digits.len() + right.trailing_zeros;
-    match left_len.cmp(&right_len) {
-        std::cmp::Ordering::Equal => {
-            let shared = left.digits.len().min(right.digits.len());
-            match left.digits.as_bytes()[..shared].cmp(&right.digits.as_bytes()[..shared]) {
-                std::cmp::Ordering::Equal => {}
-                ordering => return ordering,
-            }
-            if left.digits.as_bytes()[shared..]
-                .iter()
-                .any(|byte| *byte != b'0')
-            {
-                return std::cmp::Ordering::Greater;
-            }
-            if right.digits.as_bytes()[shared..]
-                .iter()
-                .any(|byte| *byte != b'0')
-            {
-                return std::cmp::Ordering::Less;
-            }
-            std::cmp::Ordering::Equal
-        }
-        ordering => ordering,
-    }
-}
-
-fn positive_json_number(number: &serde_json::Number) -> bool {
-    let value = number.to_string();
-    !value.starts_with('-') && value.bytes().any(|byte| matches!(byte, b'1'..=b'9'))
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct ToolSpec {
-    name: ToolName,
-    description: Arc<str>,
-    input_schema: ToolInputSchema,
-}
-
-impl ToolSpec {
-    #[allow(
-        dead_code,
-        reason = "constructed by validated ToolService resources in M8"
-    )]
-    fn new(
-        name: ToolName,
-        description: impl AsRef<str>,
-        input_schema: ToolInputSchema,
-    ) -> Result<Self, ToolValueError> {
-        let description = normalize_and_validate_text(
-            description.as_ref(),
-            ProtocolLimits::v1_0().text.max_description_bytes as usize,
-            false,
-        )?;
-        Ok(Self {
-            name,
-            description: description.into(),
-            input_schema,
-        })
-    }
-
-    pub const fn name(&self) -> &ToolName {
-        &self.name
-    }
-
-    pub fn description(&self) -> &str {
-        &self.description
-    }
-
-    pub const fn input_schema(&self) -> &ToolInputSchema {
-        &self.input_schema
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct ToolCall {
-    tool_call_id: ToolCallId,
-    name: ToolName,
-    arguments: BoundedJsonObject,
-    call_index: u32,
-}
-
-impl ToolCall {
-    #[allow(
-        dead_code,
-        reason = "constructed from validated ModelGateway responses in M7"
-    )]
-    fn new(
-        tool_call_id: ToolCallId,
-        name: ToolName,
-        arguments: BoundedJsonObject,
-        call_index: u32,
-    ) -> Self {
-        Self {
-            tool_call_id,
-            name,
-            arguments,
-            call_index,
-        }
-    }
-
-    pub const fn tool_call_id(&self) -> &ToolCallId {
-        &self.tool_call_id
-    }
-
-    pub const fn name(&self) -> &ToolName {
-        &self.name
-    }
-
-    pub const fn arguments(&self) -> &BoundedJsonObject {
-        &self.arguments
-    }
-
-    pub const fn call_index(&self) -> u32 {
-        self.call_index
-    }
-}
-
-impl fmt::Debug for ToolCall {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ToolCall")
-            .field("tool_call_id", &self.tool_call_id)
-            .field("name", &self.name)
-            .field("argument_bytes", &self.arguments.canonical_bytes().len())
-            .field("call_index", &self.call_index)
-            .finish()
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
-pub struct ToolExecutionRequest {
-    item_id: ItemId,
-    call: Arc<ToolCall>,
-}
-
-impl ToolExecutionRequest {
-    #[allow(dead_code, reason = "constructed by Session Execution in M8")]
-    fn new(item_id: ItemId, call: Arc<ToolCall>) -> Self {
-        Self { item_id, call }
-    }
-
-    pub const fn item_id(&self) -> ItemId {
-        self.item_id
-    }
-
-    pub const fn call(&self) -> &Arc<ToolCall> {
-        &self.call
-    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -779,59 +187,6 @@ pub enum ToolResultDisposition {
     Cancelled,
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub struct ToolResult {
-    tool_call_id: ToolCallId,
-    disposition: ToolResultDisposition,
-    content: ToolResultContent,
-    details: Option<BoundedJsonValue>,
-}
-
-impl ToolResult {
-    #[allow(dead_code, reason = "constructed by ToolSet terminal projection in M8")]
-    fn new(
-        tool_call_id: ToolCallId,
-        disposition: ToolResultDisposition,
-        content: ToolResultContent,
-        details: Option<BoundedJsonValue>,
-    ) -> Self {
-        Self {
-            tool_call_id,
-            disposition,
-            content,
-            details,
-        }
-    }
-
-    pub const fn tool_call_id(&self) -> &ToolCallId {
-        &self.tool_call_id
-    }
-
-    pub const fn disposition(&self) -> ToolResultDisposition {
-        self.disposition
-    }
-
-    pub const fn content(&self) -> &ToolResultContent {
-        &self.content
-    }
-
-    pub const fn details(&self) -> Option<&BoundedJsonValue> {
-        self.details.as_ref()
-    }
-}
-
-impl fmt::Debug for ToolResult {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ToolResult")
-            .field("tool_call_id", &self.tool_call_id)
-            .field("disposition", &self.disposition)
-            .field("content", &self.content)
-            .field("has_details", &self.details.is_some())
-            .finish()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ToolOutcomeSource {
     PreExecution,
@@ -845,122 +200,6 @@ pub enum ToolAbandonReason {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub struct ToolExecutionOutcome {
-    kind: ToolExecutionOutcomeKind,
-}
-
-#[derive(Clone, Eq, PartialEq)]
-enum ToolExecutionOutcomeKind {
-    Completed {
-        item_id: ItemId,
-        source: ToolOutcomeSource,
-        result: ToolResult,
-    },
-    Abandoned {
-        item_id: ItemId,
-        tool_call_id: ToolCallId,
-        reason: ToolAbandonReason,
-    },
-}
-
-pub enum ToolExecutionOutcomeRef<'a> {
-    Completed {
-        item_id: ItemId,
-        source: ToolOutcomeSource,
-        result: &'a ToolResult,
-    },
-    Abandoned {
-        item_id: ItemId,
-        tool_call_id: &'a ToolCallId,
-        reason: ToolAbandonReason,
-    },
-}
-
-impl ToolExecutionOutcome {
-    #[allow(dead_code, reason = "constructed by ToolSet terminal projection in M8")]
-    fn completed(
-        request: &ToolExecutionRequest,
-        source: ToolOutcomeSource,
-        result: ToolResult,
-    ) -> Result<Self, ToolValueError> {
-        if result.tool_call_id() != request.call().tool_call_id()
-            || (source == ToolOutcomeSource::Executed
-                && result.disposition() == ToolResultDisposition::Denied)
-        {
-            return Err(ToolValueError::InvalidOutcome);
-        }
-        Ok(Self {
-            kind: ToolExecutionOutcomeKind::Completed {
-                item_id: request.item_id(),
-                source,
-                result,
-            },
-        })
-    }
-
-    #[allow(dead_code, reason = "constructed by ToolSet terminal projection in M8")]
-    fn abandoned(request: &ToolExecutionRequest, reason: ToolAbandonReason) -> Self {
-        Self {
-            kind: ToolExecutionOutcomeKind::Abandoned {
-                item_id: request.item_id(),
-                tool_call_id: request.call().tool_call_id().clone(),
-                reason,
-            },
-        }
-    }
-
-    pub fn as_ref(&self) -> ToolExecutionOutcomeRef<'_> {
-        match &self.kind {
-            ToolExecutionOutcomeKind::Completed {
-                item_id,
-                source,
-                result,
-            } => ToolExecutionOutcomeRef::Completed {
-                item_id: *item_id,
-                source: *source,
-                result,
-            },
-            ToolExecutionOutcomeKind::Abandoned {
-                item_id,
-                tool_call_id,
-                reason,
-            } => ToolExecutionOutcomeRef::Abandoned {
-                item_id: *item_id,
-                tool_call_id,
-                reason: *reason,
-            },
-        }
-    }
-}
-
-impl fmt::Debug for ToolExecutionOutcome {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.as_ref() {
-            ToolExecutionOutcomeRef::Completed {
-                item_id,
-                source,
-                result,
-            } => formatter
-                .debug_struct("ToolExecutionOutcome::Completed")
-                .field("item_id", &item_id)
-                .field("source", &source)
-                .field("result", result)
-                .finish(),
-            ToolExecutionOutcomeRef::Abandoned {
-                item_id,
-                tool_call_id,
-                reason,
-            } => formatter
-                .debug_struct("ToolExecutionOutcome::Abandoned")
-                .field("item_id", &item_id)
-                .field("tool_call_id", tool_call_id)
-                .field("reason", &reason)
-                .finish(),
-        }
-    }
-}
-
-#[derive(Clone, Eq, PartialEq)]
 pub struct ToolRequirementSummaryView {
     filesystem: Option<Arc<str>>,
     network: Option<Arc<str>>,
@@ -968,7 +207,6 @@ pub struct ToolRequirementSummaryView {
 }
 
 impl ToolRequirementSummaryView {
-    #[allow(dead_code, reason = "constructed by Tools approval projection in M8")]
     fn new(
         filesystem: Option<String>,
         network: Option<String>,
@@ -982,7 +220,6 @@ impl ToolRequirementSummaryView {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         filesystem: Option<String>,
         network: Option<String>,
@@ -1019,7 +256,6 @@ pub struct ToolApprovalOptionView {
 }
 
 impl ToolApprovalOptionView {
-    #[allow(dead_code, reason = "constructed by Tools approval projection in M8")]
     fn new(
         option_index: u32,
         kind: ToolApprovalOptionKindView,
@@ -1040,7 +276,6 @@ impl ToolApprovalOptionView {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         option_index: u32,
         kind: ToolApprovalOptionKindView,
@@ -1077,7 +312,6 @@ pub struct ToolApprovalRequestView {
 }
 
 impl ToolApprovalRequestView {
-    #[allow(dead_code, reason = "constructed by Tools approval projection in M8")]
     fn new(
         tool_name: ToolName,
         arguments_summary: impl AsRef<str>,
@@ -1124,7 +358,6 @@ impl ToolApprovalRequestView {
         Ok(request)
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         tool_name: ToolName,
         arguments_summary: impl AsRef<str>,
@@ -1189,10 +422,6 @@ pub struct ToolApprovalResolution {
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "constructed by live approval and Conversation replay"
-)]
 enum ToolApprovalResolutionKind {
     Allowed {
         option_index: u32,
@@ -1220,7 +449,6 @@ impl ToolApprovalResolution {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) const fn reconstruct_allowed(
         option_index: u32,
         kind: ToolApprovalOptionKindView,
@@ -1230,7 +458,6 @@ impl ToolApprovalResolution {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) const fn reconstruct_denied() -> Self {
         Self {
             kind: ToolApprovalResolutionKind::Denied,
@@ -1245,8 +472,11 @@ impl fmt::Debug for ToolApprovalResolution {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-#[allow(dead_code, reason = "consumed by Tool execution control in M8")]
 pub(crate) enum ToolApprovalDecision {
+    #[allow(
+        dead_code,
+        reason = "constructed by future Tool approval execution in M8"
+    )]
     AllowOnce,
     Deny,
 }
@@ -1309,34 +539,29 @@ impl ToolApprovalRequest {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
     pub(crate) const fn view(&self) -> &ToolApprovalRequestView {
         &self.view
     }
 
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
     pub(crate) fn resolve(
         &self,
         input: ToolApprovalDecisionInput,
-    ) -> Result<ResolvedToolApproval, ToolValueError> {
+    ) -> Result<(ToolApprovalDecision, ToolApprovalResolution), ToolValueError> {
         match input {
-            ToolApprovalDecisionInput::Deny => Ok(ResolvedToolApproval {
-                decision: ToolApprovalDecision::Deny,
-                resolution: ToolApprovalResolution::reconstruct_denied(),
-            }),
+            ToolApprovalDecisionInput::Deny => Ok((
+                ToolApprovalDecision::Deny,
+                ToolApprovalResolution::reconstruct_denied(),
+            )),
             ToolApprovalDecisionInput::Allow { option_index } => {
                 let option = self
                     .options
                     .iter()
                     .find(|option| option.view.option_index() == option_index)
                     .ok_or(ToolValueError::InvalidApproval)?;
-                Ok(ResolvedToolApproval {
-                    decision: option.decision.clone(),
-                    resolution: ToolApprovalResolution::reconstruct_allowed(
-                        option_index,
-                        option.view.kind(),
-                    ),
-                })
+                Ok((
+                    option.decision.clone(),
+                    ToolApprovalResolution::reconstruct_allowed(option_index, option.view.kind()),
+                ))
             }
         }
     }
@@ -1373,29 +598,6 @@ impl ToolApprovalRequest {
     }
 }
 
-#[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
-pub(crate) struct ResolvedToolApproval {
-    decision: ToolApprovalDecision,
-    resolution: ToolApprovalResolution,
-}
-
-impl ResolvedToolApproval {
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
-    pub(crate) const fn decision(&self) -> &ToolApprovalDecision {
-        &self.decision
-    }
-
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
-    pub(crate) const fn resolution(&self) -> &ToolApprovalResolution {
-        &self.resolution
-    }
-
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
-    pub(crate) fn into_parts(self) -> (ToolApprovalDecision, ToolApprovalResolution) {
-        (self.decision, self.resolution)
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn live_approval_request_fixture() -> ToolApprovalRequest {
     let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
@@ -1428,7 +630,6 @@ pub struct UserQuestionChoice {
 }
 
 impl UserQuestionChoice {
-    #[allow(dead_code, reason = "constructed by the ask-user Tool in M8")]
     fn new(option_index: u32, label: impl AsRef<str>) -> Result<Self, ToolValueError> {
         let label = normalize_and_validate_text(
             label.as_ref(),
@@ -1442,7 +643,6 @@ impl UserQuestionChoice {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         option_index: u32,
         label: impl AsRef<str>,
@@ -1474,7 +674,6 @@ pub struct UserQuestionField {
 }
 
 impl UserQuestionField {
-    #[allow(dead_code, reason = "constructed by the ask-user Tool in M8")]
     fn new(
         question_index: u32,
         prompt: impl AsRef<str>,
@@ -1504,7 +703,6 @@ impl UserQuestionField {
         })
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         question_index: u32,
         prompt: impl AsRef<str>,
@@ -1538,7 +736,6 @@ pub struct UserQuestionRequest {
 }
 
 impl UserQuestionRequest {
-    #[allow(dead_code, reason = "constructed by the ask-user Tool in M8")]
     fn new(
         title: Option<String>,
         questions: Vec<UserQuestionField>,
@@ -1568,7 +765,6 @@ impl UserQuestionRequest {
         Ok(request)
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         title: Option<String>,
         questions: Vec<UserQuestionField>,
@@ -1734,6 +930,7 @@ impl UserQuestionAnswer {
     }
 }
 
+// Three fixed-width typed IDs plus the pending-interaction object envelope.
 const INTERACTION_VIEW_FIXED_BYTES: usize = 159;
 
 fn tool_approval_encoded_len(request: &ToolApprovalRequestView) -> Option<usize> {
@@ -1928,10 +1125,6 @@ fn validate_external_text(
     Ok(value.to_owned())
 }
 
-#[allow(
-    dead_code,
-    reason = "consumed by approval and question constructors in M8"
-)]
 fn validate_optional_text(
     value: Option<String>,
     maximum: usize,
@@ -1955,117 +1148,6 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::ItemId;
-
-    #[test]
-    fn tool_input_schema_rejects_unsupported_keywords_without_scanning_const_data() {
-        let supported = BoundedJsonSchema::from_slice(
-            br##"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"##,
-        )
-        .unwrap();
-        assert!(ToolInputSchema::new(supported).is_ok());
-
-        for input in [
-            br#"{"type":"string"}"#.as_slice(),
-            br#"{"type":"object","multipleOf":0}"#.as_slice(),
-            br#"{"type":"object","minLength":2,"maxLength":1}"#.as_slice(),
-            br#"{"patternProperties":{".*":{}}}"#.as_slice(),
-            br#"{"not":{"type":"string"}}"#.as_slice(),
-            br##"{"$dynamicRef":"#x"}"##.as_slice(),
-            br##"{"$recursiveRef":"#x"}"##.as_slice(),
-            br##"{"$ref":"#/$defs/missing"}"##.as_slice(),
-            br##"{"$defs":{"a":{"$ref":"#/$defs/b"},"b":{"$ref":"#/$defs/a"}},"$ref":"#/$defs/a"}"##.as_slice(),
-            br##"{"type":"object","$defs":{"a~2b":{"type":"object"}},"$ref":"#/$defs/a~2b"}"##.as_slice(),
-            br##"{"type":"object","$defs":{"a":{"type":"object"}},"$ref":"#/$defs/%ZZ"}"##.as_slice(),
-            br#"{"type":"object","maxItems":1e-1}"#.as_slice(),
-            br#"{"type":"object","minItems":18446744073709551617,"maxItems":18446744073709551616}"#.as_slice(),
-        ] {
-            let schema = BoundedJsonSchema::from_slice(input).unwrap();
-            assert!(matches!(
-                ToolInputSchema::new(schema),
-                Err(ToolValueError::InvalidSchema)
-            ));
-        }
-
-        let data = BoundedJsonSchema::from_slice(
-            br#"{"const":{"patternProperties":{".*":{}},"not":{"type":"string"}}}"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            ToolInputSchema::new(data),
-            Err(ToolValueError::InvalidSchema)
-        ));
-
-        let referenced = BoundedJsonSchema::from_slice(
-            br##"{"$defs":{"arguments":{"type":"object","properties":{"path":{"type":"string"}}}},"$ref":"#/$defs/arguments"}"##,
-        )
-        .unwrap();
-        assert!(ToolInputSchema::new(referenced).is_ok());
-
-        for input in [
-            br#"{"type":"object","multipleOf":1e-999999}"#.as_slice(),
-            br#"{"type":"object","maximum":1e999999}"#.as_slice(),
-            br#"{"type":"object","enum":[0,1e-999999]}"#.as_slice(),
-            br#"{"type":"object","maxItems":18446744073709551616}"#.as_slice(),
-            br#"{"type":"object","minItems":18446744073709551616,"maxItems":18446744073709551617}"#
-                .as_slice(),
-            br#"{"type":"object","maxItems":1e21}"#.as_slice(),
-            br#"{"allOf":[{"type":"object"},{"properties":{"x":{"type":"string"}}}]}"#.as_slice(),
-            br#"{"anyOf":[{"type":"object"},{"type":"object","additionalProperties":false}]}"#
-                .as_slice(),
-            br##"{"$defs":{"a/b":{"type":"object"}},"$ref":"#/$defs/a~1b"}"##.as_slice(),
-            br##"{"$defs":{"a b":{"type":"object"}},"$ref":"#/$defs/a%20b"}"##.as_slice(),
-        ] {
-            let schema = BoundedJsonSchema::from_slice(input).unwrap();
-            assert!(ToolInputSchema::new(schema).is_ok());
-        }
-        let mixed_root =
-            BoundedJsonSchema::from_slice(br#"{"anyOf":[{"type":"object"},{"type":"string"}]}"#)
-                .unwrap();
-        assert!(matches!(
-            ToolInputSchema::new(mixed_root),
-            Err(ToolValueError::InvalidSchema)
-        ));
-
-        let mut definitions = Vec::new();
-        for index in 0..300 {
-            let schema = if index == 299 {
-                r#"{"type":"object"}"#.to_owned()
-            } else {
-                format!(
-                    r##"{{"anyOf":[{{"$ref":"#/$defs/n{}"}},{{"$ref":"#/$defs/n{}"}}]}}"##,
-                    index + 1,
-                    index + 1
-                )
-            };
-            definitions.push(format!(r#""n{index}":{schema}"#));
-        }
-        let graph = format!(
-            r##"{{"$defs":{{{}}},"$ref":"#/$defs/n0"}}"##,
-            definitions.join(",")
-        );
-        let graph = BoundedJsonSchema::from_slice(graph.as_bytes()).unwrap();
-        assert!(ToolInputSchema::new(graph).is_ok());
-
-        let properties = (0..256)
-            .map(|index| {
-                format!(
-                    r#""p{index}":{{"type":"integer","minItems":1e999999,"maxItems":1e999999}}"#
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let large_exponents = format!(r#"{{"type":"object","properties":{{{properties}}}}}"#);
-        let large_exponents = BoundedJsonSchema::from_slice(large_exponents.as_bytes()).unwrap();
-        assert!(ToolInputSchema::new(large_exponents).is_ok());
-
-        let const_data = BoundedJsonSchema::from_slice(
-            br#"{"type":"object","const":{"patternProperties":{".*":{}},"not":{"type":"string"}}}"#,
-        )
-        .unwrap();
-        assert!(ToolInputSchema::new(const_data).is_ok());
-    }
-
     #[test]
     fn result_content_enforces_part_and_aggregate_boundaries() {
         assert!(ToolResultContent::from_text_parts(vec!["x".repeat(65_536)]).is_ok());
@@ -2083,79 +1165,6 @@ mod tests {
         let mut oversized = (0..4).map(|_| "x".repeat(65_536)).collect::<Vec<_>>();
         oversized.push("x".to_owned());
         assert!(ToolResultContent::from_text_parts(oversized).is_err());
-    }
-
-    #[test]
-    fn execution_outcome_enforces_source_disposition_matrix() {
-        let item_id: ItemId = "itm_11111111111111111111111111111111".parse().unwrap();
-        let call_id: ToolCallId = "call_1".parse().unwrap();
-        let call = Arc::new(ToolCall::new(
-            call_id.clone(),
-            "read_file".parse().unwrap(),
-            BoundedJsonObject::from_slice(b"{}").unwrap(),
-            0,
-        ));
-        let request = ToolExecutionRequest::new(item_id, call);
-        for source in [ToolOutcomeSource::PreExecution, ToolOutcomeSource::Executed] {
-            for disposition in [
-                ToolResultDisposition::Succeeded,
-                ToolResultDisposition::Failed,
-                ToolResultDisposition::Denied,
-                ToolResultDisposition::Cancelled,
-            ] {
-                let result = ToolResult::new(
-                    call_id.clone(),
-                    disposition,
-                    ToolResultContent::from_text_parts(vec!["result".to_owned()]).unwrap(),
-                    None,
-                );
-                assert_eq!(
-                    ToolExecutionOutcome::completed(&request, source, result).is_ok(),
-                    !(source == ToolOutcomeSource::Executed
-                        && disposition == ToolResultDisposition::Denied),
-                    "{source:?} + {disposition:?}"
-                );
-            }
-        }
-
-        let completed = ToolExecutionOutcome::completed(
-            &request,
-            ToolOutcomeSource::Executed,
-            ToolResult::new(
-                call_id.clone(),
-                ToolResultDisposition::Succeeded,
-                ToolResultContent::from_text_parts(vec!["done".to_owned()]).unwrap(),
-                None,
-            ),
-        )
-        .unwrap();
-        assert!(matches!(
-            completed.as_ref(),
-            ToolExecutionOutcomeRef::Completed {
-                item_id: actual_item_id,
-                result,
-                ..
-            } if actual_item_id == item_id && result.tool_call_id() == &call_id
-        ));
-
-        let mismatched = ToolResult::new(
-            "call_2".parse().unwrap(),
-            ToolResultDisposition::Succeeded,
-            ToolResultContent::from_text_parts(vec!["done".to_owned()]).unwrap(),
-            None,
-        );
-        assert_eq!(
-            ToolExecutionOutcome::completed(&request, ToolOutcomeSource::PreExecution, mismatched),
-            Err(ToolValueError::InvalidOutcome)
-        );
-        assert!(matches!(
-            ToolExecutionOutcome::abandoned(&request, ToolAbandonReason::OutcomeUnknown).as_ref(),
-            ToolExecutionOutcomeRef::Abandoned {
-                item_id: actual_item_id,
-                tool_call_id: actual_call_id,
-                ..
-            } if actual_item_id == item_id && actual_call_id == &call_id
-        ));
     }
 
     #[test]
@@ -2201,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_and_question_indices_and_encoded_sizes_are_bounded() {
+    fn approval_and_question_indices_and_semantic_validation_are_bounded() {
         let requirements = ToolRequirementSummaryView::new(None, None, None).unwrap();
         let option = ToolApprovalOptionView::new(
             0,
@@ -2223,15 +1232,12 @@ mod tests {
             vec![ToolApprovalOption::new(option, ToolApprovalDecision::AllowOnce).unwrap()],
         )
         .unwrap();
-        let allowed = approval
+        let (allowed_decision, allowed_resolution) = approval
             .resolve(ToolApprovalDecisionInput::Allow { option_index: 0 })
             .unwrap();
+        assert!(matches!(allowed_decision, ToolApprovalDecision::AllowOnce));
         assert!(matches!(
-            allowed.decision(),
-            ToolApprovalDecision::AllowOnce
-        ));
-        assert!(matches!(
-            allowed.resolution().as_ref(),
+            allowed_resolution.as_ref(),
             ToolApprovalResolutionRef::Allowed {
                 option_index: 0,
                 kind: ToolApprovalOptionKindView::AsRequested,
@@ -2241,12 +1247,9 @@ mod tests {
             approval.resolve(ToolApprovalDecisionInput::Allow { option_index: 1 }),
             Err(ToolValueError::InvalidApproval)
         ));
+        let (_, denied_resolution) = approval.resolve(ToolApprovalDecisionInput::Deny).unwrap();
         assert!(matches!(
-            approval
-                .resolve(ToolApprovalDecisionInput::Deny)
-                .unwrap()
-                .resolution()
-                .as_ref(),
+            denied_resolution.as_ref(),
             ToolApprovalResolutionRef::Denied
         ));
         assert!(
@@ -2292,34 +1295,6 @@ mod tests {
             ToolApprovalOption::new(restricted_view, ToolApprovalDecision::AllowOnce),
             Err(ToolValueError::InvalidApproval)
         ));
-
-        let large_requirements = ToolRequirementSummaryView::new(
-            Some("x".repeat(8_192)),
-            Some("x".repeat(8_192)),
-            Some("x".repeat(8_192)),
-        )
-        .unwrap();
-        let large_options = (0..16)
-            .map(|index| {
-                ToolApprovalOptionView::new(
-                    index,
-                    ToolApprovalOptionKindView::Restricted,
-                    "x".repeat(256),
-                    large_requirements.clone(),
-                )
-                .unwrap()
-            })
-            .collect();
-        assert!(
-            ToolApprovalRequestView::new(
-                "write_file".parse().unwrap(),
-                "x".repeat(8_192),
-                "x".repeat(8_192),
-                large_requirements,
-                large_options,
-            )
-            .is_err()
-        );
 
         let choices = vec![
             UserQuestionChoice::new(2, "A").unwrap(),
@@ -2383,60 +1358,6 @@ mod tests {
             UserQuestionAnswerValue::Text(text) => assert_eq!(text.as_ref(), "a\nb"),
             UserQuestionAnswerValue::Choice { .. } => panic!("wrong answer family"),
         }
-        let expected = serde_json::json!({
-            "answers": [{
-                "questionIndex": 1,
-                "value": {"type": "text", "data": "a\nb"}
-            }]
-        });
-        assert_eq!(
-            user_answer_encoded_len(&answer).unwrap(),
-            serde_json::to_vec(&expected).unwrap().len()
-        );
-
-        let empty = UserQuestionAnswer::new(
-            (0..4)
-                .map(|index| UserQuestionFieldAnswer::text(index, "").unwrap())
-                .collect(),
-        )
-        .unwrap();
-        let maximum = ProtocolLimits::v1_0()
-            .interaction
-            .max_interaction_answer_bytes as usize;
-        let text_budget = maximum - user_answer_encoded_len(&empty).unwrap();
-        let make_answer = |total_text: usize| {
-            let mut remaining = total_text;
-            let answers = (0..4)
-                .map(|index| {
-                    let size = remaining.min(16_384);
-                    remaining -= size;
-                    UserQuestionFieldAnswer::text(index, "x".repeat(size)).unwrap()
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(remaining, 0);
-            UserQuestionAnswer::new(answers)
-        };
-        let boundary = make_answer(text_budget).unwrap();
-        assert_eq!(user_answer_encoded_len(&boundary), Some(maximum));
-        assert!(make_answer(text_budget + 1).is_err());
-
-        let large_choices = (0..64)
-            .map(|index| UserQuestionChoice::new(index, "x".repeat(256)).unwrap())
-            .collect::<Vec<_>>();
-        let large_questions = (0..32)
-            .map(|index| {
-                UserQuestionField::new(
-                    index,
-                    "x".repeat(8_192),
-                    true,
-                    UserQuestionInput::SingleChoice {
-                        options: large_choices.clone().into(),
-                    },
-                )
-                .unwrap()
-            })
-            .collect::<Vec<_>>();
-        assert!(UserQuestionRequest::new(None, large_questions).is_err());
     }
 
     #[test]
@@ -2458,6 +1379,117 @@ mod tests {
         assert_eq!(user_question_encoded_len(&question), Some(maximum));
         assert_eq!(question_view_json_len(&question), maximum);
         assert!(question_with_extra_text(question_extra + 1).is_err());
+    }
+
+    #[test]
+    fn canonical_interaction_sizes_count_quote_and_backslash_expansion() {
+        let escaped = "\"\\";
+        assert_eq!(canonical_json_string_len(escaped), Some(6));
+
+        let requirements = ToolRequirementSummaryView::new(
+            Some(escaped.to_owned()),
+            Some(escaped.to_owned()),
+            Some(escaped.to_owned()),
+        )
+        .unwrap();
+        let option = ToolApprovalOptionView::new(
+            0,
+            ToolApprovalOptionKindView::AsRequested,
+            escaped,
+            requirements.clone(),
+        )
+        .unwrap();
+        let approval = ToolApprovalRequestView::new(
+            "write_file".parse().unwrap(),
+            escaped,
+            escaped,
+            requirements,
+            vec![option],
+        )
+        .unwrap();
+        assert_eq!(
+            tool_approval_encoded_len(&approval),
+            Some(approval_view_json_len(&approval))
+        );
+
+        let question = UserQuestionRequest::new(
+            Some(escaped.to_owned()),
+            vec![
+                UserQuestionField::new(
+                    0,
+                    escaped,
+                    false,
+                    UserQuestionInput::SingleChoice {
+                        options: vec![UserQuestionChoice::new(0, escaped).unwrap()].into(),
+                    },
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            user_question_encoded_len(&question),
+            Some(question_view_json_len(&question))
+        );
+
+        let plain_answer =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "xx").unwrap()]).unwrap();
+        let answer = UserQuestionAnswer::new(vec![
+            UserQuestionFieldAnswer::text(0, escaped).unwrap(),
+            UserQuestionFieldAnswer::choice(1, 0),
+        ])
+        .unwrap();
+        assert_eq!(
+            user_answer_encoded_len(&answer),
+            Some(user_answer_json_len(&answer))
+        );
+        let escaped_text_only =
+            UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, escaped).unwrap()])
+                .unwrap();
+        assert_eq!(
+            user_answer_encoded_len(&escaped_text_only).unwrap(),
+            user_answer_encoded_len(&plain_answer).unwrap() + 2
+        );
+    }
+
+    #[test]
+    fn user_answer_size_gate_counts_structure_escapes_and_boundary_plus_one() {
+        let maximum = ProtocolLimits::v1_0()
+            .interaction
+            .max_interaction_answer_bytes as usize;
+        let empty = UserQuestionAnswer::new(
+            (0..4)
+                .map(|index| UserQuestionFieldAnswer::text(index, "").unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let text_budget = maximum - user_answer_encoded_len(&empty).unwrap();
+
+        let make_answer = |total_text: usize, replacement: Option<char>| {
+            let mut remaining = total_text;
+            let replacement = replacement.map(|value| value.to_string());
+            let answers = (0..4)
+                .map(|index| {
+                    let size = remaining.min(16_384);
+                    remaining -= size;
+                    let mut text = "x".repeat(size);
+                    if index == 0 {
+                        if let Some(replacement) = replacement.as_deref() {
+                            text.replace_range(0..replacement.len(), replacement);
+                        }
+                    }
+                    UserQuestionFieldAnswer::text(index, text).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(remaining, 0);
+            UserQuestionAnswer::new(answers)
+        };
+
+        let boundary = make_answer(text_budget, None).unwrap();
+        assert_eq!(user_answer_encoded_len(&boundary), Some(maximum));
+        assert!(make_answer(text_budget + 1, None).is_err());
+        assert!(make_answer(text_budget, Some('"')).is_err());
+        assert!(make_answer(text_budget, Some('\\')).is_err());
     }
 
     fn approval_with_extra_text(
@@ -2587,7 +1619,32 @@ mod tests {
         }))
     }
 
-    fn interaction_view_json_len(request: Value) -> usize {
+    fn user_answer_json_len(answer: &UserQuestionAnswer) -> usize {
+        let answers = answer
+            .answers()
+            .iter()
+            .map(|answer| {
+                let value = match answer.value() {
+                    UserQuestionAnswerValue::Text(text) => {
+                        serde_json::json!({"type": "text", "data": text.as_ref()})
+                    }
+                    UserQuestionAnswerValue::Choice { option_index } => serde_json::json!({
+                        "type": "choice",
+                        "data": {"optionIndex": option_index},
+                    }),
+                };
+                serde_json::json!({
+                    "questionIndex": answer.question_index(),
+                    "value": value,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({"answers": answers}))
+            .unwrap()
+            .len()
+    }
+
+    fn interaction_view_json_len(request: serde_json::Value) -> usize {
         serde_json::to_vec(&serde_json::json!({
             "requestId": "req_00000000000000000000000000000000",
             "turnId": "trn_00000000000000000000000000000000",

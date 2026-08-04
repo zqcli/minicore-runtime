@@ -28,7 +28,6 @@ pub(crate) enum CompactionValueError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 pub(crate) enum CompactionUnitKind {
     RollingSummary,
     UserMessage,
@@ -36,7 +35,6 @@ pub(crate) enum CompactionUnitKind {
     ToolExchange,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 #[derive(Clone)]
 pub(crate) struct LiveCompactionSourceView {
     session_id: SessionId,
@@ -44,7 +42,6 @@ pub(crate) struct LiveCompactionSourceView {
     units: Arc<[LiveCompactionUnit]>,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 #[derive(Clone)]
 pub(crate) struct LiveCompactionUnit {
     first_entry_id: EntryId,
@@ -52,13 +49,11 @@ pub(crate) struct LiveCompactionUnit {
     messages: Arc<[ModelMessage]>,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 pub(crate) struct PreparedLiveCompactionUnit {
     kind: CompactionUnitKind,
     messages: Arc<[ModelMessage]>,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompactionSourceErrorReason {
     EmptyUnitMessages,
@@ -66,13 +61,11 @@ pub(crate) enum CompactionSourceErrorReason {
     MisplacedRollingSummary,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct CompactionSourceError {
     reason: CompactionSourceErrorReason,
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 impl CompactionSourceError {
     const fn new(reason: CompactionSourceErrorReason) -> Self {
         Self { reason }
@@ -96,7 +89,6 @@ impl fmt::Display for CompactionSourceError {
 
 impl Error for CompactionSourceError {}
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 impl PreparedLiveCompactionUnit {
     pub(crate) fn for_live_reducer(
         kind: CompactionUnitKind,
@@ -119,7 +111,6 @@ impl PreparedLiveCompactionUnit {
     }
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 impl LiveCompactionUnit {
     pub(crate) const fn first_entry_id(&self) -> &EntryId {
         &self.first_entry_id
@@ -134,7 +125,6 @@ impl LiveCompactionUnit {
     }
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 impl LiveCompactionSourceView {
     pub(crate) fn for_live_reducer(
         session_id: SessionId,
@@ -170,6 +160,7 @@ impl LiveCompactionSourceView {
         &self.session_id
     }
 
+    #[cfg(test)]
     pub(crate) const fn revision(&self) -> &ConversationRevision {
         &self.revision
     }
@@ -215,19 +206,6 @@ impl StoredCompaction {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "constructed by Compaction summary validation in M10"
-    )]
-    fn from_automatic(
-        summary: impl AsRef<str>,
-        first_kept_entry_id: Option<EntryId>,
-        model_call: StoredCompactionModelCall,
-    ) -> Result<Self, CompactionValueError> {
-        Self::new(summary, first_kept_entry_id, Some(model_call))
-    }
-
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         summary: impl AsRef<str>,
         first_kept_entry_id: Option<EntryId>,
@@ -250,7 +228,6 @@ impl StoredCompaction {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub fn summary(&self) -> &str {
         &self.summary
     }
@@ -260,7 +237,6 @@ impl StoredCompaction {
         self.first_kept_entry_id
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn model_call(&self) -> Option<&StoredCompactionModelCall> {
         self.model_call.as_ref()
     }
@@ -280,34 +256,24 @@ impl fmt::Debug for StoredCompaction {
     }
 }
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 pub(crate) struct CompactionReplacement {
     stored: StoredCompaction,
     rolling_summary: ModelMessage,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the test-only M4 replacement construction seam"
-)]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompactionReplacementErrorReason {
     InvalidRollingSummary,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the test-only M4 replacement construction seam"
-)]
+#[cfg(test)]
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct CompactionReplacementError {
     reason: CompactionReplacementErrorReason,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the test-only M4 replacement construction seam"
-)]
+#[cfg(test)]
 impl CompactionReplacementError {
     const fn invalid_rolling_summary() -> Self {
         Self {
@@ -316,6 +282,7 @@ impl CompactionReplacementError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Debug for CompactionReplacementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -325,15 +292,16 @@ impl fmt::Debug for CompactionReplacementError {
     }
 }
 
+#[cfg(test)]
 impl fmt::Display for CompactionReplacementError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("invalid compaction replacement")
     }
 }
 
+#[cfg(test)]
 impl Error for CompactionReplacementError {}
 
-#[allow(dead_code, reason = "consumed by LiveConversation reducer in M4")]
 impl CompactionReplacement {
     #[cfg(test)]
     pub(crate) fn for_m4_test(
@@ -407,7 +375,6 @@ impl StoredCompactionModelCall {
         clippy::too_many_arguments,
         reason = "fields mirror the frozen Compaction provenance shape"
     )]
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub(crate) fn reconstruct(
         model: ModelResponseSummary,
         response_id: Option<ProviderResponseId>,
@@ -428,37 +395,30 @@ impl StoredCompactionModelCall {
         )
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn model(&self) -> &ModelResponseSummary {
         &self.model
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn response_id(&self) -> Option<&ProviderResponseId> {
         self.response_id.as_ref()
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn usage(&self) -> Option<&ModelUsage> {
         self.usage.as_ref()
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn finish_reason(&self) -> ModelFinishReason {
         self.finish_reason
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn requested_max_output_tokens(&self) -> NonZeroU32 {
         self.requested_max_output_tokens
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn logical_retry_count(&self) -> u8 {
         self.logical_retry_count
     }
 
-    #[allow(dead_code, reason = "consumed by Conversation codec in M3")]
     pub const fn metadata(&self) -> &ProviderResponseMetadata {
         &self.metadata
     }
@@ -615,12 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn automatic_and_replay_construction_have_distinct_provenance_rules() {
+    fn stored_compaction_reconstructs_with_or_without_model_call() {
         let marker: EntryId = "ent_11111111111111111111111111111111".parse().unwrap();
-        let automatic = StoredCompaction::from_automatic(
+        let automatic = StoredCompaction::reconstruct(
             "summary",
             Some(marker),
-            model_call(ModelFinishReason::Stop, 1).unwrap(),
+            Some(model_call(ModelFinishReason::Stop, 1).unwrap()),
         )
         .unwrap();
         assert_eq!(automatic.first_kept_entry_id(), Some(marker));
@@ -641,10 +601,10 @@ mod tests {
 
     #[test]
     fn compaction_debug_does_not_expose_summary_or_provider_ids() {
-        let stored = StoredCompaction::from_automatic(
+        let stored = StoredCompaction::reconstruct(
             "SECRET-SUMMARY",
             None,
-            model_call(ModelFinishReason::Stop, 0).unwrap(),
+            Some(model_call(ModelFinishReason::Stop, 0).unwrap()),
         )
         .unwrap();
         let debug = format!("{stored:?} {:?}", stored.model_call().unwrap());
@@ -891,10 +851,10 @@ mod tests {
     #[test]
     fn m4_replacement_is_consuming_and_redacts_summary_validation_details() {
         let marker = entry_id("ent_11111111111111111111111111111111");
-        let stored = StoredCompaction::from_automatic(
+        let stored = StoredCompaction::reconstruct(
             "SECRET-ROLLING-SUMMARY",
             Some(marker),
-            model_call(ModelFinishReason::Stop, 0).unwrap(),
+            Some(model_call(ModelFinishReason::Stop, 0).unwrap()),
         )
         .unwrap();
         let replacement = CompactionReplacement::for_m4_test(stored.clone()).unwrap();

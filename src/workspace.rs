@@ -321,10 +321,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    #[allow(
-        dead_code,
-        reason = "future durable Session construction creates Workspace through this checked seam"
-    )]
     pub(crate) fn new(
         revision: WorkspaceRevision,
         primary_root: WorkspaceRootSpec,
@@ -419,10 +415,6 @@ pub enum WorkspaceInputLoweringError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-#[allow(
-    dead_code,
-    reason = "future durable Session construction reports this crate-private checked construction error"
-)]
 pub(crate) enum WorkspaceConstructionError {
     #[error("workspace has too many roots")]
     TooManyRoots,
@@ -476,27 +468,6 @@ pub(crate) fn lower_workspace(
 
     Workspace::new(revision, primary_root, additional_roots, cwd)
         .map_err(|_| WorkspaceInputLoweringError::InvalidNativePath)
-}
-
-#[allow(
-    dead_code,
-    reason = "future Store decode uses this trusted native Workspace construction seam"
-)]
-pub(crate) fn spec_from_native(
-    key: WorkspaceRootKey,
-    path: PathBuf,
-    requested_access: RequestedFilesystemAccess,
-    sources: WorkspaceSourcePolicy,
-    target: WorkspacePathTarget,
-) -> Result<WorkspaceRootSpec, WorkspaceInputLoweringError> {
-    let uri = checked_native_uri(&path, target)?;
-    let path = lower_uri(&uri, target)?;
-    Ok(WorkspaceRootSpec {
-        key,
-        path,
-        requested_access,
-        sources,
-    })
 }
 
 #[allow(
@@ -751,8 +722,8 @@ mod tests {
     use super::{
         RequestedFilesystemAccess, Workspace, WorkspaceConstructionError, WorkspaceCwdSpec,
         WorkspaceDefinitionInput, WorkspaceInputLoweringError, WorkspacePathTarget,
-        WorkspaceRootInput, WorkspaceRootSpec, WorkspaceSourcePolicy, lower_workspace,
-        spec_from_native, uri_from_spec,
+        WorkspaceRootInput, WorkspaceRootSpec, WorkspaceSourcePolicy, checked_native_uri,
+        lower_workspace, uri_from_spec,
     };
     use crate::wire::{CanonicalFileUri, WorkspaceRelativePath, WorkspaceRevision};
 
@@ -900,13 +871,7 @@ mod tests {
             (WorkspacePathTarget::Windows, "C:\\work\0project"),
         ] {
             assert_eq!(
-                spec_from_native(
-                    "repo".parse().unwrap(),
-                    PathBuf::from(native_path),
-                    RequestedFilesystemAccess::ReadWrite,
-                    WorkspaceSourcePolicy::new(true, true),
-                    target,
-                ),
+                checked_native_uri(Path::new(native_path), target),
                 Err(WorkspaceInputLoweringError::InvalidNativePath),
             );
         }
@@ -919,11 +884,8 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
 
         assert_eq!(
-            spec_from_native(
-                "repo".parse().unwrap(),
-                PathBuf::from(OsString::from_vec(vec![b'/', b'w', 0xFF])),
-                RequestedFilesystemAccess::ReadWrite,
-                WorkspaceSourcePolicy::new(true, true),
+            checked_native_uri(
+                Path::new(&OsString::from_vec(vec![b'/', b'w', 0xFF])),
                 WorkspacePathTarget::Posix,
             ),
             Err(WorkspaceInputLoweringError::NativePathNotLossless),
@@ -934,10 +896,10 @@ mod tests {
     fn workspace_aggregate_keeps_revision_order_and_cwd_and_rejects_invalid_construction() {
         let workspace = Workspace::new(
             revision(),
-            native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+            root_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
             vec![
-                native_spec("first", "/work/first", WorkspacePathTarget::Posix),
-                native_spec("second", "/work/second", WorkspacePathTarget::Posix),
+                root_spec("first", "/work/first", WorkspacePathTarget::Posix),
+                root_spec("second", "/work/second", WorkspacePathTarget::Posix),
             ],
             cwd("second", "nested"),
         )
@@ -952,8 +914,8 @@ mod tests {
         assert_eq!(
             Workspace::new(
                 revision(),
-                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
-                vec![native_spec(
+                root_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                vec![root_spec(
                     "primary",
                     "/work/other",
                     WorkspacePathTarget::Posix
@@ -965,8 +927,8 @@ mod tests {
         assert_eq!(
             Workspace::new(
                 revision(),
-                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
-                vec![native_spec(
+                root_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                vec![root_spec(
                     "other",
                     "/work/primary",
                     WorkspacePathTarget::Posix
@@ -978,7 +940,7 @@ mod tests {
         assert_eq!(
             Workspace::new(
                 revision(),
-                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                root_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
                 Vec::new(),
                 cwd("missing", ""),
             ),
@@ -987,10 +949,10 @@ mod tests {
         assert_eq!(
             Workspace::new(
                 revision(),
-                native_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
+                root_spec("primary", "/work/primary", WorkspacePathTarget::Posix),
                 (1..=16)
                     .map(|index| {
-                        native_spec(
+                        root_spec(
                             &format!("root-{index}"),
                             &format!("/work/{index}"),
                             WorkspacePathTarget::Posix,
@@ -1051,14 +1013,12 @@ mod tests {
         WorkspaceCwdSpec::new(root.parse().unwrap(), relative_path.parse().unwrap())
     }
 
-    fn native_spec(key: &str, path: &str, target: WorkspacePathTarget) -> WorkspaceRootSpec {
-        spec_from_native(
-            key.parse().unwrap(),
-            PathBuf::from(path),
-            RequestedFilesystemAccess::ReadWrite,
-            WorkspaceSourcePolicy::new(true, true),
-            target,
-        )
-        .unwrap()
+    fn root_spec(key: &str, path: &str, _target: WorkspacePathTarget) -> WorkspaceRootSpec {
+        WorkspaceRootSpec {
+            key: key.parse().unwrap(),
+            path: PathBuf::from(path),
+            requested_access: RequestedFilesystemAccess::ReadWrite,
+            sources: WorkspaceSourcePolicy::new(true, true),
+        }
     }
 }

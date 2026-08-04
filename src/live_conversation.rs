@@ -295,20 +295,10 @@ impl InteractionResolutionCandidate {
 
     pub(crate) fn owner_cancellation(
         request_id: RequestId,
-        resolution: ResolvedInteraction,
+        reason: InteractionCancelReason,
     ) -> Result<Self, InteractionCandidateError> {
-        if !matches!(
-            resolution.live(),
-            InteractionResolution::Cancelled(
-                InteractionCancelReason::TurnCancelled
-                    | InteractionCancelReason::SecurityRevoked
-                    | InteractionCancelReason::SessionUnloaded
-                    | InteractionCancelReason::RuntimeClosing
-                    | InteractionCancelReason::TurnTerminal
-            )
-        ) {
-            return Err(InteractionCandidateError::invalid_resolution_origin());
-        }
+        let resolution = ResolvedInteraction::cancelled_by_owner(reason)
+            .ok_or(InteractionCandidateError::invalid_resolution_origin())?;
         Ok(Self {
             request_id,
             resolution_key: None,
@@ -1299,9 +1289,7 @@ mod tests {
         ToolResultDisposition, UserQuestionAnswer, UserQuestionField, UserQuestionFieldAnswer,
         UserQuestionInput, UserQuestionRequest,
     };
-    use crate::turn_item_interaction::{
-        InteractionHostResolutionInput, OwnerInteractionCancelReason,
-    };
+    use crate::turn_item_interaction::InteractionHostResolutionInput;
 
     fn entry_id(value: &str) -> EntryId {
         value.parse().expect("test entry IDs are valid")
@@ -1507,8 +1495,8 @@ mod tests {
             .unwrap()
     }
 
-    fn owner_cancellation() -> ResolvedInteraction {
-        ResolvedInteraction::cancelled_by_owner(OwnerInteractionCancelReason::TurnCancelled)
+    fn owner_cancellation() -> InteractionCancelReason {
+        InteractionCancelReason::TurnCancelled
     }
 
     fn answer_for_different_question() -> ResolvedInteraction {
@@ -2344,12 +2332,11 @@ mod tests {
         let calls_before = state.scripted_allocation_calls();
 
         assert!(NonZeroUsize::new(0).is_none());
-        let host_cancel = approval_request()
-            .resolve_host(InteractionHostResolutionInput::Cancelled)
-            .unwrap();
-        let owner_error =
-            InteractionResolutionCandidate::owner_cancellation(request(1), host_cancel)
-                .unwrap_err();
+        let owner_error = InteractionResolutionCandidate::owner_cancellation(
+            request(1),
+            InteractionCancelReason::HostCancelled,
+        )
+        .unwrap_err();
         assert_eq!(
             owner_error.reason,
             InteractionCandidateErrorReason::InvalidResolutionOrigin
@@ -2357,7 +2344,7 @@ mod tests {
         let host_error = InteractionResolutionCandidate::host(
             request(1),
             resolution_key(1),
-            owner_cancellation(),
+            ResolvedInteraction::cancelled_by_owner(owner_cancellation()).unwrap(),
         )
         .unwrap_err();
         assert_eq!(
@@ -3076,17 +3063,18 @@ mod tests {
     #[test]
     fn interaction_candidates_enforce_origin_family_and_cross_request_host_key_scope_without_ids() {
         let turn_id = turn(1);
-        let host_cancel = approval_request()
-            .resolve_host(InteractionHostResolutionInput::Cancelled)
-            .unwrap();
         assert!(
-            InteractionResolutionCandidate::owner_cancellation(request(1), host_cancel).is_err()
+            InteractionResolutionCandidate::owner_cancellation(
+                request(1),
+                InteractionCancelReason::HostCancelled,
+            )
+            .is_err()
         );
         assert!(
             InteractionResolutionCandidate::host(
                 request(1),
                 resolution_key(1),
-                owner_cancellation()
+                ResolvedInteraction::cancelled_by_owner(owner_cancellation()).unwrap(),
             )
             .is_err()
         );
