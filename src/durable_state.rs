@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
@@ -17,7 +17,12 @@ use crate::agent_session_lifecycle::{
     session_definitions_have_same_canonical_execution_content,
     session_metadata_has_same_canonical_content,
 };
+use crate::conversation_storage::{
+    SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
+    validate_unpublished_conversation_for_recovery,
+};
 use crate::runtime_task::RuntimeTaskContext;
+use crate::wire::conversation_jsonl_scanner::MAX_CONVERSATION_FILE_BYTES;
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
 };
@@ -438,7 +443,7 @@ struct RecoveredCatalog {
 /// cleanup has completed under the still-held root lease.
 struct RecoveryCandidate {
     catalog: RecoveredCatalog,
-    cleanup: Option<DeferredGenerationCleanup>,
+    cleanup: Option<DeferredCleanup>,
 }
 
 /// The physical files which make up a committed generation. These paths are deliberately
@@ -469,6 +474,61 @@ enum PhysicalGenerationPayload {
     Markerless(MarkerlessGenerationFiles),
 }
 
+/// The completed physical scan of one direct entity namespace. `PUBLISHED` is the only branch
+/// point: an observed marker, even an invalid one, never falls through to unpublished staging.
+enum ScannedAgentEntity {
+    Published(PhysicalGenerationScan),
+    Unpublished(UnpublishedEntityFiles),
+}
+
+enum ScannedSessionEntity {
+    Published(PhysicalGenerationScan),
+    Unpublished(UnpublishedEntityFiles),
+}
+
+/// Exact markerless new-entity facts. The plan later owns only these paths and booleans, never
+/// scanner handles. `conversation_path` is meaningful only for Session staging.
+struct UnpublishedEntityFiles {
+    entity_path: PathBuf,
+    entity_shape: CleanupNodeIdentityShape,
+    generations_path: Option<PathBuf>,
+    generations_shape: Option<CleanupNodeIdentityShape>,
+    generation: Option<UnpublishedGenerationFiles>,
+    conversation_path: Option<PathBuf>,
+    conversation_shape: Option<CleanupRegularFileShape>,
+}
+
+/// The sole permitted physical generation inside an unpublished entity: canonical G1 only.
+struct UnpublishedGenerationFiles {
+    generation_path: PathBuf,
+    generation_shape: CleanupNodeIdentityShape,
+    has_committed: bool,
+    committed_shape: Option<CleanupNodeIdentityShape>,
+    has_head: bool,
+    has_definition: bool,
+    head_shape: Option<CleanupRegularFileShape>,
+    definition_shape: Option<CleanupRegularFileShape>,
+}
+
+/// Current platform-observable identity facts retained only for cleanup-time revalidation. Unix
+/// uses device plus inode; other platforms intentionally retain an empty seam pending the M5.0
+/// native identity/reparse process gate. It contains neither a path nor an open handle.
+#[derive(Clone, Eq, PartialEq)]
+struct CleanupNodeIdentityShape {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+/// A closed regular-file observation. In addition to its node identity it records the observed
+/// byte length, so a same-node content-size drift is not removed.
+#[derive(Clone, Eq, PartialEq)]
+struct CleanupRegularFileShape {
+    length: u64,
+    node: CleanupNodeIdentityShape,
+}
+
 /// Owned revalidation data for the sole deferred destructive action allowed during one open.
 /// It contains no iterator, directory entry, or open file handle, and its Debug form deliberately
 /// suppresses the store-local paths.
@@ -479,6 +539,37 @@ struct DeferredGenerationCleanup {
     published_path: PathBuf,
     has_head: bool,
     has_definition: bool,
+}
+
+/// The intentionally narrow set of recovery deletion plans. It is one shared registration slot
+/// for both a published trailing generation and a complete invisible new entity.
+enum DeferredCleanup {
+    TrailingGeneration(DeferredGenerationCleanup),
+    UnpublishedEntity(Box<DeferredUnpublishedEntityCleanup>),
+}
+
+/// Owned exact-shape facts for a whole invisible Agent or Session entity cleanup.
+struct DeferredUnpublishedEntityCleanup {
+    entity_path: PathBuf,
+    entity_shape: CleanupNodeIdentityShape,
+    collection_parent: PathBuf,
+    entity_entry_cap: usize,
+    generation_collection_cap: usize,
+    reservation_path: PathBuf,
+    reservation_shape: CleanupNodeIdentityShape,
+    published_path: PathBuf,
+    generations_path: Option<PathBuf>,
+    generations_shape: Option<CleanupNodeIdentityShape>,
+    generation_path: Option<PathBuf>,
+    generation_shape: Option<CleanupNodeIdentityShape>,
+    conversation_path: Option<PathBuf>,
+    conversation_shape: Option<CleanupRegularFileShape>,
+    has_committed: bool,
+    committed_shape: Option<CleanupNodeIdentityShape>,
+    has_head: bool,
+    has_definition: bool,
+    head_shape: Option<CleanupRegularFileShape>,
+    definition_shape: Option<CleanupRegularFileShape>,
 }
 
 impl fmt::Debug for DeferredGenerationCleanup {
@@ -492,6 +583,41 @@ impl fmt::Debug for DeferredGenerationCleanup {
             .field("has_head", &self.has_head)
             .field("has_definition", &self.has_definition)
             .finish()
+    }
+}
+
+impl fmt::Debug for DeferredUnpublishedEntityCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeferredUnpublishedEntityCleanup")
+            .field("entity_path", &"redacted")
+            .field("collection_parent", &"redacted")
+            .field("entity_entry_cap", &self.entity_entry_cap)
+            .field("generation_collection_cap", &self.generation_collection_cap)
+            .field("reservation_path", &"redacted")
+            .field("published_path", &"redacted")
+            .field("generations_path", &self.generations_path.is_some())
+            .field("generation_path", &self.generation_path.is_some())
+            .field("conversation_path", &self.conversation_path.is_some())
+            .field("has_committed", &self.has_committed)
+            .field("has_head", &self.has_head)
+            .field("has_definition", &self.has_definition)
+            .finish()
+    }
+}
+
+impl fmt::Debug for DeferredCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrailingGeneration(cleanup) => formatter
+                .debug_tuple("TrailingGeneration")
+                .field(cleanup)
+                .finish(),
+            Self::UnpublishedEntity(cleanup) => formatter
+                .debug_tuple("UnpublishedEntity")
+                .field(cleanup)
+                .finish(),
+        }
     }
 }
 
@@ -672,7 +798,7 @@ fn open_root_with_cleanup_filesystem(
         // step. The cleanup plan above owns only paths and boolean shape facts.
         drop(root_entries);
         if let Some(cleanup) = cleanup {
-            finalize_deferred_generation_cleanup(&cleanup, directory_sync, filesystem)?;
+            finalize_deferred_cleanup(&cleanup, directory_sync, filesystem)?;
         }
         catalog
     } else {
@@ -905,7 +1031,7 @@ fn create_format_marker(
         .map_err(|_| DurableOpenError::StorageUnavailable)?;
     validate_zero_regular_file(&marker)?;
     sync_directory(root, directory_sync)?;
-    validate_zero_regular_file(&marker)
+    validate_zero_regular_file(&marker).map(|_| ())
 }
 
 #[derive(Clone, Copy)]
@@ -925,6 +1051,43 @@ impl RecoveryCaps {
         root_sessions: ROOT_SESSION_ENTRY_CAP,
         generations: GENERATION_ENTRY_CAP,
     };
+}
+
+/// A deliberately narrow physical-scan error accumulator. Recovery still retains the first
+/// non-size physical failure in traversal order, but a size/cap observation anywhere in the
+/// entered Agent/Session physical scan dominates it after every reachable entity scan finishes.
+#[derive(Default)]
+struct PhysicalScanErrors {
+    first: Option<DurableOpenError>,
+    too_large: bool,
+}
+
+impl PhysicalScanErrors {
+    fn record<T>(&mut self, result: Result<T, DurableOpenError>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(DurableOpenError::DurableStateTooLarge) => {
+                self.too_large = true;
+                None
+            }
+            Err(error) => {
+                if self.first.is_none() {
+                    self.first = Some(error);
+                }
+                None
+            }
+        }
+    }
+
+    fn finish(self) -> Result<(), DurableOpenError> {
+        if self.too_large {
+            Err(DurableOpenError::DurableStateTooLarge)
+        } else if let Some(error) = self.first {
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn recover_marked_root(
@@ -971,34 +1134,62 @@ fn recover_marked_root_with_caps(
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
-    let (agent_reservations, session_reservations) =
-        recover_marked_reservations(&root.join(RESERVATIONS_DIRECTORY), caps)?;
+    let mut physical_errors = PhysicalScanErrors::default();
+    let (agent_reservations, session_reservations) = recover_marked_reservations(
+        &root.join(RESERVATIONS_DIRECTORY),
+        caps,
+        &mut physical_errors,
+    );
     let agent_entities = scan_agent_entities(
         &root.join(AGENTS_DIRECTORY),
         &agent_reservations,
         caps.root_agents,
-    )?;
+        &mut physical_errors,
+    );
     let session_entities = scan_session_entities(
         &root.join(SESSIONS_DIRECTORY),
         &session_reservations,
         caps.root_sessions,
-    )?;
-    let mut agent_generations = BTreeMap::new();
+        &mut physical_errors,
+    );
+    // Fully scan both entity namespaces, including every generation/payload cap, before
+    // interpreting any candidate semantics or deciding that there is more than one cleanup
+    // slot. A later TooLarge observation must not be masked by an earlier second candidate.
+    let mut agent_scans = BTreeMap::new();
     for (agent_id, entity_path) in agent_entities {
-        agent_generations.insert(agent_id, scan_agent_entity(&entity_path)?);
+        if let Some(scan) =
+            physical_errors.record(scan_agent_entity(&entity_path, caps.generations))
+        {
+            agent_scans.insert(agent_id, scan);
+        }
     }
-    let mut session_generations = BTreeMap::new();
+    let mut session_scans = BTreeMap::new();
     for (session_id, entity_path) in session_entities {
-        session_generations.insert(session_id, scan_session_entity(&entity_path)?);
+        if let Some(scan) =
+            physical_errors.record(scan_session_entity(&entity_path, caps.generations))
+        {
+            session_scans.insert(session_id, scan);
+        }
+    }
+    physical_errors.finish()?;
+    if physical_recovery_candidate_count(&agent_scans, &session_scans) > 1 {
+        return Err(DurableOpenError::DurableStateCorrupt);
     }
     let mut cleanup = None;
-    let agents = recover_agents(agent_generations, caps.generations, root, &mut cleanup)?;
-    let sessions = recover_sessions(
-        session_generations,
-        &agents,
-        caps.generations,
+    let agents = recover_agents(
+        agent_scans,
         root,
         &mut cleanup,
+        &agent_reservations,
+        caps.generations,
+    )?;
+    let sessions = recover_sessions(
+        session_scans,
+        &agents,
+        root,
+        &mut cleanup,
+        &session_reservations,
+        caps.generations,
     )?;
     Ok(RecoveryCandidate {
         catalog: RecoveredCatalog { agents, sessions },
@@ -1009,171 +1200,362 @@ fn recover_marked_root_with_caps(
 fn recover_marked_reservations(
     path: &Path,
     caps: RecoveryCaps,
-) -> Result<(BTreeSet<AgentId>, BTreeSet<SessionId>), DurableOpenError> {
-    let entries = read_entries_bounded(path, RESERVATIONS_ENTRY_CAP)?;
+    errors: &mut PhysicalScanErrors,
+) -> (
+    BTreeMap<AgentId, CleanupNodeIdentityShape>,
+    BTreeMap<SessionId, CleanupNodeIdentityShape>,
+) {
+    let entries = errors.record(read_entries_bounded(path, RESERVATIONS_ENTRY_CAP));
     let mut has_agents = false;
     let mut has_sessions = false;
-    for entry in &entries {
+    for entry in entries.as_deref().unwrap_or_default() {
         if entry_has_name(entry, AGENTS_DIRECTORY) {
-            validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
+            errors.record(validate_directory_entry(
+                entry,
+                DurableOpenError::DurableStateCorrupt,
+            ));
             has_agents = true;
         } else if entry_has_name(entry, SESSIONS_DIRECTORY) {
-            validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
+            errors.record(validate_directory_entry(
+                entry,
+                DurableOpenError::DurableStateCorrupt,
+            ));
             has_sessions = true;
         } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
     }
     if !(has_agents && has_sessions) {
-        return Err(DurableOpenError::DurableStateCorrupt);
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
     }
 
-    let agents = scan_agent_reservations(&path.join(AGENTS_DIRECTORY), caps.agent_reservations)?;
-    let sessions =
-        scan_session_reservations(&path.join(SESSIONS_DIRECTORY), caps.session_reservations)?;
-    Ok((agents, sessions))
+    let agents = scan_agent_reservations(
+        &path.join(AGENTS_DIRECTORY),
+        caps.agent_reservations,
+        errors,
+    );
+    let sessions = scan_session_reservations(
+        &path.join(SESSIONS_DIRECTORY),
+        caps.session_reservations,
+        errors,
+    );
+    (agents, sessions)
 }
 
 fn scan_agent_reservations(
     path: &Path,
     maximum: usize,
-) -> Result<BTreeSet<AgentId>, DurableOpenError> {
-    let metadata = metadata_without_following(path)?;
-    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    let entries = read_entries_bounded(path, maximum)?;
-    let mut reservation_paths = BTreeMap::new();
+    errors: &mut PhysicalScanErrors,
+) -> BTreeMap<AgentId, CleanupNodeIdentityShape> {
+    let Some(metadata) = errors.record(metadata_without_following(path)) else {
+        return BTreeMap::new();
+    };
+    errors.record(validate_existing_directory(
+        &metadata,
+        DurableOpenError::DurableStateCorrupt,
+    ));
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return BTreeMap::new();
+    }
+    let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
+        return BTreeMap::new();
+    };
+    let mut reservations = BTreeMap::new();
     for entry in entries {
-        let agent_id = parse_agent_id_name(&entry.file_name())?;
-        if reservation_paths.insert(agent_id, entry.path()).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+        let Some(agent_id) = errors.record(parse_agent_id_name(&entry.file_name())) else {
+            continue;
+        };
+        if reservations.contains_key(&agent_id) {
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+            continue;
+        }
+        if let Some(shape) = errors.record(validate_zero_regular_file(&entry.path())) {
+            reservations.insert(agent_id, shape);
         }
     }
-    for path in reservation_paths.values() {
-        validate_zero_regular_file(path)?;
-    }
-    Ok(reservation_paths.into_keys().collect())
+    reservations
 }
 
 fn scan_session_reservations(
     path: &Path,
     maximum: usize,
-) -> Result<BTreeSet<SessionId>, DurableOpenError> {
-    let metadata = metadata_without_following(path)?;
-    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    let entries = read_entries_bounded(path, maximum)?;
-    let mut reservation_paths = BTreeMap::new();
+    errors: &mut PhysicalScanErrors,
+) -> BTreeMap<SessionId, CleanupNodeIdentityShape> {
+    let Some(metadata) = errors.record(metadata_without_following(path)) else {
+        return BTreeMap::new();
+    };
+    errors.record(validate_existing_directory(
+        &metadata,
+        DurableOpenError::DurableStateCorrupt,
+    ));
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return BTreeMap::new();
+    }
+    let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
+        return BTreeMap::new();
+    };
+    let mut reservations = BTreeMap::new();
     for entry in entries {
-        let session_id = parse_session_id_name(&entry.file_name())?;
-        if reservation_paths.insert(session_id, entry.path()).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+        let Some(session_id) = errors.record(parse_session_id_name(&entry.file_name())) else {
+            continue;
+        };
+        if reservations.contains_key(&session_id) {
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+            continue;
+        }
+        if let Some(shape) = errors.record(validate_zero_regular_file(&entry.path())) {
+            reservations.insert(session_id, shape);
         }
     }
-    for path in reservation_paths.values() {
-        validate_zero_regular_file(path)?;
-    }
-    Ok(reservation_paths.into_keys().collect())
+    reservations
 }
 
 fn scan_agent_entities(
     path: &Path,
-    reservations: &BTreeSet<AgentId>,
+    reservations: &BTreeMap<AgentId, CleanupNodeIdentityShape>,
     maximum: usize,
-) -> Result<BTreeMap<AgentId, PathBuf>, DurableOpenError> {
-    let metadata = metadata_without_following(path)?;
-    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    let entries = read_entries_bounded(path, maximum)?;
+    errors: &mut PhysicalScanErrors,
+) -> BTreeMap<AgentId, PathBuf> {
+    let Some(metadata) = errors.record(metadata_without_following(path)) else {
+        return BTreeMap::new();
+    };
+    errors.record(validate_existing_directory(
+        &metadata,
+        DurableOpenError::DurableStateCorrupt,
+    ));
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return BTreeMap::new();
+    }
+    let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
+        return BTreeMap::new();
+    };
     let mut entity_paths = BTreeMap::new();
     for entry in entries {
-        let agent_id = parse_agent_id_name(&entry.file_name())?;
+        let Some(agent_id) = errors.record(parse_agent_id_name(&entry.file_name())) else {
+            continue;
+        };
         if entity_paths.insert(agent_id, entry.path()).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
     }
-    for (agent_id, entity_path) in &entity_paths {
-        let metadata = metadata_without_following(entity_path)?;
-        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-        if !reservations.contains(agent_id) {
-            return Err(DurableOpenError::DurableStateCorrupt);
+    entity_paths.retain(|agent_id, entity_path| {
+        let Some(metadata) = errors.record(metadata_without_following(entity_path)) else {
+            return false;
+        };
+        errors.record(validate_existing_directory(
+            &metadata,
+            DurableOpenError::DurableStateCorrupt,
+        ));
+        if !reservations.contains_key(agent_id) {
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
-    }
-    Ok(entity_paths)
+        !metadata.file_type().is_symlink() && metadata.is_dir()
+    });
+    entity_paths
 }
 
 fn scan_session_entities(
     path: &Path,
-    reservations: &BTreeSet<SessionId>,
+    reservations: &BTreeMap<SessionId, CleanupNodeIdentityShape>,
     maximum: usize,
-) -> Result<BTreeMap<SessionId, PathBuf>, DurableOpenError> {
-    let metadata = metadata_without_following(path)?;
-    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    let entries = read_entries_bounded(path, maximum)?;
+    errors: &mut PhysicalScanErrors,
+) -> BTreeMap<SessionId, PathBuf> {
+    let Some(metadata) = errors.record(metadata_without_following(path)) else {
+        return BTreeMap::new();
+    };
+    errors.record(validate_existing_directory(
+        &metadata,
+        DurableOpenError::DurableStateCorrupt,
+    ));
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return BTreeMap::new();
+    }
+    let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
+        return BTreeMap::new();
+    };
     let mut entity_paths = BTreeMap::new();
     for entry in entries {
-        let session_id = parse_session_id_name(&entry.file_name())?;
+        let Some(session_id) = errors.record(parse_session_id_name(&entry.file_name())) else {
+            continue;
+        };
         if entity_paths.insert(session_id, entry.path()).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
     }
 
-    for (session_id, entity_path) in &entity_paths {
-        let metadata = metadata_without_following(entity_path)?;
-        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-        if !reservations.contains(session_id) {
-            return Err(DurableOpenError::DurableStateCorrupt);
+    entity_paths.retain(|session_id, entity_path| {
+        let Some(metadata) = errors.record(metadata_without_following(entity_path)) else {
+            return false;
+        };
+        errors.record(validate_existing_directory(
+            &metadata,
+            DurableOpenError::DurableStateCorrupt,
+        ));
+        if !reservations.contains_key(session_id) {
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
-    }
-    Ok(entity_paths)
+        !metadata.file_type().is_symlink() && metadata.is_dir()
+    });
+    entity_paths
 }
 
-fn scan_session_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
+fn physical_recovery_candidate_count(
+    agents: &BTreeMap<AgentId, ScannedAgentEntity>,
+    sessions: &BTreeMap<SessionId, ScannedSessionEntity>,
+) -> usize {
+    let agents = agents
+        .values()
+        .filter(|entity| {
+            matches!(entity, ScannedAgentEntity::Unpublished(_))
+                || matches!(entity, ScannedAgentEntity::Published(scan) if scan.markerless.is_some())
+        })
+        .count();
+    let sessions = sessions
+        .values()
+        .filter(|entity| {
+            matches!(entity, ScannedSessionEntity::Unpublished(_))
+                || matches!(entity, ScannedSessionEntity::Published(scan) if scan.markerless.is_some())
+        })
+        .count();
+    agents + sessions
+}
+
+fn scan_session_entity(
+    path: &Path,
+    generation_maximum: usize,
+) -> Result<ScannedSessionEntity, DurableOpenError> {
     let mut entries = read_entries_bounded(path, SESSION_ENTITY_ENTRY_CAP)?;
     entries.sort_unstable_by_key(|entry| entry.file_name());
-    let mut published = false;
-    let mut conversation = false;
+    let mut published_path = None;
+    let mut conversation_path = None;
     let mut generations = None;
+    let mut unknown_child = false;
     for entry in entries {
         if entry_has_name(&entry, "PUBLISHED") {
-            validate_zero_regular_file(&entry.path())?;
-            published = true;
+            if published_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
         } else if entry_has_name(&entry, "conversation.jsonl") {
             // This is intentionally a physical-only check. Header and entry bytes remain owned
             // by Conversation Storage and must not make whole-store recovery read or rewrite it.
-            validate_regular_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
-            conversation = true;
+            if conversation_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
         } else if entry_has_name(&entry, "generations") {
-            validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
-            generations = Some(entry.path());
+            if generations.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
         } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            unknown_child = true;
         }
     }
-    let Some(generations) = generations else {
-        return Err(DurableOpenError::DurableStateCorrupt);
+    let mut errors = PhysicalScanErrors::default();
+    let published = published_path.is_some();
+    let generations_are_enterable = generations.as_deref().is_some_and(|generations| {
+        errors
+            .record(metadata_without_following(generations))
+            .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+    });
+    let published_scan = if published {
+        generations
+            .as_deref()
+            .filter(|_| generations_are_enterable)
+            .and_then(|generations| {
+                errors.record(scan_physical_generation_chain(
+                    generations,
+                    generation_maximum,
+                ))
+            })
+    } else {
+        None
     };
-    if !(published && conversation) {
-        return Err(DurableOpenError::DurableStateCorrupt);
+    let unpublished_scan = if published {
+        None
+    } else {
+        errors.record(scan_unpublished_entity(
+            path,
+            generations
+                .as_ref()
+                .filter(|_| generations_are_enterable)
+                .cloned(),
+            conversation_path.clone(),
+            true,
+            generation_maximum,
+        ))
+    };
+
+    if let Some(published_path) = published_path {
+        errors.record(validate_zero_regular_file(&published_path));
     }
-    Ok(generations)
+    if let Some(generations) = &generations {
+        if let Some(metadata) = errors.record(metadata_without_following(generations)) {
+            errors.record(validate_existing_directory(
+                &metadata,
+                DurableOpenError::DurableStateCorrupt,
+            ));
+        }
+    }
+    if let Some(conversation_path) = &conversation_path {
+        errors.record(validate_regular_entry_path(
+            conversation_path,
+            DurableOpenError::DurableStateCorrupt,
+        ));
+    }
+    if unknown_child || (published && (generations.is_none() || conversation_path.is_none())) {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+    match (published, published_scan, unpublished_scan) {
+        (true, Some(scan), _) => Ok(ScannedSessionEntity::Published(scan)),
+        (false, _, Some(files)) => Ok(ScannedSessionEntity::Unpublished(files)),
+        _ => Err(DurableOpenError::DurableStateCorrupt),
+    }
 }
 
 fn recover_agents(
-    entity_generations: BTreeMap<AgentId, PathBuf>,
-    generation_maximum: usize,
+    entities: BTreeMap<AgentId, ScannedAgentEntity>,
     root: &Path,
-    cleanup: &mut Option<DeferredGenerationCleanup>,
+    cleanup: &mut Option<DeferredCleanup>,
+    reservations: &BTreeMap<AgentId, CleanupNodeIdentityShape>,
+    generation_collection_cap: usize,
 ) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
     let mut agents = BTreeMap::new();
-    for (agent_id, generations) in entity_generations {
-        let RecoveredAgentGenerationChain { entry, markerless } =
-            recover_agent_generation_chain(&generations, agent_id, generation_maximum)?;
-        if let Some(markerless) = markerless {
-            register_deferred_generation_cleanup(
-                cleanup,
-                deferred_agent_generation_cleanup(root, agent_id, markerless),
-            )?;
-        }
-        if agents.insert(agent_id, entry).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+    for (agent_id, entity) in entities {
+        match entity {
+            ScannedAgentEntity::Published(scan) => {
+                let RecoveredAgentGenerationChain { entry, markerless } =
+                    recover_agent_generation_chain(scan, agent_id)?;
+                if let Some(markerless) = markerless {
+                    register_deferred_cleanup(
+                        cleanup,
+                        DeferredCleanup::TrailingGeneration(deferred_agent_generation_cleanup(
+                            root, agent_id, markerless,
+                        )),
+                    )?;
+                }
+                if agents.insert(agent_id, entry).is_some() {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+            }
+            ScannedAgentEntity::Unpublished(files) => {
+                validate_unpublished_agent_candidate(agent_id, &files)?;
+                let reservation_shape = reservations
+                    .get(&agent_id)
+                    .cloned()
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?;
+                register_deferred_cleanup(
+                    cleanup,
+                    DeferredCleanup::UnpublishedEntity(Box::new(
+                        deferred_unpublished_agent_cleanup(
+                            root,
+                            agent_id,
+                            files,
+                            generation_collection_cap,
+                            reservation_shape,
+                        ),
+                    )),
+                )?;
+            }
         }
     }
     Ok(agents)
@@ -1183,40 +1565,65 @@ fn recover_agents(
 /// function runs so every Session pin can be checked against the retained exact Agent definition
 /// index rather than an Agent's mutable current definition or status.
 fn recover_sessions(
-    entity_generations: BTreeMap<SessionId, PathBuf>,
+    entities: BTreeMap<SessionId, ScannedSessionEntity>,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
-    generation_maximum: usize,
     root: &Path,
-    cleanup: &mut Option<DeferredGenerationCleanup>,
+    cleanup: &mut Option<DeferredCleanup>,
+    reservations: &BTreeMap<SessionId, CleanupNodeIdentityShape>,
+    generation_collection_cap: usize,
 ) -> Result<BTreeMap<SessionId, DurableSessionCatalogEntry>, DurableOpenError> {
     let mut sessions = BTreeMap::new();
-    for (session_id, generations) in entity_generations {
-        let RecoveredSessionGenerationChain { entry, markerless } =
-            recover_session_generation_chain(&generations, session_id, agents, generation_maximum)?;
-        if let Some(markerless) = markerless {
-            register_deferred_generation_cleanup(
-                cleanup,
-                deferred_session_generation_cleanup(root, session_id, markerless),
-            )?;
-        }
-        if sessions.insert(session_id, entry).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+    let mut unpublished = Vec::new();
+    for (session_id, entity) in entities {
+        match entity {
+            ScannedSessionEntity::Published(scan) => {
+                let RecoveredSessionGenerationChain { entry, markerless } =
+                    recover_session_generation_chain(scan, session_id, agents)?;
+                if let Some(markerless) = markerless {
+                    register_deferred_cleanup(
+                        cleanup,
+                        DeferredCleanup::TrailingGeneration(deferred_session_generation_cleanup(
+                            root, session_id, markerless,
+                        )),
+                    )?;
+                }
+                if sessions.insert(session_id, entry).is_some() {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+            }
+            ScannedSessionEntity::Unpublished(files) => unpublished.push((session_id, files)),
         }
     }
     validate_fork_provenance_references_and_cycles(&sessions)?;
+    for (session_id, files) in unpublished {
+        validate_unpublished_session_candidate(session_id, &files, agents, &sessions)?;
+        let reservation_shape = reservations
+            .get(&session_id)
+            .cloned()
+            .ok_or(DurableOpenError::DurableStateCorrupt)?;
+        register_deferred_cleanup(
+            cleanup,
+            DeferredCleanup::UnpublishedEntity(Box::new(deferred_unpublished_session_cleanup(
+                root,
+                session_id,
+                files,
+                generation_collection_cap,
+                reservation_shape,
+            ))),
+        )?;
+    }
     Ok(sessions)
 }
 
 fn recover_session_generation_chain(
-    path: &Path,
+    scan: PhysicalGenerationScan,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
-    maximum: usize,
 ) -> Result<RecoveredSessionGenerationChain, DurableOpenError> {
     let PhysicalGenerationScan {
         committed,
         markerless,
-    } = scan_physical_generation_chain(path, maximum)?;
+    } = scan;
     let mut generations = committed.into_iter();
     let Some(first_generation) = generations.next() else {
         return Err(DurableOpenError::DurableStateCorrupt);
@@ -1487,29 +1894,273 @@ fn is_exact_next_session_metadata_revision(
     previous.get().checked_add(1) == Some(next.get())
 }
 
-fn scan_agent_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
+fn scan_agent_entity(
+    path: &Path,
+    generation_maximum: usize,
+) -> Result<ScannedAgentEntity, DurableOpenError> {
     let mut entries = read_entries_bounded(path, AGENT_ENTITY_ENTRY_CAP)?;
     entries.sort_unstable_by_key(|entry| entry.file_name());
-    let mut published = false;
+    let mut published_path = None;
     let mut generations = None;
+    let mut unknown_child = false;
     for entry in entries {
         if entry_has_name(&entry, "PUBLISHED") {
-            validate_zero_regular_file(&entry.path())?;
-            published = true;
+            if published_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
         } else if entry_has_name(&entry, "generations") {
-            validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
-            generations = Some(entry.path());
+            if generations.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
         } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            unknown_child = true;
         }
     }
-    let Some(generations) = generations else {
-        return Err(DurableOpenError::DurableStateCorrupt);
+    let mut errors = PhysicalScanErrors::default();
+    let published = published_path.is_some();
+    let generations_are_enterable = generations.as_deref().is_some_and(|generations| {
+        errors
+            .record(metadata_without_following(generations))
+            .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+    });
+    let published_scan = if published {
+        generations
+            .as_deref()
+            .filter(|_| generations_are_enterable)
+            .and_then(|generations| {
+                errors.record(scan_physical_generation_chain(
+                    generations,
+                    generation_maximum,
+                ))
+            })
+    } else {
+        None
     };
-    if !published {
-        return Err(DurableOpenError::DurableStateCorrupt);
+    let unpublished_scan = if published {
+        None
+    } else {
+        errors.record(scan_unpublished_entity(
+            path,
+            generations
+                .as_ref()
+                .filter(|_| generations_are_enterable)
+                .cloned(),
+            None,
+            false,
+            generation_maximum,
+        ))
+    };
+    if let Some(published_path) = published_path {
+        errors.record(validate_zero_regular_file(&published_path));
     }
-    Ok(generations)
+    if let Some(generations) = &generations {
+        if let Some(metadata) = errors.record(metadata_without_following(generations)) {
+            errors.record(validate_existing_directory(
+                &metadata,
+                DurableOpenError::DurableStateCorrupt,
+            ));
+        }
+    }
+    if unknown_child || (published && generations.is_none()) {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+    match (published, published_scan, unpublished_scan) {
+        (true, Some(scan), _) => Ok(ScannedAgentEntity::Published(scan)),
+        (false, _, Some(files)) => Ok(ScannedAgentEntity::Unpublished(files)),
+        _ => Err(DurableOpenError::DurableStateCorrupt),
+    }
+}
+
+fn scan_unpublished_entity(
+    entity_path: &Path,
+    generations_path: Option<PathBuf>,
+    conversation_path: Option<PathBuf>,
+    is_session: bool,
+    generation_maximum: usize,
+) -> Result<UnpublishedEntityFiles, DurableOpenError> {
+    let entity_metadata = metadata_without_following(entity_path)?;
+    let entity_shape = cleanup_node_identity_shape(&entity_metadata);
+    // Keep the G1 and conversation observations in one deliberately narrow accumulator. In
+    // particular, a corrupt G1/COMMITTED observation must not make us skip a reachable sparse
+    // conversation's 1 GiB metadata bound: TooLarge wins after both physical scans complete.
+    let mut errors = PhysicalScanErrors::default();
+    let generations_shape = generations_path.as_deref().and_then(|path| {
+        errors
+            .record(metadata_without_following(path))
+            .map(|metadata| cleanup_node_identity_shape(&metadata))
+    });
+    let generation = generations_path.as_deref().and_then(|path| {
+        errors
+            .record(scan_unpublished_generation(path, generation_maximum))
+            .flatten()
+    });
+    let conversation_shape = conversation_path
+        .as_deref()
+        .and_then(|path| errors.record(validate_unpublished_conversation_physical_shape(path)));
+
+    // These are relations between the two completed physical scans, rather than reasons to
+    // short-circuit either one.
+    if conversation_path.is_some() && !is_session {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    if conversation_path.is_some() && generation.is_none() {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    if is_session
+        && generation
+            .as_ref()
+            .is_some_and(|generation| generation.has_committed)
+        && conversation_path.is_none()
+    {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+
+    Ok(UnpublishedEntityFiles {
+        entity_path: entity_path.to_owned(),
+        entity_shape,
+        generations_path,
+        generations_shape,
+        generation,
+        conversation_path,
+        conversation_shape,
+    })
+}
+
+fn scan_unpublished_generation(
+    generations_path: &Path,
+    maximum: usize,
+) -> Result<Option<UnpublishedGenerationFiles>, DurableOpenError> {
+    let entries = read_entries_bounded(generations_path, maximum)?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut errors = PhysicalScanErrors::default();
+    let mut generation_one = None;
+    for entry in &entries {
+        let Some(generation) = errors.record(
+            StorageGeneration::parse_directory_name(&entry.file_name())
+                .map_err(|_| DurableOpenError::DurableStateCorrupt),
+        ) else {
+            continue;
+        };
+        let Some(metadata) = errors.record(metadata_without_following(&entry.path())) else {
+            continue;
+        };
+        errors.record(validate_existing_directory(
+            &metadata,
+            DurableOpenError::DurableStateCorrupt,
+        ));
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Some(payload) = errors.record(scan_unpublished_generation_payload(
+            entry.path(),
+            cleanup_node_identity_shape(&metadata),
+        )) else {
+            continue;
+        };
+        let invalid_generation = generation.get() != 1 || generation_one.replace(payload).is_some();
+        if invalid_generation {
+            errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+        }
+    }
+    if entries.len() != 1 || generation_one.is_none() {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+    Ok(generation_one)
+}
+
+fn scan_unpublished_generation_payload(
+    generation_path: PathBuf,
+    generation_shape: CleanupNodeIdentityShape,
+) -> Result<UnpublishedGenerationFiles, DurableOpenError> {
+    let mut entries = read_entries_bounded(&generation_path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut head_path = None;
+    let mut definition_path = None;
+    let mut committed_path = None;
+    let mut unknown_child = false;
+    for entry in entries {
+        if entry_has_name(&entry, "head.json") {
+            if head_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
+        } else if entry_has_name(&entry, "definition.json") {
+            if definition_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
+        } else if entry_has_name(&entry, "COMMITTED") {
+            if committed_path.replace(entry.path()).is_some() {
+                unknown_child = true;
+            }
+        } else {
+            unknown_child = true;
+        }
+    }
+    let mut errors = PhysicalScanErrors::default();
+    let head_shape = head_path
+        .as_deref()
+        .and_then(|path| errors.record(validate_generation_document_physical_shape(path)));
+    let definition_shape = definition_path
+        .as_deref()
+        .and_then(|path| errors.record(validate_generation_document_physical_shape(path)));
+    let committed_shape = committed_path
+        .as_deref()
+        .and_then(|path| errors.record(validate_zero_regular_file(path)));
+    if unknown_child
+        || (committed_path.is_some() && (head_path.is_none() || definition_path.is_none()))
+    {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+    Ok(UnpublishedGenerationFiles {
+        generation_path,
+        generation_shape,
+        has_committed: committed_path.is_some(),
+        committed_shape,
+        has_head: head_path.is_some(),
+        has_definition: definition_path.is_some(),
+        head_shape,
+        definition_shape,
+    })
+}
+
+fn validate_unpublished_conversation_physical_shape(
+    path: &Path,
+) -> Result<CleanupRegularFileShape, DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
+    validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    if metadata.len() > MAX_CONVERSATION_FILE_BYTES {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+    Ok(cleanup_regular_file_shape(&metadata))
+}
+
+fn cleanup_regular_file_shape(metadata: &fs::Metadata) -> CleanupRegularFileShape {
+    CleanupRegularFileShape {
+        length: metadata.len(),
+        node: cleanup_node_identity_shape(metadata),
+    }
+}
+
+fn cleanup_node_identity_shape(metadata: &fs::Metadata) -> CleanupNodeIdentityShape {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        CleanupNodeIdentityShape {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        CleanupNodeIdentityShape {}
+    }
 }
 
 /// Scans the shared physical generation layout before either domain's decode/fold pass. A
@@ -1520,21 +2171,43 @@ fn scan_physical_generation_chain(
     maximum: usize,
 ) -> Result<PhysicalGenerationScan, DurableOpenError> {
     let entries = read_entries_bounded(path, maximum)?;
+    let mut errors = PhysicalScanErrors::default();
     let mut generation_paths = Vec::with_capacity(entries.len());
     for entry in entries {
-        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
-            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
-        generation_paths.push((generation, entry.path()));
+        if let Some(generation) = errors.record(
+            StorageGeneration::parse_directory_name(&entry.file_name())
+                .map_err(|_| DurableOpenError::DurableStateCorrupt),
+        ) {
+            generation_paths.push((generation, entry.path()));
+        }
     }
     generation_paths.sort_unstable_by_key(|(generation, _)| *generation);
 
-    let mut committed = Vec::with_capacity(generation_paths.len());
+    let mut payloads = Vec::with_capacity(generation_paths.len());
+    for (generation, generation_path) in generation_paths {
+        let Some(metadata) = errors.record(metadata_without_following(&generation_path)) else {
+            continue;
+        };
+        errors.record(validate_existing_directory(
+            &metadata,
+            DurableOpenError::DurableStateCorrupt,
+        ));
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        if let Some(payload) = errors.record(scan_physical_generation_payload(
+            generation,
+            generation_path,
+            path,
+        )) {
+            payloads.push(payload);
+        }
+    }
+
+    let mut committed = Vec::with_capacity(payloads.len());
     let mut markerless = None;
     let mut highest_committed = None;
-    for (generation, generation_path) in generation_paths {
-        let metadata = metadata_without_following(&generation_path)?;
-        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-        let payload = scan_physical_generation_payload(generation, generation_path, path)?;
+    for payload in payloads {
         match payload {
             PhysicalGenerationPayload::Committed(files) => {
                 let expected = highest_committed
@@ -1546,7 +2219,8 @@ fn scan_physical_generation_chain(
                     })
                     .unwrap_or_else(|| StorageGeneration::new(1));
                 if markerless.is_some() || expected != Some(files.generation) {
-                    return Err(DurableOpenError::DurableStateCorrupt);
+                    errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+                    continue;
                 }
                 highest_committed = Some(files.generation);
                 committed.push(files);
@@ -1559,9 +2233,16 @@ fn scan_physical_generation_chain(
                             .checked_add(1)
                             .and_then(StorageGeneration::new)
                     })
-                    .ok_or(DurableOpenError::DurableStateCorrupt)?;
+                    .or_else(|| {
+                        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+                        None
+                    });
+                let Some(expected) = expected else {
+                    continue;
+                };
                 if markerless.is_some() || files.generation != expected {
-                    return Err(DurableOpenError::DurableStateCorrupt);
+                    errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+                    continue;
                 }
                 markerless = Some(files);
             }
@@ -1569,8 +2250,9 @@ fn scan_physical_generation_chain(
     }
 
     if committed.is_empty() {
-        return Err(DurableOpenError::DurableStateCorrupt);
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
     }
+    errors.finish()?;
     Ok(PhysicalGenerationScan {
         committed,
         markerless,
@@ -1587,6 +2269,7 @@ fn scan_physical_generation_payload(
     let mut head_path = None;
     let mut definition_path = None;
     let mut committed_path = None;
+    let mut unknown_child = false;
 
     for entry in entries {
         let slot = if entry_has_name(&entry, "head.json") {
@@ -1596,20 +2279,33 @@ fn scan_physical_generation_payload(
         } else if entry_has_name(&entry, "COMMITTED") {
             &mut committed_path
         } else {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            unknown_child = true;
+            continue;
         };
         if slot.replace(entry.path()).is_some() {
-            return Err(DurableOpenError::DurableStateCorrupt);
+            unknown_child = true;
         }
     }
 
-    if let Some(committed_path) = committed_path {
-        validate_zero_regular_file(&committed_path)?;
-        let head_path = head_path.ok_or(DurableOpenError::DurableStateCorrupt)?;
-        validate_generation_document_physical_shape(&head_path)?;
-        if let Some(definition_path) = &definition_path {
-            validate_generation_document_physical_shape(definition_path)?;
-        }
+    let mut errors = PhysicalScanErrors::default();
+    if let Some(head_path) = &head_path {
+        errors.record(validate_generation_document_physical_shape(head_path));
+    } else if committed_path.is_some() {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    if let Some(definition_path) = &definition_path {
+        errors.record(validate_generation_document_physical_shape(definition_path));
+    }
+    if let Some(committed_path) = &committed_path {
+        errors.record(validate_zero_regular_file(committed_path));
+    }
+    if unknown_child {
+        errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
+    }
+    errors.finish()?;
+
+    if committed_path.is_some() {
+        let head_path = head_path.expect("validated as present above");
         return Ok(PhysicalGenerationPayload::Committed(
             CommittedGenerationFiles {
                 generation,
@@ -1619,12 +2315,6 @@ fn scan_physical_generation_payload(
         ));
     }
 
-    if let Some(head_path) = &head_path {
-        validate_generation_document_physical_shape(head_path)?;
-    }
-    if let Some(definition_path) = &definition_path {
-        validate_generation_document_physical_shape(definition_path)?;
-    }
     Ok(PhysicalGenerationPayload::Markerless(
         MarkerlessGenerationFiles {
             generation,
@@ -1636,13 +2326,15 @@ fn scan_physical_generation_payload(
     ))
 }
 
-fn validate_generation_document_physical_shape(path: &Path) -> Result<(), DurableOpenError> {
+fn validate_generation_document_physical_shape(
+    path: &Path,
+) -> Result<CleanupRegularFileShape, DurableOpenError> {
     let metadata = metadata_without_following(path)?;
     validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
     if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
         return Err(DurableOpenError::DurableStateTooLarge);
     }
-    Ok(())
+    Ok(cleanup_regular_file_shape(&metadata))
 }
 
 fn deferred_agent_generation_cleanup(
@@ -1687,9 +2379,9 @@ fn deferred_session_generation_cleanup(
     }
 }
 
-fn register_deferred_generation_cleanup(
-    cleanup: &mut Option<DeferredGenerationCleanup>,
-    candidate: DeferredGenerationCleanup,
+fn register_deferred_cleanup(
+    cleanup: &mut Option<DeferredCleanup>,
+    candidate: DeferredCleanup,
 ) -> Result<(), DurableOpenError> {
     if cleanup.is_some() {
         return Err(DurableOpenError::DurableStateCorrupt);
@@ -1698,17 +2390,249 @@ fn register_deferred_generation_cleanup(
     Ok(())
 }
 
+fn deferred_unpublished_agent_cleanup(
+    root: &Path,
+    agent_id: AgentId,
+    files: UnpublishedEntityFiles,
+    generation_collection_cap: usize,
+    reservation_shape: CleanupNodeIdentityShape,
+) -> DeferredUnpublishedEntityCleanup {
+    let reservation_path = root
+        .join(RESERVATIONS_DIRECTORY)
+        .join(AGENTS_DIRECTORY)
+        .join(agent_id.to_string());
+    deferred_unpublished_entity_cleanup(
+        files,
+        root.join(AGENTS_DIRECTORY),
+        AGENT_ENTITY_ENTRY_CAP,
+        generation_collection_cap,
+        reservation_path,
+        reservation_shape,
+    )
+}
+
+fn deferred_unpublished_session_cleanup(
+    root: &Path,
+    session_id: SessionId,
+    files: UnpublishedEntityFiles,
+    generation_collection_cap: usize,
+    reservation_shape: CleanupNodeIdentityShape,
+) -> DeferredUnpublishedEntityCleanup {
+    let reservation_path = root
+        .join(RESERVATIONS_DIRECTORY)
+        .join(SESSIONS_DIRECTORY)
+        .join(session_id.to_string());
+    deferred_unpublished_entity_cleanup(
+        files,
+        root.join(SESSIONS_DIRECTORY),
+        SESSION_ENTITY_ENTRY_CAP,
+        generation_collection_cap,
+        reservation_path,
+        reservation_shape,
+    )
+}
+
+fn deferred_unpublished_entity_cleanup(
+    files: UnpublishedEntityFiles,
+    collection_parent: PathBuf,
+    entity_entry_cap: usize,
+    generation_collection_cap: usize,
+    reservation_path: PathBuf,
+    reservation_shape: CleanupNodeIdentityShape,
+) -> DeferredUnpublishedEntityCleanup {
+    let UnpublishedEntityFiles {
+        entity_path,
+        entity_shape,
+        generations_path,
+        generations_shape,
+        generation,
+        conversation_path,
+        conversation_shape,
+    } = files;
+    let (
+        generation_path,
+        generation_shape,
+        has_committed,
+        committed_shape,
+        has_head,
+        has_definition,
+        head_shape,
+        definition_shape,
+    ) = match generation {
+        Some(generation) => (
+            Some(generation.generation_path),
+            Some(generation.generation_shape),
+            generation.has_committed,
+            generation.committed_shape,
+            generation.has_head,
+            generation.has_definition,
+            generation.head_shape,
+            generation.definition_shape,
+        ),
+        None => (None, None, false, None, false, false, None, None),
+    };
+    DeferredUnpublishedEntityCleanup {
+        published_path: entity_path.join("PUBLISHED"),
+        entity_path,
+        entity_shape,
+        collection_parent,
+        entity_entry_cap,
+        generation_collection_cap,
+        reservation_path,
+        reservation_shape,
+        generations_path,
+        generations_shape,
+        generation_path,
+        generation_shape,
+        conversation_path,
+        conversation_shape,
+        has_committed,
+        committed_shape,
+        has_head,
+        has_definition,
+        head_shape,
+        definition_shape,
+    }
+}
+
+fn validate_unpublished_agent_candidate(
+    agent_id: AgentId,
+    files: &UnpublishedEntityFiles,
+) -> Result<(), DurableOpenError> {
+    let Some(generation) = &files.generation else {
+        return Ok(());
+    };
+    if !generation.has_committed {
+        return Ok(());
+    }
+    let head = decode_agent_head_document(&generation.generation_path.join("head.json"))?;
+    let definition =
+        decode_agent_definition_document(&generation.generation_path.join("definition.json"))?;
+    validate_generation_one_agent_semantics(
+        agent_id,
+        StorageGeneration::new(1).ok_or(DurableOpenError::DurableStateCorrupt)?,
+        &head,
+        &definition,
+    )
+}
+
+fn validate_unpublished_session_candidate(
+    session_id: SessionId,
+    files: &UnpublishedEntityFiles,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    published_sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
+) -> Result<(), DurableOpenError> {
+    let Some(generation) = &files.generation else {
+        return Ok(());
+    };
+    if !generation.has_committed {
+        return Ok(());
+    }
+
+    let head = decode_session_head_document(&generation.generation_path.join("head.json"))?;
+    let definition =
+        decode_session_definition_document(&generation.generation_path.join("definition.json"))?;
+    validate_session_generation_one(
+        session_id,
+        StorageGeneration::new(1).ok_or(DurableOpenError::DurableStateCorrupt)?,
+        &head,
+        &definition,
+        agents,
+    )?;
+    let agent = agents
+        .get(&definition.agent().agent_id())
+        .ok_or(DurableOpenError::DurableStateCorrupt)?;
+    if agent.current_head.status() != AgentStatus::Enabled
+        || (head.fork_provenance().is_none()
+            && (definition.agent().revision() != agent.current_head.current_definition_revision()
+                || definition.agent().agent_id() != agent.current_head.agent_id()))
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    if head
+        .fork_provenance()
+        .is_some_and(|provenance| !published_sessions.contains_key(&provenance.source_session_id()))
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    let expected_header = SessionHeader::reconstruct(
+        1,
+        session_id,
+        head.created_at(),
+        definition.agent(),
+        definition.revision(),
+    );
+    let expected_shape = if head.fork_provenance().is_some() {
+        UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile
+    } else {
+        UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly
+    };
+    let conversation_path = files
+        .conversation_path
+        .as_deref()
+        .ok_or(DurableOpenError::DurableStateCorrupt)?;
+    let (mut file, declared_file_bytes, initial_path_metadata) =
+        open_unpublished_conversation_for_recovery(conversation_path)?;
+    let classification = validate_unpublished_conversation_for_recovery(
+        &mut file,
+        declared_file_bytes,
+        &expected_header,
+        expected_shape,
+    );
+    let final_handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let final_path_metadata = metadata_without_following(conversation_path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &final_handle_metadata,
+        &final_path_metadata,
+    )?;
+    classification.map_err(map_unpublished_conversation_recovery_error)
+}
+
+fn open_unpublished_conversation_for_recovery(
+    path: &Path,
+) -> Result<(File, u64, fs::Metadata), DurableOpenError> {
+    let initial_path_metadata = metadata_without_following(path)?;
+    validate_existing_regular_file(&initial_path_metadata, DurableOpenError::StorageUnavailable)?;
+    if initial_path_metadata.len() > MAX_CONVERSATION_FILE_BYTES {
+        return Err(DurableOpenError::DurableStateTooLarge);
+    }
+    let file = File::open(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    let opened_path_metadata = metadata_without_following(path)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &handle_metadata,
+        &opened_path_metadata,
+    )?;
+    Ok((file, initial_path_metadata.len(), initial_path_metadata))
+}
+
+fn map_unpublished_conversation_recovery_error(
+    error: UnpublishedConversationRecoveryError,
+) -> DurableOpenError {
+    match error {
+        UnpublishedConversationRecoveryError::TooLarge => DurableOpenError::DurableStateTooLarge,
+        UnpublishedConversationRecoveryError::Corrupt => DurableOpenError::DurableStateCorrupt,
+        UnpublishedConversationRecoveryError::Unavailable => DurableOpenError::StorageUnavailable,
+    }
+}
+
 /// Recovers the committed Agent prefix while retaining one exact trailing markerless staging
 /// candidate for deferred cleanup after complete-store validation.
 fn recover_agent_generation_chain(
-    path: &Path,
+    scan: PhysicalGenerationScan,
     agent_id: AgentId,
-    maximum: usize,
 ) -> Result<RecoveredAgentGenerationChain, DurableOpenError> {
     let PhysicalGenerationScan {
         committed,
         markerless,
-    } = scan_physical_generation_chain(path, maximum)?;
+    } = scan;
     let mut generations = committed.into_iter();
     let Some(first_generation) = generations.next() else {
         return Err(DurableOpenError::DurableStateCorrupt);
@@ -1934,7 +2858,14 @@ fn validate_regular_entry(
     entry: &DirEntry,
     error: DurableOpenError,
 ) -> Result<(), DurableOpenError> {
-    let metadata = metadata_without_following(&entry.path())?;
+    validate_regular_entry_path(&entry.path(), error)
+}
+
+fn validate_regular_entry_path(
+    path: &Path,
+    error: DurableOpenError,
+) -> Result<(), DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
     validate_existing_regular_file(&metadata, error)
 }
 
@@ -2074,7 +3005,7 @@ fn validate_same_file_identity(
     Ok(())
 }
 
-fn validate_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
+fn validate_zero_regular_file(path: &Path) -> Result<CleanupNodeIdentityShape, DurableOpenError> {
     let initial_path_metadata = metadata_without_following(path)?;
     validate_existing_regular_file(
         &initial_path_metadata,
@@ -2112,7 +3043,8 @@ fn validate_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
         &initial_path_metadata,
         &final_handle_metadata,
         &final_path_metadata,
-    )
+    )?;
+    Ok(cleanup_node_identity_shape(&final_path_metadata))
 }
 
 fn create_private_directory(path: &Path) -> Result<(), DurableOpenError> {
@@ -2368,6 +3300,242 @@ fn finalize_deferred_generation_cleanup(
     Ok(())
 }
 
+fn finalize_deferred_cleanup(
+    cleanup: &DeferredCleanup,
+    directory_sync: DirectorySync,
+    filesystem: &dyn CleanupFilesystem,
+) -> Result<(), DurableOpenError> {
+    match cleanup {
+        DeferredCleanup::TrailingGeneration(cleanup) => {
+            finalize_deferred_generation_cleanup(cleanup, directory_sync, filesystem)
+        }
+        DeferredCleanup::UnpublishedEntity(cleanup) => {
+            finalize_deferred_unpublished_entity_cleanup(cleanup, directory_sync, filesystem)
+        }
+    }
+}
+
+/// Revalidates the whole exact invisible-entity shape before any deletion. It intentionally
+/// accepts no drift: a later open can classify a known partial cleanup prefix afresh, but this
+/// plan cannot treat a changed marker, child, type, mode, or payload as removable.
+fn revalidate_deferred_unpublished_entity_cleanup(
+    cleanup: &DeferredUnpublishedEntityCleanup,
+) -> Result<(), DurableOpenError> {
+    if validate_cleanup_zero_regular_file(&cleanup.reservation_path)? != cleanup.reservation_shape {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    validate_cleanup_absent(&cleanup.published_path)?;
+
+    let entity_metadata = cleanup_metadata_without_following(&cleanup.entity_path)?;
+    validate_existing_directory(&entity_metadata, DurableOpenError::DurableStateCorrupt)?;
+    if cleanup_node_identity_shape(&entity_metadata) != cleanup.entity_shape {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    let mut entries = read_cleanup_entries_bounded(&cleanup.entity_path, cleanup.entity_entry_cap)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut generations_path = None;
+    let mut generations_shape = None;
+    let mut conversation_path = None;
+    let mut conversation_shape = None;
+    for entry in entries {
+        if entry_has_name(&entry, "PUBLISHED") {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+        if entry_has_name(&entry, "generations") {
+            if generations_path.replace(entry.path()).is_some() {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
+            let metadata = cleanup_metadata_without_following(&entry.path())?;
+            generations_shape = Some(cleanup_node_identity_shape(&metadata));
+        } else if entry_has_name(&entry, "conversation.jsonl") {
+            if conversation_path.replace(entry.path()).is_some() {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            conversation_shape = Some(validate_unpublished_conversation_physical_shape(
+                &entry.path(),
+            )?);
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    if generations_path.as_deref() != cleanup.generations_path.as_deref()
+        || generations_shape != cleanup.generations_shape
+        || conversation_path.as_deref() != cleanup.conversation_path.as_deref()
+        || conversation_shape != cleanup.conversation_shape
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+
+    let Some(generations_path) = cleanup.generations_path.as_deref() else {
+        return Ok(());
+    };
+    let entries =
+        read_cleanup_entries_bounded(generations_path, cleanup.generation_collection_cap)?;
+    match cleanup.generation_path.as_deref() {
+        None if entries.is_empty() => Ok(()),
+        Some(expected_generation_path) if entries.len() == 1 => {
+            let entry = &entries[0];
+            if entry.path() != expected_generation_path
+                || StorageGeneration::parse_directory_name(&entry.file_name())
+                    .map_err(|_| DurableOpenError::DurableStateCorrupt)?
+                    .get()
+                    != 1
+            {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
+            let metadata = cleanup_metadata_without_following(&entry.path())?;
+            if Some(cleanup_node_identity_shape(&metadata)) != cleanup.generation_shape {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            revalidate_unpublished_generation_payload(cleanup)
+        }
+        _ => Err(DurableOpenError::DurableStateCorrupt),
+    }
+}
+
+fn revalidate_unpublished_generation_payload(
+    cleanup: &DeferredUnpublishedEntityCleanup,
+) -> Result<(), DurableOpenError> {
+    let generation_path = cleanup
+        .generation_path
+        .as_deref()
+        .ok_or(DurableOpenError::DurableStateCorrupt)?;
+    let mut entries = read_cleanup_entries_bounded(generation_path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut has_committed = false;
+    let mut has_head = false;
+    let mut has_definition = false;
+    let mut head_shape = None;
+    let mut definition_shape = None;
+    for entry in entries {
+        if entry_has_name(&entry, "COMMITTED") {
+            if has_committed {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            if Some(validate_cleanup_zero_regular_file(&entry.path())?) != cleanup.committed_shape {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            has_committed = true;
+        } else if entry_has_name(&entry, "head.json") {
+            if has_head {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            head_shape = Some(validate_cleanup_generation_document(&entry.path())?);
+            has_head = true;
+        } else if entry_has_name(&entry, "definition.json") {
+            if has_definition {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            definition_shape = Some(validate_cleanup_generation_document(&entry.path())?);
+            has_definition = true;
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    if has_committed != cleanup.has_committed
+        || has_head != cleanup.has_head
+        || has_definition != cleanup.has_definition
+        || head_shape != cleanup.head_shape
+        || definition_shape != cleanup.definition_shape
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(())
+}
+
+fn finalize_deferred_unpublished_entity_cleanup(
+    cleanup: &DeferredUnpublishedEntityCleanup,
+    directory_sync: DirectorySync,
+    filesystem: &dyn CleanupFilesystem,
+) -> Result<(), DurableOpenError> {
+    revalidate_deferred_unpublished_entity_cleanup(cleanup)?;
+
+    let generation_path = cleanup.generation_path.as_deref();
+    if cleanup.has_committed {
+        filesystem
+            .remove_file(
+                &generation_path
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?
+                    .join("COMMITTED"),
+            )
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if cleanup.has_definition {
+        filesystem
+            .remove_file(
+                &generation_path
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?
+                    .join("definition.json"),
+            )
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if cleanup.has_head {
+        filesystem
+            .remove_file(
+                &generation_path
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?
+                    .join("head.json"),
+            )
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    if let Some(conversation_path) = &cleanup.conversation_path {
+        filesystem
+            .remove_file(conversation_path)
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+
+    if let Some(generation_path) = generation_path {
+        sync_cleanup_directory(filesystem, generation_path, directory_sync)?;
+        remove_cleanup_directory(filesystem, generation_path)?;
+        sync_cleanup_directory(
+            filesystem,
+            cleanup
+                .generations_path
+                .as_deref()
+                .ok_or(DurableOpenError::DurableStateCorrupt)?,
+            directory_sync,
+        )?;
+    }
+    if let Some(generations_path) = &cleanup.generations_path {
+        if generation_path.is_none() {
+            sync_cleanup_directory(filesystem, generations_path, directory_sync)?;
+        }
+        remove_cleanup_directory(filesystem, generations_path)?;
+        sync_cleanup_directory(filesystem, &cleanup.entity_path, directory_sync)?;
+    } else {
+        sync_cleanup_directory(filesystem, &cleanup.entity_path, directory_sync)?;
+    }
+    remove_cleanup_directory(filesystem, &cleanup.entity_path)?;
+    sync_cleanup_directory(filesystem, &cleanup.collection_parent, directory_sync)
+}
+
+fn remove_cleanup_directory(
+    filesystem: &dyn CleanupFilesystem,
+    path: &Path,
+) -> Result<(), DurableOpenError> {
+    if filesystem.remove_dir(path).is_err()
+        && !cleanup_candidate_is_absent_after_remove_dir_error(path)
+    {
+        return Err(DurableOpenError::StorageUnavailable);
+    }
+    Ok(())
+}
+
+fn sync_cleanup_directory(
+    filesystem: &dyn CleanupFilesystem,
+    path: &Path,
+    directory_sync: DirectorySync,
+) -> Result<(), DurableOpenError> {
+    if directory_sync == DirectorySync::Supported {
+        filesystem
+            .sync_directory(path, directory_sync)
+            .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    }
+    Ok(())
+}
+
 /// Reconciles only the ambiguous `remove_dir` result immediately after its error. Any existing
 /// entry or unreadable observation remains unavailable; initial revalidation never accepts this
 /// absence.
@@ -2388,22 +3556,34 @@ fn cleanup_metadata_without_following(path: &Path) -> Result<fs::Metadata, Durab
     }
 }
 
-fn validate_cleanup_zero_regular_file(path: &Path) -> Result<(), DurableOpenError> {
+fn validate_cleanup_absent(path: &Path) -> Result<(), DurableOpenError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(DurableOpenError::DurableStateCorrupt),
+        Err(_) => Err(DurableOpenError::StorageUnavailable),
+    }
+}
+
+fn validate_cleanup_zero_regular_file(
+    path: &Path,
+) -> Result<CleanupNodeIdentityShape, DurableOpenError> {
     let metadata = cleanup_metadata_without_following(path)?;
     validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
     if metadata.len() != 0 {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    Ok(())
+    Ok(cleanup_node_identity_shape(&metadata))
 }
 
-fn validate_cleanup_generation_document(path: &Path) -> Result<(), DurableOpenError> {
+fn validate_cleanup_generation_document(
+    path: &Path,
+) -> Result<CleanupRegularFileShape, DurableOpenError> {
     let metadata = cleanup_metadata_without_following(path)?;
     validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt)?;
     if metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 {
         return Err(DurableOpenError::DurableStateTooLarge);
     }
-    Ok(())
+    Ok(cleanup_regular_file_shape(&metadata))
 }
 
 fn read_cleanup_entries_bounded(
@@ -2470,7 +3650,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::fs::{self, OpenOptions};
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
@@ -2550,11 +3730,17 @@ mod tests {
     #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CleanupOperation {
+        RemoveCommitted,
         RemoveDefinition,
         RemoveHead,
+        RemoveConversation,
         SyncCandidateDirectory,
         RemoveCandidateDirectory,
         SyncGenerationsDirectory,
+        RemoveGenerationsDirectory,
+        SyncEntityDirectory,
+        RemoveEntityDirectory,
+        SyncCollectionDirectory,
     }
 
     #[cfg(unix)]
@@ -2562,6 +3748,15 @@ mod tests {
     enum CleanupFault {
         Before(CleanupOperation),
         After(CleanupOperation),
+    }
+
+    #[cfg(unix)]
+    impl CleanupFault {
+        const fn operation(self) -> CleanupOperation {
+            match self {
+                Self::Before(operation) | Self::After(operation) => operation,
+            }
+        }
     }
 
     /// A deliberately narrow persistent fault adapter: it performs the real cleanup operation
@@ -2619,22 +3814,35 @@ mod tests {
     impl CleanupFilesystem for DeterministicPersistentFaultFilesystem {
         fn remove_file(&self, path: &Path) -> Result<(), ()> {
             let operation = match path.file_name().and_then(|name| name.to_str()) {
+                Some("COMMITTED") => CleanupOperation::RemoveCommitted,
                 Some("definition.json") => CleanupOperation::RemoveDefinition,
                 Some("head.json") => CleanupOperation::RemoveHead,
+                Some("conversation.jsonl") => CleanupOperation::RemoveConversation,
                 _ => return Err(()),
             };
             self.perform(operation, || fs::remove_file(path))
         }
 
         fn remove_dir(&self, path: &Path) -> Result<(), ()> {
-            self.perform(CleanupOperation::RemoveCandidateDirectory, || {
-                fs::remove_dir(path)
-            })
+            let operation = match path.file_name().and_then(|name| name.to_str()) {
+                Some("generations") => CleanupOperation::RemoveGenerationsDirectory,
+                Some(name) if name.starts_with("agt_") || name.starts_with("ses_") => {
+                    CleanupOperation::RemoveEntityDirectory
+                }
+                _ => CleanupOperation::RemoveCandidateDirectory,
+            };
+            self.perform(operation, || fs::remove_dir(path))
         }
 
         fn sync_directory(&self, path: &Path, _directory_sync: DirectorySync) -> Result<(), ()> {
             let operation = match path.file_name().and_then(|name| name.to_str()) {
                 Some("generations") => CleanupOperation::SyncGenerationsDirectory,
+                Some(name) if name.starts_with("agt_") || name.starts_with("ses_") => {
+                    CleanupOperation::SyncEntityDirectory
+                }
+                Some(AGENTS_DIRECTORY) | Some(SESSIONS_DIRECTORY) => {
+                    CleanupOperation::SyncCollectionDirectory
+                }
                 _ => CleanupOperation::SyncCandidateDirectory,
             };
             self.perform(operation, || {
@@ -3009,6 +4217,44 @@ mod tests {
         );
     }
 
+    fn create_unpublished_agent(
+        root: &Path,
+        agent_id: &str,
+        generations: bool,
+        generation: bool,
+        head: Option<&[u8]>,
+        definition: Option<&[u8]>,
+        committed: bool,
+    ) -> PathBuf {
+        create_file(
+            &root
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(agent_id),
+            b"",
+        );
+        let entity = agent_path(root, agent_id);
+        create_directory(&entity);
+        if generations {
+            let generations_path = entity.join("generations");
+            create_directory(&generations_path);
+            if generation {
+                let generation_path = generations_path.join(GENERATION_ONE);
+                create_directory(&generation_path);
+                if let Some(head) = head {
+                    create_file(&generation_path.join("head.json"), head);
+                }
+                if let Some(definition) = definition {
+                    create_file(&generation_path.join("definition.json"), definition);
+                }
+                if committed {
+                    create_file(&generation_path.join("COMMITTED"), b"");
+                }
+            }
+        }
+        entity
+    }
+
     fn session_path(root: &Path, session_id: &str) -> PathBuf {
         root.join(SESSIONS_DIRECTORY).join(session_id)
     }
@@ -3061,6 +4307,66 @@ mod tests {
             &definition,
             conversation,
         );
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test helper mirrors one physical entity shape"
+    )]
+    fn create_unpublished_session(
+        root: &Path,
+        session_id: &str,
+        generations: bool,
+        generation: bool,
+        head: Option<&[u8]>,
+        definition: Option<&[u8]>,
+        committed: bool,
+        conversation: Option<&[u8]>,
+    ) -> PathBuf {
+        create_file(
+            &root
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(session_id),
+            b"",
+        );
+        let entity = session_path(root, session_id);
+        create_directory(&entity);
+        if let Some(conversation) = conversation {
+            create_file(&entity.join("conversation.jsonl"), conversation);
+        }
+        if generations {
+            let generations_path = entity.join("generations");
+            create_directory(&generations_path);
+            if generation {
+                let generation_path = generations_path.join(GENERATION_ONE);
+                create_directory(&generation_path);
+                if let Some(head) = head {
+                    create_file(&generation_path.join("head.json"), head);
+                }
+                if let Some(definition) = definition {
+                    create_file(&generation_path.join("definition.json"), definition);
+                }
+                if committed {
+                    create_file(&generation_path.join("COMMITTED"), b"");
+                }
+            }
+        }
+        entity
+    }
+
+    fn ordinary_header_only_conversation(session_id: &str) -> Vec<u8> {
+        let session = replace_fixture(
+            include_bytes!("../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl"),
+            "ses_11111111111111111111111111111111",
+            session_id,
+        );
+        let agent = replace_fixture(&session, "agt_22222222222222222222222222222222", AGENT_ONE);
+        replace_fixture(
+            &agent,
+            "2026-07-31T12:00:00.000Z",
+            "2026-08-03T10:01:00.456Z",
+        )
     }
 
     fn create_ordinary_g1_session(root: &Path, session_id: &str, conversation: &[u8]) {
@@ -3219,6 +4525,34 @@ mod tests {
             Some(b"interrupted head JSON"),
             Some(b"interrupted definition JSON"),
         )
+    }
+
+    fn create_unpublished_committed_session_staging(root: &Path) -> PathBuf {
+        create_marked_empty_store(root);
+        create_valid_g1_agent(root);
+        create_unpublished_session(
+            root,
+            SESSION_ONE,
+            true,
+            true,
+            Some(session_head_fixture()),
+            Some(&session_definition_fixture()),
+            true,
+            Some(&ordinary_header_only_conversation(SESSION_ONE)),
+        )
+    }
+
+    fn unpublished_entity_cleanup_plan(root: &Path) -> super::DeferredUnpublishedEntityCleanup {
+        let entries = read_entries_bounded(root, ROOT_ENTRY_CAP).expect("the marked root is read");
+        let cleanup = super::recover_marked_root(root, &entries)
+            .expect("the exact invisible entity has a cleanup plan")
+            .cleanup
+            .expect("one exact candidate registers cleanup");
+        drop(entries);
+        let super::DeferredCleanup::UnpublishedEntity(cleanup) = cleanup else {
+            panic!("the helper is only used for whole-entity candidates");
+        };
+        *cleanup
     }
 
     fn g3_deleted_status_head() -> Vec<u8> {
@@ -3768,6 +5102,931 @@ mod tests {
                 .is_none()
         );
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpublished_committed_g1_agent_is_invisible_and_cleaned_whole() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let entity = agent_path(root.path(), AGENT_ONE);
+        let reservation = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(AGENT_ONE);
+        fs::remove_file(entity.join("PUBLISHED"))
+            .expect("the staged entity has no visibility marker");
+
+        let state = open(root.path())
+            .await
+            .expect("an exact unpublished committed Agent is invisible staging");
+        assert!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .is_none()
+        );
+        assert!(!entity.exists(), "the whole unpublished entity is removed");
+        assert!(
+            reservation.is_file(),
+            "the permanent reservation remains burned"
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("whole-entity cleanup leaves the Store reopenable");
+        assert!(
+            reopened
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .is_none()
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpublished_agent_exact_shape_matrix_is_invisible_and_preserves_reservation() {
+        for (name, generations, generation, head, definition, committed) in [
+            ("entity only", false, false, None, None, false),
+            ("empty generations", true, false, None, None, false),
+            ("empty G1", true, true, None, None, false),
+            (
+                "head only",
+                true,
+                true,
+                Some(b"partial Agent head".as_slice()),
+                None,
+                false,
+            ),
+            (
+                "definition only",
+                true,
+                true,
+                None,
+                Some(b"partial Agent definition".as_slice()),
+                false,
+            ),
+            (
+                "both payloads",
+                true,
+                true,
+                Some(b"partial Agent head".as_slice()),
+                Some(b"partial Agent definition".as_slice()),
+                false,
+            ),
+            (
+                "committed G1",
+                true,
+                true,
+                Some(agent_head_fixture()),
+                Some(agent_definition_fixture()),
+                true,
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            let entity = create_unpublished_agent(
+                root.path(),
+                AGENT_ONE,
+                generations,
+                generation,
+                head,
+                definition,
+                committed,
+            );
+            let reservation = root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE);
+
+            let state = open(root.path()).await.unwrap_or_else(|error| {
+                panic!("{name} is exact invisible Agent staging: {error:?}")
+            });
+            assert!(
+                state
+                    .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                    .is_none()
+            );
+            assert!(!entity.exists(), "{name} entity is whole-cleaned");
+            assert!(reservation.exists(), "{name} reservation remains permanent");
+            state.close().await;
+            open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} cleanup reopens: {error:?}"))
+                .close()
+                .await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpublished_session_precommit_and_committed_shapes_are_invisible_after_strict_recovery()
+     {
+        for (name, generations, generation, head, definition, conversation) in [
+            ("entity only", false, false, None, None, None),
+            ("empty generations", true, false, None, None, None),
+            ("empty G1", true, true, None, None, None),
+            (
+                "opaque precommit conversation and partial head",
+                true,
+                true,
+                Some(b"partial Session head".as_slice()),
+                None,
+                Some(b"\xff precommit conversation bytes are never parsed".as_slice()),
+            ),
+            (
+                "opaque precommit conversation and both payloads",
+                true,
+                true,
+                Some(b"partial Session head".as_slice()),
+                Some(b"partial Session definition".as_slice()),
+                Some(b"not a JSONL Header".as_slice()),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            let entity = create_unpublished_session(
+                root.path(),
+                SESSION_ONE,
+                generations,
+                generation,
+                head,
+                definition,
+                false,
+                conversation,
+            );
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} is invisible Session staging: {error:?}"));
+            assert!(
+                state
+                    .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                    .is_none()
+            );
+            assert!(!entity.exists(), "{name} entity is whole-cleaned");
+            state.close().await;
+        }
+
+        let ordinary = TempRoot::existing();
+        create_marked_empty_store(ordinary.path());
+        create_valid_g1_agent(ordinary.path());
+        let entity = create_unpublished_session(
+            ordinary.path(),
+            SESSION_ONE,
+            true,
+            true,
+            Some(session_head_fixture()),
+            Some(&session_definition_fixture()),
+            true,
+            Some(&ordinary_header_only_conversation(SESSION_ONE)),
+        );
+        let state = open(ordinary.path())
+            .await
+            .expect("committed ordinary Header-only Session staging is cleanup-only");
+        assert!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .is_none()
+        );
+        assert!(!entity.exists());
+        state.close().await;
+
+        for (name, session_id, head, definition, conversation) in [
+            (
+                "canonical Fork",
+                SESSION_TWO,
+                fork_session_head_fixture().to_vec(),
+                fork_session_definition_fixture(),
+                valid_fork_conversation(SESSION_TWO),
+            ),
+            (
+                "Genesis Header-only Fork",
+                SESSION_THREE,
+                genesis_fork_session_head_fixture().to_vec(),
+                genesis_fork_session_definition_fixture(),
+                replace_fixture(
+                    &ordinary_header_only_conversation(SESSION_THREE),
+                    "2026-08-03T10:01:00.456Z",
+                    "2026-08-03T10:03:00.000Z",
+                ),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), b"published source bytes stay opaque");
+            let entity = create_unpublished_session(
+                root.path(),
+                session_id,
+                true,
+                true,
+                Some(&head),
+                Some(&definition),
+                true,
+                Some(&conversation),
+            );
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} candidate validates: {error:?}"));
+            assert!(
+                state
+                    .session_head(SessionId::from_str(session_id).unwrap())
+                    .is_none()
+            );
+            assert!(
+                state
+                    .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                    .is_some()
+            );
+            assert!(!entity.exists());
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unpublished_committed_sessions_apply_the_current_enabled_agent_gate() {
+        let stale_ordinary = TempRoot::existing();
+        create_marked_empty_store(stale_ordinary.path());
+        create_valid_g1_agent(stale_ordinary.path());
+        create_agent_generation(
+            stale_ordinary.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let stale = create_unpublished_session(
+            stale_ordinary.path(),
+            SESSION_ONE,
+            true,
+            true,
+            Some(session_head_fixture()),
+            Some(&session_definition_fixture()),
+            true,
+            Some(&ordinary_header_only_conversation(SESSION_ONE)),
+        );
+        assert_corrupt(open(stale_ordinary.path()).await);
+        assert!(
+            stale.exists(),
+            "a stale ordinary candidate is never deleted"
+        );
+
+        for (name, status_head) in [
+            ("disabled", agent_head_status_g2_fixture().to_vec()),
+            (
+                "deleted",
+                replace_fixture(
+                    agent_head_status_g2_fixture(),
+                    "\"status\":\"disabled\"",
+                    "\"status\":\"deleted\"",
+                ),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_agent_generation(root.path(), AGENT_ONE, GENERATION_TWO, &status_head, None);
+            let ordinary = create_unpublished_session(
+                root.path(),
+                SESSION_ONE,
+                true,
+                true,
+                Some(session_head_fixture()),
+                Some(&session_definition_fixture()),
+                true,
+                Some(&ordinary_header_only_conversation(SESSION_ONE)),
+            );
+            assert_corrupt(open(root.path()).await);
+            assert!(ordinary.exists(), "{name} ordinary candidate is retained");
+
+            let fork_root = TempRoot::existing();
+            create_marked_empty_store(fork_root.path());
+            create_valid_g1_agent(fork_root.path());
+            create_agent_generation(
+                fork_root.path(),
+                AGENT_ONE,
+                GENERATION_TWO,
+                &status_head,
+                None,
+            );
+            create_valid_g1_session(
+                fork_root.path(),
+                b"published source stays physically opaque",
+            );
+            let fork = create_unpublished_session(
+                fork_root.path(),
+                SESSION_TWO,
+                true,
+                true,
+                Some(fork_session_head_fixture()),
+                Some(&fork_session_definition_fixture()),
+                true,
+                Some(&valid_fork_conversation(SESSION_TWO)),
+            );
+            assert_corrupt(open(fork_root.path()).await);
+            assert!(fork.exists(), "{name} Fork candidate is retained");
+        }
+
+        let retained_old_fork = TempRoot::existing();
+        create_marked_empty_store(retained_old_fork.path());
+        create_valid_g1_agent(retained_old_fork.path());
+        create_agent_generation(
+            retained_old_fork.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(
+            retained_old_fork.path(),
+            b"published source remains an opaque recovery concern",
+        );
+        let fork = create_unpublished_session(
+            retained_old_fork.path(),
+            SESSION_TWO,
+            true,
+            true,
+            Some(fork_session_head_fixture()),
+            Some(&fork_session_definition_fixture()),
+            true,
+            Some(&valid_fork_conversation(SESSION_TWO)),
+        );
+        let state = open(retained_old_fork.path())
+            .await
+            .expect("an Enabled Agent retains an old exact Fork pin for cleanup");
+        assert!(
+            !fork.exists(),
+            "the valid old-revision Fork is invisible and cleaned"
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn malformed_unpublished_entities_and_conversations_fail_closed_without_cleanup() {
+        let unknown = TempRoot::existing();
+        create_marked_empty_store(unknown.path());
+        let entity =
+            create_unpublished_agent(unknown.path(), AGENT_ONE, true, true, None, None, false);
+        create_file(
+            &entity
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("unknown"),
+            b"",
+        );
+        assert_corrupt(open(unknown.path()).await);
+        assert!(entity.exists());
+
+        let g2 = TempRoot::existing();
+        create_marked_empty_store(g2.path());
+        let entity = create_unpublished_agent(g2.path(), AGENT_ONE, true, true, None, None, false);
+        fs::rename(
+            entity.join("generations").join(GENERATION_ONE),
+            entity.join("generations").join(GENERATION_TWO),
+        )
+        .unwrap();
+        assert_corrupt(open(g2.path()).await);
+        assert!(entity.exists());
+
+        let missing_reservation = TempRoot::existing();
+        create_marked_empty_store(missing_reservation.path());
+        let entity = create_unpublished_agent(
+            missing_reservation.path(),
+            AGENT_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        fs::remove_file(
+            missing_reservation
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+        )
+        .unwrap();
+        assert_corrupt(open(missing_reservation.path()).await);
+        assert!(entity.exists());
+
+        let conversation_without_g1 = TempRoot::existing();
+        create_marked_empty_store(conversation_without_g1.path());
+        let entity = create_unpublished_session(
+            conversation_without_g1.path(),
+            SESSION_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+            Some(b"opaque bytes"),
+        );
+        assert_corrupt(open(conversation_without_g1.path()).await);
+        assert!(entity.exists());
+
+        for (name, conversation) in [
+            ("missing", None),
+            ("invalid Header", Some(b"not JSONL".as_slice())),
+            (
+                "partial tail",
+                Some(b"{\"type\":\"session_header\"".as_slice()),
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let entity = create_unpublished_session(
+                root.path(),
+                SESSION_ONE,
+                true,
+                true,
+                Some(session_head_fixture()),
+                Some(&session_definition_fixture()),
+                true,
+                conversation,
+            );
+            assert_corrupt(open(root.path()).await);
+            assert!(
+                entity.exists(),
+                "{name} committed Session remains for diagnosis"
+            );
+        }
+
+        let oversized = TempRoot::existing();
+        create_marked_empty_store(oversized.path());
+        let entity = create_unpublished_session(
+            oversized.path(),
+            SESSION_ONE,
+            true,
+            true,
+            None,
+            None,
+            false,
+            Some(b""),
+        );
+        let conversation = entity.join("conversation.jsonl");
+        OpenOptions::new()
+            .write(true)
+            .open(&conversation)
+            .unwrap()
+            .set_len(super::MAX_CONVERSATION_FILE_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            open(oversized.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(entity.exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_unpublished_conversation_dominates_an_invalid_committed_marker() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        let entity = create_unpublished_session(
+            root.path(),
+            SESSION_ONE,
+            true,
+            true,
+            Some(session_head_fixture()),
+            Some(&session_definition_fixture()),
+            false,
+            Some(b""),
+        );
+        create_file(
+            &entity
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("COMMITTED"),
+            b"not-zero",
+        );
+        OpenOptions::new()
+            .write(true)
+            .open(entity.join("conversation.jsonl"))
+            .unwrap()
+            .set_len(super::MAX_CONVERSATION_FILE_BYTES + 1)
+            .unwrap();
+
+        assert!(matches!(
+            open(root.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(
+            entity.exists(),
+            "an oversized entity with an invalid COMMITTED marker is never deleted"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multiple_operation_candidates_are_corrupt_and_never_partly_cleaned() {
+        let two_agents = TempRoot::existing();
+        create_marked_empty_store(two_agents.path());
+        let first = create_unpublished_agent(
+            two_agents.path(),
+            AGENT_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        let second = create_unpublished_agent(
+            two_agents.path(),
+            AGENT_TWO,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        assert_corrupt(open(two_agents.path()).await);
+        assert!(first.exists() && second.exists());
+
+        let agent_and_session = TempRoot::existing();
+        create_marked_empty_store(agent_and_session.path());
+        let agent = create_unpublished_agent(
+            agent_and_session.path(),
+            AGENT_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        let session = create_unpublished_session(
+            agent_and_session.path(),
+            SESSION_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_corrupt(open(agent_and_session.path()).await);
+        assert!(agent.exists() && session.exists());
+
+        let published_tail_and_entity = TempRoot::existing();
+        create_marked_empty_store(published_tail_and_entity.path());
+        create_valid_g1_agent(published_tail_and_entity.path());
+        let tail = create_markerless_agent_generation(
+            published_tail_and_entity.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            None,
+            None,
+        );
+        let entity = create_unpublished_session(
+            published_tail_and_entity.path(),
+            SESSION_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_corrupt(open(published_tail_and_entity.path()).await);
+        assert!(tail.exists() && entity.exists());
+    }
+
+    #[test]
+    fn candidate_multiplicity_never_masks_a_later_nested_generation_cap() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        let candidate =
+            create_unpublished_agent(root.path(), AGENT_ONE, false, false, None, None, false);
+        let oversized = create_unpublished_session(
+            root.path(),
+            SESSION_ONE,
+            true,
+            true,
+            None,
+            None,
+            false,
+            None,
+        );
+        create_directory(&oversized.join("generations").join(GENERATION_TWO));
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+        assert!(matches!(
+            recover_marked_root_with_caps(root.path(), &marked_entries(root.path()), caps),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(candidate.exists() && oversized.exists());
+    }
+
+    #[test]
+    fn later_session_generation_caps_dominate_each_earlier_agent_entity_physical_error() {
+        for kind in ["wrong marker type", "invalid marker", "unknown child"] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_file(
+                &root
+                    .path()
+                    .join(RESERVATIONS_DIRECTORY)
+                    .join(AGENTS_DIRECTORY)
+                    .join(AGENT_ONE),
+                b"",
+            );
+            let agent = agent_path(root.path(), AGENT_ONE);
+            create_directory(&agent);
+            match kind {
+                "wrong marker type" => create_directory(&agent.join("PUBLISHED")),
+                "invalid marker" => create_file(&agent.join("PUBLISHED"), b"nonzero"),
+                "unknown child" => create_file(&agent.join("unknown"), b""),
+                _ => unreachable!("the table is closed"),
+            }
+            let session = create_unpublished_session(
+                root.path(),
+                SESSION_ONE,
+                true,
+                true,
+                None,
+                None,
+                false,
+                None,
+            );
+            create_directory(&session.join("generations").join(GENERATION_TWO));
+            let caps = RecoveryCaps {
+                agent_reservations: 1,
+                session_reservations: 1,
+                root_agents: 1,
+                root_sessions: 1,
+                generations: 1,
+            };
+            assert!(matches!(
+                recover_marked_root_with_caps(root.path(), &marked_entries(root.path()), caps),
+                Err(DurableOpenError::DurableStateTooLarge)
+            ));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn oversized_g1_document_dominates_an_invalid_committed_marker() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        let entity = create_unpublished_agent(
+            root.path(),
+            AGENT_ONE,
+            true,
+            true,
+            Some(&vec![b'x'; super::MAX_DURABLE_DOCUMENT_BYTES + 1]),
+            Some(agent_definition_fixture()),
+            false,
+        );
+        create_file(
+            &entity
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("COMMITTED"),
+            b"nonzero",
+        );
+        assert!(matches!(
+            open(root.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(
+            entity.exists(),
+            "the invalid oversized candidate is not deleted"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_published_fork_validation_failure_keeps_an_unpublished_candidate() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let candidate =
+            create_unpublished_agent(root.path(), AGENT_TWO, false, false, None, None, false);
+        create_fork_g1_session(
+            root.path(),
+            SESSION_ONE,
+            SESSION_TWO,
+            "recorded_history",
+            r#"{"type":"genesis"}"#,
+            &valid_fork_conversation(SESSION_ONE),
+        );
+
+        assert_corrupt(open(root.path()).await);
+        assert!(
+            candidate.exists(),
+            "cleanup waits for the complete published Fork graph validation"
+        );
+    }
+
+    #[test]
+    fn unpublished_cleanup_revalidation_rejects_published_or_conversation_drift_without_deleting() {
+        let published = TempRoot::existing();
+        create_marked_empty_store(published.path());
+        let entity =
+            create_unpublished_agent(published.path(), AGENT_ONE, false, false, None, None, false);
+        let root_entries = read_entries_bounded(published.path(), ROOT_ENTRY_CAP).unwrap();
+        let super::DeferredCleanup::UnpublishedEntity(cleanup) =
+            super::recover_marked_root(published.path(), &root_entries)
+                .unwrap()
+                .cleanup
+                .expect("an unpublished entity has a cleanup plan")
+        else {
+            panic!("the plan is whole-entity cleanup");
+        };
+        drop(root_entries);
+        create_file(&entity.join("PUBLISHED"), b"");
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(cleanup),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(entity.exists());
+
+        let conversation = TempRoot::existing();
+        create_marked_empty_store(conversation.path());
+        let entity = create_unpublished_session(
+            conversation.path(),
+            SESSION_ONE,
+            true,
+            true,
+            Some(b"partial head"),
+            None,
+            false,
+            Some(b"opaque first bytes"),
+        );
+        let root_entries = read_entries_bounded(conversation.path(), ROOT_ENTRY_CAP).unwrap();
+        let super::DeferredCleanup::UnpublishedEntity(cleanup) =
+            super::recover_marked_root(conversation.path(), &root_entries)
+                .unwrap()
+                .cleanup
+                .expect("the Session staging has a cleanup plan")
+        else {
+            panic!("the plan is whole-entity cleanup");
+        };
+        drop(root_entries);
+        create_file(
+            &entity.join("conversation.jsonl"),
+            b"a deliberately much longer opaque conversation value",
+        );
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(cleanup),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(entity.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn whole_entity_cleanup_revalidation_rejects_same_shape_node_replacements() {
+        let committed = TempRoot::existing();
+        let entity = create_unpublished_committed_session_staging(committed.path());
+        let cleanup = unpublished_entity_cleanup_plan(committed.path());
+        let marker = entity
+            .join("generations")
+            .join(GENERATION_ONE)
+            .join("COMMITTED");
+        let replacement = marker.with_extension("replacement");
+        create_file(&replacement, b"");
+        fs::rename(&replacement, &marker).expect("the zero marker is atomically replaced");
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            entity.exists(),
+            "changed COMMITTED identity causes zero deletion"
+        );
+
+        let generation = TempRoot::existing();
+        create_marked_empty_store(generation.path());
+        let entity =
+            create_unpublished_agent(generation.path(), AGENT_ONE, true, true, None, None, false);
+        let cleanup = unpublished_entity_cleanup_plan(generation.path());
+        let g1 = entity.join("generations").join(GENERATION_ONE);
+        fs::rename(&g1, generation.path().join("old-g1")).expect("the original G1 is moved aside");
+        create_directory(&g1);
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            entity.exists(),
+            "same-shape G1 replacement causes zero deletion"
+        );
+
+        let entity_root = TempRoot::existing();
+        create_marked_empty_store(entity_root.path());
+        let entity = create_unpublished_agent(
+            entity_root.path(),
+            AGENT_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        let cleanup = unpublished_entity_cleanup_plan(entity_root.path());
+        fs::rename(&entity, entity_root.path().join("old-entity"))
+            .expect("the original entity is moved aside");
+        create_directory(&entity);
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            entity.exists(),
+            "same-shape entity replacement causes zero deletion"
+        );
+
+        let reservation_root = TempRoot::existing();
+        create_marked_empty_store(reservation_root.path());
+        let entity = create_unpublished_agent(
+            reservation_root.path(),
+            AGENT_ONE,
+            false,
+            false,
+            None,
+            None,
+            false,
+        );
+        let cleanup = unpublished_entity_cleanup_plan(reservation_root.path());
+        let reservation = reservation_root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(AGENT_ONE);
+        let replacement = reservation.with_extension("replacement");
+        create_file(&replacement, b"");
+        fs::rename(&replacement, &reservation)
+            .expect("the permanent zero reservation is atomically replaced");
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(Box::new(cleanup)),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            entity.exists(),
+            "reservation replacement causes zero deletion"
+        );
+    }
+
+    #[test]
+    fn whole_entity_cleanup_revalidation_reuses_its_initial_generation_collection_cap() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        let entity =
+            create_unpublished_agent(root.path(), AGENT_ONE, true, true, None, None, false);
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+        let entries = marked_entries(root.path());
+        let cleanup = recover_marked_root_with_caps(root.path(), &entries, caps)
+            .expect("the one-G1 candidate is scanned with the small cap")
+            .cleanup
+            .expect("the candidate has a deferred cleanup plan");
+        drop(entries);
+        let super::DeferredCleanup::UnpublishedEntity(cleanup) = cleanup else {
+            panic!("the candidate is whole-entity cleanup");
+        };
+        assert_eq!(cleanup.generation_collection_cap, 1);
+        create_directory(&entity.join("generations").join(GENERATION_TWO));
+        assert!(matches!(
+            super::finalize_deferred_cleanup(
+                &super::DeferredCleanup::UnpublishedEntity(cleanup),
+                super::DirectorySync::Unsupported,
+                &super::LocalFilesystem,
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+        assert!(entity.exists());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4633,13 +6892,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn agent_entity_shape_is_exact_and_entity_cap_precedes_classification() {
+    async fn agent_entity_shape_keeps_invalid_published_corrupt_and_accepts_exact_unpublished_g1() {
         let missing_published = TempRoot::existing();
         create_marked_empty_store(missing_published.path());
         create_valid_g1_agent(missing_published.path());
-        fs::remove_file(agent_path(missing_published.path(), AGENT_ONE).join("PUBLISHED"))
-            .expect("the visibility marker is removed");
-        assert_corrupt(open(missing_published.path()).await);
+        let entity = agent_path(missing_published.path(), AGENT_ONE);
+        let reservation = missing_published
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(AGENT_ONE);
+        fs::remove_file(entity.join("PUBLISHED")).expect("the visibility marker is removed");
+        let state = open(missing_published.path())
+            .await
+            .expect("missing PUBLISHED is exact invisible Agent staging");
+        assert!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .is_none()
+        );
+        assert!(!entity.exists());
+        assert!(reservation.exists());
+        state.close().await;
 
         let wrong_published = TempRoot::existing();
         create_marked_empty_store(wrong_published.path());
@@ -5121,14 +7395,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_entity_requires_the_exact_three_entry_shape_and_cap_precedes_classification() {
+    async fn session_entity_keeps_invalid_published_corrupt_and_accepts_exact_unpublished_g1() {
         let missing_published = TempRoot::existing();
         create_marked_empty_store(missing_published.path());
         create_valid_g1_agent(missing_published.path());
         create_valid_g1_session(missing_published.path(), b"arbitrary");
-        fs::remove_file(session_path(missing_published.path(), SESSION_ONE).join("PUBLISHED"))
-            .unwrap();
-        assert_corrupt(open(missing_published.path()).await);
+        let entity = session_path(missing_published.path(), SESSION_ONE);
+        let reservation = missing_published
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(SESSIONS_DIRECTORY)
+            .join(SESSION_ONE);
+        fs::remove_file(entity.join("PUBLISHED")).unwrap();
+        // G1 COMMITTED requires a conversation, but published Session behavior remains
+        // physical-only. The unpublished path validates this canonical Header-only file.
+        let header = replace_fixture(
+            &replace_fixture(
+                &replace_fixture(
+                    include_bytes!(
+                        "../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl"
+                    ),
+                    "ses_11111111111111111111111111111111",
+                    SESSION_ONE,
+                ),
+                "agt_22222222222222222222222222222222",
+                AGENT_ONE,
+            ),
+            "2026-07-31T12:00:00.000Z",
+            "2026-08-03T10:01:00.456Z",
+        );
+        create_file(&entity.join("conversation.jsonl"), &header);
+        let state = open(missing_published.path())
+            .await
+            .expect("missing PUBLISHED is exact invisible Session staging");
+        assert!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .is_none()
+        );
+        assert!(!entity.exists());
+        assert!(reservation.exists());
+        state.close().await;
 
         let missing_conversation = TempRoot::existing();
         create_marked_empty_store(missing_conversation.path());
@@ -7400,10 +9707,14 @@ mod tests {
         let staging =
             create_markerless_agent_generation(root.path(), AGENT_ONE, GENERATION_TWO, None, None);
         let root_entries = read_entries_bounded(root.path(), ROOT_ENTRY_CAP).unwrap();
-        let cleanup = super::recover_marked_root(root.path(), &root_entries)
-            .unwrap()
-            .cleanup
-            .expect("the empty staging directory produces a cleanup plan");
+        let super::DeferredCleanup::TrailingGeneration(cleanup) =
+            super::recover_marked_root(root.path(), &root_entries)
+                .unwrap()
+                .cleanup
+                .expect("the empty staging directory produces a cleanup plan")
+        else {
+            panic!("a published trailing generation uses its narrow cleanup variant");
+        };
         drop(root_entries);
         assert!(!cleanup.has_head && !cleanup.has_definition);
         let debug = format!("{cleanup:?}");
@@ -7458,10 +9769,14 @@ mod tests {
             agent_definition_g2_fixture(),
         );
         let root_entries = read_entries_bounded(root.path(), ROOT_ENTRY_CAP).unwrap();
-        let both_cleanup = super::recover_marked_root(root.path(), &root_entries)
-            .unwrap()
-            .cleanup
-            .expect("the complete staging subset produces a cleanup plan");
+        let super::DeferredCleanup::TrailingGeneration(both_cleanup) =
+            super::recover_marked_root(root.path(), &root_entries)
+                .unwrap()
+                .cleanup
+                .expect("the complete staging subset produces a cleanup plan")
+        else {
+            panic!("a published trailing generation uses its narrow cleanup variant");
+        };
         drop(root_entries);
         assert!(both_cleanup.has_head && both_cleanup.has_definition);
         fs::remove_file(staging.join("head.json")).unwrap();
@@ -7738,5 +10053,123 @@ mod tests {
             DirectorySync::Supported,
             "the Unix deterministic adapter verifies both required directory sync points"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpublished_entity_cleanup_is_committed_first_ordered_and_retryable_at_every_namespace() {
+        let ordered = TempRoot::existing();
+        let entity = create_unpublished_committed_session_staging(ordered.path());
+        let reservation = ordered
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(SESSIONS_DIRECTORY)
+            .join(SESSION_ONE);
+        let filesystem = DeterministicPersistentFaultFilesystem::new([]);
+        drop(
+            open_root_with_cleanup_filesystem(ordered.path().to_owned(), &filesystem)
+                .expect("faultless whole-entity cleanup succeeds"),
+        );
+        assert!(!entity.exists());
+        assert!(
+            reservation.exists(),
+            "whole cleanup never removes reservation"
+        );
+        assert_eq!(
+            filesystem.operations(),
+            [
+                CleanupOperation::RemoveCommitted,
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::RemoveConversation,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+                CleanupOperation::RemoveGenerationsDirectory,
+                CleanupOperation::SyncEntityDirectory,
+                CleanupOperation::RemoveEntityDirectory,
+                CleanupOperation::SyncCollectionDirectory,
+            ],
+            "COMMITTED precedes every payload removal, and each removed namespace syncs its direct parent exactly once",
+        );
+
+        for fault in [
+            CleanupFault::Before(CleanupOperation::RemoveCommitted),
+            CleanupFault::After(CleanupOperation::RemoveCommitted),
+            CleanupFault::Before(CleanupOperation::RemoveDefinition),
+            CleanupFault::After(CleanupOperation::RemoveDefinition),
+            CleanupFault::Before(CleanupOperation::RemoveHead),
+            CleanupFault::After(CleanupOperation::RemoveHead),
+            CleanupFault::Before(CleanupOperation::RemoveConversation),
+            CleanupFault::After(CleanupOperation::RemoveConversation),
+            CleanupFault::Before(CleanupOperation::SyncCandidateDirectory),
+            CleanupFault::After(CleanupOperation::SyncCandidateDirectory),
+            CleanupFault::Before(CleanupOperation::RemoveCandidateDirectory),
+            CleanupFault::After(CleanupOperation::RemoveCandidateDirectory),
+            CleanupFault::Before(CleanupOperation::SyncGenerationsDirectory),
+            CleanupFault::After(CleanupOperation::SyncGenerationsDirectory),
+            CleanupFault::Before(CleanupOperation::RemoveGenerationsDirectory),
+            CleanupFault::After(CleanupOperation::RemoveGenerationsDirectory),
+            CleanupFault::Before(CleanupOperation::SyncEntityDirectory),
+            CleanupFault::After(CleanupOperation::SyncEntityDirectory),
+            CleanupFault::Before(CleanupOperation::RemoveEntityDirectory),
+            CleanupFault::After(CleanupOperation::RemoveEntityDirectory),
+            CleanupFault::Before(CleanupOperation::SyncCollectionDirectory),
+            CleanupFault::After(CleanupOperation::SyncCollectionDirectory),
+        ] {
+            let root = TempRoot::existing();
+            let entity = create_unpublished_committed_session_staging(root.path());
+            let reservation = root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE);
+            let filesystem = DeterministicPersistentFaultFilesystem::new([fault]);
+            let first_open = open_root_with_cleanup_filesystem(root.path().to_owned(), &filesystem);
+            let reconciled_remove_directory = matches!(
+                fault,
+                CleanupFault::After(
+                    CleanupOperation::RemoveCandidateDirectory
+                        | CleanupOperation::RemoveGenerationsDirectory
+                        | CleanupOperation::RemoveEntityDirectory
+                )
+            );
+            if reconciled_remove_directory {
+                drop(first_open.expect("immediately absent remove-dir failure is reconciled"));
+            } else {
+                assert!(matches!(
+                    first_open,
+                    Err(DurableOpenError::StorageUnavailable)
+                ));
+            }
+            let ordered = [
+                CleanupOperation::RemoveCommitted,
+                CleanupOperation::RemoveDefinition,
+                CleanupOperation::RemoveHead,
+                CleanupOperation::RemoveConversation,
+                CleanupOperation::SyncCandidateDirectory,
+                CleanupOperation::RemoveCandidateDirectory,
+                CleanupOperation::SyncGenerationsDirectory,
+                CleanupOperation::RemoveGenerationsDirectory,
+                CleanupOperation::SyncEntityDirectory,
+                CleanupOperation::RemoveEntityDirectory,
+                CleanupOperation::SyncCollectionDirectory,
+            ];
+            let coordinate = ordered
+                .iter()
+                .position(|operation| *operation == fault.operation())
+                .expect("the fault is one ordered whole-cleanup coordinate");
+            assert_eq!(
+                &filesystem.operations()[..=coordinate],
+                &ordered[..=coordinate],
+                "the observed operation prefix reaches exactly {fault:?}",
+            );
+
+            drop(open_root(root.path().to_owned()).unwrap_or_else(|error| {
+                panic!("{fault:?} leaves an exact retry prefix: {error:?}")
+            }));
+            assert!(!entity.exists(), "{fault:?} retry removes the whole entity");
+            assert!(reservation.exists(), "{fault:?} retains reservation");
+        }
     }
 }
