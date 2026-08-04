@@ -15,13 +15,25 @@ use tokio::task::JoinHandle;
 use crate::wire::Timestamp;
 
 /// A synchronous source of wall-clock timestamps for owner-controlled operations.
+#[allow(
+    dead_code,
+    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
+)]
 pub(crate) trait Clock {
     fn now(&self) -> Timestamp;
 }
 
 /// The production wall-clock source.
+#[allow(
+    dead_code,
+    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
+)]
 pub(crate) struct SystemClock;
 
+#[allow(
+    dead_code,
+    reason = "M5 publication timestamps and M7 turn operations consume the owner clock"
+)]
 impl SystemClock {
     fn timestamp_from_utc(value: OffsetDateTime) -> Timestamp {
         let nanoseconds = value.nanosecond();
@@ -257,6 +269,7 @@ impl TrackedTask {
         self.settlement.wait().await
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait(&self) -> Result<(), RuntimeTaskError> {
         self.settlement.wait().await
     }
