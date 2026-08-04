@@ -9,13 +9,6 @@ use crate::tools::{
 use crate::wire::{ItemId, TurnId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ItemStatus {
-    Started,
-    Completed,
-    Abandoned,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum UserMessageSource {
     Input,
     Steer,
@@ -51,10 +44,6 @@ enum ItemRelationKind {
 }
 
 impl ItemRelation {
-    #[allow(
-        dead_code,
-        reason = "constructed by LiveConversation and replay in M3/M4"
-    )]
     pub(crate) const fn user_message(item_id: ItemId, turn_id: TurnId) -> Self {
         Self {
             item_id,
@@ -63,10 +52,6 @@ impl ItemRelation {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "constructed by LiveConversation and replay in M3/M4"
-    )]
     pub(crate) const fn agent_message(item_id: ItemId, turn_id: TurnId) -> Self {
         Self {
             item_id,
@@ -75,10 +60,6 @@ impl ItemRelation {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "constructed by LiveConversation and replay in M3/M4"
-    )]
     pub(crate) const fn reasoning(item_id: ItemId, turn_id: TurnId) -> Self {
         Self {
             item_id,
@@ -87,10 +68,6 @@ impl ItemRelation {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "constructed by LiveConversation and replay in M3/M4"
-    )]
     pub(crate) fn tool_invocation(
         item_id: ItemId,
         turn_id: TurnId,
@@ -165,7 +142,6 @@ impl InteractionRequest {
         Self::UserQuestion(request)
     }
 
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
     pub(crate) fn view(&self) -> InteractionRequestView {
         match self {
             Self::ToolApproval(request) => {
@@ -184,8 +160,7 @@ impl InteractionRequest {
             (Self::ToolApproval(request), InteractionHostResolutionInput::ToolApproval(input)) => {
                 let (decision, resolution) = request
                     .resolve(input)
-                    .map_err(|_| InteractionValueError::InvalidResolution)?
-                    .into_parts();
+                    .map_err(|_| InteractionValueError::InvalidResolution)?;
                 Ok(ResolvedInteraction {
                     live: InteractionResolution::ToolApproval(decision),
                     view: InteractionResolutionView::tool_approval(resolution),
@@ -291,28 +266,6 @@ pub enum InteractionCancelReason {
     TurnTerminal,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-#[allow(dead_code, reason = "consumed by Session/lifecycle owners in M8")]
-pub(crate) enum OwnerInteractionCancelReason {
-    TurnCancelled,
-    SecurityRevoked,
-    SessionUnloaded,
-    RuntimeClosing,
-    TurnTerminal,
-}
-
-impl From<OwnerInteractionCancelReason> for InteractionCancelReason {
-    fn from(value: OwnerInteractionCancelReason) -> Self {
-        match value {
-            OwnerInteractionCancelReason::TurnCancelled => Self::TurnCancelled,
-            OwnerInteractionCancelReason::SecurityRevoked => Self::SecurityRevoked,
-            OwnerInteractionCancelReason::SessionUnloaded => Self::SessionUnloaded,
-            OwnerInteractionCancelReason::RuntimeClosing => Self::RuntimeClosing,
-            OwnerInteractionCancelReason::TurnTerminal => Self::TurnTerminal,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum InteractionValueError {
     #[error("interaction resolution family does not match the request")]
@@ -393,21 +346,18 @@ impl fmt::Debug for InteractionResolutionView {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-#[allow(dead_code, reason = "consumed by Interaction waiter settlement in M8")]
 pub(crate) enum InteractionResolution {
     ToolApproval(ToolApprovalDecision),
     UserAnswer(UserQuestionAnswer),
     Cancelled(InteractionCancelReason),
 }
 
-#[allow(dead_code, reason = "consumed by Interaction waiter settlement in M8")]
 pub(crate) struct ResolvedInteraction {
     live: InteractionResolution,
     view: InteractionResolutionView,
 }
 
 impl ResolvedInteraction {
-    #[allow(dead_code, reason = "consumed by Interaction waiter settlement in M8")]
     fn cancelled(reason: InteractionCancelReason) -> Self {
         Self {
             live: InteractionResolution::Cancelled(reason),
@@ -415,17 +365,17 @@ impl ResolvedInteraction {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by Session/lifecycle owners in M8")]
-    pub(crate) fn cancelled_by_owner(reason: OwnerInteractionCancelReason) -> Self {
-        Self::cancelled(reason.into())
+    pub(crate) fn cancelled_by_owner(reason: InteractionCancelReason) -> Option<Self> {
+        if reason == InteractionCancelReason::HostCancelled {
+            return None;
+        }
+        Some(Self::cancelled(reason))
     }
 
-    #[allow(dead_code, reason = "consumed by Interaction waiter settlement in M8")]
     pub(crate) const fn live(&self) -> &InteractionResolution {
         &self.live
     }
 
-    #[allow(dead_code, reason = "consumed by public/storage projection in M8")]
     pub(crate) const fn view(&self) -> &InteractionResolutionView {
         &self.view
     }
@@ -624,32 +574,22 @@ mod tests {
                 reason: InteractionCancelReason::HostCancelled
             }
         ));
-        let mappings = [
-            (
-                OwnerInteractionCancelReason::TurnCancelled,
-                InteractionCancelReason::TurnCancelled,
-            ),
-            (
-                OwnerInteractionCancelReason::SecurityRevoked,
-                InteractionCancelReason::SecurityRevoked,
-            ),
-            (
-                OwnerInteractionCancelReason::SessionUnloaded,
-                InteractionCancelReason::SessionUnloaded,
-            ),
-            (
-                OwnerInteractionCancelReason::RuntimeClosing,
-                InteractionCancelReason::RuntimeClosing,
-            ),
-            (
-                OwnerInteractionCancelReason::TurnTerminal,
-                InteractionCancelReason::TurnTerminal,
-            ),
+        let owner_reasons = [
+            InteractionCancelReason::TurnCancelled,
+            InteractionCancelReason::SecurityRevoked,
+            InteractionCancelReason::SessionUnloaded,
+            InteractionCancelReason::RuntimeClosing,
+            InteractionCancelReason::TurnTerminal,
         ];
-        for (owner_reason, public_reason) in mappings {
+        assert!(
+            ResolvedInteraction::cancelled_by_owner(InteractionCancelReason::HostCancelled)
+                .is_none()
+        );
+        for reason in owner_reasons {
+            let owner = ResolvedInteraction::cancelled_by_owner(reason).unwrap();
             assert!(matches!(
-                ResolvedInteraction::cancelled_by_owner(owner_reason).view().as_ref(),
-                InteractionResolutionViewRef::Cancelled { reason } if reason == public_reason
+                owner.view().as_ref(),
+                InteractionResolutionViewRef::Cancelled { reason: actual } if actual == reason
             ));
         }
     }
