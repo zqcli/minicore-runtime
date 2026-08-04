@@ -125,6 +125,46 @@ fn create_published_g2_definition_generation(root: &Path) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
+fn session_definition_fixture() -> Vec<u8> {
+    let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition.json");
+    #[cfg(windows)]
+    {
+        let fixture = std::str::from_utf8(fixture).expect("the authoritative fixture is UTF-8");
+        return fixture
+            .replacen(
+                "file:///Users/example/project",
+                "file:///C:/work/project",
+                1,
+            )
+            .into_bytes();
+    }
+    #[cfg(not(windows))]
+    fixture.to_vec()
+}
+
+fn create_published_g1_session(root: &Path, conversation: &[u8]) {
+    const SESSION_ID: &str = "ses_22222222222222222222222222222222";
+    const GENERATION_ONE: &str = "00000000000000000001";
+
+    create_private_file(&root.join("reservations/sessions").join(SESSION_ID), b"");
+    let entity = root.join("sessions").join(SESSION_ID);
+    create_private_directory(&entity);
+    create_private_file(&entity.join("PUBLISHED"), b"");
+    create_private_file(&entity.join("conversation.jsonl"), conversation);
+    create_private_directory(&entity.join("generations"));
+    let generation = entity.join("generations").join(GENERATION_ONE);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head.json"),
+    );
+    create_private_file(
+        &generation.join("definition.json"),
+        &session_definition_fixture(),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 fn create_corrupt_g2_same_status_generation(root: &Path) {
     const AGENT_ID: &str = "agt_11111111111111111111111111111111";
     const GENERATION_TWO: &str = "00000000000000000002";
@@ -189,6 +229,67 @@ async fn published_committed_g1_agent_store_opens_shuts_down_and_reopens() {
     .await
     .expect("the recovered G1 Agent store reopens after shutdown");
     reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_recovers_an_ordinary_g1_session_and_preserves_invalid_conversation_bytes() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    let conversation = b"\xff arbitrary conversation bytes are not parsed at Store open\x00\n";
+    create_published_g1_session(root.path(), conversation);
+    let conversation_path = root
+        .path()
+        .join("sessions/ses_22222222222222222222222222222222/conversation.jsonl");
+    let before = fs::read(&conversation_path).expect("the physical conversation is readable");
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("an ordinary published G1 Session opens through the public runtime");
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the recovered G1 Session store reopens after shutdown");
+    reopened.shutdown().await;
+
+    assert_eq!(
+        fs::read(conversation_path).expect("the conversation remains readable"),
+        before,
+        "store recovery leaves all conversation bytes untouched"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_maps_a_session_with_a_missing_agent_ref_to_redacted_corruption() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g1_session(root.path(), b"arbitrary");
+    fs::remove_dir_all(
+        root.path()
+            .join("agents/agt_11111111111111111111111111111111"),
+    )
+    .expect("the Agent entity is removed while its orphan reservation remains");
+    let private_root = root.path().to_string_lossy();
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a Session cannot substitute a missing Agent ref with a current Agent");
+
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+    assert!(!format!("{error:?}").contains(private_root.as_ref()));
+    assert!(!error.to_string().contains(private_root.as_ref()));
+    assert!(!format!("{error:?}").contains("session-notes"));
+    assert!(!error.to_string().contains("session-notes"));
+    assert!(Error::source(&error).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

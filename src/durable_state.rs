@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use fs4::fs_std::FileExt;
 
 use crate::agent_session_lifecycle::{
-    AgentDefinition, AgentMetadata, AgentStatus, SessionForkProvenance, SessionLifecycle,
-    SessionMetadata, agent_definitions_have_same_canonical_execution_content,
+    AgentDefinition, AgentMetadata, AgentStatus, SessionDefinition, SessionForkProvenance,
+    SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
 };
 use crate::runtime_task::RuntimeTaskContext;
@@ -32,6 +32,7 @@ const RESERVATIONS_ENTRY_CAP: usize = 2;
 const AGENT_RESERVATION_ENTRY_CAP: usize = 1_000_000;
 const SESSION_RESERVATION_ENTRY_CAP: usize = 1_000_000;
 const AGENT_ENTITY_ENTRY_CAP: usize = 2;
+const SESSION_ENTITY_ENTRY_CAP: usize = 3;
 const ROOT_AGENT_ENTRY_CAP: usize = 1_000_000;
 const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_ENTRY_CAP: usize = 1_000_000;
@@ -405,6 +406,28 @@ impl fmt::Debug for DurableAgentCatalogEntry {
     }
 }
 
+/// One recovered Session's immutable current facts. This initial recovery slice supports only
+/// ordinary generation one Sessions, so no historical Session-definition index is needed yet.
+struct DurableSessionCatalogEntry {
+    current_head: Arc<DurableSessionHead>,
+    current_definition: Arc<SessionDefinition>,
+}
+
+impl fmt::Debug for DurableSessionCatalogEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableSessionCatalogEntry")
+            .field("current_head", &"redacted")
+            .field("current_definition", &"redacted")
+            .finish()
+    }
+}
+
+struct RecoveredCatalog {
+    agents: BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: BTreeMap<SessionId, DurableSessionCatalogEntry>,
+}
+
 /// The private owner of the Store V1 root lease and recovered immutable catalog.
 pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
@@ -414,10 +437,15 @@ pub(crate) struct DurableState {
         reason = "recovery catalog is consumed by later runtime read paths"
     )]
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+    #[allow(
+        dead_code,
+        reason = "recovery catalog is consumed by later runtime read paths"
+    )]
+    sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
 }
 
 impl DurableState {
-    /// Opens a Store V1 root and recovers the currently supported committed Agent chains.
+    /// Opens a Store V1 root and recovers the currently supported immutable catalog slice.
     /// Every filesystem operation runs in one tracked blocking job, never on a Tokio worker.
     pub(crate) async fn open(
         root: PathBuf,
@@ -429,6 +457,7 @@ impl DurableState {
                 task_context,
                 lease: opened.lease,
                 agents: opened.agents,
+                sessions: opened.sessions,
             }),
             Ok(Err(error)) => Err(error),
             Err(_) => Err(DurableOpenError::StorageUnavailable),
@@ -477,6 +506,29 @@ impl DurableState {
             .get(&agent_id)
             .is_some_and(|entry| entry.definition_index.contains_key(&revision))
     }
+
+    #[allow(
+        dead_code,
+        reason = "recovery catalog is consumed by later runtime read paths"
+    )]
+    pub(crate) fn session_head(&self, session_id: SessionId) -> Option<Arc<DurableSessionHead>> {
+        self.sessions
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.current_head))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "recovery catalog is consumed by later Session definition resolution"
+    )]
+    pub(crate) fn session_current_definition(
+        &self,
+        session_id: SessionId,
+    ) -> Option<Arc<SessionDefinition>> {
+        self.sessions
+            .get(&session_id)
+            .map(|entry| Arc::clone(&entry.current_definition))
+    }
 }
 
 struct RootLease {
@@ -487,6 +539,7 @@ struct RootLease {
 struct OpenRoot {
     lease: Arc<RootLease>,
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+    sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
 }
 
 impl RootLease {
@@ -528,18 +581,22 @@ fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
     let root_entries = read_entries_bounded(&root, ROOT_ENTRY_CAP)?;
     let marker_present = contains_named_entry(&root_entries, FORMAT_MARKER);
 
-    let agents = if marker_present {
+    let catalog = if marker_present {
         recover_marked_root(&root, &root_entries)?
     } else {
         validate_markerless_root(&root_entries)?;
         complete_markerless_scaffold(&root, directory_sync)?;
         create_format_marker(&root, directory_sync)?;
-        BTreeMap::new()
+        RecoveredCatalog {
+            agents: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+        }
     };
 
     Ok(OpenRoot {
         lease: Arc::new(RootLease::new(lock_file)),
-        agents: Arc::new(agents),
+        agents: Arc::new(catalog.agents),
+        sessions: Arc::new(catalog.sessions),
     })
 }
 
@@ -780,7 +837,7 @@ impl RecoveryCaps {
 fn recover_marked_root(
     root: &Path,
     entries: &[DirEntry],
-) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
+) -> Result<RecoveredCatalog, DurableOpenError> {
     recover_marked_root_with_caps(root, entries, RecoveryCaps::PRODUCTION)
 }
 
@@ -788,7 +845,7 @@ fn recover_marked_root_with_caps(
     root: &Path,
     entries: &[DirEntry],
     caps: RecoveryCaps,
-) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
+) -> Result<RecoveredCatalog, DurableOpenError> {
     let mut has_lock = false;
     let mut has_marker = false;
     let mut has_reservations = false;
@@ -821,20 +878,35 @@ fn recover_marked_root_with_caps(
         return Err(DurableOpenError::DurableStateCorrupt);
     }
 
-    let reservations = recover_marked_reservations(&root.join(RESERVATIONS_DIRECTORY), caps)?;
-    validate_required_empty_directory(&root.join(SESSIONS_DIRECTORY), caps.root_sessions)?;
-    recover_agents(
+    let (agent_reservations, session_reservations) =
+        recover_marked_reservations(&root.join(RESERVATIONS_DIRECTORY), caps)?;
+    let agent_entities = scan_agent_entities(
         &root.join(AGENTS_DIRECTORY),
-        &reservations,
+        &agent_reservations,
         caps.root_agents,
-        caps.generations,
-    )
+    )?;
+    let session_entities = scan_session_entities(
+        &root.join(SESSIONS_DIRECTORY),
+        &session_reservations,
+        caps.root_sessions,
+    )?;
+    let mut agent_generations = BTreeMap::new();
+    for (agent_id, entity_path) in agent_entities {
+        agent_generations.insert(agent_id, scan_agent_entity(&entity_path)?);
+    }
+    let mut session_generations = BTreeMap::new();
+    for (session_id, entity_path) in session_entities {
+        session_generations.insert(session_id, scan_session_entity(&entity_path)?);
+    }
+    let agents = recover_agents(agent_generations, caps.generations)?;
+    let sessions = recover_sessions(session_generations, &agents, caps.generations)?;
+    Ok(RecoveredCatalog { agents, sessions })
 }
 
 fn recover_marked_reservations(
     path: &Path,
     caps: RecoveryCaps,
-) -> Result<BTreeSet<AgentId>, DurableOpenError> {
+) -> Result<(BTreeSet<AgentId>, BTreeSet<SessionId>), DurableOpenError> {
     let entries = read_entries_bounded(path, RESERVATIONS_ENTRY_CAP)?;
     let mut has_agents = false;
     let mut has_sessions = false;
@@ -854,8 +926,9 @@ fn recover_marked_reservations(
     }
 
     let agents = scan_agent_reservations(&path.join(AGENTS_DIRECTORY), caps.agent_reservations)?;
-    validate_required_empty_directory(&path.join(SESSIONS_DIRECTORY), caps.session_reservations)?;
-    Ok(agents)
+    let sessions =
+        scan_session_reservations(&path.join(SESSIONS_DIRECTORY), caps.session_reservations)?;
+    Ok((agents, sessions))
 }
 
 fn scan_agent_reservations(
@@ -878,22 +951,31 @@ fn scan_agent_reservations(
     Ok(reservation_paths.into_keys().collect())
 }
 
-fn validate_required_empty_directory(path: &Path, maximum: usize) -> Result<(), DurableOpenError> {
+fn scan_session_reservations(
+    path: &Path,
+    maximum: usize,
+) -> Result<BTreeSet<SessionId>, DurableOpenError> {
     let metadata = metadata_without_following(path)?;
     validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-    if read_entries_bounded(path, maximum)?.is_empty() {
-        Ok(())
-    } else {
-        Err(DurableOpenError::DurableStateCorrupt)
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut reservation_paths = BTreeMap::new();
+    for entry in entries {
+        let session_id = parse_session_id_name(&entry.file_name())?;
+        if reservation_paths.insert(session_id, entry.path()).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
     }
+    for path in reservation_paths.values() {
+        validate_zero_regular_file(path)?;
+    }
+    Ok(reservation_paths.into_keys().collect())
 }
 
-fn recover_agents(
+fn scan_agent_entities(
     path: &Path,
     reservations: &BTreeSet<AgentId>,
     maximum: usize,
-    generation_maximum: usize,
-) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
+) -> Result<BTreeMap<AgentId, PathBuf>, DurableOpenError> {
     let metadata = metadata_without_following(path)?;
     validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
     let entries = read_entries_bounded(path, maximum)?;
@@ -904,14 +986,80 @@ fn recover_agents(
             return Err(DurableOpenError::DurableStateCorrupt);
         }
     }
-    let mut agents = BTreeMap::new();
-    for (agent_id, entity_path) in entity_paths {
-        let metadata = metadata_without_following(&entity_path)?;
+    for (agent_id, entity_path) in &entity_paths {
+        let metadata = metadata_without_following(entity_path)?;
         validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
-        if !reservations.contains(&agent_id) {
+        if !reservations.contains(agent_id) {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
-        let entry = recover_agent_entity(&entity_path, agent_id, generation_maximum)?;
+    }
+    Ok(entity_paths)
+}
+
+fn scan_session_entities(
+    path: &Path,
+    reservations: &BTreeSet<SessionId>,
+    maximum: usize,
+) -> Result<BTreeMap<SessionId, PathBuf>, DurableOpenError> {
+    let metadata = metadata_without_following(path)?;
+    validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut entity_paths = BTreeMap::new();
+    for entry in entries {
+        let session_id = parse_session_id_name(&entry.file_name())?;
+        if entity_paths.insert(session_id, entry.path()).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+
+    for (session_id, entity_path) in &entity_paths {
+        let metadata = metadata_without_following(entity_path)?;
+        validate_existing_directory(&metadata, DurableOpenError::DurableStateCorrupt)?;
+        if !reservations.contains(session_id) {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    Ok(entity_paths)
+}
+
+fn scan_session_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
+    let mut entries = read_entries_bounded(path, SESSION_ENTITY_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut published = false;
+    let mut conversation = false;
+    let mut generations = None;
+    for entry in entries {
+        if entry_has_name(&entry, "PUBLISHED") {
+            validate_zero_regular_file(&entry.path())?;
+            published = true;
+        } else if entry_has_name(&entry, "conversation.jsonl") {
+            // This is intentionally a physical-only check. Header and entry bytes remain owned
+            // by Conversation Storage and must not make whole-store recovery read or rewrite it.
+            validate_regular_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
+            conversation = true;
+        } else if entry_has_name(&entry, "generations") {
+            validate_directory_entry(&entry, DurableOpenError::DurableStateCorrupt)?;
+            generations = Some(entry.path());
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    let Some(generations) = generations else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if !(published && conversation) {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(generations)
+}
+
+fn recover_agents(
+    entity_generations: BTreeMap<AgentId, PathBuf>,
+    generation_maximum: usize,
+) -> Result<BTreeMap<AgentId, DurableAgentCatalogEntry>, DurableOpenError> {
+    let mut agents = BTreeMap::new();
+    for (agent_id, generations) in entity_generations {
+        let entry = recover_agent_generation_chain(&generations, agent_id, generation_maximum)?;
         if agents.insert(agent_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
@@ -919,12 +1067,126 @@ fn recover_agents(
     Ok(agents)
 }
 
-fn recover_agent_entity(
-    path: &Path,
-    agent_id: AgentId,
+/// Recovers the initially-supported catalog of ordinary, committed generation-one Sessions.
+/// Agent recovery is deliberately complete before this function runs so each Session pin can be
+/// checked against the retained Agent definition index rather than an Agent's mutable current
+/// definition or status.
+fn recover_sessions(
+    entity_generations: BTreeMap<SessionId, PathBuf>,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
     generation_maximum: usize,
-) -> Result<DurableAgentCatalogEntry, DurableOpenError> {
-    let entries = read_entries_bounded(path, AGENT_ENTITY_ENTRY_CAP)?;
+) -> Result<BTreeMap<SessionId, DurableSessionCatalogEntry>, DurableOpenError> {
+    let mut sessions = BTreeMap::new();
+    for (session_id, generations) in entity_generations {
+        let entry =
+            recover_ordinary_session_g1(&generations, session_id, agents, generation_maximum)?;
+        if sessions.insert(session_id, entry).is_some() {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    Ok(sessions)
+}
+
+fn recover_ordinary_session_g1(
+    path: &Path,
+    session_id: SessionId,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    maximum: usize,
+) -> Result<DurableSessionCatalogEntry, DurableOpenError> {
+    let entries = read_entries_bounded(path, maximum)?;
+    let mut generation_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let generation = StorageGeneration::parse_directory_name(&entry.file_name())
+            .map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+        generation_entries.push((generation, entry));
+    }
+    generation_entries.sort_unstable_by_key(|(generation, _)| *generation);
+    for (_, entry) in &generation_entries {
+        validate_directory_entry(entry, DurableOpenError::DurableStateCorrupt)?;
+    }
+
+    let [(generation, entry)] = generation_entries.as_slice() else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if generation.get() != 1 {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    let (head, definition) = recover_session_generation_payload(&entry.path())?;
+    validate_ordinary_session_generation_one(session_id, *generation, &head, &definition, agents)?;
+
+    Ok(DurableSessionCatalogEntry {
+        current_head: Arc::new(head),
+        current_definition: Arc::new(definition),
+    })
+}
+
+fn recover_session_generation_payload(
+    path: &Path,
+) -> Result<(DurableSessionHead, SessionDefinition), DurableOpenError> {
+    let mut entries = read_entries_bounded(path, GENERATION_PAYLOAD_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
+    let mut head_path = None;
+    let mut definition_path = None;
+    let mut committed = false;
+    for entry in entries {
+        if entry_has_name(&entry, "head.json") {
+            head_path = Some(entry.path());
+        } else if entry_has_name(&entry, "definition.json") {
+            definition_path = Some(entry.path());
+        } else if entry_has_name(&entry, "COMMITTED") {
+            validate_zero_regular_file(&entry.path())?;
+            committed = true;
+        } else {
+            return Err(DurableOpenError::DurableStateCorrupt);
+        }
+    }
+    let (Some(head_path), Some(definition_path)) = (head_path, definition_path) else {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    };
+    if !committed {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok((
+        decode_session_head_document(&head_path)?,
+        decode_session_definition_document(&definition_path)?,
+    ))
+}
+
+fn validate_ordinary_session_generation_one(
+    path_session_id: SessionId,
+    path_generation: StorageGeneration,
+    head: &DurableSessionHead,
+    definition: &SessionDefinition,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+) -> Result<(), DurableOpenError> {
+    let agent = definition.agent();
+    let retained_agent_definition = agents
+        .get(&agent.agent_id())
+        .is_some_and(|entry| entry.definition_index.contains_key(&agent.revision()));
+    if head.session_id() != path_session_id
+        || definition.session_id() != path_session_id
+        || head.storage_generation() != path_generation
+        || head.storage_generation().get() != 1
+        || head.previous_storage_generation().is_some()
+        || head.current_definition_revision().get() != 1
+        || head.current_definition_storage_generation() != path_generation
+        || definition.revision().get() != 1
+        || definition.workspace().revision().get() != 1
+        || head.metadata().revision().get() != 1
+        || head.lifecycle() != SessionLifecycle::Open
+        || head.fork_provenance().is_some()
+        || head.created_at() != definition.created_at()
+        || head.created_at() != head.metadata().updated_at()
+        || !retained_agent_definition
+    {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(())
+}
+
+fn scan_agent_entity(path: &Path) -> Result<PathBuf, DurableOpenError> {
+    let mut entries = read_entries_bounded(path, AGENT_ENTITY_ENTRY_CAP)?;
+    entries.sort_unstable_by_key(|entry| entry.file_name());
     let mut published = false;
     let mut generations = None;
     for entry in entries {
@@ -944,7 +1206,7 @@ fn recover_agent_entity(
     if !published {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
-    recover_agent_generation_chain(&generations, agent_id, generation_maximum)
+    Ok(generations)
 }
 
 /// Recovers a fully committed, contiguous Agent generation chain. Markerless trailing
@@ -1076,6 +1338,16 @@ fn parse_agent_id_name(name: &OsStr) -> Result<AgentId, DurableOpenError> {
         return Err(DurableOpenError::DurableStateCorrupt);
     }
     Ok(agent_id)
+}
+
+fn parse_session_id_name(name: &OsStr) -> Result<SessionId, DurableOpenError> {
+    let value = name.to_str().ok_or(DurableOpenError::DurableStateCorrupt)?;
+    let session_id =
+        SessionId::from_str(value).map_err(|_| DurableOpenError::DurableStateCorrupt)?;
+    if session_id.to_string() != value {
+        return Err(DurableOpenError::DurableStateCorrupt);
+    }
+    Ok(session_id)
 }
 
 fn validate_generation_one_agent_semantics(
@@ -1221,6 +1493,16 @@ fn decode_agent_head_document(path: &Path) -> Result<DurableAgentHead, DurableOp
 fn decode_agent_definition_document(path: &Path) -> Result<AgentDefinition, DurableOpenError> {
     let bytes = read_durable_document(path)?;
     DurableStoreV1Codec::decode_agent_definition(&bytes).map_err(map_durable_document_codec_error)
+}
+
+fn decode_session_head_document(path: &Path) -> Result<DurableSessionHead, DurableOpenError> {
+    let bytes = read_durable_document(path)?;
+    DurableStoreV1Codec::decode_session_head(&bytes).map_err(map_durable_document_codec_error)
+}
+
+fn decode_session_definition_document(path: &Path) -> Result<SessionDefinition, DurableOpenError> {
+    let bytes = read_durable_document(path)?;
+    DurableStoreV1Codec::decode_session_definition(&bytes).map_err(map_durable_document_codec_error)
 }
 
 fn map_durable_document_codec_error(error: DurableStoreCodecError) -> DurableOpenError {
@@ -1783,6 +2065,8 @@ mod tests {
 
     const AGENT_ONE: &str = "agt_11111111111111111111111111111111";
     const AGENT_TWO: &str = "agt_22222222222222222222222222222222";
+    const SESSION_ONE: &str = "ses_22222222222222222222222222222222";
+    const SESSION_TWO: &str = "ses_33333333333333333333333333333333";
     const GENERATION_ONE: &str = "00000000000000000001";
     const GENERATION_TWO: &str = "00000000000000000002";
     const GENERATION_THREE: &str = "00000000000000000003";
@@ -1810,6 +2094,61 @@ mod tests {
 
     fn agent_head_status_g2_fixture() -> &'static [u8] {
         include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-status.json")
+    }
+
+    fn session_head_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head.json")
+    }
+
+    fn session_definition_fixture() -> Vec<u8> {
+        let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition.json");
+        #[cfg(windows)]
+        {
+            return replace_fixture(
+                fixture,
+                "file:///Users/example/project",
+                "file:///C:/work/project",
+            );
+        }
+        #[cfg(not(windows))]
+        fixture.to_vec()
+    }
+
+    fn session_head_definition_g2_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-definition.json")
+    }
+
+    fn session_definition_g2_fixture() -> Vec<u8> {
+        let fixture = include_bytes!("../docs/fixtures/durable-store-v1/session-definition-2.json");
+        #[cfg(windows)]
+        {
+            return replace_fixture(
+                fixture,
+                "file:///Users/example/project",
+                "file:///C:/work/project",
+            );
+        }
+        #[cfg(not(windows))]
+        fixture.to_vec()
+    }
+
+    fn fork_session_head_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-session-head.json")
+    }
+
+    fn fork_session_definition_fixture() -> Vec<u8> {
+        let fixture =
+            include_bytes!("../docs/fixtures/durable-store-v1/fork-session-definition.json");
+        #[cfg(windows)]
+        {
+            return replace_fixture(
+                fixture,
+                "file:///Users/example/project",
+                "file:///C:/work/project",
+            );
+        }
+        #[cfg(not(windows))]
+        fixture.to_vec()
     }
 
     fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
@@ -1864,6 +2203,54 @@ mod tests {
             AGENT_ONE,
             agent_head_fixture(),
             agent_definition_fixture(),
+        );
+    }
+
+    fn session_path(root: &Path, session_id: &str) -> PathBuf {
+        root.join(SESSIONS_DIRECTORY).join(session_id)
+    }
+
+    fn session_generation_path(root: &Path, session_id: &str) -> PathBuf {
+        session_path(root, session_id)
+            .join("generations")
+            .join(GENERATION_ONE)
+    }
+
+    fn create_exact_g1_session(
+        root: &Path,
+        session_id: &str,
+        head: &[u8],
+        definition: &[u8],
+        conversation: &[u8],
+    ) {
+        create_file(
+            &root
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(session_id),
+            b"",
+        );
+        let entity = session_path(root, session_id);
+        create_directory(&entity);
+        create_file(&entity.join("PUBLISHED"), b"");
+        create_file(&entity.join("conversation.jsonl"), conversation);
+        let generations = entity.join("generations");
+        create_directory(&generations);
+        let generation = generations.join(GENERATION_ONE);
+        create_directory(&generation);
+        create_file(&generation.join("head.json"), head);
+        create_file(&generation.join("definition.json"), definition);
+        create_file(&generation.join("COMMITTED"), b"");
+    }
+
+    fn create_valid_g1_session(root: &Path, conversation: &[u8]) {
+        let definition = session_definition_fixture();
+        create_exact_g1_session(
+            root,
+            SESSION_ONE,
+            session_head_fixture(),
+            &definition,
+            conversation,
         );
     }
 
@@ -3605,7 +3992,514 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn sessions_are_required_empty_and_small_caps_take_precedence() {
+    async fn marked_empty_store_has_an_empty_private_session_catalog() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+
+        let state = open(root.path())
+            .await
+            .expect("the marked empty store opens");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert!(state.session_head(session_id).is_none());
+        assert!(state.session_current_definition(session_id).is_none());
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_ordinary_g1_session_recovers_same_arcs_without_reading_conversation_bytes() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let conversation = b"\xff entirely arbitrary non-header bytes\x00\n";
+        create_valid_g1_session(root.path(), conversation);
+        let conversation_path = session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+        let before = fs::read(&conversation_path).unwrap();
+
+        let state = open(root.path())
+            .await
+            .expect("a regular conversation is physical-only at store open");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let first = state
+            .session_head(session_id)
+            .expect("the Session is catalogued");
+        let second = state
+            .session_head(session_id)
+            .expect("the same head is retained");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.session_id(), session_id);
+        assert_eq!(first.storage_generation().get(), 1);
+        assert_eq!(first.current_definition_revision().get(), 1);
+        assert_eq!(first.current_definition_storage_generation().get(), 1);
+        assert_eq!(first.metadata().revision().get(), 1);
+        assert_eq!(first.lifecycle(), SessionLifecycle::Open);
+        assert!(first.fork_provenance().is_none());
+
+        let definition = state
+            .session_current_definition(session_id)
+            .expect("the G1 Session definition is retained");
+        let same_definition = state
+            .session_current_definition(session_id)
+            .expect("the same G1 Session definition is retained");
+        assert!(Arc::ptr_eq(&definition, &same_definition));
+        assert_eq!(definition.session_id(), session_id);
+        assert_eq!(definition.revision().get(), 1);
+        assert_eq!(definition.workspace().revision().get(), 1);
+
+        let debug = format!("{:?}", state.sessions.get(&session_id).unwrap());
+        for secret in [SESSION_ONE, AGENT_ONE, "session-notes", "openai"] {
+            assert!(!debug.contains(secret), "catalog debug leaked {secret:?}");
+        }
+        state.close().await;
+        assert_eq!(fs::read(conversation_path).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn orphan_session_reservation_is_invisible_but_published_session_requires_an_exact_match()
+    {
+        let orphan = TempRoot::existing();
+        create_marked_empty_store(orphan.path());
+        create_file(
+            &orphan
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE),
+            b"",
+        );
+        let state = open(orphan.path())
+            .await
+            .expect("an orphan Session reservation is permanent but invisible");
+        assert!(
+            state
+                .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                .is_none()
+        );
+        state.close().await;
+
+        let missing = TempRoot::existing();
+        create_marked_empty_store(missing.path());
+        create_valid_g1_agent(missing.path());
+        create_valid_g1_session(missing.path(), b"bad Header bytes are not scanned");
+        fs::remove_file(
+            missing
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE),
+        )
+        .unwrap();
+        assert_corrupt(open(missing.path()).await);
+
+        let mismatched = TempRoot::existing();
+        create_marked_empty_store(mismatched.path());
+        create_valid_g1_agent(mismatched.path());
+        create_valid_g1_session(mismatched.path(), b"bad Header bytes are not scanned");
+        fs::rename(
+            mismatched
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE),
+            mismatched
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_TWO),
+        )
+        .unwrap();
+        assert_corrupt(open(mismatched.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_entity_requires_the_exact_three_entry_shape_and_cap_precedes_classification() {
+        let missing_published = TempRoot::existing();
+        create_marked_empty_store(missing_published.path());
+        create_valid_g1_agent(missing_published.path());
+        create_valid_g1_session(missing_published.path(), b"arbitrary");
+        fs::remove_file(session_path(missing_published.path(), SESSION_ONE).join("PUBLISHED"))
+            .unwrap();
+        assert_corrupt(open(missing_published.path()).await);
+
+        let missing_conversation = TempRoot::existing();
+        create_marked_empty_store(missing_conversation.path());
+        create_valid_g1_agent(missing_conversation.path());
+        create_valid_g1_session(missing_conversation.path(), b"arbitrary");
+        fs::remove_file(
+            session_path(missing_conversation.path(), SESSION_ONE).join("conversation.jsonl"),
+        )
+        .unwrap();
+        assert_corrupt(open(missing_conversation.path()).await);
+
+        let generations_file = TempRoot::existing();
+        create_marked_empty_store(generations_file.path());
+        create_valid_g1_agent(generations_file.path());
+        create_valid_g1_session(generations_file.path(), b"arbitrary");
+        let generations = session_path(generations_file.path(), SESSION_ONE).join("generations");
+        fs::remove_dir_all(&generations).unwrap();
+        create_file(&generations, b"");
+        assert_corrupt(open(generations_file.path()).await);
+
+        let too_many = TempRoot::existing();
+        create_marked_empty_store(too_many.path());
+        create_valid_g1_agent(too_many.path());
+        create_valid_g1_session(too_many.path(), b"arbitrary");
+        create_file(
+            &session_path(too_many.path(), SESSION_ONE).join("foreign-fourth"),
+            b"",
+        );
+        assert!(matches!(
+            open(too_many.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_g1_payload_requires_exact_head_definition_and_committed_and_obeys_its_cap() {
+        for missing_name in ["head.json", "definition.json", "COMMITTED"] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), b"arbitrary");
+            fs::remove_file(session_generation_path(root.path(), SESSION_ONE).join(missing_name))
+                .unwrap();
+            assert_corrupt(open(root.path()).await);
+        }
+
+        let too_many = TempRoot::existing();
+        create_marked_empty_store(too_many.path());
+        create_valid_g1_agent(too_many.path());
+        create_valid_g1_session(too_many.path(), b"arbitrary");
+        create_file(
+            &session_generation_path(too_many.path(), SESSION_ONE).join("foreign-fourth"),
+            b"",
+        );
+        assert!(matches!(
+            open(too_many.path()).await,
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_conversation_must_be_a_private_regular_non_link_file_without_reading_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempRoot::existing();
+        create_marked_empty_store(directory.path());
+        create_valid_g1_agent(directory.path());
+        create_valid_g1_session(directory.path(), b"arbitrary");
+        let conversation = session_path(directory.path(), SESSION_ONE).join("conversation.jsonl");
+        fs::remove_file(&conversation).unwrap();
+        create_directory(&conversation);
+        assert_corrupt(open(directory.path()).await);
+
+        let linked = TempRoot::existing();
+        create_marked_empty_store(linked.path());
+        create_valid_g1_agent(linked.path());
+        create_valid_g1_session(linked.path(), b"arbitrary");
+        let conversation = session_path(linked.path(), SESSION_ONE).join("conversation.jsonl");
+        fs::remove_file(&conversation).unwrap();
+        let target_root = TempRoot::existing();
+        let target = target_root.path().join("conversation-target");
+        create_file(&target, b"not a Header");
+        symlink(&target, &conversation).unwrap();
+        assert_corrupt(open(linked.path()).await);
+
+        let wrong_mode = TempRoot::existing();
+        create_marked_empty_store(wrong_mode.path());
+        create_valid_g1_agent(wrong_mode.path());
+        create_valid_g1_session(wrong_mode.path(), b"arbitrary");
+        let conversation = session_path(wrong_mode.path(), SESSION_ONE).join("conversation.jsonl");
+        set_unix_mode(&conversation, 0o644);
+        assert_corrupt(open(wrong_mode.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_path_head_definition_and_g1_semantic_facts_must_agree() {
+        let path_mismatch = TempRoot::existing();
+        create_marked_empty_store(path_mismatch.path());
+        create_valid_g1_agent(path_mismatch.path());
+        create_valid_g1_session(path_mismatch.path(), b"arbitrary");
+        fs::rename(
+            path_mismatch
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE),
+            path_mismatch
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_TWO),
+        )
+        .unwrap();
+        fs::rename(
+            session_path(path_mismatch.path(), SESSION_ONE),
+            session_path(path_mismatch.path(), SESSION_TWO),
+        )
+        .unwrap();
+        assert_corrupt(open(path_mismatch.path()).await);
+
+        let cases = [
+            (
+                "head Session ID",
+                replace_fixture(session_head_fixture(), SESSION_ONE, SESSION_TWO),
+                session_definition_fixture(),
+            ),
+            (
+                "definition Session ID",
+                session_head_fixture().to_vec(),
+                replace_fixture(&session_definition_fixture(), SESSION_ONE, SESSION_TWO),
+            ),
+            (
+                "head definition revision",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"revision\":\"sdr_1\",\"storageGeneration\":1",
+                    "\"revision\":\"sdr_2\",\"storageGeneration\":1",
+                ),
+                session_definition_fixture(),
+            ),
+            (
+                "definition revision",
+                session_head_fixture().to_vec(),
+                replace_fixture(
+                    &session_definition_fixture(),
+                    "\"revision\":\"sdr_1\"",
+                    "\"revision\":\"sdr_2\"",
+                ),
+            ),
+            (
+                "definition workspace revision",
+                session_head_fixture().to_vec(),
+                replace_fixture(
+                    &session_definition_fixture(),
+                    "\"revision\":\"wr_1\"",
+                    "\"revision\":\"wr_2\"",
+                ),
+            ),
+            (
+                "metadata revision",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"revision\":\"smr_1\"",
+                    "\"revision\":\"smr_2\"",
+                ),
+                session_definition_fixture(),
+            ),
+            (
+                "archived lifecycle",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"lifecycle\":\"open\"",
+                    "\"lifecycle\":\"archived\"",
+                ),
+                session_definition_fixture(),
+            ),
+            (
+                "ordinary Session provenance",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"forkProvenance\":null",
+                    "\"forkProvenance\":{\"sourceSessionId\":\"ses_33333333333333333333333333333333\",\"source\":\"recorded_history\",\"anchor\":{\"type\":\"genesis\"}}",
+                ),
+                session_definition_fixture(),
+            ),
+            (
+                "head created timestamp",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"createdAt\":\"2026-08-03T10:01:00.456Z\"",
+                    "\"createdAt\":\"2026-08-03T10:01:00.457Z\"",
+                ),
+                session_definition_fixture(),
+            ),
+            (
+                "definition created timestamp",
+                session_head_fixture().to_vec(),
+                replace_fixture(
+                    &session_definition_fixture(),
+                    "\"createdAt\":\"2026-08-03T10:01:00.456Z\"",
+                    "\"createdAt\":\"2026-08-03T10:01:00.457Z\"",
+                ),
+            ),
+            (
+                "metadata timestamp",
+                replace_fixture(
+                    session_head_fixture(),
+                    "\"updatedAt\":\"2026-08-03T10:01:00.456Z\"",
+                    "\"updatedAt\":\"2026-08-03T10:01:00.457Z\"",
+                ),
+                session_definition_fixture(),
+            ),
+        ];
+
+        for (name, head, definition) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_exact_g1_session(root.path(), SESSION_ONE, &head, &definition, b"arbitrary");
+            assert!(
+                matches!(
+                    open(root.path()).await,
+                    Err(DurableOpenError::DurableStateCorrupt)
+                ),
+                "{name} must fail the G1 semantic matrix"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_agent_ref_must_resolve_to_a_retained_exact_agent_definition() {
+        let missing_agent = TempRoot::existing();
+        create_marked_empty_store(missing_agent.path());
+        create_valid_g1_session(missing_agent.path(), b"arbitrary");
+        assert_corrupt(open(missing_agent.path()).await);
+
+        let missing_revision = TempRoot::existing();
+        create_marked_empty_store(missing_revision.path());
+        create_valid_g1_agent(missing_revision.path());
+        let missing_definition = replace_fixture(
+            &session_definition_fixture(),
+            "\"revision\":\"ar_1\"",
+            "\"revision\":\"ar_2\"",
+        );
+        create_exact_g1_session(
+            missing_revision.path(),
+            SESSION_ONE,
+            session_head_fixture(),
+            &missing_definition,
+            b"arbitrary",
+        );
+        assert_corrupt(open(missing_revision.path()).await);
+
+        let retained_old_revision = TempRoot::existing();
+        create_marked_empty_store(retained_old_revision.path());
+        create_valid_g1_agent(retained_old_revision.path());
+        create_agent_generation(
+            retained_old_revision.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(retained_old_revision.path(), b"arbitrary");
+        let state = open(retained_old_revision.path())
+            .await
+            .expect("a Session may pin retained AR1 while Agent current is AR2");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        assert_eq!(
+            state
+                .agent_head(agent_id)
+                .unwrap()
+                .current_definition_revision()
+                .get(),
+            2
+        );
+        assert_eq!(
+            state
+                .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+                .unwrap()
+                .agent()
+                .revision()
+                .get(),
+            1
+        );
+        state.close().await;
+
+        let disabled_agent = TempRoot::existing();
+        create_marked_empty_store(disabled_agent.path());
+        create_valid_g1_agent(disabled_agent.path());
+        create_agent_generation(
+            disabled_agent.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_status_g2_fixture(),
+            None,
+        );
+        create_valid_g1_session(disabled_agent.path(), b"arbitrary");
+        let state = open(disabled_agent.path())
+            .await
+            .expect("recovery does not require a Session's Agent to remain Enabled");
+        state.close().await;
+
+        let deleted_agent = TempRoot::existing();
+        create_marked_empty_store(deleted_agent.path());
+        create_valid_g1_agent(deleted_agent.path());
+        create_agent_generation(
+            deleted_agent.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            &replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"status\":\"disabled\"",
+                "\"status\":\"deleted\"",
+            ),
+            None,
+        );
+        create_valid_g1_session(deleted_agent.path(), b"arbitrary");
+        let state = open(deleted_agent.path())
+            .await
+            .expect("a Deleted Agent still retains exact definitions for Session history");
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_forks_g2_and_markerless_trailing_generations_fail_closed_without_mutation() {
+        let fork = TempRoot::existing();
+        create_marked_empty_store(fork.path());
+        create_valid_g1_agent(fork.path());
+        let fork_definition = fork_session_definition_fixture();
+        create_exact_g1_session(
+            fork.path(),
+            SESSION_TWO,
+            fork_session_head_fixture(),
+            &fork_definition,
+            b"arbitrary",
+        );
+        let fork_head = session_generation_path(fork.path(), SESSION_TWO).join("head.json");
+        let before = fs::read(&fork_head).unwrap();
+        assert_corrupt(open(fork.path()).await);
+        assert_eq!(fs::read(fork_head).unwrap(), before);
+
+        let g2 = TempRoot::existing();
+        create_marked_empty_store(g2.path());
+        create_valid_g1_agent(g2.path());
+        create_valid_g1_session(g2.path(), b"arbitrary");
+        let generation = session_path(g2.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        create_directory(&generation);
+        create_file(
+            &generation.join("head.json"),
+            session_head_definition_g2_fixture(),
+        );
+        let g2_definition = session_definition_g2_fixture();
+        create_file(&generation.join("definition.json"), &g2_definition);
+        create_file(&generation.join("COMMITTED"), b"");
+        let before = fs::read(generation.join("head.json")).unwrap();
+        assert_corrupt(open(g2.path()).await);
+        assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+
+        let markerless = TempRoot::existing();
+        create_marked_empty_store(markerless.path());
+        create_valid_g1_agent(markerless.path());
+        create_valid_g1_session(markerless.path(), b"arbitrary");
+        let generation = session_path(markerless.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        create_directory(&generation);
+        create_file(
+            &generation.join("head.json"),
+            b"markerless trailing bytes survive",
+        );
+        let before = fs::read(generation.join("head.json")).unwrap();
+        assert_corrupt(open(markerless.path()).await);
+        assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_collection_names_and_small_caps_precede_shape_classification() {
         let root_sessions = TempRoot::existing();
         create_marked_empty_store(root_sessions.path());
         create_file(
@@ -3674,6 +4568,70 @@ mod tests {
                 cap_reservation_sessions.path(),
                 &marked_entries(cap_reservation_sessions.path()),
                 caps,
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+    }
+
+    #[test]
+    fn all_entity_namespaces_are_inventoried_before_generation_semantics() {
+        let later_session_collection_cap = TempRoot::existing();
+        create_marked_empty_store(later_session_collection_cap.path());
+        create_valid_g1_agent(later_session_collection_cap.path());
+        create_file(
+            &generation_path(later_session_collection_cap.path(), AGENT_ONE).join("head.json"),
+            b"corrupt Agent head\n",
+        );
+        let sessions = later_session_collection_cap.path().join(SESSIONS_DIRECTORY);
+        create_file(&sessions.join("invalid-one"), b"");
+        create_file(&sessions.join("invalid-two"), b"");
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                later_session_collection_cap.path(),
+                &marked_entries(later_session_collection_cap.path()),
+                caps,
+            ),
+            Err(DurableOpenError::DurableStateTooLarge)
+        ));
+
+        let later_session_entity_cap = TempRoot::existing();
+        create_marked_empty_store(later_session_entity_cap.path());
+        create_valid_g1_agent(later_session_entity_cap.path());
+        create_valid_g1_session(later_session_entity_cap.path(), b"arbitrary");
+        create_file(
+            &session_generation_path(later_session_entity_cap.path(), SESSION_ONE)
+                .join("head.json"),
+            &replace_fixture(
+                session_head_fixture(),
+                "\"lifecycle\":\"open\"",
+                "\"lifecycle\":\"archived\"",
+            ),
+        );
+        create_file(
+            &later_session_entity_cap
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_TWO),
+            b"",
+        );
+        let second_entity = session_path(later_session_entity_cap.path(), SESSION_TWO);
+        create_directory(&second_entity);
+        for name in ["one", "two", "three", "four"] {
+            create_file(&second_entity.join(name), b"");
+        }
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                later_session_entity_cap.path(),
+                &marked_entries(later_session_entity_cap.path()),
+                RecoveryCaps::PRODUCTION,
             ),
             Err(DurableOpenError::DurableStateTooLarge)
         ));
