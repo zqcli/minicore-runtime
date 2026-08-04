@@ -104,6 +104,46 @@ fn create_published_g1_agent_store(root: &Path) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
+fn create_published_g2_definition_generation(root: &Path) {
+    const AGENT_ID: &str = "agt_11111111111111111111111111111111";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("agents")
+        .join(AGENT_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-head-2-definition.json"),
+    );
+    create_private_file(
+        &generation.join("definition.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/agent-definition-2.json"),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
+fn create_corrupt_g2_same_status_generation(root: &Path) {
+    const AGENT_ID: &str = "agt_11111111111111111111111111111111";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("agents")
+        .join(AGENT_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    let head = std::str::from_utf8(include_bytes!(
+        "../docs/fixtures/durable-store-v1/agent-head-2-status.json"
+    ))
+    .expect("the authoritative fixture is UTF-8")
+    .replace("\"status\":\"disabled\"", "\"status\":\"enabled\"");
+    create_private_file(&generation.join("head.json"), head.as_bytes());
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn nonexistent_root_opens_shuts_down_and_reopens() {
     let root = TempRoot::new();
@@ -149,6 +189,51 @@ async fn published_committed_g1_agent_store_opens_shuts_down_and_reopens() {
     .await
     .expect("the recovered G1 Agent store reopens after shutdown");
     reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn published_committed_g1_g2_definition_agent_store_opens_shuts_down_and_reopens() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g2_definition_generation(root.path());
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the public runtime recovers the authoritative G1/G2 definition chain");
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the public runtime reopens the recovered G1/G2 definition chain");
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_runtime_maps_a_corrupt_same_status_no_op_and_redacts_it() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_corrupt_g2_same_status_generation(root.path());
+    let private_root = root.path().to_string_lossy();
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a committed same-status generation is corrupt rather than a G1 fallback");
+
+    assert_eq!(error, RuntimeInitializationError::DurableStateCorrupt);
+    assert!(!format!("{error:?}").contains(private_root.as_ref()));
+    assert!(!error.to_string().contains(private_root.as_ref()));
+    assert!(!format!("{error:?}").contains("Planner"));
+    assert!(!error.to_string().contains("Planner"));
+    assert!(Error::source(&error).is_none());
 }
 
 #[tokio::test(flavor = "current_thread")]

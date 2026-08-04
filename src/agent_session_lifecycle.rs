@@ -61,6 +61,15 @@ impl fmt::Debug for AgentDefinition {
     }
 }
 
+/// Compares the durable execution content of two Agent definitions while deliberately excluding
+/// immutable identity, revision, and definition timestamp facts.
+pub(crate) fn agent_definitions_have_same_canonical_execution_content(
+    first: &AgentDefinition,
+    second: &AgentDefinition,
+) -> bool {
+    first.prompts() == second.prompts()
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AgentMetadataError {
     #[error("agent metadata name must be non-empty")]
@@ -140,6 +149,15 @@ impl fmt::Debug for AgentMetadata {
     }
 }
 
+/// Compares canonical metadata content while deliberately excluding its CAS revision and
+/// millisecond-truncated update timestamp.
+pub(crate) fn agent_metadata_has_same_canonical_content(
+    first: &AgentMetadata,
+    second: &AgentMetadata,
+) -> bool {
+    first.name() == second.name() && first.description() == second.description()
+}
+
 fn normalize_agent_metadata_text(
     value: &str,
     maximum: usize,
@@ -167,6 +185,23 @@ pub enum AgentStatus {
     Enabled,
     Disabled,
     Deleted,
+}
+
+/// Returns whether one persisted Agent status may directly follow another in a durable
+/// generation. `Deleted` is terminal, and same-status writes are canonical no-ops.
+pub(crate) const fn is_legal_agent_status_transition(
+    previous: AgentStatus,
+    next: AgentStatus,
+) -> bool {
+    matches!(
+        (previous, next),
+        (AgentStatus::Enabled, AgentStatus::Disabled)
+            | (AgentStatus::Disabled, AgentStatus::Enabled)
+            | (
+                AgentStatus::Enabled | AgentStatus::Disabled,
+                AgentStatus::Deleted
+            )
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
