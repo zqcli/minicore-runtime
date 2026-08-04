@@ -4,9 +4,13 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 
 use crate::model_gateway::{ModelSelection, ReasoningPreference};
-use crate::prompt::AgentPromptSelection;
+use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
 use crate::wire::lexical::{LexicalError, normalize_newlines, validate_safe_text};
-use crate::wire::{AgentId, AgentMetadataRevision, AgentRevision, ProtocolLimits, Timestamp};
+use crate::wire::{
+    AgentId, AgentMetadataRevision, AgentRevision, ItemId, ProtocolLimits,
+    SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
+};
+use crate::workspace::Workspace;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AgentDefinition {
@@ -141,12 +145,20 @@ fn normalize_agent_metadata_text(
     maximum: usize,
     allow_empty: bool,
 ) -> Result<Box<str>, AgentMetadataError> {
-    let value = normalize_newlines(value);
-    validate_safe_text(&value, maximum, allow_empty).map_err(|error| match error {
+    normalize_safe_metadata_text(value, maximum, allow_empty).map_err(|error| match error {
         LexicalError::Empty => AgentMetadataError::EmptyName,
         LexicalError::TooLong => AgentMetadataError::TextTooLong,
         LexicalError::InvalidGrammar | LexicalError::UnsafeText => AgentMetadataError::UnsafeText,
-    })?;
+    })
+}
+
+fn normalize_safe_metadata_text(
+    value: &str,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<Box<str>, LexicalError> {
+    let value = normalize_newlines(value);
+    validate_safe_text(&value, maximum, allow_empty)?;
     Ok(value.into())
 }
 
@@ -207,5 +219,258 @@ impl SessionModelConfig {
 
     pub const fn max_output_tokens(&self) -> Option<NonZeroU32> {
         self.max_output_tokens
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionDefinition {
+    session_id: SessionId,
+    revision: SessionDefinitionRevision,
+    agent: AgentRevisionRef,
+    workspace: Workspace,
+    model: SessionModelConfig,
+    prompts: SessionPromptSelection,
+    created_at: Timestamp,
+}
+
+impl SessionDefinition {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a Session definition atomically owns its seven durable facts"
+    )]
+    pub const fn new(
+        session_id: SessionId,
+        revision: SessionDefinitionRevision,
+        agent: AgentRevisionRef,
+        workspace: Workspace,
+        model: SessionModelConfig,
+        prompts: SessionPromptSelection,
+        created_at: Timestamp,
+    ) -> Self {
+        Self {
+            session_id,
+            revision,
+            agent,
+            workspace,
+            model,
+            prompts,
+            created_at,
+        }
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn revision(&self) -> SessionDefinitionRevision {
+        self.revision
+    }
+
+    pub const fn agent(&self) -> AgentRevisionRef {
+        self.agent
+    }
+
+    pub const fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    pub const fn model(&self) -> &SessionModelConfig {
+        &self.model
+    }
+
+    pub const fn prompts(&self) -> &SessionPromptSelection {
+        &self.prompts
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+impl fmt::Debug for SessionDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionDefinition")
+            .field("revision", &self.revision)
+            .field("agent", &"redacted")
+            .field("workspace", &"redacted")
+            .field("model", &"redacted")
+            .field("prompt_count", &self.prompts.enabled().len())
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SessionMetadataError {
+    #[error("session metadata name must be non-empty")]
+    EmptyName,
+    #[error("session metadata exceeds its selected text limit")]
+    TextTooLong,
+    #[error("session metadata contains an unsafe control character")]
+    UnsafeText,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionMetadata {
+    revision: SessionMetadataRevision,
+    name: Option<Box<str>>,
+    description: Option<Box<str>>,
+    updated_at: Timestamp,
+}
+
+impl SessionMetadata {
+    pub fn new<N, D>(
+        revision: SessionMetadataRevision,
+        name: Option<N>,
+        description: Option<D>,
+        updated_at: Timestamp,
+    ) -> Result<Self, SessionMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        let limits = ProtocolLimits::v1_0().text;
+        let name = name
+            .map(|value| {
+                normalize_session_metadata_text(
+                    value.as_ref(),
+                    usize::from(limits.max_display_name_bytes),
+                    false,
+                )
+            })
+            .transpose()?;
+        let description = description
+            .map(|value| {
+                normalize_session_metadata_text(
+                    value.as_ref(),
+                    usize::try_from(limits.max_description_bytes).unwrap_or(usize::MAX),
+                    true,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            revision,
+            name,
+            description,
+            updated_at,
+        })
+    }
+
+    pub const fn revision(&self) -> SessionMetadataRevision {
+        self.revision
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+}
+
+impl fmt::Debug for SessionMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionMetadata")
+            .field("name_present", &self.name.is_some())
+            .field("description_present", &self.description.is_some())
+            .finish()
+    }
+}
+
+fn normalize_session_metadata_text(
+    value: &str,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<Box<str>, SessionMetadataError> {
+    normalize_safe_metadata_text(value, maximum, allow_empty).map_err(|error| match error {
+        LexicalError::Empty => SessionMetadataError::EmptyName,
+        LexicalError::TooLong => SessionMetadataError::TextTooLong,
+        LexicalError::InvalidGrammar | LexicalError::UnsafeText => SessionMetadataError::UnsafeText,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionLifecycle {
+    Open,
+    Archived,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkSourceKind {
+    LiveSnapshot,
+    RecordedHistory,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum ForkAnchor {
+    Genesis,
+    BeforeUserMessage { item_id: ItemId },
+    AfterUserMessage { item_id: ItemId },
+    BeforeFinalAgentMessage { item_id: ItemId },
+    AfterFinalAgentMessage { item_id: ItemId },
+}
+
+impl fmt::Debug for ForkAnchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Genesis => "Genesis",
+            Self::BeforeUserMessage { .. } => "BeforeUserMessage",
+            Self::AfterUserMessage { .. } => "AfterUserMessage",
+            Self::BeforeFinalAgentMessage { .. } => "BeforeFinalAgentMessage",
+            Self::AfterFinalAgentMessage { .. } => "AfterFinalAgentMessage",
+        };
+        formatter.write_str(name)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionForkProvenance {
+    source_session_id: SessionId,
+    source: ForkSourceKind,
+    anchor: ForkAnchor,
+}
+
+impl SessionForkProvenance {
+    pub const fn new(
+        source_session_id: SessionId,
+        source: ForkSourceKind,
+        anchor: ForkAnchor,
+    ) -> Self {
+        Self {
+            source_session_id,
+            source,
+            anchor,
+        }
+    }
+
+    pub const fn source_session_id(&self) -> SessionId {
+        self.source_session_id
+    }
+
+    pub const fn source(&self) -> ForkSourceKind {
+        self.source
+    }
+
+    pub const fn anchor(&self) -> &ForkAnchor {
+        &self.anchor
+    }
+}
+
+impl fmt::Debug for SessionForkProvenance {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionForkProvenance")
+            .field("source_session", &"redacted")
+            .field("source", &self.source)
+            .field("anchor", &self.anchor)
+            .finish()
     }
 }
