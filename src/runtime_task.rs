@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
 use time::OffsetDateTime;
 use tokio::runtime::Handle;
@@ -55,7 +58,7 @@ impl fmt::Display for RuntimeDependencyUnavailable {
 
 impl Error for RuntimeDependencyUnavailable {}
 
-/// A redacted terminal outcome for a tracked blocking operation.
+/// A redacted terminal outcome for an owner-tracked operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RuntimeTaskError {
     OwnerClosing,
@@ -118,7 +121,7 @@ impl RuntimeTaskContext {
             Ok(key) => key,
             Err(error) => {
                 settlement.resolve(Err(error));
-                return TrackedBlockingJob::new(settlement, RegistryKey::REJECTED);
+                return TrackedBlockingJob::new(settlement);
             }
         };
 
@@ -147,7 +150,43 @@ impl RuntimeTaskContext {
             }
         }
 
-        TrackedBlockingJob::new(settlement, key)
+        TrackedBlockingJob::new(settlement)
+    }
+
+    /// Starts owner-retained asynchronous work. The raw Tokio handle remains in the owner
+    /// registry, so dropping every caller-side task handle cannot detach admitted work.
+    pub(crate) fn spawn_tracked<F>(&self, future: F) -> Result<TrackedTask, RuntimeTaskError>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let settlement = Arc::new(Settlement::new());
+        let key = self.owner.reserve_start()?;
+        let task_owner = Arc::clone(&self.owner);
+        let task_settlement = Arc::clone(&settlement);
+        let spawned = catch_unwind(AssertUnwindSafe(|| {
+            self.owner.handle.spawn(async move {
+                // The task owns the owner while it is running, so dropping every caller-side
+                // context or task cannot detach an admitted asynchronous operation.
+                let _owner = task_owner;
+                let guard = AsyncTaskSettlementGuard::new(task_settlement);
+                future.await;
+                guard.settle_ok();
+            })
+        }));
+
+        match spawned {
+            Ok(handle) => {
+                let join_failure_settlement: Arc<dyn JoinFailureSettlement> = settlement.clone();
+                self.owner
+                    .install_async(key, handle, join_failure_settlement);
+                Ok(TrackedTask::new(settlement))
+            }
+            Err(_) => {
+                self.owner.fail_start(key);
+                settlement.resolve(Err(RuntimeTaskError::WorkerUnavailable));
+                Err(RuntimeTaskError::WorkerUnavailable)
+            }
+        }
     }
 
     /// Synchronously rejects future admissions without claiming the active shutdown leader.
@@ -158,15 +197,61 @@ impl RuntimeTaskContext {
         self.owner.request_closing();
     }
 
+    #[cfg(test)]
+    pub(crate) fn abort_latest_registered_task(&self) {
+        let registry = lock(&self.owner.registry);
+        registry
+            .tasks
+            .iter()
+            .next_back()
+            .expect("a test-created actor has a retained raw task handle")
+            .1
+            .handle
+            .abort();
+    }
+
     /// Closes admission and joins every operation reserved while the owner was open.
     pub(crate) async fn shutdown(&self) {
-        let leader = self.owner.begin_shutdown();
         self.owner.cancellation.cancel();
-        if leader {
-            self.owner.finish_shutdown().await;
-        } else {
-            self.owner.shutdown_complete.wait().await;
+        loop {
+            // Register before inspecting leadership so a cancelled leader cannot clear its
+            // claim between our inspection and this wait.
+            let notified = self.owner.registry_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            match self.owner.begin_shutdown() {
+                ShutdownAttempt::Leader(mut leadership) => {
+                    self.owner.finish_shutdown().await;
+                    leadership.complete();
+                    return;
+                }
+                ShutdownAttempt::Closed => return,
+                ShutdownAttempt::Waiting => notified.await,
+            }
         }
+    }
+}
+
+/// Opaque caller-side access to one owner-tracked asynchronous operation.
+#[derive(Clone)]
+pub(crate) struct TrackedTask {
+    settlement: Arc<Settlement<()>>,
+}
+
+impl TrackedTask {
+    fn new(settlement: Arc<Settlement<()>>) -> Self {
+        Self { settlement }
+    }
+
+    pub(crate) async fn wait(&self) -> Result<(), RuntimeTaskError> {
+        self.settlement.wait().await
+    }
+}
+
+impl fmt::Debug for TrackedTask {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TrackedTask { .. }")
     }
 }
 
@@ -177,18 +262,14 @@ where
     T: Clone + Send + 'static,
 {
     settlement: Arc<Settlement<T>>,
-    _registry_key: RegistryKey,
 }
 
 impl<T> TrackedBlockingJob<T>
 where
     T: Clone + Send + 'static,
 {
-    fn new(settlement: Arc<Settlement<T>>, registry_key: RegistryKey) -> Self {
-        Self {
-            settlement,
-            _registry_key: registry_key,
-        }
+    fn new(settlement: Arc<Settlement<T>>) -> Self {
+        Self { settlement }
     }
 
     pub(crate) async fn wait(&self) -> Result<T, RuntimeTaskError> {
@@ -210,7 +291,6 @@ struct RuntimeTaskOwner {
     cancellation: CancellationToken,
     registry: Mutex<Registry>,
     registry_changed: Notify,
-    shutdown_complete: Completion,
 }
 
 impl RuntimeTaskOwner {
@@ -220,7 +300,6 @@ impl RuntimeTaskOwner {
             cancellation: CancellationToken::new(),
             registry: Mutex::new(Registry::new()),
             registry_changed: Notify::new(),
-            shutdown_complete: Completion::new(),
         }
     }
 
@@ -257,11 +336,29 @@ impl RuntimeTaskOwner {
         handle: JoinHandle<()>,
         settlement: Arc<dyn JoinFailureSettlement>,
     ) {
+        self.install_task(key, handle, settlement);
+    }
+
+    fn install_async(
+        &self,
+        key: RegistryKey,
+        handle: JoinHandle<()>,
+        settlement: Arc<dyn JoinFailureSettlement>,
+    ) {
+        self.install_task(key, handle, settlement);
+    }
+
+    fn install_task(
+        &self,
+        key: RegistryKey,
+        handle: JoinHandle<()>,
+        settlement: Arc<dyn JoinFailureSettlement>,
+    ) {
         let mut registry = lock(&self.registry);
         registry.starting.remove(&key);
         registry
-            .blocking
-            .insert(key, RegisteredBlockingTask { handle, settlement });
+            .tasks
+            .insert(key, RegisteredTask { handle, settlement });
         drop(registry);
         self.registry_changed.notify_waiters();
     }
@@ -275,64 +372,187 @@ impl RuntimeTaskOwner {
 
     fn request_closing(&self) {
         let mut registry = lock(&self.registry);
+        let changed = registry.phase == OwnerPhase::Open;
         if registry.phase == OwnerPhase::Open {
             registry.phase = OwnerPhase::Closing;
         }
         drop(registry);
         self.cancellation.cancel();
+        if changed {
+            self.registry_changed.notify_waiters();
+        }
     }
 
-    fn begin_shutdown(&self) -> bool {
+    fn begin_shutdown(self: &Arc<Self>) -> ShutdownAttempt {
         let mut registry = lock(&self.registry);
-        if registry.phase == OwnerPhase::Closed || registry.shutdown_active {
-            return false;
+        if registry.phase == OwnerPhase::Closed {
+            return ShutdownAttempt::Closed;
+        }
+        if registry.shutdown_active {
+            return ShutdownAttempt::Waiting;
         }
         registry.phase = OwnerPhase::Closing;
         registry.shutdown_active = true;
-        true
+        ShutdownAttempt::Leader(ShutdownLeadership::new(Arc::clone(self)))
     }
 
-    async fn finish_shutdown(&self) {
-        let blocking = loop {
+    async fn finish_shutdown(self: &Arc<Self>) {
+        loop {
             let notified = self.registry_changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let blocking = {
+            let work = {
                 let mut registry = lock(&self.registry);
-                if registry.starting.is_empty() {
-                    Some(std::mem::take(&mut registry.blocking))
+                if !registry.starting.is_empty() {
+                    ShutdownWork::Wait
+                } else if registry.tasks.is_empty() {
+                    assert!(
+                        registry.starting.is_empty(),
+                        "shutdown cannot close with starts"
+                    );
+                    assert!(
+                        registry.tasks.is_empty(),
+                        "shutdown cannot close with tasks"
+                    );
+                    // Completion and leadership release are one registry transition. A later
+                    // caller must observe Closed rather than wait behind a stale leader claim.
+                    registry.phase = OwnerPhase::Closed;
+                    registry.shutdown_active = false;
+                    ShutdownWork::Complete
                 } else {
-                    None
+                    ShutdownWork::JoinAll(JoinAllRegisteredTasks::new(
+                        Arc::clone(self),
+                        std::mem::take(&mut registry.tasks),
+                    ))
                 }
             };
-            if let Some(blocking) = blocking {
-                break blocking;
+            match work {
+                ShutdownWork::JoinAll(join) => join.await,
+                ShutdownWork::Wait => notified.await,
+                ShutdownWork::Complete => {
+                    self.registry_changed.notify_waiters();
+                    return;
+                }
             }
-            notified.await;
-        };
+        }
+    }
+}
 
-        // Completed raw handles intentionally remain in the owner registry until shutdown. This
-        // initial foundation has no detached task or persistent executor/reaper of its own.
-        for (_, task) in blocking {
-            if task.handle.await.is_err() {
-                task.settlement.settle_join_failure();
+enum ShutdownAttempt {
+    Leader(ShutdownLeadership),
+    Waiting,
+    Closed,
+}
+
+/// Holds the exclusive shutdown claim until its owner finishes or its future is cancelled.
+struct ShutdownLeadership {
+    owner: Arc<RuntimeTaskOwner>,
+    completed: bool,
+}
+
+impl ShutdownLeadership {
+    fn new(owner: Arc<RuntimeTaskOwner>) -> Self {
+        Self {
+            owner,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for ShutdownLeadership {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let mut registry = lock(&self.owner.registry);
+        let was_active = registry.phase == OwnerPhase::Closing && registry.shutdown_active;
+        if was_active {
+            registry.shutdown_active = false;
+        }
+        drop(registry);
+        if was_active {
+            self.owner.registry_changed.notify_waiters();
+        }
+    }
+}
+
+enum ShutdownWork {
+    JoinAll(JoinAllRegisteredTasks),
+    Wait,
+    Complete,
+}
+
+/// Owns every raw task removed from the registry for one shutdown joining pass.
+///
+/// Polling every handle in each pass prevents a lower-key parent that awaits a later-key child
+/// from serially blocking the child join that settles its `TrackedTask`. If shutdown polling is
+/// cancelled, the guard restores every still-pending exact handle and settlement before anything
+/// can drop a raw handle and detach an operation.
+struct JoinAllRegisteredTasks {
+    owner: Arc<RuntimeTaskOwner>,
+    tasks: BTreeMap<RegistryKey, RegisteredTask>,
+}
+
+impl JoinAllRegisteredTasks {
+    fn new(owner: Arc<RuntimeTaskOwner>, tasks: BTreeMap<RegistryKey, RegisteredTask>) -> Self {
+        Self { owner, tasks }
+    }
+}
+
+impl Future for JoinAllRegisteredTasks {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        let mut completed = Vec::new();
+
+        for (key, task) in &mut this.tasks {
+            if let Poll::Ready(joined) = Pin::new(&mut task.handle).poll(context) {
+                if joined.is_err() {
+                    task.settlement.settle_join_failure();
+                }
+                completed.push(*key);
             }
         }
 
-        let mut registry = lock(&self.registry);
-        registry.phase = OwnerPhase::Closed;
+        for key in completed {
+            let removed = this.tasks.remove(&key);
+            debug_assert!(removed.is_some(), "each completed owner task has one slot");
+        }
+
+        if this.tasks.is_empty() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+impl Drop for JoinAllRegisteredTasks {
+    fn drop(&mut self) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        let mut registry = lock(&self.owner.registry);
+        for (key, task) in std::mem::take(&mut self.tasks) {
+            let previous = registry.tasks.insert(key, task);
+            debug_assert!(
+                previous.is_none(),
+                "an in-flight owner task has one registry slot"
+            );
+        }
         drop(registry);
-        self.shutdown_complete.complete();
+        self.owner.registry_changed.notify_waiters();
     }
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct RegistryKey(u64);
-
-impl RegistryKey {
-    const REJECTED: Self = Self(0);
-}
 
 struct Registry {
     phase: OwnerPhase,
@@ -340,7 +560,7 @@ struct Registry {
     next_key: u64,
     starting: BTreeSet<RegistryKey>,
     probes: BTreeMap<RegistryKey, JoinHandle<()>>,
-    blocking: BTreeMap<RegistryKey, RegisteredBlockingTask>,
+    tasks: BTreeMap<RegistryKey, RegisteredTask>,
 }
 
 impl Registry {
@@ -351,7 +571,7 @@ impl Registry {
             next_key: 1,
             starting: BTreeSet::new(),
             probes: BTreeMap::new(),
-            blocking: BTreeMap::new(),
+            tasks: BTreeMap::new(),
         }
     }
 }
@@ -363,7 +583,7 @@ enum OwnerPhase {
     Closed,
 }
 
-struct RegisteredBlockingTask {
+struct RegisteredTask {
     handle: JoinHandle<()>,
     settlement: Arc<dyn JoinFailureSettlement>,
 }
@@ -378,6 +598,36 @@ where
 {
     fn settle_join_failure(&self) {
         self.resolve(Err(RuntimeTaskError::WorkerUnavailable));
+    }
+}
+
+/// Settles any asynchronous task that is unwound or cancelled after it begins execution.
+/// A task cancelled before its first poll is settled by the owner when its registry handle joins.
+struct AsyncTaskSettlementGuard {
+    settlement: Arc<Settlement<()>>,
+    settled: bool,
+}
+
+impl AsyncTaskSettlementGuard {
+    fn new(settlement: Arc<Settlement<()>>) -> Self {
+        Self {
+            settlement,
+            settled: false,
+        }
+    }
+
+    fn settle_ok(mut self) {
+        self.settlement.resolve(Ok(()));
+        self.settled = true;
+    }
+}
+
+impl Drop for AsyncTaskSettlementGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settlement
+                .resolve(Err(RuntimeTaskError::WorkerUnavailable));
+        }
     }
 }
 
@@ -419,41 +669,6 @@ where
     }
 }
 
-struct Completion {
-    complete: Mutex<bool>,
-    changed: Notify,
-}
-
-impl Completion {
-    fn new() -> Self {
-        Self {
-            complete: Mutex::new(false),
-            changed: Notify::new(),
-        }
-    }
-
-    fn complete(&self) {
-        let mut complete = lock(&self.complete);
-        if !*complete {
-            *complete = true;
-            drop(complete);
-            self.changed.notify_waiters();
-        }
-    }
-
-    async fn wait(&self) {
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if *lock(&self.complete) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
@@ -471,6 +686,7 @@ mod tests {
     use time::OffsetDateTime;
     use time::format_description::well_known::Rfc3339;
     use tokio::runtime::{Builder, Handle};
+    use tokio::sync::Notify;
 
     use super::{
         Clock, RuntimeDependencyUnavailable, RuntimeTaskContext, RuntimeTaskError, SystemClock,
@@ -562,6 +778,128 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn tracked_async_task_settles_normally_without_exposing_a_raw_join_handle() {
+        let context = initialized_context().await;
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_by_task = Arc::clone(&completed);
+
+        let task = context
+            .spawn_tracked(async move {
+                completed_by_task.store(true, Ordering::SeqCst);
+            })
+            .expect("an open owner admits asynchronous work");
+
+        assert_eq!(task.wait().await, Ok(()));
+        assert!(completed.load(Ordering::SeqCst));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_task_does_not_cancel_or_detach_its_async_operation_from_shutdown() {
+        let context = initialized_context().await;
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let completed = Arc::new(AtomicBool::new(false));
+        let entered_by_task = Arc::clone(&entered);
+        let release_by_task = Arc::clone(&release);
+        let completed_by_task = Arc::clone(&completed);
+
+        let task = context
+            .spawn_tracked(async move {
+                entered_by_task.notify_one();
+                release_by_task.notified().await;
+                completed_by_task.store(true, Ordering::SeqCst);
+            })
+            .expect("an open owner admits asynchronous work");
+        entered.notified().await;
+        drop(task);
+
+        let mut shutdown = std::pin::pin!(context.shutdown());
+        assert!(poll_once_pending(shutdown.as_mut()).await);
+        release.notify_one();
+        shutdown.await;
+
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_panic_is_redacted_cloneable_and_settles_shared_waiters_exactly_once() {
+        let context = initialized_context().await;
+        let task = context
+            .spawn_tracked(async {
+                panic!("async task payload must not cross the task boundary");
+            })
+            .expect("an open owner admits asynchronous work");
+        let shared_waiter = task.clone();
+
+        let (first, second) = tokio::join!(task.wait(), shared_waiter.wait());
+
+        assert_eq!(first, Err(RuntimeTaskError::WorkerUnavailable));
+        assert_eq!(second, Err(RuntimeTaskError::WorkerUnavailable));
+        assert_eq!(
+            first.expect_err("the task panicked").to_string(),
+            "runtime task failed"
+        );
+        assert!(!format!("{second:?}").contains("async task payload"));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_a_started_async_task_uses_its_raii_settlement() {
+        let context = initialized_context().await;
+        let entered = Arc::new(Notify::new());
+        let entered_by_task = Arc::clone(&entered);
+        let task = context
+            .spawn_tracked(async move {
+                entered_by_task.notify_one();
+                std::future::pending::<()>().await;
+            })
+            .expect("an open owner admits asynchronous work");
+        entered.notified().await;
+
+        {
+            let registry = super::lock(&context.owner.registry);
+            registry
+                .tasks
+                .values()
+                .next()
+                .expect("the raw handle is retained only in the owner registry")
+                .handle
+                .abort();
+        }
+
+        assert_eq!(task.wait().await, Err(RuntimeTaskError::WorkerUnavailable));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_polls_a_parent_waiting_for_a_later_unpolled_aborted_child() {
+        let context = initialized_context().await;
+        let parent_waiting = Arc::new(Notify::new());
+        let parent_context = context.clone();
+        let parent_waiting_by_task = Arc::clone(&parent_waiting);
+        let parent = context
+            .spawn_tracked(async move {
+                let child = parent_context
+                    .spawn_tracked(std::future::pending())
+                    .expect("the parent creates its child before shutdown closes admission");
+                // This runs in the parent before it yields, so Tokio cannot have polled the
+                // child future. The child settlement must therefore come from owner joining.
+                parent_context.abort_latest_registered_task();
+                parent_waiting_by_task.notify_one();
+
+                assert_eq!(child.wait().await, Err(RuntimeTaskError::WorkerUnavailable));
+            })
+            .expect("the open owner admits the parent");
+        parent_waiting.notified().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), context.shutdown())
+            .await
+            .expect("shutdown polls the later child instead of serially waiting on its parent");
+        assert_eq!(parent.wait().await, Ok(()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dropping_a_job_does_not_cancel_or_detach_its_blocking_operation_from_shutdown() {
         let context = initialized_context().await;
         let entered = Arc::new(Barrier::new(2));
@@ -645,18 +983,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_shutdown_while_joining_restores_raw_jobs_for_the_next_leader() {
+        let context = initialized_context().await;
+        let task_entered = Arc::new(Notify::new());
+        let task_release = Arc::new(Notify::new());
+        let task_entered_by_operation = Arc::clone(&task_entered);
+        let task_release_by_operation = Arc::clone(&task_release);
+        let task = context
+            .spawn_tracked(async move {
+                task_entered_by_operation.notify_one();
+                task_release_by_operation.notified().await;
+            })
+            .expect("the open owner admits the asynchronous operation");
+        task_entered.notified().await;
+
+        let job_entered = Arc::new(Barrier::new(2));
+        let job_release = Arc::new(Barrier::new(2));
+        let job_entered_by_operation = Arc::clone(&job_entered);
+        let job_release_by_operation = Arc::clone(&job_release);
+        let job = context.spawn_blocking_tracked(move || {
+            job_entered_by_operation.wait();
+            job_release_by_operation.wait();
+        });
+        job_entered.wait();
+
+        let mut first = Box::pin(context.shutdown());
+        assert!(poll_once_pending(first.as_mut()).await);
+        drop(first);
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert!(matches!(registry.phase, super::OwnerPhase::Closing));
+            assert!(!registry.shutdown_active);
+            assert_eq!(
+                registry.tasks.len(),
+                2,
+                "cancellation restores the joined raw task"
+            );
+        }
+
+        let mut second = Box::pin(context.shutdown());
+        assert!(poll_once_pending(second.as_mut()).await);
+        task_release.notify_one();
+        job_release.wait();
+        second.await;
+
+        assert_eq!(task.wait().await, Ok(()));
+        assert_eq!(job.wait().await, Ok(()));
+        let registry = super::lock(&context.owner.registry);
+        assert!(matches!(registry.phase, super::OwnerPhase::Closed));
+        assert!(
+            !registry.shutdown_active && registry.starting.is_empty() && registry.tasks.is_empty(),
+            "successful shutdown closes and releases leadership in one empty-registry transition"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_shutdown_while_waiting_for_starting_releases_its_leadership() {
+        let context = initialized_context().await;
+        let key = context
+            .owner
+            .reserve_start()
+            .expect("the fresh owner reserves a starting registration");
+
+        let mut first = Box::pin(context.shutdown());
+        assert!(poll_once_pending(first.as_mut()).await);
+        drop(first);
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert!(matches!(registry.phase, super::OwnerPhase::Closing));
+            assert!(!registry.shutdown_active);
+        }
+
+        context.owner.fail_start(key);
+        context.shutdown().await;
+        assert!(matches!(
+            super::lock(&context.owner.registry).phase,
+            super::OwnerPhase::Closed
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn a_closing_request_does_not_consume_the_later_shutdown_leadership() {
         let context = initialized_context().await;
 
         context.request_closing();
         let rejected = context.spawn_blocking_tracked(|| 3_u8);
         assert_eq!(rejected.wait().await, Err(RuntimeTaskError::OwnerClosing));
+        assert_eq!(
+            context
+                .spawn_tracked(async {})
+                .expect_err("closing rejects async work"),
+            RuntimeTaskError::OwnerClosing
+        );
 
         context.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_waits_for_a_reserved_starting_registration_to_install_and_join() {
+    async fn shutdown_waits_for_a_reserved_async_starting_registration_to_install_and_join() {
         let context = initialized_context().await;
         let key = context
             .owner
@@ -666,24 +1090,24 @@ mod tests {
         let mut shutdown = std::pin::pin!(context.shutdown());
         assert!(poll_once_pending(shutdown.as_mut()).await);
 
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
         let settlement = Arc::new(super::Settlement::new());
         let entered_by_operation = Arc::clone(&entered);
         let released_by_test = Arc::clone(&release);
         let settlement_by_operation = Arc::clone(&settlement);
-        let handle = context.owner.handle.spawn_blocking(move || {
-            entered_by_operation.wait();
-            released_by_test.wait();
+        let handle = context.owner.handle.spawn(async move {
+            entered_by_operation.notify_one();
+            released_by_test.notified().await;
             settlement_by_operation.resolve(Ok(()));
         });
         let join_failure_settlement: Arc<dyn super::JoinFailureSettlement> = settlement.clone();
         context
             .owner
-            .install_blocking(key, handle, join_failure_settlement);
-        entered.wait();
+            .install_async(key, handle, join_failure_settlement);
+        entered.notified().await;
         assert!(poll_once_pending(shutdown.as_mut()).await);
-        release.wait();
+        release.notify_one();
         shutdown.await;
         assert_eq!(settlement.wait().await, Ok(()));
     }

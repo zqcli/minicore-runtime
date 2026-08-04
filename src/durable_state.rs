@@ -8,6 +8,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
     AgentDefinition, AgentMetadata, AgentStatus, SessionDefinition, SessionForkProvenance,
@@ -21,7 +23,7 @@ use crate::conversation_storage::{
     SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
     validate_unpublished_conversation_for_recovery,
 };
-use crate::runtime_task::RuntimeTaskContext;
+use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::wire::conversation_jsonl_scanner::MAX_CONVERSATION_FILE_BYTES;
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
@@ -47,6 +49,7 @@ const ROOT_AGENT_ENTRY_CAP: usize = 1_000_000;
 const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_PAYLOAD_ENTRY_CAP: usize = 3;
+const DURABLE_STATE_ACTOR_QUEUE_CAPACITY: usize = 1;
 
 /// The private physical generation ordinal used only by Store V1 documents and paths.
 #[allow(
@@ -631,9 +634,371 @@ struct RecoveredSessionGenerationChain {
     markerless: Option<MarkerlessGenerationFiles>,
 }
 
+/// The private serial owner for future DurableState mutations. This slice establishes the
+/// request/settlement lifecycle only; reservation and durable payload requests stay out of it.
+struct DurableStateActor {
+    receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
+    closing: CancellationToken,
+    #[cfg(test)]
+    receiver_closed: Arc<tokio::sync::Notify>,
+}
+
+enum DurableStateActorRequest {
+    #[cfg(test)]
+    Probe(DurableStateActorProbe),
+    #[cfg(not(test))]
+    #[allow(
+        dead_code,
+        reason = "the private probe preserves the actor request seam"
+    )]
+    Probe,
+}
+
+/// A redacted terminal response for a request owned by the durable-state actor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActorRequestError {
+    Closing,
+    Unavailable,
+}
+
+impl fmt::Display for ActorRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("durable state actor request rejected")
+    }
+}
+
+impl std::error::Error for ActorRequestError {}
+
+/// Keeps a request's reply capability with its queued payload until exactly one terminal path
+/// consumes it. Dropping an active local request, a queued receiver item, or a failed `try_send`
+/// return therefore cannot leave a requester waiting forever.
+struct DurableStateActorRequestEnvelope {
+    request: DurableStateActorRequest,
+    response: Option<oneshot::Sender<Result<(), ActorRequestError>>>,
+    drop_error: ActorRequestError,
+}
+
+impl DurableStateActorRequestEnvelope {
+    #[cfg(test)]
+    fn new(
+        request: DurableStateActorRequest,
+    ) -> (Self, oneshot::Receiver<Result<(), ActorRequestError>>) {
+        let (response, waiter) = oneshot::channel();
+        (
+            Self {
+                request,
+                response: Some(response),
+                drop_error: ActorRequestError::Unavailable,
+            },
+            waiter,
+        )
+    }
+
+    fn settle(&mut self, outcome: Result<(), ActorRequestError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    #[cfg(test)]
+    fn complete(&mut self) {
+        self.settle(Ok(()));
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(ActorRequestError::Closing));
+    }
+
+    #[cfg(not(test))]
+    fn reject_unavailable(&mut self) {
+        self.settle(Err(ActorRequestError::Unavailable));
+    }
+
+    #[cfg(test)]
+    fn reject_on_drop_as(&mut self, error: ActorRequestError) {
+        self.drop_error = error;
+    }
+
+    #[cfg(test)]
+    fn probe_signals(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        match &self.request {
+            DurableStateActorRequest::Probe(probe) => {
+                (Arc::clone(&probe.entered), Arc::clone(&probe.release))
+            }
+        }
+    }
+}
+
+impl Drop for DurableStateActorRequestEnvelope {
+    fn drop(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(self.drop_error));
+        }
+    }
+}
+
+#[cfg(test)]
+struct DurableStateActorProbe {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+struct DurableStateActorProbeWaiter {
+    response: oneshot::Receiver<Result<(), ActorRequestError>>,
+}
+
+#[cfg(test)]
+impl DurableStateActorProbeWaiter {
+    async fn wait(self) -> Result<(), ActorRequestError> {
+        self.response
+            .await
+            .unwrap_or(Err(ActorRequestError::Unavailable))
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableStateActorProbeDelivery {
+    Accepted,
+    Rejected,
+}
+
+/// Opaque owner-side control for the one tracked DurableState actor.
+#[derive(Clone)]
+struct DurableStateActorHandle {
+    #[allow(
+        dead_code,
+        reason = "retains the actor channel's sender end until future durable requests use it"
+    )]
+    sender: mpsc::Sender<DurableStateActorRequestEnvelope>,
+    closing: CancellationToken,
+    task: TrackedTask,
+    #[cfg(test)]
+    receiver_closed: Arc<tokio::sync::Notify>,
+}
+
+impl DurableStateActorHandle {
+    fn start(task_context: &RuntimeTaskContext) -> Result<Self, RuntimeTaskError> {
+        let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
+        let closing = CancellationToken::new();
+        #[cfg(test)]
+        let receiver_closed = Arc::new(tokio::sync::Notify::new());
+        let actor = DurableStateActor {
+            receiver,
+            closing: closing.clone(),
+            #[cfg(test)]
+            receiver_closed: Arc::clone(&receiver_closed),
+        };
+        let task = task_context.spawn_tracked(actor.run())?;
+        Ok(Self {
+            sender,
+            closing,
+            task,
+            #[cfg(test)]
+            receiver_closed,
+        })
+    }
+
+    fn request_closing(&self) {
+        self.closing.cancel();
+    }
+
+    async fn wait(&self) -> Result<(), RuntimeTaskError> {
+        self.task.wait().await
+    }
+
+    #[cfg(test)]
+    fn enqueue_probe(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> DurableStateActorProbeWaiter {
+        let (mut request, response) = DurableStateActorRequestEnvelope::new(
+            DurableStateActorRequest::Probe(DurableStateActorProbe { entered, release }),
+        );
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+            return DurableStateActorProbeWaiter { response };
+        }
+        let _ = self.try_enqueue(request);
+        DurableStateActorProbeWaiter { response }
+    }
+
+    /// Test-only deterministic gate between the cancellation fast-path and `try_send`.
+    /// The gate runs on a helper thread so the current-thread actor cannot close its receiver
+    /// until the test deliberately yields it a turn.
+    #[cfg(test)]
+    fn enqueue_probe_after_fast_reject_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        checked: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> (DurableStateActorProbeWaiter, DurableStateActorProbeDelivery) {
+        let (mut request, response) = DurableStateActorRequestEnvelope::new(
+            DurableStateActorRequest::Probe(DurableStateActorProbe { entered, release }),
+        );
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+            return (
+                DurableStateActorProbeWaiter { response },
+                DurableStateActorProbeDelivery::Rejected,
+            );
+        }
+        checked
+            .send(())
+            .expect("the test retains the fast-reject gate receiver");
+        resume
+            .recv()
+            .expect("the test releases the fast-reject gate sender");
+        let delivery = self.try_enqueue(request);
+        (DurableStateActorProbeWaiter { response }, delivery)
+    }
+
+    /// Test-only deterministic gate after the cancellation fast-path and the capacity
+    /// reservation which starts `try_send`. The retained permit represents a sender that won
+    /// the pre-close channel gate but has not yet published its envelope.
+    #[cfg(test)]
+    fn enqueue_probe_after_fast_reject_and_sender_gate(
+        &self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        checked: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> (DurableStateActorProbeWaiter, DurableStateActorProbeDelivery) {
+        let (mut request, response) = DurableStateActorRequestEnvelope::new(
+            DurableStateActorRequest::Probe(DurableStateActorProbe { entered, release }),
+        );
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+            return (
+                DurableStateActorProbeWaiter { response },
+                DurableStateActorProbeDelivery::Rejected,
+            );
+        }
+        let permit = match self.sender.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let rejection = if self.closing.is_cancelled() {
+                    ActorRequestError::Closing
+                } else {
+                    ActorRequestError::Unavailable
+                };
+                request.reject_on_drop_as(rejection);
+                drop(request);
+                return (
+                    DurableStateActorProbeWaiter { response },
+                    DurableStateActorProbeDelivery::Rejected,
+                );
+            }
+        };
+        checked
+            .send(())
+            .expect("the test retains the sender-gate receiver");
+        resume
+            .recv()
+            .expect("the test releases the sender-gate sender");
+        permit.send(request);
+        (
+            DurableStateActorProbeWaiter { response },
+            DurableStateActorProbeDelivery::Accepted,
+        )
+    }
+
+    #[cfg(test)]
+    fn try_enqueue(
+        &self,
+        request: DurableStateActorRequestEnvelope,
+    ) -> DurableStateActorProbeDelivery {
+        match self.sender.try_send(request) {
+            Ok(()) => DurableStateActorProbeDelivery::Accepted,
+            Err(error) => {
+                let mut request = error.into_inner();
+                let rejection = if self.closing.is_cancelled() {
+                    ActorRequestError::Closing
+                } else {
+                    ActorRequestError::Unavailable
+                };
+                request.reject_on_drop_as(rejection);
+                drop(request);
+                DurableStateActorProbeDelivery::Rejected
+            }
+        }
+    }
+}
+
+impl DurableStateActor {
+    async fn run(mut self) {
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.closing.cancelled() => {
+                    self.close_receiver_and_reject_queued().await;
+                    return;
+                }
+                request = self.receiver.recv() => match request {
+                    None => return,
+                    #[cfg(test)]
+                    Some(mut request) => {
+                        if self.closing.is_cancelled() {
+                            self.close_current_and_reject_queued(&mut request).await;
+                            return;
+                        }
+
+                        let (entered, release) = request.probe_signals();
+                        entered.notify_one();
+                        tokio::select! {
+                            biased;
+                            _ = self.closing.cancelled() => {
+                                self.close_current_and_reject_queued(&mut request).await;
+                                return;
+                            }
+                            _ = release.notified() => request.complete(),
+                        }
+                    }
+                    #[cfg(not(test))]
+                    Some(mut request) => {
+                        let DurableStateActorRequest::Probe = &request.request;
+                        request.reject_unavailable();
+                    }
+                },
+            }
+        }
+    }
+
+    /// `Receiver::close` is the linearization point with concurrent `try_send` calls. Only
+    /// after it returns may closing safely settle every request that was accepted before it.
+    async fn close_receiver_and_reject_queued(&mut self) {
+        self.receiver.close();
+        #[cfg(test)]
+        self.receiver_closed.notify_waiters();
+        self.reject_queued_as_closing().await;
+    }
+
+    #[cfg(test)]
+    async fn close_current_and_reject_queued(
+        &mut self,
+        current: &mut DurableStateActorRequestEnvelope,
+    ) {
+        self.receiver.close();
+        self.receiver_closed.notify_waiters();
+        current.reject_closing();
+        self.reject_queued_as_closing().await;
+    }
+
+    async fn reject_queued_as_closing(&mut self) {
+        while let Some(mut request) = self.receiver.recv().await {
+            request.reject_closing();
+        }
+    }
+}
+
 /// The private owner of the Store V1 root lease and recovered immutable catalog.
+#[derive(Clone)]
 pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
+    actor: DurableStateActorHandle,
     lease: Arc<RootLease>,
     #[allow(
         dead_code,
@@ -655,21 +1020,42 @@ impl DurableState {
         task_context: RuntimeTaskContext,
     ) -> Result<Self, DurableOpenError> {
         let job = task_context.spawn_blocking_tracked(move || open_root(root));
-        match job.wait().await {
-            Ok(Ok(opened)) => Ok(Self {
-                task_context,
-                lease: opened.lease,
-                agents: opened.agents,
-                sessions: opened.sessions,
-            }),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err(DurableOpenError::StorageUnavailable),
-        }
+        let opened = match job.wait().await {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(DurableOpenError::StorageUnavailable),
+        };
+        let actor = match DurableStateActorHandle::start(&task_context) {
+            Ok(actor) => actor,
+            Err(_) => {
+                // The successful open job remains owner-retained until shutdown joins its raw
+                // handle. Do not release the root lease while that work is still outstanding.
+                task_context.shutdown().await;
+                opened.lease.release();
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+        };
+
+        Ok(Self {
+            task_context,
+            actor,
+            lease: opened.lease,
+            agents: opened.agents,
+            sessions: opened.sessions,
+        })
     }
 
-    /// Releases the root lease only after the shared task owner has joined accepted jobs.
+    /// Synchronously asks the actor to stop without releasing the root lease.
+    pub(crate) fn request_closing(&self) {
+        self.actor.request_closing();
+    }
+
+    /// Requests actor closure, joins the actor and all owner-retained work, then releases the
+    /// root lease. The actor settlement inspection also covers abort-before-first-poll.
     pub(crate) async fn close(&self) {
+        self.request_closing();
         self.task_context.shutdown().await;
+        let _ = self.actor.wait().await;
         self.lease.release();
     }
 
@@ -3651,8 +4037,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
+    use std::future::{Future, poll_fn};
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
     use std::str::FromStr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3662,7 +4050,8 @@ mod tests {
     #[cfg(unix)]
     use std::sync::Mutex;
 
-    use tokio::runtime::Handle;
+    use tokio::runtime::{Builder, Handle};
+    use tokio::sync::Notify;
 
     use super::{
         AGENTS_DIRECTORY, DurableOpenError, DurableSessionHead, DurableState, FORMAT_MARKER,
@@ -3679,7 +4068,7 @@ mod tests {
         AgentStatus, ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle,
         SessionMetadata,
     };
-    use crate::runtime_task::RuntimeTaskContext;
+    use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
     use crate::wire::{
         AgentId, AgentRevision, ItemId, SessionDefinitionRevision, SessionId,
         SessionMetadataRevision, Timestamp,
@@ -3908,6 +4297,288 @@ mod tests {
             context.shutdown().await;
         }
         result
+    }
+
+    async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
+    where
+        F: Future<Output = ()>,
+    {
+        poll_fn(|context| {
+            std::task::Poll::Ready(matches!(
+                future.as_mut().poll(context),
+                std::task::Poll::Pending
+            ))
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn durable_actor_starts_closes_and_releases_its_lease_on_a_current_thread_host() {
+        let root = TempRoot::nonexistent();
+
+        let state = open(root.path())
+            .await
+            .expect("the actor starts after successful root recovery");
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("actor shutdown precedes root-lease release");
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_request_completes_its_envelope_before_shutdown() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let waiter = state
+            .actor
+            .enqueue_probe(Arc::clone(&entered), Arc::clone(&release));
+
+        entered.notified().await;
+        release.notify_one();
+        assert_eq!(waiter.wait().await, Ok(()));
+
+        state.close().await;
+    }
+
+    #[test]
+    fn durable_actor_starts_closes_and_releases_its_lease_on_a_multi_thread_host() {
+        let root = TempRoot::nonexistent();
+        let host = Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .expect("the test host builds");
+
+        host.block_on(async {
+            let state = open(root.path())
+                .await
+                .expect("the actor starts after successful root recovery");
+            state.close().await;
+
+            let reopened = open(root.path())
+                .await
+                .expect("actor shutdown precedes root-lease release");
+            reopened.close().await;
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_lease_is_held_until_a_blocked_actor_and_its_queued_request_settle() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path())
+            .await
+            .expect("the store and its actor open");
+        let first_entered = Arc::new(Notify::new());
+        let first_release = Arc::new(Notify::new());
+        let first = state
+            .actor
+            .enqueue_probe(Arc::clone(&first_entered), Arc::clone(&first_release));
+        first_entered.notified().await;
+
+        let queued_entered = Arc::new(Notify::new());
+        let queued_release = Arc::new(Notify::new());
+        let queued = state
+            .actor
+            .enqueue_probe(Arc::clone(&queued_entered), Arc::clone(&queued_release));
+        state.request_closing();
+        // Both branches are now ready; the actor's biased close branch must win.
+        first_release.notify_one();
+
+        assert!(matches!(
+            open(root.path()).await,
+            Err(DurableOpenError::StoreInUse)
+        ));
+
+        // The active probe observes Closing before its release barrier; the queued one is
+        // explicitly completed as rejected rather than silently discarded.
+        state.close().await;
+        assert_eq!(first.wait().await, Err(super::ActorRequestError::Closing));
+        assert_eq!(queued.wait().await, Err(super::ActorRequestError::Closing));
+
+        let reopened = open(root.path())
+            .await
+            .expect("the lease releases only after the actor task settles");
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_rejects_new_actor_admission_and_aborts_a_prebarrier_probe() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let active = state
+            .actor
+            .enqueue_probe(Arc::clone(&entered), Arc::clone(&release));
+        entered.notified().await;
+
+        state.request_closing();
+        let rejected = state
+            .actor
+            .enqueue_probe(Arc::new(Notify::new()), Arc::new(Notify::new()));
+        assert_eq!(
+            rejected.wait().await,
+            Err(super::ActorRequestError::Closing)
+        );
+
+        state.close().await;
+        assert_eq!(active.wait().await, Err(super::ActorRequestError::Closing));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_the_actor_settles_its_active_and_queued_request_waiters() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let actor_task = state.actor.task.clone();
+
+        let active_entered = Arc::new(Notify::new());
+        let active = state
+            .actor
+            .enqueue_probe(Arc::clone(&active_entered), Arc::new(Notify::new()));
+        active_entered.notified().await;
+        let queued = state
+            .actor
+            .enqueue_probe(Arc::new(Notify::new()), Arc::new(Notify::new()));
+
+        state.task_context.abort_latest_registered_task();
+
+        assert_eq!(
+            active.wait().await,
+            Err(super::ActorRequestError::Unavailable),
+            "dropping the active actor local settles its envelope"
+        );
+        assert_eq!(
+            queued.wait().await,
+            Err(super::ActorRequestError::Unavailable),
+            "dropping the receiver settles every queued envelope"
+        );
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+
+        state.close().await;
+        let reopened = open(root.path())
+            .await
+            .expect("the aborted actor cannot retain the root lease");
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_sender_race_across_receiver_close_always_settles_the_waiter() {
+        let accepted_root = TempRoot::nonexistent();
+        let accepted_state = open(accepted_root.path())
+            .await
+            .expect("the store and actor open");
+        let (checked_sender, checked_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+        let actor = accepted_state.actor.clone();
+        let sender = std::thread::spawn(move || {
+            actor.enqueue_probe_after_fast_reject_and_sender_gate(
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+                checked_sender,
+                resume_receiver,
+            )
+        });
+        checked_receiver
+            .recv()
+            .expect("the sender passed its cancellation fast-path and sender gate");
+        accepted_state.request_closing();
+
+        let receiver_closed = accepted_state.actor.receiver_closed.notified();
+        tokio::pin!(receiver_closed);
+        receiver_closed.as_mut().enable();
+        let mut close = Box::pin(accepted_state.close());
+        assert!(poll_once_pending(close.as_mut()).await);
+        receiver_closed.await;
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "close waits for the outstanding sender gate rather than stopping at Empty"
+        );
+
+        resume_sender
+            .send(())
+            .expect("the sender remains gated after receiver close");
+        let (accepted_waiter, accepted_delivery) = sender
+            .join()
+            .expect("the deterministic sender helper does not panic");
+        assert_eq!(
+            accepted_delivery,
+            super::DurableStateActorProbeDelivery::Accepted,
+            "the pre-close sender gate publishes an accepted request"
+        );
+        close.await;
+        assert_eq!(
+            accepted_waiter.wait().await,
+            Err(super::ActorRequestError::Closing),
+            "an accepted request is drained with a typed close rejection"
+        );
+
+        let rejected_root = TempRoot::nonexistent();
+        let rejected_state = open(rejected_root.path())
+            .await
+            .expect("the store and actor open");
+        let (checked_sender, checked_receiver) = std::sync::mpsc::channel();
+        let (resume_sender, resume_receiver) = std::sync::mpsc::channel();
+        let actor = rejected_state.actor.clone();
+        let sender = std::thread::spawn(move || {
+            actor.enqueue_probe_after_fast_reject_gate(
+                Arc::new(Notify::new()),
+                Arc::new(Notify::new()),
+                checked_sender,
+                resume_receiver,
+            )
+        });
+        checked_receiver
+            .recv()
+            .expect("the sender passed its cancellation fast-path");
+        rejected_state.request_closing();
+        rejected_state
+            .actor
+            .wait()
+            .await
+            .expect("the actor closes its receiver before the gated send resumes");
+        resume_sender
+            .send(())
+            .expect("the sender remains gated until receiver close completes");
+        let (rejected_waiter, rejected_delivery) = sender
+            .join()
+            .expect("the deterministic sender helper does not panic");
+        assert_eq!(
+            rejected_delivery,
+            super::DurableStateActorProbeDelivery::Rejected,
+            "the post-close try_send is rejected synchronously"
+        );
+        assert_eq!(
+            rejected_waiter.wait().await,
+            Err(super::ActorRequestError::Closing),
+            "the returned failed-send envelope settles its waiter before dropping"
+        );
+        rejected_state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_the_actor_before_its_first_poll_still_settles_close_and_releases_the_lease() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let actor_task = state.actor.task.clone();
+        state.task_context.abort_latest_registered_task();
+
+        state.close().await;
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+
+        let reopened = open(root.path())
+            .await
+            .expect("an aborted unpolled actor cannot retain the root lease");
+        reopened.close().await;
     }
 
     fn root_entry_names(root: &Path) -> Vec<String> {
