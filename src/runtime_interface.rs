@@ -44,7 +44,8 @@ impl RuntimeCapabilities {
         Self { values: Vec::new() }
     }
 
-    pub fn all_v1() -> Self {
+    #[cfg(test)]
+    pub(crate) fn all_v1() -> Self {
         Self {
             values: v1_runtime_capabilities().to_vec(),
         }

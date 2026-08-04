@@ -525,15 +525,13 @@ fn run_negotiation_vectors(vector: &PublicVector) {
     );
     let vectors: NegotiationVectors = read_json(&fixture_root().join("public").join(&vector.path));
     assert_eq!(vectors.runtime_supported_versions, [ProtocolVersion::V1_0]);
-    let capabilities = RuntimeCapabilities::all_v1();
-    assert_eq!(
-        vectors
-            .runtime_capabilities
-            .iter()
-            .map(|value| runtime_capability(value))
-            .collect::<Vec<_>>(),
-        capabilities.values(),
-    );
+    let fixture_capabilities = vectors
+        .runtime_capabilities
+        .iter()
+        .map(|value| runtime_capability(value))
+        .collect::<Vec<_>>();
+    let capabilities = RuntimeCapabilities::for_v1(fixture_capabilities.clone()).unwrap();
+    assert_eq!(fixture_capabilities, capabilities.values());
     let router = ProtocolBootstrapRouter::new("minicore-runtime", "0.1.0", capabilities).unwrap();
 
     for case in vectors.cases {

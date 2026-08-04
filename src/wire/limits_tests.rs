@@ -14,6 +14,12 @@ fn all_v1_capabilities() -> RuntimeCapabilities {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct NegotiationFixture {
+    runtime_capabilities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LimitRecipe {
     validator_selectors: Vec<ValidatorSelector>,
     special_cases: BTreeMap<String, SpecialCase>,
@@ -240,6 +246,21 @@ fn negotiation_selects_exact_v1_and_runtime_capability_order() {
             ])
             .unwrap(),
         }
+    );
+}
+
+#[test]
+fn negotiation_fixture_lists_the_complete_canonical_v1_capability_universe() {
+    let fixture: NegotiationFixture =
+        read_json(&fixture_root().join("public/protocol-negotiation-cases.json"));
+    assert_eq!(
+        fixture.runtime_capabilities,
+        all_v1_capabilities()
+            .values()
+            .iter()
+            .copied()
+            .map(runtime_capability_name)
+            .collect::<Vec<_>>()
     );
 }
 

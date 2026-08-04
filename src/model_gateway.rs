@@ -4,11 +4,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::wire::Money;
 use crate::wire::lexical::{
-    LexicalError, normalize_newlines, validate_opaque_ascii, validate_safe_text,
-    validate_stable_symbolic_key,
+    LexicalError, validate_opaque_ascii, validate_safe_text, validate_stable_symbolic_key,
 };
-use crate::wire::{Money, ProtocolLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
@@ -225,8 +224,6 @@ pub enum ModelValueError {
     InvalidArtifact,
     #[error("reasoning content has no portable artifact")]
     EmptyReasoningContent,
-    #[error("redacted model error message is invalid")]
-    InvalidErrorMessage,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -478,63 +475,6 @@ impl ModelUsage {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub struct RedactedErrorMessage(Arc<str>);
-
-impl RedactedErrorMessage {
-    #[allow(
-        dead_code,
-        reason = "constructed by ProviderAdapter error mapping in M14"
-    )]
-    fn new(message: impl AsRef<str>) -> Result<Self, ModelValueError> {
-        let message = normalize_newlines(message.as_ref());
-        validate_safe_text(
-            &message,
-            ProtocolLimits::v1_0().text.max_diagnostic_message_bytes as usize,
-            false,
-        )
-        .map_err(|_| ModelValueError::InvalidErrorMessage)?;
-        Ok(Self(message.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for RedactedErrorMessage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RedactedErrorMessage")
-            .field("bytes", &self.0.len())
-            .finish()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ModelCallErrorReason {
-    Cancelled,
-    ModelUnavailable,
-    AuthMissing,
-    AuthRejected,
-    RateLimited,
-    QuotaExceeded,
-    ContextOverflow,
-    UnsupportedCapability,
-    InvalidRequest,
-    SafetyBlocked,
-    Timeout,
-    TransportUnavailable,
-    ProviderUnavailable,
-    ProviderRejected,
-    RequestOutcomeUnknown,
-    StreamInterrupted,
-    UnexpectedToolCall,
-    InvalidStructuredOutput,
-    InvalidProviderResponse,
-    IncompleteResponse,
-}
-
 fn validate_optional_readable_artifact(
     value: Option<String>,
     maximum: usize,
@@ -614,16 +554,6 @@ mod tests {
             ReasoningContent::new(None, None, Some("bad\nartifact".to_owned()), None, None)
                 .is_err()
         );
-    }
-
-    #[test]
-    fn redacted_errors_are_bounded_and_debug_safe() {
-        let message = RedactedErrorMessage::new("provider unavailable\r\nretry").unwrap();
-        assert_eq!(message.as_str(), "provider unavailable\nretry");
-        assert!(!format!("{message:?}").contains("provider unavailable"));
-        assert!(RedactedErrorMessage::new("bad\u{001b}").is_err());
-        assert!(RedactedErrorMessage::new("x".repeat(2_048)).is_ok());
-        assert!(RedactedErrorMessage::new("x".repeat(2_049)).is_err());
     }
 
     #[test]
