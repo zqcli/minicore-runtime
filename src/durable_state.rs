@@ -1073,9 +1073,9 @@ fn recover_agents(
     Ok(agents)
 }
 
-/// Recovers ordinary, committed Session chains. Agent recovery is deliberately complete before
-/// this function runs so every Session pin can be checked against the retained exact Agent
-/// definition index rather than an Agent's mutable current definition or status.
+/// Recovers committed Session chains. Agent recovery is deliberately complete before this
+/// function runs so every Session pin can be checked against the retained exact Agent definition
+/// index rather than an Agent's mutable current definition or status.
 fn recover_sessions(
     entity_generations: BTreeMap<SessionId, PathBuf>,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
@@ -1083,20 +1083,17 @@ fn recover_sessions(
 ) -> Result<BTreeMap<SessionId, DurableSessionCatalogEntry>, DurableOpenError> {
     let mut sessions = BTreeMap::new();
     for (session_id, generations) in entity_generations {
-        let entry = recover_ordinary_session_generation_chain(
-            &generations,
-            session_id,
-            agents,
-            generation_maximum,
-        )?;
+        let entry =
+            recover_session_generation_chain(&generations, session_id, agents, generation_maximum)?;
         if sessions.insert(session_id, entry).is_some() {
             return Err(DurableOpenError::DurableStateCorrupt);
         }
     }
+    validate_fork_provenance_references_and_cycles(&sessions)?;
     Ok(sessions)
 }
 
-fn recover_ordinary_session_generation_chain(
+fn recover_session_generation_chain(
     path: &Path,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
@@ -1127,7 +1124,7 @@ fn recover_ordinary_session_generation_chain(
     else {
         return Err(DurableOpenError::DurableStateCorrupt);
     };
-    validate_ordinary_session_generation_one(
+    validate_session_generation_one(
         session_id,
         first_generation,
         &first_head,
@@ -1148,7 +1145,7 @@ fn recover_ordinary_session_generation_chain(
             return Err(DurableOpenError::DurableStateCorrupt);
         }
         let (head, definition) = recover_session_generation_payload(&generation_entry.path())?;
-        validate_ordinary_session_generation_transition(
+        validate_session_generation_transition(
             session_id,
             generation,
             &current_head,
@@ -1202,7 +1199,7 @@ fn recover_session_generation_payload(
     Ok((decode_session_head_document(&head_path)?, definition))
 }
 
-fn validate_ordinary_session_generation_one(
+fn validate_session_generation_one(
     path_session_id: SessionId,
     path_generation: StorageGeneration,
     head: &DurableSessionHead,
@@ -1224,7 +1221,9 @@ fn validate_ordinary_session_generation_one(
         || definition.workspace().revision().get() != 1
         || head.metadata().revision().get() != 1
         || head.lifecycle() != SessionLifecycle::Open
-        || head.fork_provenance().is_some()
+        || head.fork_provenance().is_some_and(|_| {
+            head.metadata().name().is_some() || head.metadata().description().is_some()
+        })
         || head.created_at() != definition.created_at()
         || head.created_at() != head.metadata().updated_at()
         || !retained_agent_definition
@@ -1234,7 +1233,7 @@ fn validate_ordinary_session_generation_one(
     Ok(())
 }
 
-fn validate_ordinary_session_generation_transition(
+fn validate_session_generation_transition(
     path_session_id: SessionId,
     path_generation: StorageGeneration,
     previous_head: &DurableSessionHead,
@@ -1247,8 +1246,7 @@ fn validate_ordinary_session_generation_transition(
         || head.storage_generation() != path_generation
         || head.previous_storage_generation() != Some(previous_head.storage_generation())
         || previous_head.lifecycle() == SessionLifecycle::Deleted
-        || previous_head.fork_provenance().is_some()
-        || head.fork_provenance().is_some()
+        || head.fork_provenance() != previous_head.fork_provenance()
         || head.created_at() != previous_head.created_at()
     {
         return Err(DurableOpenError::DurableStateCorrupt);
@@ -1268,6 +1266,59 @@ fn validate_ordinary_session_generation_transition(
         None if session_lifecycle_transition_is_valid(previous_head, head) => Ok(()),
         None => Err(DurableOpenError::DurableStateCorrupt),
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ForkProvenanceVisit {
+    Visiting,
+    Done,
+}
+
+/// Validates published Fork sources and detects their bounded out-degree-one cycles without
+/// inspecting source conversation bytes or current Session facts.
+fn validate_fork_provenance_references_and_cycles(
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
+) -> Result<(), DurableOpenError> {
+    let mut visits = BTreeMap::new();
+
+    for session_id in sessions.keys().copied() {
+        if visits.get(&session_id) == Some(&ForkProvenanceVisit::Done) {
+            continue;
+        }
+
+        let mut chain = Vec::new();
+        let mut current = session_id;
+        loop {
+            match visits.get(&current) {
+                Some(ForkProvenanceVisit::Visiting) => {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+                Some(ForkProvenanceVisit::Done) => break,
+                None => {
+                    visits.insert(current, ForkProvenanceVisit::Visiting);
+                    chain.push(current);
+                }
+            }
+
+            let entry = sessions
+                .get(&current)
+                .ok_or(DurableOpenError::DurableStateCorrupt)?;
+            let Some(provenance) = entry.current_head.fork_provenance() else {
+                break;
+            };
+            let source_session_id = provenance.source_session_id();
+            if !sessions.contains_key(&source_session_id) {
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            current = source_session_id;
+        }
+
+        for session_id in chain {
+            visits.insert(session_id, ForkProvenanceVisit::Done);
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_session_definition_transition(
@@ -2231,6 +2282,8 @@ mod tests {
     const AGENT_TWO: &str = "agt_22222222222222222222222222222222";
     const SESSION_ONE: &str = "ses_22222222222222222222222222222222";
     const SESSION_TWO: &str = "ses_33333333333333333333333333333333";
+    const SESSION_THREE: &str = "ses_44444444444444444444444444444444";
+    const SESSION_BEFORE_SOURCE: &str = "ses_11111111111111111111111111111111";
     const GENERATION_ONE: &str = "00000000000000000001";
     const GENERATION_TWO: &str = "00000000000000000002";
     const GENERATION_THREE: &str = "00000000000000000003";
@@ -2334,6 +2387,16 @@ mod tests {
         ))
     }
 
+    fn genesis_fork_session_head_fixture() -> &'static [u8] {
+        include_bytes!("../docs/fixtures/durable-store-v1/genesis-fork-session-head.json")
+    }
+
+    fn genesis_fork_session_definition_fixture() -> Vec<u8> {
+        session_definition_fixture_from(include_bytes!(
+            "../docs/fixtures/durable-store-v1/genesis-fork-session-definition.json"
+        ))
+    }
+
     fn replace_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
         let input = std::str::from_utf8(input).expect("fixture bytes are UTF-8");
         assert_eq!(
@@ -2342,6 +2405,28 @@ mod tests {
             "fixture replacement must be fixed and unique"
         );
         input.replacen(from, to, 1).into_bytes()
+    }
+
+    fn replace_all_fixture(input: &[u8], from: &str, to: &str) -> Vec<u8> {
+        let input = std::str::from_utf8(input).expect("fixture bytes are UTF-8");
+        assert!(input.contains(from), "fixture must contain {from:?}");
+        input.replace(from, to).into_bytes()
+    }
+
+    fn valid_ordinary_conversation(session_id: &str) -> Vec<u8> {
+        replace_all_fixture(
+            include_bytes!("../docs/fixtures/durable-store-v1/fork-source.jsonl"),
+            SESSION_ONE,
+            session_id,
+        )
+    }
+
+    fn valid_fork_conversation(session_id: &str) -> Vec<u8> {
+        replace_all_fixture(
+            include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl"),
+            SESSION_TWO,
+            session_id,
+        )
     }
 
     fn agent_path(root: &Path, agent_id: &str) -> PathBuf {
@@ -2441,6 +2526,84 @@ mod tests {
             &definition,
             conversation,
         );
+    }
+
+    fn create_ordinary_g1_session(root: &Path, session_id: &str, conversation: &[u8]) {
+        let head = replace_fixture(session_head_fixture(), SESSION_ONE, session_id);
+        let definition = replace_fixture(&session_definition_fixture(), SESSION_ONE, session_id);
+        create_exact_g1_session(root, session_id, &head, &definition, conversation);
+    }
+
+    fn fork_provenance_json(source_session_id: &str, source: &str, anchor: &str) -> String {
+        format!(
+            r#"{{"sourceSessionId":"{source_session_id}","source":"{source}","anchor":{anchor}}}"#
+        )
+    }
+
+    fn fork_session_head_for(
+        session_id: &str,
+        source_session_id: &str,
+        source: &str,
+        anchor: &str,
+    ) -> Vec<u8> {
+        let child = replace_fixture(
+            fork_session_head_fixture(),
+            r#""sessionId":"ses_33333333333333333333333333333333""#,
+            &format!(r#""sessionId":"{session_id}""#),
+        );
+        let source_session = replace_fixture(
+            &child,
+            r#""sourceSessionId":"ses_22222222222222222222222222222222""#,
+            &format!(r#""sourceSessionId":"{source_session_id}""#),
+        );
+        let source = replace_fixture(
+            &source_session,
+            r#""source":"recorded_history""#,
+            &format!(r#""source":"{source}""#),
+        );
+        replace_fixture(
+            &source,
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            anchor,
+        )
+    }
+
+    fn fork_session_definition_for(session_id: &str) -> Vec<u8> {
+        replace_fixture(&fork_session_definition_fixture(), SESSION_TWO, session_id)
+    }
+
+    fn create_fork_g1_session(
+        root: &Path,
+        session_id: &str,
+        source_session_id: &str,
+        source: &str,
+        anchor: &str,
+        conversation: &[u8],
+    ) {
+        let head = fork_session_head_for(session_id, source_session_id, source, anchor);
+        let definition = fork_session_definition_for(session_id);
+        create_exact_g1_session(root, session_id, &head, &definition, conversation);
+    }
+
+    fn fork_g2_head_from(fixture: &[u8], session_id: &str, provenance: Option<&str>) -> Vec<u8> {
+        let session = replace_fixture(
+            fixture,
+            r#""sessionId":"ses_22222222222222222222222222222222""#,
+            &format!(r#""sessionId":"{session_id}""#),
+        );
+        let provenance = match provenance {
+            Some(provenance) => replace_fixture(
+                &session,
+                r#""forkProvenance":null"#,
+                &format!(r#""forkProvenance":{provenance}"#),
+            ),
+            None => session,
+        };
+        replace_fixture(
+            &provenance,
+            r#""createdAt":"2026-08-03T10:01:00.456Z"#,
+            r#""createdAt":"2026-08-03T10:02:00.789Z"#,
+        )
     }
 
     fn create_session_generation(
@@ -4530,15 +4693,6 @@ mod tests {
                 session_definition_fixture(),
             ),
             (
-                "ordinary Session provenance",
-                replace_fixture(
-                    session_head_fixture(),
-                    "\"forkProvenance\":null",
-                    "\"forkProvenance\":{\"sourceSessionId\":\"ses_33333333333333333333333333333333\",\"source\":\"recorded_history\",\"anchor\":{\"type\":\"genesis\"}}",
-                ),
-                session_definition_fixture(),
-            ),
-            (
                 "head created timestamp",
                 replace_fixture(
                     session_head_fixture(),
@@ -4678,23 +4832,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ordinary_session_g2_recovers_while_forks_and_markerless_trailing_generations_fail_closed_without_mutation()
-     {
+    async fn session_g1_and_fork_recover_but_markerless_staging_fails_closed() {
         let fork = TempRoot::existing();
         create_marked_empty_store(fork.path());
         create_valid_g1_agent(fork.path());
+        let source_conversation = b"source arbitrary conversation bytes";
+        create_valid_g1_session(fork.path(), source_conversation);
         let fork_definition = fork_session_definition_fixture();
         create_exact_g1_session(
             fork.path(),
             SESSION_TWO,
             fork_session_head_fixture(),
             &fork_definition,
-            b"arbitrary",
+            b"child arbitrary conversation bytes",
         );
         let fork_head = session_generation_path(fork.path(), SESSION_TWO).join("head.json");
         let before = fs::read(&fork_head).unwrap();
-        assert_corrupt(open(fork.path()).await);
+        let source_conversation_path =
+            session_path(fork.path(), SESSION_ONE).join("conversation.jsonl");
+        let child_conversation_path =
+            session_path(fork.path(), SESSION_TWO).join("conversation.jsonl");
+        let source_conversation_before = fs::read(&source_conversation_path).unwrap();
+        let child_conversation_before = fs::read(&child_conversation_path).unwrap();
+        let state = open(fork.path())
+            .await
+            .expect("an authoritative recorded-history Fork G1 recovers beside its source");
+        let child = state
+            .session_head(SessionId::from_str(SESSION_TWO).unwrap())
+            .expect("the Fork child is catalogued");
+        assert_eq!(
+            child.fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                SessionId::from_str(SESSION_ONE).unwrap(),
+                ForkSourceKind::RecordedHistory,
+                ForkAnchor::AfterUserMessage {
+                    item_id: ItemId::from_str("itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                },
+            )),
+            "recovery preserves every typed fork-provenance fact"
+        );
+        state.close().await;
         assert_eq!(fs::read(fork_head).unwrap(), before);
+        assert_eq!(
+            fs::read(source_conversation_path).unwrap(),
+            source_conversation_before
+        );
+        assert_eq!(
+            fs::read(child_conversation_path).unwrap(),
+            child_conversation_before
+        );
 
         let g2 = TempRoot::existing();
         create_marked_empty_store(g2.path());
@@ -4743,6 +4929,465 @@ mod tests {
         let before = fs::read(generation.join("head.json")).unwrap();
         assert_corrupt(open(markerless.path()).await);
         assert_eq!(fs::read(generation.join("head.json")).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authoritative_genesis_and_live_snapshot_fork_g1s_recover_with_exact_provenance() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"source conversation is opaque");
+        let genesis_definition = genesis_fork_session_definition_fixture();
+        create_exact_g1_session(
+            root.path(),
+            SESSION_THREE,
+            genesis_fork_session_head_fixture(),
+            &genesis_definition,
+            b"genesis child conversation is opaque",
+        );
+        create_fork_g1_session(
+            root.path(),
+            SESSION_TWO,
+            SESSION_ONE,
+            "live_snapshot",
+            r#"{"type":"before_final_agent_message","data":{"itemId":"itm_cccccccccccccccccccccccccccccccc"}}"#,
+            b"live-snapshot child conversation is opaque",
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("authoritative Genesis and canonical LiveSnapshot Forks recover");
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .session_head(SessionId::from_str(SESSION_THREE).unwrap())
+                .unwrap()
+                .fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                source,
+                ForkSourceKind::RecordedHistory,
+                ForkAnchor::Genesis,
+            ))
+        );
+        assert_eq!(
+            state
+                .session_head(SessionId::from_str(SESSION_TWO).unwrap())
+                .unwrap()
+                .fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                source,
+                ForkSourceKind::LiveSnapshot,
+                ForkAnchor::BeforeFinalAgentMessage {
+                    item_id: ItemId::from_str("itm_cccccccccccccccccccccccccccccccc").unwrap(),
+                },
+            )),
+            "Store open retains a typed anchor without relating it to opaque source bytes"
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_source_must_be_a_published_session_catalog_entry() {
+        for source_reservation_exists in [false, true] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            if source_reservation_exists {
+                create_file(
+                    &root
+                        .path()
+                        .join(RESERVATIONS_DIRECTORY)
+                        .join(SESSIONS_DIRECTORY)
+                        .join(SESSION_ONE),
+                    b"",
+                );
+            }
+            create_fork_g1_session(
+                root.path(),
+                SESSION_TWO,
+                SESSION_ONE,
+                "recorded_history",
+                r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+                &valid_fork_conversation(SESSION_TWO),
+            );
+
+            assert_corrupt(open(root.path()).await);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_fork_child_sorting_before_its_source_does_not_affect_post_pass_recovery() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+        create_fork_g1_session(
+            root.path(),
+            SESSION_TWO,
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_TWO),
+        );
+        create_fork_g1_session(
+            root.path(),
+            SESSION_BEFORE_SOURCE,
+            SESSION_TWO,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_BEFORE_SOURCE),
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("a nested Fork child may sort before its published source");
+        for session_id in [SESSION_BEFORE_SOURCE, SESSION_TWO] {
+            assert!(
+                state
+                    .session_head(SessionId::from_str(session_id).unwrap())
+                    .is_some()
+            );
+        }
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_sources_may_currently_be_archived_or_deleted() {
+        for (name, deleted) in [("archived", false), ("deleted", true)] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), b"source conversation is opaque");
+            create_session_generation(
+                root.path(),
+                SESSION_ONE,
+                GENERATION_TWO,
+                session_head_archived_g2_fixture(),
+                None,
+            );
+            if deleted {
+                create_session_generation(
+                    root.path(),
+                    SESSION_ONE,
+                    GENERATION_THREE,
+                    session_head_deleted_g3_fixture(),
+                    None,
+                );
+            }
+            create_fork_g1_session(
+                root.path(),
+                SESSION_TWO,
+                SESSION_ONE,
+                "recorded_history",
+                r#"{"type":"genesis"}"#,
+                b"child conversation is opaque",
+            );
+
+            let state = open(root.path()).await.unwrap_or_else(|_| {
+                panic!("a {name} source remains a valid recovered Fork target")
+            });
+            assert!(
+                state
+                    .session_head(SessionId::from_str(SESSION_TWO).unwrap())
+                    .is_some()
+            );
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_provenance_cycles_are_rejected_iteratively() {
+        let two_node = TempRoot::existing();
+        create_marked_empty_store(two_node.path());
+        create_valid_g1_agent(two_node.path());
+        create_fork_g1_session(
+            two_node.path(),
+            SESSION_ONE,
+            SESSION_TWO,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_ONE),
+        );
+        create_fork_g1_session(
+            two_node.path(),
+            SESSION_TWO,
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_TWO),
+        );
+        assert_corrupt(open(two_node.path()).await);
+
+        let three_node = TempRoot::existing();
+        create_marked_empty_store(three_node.path());
+        create_valid_g1_agent(three_node.path());
+        create_fork_g1_session(
+            three_node.path(),
+            SESSION_ONE,
+            SESSION_TWO,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_ONE),
+        );
+        create_fork_g1_session(
+            three_node.path(),
+            SESSION_TWO,
+            SESSION_THREE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_TWO),
+        );
+        create_fork_g1_session(
+            three_node.path(),
+            SESSION_THREE,
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            &valid_fork_conversation(SESSION_THREE),
+        );
+        assert_corrupt(open(three_node.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_definition_metadata_and_lifecycle_generations_preserve_exact_provenance() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"source conversation is opaque");
+        create_fork_g1_session(
+            root.path(),
+            SESSION_TWO,
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+            b"child conversation is opaque",
+        );
+        let provenance = fork_provenance_json(
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+        );
+        let definition_g2_head = replace_fixture(
+            &fork_g2_head_from(
+                session_head_definition_g2_fixture(),
+                SESSION_TWO,
+                Some(&provenance),
+            ),
+            r#""updatedAt":"2026-08-03T10:01:00.456Z"#,
+            r#""updatedAt":"2026-08-03T10:02:00.789Z"#,
+        );
+        let definition_g2 =
+            replace_fixture(&session_definition_g2_fixture(), SESSION_ONE, SESSION_TWO);
+        create_session_generation(
+            root.path(),
+            SESSION_TWO,
+            GENERATION_TWO,
+            &definition_g2_head,
+            Some(&definition_g2),
+        );
+        let metadata_g3_head = replace_fixture(
+            &replace_fixture(
+                &fork_g2_head_from(
+                    session_head_metadata_g2_fixture(),
+                    SESSION_TWO,
+                    Some(&provenance),
+                ),
+                r#""storageGeneration":2,"previousStorageGeneration":1"#,
+                r#""storageGeneration":3,"previousStorageGeneration":2"#,
+            ),
+            r#""currentDefinition":{"revision":"sdr_1","storageGeneration":1}"#,
+            r#""currentDefinition":{"revision":"sdr_2","storageGeneration":2}"#,
+        );
+        create_session_generation(
+            root.path(),
+            SESSION_TWO,
+            GENERATION_THREE,
+            &metadata_g3_head,
+            None,
+        );
+        let lifecycle_g4_head = replace_fixture(
+            &replace_fixture(
+                &metadata_g3_head,
+                r#""storageGeneration":3,"previousStorageGeneration":2"#,
+                r#""storageGeneration":4,"previousStorageGeneration":3"#,
+            ),
+            r#""lifecycle":"open""#,
+            r#""lifecycle":"archived""#,
+        );
+        create_session_generation(
+            root.path(),
+            SESSION_TWO,
+            GENERATION_FOUR,
+            &lifecycle_g4_head,
+            None,
+        );
+
+        let state = open(root.path())
+            .await
+            .expect("all later Fork categories retain exact immutable provenance");
+        let child = state
+            .session_head(SessionId::from_str(SESSION_TWO).unwrap())
+            .unwrap();
+        assert_eq!(child.storage_generation().get(), 4);
+        assert_eq!(child.current_definition_revision().get(), 2);
+        assert_eq!(child.metadata().revision().get(), 2);
+        assert_eq!(child.lifecycle(), SessionLifecycle::Archived);
+        assert_eq!(
+            child.fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                SessionId::from_str(SESSION_ONE).unwrap(),
+                ForkSourceKind::RecordedHistory,
+                ForkAnchor::AfterUserMessage {
+                    item_id: ItemId::from_str("itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap(),
+                },
+            ))
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn later_session_generations_require_exact_typed_fork_provenance_equality() {
+        let original = fork_provenance_json(
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+        );
+        let cases = [
+            ("Some to None", None, false),
+            (
+                "source SessionId",
+                Some(fork_provenance_json(
+                    SESSION_THREE,
+                    "recorded_history",
+                    r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+                )),
+                true,
+            ),
+            (
+                "source kind",
+                Some(fork_provenance_json(
+                    SESSION_ONE,
+                    "live_snapshot",
+                    r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+                )),
+                false,
+            ),
+            (
+                "anchor variant",
+                Some(fork_provenance_json(
+                    SESSION_ONE,
+                    "recorded_history",
+                    r#"{"type":"before_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+                )),
+                false,
+            ),
+            (
+                "anchor itemId",
+                Some(fork_provenance_json(
+                    SESSION_ONE,
+                    "recorded_history",
+                    r#"{"type":"after_user_message","data":{"itemId":"itm_cccccccccccccccccccccccccccccccc"}}"#,
+                )),
+                false,
+            ),
+        ];
+
+        for (name, provenance, needs_second_source) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+            if needs_second_source {
+                create_ordinary_g1_session(
+                    root.path(),
+                    SESSION_THREE,
+                    &valid_ordinary_conversation(SESSION_THREE),
+                );
+            }
+            create_fork_g1_session(
+                root.path(),
+                SESSION_TWO,
+                SESSION_ONE,
+                "recorded_history",
+                r#"{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}"#,
+                &valid_fork_conversation(SESSION_TWO),
+            );
+            let head = replace_fixture(
+                &fork_g2_head_from(
+                    session_head_archived_g2_fixture(),
+                    SESSION_TWO,
+                    provenance.as_deref(),
+                ),
+                r#""updatedAt":"2026-08-03T10:01:00.456Z"#,
+                r#""updatedAt":"2026-08-03T10:02:00.789Z"#,
+            );
+            create_session_generation(root.path(), SESSION_TWO, GENERATION_TWO, &head, None);
+
+            assert!(
+                matches!(
+                    open(root.path()).await,
+                    Err(DurableOpenError::DurableStateCorrupt)
+                ),
+                "Fork provenance {name} mutation is corrupt"
+            );
+        }
+
+        let ordinary = TempRoot::existing();
+        create_marked_empty_store(ordinary.path());
+        create_valid_g1_agent(ordinary.path());
+        create_valid_g1_session(ordinary.path(), &valid_ordinary_conversation(SESSION_ONE));
+        create_ordinary_g1_session(
+            ordinary.path(),
+            SESSION_TWO,
+            &valid_ordinary_conversation(SESSION_TWO),
+        );
+        let none_to_some = replace_fixture(
+            &replace_fixture(session_head_archived_g2_fixture(), SESSION_ONE, SESSION_TWO),
+            r#""forkProvenance":null"#,
+            &format!(r#""forkProvenance":{original}"#),
+        );
+        create_session_generation(
+            ordinary.path(),
+            SESSION_TWO,
+            GENERATION_TWO,
+            &none_to_some,
+            None,
+        );
+        assert_corrupt(open(ordinary.path()).await);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_g1_metadata_must_be_empty() {
+        for (name, from, to) in [
+            ("name", r#""name":null"#, r#""name":"Fork child"#),
+            (
+                "description",
+                r#""description":null"#,
+                r#""description":"Fork child description"#,
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+            let head = replace_fixture(fork_session_head_fixture(), from, to);
+            let definition = fork_session_definition_fixture();
+            create_exact_g1_session(
+                root.path(),
+                SESSION_TWO,
+                &head,
+                &definition,
+                &valid_fork_conversation(SESSION_TWO),
+            );
+
+            assert!(
+                matches!(
+                    open(root.path()).await,
+                    Err(DurableOpenError::DurableStateCorrupt)
+                ),
+                "Fork G1 {name} must remain null"
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
