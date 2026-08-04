@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::str::FromStr;
 
@@ -26,19 +26,17 @@ use crate::runtime_interface::{
     validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
-use crate::tools::{ToolCallId, ToolName};
 use crate::workspace::{
     RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
     WorkspaceDefinitionSummaryView, WorkspaceRootInput, WorkspaceRootKey, WorkspaceRootSummaryView,
     WorkspaceSourcePolicy,
 };
 
-use super::bounded_json::{JsonNode, public_node_encoded_len};
-use super::lexical::validate_safe_text;
+use super::bounded_json::JsonNode;
 use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
 use super::scalar::{
-    AgentId, AgentMetadataRevision, AgentRevision, CommandId, ItemId, RequestId,
-    SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId,
+    AgentId, AgentRevision, CommandId, ItemId, RequestId, SessionDefinitionRevision, SessionId,
+    SessionMetadataRevision, TurnId,
 };
 use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
@@ -923,8 +921,10 @@ impl SessionSnapshot {
     ) -> Result<Self, TypedJsonError> {
         value.active_items.confirm_empty();
         value.pending_interactions.confirm_empty();
-        if !matches!(value.lifecycle, SessionLifecycleInput::Open)
-            || !matches!(value.load_state, SessionLoadStateInput::Loaded)
+        if !matches!(value.lifecycle, SessionLifecycleInput::Open) {
+            return Err(invalid_scalar());
+        }
+        if !matches!(value.load_state, SessionLoadStateInput::Loaded)
             || !matches!(value.readiness, SessionReadinessInput::Ready)
             || !matches!(value.execution, SessionExecutionInput::Idle)
             || value.current_turn.is_some()
@@ -3746,7 +3746,7 @@ fn validate_event_frame_shape(
         }
         "state" => validate_state_event_shape(data.ok_or_else(missing_required_field)?, limits),
         "progress" => {
-            validate_progress_event_shape(data.ok_or_else(missing_required_field)?, limits)?;
+            validate_progress_event_shape(data.ok_or_else(missing_required_field)?)?;
             Err(TypedJsonError::PendingPublicTarget)
         }
         "closed" => {
@@ -3802,6 +3802,11 @@ fn validate_runtime_snapshot_shape(
     if loaded.len() > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX) {
         return Err(invalid_scalar());
     }
+    let diagnostics_pending =
+        validate_snapshot_diagnostics_shape(required(object, "diagnostics")?)?;
+    if diagnostics_pending {
+        return Err(TypedJsonError::PendingPublicTarget);
+    }
     let mut session_ids = BTreeSet::new();
     for session in loaded {
         let session = session.as_object().ok_or_else(selected_wrong_json_type)?;
@@ -3821,227 +3826,99 @@ fn validate_runtime_snapshot_shape(
         }
         validate_recording(required(session, "recording")?)?;
     }
-    let diagnostics_empty = validate_diagnostics(
-        required(object, "diagnostics")?,
-        limits,
-        DiagnosticScope::Runtime,
-    )?;
-    if diagnostics_empty {
-        Ok(())
-    } else {
-        Err(TypedJsonError::PendingPublicTarget)
-    }
+    Ok(())
 }
 
 fn validate_session_snapshot_shape(
     node: &JsonNode,
     limits: ProtocolLimits,
 ) -> Result<(), TypedJsonError> {
-    let facts = validate_session_snapshot_facts(node, limits)?;
-    if facts.pending {
-        Err(TypedJsonError::PendingPublicTarget)
-    } else {
-        Ok(())
-    }
-}
-
-struct SessionSnapshotShapeFacts {
-    session_id: SessionId,
-    ready: bool,
-    execution: Box<str>,
-    current_turn: Option<CurrentTurnShapeFacts>,
-    current_turn_id: Option<TurnId>,
-    active_items: BTreeMap<ItemId, ActiveItemShapeFacts>,
-    pending_interactions: BTreeMap<RequestId, PendingInteractionShapeFacts>,
-    queue_command_ids: BTreeSet<CommandId>,
-    recording_healthy: bool,
-    pending: bool,
-}
-
-fn validate_session_snapshot_facts(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<SessionSnapshotShapeFacts, TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     let session_id = parse_id(required(object, "sessionId")?)?;
 
-    let mut pending = false;
     let lifecycle = required(object, "lifecycle")?
         .as_str()
         .ok_or_else(typed_wrong_json_type)?;
     match lifecycle {
         "open" => {}
-        "archived" | "deleted" => pending = true,
+        "archived" | "deleted" => return Err(invalid_scalar()),
         _ => return Err(unknown_output_variant()),
     }
+
+    // Known future snapshots are classified from their outer shape only.  Do not
+    // enter the item, interaction, queue, or diagnostic payloads on that path.
+    required(object, "metadata")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    required(object, "definition")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+
+    let load_state = required(object, "loadState")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    let load_pending = match load_state {
+        "loaded" => false,
+        "unloading" => true,
+        _ => return Err(unknown_output_variant()),
+    };
+    let ready = validate_readiness(required(object, "readiness")?)?;
+    let execution = validate_execution(required(object, "execution")?)?;
+
+    let current_turn_pending = match object.get("currentTurn") {
+        None | Some(JsonNode::Null) => false,
+        Some(value) => {
+            value.as_object().ok_or_else(selected_wrong_json_type)?;
+            true
+        }
+    };
+
+    let active_items = required(object, "activeItems")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    let active_items_pending = !active_items.is_empty();
+
+    let pending_interactions = required(object, "pendingInteractions")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    let pending_interactions_pending = !pending_interactions.is_empty();
+
+    let queues_pending = validate_session_queues_shape(required(object, "queues")?)?;
+    let recording_healthy = validate_recording(required(object, "recording")?)?;
+    let recording_pending = !recording_healthy;
+    let diagnostics_pending =
+        validate_snapshot_diagnostics_shape(required(object, "diagnostics")?)?;
+
+    let other_fields_pending = load_pending
+        || !ready
+        || execution != "idle"
+        || current_turn_pending
+        || active_items_pending
+        || pending_interactions_pending
+        || queues_pending
+        || recording_pending
+        || diagnostics_pending;
+    let usage_pending = match object.get("usage") {
+        None | Some(JsonNode::Null) => false,
+        Some(usage) if other_fields_pending => {
+            usage.as_object().ok_or_else(selected_wrong_json_type)?;
+            true
+        }
+        Some(usage) => validate_session_usage_shape(usage)?,
+    };
+
+    if other_fields_pending || usage_pending {
+        return Err(TypedJsonError::PendingPublicTarget);
+    }
+
+    // The loaded-ready-idle candidate remains owned by the semantic model.
     validate_session_metadata(required(object, "metadata")?, limits)?;
     let definition_session_id =
         validate_session_definition_summary(required(object, "definition")?, limits)?;
     if definition_session_id != session_id {
         return Err(invalid_scalar());
     }
-    let load_state = required(object, "loadState")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    match load_state {
-        "loaded" => {}
-        "unloading" => pending = true,
-        _ => return Err(unknown_output_variant()),
-    }
-    if lifecycle != "open" {
-        return Err(invalid_scalar());
-    }
-    let ready = validate_readiness(required(object, "readiness")?)?;
-    if !ready {
-        pending = true;
-    }
-    let execution = validate_execution(required(object, "execution")?)?;
-    if execution != "idle" {
-        pending = true;
-    }
-    let mut current_turn = None;
-    if let Some(current_turn_node) = object.get("currentTurn") {
-        if !matches!(current_turn_node, JsonNode::Null) {
-            current_turn = Some(validate_current_turn(current_turn_node)?);
-            pending = true;
-        }
-    }
-    let current_turn_id = current_turn.as_ref().map(|facts| facts.turn_id);
-    if matches!(execution, "idle" | "starting") != current_turn_id.is_none() {
-        return Err(invalid_scalar());
-    }
-    if execution == "running"
-        && current_turn
-            .as_ref()
-            .is_some_and(|facts| facts.terminal.is_some())
-    {
-        return Err(invalid_scalar());
-    }
-    let active_items = required(object, "activeItems")?
-        .as_array()
-        .ok_or_else(selected_wrong_json_type)?;
-    if active_items.len() > usize::from(limits.observation.max_active_items) {
-        return Err(invalid_scalar());
-    }
-    let mut active_items_by_id = BTreeMap::new();
-    let mut input_messages = 0_usize;
-    let mut first_item_is_input = false;
-    let mut has_final_agent_message = false;
-    for (index, item) in active_items.iter().enumerate() {
-        let item = validate_pending_item_identity(item, limits)?;
-        if current_turn_id != Some(item.turn_id) {
-            return Err(invalid_scalar());
-        }
-        let is_input = item.user_source == Some(UserMessageSourceFacts::Input);
-        let is_final = item.agent_disposition == Some(AgentDispositionFacts::Final);
-        if active_items_by_id.insert(item.item_id, item).is_some() {
-            return Err(duplicate_value());
-        }
-        if is_input {
-            input_messages = input_messages.saturating_add(1);
-            first_item_is_input |= index == 0;
-        }
-        has_final_agent_message |= is_final;
-        pending = true;
-    }
-    if current_turn.is_some() && (input_messages != 1 || !first_item_is_input) {
-        return Err(invalid_scalar());
-    }
-    let turn_completed = current_turn
-        .as_ref()
-        .and_then(|turn| turn.terminal.as_ref())
-        .is_some_and(|terminal| terminal.kind == TerminalKind::Completed);
-    if has_final_agent_message && !turn_completed {
-        return Err(invalid_scalar());
-    }
-    let interactions = required(object, "pendingInteractions")?
-        .as_array()
-        .ok_or_else(selected_wrong_json_type)?;
-    if interactions.len() > usize::from(limits.observation.max_pending_interactions) {
-        return Err(invalid_scalar());
-    }
-    let mut pending_interactions = BTreeMap::new();
-    for interaction in interactions {
-        let identity = validate_pending_interaction_identity(interaction, limits)?;
-        let Some(item) = active_items_by_id.get(&identity.item_id) else {
-            return Err(invalid_scalar());
-        };
-        let matching_tool = item.status == ItemStatusFacts::Started
-            && item.family == ItemFamilyFacts::ToolInvocation
-            && match identity.family {
-                InteractionRequestFamilyFacts::ToolApproval => item.tool_name == identity.tool_name,
-                InteractionRequestFamilyFacts::UserQuestion => item
-                    .tool_name
-                    .as_ref()
-                    .is_some_and(|tool_name| tool_name.as_str() == "ask_user"),
-            };
-        let matching_phase = current_turn.as_ref().is_some_and(|turn| {
-            turn.phase
-                == Some(match identity.family {
-                    InteractionRequestFamilyFacts::ToolApproval => TurnPhaseFacts::WaitingApproval,
-                    InteractionRequestFamilyFacts::UserQuestion => {
-                        TurnPhaseFacts::WaitingForUserInput
-                    }
-                })
-        });
-        if current_turn_id != Some(identity.turn_id) || !matching_tool || !matching_phase {
-            return Err(invalid_scalar());
-        }
-        if pending_interactions
-            .insert(identity.request_id, identity)
-            .is_some()
-        {
-            return Err(duplicate_value());
-        }
-        pending = true;
-    }
-    let queues = validate_session_queues(
-        required(object, "queues")?,
-        limits,
-        execution,
-        current_turn_id,
-    )?;
-    if !queues.minimal {
-        pending = true;
-    }
-    let cleaned_up = execution == "idle"
-        && current_turn_id.is_none()
-        && active_items_by_id.is_empty()
-        && pending_interactions.is_empty()
-        && queues.empty;
-    if (!ready || load_state == "unloading") && (!cleaned_up || queues.accepting) {
-        return Err(invalid_scalar());
-    }
-    let recording_healthy = validate_recording(required(object, "recording")?)?;
-    if !recording_healthy {
-        pending = true;
-    }
-    if let Some(usage) = object.get("usage") {
-        if !matches!(usage, JsonNode::Null) && !validate_session_usage(usage)? {
-            pending = true;
-        }
-    }
-    let diagnostics = required(object, "diagnostics")?;
-    if !validate_diagnostics(diagnostics, limits, DiagnosticScope::Session)? {
-        pending = true;
-    }
-    if (!recording_healthy && !has_current_recording_diagnostic(diagnostics)?)
-        || (recording_healthy && has_recording_diagnostic(diagnostics)?)
-    {
-        return Err(invalid_scalar());
-    }
-    Ok(SessionSnapshotShapeFacts {
-        session_id,
-        ready,
-        execution: execution.into(),
-        current_turn,
-        current_turn_id,
-        active_items: active_items_by_id,
-        pending_interactions,
-        queue_command_ids: queues.command_ids,
-        recording_healthy,
-        pending,
-    })
+    Ok(())
 }
 
 fn validate_session_metadata(
@@ -4255,930 +4132,39 @@ fn validate_recording(node: &JsonNode) -> Result<bool, TypedJsonError> {
     }
 }
 
-#[derive(Clone)]
-struct CurrentTurnShapeFacts {
-    turn_id: TurnId,
-    terminal: Option<TerminalCorrelationFacts>,
-    phase: Option<TurnPhaseFacts>,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum TurnPhaseFacts {
-    Sampling,
-    RetryBackoff,
-    Compacting,
-    WaitingApproval,
-    WaitingForUserInput,
-    ExecutingTools,
-}
-
-fn validate_current_turn(node: &JsonNode) -> Result<CurrentTurnShapeFacts, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let turn_id = parse_id(required(object, "turnId")?)?;
-    let mut terminal = None;
-    validate_adjacent_output(required(object, "status")?, |kind, data| match kind {
-        "running" => {
-            if data.is_some() {
-                Err(selected_wrong_json_type())
-            } else {
-                Ok(())
-            }
-        }
-        "completed" | "interrupted" | "failed" => {
-            let data = data
-                .ok_or_else(missing_required_field)?
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?;
-            let completed_at = required(data, "completedAt")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<Timestamp>()
-                .map_err(|_| invalid_scalar())?;
-            let (kind, reason) = match kind {
-                "completed" => (TerminalKind::Completed, None),
-                "failed" => {
-                    let reason = required(data, "reason")?
-                        .as_str()
-                        .ok_or_else(typed_wrong_json_type)?;
-                    validate_turn_failure(required(data, "reason")?)?;
-                    (TerminalKind::Failed, Some(Box::<str>::from(reason)))
-                }
-                "interrupted" => {
-                    let reason = required(data, "reason")?
-                        .as_str()
-                        .ok_or_else(typed_wrong_json_type)?;
-                    validate_turn_interruption(required(data, "reason")?)?;
-                    (TerminalKind::Interrupted, Some(Box::<str>::from(reason)))
-                }
-                _ => unreachable!(),
-            };
-            terminal = Some(TerminalCorrelationFacts {
-                kind,
-                completed_at,
-                reason,
-            });
-            Ok(())
-        }
-        _ => Err(unknown_output_variant()),
-    })?;
-    let mut phase = None;
-    if let Some(phase_node) = object.get("phase") {
-        if !matches!(phase_node, JsonNode::Null) {
-            phase = Some(
-                match phase_node.as_str().ok_or_else(typed_wrong_json_type)? {
-                    "sampling" => TurnPhaseFacts::Sampling,
-                    "retry_backoff" => TurnPhaseFacts::RetryBackoff,
-                    "compacting" => TurnPhaseFacts::Compacting,
-                    "waiting_approval" => TurnPhaseFacts::WaitingApproval,
-                    "waiting_for_user_input" => TurnPhaseFacts::WaitingForUserInput,
-                    "executing_tools" => TurnPhaseFacts::ExecutingTools,
-                    _ => return Err(unknown_output_variant()),
-                },
-            );
-        }
-    }
-    if terminal.is_some() == phase.is_some() {
-        return Err(invalid_scalar());
-    }
-    required(object, "startedAt")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?
-        .parse::<Timestamp>()
-        .map_err(|_| invalid_scalar())?;
-    Ok(CurrentTurnShapeFacts {
-        turn_id,
-        terminal,
-        phase,
-    })
-}
-
-fn validate_pending_item_identity(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<ActiveItemShapeFacts, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let item_id = parse_id(required(object, "itemId")?)?;
-    let turn_id = parse_id(required(object, "turnId")?)?;
-    let status = match required(object, "status")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?
-    {
-        "started" => ItemStatusFacts::Started,
-        "completed" => ItemStatusFacts::Completed,
-        "abandoned" => ItemStatusFacts::Abandoned,
-        _ => return Err(unknown_output_variant()),
-    };
-    let content = validate_adjacent_output(required(object, "content")?, |kind, data| {
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        validate_pending_item_content(kind, data, limits)
-    })?;
-    let valid_status = match content.family {
-        ItemFamilyFacts::ToolInvocation => match status {
-            ItemStatusFacts::Started | ItemStatusFacts::Abandoned => !content.tool_result,
-            ItemStatusFacts::Completed => content.tool_result,
-        },
-        ItemFamilyFacts::UserMessage
-        | ItemFamilyFacts::AgentMessage
-        | ItemFamilyFacts::Reasoning => status == ItemStatusFacts::Completed,
-    };
-    if !valid_status {
-        return Err(invalid_scalar());
-    }
-    required(object, "createdAt")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?
-        .parse::<Timestamp>()
-        .map_err(|_| invalid_scalar())?;
-    let completed = match object.get("completedAt") {
-        Some(JsonNode::Null) | None => false,
-        Some(completed_at) => {
-            completed_at
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<Timestamp>()
-                .map_err(|_| invalid_scalar())?;
-            true
-        }
-    };
-    if (status == ItemStatusFacts::Started) == completed {
-        return Err(invalid_scalar());
-    }
-    let projection = project_pending_item(object)?;
-    if public_node_encoded_len(&projection).ok_or_else(invalid_scalar)?
-        > usize::try_from(limits.observation.max_item_view_bytes).unwrap_or(usize::MAX)
-    {
-        return Err(invalid_scalar());
-    }
-    Ok(ActiveItemShapeFacts {
-        turn_id,
-        item_id,
-        projection,
-        status,
-        family: content.family,
-        tool_name: content.tool_name,
-        user_source: content.user_source,
-        agent_disposition: content.agent_disposition,
-    })
-}
-
-fn project_pending_item(object: &BTreeMap<Box<str>, JsonNode>) -> Result<JsonNode, TypedJsonError> {
-    let content = required(object, "content")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let kind = required(content, "type")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    let data = required(content, "data")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let projected_data = match kind {
-        "user_message" => json_node_object(vec![
-            ("source", required(data, "source")?.clone()),
-            ("body", optional_node(data.get("body"))),
-            (
-                "contributions",
-                JsonNode::Array(
-                    required(data, "contributions")?
-                        .as_array()
-                        .ok_or_else(selected_wrong_json_type)?
-                        .iter()
-                        .map(project_prompt_contribution_origin)
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-            ),
-        ]),
-        "agent_message" => json_node_object(vec![
-            ("disposition", required(data, "disposition")?.clone()),
-            ("text", required(data, "text")?.clone()),
-        ]),
-        "reasoning" => json_node_object(vec![("summaries", required(data, "summaries")?.clone())]),
-        "tool_invocation" => {
-            let result = match data.get("result") {
-                Some(result) if !matches!(result, JsonNode::Null) => {
-                    let result = result.as_object().ok_or_else(selected_wrong_json_type)?;
-                    json_node_object(vec![
-                        ("disposition", required(result, "disposition")?.clone()),
-                        ("summary", required(result, "summary")?.clone()),
-                    ])
-                }
-                _ => JsonNode::Null,
-            };
-            json_node_object(vec![
-                ("toolCallId", required(data, "toolCallId")?.clone()),
-                ("toolName", required(data, "toolName")?.clone()),
-                (
-                    "argumentsSummary",
-                    required(data, "argumentsSummary")?.clone(),
-                ),
-                ("result", result),
-            ])
-        }
-        _ => return Err(unknown_output_variant()),
-    };
-    Ok(json_node_object(vec![
-        ("itemId", required(object, "itemId")?.clone()),
-        ("turnId", required(object, "turnId")?.clone()),
-        ("status", required(object, "status")?.clone()),
-        (
-            "content",
-            json_node_object(vec![
-                ("type", JsonNode::String(kind.into())),
-                ("data", projected_data),
-            ]),
-        ),
-        ("createdAt", required(object, "createdAt")?.clone()),
-        ("completedAt", optional_node(object.get("completedAt"))),
-    ]))
-}
-
-fn project_prompt_contribution_origin(node: &JsonNode) -> Result<JsonNode, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let kind = required(object, "type")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    let data = required(object, "data")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let projected = match kind {
-        "skill" => json_node_object(vec![("skillId", required(data, "skillId")?.clone())]),
-        "workspace" => json_node_object(vec![
-            ("rootKey", required(data, "rootKey")?.clone()),
-            (
-                "relativeLocation",
-                required(data, "relativeLocation")?.clone(),
-            ),
-        ]),
-        _ => return Err(unknown_output_variant()),
-    };
-    Ok(json_node_object(vec![
-        ("type", JsonNode::String(kind.into())),
-        ("data", projected),
-    ]))
-}
-
-fn optional_node(node: Option<&JsonNode>) -> JsonNode {
-    match node {
-        Some(value) if !matches!(value, JsonNode::Null) => value.clone(),
-        Some(_) | None => JsonNode::Null,
-    }
-}
-
-fn json_node_object(fields: Vec<(&str, JsonNode)>) -> JsonNode {
-    JsonNode::Object(
-        fields
-            .into_iter()
-            .map(|(field, value)| (Box::<str>::from(field), value))
-            .collect(),
-    )
-}
-
-fn validate_pending_item_content(
-    kind: &str,
-    data: &std::collections::BTreeMap<Box<str>, JsonNode>,
-    limits: ProtocolLimits,
-) -> Result<PendingItemContentFacts, TypedJsonError> {
-    let maximum = usize::try_from(limits.observation.max_item_view_bytes).unwrap_or(usize::MAX);
-    match kind {
-        "user_message" => {
-            let source = match required(data, "source")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-            {
-                "input" => UserMessageSourceFacts::Input,
-                "steer" => UserMessageSourceFacts::Steer,
-                _ => return Err(unknown_output_variant()),
-            };
-            let body_parts = match data.get("body") {
-                Some(body) if !matches!(body, JsonNode::Null) => {
-                    let body = body.as_str().ok_or_else(typed_wrong_json_type)?;
-                    let part_maximum =
-                        usize::try_from(limits.prompt.max_message_part_bytes).unwrap_or(usize::MAX);
-                    validate_safe_text(body, part_maximum, false).map_err(|_| invalid_scalar())?;
-                    if body.len()
-                        > usize::try_from(limits.prompt.max_user_message_bytes)
-                            .unwrap_or(usize::MAX)
-                    {
-                        return Err(invalid_scalar());
-                    }
-                    1_usize
-                }
-                Some(_) | None => 0_usize,
-            };
-            let contributions = required(data, "contributions")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?;
-            let part_count = body_parts
-                .checked_add(contributions.len())
-                .ok_or_else(invalid_scalar)?;
-            if part_count == 0 || part_count > usize::from(limits.prompt.max_user_message_parts) {
-                return Err(invalid_scalar());
-            }
-            let mut origins = BTreeSet::new();
-            for contribution in contributions {
-                if !origins.insert(validate_prompt_contribution_origin(contribution, limits)?) {
-                    return Err(duplicate_value());
-                }
-            }
-            Ok(PendingItemContentFacts {
-                family: ItemFamilyFacts::UserMessage,
-                tool_result: false,
-                tool_name: None,
-                user_source: Some(source),
-                agent_disposition: None,
-            })
-        }
-        "agent_message" => {
-            let disposition = match required(data, "disposition")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-            {
-                "intermediate" => AgentDispositionFacts::Intermediate,
-                "final" => AgentDispositionFacts::Final,
-                _ => return Err(unknown_output_variant()),
-            };
-            validate_safe_string_array(required(data, "text")?, maximum)?;
-            Ok(PendingItemContentFacts {
-                family: ItemFamilyFacts::AgentMessage,
-                tool_result: false,
-                tool_name: None,
-                user_source: None,
-                agent_disposition: Some(disposition),
-            })
-        }
-        "reasoning" => {
-            validate_safe_string_array(required(data, "summaries")?, maximum)?;
-            Ok(PendingItemContentFacts::non_tool(
-                ItemFamilyFacts::Reasoning,
-            ))
-        }
-        "tool_invocation" => {
-            required(data, "toolCallId")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<ToolCallId>()
-                .map_err(|_| invalid_scalar())?;
-            let tool_name = required(data, "toolName")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<ToolName>()
-                .map_err(|_| invalid_scalar())?;
-            validate_safe_string(
-                required(data, "argumentsSummary")?,
-                usize::try_from(limits.text.max_public_summary_bytes).unwrap_or(usize::MAX),
-                false,
-            )?;
-            let mut tool_result = false;
-            if let Some(result) = data.get("result") {
-                if !matches!(result, JsonNode::Null) {
-                    tool_result = true;
-                    let result = result.as_object().ok_or_else(selected_wrong_json_type)?;
-                    match required(result, "disposition")?
-                        .as_str()
-                        .ok_or_else(typed_wrong_json_type)?
-                    {
-                        "succeeded" | "failed" | "denied" | "cancelled" => {}
-                        _ => return Err(unknown_output_variant()),
-                    }
-                    validate_safe_string(
-                        required(result, "summary")?,
-                        usize::try_from(limits.text.max_public_summary_bytes).unwrap_or(usize::MAX),
-                        true,
-                    )?;
-                }
-            }
-            Ok(PendingItemContentFacts {
-                family: ItemFamilyFacts::ToolInvocation,
-                tool_result,
-                tool_name: Some(tool_name),
-                user_source: None,
-                agent_disposition: None,
-            })
-        }
-        _ => Err(unknown_output_variant()),
-    }
-}
-
-fn validate_prompt_contribution_origin(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<PromptContributionIdentityFacts, TypedJsonError> {
-    validate_adjacent_output(node, |kind, data| {
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        match kind {
-            "skill" => {
-                let skill_id = required(data, "skillId")?
-                    .as_str()
-                    .ok_or_else(typed_wrong_json_type)?;
-                skill_id.parse::<SkillId>().map_err(|_| invalid_scalar())?;
-                Ok(PromptContributionIdentityFacts::Skill(skill_id.into()))
-            }
-            "workspace" => {
-                let root_key = required(data, "rootKey")?
-                    .as_str()
-                    .ok_or_else(typed_wrong_json_type)?;
-                root_key
-                    .parse::<WorkspaceRootKey>()
-                    .map_err(|_| invalid_scalar())?;
-                let relative_value = required(data, "relativeLocation")?
-                    .as_str()
-                    .ok_or_else(typed_wrong_json_type)?;
-                let relative = relative_value
-                    .parse::<WorkspaceRelativePath>()
-                    .map_err(|_| invalid_scalar())?;
-                validate_workspace_relative_limits(&relative, limits)?;
-                Ok(PromptContributionIdentityFacts::Workspace(
-                    root_key.into(),
-                    relative_value.into(),
-                ))
-            }
-            _ => Err(unknown_output_variant()),
-        }
-    })
-}
-
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
-enum PromptContributionIdentityFacts {
-    Skill(Box<str>),
-    Workspace(Box<str>, Box<str>),
-}
-
-fn validate_workspace_relative_limits(
-    relative: &WorkspaceRelativePath,
-    limits: ProtocolLimits,
-) -> Result<(), TypedJsonError> {
-    let value = relative.as_str();
-    if value.len() > usize::try_from(limits.workspace.max_relative_path_bytes).unwrap_or(usize::MAX)
-        || (!value.is_empty()
-            && value.split('/').count() > usize::from(limits.workspace.max_relative_path_segments))
-    {
-        Err(invalid_scalar())
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_safe_string_array(node: &JsonNode, maximum: usize) -> Result<(), TypedJsonError> {
-    let values = node.as_array().ok_or_else(selected_wrong_json_type)?;
-    for value in values {
-        validate_safe_string(value, maximum, true)?;
-    }
-    Ok(())
-}
-
-fn validate_pending_interaction_identity(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<PendingInteractionShapeFacts, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let request_id = parse_id(required(object, "requestId")?)?;
-    let turn_id = parse_id(required(object, "turnId")?)?;
-    let item_id = parse_id(required(object, "itemId")?)?;
-    let request = validate_adjacent_output(required(object, "request")?, |kind, data| {
-        if !matches!(kind, "tool_approval" | "user_question") {
-            return Err(unknown_output_variant());
-        }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        validate_pending_interaction_request(kind, data, limits)
-    })?;
-    let projection = project_pending_interaction(object)?;
-    if public_node_encoded_len(&projection).ok_or_else(invalid_scalar)?
-        > usize::try_from(limits.interaction.max_interaction_view_bytes).unwrap_or(usize::MAX)
-    {
-        return Err(invalid_scalar());
-    }
-    Ok(PendingInteractionShapeFacts {
-        request_id,
-        turn_id,
-        item_id,
-        family: request.family,
-        tool_name: request.tool_name,
-    })
-}
-
-#[derive(Clone, Copy)]
-enum InteractionRequestFamilyFacts {
-    ToolApproval,
-    UserQuestion,
-}
-
-struct PendingInteractionRequestFacts {
-    family: InteractionRequestFamilyFacts,
-    tool_name: Option<ToolName>,
-}
-
-struct PendingInteractionShapeFacts {
-    request_id: RequestId,
-    turn_id: TurnId,
-    item_id: ItemId,
-    family: InteractionRequestFamilyFacts,
-    tool_name: Option<ToolName>,
-}
-
-fn project_pending_interaction(
-    object: &BTreeMap<Box<str>, JsonNode>,
-) -> Result<JsonNode, TypedJsonError> {
-    let request = required(object, "request")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let kind = required(request, "type")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    let data = required(request, "data")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let request_data = match kind {
-        "tool_approval" => {
-            let options = required(data, "options")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?
-                .iter()
-                .map(|option| {
-                    let option = option.as_object().ok_or_else(selected_wrong_json_type)?;
-                    Ok(json_node_object(vec![
-                        ("optionIndex", required(option, "optionIndex")?.clone()),
-                        ("kind", required(option, "kind")?.clone()),
-                        ("label", required(option, "label")?.clone()),
-                        (
-                            "effectiveRequirements",
-                            project_requirement_summary(required(
-                                option,
-                                "effectiveRequirements",
-                            )?)?,
-                        ),
-                    ]))
-                })
-                .collect::<Result<Vec<_>, TypedJsonError>>()?;
-            json_node_object(vec![
-                ("toolName", required(data, "toolName")?.clone()),
-                (
-                    "argumentsSummary",
-                    required(data, "argumentsSummary")?.clone(),
-                ),
-                ("reason", required(data, "reason")?.clone()),
-                (
-                    "requirements",
-                    project_requirement_summary(required(data, "requirements")?)?,
-                ),
-                ("options", JsonNode::Array(options)),
-            ])
-        }
-        "user_question" => {
-            let questions = required(data, "questions")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?
-                .iter()
-                .map(|question| {
-                    let question = question.as_object().ok_or_else(selected_wrong_json_type)?;
-                    Ok(json_node_object(vec![
-                        (
-                            "questionIndex",
-                            required(question, "questionIndex")?.clone(),
-                        ),
-                        ("prompt", required(question, "prompt")?.clone()),
-                        ("required", required(question, "required")?.clone()),
-                        (
-                            "input",
-                            project_question_input(required(question, "input")?)?,
-                        ),
-                    ]))
-                })
-                .collect::<Result<Vec<_>, TypedJsonError>>()?;
-            json_node_object(vec![
-                ("title", optional_node(data.get("title"))),
-                ("questions", JsonNode::Array(questions)),
-            ])
-        }
-        _ => return Err(unknown_output_variant()),
-    };
-    Ok(json_node_object(vec![
-        ("requestId", required(object, "requestId")?.clone()),
-        ("turnId", required(object, "turnId")?.clone()),
-        ("itemId", required(object, "itemId")?.clone()),
-        (
-            "request",
-            json_node_object(vec![
-                ("type", JsonNode::String(kind.into())),
-                ("data", request_data),
-            ]),
-        ),
-    ]))
-}
-
-fn project_requirement_summary(node: &JsonNode) -> Result<JsonNode, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    Ok(json_node_object(vec![
-        ("filesystem", optional_node(object.get("filesystem"))),
-        ("network", optional_node(object.get("network"))),
-        ("process", optional_node(object.get("process"))),
-    ]))
-}
-
-fn project_question_input(node: &JsonNode) -> Result<JsonNode, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let kind = required(object, "type")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    let data = required(object, "data")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let data = match kind {
-        "text" => json_node_object(vec![("multiline", required(data, "multiline")?.clone())]),
-        "single_choice" => {
-            let options = required(data, "options")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?
-                .iter()
-                .map(|option| {
-                    let option = option.as_object().ok_or_else(selected_wrong_json_type)?;
-                    Ok(json_node_object(vec![
-                        ("optionIndex", required(option, "optionIndex")?.clone()),
-                        ("label", required(option, "label")?.clone()),
-                    ]))
-                })
-                .collect::<Result<Vec<_>, TypedJsonError>>()?;
-            json_node_object(vec![("options", JsonNode::Array(options))])
-        }
-        _ => return Err(unknown_output_variant()),
-    };
-    Ok(json_node_object(vec![
-        ("type", JsonNode::String(kind.into())),
-        ("data", data),
-    ]))
-}
-
-fn validate_pending_interaction_request(
-    kind: &str,
-    data: &std::collections::BTreeMap<Box<str>, JsonNode>,
-    limits: ProtocolLimits,
-) -> Result<PendingInteractionRequestFacts, TypedJsonError> {
-    match kind {
-        "tool_approval" => {
-            let tool_name = required(data, "toolName")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<ToolName>()
-                .map_err(|_| invalid_scalar())?;
-            validate_safe_string(
-                required(data, "argumentsSummary")?,
-                usize::try_from(limits.text.max_public_summary_bytes).unwrap_or(usize::MAX),
-                false,
-            )?;
-            validate_safe_string(
-                required(data, "reason")?,
-                usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
-                false,
-            )?;
-            validate_requirement_summary(required(data, "requirements")?, limits)?;
-            let options = required(data, "options")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?;
-            if options.is_empty()
-                || options.len() > usize::from(limits.interaction.max_tool_approval_options)
-            {
-                return Err(invalid_scalar());
-            }
-            for (expected_index, option) in options.iter().enumerate() {
-                let option = option.as_object().ok_or_else(selected_wrong_json_type)?;
-                let index = validate_u32_value(required(option, "optionIndex")?)?;
-                if usize::try_from(index).ok() != Some(expected_index) {
-                    return Err(invalid_scalar());
-                }
-                match required(option, "kind")?
-                    .as_str()
-                    .ok_or_else(typed_wrong_json_type)?
-                {
-                    "as_requested" | "restricted" => {}
-                    _ => return Err(unknown_output_variant()),
-                }
-                validate_safe_string(
-                    required(option, "label")?,
-                    usize::from(limits.text.max_display_name_bytes),
-                    false,
-                )?;
-                validate_requirement_summary(required(option, "effectiveRequirements")?, limits)?;
-            }
-            Ok(PendingInteractionRequestFacts {
-                family: InteractionRequestFamilyFacts::ToolApproval,
-                tool_name: Some(tool_name),
-            })
-        }
-        "user_question" => {
-            validate_optional_safe_string(
-                data.get("title"),
-                usize::from(limits.text.max_display_name_bytes),
-            )?;
-            let questions = required(data, "questions")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?;
-            if questions.is_empty()
-                || questions.len() > usize::from(limits.interaction.max_interaction_questions)
-            {
-                return Err(invalid_scalar());
-            }
-            let mut previous_index = None;
-            for question in questions {
-                let question = question.as_object().ok_or_else(selected_wrong_json_type)?;
-                let index = validate_u32_value(required(question, "questionIndex")?)?;
-                if previous_index.is_some_and(|previous| index <= previous) {
-                    return Err(invalid_scalar());
-                }
-                previous_index = Some(index);
-                validate_safe_string(
-                    required(question, "prompt")?,
-                    usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
-                    false,
-                )?;
-                if !matches!(required(question, "required")?, JsonNode::Bool(_)) {
-                    return Err(typed_wrong_json_type());
-                }
-                validate_question_input(required(question, "input")?, limits)?;
-            }
-            Ok(PendingInteractionRequestFacts {
-                family: InteractionRequestFamilyFacts::UserQuestion,
-                tool_name: None,
-            })
-        }
-        _ => Err(unknown_output_variant()),
-    }
-}
-
-fn validate_requirement_summary(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<(), TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    for field in ["filesystem", "network", "process"] {
-        if let Some(value) = object.get(field) {
-            if !matches!(value, JsonNode::Null) {
-                validate_safe_string(
-                    value,
-                    usize::try_from(limits.text.max_public_summary_bytes).unwrap_or(usize::MAX),
-                    false,
-                )?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_question_input(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
-    validate_adjacent_output(node, |kind, data| match kind {
-        "text" => {
-            let data = data
-                .ok_or_else(missing_required_field)?
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?;
-            if matches!(required(data, "multiline")?, JsonNode::Bool(_)) {
-                Ok(())
-            } else {
-                Err(typed_wrong_json_type())
-            }
-        }
-        "single_choice" => {
-            let data = data
-                .ok_or_else(missing_required_field)?
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?;
-            let options = required(data, "options")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?;
-            if options.is_empty()
-                || options.len() > usize::from(limits.interaction.max_choices_per_question)
-            {
-                return Err(invalid_scalar());
-            }
-            let mut previous_index = None;
-            for option in options {
-                let option = option.as_object().ok_or_else(selected_wrong_json_type)?;
-                let index = validate_u32_value(required(option, "optionIndex")?)?;
-                if previous_index.is_some_and(|previous| index <= previous) {
-                    return Err(invalid_scalar());
-                }
-                previous_index = Some(index);
-                validate_safe_string(
-                    required(option, "label")?,
-                    usize::from(limits.text.max_display_name_bytes),
-                    false,
-                )?;
-            }
-            Ok(())
-        }
-        _ => Err(unknown_output_variant()),
-    })
-}
-
-fn validate_safe_string(
-    node: &JsonNode,
-    maximum: usize,
-    allow_empty: bool,
-) -> Result<(), TypedJsonError> {
-    let value = node.as_str().ok_or_else(typed_wrong_json_type)?;
-    validate_safe_text(value, maximum, allow_empty).map_err(|_| invalid_scalar())
-}
-
-struct QueueShapeFacts {
-    minimal: bool,
-    empty: bool,
-    accepting: bool,
-    command_ids: BTreeSet<CommandId>,
-}
-
-fn validate_session_queues(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-    execution: &str,
-    current_turn_id: Option<TurnId>,
-) -> Result<QueueShapeFacts, TypedJsonError> {
+fn validate_session_queues_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     let submit = required(object, "submitAdmissions")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    if submit.len() > usize::from(limits.queues.max_submit_admissions) {
-        return Err(invalid_scalar());
-    }
-    let mut command_ids = BTreeSet::new();
-    let mut starting = 0_usize;
-    for (index, value) in submit.iter().enumerate() {
-        let value = value.as_object().ok_or_else(selected_wrong_json_type)?;
-        let command_id: CommandId = parse_id(required(value, "commandId")?)?;
-        if !command_ids.insert(command_id) {
-            return Err(duplicate_value());
-        }
-        match required(value, "state")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-        {
-            "queued" => {}
-            "starting" if index == 0 => starting = starting.saturating_add(1),
-            "starting" => return Err(invalid_scalar()),
-            _ => return Err(unknown_output_variant()),
-        }
-    }
-    if starting > 1 {
-        return Err(invalid_scalar());
-    }
-    if (execution == "starting") != (starting == 1) {
-        return Err(invalid_scalar());
-    }
     let steers = required(object, "steers")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    if steers.len() > usize::from(limits.queues.max_steers) {
-        return Err(invalid_scalar());
-    }
-    for value in steers {
-        let value = value.as_object().ok_or_else(selected_wrong_json_type)?;
-        let command_id: CommandId = parse_id(required(value, "commandId")?)?;
-        if !command_ids.insert(command_id) {
-            return Err(duplicate_value());
-        }
-        let expected_turn_id = parse_id(required(value, "expectedTurnId")?)?;
-        if current_turn_id != Some(expected_turn_id) {
-            return Err(invalid_scalar());
-        }
-    }
     let follow_ups = required(object, "followUps")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    if follow_ups.len() > usize::from(limits.queues.max_follow_ups) {
-        return Err(invalid_scalar());
-    }
-    for value in follow_ups {
-        let value = value.as_object().ok_or_else(selected_wrong_json_type)?;
-        let command_id: CommandId = parse_id(required(value, "commandId")?)?;
-        if !command_ids.insert(command_id) {
-            return Err(duplicate_value());
-        }
-    }
     let accepting = match required(object, "acceptingInput")? {
         JsonNode::Bool(value) => *value,
         _ => return Err(typed_wrong_json_type()),
     };
-    Ok(QueueShapeFacts {
-        minimal: submit.is_empty() && steers.is_empty() && follow_ups.is_empty() && accepting,
-        empty: submit.is_empty() && steers.is_empty() && follow_ups.is_empty(),
-        accepting,
-        command_ids,
-    })
+    Ok(!submit.is_empty() || !steers.is_empty() || !follow_ups.is_empty() || !accepting)
 }
 
-fn validate_session_usage(node: &JsonNode) -> Result<bool, TypedJsonError> {
+fn validate_session_usage_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     let model_calls = validate_canonical_u64(required(object, "modelCalls")?)?;
-    let compaction_calls = validate_canonical_u64(required(object, "compactionCalls")?)?;
-    if model_calls > 1_000_000 || compaction_calls > 1_000_000 {
-        return Err(invalid_scalar());
+    if model_calls != 0 {
+        return Ok(true);
     }
-    let mut has_tokens = false;
+
+    let compaction_calls = object
+        .get("compactionCalls")
+        .map(validate_canonical_u64)
+        .transpose()?;
+    if compaction_calls.is_some_and(|value| value != 0) {
+        return Ok(true);
+    }
+
     for field in [
         "inputTokens",
         "outputTokens",
@@ -5188,36 +4174,26 @@ fn validate_session_usage(node: &JsonNode) -> Result<bool, TypedJsonError> {
     ] {
         if let Some(value) = object.get(field) {
             if !matches!(value, JsonNode::Null) {
-                validate_canonical_u64(value)?;
-                has_tokens = true;
+                return Ok(true);
             }
         }
     }
-    let costs = required(object, "reportedCosts")?
-        .as_array()
-        .ok_or_else(selected_wrong_json_type)?;
-    if costs.len() > 8 {
-        return Err(invalid_scalar());
+    if let Some(reported_costs) = object.get("reportedCosts") {
+        if !reported_costs
+            .as_array()
+            .ok_or_else(selected_wrong_json_type)?
+            .is_empty()
+        {
+            return Ok(true);
+        }
     }
-    let mut currencies = Vec::with_capacity(costs.len());
-    for cost in costs {
-        let cost = cost.as_object().ok_or_else(selected_wrong_json_type)?;
-        required(cost, "amount")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<super::MoneyAmount>()
-            .map_err(|_| invalid_scalar())?;
-        let currency = required(cost, "currency")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<super::CurrencyCode>()
-            .map_err(|_| invalid_scalar())?;
-        currencies.push(currency);
+    if compaction_calls.is_none() {
+        return Err(missing_required_field());
     }
-    if currencies.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(invalid_scalar());
+    if object.get("reportedCosts").is_none() {
+        return Err(missing_required_field());
     }
-    Ok(model_calls == 0 && compaction_calls == 0 && !has_tokens && costs.is_empty())
+    Ok(false)
 }
 
 fn validate_canonical_u64(node: &JsonNode) -> Result<u64, TypedJsonError> {
@@ -5229,87 +4205,9 @@ fn validate_canonical_u64(node: &JsonNode) -> Result<u64, TypedJsonError> {
     Ok(value.get())
 }
 
-#[derive(Clone, Copy)]
-enum DiagnosticScope {
-    Runtime,
-    Session,
-}
-
-fn validate_diagnostics(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-    scope: DiagnosticScope,
-) -> Result<bool, TypedJsonError> {
+fn validate_snapshot_diagnostics_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
     let diagnostics = node.as_array().ok_or_else(selected_wrong_json_type)?;
-    if diagnostics.len() > usize::from(limits.observation.max_snapshot_diagnostics) {
-        return Err(invalid_scalar());
-    }
-    for diagnostic in diagnostics {
-        let diagnostic = diagnostic
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        let code = required(diagnostic, "code")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?;
-        let message = required(diagnostic, "message")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?;
-        match scope {
-            DiagnosticScope::Runtime => {
-                RuntimeDiagnosticView::new_with_limits(code, message, limits)
-                    .map_err(|_| invalid_scalar())?;
-            }
-            DiagnosticScope::Session => {
-                SessionDiagnosticView::new_with_limits(code, message, limits)
-                    .map_err(|_| invalid_scalar())?;
-            }
-        }
-    }
-    Ok(diagnostics.is_empty())
-}
-
-fn has_current_recording_diagnostic(node: &JsonNode) -> Result<bool, TypedJsonError> {
-    let first = node
-        .as_array()
-        .ok_or_else(selected_wrong_json_type)?
-        .first();
-    let Some(first) = first else {
-        return Ok(false);
-    };
-    let code = required(
-        first.as_object().ok_or_else(selected_wrong_json_type)?,
-        "code",
-    )?
-    .as_str()
-    .ok_or_else(typed_wrong_json_type)?;
-    Ok(is_recording_diagnostic_code(code))
-}
-
-fn has_recording_diagnostic(node: &JsonNode) -> Result<bool, TypedJsonError> {
-    for diagnostic in node.as_array().ok_or_else(selected_wrong_json_type)? {
-        let code = required(
-            diagnostic
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?,
-            "code",
-        )?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-        if is_recording_diagnostic_code(code) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn is_recording_diagnostic_code(code: &str) -> bool {
-    matches!(
-        code,
-        "session_recording_initialization_failed"
-            | "session_recording_encode_failed"
-            | "session_recording_append_failed"
-            | "session_recording_outcome_unknown"
-    )
+    Ok(!diagnostics.is_empty())
 }
 
 fn validate_state_event_shape(
@@ -5357,11 +4255,8 @@ enum EventRouteFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EventRouteFacts {
     family: EventRouteFamily,
-    agent_id: Option<AgentId>,
     session_id: Option<SessionId>,
     turn_id: Option<TurnId>,
-    item_id: Option<ItemId>,
-    request_id: Option<RequestId>,
 }
 
 fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonError> {
@@ -5372,11 +4267,8 @@ fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonErr
     let data = object.get("data");
     let mut facts = EventRouteFacts {
         family: EventRouteFamily::Runtime,
-        agent_id: None,
         session_id: None,
         turn_id: None,
-        item_id: None,
-        request_id: None,
     };
     match kind {
         "runtime" => {
@@ -5390,7 +4282,7 @@ fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonErr
                 .ok_or_else(missing_required_field)?
                 .as_object()
                 .ok_or_else(selected_wrong_json_type)?;
-            facts.agent_id = Some(parse_id(required(data, "agentId")?)?);
+            parse_id::<AgentId>(required(data, "agentId")?)?;
         }
         "session" => {
             facts.family = EventRouteFamily::Session;
@@ -5417,10 +4309,10 @@ fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonErr
                 facts.family,
                 EventRouteFamily::Item | EventRouteFamily::Interaction
             ) {
-                facts.item_id = Some(parse_id(required(data, "itemId")?)?);
+                parse_id::<ItemId>(required(data, "itemId")?)?;
             }
             if facts.family == EventRouteFamily::Interaction {
-                facts.request_id = Some(parse_id(required(data, "requestId")?)?);
+                parse_id::<RequestId>(required(data, "requestId")?)?;
             }
         }
         _ => return Err(unknown_output_variant()),
@@ -5437,304 +4329,61 @@ fn validate_runtime_state_msg(
     let kind = required(object, "kind")?
         .as_str()
         .ok_or_else(typed_wrong_json_type)?;
-    let snapshot_node = required(object, "snapshot")?;
-    let snapshot_pending = match validate_runtime_snapshot_shape(snapshot_node, limits) {
-        Ok(()) => false,
-        Err(error) if error.is_pending_public_target() => true,
-        Err(error) => return Err(error),
-    };
-    let loaded_session_ids = runtime_loaded_session_ids(snapshot_node)?;
-    let detail = object.get("detail");
-    let detail_is_null = detail.is_none_or(|detail| matches!(detail, JsonNode::Null));
+    let snapshot = required(object, "snapshot")?;
     match kind {
         "command_catalog_invalidated" => {
-            if route.family != EventRouteFamily::Runtime || !detail_is_null {
+            if route.family != EventRouteFamily::Runtime
+                || object
+                    .get("detail")
+                    .is_some_and(|detail| !matches!(detail, JsonNode::Null))
+            {
                 return Err(invalid_scalar());
             }
+            let snapshot_pending = match validate_runtime_snapshot_shape(snapshot, limits) {
+                Ok(()) => false,
+                Err(error) if error.is_pending_public_target() => true,
+                Err(error) => return Err(error),
+            };
             Ok(snapshot_pending)
         }
-        "agent_created"
-        | "agent_definition_updated"
-        | "agent_metadata_updated"
-        | "agent_status_changed" => {
-            let detail_agent = validate_runtime_agent_changed_detail(
-                detail.ok_or_else(missing_required_field)?,
-                limits,
-            )?;
-            let detail_agent = detail_agent.ok_or(TypedJsonError::EncodingInvariant)?;
-            let status_matches = match kind {
-                "agent_created" => {
-                    detail_agent.status == AgentStatusFacts::Enabled
-                        && detail_agent.definition_revision.get() == 1
-                        && detail_agent.metadata_revision.get() == 1
-                }
-                "agent_definition_updated" | "agent_metadata_updated" => {
-                    detail_agent.status != AgentStatusFacts::Deleted
-                }
-                "agent_status_changed" => true,
-                _ => unreachable!(),
-            };
-            if route.family != EventRouteFamily::Agent
-                || route.agent_id != Some(detail_agent.agent_id)
-                || !status_matches
-            {
+        _ => {
+            let expected_route =
+                runtime_state_route_family(kind).ok_or_else(unknown_output_variant)?;
+            if route.family != expected_route {
                 return Err(invalid_scalar());
             }
+            validate_runtime_snapshot_outer_shape(snapshot, limits)?;
+            validate_future_state_detail(kind, object.get("detail"), true)?;
             Ok(true)
         }
-        "session_created"
-        | "session_definition_updated"
-        | "session_metadata_updated"
-        | "session_archived"
-        | "session_unarchived"
-        | "session_deleted"
-        | "session_forked" => {
-            let detail_session = validate_runtime_session_changed_detail(
-                detail.ok_or_else(missing_required_field)?,
-                limits,
-            )?;
-            let detail_session = detail_session.ok_or(TypedJsonError::EncodingInvariant)?;
-            let lifecycle_matches = match kind {
-                "session_created" => {
-                    detail_session.lifecycle == SessionLifecycleFacts::Open
-                        && !detail_session.forked
-                        && detail_session.definition_revision.get() == 1
-                        && detail_session.metadata_revision.get() == 1
-                }
-                "session_definition_updated" => {
-                    detail_session.lifecycle == SessionLifecycleFacts::Open
-                }
-                "session_metadata_updated" => {
-                    detail_session.lifecycle != SessionLifecycleFacts::Deleted
-                }
-                "session_archived" => detail_session.lifecycle == SessionLifecycleFacts::Archived,
-                "session_unarchived" => detail_session.lifecycle == SessionLifecycleFacts::Open,
-                "session_deleted" => detail_session.lifecycle == SessionLifecycleFacts::Deleted,
-                "session_forked" => {
-                    detail_session.lifecycle == SessionLifecycleFacts::Open
-                        && detail_session.forked
-                        && detail_session.definition_revision.get() == 1
-                        && detail_session.metadata_revision.get() == 1
-                }
-                _ => unreachable!(),
-            };
-            if route.family != EventRouteFamily::Session
-                || route.session_id != Some(detail_session.session_id)
-                || !lifecycle_matches
-                || (matches!(
-                    kind,
-                    "session_created"
-                        | "session_archived"
-                        | "session_unarchived"
-                        | "session_deleted"
-                        | "session_forked"
-                ) && loaded_session_ids.contains(&detail_session.session_id))
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "session_loaded" | "session_unloaded" => {
-            let session_id = route.session_id.ok_or_else(invalid_scalar)?;
-            let membership_matches = if kind == "session_loaded" {
-                loaded_session_ids.contains(&session_id)
-            } else {
-                !loaded_session_ids.contains(&session_id)
-            };
-            if route.family != EventRouteFamily::Session || !detail_is_null || !membership_matches {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "diagnostics_updated" | "shared_resources_reloaded" => {
-            if route.family != EventRouteFamily::Runtime || !detail_is_null {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        _ => Err(unknown_output_variant()),
     }
 }
 
-fn runtime_loaded_session_ids(node: &JsonNode) -> Result<BTreeSet<SessionId>, TypedJsonError> {
+fn validate_runtime_snapshot_outer_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let runtime = required(object, "runtime")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    match required(runtime, "status")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "running" | "closing" => {}
+        _ => return Err(unknown_output_variant()),
+    }
     let loaded = required(object, "loadedSessions")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    loaded
-        .iter()
-        .map(|session| {
-            parse_id(required(
-                session.as_object().ok_or_else(selected_wrong_json_type)?,
-                "sessionId",
-            )?)
-        })
-        .collect()
-}
-
-fn validate_runtime_agent_changed_detail(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<Option<AgentSummaryFacts>, TypedJsonError> {
-    let mut identity = None;
-    validate_adjacent_output(node, |kind, data| {
-        if kind != "agent_changed" {
-            return Err(unknown_output_variant());
-        }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        identity = Some(validate_agent_summary(required(data, "agent")?, limits)?);
-        Ok(())
-    })?;
-    Ok(identity)
-}
-
-fn validate_runtime_session_changed_detail(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<Option<SessionSummaryFacts>, TypedJsonError> {
-    let mut identity = None;
-    validate_adjacent_output(node, |kind, data| {
-        if kind != "session_changed" {
-            return Err(unknown_output_variant());
-        }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        identity = Some(validate_session_summary(
-            required(data, "session")?,
-            limits,
-        )?);
-        Ok(())
-    })?;
-    Ok(identity)
-}
-
-fn validate_agent_summary(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<AgentSummaryFacts, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let agent_id = parse_id(required(object, "agentId")?)?;
-    let definition_revision = parse_revision(required(object, "definitionRevision")?)?;
-    let metadata = required(object, "metadata")?
-        .as_object()
-        .ok_or_else(selected_wrong_json_type)?;
-    let metadata_revision = parse_revision(required(metadata, "revision")?)?;
-    validate_safe_string(
-        required(metadata, "name")?,
-        usize::from(limits.text.max_display_name_bytes),
-        false,
-    )?;
-    validate_optional_safe_string(
-        metadata.get("description"),
-        usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
-    )?;
-    validate_timestamp(required(metadata, "updatedAt")?)?;
-    let status = match required(object, "status")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?
-    {
-        "enabled" => AgentStatusFacts::Enabled,
-        "disabled" => AgentStatusFacts::Disabled,
-        "deleted" => AgentStatusFacts::Deleted,
-        _ => return Err(unknown_output_variant()),
-    };
-    validate_timestamp(required(object, "createdAt")?)?;
-    Ok(AgentSummaryFacts {
-        agent_id,
-        definition_revision,
-        metadata_revision,
-        status,
-    })
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum AgentStatusFacts {
-    Enabled,
-    Disabled,
-    Deleted,
-}
-
-struct AgentSummaryFacts {
-    agent_id: AgentId,
-    definition_revision: AgentRevision,
-    metadata_revision: AgentMetadataRevision,
-    status: AgentStatusFacts,
-}
-
-fn validate_session_summary(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<SessionSummaryFacts, TypedJsonError> {
-    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let session_id = parse_id(required(object, "sessionId")?)?;
-    let definition_revision = parse_revision(required(object, "definitionRevision")?)?;
-    let metadata = required(object, "metadata")?;
-    validate_session_metadata(metadata, limits)?;
-    let metadata_revision = parse_revision(required(
-        metadata.as_object().ok_or_else(selected_wrong_json_type)?,
-        "revision",
-    )?)?;
-    let lifecycle = match required(object, "lifecycle")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?
-    {
-        "open" => SessionLifecycleFacts::Open,
-        "archived" => SessionLifecycleFacts::Archived,
-        "deleted" => SessionLifecycleFacts::Deleted,
-        _ => return Err(unknown_output_variant()),
-    };
-    let forked = match required(object, "forked")? {
-        JsonNode::Bool(value) => *value,
-        _ => return Err(typed_wrong_json_type()),
-    };
-    validate_timestamp(required(object, "createdAt")?)?;
-    Ok(SessionSummaryFacts {
-        session_id,
-        definition_revision,
-        metadata_revision,
-        lifecycle,
-        forked,
-    })
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum SessionLifecycleFacts {
-    Open,
-    Archived,
-    Deleted,
-}
-
-struct SessionSummaryFacts {
-    session_id: SessionId,
-    definition_revision: SessionDefinitionRevision,
-    metadata_revision: SessionMetadataRevision,
-    lifecycle: SessionLifecycleFacts,
-    forked: bool,
-}
-
-fn validate_optional_safe_string(
-    node: Option<&JsonNode>,
-    maximum: usize,
-) -> Result<(), TypedJsonError> {
-    if let Some(value) = node {
-        if !matches!(value, JsonNode::Null) {
-            validate_safe_string(value, maximum, false)?;
-        }
+    if loaded.len() > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX) {
+        return Err(invalid_scalar());
     }
+    required(object, "diagnostics")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
     Ok(())
-}
-
-fn validate_timestamp(node: &JsonNode) -> Result<(), TypedJsonError> {
-    node.as_str()
-        .ok_or_else(typed_wrong_json_type)?
-        .parse::<Timestamp>()
-        .map(|_| ())
-        .map_err(|_| invalid_scalar())
 }
 
 fn validate_session_state_msg(
@@ -5746,548 +4395,224 @@ fn validate_session_state_msg(
     let kind = required(object, "kind")?
         .as_str()
         .ok_or_else(typed_wrong_json_type)?;
-    let snapshot = validate_session_snapshot_facts(required(object, "snapshot")?, limits)?;
-    let detail = object.get("detail");
-    let detail_is_null = detail.is_none_or(|detail| matches!(detail, JsonNode::Null));
+    let snapshot = required(object, "snapshot")?;
     match kind {
-        "turn_completed" | "turn_failed" | "turn_interrupted" => {
-            let terminal =
-                validate_turn_terminal_detail(detail.ok_or_else(missing_required_field)?)?;
-            let expected = match kind {
-                "turn_completed" => TerminalKind::Completed,
-                "turn_failed" => TerminalKind::Failed,
-                "turn_interrupted" => TerminalKind::Interrupted,
-                _ => unreachable!(),
+        "turn_completed" | "turn_failed" => {
+            let terminal = validate_turn_terminal_detail(
+                object.get("detail").ok_or_else(missing_required_field)?,
+            )?;
+            let expected = if kind == "turn_completed" {
+                TerminalKind::Completed
+            } else {
+                TerminalKind::Failed
             };
+            let snapshot_session_id = validate_snapshot_session_id(snapshot)?;
             if terminal.terminal.kind != expected
                 || route.family != EventRouteFamily::Turn
-                || route.session_id != Some(snapshot.session_id)
+                || route.session_id != Some(snapshot_session_id)
                 || route.turn_id != Some(terminal.turn_id)
-                || snapshot.current_turn.as_ref().is_some_and(|current| {
-                    current.turn_id != terminal.turn_id
-                        || current.terminal.as_ref() != Some(&terminal.terminal)
-                })
             {
                 return Err(invalid_scalar());
             }
-            Ok(snapshot.pending || expected == TerminalKind::Interrupted)
+            match validate_session_snapshot_shape(snapshot, limits) {
+                Ok(()) => Ok(false),
+                Err(error) if error.is_pending_public_target() => Ok(true),
+                Err(error) => Err(error),
+            }
         }
+        _ => {
+            let expected_route =
+                session_state_route_family(kind).ok_or_else(unknown_output_variant)?;
+            if route.family != expected_route {
+                return Err(invalid_scalar());
+            }
+            validate_session_snapshot_outer_shape(snapshot)?;
+            validate_future_state_detail(kind, object.get("detail"), false)?;
+            Ok(true)
+        }
+    }
+}
+
+fn runtime_state_route_family(kind: &str) -> Option<EventRouteFamily> {
+    Some(match kind {
+        "agent_created"
+        | "agent_definition_updated"
+        | "agent_metadata_updated"
+        | "agent_status_changed" => EventRouteFamily::Agent,
+        "session_created"
+        | "session_definition_updated"
+        | "session_metadata_updated"
+        | "session_archived"
+        | "session_unarchived"
+        | "session_deleted"
+        | "session_forked"
+        | "session_loaded"
+        | "session_unloaded" => EventRouteFamily::Session,
+        "diagnostics_updated" | "shared_resources_reloaded" => EventRouteFamily::Runtime,
+        _ => return None,
+    })
+}
+
+fn session_state_route_family(kind: &str) -> Option<EventRouteFamily> {
+    Some(match kind {
+        "turn_interrupted" | "turn_started" | "turn_phase_changed" => EventRouteFamily::Turn,
+        "item_completed"
+        | "item_tool_invocation_started"
+        | "item_tool_invocation_completed"
+        | "item_tool_invocation_abandoned" => EventRouteFamily::Item,
+        "interaction_requested" | "interaction_resolved" => EventRouteFamily::Interaction,
         "session_definition_updated"
         | "session_metadata_updated"
         | "session_readiness_changed"
         | "session_execution_changed"
         | "session_settled"
         | "usage_updated"
-        | "diagnostics_updated" => {
-            require_session_route(route, snapshot.session_id)?;
-            if !detail_is_null {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "session_workspace_reloaded" => {
-            require_session_route(route, snapshot.session_id)?;
-            if !detail_is_null || !snapshot.ready {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "session_recording_changed" => {
-            require_session_route(route, snapshot.session_id)?;
-            if !detail_is_null || snapshot.recording_healthy {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "turn_started" | "turn_phase_changed" => {
-            if route.family != EventRouteFamily::Turn
-                || route.session_id != Some(snapshot.session_id)
-                || route.turn_id != snapshot.current_turn_id
-                || snapshot.execution.as_ref() != "running"
-                || snapshot
-                    .current_turn
-                    .as_ref()
-                    .is_none_or(|current| current.terminal.is_some())
-                || !detail_is_null
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "item_completed"
-        | "item_tool_invocation_started"
-        | "item_tool_invocation_completed"
-        | "item_tool_invocation_abandoned" => {
-            let item =
-                validate_item_changed_detail(detail.ok_or_else(missing_required_field)?, limits)?;
-            let kind_matches = match kind {
-                "item_completed" => {
-                    item.status == ItemStatusFacts::Completed
-                        && item.family != ItemFamilyFacts::ToolInvocation
-                }
-                "item_tool_invocation_started" => {
-                    item.status == ItemStatusFacts::Started
-                        && item.family == ItemFamilyFacts::ToolInvocation
-                }
-                "item_tool_invocation_completed" => {
-                    item.status == ItemStatusFacts::Completed
-                        && item.family == ItemFamilyFacts::ToolInvocation
-                }
-                "item_tool_invocation_abandoned" => {
-                    item.status == ItemStatusFacts::Abandoned
-                        && item.family == ItemFamilyFacts::ToolInvocation
-                }
-                _ => unreachable!(),
-            };
-            if route.family != EventRouteFamily::Item
-                || route.session_id != Some(snapshot.session_id)
-                || route.turn_id != Some(item.turn_id)
-                || route.item_id != Some(item.item_id)
-                || snapshot
-                    .active_items
-                    .get(&item.item_id)
-                    .map(|snapshot_item| &snapshot_item.projection)
-                    != Some(&item.projection)
-                || !kind_matches
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "interaction_requested" => {
-            if route.family != EventRouteFamily::Interaction
-                || route.session_id != Some(snapshot.session_id)
-                || snapshot
-                    .pending_interactions
-                    .get(&route.request_id.ok_or_else(invalid_scalar)?)
-                    .is_none_or(|interaction| {
-                        Some(interaction.turn_id) != route.turn_id
-                            || Some(interaction.item_id) != route.item_id
-                    })
-                || !detail_is_null
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "interaction_resolved" => {
-            let resolution = validate_interaction_resolved_detail(
-                detail.ok_or_else(missing_required_field)?,
-                limits,
-            )?;
-            let matching_item = route.item_id.is_some_and(|item_id| {
-                snapshot.active_items.get(&item_id).is_some_and(|item| {
-                    item.status == ItemStatusFacts::Started
-                        && item.family == ItemFamilyFacts::ToolInvocation
-                        && match resolution.family {
-                            InteractionResolutionFamilyFacts::UserAnswer => item
-                                .tool_name
-                                .as_ref()
-                                .is_some_and(|tool_name| tool_name.as_str() == "ask_user"),
-                            InteractionResolutionFamilyFacts::ToolApproval => item
-                                .tool_name
-                                .as_ref()
-                                .is_some_and(|tool_name| tool_name.as_str() != "ask_user"),
-                            InteractionResolutionFamilyFacts::Cancelled => true,
-                        }
-                })
-            });
-            if route.family != EventRouteFamily::Interaction
-                || route.session_id != Some(snapshot.session_id)
-                || route.request_id != Some(resolution.request_id)
-                || snapshot
-                    .pending_interactions
-                    .contains_key(&resolution.request_id)
-                || route.turn_id != snapshot.current_turn_id
-                || !matching_item
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        "queue_updated" => {
-            require_session_route(route, snapshot.session_id)?;
-            let removed =
-                validate_queue_updated_detail(detail.ok_or_else(missing_required_field)?, limits)?;
-            if removed
-                .iter()
-                .any(|command_id| snapshot.queue_command_ids.contains(command_id))
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(true)
-        }
-        _ => Err(unknown_output_variant()),
-    }
-}
-
-fn require_session_route(
-    route: EventRouteFacts,
-    session_id: SessionId,
-) -> Result<(), TypedJsonError> {
-    if route.family == EventRouteFamily::Session && route.session_id == Some(session_id) {
-        Ok(())
-    } else {
-        Err(invalid_scalar())
-    }
-}
-
-fn validate_item_changed_detail(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<ItemChangedFacts, TypedJsonError> {
-    let mut identity = None;
-    validate_adjacent_output(node, |kind, data| {
-        if kind != "item_changed" {
-            return Err(unknown_output_variant());
-        }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        let item = validate_pending_item_identity(required(data, "item")?, limits)?;
-        identity = Some(ItemChangedFacts {
-            turn_id: item.turn_id,
-            item_id: item.item_id,
-            projection: item.projection,
-            status: item.status,
-            family: item.family,
-        });
-        Ok(())
-    })?;
-    identity.ok_or(TypedJsonError::EncodingInvariant)
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ItemStatusFacts {
-    Started,
-    Completed,
-    Abandoned,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum ItemFamilyFacts {
-    UserMessage,
-    AgentMessage,
-    Reasoning,
-    ToolInvocation,
-}
-
-struct PendingItemContentFacts {
-    family: ItemFamilyFacts,
-    tool_result: bool,
-    tool_name: Option<ToolName>,
-    user_source: Option<UserMessageSourceFacts>,
-    agent_disposition: Option<AgentDispositionFacts>,
-}
-
-impl PendingItemContentFacts {
-    const fn non_tool(family: ItemFamilyFacts) -> Self {
-        Self {
-            family,
-            tool_result: false,
-            tool_name: None,
-            user_source: None,
-            agent_disposition: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum UserMessageSourceFacts {
-    Input,
-    Steer,
-}
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum AgentDispositionFacts {
-    Intermediate,
-    Final,
-}
-
-#[derive(Clone)]
-struct ActiveItemShapeFacts {
-    turn_id: TurnId,
-    item_id: ItemId,
-    projection: JsonNode,
-    status: ItemStatusFacts,
-    family: ItemFamilyFacts,
-    tool_name: Option<ToolName>,
-    user_source: Option<UserMessageSourceFacts>,
-    agent_disposition: Option<AgentDispositionFacts>,
-}
-
-struct ItemChangedFacts {
-    turn_id: TurnId,
-    item_id: ItemId,
-    projection: JsonNode,
-    status: ItemStatusFacts,
-    family: ItemFamilyFacts,
-}
-
-fn validate_interaction_resolved_detail(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<InteractionResolvedDetailFacts, TypedJsonError> {
-    let mut request_id = None;
-    let mut family = None;
-    validate_adjacent_output(node, |kind, data| {
-        if kind != "interaction_resolved" {
-            return Err(unknown_output_variant());
-        }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        request_id = Some(parse_id(required(data, "requestId")?)?);
-        family = Some(validate_interaction_resolution(
-            required(data, "resolution")?,
-            limits,
-        )?);
-        Ok(())
-    })?;
-    Ok(InteractionResolvedDetailFacts {
-        request_id: request_id.ok_or(TypedJsonError::EncodingInvariant)?,
-        family: family.ok_or(TypedJsonError::EncodingInvariant)?,
+        | "diagnostics_updated"
+        | "session_workspace_reloaded"
+        | "session_recording_changed"
+        | "queue_updated" => EventRouteFamily::Session,
+        _ => return None,
     })
 }
 
-#[derive(Clone, Copy)]
-enum InteractionResolutionFamilyFacts {
-    ToolApproval,
-    UserAnswer,
-    Cancelled,
-}
-
-struct InteractionResolvedDetailFacts {
-    request_id: RequestId,
-    family: InteractionResolutionFamilyFacts,
-}
-
-fn validate_interaction_resolution(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<InteractionResolutionFamilyFacts, TypedJsonError> {
-    validate_adjacent_output(node, |kind, data| match kind {
-        "tool_approval" => {
-            validate_adjacent_output(
-                data.ok_or_else(missing_required_field)?,
-                |decision, data| match decision {
-                    "denied" => {
-                        if data.is_some() {
-                            Err(selected_wrong_json_type())
-                        } else {
-                            Ok(())
-                        }
-                    }
-                    "allowed" => {
-                        let data = data
-                            .ok_or_else(missing_required_field)?
-                            .as_object()
-                            .ok_or_else(selected_wrong_json_type)?;
-                        validate_u32(required(data, "optionIndex")?)?;
-                        match required(data, "kind")?
-                            .as_str()
-                            .ok_or_else(typed_wrong_json_type)?
-                        {
-                            "as_requested" | "restricted" => Ok(()),
-                            _ => Err(unknown_output_variant()),
-                        }
-                    }
-                    _ => Err(unknown_output_variant()),
-                },
-            )?;
-            Ok(InteractionResolutionFamilyFacts::ToolApproval)
-        }
-        "user_answer" => {
-            let data_node = data.ok_or_else(missing_required_field)?;
-            let data = data_node.as_object().ok_or_else(selected_wrong_json_type)?;
-            let answers = required(data, "answers")?
-                .as_array()
-                .ok_or_else(selected_wrong_json_type)?;
-            if answers.len() > usize::from(limits.interaction.max_interaction_questions) {
-                return Err(invalid_scalar());
-            }
-            let mut previous_index = None;
-            let mut text_bytes = 0_usize;
-            for answer in answers {
-                let answer = answer.as_object().ok_or_else(selected_wrong_json_type)?;
-                let index = validate_u32_value(required(answer, "questionIndex")?)?;
-                if previous_index.is_some_and(|previous| index <= previous) {
-                    return Err(invalid_scalar());
-                }
-                previous_index = Some(index);
-                validate_adjacent_output(required(answer, "value")?, |kind, data| match kind {
-                    "text" => {
-                        let text = data
-                            .ok_or_else(missing_required_field)?
-                            .as_str()
-                            .ok_or_else(typed_wrong_json_type)?;
-                        validate_safe_text(
-                            text,
-                            usize::try_from(limits.interaction.max_answer_text_bytes)
-                                .unwrap_or(usize::MAX),
-                            true,
-                        )
-                        .map_err(|_| invalid_scalar())?;
-                        text_bytes = text_bytes
-                            .checked_add(text.len())
-                            .ok_or_else(invalid_scalar)?;
-                        if text_bytes
-                            > usize::try_from(limits.interaction.max_interaction_answer_bytes)
-                                .unwrap_or(usize::MAX)
-                        {
-                            return Err(invalid_scalar());
-                        }
-                        Ok(())
-                    }
-                    "choice" => {
-                        let data = data
-                            .ok_or_else(missing_required_field)?
-                            .as_object()
-                            .ok_or_else(selected_wrong_json_type)?;
-                        validate_u32(required(data, "optionIndex")?)
-                    }
-                    _ => Err(unknown_output_variant()),
-                })?;
-            }
-            let projection = project_user_answer_data(data_node)?;
-            if public_node_encoded_len(&projection).ok_or_else(invalid_scalar)?
-                > usize::try_from(limits.interaction.max_interaction_answer_bytes)
-                    .unwrap_or(usize::MAX)
-            {
-                return Err(invalid_scalar());
-            }
-            Ok(InteractionResolutionFamilyFacts::UserAnswer)
-        }
-        "cancelled" => {
-            let data = data
-                .ok_or_else(missing_required_field)?
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?;
-            let reason = required(data, "reason")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?;
-            if matches!(
-                reason,
-                "host_cancelled"
-                    | "turn_cancelled"
-                    | "security_revoked"
-                    | "session_unloaded"
-                    | "runtime_closing"
-                    | "turn_terminal"
-            ) {
-                Ok(InteractionResolutionFamilyFacts::Cancelled)
-            } else {
-                Err(unknown_output_variant())
-            }
-        }
-        _ => Err(unknown_output_variant()),
-    })
-}
-
-fn project_user_answer_data(node: &JsonNode) -> Result<JsonNode, TypedJsonError> {
+fn validate_snapshot_session_id(node: &JsonNode) -> Result<SessionId, TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let answers = required(object, "answers")?
-        .as_array()
-        .ok_or_else(selected_wrong_json_type)?
-        .iter()
-        .map(|answer| {
-            let answer = answer.as_object().ok_or_else(selected_wrong_json_type)?;
-            let value = required(answer, "value")?
-                .as_object()
-                .ok_or_else(selected_wrong_json_type)?;
-            let kind = required(value, "type")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?;
-            let data = required(value, "data")?;
-            let data = match kind {
-                "text" => data.clone(),
-                "choice" => {
-                    let data = data.as_object().ok_or_else(selected_wrong_json_type)?;
-                    json_node_object(vec![(
-                        "optionIndex",
-                        required(data, "optionIndex")?.clone(),
-                    )])
-                }
-                _ => return Err(unknown_output_variant()),
-            };
-            Ok(json_node_object(vec![
-                ("questionIndex", required(answer, "questionIndex")?.clone()),
-                (
-                    "value",
-                    json_node_object(vec![
-                        ("type", JsonNode::String(kind.into())),
-                        ("data", data),
-                    ]),
-                ),
-            ]))
-        })
-        .collect::<Result<Vec<_>, TypedJsonError>>()?;
-    Ok(json_node_object(vec![(
-        "answers",
-        JsonNode::Array(answers),
-    )]))
+    parse_id::<SessionId>(required(object, "sessionId")?)
 }
 
-fn validate_queue_updated_detail(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<BTreeSet<CommandId>, TypedJsonError> {
-    let mut removed_ids = None;
-    validate_adjacent_output(node, |kind, data| {
-        if kind != "queue_updated" {
-            return Err(unknown_output_variant());
+fn validate_session_snapshot_outer_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    parse_id::<SessionId>(required(object, "sessionId")?)?;
+    match required(object, "lifecycle")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "open" => {}
+        "archived" | "deleted" => return Err(invalid_scalar()),
+        _ => return Err(unknown_output_variant()),
+    }
+    required(object, "metadata")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    required(object, "definition")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    match required(object, "loadState")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "loaded" | "unloading" => {}
+        _ => return Err(unknown_output_variant()),
+    }
+    validate_readiness(required(object, "readiness")?)?;
+    validate_execution(required(object, "execution")?)?;
+    if let Some(current_turn) = object.get("currentTurn") {
+        if !matches!(current_turn, JsonNode::Null) {
+            current_turn
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
         }
-        let data = data
-            .ok_or_else(missing_required_field)?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        let removed = required(data, "removedCommandIds")?
-            .as_array()
-            .ok_or_else(selected_wrong_json_type)?;
-        let maximum = usize::from(limits.queues.max_submit_admissions)
-            + usize::from(limits.queues.max_steers)
-            + usize::from(limits.queues.max_follow_ups);
-        if removed.len() > maximum {
-            return Err(invalid_scalar());
+    }
+    required(object, "activeItems")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    required(object, "pendingInteractions")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    validate_session_queues_shape(required(object, "queues")?)?;
+    validate_recording(required(object, "recording")?)?;
+    if let Some(usage) = object.get("usage") {
+        if !matches!(usage, JsonNode::Null) {
+            usage.as_object().ok_or_else(selected_wrong_json_type)?;
         }
-        let mut command_ids = BTreeSet::new();
-        for command_id in removed {
-            let command_id: CommandId = parse_id(command_id)?;
-            if !command_ids.insert(command_id) {
-                return Err(duplicate_value());
-            }
+    }
+    required(object, "diagnostics")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    Ok(())
+}
+
+fn validate_future_state_detail(
+    kind: &str,
+    detail: Option<&JsonNode>,
+    runtime: bool,
+) -> Result<(), TypedJsonError> {
+    let expected_object_kind = if runtime {
+        match kind {
+            "agent_created"
+            | "agent_definition_updated"
+            | "agent_metadata_updated"
+            | "agent_status_changed" => Some("agent_changed"),
+            "session_created"
+            | "session_definition_updated"
+            | "session_metadata_updated"
+            | "session_archived"
+            | "session_unarchived"
+            | "session_deleted"
+            | "session_forked" => Some("session_changed"),
+            "session_loaded"
+            | "session_unloaded"
+            | "diagnostics_updated"
+            | "shared_resources_reloaded" => None,
+            _ => return Err(TypedJsonError::EncodingInvariant),
         }
-        match required(data, "reason")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-        {
-            "cancel_queued_message" | "turn_cancelled" | "turn_terminal" | "prepare_for_unload" => {
-            }
-            _ => return Err(unknown_output_variant()),
+    } else {
+        match kind {
+            "turn_interrupted" => Some("turn_terminal"),
+            "item_completed"
+            | "item_tool_invocation_started"
+            | "item_tool_invocation_completed"
+            | "item_tool_invocation_abandoned" => Some("item_changed"),
+            "interaction_resolved" => Some("interaction_resolved"),
+            "queue_updated" => Some("queue_updated"),
+            "session_definition_updated"
+            | "session_metadata_updated"
+            | "session_readiness_changed"
+            | "session_execution_changed"
+            | "session_settled"
+            | "usage_updated"
+            | "diagnostics_updated"
+            | "session_workspace_reloaded"
+            | "session_recording_changed"
+            | "turn_started"
+            | "turn_phase_changed"
+            | "interaction_requested" => None,
+            _ => return Err(TypedJsonError::EncodingInvariant),
         }
-        removed_ids = Some(command_ids);
-        Ok(())
-    })?;
-    removed_ids.ok_or(TypedJsonError::EncodingInvariant)
+    };
+
+    let Some(expected_object_kind) = expected_object_kind else {
+        if detail.is_some_and(|value| !matches!(value, JsonNode::Null)) {
+            return Err(selected_wrong_json_type());
+        }
+        return Ok(());
+    };
+
+    let detail = detail.ok_or_else(missing_required_field)?;
+    let object = detail.as_object().ok_or_else(selected_wrong_json_type)?;
+    let actual_kind = required(object, "type")?
+        .as_str()
+        .ok_or_else(selected_wrong_json_type)?;
+    if actual_kind != expected_object_kind {
+        return Err(unknown_output_variant());
+    }
+    required(object, "data")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
     Completed,
     Failed,
-    Interrupted,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Copy)]
 struct TerminalCorrelationFacts {
     kind: TerminalKind,
-    completed_at: Timestamp,
-    reason: Option<Box<str>>,
 }
 
-#[derive(Clone)]
 struct TerminalFacts {
     turn_id: TurnId,
     terminal: TerminalCorrelationFacts,
@@ -6308,42 +4633,20 @@ fn validate_turn_terminal_detail(node: &JsonNode) -> Result<TerminalFacts, Typed
                     .ok_or_else(missing_required_field)?
                     .as_object()
                     .ok_or_else(selected_wrong_json_type)?;
-                let completed_at = required(data, "completedAt")?
+                required(data, "completedAt")?
                     .as_str()
                     .ok_or_else(typed_wrong_json_type)?
                     .parse::<Timestamp>()
                     .map_err(|_| invalid_scalar())?;
-                let reason = match terminal {
-                    "completed" => None,
-                    "failed" => {
-                        validate_turn_failure(required(data, "reason")?)?;
-                        Some(Box::<str>::from(
-                            required(data, "reason")?
-                                .as_str()
-                                .ok_or_else(typed_wrong_json_type)?,
-                        ))
-                    }
-                    "interrupted" => {
-                        validate_turn_interruption(required(data, "reason")?)?;
-                        Some(Box::<str>::from(
-                            required(data, "reason")?
-                                .as_str()
-                                .ok_or_else(typed_wrong_json_type)?,
-                        ))
-                    }
-                    _ => return Err(unknown_output_variant()),
-                };
                 let kind = match terminal {
                     "completed" => TerminalKind::Completed,
-                    "failed" => TerminalKind::Failed,
-                    "interrupted" => TerminalKind::Interrupted,
+                    "failed" => {
+                        validate_turn_failure(required(data, "reason")?)?;
+                        TerminalKind::Failed
+                    }
                     _ => return Err(unknown_output_variant()),
                 };
-                selected = Some(TerminalCorrelationFacts {
-                    kind,
-                    completed_at,
-                    reason,
-                });
+                selected = Some(TerminalCorrelationFacts { kind });
                 Ok(())
             })
         }
@@ -6367,146 +4670,35 @@ fn validate_turn_failure(node: &JsonNode) -> Result<(), TypedJsonError> {
     }
 }
 
-fn validate_turn_interruption(node: &JsonNode) -> Result<(), TypedJsonError> {
-    match node.as_str().ok_or_else(typed_wrong_json_type)? {
-        "user_cancelled" | "security_revoked" | "prepare_for_unload" | "runtime_shutdown"
-        | "runtime_failure" => Ok(()),
-        _ => Err(unknown_output_variant()),
-    }
-}
-
-fn validate_progress_event_shape(
-    node: &JsonNode,
-    limits: ProtocolLimits,
-) -> Result<(), TypedJsonError> {
+fn validate_progress_event_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     required(object, "timestamp")?
         .as_str()
         .ok_or_else(typed_wrong_json_type)?
         .parse::<Timestamp>()
         .map_err(|_| invalid_scalar())?;
-    let route = validate_event_route(required(object, "route")?)?;
-    let kind = required(object, "kind")?
-        .as_str()
-        .ok_or_else(typed_wrong_json_type)?;
-    if !matches!(kind, "model" | "tool" | "compaction" | "retry") {
-        return Err(unknown_output_variant());
+    validate_event_route(required(object, "route")?)?;
+    match required(object, "kind")?.as_str() {
+        Some("model") | Some("tool") | Some("compaction") | Some("retry") => {}
+        Some(_) => return Err(unknown_output_variant()),
+        None => return Err(typed_wrong_json_type()),
     }
-    let update = validate_adjacent_output(required(object, "update")?, |update, data| {
-        let data = data
-            .ok_or_else(missing_required_field)?
+    validate_adjacent_output(required(object, "update")?, |kind, data| {
+        if !matches!(
+            kind,
+            "item_started"
+                | "item_delta"
+                | "tool_output_delta"
+                | "model_retry_scheduled"
+                | "operation_status"
+        ) {
+            return Err(unknown_output_variant());
+        }
+        data.ok_or_else(missing_required_field)?
             .as_object()
             .ok_or_else(selected_wrong_json_type)?;
-        validate_progress_update(update, data, limits)
-    })?;
-    let coherent = match update {
-        ProgressUpdateFacts::Item { item_id } => {
-            kind == "model"
-                && route.family == EventRouteFamily::Item
-                && route.item_id == Some(item_id)
-        }
-        ProgressUpdateFacts::ToolOutput { item_id } => {
-            kind == "tool"
-                && route.family == EventRouteFamily::Item
-                && route.item_id == Some(item_id)
-        }
-        ProgressUpdateFacts::Retry => kind == "retry" && route.family == EventRouteFamily::Turn,
-        ProgressUpdateFacts::Operation => {
-            kind == "compaction"
-                && matches!(
-                    route.family,
-                    EventRouteFamily::Session | EventRouteFamily::Turn
-                )
-        }
-    };
-    if coherent {
         Ok(())
-    } else {
-        Err(invalid_scalar())
-    }
-}
-
-enum ProgressUpdateFacts {
-    Item { item_id: ItemId },
-    ToolOutput { item_id: ItemId },
-    Retry,
-    Operation,
-}
-
-fn validate_progress_update(
-    kind: &str,
-    data: &std::collections::BTreeMap<Box<str>, JsonNode>,
-    limits: ProtocolLimits,
-) -> Result<ProgressUpdateFacts, TypedJsonError> {
-    let maximum = usize::try_from(limits.transport.max_progress_event_bytes).unwrap_or(usize::MAX);
-    match kind {
-        "item_started" | "item_delta" => {
-            let item_id = parse_id(required(data, "itemId")?)?;
-            validate_u32(required(data, "contentIndex")?)?;
-            match required(data, "contentKind")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-            {
-                "assistant_text" | "reasoning" => {}
-                _ => return Err(unknown_output_variant()),
-            }
-            if kind == "item_delta" {
-                validate_safe_string(required(data, "delta")?, maximum, true)?;
-            }
-            Ok(ProgressUpdateFacts::Item { item_id })
-        }
-        "tool_output_delta" => {
-            let item_id = parse_id(required(data, "itemId")?)?;
-            required(data, "toolCallId")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<ToolCallId>()
-                .map_err(|_| invalid_scalar())?;
-            validate_safe_string(required(data, "delta")?, maximum, true)?;
-            Ok(ProgressUpdateFacts::ToolOutput { item_id })
-        }
-        "model_retry_scheduled" => {
-            let maximum = match required(data, "purpose")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-            {
-                "agent_run" => 3,
-                "compaction_summary" => 1,
-                _ => return Err(unknown_output_variant()),
-            };
-            let retry_count = validate_u32_value(required(data, "retryCount")?)?;
-            if retry_count > maximum {
-                return Err(invalid_scalar());
-            }
-            required(data, "readyAt")?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?
-                .parse::<Timestamp>()
-                .map_err(|_| invalid_scalar())?;
-            Ok(ProgressUpdateFacts::Retry)
-        }
-        "operation_status" => {
-            validate_safe_string(required(data, "message")?, maximum, false)?;
-            Ok(ProgressUpdateFacts::Operation)
-        }
-        _ => Err(unknown_output_variant()),
-    }
-}
-
-fn validate_u32_value(node: &JsonNode) -> Result<u32, TypedJsonError> {
-    let literal = node
-        .as_number()
-        .map(|number| number.raw())
-        .ok_or_else(typed_wrong_json_type)?;
-    if literal.bytes().all(|byte| byte.is_ascii_digit()) {
-        literal.parse::<u32>().map_err(|_| invalid_scalar())
-    } else {
-        Err(invalid_scalar())
-    }
-}
-
-fn validate_u32(node: &JsonNode) -> Result<(), TypedJsonError> {
-    validate_u32_value(node).map(|_| ())
+    })
 }
 
 fn validate_snapshot_semantic_limits(
