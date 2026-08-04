@@ -2,7 +2,7 @@ pub mod agent_session_lifecycle;
 pub(crate) mod compaction;
 #[allow(
     dead_code,
-    reason = "M3 storage semantic values are consumed by the line codec"
+    reason = "M4 live conversation foundation is consumed by the upcoming M7 runtime slice"
 )]
 pub(crate) mod conversation_storage;
 pub(crate) mod durable_state;
@@ -14,7 +14,7 @@ pub mod runtime;
 pub mod runtime_interface;
 #[allow(
     dead_code,
-    reason = "M5.0 owner-tracked foundation is consumed by later durable owner slices"
+    reason = "owner-tracked clocks and tasks are consumed incrementally by M5 and M7"
 )]
 pub(crate) mod runtime_task;
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};

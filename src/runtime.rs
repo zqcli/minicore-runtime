@@ -176,9 +176,6 @@ impl RuntimeInner {
 
             match self.begin_shutdown() {
                 RuntimeShutdownAttempt::Leader(mut leadership) => {
-                    self.request_durable_actor_closing();
-                    self.task_context.request_closing();
-
                     // Keep the original owner in the mutex while awaiting. A cancelled leader
                     // therefore retains both the DurableState resource owner and its root lease
                     // for the next shutdown leader to take over.
