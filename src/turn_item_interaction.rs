@@ -2,9 +2,11 @@ use std::fmt;
 
 use thiserror::Error;
 
+#[cfg(test)]
+use crate::tools::ToolApprovalDecisionInput;
 use crate::tools::{
-    ToolApprovalDecision, ToolApprovalDecisionInput, ToolApprovalRequest, ToolApprovalRequestView,
-    ToolApprovalResolution, ToolCallId, UserQuestionAnswer, UserQuestionRequest,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprovalRequestView, ToolApprovalResolution,
+    ToolCallId, UserQuestionAnswer, UserQuestionRequest,
 };
 use crate::wire::{ItemId, TurnId};
 
@@ -127,17 +129,25 @@ pub enum InteractionRequestView {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum InteractionRequest {
+    #[allow(
+        dead_code,
+        reason = "M4 validates this family before M8 provides its first production constructor"
+    )]
     ToolApproval(ToolApprovalRequest),
+    #[allow(
+        dead_code,
+        reason = "M4 validates this family before M8 provides its first production constructor"
+    )]
     UserQuestion(UserQuestionRequest),
 }
 
 impl InteractionRequest {
-    #[allow(dead_code, reason = "constructed by Tool execution control in M8")]
+    #[cfg(test)]
     pub(crate) fn tool_approval(request: ToolApprovalRequest) -> Self {
         Self::ToolApproval(request)
     }
 
-    #[allow(dead_code, reason = "constructed by ask-user Tool execution in M8")]
+    #[cfg(test)]
     pub(crate) fn user_question(request: UserQuestionRequest) -> Self {
         Self::UserQuestion(request)
     }
@@ -151,7 +161,7 @@ impl InteractionRequest {
         }
     }
 
-    #[allow(dead_code, reason = "consumed by Interaction execution control in M8")]
+    #[cfg(test)]
     pub(crate) fn resolve_host(
         &self,
         input: InteractionHostResolutionInput,
@@ -249,8 +259,9 @@ impl InteractionRequest {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Eq, PartialEq)]
-pub enum InteractionHostResolutionInput {
+pub(crate) enum InteractionHostResolutionInput {
     ToolApproval(ToolApprovalDecisionInput),
     UserAnswer(UserQuestionAnswer),
     Cancelled,
@@ -281,9 +292,19 @@ pub struct InteractionResolutionView {
 
 #[derive(Clone, Eq, PartialEq)]
 enum InteractionResolutionViewKind {
+    #[allow(
+        dead_code,
+        reason = "M4 validates this safe value before M8 provides its first production constructor"
+    )]
     ToolApproval(ToolApprovalResolution),
+    #[allow(
+        dead_code,
+        reason = "M4 validates this safe value before M8 provides its first production constructor"
+    )]
     UserAnswer(UserQuestionAnswer),
-    Cancelled { reason: InteractionCancelReason },
+    Cancelled {
+        reason: InteractionCancelReason,
+    },
 }
 
 pub enum InteractionResolutionViewRef<'a> {
@@ -293,12 +314,14 @@ pub enum InteractionResolutionViewRef<'a> {
 }
 
 impl InteractionResolutionView {
+    #[cfg(test)]
     pub(crate) const fn tool_approval(resolution: ToolApprovalResolution) -> Self {
         Self {
             kind: InteractionResolutionViewKind::ToolApproval(resolution),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn user_answer(answer: UserQuestionAnswer) -> Self {
         Self {
             kind: InteractionResolutionViewKind::UserAnswer(answer),
@@ -347,7 +370,15 @@ impl fmt::Debug for InteractionResolutionView {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum InteractionResolution {
+    #[allow(
+        dead_code,
+        reason = "M4 validates this private value before M8 provides its first production constructor"
+    )]
     ToolApproval(ToolApprovalDecision),
+    #[allow(
+        dead_code,
+        reason = "M4 validates this private value before M8 provides its first production constructor"
+    )]
     UserAnswer(UserQuestionAnswer),
     Cancelled(InteractionCancelReason),
 }

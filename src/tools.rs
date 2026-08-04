@@ -410,8 +410,9 @@ impl ToolApprovalRequestView {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum ToolApprovalDecisionInput {
+pub(crate) enum ToolApprovalDecisionInput {
     Allow { option_index: u32 },
     Deny,
 }
@@ -478,6 +479,10 @@ pub(crate) enum ToolApprovalDecision {
         reason = "constructed by future Tool approval execution in M8"
     )]
     AllowOnce,
+    #[allow(
+        dead_code,
+        reason = "the M4 exact-resolution owner retains denial before the M8 host constructor"
+    )]
     Deny,
 }
 
@@ -488,10 +493,7 @@ struct ToolApprovalOption {
 }
 
 impl ToolApprovalOption {
-    #[allow(
-        dead_code,
-        reason = "constructed by ToolSet approval preparation in M8"
-    )]
+    #[cfg(test)]
     fn new(
         view: ToolApprovalOptionView,
         decision: ToolApprovalDecision,
@@ -517,10 +519,7 @@ pub(crate) struct ToolApprovalRequest {
 }
 
 impl ToolApprovalRequest {
-    #[allow(
-        dead_code,
-        reason = "constructed by ToolSet approval preparation in M8"
-    )]
+    #[cfg(test)]
     fn new(
         view: ToolApprovalRequestView,
         options: Vec<ToolApprovalOption>,
@@ -543,6 +542,7 @@ impl ToolApprovalRequest {
         &self.view
     }
 
+    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         input: ToolApprovalDecisionInput,
