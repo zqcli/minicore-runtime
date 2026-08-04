@@ -165,14 +165,6 @@ impl EntryIdGenerator {
         }
         Err(EntryIdAllocationError::CollisionAttemptsExhausted)
     }
-
-    #[cfg(test)]
-    fn allocate_with<F, E>(&mut self, next_candidate: F) -> Result<EntryId, EntryIdAllocationError>
-    where
-        F: FnMut() -> Result<EntryId, E>,
-    {
-        self.allocate_candidates(next_candidate)
-    }
 }
 
 impl fmt::Debug for EntryIdGenerator {
@@ -320,7 +312,6 @@ impl fmt::Debug for InteractionResolutionCandidate {
 
 struct Interaction {
     request_id: RequestId,
-    session_id: SessionId,
     turn_id: TurnId,
     item_id: ItemId,
     request: InteractionRequest,
@@ -331,7 +322,6 @@ enum InteractionState {
     Pending,
     Resolved {
         resolution: ResolvedInteraction,
-        resolved_at: Timestamp,
         resolution_key: Option<InteractionResolutionKey>,
     },
 }
@@ -400,7 +390,6 @@ struct ExpectedToolCall {
 
 #[derive(Clone)]
 struct PendingToolExchange {
-    turn_id: TurnId,
     assistant_entry_id: EntryId,
     assistant_message: ModelMessage,
     expected: Vec<ExpectedToolCall>,
@@ -551,7 +540,6 @@ impl LiveSessionState {
             None
         } else {
             Some(PendingToolExchange {
-                turn_id,
                 assistant_entry_id: entry_id,
                 assistant_message: message,
                 expected,
@@ -585,11 +573,6 @@ impl LiveSessionState {
                 LiveConversationErrorReason::InvalidRelation,
             ));
         };
-        if exchange.turn_id != turn_id {
-            return Err(LiveConversationError::new(
-                LiveConversationErrorReason::InvalidTurn,
-            ));
-        }
         let Some(expected_index) = exchange.expected.iter().position(|expected| {
             expected.item_id == body.item_id() && expected.tool_call_id == *body.tool_call_id()
         }) else {
@@ -725,7 +708,6 @@ impl LiveSessionState {
         );
         let interaction = Interaction {
             request_id: candidate.request_id,
-            session_id: self.session_id,
             turn_id,
             item_id: candidate.item_id,
             request: candidate.request,
@@ -755,11 +737,6 @@ impl LiveSessionState {
             ));
         };
         let interaction = &self.interactions[interaction_index];
-        if interaction.session_id != self.session_id {
-            return Err(LiveConversationError::new(
-                LiveConversationErrorReason::InteractionConflict,
-            ));
-        }
         let interaction_turn_id = interaction.turn_id;
         let resolution_key = candidate.resolution_key.clone();
         interaction
@@ -831,7 +808,6 @@ impl LiveSessionState {
         // reducer is a single synchronous owner.
         self.interactions[interaction_index].state = InteractionState::Resolved {
             resolution: candidate.resolution,
-            resolved_at: timestamp,
             resolution_key,
         };
         self.selected_path.push(entry.clone());
@@ -859,9 +835,7 @@ impl LiveSessionState {
         }
 
         let fresh_source = self.fresh_compaction_source()?;
-        if source.session_id() != &self.session_id
-            || !source.has_same_stable_identity(&fresh_source)
-        {
+        if !source.has_same_stable_identity(&fresh_source) {
             return Err(LiveConversationError::new(
                 LiveConversationErrorReason::StaleCompactionSource,
             ));
@@ -1136,11 +1110,10 @@ impl LiveSessionState {
                 && relation.turn_id() == turn_id
                 && relation.family() == ItemContentFamily::ToolInvocation
         }) && self.tool_exchange.as_ref().is_some_and(|exchange| {
-            exchange.turn_id == turn_id
-                && exchange
-                    .expected
-                    .iter()
-                    .any(|expected| expected.item_id == item_id && expected.terminal.is_none())
+            exchange
+                .expected
+                .iter()
+                .any(|expected| expected.item_id == item_id && expected.terminal.is_none())
         })
     }
 
@@ -1177,7 +1150,7 @@ impl LiveSessionState {
             let (entry_ids, scripted) = (&mut self.entry_ids, &mut self.scripted_entry_ids);
             if let Some(scripted) = scripted {
                 return entry_ids
-                    .allocate_with(|| {
+                    .allocate_candidates(|| {
                         scripted.allocation_calls += 1;
                         scripted.candidates.pop_front().unwrap_or(Err(()))
                     })
@@ -1248,7 +1221,6 @@ impl LiveSessionState {
                 .iter()
                 .map(|interaction| Interaction {
                     request_id: interaction.request_id,
-                    session_id: interaction.session_id,
                     turn_id: interaction.turn_id,
                     item_id: interaction.item_id,
                     request: interaction.request.clone(),
@@ -1256,11 +1228,9 @@ impl LiveSessionState {
                         InteractionState::Pending => InteractionState::Pending,
                         InteractionState::Resolved {
                             resolution,
-                            resolved_at,
                             resolution_key,
                         } => InteractionState::Resolved {
                             resolution: resolution.clone_for_test(),
-                            resolved_at: *resolved_at,
                             resolution_key: resolution_key.clone(),
                         },
                     },
@@ -1542,7 +1512,6 @@ mod tests {
 
     struct InteractionSnapshot {
         request_id: RequestId,
-        session_id: SessionId,
         turn_id: TurnId,
         item_id: ItemId,
         request: InteractionRequest,
@@ -1554,7 +1523,6 @@ mod tests {
         Resolved {
             resolution: ResolvedInteraction,
             resolution_view: crate::turn_item_interaction::InteractionResolutionView,
-            resolved_at: Timestamp,
             resolution_key: Option<InteractionResolutionKey>,
         },
     }
@@ -1566,7 +1534,6 @@ mod tests {
     }
 
     struct PendingToolExchangeSnapshot {
-        turn_id: TurnId,
         assistant_entry_id: EntryId,
         assistant_message: ModelMessage,
         assistant_message_identity: usize,
@@ -1586,7 +1553,6 @@ mod tests {
                 .iter()
                 .map(|interaction| InteractionSnapshot {
                     request_id: interaction.request_id,
-                    session_id: interaction.session_id,
                     turn_id: interaction.turn_id,
                     item_id: interaction.item_id,
                     request: interaction.request.clone(),
@@ -1594,12 +1560,10 @@ mod tests {
                         InteractionState::Pending => InteractionStateSnapshot::Pending,
                         InteractionState::Resolved {
                             resolution,
-                            resolved_at,
                             resolution_key,
                         } => InteractionStateSnapshot::Resolved {
                             resolution: resolution.clone_for_test(),
                             resolution_view: resolution.view().clone(),
-                            resolved_at: *resolved_at,
                             resolution_key: resolution_key.clone(),
                         },
                     },
@@ -1623,7 +1587,6 @@ mod tests {
                     .tool_exchange
                     .as_ref()
                     .map(|exchange| PendingToolExchangeSnapshot {
-                        turn_id: exchange.turn_id,
                         assistant_entry_id: exchange.assistant_entry_id,
                         assistant_message: exchange.assistant_message.clone(),
                         assistant_message_identity: std::ptr::from_ref(&exchange.assistant_message)
@@ -1703,7 +1666,6 @@ mod tests {
             assert_eq!(state.interactions.len(), self.interactions.len());
             for (actual, expected) in state.interactions.iter().zip(&self.interactions) {
                 assert_eq!(actual.request_id, expected.request_id);
-                assert_eq!(actual.session_id, expected.session_id);
                 assert_eq!(actual.turn_id, expected.turn_id);
                 assert_eq!(actual.item_id, expected.item_id);
                 assert!(actual.request == expected.request);
@@ -1712,19 +1674,16 @@ mod tests {
                     (
                         InteractionState::Resolved {
                             resolution,
-                            resolved_at,
                             resolution_key,
                         },
                         InteractionStateSnapshot::Resolved {
                             resolution: expected_resolution,
                             resolution_view: expected_resolution_view,
-                            resolved_at: expected_resolved_at,
                             resolution_key: expected_resolution_key,
                         },
                     ) => {
                         assert!(resolution.live() == expected_resolution.live());
                         assert_eq!(resolution.view(), expected_resolution_view);
-                        assert_eq!(resolved_at, expected_resolved_at);
                         assert!(resolution_key == expected_resolution_key);
                     }
                     _ => panic!("interaction state changed"),
@@ -1746,7 +1705,6 @@ mod tests {
             match (&state.tool_exchange, &self.tool_exchange) {
                 (None, None) => {}
                 (Some(actual), Some(expected)) => {
-                    assert_eq!(actual.turn_id, expected.turn_id);
                     assert_eq!(actual.assistant_entry_id, expected.assistant_entry_id);
                     assert_eq!(
                         actual.assistant_message.as_ref(),
@@ -1820,21 +1778,18 @@ mod tests {
                     panic!("pending interaction probe unexpectedly became idempotent")
                 }
             }
-        } else if let Some((turn_id, item_id, tool_call_id)) =
+        } else if let Some((item_id, tool_call_id)) =
             probe.tool_exchange.as_ref().and_then(|exchange| {
                 exchange
                     .expected
                     .iter()
                     .find(|expected| expected.terminal.is_none())
-                    .map(|expected| {
-                        (
-                            exchange.turn_id,
-                            expected.item_id,
-                            expected.tool_call_id.clone(),
-                        )
-                    })
+                    .map(|expected| (expected.item_id, expected.tool_call_id.clone()))
             })
         {
+            let turn_id = probe
+                .current_turn
+                .expect("unfinished tool exchange has a current turn");
             probe
                 .apply_tool_message(
                     completed_tool(item_id, tool_call_id.as_str(), "post-error probe"),
@@ -3938,7 +3893,7 @@ mod tests {
         let mut candidates = [Ok::<_, ()>(seeded), Ok(fresh)].into_iter();
 
         assert_eq!(
-            generator.allocate_with(|| candidates.next().unwrap()),
+            generator.allocate_candidates(|| candidates.next().unwrap()),
             Ok(fresh)
         );
     }
@@ -3949,11 +3904,11 @@ mod tests {
         let mut generator = EntryIdGenerator::new([]);
 
         assert_eq!(
-            generator.allocate_with(|| Ok::<_, ()>(candidate)),
+            generator.allocate_candidates(|| Ok::<_, ()>(candidate)),
             Ok(candidate)
         );
         assert_eq!(
-            generator.allocate_with(|| Ok::<_, ()>(candidate)),
+            generator.allocate_candidates(|| Ok::<_, ()>(candidate)),
             Err(EntryIdAllocationError::CollisionAttemptsExhausted)
         );
     }
@@ -3966,7 +3921,7 @@ mod tests {
         let mut candidates = [Ok::<_, ()>(collision), Ok(unique)].into_iter();
 
         assert_eq!(
-            generator.allocate_with(|| candidates.next().unwrap()),
+            generator.allocate_candidates(|| candidates.next().unwrap()),
             Ok(unique)
         );
     }
@@ -3978,7 +3933,7 @@ mod tests {
         let mut attempts = 0;
 
         assert_eq!(
-            generator.allocate_with(|| {
+            generator.allocate_candidates(|| {
                 attempts += 1;
                 Ok::<_, ()>(collision)
             }),
@@ -3995,7 +3950,7 @@ mod tests {
         let reserved_before = generator.reserved.clone();
 
         let error = generator
-            .allocate_with(|| Err::<EntryId, _>(raw_entropy))
+            .allocate_candidates(|| Err::<EntryId, _>(raw_entropy))
             .unwrap_err();
 
         assert_eq!(error, EntryIdAllocationError::EntropyUnavailable);
@@ -4003,7 +3958,7 @@ mod tests {
         assert!(!format!("{error:?} {error}").contains(raw_entropy));
         assert_eq!(generator.reserved, reserved_before);
         assert_eq!(
-            generator.allocate_with(|| Ok::<_, ()>(sentinel)),
+            generator.allocate_candidates(|| Ok::<_, ()>(sentinel)),
             Ok(sentinel)
         );
     }
@@ -4018,12 +3973,12 @@ mod tests {
             std::iter::repeat_n(Ok::<_, ()>(collision), 32).chain(std::iter::once(Ok(sentinel)));
 
         assert_eq!(
-            generator.allocate_with(|| candidates.next().unwrap()),
+            generator.allocate_candidates(|| candidates.next().unwrap()),
             Err(EntryIdAllocationError::CollisionAttemptsExhausted)
         );
         assert_eq!(generator.reserved, reserved_before);
         assert_eq!(
-            generator.allocate_with(|| candidates.next().unwrap()),
+            generator.allocate_candidates(|| candidates.next().unwrap()),
             Ok(sentinel)
         );
     }
@@ -4035,7 +3990,7 @@ mod tests {
         let raw_entropy = "raw entropy detail";
         let mut generator = EntryIdGenerator::new([id]);
         let error = generator
-            .allocate_with(|| Err::<EntryId, _>(raw_entropy))
+            .allocate_candidates(|| Err::<EntryId, _>(raw_entropy))
             .unwrap_err();
 
         assert_eq!(

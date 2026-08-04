@@ -25,7 +25,6 @@ use crate::wire::conversation_jsonl::ConversationCodecError;
 use crate::wire::conversation_jsonl_scanner::{
     ConversationJsonlScanner, ConversationLineCanonicality, ConversationLineFault,
     ConversationScanAccess, ConversationScanError, ConversationScanEvent,
-    MAX_CONVERSATION_ENTRY_RECORDS,
 };
 use crate::wire::{
     BoundedJsonObject, EntryId, InteractionResolutionKey, ItemId, RequestId,
@@ -201,10 +200,6 @@ pub(crate) fn validate_unpublished_conversation_for_recovery<R: Read>(
         return Err(UnpublishedConversationRecoveryError::Corrupt);
     }
 
-    // The production scanner applies the same fixed V1 complete-entry cap before yielding an
-    // Event. The explicit bound keeps this identity set bounded if scanner internals evolve.
-    let maximum_recovery_entry_ids = usize::try_from(MAX_CONVERSATION_ENTRY_RECORDS)
-        .map_err(|_| UnpublishedConversationRecoveryError::TooLarge)?;
     let mut seen_entry_ids = BTreeSet::new();
     let mut previous_entry_id = None;
 
@@ -233,9 +228,6 @@ pub(crate) fn validate_unpublished_conversation_for_recovery<R: Read>(
                 }
                 if expected_shape == UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly {
                     return Err(UnpublishedConversationRecoveryError::Corrupt);
-                }
-                if seen_entry_ids.len() >= maximum_recovery_entry_ids {
-                    return Err(UnpublishedConversationRecoveryError::TooLarge);
                 }
                 if !seen_entry_ids.insert(entry.entry_id()) {
                     return Err(UnpublishedConversationRecoveryError::Corrupt);
