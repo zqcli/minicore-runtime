@@ -1,11 +1,13 @@
 # DurableState 架构设计
 
-状态：M5.0 design gate 已冻结；Store recovery foundation implementation in progress（ADR 0136、0137）
+状态：M5.0 design gate、production recovery/root lease/owner-tracked actor与private reservation foundation已实现；production mutation API及COMMITTED/PUBLISHED publication pending（ADR 0136、0137）
 日期：2026-08-03
 
 ## 目的
 
 `DurableState`是MiniCore private deep module：在一个专用、user-private local store root中，拥有Agent/Session entity的物理布局、永久identity reservation、root lease、catalog/head installation、immutable generation、CAS recheck、marker publication、readback、recovery/cleanup、poison/closing状态和filesystem fault seam。它把跨文件durability复杂性收在一个operation owner内，而不是交给lifecycle caller拼装。
+
+当前 foundation slice 只恢复并保留永久 reservation inventory、actor owner fields 和 local physical-certainty port；**没有 standalone production `reserve` API、reservation token/receipt 或 caller-visible reservation waiter**。下一 publication slice 的 concrete Create/Fork request 会在同一 actor 内消费这些基础。
 
 [Durable Store V1](../formats/durable-store-v1.md)是路径、bytes、field order和scanner precedence的唯一exact owner；本模块拥有这些bytes的operation语义。
 

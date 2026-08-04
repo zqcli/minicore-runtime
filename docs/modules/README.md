@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0135冻结async conversation/public wire基础；ADR 0136冻结DurableState、Durable Store V1、root lease、reservation与new-entity Create/Fork complete-or-invisible / existing-head update old-or-new publication；ADR 0137冻结Tokio owner-tracked deterministic foundation。M5.0 design gate已完成；DurableState foundation、Runtime、Session、Recorder/replay、SessionExecutor/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0135冻结async conversation/public wire基础；ADR 0136冻结DurableState、Durable Store V1、root lease、reservation与new-entity Create/Fork complete-or-invisible / existing-head update old-or-new publication；ADR 0137冻结Tokio owner-tracked deterministic foundation。M5.0 design gate已完成；production recovery/root lease/owner-tracked actor foundation与private reservation foundation slice已实现（仍无production mutation API）；COMMITTED/PUBLISHED publication、production Create/Fork mutation API、Recorder/replay、Runtime、SessionExecutor/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为仍待实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
@@ -60,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4与M5.0 durable entity/async design gate已完成。M3.2 only implemented the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its future sole production issuer and does not claim root-lease production implementation. M5.0 foundation implementation是下一任务，随后是M5.1 Recorder与M5.2 semantic replay，再进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；production recovery/root lease/owner-tracked actor foundation与private reservation foundation slice已实现（仍无production mutation API）；COMMITTED/PUBLISHED publication、production Create/Fork mutation API、Recorder/replay pending。随后进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。
