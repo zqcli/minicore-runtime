@@ -1,15 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{
     AgentDefinition, AgentMetadata, AgentStatus, SessionDefinition, SessionForkProvenance,
@@ -50,6 +54,8 @@ const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_PAYLOAD_ENTRY_CAP: usize = 3;
 const DURABLE_STATE_ACTOR_QUEUE_CAPACITY: usize = 1;
+#[allow(dead_code)]
+const RESERVATION_COLLISION_ATTEMPT_CAP: usize = 32;
 
 /// The private physical generation ordinal used only by Store V1 documents and paths.
 #[allow(
@@ -446,6 +452,8 @@ struct RecoveredCatalog {
 /// cleanup has completed under the still-held root lease.
 struct RecoveryCandidate {
     catalog: RecoveredCatalog,
+    agent_reservations: BTreeMap<AgentId, CleanupNodeIdentityShape>,
+    session_reservations: BTreeMap<SessionId, CleanupNodeIdentityShape>,
     cleanup: Option<DeferredCleanup>,
 }
 
@@ -634,27 +642,155 @@ struct RecoveredSessionGenerationChain {
     markerless: Option<MarkerlessGenerationFiles>,
 }
 
-/// The private serial owner for future DurableState mutations. This slice establishes the
-/// request/settlement lifecycle only; reservation and durable payload requests stay out of it.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationPhysicalObservation {
+    Created,
+    AlreadyExistsCanonical,
+    CreateErrorAbsent,
+    CreateErrorPresent,
+    CreatedThenErrorPresent,
+    Corrupt,
+    Indeterminate,
+}
+
+/// The private serial owner for future durable mutations. The inventory, root and filesystem
+/// fields are deliberately retained now so the adjacent publication slice can consume them from
+/// the same owner; this slice exposes no production reservation operation.
+#[allow(dead_code)]
 struct DurableStateActor {
     receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
+    root: PathBuf,
+    directory_sync: DirectorySync,
+    recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
+    recovered_session_reservations: Arc<BTreeSet<SessionId>>,
+    new_agent_reservations: BTreeSet<AgentId>,
+    new_session_reservations: BTreeSet<SessionId>,
+    task_context: RuntimeTaskContext,
+    filesystem: Arc<dyn DurableFilesystem>,
     #[cfg(test)]
     receiver_closed: Arc<tokio::sync::Notify>,
 }
 
-enum DurableStateActorRequest {
-    #[cfg(test)]
-    Probe(DurableStateActorProbe),
-    #[cfg(not(test))]
-    #[allow(
-        dead_code,
-        reason = "the private probe preserves the actor request seam"
-    )]
-    Probe,
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationAttemptStage {
+    Pending = 0,
+    Crossed = 1,
+    #[allow(dead_code)]
+    Cancelled = 2,
 }
 
-/// A redacted terminal response for a request owned by the durable-state actor.
+impl ReservationAttemptStage {
+    fn try_cross(stage: &AtomicU8) -> bool {
+        stage
+            .compare_exchange(
+                Self::Pending as u8,
+                Self::Crossed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn try_cancel(stage: &AtomicU8) -> bool {
+        stage
+            .compare_exchange(
+                Self::Pending as u8,
+                Self::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    #[cfg(test)]
+    fn load(stage: &AtomicU8) -> Self {
+        match stage.load(Ordering::Acquire) {
+            value if value == Self::Pending as u8 => Self::Pending,
+            value if value == Self::Crossed as u8 => Self::Crossed,
+            value if value == Self::Cancelled as u8 => Self::Cancelled,
+            _ => unreachable!("reservation attempt state is closed over three values"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TestReservationError {
+    Closing,
+    TooLarge,
+    EntropyUnavailable,
+    CollisionAttemptsExhausted,
+    StorageUnavailable,
+    DurableStateCorrupt,
+    IndeterminatePoisoned,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReservationFault {
+    BeforeCreate,
+    AfterSideEffectCreate,
+    FileSyncError,
+    ParentSyncError,
+    ReadbackUnavailable,
+    ReadbackAbsent,
+    CorruptBeforeFinalReadback,
+}
+
+#[cfg(test)]
+impl TestReservationError {
+    const fn is_poison(self) -> bool {
+        matches!(
+            self,
+            Self::DurableStateCorrupt | Self::IndeterminatePoisoned
+        )
+    }
+}
+
+#[cfg(test)]
+struct TestReservation<T> {
+    candidates: std::collections::VecDeque<Result<T, ()>>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    maximum: usize,
+    cancel_ack: Option<Arc<Notify>>,
+    response: Option<oneshot::Sender<Result<T, TestReservationError>>>,
+}
+
+#[cfg(test)]
+impl<T> TestReservation<T> {
+    fn next(&mut self) -> Result<T, TestReservationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.candidates
+            .pop_front()
+            .unwrap_or(Err(()))
+            .map_err(|()| TestReservationError::EntropyUnavailable)
+    }
+
+    fn settle(&mut self, outcome: Result<T, TestReservationError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+}
+
+#[cfg(test)]
+impl<T> Drop for TestReservation<T> {
+    fn drop(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(TestReservationError::IndeterminatePoisoned));
+        }
+    }
+}
+
+#[cfg(test)]
+type TestAgentReservation = TestReservation<AgentId>;
+#[cfg(test)]
+type TestSessionReservation = TestReservation<SessionId>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ActorRequestError {
     Closing,
@@ -669,9 +805,21 @@ impl fmt::Display for ActorRequestError {
 
 impl std::error::Error for ActorRequestError {}
 
-/// Keeps a request's reply capability with its queued payload until exactly one terminal path
-/// consumes it. Dropping an active local request, a queued receiver item, or a failed `try_send`
-/// return therefore cannot leave a requester waiting forever.
+enum DurableStateActorRequest {
+    #[cfg(test)]
+    Probe(DurableStateActorProbe),
+    #[cfg(test)]
+    ReserveAgent(TestAgentReservation),
+    #[cfg(test)]
+    ReserveSession(TestSessionReservation),
+    #[cfg(not(test))]
+    #[allow(
+        dead_code,
+        reason = "keeps the private actor request seam instantiated"
+    )]
+    Probe,
+}
+
 struct DurableStateActorRequestEnvelope {
     request: DurableStateActorRequest,
     response: Option<oneshot::Sender<Result<(), ActorRequestError>>>,
@@ -707,24 +855,40 @@ impl DurableStateActorRequestEnvelope {
 
     fn reject_closing(&mut self) {
         self.settle(Err(ActorRequestError::Closing));
+        #[cfg(test)]
+        match &mut self.request {
+            DurableStateActorRequest::Probe(_) => {}
+            DurableStateActorRequest::ReserveAgent(request) => {
+                request.settle(Err(TestReservationError::Closing));
+            }
+            DurableStateActorRequest::ReserveSession(request) => {
+                request.settle(Err(TestReservationError::Closing));
+            }
+        }
     }
 
-    #[cfg(not(test))]
     fn reject_unavailable(&mut self) {
         self.settle(Err(ActorRequestError::Unavailable));
+        #[cfg(test)]
+        match &mut self.request {
+            DurableStateActorRequest::Probe(_) => {}
+            DurableStateActorRequest::ReserveAgent(request) => {
+                request.settle(Err(TestReservationError::StorageUnavailable));
+            }
+            DurableStateActorRequest::ReserveSession(request) => {
+                request.settle(Err(TestReservationError::StorageUnavailable));
+            }
+        }
     }
 
     #[cfg(test)]
-    fn reject_on_drop_as(&mut self, error: ActorRequestError) {
-        self.drop_error = error;
-    }
-
-    #[cfg(test)]
-    fn probe_signals(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    fn probe_signals(&self) -> Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)> {
         match &self.request {
             DurableStateActorRequest::Probe(probe) => {
-                (Arc::clone(&probe.entered), Arc::clone(&probe.release))
+                Some((Arc::clone(&probe.entered), Arc::clone(&probe.release)))
             }
+            DurableStateActorRequest::ReserveAgent(_)
+            | DurableStateActorRequest::ReserveSession(_) => None,
         }
     }
 }
@@ -764,13 +928,60 @@ enum DurableStateActorProbeDelivery {
     Rejected,
 }
 
+#[cfg(test)]
+struct TestReservationWaiter<T> {
+    response: oneshot::Receiver<Result<T, TestReservationError>>,
+}
+
+#[cfg(test)]
+impl<T> TestReservationWaiter<T> {
+    async fn wait(self) -> Result<T, TestReservationError> {
+        self.response
+            .await
+            .unwrap_or(Err(TestReservationError::IndeterminatePoisoned))
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum ReservationAttemptJobOutcome {
+    Cancelled,
+    Observed(ReservationPhysicalObservation),
+}
+
+/// An aborted or panicking actor must close admission before its owner can be joined. This is
+/// deliberately independent of request settlement: a child operation may still finish, but the
+/// dead actor can no longer admit a new mutation.
+struct UnexpectedActorExitGuard {
+    task_context: RuntimeTaskContext,
+    armed: bool,
+}
+
+impl UnexpectedActorExitGuard {
+    fn new(task_context: RuntimeTaskContext) -> Self {
+        Self {
+            task_context,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UnexpectedActorExitGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.task_context.request_closing();
+        }
+    }
+}
+
 /// Opaque owner-side control for the one tracked DurableState actor.
 #[derive(Clone)]
 struct DurableStateActorHandle {
-    #[allow(
-        dead_code,
-        reason = "retains the actor channel's sender end until future durable requests use it"
-    )]
+    #[allow(dead_code)]
     sender: mpsc::Sender<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
     task: TrackedTask,
@@ -779,7 +990,14 @@ struct DurableStateActorHandle {
 }
 
 impl DurableStateActorHandle {
-    fn start(task_context: &RuntimeTaskContext) -> Result<Self, RuntimeTaskError> {
+    fn start(
+        task_context: &RuntimeTaskContext,
+        root: PathBuf,
+        directory_sync: DirectorySync,
+        recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
+        recovered_session_reservations: Arc<BTreeSet<SessionId>>,
+        filesystem: Arc<dyn DurableFilesystem>,
+    ) -> Result<Self, RuntimeTaskError> {
         let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
         let closing = CancellationToken::new();
         #[cfg(test)]
@@ -787,6 +1005,14 @@ impl DurableStateActorHandle {
         let actor = DurableStateActor {
             receiver,
             closing: closing.clone(),
+            root,
+            directory_sync,
+            recovered_agent_reservations,
+            recovered_session_reservations,
+            new_agent_reservations: BTreeSet::new(),
+            new_session_reservations: BTreeSet::new(),
+            task_context: task_context.clone(),
+            filesystem,
             #[cfg(test)]
             receiver_closed: Arc::clone(&receiver_closed),
         };
@@ -819,15 +1045,119 @@ impl DurableStateActorHandle {
         );
         if self.closing.is_cancelled() {
             request.reject_closing();
-            return DurableStateActorProbeWaiter { response };
+        } else {
+            let _ = self.try_enqueue(request);
         }
-        let _ = self.try_enqueue(request);
         DurableStateActorProbeWaiter { response }
     }
 
-    /// Test-only deterministic gate between the cancellation fast-path and `try_send`.
-    /// The gate runs on a helper thread so the current-thread actor cannot close its receiver
-    /// until the test deliberately yields it a turn.
+    #[cfg(test)]
+    fn reserve_agent_with_script(
+        &self,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> TestReservationWaiter<AgentId> {
+        self.reserve_agent_with_script_at_maximum(candidates, calls, AGENT_RESERVATION_ENTRY_CAP)
+    }
+
+    #[cfg(test)]
+    fn reserve_agent_with_script_at_maximum(
+        &self,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: usize,
+    ) -> TestReservationWaiter<AgentId> {
+        let (response, waiter) = oneshot::channel();
+        let request = TestAgentReservation {
+            candidates: candidates.into_iter().collect(),
+            calls,
+            maximum,
+            cancel_ack: None,
+            response: Some(response),
+        };
+        self.enqueue_test_reservation(DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::ReserveAgent(request),
+            response: None,
+            drop_error: ActorRequestError::Unavailable,
+        });
+        TestReservationWaiter { response: waiter }
+    }
+
+    #[cfg(test)]
+    fn reserve_session_with_script(
+        &self,
+        candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> TestReservationWaiter<SessionId> {
+        self.reserve_session_with_script_at_maximum(
+            candidates,
+            calls,
+            SESSION_RESERVATION_ENTRY_CAP,
+        )
+    }
+
+    #[cfg(test)]
+    fn reserve_session_with_script_at_maximum(
+        &self,
+        candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: usize,
+    ) -> TestReservationWaiter<SessionId> {
+        let (response, waiter) = oneshot::channel();
+        let request = TestSessionReservation {
+            candidates: candidates.into_iter().collect(),
+            calls,
+            maximum,
+            cancel_ack: None,
+            response: Some(response),
+        };
+        self.enqueue_test_reservation(DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::ReserveSession(request),
+            response: None,
+            drop_error: ActorRequestError::Unavailable,
+        });
+        TestReservationWaiter { response: waiter }
+    }
+
+    #[cfg(test)]
+    fn reserve_agent_with_script_at_maximum_and_cancel_ack(
+        &self,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        maximum: usize,
+        cancel_ack: Arc<Notify>,
+    ) -> TestReservationWaiter<AgentId> {
+        let (response, waiter) = oneshot::channel();
+        let request = TestAgentReservation {
+            candidates: candidates.into_iter().collect(),
+            calls,
+            maximum,
+            cancel_ack: Some(cancel_ack),
+            response: Some(response),
+        };
+        self.enqueue_test_reservation(DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::ReserveAgent(request),
+            response: None,
+            drop_error: ActorRequestError::Unavailable,
+        });
+        TestReservationWaiter { response: waiter }
+    }
+
+    #[cfg(test)]
+    fn enqueue_test_reservation(&self, mut request: DurableStateActorRequestEnvelope) {
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+        } else if let Err(error) = self.sender.try_send(request) {
+            request = error.into_inner();
+            if self.closing.is_cancelled() {
+                request.reject_closing();
+            } else {
+                request.reject_unavailable();
+            }
+        }
+    }
+
+    /// Test-only deterministic gate between cancellation's fast path and `try_send`.
     #[cfg(test)]
     fn enqueue_probe_after_fast_reject_gate(
         &self,
@@ -856,9 +1186,7 @@ impl DurableStateActorHandle {
         (DurableStateActorProbeWaiter { response }, delivery)
     }
 
-    /// Test-only deterministic gate after the cancellation fast-path and the capacity
-    /// reservation which starts `try_send`. The retained permit represents a sender that won
-    /// the pre-close channel gate but has not yet published its envelope.
+    /// Test-only deterministic gate after cancellation's fast path and the capacity reservation.
     #[cfg(test)]
     fn enqueue_probe_after_fast_reject_and_sender_gate(
         &self,
@@ -880,13 +1208,11 @@ impl DurableStateActorHandle {
         let permit = match self.sender.try_reserve() {
             Ok(permit) => permit,
             Err(_) => {
-                let rejection = if self.closing.is_cancelled() {
-                    ActorRequestError::Closing
+                if self.closing.is_cancelled() {
+                    request.reject_closing();
                 } else {
-                    ActorRequestError::Unavailable
-                };
-                request.reject_on_drop_as(rejection);
-                drop(request);
+                    request.reject_unavailable();
+                }
                 return (
                     DurableStateActorProbeWaiter { response },
                     DurableStateActorProbeDelivery::Rejected,
@@ -909,19 +1235,17 @@ impl DurableStateActorHandle {
     #[cfg(test)]
     fn try_enqueue(
         &self,
-        request: DurableStateActorRequestEnvelope,
+        mut request: DurableStateActorRequestEnvelope,
     ) -> DurableStateActorProbeDelivery {
         match self.sender.try_send(request) {
             Ok(()) => DurableStateActorProbeDelivery::Accepted,
             Err(error) => {
-                let mut request = error.into_inner();
-                let rejection = if self.closing.is_cancelled() {
-                    ActorRequestError::Closing
+                request = error.into_inner();
+                if self.closing.is_cancelled() {
+                    request.reject_closing();
                 } else {
-                    ActorRequestError::Unavailable
-                };
-                request.reject_on_drop_as(rejection);
-                drop(request);
+                    request.reject_unavailable();
+                }
                 DurableStateActorProbeDelivery::Rejected
             }
         }
@@ -929,7 +1253,15 @@ impl DurableStateActorHandle {
 }
 
 impl DurableStateActor {
-    async fn run(mut self) {
+    fn run(self) -> impl Future<Output = ()> + Send {
+        let mut unexpected_exit = UnexpectedActorExitGuard::new(self.task_context.clone());
+        async move {
+            self.run_loop().await;
+            unexpected_exit.disarm();
+        }
+    }
+
+    async fn run_loop(mut self) {
         loop {
             tokio::select! {
                 biased;
@@ -939,36 +1271,270 @@ impl DurableStateActor {
                 }
                 request = self.receiver.recv() => match request {
                     None => return,
-                    #[cfg(test)]
                     Some(mut request) => {
                         if self.closing.is_cancelled() {
                             self.close_current_and_reject_queued(&mut request).await;
                             return;
                         }
-
-                        let (entered, release) = request.probe_signals();
-                        entered.notify_one();
-                        tokio::select! {
-                            biased;
-                            _ = self.closing.cancelled() => {
-                                self.close_current_and_reject_queued(&mut request).await;
-                                return;
+                        #[cfg(test)]
+                        match &mut request.request {
+                            DurableStateActorRequest::Probe(_) => {
+                                let (entered, release) = request.probe_signals().expect("Probe has signals");
+                                entered.notify_one();
+                                tokio::select! {
+                                    biased;
+                                    _ = self.closing.cancelled() => {
+                                        self.close_current_and_reject_queued(&mut request).await;
+                                        return;
+                                    }
+                                    _ = release.notified() => request.complete(),
+                                }
                             }
-                            _ = release.notified() => request.complete(),
+                            DurableStateActorRequest::ReserveAgent(reservation) => {
+                                let outcome = self.reserve_agent_for_test(reservation).await;
+                                let poison = outcome.is_err_and(TestReservationError::is_poison);
+                                reservation.settle(outcome);
+                                if poison {
+                                    self.poison_test_admission().await;
+                                    return;
+                                }
+                            }
+                            DurableStateActorRequest::ReserveSession(reservation) => {
+                                let outcome = self.reserve_session_for_test(reservation).await;
+                                let poison = outcome.is_err_and(TestReservationError::is_poison);
+                                reservation.settle(outcome);
+                                if poison {
+                                    self.poison_test_admission().await;
+                                    return;
+                                }
+                            }
                         }
-                    }
-                    #[cfg(not(test))]
-                    Some(mut request) => {
-                        let DurableStateActorRequest::Probe = &request.request;
-                        request.reject_unavailable();
+                        #[cfg(not(test))]
+                        {
+                            let DurableStateActorRequest::Probe = request.request;
+                            request.reject_unavailable();
+                        }
                     }
                 },
             }
         }
     }
 
-    /// `Receiver::close` is the linearization point with concurrent `try_send` calls. Only
-    /// after it returns may closing safely settle every request that was accepted before it.
+    #[cfg(test)]
+    fn reconcile_test_reservation<T: Copy + Ord>(
+        inventory: &mut BTreeSet<T>,
+        candidate: T,
+        was_present: bool,
+        observation: ReservationPhysicalObservation,
+        collisions: &mut usize,
+    ) -> Result<Option<T>, TestReservationError> {
+        match observation {
+            ReservationPhysicalObservation::Created if !was_present => {
+                inventory.insert(candidate);
+                Ok(Some(candidate))
+            }
+            ReservationPhysicalObservation::AlreadyExistsCanonical if was_present => {
+                *collisions += 1;
+                if *collisions == RESERVATION_COLLISION_ATTEMPT_CAP {
+                    Err(TestReservationError::CollisionAttemptsExhausted)
+                } else {
+                    Ok(None)
+                }
+            }
+            ReservationPhysicalObservation::CreateErrorAbsent if !was_present => {
+                Err(TestReservationError::StorageUnavailable)
+            }
+            ReservationPhysicalObservation::CreateErrorPresent if was_present => {
+                Err(TestReservationError::StorageUnavailable)
+            }
+            ReservationPhysicalObservation::CreateErrorPresent
+            | ReservationPhysicalObservation::CreatedThenErrorPresent
+                if !was_present =>
+            {
+                inventory.insert(candidate);
+                Err(TestReservationError::StorageUnavailable)
+            }
+            ReservationPhysicalObservation::Indeterminate => {
+                Err(TestReservationError::IndeterminatePoisoned)
+            }
+            ReservationPhysicalObservation::Corrupt
+            | ReservationPhysicalObservation::Created
+            | ReservationPhysicalObservation::AlreadyExistsCanonical
+            | ReservationPhysicalObservation::CreateErrorAbsent
+            | ReservationPhysicalObservation::CreateErrorPresent
+            | ReservationPhysicalObservation::CreatedThenErrorPresent => {
+                Err(TestReservationError::DurableStateCorrupt)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn reserve_agent_for_test(
+        &mut self,
+        request: &mut TestAgentReservation,
+    ) -> Result<AgentId, TestReservationError> {
+        if self.recovered_agent_reservations.len() + self.new_agent_reservations.len()
+            >= request.maximum
+        {
+            return Err(TestReservationError::TooLarge);
+        }
+        let mut collisions = 0;
+        loop {
+            if self.closing.is_cancelled() {
+                return Err(TestReservationError::Closing);
+            }
+            let candidate = request.next()?;
+            let was_present = self.recovered_agent_reservations.contains(&candidate)
+                || self.new_agent_reservations.contains(&candidate);
+            let observation = self
+                .run_reservation_attempt(
+                    self.root
+                        .join(RESERVATIONS_DIRECTORY)
+                        .join(AGENTS_DIRECTORY)
+                        .join(candidate.to_string()),
+                    request.cancel_ack.as_deref(),
+                )
+                .await?;
+            if let Some(reserved) = Self::reconcile_test_reservation(
+                &mut self.new_agent_reservations,
+                candidate,
+                was_present,
+                observation,
+                &mut collisions,
+            )? {
+                return Ok(reserved);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn reserve_session_for_test(
+        &mut self,
+        request: &mut TestSessionReservation,
+    ) -> Result<SessionId, TestReservationError> {
+        if self.recovered_session_reservations.len() + self.new_session_reservations.len()
+            >= request.maximum
+        {
+            return Err(TestReservationError::TooLarge);
+        }
+        let mut collisions = 0;
+        loop {
+            if self.closing.is_cancelled() {
+                return Err(TestReservationError::Closing);
+            }
+            let candidate = request.next()?;
+            let was_present = self.recovered_session_reservations.contains(&candidate)
+                || self.new_session_reservations.contains(&candidate);
+            let observation = self
+                .run_reservation_attempt(
+                    self.root
+                        .join(RESERVATIONS_DIRECTORY)
+                        .join(SESSIONS_DIRECTORY)
+                        .join(candidate.to_string()),
+                    request.cancel_ack.as_deref(),
+                )
+                .await?;
+            if let Some(reserved) = Self::reconcile_test_reservation(
+                &mut self.new_session_reservations,
+                candidate,
+                was_present,
+                observation,
+                &mut collisions,
+            )? {
+                return Ok(reserved);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn run_reservation_attempt(
+        &self,
+        path: PathBuf,
+        cancel_ack: Option<&Notify>,
+    ) -> Result<ReservationPhysicalObservation, TestReservationError> {
+        let stage = Arc::new(AtomicU8::new(ReservationAttemptStage::Pending as u8));
+        let filesystem = Arc::clone(&self.filesystem);
+        let directory_sync = self.directory_sync;
+        let job_stage = Arc::clone(&stage);
+        let job =
+            self.task_context.spawn_blocking_tracked(move || {
+                match attempt_local_reservation(
+                    filesystem.as_ref(),
+                    &path,
+                    directory_sync,
+                    &job_stage,
+                ) {
+                    Some(observation) => ReservationAttemptJobOutcome::Observed(observation),
+                    None => ReservationAttemptJobOutcome::Cancelled,
+                }
+            });
+        let mut job_wait = Box::pin(job.wait());
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                let closing_won = ReservationAttemptStage::try_cancel(&stage);
+                if closing_won {
+                    if let Some(cancel_ack) = cancel_ack {
+                        cancel_ack.notify_one();
+                    }
+                }
+                let result = job_wait.await;
+                Self::settle_reservation_attempt(result, &stage, closing_won)
+            }
+            result = &mut job_wait => {
+                Self::settle_reservation_attempt(result, &stage, false)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn settle_reservation_attempt(
+        result: Result<ReservationAttemptJobOutcome, RuntimeTaskError>,
+        stage: &AtomicU8,
+        closing_won: bool,
+    ) -> Result<ReservationPhysicalObservation, TestReservationError> {
+        match result {
+            Ok(ReservationAttemptJobOutcome::Observed(_)) if closing_won => {
+                Err(TestReservationError::IndeterminatePoisoned)
+            }
+            Ok(ReservationAttemptJobOutcome::Observed(observation)) => Ok(observation),
+            Ok(ReservationAttemptJobOutcome::Cancelled) if closing_won => {
+                Err(TestReservationError::Closing)
+            }
+            Ok(ReservationAttemptJobOutcome::Cancelled) => {
+                Err(TestReservationError::IndeterminatePoisoned)
+            }
+            Err(error) => Err(Self::classify_reservation_job_error(error, stage)),
+        }
+    }
+
+    #[cfg(test)]
+    fn classify_reservation_job_error(
+        error: RuntimeTaskError,
+        stage: &AtomicU8,
+    ) -> TestReservationError {
+        match ReservationAttemptStage::load(stage) {
+            ReservationAttemptStage::Crossed => TestReservationError::IndeterminatePoisoned,
+            ReservationAttemptStage::Pending | ReservationAttemptStage::Cancelled => {
+                if error == RuntimeTaskError::OwnerClosing {
+                    TestReservationError::Closing
+                } else {
+                    TestReservationError::StorageUnavailable
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    async fn poison_test_admission(&mut self) {
+        // This test-only transition closes actor/task admission. Concrete Create/publication
+        // requests will own production fatal propagation; there is no Runtime signal abstraction.
+        self.task_context.request_closing();
+        self.closing.cancel();
+        self.close_receiver_and_reject_queued().await;
+    }
+
+    /// `Receiver::close` is the linearization point with concurrent `try_send` calls.
     async fn close_receiver_and_reject_queued(&mut self) {
         self.receiver.close();
         #[cfg(test)]
@@ -976,12 +1542,12 @@ impl DurableStateActor {
         self.reject_queued_as_closing().await;
     }
 
-    #[cfg(test)]
     async fn close_current_and_reject_queued(
         &mut self,
         current: &mut DurableStateActorRequestEnvelope,
     ) {
         self.receiver.close();
+        #[cfg(test)]
         self.receiver_closed.notify_waiters();
         current.reject_closing();
         self.reject_queued_as_closing().await;
@@ -1019,29 +1585,55 @@ impl DurableState {
         root: PathBuf,
         task_context: RuntimeTaskContext,
     ) -> Result<Self, DurableOpenError> {
-        let job = task_context.spawn_blocking_tracked(move || open_root(root));
+        Self::open_with_filesystem(root, task_context, Arc::new(LocalFilesystem)).await
+    }
+
+    async fn open_with_filesystem(
+        root: PathBuf,
+        task_context: RuntimeTaskContext,
+        filesystem: Arc<dyn DurableFilesystem>,
+    ) -> Result<Self, DurableOpenError> {
+        let filesystem_for_open = Arc::clone(&filesystem);
+        let job = task_context.spawn_blocking_tracked(move || {
+            open_root_with_durable_filesystem(root, filesystem_for_open.as_ref()).map(Arc::new)
+        });
         let opened = match job.wait().await {
             Ok(Ok(opened)) => opened,
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(DurableOpenError::StorageUnavailable),
         };
-        let actor = match DurableStateActorHandle::start(&task_context) {
+        let OpenRoot {
+            lease,
+            agents,
+            sessions,
+            root,
+            directory_sync,
+            agent_reservations,
+            session_reservations,
+        } = &*opened;
+        let actor = match DurableStateActorHandle::start(
+            &task_context,
+            root.clone(),
+            *directory_sync,
+            Arc::clone(agent_reservations),
+            Arc::clone(session_reservations),
+            filesystem,
+        ) {
             Ok(actor) => actor,
             Err(_) => {
                 // The successful open job remains owner-retained until shutdown joins its raw
                 // handle. Do not release the root lease while that work is still outstanding.
                 task_context.shutdown().await;
-                opened.lease.release();
+                lease.release();
                 return Err(DurableOpenError::StorageUnavailable);
             }
         };
-
         Ok(Self {
             task_context,
             actor,
-            lease: opened.lease,
-            agents: opened.agents,
-            sessions: opened.sessions,
+            lease: Arc::clone(lease),
+            agents: Arc::clone(agents),
+            sessions: Arc::clone(sessions),
         })
     }
 
@@ -1129,6 +1721,10 @@ struct OpenRoot {
     lease: Arc<RootLease>,
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
     sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
+    root: PathBuf,
+    directory_sync: DirectorySync,
+    agent_reservations: Arc<BTreeSet<AgentId>>,
+    session_reservations: Arc<BTreeSet<SessionId>>,
 }
 
 impl RootLease {
@@ -1153,14 +1749,14 @@ enum DirectorySync {
     Unsupported,
 }
 
+#[cfg(test)]
 fn open_root(root: PathBuf) -> Result<OpenRoot, DurableOpenError> {
-    let filesystem = LocalFilesystem;
-    open_root_with_cleanup_filesystem(root, &filesystem)
+    open_root_with_durable_filesystem(root, &LocalFilesystem)
 }
 
-fn open_root_with_cleanup_filesystem(
+fn open_root_with_durable_filesystem(
     root: PathBuf,
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
 ) -> Result<OpenRoot, DurableOpenError> {
     prepare_root(&root)?;
     let marker_was_present = format_marker_exists(&root)?;
@@ -1178,30 +1774,43 @@ fn open_root_with_cleanup_filesystem(
     let root_entries = read_entries_bounded(&root, ROOT_ENTRY_CAP)?;
     let marker_present = contains_named_entry(&root_entries, FORMAT_MARKER);
 
-    let catalog = if marker_present {
-        let RecoveryCandidate { catalog, cleanup } = recover_marked_root(&root, &root_entries)?;
+    let (catalog, agent_reservations, session_reservations) = if marker_present {
+        let RecoveryCandidate {
+            catalog,
+            agent_reservations,
+            session_reservations,
+            cleanup,
+        } = recover_marked_root(&root, &root_entries)?;
         // No read iterator, DirEntry, or document File may outlive recovery into a destructive
         // step. The cleanup plan above owns only paths and boolean shape facts.
         drop(root_entries);
         if let Some(cleanup) = cleanup {
             finalize_deferred_cleanup(&cleanup, directory_sync, filesystem)?;
         }
-        catalog
+        (catalog, agent_reservations, session_reservations)
     } else {
         validate_markerless_root(&root_entries)?;
         drop(root_entries);
         complete_markerless_scaffold(&root, directory_sync)?;
         create_format_marker(&root, directory_sync)?;
-        RecoveredCatalog {
-            agents: BTreeMap::new(),
-            sessions: BTreeMap::new(),
-        }
+        (
+            RecoveredCatalog {
+                agents: BTreeMap::new(),
+                sessions: BTreeMap::new(),
+            },
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
     };
 
     Ok(OpenRoot {
         lease: Arc::new(RootLease::new(lock_file)),
         agents: Arc::new(catalog.agents),
         sessions: Arc::new(catalog.sessions),
+        root,
+        directory_sync,
+        agent_reservations: Arc::new(agent_reservations.into_keys().collect()),
+        session_reservations: Arc::new(session_reservations.into_keys().collect()),
     })
 }
 
@@ -1579,6 +2188,8 @@ fn recover_marked_root_with_caps(
     )?;
     Ok(RecoveryCandidate {
         catalog: RecoveredCatalog { agents, sessions },
+        agent_reservations,
+        session_reservations,
         cleanup,
     })
 }
@@ -3571,17 +4182,30 @@ fn sync_directory(path: &Path, directory_sync: DirectorySync) -> Result<(), Dura
         .map_err(|_| DurableOpenError::StorageUnavailable)
 }
 
-/// The intentionally small private destructive-I/O seam. Store scanning always uses the local
-/// standard-library read path; only deferred cleanup needs injectable remove/sync behavior.
-trait CleanupFilesystem {
+#[allow(dead_code)]
+trait DurableFilesystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> Result<(), ()>;
     fn remove_dir(&self, path: &Path) -> Result<(), ()>;
     fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()>;
+    #[cfg(test)]
+    fn before_entity_reservation_barrier(&self);
+    #[cfg(test)]
+    fn before_reservation_final_readback(&self);
+    #[cfg(test)]
+    fn after_known_reservation_collision(&self);
+    fn create_reservation(&self, path: &Path) -> io::Result<File>;
+    fn sync_reservation_file(&self, file: &File) -> io::Result<()>;
+    fn sync_reservation_parent(&self, path: &Path, directory_sync: DirectorySync)
+    -> Result<(), ()>;
+    fn reservation_handle_metadata(&self, file: &File) -> io::Result<fs::Metadata>;
+    fn reservation_path_metadata(&self, path: &Path) -> io::Result<fs::Metadata>;
+    fn open_reservation(&self, path: &Path) -> io::Result<File>;
+    fn reservation_read(&self, file: &mut File, buffer: &mut [u8]) -> io::Result<usize>;
 }
 
 struct LocalFilesystem;
 
-impl CleanupFilesystem for LocalFilesystem {
+impl DurableFilesystem for LocalFilesystem {
     fn remove_file(&self, path: &Path) -> Result<(), ()> {
         fs::remove_file(path).map_err(|_| ())
     }
@@ -3593,6 +4217,271 @@ impl CleanupFilesystem for LocalFilesystem {
     fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()> {
         sync_directory(path, directory_sync).map_err(|_| ())
     }
+
+    #[cfg(test)]
+    fn before_entity_reservation_barrier(&self) {}
+
+    #[cfg(test)]
+    fn before_reservation_final_readback(&self) {}
+
+    #[cfg(test)]
+    fn after_known_reservation_collision(&self) {}
+
+    fn create_reservation(&self, path: &Path) -> io::Result<File> {
+        create_reservation_file(path)
+    }
+
+    fn sync_reservation_file(&self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn sync_reservation_parent(
+        &self,
+        path: &Path,
+        directory_sync: DirectorySync,
+    ) -> Result<(), ()> {
+        sync_direct_parent(path, directory_sync).map_err(|_| ())
+    }
+
+    fn reservation_handle_metadata(&self, file: &File) -> io::Result<fs::Metadata> {
+        file.metadata()
+    }
+
+    fn reservation_path_metadata(&self, path: &Path) -> io::Result<fs::Metadata> {
+        fs::symlink_metadata(path)
+    }
+
+    fn open_reservation(&self, path: &Path) -> io::Result<File> {
+        File::open(path)
+    }
+
+    fn reservation_read(&self, file: &mut File, buffer: &mut [u8]) -> io::Result<usize> {
+        file.read(buffer)
+    }
+}
+
+fn create_reservation_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    set_new_file_mode(&mut options);
+    options.open(path)
+}
+
+#[allow(dead_code)]
+fn attempt_local_reservation(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    parent_sync: DirectorySync,
+    stage: &AtomicU8,
+) -> Option<ReservationPhysicalObservation> {
+    #[cfg(test)]
+    filesystem.before_entity_reservation_barrier();
+
+    // This is the sole worker-side linearization point. Once it fails, the actor has already
+    // closed the attempt and this worker must not touch the filesystem at all.
+    if !ReservationAttemptStage::try_cross(stage) {
+        return None;
+    }
+
+    let observation = (|| match filesystem.create_reservation(path) {
+        Ok(file) => {
+            let mut post_create_error = set_private_permissions(path, 0o600).is_err();
+            let handle_metadata = match validate_new_reservation_handle(filesystem, &file) {
+                Ok(metadata) => metadata,
+                Err(ReservationReadback::Corrupt) => {
+                    return ReservationPhysicalObservation::Corrupt;
+                }
+                Err(_) => return ReservationPhysicalObservation::Indeterminate,
+            };
+            if filesystem.sync_reservation_file(&file).is_err() {
+                post_create_error = true;
+            }
+            if parent_sync == DirectorySync::Supported
+                && filesystem
+                    .sync_reservation_parent(path, parent_sync)
+                    .is_err()
+            {
+                post_create_error = true;
+            }
+            match readback_reservation_marker(
+                filesystem,
+                path,
+                Some(&handle_metadata),
+                ReservationReadbackPhase::SuccessfulFinal,
+            ) {
+                ReservationReadback::Canonical if post_create_error => {
+                    ReservationPhysicalObservation::CreatedThenErrorPresent
+                }
+                ReservationReadback::Canonical => ReservationPhysicalObservation::Created,
+                ReservationReadback::Absent | ReservationReadback::Corrupt => {
+                    ReservationPhysicalObservation::Corrupt
+                }
+                ReservationReadback::Indeterminate => ReservationPhysicalObservation::Indeterminate,
+            }
+        }
+        Err(error) => {
+            let readback = readback_reservation_marker(
+                filesystem,
+                path,
+                None,
+                ReservationReadbackPhase::CreateErrorReconciliation,
+            );
+            match readback {
+                ReservationReadback::Canonical if error.kind() == io::ErrorKind::AlreadyExists => {
+                    #[cfg(test)]
+                    filesystem.after_known_reservation_collision();
+                    ReservationPhysicalObservation::AlreadyExistsCanonical
+                }
+                ReservationReadback::Canonical => {
+                    ReservationPhysicalObservation::CreateErrorPresent
+                }
+                ReservationReadback::Absent if error.kind() != io::ErrorKind::AlreadyExists => {
+                    ReservationPhysicalObservation::CreateErrorAbsent
+                }
+                ReservationReadback::Absent | ReservationReadback::Corrupt => {
+                    ReservationPhysicalObservation::Corrupt
+                }
+                ReservationReadback::Indeterminate => ReservationPhysicalObservation::Indeterminate,
+            }
+        }
+    })();
+    Some(observation)
+}
+
+#[allow(dead_code)]
+enum ReservationReadback {
+    Canonical,
+    Absent,
+    Corrupt,
+    Indeterminate,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReservationReadbackPhase {
+    CreateErrorReconciliation,
+    SuccessfulFinal,
+}
+
+#[allow(dead_code)]
+fn validate_new_reservation_handle(
+    filesystem: &dyn DurableFilesystem,
+    file: &File,
+) -> Result<fs::Metadata, ReservationReadback> {
+    let metadata = filesystem
+        .reservation_handle_metadata(file)
+        .map_err(|_| ReservationReadback::Indeterminate)?;
+    if !is_canonical_reservation_marker(&metadata) {
+        return Err(ReservationReadback::Corrupt);
+    }
+    Ok(metadata)
+}
+
+#[allow(dead_code)]
+fn readback_reservation_marker(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected_handle_metadata: Option<&fs::Metadata>,
+    phase: ReservationReadbackPhase,
+) -> ReservationReadback {
+    let initial_path_metadata = match filesystem.reservation_path_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ReservationReadback::Absent;
+        }
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    if !is_canonical_reservation_marker(&initial_path_metadata) {
+        return ReservationReadback::Corrupt;
+    }
+    let mut opened = match filesystem.open_reservation(path) {
+        Ok(file) => file,
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    let opened_metadata = match filesystem.reservation_handle_metadata(&opened) {
+        Ok(metadata) => metadata,
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    let opened_path_metadata = match filesystem.reservation_path_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ReservationReadback::Corrupt;
+        }
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    if !is_canonical_reservation_marker(&opened_metadata)
+        || !is_canonical_reservation_marker(&opened_path_metadata)
+        || !same_reservation_file_identity(&initial_path_metadata, &opened_metadata)
+        || !same_reservation_file_identity(&opened_metadata, &opened_path_metadata)
+        || expected_handle_metadata
+            .is_some_and(|expected| !same_reservation_file_identity(expected, &opened_metadata))
+    {
+        return ReservationReadback::Corrupt;
+    }
+    let mut byte = [0_u8; 1];
+    match filesystem.reservation_read(&mut opened, &mut byte) {
+        Ok(0) => {}
+        Ok(_) => return ReservationReadback::Corrupt,
+        Err(_) => return ReservationReadback::Indeterminate,
+    }
+    let final_opened_metadata = match filesystem.reservation_handle_metadata(&opened) {
+        Ok(metadata) => metadata,
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    #[cfg(test)]
+    if phase == ReservationReadbackPhase::SuccessfulFinal {
+        filesystem.before_reservation_final_readback();
+    }
+    #[cfg(not(test))]
+    let _ = phase;
+    let final_path_metadata = match filesystem.reservation_path_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ReservationReadback::Corrupt;
+        }
+        Err(_) => return ReservationReadback::Indeterminate,
+    };
+    if !is_canonical_reservation_marker(&final_opened_metadata)
+        || !is_canonical_reservation_marker(&final_path_metadata)
+        || !same_reservation_file_identity(&opened_metadata, &final_opened_metadata)
+        || !same_reservation_file_identity(&final_opened_metadata, &final_path_metadata)
+        || expected_handle_metadata.is_some_and(|expected| {
+            !same_reservation_file_identity(expected, &final_opened_metadata)
+        })
+    {
+        return ReservationReadback::Corrupt;
+    }
+    ReservationReadback::Canonical
+}
+
+#[allow(dead_code)]
+fn is_canonical_reservation_marker(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o7777 != 0o600 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+fn same_reservation_file_identity(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+
+#[cfg(not(unix))]
+#[allow(
+    dead_code,
+    reason = "the next publication slice retains the non-Unix identity seam"
+)]
+fn same_reservation_file_identity(_first: &fs::Metadata, _second: &fs::Metadata) -> bool {
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -3653,7 +4542,7 @@ fn revalidate_deferred_generation_cleanup(
 fn finalize_deferred_generation_cleanup(
     cleanup: &DeferredGenerationCleanup,
     directory_sync: DirectorySync,
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
 ) -> Result<(), DurableOpenError> {
     // A partial prior cleanup is retried only after the next open scans anew and creates a new
     // plan. This plan never accepts a payload-shape change from its initial scan.
@@ -3689,7 +4578,7 @@ fn finalize_deferred_generation_cleanup(
 fn finalize_deferred_cleanup(
     cleanup: &DeferredCleanup,
     directory_sync: DirectorySync,
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
 ) -> Result<(), DurableOpenError> {
     match cleanup {
         DeferredCleanup::TrailingGeneration(cleanup) => {
@@ -3834,7 +4723,7 @@ fn revalidate_unpublished_generation_payload(
 fn finalize_deferred_unpublished_entity_cleanup(
     cleanup: &DeferredUnpublishedEntityCleanup,
     directory_sync: DirectorySync,
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
 ) -> Result<(), DurableOpenError> {
     revalidate_deferred_unpublished_entity_cleanup(cleanup)?;
 
@@ -3898,7 +4787,7 @@ fn finalize_deferred_unpublished_entity_cleanup(
 }
 
 fn remove_cleanup_directory(
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
     path: &Path,
 ) -> Result<(), DurableOpenError> {
     if filesystem.remove_dir(path).is_err()
@@ -3910,7 +4799,7 @@ fn remove_cleanup_directory(
 }
 
 fn sync_cleanup_directory(
-    filesystem: &dyn CleanupFilesystem,
+    filesystem: &dyn DurableFilesystem,
     path: &Path,
     directory_sync: DirectorySync,
 ) -> Result<(), DurableOpenError> {
@@ -4043,7 +4932,7 @@ mod tests {
     use std::pin::Pin;
     use std::str::FromStr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     #[cfg(unix)]
     use std::collections::VecDeque;
@@ -4061,8 +4950,8 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        CleanupFilesystem, DirectorySync, classify_directory_sync, open_root,
-        open_root_with_cleanup_filesystem,
+        DirectorySync, DurableFilesystem, classify_directory_sync, open_root,
+        open_root_with_durable_filesystem,
     };
     use crate::agent_session_lifecycle::{
         AgentStatus, ForkAnchor, ForkSourceKind, SessionForkProvenance, SessionLifecycle,
@@ -4140,6 +5029,67 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// One named synchronous test gate around the physical reservation attempt. It never
+    /// synthesizes an outcome: the production attempt helper still reads real files.
+    #[cfg(unix)]
+    struct ReservationBarrier {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(unix)]
+    impl ReservationBarrier {
+        fn new(
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                entered,
+                release: Mutex::new(release),
+            }
+        }
+
+        fn cross(&self) {
+            self.entered
+                .send(())
+                .expect("the test retains the reservation barrier receiver");
+            super::lock(&self.release)
+                .recv()
+                .expect("the test releases the reservation barrier sender");
+        }
+    }
+
+    /// A final-readback gate keeps a successful physical attempt owner-retained while shutdown
+    /// races the already-crossed worker. The common readback helper still performs the real I/O.
+    #[cfg(unix)]
+    struct ReservationFinalReadback {
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[cfg(unix)]
+    impl ReservationFinalReadback {
+        fn new(
+            entered: std::sync::mpsc::Sender<()>,
+            release: std::sync::mpsc::Receiver<()>,
+        ) -> Self {
+            Self {
+                entered,
+                release: Mutex::new(release),
+            }
+        }
+
+        fn cross(&self) {
+            self.entered
+                .send(())
+                .expect("the test retains the final-readback receiver");
+            super::lock(&self.release)
+                .recv()
+                .expect("the test releases the final-readback sender");
+        }
+    }
+
+    #[cfg(unix)]
     impl CleanupFault {
         const fn operation(self) -> CleanupOperation {
             match self {
@@ -4154,6 +5104,14 @@ mod tests {
     struct DeterministicPersistentFaultFilesystem {
         faults: Mutex<VecDeque<CleanupFault>>,
         operations: Mutex<Vec<CleanupOperation>>,
+        reservation_faults: Mutex<VecDeque<super::ReservationFault>>,
+        before_reservation_barrier: Mutex<Option<ReservationBarrier>>,
+        collision_settlement: Mutex<Option<ReservationBarrier>>,
+        final_readback: Mutex<Option<ReservationFinalReadback>>,
+        final_readback_armed: AtomicBool,
+        reservation_handle_validated: AtomicBool,
+        reservation_file_synced: AtomicBool,
+        reservation_path: Mutex<Option<PathBuf>>,
     }
 
     #[cfg(unix)]
@@ -4162,11 +5120,75 @@ mod tests {
             Self {
                 faults: Mutex::new(faults.into_iter().collect()),
                 operations: Mutex::new(Vec::new()),
+                reservation_faults: Mutex::new(VecDeque::new()),
+                before_reservation_barrier: Mutex::new(None),
+                collision_settlement: Mutex::new(None),
+                final_readback: Mutex::new(None),
+                final_readback_armed: AtomicBool::new(false),
+                reservation_handle_validated: AtomicBool::new(false),
+                reservation_file_synced: AtomicBool::new(false),
+                reservation_path: Mutex::new(None),
+            }
+        }
+
+        fn with_reservation_faults(
+            faults: impl IntoIterator<Item = super::ReservationFault>,
+        ) -> Self {
+            Self {
+                faults: Mutex::new(VecDeque::new()),
+                operations: Mutex::new(Vec::new()),
+                reservation_faults: Mutex::new(faults.into_iter().collect()),
+                before_reservation_barrier: Mutex::new(None),
+                collision_settlement: Mutex::new(None),
+                final_readback: Mutex::new(None),
+                final_readback_armed: AtomicBool::new(false),
+                reservation_handle_validated: AtomicBool::new(false),
+                reservation_file_synced: AtomicBool::new(false),
+                reservation_path: Mutex::new(None),
             }
         }
 
         fn operations(&self) -> Vec<CleanupOperation> {
             super::lock(&self.operations).clone()
+        }
+
+        fn install_reservation_barrier(&self, barrier: ReservationBarrier) {
+            *super::lock(&self.before_reservation_barrier) = Some(barrier);
+        }
+
+        fn cross_reservation_barrier(&self) {
+            let barrier = super::lock(&self.before_reservation_barrier).take();
+            if let Some(barrier) = barrier {
+                barrier.cross();
+            }
+        }
+
+        fn install_collision_settlement(&self, barrier: ReservationBarrier) {
+            *super::lock(&self.collision_settlement) = Some(barrier);
+        }
+
+        fn cross_collision_settlement(&self) {
+            let barrier = super::lock(&self.collision_settlement).take();
+            if let Some(barrier) = barrier {
+                barrier.cross();
+            }
+        }
+
+        fn install_final_readback(&self, gate: ReservationFinalReadback) {
+            *super::lock(&self.final_readback) = Some(gate);
+        }
+
+        fn take_reservation_fault(
+            &self,
+            matches: impl FnOnce(super::ReservationFault) -> bool,
+        ) -> bool {
+            let mut faults = super::lock(&self.reservation_faults);
+            if faults.front().copied().is_some_and(matches) {
+                faults.pop_front();
+                true
+            } else {
+                false
+            }
         }
 
         fn perform(
@@ -4200,7 +5222,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    impl CleanupFilesystem for DeterministicPersistentFaultFilesystem {
+    impl DurableFilesystem for DeterministicPersistentFaultFilesystem {
         fn remove_file(&self, path: &Path) -> Result<(), ()> {
             let operation = match path.file_name().and_then(|name| name.to_str()) {
                 Some("COMMITTED") => CleanupOperation::RemoveCommitted,
@@ -4245,6 +5267,121 @@ mod tests {
                     Ok(())
                 }
             })
+        }
+
+        fn before_entity_reservation_barrier(&self) {
+            self.cross_reservation_barrier();
+        }
+
+        fn before_reservation_final_readback(&self) {
+            assert!(
+                self.reservation_handle_validated.load(Ordering::Acquire),
+                "final readback is reached only after new-handle validation"
+            );
+            assert!(
+                self.reservation_file_synced.load(Ordering::Acquire),
+                "final readback is reached only after reservation file sync"
+            );
+            let path = super::lock(&self.reservation_path)
+                .clone()
+                .expect("successful reservation readback has a created path");
+            let metadata = fs::symlink_metadata(path)
+                .expect("the marker remains canonical before final-readback fault injection");
+            assert!(
+                super::is_canonical_reservation_marker(&metadata),
+                "corrupt/absent faults are injected only immediately before final readback"
+            );
+            self.final_readback_armed.store(true, Ordering::Release);
+            let gate = super::lock(&self.final_readback).take();
+            if let Some(gate) = gate {
+                gate.cross();
+            }
+        }
+
+        fn after_known_reservation_collision(&self) {
+            self.cross_collision_settlement();
+        }
+
+        fn create_reservation(&self, path: &Path) -> std::io::Result<std::fs::File> {
+            if self.take_reservation_fault(|fault| fault == super::ReservationFault::BeforeCreate) {
+                return Err(std::io::Error::other("test reservation create fault"));
+            }
+            let file = super::create_reservation_file(path)?;
+            *super::lock(&self.reservation_path) = Some(path.to_owned());
+            if self.take_reservation_fault(|fault| {
+                fault == super::ReservationFault::AfterSideEffectCreate
+            }) {
+                return Err(std::io::Error::other("test reservation post-create fault"));
+            }
+            Ok(file)
+        }
+
+        fn sync_reservation_file(&self, file: &std::fs::File) -> std::io::Result<()> {
+            file.sync_all()?;
+            self.reservation_file_synced.store(true, Ordering::Release);
+            if self.take_reservation_fault(|fault| fault == super::ReservationFault::FileSyncError)
+            {
+                return Err(std::io::Error::other("test reservation file-sync fault"));
+            }
+            Ok(())
+        }
+
+        fn sync_reservation_parent(
+            &self,
+            path: &Path,
+            directory_sync: DirectorySync,
+        ) -> Result<(), ()> {
+            let result = super::sync_direct_parent(path, directory_sync).map_err(|_| ());
+            if self
+                .take_reservation_fault(|fault| fault == super::ReservationFault::ParentSyncError)
+            {
+                return Err(());
+            }
+            result
+        }
+
+        fn reservation_handle_metadata(
+            &self,
+            file: &std::fs::File,
+        ) -> std::io::Result<std::fs::Metadata> {
+            let metadata = file.metadata()?;
+            self.reservation_handle_validated
+                .store(true, Ordering::Release);
+            Ok(metadata)
+        }
+
+        fn reservation_path_metadata(&self, path: &Path) -> std::io::Result<std::fs::Metadata> {
+            if self.final_readback_armed.swap(false, Ordering::AcqRel) {
+                if self.take_reservation_fault(|fault| {
+                    fault == super::ReservationFault::ReadbackUnavailable
+                }) {
+                    return Err(std::io::Error::other("test reservation readback fault"));
+                }
+                if self.take_reservation_fault(|fault| {
+                    fault == super::ReservationFault::ReadbackAbsent
+                }) {
+                    let _ = fs::remove_file(path);
+                    return fs::symlink_metadata(path);
+                }
+                if self.take_reservation_fault(|fault| {
+                    fault == super::ReservationFault::CorruptBeforeFinalReadback
+                }) {
+                    let _ = fs::write(path, b"corrupt");
+                }
+            }
+            fs::symlink_metadata(path)
+        }
+
+        fn open_reservation(&self, path: &Path) -> std::io::Result<std::fs::File> {
+            std::fs::File::open(path)
+        }
+
+        fn reservation_read(
+            &self,
+            file: &mut std::fs::File,
+            buffer: &mut [u8],
+        ) -> std::io::Result<usize> {
+            std::io::Read::read(file, buffer)
         }
     }
 
@@ -4299,6 +5436,33 @@ mod tests {
         result
     }
 
+    #[cfg(unix)]
+    async fn open_with_reservation_filesystem(
+        root: &Path,
+        filesystem: Arc<DeterministicPersistentFaultFilesystem>,
+    ) -> DurableState {
+        let context = RuntimeTaskContext::new(Handle::current())
+            .await
+            .expect("the Tokio test runtime has a time driver");
+        DurableState::open_with_filesystem(root.to_owned(), context, filesystem)
+            .await
+            .expect("the deterministic reservation test store opens")
+    }
+
+    #[cfg(unix)]
+    fn agent_candidate(value: u128) -> AgentId {
+        format!("agt_{value:032x}")
+            .parse()
+            .expect("a nonzero test AgentId is canonical")
+    }
+
+    #[cfg(unix)]
+    fn session_candidate(value: u128) -> SessionId {
+        format!("ses_{value:032x}")
+            .parse()
+            .expect("a nonzero test SessionId is canonical")
+    }
+
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
         F: Future<Output = ()>,
@@ -4310,6 +5474,75 @@ mod tests {
             ))
         })
         .await
+    }
+
+    #[test]
+    fn reservation_attempt_failure_classification_uses_the_attempt_barrier_state() {
+        let pending =
+            std::sync::atomic::AtomicU8::new(super::ReservationAttemptStage::Pending as u8);
+        assert_eq!(
+            super::DurableStateActor::classify_reservation_job_error(
+                RuntimeTaskError::OwnerClosing,
+                &pending,
+            ),
+            super::TestReservationError::Closing
+        );
+        assert_eq!(
+            super::DurableStateActor::classify_reservation_job_error(
+                RuntimeTaskError::WorkerUnavailable,
+                &pending,
+            ),
+            super::TestReservationError::StorageUnavailable
+        );
+
+        let crossed =
+            std::sync::atomic::AtomicU8::new(super::ReservationAttemptStage::Crossed as u8);
+        assert_eq!(
+            super::DurableStateActor::classify_reservation_job_error(
+                RuntimeTaskError::OwnerClosing,
+                &crossed,
+            ),
+            super::TestReservationError::IndeterminatePoisoned
+        );
+
+        let cancelled =
+            std::sync::atomic::AtomicU8::new(super::ReservationAttemptStage::Cancelled as u8);
+        assert_eq!(
+            super::DurableStateActor::classify_reservation_job_error(
+                RuntimeTaskError::OwnerClosing,
+                &cancelled,
+            ),
+            super::TestReservationError::Closing
+        );
+        assert_eq!(
+            super::DurableStateActor::classify_reservation_job_error(
+                RuntimeTaskError::WorkerUnavailable,
+                &cancelled,
+            ),
+            super::TestReservationError::StorageUnavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_reservation_envelope_is_always_indeterminate_poisoned() {
+        let (response, waiter) = tokio::sync::oneshot::channel();
+        let reservation = super::TestAgentReservation {
+            candidates: std::collections::VecDeque::new(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            maximum: 1,
+            cancel_ack: None,
+            response: Some(response),
+        };
+        let envelope = super::DurableStateActorRequestEnvelope {
+            request: super::DurableStateActorRequest::ReserveAgent(reservation),
+            response: None,
+            drop_error: super::ActorRequestError::Unavailable,
+        };
+        drop(envelope);
+        assert_eq!(
+            waiter.await.expect("the dropped reservation responds"),
+            Err(super::TestReservationError::IndeterminatePoisoned)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4342,6 +5575,489 @@ mod tests {
         assert_eq!(waiter.wait().await, Ok(()));
 
         state.close().await;
+    }
+
+    #[cfg(unix)]
+    async fn reserve_agent(
+        state: &DurableState,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<AtomicUsize>,
+    ) -> Result<AgentId, super::TestReservationError> {
+        state
+            .actor
+            .reserve_agent_with_script(candidates, calls)
+            .wait()
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn reserve_agent_at_maximum(
+        state: &DurableState,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<AtomicUsize>,
+        maximum: usize,
+    ) -> Result<AgentId, super::TestReservationError> {
+        state
+            .actor
+            .reserve_agent_with_script_at_maximum(candidates, calls, maximum)
+            .wait()
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn reserve_session(
+        state: &DurableState,
+        candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
+        calls: Arc<AtomicUsize>,
+    ) -> Result<SessionId, super::TestReservationError> {
+        state
+            .actor
+            .reserve_session_with_script(candidates, calls)
+            .wait()
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn wait_reservation_barrier(receiver: std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || receiver.recv())
+            .await
+            .expect("the barrier waiter does not panic")
+            .expect("the reservation attempt reaches its named barrier");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_reservation_success_collision_entropy_caps_and_reopen() {
+        let root = TempRoot::nonexistent();
+        let state = open_with_reservation_filesystem(
+            root.path(),
+            Arc::new(DeterministicPersistentFaultFilesystem::new([])),
+        )
+        .await;
+        let agent = agent_candidate(1);
+        let session = session_candidate(2);
+        assert_eq!(
+            reserve_agent(&state, [Ok(agent)], Arc::new(AtomicUsize::new(0))).await,
+            Ok(agent)
+        );
+        assert_eq!(
+            reserve_session(&state, [Ok(session)], Arc::new(AtomicUsize::new(0))).await,
+            Ok(session)
+        );
+        assert!(state.agents.is_empty() && state.sessions.is_empty());
+        assert!(
+            root.path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(agent.to_string())
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(session.to_string())
+                .exists()
+        );
+        state.close().await;
+
+        let collision = agent_candidate(11);
+        create_file(
+            &root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(collision.to_string()),
+            b"",
+        );
+        let state = open_with_reservation_filesystem(
+            root.path(),
+            Arc::new(DeterministicPersistentFaultFilesystem::new([])),
+        )
+        .await;
+        let replacement = agent_candidate(12);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            reserve_agent(&state, [Ok(collision), Ok(replacement)], Arc::clone(&calls)).await,
+            Ok(replacement)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "reopen inventory makes the old ID a collision"
+        );
+        let success = agent_candidate(13);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            reserve_agent(
+                &state,
+                std::iter::repeat_n(Ok(collision), 31).chain([Ok(success)]),
+                Arc::clone(&calls)
+            )
+            .await,
+            Ok(success)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 32);
+        let sentinel = agent_candidate(14);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            reserve_agent(
+                &state,
+                std::iter::repeat_n(Ok(collision), 32).chain([Ok(sentinel)]),
+                Arc::clone(&calls)
+            )
+            .await,
+            Err(super::TestReservationError::CollisionAttemptsExhausted)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            32,
+            "candidate 33 stays unopened"
+        );
+        assert_eq!(
+            reserve_agent(&state, [Err(())], Arc::new(AtomicUsize::new(0))).await,
+            Err(super::TestReservationError::EntropyUnavailable)
+        );
+        state.close().await;
+
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_reservation_barrier(ReservationBarrier::new(entered, release_receiver));
+        let first = agent_candidate(21);
+        let first_waiter = state.actor.reserve_agent_with_script_at_maximum(
+            [Ok(first)],
+            Arc::new(AtomicUsize::new(0)),
+            1,
+        );
+        wait_reservation_barrier(receiver).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = state.actor.reserve_agent_with_script_at_maximum(
+            [Ok(agent_candidate(22))],
+            Arc::clone(&calls),
+            1,
+        );
+        release.send(()).expect("the before barrier releases");
+        assert_eq!(first_waiter.wait().await, Ok(first));
+        assert_eq!(
+            second.wait().await,
+            Err(super::TestReservationError::TooLarge)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reserve_session(
+                &state,
+                [Ok(session_candidate(23))],
+                Arc::new(AtomicUsize::new(0))
+            )
+            .await,
+            Ok(session_candidate(23))
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_wins_reservation_attempt_before_worker_cross_without_a_marker() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_reservation_barrier(ReservationBarrier::new(entered, release_receiver));
+
+        let candidate = agent_candidate(90);
+        let cancel_ack = Arc::new(Notify::new());
+        let waiter = state
+            .actor
+            .reserve_agent_with_script_at_maximum_and_cancel_ack(
+                [Ok(candidate)],
+                Arc::new(AtomicUsize::new(0)),
+                1,
+                Arc::clone(&cancel_ack),
+            );
+        wait_reservation_barrier(receiver).await;
+
+        state.request_closing();
+        cancel_ack.notified().await;
+        release.send(()).expect("the before barrier releases");
+
+        assert_eq!(
+            waiter.wait().await,
+            Err(super::TestReservationError::Closing)
+        );
+        assert!(
+            !root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string())
+                .exists(),
+            "a worker that observes Cancelled never creates the marker"
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_after_crossed_known_collision_does_not_generate_replacement() {
+        let root = TempRoot::nonexistent();
+        let bootstrap = open_with_reservation_filesystem(
+            root.path(),
+            Arc::new(DeterministicPersistentFaultFilesystem::new([])),
+        )
+        .await;
+        bootstrap.close().await;
+
+        let collision = agent_candidate(93);
+        let replacement = agent_candidate(94);
+        let collision_marker = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(collision.to_string());
+        let replacement_marker = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(replacement.to_string());
+        create_file(&collision_marker, b"");
+
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_collision_settlement(ReservationBarrier::new(entered, release_receiver));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let waiter = state.actor.reserve_agent_with_script_at_maximum(
+            [Ok(collision), Ok(replacement)],
+            Arc::clone(&calls),
+            2,
+        );
+        wait_reservation_barrier(receiver).await;
+        assert!(
+            collision_marker.is_file(),
+            "the known collision remains present"
+        );
+
+        state.request_closing();
+        release
+            .send(())
+            .expect("the crossed collision settlement releases");
+
+        assert_eq!(
+            waiter.wait().await,
+            Err(super::TestReservationError::Closing)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "closing is checked before requesting the replacement candidate"
+        );
+        assert!(
+            !replacement_marker.exists(),
+            "closing prevents a worker for the replacement candidate"
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn crossed_reservation_keeps_shutdown_pending_until_final_readback_settles() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_final_readback(ReservationFinalReadback::new(entered, release_receiver));
+
+        let candidate = agent_candidate(91);
+        let waiter = state
+            .actor
+            .reserve_agent_with_script([Ok(candidate)], Arc::new(AtomicUsize::new(0)));
+        wait_reservation_barrier(receiver).await;
+        let marker = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string());
+        assert!(
+            marker.is_file(),
+            "the worker crossed and created the marker"
+        );
+
+        state.request_closing();
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "shutdown joins the crossed worker instead of overtaking readback"
+        );
+        assert!(
+            marker.is_file(),
+            "the marker remains while readback is pending"
+        );
+
+        release.send(()).expect("the final readback releases");
+        close.await;
+        assert_eq!(waiter.wait().await, Ok(candidate));
+        assert!(
+            marker.is_file(),
+            "the settled successful attempt keeps its marker"
+        );
+
+        let reopened = open_with_reservation_filesystem(
+            root.path(),
+            Arc::new(DeterministicPersistentFaultFilesystem::new([])),
+        )
+        .await;
+        let replacement = agent_candidate(92);
+        let calls = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            reserve_agent_at_maximum(
+                &reopened,
+                [Ok(candidate), Ok(replacement)],
+                Arc::clone(&calls),
+                2,
+            )
+            .await,
+            Ok(replacement)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "reopen inventory observes the completed marker before the replacement"
+        );
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_reservation_faults_reconcile_inventory_and_close_test_admission() {
+        let root = TempRoot::nonexistent();
+        let before = agent_candidate(31);
+        let state = open_with_reservation_filesystem(
+            root.path(),
+            Arc::new(
+                DeterministicPersistentFaultFilesystem::with_reservation_faults([
+                    super::ReservationFault::BeforeCreate,
+                ]),
+            ),
+        )
+        .await;
+        assert_eq!(
+            reserve_agent(&state, [Ok(before)], Arc::new(AtomicUsize::new(0))).await,
+            Err(super::TestReservationError::StorageUnavailable)
+        );
+        assert!(
+            !root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(before.to_string())
+                .exists()
+        );
+        state.close().await;
+
+        for (offset, fault) in [
+            super::ReservationFault::AfterSideEffectCreate,
+            super::ReservationFault::FileSyncError,
+            super::ReservationFault::ParentSyncError,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TempRoot::nonexistent();
+            let burned = agent_candidate(40 + offset as u128);
+            let state = open_with_reservation_filesystem(
+                root.path(),
+                Arc::new(DeterministicPersistentFaultFilesystem::with_reservation_faults([fault])),
+            )
+            .await;
+            assert_eq!(
+                reserve_agent_at_maximum(&state, [Ok(burned)], Arc::new(AtomicUsize::new(0)), 1,)
+                    .await,
+                Err(super::TestReservationError::StorageUnavailable)
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            assert_eq!(
+                reserve_agent_at_maximum(
+                    &state,
+                    [Ok(agent_candidate(50 + offset as u128))],
+                    Arc::clone(&calls),
+                    1,
+                )
+                .await,
+                Err(super::TestReservationError::TooLarge)
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "ordinary errors expose no burn detail; cap/inventory proves it"
+            );
+            state.close().await;
+            let reopened = open_with_reservation_filesystem(
+                root.path(),
+                Arc::new(DeterministicPersistentFaultFilesystem::new([])),
+            )
+            .await;
+            let reopen_calls = Arc::new(AtomicUsize::new(0));
+            assert_eq!(
+                reserve_agent_at_maximum(
+                    &reopened,
+                    [Ok(burned), Ok(agent_candidate(60 + offset as u128))],
+                    Arc::clone(&reopen_calls),
+                    2,
+                )
+                .await,
+                Ok(agent_candidate(60 + offset as u128))
+            );
+            assert_eq!(
+                reopen_calls.load(Ordering::SeqCst),
+                2,
+                "reopen observes the burned ID as a collision before the replacement"
+            );
+            reopened.close().await;
+        }
+
+        for fault in [
+            super::ReservationFault::ReadbackUnavailable,
+            super::ReservationFault::ReadbackAbsent,
+            super::ReservationFault::CorruptBeforeFinalReadback,
+        ] {
+            let root = TempRoot::nonexistent();
+            let state = open_with_reservation_filesystem(
+                root.path(),
+                Arc::new(DeterministicPersistentFaultFilesystem::with_reservation_faults([fault])),
+            )
+            .await;
+            let expected = if fault == super::ReservationFault::ReadbackUnavailable {
+                super::TestReservationError::IndeterminatePoisoned
+            } else {
+                super::TestReservationError::DurableStateCorrupt
+            };
+            assert_eq!(
+                reserve_agent(
+                    &state,
+                    [Ok(agent_candidate(70 + fault as u8 as u128))],
+                    Arc::new(AtomicUsize::new(0))
+                )
+                .await,
+                Err(expected)
+            );
+            assert_eq!(
+                reserve_agent(
+                    &state,
+                    [Ok(agent_candidate(80))],
+                    Arc::new(AtomicUsize::new(0))
+                )
+                .await,
+                Err(super::TestReservationError::Closing)
+            );
+            state.close().await;
+        }
     }
 
     #[test]
@@ -10478,7 +12194,7 @@ mod tests {
             CleanupOperation::RemoveDefinition,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(before_definition.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(before_definition.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(staging.join("definition.json").exists());
@@ -10494,7 +12210,7 @@ mod tests {
             CleanupOperation::RemoveDefinition,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(after_definition.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(after_definition.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(!staging.join("definition.json").exists());
@@ -10514,7 +12230,7 @@ mod tests {
             CleanupOperation::RemoveHead,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(before_head.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(before_head.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(!staging.join("definition.json").exists());
@@ -10535,7 +12251,7 @@ mod tests {
             CleanupOperation::RemoveHead,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(after_head.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(after_head.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(!staging.join("definition.json").exists());
@@ -10558,7 +12274,7 @@ mod tests {
             CleanupOperation::RemoveCandidateDirectory,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(before_remove_dir.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(before_remove_dir.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(staging.is_dir());
@@ -10581,7 +12297,7 @@ mod tests {
             CleanupOperation::SyncCandidateDirectory,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(before_sync.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(before_sync.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(staging.is_dir());
@@ -10603,7 +12319,7 @@ mod tests {
             CleanupOperation::SyncCandidateDirectory,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(after_sync_candidate.path().to_owned(), &filesystem),
+            open_root_with_durable_filesystem(after_sync_candidate.path().to_owned(), &filesystem),
             Err(DurableOpenError::StorageUnavailable)
         ));
         assert!(staging.is_dir());
@@ -10628,7 +12344,7 @@ mod tests {
             CleanupOperation::RemoveCandidateDirectory,
         )]);
         let opened =
-            open_root_with_cleanup_filesystem(after_remove_dir.path().to_owned(), &filesystem)
+            open_root_with_durable_filesystem(after_remove_dir.path().to_owned(), &filesystem)
                 .expect("an absent readback reconciles the post-effect remove-dir failure");
         assert!(!staging.exists());
         assert_eq!(
@@ -10653,7 +12369,7 @@ mod tests {
             CleanupOperation::SyncGenerationsDirectory,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(
+            open_root_with_durable_filesystem(
                 before_generations_sync.path().to_owned(),
                 &filesystem,
             ),
@@ -10681,7 +12397,7 @@ mod tests {
             CleanupOperation::SyncGenerationsDirectory,
         )]);
         assert!(matches!(
-            open_root_with_cleanup_filesystem(
+            open_root_with_durable_filesystem(
                 after_generations_sync.path().to_owned(),
                 &filesystem,
             ),
@@ -10706,7 +12422,7 @@ mod tests {
         let ordered = TempRoot::existing();
         create_agent_both_payload_staging(ordered.path());
         let filesystem = DeterministicPersistentFaultFilesystem::new([]);
-        let opened = open_root_with_cleanup_filesystem(ordered.path().to_owned(), &filesystem)
+        let opened = open_root_with_durable_filesystem(ordered.path().to_owned(), &filesystem)
             .expect("the faultless cleanup succeeds");
         drop(opened);
         assert_eq!(
@@ -10738,7 +12454,7 @@ mod tests {
             .join(SESSION_ONE);
         let filesystem = DeterministicPersistentFaultFilesystem::new([]);
         drop(
-            open_root_with_cleanup_filesystem(ordered.path().to_owned(), &filesystem)
+            open_root_with_durable_filesystem(ordered.path().to_owned(), &filesystem)
                 .expect("faultless whole-entity cleanup succeeds"),
         );
         assert!(!entity.exists());
@@ -10796,7 +12512,7 @@ mod tests {
                 .join(SESSIONS_DIRECTORY)
                 .join(SESSION_ONE);
             let filesystem = DeterministicPersistentFaultFilesystem::new([fault]);
-            let first_open = open_root_with_cleanup_filesystem(root.path().to_owned(), &filesystem);
+            let first_open = open_root_with_durable_filesystem(root.path().to_owned(), &filesystem);
             let reconciled_remove_directory = matches!(
                 fault,
                 CleanupFault::After(

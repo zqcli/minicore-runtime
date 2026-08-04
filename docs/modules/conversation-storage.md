@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2完成，M5 Store recovery foundation implementation in progress）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2及M5 recovery/root-lease foundation完成，production publication、Recorder与semantic replay pending）
 日期：2026-07-31
 
 ## 目的

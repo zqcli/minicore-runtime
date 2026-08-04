@@ -26,11 +26,11 @@ architecture.md + modules/
 
 ## 当前状态
 
-M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M3.2 implemented only the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design now makes DurableState its future sole production issuer, without claiming a root-lease production implementation. M5.0 durable entity/async design gate现已冻结DurableState、Durable Store V1、permanent reservations（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new）与Tokio deterministic seams；foundation implementation pending。下一任务是M5.0 foundation implementation，随后M5.1 SessionRecorder与M5.2 semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
+M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M3.2 implemented only the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its sole production issuer. M5.0 production recovery、root lease、owner-tracked actor、reservation inventory与local physical-certainty foundation已实现；没有standalone production reservation API，COMMITTED/PUBLISHED publication与production Create/Fork mutation仍pending。随后是M5.1 SessionRecorder与M5.2 semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
 
 开发计划M0与M1已经完成，M2进行中；后续主要门禁：
 
-- M5.0：design已完成；实现single-process DurableState actor、Store V1/root lease/CAS/publication与Tokio deterministic foundation；
+- M5.0：design、recovery/root lease/owner-tracked actor及private reservation foundation已完成；下一步实现最小CAS与COMMITTED/PUBLISHED publication；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；
 - V4-C0-1：production Tool/Sandbox adapter开始前关闭enforcement fail-closed合同。
 

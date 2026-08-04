@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 Store recovery foundation implementation in progress
+状态：当前权威 physical format specification；M5.0 production recovery/root lease与private reservation physical-certainty foundation已实现，COMMITTED/PUBLISHED mutation publication pending
 日期：2026-08-03
 
 ## Scope

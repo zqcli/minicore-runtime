@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation implementation pending，随后M5.1 Recorder与M5.2 semantic replay
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation slice in progress；M5.0 publication、M5.1 Recorder与M5.2 semantic replay pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -361,7 +361,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate Completed；M5.0 foundation implementation、M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
+状态：M5.0 design gate Completed；foundation slice in progress（无 standalone production reservation API/token）；M5.0 publication、M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
 
 ### M5.0 DurableState / async foundation implementation
 
