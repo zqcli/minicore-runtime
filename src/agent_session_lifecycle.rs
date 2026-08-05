@@ -1,5 +1,5 @@
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 
 use thiserror::Error;
 
@@ -7,7 +7,7 @@ use crate::model_gateway::{ModelSelection, ReasoningPreference};
 use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
 use crate::wire::lexical::{LexicalError, normalize_newlines, validate_safe_text};
 use crate::wire::{
-    AgentId, AgentMetadataRevision, AgentRevision, ItemId, ProtocolLimits,
+    AgentId, AgentMetadataRevision, AgentRevision, IdGenerationError, ItemId, ProtocolLimits,
     SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
 };
 use crate::workspace::{Workspace, workspaces_have_same_semantic_content};
@@ -145,6 +145,68 @@ impl fmt::Debug for AgentMetadata {
             .debug_struct("AgentMetadata")
             .field("name_present", &true)
             .field("description_present", &self.description.is_some())
+            .finish()
+    }
+}
+
+/// The lifecycle-owned, pre-identity input to one durable Agent create attempt.
+///
+/// It deliberately owns no identity, storage, status, path, marker, or command facts. The
+/// durable owner supplies the candidate identity only after this value has been sealed.
+pub(crate) struct SealedAgentCreateAttempt {
+    prompts: AgentPromptSelection,
+    metadata: AgentMetadata,
+}
+
+impl SealedAgentCreateAttempt {
+    #[allow(
+        dead_code,
+        reason = "the sealed attempt constructor is consumed by the pending command surface"
+    )]
+    pub(crate) fn new<N, D>(
+        prompts: AgentPromptSelection,
+        name: N,
+        description: Option<D>,
+        created_at: Timestamp,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        let metadata_revision = AgentMetadataRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Agent metadata revision is non-zero"),
+        );
+        let metadata = AgentMetadata::new(metadata_revision, name, description, created_at)?;
+        Ok(Self { prompts, metadata })
+    }
+
+    pub(crate) fn generate_candidate(&self) -> Result<AgentId, IdGenerationError> {
+        AgentId::generate()
+    }
+
+    pub(crate) fn materialize(&self, agent_id: AgentId) -> (AgentDefinition, AgentMetadata) {
+        let revision = AgentRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Agent revision is non-zero"),
+        );
+        (
+            AgentDefinition::new(
+                agent_id,
+                revision,
+                self.prompts.clone(),
+                self.metadata.updated_at(),
+            ),
+            self.metadata.clone(),
+        )
+    }
+}
+
+impl fmt::Debug for SealedAgentCreateAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedAgentCreateAttempt")
+            .field("prompt_count", &self.prompts.enabled().len())
+            .field("metadata", &"redacted")
+            .field("created_at", &self.metadata.updated_at())
             .finish()
     }
 }
@@ -545,5 +607,56 @@ impl fmt::Debug for SessionForkProvenance {
             .field("source", &self.source)
             .field("anchor", &self.anchor)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SealedAgentCreateAttempt;
+    use crate::prompt::AgentPromptSelection;
+    use crate::wire::AgentId;
+
+    #[test]
+    fn sealed_agent_create_attempt_fixes_initial_revisions_and_redacts_input() {
+        let prompts = AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let attempt = SealedAgentCreateAttempt::new(
+            prompts,
+            "Planner secret",
+            Some("Description secret"),
+            timestamp,
+        )
+        .unwrap();
+
+        let debug = format!("{attempt:?}");
+        assert!(!debug.contains("Planner"));
+        assert!(!debug.contains("Description"));
+        assert!(!debug.contains("base"));
+        assert!(!debug.contains("safety"));
+
+        let agent_id: AgentId = "agt_11111111111111111111111111111111".parse().unwrap();
+        let (definition, metadata) = attempt.materialize(agent_id);
+        assert_eq!(definition.agent_id(), agent_id);
+        assert_eq!(definition.revision().to_string(), "ar_1");
+        assert_eq!(definition.created_at(), timestamp);
+        assert_eq!(
+            definition
+                .prompts()
+                .enabled()
+                .iter()
+                .map(|prompt| prompt.as_str())
+                .collect::<Vec<_>>(),
+            ["base", "safety"]
+        );
+        assert_eq!(metadata.revision().to_string(), "amr_1");
+        assert_eq!(metadata.name(), "Planner secret");
+        assert_eq!(metadata.description(), Some("Description secret"));
+        assert_eq!(metadata.updated_at(), timestamp);
     }
 }

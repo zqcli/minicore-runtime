@@ -118,10 +118,11 @@ impl RuntimeTaskContext {
             Ok(key) => key,
             Err(error) => {
                 settlement.resolve(Err(error));
-                return TrackedBlockingJob::new(settlement);
+                return TrackedBlockingJob::rejected(settlement);
             }
         };
 
+        let job_owner = Arc::clone(&self.owner);
         let task_owner = Arc::clone(&self.owner);
         let task_settlement = Arc::clone(&settlement);
         let spawned = catch_unwind(AssertUnwindSafe(|| {
@@ -144,10 +145,11 @@ impl RuntimeTaskContext {
             Err(_) => {
                 self.owner.fail_start(key);
                 settlement.resolve(Err(RuntimeTaskError::WorkerUnavailable));
+                return TrackedBlockingJob::rejected(settlement);
             }
         }
 
-        TrackedBlockingJob::new(settlement)
+        TrackedBlockingJob::new(job_owner, key, settlement)
     }
 
     /// Starts owner-retained asynchronous work. The raw Tokio handle remains in the owner
@@ -287,6 +289,8 @@ pub(crate) struct TrackedBlockingJob<T>
 where
     T: Clone + Send + 'static,
 {
+    owner: Option<Arc<RuntimeTaskOwner>>,
+    key: Option<RegistryKey>,
     settlement: Arc<Settlement<T>>,
 }
 
@@ -294,11 +298,34 @@ impl<T> TrackedBlockingJob<T>
 where
     T: Clone + Send + 'static,
 {
-    fn new(settlement: Arc<Settlement<T>>) -> Self {
-        Self { settlement }
+    fn new(owner: Arc<RuntimeTaskOwner>, key: RegistryKey, settlement: Arc<Settlement<T>>) -> Self {
+        Self {
+            owner: Some(owner),
+            key: Some(key),
+            settlement,
+        }
+    }
+
+    fn rejected(settlement: Arc<Settlement<T>>) -> Self {
+        Self {
+            owner: None,
+            key: None,
+            settlement,
+        }
     }
 
     pub(crate) async fn wait(&self) -> Result<T, RuntimeTaskError> {
+        if let (Some(owner), Some(key)) = (&self.owner, self.key) {
+            if let Some(task) = owner.take_registered(key) {
+                let mut join = SingleRegisteredTaskJoinGuard::new(Arc::clone(owner), key, task);
+                let join_failed = join.join().await.is_err();
+                let task = join.finish();
+                if join_failed {
+                    task.settlement.settle_join_failure();
+                }
+                drop(task);
+            }
+        }
         self.settlement.wait().await
     }
 }
@@ -358,7 +385,18 @@ impl RuntimeTaskOwner {
 
     fn take_registered(&self, key: RegistryKey) -> Option<RegisteredTask> {
         let mut registry = lock(&self.registry);
-        registry.tasks.remove(&key)
+        let task = registry.tasks.remove(&key)?;
+        let inserted = registry.joining.insert(key);
+        debug_assert!(inserted, "one waiter joins one exact owner task");
+        Some(task)
+    }
+
+    fn finish_registered_join(&self, key: RegistryKey) {
+        let mut registry = lock(&self.registry);
+        let removed = registry.joining.remove(&key);
+        debug_assert!(removed, "a completed join clears its exact owner slot");
+        drop(registry);
+        self.registry_changed.notify_waiters();
     }
 
     fn fail_start(&self, key: RegistryKey) {
@@ -401,7 +439,7 @@ impl RuntimeTaskOwner {
 
             let work = {
                 let mut registry = lock(&self.registry);
-                if !registry.starting.is_empty() {
+                if !registry.starting.is_empty() || !registry.joining.is_empty() {
                     ShutdownWork::Wait
                 } else if registry.tasks.is_empty() {
                     assert!(
@@ -411,6 +449,10 @@ impl RuntimeTaskOwner {
                     assert!(
                         registry.tasks.is_empty(),
                         "shutdown cannot close with tasks"
+                    );
+                    assert!(
+                        registry.joining.is_empty(),
+                        "shutdown cannot close with caller-joined tasks"
                     );
                     // Completion and leadership release are one registry transition. A later
                     // caller must observe Closed rather than wait behind a stale leader claim.
@@ -556,6 +598,7 @@ struct Registry {
     shutdown_active: bool,
     next_key: u64,
     starting: BTreeSet<RegistryKey>,
+    joining: BTreeSet<RegistryKey>,
     tasks: BTreeMap<RegistryKey, RegisteredTask>,
 }
 
@@ -566,6 +609,7 @@ impl Registry {
             shutdown_active: false,
             next_key: 1,
             starting: BTreeSet::new(),
+            joining: BTreeSet::new(),
             tasks: BTreeMap::new(),
         }
     }
@@ -614,9 +658,12 @@ impl SingleRegisteredTaskJoinGuard {
     }
 
     fn finish(&mut self) -> RegisteredTask {
-        self.task
+        let task = self
+            .task
             .take()
-            .expect("a single registered task join finishes only once")
+            .expect("a single registered task join finishes only once");
+        self.owner.finish_registered_join(self.key);
+        task
     }
 }
 
@@ -626,6 +673,8 @@ impl Drop for SingleRegisteredTaskJoinGuard {
             return;
         };
         let mut registry = lock(&self.owner.registry);
+        let removed = registry.joining.remove(&self.key);
+        debug_assert!(removed, "a cancelled join restores its exact joining slot");
         let previous = registry.tasks.insert(self.key, task);
         debug_assert!(
             previous.is_none(),
@@ -852,6 +901,43 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn blocking_job_wait_reaps_without_becoming_invisible_to_concurrent_shutdown() {
+        let context = initialized_context().await;
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_by_operation = Arc::clone(&entered);
+        let released_by_test = Arc::clone(&release);
+        let job = context.spawn_blocking_tracked(move || {
+            entered_by_operation.wait();
+            released_by_test.wait();
+            17_u8
+        });
+        entered.wait();
+
+        let mut wait = Box::pin(job.wait());
+        assert!(poll_once_pending(wait.as_mut()).await);
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert!(registry.tasks.is_empty());
+            assert_eq!(registry.joining.len(), 1);
+        }
+
+        let mut shutdown = Box::pin(context.shutdown());
+        assert!(
+            poll_once_pending(shutdown.as_mut()).await,
+            "shutdown waits for a caller-joined blocking task"
+        );
+        release.wait();
+        assert_eq!(wait.await, Ok(17));
+        shutdown.await;
+
+        let registry = super::lock(&context.owner.registry);
+        assert!(registry.starting.is_empty());
+        assert!(registry.joining.is_empty());
+        assert!(registry.tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn tracked_async_task_settles_normally_without_exposing_a_raw_join_handle() {
         let context = initialized_context().await;
         let completed = Arc::new(AtomicBool::new(false));
@@ -892,6 +978,10 @@ mod tests {
             assert!(
                 registry.tasks.contains_key(&task.key),
                 "cancelling a registered join restores its exact owner slot"
+            );
+            assert!(
+                registry.joining.is_empty(),
+                "a cancelled registered join cannot remain hidden from shutdown"
             );
         }
 
