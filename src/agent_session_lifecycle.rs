@@ -503,6 +503,114 @@ pub(crate) fn session_metadata_has_same_canonical_content(
     first.name() == second.name() && first.description() == second.description()
 }
 
+/// The lifecycle-owned, pre-identity input to one durable ordinary Session create attempt.
+///
+/// The requested AgentId is only a lookup key. The durable owner supplies the assigned SessionId
+/// and pins the current AgentRevisionRef after actor serialization has acquired the Agent gate.
+/// No storage, path, generation, marker, or CommandId fact belongs in this value.
+pub(crate) struct SealedSessionCreateAttempt {
+    requested_agent_id: AgentId,
+    workspace: Workspace,
+    model: SessionModelConfig,
+    prompts: SessionPromptSelection,
+    metadata: SessionMetadata,
+}
+
+#[allow(
+    dead_code,
+    reason = "the lifecycle seam is consumed by the pending Session command surface"
+)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionCreateAttemptError {
+    #[error("session create workspace must start at revision one")]
+    InvalidWorkspaceRevision,
+    #[error(transparent)]
+    InvalidMetadata(#[from] SessionMetadataError),
+}
+
+impl SealedSessionCreateAttempt {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one sealed Session create owns its fixed parent-independent candidate fragments"
+    )]
+    #[allow(
+        dead_code,
+        reason = "the sealed attempt constructor is consumed by the pending command surface"
+    )]
+    pub(crate) fn new<N, D>(
+        requested_agent_id: AgentId,
+        workspace: Workspace,
+        model: SessionModelConfig,
+        prompts: SessionPromptSelection,
+        name: Option<N>,
+        description: Option<D>,
+        created_at: Timestamp,
+    ) -> Result<Self, SessionCreateAttemptError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        if workspace.revision().get() != 1 {
+            return Err(SessionCreateAttemptError::InvalidWorkspaceRevision);
+        }
+        let metadata_revision = SessionMetadataRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Session metadata revision is non-zero"),
+        );
+        let metadata = SessionMetadata::new(metadata_revision, name, description, created_at)?;
+        Ok(Self {
+            requested_agent_id,
+            workspace,
+            model,
+            prompts,
+            metadata,
+        })
+    }
+
+    pub(crate) const fn requested_agent_id(&self) -> AgentId {
+        self.requested_agent_id
+    }
+
+    pub(crate) fn generate_candidate(&self) -> Result<SessionId, IdGenerationError> {
+        SessionId::generate()
+    }
+
+    pub(crate) fn materialize(
+        &self,
+        session_id: SessionId,
+        agent: AgentRevisionRef,
+    ) -> (SessionDefinition, SessionMetadata) {
+        let revision = SessionDefinitionRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Session definition revision is non-zero"),
+        );
+        (
+            SessionDefinition::new(
+                session_id,
+                revision,
+                agent,
+                self.workspace.clone(),
+                self.model.clone(),
+                self.prompts.clone(),
+                self.metadata.updated_at(),
+            ),
+            self.metadata.clone(),
+        )
+    }
+}
+
+impl fmt::Debug for SealedSessionCreateAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionCreateAttempt")
+            .field("requested_agent", &"redacted")
+            .field("workspace", &"redacted")
+            .field("model", &"redacted")
+            .field("prompt_count", &self.prompts.enabled().len())
+            .field("metadata", &"redacted")
+            .field("created_at", &self.metadata.updated_at())
+            .finish()
+    }
+}
+
 fn normalize_session_metadata_text(
     value: &str,
     maximum: usize,
@@ -612,9 +720,18 @@ impl fmt::Debug for SessionForkProvenance {
 
 #[cfg(test)]
 mod tests {
-    use super::SealedAgentCreateAttempt;
-    use crate::prompt::AgentPromptSelection;
-    use crate::wire::AgentId;
+    use std::num::NonZeroU64;
+
+    use super::{
+        AgentRevisionRef, SealedAgentCreateAttempt, SealedSessionCreateAttempt, SessionModelConfig,
+    };
+    use crate::model_gateway::{ModelSelection, ReasoningPreference};
+    use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
+    use crate::wire::{AgentId, AgentRevision, CanonicalFileUri, SessionId, WorkspaceRevision};
+    use crate::workspace::{
+        RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
+        WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
+    };
 
     #[test]
     fn sealed_agent_create_attempt_fixes_initial_revisions_and_redacts_input() {
@@ -657,6 +774,87 @@ mod tests {
         assert_eq!(metadata.revision().to_string(), "amr_1");
         assert_eq!(metadata.name(), "Planner secret");
         assert_eq!(metadata.description(), Some("Description secret"));
+        assert_eq!(metadata.updated_at(), timestamp);
+    }
+
+    #[test]
+    fn sealed_session_create_attempt_fixes_initial_revisions_and_redacts_input() {
+        let requested_agent: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let root_key: WorkspaceRootKey = "repo".parse().unwrap();
+        let root_uri: CanonicalFileUri = if cfg!(windows) {
+            "file:///C:/private/session-secret-workspace"
+                .parse()
+                .unwrap()
+        } else {
+            "file:///private/session-secret-workspace".parse().unwrap()
+        };
+        let input = WorkspaceDefinitionInput::new(
+            WorkspaceRootInput::new(
+                root_key.clone(),
+                root_uri,
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            WorkspaceCwdSpec::new("repo".parse().unwrap(), "src/private".parse().unwrap()),
+        )
+        .unwrap();
+        let workspace = lower_workspace(
+            input,
+            WorkspaceRevision::new(NonZeroU64::new(1).unwrap()),
+            WorkspacePathTarget::current(),
+        )
+        .unwrap();
+        let model = SessionModelConfig::new(
+            ModelSelection::new(
+                "private-provider".parse().unwrap(),
+                "private-model".parse().unwrap(),
+            ),
+            ReasoningPreference::High,
+            None,
+        );
+        let prompts =
+            SessionPromptSelection::new(vec!["private-session-prompt".parse().unwrap()]).unwrap();
+        let timestamp = "2026-08-03T10:01:00.456Z".parse().unwrap();
+        let attempt = SealedSessionCreateAttempt::new(
+            requested_agent,
+            workspace,
+            model,
+            prompts,
+            Some("private session name"),
+            Some("private session description"),
+            timestamp,
+        )
+        .unwrap();
+
+        let debug = format!("{attempt:?}");
+        for secret in [
+            "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "private/session-secret-workspace",
+            "file:///",
+            "private-provider",
+            "private-model",
+            "private-session-prompt",
+            "private session name",
+            "private session description",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "sealed attempt debug leaked {secret:?}"
+            );
+        }
+        let session_id: SessionId = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let agent_revision = AgentRevision::new(NonZeroU64::new(1).unwrap());
+        let (definition, metadata) = attempt.materialize(
+            session_id,
+            AgentRevisionRef::new(requested_agent, agent_revision),
+        );
+        assert_eq!(definition.session_id(), session_id);
+        assert_eq!(definition.revision().to_string(), "sdr_1");
+        assert_eq!(definition.agent().revision(), agent_revision);
+        assert_eq!(definition.workspace().revision().to_string(), "wr_1");
+        assert_eq!(definition.created_at(), timestamp);
+        assert_eq!(metadata.revision().to_string(), "smr_1");
         assert_eq!(metadata.updated_at(), timestamp);
     }
 }

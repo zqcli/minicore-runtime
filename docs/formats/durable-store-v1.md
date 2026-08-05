@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 production recovery/root lease、private permanent reservation foundation与crate-private Agent Create exact G1 COMMITTED/PUBLISHED publication已实现；Session Create/Fork/update/CAS及完整cross-platform native matrix pending
+状态：当前权威 physical format specification；M5.0 production recovery/root lease、private permanent reservation foundation及crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication已实现；Session Fork/update/CAS、public Runtime command及完整cross-platform native matrix pending
 日期：2026-08-03
 
 ## Scope
