@@ -2,14 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
-use std::io::{self, Read};
+use std::future::Future;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fs4::fs_std::FileExt;
-#[cfg(test)]
+use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -17,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{
-    AgentDefinition, AgentMetadata, AgentStatus, SessionDefinition, SessionForkProvenance,
-    SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
+    AgentDefinition, AgentMetadata, AgentStatus, SealedAgentCreateAttempt, SessionDefinition,
+    SessionForkProvenance, SessionLifecycle, SessionMetadata,
+    agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
     is_legal_session_lifecycle_transition,
     session_definitions_have_same_canonical_execution_content,
@@ -56,7 +58,6 @@ const ROOT_AGENT_ENTRY_CAP: usize = 1_000_000;
 const ROOT_SESSION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_ENTRY_CAP: usize = 1_000_000;
 const GENERATION_PAYLOAD_ENTRY_CAP: usize = 3;
-#[cfg(test)]
 const DURABLE_STATE_ACTOR_QUEUE_CAPACITY: usize = 1;
 #[allow(dead_code)]
 const RESERVATION_COLLISION_ATTEMPT_CAP: usize = 32;
@@ -380,6 +381,7 @@ pub(crate) enum DurableOpenError {
 
 /// One recovered Agent's immutable current facts. Historical heads are folded away after
 /// validation; retained definitions remain privately addressable through a compact index.
+#[derive(Clone)]
 struct DurableAgentCatalogEntry {
     current_head: Arc<DurableAgentHead>,
     current_definition: Arc<AgentDefinition>,
@@ -626,29 +628,87 @@ enum ReservationPhysicalObservation {
     Indeterminate,
 }
 
-/// The private serial owner for future durable mutations. The inventory, root and filesystem
-/// fields are deliberately retained now so the adjacent publication slice can consume them from
-/// the same owner; this slice exposes no production reservation operation.
-struct DurableStateActor {
-    #[cfg(test)]
-    receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
+/// The closed, redacted failure taxonomy for one accepted Agent create request.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableAgentCreateError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("Agent identity is unavailable")]
+    IdentityUnavailable,
+    #[error("Agent identity allocation attempts are exhausted")]
+    CollisionAttemptsExhausted,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+struct CreateAgentRequest {
+    attempt: SealedAgentCreateAttempt,
+    response: Option<oneshot::Sender<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>>,
     closing: CancellationToken,
     #[cfg(test)]
+    candidates: Option<std::collections::VecDeque<Result<AgentId, ()>>>,
+    #[cfg(test)]
+    candidate_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CreateAgentRequest {
+    fn settle(&mut self, outcome: Result<Arc<DurableAgentHead>, DurableAgentCreateError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject(&mut self, error: DurableAgentCreateError) {
+        self.settle(Err(error));
+    }
+}
+
+impl Drop for CreateAgentRequest {
+    fn drop(&mut self) {
+        let error = if self.closing.is_cancelled() {
+            DurableAgentCreateError::Closing
+        } else {
+            DurableAgentCreateError::InternalDispatchUnavailable
+        };
+        self.reject(error);
+    }
+}
+
+struct CreateAgentWaiter {
+    response: oneshot::Receiver<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>,
+}
+
+impl CreateAgentWaiter {
+    async fn wait(self) -> Result<Arc<DurableAgentHead>, DurableAgentCreateError> {
+        self.response
+            .await
+            .unwrap_or(Err(DurableAgentCreateError::InternalDispatchUnavailable))
+    }
+}
+
+/// The private serial owner for all durable mutations. Recovery remains immutable base state;
+/// the actor owns reservation inventory, publication I/O, and the small published overlay.
+#[allow(
+    dead_code,
+    reason = "the serial owner retains future Session and Create mutation inventory"
+)]
+struct DurableStateActor {
+    receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
+    closing: CancellationToken,
     root: PathBuf,
-    #[cfg(test)]
     directory_sync: DirectorySync,
-    #[cfg(test)]
     recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
-    #[cfg(test)]
     recovered_session_reservations: Arc<BTreeSet<SessionId>>,
-    #[cfg(test)]
     new_agent_reservations: BTreeSet<AgentId>,
-    #[cfg(test)]
     new_session_reservations: BTreeSet<SessionId>,
-    #[cfg(test)]
     task_context: RuntimeTaskContext,
-    #[cfg(test)]
     filesystem: Arc<dyn DurableFilesystem>,
+    published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
+    active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
     #[cfg(test)]
     receiver_closed: Arc<tokio::sync::Notify>,
 }
@@ -674,7 +734,6 @@ impl ReservationAttemptStage {
             .is_ok()
     }
 
-    #[cfg(test)]
     fn try_cancel(stage: &AtomicU8) -> bool {
         stage
             .compare_exchange(
@@ -686,7 +745,6 @@ impl ReservationAttemptStage {
             .is_ok()
     }
 
-    #[cfg(test)]
     fn load(stage: &AtomicU8) -> Self {
         match stage.load(Ordering::Acquire) {
             value if value == Self::Pending as u8 => Self::Pending,
@@ -788,22 +846,26 @@ impl fmt::Display for ActorRequestError {
 #[cfg(test)]
 impl std::error::Error for ActorRequestError {}
 
-#[cfg(test)]
 enum DurableStateActorRequest {
+    CreateAgent(CreateAgentRequest),
+    #[cfg(test)]
     Probe(DurableStateActorProbe),
+    #[cfg(test)]
     ReserveAgent(TestAgentReservation),
+    #[cfg(test)]
     ReserveSession(TestSessionReservation),
 }
 
-#[cfg(test)]
 struct DurableStateActorRequestEnvelope {
     request: DurableStateActorRequest,
+    #[cfg(test)]
     response: Option<oneshot::Sender<Result<(), ActorRequestError>>>,
+    #[cfg(test)]
     drop_error: ActorRequestError,
 }
 
-#[cfg(test)]
 impl DurableStateActorRequestEnvelope {
+    #[cfg(test)]
     fn new(
         request: DurableStateActorRequest,
     ) -> (Self, oneshot::Receiver<Result<(), ActorRequestError>>) {
@@ -818,24 +880,32 @@ impl DurableStateActorRequestEnvelope {
         )
     }
 
+    #[cfg(test)]
     fn settle(&mut self, outcome: Result<(), ActorRequestError>) {
         if let Some(response) = self.response.take() {
             let _ = response.send(outcome);
         }
     }
 
+    #[cfg(test)]
     fn complete(&mut self) {
         self.settle(Ok(()));
     }
 
     fn reject_closing(&mut self) {
-        self.settle(Err(ActorRequestError::Closing));
         #[cfg(test)]
+        self.settle(Err(ActorRequestError::Closing));
         match &mut self.request {
+            DurableStateActorRequest::CreateAgent(request) => {
+                request.reject(DurableAgentCreateError::Closing);
+            }
+            #[cfg(test)]
             DurableStateActorRequest::Probe(_) => {}
+            #[cfg(test)]
             DurableStateActorRequest::ReserveAgent(request) => {
                 request.settle(Err(TestReservationError::Closing));
             }
+            #[cfg(test)]
             DurableStateActorRequest::ReserveSession(request) => {
                 request.settle(Err(TestReservationError::Closing));
             }
@@ -843,13 +913,19 @@ impl DurableStateActorRequestEnvelope {
     }
 
     fn reject_unavailable(&mut self) {
-        self.settle(Err(ActorRequestError::Unavailable));
         #[cfg(test)]
+        self.settle(Err(ActorRequestError::Unavailable));
         match &mut self.request {
+            DurableStateActorRequest::CreateAgent(request) => {
+                request.reject(DurableAgentCreateError::InternalDispatchUnavailable);
+            }
+            #[cfg(test)]
             DurableStateActorRequest::Probe(_) => {}
+            #[cfg(test)]
             DurableStateActorRequest::ReserveAgent(request) => {
                 request.settle(Err(TestReservationError::StorageUnavailable));
             }
+            #[cfg(test)]
             DurableStateActorRequest::ReserveSession(request) => {
                 request.settle(Err(TestReservationError::StorageUnavailable));
             }
@@ -862,7 +938,8 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::Probe(probe) => {
                 Some((Arc::clone(&probe.entered), Arc::clone(&probe.release)))
             }
-            DurableStateActorRequest::ReserveAgent(_)
+            DurableStateActorRequest::CreateAgent(_)
+            | DurableStateActorRequest::ReserveAgent(_)
             | DurableStateActorRequest::ReserveSession(_) => None,
         }
     }
@@ -918,27 +995,29 @@ impl<T> TestReservationWaiter<T> {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy)]
 enum ReservationAttemptJobOutcome {
     Cancelled,
     Observed(ReservationPhysicalObservation),
 }
 
-#[cfg(test)]
 /// An aborted or panicking actor must close admission before its owner can be joined. This is
 /// deliberately independent of request settlement: a child operation may still finish, but the
 /// dead actor can no longer admit a new mutation.
 struct UnexpectedActorExitGuard {
     task_context: RuntimeTaskContext,
+    active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
     armed: bool,
 }
 
-#[cfg(test)]
 impl UnexpectedActorExitGuard {
-    fn new(task_context: RuntimeTaskContext) -> Self {
+    fn new(
+        task_context: RuntimeTaskContext,
+        active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
+    ) -> Self {
         Self {
             task_context,
+            active_commit_barrier,
             armed: true,
         }
     }
@@ -948,10 +1027,12 @@ impl UnexpectedActorExitGuard {
     }
 }
 
-#[cfg(test)]
 impl Drop for UnexpectedActorExitGuard {
     fn drop(&mut self) {
         if self.armed {
+            if let Some(barrier) = lock(&self.active_commit_barrier).as_ref() {
+                barrier.try_cancel();
+            }
             self.task_context.request_closing();
         }
     }
@@ -960,11 +1041,11 @@ impl Drop for UnexpectedActorExitGuard {
 /// Opaque owner-side control for the one tracked DurableState actor.
 #[derive(Clone)]
 struct DurableStateActorHandle {
-    #[cfg(test)]
     sender: mpsc::Sender<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
     #[cfg(test)]
     task: TrackedTask,
+    active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
     #[cfg(test)]
     receiver_closed: Arc<tokio::sync::Notify>,
 }
@@ -972,52 +1053,123 @@ struct DurableStateActorHandle {
 impl DurableStateActorHandle {
     fn start(
         task_context: &RuntimeTaskContext,
-        _root: PathBuf,
-        _directory_sync: DirectorySync,
-        _recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
-        _recovered_session_reservations: Arc<BTreeSet<SessionId>>,
-        _filesystem: Arc<dyn DurableFilesystem>,
+        root: PathBuf,
+        directory_sync: DirectorySync,
+        recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
+        recovered_session_reservations: Arc<BTreeSet<SessionId>>,
+        filesystem: Arc<dyn DurableFilesystem>,
+        published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
     ) -> Result<Self, RuntimeTaskError> {
         let closing = CancellationToken::new();
-
+        let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
         #[cfg(test)]
-        {
-            let (sender, receiver) = mpsc::channel(DURABLE_STATE_ACTOR_QUEUE_CAPACITY);
-            let receiver_closed = Arc::new(tokio::sync::Notify::new());
-            let actor = DurableStateActor {
-                receiver,
-                closing: closing.clone(),
-                root: _root,
-                directory_sync: _directory_sync,
-                recovered_agent_reservations: _recovered_agent_reservations,
-                recovered_session_reservations: _recovered_session_reservations,
-                new_agent_reservations: BTreeSet::new(),
-                new_session_reservations: BTreeSet::new(),
-                task_context: task_context.clone(),
-                filesystem: _filesystem,
-                receiver_closed: Arc::clone(&receiver_closed),
-            };
-            let task = task_context.spawn_tracked(actor.run())?;
-            Ok(Self {
-                sender,
-                closing,
-                task,
-                receiver_closed,
-            })
-        }
-
+        let receiver_closed = Arc::new(tokio::sync::Notify::new());
+        let active_commit_barrier = Arc::new(Mutex::new(None));
+        let actor = DurableStateActor {
+            receiver,
+            closing: closing.clone(),
+            root,
+            directory_sync,
+            recovered_agent_reservations,
+            recovered_session_reservations,
+            new_agent_reservations: BTreeSet::new(),
+            new_session_reservations: BTreeSet::new(),
+            task_context: task_context.clone(),
+            filesystem,
+            published_agents,
+            active_commit_barrier: Arc::clone(&active_commit_barrier),
+            #[cfg(test)]
+            receiver_closed: Arc::clone(&receiver_closed),
+        };
+        #[cfg(test)]
+        let task = task_context.spawn_tracked(actor.run())?;
         #[cfg(not(test))]
-        {
-            let actor = DurableStateActor {
-                closing: closing.clone(),
-            };
-            let _ = task_context.spawn_tracked(actor.run())?;
-            Ok(Self { closing })
-        }
+        let _task = task_context.spawn_tracked(actor.run())?;
+        Ok(Self {
+            sender,
+            closing,
+            #[cfg(test)]
+            task,
+            active_commit_barrier,
+            #[cfg(test)]
+            receiver_closed,
+        })
     }
 
     fn request_closing(&self) {
+        if let Some(barrier) = lock(&self.active_commit_barrier).as_ref() {
+            // The actor's async select observes the same first-wins barrier, but the owner-side
+            // close request also cancels a still-pre-COMMITTED worker synchronously. This keeps
+            // shutdown from depending on one extra scheduler turn.
+            barrier.try_cancel();
+        }
         self.closing.cancel();
+    }
+
+    async fn enqueue_create(&self, attempt: SealedAgentCreateAttempt) -> CreateAgentWaiter {
+        self.enqueue_create_request(CreateAgentRequest {
+            attempt,
+            response: None,
+            closing: self.closing.clone(),
+            #[cfg(test)]
+            candidates: None,
+            #[cfg(test)]
+            candidate_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn enqueue_create_with_test_candidates(
+        &self,
+        attempt: SealedAgentCreateAttempt,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        candidate_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> CreateAgentWaiter {
+        self.enqueue_create_request(CreateAgentRequest {
+            attempt,
+            response: None,
+            closing: self.closing.clone(),
+            candidates: Some(candidates.into_iter().collect()),
+            candidate_calls,
+        })
+        .await
+    }
+
+    async fn enqueue_create_request(&self, mut create: CreateAgentRequest) -> CreateAgentWaiter {
+        let (response, waiter) = oneshot::channel();
+        create.response = Some(response);
+        let mut envelope = DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::CreateAgent(create),
+            #[cfg(test)]
+            response: None,
+            #[cfg(test)]
+            drop_error: ActorRequestError::Unavailable,
+        };
+
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                envelope.reject_closing();
+                return CreateAgentWaiter { response: waiter };
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if self.closing.is_cancelled() {
+                        envelope.reject_closing();
+                    } else {
+                        envelope.reject_unavailable();
+                    }
+                    return CreateAgentWaiter { response: waiter };
+                }
+            },
+        };
+        // A capacity permit is the admission linearization point. No cancellation await or
+        // other fallible work may occur after it: the actor (or its drop/drain path) owns the
+        // request's physical settlement from here.
+        permit.send(envelope);
+        CreateAgentWaiter { response: waiter }
     }
 
     #[cfg(test)]
@@ -1243,40 +1395,77 @@ impl DurableStateActorHandle {
     }
 }
 
-#[cfg(not(test))]
-impl DurableStateActor {
-    async fn run(self) {
-        self.closing.cancelled().await;
-    }
-}
-
-#[cfg(test)]
 impl DurableStateActor {
     fn run(self) -> impl Future<Output = ()> + Send {
-        let mut unexpected_exit = UnexpectedActorExitGuard::new(self.task_context.clone());
+        let mut unexpected_exit = UnexpectedActorExitGuard::new(
+            self.task_context.clone(),
+            Arc::clone(&self.active_commit_barrier),
+        );
         async move {
-            self.run_loop().await;
-            unexpected_exit.disarm();
+            if self.run_loop().await {
+                unexpected_exit.disarm();
+            }
         }
     }
 
-    async fn run_loop(mut self) {
+    async fn run_loop(mut self) -> bool {
         loop {
             tokio::select! {
                 biased;
                 _ = self.closing.cancelled() => {
                     self.close_receiver_and_reject_queued().await;
-                    return;
+                    return true;
                 }
                 request = self.receiver.recv() => match request {
-                    None => return,
+                    None => return false,
                     Some(mut request) => {
                         if self.closing.is_cancelled() {
                             self.close_current_and_reject_queued(&mut request).await;
-                            return;
+                            return true;
                         }
-                        #[cfg(test)]
                         match &mut request.request {
+                            DurableStateActorRequest::CreateAgent(create) => {
+                                match self.process_create_agent(create).await {
+                                    PublicationWorkResult::Published {
+                                        entry,
+                                        close_required,
+                                    } => {
+                                        let head = Arc::clone(&entry.current_head);
+                                        lock(&self.published_agents)
+                                            .insert(head.agent_id(), entry);
+                                        // Install first, then settle the current response. A
+                                        // remembered close can drain only after this success is
+                                        // observable; queued requests must not overtake it.
+                                        create.settle(Ok(head));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                    }
+                                    PublicationWorkResult::Ordinary {
+                                        error,
+                                        close_required,
+                                    } => {
+                                        create.settle(Err(error));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                    }
+                                    PublicationWorkResult::Poisoned => {
+                                        create.settle(Err(
+                                            DurableAgentCreateError::InternalDispatchUnavailable,
+                                        ));
+                                        self.poison_create_admission().await;
+                                        return true;
+                                    }
+                                }
+                            }
+                            #[cfg(test)]
                             DurableStateActorRequest::Probe(_) => {
                                 let (entered, release) = request.probe_signals().expect("Probe has signals");
                                 entered.notify_one();
@@ -1284,27 +1473,29 @@ impl DurableStateActor {
                                     biased;
                                     _ = self.closing.cancelled() => {
                                         self.close_current_and_reject_queued(&mut request).await;
-                                        return;
+                                        return true;
                                     }
                                     _ = release.notified() => request.complete(),
                                 }
                             }
+                            #[cfg(test)]
                             DurableStateActorRequest::ReserveAgent(reservation) => {
                                 let outcome = self.reserve_agent_for_test(reservation).await;
                                 let poison = outcome.is_err_and(TestReservationError::is_poison);
                                 reservation.settle(outcome);
                                 if poison {
                                     self.poison_test_admission().await;
-                                    return;
+                                    return true;
                                 }
                             }
+                            #[cfg(test)]
                             DurableStateActorRequest::ReserveSession(reservation) => {
                                 let outcome = self.reserve_session_for_test(reservation).await;
                                 let poison = outcome.is_err_and(TestReservationError::is_poison);
                                 reservation.settle(outcome);
                                 if poison {
                                     self.poison_test_admission().await;
-                                    return;
+                                    return true;
                                 }
                             }
                         }
@@ -1312,6 +1503,228 @@ impl DurableStateActor {
                 },
             }
         }
+    }
+
+    async fn process_create_agent(
+        &mut self,
+        request: &mut CreateAgentRequest,
+    ) -> PublicationWorkResult {
+        let agent_id = match self.reserve_agent_for_create(request).await {
+            Ok(agent_id) => agent_id,
+            Err(DurableAgentCreateError::InternalDispatchUnavailable) => {
+                return PublicationWorkResult::Poisoned;
+            }
+            Err(error) => {
+                return PublicationWorkResult::Ordinary {
+                    error,
+                    close_required: false,
+                };
+            }
+        };
+        if self.closing.is_cancelled() {
+            return PublicationWorkResult::Ordinary {
+                error: DurableAgentCreateError::Closing,
+                close_required: false,
+            };
+        }
+
+        let (definition, metadata) = request.attempt.materialize(agent_id);
+        let definition = Arc::new(definition);
+        let metadata = Arc::new(metadata);
+        let generation = match StorageGeneration::new(1) {
+            Some(generation) => generation,
+            None => return PublicationWorkResult::Poisoned,
+        };
+        let head = match DurableAgentHead::new(
+            agent_id,
+            generation,
+            None,
+            definition.revision(),
+            generation,
+            metadata.as_ref().clone(),
+            AgentStatus::Enabled,
+            definition.created_at(),
+        ) {
+            Ok(head) => Arc::new(head),
+            Err(_) => return PublicationWorkResult::Poisoned,
+        };
+        if validate_generation_one_agent_semantics(agent_id, generation, &head, &definition)
+            .is_err()
+        {
+            return PublicationWorkResult::Poisoned;
+        }
+        publish_agent_generation(
+            self.task_context.clone(),
+            Arc::clone(&self.filesystem),
+            self.root.clone(),
+            self.directory_sync,
+            Arc::clone(&definition),
+            Arc::clone(&head),
+            self.closing.clone(),
+            Arc::clone(&self.active_commit_barrier),
+        )
+        .await
+    }
+
+    async fn reserve_agent_for_create(
+        &mut self,
+        request: &mut CreateAgentRequest,
+    ) -> Result<AgentId, DurableAgentCreateError> {
+        if self.recovered_agent_reservations.len() + self.new_agent_reservations.len()
+            >= AGENT_RESERVATION_ENTRY_CAP
+        {
+            return Err(DurableAgentCreateError::DurableStateTooLarge);
+        }
+        let mut collisions = 0;
+        loop {
+            if self.closing.is_cancelled() {
+                return Err(DurableAgentCreateError::Closing);
+            }
+            let candidate = {
+                #[cfg(test)]
+                {
+                    if let Some(candidates) = request.candidates.as_mut() {
+                        request.candidate_calls.fetch_add(1, Ordering::SeqCst);
+                        candidates
+                            .pop_front()
+                            .unwrap_or(Err(()))
+                            .map_err(|_| DurableAgentCreateError::IdentityUnavailable)?
+                    } else {
+                        request
+                            .attempt
+                            .generate_candidate()
+                            .map_err(|_| DurableAgentCreateError::IdentityUnavailable)?
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    request
+                        .attempt
+                        .generate_candidate()
+                        .map_err(|_| DurableAgentCreateError::IdentityUnavailable)?
+                }
+            };
+            let was_present = self.recovered_agent_reservations.contains(&candidate)
+                || self.new_agent_reservations.contains(&candidate);
+            let observation = self
+                .run_create_reservation_attempt(
+                    self.root
+                        .join(RESERVATIONS_DIRECTORY)
+                        .join(AGENTS_DIRECTORY)
+                        .join(candidate.to_string()),
+                )
+                .await?;
+            match observation {
+                ReservationPhysicalObservation::Created if !was_present => {
+                    self.new_agent_reservations.insert(candidate);
+                    return Ok(candidate);
+                }
+                ReservationPhysicalObservation::AlreadyExistsCanonical if was_present => {
+                    collisions += 1;
+                    if collisions == RESERVATION_COLLISION_ATTEMPT_CAP {
+                        return Err(DurableAgentCreateError::CollisionAttemptsExhausted);
+                    }
+                }
+                ReservationPhysicalObservation::CreateErrorAbsent if !was_present => {
+                    return Err(DurableAgentCreateError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::CreateErrorPresent if was_present => {
+                    return Err(DurableAgentCreateError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::CreateErrorPresent
+                | ReservationPhysicalObservation::CreatedThenErrorPresent
+                    if !was_present =>
+                {
+                    self.new_agent_reservations.insert(candidate);
+                    return Err(DurableAgentCreateError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::Indeterminate
+                | ReservationPhysicalObservation::Corrupt => {
+                    return Err(DurableAgentCreateError::InternalDispatchUnavailable);
+                }
+                ReservationPhysicalObservation::Created
+                | ReservationPhysicalObservation::AlreadyExistsCanonical
+                | ReservationPhysicalObservation::CreateErrorAbsent
+                | ReservationPhysicalObservation::CreateErrorPresent
+                | ReservationPhysicalObservation::CreatedThenErrorPresent => {
+                    return Err(DurableAgentCreateError::InternalDispatchUnavailable);
+                }
+            }
+        }
+    }
+
+    async fn run_create_reservation_attempt(
+        &self,
+        path: PathBuf,
+    ) -> Result<ReservationPhysicalObservation, DurableAgentCreateError> {
+        let stage = Arc::new(AtomicU8::new(ReservationAttemptStage::Pending as u8));
+        let filesystem = Arc::clone(&self.filesystem);
+        let directory_sync = self.directory_sync;
+        let job_stage = Arc::clone(&stage);
+        let job =
+            self.task_context.spawn_blocking_tracked(move || {
+                match attempt_local_reservation(
+                    filesystem.as_ref(),
+                    &path,
+                    directory_sync,
+                    &job_stage,
+                ) {
+                    Some(observation) => ReservationAttemptJobOutcome::Observed(observation),
+                    None => ReservationAttemptJobOutcome::Cancelled,
+                }
+            });
+        let mut job_wait = Box::pin(job.wait());
+        tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                let closing_won = ReservationAttemptStage::try_cancel(&stage);
+                let result = job_wait.await;
+                Self::settle_create_reservation_attempt(result, &stage, closing_won)
+            }
+            result = &mut job_wait => {
+                Self::settle_create_reservation_attempt(result, &stage, false)
+            }
+        }
+    }
+
+    fn settle_create_reservation_attempt(
+        result: Result<ReservationAttemptJobOutcome, RuntimeTaskError>,
+        stage: &AtomicU8,
+        closing_won: bool,
+    ) -> Result<ReservationPhysicalObservation, DurableAgentCreateError> {
+        match result {
+            Ok(ReservationAttemptJobOutcome::Observed(_)) if closing_won => {
+                Err(DurableAgentCreateError::InternalDispatchUnavailable)
+            }
+            Ok(ReservationAttemptJobOutcome::Observed(observation)) => Ok(observation),
+            Ok(ReservationAttemptJobOutcome::Cancelled) if closing_won => {
+                Err(DurableAgentCreateError::Closing)
+            }
+            Ok(ReservationAttemptJobOutcome::Cancelled) => {
+                Err(DurableAgentCreateError::InternalDispatchUnavailable)
+            }
+            Err(error) => match ReservationAttemptStage::load(stage) {
+                ReservationAttemptStage::Crossed => {
+                    Err(DurableAgentCreateError::InternalDispatchUnavailable)
+                }
+                ReservationAttemptStage::Pending | ReservationAttemptStage::Cancelled => {
+                    if error == RuntimeTaskError::OwnerClosing {
+                        Err(DurableAgentCreateError::Closing)
+                    } else {
+                        Err(DurableAgentCreateError::StorageUnavailable)
+                    }
+                }
+            },
+        }
+    }
+
+    async fn poison_create_admission(&mut self) {
+        self.task_context.request_closing();
+        self.closing.cancel();
+        self.close_receiver_and_reject_queued_with(
+            DurableAgentCreateError::InternalDispatchUnavailable,
+        )
+        .await;
     }
 
     #[cfg(test)]
@@ -1536,6 +1949,18 @@ impl DurableStateActor {
         self.reject_queued_as_closing().await;
     }
 
+    async fn close_receiver_and_reject_queued_with(&mut self, error: DurableAgentCreateError) {
+        self.receiver.close();
+        #[cfg(test)]
+        self.receiver_closed.notify_waiters();
+        while let Some(mut request) = self.receiver.recv().await {
+            match error {
+                DurableAgentCreateError::Closing => request.reject_closing(),
+                _ => request.reject_unavailable(),
+            }
+        }
+    }
+
     async fn close_current_and_reject_queued(
         &mut self,
         current: &mut DurableStateActorRequestEnvelope,
@@ -1554,6 +1979,812 @@ impl DurableStateActor {
     }
 }
 
+/// The four internal physical publication certainties. Only `NotPublished` may use the
+/// ordinary typed failure path; the two poisoned states are mutation-fatal and never cleaned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationCertainty {
+    NotPublished,
+    Published,
+    CommittedCorruptPoisoned,
+    IndeterminatePoisoned,
+}
+
+#[derive(Clone)]
+enum PublicationWorkResult {
+    Published {
+        entry: DurableAgentCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: DurableAgentCreateError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
+/// The single publication linearization point. The worker and actor race this state with
+/// compare/exchange; exactly one of cancellation and COMMITTED creation wins.
+struct DurableCommitBarrier {
+    stage: AtomicU8,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DurableCommitStage {
+    Pending = 0,
+    Crossed = 1,
+    Cancelled = 2,
+}
+
+impl DurableCommitBarrier {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stage: AtomicU8::new(DurableCommitStage::Pending as u8),
+        })
+    }
+
+    fn try_cross(&self) -> bool {
+        self.stage
+            .compare_exchange(
+                DurableCommitStage::Pending as u8,
+                DurableCommitStage::Crossed as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn try_cancel(&self) -> bool {
+        self.stage
+            .compare_exchange(
+                DurableCommitStage::Pending as u8,
+                DurableCommitStage::Cancelled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.stage.load(Ordering::Acquire) == DurableCommitStage::Cancelled as u8
+    }
+
+    fn current_stage(&self) -> DurableCommitStage {
+        match self.stage.load(Ordering::Acquire) {
+            value if value == DurableCommitStage::Pending as u8 => DurableCommitStage::Pending,
+            value if value == DurableCommitStage::Crossed as u8 => DurableCommitStage::Crossed,
+            value if value == DurableCommitStage::Cancelled as u8 => DurableCommitStage::Cancelled,
+            _ => unreachable!("the durable commit barrier has three closed states"),
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the actor passes the fixed publication owner, filesystem, paths, and barrier seam"
+)]
+async fn publish_agent_generation(
+    task_context: RuntimeTaskContext,
+    filesystem: Arc<dyn DurableFilesystem>,
+    root: PathBuf,
+    directory_sync: DirectorySync,
+    definition: Arc<AgentDefinition>,
+    head: Arc<DurableAgentHead>,
+    closing: CancellationToken,
+    active_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
+) -> PublicationWorkResult {
+    let barrier = DurableCommitBarrier::new();
+    *lock(&active_barrier) = Some(Arc::clone(&barrier));
+    let worker_barrier = Arc::clone(&barrier);
+    let job = task_context.spawn_blocking_tracked(move || {
+        publish_agent_generation_blocking(
+            filesystem.as_ref(),
+            &root,
+            directory_sync,
+            definition,
+            head,
+            worker_barrier,
+        )
+    });
+    let mut job_wait = Box::pin(job.wait());
+    let result = tokio::select! {
+        biased;
+        _ = closing.cancelled() => {
+            let cancellation_won = barrier.try_cancel();
+            let result = job_wait.await;
+            match result {
+                Ok(result) if cancellation_won => force_publication_closing(result),
+                Ok(result) => force_publication_close(result),
+                Err(error) if cancellation_won => {
+                    force_publication_closing(classify_publication_task_error(error, &barrier))
+                }
+                Err(error) => {
+                    force_publication_close(classify_publication_task_error(error, &barrier))
+                }
+            }
+        }
+        result = &mut job_wait => match result {
+            Ok(result) => result,
+            Err(error) => classify_publication_task_error(error, &barrier),
+        },
+    };
+    *lock(&active_barrier) = None;
+    result
+}
+
+fn classify_publication_task_error(
+    error: RuntimeTaskError,
+    barrier: &DurableCommitBarrier,
+) -> PublicationWorkResult {
+    match barrier.current_stage() {
+        DurableCommitStage::Crossed => PublicationWorkResult::Poisoned,
+        DurableCommitStage::Pending | DurableCommitStage::Cancelled => match error {
+            RuntimeTaskError::OwnerClosing => {
+                ordinary_publication_error(DurableAgentCreateError::Closing)
+            }
+            RuntimeTaskError::WorkerUnavailable => {
+                ordinary_publication_error(DurableAgentCreateError::StorageUnavailable)
+            }
+            RuntimeTaskError::OperationPanicked => PublicationWorkResult::Poisoned,
+        },
+    }
+}
+
+fn force_publication_closing(result: PublicationWorkResult) -> PublicationWorkResult {
+    match result {
+        PublicationWorkResult::Published { entry, .. } => PublicationWorkResult::Published {
+            entry,
+            close_required: true,
+        },
+        PublicationWorkResult::Ordinary { .. } => PublicationWorkResult::Ordinary {
+            error: DurableAgentCreateError::Closing,
+            close_required: false,
+        },
+        PublicationWorkResult::Poisoned => PublicationWorkResult::Poisoned,
+    }
+}
+
+fn force_publication_close(result: PublicationWorkResult) -> PublicationWorkResult {
+    match result {
+        PublicationWorkResult::Published { entry, .. } => PublicationWorkResult::Published {
+            entry,
+            close_required: true,
+        },
+        PublicationWorkResult::Ordinary { error, .. } => PublicationWorkResult::Ordinary {
+            error,
+            close_required: true,
+        },
+        PublicationWorkResult::Poisoned => PublicationWorkResult::Poisoned,
+    }
+}
+
+fn publish_agent_generation_blocking(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    definition: Arc<AgentDefinition>,
+    head: Arc<DurableAgentHead>,
+    barrier: Arc<DurableCommitBarrier>,
+) -> PublicationWorkResult {
+    let agent_id = definition.agent_id();
+    let generation = head.storage_generation();
+    let entity = root.join(AGENTS_DIRECTORY).join(agent_id.to_string());
+    let generations = entity.join("generations");
+    let generation_path = generations.join(generation.directory_name());
+    let head_path = generation_path.join("head.json");
+    let definition_path = generation_path.join("definition.json");
+    // Construct every post-barrier path before the barrier. The next physical operation after
+    // the atomic cross is therefore create_new(COMMITTED), with no allocation or callback seam.
+    let committed_path = generation_path.join("COMMITTED");
+    let published_path = entity.join("PUBLISHED");
+
+    let head_bytes = match DurableStoreV1Codec::encode_agent_head(&head) {
+        Ok(bytes) => bytes,
+        Err(error) => return ordinary_publication_error(map_publication_codec_error(error)),
+    };
+    let definition_bytes = match DurableStoreV1Codec::encode_agent_definition(&definition) {
+        Ok(bytes) => bytes,
+        Err(error) => return ordinary_publication_error(map_publication_codec_error(error)),
+    };
+    if validate_generation_one_agent_semantics(agent_id, generation, &head, &definition).is_err() {
+        return PublicationWorkResult::Poisoned;
+    }
+
+    macro_rules! precommit_step {
+        ($operation:expr) => {{
+            if barrier.is_cancelled() {
+                return reconcile_precommit_failure(
+                    filesystem,
+                    root,
+                    directory_sync,
+                    agent_id,
+                    DurableAgentCreateError::Closing,
+                    &barrier,
+                );
+            }
+            if $operation.is_err() {
+                return reconcile_precommit_failure(
+                    filesystem,
+                    root,
+                    directory_sync,
+                    agent_id,
+                    DurableAgentCreateError::StorageUnavailable,
+                    &barrier,
+                );
+            }
+        }};
+    }
+
+    precommit_step!(filesystem.create_private_directory(&entity));
+    precommit_step!(filesystem.sync_directory(&entity_parent(&entity), directory_sync));
+    precommit_step!(filesystem.create_private_directory(&generations));
+    precommit_step!(filesystem.sync_directory(&entity, directory_sync));
+    precommit_step!(filesystem.create_private_directory(&generation_path));
+    precommit_step!(filesystem.sync_directory(&generations, directory_sync));
+    precommit_step!(write_and_sync(filesystem, &head_path, &head_bytes));
+    precommit_step!(write_and_sync(
+        filesystem,
+        &definition_path,
+        &definition_bytes
+    ));
+    precommit_step!(filesystem.sync_directory(&generation_path, directory_sync));
+    precommit_step!(exact_readback(filesystem, &head_path, &head_bytes));
+    precommit_step!(exact_readback(
+        filesystem,
+        &definition_path,
+        &definition_bytes
+    ));
+
+    let mut close_required = false;
+    #[cfg(test)]
+    filesystem.before_commit_barrier();
+    if !barrier.try_cross() {
+        return reconcile_precommit_failure(
+            filesystem,
+            root,
+            directory_sync,
+            agent_id,
+            DurableAgentCreateError::Closing,
+            &barrier,
+        );
+    }
+
+    // Do not add a check, allocation, callback, or status read between this cross and the
+    // create_new below. Once the barrier wins, shutdown and caller drop cannot cancel the job.
+    let committed_file = match filesystem.create_new_private_file(&committed_path) {
+        Ok(file) => Some(file),
+        Err(()) => {
+            match reconcile_committed_failure(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                &entity,
+                &committed_path,
+                &head_path,
+                &definition_path,
+                &head_bytes,
+                &definition_bytes,
+                DurableAgentCreateError::StorageUnavailable,
+            ) {
+                CommittedFailureResolution::Continue => {
+                    close_required = true;
+                    None
+                }
+                CommittedFailureResolution::Return(result) => return result,
+            }
+        }
+    };
+    if let Some(committed_file) = committed_file {
+        let committed_operation_failed = validate_new_file_mode(&committed_file).is_err()
+            || filesystem
+                .sync_file(&committed_path, &committed_file)
+                .is_err()
+            || filesystem
+                .sync_directory(&generation_path, directory_sync)
+                .is_err();
+        let committed_readback_failed = !committed_operation_failed
+            && (!matches!(
+                exact_readback_state(filesystem, &committed_path, b""),
+                PublicationCertainty::Published
+            ) || !matches!(
+                exact_readback_state(filesystem, &head_path, &head_bytes),
+                PublicationCertainty::Published
+            ) || !matches!(
+                exact_readback_state(filesystem, &definition_path, &definition_bytes),
+                PublicationCertainty::Published
+            ));
+        if committed_operation_failed || committed_readback_failed {
+            match reconcile_committed_failure(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                &entity,
+                &committed_path,
+                &head_path,
+                &definition_path,
+                &head_bytes,
+                &definition_bytes,
+                DurableAgentCreateError::StorageUnavailable,
+            ) {
+                CommittedFailureResolution::Continue => close_required = true,
+                CommittedFailureResolution::Return(result) => return result,
+            }
+        }
+    }
+
+    let published_file = match filesystem.create_new_private_file(&published_path) {
+        Ok(file) => file,
+        Err(()) => {
+            return reconcile_published_failure(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                &entity,
+                &head_path,
+                &definition_path,
+                &head_bytes,
+                &definition_bytes,
+                close_required,
+                DurableAgentCreateError::StorageUnavailable,
+            );
+        }
+    };
+    if validate_new_file_mode(&published_file).is_err()
+        || filesystem
+            .sync_file(&published_path, &published_file)
+            .is_err()
+        || filesystem.sync_directory(&entity, directory_sync).is_err()
+        || filesystem
+            .sync_directory(&entity_parent(&entity), directory_sync)
+            .is_err()
+    {
+        return reconcile_published_failure(
+            filesystem,
+            root,
+            directory_sync,
+            agent_id,
+            &entity,
+            &head_path,
+            &definition_path,
+            &head_bytes,
+            &definition_bytes,
+            true,
+            DurableAgentCreateError::StorageUnavailable,
+        );
+    }
+
+    let recovered = match recover_published_agent(
+        filesystem,
+        &entity,
+        agent_id,
+        &head_bytes,
+        &definition_bytes,
+    ) {
+        Ok(entry) => entry,
+        Err(certainty) => {
+            return reconcile_published_failure(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                &entity,
+                &head_path,
+                &definition_path,
+                &head_bytes,
+                &definition_bytes,
+                true,
+                publication_error_for_certainty(certainty),
+            );
+        }
+    };
+    if close_required {
+        // This branch is reached only when COMMITTED was already known valid after its error;
+        // PUBLISHED success still settles the physical command before mutation close.
+        return PublicationWorkResult::Published {
+            entry: recovered,
+            close_required: true,
+        };
+    }
+    PublicationWorkResult::Published {
+        entry: recovered,
+        close_required: false,
+    }
+}
+
+fn entity_parent(entity: &Path) -> PathBuf {
+    entity
+        .parent()
+        .expect("an Agent entity always has the agents collection parent")
+        .to_owned()
+}
+
+fn exact_readback(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), ()> {
+    if matches!(
+        exact_readback_state(filesystem, path, expected),
+        PublicationCertainty::Published
+    ) {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+fn ordinary_publication_error(error: DurableAgentCreateError) -> PublicationWorkResult {
+    PublicationWorkResult::Ordinary {
+        error,
+        close_required: false,
+    }
+}
+
+fn reconcile_precommit_failure(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    agent_id: AgentId,
+    error: DurableAgentCreateError,
+    barrier: &DurableCommitBarrier,
+) -> PublicationWorkResult {
+    let error = if barrier.is_cancelled() {
+        DurableAgentCreateError::Closing
+    } else {
+        error
+    };
+    match cleanup_operation_owned_agent_staging(filesystem, root, directory_sync, agent_id, false) {
+        Ok(()) => PublicationWorkResult::Ordinary {
+            error,
+            close_required: false,
+        },
+        Err(StagingCleanupError::CloseRequired) => PublicationWorkResult::Ordinary {
+            error,
+            close_required: true,
+        },
+        Err(StagingCleanupError::Poisoned) => PublicationWorkResult::Poisoned,
+    }
+}
+
+enum CommittedFailureResolution {
+    Continue,
+    Return(PublicationWorkResult),
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconciliation seam binds the root, operation paths, and exact canonical bytes"
+)]
+fn reconcile_committed_failure(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    agent_id: AgentId,
+    _entity: &Path,
+    committed_path: &Path,
+    head_path: &Path,
+    definition_path: &Path,
+    head_bytes: &[u8],
+    definition_bytes: &[u8],
+    ordinary_error: DurableAgentCreateError,
+) -> CommittedFailureResolution {
+    match exact_readback_state(filesystem, committed_path, b"") {
+        PublicationCertainty::Published => {
+            let payloads_valid = matches!(
+                exact_readback_state(filesystem, head_path, head_bytes),
+                PublicationCertainty::Published
+            ) && matches!(
+                exact_readback_state(filesystem, definition_path, definition_bytes),
+                PublicationCertainty::Published
+            );
+            if !payloads_valid {
+                return CommittedFailureResolution::Return(PublicationWorkResult::Poisoned);
+            }
+            // A create error may have hidden a successful marker side effect. Reopen and retry
+            // its durability steps before continuing; the original ambiguity still requires
+            // Closing after the mandatory PUBLISHED settlement.
+            let _ = sync_existing_marker(
+                filesystem,
+                committed_path,
+                &[committed_path
+                    .parent()
+                    .expect("COMMITTED has its generation directory parent")],
+                directory_sync,
+            );
+            // The bytes were constructed and semantically validated before the barrier. Exact
+            // marker plus exact G1 payload readback is the post-barrier certainty proof; the
+            // complete entity scan is deliberately deferred to the PUBLISHED reconciliation.
+            CommittedFailureResolution::Continue
+        }
+        PublicationCertainty::NotPublished => {
+            let result = match cleanup_operation_owned_agent_staging(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                true,
+            ) {
+                Ok(()) => PublicationWorkResult::Ordinary {
+                    error: ordinary_error,
+                    close_required: false,
+                },
+                Err(StagingCleanupError::CloseRequired) => PublicationWorkResult::Ordinary {
+                    error: ordinary_error,
+                    close_required: true,
+                },
+                Err(StagingCleanupError::Poisoned) => PublicationWorkResult::Poisoned,
+            };
+            CommittedFailureResolution::Return(result)
+        }
+        PublicationCertainty::CommittedCorruptPoisoned
+        | PublicationCertainty::IndeterminatePoisoned => {
+            CommittedFailureResolution::Return(PublicationWorkResult::Poisoned)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the reconciliation seam binds the root, entity path, and exact canonical bytes"
+)]
+fn reconcile_published_failure(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    agent_id: AgentId,
+    entity: &Path,
+    _head_path: &Path,
+    _definition_path: &Path,
+    head_bytes: &[u8],
+    definition_bytes: &[u8],
+    close_required: bool,
+    ordinary_error: DurableAgentCreateError,
+) -> PublicationWorkResult {
+    match exact_readback_state(filesystem, &entity.join("PUBLISHED"), b"") {
+        PublicationCertainty::Published => {
+            let published_path = entity.join("PUBLISHED");
+            let collection = entity
+                .parent()
+                .expect("an Agent entity has its collection parent");
+            let resync_failed = sync_existing_marker(
+                filesystem,
+                &published_path,
+                &[entity, collection],
+                directory_sync,
+            )
+            .is_err();
+            match recover_published_agent(
+                filesystem,
+                entity,
+                agent_id,
+                head_bytes,
+                definition_bytes,
+            ) {
+                Ok(entry) => PublicationWorkResult::Published {
+                    entry,
+                    close_required: close_required || resync_failed,
+                },
+                Err(PublicationCertainty::NotPublished) => PublicationWorkResult::Poisoned,
+                Err(_) => PublicationWorkResult::Poisoned,
+            }
+        }
+        PublicationCertainty::NotPublished => {
+            match cleanup_operation_owned_agent_staging(
+                filesystem,
+                root,
+                directory_sync,
+                agent_id,
+                true,
+            ) {
+                Ok(()) => PublicationWorkResult::Ordinary {
+                    error: ordinary_error,
+                    close_required,
+                },
+                Err(StagingCleanupError::CloseRequired) => PublicationWorkResult::Ordinary {
+                    error: ordinary_error,
+                    close_required: true,
+                },
+                Err(StagingCleanupError::Poisoned) => PublicationWorkResult::Poisoned,
+            }
+        }
+        PublicationCertainty::CommittedCorruptPoisoned
+        | PublicationCertainty::IndeterminatePoisoned => PublicationWorkResult::Poisoned,
+    }
+}
+
+fn sync_existing_marker(
+    filesystem: &dyn DurableFilesystem,
+    marker_path: &Path,
+    parents: &[&Path],
+    directory_sync: DirectorySync,
+) -> Result<(), ()> {
+    let marker = filesystem.open_file(marker_path)?;
+    validate_new_file_mode(&marker).map_err(|_| ())?;
+    filesystem.sync_file(marker_path, &marker)?;
+    for parent in parents {
+        filesystem.sync_directory(parent, directory_sync)?;
+    }
+    Ok(())
+}
+
+fn recover_published_agent(
+    filesystem: &dyn DurableFilesystem,
+    entity: &Path,
+    agent_id: AgentId,
+    head_bytes: &[u8],
+    definition_bytes: &[u8],
+) -> Result<DurableAgentCatalogEntry, PublicationCertainty> {
+    let published_state = exact_readback_state(filesystem, &entity.join("PUBLISHED"), b"");
+    if published_state != PublicationCertainty::Published {
+        return Err(published_state);
+    }
+    let head_state = exact_readback_state(
+        filesystem,
+        &entity.join("generations/00000000000000000001/head.json"),
+        head_bytes,
+    );
+    if head_state != PublicationCertainty::Published {
+        return Err(match head_state {
+            PublicationCertainty::IndeterminatePoisoned => {
+                PublicationCertainty::IndeterminatePoisoned
+            }
+            _ => PublicationCertainty::CommittedCorruptPoisoned,
+        });
+    }
+    let definition_state = exact_readback_state(
+        filesystem,
+        &entity.join("generations/00000000000000000001/definition.json"),
+        definition_bytes,
+    );
+    if definition_state != PublicationCertainty::Published {
+        return Err(match definition_state {
+            PublicationCertainty::IndeterminatePoisoned => {
+                PublicationCertainty::IndeterminatePoisoned
+            }
+            _ => PublicationCertainty::CommittedCorruptPoisoned,
+        });
+    }
+    let scanned = scan_agent_entity(entity, GENERATION_ENTRY_CAP).map_err(|error| match error {
+        DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
+        DurableOpenError::DurableStateTooLarge
+        | DurableOpenError::DurableStateCorrupt
+        | DurableOpenError::StoreInUse
+        | DurableOpenError::UnsupportedStoreFormat => {
+            PublicationCertainty::CommittedCorruptPoisoned
+        }
+    })?;
+    let ScannedAgentEntity::Published(scan) = scanned else {
+        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    };
+    if scan.markerless.is_some() {
+        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    }
+    recover_agent_generation_chain(scan, agent_id)
+        .map(|recovered| recovered.entry)
+        .map_err(|error| match error {
+            DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
+            _ => PublicationCertainty::CommittedCorruptPoisoned,
+        })
+}
+
+enum StagingCleanupError {
+    CloseRequired,
+    Poisoned,
+}
+
+fn cleanup_operation_owned_agent_staging(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    agent_id: AgentId,
+    allow_committed: bool,
+) -> Result<(), StagingCleanupError> {
+    let reservation_path = root
+        .join(RESERVATIONS_DIRECTORY)
+        .join(AGENTS_DIRECTORY)
+        .join(agent_id.to_string());
+    let reservation_shape = validate_cleanup_zero_regular_file(&reservation_path)
+        .map_err(|_| StagingCleanupError::Poisoned)?;
+    let entity = root.join(AGENTS_DIRECTORY).join(agent_id.to_string());
+    match fs::symlink_metadata(&entity) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(_) => {}
+        Err(_) => return Err(StagingCleanupError::Poisoned),
+    }
+    let files = match scan_agent_entity(&entity, GENERATION_ENTRY_CAP)
+        .map_err(|_| StagingCleanupError::Poisoned)?
+    {
+        ScannedAgentEntity::Unpublished(files) => files,
+        ScannedAgentEntity::Published(_) => return Err(StagingCleanupError::Poisoned),
+    };
+    validate_unpublished_agent_candidate(agent_id, &files)
+        .map_err(|_| StagingCleanupError::Poisoned)?;
+    if !allow_committed
+        && files
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.has_committed)
+    {
+        return Err(StagingCleanupError::Poisoned);
+    }
+    let cleanup = deferred_unpublished_agent_cleanup(
+        root,
+        agent_id,
+        files,
+        GENERATION_ENTRY_CAP,
+        reservation_shape,
+    );
+    revalidate_deferred_unpublished_entity_cleanup(&cleanup)
+        .map_err(|_| StagingCleanupError::Poisoned)?;
+    execute_deferred_unpublished_entity_cleanup(&cleanup, directory_sync, filesystem).map_err(
+        |error| match error {
+            DurableOpenError::StorageUnavailable => StagingCleanupError::CloseRequired,
+            _ => StagingCleanupError::Poisoned,
+        },
+    )
+}
+
+fn exact_readback_state(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected: &[u8],
+) -> PublicationCertainty {
+    match filesystem.read_document(path) {
+        Ok(actual) if actual == expected => PublicationCertainty::Published,
+        Ok(_) => PublicationCertainty::CommittedCorruptPoisoned,
+        Err(error) => match fs::symlink_metadata(path) {
+            Err(metadata_error) if metadata_error.kind() == io::ErrorKind::NotFound => {
+                PublicationCertainty::NotPublished
+            }
+            Err(_) => PublicationCertainty::IndeterminatePoisoned,
+            Ok(_) => match error {
+                DurableOpenError::DurableStateCorrupt | DurableOpenError::DurableStateTooLarge => {
+                    PublicationCertainty::CommittedCorruptPoisoned
+                }
+                _ => PublicationCertainty::IndeterminatePoisoned,
+            },
+        },
+    }
+}
+
+fn publication_error_for_certainty(certainty: PublicationCertainty) -> DurableAgentCreateError {
+    match certainty {
+        PublicationCertainty::NotPublished => DurableAgentCreateError::StorageUnavailable,
+        PublicationCertainty::Published => DurableAgentCreateError::StorageUnavailable,
+        PublicationCertainty::CommittedCorruptPoisoned
+        | PublicationCertainty::IndeterminatePoisoned => {
+            DurableAgentCreateError::InternalDispatchUnavailable
+        }
+    }
+}
+
+fn write_and_sync(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), ()> {
+    let mut file = filesystem.create_new_private_file(path)?;
+    validate_new_file_mode(&file).map_err(|_| ())?;
+    filesystem.write_file(path, &mut file, expected)?;
+    filesystem.sync_file(path, &file)
+}
+
+fn map_publication_codec_error(error: DurableStoreCodecError) -> DurableAgentCreateError {
+    match error {
+        DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure => {
+            DurableAgentCreateError::DurableStateTooLarge
+        }
+        DurableStoreCodecError::InvalidDocument
+        | DurableStoreCodecError::InvalidShape
+        | DurableStoreCodecError::InvalidScalar
+        | DurableStoreCodecError::InvalidSemantic
+        | DurableStoreCodecError::Noncanonical => DurableAgentCreateError::StorageUnavailable,
+    }
+}
+
 /// The private owner of the Store V1 root lease and recovered immutable catalog.
 #[derive(Clone)]
 pub(crate) struct DurableState {
@@ -1565,6 +2796,7 @@ pub(crate) struct DurableState {
         reason = "recovery catalog is consumed by later runtime read paths"
     )]
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+    published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
     #[allow(
         dead_code,
         reason = "recovery catalog is consumed by later runtime read paths"
@@ -1605,6 +2837,7 @@ impl DurableState {
             agent_reservations,
             session_reservations,
         } = &*opened;
+        let published_agents = Arc::new(Mutex::new(BTreeMap::new()));
         let actor = match DurableStateActorHandle::start(
             &task_context,
             root.clone(),
@@ -1612,6 +2845,7 @@ impl DurableState {
             Arc::clone(agent_reservations),
             Arc::clone(session_reservations),
             filesystem,
+            Arc::clone(&published_agents),
         ) {
             Ok(actor) => actor,
             Err(_) => {
@@ -1627,6 +2861,7 @@ impl DurableState {
             actor,
             lease: Arc::clone(lease),
             agents: Arc::clone(agents),
+            published_agents,
             sessions: Arc::clone(sessions),
         })
     }
@@ -1645,9 +2880,60 @@ impl DurableState {
 
     #[allow(
         dead_code,
+        reason = "the production Agent command surface consumes this durable create seam"
+    )]
+    pub(crate) async fn create_agent(
+        &self,
+        attempt: SealedAgentCreateAttempt,
+    ) -> Result<Arc<DurableAgentHead>, DurableAgentCreateError> {
+        self.actor.enqueue_create(attempt).await.wait().await
+    }
+
+    #[cfg(test)]
+    async fn create_agent_with_test_candidates(
+        &self,
+        attempt: SealedAgentCreateAttempt,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+    ) -> Result<Arc<DurableAgentHead>, DurableAgentCreateError> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.create_agent_with_test_candidates_and_calls(attempt, candidates, calls)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn enqueue_agent_create_with_test_candidates(
+        &self,
+        attempt: SealedAgentCreateAttempt,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> CreateAgentWaiter {
+        self.actor
+            .enqueue_create_with_test_candidates(attempt, candidates, calls)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn create_agent_with_test_candidates_and_calls(
+        &self,
+        attempt: SealedAgentCreateAttempt,
+        candidates: impl IntoIterator<Item = Result<AgentId, ()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<Arc<DurableAgentHead>, DurableAgentCreateError> {
+        self.actor
+            .enqueue_create_with_test_candidates(attempt, candidates, calls)
+            .await
+            .wait()
+            .await
+    }
+
+    #[allow(
+        dead_code,
         reason = "recovery catalog is consumed by later runtime read paths"
     )]
     pub(crate) fn agent_head(&self, agent_id: AgentId) -> Option<Arc<DurableAgentHead>> {
+        if let Some(entry) = lock(&self.published_agents).get(&agent_id) {
+            return Some(Arc::clone(&entry.current_head));
+        }
         self.agents
             .get(&agent_id)
             .map(|entry| Arc::clone(&entry.current_head))
@@ -1661,6 +2947,9 @@ impl DurableState {
         &self,
         agent_id: AgentId,
     ) -> Option<Arc<AgentDefinition>> {
+        if let Some(entry) = lock(&self.published_agents).get(&agent_id) {
+            return Some(Arc::clone(&entry.current_definition));
+        }
         self.agents
             .get(&agent_id)
             .map(|entry| Arc::clone(&entry.current_definition))
@@ -1675,6 +2964,12 @@ impl DurableState {
         agent_id: AgentId,
         revision: AgentRevision,
     ) -> bool {
+        if lock(&self.published_agents)
+            .get(&agent_id)
+            .is_some_and(|entry| entry.definition_index.contains_key(&revision))
+        {
+            return true;
+        }
         self.agents
             .get(&agent_id)
             .is_some_and(|entry| entry.definition_index.contains_key(&revision))
@@ -4179,6 +5474,28 @@ trait DurableFilesystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> Result<(), ()>;
     fn remove_dir(&self, path: &Path) -> Result<(), ()>;
     fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()>;
+    fn create_private_directory(&self, path: &Path) -> Result<(), ()> {
+        create_private_directory(path).map_err(|_| ())
+    }
+    fn create_new_private_file(&self, path: &Path) -> Result<File, ()> {
+        create_new_private_file(path).map_err(|_| ())
+    }
+    fn open_file(&self, path: &Path) -> Result<File, ()> {
+        File::open(path).map_err(|_| ())
+    }
+    fn write_file(&self, path: &Path, file: &mut File, bytes: &[u8]) -> Result<(), ()> {
+        let _ = path;
+        file.write_all(bytes).map_err(|_| ())
+    }
+    fn sync_file(&self, path: &Path, file: &File) -> Result<(), ()> {
+        let _ = path;
+        file.sync_all().map_err(|_| ())
+    }
+    fn read_document(&self, path: &Path) -> Result<Vec<u8>, DurableOpenError> {
+        read_durable_document(path)
+    }
+    #[cfg(test)]
+    fn before_commit_barrier(&self);
     #[cfg(test)]
     fn before_entity_reservation_barrier(&self);
     #[cfg(test)]
@@ -4209,6 +5526,9 @@ impl DurableFilesystem for LocalFilesystem {
     fn sync_directory(&self, path: &Path, directory_sync: DirectorySync) -> Result<(), ()> {
         sync_directory(path, directory_sync).map_err(|_| ())
     }
+
+    #[cfg(test)]
+    fn before_commit_barrier(&self) {}
 
     #[cfg(test)]
     fn before_entity_reservation_barrier(&self) {}
@@ -4718,7 +6038,14 @@ fn finalize_deferred_unpublished_entity_cleanup(
     filesystem: &dyn DurableFilesystem,
 ) -> Result<(), DurableOpenError> {
     revalidate_deferred_unpublished_entity_cleanup(cleanup)?;
+    execute_deferred_unpublished_entity_cleanup(cleanup, directory_sync, filesystem)
+}
 
+fn execute_deferred_unpublished_entity_cleanup(
+    cleanup: &DeferredUnpublishedEntityCleanup,
+    directory_sync: DirectorySync,
+    filesystem: &dyn DurableFilesystem,
+) -> Result<(), DurableOpenError> {
     let generation_path = cleanup.generation_path.as_deref();
     if cleanup.has_committed {
         filesystem
@@ -4917,8 +6244,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, OpenOptions};
+    use std::fs::{self, File, OpenOptions};
     use std::future::{Future, poll_fn};
+    use std::io::Write;
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
@@ -5021,6 +6349,48 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationOperation {
+        CreateEntityDirectory,
+        CreateGenerationsDirectory,
+        CreateGenerationDirectory,
+        CreateHead,
+        WriteHead,
+        SyncHead,
+        ReadbackStagedHead,
+        ReadbackCommittedHead,
+        ReadbackPublishedHead,
+        CreateDefinition,
+        WriteDefinition,
+        SyncDefinition,
+        ReadbackStagedDefinition,
+        ReadbackCommittedDefinition,
+        ReadbackPublishedDefinition,
+        SyncGenerationsDirectory,
+        SyncGenerationDirectory,
+        CreateCommitted,
+        SyncCommitted,
+        ReadbackCommitted,
+        CreatePublished,
+        SyncPublished,
+        ReadbackPublished,
+        SyncEntityDirectory,
+        SyncPublishedEntityDirectory,
+        SyncAgentsDirectory,
+        SyncReservationAgentsDirectory,
+        SyncPublishedAgentsDirectory,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum PublicationFault {
+        Before(PublicationOperation),
+        After(PublicationOperation),
+        Corrupt(PublicationOperation),
+        Indeterminate(PublicationOperation),
+    }
+
+    #[cfg(unix)]
     /// One named synchronous test gate around the physical reservation attempt. It never
     /// synthesizes an outcome: the production attempt helper still reads real files.
     #[cfg(unix)]
@@ -5097,6 +6467,9 @@ mod tests {
         faults: Mutex<VecDeque<CleanupFault>>,
         operations: Mutex<Vec<CleanupOperation>>,
         reservation_faults: Mutex<VecDeque<super::ReservationFault>>,
+        publication_faults: Mutex<VecDeque<PublicationFault>>,
+        publication_armed: AtomicBool,
+        before_commit_barrier: Mutex<Option<ReservationBarrier>>,
         before_reservation_barrier: Mutex<Option<ReservationBarrier>>,
         collision_settlement: Mutex<Option<ReservationBarrier>>,
         final_readback: Mutex<Option<ReservationFinalReadback>>,
@@ -5113,6 +6486,9 @@ mod tests {
                 faults: Mutex::new(faults.into_iter().collect()),
                 operations: Mutex::new(Vec::new()),
                 reservation_faults: Mutex::new(VecDeque::new()),
+                publication_faults: Mutex::new(VecDeque::new()),
+                publication_armed: AtomicBool::new(false),
+                before_commit_barrier: Mutex::new(None),
                 before_reservation_barrier: Mutex::new(None),
                 collision_settlement: Mutex::new(None),
                 final_readback: Mutex::new(None),
@@ -5130,6 +6506,9 @@ mod tests {
                 faults: Mutex::new(VecDeque::new()),
                 operations: Mutex::new(Vec::new()),
                 reservation_faults: Mutex::new(faults.into_iter().collect()),
+                publication_faults: Mutex::new(VecDeque::new()),
+                publication_armed: AtomicBool::new(false),
+                before_commit_barrier: Mutex::new(None),
                 before_reservation_barrier: Mutex::new(None),
                 collision_settlement: Mutex::new(None),
                 final_readback: Mutex::new(None),
@@ -5140,8 +6519,29 @@ mod tests {
             }
         }
 
+        fn with_publication_faults(faults: impl IntoIterator<Item = PublicationFault>) -> Self {
+            let filesystem = Self::new([]);
+            *super::lock(&filesystem.publication_faults) = faults.into_iter().collect();
+            filesystem
+        }
+
+        fn arm_publication_faults(&self) {
+            self.publication_armed.store(true, Ordering::Release);
+        }
+
         fn operations(&self) -> Vec<CleanupOperation> {
             super::lock(&self.operations).clone()
+        }
+
+        fn install_commit_barrier(&self, barrier: ReservationBarrier) {
+            *super::lock(&self.before_commit_barrier) = Some(barrier);
+        }
+
+        fn cross_commit_barrier(&self) {
+            let barrier = super::lock(&self.before_commit_barrier).take();
+            if let Some(barrier) = barrier {
+                barrier.cross();
+            }
         }
 
         fn install_reservation_barrier(&self, barrier: ReservationBarrier) {
@@ -5183,6 +6583,48 @@ mod tests {
             }
         }
 
+        fn take_publication_fault(
+            &self,
+            operation: PublicationOperation,
+        ) -> Option<PublicationFault> {
+            if !self.publication_armed.load(Ordering::Acquire) {
+                return None;
+            }
+            let mut faults = super::lock(&self.publication_faults);
+            match faults.front().copied() {
+                Some(fault @ PublicationFault::Before(expected))
+                | Some(fault @ PublicationFault::After(expected))
+                | Some(fault @ PublicationFault::Corrupt(expected))
+                    if expected == operation =>
+                {
+                    faults.pop_front();
+                    Some(fault)
+                }
+                Some(fault @ PublicationFault::Indeterminate(expected))
+                    if expected == operation =>
+                {
+                    Some(fault)
+                }
+                _ => None,
+            }
+        }
+
+        fn perform_publication(
+            &self,
+            operation: PublicationOperation,
+            action: impl FnOnce() -> Result<(), ()>,
+        ) -> Result<(), ()> {
+            let fault = self.take_publication_fault(operation);
+            if matches!(fault, Some(PublicationFault::Before(_))) {
+                return Err(());
+            }
+            action()?;
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(());
+            }
+            Ok(())
+        }
+
         fn perform(
             &self,
             operation: CleanupOperation,
@@ -5214,7 +6656,174 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn publication_directory_create_operation(path: &Path) -> Option<PublicationOperation> {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("generations") => Some(PublicationOperation::CreateGenerationsDirectory),
+            Some(name) if name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit()) => {
+                Some(PublicationOperation::CreateGenerationDirectory)
+            }
+            Some(name) if name.starts_with("agt_") => {
+                Some(PublicationOperation::CreateEntityDirectory)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn publication_directory_sync_operation(path: &Path) -> Option<PublicationOperation> {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("generations") => Some(PublicationOperation::SyncGenerationsDirectory),
+            Some(name) if name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit()) => {
+                Some(PublicationOperation::SyncGenerationDirectory)
+            }
+            Some(name) if name.starts_with("agt_") && path.join("PUBLISHED").is_file() => {
+                Some(PublicationOperation::SyncPublishedEntityDirectory)
+            }
+            Some(name) if name.starts_with("agt_") => {
+                Some(PublicationOperation::SyncEntityDirectory)
+            }
+            Some(AGENTS_DIRECTORY)
+                if path
+                    .parent()
+                    .and_then(|parent| parent.file_name())
+                    .is_some_and(|name| name == std::ffi::OsStr::new(RESERVATIONS_DIRECTORY)) =>
+            {
+                Some(PublicationOperation::SyncReservationAgentsDirectory)
+            }
+            Some(AGENTS_DIRECTORY)
+                if fs::read_dir(path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry.path().join("PUBLISHED").is_file()) =>
+            {
+                Some(PublicationOperation::SyncPublishedAgentsDirectory)
+            }
+            Some(AGENTS_DIRECTORY) => Some(PublicationOperation::SyncAgentsDirectory),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn publication_write_operation(path: &Path) -> Option<PublicationOperation> {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("head.json") => Some(PublicationOperation::WriteHead),
+            Some("definition.json") => Some(PublicationOperation::WriteDefinition),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn publication_sync_file_operation(path: &Path) -> Option<PublicationOperation> {
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("head.json") => Some(PublicationOperation::SyncHead),
+            Some("definition.json") => Some(PublicationOperation::SyncDefinition),
+            Some("COMMITTED") => Some(PublicationOperation::SyncCommitted),
+            Some("PUBLISHED") => Some(PublicationOperation::SyncPublished),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn publication_readback_operation(path: &Path) -> Option<PublicationOperation> {
+        let generation = path.parent();
+        let entity = generation.and_then(Path::parent).and_then(Path::parent);
+        let committed = generation.is_some_and(|path| path.join("COMMITTED").exists());
+        let published = entity.is_some_and(|path| path.join("PUBLISHED").exists());
+        match path.file_name().and_then(|name| name.to_str()) {
+            Some("head.json") if published => Some(PublicationOperation::ReadbackPublishedHead),
+            Some("head.json") if committed => Some(PublicationOperation::ReadbackCommittedHead),
+            Some("head.json") => Some(PublicationOperation::ReadbackStagedHead),
+            Some("definition.json") if published => {
+                Some(PublicationOperation::ReadbackPublishedDefinition)
+            }
+            Some("definition.json") if committed => {
+                Some(PublicationOperation::ReadbackCommittedDefinition)
+            }
+            Some("definition.json") => Some(PublicationOperation::ReadbackStagedDefinition),
+            Some("COMMITTED") => Some(PublicationOperation::ReadbackCommitted),
+            Some("PUBLISHED") => Some(PublicationOperation::ReadbackPublished),
+            _ => None,
+        }
+    }
+
+    #[cfg(unix)]
     impl DurableFilesystem for DeterministicPersistentFaultFilesystem {
+        fn create_private_directory(&self, path: &Path) -> Result<(), ()> {
+            match publication_directory_create_operation(path) {
+                Some(operation) => self.perform_publication(operation, || {
+                    super::create_private_directory(path).map_err(|_| ())
+                }),
+                None => super::create_private_directory(path).map_err(|_| ()),
+            }
+        }
+
+        fn create_new_private_file(&self, path: &Path) -> Result<File, ()> {
+            let operation = match path.file_name().and_then(|name| name.to_str()) {
+                Some("head.json") => Some(PublicationOperation::CreateHead),
+                Some("definition.json") => Some(PublicationOperation::CreateDefinition),
+                Some("COMMITTED") => Some(PublicationOperation::CreateCommitted),
+                Some("PUBLISHED") => Some(PublicationOperation::CreatePublished),
+                _ => None,
+            };
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(fault, Some(PublicationFault::Before(_))) {
+                return Err(());
+            }
+            let file = super::create_new_private_file(path).map_err(|_| ())?;
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(());
+            }
+            Ok(file)
+        }
+
+        fn write_file(&self, path: &Path, file: &mut File, bytes: &[u8]) -> Result<(), ()> {
+            let operation = publication_write_operation(path);
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(fault, Some(PublicationFault::Before(_))) {
+                return Err(());
+            }
+            file.write_all(bytes).map_err(|_| ())?;
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        fn sync_file(&self, path: &Path, file: &File) -> Result<(), ()> {
+            let operation = publication_sync_file_operation(path);
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(fault, Some(PublicationFault::Before(_))) {
+                return Err(());
+            }
+            file.sync_all().map_err(|_| ())?;
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(());
+            }
+            Ok(())
+        }
+
+        fn read_document(&self, path: &Path) -> Result<Vec<u8>, DurableOpenError> {
+            let operation = publication_readback_operation(path);
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(
+                fault,
+                Some(PublicationFault::Before(_)) | Some(PublicationFault::Indeterminate(_))
+            ) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            let bytes = super::read_durable_document(path)?;
+            if matches!(fault, Some(PublicationFault::Corrupt(_))) {
+                fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            Ok(bytes)
+        }
+
         fn remove_file(&self, path: &Path) -> Result<(), ()> {
             let operation = match path.file_name().and_then(|name| name.to_str()) {
                 Some("COMMITTED") => CleanupOperation::RemoveCommitted,
@@ -5238,6 +6847,24 @@ mod tests {
         }
 
         fn sync_directory(&self, path: &Path, _directory_sync: DirectorySync) -> Result<(), ()> {
+            let action = || {
+                #[cfg(unix)]
+                {
+                    std::fs::File::open(path)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|_| ())
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Ok(())
+                }
+            };
+            if let Some(publication_operation) = publication_directory_sync_operation(path) {
+                if self.publication_armed.load(Ordering::Acquire) {
+                    return self.perform_publication(publication_operation, action);
+                }
+            }
             let operation = match path.file_name().and_then(|name| name.to_str()) {
                 Some("generations") => CleanupOperation::SyncGenerationsDirectory,
                 Some(name) if name.starts_with("agt_") || name.starts_with("ses_") => {
@@ -5259,6 +6886,10 @@ mod tests {
                     Ok(())
                 }
             })
+        }
+
+        fn before_commit_barrier(&self) {
+            self.cross_commit_barrier();
         }
 
         fn before_entity_reservation_barrier(&self) {
@@ -5436,9 +7067,12 @@ mod tests {
         let context = RuntimeTaskContext::new(Handle::current())
             .await
             .expect("the Tokio test runtime has a time driver");
-        DurableState::open_with_filesystem(root.to_owned(), context, filesystem)
-            .await
-            .expect("the deterministic reservation test store opens")
+        let state =
+            DurableState::open_with_filesystem(root.to_owned(), context, filesystem.clone())
+                .await
+                .expect("the deterministic reservation test store opens");
+        filesystem.arm_publication_faults();
+        state
     }
 
     #[cfg(unix)]
@@ -5457,7 +7091,7 @@ mod tests {
 
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
-        F: Future<Output = ()>,
+        F: Future,
     {
         poll_fn(|context| {
             std::task::Poll::Ready(matches!(
@@ -5466,6 +7100,45 @@ mod tests {
             ))
         })
         .await
+    }
+
+    #[test]
+    fn durable_commit_barrier_is_first_wins_in_both_orders() {
+        let crossed = super::DurableCommitBarrier::new();
+        assert!(crossed.try_cross());
+        assert!(!crossed.try_cancel());
+        assert!(!crossed.is_cancelled());
+
+        let cancelled = super::DurableCommitBarrier::new();
+        assert!(cancelled.try_cancel());
+        assert!(!cancelled.try_cross());
+        assert!(cancelled.is_cancelled());
+    }
+
+    #[test]
+    fn publication_task_failure_before_commit_is_ordinary_but_after_commit_is_poisoned() {
+        let pending = super::DurableCommitBarrier::new();
+        assert!(matches!(
+            super::classify_publication_task_error(RuntimeTaskError::OwnerClosing, &pending),
+            super::PublicationWorkResult::Ordinary {
+                error: super::DurableAgentCreateError::Closing,
+                close_required: false,
+            }
+        ));
+        assert!(matches!(
+            super::classify_publication_task_error(RuntimeTaskError::WorkerUnavailable, &pending,),
+            super::PublicationWorkResult::Ordinary {
+                error: super::DurableAgentCreateError::StorageUnavailable,
+                close_required: false,
+            }
+        ));
+
+        let crossed = super::DurableCommitBarrier::new();
+        assert!(crossed.try_cross());
+        assert!(matches!(
+            super::classify_publication_task_error(RuntimeTaskError::OwnerClosing, &crossed),
+            super::PublicationWorkResult::Poisoned
+        ));
     }
 
     #[test]
@@ -5550,6 +7223,664 @@ mod tests {
             .await
             .expect("actor shutdown precedes root-lease release");
         reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_agent_publishes_exact_g1_installs_catalog_and_reopens() {
+        let root = TempRoot::nonexistent();
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let prompts = crate::prompt::AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let attempt =
+            super::SealedAgentCreateAttempt::new(prompts, "Planner", None::<&str>, timestamp)
+                .unwrap();
+        let candidate = "agt_11111111111111111111111111111111".parse().unwrap();
+
+        let state = open(root.path()).await.expect("the store and actor open");
+        let returned_head = state
+            .create_agent_with_test_candidates(attempt, [Ok(candidate)])
+            .await
+            .expect("the fixed candidate publishes");
+        let catalog_head = state.agent_head(candidate).expect("the head is catalogued");
+        assert!(Arc::ptr_eq(&returned_head, &catalog_head));
+        assert_eq!(returned_head.status(), AgentStatus::Enabled);
+        assert_eq!(returned_head.storage_generation().get(), 1);
+        assert_eq!(returned_head.previous_storage_generation(), None);
+        assert_eq!(returned_head.current_definition_revision().get(), 1);
+        assert_eq!(returned_head.created_at(), timestamp);
+
+        let generation = root
+            .path()
+            .join("agents")
+            .join(candidate.to_string())
+            .join("generations")
+            .join("00000000000000000001");
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            include_bytes!("../docs/fixtures/durable-store-v1/agent-head.json")
+        );
+        assert_eq!(
+            fs::read(generation.join("definition.json")).unwrap(),
+            include_bytes!("../docs/fixtures/durable-store-v1/agent-definition.json")
+        );
+        assert_eq!(fs::read(generation.join("COMMITTED")).unwrap(), b"");
+        assert_eq!(
+            fs::read(
+                root.path()
+                    .join("agents")
+                    .join(candidate.to_string())
+                    .join("PUBLISHED")
+            )
+            .unwrap(),
+            b""
+        );
+        let definition = state
+            .agent_current_definition(candidate)
+            .expect("the definition is catalogued");
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the published agent reopens");
+        let reopened_head = reopened.agent_head(candidate).expect("the head reopens");
+        let reopened_definition = reopened
+            .agent_current_definition(candidate)
+            .expect("the definition reopens");
+        assert_eq!(&*reopened_head, &*returned_head);
+        assert_eq!(&*reopened_definition, &*definition);
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_create_waits_for_capacity_instead_of_treating_full_as_unavailable() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let active_entered = Arc::new(Notify::new());
+        let active_release = Arc::new(Notify::new());
+        let active = state
+            .actor
+            .enqueue_probe(Arc::clone(&active_entered), Arc::clone(&active_release));
+        active_entered.notified().await;
+
+        let queued_entered = Arc::new(Notify::new());
+        let queued_release = Arc::new(Notify::new());
+        let queued = state
+            .actor
+            .enqueue_probe(Arc::clone(&queued_entered), Arc::clone(&queued_release));
+
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let prompts = crate::prompt::AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let attempt =
+            super::SealedAgentCreateAttempt::new(prompts, "Planner", None::<&str>, timestamp)
+                .unwrap();
+        let candidate = "agt_33333333333333333333333333333333".parse().unwrap();
+        let mut create =
+            Box::pin(state.create_agent_with_test_candidates(attempt, [Ok(candidate)]));
+        assert!(
+            poll_once_pending(create.as_mut()).await,
+            "a full actor queue waits for capacity rather than returning unavailable"
+        );
+
+        active_release.notify_one();
+        assert_eq!(active.wait().await, Ok(()));
+        queued_entered.notified().await;
+        queued_release.notify_one();
+        assert_eq!(queued.wait().await, Ok(()));
+        assert_eq!(
+            create
+                .await
+                .expect("the admitted Create eventually settles")
+                .agent_id(),
+            candidate
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_before_commit_barrier_cleans_operation_staging_and_keeps_reservation() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_commit_barrier(ReservationBarrier::new(entered, release_receiver));
+
+        let candidate = agent_candidate(31);
+        let state_for_create = state.clone();
+        let create = tokio::spawn(async move {
+            state_for_create
+                .create_agent_with_test_candidates(
+                    super::SealedAgentCreateAttempt::new(
+                        crate::prompt::AgentPromptSelection::new(
+                            ["base", "safety"]
+                                .into_iter()
+                                .map(|value| value.parse().unwrap())
+                                .collect(),
+                        )
+                        .unwrap(),
+                        "Planner",
+                        None::<&str>,
+                        "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                    [Ok(candidate)],
+                )
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+        state.request_closing();
+        release.send(()).expect("the pre-commit barrier releases");
+        assert_eq!(
+            create.await.expect("the admitted Create task joins"),
+            Err(super::DurableAgentCreateError::Closing)
+        );
+        state.close().await;
+
+        let reservation = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string());
+        let entity = root
+            .path()
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string());
+        assert!(reservation.is_file(), "the burned reservation is retained");
+        assert!(!entity.exists(), "pre-commit staging is exactly cleaned");
+        let reopened = open(root.path())
+            .await
+            .expect("cleanup leaves a valid store");
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn publication_fault_certainty_keeps_ordinary_failures_live_and_closes_after_success() {
+        let cases = [
+            (
+                "precommit-create-before",
+                PublicationFault::Before(PublicationOperation::CreateEntityDirectory),
+                agent_candidate(41),
+                agent_candidate(42),
+                false,
+                false,
+            ),
+            (
+                "precommit-write-after",
+                PublicationFault::After(PublicationOperation::WriteHead),
+                agent_candidate(43),
+                agent_candidate(44),
+                false,
+                false,
+            ),
+            (
+                "precommit-readback-after",
+                PublicationFault::After(PublicationOperation::ReadbackStagedHead),
+                agent_candidate(45),
+                agent_candidate(46),
+                false,
+                false,
+            ),
+            (
+                "committed-after-create",
+                PublicationFault::After(PublicationOperation::CreateCommitted),
+                agent_candidate(47),
+                agent_candidate(48),
+                true,
+                true,
+            ),
+            (
+                "committed-after-sync",
+                PublicationFault::After(PublicationOperation::SyncCommitted),
+                agent_candidate(49),
+                agent_candidate(50),
+                true,
+                true,
+            ),
+            (
+                "published-before-create",
+                PublicationFault::Before(PublicationOperation::CreatePublished),
+                agent_candidate(51),
+                agent_candidate(52),
+                false,
+                false,
+            ),
+            (
+                "published-after-create",
+                PublicationFault::After(PublicationOperation::CreatePublished),
+                agent_candidate(53),
+                agent_candidate(54),
+                true,
+                false,
+            ),
+            (
+                "published-after-sync",
+                PublicationFault::After(PublicationOperation::SyncPublished),
+                agent_candidate(55),
+                agent_candidate(56),
+                true,
+                true,
+            ),
+            (
+                "published-after-directory-sync",
+                PublicationFault::After(PublicationOperation::SyncPublishedEntityDirectory),
+                agent_candidate(57),
+                agent_candidate(58),
+                true,
+                true,
+            ),
+            (
+                "published-after-agents-directory-sync",
+                PublicationFault::After(PublicationOperation::SyncPublishedAgentsDirectory),
+                agent_candidate(59),
+                agent_candidate(60),
+                true,
+                true,
+            ),
+        ];
+
+        for (name, fault, first, second, publishes, closes) in cases {
+            let root = TempRoot::nonexistent();
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let make_attempt = || {
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base", "safety"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap()
+            };
+            let first_result = state
+                .create_agent_with_test_candidates(make_attempt(), [Ok(first)])
+                .await;
+            if publishes {
+                assert_eq!(first_result.as_ref().map(|head| head.agent_id()), Ok(first));
+                assert!(
+                    state.agent_head(first).is_some(),
+                    "{name} installs before settle"
+                );
+                let second_result = state
+                    .create_agent_with_test_candidates(make_attempt(), [Ok(second)])
+                    .await;
+                if closes {
+                    assert_eq!(
+                        second_result,
+                        Err(super::DurableAgentCreateError::Closing),
+                        "{name} closes only after the current success is settled"
+                    );
+                } else {
+                    assert_eq!(
+                        second_result.map(|head| head.agent_id()),
+                        Ok(second),
+                        "{name} remains mutation-capable after exact reconciliation"
+                    );
+                }
+                state.close().await;
+                let reopened = open(root.path())
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} reopens: {error:?}"));
+                assert!(reopened.agent_head(first).is_some());
+                if !closes {
+                    assert!(reopened.agent_head(second).is_some());
+                }
+                reopened.close().await;
+            } else {
+                assert_eq!(
+                    first_result,
+                    Err(super::DurableAgentCreateError::StorageUnavailable),
+                    "{name} remains an ordinary typed failure"
+                );
+                let second_result = state
+                    .create_agent_with_test_candidates(make_attempt(), [Ok(second)])
+                    .await;
+                assert_eq!(
+                    second_result.map(|head| head.agent_id()),
+                    Ok(second),
+                    "{name}"
+                );
+                state.close().await;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_not_published_cleanup_io_failure_settles_ordinary_then_closes() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::CreatePublished),
+            ]),
+        );
+        *super::lock(&filesystem.faults) =
+            [CleanupFault::Before(CleanupOperation::RemoveCommitted)]
+                .into_iter()
+                .collect();
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let make_attempt = || {
+            super::SealedAgentCreateAttempt::new(
+                crate::prompt::AgentPromptSelection::new(
+                    ["base"]
+                        .into_iter()
+                        .map(|value| value.parse().unwrap())
+                        .collect(),
+                )
+                .unwrap(),
+                "Planner",
+                None::<&str>,
+                "2026-08-03T10:00:00.123Z".parse().unwrap(),
+            )
+            .unwrap()
+        };
+        let candidate = agent_candidate(61);
+        assert_eq!(
+            state
+                .create_agent_with_test_candidates(make_attempt(), [Ok(candidate)])
+                .await,
+            Err(super::DurableAgentCreateError::StorageUnavailable),
+            "PUBLISHED absence remains an ordinary physical outcome"
+        );
+        assert_eq!(
+            state
+                .create_agent_with_test_candidates(make_attempt(), [Ok(agent_candidate(62))])
+                .await,
+            Err(super::DurableAgentCreateError::Closing),
+            "cleanup I/O failure closes only after the ordinary response settles"
+        );
+        assert!(
+            root.path()
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string())
+                .exists(),
+            "failed cleanup leaves invisible staging for restart recovery"
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("restart completes the exact unpublished cleanup");
+        assert!(reopened.agent_head(candidate).is_none());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_admitted_create_waiter_does_not_cancel_physical_publication() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_commit_barrier(ReservationBarrier::new(entered, release_receiver));
+        let candidate = agent_candidate(49);
+        let waiter = state
+            .actor
+            .enqueue_create_with_test_candidates(
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap(),
+                [Ok(candidate)],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        drop(waiter);
+        wait_reservation_barrier(entered_receiver).await;
+        release.send(()).expect("the physical operation releases");
+        let published = root
+            .path()
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string())
+            .join("PUBLISHED");
+        while !published.exists() {
+            tokio::task::yield_now().await;
+        }
+        // The commit barrier has crossed and PUBLISHED is on disk; shutdown must join the
+        // non-cancellable suffix instead of trying to roll it back.
+        state.request_closing();
+        state.close().await;
+        let reopened = open(root.path())
+            .await
+            .expect("the dropped caller leaves a published physical entity");
+        assert!(reopened.agent_head(candidate).is_some());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn active_publication_child_is_restored_to_owner_after_actor_abort() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let actor_task = state.actor.task.clone();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_commit_barrier(ReservationBarrier::new(entered, release_receiver));
+        let candidate = agent_candidate(50);
+        let waiter = state
+            .actor
+            .enqueue_create_with_test_candidates(
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap(),
+                [Ok(candidate)],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        wait_reservation_barrier(entered_receiver).await;
+        // The active publication wait has temporarily moved the child handle into a
+        // cancellation-safe join guard, so the latest registered raw handle is the actor.
+        state.task_context.abort_latest_registered_task();
+        assert_eq!(
+            waiter.wait().await,
+            Err(super::DurableAgentCreateError::InternalDispatchUnavailable)
+        );
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "shutdown still owns the pre-commit blocking child"
+        );
+        assert!(matches!(
+            open(root.path()).await,
+            Err(super::DurableOpenError::StoreInUse)
+        ));
+
+        release.send(()).expect("the publication barrier releases");
+        close.await;
+        let reservation = root
+            .path()
+            .join(RESERVATIONS_DIRECTORY)
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string());
+        let entity = root
+            .path()
+            .join(AGENTS_DIRECTORY)
+            .join(candidate.to_string());
+        assert!(reservation.is_file());
+        assert!(!entity.exists());
+        let reopened = open(root.path())
+            .await
+            .expect("the aborted child is joined before the lease is released");
+        assert!(reopened.agent_head(candidate).is_none());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_and_indeterminate_publication_observations_poison_without_cleanup() {
+        let corrupt_root = TempRoot::nonexistent();
+        let corrupt_filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedHead),
+            ]),
+        );
+        let corrupt =
+            open_with_reservation_filesystem(corrupt_root.path(), Arc::clone(&corrupt_filesystem))
+                .await;
+        let corrupt_candidate = agent_candidate(51);
+        let corrupt_result = corrupt
+            .create_agent_with_test_candidates(
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap(),
+                [Ok(corrupt_candidate)],
+            )
+            .await;
+        assert_eq!(
+            corrupt_result,
+            Err(super::DurableAgentCreateError::InternalDispatchUnavailable)
+        );
+        corrupt.close().await;
+        assert!(matches!(
+            open(corrupt_root.path()).await,
+            Err(super::DurableOpenError::DurableStateCorrupt)
+        ));
+
+        let indeterminate_root = TempRoot::nonexistent();
+        let indeterminate_filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Indeterminate(PublicationOperation::ReadbackPublished),
+            ]),
+        );
+        let indeterminate = open_with_reservation_filesystem(
+            indeterminate_root.path(),
+            Arc::clone(&indeterminate_filesystem),
+        )
+        .await;
+        let indeterminate_candidate = agent_candidate(52);
+        assert_eq!(
+            indeterminate
+                .create_agent_with_test_candidates(
+                    super::SealedAgentCreateAttempt::new(
+                        crate::prompt::AgentPromptSelection::new(
+                            ["base"]
+                                .into_iter()
+                                .map(|value| value.parse().unwrap())
+                                .collect(),
+                        )
+                        .unwrap(),
+                        "Planner",
+                        None::<&str>,
+                        "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                    [Ok(indeterminate_candidate)],
+                )
+                .await,
+            Err(super::DurableAgentCreateError::InternalDispatchUnavailable)
+        );
+        let indeterminate_entity = indeterminate_root
+            .path()
+            .join(AGENTS_DIRECTORY)
+            .join(indeterminate_candidate.to_string());
+        assert!(indeterminate_entity.exists(), "poison never cleans staging");
+        indeterminate.close().await;
+        let reopened = open(indeterminate_root.path())
+            .await
+            .expect("indeterminate bytes are reconciled on restart");
+        assert!(reopened.agent_head(indeterminate_candidate).is_some());
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_agent_collision_tracer_retries_inside_the_same_request() {
+        let root = TempRoot::nonexistent();
+        let bootstrap = open(root.path()).await.expect("the store opens");
+        bootstrap.close().await;
+
+        let first: AgentId = "agt_11111111111111111111111111111111".parse().unwrap();
+        let second: AgentId = "agt_22222222222222222222222222222222".parse().unwrap();
+        create_file(
+            &root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(first.to_string()),
+            b"",
+        );
+
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let prompts = crate::prompt::AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let attempt =
+            super::SealedAgentCreateAttempt::new(prompts, "Planner", None::<&str>, timestamp)
+                .unwrap();
+        let state = open(root.path()).await.expect("the reservation reopens");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let head = state
+            .create_agent_with_test_candidates_and_calls(
+                attempt,
+                [Ok(first), Ok(second)],
+                Arc::clone(&calls),
+            )
+            .await
+            .expect("the same create request publishes the replacement");
+        assert_eq!(head.agent_id(), second);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(state.agent_head(first).is_none());
+        assert!(state.agent_head(second).is_some());
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6151,6 +8482,91 @@ mod tests {
         let reopened = open(root.path())
             .await
             .expect("the aborted actor cannot retain the root lease");
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_the_actor_settles_an_accepted_create_waiter() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let active_entered = Arc::new(Notify::new());
+        let active = state
+            .actor
+            .enqueue_probe(Arc::clone(&active_entered), Arc::new(Notify::new()));
+        active_entered.notified().await;
+
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let prompts = crate::prompt::AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let attempt =
+            super::SealedAgentCreateAttempt::new(prompts, "Planner", None::<&str>, timestamp)
+                .unwrap();
+        let create = state
+            .enqueue_agent_create_with_test_candidates(
+                attempt,
+                [Ok("agt_11111111111111111111111111111111".parse().unwrap())],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+
+        state.task_context.abort_latest_registered_task();
+        assert_eq!(
+            create.wait().await,
+            Err(super::DurableAgentCreateError::InternalDispatchUnavailable)
+        );
+        assert_eq!(
+            active.wait().await,
+            Err(super::ActorRequestError::Unavailable)
+        );
+        state.close().await;
+        let reopened = open(root.path())
+            .await
+            .expect("the aborted actor releases the lease");
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn closing_drains_an_accepted_create_waiter() {
+        let root = TempRoot::nonexistent();
+        let state = open(root.path()).await.expect("the store and actor open");
+        let entered = Arc::new(Notify::new());
+        let active = state
+            .actor
+            .enqueue_probe(Arc::clone(&entered), Arc::new(Notify::new()));
+        entered.notified().await;
+
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let prompts = crate::prompt::AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let attempt =
+            super::SealedAgentCreateAttempt::new(prompts, "Planner", None::<&str>, timestamp)
+                .unwrap();
+        let create = state
+            .enqueue_agent_create_with_test_candidates(
+                attempt,
+                [Ok("agt_11111111111111111111111111111111".parse().unwrap())],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+
+        state.request_closing();
+        state.close().await;
+        assert_eq!(
+            create.wait().await,
+            Err(super::DurableAgentCreateError::Closing)
+        );
+        assert_eq!(active.wait().await, Err(super::ActorRequestError::Closing));
+        let reopened = open(root.path()).await.expect("closing releases the lease");
         reopened.close().await;
     }
 
