@@ -1,13 +1,13 @@
 # DurableState 架构设计
 
-状态：M5.0 design gate、production recovery/root lease/owner-tracked actor、private reservation foundation与crate-private Agent Create exact G1 publication已实现；public Runtime command接入、Session Create/Fork/update/CAS及完整cross-platform native matrix pending（ADR 0136、0137）
+状态：M5.0 design gate、production recovery/root lease/owner-tracked actor、private reservation foundation及crate-private Agent Create与ordinary Session Create exact G1 publication已实现；public Runtime command接入、Session Fork/update/CAS及完整cross-platform native matrix pending（ADR 0136、0137）
 日期：2026-08-03
 
 ## 目的
 
 `DurableState`是MiniCore private deep module：在一个专用、user-private local store root中，拥有Agent/Session entity的物理布局、永久identity reservation、root lease、catalog/head installation、immutable generation、CAS recheck、marker publication、readback、recovery/cleanup、poison/closing状态和filesystem fault seam。它把跨文件durability复杂性收在一个operation owner内，而不是交给lifecycle caller拼装。
 
-当前 foundation已由同一actor中的concrete Agent Create request消费：sealed lifecycle attempt在reservation成功后生成exact G1 payload，完成COMMITTED/PUBLISHED certainty、catalog installation与close/reopen recovery；**没有 standalone production `reserve` API、reservation token/receipt 或 caller-visible reservation waiter**。Session Create/Fork与existing-head mutation仍待后续slice消费同一基础。
+当前 foundation已由同一actor中的concrete Agent Create与ordinary Session Create request消费：sealed lifecycle attempt在reservation成功后生成exact G1 payload；Session Create在private Agent lifecycle gate内读取current Enabled exact ref并持有同一gate至owner-tracked publication child完成，写入canonical Header-only conversation并以same-file identity/length/Header proof完成COMMITTED/PUBLISHED certainty、catalog installation与close/reopen recovery；**没有 standalone production `reserve` API、reservation token/receipt 或 caller-visible reservation waiter**。Session Fork与existing-head mutation仍待后续slice消费同一基础。
 
 [Durable Store V1](../formats/durable-store-v1.md)是路径、bytes、field order和scanner precedence的唯一exact owner；本模块拥有这些bytes的operation语义。
 
