@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation slice in progress；M5.0 publication、M5.1 Recorder与M5.2 semantic replay pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation in progress，crate-private Agent Create exact G1 publication已完成，Session Create/Fork/update/CAS与完整platform matrix pending；M5.1 Recorder与M5.2 semantic replay pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -361,11 +361,11 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate Completed；foundation slice in progress（无 standalone production reservation API/token）；M5.0 publication、M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
+状态：M5.0 design gate Completed；foundation in progress（无 standalone production reservation API/token/receipt）；Agent Create exact G1 publication、certainty与catalog install Completed；Unix process-abort tracer已实现并在macOS本地验证，自动化Linux/macOS/Windows native matrix Pending；Session Create/Fork/update/CAS Pending；M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
 
 ### M5.0 DurableState / async foundation implementation
 
-设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。过渡性的 reservation-only implementation/test 只能证明永久 reservation phase 的基础，不得宣称完整 Create/Fork crash matrix 或 complete-or-invisible 行已经通过。下一任务精确交付：
+设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。早期reservation-only implementation/test只证明了永久reservation phase；当前Agent Create slice也不代表完整Session/Fork/update或cross-platform crash matrix已通过。以下列表是M5.0 implementation series的总退出范围，已完成项继续作为后续slice不可回归的门禁：
 
 - private `DurableStateActor`、immutable catalog snapshots/capabilities、poison/closing state和all mutation/catalog-head serialization；
 - permanent CSPRNG-ID reservation (`create_new`，32 definite collision cap)、root `.minicore.lock` fs4 exclusive lease、strict user-private local filesystem validation和no-follow link/reparse/case-alias handling；

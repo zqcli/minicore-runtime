@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5.0 design gate已完成；production recovery/root lease/owner-tracked actor foundation与private reservation foundation slice已实现，仍无production mutation API；COMMITTED/PUBLISHED publication、production Create/Fork mutation API、Recorder/replay pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 recovery/root lease/owner-tracked actor、private reservation foundation与crate-private Agent Create exact G1 publication已实现；public Runtime Agent command接入、Session Create/Fork/update/CAS、完整cross-platform native matrix、Recorder/replay pending）
 
 ## 目的
 

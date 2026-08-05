@@ -2158,6 +2158,25 @@ fn force_publication_close(result: PublicationWorkResult) -> PublicationWorkResu
     }
 }
 
+#[cfg(test)]
+struct PublicationAttemptTestGuard<'a> {
+    filesystem: &'a dyn DurableFilesystem,
+}
+
+#[cfg(test)]
+impl<'a> PublicationAttemptTestGuard<'a> {
+    fn new(filesystem: &'a dyn DurableFilesystem) -> Self {
+        Self { filesystem }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PublicationAttemptTestGuard<'_> {
+    fn drop(&mut self) {
+        self.filesystem.after_agent_publication_attempt();
+    }
+}
+
 fn publish_agent_generation_blocking(
     filesystem: &dyn DurableFilesystem,
     root: &Path,
@@ -2166,6 +2185,8 @@ fn publish_agent_generation_blocking(
     head: Arc<DurableAgentHead>,
     barrier: Arc<DurableCommitBarrier>,
 ) -> PublicationWorkResult {
+    #[cfg(test)]
+    let _attempt = PublicationAttemptTestGuard::new(filesystem);
     let agent_id = definition.agent_id();
     let generation = head.storage_generation();
     let entity = root.join(AGENTS_DIRECTORY).join(agent_id.to_string());
@@ -5497,6 +5518,8 @@ trait DurableFilesystem: Send + Sync {
     #[cfg(test)]
     fn before_commit_barrier(&self);
     #[cfg(test)]
+    fn after_agent_publication_attempt(&self);
+    #[cfg(test)]
     fn before_entity_reservation_barrier(&self);
     #[cfg(test)]
     fn before_reservation_final_readback(&self);
@@ -5529,6 +5552,9 @@ impl DurableFilesystem for LocalFilesystem {
 
     #[cfg(test)]
     fn before_commit_barrier(&self) {}
+
+    #[cfg(test)]
+    fn after_agent_publication_attempt(&self) {}
 
     #[cfg(test)]
     fn before_entity_reservation_barrier(&self) {}
@@ -6326,6 +6352,42 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct NativeCrashProof {
+        path: PathBuf,
+        armed: bool,
+    }
+
+    #[cfg(unix)]
+    impl NativeCrashProof {
+        fn new(path: PathBuf) -> Self {
+            assert!(!path.exists(), "the crash proof path starts absent");
+            Self { path, armed: true }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn remove(mut self) {
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => panic!("the parent removes the native crash proof"),
+            }
+            self.armed = false;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for NativeCrashProof {
+        fn drop(&mut self) {
+            if self.armed && self.path.exists() {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum CleanupOperation {
         RemoveCommitted,
@@ -6368,6 +6430,7 @@ mod tests {
         ReadbackPublishedDefinition,
         SyncGenerationsDirectory,
         SyncGenerationDirectory,
+        SyncCommittedGenerationDirectory,
         CreateCommitted,
         SyncCommitted,
         ReadbackCommitted,
@@ -6388,6 +6451,13 @@ mod tests {
         After(PublicationOperation),
         Corrupt(PublicationOperation),
         Indeterminate(PublicationOperation),
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct PublicationMarkerSyncTarget {
+        entity: PathBuf,
+        collection: PathBuf,
     }
 
     #[cfg(unix)]
@@ -6468,11 +6538,16 @@ mod tests {
         operations: Mutex<Vec<CleanupOperation>>,
         reservation_faults: Mutex<VecDeque<super::ReservationFault>>,
         publication_faults: Mutex<VecDeque<PublicationFault>>,
+        publication_operations: Mutex<Vec<PublicationOperation>>,
         publication_armed: AtomicBool,
+        publication_marker_sync_target: Mutex<Option<PublicationMarkerSyncTarget>>,
+        publication_operation_barrier: Mutex<Option<(PublicationOperation, ReservationBarrier)>>,
+        abort_after_publication_operation: Mutex<Option<(PublicationOperation, PathBuf, String)>>,
         before_commit_barrier: Mutex<Option<ReservationBarrier>>,
         before_reservation_barrier: Mutex<Option<ReservationBarrier>>,
         collision_settlement: Mutex<Option<ReservationBarrier>>,
         final_readback: Mutex<Option<ReservationFinalReadback>>,
+        close_task_owner_before_reservation_readback: Mutex<Option<RuntimeTaskContext>>,
         final_readback_armed: AtomicBool,
         reservation_handle_validated: AtomicBool,
         reservation_file_synced: AtomicBool,
@@ -6487,11 +6562,16 @@ mod tests {
                 operations: Mutex::new(Vec::new()),
                 reservation_faults: Mutex::new(VecDeque::new()),
                 publication_faults: Mutex::new(VecDeque::new()),
+                publication_operations: Mutex::new(Vec::new()),
                 publication_armed: AtomicBool::new(false),
+                publication_marker_sync_target: Mutex::new(None),
+                publication_operation_barrier: Mutex::new(None),
+                abort_after_publication_operation: Mutex::new(None),
                 before_commit_barrier: Mutex::new(None),
                 before_reservation_barrier: Mutex::new(None),
                 collision_settlement: Mutex::new(None),
                 final_readback: Mutex::new(None),
+                close_task_owner_before_reservation_readback: Mutex::new(None),
                 final_readback_armed: AtomicBool::new(false),
                 reservation_handle_validated: AtomicBool::new(false),
                 reservation_file_synced: AtomicBool::new(false),
@@ -6507,11 +6587,16 @@ mod tests {
                 operations: Mutex::new(Vec::new()),
                 reservation_faults: Mutex::new(faults.into_iter().collect()),
                 publication_faults: Mutex::new(VecDeque::new()),
+                publication_operations: Mutex::new(Vec::new()),
                 publication_armed: AtomicBool::new(false),
+                publication_marker_sync_target: Mutex::new(None),
+                publication_operation_barrier: Mutex::new(None),
+                abort_after_publication_operation: Mutex::new(None),
                 before_commit_barrier: Mutex::new(None),
                 before_reservation_barrier: Mutex::new(None),
                 collision_settlement: Mutex::new(None),
                 final_readback: Mutex::new(None),
+                close_task_owner_before_reservation_readback: Mutex::new(None),
                 final_readback_armed: AtomicBool::new(false),
                 reservation_handle_validated: AtomicBool::new(false),
                 reservation_file_synced: AtomicBool::new(false),
@@ -6531,6 +6616,90 @@ mod tests {
 
         fn operations(&self) -> Vec<CleanupOperation> {
             super::lock(&self.operations).clone()
+        }
+
+        fn publication_operations(&self) -> Vec<PublicationOperation> {
+            super::lock(&self.publication_operations).clone()
+        }
+
+        fn install_publication_operation_barrier(
+            &self,
+            operation: PublicationOperation,
+            barrier: ReservationBarrier,
+        ) {
+            *super::lock(&self.publication_operation_barrier) = Some((operation, barrier));
+        }
+
+        fn abort_after_publication_operation(
+            &self,
+            operation: PublicationOperation,
+            proof_path: PathBuf,
+            proof: String,
+        ) {
+            *super::lock(&self.abort_after_publication_operation) =
+                Some((operation, proof_path, proof));
+        }
+
+        fn record_publication_operation(&self, operation: PublicationOperation) {
+            super::lock(&self.publication_operations).push(operation);
+        }
+
+        fn bind_publication_marker_sync_target(&self, published_path: &Path) {
+            let entity = published_path
+                .parent()
+                .expect("PUBLISHED has its entity parent")
+                .to_owned();
+            let collection = entity
+                .parent()
+                .expect("an Agent entity has its collection parent")
+                .to_owned();
+            *super::lock(&self.publication_marker_sync_target) =
+                Some(PublicationMarkerSyncTarget { entity, collection });
+        }
+
+        fn publication_directory_sync_operation(
+            &self,
+            path: &Path,
+        ) -> Option<PublicationOperation> {
+            let target = super::lock(&self.publication_marker_sync_target).clone();
+            publication_directory_sync_operation(path, target.as_ref())
+        }
+
+        fn complete_publication_operation(&self, operation: PublicationOperation) {
+            let barrier = {
+                let mut installed = super::lock(&self.publication_operation_barrier);
+                if installed
+                    .as_ref()
+                    .is_some_and(|(expected, _)| *expected == operation)
+                {
+                    installed.take().map(|(_, barrier)| barrier)
+                } else {
+                    None
+                }
+            };
+            if let Some(barrier) = barrier {
+                barrier.cross();
+            }
+            let abort = {
+                let mut installed = super::lock(&self.abort_after_publication_operation);
+                if installed
+                    .as_ref()
+                    .is_some_and(|(expected, _, _)| *expected == operation)
+                {
+                    installed.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((_, proof_path, proof)) = abort {
+                let mut file = super::create_new_private_file(&proof_path)
+                    .expect("the native crash proof file is created once");
+                file.write_all(proof.as_bytes())
+                    .expect("the native crash proof is written");
+                file.sync_all()
+                    .expect("the native crash proof is visible to the parent");
+                std::process::abort();
+            }
         }
 
         fn install_commit_barrier(&self, barrier: ReservationBarrier) {
@@ -6568,6 +6737,10 @@ mod tests {
 
         fn install_final_readback(&self, gate: ReservationFinalReadback) {
             *super::lock(&self.final_readback) = Some(gate);
+        }
+
+        fn close_task_owner_before_reservation_readback(&self, context: RuntimeTaskContext) {
+            *super::lock(&self.close_task_owner_before_reservation_readback) = Some(context);
         }
 
         fn take_reservation_fault(
@@ -6614,11 +6787,13 @@ mod tests {
             operation: PublicationOperation,
             action: impl FnOnce() -> Result<(), ()>,
         ) -> Result<(), ()> {
+            self.record_publication_operation(operation);
             let fault = self.take_publication_fault(operation);
             if matches!(fault, Some(PublicationFault::Before(_))) {
                 return Err(());
             }
             action()?;
+            self.complete_publication_operation(operation);
             if matches!(fault, Some(PublicationFault::After(_))) {
                 return Err(());
             }
@@ -6670,14 +6845,31 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn publication_directory_sync_operation(path: &Path) -> Option<PublicationOperation> {
+    fn publication_directory_sync_operation(
+        path: &Path,
+        target: Option<&PublicationMarkerSyncTarget>,
+    ) -> Option<PublicationOperation> {
+        if target.is_some_and(|target| {
+            target.entity == path && target.entity.join("PUBLISHED").is_file()
+        }) {
+            return Some(PublicationOperation::SyncPublishedEntityDirectory);
+        }
+        if target.is_some_and(|target| {
+            target.collection == path && target.entity.join("PUBLISHED").is_file()
+        }) {
+            return Some(PublicationOperation::SyncPublishedAgentsDirectory);
+        }
         match path.file_name().and_then(|name| name.to_str()) {
             Some("generations") => Some(PublicationOperation::SyncGenerationsDirectory),
+            Some(name)
+                if name.len() == 20
+                    && name.bytes().all(|byte| byte.is_ascii_digit())
+                    && path.join("COMMITTED").is_file() =>
+            {
+                Some(PublicationOperation::SyncCommittedGenerationDirectory)
+            }
             Some(name) if name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit()) => {
                 Some(PublicationOperation::SyncGenerationDirectory)
-            }
-            Some(name) if name.starts_with("agt_") && path.join("PUBLISHED").is_file() => {
-                Some(PublicationOperation::SyncPublishedEntityDirectory)
             }
             Some(name) if name.starts_with("agt_") => {
                 Some(PublicationOperation::SyncEntityDirectory)
@@ -6689,16 +6881,6 @@ mod tests {
                     .is_some_and(|name| name == std::ffi::OsStr::new(RESERVATIONS_DIRECTORY)) =>
             {
                 Some(PublicationOperation::SyncReservationAgentsDirectory)
-            }
-            Some(AGENTS_DIRECTORY)
-                if fs::read_dir(path)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Result::ok)
-                    .any(|entry| entry.path().join("PUBLISHED").is_file()) =>
-            {
-                Some(PublicationOperation::SyncPublishedAgentsDirectory)
             }
             Some(AGENTS_DIRECTORY) => Some(PublicationOperation::SyncAgentsDirectory),
             _ => None,
@@ -6767,11 +6949,20 @@ mod tests {
                 Some("PUBLISHED") => Some(PublicationOperation::CreatePublished),
                 _ => None,
             };
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
             let fault = operation.and_then(|operation| self.take_publication_fault(operation));
             if matches!(fault, Some(PublicationFault::Before(_))) {
                 return Err(());
             }
             let file = super::create_new_private_file(path).map_err(|_| ())?;
+            if operation == Some(PublicationOperation::CreatePublished) {
+                self.bind_publication_marker_sync_target(path);
+            }
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
             if matches!(fault, Some(PublicationFault::After(_))) {
                 return Err(());
             }
@@ -6780,11 +6971,17 @@ mod tests {
 
         fn write_file(&self, path: &Path, file: &mut File, bytes: &[u8]) -> Result<(), ()> {
             let operation = publication_write_operation(path);
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
             let fault = operation.and_then(|operation| self.take_publication_fault(operation));
             if matches!(fault, Some(PublicationFault::Before(_))) {
                 return Err(());
             }
             file.write_all(bytes).map_err(|_| ())?;
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
             if matches!(fault, Some(PublicationFault::After(_))) {
                 return Err(());
             }
@@ -6793,11 +6990,17 @@ mod tests {
 
         fn sync_file(&self, path: &Path, file: &File) -> Result<(), ()> {
             let operation = publication_sync_file_operation(path);
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
             let fault = operation.and_then(|operation| self.take_publication_fault(operation));
             if matches!(fault, Some(PublicationFault::Before(_))) {
                 return Err(());
             }
             file.sync_all().map_err(|_| ())?;
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
             if matches!(fault, Some(PublicationFault::After(_))) {
                 return Err(());
             }
@@ -6806,6 +7009,9 @@ mod tests {
 
         fn read_document(&self, path: &Path) -> Result<Vec<u8>, DurableOpenError> {
             let operation = publication_readback_operation(path);
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
             let fault = operation.and_then(|operation| self.take_publication_fault(operation));
             if matches!(
                 fault,
@@ -6814,6 +7020,9 @@ mod tests {
                 return Err(DurableOpenError::StorageUnavailable);
             }
             let bytes = super::read_durable_document(path)?;
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
             if matches!(fault, Some(PublicationFault::Corrupt(_))) {
                 fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
                 return Err(DurableOpenError::DurableStateCorrupt);
@@ -6860,7 +7069,7 @@ mod tests {
                     Ok(())
                 }
             };
-            if let Some(publication_operation) = publication_directory_sync_operation(path) {
+            if let Some(publication_operation) = self.publication_directory_sync_operation(path) {
                 if self.publication_armed.load(Ordering::Acquire) {
                     return self.perform_publication(publication_operation, action);
                 }
@@ -6892,6 +7101,10 @@ mod tests {
             self.cross_commit_barrier();
         }
 
+        fn after_agent_publication_attempt(&self) {
+            super::lock(&self.publication_marker_sync_target).take();
+        }
+
         fn before_entity_reservation_barrier(&self) {
             self.cross_reservation_barrier();
         }
@@ -6914,6 +7127,11 @@ mod tests {
                 super::is_canonical_reservation_marker(&metadata),
                 "corrupt/absent faults are injected only immediately before final readback"
             );
+            if let Some(context) =
+                super::lock(&self.close_task_owner_before_reservation_readback).take()
+            {
+                context.request_closing();
+            }
             self.final_readback_armed.store(true, Ordering::Release);
             let gate = super::lock(&self.final_readback).take();
             if let Some(gate) = gate {
@@ -7100,6 +7318,79 @@ mod tests {
             ))
         })
         .await
+    }
+
+    #[cfg(unix)]
+    fn kill_and_reap_native_child(child: &mut std::process::Child) -> bool {
+        let _ = child.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(Some(_)) = child.try_wait() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_native_abort_child(root: &Path, candidate: AgentId, point: &str) {
+        use std::os::unix::process::ExitStatusExt;
+
+        let proof_file = NativeCrashProof::new(root.with_extension(format!("{point}.crash-proof")));
+        let proof = format!("minicore-native-abort-v1:{point}:{candidate}");
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("the lib test binary has an executable path"),
+        );
+        command
+            .arg("--exact")
+            .arg("durable_state::tests::native_process_abort_agent_create_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("MINICORE_TEST_CRASH_CHILD", "v1")
+            .env("MINICORE_TEST_CRASH_ROOT", root)
+            .env("MINICORE_TEST_CRASH_AGENT", candidate.to_string())
+            .env("MINICORE_TEST_CRASH_POINT", point)
+            .env("MINICORE_TEST_CRASH_PROOF", proof_file.path())
+            .env("MINICORE_TEST_CRASH_NONCE", &proof)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().expect("the native crash child starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => {
+                    assert!(
+                        kill_and_reap_native_child(&mut child),
+                        "the unobservable native crash child is killed and reaped"
+                    );
+                    panic!("the native crash child could not be observed safely");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                assert!(
+                    kill_and_reap_native_child(&mut child),
+                    "the timed-out native crash child is killed and reaped"
+                );
+                panic!("the native crash child exceeded its bounded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let proof_bytes = fs::read(proof_file.path());
+        proof_file.remove();
+        assert!(
+            status.signal().is_some(),
+            "the child must terminate by signal at the explicit process-abort coordinate"
+        );
+        assert_eq!(
+            proof_bytes.expect("the child writes its exact crash-hook proof"),
+            proof.as_bytes(),
+            "an unrelated signal cannot impersonate the publication abort hook"
+        );
     }
 
     #[test]
@@ -7407,6 +7698,62 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
+    async fn publication_job_rejected_before_start_is_closing_without_entity_staging() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        filesystem.close_task_owner_before_reservation_readback(state.task_context.clone());
+        let candidate = agent_candidate(65);
+
+        assert_eq!(
+            state
+                .create_agent_with_test_candidates(
+                    super::SealedAgentCreateAttempt::new(
+                        crate::prompt::AgentPromptSelection::new(
+                            ["base"]
+                                .into_iter()
+                                .map(|value| value.parse().unwrap())
+                                .collect(),
+                        )
+                        .unwrap(),
+                        "Planner",
+                        None::<&str>,
+                        "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                    [Ok(candidate)],
+                )
+                .await,
+            Err(super::DurableAgentCreateError::Closing),
+            "owner admission rejection before publication start is not physical poison"
+        );
+        assert!(
+            root.path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string())
+                .is_file(),
+            "the successful reservation remains permanently burned"
+        );
+        assert!(
+            !root
+                .path()
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string())
+                .exists(),
+            "a rejected publication job cannot create markerless entity staging"
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the rejected pre-start publication leaves a valid store");
+        assert!(reopened.agent_head(candidate).is_none());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
     async fn publication_fault_certainty_keeps_ordinary_failures_live_and_closes_after_success() {
         let cases = [
             (
@@ -7489,6 +7836,14 @@ mod tests {
                 true,
                 true,
             ),
+            (
+                "published-head-readback-after",
+                PublicationFault::After(PublicationOperation::ReadbackPublishedHead),
+                agent_candidate(77),
+                agent_candidate(78),
+                true,
+                true,
+            ),
         ];
 
         for (name, fault, first, second, publishes, closes) in cases {
@@ -7515,6 +7870,53 @@ mod tests {
             let first_result = state
                 .create_agent_with_test_candidates(make_attempt(), [Ok(first)])
                 .await;
+            if name == "published-after-create" {
+                let operations = filesystem.publication_operations();
+                let published_create = operations
+                    .iter()
+                    .position(|operation| *operation == PublicationOperation::CreatePublished)
+                    .expect("the PUBLISHED create attempt is recorded");
+                assert_eq!(
+                    &operations[published_create..],
+                    &[
+                        PublicationOperation::CreatePublished,
+                        PublicationOperation::ReadbackPublished,
+                        PublicationOperation::SyncPublished,
+                        PublicationOperation::SyncPublishedEntityDirectory,
+                        PublicationOperation::SyncPublishedAgentsDirectory,
+                        PublicationOperation::ReadbackPublished,
+                        PublicationOperation::ReadbackPublishedHead,
+                        PublicationOperation::ReadbackPublishedDefinition,
+                    ],
+                    "PUBLISHED create ambiguity has one exact reconciliation suffix"
+                );
+            }
+            if name == "published-head-readback-after" {
+                let operations = filesystem.publication_operations();
+                let published_create = operations
+                    .iter()
+                    .position(|operation| *operation == PublicationOperation::CreatePublished)
+                    .expect("the PUBLISHED create attempt is recorded");
+                assert_eq!(
+                    &operations[published_create..],
+                    &[
+                        PublicationOperation::CreatePublished,
+                        PublicationOperation::SyncPublished,
+                        PublicationOperation::SyncPublishedEntityDirectory,
+                        PublicationOperation::SyncPublishedAgentsDirectory,
+                        PublicationOperation::ReadbackPublished,
+                        PublicationOperation::ReadbackPublishedHead,
+                        PublicationOperation::ReadbackPublished,
+                        PublicationOperation::SyncPublished,
+                        PublicationOperation::SyncPublishedEntityDirectory,
+                        PublicationOperation::SyncPublishedAgentsDirectory,
+                        PublicationOperation::ReadbackPublished,
+                        PublicationOperation::ReadbackPublishedHead,
+                        PublicationOperation::ReadbackPublishedDefinition,
+                    ],
+                    "final readback reconciliation keeps the current marker-sync target"
+                );
+            }
             if publishes {
                 assert_eq!(first_result.as_ref().map(|head| head.agent_id()), Ok(first));
                 assert!(
@@ -7563,6 +7965,65 @@ mod tests {
                 state.close().await;
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_collection_sync_coordinate_is_bound_to_the_current_entity() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let make_attempt = || {
+            super::SealedAgentCreateAttempt::new(
+                crate::prompt::AgentPromptSelection::new(
+                    ["base"]
+                        .into_iter()
+                        .map(|value| value.parse().unwrap())
+                        .collect(),
+                )
+                .unwrap(),
+                "Planner",
+                None::<&str>,
+                "2026-08-03T10:00:00.123Z".parse().unwrap(),
+            )
+            .unwrap()
+        };
+        let first = agent_candidate(75);
+        state
+            .create_agent_with_test_candidates(make_attempt(), [Ok(first)])
+            .await
+            .expect("the nonempty store starts with one published Agent");
+
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::SyncPublishedAgentsDirectory,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let second = agent_candidate(76);
+        let second_entity = root.path().join(AGENTS_DIRECTORY).join(second.to_string());
+        let state_for_create = state.clone();
+        let create = tokio::spawn(async move {
+            state_for_create
+                .create_agent_with_test_candidates(make_attempt(), [Ok(second)])
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+        assert!(
+            second_entity.join("PUBLISHED").is_file(),
+            "an older published Agent cannot move this coordinate into precommit staging"
+        );
+        release
+            .send(())
+            .expect("the current entity collection sync resumes");
+        assert_eq!(
+            create
+                .await
+                .expect("the current Agent create task joins")
+                .map(|head| head.agent_id()),
+            Ok(second)
+        );
+        state.close().await;
     }
 
     #[cfg(unix)]
@@ -7749,6 +8210,172 @@ mod tests {
             .expect("the aborted child is joined before the lease is released");
         assert!(reopened.agent_head(candidate).is_none());
         reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn actor_abort_after_committed_keeps_child_and_lease_until_published_reopen() {
+        let root = TempRoot::nonexistent();
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let actor_task = state.actor.task.clone();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::SyncCommittedGenerationDirectory,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let candidate = agent_candidate(63);
+        let waiter = state
+            .actor
+            .enqueue_create_with_test_candidates(
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap(),
+                [Ok(candidate)],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        wait_reservation_barrier(entered_receiver).await;
+
+        state.task_context.abort_latest_registered_task();
+        assert_eq!(
+            waiter.wait().await,
+            Err(super::DurableAgentCreateError::InternalDispatchUnavailable),
+            "the dead actor cannot claim whether its post-barrier request completed"
+        );
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "shutdown retains the non-cancellable post-COMMITTED child"
+        );
+        assert!(matches!(
+            open(root.path()).await,
+            Err(super::DurableOpenError::StoreInUse)
+        ));
+
+        release.send(()).expect("the committed publication resumes");
+        close.await;
+        assert!(
+            root.path()
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string())
+                .join("PUBLISHED")
+                .is_file()
+        );
+        let reopened = open(root.path())
+            .await
+            .expect("post-COMMITTED actor loss reopens as a complete Agent");
+        assert!(reopened.agent_head(candidate).is_some());
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawned as a controlled native process-abort child"]
+    async fn native_process_abort_agent_create_child() {
+        if std::env::var("MINICORE_TEST_CRASH_CHILD").as_deref() != Ok("v1") {
+            return;
+        }
+        let root = PathBuf::from(
+            std::env::var_os("MINICORE_TEST_CRASH_ROOT")
+                .expect("the parent supplies the crash root"),
+        );
+        let candidate: AgentId = std::env::var("MINICORE_TEST_CRASH_AGENT")
+            .expect("the parent supplies the crash Agent")
+            .parse()
+            .expect("the crash Agent ID is canonical");
+        let operation = match std::env::var("MINICORE_TEST_CRASH_POINT").as_deref() {
+            Ok("before_published") => PublicationOperation::SyncCommittedGenerationDirectory,
+            Ok("after_published") => PublicationOperation::SyncPublishedAgentsDirectory,
+            _ => panic!("the parent supplies a known crash coordinate"),
+        };
+        let proof_path = PathBuf::from(
+            std::env::var_os("MINICORE_TEST_CRASH_PROOF")
+                .expect("the parent supplies the crash proof path"),
+        );
+        let proof = std::env::var("MINICORE_TEST_CRASH_NONCE")
+            .expect("the parent supplies the crash proof nonce");
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(&root, Arc::clone(&filesystem)).await;
+        filesystem.abort_after_publication_operation(operation, proof_path, proof);
+
+        let result = state
+            .create_agent_with_test_candidates(
+                super::SealedAgentCreateAttempt::new(
+                    crate::prompt::AgentPromptSelection::new(
+                        ["base"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "Planner",
+                    None::<&str>,
+                    "2026-08-03T10:00:00.123Z".parse().unwrap(),
+                )
+                .unwrap(),
+                [Ok(candidate)],
+            )
+            .await;
+        panic!("the native crash hook did not abort publication: {result:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_process_abort_reopens_agent_create_as_invisible_or_published() {
+        for (point, candidate, published) in [
+            ("before_published", agent_candidate(73), false),
+            ("after_published", agent_candidate(74), true),
+        ] {
+            let root = TempRoot::nonexistent();
+            run_native_abort_child(root.path(), candidate, point);
+
+            let reservation = root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string());
+            let entity = root
+                .path()
+                .join(AGENTS_DIRECTORY)
+                .join(candidate.to_string());
+            let generation = entity.join("generations").join("00000000000000000001");
+            assert!(reservation.is_file(), "{point} retains the burned ID");
+            assert!(generation.join("COMMITTED").is_file(), "{point}");
+            assert_eq!(entity.join("PUBLISHED").is_file(), published, "{point}");
+
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{point} reopens: {error:?}"));
+            assert_eq!(
+                reopened.agent_head(candidate).is_some(),
+                published,
+                "{point}"
+            );
+            if !published {
+                assert!(
+                    !entity.exists(),
+                    "restart exactly cleans the invisible aborted entity"
+                );
+            }
+            reopened.close().await;
+        }
     }
 
     #[cfg(unix)]
