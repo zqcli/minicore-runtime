@@ -266,6 +266,117 @@ pub(crate) const fn is_legal_agent_status_transition(
     )
 }
 
+/// Lifecycle-owned semantic input to one Agent status CAS. It carries no storage generation,
+/// path, timestamp, marker, command identity, or publication handle.
+pub(crate) struct SealedAgentStatusAttempt {
+    agent_id: AgentId,
+    expected_status: AgentStatus,
+    target_status: AgentStatus,
+}
+
+#[allow(
+    dead_code,
+    reason = "the public Agent status command constructor consumes this sealed error"
+)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum AgentStatusAttemptError {
+    #[error("usable Agent status mutation cannot target deleted")]
+    InvalidUsableTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AgentStatusDecision {
+    NoChange,
+    Publish(AgentStatus),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum AgentStatusDecisionError {
+    #[error("Agent status compare-and-swap is stale")]
+    StaleStatus,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent status transition is invalid")]
+    InvalidTransition,
+}
+
+impl SealedAgentStatusAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Agent status command constructor consumes this sealed seam"
+    )]
+    pub(crate) fn set_usable(
+        agent_id: AgentId,
+        expected_status: AgentStatus,
+        target_status: AgentStatus,
+    ) -> Result<Self, AgentStatusAttemptError> {
+        if target_status == AgentStatus::Deleted {
+            return Err(AgentStatusAttemptError::InvalidUsableTarget);
+        }
+        Ok(Self {
+            agent_id,
+            expected_status,
+            target_status,
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the public Agent delete command constructor consumes this sealed seam"
+    )]
+    pub(crate) const fn delete(agent_id: AgentId, expected_status: AgentStatus) -> Self {
+        Self {
+            agent_id,
+            expected_status,
+            target_status: AgentStatus::Deleted,
+        }
+    }
+
+    pub(crate) const fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn expected_status(&self) -> AgentStatus {
+        self.expected_status
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn target_status(&self) -> AgentStatus {
+        self.target_status
+    }
+
+    pub(crate) fn decide(
+        &self,
+        current_status: AgentStatus,
+    ) -> Result<AgentStatusDecision, AgentStatusDecisionError> {
+        if current_status != self.expected_status {
+            return Err(AgentStatusDecisionError::StaleStatus);
+        }
+        if current_status == AgentStatus::Deleted {
+            return Err(AgentStatusDecisionError::AgentDeleted);
+        }
+        if current_status == self.target_status {
+            return Ok(AgentStatusDecision::NoChange);
+        }
+        if !is_legal_agent_status_transition(current_status, self.target_status) {
+            return Err(AgentStatusDecisionError::InvalidTransition);
+        }
+        Ok(AgentStatusDecision::Publish(self.target_status))
+    }
+}
+
+impl fmt::Debug for SealedAgentStatusAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedAgentStatusAttempt")
+            .field("agent_id", &"redacted")
+            .field("expected_status", &self.expected_status)
+            .field("target_status", &self.target_status)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AgentRevisionRef {
     agent_id: AgentId,
@@ -818,8 +929,9 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        AgentRevisionRef, SealedAgentCreateAttempt, SealedSessionCreateAttempt,
-        SealedSessionForkAttempt, SessionDefinition, SessionForkAttemptError, SessionModelConfig,
+        AgentRevisionRef, AgentStatus, AgentStatusAttemptError, SealedAgentCreateAttempt,
+        SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
+        SessionDefinition, SessionForkAttemptError, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -874,6 +986,33 @@ mod tests {
         assert_eq!(metadata.name(), "Planner secret");
         assert_eq!(metadata.description(), Some("Description secret"));
         assert_eq!(metadata.updated_at(), timestamp);
+    }
+
+    #[test]
+    fn sealed_agent_status_attempt_separates_usable_status_and_delete_and_redacts_identity() {
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let usable = SealedAgentStatusAttempt::set_usable(
+            agent_id,
+            AgentStatus::Enabled,
+            AgentStatus::Disabled,
+        )
+        .unwrap();
+        assert_eq!(usable.agent_id(), agent_id);
+        assert_eq!(usable.expected_status(), AgentStatus::Enabled);
+        assert_eq!(usable.target_status(), AgentStatus::Disabled);
+        assert!(!format!("{usable:?}").contains("agt_aaaaaaaa"));
+        assert_eq!(
+            SealedAgentStatusAttempt::set_usable(
+                agent_id,
+                AgentStatus::Enabled,
+                AgentStatus::Deleted,
+            )
+            .unwrap_err(),
+            AgentStatusAttemptError::InvalidUsableTarget
+        );
+
+        let delete = SealedAgentStatusAttempt::delete(agent_id, AgentStatus::Disabled);
+        assert_eq!(delete.target_status(), AgentStatus::Deleted);
     }
 
     #[test]

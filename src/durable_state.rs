@@ -18,7 +18,8 @@ use tokio_util::sync::CancellationToken;
 use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{
-    AgentDefinition, AgentMetadata, AgentRevisionRef, AgentStatus, SealedAgentCreateAttempt,
+    AgentDefinition, AgentMetadata, AgentRevisionRef, AgentStatus, AgentStatusDecision,
+    AgentStatusDecisionError, SealedAgentCreateAttempt, SealedAgentStatusAttempt,
     SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionDefinition, SessionForkProvenance,
     SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
@@ -387,7 +388,7 @@ pub(crate) enum DurableOpenError {
 struct DurableAgentCatalogEntry {
     current_head: Arc<DurableAgentHead>,
     current_definition: Arc<AgentDefinition>,
-    definition_index: BTreeMap<AgentRevision, StorageGeneration>,
+    definition_index: Arc<BTreeMap<AgentRevision, StorageGeneration>>,
 }
 
 fn ordinary_session_create_agent_basis(
@@ -402,7 +403,7 @@ fn ordinary_session_create_agent_basis(
     DurableAgentCatalogEntry {
         current_head,
         current_definition,
-        definition_index,
+        definition_index: Arc::new(definition_index),
     }
 }
 
@@ -414,7 +415,7 @@ fn recorded_fork_agent_basis(
     Some(DurableAgentCatalogEntry {
         current_head: Arc::clone(&entry.current_head),
         current_definition: Arc::clone(&entry.current_definition),
-        definition_index: BTreeMap::from([(captured.revision(), generation)]),
+        definition_index: Arc::new(BTreeMap::from([(captured.revision(), generation)])),
     })
 }
 
@@ -730,6 +731,50 @@ pub(crate) enum DurableSessionForkError {
     InternalDispatchUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableAgentStatusError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Agent was not found")]
+    AgentNotFound,
+    #[error("Agent status compare-and-swap is stale")]
+    StaleStatus,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[allow(
+    dead_code,
+    reason = "the public Agent command completion consumes this private durable outcome"
+)]
+#[derive(Clone, Debug)]
+pub(crate) enum DurableAgentStatusOutcome {
+    NoChange(Arc<DurableAgentHead>),
+    Updated(Arc<DurableAgentHead>),
+}
+
+#[allow(
+    dead_code,
+    reason = "the public Agent command completion consumes these outcome projections"
+)]
+impl DurableAgentStatusOutcome {
+    pub(crate) fn head(&self) -> &Arc<DurableAgentHead> {
+        match self {
+            Self::NoChange(head) | Self::Updated(head) => head,
+        }
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        matches!(self, Self::Updated(_))
+    }
+}
+
 struct CreateAgentRequest {
     attempt: SealedAgentCreateAttempt,
     response: Option<oneshot::Sender<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>>,
@@ -772,6 +817,48 @@ impl CreateAgentWaiter {
         self.response
             .await
             .unwrap_or(Err(DurableAgentCreateError::InternalDispatchUnavailable))
+    }
+}
+
+struct SetAgentStatusRequest {
+    attempt: SealedAgentStatusAttempt,
+    response: Option<oneshot::Sender<Result<DurableAgentStatusOutcome, DurableAgentStatusError>>>,
+    closing: CancellationToken,
+    permit: Option<AgentStatusMutationPermit>,
+}
+
+impl SetAgentStatusRequest {
+    fn settle(&mut self, outcome: Result<DurableAgentStatusOutcome, DurableAgentStatusError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject(&mut self, error: DurableAgentStatusError) {
+        self.settle(Err(error));
+    }
+}
+
+impl Drop for SetAgentStatusRequest {
+    fn drop(&mut self) {
+        let error = if self.closing.is_cancelled() {
+            DurableAgentStatusError::Closing
+        } else {
+            DurableAgentStatusError::InternalDispatchUnavailable
+        };
+        self.reject(error);
+    }
+}
+
+struct SetAgentStatusWaiter {
+    response: oneshot::Receiver<Result<DurableAgentStatusOutcome, DurableAgentStatusError>>,
+}
+
+impl SetAgentStatusWaiter {
+    async fn wait(self) -> Result<DurableAgentStatusOutcome, DurableAgentStatusError> {
+        self.response
+            .await
+            .unwrap_or(Err(DurableAgentStatusError::InternalDispatchUnavailable))
     }
 }
 
@@ -873,6 +960,19 @@ struct AgentLifecycleGateRegistry {
     gates: Mutex<BTreeMap<AgentId, Arc<tokio::sync::RwLock<()>>>>,
     #[cfg(test)]
     publication_waiting: Notify,
+    #[cfg(test)]
+    status_mutation_waiting: Notify,
+}
+
+/// Typed exclusive status epoch. It deliberately exposes no raw lock operations and may be held
+/// by the actor publication owner across owner-tracked local durable I/O.
+#[derive(Clone)]
+struct AgentStatusMutationPermit {
+    _guard: Arc<AgentStatusMutationGuard>,
+}
+
+struct AgentStatusMutationGuard {
+    _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
 impl AgentLifecycleGateRegistry {
@@ -894,9 +994,24 @@ impl AgentLifecycleGateRegistry {
         self.gate(agent_id).read_owned().await
     }
 
+    async fn acquire_status_mutation(&self, agent_id: AgentId) -> AgentStatusMutationPermit {
+        #[cfg(test)]
+        self.status_mutation_waiting.notify_one();
+        AgentStatusMutationPermit {
+            _guard: Arc::new(AgentStatusMutationGuard {
+                _guard: self.gate(agent_id).write_owned().await,
+            }),
+        }
+    }
+
     #[cfg(test)]
     async fn wait_for_publication_for_test(&self) {
         self.publication_waiting.notified().await;
+    }
+
+    #[cfg(test)]
+    async fn wait_for_status_mutation_for_test(&self) {
+        self.status_mutation_waiting.notified().await;
     }
 }
 
@@ -1063,6 +1178,7 @@ impl std::error::Error for ActorRequestError {}
 
 enum DurableStateActorRequest {
     CreateAgent(CreateAgentRequest),
+    SetAgentStatus(SetAgentStatusRequest),
     CreateSession(CreateSessionRequest),
     ForkSession(ForkSessionRequest),
     #[cfg(test)]
@@ -1116,6 +1232,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::CreateAgent(request) => {
                 request.reject(DurableAgentCreateError::Closing);
             }
+            DurableStateActorRequest::SetAgentStatus(request) => {
+                request.reject(DurableAgentStatusError::Closing);
+            }
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::Closing);
             }
@@ -1141,6 +1260,9 @@ impl DurableStateActorRequestEnvelope {
         match &mut self.request {
             DurableStateActorRequest::CreateAgent(request) => {
                 request.reject(DurableAgentCreateError::InternalDispatchUnavailable);
+            }
+            DurableStateActorRequest::SetAgentStatus(request) => {
+                request.reject(DurableAgentStatusError::InternalDispatchUnavailable);
             }
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::InternalDispatchUnavailable);
@@ -1168,6 +1290,7 @@ impl DurableStateActorRequestEnvelope {
                 Some((Arc::clone(&probe.entered), Arc::clone(&probe.release)))
             }
             DurableStateActorRequest::CreateAgent(_)
+            | DurableStateActorRequest::SetAgentStatus(_)
             | DurableStateActorRequest::CreateSession(_)
             | DurableStateActorRequest::ForkSession(_)
             | DurableStateActorRequest::ReserveAgent(_)
@@ -1422,6 +1545,46 @@ impl DurableStateActorHandle {
         // request's physical settlement from here.
         permit.send(envelope);
         CreateAgentWaiter { response: waiter }
+    }
+
+    async fn enqueue_agent_status(
+        &self,
+        attempt: SealedAgentStatusAttempt,
+    ) -> SetAgentStatusWaiter {
+        let (response, waiter) = oneshot::channel();
+        let request = SetAgentStatusRequest {
+            attempt,
+            response: Some(response),
+            closing: self.closing.clone(),
+            permit: None,
+        };
+        let mut envelope = DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::SetAgentStatus(request),
+            #[cfg(test)]
+            response: None,
+            #[cfg(test)]
+            drop_error: ActorRequestError::Unavailable,
+        };
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                envelope.reject_closing();
+                return SetAgentStatusWaiter { response: waiter };
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if self.closing.is_cancelled() {
+                        envelope.reject_closing();
+                    } else {
+                        envelope.reject_unavailable();
+                    }
+                    return SetAgentStatusWaiter { response: waiter };
+                }
+            },
+        };
+        permit.send(envelope);
+        SetAgentStatusWaiter { response: waiter }
     }
 
     async fn enqueue_session_create(
@@ -1857,6 +2020,55 @@ impl DurableStateActor {
                                     }
                                 }
                             }
+                            DurableStateActorRequest::SetAgentStatus(status) => {
+                                match self.process_agent_status(status).await {
+                                    AgentStatusMutationWorkResult::NoChange(head) => {
+                                        status.settle(Ok(DurableAgentStatusOutcome::NoChange(head)));
+                                        status.permit.take();
+                                    }
+                                    AgentStatusMutationWorkResult::Published {
+                                        entry,
+                                        close_required,
+                                    } => {
+                                        let head = Arc::clone(&entry.current_head);
+                                        debug_assert!(lock(&self.published_agents)
+                                            .contains_key(&head.agent_id()));
+                                        status.settle(Ok(DurableAgentStatusOutcome::Updated(head)));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            status.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        status.permit.take();
+                                    }
+                                    AgentStatusMutationWorkResult::Ordinary {
+                                        error,
+                                        close_required,
+                                    } => {
+                                        status.settle(Err(error));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            status.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        status.permit.take();
+                                    }
+                                    AgentStatusMutationWorkResult::Poisoned => {
+                                        status.settle(Err(
+                                            DurableAgentStatusError::InternalDispatchUnavailable,
+                                        ));
+                                        self.task_context.request_closing();
+                                        self.closing.cancel();
+                                        status.permit.take();
+                                        self.close_receiver_and_reject_queued().await;
+                                        return true;
+                                    }
+                                }
+                            }
                             DurableStateActorRequest::CreateSession(create) => {
                                 match self.process_create_session(create).await {
                                     SessionPublicationWorkResult::Published {
@@ -2032,6 +2244,127 @@ impl DurableStateActor {
             self.directory_sync,
             Arc::clone(&definition),
             Arc::clone(&head),
+            self.closing.clone(),
+            Arc::clone(&self.active_commit_barrier),
+        )
+        .await
+    }
+
+    async fn process_agent_status(
+        &mut self,
+        request: &mut SetAgentStatusRequest,
+    ) -> AgentStatusMutationWorkResult {
+        let agent_id = request.attempt.agent_id();
+        let exists = lock(&self.published_agents).contains_key(&agent_id)
+            || self.recovered_agents.contains_key(&agent_id);
+        if !exists {
+            return AgentStatusMutationWorkResult::Ordinary {
+                error: DurableAgentStatusError::AgentNotFound,
+                close_required: false,
+            };
+        }
+        let status_gate = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                return AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::Closing,
+                    close_required: false,
+                };
+            }
+            permit = self.agent_lifecycle_gates.acquire_status_mutation(agent_id) => permit,
+        };
+        request.permit = Some(status_gate);
+        let current = {
+            let published = lock(&self.published_agents);
+            published
+                .get(&agent_id)
+                .cloned()
+                .or_else(|| self.recovered_agents.get(&agent_id).cloned())
+        };
+        let Some(current) = current else {
+            return AgentStatusMutationWorkResult::Poisoned;
+        };
+        let target_status = match request.attempt.decide(current.current_head.status()) {
+            Ok(AgentStatusDecision::NoChange) => {
+                return AgentStatusMutationWorkResult::NoChange(Arc::clone(&current.current_head));
+            }
+            Ok(AgentStatusDecision::Publish(status)) => status,
+            Err(AgentStatusDecisionError::StaleStatus) => {
+                return AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::StaleStatus,
+                    close_required: false,
+                };
+            }
+            Err(AgentStatusDecisionError::AgentDeleted) => {
+                return AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::AgentDeleted,
+                    close_required: false,
+                };
+            }
+            Err(AgentStatusDecisionError::InvalidTransition) => {
+                return AgentStatusMutationWorkResult::Poisoned;
+            }
+        };
+        let next_generation_value = match current
+            .current_head
+            .storage_generation()
+            .get()
+            .checked_add(1)
+        {
+            Some(value) if value as usize <= GENERATION_ENTRY_CAP => value,
+            _ => {
+                return AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::DurableStateTooLarge,
+                    close_required: false,
+                };
+            }
+        };
+        let Some(next_generation) = StorageGeneration::new(next_generation_value) else {
+            return AgentStatusMutationWorkResult::Poisoned;
+        };
+        let head = match DurableAgentHead::new(
+            agent_id,
+            next_generation,
+            Some(current.current_head.storage_generation()),
+            current.current_head.current_definition_revision(),
+            current.current_head.current_definition_storage_generation(),
+            current.current_head.metadata().clone(),
+            target_status,
+            current.current_head.created_at(),
+        ) {
+            Ok(head) => Arc::new(head),
+            Err(_) => return AgentStatusMutationWorkResult::Poisoned,
+        };
+        if !agent_status_transition_is_valid(&current.current_head, &head) {
+            return AgentStatusMutationWorkResult::Poisoned;
+        }
+        let head_bytes = match DurableStoreV1Codec::encode_agent_head(&head) {
+            Ok(bytes) => bytes,
+            Err(
+                DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure,
+            ) => {
+                return AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::DurableStateTooLarge,
+                    close_required: false,
+                };
+            }
+            Err(_) => return AgentStatusMutationWorkResult::Poisoned,
+        };
+        publish_agent_status_generation(
+            self.task_context.clone(),
+            Arc::clone(&self.lease),
+            Arc::clone(&self.filesystem),
+            self.root.clone(),
+            self.directory_sync,
+            current,
+            head,
+            head_bytes,
+            Arc::clone(&self.published_agents),
+            request
+                .permit
+                .as_ref()
+                .expect("the status request retains its exclusive permit")
+                .clone(),
             self.closing.clone(),
             Arc::clone(&self.active_commit_barrier),
         )
@@ -3041,6 +3374,20 @@ enum PublicationWorkResult {
 }
 
 #[derive(Clone)]
+enum AgentStatusMutationWorkResult {
+    NoChange(Arc<DurableAgentHead>),
+    Published {
+        entry: DurableAgentCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: DurableAgentStatusError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
+#[derive(Clone)]
 enum SessionPublicationWorkResult {
     Published {
         entry: DurableSessionCatalogEntry,
@@ -3347,6 +3694,450 @@ impl DurableCommitBarrier {
             _ => unreachable!("the durable commit barrier has three closed states"),
         }
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the actor passes the fixed publication owner, filesystem, paths, and barrier seam"
+)]
+async fn publish_agent_status_generation(
+    task_context: RuntimeTaskContext,
+    lease: Arc<RootLease>,
+    filesystem: Arc<dyn DurableFilesystem>,
+    root: PathBuf,
+    directory_sync: DirectorySync,
+    current: DurableAgentCatalogEntry,
+    head: Arc<DurableAgentHead>,
+    head_bytes: Vec<u8>,
+    published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
+    status_gate: AgentStatusMutationPermit,
+    closing: CancellationToken,
+    active_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
+) -> AgentStatusMutationWorkResult {
+    let barrier = DurableCommitBarrier::new();
+    *lock(&active_barrier) = Some(Arc::clone(&barrier));
+    let worker_barrier = Arc::clone(&barrier);
+    let worker_status_gate = status_gate.clone();
+    let job = task_context.spawn_blocking_tracked(move || {
+        let _lease = lease;
+        let _status_gate = worker_status_gate;
+        publish_agent_status_generation_blocking(
+            filesystem.as_ref(),
+            &root,
+            directory_sync,
+            current,
+            head,
+            &head_bytes,
+            worker_barrier,
+        )
+    });
+    let mut job_wait = Box::pin(job.wait());
+    let result = tokio::select! {
+        biased;
+        _ = closing.cancelled() => {
+            let cancellation_won = barrier.try_cancel();
+            let result = job_wait.await;
+            match result {
+                Ok(result) if cancellation_won => force_agent_status_closing(result),
+                Ok(result) => force_agent_status_close(result),
+                Err(error) if cancellation_won => {
+                    force_agent_status_closing(classify_agent_status_task_error(error, &barrier))
+                }
+                Err(error) => {
+                    force_agent_status_close(classify_agent_status_task_error(error, &barrier))
+                }
+            }
+        }
+        result = &mut job_wait => match result {
+            Ok(result) => result,
+            Err(error) => classify_agent_status_task_error(error, &barrier),
+        },
+    };
+    *lock(&active_barrier) = None;
+    if let AgentStatusMutationWorkResult::Published { entry, .. } = &result {
+        lock(&published_agents).insert(entry.current_head.agent_id(), entry.clone());
+    }
+    drop(status_gate);
+    result
+}
+
+fn classify_agent_status_task_error(
+    error: RuntimeTaskError,
+    barrier: &DurableCommitBarrier,
+) -> AgentStatusMutationWorkResult {
+    match barrier.current_stage() {
+        DurableCommitStage::Crossed => AgentStatusMutationWorkResult::Poisoned,
+        DurableCommitStage::Pending | DurableCommitStage::Cancelled => match error {
+            RuntimeTaskError::OwnerClosing => AgentStatusMutationWorkResult::Ordinary {
+                error: DurableAgentStatusError::Closing,
+                close_required: false,
+            },
+            RuntimeTaskError::WorkerUnavailable => AgentStatusMutationWorkResult::Ordinary {
+                error: DurableAgentStatusError::StorageUnavailable,
+                close_required: false,
+            },
+            RuntimeTaskError::OperationPanicked => AgentStatusMutationWorkResult::Poisoned,
+        },
+    }
+}
+
+fn force_agent_status_closing(
+    result: AgentStatusMutationWorkResult,
+) -> AgentStatusMutationWorkResult {
+    match result {
+        AgentStatusMutationWorkResult::Published { entry, .. } => {
+            AgentStatusMutationWorkResult::Published {
+                entry,
+                close_required: true,
+            }
+        }
+        AgentStatusMutationWorkResult::Ordinary { .. }
+        | AgentStatusMutationWorkResult::NoChange(_) => AgentStatusMutationWorkResult::Ordinary {
+            error: DurableAgentStatusError::Closing,
+            close_required: false,
+        },
+        AgentStatusMutationWorkResult::Poisoned => AgentStatusMutationWorkResult::Poisoned,
+    }
+}
+
+fn force_agent_status_close(
+    result: AgentStatusMutationWorkResult,
+) -> AgentStatusMutationWorkResult {
+    match result {
+        AgentStatusMutationWorkResult::Published { entry, .. } => {
+            AgentStatusMutationWorkResult::Published {
+                entry,
+                close_required: true,
+            }
+        }
+        AgentStatusMutationWorkResult::Ordinary { error, .. } => {
+            AgentStatusMutationWorkResult::Ordinary {
+                error,
+                close_required: true,
+            }
+        }
+        AgentStatusMutationWorkResult::NoChange(head) => {
+            AgentStatusMutationWorkResult::NoChange(head)
+        }
+        AgentStatusMutationWorkResult::Poisoned => AgentStatusMutationWorkResult::Poisoned,
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the existing Agent status worker binds one exact old/new head publication"
+)]
+fn publish_agent_status_generation_blocking(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    current: DurableAgentCatalogEntry,
+    head: Arc<DurableAgentHead>,
+    head_bytes: &[u8],
+    barrier: Arc<DurableCommitBarrier>,
+) -> AgentStatusMutationWorkResult {
+    #[cfg(test)]
+    let _attempt = PublicationAttemptTestGuard::new(filesystem);
+    let agent_id = head.agent_id();
+    let generation = head.storage_generation();
+    let entity = root.join(AGENTS_DIRECTORY).join(agent_id.to_string());
+    let generations = entity.join("generations");
+    let generation_path = generations.join(generation.directory_name());
+    let head_path = generation_path.join("head.json");
+    let committed_path = generation_path.join("COMMITTED");
+
+    macro_rules! precommit_step {
+        ($operation:expr) => {{
+            if barrier.is_cancelled() {
+                return reconcile_agent_status_precommit_failure(
+                    filesystem,
+                    root,
+                    directory_sync,
+                    &current,
+                    generation,
+                    DurableAgentStatusError::Closing,
+                    &barrier,
+                );
+            }
+            if $operation.is_err() {
+                return reconcile_agent_status_precommit_failure(
+                    filesystem,
+                    root,
+                    directory_sync,
+                    &current,
+                    generation,
+                    DurableAgentStatusError::StorageUnavailable,
+                    &barrier,
+                );
+            }
+        }};
+    }
+
+    precommit_step!(filesystem.create_private_directory(&generation_path));
+    precommit_step!(filesystem.sync_directory(&generations, directory_sync));
+    precommit_step!(write_and_sync(filesystem, &head_path, head_bytes));
+    precommit_step!(filesystem.sync_directory(&generation_path, directory_sync));
+    precommit_step!(exact_readback(filesystem, &head_path, head_bytes));
+
+    #[cfg(test)]
+    filesystem.before_commit_barrier();
+    if !barrier.try_cross() {
+        return reconcile_agent_status_precommit_failure(
+            filesystem,
+            root,
+            directory_sync,
+            &current,
+            generation,
+            DurableAgentStatusError::Closing,
+            &barrier,
+        );
+    }
+
+    let mut close_required = false;
+    let committed_file = match filesystem.create_new_private_file(&committed_path) {
+        Ok(file) => Some(file),
+        Err(()) => {
+            match reconcile_agent_status_committed_failure(
+                filesystem,
+                root,
+                directory_sync,
+                &current,
+                &head,
+                head_bytes,
+            ) {
+                AgentStatusCommittedResolution::Continue => {
+                    close_required = true;
+                    None
+                }
+                AgentStatusCommittedResolution::Return(result) => return result,
+            }
+        }
+    };
+    if let Some(committed_file) = committed_file {
+        let operation_failed = validate_new_file_mode(&committed_file).is_err()
+            || filesystem
+                .sync_file(&committed_path, &committed_file)
+                .is_err()
+            || filesystem
+                .sync_directory(&generation_path, directory_sync)
+                .is_err();
+        let readback_failed = !operation_failed
+            && (!matches!(
+                exact_readback_state(filesystem, &committed_path, b""),
+                PublicationCertainty::Published
+            ) || !matches!(
+                exact_readback_state(filesystem, &head_path, head_bytes),
+                PublicationCertainty::Published
+            ));
+        if operation_failed || readback_failed {
+            match reconcile_agent_status_committed_failure(
+                filesystem,
+                root,
+                directory_sync,
+                &current,
+                &head,
+                head_bytes,
+            ) {
+                AgentStatusCommittedResolution::Continue => close_required = true,
+                AgentStatusCommittedResolution::Return(result) => return result,
+            }
+        }
+    }
+
+    match recover_published_agent_status(filesystem, &entity, &current, &head, head_bytes) {
+        Ok(entry) => AgentStatusMutationWorkResult::Published {
+            entry,
+            close_required,
+        },
+        Err(_) => AgentStatusMutationWorkResult::Poisoned,
+    }
+}
+
+fn reconcile_agent_status_precommit_failure(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    current: &DurableAgentCatalogEntry,
+    generation: StorageGeneration,
+    error: DurableAgentStatusError,
+    barrier: &DurableCommitBarrier,
+) -> AgentStatusMutationWorkResult {
+    let error = if barrier.is_cancelled() {
+        DurableAgentStatusError::Closing
+    } else {
+        error
+    };
+    match cleanup_operation_owned_agent_trailing(
+        filesystem,
+        root,
+        directory_sync,
+        current,
+        generation,
+    ) {
+        Ok(()) => AgentStatusMutationWorkResult::Ordinary {
+            error,
+            close_required: false,
+        },
+        Err(StagingCleanupError::CloseRequired) => AgentStatusMutationWorkResult::Ordinary {
+            error,
+            close_required: true,
+        },
+        Err(StagingCleanupError::Poisoned) => AgentStatusMutationWorkResult::Poisoned,
+    }
+}
+
+enum AgentStatusCommittedResolution {
+    Continue,
+    Return(AgentStatusMutationWorkResult),
+}
+
+fn reconcile_agent_status_committed_failure(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    current: &DurableAgentCatalogEntry,
+    head: &DurableAgentHead,
+    head_bytes: &[u8],
+) -> AgentStatusCommittedResolution {
+    let generation_path = root
+        .join(AGENTS_DIRECTORY)
+        .join(head.agent_id().to_string())
+        .join("generations")
+        .join(head.storage_generation().directory_name());
+    let committed_path = generation_path.join("COMMITTED");
+    match exact_readback_state(filesystem, &committed_path, b"") {
+        PublicationCertainty::Published => {
+            if exact_readback_state(filesystem, &generation_path.join("head.json"), head_bytes)
+                != PublicationCertainty::Published
+            {
+                return AgentStatusCommittedResolution::Return(
+                    AgentStatusMutationWorkResult::Poisoned,
+                );
+            }
+            let _ = sync_existing_marker(
+                filesystem,
+                &committed_path,
+                &[&generation_path],
+                directory_sync,
+            );
+            AgentStatusCommittedResolution::Continue
+        }
+        PublicationCertainty::NotPublished => {
+            let result = match cleanup_operation_owned_agent_trailing(
+                filesystem,
+                root,
+                directory_sync,
+                current,
+                head.storage_generation(),
+            ) {
+                Ok(()) => AgentStatusMutationWorkResult::Ordinary {
+                    error: DurableAgentStatusError::StorageUnavailable,
+                    close_required: false,
+                },
+                Err(StagingCleanupError::CloseRequired) => {
+                    AgentStatusMutationWorkResult::Ordinary {
+                        error: DurableAgentStatusError::StorageUnavailable,
+                        close_required: true,
+                    }
+                }
+                Err(StagingCleanupError::Poisoned) => AgentStatusMutationWorkResult::Poisoned,
+            };
+            AgentStatusCommittedResolution::Return(result)
+        }
+        PublicationCertainty::CommittedCorruptPoisoned
+        | PublicationCertainty::IndeterminatePoisoned => {
+            AgentStatusCommittedResolution::Return(AgentStatusMutationWorkResult::Poisoned)
+        }
+    }
+}
+
+fn cleanup_operation_owned_agent_trailing(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    directory_sync: DirectorySync,
+    current: &DurableAgentCatalogEntry,
+    generation: StorageGeneration,
+) -> Result<(), StagingCleanupError> {
+    let entity = root
+        .join(AGENTS_DIRECTORY)
+        .join(current.current_head.agent_id().to_string());
+    let generation_path = entity.join("generations").join(generation.directory_name());
+    match fs::symlink_metadata(&generation_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(_) => {}
+        Err(_) => return Err(StagingCleanupError::Poisoned),
+    }
+    let scanned = scan_agent_entity(&entity, GENERATION_ENTRY_CAP)
+        .map_err(|_| StagingCleanupError::Poisoned)?;
+    let ScannedAgentEntity::Published(scan) = scanned else {
+        return Err(StagingCleanupError::Poisoned);
+    };
+    let recovered = recover_agent_generation_chain(scan, current.current_head.agent_id())
+        .map_err(|_| StagingCleanupError::Poisoned)?;
+    if recovered.entry.current_head != current.current_head
+        || recovered.entry.current_definition != current.current_definition
+        || recovered.entry.definition_index != current.definition_index
+    {
+        return Err(StagingCleanupError::Poisoned);
+    }
+    let Some(markerless) = recovered.markerless else {
+        return Err(StagingCleanupError::Poisoned);
+    };
+    if markerless.generation != generation || markerless.has_definition {
+        return Err(StagingCleanupError::Poisoned);
+    }
+    let cleanup =
+        deferred_agent_generation_cleanup(root, current.current_head.agent_id(), markerless);
+    finalize_deferred_generation_cleanup(&cleanup, directory_sync, filesystem).map_err(|error| {
+        match error {
+            DurableOpenError::StorageUnavailable => StagingCleanupError::CloseRequired,
+            _ => StagingCleanupError::Poisoned,
+        }
+    })
+}
+
+fn recover_published_agent_status(
+    filesystem: &dyn DurableFilesystem,
+    entity: &Path,
+    current: &DurableAgentCatalogEntry,
+    expected_head: &DurableAgentHead,
+    head_bytes: &[u8],
+) -> Result<DurableAgentCatalogEntry, PublicationCertainty> {
+    let generation_path = entity
+        .join("generations")
+        .join(expected_head.storage_generation().directory_name());
+    for (path, expected) in [
+        (generation_path.join("COMMITTED"), b"".as_slice()),
+        (generation_path.join("head.json"), head_bytes),
+    ] {
+        let state = exact_readback_state(filesystem, &path, expected);
+        if state != PublicationCertainty::Published {
+            return Err(committed_payload_certainty(state));
+        }
+    }
+    let scanned = scan_agent_entity(entity, GENERATION_ENTRY_CAP).map_err(|error| match error {
+        DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
+        _ => PublicationCertainty::CommittedCorruptPoisoned,
+    })?;
+    let ScannedAgentEntity::Published(scan) = scanned else {
+        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    };
+    if scan.markerless.is_some() {
+        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    }
+    let recovered = recover_agent_generation_chain(scan, expected_head.agent_id()).map_err(
+        |error| match error {
+            DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
+            _ => PublicationCertainty::CommittedCorruptPoisoned,
+        },
+    )?;
+    if recovered.entry.current_head.as_ref() != expected_head
+        || recovered.entry.current_definition != current.current_definition
+        || recovered.entry.definition_index != current.definition_index
+    {
+        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    }
+    Ok(recovered.entry)
 }
 
 #[allow(
@@ -5186,6 +5977,17 @@ impl DurableState {
         attempt: SealedAgentCreateAttempt,
     ) -> Result<Arc<DurableAgentHead>, DurableAgentCreateError> {
         self.actor.enqueue_create(attempt).await.wait().await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the production Agent command surface consumes this status CAS seam"
+    )]
+    pub(crate) async fn set_agent_status(
+        &self,
+        attempt: SealedAgentStatusAttempt,
+    ) -> Result<DurableAgentStatusOutcome, DurableAgentStatusError> {
+        self.actor.enqueue_agent_status(attempt).await.wait().await
     }
 
     #[cfg(test)]
@@ -7358,7 +8160,7 @@ fn recover_agent_generation_chain(
         entry: DurableAgentCatalogEntry {
             current_head: Arc::new(current_head),
             current_definition: Arc::new(current_definition),
-            definition_index,
+            definition_index: Arc::new(definition_index),
         },
         markerless,
     })
@@ -8655,9 +9457,9 @@ mod tests {
         open_root_with_durable_filesystem,
     };
     use crate::agent_session_lifecycle::{
-        AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedSessionCreateAttempt,
-        SealedSessionForkAttempt, SessionForkProvenance, SessionLifecycle, SessionMetadata,
-        SessionModelConfig,
+        AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedAgentStatusAttempt,
+        SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionForkProvenance,
+        SessionLifecycle, SessionMetadata, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::SessionPromptSelection;
@@ -10140,6 +10942,253 @@ mod tests {
         assert_eq!(&*reopened_head, &*returned_head);
         assert_eq!(&*reopened_definition, &*definition);
         reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_status_cas_publishes_exact_g2_installs_catalog_and_reopens() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let state = open(root.path()).await.expect("the Enabled Agent opens");
+        let outcome = state
+            .set_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Disabled,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the status CAS publishes");
+        assert!(outcome.changed());
+        assert_eq!(outcome.head().status(), AgentStatus::Disabled);
+        assert_eq!(outcome.head().storage_generation().get(), 2);
+        let catalog_head = state.agent_head(agent_id).unwrap();
+        assert!(Arc::ptr_eq(outcome.head(), &catalog_head));
+
+        let generation = agent_path(root.path(), AGENT_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            agent_head_status_g2_fixture()
+        );
+        assert_eq!(fs::read(generation.join("COMMITTED")).unwrap(), b"");
+        assert!(!generation.join("definition.json").exists());
+        assert_eq!(
+            fs::read(agent_path(root.path(), AGENT_ONE).join("PUBLISHED")).unwrap(),
+            b""
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the disabled G2 Agent reopens");
+        let reopened_head = reopened.agent_head(agent_id).unwrap();
+        assert_eq!(reopened_head.status(), AgentStatus::Disabled);
+        assert_eq!(reopened_head.storage_generation().get(), 2);
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_status_cas_checks_stale_before_noop_and_keeps_deleted_terminal() {
+        let no_op_root = TempRoot::existing();
+        create_marked_empty_store(no_op_root.path());
+        create_valid_g1_agent(no_op_root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let state = open(no_op_root.path())
+            .await
+            .expect("the Enabled Agent opens");
+        assert_eq!(
+            state
+                .set_agent_status(
+                    SealedAgentStatusAttempt::set_usable(
+                        agent_id,
+                        AgentStatus::Disabled,
+                        AgentStatus::Enabled,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::DurableAgentStatusError::StaleStatus,
+            "stale CAS is rejected even when the target equals current"
+        );
+        let no_change = state
+            .set_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Enabled,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("a current same-status request is a canonical no-op");
+        assert!(!no_change.changed());
+        assert_eq!(no_change.head().storage_generation().get(), 1);
+        assert!(
+            !agent_path(no_op_root.path(), AGENT_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .exists()
+        );
+        state.close().await;
+
+        let deleted_root = TempRoot::existing();
+        create_marked_empty_store(deleted_root.path());
+        create_valid_g1_agent(deleted_root.path());
+        let deleted = open(deleted_root.path())
+            .await
+            .expect("the deletable Agent opens");
+        let outcome = deleted
+            .set_agent_status(SealedAgentStatusAttempt::delete(
+                agent_id,
+                AgentStatus::Enabled,
+            ))
+            .await
+            .expect("direct delete publishes");
+        assert!(outcome.changed());
+        assert_eq!(outcome.head().status(), AgentStatus::Deleted);
+        let generation = agent_path(deleted_root.path(), AGENT_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            replace_fixture(
+                agent_head_status_g2_fixture(),
+                "\"status\":\"disabled\"",
+                "\"status\":\"deleted\"",
+            )
+        );
+        for attempt in [
+            SealedAgentStatusAttempt::delete(agent_id, AgentStatus::Deleted),
+            SealedAgentStatusAttempt::set_usable(
+                agent_id,
+                AgentStatus::Deleted,
+                AgentStatus::Disabled,
+            )
+            .unwrap(),
+        ] {
+            assert_eq!(
+                deleted.set_agent_status(attempt).await.unwrap_err(),
+                super::DurableAgentStatusError::AgentDeleted
+            );
+        }
+        assert!(
+            !agent_path(deleted_root.path(), AGENT_ONE)
+                .join("generations")
+                .join(GENERATION_THREE)
+                .exists()
+        );
+        deleted.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_status_exclusive_gate_linearizes_before_queued_session_create() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let state = open(root.path()).await.expect("the Enabled Agent opens");
+        let admission = state
+            .agent_lifecycle_gates
+            .acquire_publication(agent_id)
+            .await;
+        let (release_admission, wait_admission) = std::sync::mpsc::channel();
+        let admission_holder = std::thread::spawn(move || {
+            let _admission = admission;
+            wait_admission
+                .recv()
+                .expect("the test releases the admission gate");
+        });
+        let status = state
+            .actor
+            .enqueue_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Disabled,
+                )
+                .unwrap(),
+            )
+            .await;
+        state
+            .agent_lifecycle_gates
+            .wait_for_status_mutation_for_test()
+            .await;
+        assert_eq!(
+            state.agent_head(agent_id).unwrap().status(),
+            AgentStatus::Enabled
+        );
+        let session_id = session_candidate(102);
+        let create = state
+            .actor
+            .enqueue_session_create_with_test_candidates(
+                ordinary_session_create_attempt(agent_id),
+                [Ok(session_id)],
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .await;
+        release_admission
+            .send(())
+            .expect("the admission holder releases");
+        admission_holder.join().expect("the admission holder joins");
+
+        let status = status.wait().await.expect("the exclusive status CAS wins");
+        assert_eq!(status.head().status(), AgentStatus::Disabled);
+        assert_eq!(
+            create.wait().await,
+            Err(super::DurableSessionCreateError::AgentDisabled),
+            "the queued Create observes the completed exclusive status epoch"
+        );
+        assert!(!session_path(root.path(), &session_id.to_string()).exists());
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_status_noop_performs_zero_publication_io() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::CreateGenerationDirectory),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), filesystem).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let no_change = state
+            .set_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Enabled,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the no-op bypasses publication");
+        assert!(!no_change.changed());
+        assert_eq!(
+            state
+                .set_agent_status(
+                    SealedAgentStatusAttempt::set_usable(
+                        agent_id,
+                        AgentStatus::Enabled,
+                        AgentStatus::Disabled,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::DurableAgentStatusError::StorageUnavailable,
+            "the still-armed fault is consumed only by the real mutation"
+        );
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11709,6 +12758,122 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("{name} reopens: {error:?}"));
             assert_eq!(reopened.session_head(first).is_some(), publishes, "{name}");
+            reopened.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_status_faults_reopen_as_complete_old_or_new_generation() {
+        let cases = [
+            (
+                "head-write-after",
+                PublicationFault::After(PublicationOperation::WriteHead),
+                false,
+                false,
+            ),
+            (
+                "committed-create-before",
+                PublicationFault::Before(PublicationOperation::CreateCommitted),
+                false,
+                false,
+            ),
+            (
+                "committed-create-after",
+                PublicationFault::After(PublicationOperation::CreateCommitted),
+                true,
+                true,
+            ),
+            (
+                "committed-file-sync-after",
+                PublicationFault::After(PublicationOperation::SyncCommitted),
+                true,
+                true,
+            ),
+            (
+                "committed-generation-sync-after",
+                PublicationFault::After(PublicationOperation::SyncCommittedGenerationDirectory),
+                true,
+                true,
+            ),
+        ];
+
+        for (name, fault, publishes, closes) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+            let attempt = || {
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Disabled,
+                )
+                .unwrap()
+            };
+            let result = state.set_agent_status(attempt()).await;
+            if publishes {
+                let outcome = result.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                assert!(outcome.changed());
+                assert_eq!(outcome.head().status(), AgentStatus::Disabled);
+                assert_eq!(
+                    state.agent_head(agent_id).unwrap().status(),
+                    AgentStatus::Disabled
+                );
+                if closes {
+                    assert_eq!(
+                        state
+                            .set_agent_status(
+                                SealedAgentStatusAttempt::set_usable(
+                                    agent_id,
+                                    AgentStatus::Disabled,
+                                    AgentStatus::Enabled,
+                                )
+                                .unwrap(),
+                            )
+                            .await
+                            .unwrap_err(),
+                        super::DurableAgentStatusError::Closing,
+                        "{name} settles success before closing"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    super::DurableAgentStatusError::StorageUnavailable,
+                    "{name} is an ordinary old-head result"
+                );
+                assert_eq!(
+                    state.agent_head(agent_id).unwrap().status(),
+                    AgentStatus::Enabled
+                );
+                assert!(
+                    !agent_path(root.path(), AGENT_ONE)
+                        .join("generations")
+                        .join(GENERATION_TWO)
+                        .exists(),
+                    "{name} exactly cleans invisible trailing staging"
+                );
+                let retry = state
+                    .set_agent_status(attempt())
+                    .await
+                    .expect("the same G2 can be retried only after exact cleanup");
+                assert_eq!(retry.head().status(), AgentStatus::Disabled);
+            }
+            state.close().await;
+
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} reopens: {error:?}"));
+            assert_eq!(
+                reopened.agent_head(agent_id).unwrap().status(),
+                AgentStatus::Disabled,
+                "{name} reopens the complete new head after success or explicit retry"
+            );
             reopened.close().await;
         }
     }
