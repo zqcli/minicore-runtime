@@ -22,6 +22,9 @@ jobs:
         run: rustup toolchain install "${{ matrix.rust }}" --profile minimal --component rustfmt --component clippy
       - name: Select Rust toolchain
         run: rustup override set "${{ matrix.rust }}"
+      - name: Install stable quality gate tools
+        if: matrix.rust == 'stable'
+        run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - name: Run stable quality gate
         if: matrix.rust == 'stable'
         run: ./scripts/check.sh
