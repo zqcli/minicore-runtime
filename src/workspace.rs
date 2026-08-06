@@ -420,6 +420,42 @@ pub(crate) fn workspace_revision_transition_is_valid(
     }
 }
 
+/// The only Workspace revision materialization owned by the Session definition publisher.
+/// Runtime/Workspace lowers and validates the candidate before it crosses this seam; the
+/// candidate's revision is therefore only a placeholder. Equivalent content retains the
+/// authoritative revision, while changed content advances it exactly once.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionDefinitionWorkspaceMaterializationError {
+    #[error("Workspace revision is exhausted")]
+    RevisionExhausted,
+}
+
+pub(crate) fn materialize_session_definition_workspace(
+    current: &Workspace,
+    candidate: &Workspace,
+) -> Result<Workspace, SessionDefinitionWorkspaceMaterializationError> {
+    let revision = if workspaces_have_same_semantic_content(current, candidate) {
+        current.revision()
+    } else {
+        current
+            .revision()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(WorkspaceRevision::new)
+            .ok_or(SessionDefinitionWorkspaceMaterializationError::RevisionExhausted)?
+    };
+    Ok(Workspace::new(
+        revision,
+        candidate.primary_root().clone(),
+        candidate.additional_roots().to_vec(),
+        candidate.cwd().clone(),
+    )
+    .expect(
+        "a valid Workspace candidate remains valid when reconstructed with its authoritative revision",
+    ))
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum WorkspaceInputLoweringError {
     #[error("workspace input uses an unsupported host path family")]

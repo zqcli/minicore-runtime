@@ -10,7 +10,9 @@ use crate::wire::{
     AgentId, AgentMetadataRevision, AgentRevision, IdGenerationError, ItemId, ProtocolLimits,
     SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp,
 };
-use crate::workspace::{Workspace, workspaces_have_same_semantic_content};
+use crate::workspace::{
+    Workspace, materialize_session_definition_workspace, workspaces_have_same_semantic_content,
+};
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct AgentDefinition {
@@ -842,6 +844,332 @@ pub(crate) fn session_definitions_have_same_canonical_execution_content(
         && first.prompts() == second.prompts()
 }
 
+/// Lifecycle-owned semantic input to one ordinary Session definition CAS. Workspace candidates
+/// have already been host-lowered and validated by the Runtime/Workspace owner. Their revision is
+/// deliberately not trusted here: the Session owner materializes the authoritative current-or-
+/// next WorkspaceRevision only after it has read the current head under the Session gate.
+pub(crate) struct SealedSessionDefinitionAttempt {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    workspace: Option<Workspace>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
+    owner_timestamp: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionDefinitionDecisionError {
+    #[error("Session definition compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Session is archived")]
+    SessionArchived,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session definition revision is exhausted")]
+    RevisionExhausted,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the sealed decision keeps the complete immutable candidate in one owner value"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionDefinitionDecision {
+    NoChange,
+    Publish(SessionDefinition),
+}
+
+impl SealedSessionDefinitionAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Session definition command constructor consumes this sealed seam"
+    )]
+    pub(crate) fn new(
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        workspace: Option<Workspace>,
+        model: Option<SessionModelConfig>,
+        prompts: Option<SessionPromptSelection>,
+        owner_timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            session_id,
+            expected_revision,
+            workspace,
+            model,
+            prompts,
+            owner_timestamp,
+        }
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn expected_revision(&self) -> SessionDefinitionRevision {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn owner_timestamp(&self) -> Timestamp {
+        self.owner_timestamp
+    }
+
+    /// Decides the ordinary definition CAS in its authoritative order: expected revision,
+    /// Open lifecycle, complete replacement application, canonical no-op, then checked next
+    /// SessionDefinitionRevision and WorkspaceRevision materialization.
+    pub(crate) fn decide(
+        &self,
+        current_lifecycle: SessionLifecycle,
+        current_definition: &SessionDefinition,
+    ) -> Result<SessionDefinitionDecision, SessionDefinitionDecisionError> {
+        if current_definition.revision() != self.expected_revision {
+            return Err(SessionDefinitionDecisionError::StaleRevision);
+        }
+        match current_lifecycle {
+            SessionLifecycle::Open => {}
+            SessionLifecycle::Archived => {
+                return Err(SessionDefinitionDecisionError::SessionArchived);
+            }
+            SessionLifecycle::Deleted => {
+                return Err(SessionDefinitionDecisionError::SessionDeleted);
+            }
+        }
+
+        let candidate_workspace = self
+            .workspace
+            .clone()
+            .unwrap_or_else(|| current_definition.workspace().clone());
+        let patched_definition = SessionDefinition::new(
+            current_definition.session_id(),
+            current_definition.revision(),
+            current_definition.agent(),
+            candidate_workspace,
+            self.model
+                .clone()
+                .unwrap_or_else(|| current_definition.model().clone()),
+            self.prompts
+                .clone()
+                .unwrap_or_else(|| current_definition.prompts().clone()),
+            current_definition.created_at(),
+        );
+        if session_definitions_have_same_canonical_execution_content(
+            &patched_definition,
+            current_definition,
+        ) {
+            return Ok(SessionDefinitionDecision::NoChange);
+        }
+
+        let next_revision = current_definition
+            .revision()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(SessionDefinitionRevision::new)
+            .ok_or(SessionDefinitionDecisionError::RevisionExhausted)?;
+        let workspace = self
+            .workspace
+            .as_ref()
+            .map(|candidate| {
+                materialize_session_definition_workspace(current_definition.workspace(), candidate)
+            })
+            .transpose()
+            .map_err(
+                |crate::workspace::SessionDefinitionWorkspaceMaterializationError::RevisionExhausted| {
+                    SessionDefinitionDecisionError::RevisionExhausted
+                },
+            )?
+            .unwrap_or_else(|| current_definition.workspace().clone());
+        Ok(SessionDefinitionDecision::Publish(SessionDefinition::new(
+            current_definition.session_id(),
+            next_revision,
+            current_definition.agent(),
+            workspace,
+            patched_definition.model().clone(),
+            patched_definition.prompts().clone(),
+            self.owner_timestamp,
+        )))
+    }
+}
+
+impl fmt::Debug for SealedSessionDefinitionAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionDefinitionAttempt")
+            .field("session_id", &"redacted")
+            .field("expected_revision", &self.expected_revision)
+            .field("workspace_present", &self.workspace.is_some())
+            .field("model_present", &self.model.is_some())
+            .field("prompts_present", &self.prompts.is_some())
+            .field("owner_timestamp", &"redacted")
+            .finish()
+    }
+}
+
+/// Lifecycle-owned semantic input to the explicit same-Agent Session upgrade path. `None`
+/// resolves the authoritative current Agent revision under the Agent read gate; `Some` pins the
+/// exact retained revision supplied by the caller. It is intentionally separate from the closed
+/// ordinary definition patch so an AgentRevisionRef cannot be smuggled through that path.
+pub(crate) struct SealedSessionAgentUpgradeAttempt {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRef>,
+    owner_timestamp: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionAgentUpgradeDecisionError {
+    #[error("Session definition compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Session is archived")]
+    SessionArchived,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session upgrade targets another Agent")]
+    AgentMismatch,
+    #[error("Agent is disabled")]
+    AgentDisabled,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent revision is unavailable")]
+    RevisionUnavailable,
+    #[error("Session definition revision is exhausted")]
+    RevisionExhausted,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the sealed decision keeps the complete immutable candidate in one owner value"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionAgentUpgradeDecision {
+    NoChange,
+    Publish(SessionDefinition),
+}
+
+impl SealedSessionAgentUpgradeAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Session upgrade command constructor consumes this sealed seam"
+    )]
+    pub(crate) const fn new(
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+        owner_timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            session_id,
+            expected_revision,
+            target,
+            owner_timestamp,
+        }
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn target(&self) -> Option<AgentRevisionRef> {
+        self.target
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn expected_revision(&self) -> SessionDefinitionRevision {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn owner_timestamp(&self) -> Timestamp {
+        self.owner_timestamp
+    }
+
+    /// Resolves and validates the exact target while both private lifecycle gates are held. The
+    /// caller supplies only authoritative Agent facts observed under the Agent read gate: its
+    /// current revision, status, and retained-definition membership for an explicit target.
+    pub(crate) fn decide(
+        &self,
+        current_lifecycle: SessionLifecycle,
+        current_definition: &SessionDefinition,
+        agent_status: AgentStatus,
+        agent_current_revision: AgentRevision,
+        target_is_retained: bool,
+    ) -> Result<SessionAgentUpgradeDecision, SessionAgentUpgradeDecisionError> {
+        if current_definition.revision() != self.expected_revision {
+            return Err(SessionAgentUpgradeDecisionError::StaleRevision);
+        }
+        match current_lifecycle {
+            SessionLifecycle::Open => {}
+            SessionLifecycle::Archived => {
+                return Err(SessionAgentUpgradeDecisionError::SessionArchived);
+            }
+            SessionLifecycle::Deleted => {
+                return Err(SessionAgentUpgradeDecisionError::SessionDeleted);
+            }
+        }
+
+        let target = self.target.unwrap_or_else(|| {
+            AgentRevisionRef::new(
+                current_definition.agent().agent_id(),
+                agent_current_revision,
+            )
+        });
+        if target.agent_id() != current_definition.agent().agent_id() {
+            return Err(SessionAgentUpgradeDecisionError::AgentMismatch);
+        }
+        match agent_status {
+            AgentStatus::Enabled => {}
+            AgentStatus::Disabled => {
+                return Err(SessionAgentUpgradeDecisionError::AgentDisabled);
+            }
+            AgentStatus::Deleted => {
+                return Err(SessionAgentUpgradeDecisionError::AgentDeleted);
+            }
+        }
+        if !target_is_retained {
+            return Err(SessionAgentUpgradeDecisionError::RevisionUnavailable);
+        }
+        if target == current_definition.agent() {
+            return Ok(SessionAgentUpgradeDecision::NoChange);
+        }
+        let next_revision = current_definition
+            .revision()
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(SessionDefinitionRevision::new)
+            .ok_or(SessionAgentUpgradeDecisionError::RevisionExhausted)?;
+        Ok(SessionAgentUpgradeDecision::Publish(
+            SessionDefinition::new(
+                current_definition.session_id(),
+                next_revision,
+                target,
+                current_definition.workspace().clone(),
+                current_definition.model().clone(),
+                current_definition.prompts().clone(),
+                self.owner_timestamp,
+            ),
+        ))
+    }
+}
+
+impl fmt::Debug for SealedSessionAgentUpgradeAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionAgentUpgradeAttempt")
+            .field("session_id", &"redacted")
+            .field("expected_revision", &self.expected_revision)
+            .field("target_present", &self.target.is_some())
+            .field("owner_timestamp", &"redacted")
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SessionMetadataError {
     #[error("session metadata name must be non-empty")]
@@ -1637,12 +1965,14 @@ mod tests {
         AgentDefinitionDecision, AgentMetadataDecision, AgentMetadataDecisionError,
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
         SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
-        SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
-        SealedSessionLifecycleAttempt, SealedSessionMetadataAttempt, SessionDefinition,
-        SessionForkAttemptError, SessionLifecycle, SessionLifecycleAction,
-        SessionLifecycleDecision, SessionLifecycleDecisionError, SessionMetadataDecision,
-        SessionMetadataDecisionError, SessionMetadataDescriptionPatch, SessionMetadataNamePatch,
-        SessionModelConfig,
+        SealedAgentStatusAttempt, SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt,
+        SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
+        SealedSessionMetadataAttempt, SessionAgentUpgradeDecision,
+        SessionAgentUpgradeDecisionError, SessionDefinition, SessionDefinitionDecision,
+        SessionDefinitionDecisionError, SessionForkAttemptError, SessionLifecycle,
+        SessionLifecycleAction, SessionLifecycleDecision, SessionLifecycleDecisionError,
+        SessionMetadataDecision, SessionMetadataDecisionError, SessionMetadataDescriptionPatch,
+        SessionMetadataNamePatch, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -1651,8 +1981,9 @@ mod tests {
         SessionId, WorkspaceRevision,
     };
     use crate::workspace::{
-        RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
-        WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
+        RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
+        WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy,
+        lower_workspace,
     };
 
     #[test]
@@ -2421,5 +2752,541 @@ mod tests {
         assert_eq!(definition.created_at(), timestamp);
         assert_eq!(metadata.revision().to_string(), "smr_1");
         assert_eq!(metadata.updated_at(), timestamp);
+    }
+
+    fn definition_test_workspace(revision: u64, location: &str) -> Workspace {
+        let uri = if cfg!(windows) {
+            format!("file:///C:/workspace/{location}")
+        } else {
+            format!("file:///workspace/{location}")
+        };
+        lower_workspace(
+            WorkspaceDefinitionInput::new(
+                WorkspaceRootInput::new(
+                    "repo".parse().unwrap(),
+                    uri.parse().unwrap(),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(true, true),
+                ),
+                Vec::new(),
+                WorkspaceCwdSpec::new("repo".parse().unwrap(), "src".parse().unwrap()),
+            )
+            .unwrap(),
+            WorkspaceRevision::new(NonZeroU64::new(revision).unwrap()),
+            WorkspacePathTarget::current(),
+        )
+        .unwrap()
+    }
+
+    fn definition_test_model(model: &str) -> SessionModelConfig {
+        SessionModelConfig::new(
+            ModelSelection::new("provider".parse().unwrap(), model.parse().unwrap()),
+            ReasoningPreference::Auto,
+            Some(NonZeroU32::new(2048).unwrap()),
+        )
+    }
+
+    fn definition_test_prompts(values: &[&str]) -> SessionPromptSelection {
+        SessionPromptSelection::new(values.iter().map(|value| value.parse().unwrap()).collect())
+            .unwrap()
+    }
+
+    fn definition_test_current(
+        session_revision: u64,
+        agent_revision: u64,
+        workspace: Workspace,
+        model: &str,
+        prompts: &[&str],
+    ) -> SessionDefinition {
+        SessionDefinition::new(
+            "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+            SessionDefinitionRevision::new(NonZeroU64::new(session_revision).unwrap()),
+            AgentRevisionRef::new(
+                "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+                AgentRevision::new(NonZeroU64::new(agent_revision).unwrap()),
+            ),
+            workspace,
+            definition_test_model(model),
+            definition_test_prompts(prompts),
+            "2026-08-03T10:00:00.123Z".parse().unwrap(),
+        )
+    }
+
+    #[test]
+    fn sealed_session_definition_patch_matrix_is_authoritative_and_redacted() {
+        let session_id: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let current_workspace = definition_test_workspace(1, "current-secret-path");
+        let current = definition_test_current(
+            1,
+            1,
+            current_workspace.clone(),
+            "model-current-secret",
+            &["prompt-current-secret"],
+        );
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let empty = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            None,
+            None,
+            None,
+            owner_timestamp,
+        );
+
+        assert_eq!(
+            empty
+                .decide(SessionLifecycle::Deleted, &current)
+                .unwrap_err(),
+            SessionDefinitionDecisionError::SessionDeleted
+        );
+        let stale_current = definition_test_current(
+            2,
+            1,
+            current_workspace.clone(),
+            "model-current-secret",
+            &["prompt-current-secret"],
+        );
+        assert_eq!(
+            empty
+                .decide(SessionLifecycle::Deleted, &stale_current)
+                .unwrap_err(),
+            SessionDefinitionDecisionError::StaleRevision,
+            "stale wins before lifecycle and no-op"
+        );
+        assert_eq!(
+            empty
+                .decide(SessionLifecycle::Archived, &current)
+                .unwrap_err(),
+            SessionDefinitionDecisionError::SessionArchived
+        );
+        assert_eq!(
+            empty.decide(SessionLifecycle::Open, &current).unwrap(),
+            SessionDefinitionDecision::NoChange
+        );
+
+        let prompt_only = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            None,
+            None,
+            Some(definition_test_prompts(&[
+                "prompt-current-secret",
+                "prompt-new",
+            ])),
+            owner_timestamp,
+        )
+        .decide(SessionLifecycle::Open, &current)
+        .unwrap();
+        let model_only = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            None,
+            Some(definition_test_model("model-new")),
+            None,
+            owner_timestamp,
+        )
+        .decide(SessionLifecycle::Open, &current)
+        .unwrap();
+        let workspace_only = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            Some(definition_test_workspace(99, "workspace-new")),
+            None,
+            None,
+            owner_timestamp,
+        )
+        .decide(SessionLifecycle::Open, &current)
+        .unwrap();
+        let combined = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            Some(definition_test_workspace(42, "workspace-combined")),
+            Some(definition_test_model("model-combined")),
+            Some(definition_test_prompts(&["prompt-combined"])),
+            owner_timestamp,
+        )
+        .decide(SessionLifecycle::Open, &current)
+        .unwrap();
+
+        let SessionDefinitionDecision::Publish(prompt_only) = prompt_only else {
+            panic!("prompt-only replacement publishes");
+        };
+        assert_eq!(prompt_only.revision().get(), 2);
+        assert_eq!(
+            prompt_only.workspace().revision(),
+            current.workspace().revision()
+        );
+        let SessionDefinitionDecision::Publish(model_only) = model_only else {
+            panic!("model-only replacement publishes");
+        };
+        assert_eq!(model_only.revision().get(), 2);
+        assert_eq!(
+            model_only.workspace().revision(),
+            current.workspace().revision()
+        );
+        let SessionDefinitionDecision::Publish(workspace_only) = workspace_only else {
+            panic!("Workspace-only replacement publishes");
+        };
+        assert_eq!(workspace_only.revision().get(), 2);
+        assert_eq!(workspace_only.workspace().revision().get(), 2);
+        let SessionDefinitionDecision::Publish(combined) = combined else {
+            panic!("combined replacement publishes");
+        };
+        assert_eq!(combined.revision().get(), 2);
+        assert_eq!(combined.workspace().revision().get(), 2);
+
+        let equivalent_workspace_with_model_change = SealedSessionDefinitionAttempt::new(
+            session_id,
+            current.revision(),
+            Some(definition_test_workspace(777, "current-secret-path")),
+            Some(definition_test_model("model-equivalent-workspace")),
+            None,
+            owner_timestamp,
+        )
+        .decide(SessionLifecycle::Open, &current)
+        .unwrap();
+        let SessionDefinitionDecision::Publish(equivalent_workspace_with_model_change) =
+            equivalent_workspace_with_model_change
+        else {
+            panic!("the model change publishes");
+        };
+        assert_eq!(
+            equivalent_workspace_with_model_change
+                .workspace()
+                .revision(),
+            current.workspace().revision(),
+            "an arbitrary candidate revision never replaces the authoritative Workspace revision"
+        );
+
+        let exhausted_session = definition_test_current(
+            u64::MAX,
+            1,
+            current_workspace.clone(),
+            "model-current-secret",
+            &["prompt-current-secret"],
+        );
+        let changed_model = SealedSessionDefinitionAttempt::new(
+            session_id,
+            exhausted_session.revision(),
+            None,
+            Some(definition_test_model("model-after-exhaustion")),
+            None,
+            owner_timestamp,
+        );
+        assert_eq!(
+            changed_model
+                .decide(SessionLifecycle::Open, &exhausted_session)
+                .unwrap_err(),
+            SessionDefinitionDecisionError::RevisionExhausted
+        );
+        let exhausted_empty = SealedSessionDefinitionAttempt::new(
+            session_id,
+            exhausted_session.revision(),
+            None,
+            None,
+            None,
+            owner_timestamp,
+        );
+        assert_eq!(
+            exhausted_empty.decide(SessionLifecycle::Open, &exhausted_session),
+            Ok(SessionDefinitionDecision::NoChange)
+        );
+
+        let exhausted_workspace = definition_test_current(
+            1,
+            1,
+            definition_test_workspace(u64::MAX, "current-secret-path"),
+            "model-current-secret",
+            &["prompt-current-secret"],
+        );
+        assert_eq!(
+            SealedSessionDefinitionAttempt::new(
+                session_id,
+                exhausted_workspace.revision(),
+                Some(definition_test_workspace(1, "workspace-overflow")),
+                None,
+                None,
+                owner_timestamp,
+            )
+            .decide(SessionLifecycle::Open, &exhausted_workspace)
+            .unwrap_err(),
+            SessionDefinitionDecisionError::RevisionExhausted,
+            "only a changed Workspace asks for a next WorkspaceRevision"
+        );
+        assert!(matches!(
+            SealedSessionDefinitionAttempt::new(
+                session_id,
+                exhausted_workspace.revision(),
+                Some(definition_test_workspace(99, "current-secret-path")),
+                Some(definition_test_model("model-after-workspace-overflow")),
+                None,
+                owner_timestamp,
+            )
+            .decide(SessionLifecycle::Open, &exhausted_workspace),
+            Ok(SessionDefinitionDecision::Publish(_))
+        ));
+
+        let debug = format!(
+            "{:?}",
+            SealedSessionDefinitionAttempt::new(
+                session_id,
+                current.revision(),
+                Some(definition_test_workspace(1, "debug-path-secret")),
+                Some(definition_test_model("debug-model-secret")),
+                Some(definition_test_prompts(&["debug-prompt-secret"])),
+                "2026-08-03T10:00:05.999Z".parse().unwrap(),
+            )
+        );
+        for secret in [
+            "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "debug-model-secret",
+            "debug-prompt-secret",
+            "debug-path-secret",
+            "10:00:05.999",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "definition debug leaked {secret:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sealed_session_agent_upgrade_matrix_preserves_target_and_gate_ordering_facts() {
+        let session_id: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let other_agent_id: AgentId = "agt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let current = definition_test_current(
+            1,
+            1,
+            definition_test_workspace(1, "upgrade-workspace"),
+            "upgrade-model",
+            &["upgrade-prompt"],
+        );
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let current_agent = AgentRevision::new(NonZeroU64::new(2).unwrap());
+        let historical_agent = current.agent().revision();
+        let latest = SealedSessionAgentUpgradeAttempt::new(
+            session_id,
+            current.revision(),
+            None,
+            owner_timestamp,
+        );
+
+        assert_eq!(
+            SealedSessionAgentUpgradeAttempt::new(
+                session_id,
+                "sdr_2".parse().unwrap(),
+                None,
+                owner_timestamp,
+            )
+            .decide(
+                SessionLifecycle::Deleted,
+                &current,
+                AgentStatus::Deleted,
+                current_agent,
+                false,
+            )
+            .unwrap_err(),
+            SessionAgentUpgradeDecisionError::StaleRevision,
+            "stale wins before lifecycle, status, and retention"
+        );
+        assert_eq!(
+            latest
+                .decide(
+                    SessionLifecycle::Archived,
+                    &current,
+                    AgentStatus::Enabled,
+                    current_agent,
+                    true,
+                )
+                .unwrap_err(),
+            SessionAgentUpgradeDecisionError::SessionArchived
+        );
+        assert_eq!(
+            latest
+                .decide(
+                    SessionLifecycle::Deleted,
+                    &current,
+                    AgentStatus::Enabled,
+                    current_agent,
+                    true,
+                )
+                .unwrap_err(),
+            SessionAgentUpgradeDecisionError::SessionDeleted
+        );
+        assert_eq!(
+            SealedSessionAgentUpgradeAttempt::new(
+                session_id,
+                current.revision(),
+                Some(AgentRevisionRef::new(other_agent_id, current_agent,)),
+                owner_timestamp,
+            )
+            .decide(
+                SessionLifecycle::Open,
+                &current,
+                AgentStatus::Deleted,
+                current_agent,
+                false,
+            )
+            .unwrap_err(),
+            SessionAgentUpgradeDecisionError::AgentMismatch,
+            "Agent identity wins before status and retention"
+        );
+
+        for status in [AgentStatus::Disabled, AgentStatus::Deleted] {
+            for target in [
+                None,
+                Some(AgentRevisionRef::new(agent_id, current_agent)),
+                Some(AgentRevisionRef::new(agent_id, historical_agent)),
+                Some(current.agent()),
+            ] {
+                assert_eq!(
+                    SealedSessionAgentUpgradeAttempt::new(
+                        session_id,
+                        current.revision(),
+                        target,
+                        owner_timestamp,
+                    )
+                    .decide(
+                        SessionLifecycle::Open,
+                        &current,
+                        status,
+                        current_agent,
+                        true
+                    )
+                    .unwrap_err(),
+                    match status {
+                        AgentStatus::Disabled => SessionAgentUpgradeDecisionError::AgentDisabled,
+                        AgentStatus::Deleted => SessionAgentUpgradeDecisionError::AgentDeleted,
+                        AgentStatus::Enabled => unreachable!(),
+                    }
+                );
+            }
+        }
+
+        assert_eq!(
+            SealedSessionAgentUpgradeAttempt::new(
+                session_id,
+                current.revision(),
+                Some(AgentRevisionRef::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(3).unwrap()),
+                )),
+                owner_timestamp,
+            )
+            .decide(
+                SessionLifecycle::Open,
+                &current,
+                AgentStatus::Enabled,
+                current_agent,
+                false,
+            )
+            .unwrap_err(),
+            SessionAgentUpgradeDecisionError::RevisionUnavailable
+        );
+
+        let exact_current = SealedSessionAgentUpgradeAttempt::new(
+            session_id,
+            current.revision(),
+            Some(current.agent()),
+            owner_timestamp,
+        )
+        .decide(
+            SessionLifecycle::Open,
+            &current,
+            AgentStatus::Enabled,
+            current_agent,
+            true,
+        )
+        .unwrap();
+        assert_eq!(exact_current, SessionAgentUpgradeDecision::NoChange);
+        assert!(matches!(
+            latest
+                .decide(
+                    SessionLifecycle::Open,
+                    &current,
+                    AgentStatus::Enabled,
+                    current_agent,
+                    true,
+                )
+                .unwrap(),
+            SessionAgentUpgradeDecision::Publish(_)
+        ));
+
+        let SessionAgentUpgradeDecision::Publish(upgraded) = latest
+            .decide(
+                SessionLifecycle::Open,
+                &current,
+                AgentStatus::Enabled,
+                current_agent,
+                true,
+            )
+            .unwrap()
+        else {
+            panic!("the latest Agent revision publishes");
+        };
+        assert_eq!(upgraded.revision().get(), 2);
+        assert_eq!(
+            upgraded.agent(),
+            AgentRevisionRef::new(agent_id, current_agent)
+        );
+        let rollback = SealedSessionAgentUpgradeAttempt::new(
+            session_id,
+            upgraded.revision(),
+            Some(current.agent()),
+            "2026-08-03T10:00:06.000Z".parse().unwrap(),
+        )
+        .decide(
+            SessionLifecycle::Open,
+            &upgraded,
+            AgentStatus::Enabled,
+            current_agent,
+            true,
+        )
+        .unwrap();
+        let SessionAgentUpgradeDecision::Publish(rollback) = rollback else {
+            panic!("the retained historical Agent revision publishes");
+        };
+        assert_eq!(rollback.revision().get(), 3);
+        assert_eq!(rollback.agent(), current.agent());
+
+        let exhausted = definition_test_current(
+            u64::MAX,
+            1,
+            definition_test_workspace(1, "upgrade-workspace"),
+            "upgrade-model",
+            &["upgrade-prompt"],
+        );
+        let exhausted_latest = SealedSessionAgentUpgradeAttempt::new(
+            session_id,
+            exhausted.revision(),
+            None,
+            owner_timestamp,
+        );
+        assert_eq!(
+            exhausted_latest
+                .decide(
+                    SessionLifecycle::Open,
+                    &exhausted,
+                    AgentStatus::Enabled,
+                    current_agent,
+                    true,
+                )
+                .unwrap_err(),
+            SessionAgentUpgradeDecisionError::RevisionExhausted
+        );
+
+        let debug = format!(
+            "{:?}",
+            SealedSessionAgentUpgradeAttempt::new(
+                session_id,
+                current.revision(),
+                Some(AgentRevisionRef::new(agent_id, current_agent)),
+                "2026-08-03T10:00:05.999Z".parse().unwrap(),
+            )
+        );
+        assert!(!debug.contains("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!debug.contains("10:00:05.999"));
     }
 }
