@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126–0135冻结async execution、conversation/wire与public payload基础；ADR 0136冻结DurableState/Store V1/root lease（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new），ADR 0137冻结Tokio owner-tracked foundation。M5.0 recovery、root lease、owner-tracked actor、permanent reservation inventory、crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication、unloaded RecordedHistory + Genesis Session Fork tracer，以及Agent status/definition/metadata与Session metadata G2 CAS tracers已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Session definition/lifecycle update/CAS及完整cross-platform native matrix仍待实现；后续见[开发计划](development-plan.md)。 |
+| V2 | 当前权威架构。ADR 0126–0135冻结async execution、conversation/wire与public payload基础；ADR 0136冻结DurableState/Store V1/root lease（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new），ADR 0137冻结Tokio owner-tracked foundation。M5.0 recovery、root lease、owner-tracked actor、permanent reservation inventory、crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication、unloaded RecordedHistory + Genesis Session Fork tracer，以及Agent status/definition/metadata、Session metadata G2 CAS与Session lifecycle existing-head action tracers已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Session definition update/CAS、Session lifecycle Runtime residency integration及完整cross-platform native matrix仍待实现；后续见[开发计划](development-plan.md)。 |
 
 权威顺序：本文与`docs/modules/` → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 

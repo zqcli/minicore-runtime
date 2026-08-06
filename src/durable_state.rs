@@ -22,8 +22,9 @@ use crate::agent_session_lifecycle::{
     AgentMetadataDecision, AgentMetadataDecisionError, AgentRevisionRef, AgentStatus,
     AgentStatusDecision, AgentStatusDecisionError, SealedAgentCreateAttempt,
     SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
-    SealedSessionCreateAttempt, SealedSessionForkAttempt, SealedSessionMetadataAttempt,
-    SessionDefinition, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+    SealedSessionCreateAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
+    SealedSessionMetadataAttempt, SessionDefinition, SessionForkProvenance, SessionLifecycle,
+    SessionLifecycleDecision, SessionLifecycleDecisionError, SessionMetadata,
     SessionMetadataDecision, SessionMetadataDecisionError,
     agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
@@ -919,6 +920,50 @@ impl DurableSessionMetadataOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableSessionLifecycleError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Session was not found")]
+    SessionNotFound,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session lifecycle transition is invalid")]
+    InvalidLifecycleTransition,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending Session lifecycle command consumes this private durable outcome"
+)]
+#[derive(Clone, Debug)]
+pub(crate) enum DurableSessionLifecycleOutcome {
+    NoChange(Arc<DurableSessionHead>),
+    Updated(Arc<DurableSessionHead>),
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending Session lifecycle command consumes these outcome projections"
+)]
+impl DurableSessionLifecycleOutcome {
+    pub(crate) fn head(&self) -> &Arc<DurableSessionHead> {
+        match self {
+            Self::NoChange(head) | Self::Updated(head) => head,
+        }
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        matches!(self, Self::Updated(_))
+    }
+}
+
 struct CreateAgentRequest {
     attempt: SealedAgentCreateAttempt,
     response: Option<oneshot::Sender<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>>,
@@ -1231,6 +1276,54 @@ impl SetSessionMetadataWaiter {
     }
 }
 
+struct SetSessionLifecycleRequest {
+    attempt: SealedSessionLifecycleAttempt,
+    response: Option<
+        oneshot::Sender<Result<DurableSessionLifecycleOutcome, DurableSessionLifecycleError>>,
+    >,
+    closing: CancellationToken,
+    permit: Option<SessionMutationPermit>,
+}
+
+impl SetSessionLifecycleRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<DurableSessionLifecycleOutcome, DurableSessionLifecycleError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject(&mut self, error: DurableSessionLifecycleError) {
+        self.settle(Err(error));
+    }
+}
+
+impl Drop for SetSessionLifecycleRequest {
+    fn drop(&mut self) {
+        let error = if self.closing.is_cancelled() {
+            DurableSessionLifecycleError::Closing
+        } else {
+            DurableSessionLifecycleError::InternalDispatchUnavailable
+        };
+        self.reject(error);
+    }
+}
+
+struct SetSessionLifecycleWaiter {
+    response:
+        oneshot::Receiver<Result<DurableSessionLifecycleOutcome, DurableSessionLifecycleError>>,
+}
+
+impl SetSessionLifecycleWaiter {
+    async fn wait(self) -> Result<DurableSessionLifecycleOutcome, DurableSessionLifecycleError> {
+        self.response.await.unwrap_or(Err(
+            DurableSessionLifecycleError::InternalDispatchUnavailable,
+        ))
+    }
+}
+
 /// The private per-Agent synchronization shared by durable publication and future initiating
 /// Input admission. Read permits preserve an Enabled epoch; Agent mutation takes the exclusive
 /// side before changing that epoch.
@@ -1511,6 +1604,7 @@ enum DurableStateActorRequest {
     SetAgentDefinition(SetAgentDefinitionRequest),
     CreateSession(CreateSessionRequest),
     SetSessionMetadata(SetSessionMetadataRequest),
+    SetSessionLifecycle(SetSessionLifecycleRequest),
     ForkSession(ForkSessionRequest),
     #[cfg(test)]
     Probe(DurableStateActorProbe),
@@ -1578,6 +1672,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::SetSessionMetadata(request) => {
                 request.reject(DurableSessionMetadataError::Closing);
             }
+            DurableStateActorRequest::SetSessionLifecycle(request) => {
+                request.reject(DurableSessionLifecycleError::Closing);
+            }
             DurableStateActorRequest::ForkSession(request) => {
                 request.reject(DurableSessionForkError::Closing);
             }
@@ -1616,6 +1713,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::SetSessionMetadata(request) => {
                 request.reject(DurableSessionMetadataError::InternalDispatchUnavailable);
             }
+            DurableStateActorRequest::SetSessionLifecycle(request) => {
+                request.reject(DurableSessionLifecycleError::InternalDispatchUnavailable);
+            }
             DurableStateActorRequest::ForkSession(request) => {
                 request.reject(DurableSessionForkError::InternalDispatchUnavailable);
             }
@@ -1644,6 +1744,7 @@ impl DurableStateActorRequestEnvelope {
             | DurableStateActorRequest::SetAgentDefinition(_)
             | DurableStateActorRequest::CreateSession(_)
             | DurableStateActorRequest::SetSessionMetadata(_)
+            | DurableStateActorRequest::SetSessionLifecycle(_)
             | DurableStateActorRequest::ForkSession(_)
             | DurableStateActorRequest::ReserveAgent(_)
             | DurableStateActorRequest::ReserveSession(_) => None,
@@ -2131,6 +2232,46 @@ impl DurableStateActorHandle {
         };
         permit.send(envelope);
         SetSessionMetadataWaiter { response: waiter }
+    }
+
+    async fn enqueue_session_lifecycle(
+        &self,
+        attempt: SealedSessionLifecycleAttempt,
+    ) -> SetSessionLifecycleWaiter {
+        let (response, waiter) = oneshot::channel();
+        let request = SetSessionLifecycleRequest {
+            attempt,
+            response: Some(response),
+            closing: self.closing.clone(),
+            permit: None,
+        };
+        let mut envelope = DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::SetSessionLifecycle(request),
+            #[cfg(test)]
+            response: None,
+            #[cfg(test)]
+            drop_error: ActorRequestError::Unavailable,
+        };
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                envelope.reject_closing();
+                return SetSessionLifecycleWaiter { response: waiter };
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if self.closing.is_cancelled() {
+                        envelope.reject_closing();
+                    } else {
+                        envelope.reject_unavailable();
+                    }
+                    return SetSessionLifecycleWaiter { response: waiter };
+                }
+            },
+        };
+        permit.send(envelope);
+        SetSessionLifecycleWaiter { response: waiter }
     }
 
     async fn enqueue_session_fork(&self, attempt: SealedSessionForkAttempt) -> ForkSessionWaiter {
@@ -2746,6 +2887,59 @@ impl DurableStateActor {
                                         self.task_context.request_closing();
                                         self.closing.cancel();
                                         metadata.permit.take();
+                                        self.close_receiver_and_reject_queued().await;
+                                        return true;
+                                    }
+                                }
+                            }
+                            DurableStateActorRequest::SetSessionLifecycle(lifecycle) => {
+                                match self.process_session_lifecycle(lifecycle).await {
+                                    SessionLifecycleMutationWorkResult::NoChange(head) => {
+                                        lifecycle.settle(Ok(
+                                            DurableSessionLifecycleOutcome::NoChange(head),
+                                        ));
+                                        lifecycle.permit.take();
+                                    }
+                                    SessionLifecycleMutationWorkResult::Published {
+                                        entry,
+                                        close_required,
+                                    } => {
+                                        let head = Arc::clone(&entry.current_head);
+                                        lock(&self.published_sessions)
+                                            .insert(head.session_id(), entry);
+                                        lifecycle.settle(Ok(
+                                            DurableSessionLifecycleOutcome::Updated(head),
+                                        ));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            lifecycle.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        lifecycle.permit.take();
+                                    }
+                                    SessionLifecycleMutationWorkResult::Ordinary {
+                                        error,
+                                        close_required,
+                                    } => {
+                                        lifecycle.settle(Err(error));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            lifecycle.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        lifecycle.permit.take();
+                                    }
+                                    SessionLifecycleMutationWorkResult::Poisoned => {
+                                        lifecycle.settle(Err(
+                                            DurableSessionLifecycleError::InternalDispatchUnavailable,
+                                        ));
+                                        self.task_context.request_closing();
+                                        self.closing.cancel();
+                                        lifecycle.permit.take();
                                         self.close_receiver_and_reject_queued().await;
                                         return true;
                                     }
@@ -3540,6 +3734,144 @@ impl DurableStateActor {
                     .permit
                     .as_ref()
                     .expect("the Session metadata request retains its exclusive permit")
+                    .clone(),
+                self.closing.clone(),
+                Arc::clone(&self.active_commit_barrier),
+            )
+            .await,
+        )
+    }
+
+    /// Admits only the durable half of a Session lifecycle mutation. For Archive/Delete, the
+    /// future Runtime/residency owner must not merely observe `Unloaded` before calling this
+    /// seam: it must establish and retain exclusion against concurrent Load/residency changes
+    /// from that check through completion of this durable operation. DurableState remains unaware
+    /// of residency and performs no such validation or exclusion.
+    async fn process_session_lifecycle(
+        &mut self,
+        request: &mut SetSessionLifecycleRequest,
+    ) -> SessionLifecycleMutationWorkResult {
+        let session_id = request.attempt.session_id();
+        let exists = lock(&self.published_sessions).contains_key(&session_id)
+            || self.recovered_sessions.contains_key(&session_id);
+        if !exists {
+            return SessionLifecycleMutationWorkResult::Ordinary {
+                error: DurableSessionLifecycleError::SessionNotFound,
+                close_required: false,
+            };
+        }
+        let mutation_permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                return SessionLifecycleMutationWorkResult::Ordinary {
+                    error: DurableSessionLifecycleError::Closing,
+                    close_required: false,
+                };
+            }
+            permit = self.session_lifecycle_gates.acquire_mutation(session_id) => permit,
+        };
+        request.permit = Some(mutation_permit);
+        let current = {
+            let published = lock(&self.published_sessions);
+            published
+                .get(&session_id)
+                .cloned()
+                .or_else(|| self.recovered_sessions.get(&session_id).cloned())
+        };
+        let Some(current) = current else {
+            return SessionLifecycleMutationWorkResult::Poisoned;
+        };
+        let target_lifecycle = match request.attempt.decide(current.current_head.lifecycle()) {
+            Ok(SessionLifecycleDecision::NoChange) => {
+                return SessionLifecycleMutationWorkResult::NoChange(Arc::clone(
+                    &current.current_head,
+                ));
+            }
+            Ok(SessionLifecycleDecision::Publish(lifecycle)) => lifecycle,
+            Err(SessionLifecycleDecisionError::SessionDeleted) => {
+                return SessionLifecycleMutationWorkResult::Ordinary {
+                    error: DurableSessionLifecycleError::SessionDeleted,
+                    close_required: false,
+                };
+            }
+            Err(SessionLifecycleDecisionError::InvalidTransition) => {
+                return SessionLifecycleMutationWorkResult::Ordinary {
+                    error: DurableSessionLifecycleError::InvalidLifecycleTransition,
+                    close_required: false,
+                };
+            }
+        };
+        let next_generation_value = match current
+            .current_head
+            .storage_generation()
+            .get()
+            .checked_add(1)
+        {
+            Some(value) if value as usize <= GENERATION_ENTRY_CAP => value,
+            _ => {
+                return SessionLifecycleMutationWorkResult::Ordinary {
+                    error: DurableSessionLifecycleError::DurableStateTooLarge,
+                    close_required: false,
+                };
+            }
+        };
+        let Some(next_generation) = StorageGeneration::new(next_generation_value) else {
+            return SessionLifecycleMutationWorkResult::Poisoned;
+        };
+        let head = match DurableSessionHead::new(
+            session_id,
+            next_generation,
+            Some(current.current_head.storage_generation()),
+            current.current_head.current_definition_revision(),
+            current.current_head.current_definition_storage_generation(),
+            current.current_head.metadata().clone(),
+            target_lifecycle,
+            current.current_head.fork_provenance().cloned(),
+            current.current_head.created_at(),
+        ) {
+            Ok(head) => Arc::new(head),
+            Err(_) => return SessionLifecycleMutationWorkResult::Poisoned,
+        };
+        let pinned_agent = current.current_definition.agent();
+        let agent_id = pinned_agent.agent_id();
+        let agent = {
+            let published = lock(&self.published_agents);
+            published
+                .get(&agent_id)
+                .or_else(|| self.recovered_agents.get(&agent_id))
+                .and_then(|entry| session_agent_basis(entry, pinned_agent))
+        };
+        let Some(agent) = agent else {
+            return SessionLifecycleMutationWorkResult::Poisoned;
+        };
+        let agents = BTreeMap::from([(agent_id, agent)]);
+        if validate_session_generation_transition(
+            session_id,
+            next_generation,
+            &current.current_head,
+            &current.current_definition,
+            &head,
+            None,
+            &agents,
+        )
+        .is_err()
+        {
+            return SessionLifecycleMutationWorkResult::Poisoned;
+        }
+        map_session_lifecycle_existing_generation_result(
+            publish_session_existing_generation(
+                self.task_context.clone(),
+                Arc::clone(&self.lease),
+                Arc::clone(&self.filesystem),
+                self.root.clone(),
+                self.directory_sync,
+                current,
+                head,
+                Arc::new(agents),
+                request
+                    .permit
+                    .as_ref()
+                    .expect("the Session lifecycle request retains its exclusive permit")
                     .clone(),
                 self.closing.clone(),
                 Arc::clone(&self.active_commit_barrier),
@@ -4507,6 +4839,19 @@ enum SessionMetadataMutationWorkResult {
     Poisoned,
 }
 
+enum SessionLifecycleMutationWorkResult {
+    NoChange(Arc<DurableSessionHead>),
+    Published {
+        entry: DurableSessionCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: DurableSessionLifecycleError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
 #[derive(Clone)]
 enum SessionForkPublicationWorkResult {
     Published {
@@ -5183,6 +5528,38 @@ fn map_session_metadata_existing_generation_result(
     }
 }
 
+fn map_session_lifecycle_existing_generation_result(
+    result: SessionExistingGenerationWorkResult,
+) -> SessionLifecycleMutationWorkResult {
+    match result {
+        SessionExistingGenerationWorkResult::Published {
+            entry,
+            close_required,
+        } => SessionLifecycleMutationWorkResult::Published {
+            entry,
+            close_required,
+        },
+        SessionExistingGenerationWorkResult::Ordinary {
+            error,
+            close_required,
+        } => SessionLifecycleMutationWorkResult::Ordinary {
+            error: match error {
+                SessionExistingGenerationError::Closing => DurableSessionLifecycleError::Closing,
+                SessionExistingGenerationError::DurableStateTooLarge => {
+                    DurableSessionLifecycleError::DurableStateTooLarge
+                }
+                SessionExistingGenerationError::StorageUnavailable => {
+                    DurableSessionLifecycleError::StorageUnavailable
+                }
+            },
+            close_required,
+        },
+        SessionExistingGenerationWorkResult::Poisoned => {
+            SessionLifecycleMutationWorkResult::Poisoned
+        }
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the Agent existing-generation worker binds the fixed physical paths and exact facts"
@@ -5404,16 +5781,16 @@ fn publish_session_existing_generation_blocking(
         assert_eq!(
             agents.len(),
             1,
-            "Session metadata carries exactly one Agent basis into publication"
+            "Session existing-generation mutation carries exactly one Agent basis into publication"
         );
-        let basis = agents
-            .get(&pinned_agent.agent_id())
-            .expect("the Session metadata Agent basis matches the pinned Agent");
+        let basis = agents.get(&pinned_agent.agent_id()).expect(
+            "the Session existing-generation mutation Agent basis matches the pinned Agent",
+        );
         assert!(
             basis
                 .definition_index
                 .contains_key(&pinned_agent.revision()),
-            "the Session metadata Agent basis contains the pinned revision"
+            "the Session existing-generation mutation Agent basis contains the pinned revision"
         );
     }
     let session_id = head.session_id();
@@ -7964,6 +8341,26 @@ impl DurableState {
     ) -> Result<DurableSessionMetadataOutcome, DurableSessionMetadataError> {
         self.actor
             .enqueue_session_metadata(attempt)
+            .await
+            .wait()
+            .await
+    }
+
+    /// Publishes only the durable Session lifecycle head. For Archive/Delete, the future
+    /// Runtime/residency owner must not merely observe `Unloaded` before invoking this seam: it
+    /// must establish and retain exclusion against concurrent Load/residency changes from that
+    /// check through completion of this durable operation. DurableState remains unaware of
+    /// residency and performs no such validation or exclusion.
+    #[allow(
+        dead_code,
+        reason = "the pending Session lifecycle command consumes this durable action seam"
+    )]
+    pub(crate) async fn update_session_lifecycle(
+        &self,
+        attempt: SealedSessionLifecycleAttempt,
+    ) -> Result<DurableSessionLifecycleOutcome, DurableSessionLifecycleError> {
+        self.actor
+            .enqueue_session_lifecycle(attempt)
             .await
             .wait()
             .await
@@ -11495,9 +11892,9 @@ mod tests {
     use crate::agent_session_lifecycle::{
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind,
         SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
-        SealedSessionCreateAttempt, SealedSessionForkAttempt, SealedSessionMetadataAttempt,
-        SessionForkProvenance, SessionLifecycle, SessionMetadata, SessionMetadataDescriptionPatch,
-        SessionMetadataNamePatch, SessionModelConfig,
+        SealedSessionCreateAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
+        SealedSessionMetadataAttempt, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+        SessionMetadataDescriptionPatch, SessionMetadataNamePatch, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -12945,6 +13342,131 @@ mod tests {
             .await
             .expect("actor shutdown precedes root-lease release");
         reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_no_ops_and_invalid_edges_perform_zero_publication_io() {
+        for (name, shape) in [
+            ("archive-archived", 0_u8),
+            ("unarchive-open", 1_u8),
+            ("delete-deleted", 2_u8),
+            ("delete-open", 3_u8),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            if shape == 0 || shape == 2 {
+                create_session_generation(
+                    root.path(),
+                    SESSION_ONE,
+                    GENERATION_TWO,
+                    session_head_archived_g2_fixture(),
+                    None,
+                );
+            }
+            if shape == 2 {
+                create_session_generation(
+                    root.path(),
+                    SESSION_ONE,
+                    GENERATION_THREE,
+                    session_head_deleted_g3_fixture(),
+                    None,
+                );
+            }
+            let filesystem = Arc::new(
+                DeterministicPersistentFaultFilesystem::with_publication_faults([
+                    PublicationFault::Before(PublicationOperation::CreateGenerationDirectory),
+                ]),
+            );
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+            let original_head = state.session_head(session_id).unwrap();
+            let original_definition = state.session_current_definition(session_id).unwrap();
+            let attempt = match shape {
+                0 => SealedSessionLifecycleAttempt::archive(session_id),
+                1 => SealedSessionLifecycleAttempt::unarchive(session_id),
+                2 => SealedSessionLifecycleAttempt::delete(session_id),
+                3 => SealedSessionLifecycleAttempt::delete(session_id),
+                _ => unreachable!(),
+            };
+            let result = state.update_session_lifecycle(attempt).await;
+            match shape {
+                0 | 1 => {
+                    let outcome = result.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                    assert!(!outcome.changed(), "{name}");
+                    assert!(Arc::ptr_eq(&original_head, outcome.head()), "{name}");
+                }
+                2 => assert_eq!(
+                    result.unwrap_err(),
+                    super::DurableSessionLifecycleError::SessionDeleted,
+                    "{name}"
+                ),
+                3 => assert_eq!(
+                    result.unwrap_err(),
+                    super::DurableSessionLifecycleError::InvalidLifecycleTransition,
+                    "{name}"
+                ),
+                _ => unreachable!(),
+            }
+            assert!(Arc::ptr_eq(
+                &original_head,
+                &state.session_head(session_id).unwrap()
+            ));
+            assert!(Arc::ptr_eq(
+                &original_definition,
+                &state.session_current_definition(session_id).unwrap()
+            ));
+            assert!(
+                filesystem.publication_operations().is_empty(),
+                "{name} must not enter the publication worker"
+            );
+            state.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn absent_session_lifecycle_mutations_do_not_grow_gate_registry_or_publish() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::CreateGenerationDirectory),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let initial_gate_count = super::lock(&state.session_lifecycle_gates.gates).len();
+        assert_eq!(initial_gate_count, 0);
+
+        for session_id in [
+            session_candidate(200),
+            session_candidate(201),
+            session_candidate(202),
+        ] {
+            assert_eq!(
+                state
+                    .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+                    .await
+                    .unwrap_err(),
+                super::DurableSessionLifecycleError::SessionNotFound,
+                "an absent valid SessionId is rejected before gate acquisition"
+            );
+            assert_eq!(
+                super::lock(&state.session_lifecycle_gates.gates).len(),
+                initial_gate_count,
+                "an absent valid SessionId does not allocate a Session lifecycle gate"
+            );
+        }
+        assert!(
+            filesystem.publication_operations().is_empty(),
+            "absent Session lifecycle mutations do not enter publication"
+        );
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14619,6 +15141,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_on_fork_retains_provenance_definition_metadata_and_conversation() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        create_fork_g1_session(
+            root.path(),
+            SESSION_TWO,
+            SESSION_ONE,
+            "recorded_history",
+            r#"{"type":"genesis"}"#,
+            &valid_fork_conversation(SESSION_TWO),
+        );
+        let session_id = SessionId::from_str(SESSION_TWO).unwrap();
+        let conversation_path = session_path(root.path(), SESSION_TWO).join("conversation.jsonl");
+        let conversation_before = fs::read(&conversation_path).unwrap();
+        let state = open(root.path()).await.expect("the fork Session opens");
+        let original_head = state.session_head(session_id).unwrap();
+        let original_definition = state.session_current_definition(session_id).unwrap();
+        let original_metadata = original_head.metadata().clone();
+        let provenance = original_head
+            .fork_provenance()
+            .cloned()
+            .expect("the fork child has provenance");
+
+        let outcome = state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await
+            .expect("fork lifecycle publication succeeds");
+        assert!(outcome.changed());
+        assert_eq!(outcome.head().storage_generation().get(), 2);
+        assert_eq!(outcome.head().lifecycle(), SessionLifecycle::Archived);
+        assert_eq!(outcome.head().fork_provenance(), Some(&provenance));
+        assert_eq!(outcome.head().metadata(), &original_metadata);
+        assert!(Arc::ptr_eq(
+            &original_definition,
+            &state.session_current_definition(session_id).unwrap()
+        ));
+        let generation = session_path(root.path(), SESSION_TWO)
+            .join("generations")
+            .join(GENERATION_TWO);
+        assert!(!generation.join("definition.json").exists());
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the fork lifecycle chain reopens");
+        let reopened_head = reopened.session_head(session_id).unwrap();
+        let reopened_definition = reopened.session_current_definition(session_id).unwrap();
+        assert_eq!(reopened_head.fork_provenance(), Some(&provenance));
+        assert_eq!(reopened_head.metadata(), &original_metadata);
+        assert_eq!(&*reopened_definition, &*original_definition);
+        assert!(!generation.join("definition.json").exists());
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_metadata_after_definition_retains_current_definition_and_conversation() {
         let root = TempRoot::existing();
         create_marked_empty_store(root.path());
@@ -15376,6 +15957,606 @@ mod tests {
         assert_eq!(head.metadata().revision().get(), 2);
         assert_eq!(head.metadata().name(), Some("Project session"));
         reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_archive_unarchive_delete_publish_and_reopen() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let conversation_path = session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+        let conversation_before = fs::read(&conversation_path).unwrap();
+        let conversation_metadata_before = fs::symlink_metadata(&conversation_path).unwrap();
+        let state = open(root.path()).await.expect("the Session store opens");
+        let definition = state.session_current_definition(session_id).unwrap();
+        let original = state.session_head(session_id).unwrap();
+
+        let archived = state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await
+            .expect("Archive publishes");
+        assert!(archived.changed());
+        assert_eq!(archived.head().storage_generation().get(), 2);
+        assert_eq!(archived.head().lifecycle(), SessionLifecycle::Archived);
+        assert_eq!(archived.head().metadata(), original.metadata());
+        assert_eq!(archived.head().created_at(), original.created_at());
+        assert!(Arc::ptr_eq(
+            &definition,
+            &state.session_current_definition(session_id).unwrap()
+        ));
+        let generation = session_path(root.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            super::DurableStoreV1Codec::encode_session_head(archived.head()).unwrap()
+        );
+        assert!(!generation.join("definition.json").exists());
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        let conversation_metadata_after = fs::symlink_metadata(&conversation_path).unwrap();
+        assert_eq!(
+            conversation_metadata_after.len(),
+            conversation_metadata_before.len()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                conversation_metadata_after.dev(),
+                conversation_metadata_before.dev()
+            );
+            assert_eq!(
+                conversation_metadata_after.ino(),
+                conversation_metadata_before.ino()
+            );
+        }
+        state.close().await;
+
+        let state = open(root.path()).await.expect("Archived reopens");
+        let reopened_archived = state.session_head(session_id).unwrap();
+        let reopened_definition = state.session_current_definition(session_id).unwrap();
+        assert_eq!(reopened_archived.lifecycle(), SessionLifecycle::Archived);
+        assert_eq!(&*reopened_archived, archived.head().as_ref());
+        let unarchived = state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::unarchive(session_id))
+            .await
+            .expect("Unarchive publishes");
+        assert!(unarchived.changed());
+        assert_eq!(unarchived.head().storage_generation().get(), 3);
+        assert_eq!(unarchived.head().lifecycle(), SessionLifecycle::Open);
+        assert!(Arc::ptr_eq(
+            &reopened_definition,
+            &state.session_current_definition(session_id).unwrap()
+        ));
+        let generation = session_path(root.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_THREE);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            super::DurableStoreV1Codec::encode_session_head(unarchived.head()).unwrap()
+        );
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+
+        let archived_again = state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await
+            .expect("Archive after Unarchive publishes");
+        let deleted = state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::delete(session_id))
+            .await
+            .expect("Delete publishes from Archived");
+        assert!(archived_again.changed());
+        assert_eq!(archived_again.head().storage_generation().get(), 4);
+        assert!(deleted.changed());
+        assert_eq!(deleted.head().storage_generation().get(), 5);
+        assert_eq!(deleted.head().lifecycle(), SessionLifecycle::Deleted);
+        assert_eq!(deleted.head().metadata(), original.metadata());
+        assert_eq!(deleted.head().created_at(), original.created_at());
+        assert!(Arc::ptr_eq(
+            &reopened_definition,
+            &state.session_current_definition(session_id).unwrap()
+        ));
+        let generation = session_path(root.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_FOUR);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            super::DurableStoreV1Codec::encode_session_head(archived_again.head()).unwrap()
+        );
+        let generation = session_path(root.path(), SESSION_ONE)
+            .join("generations")
+            .join("00000000000000000005");
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            super::DurableStoreV1Codec::encode_session_head(deleted.head()).unwrap()
+        );
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        state.close().await;
+
+        let reopened = open(root.path()).await.expect("Deleted reopens");
+        let final_head = reopened.session_head(session_id).unwrap();
+        assert_eq!(final_head.storage_generation().get(), 5);
+        assert_eq!(final_head.lifecycle(), SessionLifecycle::Deleted);
+        assert_eq!(
+            &*reopened.session_current_definition(session_id).unwrap(),
+            &*definition
+        );
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_after_definition_change_retries_with_complete_historical_agent_basis()
+     {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let session_definition_g2 = replace_fixture(
+            &session_definition_g2_fixture(),
+            "\"revision\":\"ar_1\"",
+            "\"revision\":\"ar_2\"",
+        );
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::ReadbackStagedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let current_definition = state.session_current_definition(session_id).unwrap();
+        assert_eq!(current_definition.agent().revision().get(), 2);
+        assert!(state.contains_agent_definition(agent_id, "ar_1".parse().unwrap()));
+        assert!(state.contains_agent_definition(agent_id, "ar_2".parse().unwrap()));
+        let conversation_path = session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+        let conversation_before = fs::read(&conversation_path).unwrap();
+        let conversation_metadata_before = fs::symlink_metadata(&conversation_path).unwrap();
+        let make_attempt = || SealedSessionLifecycleAttempt::archive(session_id);
+
+        assert_eq!(
+            state
+                .update_session_lifecycle(make_attempt())
+                .await
+                .unwrap_err(),
+            super::DurableSessionLifecycleError::StorageUnavailable
+        );
+        assert!(
+            !session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_THREE)
+                .exists(),
+            "pre-COMMITTED cleanup removes the historical-chain staging generation"
+        );
+        assert_eq!(
+            state.session_head(session_id).unwrap().lifecycle(),
+            SessionLifecycle::Open
+        );
+
+        let retry = state
+            .update_session_lifecycle(make_attempt())
+            .await
+            .expect("the retry publishes after exact cleanup");
+        assert_eq!(retry.head().storage_generation().get(), 3);
+        assert_eq!(retry.head().lifecycle(), SessionLifecycle::Archived);
+        assert!(Arc::ptr_eq(
+            &current_definition,
+            &state.session_current_definition(session_id).unwrap()
+        ));
+        assert!(state.contains_agent_definition(agent_id, "ar_1".parse().unwrap()));
+        assert!(state.contains_agent_definition(agent_id, "ar_2".parse().unwrap()));
+        let generation = session_path(root.path(), SESSION_ONE)
+            .join("generations")
+            .join(GENERATION_THREE);
+        assert!(!generation.join("definition.json").exists());
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        let conversation_metadata_after = fs::symlink_metadata(&conversation_path).unwrap();
+        assert_eq!(
+            conversation_metadata_after.len(),
+            conversation_metadata_before.len()
+        );
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            conversation_metadata_after.dev(),
+            conversation_metadata_before.dev()
+        );
+        assert_eq!(
+            conversation_metadata_after.ino(),
+            conversation_metadata_before.ino()
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the historical lifecycle chain reopens");
+        assert_eq!(
+            reopened
+                .session_head(session_id)
+                .unwrap()
+                .storage_generation()
+                .get(),
+            3
+        );
+        assert_eq!(
+            reopened.session_head(session_id).unwrap().lifecycle(),
+            SessionLifecycle::Archived
+        );
+        assert_eq!(
+            reopened
+                .session_current_definition(session_id)
+                .unwrap()
+                .agent()
+                .revision()
+                .get(),
+            2
+        );
+        assert!(reopened.contains_agent_definition(agent_id, "ar_1".parse().unwrap()));
+        assert!(reopened.contains_agent_definition(agent_id, "ar_2".parse().unwrap()));
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_actor_abort_before_commit_keeps_session_gate_and_lease() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let actor_task = state.actor.task.clone();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_commit_barrier(ReservationBarrier::new(entered, release_receiver));
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let waiter = state
+            .actor
+            .enqueue_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await;
+        wait_reservation_barrier(entered_receiver).await;
+
+        state.task_context.abort_latest_registered_task();
+        assert_eq!(
+            waiter.wait().await.unwrap_err(),
+            super::DurableSessionLifecycleError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+        assert!(
+            state
+                .session_lifecycle_gates
+                .gate(session_id)
+                .try_write_owned()
+                .is_err(),
+            "the pre-COMMITTED worker retains the Session gate"
+        );
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "shutdown retains the pre-COMMITTED lifecycle worker and root lease"
+        );
+        assert!(matches!(
+            open(root.path()).await,
+            Err(super::DurableOpenError::StoreInUse)
+        ));
+        release
+            .send(())
+            .expect("the pre-COMMITTED lifecycle worker resumes");
+        close.await;
+        assert!(
+            !session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .exists(),
+            "the aborted pre-COMMITTED attempt cleans its trailing generation"
+        );
+        let reopened = open(root.path()).await.expect("the old head reopens");
+        assert_eq!(
+            reopened.session_head(session_id).unwrap().lifecycle(),
+            SessionLifecycle::Open
+        );
+        assert_eq!(
+            reopened
+                .session_head(session_id)
+                .unwrap()
+                .storage_generation()
+                .get(),
+            1
+        );
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_actor_abort_after_committed_keeps_session_gate_and_lease() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let actor_task = state.actor.task.clone();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::SyncCommittedGenerationDirectory,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let waiter = state
+            .actor
+            .enqueue_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await;
+        wait_reservation_barrier(entered_receiver).await;
+
+        state.task_context.abort_latest_registered_task();
+        assert_eq!(
+            waiter.wait().await.unwrap_err(),
+            super::DurableSessionLifecycleError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            actor_task.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable)
+        );
+        assert!(
+            state
+                .session_lifecycle_gates
+                .gate(session_id)
+                .try_write_owned()
+                .is_err(),
+            "the post-COMMITTED worker retains the Session gate"
+        );
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "shutdown retains the post-COMMITTED lifecycle worker and root lease"
+        );
+        assert!(matches!(
+            open(root.path()).await,
+            Err(super::DurableOpenError::StoreInUse)
+        ));
+        release
+            .send(())
+            .expect("the post-COMMITTED lifecycle worker resumes");
+        close.await;
+        assert!(
+            session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .join("COMMITTED")
+                .is_file()
+        );
+        let reopened = open(root.path()).await.expect("the new head reopens");
+        assert_eq!(
+            reopened.session_head(session_id).unwrap().lifecycle(),
+            SessionLifecycle::Archived
+        );
+        assert_eq!(
+            reopened
+                .session_head(session_id)
+                .unwrap()
+                .storage_generation()
+                .get(),
+            2
+        );
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_lifecycle_faults_reconcile_old_or_new_and_poison_after_uncertainty() {
+        let ordinary_cases = [
+            (
+                "head-write-after",
+                PublicationFault::After(PublicationOperation::WriteHead),
+                false,
+            ),
+            (
+                "definition-absence-readback-before",
+                PublicationFault::Before(PublicationOperation::ReadbackStagedDefinition),
+                false,
+            ),
+            (
+                "committed-create-before",
+                PublicationFault::Before(PublicationOperation::CreateCommitted),
+                false,
+            ),
+            (
+                "committed-create-after",
+                PublicationFault::After(PublicationOperation::CreateCommitted),
+                true,
+            ),
+            (
+                "committed-sync-after",
+                PublicationFault::After(PublicationOperation::SyncCommitted),
+                true,
+            ),
+        ];
+        for (name, fault, closes) in ordinary_cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+            let make_attempt = || SealedSessionLifecycleAttempt::archive(session_id);
+            let first = state.update_session_lifecycle(make_attempt()).await;
+            let generation = session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_TWO);
+            if closes {
+                let outcome = first.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                assert!(outcome.changed(), "{name}");
+                assert_eq!(
+                    outcome.head().lifecycle(),
+                    SessionLifecycle::Archived,
+                    "{name}"
+                );
+                assert_eq!(outcome.head().storage_generation().get(), 2, "{name}");
+                assert_eq!(
+                    state
+                        .update_session_lifecycle(make_attempt())
+                        .await
+                        .unwrap_err(),
+                    super::DurableSessionLifecycleError::Closing,
+                    "{name} settles Completed before remembered Closing"
+                );
+            } else {
+                assert_eq!(
+                    first.unwrap_err(),
+                    super::DurableSessionLifecycleError::StorageUnavailable,
+                    "{name} is an ordinary pre-COMMITTED failure"
+                );
+                assert!(
+                    !generation.exists(),
+                    "{name} removes exact trailing staging"
+                );
+                let retry = state
+                    .update_session_lifecycle(make_attempt())
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} retry: {error:?}"));
+                assert_eq!(
+                    retry.head().lifecycle(),
+                    SessionLifecycle::Archived,
+                    "{name}"
+                );
+                assert_eq!(retry.head().storage_generation().get(), 2, "{name}");
+            }
+            assert!(!generation.join("definition.json").exists(), "{name}");
+            assert_eq!(
+                fs::read(session_path(root.path(), SESSION_ONE).join("conversation.jsonl"))
+                    .unwrap(),
+                ordinary_header_only_conversation(SESSION_ONE),
+                "{name} does not touch conversation bytes"
+            );
+            state.close().await;
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            assert_eq!(
+                reopened.session_head(session_id).unwrap().lifecycle(),
+                SessionLifecycle::Archived,
+                "{name} reopens the new lifecycle head"
+            );
+            assert_eq!(
+                reopened
+                    .session_head(session_id)
+                    .unwrap()
+                    .storage_generation()
+                    .get(),
+                2,
+                "{name} reopens generation two"
+            );
+            reopened.close().await;
+        }
+
+        let poisoned_cases = [
+            (
+                "committed-definition-indeterminate",
+                PublicationFault::Indeterminate(PublicationOperation::ReadbackCommittedDefinition),
+                false,
+            ),
+            (
+                "final-definition-before",
+                PublicationFault::Before(PublicationOperation::ReadbackPublishedDefinition),
+                false,
+            ),
+            (
+                "final-definition-indeterminate",
+                PublicationFault::Indeterminate(PublicationOperation::ReadbackPublishedDefinition),
+                false,
+            ),
+            (
+                "final-definition-corrupt",
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedDefinition),
+                true,
+            ),
+        ];
+        for (name, fault, corrupt) in poisoned_cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+            let result = state
+                .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+                .await;
+            assert_eq!(
+                result.unwrap_err(),
+                super::DurableSessionLifecycleError::InternalDispatchUnavailable,
+                "{name} poisons after committed or final uncertainty"
+            );
+            assert_eq!(
+                state
+                    .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+                    .await
+                    .unwrap_err(),
+                super::DurableSessionLifecycleError::Closing,
+                "{name} persistently poisons actor admission"
+            );
+            let definition = session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .join("definition.json");
+            if corrupt {
+                assert_eq!(fs::read(&definition).unwrap(), b"corrupt", "{name}");
+            } else {
+                assert!(!definition.exists(), "{name} retains definition absence");
+            }
+            state.close().await;
+            if corrupt {
+                assert!(matches!(
+                    open(root.path()).await,
+                    Err(super::DurableOpenError::DurableStateCorrupt)
+                ));
+            } else {
+                let reopened = open(root.path())
+                    .await
+                    .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                assert_eq!(
+                    reopened.session_head(session_id).unwrap().lifecycle(),
+                    SessionLifecycle::Archived,
+                    "{name} reopens the valid old-or-new physical chain"
+                );
+                assert_eq!(
+                    reopened
+                        .session_head(session_id)
+                        .unwrap()
+                        .storage_generation()
+                        .get(),
+                    2,
+                    "{name} retains the committed new head"
+                );
+                reopened.close().await;
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
