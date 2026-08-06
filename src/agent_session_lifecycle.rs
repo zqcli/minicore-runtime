@@ -1442,6 +1442,113 @@ pub(crate) const fn is_legal_session_lifecycle_transition(
     )
 }
 
+/// The only semantic actions admitted by an existing-head Session lifecycle mutation. Keeping the
+/// action set closed prevents a caller from manufacturing an arbitrary lifecycle target such as
+/// `Open -> Deleted` and accidentally treating it as a valid mutation.
+#[allow(
+    dead_code,
+    reason = "the pending Session lifecycle command constructs these sealed actions"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionLifecycleAction {
+    Archive,
+    Unarchive,
+    Delete,
+}
+
+impl SessionLifecycleAction {
+    const fn target(self) -> SessionLifecycle {
+        match self {
+            Self::Archive => SessionLifecycle::Archived,
+            Self::Unarchive => SessionLifecycle::Open,
+            Self::Delete => SessionLifecycle::Deleted,
+        }
+    }
+}
+
+/// Lifecycle-owned semantic input to one existing-head Session lifecycle mutation. It deliberately
+/// carries no expected lifecycle token: the authoritative actor reads current state after taking
+/// the Session gate. Residency is not represented here because Archive/Delete's Unloaded
+/// precondition belongs to the future Runtime/residency owner, not to this durable-only seam.
+pub(crate) struct SealedSessionLifecycleAttempt {
+    session_id: SessionId,
+    action: SessionLifecycleAction,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionLifecycleDecisionError {
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session lifecycle transition is invalid")]
+    InvalidTransition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionLifecycleDecision {
+    NoChange,
+    Publish(SessionLifecycle),
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending Session lifecycle command consumes this sealed attempt"
+)]
+impl SealedSessionLifecycleAttempt {
+    const fn new(session_id: SessionId, action: SessionLifecycleAction) -> Self {
+        Self { session_id, action }
+    }
+
+    pub(crate) const fn archive(session_id: SessionId) -> Self {
+        Self::new(session_id, SessionLifecycleAction::Archive)
+    }
+
+    pub(crate) const fn unarchive(session_id: SessionId) -> Self {
+        Self::new(session_id, SessionLifecycleAction::Unarchive)
+    }
+
+    pub(crate) const fn delete(session_id: SessionId) -> Self {
+        Self::new(session_id, SessionLifecycleAction::Delete)
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[cfg(test)]
+    const fn action(&self) -> SessionLifecycleAction {
+        self.action
+    }
+
+    /// Decides the closed lifecycle action matrix against the current state supplied by the
+    /// authoritative DurableState actor after it has acquired the Session gate.
+    pub(crate) fn decide(
+        &self,
+        current_lifecycle: SessionLifecycle,
+    ) -> Result<SessionLifecycleDecision, SessionLifecycleDecisionError> {
+        if current_lifecycle == SessionLifecycle::Deleted {
+            return Err(SessionLifecycleDecisionError::SessionDeleted);
+        }
+        let target = self.action.target();
+        if current_lifecycle == target {
+            return Ok(SessionLifecycleDecision::NoChange);
+        }
+        if !is_legal_session_lifecycle_transition(current_lifecycle, target) {
+            return Err(SessionLifecycleDecisionError::InvalidTransition);
+        }
+        Ok(SessionLifecycleDecision::Publish(target))
+    }
+}
+
+impl fmt::Debug for SealedSessionLifecycleAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionLifecycleAttempt")
+            .field("session_id", &"redacted")
+            .field("action", &self.action)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkSourceKind {
     LiveSnapshot,
@@ -1531,9 +1638,11 @@ mod tests {
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
         SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
         SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
-        SealedSessionMetadataAttempt, SessionDefinition, SessionForkAttemptError, SessionLifecycle,
-        SessionMetadataDecision, SessionMetadataDecisionError, SessionMetadataDescriptionPatch,
-        SessionMetadataNamePatch, SessionModelConfig,
+        SealedSessionLifecycleAttempt, SealedSessionMetadataAttempt, SessionDefinition,
+        SessionForkAttemptError, SessionLifecycle, SessionLifecycleAction,
+        SessionLifecycleDecision, SessionLifecycleDecisionError, SessionMetadataDecision,
+        SessionMetadataDecisionError, SessionMetadataDescriptionPatch, SessionMetadataNamePatch,
+        SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -1545,6 +1654,72 @@ mod tests {
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
         WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
     };
+
+    #[test]
+    fn sealed_session_lifecycle_action_matrix_is_closed_and_redacted() {
+        let session_id: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let cases = [
+            (
+                SessionLifecycle::Open,
+                SessionLifecycleAction::Archive,
+                Ok(SessionLifecycleDecision::Publish(
+                    SessionLifecycle::Archived,
+                )),
+            ),
+            (
+                SessionLifecycle::Archived,
+                SessionLifecycleAction::Archive,
+                Ok(SessionLifecycleDecision::NoChange),
+            ),
+            (
+                SessionLifecycle::Deleted,
+                SessionLifecycleAction::Archive,
+                Err(SessionLifecycleDecisionError::SessionDeleted),
+            ),
+            (
+                SessionLifecycle::Open,
+                SessionLifecycleAction::Unarchive,
+                Ok(SessionLifecycleDecision::NoChange),
+            ),
+            (
+                SessionLifecycle::Archived,
+                SessionLifecycleAction::Unarchive,
+                Ok(SessionLifecycleDecision::Publish(SessionLifecycle::Open)),
+            ),
+            (
+                SessionLifecycle::Deleted,
+                SessionLifecycleAction::Unarchive,
+                Err(SessionLifecycleDecisionError::SessionDeleted),
+            ),
+            (
+                SessionLifecycle::Open,
+                SessionLifecycleAction::Delete,
+                Err(SessionLifecycleDecisionError::InvalidTransition),
+            ),
+            (
+                SessionLifecycle::Archived,
+                SessionLifecycleAction::Delete,
+                Ok(SessionLifecycleDecision::Publish(SessionLifecycle::Deleted)),
+            ),
+            (
+                SessionLifecycle::Deleted,
+                SessionLifecycleAction::Delete,
+                Err(SessionLifecycleDecisionError::SessionDeleted),
+            ),
+        ];
+        for (current, action, expected) in cases {
+            let attempt = SealedSessionLifecycleAttempt::new(session_id, action);
+            assert_eq!(attempt.session_id(), session_id);
+            assert_eq!(attempt.action(), action);
+            assert_eq!(attempt.decide(current), expected);
+        }
+
+        let archive = SealedSessionLifecycleAttempt::archive(session_id);
+        let debug = format!("{archive:?}");
+        assert!(!debug.contains("ses_aaaaaaaa"));
+        assert!(!debug.contains("expected"));
+        assert!(!debug.contains("stale"));
+    }
 
     #[test]
     fn sealed_agent_create_attempt_fixes_initial_revisions_and_redacts_input() {
