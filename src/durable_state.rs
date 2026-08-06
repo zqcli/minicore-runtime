@@ -19,15 +19,16 @@ use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{
     AgentDefinition, AgentMetadata, AgentRevisionRef, AgentStatus, SealedAgentCreateAttempt,
-    SealedSessionCreateAttempt, SessionDefinition, SessionForkProvenance, SessionLifecycle,
-    SessionMetadata, agent_definitions_have_same_canonical_execution_content,
+    SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionDefinition, SessionForkProvenance,
+    SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
     is_legal_session_lifecycle_transition,
     session_definitions_have_same_canonical_execution_content,
     session_metadata_has_same_canonical_content,
 };
 use crate::conversation_storage::{
-    SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
+    RecordedForkConversationLease, RecordedForkSourceError, SessionHeader,
+    UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
     validate_unpublished_conversation_for_recovery,
 };
 #[cfg(test)]
@@ -405,6 +406,18 @@ fn ordinary_session_create_agent_basis(
     }
 }
 
+fn recorded_fork_agent_basis(
+    entry: &DurableAgentCatalogEntry,
+    captured: AgentRevisionRef,
+) -> Option<DurableAgentCatalogEntry> {
+    let generation = *entry.definition_index.get(&captured.revision())?;
+    Some(DurableAgentCatalogEntry {
+        current_head: Arc::clone(&entry.current_head),
+        current_definition: Arc::clone(&entry.current_definition),
+        definition_index: BTreeMap::from([(captured.revision(), generation)]),
+    })
+}
+
 impl fmt::Debug for DurableAgentCatalogEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -686,6 +699,37 @@ pub(crate) enum DurableSessionCreateError {
     InternalDispatchUnavailable,
 }
 
+/// The closed, redacted failure taxonomy for one accepted recorded Genesis Fork request.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableSessionForkError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("Fork child identity is unavailable")]
+    IdentityUnavailable,
+    #[error("Fork child identity allocation attempts are exhausted")]
+    CollisionAttemptsExhausted,
+    #[error("Fork child identity conflicts with its source")]
+    SourceIdentityConflict,
+    #[error("Fork source Session was not found")]
+    SourceNotFound,
+    #[error("Fork source Session is deleted")]
+    SourceDeleted,
+    #[error("Fork source conversation exceeds its selected storage limit")]
+    SourceConversationTooLarge,
+    #[error("Fork source conversation is corrupt")]
+    SourceConversationCorrupt,
+    #[error("requested Agent is disabled")]
+    AgentDisabled,
+    #[error("requested Agent is deleted")]
+    AgentDeleted,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 struct CreateAgentRequest {
     attempt: SealedAgentCreateAttempt,
     response: Option<oneshot::Sender<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>>,
@@ -776,6 +820,51 @@ impl CreateSessionWaiter {
     }
 }
 
+struct ForkSessionRequest {
+    attempt: SealedSessionForkAttempt,
+    response: Option<oneshot::Sender<Result<Arc<DurableSessionHead>, DurableSessionForkError>>>,
+    closing: CancellationToken,
+    #[cfg(test)]
+    candidates: Option<std::collections::VecDeque<Result<SessionId, ()>>>,
+    #[cfg(test)]
+    candidate_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ForkSessionRequest {
+    fn settle(&mut self, outcome: Result<Arc<DurableSessionHead>, DurableSessionForkError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject(&mut self, error: DurableSessionForkError) {
+        self.settle(Err(error));
+    }
+}
+
+impl Drop for ForkSessionRequest {
+    fn drop(&mut self) {
+        let error = if self.closing.is_cancelled() {
+            DurableSessionForkError::Closing
+        } else {
+            DurableSessionForkError::InternalDispatchUnavailable
+        };
+        self.reject(error);
+    }
+}
+
+struct ForkSessionWaiter {
+    response: oneshot::Receiver<Result<Arc<DurableSessionHead>, DurableSessionForkError>>,
+}
+
+impl ForkSessionWaiter {
+    async fn wait(self) -> Result<Arc<DurableSessionHead>, DurableSessionForkError> {
+        self.response
+            .await
+            .unwrap_or(Err(DurableSessionForkError::InternalDispatchUnavailable))
+    }
+}
+
 /// The private per-Agent synchronization shared by durable publication and future initiating
 /// Input admission. Read permits preserve an Enabled epoch; status mutation takes the exclusive
 /// side before changing that epoch.
@@ -820,10 +909,12 @@ impl AgentLifecycleGateRegistry {
 struct DurableStateActor {
     receiver: mpsc::Receiver<DurableStateActorRequestEnvelope>,
     closing: CancellationToken,
+    lease: Arc<RootLease>,
     root: PathBuf,
     directory_sync: DirectorySync,
     agent_lifecycle_gates: Arc<AgentLifecycleGateRegistry>,
     recovered_agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+    recovered_sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
     recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
     recovered_session_reservations: Arc<BTreeSet<SessionId>>,
     new_agent_reservations: BTreeSet<AgentId>,
@@ -973,6 +1064,7 @@ impl std::error::Error for ActorRequestError {}
 enum DurableStateActorRequest {
     CreateAgent(CreateAgentRequest),
     CreateSession(CreateSessionRequest),
+    ForkSession(ForkSessionRequest),
     #[cfg(test)]
     Probe(DurableStateActorProbe),
     #[cfg(test)]
@@ -1027,6 +1119,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::Closing);
             }
+            DurableStateActorRequest::ForkSession(request) => {
+                request.reject(DurableSessionForkError::Closing);
+            }
             #[cfg(test)]
             DurableStateActorRequest::Probe(_) => {}
             #[cfg(test)]
@@ -1050,6 +1145,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::InternalDispatchUnavailable);
             }
+            DurableStateActorRequest::ForkSession(request) => {
+                request.reject(DurableSessionForkError::InternalDispatchUnavailable);
+            }
             #[cfg(test)]
             DurableStateActorRequest::Probe(_) => {}
             #[cfg(test)]
@@ -1071,6 +1169,7 @@ impl DurableStateActorRequestEnvelope {
             }
             DurableStateActorRequest::CreateAgent(_)
             | DurableStateActorRequest::CreateSession(_)
+            | DurableStateActorRequest::ForkSession(_)
             | DurableStateActorRequest::ReserveAgent(_)
             | DurableStateActorRequest::ReserveSession(_) => None,
         }
@@ -1196,10 +1295,12 @@ impl DurableStateActorHandle {
     )]
     fn start(
         task_context: &RuntimeTaskContext,
+        lease: Arc<RootLease>,
         root: PathBuf,
         directory_sync: DirectorySync,
         agent_lifecycle_gates: Arc<AgentLifecycleGateRegistry>,
         recovered_agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+        recovered_sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
         recovered_agent_reservations: Arc<BTreeSet<AgentId>>,
         recovered_session_reservations: Arc<BTreeSet<SessionId>>,
         filesystem: Arc<dyn DurableFilesystem>,
@@ -1214,10 +1315,12 @@ impl DurableStateActorHandle {
         let actor = DurableStateActor {
             receiver,
             closing: closing.clone(),
+            lease,
             root,
             directory_sync,
             agent_lifecycle_gates,
             recovered_agents,
+            recovered_sessions,
             recovered_agent_reservations,
             recovered_session_reservations,
             new_agent_reservations: BTreeSet::new(),
@@ -1391,6 +1494,74 @@ impl DurableStateActorHandle {
         // request's physical settlement from here.
         permit.send(envelope);
         CreateSessionWaiter { response: waiter }
+    }
+
+    async fn enqueue_session_fork(&self, attempt: SealedSessionForkAttempt) -> ForkSessionWaiter {
+        self.enqueue_session_fork_request(ForkSessionRequest {
+            attempt,
+            response: None,
+            closing: self.closing.clone(),
+            #[cfg(test)]
+            candidates: None,
+            #[cfg(test)]
+            candidate_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+        .await
+    }
+
+    #[cfg(test)]
+    async fn enqueue_session_fork_with_test_candidates(
+        &self,
+        attempt: SealedSessionForkAttempt,
+        candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
+        candidate_calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> ForkSessionWaiter {
+        self.enqueue_session_fork_request(ForkSessionRequest {
+            attempt,
+            response: None,
+            closing: self.closing.clone(),
+            candidates: Some(candidates.into_iter().collect()),
+            candidate_calls,
+        })
+        .await
+    }
+
+    async fn enqueue_session_fork_request(
+        &self,
+        mut fork: ForkSessionRequest,
+    ) -> ForkSessionWaiter {
+        let (response, waiter) = oneshot::channel();
+        fork.response = Some(response);
+        let mut envelope = DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::ForkSession(fork),
+            #[cfg(test)]
+            response: None,
+            #[cfg(test)]
+            drop_error: ActorRequestError::Unavailable,
+        };
+
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                envelope.reject_closing();
+                return ForkSessionWaiter { response: waiter };
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if self.closing.is_cancelled() {
+                        envelope.reject_closing();
+                    } else {
+                        envelope.reject_unavailable();
+                    }
+                    return ForkSessionWaiter { response: waiter };
+                }
+            },
+        };
+        // The permit is the exact request-admission linearization point. From here the actor or
+        // its drain path owns settlement, including a permanently reserved child identity.
+        permit.send(envelope);
+        ForkSessionWaiter { response: waiter }
     }
 
     #[cfg(test)]
@@ -1727,6 +1898,44 @@ impl DurableStateActor {
                                     }
                                 }
                             }
+                            DurableStateActorRequest::ForkSession(fork) => {
+                                match self.process_fork_session(fork).await {
+                                    SessionForkPublicationWorkResult::Published {
+                                        entry,
+                                        close_required,
+                                    } => {
+                                        let head = Arc::clone(&entry.current_head);
+                                        lock(&self.published_sessions)
+                                            .insert(head.session_id(), entry);
+                                        fork.settle(Ok(head));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                    }
+                                    SessionForkPublicationWorkResult::Ordinary {
+                                        error,
+                                        close_required,
+                                    } => {
+                                        fork.settle(Err(error));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                    }
+                                    SessionForkPublicationWorkResult::Poisoned => {
+                                        fork.settle(Err(
+                                            DurableSessionForkError::InternalDispatchUnavailable,
+                                        ));
+                                        self.poison_session_create_admission().await;
+                                        return true;
+                                    }
+                                }
+                            }
                             #[cfg(test)]
                             DurableStateActorRequest::Probe(_) => {
                                 let (entered, release) = request.probe_signals().expect("Probe has signals");
@@ -1817,6 +2026,7 @@ impl DurableStateActor {
         }
         publish_agent_generation(
             self.task_context.clone(),
+            Arc::clone(&self.lease),
             Arc::clone(&self.filesystem),
             self.root.clone(),
             self.directory_sync,
@@ -1962,6 +2172,7 @@ impl DurableStateActor {
         };
         publish_session_generation(
             self.task_context.clone(),
+            Arc::clone(&self.lease),
             Arc::clone(&self.filesystem),
             self.root.clone(),
             self.directory_sync,
@@ -1971,11 +2182,216 @@ impl DurableStateActor {
             definition_bytes,
             conversation_bytes,
             Arc::new(agents),
+            Arc::new(BTreeMap::new()),
             agent_gate,
             self.closing.clone(),
             Arc::clone(&self.active_commit_barrier),
         )
         .await
+    }
+
+    async fn process_fork_session(
+        &mut self,
+        request: &mut ForkSessionRequest,
+    ) -> SessionForkPublicationWorkResult {
+        let child_session_id = match self.reserve_session_for_fork(request).await {
+            Ok(session_id) => session_id,
+            Err(DurableSessionForkError::InternalDispatchUnavailable) => {
+                return SessionForkPublicationWorkResult::Poisoned;
+            }
+            Err(error) => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error,
+                    close_required: false,
+                };
+            }
+        };
+        if self.closing.is_cancelled() {
+            return SessionForkPublicationWorkResult::Ordinary {
+                error: DurableSessionForkError::Closing,
+                close_required: false,
+            };
+        }
+
+        let source_session_id = request.attempt.source_session_id();
+        let source = {
+            let published = lock(&self.published_sessions);
+            published
+                .get(&source_session_id)
+                .cloned()
+                .or_else(|| self.recovered_sessions.get(&source_session_id).cloned())
+        };
+        let Some(source) = source else {
+            return SessionForkPublicationWorkResult::Ordinary {
+                error: DurableSessionForkError::SourceNotFound,
+                close_required: false,
+            };
+        };
+        if source.current_head.lifecycle() == SessionLifecycle::Deleted {
+            return SessionForkPublicationWorkResult::Ordinary {
+                error: DurableSessionForkError::SourceDeleted,
+                close_required: false,
+            };
+        }
+
+        match validate_recorded_genesis_fork_source(
+            self.task_context.clone(),
+            Arc::clone(&self.lease),
+            Arc::clone(&self.filesystem),
+            self.root.clone(),
+            source_session_id,
+            source.clone(),
+            self.closing.clone(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(DurableSessionForkError::InternalDispatchUnavailable) => {
+                return SessionForkPublicationWorkResult::Poisoned;
+            }
+            Err(error) => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error,
+                    close_required: false,
+                };
+            }
+        }
+        if self.closing.is_cancelled() {
+            return SessionForkPublicationWorkResult::Ordinary {
+                error: DurableSessionForkError::Closing,
+                close_required: false,
+            };
+        }
+
+        let captured_agent = source.current_definition.agent();
+        let agent_id = captured_agent.agent_id();
+        let agent_exists = lock(&self.published_agents).contains_key(&agent_id)
+            || self.recovered_agents.contains_key(&agent_id);
+        if !agent_exists {
+            return SessionForkPublicationWorkResult::Poisoned;
+        }
+        let agent_gate = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error: DurableSessionForkError::Closing,
+                    close_required: false,
+                };
+            }
+            permit = self.agent_lifecycle_gates.acquire_publication(agent_id) => permit,
+        };
+        let agent = {
+            let published = lock(&self.published_agents);
+            published
+                .get(&agent_id)
+                .or_else(|| self.recovered_agents.get(&agent_id))
+                .and_then(|entry| recorded_fork_agent_basis(entry, captured_agent))
+        };
+        let Some(agent) = agent else {
+            return SessionForkPublicationWorkResult::Poisoned;
+        };
+        match agent.current_head.status() {
+            AgentStatus::Enabled => {}
+            AgentStatus::Disabled => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error: DurableSessionForkError::AgentDisabled,
+                    close_required: false,
+                };
+            }
+            AgentStatus::Deleted => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error: DurableSessionForkError::AgentDeleted,
+                    close_required: false,
+                };
+            }
+        }
+
+        let (definition, metadata, provenance) = match request
+            .attempt
+            .materialize(child_session_id, &source.current_definition)
+        {
+            Ok(parts) => parts,
+            Err(_) => return SessionForkPublicationWorkResult::Poisoned,
+        };
+        let definition = Arc::new(definition);
+        let generation = match StorageGeneration::new(1) {
+            Some(generation) => generation,
+            None => return SessionForkPublicationWorkResult::Poisoned,
+        };
+        let head = match DurableSessionHead::new(
+            child_session_id,
+            generation,
+            None,
+            definition.revision(),
+            generation,
+            metadata.clone(),
+            SessionLifecycle::Open,
+            Some(provenance),
+            metadata.updated_at(),
+        ) {
+            Ok(head) => Arc::new(head),
+            Err(_) => return SessionForkPublicationWorkResult::Poisoned,
+        };
+        let agents = BTreeMap::from([(agent_id, agent)]);
+        let sessions = BTreeMap::from([(source_session_id, source)]);
+        if validate_session_generation_one(
+            child_session_id,
+            generation,
+            &head,
+            &definition,
+            &agents,
+        )
+        .is_err()
+            || definition.agent() != captured_agent
+        {
+            return SessionForkPublicationWorkResult::Poisoned;
+        }
+
+        let header = SessionHeader::reconstruct(
+            1,
+            child_session_id,
+            definition.created_at(),
+            definition.agent(),
+            definition.revision(),
+        );
+        let mut conversation_bytes = match ConversationLineCodec::encode_header(&header) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return SessionForkPublicationWorkResult::Ordinary {
+                    error: DurableSessionForkError::StorageUnavailable,
+                    close_required: false,
+                };
+            }
+        };
+        conversation_bytes.push(b'\n');
+        let head_bytes = match DurableStoreV1Codec::encode_session_head(&head) {
+            Ok(bytes) => bytes,
+            Err(_) => return SessionForkPublicationWorkResult::Poisoned,
+        };
+        let definition_bytes = match DurableStoreV1Codec::encode_session_definition(&definition) {
+            Ok(bytes) => bytes,
+            Err(_) => return SessionForkPublicationWorkResult::Poisoned,
+        };
+        map_session_publication_for_fork(
+            publish_session_generation(
+                self.task_context.clone(),
+                Arc::clone(&self.lease),
+                Arc::clone(&self.filesystem),
+                self.root.clone(),
+                self.directory_sync,
+                definition,
+                head,
+                head_bytes,
+                definition_bytes,
+                conversation_bytes,
+                Arc::new(agents),
+                Arc::new(sessions),
+                agent_gate,
+                self.closing.clone(),
+                Arc::clone(&self.active_commit_barrier),
+            )
+            .await,
+        )
     }
 
     async fn reserve_session_for_create(
@@ -2069,6 +2485,105 @@ impl DurableStateActor {
                 | ReservationPhysicalObservation::CreateErrorPresent
                 | ReservationPhysicalObservation::CreatedThenErrorPresent => {
                     return Err(DurableSessionCreateError::InternalDispatchUnavailable);
+                }
+            }
+        }
+    }
+
+    async fn reserve_session_for_fork(
+        &mut self,
+        request: &mut ForkSessionRequest,
+    ) -> Result<SessionId, DurableSessionForkError> {
+        if self.recovered_session_reservations.len() + self.new_session_reservations.len()
+            >= SESSION_RESERVATION_ENTRY_CAP
+        {
+            return Err(DurableSessionForkError::DurableStateTooLarge);
+        }
+        let mut collisions = 0;
+        loop {
+            if self.closing.is_cancelled() {
+                return Err(DurableSessionForkError::Closing);
+            }
+            let candidate = {
+                #[cfg(test)]
+                {
+                    if let Some(candidates) = request.candidates.as_mut() {
+                        request.candidate_calls.fetch_add(1, Ordering::SeqCst);
+                        candidates
+                            .pop_front()
+                            .unwrap_or(Err(()))
+                            .map_err(|_| DurableSessionForkError::IdentityUnavailable)?
+                    } else {
+                        request
+                            .attempt
+                            .generate_candidate()
+                            .map_err(|_| DurableSessionForkError::IdentityUnavailable)?
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    request
+                        .attempt
+                        .generate_candidate()
+                        .map_err(|_| DurableSessionForkError::IdentityUnavailable)?
+                }
+            };
+            if candidate == request.attempt.source_session_id() {
+                return Err(DurableSessionForkError::SourceIdentityConflict);
+            }
+            let was_present = self.recovered_session_reservations.contains(&candidate)
+                || self.new_session_reservations.contains(&candidate);
+            let observation = self
+                .run_create_reservation_attempt(
+                    self.root
+                        .join(RESERVATIONS_DIRECTORY)
+                        .join(SESSIONS_DIRECTORY)
+                        .join(candidate.to_string()),
+                )
+                .await
+                .map_err(|error| match error {
+                    CreateReservationAttemptError::Closing => DurableSessionForkError::Closing,
+                    CreateReservationAttemptError::StorageUnavailable => {
+                        DurableSessionForkError::StorageUnavailable
+                    }
+                    CreateReservationAttemptError::Poisoned => {
+                        DurableSessionForkError::InternalDispatchUnavailable
+                    }
+                })?;
+            match observation {
+                ReservationPhysicalObservation::Created if !was_present => {
+                    self.new_session_reservations.insert(candidate);
+                    return Ok(candidate);
+                }
+                ReservationPhysicalObservation::AlreadyExistsCanonical if was_present => {
+                    collisions += 1;
+                    if collisions == RESERVATION_COLLISION_ATTEMPT_CAP {
+                        return Err(DurableSessionForkError::CollisionAttemptsExhausted);
+                    }
+                }
+                ReservationPhysicalObservation::CreateErrorAbsent if !was_present => {
+                    return Err(DurableSessionForkError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::CreateErrorPresent if was_present => {
+                    return Err(DurableSessionForkError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::CreateErrorPresent
+                | ReservationPhysicalObservation::CreatedThenErrorPresent
+                    if !was_present =>
+                {
+                    self.new_session_reservations.insert(candidate);
+                    return Err(DurableSessionForkError::StorageUnavailable);
+                }
+                ReservationPhysicalObservation::Indeterminate
+                | ReservationPhysicalObservation::Corrupt => {
+                    return Err(DurableSessionForkError::InternalDispatchUnavailable);
+                }
+                ReservationPhysicalObservation::Created
+                | ReservationPhysicalObservation::AlreadyExistsCanonical
+                | ReservationPhysicalObservation::CreateErrorAbsent
+                | ReservationPhysicalObservation::CreateErrorPresent
+                | ReservationPhysicalObservation::CreatedThenErrorPresent => {
+                    return Err(DurableSessionForkError::InternalDispatchUnavailable);
                 }
             }
         }
@@ -2176,20 +2691,17 @@ impl DurableStateActor {
     ) -> Result<ReservationPhysicalObservation, CreateReservationAttemptError> {
         let stage = Arc::new(AtomicU8::new(ReservationAttemptStage::Pending as u8));
         let filesystem = Arc::clone(&self.filesystem);
+        let lease = Arc::clone(&self.lease);
         let directory_sync = self.directory_sync;
         let job_stage = Arc::clone(&stage);
-        let job =
-            self.task_context.spawn_blocking_tracked(move || {
-                match attempt_local_reservation(
-                    filesystem.as_ref(),
-                    &path,
-                    directory_sync,
-                    &job_stage,
-                ) {
-                    Some(observation) => ReservationAttemptJobOutcome::Observed(observation),
-                    None => ReservationAttemptJobOutcome::Cancelled,
-                }
-            });
+        let job = self.task_context.spawn_blocking_tracked(move || {
+            let _lease = lease;
+            match attempt_local_reservation(filesystem.as_ref(), &path, directory_sync, &job_stage)
+            {
+                Some(observation) => ReservationAttemptJobOutcome::Observed(observation),
+                None => ReservationAttemptJobOutcome::Cancelled,
+            }
+        });
         let mut job_wait = Box::pin(job.wait());
         tokio::select! {
             biased;
@@ -2541,6 +3053,237 @@ enum SessionPublicationWorkResult {
     Poisoned,
 }
 
+#[derive(Clone)]
+enum SessionForkPublicationWorkResult {
+    Published {
+        entry: DurableSessionCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: DurableSessionForkError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
+async fn validate_recorded_genesis_fork_source(
+    task_context: RuntimeTaskContext,
+    lease: Arc<RootLease>,
+    filesystem: Arc<dyn DurableFilesystem>,
+    root: PathBuf,
+    source_session_id: SessionId,
+    source: DurableSessionCatalogEntry,
+    closing: CancellationToken,
+) -> Result<(), DurableSessionForkError> {
+    let job = task_context.spawn_blocking_tracked(move || {
+        let _lease = lease;
+        validate_recorded_genesis_fork_source_blocking(
+            filesystem.as_ref(),
+            &root,
+            source_session_id,
+            &source,
+        )
+    });
+    let mut job_wait = Box::pin(job.wait());
+    tokio::select! {
+        biased;
+        _ = closing.cancelled() => {
+            match job_wait.await {
+                Ok(_) => Err(DurableSessionForkError::Closing),
+                Err(error) => Err(map_fork_source_task_error(error)),
+            }
+        }
+        result = &mut job_wait => match result {
+            Ok(result) => result,
+            Err(error) => Err(map_fork_source_task_error(error)),
+        },
+    }
+}
+
+fn validate_recorded_genesis_fork_source_blocking(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    source_session_id: SessionId,
+    source: &DurableSessionCatalogEntry,
+) -> Result<(), DurableSessionForkError> {
+    let source_entity = root
+        .join(SESSIONS_DIRECTORY)
+        .join(source_session_id.to_string());
+    let current_generation = source.current_head.storage_generation();
+    let current_generation_path = source_entity
+        .join("generations")
+        .join(current_generation.directory_name());
+    let current_head_bytes = DurableStoreV1Codec::encode_session_head(&source.current_head)
+        .map_err(|_| DurableSessionForkError::InternalDispatchUnavailable)?;
+    let current_definition_bytes =
+        DurableStoreV1Codec::encode_session_definition(&source.current_definition)
+            .map_err(|_| DurableSessionForkError::InternalDispatchUnavailable)?;
+    let current_definition_path = source_entity
+        .join("generations")
+        .join(
+            source
+                .current_head
+                .current_definition_storage_generation()
+                .directory_name(),
+        )
+        .join("definition.json");
+    for (path, expected) in [
+        (source_entity.join("PUBLISHED"), b"".as_slice()),
+        (current_generation_path.join("COMMITTED"), b"".as_slice()),
+        (
+            current_generation_path.join("head.json"),
+            current_head_bytes.as_slice(),
+        ),
+        (current_definition_path, current_definition_bytes.as_slice()),
+    ] {
+        if exact_readback_state(filesystem, &path, expected) != PublicationCertainty::Published {
+            return Err(DurableSessionForkError::InternalDispatchUnavailable);
+        }
+    }
+    let initial_definition_path =
+        source_entity.join("generations/00000000000000000001/definition.json");
+    let initial_definition_bytes = filesystem
+        .read_document(&initial_definition_path)
+        .map_err(map_recorded_fork_source_definition_error)?;
+    let initial_definition =
+        DurableStoreV1Codec::decode_session_definition(&initial_definition_bytes)
+            .map_err(map_durable_document_codec_error)
+            .map_err(map_recorded_fork_source_definition_error)?;
+    if initial_definition.session_id() != source_session_id
+        || initial_definition.revision().get() != 1
+        || initial_definition.agent().agent_id() != source.current_definition.agent().agent_id()
+        || initial_definition.created_at() != source.current_head.created_at()
+    {
+        return Err(DurableSessionForkError::InternalDispatchUnavailable);
+    }
+    let expected_header = SessionHeader::reconstruct(
+        1,
+        source_session_id,
+        source.current_head.created_at(),
+        initial_definition.agent(),
+        initial_definition.revision(),
+    );
+    let conversation_path = source_entity.join("conversation.jsonl");
+    let initial_path_metadata =
+        metadata_without_following(&conversation_path).map_err(map_recorded_fork_open_error)?;
+    validate_existing_regular_file(
+        &initial_path_metadata,
+        DurableOpenError::DurableStateCorrupt,
+    )
+    .map_err(map_recorded_fork_open_error)?;
+    if initial_path_metadata.len() > MAX_CONVERSATION_FILE_BYTES {
+        return Err(DurableSessionForkError::SourceConversationTooLarge);
+    }
+    let file = filesystem
+        .open_file(&conversation_path)
+        .map_err(|_| DurableSessionForkError::StorageUnavailable)?;
+    let opened_handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableSessionForkError::StorageUnavailable)?;
+    let opened_path_metadata =
+        metadata_without_following(&conversation_path).map_err(map_recorded_fork_open_error)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &opened_handle_metadata,
+        &opened_path_metadata,
+    )
+    .map_err(map_recorded_fork_open_error)?;
+    let declared_file_bytes = initial_path_metadata.len();
+    let mut lease = RecordedForkConversationLease::from_durable_state(
+        source_session_id,
+        declared_file_bytes,
+        file,
+    );
+    if lease.source_session_id() != source_session_id
+        || lease.declared_file_bytes() != declared_file_bytes
+    {
+        return Err(DurableSessionForkError::InternalDispatchUnavailable);
+    }
+    lease
+        .validate_recorded_genesis(&expected_header)
+        .map_err(map_recorded_fork_source_error)?;
+    let final_handle_metadata = lease
+        .handle_metadata()
+        .map_err(|_| DurableSessionForkError::StorageUnavailable)?;
+    let final_path_metadata =
+        metadata_without_following(&conversation_path).map_err(map_recorded_fork_open_error)?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &final_handle_metadata,
+        &final_path_metadata,
+    )
+    .map_err(map_recorded_fork_open_error)
+}
+
+const fn map_recorded_fork_source_error(error: RecordedForkSourceError) -> DurableSessionForkError {
+    match error {
+        RecordedForkSourceError::TooLarge => DurableSessionForkError::SourceConversationTooLarge,
+        RecordedForkSourceError::Corrupt => DurableSessionForkError::SourceConversationCorrupt,
+        RecordedForkSourceError::Unavailable => DurableSessionForkError::StorageUnavailable,
+    }
+}
+
+const fn map_recorded_fork_open_error(error: DurableOpenError) -> DurableSessionForkError {
+    match error {
+        DurableOpenError::DurableStateTooLarge => {
+            DurableSessionForkError::SourceConversationTooLarge
+        }
+        DurableOpenError::DurableStateCorrupt
+        | DurableOpenError::UnsupportedStoreFormat
+        | DurableOpenError::StoreInUse => DurableSessionForkError::SourceConversationCorrupt,
+        DurableOpenError::StorageUnavailable => DurableSessionForkError::StorageUnavailable,
+    }
+}
+
+const fn map_recorded_fork_source_definition_error(
+    error: DurableOpenError,
+) -> DurableSessionForkError {
+    let _ = error;
+    DurableSessionForkError::InternalDispatchUnavailable
+}
+
+const fn map_fork_source_task_error(error: RuntimeTaskError) -> DurableSessionForkError {
+    match error {
+        RuntimeTaskError::OwnerClosing => DurableSessionForkError::Closing,
+        RuntimeTaskError::WorkerUnavailable => DurableSessionForkError::StorageUnavailable,
+        RuntimeTaskError::OperationPanicked => DurableSessionForkError::InternalDispatchUnavailable,
+    }
+}
+
+fn map_session_publication_for_fork(
+    result: SessionPublicationWorkResult,
+) -> SessionForkPublicationWorkResult {
+    match result {
+        SessionPublicationWorkResult::Published {
+            entry,
+            close_required,
+        } => SessionForkPublicationWorkResult::Published {
+            entry,
+            close_required,
+        },
+        SessionPublicationWorkResult::Ordinary {
+            error: DurableSessionCreateError::Closing,
+            close_required,
+        } => SessionForkPublicationWorkResult::Ordinary {
+            error: DurableSessionForkError::Closing,
+            close_required,
+        },
+        SessionPublicationWorkResult::Ordinary {
+            error: DurableSessionCreateError::StorageUnavailable,
+            close_required,
+        } => SessionForkPublicationWorkResult::Ordinary {
+            error: DurableSessionForkError::StorageUnavailable,
+            close_required,
+        },
+        SessionPublicationWorkResult::Ordinary {
+            error: DurableSessionCreateError::InternalDispatchUnavailable,
+            ..
+        }
+        | SessionPublicationWorkResult::Poisoned => SessionForkPublicationWorkResult::Poisoned,
+        SessionPublicationWorkResult::Ordinary { .. } => SessionForkPublicationWorkResult::Poisoned,
+    }
+}
+
 /// The ordinary-Create conversation fact validated before COMMITTED. The proof retains the
 /// exact physical identity/length and canonical Header semantics so final publication revalidates
 /// the same file rather than assembling certainty from an unrelated same-content replacement.
@@ -2612,6 +3355,7 @@ impl DurableCommitBarrier {
 )]
 async fn publish_agent_generation(
     task_context: RuntimeTaskContext,
+    lease: Arc<RootLease>,
     filesystem: Arc<dyn DurableFilesystem>,
     root: PathBuf,
     directory_sync: DirectorySync,
@@ -2624,6 +3368,7 @@ async fn publish_agent_generation(
     *lock(&active_barrier) = Some(Arc::clone(&barrier));
     let worker_barrier = Arc::clone(&barrier);
     let job = task_context.spawn_blocking_tracked(move || {
+        let _lease = lease;
         publish_agent_generation_blocking(
             filesystem.as_ref(),
             &root,
@@ -2665,6 +3410,7 @@ async fn publish_agent_generation(
 )]
 async fn publish_session_generation(
     task_context: RuntimeTaskContext,
+    lease: Arc<RootLease>,
     filesystem: Arc<dyn DurableFilesystem>,
     root: PathBuf,
     directory_sync: DirectorySync,
@@ -2674,6 +3420,7 @@ async fn publish_session_generation(
     definition_bytes: Vec<u8>,
     conversation_bytes: Vec<u8>,
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
+    sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
     agent_gate: tokio::sync::OwnedRwLockReadGuard<()>,
     closing: CancellationToken,
     active_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
@@ -2682,6 +3429,7 @@ async fn publish_session_generation(
     *lock(&active_barrier) = Some(Arc::clone(&barrier));
     let worker_barrier = Arc::clone(&barrier);
     let job = task_context.spawn_blocking_tracked(move || {
+        let _lease = lease;
         let _agent_gate = agent_gate;
         publish_session_generation_blocking(
             filesystem.as_ref(),
@@ -2693,6 +3441,7 @@ async fn publish_session_generation(
             &definition_bytes,
             &conversation_bytes,
             &agents,
+            &sessions,
             worker_barrier,
         )
     });
@@ -2796,6 +3545,7 @@ fn publish_session_generation_blocking(
     definition_bytes: &[u8],
     conversation_bytes: &[u8],
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     barrier: Arc<DurableCommitBarrier>,
 ) -> SessionPublicationWorkResult {
     #[cfg(test)]
@@ -2829,6 +3579,7 @@ fn publish_session_generation_blocking(
                     directory_sync,
                     session_id,
                     agents,
+                    sessions,
                     DurableSessionCreateError::Closing,
                     &barrier,
                 );
@@ -2840,6 +3591,7 @@ fn publish_session_generation_blocking(
                     directory_sync,
                     session_id,
                     agents,
+                    sessions,
                     DurableSessionCreateError::StorageUnavailable,
                     &barrier,
                 );
@@ -2886,6 +3638,7 @@ fn publish_session_generation_blocking(
             directory_sync,
             session_id,
             agents,
+            sessions,
             DurableSessionCreateError::Closing,
             &barrier,
         );
@@ -2904,6 +3657,7 @@ fn publish_session_generation_blocking(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 DurableSessionCreateError::StorageUnavailable,
                 &barrier,
             );
@@ -2920,6 +3674,7 @@ fn publish_session_generation_blocking(
             directory_sync,
             session_id,
             agents,
+            sessions,
             DurableSessionCreateError::Closing,
             &barrier,
         );
@@ -2936,6 +3691,7 @@ fn publish_session_generation_blocking(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 &committed_path,
                 &head_path,
                 &definition_path,
@@ -2981,6 +3737,7 @@ fn publish_session_generation_blocking(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 &committed_path,
                 &head_path,
                 &definition_path,
@@ -3004,6 +3761,7 @@ fn publish_session_generation_blocking(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 &entity,
                 head_bytes,
                 definition_bytes,
@@ -3033,6 +3791,7 @@ fn publish_session_generation_blocking(
             directory_sync,
             session_id,
             agents,
+            sessions,
             &entity,
             head_bytes,
             definition_bytes,
@@ -3047,6 +3806,7 @@ fn publish_session_generation_blocking(
         &entity,
         session_id,
         agents,
+        sessions,
         head_bytes,
         definition_bytes,
         &conversation_proof,
@@ -3059,6 +3819,7 @@ fn publish_session_generation_blocking(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 &entity,
                 head_bytes,
                 definition_bytes,
@@ -3093,6 +3854,7 @@ fn reconcile_session_precommit_failure(
     directory_sync: DirectorySync,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     error: DurableSessionCreateError,
     barrier: &DurableCommitBarrier,
 ) -> SessionPublicationWorkResult {
@@ -3107,6 +3869,7 @@ fn reconcile_session_precommit_failure(
         directory_sync,
         session_id,
         agents,
+        sessions,
         false,
     ) {
         Ok(()) => SessionPublicationWorkResult::Ordinary {
@@ -3136,6 +3899,7 @@ fn reconcile_session_committed_failure(
     directory_sync: DirectorySync,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     committed_path: &Path,
     head_path: &Path,
     definition_path: &Path,
@@ -3184,6 +3948,7 @@ fn reconcile_session_committed_failure(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 true,
             ) {
                 Ok(()) => SessionPublicationWorkResult::Ordinary {
@@ -3215,6 +3980,7 @@ fn reconcile_session_published_failure(
     directory_sync: DirectorySync,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     entity: &Path,
     head_bytes: &[u8],
     definition_bytes: &[u8],
@@ -3240,6 +4006,7 @@ fn reconcile_session_published_failure(
                 entity,
                 session_id,
                 agents,
+                sessions,
                 head_bytes,
                 definition_bytes,
                 conversation_proof,
@@ -3259,6 +4026,7 @@ fn reconcile_session_published_failure(
                 directory_sync,
                 session_id,
                 agents,
+                sessions,
                 true,
             ) {
                 Ok(()) => SessionPublicationWorkResult::Ordinary {
@@ -3286,6 +4054,7 @@ fn recover_published_session(
     entity: &Path,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     head_bytes: &[u8],
     definition_bytes: &[u8],
     conversation_proof: &PreparedOrdinaryConversationProof,
@@ -3343,14 +4112,23 @@ fn recover_published_session(
     let agent = agents
         .get(&pinned_agent.agent_id())
         .ok_or(PublicationCertainty::CommittedCorruptPoisoned)?;
-    let expected_agent = AgentRevisionRef::new(
-        pinned_agent.agent_id(),
-        agent.current_head.current_definition_revision(),
-    );
-    if agent.current_head.status() != AgentStatus::Enabled
-        || recovered.entry.current_definition.agent() != expected_agent
-    {
+    if agent.current_head.status() != AgentStatus::Enabled {
         return Err(PublicationCertainty::CommittedCorruptPoisoned);
+    }
+    match recovered.entry.current_head.fork_provenance() {
+        None => {
+            let expected_agent = AgentRevisionRef::new(
+                pinned_agent.agent_id(),
+                agent.current_head.current_definition_revision(),
+            );
+            if pinned_agent != expected_agent {
+                return Err(PublicationCertainty::CommittedCorruptPoisoned);
+            }
+        }
+        Some(provenance)
+            if provenance.source_session_id() != session_id
+                && sessions.contains_key(&provenance.source_session_id()) => {}
+        Some(_) => return Err(PublicationCertainty::CommittedCorruptPoisoned),
     }
 
     let expected_header = SessionHeader::reconstruct(
@@ -4191,6 +4969,7 @@ fn cleanup_operation_owned_session_staging(
     directory_sync: DirectorySync,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     allow_committed: bool,
 ) -> Result<(), StagingCleanupError> {
     let reservation_path = root
@@ -4211,7 +4990,7 @@ fn cleanup_operation_owned_session_staging(
         ScannedSessionEntity::Unpublished(files) => files,
         ScannedSessionEntity::Published(_) => return Err(StagingCleanupError::Poisoned),
     };
-    validate_unpublished_session_candidate(session_id, &files, agents, &BTreeMap::new())
+    validate_unpublished_session_candidate(session_id, &files, agents, sessions)
         .map_err(|_| StagingCleanupError::Poisoned)?;
     if !allow_committed
         && files
@@ -4352,10 +5131,12 @@ impl DurableState {
         let agent_lifecycle_gates = Arc::new(AgentLifecycleGateRegistry::default());
         let actor = match DurableStateActorHandle::start(
             &task_context,
+            Arc::clone(lease),
             root.clone(),
             *directory_sync,
             Arc::clone(&agent_lifecycle_gates),
             Arc::clone(agents),
+            Arc::clone(sessions),
             Arc::clone(agent_reservations),
             Arc::clone(session_reservations),
             filesystem,
@@ -4479,6 +5260,37 @@ impl DurableState {
     ) -> Result<Arc<DurableSessionHead>, DurableSessionCreateError> {
         self.actor
             .enqueue_session_create_with_test_candidates(attempt, candidates, calls)
+            .await
+            .wait()
+            .await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the production Session command surface consumes this durable Fork seam"
+    )]
+    /// Publishes the current unloaded-source RecordedHistory + Genesis tracer.
+    ///
+    /// The future Runtime command caller must linearize source residency and invoke this seam only
+    /// with an unloaded source; loaded sources require `LiveSnapshot` and are not accepted through
+    /// this tracer. Keeping the method crate-private prevents that precondition becoming a public
+    /// production promise before Session residency ownership exists.
+    pub(crate) async fn fork_session(
+        &self,
+        attempt: SealedSessionForkAttempt,
+    ) -> Result<Arc<DurableSessionHead>, DurableSessionForkError> {
+        self.actor.enqueue_session_fork(attempt).await.wait().await
+    }
+
+    #[cfg(test)]
+    async fn fork_session_with_test_candidates(
+        &self,
+        attempt: SealedSessionForkAttempt,
+        candidates: impl IntoIterator<Item = Result<SessionId, ()>>,
+    ) -> Result<Arc<DurableSessionHead>, DurableSessionForkError> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        self.actor
+            .enqueue_session_fork_with_test_candidates(attempt, candidates, calls)
             .await
             .wait()
             .await
@@ -7844,7 +8656,8 @@ mod tests {
     };
     use crate::agent_session_lifecycle::{
         AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedSessionCreateAttempt,
-        SessionForkProvenance, SessionLifecycle, SessionMetadata, SessionModelConfig,
+        SealedSessionForkAttempt, SessionForkProvenance, SessionLifecycle, SessionMetadata,
+        SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::SessionPromptSelection;
@@ -9074,6 +9887,67 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn run_native_abort_session_fork_child(root: &Path, candidate: SessionId, point: &str) {
+        use std::os::unix::process::ExitStatusExt;
+
+        let proof_file =
+            NativeCrashProof::new(root.with_extension(format!("session-fork-{point}.crash-proof")));
+        let proof = format!("minicore-native-session-fork-abort-v1:{point}:{candidate}");
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("the lib test binary has an executable path"),
+        );
+        command
+            .arg("--exact")
+            .arg("durable_state::tests::native_process_abort_session_fork_child")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env("MINICORE_TEST_SESSION_FORK_CRASH_CHILD", "v1")
+            .env("MINICORE_TEST_CRASH_ROOT", root)
+            .env("MINICORE_TEST_CRASH_SESSION", candidate.to_string())
+            .env("MINICORE_TEST_CRASH_POINT", point)
+            .env("MINICORE_TEST_CRASH_PROOF", proof_file.path())
+            .env("MINICORE_TEST_CRASH_NONCE", &proof)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command
+            .spawn()
+            .expect("the native Session Fork crash child starts");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(_) => {
+                    assert!(
+                        kill_and_reap_native_child(&mut child),
+                        "the unobservable Session Fork crash child is killed and reaped"
+                    );
+                    panic!("the native Session Fork crash child could not be observed safely");
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                assert!(
+                    kill_and_reap_native_child(&mut child),
+                    "the timed-out Session Fork crash child is killed and reaped"
+                );
+                panic!("the native Session Fork crash child exceeded its bounded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let proof_bytes = fs::read(proof_file.path());
+        proof_file.remove();
+        assert!(
+            status.signal().is_some(),
+            "the Session Fork child terminates by signal at the explicit abort coordinate"
+        );
+        assert_eq!(
+            proof_bytes.expect("the Session Fork child writes its exact crash-hook proof"),
+            proof.as_bytes(),
+            "an unrelated signal cannot impersonate the Session Fork abort hook"
+        );
+    }
+
     #[test]
     fn durable_commit_barrier_is_first_wins_in_both_orders() {
         let crossed = super::DurableCommitBarrier::new();
@@ -9470,6 +10344,536 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_publishes_exact_child_g1_and_reopens() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        let child = SessionId::from_str(SESSION_THREE).unwrap();
+        let attempt = SealedSessionForkAttempt::recorded_genesis(
+            source,
+            "2026-08-03T10:03:00.000Z".parse().unwrap(),
+        );
+
+        let state = open(root.path()).await.expect("the source store opens");
+        let returned_head = state
+            .fork_session_with_test_candidates(attempt, [Ok(child)])
+            .await
+            .expect("the recorded Genesis Fork publishes");
+        let catalog_head = state
+            .session_head(child)
+            .expect("the child head is installed before completion");
+        assert!(Arc::ptr_eq(&returned_head, &catalog_head));
+        assert_eq!(
+            returned_head.fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                source,
+                ForkSourceKind::RecordedHistory,
+                ForkAnchor::Genesis,
+            ))
+        );
+
+        let child_entity = session_path(root.path(), SESSION_THREE);
+        let generation = child_entity.join("generations").join(GENERATION_ONE);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            genesis_fork_session_head_fixture()
+        );
+        assert_eq!(
+            fs::read(generation.join("definition.json")).unwrap(),
+            genesis_fork_session_definition_fixture()
+        );
+        assert_eq!(fs::read(generation.join("COMMITTED")).unwrap(), b"");
+        assert_eq!(fs::read(child_entity.join("PUBLISHED")).unwrap(), b"");
+        assert_eq!(
+            fs::read(child_entity.join("conversation.jsonl")).unwrap(),
+            include_bytes!("../docs/fixtures/durable-store-v1/genesis-fork-child.jsonl")
+        );
+        let definition = state
+            .session_current_definition(child)
+            .expect("the child definition is installed");
+        assert_eq!(definition.revision().get(), 1);
+        assert_eq!(definition.workspace().revision().get(), 1);
+        assert_eq!(definition.agent().revision().get(), 1);
+        assert!(state.session_head(source).is_some());
+        state.close().await;
+
+        let reopened = open(root.path()).await.expect("the Fork child reopens");
+        assert_eq!(
+            &*reopened
+                .session_head(child)
+                .expect("the child head reopens"),
+            &*returned_head
+        );
+        assert_eq!(
+            &*reopened
+                .session_current_definition(child)
+                .expect("the child definition reopens"),
+            &*definition
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_rejects_missing_and_deleted_sources_after_reservation() {
+        for (name, install_source, expected) in [
+            (
+                "missing",
+                false,
+                super::DurableSessionForkError::SourceNotFound,
+            ),
+            (
+                "deleted",
+                true,
+                super::DurableSessionForkError::SourceDeleted,
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            if install_source {
+                create_valid_g1_session(
+                    root.path(),
+                    &ordinary_header_only_conversation(SESSION_ONE),
+                );
+                create_session_generation(
+                    root.path(),
+                    SESSION_ONE,
+                    GENERATION_TWO,
+                    session_head_archived_g2_fixture(),
+                    None,
+                );
+                create_session_generation(
+                    root.path(),
+                    SESSION_ONE,
+                    GENERATION_THREE,
+                    session_head_deleted_g3_fixture(),
+                    None,
+                );
+            }
+            let source = SessionId::from_str(SESSION_ONE).unwrap();
+            let child = SessionId::from_str(SESSION_THREE).unwrap();
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("the {name} source store opens: {error:?}"));
+            assert_eq!(
+                state
+                    .fork_session_with_test_candidates(
+                        SealedSessionForkAttempt::recorded_genesis(
+                            source,
+                            "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                        ),
+                        [Ok(child)],
+                    )
+                    .await,
+                Err(expected),
+                "the {name} source is classified exactly"
+            );
+            assert!(
+                root.path()
+                    .join(RESERVATIONS_DIRECTORY)
+                    .join(SESSIONS_DIRECTORY)
+                    .join(SESSION_THREE)
+                    .is_file(),
+                "the child identity is permanently reserved before source resolution"
+            );
+            assert!(!session_path(root.path(), SESSION_THREE).exists());
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_allows_archived_source_and_preserves_captured_agent_revision() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_archived_g2_fixture(),
+            None,
+        );
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        let child = SessionId::from_str(SESSION_THREE).unwrap();
+        let state = open(root.path()).await.expect("the archived source opens");
+        assert_eq!(
+            state
+                .agent_head(AgentId::from_str(AGENT_ONE).unwrap())
+                .unwrap()
+                .current_definition_revision()
+                .get(),
+            2,
+            "the Agent current definition is newer than the source capture"
+        );
+        state
+            .fork_session_with_test_candidates(
+                SealedSessionForkAttempt::recorded_genesis(
+                    source,
+                    "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                ),
+                [Ok(child)],
+            )
+            .await
+            .expect("an archived source remains forkable while the Agent is Enabled");
+        let child_definition = state.session_current_definition(child).unwrap();
+        assert_eq!(child_definition.agent().revision().get(), 1);
+        assert_eq!(child_definition.workspace().revision().get(), 1);
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the child retaining Agent revision one reopens");
+        assert_eq!(
+            reopened
+                .session_current_definition(child)
+                .unwrap()
+                .agent()
+                .revision()
+                .get(),
+            1
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_captures_the_source_current_definition_semantics() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let child = SessionId::from_str(SESSION_THREE).unwrap();
+        let state = open(root.path()).await.expect("the G2 source opens");
+        state
+            .fork_session_with_test_candidates(
+                SealedSessionForkAttempt::recorded_genesis(
+                    SessionId::from_str(SESSION_ONE).unwrap(),
+                    "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                ),
+                [Ok(child)],
+            )
+            .await
+            .expect("the Fork captures the source current definition");
+        let definition = state.session_current_definition(child).unwrap();
+        assert_eq!(definition.revision().get(), 1);
+        assert_eq!(definition.workspace().revision().get(), 1);
+        assert_eq!(definition.model().max_output_tokens().unwrap().get(), 8192);
+        assert_eq!(
+            definition.created_at(),
+            "2026-08-03T10:03:00.000Z".parse().unwrap()
+        );
+        state.close().await;
+
+        let reopened = open(root.path())
+            .await
+            .expect("the G2-derived child reopens");
+        assert_eq!(
+            reopened
+                .session_current_definition(child)
+                .unwrap()
+                .model()
+                .max_output_tokens()
+                .unwrap()
+                .get(),
+            8192
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_requires_the_current_agent_to_be_enabled() {
+        for (status, expected) in [
+            (
+                AgentStatus::Disabled,
+                super::DurableSessionForkError::AgentDisabled,
+            ),
+            (
+                AgentStatus::Deleted,
+                super::DurableSessionForkError::AgentDeleted,
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let status_head = match status {
+                AgentStatus::Disabled => agent_head_status_g2_fixture().to_vec(),
+                AgentStatus::Deleted => replace_fixture(
+                    agent_head_status_g2_fixture(),
+                    "\"status\":\"disabled\"",
+                    "\"status\":\"deleted\"",
+                ),
+                AgentStatus::Enabled => unreachable!("the test covers non-Enabled states"),
+            };
+            create_agent_generation(root.path(), AGENT_ONE, GENERATION_TWO, &status_head, None);
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            let state = open(root.path()).await.expect("the source store opens");
+            let child = SessionId::from_str(SESSION_THREE).unwrap();
+            assert_eq!(
+                state
+                    .fork_session_with_test_candidates(
+                        SealedSessionForkAttempt::recorded_genesis(
+                            SessionId::from_str(SESSION_ONE).unwrap(),
+                            "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                        ),
+                        [Ok(child)],
+                    )
+                    .await,
+                Err(expected)
+            );
+            assert!(!session_path(root.path(), SESSION_THREE).exists());
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_source_conversation_failures_are_typed_and_session_local() {
+        for (name, remove_source, expected) in [
+            (
+                "noncanonical Header",
+                false,
+                super::DurableSessionForkError::SourceConversationCorrupt,
+            ),
+            (
+                "missing conversation",
+                true,
+                super::DurableSessionForkError::StorageUnavailable,
+            ),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            let state = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("the {name} source is initially valid: {error:?}"));
+            let source_conversation =
+                session_path(root.path(), SESSION_ONE).join("conversation.jsonl");
+            if remove_source {
+                fs::remove_file(&source_conversation).unwrap();
+            } else {
+                let canonical = fs::read(&source_conversation).unwrap();
+                let mut noncanonical = Vec::with_capacity(canonical.len() + 1);
+                noncanonical.push(b' ');
+                noncanonical.extend_from_slice(&canonical);
+                fs::write(&source_conversation, noncanonical).unwrap();
+            }
+            assert_eq!(
+                state
+                    .fork_session_with_test_candidates(
+                        SealedSessionForkAttempt::recorded_genesis(
+                            SessionId::from_str(SESSION_ONE).unwrap(),
+                            "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                        ),
+                        [Ok(session_candidate(96))],
+                    )
+                    .await,
+                Err(expected),
+                "{name} maps through the source capability"
+            );
+            assert_eq!(
+                state
+                    .create_session_with_test_candidates(
+                        ordinary_session_create_attempt(AgentId::from_str(AGENT_ONE).unwrap()),
+                        [Ok(session_candidate(97))],
+                    )
+                    .await
+                    .map(|head| head.session_id()),
+                Ok(session_candidate(97)),
+                "{name} degrades only that source Session rather than closing DurableState"
+            );
+            state.close().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_treats_a_changed_required_source_definition_as_fatal() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let state = open(root.path())
+            .await
+            .expect("the source is initially valid");
+        fs::write(
+            session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("definition.json"),
+            b"corrupt source definition",
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .fork_session_with_test_candidates(
+                    SealedSessionForkAttempt::recorded_genesis(
+                        SessionId::from_str(SESSION_ONE).unwrap(),
+                        "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    ),
+                    [Ok(session_candidate(98))],
+                )
+                .await,
+            Err(super::DurableSessionForkError::InternalDispatchUnavailable)
+        );
+        assert!(!session_path(root.path(), &session_candidate(98).to_string()).exists());
+        state.close().await;
+        assert!(matches!(
+            open(root.path()).await,
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_exactly_revalidates_the_source_current_generation() {
+        for remove_current_definition in [false, true] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            create_session_generation(
+                root.path(),
+                SESSION_ONE,
+                GENERATION_TWO,
+                session_head_definition_g2_fixture(),
+                Some(&session_definition_g2_fixture()),
+            );
+            let state = open(root.path())
+                .await
+                .expect("the G2 source is initially valid");
+            let current_definition_path = session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .join("definition.json");
+            if remove_current_definition {
+                fs::remove_file(&current_definition_path).unwrap();
+            } else {
+                let changed = replace_fixture(
+                    &fs::read(&current_definition_path).unwrap(),
+                    "\"maxOutputTokens\":8192",
+                    "\"maxOutputTokens\":8193",
+                );
+                fs::write(&current_definition_path, changed).unwrap();
+            }
+            let child = session_candidate(if remove_current_definition { 100 } else { 101 });
+            assert_eq!(
+                state
+                    .fork_session_with_test_candidates(
+                        SealedSessionForkAttempt::recorded_genesis(
+                            SessionId::from_str(SESSION_ONE).unwrap(),
+                            "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                        ),
+                        [Ok(child)],
+                    )
+                    .await,
+                Err(super::DurableSessionForkError::InternalDispatchUnavailable)
+            );
+            assert!(!session_path(root.path(), &child.to_string()).exists());
+            state.close().await;
+            if remove_current_definition {
+                assert!(matches!(
+                    open(root.path()).await,
+                    Err(DurableOpenError::DurableStateCorrupt)
+                ));
+            } else {
+                let reopened = open(root.path())
+                    .await
+                    .expect("restart may adopt a separately valid externally changed store");
+                assert_eq!(
+                    reopened
+                        .session_current_definition(SessionId::from_str(SESSION_ONE).unwrap())
+                        .unwrap()
+                        .model()
+                        .max_output_tokens()
+                        .unwrap()
+                        .get(),
+                    8193
+                );
+                reopened.close().await;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_portably_rejects_a_child_equal_to_its_source() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        let state = open(root.path()).await.expect("the source store opens");
+        assert_eq!(
+            state
+                .fork_session_with_test_candidates(
+                    SealedSessionForkAttempt::recorded_genesis(
+                        source,
+                        "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    ),
+                    [Ok(source)],
+                )
+                .await,
+            Err(super::DurableSessionForkError::SourceIdentityConflict)
+        );
+        assert_eq!(
+            fs::read_dir(root.path().join(SESSIONS_DIRECTORY))
+                .unwrap()
+                .count(),
+            1
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_rejects_source_identity_before_reservation_io() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_reservation_faults([
+                super::ReservationFault::BeforeCreate,
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), filesystem).await;
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .fork_session_with_test_candidates(
+                    SealedSessionForkAttempt::recorded_genesis(
+                        source,
+                        "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    ),
+                    [Ok(source)],
+                )
+                .await,
+            Err(super::DurableSessionForkError::SourceIdentityConflict),
+            "the untouched BeforeCreate fault proves no reservation syscall occurred"
+        );
+        assert_eq!(
+            fs::read_dir(root.path().join(SESSIONS_DIRECTORY))
+                .unwrap()
+                .count(),
+            1
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn create_session_reports_a_missing_agent_without_entity_staging() {
         let root = TempRoot::nonexistent();
         let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
@@ -9749,6 +11153,41 @@ mod tests {
                 .agent_id(),
             candidate
         );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_maps_pre_source_worker_owner_close_to_closing() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        filesystem.close_task_owner_before_reservation_readback(state.task_context.clone());
+        let child = session_candidate(99);
+        assert_eq!(
+            state
+                .fork_session_with_test_candidates(
+                    SealedSessionForkAttempt::recorded_genesis(
+                        SessionId::from_str(SESSION_ONE).unwrap(),
+                        "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    ),
+                    [Ok(child)],
+                )
+                .await,
+            Err(super::DurableSessionForkError::Closing)
+        );
+        assert!(
+            root.path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(child.to_string())
+                .is_file(),
+            "the child identity was burned before the source job was rejected"
+        );
+        assert!(!session_path(root.path(), &child.to_string()).exists());
         state.close().await;
     }
 
@@ -10272,6 +11711,172 @@ mod tests {
             assert_eq!(reopened.session_head(first).is_some(), publishes, "{name}");
             reopened.close().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_genesis_fork_faults_preserve_source_dependency_and_visibility_certainty() {
+        let cases = [
+            (
+                "conversation-write-after",
+                PublicationFault::After(PublicationOperation::WriteConversation),
+                false,
+                false,
+            ),
+            (
+                "committed-create-after",
+                PublicationFault::After(PublicationOperation::CreateCommitted),
+                true,
+                true,
+            ),
+            (
+                "published-create-after",
+                PublicationFault::After(PublicationOperation::CreatePublished),
+                true,
+                false,
+            ),
+            (
+                "published-sessions-sync-after",
+                PublicationFault::After(PublicationOperation::SyncPublishedSessionsDirectory),
+                true,
+                true,
+            ),
+        ];
+
+        for (name, fault, publishes, closes) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state =
+                open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+            let source = SessionId::from_str(SESSION_ONE).unwrap();
+            let first = session_candidate(91);
+            let second = session_candidate(92);
+            let make_attempt = || {
+                SealedSessionForkAttempt::recorded_genesis(
+                    source,
+                    "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                )
+            };
+            let first_result = state
+                .fork_session_with_test_candidates(make_attempt(), [Ok(first)])
+                .await;
+
+            if publishes {
+                assert_eq!(
+                    first_result.as_ref().map(|head| head.session_id()),
+                    Ok(first),
+                    "{name}"
+                );
+                assert!(
+                    state.session_head(source).is_some(),
+                    "{name} retains source"
+                );
+                assert!(state.session_head(first).is_some(), "{name} installs child");
+                let second_result = state
+                    .fork_session_with_test_candidates(make_attempt(), [Ok(second)])
+                    .await;
+                if closes {
+                    assert_eq!(
+                        second_result,
+                        Err(super::DurableSessionForkError::Closing),
+                        "{name} closes only after child success"
+                    );
+                } else {
+                    assert_eq!(
+                        second_result.map(|head| head.session_id()),
+                        Ok(second),
+                        "{name} remains mutation-capable"
+                    );
+                }
+            } else {
+                assert_eq!(
+                    first_result,
+                    Err(super::DurableSessionForkError::StorageUnavailable),
+                    "{name} is an ordinary prepublication failure"
+                );
+                assert!(
+                    state.session_head(source).is_some(),
+                    "{name} retains source"
+                );
+                assert!(!session_path(root.path(), &first.to_string()).exists());
+                assert_eq!(
+                    state
+                        .fork_session_with_test_candidates(make_attempt(), [Ok(second)])
+                        .await
+                        .map(|head| head.session_id()),
+                    Ok(second),
+                    "{name} cleanup validated the source dependency"
+                );
+            }
+
+            state.close().await;
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} Fork store reopens: {error:?}"));
+            assert!(reopened.session_head(source).is_some(), "{name}");
+            assert_eq!(reopened.session_head(first).is_some(), publishes, "{name}");
+            reopened.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_fork_facades_cannot_release_the_root_lease_before_actor_job_settlement() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let owner = state.task_context.clone();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_commit_barrier(ReservationBarrier::new(entered, release_receiver));
+        let child = session_candidate(95);
+        let state_for_fork = state.clone();
+        let fork = tokio::spawn(async move {
+            state_for_fork
+                .fork_session_with_test_candidates(
+                    SealedSessionForkAttempt::recorded_genesis(
+                        SessionId::from_str(SESSION_ONE).unwrap(),
+                        "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                    ),
+                    [Ok(child)],
+                )
+                .await
+        });
+
+        wait_reservation_barrier(entered_receiver).await;
+        fork.abort();
+        assert!(
+            fork.await
+                .expect_err("the dispatch future is aborted")
+                .is_cancelled()
+        );
+        drop(state);
+
+        let contender_context = RuntimeTaskContext::new(Handle::current())
+            .await
+            .expect("the contender has a time driver");
+        assert!(matches!(
+            DurableState::open(root.path().to_owned(), contender_context.clone()).await,
+            Err(DurableOpenError::StoreInUse)
+        ));
+        contender_context.shutdown().await;
+
+        release
+            .send(())
+            .expect("the actor-owned Fork publication resumes");
+        owner.shutdown().await;
+        let reopened = open(root.path())
+            .await
+            .expect("the root lease releases only after actor and child settlement");
+        assert!(reopened.session_head(child).is_some());
+        reopened.close().await;
     }
 
     #[cfg(unix)]
@@ -10876,6 +12481,100 @@ mod tests {
                 assert!(
                     !entity.exists(),
                     "restart exactly cleans the invisible aborted Session entity"
+                );
+            }
+            reopened.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "spawned as a controlled native process-abort child"]
+    async fn native_process_abort_session_fork_child() {
+        if std::env::var("MINICORE_TEST_SESSION_FORK_CRASH_CHILD").as_deref() != Ok("v1") {
+            return;
+        }
+        let root = PathBuf::from(
+            std::env::var_os("MINICORE_TEST_CRASH_ROOT")
+                .expect("the parent supplies the Session Fork crash root"),
+        );
+        let candidate: SessionId = std::env::var("MINICORE_TEST_CRASH_SESSION")
+            .expect("the parent supplies the Fork child Session")
+            .parse()
+            .expect("the Fork child Session ID is canonical");
+        let operation = match std::env::var("MINICORE_TEST_CRASH_POINT").as_deref() {
+            Ok("before_published") => PublicationOperation::SyncCommittedGenerationDirectory,
+            Ok("after_published") => PublicationOperation::SyncPublishedSessionsDirectory,
+            _ => panic!("the parent supplies a known Session Fork crash coordinate"),
+        };
+        let proof_path = PathBuf::from(
+            std::env::var_os("MINICORE_TEST_CRASH_PROOF")
+                .expect("the parent supplies the Session Fork crash proof path"),
+        );
+        let proof = std::env::var("MINICORE_TEST_CRASH_NONCE")
+            .expect("the parent supplies the Session Fork crash proof nonce");
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(&root, Arc::clone(&filesystem)).await;
+        filesystem.abort_after_publication_operation(operation, proof_path, proof);
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+
+        let result = state
+            .fork_session_with_test_candidates(
+                SealedSessionForkAttempt::recorded_genesis(
+                    source,
+                    "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                ),
+                [Ok(candidate)],
+            )
+            .await;
+        panic!("the native Session Fork crash hook did not abort publication: {result:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn native_process_abort_reopens_session_fork_as_invisible_or_published() {
+        for (point, candidate, published) in [
+            ("before_published", session_candidate(93), false),
+            ("after_published", session_candidate(94), true),
+        ] {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            create_valid_g1_session(root.path(), &ordinary_header_only_conversation(SESSION_ONE));
+            run_native_abort_session_fork_child(root.path(), candidate, point);
+
+            let reservation = root
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(candidate.to_string());
+            let entity = session_path(root.path(), &candidate.to_string());
+            let generation = entity.join("generations").join(GENERATION_ONE);
+            assert!(
+                reservation.is_file(),
+                "{point} retains the burned Fork child ID"
+            );
+            assert!(generation.join("COMMITTED").is_file(), "{point}");
+            assert_eq!(entity.join("PUBLISHED").is_file(), published, "{point}");
+
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{point} Session Fork store reopens: {error:?}"));
+            assert!(
+                reopened
+                    .session_head(SessionId::from_str(SESSION_ONE).unwrap())
+                    .is_some(),
+                "{point} retains the published source"
+            );
+            assert_eq!(
+                reopened.session_head(candidate).is_some(),
+                published,
+                "{point}"
+            );
+            if !published {
+                assert!(
+                    !entity.exists(),
+                    "restart exactly cleans the invisible aborted Fork child"
                 );
             }
             reopened.close().await;

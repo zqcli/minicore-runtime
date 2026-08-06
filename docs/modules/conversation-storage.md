@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 recovery/root-lease foundation、crate-private Agent Create及ordinary Session Create canonical Header/same-file proof publication完成；published conversation target/writable proof、Session Fork、Recorder与semantic replay pending）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 recovery/root-lease foundation、crate-private Agent Create、ordinary Session Create canonical Header/same-file proof publication及unloaded RecordedHistory + Genesis Fork source-Header tracer完成；published conversation target/writable proof、non-Genesis/LiveSnapshot Fork semantic streaming、Recorder与semantic replay pending）
 日期：2026-07-31
 
 ## 目的

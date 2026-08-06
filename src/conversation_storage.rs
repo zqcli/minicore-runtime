@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
-use std::io::Read;
+use std::fs::{File, Metadata};
+use std::io::{self, Read};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -85,6 +86,103 @@ impl ExclusiveWritableConversationLease {
             session_id,
             declared_file_bytes,
         }
+    }
+}
+
+/// Opaque same-open source capability for one unloaded recorded-history Fork capture.
+///
+/// DurableState is the sole issuer. The lease contains no path and exposes no raw file handle;
+/// Conversation Storage consumes the held file for Header validation while DurableState retains
+/// the root lease and independently revalidates the source path observation.
+pub(crate) struct RecordedForkConversationLease {
+    source_session_id: SessionId,
+    declared_file_bytes: u64,
+    file: File,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum RecordedForkSourceError {
+    #[error("recorded Fork source exceeds its selected storage limit")]
+    TooLarge,
+    #[error("recorded Fork source is corrupt")]
+    Corrupt,
+    #[error("recorded Fork source is unavailable")]
+    Unavailable,
+}
+
+impl RecordedForkConversationLease {
+    pub(crate) fn from_durable_state(
+        source_session_id: SessionId,
+        declared_file_bytes: u64,
+        file: File,
+    ) -> Self {
+        Self {
+            source_session_id,
+            declared_file_bytes,
+            file,
+        }
+    }
+
+    pub(crate) const fn source_session_id(&self) -> SessionId {
+        self.source_session_id
+    }
+
+    pub(crate) const fn declared_file_bytes(&self) -> u64 {
+        self.declared_file_bytes
+    }
+
+    pub(crate) fn validate_recorded_genesis(
+        &mut self,
+        expected_header: &SessionHeader,
+    ) -> Result<(), RecordedForkSourceError> {
+        let scanner = ConversationJsonlScanner::open(
+            &mut self.file,
+            self.declared_file_bytes,
+            self.source_session_id,
+            ConversationScanAccess::ReadOnly,
+        )
+        .map_err(map_recorded_fork_source_scan_error)?;
+        if scanner
+            .header()
+            .map_err(map_recorded_fork_source_scan_error)?
+            != expected_header
+            || !scanner.header_is_canonical()
+        {
+            return Err(RecordedForkSourceError::Corrupt);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn handle_metadata(&self) -> io::Result<Metadata> {
+        self.file.metadata()
+    }
+}
+
+impl fmt::Debug for RecordedForkConversationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordedForkConversationLease")
+            .field("source_session", &"redacted")
+            .field("declared_file_bytes", &self.declared_file_bytes)
+            .finish()
+    }
+}
+
+fn map_recorded_fork_source_scan_error(error: ConversationScanError) -> RecordedForkSourceError {
+    match error {
+        ConversationScanError::FileTooLarge
+        | ConversationScanError::HistoryTooLarge
+        | ConversationScanError::HeaderCorrupt {
+            code: ConversationCodecError::HeaderTooLarge,
+        } => RecordedForkSourceError::TooLarge,
+        ConversationScanError::HeaderCorrupt { .. }
+        | ConversationScanError::UnsupportedFormatVersion
+        | ConversationScanError::MissingHeader => RecordedForkSourceError::Corrupt,
+        ConversationScanError::LeaseMismatch
+        | ConversationScanError::InputChanged
+        | ConversationScanError::InputUnavailable
+        | ConversationScanError::CounterOverflow
+        | ConversationScanError::InvariantViolation => RecordedForkSourceError::Unavailable,
     }
 }
 
