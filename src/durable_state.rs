@@ -439,13 +439,95 @@ impl fmt::Debug for DurableAgentCatalogEntry {
     }
 }
 
+/// The compact immutable exact-definition index owned only by Session recovery/publication.
+/// Recovered definitions are dense by revision (`revision - 1`), while definitions published by
+/// this process live in the small overlay. Existing Session publication therefore shares the
+/// recovered base and copies only the process-local overlay when appending one mapping.
+#[derive(Clone)]
+struct SessionDefinitionIndex {
+    recovered_base: Arc<[StorageGeneration]>,
+    published_overlay: Arc<[StorageGeneration]>,
+}
+
+impl SessionDefinitionIndex {
+    fn from_recovered(generations: Vec<StorageGeneration>) -> Arc<Self> {
+        Arc::new(Self {
+            recovered_base: Arc::from(generations.into_boxed_slice()),
+            published_overlay: empty_storage_generation_slice(),
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.recovered_base.len() + self.published_overlay.len()
+    }
+
+    fn get(&self, revision: &SessionDefinitionRevision) -> Option<&StorageGeneration> {
+        let offset = usize::try_from(revision.get().checked_sub(1)?).ok()?;
+        if let Some(generation) = self.recovered_base.get(offset) {
+            return Some(generation);
+        }
+        self.published_overlay
+            .get(offset.checked_sub(self.recovered_base.len())?)
+    }
+
+    fn generation_at_position(&self, position: usize) -> Option<StorageGeneration> {
+        self.recovered_base.get(position).copied().or_else(|| {
+            self.published_overlay
+                .get(position.checked_sub(self.recovered_base.len())?)
+                .copied()
+        })
+    }
+
+    fn append_one(
+        &self,
+        revision: SessionDefinitionRevision,
+        generation: StorageGeneration,
+    ) -> Option<Arc<Self>> {
+        let expected_revision = u64::try_from(self.len()).ok()?.checked_add(1)?;
+        if revision.get() != expected_revision {
+            return None;
+        }
+        let mut overlay = self.published_overlay.to_vec();
+        overlay.push(generation);
+        Some(Arc::new(Self {
+            recovered_base: Arc::clone(&self.recovered_base),
+            published_overlay: Arc::from(overlay.into_boxed_slice()),
+        }))
+    }
+
+    #[cfg(test)]
+    fn recovered_base(&self) -> &Arc<[StorageGeneration]> {
+        &self.recovered_base
+    }
+
+    #[cfg(test)]
+    fn published_overlay(&self) -> &Arc<[StorageGeneration]> {
+        &self.published_overlay
+    }
+}
+
+fn empty_storage_generation_slice() -> Arc<[StorageGeneration]> {
+    Arc::from(Vec::<StorageGeneration>::new().into_boxed_slice())
+}
+
+impl fmt::Debug for SessionDefinitionIndex {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionDefinitionIndex")
+            .field("recovered_base_len", &self.recovered_base.len())
+            .field("published_overlay_len", &self.published_overlay.len())
+            .finish()
+    }
+}
+
 /// One recovered Session's immutable current facts. Rolling adjacent-generation validation
-/// carries the current definition forward, and Store V1 has no separately addressable durable
-/// historical Session reference, so the catalog deliberately needs no historical Session index.
+/// carries the current definition forward while the compact index retains the exact durable
+/// generation for every historical Session definition revision.
 #[derive(Clone)]
 struct DurableSessionCatalogEntry {
     current_head: Arc<DurableSessionHead>,
     current_definition: Arc<SessionDefinition>,
+    definition_index: Arc<SessionDefinitionIndex>,
 }
 
 impl fmt::Debug for DurableSessionCatalogEntry {
@@ -454,6 +536,7 @@ impl fmt::Debug for DurableSessionCatalogEntry {
             .debug_struct("DurableSessionCatalogEntry")
             .field("current_head", &"redacted")
             .field("current_definition", &"redacted")
+            .field("definition_index", &self.definition_index)
             .finish()
     }
 }
@@ -1044,6 +1127,106 @@ pub(crate) enum DurableSessionAgentUpgradeError {
     StorageUnavailable,
     #[error("durable state dispatch is unavailable")]
     InternalDispatchUnavailable,
+}
+
+/// The closed, redacted failure taxonomy for one exact Agent definition read.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableAgentDefinitionReadError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Agent was not found")]
+    AgentNotFound,
+    #[error("Agent definition revision is unavailable")]
+    RevisionUnavailable,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// The closed, redacted failure taxonomy for one exact Session definition read.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableSessionDefinitionReadError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Session was not found")]
+    SessionNotFound,
+    #[error("Session definition revision is unavailable")]
+    RevisionUnavailable,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy)]
+struct AgentDefinitionReadSnapshot {
+    agent_id: AgentId,
+    revision: AgentRevision,
+    storage_generation: StorageGeneration,
+}
+
+#[derive(Clone, Copy)]
+struct SessionDefinitionReadSnapshot {
+    session_id: SessionId,
+    revision: SessionDefinitionRevision,
+    storage_generation: StorageGeneration,
+}
+
+#[derive(Clone)]
+enum AgentDefinitionReadSelection {
+    Current(Arc<AgentDefinition>),
+    Historical(AgentDefinitionReadSnapshot),
+}
+
+#[derive(Clone)]
+enum SessionDefinitionReadSelection {
+    Current(Arc<SessionDefinition>),
+    Historical(SessionDefinitionReadSnapshot),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexedDefinitionReadFailure {
+    StorageUnavailable,
+    Integrity,
+}
+
+/// Keeps an owner-retained indexed-definition read responsible for poisoning its owner when the
+/// physical result proves the recovered index wrong or the blocking operation unwinds.
+struct IndexedDefinitionReadPoisonGuard {
+    task_context: RuntimeTaskContext,
+    actor: DurableStateActorHandle,
+    armed: bool,
+}
+
+impl IndexedDefinitionReadPoisonGuard {
+    fn new(task_context: RuntimeTaskContext, actor: DurableStateActorHandle) -> Self {
+        Self {
+            task_context,
+            actor,
+            armed: true,
+        }
+    }
+
+    fn settle<T>(&mut self, result: &Result<T, IndexedDefinitionReadFailure>) {
+        if result.is_ok()
+            || matches!(
+                result,
+                Err(IndexedDefinitionReadFailure::StorageUnavailable)
+            )
+        {
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for IndexedDefinitionReadPoisonGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.task_context.request_closing();
+            self.actor.request_closing();
+        }
+    }
 }
 
 #[allow(
@@ -2062,6 +2245,7 @@ enum CreateReservationAttemptError {
 /// dead actor can no longer admit a new mutation.
 struct UnexpectedActorExitGuard {
     task_context: RuntimeTaskContext,
+    closing: CancellationToken,
     active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
     armed: bool,
 }
@@ -2069,10 +2253,12 @@ struct UnexpectedActorExitGuard {
 impl UnexpectedActorExitGuard {
     fn new(
         task_context: RuntimeTaskContext,
+        closing: CancellationToken,
         active_commit_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
     ) -> Self {
         Self {
             task_context,
+            closing,
             active_commit_barrier,
             armed: true,
         }
@@ -2089,6 +2275,7 @@ impl Drop for UnexpectedActorExitGuard {
             if let Some(barrier) = lock(&self.active_commit_barrier).as_ref() {
                 barrier.try_cancel();
             }
+            self.closing.cancel();
             self.task_context.request_closing();
         }
     }
@@ -2892,6 +3079,7 @@ impl DurableStateActor {
     fn run(self) -> impl Future<Output = ()> + Send {
         let mut unexpected_exit = UnexpectedActorExitGuard::new(
             self.task_context.clone(),
+            self.closing.clone(),
             Arc::clone(&self.active_commit_barrier),
         );
         async move {
@@ -7276,9 +7464,16 @@ fn cleanup_operation_owned_session_trailing(
     let ScannedSessionEntity::Published(scan) = scanned else {
         return Err(StagingCleanupError::Poisoned);
     };
-    let recovered =
-        recover_session_generation_chain(scan, current.current_head.session_id(), agents)
-            .map_err(|_| StagingCleanupError::Poisoned)?;
+    let recovered = recover_session_generation_chain_with_index(
+        scan,
+        current.current_head.session_id(),
+        agents,
+        SessionDefinitionRecoveryMode::ValidateReuse {
+            existing: Arc::clone(&current.definition_index),
+            appended: None,
+        },
+    )
+    .map_err(|_| StagingCleanupError::Poisoned)?;
     if recovered.entry.current_head != current.current_head
         || recovered.entry.current_definition != current.current_definition
     {
@@ -8230,20 +8425,27 @@ fn recover_published_session_existing_generation(
         return Err(PublicationCertainty::CommittedCorruptPoisoned);
     }
     let session_id = expected_head.session_id();
-    let recovered = recover_session_generation_chain(scan, session_id, agents).map_err(
-        |error| match error {
-            DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
-            _ => PublicationCertainty::CommittedCorruptPoisoned,
+    let recovery_mode = match expected_definition {
+        Some(_) => SessionDefinitionRecoveryMode::ValidateReuse {
+            existing: Arc::clone(&current.definition_index),
+            appended: Some((
+                expected_head.current_definition_revision(),
+                expected_head.current_definition_storage_generation(),
+            )),
         },
-    )?;
+        None => SessionDefinitionRecoveryMode::ValidateReuse {
+            existing: Arc::clone(&current.definition_index),
+            appended: None,
+        },
+    };
+    let recovered =
+        recover_session_generation_chain_with_index(scan, session_id, agents, recovery_mode)
+            .map_err(|error| match error {
+                DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
+                _ => PublicationCertainty::CommittedCorruptPoisoned,
+            })?;
     if recovered.entry.current_head.as_ref() != expected_head {
         return Err(PublicationCertainty::CommittedCorruptPoisoned);
-    }
-    match expected_definition {
-        Some(definition) if recovered.entry.current_definition.as_ref() == definition => {}
-        None if recovered.entry.current_definition.as_ref()
-            == current.current_definition.as_ref() => {}
-        _ => return Err(PublicationCertainty::CommittedCorruptPoisoned),
     }
     let pinned_agent = recovered.entry.current_definition.agent();
     let Some(agent) = agents.get(&pinned_agent.agent_id()) else {
@@ -8255,13 +8457,23 @@ fn recover_published_session_existing_generation(
     {
         return Err(PublicationCertainty::CommittedCorruptPoisoned);
     }
-    Ok(DurableSessionCatalogEntry {
-        current_head: recovered.entry.current_head,
-        current_definition: match expected_definition {
-            Some(_) => recovered.entry.current_definition,
-            None => Arc::clone(&current.current_definition),
-        },
-    })
+    match expected_definition {
+        Some(definition) if recovered.entry.current_definition.as_ref() == definition => {
+            Ok(recovered.entry)
+        }
+        None if recovered.entry.current_definition.as_ref()
+            == current.current_definition.as_ref() =>
+        {
+            // ValidateReuse returns the already-installed immutable index for head-only
+            // publication; retain the already-installed current definition Arc as well.
+            Ok(DurableSessionCatalogEntry {
+                current_head: recovered.entry.current_head,
+                current_definition: Arc::clone(&current.current_definition),
+                definition_index: recovered.entry.definition_index,
+            })
+        }
+        _ => Err(PublicationCertainty::CommittedCorruptPoisoned),
+    }
 }
 
 fn committed_payload_certainty(certainty: PublicationCertainty) -> PublicationCertainty {
@@ -9201,6 +9413,8 @@ pub(crate) struct DurableState {
     task_context: RuntimeTaskContext,
     actor: DurableStateActorHandle,
     lease: Arc<RootLease>,
+    root: PathBuf,
+    filesystem: Arc<dyn DurableFilesystem>,
     #[allow(
         dead_code,
         reason = "recovery catalog is consumed by later runtime read paths"
@@ -9249,6 +9463,8 @@ impl DurableState {
             agent_reservations,
             session_reservations,
         } = &*opened;
+        let state_root = root.clone();
+        let state_filesystem = Arc::clone(&filesystem);
         let published_agents = Arc::new(Mutex::new(BTreeMap::new()));
         let published_sessions = Arc::new(Mutex::new(BTreeMap::new()));
         let agent_lifecycle_gates = Arc::new(AgentLifecycleGateRegistry::default());
@@ -9281,6 +9497,8 @@ impl DurableState {
             task_context,
             actor,
             lease: Arc::clone(lease),
+            root: state_root,
+            filesystem: state_filesystem,
             agents: Arc::clone(agents),
             published_agents,
             #[cfg(test)]
@@ -9611,6 +9829,347 @@ impl DurableState {
             .get(&session_id)
             .map(|entry| Arc::clone(&entry.current_definition))
     }
+
+    /// Reads one exact Agent definition revision. The current revision is already installed in
+    /// the immutable catalog; only an indexed historical revision admits bounded blocking I/O.
+    #[allow(
+        dead_code,
+        reason = "the future Load/Turn capture owner consumes this exact Agent read seam"
+    )]
+    pub(crate) async fn read_agent_definition(
+        &self,
+        reference: AgentRevisionRef,
+    ) -> Result<Arc<AgentDefinition>, DurableAgentDefinitionReadError> {
+        if self.actor.closing.is_cancelled() {
+            return Err(DurableAgentDefinitionReadError::Closing);
+        }
+        let snapshot = match self.snapshot_agent_definition(reference)? {
+            AgentDefinitionReadSelection::Current(definition) => return Ok(definition),
+            AgentDefinitionReadSelection::Historical(snapshot) => snapshot,
+        };
+
+        let lease = Arc::clone(&self.lease);
+        let filesystem = Arc::clone(&self.filesystem);
+        let root = self.root.clone();
+        let task_context = self.task_context.clone();
+        let actor = self.actor.clone();
+        let job = self.task_context.spawn_blocking_tracked(move || {
+            let _lease = lease;
+            let mut poison_guard = IndexedDefinitionReadPoisonGuard::new(task_context, actor);
+            let result =
+                read_indexed_agent_definition_blocking(filesystem.as_ref(), &root, snapshot);
+            poison_guard.settle(&result);
+            result
+        });
+        let mut job_wait = Box::pin(job.wait());
+        tokio::select! {
+            biased;
+            _ = self.actor.closing.cancelled() => {
+                let result = job_wait.await;
+                self.finish_agent_definition_read_after_closing(result)
+            }
+            result = &mut job_wait => self.finish_agent_definition_read(result),
+        }
+    }
+
+    /// Reads the current Session definition or one exact historical revision. `None` is the
+    /// current catalog lookup and never performs filesystem I/O.
+    #[allow(
+        dead_code,
+        reason = "the future Load/Turn capture owner consumes this exact Session read seam"
+    )]
+    pub(crate) async fn read_session_definition(
+        &self,
+        session_id: SessionId,
+        revision: Option<SessionDefinitionRevision>,
+    ) -> Result<Arc<SessionDefinition>, DurableSessionDefinitionReadError> {
+        if self.actor.closing.is_cancelled() {
+            return Err(DurableSessionDefinitionReadError::Closing);
+        }
+        let snapshot = match self.snapshot_session_definition(session_id, revision)? {
+            SessionDefinitionReadSelection::Current(definition) => return Ok(definition),
+            SessionDefinitionReadSelection::Historical(snapshot) => snapshot,
+        };
+
+        let lease = Arc::clone(&self.lease);
+        let filesystem = Arc::clone(&self.filesystem);
+        let root = self.root.clone();
+        let task_context = self.task_context.clone();
+        let actor = self.actor.clone();
+        let job = self.task_context.spawn_blocking_tracked(move || {
+            let _lease = lease;
+            let mut poison_guard = IndexedDefinitionReadPoisonGuard::new(task_context, actor);
+            let result =
+                read_indexed_session_definition_blocking(filesystem.as_ref(), &root, snapshot);
+            poison_guard.settle(&result);
+            result
+        });
+        let mut job_wait = Box::pin(job.wait());
+        tokio::select! {
+            biased;
+            _ = self.actor.closing.cancelled() => {
+                let result = job_wait.await;
+                self.finish_session_definition_read_after_closing(result)
+            }
+            result = &mut job_wait => self.finish_session_definition_read(result),
+        }
+    }
+
+    fn snapshot_agent_definition(
+        &self,
+        reference: AgentRevisionRef,
+    ) -> Result<AgentDefinitionReadSelection, DurableAgentDefinitionReadError> {
+        let entry = lock(&self.published_agents)
+            .get(&reference.agent_id())
+            .cloned()
+            .or_else(|| self.agents.get(&reference.agent_id()).cloned())
+            .ok_or(DurableAgentDefinitionReadError::AgentNotFound)?;
+        if entry.current_head.current_definition_revision() == reference.revision() {
+            return Ok(AgentDefinitionReadSelection::Current(Arc::clone(
+                &entry.current_definition,
+            )));
+        }
+        let storage_generation = entry
+            .definition_index
+            .get(&reference.revision())
+            .copied()
+            .ok_or(DurableAgentDefinitionReadError::RevisionUnavailable)?;
+        Ok(AgentDefinitionReadSelection::Historical(
+            AgentDefinitionReadSnapshot {
+                agent_id: reference.agent_id(),
+                revision: reference.revision(),
+                storage_generation,
+            },
+        ))
+    }
+
+    fn snapshot_session_definition(
+        &self,
+        session_id: SessionId,
+        revision: Option<SessionDefinitionRevision>,
+    ) -> Result<SessionDefinitionReadSelection, DurableSessionDefinitionReadError> {
+        let entry = lock(&self.published_sessions)
+            .get(&session_id)
+            .cloned()
+            .or_else(|| self.sessions.get(&session_id).cloned())
+            .ok_or(DurableSessionDefinitionReadError::SessionNotFound)?;
+        let requested_revision =
+            revision.unwrap_or(entry.current_head.current_definition_revision());
+        if requested_revision == entry.current_head.current_definition_revision() {
+            return Ok(SessionDefinitionReadSelection::Current(Arc::clone(
+                &entry.current_definition,
+            )));
+        }
+        let storage_generation = entry
+            .definition_index
+            .get(&requested_revision)
+            .copied()
+            .ok_or(DurableSessionDefinitionReadError::RevisionUnavailable)?;
+        Ok(SessionDefinitionReadSelection::Historical(
+            SessionDefinitionReadSnapshot {
+                session_id,
+                revision: requested_revision,
+                storage_generation,
+            },
+        ))
+    }
+
+    fn finish_agent_definition_read(
+        &self,
+        result: Result<
+            Result<Arc<AgentDefinition>, IndexedDefinitionReadFailure>,
+            RuntimeTaskError,
+        >,
+    ) -> Result<Arc<AgentDefinition>, DurableAgentDefinitionReadError> {
+        match result {
+            Ok(Ok(definition)) => Ok(definition),
+            Ok(Err(IndexedDefinitionReadFailure::StorageUnavailable)) => {
+                Err(DurableAgentDefinitionReadError::StorageUnavailable)
+            }
+            Ok(Err(IndexedDefinitionReadFailure::Integrity)) => {
+                self.request_definition_integrity_closing();
+                Err(DurableAgentDefinitionReadError::InternalDispatchUnavailable)
+            }
+            Err(error) => self.finish_agent_definition_read_task_error(error),
+        }
+    }
+
+    fn finish_agent_definition_read_after_closing(
+        &self,
+        result: Result<
+            Result<Arc<AgentDefinition>, IndexedDefinitionReadFailure>,
+            RuntimeTaskError,
+        >,
+    ) -> Result<Arc<AgentDefinition>, DurableAgentDefinitionReadError> {
+        match result {
+            Ok(Err(IndexedDefinitionReadFailure::Integrity)) => {
+                self.request_definition_integrity_closing();
+                Err(DurableAgentDefinitionReadError::InternalDispatchUnavailable)
+            }
+            Ok(Ok(_)) | Ok(Err(IndexedDefinitionReadFailure::StorageUnavailable)) => {
+                Err(DurableAgentDefinitionReadError::Closing)
+            }
+            Err(error) => self.finish_agent_definition_read_task_error(error),
+        }
+    }
+
+    fn finish_agent_definition_read_task_error(
+        &self,
+        error: RuntimeTaskError,
+    ) -> Result<Arc<AgentDefinition>, DurableAgentDefinitionReadError> {
+        match error {
+            RuntimeTaskError::OwnerClosing => Err(DurableAgentDefinitionReadError::Closing),
+            RuntimeTaskError::WorkerUnavailable => {
+                // Executor/dispatch failure is not a storage observation. Keep this owner open
+                // by local convention, but never redact it as StorageUnavailable.
+                Err(DurableAgentDefinitionReadError::InternalDispatchUnavailable)
+            }
+            RuntimeTaskError::OperationPanicked => {
+                self.request_definition_integrity_closing();
+                Err(DurableAgentDefinitionReadError::InternalDispatchUnavailable)
+            }
+        }
+    }
+
+    fn finish_session_definition_read(
+        &self,
+        result: Result<
+            Result<Arc<SessionDefinition>, IndexedDefinitionReadFailure>,
+            RuntimeTaskError,
+        >,
+    ) -> Result<Arc<SessionDefinition>, DurableSessionDefinitionReadError> {
+        match result {
+            Ok(Ok(definition)) => Ok(definition),
+            Ok(Err(IndexedDefinitionReadFailure::StorageUnavailable)) => {
+                Err(DurableSessionDefinitionReadError::StorageUnavailable)
+            }
+            Ok(Err(IndexedDefinitionReadFailure::Integrity)) => {
+                self.request_definition_integrity_closing();
+                Err(DurableSessionDefinitionReadError::InternalDispatchUnavailable)
+            }
+            Err(error) => self.finish_session_definition_read_task_error(error),
+        }
+    }
+
+    fn finish_session_definition_read_after_closing(
+        &self,
+        result: Result<
+            Result<Arc<SessionDefinition>, IndexedDefinitionReadFailure>,
+            RuntimeTaskError,
+        >,
+    ) -> Result<Arc<SessionDefinition>, DurableSessionDefinitionReadError> {
+        match result {
+            Ok(Err(IndexedDefinitionReadFailure::Integrity)) => {
+                self.request_definition_integrity_closing();
+                Err(DurableSessionDefinitionReadError::InternalDispatchUnavailable)
+            }
+            Ok(Ok(_)) | Ok(Err(IndexedDefinitionReadFailure::StorageUnavailable)) => {
+                Err(DurableSessionDefinitionReadError::Closing)
+            }
+            Err(error) => self.finish_session_definition_read_task_error(error),
+        }
+    }
+
+    fn finish_session_definition_read_task_error(
+        &self,
+        error: RuntimeTaskError,
+    ) -> Result<Arc<SessionDefinition>, DurableSessionDefinitionReadError> {
+        match error {
+            RuntimeTaskError::OwnerClosing => Err(DurableSessionDefinitionReadError::Closing),
+            RuntimeTaskError::WorkerUnavailable => {
+                Err(DurableSessionDefinitionReadError::InternalDispatchUnavailable)
+            }
+            RuntimeTaskError::OperationPanicked => {
+                self.request_definition_integrity_closing();
+                Err(DurableSessionDefinitionReadError::InternalDispatchUnavailable)
+            }
+        }
+    }
+
+    fn request_definition_integrity_closing(&self) {
+        // Poison closes the task owner before the actor. This makes the read's owner admission
+        // fail first even when the actor-closing select branch already won.
+        self.task_context.request_closing();
+        self.actor.request_closing();
+    }
+}
+
+/// Reads a definition whose existence was proven by committed indexed recovery. A missing or
+/// physically invalid document is therefore integrity, while an ordinary read/metadata failure
+/// remains retryable storage unavailability. The second metadata observation is what preserves
+/// definite NotFound without turning a transient adapter fault into poison.
+fn read_required_indexed_definition_document(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+) -> Result<Vec<u8>, IndexedDefinitionReadFailure> {
+    match filesystem.read_document(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(DurableOpenError::DurableStateCorrupt | DurableOpenError::DurableStateTooLarge) => {
+            Err(IndexedDefinitionReadFailure::Integrity)
+        }
+        Err(
+            DurableOpenError::StorageUnavailable
+            | DurableOpenError::StoreInUse
+            | DurableOpenError::UnsupportedStoreFormat,
+        ) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(IndexedDefinitionReadFailure::Integrity)
+            }
+            Err(_) => Err(IndexedDefinitionReadFailure::StorageUnavailable),
+            Ok(metadata)
+                if validate_existing_regular_file(
+                    &metadata,
+                    DurableOpenError::DurableStateCorrupt,
+                )
+                .is_err()
+                    || metadata.len() > MAX_DURABLE_DOCUMENT_BYTES as u64 =>
+            {
+                Err(IndexedDefinitionReadFailure::Integrity)
+            }
+            Ok(_) => Err(IndexedDefinitionReadFailure::StorageUnavailable),
+        },
+    }
+}
+
+fn read_indexed_agent_definition_blocking(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    snapshot: AgentDefinitionReadSnapshot,
+) -> Result<Arc<AgentDefinition>, IndexedDefinitionReadFailure> {
+    let path = root
+        .join(AGENTS_DIRECTORY)
+        .join(snapshot.agent_id.to_string())
+        .join("generations")
+        .join(snapshot.storage_generation.directory_name())
+        .join("definition.json");
+    let bytes = read_required_indexed_definition_document(filesystem, &path)?;
+    let definition = DurableStoreV1Codec::decode_agent_definition(&bytes)
+        .map_err(|_| IndexedDefinitionReadFailure::Integrity)?;
+    if definition.agent_id() != snapshot.agent_id || definition.revision() != snapshot.revision {
+        return Err(IndexedDefinitionReadFailure::Integrity);
+    }
+    Ok(Arc::new(definition))
+}
+
+fn read_indexed_session_definition_blocking(
+    filesystem: &dyn DurableFilesystem,
+    root: &Path,
+    snapshot: SessionDefinitionReadSnapshot,
+) -> Result<Arc<SessionDefinition>, IndexedDefinitionReadFailure> {
+    let path = root
+        .join(SESSIONS_DIRECTORY)
+        .join(snapshot.session_id.to_string())
+        .join("generations")
+        .join(snapshot.storage_generation.directory_name())
+        .join("definition.json");
+    let bytes = read_required_indexed_definition_document(filesystem, &path)?;
+    let definition = DurableStoreV1Codec::decode_session_definition(&bytes)
+        .map_err(|_| IndexedDefinitionReadFailure::Integrity)?;
+    if definition.session_id() != snapshot.session_id || definition.revision() != snapshot.revision
+    {
+        return Err(IndexedDefinitionReadFailure::Integrity);
+    }
+    Ok(Arc::new(definition))
 }
 
 struct RootLease {
@@ -10513,10 +11072,123 @@ fn recover_sessions(
     Ok(sessions)
 }
 
+enum SessionDefinitionRecoveryMode {
+    Build,
+    ValidateReuse {
+        existing: Arc<SessionDefinitionIndex>,
+        appended: Option<(SessionDefinitionRevision, StorageGeneration)>,
+    },
+}
+
+/// A Session-specific recovery sink. Build allocates the one dense recovered base; ValidateReuse
+/// streams every definition mapping against the already-installed index and allocates no index
+/// storage until an optional one-entry process-local append is proven.
+struct SessionDefinitionRecoverySink {
+    mode: SessionDefinitionRecoveryMode,
+    definitions_seen: usize,
+    recovered_generations: Option<Vec<StorageGeneration>>,
+}
+
+impl SessionDefinitionRecoverySink {
+    fn new(mode: SessionDefinitionRecoveryMode) -> Self {
+        let recovered_generations = if matches!(mode, SessionDefinitionRecoveryMode::Build) {
+            Some(Vec::new())
+        } else {
+            None
+        };
+        Self {
+            mode,
+            definitions_seen: 0,
+            recovered_generations,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        revision: SessionDefinitionRevision,
+        generation: StorageGeneration,
+    ) -> Result<(), DurableOpenError> {
+        match &self.mode {
+            SessionDefinitionRecoveryMode::Build => {
+                self.recovered_generations
+                    .as_mut()
+                    .expect("Build owns its dense recovery buffer")
+                    .push(generation);
+            }
+            SessionDefinitionRecoveryMode::ValidateReuse { existing, appended } => {
+                let expected_revision = u64::try_from(self.definitions_seen)
+                    .ok()
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?;
+                let expected_generation = if let Some(expected) =
+                    existing.generation_at_position(self.definitions_seen)
+                {
+                    expected
+                } else if self.definitions_seen == existing.len() {
+                    let (appended_revision, appended_generation) =
+                        appended.ok_or(DurableOpenError::DurableStateCorrupt)?;
+                    if appended_revision.get() != expected_revision {
+                        return Err(DurableOpenError::DurableStateCorrupt);
+                    }
+                    appended_generation
+                } else {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                };
+                if revision.get() != expected_revision || generation != expected_generation {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+            }
+        }
+        self.definitions_seen = self
+            .definitions_seen
+            .checked_add(1)
+            .ok_or(DurableOpenError::DurableStateCorrupt)?;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Arc<SessionDefinitionIndex>, DurableOpenError> {
+        match self.mode {
+            SessionDefinitionRecoveryMode::Build => Ok(SessionDefinitionIndex::from_recovered(
+                self.recovered_generations
+                    .expect("Build owns its dense recovery buffer"),
+            )),
+            SessionDefinitionRecoveryMode::ValidateReuse { existing, appended } => {
+                let expected_len = existing
+                    .len()
+                    .checked_add(usize::from(appended.is_some()))
+                    .ok_or(DurableOpenError::DurableStateCorrupt)?;
+                if self.definitions_seen != expected_len {
+                    return Err(DurableOpenError::DurableStateCorrupt);
+                }
+                match appended {
+                    Some((revision, generation)) => existing
+                        .append_one(revision, generation)
+                        .ok_or(DurableOpenError::DurableStateCorrupt),
+                    None => Ok(existing),
+                }
+            }
+        }
+    }
+}
+
 fn recover_session_generation_chain(
     scan: PhysicalGenerationScan,
     session_id: SessionId,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+) -> Result<RecoveredSessionGenerationChain, DurableOpenError> {
+    recover_session_generation_chain_with_index(
+        scan,
+        session_id,
+        agents,
+        SessionDefinitionRecoveryMode::Build,
+    )
+}
+
+fn recover_session_generation_chain_with_index(
+    scan: PhysicalGenerationScan,
+    session_id: SessionId,
+    agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
+    recovery_mode: SessionDefinitionRecoveryMode,
 ) -> Result<RecoveredSessionGenerationChain, DurableOpenError> {
     let PhysicalGenerationScan {
         committed,
@@ -10540,6 +11212,8 @@ fn recover_session_generation_chain(
         agents,
     )?;
 
+    let mut index_recovery = SessionDefinitionRecoverySink::new(recovery_mode);
+    index_recovery.observe(first_definition.revision(), first_generation.generation)?;
     let mut current_head = first_head;
     let mut current_definition = first_definition;
     for generation in generations {
@@ -10563,6 +11237,7 @@ fn recover_session_generation_chain(
             agents,
         )?;
         if let Some(definition) = definition {
+            index_recovery.observe(definition.revision(), generation.generation)?;
             current_definition = definition;
         }
         current_head = head;
@@ -10576,6 +11251,7 @@ fn recover_session_generation_chain(
         entry: DurableSessionCatalogEntry {
             current_head: Arc::new(current_head),
             current_definition: Arc::new(current_definition),
+            definition_index: index_recovery.finish()?,
         },
         markerless,
     })
@@ -12939,7 +13615,8 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        AGENTS_DIRECTORY, DurableOpenError, DurableSessionDefinitionError, DurableSessionHead,
+        AGENTS_DIRECTORY, DurableAgentDefinitionReadError, DurableOpenError,
+        DurableSessionDefinitionError, DurableSessionDefinitionReadError, DurableSessionHead,
         DurableState, FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE,
         RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, RecoveryCaps,
         SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, read_durable_document,
@@ -13120,6 +13797,7 @@ mod tests {
         After(PublicationOperation),
         Corrupt(PublicationOperation),
         Indeterminate(PublicationOperation),
+        Panic(PublicationOperation),
     }
 
     #[cfg(unix)]
@@ -13437,6 +14115,7 @@ mod tests {
                 Some(fault @ PublicationFault::Before(expected))
                 | Some(fault @ PublicationFault::After(expected))
                 | Some(fault @ PublicationFault::Corrupt(expected))
+                | Some(fault @ PublicationFault::Panic(expected))
                     if expected == operation =>
                 {
                     faults.pop_front();
@@ -13715,6 +14394,9 @@ mod tests {
             let bytes = super::read_durable_document(path)?;
             if let Some(operation) = operation {
                 self.complete_publication_operation(operation);
+            }
+            if matches!(fault, Some(PublicationFault::Panic(_))) {
+                panic!("deterministic read worker panic");
             }
             if matches!(fault, Some(PublicationFault::Corrupt(_))) {
                 fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
@@ -27463,7 +28145,8 @@ mod tests {
             PublicationFault::Before(operation)
             | PublicationFault::After(operation)
             | PublicationFault::Corrupt(operation)
-            | PublicationFault::Indeterminate(operation) => operation,
+            | PublicationFault::Indeterminate(operation)
+            | PublicationFault::Panic(operation) => operation,
         };
         let assert_no_conversation_publication = || {
             for conversation_operation in [
@@ -27822,6 +28505,14 @@ mod tests {
             &old_definition,
             &state.session_current_definition(session_id).unwrap()
         ));
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::RevisionUnavailable,
+            "the new exact revision is unavailable until catalog installation"
+        );
         assert!(!update.is_finished());
         release
             .send(())
@@ -27838,6 +28529,22 @@ mod tests {
             outcome.definition(),
             &state.session_current_definition(session_id).unwrap()
         ));
+        assert!(Arc::ptr_eq(
+            outcome.definition(),
+            &state
+                .read_session_definition(session_id, None)
+                .await
+                .expect("the installed current Session definition reads")
+        ));
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .expect("the old Session definition remains historical")
+                .revision()
+                .get(),
+            1
+        );
         state.close().await;
 
         let root = TempRoot::existing();
@@ -27984,6 +28691,1016 @@ mod tests {
             1
         );
         reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_agent_and_session_definition_reads_resolve_authoritative_history() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        let state = open(root.path()).await.expect("the fixture store opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+
+        state
+            .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                "ar_1".parse().unwrap(),
+                AgentPromptSelection::new(
+                    ["base", "code-review", "safety"]
+                        .into_iter()
+                        .map(|value| value.parse().unwrap())
+                        .collect(),
+                )
+                .unwrap(),
+                "2026-08-03T10:00:05.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the Agent definition publishes");
+        let current_agent = state.agent_current_definition(agent_id).unwrap();
+        let current_agent_read = state
+            .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+            .await
+            .expect("the current Agent definition reads from the catalog");
+        assert!(Arc::ptr_eq(&current_agent, &current_agent_read));
+
+        state
+            .update_agent_metadata(
+                SealedAgentMetadataAttempt::new(
+                    agent_id,
+                    "amr_1".parse().unwrap(),
+                    Some("Planner revised".to_owned()),
+                    AgentMetadataDescriptionPatch::keep(),
+                    "2026-08-03T10:00:06.000Z".parse().unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the Agent metadata publication succeeds");
+        state
+            .set_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Disabled,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the Agent status publication succeeds");
+        let historical_agent = state
+            .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+            .await
+            .expect("the indexed historical Agent definition reads");
+        assert_eq!(historical_agent.revision().get(), 1);
+        assert_eq!(
+            super::DurableStoreV1Codec::encode_agent_definition(&historical_agent).unwrap(),
+            agent_definition_fixture()
+        );
+
+        let initial_session = state.session_current_definition(session_id).unwrap();
+        let initial_session_index =
+            Arc::clone(&state.sessions.get(&session_id).unwrap().definition_index);
+        let recovered_base = Arc::clone(initial_session_index.recovered_base());
+        assert!(initial_session_index.published_overlay().is_empty());
+        let no_change = state
+            .update_session_definition(SealedSessionDefinitionAttempt::new(
+                session_id,
+                initial_session.revision(),
+                None,
+                None,
+                None,
+                "2026-08-03T10:00:07.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the Session definition no-op succeeds");
+        assert!(!no_change.changed());
+        let index_after_no_change =
+            Arc::clone(&state.sessions.get(&session_id).unwrap().definition_index);
+        assert!(Arc::ptr_eq(&initial_session_index, &index_after_no_change));
+        let changed_model = SessionModelConfig::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5-mini".parse().unwrap()),
+            initial_session.model().reasoning(),
+            initial_session.model().max_output_tokens(),
+        );
+        state
+            .update_session_definition(SealedSessionDefinitionAttempt::new(
+                session_id,
+                initial_session.revision(),
+                None,
+                Some(changed_model),
+                None,
+                "2026-08-03T10:00:07.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the Session definition publishes");
+        let first_session = state.session_current_definition(session_id).unwrap();
+        let first_session_read = state
+            .read_session_definition(session_id, None)
+            .await
+            .expect("None reads the current Session definition");
+        assert!(Arc::ptr_eq(&first_session, &first_session_read));
+        let exact_first_session_read = state
+            .read_session_definition(session_id, Some("sdr_2".parse().unwrap()))
+            .await
+            .expect("the current Session revision reads from the catalog");
+        assert!(Arc::ptr_eq(&first_session, &exact_first_session_read));
+
+        let second_model = SessionModelConfig::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            first_session.model().reasoning(),
+            Some(NonZeroU32::new(8192).unwrap()),
+        );
+        state
+            .update_session_definition(SealedSessionDefinitionAttempt::new(
+                session_id,
+                first_session.revision(),
+                None,
+                Some(second_model),
+                None,
+                "2026-08-03T10:00:08.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the second Session definition publishes");
+        let current_session = state.session_current_definition(session_id).unwrap();
+        assert_eq!(current_session.revision().get(), 3);
+        let current_session_read = state
+            .read_session_definition(session_id, Some("sdr_3".parse().unwrap()))
+            .await
+            .expect("the second current Session revision reads from the catalog");
+        assert!(Arc::ptr_eq(&current_session, &current_session_read));
+
+        let definition_index_after_definition = {
+            let published = super::lock(&state.published_sessions);
+            Arc::clone(&published.get(&session_id).unwrap().definition_index)
+        };
+        assert_eq!(
+            definition_index_after_definition.get(&"sdr_1".parse().unwrap()),
+            Some(&StorageGeneration::new(1).unwrap())
+        );
+        assert_eq!(
+            definition_index_after_definition.get(&"sdr_2".parse().unwrap()),
+            Some(&StorageGeneration::new(2).unwrap())
+        );
+        assert_eq!(
+            definition_index_after_definition.get(&"sdr_3".parse().unwrap()),
+            Some(&StorageGeneration::new(3).unwrap())
+        );
+        assert_eq!(definition_index_after_definition.len(), 3);
+        assert!(Arc::ptr_eq(
+            &recovered_base,
+            definition_index_after_definition.recovered_base()
+        ));
+        assert_eq!(
+            definition_index_after_definition.published_overlay().len(),
+            2
+        );
+        state
+            .update_session_metadata(SealedSessionMetadataAttempt::new(
+                session_id,
+                "smr_1".parse().unwrap(),
+                SessionMetadataNamePatch::set("Project session").unwrap(),
+                SessionMetadataDescriptionPatch::keep(),
+                "2026-08-03T10:00:08.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the Session metadata publication succeeds");
+        let definition_index_after_metadata = {
+            let published = super::lock(&state.published_sessions);
+            Arc::clone(&published.get(&session_id).unwrap().definition_index)
+        };
+        assert!(Arc::ptr_eq(
+            &definition_index_after_definition,
+            &definition_index_after_metadata
+        ));
+        state
+            .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+            .await
+            .expect("the Session lifecycle publication succeeds");
+        let definition_index_after_lifecycle = {
+            let published = super::lock(&state.published_sessions);
+            Arc::clone(&published.get(&session_id).unwrap().definition_index)
+        };
+        assert!(Arc::ptr_eq(
+            &definition_index_after_metadata,
+            &definition_index_after_lifecycle
+        ));
+
+        let historical_session = state
+            .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+            .await
+            .expect("the indexed historical Session definition reads");
+        assert_eq!(historical_session.revision().get(), 1);
+        assert_eq!(
+            super::DurableStoreV1Codec::encode_session_definition(&historical_session).unwrap(),
+            session_definition_fixture()
+        );
+
+        state.close().await;
+        let reopened = open(root.path())
+            .await
+            .expect("the historical chain reopens");
+        assert_eq!(
+            reopened
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .read_session_definition(session_id, None)
+                .await
+                .unwrap()
+                .revision()
+                .get(),
+            3
+        );
+        let reopened_index = {
+            let entry = reopened.sessions.get(&session_id).unwrap();
+            Arc::clone(&entry.definition_index)
+        };
+        assert_eq!(reopened_index.len(), 3);
+        assert_eq!(reopened_index.published_overlay().len(), 0);
+        assert_eq!(reopened_index.recovered_base().len(), 3);
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_definition_reads_reject_all_paths_after_request_closing_and_close() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let state = open(root.path()).await.expect("the exact-read store opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+
+        state.request_closing();
+        for result in [
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+                .await,
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await,
+            state
+                .read_agent_definition(AgentRevisionRef::new(
+                    AgentId::from_str(AGENT_TWO).unwrap(),
+                    "ar_1".parse().unwrap(),
+                ))
+                .await,
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_3".parse().unwrap()))
+                .await,
+        ] {
+            assert_eq!(
+                result.unwrap_err(),
+                DurableAgentDefinitionReadError::Closing
+            );
+        }
+        for result in [
+            state.read_session_definition(session_id, None).await,
+            state
+                .read_session_definition(session_id, Some("sdr_2".parse().unwrap()))
+                .await,
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await,
+            state
+                .read_session_definition(SessionId::from_str(SESSION_TWO).unwrap(), None)
+                .await,
+            state
+                .read_session_definition(session_id, Some("sdr_3".parse().unwrap()))
+                .await,
+        ] {
+            assert_eq!(
+                result.unwrap_err(),
+                DurableSessionDefinitionReadError::Closing
+            );
+        }
+
+        state.close().await;
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::Closing
+        );
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::Closing
+        );
+        assert_eq!(
+            state
+                .read_session_definition(session_id, None)
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::Closing
+        );
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::Closing
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn exact_definition_reads_keep_current_and_unavailable_paths_zero_io_and_retry_storage() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+
+        let current = state
+            .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+            .await
+            .expect("the current Agent definition is catalogued");
+        assert!(filesystem.publication_operations().is_empty());
+        assert_eq!(current.revision().get(), 2);
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(
+                    AgentId::from_str(AGENT_TWO).unwrap(),
+                    "ar_1".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::AgentNotFound
+        );
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_3".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::RevisionUnavailable
+        );
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::RevisionUnavailable
+        );
+        assert_eq!(
+            state
+                .read_session_definition(SessionId::from_str(SESSION_TWO).unwrap(), None,)
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::SessionNotFound
+        );
+        assert!(filesystem.publication_operations().is_empty());
+
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::StorageUnavailable
+        );
+        assert!(!state.actor.closing.is_cancelled());
+        let retried = state
+            .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+            .await
+            .expect("the transient historical read fault is retryable");
+        assert_eq!(retried.revision().get(), 1);
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_indexed_definition_read_closes_admission_and_redacts_failure() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let error = state
+            .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DurableAgentDefinitionReadError::InternalDispatchUnavailable
+        );
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        for secret in [AGENT_ONE, "definition.json", "corrupt"] {
+            assert!(!debug.contains(secret));
+            assert!(!display.contains(secret));
+        }
+        assert_eq!(
+            state
+                .update_agent_metadata(
+                    SealedAgentMetadataAttempt::new(
+                        agent_id,
+                        "amr_1".parse().unwrap(),
+                        Some("Planner revised".to_owned()),
+                        AgentMetadataDescriptionPatch::keep(),
+                        "2026-08-03T10:00:06.000Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::DurableAgentMetadataError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleted_indexed_agent_definition_is_integrity_fatal_and_closes_admission() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let state = open(root.path()).await.expect("the Agent store opens");
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        fs::remove_file(
+            agent_path(root.path(), AGENT_ONE)
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("definition.json"),
+        )
+        .expect("the indexed Agent definition is deleted");
+
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            state
+                .update_agent_metadata(
+                    SealedAgentMetadataAttempt::new(
+                        agent_id,
+                        "amr_1".parse().unwrap(),
+                        Some("Planner revised".to_owned()),
+                        AgentMetadataDescriptionPatch::keep(),
+                        "2026-08-03T10:00:06.000Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::DurableAgentMetadataError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn deleted_indexed_session_definition_is_integrity_fatal_and_closes_admission() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let state = open(root.path()).await.expect("the Session store opens");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        fs::remove_file(
+            session_path(root.path(), SESSION_ONE)
+                .join("generations")
+                .join(GENERATION_ONE)
+                .join("definition.json"),
+        )
+        .expect("the indexed Session definition is deleted");
+
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            state
+                .update_session_metadata(SealedSessionMetadataAttempt::new(
+                    session_id,
+                    "smr_1".parse().unwrap(),
+                    SessionMetadataNamePatch::set("Project session").unwrap(),
+                    SessionMetadataDescriptionPatch::keep(),
+                    "2026-08-03T10:00:08.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableSessionMetadataError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexed_session_definition_storage_fault_is_retryable() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::StorageUnavailable
+        );
+        assert!(!state.actor.closing.is_cancelled());
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn corrupt_indexed_session_definition_closes_admission_and_redacts_failure() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let error = state
+            .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DurableSessionDefinitionReadError::InternalDispatchUnavailable
+        );
+        let debug = format!("{error:?}");
+        let display = error.to_string();
+        for secret in [SESSION_ONE, "definition.json", "corrupt"] {
+            assert!(!debug.contains(secret));
+            assert!(!display.contains(secret));
+        }
+        assert_eq!(
+            state
+                .update_session_metadata(SealedSessionMetadataAttempt::new(
+                    session_id,
+                    "smr_1".parse().unwrap(),
+                    SessionMetadataNamePatch::set("Project session").unwrap(),
+                    SessionMetadataDescriptionPatch::keep(),
+                    "2026-08-03T10:00:08.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableSessionMetadataError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexed_definition_worker_panic_poison_closes_agent_admission() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Panic(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn indexed_definition_worker_panic_poison_closes_session_admission() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Panic(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert_eq!(
+            state
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::InternalDispatchUnavailable
+        );
+        assert_eq!(
+            state
+                .read_session_definition(session_id, None)
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::Closing
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_blocked_corrupt_agent_definition_read_poison_closes_owner() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::ReadbackPublishedDefinition,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let state_for_read = state.clone();
+        let read = tokio::spawn(async move {
+            state_for_read
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+        read.abort();
+        assert!(
+            read.await
+                .expect_err("the blocked Agent read wrapper is cancelled")
+                .is_cancelled(),
+            "caller cancellation must not detach the owner-retained read"
+        );
+
+        release
+            .send(())
+            .expect("the corrupt Agent read worker barrier releases");
+        state.actor.closing.cancelled().await;
+        assert_eq!(
+            fs::read(
+                agent_path(root.path(), AGENT_ONE)
+                    .join("generations")
+                    .join(GENERATION_ONE)
+                    .join("definition.json")
+            )
+            .expect("the indexed Agent definition remains addressable"),
+            b"corrupt"
+        );
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::Closing,
+            "current Agent admission closes before explicit close"
+        );
+        assert_eq!(
+            state
+                .update_agent_metadata(
+                    SealedAgentMetadataAttempt::new(
+                        agent_id,
+                        "amr_1".parse().unwrap(),
+                        Some("Planner revised".to_owned()),
+                        AgentMetadataDescriptionPatch::keep(),
+                        "2026-08-03T10:00:06.000Z".parse().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::DurableAgentMetadataError::Closing,
+            "new Agent admission closes before explicit close"
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_blocked_corrupt_session_definition_read_poison_closes_owner() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"opaque conversation bytes");
+        create_session_generation(
+            root.path(),
+            SESSION_ONE,
+            GENERATION_TWO,
+            session_head_definition_g2_fixture(),
+            Some(&session_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Corrupt(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::ReadbackPublishedDefinition,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let state_for_read = state.clone();
+        let read = tokio::spawn(async move {
+            state_for_read
+                .read_session_definition(session_id, Some("sdr_1".parse().unwrap()))
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+        read.abort();
+        assert!(
+            read.await
+                .expect_err("the blocked Session read wrapper is cancelled")
+                .is_cancelled(),
+            "caller cancellation must not detach the owner-retained read"
+        );
+
+        release
+            .send(())
+            .expect("the corrupt Session read worker barrier releases");
+        state.actor.closing.cancelled().await;
+        assert_eq!(
+            fs::read(
+                session_path(root.path(), SESSION_ONE)
+                    .join("generations")
+                    .join(GENERATION_ONE)
+                    .join("definition.json")
+            )
+            .expect("the indexed Session definition remains addressable"),
+            b"corrupt"
+        );
+        assert_eq!(
+            state
+                .read_session_definition(session_id, None)
+                .await
+                .unwrap_err(),
+            DurableSessionDefinitionReadError::Closing,
+            "current Session admission closes before explicit close"
+        );
+        assert_eq!(
+            state
+                .update_session_metadata(SealedSessionMetadataAttempt::new(
+                    session_id,
+                    "smr_1".parse().unwrap(),
+                    SessionMetadataNamePatch::set("Project session").unwrap(),
+                    SessionMetadataDescriptionPatch::keep(),
+                    "2026-08-03T10:00:08.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableSessionMetadataError::Closing,
+            "new Session admission closes before explicit close"
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_blocked_panicking_agent_definition_read_poison_closes_owner() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Panic(PublicationOperation::ReadbackPublishedDefinition),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::ReadbackPublishedDefinition,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let state_for_read = state.clone();
+        let read = tokio::spawn(async move {
+            state_for_read
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+        read.abort();
+        assert!(
+            read.await
+                .expect_err("the blocked panicking Agent read wrapper is cancelled")
+                .is_cancelled(),
+            "caller cancellation must not detach the owner-retained read"
+        );
+
+        release
+            .send(())
+            .expect("the panicking Agent read worker barrier releases");
+        state.actor.closing.cancelled().await;
+        assert_eq!(
+            state
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_2".parse().unwrap()))
+                .await
+                .unwrap_err(),
+            DurableAgentDefinitionReadError::Closing,
+            "the panicking worker closes current admission independently of its caller"
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_historical_definition_read_remains_owner_tracked_until_release() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_agent_generation(
+            root.path(),
+            AGENT_ONE,
+            GENERATION_TWO,
+            agent_head_definition_g2_fixture(),
+            Some(agent_definition_g2_fixture()),
+        );
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::ReadbackPublishedDefinition,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let state_for_read = state.clone();
+        let read = tokio::spawn(async move {
+            state_for_read
+                .read_agent_definition(AgentRevisionRef::new(agent_id, "ar_1".parse().unwrap()))
+                .await
+        });
+        wait_reservation_barrier(entered_receiver).await;
+
+        read.abort();
+        assert!(
+            read.await
+                .expect_err("the wrapper task is cancelled")
+                .is_cancelled(),
+            "aborting the wrapper must not detach the resolver"
+        );
+
+        let mut close = Box::pin(state.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "close waits for the blocked owner-tracked read worker"
+        );
+        assert!(
+            matches!(open(root.path()).await, Err(DurableOpenError::StoreInUse)),
+            "the owner-tracked read still holds the root lease after wrapper cancellation"
+        );
+
+        release.send(()).expect("the read worker barrier releases");
+        close.await;
     }
 
     #[tokio::test(flavor = "current_thread")]
