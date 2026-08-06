@@ -137,6 +137,15 @@ impl AgentMetadata {
     pub const fn updated_at(&self) -> Timestamp {
         self.updated_at
     }
+
+    fn with_revision(&self, revision: AgentMetadataRevision, updated_at: Timestamp) -> Self {
+        Self {
+            revision,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            updated_at,
+        }
+    }
 }
 
 impl fmt::Debug for AgentMetadata {
@@ -481,6 +490,208 @@ impl fmt::Debug for SealedAgentDefinitionAttempt {
             .field("agent_id", &"redacted")
             .field("expected_revision", &self.expected_revision)
             .field("target_prompts", &"redacted")
+            .field("owner_timestamp", &"redacted")
+            .finish()
+    }
+}
+
+/// The sealed description half of an Agent metadata patch. Its representation is private so a
+/// caller cannot forge an invalid canonical Set value or confuse Keep with Clear.
+#[allow(
+    dead_code,
+    reason = "the sealed description patch is consumed by the pending Agent command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AgentMetadataDescriptionPatch {
+    value: AgentMetadataDescriptionPatchValue,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed description patch is consumed by the pending Agent command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+enum AgentMetadataDescriptionPatchValue {
+    Keep,
+    Set(Box<str>),
+    Clear,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed description patch is consumed by the pending Agent command surface"
+)]
+impl AgentMetadataDescriptionPatch {
+    pub(crate) const fn keep() -> Self {
+        Self {
+            value: AgentMetadataDescriptionPatchValue::Keep,
+        }
+    }
+
+    pub(crate) fn set<D>(raw: D) -> Result<Self, AgentMetadataError>
+    where
+        D: AsRef<str>,
+    {
+        let limits = ProtocolLimits::v1_0().text;
+        let value = normalize_agent_metadata_text(
+            raw.as_ref(),
+            usize::try_from(limits.max_description_bytes).unwrap_or(usize::MAX),
+            true,
+        )?;
+        Ok(Self {
+            value: AgentMetadataDescriptionPatchValue::Set(value),
+        })
+    }
+
+    pub(crate) const fn clear() -> Self {
+        Self {
+            value: AgentMetadataDescriptionPatchValue::Clear,
+        }
+    }
+
+    fn apply_to(&self, current: Option<&str>) -> Option<Box<str>> {
+        match &self.value {
+            AgentMetadataDescriptionPatchValue::Keep => current.map(|value| value.into()),
+            AgentMetadataDescriptionPatchValue::Set(value) => Some(value.clone()),
+            AgentMetadataDescriptionPatchValue::Clear => None,
+        }
+    }
+}
+
+impl fmt::Debug for AgentMetadataDescriptionPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.value {
+            AgentMetadataDescriptionPatchValue::Keep => "Keep",
+            AgentMetadataDescriptionPatchValue::Set(_) => "Set",
+            AgentMetadataDescriptionPatchValue::Clear => "Clear",
+        };
+        formatter
+            .debug_struct("AgentMetadataDescriptionPatch")
+            .field("kind", &kind)
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+
+/// Lifecycle-owned semantic input to one Agent metadata CAS. It carries only the Agent lookup
+/// key, expected current metadata revision, canonical patch intent, and owner timestamp. Storage
+/// generation, paths, markers, command identity, and publication handles do not cross this seam.
+pub(crate) struct SealedAgentMetadataAttempt {
+    agent_id: AgentId,
+    expected_revision: AgentMetadataRevision,
+    name: Option<Box<str>>,
+    description: AgentMetadataDescriptionPatch,
+    owner_timestamp: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum AgentMetadataDecisionError {
+    #[error("Agent metadata compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent metadata revision is exhausted")]
+    RevisionExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AgentMetadataDecision {
+    NoChange,
+    Publish(AgentMetadata),
+}
+
+impl SealedAgentMetadataAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Agent metadata command constructor consumes this sealed seam"
+    )]
+    pub(crate) fn new(
+        agent_id: AgentId,
+        expected_revision: AgentMetadataRevision,
+        name: Option<String>,
+        description: AgentMetadataDescriptionPatch,
+        owner_timestamp: Timestamp,
+    ) -> Result<Self, AgentMetadataError> {
+        let limits = ProtocolLimits::v1_0().text;
+        let name = name
+            .map(|value| {
+                normalize_agent_metadata_text(
+                    &value,
+                    usize::from(limits.max_display_name_bytes),
+                    false,
+                )
+            })
+            .transpose()?;
+        Ok(Self {
+            agent_id,
+            expected_revision,
+            name,
+            description,
+            owner_timestamp,
+        })
+    }
+
+    pub(crate) const fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn expected_revision(&self) -> AgentMetadataRevision {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn owner_timestamp(&self) -> Timestamp {
+        self.owner_timestamp
+    }
+
+    /// Decides the semantic CAS in its authoritative order: expected metadata revision, terminal
+    /// status, patch application against authoritative current metadata, canonical no-op, then
+    /// checked next revision and metadata materialization.
+    pub(crate) fn decide(
+        &self,
+        current_status: AgentStatus,
+        current_metadata: &AgentMetadata,
+    ) -> Result<AgentMetadataDecision, AgentMetadataDecisionError> {
+        let current_revision = current_metadata.revision();
+        if current_revision != self.expected_revision {
+            return Err(AgentMetadataDecisionError::StaleRevision);
+        }
+        if current_status == AgentStatus::Deleted {
+            return Err(AgentMetadataDecisionError::AgentDeleted);
+        }
+        let patched_metadata = AgentMetadata {
+            revision: current_metadata.revision(),
+            name: self
+                .name
+                .clone()
+                .unwrap_or_else(|| current_metadata.name.clone()),
+            description: self.description.apply_to(current_metadata.description()),
+            updated_at: current_metadata.updated_at(),
+        };
+        if agent_metadata_has_same_canonical_content(&patched_metadata, current_metadata) {
+            return Ok(AgentMetadataDecision::NoChange);
+        }
+        let next_revision = current_revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(AgentMetadataRevision::new)
+            .ok_or(AgentMetadataDecisionError::RevisionExhausted)?;
+        Ok(AgentMetadataDecision::Publish(
+            patched_metadata.with_revision(next_revision, self.owner_timestamp),
+        ))
+    }
+}
+
+impl fmt::Debug for SealedAgentMetadataAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedAgentMetadataAttempt")
+            .field("agent_id", &"redacted")
+            .field("expected_revision", &self.expected_revision)
+            .field("name_patch", &"redacted")
+            .field("description_patch", &"redacted")
             .field("owner_timestamp", &"redacted")
             .finish()
     }
@@ -1038,16 +1249,17 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        AgentDefinitionDecision, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
-        SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentStatusAttempt,
-        SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionDefinition,
-        SessionForkAttemptError, SessionModelConfig,
+        AgentDefinitionDecision, AgentMetadataDecision, AgentMetadataDecisionError,
+        AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
+        SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
+        SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
+        SessionDefinition, SessionForkAttemptError, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
     use crate::wire::{
-        AgentId, AgentRevision, CanonicalFileUri, SessionDefinitionRevision, SessionId,
-        WorkspaceRevision,
+        AgentId, AgentMetadataRevision, AgentRevision, CanonicalFileUri, SessionDefinitionRevision,
+        SessionId, WorkspaceRevision,
     };
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
@@ -1208,6 +1420,231 @@ mod tests {
         assert_eq!(definition.revision().get(), 2);
         assert_eq!(definition.prompts(), &target_prompts);
         assert_eq!(definition.created_at(), owner_timestamp);
+    }
+
+    #[test]
+    fn sealed_agent_metadata_attempt_preserves_patch_intent_and_orders_cas() {
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let first_revision = AgentMetadataRevision::new(NonZeroU64::new(1).unwrap());
+        let current_timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let current = super::AgentMetadata::new(
+            first_revision,
+            "Planner",
+            Some("Description"),
+            current_timestamp,
+        )
+        .unwrap();
+        let attempt = SealedAgentMetadataAttempt::new(
+            agent_id,
+            first_revision,
+            Some("Planner revised\r\nsecret".to_owned()),
+            AgentMetadataDescriptionPatch::set("Description revised\rsecret").unwrap(),
+            owner_timestamp,
+        )
+        .unwrap();
+        let stale_current = super::AgentMetadata::new(
+            AgentMetadataRevision::new(NonZeroU64::new(2).unwrap()),
+            "Planner",
+            Some("Description"),
+            current_timestamp,
+        )
+        .unwrap();
+
+        assert_eq!(attempt.expected_revision(), first_revision);
+        assert_eq!(attempt.owner_timestamp(), owner_timestamp);
+        let debug = format!("{attempt:?}");
+        for secret in [
+            "agt_aaaaaaaa",
+            "Planner revised",
+            "Description revised",
+            "10:00:05",
+        ] {
+            assert!(
+                !debug.contains(secret),
+                "metadata attempt leaked {secret:?}"
+            );
+        }
+
+        assert_eq!(
+            attempt
+                .decide(AgentStatus::Deleted, &stale_current)
+                .unwrap_err(),
+            AgentMetadataDecisionError::StaleRevision
+        );
+        assert_eq!(
+            attempt.decide(AgentStatus::Deleted, &current).unwrap_err(),
+            AgentMetadataDecisionError::AgentDeleted
+        );
+
+        let AgentMetadataDecision::Publish(metadata) =
+            attempt.decide(AgentStatus::Disabled, &current).unwrap()
+        else {
+            panic!("changed canonical metadata publishes a new revision");
+        };
+        assert_eq!(metadata.revision().get(), 2);
+        assert_eq!(metadata.name(), "Planner revised\nsecret");
+        assert_eq!(metadata.description(), Some("Description revised\nsecret"));
+        assert_eq!(metadata.updated_at(), owner_timestamp);
+    }
+
+    #[test]
+    fn sealed_agent_metadata_patch_applies_each_intent_and_no_ops_after_cas() {
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let revision = AgentMetadataRevision::new(NonZeroU64::new(1).unwrap());
+        let timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let current =
+            super::AgentMetadata::new(revision, "Planner", Some("Description"), timestamp).unwrap();
+
+        let AgentMetadataDecision::Publish(name_only) = SealedAgentMetadataAttempt::new(
+            agent_id,
+            revision,
+            Some("Planner revised\r\n".to_owned()),
+            AgentMetadataDescriptionPatch::keep(),
+            owner_timestamp,
+        )
+        .unwrap()
+        .decide(AgentStatus::Enabled, &current)
+        .unwrap() else {
+            panic!("a name-only patch changes metadata");
+        };
+        assert_eq!(name_only.name(), "Planner revised\n");
+        assert_eq!(name_only.description(), Some("Description"));
+
+        let AgentMetadataDecision::Publish(description_set) = SealedAgentMetadataAttempt::new(
+            agent_id,
+            revision,
+            None,
+            AgentMetadataDescriptionPatch::set("Updated description").unwrap(),
+            owner_timestamp,
+        )
+        .unwrap()
+        .decide(AgentStatus::Enabled, &current)
+        .unwrap() else {
+            panic!("a description Set patch changes metadata");
+        };
+        assert_eq!(description_set.name(), "Planner");
+        assert_eq!(description_set.description(), Some("Updated description"));
+
+        let AgentMetadataDecision::Publish(description_clear) = SealedAgentMetadataAttempt::new(
+            agent_id,
+            revision,
+            None,
+            AgentMetadataDescriptionPatch::clear(),
+            owner_timestamp,
+        )
+        .unwrap()
+        .decide(AgentStatus::Enabled, &current)
+        .unwrap() else {
+            panic!("a description Clear patch changes metadata");
+        };
+        assert_eq!(description_clear.name(), "Planner");
+        assert_eq!(description_clear.description(), None);
+
+        for (name, description) in [
+            (None, AgentMetadataDescriptionPatch::keep()),
+            (
+                Some("Planner".to_owned()),
+                AgentMetadataDescriptionPatch::set("Description").unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                SealedAgentMetadataAttempt::new(
+                    agent_id,
+                    revision,
+                    name,
+                    description,
+                    owner_timestamp
+                )
+                .unwrap()
+                .decide(AgentStatus::Enabled, &current)
+                .unwrap(),
+                AgentMetadataDecision::NoChange
+            );
+        }
+
+        let empty = SealedAgentMetadataAttempt::new(
+            agent_id,
+            revision,
+            None,
+            AgentMetadataDescriptionPatch::keep(),
+            owner_timestamp,
+        )
+        .unwrap();
+        let stale_current = super::AgentMetadata::new(
+            AgentMetadataRevision::new(NonZeroU64::new(2).unwrap()),
+            "Planner",
+            Some("Description"),
+            timestamp,
+        )
+        .unwrap();
+        assert_eq!(
+            empty
+                .decide(AgentStatus::Enabled, &stale_current)
+                .unwrap_err(),
+            AgentMetadataDecisionError::StaleRevision,
+            "stale wins even for an empty patch"
+        );
+        assert_eq!(
+            empty.decide(AgentStatus::Deleted, &current).unwrap_err(),
+            AgentMetadataDecisionError::AgentDeleted,
+            "Deleted wins even for an empty patch"
+        );
+
+        let equivalent = SealedAgentMetadataAttempt::new(
+            agent_id,
+            revision,
+            Some("Planner".to_owned()),
+            AgentMetadataDescriptionPatch::set("Description").unwrap(),
+            owner_timestamp,
+        )
+        .unwrap();
+        assert_eq!(
+            equivalent
+                .decide(AgentStatus::Deleted, &current)
+                .unwrap_err(),
+            AgentMetadataDecisionError::AgentDeleted,
+            "Deleted wins even for a canonical-equivalent patch"
+        );
+    }
+
+    #[test]
+    fn sealed_agent_metadata_patch_reports_revision_exhaustion_only_for_a_change() {
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let exhausted_revision = AgentMetadataRevision::new(NonZeroU64::new(u64::MAX).unwrap());
+        let current = super::AgentMetadata::new(
+            exhausted_revision,
+            "Planner",
+            None::<&str>,
+            "2026-08-03T10:00:00.123Z".parse().unwrap(),
+        )
+        .unwrap();
+        let changed = SealedAgentMetadataAttempt::new(
+            agent_id,
+            exhausted_revision,
+            Some("another name".to_owned()),
+            AgentMetadataDescriptionPatch::keep(),
+            "2026-08-03T10:00:05.000Z".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            changed.decide(AgentStatus::Enabled, &current).unwrap_err(),
+            AgentMetadataDecisionError::RevisionExhausted
+        );
+
+        let empty = SealedAgentMetadataAttempt::new(
+            agent_id,
+            exhausted_revision,
+            None,
+            AgentMetadataDescriptionPatch::keep(),
+            "2026-08-03T10:00:05.000Z".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.decide(AgentStatus::Enabled, &current).unwrap(),
+            AgentMetadataDecision::NoChange
+        );
     }
 
     #[test]
