@@ -26,11 +26,11 @@ architecture.md + modules/
 
 ## 当前状态
 
-M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M3.2 implemented only the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its sole production issuer. M5.0 production recovery、root lease、owner-tracked actor、permanent reservation inventory及crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication已实现；没有standalone production reservation API/token/receipt。public Runtime command接入、Session Fork/update/CAS及完整cross-platform native matrix仍pending。随后是M5.1 SessionRecorder与M5.2 semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
+M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M3.2 implemented only the scanner requiring opaque `ExclusiveWritableConversationLease`; M5.0 design makes DurableState its sole production issuer. M5.0 production recovery、root lease、owner-tracked actor、permanent reservation inventory、crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication，以及unloaded RecordedHistory + Genesis Session Fork tracer已实现；没有standalone production reservation API/token/receipt。public Runtime command接入、remaining Fork anchors/LiveSnapshot、update/CAS及完整cross-platform native matrix仍pending。随后是M5.1 SessionRecorder与M5.2 semantic replay；behavioral Runtime facade、实际Recorder/replay、`SessionExecutor`/`ActiveTurnTask`、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为尚未实现。
 
 开发计划M0与M1已经完成，M2进行中；后续主要门禁：
 
-- M5.0：design、recovery/root lease/owner-tracked actor、private permanent reservation foundation及crate-private Agent Create与ordinary Session Create exact G1 publication已完成；下一步实现Session Fork、existing-head update/CAS、public Runtime command与完整platform matrix；
+- M5.0：design、recovery/root lease/owner-tracked actor、private permanent reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 publication，以及unloaded RecordedHistory + Genesis Session Fork tracer已完成；下一步实现remaining Fork anchors/LiveSnapshot、existing-head update/CAS、public Runtime command与完整platform matrix；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；
 - V4-C0-1：production Tool/Sandbox adapter开始前关闭enforcement fail-closed合同。
 

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -368,6 +369,21 @@ impl Workspace {
 
     pub const fn cwd(&self) -> &WorkspaceCwdSpec {
         &self.cwd
+    }
+
+    /// Resets only the Workspace revision while preserving the exact semantic content for a
+    /// newly materialized Session Fork. The caller is the lifecycle owner of that new entity;
+    /// this is not a general revision mutation seam.
+    pub(crate) fn reset_revision_for_fork(&self) -> Self {
+        Self::new(
+            WorkspaceRevision::new(
+                NonZeroU64::new(1).expect("the fixed initial Workspace revision is non-zero"),
+            ),
+            self.primary_root.clone(),
+            self.additional_roots.clone(),
+            self.cwd.clone(),
+        )
+        .expect("a previously valid Workspace remains valid after its Fork revision reset")
     }
 }
 

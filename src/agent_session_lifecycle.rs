@@ -503,6 +503,93 @@ pub(crate) fn session_metadata_has_same_canonical_content(
     first.name() == second.name() && first.description() == second.description()
 }
 
+/// The lifecycle-owned, pre-identity input to one recorded-history Genesis Fork attempt.
+///
+/// The source Session identity and child-local creation timestamp are the only facts captured
+/// here. DurableState supplies the child identity and the exact source definition after actor
+/// serialization; physical storage, publication and source conversation facts do not cross this
+/// seam.
+pub(crate) struct SealedSessionForkAttempt {
+    source_session_id: SessionId,
+    child_created_at: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionForkAttemptError {
+    #[error("fork source definition does not match the captured source")]
+    SourceDefinitionMismatch,
+}
+
+impl SealedSessionForkAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Session Fork command constructor consumes this sealed lifecycle seam"
+    )]
+    pub(crate) const fn recorded_genesis(
+        source_session_id: SessionId,
+        child_created_at: Timestamp,
+    ) -> Self {
+        Self {
+            source_session_id,
+            child_created_at,
+        }
+    }
+
+    pub(crate) const fn source_session_id(&self) -> SessionId {
+        self.source_session_id
+    }
+
+    pub(crate) fn generate_candidate(&self) -> Result<SessionId, IdGenerationError> {
+        SessionId::generate()
+    }
+
+    pub(crate) fn materialize(
+        &self,
+        child_session_id: SessionId,
+        source_definition: &SessionDefinition,
+    ) -> Result<(SessionDefinition, SessionMetadata, SessionForkProvenance), SessionForkAttemptError>
+    {
+        if source_definition.session_id() != self.source_session_id {
+            return Err(SessionForkAttemptError::SourceDefinitionMismatch);
+        }
+        let definition_revision = SessionDefinitionRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Session definition revision is non-zero"),
+        );
+        let metadata_revision = SessionMetadataRevision::new(
+            NonZeroU64::new(1).expect("the fixed initial Session metadata revision is non-zero"),
+        );
+        let workspace = source_definition.workspace().reset_revision_for_fork();
+        let metadata = SessionMetadata::new(
+            metadata_revision,
+            None::<&str>,
+            None::<&str>,
+            self.child_created_at,
+        )
+        .expect("empty Genesis Fork metadata is always valid");
+        let definition = SessionDefinition::new(
+            child_session_id,
+            definition_revision,
+            source_definition.agent(),
+            workspace,
+            source_definition.model().clone(),
+            source_definition.prompts().clone(),
+            self.child_created_at,
+        );
+        let provenance = SessionForkProvenance::recorded_genesis(self.source_session_id);
+        Ok((definition, metadata, provenance))
+    }
+}
+
+impl fmt::Debug for SealedSessionForkAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionForkAttempt")
+            .field("source_session", &"redacted")
+            .field("child_created_at", &"redacted")
+            .finish()
+    }
+}
+
 /// The lifecycle-owned, pre-identity input to one durable ordinary Session create attempt.
 ///
 /// The requested AgentId is only a lookup key. The durable owner supplies the assigned SessionId
@@ -682,6 +769,14 @@ pub struct SessionForkProvenance {
 }
 
 impl SessionForkProvenance {
+    pub(crate) const fn recorded_genesis(source_session_id: SessionId) -> Self {
+        Self {
+            source_session_id,
+            source: ForkSourceKind::RecordedHistory,
+            anchor: ForkAnchor::Genesis,
+        }
+    }
+
     pub const fn new(
         source_session_id: SessionId,
         source: ForkSourceKind,
@@ -720,14 +815,18 @@ impl fmt::Debug for SessionForkProvenance {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
+    use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        AgentRevisionRef, SealedAgentCreateAttempt, SealedSessionCreateAttempt, SessionModelConfig,
+        AgentRevisionRef, SealedAgentCreateAttempt, SealedSessionCreateAttempt,
+        SealedSessionForkAttempt, SessionDefinition, SessionForkAttemptError, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
-    use crate::wire::{AgentId, AgentRevision, CanonicalFileUri, SessionId, WorkspaceRevision};
+    use crate::wire::{
+        AgentId, AgentRevision, CanonicalFileUri, SessionDefinitionRevision, SessionId,
+        WorkspaceRevision,
+    };
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
         WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
@@ -775,6 +874,99 @@ mod tests {
         assert_eq!(metadata.name(), "Planner secret");
         assert_eq!(metadata.description(), Some("Description secret"));
         assert_eq!(metadata.updated_at(), timestamp);
+    }
+
+    #[test]
+    fn sealed_session_fork_attempt_records_only_genesis_source_facts_and_redacts_source_identity() {
+        let source_session: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let timestamp = "2026-08-03T10:03:00.000Z".parse().unwrap();
+        let attempt = SealedSessionForkAttempt::recorded_genesis(source_session, timestamp);
+
+        assert_eq!(attempt.source_session_id(), source_session);
+        let debug = format!("{attempt:?}");
+        assert!(!debug.contains("ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(!debug.contains("10:03:00"));
+
+        let source_id: SessionId = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        assert_ne!(attempt.source_session_id(), source_id);
+    }
+
+    #[test]
+    fn sealed_recorded_genesis_fork_resets_child_revisions_and_copies_source_semantics() {
+        let source_session: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let child_session: SessionId = "ses_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let root_key: WorkspaceRootKey = "repo".parse().unwrap();
+        let root_uri: CanonicalFileUri = if cfg!(windows) {
+            "file:///C:/work/project".parse().unwrap()
+        } else {
+            "file:///Users/example/project".parse().unwrap()
+        };
+        let workspace = lower_workspace(
+            WorkspaceDefinitionInput::new(
+                WorkspaceRootInput::new(
+                    root_key,
+                    root_uri,
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(true, true),
+                ),
+                Vec::new(),
+                WorkspaceCwdSpec::new("repo".parse().unwrap(), "src".parse().unwrap()),
+            )
+            .unwrap(),
+            WorkspaceRevision::new(NonZeroU64::new(7).unwrap()),
+            WorkspacePathTarget::current(),
+        )
+        .unwrap();
+        let source_definition = SessionDefinition::new(
+            source_session,
+            SessionDefinitionRevision::new(NonZeroU64::new(9).unwrap()),
+            AgentRevisionRef::new(
+                "agt_11111111111111111111111111111111".parse().unwrap(),
+                AgentRevision::new(NonZeroU64::new(3).unwrap()),
+            ),
+            workspace,
+            SessionModelConfig::new(
+                ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+                ReasoningPreference::Auto,
+                Some(NonZeroU32::new(4096).unwrap()),
+            ),
+            SessionPromptSelection::new(vec!["base".parse().unwrap()]).unwrap(),
+            "2026-08-03T10:01:00.456Z".parse().unwrap(),
+        );
+        let child_created_at = "2026-08-03T10:03:00.000Z".parse().unwrap();
+        let attempt = SealedSessionForkAttempt::recorded_genesis(source_session, child_created_at);
+        let (definition, metadata, provenance) = attempt
+            .materialize(child_session, &source_definition)
+            .unwrap();
+
+        assert_eq!(definition.session_id(), child_session);
+        assert_eq!(definition.revision().get(), 1);
+        assert_eq!(definition.workspace().revision().get(), 1);
+        assert_eq!(definition.agent(), source_definition.agent());
+        assert_eq!(definition.model(), source_definition.model());
+        assert_eq!(definition.prompts(), source_definition.prompts());
+        assert_eq!(definition.created_at(), child_created_at);
+        assert_eq!(metadata.revision().get(), 1);
+        assert_eq!(metadata.name(), None);
+        assert_eq!(metadata.description(), None);
+        assert_eq!(metadata.updated_at(), child_created_at);
+        assert_eq!(provenance.source_session_id(), source_session);
+        assert_eq!(provenance.source(), super::ForkSourceKind::RecordedHistory);
+        assert_eq!(provenance.anchor(), &super::ForkAnchor::Genesis);
+
+        let other_source = SessionDefinition::new(
+            "ses_cccccccccccccccccccccccccccccccc".parse().unwrap(),
+            source_definition.revision(),
+            source_definition.agent(),
+            source_definition.workspace().clone(),
+            source_definition.model().clone(),
+            source_definition.prompts().clone(),
+            source_definition.created_at(),
+        );
+        assert_eq!(
+            attempt.materialize(child_session, &other_source),
+            Err(SessionForkAttemptError::SourceDefinitionMismatch)
+        );
     }
 
     #[test]
