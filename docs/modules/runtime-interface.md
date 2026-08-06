@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5.0 recovery/root lease/owner-tracked actor、private reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer，以及Agent status/definition/metadata G2 CAS tracers已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Session existing-head update/CAS、完整cross-platform native matrix、Recorder/replay pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 recovery/root lease/owner-tracked actor、private reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer，以及Agent status/definition/metadata与Session metadata G2 CAS tracers已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Session definition/lifecycle update/CAS、完整cross-platform native matrix、Recorder/replay pending）
 
 ## 目的
 

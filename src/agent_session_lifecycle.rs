@@ -913,6 +913,15 @@ impl SessionMetadata {
     pub const fn updated_at(&self) -> Timestamp {
         self.updated_at
     }
+
+    fn with_revision(&self, revision: SessionMetadataRevision, updated_at: Timestamp) -> Self {
+        Self {
+            revision,
+            name: self.name.clone(),
+            description: self.description.clone(),
+            updated_at,
+        }
+    }
 }
 
 impl fmt::Debug for SessionMetadata {
@@ -932,6 +941,275 @@ pub(crate) fn session_metadata_has_same_canonical_content(
     second: &SessionMetadata,
 ) -> bool {
     first.name() == second.name() && first.description() == second.description()
+}
+
+/// The sealed name half of a Session metadata patch. Its representation is private so a caller
+/// cannot forge an invalid canonical Set value or confuse Keep with Clear.
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SessionMetadataNamePatch {
+    value: SessionMetadataNamePatchValue,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+enum SessionMetadataNamePatchValue {
+    Keep,
+    Set(Box<str>),
+    Clear,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+impl SessionMetadataNamePatch {
+    pub(crate) const fn keep() -> Self {
+        Self {
+            value: SessionMetadataNamePatchValue::Keep,
+        }
+    }
+
+    pub(crate) fn set<N>(raw: N) -> Result<Self, SessionMetadataError>
+    where
+        N: AsRef<str>,
+    {
+        let limits = ProtocolLimits::v1_0().text;
+        let value = normalize_session_metadata_text(
+            raw.as_ref(),
+            usize::from(limits.max_display_name_bytes),
+            false,
+        )?;
+        Ok(Self {
+            value: SessionMetadataNamePatchValue::Set(value),
+        })
+    }
+
+    pub(crate) const fn clear() -> Self {
+        Self {
+            value: SessionMetadataNamePatchValue::Clear,
+        }
+    }
+
+    fn apply_to(&self, current: Option<&str>) -> Option<Box<str>> {
+        match &self.value {
+            SessionMetadataNamePatchValue::Keep => current.map(Into::into),
+            SessionMetadataNamePatchValue::Set(value) => Some(value.clone()),
+            SessionMetadataNamePatchValue::Clear => None,
+        }
+    }
+}
+
+impl fmt::Debug for SessionMetadataNamePatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.value {
+            SessionMetadataNamePatchValue::Keep => "Keep",
+            SessionMetadataNamePatchValue::Set(_) => "Set",
+            SessionMetadataNamePatchValue::Clear => "Clear",
+        };
+        formatter
+            .debug_struct("SessionMetadataNamePatch")
+            .field("kind", &kind)
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+
+/// The sealed description half of a Session metadata patch. Set permits the canonical empty
+/// description, while the representation still keeps Keep distinct from Clear.
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct SessionMetadataDescriptionPatch {
+    value: SessionMetadataDescriptionPatchValue,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+#[derive(Clone, Eq, PartialEq)]
+enum SessionMetadataDescriptionPatchValue {
+    Keep,
+    Set(Box<str>),
+    Clear,
+}
+
+#[allow(
+    dead_code,
+    reason = "the sealed Session metadata patch is consumed by the pending Session command surface"
+)]
+impl SessionMetadataDescriptionPatch {
+    pub(crate) const fn keep() -> Self {
+        Self {
+            value: SessionMetadataDescriptionPatchValue::Keep,
+        }
+    }
+
+    pub(crate) fn set<D>(raw: D) -> Result<Self, SessionMetadataError>
+    where
+        D: AsRef<str>,
+    {
+        let limits = ProtocolLimits::v1_0().text;
+        let value = normalize_session_metadata_text(
+            raw.as_ref(),
+            usize::try_from(limits.max_description_bytes).unwrap_or(usize::MAX),
+            true,
+        )?;
+        Ok(Self {
+            value: SessionMetadataDescriptionPatchValue::Set(value),
+        })
+    }
+
+    pub(crate) const fn clear() -> Self {
+        Self {
+            value: SessionMetadataDescriptionPatchValue::Clear,
+        }
+    }
+
+    fn apply_to(&self, current: Option<&str>) -> Option<Box<str>> {
+        match &self.value {
+            SessionMetadataDescriptionPatchValue::Keep => current.map(Into::into),
+            SessionMetadataDescriptionPatchValue::Set(value) => Some(value.clone()),
+            SessionMetadataDescriptionPatchValue::Clear => None,
+        }
+    }
+}
+
+impl fmt::Debug for SessionMetadataDescriptionPatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.value {
+            SessionMetadataDescriptionPatchValue::Keep => "Keep",
+            SessionMetadataDescriptionPatchValue::Set(_) => "Set",
+            SessionMetadataDescriptionPatchValue::Clear => "Clear",
+        };
+        formatter
+            .debug_struct("SessionMetadataDescriptionPatch")
+            .field("kind", &kind)
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+
+/// Lifecycle-owned semantic input to one Session metadata CAS. It carries only the Session lookup
+/// key, expected current metadata revision, canonical patch intent, and owner timestamp. Storage
+/// generation, paths, markers, command identity, and publication handles do not cross this seam.
+pub(crate) struct SealedSessionMetadataAttempt {
+    session_id: SessionId,
+    expected_revision: SessionMetadataRevision,
+    name: SessionMetadataNamePatch,
+    description: SessionMetadataDescriptionPatch,
+    owner_timestamp: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionMetadataDecisionError {
+    #[error("Session metadata compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session metadata revision is exhausted")]
+    RevisionExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionMetadataDecision {
+    NoChange,
+    Publish(SessionMetadata),
+}
+
+impl SealedSessionMetadataAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Session metadata command constructor consumes this sealed seam"
+    )]
+    pub(crate) fn new(
+        session_id: SessionId,
+        expected_revision: SessionMetadataRevision,
+        name: SessionMetadataNamePatch,
+        description: SessionMetadataDescriptionPatch,
+        owner_timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            session_id,
+            expected_revision,
+            name,
+            description,
+            owner_timestamp,
+        }
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn expected_revision(&self) -> SessionMetadataRevision {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) const fn owner_timestamp(&self) -> Timestamp {
+        self.owner_timestamp
+    }
+
+    /// Decides the semantic CAS in its authoritative order: expected metadata revision, terminal
+    /// lifecycle, patch application against authoritative current metadata, canonical no-op, then
+    /// checked next revision and metadata materialization.
+    pub(crate) fn decide(
+        &self,
+        current_lifecycle: SessionLifecycle,
+        current_metadata: &SessionMetadata,
+    ) -> Result<SessionMetadataDecision, SessionMetadataDecisionError> {
+        let current_revision = current_metadata.revision();
+        if current_revision != self.expected_revision {
+            return Err(SessionMetadataDecisionError::StaleRevision);
+        }
+        if current_lifecycle == SessionLifecycle::Deleted {
+            return Err(SessionMetadataDecisionError::SessionDeleted);
+        }
+        let patched_metadata = SessionMetadata {
+            revision: current_revision,
+            name: self.name.apply_to(current_metadata.name()),
+            description: self.description.apply_to(current_metadata.description()),
+            updated_at: current_metadata.updated_at(),
+        };
+        if session_metadata_has_same_canonical_content(&patched_metadata, current_metadata) {
+            return Ok(SessionMetadataDecision::NoChange);
+        }
+        let next_revision = current_revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(SessionMetadataRevision::new)
+            .ok_or(SessionMetadataDecisionError::RevisionExhausted)?;
+        Ok(SessionMetadataDecision::Publish(
+            patched_metadata.with_revision(next_revision, self.owner_timestamp),
+        ))
+    }
+}
+
+impl fmt::Debug for SealedSessionMetadataAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedSessionMetadataAttempt")
+            .field("session_id", &"redacted")
+            .field("expected_revision", &self.expected_revision)
+            .field("name_patch", &"redacted")
+            .field("description_patch", &"redacted")
+            .field("owner_timestamp", &"redacted")
+            .finish()
+    }
 }
 
 /// The lifecycle-owned, pre-identity input to one recorded-history Genesis Fork attempt.
@@ -1253,7 +1531,9 @@ mod tests {
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
         SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
         SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
-        SessionDefinition, SessionForkAttemptError, SessionModelConfig,
+        SealedSessionMetadataAttempt, SessionDefinition, SessionForkAttemptError, SessionLifecycle,
+        SessionMetadataDecision, SessionMetadataDecisionError, SessionMetadataDescriptionPatch,
+        SessionMetadataNamePatch, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -1644,6 +1924,153 @@ mod tests {
         assert_eq!(
             empty.decide(AgentStatus::Enabled, &current).unwrap(),
             AgentMetadataDecision::NoChange
+        );
+    }
+
+    #[test]
+    fn sealed_session_metadata_patch_preserves_intents_and_orders_cas() {
+        let session_id: SessionId = "ses_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let revision = super::SessionMetadataRevision::new(NonZeroU64::new(1).unwrap());
+        let current_timestamp = "2026-08-03T10:00:00.123Z".parse().unwrap();
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let current = super::SessionMetadata::new(
+            revision,
+            Some("Planner"),
+            Some("Description"),
+            current_timestamp,
+        )
+        .unwrap();
+        let changed = SealedSessionMetadataAttempt::new(
+            session_id,
+            revision,
+            SessionMetadataNamePatch::set("Revised\r\nname").unwrap(),
+            SessionMetadataDescriptionPatch::set("Revised\rdescription").unwrap(),
+            owner_timestamp,
+        );
+        let debug = format!("{changed:?}");
+        for secret in ["ses_aaaaaaaa", "Revised", "10:00:05"] {
+            assert!(
+                !debug.contains(secret),
+                "metadata attempt leaked {secret:?}"
+            );
+        }
+        assert_eq!(changed.expected_revision(), revision);
+        assert_eq!(changed.owner_timestamp(), owner_timestamp);
+
+        let stale = super::SessionMetadata::new(
+            super::SessionMetadataRevision::new(NonZeroU64::new(2).unwrap()),
+            Some("Planner"),
+            Some("Description"),
+            current_timestamp,
+        )
+        .unwrap();
+        assert_eq!(
+            changed
+                .decide(SessionLifecycle::Deleted, &stale)
+                .unwrap_err(),
+            SessionMetadataDecisionError::StaleRevision
+        );
+        assert_eq!(
+            changed
+                .decide(SessionLifecycle::Deleted, &current)
+                .unwrap_err(),
+            SessionMetadataDecisionError::SessionDeleted
+        );
+        let SessionMetadataDecision::Publish(published) = changed
+            .decide(SessionLifecycle::Archived, &current)
+            .unwrap()
+        else {
+            panic!("changed Session metadata publishes");
+        };
+        assert_eq!(published.revision().get(), 2);
+        assert_eq!(published.name(), Some("Revised\nname"));
+        assert_eq!(published.description(), Some("Revised\ndescription"));
+        assert_eq!(published.updated_at(), owner_timestamp);
+
+        for (name, description, expected_name, expected_description) in [
+            (
+                SessionMetadataNamePatch::keep(),
+                SessionMetadataDescriptionPatch::keep(),
+                Some("Planner"),
+                Some("Description"),
+            ),
+            (
+                SessionMetadataNamePatch::clear(),
+                SessionMetadataDescriptionPatch::keep(),
+                None,
+                Some("Description"),
+            ),
+            (
+                SessionMetadataNamePatch::keep(),
+                SessionMetadataDescriptionPatch::clear(),
+                Some("Planner"),
+                None,
+            ),
+            (
+                SessionMetadataNamePatch::set("Planner").unwrap(),
+                SessionMetadataDescriptionPatch::set("").unwrap(),
+                Some("Planner"),
+                Some(""),
+            ),
+        ] {
+            let attempt = SealedSessionMetadataAttempt::new(
+                session_id,
+                revision,
+                name,
+                description,
+                owner_timestamp,
+            );
+            let decision = attempt.decide(SessionLifecycle::Open, &current).unwrap();
+            if expected_name == current.name() && expected_description == current.description() {
+                assert_eq!(decision, SessionMetadataDecision::NoChange);
+            } else {
+                let SessionMetadataDecision::Publish(metadata) = decision else {
+                    panic!("the Session metadata patch changes canonical content");
+                };
+                assert_eq!(metadata.name(), expected_name);
+                assert_eq!(metadata.description(), expected_description);
+            }
+        }
+
+        let equivalent = SealedSessionMetadataAttempt::new(
+            session_id,
+            revision,
+            SessionMetadataNamePatch::set("Planner").unwrap(),
+            SessionMetadataDescriptionPatch::set("Description").unwrap(),
+            owner_timestamp,
+        );
+        assert_eq!(
+            equivalent
+                .decide(SessionLifecycle::Deleted, &current)
+                .unwrap_err(),
+            SessionMetadataDecisionError::SessionDeleted
+        );
+
+        let exhausted = super::SessionMetadata::new(
+            super::SessionMetadataRevision::new(NonZeroU64::new(u64::MAX).unwrap()),
+            Some("Planner"),
+            Some("Description"),
+            current_timestamp,
+        )
+        .unwrap();
+        assert_eq!(
+            changed
+                .decide(SessionLifecycle::Open, &exhausted)
+                .unwrap_err(),
+            SessionMetadataDecisionError::StaleRevision
+        );
+        let exhausted_changed = SealedSessionMetadataAttempt::new(
+            session_id,
+            exhausted.revision(),
+            SessionMetadataNamePatch::set("Different").unwrap(),
+            SessionMetadataDescriptionPatch::keep(),
+            owner_timestamp,
+        );
+        assert_eq!(
+            exhausted_changed
+                .decide(SessionLifecycle::Open, &exhausted)
+                .unwrap_err(),
+            SessionMetadataDecisionError::RevisionExhausted
         );
     }
 
