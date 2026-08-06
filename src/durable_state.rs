@@ -18,8 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{
-    AgentDefinition, AgentMetadata, AgentRevisionRef, AgentStatus, AgentStatusDecision,
-    AgentStatusDecisionError, SealedAgentCreateAttempt, SealedAgentStatusAttempt,
+    AgentDefinition, AgentDefinitionDecision, AgentDefinitionDecisionError, AgentMetadata,
+    AgentRevisionRef, AgentStatus, AgentStatusDecision, AgentStatusDecisionError,
+    SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentStatusAttempt,
     SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionDefinition, SessionForkProvenance,
     SessionLifecycle, SessionMetadata, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
@@ -775,6 +776,56 @@ impl DurableAgentStatusOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableAgentDefinitionError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Agent was not found")]
+    AgentNotFound,
+    #[error("Agent definition compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[allow(
+    dead_code,
+    reason = "the public Agent command completion consumes this private durable outcome"
+)]
+#[derive(Clone, Debug)]
+pub(crate) enum DurableAgentDefinitionOutcome {
+    NoChange(Arc<DurableAgentHead>, Arc<AgentDefinition>),
+    Updated(Arc<DurableAgentHead>, Arc<AgentDefinition>),
+}
+
+#[allow(
+    dead_code,
+    reason = "the public Agent command completion consumes these outcome projections"
+)]
+impl DurableAgentDefinitionOutcome {
+    pub(crate) fn head(&self) -> &Arc<DurableAgentHead> {
+        match self {
+            Self::NoChange(head, _) | Self::Updated(head, _) => head,
+        }
+    }
+
+    pub(crate) fn definition(&self) -> &Arc<AgentDefinition> {
+        match self {
+            Self::NoChange(_, definition) | Self::Updated(_, definition) => definition,
+        }
+    }
+
+    pub(crate) const fn changed(&self) -> bool {
+        matches!(self, Self::Updated(_, _))
+    }
+}
+
 struct CreateAgentRequest {
     attempt: SealedAgentCreateAttempt,
     response: Option<oneshot::Sender<Result<Arc<DurableAgentHead>, DurableAgentCreateError>>>,
@@ -824,7 +875,7 @@ struct SetAgentStatusRequest {
     attempt: SealedAgentStatusAttempt,
     response: Option<oneshot::Sender<Result<DurableAgentStatusOutcome, DurableAgentStatusError>>>,
     closing: CancellationToken,
-    permit: Option<AgentStatusMutationPermit>,
+    permit: Option<AgentMutationPermit>,
 }
 
 impl SetAgentStatusRequest {
@@ -859,6 +910,52 @@ impl SetAgentStatusWaiter {
         self.response
             .await
             .unwrap_or(Err(DurableAgentStatusError::InternalDispatchUnavailable))
+    }
+}
+
+struct SetAgentDefinitionRequest {
+    attempt: SealedAgentDefinitionAttempt,
+    response:
+        Option<oneshot::Sender<Result<DurableAgentDefinitionOutcome, DurableAgentDefinitionError>>>,
+    closing: CancellationToken,
+    permit: Option<AgentMutationPermit>,
+}
+
+impl SetAgentDefinitionRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<DurableAgentDefinitionOutcome, DurableAgentDefinitionError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject(&mut self, error: DurableAgentDefinitionError) {
+        self.settle(Err(error));
+    }
+}
+
+impl Drop for SetAgentDefinitionRequest {
+    fn drop(&mut self) {
+        let error = if self.closing.is_cancelled() {
+            DurableAgentDefinitionError::Closing
+        } else {
+            DurableAgentDefinitionError::InternalDispatchUnavailable
+        };
+        self.reject(error);
+    }
+}
+
+struct SetAgentDefinitionWaiter {
+    response: oneshot::Receiver<Result<DurableAgentDefinitionOutcome, DurableAgentDefinitionError>>,
+}
+
+impl SetAgentDefinitionWaiter {
+    async fn wait(self) -> Result<DurableAgentDefinitionOutcome, DurableAgentDefinitionError> {
+        self.response.await.unwrap_or(Err(
+            DurableAgentDefinitionError::InternalDispatchUnavailable,
+        ))
     }
 }
 
@@ -953,7 +1050,7 @@ impl ForkSessionWaiter {
 }
 
 /// The private per-Agent synchronization shared by durable publication and future initiating
-/// Input admission. Read permits preserve an Enabled epoch; status mutation takes the exclusive
+/// Input admission. Read permits preserve an Enabled epoch; Agent mutation takes the exclusive
 /// side before changing that epoch.
 #[derive(Default)]
 struct AgentLifecycleGateRegistry {
@@ -961,17 +1058,17 @@ struct AgentLifecycleGateRegistry {
     #[cfg(test)]
     publication_waiting: Notify,
     #[cfg(test)]
-    status_mutation_waiting: Notify,
+    mutation_waiting: Notify,
 }
 
-/// Typed exclusive status epoch. It deliberately exposes no raw lock operations and may be held
-/// by the actor publication owner across owner-tracked local durable I/O.
+/// Typed exclusive Agent mutation epoch. It deliberately exposes no raw lock operations and may
+/// be held by the actor publication owner across owner-tracked local durable I/O.
 #[derive(Clone)]
-struct AgentStatusMutationPermit {
-    _guard: Arc<AgentStatusMutationGuard>,
+struct AgentMutationPermit {
+    _guard: Arc<AgentMutationGuard>,
 }
 
-struct AgentStatusMutationGuard {
+struct AgentMutationGuard {
     _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
 }
 
@@ -994,11 +1091,11 @@ impl AgentLifecycleGateRegistry {
         self.gate(agent_id).read_owned().await
     }
 
-    async fn acquire_status_mutation(&self, agent_id: AgentId) -> AgentStatusMutationPermit {
+    async fn acquire_mutation(&self, agent_id: AgentId) -> AgentMutationPermit {
         #[cfg(test)]
-        self.status_mutation_waiting.notify_one();
-        AgentStatusMutationPermit {
-            _guard: Arc::new(AgentStatusMutationGuard {
+        self.mutation_waiting.notify_one();
+        AgentMutationPermit {
+            _guard: Arc::new(AgentMutationGuard {
                 _guard: self.gate(agent_id).write_owned().await,
             }),
         }
@@ -1010,8 +1107,8 @@ impl AgentLifecycleGateRegistry {
     }
 
     #[cfg(test)]
-    async fn wait_for_status_mutation_for_test(&self) {
-        self.status_mutation_waiting.notified().await;
+    async fn wait_for_agent_mutation_for_test(&self) {
+        self.mutation_waiting.notified().await;
     }
 }
 
@@ -1179,6 +1276,7 @@ impl std::error::Error for ActorRequestError {}
 enum DurableStateActorRequest {
     CreateAgent(CreateAgentRequest),
     SetAgentStatus(SetAgentStatusRequest),
+    SetAgentDefinition(SetAgentDefinitionRequest),
     CreateSession(CreateSessionRequest),
     ForkSession(ForkSessionRequest),
     #[cfg(test)]
@@ -1235,6 +1333,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::SetAgentStatus(request) => {
                 request.reject(DurableAgentStatusError::Closing);
             }
+            DurableStateActorRequest::SetAgentDefinition(request) => {
+                request.reject(DurableAgentDefinitionError::Closing);
+            }
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::Closing);
             }
@@ -1264,6 +1365,9 @@ impl DurableStateActorRequestEnvelope {
             DurableStateActorRequest::SetAgentStatus(request) => {
                 request.reject(DurableAgentStatusError::InternalDispatchUnavailable);
             }
+            DurableStateActorRequest::SetAgentDefinition(request) => {
+                request.reject(DurableAgentDefinitionError::InternalDispatchUnavailable);
+            }
             DurableStateActorRequest::CreateSession(request) => {
                 request.reject(DurableSessionCreateError::InternalDispatchUnavailable);
             }
@@ -1291,6 +1395,7 @@ impl DurableStateActorRequestEnvelope {
             }
             DurableStateActorRequest::CreateAgent(_)
             | DurableStateActorRequest::SetAgentStatus(_)
+            | DurableStateActorRequest::SetAgentDefinition(_)
             | DurableStateActorRequest::CreateSession(_)
             | DurableStateActorRequest::ForkSession(_)
             | DurableStateActorRequest::ReserveAgent(_)
@@ -1585,6 +1690,46 @@ impl DurableStateActorHandle {
         };
         permit.send(envelope);
         SetAgentStatusWaiter { response: waiter }
+    }
+
+    async fn enqueue_agent_definition(
+        &self,
+        attempt: SealedAgentDefinitionAttempt,
+    ) -> SetAgentDefinitionWaiter {
+        let (response, waiter) = oneshot::channel();
+        let request = SetAgentDefinitionRequest {
+            attempt,
+            response: Some(response),
+            closing: self.closing.clone(),
+            permit: None,
+        };
+        let mut envelope = DurableStateActorRequestEnvelope {
+            request: DurableStateActorRequest::SetAgentDefinition(request),
+            #[cfg(test)]
+            response: None,
+            #[cfg(test)]
+            drop_error: ActorRequestError::Unavailable,
+        };
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                envelope.reject_closing();
+                return SetAgentDefinitionWaiter { response: waiter };
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    if self.closing.is_cancelled() {
+                        envelope.reject_closing();
+                    } else {
+                        envelope.reject_unavailable();
+                    }
+                    return SetAgentDefinitionWaiter { response: waiter };
+                }
+            },
+        };
+        permit.send(envelope);
+        SetAgentDefinitionWaiter { response: waiter }
     }
 
     async fn enqueue_session_create(
@@ -2031,8 +2176,8 @@ impl DurableStateActor {
                                         close_required,
                                     } => {
                                         let head = Arc::clone(&entry.current_head);
-                                        debug_assert!(lock(&self.published_agents)
-                                            .contains_key(&head.agent_id()));
+                                        lock(&self.published_agents)
+                                            .insert(head.agent_id(), entry);
                                         status.settle(Ok(DurableAgentStatusOutcome::Updated(head)));
                                         if close_required {
                                             self.task_context.request_closing();
@@ -2064,6 +2209,67 @@ impl DurableStateActor {
                                         self.task_context.request_closing();
                                         self.closing.cancel();
                                         status.permit.take();
+                                        self.close_receiver_and_reject_queued().await;
+                                        return true;
+                                    }
+                                }
+                            }
+                            DurableStateActorRequest::SetAgentDefinition(definition) => {
+                                match self.process_agent_definition(definition).await {
+                                    AgentDefinitionMutationWorkResult::NoChange {
+                                        head,
+                                        definition: current_definition,
+                                    } => {
+                                        definition.settle(Ok(DurableAgentDefinitionOutcome::NoChange(
+                                            head,
+                                            current_definition,
+                                        )));
+                                        definition.permit.take();
+                                    }
+                                    AgentDefinitionMutationWorkResult::Published {
+                                        entry,
+                                        close_required,
+                                    } => {
+                                        let head = Arc::clone(&entry.current_head);
+                                        let current_definition = Arc::clone(&entry.current_definition);
+                                        lock(&self.published_agents)
+                                            .insert(head.agent_id(), entry);
+                                        definition.settle(Ok(
+                                            DurableAgentDefinitionOutcome::Updated(
+                                                head,
+                                                current_definition,
+                                            ),
+                                        ));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            definition.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        definition.permit.take();
+                                    }
+                                    AgentDefinitionMutationWorkResult::Ordinary {
+                                        error,
+                                        close_required,
+                                    } => {
+                                        definition.settle(Err(error));
+                                        if close_required {
+                                            self.task_context.request_closing();
+                                            self.closing.cancel();
+                                            definition.permit.take();
+                                            self.close_receiver_and_reject_queued().await;
+                                            return true;
+                                        }
+                                        definition.permit.take();
+                                    }
+                                    AgentDefinitionMutationWorkResult::Poisoned => {
+                                        definition.settle(Err(
+                                            DurableAgentDefinitionError::InternalDispatchUnavailable,
+                                        ));
+                                        self.task_context.request_closing();
+                                        self.closing.cancel();
+                                        definition.permit.take();
                                         self.close_receiver_and_reject_queued().await;
                                         return true;
                                     }
@@ -2263,7 +2469,7 @@ impl DurableStateActor {
                 close_required: false,
             };
         }
-        let status_gate = tokio::select! {
+        let mutation_permit = tokio::select! {
             biased;
             _ = self.closing.cancelled() => {
                 return AgentStatusMutationWorkResult::Ordinary {
@@ -2271,9 +2477,9 @@ impl DurableStateActor {
                     close_required: false,
                 };
             }
-            permit = self.agent_lifecycle_gates.acquire_status_mutation(agent_id) => permit,
+            permit = self.agent_lifecycle_gates.acquire_mutation(agent_id) => permit,
         };
-        request.permit = Some(status_gate);
+        request.permit = Some(mutation_permit);
         let current = {
             let published = lock(&self.published_agents);
             published
@@ -2338,37 +2544,156 @@ impl DurableStateActor {
         if !agent_status_transition_is_valid(&current.current_head, &head) {
             return AgentStatusMutationWorkResult::Poisoned;
         }
-        let head_bytes = match DurableStoreV1Codec::encode_agent_head(&head) {
-            Ok(bytes) => bytes,
-            Err(
-                DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure,
-            ) => {
-                return AgentStatusMutationWorkResult::Ordinary {
-                    error: DurableAgentStatusError::DurableStateTooLarge,
+        map_agent_status_existing_generation_result(
+            publish_agent_existing_generation(
+                self.task_context.clone(),
+                Arc::clone(&self.lease),
+                Arc::clone(&self.filesystem),
+                self.root.clone(),
+                self.directory_sync,
+                current,
+                head,
+                None,
+                request
+                    .permit
+                    .as_ref()
+                    .expect("the status request retains its exclusive permit")
+                    .clone(),
+                self.closing.clone(),
+                Arc::clone(&self.active_commit_barrier),
+            )
+            .await,
+        )
+    }
+
+    async fn process_agent_definition(
+        &mut self,
+        request: &mut SetAgentDefinitionRequest,
+    ) -> AgentDefinitionMutationWorkResult {
+        let agent_id = request.attempt.agent_id();
+        let exists = lock(&self.published_agents).contains_key(&agent_id)
+            || self.recovered_agents.contains_key(&agent_id);
+        if !exists {
+            return AgentDefinitionMutationWorkResult::Ordinary {
+                error: DurableAgentDefinitionError::AgentNotFound,
+                close_required: false,
+            };
+        }
+        let mutation_permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                return AgentDefinitionMutationWorkResult::Ordinary {
+                    error: DurableAgentDefinitionError::Closing,
                     close_required: false,
                 };
             }
-            Err(_) => return AgentStatusMutationWorkResult::Poisoned,
+            permit = self.agent_lifecycle_gates.acquire_mutation(agent_id) => permit,
         };
-        publish_agent_status_generation(
-            self.task_context.clone(),
-            Arc::clone(&self.lease),
-            Arc::clone(&self.filesystem),
-            self.root.clone(),
-            self.directory_sync,
-            current,
-            head,
-            head_bytes,
-            Arc::clone(&self.published_agents),
-            request
-                .permit
-                .as_ref()
-                .expect("the status request retains its exclusive permit")
-                .clone(),
-            self.closing.clone(),
-            Arc::clone(&self.active_commit_barrier),
+        request.permit = Some(mutation_permit);
+        let current = {
+            let published = lock(&self.published_agents);
+            published
+                .get(&agent_id)
+                .cloned()
+                .or_else(|| self.recovered_agents.get(&agent_id).cloned())
+        };
+        let Some(current) = current else {
+            return AgentDefinitionMutationWorkResult::Poisoned;
+        };
+        let decision = match request.attempt.decide(
+            current.current_head.current_definition_revision(),
+            current.current_head.status(),
+            &current.current_definition,
+        ) {
+            Ok(decision) => decision,
+            Err(AgentDefinitionDecisionError::StaleRevision) => {
+                return AgentDefinitionMutationWorkResult::Ordinary {
+                    error: DurableAgentDefinitionError::StaleRevision,
+                    close_required: false,
+                };
+            }
+            Err(AgentDefinitionDecisionError::AgentDeleted) => {
+                return AgentDefinitionMutationWorkResult::Ordinary {
+                    error: DurableAgentDefinitionError::AgentDeleted,
+                    close_required: false,
+                };
+            }
+            Err(AgentDefinitionDecisionError::RevisionExhausted) => {
+                return AgentDefinitionMutationWorkResult::Ordinary {
+                    error: DurableAgentDefinitionError::DurableStateTooLarge,
+                    close_required: false,
+                };
+            }
+        };
+        let AgentDefinitionDecision::Publish(next_definition) = decision else {
+            return AgentDefinitionMutationWorkResult::NoChange {
+                head: Arc::clone(&current.current_head),
+                definition: Arc::clone(&current.current_definition),
+            };
+        };
+        let next_generation_value = match current
+            .current_head
+            .storage_generation()
+            .get()
+            .checked_add(1)
+        {
+            Some(value) if value as usize <= GENERATION_ENTRY_CAP => value,
+            _ => {
+                return AgentDefinitionMutationWorkResult::Ordinary {
+                    error: DurableAgentDefinitionError::DurableStateTooLarge,
+                    close_required: false,
+                };
+            }
+        };
+        let Some(next_generation) = StorageGeneration::new(next_generation_value) else {
+            return AgentDefinitionMutationWorkResult::Poisoned;
+        };
+        let next_definition = Arc::new(next_definition);
+        let head = match DurableAgentHead::new(
+            agent_id,
+            next_generation,
+            Some(current.current_head.storage_generation()),
+            next_definition.revision(),
+            next_generation,
+            current.current_head.metadata().clone(),
+            current.current_head.status(),
+            current.current_head.created_at(),
+        ) {
+            Ok(head) => Arc::new(head),
+            Err(_) => return AgentDefinitionMutationWorkResult::Poisoned,
+        };
+        if validate_agent_generation_transition(
+            agent_id,
+            next_generation,
+            &current.current_head,
+            &current.current_definition,
+            &head,
+            Some(&next_definition),
         )
-        .await
+        .is_err()
+        {
+            return AgentDefinitionMutationWorkResult::Poisoned;
+        }
+        map_agent_definition_existing_generation_result(
+            publish_agent_existing_generation(
+                self.task_context.clone(),
+                Arc::clone(&self.lease),
+                Arc::clone(&self.filesystem),
+                self.root.clone(),
+                self.directory_sync,
+                current,
+                head,
+                Some(next_definition),
+                request
+                    .permit
+                    .as_ref()
+                    .expect("the definition request retains its exclusive permit")
+                    .clone(),
+                self.closing.clone(),
+                Arc::clone(&self.active_commit_barrier),
+            )
+            .await,
+        )
     }
 
     async fn process_create_session(
@@ -3360,6 +3685,26 @@ enum PublicationCertainty {
     IndeterminatePoisoned,
 }
 
+#[derive(Clone, Copy)]
+enum AgentExistingGenerationError {
+    Closing,
+    DurableStateTooLarge,
+    StorageUnavailable,
+}
+
+#[derive(Clone)]
+enum AgentExistingGenerationWorkResult {
+    Published {
+        entry: DurableAgentCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: AgentExistingGenerationError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
 #[derive(Clone)]
 enum PublicationWorkResult {
     Published {
@@ -3382,6 +3727,22 @@ enum AgentStatusMutationWorkResult {
     },
     Ordinary {
         error: DurableAgentStatusError,
+        close_required: bool,
+    },
+    Poisoned,
+}
+
+enum AgentDefinitionMutationWorkResult {
+    NoChange {
+        head: Arc<DurableAgentHead>,
+        definition: Arc<AgentDefinition>,
+    },
+    Published {
+        entry: DurableAgentCatalogEntry,
+        close_required: bool,
+    },
+    Ordinary {
+        error: DurableAgentDefinitionError,
         close_required: bool,
     },
     Poisoned,
@@ -3698,9 +4059,9 @@ impl DurableCommitBarrier {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the actor passes the fixed publication owner, filesystem, paths, and barrier seam"
+    reason = "the Agent existing-generation publisher binds one exact old/new head and optional definition"
 )]
-async fn publish_agent_status_generation(
+async fn publish_agent_existing_generation(
     task_context: RuntimeTaskContext,
     lease: Arc<RootLease>,
     filesystem: Arc<dyn DurableFilesystem>,
@@ -3708,26 +4069,27 @@ async fn publish_agent_status_generation(
     directory_sync: DirectorySync,
     current: DurableAgentCatalogEntry,
     head: Arc<DurableAgentHead>,
-    head_bytes: Vec<u8>,
-    published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
-    status_gate: AgentStatusMutationPermit,
+    definition: Option<Arc<AgentDefinition>>,
+    mutation_permit: AgentMutationPermit,
     closing: CancellationToken,
     active_barrier: Arc<Mutex<Option<Arc<DurableCommitBarrier>>>>,
-) -> AgentStatusMutationWorkResult {
+) -> AgentExistingGenerationWorkResult {
     let barrier = DurableCommitBarrier::new();
     *lock(&active_barrier) = Some(Arc::clone(&barrier));
     let worker_barrier = Arc::clone(&barrier);
-    let worker_status_gate = status_gate.clone();
+    // The request keeps its original permit. This explicit worker clone keeps the Agent gate
+    // closed if the actor is aborted after COMMITTED and the owner later joins the worker.
+    let worker_mutation_permit = mutation_permit.clone();
     let job = task_context.spawn_blocking_tracked(move || {
         let _lease = lease;
-        let _status_gate = worker_status_gate;
-        publish_agent_status_generation_blocking(
+        let _worker_mutation_permit = worker_mutation_permit;
+        publish_agent_existing_generation_blocking(
             filesystem.as_ref(),
             &root,
             directory_sync,
             current,
             head,
-            &head_bytes,
+            definition,
             worker_barrier,
         )
     });
@@ -3738,104 +4100,163 @@ async fn publish_agent_status_generation(
             let cancellation_won = barrier.try_cancel();
             let result = job_wait.await;
             match result {
-                Ok(result) if cancellation_won => force_agent_status_closing(result),
-                Ok(result) => force_agent_status_close(result),
+                Ok(result) if cancellation_won => force_agent_existing_generation_closing(result),
+                Ok(result) => force_agent_existing_generation_close(result),
                 Err(error) if cancellation_won => {
-                    force_agent_status_closing(classify_agent_status_task_error(error, &barrier))
+                    force_agent_existing_generation_closing(
+                        classify_agent_existing_generation_task_error(error, &barrier),
+                    )
                 }
-                Err(error) => {
-                    force_agent_status_close(classify_agent_status_task_error(error, &barrier))
-                }
+                Err(error) => force_agent_existing_generation_close(
+                    classify_agent_existing_generation_task_error(error, &barrier),
+                ),
             }
         }
         result = &mut job_wait => match result {
             Ok(result) => result,
-            Err(error) => classify_agent_status_task_error(error, &barrier),
+            Err(error) => classify_agent_existing_generation_task_error(error, &barrier),
         },
     };
     *lock(&active_barrier) = None;
-    if let AgentStatusMutationWorkResult::Published { entry, .. } = &result {
-        lock(&published_agents).insert(entry.current_head.agent_id(), entry.clone());
-    }
-    drop(status_gate);
+    // The request-owned permit remains in the concrete request until the actor installs the
+    // catalog entry and settles the current waiter. Only this worker clone is released here.
+    drop(mutation_permit);
     result
 }
 
-fn classify_agent_status_task_error(
+fn classify_agent_existing_generation_task_error(
     error: RuntimeTaskError,
     barrier: &DurableCommitBarrier,
-) -> AgentStatusMutationWorkResult {
+) -> AgentExistingGenerationWorkResult {
     match barrier.current_stage() {
-        DurableCommitStage::Crossed => AgentStatusMutationWorkResult::Poisoned,
+        DurableCommitStage::Crossed => AgentExistingGenerationWorkResult::Poisoned,
         DurableCommitStage::Pending | DurableCommitStage::Cancelled => match error {
-            RuntimeTaskError::OwnerClosing => AgentStatusMutationWorkResult::Ordinary {
-                error: DurableAgentStatusError::Closing,
+            RuntimeTaskError::OwnerClosing => AgentExistingGenerationWorkResult::Ordinary {
+                error: AgentExistingGenerationError::Closing,
                 close_required: false,
             },
-            RuntimeTaskError::WorkerUnavailable => AgentStatusMutationWorkResult::Ordinary {
-                error: DurableAgentStatusError::StorageUnavailable,
+            RuntimeTaskError::WorkerUnavailable => AgentExistingGenerationWorkResult::Ordinary {
+                error: AgentExistingGenerationError::StorageUnavailable,
                 close_required: false,
             },
-            RuntimeTaskError::OperationPanicked => AgentStatusMutationWorkResult::Poisoned,
+            RuntimeTaskError::OperationPanicked => AgentExistingGenerationWorkResult::Poisoned,
         },
     }
 }
 
-fn force_agent_status_closing(
-    result: AgentStatusMutationWorkResult,
-) -> AgentStatusMutationWorkResult {
+fn force_agent_existing_generation_closing(
+    result: AgentExistingGenerationWorkResult,
+) -> AgentExistingGenerationWorkResult {
     match result {
-        AgentStatusMutationWorkResult::Published { entry, .. } => {
-            AgentStatusMutationWorkResult::Published {
+        AgentExistingGenerationWorkResult::Published { entry, .. } => {
+            AgentExistingGenerationWorkResult::Published {
                 entry,
                 close_required: true,
             }
         }
-        AgentStatusMutationWorkResult::Ordinary { .. }
-        | AgentStatusMutationWorkResult::NoChange(_) => AgentStatusMutationWorkResult::Ordinary {
-            error: DurableAgentStatusError::Closing,
-            close_required: false,
-        },
-        AgentStatusMutationWorkResult::Poisoned => AgentStatusMutationWorkResult::Poisoned,
+        AgentExistingGenerationWorkResult::Ordinary { .. } => {
+            AgentExistingGenerationWorkResult::Ordinary {
+                error: AgentExistingGenerationError::Closing,
+                close_required: false,
+            }
+        }
+        AgentExistingGenerationWorkResult::Poisoned => AgentExistingGenerationWorkResult::Poisoned,
     }
 }
 
-fn force_agent_status_close(
-    result: AgentStatusMutationWorkResult,
-) -> AgentStatusMutationWorkResult {
+fn force_agent_existing_generation_close(
+    result: AgentExistingGenerationWorkResult,
+) -> AgentExistingGenerationWorkResult {
     match result {
-        AgentStatusMutationWorkResult::Published { entry, .. } => {
-            AgentStatusMutationWorkResult::Published {
+        AgentExistingGenerationWorkResult::Published { entry, .. } => {
+            AgentExistingGenerationWorkResult::Published {
                 entry,
                 close_required: true,
             }
         }
-        AgentStatusMutationWorkResult::Ordinary { error, .. } => {
-            AgentStatusMutationWorkResult::Ordinary {
+        AgentExistingGenerationWorkResult::Ordinary { error, .. } => {
+            AgentExistingGenerationWorkResult::Ordinary {
                 error,
                 close_required: true,
             }
         }
-        AgentStatusMutationWorkResult::NoChange(head) => {
-            AgentStatusMutationWorkResult::NoChange(head)
-        }
-        AgentStatusMutationWorkResult::Poisoned => AgentStatusMutationWorkResult::Poisoned,
+        AgentExistingGenerationWorkResult::Poisoned => AgentExistingGenerationWorkResult::Poisoned,
+    }
+}
+
+fn map_agent_status_existing_generation_result(
+    result: AgentExistingGenerationWorkResult,
+) -> AgentStatusMutationWorkResult {
+    match result {
+        AgentExistingGenerationWorkResult::Published {
+            entry,
+            close_required,
+        } => AgentStatusMutationWorkResult::Published {
+            entry,
+            close_required,
+        },
+        AgentExistingGenerationWorkResult::Ordinary {
+            error,
+            close_required,
+        } => AgentStatusMutationWorkResult::Ordinary {
+            error: match error {
+                AgentExistingGenerationError::Closing => DurableAgentStatusError::Closing,
+                AgentExistingGenerationError::DurableStateTooLarge => {
+                    DurableAgentStatusError::DurableStateTooLarge
+                }
+                AgentExistingGenerationError::StorageUnavailable => {
+                    DurableAgentStatusError::StorageUnavailable
+                }
+            },
+            close_required,
+        },
+        AgentExistingGenerationWorkResult::Poisoned => AgentStatusMutationWorkResult::Poisoned,
+    }
+}
+
+fn map_agent_definition_existing_generation_result(
+    result: AgentExistingGenerationWorkResult,
+) -> AgentDefinitionMutationWorkResult {
+    match result {
+        AgentExistingGenerationWorkResult::Published {
+            entry,
+            close_required,
+        } => AgentDefinitionMutationWorkResult::Published {
+            entry,
+            close_required,
+        },
+        AgentExistingGenerationWorkResult::Ordinary {
+            error,
+            close_required,
+        } => AgentDefinitionMutationWorkResult::Ordinary {
+            error: match error {
+                AgentExistingGenerationError::Closing => DurableAgentDefinitionError::Closing,
+                AgentExistingGenerationError::DurableStateTooLarge => {
+                    DurableAgentDefinitionError::DurableStateTooLarge
+                }
+                AgentExistingGenerationError::StorageUnavailable => {
+                    DurableAgentDefinitionError::StorageUnavailable
+                }
+            },
+            close_required,
+        },
+        AgentExistingGenerationWorkResult::Poisoned => AgentDefinitionMutationWorkResult::Poisoned,
     }
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the existing Agent status worker binds one exact old/new head publication"
+    reason = "the Agent existing-generation worker binds the fixed physical paths and exact facts"
 )]
-fn publish_agent_status_generation_blocking(
+fn publish_agent_existing_generation_blocking(
     filesystem: &dyn DurableFilesystem,
     root: &Path,
     directory_sync: DirectorySync,
     current: DurableAgentCatalogEntry,
     head: Arc<DurableAgentHead>,
-    head_bytes: &[u8],
+    definition: Option<Arc<AgentDefinition>>,
     barrier: Arc<DurableCommitBarrier>,
-) -> AgentStatusMutationWorkResult {
+) -> AgentExistingGenerationWorkResult {
     #[cfg(test)]
     let _attempt = PublicationAttemptTestGuard::new(filesystem);
     let agent_id = head.agent_id();
@@ -3844,29 +4265,70 @@ fn publish_agent_status_generation_blocking(
     let generations = entity.join("generations");
     let generation_path = generations.join(generation.directory_name());
     let head_path = generation_path.join("head.json");
+    let definition_path = generation_path.join("definition.json");
     let committed_path = generation_path.join("COMMITTED");
+    let allow_definition = definition.is_some();
+
+    if validate_agent_generation_transition(
+        agent_id,
+        generation,
+        &current.current_head,
+        &current.current_definition,
+        &head,
+        definition.as_deref(),
+    )
+    .is_err()
+    {
+        return AgentExistingGenerationWorkResult::Poisoned;
+    }
+    let head_bytes = match DurableStoreV1Codec::encode_agent_head(&head) {
+        Ok(bytes) => bytes,
+        Err(DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure) => {
+            return AgentExistingGenerationWorkResult::Ordinary {
+                error: AgentExistingGenerationError::DurableStateTooLarge,
+                close_required: false,
+            };
+        }
+        Err(_) => return AgentExistingGenerationWorkResult::Poisoned,
+    };
+    let definition_bytes = match definition
+        .as_ref()
+        .map(|definition| DurableStoreV1Codec::encode_agent_definition(definition))
+        .transpose()
+    {
+        Ok(bytes) => bytes,
+        Err(DurableStoreCodecError::DocumentTooLarge | DurableStoreCodecError::JsonStructure) => {
+            return AgentExistingGenerationWorkResult::Ordinary {
+                error: AgentExistingGenerationError::DurableStateTooLarge,
+                close_required: false,
+            };
+        }
+        Err(_) => return AgentExistingGenerationWorkResult::Poisoned,
+    };
 
     macro_rules! precommit_step {
         ($operation:expr) => {{
             if barrier.is_cancelled() {
-                return reconcile_agent_status_precommit_failure(
+                return reconcile_agent_existing_generation_precommit_failure(
                     filesystem,
                     root,
                     directory_sync,
                     &current,
                     generation,
-                    DurableAgentStatusError::Closing,
+                    allow_definition,
+                    AgentExistingGenerationError::Closing,
                     &barrier,
                 );
             }
             if $operation.is_err() {
-                return reconcile_agent_status_precommit_failure(
+                return reconcile_agent_existing_generation_precommit_failure(
                     filesystem,
                     root,
                     directory_sync,
                     &current,
                     generation,
-                    DurableAgentStatusError::StorageUnavailable,
+                    allow_definition,
+                    AgentExistingGenerationError::StorageUnavailable,
                     &barrier,
                 );
             }
@@ -3875,43 +4337,58 @@ fn publish_agent_status_generation_blocking(
 
     precommit_step!(filesystem.create_private_directory(&generation_path));
     precommit_step!(filesystem.sync_directory(&generations, directory_sync));
-    precommit_step!(write_and_sync(filesystem, &head_path, head_bytes));
+    precommit_step!(write_and_sync(filesystem, &head_path, &head_bytes));
+    if let Some(definition_bytes) = definition_bytes.as_deref() {
+        precommit_step!(write_and_sync(
+            filesystem,
+            &definition_path,
+            definition_bytes,
+        ));
+    }
     precommit_step!(filesystem.sync_directory(&generation_path, directory_sync));
-    precommit_step!(exact_readback(filesystem, &head_path, head_bytes));
+    precommit_step!(exact_readback(filesystem, &head_path, &head_bytes));
+    precommit_step!(exact_agent_definition_readback_result(
+        filesystem,
+        &definition_path,
+        definition_bytes.as_deref(),
+        AgentDefinitionObservationStage::Staged,
+    ));
 
+    let mut close_required = false;
     #[cfg(test)]
     filesystem.before_commit_barrier();
     if !barrier.try_cross() {
-        return reconcile_agent_status_precommit_failure(
+        return reconcile_agent_existing_generation_precommit_failure(
             filesystem,
             root,
             directory_sync,
             &current,
             generation,
-            DurableAgentStatusError::Closing,
+            allow_definition,
+            AgentExistingGenerationError::Closing,
             &barrier,
         );
     }
 
-    let mut close_required = false;
     let committed_file = match filesystem.create_new_private_file(&committed_path) {
         Ok(file) => Some(file),
-        Err(()) => {
-            match reconcile_agent_status_committed_failure(
-                filesystem,
-                root,
-                directory_sync,
-                &current,
-                &head,
-                head_bytes,
-            ) {
-                AgentStatusCommittedResolution::Continue => {
-                    close_required = true;
-                    None
-                }
-                AgentStatusCommittedResolution::Return(result) => return result,
+        Err(()) => match reconcile_agent_existing_generation_committed_failure(
+            filesystem,
+            root,
+            directory_sync,
+            &current,
+            &head,
+            &head_bytes,
+            &definition_path,
+            definition_bytes.as_deref(),
+            allow_definition,
+        ) {
+            AgentExistingCommittedResolution::Continue => {
+                close_required = true;
+                None
             }
-        }
+            AgentExistingCommittedResolution::Return(result) => return result,
+        },
     };
     if let Some(committed_file) = committed_file {
         let operation_failed = validate_new_file_mode(&committed_file).is_err()
@@ -3922,48 +4399,67 @@ fn publish_agent_status_generation_blocking(
                 .sync_directory(&generation_path, directory_sync)
                 .is_err();
         let readback_failed = !operation_failed
-            && (!matches!(
-                exact_readback_state(filesystem, &committed_path, b""),
-                PublicationCertainty::Published
-            ) || !matches!(
-                exact_readback_state(filesystem, &head_path, head_bytes),
-                PublicationCertainty::Published
-            ));
+            && (exact_readback_state(filesystem, &committed_path, b"")
+                != PublicationCertainty::Published
+                || exact_readback_state(filesystem, &head_path, &head_bytes)
+                    != PublicationCertainty::Published
+                || exact_agent_definition_readback(
+                    filesystem,
+                    &definition_path,
+                    definition_bytes.as_deref(),
+                    AgentDefinitionObservationStage::Committed,
+                ) != PublicationCertainty::Published);
         if operation_failed || readback_failed {
-            match reconcile_agent_status_committed_failure(
+            match reconcile_agent_existing_generation_committed_failure(
                 filesystem,
                 root,
                 directory_sync,
                 &current,
                 &head,
-                head_bytes,
+                &head_bytes,
+                &definition_path,
+                definition_bytes.as_deref(),
+                allow_definition,
             ) {
-                AgentStatusCommittedResolution::Continue => close_required = true,
-                AgentStatusCommittedResolution::Return(result) => return result,
+                AgentExistingCommittedResolution::Continue => close_required = true,
+                AgentExistingCommittedResolution::Return(result) => return result,
             }
         }
     }
 
-    match recover_published_agent_status(filesystem, &entity, &current, &head, head_bytes) {
-        Ok(entry) => AgentStatusMutationWorkResult::Published {
+    match recover_published_agent_existing_generation(
+        filesystem,
+        &entity,
+        &current,
+        &head,
+        definition.as_deref(),
+        &head_bytes,
+        definition_bytes.as_deref(),
+    ) {
+        Ok(entry) => AgentExistingGenerationWorkResult::Published {
             entry,
             close_required,
         },
-        Err(_) => AgentStatusMutationWorkResult::Poisoned,
+        Err(_) => AgentExistingGenerationWorkResult::Poisoned,
     }
 }
 
-fn reconcile_agent_status_precommit_failure(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Agent precommit reconciliation binds the old catalog, exact generation, and cleanup policy"
+)]
+fn reconcile_agent_existing_generation_precommit_failure(
     filesystem: &dyn DurableFilesystem,
     root: &Path,
     directory_sync: DirectorySync,
     current: &DurableAgentCatalogEntry,
     generation: StorageGeneration,
-    error: DurableAgentStatusError,
+    allow_definition: bool,
+    error: AgentExistingGenerationError,
     barrier: &DurableCommitBarrier,
-) -> AgentStatusMutationWorkResult {
+) -> AgentExistingGenerationWorkResult {
     let error = if barrier.is_cancelled() {
-        DurableAgentStatusError::Closing
+        AgentExistingGenerationError::Closing
     } else {
         error
     };
@@ -3973,54 +4469,67 @@ fn reconcile_agent_status_precommit_failure(
         directory_sync,
         current,
         generation,
+        allow_definition,
     ) {
-        Ok(()) => AgentStatusMutationWorkResult::Ordinary {
+        Ok(()) => AgentExistingGenerationWorkResult::Ordinary {
             error,
             close_required: false,
         },
-        Err(StagingCleanupError::CloseRequired) => AgentStatusMutationWorkResult::Ordinary {
+        Err(StagingCleanupError::CloseRequired) => AgentExistingGenerationWorkResult::Ordinary {
             error,
             close_required: true,
         },
-        Err(StagingCleanupError::Poisoned) => AgentStatusMutationWorkResult::Poisoned,
+        Err(StagingCleanupError::Poisoned) => AgentExistingGenerationWorkResult::Poisoned,
     }
 }
 
-enum AgentStatusCommittedResolution {
+enum AgentExistingCommittedResolution {
     Continue,
-    Return(AgentStatusMutationWorkResult),
+    Return(AgentExistingGenerationWorkResult),
 }
 
-fn reconcile_agent_status_committed_failure(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Agent committed reconciliation binds one exact old/new generation and optional definition"
+)]
+fn reconcile_agent_existing_generation_committed_failure(
     filesystem: &dyn DurableFilesystem,
     root: &Path,
     directory_sync: DirectorySync,
     current: &DurableAgentCatalogEntry,
     head: &DurableAgentHead,
     head_bytes: &[u8],
-) -> AgentStatusCommittedResolution {
-    let generation_path = root
-        .join(AGENTS_DIRECTORY)
-        .join(head.agent_id().to_string())
-        .join("generations")
-        .join(head.storage_generation().directory_name());
+    definition_path: &Path,
+    definition_bytes: Option<&[u8]>,
+    allow_definition: bool,
+) -> AgentExistingCommittedResolution {
+    let generation_path = definition_path
+        .parent()
+        .expect("Agent definition has its generation directory parent");
     let committed_path = generation_path.join("COMMITTED");
     match exact_readback_state(filesystem, &committed_path, b"") {
         PublicationCertainty::Published => {
-            if exact_readback_state(filesystem, &generation_path.join("head.json"), head_bytes)
-                != PublicationCertainty::Published
-            {
-                return AgentStatusCommittedResolution::Return(
-                    AgentStatusMutationWorkResult::Poisoned,
+            let payloads_valid =
+                exact_readback_state(filesystem, &generation_path.join("head.json"), head_bytes)
+                    == PublicationCertainty::Published
+                    && exact_agent_definition_readback(
+                        filesystem,
+                        definition_path,
+                        definition_bytes,
+                        AgentDefinitionObservationStage::Committed,
+                    ) == PublicationCertainty::Published;
+            if !payloads_valid {
+                return AgentExistingCommittedResolution::Return(
+                    AgentExistingGenerationWorkResult::Poisoned,
                 );
             }
             let _ = sync_existing_marker(
                 filesystem,
                 &committed_path,
-                &[&generation_path],
+                &[generation_path],
                 directory_sync,
             );
-            AgentStatusCommittedResolution::Continue
+            AgentExistingCommittedResolution::Continue
         }
         PublicationCertainty::NotPublished => {
             let result = match cleanup_operation_owned_agent_trailing(
@@ -4029,24 +4538,25 @@ fn reconcile_agent_status_committed_failure(
                 directory_sync,
                 current,
                 head.storage_generation(),
+                allow_definition,
             ) {
-                Ok(()) => AgentStatusMutationWorkResult::Ordinary {
-                    error: DurableAgentStatusError::StorageUnavailable,
+                Ok(()) => AgentExistingGenerationWorkResult::Ordinary {
+                    error: AgentExistingGenerationError::StorageUnavailable,
                     close_required: false,
                 },
                 Err(StagingCleanupError::CloseRequired) => {
-                    AgentStatusMutationWorkResult::Ordinary {
-                        error: DurableAgentStatusError::StorageUnavailable,
+                    AgentExistingGenerationWorkResult::Ordinary {
+                        error: AgentExistingGenerationError::StorageUnavailable,
                         close_required: true,
                     }
                 }
-                Err(StagingCleanupError::Poisoned) => AgentStatusMutationWorkResult::Poisoned,
+                Err(StagingCleanupError::Poisoned) => AgentExistingGenerationWorkResult::Poisoned,
             };
-            AgentStatusCommittedResolution::Return(result)
+            AgentExistingCommittedResolution::Return(result)
         }
         PublicationCertainty::CommittedCorruptPoisoned
         | PublicationCertainty::IndeterminatePoisoned => {
-            AgentStatusCommittedResolution::Return(AgentStatusMutationWorkResult::Poisoned)
+            AgentExistingCommittedResolution::Return(AgentExistingGenerationWorkResult::Poisoned)
         }
     }
 }
@@ -4057,6 +4567,7 @@ fn cleanup_operation_owned_agent_trailing(
     directory_sync: DirectorySync,
     current: &DurableAgentCatalogEntry,
     generation: StorageGeneration,
+    allow_definition: bool,
 ) -> Result<(), StagingCleanupError> {
     let entity = root
         .join(AGENTS_DIRECTORY)
@@ -4083,7 +4594,7 @@ fn cleanup_operation_owned_agent_trailing(
     let Some(markerless) = recovered.markerless else {
         return Err(StagingCleanupError::Poisoned);
     };
-    if markerless.generation != generation || markerless.has_definition {
+    if markerless.generation != generation || (!allow_definition && markerless.has_definition) {
         return Err(StagingCleanupError::Poisoned);
     }
     let cleanup =
@@ -4096,13 +4607,23 @@ fn cleanup_operation_owned_agent_trailing(
     })
 }
 
-fn recover_published_agent_status(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the Agent recovery seam binds the old catalog and exact next head/definition"
+)]
+fn recover_published_agent_existing_generation(
     filesystem: &dyn DurableFilesystem,
     entity: &Path,
     current: &DurableAgentCatalogEntry,
     expected_head: &DurableAgentHead,
+    expected_definition: Option<&AgentDefinition>,
     head_bytes: &[u8],
+    definition_bytes: Option<&[u8]>,
 ) -> Result<DurableAgentCatalogEntry, PublicationCertainty> {
+    let published_state = exact_readback_state(filesystem, &entity.join("PUBLISHED"), b"");
+    if published_state != PublicationCertainty::Published {
+        return Err(published_state);
+    }
     let generation_path = entity
         .join("generations")
         .join(expected_head.storage_generation().directory_name());
@@ -4114,6 +4635,15 @@ fn recover_published_agent_status(
         if state != PublicationCertainty::Published {
             return Err(committed_payload_certainty(state));
         }
+    }
+    let definition_state = exact_agent_definition_readback(
+        filesystem,
+        &generation_path.join("definition.json"),
+        definition_bytes,
+        AgentDefinitionObservationStage::Final,
+    );
+    if definition_state != PublicationCertainty::Published {
+        return Err(committed_payload_certainty(definition_state));
     }
     let scanned = scan_agent_entity(entity, GENERATION_ENTRY_CAP).map_err(|error| match error {
         DurableOpenError::StorageUnavailable => PublicationCertainty::IndeterminatePoisoned,
@@ -4131,13 +4661,63 @@ fn recover_published_agent_status(
             _ => PublicationCertainty::CommittedCorruptPoisoned,
         },
     )?;
-    if recovered.entry.current_head.as_ref() != expected_head
-        || recovered.entry.current_definition != current.current_definition
-        || recovered.entry.definition_index != current.definition_index
-    {
+    if recovered.entry.current_head.as_ref() != expected_head {
         return Err(PublicationCertainty::CommittedCorruptPoisoned);
     }
+    match expected_definition {
+        Some(definition)
+            if recovered.entry.current_definition.as_ref() == definition
+                && agent_definition_index_extends(
+                    &current.definition_index,
+                    &recovered.entry.definition_index,
+                ) => {}
+        None if recovered.entry.current_definition == current.current_definition
+            && recovered.entry.definition_index == current.definition_index => {}
+        _ => return Err(PublicationCertainty::CommittedCorruptPoisoned),
+    }
     Ok(recovered.entry)
+}
+
+// Definition publication deliberately takes the full-chain recovery result rather than cloning
+// the current Arc<BTreeMap>. This architecture has no persistent index overlay; recovery already
+// walks every retained generation, so rebuilding the compact index avoids an additional million-
+// entry clone while keeping the required full-recovery proof.
+fn agent_definition_index_extends(
+    previous: &Arc<BTreeMap<AgentRevision, StorageGeneration>>,
+    next: &Arc<BTreeMap<AgentRevision, StorageGeneration>>,
+) -> bool {
+    previous.len().checked_add(1) == Some(next.len())
+        && previous.iter().eq(next.iter().take(previous.len()))
+}
+
+fn exact_agent_definition_readback(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected: Option<&[u8]>,
+    stage: AgentDefinitionObservationStage,
+) -> PublicationCertainty {
+    match filesystem.observe_agent_definition(path, stage) {
+        Ok(Some(actual)) if expected == Some(actual.as_slice()) => PublicationCertainty::Published,
+        Ok(None) if expected.is_none() => PublicationCertainty::Published,
+        Ok(_) => PublicationCertainty::CommittedCorruptPoisoned,
+        Err(DurableOpenError::StorageUnavailable) => PublicationCertainty::IndeterminatePoisoned,
+        Err(_) => PublicationCertainty::CommittedCorruptPoisoned,
+    }
+}
+
+fn exact_agent_definition_readback_result(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    expected: Option<&[u8]>,
+    stage: AgentDefinitionObservationStage,
+) -> Result<(), ()> {
+    if exact_agent_definition_readback(filesystem, path, expected, stage)
+        == PublicationCertainty::Published
+    {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 #[allow(
@@ -5988,6 +6568,21 @@ impl DurableState {
         attempt: SealedAgentStatusAttempt,
     ) -> Result<DurableAgentStatusOutcome, DurableAgentStatusError> {
         self.actor.enqueue_agent_status(attempt).await.wait().await
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the production Agent command surface consumes this definition CAS seam"
+    )]
+    pub(crate) async fn update_agent_definition(
+        &self,
+        attempt: SealedAgentDefinitionAttempt,
+    ) -> Result<DurableAgentDefinitionOutcome, DurableAgentDefinitionError> {
+        self.actor
+            .enqueue_agent_definition(attempt)
+            .await
+            .wait()
+            .await
     }
 
     #[cfg(test)]
@@ -8647,6 +9242,26 @@ fn sync_directory(path: &Path, directory_sync: DirectorySync) -> Result<(), Dura
         .map_err(|_| DurableOpenError::StorageUnavailable)
 }
 
+#[derive(Clone, Copy)]
+enum AgentDefinitionObservationStage {
+    Staged,
+    Committed,
+    Final,
+}
+
+fn read_optional_agent_definition_document(
+    path: &Path,
+) -> Result<Option<Vec<u8>>, DurableOpenError> {
+    match metadata_without_following(path) {
+        Err(DurableOpenError::StorageUnavailable) => match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            _ => Err(DurableOpenError::StorageUnavailable),
+        },
+        Err(error) => Err(error),
+        Ok(_) => read_durable_document(path).map(Some),
+    }
+}
+
 #[allow(dead_code)]
 trait DurableFilesystem: Send + Sync {
     fn remove_file(&self, path: &Path) -> Result<(), ()>;
@@ -8671,6 +9286,13 @@ trait DurableFilesystem: Send + Sync {
     }
     fn read_document(&self, path: &Path) -> Result<Vec<u8>, DurableOpenError> {
         read_durable_document(path)
+    }
+    fn observe_agent_definition(
+        &self,
+        path: &Path,
+        _stage: AgentDefinitionObservationStage,
+    ) -> Result<Option<Vec<u8>>, DurableOpenError> {
+        read_optional_agent_definition_document(path)
     }
     #[cfg(test)]
     fn before_commit_barrier(&self);
@@ -9457,12 +10079,12 @@ mod tests {
         open_root_with_durable_filesystem,
     };
     use crate::agent_session_lifecycle::{
-        AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedAgentStatusAttempt,
-        SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionForkProvenance,
-        SessionLifecycle, SessionMetadata, SessionModelConfig,
+        AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedAgentDefinitionAttempt,
+        SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
+        SessionForkProvenance, SessionLifecycle, SessionMetadata, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
-    use crate::prompt::SessionPromptSelection;
+    use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
     use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
     use crate::wire::{
         AgentId, AgentRevision, ItemId, SessionDefinitionRevision, SessionId,
@@ -10106,7 +10728,7 @@ mod tests {
         let generation = path.parent();
         let entity = generation.and_then(Path::parent).and_then(Path::parent);
         let committed = generation.is_some_and(|path| path.join("COMMITTED").exists());
-        let published = entity.is_some_and(|path| path.join("PUBLISHED").exists());
+        let published = committed && entity.is_some_and(|path| path.join("PUBLISHED").exists());
         match path.file_name().and_then(|name| name.to_str()) {
             Some("head.json") if published => Some(PublicationOperation::ReadbackPublishedHead),
             Some("head.json") if committed => Some(PublicationOperation::ReadbackCommittedHead),
@@ -10218,6 +10840,42 @@ mod tests {
             if let Some(operation) = operation {
                 self.complete_publication_operation(operation);
             }
+            if matches!(fault, Some(PublicationFault::Corrupt(_))) {
+                fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            Ok(bytes)
+        }
+
+        fn observe_agent_definition(
+            &self,
+            path: &Path,
+            stage: super::AgentDefinitionObservationStage,
+        ) -> Result<Option<Vec<u8>>, DurableOpenError> {
+            let operation = match stage {
+                super::AgentDefinitionObservationStage::Staged => {
+                    PublicationOperation::ReadbackStagedDefinition
+                }
+                super::AgentDefinitionObservationStage::Committed => {
+                    PublicationOperation::ReadbackCommittedDefinition
+                }
+                super::AgentDefinitionObservationStage::Final => {
+                    PublicationOperation::ReadbackPublishedDefinition
+                }
+            };
+            self.record_publication_operation(operation);
+            let fault = self.take_publication_fault(operation);
+            if matches!(
+                fault,
+                Some(PublicationFault::Before(_)) | Some(PublicationFault::Indeterminate(_))
+            ) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            let bytes = super::read_optional_agent_definition_document(path)?;
+            self.complete_publication_operation(operation);
             if matches!(fault, Some(PublicationFault::Corrupt(_))) {
                 fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
                 return Err(DurableOpenError::DurableStateCorrupt);
@@ -10993,6 +11651,325 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_cas_publishes_exact_g2_retains_both_revisions_and_reopens() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let expected_revision = AgentRevision::new(NonZeroU64::new(1).unwrap());
+        let owner_timestamp: Timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let prompts = AgentPromptSelection::new(
+            ["base", "code-review", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let state = open(root.path()).await.expect("the Enabled Agent opens");
+        let outcome = state
+            .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                expected_revision,
+                prompts,
+                owner_timestamp,
+            ))
+            .await
+            .expect("the definition CAS publishes");
+        assert!(outcome.changed());
+        assert_eq!(outcome.head().storage_generation().get(), 2);
+        assert_eq!(outcome.head().current_definition_revision().get(), 2);
+        assert_eq!(outcome.definition().revision().get(), 2);
+        assert_eq!(outcome.definition().created_at(), owner_timestamp);
+        let catalog_head = state
+            .agent_head(agent_id)
+            .expect("the new head is installed");
+        let catalog_definition = state
+            .agent_current_definition(agent_id)
+            .expect("the new definition is installed");
+        assert!(Arc::ptr_eq(outcome.head(), &catalog_head));
+        assert!(Arc::ptr_eq(outcome.definition(), &catalog_definition));
+        assert!(state.contains_agent_definition(agent_id, expected_revision));
+        assert!(
+            state.contains_agent_definition(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(2).unwrap())
+            )
+        );
+
+        let generation = agent_path(root.path(), AGENT_ONE)
+            .join("generations")
+            .join(GENERATION_TWO);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            agent_head_definition_g2_fixture()
+        );
+        assert_eq!(
+            fs::read(generation.join("definition.json")).unwrap(),
+            agent_definition_g2_fixture()
+        );
+        assert_eq!(fs::read(generation.join("COMMITTED")).unwrap(), b"");
+        state.close().await;
+
+        let reopened = open(root.path()).await.expect("the definition G2 reopens");
+        assert_eq!(
+            reopened
+                .agent_head(agent_id)
+                .expect("the head reopens")
+                .current_definition_revision()
+                .get(),
+            2
+        );
+        assert_eq!(
+            reopened
+                .agent_current_definition(agent_id)
+                .expect("the definition reopens")
+                .revision()
+                .get(),
+            2
+        );
+        assert!(reopened.contains_agent_definition(agent_id, expected_revision));
+        reopened.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_catalog_waits_for_final_payload_readback() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let filesystem = Arc::new(DeterministicPersistentFaultFilesystem::new([]));
+        let state = open_with_reservation_filesystem(root.path(), Arc::clone(&filesystem)).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let (entered, entered_receiver) = std::sync::mpsc::channel();
+        let (release, release_receiver) = std::sync::mpsc::channel();
+        filesystem.install_publication_operation_barrier(
+            PublicationOperation::ReadbackPublishedDefinition,
+            ReservationBarrier::new(entered, release_receiver),
+        );
+        let state_for_update = state.clone();
+        let update = tokio::spawn(async move {
+            state_for_update
+                .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(1).unwrap()),
+                    AgentPromptSelection::new(
+                        ["base", "code-review", "safety"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "2026-08-03T10:00:05.000Z".parse().unwrap(),
+                ))
+                .await
+        });
+
+        wait_reservation_barrier(entered_receiver).await;
+        assert_eq!(
+            state
+                .agent_head(agent_id)
+                .unwrap()
+                .current_definition_revision()
+                .get(),
+            1,
+            "the catalog stays old until final definition payload readback"
+        );
+        assert!(
+            agent_path(root.path(), AGENT_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .join("COMMITTED")
+                .is_file()
+        );
+        release
+            .send(())
+            .expect("the final definition readback resumes");
+        let outcome = update
+            .await
+            .expect("the update task joins")
+            .expect("the definition update settles");
+        assert_eq!(outcome.head().current_definition_revision().get(), 2);
+        assert_eq!(
+            state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_cas_orders_stale_before_noop_and_deleted_and_disabled_semantics() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let revision_one = AgentRevision::new(NonZeroU64::new(1).unwrap());
+        let same_prompts = AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let changed_prompts = AgentPromptSelection::new(
+            ["base", "code-review", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let state = open(root.path()).await.expect("the Agent opens");
+        assert_eq!(
+            state
+                .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(2).unwrap()),
+                    same_prompts.clone(),
+                    "2026-08-03T10:00:05.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableAgentDefinitionError::StaleRevision
+        );
+        let no_change = state
+            .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                revision_one,
+                same_prompts,
+                "2026-08-03T10:00:05.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("same prompt selection is a no-op");
+        assert!(!no_change.changed());
+        assert_eq!(no_change.head().storage_generation().get(), 1);
+        assert!(
+            !agent_path(root.path(), AGENT_ONE)
+                .join("generations")
+                .join(GENERATION_TWO)
+                .exists()
+        );
+
+        state
+            .set_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Disabled,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the Agent can be disabled");
+        let disabled = state
+            .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                revision_one,
+                changed_prompts.clone(),
+                "2026-08-03T10:00:05.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("Disabled still permits definition updates");
+        assert!(disabled.changed());
+        assert_eq!(disabled.head().status(), AgentStatus::Disabled);
+        assert_eq!(disabled.head().storage_generation().get(), 3);
+
+        state
+            .set_agent_status(SealedAgentStatusAttempt::delete(
+                agent_id,
+                AgentStatus::Disabled,
+            ))
+            .await
+            .expect("the disabled Agent can be deleted");
+        assert_eq!(
+            state
+                .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(2).unwrap()),
+                    changed_prompts,
+                    "2026-08-03T10:00:06.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableAgentDefinitionError::AgentDeleted
+        );
+        assert!(
+            !agent_path(root.path(), AGENT_ONE)
+                .join("generations")
+                .join("00000000000000000005")
+                .exists()
+        );
+        state.close().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_noop_performs_zero_publication_io() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let filesystem = Arc::new(
+            DeterministicPersistentFaultFilesystem::with_publication_faults([
+                PublicationFault::Before(PublicationOperation::CreateGenerationDirectory),
+            ]),
+        );
+        let state = open_with_reservation_filesystem(root.path(), filesystem).await;
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let prompts = AgentPromptSelection::new(
+            ["base", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let original_head = state.agent_head(agent_id).unwrap();
+        let original_definition = state.agent_current_definition(agent_id).unwrap();
+        let no_change = state
+            .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(1).unwrap()),
+                prompts.clone(),
+                "2026-08-03T10:00:05.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the armed publication fault is bypassed by the no-op");
+        assert!(!no_change.changed());
+        assert!(Arc::ptr_eq(no_change.head(), &original_head));
+        assert!(Arc::ptr_eq(no_change.definition(), &original_definition));
+        assert_eq!(no_change.definition().revision().get(), 1);
+        assert_eq!(
+            no_change.definition().created_at(),
+            "2026-08-03T10:00:00.123Z".parse().unwrap()
+        );
+        let debug = format!("{no_change:?}");
+        assert!(!debug.contains(AGENT_ONE));
+        assert!(!debug.contains("safety"));
+        assert!(!debug.contains("10:00:00"));
+        let changed = AgentPromptSelection::new(
+            ["base", "code-review", "safety"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .update_agent_definition(SealedAgentDefinitionAttempt::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(1).unwrap()),
+                    changed,
+                    "2026-08-03T10:00:05.000Z".parse().unwrap(),
+                ))
+                .await
+                .unwrap_err(),
+            super::DurableAgentDefinitionError::StorageUnavailable
+        );
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn agent_status_cas_checks_stale_before_noop_and_keeps_deleted_terminal() {
         let no_op_root = TempRoot::existing();
         create_marked_empty_store(no_op_root.path());
@@ -11117,7 +12094,7 @@ mod tests {
             .await;
         state
             .agent_lifecycle_gates
-            .wait_for_status_mutation_for_test()
+            .wait_for_agent_mutation_for_test()
             .await;
         assert_eq!(
             state.agent_head(agent_id).unwrap().status(),
@@ -11145,6 +12122,95 @@ mod tests {
             "the queued Create observes the completed exclusive status epoch"
         );
         assert!(!session_path(root.path(), &session_id.to_string()).exists());
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_exclusive_gate_linearizes_before_queued_status_and_session_create() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+        let state = open(root.path()).await.expect("the Enabled Agent opens");
+        let admission = state
+            .agent_lifecycle_gates
+            .acquire_publication(agent_id)
+            .await;
+        let (release_admission, wait_admission) = std::sync::mpsc::channel();
+        let admission_holder = std::thread::spawn(move || {
+            let _admission = admission;
+            wait_admission
+                .recv()
+                .expect("the test releases the admission gate");
+        });
+        let definition = state
+            .actor
+            .enqueue_agent_definition(SealedAgentDefinitionAttempt::new(
+                agent_id,
+                AgentRevision::new(NonZeroU64::new(1).unwrap()),
+                AgentPromptSelection::new(
+                    ["base", "code-review", "safety"]
+                        .into_iter()
+                        .map(|value| value.parse().unwrap())
+                        .collect(),
+                )
+                .unwrap(),
+                "2026-08-03T10:00:05.000Z".parse().unwrap(),
+            ))
+            .await;
+        state
+            .agent_lifecycle_gates
+            .wait_for_agent_mutation_for_test()
+            .await;
+        let status = state
+            .actor
+            .enqueue_agent_status(
+                SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    AgentStatus::Enabled,
+                    AgentStatus::Enabled,
+                )
+                .unwrap(),
+            )
+            .await;
+        let session_id = session_candidate(103);
+        let actor = state.actor.clone();
+        let session = tokio::spawn(async move {
+            actor
+                .enqueue_session_create_with_test_candidates(
+                    ordinary_session_create_attempt(agent_id),
+                    [Ok(session_id)],
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .await
+                .wait()
+                .await
+        });
+        tokio::task::yield_now().await;
+        release_admission
+            .send(())
+            .expect("the admission holder releases");
+        admission_holder.join().expect("the admission holder joins");
+
+        let definition = definition.wait().await.expect("the definition CAS wins");
+        assert!(definition.changed());
+        let status = status.wait().await.expect("the queued status settles");
+        assert!(!status.changed());
+        assert_eq!(status.head().current_definition_revision().get(), 2);
+
+        let session = session
+            .await
+            .expect("the queued Session task joins")
+            .expect("the Session observes the new retained Agent revision");
+        assert_eq!(
+            state
+                .session_current_definition(session.session_id())
+                .unwrap()
+                .agent()
+                .revision()
+                .get(),
+            2
+        );
         state.close().await;
     }
 
@@ -12773,6 +13839,12 @@ mod tests {
                 false,
             ),
             (
+                "definition-absence-readback-before",
+                PublicationFault::Before(PublicationOperation::ReadbackStagedDefinition),
+                false,
+                false,
+            ),
+            (
                 "committed-create-before",
                 PublicationFault::Before(PublicationOperation::CreateCommitted),
                 false,
@@ -12873,6 +13945,146 @@ mod tests {
                 reopened.agent_head(agent_id).unwrap().status(),
                 AgentStatus::Disabled,
                 "{name} reopens the complete new head after success or explicit retry"
+            );
+            reopened.close().await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_definition_faults_clean_precommit_or_reconcile_committed_generation() {
+        let cases = [
+            (
+                "definition-create-before",
+                PublicationFault::Before(PublicationOperation::CreateDefinition),
+                false,
+                false,
+            ),
+            (
+                "definition-create-after",
+                PublicationFault::After(PublicationOperation::CreateDefinition),
+                false,
+                false,
+            ),
+            (
+                "definition-write-after",
+                PublicationFault::After(PublicationOperation::WriteDefinition),
+                false,
+                false,
+            ),
+            (
+                "definition-sync-after",
+                PublicationFault::After(PublicationOperation::SyncDefinition),
+                false,
+                false,
+            ),
+            (
+                "definition-readback-after",
+                PublicationFault::After(PublicationOperation::ReadbackStagedDefinition),
+                false,
+                false,
+            ),
+            (
+                "committed-create-before",
+                PublicationFault::Before(PublicationOperation::CreateCommitted),
+                false,
+                false,
+            ),
+            (
+                "committed-create-after",
+                PublicationFault::After(PublicationOperation::CreateCommitted),
+                true,
+                true,
+            ),
+            (
+                "committed-sync-after",
+                PublicationFault::After(PublicationOperation::SyncCommitted),
+                true,
+                true,
+            ),
+        ];
+
+        for (name, fault, publishes, closes) in cases {
+            let root = TempRoot::existing();
+            create_marked_empty_store(root.path());
+            create_valid_g1_agent(root.path());
+            let filesystem =
+                Arc::new(DeterministicPersistentFaultFilesystem::with_publication_faults([fault]));
+            let state = open_with_reservation_filesystem(root.path(), filesystem).await;
+            let agent_id = AgentId::from_str(AGENT_ONE).unwrap();
+            let make_attempt = || {
+                SealedAgentDefinitionAttempt::new(
+                    agent_id,
+                    AgentRevision::new(NonZeroU64::new(1).unwrap()),
+                    AgentPromptSelection::new(
+                        ["base", "code-review", "safety"]
+                            .into_iter()
+                            .map(|value| value.parse().unwrap())
+                            .collect(),
+                    )
+                    .unwrap(),
+                    "2026-08-03T10:00:05.000Z".parse().unwrap(),
+                )
+            };
+            let first = state.update_agent_definition(make_attempt()).await;
+            if publishes {
+                let outcome = first.unwrap_or_else(|error| panic!("{name}: {error:?}"));
+                assert!(outcome.changed(), "{name}");
+                assert_eq!(outcome.head().current_definition_revision().get(), 2);
+                assert_eq!(
+                    fs::read(
+                        agent_path(root.path(), AGENT_ONE)
+                            .join("generations")
+                            .join(GENERATION_TWO)
+                            .join("definition.json")
+                    )
+                    .unwrap(),
+                    agent_definition_g2_fixture(),
+                    "{name} writes the exact definition bytes"
+                );
+                if closes {
+                    assert_eq!(
+                        state
+                            .update_agent_definition(make_attempt())
+                            .await
+                            .unwrap_err(),
+                        super::DurableAgentDefinitionError::Closing,
+                        "{name} settles the success before remembered close"
+                    );
+                }
+            } else {
+                assert!(
+                    matches!(
+                        &first,
+                        Err(super::DurableAgentDefinitionError::StorageUnavailable)
+                    ),
+                    "{name} is an ordinary pre-COMMITTED failure: {first:?}"
+                );
+                assert!(
+                    !agent_path(root.path(), AGENT_ONE)
+                        .join("generations")
+                        .join(GENERATION_TWO)
+                        .exists(),
+                    "{name} removes the exact trailing subset"
+                );
+                let retry = state
+                    .update_agent_definition(make_attempt())
+                    .await
+                    .unwrap_or_else(|error| panic!("{name} retry: {error:?}"));
+                assert_eq!(retry.definition().revision().get(), 2, "{name}");
+            }
+            state.close().await;
+            let reopened = open(root.path())
+                .await
+                .unwrap_or_else(|error| panic!("{name} reopens: {error:?}"));
+            assert_eq!(
+                reopened
+                    .agent_current_definition(agent_id)
+                    .unwrap()
+                    .revision()
+                    .get(),
+                2,
+                "{name} recovers the retained definition"
             );
             reopened.close().await;
         }

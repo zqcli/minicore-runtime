@@ -377,6 +377,115 @@ impl fmt::Debug for SealedAgentStatusAttempt {
     }
 }
 
+/// Lifecycle-owned semantic input to one Agent definition CAS. It carries only the Agent lookup
+/// key, the expected current definition revision, the requested prompt selection, and the owner
+/// timestamp. Storage generation, paths, markers, command identity, and publication handles do
+/// not cross this seam.
+pub(crate) struct SealedAgentDefinitionAttempt {
+    agent_id: AgentId,
+    expected_revision: AgentRevision,
+    target_prompts: AgentPromptSelection,
+    owner_timestamp: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum AgentDefinitionDecisionError {
+    #[error("Agent definition compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent definition revision is exhausted")]
+    RevisionExhausted,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AgentDefinitionDecision {
+    NoChange,
+    Publish(AgentDefinition),
+}
+
+impl SealedAgentDefinitionAttempt {
+    #[allow(
+        dead_code,
+        reason = "the public Agent definition command constructor consumes this sealed seam"
+    )]
+    pub(crate) fn new(
+        agent_id: AgentId,
+        expected_revision: AgentRevision,
+        target_prompts: AgentPromptSelection,
+        owner_timestamp: Timestamp,
+    ) -> Self {
+        Self {
+            agent_id,
+            expected_revision,
+            target_prompts,
+            owner_timestamp,
+        }
+    }
+
+    pub(crate) const fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn expected_revision(&self) -> AgentRevision {
+        self.expected_revision
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn owner_timestamp(&self) -> Timestamp {
+        self.owner_timestamp
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_prompts(&self) -> &AgentPromptSelection {
+        &self.target_prompts
+    }
+
+    /// Decides the semantic CAS in its authoritative order: expected revision, terminal status,
+    /// canonical no-op, then checked next revision and materialization.
+    pub(crate) fn decide(
+        &self,
+        current_revision: AgentRevision,
+        current_status: AgentStatus,
+        current_definition: &AgentDefinition,
+    ) -> Result<AgentDefinitionDecision, AgentDefinitionDecisionError> {
+        if current_revision != self.expected_revision {
+            return Err(AgentDefinitionDecisionError::StaleRevision);
+        }
+        if current_status == AgentStatus::Deleted {
+            return Err(AgentDefinitionDecisionError::AgentDeleted);
+        }
+        if current_definition.prompts() == &self.target_prompts {
+            return Ok(AgentDefinitionDecision::NoChange);
+        }
+        let next_revision = current_revision
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(AgentRevision::new)
+            .ok_or(AgentDefinitionDecisionError::RevisionExhausted)?;
+        Ok(AgentDefinitionDecision::Publish(AgentDefinition::new(
+            self.agent_id,
+            next_revision,
+            self.target_prompts.clone(),
+            self.owner_timestamp,
+        )))
+    }
+}
+
+impl fmt::Debug for SealedAgentDefinitionAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedAgentDefinitionAttempt")
+            .field("agent_id", &"redacted")
+            .field("expected_revision", &self.expected_revision)
+            .field("target_prompts", &"redacted")
+            .field("owner_timestamp", &"redacted")
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AgentRevisionRef {
     agent_id: AgentId,
@@ -929,9 +1038,10 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::{
-        AgentRevisionRef, AgentStatus, AgentStatusAttemptError, SealedAgentCreateAttempt,
-        SealedAgentStatusAttempt, SealedSessionCreateAttempt, SealedSessionForkAttempt,
-        SessionDefinition, SessionForkAttemptError, SessionModelConfig,
+        AgentDefinitionDecision, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
+        SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentStatusAttempt,
+        SealedSessionCreateAttempt, SealedSessionForkAttempt, SessionDefinition,
+        SessionForkAttemptError, SessionModelConfig,
     };
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
@@ -1013,6 +1123,91 @@ mod tests {
 
         let delete = SealedAgentStatusAttempt::delete(agent_id, AgentStatus::Disabled);
         assert_eq!(delete.target_status(), AgentStatus::Deleted);
+    }
+
+    #[test]
+    fn sealed_agent_definition_attempt_orders_cas_checks_and_redacts_semantics() {
+        let agent_id: AgentId = "agt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap();
+        let first_revision = AgentRevision::new(NonZeroU64::new(1).unwrap());
+        let current_prompts = AgentPromptSelection::new(vec!["base".parse().unwrap()]).unwrap();
+        let target_prompts = AgentPromptSelection::new(
+            ["base", "code-review"]
+                .into_iter()
+                .map(|value| value.parse().unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let owner_timestamp = "2026-08-03T10:00:05.000Z".parse().unwrap();
+        let current = super::AgentDefinition::new(
+            agent_id,
+            first_revision,
+            current_prompts,
+            "2026-08-03T10:00:00.123Z".parse().unwrap(),
+        );
+        let attempt = SealedAgentDefinitionAttempt::new(
+            agent_id,
+            first_revision,
+            target_prompts.clone(),
+            owner_timestamp,
+        );
+
+        assert_eq!(attempt.expected_revision(), first_revision);
+        assert_eq!(attempt.target_prompts(), &target_prompts);
+        assert_eq!(attempt.owner_timestamp(), owner_timestamp);
+        let debug = format!("{attempt:?}");
+        assert!(!debug.contains("agt_aaaaaaaa"));
+        assert!(!debug.contains("code-review"));
+        assert!(!debug.contains("10:00:05"));
+
+        assert_eq!(
+            attempt
+                .decide(
+                    AgentRevision::new(NonZeroU64::new(2).unwrap()),
+                    AgentStatus::Deleted,
+                    &current,
+                )
+                .unwrap_err(),
+            super::AgentDefinitionDecisionError::StaleRevision
+        );
+        assert_eq!(
+            attempt
+                .decide(first_revision, AgentStatus::Deleted, &current)
+                .unwrap_err(),
+            super::AgentDefinitionDecisionError::AgentDeleted
+        );
+        assert_eq!(
+            SealedAgentDefinitionAttempt::new(
+                agent_id,
+                first_revision,
+                current.prompts().clone(),
+                owner_timestamp,
+            )
+            .decide(first_revision, AgentStatus::Deleted, &current)
+            .unwrap_err(),
+            super::AgentDefinitionDecisionError::AgentDeleted,
+            "Deleted remains terminal even when the target is canonically unchanged"
+        );
+
+        let no_op = SealedAgentDefinitionAttempt::new(
+            agent_id,
+            first_revision,
+            current.prompts().clone(),
+            owner_timestamp,
+        )
+        .decide(first_revision, AgentStatus::Enabled, &current)
+        .unwrap();
+        assert_eq!(no_op, AgentDefinitionDecision::NoChange);
+
+        let published = attempt
+            .decide(first_revision, AgentStatus::Disabled, &current)
+            .unwrap();
+        let AgentDefinitionDecision::Publish(definition) = published else {
+            panic!("changed prompt selection publishes a new definition");
+        };
+        assert_eq!(definition.agent_id(), agent_id);
+        assert_eq!(definition.revision().get(), 2);
+        assert_eq!(definition.prompts(), &target_prompts);
+        assert_eq!(definition.created_at(), owner_timestamp);
     }
 
     #[test]
