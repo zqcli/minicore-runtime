@@ -10,7 +10,9 @@ use thiserror::Error;
 use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::AgentRevisionRef;
-use crate::compaction::StoredCompaction;
+use crate::compaction::{
+    CompactionUnitKind, LiveCompactionUnit, PreparedLiveCompactionUnit, StoredCompaction,
+};
 use crate::model_gateway::{
     ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
     ProviderResponseMetadata, ReasoningContent,
@@ -23,7 +25,7 @@ use crate::tools::{
     UserQuestionRequest,
 };
 use crate::turn_item_interaction::{
-    AssistantDisposition, InteractionCancelReason, UserMessageSource,
+    AssistantDisposition, InteractionCancelReason, ItemRelation, UserMessageSource,
 };
 use crate::wire::conversation_jsonl::{
     ConversationCodecError, ConversationDecodeFacts, ConversationLineCodec,
@@ -53,6 +55,7 @@ pub(crate) mod live_conversation;
     reason = "the read-only projection is re-exported for Conversation Storage consumers"
 )]
 pub(crate) use live_conversation::LiveConversationView;
+use live_conversation::{ConversationRevision, LiveSessionState};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum StoredValueError {
@@ -112,6 +115,25 @@ impl ExclusiveWritableConversationLease {
     /// Gives the append handle only to Conversation Storage's internal consumer.
     pub(crate) fn into_file(self) -> Option<File> {
         self.file
+    }
+
+    /// Truncates only the final partial tail offset returned by the same-open writable scan and
+    /// updates the proof's declared length for the Recorder that will consume these exact parts.
+    /// No caller can provide an arbitrary writable proof or offset.
+    fn truncate_to(&mut self, offset: u64) -> Result<(), ()> {
+        if offset > self.declared_file_bytes {
+            return Err(());
+        }
+        let file = self.file.as_mut().ok_or(())?;
+        if file.metadata().map_err(|_| ())?.len() != self.declared_file_bytes {
+            return Err(());
+        }
+        file.set_len(offset).map_err(|_| ())?;
+        if file.metadata().map_err(|_| ())?.len() != offset {
+            return Err(());
+        }
+        self.declared_file_bytes = offset;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1053,6 +1075,7 @@ struct PendingToolExchange {
 /// own unit, so a marker naming one of them can never match a unit origin.
 struct ReplayUnit {
     origin: EntryId,
+    kind: CompactionUnitKind,
     messages: Vec<ModelMessage>,
 }
 
@@ -1563,8 +1586,18 @@ struct ReplaySanitizerPass<'a> {
     path_members: &'a BTreeSet<EntryId>,
     facts: &'a SemanticFacts,
     units: Vec<ReplayUnit>,
+    relations: Vec<ItemRelation>,
     pending_exchange: Option<PendingToolExchange>,
+    revision_operations: u64,
+    revision_overflowed: bool,
     diagnostics: &'a mut ConversationReplayDiagnostics,
+}
+
+struct ReplaySanitizedProjection {
+    units: Vec<ReplayUnit>,
+    messages: Vec<ModelMessage>,
+    relations: Vec<ItemRelation>,
+    revision_operations: u64,
 }
 
 impl ReplaySanitizerPass<'_> {
@@ -1578,13 +1611,28 @@ impl ReplaySanitizerPass<'_> {
 
     /// Runs the pass over the canonical selected-path entries in physical order and returns the
     /// flattened sanitized messages of the final stable units.
-    fn run(&mut self, eof_location: ConversationPhysicalLocation) -> Vec<ModelMessage> {
+    fn run(
+        &mut self,
+        eof_location: ConversationPhysicalLocation,
+    ) -> Result<ReplaySanitizedProjection, ConversationReplayError> {
         for scan_entry in self.entries {
             if self.path_members.contains(&scan_entry.entry.entry_id()) {
                 self.project_entry(scan_entry);
             }
         }
-        self.finish(eof_location)
+        let projection = self.finish(eof_location);
+        if self.revision_overflowed {
+            return Err(ConversationReplayError::InvariantViolation);
+        }
+        Ok(projection)
+    }
+
+    fn advance_revision(&mut self) {
+        if let Some(next) = self.revision_operations.checked_add(1) {
+            self.revision_operations = next;
+        } else {
+            self.revision_overflowed = true;
+        }
     }
 
     fn project_entry(&mut self, scan_entry: &ScanEntry) {
@@ -1616,10 +1664,16 @@ impl ReplaySanitizerPass<'_> {
         // complete exchange emitted here keeps its messages ahead of this entry's. Only a
         // semantically valid projected User reaches this boundary.
         self.close_exchange(scan_entry.location);
+        self.relations.push(ItemRelation::user_message(
+            message.item_id(),
+            scan_entry.entry.turn_id(),
+        ));
         self.units.push(ReplayUnit {
             origin: scan_entry.entry.entry_id(),
+            kind: CompactionUnitKind::UserMessage,
             messages: vec![ModelMessage::canonical_user(message.content().clone())],
         });
+        self.advance_revision();
     }
 
     fn project_assistant(&mut self, scan_entry: &ScanEntry, message: &StoredAssistantMessage) {
@@ -1680,10 +1734,35 @@ impl ReplaySanitizerPass<'_> {
         // Only a semantically valid projected Assistant closes an unfinished selected-path
         // exchange.
         self.close_exchange(scan_entry.location);
+        for item in message.content() {
+            if !valid_items.contains(&item.item_id()) {
+                continue;
+            }
+            let relation = match item {
+                StoredAssistantContent::Reasoning { item_id, .. } => {
+                    ItemRelation::reasoning(*item_id, scan_entry.entry.turn_id())
+                }
+                StoredAssistantContent::Text { item_id, .. } => {
+                    ItemRelation::agent_message(*item_id, scan_entry.entry.turn_id())
+                }
+                StoredAssistantContent::ToolCall {
+                    item_id,
+                    tool_call_id,
+                    ..
+                } => ItemRelation::tool_invocation(
+                    *item_id,
+                    scan_entry.entry.turn_id(),
+                    tool_call_id.clone(),
+                ),
+            };
+            self.relations.push(relation);
+        }
+        self.advance_revision();
         if expected.is_empty() {
             // A plain Assistant is its own unit.
             self.units.push(ReplayUnit {
                 origin: scan_entry.entry.entry_id(),
+                kind: CompactionUnitKind::AssistantMessage,
                 messages: vec![projected],
             });
         } else {
@@ -1820,8 +1899,10 @@ impl ReplaySanitizerPass<'_> {
         }
         self.units.push(ReplayUnit {
             origin: exchange.assistant_entry_id,
+            kind: CompactionUnitKind::ToolExchange,
             messages,
         });
+        self.advance_revision();
     }
 
     /// Applies one recorded Compaction to the current stable units per ADR 0132. A valid marker
@@ -1847,6 +1928,7 @@ impl ReplaySanitizerPass<'_> {
         self.close_exchange(scan_entry.location);
         let summary_unit = ReplayUnit {
             origin: scan_entry.entry.entry_id(),
+            kind: CompactionUnitKind::RollingSummary,
             messages: vec![summary],
         };
         match stored.first_kept_entry_id() {
@@ -1860,6 +1942,7 @@ impl ReplaySanitizerPass<'_> {
                     return;
                 }
                 self.units = vec![summary_unit];
+                self.advance_revision();
             }
             Some(marker) => {
                 let Some(index) = self.units.iter().position(|unit| unit.origin == marker) else {
@@ -1880,17 +1963,25 @@ impl ReplaySanitizerPass<'_> {
                 let retained = self.units.split_off(index);
                 self.units = vec![summary_unit];
                 self.units.extend(retained);
+                self.advance_revision();
             }
         }
     }
 
-    /// EOF: closes any unfinished selected-path exchange and flattens the final stable units.
-    fn finish(&mut self, eof_location: ConversationPhysicalLocation) -> Vec<ModelMessage> {
+    /// EOF: closes any unfinished selected-path exchange and returns the final stable units.
+    fn finish(&mut self, eof_location: ConversationPhysicalLocation) -> ReplaySanitizedProjection {
         self.close_exchange(eof_location);
-        std::mem::take(&mut self.units)
-            .into_iter()
-            .flat_map(|unit| unit.messages)
-            .collect()
+        let units = std::mem::take(&mut self.units);
+        let messages = units
+            .iter()
+            .flat_map(|unit| unit.messages.iter().cloned())
+            .collect();
+        ReplaySanitizedProjection {
+            units,
+            messages,
+            relations: std::mem::take(&mut self.relations),
+            revision_operations: self.revision_operations,
+        }
     }
 }
 /// Validates one recorded Interaction resolution against its exact earlier request body using
@@ -1926,10 +2017,14 @@ fn validate_interaction_resolution(
 pub(crate) struct ReplayedConversationView {
     header: SessionHeader,
     accepted_entries: Arc<[Arc<StoredSessionEntry>]>,
+    selected_entries: Arc<[Arc<StoredSessionEntry>]>,
     selected_path: Arc<[EntryId]>,
     selected_head: Option<EntryId>,
     reserved_ids: Arc<[EntryId]>,
     sanitized_messages: Arc<[ModelMessage]>,
+    stable_units: Arc<[LiveCompactionUnit]>,
+    relations: Arc<[ItemRelation]>,
+    revision: ConversationRevision,
     historical_item_ids: Arc<[ItemId]>,
     diagnostics: ConversationReplayDiagnostics,
     tail_action: Option<ConversationPartialTailAction>,
@@ -1956,6 +2051,10 @@ impl ReplayedConversationView {
             .collect()
     }
 
+    pub(crate) fn selected_entries(&self) -> &[Arc<StoredSessionEntry>] {
+        &self.selected_entries
+    }
+
     /// The selected root-to-leaf path of the canonical component, in path order.
     pub(crate) fn selected_path(&self) -> &[EntryId] {
         &self.selected_path
@@ -1974,6 +2073,18 @@ impl ReplayedConversationView {
 
     pub(crate) fn sanitized_messages(&self) -> &[ModelMessage] {
         &self.sanitized_messages
+    }
+
+    pub(crate) fn stable_units(&self) -> &[LiveCompactionUnit] {
+        &self.stable_units
+    }
+
+    pub(crate) fn relations(&self) -> &[ItemRelation] {
+        &self.relations
+    }
+
+    pub(crate) const fn revision(&self) -> ConversationRevision {
+        self.revision
     }
 
     /// Historical item ids in physical order over all accepted entries.
@@ -2000,10 +2111,14 @@ impl fmt::Debug for ReplayedConversationView {
         formatter
             .debug_struct("ReplayedConversationView")
             .field("accepted_entries", &self.accepted_entries.len())
+            .field("selected_entries", &self.selected_entries.len())
             .field("selected_path_len", &self.selected_path.len())
             .field("has_selected_head", &self.selected_head.is_some())
             .field("reserved_ids", &self.reserved_ids.len())
             .field("sanitized_messages", &self.sanitized_messages.len())
+            .field("stable_units", &self.stable_units.len())
+            .field("relations", &self.relations.len())
+            .field("revision", &"redacted")
             .field("historical_item_ids", &self.historical_item_ids.len())
             .field("diagnostics", &self.diagnostics)
             .field("tail_action", &self.tail_action)
@@ -2049,6 +2164,16 @@ pub(crate) fn replay_conversation<R: Read>(
 
     let (selected_path, selected_head) = scan.selected_path();
     let path_members = selected_path.iter().copied().collect::<BTreeSet<_>>();
+    let selected_entries = selected_path
+        .iter()
+        .map(|entry_id| {
+            let index = scan
+                .entry_index
+                .get(entry_id)
+                .expect("selected path entries are present in the replay index");
+            Arc::clone(&scan.entries[*index].entry)
+        })
+        .collect::<Vec<_>>();
 
     // Pass one: all-history semantic facts in physical order (historical items, accepted
     // ToolCall facts, per-fact Tool/Interaction validity and their owning diagnostics). It
@@ -2075,17 +2200,29 @@ pub(crate) fn replay_conversation<R: Read>(
     // Pass two: the selected-path-only sanitizer, which owns the pending Tool exchange and the
     // stable units. Off-path entries never mutate it; invalid facts from pass one are skipped
     // without duplicate diagnostics.
-    let messages = {
+    let projection = {
         let mut sanitizer = ReplaySanitizerPass {
             entries: &scan.entries,
             path_members: &path_members,
             facts: &facts,
             units: Vec::new(),
+            relations: Vec::new(),
             pending_exchange: None,
+            revision_operations: 0,
+            revision_overflowed: false,
             diagnostics: &mut scan.diagnostics,
         };
-        sanitizer.run(eof_location)
+        sanitizer.run(eof_location)?
     };
+    let stable_units = projection
+        .units
+        .iter()
+        .map(|unit| {
+            PreparedLiveCompactionUnit::for_replay(unit.kind, unit.messages.clone().into())
+                .map(|prepared| prepared.bind_origin(unit.origin))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ConversationReplayError::InvariantViolation)?;
 
     Ok(ReplayedConversationView {
         header,
@@ -2095,13 +2232,114 @@ pub(crate) fn replay_conversation<R: Read>(
             .map(|scan_entry| Arc::clone(&scan_entry.entry))
             .collect::<Vec<_>>()
             .into(),
+        selected_entries: selected_entries.into(),
         selected_path: selected_path.into(),
         selected_head,
         reserved_ids: scan.reserved_ids.into(),
-        sanitized_messages: messages.into(),
+        sanitized_messages: projection.messages.into(),
+        stable_units: stable_units.into(),
+        relations: projection.relations.into(),
+        revision: ConversationRevision::from_replay_operations(projection.revision_operations),
         historical_item_ids: facts.historical_item_ids.into(),
         diagnostics: scan.diagnostics.finish(),
         tail_action: scan.tail_action,
+    })
+}
+
+/// Redacted failures from the replay-backed loaded-conversation preparation owner.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ConversationLoadError {
+    #[error("conversation replay failed")]
+    Replay(ConversationReplayError),
+    #[error("conversation tail truncation failed")]
+    TailTruncateFailed,
+    #[error("conversation live state seed violated its owner invariant")]
+    LiveStateInvariant,
+    #[error("conversation load task failed")]
+    Runtime(RuntimeTaskError),
+}
+
+/// The cold conversation objects installed into one loaded Session.
+pub(crate) struct ReplayedConversationLoad {
+    pub(crate) live_state: LiveSessionState,
+    pub(crate) recorder: SessionRecorder,
+    pub(crate) diagnostics: ConversationReplayDiagnostics,
+}
+
+/// Replays and prepares one DurableState-issued target while retaining all physical handles in
+/// the same owner-tracked blocking job. The target is never exposed to residency as a path or a
+/// separately manufactured writable lease.
+pub(crate) async fn load_replayed_conversation(
+    target: PublishedConversationTarget,
+    task_context: RuntimeTaskContext,
+) -> Result<ReplayedConversationLoad, ConversationLoadError> {
+    let session_id = target.session_id();
+    let declared_file_bytes = target.declared_file_bytes();
+    let (file, writable_lease) = target.into_parts();
+    let result_slot: Arc<Mutex<Option<Result<ReplayedConversationLoad, ConversationLoadError>>>> =
+        Arc::new(Mutex::new(None));
+    let worker_slot = Arc::clone(&result_slot);
+    let recorder_task_context = task_context.clone();
+    let job = task_context.spawn_blocking_tracked(move || {
+        let result = prepare_replayed_conversation_blocking(
+            session_id,
+            declared_file_bytes,
+            file,
+            writable_lease,
+            recorder_task_context,
+        );
+        *lock_recorder(&worker_slot) = Some(result);
+    });
+
+    match job.wait().await {
+        Ok(()) => lock_recorder(&result_slot)
+            .take()
+            .ok_or(ConversationLoadError::Runtime(
+                RuntimeTaskError::WorkerUnavailable,
+            ))?,
+        Err(error) => Err(ConversationLoadError::Runtime(error)),
+    }
+}
+
+fn prepare_replayed_conversation_blocking(
+    session_id: SessionId,
+    mut declared_file_bytes: u64,
+    file: File,
+    mut writable_lease: ExclusiveWritableConversationLease,
+    task_context: RuntimeTaskContext,
+) -> Result<ReplayedConversationLoad, ConversationLoadError> {
+    let replay_reader = file
+        .try_clone()
+        .map_err(|_| ConversationLoadError::Replay(ConversationReplayError::InputUnavailable))?;
+    let view = replay_conversation(
+        replay_reader,
+        declared_file_bytes,
+        session_id,
+        ConversationScanAccess::ExclusiveWritable(&writable_lease),
+    )
+    .map_err(ConversationLoadError::Replay)?;
+
+    if let Some(ConversationPartialTailAction::TruncateTo { offset }) = view.tail_action() {
+        writable_lease
+            .truncate_to(offset)
+            .map_err(|_| ConversationLoadError::TailTruncateFailed)?;
+        declared_file_bytes = offset;
+    }
+
+    let live_state = LiveSessionState::from_replayed_view(session_id, &view)
+        .map_err(|_| ConversationLoadError::LiveStateInvariant)?;
+    let diagnostics = view.diagnostics().clone();
+    let recorder = SessionRecorder::from_published_parts(
+        session_id,
+        declared_file_bytes,
+        file,
+        writable_lease,
+        task_context,
+    );
+    Ok(ReplayedConversationLoad {
+        live_state,
+        recorder,
+        diagnostics,
     })
 }
 
@@ -2891,6 +3129,25 @@ impl SessionRecorder {
         let target_file_bytes = target.declared_file_bytes();
         let (file, writable_lease) = target.into_parts();
 
+        Self::from_published_parts(
+            target_session_id,
+            target_file_bytes,
+            file,
+            writable_lease,
+            task_context,
+        )
+    }
+
+    /// Consumes the exact File/proof pair transferred from one PublishedConversationTarget. This
+    /// is used by the replay-backed Load owner after it has optionally truncated the scanner's
+    /// final partial tail; the method does not issue or reconstruct a production proof.
+    pub(crate) fn from_published_parts(
+        target_session_id: SessionId,
+        target_file_bytes: u64,
+        file: File,
+        writable_lease: ExclusiveWritableConversationLease,
+        task_context: RuntimeTaskContext,
+    ) -> Self {
         // The writable lease is only a same-open binding proof. Its private File is deliberately
         // not consumed here; the published target File remains the recorder's sole append handle.
         let validation = if writable_lease.session_id() != target_session_id
@@ -5518,6 +5775,48 @@ mod tests {
                     .parse::<ItemId>()
                     .unwrap(),
             ]
+        );
+    }
+
+    #[test]
+    fn replay_seed_preserves_stable_units_relations_and_revision_for_live_state() {
+        let session_id = fixture_session(TOOL_EXCHANGE_GOLDEN);
+        let view =
+            replay_fixture(TOOL_EXCHANGE_GOLDEN, session_id).expect("golden tool exchange replays");
+        assert_eq!(view.revision().operation_count_for_test(), 4);
+        assert_eq!(
+            view.stable_units()
+                .iter()
+                .map(LiveCompactionUnit::kind)
+                .collect::<Vec<_>>(),
+            [
+                CompactionUnitKind::UserMessage,
+                CompactionUnitKind::ToolExchange,
+                CompactionUnitKind::AssistantMessage,
+            ]
+        );
+
+        let state = LiveSessionState::from_replayed_view(session_id, &view)
+            .expect("the replay projection seeds live state without applying history");
+        let captured = state
+            .capture_conversation_views()
+            .expect("the replay seed preserves a valid stable source");
+        assert_eq!(captured.conversation().messages().len(), 4);
+        assert_eq!(
+            captured
+                .conversation()
+                .revision()
+                .operation_count_for_test(),
+            4
+        );
+        assert_eq!(captured.relations().len(), 4);
+        assert!(captured.pending_interactions().is_empty());
+        assert!(
+            state.entry_id_is_reserved_for_test(
+                "ent_00000000000000000000000000000004"
+                    .parse()
+                    .expect("the golden EntryId is valid")
+            )
         );
     }
 

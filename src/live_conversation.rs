@@ -57,6 +57,19 @@ impl LiveConversationView {
 pub(crate) struct ConversationRevision(u64);
 
 impl ConversationRevision {
+    /// Reconstructs the process-local revision counted by the bounded cold replay projection. The
+    /// count covers only facts that survive model-visible replay semantics; it is not a physical
+    /// line counter. The caller owns the checked operation count; this constructor is not a wire
+    /// or public ID ingress.
+    pub(crate) const fn from_replay_operations(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn operation_count_for_test(self) -> u64 {
+        self.0
+    }
+
     pub(crate) fn checked_next(self) -> Result<Self, LiveConversationError> {
         self.0
             .checked_add(1)
@@ -446,6 +459,100 @@ impl LiveSessionState {
             #[cfg(test)]
             fail_prepared_unit_preflight: false,
         }
+    }
+
+    /// Seeds a loaded Session from Conversation Storage's already-sanitized cold projection.
+    /// This constructor is intentionally separate from every strict live `apply_*` method:
+    /// tolerant replay may have isolated facts that a live mutation would reject, and replay
+    /// must never manufacture a new EntryId or re-run live validation as a repair operation.
+    pub(crate) fn from_replayed_view(
+        session_id: SessionId,
+        view: &super::ReplayedConversationView,
+    ) -> Result<Self, LiveConversationError> {
+        if view.header().session_id() != session_id {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidRelation,
+            ));
+        }
+
+        let selected_entries = view.selected_entries();
+        let mut selected_ids = BTreeSet::new();
+        let mut previous = None;
+        for (index, entry) in selected_entries.iter().enumerate() {
+            if entry.session_id() != session_id
+                || !selected_ids.insert(entry.entry_id())
+                || (index == 0 && entry.parent_id().is_some())
+                || (index != 0 && entry.parent_id() != previous)
+            {
+                return Err(LiveConversationError::new(
+                    LiveConversationErrorReason::InvalidRelation,
+                ));
+            }
+            previous = Some(entry.entry_id());
+        }
+        if previous != view.selected_head() {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidRelation,
+            ));
+        }
+
+        let reserved = view.reserved_ids().iter().copied().collect::<BTreeSet<_>>();
+        if selected_ids
+            .iter()
+            .any(|entry_id| !reserved.contains(entry_id))
+        {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidRelation,
+            ));
+        }
+
+        let relations = view.relations().to_vec();
+        let mut relation_items = BTreeSet::new();
+        if relations
+            .iter()
+            .any(|relation| !relation_items.insert(relation.item_id()))
+        {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidRelation,
+            ));
+        }
+
+        let stable_units = view.stable_units().to_vec();
+        if stable_units
+            .iter()
+            .any(|unit| !selected_ids.contains(unit.first_entry_id()))
+        {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidCompactionSource,
+            ));
+        }
+        LiveCompactionSourceView::for_replay(
+            session_id,
+            view.revision(),
+            stable_units.clone().into(),
+        )
+        .map_err(|_| {
+            LiveConversationError::new(LiveConversationErrorReason::InvalidCompactionSource)
+        })?;
+
+        Ok(Self {
+            session_id,
+            selected_path: selected_entries.to_vec(),
+            entry_ids: EntryIdGenerator::new(reserved),
+            revision: view.revision(),
+            relations,
+            // Recorded Interaction facts remain in the selected history, but replay never
+            // reconstructs a process-local waiter or the private approval mapping needed for a
+            // live pending Interaction.
+            interactions: Vec::new(),
+            stable_units,
+            current_turn: None,
+            tool_exchange: None,
+            #[cfg(test)]
+            scripted_entry_ids: None,
+            #[cfg(test)]
+            fail_prepared_unit_preflight: false,
+        })
     }
 
     pub(crate) fn apply_user_message(
@@ -1204,6 +1311,11 @@ impl LiveSessionState {
         self.scripted_entry_ids
             .as_ref()
             .map_or(0, |scripted| scripted.allocation_calls)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_id_is_reserved_for_test(&self, entry_id: EntryId) -> bool {
+        self.entry_ids.reserved.contains(&entry_id)
     }
 
     /// Exact test-only owner clone for acceptance probes. Production state deliberately remains

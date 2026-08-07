@@ -90,7 +90,7 @@ impl fmt::Display for CompactionSourceError {
 impl Error for CompactionSourceError {}
 
 impl PreparedLiveCompactionUnit {
-    pub(crate) fn for_live_reducer(
+    fn new(
         kind: CompactionUnitKind,
         messages: Arc<[ModelMessage]>,
     ) -> Result<Self, CompactionSourceError> {
@@ -100,6 +100,22 @@ impl PreparedLiveCompactionUnit {
             ));
         }
         Ok(Self { kind, messages })
+    }
+
+    pub(crate) fn for_live_reducer(
+        kind: CompactionUnitKind,
+        messages: Arc<[ModelMessage]>,
+    ) -> Result<Self, CompactionSourceError> {
+        Self::new(kind, messages)
+    }
+
+    /// Constructs a stable unit from the already-sanitized cold replay projection. Replay has a
+    /// separate named ingress so it cannot accidentally be mistaken for a live reducer apply.
+    pub(crate) fn for_replay(
+        kind: CompactionUnitKind,
+        messages: Arc<[ModelMessage]>,
+    ) -> Result<Self, CompactionSourceError> {
+        Self::new(kind, messages)
     }
 
     pub(crate) fn bind_origin(self, first_entry_id: EntryId) -> LiveCompactionUnit {
@@ -127,6 +143,24 @@ impl LiveCompactionUnit {
 
 impl LiveCompactionSourceView {
     pub(crate) fn for_live_reducer(
+        session_id: SessionId,
+        revision: ConversationRevision,
+        units: Arc<[LiveCompactionUnit]>,
+    ) -> Result<Self, CompactionSourceError> {
+        Self::validate_and_build(session_id, revision, units)
+    }
+
+    /// Validates the stable-unit source emitted by tolerant cold replay. This is a distinct
+    /// ingress from the live reducer source even though both preserve the same source invariants.
+    pub(crate) fn for_replay(
+        session_id: SessionId,
+        revision: ConversationRevision,
+        units: Arc<[LiveCompactionUnit]>,
+    ) -> Result<Self, CompactionSourceError> {
+        Self::validate_and_build(session_id, revision, units)
+    }
+
+    fn validate_and_build(
         session_id: SessionId,
         revision: ConversationRevision,
         units: Arc<[LiveCompactionUnit]>,

@@ -5,10 +5,11 @@
 
 //! The crate-private loaded Session execution seam.
 //!
-//! This module deliberately stops at one already-loaded, Ready+Idle Session. It owns neither
-//! Runtime residency nor the public Runtime facade. The Runtime-owned residency registry that
-//! starts an executor retains its permit (and excludes lifecycle/load changes) for as long as the
-//! loaded executor is live; this constructor does not acquire that permit.
+//! This module deliberately stops at one already-loaded, Ready+Idle Session. It retains the
+//! replay-seeded live state and inline Recorder supplied by residency, but owns neither Runtime
+//! residency nor the public Runtime facade. The Runtime-owned residency registry that starts an
+//! executor retains its permit (and excludes lifecycle/load changes) for as long as the loaded
+//! executor is live; this constructor does not acquire that permit.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -21,9 +22,11 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
     SessionDefinitionDecisionError, SessionLifecycle,
 };
+use crate::conversation_storage::{ConversationReplayDiagnostics, SessionRecorder};
 use crate::durable_state::{
     DurableSessionDefinitionError, DurableSessionDefinitionOutcome, DurableState,
 };
+use crate::live_conversation::LiveSessionState;
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision};
 use crate::workspace::{
@@ -233,6 +236,27 @@ impl fmt::Debug for SessionDefinitionPublicationPermit {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct LoadedSessionConversation {
+    live_state: Arc<Mutex<LiveSessionState>>,
+    recorder: Arc<SessionRecorder>,
+    replay_diagnostics: ConversationReplayDiagnostics,
+}
+
+impl LoadedSessionConversation {
+    pub(crate) fn from_replay(
+        live_state: LiveSessionState,
+        recorder: SessionRecorder,
+        replay_diagnostics: ConversationReplayDiagnostics,
+    ) -> Self {
+        Self {
+            live_state: Arc::new(Mutex::new(live_state)),
+            recorder: Arc::new(recorder),
+            replay_diagnostics,
+        }
+    }
+}
+
 /// The loaded Session control actor handle.
 #[derive(Clone)]
 pub(crate) struct SessionExecutor {
@@ -240,6 +264,7 @@ pub(crate) struct SessionExecutor {
     closing: CancellationToken,
     task: TrackedTask,
     failure_state: Arc<ActorFailureState>,
+    conversation: Option<Arc<LoadedSessionConversation>>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -254,14 +279,52 @@ impl SessionExecutor {
     /// Starts one loaded Ready+Idle Session.
     ///
     /// The caller must already own the future Runtime residency permit and must exclude
-    /// lifecycle/load changes for the exact loaded Session.  This constructor validates only the
-    /// loaded definition/snapshot binding; it deliberately does not acquire that future permit.
+    /// lifecycle/load changes for the exact loaded Session. This constructor validates the
+    /// definition/snapshot binding and adopts an already replay-seeded state/Recorder pair; it
+    /// deliberately does not acquire that future permit.
     pub(crate) fn start_loaded_ready_idle(
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
+        conversation: LoadedSessionConversation,
+    ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_ready_idle_inner(
+            task_context,
+            durable_state,
+            resolver,
+            definition,
+            workspace,
+            Some(Arc::new(conversation)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_loaded_ready_idle_without_conversation(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        definition: Arc<SessionDefinition>,
+        workspace: Arc<WorkspaceSnapshot>,
+    ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_ready_idle_inner(
+            task_context,
+            durable_state,
+            resolver,
+            definition,
+            workspace,
+            None,
+        )
+    }
+
+    fn start_loaded_ready_idle_inner(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        definition: Arc<SessionDefinition>,
+        workspace: Arc<WorkspaceSnapshot>,
+        conversation: Option<Arc<LoadedSessionConversation>>,
     ) -> Result<Self, SessionExecutorStartError> {
         if definition.session_id() != workspace.session_id() {
             return Err(SessionExecutorStartError::SessionIdMismatch);
@@ -293,6 +356,7 @@ impl SessionExecutor {
             execution_state: SessionExecutionState::Idle,
             active_publication: None,
             failure_state: Arc::clone(&failure_state),
+            conversation: conversation.clone(),
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -328,6 +392,7 @@ impl SessionExecutor {
             closing,
             task,
             failure_state,
+            conversation,
             #[cfg(test)]
             hooks,
         })
@@ -342,7 +407,11 @@ impl SessionExecutor {
     /// for the owner-tracked actor settlement.  It never shuts down the shared RuntimeTaskContext.
     pub(crate) async fn close(&self) -> Result<(), SessionExecutorCloseError> {
         self.request_closing();
-        if self.task.wait().await.is_err() || self.failure_state.is_fatal() {
+        let task_result = self.task.wait().await;
+        if let Some(conversation) = &self.conversation {
+            conversation.recorder.close().await;
+        }
+        if task_result.is_err() || self.failure_state.is_fatal() {
             Err(SessionExecutorCloseError::InternalDispatchUnavailable)
         } else {
             Ok(())
@@ -430,6 +499,27 @@ impl SessionExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) fn live_state_for_test(&self) -> Option<Arc<Mutex<LiveSessionState>>> {
+        self.conversation
+            .as_ref()
+            .map(|conversation| Arc::clone(&conversation.live_state))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn recorder_for_test(&self) -> Option<Arc<SessionRecorder>> {
+        self.conversation
+            .as_ref()
+            .map(|conversation| Arc::clone(&conversation.recorder))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replay_diagnostics_for_test(&self) -> Option<ConversationReplayDiagnostics> {
+        self.conversation
+            .as_ref()
+            .map(|conversation| conversation.replay_diagnostics.clone())
+    }
+
+    #[cfg(test)]
     pub(crate) async fn starting_admission_probe_for_test(
         &self,
     ) -> Result<(), SessionWorkspaceDefinitionError> {
@@ -474,6 +564,7 @@ struct SessionExecutorActor {
     execution_state: SessionExecutionState,
     active_publication: Option<ActivePublication>,
     failure_state: Arc<ActorFailureState>,
+    conversation: Option<Arc<LoadedSessionConversation>>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -529,7 +620,7 @@ impl SessionExecutorActor {
                     }
                     None => {
                         self.reap_after_missing_completion().await;
-                        return false;
+                        return self.close_and_drain().await;
                     }
                 },
                 request = self.receiver.recv() => match request {
@@ -571,6 +662,9 @@ impl SessionExecutorActor {
             }
 
             if self.active_publication.is_none() && requests_drained {
+                if let Some(conversation) = &self.conversation {
+                    conversation.recorder.close().await;
+                }
                 return normal_exit;
             }
 
@@ -1803,6 +1897,13 @@ mod tests {
         create_file(&g1.join("COMMITTED"), b"");
     }
 
+    fn conversation_header_fixture() -> Vec<u8> {
+        format!(
+            "{{\"type\":\"session_header\",\"data\":{{\"formatVersion\":1,\"sessionId\":\"{SESSION_ID}\",\"createdAt\":\"2026-08-03T10:01:00.456Z\",\"initialAgent\":{{\"agentId\":\"{AGENT_ID}\",\"revision\":\"ar_1\"}},\"initialDefinitionRevision\":\"sdr_1\"}}}}\n"
+        )
+        .into_bytes()
+    }
+
     fn create_fixture_session(root: &Path, workspace: &Path) {
         let reservation = root.join("reservations").join("sessions").join(SESSION_ID);
         create_file(&reservation, b"");
@@ -1811,7 +1912,7 @@ mod tests {
         create_file(&entity.join("PUBLISHED"), b"");
         create_file(
             &entity.join("conversation.jsonl"),
-            b"opaque conversation fixture bytes",
+            &conversation_header_fixture(),
         );
         let generation = entity.join("generations");
         create_dir(&generation);
@@ -1856,7 +1957,7 @@ mod tests {
         let prompts = Arc::from(Vec::new().into_boxed_slice());
         let skills = Arc::from(Vec::new().into_boxed_slice());
         let workspace_snapshot = candidate.finish(prompts, skills).unwrap();
-        let executor = SessionExecutor::start_loaded_ready_idle(
+        let executor = SessionExecutor::start_loaded_ready_idle_without_conversation(
             context.clone(),
             state.clone(),
             resolver,
@@ -1964,7 +2065,7 @@ mod tests {
         let conversation = store.session_path().join("conversation.jsonl");
         assert_eq!(
             fs::read(conversation).unwrap(),
-            b"opaque conversation fixture bytes"
+            conversation_header_fixture()
         );
         close_loaded(loaded).await;
 

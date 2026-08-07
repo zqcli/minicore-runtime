@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；crate-private loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion与unified loaded/unloaded Workspace update foundation已实现；public Snapshot/Event、replay/Recorder-backed full Load、active-Turn grace Unload、Turn admission与`ActiveTurnTask` pending）
+状态：当前权威架构（ADR 0137后；crate-private loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update，以及replay/Recorder-backed Ready+Idle Load hydration已实现；public Snapshot/Event、active-Turn grace Unload、Turn admission与`ActiveTurnTask` pending）
 日期：2026-07-31
 
 ## 目的
@@ -543,6 +543,8 @@ open DurableState PublishedConversationTarget with optional root-lease-derived w
 - Submit admission/Steer/FollowUp queue；
 - retry timer；
 - old Recorder object或in-flight append。
+
+当前Ready+Idle hydration把replay-seeded `LiveSessionState`和同一target parts初始化的`SessionRecorder`一并交给`SessionExecutor`；actor close先关闭/等待Recorder，再完成residency Unload。cold seed保留selected path、stable units、relations、replay revision与reserved EntryId，但按recovery contract保持`current_turn = None`并不恢复Interaction waiter。
 
 Load不推断旧Turn outcome、不恢复terminal reason，也不执行recovery append。recorded `TurnId`只用于conversation history grouping。当前loaded instance一旦Degraded便保持Degraded，不probe/retry、不创建segment、不backfill。Host执行Unload/Load后，新loaded instance只从recorded prefix开始并重新尝试初始化Recorder，结果为Healthy或Degraded；旧unrecorded live tail和旧TurnStatus永久丢失。
 
