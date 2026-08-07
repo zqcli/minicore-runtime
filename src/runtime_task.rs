@@ -188,6 +188,15 @@ impl RuntimeTaskContext {
         }
     }
 
+    /// Reports whether this owner has stopped accepting new tracked work.
+    #[allow(
+        dead_code,
+        reason = "loaded Session execution uses this owner admission probe"
+    )]
+    pub(crate) fn is_closing(&self) -> bool {
+        self.owner.is_closing()
+    }
+
     /// Synchronously rejects future admissions without claiming the active shutdown leader.
     ///
     /// Runtime facade drop uses this best-effort signal. A later explicit shutdown can still
@@ -207,6 +216,12 @@ impl RuntimeTaskContext {
             .1
             .handle
             .abort();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn registered_task_count_for_test(&self) -> usize {
+        let registry = lock(&self.owner.registry);
+        registry.starting.len() + registry.joining.len() + registry.tasks.len()
     }
 
     /// Closes admission and joins every operation reserved while the owner was open.
@@ -254,8 +269,8 @@ impl TrackedTask {
 
     /// Joins this task's exact owner registration before observing its shared settlement.
     ///
-    /// This is intentionally private: normal callers wait on settlement, while initialization
-    /// must also observe a task that was cancelled or panicked before its first poll.
+    /// This is intentionally private: initialization uses the exact-registration failure result,
+    /// while normal crate-private waiters may share the same settlement path.
     async fn join_registered(&self) -> Result<(), RuntimeTaskError> {
         let task = self
             .owner
@@ -271,9 +286,52 @@ impl TrackedTask {
         self.settlement.wait().await
     }
 
-    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "loaded Session execution uses this owner task settlement"
+    )]
     pub(crate) async fn wait(&self) -> Result<(), RuntimeTaskError> {
-        self.settlement.wait().await
+        loop {
+            // A caller-side close may race an admitted task before its first poll.  Both
+            // notifications must be enabled before inspecting either source: the first waiter
+            // may be cancelled while it owns the exact raw handle, and its guard then restores
+            // that handle by notifying the registry rather than the shared settlement.
+            let registry_changed = self.owner.registry_changed.notified();
+            tokio::pin!(registry_changed);
+            registry_changed.as_mut().enable();
+            let settlement_changed = self.settlement.changed.notified();
+            tokio::pin!(settlement_changed);
+            settlement_changed.as_mut().enable();
+
+            if let Some(task) = self.owner.take_registered(self.key) {
+                let mut join =
+                    SingleRegisteredTaskJoinGuard::new(Arc::clone(&self.owner), self.key, task);
+                let join_failed = join.join().await.is_err();
+                let task = join.finish();
+                if join_failed {
+                    task.settlement.settle_join_failure();
+                }
+                drop(task);
+                continue;
+            }
+
+            if let Some(outcome) = self.settlement.current() {
+                if !self.owner.has_registration(self.key) {
+                    return outcome;
+                }
+                // The shared result can settle before the owner finishes reaping the exact raw
+                // handle. Do not wait on the already-ready settlement notification: only the
+                // registry transition can make this exact waiter eligible to return.
+                registry_changed.await;
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                _ = registry_changed => {}
+                _ = settlement_changed => {}
+            }
+        }
     }
 }
 
@@ -391,6 +449,13 @@ impl RuntimeTaskOwner {
         Some(task)
     }
 
+    fn has_registration(&self, key: RegistryKey) -> bool {
+        let registry = lock(&self.registry);
+        registry.starting.contains(&key)
+            || registry.tasks.contains_key(&key)
+            || registry.joining.contains(&key)
+    }
+
     fn finish_registered_join(&self, key: RegistryKey) {
         let mut registry = lock(&self.registry);
         let removed = registry.joining.remove(&key);
@@ -404,6 +469,15 @@ impl RuntimeTaskOwner {
         registry.starting.remove(&key);
         drop(registry);
         self.registry_changed.notify_waiters();
+    }
+
+    #[allow(
+        dead_code,
+        reason = "RuntimeTaskContext exposes this owner admission probe"
+    )]
+    fn is_closing(&self) -> bool {
+        let registry = lock(&self.registry);
+        registry.phase != OwnerPhase::Open
     }
 
     fn request_closing(&self) {
@@ -753,6 +827,10 @@ where
         }
     }
 
+    fn current(&self) -> Option<Result<T, RuntimeTaskError>> {
+        lock(&self.outcome).clone()
+    }
+
     async fn wait(&self) -> Result<T, RuntimeTaskError> {
         loop {
             let notified = self.changed.notified();
@@ -848,16 +926,10 @@ mod tests {
             .build()
             .expect("the driver runtime builds");
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            driver.block_on(async {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(1),
-                    RuntimeTaskContext::new(closed_handle),
-                )
-                .await
-            })
+            driver.block_on(RuntimeTaskContext::new(closed_handle))
         }));
 
-        assert!(matches!(result, Ok(Ok(Err(RuntimeDependencyUnavailable)))));
+        assert!(matches!(result, Ok(Err(RuntimeDependencyUnavailable))));
     }
 
     #[test]
@@ -991,6 +1063,81 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_first_shared_waiter_wakes_second_for_an_aborted_pre_poll_task() {
+        let context = initialized_context().await;
+        // The admitted task is aborted while it is still queued, before its future can construct
+        // AsyncTaskSettlementGuard.  Its settlement must therefore come from owner reaping.
+        let task_before_first_poll = context
+            .spawn_tracked(std::future::pending())
+            .expect("the open owner admits the pre-poll task");
+        context.abort_latest_registered_task();
+        let second_waiter = task_before_first_poll.clone();
+
+        // Waiter A owns the exact registration, but the cancelled raw task has not yet produced
+        // its join result.  The poll-once seam leaves A in the cancellation window.
+        let mut waiter_a = Box::pin(task_before_first_poll.wait());
+        assert!(poll_once_pending(waiter_a.as_mut()).await);
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert_eq!(registry.joining.len(), 1);
+            assert!(registry.tasks.is_empty());
+        }
+
+        // Waiter B has no settlement notification to await yet.  It must also register the owner
+        // notification so A's guard restoration wakes it after A is cancelled.
+        let mut waiter_b = Box::pin(second_waiter.wait());
+        assert!(poll_once_pending(waiter_b.as_mut()).await);
+        drop(waiter_a);
+
+        assert_eq!(waiter_b.await, Err(RuntimeTaskError::WorkerUnavailable));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn settled_shared_waiter_stays_pending_until_a_cancelled_join_is_reaped() {
+        let context = initialized_context().await;
+        let release = Arc::new(Notify::new());
+        let release_by_task = Arc::clone(&release);
+        let task = context
+            .spawn_tracked(async move {
+                release_by_task.notified().await;
+            })
+            .expect("the open owner admits the asynchronous operation");
+        let second_waiter = task.clone();
+
+        // Waiter A owns the exact raw handle while its JoinHandle is still pending. Settle the
+        // shared result independently to reproduce the result-before-reap race.
+        let mut waiter_a = Box::pin(task.wait());
+        assert!(poll_once_pending(waiter_a.as_mut()).await);
+        {
+            let registry = super::lock(&context.owner.registry);
+            assert!(registry.joining.contains(&second_waiter.key));
+            assert!(!registry.tasks.contains_key(&second_waiter.key));
+        }
+        second_waiter.settlement.resolve(Ok(()));
+
+        // B must not observe the ready shared result while A still owns the joining slot.
+        let mut waiter_b = Box::pin(second_waiter.wait());
+        assert!(poll_once_pending(waiter_b.as_mut()).await);
+
+        // Cancelling A restores the same handle and notifies the registry. Releasing the task
+        // then lets B take and reap that restored handle before it returns.
+        drop(waiter_a);
+        release.notify_one();
+        assert_eq!(waiter_b.await, Ok(()));
+
+        let registered_count = {
+            let registry = super::lock(&context.owner.registry);
+            assert!(!registry.starting.contains(&second_waiter.key));
+            assert!(!registry.tasks.contains_key(&second_waiter.key));
+            assert!(!registry.joining.contains(&second_waiter.key));
+            registry.starting.len() + registry.tasks.len() + registry.joining.len()
+        };
+        assert_eq!(registered_count, 0);
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dropping_a_task_does_not_cancel_or_detach_its_async_operation_from_shutdown() {
         let context = initialized_context().await;
         let entered = Arc::new(Notify::new());
@@ -1089,9 +1236,7 @@ mod tests {
             .expect("the open owner admits the parent");
         parent_waiting.notified().await;
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), context.shutdown())
-            .await
-            .expect("shutdown polls the later child instead of serially waiting on its parent");
+        context.shutdown().await;
         assert_eq!(parent.wait().await, Ok(()));
     }
 

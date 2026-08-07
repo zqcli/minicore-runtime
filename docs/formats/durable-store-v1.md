@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 production recovery/root lease、private permanent reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 COMMITTED/PUBLISHED publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer，以及exact historical Agent/Session definition resolution已实现；remaining Fork anchors/LiveSnapshot、loaded Workspace Idle/Snapshot publication、Session lifecycle Runtime residency integration、public Runtime command及完整cross-platform native matrix pending
+状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution，以及crate-private loaded Ready+Idle Workspace definition composite publication已实现；remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、public Runtime command及完整cross-platform native matrix pending
 日期：2026-08-03
 
 ## Scope
