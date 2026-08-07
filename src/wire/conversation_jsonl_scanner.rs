@@ -10,8 +10,8 @@ use crate::conversation_storage::{
 };
 use crate::wire::SessionId;
 use crate::wire::conversation_jsonl::{
-    ConversationCodecError, ConversationLineCodec, MAX_CONVERSATION_ENTRY_BYTES,
-    MAX_CONVERSATION_HEADER_BYTES,
+    ConversationCodecError, ConversationDecodeFacts, ConversationLineCodec,
+    MAX_CONVERSATION_ENTRY_BYTES, MAX_CONVERSATION_HEADER_BYTES,
 };
 
 /// The V1 physical-file cap, including any final unterminated bytes.
@@ -66,7 +66,7 @@ pub(crate) struct ConversationPhysicalLocation {
 
 #[allow(dead_code, reason = "locations remain a scanner consumer seam")]
 impl ConversationPhysicalLocation {
-    const fn new(line_number: u64, offset: u64) -> Self {
+    pub(crate) const fn new(line_number: u64, offset: u64) -> Self {
         Self {
             line_number,
             offset,
@@ -113,6 +113,9 @@ pub(crate) enum ConversationScanEvent {
         location: ConversationPhysicalLocation,
         canonicality: ConversationLineCanonicality,
         entry: Box<StoredSessionEntry>,
+        /// Bounded salvage facts counted by the codec for this exact line. The scanner retains
+        /// no raw line bytes; only these counts cross the event boundary.
+        decode_facts: ConversationDecodeFacts,
     },
     Fault {
         location: ConversationPhysicalLocation,
@@ -130,11 +133,13 @@ impl fmt::Debug for ConversationScanEvent {
             Self::Entry {
                 location,
                 canonicality,
+                decode_facts,
                 ..
             } => formatter
                 .debug_struct("ConversationScanEvent::Entry")
                 .field("location", location)
                 .field("canonicality", canonicality)
+                .field("decode_facts", decode_facts)
                 .finish(),
             Self::Fault { location, fault } => formatter
                 .debug_struct("ConversationScanEvent::Fault")
@@ -429,9 +434,11 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                         fault: ConversationLineFault::InvalidUtf8,
                     }));
                 }
-                match ConversationLineCodec::decode_entry_for_session(
+                let mut facts = ConversationDecodeFacts::default();
+                match ConversationLineCodec::decode_entry_for_session_with_facts(
                     &self.line_buffer,
                     self.header()?.session_id(),
+                    &mut facts,
                 ) {
                     Ok(entry) => {
                         let canonicality = if exact_lf
@@ -446,6 +453,7 @@ impl<'lease, R: Read> ConversationJsonlScanner<'lease, R> {
                             location,
                             canonicality,
                             entry: Box::new(entry),
+                            decode_facts: facts,
                         }))
                     }
                     Err(error) => Ok(Some(ConversationScanEvent::Fault {

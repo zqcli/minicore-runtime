@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
@@ -15,7 +15,7 @@ use crate::model_gateway::{
     ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
     ProviderResponseMetadata, ReasoningContent,
 };
-use crate::prompt::CanonicalUserMessage;
+use crate::prompt::{CanonicalUserMessage, ModelAssistantContent, ModelMessage};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedBlockingJob};
 use crate::tools::{
     ToolAbandonReason, ToolApprovalRequestView, ToolApprovalResolution, ToolCallId, ToolName,
@@ -26,12 +26,13 @@ use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, UserMessageSource,
 };
 use crate::wire::conversation_jsonl::{
-    ConversationCodecError, ConversationLineCodec, MAX_CONVERSATION_ENTRY_BYTES,
+    ConversationCodecError, ConversationDecodeFacts, ConversationLineCodec,
+    MAX_CONVERSATION_ENTRY_BYTES,
 };
 use crate::wire::conversation_jsonl_scanner::{
     ConversationJsonlScanner, ConversationLineCanonicality, ConversationLineFault,
-    ConversationScanAccess, ConversationScanError, ConversationScanEvent,
-    MAX_CONVERSATION_FILE_BYTES,
+    ConversationPartialTailAction, ConversationPhysicalLocation, ConversationScanAccess,
+    ConversationScanError, ConversationScanEvent, MAX_CONVERSATION_FILE_BYTES,
 };
 use crate::wire::{
     BoundedJsonObject, EntryId, InteractionResolutionKey, ItemId, RequestId,
@@ -476,6 +477,1632 @@ fn map_unpublished_conversation_recovery_scan_error(
             UnpublishedConversationRecoveryError::Unavailable
         }
     }
+}
+
+/// Closed crate-private diagnostic code set for M5 tolerant replay.
+///
+/// The set is exact and closed: every replay outcome maps to one code, and no free-form
+/// diagnostic string can be produced. Codes are snake_case in `Display` to match the authoritative
+/// fixture metadata vocabulary.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ConversationReplayDiagnosticCode {
+    PartialTail,
+    OversizedLine,
+    InvalidUtf8,
+    MalformedJson,
+    InvalidEntry,
+    UnknownRecordVariant,
+    UnknownEntryVariant,
+    DuplicateEntryId,
+    MissingParent,
+    SessionMismatch,
+    InvalidRelation,
+    InvalidContributionStamp,
+    DuplicateContributionStamp,
+    InvalidToolExchange,
+    InvalidInteractionRelation,
+    InvalidCompactionMarker,
+    DiagnosticsTruncated,
+    #[allow(
+        dead_code,
+        reason = "reserved by the closed V1 diagnostic code set; the scanner surfaces the 1,000,000-entry cap as the typed HistoryTooLarge replay error instead of a detail fact"
+    )]
+    HistoryTooLarge,
+}
+
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+impl ConversationReplayDiagnosticCode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::PartialTail => "partial_tail",
+            Self::OversizedLine => "oversized_line",
+            Self::InvalidUtf8 => "invalid_utf8",
+            Self::MalformedJson => "malformed_json",
+            Self::InvalidEntry => "invalid_entry",
+            Self::UnknownRecordVariant => "unknown_record_variant",
+            Self::UnknownEntryVariant => "unknown_entry_variant",
+            Self::DuplicateEntryId => "duplicate_entry_id",
+            Self::MissingParent => "missing_parent",
+            Self::SessionMismatch => "session_mismatch",
+            Self::InvalidRelation => "invalid_relation",
+            Self::InvalidContributionStamp => "invalid_contribution_stamp",
+            Self::DuplicateContributionStamp => "duplicate_contribution_stamp",
+            Self::InvalidToolExchange => "invalid_tool_exchange",
+            Self::InvalidInteractionRelation => "invalid_interaction_relation",
+            Self::InvalidCompactionMarker => "invalid_compaction_marker",
+            Self::DiagnosticsTruncated => "diagnostics_truncated",
+            Self::HistoryTooLarge => "history_too_large",
+        }
+    }
+
+    /// Resolves the exact closed snake_case name back to its code. Crate-private so tests and
+    /// the future Load seam can interpret the authoritative fixture vocabulary.
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "partial_tail" => Self::PartialTail,
+            "oversized_line" => Self::OversizedLine,
+            "invalid_utf8" => Self::InvalidUtf8,
+            "malformed_json" => Self::MalformedJson,
+            "invalid_entry" => Self::InvalidEntry,
+            "unknown_record_variant" => Self::UnknownRecordVariant,
+            "unknown_entry_variant" => Self::UnknownEntryVariant,
+            "duplicate_entry_id" => Self::DuplicateEntryId,
+            "missing_parent" => Self::MissingParent,
+            "session_mismatch" => Self::SessionMismatch,
+            "invalid_relation" => Self::InvalidRelation,
+            "invalid_contribution_stamp" => Self::InvalidContributionStamp,
+            "duplicate_contribution_stamp" => Self::DuplicateContributionStamp,
+            "invalid_tool_exchange" => Self::InvalidToolExchange,
+            "invalid_interaction_relation" => Self::InvalidInteractionRelation,
+            "invalid_compaction_marker" => Self::InvalidCompactionMarker,
+            "diagnostics_truncated" => Self::DiagnosticsTruncated,
+            "history_too_large" => Self::HistoryTooLarge,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for ConversationReplayDiagnosticCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// One bounded diagnostic detail fact: an exact closed code plus the physical line/byte location.
+///
+/// The detail never carries IDs, user text, tool output, provider data, a raw line, or a path,
+/// so both `Debug` and `Display` of the enclosing diagnostics are inherently redacted.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationReplayDiagnosticDetail {
+    code: ConversationReplayDiagnosticCode,
+    line_number: u64,
+    offset: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+impl ConversationReplayDiagnosticDetail {
+    pub(crate) const fn code(self) -> ConversationReplayDiagnosticCode {
+        self.code
+    }
+
+    pub(crate) const fn line_number(self) -> u64 {
+        self.line_number
+    }
+
+    pub(crate) const fn offset(self) -> u64 {
+        self.offset
+    }
+}
+
+/// One truncation summary: how many detail facts were omitted beyond the retained first 100, plus
+/// the exact aggregate totals at the end of replay.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConversationReplayTruncationSummary {
+    omitted_details: u64,
+    totals: BTreeMap<ConversationReplayDiagnosticCode, u64>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+impl ConversationReplayTruncationSummary {
+    pub(crate) const fn omitted_details(&self) -> u64 {
+        self.omitted_details
+    }
+
+    pub(crate) fn totals(&self) -> &BTreeMap<ConversationReplayDiagnosticCode, u64> {
+        &self.totals
+    }
+}
+
+/// Bounded aggregate diagnostics for one tolerant replay.
+///
+/// Every fact increments its closed-code aggregate counter; at most the first 100 detail facts
+/// are retained in physical order. When more facts arrive, one truncation summary records the
+/// omitted count and the final totals, and the aggregate `DiagnosticsTruncated` counter becomes
+/// exactly one.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ConversationReplayDiagnostics {
+    details: Vec<ConversationReplayDiagnosticDetail>,
+    truncation: Option<ConversationReplayTruncationSummary>,
+    counts: BTreeMap<ConversationReplayDiagnosticCode, u64>,
+    total_facts: u64,
+}
+
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+impl ConversationReplayDiagnostics {
+    const MAX_RETAINED_DETAILS: usize = 100;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            details: Vec::with_capacity(Self::MAX_RETAINED_DETAILS),
+            truncation: None,
+            counts: BTreeMap::new(),
+            total_facts: 0,
+        }
+    }
+
+    /// Records one bounded fact and keeps the retained details in physical order with a
+    /// deterministic tie-break.
+    ///
+    /// Scan facts arrive first (pass one, physical order) and semantic projection facts arrive
+    /// later (pass two, physical order over accepted entries), so a later projection fact at an
+    /// earlier physical offset must not be appended ahead of earlier physical scan facts.
+    /// Inserting by physical location and trimming to the first 100 keeps the retained details
+    /// equal to the first 100 observed facts in physical/emission order at every point, with
+    /// equal locations resolved by emission order (scan facts before projection facts).
+    fn record(
+        &mut self,
+        code: ConversationReplayDiagnosticCode,
+        location: ConversationPhysicalLocation,
+    ) {
+        let count = self.counts.entry(code).or_insert(0);
+        *count = count
+            .checked_add(1)
+            .expect("replay diagnostic aggregate counters cannot overflow");
+        self.total_facts = self
+            .total_facts
+            .checked_add(1)
+            .expect("replay diagnostic fact counters cannot overflow");
+        let detail = ConversationReplayDiagnosticDetail {
+            code,
+            line_number: location.line_number(),
+            offset: location.offset(),
+        };
+        let position = self.details.partition_point(|retained| {
+            (retained.line_number, retained.offset) <= (detail.line_number, detail.offset)
+        });
+        if position < Self::MAX_RETAINED_DETAILS {
+            if self.details.len() == Self::MAX_RETAINED_DETAILS {
+                self.details.pop();
+            }
+            self.details.insert(position, detail);
+        }
+    }
+
+    /// Freezes the diagnostics: snapshots the final totals into the truncation summary and adds
+    /// the single `DiagnosticsTruncated` aggregate fact when any detail was omitted. The totals
+    /// snapshot contains every observed source fact but not the synthetic `DiagnosticsTruncated`
+    /// fact itself.
+    fn finish(mut self) -> Self {
+        if self.total_facts > Self::MAX_RETAINED_DETAILS as u64 {
+            self.truncation = Some(ConversationReplayTruncationSummary {
+                omitted_details: self.total_facts - Self::MAX_RETAINED_DETAILS as u64,
+                totals: self.counts.clone(),
+            });
+            let count = self
+                .counts
+                .entry(ConversationReplayDiagnosticCode::DiagnosticsTruncated)
+                .or_insert(0);
+            *count = count
+                .checked_add(1)
+                .expect("replay diagnostic aggregate counters cannot overflow");
+        }
+        self
+    }
+
+    pub(crate) fn count(&self, code: ConversationReplayDiagnosticCode) -> u64 {
+        self.counts.get(&code).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn counts(&self) -> &BTreeMap<ConversationReplayDiagnosticCode, u64> {
+        &self.counts
+    }
+
+    /// The first 100 retained detail facts in physical order.
+    pub(crate) fn details(&self) -> &[ConversationReplayDiagnosticDetail] {
+        &self.details
+    }
+
+    pub(crate) fn truncation(&self) -> Option<&ConversationReplayTruncationSummary> {
+        self.truncation.as_ref()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+}
+
+impl fmt::Debug for ConversationReplayDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConversationReplayDiagnostics")
+            .field("counts", &self.counts)
+            .field("retained_details", &self.details.len())
+            .field("truncation", &self.truncation)
+            .finish()
+    }
+}
+
+impl fmt::Display for ConversationReplayDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, (code, count)) in self.counts.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(", ")?;
+            }
+            write!(formatter, "{code}={count}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Redacted typed failure for one tolerant replay attempt.
+///
+/// Strict Header failures and bounded scan caps stop replay with this typed error. The variants
+/// carry no IDs, text, raw line, or path, so the derived `Debug` and the `Display` below are both
+/// redacted.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationReplayError {
+    HistoryTooLarge,
+    HeaderCorrupt,
+    UnsupportedFormatVersion,
+    MissingHeader,
+    LeaseMismatch,
+    InputChanged,
+    InputUnavailable,
+    CounterOverflow,
+    InvariantViolation,
+}
+
+impl fmt::Display for ConversationReplayError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::HistoryTooLarge => {
+                "conversation history exceeds the physical file or entry-count limit"
+            }
+            Self::HeaderCorrupt => "conversation header is corrupt",
+            Self::UnsupportedFormatVersion => {
+                "conversation header has an unsupported format version"
+            }
+            Self::MissingHeader => "conversation file does not contain a complete Header",
+            Self::LeaseMismatch => "conversation writable lease does not match the opened file",
+            Self::InputChanged => "conversation file changed after its metadata was read",
+            Self::InputUnavailable => "conversation replay input is unavailable",
+            Self::CounterOverflow => "conversation replay counter overflow",
+            Self::InvariantViolation => "conversation replay invariant was violated",
+        };
+        formatter.write_str(message)
+    }
+}
+
+fn map_replay_scan_error(error: ConversationScanError) -> ConversationReplayError {
+    match error {
+        // The wire boundary recipe/fixture maps both the 1 GiB physical file cap and the
+        // 1,000,000-complete-entry cap to the same typed HistoryTooLarge outcome.
+        ConversationScanError::FileTooLarge | ConversationScanError::HistoryTooLarge => {
+            ConversationReplayError::HistoryTooLarge
+        }
+        ConversationScanError::HeaderCorrupt { .. } => ConversationReplayError::HeaderCorrupt,
+        ConversationScanError::UnsupportedFormatVersion => {
+            ConversationReplayError::UnsupportedFormatVersion
+        }
+        ConversationScanError::MissingHeader => ConversationReplayError::MissingHeader,
+        ConversationScanError::LeaseMismatch => ConversationReplayError::LeaseMismatch,
+        ConversationScanError::InputChanged => ConversationReplayError::InputChanged,
+        ConversationScanError::InputUnavailable => ConversationReplayError::InputUnavailable,
+        ConversationScanError::CounterOverflow => ConversationReplayError::CounterOverflow,
+        ConversationScanError::InvariantViolation => ConversationReplayError::InvariantViolation,
+    }
+}
+
+/// One accepted entry plus the physical facts the replay projection needs.
+struct ScanEntry {
+    entry: Arc<StoredSessionEntry>,
+    location: ConversationPhysicalLocation,
+    /// Physical index among accepted entries; the semantic pass uses it to re-read an earlier
+    /// entry exactly (for Interaction request bodies) without cloning payloads.
+    index: usize,
+    /// The disconnected history-tree component this entry belongs to.
+    component: u64,
+}
+
+/// Physical scan state: first-valid identity reservation, component isolation, and the bounded
+/// structural diagnostics. The scanner remains the physical owner; this state only consumes its
+/// typed events.
+struct ReplayScanState {
+    reserved_ids: Vec<EntryId>,
+    reserved_set: BTreeSet<EntryId>,
+    entries: Vec<ScanEntry>,
+    /// EntryId to physical index into `entries`: every accepted entry gets exactly one index, so
+    /// ancestor/path lookups are O(log n) instead of rescanning the Vec for every ID. Bounded at
+    /// the 1,000,000-entry cap alongside the other per-entry state.
+    entry_index: BTreeMap<EntryId, usize>,
+    components: BTreeMap<EntryId, u64>,
+    next_component: u64,
+    canonical_component: Option<u64>,
+    diagnostics: ConversationReplayDiagnostics,
+    tail_action: Option<ConversationPartialTailAction>,
+    last_location: Option<ConversationPhysicalLocation>,
+}
+
+impl ReplayScanState {
+    fn new() -> Self {
+        Self {
+            reserved_ids: Vec::new(),
+            reserved_set: BTreeSet::new(),
+            entries: Vec::new(),
+            entry_index: BTreeMap::new(),
+            components: BTreeMap::new(),
+            next_component: 0,
+            canonical_component: None,
+            diagnostics: ConversationReplayDiagnostics::new(),
+            tail_action: None,
+            last_location: None,
+        }
+    }
+
+    fn record(
+        &mut self,
+        code: ConversationReplayDiagnosticCode,
+        location: ConversationPhysicalLocation,
+    ) {
+        self.diagnostics.record(code, location);
+    }
+
+    fn observe(&mut self, event: ConversationScanEvent) {
+        self.last_location = match &event {
+            ConversationScanEvent::Entry { location, .. }
+            | ConversationScanEvent::Fault { location, .. }
+            | ConversationScanEvent::PartialTail { location, .. } => Some(*location),
+        };
+        match event {
+            ConversationScanEvent::Entry {
+                location,
+                entry,
+                decode_facts,
+                ..
+            } => self.observe_entry(*entry, location, decode_facts),
+            ConversationScanEvent::Fault { location, fault } => {
+                self.record(replay_fault_code(fault), location);
+            }
+            ConversationScanEvent::PartialTail { location, action } => {
+                self.tail_action = Some(action);
+                self.record(ConversationReplayDiagnosticCode::PartialTail, location);
+            }
+        }
+    }
+
+    fn observe_entry(
+        &mut self,
+        entry: StoredSessionEntry,
+        location: ConversationPhysicalLocation,
+        decode_facts: ConversationDecodeFacts,
+    ) {
+        // Session mismatch was already rejected by the scanner before this event, so reservation
+        // happens only for first-valid, session-matching entries.
+        let entry_id = entry.entry_id();
+        if !self.reserved_set.insert(entry_id) {
+            self.record(ConversationReplayDiagnosticCode::DuplicateEntryId, location);
+            return;
+        }
+        self.reserved_ids.push(entry_id);
+
+        // The codec counted independently degradable contribution stamps on this exact line.
+        for _ in 0..decode_facts.invalid_contribution_stamps {
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidContributionStamp,
+                location,
+            );
+        }
+        for _ in 0..decode_facts.duplicate_contribution_stamps {
+            self.record(
+                ConversationReplayDiagnosticCode::DuplicateContributionStamp,
+                location,
+            );
+        }
+
+        let component = match entry.parent_id() {
+            None => {
+                let component = self.next_component;
+                self.next_component = self
+                    .next_component
+                    .checked_add(1)
+                    .expect("component counters cannot overflow");
+                if self.canonical_component.is_none() {
+                    self.canonical_component = Some(component);
+                } else {
+                    // A second root is isolated into its own component and diagnosed; the first
+                    // accepted root remains canonical.
+                    self.record(ConversationReplayDiagnosticCode::InvalidRelation, location);
+                }
+                component
+            }
+            Some(parent_id) if !self.reserved_set.contains(&parent_id) => {
+                self.record(ConversationReplayDiagnosticCode::MissingParent, location);
+                let component = self.next_component;
+                self.next_component = self
+                    .next_component
+                    .checked_add(1)
+                    .expect("component counters cannot overflow");
+                component
+            }
+            Some(parent_id) => *self
+                .components
+                .get(&parent_id)
+                .expect("a reserved parent always has a recorded component"),
+        };
+        self.components.insert(entry_id, component);
+        self.entry_index.insert(entry_id, self.entries.len());
+        self.entries.push(ScanEntry {
+            entry: Arc::new(entry),
+            location,
+            index: self.entries.len(),
+            component,
+        });
+    }
+
+    /// The selected path: the ancestor chain from the first accepted root to the physical-last
+    /// accepted entry of its canonical component. Isolated roots and orphans never appear.
+    ///
+    /// Each ancestor lookup resolves through the EntryId-to-index map, so a pathological 1 GiB
+    /// chain costs O(n log n) total instead of rescanning the accepted Vec for every ancestor.
+    fn selected_path(&self) -> (Vec<EntryId>, Option<EntryId>) {
+        let Some(canonical_component) = self.canonical_component else {
+            return (Vec::new(), None);
+        };
+        let leaf = self
+            .entries
+            .iter()
+            .rev()
+            .find(|scan_entry| scan_entry.component == canonical_component)
+            .expect("the canonical component has its first root as a member");
+        let mut path = Vec::new();
+        let mut current = Some(leaf.entry.entry_id());
+        while let Some(entry_id) = current {
+            path.push(entry_id);
+            let index = *self
+                .entry_index
+                .get(&entry_id)
+                .expect("every accepted entry has one physical index");
+            current = self.entries[index].entry.parent_id();
+        }
+        path.reverse();
+        (path, Some(leaf.entry.entry_id()))
+    }
+}
+
+fn replay_fault_code(fault: ConversationLineFault) -> ConversationReplayDiagnosticCode {
+    match fault {
+        ConversationLineFault::OversizedLine => ConversationReplayDiagnosticCode::OversizedLine,
+        ConversationLineFault::InvalidUtf8 => ConversationReplayDiagnosticCode::InvalidUtf8,
+        ConversationLineFault::MalformedJson => ConversationReplayDiagnosticCode::MalformedJson,
+        ConversationLineFault::InvalidEntry => ConversationReplayDiagnosticCode::InvalidEntry,
+        ConversationLineFault::UnknownRecordVariant => {
+            ConversationReplayDiagnosticCode::UnknownRecordVariant
+        }
+        ConversationLineFault::UnknownEntryVariant => {
+            ConversationReplayDiagnosticCode::UnknownEntryVariant
+        }
+        ConversationLineFault::SessionMismatch => ConversationReplayDiagnosticCode::SessionMismatch,
+    }
+}
+
+/// One assistant tool call expected by a pending Tool exchange, with the first valid terminal
+/// outcome. Owned by the selected-path sanitizer pass.
+struct ExpectedToolCall {
+    item_id: ItemId,
+    tool_call_id: ToolCallId,
+    terminal: Option<StoredToolOutcome>,
+}
+
+/// The model-visible pending Tool exchange owned by the selected-path sanitizer pass. Completed
+/// exchanges are emitted immediately in assistant call order; an exchange left open when a
+/// selected-path user/assistant/compaction or EOF arrives is excluded with one
+/// `invalid_tool_exchange` fact at the closing boundary. Off-path entries never create, close,
+/// complete, or replace this exchange (ADR 0124/0132 branch isolation).
+struct PendingToolExchange {
+    assistant_entry_id: EntryId,
+    assistant_message: ModelMessage,
+    expected: Vec<ExpectedToolCall>,
+}
+
+/// One sanitized stable unit over the selected path: the origin EntryId plus the model-visible
+/// messages it contributes. An ordinary User and a plain Assistant are units; a complete Tool
+/// exchange is one unit with the assistant origin; a rolling summary is the leading unit with
+/// the compaction entry origin. Tool results and Interaction/internal entries never get their
+/// own unit, so a marker naming one of them can never match a unit origin.
+struct ReplayUnit {
+    origin: EntryId,
+    messages: Vec<ModelMessage>,
+}
+
+/// One accepted interaction request fact available to later resolutions. The request body is not
+/// cloned: the resolution re-reads the exact earlier entry by physical index, so interaction
+/// state stays O(requests) with no payload duplication.
+struct AcceptedInteraction {
+    item_id: ItemId,
+    request_entry_index: usize,
+    resolved: bool,
+}
+
+/// One accepted assistant ToolCall fact keyed by its exact (ItemId, ToolCallId) pair: the owning
+/// assistant entry plus the first valid terminal outcome. Item identities are first-valid
+/// file-wide, so each pair resolves to at most one accepted call fact.
+struct AcceptedToolCallFact {
+    assistant_entry_id: EntryId,
+    terminal: Option<StoredToolOutcome>,
+}
+
+/// The per-tool classification of an invalid ToolMessage fact, owned by the semantic facts pass.
+/// The pass records exactly one owning diagnostic per fact; the selected-path sanitizer pass
+/// consumes the class so it can skip invalid selected facts without re-emitting diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InvalidToolFactKind {
+    /// No accepted assistant ToolCall matches the result's (ItemId, ToolCallId) pair.
+    Orphan,
+    /// The result's ToolCallId matches an accepted call under a different ItemId.
+    IdentityConflict,
+    /// A first valid terminal outcome already won for the matching accepted call.
+    DuplicateTerminal,
+    /// The first terminal outcome for the matching accepted call is Abandoned.
+    AbandonedFirst,
+}
+
+/// One invalid ToolMessage fact plus its owning assistant exchange when that owner is uniquely
+/// identified. `AbandonedFirst` always carries its exact-pair owner with `invalidates_owner`
+/// set; `DuplicateTerminal` carries its exact-pair owner without invalidation; and
+/// `IdentityConflict` carries the unique live candidate when exactly one exists, with
+/// invalidation only when that candidate's exact call fact has no terminal yet — a candidate
+/// that already has a terminal retains its valid exchange and only the malformed fact is
+/// diagnosed. `Orphan` and ambiguous (multi-candidate) `IdentityConflict` facts carry `None`
+/// and never invalidate. The selected-path sanitizer pass consumes the fact so it can clear
+/// its pending exchange only when `invalidates_owner` is set and the owner matches the pending
+/// exchange's assistant entry: a fact for an already-closed, other, retained-valid, or
+/// off-path exchange never clears the current pending exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InvalidToolFact {
+    kind: InvalidToolFactKind,
+    owner: Option<EntryId>,
+    /// True only when the semantic facts pass invalidated `owner`'s exchange (removed its
+    /// calls from the live-call index and marked the exchange invalidated). The sanitizer
+    /// pass clears a matching pending exchange only for facts with this set.
+    invalidates_owner: bool,
+}
+
+/// The all-history semantic facts one tolerant replay owns. The semantic facts pass produces
+/// these in physical order over every accepted entry; the selected-path sanitizer pass consumes
+/// them so invalid selected entries and tool facts are skipped without duplicate diagnostics.
+struct SemanticFacts {
+    /// First-valid semantic item ids in physical order over all accepted entries.
+    historical_item_ids: Vec<ItemId>,
+    /// EntryId → the item ids accepted (first-valid, non-duplicate) inside that entry, in
+    /// content order. The sanitizer pass rebuilds only these items; entries with no accepted
+    /// items yield no unit and no re-emitted relation diagnostic.
+    valid_items_by_entry: BTreeMap<EntryId, Vec<ItemId>>,
+    /// Tool entry id → the first valid completed terminal outcome accepted for its exchange.
+    valid_tool_terminals: BTreeMap<EntryId, StoredToolOutcome>,
+    /// Tool entry id → the invalid fact class plus its owning exchange; the sanitizer pass
+    /// skips these facts and clears its pending exchange only for a matching invalidated
+    /// owner.
+    invalid_tool_facts: BTreeMap<EntryId, InvalidToolFact>,
+}
+
+/// The all-history semantic facts pass over every accepted entry in physical order.
+///
+/// This pass is deliberately separate from the physical scan and from the live reducer: live
+/// Turn/ID rules are strict, replay validates relations tolerantly, isolates every invalid fact
+/// with exactly one owning diagnostic, and continues. It owns the first-valid item index (and
+/// therefore `historical_item_ids`), the accepted ToolCall facts by (ItemId, ToolCallId) plus
+/// the bounded live-call index for response-local ToolCallId reuse, the item set for
+/// Interaction requests, the all-history Tool outcome validity (first valid terminal outcome
+/// wins per accepted call; exactly one `invalid_tool_exchange` diagnostic for every orphan,
+/// identity-conflicting, duplicate-terminal, or abandoned-first result fact, each carrying its
+/// owning exchange when uniquely identified), and the Interaction request/resolution relation.
+/// It never maintains a model-visible pending exchange and never builds stable units; those
+/// belong to the selected-path sanitizer pass, which consumes the per-entry and per-tool
+/// validity facts exposed in `SemanticFacts`.
+struct ReplaySemanticFactsPass<'a> {
+    entries: &'a [ScanEntry],
+    seen_items: BTreeSet<ItemId>,
+    historical_item_ids: Vec<ItemId>,
+    /// Accepted ToolCall items; an Interaction request must reference one of these.
+    tool_call_items: BTreeSet<ItemId>,
+    /// Accepted assistant ToolCall facts by exact (ItemId, ToolCallId) pair.
+    call_facts: BTreeMap<(ItemId, ToolCallId), AcceptedToolCallFact>,
+    /// Live accepted assistant calls by ToolCallId, as exact (ItemId, EntryId) pairs. Live
+    /// means accepted and not owned by an invalidated exchange; terminal calls are retained
+    /// because ToolCallId is response-local: a completed call still constrains later conflict
+    /// resolution, and retiring it on completion would let a malformed result with the same
+    /// ToolCallId invalidate an unrelated live exchange that legally reused the id.
+    /// Identity-conflict resolution examines only one ToolCallId's live candidates, so under
+    /// response-local ToolCallId reuse it never rescans the history and stays bounded by the
+    /// accepted calls.
+    live_calls_by_id: BTreeMap<ToolCallId, BTreeSet<(ItemId, EntryId)>>,
+    /// Assistant entry → its accepted (ItemId, ToolCallId) calls, for removal from
+    /// `live_calls_by_id` when the exchange is invalidated.
+    accepted_calls_by_assistant: BTreeMap<EntryId, BTreeSet<(ItemId, ToolCallId)>>,
+    /// Assistant entries whose exchange was invalidated by an identity-conflicting or
+    /// abandoned-first result fact; a later result for one of their exact pairs is a late
+    /// orphan fact and never re-enters ToolCallId conflict matching.
+    invalidated_exchanges: BTreeSet<EntryId>,
+    valid_items_by_entry: BTreeMap<EntryId, Vec<ItemId>>,
+    valid_tool_terminals: BTreeMap<EntryId, StoredToolOutcome>,
+    invalid_tool_facts: BTreeMap<EntryId, InvalidToolFact>,
+    interactions: BTreeMap<RequestId, AcceptedInteraction>,
+    diagnostics: &'a mut ConversationReplayDiagnostics,
+}
+
+impl ReplaySemanticFactsPass<'_> {
+    fn record(
+        &mut self,
+        code: ConversationReplayDiagnosticCode,
+        location: ConversationPhysicalLocation,
+    ) {
+        self.diagnostics.record(code, location);
+    }
+
+    /// Runs the pass over all accepted entries in physical order and returns the semantic facts
+    /// the selected-path sanitizer pass consumes.
+    fn run(mut self) -> SemanticFacts {
+        for scan_entry in self.entries {
+            self.project_entry(scan_entry);
+        }
+        SemanticFacts {
+            historical_item_ids: self.historical_item_ids,
+            valid_items_by_entry: self.valid_items_by_entry,
+            valid_tool_terminals: self.valid_tool_terminals,
+            invalid_tool_facts: self.invalid_tool_facts,
+        }
+    }
+
+    fn project_entry(&mut self, scan_entry: &ScanEntry) {
+        match scan_entry.entry.body() {
+            StoredEntryBody::UserMessage(message) => self.project_user(scan_entry, message),
+            StoredEntryBody::AssistantMessage(message) => {
+                self.project_assistant(scan_entry, message);
+            }
+            StoredEntryBody::ToolMessage(message) => self.project_tool(scan_entry, message),
+            StoredEntryBody::InteractionRequested(request) => {
+                self.project_interaction_request(scan_entry, request);
+            }
+            StoredEntryBody::InteractionResolved(resolution) => {
+                self.project_interaction_resolution(scan_entry, resolution);
+            }
+            StoredEntryBody::Compaction(_) => {}
+        }
+    }
+
+    fn project_user(&mut self, scan_entry: &ScanEntry, message: &StoredUserMessage) {
+        if !self.seen_items.insert(message.item_id()) {
+            // A duplicate item identity across User/Assistant content is isolated: the entry
+            // yields no semantic items.
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidRelation,
+                scan_entry.location,
+            );
+            return;
+        }
+        self.historical_item_ids.push(message.item_id());
+        self.valid_items_by_entry
+            .insert(scan_entry.entry.entry_id(), vec![message.item_id()]);
+    }
+
+    fn project_assistant(&mut self, scan_entry: &ScanEntry, message: &StoredAssistantMessage) {
+        let mut valid_items = Vec::with_capacity(message.content().len());
+        for item in message.content() {
+            if !self.seen_items.insert(item.item_id()) {
+                // Duplicate content items are isolated one by one; each gets one owning fact.
+                self.record(
+                    ConversationReplayDiagnosticCode::InvalidRelation,
+                    scan_entry.location,
+                );
+                continue;
+            }
+            self.historical_item_ids.push(item.item_id());
+            valid_items.push(item.item_id());
+            if let StoredAssistantContent::ToolCall {
+                item_id,
+                tool_call_id,
+                ..
+            } = item
+            {
+                // The call is an accepted ToolCall fact for later Interaction requests and for
+                // the first-valid-terminal outcome resolution. It enters the live-call index
+                // and remains there until its exchange is invalidated; terminal calls are
+                // retained because ToolCallId is response-local.
+                self.tool_call_items.insert(*item_id);
+                self.live_calls_by_id
+                    .entry(tool_call_id.clone())
+                    .or_default()
+                    .insert((*item_id, scan_entry.entry.entry_id()));
+                self.accepted_calls_by_assistant
+                    .entry(scan_entry.entry.entry_id())
+                    .or_default()
+                    .insert((*item_id, tool_call_id.clone()));
+                self.call_facts.insert(
+                    (*item_id, tool_call_id.clone()),
+                    AcceptedToolCallFact {
+                        assistant_entry_id: scan_entry.entry.entry_id(),
+                        terminal: None,
+                    },
+                );
+            }
+        }
+        if !valid_items.is_empty() {
+            self.valid_items_by_entry
+                .insert(scan_entry.entry.entry_id(), valid_items);
+        }
+    }
+
+    /// Invalidates one assistant exchange: marks it, removes every one of its accepted calls
+    /// from the live-call index, and leaves its exact-pair facts in place so a later result
+    /// for one of those pairs is classified as a late orphan instead of re-entering
+    /// ToolCallId conflict matching.
+    fn invalidate_exchange(&mut self, assistant_entry_id: EntryId) {
+        if !self.invalidated_exchanges.insert(assistant_entry_id) {
+            return;
+        }
+        let Some(calls) = self.accepted_calls_by_assistant.remove(&assistant_entry_id) else {
+            return;
+        };
+        for (item_id, tool_call_id) in calls {
+            self.retire_call(item_id, &tool_call_id, assistant_entry_id);
+        }
+    }
+
+    /// Removes one accepted call from the live-call index when its exchange is invalidated.
+    /// Terminal calls are retained: ToolCallId is response-local, so a completed call still
+    /// constrains later conflict resolution. The exact-pair fact registry is untouched.
+    fn retire_call(
+        &mut self,
+        item_id: ItemId,
+        tool_call_id: &ToolCallId,
+        assistant_entry_id: EntryId,
+    ) {
+        if let Some(live) = self.live_calls_by_id.get_mut(tool_call_id) {
+            live.remove(&(item_id, assistant_entry_id));
+        }
+    }
+
+    fn project_tool(&mut self, scan_entry: &ScanEntry, message: &StoredToolMessage) {
+        let location = scan_entry.location;
+        let item = message.item_id();
+        let call = message.tool_call_id();
+
+        // Exact (ItemId, ToolCallId) resolution first: item identities are first-valid
+        // file-wide, so an exact pair belongs to at most one accepted call. A result whose
+        // exact pair exists but whose exchange was already invalidated is a late fact for a
+        // dead exchange: it is an orphan immediately and never falls through to the
+        // ToolCallId conflict index, so it can never invalidate another assistant exchange
+        // that legally reused the same ToolCallId in a different response.
+        match self.call_facts.get(&(item, call.clone())) {
+            Some(fact)
+                if !self
+                    .invalidated_exchanges
+                    .contains(&fact.assistant_entry_id) =>
+            {
+                let assistant_entry_id = fact.assistant_entry_id;
+                let terminal_taken = fact.terminal.is_some();
+                if terminal_taken {
+                    // First valid terminal outcome already won; the later result is skipped.
+                    self.record(
+                        ConversationReplayDiagnosticCode::InvalidToolExchange,
+                        location,
+                    );
+                    self.invalid_tool_facts.insert(
+                        scan_entry.entry.entry_id(),
+                        InvalidToolFact {
+                            kind: InvalidToolFactKind::DuplicateTerminal,
+                            owner: Some(assistant_entry_id),
+                            invalidates_owner: false,
+                        },
+                    );
+                } else {
+                    match message.outcome() {
+                        StoredToolOutcome::Abandoned { .. } => {
+                            // Abandoned-first terminal invalidates the whole exchange.
+                            self.record(
+                                ConversationReplayDiagnosticCode::InvalidToolExchange,
+                                location,
+                            );
+                            self.invalidate_exchange(assistant_entry_id);
+                            self.invalid_tool_facts.insert(
+                                scan_entry.entry.entry_id(),
+                                InvalidToolFact {
+                                    kind: InvalidToolFactKind::AbandonedFirst,
+                                    owner: Some(assistant_entry_id),
+                                    invalidates_owner: true,
+                                },
+                            );
+                        }
+                        StoredToolOutcome::Completed { .. } => {
+                            let fact = self
+                                .call_facts
+                                .get_mut(&(item, call.clone()))
+                                .expect("the live exact call fact is still present");
+                            fact.terminal = Some(message.outcome().clone());
+                            // The call stays in the live-call index: ToolCallId is
+                            // response-local, so the completed call still constrains later
+                            // no-exact conflict resolution.
+                            self.valid_tool_terminals
+                                .insert(scan_entry.entry.entry_id(), message.outcome().clone());
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                // The exact pair exists but its owning exchange is already invalidated: the
+                // result is a late fact for a closed exchange and is isolated as an orphan.
+                // It must not fall through to ToolCallId conflict matching.
+                self.record(
+                    ConversationReplayDiagnosticCode::InvalidToolExchange,
+                    location,
+                );
+                self.invalid_tool_facts.insert(
+                    scan_entry.entry.entry_id(),
+                    InvalidToolFact {
+                        kind: InvalidToolFactKind::Orphan,
+                        owner: None,
+                        invalidates_owner: false,
+                    },
+                );
+            }
+            None => {
+                // No accepted call matches the exact pair: resolve by ToolCallId against the
+                // live calls (every accepted call whose owning exchange is not invalidated,
+                // including terminal calls). The scan is bounded to two candidates because
+                // only the unique single candidate can be invalidated; an ambiguous
+                // multi-candidate conflict never arbitrarily invalidates an exchange. A
+                // single terminal candidate is never invalidated either: its exchange stays
+                // valid and only the malformed fact is diagnosed.
+                let candidates: Vec<(ItemId, EntryId)> = self
+                    .live_calls_by_id
+                    .get(call)
+                    .into_iter()
+                    .flat_map(|live| live.iter())
+                    .filter(|(candidate_item, _)| *candidate_item != item)
+                    .take(2)
+                    .copied()
+                    .collect();
+                self.record(
+                    ConversationReplayDiagnosticCode::InvalidToolExchange,
+                    location,
+                );
+                match candidates.as_slice() {
+                    [] => {
+                        self.invalid_tool_facts.insert(
+                            scan_entry.entry.entry_id(),
+                            InvalidToolFact {
+                                kind: InvalidToolFactKind::Orphan,
+                                owner: None,
+                                invalidates_owner: false,
+                            },
+                        );
+                    }
+                    [(candidate_item, assistant_entry_id)] => {
+                        // The unique live candidate owns the fact. Invalidate its exchange
+                        // only when that candidate's exact call fact has no terminal yet; a
+                        // candidate that already has a terminal retains its valid exchange
+                        // and only the malformed fact is diagnosed.
+                        let has_terminal = self
+                            .call_facts
+                            .get(&(*candidate_item, call.clone()))
+                            .is_some_and(|fact| fact.terminal.is_some());
+                        if !has_terminal {
+                            self.invalidate_exchange(*assistant_entry_id);
+                        }
+                        self.invalid_tool_facts.insert(
+                            scan_entry.entry.entry_id(),
+                            InvalidToolFact {
+                                kind: InvalidToolFactKind::IdentityConflict,
+                                owner: Some(*assistant_entry_id),
+                                invalidates_owner: !has_terminal,
+                            },
+                        );
+                    }
+                    _ => {
+                        // Multiple live candidates under one ToolCallId: the owner is
+                        // ambiguous, so no exchange is arbitrarily invalidated.
+                        self.invalid_tool_facts.insert(
+                            scan_entry.entry.entry_id(),
+                            InvalidToolFact {
+                                kind: InvalidToolFactKind::IdentityConflict,
+                                owner: None,
+                                invalidates_owner: false,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn project_interaction_request(
+        &mut self,
+        scan_entry: &ScanEntry,
+        request: &StoredInteractionRequest,
+    ) {
+        let location = scan_entry.location;
+        if self.interactions.contains_key(&request.request_id()) {
+            // Duplicate RequestId: first valid wins.
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidInteractionRelation,
+                location,
+            );
+            return;
+        }
+        if !self.tool_call_items.contains(&request.item_id()) {
+            // The request must reference an accepted ToolCall.
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidInteractionRelation,
+                location,
+            );
+            return;
+        }
+        self.interactions.insert(
+            request.request_id(),
+            AcceptedInteraction {
+                item_id: request.item_id(),
+                request_entry_index: scan_entry.index,
+                resolved: false,
+            },
+        );
+    }
+
+    fn project_interaction_resolution(
+        &mut self,
+        scan_entry: &ScanEntry,
+        resolution: &StoredInteractionResolution,
+    ) {
+        let location = scan_entry.location;
+        // Resolve the interaction fact first so no mutable borrow of `self.interactions` spans
+        // the diagnostics and exact-request-body lookups.
+        let valid = match self.interactions.get_mut(&resolution.request_id()) {
+            None => {
+                // Orphan resolution: no earlier request with this RequestId.
+                false
+            }
+            Some(interaction) => {
+                if interaction.item_id != resolution.item_id() {
+                    false
+                } else if interaction.resolved {
+                    // First terminal resolution wins; later resolutions are isolated.
+                    false
+                } else {
+                    let StoredEntryBody::InteractionRequested(stored_request) =
+                        self.entries[interaction.request_entry_index].entry.body()
+                    else {
+                        unreachable!(
+                            "an accepted interaction request entry is InteractionRequested"
+                        )
+                    };
+                    let valid = validate_interaction_resolution(
+                        stored_request.request(),
+                        resolution.resolution(),
+                    );
+                    if valid {
+                        interaction.resolved = true;
+                    }
+                    valid
+                }
+            }
+        };
+        if !valid {
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidInteractionRelation,
+                location,
+            );
+        }
+    }
+}
+
+/// The selected-path-only sanitizer pass over accepted entries in physical order.
+///
+/// Only entries whose EntryId is in the canonical selected path are projected: off-path branch
+/// User/Assistant/Tool/Compaction entries never mutate this pass's pending exchange, stable
+/// units, or sanitized messages (ADR 0124/0132 branch isolation). It owns the model-visible
+/// stable units: a selected-path ordinary User and a plain Assistant are units; a pending Tool
+/// exchange opens only for a selected-path Assistant with accepted ToolCall items and is
+/// completed only by selected-path Tool children; an exchange left open when a selected-path
+/// User/Assistant/Compaction or EOF arrives is excluded with one `invalid_tool_exchange` fact
+/// at the closing boundary; a completed exchange becomes one stable unit in assistant call
+/// order. Compaction markers are interpreted against the current stable-unit origins per
+/// ADR 0132: `Some(id)` is valid only when it exactly matches a current unit origin at index >
+/// 0, and `None` only when the current effective units are non-empty. Interaction entries have
+/// no model effect here. Entries the semantic facts pass marked invalid are skipped without
+/// re-emitting their diagnostics; a skipped invalid entry never closes an unfinished selected
+/// exchange. An invalid selected Tool fact clears the pending exchange only when the semantic
+/// facts pass invalidated its owner and that owner matches the pending exchange's assistant
+/// entry (a fact for an already-closed, other, retained-valid, or off-path exchange never
+/// clears it); an orphan, duplicate-terminal, or ambiguous conflict fact never mutates the
+/// pending exchange. A globally valid first-terminal selected Tool fact
+/// that is not expected by the current pending exchange owns exactly one
+/// `invalid_tool_exchange` fact at its own location and leaves the pending exchange untouched.
+struct ReplaySanitizerPass<'a> {
+    entries: &'a [ScanEntry],
+    path_members: &'a BTreeSet<EntryId>,
+    facts: &'a SemanticFacts,
+    units: Vec<ReplayUnit>,
+    pending_exchange: Option<PendingToolExchange>,
+    diagnostics: &'a mut ConversationReplayDiagnostics,
+}
+
+impl ReplaySanitizerPass<'_> {
+    fn record(
+        &mut self,
+        code: ConversationReplayDiagnosticCode,
+        location: ConversationPhysicalLocation,
+    ) {
+        self.diagnostics.record(code, location);
+    }
+
+    /// Runs the pass over the canonical selected-path entries in physical order and returns the
+    /// flattened sanitized messages of the final stable units.
+    fn run(&mut self, eof_location: ConversationPhysicalLocation) -> Vec<ModelMessage> {
+        for scan_entry in self.entries {
+            if self.path_members.contains(&scan_entry.entry.entry_id()) {
+                self.project_entry(scan_entry);
+            }
+        }
+        self.finish(eof_location)
+    }
+
+    fn project_entry(&mut self, scan_entry: &ScanEntry) {
+        match scan_entry.entry.body() {
+            StoredEntryBody::UserMessage(message) => self.project_user(scan_entry, message),
+            StoredEntryBody::AssistantMessage(message) => {
+                self.project_assistant(scan_entry, message);
+            }
+            StoredEntryBody::ToolMessage(message) => self.project_tool(scan_entry, message),
+            StoredEntryBody::InteractionRequested(_) | StoredEntryBody::InteractionResolved(_) => {
+                // Interactions have no model effect in the sanitized projection.
+            }
+            StoredEntryBody::Compaction(stored) => self.project_compaction(scan_entry, stored),
+        }
+    }
+
+    fn project_user(&mut self, scan_entry: &ScanEntry, message: &StoredUserMessage) {
+        if !self
+            .facts
+            .valid_items_by_entry
+            .contains_key(&scan_entry.entry.entry_id())
+        {
+            // Duplicate item identity: the semantic facts pass owns the diagnostic; the entry
+            // yields no unit and must not close an unfinished exchange or emit an extra
+            // incomplete diagnostic.
+            return;
+        }
+        // Any selected-path user/assistant/compaction arrival closes an unfinished exchange; a
+        // complete exchange emitted here keeps its messages ahead of this entry's. Only a
+        // semantically valid projected User reaches this boundary.
+        self.close_exchange(scan_entry.location);
+        self.units.push(ReplayUnit {
+            origin: scan_entry.entry.entry_id(),
+            messages: vec![ModelMessage::canonical_user(message.content().clone())],
+        });
+    }
+
+    fn project_assistant(&mut self, scan_entry: &ScanEntry, message: &StoredAssistantMessage) {
+        let Some(valid_items) = self
+            .facts
+            .valid_items_by_entry
+            .get(&scan_entry.entry.entry_id())
+        else {
+            // Every content item was invalid: the message yields no unit at all; the semantic
+            // facts pass owns the relation diagnostics. The invalid entry must not close an
+            // unfinished exchange or emit an extra incomplete diagnostic.
+            return;
+        };
+        let mut content = Vec::with_capacity(message.content().len());
+        let mut expected = Vec::new();
+        for item in message.content() {
+            if !valid_items.contains(&item.item_id()) {
+                continue;
+            }
+            match item {
+                StoredAssistantContent::Reasoning { content: value, .. } => {
+                    content.push(ModelAssistantContent::reasoning(value.clone()));
+                }
+                StoredAssistantContent::Text { text, .. } => {
+                    let Ok(text) = ModelAssistantContent::text(text.clone()) else {
+                        // The codec already validated the stored text; this cannot fail.
+                        continue;
+                    };
+                    content.push(text);
+                }
+                StoredAssistantContent::ToolCall {
+                    item_id,
+                    tool_call_id,
+                    name,
+                    arguments,
+                } => {
+                    content.push(ModelAssistantContent::tool_call(
+                        tool_call_id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                    ));
+                    expected.push(ExpectedToolCall {
+                        item_id: *item_id,
+                        tool_call_id: tool_call_id.clone(),
+                        terminal: None,
+                    });
+                }
+            }
+        }
+        if content.is_empty() {
+            // An empty projected message yields no unit and does not close an unfinished
+            // exchange.
+            return;
+        }
+        let Ok(projected) = ModelMessage::assistant(content.into()) else {
+            return;
+        };
+        // Only a semantically valid projected Assistant closes an unfinished selected-path
+        // exchange.
+        self.close_exchange(scan_entry.location);
+        if expected.is_empty() {
+            // A plain Assistant is its own unit.
+            self.units.push(ReplayUnit {
+                origin: scan_entry.entry.entry_id(),
+                messages: vec![projected],
+            });
+        } else {
+            // The message is held until its exchange completes or a selected-path
+            // user/assistant/compaction arrival or EOF closes it.
+            self.pending_exchange = Some(PendingToolExchange {
+                assistant_entry_id: scan_entry.entry.entry_id(),
+                assistant_message: projected,
+                expected,
+            });
+        }
+    }
+
+    fn project_tool(&mut self, scan_entry: &ScanEntry, message: &StoredToolMessage) {
+        if let Some(outcome) = self
+            .facts
+            .valid_tool_terminals
+            .get(&scan_entry.entry.entry_id())
+        {
+            // First valid terminal outcome: complete the pending selected exchange when it
+            // expects this (ItemId, ToolCallId) pair.
+            let Some(exchange) = self.pending_exchange.as_mut() else {
+                // Valid fact whose exchange already closed on the selected path (closure after
+                // a late result): it is not model-visible and owns exactly one
+                // `invalid_tool_exchange` fact at this tool location.
+                self.record(
+                    ConversationReplayDiagnosticCode::InvalidToolExchange,
+                    scan_entry.location,
+                );
+                return;
+            };
+            let Some(index) = exchange.expected.iter().position(|expected| {
+                expected.item_id == message.item_id()
+                    && expected.tool_call_id == *message.tool_call_id()
+            }) else {
+                // Valid fact belonging to another exchange (already closed or off-path in the
+                // selected projection): it is not model-visible and owns exactly one
+                // `invalid_tool_exchange` fact at this tool location. The current pending
+                // exchange stays untouched.
+                self.record(
+                    ConversationReplayDiagnosticCode::InvalidToolExchange,
+                    scan_entry.location,
+                );
+                return;
+            };
+            exchange.expected[index].terminal = Some(outcome.clone());
+            if exchange
+                .expected
+                .iter()
+                .all(|expected| expected.terminal.is_some())
+            {
+                let exchange = self
+                    .pending_exchange
+                    .take()
+                    .expect("the completed exchange is still pending");
+                self.emit_exchange(exchange);
+            }
+            return;
+        }
+        let Some(fact) = self
+            .facts
+            .invalid_tool_facts
+            .get(&scan_entry.entry.entry_id())
+        else {
+            unreachable!("every accepted tool entry is classified by the facts pass")
+        };
+        match fact.kind {
+            InvalidToolFactKind::IdentityConflict | InvalidToolFactKind::AbandonedFirst => {
+                // The semantic facts pass owns the fact's diagnostic. The fact clears the
+                // pending exchange only when the owner was actually invalidated by the
+                // semantic facts pass and matches the pending exchange's assistant entry; a
+                // fact for an already-closed, other, retained-valid (terminal candidate), or
+                // off-path exchange never clears the current pending exchange.
+                if fact.invalidates_owner {
+                    if let Some(owner) = fact.owner {
+                        if self
+                            .pending_exchange
+                            .as_ref()
+                            .is_some_and(|exchange| exchange.assistant_entry_id == owner)
+                        {
+                            self.pending_exchange = None;
+                        }
+                    }
+                }
+            }
+            InvalidToolFactKind::Orphan | InvalidToolFactKind::DuplicateTerminal => {
+                // These facts never mutate the pending exchange.
+            }
+        }
+    }
+
+    /// Closes an unfinished exchange at a selected-path user/assistant/compaction arrival or
+    /// EOF. An incomplete exchange is excluded with one `invalid_tool_exchange` fact at the
+    /// closing location; late selected-path results for the closed exchange are isolated: an
+    /// invalid fact owns its fact diagnostic, and a globally valid fact owns one sanitizer
+    /// diagnostic at its own tool location, leaving any current pending exchange untouched.
+    fn close_exchange(&mut self, closing_location: ConversationPhysicalLocation) {
+        let Some(exchange) = self.pending_exchange.take() else {
+            return;
+        };
+        if exchange
+            .expected
+            .iter()
+            .all(|expected| expected.terminal.is_some())
+        {
+            self.emit_exchange(exchange);
+            return;
+        }
+        self.record(
+            ConversationReplayDiagnosticCode::InvalidToolExchange,
+            closing_location,
+        );
+        // The exchange is dropped; late selected-path results for it are isolated facts with
+        // their own diagnostics and never complete or clear a later pending exchange.
+    }
+
+    /// Emits a completed exchange in assistant call order as one stable unit. The exchange's
+    /// assistant entry is always on the selected path: the sanitizer pass opens pending
+    /// exchanges only for selected-path assistants.
+    fn emit_exchange(&mut self, exchange: PendingToolExchange) {
+        let mut messages = vec![exchange.assistant_message];
+        for expected in &exchange.expected {
+            let StoredToolOutcome::Completed { content, .. } = expected
+                .terminal
+                .as_ref()
+                .expect("a completed exchange has every terminal outcome")
+            else {
+                unreachable!("abandoned-first never leaves a completed exchange")
+            };
+            messages.push(ModelMessage::tool_result(
+                expected.tool_call_id.clone(),
+                content.clone(),
+            ));
+        }
+        self.units.push(ReplayUnit {
+            origin: exchange.assistant_entry_id,
+            messages,
+        });
+    }
+
+    /// Applies one recorded Compaction to the current stable units per ADR 0132. A valid marker
+    /// exactly matches a current unit origin at index > 0; the units are then replaced by
+    /// `[new summary] + units[index..]`. `None` is valid only when the current effective units
+    /// are non-empty and replaces them with the summary alone. Every other marker (first unit,
+    /// ToolResult/internal entry, missing/orphan/ignored entry, already-removed unit, or a
+    /// future entry) is invalid and has no effect, with one owning diagnostic.
+    fn project_compaction(&mut self, scan_entry: &ScanEntry, stored: &StoredCompaction) {
+        let Ok(summary) = ModelMessage::rolling_summary(stored.summary().into()) else {
+            // The codec already validated the summary text; defensively isolate the marker.
+            // The compaction is still a selected-path boundary: it closes an unfinished
+            // exchange before recording the invalid marker.
+            self.close_exchange(scan_entry.location);
+            self.record(
+                ConversationReplayDiagnosticCode::InvalidCompactionMarker,
+                scan_entry.location,
+            );
+            return;
+        };
+        // The summary is constructed and validated first; the compaction then closes any
+        // unfinished exchange before either a valid or an invalid marker is applied.
+        self.close_exchange(scan_entry.location);
+        let summary_unit = ReplayUnit {
+            origin: scan_entry.entry.entry_id(),
+            messages: vec![summary],
+        };
+        match stored.first_kept_entry_id() {
+            None => {
+                if self.units.is_empty() {
+                    // `None` covers all units only when the effective conversation is non-empty.
+                    self.record(
+                        ConversationReplayDiagnosticCode::InvalidCompactionMarker,
+                        scan_entry.location,
+                    );
+                    return;
+                }
+                self.units = vec![summary_unit];
+            }
+            Some(marker) => {
+                let Some(index) = self.units.iter().position(|unit| unit.origin == marker) else {
+                    self.record(
+                        ConversationReplayDiagnosticCode::InvalidCompactionMarker,
+                        scan_entry.location,
+                    );
+                    return;
+                };
+                if index == 0 {
+                    // The marker must not point at the leading unit.
+                    self.record(
+                        ConversationReplayDiagnosticCode::InvalidCompactionMarker,
+                        scan_entry.location,
+                    );
+                    return;
+                }
+                let retained = self.units.split_off(index);
+                self.units = vec![summary_unit];
+                self.units.extend(retained);
+            }
+        }
+    }
+
+    /// EOF: closes any unfinished selected-path exchange and flattens the final stable units.
+    fn finish(&mut self, eof_location: ConversationPhysicalLocation) -> Vec<ModelMessage> {
+        self.close_exchange(eof_location);
+        std::mem::take(&mut self.units)
+            .into_iter()
+            .flat_map(|unit| unit.messages)
+            .collect()
+    }
+}
+/// Validates one recorded Interaction resolution against its exact earlier request body using
+/// the Tools/UserQuestion owner validators. `Cancelled` is a valid owner closure for every
+/// request family; every other family must match and pass the owner value check.
+fn validate_interaction_resolution(
+    request: &StoredInteractionRequestBody,
+    resolution: &StoredInteractionResolutionBody,
+) -> bool {
+    match (request, resolution) {
+        (
+            StoredInteractionRequestBody::ToolApproval(view),
+            StoredInteractionResolutionBody::ToolApproval(resolution),
+        ) => view.validate_recorded_resolution(*resolution).is_ok(),
+        (
+            StoredInteractionRequestBody::UserQuestion(request),
+            StoredInteractionResolutionBody::UserAnswer(answer),
+        ) => request.validate_answer(answer.clone()).is_ok(),
+        (_, StoredInteractionResolutionBody::Cancelled(_)) => true,
+        _ => false,
+    }
+}
+
+/// The cold, tolerant replay result owned by Conversation Storage.
+///
+/// `current_turn` is deliberately not reconstructed: replay rebuilds conversation facts only, so
+/// the view exposes the explicit cold-state fact `None`.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+#[derive(Clone)]
+pub(crate) struct ReplayedConversationView {
+    header: SessionHeader,
+    accepted_entries: Arc<[Arc<StoredSessionEntry>]>,
+    selected_path: Arc<[EntryId]>,
+    selected_head: Option<EntryId>,
+    reserved_ids: Arc<[EntryId]>,
+    sanitized_messages: Arc<[ModelMessage]>,
+    historical_item_ids: Arc<[ItemId]>,
+    diagnostics: ConversationReplayDiagnostics,
+    tail_action: Option<ConversationPartialTailAction>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+impl ReplayedConversationView {
+    pub(crate) fn header(&self) -> &SessionHeader {
+        &self.header
+    }
+
+    /// Accepted entries in physical order: every first-valid, session-matching decoded entry.
+    pub(crate) fn accepted_entries(&self) -> &[Arc<StoredSessionEntry>] {
+        &self.accepted_entries
+    }
+
+    pub(crate) fn accepted_entry_ids(&self) -> Vec<EntryId> {
+        self.accepted_entries
+            .iter()
+            .map(|entry| entry.entry_id())
+            .collect()
+    }
+
+    /// The selected root-to-leaf path of the canonical component, in path order.
+    pub(crate) fn selected_path(&self) -> &[EntryId] {
+        &self.selected_path
+    }
+
+    /// The physical-last leaf of the canonical component.
+    pub(crate) fn selected_head(&self) -> Option<EntryId> {
+        self.selected_head
+    }
+
+    /// Every first-valid accepted EntryId in physical order; this seeds the future collision
+    /// guard so later appends can never reuse a replayed identity.
+    pub(crate) fn reserved_ids(&self) -> &[EntryId] {
+        &self.reserved_ids
+    }
+
+    pub(crate) fn sanitized_messages(&self) -> &[ModelMessage] {
+        &self.sanitized_messages
+    }
+
+    /// Historical item ids in physical order over all accepted entries.
+    pub(crate) fn historical_item_ids(&self) -> &[ItemId] {
+        &self.historical_item_ids
+    }
+
+    pub(crate) fn diagnostics(&self) -> &ConversationReplayDiagnostics {
+        &self.diagnostics
+    }
+
+    pub(crate) fn tail_action(&self) -> Option<ConversationPartialTailAction> {
+        self.tail_action
+    }
+
+    /// Explicit cold-state fact: replay never reconstructs the live current Turn.
+    pub(crate) const fn current_turn(&self) -> Option<TurnId> {
+        None
+    }
+}
+
+impl fmt::Debug for ReplayedConversationView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReplayedConversationView")
+            .field("accepted_entries", &self.accepted_entries.len())
+            .field("selected_path_len", &self.selected_path.len())
+            .field("has_selected_head", &self.selected_head.is_some())
+            .field("reserved_ids", &self.reserved_ids.len())
+            .field("sanitized_messages", &self.sanitized_messages.len())
+            .field("historical_item_ids", &self.historical_item_ids.len())
+            .field("diagnostics", &self.diagnostics)
+            .field("tail_action", &self.tail_action)
+            .finish()
+    }
+}
+
+/// M5 tolerant semantic replay, owned by Conversation Storage.
+///
+/// The scanner remains the physical bounded owner (strict Header, file/line/entry caps, complete
+/// malformed-line skip, one final partial-tail action). This seam consumes only typed scanner
+/// events and rebuilds the cold conversation facts in two owner-specific passes: the all-history
+/// semantic facts pass (first-valid identity reservation stays with the scan; historical items,
+/// accepted ToolCall/Interaction facts, and per-fact owning diagnostics) and the selected-path
+/// sanitizer pass (sanitized model messages and stable units, isolated from off-path branches
+/// per ADR 0124/0132). It never calls live reducer apply methods: replay is deliberately
+/// separate.
+#[allow(
+    dead_code,
+    reason = "the M5.2 replay seam is consumed by focused replay tests and the pending Load seam"
+)]
+pub(crate) fn replay_conversation<R: Read>(
+    reader: R,
+    declared_file_bytes: u64,
+    expected_session_id: SessionId,
+    access: ConversationScanAccess<'_>,
+) -> Result<ReplayedConversationView, ConversationReplayError> {
+    let mut scanner =
+        ConversationJsonlScanner::open(reader, declared_file_bytes, expected_session_id, access)
+            .map_err(map_replay_scan_error)?;
+    let header = scanner.header().map_err(map_replay_scan_error)?.clone();
+
+    let mut scan = ReplayScanState::new();
+    loop {
+        match scanner.next_event().map_err(map_replay_scan_error)? {
+            None => break,
+            Some(event) => scan.observe(event),
+        }
+    }
+    let eof_location = scan
+        .last_location
+        .unwrap_or_else(|| ConversationPhysicalLocation::new(0, 0));
+
+    let (selected_path, selected_head) = scan.selected_path();
+    let path_members = selected_path.iter().copied().collect::<BTreeSet<_>>();
+
+    // Pass one: all-history semantic facts in physical order (historical items, accepted
+    // ToolCall facts, per-fact Tool/Interaction validity and their owning diagnostics). It
+    // never builds a model-visible pending exchange or stable units.
+    let facts = {
+        let facts_pass = ReplaySemanticFactsPass {
+            entries: &scan.entries,
+            seen_items: BTreeSet::new(),
+            historical_item_ids: Vec::new(),
+            tool_call_items: BTreeSet::new(),
+            call_facts: BTreeMap::new(),
+            live_calls_by_id: BTreeMap::new(),
+            accepted_calls_by_assistant: BTreeMap::new(),
+            invalidated_exchanges: BTreeSet::new(),
+            valid_items_by_entry: BTreeMap::new(),
+            valid_tool_terminals: BTreeMap::new(),
+            invalid_tool_facts: BTreeMap::new(),
+            interactions: BTreeMap::new(),
+            diagnostics: &mut scan.diagnostics,
+        };
+        facts_pass.run()
+    };
+
+    // Pass two: the selected-path-only sanitizer, which owns the pending Tool exchange and the
+    // stable units. Off-path entries never mutate it; invalid facts from pass one are skipped
+    // without duplicate diagnostics.
+    let messages = {
+        let mut sanitizer = ReplaySanitizerPass {
+            entries: &scan.entries,
+            path_members: &path_members,
+            facts: &facts,
+            units: Vec::new(),
+            pending_exchange: None,
+            diagnostics: &mut scan.diagnostics,
+        };
+        sanitizer.run(eof_location)
+    };
+
+    Ok(ReplayedConversationView {
+        header,
+        accepted_entries: scan
+            .entries
+            .iter()
+            .map(|scan_entry| Arc::clone(&scan_entry.entry))
+            .collect::<Vec<_>>()
+            .into(),
+        selected_path: selected_path.into(),
+        selected_head,
+        reserved_ids: scan.reserved_ids.into(),
+        sanitized_messages: messages.into(),
+        historical_item_ids: facts.historical_item_ids.into(),
+        diagnostics: scan.diagnostics.finish(),
+        tail_action: scan.tail_action,
+    })
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -2058,14 +3685,26 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::task::Poll;
 
+    use serde_json::Value;
+
     use super::*;
     use crate::agent_session_lifecycle::AgentRevisionRef;
     use crate::model_gateway::{
         ModelId, ModelReasoningSummary, ModelServiceClass, ProviderId, ProviderResponseMetadata,
     };
-    use crate::tools::{ToolApprovalResolutionRef, UserQuestionFieldAnswer};
+    use crate::prompt::{
+        CanonicalUserMessage, MessageContent, MessageRecord, ModelAssistantContentRef,
+        ModelMessageRef,
+    };
+    use crate::tools::{
+        ToolApprovalOptionKindView, ToolApprovalOptionView, ToolApprovalResolutionRef,
+        ToolRequirementSummaryView, UserQuestionField, UserQuestionFieldAnswer, UserQuestionInput,
+        UserQuestionRequest,
+    };
+    use crate::wire::BoundedJsonObject;
     use crate::wire::conversation_jsonl::{
-        ConversationLineCodec, MAX_CONVERSATION_ENTRY_BYTES, MAX_CONVERSATION_HEADER_BYTES,
+        ConversationLineCodec, ConversationRecord, MAX_CONVERSATION_ENTRY_BYTES,
+        MAX_CONVERSATION_HEADER_BYTES,
     };
 
     const HEADER_ONLY: &[u8] =
@@ -3331,5 +4970,2701 @@ mod tests {
         finish_recorder_fixture(task_context.clone(), &recorder).await;
         assert_eq!(task_context.registered_task_count_for_test(), 0);
         std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    const TOOL_EXCHANGE_GOLDEN: &[u8] =
+        include_bytes!("../docs/fixtures/wire-v1/conversation/golden/tool-exchange.jsonl");
+    const INTERACTION_COMPACTION_GOLDEN: &[u8] =
+        include_bytes!("../docs/fixtures/wire-v1/conversation/golden/interaction-compaction.jsonl");
+    const INTERACTION_VARIANTS_GOLDEN: &[u8] =
+        include_bytes!("../docs/fixtures/wire-v1/conversation/golden/interaction-variants.jsonl");
+
+    struct CorruptionCase {
+        name: &'static str,
+        bytes: &'static [u8],
+        expected: &'static str,
+    }
+
+    macro_rules! corruption_case {
+        ($name:literal) => {
+            CorruptionCase {
+                name: $name,
+                bytes: include_bytes!(concat!(
+                    "../docs/fixtures/wire-v1/conversation/corruption/",
+                    $name,
+                    ".jsonl"
+                )),
+                expected: include_str!(concat!(
+                    "../docs/fixtures/wire-v1/conversation/corruption/",
+                    $name,
+                    ".expected.json"
+                )),
+            }
+        };
+    }
+
+    const CORRUPTION_CASES: &[CorruptionCase] = &[
+        corruption_case!("branch-last-leaf"),
+        corruption_case!("contribution-stamp-salvage"),
+        corruption_case!("crlf-input"),
+        corruption_case!("duplicate-entry-id"),
+        corruption_case!("duplicate-header-key"),
+        corruption_case!("entry-session-mismatch"),
+        corruption_case!("incomplete-tool-exchange"),
+        corruption_case!("invalid-compaction-marker"),
+        corruption_case!("invalid-item-relation"),
+        corruption_case!("malformed-middle"),
+        corruption_case!("multiple-root-isolation"),
+        corruption_case!("orphan-interaction-resolution"),
+        corruption_case!("orphan-parent"),
+        corruption_case!("partial-tail"),
+        corruption_case!("tool-terminal-conflict"),
+        corruption_case!("unknown-body-variant"),
+        corruption_case!("unknown-entry-field"),
+        corruption_case!("unknown-record-variant"),
+        corruption_case!("unsupported-version-header"),
+        corruption_case!("wrong-session-header"),
+    ];
+
+    fn fixture_session(bytes: &[u8]) -> SessionId {
+        let first_line = bytes
+            .split(|byte| *byte == b'\n')
+            .next()
+            .expect("fixture has a first line")
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| {
+                bytes
+                    .split(|byte| *byte == b'\n')
+                    .next()
+                    .expect("fixture has a first line")
+            });
+        let ConversationRecord::Header(header) = ConversationLineCodec::decode_record(first_line)
+            .expect("replay fixture starts with a decodable Header")
+        else {
+            panic!("replay fixture must start with a Header");
+        };
+        header.session_id()
+    }
+
+    fn replay_fixture(
+        bytes: &[u8],
+        session_id: SessionId,
+    ) -> Result<ReplayedConversationView, ConversationReplayError> {
+        replay_conversation(
+            Cursor::new(bytes.to_vec()),
+            u64::try_from(bytes.len()).expect("fixture length fits u64"),
+            session_id,
+            ConversationScanAccess::ReadOnly,
+        )
+    }
+
+    fn entry_ids(value: &Value) -> Vec<EntryId> {
+        value
+            .as_array()
+            .expect("expected entry id array")
+            .iter()
+            .map(|value| value.as_str().expect("entry id string").parse().unwrap())
+            .collect()
+    }
+
+    fn item_ids(value: &Value) -> Vec<ItemId> {
+        value
+            .as_array()
+            .expect("expected item id array")
+            .iter()
+            .map(|value| value.as_str().expect("item id string").parse().unwrap())
+            .collect()
+    }
+
+    fn assert_messages_match(messages: &[ModelMessage], expected: &Value, case: &str) {
+        let expected = expected
+            .as_array()
+            .expect("expected sanitizedModelMessages array");
+        assert_eq!(
+            messages.len(),
+            expected.len(),
+            "{case}: sanitized message count"
+        );
+        for (index, (message, expected_message)) in messages.iter().zip(expected).enumerate() {
+            match message.as_ref() {
+                ModelMessageRef::User { content } => {
+                    assert_eq!(
+                        expected_message["role"], "user",
+                        "{case}: message {index} role"
+                    );
+                    let expected_parts = expected_message["content"]
+                        .as_array()
+                        .expect("user content array");
+                    assert_eq!(
+                        content.len(),
+                        expected_parts.len(),
+                        "{case}: message {index} user part count"
+                    );
+                    for (part_index, (part, expected_part)) in
+                        content.iter().zip(expected_parts).enumerate()
+                    {
+                        assert_eq!(
+                            expected_part["type"], "text",
+                            "{case}: message {index} part {part_index} type"
+                        );
+                        assert_eq!(
+                            part.as_text(),
+                            expected_part["data"]["text"].as_str().unwrap(),
+                            "{case}: message {index} part {part_index} text"
+                        );
+                    }
+                }
+                ModelMessageRef::Assistant { content } => {
+                    assert_eq!(
+                        expected_message["role"], "assistant",
+                        "{case}: message {index} role"
+                    );
+                    let expected_blocks = expected_message["content"]
+                        .as_array()
+                        .expect("assistant content array");
+                    assert_eq!(
+                        content.len(),
+                        expected_blocks.len(),
+                        "{case}: message {index} assistant block count"
+                    );
+                    for (block_index, (block, expected_block)) in
+                        content.iter().zip(expected_blocks).enumerate()
+                    {
+                        match block.as_ref() {
+                            ModelAssistantContentRef::Reasoning(value) => {
+                                assert_eq!(
+                                    expected_block["type"], "reasoning",
+                                    "{case}: message {index} block {block_index} type"
+                                );
+                                assert_eq!(
+                                    value.text(),
+                                    expected_block["data"]["text"].as_str(),
+                                    "{case}: message {index} block {block_index} reasoning text"
+                                );
+                                assert_eq!(
+                                    value.summary(),
+                                    expected_block["data"]["summary"].as_str(),
+                                    "{case}: message {index} block {block_index} reasoning summary"
+                                );
+                                assert_eq!(
+                                    value.encrypted(),
+                                    expected_block["data"]["encrypted"].as_str(),
+                                    "{case}: message {index} block {block_index} reasoning encrypted"
+                                );
+                                assert_eq!(
+                                    value.signature(),
+                                    expected_block["data"]["signature"].as_str(),
+                                    "{case}: message {index} block {block_index} reasoning signature"
+                                );
+                                assert_eq!(
+                                    value.provider_item_id().is_none(),
+                                    expected_block["data"]["providerItemId"].is_null(),
+                                    "{case}: message {index} block {block_index} provider item"
+                                );
+                            }
+                            ModelAssistantContentRef::Text(text) => {
+                                assert_eq!(
+                                    expected_block["type"], "text",
+                                    "{case}: message {index} block {block_index} type"
+                                );
+                                assert_eq!(
+                                    text,
+                                    expected_block["data"]["text"].as_str().unwrap(),
+                                    "{case}: message {index} block {block_index} text"
+                                );
+                            }
+                            ModelAssistantContentRef::ToolCall {
+                                tool_call_id,
+                                name,
+                                arguments,
+                            } => {
+                                assert_eq!(
+                                    expected_block["type"], "tool_call",
+                                    "{case}: message {index} block {block_index} type"
+                                );
+                                assert_eq!(
+                                    tool_call_id.as_str(),
+                                    expected_block["data"]["toolCallId"].as_str().unwrap(),
+                                    "{case}: message {index} block {block_index} tool call id"
+                                );
+                                assert_eq!(
+                                    name.as_str(),
+                                    expected_block["data"]["name"].as_str().unwrap(),
+                                    "{case}: message {index} block {block_index} tool name"
+                                );
+                                let expected_arguments = BoundedJsonObject::from_slice(
+                                    expected_block["data"]["arguments"].to_string().as_bytes(),
+                                )
+                                .expect("expected arguments parse");
+                                assert_eq!(
+                                    arguments.canonical_bytes(),
+                                    expected_arguments.canonical_bytes(),
+                                    "{case}: message {index} block {block_index} arguments"
+                                );
+                            }
+                        }
+                    }
+                }
+                ModelMessageRef::Tool {
+                    tool_call_id,
+                    content,
+                } => {
+                    assert_eq!(
+                        expected_message["role"], "tool",
+                        "{case}: message {index} role"
+                    );
+                    assert_eq!(
+                        tool_call_id.as_str(),
+                        expected_message["toolCallId"].as_str().unwrap(),
+                        "{case}: message {index} tool call id"
+                    );
+                    let expected_parts = expected_message["content"]["parts"]
+                        .as_array()
+                        .expect("tool content parts array");
+                    assert_eq!(
+                        content.parts().len(),
+                        expected_parts.len(),
+                        "{case}: message {index} tool part count"
+                    );
+                    for (part_index, (part, expected_part)) in
+                        content.parts().iter().zip(expected_parts).enumerate()
+                    {
+                        assert_eq!(
+                            expected_part["type"], "text",
+                            "{case}: message {index} part {part_index} type"
+                        );
+                        assert_eq!(
+                            part.as_text(),
+                            expected_part["data"]["text"].as_str().unwrap(),
+                            "{case}: message {index} part {part_index} text"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn assert_diagnostic_counts(
+        diagnostics: &ConversationReplayDiagnostics,
+        expected: &Value,
+        case: &str,
+    ) {
+        let expected = expected.as_array().expect("expected diagnostics array");
+        assert_eq!(
+            diagnostics.counts().len(),
+            expected.len(),
+            "{case}: diagnostic aggregate code set"
+        );
+        for group in expected {
+            let code = ConversationReplayDiagnosticCode::from_name(
+                group["code"].as_str().expect("diagnostic code name"),
+            )
+            .expect("expected diagnostic code is in the closed set");
+            assert_eq!(
+                diagnostics.count(code),
+                group["count"].as_u64().expect("diagnostic count"),
+                "{case}: aggregate count for {}",
+                group["code"]
+            );
+        }
+    }
+
+    fn assert_tail_action(
+        actual: Option<ConversationPartialTailAction>,
+        expected_action: &Value,
+        expected_offset: Option<u64>,
+        case: &str,
+    ) {
+        match expected_action.as_str().expect("tail action name") {
+            "none" => assert_eq!(actual, None, "{case}: tail action"),
+            "ignore" => assert_eq!(
+                actual,
+                Some(ConversationPartialTailAction::Ignore),
+                "{case}: tail action"
+            ),
+            "truncate" => assert_eq!(
+                actual,
+                Some(ConversationPartialTailAction::TruncateTo {
+                    offset: expected_offset.expect("truncate offset"),
+                }),
+                "{case}: tail action"
+            ),
+            other => panic!("{case}: unexpected expected tail action {other}"),
+        }
+    }
+
+    #[test]
+    fn replay_executes_every_corruption_fixture_sidecar() {
+        assert_eq!(CORRUPTION_CASES.len(), 20, "corruption fixture inventory");
+        for case in CORRUPTION_CASES {
+            let expected: Value =
+                serde_json::from_str(case.expected).expect("expected sidecar is JSON");
+            let length = u64::try_from(case.bytes.len()).expect("fixture length fits u64");
+            let session_id = match expected["load"].as_str().expect("load outcome") {
+                "fails" => expected["openedSessionId"]
+                    .as_str()
+                    .expect("opened session id")
+                    .parse()
+                    .expect("opened session id is valid"),
+                _ => fixture_session(case.bytes),
+            };
+
+            let result = replay_fixture(case.bytes, session_id);
+            match expected["load"].as_str().expect("load outcome") {
+                "fails" => {
+                    let error = result.expect_err("expected a typed load failure");
+                    let expected_error = match expected["error"].as_str().expect("error name") {
+                        "HeaderCorrupt" => ConversationReplayError::HeaderCorrupt,
+                        "UnsupportedFormatVersion" => {
+                            ConversationReplayError::UnsupportedFormatVersion
+                        }
+                        other => panic!("{}: unexpected expected error {other}", case.name),
+                    };
+                    assert_eq!(error, expected_error, "{}: typed load error", case.name);
+                }
+                _ => {
+                    let view = result.unwrap_or_else(|error| {
+                        panic!("{}: tolerant replay must load: {error}", case.name)
+                    });
+                    assert_eq!(
+                        view.accepted_entry_ids(),
+                        entry_ids(&expected["acceptedEntryIds"]),
+                        "{}: accepted entry ids",
+                        case.name
+                    );
+                    let expected_path = entry_ids(&expected["selectedPath"]);
+                    assert_eq!(
+                        view.selected_path(),
+                        expected_path.as_slice(),
+                        "{}: selected path",
+                        case.name
+                    );
+                    assert_eq!(
+                        view.selected_head(),
+                        expected_path.last().copied(),
+                        "{}: selected head",
+                        case.name
+                    );
+                    assert_messages_match(
+                        view.sanitized_messages(),
+                        &expected["sanitizedModelMessages"],
+                        case.name,
+                    );
+                    assert_eq!(
+                        view.historical_item_ids(),
+                        item_ids(&expected["historicalItemIds"]).as_slice(),
+                        "{}: historical item ids",
+                        case.name
+                    );
+                    let diagnostics = expected
+                        .get("diagnostics")
+                        .or_else(|| expected["diagnosticsByMode"].get("readOnly"))
+                        .expect("expected diagnostics");
+                    assert_diagnostic_counts(view.diagnostics(), diagnostics, case.name);
+                    assert_tail_action(
+                        view.tail_action(),
+                        &expected["tail"]["readOnlyAction"],
+                        None,
+                        case.name,
+                    );
+                    assert_eq!(
+                        view.current_turn(),
+                        None,
+                        "{}: cold state has no current turn",
+                        case.name
+                    );
+
+                    let accepted = view.accepted_entry_ids();
+                    assert_eq!(
+                        view.reserved_ids(),
+                        accepted.as_slice(),
+                        "{}: reserved ids are exactly the first-valid accepted ids",
+                        case.name
+                    );
+
+                    if case.name == "entry-session-mismatch" {
+                        let assertions = &expected["identityAssertions"];
+                        assert_eq!(
+                            assertions["mismatchedLineReservesEntryId"], false,
+                            "session mismatch must not reserve the EntryId"
+                        );
+                        assert_eq!(
+                            assertions["laterMatchingSessionReuseAccepted"], true,
+                            "the later matching line reuses the id first-valid"
+                        );
+                    }
+
+                    // The exclusive-writable pass returns the writable tail action and keeps
+                    // the same semantic projection and diagnostics.
+                    let lease =
+                        ExclusiveWritableConversationLease::for_scanner_test(session_id, length);
+                    let writable_view = replay_conversation(
+                        Cursor::new(case.bytes.to_vec()),
+                        length,
+                        session_id,
+                        ConversationScanAccess::ExclusiveWritable(&lease),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("{}: writable replay must load: {error}", case.name)
+                    });
+                    assert_messages_match(
+                        writable_view.sanitized_messages(),
+                        &expected["sanitizedModelMessages"],
+                        case.name,
+                    );
+                    let writable_diagnostics = expected
+                        .get("diagnostics")
+                        .or_else(|| expected["diagnosticsByMode"].get("exclusiveWritable"))
+                        .expect("expected writable diagnostics");
+                    assert_diagnostic_counts(
+                        writable_view.diagnostics(),
+                        writable_diagnostics,
+                        case.name,
+                    );
+                    assert_tail_action(
+                        writable_view.tail_action(),
+                        &expected["tail"]["exclusiveWritableAction"],
+                        expected["tail"]["truncateOffset"].as_u64(),
+                        case.name,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn replay_projects_the_golden_complete_tool_exchange() {
+        let session_id = fixture_session(TOOL_EXCHANGE_GOLDEN);
+        let view =
+            replay_fixture(TOOL_EXCHANGE_GOLDEN, session_id).expect("golden tool exchange replays");
+        let messages = view.sanitized_messages();
+        let roles = messages
+            .iter()
+            .map(|message| match message.as_ref() {
+                ModelMessageRef::User { .. } => "user",
+                ModelMessageRef::Assistant { .. } => "assistant",
+                ModelMessageRef::Tool { .. } => "tool",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant"]);
+
+        match messages[1].as_ref() {
+            ModelMessageRef::Assistant { content } => {
+                assert_eq!(content.len(), 1);
+                match content[0].as_ref() {
+                    ModelAssistantContentRef::ToolCall {
+                        tool_call_id,
+                        name,
+                        arguments,
+                    } => {
+                        assert_eq!(tool_call_id.as_str(), "call_weather_1");
+                        assert_eq!(name.as_str(), "get_weather");
+                        assert_eq!(
+                            arguments.canonical_json(),
+                            "{\"city\":\"Paris\",\"days\":1,\"units\":\"metric\"}"
+                        );
+                    }
+                    other => panic!("expected a tool call block, got {other:?}"),
+                }
+            }
+            _ => panic!("second message is the assistant tool call"),
+        }
+
+        match messages[2].as_ref() {
+            ModelMessageRef::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id.as_str(), "call_weather_1");
+                assert_eq!(content.parts().len(), 1);
+                assert_eq!(content.parts()[0].as_text(), "18 C, clear");
+            }
+            _ => panic!("third message is the tool result"),
+        }
+
+        match messages[3].as_ref() {
+            ModelMessageRef::Assistant { content } => {
+                assert_eq!(content.len(), 2);
+                match content[0].as_ref() {
+                    ModelAssistantContentRef::Reasoning(value) => {
+                        assert_eq!(value.summary(), Some("Checked weather tool output."));
+                    }
+                    other => panic!("expected reasoning block, got {other:?}"),
+                }
+                match content[1].as_ref() {
+                    ModelAssistantContentRef::Text(text) => {
+                        assert_eq!(text, "It is 18 C and clear in Paris.");
+                    }
+                    other => panic!("expected text block, got {other:?}"),
+                }
+            }
+            _ => panic!("fourth message is the final assistant"),
+        }
+
+        assert!(view.diagnostics().is_empty());
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_44444444444444444444444444444444"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_55555555555555555555555555555555"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_77777777777777777777777777777777"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_66666666666666666666666666666666"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_applies_the_golden_null_marker_compaction_as_a_rolling_summary() {
+        let session_id = fixture_session(INTERACTION_COMPACTION_GOLDEN);
+        let view = replay_fixture(INTERACTION_COMPACTION_GOLDEN, session_id)
+            .expect("golden interaction compaction replays");
+        let messages = view.sanitized_messages();
+        assert_eq!(messages.len(), 1);
+        match messages[0].as_ref() {
+            ModelMessageRef::User { content } => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(
+                    content[0].as_text(),
+                    "The user selected production deployment."
+                );
+            }
+            _ => panic!("a valid null-marker compaction projects one rolling summary"),
+        }
+        assert!(view.diagnostics().is_empty());
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_10000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_10000000000000000000000000000002"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_orders_golden_interaction_variants_by_assistant_calls() {
+        let session_id = fixture_session(INTERACTION_VARIANTS_GOLDEN);
+        let view = replay_fixture(INTERACTION_VARIANTS_GOLDEN, session_id)
+            .expect("golden interaction variants replay");
+        let messages = view.sanitized_messages();
+        assert_eq!(messages.len(), 5, "user, assistant, and three tool results");
+        let assistant_calls = match messages[1].as_ref() {
+            ModelMessageRef::Assistant { content } => content
+                .iter()
+                .map(|block| match block.as_ref() {
+                    ModelAssistantContentRef::ToolCall { tool_call_id, .. } => {
+                        tool_call_id.as_str().to_owned()
+                    }
+                    other => panic!("expected tool call block, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("second message is the assistant"),
+        };
+        assert_eq!(
+            assistant_calls,
+            ["call_allow", "call_deny", "call_cancel_question"]
+        );
+        let model_visible_tool_order = messages[2..]
+            .iter()
+            .map(|message| match message.as_ref() {
+                ModelMessageRef::Tool { tool_call_id, .. } => tool_call_id.as_str().to_owned(),
+                _ => panic!("messages after the assistant are tool results"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model_visible_tool_order,
+            ["call_allow", "call_deny", "call_cancel_question"],
+            "complete exchange projects in assistant call order, not physical result order"
+        );
+
+        // The golden sidecar asserts the same ordering facts about the fixture's physical bytes.
+        let sidecar: Value = serde_json::from_str(include_str!(
+            "../docs/fixtures/wire-v1/conversation/golden/interaction-variants.expected.json"
+        ))
+        .expect("interaction variants sidecar is JSON");
+        let sidecar = &sidecar["assertions"];
+        let expected_physical_terminal_order = sidecar["toolOrdering"]["physicalTerminalOrder"]
+            .as_array()
+            .expect("physical terminal order array")
+            .iter()
+            .map(|value| value.as_str().expect("tool call id").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_physical_terminal_order,
+            ["call_cancel_question", "call_allow", "call_deny"].as_slice()
+        );
+        let expected_model_visible_order = sidecar["toolOrdering"]["modelVisibleOrder"]
+            .as_array()
+            .expect("model visible order array")
+            .iter()
+            .map(|value| value.as_str().expect("tool call id").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_model_visible_order,
+            model_visible_tool_order.as_slice()
+        );
+
+        let mut physical_entry_ids = Vec::new();
+        let mut physical_terminal_order = Vec::new();
+        for line in INTERACTION_VARIANTS_GOLDEN.split(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let ConversationRecord::Entry(entry) =
+                ConversationLineCodec::decode_record(line).expect("golden line decodes")
+            else {
+                continue;
+            };
+            physical_entry_ids.push(entry.entry_id());
+            if let StoredEntryBody::ToolMessage(message) = entry.body() {
+                physical_terminal_order.push(message.tool_call_id().as_str().to_owned());
+            }
+        }
+        assert_eq!(
+            physical_terminal_order,
+            ["call_cancel_question", "call_allow", "call_deny"],
+            "physical terminal order"
+        );
+        let required_physical_order = sidecar["askUserExclusiveFirst"]["requiredPhysicalOrder"]
+            .as_array()
+            .expect("required physical order array")
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .expect("entry id")
+                    .parse::<EntryId>()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut previous_position = None;
+        for entry_id in &required_physical_order {
+            let position = physical_entry_ids
+                .iter()
+                .position(|current| current == entry_id)
+                .unwrap_or_else(|| panic!("required order entry {entry_id} is in the fixture"));
+            assert!(
+                previous_position.is_none_or(|previous| previous < position),
+                "required physical order is strictly increasing"
+            );
+            previous_position = Some(position);
+        }
+    }
+
+    fn synthetic_entry(
+        entry_id: &str,
+        parent: Option<&str>,
+        body: StoredEntryBody,
+    ) -> StoredSessionEntry {
+        StoredSessionEntry::reconstruct(
+            entry_id.parse().expect("synthetic Entry ID is valid"),
+            parent.map(|parent| parent.parse().expect("synthetic parent ID is valid")),
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("synthetic Session ID is valid"),
+            "trn_33333333333333333333333333333333"
+                .parse()
+                .expect("synthetic Turn ID is valid"),
+            "2026-07-31T12:00:01.000Z"
+                .parse()
+                .expect("synthetic timestamp is valid"),
+            body,
+        )
+    }
+
+    fn synthetic_user(
+        entry_id: &str,
+        parent: Option<&str>,
+        item_id: &str,
+        text: &str,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::UserMessage(StoredUserMessage::reconstruct(
+                item_id.parse().expect("synthetic Item ID is valid"),
+                UserMessageSource::Input,
+                CanonicalUserMessage::reconstruct(
+                    MessageRecord::reconstruct(vec![
+                        MessageContent::reconstruct_text(text)
+                            .expect("synthetic user text is safe"),
+                    ])
+                    .expect("synthetic message record"),
+                    Vec::new(),
+                )
+                .expect("synthetic canonical user message"),
+            )),
+        )
+    }
+
+    fn synthetic_compaction(
+        entry_id: &str,
+        parent: Option<&str>,
+        summary: &str,
+        marker: Option<&str>,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::Compaction(
+                StoredCompaction::reconstruct(
+                    summary,
+                    marker
+                        .map(|marker| marker.parse().expect("synthetic marker Entry ID is valid")),
+                    None,
+                )
+                .expect("synthetic stored compaction"),
+            ),
+        )
+    }
+
+    fn synthetic_assistant_with_tool_calls(
+        entry_id: &str,
+        parent: Option<&str>,
+        calls: &[&str],
+        item_ids: &[&str],
+    ) -> StoredSessionEntry {
+        assert_eq!(calls.len(), item_ids.len(), "one item per synthetic call");
+        let content = calls
+            .iter()
+            .zip(item_ids)
+            .map(|(call, item_id)| StoredAssistantContent::ToolCall {
+                item_id: item_id.parse().expect("synthetic Item ID is valid"),
+                tool_call_id: call.parse().expect("synthetic ToolCall ID is valid"),
+                name: "fixture_tool".parse().expect("synthetic ToolName is valid"),
+                arguments: BoundedJsonObject::from_slice(b"{}").expect("synthetic arguments parse"),
+            })
+            .collect();
+        let message = StoredAssistantMessage::reconstruct(
+            AssistantDisposition::Intermediate,
+            content,
+            model(),
+            None,
+            ModelFinishReason::ToolCalls,
+            NonZeroU32::new(1).unwrap(),
+            None,
+            0,
+            metadata(),
+        )
+        .expect("synthetic assistant tool-call message");
+        synthetic_entry(entry_id, parent, StoredEntryBody::AssistantMessage(message))
+    }
+
+    fn synthetic_assistant_text(
+        entry_id: &str,
+        parent: Option<&str>,
+        item_id: &str,
+        text: &str,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::AssistantMessage(assistant(vec![StoredAssistantContent::Text {
+                item_id: item_id.parse().expect("synthetic Item ID is valid"),
+                text: text.into(),
+            }])),
+        )
+    }
+
+    fn synthetic_tool(
+        entry_id: &str,
+        parent: Option<&str>,
+        item_id: &str,
+        call: &str,
+        text: &str,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::ToolMessage(StoredToolMessage::reconstruct(
+                item_id.parse().expect("synthetic Item ID is valid"),
+                call.parse().expect("synthetic ToolCall ID is valid"),
+                StoredToolOutcome::completed(
+                    ToolOutcomeSource::PreExecution,
+                    ToolResultDisposition::Succeeded,
+                    ToolResultContent::from_text_parts(vec![text.to_owned()])
+                        .expect("synthetic tool text is safe"),
+                )
+                .expect("synthetic completed outcome"),
+            )),
+        )
+    }
+
+    fn synthetic_abandoned_tool(
+        entry_id: &str,
+        parent: Option<&str>,
+        item_id: &str,
+        call: &str,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::ToolMessage(StoredToolMessage::reconstruct(
+                item_id.parse().expect("synthetic Item ID is valid"),
+                call.parse().expect("synthetic ToolCall ID is valid"),
+                StoredToolOutcome::Abandoned {
+                    reason: ToolAbandonReason::OutcomeUnknown,
+                },
+            )),
+        )
+    }
+
+    fn synthetic_user_question_request() -> StoredInteractionRequestBody {
+        StoredInteractionRequestBody::UserQuestion(
+            UserQuestionRequest::reconstruct(
+                Some("Choose target".to_owned()),
+                vec![
+                    UserQuestionField::reconstruct(
+                        0,
+                        "Where?",
+                        true,
+                        UserQuestionInput::Text { multiline: false },
+                    )
+                    .expect("synthetic question field"),
+                ],
+            )
+            .expect("synthetic user question request"),
+        )
+    }
+
+    fn synthetic_tool_approval_request() -> StoredInteractionRequestBody {
+        let requirements = ToolRequirementSummaryView::reconstruct(None, None, None)
+            .expect("synthetic requirements");
+        let option = ToolApprovalOptionView::reconstruct(
+            0,
+            ToolApprovalOptionKindView::AsRequested,
+            "Allow once",
+            requirements.clone(),
+        )
+        .expect("synthetic option");
+        StoredInteractionRequestBody::ToolApproval(
+            ToolApprovalRequestView::reconstruct(
+                "write_file".parse().expect("synthetic ToolName is valid"),
+                "path: src/lib.rs",
+                "write requested",
+                requirements,
+                vec![option],
+            )
+            .expect("synthetic tool approval request"),
+        )
+    }
+
+    fn synthetic_interaction_request(
+        entry_id: &str,
+        parent: Option<&str>,
+        request_id: &str,
+        item_id: &str,
+        request: StoredInteractionRequestBody,
+    ) -> StoredSessionEntry {
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::InteractionRequested(StoredInteractionRequest::reconstruct(
+                request_id.parse().expect("synthetic Request ID is valid"),
+                item_id.parse().expect("synthetic Item ID is valid"),
+                request,
+            )),
+        )
+    }
+
+    fn synthetic_interaction_resolution(
+        entry_id: &str,
+        parent: Option<&str>,
+        request_id: &str,
+        item_id: &str,
+        resolution: StoredInteractionResolutionBody,
+    ) -> StoredSessionEntry {
+        let requires_key = !matches!(resolution, StoredInteractionResolutionBody::Cancelled(_))
+            || matches!(
+                resolution,
+                StoredInteractionResolutionBody::Cancelled(InteractionCancelReason::HostCancelled)
+            );
+        synthetic_entry(
+            entry_id,
+            parent,
+            StoredEntryBody::InteractionResolved(
+                StoredInteractionResolution::reconstruct(
+                    request_id.parse().expect("synthetic Request ID is valid"),
+                    item_id.parse().expect("synthetic Item ID is valid"),
+                    resolution,
+                    requires_key.then(|| {
+                        "irk_11111111111111111111111111111111"
+                            .parse()
+                            .expect("synthetic resolution key is valid")
+                    }),
+                )
+                .expect("synthetic stored interaction resolution"),
+            ),
+        )
+    }
+
+    fn synthetic_file(entries: &[StoredSessionEntry]) -> Vec<u8> {
+        let mut bytes = HEADER_ONLY.to_vec();
+        for entry in entries {
+            let encoded =
+                ConversationLineCodec::encode_entry(entry).expect("synthetic entry encodes");
+            bytes.extend_from_slice(&encoded);
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    fn replay_synthetic(bytes: &[u8]) -> ReplayedConversationView {
+        replay_fixture(
+            bytes,
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("synthetic Session ID is valid"),
+        )
+        .expect("synthetic conversation replays")
+    }
+
+    fn synthetic_message_texts(view: &ReplayedConversationView) -> Vec<String> {
+        view.sanitized_messages()
+            .iter()
+            .map(|message| match message.as_ref() {
+                ModelMessageRef::User { content } => {
+                    assert_eq!(content.len(), 1, "synthetic user messages have one part");
+                    content[0].as_text().to_owned()
+                }
+                _ => panic!("synthetic projection only contains user messages"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replay_isolates_missing_and_ignored_compaction_markers() {
+        // The marker references an entry id that never appears in the file.
+        let missing = synthetic_file(&[
+            synthetic_user(
+                "ent_01000000000000000000000000000001",
+                None,
+                "itm_01000000000000000000000000000001",
+                "keep me",
+            ),
+            synthetic_compaction(
+                "ent_01000000000000000000000000000002",
+                Some("ent_01000000000000000000000000000001"),
+                "missing marker",
+                Some("ent_99999999999999999999999999999999"),
+            ),
+        ]);
+        let view = replay_synthetic(&missing);
+        assert_eq!(synthetic_message_texts(&view), ["keep me"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+
+        // The marker references an entry that is accepted later but isolated as an orphan.
+        let ignored = synthetic_file(&[
+            synthetic_user(
+                "ent_02000000000000000000000000000001",
+                None,
+                "itm_02000000000000000000000000000001",
+                "keep me too",
+            ),
+            synthetic_compaction(
+                "ent_02000000000000000000000000000002",
+                Some("ent_02000000000000000000000000000001"),
+                "ignored marker",
+                Some("ent_02000000000000000000000000000003"),
+            ),
+            synthetic_user(
+                "ent_02000000000000000000000000000003",
+                Some("ent_ffffffffffffffffffffffffffffffff"),
+                "itm_02000000000000000000000000000003",
+                "orphaned marker target",
+            ),
+        ]);
+        let view = replay_synthetic(&ignored);
+        assert_eq!(synthetic_message_texts(&view), ["keep me too"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::MissingParent),
+            1
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+        // The root and the compaction form the canonical path; the orphan target is isolated.
+        assert_eq!(
+            view.selected_path(),
+            [
+                "ent_02000000000000000000000000000001"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_02000000000000000000000000000002"
+                    .parse::<EntryId>()
+                    .unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_compaction_markers_use_prior_stable_unit_origins() {
+        // ADR 0132: `first_kept_entry_id` is valid only when it exactly matches a current unit
+        // origin at index > 0. Here the marker names the second user unit, so the units become
+        // [new summary] + units[index..].
+        let valid = synthetic_file(&[
+            synthetic_user(
+                "ent_03000000000000000000000000000001",
+                None,
+                "itm_03000000000000000000000000000001",
+                "root text",
+            ),
+            synthetic_user(
+                "ent_03000000000000000000000000000002",
+                Some("ent_03000000000000000000000000000001"),
+                "itm_03000000000000000000000000000002",
+                "retained unit",
+            ),
+            synthetic_compaction(
+                "ent_03000000000000000000000000000003",
+                Some("ent_03000000000000000000000000000002"),
+                "rolling summary",
+                Some("ent_03000000000000000000000000000002"),
+            ),
+        ]);
+        let view = replay_synthetic(&valid);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            ["rolling summary", "retained unit"],
+            "a valid prior-unit marker replaces units[0..index] with the summary"
+        );
+        assert!(view.diagnostics().is_empty());
+
+        // A marker pointing at the leading unit (index 0) is invalid and has no effect.
+        let first = synthetic_file(&[
+            synthetic_user(
+                "ent_04000000000000000000000000000001",
+                None,
+                "itm_04000000000000000000000000000001",
+                "root text",
+            ),
+            synthetic_compaction(
+                "ent_04000000000000000000000000000002",
+                Some("ent_04000000000000000000000000000001"),
+                "rolling summary",
+                Some("ent_04000000000000000000000000000001"),
+            ),
+        ]);
+        let view = replay_synthetic(&first);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            ["root text"],
+            "a marker naming the first unit is invalid and ignored"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+
+        // A marker naming an entry that appears later in the file (a future entry) cannot be a
+        // prior unit origin: it is invalid and ignored.
+        let future = synthetic_file(&[
+            synthetic_user(
+                "ent_05000000000000000000000000000001",
+                None,
+                "itm_05000000000000000000000000000001",
+                "root text",
+            ),
+            synthetic_compaction(
+                "ent_05000000000000000000000000000002",
+                Some("ent_05000000000000000000000000000001"),
+                "rolling summary",
+                Some("ent_05000000000000000000000000000003"),
+            ),
+            synthetic_user(
+                "ent_05000000000000000000000000000003",
+                Some("ent_05000000000000000000000000000002"),
+                "itm_05000000000000000000000000000003",
+                "future target",
+            ),
+        ]);
+        let view = replay_synthetic(&future);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            ["root text", "future target"],
+            "a future marker is invalid and has no effect"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+
+        // A marker naming a unit already removed by an earlier compaction is invalid: only
+        // current unit origins can be matched.
+        let already_removed = synthetic_file(&[
+            synthetic_user(
+                "ent_06000000000000000000000000000001",
+                None,
+                "itm_06000000000000000000000000000001",
+                "root text",
+            ),
+            synthetic_user(
+                "ent_06000000000000000000000000000002",
+                Some("ent_06000000000000000000000000000001"),
+                "itm_06000000000000000000000000000002",
+                "kept after first compaction",
+            ),
+            synthetic_compaction(
+                "ent_06000000000000000000000000000003",
+                Some("ent_06000000000000000000000000000002"),
+                "first summary",
+                Some("ent_06000000000000000000000000000002"),
+            ),
+            synthetic_compaction(
+                "ent_06000000000000000000000000000004",
+                Some("ent_06000000000000000000000000000003"),
+                "second summary",
+                Some("ent_06000000000000000000000000000001"),
+            ),
+        ]);
+        let view = replay_synthetic(&already_removed);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            ["first summary", "kept after first compaction"],
+            "a marker naming an already-removed unit is invalid and ignored"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+
+        // `None` is valid only when the effective units are non-empty.
+        let empty = synthetic_file(&[synthetic_compaction(
+            "ent_07000000000000000000000000000001",
+            None,
+            "summary over nothing",
+            None,
+        )]);
+        let view = replay_synthetic(&empty);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            Vec::<String>::new(),
+            "a null marker over empty units is invalid and has no effect"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+
+        // A marker naming a ToolResult entry is invalid: tool results are internal to the
+        // assistant-origin exchange unit and are never a unit origin.
+        let tool_internal = synthetic_file(&[
+            synthetic_user(
+                "ent_08000000000000000000000000000001",
+                None,
+                "itm_08000000000000000000000000000001",
+                "root text",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_08000000000000000000000000000002",
+                Some("ent_08000000000000000000000000000001"),
+                &["call_internal"],
+                &["itm_08000000000000000000000000000002"],
+            ),
+            synthetic_tool(
+                "ent_08000000000000000000000000000003",
+                Some("ent_08000000000000000000000000000002"),
+                "itm_08000000000000000000000000000002",
+                "call_internal",
+                "done",
+            ),
+            synthetic_compaction(
+                "ent_08000000000000000000000000000004",
+                Some("ent_08000000000000000000000000000003"),
+                "rolling summary",
+                Some("ent_08000000000000000000000000000003"),
+            ),
+        ]);
+        let view = replay_synthetic(&tool_internal);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool"],
+            "a marker naming a ToolResult entry is invalid and ignored"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidCompactionMarker),
+            1
+        );
+    }
+
+    fn synthetic_message_roles(view: &ReplayedConversationView) -> Vec<&'static str> {
+        view.sanitized_messages()
+            .iter()
+            .map(|message| match message.as_ref() {
+                ModelMessageRef::User { .. } => "user",
+                ModelMessageRef::Assistant { .. } => "assistant",
+                ModelMessageRef::Tool { .. } => "tool",
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replay_history_items_include_only_semantically_valid_item_ids() {
+        // An orphan ToolMessage (no earlier accepted Assistant ToolCall matches its
+        // (ItemId, ToolCallId) pair) contributes no historical item id.
+        let orphan = synthetic_file(&[
+            synthetic_user(
+                "ent_0c000000000000000000000000000001",
+                None,
+                "itm_0c000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_0c000000000000000000000000000002",
+                Some("ent_0c000000000000000000000000000001"),
+                &["call_orphan"],
+                &["itm_0c000000000000000000000000000002"],
+            ),
+            synthetic_tool(
+                "ent_0c000000000000000000000000000003",
+                Some("ent_0c000000000000000000000000000002"),
+                "itm_0c000000000000000000000000000003",
+                "call_unknown",
+                "late",
+            ),
+        ]);
+        let view = replay_synthetic(&orphan);
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_0c000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_0c000000000000000000000000000002"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ],
+            "orphan tool items never enter the historical index"
+        );
+        assert_eq!(synthetic_message_roles(&view), ["user"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            2,
+            "the orphan result and the then-incomplete exchange each own one fact"
+        );
+
+        // An identity-conflicting result (matching ToolCallId, different ItemId) invalidates the
+        // exchange, and its item never enters the historical index.
+        let conflict = synthetic_file(&[
+            synthetic_user(
+                "ent_0d000000000000000000000000000001",
+                None,
+                "itm_0d000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_0d000000000000000000000000000002",
+                Some("ent_0d000000000000000000000000000001"),
+                &["call_conflict"],
+                &["itm_0d000000000000000000000000000002"],
+            ),
+            synthetic_tool(
+                "ent_0d000000000000000000000000000003",
+                Some("ent_0d000000000000000000000000000002"),
+                "itm_0d000000000000000000000000000003",
+                "call_conflict",
+                "wrong identity",
+            ),
+            synthetic_tool(
+                "ent_0d000000000000000000000000000004",
+                Some("ent_0d000000000000000000000000000003"),
+                "itm_0d000000000000000000000000000002",
+                "call_conflict",
+                "late correct",
+            ),
+        ]);
+        let view = replay_synthetic(&conflict);
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_0d000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_0d000000000000000000000000000002"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ],
+            "identity-conflicting tool items never enter the historical index"
+        );
+        assert_eq!(synthetic_message_roles(&view), ["user"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            2,
+            "the identity conflict and the later orphan each own one fact"
+        );
+
+        // A duplicate item identity across User and Assistant content is isolated: the assistant
+        // message yields no unit and contributes no item id.
+        let duplicate = synthetic_file(&[
+            synthetic_user(
+                "ent_0e000000000000000000000000000001",
+                None,
+                "itm_0e000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_text(
+                "ent_0e000000000000000000000000000002",
+                Some("ent_0e000000000000000000000000000001"),
+                "itm_0e000000000000000000000000000001",
+                "duplicate identity",
+            ),
+        ]);
+        let view = replay_synthetic(&duplicate);
+        assert_eq!(
+            view.historical_item_ids(),
+            ["itm_0e000000000000000000000000000001"
+                .parse::<ItemId>()
+                .unwrap(),],
+            "duplicate assistant content adds no historical item"
+        );
+        assert_eq!(synthetic_message_roles(&view), ["user"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidRelation),
+            1
+        );
+    }
+
+    #[test]
+    fn replay_tool_exchanges_match_by_item_call_pair_and_first_terminal_wins() {
+        // The first completed terminal wins; a later duplicate result is isolated with one
+        // fact and the exchange stays model-visible.
+        let duplicate_terminal = synthetic_file(&[
+            synthetic_user(
+                "ent_11000000000000000000000000000001",
+                None,
+                "itm_11000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_11000000000000000000000000000002",
+                Some("ent_11000000000000000000000000000001"),
+                &["call_1"],
+                &["itm_11000000000000000000000000000002"],
+            ),
+            synthetic_tool(
+                "ent_11000000000000000000000000000003",
+                Some("ent_11000000000000000000000000000002"),
+                "itm_11000000000000000000000000000002",
+                "call_1",
+                "ok",
+            ),
+            synthetic_tool(
+                "ent_11000000000000000000000000000004",
+                Some("ent_11000000000000000000000000000003"),
+                "itm_11000000000000000000000000000002",
+                "call_1",
+                "duplicate",
+            ),
+        ]);
+        let view = replay_synthetic(&duplicate_terminal);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool"]
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[2].as_ref() else {
+            panic!("third message is the first valid tool result")
+        };
+        assert_eq!(content.parts().len(), 1);
+        assert_eq!(content.parts()[0].as_text(), "ok");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            1,
+            "the later duplicate terminal owns one fact"
+        );
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_11000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_11000000000000000000000000000002"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ]
+        );
+
+        // Abandoned-first excludes the whole exchange from the model conversation.
+        let abandoned_first = synthetic_file(&[
+            synthetic_user(
+                "ent_12000000000000000000000000000001",
+                None,
+                "itm_12000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_12000000000000000000000000000002",
+                Some("ent_12000000000000000000000000000001"),
+                &["call_2"],
+                &["itm_12000000000000000000000000000002"],
+            ),
+            synthetic_abandoned_tool(
+                "ent_12000000000000000000000000000003",
+                Some("ent_12000000000000000000000000000002"),
+                "itm_12000000000000000000000000000002",
+                "call_2",
+            ),
+        ]);
+        let view = replay_synthetic(&abandoned_first);
+        assert_eq!(synthetic_message_roles(&view), ["user"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            1,
+            "abandoned-first owns one fact and excludes the exchange"
+        );
+    }
+
+    #[test]
+    fn replay_late_invalid_fact_for_a_closed_exchange_never_clears_the_next_exchange() {
+        // Two selected-path exchanges: the first is left unfinished when the second assistant
+        // opens (its boundary close owns one fact), and a late Abandoned-first fact for the
+        // first exchange arrives while the second exchange is pending. The late fact is owned
+        // by the semantic facts pass and must not clear the second assistant's pending
+        // exchange: the owner-aware sanitizer clears only a pending exchange whose assistant
+        // entry matches the fact owner. The second exchange still projects as one stable unit
+        // with its own tool result, and the late fact emits exactly its one fact-owned
+        // diagnostic (no sanitizer diagnostic at the fact location).
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_20000000000000000000000000000001",
+                None,
+                "itm_20000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_20000000000000000000000000000002",
+                Some("ent_20000000000000000000000000000001"),
+                &["call_first"],
+                &["itm_20000000000000000000000000000002"],
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_20000000000000000000000000000003",
+                Some("ent_20000000000000000000000000000002"),
+                &["call_second"],
+                &["itm_20000000000000000000000000000003"],
+            ),
+            // Late invalid fact for the already-boundary-closed first exchange, arriving
+            // while the second exchange is pending.
+            synthetic_abandoned_tool(
+                "ent_20000000000000000000000000000004",
+                Some("ent_20000000000000000000000000000003"),
+                "itm_20000000000000000000000000000002",
+                "call_first",
+            ),
+            synthetic_tool(
+                "ent_20000000000000000000000000000005",
+                Some("ent_20000000000000000000000000000004"),
+                "itm_20000000000000000000000000000003",
+                "call_second",
+                "second done",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool"],
+            "the second exchange projects despite the late invalid fact for the first"
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[2].as_ref() else {
+            panic!("third message is the second exchange's tool result")
+        };
+        assert_eq!(content.parts()[0].as_text(), "second done");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            2,
+            "one boundary fact closing the first exchange and one fact-owned diagnostic for \
+             the late abandoned fact"
+        );
+        let details = view.diagnostics().details();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 4)
+                .count(),
+            1,
+            "the second assistant's boundary close owns exactly one fact"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 5)
+                .count(),
+            1,
+            "the late abandoned fact owns exactly its own fact and no sanitizer diagnostic"
+        );
+    }
+
+    #[test]
+    fn replay_late_valid_result_after_a_user_boundary_owns_one_diagnostic() {
+        // A selected-path assistant exchange is closed by a valid User boundary; a matching
+        // Completed result arriving afterwards is globally valid but is not model-visible, and
+        // owns exactly one `invalid_tool_exchange` diagnostic at its own tool location.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_21000000000000000000000000000001",
+                None,
+                "itm_21000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_21000000000000000000000000000002",
+                Some("ent_21000000000000000000000000000001"),
+                &["call_late"],
+                &["itm_21000000000000000000000000000002"],
+            ),
+            synthetic_user(
+                "ent_21000000000000000000000000000003",
+                Some("ent_21000000000000000000000000000002"),
+                "itm_21000000000000000000000000000003",
+                "boundary",
+            ),
+            synthetic_tool(
+                "ent_21000000000000000000000000000004",
+                Some("ent_21000000000000000000000000000003"),
+                "itm_21000000000000000000000000000002",
+                "call_late",
+                "late result",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+        assert_eq!(
+            synthetic_message_texts(&view),
+            ["root", "boundary"],
+            "the late result is not model-visible"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            2,
+            "one boundary fact closing the unfinished exchange and one fact for the late \
+             result"
+        );
+        let details = view.diagnostics().details();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 4)
+                .count(),
+            1,
+            "the user boundary close owns exactly one fact"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 5)
+                .count(),
+            1,
+            "the late result owns exactly one diagnostic at its own location"
+        );
+    }
+
+    #[test]
+    fn replay_invalid_user_and_assistant_entries_do_not_close_a_pending_exchange() {
+        // Invalid selected-path User/Assistant projections are isolated facts, not legal
+        // exchange boundaries. A duplicate User item and an Assistant whose only item is the
+        // same duplicate must not discard the earlier pending exchange before its valid Tool
+        // result arrives.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_25000000000000000000000000000001",
+                None,
+                "itm_25000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_25000000000000000000000000000002",
+                Some("ent_25000000000000000000000000000001"),
+                &["call_kept"],
+                &["itm_25000000000000000000000000000002"],
+            ),
+            synthetic_user(
+                "ent_25000000000000000000000000000003",
+                Some("ent_25000000000000000000000000000002"),
+                "itm_25000000000000000000000000000001",
+                "duplicate user",
+            ),
+            synthetic_assistant_text(
+                "ent_25000000000000000000000000000004",
+                Some("ent_25000000000000000000000000000003"),
+                "itm_25000000000000000000000000000001",
+                "duplicate assistant",
+            ),
+            synthetic_tool(
+                "ent_25000000000000000000000000000005",
+                Some("ent_25000000000000000000000000000004"),
+                "itm_25000000000000000000000000000002",
+                "call_kept",
+                "kept result",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool"],
+            "both invalid projections are skipped without closing the valid pending exchange"
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[2].as_ref() else {
+            panic!("third message is the retained tool result")
+        };
+        assert_eq!(content.parts()[0].as_text(), "kept result");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidRelation),
+            2,
+            "the duplicate User and duplicate Assistant each own their relation fact"
+        );
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            0,
+            "invalid projections are not exchange-closing boundaries"
+        );
+    }
+
+    #[test]
+    fn replay_reused_tool_call_id_never_invalidates_a_legal_response_local_owner() {
+        // Response-local ToolCallId reuse: the same ToolCallId is issued by two different
+        // assistants with different item ids. The first exchange is invalidated by its own
+        // abandoned-first fact; a late exact-pair result for the first exchange then arrives.
+        // The late result is a fact for a dead exchange and must be isolated as an orphan
+        // without falling through to ToolCallId conflict matching: it must not invalidate the
+        // second assistant's exchange, which legally reused the ToolCallId in another
+        // response. The second exchange stays model-visible with its own completed result.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_22000000000000000000000000000001",
+                None,
+                "itm_22000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_22000000000000000000000000000002",
+                Some("ent_22000000000000000000000000000001"),
+                &["call_reused"],
+                &["itm_22000000000000000000000000000002"],
+            ),
+            synthetic_abandoned_tool(
+                "ent_22000000000000000000000000000003",
+                Some("ent_22000000000000000000000000000002"),
+                "itm_22000000000000000000000000000002",
+                "call_reused",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_22000000000000000000000000000004",
+                Some("ent_22000000000000000000000000000003"),
+                &["call_reused"],
+                &["itm_22000000000000000000000000000003"],
+            ),
+            // Late exact-pair result for the invalidated first exchange, arriving while the
+            // second exchange is pending.
+            synthetic_tool(
+                "ent_22000000000000000000000000000005",
+                Some("ent_22000000000000000000000000000004"),
+                "itm_22000000000000000000000000000002",
+                "call_reused",
+                "late first",
+            ),
+            synthetic_tool(
+                "ent_22000000000000000000000000000006",
+                Some("ent_22000000000000000000000000000005"),
+                "itm_22000000000000000000000000000003",
+                "call_reused",
+                "second done",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool"],
+            "the legal response-local owner stays model-visible; the late first result never \
+             leaks"
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[2].as_ref() else {
+            panic!("third message is the second exchange's tool result")
+        };
+        assert_eq!(content.parts()[0].as_text(), "second done");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            2,
+            "the abandoned-first fact and the late orphan exact-pair result each own one fact; \
+             no collateral invalidation of the second exchange"
+        );
+        let details = view.diagnostics().details();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 4)
+                .count(),
+            1,
+            "the abandoned-first fact owns exactly one diagnostic"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 6)
+                .count(),
+            1,
+            "the late exact-pair result owns exactly one orphan diagnostic"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 5)
+                .count(),
+            0,
+            "the second assistant opening owns no diagnostic: the first exchange was already \
+             invalidated, so nothing closes at this boundary"
+        );
+    }
+
+    #[test]
+    fn replay_completed_call_id_reuse_keeps_the_pending_response_local_owner() {
+        // ToolCallId is response-local: assistant A's call_reused completes with a valid
+        // terminal, then assistant B legally reuses the same call_reused in a later response
+        // and is still pending. A malformed ToolMessage whose ItemId is never accepted
+        // anywhere (so no exact pair matches) plus call_reused is ambiguous between A and B:
+        // the live-call index retains A's terminal call, so the conflict has two live
+        // candidates and B's exchange is never invalidated. B's complete exchange stays
+        // model-visible, and only the malformed result owns one `invalid_tool_exchange`
+        // diagnostic.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_23000000000000000000000000000001",
+                None,
+                "itm_23000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_23000000000000000000000000000002",
+                Some("ent_23000000000000000000000000000001"),
+                &["call_reused"],
+                &["itm_23000000000000000000000000000002"],
+            ),
+            synthetic_tool(
+                "ent_23000000000000000000000000000003",
+                Some("ent_23000000000000000000000000000002"),
+                "itm_23000000000000000000000000000002",
+                "call_reused",
+                "first done",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_23000000000000000000000000000004",
+                Some("ent_23000000000000000000000000000003"),
+                &["call_reused"],
+                &["itm_23000000000000000000000000000003"],
+            ),
+            // Malformed result before B's correct result: the ItemId is never accepted, so
+            // no exact pair matches; the ToolCallId is ambiguous between A's terminal call
+            // and B's pending call.
+            synthetic_tool(
+                "ent_23000000000000000000000000000005",
+                Some("ent_23000000000000000000000000000004"),
+                "itm_99999999999999999999999999999999",
+                "call_reused",
+                "malformed",
+            ),
+            synthetic_tool(
+                "ent_23000000000000000000000000000006",
+                Some("ent_23000000000000000000000000000005"),
+                "itm_23000000000000000000000000000003",
+                "call_reused",
+                "second done",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool", "assistant", "tool"],
+            "both exchanges are model-visible: A's completed exchange and B's completed \
+             exchange"
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[4].as_ref() else {
+            panic!("fifth message is B's tool result")
+        };
+        assert_eq!(content.parts()[0].as_text(), "second done");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            1,
+            "only the malformed result owns one fact; B's pending exchange is never \
+             invalidated by an ambiguous response-local ToolCallId"
+        );
+        let details = view.diagnostics().details();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 6)
+                .count(),
+            1,
+            "the malformed result owns exactly one diagnostic at its own location"
+        );
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 5)
+                .count(),
+            0,
+            "B's assistant opening owns no diagnostic: A's exchange already completed, so \
+             nothing closes at this boundary"
+        );
+    }
+
+    #[test]
+    fn replay_ambiguous_result_against_a_terminal_call_retains_the_valid_exchange() {
+        // A malformed ToolMessage with a never-accepted ItemId plus a ToolCallId whose only
+        // live candidate already has a valid terminal: the fact is diagnosed as an identity
+        // conflict owned by that candidate, but the exchange is retained. The owner's pending
+        // exchange (still waiting for its second call's result) is not cleared: only a fact
+        // whose owner was actually invalidated by the semantic facts pass clears a matching
+        // pending exchange.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_24000000000000000000000000000001",
+                None,
+                "itm_24000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_24000000000000000000000000000002",
+                Some("ent_24000000000000000000000000000001"),
+                &["call_first", "call_second"],
+                &[
+                    "itm_24000000000000000000000000000002",
+                    "itm_24000000000000000000000000000003",
+                ],
+            ),
+            synthetic_tool(
+                "ent_24000000000000000000000000000003",
+                Some("ent_24000000000000000000000000000002"),
+                "itm_24000000000000000000000000000002",
+                "call_first",
+                "first done",
+            ),
+            // Malformed result: only the terminal call_first is a live candidate for this
+            // ToolCallId, so it owns the fact, but its terminal is retained and the exchange
+            // is not invalidated.
+            synthetic_tool(
+                "ent_24000000000000000000000000000004",
+                Some("ent_24000000000000000000000000000003"),
+                "itm_99999999999999999999999999999999",
+                "call_first",
+                "malformed",
+            ),
+            synthetic_tool(
+                "ent_24000000000000000000000000000005",
+                Some("ent_24000000000000000000000000000004"),
+                "itm_24000000000000000000000000000003",
+                "call_second",
+                "second done",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool", "tool"],
+            "the exchange is retained and both tool results stay model-visible"
+        );
+        let ModelMessageRef::Tool { content, .. } = view.sanitized_messages()[3].as_ref() else {
+            panic!("fourth message is the second tool result")
+        };
+        assert_eq!(content.parts()[0].as_text(), "second done");
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidToolExchange),
+            1,
+            "only the malformed result owns one fact; the terminal candidate's exchange is \
+             retained"
+        );
+        let details = view.diagnostics().details();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|detail| detail.line_number() == 5)
+                .count(),
+            1,
+            "the malformed result owns exactly one diagnostic at its own location"
+        );
+    }
+
+    #[test]
+    fn replay_isolates_off_path_branch_tool_exchanges_from_the_selected_projection() {
+        // ADR 0124/0132 branch isolation: an off-path branch assistant/tool exchange physically
+        // interleaved before the selected leaf must never close, complete, or replace the
+        // selected-path pending exchange, and an off-path incomplete exchange must never close
+        // it at a boundary. The selected assistant's exchange still projects as one stable unit
+        // in assistant call order, and a compaction marker naming its assistant origin still
+        // resolves against the current stable units.
+        let bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_1b000000000000000000000000000001",
+                None,
+                "itm_1b000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_1b000000000000000000000000000002",
+                Some("ent_1b000000000000000000000000000001"),
+                &["call_selected"],
+                &["itm_1b000000000000000000000000000002"],
+            ),
+            // Off-path branch: assistant + completed tool exchange, physically before the
+            // selected tool result.
+            synthetic_assistant_with_tool_calls(
+                "ent_1b000000000000000000000000000003",
+                Some("ent_1b000000000000000000000000000001"),
+                &["call_branch"],
+                &["itm_1b000000000000000000000000000003"],
+            ),
+            synthetic_tool(
+                "ent_1b000000000000000000000000000004",
+                Some("ent_1b000000000000000000000000000003"),
+                "itm_1b000000000000000000000000000003",
+                "call_branch",
+                "branch done",
+            ),
+            synthetic_tool(
+                "ent_1b000000000000000000000000000005",
+                Some("ent_1b000000000000000000000000000002"),
+                "itm_1b000000000000000000000000000002",
+                "call_selected",
+                "selected done",
+            ),
+            // Off-path incomplete exchange: its boundary/EOF close must not touch the selected
+            // exchange.
+            synthetic_assistant_with_tool_calls(
+                "ent_1b000000000000000000000000000006",
+                Some("ent_1b000000000000000000000000000001"),
+                &["call_incomplete"],
+                &["itm_1b000000000000000000000000000006"],
+            ),
+            synthetic_user(
+                "ent_1b000000000000000000000000000007",
+                Some("ent_1b000000000000000000000000000005"),
+                "itm_1b000000000000000000000000000007",
+                "selected leaf",
+            ),
+            // The marker names the selected exchange's assistant origin: valid only when the
+            // exchange is a current stable unit at index > 0.
+            synthetic_compaction(
+                "ent_1b000000000000000000000000000008",
+                Some("ent_1b000000000000000000000000000007"),
+                "rolling summary",
+                Some("ent_1b000000000000000000000000000002"),
+            ),
+            synthetic_assistant_text(
+                "ent_1b000000000000000000000000000009",
+                Some("ent_1b000000000000000000000000000008"),
+                "itm_1b000000000000000000000000000009",
+                "final answer",
+            ),
+        ]);
+        let view = replay_synthetic(&bytes);
+
+        assert_eq!(
+            view.selected_path(),
+            [
+                "ent_1b000000000000000000000000000001"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_1b000000000000000000000000000002"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_1b000000000000000000000000000005"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_1b000000000000000000000000000007"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_1b000000000000000000000000000008"
+                    .parse::<EntryId>()
+                    .unwrap(),
+                "ent_1b000000000000000000000000000009"
+                    .parse::<EntryId>()
+                    .unwrap(),
+            ],
+            "the off-path branch entries never enter the selected path"
+        );
+
+        // The selected exchange survives the interleaved branch: it projects as one stable unit
+        // (assistant call in call order, then its tool result), and the compaction marker
+        // resolves only because that exchange is still a current stable unit.
+        assert_eq!(
+            synthetic_message_roles(&view),
+            ["user", "assistant", "tool", "user", "assistant"],
+            "the branch exchange never leaks into the selected projection"
+        );
+        let messages = view.sanitized_messages();
+        match messages[0].as_ref() {
+            ModelMessageRef::User { content } => {
+                assert_eq!(content[0].as_text(), "rolling summary");
+            }
+            _ => panic!("first message is the applied compaction summary"),
+        }
+        match messages[1].as_ref() {
+            ModelMessageRef::Assistant { content } => {
+                assert_eq!(content.len(), 1);
+                match content[0].as_ref() {
+                    ModelAssistantContentRef::ToolCall { tool_call_id, .. } => {
+                        assert_eq!(tool_call_id.as_str(), "call_selected");
+                    }
+                    other => panic!("selected assistant projects its tool call, got {other:?}"),
+                }
+            }
+            _ => panic!("second message is the selected assistant exchange"),
+        }
+        match messages[2].as_ref() {
+            ModelMessageRef::Tool {
+                tool_call_id,
+                content,
+            } => {
+                assert_eq!(tool_call_id.as_str(), "call_selected");
+                assert_eq!(content.parts().len(), 1);
+                assert_eq!(content.parts()[0].as_text(), "selected done");
+            }
+            _ => panic!("third message is the selected tool result"),
+        }
+        match messages[3].as_ref() {
+            ModelMessageRef::User { content } => {
+                assert_eq!(content[0].as_text(), "selected leaf");
+            }
+            _ => panic!("fourth message is the selected leaf user"),
+        }
+        match messages[4].as_ref() {
+            ModelMessageRef::Assistant { content } => match content[0].as_ref() {
+                ModelAssistantContentRef::Text(text) => {
+                    assert_eq!(text, "final answer");
+                }
+                other => panic!("final assistant is plain text, got {other:?}"),
+            },
+            _ => panic!("fifth message is the final selected assistant"),
+        }
+
+        assert!(
+            view.diagnostics().is_empty(),
+            "the complete branch exchange and the off-path incomplete exchange never leak \
+             diagnostics into the selected projection"
+        );
+        assert_eq!(
+            view.historical_item_ids(),
+            [
+                "itm_1b000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_1b000000000000000000000000000002"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_1b000000000000000000000000000003"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_1b000000000000000000000000000006"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_1b000000000000000000000000000007"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                "itm_1b000000000000000000000000000009"
+                    .parse::<ItemId>()
+                    .unwrap(),
+            ],
+            "all-history semantic facts still cover every accepted entry, including off-path \
+             items; tool result items never enter the historical index"
+        );
+    }
+
+    #[test]
+    fn replay_interaction_relations_validate_requests_resolutions_and_terminal_wins() {
+        // A valid request must reference an accepted ToolCall item and have a unique RequestId;
+        // a valid resolution must reference the earlier request with matching item/family and
+        // pass the owner validator.
+        let valid = synthetic_file(&[
+            synthetic_user(
+                "ent_13000000000000000000000000000001",
+                None,
+                "itm_13000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_13000000000000000000000000000002",
+                Some("ent_13000000000000000000000000000001"),
+                &["call_q"],
+                &["itm_13000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_13000000000000000000000000000003",
+                Some("ent_13000000000000000000000000000002"),
+                "req_13000000000000000000000000000001",
+                "itm_13000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+            synthetic_interaction_resolution(
+                "ent_13000000000000000000000000000004",
+                Some("ent_13000000000000000000000000000003"),
+                "req_13000000000000000000000000000001",
+                "itm_13000000000000000000000000000002",
+                StoredInteractionResolutionBody::UserAnswer(
+                    UserQuestionAnswer::new(vec![UserQuestionFieldAnswer::text(0, "yes").unwrap()])
+                        .expect("synthetic answer"),
+                ),
+            ),
+        ]);
+        let view = replay_synthetic(&valid);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            0,
+            "the golden request/resolution relation is valid"
+        );
+
+        // A resolution without any earlier request is orphaned.
+        let orphan_resolution = synthetic_file(&[
+            synthetic_user(
+                "ent_14000000000000000000000000000001",
+                None,
+                "itm_14000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_interaction_resolution(
+                "ent_14000000000000000000000000000002",
+                Some("ent_14000000000000000000000000000001"),
+                "req_14000000000000000000000000000001",
+                "itm_14000000000000000000000000000001",
+                StoredInteractionResolutionBody::Cancelled(InteractionCancelReason::TurnCancelled),
+            ),
+        ]);
+        let view = replay_synthetic(&orphan_resolution);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // A request referencing a User item (not an accepted ToolCall) is invalid.
+        let not_tool_call = synthetic_file(&[
+            synthetic_user(
+                "ent_15000000000000000000000000000001",
+                None,
+                "itm_15000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_interaction_request(
+                "ent_15000000000000000000000000000002",
+                Some("ent_15000000000000000000000000000001"),
+                "req_15000000000000000000000000000001",
+                "itm_15000000000000000000000000000001",
+                synthetic_user_question_request(),
+            ),
+        ]);
+        let view = replay_synthetic(&not_tool_call);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // A duplicate RequestId is invalid: first valid wins.
+        let duplicate_request = synthetic_file(&[
+            synthetic_user(
+                "ent_16000000000000000000000000000001",
+                None,
+                "itm_16000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_16000000000000000000000000000002",
+                Some("ent_16000000000000000000000000000001"),
+                &["call_a"],
+                &["itm_16000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_16000000000000000000000000000003",
+                Some("ent_16000000000000000000000000000002"),
+                "req_16000000000000000000000000000001",
+                "itm_16000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+            synthetic_interaction_request(
+                "ent_16000000000000000000000000000004",
+                Some("ent_16000000000000000000000000000003"),
+                "req_16000000000000000000000000000001",
+                "itm_16000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+        ]);
+        let view = replay_synthetic(&duplicate_request);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // A resolution with the right RequestId but the wrong item is invalid.
+        let wrong_item = synthetic_file(&[
+            synthetic_user(
+                "ent_17000000000000000000000000000001",
+                None,
+                "itm_17000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_17000000000000000000000000000002",
+                Some("ent_17000000000000000000000000000001"),
+                &["call_b"],
+                &["itm_17000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_17000000000000000000000000000003",
+                Some("ent_17000000000000000000000000000002"),
+                "req_17000000000000000000000000000001",
+                "itm_17000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+            synthetic_interaction_resolution(
+                "ent_17000000000000000000000000000004",
+                Some("ent_17000000000000000000000000000003"),
+                "req_17000000000000000000000000000001",
+                "itm_17000000000000000000000000000099",
+                StoredInteractionResolutionBody::Cancelled(InteractionCancelReason::TurnCancelled),
+            ),
+        ]);
+        let view = replay_synthetic(&wrong_item);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // A family mismatch (UserQuestion request answered by a ToolApproval resolution) is
+        // invalid even though both values are owner-valid in isolation.
+        let family_mismatch = synthetic_file(&[
+            synthetic_user(
+                "ent_18000000000000000000000000000001",
+                None,
+                "itm_18000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_18000000000000000000000000000002",
+                Some("ent_18000000000000000000000000000001"),
+                &["call_c"],
+                &["itm_18000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_18000000000000000000000000000003",
+                Some("ent_18000000000000000000000000000002"),
+                "req_18000000000000000000000000000001",
+                "itm_18000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+            synthetic_interaction_resolution(
+                "ent_18000000000000000000000000000004",
+                Some("ent_18000000000000000000000000000003"),
+                "req_18000000000000000000000000000001",
+                "itm_18000000000000000000000000000002",
+                StoredInteractionResolutionBody::ToolApproval(
+                    ToolApprovalResolution::reconstruct_allowed(
+                        0,
+                        ToolApprovalOptionKindView::AsRequested,
+                    ),
+                ),
+            ),
+        ]);
+        let view = replay_synthetic(&family_mismatch);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // A UserAnswer that fails the UserQuestion validator (unknown question index) is
+        // invalid even though the RequestId/item/family all match.
+        let invalid_answer = synthetic_file(&[
+            synthetic_user(
+                "ent_19000000000000000000000000000001",
+                None,
+                "itm_19000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_19000000000000000000000000000002",
+                Some("ent_19000000000000000000000000000001"),
+                &["call_d"],
+                &["itm_19000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_19000000000000000000000000000003",
+                Some("ent_19000000000000000000000000000002"),
+                "req_19000000000000000000000000000001",
+                "itm_19000000000000000000000000000002",
+                synthetic_user_question_request(),
+            ),
+            synthetic_interaction_resolution(
+                "ent_19000000000000000000000000000004",
+                Some("ent_19000000000000000000000000000003"),
+                "req_19000000000000000000000000000001",
+                "itm_19000000000000000000000000000002",
+                StoredInteractionResolutionBody::UserAnswer(
+                    UserQuestionAnswer::new(vec![
+                        UserQuestionFieldAnswer::text(7, "nope").unwrap(),
+                    ])
+                    .expect("synthetic out-of-range answer"),
+                ),
+            ),
+        ]);
+        let view = replay_synthetic(&invalid_answer);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1
+        );
+
+        // First terminal resolution wins: a second resolution for the same request is isolated
+        // even when it is owner-valid on its own.
+        let second_resolution = synthetic_file(&[
+            synthetic_user(
+                "ent_1a000000000000000000000000000001",
+                None,
+                "itm_1a000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_assistant_with_tool_calls(
+                "ent_1a000000000000000000000000000002",
+                Some("ent_1a000000000000000000000000000001"),
+                &["call_e"],
+                &["itm_1a000000000000000000000000000002"],
+            ),
+            synthetic_interaction_request(
+                "ent_1a000000000000000000000000000003",
+                Some("ent_1a000000000000000000000000000002"),
+                "req_1a000000000000000000000000000001",
+                "itm_1a000000000000000000000000000002",
+                synthetic_tool_approval_request(),
+            ),
+            synthetic_interaction_resolution(
+                "ent_1a000000000000000000000000000004",
+                Some("ent_1a000000000000000000000000000003"),
+                "req_1a000000000000000000000000000001",
+                "itm_1a000000000000000000000000000002",
+                StoredInteractionResolutionBody::ToolApproval(
+                    ToolApprovalResolution::reconstruct_allowed(
+                        0,
+                        ToolApprovalOptionKindView::AsRequested,
+                    ),
+                ),
+            ),
+            synthetic_interaction_resolution(
+                "ent_1a000000000000000000000000000005",
+                Some("ent_1a000000000000000000000000000004"),
+                "req_1a000000000000000000000000000001",
+                "itm_1a000000000000000000000000000002",
+                StoredInteractionResolutionBody::ToolApproval(
+                    ToolApprovalResolution::reconstruct_allowed(
+                        0,
+                        ToolApprovalOptionKindView::AsRequested,
+                    ),
+                ),
+            ),
+        ]);
+        let view = replay_synthetic(&second_resolution);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::InvalidInteractionRelation),
+            1,
+            "first terminal resolution wins; the later one is isolated"
+        );
+    }
+
+    #[test]
+    fn replay_diagnostics_keep_physical_order_across_scan_and_semantic_passes() {
+        // The semantic pass runs after the physical scan, so its invalid_relation fact at line 3
+        // must still land ahead of the 150 later malformed-line scan facts in the retained
+        // details, and the truncation totals cover every observed source fact.
+        let mut bytes = synthetic_file(&[
+            synthetic_user(
+                "ent_0f000000000000000000000000000001",
+                None,
+                "itm_0f000000000000000000000000000001",
+                "root",
+            ),
+            synthetic_user(
+                "ent_0f000000000000000000000000000002",
+                Some("ent_0f000000000000000000000000000001"),
+                "itm_0f000000000000000000000000000001",
+                "duplicate item",
+            ),
+        ]);
+        for _ in 0..150 {
+            bytes.extend_from_slice(b"not json\n");
+        }
+        let view = replay_synthetic(&bytes);
+        let diagnostics = view.diagnostics();
+        assert_eq!(diagnostics.details().len(), 100);
+        assert_eq!(diagnostics.details()[0].line_number(), 3);
+        assert_eq!(
+            diagnostics.details()[0].code(),
+            ConversationReplayDiagnosticCode::InvalidRelation
+        );
+        assert_eq!(diagnostics.details()[1].line_number(), 4);
+        assert_eq!(
+            diagnostics.details()[1].code(),
+            ConversationReplayDiagnosticCode::MalformedJson
+        );
+        assert_eq!(
+            diagnostics.count(ConversationReplayDiagnosticCode::MalformedJson),
+            150
+        );
+        assert_eq!(
+            diagnostics.count(ConversationReplayDiagnosticCode::InvalidRelation),
+            1
+        );
+        assert_eq!(
+            diagnostics.count(ConversationReplayDiagnosticCode::DiagnosticsTruncated),
+            1
+        );
+        let truncation = diagnostics
+            .truncation()
+            .expect("omitted details produce one truncation summary");
+        assert_eq!(
+            truncation.omitted_details(),
+            51,
+            "151 facts minus 100 retained"
+        );
+        assert_eq!(
+            truncation
+                .totals()
+                .get(&ConversationReplayDiagnosticCode::MalformedJson),
+            Some(&150)
+        );
+        assert_eq!(
+            truncation
+                .totals()
+                .get(&ConversationReplayDiagnosticCode::InvalidRelation),
+            Some(&1)
+        );
+        assert_eq!(
+            truncation.totals().len(),
+            2,
+            "the totals carry every observed source fact and never diagnostics_truncated"
+        );
+    }
+
+    #[test]
+    fn replay_diagnostics_retain_one_hundred_details_then_truncate() {
+        let mut bytes = HEADER_ONLY.to_vec();
+        for _ in 0..150 {
+            bytes.extend_from_slice(b"not json\n");
+        }
+        let view = replay_synthetic(&bytes);
+        let diagnostics = view.diagnostics();
+        assert_eq!(
+            diagnostics.count(ConversationReplayDiagnosticCode::MalformedJson),
+            150,
+            "every malformed line is counted in the aggregate"
+        );
+        assert_eq!(
+            diagnostics.count(ConversationReplayDiagnosticCode::DiagnosticsTruncated),
+            1,
+            "exactly one truncation summary"
+        );
+        assert_eq!(
+            diagnostics.details().len(),
+            100,
+            "first 100 details retained"
+        );
+        assert_eq!(
+            diagnostics.details()[0].line_number(),
+            2,
+            "the first retained detail is the first physical fault"
+        );
+        assert_eq!(
+            diagnostics.details()[0].code(),
+            ConversationReplayDiagnosticCode::MalformedJson
+        );
+        let truncation = diagnostics
+            .truncation()
+            .expect("omitted details produce one truncation summary");
+        assert_eq!(truncation.omitted_details(), 50);
+        assert_eq!(
+            truncation
+                .totals()
+                .get(&ConversationReplayDiagnosticCode::MalformedJson),
+            Some(&150),
+            "the truncation summary carries the final aggregate totals"
+        );
+        assert_eq!(truncation.totals().len(), 1);
+    }
+
+    #[test]
+    fn replay_cold_view_diagnostics_and_errors_are_redacted() {
+        let bytes = synthetic_file(&[synthetic_user(
+            "ent_0b000000000000000000000000000001",
+            None,
+            "itm_0b000000000000000000000000000001",
+            "secret conversation text /private/path",
+        )]);
+        let view = replay_synthetic(&bytes);
+        let rendered = format!("{view:?} {:?} {}", view.diagnostics(), view.diagnostics());
+        for secret in [
+            "ses_11111111111111111111111111111111",
+            "ent_0b000000000000000000000000000001",
+            "itm_0b000000000000000000000000000001",
+            "trn_33333333333333333333333333333333",
+            "secret conversation text",
+            "/private/path",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "replay Debug/Display leaked {secret}"
+            );
+        }
+
+        let missing_header = replay_fixture(
+            b"secret conversation text /private/path\n",
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("session id is valid"),
+        );
+        let error = missing_header.expect_err("malformed header line must fail replay");
+        let rendered_error = format!("{error:?} {error}");
+        for secret in ["secret conversation text", "/private/path"] {
+            assert!(
+                !rendered_error.contains(secret),
+                "replay error leaked {secret}"
+            );
+        }
+
+        let too_large = replay_conversation(
+            Cursor::new(Vec::new()),
+            MAX_CONVERSATION_FILE_BYTES + 1,
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("session id is valid"),
+            ConversationScanAccess::ReadOnly,
+        );
+        assert_eq!(
+            too_large.unwrap_err(),
+            ConversationReplayError::HistoryTooLarge,
+            "the physical file cap maps to the wire HistoryTooLarge outcome"
+        );
+    }
+
+    #[test]
+    fn replay_maps_scanner_failures_to_typed_redacted_errors() {
+        for (scanner_error, expected) in [
+            (
+                ConversationScanError::FileTooLarge,
+                ConversationReplayError::HistoryTooLarge,
+            ),
+            (
+                ConversationScanError::HistoryTooLarge,
+                ConversationReplayError::HistoryTooLarge,
+            ),
+            (
+                ConversationScanError::HeaderCorrupt {
+                    code: ConversationCodecError::JsonSyntax,
+                },
+                ConversationReplayError::HeaderCorrupt,
+            ),
+            (
+                ConversationScanError::UnsupportedFormatVersion,
+                ConversationReplayError::UnsupportedFormatVersion,
+            ),
+            (
+                ConversationScanError::MissingHeader,
+                ConversationReplayError::MissingHeader,
+            ),
+            (
+                ConversationScanError::LeaseMismatch,
+                ConversationReplayError::LeaseMismatch,
+            ),
+            (
+                ConversationScanError::InputChanged,
+                ConversationReplayError::InputChanged,
+            ),
+            (
+                ConversationScanError::InputUnavailable,
+                ConversationReplayError::InputUnavailable,
+            ),
+            (
+                ConversationScanError::CounterOverflow,
+                ConversationReplayError::CounterOverflow,
+            ),
+            (
+                ConversationScanError::InvariantViolation,
+                ConversationReplayError::InvariantViolation,
+            ),
+        ] {
+            assert_eq!(map_replay_scan_error(scanner_error), expected);
+        }
+
+        let empty = replay_conversation(
+            Cursor::new(Vec::new()),
+            0,
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("session id is valid"),
+            ConversationScanAccess::ReadOnly,
+        );
+        assert_eq!(empty.unwrap_err(), ConversationReplayError::MissingHeader);
+
+        let malformed_header = replay_fixture(
+            b"not json\n",
+            "ses_11111111111111111111111111111111"
+                .parse()
+                .expect("session id is valid"),
+        );
+        assert_eq!(
+            malformed_header.unwrap_err(),
+            ConversationReplayError::HeaderCorrupt
+        );
+    }
+
+    #[test]
+    fn replay_cold_state_never_reconstructs_current_turn() {
+        for case in CORRUPTION_CASES {
+            let expected: Value =
+                serde_json::from_str(case.expected).expect("expected sidecar is JSON");
+            if expected["load"].as_str() == Some("fails") {
+                continue;
+            }
+            let session_id = fixture_session(case.bytes);
+            let view = replay_fixture(case.bytes, session_id)
+                .unwrap_or_else(|error| panic!("{}: replay must load: {error}", case.name));
+            assert_eq!(
+                view.current_turn(),
+                None,
+                "{}: replay never reconstructs a current turn",
+                case.name
+            );
+        }
     }
 }

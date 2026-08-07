@@ -77,6 +77,19 @@ pub(crate) enum ConversationCodecError {
     UnexpectedRecordKind,
 }
 
+/// Bounded decode facts counted while one entry line was projected. The seam carries only
+/// counts, never the raw line or the dropped values, so the scanner can relay salvage facts to
+/// the tolerant replay owner without retaining physical bytes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConversationDecodeFacts {
+    /// Contribution stamps dropped because they are malformed, unknown, out of range, or
+    /// violate the closed stamp contract. The surviving user body keeps its full valid text.
+    pub(crate) invalid_contribution_stamps: u64,
+    /// Contribution stamps dropped because their part index or origin duplicates a stamp that
+    /// was already kept for this message.
+    pub(crate) duplicate_contribution_stamps: u64,
+}
+
 /// A bounded, fully typed V1 JSONL record. It never exposes the parser's raw JSON tree.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ConversationRecord {
@@ -100,6 +113,16 @@ impl ConversationLineCodec {
     pub(crate) fn decode_record(
         input: &[u8],
     ) -> Result<ConversationRecord, ConversationCodecError> {
+        Self::decode_record_with_facts(input, &mut ConversationDecodeFacts::default())
+    }
+
+    /// Bounded decode-facts seam: like `decode_record`, but also counts independently degradable
+    /// nested facts (currently dropped contribution stamps) that the scanner carries through its
+    /// Entry events without retaining the raw line.
+    pub(crate) fn decode_record_with_facts(
+        input: &[u8],
+        facts: &mut ConversationDecodeFacts,
+    ) -> Result<ConversationRecord, ConversationCodecError> {
         if input.len() > MAX_CONVERSATION_ENTRY_BYTES {
             return Err(ConversationCodecError::LineTooLarge);
         }
@@ -107,7 +130,7 @@ impl ConversationLineCodec {
         let node = parse_node(input, JsonParseLimits::conversation(preflight.input_limit))
             .map_err(map_json_error)?;
         let mut tool_call_arguments = preflight.tool_call_arguments.into_iter();
-        let record = decode_record_node(&node, input.len(), &mut tool_call_arguments)?;
+        let record = decode_record_node(&node, input.len(), &mut tool_call_arguments, facts)?;
         if tool_call_arguments.next().is_some() {
             return Err(ConversationCodecError::InvalidShape);
         }
@@ -130,11 +153,26 @@ impl ConversationLineCodec {
         Ok(header)
     }
 
+    #[allow(
+        dead_code,
+        reason = "the M3 codec entry point remains available to focused codec tests while the scanner consumes the facts seam"
+    )]
     pub(crate) fn decode_entry_for_session(
         input: &[u8],
         header_session_id: SessionId,
     ) -> Result<StoredSessionEntry, ConversationCodecError> {
-        let ConversationRecord::Entry(entry) = Self::decode_record(input)? else {
+        let mut facts = ConversationDecodeFacts::default();
+        Self::decode_entry_for_session_with_facts(input, header_session_id, &mut facts)
+    }
+
+    /// Bounded decode-facts seam: like `decode_entry_for_session`, but also returns the counted
+    /// salvage facts for this line. The scanner Entry event carries only these counts.
+    pub(crate) fn decode_entry_for_session_with_facts(
+        input: &[u8],
+        header_session_id: SessionId,
+        facts: &mut ConversationDecodeFacts,
+    ) -> Result<StoredSessionEntry, ConversationCodecError> {
+        let ConversationRecord::Entry(entry) = Self::decode_record_with_facts(input, facts)? else {
             return Err(ConversationCodecError::UnexpectedRecordKind);
         };
         if entry.session_id() != header_session_id {
@@ -641,6 +679,7 @@ fn decode_record_node(
     node: &JsonNode,
     input_len: usize,
     tool_call_arguments: &mut std::vec::IntoIter<BoundedJsonObject>,
+    facts: &mut ConversationDecodeFacts,
 ) -> Result<ConversationRecord, ConversationCodecError> {
     let root = as_object(node)?;
     let record_type = string(required(root, "type")?)?;
@@ -656,6 +695,7 @@ fn decode_record_node(
         "entry" => Ok(ConversationRecord::Entry(Box::new(decode_entry(
             data,
             tool_call_arguments,
+            facts,
         )?))),
         _ => Err(ConversationCodecError::UnknownRecordVariant),
     }
@@ -702,6 +742,7 @@ fn decode_initial_agent(node: &JsonNode) -> Result<AgentRevisionRef, Conversatio
 fn decode_entry(
     node: &JsonNode,
     tool_call_arguments: &mut std::vec::IntoIter<BoundedJsonObject>,
+    facts: &mut ConversationDecodeFacts,
 ) -> Result<StoredSessionEntry, ConversationCodecError> {
     let data = as_object(node)?;
     // Entry objects are additive-compatible after a valid V1 header. Structural limits have
@@ -711,7 +752,7 @@ fn decode_entry(
     let session_id = scalar(required(data, "sessionId")?)?;
     let turn_id = scalar(required(data, "turnId")?)?;
     let timestamp = scalar(required(data, "timestamp")?)?;
-    let body = decode_body(required(data, "body")?, tool_call_arguments)?;
+    let body = decode_body(required(data, "body")?, tool_call_arguments, facts)?;
     Ok(StoredSessionEntry::reconstruct(
         entry_id, parent_id, session_id, turn_id, timestamp, body,
     ))
@@ -720,12 +761,13 @@ fn decode_entry(
 fn decode_body(
     node: &JsonNode,
     tool_call_arguments: &mut std::vec::IntoIter<BoundedJsonObject>,
+    facts: &mut ConversationDecodeFacts,
 ) -> Result<StoredEntryBody, ConversationCodecError> {
     let object = as_object(node)?;
     let body_type = string(required(object, "type")?)?;
     let data = required(object, "data")?;
     match body_type {
-        "user_message" => decode_user_message(data).map(StoredEntryBody::UserMessage),
+        "user_message" => decode_user_message(data, facts).map(StoredEntryBody::UserMessage),
         "assistant_message" => decode_assistant_message(data, tool_call_arguments)
             .map(StoredEntryBody::AssistantMessage),
         "tool_message" => decode_tool_message(data).map(StoredEntryBody::ToolMessage),
@@ -740,7 +782,10 @@ fn decode_body(
     }
 }
 
-fn decode_user_message(node: &JsonNode) -> Result<StoredUserMessage, ConversationCodecError> {
+fn decode_user_message(
+    node: &JsonNode,
+    facts: &mut ConversationDecodeFacts,
+) -> Result<StoredUserMessage, ConversationCodecError> {
     let object = as_object(node)?;
     let item_id = scalar(required(object, "itemId")?)?;
     let source = match string(required(object, "source")?)? {
@@ -748,11 +793,14 @@ fn decode_user_message(node: &JsonNode) -> Result<StoredUserMessage, Conversatio
         "steer" => UserMessageSource::Steer,
         _ => return Err(ConversationCodecError::UnknownLeafVariant),
     };
-    let content = decode_user_content(required(object, "content")?)?;
+    let content = decode_user_content_with_facts(required(object, "content")?, facts)?;
     Ok(StoredUserMessage::reconstruct(item_id, source, content))
 }
 
-fn decode_user_content(node: &JsonNode) -> Result<CanonicalUserMessage, ConversationCodecError> {
+fn decode_user_content_with_facts(
+    node: &JsonNode,
+    facts: &mut ConversationDecodeFacts,
+) -> Result<CanonicalUserMessage, ConversationCodecError> {
     let object = as_object(node)?;
     let parts = array(required(object, "parts")?)?
         .iter()
@@ -761,22 +809,41 @@ fn decode_user_content(node: &JsonNode) -> Result<CanonicalUserMessage, Conversa
     let message =
         MessageRecord::reconstruct(parts).map_err(|_| ConversationCodecError::InvalidSemantic)?;
 
-    // Stamps are intentionally the one independently degradable nested element. M3 only returns
-    // the surviving value; M5 will own any diagnostics for dropped facts.
+    // Stamps are intentionally the one independently degradable nested element. The codec keeps
+    // the same survivor set as M3 while the decode-facts seam counts each dropped stamp so the
+    // tolerant replay owner can diagnose it without any raw line.
     let mut stamps = Vec::new();
     let mut seen_indices = std::collections::BTreeSet::new();
     let mut seen_origins = std::collections::BTreeSet::new();
     let mut previous_index = None;
     for stamp in array(required(object, "contributionStamps")?)? {
         let Ok(stamp) = decode_stamp(stamp) else {
+            facts.invalid_contribution_stamps = facts
+                .invalid_contribution_stamps
+                .checked_add(1)
+                .expect("decode-fact counters cannot overflow");
             continue;
         };
         let index = stamp.content_part_index() as usize;
-        if index >= message.content().len()
-            || previous_index.is_some_and(|previous| index <= previous)
-            || seen_indices.contains(&index)
-            || seen_origins.contains(stamp.origin())
-        {
+        if index >= message.content().len() {
+            facts.invalid_contribution_stamps = facts
+                .invalid_contribution_stamps
+                .checked_add(1)
+                .expect("decode-fact counters cannot overflow");
+            continue;
+        }
+        if seen_indices.contains(&index) || seen_origins.contains(stamp.origin()) {
+            facts.duplicate_contribution_stamps = facts
+                .duplicate_contribution_stamps
+                .checked_add(1)
+                .expect("decode-fact counters cannot overflow");
+            continue;
+        }
+        if previous_index.is_some_and(|previous| index <= previous) {
+            facts.invalid_contribution_stamps = facts
+                .invalid_contribution_stamps
+                .checked_add(1)
+                .expect("decode-fact counters cannot overflow");
             continue;
         }
         seen_indices.insert(index);
