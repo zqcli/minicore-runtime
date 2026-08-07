@@ -59,19 +59,41 @@ pub(crate) enum StoredValueError {
     InteractionResolution,
 }
 
-/// Opaque evidence that Conversation Storage opened one physical conversation file for exclusive
+/// Opaque evidence that DurableState opened one physical conversation file for exclusive
 /// writable use.
 ///
-/// This is deliberately only a file-binding capability: it records the Session identity and the
-/// physical length observed while opening the file. It does not acquire, hold, or emulate an OS
-/// lock. M5.0 will add the owning storage path that can create this proof after it has acquired a
-/// real lease.
+/// DurableState is the sole production issuer: while holding the root lease, it binds the Session
+/// identity and physical length observed from the same-open file into this proof. The proof does
+/// not acquire, hold, or emulate an OS lock; Conversation Storage only consumes its private
+/// append-capable handle when it needs to perform the corresponding write work.
+#[allow(
+    dead_code,
+    reason = "the DurableState-issued append handle is consumed by the pending Recorder seam"
+)]
 pub(crate) struct ExclusiveWritableConversationLease {
     session_id: SessionId,
     declared_file_bytes: u64,
+    file: Option<File>,
 }
 
+#[allow(
+    dead_code,
+    reason = "the DurableState-issued append handle is consumed by the pending Recorder seam"
+)]
 impl ExclusiveWritableConversationLease {
+    /// Constructs the production proof from DurableState's same-open append-capable handle.
+    pub(crate) fn from_durable_state(
+        session_id: SessionId,
+        declared_file_bytes: u64,
+        file: File,
+    ) -> Self {
+        Self {
+            session_id,
+            declared_file_bytes,
+            file: Some(file),
+        }
+    }
+
     pub(crate) const fn session_id(&self) -> SessionId {
         self.session_id
     }
@@ -80,12 +102,93 @@ impl ExclusiveWritableConversationLease {
         self.declared_file_bytes
     }
 
+    /// Gives the append handle only to Conversation Storage's internal consumer.
+    pub(crate) fn into_file(self) -> Option<File> {
+        self.file
+    }
+
     #[cfg(test)]
     pub(crate) const fn for_scanner_test(session_id: SessionId, declared_file_bytes: u64) -> Self {
         Self {
             session_id,
             declared_file_bytes,
+            file: None,
         }
+    }
+}
+
+impl fmt::Debug for ExclusiveWritableConversationLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExclusiveWritableConversationLease")
+            .field("session_id", &"redacted")
+            .field("declared_file_bytes", &self.declared_file_bytes)
+            .finish()
+    }
+}
+
+/// Opaque physical target for one published conversation opened by DurableState.
+///
+/// The target keeps only the Session identity, the same-open declared length, and an
+/// append-capable handle. It never stores or exposes the target path. Conversation Storage may
+/// consume it into the file and its paired writable proof; lifecycle callers see only this opaque
+/// capability.
+#[allow(
+    dead_code,
+    reason = "the DurableState-issued target is consumed by the pending Recorder seam"
+)]
+pub(crate) struct PublishedConversationTarget {
+    session_id: SessionId,
+    declared_file_bytes: u64,
+    file: File,
+    writable_lease: ExclusiveWritableConversationLease,
+}
+
+#[allow(
+    dead_code,
+    reason = "the DurableState-issued target is consumed by the pending Recorder seam"
+)]
+impl PublishedConversationTarget {
+    /// Constructs the production target and paired proof from DurableState's same-open handles.
+    pub(crate) fn from_durable_state(
+        session_id: SessionId,
+        declared_file_bytes: u64,
+        file: File,
+        writable_file: File,
+    ) -> Self {
+        Self {
+            session_id,
+            declared_file_bytes,
+            file,
+            writable_lease: ExclusiveWritableConversationLease::from_durable_state(
+                session_id,
+                declared_file_bytes,
+                writable_file,
+            ),
+        }
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn declared_file_bytes(&self) -> u64 {
+        self.declared_file_bytes
+    }
+
+    /// Splits the target into its append-capable handle and its DurableState-issued proof.
+    pub(crate) fn into_parts(self) -> (File, ExclusiveWritableConversationLease) {
+        (self.file, self.writable_lease)
+    }
+}
+
+impl fmt::Debug for PublishedConversationTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedConversationTarget")
+            .field("session_id", &"redacted")
+            .field("declared_file_bytes", &self.declared_file_bytes)
+            .finish()
     }
 }
 

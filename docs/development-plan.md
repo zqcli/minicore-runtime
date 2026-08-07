@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、replay/Recorder-backed full Load、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending；M5.1 Recorder与M5.2 semantic replay pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target与same-open writable proof已完成，Recorder与M5.2 semantic replay pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、replay/Recorder-backed full Load、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -384,6 +384,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 实现：
 
+- [x] DurableState-issued `PublishedConversationTarget`：在root lease下owner-tracked打开已发布conversation，严格校验initial Header、bounded physical length、regular-file mode与same-open path/handle identity；由Conversation Storage从same-open handle clone出opaque writable proof；
 - open/use M5.0已经发布的valid Header与writable conversation proof；initial Header creation属于M5.0；
 - single ordered `record(entry).await`；
 - encode完成且size合法后才进行第一次write；
