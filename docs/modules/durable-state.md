@@ -1,6 +1,6 @@
 # DurableState 架构设计
 
-状态：M5.0 design gate、production recovery/root lease/owner-tracked actor、private reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer，以及exact historical Agent/Session definition resolution已实现；crate-private loaded Ready+Idle SessionExecutor已消费Workspace definition durable publication并完成required Snapshot install/post-commit poison；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration及完整cross-platform native matrix pending（ADR 0136、0137）
+状态：M5.0 production durable foundation与exact historical definition resolution已实现；loaded Ready+Idle SessionExecutor及Runtime residency actor已消费definition/lifecycle durable seams并完成required Snapshot install、unloaded exclusion与post-commit poison；public Runtime command、remaining Fork anchors/LiveSnapshot及完整cross-platform native matrix pending（ADR 0136、0137）
 日期：2026-08-03
 
 ## 目的

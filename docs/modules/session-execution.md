@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；crate-private loaded Ready+Idle `SessionExecutor` actor、immutable snapshot read model、typed Workspace definition publication permit、owner-tracked publication task、pre/post-commit settlement与close drain foundation已实现；Runtime loaded registry、Load/Unload、public Snapshot/Event、Turn admission与`ActiveTurnTask` pending）
+状态：当前权威架构（ADR 0137后；crate-private loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion与unified loaded/unloaded Workspace update foundation已实现；public Snapshot/Event、replay/Recorder-backed full Load、active-Turn grace Unload、Turn admission与`ActiveTurnTask` pending）
 日期：2026-07-31
 
 ## 目的

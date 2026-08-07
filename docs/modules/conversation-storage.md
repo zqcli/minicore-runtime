@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、exact historical definition resolution与crate-private loaded Ready+Idle Workspace definition publication owner完成；published conversation target/writable proof、non-Genesis/LiveSnapshot Fork semantic streaming、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、Recorder与semantic replay pending）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、Runtime Ready+Idle residency/Load/Unload foundation完成；published conversation target/writable proof、non-Genesis/LiveSnapshot Fork semantic streaming、replay/Recorder-backed full Load、active-Turn grace Unload、Recorder与semantic replay pending）
 日期：2026-07-31
 
 ## 目的

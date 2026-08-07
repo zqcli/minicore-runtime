@@ -6,8 +6,18 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
+use crate::agent_session_lifecycle::SealedSessionLifecycleAttempt;
 use crate::durable_state::{DurableOpenError, DurableState};
 use crate::runtime_task::RuntimeTaskContext;
+use crate::session_execution::{SessionExecutorSnapshot, SessionWorkspaceDefinitionOutcome};
+use crate::session_residency::{
+    SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
+    SessionResidencyRegistry, SessionResidencySnapshotError, SessionResidencyStartError,
+    SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
+    SessionResidencyWorkspaceDefinitionError,
+};
+use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp};
+use crate::workspace::{Workspace, WorkspaceResolver};
 
 /// Host configuration for a MiniCore runtime instance.
 #[non_exhaustive]
@@ -88,7 +98,29 @@ impl MiniCoreRuntime {
                 }
             };
 
-        let inner = Arc::new(RuntimeInner::new(task_context, durable_state));
+        let resolver = Arc::new(WorkspaceResolver::new(task_context.clone()));
+        let session_residency = match SessionResidencyRegistry::start(
+            task_context.clone(),
+            durable_state.clone(),
+            resolver,
+        ) {
+            Ok(session_residency) => Arc::new(session_residency),
+            Err(error) => {
+                durable_state.close().await;
+                return Err(match error {
+                    SessionResidencyStartError::Closing
+                    | SessionResidencyStartError::InternalDispatchUnavailable => {
+                        RuntimeInitializationError::RuntimeDependencyUnavailable
+                    }
+                });
+            }
+        };
+
+        let inner = Arc::new(RuntimeInner::new(
+            task_context,
+            durable_state,
+            session_residency,
+        ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
     }
@@ -128,16 +160,22 @@ impl From<DurableOpenError> for RuntimeInitializationError {
 struct RuntimeInner {
     task_context: RuntimeTaskContext,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
+    session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
     lifecycle: Mutex<RuntimeLifecycle>,
     lifecycle_changed: Notify,
 }
 
 impl RuntimeInner {
-    fn new(task_context: RuntimeTaskContext, durable_state: DurableState) -> Self {
+    fn new(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        session_residency: Arc<SessionResidencyRegistry>,
+    ) -> Self {
         Self {
             task_context,
             retained_until_shutdown: Mutex::new(None),
+            session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
             lifecycle: Mutex::new(RuntimeLifecycle::Open),
             lifecycle_changed: Notify::new(),
@@ -159,6 +197,7 @@ impl RuntimeInner {
             };
         }
         drop(lifecycle);
+        self.request_session_residency_closing();
         self.request_durable_actor_closing();
         self.task_context.request_closing();
         if changed {
@@ -176,9 +215,15 @@ impl RuntimeInner {
 
             match self.begin_shutdown() {
                 RuntimeShutdownAttempt::Leader(mut leadership) => {
-                    // Keep the original owner in the mutex while awaiting. A cancelled leader
-                    // therefore retains both the DurableState resource owner and its root lease
-                    // for the next shutdown leader to take over.
+                    // Keep each original owner in its mutex while awaiting. A cancelled leader
+                    // therefore retains the loaded executors, DurableState, and root lease for
+                    // the next shutdown leader to take over.
+                    let session_residency = lock(&self.session_residency).as_ref().cloned();
+                    if let Some(session_residency) = session_residency {
+                        session_residency.close().await;
+                        let removed = lock(&self.session_residency).take();
+                        drop(removed);
+                    }
                     let durable_state = lock(&self.durable_state).as_ref().cloned();
                     if let Some(durable_state) = durable_state {
                         durable_state.close().await;
@@ -200,6 +245,99 @@ impl RuntimeInner {
     fn request_durable_actor_closing(&self) {
         if let Some(durable_state) = lock(&self.durable_state).as_ref() {
             durable_state.request_closing();
+        }
+    }
+
+    fn request_session_residency_closing(&self) {
+        if let Some(session_residency) = lock(&self.session_residency).as_ref() {
+            session_residency.request_closing();
+        }
+    }
+
+    fn residency(&self) -> Option<Arc<SessionResidencyRegistry>> {
+        lock(&self.session_residency).as_ref().cloned()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending public Session load route consumes this Runtime-owned seam"
+    )]
+    async fn load_session_ready_idle(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionResidencyLoadOutcome, SessionResidencyLoadError> {
+        match self.residency() {
+            Some(residency) => residency.load_ready_idle(session_id).await,
+            None => Err(SessionResidencyLoadError::Closing),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending public Session unload route consumes this Runtime-owned seam"
+    )]
+    async fn unload_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionResidencyUnloadOutcome, SessionResidencyUnloadError> {
+        match self.residency() {
+            Some(residency) => residency.unload(session_id).await,
+            None => Err(SessionResidencyUnloadError::Closing),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending public Session lifecycle routes consume this owner seam"
+    )]
+    async fn update_session_lifecycle(
+        &self,
+        attempt: SealedSessionLifecycleAttempt,
+    ) -> Result<crate::durable_state::DurableSessionLifecycleOutcome, SessionResidencyLifecycleError>
+    {
+        match self.residency() {
+            Some(residency) => residency.update_lifecycle(attempt).await,
+            None => Err(SessionResidencyLifecycleError::Closing),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending public Session snapshot route consumes this owner seam"
+    )]
+    async fn loaded_session_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError> {
+        match self.residency() {
+            Some(residency) => residency.snapshot(session_id).await,
+            None => Err(SessionResidencySnapshotError::Closing),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the pending Session definition command consumes this owner seam"
+    )]
+    async fn update_session_workspace_definition(
+        &self,
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        workspace: Workspace,
+        owner_timestamp: Timestamp,
+    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+        match self.residency() {
+            Some(residency) => {
+                residency
+                    .update_workspace_definition(
+                        session_id,
+                        expected_revision,
+                        workspace,
+                        owner_timestamp,
+                    )
+                    .await
+            }
+            None => Err(SessionResidencyWorkspaceDefinitionError::Closing),
         }
     }
 
@@ -303,6 +441,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::num::NonZeroU32;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -314,7 +453,24 @@ mod tests {
     use super::{
         MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError, RuntimeLifecycle,
     };
+    use crate::agent_session_lifecycle::{
+        SealedAgentCreateAttempt, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt,
+        SessionModelConfig,
+    };
+    use crate::model_gateway::{ModelSelection, ReasoningPreference};
+    use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
     use crate::runtime_task::RuntimeTaskError;
+    use crate::session_execution::SessionExecutionState;
+    use crate::session_residency::{
+        SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
+        SessionResidencyUnloadOutcome,
+    };
+    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
+    use crate::workspace::{
+        RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
+        WorkspacePathTarget, WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy,
+        lower_workspace,
+    };
 
     static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -351,6 +507,130 @@ mod tests {
         }
     }
 
+    struct TempWorkspace {
+        path: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new() -> Self {
+            loop {
+                let suffix = NEXT_TEMP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+                assert_ne!(suffix, 0, "test Workspace suffix must be nonzero");
+                let path = std::env::temp_dir().join(format!(
+                    "minicore-runtime-workspace-{}-{suffix}",
+                    std::process::id()
+                ));
+                if path.exists() {
+                    continue;
+                }
+                fs::create_dir(&path).expect("the temporary Workspace root is created");
+                fs::create_dir(path.join("src")).expect("the temporary Workspace cwd is created");
+                return Self { path };
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            if self.path.exists() {
+                fs::remove_dir_all(&self.path)
+                    .expect("the temporary Workspace root is removed deterministically");
+            }
+        }
+    }
+
+    fn workspace_uri(path: &Path) -> CanonicalFileUri {
+        #[cfg(windows)]
+        {
+            let path = path.to_string_lossy().replace('\\', "/");
+            let path = path.strip_prefix('/').unwrap_or(&path);
+            return format!("file:///{path}")
+                .parse()
+                .expect("temporary Windows URI");
+        }
+        #[cfg(not(windows))]
+        {
+            CanonicalFileUri::from_decoded_parts(
+                FileUriFamily::Posix,
+                None,
+                path.to_str().expect("temporary path is UTF-8"),
+            )
+            .expect("temporary POSIX URI")
+        }
+    }
+
+    fn workspace_with_revision(path: &Path, revision: &str) -> Workspace {
+        let key: WorkspaceRootKey = "repo".parse().unwrap();
+        lower_workspace(
+            WorkspaceDefinitionInput::new(
+                WorkspaceRootInput::new(
+                    key.clone(),
+                    workspace_uri(path),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(false, false),
+                ),
+                Vec::new(),
+                WorkspaceCwdSpec::new(key, "src".parse().unwrap()),
+            )
+            .unwrap(),
+            revision.parse().unwrap(),
+            WorkspacePathTarget::current(),
+        )
+        .unwrap()
+    }
+
+    fn workspace(path: &Path) -> Workspace {
+        workspace_with_revision(path, "wr_1")
+    }
+
+    fn changed_workspace(path: &Path) -> Workspace {
+        workspace_with_revision(path, "wr_99")
+    }
+
+    async fn create_runtime_session(runtime: &MiniCoreRuntime, workspace_root: &Path) -> SessionId {
+        let durable_state = super::lock(&runtime.inner.durable_state)
+            .as_ref()
+            .cloned()
+            .expect("the open Runtime retains DurableState");
+        let created_at = "2026-08-03T10:01:00.456Z".parse().unwrap();
+        let agent = durable_state
+            .create_agent(
+                SealedAgentCreateAttempt::new(
+                    AgentPromptSelection::new(Vec::new()).unwrap(),
+                    "Runtime Test Agent",
+                    None::<&str>,
+                    created_at,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the Runtime test Agent is published");
+        durable_state
+            .create_session(
+                SealedSessionCreateAttempt::new(
+                    agent.agent_id(),
+                    workspace(workspace_root),
+                    SessionModelConfig::new(
+                        ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+                        ReasoningPreference::Auto,
+                        Some(NonZeroU32::new(4096).unwrap()),
+                    ),
+                    SessionPromptSelection::new(Vec::new()).unwrap(),
+                    None::<&str>,
+                    None::<&str>,
+                    created_at,
+                )
+                .unwrap(),
+            )
+            .await
+            .expect("the Runtime test Session is published")
+            .session_id()
+    }
+
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
         F: Future<Output = ()>,
@@ -362,6 +642,170 @@ mod tests {
             ))
         })
         .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_owns_load_unload_and_lifecycle_residency() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the runtime opens");
+        let session_id = create_runtime_session(&runtime, workspace.path()).await;
+
+        assert_eq!(
+            runtime.inner.load_session_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        assert_eq!(
+            runtime
+                .inner
+                .loaded_session_snapshot(session_id)
+                .await
+                .unwrap()
+                .execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(matches!(
+            runtime
+                .inner
+                .update_session_lifecycle(SealedSessionLifecycleAttempt::unarchive(session_id))
+                .await,
+            Ok(crate::durable_state::DurableSessionLifecycleOutcome::NoChange(_))
+        ));
+        assert!(matches!(
+            runtime
+                .inner
+                .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+                .await,
+            Err(SessionResidencyLifecycleError::SessionBusy)
+        ));
+        assert_eq!(
+            runtime.inner.unload_session(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        assert!(matches!(
+            runtime
+                .inner
+                .update_session_lifecycle(SealedSessionLifecycleAttempt::archive(session_id))
+                .await,
+            Ok(crate::durable_state::DurableSessionLifecycleOutcome::Updated(_))
+        ));
+        assert_eq!(
+            runtime.inner.load_session_ready_idle(session_id).await,
+            Err(SessionResidencyLoadError::SessionArchived)
+        );
+        assert!(matches!(
+            runtime
+                .inner
+                .update_session_lifecycle(SealedSessionLifecycleAttempt::unarchive(session_id))
+                .await,
+            Ok(crate::durable_state::DurableSessionLifecycleOutcome::Updated(_))
+        ));
+        assert_eq!(
+            runtime.inner.load_session_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+
+        runtime.shutdown().await;
+        assert!(super::lock(&runtime.inner.session_residency).is_none());
+        assert!(super::lock(&runtime.inner.durable_state).is_none());
+
+        let reopened = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("shutdown releases the root after unloading the Session");
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_shutdown_retains_a_blocked_residency_owner_for_the_next_leader() {
+        let root = TempRoot::new();
+        let old_workspace = TempWorkspace::new();
+        let new_workspace = TempWorkspace::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the runtime opens");
+        let session_id = create_runtime_session(&runtime, old_workspace.path()).await;
+        runtime
+            .inner
+            .load_session_ready_idle(session_id)
+            .await
+            .expect("the Session loads");
+        let residency = runtime.inner.residency().expect("residency is installed");
+        let executor = residency
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed");
+        let hooks = executor.test_hooks();
+        hooks.arm_after_candidate_snapshot_finish_before_durable();
+        let current = runtime
+            .inner
+            .loaded_session_snapshot(session_id)
+            .await
+            .unwrap();
+        let mut update = Box::pin(runtime.inner.update_session_workspace_definition(
+            session_id,
+            current.definition_revision(),
+            changed_workspace(new_workspace.path()),
+            "2026-08-03T10:02:00.000Z".parse().unwrap(),
+        ));
+        tokio::select! {
+            _ = hooks.wait_after_candidate_snapshot_finish_before_durable() => {}
+            result = &mut update => panic!("publication settled before the named barrier: {result:?}"),
+        }
+
+        let mut first = Box::pin(runtime.shutdown());
+        assert!(poll_once_pending(first.as_mut()).await);
+        drop(first);
+        assert!(matches!(
+            *super::lock(&runtime.inner.lifecycle),
+            RuntimeLifecycle::Closing {
+                shutdown_active: false
+            }
+        ));
+        assert!(super::lock(&runtime.inner.session_residency).is_some());
+        assert!(super::lock(&runtime.inner.durable_state).is_some());
+
+        let mut second = Box::pin(runtime.shutdown());
+        assert!(poll_once_pending(second.as_mut()).await);
+        hooks.release_after_candidate_snapshot_finish_before_durable();
+        second.await;
+        assert!(
+            update
+                .await
+                .expect("the admitted publication settles")
+                .changed()
+        );
+        assert!(super::lock(&runtime.inner.session_residency).is_none());
+        assert!(super::lock(&runtime.inner.durable_state).is_none());
+
+        let reopened = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the later shutdown leader releases the root");
+        let durable_state = super::lock(&reopened.inner.durable_state)
+            .as_ref()
+            .cloned()
+            .expect("the reopened Runtime retains DurableState");
+        assert_eq!(
+            durable_state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
+        reopened.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]

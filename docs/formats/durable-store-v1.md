@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution，以及crate-private loaded Ready+Idle Workspace definition composite publication已实现；remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、public Runtime command及完整cross-platform native matrix pending
+状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency lifecycle exclusion已实现；remaining Fork anchors/LiveSnapshot、public Runtime command及完整cross-platform native matrix pending
 日期：2026-08-03
 
 ## Scope

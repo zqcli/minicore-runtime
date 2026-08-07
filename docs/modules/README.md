@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0135冻结async conversation/public wire基础；ADR 0136冻结DurableState、Durable Store V1、root lease、reservation与new-entity Create/Fork complete-or-invisible / existing-head update old-or-new publication；ADR 0137冻结Tokio owner-tracked deterministic foundation。M5.0 recovery/root lease/owner-tracked actor、private permanent reservation foundation、crate-private Agent Create与ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer，以及exact historical Agent/Session definition resolution已实现；M6.1 crate-private Workspace resolver/immutable Snapshot foundation与loaded Ready+Idle Workspace definition publication owner已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、完整cross-platform native matrix、Recorder/replay、Runtime behavioral execution、完整SessionExecutor Turn control/ActiveTurnTask、M8 public DTO、M10 planner/model compaction与provider/Tool adapter行为仍待实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M5.0 durable foundation与exact historical definition resolution已实现；M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication owner及Runtime-owned residency actor/Load/Unload/lifecycle exclusion foundation已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload、完整cross-platform native matrix、完整SessionExecutor Turn control/ActiveTurnTask、M8 public DTO、M10 compaction与provider/Tool adapter行为仍待实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
@@ -60,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；M5.0 durable foundation、M6.1 Workspace resolver/Snapshot与crate-private loaded Ready+Idle Workspace definition publication owner已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、完整cross-platform native matrix、Recorder/replay pending。随后进入M6 resources与behavioral Runtime vertical slice；production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；M5.0 durable foundation、M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication与Runtime residency foundation已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload、完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

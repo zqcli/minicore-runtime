@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution与crate-private loaded Ready+Idle Workspace definition publication owner已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、完整cross-platform native matrix、Recorder/replay pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、loaded Ready+Idle publication owner及Runtime-owned residency/lifecycle integration foundation已实现；public Runtime command、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload、完整cross-platform native matrix pending）
 日期：2026-07-31
 
 ## 目的
@@ -1326,4 +1326,4 @@ Agent release channel
 - [x] 明确Agent/Session definition、metadata和lifecycle不进入conversation JSONL（ADR 0131）。
 - [x] 完成SessionExecutor owner和crate-private request interface。
 - [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。
-- [x] M5.0冻结DurableState、Durable Store V1、root lease、permanent reservations（new-entity Create/Fork complete-or-invisible、existing-head update old-or-new）与Tokio/deterministic test seams；production durable foundation与exact historical definition resolution已实现，crate-private loaded Ready+Idle SessionExecutor已消费Workspace definition publication并完成Snapshot install/post-commit poison；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、完整cross-platform native matrix、Recorder/replay仍pending。
+- [x] M5.0冻结DurableState、Durable Store V1、root lease、permanent reservations与Tokio/deterministic test seams；production durable foundation、exact historical definition resolution、loaded Ready+Idle SessionExecutor publication owner及Runtime residency/lifecycle integration foundation已实现；public Runtime command、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload、完整cross-platform native matrix仍pending。

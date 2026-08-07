@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、Workspace resolver/Snapshot与crate-private loaded Ready+Idle Workspace definition publication owner已实现；public Runtime command接入、remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、完整cross-platform native matrix、Recorder/replay pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、Workspace resolver/Snapshot、loaded Ready+Idle publication owner及Runtime-owned residency actor/Load/Unload/lifecycle exclusion foundation已实现；public command/query/snapshot/event接入、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload、完整cross-platform native matrix pending）
 
 ## 目的
 

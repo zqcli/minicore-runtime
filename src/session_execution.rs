@@ -1,14 +1,14 @@
 #![allow(
     dead_code,
-    reason = "the loaded Session executor is a crate-private foundation awaiting Runtime wiring"
+    reason = "the loaded Session executor awaits public routing and Turn integration"
 )]
 
 //! The crate-private loaded Session execution seam.
 //!
-//! This module deliberately stops at one already-loaded, Ready+Idle Session.  It owns neither
-//! Runtime residency nor the public Runtime facade.  The caller that starts an executor must
-//! retain the future Runtime residency permit (and exclude lifecycle/load changes) for as long as
-//! the loaded executor is live; this constructor does not acquire that permit.
+//! This module deliberately stops at one already-loaded, Ready+Idle Session. It owns neither
+//! Runtime residency nor the public Runtime facade. The Runtime-owned residency registry that
+//! starts an executor retains its permit (and excludes lifecycle/load changes) for as long as the
+//! loaded executor is live; this constructor does not acquire that permit.
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -184,6 +184,13 @@ pub(crate) enum SessionExecutorSnapshotError {
     InternalDispatchUnavailable,
 }
 
+/// Redacted failure from joining one loaded Session executor during Unload/shutdown.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionExecutorCloseError {
+    #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 /// Redacted failures from executor construction.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionExecutorStartError {
@@ -232,6 +239,7 @@ pub(crate) struct SessionExecutor {
     sender: mpsc::Sender<SessionExecutorRequest>,
     closing: CancellationToken,
     task: TrackedTask,
+    failure_state: Arc<ActorFailureState>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -292,7 +300,7 @@ impl SessionExecutor {
             closing.clone(),
             task_context.clone(),
             durable_state.clone(),
-            failure_state,
+            Arc::clone(&failure_state),
         );
         let task = match task_context.spawn_tracked(async move {
             let normal_exit = actor.run().await;
@@ -319,6 +327,7 @@ impl SessionExecutor {
             sender,
             closing,
             task,
+            failure_state,
             #[cfg(test)]
             hooks,
         })
@@ -331,9 +340,13 @@ impl SessionExecutor {
 
     /// Closes this executor, drains accepted requests, waits the admitted publication, and waits
     /// for the owner-tracked actor settlement.  It never shuts down the shared RuntimeTaskContext.
-    pub(crate) async fn close(&self) {
+    pub(crate) async fn close(&self) -> Result<(), SessionExecutorCloseError> {
         self.request_closing();
-        let _ = self.task.wait().await;
+        if self.task.wait().await.is_err() || self.failure_state.is_fatal() {
+            Err(SessionExecutorCloseError::InternalDispatchUnavailable)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns the last coherent immutable loaded snapshot.  Requests sent while a publication
@@ -591,6 +604,7 @@ impl SessionExecutorActor {
             let _ = worker_task.wait().await;
         }
         self.closing.cancel();
+        self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
         active.waiter.settle(Err(
@@ -935,6 +949,7 @@ impl SessionExecutorActor {
 
     fn close_for_fatal(&mut self, _fatality: ActorFatality) {
         self.closing.cancel();
+        self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
         if let Some(active) = self.active_publication.take() {
@@ -1203,9 +1218,18 @@ impl SessionExecutorRequest {
 #[derive(Default)]
 struct ActorFailureState {
     active: Mutex<Option<Arc<PublicationWaiterState>>>,
+    fatal: std::sync::atomic::AtomicBool,
 }
 
 impl ActorFailureState {
+    fn mark_fatal(&self) {
+        self.fatal.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_fatal(&self) -> bool {
+        self.fatal.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn install(&self, waiter: Arc<PublicationWaiterState>) {
         let mut active = lock(&self.active);
         debug_assert!(
@@ -1293,6 +1317,7 @@ impl Drop for ActorExitGuard {
             return;
         }
         self.closing.cancel();
+        self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
         let waiter = lock(&self.failure_state.active).take();
@@ -1868,7 +1893,7 @@ mod tests {
     }
 
     async fn close_loaded(loaded: LoadedFixture) {
-        loaded.executor.close().await;
+        let _ = loaded.executor.close().await;
         loaded.state.close().await;
         // DurableState closes the shared owner; retaining this explicit field makes the fixture's
         // ownership visible and prevents accidental detached context tasks in future test edits.
@@ -2089,7 +2114,7 @@ mod tests {
         let mut close = Box::pin(loaded.executor.close());
         assert!(poll_once_pending(close.as_mut()).await);
         hooks.release_after_candidate_snapshot_finish_before_durable();
-        close.await;
+        close.await.expect("the executor closes normally");
         assert!(publication.await.unwrap().unwrap().changed());
         loaded.state.close().await;
         let _ = loaded.context;
@@ -2123,7 +2148,7 @@ mod tests {
             waiter.await.unwrap(),
             Err(SessionExecutorSnapshotError::Closing)
         ));
-        close.await;
+        close.await.expect("the executor closes normally");
 
         loaded.state.close().await;
         let _ = loaded.context;
@@ -2146,7 +2171,7 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(poll_once_pending(close.as_mut()).await);
         drop(permit);
-        close.await;
+        close.await.expect("the executor closes normally");
 
         loaded.state.close().await;
         let _ = loaded.context;
@@ -2175,7 +2200,7 @@ mod tests {
         let mut close = Box::pin(loaded.executor.close());
         assert!(poll_once_pending(close.as_mut()).await);
         hooks.release_after_commit_before_install();
-        close.await;
+        close.await.expect("the executor closes normally");
         assert!(publication.await.unwrap().unwrap().changed());
         hooks.wait_for_publication_settlement().await;
         assert_eq!(
@@ -2343,7 +2368,10 @@ mod tests {
             loaded.executor.snapshot().await,
             Err(SessionExecutorSnapshotError::Closing)
         ));
-        loaded.executor.close().await;
+        assert_eq!(
+            loaded.executor.close().await,
+            Err(SessionExecutorCloseError::InternalDispatchUnavailable)
+        );
         loaded.state.close().await;
         let _ = loaded.context;
     }
@@ -2359,7 +2387,10 @@ mod tests {
             result.await,
             Err(SessionExecutorSnapshotError::Closing)
         ));
-        loaded.executor.close().await;
+        assert_eq!(
+            loaded.executor.close().await,
+            Err(SessionExecutorCloseError::InternalDispatchUnavailable)
+        );
         loaded.state.close().await;
         let _ = loaded.context;
     }
@@ -2468,7 +2499,11 @@ mod tests {
             known_durable_tasks + 1
         );
 
-        loaded.executor.close().await;
+        loaded
+            .executor
+            .close()
+            .await
+            .expect("the executor closes normally");
         assert_eq!(
             loaded.context.registered_task_count_for_test(),
             known_durable_tasks

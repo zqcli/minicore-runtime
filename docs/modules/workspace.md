@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0135；M6.1 crate-private `WorkspaceResolver`、canonical root/cwd validation、authority tightening、candidate capture、immutable `WorkspaceSnapshot`与loaded Ready+Idle definition publication foundation已实现；Prompt/Skill source adapter、WorkspaceAccessView/ToolContext、Runtime loaded registry/public routing与SecurityRevoked integration pending）
+状态：当前权威架构（ADR 0135；M6.1 `WorkspaceResolver`、immutable `WorkspaceSnapshot`、loaded Ready+Idle publication及Runtime residency统一loaded/unloaded definition routing foundation已实现；Prompt/Skill source adapter、WorkspaceAccessView/ToolContext、public routing与SecurityRevoked integration pending）
 日期：2026-07-31
 
 ## 目的

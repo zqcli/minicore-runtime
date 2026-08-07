@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation in progress，crate-private Agent Create、ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer与exact historical Agent/Session definition resolution已完成，remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、public Runtime command与完整platform matrix pending；M6.1 Workspace resolver/immutable Snapshot foundation与crate-private loaded Ready+Idle Workspace publication owner已完成，PromptSet、actual Workspace source discovery、captured empty SkillView/ToolSet、public Snapshot/Event与full SessionExecutor Turn integration pending；M5.1 Recorder与M5.2 semantic replay pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、replay/Recorder-backed full Load、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending；M5.1 Recorder与M5.2 semantic replay pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -361,11 +361,11 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate Completed；foundation in progress（无 standalone production reservation API/token/receipt）；Agent Create、ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer的certainty/catalog install与exact historical Agent/Session definition resolution Completed；crate-private loaded Ready+Idle Workspace definition composite publication也已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix Pending；remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration及public Runtime command Pending；M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
+状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
 
 ### M5.0 DurableState / async foundation implementation
 
-设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。早期reservation-only implementation/test只证明了永久reservation phase；当前durable foundation、exact historical definition resolution与crate-private loaded Workspace composite publication也不代表remaining Fork anchors/LiveSnapshot、Runtime loaded registry/Load/Unload、Session lifecycle Runtime residency integration、public Runtime command或cross-platform crash matrix已通过。以下列表是M5.0 implementation series的总退出范围，已完成项继续作为后续slice不可回归的门禁：
+设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。当前durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency exclusion也不代表remaining Fork anchors/LiveSnapshot、public Runtime command、Recorder/replay或cross-platform crash matrix已通过。以下列表是M5.0 implementation series的总退出范围，已完成项继续作为后续slice不可回归的门禁：
 
 - private `DurableStateActor`、immutable catalog snapshots/capabilities、poison/closing state和all mutation/catalog-head serialization；
 - permanent CSPRNG-ID reservation (`create_new`，32 definite collision cap)、root `.minicore.lock` fs4 exclusive lease、strict user-private local filesystem validation和no-follow link/reparse/case-alias handling；
@@ -445,7 +445,7 @@ provider-neutral request/result seam稳定后立即并行运行private Rig reali
 
 ## M7 · Ordinary AgentRun Vertical Slice
 
-当前进度：crate-private loaded Ready+Idle `SessionExecutor` actor与Workspace definition publication foundation Completed。它已消费owner-registered publication task/permit、old-Snapshot visibility、caller-drop independence、post-commit install poison、cancellation-safe tracked-child reap及close/request drain；Runtime loaded registry、Load/Unload、public dispatch/snapshot/event、replay/Recorder、Turn admission与ActiveTurnTask仍Pending。
+当前进度：crate-private loaded Ready+Idle `SessionExecutor`与Runtime-owned residency actor foundation Completed。它已消费single-flight Load、coherent durable head+definition capture/final recheck、opaque residency permit、per-Session typed gate、draining Unload、Archive/Delete unloaded exclusion、unified loaded/unloaded Workspace update、caller-drop independence、child reap/gate cleanup、pre-close reserved request drain及shutdown cancellation retention；public dispatch/snapshot/event、replay/Recorder-backed full Load、active-Turn grace Unload、Turn admission与ActiveTurnTask仍Pending。
 
 实现：
 
