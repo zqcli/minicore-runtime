@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0135；M2 incremental public codec实施中）
+状态：当前权威架构（ADR 0135；M6.1 crate-private `WorkspaceResolver`、canonical root/cwd validation、authority tightening、candidate capture与immutable `WorkspaceSnapshot` foundation已实现；Prompt/Skill source adapter、WorkspaceAccessView/ToolContext、loaded Session publication与SecurityRevoked integration pending）
 日期：2026-07-31
 
 ## 目的
@@ -463,7 +463,7 @@ requested Skill source
 WorkspaceResolver 是 Workspace 模块的唯一解析入口：
 
 ```rust
-pub struct WorkspaceResolver {
+pub(crate) struct WorkspaceResolver {
     paths: Arc<dyn WorkspacePathAdapter>,
     authority: Arc<dyn WorkspaceAuthority>,
 }
@@ -837,11 +837,11 @@ impl WorkspaceSnapshotCandidate {
         self,
         prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
         skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
-    ) -> Arc<WorkspaceSnapshot>;
+    ) -> Result<Arc<WorkspaceSnapshot>, WorkspaceSnapshotFinishError>;
 }
 ```
 
-`ResolvedWorkspace`是`SessionWorkspaceState::Ready`保存的published wrapper，不是WorkspaceResolver的直接返回值；只有candidate `finish(...)`完成Prompt/Skill source capture后才能创建。
+`ResolvedWorkspace`是`SessionWorkspaceState::Ready`保存的published wrapper，不是WorkspaceResolver的直接返回值；只有candidate `finish(...)`完成Prompt/Skill source capture后才能创建。每个candidate内部持有不公开、不持久化且不命名的process-local capability basis；capture context产生的source必须携带同一basis，`finish(...)`在release build中同时验证basis identity与root/kind/path/trust authorization，不允许把旧candidate或另一candidate的captured source拼入当前Snapshot。失败返回redacted `WorkspaceSnapshotFinishError`，不能依赖`debug_assert!`或production panic执行授权检查；该basis不是Workspace identity、fingerprint、revision或public token。
 
 Authority hard restriction由WorkspaceAuthority或host作为独立security event发布，不伪装成Workspace definition update：
 
@@ -913,7 +913,7 @@ Create完成lowering或加载已有durable definition后，resolve流程为：
 → WorkspaceResolver::resolve(exact definition.workspace) → WorkspaceSnapshotCandidate
 → PromptService.capture_workspace_sources(candidate.prompt_capture_context())
 → SkillService.capture_workspace_sources(candidate.skill_capture_context())
-→ candidate.finish(prompt_sources, skill_sources) → Arc<WorkspaceSnapshot>
+→ candidate.finish(prompt_sources, skill_sources) → Result<Arc<WorkspaceSnapshot>, _>
 → publication 前 CAS SessionLifecycle 仍为 Open且 current revision 未变化
 → Ready(ResolvedWorkspace { snapshot })
    或 Unavailable(error)
@@ -1313,6 +1313,8 @@ upload / telemetry
 - Workspace Skill adapter的capture只能使用WorkspaceSkillCaptureContext，并必须通过context构造CapturedWorkspaceSkillSource；
 - captured SkillView entry、LoadedSkill和SkillInjection使用同一SkillId与exact source authorization完成composition前校验；live/recorded stamp只保存SkillId或Workspace root-relative safe origin；
 - WorkspacePromptContext、WorkspaceSkillContext 和 WorkspaceToolContext 不能由调用方伪造；
+- authority decision必须回显并exact匹配完整canonical request root（key、role、canonical path、requested access与source policy）；仅匹配WorkspaceRootKey/role不足以授权；
+- captured Prompt/Skill source不能跨candidate capability basis拼接，即使可见root/path/trust结构相同也必须fail closed；
 - authority failure 和 root unavailable；
 - candidate update 失败不修改 current definition/snapshot；
 - loaded Session非Idle时Workspace update/reload返回SessionBusy且不排队；
@@ -1358,3 +1360,4 @@ upload / telemetry
 - [x] 冻结WorkspaceUnavailable → SessionNotReady/UserActionRequired公开映射；
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义；
 - [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。
+- [x] 实现M6.1 crate-private resolver/snapshot foundation：owner-tracked local canonicalization、duplicate/overlap/cwd校验、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与immutable Snapshot；actual source discovery、Tool access view、loaded publication和security integration仍由后续slice消费。

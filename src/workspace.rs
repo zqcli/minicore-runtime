@@ -1,14 +1,24 @@
+#![allow(
+    dead_code,
+    reason = "M6.1 workspace resolution is a crate-private seam awaiting Session publication"
+)]
+
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
 use crate::wire::lexical::{LexicalError, validate_stable_symbolic_key};
 use crate::wire::{
-    CanonicalFileUri, FileUriFamily, ProtocolLimits, WorkspaceRelativePath, WorkspaceRevision,
+    CanonicalFileUri, FileUriFamily, ProtocolLimits, SessionId, WorkspaceRelativePath,
+    WorkspaceRevision,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -767,17 +777,1502 @@ impl fmt::Debug for WorkspaceDefinitionSummaryView {
     }
 }
 
+/// A canonical, existing directory path owned by the Workspace resolver.
+///
+/// The constructor is deliberately private.  A value can only be produced by a
+/// `WorkspacePathAdapter` after it has performed its platform-specific checks.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct CanonicalWorkspacePath(PathBuf);
+
+impl CanonicalWorkspacePath {
+    fn new(path: PathBuf) -> Self {
+        Self(path)
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CanonicalWorkspacePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalWorkspacePath { .. }")
+    }
+}
+
+impl fmt::Display for CanonicalWorkspacePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<canonical-workspace-path>")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum WorkspaceRootRole {
+    Primary,
+    Additional,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum WorkspaceTrustLevel {
+    Trusted,
+    Restricted,
+    Untrusted,
+}
+
+/// A non-zero revision supplied by the current authority decision.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct WorkspaceTrustRevision(NonZeroU64);
+
+impl WorkspaceTrustRevision {
+    pub(crate) const fn new(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct WorkspaceRootTrust {
+    level: WorkspaceTrustLevel,
+    revision: WorkspaceTrustRevision,
+}
+
+impl WorkspaceRootTrust {
+    pub(crate) const fn new(level: WorkspaceTrustLevel, revision: WorkspaceTrustRevision) -> Self {
+        Self { level, revision }
+    }
+
+    pub(crate) const fn level(self) -> WorkspaceTrustLevel {
+        self.level
+    }
+
+    pub(crate) const fn revision(self) -> WorkspaceTrustRevision {
+        self.revision
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum WorkspaceFilesystemGrant {
+    None,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl WorkspaceFilesystemGrant {
+    const fn is_readable(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+enum WorkspacePathError {
+    #[error("workspace root is unavailable")]
+    Unavailable,
+    #[error("workspace root is not a directory")]
+    NotDirectory,
+    #[error("workspace path canonicalization failed")]
+    CanonicalizationFailed,
+}
+
+/// The path seam is synchronous because the resolver owns its complete path phase
+/// on one owner-tracked blocking worker.
+trait WorkspacePathAdapter: Send + Sync {
+    fn canonicalize_directory(
+        &self,
+        path: &Path,
+    ) -> Result<CanonicalWorkspacePath, WorkspacePathError>;
+}
+
+struct LocalWorkspacePathAdapter;
+
+impl WorkspacePathAdapter for LocalWorkspacePathAdapter {
+    fn canonicalize_directory(
+        &self,
+        path: &Path,
+    ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+        let canonical = std::fs::canonicalize(path).map_err(map_path_io_error)?;
+        let metadata = std::fs::metadata(&canonical).map_err(map_path_io_error)?;
+        if !metadata.is_dir() {
+            return Err(WorkspacePathError::NotDirectory);
+        }
+        Ok(CanonicalWorkspacePath::new(canonical))
+    }
+}
+
+fn map_path_io_error(error: std::io::Error) -> WorkspacePathError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => WorkspacePathError::Unavailable,
+        _ => WorkspacePathError::CanonicalizationFailed,
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct WorkspaceAuthorityRootRequest {
+    key: WorkspaceRootKey,
+    role: WorkspaceRootRole,
+    canonical_path: CanonicalWorkspacePath,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+impl WorkspaceAuthorityRootRequest {
+    fn new(
+        key: WorkspaceRootKey,
+        role: WorkspaceRootRole,
+        canonical_path: CanonicalWorkspacePath,
+        requested_access: RequestedFilesystemAccess,
+        sources: WorkspaceSourcePolicy,
+    ) -> Self {
+        Self {
+            key,
+            role,
+            canonical_path,
+            requested_access,
+            sources,
+        }
+    }
+
+    pub(crate) fn key(&self) -> &WorkspaceRootKey {
+        &self.key
+    }
+
+    pub(crate) const fn role(&self) -> WorkspaceRootRole {
+        self.role
+    }
+
+    pub(crate) fn canonical_path(&self) -> &CanonicalWorkspacePath {
+        &self.canonical_path
+    }
+
+    pub(crate) const fn requested_access(&self) -> RequestedFilesystemAccess {
+        self.requested_access
+    }
+
+    pub(crate) const fn sources(&self) -> WorkspaceSourcePolicy {
+        self.sources
+    }
+}
+
+impl fmt::Debug for WorkspaceAuthorityRootRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAuthorityRootRequest")
+            .field("role", &self.role)
+            .field("requested_access", &self.requested_access)
+            .field("sources", &self.sources)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceAuthorityRequest {
+    roots: Vec<WorkspaceAuthorityRootRequest>,
+}
+
+impl WorkspaceAuthorityRequest {
+    fn new(roots: Vec<WorkspaceAuthorityRootRequest>) -> Self {
+        Self { roots }
+    }
+
+    fn roots(&self) -> &[WorkspaceAuthorityRootRequest] {
+        &self.roots
+    }
+}
+
+impl fmt::Debug for WorkspaceAuthorityRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAuthorityRequest")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceAuthorityRootDecision {
+    request: WorkspaceAuthorityRootRequest,
+    trust: WorkspaceRootTrust,
+    filesystem_ceiling: WorkspaceFilesystemGrant,
+    prompt_source_ceiling: bool,
+    skill_source_ceiling: bool,
+}
+
+impl WorkspaceAuthorityRootDecision {
+    fn new(
+        request: WorkspaceAuthorityRootRequest,
+        trust: WorkspaceRootTrust,
+        filesystem_ceiling: WorkspaceFilesystemGrant,
+        prompt_source_ceiling: bool,
+        skill_source_ceiling: bool,
+    ) -> Self {
+        Self {
+            request,
+            trust,
+            filesystem_ceiling,
+            prompt_source_ceiling,
+            skill_source_ceiling,
+        }
+    }
+}
+
+impl fmt::Debug for WorkspaceAuthorityRootDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAuthorityRootDecision")
+            .field("role", &self.request.role)
+            .field("trust", &self.trust)
+            .field("filesystem_ceiling", &self.filesystem_ceiling)
+            .field("prompt_source_ceiling", &self.prompt_source_ceiling)
+            .field("skill_source_ceiling", &self.skill_source_ceiling)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+struct WorkspaceAuthorityDecision {
+    roots: Vec<WorkspaceAuthorityRootDecision>,
+}
+
+impl WorkspaceAuthorityDecision {
+    fn new(roots: Vec<WorkspaceAuthorityRootDecision>) -> Self {
+        Self { roots }
+    }
+
+    fn roots(&self) -> &[WorkspaceAuthorityRootDecision] {
+        &self.roots
+    }
+}
+
+impl fmt::Debug for WorkspaceAuthorityDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceAuthorityDecision")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+enum WorkspaceAuthorityError {
+    #[error("workspace authority is unavailable")]
+    Unavailable,
+    #[error("workspace authority denied the request")]
+    Denied,
+}
+
+type WorkspaceAuthorityFuture = Pin<
+    Box<dyn Future<Output = Result<WorkspaceAuthorityDecision, WorkspaceAuthorityError>> + Send>,
+>;
+
+trait WorkspaceAuthority: Send + Sync {
+    fn authorize(&self, request: WorkspaceAuthorityRequest) -> WorkspaceAuthorityFuture;
+}
+
+/// The production M6.1 policy is deliberately fail-closed.  It reports the current
+/// roots without treating them as trusted and grants neither filesystem nor source access.
+struct RestrictedWorkspaceAuthority;
+
+impl WorkspaceAuthority for RestrictedWorkspaceAuthority {
+    fn authorize(&self, request: WorkspaceAuthorityRequest) -> WorkspaceAuthorityFuture {
+        Box::pin(async move {
+            let revision = WorkspaceTrustRevision::new(
+                NonZeroU64::new(1).expect("the restricted authority revision is non-zero"),
+            );
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        WorkspaceRootTrust::new(WorkspaceTrustLevel::Untrusted, revision),
+                        WorkspaceFilesystemGrant::None,
+                        false,
+                        false,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceResolveError {
+    #[error("workspace resolution is closing")]
+    Closing,
+    #[error("workspace root is unavailable")]
+    RootUnavailable,
+    #[error("workspace root is not a directory")]
+    RootNotDirectory,
+    #[error("workspace path canonicalization failed")]
+    CanonicalizationFailed,
+    #[error("workspace contains a duplicate canonical root")]
+    DuplicateRoot,
+    #[error("workspace roots overlap")]
+    OverlappingRoots,
+    #[error("workspace cwd is outside declared roots")]
+    CwdOutsideRoots,
+    #[error("workspace cwd does not match its declared root")]
+    CwdRootMismatch,
+    #[error("workspace authority is unavailable")]
+    AuthorityUnavailable,
+    #[error("workspace authority denied the request")]
+    AuthorityDenied,
+    #[error("workspace resolver dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+fn map_path_error(error: WorkspacePathError) -> WorkspaceResolveError {
+    match error {
+        WorkspacePathError::Unavailable => WorkspaceResolveError::RootUnavailable,
+        WorkspacePathError::NotDirectory => WorkspaceResolveError::RootNotDirectory,
+        WorkspacePathError::CanonicalizationFailed => WorkspaceResolveError::CanonicalizationFailed,
+    }
+}
+
+#[derive(Clone)]
+struct DeclaredWorkspaceRoot {
+    key: WorkspaceRootKey,
+    role: WorkspaceRootRole,
+    path: PathBuf,
+    requested_access: RequestedFilesystemAccess,
+    sources: WorkspaceSourcePolicy,
+}
+
+#[derive(Clone)]
+struct WorkspacePathPhase {
+    canonical_roots: Vec<CanonicalWorkspacePath>,
+    canonical_cwd: CanonicalWorkspacePath,
+}
+
+fn resolve_path_phase(
+    adapter: &dyn WorkspacePathAdapter,
+    roots: Vec<DeclaredWorkspaceRoot>,
+    cwd_root: WorkspaceRootKey,
+    cwd_relative_path: WorkspaceRelativePath,
+) -> Result<WorkspacePathPhase, WorkspaceResolveError> {
+    let mut canonical_roots = Vec::with_capacity(roots.len());
+    for root in &roots {
+        canonical_roots.push(
+            adapter
+                .canonicalize_directory(&root.path)
+                .map_err(map_path_error)?,
+        );
+    }
+
+    for (index, root) in canonical_roots.iter().enumerate() {
+        if canonical_roots[..index]
+            .iter()
+            .any(|previous| previous.as_path() == root.as_path())
+        {
+            return Err(WorkspaceResolveError::DuplicateRoot);
+        }
+    }
+
+    for (index, root) in canonical_roots.iter().enumerate() {
+        if canonical_roots[..index].iter().any(|previous| {
+            previous.as_path().starts_with(root.as_path())
+                || root.as_path().starts_with(previous.as_path())
+        }) {
+            return Err(WorkspaceResolveError::OverlappingRoots);
+        }
+    }
+
+    let cwd_root_index = roots
+        .iter()
+        .position(|root| root.key == cwd_root)
+        .ok_or(WorkspaceResolveError::CwdRootMismatch)?;
+    let cwd_native_path = roots[cwd_root_index].path.join(cwd_relative_path.as_str());
+    let canonical_cwd = adapter
+        .canonicalize_directory(&cwd_native_path)
+        .map_err(map_path_error)?;
+
+    let containing_roots = canonical_roots
+        .iter()
+        .enumerate()
+        .filter(|(_, root)| canonical_cwd.as_path().starts_with(root.as_path()))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if containing_roots.is_empty() {
+        return Err(WorkspaceResolveError::CwdOutsideRoots);
+    }
+    if containing_roots.len() != 1 || roots[containing_roots[0]].key != cwd_root {
+        return Err(WorkspaceResolveError::CwdRootMismatch);
+    }
+
+    Ok(WorkspacePathPhase {
+        canonical_roots,
+        canonical_cwd,
+    })
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ResolvedWorkspaceRoot {
+    key: WorkspaceRootKey,
+    role: WorkspaceRootRole,
+    canonical_path: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+    filesystem: WorkspaceFilesystemGrant,
+    prompt_source: bool,
+    skill_source: bool,
+}
+
+impl fmt::Debug for ResolvedWorkspaceRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedWorkspaceRoot")
+            .field("role", &self.role)
+            .field("trust", &self.trust)
+            .field("filesystem", &self.filesystem)
+            .field("prompt_source", &self.prompt_source)
+            .field("skill_source", &self.skill_source)
+            .finish()
+    }
+}
+
+fn requested_filesystem_grant(
+    requested_access: RequestedFilesystemAccess,
+) -> WorkspaceFilesystemGrant {
+    match requested_access {
+        RequestedFilesystemAccess::ReadOnly => WorkspaceFilesystemGrant::ReadOnly,
+        RequestedFilesystemAccess::ReadWrite => WorkspaceFilesystemGrant::ReadWrite,
+    }
+}
+
+fn intersect_filesystem_grants(
+    requested_access: RequestedFilesystemAccess,
+    authority_ceiling: WorkspaceFilesystemGrant,
+) -> WorkspaceFilesystemGrant {
+    match (
+        requested_filesystem_grant(requested_access),
+        authority_ceiling,
+    ) {
+        (WorkspaceFilesystemGrant::None, _) | (_, WorkspaceFilesystemGrant::None) => {
+            WorkspaceFilesystemGrant::None
+        }
+        (WorkspaceFilesystemGrant::ReadOnly, WorkspaceFilesystemGrant::ReadOnly)
+        | (WorkspaceFilesystemGrant::ReadOnly, WorkspaceFilesystemGrant::ReadWrite)
+        | (WorkspaceFilesystemGrant::ReadWrite, WorkspaceFilesystemGrant::ReadOnly) => {
+            WorkspaceFilesystemGrant::ReadOnly
+        }
+        (WorkspaceFilesystemGrant::ReadWrite, WorkspaceFilesystemGrant::ReadWrite) => {
+            WorkspaceFilesystemGrant::ReadWrite
+        }
+    }
+}
+
+fn resolve_authority(
+    expected_request: &WorkspaceAuthorityRequest,
+    decision: WorkspaceAuthorityDecision,
+) -> Result<Vec<ResolvedWorkspaceRoot>, WorkspaceResolveError> {
+    if decision.roots().len() != expected_request.roots().len() {
+        return Err(WorkspaceResolveError::InternalDispatchUnavailable);
+    }
+
+    if expected_request
+        .roots()
+        .iter()
+        .zip(decision.roots())
+        .any(|(expected, authority)| authority.request != *expected)
+    {
+        return Err(WorkspaceResolveError::InternalDispatchUnavailable);
+    }
+
+    expected_request
+        .roots()
+        .iter()
+        .zip(decision.roots())
+        .map(|(root, authority)| {
+            let filesystem =
+                intersect_filesystem_grants(root.requested_access, authority.filesystem_ceiling);
+            Ok(ResolvedWorkspaceRoot {
+                key: root.key.clone(),
+                role: root.role,
+                canonical_path: root.canonical_path.clone(),
+                trust: authority.trust,
+                filesystem,
+                prompt_source: root.sources.prompt()
+                    && authority.prompt_source_ceiling
+                    && filesystem.is_readable(),
+                skill_source: root.sources.skill()
+                    && authority.skill_source_ceiling
+                    && filesystem.is_readable(),
+            })
+        })
+        .collect()
+}
+
+fn map_runtime_task_error(
+    task_context: &RuntimeTaskContext,
+    error: RuntimeTaskError,
+) -> WorkspaceResolveError {
+    match error {
+        RuntimeTaskError::OwnerClosing => WorkspaceResolveError::Closing,
+        RuntimeTaskError::WorkerUnavailable => WorkspaceResolveError::InternalDispatchUnavailable,
+        RuntimeTaskError::OperationPanicked => {
+            task_context.request_closing();
+            WorkspaceResolveError::InternalDispatchUnavailable
+        }
+    }
+}
+
+pub(crate) struct WorkspaceResolver {
+    task_context: RuntimeTaskContext,
+    paths: Arc<dyn WorkspacePathAdapter>,
+    authority: Arc<dyn WorkspaceAuthority>,
+}
+
+impl WorkspaceResolver {
+    pub(crate) fn new(task_context: RuntimeTaskContext) -> Self {
+        Self::new_with_adapters(
+            task_context,
+            Arc::new(LocalWorkspacePathAdapter),
+            Arc::new(RestrictedWorkspaceAuthority),
+        )
+    }
+
+    fn new_with_adapters(
+        task_context: RuntimeTaskContext,
+        paths: Arc<dyn WorkspacePathAdapter>,
+        authority: Arc<dyn WorkspaceAuthority>,
+    ) -> Self {
+        Self {
+            task_context,
+            paths,
+            authority,
+        }
+    }
+
+    pub(crate) async fn resolve(
+        &self,
+        session_id: SessionId,
+        workspace: &Workspace,
+    ) -> Result<WorkspaceSnapshotCandidate, WorkspaceResolveError> {
+        let declared_roots = std::iter::once((&workspace.primary_root, WorkspaceRootRole::Primary))
+            .chain(
+                workspace
+                    .additional_roots
+                    .iter()
+                    .map(|root| (root, WorkspaceRootRole::Additional)),
+            )
+            .map(|(root, role)| DeclaredWorkspaceRoot {
+                key: root.key.clone(),
+                role,
+                path: root.path.clone(),
+                requested_access: root.requested_access,
+                sources: root.sources,
+            })
+            .collect::<Vec<_>>();
+        let cwd_root = workspace.cwd.root().clone();
+        let cwd_relative_path = workspace.cwd.relative_path().clone();
+        let paths = Arc::clone(&self.paths);
+        let roots_for_path = declared_roots.clone();
+        let path_job = self.task_context.spawn_blocking_tracked(move || {
+            resolve_path_phase(paths.as_ref(), roots_for_path, cwd_root, cwd_relative_path)
+        });
+        let path_phase = path_job
+            .wait()
+            .await
+            .map_err(|error| map_runtime_task_error(&self.task_context, error))??;
+
+        let request_roots = declared_roots
+            .iter()
+            .zip(&path_phase.canonical_roots)
+            .map(|(root, canonical_path)| {
+                WorkspaceAuthorityRootRequest::new(
+                    root.key.clone(),
+                    root.role,
+                    canonical_path.clone(),
+                    root.requested_access,
+                    root.sources,
+                )
+            })
+            .collect();
+        let request = WorkspaceAuthorityRequest::new(request_roots);
+        let expected_request = request.clone();
+        let decision = self
+            .authority
+            .authorize(request)
+            .await
+            .map_err(|error| match error {
+                WorkspaceAuthorityError::Unavailable => WorkspaceResolveError::AuthorityUnavailable,
+                WorkspaceAuthorityError::Denied => WorkspaceResolveError::AuthorityDenied,
+            })?;
+        let resolved_roots = match resolve_authority(&expected_request, decision) {
+            Ok(roots) => roots,
+            Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
+                self.task_context.request_closing();
+                return Err(WorkspaceResolveError::InternalDispatchUnavailable);
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(WorkspaceSnapshotCandidate::new(
+            session_id,
+            workspace.revision,
+            resolved_roots,
+            path_phase.canonical_cwd,
+        ))
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct WorkspaceSourceAuthorization {
+    root_key: WorkspaceRootKey,
+    canonical_root: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+impl WorkspaceSourceAuthorization {
+    pub(crate) fn root_key(&self) -> &WorkspaceRootKey {
+        &self.root_key
+    }
+
+    pub(crate) const fn trust(&self) -> WorkspaceRootTrust {
+        self.trust
+    }
+}
+
+impl fmt::Debug for WorkspaceSourceAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSourceAuthorization")
+            .field("trust", &self.trust)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceSourceCaptureError {
+    #[error("workspace source location must be a non-root relative path")]
+    InvalidRelativeLocation,
+    #[error("workspace source is outside an authorized root")]
+    SourceOutsideAuthorizedRoot,
+    #[error("workspace source kind is not authorized")]
+    SourceKindNotAuthorized,
+}
+
+impl fmt::Debug for WorkspaceSourceCaptureError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AuthorizedPromptSourceRoot {
+    key: WorkspaceRootKey,
+    canonical_path: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+impl AuthorizedPromptSourceRoot {
+    pub(crate) fn key(&self) -> &WorkspaceRootKey {
+        &self.key
+    }
+
+    pub(crate) fn canonical_path(&self) -> &CanonicalWorkspacePath {
+        &self.canonical_path
+    }
+
+    pub(crate) const fn trust(&self) -> WorkspaceRootTrust {
+        self.trust
+    }
+}
+
+impl fmt::Debug for AuthorizedPromptSourceRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedPromptSourceRoot")
+            .field("trust", &self.trust)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct AuthorizedSkillSourceRoot {
+    key: WorkspaceRootKey,
+    canonical_path: CanonicalWorkspacePath,
+    trust: WorkspaceRootTrust,
+}
+
+impl AuthorizedSkillSourceRoot {
+    pub(crate) fn key(&self) -> &WorkspaceRootKey {
+        &self.key
+    }
+
+    pub(crate) fn canonical_path(&self) -> &CanonicalWorkspacePath {
+        &self.canonical_path
+    }
+
+    pub(crate) const fn trust(&self) -> WorkspaceRootTrust {
+        self.trust
+    }
+}
+
+impl fmt::Debug for AuthorizedSkillSourceRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedSkillSourceRoot")
+            .field("trust", &self.trust)
+            .finish()
+    }
+}
+
+struct WorkspaceCandidateCapabilityBasis;
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum WorkspaceSnapshotFinishError {
+    #[error("workspace snapshot finish authorization mismatch")]
+    AuthorizationMismatch,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspacePromptCaptureContext {
+    basis: Arc<WorkspaceCandidateCapabilityBasis>,
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    roots: Arc<[AuthorizedPromptSourceRoot]>,
+}
+
+impl WorkspacePromptCaptureContext {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath {
+        &self.cwd
+    }
+
+    pub(crate) fn roots(&self) -> &[AuthorizedPromptSourceRoot] {
+        &self.roots
+    }
+
+    pub(crate) fn capture(
+        &self,
+        root_key: &WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        content: Arc<str>,
+    ) -> Result<CapturedWorkspacePromptSource, WorkspaceSourceCaptureError> {
+        let root = self
+            .roots
+            .iter()
+            .find(|root| root.key == *root_key)
+            .ok_or(WorkspaceSourceCaptureError::SourceKindNotAuthorized)?;
+        validate_source_relative_location(&relative_location)?;
+        Ok(CapturedWorkspacePromptSource {
+            relative_location,
+            content,
+            basis: Arc::clone(&self.basis),
+            authorization: WorkspaceSourceAuthorization {
+                root_key: root.key.clone(),
+                canonical_root: root.canonical_path.clone(),
+                trust: root.trust,
+            },
+        })
+    }
+}
+
+impl fmt::Debug for WorkspacePromptCaptureContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspacePromptCaptureContext")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceSkillCaptureContext {
+    basis: Arc<WorkspaceCandidateCapabilityBasis>,
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    roots: Arc<[AuthorizedSkillSourceRoot]>,
+}
+
+impl WorkspaceSkillCaptureContext {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath {
+        &self.cwd
+    }
+
+    pub(crate) fn roots(&self) -> &[AuthorizedSkillSourceRoot] {
+        &self.roots
+    }
+
+    pub(crate) fn capture(
+        &self,
+        root_key: &WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        bytes: Arc<[u8]>,
+    ) -> Result<CapturedWorkspaceSkillSource, WorkspaceSourceCaptureError> {
+        let root = self
+            .roots
+            .iter()
+            .find(|root| root.key == *root_key)
+            .ok_or(WorkspaceSourceCaptureError::SourceKindNotAuthorized)?;
+        validate_source_relative_location(&relative_location)?;
+        Ok(CapturedWorkspaceSkillSource {
+            relative_location,
+            bytes,
+            basis: Arc::clone(&self.basis),
+            authorization: WorkspaceSourceAuthorization {
+                root_key: root.key.clone(),
+                canonical_root: root.canonical_path.clone(),
+                trust: root.trust,
+            },
+        })
+    }
+}
+
+impl fmt::Debug for WorkspaceSkillCaptureContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSkillCaptureContext")
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+fn validate_source_relative_location(
+    relative_location: &WorkspaceRelativePath,
+) -> Result<(), WorkspaceSourceCaptureError> {
+    if relative_location.is_root() {
+        return Err(WorkspaceSourceCaptureError::InvalidRelativeLocation);
+    }
+    let path = Path::new(relative_location.as_str());
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(WorkspaceSourceCaptureError::SourceOutsideAuthorizedRoot);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedWorkspacePromptSource {
+    relative_location: WorkspaceRelativePath,
+    content: Arc<str>,
+    basis: Arc<WorkspaceCandidateCapabilityBasis>,
+    authorization: WorkspaceSourceAuthorization,
+}
+
+impl CapturedWorkspacePromptSource {
+    pub(crate) fn relative_location(&self) -> &WorkspaceRelativePath {
+        &self.relative_location
+    }
+
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization {
+        &self.authorization
+    }
+}
+
+impl fmt::Debug for CapturedWorkspacePromptSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedWorkspacePromptSource")
+            .field("has_content", &true)
+            .field("authorization", &self.authorization)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedWorkspaceSkillSource {
+    relative_location: WorkspaceRelativePath,
+    bytes: Arc<[u8]>,
+    basis: Arc<WorkspaceCandidateCapabilityBasis>,
+    authorization: WorkspaceSourceAuthorization,
+}
+
+impl CapturedWorkspaceSkillSource {
+    pub(crate) fn relative_location(&self) -> &WorkspaceRelativePath {
+        &self.relative_location
+    }
+
+    pub(crate) fn bytes(&self) -> &Arc<[u8]> {
+        &self.bytes
+    }
+
+    pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization {
+        &self.authorization
+    }
+}
+
+impl fmt::Debug for CapturedWorkspaceSkillSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedWorkspaceSkillSource")
+            .field("byte_count", &self.bytes.len())
+            .field("authorization", &self.authorization)
+            .finish()
+    }
+}
+
+pub(crate) struct WorkspaceSnapshotCandidate {
+    session_id: SessionId,
+    revision: WorkspaceRevision,
+    roots: Arc<[ResolvedWorkspaceRoot]>,
+    cwd: CanonicalWorkspacePath,
+    basis: Arc<WorkspaceCandidateCapabilityBasis>,
+}
+
+impl WorkspaceSnapshotCandidate {
+    fn new(
+        session_id: SessionId,
+        revision: WorkspaceRevision,
+        roots: Vec<ResolvedWorkspaceRoot>,
+        cwd: CanonicalWorkspacePath,
+    ) -> Self {
+        Self {
+            session_id,
+            revision,
+            roots: roots.into(),
+            cwd,
+            basis: Arc::new(WorkspaceCandidateCapabilityBasis),
+        }
+    }
+
+    pub(crate) const fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    pub(crate) fn prompt_capture_context(&self) -> WorkspacePromptCaptureContext {
+        let roots = self
+            .roots
+            .iter()
+            .filter(|root| root.prompt_source)
+            .map(|root| AuthorizedPromptSourceRoot {
+                key: root.key.clone(),
+                canonical_path: root.canonical_path.clone(),
+                trust: root.trust,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        WorkspacePromptCaptureContext {
+            basis: Arc::clone(&self.basis),
+            session_id: self.session_id,
+            cwd: self.cwd.clone(),
+            roots,
+        }
+    }
+
+    pub(crate) fn skill_capture_context(&self) -> WorkspaceSkillCaptureContext {
+        let roots = self
+            .roots
+            .iter()
+            .filter(|root| root.skill_source)
+            .map(|root| AuthorizedSkillSourceRoot {
+                key: root.key.clone(),
+                canonical_path: root.canonical_path.clone(),
+                trust: root.trust,
+            })
+            .collect::<Vec<_>>()
+            .into();
+        WorkspaceSkillCaptureContext {
+            basis: Arc::clone(&self.basis),
+            session_id: self.session_id,
+            cwd: self.cwd.clone(),
+            roots,
+        }
+    }
+
+    pub(crate) fn finish(
+        self,
+        prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
+        skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
+    ) -> Result<Arc<WorkspaceSnapshot>, WorkspaceSnapshotFinishError> {
+        if !self.sources_match_roots(&prompt_sources, &skill_sources) {
+            return Err(WorkspaceSnapshotFinishError::AuthorizationMismatch);
+        }
+        Ok(Arc::new(WorkspaceSnapshot {
+            session_id: self.session_id,
+            revision: self.revision,
+            roots: self.roots,
+            cwd: self.cwd,
+            prompt_sources,
+            skill_sources,
+        }))
+    }
+
+    fn sources_match_roots(
+        &self,
+        prompt_sources: &[CapturedWorkspacePromptSource],
+        skill_sources: &[CapturedWorkspaceSkillSource],
+    ) -> bool {
+        prompt_sources.iter().all(|source| {
+            validate_source_relative_location(&source.relative_location).is_ok()
+                && Arc::ptr_eq(&self.basis, &source.basis)
+                && self.roots.iter().any(|root| {
+                    root.prompt_source
+                        && root.key == source.authorization.root_key
+                        && root.canonical_path == source.authorization.canonical_root
+                        && root.trust == source.authorization.trust
+                })
+        }) && skill_sources.iter().all(|source| {
+            validate_source_relative_location(&source.relative_location).is_ok()
+                && Arc::ptr_eq(&self.basis, &source.basis)
+                && self.roots.iter().any(|root| {
+                    root.skill_source
+                        && root.key == source.authorization.root_key
+                        && root.canonical_path == source.authorization.canonical_root
+                        && root.trust == source.authorization.trust
+                })
+        })
+    }
+}
+
+impl fmt::Debug for WorkspaceSnapshotCandidate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSnapshotCandidate")
+            .field("revision", &self.revision)
+            .field("root_count", &self.roots.len())
+            .finish()
+    }
+}
+
+pub(crate) struct WorkspaceSnapshot {
+    session_id: SessionId,
+    revision: WorkspaceRevision,
+    roots: Arc<[ResolvedWorkspaceRoot]>,
+    cwd: CanonicalWorkspacePath,
+    prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
+    skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
+}
+
+impl WorkspaceSnapshot {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    pub(crate) fn prompt_context(&self) -> WorkspacePromptContext {
+        let primary_root = self
+            .roots
+            .first()
+            .expect("a Workspace always has a primary root")
+            .canonical_path
+            .clone();
+        WorkspacePromptContext {
+            session_id: self.session_id,
+            cwd: self.cwd.clone(),
+            primary_root,
+            sources: Arc::clone(&self.prompt_sources),
+        }
+    }
+
+    pub(crate) fn skill_context(&self) -> WorkspaceSkillContext {
+        WorkspaceSkillContext {
+            session_id: self.session_id,
+            cwd: self.cwd.clone(),
+            sources: Arc::clone(&self.skill_sources),
+        }
+    }
+
+    pub(crate) fn into_resolved(self: Arc<Self>) -> ResolvedWorkspace {
+        ResolvedWorkspace { snapshot: self }
+    }
+}
+
+impl fmt::Debug for WorkspaceSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSnapshot")
+            .field("revision", &self.revision)
+            .field("root_count", &self.roots.len())
+            .field("prompt_source_count", &self.prompt_sources.len())
+            .field("skill_source_count", &self.skill_sources.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ResolvedWorkspace {
+    snapshot: Arc<WorkspaceSnapshot>,
+}
+
+impl ResolvedWorkspace {
+    pub(crate) fn snapshot(&self) -> &Arc<WorkspaceSnapshot> {
+        &self.snapshot
+    }
+
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.snapshot.session_id()
+    }
+
+    pub(crate) fn revision(&self) -> WorkspaceRevision {
+        self.snapshot.revision()
+    }
+}
+
+impl fmt::Debug for ResolvedWorkspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedWorkspace")
+            .field("snapshot", &self.snapshot)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspacePromptContext {
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    primary_root: CanonicalWorkspacePath,
+    sources: Arc<[CapturedWorkspacePromptSource]>,
+}
+
+impl WorkspacePromptContext {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath {
+        &self.cwd
+    }
+
+    pub(crate) fn primary_root(&self) -> &CanonicalWorkspacePath {
+        &self.primary_root
+    }
+
+    pub(crate) fn sources(&self) -> &[CapturedWorkspacePromptSource] {
+        &self.sources
+    }
+}
+
+impl fmt::Debug for WorkspacePromptContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspacePromptContext")
+            .field("source_count", &self.sources.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceSkillContext {
+    session_id: SessionId,
+    cwd: CanonicalWorkspacePath,
+    sources: Arc<[CapturedWorkspaceSkillSource]>,
+}
+
+impl WorkspaceSkillContext {
+    pub(crate) fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) fn cwd(&self) -> &CanonicalWorkspacePath {
+        &self.cwd
+    }
+
+    pub(crate) fn sources(&self) -> &[CapturedWorkspaceSkillSource] {
+        &self.sources
+    }
+}
+
+impl fmt::Debug for WorkspaceSkillContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspaceSkillContext")
+            .field("source_count", &self.sources.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::future::{Future, poll_fn};
+    use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::{
-        RequestedFilesystemAccess, Workspace, WorkspaceConstructionError, WorkspaceCwdSpec,
-        WorkspaceDefinitionInput, WorkspaceInputLoweringError, WorkspacePathTarget,
-        WorkspaceRootInput, WorkspaceRootSpec, WorkspaceSourcePolicy, checked_native_uri,
-        lower_workspace, uri_from_spec,
+        CanonicalWorkspacePath, CapturedWorkspacePromptSource, CapturedWorkspaceSkillSource,
+        LocalWorkspacePathAdapter, RequestedFilesystemAccess, RestrictedWorkspaceAuthority,
+        Workspace, WorkspaceAuthority, WorkspaceAuthorityDecision, WorkspaceAuthorityError,
+        WorkspaceAuthorityRequest, WorkspaceAuthorityRootDecision, WorkspaceAuthorityRootRequest,
+        WorkspaceConstructionError, WorkspaceCwdSpec, WorkspaceDefinitionInput,
+        WorkspaceFilesystemGrant, WorkspaceInputLoweringError, WorkspacePathAdapter,
+        WorkspacePathError, WorkspacePathTarget, WorkspaceResolveError, WorkspaceResolver,
+        WorkspaceRootInput, WorkspaceRootRole, WorkspaceRootSpec, WorkspaceRootTrust,
+        WorkspaceSnapshotFinishError, WorkspaceSourceCaptureError, WorkspaceSourcePolicy,
+        WorkspaceTrustLevel, WorkspaceTrustRevision, checked_native_uri, lower_workspace,
+        uri_from_spec,
     };
-    use crate::wire::{CanonicalFileUri, WorkspaceRelativePath, WorkspaceRevision};
+    use crate::runtime_task::RuntimeTaskContext;
+    use crate::wire::{CanonicalFileUri, SessionId, WorkspaceRelativePath, WorkspaceRevision};
+
+    static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Clone)]
+    struct DeterministicWorkspacePathAdapter {
+        mappings: BTreeMap<PathBuf, Result<CanonicalWorkspacePath, WorkspacePathError>>,
+        entered: Option<Arc<Barrier>>,
+        release: Option<Arc<Barrier>>,
+        block_once: Arc<AtomicBool>,
+        panic: bool,
+    }
+
+    impl DeterministicWorkspacePathAdapter {
+        fn identity() -> Self {
+            Self {
+                mappings: BTreeMap::new(),
+                entered: None,
+                release: None,
+                block_once: Arc::new(AtomicBool::new(false)),
+                panic: false,
+            }
+        }
+
+        fn mapping(mut self, input: &str, canonical: &str) -> Self {
+            self.mappings.insert(
+                PathBuf::from(input),
+                Ok(CanonicalWorkspacePath::new(PathBuf::from(canonical))),
+            );
+            self
+        }
+
+        fn blocking(entered: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+            Self {
+                mappings: BTreeMap::new(),
+                entered: Some(entered),
+                release: Some(release),
+                block_once: Arc::new(AtomicBool::new(true)),
+                panic: false,
+            }
+        }
+
+        fn panicking() -> Self {
+            Self {
+                panic: true,
+                ..Self::identity()
+            }
+        }
+    }
+
+    impl WorkspacePathAdapter for DeterministicWorkspacePathAdapter {
+        fn canonicalize_directory(
+            &self,
+            path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            if self.panic {
+                panic!("deterministic path adapter panic payload");
+            }
+            if self.block_once.swap(false, Ordering::SeqCst) {
+                self.entered
+                    .as_ref()
+                    .expect("a blocking adapter has an entry barrier")
+                    .wait();
+                self.release
+                    .as_ref()
+                    .expect("a blocking adapter has a release barrier")
+                    .wait();
+            }
+            self.mappings
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| Ok(CanonicalWorkspacePath::new(path.to_path_buf())))
+        }
+    }
+
+    #[derive(Clone)]
+    struct DeterministicWorkspaceAuthority {
+        handler: Arc<
+            dyn Fn(
+                    WorkspaceAuthorityRequest,
+                ) -> Result<WorkspaceAuthorityDecision, WorkspaceAuthorityError>
+                + Send
+                + Sync,
+        >,
+    }
+
+    impl DeterministicWorkspaceAuthority {
+        fn new<F>(handler: F) -> Self
+        where
+            F: Fn(
+                    WorkspaceAuthorityRequest,
+                ) -> Result<WorkspaceAuthorityDecision, WorkspaceAuthorityError>
+                + Send
+                + Sync
+                + 'static,
+        {
+            Self {
+                handler: Arc::new(handler),
+            }
+        }
+    }
+
+    impl WorkspaceAuthority for DeterministicWorkspaceAuthority {
+        fn authorize(&self, request: WorkspaceAuthorityRequest) -> super::WorkspaceAuthorityFuture {
+            let handler = Arc::clone(&self.handler);
+            Box::pin(async move { handler(request) })
+        }
+    }
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn new(label: &str) -> Self {
+            let suffix = NEXT_TEMP_SUFFIX.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "minicore-runtime-workspace-{label}-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("the test temporary directory is creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn initialized_context() -> RuntimeTaskContext {
+        RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the test runtime has the required timer service")
+    }
+
+    fn session_id() -> SessionId {
+        "ses_11111111111111111111111111111111"
+            .parse()
+            .expect("the test session id is canonical")
+    }
+
+    fn trust() -> WorkspaceRootTrust {
+        WorkspaceRootTrust::new(
+            WorkspaceTrustLevel::Trusted,
+            WorkspaceTrustRevision::new(
+                NonZeroU64::new(7).expect("the test trust revision is non-zero"),
+            ),
+        )
+    }
+
+    fn authority_with_ceiling(
+        filesystem: WorkspaceFilesystemGrant,
+        prompt: bool,
+        skill: bool,
+    ) -> Arc<dyn WorkspaceAuthority> {
+        Arc::new(DeterministicWorkspaceAuthority::new(move |request| {
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        trust(),
+                        filesystem,
+                        prompt,
+                        skill,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        }))
+    }
+
+    fn authority_by_key() -> Arc<dyn WorkspaceAuthority> {
+        Arc::new(DeterministicWorkspaceAuthority::new(|request| {
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    let is_primary = root.key.as_str() == "primary";
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        trust(),
+                        WorkspaceFilesystemGrant::ReadWrite,
+                        is_primary,
+                        !is_primary,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        }))
+    }
+
+    fn resolver_with_adapters(
+        context: RuntimeTaskContext,
+        paths: impl WorkspacePathAdapter + 'static,
+        authority: Arc<dyn WorkspaceAuthority>,
+    ) -> WorkspaceResolver {
+        WorkspaceResolver::new_with_adapters(context, Arc::new(paths), authority)
+    }
+
+    fn root_spec_with(
+        key: &str,
+        path: &str,
+        requested_access: RequestedFilesystemAccess,
+        sources: WorkspaceSourcePolicy,
+    ) -> WorkspaceRootSpec {
+        WorkspaceRootSpec {
+            key: key.parse().expect("the test root key is canonical"),
+            path: PathBuf::from(path),
+            requested_access,
+            sources,
+        }
+    }
+
+    fn resolver_workspace(
+        primary: (&str, &str, RequestedFilesystemAccess, WorkspaceSourcePolicy),
+        additional: Vec<(&str, &str, RequestedFilesystemAccess, WorkspaceSourcePolicy)>,
+        cwd_root: &str,
+        cwd_relative: &str,
+    ) -> Workspace {
+        Workspace::new(
+            revision(),
+            root_spec_with(primary.0, primary.1, primary.2, primary.3),
+            additional
+                .into_iter()
+                .map(|root| root_spec_with(root.0, root.1, root.2, root.3))
+                .collect(),
+            cwd(cwd_root, cwd_relative),
+        )
+        .expect("the resolver test workspace is structurally valid")
+    }
+
+    async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
+    where
+        F: Future,
+    {
+        poll_fn(|context| {
+            std::task::Poll::Ready(matches!(
+                future.as_mut().poll(context),
+                std::task::Poll::Pending
+            ))
+        })
+        .await
+    }
 
     #[test]
     fn explicit_posix_target_lowers_and_roundtrips_a_canonical_root() {
@@ -1042,6 +2537,823 @@ mod tests {
         assert!(!error_text.contains("root-secret"));
         assert!(!error_text.contains("private-uri-secret"));
         assert!(!error_text.contains("file:///"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_resolver_preserves_roles_order_cwd_and_snapshot_binding() {
+        let temporary = TempDirectory::new("local-success");
+        let primary = temporary.path().join("primary");
+        let primary_cwd = primary.join("src");
+        let additional = temporary.path().join("additional");
+        let additional_cwd = additional.join("nested");
+        std::fs::create_dir_all(&primary_cwd).expect("the primary test root is creatable");
+        std::fs::create_dir_all(&additional_cwd).expect("the additional test root is creatable");
+
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                primary.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            vec![root_spec_with(
+                "additional",
+                additional.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            )],
+            cwd("additional", "nested"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, true, true),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate.revision(), revision());
+        assert_eq!(candidate.roots.len(), 2);
+        assert_eq!(candidate.roots[0].role, WorkspaceRootRole::Primary);
+        assert_eq!(candidate.roots[1].role, WorkspaceRootRole::Additional);
+        assert_eq!(candidate.roots[0].key.as_str(), "primary");
+        assert_eq!(candidate.roots[1].key.as_str(), "additional");
+        assert_eq!(
+            candidate.cwd.as_path(),
+            std::fs::canonicalize(&additional_cwd).unwrap()
+        );
+
+        let snapshot = candidate
+            .finish(Arc::from(Vec::new()), Arc::from(Vec::new()))
+            .unwrap();
+        let snapshot_copy = Arc::clone(&snapshot);
+        assert_eq!(snapshot.session_id(), session_id());
+        assert_eq!(snapshot.revision(), revision());
+        assert_eq!(snapshot_copy.cwd, snapshot.cwd);
+        assert_eq!(snapshot_copy.roots, snapshot.roots);
+        assert!(format!("{snapshot:?} {snapshot_copy:?}").contains("root_count"));
+        assert!(!format!("{snapshot:?}").contains(primary.to_str().unwrap()));
+        assert!(!format!("{snapshot:?}").contains(&session_id().to_string()));
+
+        let resolved = Arc::clone(&snapshot).into_resolved();
+        assert_eq!(resolved.session_id(), session_id());
+        assert_eq!(resolved.revision(), revision());
+        assert_eq!(resolved.snapshot.roots, snapshot.roots);
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_cwd_can_be_in_primary_or_additional_root() {
+        let temporary = TempDirectory::new("cwd-roots");
+        let primary = temporary.path().join("primary");
+        let primary_cwd = primary.join("src");
+        let additional = temporary.path().join("additional");
+        let additional_cwd = additional.join("nested");
+        std::fs::create_dir_all(&primary_cwd).expect("the primary test root is creatable");
+        std::fs::create_dir_all(&additional_cwd).expect("the additional test root is creatable");
+
+        let primary_root = root_spec_with(
+            "primary",
+            primary.to_str().unwrap(),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(false, false),
+        );
+        let additional_root = root_spec_with(
+            "additional",
+            additional.to_str().unwrap(),
+            RequestedFilesystemAccess::ReadWrite,
+            WorkspaceSourcePolicy::new(false, false),
+        );
+        let primary_workspace = Workspace::new(
+            revision(),
+            primary_root.clone(),
+            vec![additional_root.clone()],
+            cwd("primary", "src"),
+        )
+        .unwrap();
+        let additional_workspace = Workspace::new(
+            revision(),
+            primary_root,
+            vec![additional_root],
+            cwd("additional", "nested"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            LocalWorkspacePathAdapter,
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, false, false),
+        );
+        let primary_candidate = resolver
+            .resolve(session_id(), &primary_workspace)
+            .await
+            .unwrap();
+        let additional_candidate = resolver
+            .resolve(session_id(), &additional_workspace)
+            .await
+            .unwrap();
+        assert_eq!(
+            primary_candidate.cwd.as_path(),
+            std::fs::canonicalize(primary_cwd).unwrap()
+        );
+        assert_eq!(
+            additional_candidate.cwd.as_path(),
+            std::fs::canonicalize(additional_cwd).unwrap()
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn requested_access_and_source_flags_are_tightened_independently() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadOnly, true, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let root = &candidate.roots[0];
+        assert_eq!(root.filesystem, WorkspaceFilesystemGrant::ReadOnly);
+        assert!(root.prompt_source);
+        assert!(!root.skill_source);
+        assert_eq!(root.trust.level(), WorkspaceTrustLevel::Trusted);
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restricted_production_authority_is_untrusted_and_cannot_widen_access() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            Arc::new(RestrictedWorkspaceAuthority),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let root = &candidate.roots[0];
+        assert_eq!(root.trust.level(), WorkspaceTrustLevel::Untrusted);
+        assert_eq!(root.filesystem, WorkspaceFilesystemGrant::None);
+        assert!(!root.prompt_source);
+        assert!(!root.skill_source);
+        assert!(candidate.prompt_capture_context().roots().is_empty());
+        assert!(candidate.skill_capture_context().roots().is_empty());
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn canonical_duplicate_via_symlink_alias_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("duplicate-symlink");
+        let real = temporary.path().join("real");
+        let alias = temporary.path().join("alias");
+        std::fs::create_dir_all(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        let workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                real.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            vec![root_spec_with(
+                "alias",
+                alias.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            )],
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = WorkspaceResolver::new(task_context.clone());
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::DuplicateRoot
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn nested_canonical_roots_are_rejected_without_string_prefix_logic() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/project",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            vec![(
+                "nested",
+                "/deterministic/project-two",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            )],
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity()
+                .mapping("/deterministic/project-two", "/deterministic/project/child"),
+            Arc::new(RestrictedWorkspaceAuthority),
+        );
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::OverlappingRoots
+        );
+        task_context.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cwd_symlink_escape_and_root_key_mismatch_are_distinct() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TempDirectory::new("cwd-links");
+        let primary = temporary.path().join("primary");
+        let additional = temporary.path().join("additional");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&additional).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, primary.join("escape")).unwrap();
+        symlink(&additional, primary.join("to-additional")).unwrap();
+
+        let roots = || {
+            (
+                root_spec_with(
+                    "primary",
+                    primary.to_str().unwrap(),
+                    RequestedFilesystemAccess::ReadWrite,
+                    WorkspaceSourcePolicy::new(false, false),
+                ),
+                vec![root_spec_with(
+                    "additional",
+                    additional.to_str().unwrap(),
+                    RequestedFilesystemAccess::ReadOnly,
+                    WorkspaceSourcePolicy::new(false, false),
+                )],
+            )
+        };
+        let (primary_root, additional_roots) = roots();
+        let escape_workspace = Workspace::new(
+            revision(),
+            primary_root,
+            additional_roots.clone(),
+            cwd("primary", "escape"),
+        )
+        .unwrap();
+        let (primary_root, additional_roots) = roots();
+        let mismatch_workspace = Workspace::new(
+            revision(),
+            primary_root,
+            additional_roots,
+            cwd("primary", "to-additional"),
+        )
+        .unwrap();
+
+        let task_context = initialized_context().await;
+        let resolver = WorkspaceResolver::new(task_context.clone());
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &escape_workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::CwdOutsideRoots
+        );
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &mismatch_workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::CwdRootMismatch
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_and_non_directory_roots_use_typed_errors() {
+        let temporary = TempDirectory::new("root-errors");
+        let missing = temporary.path().join("missing");
+        let missing_workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                missing.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let file = temporary.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        let file_workspace = Workspace::new(
+            revision(),
+            root_spec_with(
+                "primary",
+                file.to_str().unwrap(),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            cwd("primary", ""),
+        )
+        .unwrap();
+        let task_context = initialized_context().await;
+        let resolver = WorkspaceResolver::new(task_context.clone());
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &missing_workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::RootUnavailable
+        );
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &file_workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::RootNotDirectory
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_and_skill_capture_contexts_cannot_cross_authorize() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            ),
+            vec![(
+                "additional",
+                "/deterministic/additional",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            )],
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_by_key(),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let prompt_context = candidate.prompt_capture_context();
+        let skill_context = candidate.skill_capture_context();
+        assert_eq!(prompt_context.roots().len(), 1);
+        assert_eq!(skill_context.roots().len(), 1);
+        let primary_key = "primary".parse().unwrap();
+        let additional_key = "additional".parse().unwrap();
+        assert_eq!(
+            prompt_context
+                .capture(
+                    &primary_key,
+                    "instructions.md".parse().unwrap(),
+                    Arc::<str>::from("immutable prompt body"),
+                )
+                .as_ref()
+                .unwrap()
+                .content(),
+            "immutable prompt body"
+        );
+        assert!(matches!(
+            prompt_context.capture(
+                &additional_key,
+                "instructions.md".parse().unwrap(),
+                Arc::<str>::from("wrong kind"),
+            ),
+            Err(WorkspaceSourceCaptureError::SourceKindNotAuthorized)
+        ));
+        assert!(matches!(
+            prompt_context.capture(
+                &primary_key,
+                WorkspaceRelativePath::default(),
+                Arc::<str>::from("root location is not a source"),
+            ),
+            Err(WorkspaceSourceCaptureError::InvalidRelativeLocation)
+        ));
+
+        let prompt = prompt_context
+            .capture(
+                &primary_key,
+                "instructions.md".parse().unwrap(),
+                Arc::<str>::from("immutable prompt body"),
+            )
+            .unwrap();
+        let skill = skill_context
+            .capture(
+                &additional_key,
+                "skill.bin".parse().unwrap(),
+                Arc::<[u8]>::from(vec![1_u8, 2, 3]),
+            )
+            .unwrap();
+        assert!(matches!(
+            skill_context.capture(
+                &primary_key,
+                "skill.bin".parse().unwrap(),
+                Arc::<[u8]>::from(vec![9_u8]),
+            ),
+            Err(WorkspaceSourceCaptureError::SourceKindNotAuthorized)
+        ));
+        let snapshot = candidate
+            .finish(
+                Arc::<[CapturedWorkspacePromptSource]>::from(vec![prompt]),
+                Arc::<[CapturedWorkspaceSkillSource]>::from(vec![skill]),
+            )
+            .unwrap();
+        assert_eq!(snapshot.prompt_sources.len(), 1);
+        assert_eq!(snapshot.skill_sources.len(), 1);
+        assert_eq!(
+            snapshot.prompt_sources[0].content(),
+            "immutable prompt body"
+        );
+        assert_eq!(snapshot.skill_sources[0].bytes().as_ref(), &[1, 2, 3]);
+        assert_eq!(
+            snapshot.prompt_sources[0]
+                .authorization()
+                .root_key()
+                .as_str(),
+            "primary"
+        );
+        assert_eq!(
+            snapshot.skill_sources[0]
+                .authorization()
+                .root_key()
+                .as_str(),
+            "additional"
+        );
+        let prompt_projection = snapshot.prompt_context();
+        let skill_projection = snapshot.skill_context();
+        assert_eq!(prompt_projection.sources().len(), 1);
+        assert_eq!(skill_projection.sources().len(), 1);
+        let debug = format!("{snapshot:?} {:?}", snapshot.prompt_sources);
+        assert!(!debug.contains("immutable prompt body"));
+        assert!(!debug.contains("skill.bin"));
+        assert!(!debug.contains("/deterministic"));
+        assert!(!debug.contains(&session_id().to_string()));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_capability_basis_rejects_sources_from_an_identical_candidate() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, true, false),
+        );
+        let candidate_a = resolver.resolve(session_id(), &workspace).await.unwrap();
+        let candidate_b = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate_a.roots, candidate_b.roots);
+        assert_eq!(candidate_a.cwd, candidate_b.cwd);
+
+        let source = candidate_a
+            .prompt_capture_context()
+            .capture(
+                &"primary".parse().unwrap(),
+                "instructions.md".parse().unwrap(),
+                Arc::<str>::from("private prompt body"),
+            )
+            .unwrap();
+        let error = candidate_b
+            .finish(
+                Arc::<[CapturedWorkspacePromptSource]>::from(vec![source]),
+                Arc::from(Vec::new()),
+            )
+            .unwrap_err();
+        assert_eq!(error, WorkspaceSnapshotFinishError::AuthorizationMismatch);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("instructions.md"));
+        assert!(!error_text.contains("private prompt body"));
+        assert!(!error_text.contains("/deterministic/primary"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authorized_capture_cannot_be_installed_into_an_unauthorized_candidate() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let authorized_resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, true, false),
+        );
+        let unauthorized_resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::None, false, false),
+        );
+        let authorized_candidate = authorized_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        let unauthorized_candidate = unauthorized_resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap();
+        assert!(!unauthorized_candidate.roots[0].prompt_source);
+        let source = authorized_candidate
+            .prompt_capture_context()
+            .capture(
+                &"primary".parse().unwrap(),
+                "instructions.md".parse().unwrap(),
+                Arc::<str>::from("authorized prompt body"),
+            )
+            .unwrap();
+
+        let error = unauthorized_candidate
+            .finish(
+                Arc::<[CapturedWorkspacePromptSource]>::from(vec![source]),
+                Arc::from(Vec::new()),
+            )
+            .unwrap_err();
+        assert_eq!(error, WorkspaceSnapshotFinishError::AuthorizationMismatch);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("instructions.md"));
+        assert!(!error_text.contains("authorized prompt body"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authority_unavailable_and_denied_remain_distinct() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        for expected in [
+            (
+                WorkspaceAuthorityError::Unavailable,
+                WorkspaceResolveError::AuthorityUnavailable,
+            ),
+            (
+                WorkspaceAuthorityError::Denied,
+                WorkspaceResolveError::AuthorityDenied,
+            ),
+        ] {
+            let task_context = initialized_context().await;
+            let authority = Arc::new(DeterministicWorkspaceAuthority::new(move |_| {
+                Err(expected.0)
+            }));
+            let resolver = resolver_with_adapters(
+                task_context.clone(),
+                DeterministicWorkspacePathAdapter::identity(),
+                authority,
+            );
+            assert_eq!(
+                resolver
+                    .resolve(session_id(), &workspace)
+                    .await
+                    .unwrap_err(),
+                expected.1
+            );
+            task_context.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adapter_decision_shape_mismatch_closes_owner_and_redacts_error() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let authority = Arc::new(DeterministicWorkspaceAuthority::new(|request| {
+            let expected = &request.roots()[0];
+            let stale = WorkspaceAuthorityRootRequest::new(
+                "wrong-key".parse().unwrap(),
+                expected.role,
+                expected.canonical_path.clone(),
+                expected.requested_access,
+                expected.sources,
+            );
+            Ok(WorkspaceAuthorityDecision::new(vec![
+                WorkspaceAuthorityRootDecision::new(
+                    stale,
+                    trust(),
+                    WorkspaceFilesystemGrant::None,
+                    false,
+                    false,
+                ),
+            ]))
+        }));
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority,
+        );
+        let error = resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap_err();
+        assert_eq!(error, WorkspaceResolveError::InternalDispatchUnavailable);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("wrong-key"));
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::Closing
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_authority_request_cannot_reuse_key_and_role_after_root_changes() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let authority = Arc::new(DeterministicWorkspaceAuthority::new(|request| {
+            let expected = &request.roots()[0];
+            let stale = WorkspaceAuthorityRootRequest::new(
+                expected.key.clone(),
+                expected.role,
+                CanonicalWorkspacePath::new(PathBuf::from("/stale/canonical/root")),
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, true),
+            );
+            Ok(WorkspaceAuthorityDecision::new(vec![
+                WorkspaceAuthorityRootDecision::new(
+                    stale,
+                    trust(),
+                    WorkspaceFilesystemGrant::ReadWrite,
+                    true,
+                    true,
+                ),
+            ]))
+        }));
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority,
+        );
+        let error = resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap_err();
+        assert_eq!(error, WorkspaceResolveError::InternalDispatchUnavailable);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("/stale/canonical/root"));
+        assert_eq!(
+            resolver
+                .resolve(session_id(), &workspace)
+                .await
+                .unwrap_err(),
+            WorkspaceResolveError::Closing
+        );
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_panic_closes_owner_and_redacts_panic_payload() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::panicking(),
+            Arc::new(RestrictedWorkspaceAuthority),
+        );
+        let error = resolver
+            .resolve(session_id(), &workspace)
+            .await
+            .unwrap_err();
+        assert_eq!(error, WorkspaceResolveError::InternalDispatchUnavailable);
+        let error_text = format!("{error:?} {error}");
+        assert!(!error_text.contains("deterministic path adapter panic payload"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelling_path_wait_keeps_owner_tracked_work_until_named_barrier_release() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadOnly,
+                WorkspaceSourcePolicy::new(false, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_for_waiter = Arc::clone(&entered);
+        let entered_waiter = thread::spawn(move || {
+            entered_for_waiter.wait();
+        });
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::blocking(Arc::clone(&entered), Arc::clone(&release)),
+            Arc::new(RestrictedWorkspaceAuthority),
+        );
+        let mut resolve = Box::pin(resolver.resolve(session_id(), &workspace));
+        assert!(poll_once_pending(resolve.as_mut()).await);
+        entered_waiter
+            .join()
+            .expect("the named entry barrier released");
+        drop(resolve);
+
+        let mut shutdown = Box::pin(task_context.shutdown());
+        assert!(poll_once_pending(shutdown.as_mut()).await);
+        release.wait();
+        shutdown.await;
     }
 
     fn revision() -> WorkspaceRevision {
