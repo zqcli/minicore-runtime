@@ -6,10 +6,11 @@
 //! The crate-private owner of loaded Session residency.
 //!
 //! This module deliberately stops at the boundary between durable Session definitions, the
-//! Workspace resolver, and a loaded Ready+Idle [`SessionExecutor`].  It owns no public Runtime
-//! routing, Turn state, replay, or recording. `RuntimeInner` retains this registry as one deep
-//! resource owner without making any residency permit, gate, executor, or task handle part of the
-//! Runtime interface.
+//! Workspace resolver, replay-backed Ready+Idle installation, and a loaded [`SessionExecutor`].
+//! Conversation Storage retains semantic replay and recording ownership; this registry only keeps
+//! their prepared state/recorder alive through publication. It owns no public Runtime routing or
+//! Turn state. `RuntimeInner` retains this registry as one deep resource owner without making any
+//! residency permit, gate, executor, or task handle part of the Runtime interface.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -25,13 +26,16 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
     SessionLifecycleDecision, SessionLifecycleDecisionError,
 };
+use crate::conversation_storage::{
+    ConversationLoadError, ConversationReplayError, load_replayed_conversation,
+};
 use crate::durable_state::{
-    DurableSessionDefinitionError, DurableSessionDefinitionOutcome, DurableSessionLifecycleError,
-    DurableSessionLifecycleOutcome, DurableState,
+    DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
+    DurableSessionLifecycleError, DurableSessionLifecycleOutcome, DurableState,
 };
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
-    SessionExecutor, SessionExecutorCloseError, SessionExecutorSnapshot,
+    LoadedSessionConversation, SessionExecutor, SessionExecutorCloseError, SessionExecutorSnapshot,
     SessionExecutorSnapshotError, SessionExecutorStartError, SessionWorkspaceDefinitionError,
     SessionWorkspaceDefinitionOutcome,
 };
@@ -72,6 +76,12 @@ pub(crate) enum SessionResidencyLoadError {
     WorkspaceUnavailable,
     #[error("workspace candidate was rejected")]
     WorkspaceRejected,
+    #[error("recorded conversation state is corrupt")]
+    RecordedStateCorrupt,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1855,24 +1865,46 @@ async fn run_load(
     if context.closing.is_cancelled() {
         return Err(SessionResidencyLoadError::Closing);
     }
+
+    let target = context
+        .durable_state
+        .open_conversation_target(session_id)
+        .await
+        .map_err(|error| map_conversation_target_load_error(&context, error))?;
+    let loaded_conversation = load_replayed_conversation(target, context.task_context.clone())
+        .await
+        .map_err(|error| map_conversation_load_error(&context, error))?;
+    let recorder = loaded_conversation.recorder;
+    let live_state = loaded_conversation.live_state;
+    let replay_diagnostics = loaded_conversation.diagnostics;
+    let recorder_for_executor = recorder.clone();
+    let conversation = LoadedSessionConversation::from_replay(
+        live_state,
+        recorder_for_executor,
+        replay_diagnostics,
+    );
     let executor = match SessionExecutor::start_loaded_ready_idle(
         context.task_context.clone(),
         context.durable_state.clone(),
         Arc::clone(&context.resolver),
         definition,
         workspace_snapshot,
+        conversation,
     ) {
         Ok(executor) => executor,
         Err(SessionExecutorStartError::Closing) => {
+            recorder.close().await;
             return Err(SessionResidencyLoadError::Closing);
         }
         Err(
             SessionExecutorStartError::SessionIdMismatch
             | SessionExecutorStartError::WorkspaceRevisionMismatch,
         ) => {
+            recorder.close().await;
             return Err(context.internal_load());
         }
         Err(SessionExecutorStartError::InternalDispatchUnavailable) => {
+            recorder.close().await;
             return Err(context.internal_load());
         }
     };
@@ -1884,6 +1916,7 @@ async fn run_load(
     {
         InstallResult::Installed => Ok(SessionResidencyLoadOutcome::Loaded),
         InstallResult::AlreadyLoaded => {
+            recorder.close().await;
             if executor.close().await.is_err() {
                 Err(context.internal_load())
             } else {
@@ -1891,6 +1924,7 @@ async fn run_load(
             }
         }
         InstallResult::Closing => {
+            recorder.close().await;
             if executor.close().await.is_err() {
                 Err(context.internal_load())
             } else {
@@ -2047,6 +2081,56 @@ fn valid_current_shape(
         && head.current_definition_revision() == definition.revision()
 }
 
+fn map_conversation_target_load_error(
+    context: &OperationContext,
+    error: DurableConversationTargetError,
+) -> SessionResidencyLoadError {
+    match error {
+        DurableConversationTargetError::Closing => SessionResidencyLoadError::Closing,
+        DurableConversationTargetError::SessionNotFound => {
+            SessionResidencyLoadError::SessionNotFound
+        }
+        DurableConversationTargetError::Corrupt => SessionResidencyLoadError::RecordedStateCorrupt,
+        DurableConversationTargetError::TooLarge => SessionResidencyLoadError::DurableStateTooLarge,
+        DurableConversationTargetError::StorageUnavailable => {
+            SessionResidencyLoadError::StorageUnavailable
+        }
+        DurableConversationTargetError::InternalDispatchUnavailable => context.internal_load(),
+    }
+}
+
+fn map_conversation_load_error(
+    context: &OperationContext,
+    error: ConversationLoadError,
+) -> SessionResidencyLoadError {
+    match error {
+        ConversationLoadError::Replay(replay) => match replay {
+            ConversationReplayError::HistoryTooLarge => {
+                SessionResidencyLoadError::DurableStateTooLarge
+            }
+            ConversationReplayError::HeaderCorrupt
+            | ConversationReplayError::UnsupportedFormatVersion
+            | ConversationReplayError::MissingHeader => {
+                SessionResidencyLoadError::RecordedStateCorrupt
+            }
+            ConversationReplayError::InputChanged | ConversationReplayError::InputUnavailable => {
+                SessionResidencyLoadError::StorageUnavailable
+            }
+            ConversationReplayError::LeaseMismatch
+            | ConversationReplayError::CounterOverflow
+            | ConversationReplayError::InvariantViolation => context.internal_load(),
+        },
+        ConversationLoadError::TailTruncateFailed => SessionResidencyLoadError::StorageUnavailable,
+        ConversationLoadError::LiveStateInvariant => context.internal_load(),
+        ConversationLoadError::Runtime(RuntimeTaskError::OwnerClosing) => {
+            SessionResidencyLoadError::Closing
+        }
+        ConversationLoadError::Runtime(
+            RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable,
+        ) => context.internal_load(),
+    }
+}
+
 fn map_durable_lifecycle_error(
     context: &OperationContext,
     error: DurableSessionLifecycleError,
@@ -2186,6 +2270,7 @@ mod tests {
 
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2387,6 +2472,31 @@ mod tests {
         create_file(&g1.join("COMMITTED"), b"");
     }
 
+    fn conversation_header_fixture() -> Vec<u8> {
+        format!(
+            "{{\"type\":\"session_header\",\"data\":{{\"formatVersion\":1,\"sessionId\":\"{SESSION_ID}\",\"createdAt\":\"2026-08-03T10:01:00.456Z\",\"initialAgent\":{{\"agentId\":\"{AGENT_ID}\",\"revision\":\"ar_1\"}},\"initialDefinitionRevision\":\"sdr_1\"}}}}\n"
+        )
+        .into_bytes()
+    }
+
+    fn replayed_user_conversation_fixture() -> Vec<u8> {
+        let source = include_str!(
+            "../docs/fixtures/wire-v1/conversation/golden/user-sources-and-stamps.jsonl"
+        );
+        let mut lines = source.lines();
+        let header = lines
+            .next()
+            .expect("the replay fixture has a Header")
+            .replace("ses_12121212121212121212121212121212", SESSION_ID)
+            .replace("2026-07-31T14:00:00.000Z", "2026-08-03T10:01:00.456Z")
+            .replace("agt_23232323232323232323232323232323", AGENT_ID);
+        let entry = lines
+            .next()
+            .expect("the replay fixture has a User entry")
+            .replace("ses_12121212121212121212121212121212", SESSION_ID);
+        format!("{header}\n{entry}\n").into_bytes()
+    }
+
     fn create_fixture_session(root: &Path, workspace: &Path) {
         let reservation = root.join("reservations").join("sessions").join(SESSION_ID);
         create_file(&reservation, b"");
@@ -2395,7 +2505,7 @@ mod tests {
         create_file(&entity.join("PUBLISHED"), b"");
         create_file(
             &entity.join("conversation.jsonl"),
-            b"opaque conversation fixture bytes",
+            &conversation_header_fixture(),
         );
         let generation = entity.join("generations");
         create_dir(&generation);
@@ -2479,6 +2589,34 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn dropped_load_waiter_still_installs_replayed_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        assert!(poll_once_pending(load.as_mut()).await);
+        registry.wait_for_active_operation_for_test().await;
+        drop(load);
+
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        assert_eq!(
+            registry
+                .snapshot(session_id)
+                .await
+                .expect("the dropped Load still installs a coherent executor")
+                .execution_state(),
+            crate::session_execution::SessionExecutionState::Idle
+        );
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn duplicate_load_is_idempotent_and_installs_one_owner() {
         let store = TempStore::new();
         let (context, state, registry) = open_registry(&store).await;
@@ -2510,6 +2648,86 @@ mod tests {
         registry.wait_for_no_active_operation_for_test().await;
         assert_eq!(registry.loaded_count_for_test(), 0);
         assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_hydrates_replayed_conversation_and_truncates_partial_tail() {
+        let store = TempStore::new();
+        let recorded = replayed_user_conversation_fixture();
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        fs::write(&conversation_path, &recorded).expect("the replay fixture is installed");
+        let mut append = fs::OpenOptions::new()
+            .append(true)
+            .open(&conversation_path)
+            .expect("the conversation opens for a partial tail");
+        append
+            .write_all(b"{\"type\":\"entry\",\"data\":{")
+            .expect("the partial tail writes");
+        drop(append);
+
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+
+        assert_eq!(fs::read(&conversation_path).unwrap(), recorded);
+        let executor = registry
+            .executor_for_test(session_id)
+            .expect("the hydrated executor is installed");
+        let live_state = executor
+            .live_state_for_test()
+            .expect("production Load installs replayed live state");
+        {
+            let live_state = lock(&live_state);
+            let views = live_state
+                .capture_conversation_views()
+                .expect("the replayed state has a valid compaction source");
+            assert_eq!(views.conversation().messages().len(), 1);
+            assert_eq!(views.compaction_source().units().len(), 1);
+            assert_eq!(
+                views.compaction_source().units()[0].kind(),
+                crate::compaction::CompactionUnitKind::UserMessage
+            );
+            assert_eq!(views.relations().len(), 1);
+            assert_ne!(
+                views.conversation().revision(),
+                crate::live_conversation::ConversationRevision::default()
+            );
+            let replayed_entry_id = "ent_a0000000000000000000000000000001"
+                .parse()
+                .expect("the fixture EntryId is valid");
+            assert_eq!(views.selected_head(), Some(&replayed_entry_id));
+            assert!(live_state.entry_id_is_reserved_for_test(
+                "ent_a0000000000000000000000000000001".parse().unwrap()
+            ));
+        }
+
+        let diagnostics = executor
+            .replay_diagnostics_for_test()
+            .expect("production Load retains replay diagnostics");
+        assert_eq!(
+            diagnostics
+                .count(crate::conversation_storage::ConversationReplayDiagnosticCode::PartialTail),
+            1
+        );
+        let recorder = executor
+            .recorder_for_test()
+            .expect("production Load installs a Recorder");
+        assert!(matches!(
+            &*recorder.health(),
+            crate::conversation_storage::RecordingHealth::Healthy
+        ));
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
         close_fixture(context, state, registry).await;
     }
 
@@ -2763,6 +2981,29 @@ mod tests {
             assert_eq!(registry.gate_count_for_test(), 0);
         }
 
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_maps_strict_conversation_header_failure_without_installing_residency() {
+        let store = TempStore::new();
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        fs::write(&conversation_path, b"not a conversation header\n")
+            .expect("the corrupt Header fixture writes");
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Err(SessionResidencyLoadError::RecordedStateCorrupt)
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
         close_fixture(context, state, registry).await;
     }
 

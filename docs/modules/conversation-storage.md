@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、Runtime Ready+Idle residency/Load/Unload foundation、DurableState-issued published conversation target/same-open writable proof、owner-tracked Recorder physical append slice与M5.2 tolerant semantic replay/corruption sidecars完成；non-Genesis/LiveSnapshot Fork semantic streaming、replay/Recorder-backed full Load、M5.1完整fixture/native exit gate与active-Turn grace Unload pending）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、Runtime Ready+Idle residency/Load/Unload foundation、DurableState-issued published conversation target/same-open writable proof、owner-tracked Recorder physical append、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration完成；non-Genesis/LiveSnapshot Fork semantic streaming、M5.1完整fixture/native exit gate与active-Turn grace Unload pending）
 日期：2026-07-31
 
 ## 目的
@@ -876,6 +876,8 @@ receive DurableState PublishedConversationTarget and optional root-lease-derived
 → current_turn = None
 → SessionExecutor Idle or WorkspaceUnavailable
 ```
+
+当前crate-private Ready+Idle Load已按该顺序消费同一`PublishedConversationTarget`：一个`RuntimeTaskContext::spawn_blocking_tracked` job在仍持有target/proof时完成replay、可授权tail truncate、cold `LiveSessionState` seed与Recorder initialization；随后residency才发布`SessionExecutor`。seed直接保留selected path、reserved EntryId、stable units、relations和replay revision，绝不调用strict live reducer；recorded Interaction保留为history，但不恢复process-local waiter或private approval mapping。Executor close会先关闭并drain这一个Recorder。public Snapshot/Event diagnostics、Turn admission和完整execution readiness仍是后续slice。
 
 recording unavailable不阻止admission。新loaded instance始终尝试初始化Recorder，并根据open结果初始化为Healthy或Degraded；它不继承旧loaded instance的health object。Unload/Load永久丢弃旧unrecorded live tail和旧TurnStatus。Load不推断旧Turn outcome、不创建restart interruption，也不执行recovery append。
 

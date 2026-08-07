@@ -1,6 +1,6 @@
 # Conversation JSONL Format V1
 
-状态：当前权威format specification（ADR 0134；M3.1 exact line codec、M3.2 scanner、M5.1 target/proof及Recorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars已完成；replay/Recorder-backed full Load与M5.1完整fixture/native exit gate仍pending）
+状态：当前权威format specification（ADR 0134；M3.1 exact line codec、M3.2 scanner、M5.1 target/proof及Recorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已完成；M5.1完整fixture/native exit gate仍pending）
 日期：2026-07-31
 
 ## Scope

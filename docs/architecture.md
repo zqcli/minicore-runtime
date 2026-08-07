@@ -7,7 +7,7 @@
 | 版本 | 状态 |
 | --- | --- |
 | V1 | 已归档，只保存在[`docs/archive/v1/`](archive/v1/README.md)和Git history中。 |
-| V2 | 当前权威架构。ADR 0126–0137冻结async execution、conversation/wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M5.0 durable foundation与exact historical definition resolution已实现；M5.1 target/proof与owner-tracked SessionRecorder physical append slice已实现；M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication owner及Runtime-owned residency actor（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已实现；public Runtime command/snapshot/event、replay/Recorder-backed full Load、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload及完整cross-platform native matrix仍待实现；M5.2 tolerant semantic replay seam与corruption sidecars已实现，M5.1完整fixture/native exit gate仍待关闭；后续见[开发计划](development-plan.md)。 |
+| V2 | 当前权威架构。ADR 0126–0137冻结async execution、conversation/wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M5.0 durable foundation与exact historical definition resolution已实现；M5.1 target/proof与owner-tracked SessionRecorder physical append slice已实现；M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication owner、Runtime-owned residency actor（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）及replay/Recorder-backed Ready+Idle Load hydration已实现；public Runtime command/snapshot/event、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload及完整cross-platform native matrix仍待实现；M5.2 tolerant semantic replay seam与corruption sidecars已实现，M5.1完整fixture/native exit gate仍待关闭；后续见[开发计划](development-plan.md)。 |
 
 权威顺序：本文与`docs/modules/` → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
