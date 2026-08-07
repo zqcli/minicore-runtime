@@ -14,6 +14,7 @@ pub mod runtime;
 pub mod runtime_interface;
 pub(crate) mod runtime_task;
 pub(crate) mod session_execution;
+pub(crate) mod session_residency;
 pub use runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
 pub mod skills;
 pub mod tools;

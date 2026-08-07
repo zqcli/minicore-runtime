@@ -530,6 +530,36 @@ struct DurableSessionCatalogEntry {
     definition_index: Arc<SessionDefinitionIndex>,
 }
 
+/// One coherent immutable current Session catalog projection.
+///
+/// Runtime Load consumes the head and definition together so a process-local publication cannot
+/// make it assemble a mixed revision from two separate catalog lookups.
+#[derive(Clone)]
+pub(crate) struct DurableSessionCurrent {
+    head: Arc<DurableSessionHead>,
+    definition: Arc<SessionDefinition>,
+}
+
+impl DurableSessionCurrent {
+    pub(crate) fn head(&self) -> &Arc<DurableSessionHead> {
+        &self.head
+    }
+
+    pub(crate) fn definition(&self) -> &Arc<SessionDefinition> {
+        &self.definition
+    }
+}
+
+impl fmt::Debug for DurableSessionCurrent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableSessionCurrent")
+            .field("head", &"redacted")
+            .field("definition", &"redacted")
+            .finish()
+    }
+}
+
 impl fmt::Debug for DurableSessionCatalogEntry {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -9806,12 +9836,8 @@ impl DurableState {
         reason = "recovery catalog is consumed by later runtime read paths"
     )]
     pub(crate) fn session_head(&self, session_id: SessionId) -> Option<Arc<DurableSessionHead>> {
-        if let Some(entry) = lock(&self.published_sessions).get(&session_id) {
-            return Some(Arc::clone(&entry.current_head));
-        }
-        self.sessions
-            .get(&session_id)
-            .map(|entry| Arc::clone(&entry.current_head))
+        self.session_current(session_id)
+            .map(|current| Arc::clone(current.head()))
     }
 
     #[allow(
@@ -9822,12 +9848,20 @@ impl DurableState {
         &self,
         session_id: SessionId,
     ) -> Option<Arc<SessionDefinition>> {
-        if let Some(entry) = lock(&self.published_sessions).get(&session_id) {
-            return Some(Arc::clone(&entry.current_definition));
-        }
-        self.sessions
+        self.session_current(session_id)
+            .map(|current| Arc::clone(current.definition()))
+    }
+
+    /// Returns the current Session head and definition from one immutable catalog entry.
+    pub(crate) fn session_current(&self, session_id: SessionId) -> Option<DurableSessionCurrent> {
+        let entry = lock(&self.published_sessions)
             .get(&session_id)
-            .map(|entry| Arc::clone(&entry.current_definition))
+            .cloned()
+            .or_else(|| self.sessions.get(&session_id).cloned())?;
+        Some(DurableSessionCurrent {
+            head: Arc::clone(&entry.current_head),
+            definition: Arc::clone(&entry.current_definition),
+        })
     }
 
     /// Reads one exact Agent definition revision. The current revision is already installed in
