@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation in progress，crate-private Agent Create、ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer与exact historical Agent/Session definition resolution已完成，remaining Fork anchors/LiveSnapshot、loaded Workspace Idle/Snapshot publication、Session lifecycle Runtime residency integration、public Runtime command与完整platform matrix pending；M5.1 Recorder与M5.2 semantic replay pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 foundation in progress，crate-private Agent Create、ordinary Session Create exact G1 publication、unloaded RecordedHistory + Genesis Session Fork tracer、Agent status/definition/metadata、Session metadata CAS、Session definition/Agent revision upgrade CAS、Session lifecycle existing-head action tracer与exact historical Agent/Session definition resolution已完成，remaining Fork anchors/LiveSnapshot、loaded Workspace Idle/Snapshot publication、Session lifecycle Runtime residency integration、public Runtime command与完整platform matrix pending；M6.1 Workspace resolver/immutable Snapshot foundation已完成，PromptSet、actual Workspace source discovery、captured empty SkillView/ToolSet与SessionExecutor integration pending；M5.1 Recorder与M5.2 semantic replay pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -414,6 +414,8 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 ## M6 · Minimal Turn资源与Scripted ModelGateway
 
 ### M6.1 Workspace、Prompt与captured empty views
+
+当前进度：Workspace definition resolve与immutable Snapshot foundation Completed，包括owner-tracked local canonicalization、canonical duplicate/overlap/cwd validation、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与cross-candidate fail-closed finish。Prompt source adapter/materialization、PromptService/PromptSet、captured empty SkillView/ToolSet及loaded Session publication Pending。
 
 先实现ordinary Text turn所需最小但真实路径：
 
