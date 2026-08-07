@@ -1,6 +1,6 @@
 # Conversation JSONL Format V1
 
-状态：当前权威format specification（ADR 0134；M3.1 exact line codec与M3.2 scanner已完成，M5 Recorder/replay implementation pending）
+状态：当前权威format specification（ADR 0134；M3.1 exact line codec、M3.2 scanner与M5.1 target/proof及Recorder physical append slice已完成，M5.2 semantic replay pending）
 日期：2026-07-31
 
 ## Scope
@@ -66,7 +66,7 @@ Exact wire：
 - Header.sessionId必须匹配caller打开的catalog/path SessionId；
 - Header没有EntryId/parent/TurnId；
 - Header只证明file identity与creation provenance，不是current definition/authorization；
-- M3.2 scanner only returns a final partial-tail truncation action after a valid v1 Header and opaque `ExclusiveWritableConversationLease`; DurableState now issues `PublishedConversationTarget` after exact Header and same-open-file validation, and Conversation Storage derives the paired writable proof from that target, while the current `#[cfg(test)]` constructor remains scanner-test-only；
+- M3.2 scanner only returns a final partial-tail truncation action after a valid v1 Header and opaque `ExclusiveWritableConversationLease`; DurableState now issues `PublishedConversationTarget` plus the paired proof after exact Header and same-open-file validation, and Recorder consumes the opaque pair, while the current `#[cfg(test)]` constructor remains scanner-test-only；
 - v1 writer不向higher version file append。
 
 ## Entry Envelope

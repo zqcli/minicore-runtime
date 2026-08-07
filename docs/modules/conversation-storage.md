@@ -1,6 +1,6 @@
 # Conversation Recording 与 Replay 架构设计
 
-状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、Runtime Ready+Idle residency/Load/Unload foundation、DurableState-issued published conversation target与same-open writable proof完成；Recorder、non-Genesis/LiveSnapshot Fork semantic streaming、replay/Recorder-backed full Load、active-Turn grace Unload与semantic replay pending）
+状态：当前权威架构（ADR 0134，受ADR 0136/0137 durable/async refinements约束；M3.1/M3.2、M5 durable foundation、Runtime Ready+Idle residency/Load/Unload foundation、DurableState-issued published conversation target/same-open writable proof与owner-tracked Recorder physical append slice完成；semantic replay、non-Genesis/LiveSnapshot Fork semantic streaming、replay/Recorder-backed full Load、active-Turn grace Unload pending）
 日期：2026-07-31
 
 ## 目的
@@ -361,15 +361,28 @@ impl CapturedConversationViews {
 
 ```rust
 pub(crate) struct SessionRecorder {
-    session_id: SessionId,
-    state: std::sync::Mutex<SessionRecorderState>,
-    health: ArcSwap<RecordingHealth>,
+    core: Arc<SessionRecorderCore>,
 }
 
-pub(crate) enum SessionRecorderState {
-    Ready { file: std::fs::File },
-    InFlight { settlement: Arc<RecorderSettlement> },
+struct SessionRecorderCore {
+    session_id: SessionId,
+    state: std::sync::Mutex<RecorderState>,
+    health: std::sync::Mutex<Arc<RecordingHealth>>,
+    last_attempt: std::sync::Mutex<Option<Arc<RecorderAttempt>>>,
+    closing: AtomicBool,
+}
+
+enum RecorderState {
+    Ready { file: std::fs::File, file_bytes: u64 },
+    InFlight(Arc<RecorderAttempt>),
     Degraded,
+    Closed,
+}
+
+struct RecorderAttempt {
+    file: std::sync::Mutex<Option<std::fs::File>>,
+    job: std::sync::Mutex<Option<TrackedBlockingJob<()>>>,
+    outcome: std::sync::Mutex<Option<Result<(), SessionRecordingError>>>,
 }
 
 impl SessionRecorder {
@@ -379,6 +392,8 @@ impl SessionRecorder {
     ) -> RecordOutcome;
 
     pub fn health(&self) -> Arc<RecordingHealth>;
+
+    pub async fn close(&self);
 }
 ```
 
@@ -405,7 +420,7 @@ pub enum RecordingHealth {
 
 MVP的recordable domain mutation保持单producer ownership：Starting/Idle mutation由SessionExecutor拥有，Running Turn mutation由ActiveTurnTask拥有，Interaction routing只在对应task等待期间完成request/resolution mutation。不得让两个独立caller并发apply可记录的live mutation，再依赖Recorder mutex acquisition决定history顺序。未来出现真实multi-producer需求时必须引入显式domain sequencing，不能静默依赖scheduler顺序。
 
-Recorder的短`std::sync::Mutex`只保护handle-transfer state，绝不保护异步append。state machine固定为：同步lock后从`Ready`移出`std::fs::File`；调用`RuntimeTaskContext::spawn_blocking_tracked`先原子预留owner-registry slot，再spawn write job；RuntimeTaskContext registry拥有实际job slot/raw `JoinHandle`，Recorder只安装其shared `RecorderSettlement`为`InFlight`，然后释放guard并在guard外await。spawn不能启动时settlement exactly-once完成，file被确定性restore或关闭并Degraded，不允许留下永远pending的`InFlight`。settlement在`Written`时同步取lock并返回/restore file到`Ready`；在write/join/panic/unknown outcome时安装terminal `Degraded`、关闭该handle并发布health。panic/unload finalizer遇到`InFlight`时clone并await同一个shared settlement；它不创建第二个job。任何raw guard都不得跨await，且没有persistent worker/background queue。`health`通过独立immutable publication读取，Snapshot不等待当前file write。Recorder按单Session顺序处理当前entry。以下任一情况首次发生后进入Degraded并停止后续append：
+Recorder的短`std::sync::Mutex`只保护handle-transfer state，绝不保护异步append。当前最小实现把一次物理append收口为一个crate-private `RecorderAttempt`：它保留同一 `TrackedBlockingJob` 与共享结果；caller drop后由下一次 `record` 或 `close` reap exact attempt，不创建额外finalizer actor、persistent worker或recording queue。state machine固定为：同步lock后从`Ready`移出`std::fs::File`；调用`RuntimeTaskContext::spawn_blocking_tracked`先原子预留owner-registry slot，再spawn write job；RuntimeTaskContext registry拥有实际job slot/raw `JoinHandle`，Recorder把exact job安装到`InFlight` attempt，然后释放guard并在guard外await。spawn不能启动时job settlement与attempt health确定性完成，file被关闭并Degraded，不允许留下永远pending的`InFlight`。job在`Written`时同步取lock并返回/restore file到`Ready`；在write/join/panic/unknown outcome时安装terminal `Degraded`、关闭该handle并发布health。任何raw guard都不得跨await。`health`通过独立immutable publication读取，Snapshot不等待当前file write。Recorder按单Session顺序处理当前entry。以下任一情况首次发生后进入Degraded并停止后续append：
 
 - encode失败；
 - root lease intact时的ordinary conversation capability/open failure；
@@ -473,7 +488,7 @@ impl ConversationStorage {
 }
 ```
 
-`ForkConversationSeed` is closed over `LiveForkConversationSeed | RecordedForkConversationSeed`; both feed the **one semantic streaming re-encode operation**. DurableState/source-residency ownership is the sole issuer of the physical `RecordedForkConversationLease`: it binds the exact source Session/file observation and blocks Load, append and tail truncate. Conversation Storage consumes that lease to replay/resolve the anchor and create a semantic recorded seed that retains the physical lease until streaming/readback completes. `PublishedConversationTarget` and `ExclusiveWritableConversationLease` have no public or caller-visible constructor. DurableState now issues the target after exact Session/Header and same-open physical validation; consuming the target inside Conversation Storage produces the paired same-open writable proof. The existing `#[cfg(test)]` constructor remains scanner-test-only. They expose neither a path nor a raw file handle to lifecycle callers. A live immutable seed needs no long file lease after capture. `ForkConversationSink` is DurableState actor-owned/tracked markerless final-path work, not a caller staging path. `PreparedConversationProof` is opaque and binds child SessionId, same file identity/length, strict Header and fully reread selected semantic path; it is checked again at PUBLISHED without allocating or rereading 1 GiB a second time.
+`ForkConversationSeed` is closed over `LiveForkConversationSeed | RecordedForkConversationSeed`; both feed the **one semantic streaming re-encode operation**. DurableState/source-residency ownership is the sole issuer of the physical `RecordedForkConversationLease`: it binds the exact source Session/file observation and blocks Load, append and tail truncate. Conversation Storage consumes that lease to replay/resolve the anchor and create a semantic recorded seed that retains the physical lease until streaming/readback completes. `PublishedConversationTarget` and `ExclusiveWritableConversationLease` have no public or caller-visible constructor. DurableState now issues the target and paired proof after exact Session/Header and same-open physical validation; the Recorder/Conversation Storage seam consumes both without exposing a path or lifecycle-visible raw handle. The existing `#[cfg(test)]` constructor remains scanner-test-only. They expose neither a path nor a raw file handle to lifecycle callers. A live immutable seed needs no long file lease after capture. `ForkConversationSink` is DurableState actor-owned/tracked markerless final-path work, not a caller staging path. `PreparedConversationProof` is opaque and binds child SessionId, same file identity/length, strict Header and fully reread selected semantic path; it is checked again at PUBLISHED without allocating or rereading 1 GiB a second time.
 
 Header strict failure maps to `HeaderCorrupt`/unsupported version and the 1 GiB/1,000,000-entry cap maps to `HistoryTooLarge`. Runtime projects those as `DurableStateCorrupt`/`DurableStateTooLarge`. Every blocking `open`/scan/replay/recorded-lease read/streamed re-encode/readback runs in an owner-tracked `RuntimeTaskContext` job; none runs directly on a current-thread Tokio worker, and caller drop cannot outlive shutdown ownership. Ordinary Recorder initialization/open/write failure is only the loaded Session's `RecordingHealth::Degraded`; it neither loses the root lease nor poisons DurableState.
 
