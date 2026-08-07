@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, DirEntry, File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -35,15 +35,18 @@ use crate::agent_session_lifecycle::{
     session_metadata_has_same_canonical_content,
 };
 use crate::conversation_storage::{
-    RecordedForkConversationLease, RecordedForkSourceError, SessionHeader,
-    UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
+    PublishedConversationTarget, RecordedForkConversationLease, RecordedForkSourceError,
+    SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
     validate_unpublished_conversation_for_recovery,
 };
 #[cfg(test)]
 use crate::runtime_task::TrackedTask;
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
 use crate::wire::conversation_jsonl::{ConversationCodecError, ConversationLineCodec};
-use crate::wire::conversation_jsonl_scanner::MAX_CONVERSATION_FILE_BYTES;
+use crate::wire::conversation_jsonl_scanner::{
+    ConversationJsonlScanner, ConversationScanAccess, ConversationScanError,
+    MAX_CONVERSATION_FILE_BYTES,
+};
 use crate::wire::durable_store::{
     DurableStoreCodecError, DurableStoreV1Codec, MAX_DURABLE_DOCUMENT_BYTES,
 };
@@ -1183,6 +1186,27 @@ pub(crate) enum DurableSessionDefinitionReadError {
     SessionNotFound,
     #[error("Session definition revision is unavailable")]
     RevisionUnavailable,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("durable state dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// The closed, redacted failure taxonomy for one published conversation target open.
+#[allow(
+    dead_code,
+    reason = "the pending SessionRecorder consumes this physical target seam"
+)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum DurableConversationTargetError {
+    #[error("durable state is closing")]
+    Closing,
+    #[error("Session was not found")]
+    SessionNotFound,
+    #[error("published conversation is corrupt")]
+    Corrupt,
+    #[error("published conversation exceeds its selected storage limit")]
+    TooLarge,
     #[error("durable storage is unavailable")]
     StorageUnavailable,
     #[error("durable state dispatch is unavailable")]
@@ -9864,6 +9888,62 @@ impl DurableState {
         })
     }
 
+    /// Opens one published conversation as an opaque append-capable target. The target's
+    /// same-open `into_parts` consumer issues the paired writable proof. The root lease is
+    /// retained by the owner-tracked blocking operation until the target handle and its final
+    /// physical observations have settled.
+    #[allow(
+        dead_code,
+        reason = "the pending SessionRecorder consumes this physical target seam"
+    )]
+    pub(crate) async fn open_conversation_target(
+        &self,
+        session_id: SessionId,
+    ) -> Result<PublishedConversationTarget, DurableConversationTargetError> {
+        if self.actor.closing.is_cancelled() {
+            return Err(DurableConversationTargetError::Closing);
+        }
+        let current = self
+            .session_current(session_id)
+            .ok_or(DurableConversationTargetError::SessionNotFound)?;
+        let initial_revision =
+            SessionDefinitionRevision::new(std::num::NonZeroU64::new(1).expect("one is nonzero"));
+        let initial_definition = self
+            .read_session_definition(session_id, Some(initial_revision))
+            .await
+            .map_err(map_conversation_target_definition_error)?;
+        let expected_header = SessionHeader::reconstruct(
+            1,
+            session_id,
+            current.head.created_at(),
+            initial_definition.agent(),
+            initial_definition.revision(),
+        );
+        let root = self.root.clone();
+        let lease = Arc::clone(&self.lease);
+        let job = self.task_context.spawn_blocking_tracked(move || {
+            let _lease = lease;
+            open_published_conversation_target_blocking(&root, session_id, &expected_header)
+                .map(|target| Arc::new(Mutex::new(Some(target))))
+        });
+        match job.wait().await {
+            Ok(Ok(target)) => target
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .ok_or(DurableConversationTargetError::InternalDispatchUnavailable),
+            Ok(Err(error)) => Err(error),
+            Err(RuntimeTaskError::OwnerClosing) => Err(DurableConversationTargetError::Closing),
+            Err(RuntimeTaskError::WorkerUnavailable) => {
+                Err(DurableConversationTargetError::InternalDispatchUnavailable)
+            }
+            Err(RuntimeTaskError::OperationPanicked) => {
+                self.request_definition_integrity_closing();
+                Err(DurableConversationTargetError::InternalDispatchUnavailable)
+            }
+        }
+    }
+
     /// Reads one exact Agent definition revision. The current revision is already installed in
     /// the immutable catalog; only an indexed historical revision admits bounded blocking I/O.
     #[allow(
@@ -10125,6 +10205,176 @@ impl DurableState {
         // fail first even when the actor-closing select branch already won.
         self.task_context.request_closing();
         self.actor.request_closing();
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending SessionRecorder consumes this physical target seam"
+)]
+fn open_published_conversation_target_blocking(
+    root: &Path,
+    session_id: SessionId,
+    expected_header: &SessionHeader,
+) -> Result<PublishedConversationTarget, DurableConversationTargetError> {
+    let path = root
+        .join(SESSIONS_DIRECTORY)
+        .join(session_id.to_string())
+        .join("conversation.jsonl");
+    let initial_path_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DurableConversationTargetError::Corrupt);
+        }
+        Err(_) => return Err(DurableConversationTargetError::StorageUnavailable),
+    };
+    if initial_path_metadata.len() > MAX_CONVERSATION_FILE_BYTES {
+        return Err(DurableConversationTargetError::TooLarge);
+    }
+    validate_existing_regular_file(
+        &initial_path_metadata,
+        DurableOpenError::DurableStateCorrupt,
+    )
+    .map_err(map_conversation_target_open_error)?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).append(true);
+    let mut file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(DurableConversationTargetError::Corrupt);
+        }
+        Err(_) => return Err(DurableConversationTargetError::StorageUnavailable),
+    };
+    let handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let opened_path_metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            DurableConversationTargetError::Corrupt
+        } else {
+            DurableConversationTargetError::StorageUnavailable
+        }
+    })?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &handle_metadata,
+        &opened_path_metadata,
+    )
+    .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+
+    let final_handle_metadata = file
+        .metadata()
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let final_path_metadata = fs::symlink_metadata(&path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            DurableConversationTargetError::Corrupt
+        } else {
+            DurableConversationTargetError::StorageUnavailable
+        }
+    })?;
+    validate_open_file_observation(
+        &initial_path_metadata,
+        &final_handle_metadata,
+        &final_path_metadata,
+    )
+    .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+
+    let scan_file = file
+        .try_clone()
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    let scanner = ConversationJsonlScanner::open(
+        scan_file,
+        initial_path_metadata.len(),
+        session_id,
+        ConversationScanAccess::ReadOnly,
+    )
+    .map_err(map_conversation_target_scan_error)?;
+    if !scanner.header_is_canonical()
+        || scanner
+            .header()
+            .map_err(map_conversation_target_scan_error)?
+            != expected_header
+    {
+        return Err(DurableConversationTargetError::Corrupt);
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+
+    let writable_file = file
+        .try_clone()
+        .map_err(|_| DurableConversationTargetError::StorageUnavailable)?;
+    Ok(PublishedConversationTarget::from_durable_state(
+        session_id,
+        initial_path_metadata.len(),
+        file,
+        writable_file,
+    ))
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending SessionRecorder consumes this physical target seam"
+)]
+fn map_conversation_target_open_error(error: DurableOpenError) -> DurableConversationTargetError {
+    match error {
+        DurableOpenError::DurableStateCorrupt => DurableConversationTargetError::Corrupt,
+        DurableOpenError::DurableStateTooLarge => DurableConversationTargetError::TooLarge,
+        DurableOpenError::StorageUnavailable
+        | DurableOpenError::StoreInUse
+        | DurableOpenError::UnsupportedStoreFormat => {
+            DurableConversationTargetError::StorageUnavailable
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending SessionRecorder consumes this physical target seam"
+)]
+const fn map_conversation_target_definition_error(
+    error: DurableSessionDefinitionReadError,
+) -> DurableConversationTargetError {
+    match error {
+        DurableSessionDefinitionReadError::Closing => DurableConversationTargetError::Closing,
+        DurableSessionDefinitionReadError::SessionNotFound => {
+            DurableConversationTargetError::SessionNotFound
+        }
+        DurableSessionDefinitionReadError::RevisionUnavailable => {
+            DurableConversationTargetError::InternalDispatchUnavailable
+        }
+        DurableSessionDefinitionReadError::StorageUnavailable => {
+            DurableConversationTargetError::StorageUnavailable
+        }
+        DurableSessionDefinitionReadError::InternalDispatchUnavailable => {
+            DurableConversationTargetError::InternalDispatchUnavailable
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the pending SessionRecorder consumes this physical target seam"
+)]
+fn map_conversation_target_scan_error(
+    error: ConversationScanError,
+) -> DurableConversationTargetError {
+    match error {
+        ConversationScanError::FileTooLarge
+        | ConversationScanError::HistoryTooLarge
+        | ConversationScanError::HeaderCorrupt {
+            code: ConversationCodecError::HeaderTooLarge,
+        } => DurableConversationTargetError::TooLarge,
+        ConversationScanError::HeaderCorrupt { .. }
+        | ConversationScanError::UnsupportedFormatVersion
+        | ConversationScanError::MissingHeader => DurableConversationTargetError::Corrupt,
+        ConversationScanError::LeaseMismatch
+        | ConversationScanError::InputChanged
+        | ConversationScanError::InputUnavailable
+        | ConversationScanError::CounterOverflow
+        | ConversationScanError::InvariantViolation => {
+            DurableConversationTargetError::StorageUnavailable
+        }
     }
 }
 
@@ -13649,9 +13899,9 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::{
-        AGENTS_DIRECTORY, DurableAgentDefinitionReadError, DurableOpenError,
-        DurableSessionDefinitionError, DurableSessionDefinitionReadError, DurableSessionHead,
-        DurableState, FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE,
+        AGENTS_DIRECTORY, DurableAgentDefinitionReadError, DurableConversationTargetError,
+        DurableOpenError, DurableSessionDefinitionError, DurableSessionDefinitionReadError,
+        DurableSessionHead, DurableState, FORMAT_MARKER, GENERATION_PAYLOAD_ENTRY_CAP, LOCK_FILE,
         RESERVATIONS_DIRECTORY, RESERVATIONS_ENTRY_CAP, ROOT_ENTRY_CAP, RecoveryCaps,
         SESSIONS_DIRECTORY, StorageGeneration, parse_agent_id_name, read_durable_document,
         read_entries_bounded, recover_marked_root_with_caps,
@@ -25740,6 +25990,69 @@ mod tests {
         }
         state.close().await;
         assert_eq!(fs::read(conversation_path).unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_conversation_target_issues_same_open_writable_proof() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        let conversation = ordinary_header_only_conversation(SESSION_ONE);
+        create_valid_g1_session(root.path(), &conversation);
+
+        let state = open(root.path()).await.expect("the store opens");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        let target = state
+            .open_conversation_target(session_id)
+            .await
+            .expect("the published conversation target opens");
+        assert_eq!(target.session_id(), session_id);
+        assert_eq!(target.declared_file_bytes(), conversation.len() as u64);
+
+        let (target_file, writable_lease) = target.into_parts();
+        assert_eq!(writable_lease.session_id(), session_id);
+        assert_eq!(
+            writable_lease.declared_file_bytes(),
+            conversation.len() as u64
+        );
+        let writable_file = writable_lease
+            .into_file()
+            .expect("a production lease retains its same-open file");
+        let target_metadata = target_file.metadata().unwrap();
+        let writable_metadata = writable_file.metadata().unwrap();
+        assert_eq!(target_metadata.len(), conversation.len() as u64);
+        assert_eq!(writable_metadata.len(), conversation.len() as u64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            assert_eq!(target_metadata.dev(), writable_metadata.dev());
+            assert_eq!(target_metadata.ino(), writable_metadata.ino());
+        }
+
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn published_conversation_target_rejects_noncanonical_or_missing_physical_file() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), b"not a conversation header\n");
+
+        let state = open(root.path()).await.expect("the store opens");
+        let session_id = SessionId::from_str(SESSION_ONE).unwrap();
+        assert!(matches!(
+            state.open_conversation_target(session_id).await,
+            Err(DurableConversationTargetError::Corrupt)
+        ));
+
+        fs::remove_file(session_path(root.path(), SESSION_ONE).join("conversation.jsonl")).unwrap();
+        assert!(matches!(
+            state.open_conversation_target(session_id).await,
+            Err(DurableConversationTargetError::Corrupt)
+        ));
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
