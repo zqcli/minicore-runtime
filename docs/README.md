@@ -26,7 +26,7 @@ architecture.md + modules/
 
 ## 当前状态
 
-M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M5.0 production durable foundation与exact historical definition resolution已实现；没有standalone production reservation API/token/receipt。M6.1 Workspace resolver/Snapshot、loaded Ready+Idle Workspace publication owner及Runtime-owned residency actor/single-flight Load/draining Unload/lifecycle exclusion foundation已实现；PromptSet、actual source discovery、captured empty SkillView/ToolSet、public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、replay/Recorder-backed full Load、active-Turn grace Unload及完整cross-platform native matrix仍pending。完整`SessionExecutor` Turn control/`ActiveTurnTask`、M10 compaction与provider/Tool adapter行为尚未实现。
+M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M5.0 production durable foundation与exact historical definition resolution已实现；M5.1 target/proof与owner-tracked SessionRecorder physical append slice已实现；没有standalone production reservation API/token/receipt。M6.1 Workspace resolver/Snapshot、loaded Ready+Idle Workspace publication owner及Runtime-owned residency actor/single-flight Load/draining Unload/lifecycle exclusion foundation已实现；PromptSet、actual source discovery、captured empty SkillView/ToolSet、public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、semantic replay/Recorder-backed full Load、active-Turn grace Unload及完整cross-platform native matrix仍pending。完整`SessionExecutor` Turn control/`ActiveTurnTask`、M10 compaction与provider/Tool adapter行为尚未实现。
 
 开发计划M0与M1已经完成，M2进行中；后续主要门禁：
 

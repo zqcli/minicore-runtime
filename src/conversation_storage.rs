@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{File, Metadata};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::AgentRevisionRef;
 use crate::compaction::StoredCompaction;
@@ -14,6 +16,7 @@ use crate::model_gateway::{
     ProviderResponseMetadata, ReasoningContent,
 };
 use crate::prompt::CanonicalUserMessage;
+use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedBlockingJob};
 use crate::tools::{
     ToolAbandonReason, ToolApprovalRequestView, ToolApprovalResolution, ToolCallId, ToolName,
     ToolOutcomeSource, ToolResultContent, ToolResultDisposition, UserQuestionAnswer,
@@ -22,10 +25,13 @@ use crate::tools::{
 use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, UserMessageSource,
 };
-use crate::wire::conversation_jsonl::ConversationCodecError;
+use crate::wire::conversation_jsonl::{
+    ConversationCodecError, ConversationLineCodec, MAX_CONVERSATION_ENTRY_BYTES,
+};
 use crate::wire::conversation_jsonl_scanner::{
     ConversationJsonlScanner, ConversationLineCanonicality, ConversationLineFault,
     ConversationScanAccess, ConversationScanError, ConversationScanEvent,
+    MAX_CONVERSATION_FILE_BYTES,
 };
 use crate::wire::{
     BoundedJsonObject, EntryId, InteractionResolutionKey, ItemId, RequestId,
@@ -538,6 +544,891 @@ impl fmt::Debug for StoredSessionEntry {
             .field("body", &self.body)
             .finish()
     }
+}
+
+/// The redacted, crate-private failure taxonomy for one best-effort recording attempt.
+#[allow(
+    dead_code,
+    reason = "the loaded SessionExecutor consumes the pending Recorder seam"
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum SessionRecordingError {
+    TargetInvariant,
+    MetadataUnavailable,
+    EntrySessionMismatch,
+    Encode(ConversationCodecError),
+    EntryTooLarge,
+    FileTooLarge,
+    WriteFailed,
+    Runtime(RuntimeTaskError),
+}
+
+impl fmt::Debug for SessionRecordingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::TargetInvariant => "TargetInvariant",
+            Self::MetadataUnavailable => "MetadataUnavailable",
+            Self::EntrySessionMismatch => "EntrySessionMismatch",
+            Self::Encode(_) => "Encode",
+            Self::EntryTooLarge => "EntryTooLarge",
+            Self::FileTooLarge => "FileTooLarge",
+            Self::WriteFailed => "WriteFailed",
+            Self::Runtime(_) => "Runtime",
+        };
+        formatter.write_str("SessionRecordingError::")?;
+        formatter.write_str(name)
+    }
+}
+
+impl fmt::Display for SessionRecordingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::TargetInvariant => "conversation recording target invariant failed",
+            Self::MetadataUnavailable => "conversation recording target metadata unavailable",
+            Self::EntrySessionMismatch => "conversation entry session identity mismatch",
+            Self::Encode(_) => "conversation entry encoding failed",
+            Self::EntryTooLarge => "conversation entry exceeds the recording limit",
+            Self::FileTooLarge => "conversation file exceeds the recording limit",
+            Self::WriteFailed => "conversation append failed",
+            Self::Runtime(_) => "conversation recording task failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for SessionRecordingError {}
+
+/// The result of one ordered, best-effort append attempt.
+#[allow(
+    dead_code,
+    reason = "the loaded SessionExecutor consumes the pending Recorder seam"
+)]
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) enum RecordOutcome {
+    Written,
+    NotRecorded { health: RecordingHealth },
+}
+
+impl fmt::Debug for RecordOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Written => formatter.write_str("RecordOutcome::Written"),
+            Self::NotRecorded { health } => formatter
+                .debug_struct("RecordOutcome::NotRecorded")
+                .field("health", health)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Display for RecordOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Written => formatter.write_str("written"),
+            Self::NotRecorded { .. } => formatter.write_str("not recorded"),
+        }
+    }
+}
+
+/// Redacted internal health for one loaded Session's conversation recorder.
+#[allow(
+    dead_code,
+    reason = "the loaded SessionExecutor consumes the pending Recorder seam"
+)]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RecordingHealth {
+    Healthy,
+    Degraded {
+        failed_entry_id: Option<EntryId>,
+        reason: SessionRecordingError,
+    },
+}
+
+impl fmt::Debug for RecordingHealth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => formatter.write_str("RecordingHealth::Healthy"),
+            Self::Degraded { reason, .. } => formatter
+                .debug_struct("RecordingHealth::Degraded")
+                .field("failed_entry_id", &"redacted")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+impl fmt::Display for RecordingHealth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Healthy => formatter.write_str("healthy"),
+            Self::Degraded { .. } => formatter.write_str("recording degraded"),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the named write seam is consumed by focused Recorder tests"
+)]
+#[derive(Clone, Copy)]
+enum RecorderWriteFault {
+    Fail,
+    Panic,
+}
+
+/// Test-only coordination immediately before the first physical append write.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "deterministic Recorder tests consume this named write seam"
+)]
+pub(crate) struct RecorderWriteBarrier {
+    entered: AtomicBool,
+    entered_notify: Notify,
+    release: Mutex<bool>,
+    release_changed: std::sync::Condvar,
+    fault: Mutex<Option<RecorderWriteFault>>,
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "the named write seam is consumed by focused Recorder tests"
+)]
+impl RecorderWriteBarrier {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            entered_notify: Notify::new(),
+            release: Mutex::new(false),
+            release_changed: std::sync::Condvar::new(),
+            fault: Mutex::new(None),
+        })
+    }
+
+    fn disabled() -> Arc<Self> {
+        let barrier = Self::new();
+        barrier.release();
+        barrier
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.entered_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let mut released = lock_recorder(&self.release);
+        *released = true;
+        drop(released);
+        self.release_changed.notify_all();
+    }
+
+    pub(crate) fn fail_before_write(&self) {
+        *lock_recorder(&self.fault) = Some(RecorderWriteFault::Fail);
+        self.release();
+    }
+
+    pub(crate) fn panic_before_write(&self) {
+        *lock_recorder(&self.fault) = Some(RecorderWriteFault::Panic);
+        self.release();
+    }
+
+    fn before_first_write(&self) -> Result<(), SessionRecordingError> {
+        self.entered.store(true, Ordering::Release);
+        self.entered_notify.notify_waiters();
+
+        let mut released = lock_recorder(&self.release);
+        while !*released {
+            released = self
+                .release_changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        drop(released);
+
+        match lock_recorder(&self.fault).take() {
+            Some(RecorderWriteFault::Fail) => Err(SessionRecordingError::WriteFailed),
+            Some(RecorderWriteFault::Panic) => {
+                panic!("RecorderWriteBarrier requested a write panic")
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl fmt::Debug for RecorderWriteBarrier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RecorderWriteBarrier { .. }")
+    }
+}
+
+/// One started physical append: the pending File slot, the expected pre-write length, the failed
+/// EntryId, the retained blocking job, and the settled outcome. The core keeps the exact started
+/// or completed attempt in `last_attempt` until the next record or close reaps it.
+struct RecorderAttempt {
+    file: Mutex<Option<File>>,
+    expected_file_bytes: u64,
+    failed_entry_id: EntryId,
+    job: Mutex<Option<TrackedBlockingJob<()>>>,
+    // Closes the cross-thread window between the attempt becoming visible (InFlight
+    // publication) and the publisher's synchronous `store_job` install: a reaper that starts
+    // inside that window parks here instead of misclassifying the empty slot as a missing
+    // worker. The slot is written exactly once per attempt, so waking means the exact job.
+    job_ready: Notify,
+    outcome: Mutex<Option<Result<(), SessionRecordingError>>>,
+    changed: Notify,
+}
+
+impl RecorderAttempt {
+    fn new(file: File, expected_file_bytes: u64, failed_entry_id: EntryId) -> Arc<Self> {
+        Arc::new(Self {
+            file: Mutex::new(Some(file)),
+            expected_file_bytes,
+            failed_entry_id,
+            job: Mutex::new(None),
+            job_ready: Notify::new(),
+            outcome: Mutex::new(None),
+            changed: Notify::new(),
+        })
+    }
+
+    fn take_file(&self) -> Option<File> {
+        lock_recorder(&self.file).take()
+    }
+
+    /// Installs the exact blocking job for this attempt and wakes any reaper that entered the
+    /// publication-to-install window. The store precedes the wake so a waiter that already
+    /// re-checked the slot cannot miss the install (`Notify` delivers a wakeup that lands
+    /// before the awaited `notified` future).
+    fn store_job(&self, job: TrackedBlockingJob<()>) {
+        *lock_recorder(&self.job) = Some(job);
+        self.job_ready.notify_waiters();
+    }
+
+    /// Waits until the exact job is installed, then clones it.
+    ///
+    /// A reaper can observe the attempt between `reserve_record` publishing `InFlight` and the
+    /// publisher's synchronous `store_job`; the empty slot is a publication window, not a
+    /// missing worker. The publisher has no await point inside that window, so this wait always
+    /// completes. No mutex guard is held across the await: the slot is only re-checked under
+    /// the short-lived job lock, and the `Notify` interest is enabled before every check, so an
+    /// install racing the check cannot be lost.
+    async fn wait_for_job(&self) -> TrackedBlockingJob<()> {
+        loop {
+            let notified = self.job_ready.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(job) = self.job() {
+                return job;
+            }
+            notified.await;
+        }
+    }
+
+    /// Clones the retained blocking job so concurrent record/close reapers can share its exact
+    /// `wait`; `TrackedBlockingJob` supports shared waiters, so a clone never consumes the slot
+    /// out from under another reaper.
+    fn job(&self) -> Option<TrackedBlockingJob<()>> {
+        lock_recorder(&self.job).clone()
+    }
+
+    /// Exactly-once settlement for worker-observed outcomes.
+    fn resolve(&self, result: Result<(), SessionRecordingError>) {
+        let mut outcome = lock_recorder(&self.outcome);
+        if outcome.is_none() {
+            *outcome = Some(result);
+            drop(outcome);
+            self.changed.notify_waiters();
+        }
+    }
+
+    /// Overwrites the stored outcome with a terminal task failure and notifies waiters.
+    ///
+    /// This is reserved for raw-task/join failures that can arrive after a provisional worker
+    /// success; the normal worker path stays exactly-once through `resolve`.
+    fn force_task_failure(&self, reason: SessionRecordingError) {
+        *lock_recorder(&self.outcome) = Some(Err(reason));
+        self.changed.notify_waiters();
+    }
+
+    fn outcome(&self) -> Option<Result<(), SessionRecordingError>> {
+        *lock_recorder(&self.outcome)
+    }
+}
+
+enum RecorderState {
+    Ready { file: File, file_bytes: u64 },
+    InFlight(Arc<RecorderAttempt>),
+    Degraded,
+    Closed,
+}
+
+struct SessionRecorderCore {
+    session_id: SessionId,
+    task_context: RuntimeTaskContext,
+    state: Mutex<RecorderState>,
+    health: Mutex<Arc<RecordingHealth>>,
+    last_attempt: Mutex<Option<Arc<RecorderAttempt>>>,
+    closing: AtomicBool,
+    #[cfg(test)]
+    write_barrier: Mutex<Arc<RecorderWriteBarrier>>,
+}
+
+impl SessionRecorderCore {
+    fn current_health(&self) -> Arc<RecordingHealth> {
+        Arc::clone(&lock_recorder(&self.health))
+    }
+
+    fn health_is_healthy_locked(&self) -> bool {
+        matches!(&**lock_recorder(&self.health), RecordingHealth::Healthy)
+    }
+
+    fn install_degraded_locked(
+        &self,
+        failed_entry_id: Option<EntryId>,
+        reason: SessionRecordingError,
+    ) -> Arc<RecordingHealth> {
+        let mut health = lock_recorder(&self.health);
+        if matches!(&**health, RecordingHealth::Healthy) {
+            *health = Arc::new(RecordingHealth::Degraded {
+                failed_entry_id,
+                reason,
+            });
+        }
+        Arc::clone(&health)
+    }
+
+    fn may_attempt(&self) -> bool {
+        if self.closing.load(Ordering::Acquire) {
+            return false;
+        }
+        let state = lock_recorder(&self.state);
+        self.health_is_healthy_locked()
+            && matches!(
+                &*state,
+                RecorderState::Ready { .. } | RecorderState::InFlight(_)
+            )
+    }
+
+    fn mark_degraded(
+        &self,
+        failed_entry_id: Option<EntryId>,
+        reason: SessionRecordingError,
+    ) -> Arc<RecordingHealth> {
+        let mut state = lock_recorder(&self.state);
+        if matches!(&*state, RecorderState::Closed) {
+            return self.current_health();
+        }
+        let health = self.install_degraded_locked(failed_entry_id, reason);
+        if matches!(&*state, RecorderState::Ready { .. }) {
+            let previous = std::mem::replace(&mut *state, RecorderState::Degraded);
+            drop(previous);
+        }
+        drop(state);
+        health
+    }
+
+    fn reserve_record(&self, entry_id: EntryId, line_bytes: u64) -> ReserveRecord {
+        let mut state = lock_recorder(&self.state);
+        if self.closing.load(Ordering::Acquire) {
+            return ReserveRecord::NotRecorded(self.current_health());
+        }
+        if !self.health_is_healthy_locked() {
+            return ReserveRecord::NotRecorded(self.current_health());
+        }
+        match &*state {
+            RecorderState::InFlight(attempt) => {
+                return ReserveRecord::Wait(Arc::clone(attempt));
+            }
+            RecorderState::Degraded | RecorderState::Closed => {
+                return ReserveRecord::NotRecorded(self.current_health());
+            }
+            RecorderState::Ready { .. } => {}
+        }
+
+        let previous = std::mem::replace(&mut *state, RecorderState::Closed);
+        let RecorderState::Ready { file, file_bytes } = previous else {
+            *state = previous;
+            return ReserveRecord::NotRecorded(self.current_health());
+        };
+        if file_bytes
+            .checked_add(line_bytes)
+            .is_none_or(|next| next > MAX_CONVERSATION_FILE_BYTES)
+        {
+            let health =
+                self.install_degraded_locked(Some(entry_id), SessionRecordingError::FileTooLarge);
+            *state = RecorderState::Degraded;
+            drop(state);
+            drop(file);
+            return ReserveRecord::NotRecorded(health);
+        }
+
+        let attempt = RecorderAttempt::new(file, file_bytes, entry_id);
+        *state = RecorderState::InFlight(Arc::clone(&attempt));
+        // The exact attempt is visible to reapers before any blocking work can start.
+        *lock_recorder(&self.last_attempt) = Some(Arc::clone(&attempt));
+        drop(state);
+        ReserveRecord::Start { attempt }
+    }
+
+    fn succeed_attempt(&self, attempt: &Arc<RecorderAttempt>, file: File, file_bytes: u64) {
+        let mut state = lock_recorder(&self.state);
+        if matches!(&*state, RecorderState::InFlight(current) if Arc::ptr_eq(current, attempt)) {
+            *state = RecorderState::Ready { file, file_bytes };
+        }
+        drop(state);
+        attempt.resolve(Ok(()));
+    }
+
+    /// Settles a worker-observed failure of one attempt.
+    ///
+    /// Exact ownership is decided under the short state lock: the attempt is exact when it is
+    /// the current `InFlight` attempt, or when the state is already `Degraded` while
+    /// `last_attempt` still retains this same attempt (a duplicate completion racing the
+    /// reaper). Only the exact attempt installs the sticky degraded health — under the same
+    /// lock, immediately after the exact state transition, so a concurrent `record` can never
+    /// observe a `Degraded` state with `Healthy` health — and only it drops the attempt's
+    /// file. A stale completion (the state has moved on) still resolves its own attempt
+    /// outcome so a waiting record/close reaper observes it, but it touches neither current
+    /// state, health, nor file.
+    fn fail_attempt(&self, attempt: &Arc<RecorderAttempt>, reason: SessionRecordingError) {
+        let mut exact = false;
+        {
+            let mut state = lock_recorder(&self.state);
+            match &*state {
+                RecorderState::InFlight(current) if Arc::ptr_eq(current, attempt) => {
+                    *state = RecorderState::Degraded;
+                    exact = true;
+                }
+                RecorderState::Degraded
+                    if lock_recorder(&self.last_attempt)
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, attempt)) =>
+                {
+                    // Duplicate completion of the exact attempt: the state already degraded
+                    // for this same retained attempt, so the sticky install below is a no-op
+                    // unless the first completer's health install raced this one.
+                    exact = true;
+                }
+                _ => {}
+            }
+            if exact {
+                let _ = self.install_degraded_locked(Some(attempt.failed_entry_id), reason);
+            }
+        }
+        if exact {
+            drop(attempt.take_file());
+        }
+        attempt.resolve(Err(reason));
+    }
+
+    fn clear_last_attempt(&self, attempt: &Arc<RecorderAttempt>) {
+        let mut last_attempt = lock_recorder(&self.last_attempt);
+        if last_attempt
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, attempt))
+        {
+            *last_attempt = None;
+        }
+    }
+
+    /// Terminal degradation for a raw-task/join failure of the exact attempt.
+    ///
+    /// Moves the exact current attempt out of `InFlight` — or out of the `Ready` state it left
+    /// behind after a provisional worker success — into `Degraded`, drops its file if present,
+    /// installs sticky health under the same short state lock, and force-records the attempt
+    /// error. Exact-attempt ownership is preserved through the state/last relationship: every
+    /// state transition is guarded by `Arc::ptr_eq`, and serial admission means no later
+    /// attempt can have started before this retained attempt is reaped, so a later attempt is
+    /// never affected.
+    fn fail_attempt_task(&self, attempt: &Arc<RecorderAttempt>, reason: SessionRecordingError) {
+        let mut degraded = false;
+        {
+            let mut state = lock_recorder(&self.state);
+            match &*state {
+                RecorderState::InFlight(current) if Arc::ptr_eq(current, attempt) => {
+                    *state = RecorderState::Degraded;
+                    degraded = true;
+                }
+                RecorderState::Ready { .. } => {
+                    // A `Ready` state belongs to this attempt exactly while `last_attempt` still
+                    // retains it (the attempt's file moved into the state on worker success).
+                    let retained = lock_recorder(&self.last_attempt)
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, attempt));
+                    if retained {
+                        let RecorderState::Ready { file, .. } =
+                            std::mem::replace(&mut *state, RecorderState::Degraded)
+                        else {
+                            unreachable!("the matched state is the Ready variant");
+                        };
+                        drop(file);
+                        degraded = true;
+                    }
+                }
+                _ => {}
+            }
+            if degraded {
+                // Install the sticky health under the same short state lock, immediately after
+                // the exact transition: a concurrent `record` can never observe a `Degraded`
+                // state with `Healthy` health.
+                let _ = self.install_degraded_locked(Some(attempt.failed_entry_id), reason);
+            }
+        }
+        if degraded {
+            // Release the attempt's handle outside the state lock. The worker's RAII failure path
+            // takes the same two locks in the opposite temporal order, so no lock is held while
+            // transferring or dropping the physical File.
+            drop(attempt.take_file());
+        }
+        // Overwrite any provisional worker result: a task/join failure is terminal for this
+        // exact attempt even when the physical bytes were already appended.
+        attempt.force_task_failure(reason);
+    }
+
+    async fn reap_attempt(&self, attempt: &Arc<RecorderAttempt>) {
+        // A concurrent reaper can enter between InFlight publication and the publisher's
+        // synchronous `store_job`; wait for the exact job install instead of classifying the
+        // momentarily empty slot as a missing worker. The publisher has no await inside that
+        // window, so the wait cannot hang, and no mutex guard is held across it.
+        let job = attempt.wait_for_job().await;
+        // Reap the exact tracked job before consulting any worker outcome: a task aborted before
+        // its first poll never runs the worker guard, so only the join can settle it.
+        if let Err(error) = job.wait().await {
+            // Any raw-task/join failure is terminal for this exact attempt, even when the worker
+            // already recorded a provisional `Ok(())` outcome.
+            self.fail_attempt_task(attempt, SessionRecordingError::Runtime(error));
+        } else if attempt.outcome().is_none() {
+            // The task completed but no worker outcome was recorded; settle the exact attempt.
+            self.fail_attempt_task(attempt, SessionRecordingError::WriteFailed);
+        }
+        self.clear_last_attempt(attempt);
+    }
+
+    async fn reap_last_attempt(&self) {
+        // Clone, never take: caller cancellation while awaiting must leave the retained
+        // exact-job anchor in place for the next record or close reaper.
+        let attempt = lock_recorder(&self.last_attempt).clone();
+        if let Some(attempt) = attempt {
+            self.reap_attempt(&attempt).await;
+        }
+    }
+
+    #[cfg(test)]
+    fn write_barrier(&self) -> Arc<RecorderWriteBarrier> {
+        Arc::clone(&lock_recorder(&self.write_barrier))
+    }
+
+    #[cfg(test)]
+    fn set_write_barrier(&self, barrier: Arc<RecorderWriteBarrier>) {
+        *lock_recorder(&self.write_barrier) = barrier;
+    }
+
+    async fn write_entry(
+        self: &Arc<Self>,
+        line: Vec<u8>,
+        line_bytes: u64,
+        attempt: &Arc<RecorderAttempt>,
+    ) -> Result<(), SessionRecordingError> {
+        let worker_core = Arc::clone(self);
+        let worker_attempt = Arc::clone(attempt);
+        #[cfg(test)]
+        let barrier = self.write_barrier();
+
+        let job = self.task_context.spawn_blocking_tracked(move || {
+            let guard = RecorderWriteCompletionGuard::new(
+                Arc::clone(&worker_core),
+                Arc::clone(&worker_attempt),
+            );
+            let Some(mut file) = worker_attempt.take_file() else {
+                guard.fail(SessionRecordingError::WriteFailed);
+                return;
+            };
+            match file.metadata() {
+                Ok(metadata) if metadata.len() == worker_attempt.expected_file_bytes => {}
+                Ok(_) => {
+                    drop(file);
+                    guard.fail(SessionRecordingError::TargetInvariant);
+                    return;
+                }
+                Err(_) => {
+                    drop(file);
+                    guard.fail(SessionRecordingError::MetadataUnavailable);
+                    return;
+                }
+            }
+            #[cfg(test)]
+            if let Err(error) = barrier.before_first_write() {
+                drop(file);
+                guard.fail(error);
+                return;
+            }
+            if file.write_all(&line).is_err() {
+                drop(file);
+                guard.fail(SessionRecordingError::WriteFailed);
+                return;
+            }
+            guard.success(file, worker_attempt.expected_file_bytes + line_bytes);
+        });
+
+        // Retain the exact job in the attempt: a caller drop after this point still leaves the
+        // worker and its job owned by `last_attempt` until the next record or close reaps them.
+        attempt.store_job(job);
+        // Reaping settles this exact attempt — including any raw-task/join failure — before the
+        // caller observes its outcome; there is no separate manual job wait path.
+        self.reap_attempt(attempt).await;
+        attempt
+            .outcome()
+            .expect("reap_attempt settles the exact attempt outcome before returning")
+    }
+}
+
+enum ReserveRecord {
+    Start { attempt: Arc<RecorderAttempt> },
+    Wait(Arc<RecorderAttempt>),
+    NotRecorded(Arc<RecordingHealth>),
+}
+
+/// Small RAII completion guard: the blocking worker always settles its exact attempt, even when
+/// the worker unwinds (panic) before taking an explicit success or failure path.
+struct RecorderWriteCompletionGuard {
+    core: Arc<SessionRecorderCore>,
+    attempt: Arc<RecorderAttempt>,
+    armed: bool,
+}
+
+impl RecorderWriteCompletionGuard {
+    fn new(core: Arc<SessionRecorderCore>, attempt: Arc<RecorderAttempt>) -> Self {
+        Self {
+            core,
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn success(mut self, file: File, file_bytes: u64) {
+        self.core.succeed_attempt(&self.attempt, file, file_bytes);
+        self.armed = false;
+    }
+
+    fn fail(mut self, reason: SessionRecordingError) {
+        self.core.fail_attempt(&self.attempt, reason);
+        self.armed = false;
+    }
+}
+
+impl Drop for RecorderWriteCompletionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let reason = if std::thread::panicking() {
+            SessionRecordingError::Runtime(RuntimeTaskError::OperationPanicked)
+        } else {
+            SessionRecordingError::WriteFailed
+        };
+        self.core.fail_attempt(&self.attempt, reason);
+    }
+}
+
+/// One loaded Session's ordered, best-effort JSONL recorder.
+#[allow(
+    dead_code,
+    reason = "the loaded SessionExecutor consumes the pending Recorder seam"
+)]
+#[derive(Clone)]
+pub(crate) struct SessionRecorder {
+    core: Arc<SessionRecorderCore>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the loaded SessionExecutor consumes the pending Recorder seam"
+)]
+impl SessionRecorder {
+    pub(crate) fn from_published_target(
+        target: PublishedConversationTarget,
+        task_context: RuntimeTaskContext,
+    ) -> Self {
+        let target_session_id = target.session_id();
+        let target_file_bytes = target.declared_file_bytes();
+        let (file, writable_lease) = target.into_parts();
+
+        // The writable lease is only a same-open binding proof. Its private File is deliberately
+        // not consumed here; the published target File remains the recorder's sole append handle.
+        let validation = if writable_lease.session_id() != target_session_id
+            || writable_lease.declared_file_bytes() != target_file_bytes
+        {
+            Err(SessionRecordingError::TargetInvariant)
+        } else {
+            match file.metadata() {
+                Ok(metadata) if metadata.len() != target_file_bytes => {
+                    Err(SessionRecordingError::TargetInvariant)
+                }
+                Ok(metadata) if metadata.len() > MAX_CONVERSATION_FILE_BYTES => {
+                    Err(SessionRecordingError::FileTooLarge)
+                }
+                Ok(_) => Ok(()),
+                Err(_) => Err(SessionRecordingError::MetadataUnavailable),
+            }
+        };
+        drop(writable_lease);
+
+        let health = Arc::new(match validation {
+            Ok(()) => RecordingHealth::Healthy,
+            Err(reason) => RecordingHealth::Degraded {
+                failed_entry_id: None,
+                reason,
+            },
+        });
+        let state = if matches!(&*health, RecordingHealth::Healthy) {
+            RecorderState::Ready {
+                file,
+                file_bytes: target_file_bytes,
+            }
+        } else {
+            drop(file);
+            RecorderState::Degraded
+        };
+
+        Self {
+            core: Arc::new(SessionRecorderCore {
+                session_id: target_session_id,
+                task_context,
+                state: Mutex::new(state),
+                health: Mutex::new(health),
+                last_attempt: Mutex::new(None),
+                closing: AtomicBool::new(false),
+                #[cfg(test)]
+                write_barrier: Mutex::new(RecorderWriteBarrier::disabled()),
+            }),
+        }
+    }
+
+    pub(crate) async fn record(&self, entry: Arc<StoredSessionEntry>) -> RecordOutcome {
+        if self.core.closing.load(Ordering::Acquire) {
+            return self.not_recorded();
+        }
+        // Reap the exact prior attempt (including a caller-dropped record) before admission.
+        self.core.reap_last_attempt().await;
+
+        let entry_id = entry.entry_id();
+        if entry.session_id() != self.core.session_id {
+            self.core
+                .mark_degraded(Some(entry_id), SessionRecordingError::EntrySessionMismatch);
+            return self.not_recorded();
+        }
+        let mut encoded = match ConversationLineCodec::encode_entry(&entry) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                self.core
+                    .mark_degraded(Some(entry_id), SessionRecordingError::Encode(error));
+                return self.not_recorded();
+            }
+        };
+        // The physical line carries one LF; the buffer may reach the entry cap plus that LF.
+        let line_len = match encoded.len().checked_add(1) {
+            Some(line_len) if encoded.len() <= MAX_CONVERSATION_ENTRY_BYTES => line_len,
+            _ => {
+                self.core
+                    .mark_degraded(Some(entry_id), SessionRecordingError::EntryTooLarge);
+                return self.not_recorded();
+            }
+        };
+        encoded.push(b'\n');
+        let line_bytes = u64::try_from(line_len).expect("a recorded entry line fits u64");
+
+        loop {
+            match self.core.reserve_record(entry_id, line_bytes) {
+                ReserveRecord::Start { attempt } => {
+                    let result = self.core.write_entry(encoded, line_bytes, &attempt).await;
+                    return match result {
+                        Ok(()) => RecordOutcome::Written,
+                        Err(_) => self.not_recorded(),
+                    };
+                }
+                ReserveRecord::Wait(attempt) => {
+                    self.core.reap_attempt(&attempt).await;
+                    match attempt.outcome() {
+                        Some(Ok(())) if self.core.may_attempt() => continue,
+                        Some(Ok(())) | Some(Err(_)) | None => return self.not_recorded(),
+                    }
+                }
+                ReserveRecord::NotRecorded(health) => {
+                    return RecordOutcome::NotRecorded { health: *health };
+                }
+            }
+        }
+    }
+
+    pub(crate) fn health(&self) -> Arc<RecordingHealth> {
+        self.core.current_health()
+    }
+
+    pub(crate) async fn close(&self) {
+        self.core.closing.store(true, Ordering::Release);
+        loop {
+            self.core.reap_last_attempt().await;
+            let action = {
+                let mut state = lock_recorder(&self.core.state);
+                match &*state {
+                    RecorderState::InFlight(attempt) => CloseAction::Wait(Arc::clone(attempt)),
+                    RecorderState::Ready { .. } => {
+                        let previous = std::mem::replace(&mut *state, RecorderState::Closed);
+                        drop(state);
+                        drop(previous);
+                        CloseAction::Done
+                    }
+                    RecorderState::Degraded | RecorderState::Closed => {
+                        *state = RecorderState::Closed;
+                        CloseAction::Done
+                    }
+                }
+            };
+            match action {
+                CloseAction::Done => return,
+                CloseAction::Wait(attempt) => self.core.reap_attempt(&attempt).await,
+            }
+        }
+    }
+
+    fn not_recorded(&self) -> RecordOutcome {
+        RecordOutcome::NotRecorded {
+            health: *self.core.current_health(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_write_barrier_for_test(&self, barrier: Arc<RecorderWriteBarrier>) {
+        self.core.set_write_barrier(barrier);
+    }
+}
+
+impl fmt::Debug for SessionRecorder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionRecorder { .. }")
+    }
+}
+
+enum CloseAction {
+    Done,
+    Wait(Arc<RecorderAttempt>),
+}
+
+fn lock_recorder<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1159,7 +2050,13 @@ impl fmt::Debug for StoredInteractionResolutionBody {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Cursor, Read};
+    use std::fs::OpenOptions;
+    use std::future::Future;
+    use std::io::{self, Cursor, Read, Write};
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::task::Poll;
 
     use super::*;
     use crate::agent_session_lifecycle::AgentRevisionRef;
@@ -1174,6 +2071,84 @@ mod tests {
     const HEADER_ONLY: &[u8] =
         include_bytes!("../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl");
     const FORK_CHILD: &[u8] = include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl");
+    static RECORDER_TEST_FILE: AtomicU64 = AtomicU64::new(0);
+
+    fn recorder_target() -> (PathBuf, PublishedConversationTarget) {
+        let ordinal = RECORDER_TEST_FILE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "minicore-recorder-{}-{ordinal}.jsonl",
+            std::process::id()
+        ));
+        let mut initial_file = std::fs::File::create(&path).expect("recorder test target creates");
+        initial_file
+            .write_all(HEADER_ONLY)
+            .expect("recorder test header writes");
+        drop(initial_file);
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .expect("recorder test target opens");
+        let file_bytes = file.metadata().expect("recorder test metadata reads").len();
+        let writable_file = file.try_clone().expect("recorder test file clones");
+        let session_id = standard_header().session_id();
+        (
+            path,
+            PublishedConversationTarget::from_durable_state(
+                session_id,
+                file_bytes,
+                file,
+                writable_file,
+            ),
+        )
+    }
+
+    async fn recorder_fixture() -> (RuntimeTaskContext, SessionRecorder, PathBuf) {
+        let task_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the Tokio test runtime has a time driver");
+        let (path, target) = recorder_target();
+        let recorder = SessionRecorder::from_published_target(target, task_context.clone());
+        (task_context, recorder, path)
+    }
+
+    async fn poll_to_pending<F>(future: &mut Pin<Box<F>>)
+    where
+        F: Future,
+    {
+        std::future::poll_fn(|context| match future.as_mut().poll(context) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(_) => panic!("test future completed before its named barrier"),
+        })
+        .await;
+    }
+
+    fn recorder_entry(text: &str) -> Arc<StoredSessionEntry> {
+        Arc::new(entry(StoredEntryBody::AssistantMessage(assistant(vec![
+            text_content(text.to_owned()),
+        ]))))
+    }
+
+    fn mismatched_recorder_entry() -> Arc<StoredSessionEntry> {
+        let value = entry(StoredEntryBody::AssistantMessage(assistant(vec![
+            text_content("mismatch"),
+        ])));
+        Arc::new(StoredSessionEntry::reconstruct(
+            value.entry_id(),
+            value.parent_id(),
+            "ses_99999999999999999999999999999999"
+                .parse()
+                .expect("test Session ID is valid"),
+            value.turn_id(),
+            value.timestamp(),
+            value.body().clone(),
+        ))
+    }
+
+    async fn finish_recorder_fixture(task_context: RuntimeTaskContext, recorder: &SessionRecorder) {
+        recorder.close().await;
+        task_context.shutdown().await;
+    }
 
     fn header(session_id: &str, created_at: &str, agent_id: &str) -> SessionHeader {
         SessionHeader::reconstruct(
@@ -1883,5 +2858,478 @@ mod tests {
             ))),
             Err(crate::wire::conversation_jsonl::ConversationCodecError::InvalidSemantic)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_appends_canonical_entry_bytes_and_one_lf() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let entry = recorder_entry("canonical");
+        let encoded = ConversationLineCodec::encode_entry(&entry).expect("entry encodes");
+
+        assert_eq!(recorder.record(entry).await, RecordOutcome::Written);
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        finish_recorder_fixture(task_context, &recorder).await;
+
+        let mut expected = HEADER_ONLY.to_vec();
+        expected.extend_from_slice(&encoded);
+        expected.push(b'\n');
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            expected
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_constructor_invariant_mismatch_is_terminally_degraded() {
+        let task_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the Tokio test runtime has a time driver");
+        let (path, target) = recorder_target();
+        let (file, original_lease) = target.into_parts();
+        let target_session_id = standard_header().session_id();
+        let declared_file_bytes = file.metadata().expect("recorder test metadata reads").len();
+        let invalid_declared_file_bytes = declared_file_bytes + 1;
+        let writable_file = file.try_clone().expect("recorder test file clones");
+        drop(original_lease);
+        let target = PublishedConversationTarget {
+            session_id: target_session_id,
+            declared_file_bytes: invalid_declared_file_bytes,
+            file,
+            writable_lease: ExclusiveWritableConversationLease::from_durable_state(
+                target_session_id,
+                invalid_declared_file_bytes,
+                writable_file,
+            ),
+        };
+        let recorder = SessionRecorder::from_published_target(target, task_context.clone());
+        assert!(matches!(
+            *recorder.health(),
+            RecordingHealth::Degraded {
+                failed_entry_id: None,
+                reason: SessionRecordingError::TargetInvariant,
+            }
+        ));
+        assert!(matches!(
+            recorder.record(recorder_entry("not written")).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded { .. }
+            }
+        ));
+        finish_recorder_fixture(task_context.clone(), &recorder).await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            HEADER_ONLY
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_allows_only_one_in_flight_append() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let mut first = Box::pin(recorder.record(recorder_entry("first")));
+        poll_to_pending(&mut first).await;
+        barrier.wait_until_entered().await;
+
+        let mut second = Box::pin(recorder.record(recorder_entry("second")));
+        poll_to_pending(&mut second).await;
+        assert_eq!(
+            task_context.registered_task_count_for_test(),
+            1,
+            "only the one admitted blocking append is registered while the second waits"
+        );
+
+        barrier.release();
+        let (first_outcome, second_outcome) = tokio::join!(first, second);
+        assert_eq!(first_outcome, RecordOutcome::Written);
+        assert_eq!(second_outcome, RecordOutcome::Written);
+
+        finish_recorder_fixture(task_context.clone(), &recorder).await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        let bytes = std::fs::read(&path).expect("recorder test target reads");
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 3);
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_degraded_health_stops_the_suffix() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        barrier.fail_before_write();
+
+        let first = recorder.record(recorder_entry("failed"));
+        assert!(matches!(
+            first.await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded { .. }
+            }
+        ));
+        let after_failure = recorder.record(recorder_entry("suffix")).await;
+        assert!(matches!(
+            after_failure,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded { .. }
+            }
+        ));
+
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            HEADER_ONLY
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_worker_panic_degrades_and_settles() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        barrier.panic_before_write();
+
+        assert!(matches!(
+            recorder.record(recorder_entry("panic")).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded { .. }
+            }
+        ));
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            HEADER_ONLY
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_failure_completion_is_exact_or_inert() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let entry = recorder_entry("exactness");
+
+        // Publish the exact current attempt exactly as `record` does.
+        let ReserveRecord::Start { attempt } = recorder.core.reserve_record(entry.entry_id(), 1)
+        else {
+            panic!("the fresh recorder admits its first attempt");
+        };
+
+        // A stale completion of a previous attempt must not touch the current state, health,
+        // or its own file; it still settles its own attempt outcome.
+        let (path_stale, target_stale) = recorder_target();
+        let (file_stale, _) = target_stale.into_parts();
+        let stale = RecorderAttempt::new(file_stale, 0, entry.entry_id());
+        recorder
+            .core
+            .fail_attempt(&stale, SessionRecordingError::WriteFailed);
+        assert!(
+            lock_recorder(&stale.file).is_some(),
+            "a stale completion does not consume its file"
+        );
+        assert_eq!(
+            stale.outcome(),
+            Some(Err(SessionRecordingError::WriteFailed)),
+            "a stale completion still settles its own attempt outcome"
+        );
+        assert!(
+            matches!(*recorder.health(), RecordingHealth::Healthy),
+            "a stale completion never degrades the current health"
+        );
+        assert!(
+            matches!(
+                &*lock_recorder(&recorder.core.state),
+                RecorderState::InFlight(current) if Arc::ptr_eq(current, &attempt)
+            ),
+            "a stale completion never touches the current state"
+        );
+
+        // Duplicate completion of the exact attempt while the state already degraded but
+        // `last_attempt` still retains it: the retained attempt is the exact owner and may
+        // install the sticky health.
+        *lock_recorder(&recorder.core.state) = RecorderState::Degraded;
+        recorder
+            .core
+            .fail_attempt(&attempt, SessionRecordingError::TargetInvariant);
+        assert!(matches!(
+            *recorder.health(),
+            RecordingHealth::Degraded {
+                reason: SessionRecordingError::TargetInvariant,
+                ..
+            }
+        ));
+        assert_eq!(
+            attempt.outcome(),
+            Some(Err(SessionRecordingError::TargetInvariant))
+        );
+
+        // Clean up: install the exact job so the close reaper settles the retained attempt.
+        attempt.store_job(task_context.spawn_blocking_tracked(|| ()));
+        finish_recorder_fixture(task_context.clone(), &recorder).await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        std::fs::remove_file(path).expect("recorder test target removes");
+        std::fs::remove_file(path_stale).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_spawn_rejection_degrades_without_an_append() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        task_context.request_closing();
+
+        assert!(matches!(
+            recorder.record(recorder_entry("not started")).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded {
+                    reason: SessionRecordingError::Runtime(_),
+                    ..
+                }
+            }
+        ));
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            HEADER_ONLY
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_caller_drop_still_settles_the_owner_work() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let mut dropped = Box::pin(recorder.record(recorder_entry("caller drop")));
+        poll_to_pending(&mut dropped).await;
+        barrier.wait_until_entered().await;
+        drop(dropped);
+
+        barrier.release();
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+
+        let bytes = std::fs::read(&path).expect("recorder test target reads");
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_cancelled_close_keeps_the_exact_attempt_anchor() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let mut record = Box::pin(recorder.record(recorder_entry("cancelled close")));
+        poll_to_pending(&mut record).await;
+        barrier.wait_until_entered().await;
+
+        let mut close = Box::pin(recorder.close());
+        poll_to_pending(&mut close).await;
+        assert!(
+            lock_recorder(&recorder.core.last_attempt).is_some(),
+            "close is reaping the retained in-flight attempt"
+        );
+        drop(close);
+
+        // Cancelling a reaper while it awaits must not consume the retained exact-job anchor;
+        // otherwise a later operation could bypass reaping the completed raw task.
+        assert!(
+            lock_recorder(&recorder.core.last_attempt).is_some(),
+            "a cancelled reaper leaves the exact attempt anchor in place"
+        );
+
+        barrier.release();
+        assert_eq!(record.await, RecordOutcome::Written);
+
+        // The next close still reaps the exact job the cancelled close left behind.
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[test]
+    fn session_recorder_pre_poll_abort_is_settled_by_reap_without_hanging() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_time()
+            .build()
+            .expect("the recorder abort test runtime builds");
+        runtime.block_on(async {
+            let (task_context, recorder, path) = recorder_fixture().await;
+
+            // Occupy the single blocking-pool thread so the append worker stays queued and can
+            // be aborted before its first poll: its guard then never runs, and no worker
+            // outcome is ever recorded.
+            let blocker_entered = Arc::new(std::sync::Barrier::new(2));
+            let blocker_release = Arc::new(std::sync::Barrier::new(2));
+            let entered_by_blocker = Arc::clone(&blocker_entered);
+            let released_by_blocker = Arc::clone(&blocker_release);
+            let _blocker = task_context.spawn_blocking_tracked(move || {
+                entered_by_blocker.wait();
+                released_by_blocker.wait();
+            });
+            blocker_entered.wait();
+
+            let mut record = Box::pin(recorder.record(recorder_entry("pre-poll abort")));
+            poll_to_pending(&mut record).await;
+            // Drop the caller before it reaps: the dropped join guard restores the raw handle,
+            // and the still-queued worker stays unstarted.
+            drop(record);
+
+            task_context.abort_latest_registered_task();
+            blocker_release.wait();
+
+            // Reaping must wait the exact tracked job first; the aborted join failure settles
+            // the attempt that no worker guard can settle.
+            recorder.close().await;
+            assert!(matches!(
+                *recorder.health(),
+                RecordingHealth::Degraded {
+                    reason: SessionRecordingError::Runtime(_),
+                    ..
+                }
+            ));
+
+            task_context.shutdown().await;
+            assert_eq!(task_context.registered_task_count_for_test(), 0);
+            assert_eq!(
+                std::fs::read(&path).expect("recorder test target reads"),
+                HEADER_ONLY
+            );
+            std::fs::remove_file(path).expect("recorder test target removes");
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_reaper_parks_until_the_exact_job_install() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+
+        // Publish the exact attempt (InFlight + last_attempt) exactly as `record` does, but
+        // hold the job back: a reaper that starts inside the publication-to-install window must
+        // park on the install instead of misclassifying the empty slot as WorkerUnavailable.
+        let entry = recorder_entry("held job");
+        let ReserveRecord::Start { attempt } = recorder.core.reserve_record(entry.entry_id(), 1)
+        else {
+            panic!("the fresh recorder admits its first attempt");
+        };
+
+        let mut reaper = Box::pin(recorder.core.reap_attempt(&attempt));
+        poll_to_pending(&mut reaper).await;
+        assert!(
+            attempt.job().is_none(),
+            "the reaper parks on the job install instead of failing the empty slot"
+        );
+        assert!(
+            matches!(*recorder.health(), RecordingHealth::Healthy),
+            "the parked reaper did not settle the attempt"
+        );
+        assert!(
+            lock_recorder(&recorder.core.last_attempt).is_some(),
+            "the parked reaper keeps the exact attempt anchor"
+        );
+
+        // The publisher's synchronous install (the production `write_entry` has no await
+        // between publication and this call) releases the parked reaper.
+        attempt.store_job(task_context.spawn_blocking_tracked(|| ()));
+        reaper.await;
+
+        // The reaper settled the exact attempt: job installed, outcome recorded, anchor cleared.
+        assert!(attempt.job().is_some(), "the exact job is retained");
+        assert!(
+            attempt.outcome().is_some(),
+            "the reaper settles the exact attempt outcome"
+        );
+        assert!(
+            lock_recorder(&recorder.core.last_attempt).is_none(),
+            "the finished reaper clears the exact attempt anchor"
+        );
+        assert!(matches!(
+            *recorder.health(),
+            RecordingHealth::Degraded {
+                reason: SessionRecordingError::WriteFailed,
+                ..
+            }
+        ));
+
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        finish_recorder_fixture(task_context, &recorder).await;
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            HEADER_ONLY
+        );
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_close_waits_for_in_flight_and_is_idempotent() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let mut record = Box::pin(recorder.record(recorder_entry("close")));
+        poll_to_pending(&mut record).await;
+        barrier.wait_until_entered().await;
+
+        let mut close = Box::pin(recorder.close());
+        poll_to_pending(&mut close).await;
+        assert!(matches!(
+            recorder
+                .record(recorder_entry("after close admission"))
+                .await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Healthy
+            }
+        ));
+        barrier.release();
+        let (outcome, ()) = tokio::join!(record, close);
+        assert_eq!(outcome, RecordOutcome::Written);
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+
+        recorder.close().await;
+        assert!(matches!(
+            recorder.record(recorder_entry("after close")).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Healthy
+            }
+        ));
+        task_context.shutdown().await;
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_debug_and_display_redact_entry_identity() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let outcome = recorder.record(mismatched_recorder_entry()).await;
+        let health = recorder.health();
+        let debug = format!("{health:?} {health} {outcome:?} {outcome}");
+        for secret in [
+            "ses_99999999999999999999999999999999",
+            "ent_11111111111111111111111111111111",
+            "mismatch",
+        ] {
+            assert!(!debug.contains(secret), "Recorder output leaked {secret}");
+        }
+        assert!(matches!(
+            *health,
+            RecordingHealth::Degraded {
+                failed_entry_id: Some(_),
+                reason: SessionRecordingError::EntrySessionMismatch,
+            }
+        ));
+
+        finish_recorder_fixture(task_context.clone(), &recorder).await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        std::fs::remove_file(path).expect("recorder test target removes");
     }
 }

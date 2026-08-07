@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target与same-open writable proof已完成，Recorder与M5.2 semantic replay pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、replay/Recorder-backed full Load、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof与owner-tracked SessionRecorder physical append slice已实现，M5.2 semantic replay与完整M5.1 fixture/native exit gate仍pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、replay/Recorder-backed full Load、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -361,7 +361,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 SessionRecorder、M5.2 semantic replay/corruption sidecars Pending。
+状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof与owner-tracked SessionRecorder physical append slice已实现，完整fixture/native exit gate、M5.2 semantic replay/corruption sidecars Pending。
 
 ### M5.0 DurableState / async foundation implementation
 
@@ -384,16 +384,18 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 实现：
 
-- [x] DurableState-issued `PublishedConversationTarget`：在root lease下owner-tracked打开已发布conversation，严格校验initial Header、bounded physical length、regular-file mode与same-open path/handle identity；由Conversation Storage从same-open handle clone出opaque writable proof；
-- open/use M5.0已经发布的valid Header与writable conversation proof；initial Header creation属于M5.0；
-- single ordered `record(entry).await`；
-- encode完成且size合法后才进行第一次write；
-- `write_all`语义与partial/unknown write failure；
-- first failure `Healthy → Degraded`，当前load停止后续记录；
-- 不retry、不segment、不backfill、不回滚live mutation；
-- diagnostic只保留allowlisted code与redacted bounded message。
+- [x] DurableState-issued `PublishedConversationTarget`与paired writable proof：在root lease下owner-tracked打开已发布conversation，严格校验initial Header、bounded physical length、regular-file mode与same-open path/handle identity；Recorder只消费opaque target/proof，不取得path；
+- [x] open/use M5.0已经发布的valid Header与writable conversation proof；initial Header creation属于M5.0；
+- [x] single ordered `record(entry).await`；
+- [x] encode完成且size合法后才进行第一次write；
+- [x] `write_all`语义与partial/unknown write failure；
+- [x] first failure `Healthy → Degraded`，当前load停止后续记录；
+- [x] 不retry、不segment、不backfill、不回滚live mutation；
+- [x] diagnostic只保留allowlisted code与redacted bounded message；
 
-退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个job、panic/unload finalizer复用shared settlement、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
+当前 slice 已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；semantic replay、Recorder-backed full Load、fixture/native complete exit gate仍不在本 slice。
+
+退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个physical job、panic/close reaper复用exact attempt、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
 
 ### M5.2 Tolerant semantic replay
 
