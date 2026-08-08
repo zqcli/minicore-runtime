@@ -43,7 +43,9 @@ use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
-use crate::session_ingress::{FollowUpQueue, FollowUpQueueError};
+use crate::session_ingress::{
+    FollowUpQueue, FollowUpQueueError, QueuedSteer, SteerQueue, SteerQueueError,
+};
 #[cfg(test)]
 use crate::tools::ToolExecutionResult;
 use crate::tools::{ToolCall, ToolExecutionOutcome, ToolExecutionRequest, ToolSet};
@@ -373,6 +375,24 @@ pub(crate) enum SessionFollowUpError {
     #[error("the FollowUp queue is full")]
     QueueFull,
     #[error("session follow-up dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionSteerError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session execution has no active Turn")]
+    TurnNotRunning,
+    #[error("the Turn is already cancelling")]
+    TurnCancelling,
+    #[error("the Steer target does not match the active Turn")]
+    ExpectedTurnMismatch,
+    #[error("the Steer command conflicts with an admitted command")]
+    CommandConflict,
+    #[error("the Steer queue is full")]
+    QueueFull,
+    #[error("session steer dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
 
@@ -721,6 +741,7 @@ impl SessionExecutor {
             active_turn: None,
             pending_interactions: BTreeMap::new(),
             follow_up: FollowUpQueue::new(),
+            steer: SteerQueue::new(),
             turn_admission_gate: Arc::clone(&turn_admission_gate),
             events: events.clone(),
             #[cfg(test)]
@@ -1029,6 +1050,46 @@ impl SessionExecutor {
         })
     }
 
+    /// Queues a Steer for the active Turn.  The public command and snapshot projection remain
+    /// outside this crate-private seam; consumption is performed by the active Turn worker at a
+    /// complete assistant/tool safe point.
+    pub(crate) async fn steer(
+        &self,
+        turn_id: TurnId,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<(), SessionSteerError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::Steer(SteerRequest {
+            turn_id,
+            command_id,
+            intent: Some(intent),
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionSteerError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionSteerError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionSteerError::Closing)
+            } else {
+                Err(SessionSteerError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
@@ -1142,6 +1203,7 @@ struct SessionExecutorActor {
     active_turn: Option<ActiveTurn>,
     pending_interactions: BTreeMap<RequestId, ActiveInteraction>,
     follow_up: FollowUpQueue,
+    steer: SteerQueue,
     turn_admission_gate: Arc<TurnAdmissionGate>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     #[cfg(test)]
@@ -1368,6 +1430,9 @@ impl SessionExecutorActor {
             SessionExecutorRequest::FollowUp(request) => {
                 self.enqueue_follow_up(request)?;
             }
+            SessionExecutorRequest::Steer(request) => {
+                self.enqueue_steer(request)?;
+            }
             SessionExecutorRequest::ResolveInteraction(request) => {
                 self.resolve_interaction_request(request).await?;
             }
@@ -1402,6 +1467,44 @@ impl SessionExecutorActor {
             }
             Err(FollowUpQueueError::DuplicateCommandId) => {
                 request.settle(Err(SessionFollowUpError::CommandConflict));
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_steer(&mut self, request: &mut SteerRequest) -> Result<(), ActorFatality> {
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            request.settle(Err(SessionSteerError::TurnNotRunning));
+            return Ok(());
+        };
+        if active_turn.turn_id != request.turn_id {
+            request.settle(Err(SessionSteerError::ExpectedTurnMismatch));
+            return Ok(());
+        }
+        if active_turn.cancellation.is_cancelled() {
+            request.settle(Err(SessionSteerError::TurnCancelling));
+            return Ok(());
+        }
+        if active_turn.command_id == request.command_id
+            || self
+                .active_admission
+                .as_ref()
+                .is_some_and(|admission| admission.command_id == request.command_id)
+        {
+            request.settle(Err(SessionSteerError::CommandConflict));
+            return Ok(());
+        }
+        let Some(intent) = request.intent.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        match self
+            .steer
+            .try_push(request.turn_id, request.command_id, intent)
+        {
+            Ok(()) => request.settle(Ok(())),
+            Err(SteerQueueError::Full) => request.settle(Err(SessionSteerError::QueueFull)),
+            Err(SteerQueueError::DuplicateCommandId) => {
+                request.settle(Err(SessionSteerError::CommandConflict));
             }
         }
         Ok(())
@@ -1564,6 +1667,7 @@ impl SessionExecutorActor {
             let completion_sender = self.completion_sender.clone();
             let guard = TurnCompletionGuard::new(completion_sender, turn_id);
             let interaction_completion_sender = self.completion_sender.clone();
+            let steer_completion_sender = self.completion_sender.clone();
             let worker = async move {
                 let mut guard = guard;
                 let terminal = run_active_turn(
@@ -1573,6 +1677,7 @@ impl SessionExecutorActor {
                     turn_id,
                     cancellation,
                     interaction_completion_sender,
+                    steer_completion_sender,
                 )
                 .await;
                 guard.complete(terminal);
@@ -1741,6 +1846,7 @@ impl SessionExecutorActor {
                     return Ok(());
                 }
                 active.cancellation.cancel();
+                self.steer.clear_for_turn(turn_id);
                 let pending = self
                     .pending_interactions
                     .iter()
@@ -1827,6 +1933,7 @@ impl SessionExecutorActor {
         if self.pending_interactions.len() != pending_before {
             self.publish_pending_interactions()?;
         }
+        self.steer.clear_for_turn(active.turn_id);
         let Some(conversation) = self.conversation.as_ref() else {
             return Err(ActorFatality::Integrity);
         };
@@ -2022,8 +2129,26 @@ impl SessionExecutorActor {
             ExecutorCompletion::InteractionRequested(completion) => {
                 self.handle_interaction_requested(completion).await
             }
+            ExecutorCompletion::SteerSafePoint(completion) => {
+                self.handle_steer_safe_point(completion)
+            }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
         }
+    }
+
+    fn handle_steer_safe_point(
+        &mut self,
+        completion: SteerSafePointCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            return Err(ActorFatality::Internal);
+        };
+        if active_turn.turn_id != completion.turn_id {
+            return Err(ActorFatality::Internal);
+        }
+        let steer = self.steer.pop_front_for_turn(completion.turn_id);
+        let _ = completion.response.send(steer);
+        Ok(())
     }
 
     async fn handle_publication_completion(
@@ -2262,6 +2387,7 @@ enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
     InteractionRequested(InteractionRequestedCompletion),
+    SteerSafePoint(SteerSafePointCompletion),
     Turn(TurnCompletion),
 }
 
@@ -2273,6 +2399,11 @@ struct InteractionRequestedCompletion {
     request_id: RequestId,
     request: InteractionRequest,
     resolution_sender: oneshot::Sender<ResolvedInteraction>,
+}
+
+struct SteerSafePointCompletion {
+    turn_id: TurnId,
+    response: oneshot::Sender<Option<QueuedSteer>>,
 }
 
 struct PublicationCompletion {
@@ -2427,6 +2558,7 @@ async fn run_active_turn(
     turn_id: TurnId,
     cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> SessionTurnTerminal {
     if context.turn_id() != turn_id {
         return SessionTurnTerminal::Failed(SessionTurnFailure::Internal);
@@ -2438,6 +2570,7 @@ async fn run_active_turn(
         turn_id,
         cancellation,
         interaction_completion_sender,
+        steer_completion_sender,
     )
     .await;
     match result {
@@ -2470,6 +2603,7 @@ async fn run_active_turn_inner(
     turn_id: TurnId,
     cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     loop {
         if cancellation.is_cancelled() {
@@ -2657,7 +2791,72 @@ async fn run_active_turn_inner(
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
+        consume_one_steer(
+            Arc::clone(&context),
+            Arc::clone(&conversation),
+            turn_id,
+            cancellation.clone(),
+            &steer_completion_sender,
+        )
+        .await?;
     }
+}
+
+async fn consume_one_steer(
+    context: Arc<TurnExecutionContext>,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_id: TurnId,
+    cancellation: CancellationToken,
+    steer_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
+) -> Result<(), SessionTurnFailure> {
+    let basis_revision = lock(&conversation.live_state)
+        .capture_conversation_views()
+        .map_err(|_| SessionTurnFailure::Internal)?
+        .conversation()
+        .revision();
+    let (response, waiter) = oneshot::channel();
+    steer_completion_sender
+        .send(ExecutorCompletion::SteerSafePoint(
+            SteerSafePointCompletion { turn_id, response },
+        ))
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    let Some(queued) = (tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
+        result = waiter => result.map_err(|_| SessionTurnFailure::Internal)?,
+    }) else {
+        return Ok(());
+    };
+    let (_command_id, queued_turn_id, intent) = queued.into_parts();
+    if queued_turn_id != turn_id {
+        return Err(SessionTurnFailure::Internal);
+    }
+    let message = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
+        result = context.resolve_user_message(intent) => result.map_err(map_turn_prompt_error)?,
+    };
+    if cancellation.is_cancelled() {
+        return Err(SessionTurnFailure::Model);
+    }
+    let current_revision = lock(&conversation.live_state)
+        .capture_conversation_views()
+        .map_err(|_| SessionTurnFailure::Internal)?
+        .conversation()
+        .revision();
+    if current_revision != basis_revision {
+        return Ok(());
+    }
+    let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
+    let fact = lock(&conversation.live_state)
+        .apply_user_message(
+            StoredUserMessage::reconstruct(item_id, UserMessageSource::Steer, message),
+            turn_id,
+            SystemClock.now(),
+        )
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+    Ok(())
 }
 
 fn map_model_call_failure(error: crate::model_gateway::ModelCallError) -> SessionTurnFailure {
@@ -3008,6 +3207,13 @@ struct FollowUpRequest {
     response: Option<oneshot::Sender<Result<(), SessionFollowUpError>>>,
 }
 
+struct SteerRequest {
+    turn_id: TurnId,
+    command_id: CommandId,
+    intent: Option<PromptIntent>,
+    response: Option<oneshot::Sender<Result<(), SessionSteerError>>>,
+}
+
 impl FollowUpRequest {
     fn settle(&mut self, outcome: Result<(), SessionFollowUpError>) {
         if let Some(response) = self.response.take() {
@@ -3021,6 +3227,24 @@ impl FollowUpRequest {
 }
 
 impl Drop for FollowUpRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+impl SteerRequest {
+    fn settle(&mut self, outcome: Result<(), SessionSteerError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionSteerError::Closing));
+    }
+}
+
+impl Drop for SteerRequest {
     fn drop(&mut self) {
         self.reject_closing();
     }
@@ -3170,6 +3394,7 @@ enum SessionExecutorRequest {
     Snapshot(SnapshotRequest),
     Submit(SubmitRequest),
     FollowUp(FollowUpRequest),
+    Steer(SteerRequest),
     ResolveInteraction(ResolveInteractionRequest),
     Cancel(CancelRequest),
     Subscribe(SubscribeRequest),
@@ -3184,6 +3409,7 @@ impl SessionExecutorRequest {
             Self::Snapshot(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
             Self::FollowUp(request) => request.reject_closing(),
+            Self::Steer(request) => request.reject_closing(),
             Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Cancel(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
@@ -4242,7 +4468,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn ordinary_scripted_turn_completes_a_tool_round_before_the_final_model_call() {
+    async fn ordinary_scripted_turn_consumes_steer_after_a_tool_round_before_the_final_model_call()
+    {
         let store = TempStore::new();
         let agent_definition_path = store
             .root
@@ -4287,6 +4514,10 @@ mod tests {
             "{\"value\":1}",
             "tool complete",
         );
+        let tool_started = Arc::new(tokio::sync::Notify::new());
+        let release_tool = Arc::new(tokio::sync::Notify::new());
+        let tool_started_for_executor = Arc::clone(&tool_started);
+        let release_tool_for_executor = Arc::clone(&release_tool);
         let tool_set = ToolSet::with_executor(
             vec![
                 crate::tools::ToolDefinition::new(
@@ -4297,8 +4528,12 @@ mod tests {
                 )
                 .unwrap(),
             ],
-            |call| {
+            move |call| {
+                let tool_started = Arc::clone(&tool_started_for_executor);
+                let release_tool = Arc::clone(&release_tool_for_executor);
                 Box::pin(async move {
+                    tool_started.notify_one();
+                    release_tool.notified().await;
                     ToolExecutionResult::completed_text(call.call().arguments().canonical_json())
                         .unwrap()
                 })
@@ -4351,6 +4586,22 @@ mod tests {
             )
             .await
             .unwrap();
+        tool_started.notified().await;
+        assert_eq!(
+            executor
+                .steer(
+                    turn_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("steer while tool runs").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        release_tool.notify_one();
         assert_eq!(
             wait_for_terminal(&executor, turn_id).await,
             SessionTurnTerminal::Completed
@@ -4362,7 +4613,7 @@ mod tests {
             let live = lock(&live_state);
             let captured = live.capture_conversation_views().unwrap();
             let messages = captured.conversation().messages();
-            assert_eq!(messages.len(), 4);
+            assert_eq!(messages.len(), 5);
             assert!(matches!(
                 messages[1].as_ref(),
                 crate::prompt::ModelMessageRef::Assistant { content }
@@ -4374,6 +4625,10 @@ mod tests {
             ));
             assert!(matches!(
                 messages[3].as_ref(),
+                crate::prompt::ModelMessageRef::User { .. }
+            ));
+            assert!(matches!(
+                messages[4].as_ref(),
                 crate::prompt::ModelMessageRef::Assistant { content }
                     if matches!(content[0].as_ref(), crate::prompt::ModelAssistantContentRef::Text("tool complete"))
             ));
@@ -5030,6 +5285,27 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(SessionFollowUpError::TurnNotRunning));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn steer_is_rejected_without_an_active_turn() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let turn_id: TurnId = "trn_11111111111111111111111111111111".parse().unwrap();
+        let result = loaded
+            .executor
+            .steer(
+                turn_id,
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("queued steer").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(result, Err(SessionSteerError::TurnNotRunning));
         close_loaded(loaded).await;
     }
 
