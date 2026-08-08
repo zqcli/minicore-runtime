@@ -26,8 +26,12 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
     SessionLifecycleDecision, SessionLifecycleDecisionError,
 };
+#[cfg(not(test))]
+use crate::conversation_storage::load_replayed_conversation;
+use crate::conversation_storage::{ConversationLoadError, ConversationReplayError};
+#[cfg(test)]
 use crate::conversation_storage::{
-    ConversationLoadError, ConversationReplayError, load_replayed_conversation,
+    ReplayPreparationBarrier, load_replayed_conversation_with_barrier_for_test,
 };
 use crate::durable_state::{
     DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
@@ -256,12 +260,16 @@ impl ResidencyState {
 
 struct ResidencyShared {
     state: Mutex<ResidencyState>,
+    #[cfg(test)]
+    replay_preparation_barrier: Mutex<Option<Arc<ReplayPreparationBarrier>>>,
 }
 
 impl ResidencyShared {
     fn new() -> Self {
         Self {
             state: Mutex::new(ResidencyState::new()),
+            #[cfg(test)]
+            replay_preparation_barrier: Mutex::new(None),
         }
     }
 
@@ -687,6 +695,8 @@ struct OperationContext {
     resolver: Arc<WorkspaceResolver>,
     closing: CancellationToken,
     failure: Arc<RegistryFailureState>,
+    #[cfg(test)]
+    replay_preparation_barrier: Option<Arc<ReplayPreparationBarrier>>,
 }
 
 impl OperationContext {
@@ -1042,6 +1052,8 @@ impl SessionResidencyActor {
             resolver: Arc::clone(&self.resolver),
             closing: self.closing.clone(),
             failure: Arc::clone(&self.failure),
+            #[cfg(test)]
+            replay_preparation_barrier: lock(&self.state.replay_preparation_barrier).clone(),
         }
     }
 
@@ -1726,6 +1738,14 @@ impl SessionResidencyRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_replay_preparation_barrier_for_test(
+        &self,
+        barrier: Option<Arc<ReplayPreparationBarrier>>,
+    ) {
+        *lock(&self.shared.replay_preparation_barrier) = barrier;
+    }
+
+    #[cfg(test)]
     pub(crate) fn loaded_count_for_test(&self) -> usize {
         self.shared.loaded_count()
     }
@@ -1871,6 +1891,15 @@ async fn run_load(
         .open_conversation_target(session_id)
         .await
         .map_err(|error| map_conversation_target_load_error(&context, error))?;
+    #[cfg(test)]
+    let loaded_conversation = load_replayed_conversation_with_barrier_for_test(
+        target,
+        context.task_context.clone(),
+        context.replay_preparation_barrier.clone(),
+    )
+    .await
+    .map_err(|error| map_conversation_load_error(&context, error))?;
+    #[cfg(not(test))]
     let loaded_conversation = load_replayed_conversation(target, context.task_context.clone())
         .await
         .map_err(|error| map_conversation_load_error(&context, error))?;
@@ -2277,7 +2306,9 @@ mod tests {
 
     use tokio::runtime::Handle;
 
-    use crate::agent_session_lifecycle::SealedSessionLifecycleAttempt;
+    use crate::agent_session_lifecycle::{
+        SealedSessionDefinitionAttempt, SealedSessionLifecycleAttempt,
+    };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier};
     use crate::durable_state::DurableState;
     use crate::runtime_task::RuntimeTaskContext;
@@ -3115,6 +3146,345 @@ mod tests {
             assert_eq!(context.registered_task_count_for_test(), baseline);
         }
 
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropped_load_waiter_at_replay_barrier_still_installs_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let baseline = context.registered_task_count_for_test();
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.arm_before_recorder();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        assert!(poll_once_pending(load.as_mut()).await);
+        barrier.wait_until_before_recorder().await;
+        drop(load);
+
+        // The dropped caller cannot cancel the admitted child; the replay worker completes and
+        // still installs the residency.
+        barrier.release_before_recorder();
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        assert_eq!(registry.gate_count_for_test(), 1);
+        assert_eq!(
+            context.registered_task_count_for_test(),
+            baseline + 1,
+            "the admitted Load child and its replay worker are reaped; the loaded executor actor remains registered"
+        );
+        assert_eq!(
+            registry
+                .snapshot(session_id)
+                .await
+                .expect("the dropped Load still installs a coherent executor")
+                .execution_state(),
+            crate::session_execution::SessionExecutionState::Idle
+        );
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_replay_spawn_rejection_maps_to_closing_without_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.arm_before_spawn();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        assert!(poll_once_pending(load.as_mut()).await);
+        barrier.wait_until_before_spawn().await;
+        context.request_closing();
+        barrier.release_before_spawn();
+
+        assert_eq!(
+            load.await,
+            Err(SessionResidencyLoadError::Closing),
+            "a rejected replay worker spawn maps to the existing Closing contract"
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_replay_worker_panic_maps_to_internal_without_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.panic_before_recorder();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+
+        let result = registry.load_ready_idle(session_id).await;
+        assert_eq!(
+            result,
+            Err(SessionResidencyLoadError::InternalDispatchUnavailable),
+            "a panicked replay worker maps to the existing redacted internal contract"
+        );
+        assert!(
+            !format!("{result:?}").contains("ReplayPreparationBarrier"),
+            "the replay worker panic payload never crosses the owner boundary"
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_replay_worker_join_failure_maps_to_internal_without_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.arm_before_spawn();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        assert!(poll_once_pending(load.as_mut()).await);
+        barrier.wait_until_before_spawn().await;
+
+        // Arm the one-shot join-failure seam while the Load is paused before it spawns the
+        // replay blocking worker.  That exact worker consumes the fault: its raw join handle
+        // aborts immediately, so `TrackedBlockingJob::wait()` settles WorkerUnavailable without
+        // running the replay operation closure.  The parent Load task is never touched.
+        context.inject_next_blocking_job_join_failure();
+        barrier.release_before_spawn();
+
+        assert_eq!(
+            load.await,
+            Err(SessionResidencyLoadError::InternalDispatchUnavailable),
+            "a replay worker join failure maps to the existing redacted internal contract"
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_installs_ready_idle_with_degraded_recorder_on_length_invariant_failure() {
+        let store = TempStore::new();
+        let recorded = replayed_user_conversation_fixture();
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        fs::write(&conversation_path, &recorded).expect("the replay fixture is installed");
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.corrupt_length_before_recorder();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded),
+            "Load still installs Ready+Idle when the same target fails its Recorder invariant"
+        );
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        assert_eq!(registry.gate_count_for_test(), 1);
+        assert_eq!(
+            registry
+                .snapshot(session_id)
+                .await
+                .expect("the degraded-recorder Load installs an Idle executor")
+                .execution_state(),
+            crate::session_execution::SessionExecutionState::Idle
+        );
+
+        let executor = registry
+            .executor_for_test(session_id)
+            .expect("the degraded-recorder Load installs its executor");
+        let recorder = executor
+            .recorder_for_test()
+            .expect("the installed executor retains its Recorder");
+        assert!(matches!(
+            &*recorder.health(),
+            crate::conversation_storage::RecordingHealth::Degraded {
+                failed_entry_id: None,
+                reason: crate::conversation_storage::SessionRecordingError::TargetInvariant,
+            }
+        ));
+
+        // No second target/proof was manufactured: the one published conversation file now
+        // carries exactly the replayed bytes plus the injected byte.
+        let mut expected = recorded;
+        expected.extend_from_slice(b"x");
+        assert_eq!(fs::read(&conversation_path).unwrap(), expected);
+
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_fails_closed_when_definition_publishes_between_candidate_and_final_recheck() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let current = state
+            .session_current(session_id)
+            .expect("the fixture Session is current");
+        assert_eq!(current.definition().revision().get(), 1);
+
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let hooks = resolver.test_hooks();
+        hooks.arm_after_candidate_before_final_recheck();
+        let registry = SessionResidencyRegistry::start(context.clone(), state.clone(), resolver)
+            .expect("the residency actor starts");
+        let baseline = context.registered_task_count_for_test();
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        tokio::select! {
+            _ = hooks.wait_after_candidate_before_final_recheck() => {}
+            result = &mut load => panic!("load settled before the final durable recheck: {result:?}"),
+        }
+
+        // The durable definition update publishes while the Load holds its stale candidate and
+        // has not yet performed the final durable recheck.  The gate does not protect this
+        // direct durable publication, exactly like a concurrent Workspace publication owner.
+        let outcome = state
+            .update_session_definition(SealedSessionDefinitionAttempt::new(
+                session_id,
+                current.definition().revision(),
+                Some(changed_workspace(&store.new_workspace)),
+                None,
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+            ))
+            .await
+            .expect("the durable definition update publishes");
+        assert!(outcome.changed());
+        assert_eq!(outcome.definition().revision().get(), 2);
+
+        hooks.release_after_candidate_before_final_recheck();
+        assert_eq!(
+            load.await,
+            Err(SessionResidencyLoadError::StaleDefinition),
+            "the stale candidate must fail closed without installing residency"
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        assert_eq!(
+            context.registered_task_count_for_test(),
+            baseline,
+            "the ordinary stale Load reaps its child while the owner actors remain available"
+        );
+
+        // A current Load resolves the updated definition and installs residency.
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        let snapshot = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(snapshot.definition_revision().get(), 2);
+        assert_eq!(snapshot.workspace_revision().get(), 2);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cold_reload_after_recorder_append_accepts_the_full_second_user_entry() {
+        let store = TempStore::new();
+        let recorded = replayed_user_conversation_fixture();
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        fs::write(&conversation_path, &recorded).expect("the replay fixture is installed");
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        registry.load_ready_idle(session_id).await.unwrap();
+
+        // Physical append of the fixture's second User entry through the installed Recorder.
+        let recorder = registry
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed")
+            .recorder_for_test()
+            .expect("the loaded executor retains its Recorder");
+        let entry_line = replayed_user_append_entry_fixture();
+        let entry = ConversationLineCodec::decode_entry_for_session(&entry_line, session_id)
+            .expect("the production codec replays the fixture User entry");
+        assert_eq!(
+            recorder.record(Arc::new(entry)).await,
+            RecordOutcome::Written
+        );
+
+        // Cold reload: unload closes the Recorder and a fresh Load replays the durable bytes.
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+
+        let executor = registry
+            .executor_for_test(session_id)
+            .expect("the cold reload installs its executor");
+        let live_state = executor
+            .live_state_for_test()
+            .expect("the cold reload installs replayed live state");
+        let reloaded_recorder = executor
+            .recorder_for_test()
+            .expect("the cold reload installs its Recorder");
+        assert!(matches!(
+            &*reloaded_recorder.health(),
+            crate::conversation_storage::RecordingHealth::Healthy
+        ));
+        {
+            let live_state = lock(&live_state);
+            let views = live_state
+                .capture_conversation_views()
+                .expect("the reloaded state has a valid compaction source");
+            assert_eq!(
+                views.conversation().messages().len(),
+                2,
+                "the complete second User entry is replayed, not only codec-decoded"
+            );
+            assert_eq!(views.compaction_source().units().len(), 2);
+            assert_eq!(views.relations().len(), 2);
+            let second_entry_id: crate::wire::EntryId = "ent_a0000000000000000000000000000002"
+                .parse()
+                .expect("the fixture EntryId is valid");
+            assert_eq!(views.selected_head(), Some(&second_entry_id));
+            assert!(live_state.entry_id_is_reserved_for_test(second_entry_id));
+        }
+
+        // The durable file is the replayed bytes plus exactly one complete appended entry line.
+        let mut expected = recorded;
+        expected.extend_from_slice(&entry_line);
+        expected.push(b'\n');
+        assert_eq!(fs::read(&conversation_path).unwrap(), expected);
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
         close_fixture(context, state, registry).await;
     }
 

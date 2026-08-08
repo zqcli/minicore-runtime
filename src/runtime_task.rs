@@ -4,6 +4,8 @@ use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
@@ -126,6 +128,10 @@ impl RuntimeTaskContext {
         let task_owner = Arc::clone(&self.owner);
         let task_settlement = Arc::clone(&settlement);
         let spawned = catch_unwind(AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if let Some(handle) = self.owner.spawn_blocking_with_injected_failure() {
+                return handle;
+            }
             self.owner.handle.spawn_blocking(move || {
                 // The task owns the owner while it is running, so dropping every caller-side
                 // context or job cannot detach an admitted blocking operation.
@@ -216,6 +222,14 @@ impl RuntimeTaskContext {
             .1
             .handle
             .abort();
+    }
+
+    /// Test-only one-shot seam: the next admitted blocking job joins as an immediate worker
+    /// cancellation without ever running its operation closure.  The fault is consumed by that
+    /// exact `spawn_blocking_tracked` admission and never touches any other registered task.
+    #[cfg(test)]
+    pub(crate) fn inject_next_blocking_job_join_failure(&self) {
+        self.owner.inject_next_blocking_job_join_failure();
     }
 
     #[cfg(test)]
@@ -401,6 +415,8 @@ struct RuntimeTaskOwner {
     handle: Handle,
     registry: Mutex<Registry>,
     registry_changed: Notify,
+    #[cfg(test)]
+    next_blocking_job_join_failure: AtomicBool,
 }
 
 impl RuntimeTaskOwner {
@@ -409,6 +425,32 @@ impl RuntimeTaskOwner {
             handle,
             registry: Mutex::new(Registry::new()),
             registry_changed: Notify::new(),
+            #[cfg(test)]
+            next_blocking_job_join_failure: AtomicBool::new(false),
+        }
+    }
+
+    /// Test-only one-shot join-failure injection for the next blocking job admission.
+    #[cfg(test)]
+    fn inject_next_blocking_job_join_failure(&self) {
+        self.next_blocking_job_join_failure
+            .store(true, Ordering::Release);
+    }
+
+    /// Test-only: when the one-shot fault is armed, the next `spawn_blocking_tracked` installs
+    /// an immediately-aborted pending async raw handle as its owner registration, so the exact
+    /// owner join settles `WorkerUnavailable` without the operation closure ever running.
+    #[cfg(test)]
+    fn spawn_blocking_with_injected_failure(&self) -> Option<JoinHandle<()>> {
+        if self
+            .next_blocking_job_join_failure
+            .swap(false, Ordering::AcqRel)
+        {
+            let handle = self.handle.spawn(std::future::pending::<()>());
+            handle.abort();
+            Some(handle)
+        } else {
+            None
         }
     }
 
@@ -969,6 +1011,31 @@ mod tests {
         release.wait();
 
         assert_eq!(job.wait().await, Ok(7));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injected_blocking_join_failure_settles_without_running_the_operation() {
+        let context = initialized_context().await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runs_by_operation = Arc::clone(&runs);
+
+        context.inject_next_blocking_job_join_failure();
+        let job = context.spawn_blocking_tracked(move || {
+            runs_by_operation.fetch_add(1, Ordering::SeqCst);
+            3_u8
+        });
+
+        assert_eq!(job.wait().await, Err(RuntimeTaskError::WorkerUnavailable));
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the injected join failure aborts the worker before its operation closure runs"
+        );
+
+        // The seam is one-shot: the next admission runs its closure normally.
+        let next = context.spawn_blocking_tracked(|| 5_u8);
+        assert_eq!(next.wait().await, Ok(5));
         context.shutdown().await;
     }
 

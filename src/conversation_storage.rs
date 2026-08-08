@@ -3,6 +3,8 @@ use std::fmt;
 use std::fs::{File, Metadata};
 use std::io::{self, Read, Write};
 use std::num::NonZeroU32;
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -2259,6 +2261,202 @@ pub(crate) enum ConversationLoadError {
     Runtime(RuntimeTaskError),
 }
 
+/// Test-only coordination at named points inside one replay-backed Load preparation.
+///
+/// The production load path never constructs a barrier, so production behavior is identical
+/// across build configurations.  The type itself exists in every build only so the
+/// owner-tracked blocking worker signature stays uniform; every behavior is `#[cfg(test)]`.
+#[allow(
+    dead_code,
+    reason = "the replay preparation seam type keeps the owner-tracked worker signature uniform in production builds"
+)]
+pub(crate) struct ReplayPreparationBarrier {
+    #[cfg(test)]
+    inner: Arc<ReplayPreparationBarrierInner>,
+}
+
+#[cfg(test)]
+struct ReplayPreparationBarrierInner {
+    before_spawn_armed: AtomicBool,
+    before_spawn_entered: AtomicBool,
+    before_spawn_released: AtomicBool,
+    before_spawn_changed: Notify,
+    before_recorder_armed: AtomicBool,
+    before_recorder_entered: AtomicBool,
+    before_recorder_changed: Notify,
+    before_recorder_release_lock: Mutex<bool>,
+    before_recorder_wake: Condvar,
+    panic_before_recorder: AtomicBool,
+    corrupt_length_before_recorder: AtomicBool,
+}
+
+#[cfg(test)]
+impl ReplayPreparationBarrier {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(ReplayPreparationBarrierInner {
+                before_spawn_armed: AtomicBool::new(false),
+                before_spawn_entered: AtomicBool::new(false),
+                before_spawn_released: AtomicBool::new(false),
+                before_spawn_changed: Notify::new(),
+                before_recorder_armed: AtomicBool::new(false),
+                before_recorder_entered: AtomicBool::new(false),
+                before_recorder_changed: Notify::new(),
+                before_recorder_release_lock: Mutex::new(false),
+                before_recorder_wake: Condvar::new(),
+                panic_before_recorder: AtomicBool::new(false),
+                corrupt_length_before_recorder: AtomicBool::new(false),
+            }),
+        })
+    }
+
+    /// Pauses the next admitted Load just before its replay blocking worker is spawned.
+    ///
+    /// Arming resets the previous cycle's entered/released state, so the same seam can be
+    /// reused without an already-passed cycle making the next wait return immediately.
+    pub(crate) fn arm_before_spawn(&self) {
+        self.inner
+            .before_spawn_entered
+            .store(false, Ordering::Release);
+        self.inner
+            .before_spawn_released
+            .store(false, Ordering::Release);
+        self.inner.before_spawn_armed.store(true, Ordering::Release);
+        self.inner.before_spawn_changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_until_before_spawn(&self) {
+        loop {
+            let notified = self.inner.before_spawn_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.before_spawn_entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release_before_spawn(&self) {
+        self.inner
+            .before_spawn_released
+            .store(true, Ordering::Release);
+        self.inner.before_spawn_changed.notify_waiters();
+    }
+
+    /// Pauses the admitted Load inside the replay worker, between replay preparation and
+    /// Recorder construction from the same published target parts.
+    ///
+    /// Arming resets the previous cycle's entered/release state, so the same seam can be reused
+    /// without an already-passed cycle making the next wait return immediately.  The release
+    /// lock is touched only synchronously here, never across an await.
+    pub(crate) fn arm_before_recorder(&self) {
+        self.inner
+            .before_recorder_entered
+            .store(false, Ordering::Release);
+        {
+            let mut released = lock_recorder(&self.inner.before_recorder_release_lock);
+            *released = false;
+        }
+        self.inner
+            .before_recorder_armed
+            .store(true, Ordering::Release);
+        self.inner.before_recorder_changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_until_before_recorder(&self) {
+        loop {
+            let notified = self.inner.before_recorder_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.before_recorder_entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) fn release_before_recorder(&self) {
+        let mut released = lock_recorder(&self.inner.before_recorder_release_lock);
+        *released = true;
+        drop(released);
+        self.inner.before_recorder_wake.notify_all();
+    }
+
+    /// Makes the same physical target fail its declared-length invariant at Recorder
+    /// construction, without manufacturing a second target or writable proof.
+    pub(crate) fn corrupt_length_before_recorder(&self) {
+        self.inner
+            .corrupt_length_before_recorder
+            .store(true, Ordering::Release);
+    }
+
+    /// Panics the next replay blocking worker at the named seam.  The panic payload is caught
+    /// and redacted by the owner-tracked job boundary.
+    pub(crate) fn panic_before_recorder(&self) {
+        self.inner
+            .panic_before_recorder
+            .store(true, Ordering::Release);
+    }
+
+    async fn before_spawn(&self) {
+        if self.inner.before_spawn_armed.swap(false, Ordering::AcqRel) {
+            self.inner
+                .before_spawn_entered
+                .store(true, Ordering::Release);
+            self.inner.before_spawn_changed.notify_waiters();
+            loop {
+                let notified = self.inner.before_spawn_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.inner.before_spawn_released.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    fn before_recorder(&self, file: &File) {
+        if self
+            .inner
+            .before_recorder_armed
+            .swap(false, Ordering::AcqRel)
+        {
+            self.inner
+                .before_recorder_entered
+                .store(true, Ordering::Release);
+            self.inner.before_recorder_changed.notify_waiters();
+            let mut released = lock_recorder(&self.inner.before_recorder_release_lock);
+            while !*released {
+                released = self
+                    .inner
+                    .before_recorder_wake
+                    .wait(released)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            drop(released);
+        }
+        if self
+            .inner
+            .panic_before_recorder
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("ReplayPreparationBarrier requested a replay worker panic");
+        }
+        if self
+            .inner
+            .corrupt_length_before_recorder
+            .swap(false, Ordering::AcqRel)
+        {
+            // The same published target: append one byte so the Recorder's declared-length
+            // invariant fails for this exact target and proof pair.
+            let mut sink = file;
+            let _ = sink.write_all(b"x");
+        }
+    }
+}
+
 /// The cold conversation objects installed into one loaded Session.
 pub(crate) struct ReplayedConversationLoad {
     pub(crate) live_state: LiveSessionState,
@@ -2269,9 +2467,32 @@ pub(crate) struct ReplayedConversationLoad {
 /// Replays and prepares one DurableState-issued target while retaining all physical handles in
 /// the same owner-tracked blocking job. The target is never exposed to residency as a path or a
 /// separately manufactured writable lease.
+#[allow(
+    dead_code,
+    reason = "unit tests route the same owner-tracked worker through the named replay barrier entry point"
+)]
 pub(crate) async fn load_replayed_conversation(
     target: PublishedConversationTarget,
     task_context: RuntimeTaskContext,
+) -> Result<ReplayedConversationLoad, ConversationLoadError> {
+    load_replayed_conversation_inner(target, task_context, None).await
+}
+
+/// Test-only entry point that routes one named replay preparation barrier into the same
+/// owner-tracked worker.  Production Load always passes `None`.
+#[cfg(test)]
+pub(crate) async fn load_replayed_conversation_with_barrier_for_test(
+    target: PublishedConversationTarget,
+    task_context: RuntimeTaskContext,
+    barrier: Option<Arc<ReplayPreparationBarrier>>,
+) -> Result<ReplayedConversationLoad, ConversationLoadError> {
+    load_replayed_conversation_inner(target, task_context, barrier).await
+}
+
+async fn load_replayed_conversation_inner(
+    target: PublishedConversationTarget,
+    task_context: RuntimeTaskContext,
+    barrier: Option<Arc<ReplayPreparationBarrier>>,
 ) -> Result<ReplayedConversationLoad, ConversationLoadError> {
     let session_id = target.session_id();
     let declared_file_bytes = target.declared_file_bytes();
@@ -2280,6 +2501,10 @@ pub(crate) async fn load_replayed_conversation(
         Arc::new(Mutex::new(None));
     let worker_slot = Arc::clone(&result_slot);
     let recorder_task_context = task_context.clone();
+    #[cfg(test)]
+    if let Some(barrier) = &barrier {
+        barrier.before_spawn().await;
+    }
     let job = task_context.spawn_blocking_tracked(move || {
         let result = prepare_replayed_conversation_blocking(
             session_id,
@@ -2287,6 +2512,7 @@ pub(crate) async fn load_replayed_conversation(
             file,
             writable_lease,
             recorder_task_context,
+            barrier,
         );
         *lock_recorder(&worker_slot) = Some(result);
     });
@@ -2307,6 +2533,7 @@ fn prepare_replayed_conversation_blocking(
     file: File,
     mut writable_lease: ExclusiveWritableConversationLease,
     task_context: RuntimeTaskContext,
+    _barrier: Option<Arc<ReplayPreparationBarrier>>,
 ) -> Result<ReplayedConversationLoad, ConversationLoadError> {
     let replay_reader = file
         .try_clone()
@@ -2329,6 +2556,10 @@ fn prepare_replayed_conversation_blocking(
     let live_state = LiveSessionState::from_replayed_view(session_id, &view)
         .map_err(|_| ConversationLoadError::LiveStateInvariant)?;
     let diagnostics = view.diagnostics().clone();
+    #[cfg(test)]
+    if let Some(barrier) = &_barrier {
+        barrier.before_recorder(&file);
+    }
     let recorder = SessionRecorder::from_published_parts(
         session_id,
         declared_file_bytes,
