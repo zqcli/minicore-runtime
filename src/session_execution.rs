@@ -45,7 +45,9 @@ use crate::prompt::{
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
-    FollowUpQueue, FollowUpQueueError, QueuedSteer, SteerQueue, SteerQueueError,
+    EmergencyControlHandle, EmergencyControlSignal, EmergencyControlSignalOutcome,
+    EmergencyControlTarget, FollowUpQueue, FollowUpQueueError, QueuedSteer, SteerQueue,
+    SteerQueueError,
 };
 #[cfg(test)]
 use crate::tools::ToolExecutionResult;
@@ -726,6 +728,7 @@ pub(crate) struct SessionExecutor {
     published_snapshot: Arc<Mutex<Arc<SessionExecutorSnapshot>>>,
     conversation: Option<Arc<LoadedSessionConversation>>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
+    emergency: EmergencyControlHandle,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -849,6 +852,7 @@ impl SessionExecutor {
         let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
         let closing = CancellationToken::new();
         let turn_admission_gate = Arc::new(TurnAdmissionGate::new());
+        let emergency = EmergencyControlHandle::new();
         #[cfg(test)]
         let hooks = Arc::new(SessionExecutorTestHooksInner::new());
         let failure_state = Arc::new(ActorFailureState::default());
@@ -876,6 +880,7 @@ impl SessionExecutor {
             steer: SteerQueue::new(),
             turn_admission_gate: Arc::clone(&turn_admission_gate),
             events: events.clone(),
+            emergency: emergency.clone(),
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -916,6 +921,7 @@ impl SessionExecutor {
             published_snapshot,
             conversation,
             events,
+            emergency,
             #[cfg(test)]
             hooks,
         })
@@ -1292,6 +1298,11 @@ impl SessionExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) fn emergency_control_for_test(&self) -> EmergencyControlHandle {
+        self.emergency.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn wait_until_closing_for_test(&self) {
         self.closing.cancelled().await;
     }
@@ -1401,6 +1412,7 @@ struct SessionExecutorActor {
     steer: SteerQueue,
     turn_admission_gate: Arc<TurnAdmissionGate>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
+    emergency: EmergencyControlHandle,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -1415,6 +1427,7 @@ struct ActivePublication {
 struct ActiveAdmission {
     command_id: CommandId,
     turn_id: TurnId,
+    emergency: crate::session_ingress::EmergencyControlObservation,
     waiter: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
     cancellation: CancellationToken,
     task: Option<TrackedTask>,
@@ -1424,6 +1437,7 @@ struct ActiveTurn {
     command_id: CommandId,
     turn_id: TurnId,
     control_generation: Arc<ControlGeneration>,
+    emergency: crate::session_ingress::EmergencyControlObservation,
     cancellation: CancellationToken,
     task: Option<TrackedTask>,
     steer_admission_open: bool,
@@ -1760,9 +1774,14 @@ impl SessionExecutorActor {
         let turn_id = TurnId::generate().map_err(|_| ActorFatality::Internal)?;
         let command_id = request.command_id;
         let waiter = request.response.take();
+        let emergency = self
+            .emergency
+            .bind(EmergencyControlTarget::Submit(command_id))
+            .map_err(|_| ActorFatality::Internal)?;
         self.active_admission = Some(ActiveAdmission {
             command_id,
             turn_id,
+            emergency,
             waiter,
             cancellation: CancellationToken::new(),
             task: None,
@@ -1848,6 +1867,7 @@ impl SessionExecutorActor {
         let context = match completion.result {
             Ok(context) => context,
             Err(error) => {
+                self.emergency.retire(active.emergency);
                 self.execution_state = SessionExecutionState::Idle;
                 self.publish_execution_state(
                     SessionExecutionState::Idle,
@@ -1867,7 +1887,15 @@ impl SessionExecutorActor {
         let Some(resources) = self.turn_resources.as_ref().cloned() else {
             return Err(ActorFatality::Integrity);
         };
+        self.emergency.retire(active.emergency);
+        let emergency = self
+            .emergency
+            .bind(EmergencyControlTarget::Turn(active.turn_id))
+            .map_err(|_| ActorFatality::Internal)?;
         let cancellation = active.cancellation.clone();
+        if cancellation.is_cancelled() {
+            self.signal_emergency_cancel(EmergencyControlTarget::Turn(active.turn_id))?;
+        }
         let control_generation = Arc::new(ControlGeneration(0));
         conversation.install_control_generation(active.turn_id, Arc::clone(&control_generation));
         self.execution_state = SessionExecutionState::Running;
@@ -1880,6 +1908,7 @@ impl SessionExecutorActor {
             command_id: active.command_id,
             turn_id: active.turn_id,
             control_generation: Arc::clone(&control_generation),
+            emergency,
             cancellation: cancellation.clone(),
             task: None,
             steer_admission_open: true,
@@ -2045,6 +2074,7 @@ impl SessionExecutorActor {
                     request.settle(Err(SessionCancelError::TurnCancelling));
                     return Ok(());
                 }
+                self.signal_emergency_cancel(EmergencyControlTarget::Submit(command_id))?;
                 active.cancellation.cancel();
                 request.settle(Ok(()));
             }
@@ -2058,6 +2088,7 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionCancelError::TurnCancelling));
                         return Ok(());
                     }
+                    self.signal_emergency_cancel(active.emergency.target())?;
                     active.cancellation.cancel();
                     request.settle(Ok(()));
                     return Ok(());
@@ -2084,6 +2115,7 @@ impl SessionExecutorActor {
                     request.settle(Err(SessionCancelError::TurnCancelling));
                     return Ok(());
                 }
+                self.signal_emergency_cancel(active.emergency.target())?;
                 active.cancellation.cancel();
                 if !self.steer.clear_for_turn(turn_id).is_empty() {
                     self.publish_queue_projection();
@@ -2103,6 +2135,17 @@ impl SessionExecutorActor {
             }
         }
         Ok(())
+    }
+
+    fn signal_emergency_cancel(&self, target: EmergencyControlTarget) -> Result<(), ActorFatality> {
+        match self
+            .emergency
+            .signal(target, EmergencyControlSignal::Cancel)
+        {
+            EmergencyControlSignalOutcome::Accepted { .. }
+            | EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(()),
+            EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
+        }
     }
 
     async fn cancel_pending_interaction(
@@ -2182,6 +2225,7 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         conversation.clear_control_generation(active.turn_id, &active.control_generation);
+        self.emergency.retire(active.emergency);
         let pending_before = self.pending_interactions.len();
         self.pending_interactions
             .retain(|_, interaction| interaction.turn_id != active.turn_id);
@@ -6495,6 +6539,13 @@ mod tests {
                 .cancel(SessionCancelTarget::Submit(command_id), timestamp)
                 .await,
             Ok(())
+        );
+        assert_eq!(
+            executor
+                .emergency_control_for_test()
+                .observe(EmergencyControlTarget::Submit(command_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::Cancel)
         );
         hooks.release_after_agent_admission_before_input();
         assert_eq!(submit.await.unwrap(), Err(SessionSubmitError::Cancelled));

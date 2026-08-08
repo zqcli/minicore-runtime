@@ -1,13 +1,13 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel与M9.1–M9.6 crate-private queue/Steer/arbitration/retry seams已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整Emergency/SecurityRevoked control lanes、public projections、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel与M9.1–M9.9 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整SecurityRevoked runtime route、public projections、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.8 已在 M9.7 的 crate-private Snapshot lane projection 之后补齐 sticky EmergencyControl 的 target/epoch、Cancel 与 SecurityRevoked first-wins、stale-target rejection、retire 与 cancellation wakeup seam；完整 SecurityRevoked/EmergencyControl runtime 路由、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
+当前实现进度：M9.9 已在 M9.8 sticky EmergencyControl seam 之后将 Cancel 接入 active Submit、Starting Turn 与 Running Turn，并在 admission 被取消后转为 Turn 时保留 Cancel sticky signal；完整 SecurityRevoked runtime 路由、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
 
 核心目标：
 
