@@ -1,8 +1,8 @@
 # ModelGateway架构设计
 
-日期：2026-07-31
+日期：2026-08-08
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（M6.2 scripted text-only foundation已实现；Structured/Tool/Compaction paths、credential/connection implementation、Rig reality gate与production adapters待实现）
 
 ## 目的
 
@@ -26,6 +26,8 @@
 - Runtime公开model catalog/query/event协议；其safe view以[Runtime Interface](runtime-interface.md)为权威；
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
+
+当前M6.2实现范围严格限于ordinary text-only AgentRun：Runtime拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、minimal terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。`OutputContract::NoToolCalls`已保留closed value，但Structured schema、non-empty ToolSpec与允许ToolCall的response、CompactionSummary budget/proof、auth/credential/connection/cache以及Rig provider mapping均未实现，也不由本里程碑暗示可用。
 
 相关权威文档：
 
@@ -963,10 +965,11 @@ pub struct ModelCallResult {
 }
 
 pub struct FinalizedAssistantResponse {
-    pub model: ModelDefinitionRef,
+    pub model: ModelResponseSummary,
     pub response_id: Option<ProviderResponseId>,
     pub content: Arc<[FinalizedAssistantContent]>,
     pub finish_reason: ModelFinishReason,
+    pub effective_max_output_tokens: NonZeroU32,
     pub usage: Option<ModelUsage>,
     pub metadata: ProviderResponseMetadata,
 }
@@ -1363,7 +1366,7 @@ pub enum ModelCallErrorReason {
 - provider status、request ID等只作为allowlisted diagnostic；
 - ContextOverflow必须与Prompt本地size validation保留不同source；
 - SafetyBlocked和Refused response的最终建模必须由adapter根据provider protocol一致处理；
-- `Timeout`、`TransportUnavailable`和`ProviderUnavailable`只有在delivery proof为`NotSent`或`RejectedBeforeExecution`时才能保持该retryable reason；`AcceptedNoOutput`没有明确pre-execution rejection proof时、以及其他outcome unknown都必须映射`RequestOutcomeUnknown`，已有semantic delta必须映射`StreamInterrupted`；
+- `Timeout`、`TransportUnavailable`、`ProviderUnavailable`和`RateLimited`只有在delivery proof为`NotSent`或`RejectedBeforeExecution`时才能保持该retryable reason；`AcceptedNoOutput`没有明确pre-execution rejection proof时、以及其他outcome unknown都必须映射`RequestOutcomeUnknown`，已有semantic delta必须映射`StreamInterrupted`；
 - 上述四个response error发生在request已经离开`NotSent | RejectedBeforeExecution`安全状态之后，或在completed response validation期间，不满足ADR 0119的safe-delivery retry前提；SessionExecutor不得把它们重新解释为transient failure。
 
 ## Authentication And Secret Redaction
@@ -1946,8 +1949,10 @@ src/model_gateway/provider/scripted.rs
 - [x] 定义cache、connection reuse和continuation等价性规则。
 - [x] 定义multi-session直接并发和provider rate-limit governance（ADR 0125）。
 - [x] 定义persistence、recovery、performance和test matrix。
-- [ ] 实现ScriptedProviderAdapter并通过阶段6–8 ordinary/compaction vertical slices。
+- [x] 实现M6.2 ScriptedProviderAdapter text-only AgentRun vertical slice，包括exact request identity、ordered progress、terminal/error validation、cancellation与reload-retained adapter。
+- [ ] 随M8/M10扩展ScriptedProviderAdapter覆盖允许ToolCall与CompactionSummary vertical slices。
 - [ ] 尽早执行Rig 0.40.0 ModelGateway integration spike，在production adapter冻结前完成。
-- [ ] 实现ModelGateway和Rig provider adapters。
+- [x] 实现ModelGateway model resolution、immutable request/proof与single-attempt scripted core。
+- [ ] 实现credential/connection/cache policy和Rig production provider adapters。
 - [ ] 完成OpenAI Responses与Anthropic Messages mock-server tests。
 - [x] 在阶段9冻结公开model catalog/query协议。

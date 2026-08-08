@@ -2037,7 +2037,8 @@ fn map_prompt_load_error(
         | PromptErrorKind::InvalidRole
         | PromptErrorKind::RequiredPromptMissing
         | PromptErrorKind::InvalidIntent
-        | PromptErrorKind::InvalidContribution => context.internal_load(),
+        | PromptErrorKind::InvalidContribution
+        | PromptErrorKind::ContextLimitExceeded => context.internal_load(),
     }
 }
 

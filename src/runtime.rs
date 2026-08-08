@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::SealedSessionLifecycleAttempt;
 use crate::durable_state::{DurableOpenError, DurableState};
+use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_task::RuntimeTaskContext;
 use crate::session_execution::{SessionExecutorSnapshot, SessionWorkspaceDefinitionOutcome};
@@ -111,6 +112,14 @@ impl MiniCoreRuntime {
                 return Err(RuntimeInitializationError::RuntimeDependencyUnavailable);
             }
         };
+        let model_gateway = Arc::new(ModelGateway::new(Vec::new()));
+        let model_catalog = match model_gateway.initialize().await {
+            Ok(catalog) => catalog,
+            Err(_) => {
+                task_context.shutdown().await;
+                return Err(RuntimeInitializationError::RuntimeDependencyUnavailable);
+            }
+        };
         let durable_state =
             match DurableState::open(config.durable_root, task_context.clone()).await {
                 Ok(durable_state) => durable_state,
@@ -145,6 +154,8 @@ impl MiniCoreRuntime {
             session_residency,
             prompt_service,
             prompt_resources,
+            model_gateway,
+            model_catalog,
         ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
@@ -194,6 +205,16 @@ struct RuntimeInner {
         reason = "the immediately adjacent shared-resource capture slice consumes this root"
     )]
     prompt_resources: Arc<PromptResourceView>,
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent Turn capture slice consumes the Runtime owner"
+    )]
+    model_gateway: Arc<ModelGateway>,
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent shared-resource capture slice consumes this root"
+    )]
+    model_catalog: Arc<ModelCatalogView>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
@@ -208,11 +229,15 @@ impl RuntimeInner {
         session_residency: Arc<SessionResidencyRegistry>,
         prompt_service: Arc<PromptService>,
         prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
     ) -> Self {
         Self {
             task_context,
             prompt_service,
             prompt_resources,
+            model_gateway,
+            model_catalog,
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
@@ -230,6 +255,11 @@ impl RuntimeInner {
     #[cfg(test)]
     fn prompt_resources(&self) -> (&Arc<PromptService>, &Arc<PromptResourceView>) {
         (&self.prompt_service, &self.prompt_resources)
+    }
+
+    #[cfg(test)]
+    fn model_resources(&self) -> (&Arc<ModelGateway>, &Arc<ModelCatalogView>) {
+        (&self.model_gateway, &self.model_catalog)
     }
 
     fn request_closing(&self) {
@@ -732,6 +762,16 @@ mod tests {
                 .build_reload_candidate()
                 .await
                 .expect("the empty shared Prompt candidate rebuilds")
+                .definition_count(),
+            0
+        );
+        let (model_gateway, model_catalog) = runtime.inner.model_resources();
+        assert_eq!(model_catalog.definition_count(), 0);
+        assert_eq!(
+            model_gateway
+                .build_reload_candidate()
+                .await
+                .expect("the empty Model catalog candidate rebuilds")
                 .definition_count(),
             0
         );

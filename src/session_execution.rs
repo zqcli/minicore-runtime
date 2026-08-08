@@ -1271,7 +1271,8 @@ fn map_prompt_error(error: PromptError) -> SessionWorkspaceDefinitionError {
         | PromptErrorKind::InvalidRole
         | PromptErrorKind::RequiredPromptMissing
         | PromptErrorKind::InvalidIntent
-        | PromptErrorKind::InvalidContribution => {
+        | PromptErrorKind::InvalidContribution
+        | PromptErrorKind::ContextLimitExceeded => {
             SessionWorkspaceDefinitionError::InternalDispatchUnavailable
         }
     }
