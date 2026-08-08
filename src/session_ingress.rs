@@ -6,14 +6,15 @@
 //! Process-local Session input lanes.
 //!
 //! The queues only own admitted intent and command identity.  SessionExecutor remains the sole
-//! owner of live state and decides when a queued FollowUp may start a new Turn.
+//! owner of live state and decides when queued FollowUp or Steer input may advance execution.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::prompt::PromptIntent;
-use crate::wire::CommandId;
+use crate::wire::{CommandId, TurnId};
 
 pub(crate) const FOLLOW_UP_QUEUE_CAPACITY: usize = 8;
+pub(crate) const STEER_QUEUE_CAPACITY: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FollowUpQueueError {
@@ -42,6 +43,134 @@ impl QueuedFollowUp {
 
 pub(crate) struct FollowUpQueue {
     entries: VecDeque<QueuedFollowUp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SteerQueueError {
+    Full,
+    DuplicateCommandId,
+}
+
+pub(crate) struct QueuedSteer {
+    command_id: CommandId,
+    turn_id: TurnId,
+    intent: PromptIntent,
+}
+
+impl QueuedSteer {
+    pub(crate) fn new(command_id: CommandId, turn_id: TurnId, intent: PromptIntent) -> Self {
+        Self {
+            command_id,
+            turn_id,
+            intent,
+        }
+    }
+
+    pub(crate) const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    pub(crate) const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub(crate) fn into_parts(self) -> (CommandId, TurnId, PromptIntent) {
+        (self.command_id, self.turn_id, self.intent)
+    }
+}
+
+pub(crate) struct SteerQueue {
+    entries: BTreeMap<TurnId, VecDeque<QueuedSteer>>,
+    len: usize,
+}
+
+impl Default for SteerQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SteerQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn try_push(
+        &mut self,
+        turn_id: TurnId,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<(), SteerQueueError> {
+        if self
+            .entries
+            .values()
+            .flatten()
+            .any(|entry| entry.command_id() == command_id)
+        {
+            return Err(SteerQueueError::DuplicateCommandId);
+        }
+        if self
+            .entries
+            .get(&turn_id)
+            .is_some_and(|queue| queue.len() == STEER_QUEUE_CAPACITY)
+        {
+            return Err(SteerQueueError::Full);
+        }
+        self.entries
+            .entry(turn_id)
+            .or_default()
+            .push_back(QueuedSteer::new(command_id, turn_id, intent));
+        self.len += 1;
+        Ok(())
+    }
+
+    pub(crate) fn pop_front_for_turn(&mut self, turn_id: TurnId) -> Option<QueuedSteer> {
+        let queue = self.entries.get_mut(&turn_id)?;
+        let entry = queue.pop_front()?;
+        self.len -= 1;
+        if queue.is_empty() {
+            self.entries.remove(&turn_id);
+        }
+        Some(entry)
+    }
+
+    pub(crate) fn remove(&mut self, command_id: CommandId) -> Option<QueuedSteer> {
+        let turn_id = self.entries.iter().find_map(|(turn_id, queue)| {
+            queue
+                .iter()
+                .any(|entry| entry.command_id() == command_id)
+                .then_some(*turn_id)
+        })?;
+        let queue = self.entries.get_mut(&turn_id)?;
+        let index = queue
+            .iter()
+            .position(|entry| entry.command_id() == command_id)?;
+        let entry = queue.remove(index)?;
+        self.len -= 1;
+        if queue.is_empty() {
+            self.entries.remove(&turn_id);
+        }
+        Some(entry)
+    }
+
+    pub(crate) fn clear_for_turn(&mut self, turn_id: TurnId) -> Vec<QueuedSteer> {
+        let Some(queue) = self.entries.remove(&turn_id) else {
+            return Vec::new();
+        };
+        self.len -= queue.len();
+        queue.into_iter().collect()
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 impl Default for FollowUpQueue {
@@ -101,9 +230,12 @@ impl FollowUpQueue {
 #[cfg(test)]
 mod tests {
     use crate::prompt::{PromptBodyIntent, PromptIntent, TextIntent};
-    use crate::wire::CommandId;
+    use crate::wire::{CommandId, TurnId};
 
-    use super::{FOLLOW_UP_QUEUE_CAPACITY, FollowUpQueue, FollowUpQueueError};
+    use super::{
+        FOLLOW_UP_QUEUE_CAPACITY, FollowUpQueue, FollowUpQueueError, QueuedSteer,
+        STEER_QUEUE_CAPACITY, SteerQueue, SteerQueueError,
+    };
 
     fn intent(text: &str) -> PromptIntent {
         PromptIntent::new(
@@ -115,6 +247,10 @@ mod tests {
 
     fn command_id(value: u8) -> CommandId {
         format!("cmd_{value:032x}").parse().unwrap()
+    }
+
+    fn turn_id(value: u8) -> TurnId {
+        format!("trn_{value:032x}").parse().unwrap()
     }
 
     #[test]
@@ -153,6 +289,117 @@ mod tests {
         assert_eq!(
             queue.try_push(command_id(31), intent("overflow")),
             Err(FollowUpQueueError::Full)
+        );
+    }
+
+    #[test]
+    fn steer_queue_keeps_independent_turn_fifos_and_clears_one_turn() {
+        let mut queue = SteerQueue::new();
+        let first_turn = turn_id(1);
+        let second_turn = turn_id(2);
+        queue
+            .try_push(first_turn, command_id(1), intent("first one"))
+            .unwrap();
+        queue
+            .try_push(second_turn, command_id(2), intent("second one"))
+            .unwrap();
+        queue
+            .try_push(first_turn, command_id(3), intent("first two"))
+            .unwrap();
+
+        let (command, turn, _) = queue.pop_front_for_turn(first_turn).unwrap().into_parts();
+        assert_eq!(command, command_id(1));
+        assert_eq!(turn, first_turn);
+        assert_eq!(queue.len(), 2);
+
+        let cleared = queue.clear_for_turn(first_turn);
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].command_id(), command_id(3));
+        assert_eq!(queue.len(), 1);
+        assert_eq!(
+            queue.pop_front_for_turn(second_turn).unwrap().command_id(),
+            command_id(2)
+        );
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn steer_queue_rejects_duplicate_and_over_capacity_commands() {
+        let mut queue = SteerQueue::new();
+        let turn = turn_id(9);
+        queue
+            .try_push(turn, command_id(1), intent("first"))
+            .unwrap();
+        assert_eq!(
+            queue.try_push(turn_id(10), command_id(1), intent("duplicate")),
+            Err(SteerQueueError::DuplicateCommandId)
+        );
+        for value in 2..=u8::try_from(STEER_QUEUE_CAPACITY).unwrap() {
+            queue
+                .try_push(turn, command_id(value), intent("queued"))
+                .unwrap();
+        }
+        assert_eq!(queue.len(), STEER_QUEUE_CAPACITY);
+        assert_eq!(
+            queue.try_push(turn, command_id(31), intent("overflow")),
+            Err(SteerQueueError::Full)
+        );
+        let removed = queue.remove(command_id(4)).unwrap();
+        assert_eq!(removed.turn_id(), turn);
+        assert_eq!(queue.len(), STEER_QUEUE_CAPACITY - 1);
+
+        queue
+            .try_push(turn, command_id(32), intent("replacement"))
+            .unwrap();
+        assert_eq!(queue.len(), STEER_QUEUE_CAPACITY);
+        assert_eq!(
+            queue.pop_front_for_turn(turn).unwrap().command_id(),
+            command_id(1)
+        );
+        assert_eq!(
+            queue.pop_front_for_turn(turn).unwrap().command_id(),
+            command_id(2)
+        );
+        assert_eq!(
+            queue.pop_front_for_turn(turn).unwrap().command_id(),
+            command_id(3)
+        );
+        assert_eq!(
+            queue.pop_front_for_turn(turn).unwrap().command_id(),
+            command_id(5)
+        );
+
+        let cleared = queue.clear_for_turn(turn);
+        assert_eq!(
+            cleared
+                .iter()
+                .map(QueuedSteer::command_id)
+                .collect::<Vec<_>>(),
+            vec![command_id(6), command_id(7), command_id(8), command_id(32)]
+        );
+        assert!(queue.is_empty());
+        assert!(queue.clear_for_turn(turn).is_empty());
+    }
+
+    #[test]
+    fn steer_queue_capacity_is_independent_per_turn() {
+        let mut queue = SteerQueue::new();
+        let first_turn = turn_id(11);
+        let second_turn = turn_id(12);
+
+        for value in 1..=u8::try_from(STEER_QUEUE_CAPACITY).unwrap() {
+            queue
+                .try_push(first_turn, command_id(value), intent("first turn"))
+                .unwrap();
+        }
+        assert_eq!(queue.len(), STEER_QUEUE_CAPACITY);
+        queue
+            .try_push(second_turn, command_id(31), intent("second turn"))
+            .unwrap();
+        assert_eq!(queue.len(), STEER_QUEUE_CAPACITY + 1);
+        assert_eq!(
+            queue.try_push(first_turn, command_id(32), intent("first turn overflow"),),
+            Err(SteerQueueError::Full)
         );
     }
 }
