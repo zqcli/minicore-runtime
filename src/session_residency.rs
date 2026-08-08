@@ -37,6 +37,7 @@ use crate::durable_state::{
     DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
     DurableSessionLifecycleError, DurableSessionLifecycleOutcome, DurableState,
 };
+use crate::prompt::{PromptError, PromptErrorKind, PromptService};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
     LoadedSessionConversation, SessionExecutor, SessionExecutorCloseError, SessionExecutorSnapshot,
@@ -693,6 +694,7 @@ struct OperationContext {
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
+    prompt_service: Arc<PromptService>,
     closing: CancellationToken,
     failure: Arc<RegistryFailureState>,
     #[cfg(test)]
@@ -993,6 +995,7 @@ struct SessionResidencyActor {
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
+    prompt_service: Arc<PromptService>,
     state: Arc<ResidencyShared>,
     failure: Arc<RegistryFailureState>,
     active_waiters: Arc<ActiveWaiters>,
@@ -1050,6 +1053,7 @@ impl SessionResidencyActor {
             task_context: self.task_context.clone(),
             durable_state: self.durable_state.clone(),
             resolver: Arc::clone(&self.resolver),
+            prompt_service: Arc::clone(&self.prompt_service),
             closing: self.closing.clone(),
             failure: Arc::clone(&self.failure),
             #[cfg(test)]
@@ -1461,6 +1465,7 @@ impl SessionResidencyRegistry {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
     ) -> Result<Self, SessionResidencyStartError> {
         let closing = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(SESSION_RESIDENCY_REQUEST_QUEUE_CAPACITY);
@@ -1476,6 +1481,7 @@ impl SessionResidencyRegistry {
             task_context: task_context.clone(),
             durable_state: durable_state.clone(),
             resolver,
+            prompt_service,
             state: Arc::clone(&shared),
             failure: Arc::clone(&failure),
             active_waiters: Arc::clone(&active_waiters),
@@ -1845,46 +1851,24 @@ async fn run_load(
     if candidate.revision() != definition.workspace().revision() {
         return Err(context.internal_load());
     }
-    let prompt_context = candidate.prompt_capture_context();
     let skill_context = candidate.skill_capture_context();
-    if !prompt_context.roots().is_empty() || !skill_context.roots().is_empty() {
-        // Source discovery is intentionally fail-closed until the Prompt/Skill source adapters
-        // exist.  Never silently discard an authorized source root in production.
+    if !skill_context.roots().is_empty() {
+        // Skill source discovery remains fail-closed until SkillService owns its candidate path.
         return Err(context.internal_load());
     }
-    let prompt_sources = Arc::from(Vec::new().into_boxed_slice());
+    let prompt_context = candidate.prompt_capture_context();
+    let requires_revalidation = !prompt_context.roots().is_empty();
+    let capture = context
+        .prompt_service
+        .capture_workspace_sources(prompt_context);
+    tokio::pin!(capture);
+    let prompt_sources = tokio::select! {
+        biased;
+        _ = context.closing.cancelled() => return Err(SessionResidencyLoadError::Closing),
+        result = &mut capture => result,
+    }
+    .map_err(|error| map_prompt_load_error(&context, error))?;
     let skill_sources = Arc::from(Vec::new().into_boxed_slice());
-    let workspace_snapshot = match candidate.finish(prompt_sources, skill_sources) {
-        Ok(snapshot) => snapshot,
-        Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
-            return Err(context.internal_load());
-        }
-    };
-
-    let final_current = match context.durable_state.session_current(session_id) {
-        Some(current) => current,
-        None => return Err(context.internal_load()),
-    };
-    let final_head = final_current.head();
-    let final_definition = final_current.definition();
-    if !valid_current_shape(session_id, final_head, final_definition) {
-        return Err(context.internal_load());
-    }
-    match final_head.lifecycle() {
-        SessionLifecycle::Open => {}
-        SessionLifecycle::Archived => return Err(SessionResidencyLoadError::SessionArchived),
-        SessionLifecycle::Deleted => return Err(SessionResidencyLoadError::SessionDeleted),
-    }
-    if final_definition.revision() != definition.revision() {
-        return Err(SessionResidencyLoadError::StaleDefinition);
-    }
-    if final_definition.as_ref() != definition.as_ref() {
-        return Err(context.internal_load());
-    }
-
-    if context.closing.is_cancelled() {
-        return Err(SessionResidencyLoadError::Closing);
-    }
 
     let target = context
         .durable_state
@@ -1903,6 +1887,82 @@ async fn run_load(
     let loaded_conversation = load_replayed_conversation(target, context.task_context.clone())
         .await
         .map_err(|error| map_conversation_load_error(&context, error))?;
+    let workspace_snapshot = async {
+        if requires_revalidation {
+            let revalidation_result = {
+                let revalidation = context
+                    .resolver
+                    .revalidate_candidate(&candidate, definition.workspace());
+                tokio::pin!(revalidation);
+                tokio::select! {
+                    biased;
+                    _ = context.closing.cancelled() => {
+                        return Err(SessionResidencyLoadError::Closing);
+                    }
+                    result = &mut revalidation => result,
+                }
+            };
+            match revalidation_result {
+                Ok(true) => {}
+                Ok(false) => return Err(SessionResidencyLoadError::WorkspaceUnavailable),
+                Err(WorkspaceResolveError::Closing) => {
+                    return Err(SessionResidencyLoadError::Closing);
+                }
+                Err(
+                    WorkspaceResolveError::RootUnavailable
+                    | WorkspaceResolveError::AuthorityUnavailable
+                    | WorkspaceResolveError::CanonicalizationFailed,
+                ) => return Err(SessionResidencyLoadError::WorkspaceUnavailable),
+                Err(
+                    WorkspaceResolveError::RootNotDirectory
+                    | WorkspaceResolveError::DuplicateRoot
+                    | WorkspaceResolveError::OverlappingRoots
+                    | WorkspaceResolveError::CwdOutsideRoots
+                    | WorkspaceResolveError::CwdRootMismatch
+                    | WorkspaceResolveError::AuthorityDenied,
+                ) => return Err(SessionResidencyLoadError::WorkspaceRejected),
+                Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
+                    return Err(context.internal_load());
+                }
+            }
+        }
+        let workspace_snapshot = candidate.finish(prompt_sources, skill_sources).map_err(
+            |WorkspaceSnapshotFinishError::AuthorizationMismatch| context.internal_load(),
+        )?;
+
+        let final_current = context
+            .durable_state
+            .session_current(session_id)
+            .ok_or_else(|| context.internal_load())?;
+        let final_head = final_current.head();
+        let final_definition = final_current.definition();
+        if !valid_current_shape(session_id, final_head, final_definition) {
+            return Err(context.internal_load());
+        }
+        match final_head.lifecycle() {
+            SessionLifecycle::Open => {}
+            SessionLifecycle::Archived => return Err(SessionResidencyLoadError::SessionArchived),
+            SessionLifecycle::Deleted => return Err(SessionResidencyLoadError::SessionDeleted),
+        }
+        if final_definition.revision() != definition.revision() {
+            return Err(SessionResidencyLoadError::StaleDefinition);
+        }
+        if final_definition.as_ref() != definition.as_ref() {
+            return Err(context.internal_load());
+        }
+        if context.closing.is_cancelled() {
+            return Err(SessionResidencyLoadError::Closing);
+        }
+        Ok(workspace_snapshot)
+    }
+    .await;
+    let workspace_snapshot = match workspace_snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            loaded_conversation.recorder.close().await;
+            return Err(error);
+        }
+    };
     let recorder = loaded_conversation.recorder;
     let live_state = loaded_conversation.live_state;
     let replay_diagnostics = loaded_conversation.diagnostics;
@@ -1916,6 +1976,7 @@ async fn run_load(
         context.task_context.clone(),
         context.durable_state.clone(),
         Arc::clone(&context.resolver),
+        Arc::clone(&context.prompt_service),
         definition,
         workspace_snapshot,
         conversation,
@@ -1960,6 +2021,23 @@ async fn run_load(
                 Err(SessionResidencyLoadError::Closing)
             }
         }
+    }
+}
+
+fn map_prompt_load_error(
+    context: &OperationContext,
+    error: PromptError,
+) -> SessionResidencyLoadError {
+    match error.kind() {
+        PromptErrorKind::SourceDiscovery => SessionResidencyLoadError::WorkspaceUnavailable,
+        PromptErrorKind::ContentLoad | PromptErrorKind::DuplicateKey => {
+            SessionResidencyLoadError::WorkspaceRejected
+        }
+        PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::RequiredPromptMissing
+        | PromptErrorKind::InvalidIntent
+        | PromptErrorKind::InvalidContribution => context.internal_load(),
     }
 }
 
@@ -2065,7 +2143,12 @@ async fn run_workspace_definition(
     let _permit = SessionResidencyOperationPermit::acquire(gate).await;
     if let Some(executor) = context.state.executor(session_id) {
         return match executor
-            .update_workspace_definition(expected_revision, workspace, owner_timestamp)
+            .update_workspace_definition_with_cancellation(
+                expected_revision,
+                workspace,
+                owner_timestamp,
+                context.closing.clone(),
+            )
             .await
         {
             Ok(outcome) => Ok(outcome),
@@ -2302,7 +2385,7 @@ mod tests {
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use tokio::runtime::Handle;
 
@@ -2311,6 +2394,10 @@ mod tests {
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier};
     use crate::durable_state::DurableState;
+    use crate::prompt::{
+        PromptSourceError, WorkspacePromptSource, WorkspacePromptSourceAdapter,
+        WorkspacePromptSourceFuture,
+    };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
@@ -2324,6 +2411,94 @@ mod tests {
     const G1: &str = "00000000000000000001";
 
     static NEXT_TEST_ROOT: AtomicUsize = AtomicUsize::new(1);
+
+    struct MutableWorkspacePromptSource {
+        result: Mutex<Result<Vec<WorkspacePromptSource>, PromptSourceError>>,
+        calls: AtomicUsize,
+        block_next: AtomicBool,
+        entered: AtomicBool,
+        released: AtomicBool,
+        entered_changed: Notify,
+    }
+
+    impl MutableWorkspacePromptSource {
+        fn unavailable() -> Self {
+            Self {
+                result: Mutex::new(Err(PromptSourceError::Unavailable)),
+                calls: AtomicUsize::new(0),
+                block_next: AtomicBool::new(false),
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                entered_changed: Notify::new(),
+            }
+        }
+
+        fn replace(&self, content: &str) {
+            let source = WorkspacePromptSource::new(
+                "repo".parse().unwrap(),
+                "AGENTS.md".parse().unwrap(),
+                Arc::from(content),
+            );
+            *lock(&self.result) = Ok(vec![source]);
+        }
+
+        fn fail(&self) {
+            *lock(&self.result) = Err(PromptSourceError::Unavailable);
+        }
+
+        fn block_next(&self) {
+            self.entered.store(false, Ordering::Release);
+            self.released.store(false, Ordering::Release);
+            self.block_next.store(true, Ordering::Release);
+        }
+
+        async fn wait_until_entered(&self) {
+            loop {
+                let notified = self.entered_changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn release_blocked(&self) {
+            self.released.store(true, Ordering::Release);
+            self.entered_changed.notify_waiters();
+        }
+    }
+
+    impl WorkspacePromptSourceAdapter for MutableWorkspacePromptSource {
+        fn capture<'a>(
+            &'a self,
+            _context: &'a crate::workspace::WorkspacePromptCaptureContext,
+        ) -> WorkspacePromptSourceFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = lock(&self.result).clone();
+            Box::pin(async move {
+                if self.block_next.swap(false, Ordering::AcqRel) {
+                    self.entered.store(true, Ordering::Release);
+                    self.entered_changed.notify_waiters();
+                    loop {
+                        let notified = self.entered_changed.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        if self.released.load(Ordering::Acquire) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                }
+                result
+            })
+        }
+    }
 
     fn session_candidate(value: u128) -> SessionId {
         format!("ses_{value:032x}")
@@ -2582,8 +2757,16 @@ mod tests {
     ) -> (RuntimeTaskContext, DurableState, SessionResidencyRegistry) {
         let (context, state) = open_state(&store.root).await;
         let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
-        let registry = SessionResidencyRegistry::start(context.clone(), state.clone(), resolver)
-            .expect("the residency actor starts");
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
         (context, state, registry)
     }
 
@@ -2629,6 +2812,322 @@ mod tests {
             Err(SessionResidencyLoadError::InternalDispatchUnavailable)
         ));
         registry.close().await;
+        state.close().await;
+        assert_eq!(context.registered_task_count_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_and_loaded_workspace_publication_capture_prompt_sources() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
+            context.clone(),
+            true,
+            false,
+        ));
+        let source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let _resources = prompt_service.initialize().await.unwrap();
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Err(SessionResidencyLoadError::WorkspaceUnavailable)
+        );
+        assert_eq!(source.call_count(), 1);
+        assert_eq!(registry.loaded_count_for_test(), 0);
+
+        source.replace("");
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Err(SessionResidencyLoadError::WorkspaceRejected)
+        );
+        assert_eq!(registry.loaded_count_for_test(), 0);
+
+        source.replace("first project prompt");
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        let first = registry.snapshot(session_id).await.unwrap();
+        let first_prompt = first.workspace().prompt_context();
+        assert_eq!(first_prompt.sources().len(), 1);
+        assert_eq!(first_prompt.sources()[0].content(), "first project prompt");
+        assert_eq!(
+            first_prompt.sources()[0].relative_location().as_str(),
+            "AGENTS.md"
+        );
+
+        source.fail();
+        assert_eq!(
+            registry
+                .update_workspace_definition(
+                    session_id,
+                    first.definition_revision(),
+                    changed_workspace(&store.new_workspace),
+                    "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                )
+                .await,
+            Err(SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable)
+        );
+        let unchanged = registry.snapshot(session_id).await.unwrap();
+        let unchanged_prompt = unchanged.workspace().prompt_context();
+        assert_eq!(unchanged.definition_revision().get(), 1);
+        assert_eq!(
+            unchanged_prompt.sources()[0].content(),
+            "first project prompt"
+        );
+
+        source.replace("second project prompt");
+        let outcome = registry
+            .update_workspace_definition(
+                session_id,
+                first.definition_revision(),
+                changed_workspace(&store.new_workspace),
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+            )
+            .await
+            .expect("the loaded Workspace publication captures its Prompt candidate");
+        assert!(outcome.changed());
+        let second = registry.snapshot(session_id).await.unwrap();
+        let second_prompt = second.workspace().prompt_context();
+        assert_eq!(second_prompt.sources().len(), 1);
+        assert_eq!(
+            second_prompt.sources()[0].content(),
+            "second project prompt"
+        );
+        assert_eq!(source.call_count(), 5);
+
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn load_revalidates_prompt_authority_after_replay_before_install() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let prompt_grant = Arc::new(AtomicBool::new(true));
+        let resolver = Arc::new(WorkspaceResolver::new_with_mutable_prompt_grant_for_test(
+            context.clone(),
+            Arc::clone(&prompt_grant),
+        ));
+        let source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        source.replace("captured project prompt");
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let barrier = ReplayPreparationBarrier::new();
+        barrier.arm_before_recorder();
+        registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        tokio::select! {
+            _ = barrier.wait_until_before_recorder() => {}
+            result = &mut load => {
+                panic!("Load settled before replay preparation paused: {result:?}")
+            }
+        }
+        prompt_grant.store(false, Ordering::Release);
+        barrier.release_before_recorder();
+
+        assert_eq!(
+            load.await,
+            Err(SessionResidencyLoadError::WorkspaceUnavailable)
+        );
+        assert_eq!(source.call_count(), 1);
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_publication_rejects_changed_prompt_authority_and_keeps_old_snapshot() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let prompt_grant = Arc::new(AtomicBool::new(true));
+        let resolver = Arc::new(WorkspaceResolver::new_with_mutable_prompt_grant_for_test(
+            context.clone(),
+            Arc::clone(&prompt_grant),
+        ));
+        let source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        source.replace("first project prompt");
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        registry.load_ready_idle(session_id).await.unwrap();
+        let first = registry.snapshot(session_id).await.unwrap();
+
+        source.replace("replacement project prompt");
+        source.block_next();
+        let mut update = Box::pin(registry.update_workspace_definition(
+            session_id,
+            first.definition_revision(),
+            changed_workspace(&store.new_workspace),
+            "2026-08-03T10:02:00.000Z".parse().unwrap(),
+        ));
+        tokio::select! {
+            _ = source.wait_until_entered() => {}
+            result = &mut update => {
+                panic!("Workspace publication settled before Prompt capture paused: {result:?}")
+            }
+        }
+        prompt_grant.store(false, Ordering::Release);
+        source.release_blocked();
+
+        assert_eq!(
+            update.await,
+            Err(SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable)
+        );
+        let unchanged = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(unchanged.definition_revision().get(), 1);
+        assert_eq!(
+            unchanged.workspace().prompt_context().sources()[0].content(),
+            "first project prompt"
+        );
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_closing_cancels_blocked_workspace_prompt_capture() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
+            context.clone(),
+            true,
+            false,
+        ));
+        let source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        source.replace("blocked project prompt");
+        source.block_next();
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            Arc::clone(&resolver),
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        let mut load = Box::pin(registry.load_ready_idle(session_id));
+        tokio::select! {
+            _ = source.wait_until_entered() => {}
+            result = &mut load => panic!("Load settled before Prompt capture blocked: {result:?}"),
+        }
+        registry.close().await;
+        assert_eq!(load.await, Err(SessionResidencyLoadError::Closing));
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        state.close().await;
+        assert_eq!(context.registered_task_count_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_closing_cancels_blocked_workspace_prompt_publication() {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
+            context.clone(),
+            true,
+            false,
+        ));
+        let source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        source.replace("first project prompt");
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        registry.load_ready_idle(session_id).await.unwrap();
+        let first = registry.snapshot(session_id).await.unwrap();
+
+        source.replace("blocked replacement prompt");
+        source.block_next();
+        let mut update = Box::pin(registry.update_workspace_definition(
+            session_id,
+            first.definition_revision(),
+            changed_workspace(&store.new_workspace),
+            "2026-08-03T10:02:00.000Z".parse().unwrap(),
+        ));
+        tokio::select! {
+            _ = source.wait_until_entered() => {}
+            result = &mut update => {
+                panic!("Workspace publication settled before Prompt capture blocked: {result:?}")
+            }
+        }
+        registry.close().await;
+        assert_eq!(
+            update.await,
+            Err(SessionResidencyWorkspaceDefinitionError::Closing)
+        );
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
         state.close().await;
         assert_eq!(context.registered_task_count_for_test(), 0);
     }
@@ -2873,9 +3372,16 @@ mod tests {
                     .expect("the archived fixture deletes");
             }
             let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
-            let registry =
-                SessionResidencyRegistry::start(context.clone(), state.clone(), resolver)
-                    .expect("the residency actor starts");
+            let prompt_service = Arc::new(
+                PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+            );
+            let registry = SessionResidencyRegistry::start(
+                context.clone(),
+                state.clone(),
+                resolver,
+                prompt_service,
+            )
+            .expect("the residency actor starts");
             assert_eq!(
                 registry.load_ready_idle(session_id).await,
                 Err(if delete {
@@ -3351,8 +3857,16 @@ mod tests {
         let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
         let hooks = resolver.test_hooks();
         hooks.arm_after_candidate_before_final_recheck();
-        let registry = SessionResidencyRegistry::start(context.clone(), state.clone(), resolver)
-            .expect("the residency actor starts");
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
         let baseline = context.registered_task_count_for_test();
 
         let mut load = Box::pin(registry.load_ready_idle(session_id));

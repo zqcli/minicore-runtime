@@ -1103,6 +1103,39 @@ impl WorkspaceAuthority for RestrictedWorkspaceAuthority {
     }
 }
 
+#[cfg(test)]
+struct SourceGrantWorkspaceAuthority {
+    prompt: Arc<AtomicBool>,
+    skill: bool,
+}
+
+#[cfg(test)]
+impl WorkspaceAuthority for SourceGrantWorkspaceAuthority {
+    fn authorize(&self, request: WorkspaceAuthorityRequest) -> WorkspaceAuthorityFuture {
+        let prompt = self.prompt.load(Ordering::Acquire);
+        let skill = self.skill;
+        Box::pin(async move {
+            let revision = WorkspaceTrustRevision::new(
+                NonZeroU64::new(1).expect("the test authority revision is non-zero"),
+            );
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        WorkspaceRootTrust::new(WorkspaceTrustLevel::Trusted, revision),
+                        requested_filesystem_grant(root.requested_access),
+                        prompt,
+                        skill,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum WorkspaceResolveError {
     #[error("workspace resolution is closing")]
@@ -1340,6 +1373,37 @@ impl WorkspaceResolver {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_with_source_grants_for_test(
+        task_context: RuntimeTaskContext,
+        prompt: bool,
+        skill: bool,
+    ) -> Self {
+        Self::new_with_adapters(
+            task_context,
+            Arc::new(LocalWorkspacePathAdapter),
+            Arc::new(SourceGrantWorkspaceAuthority {
+                prompt: Arc::new(AtomicBool::new(prompt)),
+                skill,
+            }),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_mutable_prompt_grant_for_test(
+        task_context: RuntimeTaskContext,
+        prompt: Arc<AtomicBool>,
+    ) -> Self {
+        Self::new_with_adapters(
+            task_context,
+            Arc::new(LocalWorkspacePathAdapter),
+            Arc::new(SourceGrantWorkspaceAuthority {
+                prompt,
+                skill: false,
+            }),
+        )
+    }
+
     fn new_with_adapters(
         task_context: RuntimeTaskContext,
         paths: Arc<dyn WorkspacePathAdapter>,
@@ -1436,6 +1500,15 @@ impl WorkspaceResolver {
         self.hooks.inner.after_candidate.wait_if_armed().await;
 
         Ok(candidate)
+    }
+
+    pub(crate) async fn revalidate_candidate(
+        &self,
+        candidate: &WorkspaceSnapshotCandidate,
+        workspace: &Workspace,
+    ) -> Result<bool, WorkspaceResolveError> {
+        let fresh = self.resolve(candidate.session_id, workspace).await?;
+        Ok(candidate.has_same_resolution_as(&fresh))
     }
 }
 
@@ -1886,6 +1959,13 @@ impl WorkspaceSnapshotCandidate {
         self.revision
     }
 
+    fn has_same_resolution_as(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.revision == other.revision
+            && self.roots == other.roots
+            && self.cwd == other.cwd
+    }
+
     pub(crate) fn prompt_capture_context(&self) -> WorkspacePromptCaptureContext {
         let roots = self
             .roots
@@ -2185,7 +2265,7 @@ mod tests {
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -2275,6 +2355,32 @@ mod tests {
                 .get(path)
                 .cloned()
                 .unwrap_or_else(|| Ok(CanonicalWorkspacePath::new(path.to_path_buf())))
+        }
+    }
+
+    struct ChangingCanonicalWorkspacePathAdapter {
+        calls: AtomicUsize,
+    }
+
+    impl ChangingCanonicalWorkspacePathAdapter {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl WorkspacePathAdapter for ChangingCanonicalWorkspacePathAdapter {
+        fn canonicalize_directory(
+            &self,
+            _path: &Path,
+        ) -> Result<CanonicalWorkspacePath, WorkspacePathError> {
+            let path = if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                "/deterministic/first"
+            } else {
+                "/deterministic/second"
+            };
+            Ok(CanonicalWorkspacePath::new(PathBuf::from(path)))
         }
     }
 
@@ -3257,6 +3363,85 @@ mod tests {
         assert!(!error_text.contains("instructions.md"));
         assert!(!error_text.contains("private prompt body"));
         assert!(!error_text.contains("/deterministic/primary"));
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_revalidation_detects_changed_authority_facts() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/deterministic/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_authority = Arc::clone(&calls);
+        let authority = Arc::new(DeterministicWorkspaceAuthority::new(move |request| {
+            let prompt = calls_for_authority.fetch_add(1, Ordering::SeqCst) == 0;
+            let roots = request
+                .roots()
+                .iter()
+                .map(|root| {
+                    WorkspaceAuthorityRootDecision::new(
+                        root.clone(),
+                        trust(),
+                        WorkspaceFilesystemGrant::ReadWrite,
+                        prompt,
+                        false,
+                    )
+                })
+                .collect();
+            Ok(WorkspaceAuthorityDecision::new(roots))
+        }));
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            DeterministicWorkspacePathAdapter::identity(),
+            authority,
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert_eq!(candidate.prompt_capture_context().roots().len(), 1);
+        assert!(
+            !resolver
+                .revalidate_candidate(&candidate, &workspace)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task_context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn candidate_revalidation_detects_changed_canonical_paths() {
+        let workspace = resolver_workspace(
+            (
+                "primary",
+                "/declared/primary",
+                RequestedFilesystemAccess::ReadWrite,
+                WorkspaceSourcePolicy::new(true, false),
+            ),
+            Vec::new(),
+            "primary",
+            "",
+        );
+        let task_context = initialized_context().await;
+        let resolver = resolver_with_adapters(
+            task_context.clone(),
+            ChangingCanonicalWorkspacePathAdapter::new(),
+            authority_with_ceiling(WorkspaceFilesystemGrant::ReadWrite, true, false),
+        );
+        let candidate = resolver.resolve(session_id(), &workspace).await.unwrap();
+        assert!(
+            !resolver
+                .revalidate_candidate(&candidate, &workspace)
+                .await
+                .unwrap()
+        );
         task_context.shutdown().await;
     }
 

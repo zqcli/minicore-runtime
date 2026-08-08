@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::SealedSessionLifecycleAttempt;
 use crate::durable_state::{DurableOpenError, DurableState};
+use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_task::RuntimeTaskContext;
 use crate::session_execution::{SessionExecutorSnapshot, SessionWorkspaceDefinitionOutcome};
 use crate::session_residency::{
@@ -18,6 +19,8 @@ use crate::session_residency::{
 };
 use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp};
 use crate::workspace::{Workspace, WorkspaceResolver};
+
+const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's request.";
 
 /// Host configuration for a MiniCore runtime instance.
 #[non_exhaustive]
@@ -89,6 +92,25 @@ impl MiniCoreRuntime {
         let task_context = RuntimeTaskContext::new(handle)
             .await
             .map_err(|_| RuntimeInitializationError::RuntimeDependencyUnavailable)?;
+        let prompt_service = match PromptService::new(
+            Arc::from(DEFAULT_RUNTIME_REQUIRED_POLICY),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ) {
+            Ok(service) => Arc::new(service),
+            Err(_) => {
+                task_context.shutdown().await;
+                return Err(RuntimeInitializationError::RuntimeDependencyUnavailable);
+            }
+        };
+        let prompt_resources = match prompt_service.initialize().await {
+            Ok(resources) => resources,
+            Err(_) => {
+                task_context.shutdown().await;
+                return Err(RuntimeInitializationError::RuntimeDependencyUnavailable);
+            }
+        };
         let durable_state =
             match DurableState::open(config.durable_root, task_context.clone()).await {
                 Ok(durable_state) => durable_state,
@@ -103,6 +125,7 @@ impl MiniCoreRuntime {
             task_context.clone(),
             durable_state.clone(),
             resolver,
+            Arc::clone(&prompt_service),
         ) {
             Ok(session_residency) => Arc::new(session_residency),
             Err(error) => {
@@ -120,6 +143,8 @@ impl MiniCoreRuntime {
             task_context,
             durable_state,
             session_residency,
+            prompt_service,
+            prompt_resources,
         ));
         inner.retain_until_shutdown();
         Ok(Self { inner })
@@ -159,6 +184,16 @@ impl From<DurableOpenError> for RuntimeInitializationError {
 
 struct RuntimeInner {
     task_context: RuntimeTaskContext,
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent Turn capture slice consumes the Runtime owner"
+    )]
+    prompt_service: Arc<PromptService>,
+    #[allow(
+        dead_code,
+        reason = "the immediately adjacent shared-resource capture slice consumes this root"
+    )]
+    prompt_resources: Arc<PromptResourceView>,
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
@@ -171,9 +206,13 @@ impl RuntimeInner {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         session_residency: Arc<SessionResidencyRegistry>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
     ) -> Self {
         Self {
             task_context,
+            prompt_service,
+            prompt_resources,
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
@@ -186,6 +225,11 @@ impl RuntimeInner {
     // awaited shutdown has drained the owner. Explicit shutdown breaks this retention.
     fn retain_until_shutdown(self: &Arc<Self>) {
         *lock(&self.retained_until_shutdown) = Some(Arc::clone(self));
+    }
+
+    #[cfg(test)]
+    fn prompt_resources(&self) -> (&Arc<PromptService>, &Arc<PromptResourceView>) {
+        (&self.prompt_service, &self.prompt_resources)
     }
 
     fn request_closing(&self) {
@@ -681,6 +725,16 @@ mod tests {
         )
         .await
         .expect("the runtime opens");
+        let (prompt_service, prompt_resources) = runtime.inner.prompt_resources();
+        assert_eq!(prompt_resources.definition_count(), 0);
+        assert_eq!(
+            prompt_service
+                .build_reload_candidate()
+                .await
+                .expect("the empty shared Prompt candidate rebuilds")
+                .definition_count(),
+            0
+        );
         let session_id = create_runtime_session(&runtime, workspace.path()).await;
 
         assert_eq!(
