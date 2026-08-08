@@ -1954,6 +1954,10 @@ impl ModelCallError {
     pub(crate) const fn delivery(&self) -> ProviderRequestDeliveryState {
         self.delivery
     }
+
+    pub(crate) const fn cancelled() -> Self {
+        Self::new(ModelCallErrorReason::Cancelled)
+    }
 }
 
 impl fmt::Debug for ModelCallError {

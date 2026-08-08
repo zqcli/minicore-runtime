@@ -2209,21 +2209,24 @@ async fn run_load(
         replay_diagnostics,
     );
     let executor_result = match context.turn_resources.as_ref() {
-        Some(resources) => SessionExecutor::start_loaded_ready_idle_with_turn_resources(
-            SessionExecutorDependencies::with_turn_resources_and_tools(
-                context.task_context.clone(),
-                context.durable_state.clone(),
-                Arc::clone(&context.resolver),
-                Arc::clone(&context.prompt_service),
-                Arc::clone(&resources.prompt_resources),
-                Arc::clone(&resources.model_gateway),
-                Arc::clone(&resources.model_catalog),
-                Arc::clone(&resources.tool_set),
-            ),
-            definition,
-            workspace_snapshot,
-            conversation,
-        ),
+        Some(resources) => {
+            SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
+                SessionExecutorDependencies::with_turn_resources_and_tools(
+                    context.task_context.clone(),
+                    context.durable_state.clone(),
+                    Arc::clone(&context.resolver),
+                    Arc::clone(&context.prompt_service),
+                    Arc::clone(&resources.prompt_resources),
+                    Arc::clone(&resources.model_gateway),
+                    Arc::clone(&resources.model_catalog),
+                    Arc::clone(&resources.tool_set),
+                ),
+                definition,
+                workspace_snapshot,
+                conversation,
+                context.closing.clone(),
+            )
+        }
         None => {
             #[cfg(test)]
             {

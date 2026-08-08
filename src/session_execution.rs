@@ -606,7 +606,15 @@ pub(crate) struct LoadedSessionConversation {
     live_state: Arc<Mutex<LiveSessionState>>,
     recorder: Arc<SessionRecorder>,
     replay_diagnostics: ConversationReplayDiagnostics,
+    active_control_generation: ActiveControlGeneration,
 }
+
+/// Process-local identity for the control owner of one active Turn.  The worker keeps the exact
+/// identity it was admitted with and compares it against the actor-owned current identity before
+/// every logical retry.
+struct ControlGeneration(u8);
+
+type ActiveControlGeneration = Arc<Mutex<Option<(TurnId, Arc<ControlGeneration>)>>>;
 
 impl LoadedSessionConversation {
     pub(crate) fn from_replay(
@@ -618,6 +626,42 @@ impl LoadedSessionConversation {
             live_state: Arc::new(Mutex::new(live_state)),
             recorder: Arc::new(recorder),
             replay_diagnostics,
+            active_control_generation: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn install_control_generation(&self, turn_id: TurnId, generation: Arc<ControlGeneration>) {
+        *lock(&self.active_control_generation) = Some((turn_id, generation));
+    }
+
+    fn clear_control_generation(&self, turn_id: TurnId, generation: &Arc<ControlGeneration>) {
+        let mut current = lock(&self.active_control_generation);
+        if current
+            .as_ref()
+            .is_some_and(|(current_turn, current_generation)| {
+                *current_turn == turn_id && Arc::ptr_eq(current_generation, generation)
+            })
+        {
+            *current = None;
+        }
+    }
+
+    fn has_control_generation(&self, turn_id: TurnId, generation: &Arc<ControlGeneration>) -> bool {
+        lock(&self.active_control_generation).as_ref().is_some_and(
+            |(current_turn, current_generation)| {
+                *current_turn == turn_id && Arc::ptr_eq(current_generation, generation)
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn invalidate_control_generation_for_test(&self, turn_id: TurnId) {
+        let mut current = lock(&self.active_control_generation);
+        if current
+            .as_ref()
+            .is_some_and(|(current_turn, _)| *current_turn == turn_id)
+        {
+            *current = None;
         }
     }
 }
@@ -665,20 +709,39 @@ impl SessionExecutor {
             definition,
             workspace,
             Some(Arc::new(conversation)),
+            CancellationToken::new(),
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn start_loaded_ready_idle_with_turn_resources(
         dependencies: SessionExecutorDependencies,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
         conversation: LoadedSessionConversation,
     ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
+            dependencies,
+            definition,
+            workspace,
+            conversation,
+            CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn start_loaded_ready_idle_with_turn_resources_and_lifecycle(
+        dependencies: SessionExecutorDependencies,
+        definition: Arc<SessionDefinition>,
+        workspace: Arc<WorkspaceSnapshot>,
+        conversation: LoadedSessionConversation,
+        lifecycle_closing: CancellationToken,
+    ) -> Result<Self, SessionExecutorStartError> {
         Self::start_loaded_ready_idle_inner(
             dependencies,
             definition,
             workspace,
             Some(Arc::new(conversation)),
+            lifecycle_closing,
         )
     }
 
@@ -701,6 +764,7 @@ impl SessionExecutor {
             definition,
             workspace,
             None,
+            CancellationToken::new(),
         )
     }
 
@@ -709,6 +773,7 @@ impl SessionExecutor {
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
         conversation: Option<Arc<LoadedSessionConversation>>,
+        lifecycle_closing: CancellationToken,
     ) -> Result<Self, SessionExecutorStartError> {
         let SessionExecutorDependencies {
             task_context,
@@ -743,6 +808,7 @@ impl SessionExecutor {
             completions: completion_receiver,
             completion_sender,
             closing: closing.clone(),
+            lifecycle_closing,
             task_context: task_context.clone(),
             durable_state: durable_state.clone(),
             resolver,
@@ -1189,6 +1255,33 @@ impl SessionExecutor {
     }
 
     #[cfg(test)]
+    pub(crate) fn invalidate_control_generation_for_test(&self, turn_id: TurnId) {
+        if let Some(conversation) = &self.conversation {
+            conversation.invalidate_control_generation_for_test(turn_id);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retry_basis_matches_for_test(
+        &self,
+        turn_id: TurnId,
+        source_revision: crate::live_conversation::ConversationRevision,
+    ) -> Option<bool> {
+        let conversation = self.conversation.as_ref()?;
+        let generation = lock(&conversation.active_control_generation)
+            .as_ref()
+            .and_then(|(current_turn, generation)| {
+                (*current_turn == turn_id).then(|| Arc::clone(generation))
+            })?;
+        Some(retry_basis_is_current(
+            conversation,
+            turn_id,
+            &generation,
+            source_revision,
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn recorder_for_test(&self) -> Option<Arc<SessionRecorder>> {
         self.conversation
             .as_ref()
@@ -1240,6 +1333,7 @@ struct SessionExecutorActor {
     completions: mpsc::UnboundedReceiver<ExecutorCompletion>,
     completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     closing: CancellationToken,
+    lifecycle_closing: CancellationToken,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
@@ -1280,6 +1374,7 @@ struct ActiveAdmission {
 struct ActiveTurn {
     command_id: CommandId,
     turn_id: TurnId,
+    control_generation: Arc<ControlGeneration>,
     cancellation: CancellationToken,
     task: Option<TrackedTask>,
     steer_admission_open: bool,
@@ -1717,6 +1812,8 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         let cancellation = active.cancellation.clone();
+        let control_generation = Arc::new(ControlGeneration(0));
+        conversation.install_control_generation(active.turn_id, Arc::clone(&control_generation));
         self.execution_state = SessionExecutionState::Running;
         let current = Arc::new(self.current.with_execution(
             SessionExecutionState::Running,
@@ -1727,6 +1824,7 @@ impl SessionExecutorActor {
         self.active_turn = Some(ActiveTurn {
             command_id: active.command_id,
             turn_id: active.turn_id,
+            control_generation: Arc::clone(&control_generation),
             cancellation: cancellation.clone(),
             task: None,
             steer_admission_open: true,
@@ -1742,6 +1840,8 @@ impl SessionExecutorActor {
                 }));
         } else {
             let completion_sender = self.completion_sender.clone();
+            let executor_closing = self.closing.clone();
+            let lifecycle_closing = self.lifecycle_closing.clone();
             let guard = TurnCompletionGuard::new(completion_sender, turn_id);
             let interaction_completion_sender = self.completion_sender.clone();
             let steer_completion_sender = self.completion_sender.clone();
@@ -1754,7 +1854,10 @@ impl SessionExecutorActor {
                     resources.model_gateway,
                     conversation,
                     turn_id,
+                    control_generation,
                     cancellation,
+                    executor_closing,
+                    lifecycle_closing,
                     interaction_completion_sender,
                     steer_completion_sender,
                     #[cfg(test)]
@@ -2008,6 +2111,10 @@ impl SessionExecutorActor {
         if active.turn_id != completion.turn_id {
             return Err(ActorFatality::Internal);
         }
+        let Some(conversation) = self.conversation.as_ref().cloned() else {
+            return Err(ActorFatality::Integrity);
+        };
+        conversation.clear_control_generation(active.turn_id, &active.control_generation);
         let pending_before = self.pending_interactions.len();
         self.pending_interactions
             .retain(|_, interaction| interaction.turn_id != active.turn_id);
@@ -2015,9 +2122,6 @@ impl SessionExecutorActor {
             self.publish_pending_interactions()?;
         }
         self.steer.clear_for_turn(active.turn_id);
-        let Some(conversation) = self.conversation.as_ref() else {
-            return Err(ActorFatality::Integrity);
-        };
         let live_turn = lock(&conversation.live_state).current_turn();
         if live_turn == Some(active.turn_id) {
             lock(&conversation.live_state)
@@ -2640,19 +2744,19 @@ async fn run_admission(
     Ok(context)
 }
 
-#[cfg_attr(
-    test,
-    allow(
-        clippy::too_many_arguments,
-        reason = "test-only arbitration hooks keep the production execution seam unchanged"
-    )
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one ActiveTurn binds its immutable context, model, channels, and cancellation basis"
 )]
 async fn run_active_turn(
     context: Arc<TurnExecutionContext>,
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    control_generation: Arc<ControlGeneration>,
     cancellation: CancellationToken,
+    executor_closing: CancellationToken,
+    closing: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
@@ -2665,7 +2769,10 @@ async fn run_active_turn(
         model_gateway,
         Arc::clone(&conversation),
         turn_id,
+        control_generation,
         cancellation,
+        executor_closing,
+        closing,
         interaction_completion_sender,
         steer_completion_sender,
         #[cfg(test)]
@@ -2695,19 +2802,19 @@ async fn run_active_turn(
     }
 }
 
-#[cfg_attr(
-    test,
-    allow(
-        clippy::too_many_arguments,
-        reason = "test-only arbitration hooks keep the production execution seam unchanged"
-    )
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one ActiveTurn binds its immutable context, model, channels, and cancellation basis"
 )]
 async fn run_active_turn_inner(
     context: Arc<TurnExecutionContext>,
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    control_generation: Arc<ControlGeneration>,
     cancellation: CancellationToken,
+    executor_closing: CancellationToken,
+    closing: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
@@ -2735,7 +2842,12 @@ async fn run_active_turn_inner(
         let (result, logical_retry_count) = call_agent_run_with_logical_retry(
             &model_gateway,
             Arc::clone(&request),
+            &conversation,
+            turn_id,
+            Arc::clone(&control_generation),
             cancellation.clone(),
+            executor_closing.clone(),
+            closing.clone(),
         )
         .await
         .map_err(map_model_call_failure)?;
@@ -2981,13 +3093,33 @@ async fn run_active_turn_inner(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "retry policy receives the immutable call plus its owner-local cancellation basis"
+)]
 async fn call_agent_run_with_logical_retry(
     model_gateway: &ModelGateway,
     request: Arc<ModelCallRequest>,
+    conversation: &LoadedSessionConversation,
+    turn_id: TurnId,
+    control_generation: Arc<ControlGeneration>,
     cancellation: CancellationToken,
+    executor_closing: CancellationToken,
+    closing: CancellationToken,
 ) -> Result<(ModelCallResult, u8), ModelCallError> {
     let mut logical_retries = 0_u8;
     loop {
+        if cancellation.is_cancelled() || closing.is_cancelled() {
+            return Err(ModelCallError::cancelled());
+        }
+        if !retry_basis_is_current(
+            conversation,
+            turn_id,
+            &control_generation,
+            request.source_revision(),
+        ) {
+            return Err(ModelCallError::cancelled());
+        }
         let result = model_gateway
             .generate_model_turn(
                 Arc::clone(&request),
@@ -2996,21 +3128,67 @@ async fn call_agent_run_with_logical_retry(
             )
             .await;
         let error = match result {
-            Ok(result) => return Ok((result, logical_retries)),
+            Ok(result) => {
+                if cancellation.is_cancelled()
+                    || closing.is_cancelled()
+                    || !retry_basis_is_current(
+                        conversation,
+                        turn_id,
+                        &control_generation,
+                        request.source_revision(),
+                    )
+                {
+                    return Err(ModelCallError::cancelled());
+                }
+                return Ok((result, logical_retries));
+            }
             Err(error) => error,
         };
         let Some(delay) = agent_run_retry_delay(&error, usize::from(logical_retries)) else {
             return Err(error);
         };
+        if !retry_basis_is_current(
+            conversation,
+            turn_id,
+            &control_generation,
+            request.source_revision(),
+        ) {
+            return Err(error);
+        }
         logical_retries += 1;
         tokio::select! {
             biased;
+            _ = executor_closing.cancelled() => {
+                return Err(error);
+            }
+            _ = closing.cancelled() => {
+                return Err(error);
+            }
             _ = cancellation.cancelled() => {
                 return Err(error);
             }
             _ = tokio::time::sleep(delay) => {}
         }
     }
+}
+
+fn retry_basis_is_current(
+    conversation: &LoadedSessionConversation,
+    turn_id: TurnId,
+    control_generation: &Arc<ControlGeneration>,
+    source_revision: crate::live_conversation::ConversationRevision,
+) -> bool {
+    if !conversation.has_control_generation(turn_id, control_generation) {
+        return false;
+    }
+    let live_state = lock(&conversation.live_state);
+    if live_state.current_turn() != Some(turn_id) {
+        return false;
+    }
+    live_state
+        .capture_conversation_views()
+        .ok()
+        .is_some_and(|views| views.conversation().revision() == source_revision)
 }
 
 fn agent_run_retry_delay(
@@ -4379,6 +4557,7 @@ mod tests {
         state: DurableState,
         executor: SessionExecutor,
         definition: Arc<SessionDefinition>,
+        lifecycle_closing: CancellationToken,
     }
 
     fn set_private_directory_mode(path: &Path) {
@@ -4560,6 +4739,7 @@ mod tests {
             state,
             executor,
             definition,
+            lifecycle_closing: CancellationToken::new(),
         }
     }
 
@@ -4616,7 +4796,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+        let lifecycle_closing = CancellationToken::new();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
             SessionExecutorDependencies::with_turn_resources(
                 context.clone(),
                 state.clone(),
@@ -4633,6 +4814,7 @@ mod tests {
                 loaded.recorder,
                 loaded.diagnostics,
             ),
+            lifecycle_closing.clone(),
         )
         .unwrap();
         LoadedFixture {
@@ -4640,6 +4822,7 @@ mod tests {
             state,
             executor,
             definition,
+            lifecycle_closing,
         }
     }
 
@@ -4687,12 +4870,13 @@ mod tests {
     }
 
     async fn wait_for_request_count(model: &ScriptedModelFixture, expected: usize) {
-        loop {
+        for _ in 0..100_000 {
             if model.request_count() >= expected {
                 return;
             }
             tokio::task::yield_now().await;
         }
+        panic!("the scripted provider did not reach the expected attempt count");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5062,6 +5246,87 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stale_retry_basis_stops_before_the_next_attempt() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["must not run"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("stale retry").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        let revision = lock(&loaded.executor.live_state_for_test().unwrap())
+            .capture_conversation_views()
+            .unwrap()
+            .conversation()
+            .revision();
+        assert_eq!(
+            loaded
+                .executor
+                .retry_basis_matches_for_test(turn_id, revision),
+            Some(true)
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .retry_basis_matches_for_test(turn_id, revision.checked_next().unwrap()),
+            Some(false)
+        );
+        loaded
+            .executor
+            .invalidate_control_generation_for_test(turn_id);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn executor_lifecycle_close_interrupts_retry_backoff() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["must not run"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let _turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("close retry").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        loaded.lifecycle_closing.cancel();
+        assert!(loaded.executor.close().await.is_ok());
+        assert_eq!(model.request_count(), 1);
+        assert_eq!(loaded.executor.published_snapshot().current_turn(), None);
+        loaded.state.close().await;
+        let _ = loaded.context;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
