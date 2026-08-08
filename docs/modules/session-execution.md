@@ -1,13 +1,13 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip已接通ToolCall → ToolSet执行 → ordered ToolResult → 下一次Model → final Assistant；具体Prompt/Skill source adapter、完整Tool policy/approval、Interaction/Cancel、logical retry、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel与M9.1–M9.6 crate-private queue/Steer/arbitration/retry seams已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整Emergency/SecurityRevoked control lanes、public projections、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.5 已接通 AgentRun 的最小 delivery-safe logical retry（同一 `Arc<ModelCallRequest>`、最多 3 次、2/4/8 秒取消感知 backoff）；control-generation/emergency/lifecycle 全 basis 重验、retry progress/public projection 与 Compaction retry仍后置。
+当前实现进度：M9.6 已在 M9.5 的 AgentRun delivery-safe logical retry 上补齐最小 process-local control-generation、current Turn/`ConversationRevision` 与 executor lifecycle 重验（同一 `Arc<ModelCallRequest>`、最多 3 次、2/4/8 秒取消感知 backoff）；完整 SecurityRevoked/EmergencyControl、retry progress/public projection 与 Compaction retry仍后置。
 
 核心目标：
 
