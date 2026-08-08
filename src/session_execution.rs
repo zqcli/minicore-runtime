@@ -879,11 +879,13 @@ impl SessionExecutor {
         &self,
         request_id: RequestId,
         resolution: ResolvedInteraction,
+        timestamp: Timestamp,
     ) -> Result<(), SessionInteractionError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::ResolveInteraction(ResolveInteractionRequest {
             request_id,
             resolution: Some(resolution),
+            timestamp,
             response: Some(response),
         });
         let permit = tokio::select! {
@@ -1441,7 +1443,7 @@ impl SessionExecutorActor {
             completion.request,
         );
         let fact = lock(&conversation.live_state)
-            .apply_interaction_request(candidate, completion.turn_id, SystemClock.now())
+            .apply_interaction_request(candidate, completion.turn_id, completion.timestamp)
             .map_err(|_| ActorFatality::Integrity)?;
         let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
         self.pending_interactions.insert(
@@ -1475,7 +1477,7 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         let apply = lock(&conversation.live_state)
-            .apply_interaction_resolution(candidate, SystemClock.now())
+            .apply_interaction_resolution(candidate, request.timestamp)
             .map_err(|_| SessionInteractionError::InvalidResolution);
         let fact = match apply {
             Ok(InteractionResolutionApplyOutcome::Applied(fact)) => fact,
@@ -1958,6 +1960,7 @@ enum ExecutorCompletion {
 
 struct InteractionRequestedCompletion {
     turn_id: TurnId,
+    timestamp: Timestamp,
     item_id: ItemId,
     tool_call_id: crate::tools::ToolCallId,
     request_id: RequestId,
@@ -2264,6 +2267,7 @@ async fn run_active_turn_inner(
                 } => {
                     let completion = InteractionRequestedCompletion {
                         turn_id,
+                        timestamp: SystemClock.now(),
                         item_id,
                         tool_call_id: tool_call_id.clone(),
                         request_id,
@@ -2663,6 +2667,7 @@ struct SubmitRequest {
 struct ResolveInteractionRequest {
     request_id: RequestId,
     resolution: Option<ResolvedInteraction>,
+    timestamp: Timestamp,
     response: Option<oneshot::Sender<Result<(), SessionInteractionError>>>,
 }
 
@@ -4142,7 +4147,11 @@ mod tests {
             )
             .unwrap();
         executor
-            .resolve_interaction(request_id, resolution)
+            .resolve_interaction(
+                request_id,
+                resolution,
+                "2026-08-08T10:00:00.000Z".parse().unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(

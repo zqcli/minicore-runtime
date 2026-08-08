@@ -462,13 +462,28 @@ impl ToolSet {
         resolution: ResolvedInteraction,
     ) -> ToolExecutionOutcome {
         let result = match resolution.live() {
-            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny)
-            | InteractionResolution::Cancelled(_) => denied,
+            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny) => denied,
+            InteractionResolution::Cancelled(_) => Self::cancelled_result(denied),
             InteractionResolution::ToolApproval(_) | InteractionResolution::UserAnswer(_) => {
                 allowed
             }
         };
         Self::bind_result(item_id, tool_call_id, result)
+    }
+
+    fn cancelled_result(result: ToolExecutionResult) -> ToolExecutionResult {
+        match result {
+            ToolExecutionResult::Completed { content, .. }
+            | ToolExecutionResult::PreExecution { content, .. } => {
+                ToolExecutionResult::PreExecution {
+                    disposition: ToolResultDisposition::Cancelled,
+                    content,
+                }
+            }
+            ToolExecutionResult::Interaction { .. } | ToolExecutionResult::Abandoned { .. } => {
+                result
+            }
+        }
     }
 
     fn bind_result(
@@ -1678,6 +1693,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::turn_item_interaction::InteractionCancelReason;
 
     #[tokio::test]
     async fn captured_tool_set_executes_only_known_tools() {
@@ -1897,6 +1913,32 @@ mod tests {
                 tool_call_id,
                 reason: ToolAbandonReason::OutcomeUnknown,
             } if actual_item_id == item_id && tool_call_id.as_str() == "call_denied"
+        ));
+    }
+
+    #[test]
+    fn cancelled_interaction_is_a_pre_execution_cancelled_result() {
+        let item_id = "itm_0000000000000000000000000000000b".parse().unwrap();
+        let tool_call_id = "call_cancelled".parse().unwrap();
+        let content = ToolResultContent::from_text_parts(vec!["cancelled".to_owned()]).unwrap();
+        let outcome = ToolSet::settle_interaction(
+            item_id,
+            tool_call_id,
+            ToolExecutionResult::completed_text("allowed").unwrap(),
+            ToolExecutionResult::PreExecution {
+                disposition: ToolResultDisposition::Denied,
+                content,
+            },
+            ResolvedInteraction::cancelled_by_owner(InteractionCancelReason::TurnCancelled)
+                .unwrap(),
+        );
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Cancelled,
+                ..
+            }
         ));
     }
 
