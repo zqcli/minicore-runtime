@@ -2771,6 +2771,12 @@ impl fmt::Display for RecordingHealth {
 enum RecorderWriteFault {
     Fail,
     Panic,
+    /// Write only the canonical encoded JSON without the trailing LF, then fail the exact
+    /// attempt: the file keeps an unterminated tail.
+    PartialWrite,
+    /// Write the complete newline-terminated line, then panic before the attempt settles: the
+    /// line is kept but the Recorder degrades through the operation failure.
+    PanicAfterWrite,
 }
 
 /// Test-only coordination around the first physical append write.
@@ -2869,7 +2875,20 @@ impl RecorderWriteBarrier {
         self.release();
     }
 
-    fn before_first_write(&self) -> Result<(), SessionRecordingError> {
+    pub(crate) fn partial_write(&self) {
+        *lock_recorder(&self.fault) = Some(RecorderWriteFault::PartialWrite);
+        self.release();
+    }
+
+    pub(crate) fn panic_after_write(&self) {
+        *lock_recorder(&self.fault) = Some(RecorderWriteFault::PanicAfterWrite);
+        self.release();
+    }
+
+    /// Waits for the before-write gate and returns the exact consumed fault. The worker keeps
+    /// ownership of the post-gate faults and performs the corresponding physical write shape;
+    /// `Fail` and `Panic` are fully consumed here and never reach the worker.
+    fn before_first_write(&self) -> Result<Option<RecorderWriteFault>, SessionRecordingError> {
         self.entered.store(true, Ordering::Release);
         self.entered_notify.notify_waiters();
 
@@ -2882,12 +2901,13 @@ impl RecorderWriteBarrier {
         }
         drop(released);
 
-        match lock_recorder(&self.fault).take() {
+        let fault = lock_recorder(&self.fault).take();
+        match fault {
             Some(RecorderWriteFault::Fail) => Err(SessionRecordingError::WriteFailed),
             Some(RecorderWriteFault::Panic) => {
                 panic!("RecorderWriteBarrier requested a write panic")
             }
-            None => Ok(()),
+            other => Ok(other),
         }
     }
 
@@ -3308,10 +3328,39 @@ impl SessionRecorderCore {
                 }
             }
             #[cfg(test)]
-            if let Err(error) = barrier.before_first_write() {
-                drop(file);
-                guard.fail(error);
-                return;
+            match barrier.before_first_write() {
+                Err(error) => {
+                    drop(file);
+                    guard.fail(error);
+                    return;
+                }
+                Ok(Some(RecorderWriteFault::PartialWrite)) => {
+                    // Keep only the canonical encoded JSON without the trailing LF, then fail
+                    // the exact attempt: the file retains an unterminated tail.
+                    if file.write_all(&line[..line.len() - 1]).is_err() {
+                        drop(file);
+                        guard.fail(SessionRecordingError::WriteFailed);
+                        return;
+                    }
+                    drop(file);
+                    guard.fail(SessionRecordingError::WriteFailed);
+                    return;
+                }
+                Ok(Some(RecorderWriteFault::PanicAfterWrite)) => {
+                    // Write the complete newline-terminated line, then unwind before the
+                    // attempt settles: the line is kept and the operation failure degrades the
+                    // exact attempt.
+                    if file.write_all(&line).is_err() {
+                        drop(file);
+                        guard.fail(SessionRecordingError::WriteFailed);
+                        return;
+                    }
+                    panic!("RecorderWriteBarrier requested a post-write panic");
+                }
+                Ok(Some(RecorderWriteFault::Fail | RecorderWriteFault::Panic)) => {
+                    unreachable!("Fail and Panic faults are consumed inside the barrier")
+                }
+                Ok(None) => {}
             }
             if file.write_all(&line).is_err() {
                 drop(file);
@@ -4245,6 +4294,9 @@ mod tests {
         include_bytes!("../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl");
     const FORK_CHILD: &[u8] = include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl");
     static RECORDER_TEST_FILE: AtomicU64 = AtomicU64::new(0);
+    const PREFIX_ENTRY_ID: &str = "ent_10000000000000000000000000000001";
+    const CHILD_ENTRY_ID: &str = "ent_10000000000000000000000000000002";
+    const AFTER_ENTRY_ID: &str = "ent_10000000000000000000000000000003";
 
     fn recorder_target() -> (PathBuf, PublishedConversationTarget) {
         let ordinal = RECORDER_TEST_FILE.fetch_add(1, Ordering::Relaxed);
@@ -4300,6 +4352,84 @@ mod tests {
         Arc::new(entry(StoredEntryBody::AssistantMessage(assistant(vec![
             text_content(text.to_owned()),
         ]))))
+    }
+
+    /// One assistant entry with an explicit EntryId and optional parent, so a recorder test can
+    /// append a linked suffix that cold replay keeps on the selected path.
+    fn recorder_entry_with_id(
+        entry_id: &str,
+        parent_id: Option<&str>,
+        text: &str,
+    ) -> Arc<StoredSessionEntry> {
+        // Each test entry needs its own ItemId: replay only accepts first-valid item identity,
+        // so two entries sharing the helper's default item id would drop the second message.
+        let item_id = format!("itm_{}", &entry_id[4..]);
+        let value = entry(StoredEntryBody::AssistantMessage(assistant(vec![
+            StoredAssistantContent::Text {
+                item_id: item_id.parse().expect("test ItemId is valid"),
+                text: text.to_owned().into(),
+            },
+        ])));
+        Arc::new(StoredSessionEntry::reconstruct(
+            entry_id.parse().expect("test EntryId is valid"),
+            parent_id.map(|parent_id| parent_id.parse().expect("test parent EntryId is valid")),
+            value.session_id(),
+            value.turn_id(),
+            value.timestamp(),
+            value.body().clone(),
+        ))
+    }
+
+    fn assert_replayed_assistant_texts(view: &ReplayedConversationView, texts: &[&str]) {
+        let messages = view.sanitized_messages();
+        assert_eq!(
+            messages.len(),
+            texts.len(),
+            "sanitized message count matches the recorded assistant lines"
+        );
+        for (message, expected) in messages.iter().zip(texts) {
+            match message.as_ref() {
+                ModelMessageRef::Assistant { content } => {
+                    assert_eq!(content.len(), 1, "one assistant text block");
+                    match content[0].as_ref() {
+                        ModelAssistantContentRef::Text(actual) => {
+                            assert_eq!(actual, *expected, "assistant text")
+                        }
+                        other => panic!("expected a text block, got {other:?}"),
+                    }
+                }
+                other => panic!("expected an assistant message, got {other:?}"),
+            }
+        }
+    }
+
+    fn cold_replay_at(path: &std::path::Path) -> (Vec<u8>, ReplayedConversationView) {
+        let bytes = std::fs::read(path).expect("recorder test target reads");
+        let view = replay_fixture(&bytes, standard_header().session_id())
+            .expect("the recorder file cold-replays tolerantly");
+        (bytes, view)
+    }
+
+    async fn writable_cold_load(
+        path: &std::path::Path,
+        task_context: RuntimeTaskContext,
+    ) -> ReplayedConversationLoad {
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .expect("recorder test target opens");
+        let file_bytes = file.metadata().expect("recorder test metadata reads").len();
+        let writable_file = file.try_clone().expect("recorder test file clones");
+        let target = PublishedConversationTarget::from_durable_state(
+            standard_header().session_id(),
+            file_bytes,
+            file,
+            writable_file,
+        );
+        load_replayed_conversation(target, task_context)
+            .await
+            .expect("the writable cold load prepares the exact target")
     }
 
     fn mismatched_recorder_entry() -> Arc<StoredSessionEntry> {
@@ -5297,7 +5427,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn session_recorder_caller_drop_after_physical_write_keeps_a_complete_line() {
+    async fn recorder_caller_drop_after_barrier() {
         let (task_context, recorder, path) = recorder_fixture().await;
         let barrier = RecorderWriteBarrier::new();
         barrier.hold_after_write();
@@ -5327,8 +5457,439 @@ mod tests {
         ConversationLineCodec::decode_entry_for_session(entry_line, standard_header().session_id())
             .expect("the complete append remains replayable");
 
+        // The dropped caller still left a complete newline-terminated line; cold replay accepts
+        // it as a line (matrix `recorder.caller_drop.after_write`: complete_line_replayed).
+        let view = replay_fixture(&bytes, standard_header().session_id())
+            .expect("the complete line cold-replays after the caller drop");
+        assert_eq!(
+            view.tail_action(),
+            None,
+            "no partial tail after the caller drop"
+        );
+        assert_eq!(view.accepted_entry_ids().len(), 1);
+        assert_eq!(view.selected_path().len(), 1);
+        assert_replayed_assistant_texts(&view, &["after physical write"]);
+        assert!(view.diagnostics().is_empty());
+
         task_context.shutdown().await;
         std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_partial_tail_replay() {
+        // Matrix `recorder.write.partial_tail`: a partial physical write leaves an unterminated
+        // tail, the exact attempt terminally degrades, and cold replay ignores or truncates that
+        // tail while keeping the recorded prefix.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        let partial = recorder_entry_with_id(CHILD_ENTRY_ID, Some(PREFIX_ENTRY_ID), "partial tail");
+        let partial_entry_id = partial.entry_id();
+        let partial_encoded = ConversationLineCodec::encode_entry(&partial).expect("entry encodes");
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        barrier.partial_write();
+
+        assert!(matches!(
+            recorder.record(partial.clone()).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded {
+                    failed_entry_id: Some(failed_entry_id),
+                    reason: SessionRecordingError::WriteFailed,
+                }
+            } if failed_entry_id == partial_entry_id
+        ));
+        recorder.close().await;
+        task_context.shutdown().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+
+        // The file keeps the unterminated tail: the canonical JSON without the trailing LF.
+        let (bytes, view) = cold_replay_at(&path);
+        assert!(
+            bytes.ends_with(&partial_encoded) && !bytes.ends_with(b"\n"),
+            "the failed append leaves the canonical JSON without the trailing LF"
+        );
+        assert_eq!(
+            view.tail_action(),
+            Some(ConversationPartialTailAction::Ignore),
+            "read-only replay ignores the partial tail"
+        );
+        assert_eq!(view.accepted_entry_ids(), [prefix.entry_id()]);
+        assert_eq!(view.selected_path(), [prefix.entry_id()].as_slice());
+        assert_replayed_assistant_texts(&view, &["prefix"]);
+        assert_eq!(
+            view.diagnostics()
+                .count(ConversationReplayDiagnosticCode::PartialTail),
+            1
+        );
+
+        // A writable cold load of the same target truncates to the last LF; the prefix then
+        // replays cleanly and the fresh Recorder is Healthy.
+        let load_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the Tokio test runtime has a time driver");
+        let loaded = writable_cold_load(&path, load_context.clone()).await;
+        let truncated = std::fs::read(&path).expect("recorder test target reads");
+        let mut expected_prefix = HEADER_ONLY.to_vec();
+        expected_prefix.extend_from_slice(
+            &ConversationLineCodec::encode_entry(&prefix).expect("entry encodes"),
+        );
+        expected_prefix.push(b'\n');
+        assert_eq!(
+            truncated, expected_prefix,
+            "the writable load truncates the partial tail to the last LF"
+        );
+        assert_eq!(
+            loaded
+                .diagnostics
+                .count(ConversationReplayDiagnosticCode::PartialTail),
+            1
+        );
+        assert!(matches!(
+            *loaded.recorder.health(),
+            RecordingHealth::Healthy
+        ));
+
+        // The truncated prefix is again writable: a fresh append replays as a complete line.
+        let after =
+            recorder_entry_with_id(AFTER_ENTRY_ID, Some(PREFIX_ENTRY_ID), "after truncation");
+        assert_eq!(
+            loaded.recorder.record(after.clone()).await,
+            RecordOutcome::Written
+        );
+        loaded.recorder.close().await;
+        load_context.shutdown().await;
+        assert_eq!(load_context.registered_task_count_for_test(), 0);
+        let (final_bytes, final_view) = cold_replay_at(&path);
+        assert!(final_bytes.ends_with(b"\n"), "no unterminated tail remains");
+        assert_eq!(final_view.tail_action(), None);
+        assert_eq!(
+            final_view.accepted_entry_ids(),
+            [prefix.entry_id(), after.entry_id()]
+        );
+        assert_eq!(
+            final_view.selected_path(),
+            [prefix.entry_id(), after.entry_id()].as_slice()
+        );
+        assert_replayed_assistant_texts(&final_view, &["prefix", "after truncation"]);
+        assert!(final_view.diagnostics().is_empty());
+        std::fs::remove_file(&path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_full_line_replay() {
+        // Matrix `recorder.write.full_line_after_side_effect`: the complete newline-terminated
+        // line is physically written, then the worker fails before the attempt settles; the line
+        // is kept, the Recorder degrades, and cold replay accepts the complete line.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        let child = recorder_entry_with_id(CHILD_ENTRY_ID, Some(PREFIX_ENTRY_ID), "complete line");
+        let child_entry_id = child.entry_id();
+        let child_encoded = ConversationLineCodec::encode_entry(&child).expect("entry encodes");
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        barrier.panic_after_write();
+
+        assert!(matches!(
+            recorder.record(child.clone()).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded {
+                    failed_entry_id: Some(failed_entry_id),
+                    reason: SessionRecordingError::Runtime(RuntimeTaskError::OperationPanicked),
+                }
+            } if failed_entry_id == child_entry_id
+        ));
+        recorder.close().await;
+        task_context.shutdown().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+
+        let (bytes, view) = cold_replay_at(&path);
+        assert!(
+            bytes.len() > child_encoded.len()
+                && bytes.ends_with(b"\n")
+                && bytes[..bytes.len() - 1].ends_with(&child_encoded),
+            "the complete newline-terminated line survives the worker failure"
+        );
+        assert_eq!(
+            view.tail_action(),
+            None,
+            "a complete line is never treated as a partial tail"
+        );
+        assert_eq!(
+            view.accepted_entry_ids(),
+            [prefix.entry_id(), child.entry_id()]
+        );
+        assert_eq!(
+            view.selected_path(),
+            [prefix.entry_id(), child.entry_id()].as_slice()
+        );
+        assert_replayed_assistant_texts(&view, &["prefix", "complete line"]);
+        assert!(view.diagnostics().is_empty());
+
+        // A writable cold load of the same target must not mis-truncate the complete line.
+        let load_context = RuntimeTaskContext::new(tokio::runtime::Handle::current())
+            .await
+            .expect("the Tokio test runtime has a time driver");
+        let loaded = writable_cold_load(&path, load_context.clone()).await;
+        assert_eq!(
+            std::fs::read(&path).expect("recorder test target reads"),
+            bytes,
+            "the writable load keeps the complete line untouched"
+        );
+        assert!(loaded.diagnostics.is_empty());
+        assert!(matches!(
+            *loaded.recorder.health(),
+            RecordingHealth::Healthy
+        ));
+        loaded.recorder.close().await;
+        load_context.shutdown().await;
+        assert_eq!(load_context.registered_task_count_for_test(), 0);
+        std::fs::remove_file(&path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_spawn_failure() {
+        // Matrix `recorder.job.spawn_failure`: the owner stops admitting tracked work, the exact
+        // append spawn is rejected, and only the recorded prefix cold-replays.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        task_context.request_closing();
+        let suffix =
+            recorder_entry_with_id(CHILD_ENTRY_ID, Some(PREFIX_ENTRY_ID), "spawn rejected");
+        let suffix_entry_id = suffix.entry_id();
+        assert!(matches!(
+            recorder.record(suffix).await,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded {
+                    failed_entry_id: Some(failed_entry_id),
+                    reason: SessionRecordingError::Runtime(RuntimeTaskError::OwnerClosing),
+                }
+            } if failed_entry_id == suffix_entry_id
+        ));
+        assert_eq!(
+            task_context.registered_task_count_for_test(),
+            0,
+            "a rejected spawn never registers a worker"
+        );
+        recorder.close().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+
+        let (bytes, view) = cold_replay_at(&path);
+        let mut expected = HEADER_ONLY.to_vec();
+        expected.extend_from_slice(
+            &ConversationLineCodec::encode_entry(&prefix).expect("entry encodes"),
+        );
+        expected.push(b'\n');
+        assert_eq!(bytes, expected, "only the recorded prefix is on the file");
+        assert_eq!(view.tail_action(), None);
+        assert_eq!(view.accepted_entry_ids(), [prefix.entry_id()]);
+        assert_eq!(view.selected_path(), [prefix.entry_id()].as_slice());
+        assert_replayed_assistant_texts(&view, &["prefix"]);
+        assert!(view.diagnostics().is_empty());
+        std::fs::remove_file(&path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_caller_drop_before_barrier() {
+        // Matrix `recorder.caller_drop.before_write`: the caller enters the write barrier and
+        // drops; the exact attempt then fails before any write and terminally degrades the
+        // Recorder, while the recorded prefix cold-replays.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        let child = recorder_entry_with_id(
+            CHILD_ENTRY_ID,
+            Some(PREFIX_ENTRY_ID),
+            "dropped before write",
+        );
+        let child_entry_id = child.entry_id();
+        let mut dropped = Box::pin(recorder.record(child));
+        poll_to_pending(&mut dropped).await;
+        barrier.wait_until_entered().await;
+        drop(dropped);
+
+        // The caller is gone before the write gate opens; the exact attempt then fails without
+        // writing and terminally degrades the Recorder.
+        barrier.fail_before_write();
+        recorder.close().await;
+        assert!(matches!(
+            *recorder.health(),
+            RecordingHealth::Degraded {
+                failed_entry_id: Some(failed_entry_id),
+                reason: SessionRecordingError::WriteFailed,
+            } if failed_entry_id == child_entry_id
+        ));
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        task_context.shutdown().await;
+
+        let (bytes, view) = cold_replay_at(&path);
+        let mut expected = HEADER_ONLY.to_vec();
+        expected.extend_from_slice(
+            &ConversationLineCodec::encode_entry(&prefix).expect("entry encodes"),
+        );
+        expected.push(b'\n');
+        assert_eq!(
+            bytes, expected,
+            "the dropped-before-write entry is never appended"
+        );
+        assert_eq!(view.tail_action(), None);
+        assert_eq!(view.accepted_entry_ids(), [prefix.entry_id()]);
+        assert_eq!(view.selected_path(), [prefix.entry_id()].as_slice());
+        assert_replayed_assistant_texts(&view, &["prefix"]);
+        assert!(view.diagnostics().is_empty());
+        std::fs::remove_file(&path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_join_panic() {
+        // Matrix `recorder.job.join_panic`: the exact worker appends the complete canonical
+        // line and settles its provisional success, then unwinds after the operation so the
+        // raw Tokio join really fails; the terminal join failure degrades the Recorder and
+        // replay accepts the complete line the worker already wrote.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        // Hold after the complete physical write so `record` owns the exact raw join while
+        // `close` becomes a second waiter on the same attempt. Releasing the worker lets it
+        // settle provisional success and then fail its raw join; neither waiter may escape the
+        // provisional result.
+        let barrier = RecorderWriteBarrier::new();
+        barrier.hold_after_write();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        task_context.inject_next_blocking_job_post_operation_panic();
+        let child = recorder_entry_with_id(CHILD_ENTRY_ID, Some(PREFIX_ENTRY_ID), "join failure");
+        let child_entry_id = child.entry_id();
+        let child_encoded = ConversationLineCodec::encode_entry(&child).expect("entry encodes");
+
+        let mut record = Box::pin(recorder.record(child.clone()));
+        poll_to_pending(&mut record).await;
+        barrier.release();
+        barrier.wait_until_written().await;
+        let mut close = Box::pin(recorder.close());
+        poll_to_pending(&mut close).await;
+        barrier.release_after_write();
+        let (outcome, ()) = tokio::join!(record, close);
+        assert!(matches!(
+            outcome,
+            RecordOutcome::NotRecorded {
+                health: RecordingHealth::Degraded {
+                    failed_entry_id: Some(failed_entry_id),
+                    reason: SessionRecordingError::Runtime(RuntimeTaskError::WorkerUnavailable),
+                }
+            } if failed_entry_id == child_entry_id
+        ));
+        task_context.shutdown().await;
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+
+        // The provisional success already committed the complete line before the raw join
+        // failed; cold replay accepts it as a complete line with no partial tail.
+        let (bytes, view) = cold_replay_at(&path);
+        assert!(
+            bytes.len() > child_encoded.len()
+                && bytes.ends_with(b"\n")
+                && bytes[..bytes.len() - 1].ends_with(&child_encoded),
+            "the complete newline-terminated line survives the raw join failure"
+        );
+        assert_eq!(
+            view.tail_action(),
+            None,
+            "a complete line is never treated as a partial tail"
+        );
+        assert_eq!(
+            view.accepted_entry_ids(),
+            [prefix.entry_id(), child.entry_id()]
+        );
+        assert_eq!(
+            view.selected_path(),
+            [prefix.entry_id(), child.entry_id()].as_slice()
+        );
+        assert_replayed_assistant_texts(&view, &["prefix", "join failure"]);
+        assert!(view.diagnostics().is_empty());
+        std::fs::remove_file(&path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorder_shutdown_join() {
+        // Matrix `recorder.shutdown.waits_settlement`: the physical write happened but the exact
+        // attempt is not yet settled; owner shutdown waits for the exact Recorder job, and both
+        // the record and the shutdown complete with a Healthy Recorder and a complete replayed
+        // line.
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let prefix = recorder_entry_with_id(PREFIX_ENTRY_ID, None, "prefix");
+        assert_eq!(
+            recorder.record(prefix.clone()).await,
+            RecordOutcome::Written
+        );
+
+        let barrier = RecorderWriteBarrier::new();
+        barrier.hold_after_write();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+        let child = recorder_entry_with_id(CHILD_ENTRY_ID, Some(PREFIX_ENTRY_ID), "complete line");
+        let mut record = Box::pin(recorder.record(child.clone()));
+        poll_to_pending(&mut record).await;
+        barrier.release();
+        barrier.wait_until_written().await;
+
+        // The line is physically written but the attempt is not settled: shutdown must wait for
+        // the exact Recorder job instead of closing over it.
+        let mut shutdown = Box::pin(task_context.shutdown());
+        poll_to_pending(&mut shutdown).await;
+        assert!(
+            task_context.is_closing(),
+            "the owner shutdown is in its closing phase while it waits"
+        );
+
+        barrier.release_after_write();
+        assert_eq!(record.await, RecordOutcome::Written);
+        shutdown.await;
+
+        assert!(matches!(*recorder.health(), RecordingHealth::Healthy));
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        recorder.close().await;
+
+        let (bytes, view) = cold_replay_at(&path);
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == b'\n').count(),
+            3,
+            "header plus two complete lines"
+        );
+        assert_eq!(view.tail_action(), None);
+        assert_eq!(
+            view.accepted_entry_ids(),
+            [prefix.entry_id(), child.entry_id()]
+        );
+        assert_eq!(
+            view.selected_path(),
+            [prefix.entry_id(), child.entry_id()].as_slice()
+        );
+        assert_replayed_assistant_texts(&view, &["prefix", "complete line"]);
+        assert!(view.diagnostics().is_empty());
+        std::fs::remove_file(&path).expect("recorder test target removes");
     }
 
     #[tokio::test(flavor = "current_thread")]
