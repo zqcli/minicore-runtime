@@ -1,14 +1,16 @@
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::wire::ProtocolLimits;
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_opaque_ascii,
     validate_safe_text, validate_stable_symbolic_key,
 };
+use crate::wire::{BoundedJsonObject, BoundedJsonSchema, ItemId, ProtocolLimits};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolNameError {
@@ -102,21 +104,201 @@ impl fmt::Debug for ToolCallId {
     }
 }
 
-/// The immutable Tool set captured for one Turn.
-///
-/// M6.1 intentionally supports only the valid empty set. The shared inner value lets Prompt
-/// retain an exact parent-owned projection without adding a ToolSet ID or exposing execution
-/// routes before M8.
 #[allow(
     dead_code,
-    reason = "the empty captured ToolSet is consumed by the pending TurnExecutionContext"
+    reason = "serial/parallel policy is consumed by ToolService publication"
 )]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ToolExecutionMode {
+    Parallel,
+    Serial,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ToolDefinition {
+    spec: ToolSpec,
+    mode: ToolExecutionMode,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ToolSpec {
+    name: ToolName,
+    description: Arc<str>,
+    input_schema: BoundedJsonSchema,
+}
+
+impl ToolDefinition {
+    #[cfg(test)]
+    pub(crate) fn new(
+        name: ToolName,
+        description: impl AsRef<str>,
+        input_schema: BoundedJsonSchema,
+        mode: ToolExecutionMode,
+    ) -> Result<Self, ToolValueError> {
+        let description = normalize_and_validate_text(
+            description.as_ref(),
+            ProtocolLimits::v1_0().text.max_description_bytes as usize,
+            false,
+        )?;
+        Ok(Self {
+            spec: ToolSpec {
+                name,
+                description: description.into(),
+                input_schema,
+            },
+            mode,
+        })
+    }
+
+    pub(crate) const fn name(&self) -> &ToolName {
+        self.spec.name()
+    }
+
+    pub(crate) const fn mode(&self) -> ToolExecutionMode {
+        self.mode
+    }
+}
+
+impl ToolSpec {
+    pub(crate) const fn name(&self) -> &ToolName {
+        &self.name
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        &self.description
+    }
+
+    pub(crate) const fn input_schema(&self) -> &BoundedJsonSchema {
+        &self.input_schema
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct ToolCall {
+    tool_call_id: ToolCallId,
+    name: ToolName,
+    arguments: BoundedJsonObject,
+    call_index: u32,
+}
+
+impl ToolCall {
+    pub(crate) const fn new(
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+        call_index: u32,
+    ) -> Self {
+        Self {
+            tool_call_id,
+            name,
+            arguments,
+            call_index,
+        }
+    }
+
+    pub(crate) const fn tool_call_id(&self) -> &ToolCallId {
+        &self.tool_call_id
+    }
+
+    pub(crate) const fn name(&self) -> &ToolName {
+        &self.name
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "arguments are consumed by concrete Tool executors"
+        )
+    )]
+    pub(crate) const fn arguments(&self) -> &BoundedJsonObject {
+        &self.arguments
+    }
+
+    pub(crate) const fn call_index(&self) -> u32 {
+        self.call_index
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolExecutionRequest {
+    item_id: ItemId,
+    call: Arc<ToolCall>,
+}
+
+impl ToolExecutionRequest {
+    pub(crate) fn new(item_id: ItemId, call: ToolCall) -> Self {
+        Self {
+            item_id,
+            call: Arc::new(call),
+        }
+    }
+
+    pub(crate) const fn item_id(&self) -> ItemId {
+        self.item_id
+    }
+
+    pub(crate) const fn call(&self) -> &Arc<ToolCall> {
+        &self.call
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "abandoned settlement is consumed by M8 cancel/control lanes"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ToolExecutionResult {
+    Completed {
+        disposition: ToolResultDisposition,
+        content: ToolResultContent,
+    },
+    Abandoned {
+        reason: ToolAbandonReason,
+    },
+}
+
+impl ToolExecutionResult {
+    #[cfg(test)]
+    pub(crate) fn completed_text(text: impl AsRef<str>) -> Result<Self, ToolValueError> {
+        Ok(Self::Completed {
+            disposition: ToolResultDisposition::Succeeded,
+            content: ToolResultContent::from_text_parts(vec![text.as_ref().to_owned()])?,
+        })
+    }
+}
+
+pub(crate) type ToolExecutionFuture =
+    Pin<Box<dyn Future<Output = ToolExecutionResult> + Send + 'static>>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ToolExecutionOutcome {
+    Completed {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        source: ToolOutcomeSource,
+        disposition: ToolResultDisposition,
+        content: ToolResultContent,
+    },
+    Abandoned {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        reason: ToolAbandonReason,
+    },
+}
+
+type ToolExecutor = dyn Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync;
+
+/// The immutable Tool set captured for one Turn.
+#[derive(Clone)]
 pub(crate) struct ToolSet {
     inner: Arc<ToolSetInner>,
 }
 
 struct ToolSetInner {
-    spec_count: usize,
+    definitions: Arc<[ToolDefinition]>,
+    specs: Arc<[ToolSpec]>,
+    executor: Option<Arc<ToolExecutor>>,
 }
 
 /// The model-safe projection of one exact captured [`ToolSet`].
@@ -136,8 +318,138 @@ pub(crate) struct ToolPromptView {
 impl ToolSet {
     pub(crate) fn empty() -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(ToolSetInner { spec_count: 0 }),
+            inner: Arc::new(ToolSetInner {
+                definitions: Arc::from([]),
+                specs: Arc::from([]),
+                executor: None,
+            }),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_executor(
+        definitions: Vec<ToolDefinition>,
+        executor: impl Fn(ToolExecutionRequest) -> ToolExecutionFuture + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        let specs = definitions
+            .iter()
+            .map(|definition| definition.spec.clone())
+            .collect::<Vec<_>>();
+        Arc::new(Self {
+            inner: Arc::new(ToolSetInner {
+                definitions: definitions.into(),
+                specs: specs.into(),
+                executor: Some(Arc::new(executor)),
+            }),
+        })
+    }
+
+    pub(crate) fn definitions(&self) -> &[ToolDefinition] {
+        &self.inner.definitions
+    }
+
+    pub(crate) async fn execute(&self, request: ToolExecutionRequest) -> ToolExecutionOutcome {
+        let item_id = request.item_id();
+        let tool_call_id = request.call().tool_call_id().clone();
+        if !self
+            .inner
+            .definitions
+            .iter()
+            .any(|definition| definition.name() == request.call().name())
+        {
+            return ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Failed,
+                content: ToolResultContent::tool_unavailable(),
+            };
+        }
+        let Some(executor) = self.inner.executor.as_ref() else {
+            return ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Failed,
+                content: ToolResultContent::tool_unavailable(),
+            };
+        };
+        let result = executor(request.clone()).await;
+        match result {
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: _,
+            } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
+            ToolExecutionResult::Completed {
+                disposition,
+                content,
+            } => ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition,
+                content,
+            },
+            ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason,
+            },
+        }
+    }
+
+    pub(crate) async fn execute_round(
+        &self,
+        mut calls: Vec<ToolExecutionRequest>,
+    ) -> Vec<ToolExecutionOutcome> {
+        calls.sort_by_key(|call| call.call().call_index());
+        let is_serial = calls.iter().any(|call| {
+            self.inner
+                .definitions
+                .iter()
+                .find(|definition| definition.name() == call.call().name())
+                .is_some_and(|definition| definition.mode() == ToolExecutionMode::Serial)
+        });
+        if is_serial {
+            let mut results = Vec::with_capacity(calls.len());
+            for call in calls {
+                let (item_id, tool_call_id, join) = self.spawn_execution(call);
+                results.push(settle_execution(item_id, tool_call_id, join).await);
+            }
+            return results;
+        }
+
+        let mut joins = Vec::with_capacity(calls.len());
+        for call in calls {
+            joins.push(self.spawn_execution(call));
+        }
+        let mut results = Vec::with_capacity(joins.len());
+        for (item_id, tool_call_id, join) in joins {
+            results.push(settle_execution(item_id, tool_call_id, join).await);
+        }
+        results
+    }
+
+    fn spawn_execution(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> (
+        ItemId,
+        ToolCallId,
+        tokio::task::JoinHandle<ToolExecutionOutcome>,
+    ) {
+        let item_id = request.item_id();
+        let tool_call_id = request.call().tool_call_id().clone();
+        let set = self.clone();
+        (
+            item_id,
+            tool_call_id,
+            tokio::spawn(async move { set.execute(request).await }),
+        )
     }
 
     pub(crate) fn prompt_view(&self) -> ToolPromptView {
@@ -151,13 +463,32 @@ impl ToolSet {
     }
 }
 
+async fn settle_execution(
+    item_id: ItemId,
+    tool_call_id: ToolCallId,
+    join: tokio::task::JoinHandle<ToolExecutionOutcome>,
+) -> ToolExecutionOutcome {
+    match join.await {
+        Ok(result) => result,
+        Err(_) => ToolExecutionOutcome::Abandoned {
+            item_id,
+            tool_call_id,
+            reason: ToolAbandonReason::RuntimeFailure,
+        },
+    }
+}
+
 #[allow(
     dead_code,
     reason = "the PromptSet captures this owner-bound empty projection in M6.1"
 )]
 impl ToolPromptView {
     pub(crate) fn is_empty(&self) -> bool {
-        self.inner.spec_count == 0
+        self.inner.specs.is_empty()
+    }
+
+    pub(crate) fn specs(&self) -> &[ToolSpec] {
+        &self.inner.specs
     }
 }
 
@@ -165,7 +496,7 @@ impl fmt::Debug for ToolSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolSet")
-            .field("spec_count", &self.inner.spec_count)
+            .field("spec_count", &self.inner.definitions.len())
             .finish()
     }
 }
@@ -174,7 +505,7 @@ impl fmt::Debug for ToolPromptView {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolPromptView")
-            .field("spec_count", &self.inner.spec_count)
+            .field("spec_count", &self.inner.specs.len())
             .finish()
     }
 }
@@ -221,6 +552,14 @@ pub struct ToolResultContent {
 }
 
 impl ToolResultContent {
+    fn tool_unavailable() -> Self {
+        Self {
+            parts: Arc::from([ToolResultContentPart::Text(ToolResultText(Arc::from(
+                "tool is unavailable",
+            )))]),
+        }
+    }
+
     pub fn from_text_parts(parts: Vec<String>) -> Result<Self, ToolValueError> {
         if parts.is_empty() || parts.len() > 32 {
             return Err(ToolValueError::InvalidResultPartCount);
@@ -1224,7 +1563,227 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[tokio::test]
+    async fn captured_tool_set_executes_only_known_tools() {
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_by_executor = Arc::clone(&observed);
+        let set = ToolSet::with_executor(
+            vec![
+                ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON request",
+                    "{}".parse().unwrap(),
+                    ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            move |request| {
+                let observed = Arc::clone(&observed_by_executor);
+                Box::pin(async move {
+                    let call = request.call();
+                    observed.lock().unwrap().push((
+                        call.tool_call_id().as_str().to_owned(),
+                        call.name().as_str().to_owned(),
+                        call.arguments().canonical_json().to_owned(),
+                    ));
+                    ToolExecutionResult::completed_text("echoed").unwrap()
+                })
+            },
+        );
+
+        let outcome = set
+            .execute(ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000001".parse().unwrap(),
+                ToolCall::new(
+                    "call_1".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{\"value\":1}".parse().unwrap(),
+                    0,
+                ),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Completed {
+                item_id,
+                ref tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition: ToolResultDisposition::Succeeded,
+                ..
+            } if item_id == "itm_00000000000000000000000000000001".parse().unwrap()
+                && tool_call_id.as_str() == "call_1"
+        ));
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [(
+                "call_1".to_owned(),
+                "echo".to_owned(),
+                "{\"value\":1}".to_owned()
+            )]
+        );
+
+        let unknown = set
+            .execute(ToolExecutionRequest::new(
+                "itm_00000000000000000000000000000002".parse().unwrap(),
+                ToolCall::new(
+                    "call_2".parse().unwrap(),
+                    "missing".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ))
+            .await;
+        assert!(matches!(
+            unknown,
+            ToolExecutionOutcome::Completed {
+                item_id,
+                ref tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition: ToolResultDisposition::Failed,
+                ref content,
+            } if item_id == "itm_00000000000000000000000000000002".parse().unwrap()
+                && tool_call_id.as_str() == "call_2"
+                && content.parts()[0].as_text() == "tool is unavailable"
+        ));
+        assert_eq!(observed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_round_preserves_call_order_for_parallel_execution() {
+        let set = ToolSet::with_executor(
+            vec![
+                ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON request",
+                    "{}".parse().unwrap(),
+                    ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            |request| {
+                Box::pin(async move {
+                    ToolExecutionResult::completed_text(request.call().tool_call_id().as_str())
+                        .unwrap()
+                })
+            },
+        );
+        let results = set
+            .execute_round(
+                [("call_c", 2_u32), ("call_a", 0), ("call_b", 1)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(item_index, (id, call_index))| {
+                        ToolExecutionRequest::new(
+                            format!("itm_{:032x}", item_index + 1).parse().unwrap(),
+                            ToolCall::new(
+                                id.parse().unwrap(),
+                                "echo".parse().unwrap(),
+                                "{}".parse().unwrap(),
+                                call_index,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+            .await;
+        let contents = results
+            .into_iter()
+            .map(|result| match result {
+                ToolExecutionOutcome::Completed { content, .. } => {
+                    content.parts()[0].as_text().to_owned()
+                }
+                ToolExecutionOutcome::Abandoned { .. } => panic!("unexpected abandoned result"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(contents, ["call_a", "call_b", "call_c"]);
+    }
+
+    #[tokio::test]
+    async fn tool_round_maps_executor_panics_to_identity_bound_abandoned_outcomes() {
+        for mode in [ToolExecutionMode::Parallel, ToolExecutionMode::Serial] {
+            let set = ToolSet::with_executor(
+                vec![
+                    ToolDefinition::new(
+                        "echo".parse().unwrap(),
+                        "Echo a bounded JSON request",
+                        "{}".parse().unwrap(),
+                        mode,
+                    )
+                    .unwrap(),
+                ],
+                |_| Box::pin(async { panic!("scripted executor panic") }),
+            );
+            let item_id = "itm_00000000000000000000000000000009".parse().unwrap();
+            let results = set
+                .execute_round(vec![ToolExecutionRequest::new(
+                    item_id,
+                    ToolCall::new(
+                        "call_panic".parse().unwrap(),
+                        "echo".parse().unwrap(),
+                        "{}".parse().unwrap(),
+                        0,
+                    ),
+                )])
+                .await;
+
+            assert!(matches!(
+                results.as_slice(),
+                [ToolExecutionOutcome::Abandoned {
+                    item_id: actual_item_id,
+                    tool_call_id,
+                    reason: ToolAbandonReason::RuntimeFailure,
+                }] if *actual_item_id == item_id && tool_call_id.as_str() == "call_panic"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn executed_denied_is_not_emitted_as_an_executed_tool_result() {
+        let set = ToolSet::with_executor(
+            vec![
+                ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON request",
+                    "{}".parse().unwrap(),
+                    ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            |_| {
+                Box::pin(async {
+                    ToolExecutionResult::Completed {
+                        disposition: ToolResultDisposition::Denied,
+                        content: ToolResultContent::from_text_parts(vec!["denied".to_owned()])
+                            .unwrap(),
+                    }
+                })
+            },
+        );
+        let item_id = "itm_0000000000000000000000000000000a".parse().unwrap();
+        let outcome = set
+            .execute(ToolExecutionRequest::new(
+                item_id,
+                ToolCall::new(
+                    "call_denied".parse().unwrap(),
+                    "echo".parse().unwrap(),
+                    "{}".parse().unwrap(),
+                    0,
+                ),
+            ))
+            .await;
+        assert!(matches!(
+            outcome,
+            ToolExecutionOutcome::Abandoned {
+                item_id: actual_item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            } if actual_item_id == item_id && tool_call_id.as_str() == "call_denied"
+        ));
+    }
 
     #[test]
     fn empty_prompt_view_retains_its_exact_parent_without_an_identity_value() {

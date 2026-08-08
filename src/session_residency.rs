@@ -48,6 +48,7 @@ use crate::session_execution::{
     SessionExecutorStartError, SessionExecutorSubscription, SessionSubmitError,
     SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
 };
+use crate::tools::ToolSet;
 use crate::wire::{CommandId, SessionDefinitionRevision, SessionId, Timestamp, TurnId};
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshotFinishError,
@@ -755,6 +756,7 @@ struct ResidencyTurnResources {
     prompt_resources: Arc<PromptResourceView>,
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
+    tool_set: Arc<ToolSet>,
 }
 
 impl OperationContext {
@@ -1541,6 +1543,32 @@ impl SessionResidencyRegistry {
         model_gateway: Arc<ModelGateway>,
         model_catalog: Arc<ModelCatalogView>,
     ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_with_turn_resources_and_tools(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            ToolSet::empty(),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one test-injected turn resource bundle binds the exact runtime owners"
+    )]
+    pub(crate) fn start_with_turn_resources_and_tools(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_set: Arc<ToolSet>,
+    ) -> Result<Self, SessionResidencyStartError> {
         Self::start_inner(
             task_context,
             durable_state,
@@ -1550,6 +1578,7 @@ impl SessionResidencyRegistry {
                 prompt_resources,
                 model_gateway,
                 model_catalog,
+                tool_set,
             }),
         )
     }
@@ -2122,7 +2151,7 @@ async fn run_load(
     );
     let executor_result = match context.turn_resources.as_ref() {
         Some(resources) => SessionExecutor::start_loaded_ready_idle_with_turn_resources(
-            SessionExecutorDependencies::with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
                 context.task_context.clone(),
                 context.durable_state.clone(),
                 Arc::clone(&context.resolver),
@@ -2130,6 +2159,7 @@ async fn run_load(
                 Arc::clone(&resources.prompt_resources),
                 Arc::clone(&resources.model_gateway),
                 Arc::clone(&resources.model_catalog),
+                Arc::clone(&resources.tool_set),
             ),
             definition,
             workspace_snapshot,

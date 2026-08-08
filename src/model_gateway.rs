@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -12,10 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::live_conversation::ConversationRevision;
 use crate::prompt::AssembledModelContext;
-use crate::wire::Money;
+use crate::tools::{ToolCallId, ToolName};
 use crate::wire::lexical::{
     LexicalError, validate_opaque_ascii, validate_safe_text, validate_stable_symbolic_key,
 };
+use crate::wire::{BoundedJsonObject, Money};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ModelIdentityError {
@@ -1094,7 +1095,7 @@ impl ModelCallRequest {
                 ModelRequestValidationErrorKind::AssemblyMismatch,
             ));
         }
-        if !input.tools_empty() {
+        if input.output_contract().is_some() && !input.tools_empty() {
             return Err(ModelRequestValidationError::new(
                 ModelRequestValidationErrorKind::UnsupportedInput,
             ));
@@ -1225,6 +1226,45 @@ impl ScriptedModelFixture {
                 )
             })
             .collect();
+        Self::from_scripts(scripts, context_window_tokens)
+    }
+
+    pub(crate) fn with_tool_round(
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &str,
+        final_text: &str,
+    ) -> Self {
+        let scripts = vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::ToolCall {
+                        tool_call_id: tool_call_id.parse().unwrap(),
+                        name: tool_name.parse().unwrap(),
+                        arguments: arguments.parse().unwrap(),
+                    }]),
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::Text(Arc::from(final_text))]),
+                    finish_reason: ModelFinishReason::Stop,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ];
+        Self::from_scripts(scripts, 128_000)
+    }
+
+    fn from_scripts(scripts: Vec<ScriptedProviderScript>, context_window_tokens: u32) -> Self {
         let adapter = Arc::new(ScriptedProviderAdapter::new(scripts));
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
         let definition = ModelDefinition::new(
@@ -1699,7 +1739,11 @@ impl ModelUsage {
 enum ProviderAttemptContent {
     Reasoning(ReasoningContent),
     Text(Arc<str>),
-    ToolCall,
+    ToolCall {
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+    },
 }
 
 impl fmt::Debug for ProviderAttemptContent {
@@ -1707,7 +1751,7 @@ impl fmt::Debug for ProviderAttemptContent {
         let kind = match self {
             Self::Reasoning(_) => "reasoning",
             Self::Text(_) => "text",
-            Self::ToolCall => "tool_call",
+            Self::ToolCall { .. } => "tool_call",
         };
         formatter
             .debug_struct("ProviderAttemptContent")
@@ -1895,7 +1939,14 @@ impl fmt::Debug for ModelCallError {
 #[derive(Clone)]
 pub(crate) enum FinalizedAssistantContent {
     Reasoning(ReasoningContent),
-    Text { text: Arc<str> },
+    Text {
+        text: Arc<str>,
+    },
+    ToolCall {
+        tool_call_id: ToolCallId,
+        name: ToolName,
+        arguments: BoundedJsonObject,
+    },
 }
 
 impl fmt::Debug for FinalizedAssistantContent {
@@ -1903,6 +1954,7 @@ impl fmt::Debug for FinalizedAssistantContent {
         let kind = match self {
             Self::Reasoning(_) => "reasoning",
             Self::Text { .. } => "text",
+            Self::ToolCall { .. } => "tool_call",
         };
         formatter
             .debug_struct("FinalizedAssistantContent")
@@ -2021,6 +2073,7 @@ fn finalize_provider_result(
     let mut content = Vec::with_capacity(result.content.len());
     let mut has_visible_text = false;
     let mut has_tool_call = false;
+    let mut tool_call_ids = BTreeSet::new();
 
     for block in result.content.iter().cloned() {
         match block {
@@ -2034,8 +2087,32 @@ fn finalize_provider_result(
                 has_visible_text = true;
                 content.push(FinalizedAssistantContent::Text { text });
             }
-            ProviderAttemptContent::ToolCall => {
+            ProviderAttemptContent::ToolCall {
+                tool_call_id,
+                name,
+                arguments,
+            } => {
                 has_tool_call = true;
+                if !tool_call_ids.insert(tool_call_id.clone()) {
+                    return Err(ModelCallError::new(
+                        ModelCallErrorReason::InvalidProviderResponse,
+                    ));
+                }
+                if !request
+                    .input
+                    .tools()
+                    .iter()
+                    .any(|definition| definition.name() == &name)
+                {
+                    return Err(ModelCallError::new(
+                        ModelCallErrorReason::UnexpectedToolCall,
+                    ));
+                }
+                content.push(FinalizedAssistantContent::ToolCall {
+                    tool_call_id,
+                    name,
+                    arguments,
+                });
             }
         }
     }
@@ -2071,7 +2148,12 @@ fn finalize_provider_result(
                 ModelCallErrorReason::InvalidProviderResponse,
             ));
         }
-        ModelFinishReason::Stop | ModelFinishReason::Unknown if !has_visible_text => {
+        ModelFinishReason::Stop if !has_visible_text => {
+            return Err(ModelCallError::new(
+                ModelCallErrorReason::IncompleteResponse,
+            ));
+        }
+        ModelFinishReason::Unknown if !has_tool_call && !has_visible_text => {
             return Err(ModelCallError::new(
                 ModelCallErrorReason::IncompleteResponse,
             ));
@@ -2150,7 +2232,7 @@ mod tests {
         TextIntent,
     };
     use crate::skills::SkillView;
-    use crate::tools::ToolSet;
+    use crate::tools::{ToolDefinition, ToolExecutionMode, ToolExecutionResult, ToolSet};
     use crate::turn_item_interaction::UserMessageSource;
     use crate::wire::{
         AgentRevision, ItemId, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
@@ -2222,6 +2304,13 @@ mod tests {
     }
 
     async fn prompt_set_for_model(model: Arc<TurnModelSnapshot>) -> Arc<crate::prompt::PromptSet> {
+        prompt_set_for_model_with_tools(model, ToolSet::empty()).await
+    }
+
+    async fn prompt_set_for_model_with_tools(
+        model: Arc<TurnModelSnapshot>,
+        tools: Arc<ToolSet>,
+    ) -> Arc<crate::prompt::PromptSet> {
         let service = PromptService::new(
             Arc::from("SECRET required system"),
             Some(Arc::from("SECRET base system")),
@@ -2237,7 +2326,6 @@ mod tests {
             .finish(Arc::from([]), Arc::from([]))
             .unwrap()
             .prompt_context();
-        let tools = ToolSet::empty();
         let skills = SkillView::empty();
         service
             .for_turn(PromptTurnContext::new(
@@ -2256,6 +2344,25 @@ mod tests {
                 model,
             ))
             .unwrap()
+    }
+
+    fn scripted_tool_set() -> Arc<ToolSet> {
+        ToolSet::with_executor(
+            vec![
+                ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            |_| {
+                Box::pin(async {
+                    ToolExecutionResult::completed_text("unused scripted result").unwrap()
+                })
+            },
+        )
     }
 
     fn live_user_context(
@@ -2310,7 +2417,14 @@ mod tests {
     }
 
     async fn request_for_model(model: Arc<TurnModelSnapshot>) -> Arc<ModelCallRequest> {
-        let prompt_set = prompt_set_for_model(Arc::clone(&model)).await;
+        request_for_model_with_tools(model, ToolSet::empty()).await
+    }
+
+    async fn request_for_model_with_tools(
+        model: Arc<TurnModelSnapshot>,
+        tools: Arc<ToolSet>,
+    ) -> Arc<ModelCallRequest> {
+        let prompt_set = prompt_set_for_model_with_tools(Arc::clone(&model), tools).await;
         let (live, revision) = live_user_context(&prompt_set);
         let views = live.capture_conversation_views().unwrap();
         let input = Arc::new(
@@ -2711,7 +2825,11 @@ mod tests {
         };
         let forbidden_tool = ProviderAttemptResult {
             response_id: None,
-            content: Arc::from([ProviderAttemptContent::ToolCall]),
+            content: Arc::from([ProviderAttemptContent::ToolCall {
+                tool_call_id: "call_forbidden".parse().unwrap(),
+                name: "missing".parse().unwrap(),
+                arguments: "{}".parse().unwrap(),
+            }]),
             finish_reason: ModelFinishReason::ToolCalls,
             usage: None,
             metadata: ProviderResponseMetadata::new(None, None, None),
@@ -2782,6 +2900,125 @@ mod tests {
             assert_eq!(error.reason(), expected);
         }
         assert_eq!(adapter.requests().len(), 5);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn allowed_tool_responses_reject_duplicate_ids_but_accept_unknown_finish_reason() {
+        let duplicate_id: ToolCallId = "call_duplicate".parse().unwrap();
+        let adapter = Arc::new(ScriptedProviderAdapter::new(vec![
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([
+                        ProviderAttemptContent::ToolCall {
+                            tool_call_id: duplicate_id.clone(),
+                            name: "echo".parse().unwrap(),
+                            arguments: "{}".parse().unwrap(),
+                        },
+                        ProviderAttemptContent::ToolCall {
+                            tool_call_id: duplicate_id,
+                            name: "echo".parse().unwrap(),
+                            arguments: "{}".parse().unwrap(),
+                        },
+                    ]),
+                    finish_reason: ModelFinishReason::ToolCalls,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+            ScriptedProviderScript::success(
+                Vec::new(),
+                ProviderAttemptResult {
+                    response_id: None,
+                    content: Arc::from([ProviderAttemptContent::ToolCall {
+                        tool_call_id: "call_unknown_finish".parse().unwrap(),
+                        name: "echo".parse().unwrap(),
+                        arguments: "{}".parse().unwrap(),
+                    }]),
+                    finish_reason: ModelFinishReason::Unknown,
+                    usage: None,
+                    metadata: ProviderResponseMetadata::new(None, None, None),
+                },
+            ),
+        ]));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let source = Arc::new(MutableModelSource::new(vec![text_definition(
+            1, 4_096, provider,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let tools = scripted_tool_set();
+        let request = request_for_model_with_tools(Arc::clone(&model), tools).await;
+
+        let duplicate = gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            duplicate.reason(),
+            ModelCallErrorReason::InvalidProviderResponse
+        );
+
+        let accepted = gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            accepted.response().content(),
+            [FinalizedAssistantContent::ToolCall {
+                tool_call_id,
+                name,
+                ..
+            }] if tool_call_id.as_str() == "call_unknown_finish" && name.as_str() == "echo"
+        ));
+        assert_eq!(adapter.requests().len(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_tool_calls_output_contract_rejects_a_non_empty_tool_prompt() {
+        let adapter: Arc<dyn ProviderAdapter> = Arc::new(ScriptedProviderAdapter::new(Vec::new()));
+        let source = Arc::new(MutableModelSource::new(vec![text_definition(
+            1, 4_096, adapter,
+        )]));
+        let source_adapter: Arc<dyn ModelSourceAdapter> = source;
+        let gateway = ModelGateway::new(vec![source_adapter]);
+        let model = gateway
+            .resolve_for_turn(gateway.initialize().await.unwrap(), resolve_request(None))
+            .unwrap();
+        let tool_set = scripted_tool_set();
+        let prompt_set = prompt_set_for_model_with_tools(Arc::clone(&model), tool_set).await;
+        let (live, revision) = live_user_context(&prompt_set);
+        let views = live.capture_conversation_views().unwrap();
+        let contract = OutputContract::NoToolCalls;
+        let input = Arc::new(
+            prompt_set
+                .assemble(PromptAssemblyInput::agent_run(
+                    views.conversation(),
+                    Some(&contract),
+                ))
+                .unwrap(),
+        );
+        assert_eq!(input.tools().len(), 1);
+        assert_eq!(input.tools()[0].name().as_str(), "echo");
+
+        let error = ModelCallRequest::new(model, ModelCallPurpose::AgentRun, input, revision, None)
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            ModelRequestValidationErrorKind::UnsupportedInput
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
