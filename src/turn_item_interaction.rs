@@ -141,6 +141,15 @@ pub(crate) enum InteractionRequest {
     UserQuestion(UserQuestionRequest),
 }
 
+impl fmt::Debug for InteractionRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ToolApproval(_) => formatter.write_str("InteractionRequest::ToolApproval(..)"),
+            Self::UserQuestion(_) => formatter.write_str("InteractionRequest::UserQuestion(..)"),
+        }
+    }
+}
+
 impl InteractionRequest {
     #[cfg(test)]
     pub(crate) fn tool_approval(request: ToolApprovalRequest) -> Self {
@@ -388,6 +397,15 @@ pub(crate) struct ResolvedInteraction {
     view: InteractionResolutionView,
 }
 
+impl fmt::Debug for ResolvedInteraction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedInteraction")
+            .field("resolution", &self.view)
+            .finish()
+    }
+}
+
 impl ResolvedInteraction {
     fn cancelled(reason: InteractionCancelReason) -> Self {
         Self {
@@ -411,14 +429,18 @@ impl ResolvedInteraction {
         &self.view
     }
 
-    /// Clones both the opaque execution value and its safe projection for owner tests without
-    /// broadening the production construction surface.
-    #[cfg(test)]
-    pub(crate) fn clone_for_test(&self) -> Self {
+    pub(crate) fn clone_for_owner(&self) -> Self {
         Self {
             live: self.live.clone(),
             view: self.view.clone(),
         }
+    }
+
+    /// Clones both the opaque execution value and its safe projection for owner tests without
+    /// broadening the production construction surface.
+    #[cfg(test)]
+    pub(crate) fn clone_for_test(&self) -> Self {
+        self.clone_for_owner()
     }
 }
 

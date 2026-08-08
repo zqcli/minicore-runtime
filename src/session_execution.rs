@@ -11,6 +11,7 @@
 //! executor retains its permit (and excludes lifecycle/load changes) for as long as the loaded
 //! executor is live; this constructor does not acquire that permit.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -30,7 +31,10 @@ use crate::durable_state::{
     AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
     DurableSessionDefinitionOutcome, DurableState,
 };
-use crate::live_conversation::LiveSessionState;
+use crate::live_conversation::{
+    InteractionRequestCandidate, InteractionResolutionApplyOutcome, InteractionResolutionCandidate,
+    LiveSessionState,
+};
 use crate::model_gateway::{
     FinalizedAssistantContent, ModelCallErrorReason, ModelCallPurpose, ModelCallRequest,
     ModelCatalogView, ModelGateway, ModelProgressPublisher, ModelRequestValidationErrorKind,
@@ -45,10 +49,12 @@ use crate::tools::{ToolCall, ToolExecutionOutcome, ToolExecutionRequest, ToolSet
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
 };
-use crate::turn_item_interaction::{AssistantDisposition, UserMessageSource};
+use crate::turn_item_interaction::{
+    AssistantDisposition, InteractionRequest, ResolvedInteraction, UserMessageSource,
+};
 use crate::wire::{
-    CommandId, IdGenerationError, ItemId, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
-    WorkspaceRevision,
+    CommandId, IdGenerationError, InteractionResolutionKey, ItemId, RequestId,
+    SessionDefinitionRevision, SessionId, Timestamp, TurnId, WorkspaceRevision,
 };
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshot,
@@ -144,6 +150,7 @@ pub(crate) struct SessionExecutorSnapshot {
     execution_state: SessionExecutionState,
     current_turn: Option<TurnId>,
     last_terminal: Option<(TurnId, SessionTurnTerminal)>,
+    pending_interactions: Arc<[crate::live_conversation::PendingInteractionFact]>,
 }
 
 impl SessionExecutorSnapshot {
@@ -158,6 +165,7 @@ impl SessionExecutorSnapshot {
             execution_state,
             current_turn: None,
             last_terminal: None,
+            pending_interactions: Arc::from([]),
         }
     }
 
@@ -173,6 +181,21 @@ impl SessionExecutorSnapshot {
             execution_state,
             current_turn,
             last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+        }
+    }
+
+    fn with_pending_interactions(
+        &self,
+        pending_interactions: Arc<[crate::live_conversation::PendingInteractionFact]>,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            workspace: Arc::clone(&self.workspace),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            last_terminal: self.last_terminal,
+            pending_interactions,
         }
     }
 
@@ -203,6 +226,12 @@ impl SessionExecutorSnapshot {
     pub(crate) const fn last_terminal(&self) -> Option<(TurnId, SessionTurnTerminal)> {
         self.last_terminal
     }
+
+    pub(crate) fn pending_interactions(
+        &self,
+    ) -> &[crate::live_conversation::PendingInteractionFact] {
+        &self.pending_interactions
+    }
 }
 
 impl fmt::Debug for SessionExecutorSnapshot {
@@ -214,6 +243,7 @@ impl fmt::Debug for SessionExecutorSnapshot {
             .field("execution_state", &self.execution_state)
             .field("current_turn", &self.current_turn)
             .field("last_terminal", &self.last_terminal)
+            .field("pending_interactions", &self.pending_interactions.len())
             .finish()
     }
 }
@@ -296,6 +326,18 @@ pub(crate) enum SessionExecutorSnapshotError {
     #[error("session executor is closing")]
     Closing,
     #[error("session executor dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionInteractionError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("interaction is not pending")]
+    NotFound,
+    #[error("interaction resolution is invalid for the pending request")]
+    InvalidResolution,
+    #[error("session interaction dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
 
@@ -634,6 +676,7 @@ impl SessionExecutor {
             turn_resources,
             active_admission: None,
             active_turn: None,
+            pending_interactions: BTreeMap::new(),
             turn_admission_gate: Arc::clone(&turn_admission_gate),
             events: events.clone(),
             #[cfg(test)]
@@ -832,6 +875,41 @@ impl SessionExecutor {
         })
     }
 
+    pub(crate) async fn resolve_interaction(
+        &self,
+        request_id: RequestId,
+        resolution: ResolvedInteraction,
+    ) -> Result<(), SessionInteractionError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::ResolveInteraction(ResolveInteractionRequest {
+            request_id,
+            resolution: Some(resolution),
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionInteractionError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionInteractionError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionInteractionError::Closing)
+            } else {
+                Err(SessionInteractionError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
@@ -943,6 +1021,7 @@ struct SessionExecutorActor {
     turn_resources: Option<TurnResources>,
     active_admission: Option<ActiveAdmission>,
     active_turn: Option<ActiveTurn>,
+    pending_interactions: BTreeMap<RequestId, ActiveInteraction>,
     turn_admission_gate: Arc<TurnAdmissionGate>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     #[cfg(test)]
@@ -967,6 +1046,12 @@ struct ActiveTurn {
     command_id: CommandId,
     turn_id: TurnId,
     task: Option<TrackedTask>,
+}
+
+struct ActiveInteraction {
+    turn_id: TurnId,
+    item_id: ItemId,
+    resolution_sender: oneshot::Sender<ResolvedInteraction>,
 }
 
 #[derive(Clone)]
@@ -1059,6 +1144,7 @@ impl SessionExecutorActor {
         self.receiver.close();
         self.execution_state = SessionExecutionState::Finishing;
         self.install_current_state(SessionExecutionState::Finishing);
+        self.pending_interactions.clear();
         let mut requests_drained = false;
         let mut normal_exit = true;
 
@@ -1156,6 +1242,9 @@ impl SessionExecutorActor {
             }
             SessionExecutorRequest::Submit(request) => {
                 self.start_admission(request)?;
+            }
+            SessionExecutorRequest::ResolveInteraction(request) => {
+                self.resolve_interaction_request(request).await?;
             }
         }
         Ok(())
@@ -1298,10 +1387,17 @@ impl SessionExecutorActor {
         let completion_sender = self.completion_sender.clone();
         let turn_id = active.turn_id;
         let guard = TurnCompletionGuard::new(completion_sender, turn_id);
+        let interaction_completion_sender = self.completion_sender.clone();
         let worker = async move {
             let mut guard = guard;
-            let terminal =
-                run_active_turn(context, resources.model_gateway, conversation, turn_id).await;
+            let terminal = run_active_turn(
+                context,
+                resources.model_gateway,
+                conversation,
+                turn_id,
+                interaction_completion_sender,
+            )
+            .await;
             guard.complete(terminal);
         };
         match self.task_context.spawn_tracked(worker) {
@@ -1323,6 +1419,96 @@ impl SessionExecutorActor {
         Ok(())
     }
 
+    async fn handle_interaction_requested(
+        &mut self,
+        completion: InteractionRequestedCompletion,
+    ) -> Result<(), ActorFatality> {
+        if self.closing.is_cancelled() {
+            return Ok(());
+        }
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            return Err(ActorFatality::Internal);
+        };
+        if active_turn.turn_id != completion.turn_id {
+            return Err(ActorFatality::Internal);
+        }
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let candidate = InteractionRequestCandidate::new(
+            completion.request_id,
+            completion.item_id,
+            completion.request,
+        );
+        let fact = lock(&conversation.live_state)
+            .apply_interaction_request(candidate, completion.turn_id, SystemClock.now())
+            .map_err(|_| ActorFatality::Integrity)?;
+        let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+        self.pending_interactions.insert(
+            completion.request_id,
+            ActiveInteraction {
+                turn_id: completion.turn_id,
+                item_id: completion.item_id,
+                resolution_sender: completion.resolution_sender,
+            },
+        );
+        self.publish_pending_interactions()?;
+        Ok(())
+    }
+
+    async fn resolve_interaction_request(
+        &mut self,
+        request: &mut ResolveInteractionRequest,
+    ) -> Result<(), ActorFatality> {
+        let Some(resolution) = request.resolution.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        if !self.pending_interactions.contains_key(&request.request_id) {
+            request.settle(Err(SessionInteractionError::NotFound));
+            return Ok(());
+        }
+        let resolution_for_worker = resolution.clone_for_owner();
+        let key = InteractionResolutionKey::generate().map_err(|_| ActorFatality::Internal)?;
+        let candidate = InteractionResolutionCandidate::host(request.request_id, key, resolution)
+            .map_err(|_| ActorFatality::Integrity)?;
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let apply = lock(&conversation.live_state)
+            .apply_interaction_resolution(candidate, SystemClock.now())
+            .map_err(|_| SessionInteractionError::InvalidResolution);
+        let fact = match apply {
+            Ok(InteractionResolutionApplyOutcome::Applied(fact)) => fact,
+            Ok(InteractionResolutionApplyOutcome::Idempotent { .. }) => {
+                request.settle(Err(SessionInteractionError::NotFound));
+                return Ok(());
+            }
+            Err(error) => {
+                request.settle(Err(error));
+                return Ok(());
+            }
+        };
+        let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+        let active = self
+            .pending_interactions
+            .remove(&request.request_id)
+            .ok_or(ActorFatality::Internal)?;
+        let _ = active.item_id;
+        self.publish_pending_interactions()?;
+        let _ = active.resolution_sender.send(resolution_for_worker);
+        request.settle(Ok(()));
+        Ok(())
+    }
+
+    fn publish_pending_interactions(&mut self) -> Result<(), ActorFatality> {
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let pending = lock(&conversation.live_state).pending_interaction_facts();
+        self.publish_current(Arc::new(self.current.with_pending_interactions(pending)));
+        Ok(())
+    }
+
     async fn handle_turn_completion(
         &mut self,
         completion: TurnCompletion,
@@ -1336,6 +1522,12 @@ impl SessionExecutorActor {
         };
         if active.turn_id != completion.turn_id {
             return Err(ActorFatality::Internal);
+        }
+        let pending_before = self.pending_interactions.len();
+        self.pending_interactions
+            .retain(|_, interaction| interaction.turn_id != active.turn_id);
+        if self.pending_interactions.len() != pending_before {
+            self.publish_pending_interactions()?;
         }
         let Some(conversation) = self.conversation.as_ref() else {
             return Err(ActorFatality::Integrity);
@@ -1517,6 +1709,9 @@ impl SessionExecutorActor {
             }
             ExecutorCompletion::Admission(completion) => {
                 self.handle_admission_completion(completion).await
+            }
+            ExecutorCompletion::InteractionRequested(completion) => {
+                self.handle_interaction_requested(completion).await
             }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
         }
@@ -1715,6 +1910,7 @@ impl SessionExecutorActor {
     fn close_for_fatal(&mut self, _fatality: ActorFatality) {
         self.turn_admission_gate.close();
         self.closing.cancel();
+        self.pending_interactions.clear();
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
         self.durable_state.request_closing();
@@ -1756,7 +1952,17 @@ fn valid_durable_definition_shape(
 enum ExecutorCompletion {
     Publication(PublicationCompletion),
     Admission(AdmissionCompletion),
+    InteractionRequested(InteractionRequestedCompletion),
     Turn(TurnCompletion),
+}
+
+struct InteractionRequestedCompletion {
+    turn_id: TurnId,
+    item_id: ItemId,
+    tool_call_id: crate::tools::ToolCallId,
+    request_id: RequestId,
+    request: InteractionRequest,
+    resolution_sender: oneshot::Sender<ResolvedInteraction>,
 }
 
 struct PublicationCompletion {
@@ -1891,6 +2097,7 @@ async fn run_active_turn(
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> SessionTurnTerminal {
     if context.turn_id() != turn_id {
         return SessionTurnTerminal::Failed(SessionTurnFailure::Internal);
@@ -1900,6 +2107,7 @@ async fn run_active_turn(
         model_gateway,
         Arc::clone(&conversation),
         turn_id,
+        interaction_completion_sender,
     )
     .await;
     match result {
@@ -1930,6 +2138,7 @@ async fn run_active_turn_inner(
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     loop {
         let captured = lock(&conversation.live_state)
@@ -2042,6 +2251,53 @@ async fn run_active_turn_inner(
         let tool_results = context.tool_set().execute_round(requests).await;
         let mut abandoned = false;
         for outcome in tool_results {
+            let outcome = match outcome {
+                ToolExecutionOutcome::Interaction {
+                    item_id,
+                    tool_call_id,
+                    request_id,
+                    request,
+                    resolution_sender,
+                    resolution_receiver,
+                    allowed,
+                    denied,
+                } => {
+                    let completion = InteractionRequestedCompletion {
+                        turn_id,
+                        item_id,
+                        tool_call_id: tool_call_id.clone(),
+                        request_id,
+                        request,
+                        resolution_sender,
+                    };
+                    if interaction_completion_sender
+                        .send(ExecutorCompletion::InteractionRequested(completion))
+                        .is_err()
+                    {
+                        ToolExecutionOutcome::Abandoned {
+                            item_id,
+                            tool_call_id,
+                            reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+                        }
+                    } else {
+                        match resolution_receiver.await {
+                            Ok(resolution) => ToolSet::settle_interaction(
+                                item_id,
+                                tool_call_id,
+                                *allowed,
+                                *denied,
+                                resolution,
+                            ),
+                            Err(_) => ToolExecutionOutcome::Abandoned {
+                                item_id,
+                                tool_call_id,
+                                reason: crate::tools::ToolAbandonReason::RuntimeFailure,
+                            },
+                        }
+                    }
+                }
+                outcome => outcome,
+            };
             let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
             abandoned |= matches!(&stored, StoredToolOutcome::Abandoned { .. });
             let fact = lock(&conversation.live_state)
@@ -2109,6 +2365,7 @@ fn stored_tool_outcome(
             tool_call_id,
             StoredToolOutcome::Abandoned { reason },
         )),
+        ToolExecutionOutcome::Interaction { .. } => Err(SessionTurnFailure::Internal),
     }
 }
 
@@ -2403,6 +2660,30 @@ struct SubmitRequest {
     response: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
 }
 
+struct ResolveInteractionRequest {
+    request_id: RequestId,
+    resolution: Option<ResolvedInteraction>,
+    response: Option<oneshot::Sender<Result<(), SessionInteractionError>>>,
+}
+
+impl ResolveInteractionRequest {
+    fn settle(&mut self, outcome: Result<(), SessionInteractionError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionInteractionError::Closing));
+    }
+}
+
+impl Drop for ResolveInteractionRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 struct SubscribeRequest {
     response:
         Option<oneshot::Sender<Result<SessionExecutorSubscription, SessionExecutorSnapshotError>>>,
@@ -2497,6 +2778,7 @@ enum SessionExecutorRequest {
     Update(WorkspaceDefinitionRequest),
     Snapshot(SnapshotRequest),
     Submit(SubmitRequest),
+    ResolveInteraction(ResolveInteractionRequest),
     Subscribe(SubscribeRequest),
     #[cfg(test)]
     StartingProbe(StartingProbeRequest),
@@ -2508,6 +2790,7 @@ impl SessionExecutorRequest {
             Self::Update(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
+            Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
             #[cfg(test)]
             Self::StartingProbe(request) => request.reject_closing(),
@@ -3038,7 +3321,7 @@ mod tests {
     use crate::model_gateway::ScriptedModelFixture;
     use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
-    use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
+    use crate::wire::{CanonicalFileUri, FileUriFamily, RequestId, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
         WorkspaceRootInput, WorkspaceRootKey, WorkspaceSourcePolicy, lower_workspace,
@@ -3700,6 +3983,188 @@ mod tests {
                     if matches!(content[0].as_ref(), crate::prompt::ModelAssistantContentRef::Text("tool complete"))
             ));
         }
+        executor.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripted_tool_interaction_is_snapshot_resolved_and_recorded_before_next_model_call() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_approval",
+            "echo",
+            "{\"value\":1}",
+            "denied tool round complete",
+        );
+        let request_id: RequestId = "req_33333333333333333333333333333333".parse().unwrap();
+        let interaction_request =
+            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        let denied = ToolExecutionResult::PreExecution {
+            disposition: crate::tools::ToolResultDisposition::Denied,
+            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                "approval denied".to_owned(),
+            ])
+            .unwrap(),
+        };
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let interaction_request = interaction_request.clone();
+                let allowed = allowed.clone();
+                let denied = denied.clone();
+                move |_| {
+                    let interaction_request = interaction_request.clone();
+                    let allowed = allowed.clone();
+                    let denied = denied.clone();
+                    Box::pin(async move {
+                        ToolExecutionResult::Interaction {
+                            request_id,
+                            request: interaction_request,
+                            allowed: Box::new(allowed),
+                            denied: Box::new(denied),
+                        }
+                    })
+                }
+            },
+        );
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+                tool_set,
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+
+        let turn_id = executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = executor.snapshot().await.unwrap();
+                if snapshot.pending_interactions().len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Interaction request is projected");
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+
+        let resolution = interaction_request
+            .resolve_host(
+                crate::turn_item_interaction::InteractionHostResolutionInput::ToolApproval(
+                    crate::tools::ToolApprovalDecisionInput::Deny,
+                ),
+            )
+            .unwrap();
+        executor
+            .resolve_interaction(request_id, resolution)
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        assert!(
+            executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        let recording =
+            fs::read_to_string(store.session_path().join("conversation.jsonl")).unwrap();
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("approval denied"));
+        assert!(recording.contains("denied"));
         executor.close().await.unwrap();
         state.close().await;
     }

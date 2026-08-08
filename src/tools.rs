@@ -5,7 +5,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
+use tokio::sync::oneshot;
 
+use crate::turn_item_interaction::{
+    InteractionRequest, InteractionResolution, ResolvedInteraction,
+};
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_opaque_ascii,
     validate_safe_text, validate_stable_symbolic_key,
@@ -253,6 +257,16 @@ pub(crate) enum ToolExecutionResult {
         disposition: ToolResultDisposition,
         content: ToolResultContent,
     },
+    PreExecution {
+        disposition: ToolResultDisposition,
+        content: ToolResultContent,
+    },
+    Interaction {
+        request_id: crate::wire::RequestId,
+        request: InteractionRequest,
+        allowed: Box<ToolExecutionResult>,
+        denied: Box<ToolExecutionResult>,
+    },
     Abandoned {
         reason: ToolAbandonReason,
     },
@@ -271,7 +285,7 @@ impl ToolExecutionResult {
 pub(crate) type ToolExecutionFuture =
     Pin<Box<dyn Future<Output = ToolExecutionResult> + Send + 'static>>;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) enum ToolExecutionOutcome {
     Completed {
         item_id: ItemId,
@@ -279,6 +293,16 @@ pub(crate) enum ToolExecutionOutcome {
         source: ToolOutcomeSource,
         disposition: ToolResultDisposition,
         content: ToolResultContent,
+    },
+    Interaction {
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        request_id: crate::wire::RequestId,
+        request: InteractionRequest,
+        resolution_sender: oneshot::Sender<ResolvedInteraction>,
+        resolution_receiver: oneshot::Receiver<ResolvedInteraction>,
+        allowed: Box<ToolExecutionResult>,
+        denied: Box<ToolExecutionResult>,
     },
     Abandoned {
         item_id: ItemId,
@@ -391,6 +415,94 @@ impl ToolSet {
                 item_id,
                 tool_call_id,
                 source: ToolOutcomeSource::Executed,
+                disposition,
+                content,
+            },
+            ToolExecutionResult::PreExecution {
+                disposition,
+                content,
+            } => ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
+                disposition,
+                content,
+            },
+            ToolExecutionResult::Interaction {
+                request_id,
+                request,
+                allowed,
+                denied,
+            } => {
+                let (resolution_sender, resolution_receiver) = oneshot::channel();
+                ToolExecutionOutcome::Interaction {
+                    item_id,
+                    tool_call_id,
+                    request_id,
+                    request,
+                    resolution_sender,
+                    resolution_receiver,
+                    allowed,
+                    denied,
+                }
+            }
+            ToolExecutionResult::Abandoned { reason } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason,
+            },
+        }
+    }
+
+    pub(crate) fn settle_interaction(
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        allowed: ToolExecutionResult,
+        denied: ToolExecutionResult,
+        resolution: ResolvedInteraction,
+    ) -> ToolExecutionOutcome {
+        let result = match resolution.live() {
+            InteractionResolution::ToolApproval(ToolApprovalDecision::Deny)
+            | InteractionResolution::Cancelled(_) => denied,
+            InteractionResolution::ToolApproval(_) | InteractionResolution::UserAnswer(_) => {
+                allowed
+            }
+        };
+        Self::bind_result(item_id, tool_call_id, result)
+    }
+
+    fn bind_result(
+        item_id: ItemId,
+        tool_call_id: ToolCallId,
+        result: ToolExecutionResult,
+    ) -> ToolExecutionOutcome {
+        match result {
+            ToolExecutionResult::Completed {
+                disposition: ToolResultDisposition::Denied,
+                content: _,
+            }
+            | ToolExecutionResult::Interaction { .. } => ToolExecutionOutcome::Abandoned {
+                item_id,
+                tool_call_id,
+                reason: ToolAbandonReason::OutcomeUnknown,
+            },
+            ToolExecutionResult::Completed {
+                disposition,
+                content,
+            } => ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::Executed,
+                disposition,
+                content,
+            },
+            ToolExecutionResult::PreExecution {
+                disposition,
+                content,
+            } => ToolExecutionOutcome::Completed {
+                item_id,
+                tool_call_id,
+                source: ToolOutcomeSource::PreExecution,
                 disposition,
                 content,
             },
@@ -1695,6 +1807,9 @@ mod tests {
             .map(|result| match result {
                 ToolExecutionOutcome::Completed { content, .. } => {
                     content.parts()[0].as_text().to_owned()
+                }
+                ToolExecutionOutcome::Interaction { .. } => {
+                    panic!("unexpected interaction result")
                 }
                 ToolExecutionOutcome::Abandoned { .. } => panic!("unexpected abandoned result"),
             })

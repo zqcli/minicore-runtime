@@ -339,6 +339,7 @@ enum InteractionState {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct PendingInteractionFact {
     request_id: RequestId,
     turn_id: TurnId,
@@ -1055,8 +1056,19 @@ impl LiveSessionState {
     ) -> Result<CapturedConversationViews, LiveConversationError> {
         let source = self.fresh_compaction_source()?;
         let messages = self.flatten_stable_messages();
-        let pending_interactions = self
-            .interactions
+        let pending_interactions = self.pending_interaction_facts().to_vec();
+
+        Ok(CapturedConversationViews {
+            conversation: LiveConversationView::from_live_state(self.revision, messages.into()),
+            compaction_source: source,
+            selected_head: self.selected_path.last().map(|entry| entry.entry_id()),
+            relations: self.relations.clone().into(),
+            pending_interactions: pending_interactions.into(),
+        })
+    }
+
+    pub(crate) fn pending_interaction_facts(&self) -> Arc<[PendingInteractionFact]> {
+        self.interactions
             .iter()
             .filter_map(|interaction| {
                 if matches!(interaction.state, InteractionState::Pending) {
@@ -1070,15 +1082,8 @@ impl LiveSessionState {
                     None
                 }
             })
-            .collect::<Vec<_>>();
-
-        Ok(CapturedConversationViews {
-            conversation: LiveConversationView::from_live_state(self.revision, messages.into()),
-            compaction_source: source,
-            selected_head: self.selected_path.last().map(|entry| entry.entry_id()),
-            relations: self.relations.clone().into(),
-            pending_interactions: pending_interactions.into(),
-        })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     fn require_current_turn(&self, turn_id: TurnId) -> Result<(), LiveConversationError> {
