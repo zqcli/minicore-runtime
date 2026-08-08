@@ -56,6 +56,7 @@ enum VectorSlice {
     Foundation,
     M1,
     M2Initial,
+    M7,
     M8,
     M9,
     M10,
@@ -137,6 +138,7 @@ fn every_active_public_manifest_vector_uses_an_exported_production_seam() {
             VectorSlice::Foundation
             | VectorSlice::M1
             | VectorSlice::M2Initial
+            | VectorSlice::M7
             | VectorSlice::M8
             | VectorSlice::M9
             | VectorSlice::M10
@@ -300,6 +302,14 @@ fn assert_command_response_semantics(
             assert_eq!(error.code(), CommandErrorCode::SessionBusy);
             assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
             assert!(matches!(error.subject(), Some(PublicSubject::Session(_))));
+        }
+        (Some("ingress_backoff_rejection"), CommandCompletion::Rejected(error)) => {
+            assert!(matches!(
+                error.retry(),
+                RetryAdvice::RetryWithBackoff {
+                    retry_after: Some(_)
+                }
+            ));
         }
         (
             Some("command_output_completion"),

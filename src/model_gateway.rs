@@ -1194,6 +1194,84 @@ impl fmt::Debug for ModelGateway {
 }
 
 #[cfg(test)]
+pub(crate) struct ScriptedModelFixture {
+    gateway: Arc<ModelGateway>,
+    catalog: Arc<ModelCatalogView>,
+    adapter: Arc<ScriptedProviderAdapter>,
+}
+
+#[cfg(test)]
+impl ScriptedModelFixture {
+    pub(crate) fn new(responses: Vec<&str>) -> Self {
+        Self::with_context_window_tokens(responses, 128_000)
+    }
+
+    pub(crate) fn with_context_window_tokens(
+        responses: Vec<&str>,
+        context_window_tokens: u32,
+    ) -> Self {
+        let scripts = responses
+            .into_iter()
+            .map(|text| {
+                ScriptedProviderScript::success(
+                    Vec::new(),
+                    ProviderAttemptResult {
+                        response_id: None,
+                        content: Arc::from([ProviderAttemptContent::Text(Arc::from(text))]),
+                        finish_reason: ModelFinishReason::Stop,
+                        usage: None,
+                        metadata: ProviderResponseMetadata::new(None, None, None),
+                    },
+                )
+            })
+            .collect();
+        let adapter = Arc::new(ScriptedProviderAdapter::new(scripts));
+        let provider: Arc<dyn ProviderAdapter> = adapter.clone();
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(
+                NonZeroU32::new(context_window_tokens),
+                NonZeroU32::new(8_192),
+            ),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            provider,
+        )
+        .unwrap();
+        let gateway = Arc::new(ModelGateway::new(Vec::new()));
+        let mut definitions = BTreeMap::new();
+        definitions.insert(definition.selection.clone(), Arc::new(definition));
+        let catalog = Arc::new(ModelCatalogView {
+            owner: Arc::clone(&gateway.owner),
+            definitions,
+        });
+        Self {
+            gateway,
+            catalog,
+            adapter,
+        }
+    }
+
+    pub(crate) const fn gateway(&self) -> &Arc<ModelGateway> {
+        &self.gateway
+    }
+
+    pub(crate) const fn catalog(&self) -> &Arc<ModelCatalogView> {
+        &self.catalog
+    }
+
+    pub(crate) fn request_count(&self) -> usize {
+        self.adapter.requests().len()
+    }
+}
+
+#[cfg(test)]
 struct ScriptedProviderAdapter {
     scripts: std::sync::Mutex<std::collections::VecDeque<ScriptedProviderScript>>,
     requests: std::sync::Mutex<Vec<Arc<ModelCallRequest>>>,

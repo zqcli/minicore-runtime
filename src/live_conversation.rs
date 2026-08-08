@@ -12,9 +12,9 @@ use crate::compaction::{
 };
 use crate::prompt::{ModelAssistantContent, ModelMessage};
 use crate::turn_item_interaction::{
-    InteractionCancelReason, InteractionRequest, InteractionRequestView, InteractionResolution,
-    InteractionResolutionViewRef, ItemContentFamily, ItemRelation, ResolvedInteraction,
-    UserMessageSource,
+    AssistantDisposition, InteractionCancelReason, InteractionRequest, InteractionRequestView,
+    InteractionResolution, InteractionResolutionViewRef, ItemContentFamily, ItemRelation,
+    ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
     EntryId, InteractionResolutionKey, ItemId, RequestId, SessionId, Timestamp, TurnId,
@@ -664,6 +664,50 @@ impl LiveSessionState {
             entry,
             revision: self.revision,
         })
+    }
+
+    pub(crate) fn complete_with_assistant_message(
+        &mut self,
+        body: StoredAssistantMessage,
+        turn_id: TurnId,
+        timestamp: Timestamp,
+    ) -> Result<AppliedConversationFact, LiveConversationError> {
+        if body.disposition() != AssistantDisposition::Final
+            || body
+                .content()
+                .iter()
+                .any(|content| matches!(content, StoredAssistantContent::ToolCall { .. }))
+        {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidTurn,
+            ));
+        }
+        let fact = self.apply_assistant_message(body, turn_id, timestamp)?;
+        debug_assert!(self.tool_exchange.is_none());
+        self.current_turn = None;
+        Ok(fact)
+    }
+
+    pub(crate) fn fail_current_turn(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<(), LiveConversationError> {
+        self.require_current_turn(turn_id)?;
+        if self.tool_exchange.is_some() {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::PendingToolExchange,
+            ));
+        }
+        self.current_turn = None;
+        Ok(())
+    }
+
+    pub(crate) const fn current_turn(&self) -> Option<TurnId> {
+        self.current_turn
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
     }
 
     pub(crate) fn apply_tool_message(

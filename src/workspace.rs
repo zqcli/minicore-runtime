@@ -1940,6 +1940,12 @@ pub(crate) struct WorkspaceSnapshotCandidate {
 }
 
 impl WorkspaceSnapshotCandidate {
+    #[cfg(test)]
+    pub(crate) fn with_revision_for_test(mut self, revision: WorkspaceRevision) -> Self {
+        self.revision = revision;
+        self
+    }
+
     fn new(
         session_id: SessionId,
         revision: WorkspaceRevision,

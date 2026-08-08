@@ -387,7 +387,7 @@ def check_public() -> None:
     assert set(paths) == actual, (set(paths) - actual, actual - set(paths))
 
     allowed_statuses = {"active", "pending"}
-    allowed_slices = {"foundation", "m1", "m2_initial", "m8", "m9", "m10", "m11"}
+    allowed_slices = {"foundation", "m1", "m2_initial", "m7", "m8", "m9", "m10", "m11"}
     active = 0
     pending = 0
 

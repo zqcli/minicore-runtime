@@ -37,14 +37,18 @@ use crate::durable_state::{
     DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
     DurableSessionLifecycleError, DurableSessionLifecycleOutcome, DurableState,
 };
-use crate::prompt::{PromptError, PromptErrorKind, PromptService};
+use crate::model_gateway::{ModelCatalogView, ModelGateway};
+use crate::prompt::{
+    PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
+};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
-    LoadedSessionConversation, SessionExecutor, SessionExecutorCloseError, SessionExecutorSnapshot,
-    SessionExecutorSnapshotError, SessionExecutorStartError, SessionWorkspaceDefinitionError,
-    SessionWorkspaceDefinitionOutcome,
+    LoadedSessionConversation, SessionExecutor, SessionExecutorCloseError,
+    SessionExecutorDependencies, SessionExecutorSnapshot, SessionExecutorSnapshotError,
+    SessionExecutorStartError, SessionExecutorSubscription, SessionSubmitError,
+    SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
 };
-use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp};
+use crate::wire::{CommandId, SessionDefinitionRevision, SessionId, Timestamp, TurnId};
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshotFinishError,
 };
@@ -122,6 +126,38 @@ pub(crate) enum SessionResidencySnapshotError {
     SessionNotLoaded,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencySubmitError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session execution is busy")]
+    SessionBusy,
+    #[error("loaded session execution dependencies are unavailable")]
+    DependencyUnavailable,
+    #[error("agent is unavailable for execution")]
+    AgentUnavailable,
+    #[error("turn prompt capture failed")]
+    Prompt,
+    #[error("turn input is invalid")]
+    InvalidArgument,
+    #[error("turn input exceeds the model context limit")]
+    ContextOverflow,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencySubscriptionError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session event publisher is unavailable")]
+    PublisherUnavailable,
 }
 
 /// Redacted failures from one loaded Workspace definition publication request.
@@ -298,6 +334,18 @@ impl ResidencyShared {
             .loaded
             .get(&session_id)
             .map(|loaded| loaded.executor.clone())
+    }
+
+    fn loaded_session_snapshots(&self) -> Vec<Arc<SessionExecutorSnapshot>> {
+        let executors = lock(&self.state)
+            .loaded
+            .values()
+            .map(|loaded| loaded.executor.clone())
+            .collect::<Vec<_>>();
+        executors
+            .into_iter()
+            .map(|executor| executor.published_snapshot())
+            .collect()
     }
 
     fn install_if_open(
@@ -695,10 +743,18 @@ struct OperationContext {
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
     prompt_service: Arc<PromptService>,
+    turn_resources: Option<ResidencyTurnResources>,
     closing: CancellationToken,
     failure: Arc<RegistryFailureState>,
     #[cfg(test)]
     replay_preparation_barrier: Option<Arc<ReplayPreparationBarrier>>,
+}
+
+#[derive(Clone)]
+struct ResidencyTurnResources {
+    prompt_resources: Arc<PromptResourceView>,
+    model_gateway: Arc<ModelGateway>,
+    model_catalog: Arc<ModelCatalogView>,
 }
 
 impl OperationContext {
@@ -996,6 +1052,7 @@ struct SessionResidencyActor {
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
     prompt_service: Arc<PromptService>,
+    turn_resources: Option<ResidencyTurnResources>,
     state: Arc<ResidencyShared>,
     failure: Arc<RegistryFailureState>,
     active_waiters: Arc<ActiveWaiters>,
@@ -1054,6 +1111,7 @@ impl SessionResidencyActor {
             durable_state: self.durable_state.clone(),
             resolver: Arc::clone(&self.resolver),
             prompt_service: Arc::clone(&self.prompt_service),
+            turn_resources: self.turn_resources.clone(),
             closing: self.closing.clone(),
             failure: Arc::clone(&self.failure),
             #[cfg(test)]
@@ -1459,13 +1517,49 @@ impl fmt::Debug for SessionResidencyRegistry {
 }
 
 impl SessionResidencyRegistry {
-    /// Starts the residency actor.  The durable state and resolver are retained by the actor and
-    /// by any admitted owner-tracked child work; no raw Tokio task handle escapes this method.
+    pub(crate) fn loaded_session_snapshots(&self) -> Vec<Arc<SessionExecutorSnapshot>> {
+        self.shared.loaded_session_snapshots()
+    }
+
+    /// Starts a test-only residency actor without Turn resources.
+    #[cfg(test)]
     pub(crate) fn start(
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
         prompt_service: Arc<PromptService>,
+    ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_inner(task_context, durable_state, resolver, prompt_service, None)
+    }
+
+    pub(crate) fn start_with_turn_resources(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+    ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_inner(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            Some(ResidencyTurnResources {
+                prompt_resources,
+                model_gateway,
+                model_catalog,
+            }),
+        )
+    }
+
+    fn start_inner(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        turn_resources: Option<ResidencyTurnResources>,
     ) -> Result<Self, SessionResidencyStartError> {
         let closing = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(SESSION_RESIDENCY_REQUEST_QUEUE_CAPACITY);
@@ -1482,6 +1576,7 @@ impl SessionResidencyRegistry {
             durable_state: durable_state.clone(),
             resolver,
             prompt_service,
+            turn_resources,
             state: Arc::clone(&shared),
             failure: Arc::clone(&failure),
             active_waiters: Arc::clone(&active_waiters),
@@ -1631,6 +1726,59 @@ impl SessionResidencyRegistry {
         waiter
             .await
             .unwrap_or_else(|_| self.snapshot_waiter_fallback())
+    }
+
+    pub(crate) async fn submit(
+        &self,
+        session_id: SessionId,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<TurnId, SessionResidencySubmitError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencySubmitError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencySubmitError::SessionNotLoaded)?;
+        executor
+            .submit(command_id, intent)
+            .await
+            .map_err(|error| match error {
+                SessionSubmitError::Closing => SessionResidencySubmitError::Closing,
+                SessionSubmitError::SessionBusy => SessionResidencySubmitError::SessionBusy,
+                SessionSubmitError::DependencyUnavailable => {
+                    SessionResidencySubmitError::DependencyUnavailable
+                }
+                SessionSubmitError::AgentUnavailable => {
+                    SessionResidencySubmitError::AgentUnavailable
+                }
+                SessionSubmitError::Prompt => SessionResidencySubmitError::Prompt,
+                SessionSubmitError::InvalidArgument => SessionResidencySubmitError::InvalidArgument,
+                SessionSubmitError::ContextOverflow => SessionResidencySubmitError::ContextOverflow,
+                SessionSubmitError::InternalDispatchUnavailable => {
+                    SessionResidencySubmitError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionExecutorSubscription, SessionResidencySubscriptionError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencySubscriptionError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencySubscriptionError::SessionNotLoaded)?;
+        executor.subscribe().await.map_err(|error| match error {
+            SessionExecutorSnapshotError::Closing => SessionResidencySubscriptionError::Closing,
+            SessionExecutorSnapshotError::InternalDispatchUnavailable => {
+                SessionResidencySubscriptionError::PublisherUnavailable
+            }
+        })
     }
 
     /// Routes a loaded Workspace definition replacement to the installed executor.
@@ -1972,15 +2120,42 @@ async fn run_load(
         recorder_for_executor,
         replay_diagnostics,
     );
-    let executor = match SessionExecutor::start_loaded_ready_idle(
-        context.task_context.clone(),
-        context.durable_state.clone(),
-        Arc::clone(&context.resolver),
-        Arc::clone(&context.prompt_service),
-        definition,
-        workspace_snapshot,
-        conversation,
-    ) {
+    let executor_result = match context.turn_resources.as_ref() {
+        Some(resources) => SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources(
+                context.task_context.clone(),
+                context.durable_state.clone(),
+                Arc::clone(&context.resolver),
+                Arc::clone(&context.prompt_service),
+                Arc::clone(&resources.prompt_resources),
+                Arc::clone(&resources.model_gateway),
+                Arc::clone(&resources.model_catalog),
+            ),
+            definition,
+            workspace_snapshot,
+            conversation,
+        ),
+        None => {
+            #[cfg(test)]
+            {
+                SessionExecutor::start_loaded_ready_idle(
+                    context.task_context.clone(),
+                    context.durable_state.clone(),
+                    Arc::clone(&context.resolver),
+                    Arc::clone(&context.prompt_service),
+                    definition,
+                    workspace_snapshot,
+                    conversation,
+                )
+            }
+            #[cfg(not(test))]
+            {
+                recorder.close().await;
+                return Err(context.internal_load());
+            }
+        }
+    };
+    let executor = match executor_result {
         Ok(executor) => executor,
         Err(SessionExecutorStartError::Closing) => {
             recorder.close().await;

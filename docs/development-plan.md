@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof、owner-tracked SessionRecorder physical append及全部七个 `slice = m5_1` Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现并通过独立全量验证；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition、Runtime-owned PromptService/initial PromptResourceView、Workspace Prompt candidate capture在Load与loaded Workspace publication中的接入，以及owner-bound empty SkillView/ToolSet foundation已实现；M6.2 scripted text-only ModelGateway foundation已完成AgentRun Prompt assembly/proof、model resolution/request、single provider attempt、progress/final/error validation、cancel linearization和Runtime-owned initial empty catalog；complete shared-root publication、concrete source discovery、Skill source capture、Structured/Tool/Compaction assembly、production Rig adapter、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof、owner-tracked SessionRecorder physical append及全部七个 `slice = m5_1` Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现并通过独立全量验证；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition、Runtime-owned PromptService/initial PromptResourceView、Workspace Prompt candidate capture在Load与loaded Workspace publication中的接入，以及owner-bound empty SkillView/ToolSet foundation已实现；M6.2 scripted text-only ModelGateway foundation已完成AgentRun Prompt assembly/proof、model resolution/request、single provider attempt、progress/final/error validation、cancel linearization和Runtime-owned initial empty catalog；M7 ordinary AgentRun vertical slice已完成public Create/Load/Submit/Snapshot/Subscribe/Unload、immutable Turn context capture、Input/final Assistant live apply与inline record、single scripted model attempt、terminal Event、Unload/Load replay，以及context overflow、Recorder failure和busy/Unload关键路径；complete shared-root publication、concrete source discovery、Skill source capture、Structured/Tool/Compaction assembly、production Rig adapter与grace/cancel式active-Turn Unload仍pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -53,9 +53,9 @@ M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 
 当前不能视为已完成：
 
-- M2 public protocol route/DTO families与完整manifest closure；
-- M5 semantic replay/corruption sidecars；
-- full SessionExecutor Turn behavior、ActiveTurnTask和public scripted Runtime vertical slice；
+- M2 remaining public protocol DTO families与完整manifest closure；
+- M8–M10 Tool/Interaction/Cancel、queues/logical retry、Skill composition与Compaction；
+- M11 remaining Fork anchors/LiveSnapshot与full recovery conformance；
 - production provider与sandbox adapter。
 
 M4已完成Prompt-owned opaque `ModelMessage`、`ConversationRevision`/`EntryIdGenerator`、`LiveSessionState` User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset。Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。
@@ -455,7 +455,7 @@ provider-neutral request/result seam稳定后立即并行运行private Rig reali
 
 ## M7 · Ordinary AgentRun Vertical Slice
 
-当前进度：crate-private loaded Ready+Idle `SessionExecutor`与Runtime-owned residency actor foundation Completed。它已消费single-flight Load、coherent durable head+definition capture/final recheck、opaque residency permit、per-Session typed gate、draining Unload、Archive/Delete unloaded exclusion、unified loaded/unloaded Workspace update、caller-drop independence、child reap/gate cleanup、pre-close reserved request drain及shutdown cancellation retention；Load还已消费DurableState-issued target，在owner-tracked blocking work中replay、authorized partial-tail truncate、cold `LiveSessionState` seed与Recorder initialization，并由executor close drain Recorder；本次conformance slice进一步证明admitted Load cancellation、replay worker故障映射、degraded Recorder initialization、stale Workspace candidate拒绝及完成append后的cold replay；public dispatch/snapshot/event、active-Turn grace Unload、Turn admission与ActiveTurnTask仍Pending。
+当前进度：Completed。public `MiniCoreRuntime` facade已驱动Create/Load/Submit/Snapshot/Subscribe/Unload；Submit admission捕获exact Session/Agent/Workspace/Prompt/Model bindings，Input live apply与inline record后返回`TurnStarted`，one ActiveTurnTask完成一次text-only ModelGateway request、final Assistant apply/record和Completed/Failed settlement；subscription保持snapshot-first并携带matching terminal detail，Unload等待已经进入的ordinary Turn完成，cold Load只恢复recorded prefix且`current_turn = None`。端到端与fault tests覆盖successful User/Assistant replay、context overflow时provider零调用、Recorder failure不重复Model request、concurrent Submit Busy及Unload drain。
 
 实现：
 

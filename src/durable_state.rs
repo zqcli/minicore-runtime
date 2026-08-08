@@ -1794,6 +1794,19 @@ struct AgentPublicationPermit {
     _guard: Arc<AgentPublicationGuard>,
 }
 
+/// The short read side of the Agent lifecycle gate used only for initiating Input apply.
+pub(crate) struct AgentAdmissionPermit {
+    _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum AgentAdmissionError {
+    #[error("agent admission is closing")]
+    Closing,
+    #[error("agent is unavailable for execution")]
+    AgentUnavailable,
+}
+
 struct AgentPublicationGuard {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
@@ -1836,6 +1849,12 @@ impl AgentLifecycleGateRegistry {
             _guard: Arc::new(AgentMutationGuard {
                 _guard: self.gate(agent_id).write_owned().await,
             }),
+        }
+    }
+
+    async fn acquire_admission(&self, agent_id: AgentId) -> AgentAdmissionPermit {
+        AgentAdmissionPermit {
+            _guard: self.gate(agent_id).read_owned().await,
         }
     }
 
@@ -9475,7 +9494,6 @@ pub(crate) struct DurableState {
     )]
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
     published_agents: Arc<Mutex<BTreeMap<AgentId, DurableAgentCatalogEntry>>>,
-    #[cfg(test)]
     agent_lifecycle_gates: Arc<AgentLifecycleGateRegistry>,
     sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
     published_sessions: Arc<Mutex<BTreeMap<SessionId, DurableSessionCatalogEntry>>>,
@@ -9485,6 +9503,26 @@ pub(crate) struct DurableState {
 }
 
 impl DurableState {
+    pub(crate) async fn acquire_agent_admission(
+        &self,
+        reference: AgentRevisionRef,
+    ) -> Result<AgentAdmissionPermit, AgentAdmissionError> {
+        let permit = tokio::select! {
+            biased;
+            _ = self.actor.closing.cancelled() => return Err(AgentAdmissionError::Closing),
+            permit = self.agent_lifecycle_gates.acquire_admission(reference.agent_id()) => permit,
+        };
+        let head = self
+            .agent_head(reference.agent_id())
+            .ok_or(AgentAdmissionError::AgentUnavailable)?;
+        if head.status() != AgentStatus::Enabled
+            || !self.contains_agent_definition(reference.agent_id(), reference.revision())
+        {
+            return Err(AgentAdmissionError::AgentUnavailable);
+        }
+        Ok(permit)
+    }
+
     /// Opens a Store V1 root and recovers the currently supported immutable catalog slice.
     /// Every filesystem operation runs in one tracked blocking job, never on a Tokio worker.
     pub(crate) async fn open(
@@ -9555,7 +9593,6 @@ impl DurableState {
             filesystem: state_filesystem,
             agents: Arc::clone(agents),
             published_agents,
-            #[cfg(test)]
             agent_lifecycle_gates,
             sessions: Arc::clone(sessions),
             published_sessions,

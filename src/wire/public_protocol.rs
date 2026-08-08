@@ -22,8 +22,7 @@ use crate::runtime_interface::{
     SessionRecordingState, SessionRecordingView, SessionSnapshot, SessionStateEventKind,
     SessionUsageView, SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg,
     SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
-    command_error_code_allows_retry_with_backoff, validate_command_error_contract,
-    validate_command_error_message, validate_command_output,
+    validate_command_error_contract, validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
 use crate::workspace::{
@@ -42,7 +41,7 @@ use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
     WireV1Codec,
 };
-use super::{CanonicalFileUri, Money, Timestamp, WorkspaceRelativePath};
+use super::{CanonicalFileUri, Duration, Money, Timestamp, WorkspaceRelativePath};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeRequestKind {
@@ -2790,19 +2789,29 @@ impl PublicIngressLaneInput {
 }
 
 #[derive(Deserialize)]
-struct RetryAdviceInput {
-    #[serde(rename = "type")]
-    kind: String,
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum RetryAdviceInput {
+    DoNotRetry,
+    RefreshAndRetry,
+    RetryWithBackoff(RetryWithBackoffInput),
+    UserActionRequired,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryWithBackoffInput {
+    retry_after: Option<Duration>,
 }
 
 impl RetryAdviceInput {
     fn into_semantic(self) -> Result<RetryAdvice, TypedJsonError> {
-        Ok(match self.kind.as_str() {
-            "do_not_retry" => RetryAdvice::DoNotRetry,
-            "refresh_and_retry" => RetryAdvice::RefreshAndRetry,
-            "user_action_required" => RetryAdvice::UserActionRequired,
-            "retry_with_backoff" => return Err(TypedJsonError::PendingPublicTarget),
-            _ => return Err(unknown_output_variant()),
+        Ok(match self {
+            Self::DoNotRetry => RetryAdvice::DoNotRetry,
+            Self::RefreshAndRetry => RetryAdvice::RefreshAndRetry,
+            Self::RetryWithBackoff(value) => RetryAdvice::RetryWithBackoff {
+                retry_after: value.retry_after,
+            },
+            Self::UserActionRequired => RetryAdvice::UserActionRequired,
         })
     }
 }
@@ -3046,19 +3055,30 @@ impl PublicIngressLaneOutput {
 }
 
 #[derive(Serialize)]
-struct RetryAdviceOutput {
-    #[serde(rename = "type")]
-    kind: &'static str,
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum RetryAdviceOutput {
+    DoNotRetry,
+    RefreshAndRetry,
+    RetryWithBackoff(RetryWithBackoffOutput),
+    UserActionRequired,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetryWithBackoffOutput {
+    retry_after: Option<Duration>,
 }
 
 impl RetryAdviceOutput {
     const fn from_semantic(value: RetryAdvice) -> Self {
-        let kind = match value {
-            RetryAdvice::DoNotRetry => "do_not_retry",
-            RetryAdvice::RefreshAndRetry => "refresh_and_retry",
-            RetryAdvice::UserActionRequired => "user_action_required",
-        };
-        Self { kind }
+        match value {
+            RetryAdvice::DoNotRetry => Self::DoNotRetry,
+            RetryAdvice::RefreshAndRetry => Self::RefreshAndRetry,
+            RetryAdvice::RetryWithBackoff { retry_after } => {
+                Self::RetryWithBackoff(RetryWithBackoffOutput { retry_after })
+            }
+            RetryAdvice::UserActionRequired => Self::UserActionRequired,
+        }
     }
 }
 
@@ -3536,28 +3556,14 @@ fn validate_command_error(node: &JsonNode, limits: ProtocolLimits) -> Result<(),
         .ok_or_else(typed_wrong_json_type)?;
     validate_command_error_message(message, limits.text.max_diagnostic_message_bytes as usize)
         .map_err(|_| invalid_scalar())?;
-    let pending_retry = match validate_retry_advice(required(object, "retry")?)? {
-        ValidatedRetryAdvice::Current(retry) => {
-            validate_command_error_contract(code, retry).map_err(|_| invalid_scalar())?;
-            false
-        }
-        ValidatedRetryAdvice::RetryWithBackoff => {
-            if !command_error_code_allows_retry_with_backoff(code) {
-                return Err(invalid_scalar());
-            }
-            true
-        }
-    };
+    let retry = validate_retry_advice(required(object, "retry")?)?;
+    validate_command_error_contract(code, retry).map_err(|_| invalid_scalar())?;
     if let Some(subject) = object.get("subject") {
         if !matches!(subject, JsonNode::Null) {
             validate_public_subject(subject)?;
         }
     }
-    if pending_retry {
-        Err(TypedJsonError::PendingPublicTarget)
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 fn validate_command_error_code(node: &JsonNode) -> Result<CommandErrorCode, TypedJsonError> {
@@ -3614,26 +3620,32 @@ fn validate_command_error_code(node: &JsonNode) -> Result<CommandErrorCode, Type
     Ok(code)
 }
 
-enum ValidatedRetryAdvice {
-    Current(RetryAdvice),
-    RetryWithBackoff,
-}
-
-fn validate_retry_advice(node: &JsonNode) -> Result<ValidatedRetryAdvice, TypedJsonError> {
+fn validate_retry_advice(node: &JsonNode) -> Result<RetryAdvice, TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     let kind = required(object, "type")?
         .as_str()
         .ok_or_else(selected_wrong_json_type)?;
     let data = object.get("data");
     let retry = match kind {
-        "do_not_retry" => ValidatedRetryAdvice::Current(RetryAdvice::DoNotRetry),
-        "refresh_and_retry" => ValidatedRetryAdvice::Current(RetryAdvice::RefreshAndRetry),
-        "user_action_required" => ValidatedRetryAdvice::Current(RetryAdvice::UserActionRequired),
+        "do_not_retry" => RetryAdvice::DoNotRetry,
+        "refresh_and_retry" => RetryAdvice::RefreshAndRetry,
+        "user_action_required" => RetryAdvice::UserActionRequired,
         "retry_with_backoff" => {
-            data.ok_or_else(missing_required_field)?
+            let object = data
+                .ok_or_else(missing_required_field)?
                 .as_object()
                 .ok_or_else(selected_wrong_json_type)?;
-            return Ok(ValidatedRetryAdvice::RetryWithBackoff);
+            let retry_after = match required(object, "retryAfter")? {
+                JsonNode::Null => None,
+                value => {
+                    let raw = value.as_number().ok_or_else(typed_wrong_json_type)?.raw();
+                    let milliseconds = raw.parse::<u64>().map_err(|_| invalid_scalar())?;
+                    let milliseconds =
+                        u32::try_from(milliseconds).map_err(|_| duration_out_of_range())?;
+                    Some(Duration::new(milliseconds).map_err(|_| duration_out_of_range())?)
+                }
+            };
+            return Ok(RetryAdvice::RetryWithBackoff { retry_after });
         }
         _ => return Err(unknown_output_variant()),
     };
@@ -5323,6 +5335,13 @@ fn invalid_scalar() -> TypedJsonError {
     public_fault(
         PublicDecodeStage::TypedScalar,
         PublicDecodeCode::InvalidScalar,
+    )
+}
+
+fn duration_out_of_range() -> TypedJsonError {
+    public_fault(
+        PublicDecodeStage::TypedScalar,
+        PublicDecodeCode::DurationOutOfRange,
     )
 }
 

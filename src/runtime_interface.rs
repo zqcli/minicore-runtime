@@ -8,8 +8,8 @@ use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
 use crate::wire::lexical::{normalize_newlines, validate_safe_text, validate_stable_symbolic_key};
 use crate::wire::{
-    AgentId, CommandId, ItemId, Money, ProtocolLimits, RequestId, SessionDefinitionRevision,
-    SessionId, SessionMetadataRevision, Timestamp, TurnId,
+    AgentId, CommandId, Duration, ItemId, Money, ProtocolLimits, RequestId,
+    SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp, TurnId,
 };
 use crate::workspace::{WorkspaceDefinitionInput, WorkspaceDefinitionSummaryView};
 
@@ -502,29 +502,23 @@ pub(crate) fn validate_command_error_contract(
         CommandErrorCode::AgentDisabled
         | CommandErrorCode::SessionArchived
         | CommandErrorCode::SessionNotLoaded
-        | CommandErrorCode::SessionNotReady
         | CommandErrorCode::ReloadValidationFailed
         | CommandErrorCode::Unauthorized
         | CommandErrorCode::DurableStateCorrupt
         | CommandErrorCode::DurableStateTooLarge => retry == RetryAdvice::UserActionRequired,
-        CommandErrorCode::Unavailable => retry == RetryAdvice::DoNotRetry,
-        CommandErrorCode::IngressLaneFull { .. } | CommandErrorCode::RuntimeClosing => false,
+        CommandErrorCode::SessionNotReady => {
+            retry == RetryAdvice::UserActionRequired || retry.is_backoff()
+        }
+        CommandErrorCode::Unavailable => retry == RetryAdvice::DoNotRetry || retry.is_backoff(),
+        CommandErrorCode::IngressLaneFull { .. } | CommandErrorCode::RuntimeClosing => {
+            retry.is_backoff()
+        }
     };
     if valid {
         Ok(())
     } else {
         Err(CommandValueError::InvalidErrorContract)
     }
-}
-
-pub(crate) const fn command_error_code_allows_retry_with_backoff(code: CommandErrorCode) -> bool {
-    matches!(
-        code,
-        CommandErrorCode::IngressLaneFull { .. }
-            | CommandErrorCode::SessionNotReady
-            | CommandErrorCode::Unavailable
-            | CommandErrorCode::RuntimeClosing
-    )
 }
 
 pub(crate) fn validate_command_output(text: &str, maximum: usize) -> Result<(), CommandValueError> {
@@ -597,7 +591,14 @@ pub enum PublicIngressLane {
 pub enum RetryAdvice {
     DoNotRetry,
     RefreshAndRetry,
+    RetryWithBackoff { retry_after: Option<Duration> },
     UserActionRequired,
+}
+
+impl RetryAdvice {
+    const fn is_backoff(self) -> bool {
+        matches!(self, Self::RetryWithBackoff { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1675,3 +1676,101 @@ pub enum RuntimeDispatchError {
     #[error("runtime dispatch owner is unavailable")]
     InternalDispatchUnavailable,
 }
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QueryErrorCode {
+    InvalidArgument,
+    NotFound,
+    SessionNotLoaded,
+    StaleCursor,
+    ResultTooLarge,
+    Unavailable,
+    DurableStateCorrupt,
+    DurableStateTooLarge,
+    RuntimeClosing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SnapshotErrorCode {
+    NotFound,
+    SessionNotLoaded,
+    Unavailable,
+    RuntimeClosing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SubscriptionErrorCode {
+    UnsupportedScope,
+    NotFound,
+    SessionNotLoaded,
+    PublisherUnavailable,
+    RuntimeClosing,
+}
+
+macro_rules! public_route_error {
+    ($name:ident, $code:ident) => {
+        #[derive(Clone, Eq, PartialEq)]
+        pub struct $name {
+            code: $code,
+            message: Box<str>,
+            retry: RetryAdvice,
+            subject: Option<PublicSubject>,
+        }
+
+        impl $name {
+            pub(crate) fn new(
+                code: $code,
+                message: &'static str,
+                retry: RetryAdvice,
+                subject: Option<PublicSubject>,
+            ) -> Self {
+                debug_assert!(
+                    validate_safe_text(
+                        message,
+                        ProtocolLimits::v1_0().text.max_diagnostic_message_bytes as usize,
+                        false,
+                    )
+                    .is_ok()
+                );
+                Self {
+                    code,
+                    message: message.into(),
+                    retry,
+                    subject,
+                }
+            }
+
+            pub const fn code(&self) -> $code {
+                self.code
+            }
+
+            pub fn message(&self) -> &str {
+                &self.message
+            }
+
+            pub const fn retry(&self) -> RetryAdvice {
+                self.retry
+            }
+
+            pub const fn subject(&self) -> Option<&PublicSubject> {
+                self.subject.as_ref()
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct(stringify!($name))
+                    .field("code", &self.code)
+                    .field("message", &"<redacted>")
+                    .field("retry", &self.retry)
+                    .field("subject", &self.subject)
+                    .finish()
+            }
+        }
+    };
+}
+
+public_route_error!(QueryError, QueryErrorCode);
+public_route_error!(SnapshotError, SnapshotErrorCode);
+public_route_error!(SubscriptionError, SubscriptionErrorCode);
