@@ -43,10 +43,10 @@ use crate::prompt::{
 };
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
-    LoadedSessionConversation, SessionExecutor, SessionExecutorCloseError,
-    SessionExecutorDependencies, SessionExecutorSnapshot, SessionExecutorSnapshotError,
-    SessionExecutorStartError, SessionExecutorSubscription, SessionSubmitError,
-    SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
+    LoadedSessionConversation, SessionCancelError, SessionCancelTarget, SessionExecutor,
+    SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorSnapshot,
+    SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
+    SessionSubmitError, SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
 };
 use crate::tools::ToolSet;
 use crate::wire::{CommandId, SessionDefinitionRevision, SessionId, Timestamp, TurnId};
@@ -147,6 +147,28 @@ pub(crate) enum SessionResidencySubmitError {
     InvalidArgument,
     #[error("turn input exceeds the model context limit")]
     ContextOverflow,
+    #[error("the Submit was cancelled before Turn start")]
+    Cancelled,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyCancelError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("the Submit is no longer cancellable")]
+    SubmitNotCancellable,
+    #[error("the Turn target does not match the active Turn")]
+    ExpectedTurnMismatch,
+    #[error("the Turn is not running")]
+    TurnNotRunning,
+    #[error("the Turn is already cancelling")]
+    TurnCancelling,
+    #[error("the Turn is already terminal")]
+    TurnTerminal,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1785,8 +1807,45 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::Prompt => SessionResidencySubmitError::Prompt,
                 SessionSubmitError::InvalidArgument => SessionResidencySubmitError::InvalidArgument,
                 SessionSubmitError::ContextOverflow => SessionResidencySubmitError::ContextOverflow,
+                SessionSubmitError::Cancelled => SessionResidencySubmitError::Cancelled,
                 SessionSubmitError::InternalDispatchUnavailable => {
                     SessionResidencySubmitError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn cancel(
+        &self,
+        session_id: SessionId,
+        target: SessionCancelTarget,
+        timestamp: Timestamp,
+    ) -> Result<(), SessionResidencyCancelError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencyCancelError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencyCancelError::SessionNotLoaded)?;
+        executor
+            .cancel(target, timestamp)
+            .await
+            .map_err(|error| match error {
+                SessionCancelError::Closing => SessionResidencyCancelError::Closing,
+                SessionCancelError::SessionNotLoaded => {
+                    SessionResidencyCancelError::SessionNotLoaded
+                }
+                SessionCancelError::SubmitNotCancellable => {
+                    SessionResidencyCancelError::SubmitNotCancellable
+                }
+                SessionCancelError::ExpectedTurnMismatch => {
+                    SessionResidencyCancelError::ExpectedTurnMismatch
+                }
+                SessionCancelError::TurnNotRunning => SessionResidencyCancelError::TurnNotRunning,
+                SessionCancelError::TurnCancelling => SessionResidencyCancelError::TurnCancelling,
+                SessionCancelError::TurnTerminal => SessionResidencyCancelError::TurnTerminal,
+                SessionCancelError::InternalDispatchUnavailable => {
+                    SessionResidencyCancelError::InternalDispatchUnavailable
                 }
             })
     }
