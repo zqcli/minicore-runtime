@@ -1264,6 +1264,29 @@ impl ScriptedModelFixture {
         Self::from_scripts(scripts, 128_000)
     }
 
+    pub(crate) fn with_failure_reasons_then_responses(
+        failures: Vec<ModelCallErrorReason>,
+        responses: Vec<&str>,
+    ) -> Self {
+        let scripts = failures
+            .into_iter()
+            .map(|reason| ScriptedProviderScript::failure(ProviderAttemptError::new(reason)))
+            .chain(responses.into_iter().map(|text| {
+                ScriptedProviderScript::success(
+                    Vec::new(),
+                    ProviderAttemptResult {
+                        response_id: None,
+                        content: Arc::from([ProviderAttemptContent::Text(Arc::from(text))]),
+                        finish_reason: ModelFinishReason::Stop,
+                        usage: None,
+                        metadata: ProviderResponseMetadata::new(None, None, None),
+                    },
+                )
+            }))
+            .collect();
+        Self::from_scripts(scripts, 128_000)
+    }
+
     fn from_scripts(scripts: Vec<ScriptedProviderScript>, context_window_tokens: u32) -> Self {
         let adapter = Arc::new(ScriptedProviderAdapter::new(scripts));
         let provider: Arc<dyn ProviderAdapter> = adapter.clone();
@@ -1308,6 +1331,10 @@ impl ScriptedModelFixture {
 
     pub(crate) fn request_count(&self) -> usize {
         self.adapter.requests().len()
+    }
+
+    pub(crate) fn requests(&self) -> Vec<Arc<ModelCallRequest>> {
+        self.adapter.requests()
     }
 }
 
@@ -1870,6 +1897,7 @@ pub(crate) enum ModelCallErrorReason {
 pub(crate) struct ModelCallError {
     reason: ModelCallErrorReason,
     retry_after: Option<Duration>,
+    delivery: ProviderRequestDeliveryState,
 }
 
 #[cfg_attr(
@@ -1881,6 +1909,7 @@ impl ModelCallError {
         Self {
             reason,
             retry_after: None,
+            delivery: ProviderRequestDeliveryState::NotSent,
         }
     }
 
@@ -1910,6 +1939,7 @@ impl ModelCallError {
             } else {
                 None
             },
+            delivery: error.delivery,
         }
     }
 
@@ -1920,6 +1950,10 @@ impl ModelCallError {
     pub(crate) const fn retry_after(&self) -> Option<Duration> {
         self.retry_after
     }
+
+    pub(crate) const fn delivery(&self) -> ProviderRequestDeliveryState {
+        self.delivery
+    }
 }
 
 impl fmt::Debug for ModelCallError {
@@ -1928,6 +1962,7 @@ impl fmt::Debug for ModelCallError {
             .debug_struct("ModelCallError")
             .field("reason", &self.reason)
             .field("retry_after", &self.retry_after)
+            .field("delivery", &self.delivery)
             .finish()
     }
 }
