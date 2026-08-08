@@ -13,25 +13,27 @@ use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandRequest, CommandResponse, EventFrame, LoadedSessionSummary, PublicSubject, QueryError,
-    QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
-    RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot,
-    RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary, SessionExecutionView,
-    SessionMetadataView, SessionReadinessView, SessionRecordingState, SessionRecordingView,
-    SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse,
-    StateEvent, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope,
-    TurnCommand, TurnFailureView,
+    CommandRequest, CommandResponse, EventFrame, LoadedSessionSummary, PublicCancelTarget,
+    PublicSubject, QueryError, QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities,
+    RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
+    RuntimeSnapshot, RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary,
+    SessionExecutionView, SessionMetadataView, SessionReadinessView, SessionRecordingState,
+    SessionRecordingView, SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest,
+    SnapshotResponse, StateEvent, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, TurnFailureView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
-    SessionExecutionState, SessionExecutorSnapshot, SessionExecutorSubscription,
-    SessionTurnFailure, SessionTurnTerminal, SessionWorkspaceDefinitionOutcome,
+    SessionCancelTarget, SessionExecutionState, SessionExecutorSnapshot,
+    SessionExecutorSubscription, SessionTurnFailure, SessionTurnTerminal,
+    SessionWorkspaceDefinitionOutcome,
 };
 use crate::session_residency::{
-    SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
-    SessionResidencyRegistry, SessionResidencySnapshotError, SessionResidencyStartError,
-    SessionResidencySubmitError, SessionResidencySubscriptionError, SessionResidencyUnloadError,
-    SessionResidencyUnloadOutcome, SessionResidencyWorkspaceDefinitionError,
+    SessionResidencyCancelError, SessionResidencyLifecycleError, SessionResidencyLoadError,
+    SessionResidencyLoadOutcome, SessionResidencyRegistry, SessionResidencySnapshotError,
+    SessionResidencyStartError, SessionResidencySubmitError, SessionResidencySubscriptionError,
+    SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
+    SessionResidencyWorkspaceDefinitionError,
 };
 use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision};
 use crate::workspace::{
@@ -471,12 +473,24 @@ impl RuntimeInner {
                     Err(error) => map_submit_error(command_id, session_id, error)?,
                 }
             }
-            RuntimeCommand::Turn(TurnCommand::Cancel { session_id, .. }) => rejected_completion(
-                CommandErrorCode::SubmitNotCancellable,
-                "turn cancellation is not available in this runtime slice",
-                RetryAdvice::RefreshAndRetry,
-                Some(PublicSubject::Session(session_id)),
-            ),
+            RuntimeCommand::Turn(TurnCommand::Cancel { session_id, target }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                let target = match target {
+                    PublicCancelTarget::Submit(command_id) => {
+                        SessionCancelTarget::Submit(command_id)
+                    }
+                    PublicCancelTarget::Turn(turn_id) => SessionCancelTarget::Turn(turn_id),
+                };
+                match residency
+                    .cancel(session_id, target, SystemClock.now())
+                    .await
+                {
+                    Ok(()) => completed_output("cancel accepted"),
+                    Err(error) => map_cancel_error(command_id, session_id, error)?,
+                }
+            }
             RuntimeCommand::Runtime(_) => rejected_completion(
                 CommandErrorCode::ReloadValidationFailed,
                 "shared resource reload is not available in this runtime slice",
@@ -1048,7 +1062,69 @@ fn map_submit_error(
             RetryAdvice::DoNotRetry,
             subject,
         ),
+        SessionResidencySubmitError::Cancelled => rejected_completion(
+            CommandErrorCode::TurnCancelling,
+            "turn cancellation is in progress",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
         SessionResidencySubmitError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_cancel_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyCancelError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyCancelError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyCancelError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyCancelError::SubmitNotCancellable => rejected_completion(
+            CommandErrorCode::SubmitNotCancellable,
+            "the Submit is no longer cancellable",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyCancelError::ExpectedTurnMismatch => rejected_completion(
+            CommandErrorCode::ExpectedTurnMismatch,
+            "the Turn target does not match the active Turn",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyCancelError::TurnNotRunning => rejected_completion(
+            CommandErrorCode::TurnNotRunning,
+            "the Turn is not running",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyCancelError::TurnCancelling => rejected_completion(
+            CommandErrorCode::TurnCancelling,
+            "the Turn is already cancelling",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyCancelError::TurnTerminal => rejected_completion(
+            CommandErrorCode::TurnTerminal,
+            "the Turn is already terminal",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyCancelError::InternalDispatchUnavailable => {
             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
         }
     };

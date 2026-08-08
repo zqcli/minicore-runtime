@@ -341,6 +341,26 @@ pub(crate) enum SessionInteractionError {
     InternalDispatchUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionCancelError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("the Session is not loaded")]
+    SessionNotLoaded,
+    #[error("the Submit is no longer cancellable")]
+    SubmitNotCancellable,
+    #[error("the Turn target does not match the active Turn")]
+    ExpectedTurnMismatch,
+    #[error("the Turn is not running")]
+    TurnNotRunning,
+    #[error("the Turn is already cancelling")]
+    TurnCancelling,
+    #[error("the Turn is already terminal")]
+    TurnTerminal,
+    #[error("session cancellation dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 /// Redacted failure from joining one loaded Session executor during Unload/shutdown.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionExecutorCloseError {
@@ -377,8 +397,16 @@ pub(crate) enum SessionSubmitError {
     InvalidArgument,
     #[error("turn input exceeds the model context limit")]
     ContextOverflow,
+    #[error("the Submit was cancelled before Turn start")]
+    Cancelled,
     #[error("session turn dispatch is unavailable")]
     InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionCancelTarget {
+    Submit(CommandId),
+    Turn(TurnId),
 }
 
 #[derive(Clone)]
@@ -912,6 +940,41 @@ impl SessionExecutor {
         })
     }
 
+    pub(crate) async fn cancel(
+        &self,
+        target: SessionCancelTarget,
+        timestamp: Timestamp,
+    ) -> Result<(), SessionCancelError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::Cancel(CancelRequest {
+            target,
+            timestamp,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionCancelError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionCancelError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionCancelError::Closing)
+            } else {
+                Err(SessionCancelError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
@@ -1041,12 +1104,14 @@ struct ActiveAdmission {
     command_id: CommandId,
     turn_id: TurnId,
     waiter: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
+    cancellation: CancellationToken,
     task: Option<TrackedTask>,
 }
 
 struct ActiveTurn {
     command_id: CommandId,
     turn_id: TurnId,
+    cancellation: CancellationToken,
     task: Option<TrackedTask>,
 }
 
@@ -1248,6 +1313,9 @@ impl SessionExecutorActor {
             SessionExecutorRequest::ResolveInteraction(request) => {
                 self.resolve_interaction_request(request).await?;
             }
+            SessionExecutorRequest::Cancel(request) => {
+                self.cancel_request(request).await?;
+            }
         }
         Ok(())
     }
@@ -1284,8 +1352,16 @@ impl SessionExecutorActor {
             command_id,
             turn_id,
             waiter,
+            cancellation: CancellationToken::new(),
             task: None,
         });
+
+        let cancellation = self
+            .active_admission
+            .as_ref()
+            .expect("admission is installed before spawning")
+            .cancellation
+            .clone();
 
         let completion_sender = self.completion_sender.clone();
         let durable_state = self.durable_state.clone();
@@ -1308,6 +1384,7 @@ impl SessionExecutorActor {
                 resources,
                 conversation,
                 turn_admission_gate,
+                cancellation,
                 turn_id,
                 intent,
                 #[cfg(test)]
@@ -1373,6 +1450,7 @@ impl SessionExecutorActor {
         let Some(resources) = self.turn_resources.as_ref().cloned() else {
             return Err(ActorFatality::Integrity);
         };
+        let cancellation = active.cancellation.clone();
         self.execution_state = SessionExecutionState::Running;
         let current = Arc::new(self.current.with_execution(
             SessionExecutionState::Running,
@@ -1383,36 +1461,47 @@ impl SessionExecutorActor {
         self.active_turn = Some(ActiveTurn {
             command_id: active.command_id,
             turn_id: active.turn_id,
+            cancellation: cancellation.clone(),
             task: None,
         });
 
-        let completion_sender = self.completion_sender.clone();
         let turn_id = active.turn_id;
-        let guard = TurnCompletionGuard::new(completion_sender, turn_id);
-        let interaction_completion_sender = self.completion_sender.clone();
-        let worker = async move {
-            let mut guard = guard;
-            let terminal = run_active_turn(
-                context,
-                resources.model_gateway,
-                conversation,
-                turn_id,
-                interaction_completion_sender,
-            )
-            .await;
-            guard.complete(terminal);
-        };
-        match self.task_context.spawn_tracked(worker) {
-            Ok(task) => {
-                self.active_turn
-                    .as_mut()
-                    .expect("active Turn is installed before spawn")
-                    .task = Some(task);
-            }
-            Err(RuntimeTaskError::OwnerClosing) => {}
-            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
-                self.task_context.request_closing();
-                self.durable_state.request_closing();
+        if cancellation.is_cancelled() {
+            let _ = self
+                .completion_sender
+                .send(ExecutorCompletion::Turn(TurnCompletion {
+                    turn_id,
+                    terminal: SessionTurnTerminal::Failed(SessionTurnFailure::Model),
+                }));
+        } else {
+            let completion_sender = self.completion_sender.clone();
+            let guard = TurnCompletionGuard::new(completion_sender, turn_id);
+            let interaction_completion_sender = self.completion_sender.clone();
+            let worker = async move {
+                let mut guard = guard;
+                let terminal = run_active_turn(
+                    context,
+                    resources.model_gateway,
+                    conversation,
+                    turn_id,
+                    cancellation,
+                    interaction_completion_sender,
+                )
+                .await;
+                guard.complete(terminal);
+            };
+            match self.task_context.spawn_tracked(worker) {
+                Ok(task) => {
+                    self.active_turn
+                        .as_mut()
+                        .expect("active Turn is installed before spawn")
+                        .task = Some(task);
+                }
+                Err(RuntimeTaskError::OwnerClosing) => {}
+                Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                    self.task_context.request_closing();
+                    self.durable_state.request_closing();
+                }
             }
         }
         if let Some(waiter) = active.waiter.take() {
@@ -1455,6 +1544,14 @@ impl SessionExecutorActor {
             },
         );
         self.publish_pending_interactions()?;
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(|active_turn| active_turn.cancellation.is_cancelled())
+        {
+            self.cancel_pending_interaction(completion.request_id, completion.timestamp)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1499,6 +1596,118 @@ impl SessionExecutorActor {
         self.publish_pending_interactions()?;
         let _ = active.resolution_sender.send(resolution_for_worker);
         request.settle(Ok(()));
+        Ok(())
+    }
+
+    async fn cancel_request(&mut self, request: &mut CancelRequest) -> Result<(), ActorFatality> {
+        match request.target {
+            SessionCancelTarget::Submit(command_id) => {
+                let Some(active) = self.active_admission.as_ref() else {
+                    request.settle(Err(SessionCancelError::SubmitNotCancellable));
+                    return Ok(());
+                };
+                if active.command_id != command_id {
+                    request.settle(Err(SessionCancelError::SubmitNotCancellable));
+                    return Ok(());
+                }
+                if active.cancellation.is_cancelled() {
+                    request.settle(Err(SessionCancelError::TurnCancelling));
+                    return Ok(());
+                }
+                active.cancellation.cancel();
+                request.settle(Ok(()));
+            }
+            SessionCancelTarget::Turn(turn_id) => {
+                if let Some(active) = self.active_admission.as_ref() {
+                    if active.turn_id != turn_id {
+                        request.settle(Err(SessionCancelError::ExpectedTurnMismatch));
+                        return Ok(());
+                    }
+                    if active.cancellation.is_cancelled() {
+                        request.settle(Err(SessionCancelError::TurnCancelling));
+                        return Ok(());
+                    }
+                    active.cancellation.cancel();
+                    request.settle(Ok(()));
+                    return Ok(());
+                }
+
+                let Some(active) = self.active_turn.as_ref() else {
+                    let error = if self
+                        .current
+                        .last_terminal()
+                        .is_some_and(|(terminal_turn, _)| terminal_turn == turn_id)
+                    {
+                        SessionCancelError::TurnTerminal
+                    } else {
+                        SessionCancelError::TurnNotRunning
+                    };
+                    request.settle(Err(error));
+                    return Ok(());
+                };
+                if active.turn_id != turn_id {
+                    request.settle(Err(SessionCancelError::ExpectedTurnMismatch));
+                    return Ok(());
+                }
+                if active.cancellation.is_cancelled() {
+                    request.settle(Err(SessionCancelError::TurnCancelling));
+                    return Ok(());
+                }
+                active.cancellation.cancel();
+                let pending = self
+                    .pending_interactions
+                    .iter()
+                    .filter_map(|(request_id, interaction)| {
+                        (interaction.turn_id == turn_id).then_some(*request_id)
+                    })
+                    .collect::<Vec<_>>();
+                request.settle(Ok(()));
+                for request_id in pending {
+                    self.cancel_pending_interaction(request_id, request.timestamp)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel_pending_interaction(
+        &mut self,
+        request_id: RequestId,
+        timestamp: Timestamp,
+    ) -> Result<(), ActorFatality> {
+        let Some(active) = self.pending_interactions.get(&request_id) else {
+            return Ok(());
+        };
+        let turn_id = active.turn_id;
+        let candidate = InteractionResolutionCandidate::owner_cancellation(
+            request_id,
+            crate::turn_item_interaction::InteractionCancelReason::TurnCancelled,
+        )
+        .map_err(|_| ActorFatality::Integrity)?;
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let fact = match lock(&conversation.live_state)
+            .apply_interaction_resolution(candidate, timestamp)
+            .map_err(|_| ActorFatality::Integrity)?
+        {
+            InteractionResolutionApplyOutcome::Applied(fact) => fact,
+            InteractionResolutionApplyOutcome::Idempotent { .. } => return Ok(()),
+        };
+        let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+        let active = self
+            .pending_interactions
+            .remove(&request_id)
+            .ok_or(ActorFatality::Internal)?;
+        self.publish_pending_interactions()?;
+        let _ = active.resolution_sender.send(
+            ResolvedInteraction::cancelled_by_owner(
+                crate::turn_item_interaction::InteractionCancelReason::TurnCancelled,
+            )
+            .ok_or(ActorFatality::Integrity)?,
+        );
+        debug_assert_eq!(active.turn_id, turn_id);
         Ok(())
     }
 
@@ -2004,6 +2213,7 @@ enum CompletionHandling {
 
 struct AdmissionWork {
     closing: CancellationToken,
+    cancellation: CancellationToken,
     durable_state: DurableState,
     definition: Arc<SessionDefinition>,
     workspace: Arc<WorkspaceSnapshot>,
@@ -2022,6 +2232,7 @@ async fn run_admission(
 ) -> Result<Arc<TurnExecutionContext>, SessionSubmitError> {
     let AdmissionWork {
         closing,
+        cancellation,
         durable_state,
         definition,
         workspace,
@@ -2037,11 +2248,15 @@ async fn run_admission(
     if closing.is_cancelled() {
         return Err(SessionSubmitError::Closing);
     }
+    if cancellation.is_cancelled() {
+        return Err(SessionSubmitError::Cancelled);
+    }
     let agent_read = durable_state.read_agent_definition(definition.agent());
     tokio::pin!(agent_read);
     let agent = tokio::select! {
         biased;
         _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
         result = &mut agent_read => result,
     }
     .map_err(map_agent_definition_read_error)?;
@@ -2057,21 +2272,30 @@ async fn run_admission(
         tool_set: resources.tool_set,
     })
     .map_err(map_turn_context_capture_error)?;
-    let message = context
-        .resolve_user_message(intent)
-        .await
-        .map_err(map_submit_prompt_error)?;
+    let message = tokio::select! {
+        biased;
+        _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
+        result = context.resolve_user_message(intent) => result.map_err(map_submit_prompt_error)?,
+    };
     if lock(&conversation.live_state).session_id() != context.session_id() {
         return Err(SessionSubmitError::InternalDispatchUnavailable);
     }
     if closing.is_cancelled() {
         return Err(SessionSubmitError::Closing);
     }
+    if cancellation.is_cancelled() {
+        return Err(SessionSubmitError::Cancelled);
+    }
     let item_id = ItemId::generate().map_err(map_id_generation_error)?;
-    let admission = durable_state
-        .acquire_agent_admission(context.agent())
-        .await
-        .map_err(map_agent_admission_error)?;
+    let admission = tokio::select! {
+        biased;
+        _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
+        result = durable_state.acquire_agent_admission(context.agent()) => {
+            result.map_err(map_agent_admission_error)?
+        }
+    };
     #[cfg(test)]
     hooks.after_agent_admission_before_input().await;
     let fact = {
@@ -2081,6 +2305,9 @@ async fn run_admission(
             .ok_or(SessionSubmitError::Closing)?;
         if closing.is_cancelled() {
             return Err(SessionSubmitError::Closing);
+        }
+        if cancellation.is_cancelled() {
+            return Err(SessionSubmitError::Cancelled);
         }
         let mut live_state = lock(&conversation.live_state);
         live_state
@@ -2100,6 +2327,7 @@ async fn run_active_turn(
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> SessionTurnTerminal {
     if context.turn_id() != turn_id {
@@ -2110,6 +2338,7 @@ async fn run_active_turn(
         model_gateway,
         Arc::clone(&conversation),
         turn_id,
+        cancellation,
         interaction_completion_sender,
     )
     .await;
@@ -2141,9 +2370,13 @@ async fn run_active_turn_inner(
     model_gateway: Arc<ModelGateway>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     loop {
+        if cancellation.is_cancelled() {
+            return Err(SessionTurnFailure::Model);
+        }
         let captured = lock(&conversation.live_state)
             .capture_conversation_views()
             .map_err(|_| SessionTurnFailure::Internal)?;
@@ -2164,10 +2397,13 @@ async fn run_active_turn_inner(
             .generate_model_turn(
                 request,
                 ModelProgressPublisher::discard(),
-                CancellationToken::new(),
+                cancellation.clone(),
             )
             .await
             .map_err(map_model_call_failure)?;
+        if cancellation.is_cancelled() {
+            return Err(SessionTurnFailure::Model);
+        }
         let response = result.response();
         let mut content = Vec::with_capacity(response.content().len());
         let mut calls = Vec::new();
@@ -2284,7 +2520,8 @@ async fn run_active_turn_inner(
                             reason: crate::tools::ToolAbandonReason::RuntimeFailure,
                         }
                     } else {
-                        match resolution_receiver.await {
+                        let resolution = resolution_receiver.await;
+                        match resolution {
                             Ok(resolution) => ToolSet::settle_interaction(
                                 item_id,
                                 tool_call_id,
@@ -2317,6 +2554,9 @@ async fn run_active_turn_inner(
             lock(&conversation.live_state)
                 .abandon_current_tool_exchange(turn_id)
                 .map_err(|_| SessionTurnFailure::Internal)?;
+            return Err(SessionTurnFailure::Model);
+        }
+        if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
     }
@@ -2671,6 +2911,30 @@ struct ResolveInteractionRequest {
     response: Option<oneshot::Sender<Result<(), SessionInteractionError>>>,
 }
 
+struct CancelRequest {
+    target: SessionCancelTarget,
+    timestamp: Timestamp,
+    response: Option<oneshot::Sender<Result<(), SessionCancelError>>>,
+}
+
+impl CancelRequest {
+    fn settle(&mut self, outcome: Result<(), SessionCancelError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionCancelError::Closing));
+    }
+}
+
+impl Drop for CancelRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 impl ResolveInteractionRequest {
     fn settle(&mut self, outcome: Result<(), SessionInteractionError>) {
         if let Some(response) = self.response.take() {
@@ -2784,6 +3048,7 @@ enum SessionExecutorRequest {
     Snapshot(SnapshotRequest),
     Submit(SubmitRequest),
     ResolveInteraction(ResolveInteractionRequest),
+    Cancel(CancelRequest),
     Subscribe(SubscribeRequest),
     #[cfg(test)]
     StartingProbe(StartingProbeRequest),
@@ -2796,6 +3061,7 @@ impl SessionExecutorRequest {
             Self::Snapshot(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
             Self::ResolveInteraction(request) => request.reject_closing(),
+            Self::Cancel(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
             #[cfg(test)]
             Self::StartingProbe(request) => request.reject_closing(),
@@ -4174,6 +4440,307 @@ mod tests {
         assert!(recording.contains("pre_execution"));
         assert!(recording.contains("approval denied"));
         assert!(recording.contains("denied"));
+        executor.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_pending_tool_interaction_settles_cancelled_without_a_followup_model_call() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_cancel",
+            "echo",
+            "{\"value\":1}",
+            "must not run",
+        );
+        let request_id: RequestId = "req_44444444444444444444444444444444".parse().unwrap();
+        let interaction_request =
+            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        let denied = ToolExecutionResult::PreExecution {
+            disposition: crate::tools::ToolResultDisposition::Denied,
+            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                "approval denied".to_owned(),
+            ])
+            .unwrap(),
+        };
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let interaction_request = interaction_request.clone();
+                let allowed = allowed.clone();
+                let denied = denied.clone();
+                move |_| {
+                    let interaction_request = interaction_request.clone();
+                    let allowed = allowed.clone();
+                    let denied = denied.clone();
+                    Box::pin(async move {
+                        ToolExecutionResult::Interaction {
+                            request_id,
+                            request: interaction_request,
+                            allowed: Box::new(allowed),
+                            denied: Box::new(denied),
+                        }
+                    })
+                }
+            },
+        );
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+                tool_set,
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+
+        let turn_id = executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = executor.snapshot().await.unwrap();
+                if snapshot.pending_interactions().len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Interaction request is projected");
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+
+        let timestamp: Timestamp = "2026-08-08T10:01:00.000Z".parse().unwrap();
+        let mismatched_turn = TurnId::generate().unwrap();
+        assert_eq!(
+            executor
+                .cancel(SessionCancelTarget::Turn(mismatched_turn), timestamp)
+                .await,
+            Err(SessionCancelError::ExpectedTurnMismatch)
+        );
+        assert_eq!(
+            executor
+                .cancel(SessionCancelTarget::Turn(turn_id), timestamp)
+                .await,
+            Ok(())
+        );
+        assert!(
+            executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        assert_eq!(
+            wait_for_terminal(&executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        assert_eq!(
+            executor
+                .cancel(SessionCancelTarget::Turn(turn_id), timestamp)
+                .await,
+            Err(SessionCancelError::TurnTerminal)
+        );
+        let recording =
+            fs::read_to_string(store.session_path().join("conversation.jsonl")).unwrap();
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("turn_cancelled"));
+        assert!(recording.contains("cancelled"));
+        assert!(recording.contains("pre_execution"));
+        assert!(!recording.contains("must not run"));
+        executor.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_submit_before_input_prevents_turn_start_and_model_call() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+
+        let hooks = executor.test_hooks();
+        hooks.arm_after_agent_admission_before_input();
+        let command_id = CommandId::generate().unwrap();
+        let submit_executor = executor.clone();
+        let submit = tokio::spawn(async move {
+            submit_executor
+                .submit(
+                    command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cancel before input").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        hooks.wait_after_agent_admission_before_input().await;
+        let timestamp: Timestamp = "2026-08-08T10:02:00.000Z".parse().unwrap();
+        assert_eq!(
+            executor
+                .cancel(SessionCancelTarget::Submit(command_id), timestamp)
+                .await,
+            Ok(())
+        );
+        hooks.release_after_agent_admission_before_input();
+        assert_eq!(submit.await.unwrap(), Err(SessionSubmitError::Cancelled));
+        let snapshot = executor.snapshot().await.unwrap();
+        assert_eq!(snapshot.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(snapshot.current_turn(), None);
+        assert_eq!(model.request_count(), 0);
         executor.close().await.unwrap();
         state.close().await;
     }
