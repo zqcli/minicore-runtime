@@ -27,6 +27,7 @@ use crate::durable_state::{
     DurableSessionDefinitionError, DurableSessionDefinitionOutcome, DurableState,
 };
 use crate::live_conversation::LiveSessionState;
+use crate::prompt::{PromptError, PromptErrorKind, PromptService};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision};
 use crate::workspace::{
@@ -286,6 +287,7 @@ impl SessionExecutor {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
         conversation: LoadedSessionConversation,
@@ -294,6 +296,7 @@ impl SessionExecutor {
             task_context,
             durable_state,
             resolver,
+            prompt_service,
             definition,
             workspace,
             Some(Arc::new(conversation)),
@@ -305,6 +308,7 @@ impl SessionExecutor {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
     ) -> Result<Self, SessionExecutorStartError> {
@@ -312,6 +316,7 @@ impl SessionExecutor {
             task_context,
             durable_state,
             resolver,
+            prompt_service,
             definition,
             workspace,
             None,
@@ -322,6 +327,7 @@ impl SessionExecutor {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
         conversation: Option<Arc<LoadedSessionConversation>>,
@@ -352,6 +358,7 @@ impl SessionExecutor {
             task_context: task_context.clone(),
             durable_state: durable_state.clone(),
             resolver,
+            prompt_service,
             current,
             execution_state: SessionExecutionState::Idle,
             active_publication: None,
@@ -398,7 +405,8 @@ impl SessionExecutor {
         })
     }
 
-    /// Requests the actor to reject future requests.  An admitted publication is not cancelled.
+    /// Requests the actor to reject future requests.  An admitted publication may abandon
+    /// cancellable candidate capture, but work that has reached durable publication still drains.
     pub(crate) fn request_closing(&self) {
         self.closing.cancel();
     }
@@ -458,11 +466,28 @@ impl SessionExecutor {
         workspace: Workspace,
         owner_timestamp: Timestamp,
     ) -> Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError> {
+        self.update_workspace_definition_with_cancellation(
+            expected_revision,
+            workspace,
+            owner_timestamp,
+            CancellationToken::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn update_workspace_definition_with_cancellation(
+        &self,
+        expected_revision: SessionDefinitionRevision,
+        workspace: Workspace,
+        owner_timestamp: Timestamp,
+        candidate_cancellation: CancellationToken,
+    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::Update(WorkspaceDefinitionRequest {
             expected_revision,
             workspace,
             owner_timestamp,
+            candidate_cancellation,
             response: Some(response),
         });
         let permit = tokio::select! {
@@ -560,6 +585,7 @@ struct SessionExecutorActor {
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
+    prompt_service: Arc<PromptService>,
     current: Arc<SessionExecutorSnapshot>,
     execution_state: SessionExecutionState,
     active_publication: Option<ActivePublication>,
@@ -574,6 +600,28 @@ struct ActivePublication {
     expected: ExpectedPublication,
     waiter: Arc<PublicationWaiterState>,
     worker_task: Option<TrackedTask>,
+}
+
+#[derive(Clone)]
+struct WorkspacePublicationContext {
+    durable_state: DurableState,
+    resolver: Arc<WorkspaceResolver>,
+    prompt_service: Arc<PromptService>,
+    executor_closing: CancellationToken,
+    candidate_cancellation: CancellationToken,
+}
+
+impl WorkspacePublicationContext {
+    fn is_cancelled(&self) -> bool {
+        self.executor_closing.is_cancelled() || self.candidate_cancellation.is_cancelled()
+    }
+
+    async fn cancelled(&self) {
+        tokio::select! {
+            _ = self.executor_closing.cancelled() => {}
+            _ = self.candidate_cancellation.cancelled() => {}
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -746,6 +794,10 @@ impl SessionExecutorActor {
             request.settle(Err(SessionWorkspaceDefinitionError::Closing));
             return Ok(());
         }
+        if request.candidate_cancellation.is_cancelled() {
+            request.settle(Err(SessionWorkspaceDefinitionError::Closing));
+            return Ok(());
+        }
 
         let attempt = SealedSessionDefinitionAttempt::new(
             self.current.definition().session_id(),
@@ -803,7 +855,13 @@ impl SessionExecutorActor {
         let completion_sender = self.completion_sender.clone();
         let task_context = self.task_context.clone();
         let durable_state = self.durable_state.clone();
-        let resolver = Arc::clone(&self.resolver);
+        let publication_context = WorkspacePublicationContext {
+            durable_state: durable_state.clone(),
+            resolver: Arc::clone(&self.resolver),
+            prompt_service: Arc::clone(&self.prompt_service),
+            executor_closing: self.closing.clone(),
+            candidate_cancellation: request.candidate_cancellation.clone(),
+        };
         let session_id = self.current.definition().session_id();
         let expected_for_worker = expected.clone();
         #[cfg(test)]
@@ -818,8 +876,7 @@ impl SessionExecutorActor {
             let mut guard = guard;
             #[cfg(test)]
             let result = run_publication(
-                durable_state,
-                resolver,
+                publication_context,
                 session_id,
                 attempt,
                 expected_for_worker,
@@ -828,8 +885,7 @@ impl SessionExecutorActor {
             .await;
             #[cfg(not(test))]
             let result = run_publication(
-                durable_state,
-                resolver,
+                publication_context,
                 session_id,
                 attempt,
                 expected_for_worker,
@@ -1100,8 +1156,7 @@ enum CompletionHandling {
 }
 
 async fn run_publication(
-    durable_state: DurableState,
-    resolver: Arc<WorkspaceResolver>,
+    context: WorkspacePublicationContext,
     session_id: SessionId,
     attempt: SealedSessionDefinitionAttempt,
     expected: ExpectedPublication,
@@ -1109,12 +1164,16 @@ async fn run_publication(
 ) -> PublicationCompletionResult {
     if !expected.is_publish() {
         return PublicationCompletionResult::Durable {
-            outcome: durable_state.update_session_definition(attempt).await,
+            outcome: context
+                .durable_state
+                .update_session_definition(attempt)
+                .await,
             snapshot: None,
         };
     }
 
-    let candidate = match resolver
+    let candidate = match context
+        .resolver
         .resolve(session_id, expected.definition().workspace())
         .await
     {
@@ -1126,15 +1185,56 @@ async fn run_publication(
             SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
         );
     }
-    let prompt_context = candidate.prompt_capture_context();
     let skill_context = candidate.skill_capture_context();
-    if !prompt_context.roots().is_empty() || !skill_context.roots().is_empty() {
+    if !skill_context.roots().is_empty() {
         return PublicationCompletionResult::Error(
             SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
         );
     }
-    let prompt_sources = Arc::from(Vec::new().into_boxed_slice());
+    let prompt_context = candidate.prompt_capture_context();
+    let requires_revalidation = !prompt_context.roots().is_empty();
+    let capture = context
+        .prompt_service
+        .capture_workspace_sources(prompt_context);
+    tokio::pin!(capture);
+    let prompt_sources = match tokio::select! {
+        biased;
+        _ = context.cancelled() => return PublicationCompletionResult::Error(
+            SessionWorkspaceDefinitionError::Closing,
+        ),
+        result = &mut capture => result,
+    } {
+        Ok(sources) => sources,
+        Err(error) => return PublicationCompletionResult::Error(map_prompt_error(error)),
+    };
+    if requires_revalidation {
+        let revalidation_result = {
+            let revalidation = context
+                .resolver
+                .revalidate_candidate(&candidate, expected.definition().workspace());
+            tokio::pin!(revalidation);
+            tokio::select! {
+                biased;
+                _ = context.cancelled() => return PublicationCompletionResult::Error(
+                    SessionWorkspaceDefinitionError::Closing,
+                ),
+                result = &mut revalidation => result,
+            }
+        };
+        match revalidation_result {
+            Ok(true) => {}
+            Ok(false) => {
+                return PublicationCompletionResult::Error(
+                    SessionWorkspaceDefinitionError::WorkspaceUnavailable,
+                );
+            }
+            Err(error) => return PublicationCompletionResult::Error(map_workspace_error(error)),
+        }
+    }
     let skill_sources = Arc::from(Vec::new().into_boxed_slice());
+    if context.is_cancelled() {
+        return PublicationCompletionResult::Error(SessionWorkspaceDefinitionError::Closing);
+    }
     let snapshot = match candidate.finish(prompt_sources, skill_sources) {
         Ok(snapshot) => snapshot,
         Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
@@ -1147,7 +1247,10 @@ async fn run_publication(
     #[cfg(test)]
     hooks.after_candidate_snapshot_finish_before_durable().await;
 
-    let outcome = durable_state.update_session_definition(attempt).await;
+    let outcome = context
+        .durable_state
+        .update_session_definition(attempt)
+        .await;
     #[cfg(test)]
     if matches!(&outcome, Ok(DurableSessionDefinitionOutcome::Updated(..))) {
         hooks.after_commit_before_install().await;
@@ -1155,6 +1258,22 @@ async fn run_publication(
     PublicationCompletionResult::Durable {
         outcome,
         snapshot: Some(snapshot),
+    }
+}
+
+fn map_prompt_error(error: PromptError) -> SessionWorkspaceDefinitionError {
+    match error.kind() {
+        PromptErrorKind::SourceDiscovery => SessionWorkspaceDefinitionError::WorkspaceUnavailable,
+        PromptErrorKind::ContentLoad | PromptErrorKind::DuplicateKey => {
+            SessionWorkspaceDefinitionError::WorkspaceRejected
+        }
+        PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::RequiredPromptMissing
+        | PromptErrorKind::InvalidIntent
+        | PromptErrorKind::InvalidContribution => {
+            SessionWorkspaceDefinitionError::InternalDispatchUnavailable
+        }
     }
 }
 
@@ -1214,6 +1333,7 @@ struct WorkspaceDefinitionRequest {
     expected_revision: SessionDefinitionRevision,
     workspace: Workspace,
     owner_timestamp: Timestamp,
+    candidate_cancellation: CancellationToken,
     response: Option<
         oneshot::Sender<Result<SessionWorkspaceDefinitionOutcome, SessionWorkspaceDefinitionError>>,
     >,
@@ -1946,6 +2066,9 @@ mod tests {
     async fn loaded_fixture(store: &TempStore) -> LoadedFixture {
         let (context, state) = open_state(&store.root).await;
         let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
         let session_id: SessionId = SESSION_ID.parse().unwrap();
         let definition = state
             .session_current_definition(session_id)
@@ -1961,6 +2084,7 @@ mod tests {
             context.clone(),
             state.clone(),
             resolver,
+            prompt_service,
             Arc::clone(&definition),
             workspace_snapshot,
         )

@@ -1,6 +1,6 @@
 # Workspace 子系统架构设计
 
-状态：当前权威架构（ADR 0135；M6.1 `WorkspaceResolver`、immutable `WorkspaceSnapshot`、loaded Ready+Idle publication及Runtime residency统一loaded/unloaded definition routing foundation已实现；Prompt/Skill source adapter、WorkspaceAccessView/ToolContext、public routing与SecurityRevoked integration pending）
+状态：当前权威架构（ADR 0135；M6.1 `WorkspaceResolver`、immutable `WorkspaceSnapshot`、loaded Ready+Idle publication及Runtime residency统一loaded/unloaded definition routing foundation已实现；Workspace Prompt candidate capture已接入Load和loaded Idle publication；具体Prompt/Skill source adapter、Skill capture、WorkspaceAccessView/ToolContext、public routing与SecurityRevoked integration pending）
 日期：2026-07-31
 
 ## 目的
@@ -1360,4 +1360,4 @@ upload / telemetry
 - [x] 冻结WorkspaceUnavailable → SessionNotReady/UserActionRequired公开映射；
 - [x] 对齐Session lifecycle、definition revision、load/readiness、Idle-only update和security interruption语义；
 - [x] conversation JSONL不保存Turn-start Workspace摘要；WorkspaceSnapshotRef与WorkspaceRevision execution binding均不进入recording。
-- [x] 实现M6.1 crate-private resolver/snapshot foundation：owner-tracked local canonicalization、duplicate/overlap/cwd校验、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与immutable Snapshot；actual source discovery、Tool access view、loaded publication和security integration仍由后续slice消费。
+- [x] 实现M6.1 crate-private resolver/snapshot foundation：owner-tracked local canonicalization、duplicate/overlap/cwd校验、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与immutable Snapshot；Workspace Prompt candidate capture已接入Load与loaded Idle Workspace publication并保持candidate失败不发布，actual filesystem discovery、Skill capture、Tool access view和security integration仍由后续slice消费。
