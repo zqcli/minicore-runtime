@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof、owner-tracked SessionRecorder physical append及全部七个 `slice = m5_1` Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现并通过独立全量验证；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition、Runtime-owned PromptService/initial PromptResourceView、Workspace Prompt candidate capture在Load与loaded Workspace publication中的接入，以及owner-bound empty SkillView/ToolSet foundation已实现；complete shared-root publication、concrete source discovery、Skill source capture、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof、owner-tracked SessionRecorder physical append及全部七个 `slice = m5_1` Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现并通过独立全量验证；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition、Runtime-owned PromptService/initial PromptResourceView、Workspace Prompt candidate capture在Load与loaded Workspace publication中的接入，以及owner-bound empty SkillView/ToolSet foundation已实现；M6.2 scripted text-only ModelGateway foundation已完成AgentRun Prompt assembly/proof、model resolution/request、single provider attempt、progress/final/error validation、cancel linearization和Runtime-owned initial empty catalog；complete shared-root publication、concrete source discovery、Skill source capture、Structured/Tool/Compaction assembly、production Rig adapter、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -55,7 +55,7 @@ M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 
 - M2 public protocol route/DTO families与完整manifest closure；
 - M5 semantic replay/corruption sidecars；
-- SessionRecorder、SessionExecutor、ActiveTurnTask和ScriptedProvider vertical slice；
+- full SessionExecutor Turn behavior、ActiveTurnTask和public scripted Runtime vertical slice；
 - production provider与sandbox adapter。
 
 M4已完成Prompt-owned opaque `ModelMessage`、`ConversationRevision`/`EntryIdGenerator`、`LiveSessionState` User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset。Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。
@@ -422,7 +422,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ### M6.1 Workspace、Prompt与captured empty views
 
-当前进度：Workspace definition resolve与immutable Snapshot foundation Completed，包括owner-tracked local canonicalization、canonical duplicate/overlap/cwd validation、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与cross-candidate fail-closed finish。已完成 crate-private Prompt candidate materialization、immutable PromptResourceView/PromptSet profile、固定层级与稳定排序、candidate-only Workspace source capture、Text-only atomic composition、Runtime-owned PromptService与initial PromptResourceView，以及Workspace Prompt candidate capture在Session Load和loaded Idle Workspace原子publication中的接入；capture监听owner/operation closing，capture后重新验证canonical path与authority facts，且Load的final revalidation位于replay/Recorder准备之后、executor安装之前；source unavailable/content rejection、revalidation mismatch或closing均不发布candidate且旧Snapshot不变。由 parent owner 构造的合法 empty SkillView/ToolPromptView也已完成。具体 filesystem adapter、四模块complete shared-root publication、Skill source capture/contribution async resolve、Tool/Skill metadata projection和最终 Model assembly仍 Pending。
+当前进度：Workspace definition resolve与immutable Snapshot foundation Completed，包括owner-tracked local canonicalization、canonical duplicate/overlap/cwd validation、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与cross-candidate fail-closed finish。已完成 crate-private Prompt candidate materialization、immutable PromptResourceView/PromptSet profile、固定层级与稳定排序、candidate-only Workspace source capture、Text-only atomic composition、Runtime-owned PromptService与initial PromptResourceView，以及Workspace Prompt candidate capture在Session Load和loaded Idle Workspace原子publication中的接入；capture监听owner/operation closing，capture后重新验证canonical path与authority facts，且Load的final revalidation位于replay/Recorder准备之后、executor安装之前；source unavailable/content rejection、revalidation mismatch或closing均不发布candidate且旧Snapshot不变。由 parent owner 构造的合法 empty SkillView/ToolPromptView也已完成；ordinary text-only AgentRun final assembly已在M6.2完成。具体 filesystem adapter、四模块complete shared-root publication、Skill source capture/contribution async resolve和non-empty Tool/Skill metadata projection仍 Pending。
 
 先实现ordinary Text turn所需最小但真实路径：
 
@@ -435,6 +435,8 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - 本切片不宣称 public Runtime Load、TurnExecutionContext capture、ModelGateway request、Snapshot/Event 或 ActiveTurn 行为已经可用。
 
 ### M6.2 ModelGateway与ScriptedProviderAdapter
+
+当前进度：Completed（scripted text-only foundation）。`PromptSet::assemble`把固定System sections、ordered User static context和sanitized `LiveConversationView`组装为唯一`AssembledModelContext`，使用pinned `TurnModelSnapshot` estimator/context limit执行final input preflight，proof绑定AgentRun、exact process-local `TurnModelRef`和ConversationRevision；Model catalog resolution、retained `TurnModelSnapshot`、唯一`ModelCallRequest` constructor、single `ProviderAdapter::execute` attempt、provider-neutral progress、typed delivery-aware errors、minimal text terminal validation及cancel/terminal first-wins均已实现。unsafe `AcceptedNoOutput | Unknown | OutputStarted`不会保留包括`RateLimited`在内的retryable reason。Runtime拥有empty `ModelGateway`与initial immutable empty `ModelCatalogView`。reload只影响future snapshot，旧snapshot继续调用旧adapter。Structured output、允许ToolCall的non-empty ToolSpec、CompactionSummary assembly、credential/auth/connection实现、Rig adapter与public Runtime/ActiveTurnTask消费仍 Pending。
 
 实现：
 

@@ -1,7 +1,7 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（M6.1 已实现 Prompt candidate/profile/Text composition、Runtime-owned PromptService/initial PromptResourceView，以及Workspace Prompt candidate capture在Session Load和loaded Workspace publication中的接入；complete shared-root publication、具体 source adapter、Turn capture 与 final assembly 待实现）
-日期：2026-07-31
+状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture已实现；M6.2 text-only AgentRun final assembly/proof已实现；complete shared-root publication、具体source adapter、Skill contribution、Structured/Tool/Compaction assembly与Turn capture消费待实现）
+日期：2026-08-08
 
 ## 目的
 
@@ -29,6 +29,8 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Compaction的cut、trigger和SessionExecutor orchestration；本文只固定CompactionSummary assembly contract；
 - Historical PromptSet/rendered Prompt审计格式；MVP不执行exact same-Turn cold recovery，也不保存PromptContent resolver；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现。
+
+当前M6.2实现只接受parent-owned empty `ToolPromptView`和`SkillPromptView`，因此`AssembledModelContext`通过`tools_empty()`表达已验证的empty ToolSpec事实，尚不提前冻结M8的concrete `ToolSpec` carrier或Prompt diagnostics数组。PromptSet持有pinned `Arc<TurnModelSnapshot>`，使用其中同一个estimator与context limit完成final input validation；assembly proof只保存opaque exact `TurnModelRef`。完整TurnExecutionContext在M7复用该snapshot。这些是text-only staged implementation constraints，不改变下文完整MVP contract。
 
 ## 决策摘要
 

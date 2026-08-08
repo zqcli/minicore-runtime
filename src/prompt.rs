@@ -8,11 +8,15 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::AgentRevisionRef;
-use crate::model_gateway::ReasoningContent;
+use crate::live_conversation::{ConversationRevision, LiveConversationView};
+use crate::model_gateway::{
+    ModelCallPurpose, OutputContract, ReasoningContent, TurnModelRef, TurnModelSnapshot,
+};
 use crate::skills::{SkillId, SkillPromptView};
 use crate::tools::{ToolCallId, ToolName, ToolPromptView, ToolResultContent};
 use crate::wire::lexical::{
-    LexicalError, normalize_newlines, validate_safe_text, validate_stable_symbolic_key,
+    LexicalError, canonical_json_string_len, normalize_newlines, validate_safe_text,
+    validate_stable_symbolic_key,
 };
 use crate::wire::{
     BoundedJsonObject, ProtocolLimits, SessionDefinitionRevision, SessionId, WorkspaceRelativePath,
@@ -210,6 +214,7 @@ pub(crate) enum PromptErrorKind {
     RequiredPromptMissing,
     InvalidIntent,
     InvalidContribution,
+    ContextLimitExceeded,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -736,6 +741,7 @@ impl PromptService {
             },
             tools: context.tools,
             skills: context.skills,
+            model: context.model,
         }))
     }
 }
@@ -766,6 +772,7 @@ pub(crate) struct PromptTurnContext {
     workspace: WorkspacePromptContext,
     tools: ToolPromptView,
     skills: SkillPromptView,
+    model: Arc<TurnModelSnapshot>,
 }
 
 #[allow(
@@ -787,6 +794,7 @@ impl PromptTurnContext {
         workspace: WorkspacePromptContext,
         tools: ToolPromptView,
         skills: SkillPromptView,
+        model: Arc<TurnModelSnapshot>,
     ) -> Self {
         Self {
             agent,
@@ -798,6 +806,7 @@ impl PromptTurnContext {
             workspace,
             tools,
             skills,
+            model,
         }
     }
 }
@@ -965,6 +974,113 @@ impl fmt::Debug for PromptProfile {
     }
 }
 
+pub(crate) struct PromptAssemblyInput<'a> {
+    conversation: &'a LiveConversationView,
+    output_contract: Option<&'a OutputContract>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the immediately adjacent M7 ActiveTurnTask constructs AgentRun assembly input"
+)]
+impl<'a> PromptAssemblyInput<'a> {
+    pub(crate) const fn agent_run(
+        conversation: &'a LiveConversationView,
+        output_contract: Option<&'a OutputContract>,
+    ) -> Self {
+        Self {
+            conversation,
+            output_contract,
+        }
+    }
+}
+
+pub(crate) struct AssembledModelContext {
+    system: Arc<[PromptSection]>,
+    messages: Arc<[ModelMessage]>,
+    output_contract: Option<OutputContract>,
+    assembly_proof: PromptAssemblyProof,
+}
+
+impl AssembledModelContext {
+    #[cfg(test)]
+    pub(crate) fn system(&self) -> &[PromptSection] {
+        &self.system
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+
+    pub(crate) const fn output_contract(&self) -> Option<&OutputContract> {
+        self.output_contract.as_ref()
+    }
+
+    pub(crate) const fn tools_empty(&self) -> bool {
+        true
+    }
+
+    pub(crate) const fn assembly_proof(&self) -> &PromptAssemblyProof {
+        &self.assembly_proof
+    }
+}
+
+impl fmt::Debug for AssembledModelContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AssembledModelContext")
+            .field("system_sections", &self.system.len())
+            .field("messages", &self.messages.len())
+            .field("has_output_contract", &self.output_contract.is_some())
+            .finish()
+    }
+}
+
+pub(crate) struct PromptAssemblyProof {
+    purpose: ModelCallPurpose,
+    turn_model: TurnModelRef,
+    source_revision: ConversationRevision,
+    output_contract: Option<OutputContract>,
+}
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "validated by the adjacent M7 ModelCallRequest constructor"
+    )
+)]
+impl PromptAssemblyProof {
+    pub(crate) const fn purpose(&self) -> ModelCallPurpose {
+        self.purpose
+    }
+
+    pub(crate) const fn turn_model(&self) -> &TurnModelRef {
+        &self.turn_model
+    }
+
+    pub(crate) const fn source_revision(&self) -> ConversationRevision {
+        self.source_revision
+    }
+
+    pub(crate) const fn output_contract(&self) -> Option<&OutputContract> {
+        self.output_contract.as_ref()
+    }
+}
+
+impl fmt::Debug for PromptAssemblyProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptAssemblyProof")
+            .field("purpose", &self.purpose)
+            .field("turn_model", &self.turn_model)
+            .field("source_revision", &self.source_revision)
+            .field("has_output_contract", &self.output_contract.is_some())
+            .finish()
+    }
+}
+
 #[allow(
     dead_code,
     reason = "the PromptSet profile is consumed by M6.2 final model-context assembly"
@@ -977,6 +1093,7 @@ pub(crate) struct PromptSet {
     profile: PromptProfile,
     tools: ToolPromptView,
     skills: SkillPromptView,
+    model: Arc<TurnModelSnapshot>,
 }
 
 #[allow(
@@ -1018,6 +1135,181 @@ impl PromptSet {
         CanonicalUserMessage::new(message, Vec::new())
             .map_err(|_| PromptError::new(PromptErrorKind::InvalidIntent))
     }
+
+    pub(crate) fn assemble(
+        &self,
+        input: PromptAssemblyInput<'_>,
+    ) -> Result<AssembledModelContext, PromptError> {
+        if !self.tools.is_empty() || !self.skills.is_empty() {
+            return Err(PromptError::new(PromptErrorKind::PromptUnavailable));
+        }
+
+        let mut messages = Vec::with_capacity(
+            self.profile.user_context.len() + input.conversation.messages().len(),
+        );
+        for section in &*self.profile.user_context {
+            messages.push(
+                ModelMessage::unstamped_user_text(Arc::from(section.text()))
+                    .map_err(|_| PromptError::new(PromptErrorKind::InvalidContribution))?,
+            );
+        }
+        messages.extend(input.conversation.messages().iter().cloned());
+        let output_contract = input.output_contract.cloned();
+
+        let canonical_bytes = canonical_model_context_bytes(
+            &self.profile.system,
+            &messages,
+            output_contract.as_ref(),
+        )
+        .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let estimated_tokens = self
+            .model
+            .token_estimator()
+            .estimate_utf8_bytes(canonical_bytes);
+        if self
+            .model
+            .limits()
+            .context_window_tokens()
+            .is_some_and(|limit| estimated_tokens > u64::from(limit.get()))
+        {
+            return Err(PromptError::new(PromptErrorKind::ContextLimitExceeded));
+        }
+
+        Ok(AssembledModelContext {
+            system: Arc::clone(&self.profile.system),
+            messages: messages.into(),
+            output_contract: output_contract.clone(),
+            assembly_proof: PromptAssemblyProof {
+                purpose: ModelCallPurpose::AgentRun,
+                turn_model: self.model.turn_model_ref(),
+                source_revision: input.conversation.revision(),
+                output_contract,
+            },
+        })
+    }
+}
+
+fn canonical_model_context_bytes(
+    system: &[PromptSection],
+    messages: &[ModelMessage],
+    output_contract: Option<&OutputContract>,
+) -> Option<usize> {
+    let mut bytes = r#"{"system":["#.len();
+    for (index, section) in system.iter().enumerate() {
+        add_separator(&mut bytes, index)?;
+        add_literal(&mut bytes, r#"{"role":"system","content":"#)?;
+        add_json_string(&mut bytes, section.text())?;
+        add_literal(&mut bytes, "}")?;
+    }
+    add_literal(&mut bytes, r#"],"messages":["#)?;
+    for (index, message) in messages.iter().enumerate() {
+        add_separator(&mut bytes, index)?;
+        add_model_message(&mut bytes, message)?;
+    }
+    add_literal(&mut bytes, r#"],"tools":[],"outputContract":"#)?;
+    match output_contract {
+        Some(OutputContract::NoToolCalls) => add_json_string(&mut bytes, "no_tool_calls")?,
+        None => add_literal(&mut bytes, "null")?,
+    }
+    add_literal(&mut bytes, "}")?;
+    Some(bytes)
+}
+
+fn add_model_message(bytes: &mut usize, message: &ModelMessage) -> Option<()> {
+    match message.as_ref() {
+        ModelMessageRef::User { content } => {
+            add_literal(bytes, r#"{"role":"user","content":["#)?;
+            for (index, part) in content.iter().enumerate() {
+                add_separator(bytes, index)?;
+                add_json_string(bytes, part.as_text())?;
+            }
+            add_literal(bytes, "]}")
+        }
+        ModelMessageRef::Assistant { content } => {
+            add_literal(bytes, r#"{"role":"assistant","content":["#)?;
+            for (index, block) in content.iter().enumerate() {
+                add_separator(bytes, index)?;
+                add_assistant_content(bytes, block)?;
+            }
+            add_literal(bytes, "]}")
+        }
+        ModelMessageRef::Tool {
+            tool_call_id,
+            content,
+        } => {
+            add_literal(bytes, r#"{"role":"tool","toolCallId":"#)?;
+            add_json_string(bytes, tool_call_id.as_str())?;
+            add_literal(bytes, r#","content":["#)?;
+            for (index, part) in content.parts().iter().enumerate() {
+                add_separator(bytes, index)?;
+                add_json_string(bytes, part.as_text())?;
+            }
+            add_literal(bytes, "]}")
+        }
+    }
+}
+
+fn add_assistant_content(bytes: &mut usize, content: &ModelAssistantContent) -> Option<()> {
+    match content.as_ref() {
+        ModelAssistantContentRef::Reasoning(reasoning) => {
+            add_literal(bytes, r#"{"type":"reasoning""#)?;
+            add_optional_json_field(bytes, "text", reasoning.text())?;
+            add_optional_json_field(bytes, "summary", reasoning.summary())?;
+            add_optional_json_field(bytes, "encrypted", reasoning.encrypted())?;
+            add_optional_json_field(bytes, "signature", reasoning.signature())?;
+            add_optional_json_field(
+                bytes,
+                "providerItemId",
+                reasoning.provider_item_id().map(|id| id.as_str()),
+            )?;
+            add_literal(bytes, "}")
+        }
+        ModelAssistantContentRef::Text(text) => {
+            add_literal(bytes, r#"{"type":"text","text":"#)?;
+            add_json_string(bytes, text)?;
+            add_literal(bytes, "}")
+        }
+        ModelAssistantContentRef::ToolCall {
+            tool_call_id,
+            name,
+            arguments,
+        } => {
+            add_literal(bytes, r#"{"type":"tool_call","toolCallId":"#)?;
+            add_json_string(bytes, tool_call_id.as_str())?;
+            add_literal(bytes, r#","name":"#)?;
+            add_json_string(bytes, name.as_str())?;
+            add_literal(bytes, r#","arguments":"#)?;
+            add_literal(bytes, arguments.canonical_bytes())?;
+            add_literal(bytes, "}")
+        }
+    }
+}
+
+fn add_optional_json_field(bytes: &mut usize, name: &str, value: Option<&str>) -> Option<()> {
+    let Some(value) = value else {
+        return Some(());
+    };
+    add_literal(bytes, ",")?;
+    add_json_string(bytes, name)?;
+    add_literal(bytes, ":")?;
+    add_json_string(bytes, value)
+}
+
+fn add_separator(bytes: &mut usize, index: usize) -> Option<()> {
+    if index > 0 {
+        add_literal(bytes, ",")?;
+    }
+    Some(())
+}
+
+fn add_json_string(bytes: &mut usize, value: &str) -> Option<()> {
+    *bytes = bytes.checked_add(canonical_json_string_len(value)?)?;
+    Some(())
+}
+
+fn add_literal(bytes: &mut usize, value: impl AsRef<[u8]>) -> Option<()> {
+    *bytes = bytes.checked_add(value.as_ref().len())?;
+    Some(())
 }
 
 impl fmt::Debug for PromptSet {
@@ -1781,10 +2073,16 @@ mod tests {
 
     use super::*;
     use crate::agent_session_lifecycle::AgentRevisionRef;
-    use crate::model_gateway::ProviderItemId;
+    use crate::conversation_storage::StoredUserMessage;
+    use crate::live_conversation::LiveSessionState;
+    use crate::model_gateway::{ModelCallPurpose, ProviderItemId, TurnModelSnapshot};
     use crate::skills::SkillView;
     use crate::tools::{ToolCallId, ToolName, ToolResultContent, ToolSet};
-    use crate::wire::{AgentRevision, BoundedJsonObject, SessionDefinitionRevision, SessionId};
+    use crate::turn_item_interaction::UserMessageSource;
+    use crate::wire::{
+        AgentRevision, BoundedJsonObject, ItemId, SessionDefinitionRevision, SessionId, Timestamp,
+        TurnId,
+    };
     use crate::workspace::prompt_candidate_for_test;
 
     struct MutablePromptSource {
@@ -1932,6 +2230,26 @@ mod tests {
         tool_set: &Arc<ToolSet>,
         skill_view: &Arc<SkillView>,
     ) -> PromptTurnContext {
+        turn_context_with_model(
+            resources,
+            agent_prompts,
+            session_prompts,
+            workspace,
+            tool_set,
+            skill_view,
+            TurnModelSnapshot::test_fixture(None),
+        )
+    }
+
+    fn turn_context_with_model(
+        resources: Arc<PromptResourceView>,
+        agent_prompts: Vec<PromptId>,
+        session_prompts: Vec<PromptId>,
+        workspace: WorkspacePromptContext,
+        tool_set: &Arc<ToolSet>,
+        skill_view: &Arc<SkillView>,
+        model: Arc<TurnModelSnapshot>,
+    ) -> PromptTurnContext {
         PromptTurnContext::new(
             agent_revision_ref(),
             session_id(),
@@ -1942,6 +2260,7 @@ mod tests {
             workspace,
             tool_set.prompt_view(),
             skill_view.prompt_view(),
+            model,
         )
     }
 
@@ -2959,5 +3278,101 @@ mod tests {
     #[test]
     fn workspace_relative_path_rejects_unsafe_location_before_prompt_stamping() {
         assert!(WorkspaceRelativePath::from_str("src/\u{001b}[31m").is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_run_assembly_orders_static_context_before_sanitized_conversation() {
+        let source = Arc::new(MutablePromptSource::new(vec![user_definition(
+            "session-context",
+            "session-context",
+            PromptRole::User,
+            "static session context",
+        )]));
+        let source_adapter: Arc<dyn PromptSourceAdapter> = source;
+        let service = PromptService::new(
+            Arc::from("required system policy"),
+            Some(Arc::from("base system policy")),
+            vec![source_adapter],
+            Vec::new(),
+        )
+        .unwrap();
+        let resources = service.initialize().await.unwrap();
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+        let model = TurnModelSnapshot::test_fixture(None);
+        let model_ref = model.turn_model_ref();
+        let set = service
+            .for_turn(turn_context_with_model(
+                resources,
+                Vec::new(),
+                vec!["session-context".parse().unwrap()],
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+                model,
+            ))
+            .unwrap();
+
+        let user = set
+            .compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("live user input").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut live = LiveSessionState::new(session_id(), []);
+        live.apply_user_message(
+            StoredUserMessage::reconstruct(
+                "itm_00000000000000000000000000000001"
+                    .parse::<ItemId>()
+                    .unwrap(),
+                UserMessageSource::Input,
+                user,
+            ),
+            "trn_00000000000000000000000000000001"
+                .parse::<TurnId>()
+                .unwrap(),
+            "2026-08-08T00:00:00.000Z".parse::<Timestamp>().unwrap(),
+        )
+        .unwrap();
+        let views = live.capture_conversation_views().unwrap();
+
+        let output_contract = OutputContract::NoToolCalls;
+        let assembled = set
+            .assemble(PromptAssemblyInput::agent_run(
+                views.conversation(),
+                Some(&output_contract),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            assembled
+                .system()
+                .iter()
+                .map(PromptSection::text)
+                .collect::<Vec<_>>(),
+            ["required system policy", "base system policy"]
+        );
+        assert_eq!(assembled.messages().len(), 2);
+        for (message, expected) in assembled
+            .messages()
+            .iter()
+            .zip(["static session context", "live user input"])
+        {
+            match message.as_ref() {
+                ModelMessageRef::User { content } => {
+                    assert_eq!(content.len(), 1);
+                    assert_eq!(content[0].as_text(), expected);
+                }
+                _ => panic!("assembly changed the expected user-message order"),
+            }
+        }
+        let proof = assembled.assembly_proof();
+        assert_eq!(proof.purpose(), ModelCallPurpose::AgentRun);
+        assert!(proof.turn_model().is_exact(&model_ref));
+        assert_eq!(proof.source_revision(), views.conversation().revision());
+        assert_eq!(proof.output_contract(), Some(&output_contract));
     }
 }
