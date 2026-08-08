@@ -36,8 +36,9 @@ use crate::live_conversation::{
     LiveSessionState,
 };
 use crate::model_gateway::{
-    FinalizedAssistantContent, ModelCallErrorReason, ModelCallPurpose, ModelCallRequest,
-    ModelCatalogView, ModelGateway, ModelProgressPublisher, ModelRequestValidationErrorKind,
+    FinalizedAssistantContent, ModelCallError, ModelCallErrorReason, ModelCallPurpose,
+    ModelCallRequest, ModelCallResult, ModelCatalogView, ModelGateway, ModelProgressPublisher,
+    ModelRequestValidationErrorKind, ProviderRequestDeliveryState,
 };
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
@@ -66,6 +67,12 @@ use crate::workspace::{
 
 const SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY: usize = 8;
 const SESSION_EVENT_CAPACITY: usize = 32;
+const AGENT_RUN_MAX_LOGICAL_RETRIES: usize = 3;
+const AGENT_RUN_RETRY_BACKOFFS: [std::time::Duration; AGENT_RUN_MAX_LOGICAL_RETRIES] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+];
 
 /// The only execution states represented by a loaded Session executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2725,14 +2732,13 @@ async fn run_active_turn_inner(
         )
         .map(Arc::new)
         .map_err(map_model_request_error)?;
-        let result = model_gateway
-            .generate_model_turn(
-                request,
-                ModelProgressPublisher::discard(),
-                cancellation.clone(),
-            )
-            .await
-            .map_err(map_model_call_failure)?;
+        let (result, logical_retry_count) = call_agent_run_with_logical_retry(
+            &model_gateway,
+            Arc::clone(&request),
+            cancellation.clone(),
+        )
+        .await
+        .map_err(map_model_call_failure)?;
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
@@ -2793,7 +2799,7 @@ async fn run_active_turn_inner(
             response.finish_reason(),
             response.effective_max_output_tokens(),
             response.usage().cloned(),
-            0,
+            logical_retry_count,
             response.metadata().clone(),
         )
         .map_err(|_| SessionTurnFailure::Internal)?;
@@ -2972,6 +2978,62 @@ async fn run_active_turn_inner(
                 let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
             }
         }
+    }
+}
+
+async fn call_agent_run_with_logical_retry(
+    model_gateway: &ModelGateway,
+    request: Arc<ModelCallRequest>,
+    cancellation: CancellationToken,
+) -> Result<(ModelCallResult, u8), ModelCallError> {
+    let mut logical_retries = 0_u8;
+    loop {
+        let result = model_gateway
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                cancellation.clone(),
+            )
+            .await;
+        let error = match result {
+            Ok(result) => return Ok((result, logical_retries)),
+            Err(error) => error,
+        };
+        let Some(delay) = agent_run_retry_delay(&error, usize::from(logical_retries)) else {
+            return Err(error);
+        };
+        logical_retries += 1;
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                return Err(error);
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn agent_run_retry_delay(
+    error: &ModelCallError,
+    logical_retries: usize,
+) -> Option<std::time::Duration> {
+    let backoff = AGENT_RUN_RETRY_BACKOFFS.get(logical_retries).copied()?;
+    if !matches!(
+        error.delivery(),
+        ProviderRequestDeliveryState::NotSent
+            | ProviderRequestDeliveryState::RejectedBeforeExecution
+    ) {
+        return None;
+    }
+    match error.reason() {
+        ModelCallErrorReason::Timeout
+        | ModelCallErrorReason::TransportUnavailable
+        | ModelCallErrorReason::ProviderUnavailable => Some(backoff),
+        ModelCallErrorReason::RateLimited => error
+            .retry_after()
+            .filter(|hint| *hint <= std::time::Duration::from_secs(60))
+            .map(|hint| backoff.max(hint)),
+        _ => None,
     }
 }
 
@@ -4624,6 +4686,15 @@ mod tests {
         .expect("the scripted Turn reaches terminal state")
     }
 
+    async fn wait_for_request_count(model: &ScriptedModelFixture, expected: usize) {
+        loop {
+            if model.request_count() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn ordinary_scripted_turn_records_and_replays_user_and_final_assistant() {
         let store = TempStore::new();
@@ -4822,6 +4893,234 @@ mod tests {
         }
         executor.close().await.unwrap();
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn agent_run_retries_delivery_safe_transient_with_same_request_arc() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["retry succeeded"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("retry me").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        let revision_before_backoff = lock(&loaded.executor.live_state_for_test().unwrap())
+            .capture_conversation_views()
+            .unwrap()
+            .conversation()
+            .revision();
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(Arc::ptr_eq(&requests[0], &requests[1]));
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the retry result is recorded");
+        assert!(recording.contains(r#""logicalRetryCount":1"#));
+        let revision_after_retry = lock(&loaded.executor.live_state_for_test().unwrap())
+            .capture_conversation_views()
+            .unwrap()
+            .conversation()
+            .revision();
+        assert_ne!(revision_before_backoff, revision_after_retry);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn agent_run_does_not_retry_unknown_or_stream_interrupted_failures() {
+        for reason in [
+            ModelCallErrorReason::RequestOutcomeUnknown,
+            ModelCallErrorReason::StreamInterrupted,
+        ] {
+            let store = TempStore::new();
+            let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+                vec![reason],
+                vec!["must not run"],
+            );
+            let loaded = scripted_text_fixture(&store, &model).await;
+            let turn_id = loaded
+                .executor
+                .submit(
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("do not retry").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                wait_for_terminal(&loaded.executor, turn_id).await,
+                SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            );
+            assert_eq!(model.request_count(), 1);
+            close_loaded(loaded).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn agent_run_retry_exhaustion_stops_after_four_gateway_attempts() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![
+                ModelCallErrorReason::Timeout,
+                ModelCallErrorReason::TransportUnavailable,
+                ModelCallErrorReason::ProviderUnavailable,
+                ModelCallErrorReason::Timeout,
+            ],
+            Vec::new(),
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("exhaust retries").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        wait_for_request_count(&model, 2).await;
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        wait_for_request_count(&model, 3).await;
+        tokio::time::advance(std::time::Duration::from_secs(8)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 4);
+        let requests = model.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(
+            requests
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0], &pair[1]))
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn cancel_during_agent_run_retry_backoff_sends_no_extra_attempt() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["must not run"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("cancel retry").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        wait_for_request_count(&model, 1).await;
+        assert_eq!(
+            loaded
+                .executor
+                .cancel(
+                    SessionCancelTarget::Turn(turn_id),
+                    "2026-08-08T10:03:00.000Z".parse().unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn steer_queued_during_agent_run_retry_backoff_is_consumed_after_success() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["retry candidate", "after steer"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("initial").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        wait_for_request_count(&model, 1).await;
+        let revision_before_steer = lock(&loaded.executor.live_state_for_test().unwrap())
+            .capture_conversation_views()
+            .unwrap()
+            .conversation()
+            .revision();
+        assert_eq!(
+            loaded
+                .executor
+                .steer(
+                    turn_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("queued steer").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        let revision_after_steer = lock(&loaded.executor.live_state_for_test().unwrap())
+            .capture_conversation_views()
+            .unwrap()
+            .conversation()
+            .revision();
+        assert_eq!(revision_before_steer, revision_after_steer);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 3);
+        let recording =
+            fs::read_to_string(store.session_path().join("conversation.jsonl")).unwrap();
+        assert!(recording.contains("queued steer"));
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
