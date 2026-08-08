@@ -60,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；M5.1 conversation target/proof与owner-tracked Recorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars、M5.0 durable foundation、M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication、Runtime residency foundation与replay/Recorder-backed Ready+Idle Load hydration已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、完整cross-platform native matrix pending，M5.1完整fixture/native exit gate仍待关闭。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；M5.1 conversation target/proof、owner-tracked Recorder physical append及全部七个 `slice = m5_1` fixture坐标、M5.2 tolerant semantic replay/corruption sidecars、M5.0 durable foundation、M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication、Runtime residency foundation与replay/Recorder-backed Ready+Idle Load hydration已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload与完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

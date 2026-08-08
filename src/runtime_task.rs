@@ -132,6 +132,8 @@ impl RuntimeTaskContext {
             if let Some(handle) = self.owner.spawn_blocking_with_injected_failure() {
                 return handle;
             }
+            #[cfg(test)]
+            let panic_after_operation = self.owner.take_post_operation_panic();
             self.owner.handle.spawn_blocking(move || {
                 // The task owns the owner while it is running, so dropping every caller-side
                 // context or job cannot detach an admitted blocking operation.
@@ -139,6 +141,12 @@ impl RuntimeTaskContext {
                 let outcome = catch_unwind(AssertUnwindSafe(operation))
                     .map_err(|_| RuntimeTaskError::OperationPanicked);
                 task_settlement.resolve(outcome);
+                #[cfg(test)]
+                if panic_after_operation {
+                    // The operation ran and settled its result; unwind after its catch_unwind
+                    // so the exact raw Tokio join reports a real failure.
+                    panic!("injected post-operation join failure");
+                }
             })
         }));
 
@@ -232,6 +240,16 @@ impl RuntimeTaskContext {
         self.owner.inject_next_blocking_job_join_failure();
     }
 
+    /// Test-only one-shot seam: the next admitted blocking job runs its operation closure to
+    /// completion and settles its result, then unwinds after the operation's `catch_unwind` so
+    /// the exact raw Tokio join reports a real failure.  The fault is consumed by that exact
+    /// `spawn_blocking_tracked` admission, runs only inside the spawned worker, and never
+    /// touches the parent/caller task or any other registered task.
+    #[cfg(test)]
+    pub(crate) fn inject_next_blocking_job_post_operation_panic(&self) {
+        self.owner.inject_next_blocking_job_post_operation_panic();
+    }
+
     #[cfg(test)]
     pub(crate) fn registered_task_count_for_test(&self) -> usize {
         let registry = lock(&self.owner.registry);
@@ -292,10 +310,7 @@ impl TrackedTask {
             .ok_or(RuntimeTaskError::WorkerUnavailable)?;
         let mut join = SingleRegisteredTaskJoinGuard::new(Arc::clone(&self.owner), self.key, task);
         let join_failed = join.join().await.is_err();
-        let task = join.finish();
-        if join_failed {
-            task.settlement.settle_join_failure();
-        }
+        let task = join.finish(join_failed);
         drop(task);
         self.settlement.wait().await
     }
@@ -321,10 +336,7 @@ impl TrackedTask {
                 let mut join =
                     SingleRegisteredTaskJoinGuard::new(Arc::clone(&self.owner), self.key, task);
                 let join_failed = join.join().await.is_err();
-                let task = join.finish();
-                if join_failed {
-                    task.settlement.settle_join_failure();
-                }
+                let task = join.finish(join_failed);
                 drop(task);
                 continue;
             }
@@ -387,18 +399,43 @@ where
     }
 
     pub(crate) async fn wait(&self) -> Result<T, RuntimeTaskError> {
-        if let (Some(owner), Some(key)) = (&self.owner, self.key) {
+        let (Some(owner), Some(key)) = (&self.owner, self.key) else {
+            return self.settlement.wait().await;
+        };
+
+        loop {
+            // A cloned waiter must not observe an operation's provisional settlement while
+            // another waiter still owns the exact raw join. A raw task can fail after the
+            // operation settled, and that terminal join failure must win for every waiter.
+            let registry_changed = owner.registry_changed.notified();
+            tokio::pin!(registry_changed);
+            registry_changed.as_mut().enable();
+            let settlement_changed = self.settlement.changed.notified();
+            tokio::pin!(settlement_changed);
+            settlement_changed.as_mut().enable();
+
             if let Some(task) = owner.take_registered(key) {
                 let mut join = SingleRegisteredTaskJoinGuard::new(Arc::clone(owner), key, task);
                 let join_failed = join.join().await.is_err();
-                let task = join.finish();
-                if join_failed {
-                    task.settlement.settle_join_failure();
-                }
+                let task = join.finish(join_failed);
                 drop(task);
+                continue;
+            }
+
+            if let Some(outcome) = self.settlement.current() {
+                if !owner.has_registration(key) {
+                    return outcome;
+                }
+                registry_changed.await;
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                _ = registry_changed => {}
+                _ = settlement_changed => {}
             }
         }
-        self.settlement.wait().await
     }
 }
 
@@ -417,6 +454,8 @@ struct RuntimeTaskOwner {
     registry_changed: Notify,
     #[cfg(test)]
     next_blocking_job_join_failure: AtomicBool,
+    #[cfg(test)]
+    next_blocking_job_post_operation_panic: AtomicBool,
 }
 
 impl RuntimeTaskOwner {
@@ -427,6 +466,8 @@ impl RuntimeTaskOwner {
             registry_changed: Notify::new(),
             #[cfg(test)]
             next_blocking_job_join_failure: AtomicBool::new(false),
+            #[cfg(test)]
+            next_blocking_job_post_operation_panic: AtomicBool::new(false),
         }
     }
 
@@ -435,6 +476,21 @@ impl RuntimeTaskOwner {
     fn inject_next_blocking_job_join_failure(&self) {
         self.next_blocking_job_join_failure
             .store(true, Ordering::Release);
+    }
+
+    /// Test-only one-shot post-operation panic injection for the next blocking job admission.
+    #[cfg(test)]
+    fn inject_next_blocking_job_post_operation_panic(&self) {
+        self.next_blocking_job_post_operation_panic
+            .store(true, Ordering::Release);
+    }
+
+    /// Test-only one-shot consumption of the post-operation panic seam: `true` arms the next
+    /// admitted blocking operation to unwind after it settles its result.
+    #[cfg(test)]
+    fn take_post_operation_panic(&self) -> bool {
+        self.next_blocking_job_post_operation_panic
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Test-only: when the one-shot fault is armed, the next `spawn_blocking_tracked` installs
@@ -773,11 +829,17 @@ impl SingleRegisteredTaskJoinGuard {
         .await
     }
 
-    fn finish(&mut self) -> RegisteredTask {
+    fn finish(&mut self, join_failed: bool) -> RegisteredTask {
         let task = self
             .task
             .take()
             .expect("a single registered task join finishes only once");
+        if join_failed {
+            // Publish the terminal join result before making the exact registration disappear.
+            // Shared waiters may already see a provisional operation result, so waking them via
+            // the registry transition first would allow that result to escape.
+            task.settlement.settle_join_failure();
+        }
         self.owner.finish_registered_join(self.key);
         task
     }
@@ -810,7 +872,20 @@ where
     T: Clone + Send + 'static,
 {
     fn settle_join_failure(&self) {
-        self.resolve(Err(RuntimeTaskError::WorkerUnavailable));
+        // A raw join failure is terminal and wins over any result the worker already settled:
+        // the operation may have run and physically committed its side effect before the task
+        // died, so waiters must observe `WorkerUnavailable` instead of a provisional success.
+        // The terminal outcome is idempotent: a repeated join failure keeps the same error.
+        let mut stored = lock(&self.outcome);
+        let changed = !matches!(
+            stored.as_ref(),
+            Some(Err(RuntimeTaskError::WorkerUnavailable))
+        );
+        if changed {
+            *stored = Some(Err(RuntimeTaskError::WorkerUnavailable));
+            drop(stored);
+            self.changed.notify_waiters();
+        }
     }
 }
 
@@ -1036,6 +1111,78 @@ mod tests {
         // The seam is one-shot: the next admission runs its closure normally.
         let next = context.spawn_blocking_tracked(|| 5_u8);
         assert_eq!(next.wait().await, Ok(5));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injected_post_operation_panic_settles_worker_unavailable_after_the_operation_ran() {
+        let context = initialized_context().await;
+        let ran = Arc::new(AtomicUsize::new(0));
+        let ran_by_operation = Arc::clone(&ran);
+
+        context.inject_next_blocking_job_post_operation_panic();
+        let job = context.spawn_blocking_tracked(move || {
+            ran_by_operation.fetch_add(1, Ordering::SeqCst);
+            7_u8
+        });
+
+        assert_eq!(
+            job.wait().await,
+            Err(RuntimeTaskError::WorkerUnavailable),
+            "the raw join failure overrides the operation's provisional success"
+        );
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "the injected post-operation panic runs the operation closure to completion first"
+        );
+
+        // The seam is one-shot and targets exactly the next admission: the next blocking job
+        // runs normally on the same owner, untouched by the consumed fault.
+        let next = context.spawn_blocking_tracked(|| 5_u8);
+        assert_eq!(next.wait().await, Ok(5));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shared_blocking_waiters_do_not_escape_a_provisional_result_before_join_failure() {
+        let context = initialized_context().await;
+        let key = context
+            .owner
+            .reserve_start()
+            .expect("the open owner reserves the blocking task");
+        let settlement = Arc::new(super::Settlement::new());
+        let worker_settled = Arc::new(Barrier::new(2));
+        let worker_release = Arc::new(Barrier::new(2));
+        let settlement_by_worker = Arc::clone(&settlement);
+        let settled_by_worker = Arc::clone(&worker_settled);
+        let release_by_worker = Arc::clone(&worker_release);
+        let handle = context.owner.handle.spawn_blocking(move || {
+            settlement_by_worker.resolve(Ok(7_u8));
+            settled_by_worker.wait();
+            release_by_worker.wait();
+            panic!("blocking task fails after its provisional result");
+        });
+        let join_failure_settlement: Arc<dyn super::JoinFailureSettlement> = settlement.clone();
+        context
+            .owner
+            .install_task(key, handle, join_failure_settlement);
+        let job = super::TrackedBlockingJob::new(Arc::clone(&context.owner), key, settlement);
+        let shared_waiter = job.clone();
+
+        // The operation result is already present, but the raw task is held before its terminal
+        // panic. Waiter A owns that exact join; waiter B must remain pending instead of returning
+        // the provisional `Ok(7)`.
+        worker_settled.wait();
+        let mut waiter_a = Box::pin(job.wait());
+        assert!(poll_once_pending(waiter_a.as_mut()).await);
+        let mut waiter_b = Box::pin(shared_waiter.wait());
+        assert!(poll_once_pending(waiter_b.as_mut()).await);
+
+        worker_release.wait();
+        let (first, second) = tokio::join!(waiter_a, waiter_b);
+        assert_eq!(first, Err(RuntimeTaskError::WorkerUnavailable));
+        assert_eq!(second, Err(RuntimeTaskError::WorkerUnavailable));
         context.shutdown().await;
     }
 

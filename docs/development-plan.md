@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现并通过独立全量验证，M5.1完整fixture/native exit gate仍pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition与owner-bound empty SkillView/ToolSet foundation已实现；Runtime shared-root publication、concrete source discovery、Workspace source Load integration、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof、owner-tracked SessionRecorder physical append及全部七个 `slice = m5_1` Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现并通过独立全量验证；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition与owner-bound empty SkillView/ToolSet foundation已实现；Runtime shared-root publication、concrete source discovery、Workspace source Load integration、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -361,7 +361,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现；本次Load fault-and-replay conformance slice进一步以确定性测试覆盖admitted Load caller cancellation、replay worker spawn rejection/panic/join failure、Recorder initialization degradation、stale Workspace candidate recheck与completed append后的cold replay；完整fixture/native exit gate仍Pending。
+状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof、owner-tracked SessionRecorder physical append及全部七个 Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现；Load fault-and-replay conformance继续以确定性测试覆盖admitted Load caller cancellation、replay worker spawn rejection/panic/join failure、Recorder initialization degradation、stale Workspace candidate recheck与completed append后的cold replay。
 
 ### M5.0 DurableState / async foundation implementation
 
@@ -382,6 +382,8 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ### M5.1 SessionRecorder
 
+状态：Completed。全部七个 Durable Store `slice = m5_1` Recorder坐标已由same-named deterministic tests消费；完整cross-platform native matrix仍属于M5.0/platform gate，不由本里程碑宣称完成。
+
 实现：
 
 - [x] DurableState-issued `PublishedConversationTarget`与paired writable proof：在root lease下owner-tracked打开已发布conversation，严格校验initial Header、bounded physical length、regular-file mode与same-open path/handle identity；Recorder只消费opaque target/proof，不取得path；
@@ -393,13 +395,13 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - [x] 不retry、不segment、不backfill、不回滚live mutation；
 - [x] diagnostic只保留allowlisted code与redacted bounded message；
 
-当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；本次生命周期切片进一步用确定性 physical-write 前后 barrier 证明 caller drop-after-write、Registry drain，以及 `MiniCoreRuntime::shutdown()` 先排空 loaded Recorder、再释放 DurableState root lease；M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor；Load fault-and-replay conformance还覆盖了admitted Load cancellation、replay worker spawn rejection/panic/join failure、degraded Recorder initialization、stale Workspace recheck和append后的cold replay。M5.1完整fixture/native exit gate仍不在本 slice。
+当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；确定性 physical-write 前后 barrier证明caller drop-before/after-write、partial tail、complete line after side effect、shutdown settlement与Registry drain，Runtime级测试证明 `MiniCoreRuntime::shutdown()` 先排空 loaded Recorder、再释放 DurableState root lease。`recorder.job.join_panic` 使用真实raw JoinError覆盖operation已发布的provisional success，并由并发 `record`/`close` shared waiters证明exact attempt在raw registration reap前不会提前返回；cold replay随后决定保留完整line或忽略/truncate partial tail。M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor；Load fault-and-replay conformance还覆盖了admitted Load cancellation、replay worker spawn rejection/panic/join failure、degraded Recorder initialization、stale Workspace recheck和append后的cold replay。
 
 退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个physical job、panic/close reaper复用exact attempt、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
 
 ### M5.2 Tolerant semantic replay
 
-状态：Semantic replay seam与全部conversation corruption sidecars已实现并通过独立 replay、全 suite、MSRV、heavy、docs与fixture gates；replay/Recorder-backed Ready+Idle Load hydration已实现，M5.1 fixture/native exit gate仍pending。
+状态：Semantic replay seam与全部conversation corruption sidecars已实现并通过独立 replay、全 suite、MSRV、heavy、docs与fixture gates；replay/Recorder-backed Ready+Idle Load hydration与M5.1全部Recorder fixture坐标已实现。
 
 实现：
 
@@ -697,9 +699,9 @@ M6后允许private、不可发布的Rig reality spike；开始production `RigPro
 
 M0与M1已完成；M2 minimal Snapshot/Event已落地，M3.1 exact Conversation Header/Entry per-line codec、M3.2 bounded physical JSONL scanner与M4 LiveConversation reducer已完成。继续按下列顺序执行，不提前进入Session执行：
 
-1. `M5.0` DurableState/async foundations implementation；
-2. `M5.1` SessionRecorder；
-3. `M5.2` tolerant semantic replay与corruption sidecars及replay/Recorder-backed Ready+Idle Load hydration（已完成）；随后关闭M5.1 fixture/native exit gate；
+1. `M5.0` DurableState/async foundations implementation（foundation已完成，完整platform matrix仍pending）；
+2. `M5.1` SessionRecorder与全部七个fixture坐标（已完成）；
+3. `M5.2` tolerant semantic replay、corruption sidecars及replay/Recorder-backed Ready+Idle Load hydration（已完成）；
 4. M6–M10随owning behavior补齐resources、behavioral Runtime slice、non-empty Item/Interaction/queue、Degraded recording、usage/diagnostics、Progress/Closed EventFrame，并逐项激活remaining manifest vectors。
 
 在M2–M6 prerequisites关闭前不得进入M7 ordinary behavior slice；production Provider与Tool/Sandbox继续分别受V4-P1-3和V4-C0-1门禁约束。
