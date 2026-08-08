@@ -457,6 +457,7 @@ mod tests {
         SealedAgentCreateAttempt, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt,
         SessionModelConfig,
     };
+    use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
     use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{AgentPromptSelection, SessionPromptSelection};
     use crate::runtime_task::RuntimeTaskError;
@@ -465,6 +466,7 @@ mod tests {
         SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
         SessionResidencyUnloadOutcome,
     };
+    use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, Workspace, WorkspaceCwdSpec, WorkspaceDefinitionInput,
@@ -631,9 +633,34 @@ mod tests {
             .session_id()
     }
 
+    fn replayed_user_entry(session_id: SessionId, line_index: usize) -> Vec<u8> {
+        let source = include_str!(
+            "../docs/fixtures/wire-v1/conversation/golden/user-sources-and-stamps.jsonl"
+        );
+        let entry = source
+            .lines()
+            .nth(line_index)
+            .expect("the replay fixture has a User entry")
+            .replace(
+                "ses_12121212121212121212121212121212",
+                &session_id.to_string(),
+            );
+        entry.into_bytes()
+    }
+
+    fn replayed_user_conversation(session_id: SessionId, header: SessionHeader) -> Vec<u8> {
+        let entry = replayed_user_entry(session_id, 1);
+        let mut bytes = ConversationLineCodec::encode_header(&header)
+            .expect("the runtime replay Header encodes");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&entry);
+        bytes.push(b'\n');
+        bytes
+    }
+
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
-        F: Future<Output = ()>,
+        F: Future,
     {
         poll_fn(|context| {
             std::task::Poll::Ready(matches!(
@@ -720,6 +747,92 @@ mod tests {
         )
         .await
         .expect("shutdown releases the root after unloading the Session");
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drains_loaded_recorder_before_releasing_root_lease() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the runtime opens");
+        let session_id = create_runtime_session(&runtime, workspace.path()).await;
+
+        let durable_state = super::lock(&runtime.inner.durable_state)
+            .as_ref()
+            .cloned()
+            .expect("the open Runtime retains DurableState");
+        let current = durable_state
+            .session_current(session_id)
+            .expect("the created Session is catalogued");
+        let header = SessionHeader::reconstruct(
+            1,
+            session_id,
+            current.head().created_at(),
+            current.definition().agent(),
+            current.definition().revision(),
+        );
+        drop(durable_state);
+
+        let conversation_path = root
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("conversation.jsonl");
+        let recorded = replayed_user_conversation(session_id, header);
+        fs::write(&conversation_path, &recorded).expect("the replay fixture is installed");
+
+        assert_eq!(
+            runtime.inner.load_session_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        let residency = runtime.inner.residency().expect("residency is installed");
+        let recorder = residency
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed")
+            .recorder_for_test()
+            .expect("the loaded executor retains its Recorder");
+        let barrier = RecorderWriteBarrier::new();
+        barrier.hold_after_write();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let entry_line = replayed_user_entry(session_id, 2);
+        let entry = ConversationLineCodec::decode_entry_for_session(&entry_line, session_id)
+            .expect("the production codec decodes the replay entry");
+        let mut append = Box::pin(recorder.record(Arc::new(entry)));
+        assert!(poll_once_pending(append.as_mut()).await);
+        barrier.release();
+        barrier.wait_until_written().await;
+
+        // Runtime shutdown must drain residency, including the Recorder's exact tracked job,
+        // before it closes DurableState and releases the Store root lease.
+        let mut shutdown = Box::pin(runtime.shutdown());
+        assert!(poll_once_pending(shutdown.as_mut()).await);
+        assert!(matches!(
+            MiniCoreRuntime::open(
+                MiniCoreRuntimeConfig::new(root.path().to_owned()),
+                Handle::current(),
+            )
+            .await,
+            Err(RuntimeInitializationError::StoreInUse)
+        ));
+
+        barrier.release_after_write();
+        assert_eq!(append.await, RecordOutcome::Written);
+        shutdown.await;
+        assert!(super::lock(&runtime.inner.session_residency).is_none());
+        assert!(super::lock(&runtime.inner.durable_state).is_none());
+
+        let reopened = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the drained shutdown releases the root lease");
         reopened.shutdown().await;
     }
 
