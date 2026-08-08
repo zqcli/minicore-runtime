@@ -156,6 +156,13 @@ impl SteerQueue {
         Some(entry)
     }
 
+    pub(crate) fn contains(&self, command_id: CommandId) -> bool {
+        self.entries
+            .values()
+            .flatten()
+            .any(|entry| entry.command_id() == command_id)
+    }
+
     pub(crate) fn clear_for_turn(&mut self, turn_id: TurnId) -> Vec<QueuedSteer> {
         let Some(queue) = self.entries.remove(&turn_id) else {
             return Vec::new();
@@ -216,6 +223,12 @@ impl FollowUpQueue {
             .iter()
             .position(|entry| entry.command_id() == command_id)?;
         self.entries.remove(index)
+    }
+
+    pub(crate) fn contains(&self, command_id: CommandId) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.command_id() == command_id)
     }
 
     pub(crate) fn len(&self) -> usize {
