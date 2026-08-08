@@ -30,7 +30,7 @@ M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2和M4已完成。M5.0 productio
 
 开发计划M0与M1已经完成，M2按行为slice增量推进，M8.1已完成；后续主要门禁：
 
-- M5.0/M5.1/M5.2 foundation：durable entity publication、exact historical definition resolution、SessionRecorder七项fixture conformance、Workspace resolver/Snapshot、loaded Ready+Idle publication owner、Runtime residency integration、tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration已完成；M7 ordinary AgentRun与M8.1最小Scripted Tool round-trip已完成；下一步实现M8.2 Interaction、M8.3 Cancel、public Tool/Interaction DTO、active-Turn grace Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix；
+- M5.0/M5.1/M5.2 foundation：durable entity publication、exact historical definition resolution、SessionRecorder七项fixture conformance、Workspace resolver/Snapshot、loaded Ready+Idle publication owner、Runtime residency integration、tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration已完成；M7 ordinary AgentRun、M8.1最小Scripted Tool round-trip、M8.2 crate-private Interaction seam与M8.3 crate-private Cancel seam已完成；M9.1 bounded crate-private FollowUp FIFO与terminal handoff已接通；下一步实现完整Steer/FollowUp control lanes、public Tool/Interaction DTO、logical retry、active-Turn grace Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；
 - V4-C0-1：production Tool/Sandbox adapter开始前关闭enforcement fail-closed合同。
 

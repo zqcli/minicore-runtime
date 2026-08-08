@@ -43,6 +43,7 @@ use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
+use crate::session_ingress::{FollowUpQueue, FollowUpQueueError};
 #[cfg(test)]
 use crate::tools::ToolExecutionResult;
 use crate::tools::{ToolCall, ToolExecutionOutcome, ToolExecutionRequest, ToolSet};
@@ -358,6 +359,20 @@ pub(crate) enum SessionCancelError {
     #[error("the Turn is already terminal")]
     TurnTerminal,
     #[error("session cancellation dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionFollowUpError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session execution has no active Turn")]
+    TurnNotRunning,
+    #[error("the FollowUp command conflicts with an admitted command")]
+    CommandConflict,
+    #[error("the FollowUp queue is full")]
+    QueueFull,
+    #[error("session follow-up dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
 
@@ -705,6 +720,7 @@ impl SessionExecutor {
             active_admission: None,
             active_turn: None,
             pending_interactions: BTreeMap::new(),
+            follow_up: FollowUpQueue::new(),
             turn_admission_gate: Arc::clone(&turn_admission_gate),
             events: events.clone(),
             #[cfg(test)]
@@ -975,6 +991,44 @@ impl SessionExecutor {
         })
     }
 
+    /// Queues a FollowUp behind the active Turn.  The public command and snapshot projection are
+    /// intentionally deferred to the owning M9 slice; this seam only preserves bounded FIFO
+    /// admission and terminal handoff inside the Session actor.
+    pub(crate) async fn follow_up(
+        &self,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<(), SessionFollowUpError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::FollowUp(FollowUpRequest {
+            command_id,
+            intent: Some(intent),
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionFollowUpError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionFollowUpError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionFollowUpError::Closing)
+            } else {
+                Err(SessionFollowUpError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
@@ -1087,6 +1141,7 @@ struct SessionExecutorActor {
     active_admission: Option<ActiveAdmission>,
     active_turn: Option<ActiveTurn>,
     pending_interactions: BTreeMap<RequestId, ActiveInteraction>,
+    follow_up: FollowUpQueue,
     turn_admission_gate: Arc<TurnAdmissionGate>,
     events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     #[cfg(test)]
@@ -1310,11 +1365,43 @@ impl SessionExecutorActor {
             SessionExecutorRequest::Submit(request) => {
                 self.start_admission(request)?;
             }
+            SessionExecutorRequest::FollowUp(request) => {
+                self.enqueue_follow_up(request)?;
+            }
             SessionExecutorRequest::ResolveInteraction(request) => {
                 self.resolve_interaction_request(request).await?;
             }
             SessionExecutorRequest::Cancel(request) => {
                 self.cancel_request(request).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_follow_up(&mut self, request: &mut FollowUpRequest) -> Result<(), ActorFatality> {
+        let Some(active_turn) = self.active_turn.as_ref() else {
+            request.settle(Err(SessionFollowUpError::TurnNotRunning));
+            return Ok(());
+        };
+        if active_turn.command_id == request.command_id
+            || self
+                .active_admission
+                .as_ref()
+                .is_some_and(|admission| admission.command_id == request.command_id)
+        {
+            request.settle(Err(SessionFollowUpError::CommandConflict));
+            return Ok(());
+        }
+        let Some(intent) = request.intent.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        match self.follow_up.try_push(request.command_id, intent) {
+            Ok(()) => request.settle(Ok(())),
+            Err(FollowUpQueueError::Full) => {
+                request.settle(Err(SessionFollowUpError::QueueFull));
+            }
+            Err(FollowUpQueueError::DuplicateCommandId) => {
+                request.settle(Err(SessionFollowUpError::CommandConflict));
             }
         }
         Ok(())
@@ -1769,6 +1856,17 @@ impl SessionExecutorActor {
             terminal: completion.terminal,
             snapshot: Arc::clone(&self.current),
         }));
+        if task_result.is_ok() {
+            if let Some(queued) = self.follow_up.pop_front() {
+                let (command_id, intent) = queued.into_parts();
+                let mut request = SubmitRequest {
+                    command_id,
+                    intent: Some(intent),
+                    response: None,
+                };
+                self.start_admission(&mut request)?;
+            }
+        }
         if task_result.is_err() {
             Err(ActorFatality::Internal)
         } else {
@@ -2904,6 +3002,30 @@ struct SubmitRequest {
     response: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
 }
 
+struct FollowUpRequest {
+    command_id: CommandId,
+    intent: Option<PromptIntent>,
+    response: Option<oneshot::Sender<Result<(), SessionFollowUpError>>>,
+}
+
+impl FollowUpRequest {
+    fn settle(&mut self, outcome: Result<(), SessionFollowUpError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionFollowUpError::Closing));
+    }
+}
+
+impl Drop for FollowUpRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 struct ResolveInteractionRequest {
     request_id: RequestId,
     resolution: Option<ResolvedInteraction>,
@@ -3047,6 +3169,7 @@ enum SessionExecutorRequest {
     Update(WorkspaceDefinitionRequest),
     Snapshot(SnapshotRequest),
     Submit(SubmitRequest),
+    FollowUp(FollowUpRequest),
     ResolveInteraction(ResolveInteractionRequest),
     Cancel(CancelRequest),
     Subscribe(SubscribeRequest),
@@ -3060,6 +3183,7 @@ impl SessionExecutorRequest {
             Self::Update(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
             Self::Submit(request) => request.reject_closing(),
+            Self::FollowUp(request) => request.reject_closing(),
             Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Cancel(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
@@ -4887,6 +5011,25 @@ mod tests {
             )
             .contains(SESSION_ID)
         );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn follow_up_is_rejected_without_an_active_turn() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let result = loaded
+            .executor
+            .follow_up(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("queued later").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(result, Err(SessionFollowUpError::TurnNotRunning));
         close_loaded(loaded).await;
     }
 
