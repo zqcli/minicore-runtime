@@ -488,7 +488,7 @@ Create → Load → Submit(Text) → Model(final text)
 
 ## M8 · Tools、Interaction与Cancel
 
-当前进度：M8.1最小Scripted Tool exchange已完成。`ToolSet`捕获immutable definitions与crate-private executor，按ToolExecutionMode选择并发/串行 round，结果按assistant call order回填；ModelGateway已允许非空ToolPromptView并校验ToolCall名称，ActiveTurnTask已执行ToolCall → ToolResult → 下一次Model → final Assistant。具体schema/policy/approval、public Tool DTO、Interaction与Cancel仍由M8.2/M8.3完成。
+当前进度：M8.1最小Scripted Tool exchange与M8.2最小crate-private scripted approval seam已完成。`ToolSet`捕获immutable definitions与crate-private executor，按ToolExecutionMode选择并发/串行 round，结果按assistant call order回填；ModelGateway已允许非空ToolPromptView并校验ToolCall名称，ActiveTurnTask已接通ToolCall → ToolResult → 下一次Model → final Assistant，以及Interaction request → snapshot pending → host resolution → truthful ToolResult。具体schema/policy/approval、public Tool DTO、完整Interaction control lanes与Cancel仍由后续M8 slices完成。
 
 M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和Tool settlement所需control lanes；不能等到M9才让Cancel/approval message进入actor。
 
@@ -505,6 +505,8 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 - 已验证当前可达的unknown/pre-execution失败、Executed成功和Abandoned结算；完整pre-execution/Executed truth matrix随production ToolService与M8.2/M8.3 control lanes收口。
 
 ### M8.2 Interaction
+
+当前 slice 只闭合一个crate-private scripted approval vertical seam：Tool executor发出Interaction后由Session actor live apply并inline record，pending request进入Session snapshot；host按exact request resolution actor apply并inline record，随后恢复Tool waiter并继续下一次Model。UserQuestion、public Interaction DTO、resolution key幂等路由、完整policy/approval与owner control lanes仍待后续slice。
 
 - request live apply → record attempt → notify；
 - approval只选择request-scoped option或Deny；
