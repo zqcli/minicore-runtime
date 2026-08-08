@@ -12,6 +12,11 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use tokio::sync::Notify;
+
 use thiserror::Error;
 
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError};
@@ -1322,6 +1327,8 @@ pub(crate) struct WorkspaceResolver {
     task_context: RuntimeTaskContext,
     paths: Arc<dyn WorkspacePathAdapter>,
     authority: Arc<dyn WorkspaceAuthority>,
+    #[cfg(test)]
+    hooks: Arc<WorkspaceResolverTestHooks>,
 }
 
 impl WorkspaceResolver {
@@ -1342,6 +1349,15 @@ impl WorkspaceResolver {
             task_context,
             paths,
             authority,
+            #[cfg(test)]
+            hooks: Arc::new(WorkspaceResolverTestHooks::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> WorkspaceResolverTestHooks {
+        WorkspaceResolverTestHooks {
+            inner: Arc::clone(&self.hooks.inner),
         }
     }
 
@@ -1409,12 +1425,125 @@ impl WorkspaceResolver {
             Err(error) => return Err(error),
         };
 
-        Ok(WorkspaceSnapshotCandidate::new(
+        let candidate = WorkspaceSnapshotCandidate::new(
             session_id,
             workspace.revision,
             resolved_roots,
             path_phase.canonical_cwd,
-        ))
+        );
+
+        #[cfg(test)]
+        self.hooks.inner.after_candidate.wait_if_armed().await;
+
+        Ok(candidate)
+    }
+}
+
+/// Test-only deterministic pause at the exact stage where one Load holds its resolved candidate
+/// but has not yet performed its final durable recheck.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct WorkspaceResolverTestHooks {
+    inner: Arc<WorkspaceResolverTestHooksInner>,
+}
+
+#[cfg(test)]
+struct WorkspaceResolverTestHooksInner {
+    after_candidate: Arc<WorkspaceResolverAsyncBarrier>,
+}
+
+#[cfg(test)]
+impl WorkspaceResolverTestHooksInner {
+    fn new() -> Self {
+        Self {
+            after_candidate: Arc::new(WorkspaceResolverAsyncBarrier::new()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl WorkspaceResolverTestHooks {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(WorkspaceResolverTestHooksInner::new()),
+        }
+    }
+
+    pub(crate) fn arm_after_candidate_before_final_recheck(&self) {
+        self.inner.after_candidate.arm();
+    }
+
+    pub(crate) async fn wait_after_candidate_before_final_recheck(&self) {
+        self.inner.after_candidate.wait_until_entered().await;
+    }
+
+    pub(crate) fn release_after_candidate_before_final_recheck(&self) {
+        self.inner.after_candidate.release();
+    }
+}
+
+#[cfg(test)]
+struct WorkspaceResolverAsyncBarrier {
+    armed: AtomicBool,
+    entered: AtomicBool,
+    released: AtomicBool,
+    changed: Notify,
+}
+
+#[cfg(test)]
+impl WorkspaceResolverAsyncBarrier {
+    fn new() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+
+    fn arm(&self) {
+        self.entered.store(false, Ordering::Release);
+        self.released.store(false, Ordering::Release);
+        self.armed.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_if_armed(&self) {
+        if self
+            .armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.entered.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_until_entered(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.entered.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.changed.notify_waiters();
     }
 }
 

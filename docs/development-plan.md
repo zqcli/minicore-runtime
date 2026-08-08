@@ -361,7 +361,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现；完整fixture/native exit gate仍Pending。
+状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现；本次Load fault-and-replay conformance slice进一步以确定性测试覆盖admitted Load caller cancellation、replay worker spawn rejection/panic/join failure、Recorder initialization degradation、stale Workspace candidate recheck与completed append后的cold replay；完整fixture/native exit gate仍Pending。
 
 ### M5.0 DurableState / async foundation implementation
 
@@ -393,7 +393,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - [x] 不retry、不segment、不backfill、不回滚live mutation；
 - [x] diagnostic只保留allowlisted code与redacted bounded message；
 
-当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；本次生命周期切片进一步用确定性 physical-write 前后 barrier 证明 caller drop-after-write、Registry drain，以及 `MiniCoreRuntime::shutdown()` 先排空 loaded Recorder、再释放 DurableState root lease；M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor。M5.1完整fixture/native exit gate仍不在本 slice。
+当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；本次生命周期切片进一步用确定性 physical-write 前后 barrier 证明 caller drop-after-write、Registry drain，以及 `MiniCoreRuntime::shutdown()` 先排空 loaded Recorder、再释放 DurableState root lease；M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor；Load fault-and-replay conformance还覆盖了admitted Load cancellation、replay worker spawn rejection/panic/join failure、degraded Recorder initialization、stale Workspace recheck和append后的cold replay。M5.1完整fixture/native exit gate仍不在本 slice。
 
 退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个physical job、panic/close reaper复用exact attempt、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
 
@@ -451,7 +451,7 @@ provider-neutral request/result seam稳定后立即并行运行private Rig reali
 
 ## M7 · Ordinary AgentRun Vertical Slice
 
-当前进度：crate-private loaded Ready+Idle `SessionExecutor`与Runtime-owned residency actor foundation Completed。它已消费single-flight Load、coherent durable head+definition capture/final recheck、opaque residency permit、per-Session typed gate、draining Unload、Archive/Delete unloaded exclusion、unified loaded/unloaded Workspace update、caller-drop independence、child reap/gate cleanup、pre-close reserved request drain及shutdown cancellation retention；Load还已消费DurableState-issued target，在owner-tracked blocking work中replay、authorized partial-tail truncate、cold `LiveSessionState` seed与Recorder initialization，并由executor close drain Recorder；public dispatch/snapshot/event、active-Turn grace Unload、Turn admission与ActiveTurnTask仍Pending。
+当前进度：crate-private loaded Ready+Idle `SessionExecutor`与Runtime-owned residency actor foundation Completed。它已消费single-flight Load、coherent durable head+definition capture/final recheck、opaque residency permit、per-Session typed gate、draining Unload、Archive/Delete unloaded exclusion、unified loaded/unloaded Workspace update、caller-drop independence、child reap/gate cleanup、pre-close reserved request drain及shutdown cancellation retention；Load还已消费DurableState-issued target，在owner-tracked blocking work中replay、authorized partial-tail truncate、cold `LiveSessionState` seed与Recorder initialization，并由executor close drain Recorder；本次conformance slice进一步证明admitted Load cancellation、replay worker故障映射、degraded Recorder initialization、stale Workspace candidate拒绝及完成append后的cold replay；public dispatch/snapshot/event、active-Turn grace Unload、Turn admission与ActiveTurnTask仍Pending。
 
 实现：
 
