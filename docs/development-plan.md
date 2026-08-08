@@ -530,7 +530,7 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 
 ## M9 · Steer、FollowUp与Logical Retry
 
-当前进度：M9.1 已完成最小 crate-private FollowUp FIFO seam：bounded admission、duplicate command rejection、按 CommandId remove 基础与 terminal handoff；M9.2 已接通 crate-private Steer admission、expected Turn 校验、per-Turn bounded FIFO，以及完整 tool round 后、下一次 Model 前的一条 FIFO safe-point 消费（复用 captured TurnExecutionContext 并按 `UserMessageSource::Steer` apply/record）；M9.3 已接通 actor-local queued-message cancellation，Steer/FollowUp 均按 CommandId remove，重复取消返回 `NotQueued`，且两 lane 拒绝重复 CommandId。完整 Steer/FollowUp public projection、fair admission、logical retry与Skill composition仍后置。
+当前进度：M9.1 已完成最小 crate-private FollowUp FIFO seam：bounded admission、duplicate command rejection、按 CommandId remove 基础与 terminal handoff；M9.2 已接通 crate-private Steer admission、expected Turn 校验、per-Turn bounded FIFO，以及完整 tool round 后、下一次 Model 前的一条 FIFO safe-point 消费（复用 captured TurnExecutionContext 并按 `UserMessageSource::Steer` apply/record）；M9.3 已接通 actor-local queued-message cancellation，Steer/FollowUp 均按 CommandId remove，重复取消返回 `NotQueued`，且两 lane 拒绝重复 CommandId；M9.4 已闭合 text-only candidate 与迟到 Steer 的 first-wins 仲裁：Steer 胜出时先记录 Intermediate assistant，再记录 Steer 后进入下一次 Model；Final reservation 胜出时关闭该 Turn 的 Steer admission。下一步推进 AgentRun logical retry；完整 Steer/FollowUp public projection、fair admission与Skill composition仍后置。
 
 实现：
 
