@@ -171,6 +171,18 @@ impl SteerQueue {
         queue.into_iter().collect()
     }
 
+    pub(crate) fn command_ids_for_turn(&self, turn_id: TurnId) -> Vec<CommandId> {
+        self.entries
+            .get(&turn_id)
+            .map(|queue| queue.iter().map(QueuedSteer::command_id).collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.len = 0;
+    }
+
     pub(crate) const fn len(&self) -> usize {
         self.len
     }
@@ -223,6 +235,17 @@ impl FollowUpQueue {
             .iter()
             .position(|entry| entry.command_id() == command_id)?;
         self.entries.remove(index)
+    }
+
+    pub(crate) fn command_ids(&self) -> Vec<CommandId> {
+        self.entries
+            .iter()
+            .map(QueuedFollowUp::command_id)
+            .collect()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
     }
 
     pub(crate) fn contains(&self, command_id: CommandId) -> bool {

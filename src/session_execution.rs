@@ -161,6 +161,9 @@ pub(crate) struct SessionExecutorSnapshot {
     current_turn: Option<TurnId>,
     last_terminal: Option<(TurnId, SessionTurnTerminal)>,
     pending_interactions: Arc<[crate::live_conversation::PendingInteractionFact]>,
+    active_submit_command_id: Option<CommandId>,
+    follow_up_command_ids: Arc<[CommandId]>,
+    steer_command_ids: Arc<[CommandId]>,
 }
 
 impl SessionExecutorSnapshot {
@@ -176,6 +179,9 @@ impl SessionExecutorSnapshot {
             current_turn: None,
             last_terminal: None,
             pending_interactions: Arc::from([]),
+            active_submit_command_id: None,
+            follow_up_command_ids: Arc::from([]),
+            steer_command_ids: Arc::from([]),
         }
     }
 
@@ -192,6 +198,9 @@ impl SessionExecutorSnapshot {
             current_turn,
             last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
         }
     }
 
@@ -206,6 +215,28 @@ impl SessionExecutorSnapshot {
             current_turn: self.current_turn,
             last_terminal: self.last_terminal,
             pending_interactions,
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    fn with_queue_projection(
+        &self,
+        active_submit_command_id: Option<CommandId>,
+        follow_up_command_ids: Arc<[CommandId]>,
+        steer_command_ids: Arc<[CommandId]>,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            workspace: Arc::clone(&self.workspace),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id,
+            follow_up_command_ids,
+            steer_command_ids,
         }
     }
 
@@ -242,6 +273,18 @@ impl SessionExecutorSnapshot {
     ) -> &[crate::live_conversation::PendingInteractionFact] {
         &self.pending_interactions
     }
+
+    pub(crate) const fn active_submit_command_id(&self) -> Option<CommandId> {
+        self.active_submit_command_id
+    }
+
+    pub(crate) fn follow_up_command_ids(&self) -> &[CommandId] {
+        &self.follow_up_command_ids
+    }
+
+    pub(crate) fn steer_command_ids(&self) -> &[CommandId] {
+        &self.steer_command_ids
+    }
 }
 
 impl fmt::Debug for SessionExecutorSnapshot {
@@ -254,6 +297,12 @@ impl fmt::Debug for SessionExecutorSnapshot {
             .field("current_turn", &self.current_turn)
             .field("last_terminal", &self.last_terminal)
             .field("pending_interactions", &self.pending_interactions.len())
+            .field(
+                "active_submit_command_id",
+                &self.active_submit_command_id.is_some(),
+            )
+            .field("follow_up_command_ids", &self.follow_up_command_ids.len())
+            .field("steer_command_ids", &self.steer_command_ids.len())
             .finish()
     }
 }
@@ -1474,6 +1523,8 @@ impl SessionExecutorActor {
 
     async fn close_and_drain(&mut self) -> bool {
         self.receiver.close();
+        self.follow_up.clear();
+        self.steer.clear();
         self.execution_state = SessionExecutionState::Finishing;
         self.install_current_state(SessionExecutionState::Finishing);
         self.pending_interactions.clear();
@@ -1613,7 +1664,10 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         match self.follow_up.try_push(request.command_id, intent) {
-            Ok(()) => request.settle(Ok(())),
+            Ok(()) => {
+                self.publish_queue_projection();
+                request.settle(Ok(()));
+            }
             Err(FollowUpQueueError::Full) => {
                 request.settle(Err(SessionFollowUpError::QueueFull));
             }
@@ -1628,9 +1682,10 @@ impl SessionExecutorActor {
         &mut self,
         request: &mut CancelQueuedMessageRequest,
     ) -> Result<(), ActorFatality> {
-        if self.steer.remove(request.command_id).is_some()
-            || self.follow_up.remove(request.command_id).is_some()
-        {
+        let removed = self.steer.remove(request.command_id).is_some()
+            || self.follow_up.remove(request.command_id).is_some();
+        if removed {
+            self.publish_queue_projection();
             request.settle(Ok(()));
         } else {
             request.settle(Err(SessionQueuedMessageError::NotQueued));
@@ -1672,7 +1727,10 @@ impl SessionExecutorActor {
             .steer
             .try_push(request.turn_id, request.command_id, intent)
         {
-            Ok(()) => request.settle(Ok(())),
+            Ok(()) => {
+                self.publish_queue_projection();
+                request.settle(Ok(()));
+            }
             Err(SteerQueueError::Full) => request.settle(Err(SessionSteerError::QueueFull)),
             Err(SteerQueueError::DuplicateCommandId) => {
                 request.settle(Err(SessionSteerError::CommandConflict));
@@ -1702,13 +1760,6 @@ impl SessionExecutorActor {
         let turn_id = TurnId::generate().map_err(|_| ActorFatality::Internal)?;
         let command_id = request.command_id;
         let waiter = request.response.take();
-        self.execution_state = SessionExecutionState::Starting;
-        let current = Arc::new(self.current.with_execution(
-            SessionExecutionState::Starting,
-            None,
-            self.current.last_terminal(),
-        ));
-        self.publish_current(current);
         self.active_admission = Some(ActiveAdmission {
             command_id,
             turn_id,
@@ -1716,6 +1767,12 @@ impl SessionExecutorActor {
             cancellation: CancellationToken::new(),
             task: None,
         });
+        self.execution_state = SessionExecutionState::Starting;
+        self.publish_execution_state(
+            SessionExecutionState::Starting,
+            None,
+            self.current.last_terminal(),
+        );
 
         let cancellation = self
             .active_admission
@@ -1792,12 +1849,11 @@ impl SessionExecutorActor {
             Ok(context) => context,
             Err(error) => {
                 self.execution_state = SessionExecutionState::Idle;
-                let current = Arc::new(self.current.with_execution(
+                self.publish_execution_state(
                     SessionExecutionState::Idle,
                     None,
                     self.current.last_terminal(),
-                ));
-                self.publish_current(current);
+                );
                 if let Some(waiter) = active.waiter.take() {
                     let _ = waiter.send(Err(error));
                 }
@@ -1815,12 +1871,11 @@ impl SessionExecutorActor {
         let control_generation = Arc::new(ControlGeneration(0));
         conversation.install_control_generation(active.turn_id, Arc::clone(&control_generation));
         self.execution_state = SessionExecutionState::Running;
-        let current = Arc::new(self.current.with_execution(
+        self.publish_execution_state(
             SessionExecutionState::Running,
             Some(active.turn_id),
             self.current.last_terminal(),
-        ));
-        self.publish_current(current);
+        );
         self.active_turn = Some(ActiveTurn {
             command_id: active.command_id,
             turn_id: active.turn_id,
@@ -2030,7 +2085,9 @@ impl SessionExecutorActor {
                     return Ok(());
                 }
                 active.cancellation.cancel();
-                self.steer.clear_for_turn(turn_id);
+                if !self.steer.clear_for_turn(turn_id).is_empty() {
+                    self.publish_queue_projection();
+                }
                 let pending = self
                     .pending_interactions
                     .iter()
@@ -2093,7 +2150,17 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Integrity);
         };
         let pending = lock(&conversation.live_state).pending_interaction_facts();
-        self.publish_current(Arc::new(self.current.with_pending_interactions(pending)));
+        let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
+            self.queue_projection(self.current.current_turn());
+        let current = self
+            .current
+            .with_pending_interactions(pending)
+            .with_queue_projection(
+                active_submit_command_id,
+                follow_up_command_ids,
+                steer_command_ids,
+            );
+        self.publish_current(Arc::new(current));
         Ok(())
     }
 
@@ -2122,6 +2189,11 @@ impl SessionExecutorActor {
             self.publish_pending_interactions()?;
         }
         self.steer.clear_for_turn(active.turn_id);
+        let queued_follow_up = if task_result.is_ok() {
+            self.follow_up.pop_front()
+        } else {
+            None
+        };
         let live_turn = lock(&conversation.live_state).current_turn();
         if live_turn == Some(active.turn_id) {
             lock(&conversation.live_state)
@@ -2135,12 +2207,11 @@ impl SessionExecutorActor {
             self.durable_state.request_closing();
         }
         self.execution_state = SessionExecutionState::Idle;
-        let current = Arc::new(self.current.with_execution(
+        self.publish_execution_state(
             SessionExecutionState::Idle,
             None,
             Some((active.turn_id, completion.terminal)),
-        ));
-        self.publish_current(current);
+        );
         let _ = self.events.send(Arc::new(SessionExecutorEvent {
             timestamp: SystemClock.now(),
             command_id: active.command_id,
@@ -2148,16 +2219,14 @@ impl SessionExecutorActor {
             terminal: completion.terminal,
             snapshot: Arc::clone(&self.current),
         }));
-        if task_result.is_ok() {
-            if let Some(queued) = self.follow_up.pop_front() {
-                let (command_id, intent) = queued.into_parts();
-                let mut request = SubmitRequest {
-                    command_id,
-                    intent: Some(intent),
-                    response: None,
-                };
-                self.start_admission(&mut request)?;
-            }
+        if let Some(queued) = queued_follow_up {
+            let (command_id, intent) = queued.into_parts();
+            let mut request = SubmitRequest {
+                command_id,
+                intent: Some(intent),
+                response: None,
+            };
+            self.start_admission(&mut request)?;
         }
         if task_result.is_err() {
             Err(ActorFatality::Internal)
@@ -2332,6 +2401,9 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Internal);
         }
         let steer = self.steer.pop_front_for_turn(completion.turn_id);
+        if steer.is_some() {
+            self.publish_queue_projection();
+        }
         if steer.is_none() && completion.close_if_empty {
             if let Some(active_turn) = self.active_turn.as_mut() {
                 active_turn.steer_admission_open = false;
@@ -2387,12 +2459,19 @@ impl SessionExecutorActor {
                         self.close_for_fatal(ActorFatality::Integrity);
                         return Err(ActorFatality::Integrity);
                     }
+                    let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
+                        self.queue_projection(self.current.current_turn());
                     let current = Arc::new(
                         SessionExecutorSnapshot::new(definition, snapshot, self.execution_state)
                             .with_execution(
                                 self.execution_state,
                                 self.current.current_turn(),
                                 self.current.last_terminal(),
+                            )
+                            .with_queue_projection(
+                                active_submit_command_id,
+                                follow_up_command_ids,
+                                steer_command_ids,
                             ),
                     );
                     self.publish_current(current);
@@ -2536,6 +2615,9 @@ impl SessionExecutorActor {
     fn close_for_fatal(&mut self, _fatality: ActorFatality) {
         self.turn_admission_gate.close();
         self.closing.cancel();
+        self.follow_up.clear();
+        self.steer.clear();
+        self.publish_queue_projection();
         self.pending_interactions.clear();
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
@@ -2549,10 +2631,61 @@ impl SessionExecutorActor {
     }
 
     fn install_current_state(&mut self, execution_state: SessionExecutionState) {
-        let current = Arc::new(self.current.with_execution(
+        self.publish_execution_state(
             execution_state,
             self.current.current_turn(),
             self.current.last_terminal(),
+        );
+    }
+
+    fn publish_execution_state(
+        &mut self,
+        execution_state: SessionExecutionState,
+        current_turn: Option<TurnId>,
+        last_terminal: Option<(TurnId, SessionTurnTerminal)>,
+    ) {
+        let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
+            self.queue_projection(current_turn);
+        let current = Arc::new(
+            self.current
+                .with_execution(execution_state, current_turn, last_terminal)
+                .with_queue_projection(
+                    active_submit_command_id,
+                    follow_up_command_ids,
+                    steer_command_ids,
+                ),
+        );
+        self.publish_current(current);
+    }
+
+    fn queue_projection(
+        &self,
+        current_turn: Option<TurnId>,
+    ) -> (Option<CommandId>, Arc<[CommandId]>, Arc<[CommandId]>) {
+        let active_submit_command_id = self
+            .active_admission
+            .as_ref()
+            .map(|admission| admission.command_id);
+        let follow_up_command_ids = Arc::from(self.follow_up.command_ids());
+        let steer_command_ids = Arc::from(
+            current_turn
+                .map(|turn_id| self.steer.command_ids_for_turn(turn_id))
+                .unwrap_or_default(),
+        );
+        (
+            active_submit_command_id,
+            follow_up_command_ids,
+            steer_command_ids,
+        )
+    }
+
+    fn publish_queue_projection(&mut self) {
+        let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
+            self.queue_projection(self.current.current_turn());
+        let current = Arc::new(self.current.with_queue_projection(
+            active_submit_command_id,
+            follow_up_command_ids,
+            steer_command_ids,
         ));
         self.publish_current(current);
     }
@@ -6354,6 +6487,8 @@ mod tests {
                 .await
         });
         hooks.wait_after_agent_admission_before_input().await;
+        let starting = executor.snapshot().await.unwrap();
+        assert_eq!(starting.active_submit_command_id(), Some(command_id));
         let timestamp: Timestamp = "2026-08-08T10:02:00.000Z".parse().unwrap();
         assert_eq!(
             executor
@@ -6571,6 +6706,133 @@ mod tests {
             loaded.executor.cancel_queued_message(command_id).await,
             Err(SessionQueuedMessageError::Closing)
         );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_projects_queued_message_ids_and_clears_consumed_lanes() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["initial", "follow-up"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let initial_command = CommandId::generate().unwrap();
+        let initial_turn = loaded
+            .executor
+            .submit(
+                initial_command,
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("initial").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_agent_run_attempt().await;
+
+        let follow_first = CommandId::generate().unwrap();
+        let follow_second = CommandId::generate().unwrap();
+        let steer_first = CommandId::generate().unwrap();
+        let steer_second = CommandId::generate().unwrap();
+        let follow_intent = || {
+            PromptIntent::new(
+                PromptBodyIntent::Text(TextIntent::new("follow-up").unwrap()),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        let steer_intent = || {
+            PromptIntent::new(
+                PromptBodyIntent::Text(TextIntent::new("steer").unwrap()),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            loaded
+                .executor
+                .follow_up(follow_first, follow_intent())
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .follow_up(follow_second, follow_intent())
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .steer(initial_turn, steer_first, steer_intent())
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .steer(initial_turn, steer_second, steer_intent())
+                .await,
+            Ok(())
+        );
+
+        let queued = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(queued.active_submit_command_id(), None);
+        assert_eq!(
+            queued.follow_up_command_ids(),
+            &[follow_first, follow_second]
+        );
+        assert_eq!(queued.steer_command_ids(), &[steer_first, steer_second]);
+
+        assert_eq!(
+            loaded.executor.cancel_queued_message(follow_second).await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded.executor.cancel_queued_message(steer_second).await,
+            Ok(())
+        );
+        let after_cancel = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(after_cancel.follow_up_command_ids(), &[follow_first]);
+        assert_eq!(after_cancel.steer_command_ids(), &[steer_first]);
+
+        assert_eq!(
+            loaded.executor.cancel_queued_message(steer_first).await,
+            Ok(())
+        );
+        hooks.release_before_agent_run_attempt();
+        wait_for_request_count(&model, 2).await;
+        let follow_up_turn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot
+                    .current_turn()
+                    .is_some_and(|turn| turn != initial_turn)
+                {
+                    assert!(snapshot.follow_up_command_ids().is_empty());
+                    assert!(snapshot.steer_command_ids().is_empty());
+                    break snapshot.current_turn().unwrap();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued FollowUp starts after the initial Turn");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.last_terminal().is_some_and(|(turn, terminal)| {
+                    turn == follow_up_turn && terminal == SessionTurnTerminal::Completed
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the queued FollowUp reaches terminal state");
         close_loaded(loaded).await;
     }
 

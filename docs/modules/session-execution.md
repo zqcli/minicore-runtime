@@ -7,7 +7,7 @@
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.6 已在 M9.5 的 AgentRun delivery-safe logical retry 上补齐最小 process-local control-generation、current Turn/`ConversationRevision` 与 executor lifecycle 重验（同一 `Arc<ModelCallRequest>`、最多 3 次、2/4/8 秒取消感知 backoff）；完整 SecurityRevoked/EmergencyControl、retry progress/public projection 与 Compaction retry仍后置。
+当前实现进度：M9.7 已在 M9.6 的 retry control basis 之后补齐 crate-private Snapshot 的 active Submit/FollowUp/Steer command-id lane projection（actor-owned coherent capture、lane-local FIFO、取消/消费/terminal/close 后更新；不泄漏 intent/body）；完整 SecurityRevoked/EmergencyControl、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
 
 核心目标：
 
