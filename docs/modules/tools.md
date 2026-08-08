@@ -1,6 +1,6 @@
 # Tool 子系统架构设计
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构；M8.1最小Scripted Tool round-trip已实现，完整ToolService/source/schema/policy/approval与production executor仍待实现
 日期：2026-07-31
 
 ## 目的

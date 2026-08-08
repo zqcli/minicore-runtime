@@ -37,6 +37,7 @@ pub(crate) struct TurnContextCapture {
     pub(crate) prompt_resources: Arc<PromptResourceView>,
     pub(crate) model_gateway: Arc<ModelGateway>,
     pub(crate) model_catalog: Arc<ModelCatalogView>,
+    pub(crate) tool_set: Arc<ToolSet>,
 }
 
 pub(crate) struct TurnExecutionContext {
@@ -75,7 +76,7 @@ impl TurnExecutionContext {
             )
             .map_err(|error| TurnContextCaptureError::Model(error.kind()))?;
         let skill_view = SkillView::empty();
-        let tool_set = ToolSet::empty();
+        let tool_set = input.tool_set;
         let prompt_set = input
             .prompt_service
             .for_turn(PromptTurnContext::new(
@@ -120,6 +121,10 @@ impl TurnExecutionContext {
         self.prompt_set
             .assemble(PromptAssemblyInput::agent_run(conversation, None))
             .map(Arc::new)
+    }
+
+    pub(crate) const fn tool_set(&self) -> &Arc<ToolSet> {
+        &self.tool_set
     }
 
     pub(crate) const fn session_id(&self) -> SessionId {
@@ -175,6 +180,7 @@ mod tests {
         AgentPromptSelection, PromptBodyIntent, PromptIntent, PromptService,
         SessionPromptSelection, TextIntent,
     };
+    use crate::tools::ToolSet;
     use crate::wire::{
         AgentId, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
         WorkspaceRevision,
@@ -294,6 +300,7 @@ mod tests {
             prompt_resources,
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
+            tool_set: ToolSet::empty(),
         })
         .unwrap();
 
@@ -335,6 +342,7 @@ mod tests {
             prompt_resources: Arc::clone(&prompt_resources),
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
+            tool_set: ToolSet::empty(),
         });
         assert_eq!(result.unwrap_err(), TurnContextCaptureError::InvalidBinding);
 
@@ -353,6 +361,7 @@ mod tests {
             prompt_resources: Arc::clone(&prompt_resources),
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
+            tool_set: ToolSet::empty(),
         });
         assert_eq!(result.unwrap_err(), TurnContextCaptureError::InvalidBinding);
 
@@ -366,6 +375,7 @@ mod tests {
             prompt_resources,
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(other_model.catalog()),
+            tool_set: ToolSet::empty(),
         });
         assert_eq!(
             result.unwrap_err(),

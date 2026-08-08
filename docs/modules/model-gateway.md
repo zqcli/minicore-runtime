@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted text-only foundation已实现；Structured/Tool/Compaction paths、credential/connection implementation、Rig reality gate与production adapters待实现）
+状态：当前权威架构（M6.2 scripted text-only foundation与M8.1最小ToolCall validation/round-trip已实现；完整ToolSpec schema、Structured/Compaction paths、credential/connection implementation、Rig reality gate与production adapters待实现）
 
 ## 目的
 
@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2实现范围严格限于ordinary text-only AgentRun：Runtime拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、minimal terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。`OutputContract::NoToolCalls`已保留closed value，但Structured schema、non-empty ToolSpec与允许ToolCall的response、CompactionSummary budget/proof、auth/credential/connection/cache以及Rig provider mapping均未实现，也不由本里程碑暗示可用。
+当前M6.2实现范围严格限于ordinary text-only AgentRun，M8.1在其上增加最小允许ToolCall路径：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行；非空ToolPromptView时，Gateway校验ToolCall名称并把结构化调用交给ActiveTurnTask。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。`OutputContract::NoToolCalls`已保留closed value；完整ToolSpec schema、Structured schema、CompactionSummary budget/proof、auth/credential/connection/cache以及Rig provider mapping仍未实现，也不由本里程碑暗示可用。
 
 相关权威文档：
 

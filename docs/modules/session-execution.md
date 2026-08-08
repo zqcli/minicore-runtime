@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；具体Prompt/Skill source adapter、Tool/Interaction/Cancel、logical retry、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip已接通ToolCall → ToolSet执行 → ordered ToolResult → 下一次Model → final Assistant；具体Prompt/Skill source adapter、完整Tool policy/approval、Interaction/Cancel、logical retry、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的

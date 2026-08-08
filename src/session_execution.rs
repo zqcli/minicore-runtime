@@ -24,7 +24,7 @@ use crate::agent_session_lifecycle::{
 };
 use crate::conversation_storage::{
     ConversationReplayDiagnostics, SessionRecorder, StoredAssistantContent, StoredAssistantMessage,
-    StoredUserMessage,
+    StoredToolMessage, StoredToolOutcome, StoredUserMessage,
 };
 use crate::durable_state::{
     AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
@@ -39,6 +39,9 @@ use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
+#[cfg(test)]
+use crate::tools::ToolExecutionResult;
+use crate::tools::{ToolCall, ToolExecutionOutcome, ToolExecutionRequest, ToolSet};
 use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
 };
@@ -341,6 +344,7 @@ struct TurnResources {
     prompt_resources: Arc<PromptResourceView>,
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
+    tool_set: Arc<ToolSet>,
 }
 
 pub(crate) struct SessionExecutorDependencies {
@@ -361,6 +365,32 @@ impl SessionExecutorDependencies {
         model_gateway: Arc<ModelGateway>,
         model_catalog: Arc<ModelCatalogView>,
     ) -> Self {
+        Self::with_turn_resources_and_tools(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            ToolSet::empty(),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one test-injected turn resource bundle binds the exact runtime owners"
+    )]
+    pub(crate) fn with_turn_resources_and_tools(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_set: Arc<ToolSet>,
+    ) -> Self {
         Self {
             task_context,
             durable_state,
@@ -370,6 +400,7 @@ impl SessionExecutorDependencies {
                 prompt_resources,
                 model_gateway,
                 model_catalog,
+                tool_set,
             }),
         }
     }
@@ -1814,6 +1845,7 @@ async fn run_admission(
         prompt_resources: resources.prompt_resources,
         model_gateway: resources.model_gateway,
         model_catalog: resources.model_catalog,
+        tool_set: resources.tool_set,
     })
     .map_err(map_turn_context_capture_error)?;
     let message = context
@@ -1876,7 +1908,14 @@ async fn run_active_turn(
             SessionTurnTerminal::Completed
         }
         Err(failure) => {
-            let settled = lock(&conversation.live_state).fail_current_turn(turn_id);
+            let settled = {
+                let mut live_state = lock(&conversation.live_state);
+                if live_state.current_turn() == Some(turn_id) {
+                    live_state.fail_current_turn(turn_id)
+                } else {
+                    Ok(())
+                }
+            };
             if settled.is_err() {
                 SessionTurnTerminal::Failed(SessionTurnFailure::Internal)
             } else {
@@ -1892,86 +1931,185 @@ async fn run_active_turn_inner(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
-    let captured = lock(&conversation.live_state)
-        .capture_conversation_views()
-        .map_err(|_| SessionTurnFailure::Internal)?;
-    let source_revision = captured.conversation().revision();
-    let assembled = context
-        .assemble_agent_run(captured.conversation())
-        .map_err(map_turn_prompt_error)?;
-    let request = ModelCallRequest::new(
-        Arc::clone(context.model()),
-        ModelCallPurpose::AgentRun,
-        assembled,
-        source_revision,
-        None,
-    )
-    .map(Arc::new)
-    .map_err(map_model_request_error)?;
-    let result = model_gateway
-        .generate_model_turn(
-            request,
-            ModelProgressPublisher::discard(),
-            CancellationToken::new(),
+    loop {
+        let captured = lock(&conversation.live_state)
+            .capture_conversation_views()
+            .map_err(|_| SessionTurnFailure::Internal)?;
+        let source_revision = captured.conversation().revision();
+        let assembled = context
+            .assemble_agent_run(captured.conversation())
+            .map_err(map_turn_prompt_error)?;
+        let request = ModelCallRequest::new(
+            Arc::clone(context.model()),
+            ModelCallPurpose::AgentRun,
+            assembled,
+            source_revision,
+            None,
         )
-        .await
-        .map_err(|error| match error.reason() {
-            ModelCallErrorReason::ContextOverflow => SessionTurnFailure::ContextOverflow,
-            ModelCallErrorReason::Cancelled
-            | ModelCallErrorReason::ModelUnavailable
-            | ModelCallErrorReason::AuthMissing
-            | ModelCallErrorReason::AuthRejected
-            | ModelCallErrorReason::RateLimited
-            | ModelCallErrorReason::QuotaExceeded
-            | ModelCallErrorReason::UnsupportedCapability
-            | ModelCallErrorReason::InvalidRequest
-            | ModelCallErrorReason::SafetyBlocked
-            | ModelCallErrorReason::Timeout
-            | ModelCallErrorReason::TransportUnavailable
-            | ModelCallErrorReason::ProviderUnavailable
-            | ModelCallErrorReason::ProviderRejected
-            | ModelCallErrorReason::RequestOutcomeUnknown
-            | ModelCallErrorReason::StreamInterrupted
-            | ModelCallErrorReason::UnexpectedToolCall
-            | ModelCallErrorReason::InvalidStructuredOutput
-            | ModelCallErrorReason::InvalidProviderResponse
-            | ModelCallErrorReason::IncompleteResponse => SessionTurnFailure::Model,
-        })?;
-    let response = result.response();
-    let mut content = Vec::with_capacity(response.content().len());
-    for block in response.content() {
-        let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
-        match block {
-            FinalizedAssistantContent::Reasoning(reasoning) => {
-                content.push(StoredAssistantContent::Reasoning {
-                    item_id,
-                    content: reasoning.clone(),
-                });
-            }
-            FinalizedAssistantContent::Text { text } => {
-                content.push(StoredAssistantContent::Text {
-                    item_id,
-                    text: Arc::clone(text),
-                });
+        .map(Arc::new)
+        .map_err(map_model_request_error)?;
+        let result = model_gateway
+            .generate_model_turn(
+                request,
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .map_err(map_model_call_failure)?;
+        let response = result.response();
+        let mut content = Vec::with_capacity(response.content().len());
+        let mut calls = Vec::new();
+        for block in response.content() {
+            let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
+            match block {
+                FinalizedAssistantContent::Reasoning(reasoning) => {
+                    content.push(StoredAssistantContent::Reasoning {
+                        item_id,
+                        content: reasoning.clone(),
+                    });
+                }
+                FinalizedAssistantContent::Text { text } => {
+                    content.push(StoredAssistantContent::Text {
+                        item_id,
+                        text: Arc::clone(text),
+                    });
+                }
+                FinalizedAssistantContent::ToolCall {
+                    tool_call_id,
+                    name,
+                    arguments,
+                } => {
+                    let call_index =
+                        u32::try_from(calls.len()).map_err(|_| SessionTurnFailure::Internal)?;
+                    content.push(StoredAssistantContent::ToolCall {
+                        item_id,
+                        tool_call_id: tool_call_id.clone(),
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                    });
+                    calls.push((
+                        item_id,
+                        ToolCall::new(
+                            tool_call_id.clone(),
+                            name.clone(),
+                            arguments.clone(),
+                            call_index,
+                        ),
+                    ));
+                }
             }
         }
-    }
-    let body = StoredAssistantMessage::reconstruct(
-        AssistantDisposition::Final,
-        content,
-        response.model().clone(),
-        response.response_id().cloned(),
-        response.finish_reason(),
-        response.effective_max_output_tokens(),
-        response.usage().cloned(),
-        0,
-        response.metadata().clone(),
-    )
-    .map_err(|_| SessionTurnFailure::Internal)?;
-    let fact = lock(&conversation.live_state)
-        .complete_with_assistant_message(body, turn_id, SystemClock.now())
+        let is_tool_round = !calls.is_empty();
+        let disposition = if is_tool_round {
+            AssistantDisposition::Intermediate
+        } else {
+            AssistantDisposition::Final
+        };
+        let body = StoredAssistantMessage::reconstruct(
+            disposition,
+            content,
+            response.model().clone(),
+            response.response_id().cloned(),
+            response.finish_reason(),
+            response.effective_max_output_tokens(),
+            response.usage().cloned(),
+            0,
+            response.metadata().clone(),
+        )
         .map_err(|_| SessionTurnFailure::Internal)?;
-    Ok(Arc::clone(fact.entry()))
+        let fact = {
+            let mut live_state = lock(&conversation.live_state);
+            if is_tool_round {
+                live_state
+                    .apply_assistant_message(body, turn_id, SystemClock.now())
+                    .map_err(|_| SessionTurnFailure::Internal)?
+            } else {
+                live_state
+                    .complete_with_assistant_message(body, turn_id, SystemClock.now())
+                    .map_err(|_| SessionTurnFailure::Internal)?
+            }
+        };
+        let entry = Arc::clone(fact.entry());
+        if !is_tool_round {
+            return Ok(entry);
+        }
+        let _ = conversation.recorder.record(entry).await;
+
+        let requests = calls
+            .into_iter()
+            .map(|(item_id, call)| ToolExecutionRequest::new(item_id, call))
+            .collect::<Vec<_>>();
+        let tool_results = context.tool_set().execute_round(requests).await;
+        let mut abandoned = false;
+        for outcome in tool_results {
+            let (item_id, tool_call_id, stored) = stored_tool_outcome(outcome)?;
+            abandoned |= matches!(&stored, StoredToolOutcome::Abandoned { .. });
+            let fact = lock(&conversation.live_state)
+                .apply_tool_message(
+                    StoredToolMessage::reconstruct(item_id, tool_call_id, stored),
+                    turn_id,
+                    SystemClock.now(),
+                )
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+        }
+        if abandoned {
+            lock(&conversation.live_state)
+                .abandon_current_tool_exchange(turn_id)
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            return Err(SessionTurnFailure::Model);
+        }
+    }
+}
+
+fn map_model_call_failure(error: crate::model_gateway::ModelCallError) -> SessionTurnFailure {
+    match error.reason() {
+        ModelCallErrorReason::ContextOverflow => SessionTurnFailure::ContextOverflow,
+        ModelCallErrorReason::Cancelled
+        | ModelCallErrorReason::ModelUnavailable
+        | ModelCallErrorReason::AuthMissing
+        | ModelCallErrorReason::AuthRejected
+        | ModelCallErrorReason::RateLimited
+        | ModelCallErrorReason::QuotaExceeded
+        | ModelCallErrorReason::UnsupportedCapability
+        | ModelCallErrorReason::InvalidRequest
+        | ModelCallErrorReason::SafetyBlocked
+        | ModelCallErrorReason::Timeout
+        | ModelCallErrorReason::TransportUnavailable
+        | ModelCallErrorReason::ProviderUnavailable
+        | ModelCallErrorReason::ProviderRejected
+        | ModelCallErrorReason::RequestOutcomeUnknown
+        | ModelCallErrorReason::StreamInterrupted
+        | ModelCallErrorReason::UnexpectedToolCall
+        | ModelCallErrorReason::InvalidStructuredOutput
+        | ModelCallErrorReason::InvalidProviderResponse
+        | ModelCallErrorReason::IncompleteResponse => SessionTurnFailure::Model,
+    }
+}
+
+fn stored_tool_outcome(
+    outcome: ToolExecutionOutcome,
+) -> Result<(ItemId, crate::tools::ToolCallId, StoredToolOutcome), SessionTurnFailure> {
+    match outcome {
+        ToolExecutionOutcome::Completed {
+            item_id,
+            tool_call_id,
+            source,
+            disposition,
+            content,
+        } => StoredToolOutcome::completed(source, disposition, content)
+            .map(|stored| (item_id, tool_call_id, stored))
+            .map_err(|_| SessionTurnFailure::Internal),
+        ToolExecutionOutcome::Abandoned {
+            item_id,
+            tool_call_id,
+            reason,
+        } => Ok((
+            item_id,
+            tool_call_id,
+            StoredToolOutcome::Abandoned { reason },
+        )),
+    }
 }
 
 fn map_agent_definition_read_error(error: DurableAgentDefinitionReadError) -> SessionSubmitError {
@@ -3421,6 +3559,269 @@ mod tests {
                 3
             );
         }
+        executor.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_scripted_turn_completes_a_tool_round_before_the_final_model_call() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_echo",
+            "echo",
+            "{\"value\":1}",
+            "tool complete",
+        );
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Parallel,
+                )
+                .unwrap(),
+            ],
+            |call| {
+                Box::pin(async move {
+                    ToolExecutionResult::completed_text(call.call().arguments().canonical_json())
+                        .unwrap()
+                })
+            },
+        );
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+                tool_set,
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+
+        let turn_id = executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+
+        let live_state = executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            let captured = live.capture_conversation_views().unwrap();
+            let messages = captured.conversation().messages();
+            assert_eq!(messages.len(), 4);
+            assert!(matches!(
+                messages[1].as_ref(),
+                crate::prompt::ModelMessageRef::Assistant { content }
+                    if matches!(content[0].as_ref(), crate::prompt::ModelAssistantContentRef::ToolCall { .. })
+            ));
+            assert!(matches!(
+                messages[2].as_ref(),
+                crate::prompt::ModelMessageRef::Tool { .. }
+            ));
+            assert!(matches!(
+                messages[3].as_ref(),
+                crate::prompt::ModelMessageRef::Assistant { content }
+                    if matches!(content[0].as_ref(), crate::prompt::ModelAssistantContentRef::Text("tool complete"))
+            ));
+        }
+        executor.close().await.unwrap();
+        state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_tool_settlement_ends_the_turn_without_a_followup_model_call() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model =
+            ScriptedModelFixture::with_tool_round("call_abandoned", "echo", "{}", "must not run");
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            |_| {
+                Box::pin(async {
+                    ToolExecutionResult::Abandoned {
+                        reason: crate::tools::ToolAbandonReason::OutcomeUnknown,
+                    }
+                })
+            },
+        );
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+                tool_set,
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+
+        let turn_id = executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        let live_state = executor.live_state_for_test().unwrap();
+        assert_eq!(lock(&live_state).current_turn(), None);
+        let recording =
+            fs::read_to_string(store.session_path().join("conversation.jsonl")).unwrap();
+        assert!(recording.contains("abandoned"));
+        assert!(!recording.contains("must not run"));
         executor.close().await.unwrap();
         state.close().await;
     }

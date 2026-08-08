@@ -702,6 +702,21 @@ impl LiveSessionState {
         Ok(())
     }
 
+    pub(crate) fn abandon_current_tool_exchange(
+        &mut self,
+        turn_id: TurnId,
+    ) -> Result<(), LiveConversationError> {
+        self.require_current_turn(turn_id)?;
+        if self.tool_exchange.is_none() {
+            return Err(LiveConversationError::new(
+                LiveConversationErrorReason::InvalidRelation,
+            ));
+        }
+        self.tool_exchange = None;
+        self.current_turn = None;
+        Ok(())
+    }
+
     pub(crate) const fn current_turn(&self) -> Option<TurnId> {
         self.current_turn
     }

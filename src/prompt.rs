@@ -998,6 +998,7 @@ impl<'a> PromptAssemblyInput<'a> {
 pub(crate) struct AssembledModelContext {
     system: Arc<[PromptSection]>,
     messages: Arc<[ModelMessage]>,
+    tools: ToolPromptView,
     output_contract: Option<OutputContract>,
     assembly_proof: PromptAssemblyProof,
 }
@@ -1017,8 +1018,12 @@ impl AssembledModelContext {
         self.output_contract.as_ref()
     }
 
-    pub(crate) const fn tools_empty(&self) -> bool {
-        true
+    pub(crate) fn tools_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    pub(crate) fn tools(&self) -> &[crate::tools::ToolSpec] {
+        self.tools.specs()
     }
 
     pub(crate) const fn assembly_proof(&self) -> &PromptAssemblyProof {
@@ -1032,6 +1037,7 @@ impl fmt::Debug for AssembledModelContext {
             .debug_struct("AssembledModelContext")
             .field("system_sections", &self.system.len())
             .field("messages", &self.messages.len())
+            .field("tools", &self.tools.specs().len())
             .field("has_output_contract", &self.output_contract.is_some())
             .finish()
     }
@@ -1140,7 +1146,7 @@ impl PromptSet {
         &self,
         input: PromptAssemblyInput<'_>,
     ) -> Result<AssembledModelContext, PromptError> {
-        if !self.tools.is_empty() || !self.skills.is_empty() {
+        if !self.skills.is_empty() {
             return Err(PromptError::new(PromptErrorKind::PromptUnavailable));
         }
 
@@ -1159,6 +1165,7 @@ impl PromptSet {
         let canonical_bytes = canonical_model_context_bytes(
             &self.profile.system,
             &messages,
+            &self.tools,
             output_contract.as_ref(),
         )
         .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
@@ -1178,6 +1185,7 @@ impl PromptSet {
         Ok(AssembledModelContext {
             system: Arc::clone(&self.profile.system),
             messages: messages.into(),
+            tools: self.tools.clone(),
             output_contract: output_contract.clone(),
             assembly_proof: PromptAssemblyProof {
                 purpose: ModelCallPurpose::AgentRun,
@@ -1192,6 +1200,7 @@ impl PromptSet {
 fn canonical_model_context_bytes(
     system: &[PromptSection],
     messages: &[ModelMessage],
+    tools: &ToolPromptView,
     output_contract: Option<&OutputContract>,
 ) -> Option<usize> {
     let mut bytes = r#"{"system":["#.len();
@@ -1206,7 +1215,18 @@ fn canonical_model_context_bytes(
         add_separator(&mut bytes, index)?;
         add_model_message(&mut bytes, message)?;
     }
-    add_literal(&mut bytes, r#"],"tools":[],"outputContract":"#)?;
+    add_literal(&mut bytes, r#"],"tools":["#)?;
+    for (index, definition) in tools.specs().iter().enumerate() {
+        add_separator(&mut bytes, index)?;
+        add_literal(&mut bytes, r#"{"name":"#)?;
+        add_json_string(&mut bytes, definition.name().as_str())?;
+        add_literal(&mut bytes, r#","description":"#)?;
+        add_json_string(&mut bytes, definition.description())?;
+        add_literal(&mut bytes, r#","inputSchema":"#)?;
+        add_literal(&mut bytes, definition.input_schema().canonical_bytes())?;
+        add_literal(&mut bytes, "}")?;
+    }
+    add_literal(&mut bytes, r#"],"outputContract":"#)?;
     match output_contract {
         Some(OutputContract::NoToolCalls) => add_json_string(&mut bytes, "no_tool_calls")?,
         None => add_literal(&mut bytes, "null")?,
