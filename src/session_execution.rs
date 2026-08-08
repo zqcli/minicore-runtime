@@ -1275,6 +1275,7 @@ struct ActiveTurn {
     turn_id: TurnId,
     cancellation: CancellationToken,
     task: Option<TrackedTask>,
+    steer_admission_open: bool,
 }
 
 struct ActiveInteraction {
@@ -1548,6 +1549,10 @@ impl SessionExecutorActor {
             request.settle(Err(SessionSteerError::TurnCancelling));
             return Ok(());
         }
+        if !active_turn.steer_admission_open {
+            request.settle(Err(SessionSteerError::TurnNotRunning));
+            return Ok(());
+        }
         if active_turn.command_id == request.command_id
             || self
                 .active_admission
@@ -1717,6 +1722,7 @@ impl SessionExecutorActor {
             turn_id: active.turn_id,
             cancellation: cancellation.clone(),
             task: None,
+            steer_admission_open: true,
         });
 
         let turn_id = active.turn_id;
@@ -1732,6 +1738,8 @@ impl SessionExecutorActor {
             let guard = TurnCompletionGuard::new(completion_sender, turn_id);
             let interaction_completion_sender = self.completion_sender.clone();
             let steer_completion_sender = self.completion_sender.clone();
+            #[cfg(test)]
+            let hooks = Arc::clone(&self.hooks);
             let worker = async move {
                 let mut guard = guard;
                 let terminal = run_active_turn(
@@ -1742,6 +1750,8 @@ impl SessionExecutorActor {
                     cancellation,
                     interaction_completion_sender,
                     steer_completion_sender,
+                    #[cfg(test)]
+                    hooks,
                 )
                 .await;
                 guard.complete(terminal);
@@ -2194,13 +2204,13 @@ impl SessionExecutorActor {
                 self.handle_interaction_requested(completion).await
             }
             ExecutorCompletion::SteerSafePoint(completion) => {
-                self.handle_steer_safe_point(completion)
+                self.handle_steer_safe_point(completion).await
             }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
         }
     }
 
-    fn handle_steer_safe_point(
+    async fn handle_steer_safe_point(
         &mut self,
         completion: SteerSafePointCompletion,
     ) -> Result<(), ActorFatality> {
@@ -2211,6 +2221,13 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Internal);
         }
         let steer = self.steer.pop_front_for_turn(completion.turn_id);
+        if steer.is_none() && completion.close_if_empty {
+            if let Some(active_turn) = self.active_turn.as_mut() {
+                active_turn.steer_admission_open = false;
+            }
+        }
+        #[cfg(test)]
+        self.hooks.after_steer_arbitration().await;
         let _ = completion.response.send(steer);
         Ok(())
     }
@@ -2468,6 +2485,7 @@ struct InteractionRequestedCompletion {
 struct SteerSafePointCompletion {
     turn_id: TurnId,
     response: oneshot::Sender<Option<QueuedSteer>>,
+    close_if_empty: bool,
 }
 
 struct PublicationCompletion {
@@ -2615,6 +2633,13 @@ async fn run_admission(
     Ok(context)
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        clippy::too_many_arguments,
+        reason = "test-only arbitration hooks keep the production execution seam unchanged"
+    )
+)]
 async fn run_active_turn(
     context: Arc<TurnExecutionContext>,
     model_gateway: Arc<ModelGateway>,
@@ -2623,6 +2648,7 @@ async fn run_active_turn(
     cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> SessionTurnTerminal {
     if context.turn_id() != turn_id {
         return SessionTurnTerminal::Failed(SessionTurnFailure::Internal);
@@ -2635,6 +2661,8 @@ async fn run_active_turn(
         cancellation,
         interaction_completion_sender,
         steer_completion_sender,
+        #[cfg(test)]
+        hooks,
     )
     .await;
     match result {
@@ -2660,6 +2688,13 @@ async fn run_active_turn(
     }
 }
 
+#[cfg_attr(
+    test,
+    allow(
+        clippy::too_many_arguments,
+        reason = "test-only arbitration hooks keep the production execution seam unchanged"
+    )
+)]
 async fn run_active_turn_inner(
     context: Arc<TurnExecutionContext>,
     model_gateway: Arc<ModelGateway>,
@@ -2668,6 +2703,7 @@ async fn run_active_turn_inner(
     cancellation: CancellationToken,
     interaction_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     loop {
         if cancellation.is_cancelled() {
@@ -2761,6 +2797,60 @@ async fn run_active_turn_inner(
             response.metadata().clone(),
         )
         .map_err(|_| SessionTurnFailure::Internal)?;
+        let steer = if !is_tool_round {
+            arbitrate_one_steer(
+                Arc::clone(&conversation),
+                turn_id,
+                cancellation.clone(),
+                &steer_completion_sender,
+                true,
+                #[cfg(test)]
+                Arc::clone(&hooks),
+            )
+            .await?
+        } else {
+            SteerArbitration::none()
+        };
+        if let Some(queued) = steer.queued {
+            let intermediate = StoredAssistantMessage::reconstruct(
+                AssistantDisposition::Intermediate,
+                body.content().to_vec(),
+                body.model().clone(),
+                body.response_id().cloned(),
+                body.finish_reason(),
+                body.effective_max_output_tokens(),
+                body.usage().cloned(),
+                body.logical_retry_count(),
+                body.metadata().clone(),
+            )
+            .map_err(|_| SessionTurnFailure::Internal)?;
+            let assistant_fact = lock(&conversation.live_state)
+                .apply_assistant_message(intermediate, turn_id, SystemClock.now())
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            let _ = conversation
+                .recorder
+                .record(Arc::clone(assistant_fact.entry()))
+                .await;
+            if let Some(steer) = resolve_one_steer(
+                Arc::clone(&context),
+                Arc::clone(&conversation),
+                turn_id,
+                queued,
+                assistant_fact.revision(),
+                cancellation.clone(),
+            )
+            .await?
+            {
+                let steer_fact = lock(&conversation.live_state)
+                    .apply_user_message(steer, turn_id, SystemClock.now())
+                    .map_err(|_| SessionTurnFailure::Internal)?;
+                let _ = conversation
+                    .recorder
+                    .record(Arc::clone(steer_fact.entry()))
+                    .await;
+            }
+            continue;
+        }
         let fact = {
             let mut live_state = lock(&conversation.live_state);
             if is_tool_round {
@@ -2855,24 +2945,60 @@ async fn run_active_turn_inner(
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
-        consume_one_steer(
-            Arc::clone(&context),
+        let steer = arbitrate_one_steer(
             Arc::clone(&conversation),
             turn_id,
             cancellation.clone(),
             &steer_completion_sender,
+            false,
+            #[cfg(test)]
+            Arc::clone(&hooks),
         )
         .await?;
+        if let Some(queued) = steer.queued {
+            if let Some(steer) = resolve_one_steer(
+                Arc::clone(&context),
+                Arc::clone(&conversation),
+                turn_id,
+                queued,
+                steer.basis_revision,
+                cancellation.clone(),
+            )
+            .await?
+            {
+                let fact = lock(&conversation.live_state)
+                    .apply_user_message(steer, turn_id, SystemClock.now())
+                    .map_err(|_| SessionTurnFailure::Internal)?;
+                let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+            }
+        }
     }
 }
 
-async fn consume_one_steer(
-    context: Arc<TurnExecutionContext>,
+struct SteerArbitration {
+    basis_revision: crate::live_conversation::ConversationRevision,
+    queued: Option<QueuedSteer>,
+}
+
+impl SteerArbitration {
+    fn none() -> Self {
+        Self {
+            basis_revision: crate::live_conversation::ConversationRevision::default(),
+            queued: None,
+        }
+    }
+}
+
+async fn arbitrate_one_steer(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
     cancellation: CancellationToken,
     steer_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
-) -> Result<(), SessionTurnFailure> {
+    close_if_empty: bool,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
+) -> Result<SteerArbitration, SessionTurnFailure> {
+    #[cfg(test)]
+    hooks.before_steer_safe_point().await;
     let basis_revision = lock(&conversation.live_state)
         .capture_conversation_views()
         .map_err(|_| SessionTurnFailure::Internal)?
@@ -2881,7 +3007,11 @@ async fn consume_one_steer(
     let (response, waiter) = oneshot::channel();
     steer_completion_sender
         .send(ExecutorCompletion::SteerSafePoint(
-            SteerSafePointCompletion { turn_id, response },
+            SteerSafePointCompletion {
+                turn_id,
+                response,
+                close_if_empty,
+            },
         ))
         .map_err(|_| SessionTurnFailure::Internal)?;
     let Some(queued) = (tokio::select! {
@@ -2889,8 +3019,28 @@ async fn consume_one_steer(
         _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
         result = waiter => result.map_err(|_| SessionTurnFailure::Internal)?,
     }) else {
-        return Ok(());
+        return Ok(SteerArbitration {
+            basis_revision,
+            queued: None,
+        });
     };
+    if queued.turn_id() != turn_id {
+        return Err(SessionTurnFailure::Internal);
+    }
+    Ok(SteerArbitration {
+        basis_revision,
+        queued: Some(queued),
+    })
+}
+
+async fn resolve_one_steer(
+    context: Arc<TurnExecutionContext>,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_id: TurnId,
+    queued: QueuedSteer,
+    basis_revision: crate::live_conversation::ConversationRevision,
+    cancellation: CancellationToken,
+) -> Result<Option<StoredUserMessage>, SessionTurnFailure> {
     let (_command_id, queued_turn_id, intent) = queued.into_parts();
     if queued_turn_id != turn_id {
         return Err(SessionTurnFailure::Internal);
@@ -2909,18 +3059,14 @@ async fn consume_one_steer(
         .conversation()
         .revision();
     if current_revision != basis_revision {
-        return Ok(());
+        return Ok(None);
     }
     let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
-    let fact = lock(&conversation.live_state)
-        .apply_user_message(
-            StoredUserMessage::reconstruct(item_id, UserMessageSource::Steer, message),
-            turn_id,
-            SystemClock.now(),
-        )
-        .map_err(|_| SessionTurnFailure::Internal)?;
-    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
-    Ok(())
+    Ok(Some(StoredUserMessage::reconstruct(
+        item_id,
+        UserMessageSource::Steer,
+        message,
+    )))
 }
 
 fn map_model_call_failure(error: crate::model_gateway::ModelCallError) -> SessionTurnFailure {
@@ -3816,6 +3962,36 @@ impl SessionExecutorTestHooks {
         self.inner.after_agent_admission_before_input.release();
     }
 
+    pub(crate) fn arm_before_steer_safe_point(&self) {
+        self.inner.before_steer_safe_point.arm();
+    }
+
+    pub(crate) async fn wait_before_steer_safe_point(&self) {
+        self.inner
+            .before_steer_safe_point
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_steer_safe_point(&self) {
+        self.inner.before_steer_safe_point.release();
+    }
+
+    pub(crate) fn arm_after_steer_arbitration(&self) {
+        self.inner.after_steer_arbitration.arm();
+    }
+
+    pub(crate) async fn wait_after_steer_arbitration(&self) {
+        self.inner
+            .after_steer_arbitration
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_steer_arbitration(&self) {
+        self.inner.after_steer_arbitration.release();
+    }
+
     pub(crate) fn arm_after_candidate_snapshot_finish_before_durable(&self) {
         self.inner.after_snapshot_finish.arm();
     }
@@ -3858,6 +4034,8 @@ impl SessionExecutorTestHooks {
 struct SessionExecutorTestHooksInner {
     before_snapshot_response: Arc<NamedAsyncBarrier>,
     after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
+    before_steer_safe_point: Arc<NamedAsyncBarrier>,
+    after_steer_arbitration: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
     after_commit_before_install: Arc<NamedAsyncBarrier>,
     settled: Arc<SettlementNotification>,
@@ -3870,6 +4048,8 @@ impl SessionExecutorTestHooksInner {
         Self {
             before_snapshot_response: Arc::new(NamedAsyncBarrier::new()),
             after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
+            before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
+            after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
             settled: Arc::new(SettlementNotification::new()),
@@ -3885,6 +4065,14 @@ impl SessionExecutorTestHooksInner {
         self.after_agent_admission_before_input
             .wait_if_armed()
             .await;
+    }
+
+    async fn before_steer_safe_point(&self) {
+        self.before_steer_safe_point.wait_if_armed().await;
+    }
+
+    async fn after_steer_arbitration(&self) {
+        self.after_steer_arbitration.wait_if_armed().await;
     }
 
     async fn after_candidate_snapshot_finish_before_durable(&self) {
@@ -4313,6 +4501,86 @@ mod tests {
         }
     }
 
+    async fn scripted_text_fixture(
+        store: &TempStore,
+        model: &ScriptedModelFixture,
+    ) -> LoadedFixture {
+        for (path, from, to) in [
+            (
+                store
+                    .root
+                    .join("agents")
+                    .join(AGENT_ID)
+                    .join("generations")
+                    .join(G1)
+                    .join("definition.json"),
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+            (
+                store
+                    .session_path()
+                    .join("generations")
+                    .join(G1)
+                    .join("definition.json"),
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        ] {
+            let bytes = fs::read(&path).expect("the fixture definition is readable");
+            create_file(&path, &replace_fixture(&bytes, from, to));
+        }
+
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state
+            .session_current_definition(session_id)
+            .expect("the fixture Session definition is current");
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .expect("the fixture Workspace resolves")
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+            ),
+            Arc::clone(&definition),
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+        LoadedFixture {
+            context,
+            state,
+            executor,
+            definition,
+        }
+    }
+
     fn changed_workspace(path: &Path) -> Workspace {
         let key: WorkspaceRootKey = "repo".parse().unwrap();
         lower_workspace(
@@ -4554,6 +4822,157 @@ mod tests {
         }
         executor.close().await.unwrap();
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_candidate_steer_wins_and_records_continue_before_steer() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["candidate", "answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_steer_safe_point();
+
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_steer_safe_point().await;
+
+        let steer_executor = loaded.executor.clone();
+        let steer = tokio::spawn(async move {
+            steer_executor
+                .steer(
+                    turn_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("focus").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        assert_eq!(steer.await.unwrap(), Ok(()));
+        hooks.release_before_steer_safe_point();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            let captured = live.capture_conversation_views().unwrap();
+            let messages = captured.conversation().messages();
+            assert_eq!(messages.len(), 4);
+            assert!(matches!(
+                messages[1].as_ref(),
+                crate::prompt::ModelMessageRef::Assistant { .. }
+            ));
+            assert!(matches!(
+                messages[2].as_ref(),
+                crate::prompt::ModelMessageRef::User { .. }
+            ));
+            assert!(matches!(
+                messages[3].as_ref(),
+                crate::prompt::ModelMessageRef::Assistant { .. }
+            ));
+        }
+
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        let intermediate = recording
+            .find(r#""disposition":"intermediate""#)
+            .expect("the candidate is recorded as Intermediate");
+        let steer = recording
+            .find(r#""source":"steer""#)
+            .expect("the Steer is recorded");
+        let final_assistant = recording
+            .rfind(r#""disposition":"final""#)
+            .expect("the final assistant is recorded");
+        assert!(intermediate < steer && steer < final_assistant);
+
+        loaded.executor.close().await.unwrap();
+        loaded.state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn text_candidate_final_reservation_wins_and_closes_steer_admission() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["candidate"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_after_steer_arbitration();
+
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("hello").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_after_steer_arbitration().await;
+
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert_eq!(
+            lock(&live_state)
+                .capture_conversation_views()
+                .unwrap()
+                .conversation()
+                .messages()
+                .len(),
+            1,
+            "final reservation does not mutate the live conversation"
+        );
+
+        let steer_executor = loaded.executor.clone();
+        let mut steer = Box::pin(
+            steer_executor.steer(
+                turn_id,
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("late focus").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            ),
+        );
+        assert!(poll_once_pending(steer.as_mut()).await);
+        hooks.release_after_steer_arbitration();
+        assert_eq!(steer.await, Err(SessionSteerError::TurnNotRunning));
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        {
+            let live = lock(&live_state);
+            let captured = live.capture_conversation_views().unwrap();
+            let messages = captured.conversation().messages();
+            assert_eq!(messages.len(), 2);
+        }
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert_eq!(recording.matches(r#""disposition":"final""#).count(), 1);
+        assert!(!recording.contains(r#""source":"steer""#));
+
+        loaded.executor.close().await.unwrap();
+        loaded.state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
