@@ -393,7 +393,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - [x] 不retry、不segment、不backfill、不回滚live mutation；
 - [x] diagnostic只保留allowlisted code与redacted bounded message；
 
-当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor。M5.1完整fixture/native exit gate仍不在本 slice。
+当前实现已覆盖 canonical append、single in-flight、spawn/panic、caller drop、close drain、owner reap与redaction；本次生命周期切片进一步用确定性 physical-write 前后 barrier 证明 caller drop-after-write、Registry drain，以及 `MiniCoreRuntime::shutdown()` 先排空 loaded Recorder、再释放 DurableState root lease；M5.2 tolerant semantic replay与corruption sidecars已独立实现并验证；同一published target现在经owner-tracked replay/tail-truncate/cold-seed/Recorder initialization进入Ready+Idle executor。M5.1完整fixture/native exit gate仍不在本 slice。
 
 退出条件：every Durable Store fixture case with `slice = m5_1` passes，并额外证明tracked-job pre-registration、spawn failure/panic、join panic、caller drop在RecorderWriteBarrier前后、同一时刻至多一个physical job、panic/close reaper复用exact attempt、shutdown join、raw guard不跨await，以及root lease只在所有Recorder jobs后释放。M5.1 does not consume any M5.0 durable case.
 

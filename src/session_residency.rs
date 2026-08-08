@@ -2278,8 +2278,10 @@ mod tests {
     use tokio::runtime::Handle;
 
     use crate::agent_session_lifecycle::SealedSessionLifecycleAttempt;
+    use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier};
     use crate::durable_state::DurableState;
     use crate::runtime_task::RuntimeTaskContext;
+    use crate::wire::conversation_jsonl::ConversationLineCodec;
     use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
     use crate::workspace::{
         RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput, WorkspacePathTarget,
@@ -2495,6 +2497,18 @@ mod tests {
             .expect("the replay fixture has a User entry")
             .replace("ses_12121212121212121212121212121212", SESSION_ID);
         format!("{header}\n{entry}\n").into_bytes()
+    }
+
+    fn replayed_user_append_entry_fixture() -> Vec<u8> {
+        let source = include_str!(
+            "../docs/fixtures/wire-v1/conversation/golden/user-sources-and-stamps.jsonl"
+        );
+        source
+            .lines()
+            .nth(2)
+            .expect("the replay fixture has a second User entry")
+            .replace("ses_12121212121212121212121212121212", SESSION_ID)
+            .into_bytes()
     }
 
     fn create_fixture_session(root: &Path, workspace: &Path) {
@@ -2965,6 +2979,66 @@ mod tests {
         assert_eq!(registry.gate_count_for_test(), 0);
         state.close().await;
         assert_eq!(context.registered_task_count_for_test(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn registry_close_waits_for_a_blocked_recorder_append_and_reaps_owner_work() {
+        let store = TempStore::new();
+        let recorded = replayed_user_conversation_fixture();
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        fs::write(&conversation_path, &recorded).expect("the replay fixture is installed");
+
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        registry.load_ready_idle(session_id).await.unwrap();
+        let baseline = context.registered_task_count_for_test();
+
+        let recorder = registry
+            .executor_for_test(session_id)
+            .expect("the loaded executor is installed")
+            .recorder_for_test()
+            .expect("the loaded executor retains its Recorder");
+        let barrier = RecorderWriteBarrier::new();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        // The appended Entry is the fixture's User entry, obtained through the existing
+        // production replay codec seam instead of a new production accessor.
+        let entry_line = replayed_user_append_entry_fixture();
+        let entry = ConversationLineCodec::decode_entry_for_session(&entry_line, session_id)
+            .expect("the production codec replays the fixture User entry");
+
+        let mut append = Box::pin(recorder.record(Arc::new(entry)));
+        assert!(poll_once_pending(append.as_mut()).await);
+        barrier.wait_until_entered().await;
+        assert_eq!(
+            context.registered_task_count_for_test(),
+            baseline + 1,
+            "the blocked Recorder append is the only extra registered owner work"
+        );
+
+        let mut close = Box::pin(registry.close());
+        assert!(
+            poll_once_pending(close.as_mut()).await,
+            "registry close must drain the blocked Recorder append before it settles"
+        );
+        assert_eq!(context.registered_task_count_for_test(), baseline + 1);
+
+        barrier.release();
+        assert_eq!(append.await, RecordOutcome::Written);
+        close.await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.gate_count_for_test(), 0);
+        state.close().await;
+        assert_eq!(context.registered_task_count_for_test(), 0);
+
+        // The Registry has drained its loaded owner before the DurableState root is closed.
+        let (reopen_context, reopened) = open_state(&store.root).await;
+        reopened.close().await;
+        assert_eq!(reopen_context.registered_task_count_for_test(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

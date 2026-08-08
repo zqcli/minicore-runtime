@@ -2542,7 +2542,7 @@ enum RecorderWriteFault {
     Panic,
 }
 
-/// Test-only coordination immediately before the first physical append write.
+/// Test-only coordination around the first physical append write.
 #[cfg(test)]
 #[allow(
     dead_code,
@@ -2553,6 +2553,10 @@ pub(crate) struct RecorderWriteBarrier {
     entered_notify: Notify,
     release: Mutex<bool>,
     release_changed: std::sync::Condvar,
+    written: AtomicBool,
+    written_notify: Notify,
+    after_write_release: Mutex<bool>,
+    after_write_changed: std::sync::Condvar,
     fault: Mutex<Option<RecorderWriteFault>>,
 }
 
@@ -2568,6 +2572,10 @@ impl RecorderWriteBarrier {
             entered_notify: Notify::new(),
             release: Mutex::new(false),
             release_changed: std::sync::Condvar::new(),
+            written: AtomicBool::new(false),
+            written_notify: Notify::new(),
+            after_write_release: Mutex::new(true),
+            after_write_changed: std::sync::Condvar::new(),
             fault: Mutex::new(None),
         })
     }
@@ -2590,11 +2598,34 @@ impl RecorderWriteBarrier {
         }
     }
 
+    pub(crate) async fn wait_until_written(&self) {
+        loop {
+            let notified = self.written_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.written.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     pub(crate) fn release(&self) {
         let mut released = lock_recorder(&self.release);
         *released = true;
         drop(released);
         self.release_changed.notify_all();
+    }
+
+    pub(crate) fn hold_after_write(&self) {
+        *lock_recorder(&self.after_write_release) = false;
+    }
+
+    pub(crate) fn release_after_write(&self) {
+        let mut released = lock_recorder(&self.after_write_release);
+        *released = true;
+        drop(released);
+        self.after_write_changed.notify_all();
     }
 
     pub(crate) fn fail_before_write(&self) {
@@ -2626,6 +2657,19 @@ impl RecorderWriteBarrier {
                 panic!("RecorderWriteBarrier requested a write panic")
             }
             None => Ok(()),
+        }
+    }
+
+    fn after_first_write(&self) {
+        self.written.store(true, Ordering::Release);
+        self.written_notify.notify_waiters();
+
+        let mut released = lock_recorder(&self.after_write_release);
+        while !*released {
+            released = self
+                .after_write_changed
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
 }
@@ -3043,6 +3087,8 @@ impl SessionRecorderCore {
                 guard.fail(SessionRecordingError::WriteFailed);
                 return;
             }
+            #[cfg(test)]
+            barrier.after_first_write();
             guard.success(file, worker_attempt.expected_file_bytes + line_bytes);
         });
 
@@ -5016,6 +5062,41 @@ mod tests {
 
         let bytes = std::fs::read(&path).expect("recorder test target reads");
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        std::fs::remove_file(path).expect("recorder test target removes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn session_recorder_caller_drop_after_physical_write_keeps_a_complete_line() {
+        let (task_context, recorder, path) = recorder_fixture().await;
+        let barrier = RecorderWriteBarrier::new();
+        barrier.hold_after_write();
+        recorder.set_write_barrier_for_test(Arc::clone(&barrier));
+
+        let mut record = Box::pin(recorder.record(recorder_entry("after physical write")));
+        poll_to_pending(&mut record).await;
+        barrier.release();
+        barrier.wait_until_written().await;
+
+        // The bytes are already newline-terminated, but the exact tracked attempt has not yet
+        // settled. Dropping the caller must leave that attempt for close() to reap.
+        drop(record);
+        let mut close = Box::pin(recorder.close());
+        poll_to_pending(&mut close).await;
+        barrier.release_after_write();
+        close.await;
+
+        assert!(matches!(*recorder.health(), RecordingHealth::Healthy));
+        assert_eq!(task_context.registered_task_count_for_test(), 0);
+        let bytes = std::fs::read(&path).expect("recorder test target reads");
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        let entry_line = bytes
+            .split(|byte| *byte == b'\n')
+            .nth(1)
+            .expect("the completed append has one entry line");
+        ConversationLineCodec::decode_entry_for_session(entry_line, standard_header().session_id())
+            .expect("the complete append remains replayable");
+
+        task_context.shutdown().await;
         std::fs::remove_file(path).expect("recorder test target removes");
     }
 
