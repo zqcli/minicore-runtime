@@ -7,7 +7,7 @@
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.7 已在 M9.6 的 retry control basis 之后补齐 crate-private Snapshot 的 active Submit/FollowUp/Steer command-id lane projection（actor-owned coherent capture、lane-local FIFO、取消/消费/terminal/close 后更新；不泄漏 intent/body）；完整 SecurityRevoked/EmergencyControl、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
+当前实现进度：M9.8 已在 M9.7 的 crate-private Snapshot lane projection 之后补齐 sticky EmergencyControl 的 target/epoch、Cancel 与 SecurityRevoked first-wins、stale-target rejection、retire 与 cancellation wakeup seam；完整 SecurityRevoked/EmergencyControl runtime 路由、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
 
 核心目标：
 

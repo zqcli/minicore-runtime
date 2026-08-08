@@ -9,12 +9,219 @@
 //! owner of live state and decides when queued FollowUp or Steer input may advance execution.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use tokio_util::sync::CancellationToken;
 
 use crate::prompt::PromptIntent;
 use crate::wire::{CommandId, TurnId};
 
 pub(crate) const FOLLOW_UP_QUEUE_CAPACITY: usize = 8;
 pub(crate) const STEER_QUEUE_CAPACITY: usize = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmergencyControlSignal {
+    Cancel,
+    SecurityRevoked,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum EmergencyControlTarget {
+    Submit(CommandId),
+    Turn(TurnId),
+}
+
+impl std::fmt::Debug for EmergencyControlTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EmergencyControlTarget { .. }")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct EmergencyControlObservation {
+    target: EmergencyControlTarget,
+    epoch: u64,
+    signal: Option<EmergencyControlSignal>,
+}
+
+impl std::fmt::Debug for EmergencyControlObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EmergencyControlObservation { .. }")
+    }
+}
+
+impl EmergencyControlObservation {
+    pub(crate) const fn target(self) -> EmergencyControlTarget {
+        self.target
+    }
+
+    pub(crate) const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) const fn signal(self) -> Option<EmergencyControlSignal> {
+        self.signal
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmergencyControlSignalOutcome {
+    Accepted {
+        epoch: u64,
+    },
+    AlreadySignaled {
+        epoch: u64,
+        signal: EmergencyControlSignal,
+    },
+    StaleTarget,
+}
+
+impl EmergencyControlSignalOutcome {
+    pub(crate) const fn epoch(self) -> Option<u64> {
+        match self {
+            Self::Accepted { epoch } | Self::AlreadySignaled { epoch, .. } => Some(epoch),
+            Self::StaleTarget => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EmergencyControlBindError {
+    EpochExhausted,
+}
+
+struct EmergencyControlState {
+    target: Option<EmergencyControlTarget>,
+    epoch: u64,
+    signal: Option<EmergencyControlSignal>,
+    cancellation: CancellationToken,
+}
+
+/// A process-local sticky emergency signal owned by one Session control plane.
+///
+/// Binding a new target retires any prior signal.  A signal is first-wins for the bound target;
+/// stale targets cannot affect the current target or its cancellation wakeup.
+#[derive(Clone)]
+pub(crate) struct EmergencyControlHandle {
+    state: Arc<Mutex<EmergencyControlState>>,
+}
+
+impl std::fmt::Debug for EmergencyControlHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EmergencyControlHandle { .. }")
+    }
+}
+
+impl EmergencyControlHandle {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(EmergencyControlState {
+                target: None,
+                epoch: 0,
+                signal: None,
+                cancellation: CancellationToken::new(),
+            })),
+        }
+    }
+
+    pub(crate) fn bind(
+        &self,
+        target: EmergencyControlTarget,
+    ) -> Result<EmergencyControlObservation, EmergencyControlBindError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        state.epoch = state
+            .epoch
+            .checked_add(1)
+            .ok_or(EmergencyControlBindError::EpochExhausted)?;
+        state.cancellation.cancel();
+        state.target = Some(target);
+        state.signal = None;
+        state.cancellation = CancellationToken::new();
+        Ok(EmergencyControlObservation {
+            target,
+            epoch: state.epoch,
+            signal: None,
+        })
+    }
+
+    pub(crate) fn observe(
+        &self,
+        target: EmergencyControlTarget,
+    ) -> Option<EmergencyControlObservation> {
+        let state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        (state.target == Some(target)).then_some(EmergencyControlObservation {
+            target,
+            epoch: state.epoch,
+            signal: state.signal,
+        })
+    }
+
+    pub(crate) fn signal(
+        &self,
+        target: EmergencyControlTarget,
+        signal: EmergencyControlSignal,
+    ) -> EmergencyControlSignalOutcome {
+        let mut state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        if state.target != Some(target) {
+            return EmergencyControlSignalOutcome::StaleTarget;
+        }
+        if let Some(existing) = state.signal {
+            return EmergencyControlSignalOutcome::AlreadySignaled {
+                epoch: state.epoch,
+                signal: existing,
+            };
+        }
+        state.signal = Some(signal);
+        state.cancellation.cancel();
+        EmergencyControlSignalOutcome::Accepted { epoch: state.epoch }
+    }
+
+    pub(crate) fn retire(&self, observation: EmergencyControlObservation) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        if state.target != Some(observation.target) || state.epoch != observation.epoch {
+            return false;
+        }
+        state.cancellation.cancel();
+        state.target = None;
+        state.signal = None;
+        state.cancellation = CancellationToken::new();
+        true
+    }
+
+    pub(crate) fn is_current(&self, target: EmergencyControlTarget, epoch: u64) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("emergency control state is not poisoned");
+        state.target == Some(target) && state.epoch == epoch
+    }
+
+    pub(crate) async fn cancelled(&self, target: EmergencyControlTarget, epoch: u64) {
+        let cancellation = {
+            let state = self
+                .state
+                .lock()
+                .expect("emergency control state is not poisoned");
+            if state.target != Some(target) || state.epoch != epoch {
+                return;
+            }
+            state.cancellation.clone()
+        };
+        cancellation.cancelled().await;
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FollowUpQueueError {
@@ -269,8 +476,9 @@ mod tests {
     use crate::wire::{CommandId, TurnId};
 
     use super::{
-        FOLLOW_UP_QUEUE_CAPACITY, FollowUpQueue, FollowUpQueueError, QueuedSteer,
-        STEER_QUEUE_CAPACITY, SteerQueue, SteerQueueError,
+        EmergencyControlHandle, EmergencyControlSignal, EmergencyControlSignalOutcome,
+        EmergencyControlTarget, FOLLOW_UP_QUEUE_CAPACITY, FollowUpQueue, FollowUpQueueError,
+        QueuedSteer, STEER_QUEUE_CAPACITY, SteerQueue, SteerQueueError,
     };
 
     fn intent(text: &str) -> PromptIntent {
@@ -437,5 +645,71 @@ mod tests {
             queue.try_push(first_turn, command_id(32), intent("first turn overflow"),),
             Err(SteerQueueError::Full)
         );
+    }
+
+    #[test]
+    fn emergency_control_is_sticky_first_wins_and_retires_by_observation() {
+        let control = EmergencyControlHandle::new();
+        let turn = turn_id(41);
+        let target = EmergencyControlTarget::Turn(turn);
+        let observation = control.bind(target).unwrap();
+        assert_eq!(control.observe(target), Some(observation));
+        assert!(control.is_current(target, observation.epoch()));
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: observation.epoch()
+            }
+        );
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::SecurityRevoked),
+            EmergencyControlSignalOutcome::AlreadySignaled {
+                epoch: observation.epoch(),
+                signal: EmergencyControlSignal::Cancel,
+            }
+        );
+        assert_eq!(
+            control.observe(target).unwrap().signal(),
+            Some(EmergencyControlSignal::Cancel)
+        );
+
+        let replacement = control
+            .bind(EmergencyControlTarget::Submit(command_id(42)))
+            .unwrap();
+        assert!(!control.retire(observation));
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::Cancel),
+            EmergencyControlSignalOutcome::StaleTarget
+        );
+        assert!(control.retire(replacement));
+        assert!(control.observe(replacement.target()).is_none());
+        assert!(!control.is_current(replacement.target(), replacement.epoch()));
+        assert!(format!("{control:?}").contains("EmergencyControlHandle { .. }"));
+        assert_eq!(
+            format!("{observation:?}"),
+            "EmergencyControlObservation { .. }"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_control_wakes_only_the_current_bound_waiter() {
+        let control = EmergencyControlHandle::new();
+        let target = EmergencyControlTarget::Turn(turn_id(51));
+        let observation = control.bind(target).unwrap();
+        let waiter_control = control.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_control.cancelled(target, observation.epoch()).await;
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.signal(target, EmergencyControlSignal::SecurityRevoked),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: observation.epoch()
+            }
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("the bound emergency waiter wakes")
+            .expect("the emergency waiter does not panic");
     }
 }
