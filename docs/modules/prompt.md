@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（ADR 0134后，生产实现待启动）
+状态：当前权威架构（M6.1 已实现 Prompt candidate/profile/Text composition foundation；Runtime publication、完整 source adapter、Turn capture 与 final assembly 待实现）
 日期：2026-07-31
 
 ## 目的
