@@ -396,6 +396,16 @@ pub(crate) enum SessionSteerError {
     InternalDispatchUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionQueuedMessageError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("the queued message is not queued")]
+    NotQueued,
+    #[error("session queued-message dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 /// Redacted failure from joining one loaded Session executor during Unload/shutdown.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum SessionExecutorCloseError {
@@ -1090,6 +1100,41 @@ impl SessionExecutor {
         })
     }
 
+    /// Removes one admitted Steer or FollowUp by CommandId.  The public command and snapshot
+    /// projection remain outside this crate-private seam.
+    pub(crate) async fn cancel_queued_message(
+        &self,
+        command_id: CommandId,
+    ) -> Result<(), SessionQueuedMessageError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::CancelQueuedMessage(CancelQueuedMessageRequest {
+            command_id,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionQueuedMessageError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionQueuedMessageError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionQueuedMessageError::Closing)
+            } else {
+                Err(SessionQueuedMessageError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     pub(crate) async fn subscribe(
         &self,
     ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
@@ -1433,6 +1478,9 @@ impl SessionExecutorActor {
             SessionExecutorRequest::Steer(request) => {
                 self.enqueue_steer(request)?;
             }
+            SessionExecutorRequest::CancelQueuedMessage(request) => {
+                self.cancel_queued_message_request(request)?;
+            }
             SessionExecutorRequest::ResolveInteraction(request) => {
                 self.resolve_interaction_request(request).await?;
             }
@@ -1453,6 +1501,7 @@ impl SessionExecutorActor {
                 .active_admission
                 .as_ref()
                 .is_some_and(|admission| admission.command_id == request.command_id)
+            || self.steer.contains(request.command_id)
         {
             request.settle(Err(SessionFollowUpError::CommandConflict));
             return Ok(());
@@ -1468,6 +1517,20 @@ impl SessionExecutorActor {
             Err(FollowUpQueueError::DuplicateCommandId) => {
                 request.settle(Err(SessionFollowUpError::CommandConflict));
             }
+        }
+        Ok(())
+    }
+
+    fn cancel_queued_message_request(
+        &mut self,
+        request: &mut CancelQueuedMessageRequest,
+    ) -> Result<(), ActorFatality> {
+        if self.steer.remove(request.command_id).is_some()
+            || self.follow_up.remove(request.command_id).is_some()
+        {
+            request.settle(Ok(()));
+        } else {
+            request.settle(Err(SessionQueuedMessageError::NotQueued));
         }
         Ok(())
     }
@@ -1490,6 +1553,7 @@ impl SessionExecutorActor {
                 .active_admission
                 .as_ref()
                 .is_some_and(|admission| admission.command_id == request.command_id)
+            || self.follow_up.contains(request.command_id)
         {
             request.settle(Err(SessionSteerError::CommandConflict));
             return Ok(());
@@ -3214,6 +3278,11 @@ struct SteerRequest {
     response: Option<oneshot::Sender<Result<(), SessionSteerError>>>,
 }
 
+struct CancelQueuedMessageRequest {
+    command_id: CommandId,
+    response: Option<oneshot::Sender<Result<(), SessionQueuedMessageError>>>,
+}
+
 impl FollowUpRequest {
     fn settle(&mut self, outcome: Result<(), SessionFollowUpError>) {
         if let Some(response) = self.response.take() {
@@ -3245,6 +3314,24 @@ impl SteerRequest {
 }
 
 impl Drop for SteerRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+impl CancelQueuedMessageRequest {
+    fn settle(&mut self, outcome: Result<(), SessionQueuedMessageError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionQueuedMessageError::Closing));
+    }
+}
+
+impl Drop for CancelQueuedMessageRequest {
     fn drop(&mut self) {
         self.reject_closing();
     }
@@ -3395,6 +3482,7 @@ enum SessionExecutorRequest {
     Submit(SubmitRequest),
     FollowUp(FollowUpRequest),
     Steer(SteerRequest),
+    CancelQueuedMessage(CancelQueuedMessageRequest),
     ResolveInteraction(ResolveInteractionRequest),
     Cancel(CancelRequest),
     Subscribe(SubscribeRequest),
@@ -3410,6 +3498,7 @@ impl SessionExecutorRequest {
             Self::Submit(request) => request.reject_closing(),
             Self::FollowUp(request) => request.reject_closing(),
             Self::Steer(request) => request.reject_closing(),
+            Self::CancelQueuedMessage(request) => request.reject_closing(),
             Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Cancel(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
@@ -4587,11 +4676,12 @@ mod tests {
             .await
             .unwrap();
         tool_started.notified().await;
+        let consumed_steer_command_id = CommandId::generate().unwrap();
         assert_eq!(
             executor
                 .steer(
                     turn_id,
-                    CommandId::generate().unwrap(),
+                    consumed_steer_command_id,
                     PromptIntent::new(
                         PromptBodyIntent::Text(TextIntent::new("steer while tool runs").unwrap()),
                         Vec::new(),
@@ -4600,6 +4690,121 @@ mod tests {
                 )
                 .await,
             Ok(())
+        );
+        let cross_lane_steer_command_id = CommandId::generate().unwrap();
+        assert_eq!(
+            executor
+                .steer(
+                    turn_id,
+                    cross_lane_steer_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cross-lane steer").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            executor
+                .follow_up(
+                    cross_lane_steer_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("duplicate follow-up").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(SessionFollowUpError::CommandConflict)
+        );
+        assert_eq!(
+            executor
+                .cancel_queued_message(cross_lane_steer_command_id)
+                .await,
+            Ok(())
+        );
+        let cross_lane_follow_up_command_id = CommandId::generate().unwrap();
+        assert_eq!(
+            executor
+                .follow_up(
+                    cross_lane_follow_up_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cross-lane follow-up").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            executor
+                .steer(
+                    turn_id,
+                    cross_lane_follow_up_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("duplicate steer").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(SessionSteerError::CommandConflict)
+        );
+        assert_eq!(
+            executor
+                .cancel_queued_message(cross_lane_follow_up_command_id)
+                .await,
+            Ok(())
+        );
+        let cancelled_steer_command_id = CommandId::generate().unwrap();
+        assert_eq!(
+            executor
+                .steer(
+                    turn_id,
+                    cancelled_steer_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cancelled steer").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        let cancelled_follow_up_command_id = CommandId::generate().unwrap();
+        assert_eq!(
+            executor
+                .follow_up(
+                    cancelled_follow_up_command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cancelled follow-up").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            executor
+                .cancel_queued_message(cancelled_steer_command_id)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            executor
+                .cancel_queued_message(cancelled_follow_up_command_id)
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            executor
+                .cancel_queued_message(cancelled_steer_command_id)
+                .await,
+            Err(SessionQueuedMessageError::NotQueued)
         );
         release_tool.notify_one();
         assert_eq!(
@@ -5306,6 +5511,24 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(SessionSteerError::TurnNotRunning));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_message_cancel_reports_not_queued_and_closing() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let command_id: CommandId = "cmd_33333333333333333333333333333333".parse().unwrap();
+        assert_eq!(
+            loaded.executor.cancel_queued_message(command_id).await,
+            Err(SessionQueuedMessageError::NotQueued)
+        );
+
+        loaded.executor.request_closing();
+        assert_eq!(
+            loaded.executor.cancel_queued_message(command_id).await,
+            Err(SessionQueuedMessageError::Closing)
+        );
         close_loaded(loaded).await;
     }
 
