@@ -1,18 +1,26 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::agent_session_lifecycle::AgentRevisionRef;
 use crate::model_gateway::ReasoningContent;
-use crate::skills::SkillId;
-use crate::tools::{ToolCallId, ToolName, ToolResultContent};
+use crate::skills::{SkillId, SkillPromptView};
+use crate::tools::{ToolCallId, ToolName, ToolPromptView, ToolResultContent};
 use crate::wire::lexical::{
     LexicalError, normalize_newlines, validate_safe_text, validate_stable_symbolic_key,
 };
-use crate::wire::{BoundedJsonObject, ProtocolLimits, WorkspaceRelativePath};
-use crate::workspace::WorkspaceRootKey;
+use crate::wire::{
+    BoundedJsonObject, ProtocolLimits, SessionDefinitionRevision, SessionId, WorkspaceRelativePath,
+};
+use crate::workspace::{
+    CapturedWorkspacePromptSource, WorkspacePromptCaptureContext, WorkspacePromptContext,
+    WorkspaceRootKey,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PromptValueError {
@@ -190,6 +198,892 @@ fn prompt_selection_set(
         return Err(PromptSelectionError::DuplicatePrompt);
     }
     Ok(enabled)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptErrorKind {
+    SourceDiscovery,
+    ContentLoad,
+    DuplicateKey,
+    PromptUnavailable,
+    InvalidRole,
+    RequiredPromptMissing,
+    InvalidIntent,
+    InvalidContribution,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct PromptError {
+    kind: PromptErrorKind,
+}
+
+impl PromptError {
+    const fn new(kind: PromptErrorKind) -> Self {
+        Self { kind }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the Prompt owner exposes this redacted kind to its future Turn mapper"
+    )]
+    pub(crate) const fn kind(self) -> PromptErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Debug for PromptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptError")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl fmt::Display for PromptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("prompt operation failed")
+    }
+}
+
+impl std::error::Error for PromptError {}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "source adapters use this closed failure in the pending filesystem adapters"
+)]
+pub(crate) enum PromptSourceError {
+    #[error("prompt source is unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptRole {
+    System,
+    User,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+#[allow(
+    dead_code,
+    reason = "source adapters construct these two trusted provenance families"
+)]
+pub(crate) enum PromptSourceProvenance {
+    Runtime(Box<str>),
+    User(Box<str>),
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptSourceDefinition {
+    id: PromptId,
+    key: Box<str>,
+    name: Box<str>,
+    description: Option<Box<str>>,
+    role: PromptRole,
+    content: Arc<str>,
+    provenance: PromptSourceProvenance,
+}
+
+#[allow(
+    dead_code,
+    reason = "source adapters construct complete candidate facts"
+)]
+impl PromptSourceDefinition {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the source fact mirrors one complete Prompt definition candidate"
+    )]
+    pub(crate) fn new(
+        id: PromptId,
+        key: impl Into<Box<str>>,
+        name: impl Into<Box<str>>,
+        description: Option<Box<str>>,
+        role: PromptRole,
+        content: Arc<str>,
+        provenance: PromptSourceProvenance,
+    ) -> Self {
+        Self {
+            id,
+            key: key.into(),
+            name: name.into(),
+            description,
+            role,
+            content,
+            provenance,
+        }
+    }
+}
+
+impl fmt::Debug for PromptSourceDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptSourceDefinition")
+            .field("role", &self.role)
+            .field("has_description", &self.description.is_some())
+            .field("content_bytes", &self.content.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspacePromptSource {
+    root_key: WorkspaceRootKey,
+    relative_location: WorkspaceRelativePath,
+    content: Arc<str>,
+}
+
+#[allow(
+    dead_code,
+    reason = "Workspace source adapters construct captured candidate facts"
+)]
+impl WorkspacePromptSource {
+    pub(crate) fn new(
+        root_key: WorkspaceRootKey,
+        relative_location: WorkspaceRelativePath,
+        content: Arc<str>,
+    ) -> Self {
+        Self {
+            root_key,
+            relative_location,
+            content,
+        }
+    }
+}
+
+impl fmt::Debug for WorkspacePromptSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkspacePromptSource")
+            .field("content_bytes", &self.content.len())
+            .finish()
+    }
+}
+
+pub(crate) type PromptSourceFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<PromptSourceDefinition>, PromptSourceError>> + Send + 'a>,
+>;
+
+pub(crate) trait PromptSourceAdapter: Send + Sync {
+    fn discover(&self) -> PromptSourceFuture<'_>;
+}
+
+pub(crate) type WorkspacePromptSourceFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Vec<WorkspacePromptSource>, PromptSourceError>> + Send + 'a>,
+>;
+
+pub(crate) trait WorkspacePromptSourceAdapter: Send + Sync {
+    fn capture<'a>(
+        &'a self,
+        context: &'a WorkspacePromptCaptureContext,
+    ) -> WorkspacePromptSourceFuture<'a>;
+}
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PromptKey(Box<str>);
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PromptSourceId(Box<str>);
+
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum PromptProvenance {
+    Runtime(PromptSourceId),
+    User(PromptSourceId),
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptContent {
+    text: Arc<str>,
+}
+
+impl PromptContent {
+    fn materialize(text: Arc<str>) -> Result<Self, LexicalError> {
+        let text = if text.contains('\r') {
+            Arc::<str>::from(normalize_newlines(&text))
+        } else {
+            text
+        };
+        validate_safe_text(&text, usize::MAX, false)?;
+        Ok(Self { text })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "M6.2 Prompt assembly reads materialized section content through this getter"
+    )]
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn into_arc(self) -> Arc<str> {
+        self.text
+    }
+}
+
+impl fmt::Debug for PromptContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptContent")
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptDefinition {
+    id: PromptId,
+    key: PromptKey,
+    name: Arc<str>,
+    description: Option<Arc<str>>,
+    role: PromptRole,
+    content: PromptContent,
+    provenance: PromptProvenance,
+}
+
+impl PromptDefinition {
+    fn materialize(source: PromptSourceDefinition) -> Result<Self, PromptError> {
+        let PromptSourceDefinition {
+            id,
+            key,
+            name,
+            description,
+            role,
+            content,
+            provenance,
+        } = source;
+        validate_stable_symbolic_key(&key, 128, false)
+            .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+        let name = normalize_prompt_metadata(
+            name,
+            usize::from(ProtocolLimits::v1_0().text.max_display_name_bytes),
+            false,
+        )?;
+        let description = description
+            .map(|description| {
+                normalize_prompt_metadata(
+                    description,
+                    usize::try_from(ProtocolLimits::v1_0().text.max_description_bytes)
+                        .unwrap_or(usize::MAX),
+                    true,
+                )
+            })
+            .transpose()?;
+        let content = PromptContent::materialize(content)
+            .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+        let provenance = match provenance {
+            PromptSourceProvenance::Runtime(source_id) => {
+                PromptProvenance::Runtime(prompt_source_id(source_id)?)
+            }
+            PromptSourceProvenance::User(source_id) => {
+                PromptProvenance::User(prompt_source_id(source_id)?)
+            }
+        };
+        Ok(Self {
+            id,
+            key: PromptKey(key),
+            name,
+            description,
+            role,
+            content,
+            provenance,
+        })
+    }
+
+    pub(crate) fn id(&self) -> &PromptId {
+        &self.id
+    }
+}
+
+impl fmt::Debug for PromptDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptDefinition")
+            .field("role", &self.role)
+            .field("name_bytes", &self.name.len())
+            .field("has_description", &self.description.is_some())
+            .field("content_bytes", &self.content.text.len())
+            .finish()
+    }
+}
+
+struct PromptServiceOwner;
+
+pub(crate) struct PromptResourceView {
+    owner: Arc<PromptServiceOwner>,
+    definitions: BTreeMap<PromptId, Arc<PromptDefinition>>,
+}
+
+impl PromptResourceView {
+    fn materialize(
+        owner: Arc<PromptServiceOwner>,
+        sources: Vec<PromptSourceDefinition>,
+    ) -> Result<Arc<Self>, PromptError> {
+        let mut definitions = BTreeMap::new();
+        for source in sources {
+            let definition = Arc::new(PromptDefinition::materialize(source)?);
+            if definitions.contains_key(definition.id()) {
+                return Err(PromptError::new(PromptErrorKind::DuplicateKey));
+            }
+            definitions.insert(definition.id().clone(), definition);
+        }
+        Ok(Arc::new(Self { owner, definitions }))
+    }
+
+    #[allow(
+        dead_code,
+        reason = "Turn capture and Prompt tests inspect the immutable candidate size"
+    )]
+    pub(crate) fn definition_count(&self) -> usize {
+        self.definitions.len()
+    }
+
+    fn definition(&self, id: &PromptId) -> Option<&Arc<PromptDefinition>> {
+        self.definitions.get(id)
+    }
+}
+
+impl fmt::Debug for PromptResourceView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptResourceView")
+            .field("definition_count", &self.definition_count())
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the PromptService foundation is consumed by the pending Runtime shared roots"
+)]
+pub(crate) struct PromptService {
+    owner: Arc<PromptServiceOwner>,
+    required_policy: PromptContent,
+    base_prompt: Option<PromptContent>,
+    shared_sources: Arc<[Arc<dyn PromptSourceAdapter>]>,
+    workspace_sources: Arc<[Arc<dyn WorkspacePromptSourceAdapter>]>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the PromptService foundation is consumed by the pending Runtime shared roots"
+)]
+impl PromptService {
+    pub(crate) fn new(
+        required_policy: Arc<str>,
+        base_prompt: Option<Arc<str>>,
+        shared_sources: Vec<Arc<dyn PromptSourceAdapter>>,
+        workspace_sources: Vec<Arc<dyn WorkspacePromptSourceAdapter>>,
+    ) -> Result<Self, PromptError> {
+        let required_policy = PromptContent::materialize(required_policy).map_err(|error| {
+            PromptError::new(if error == LexicalError::Empty {
+                PromptErrorKind::RequiredPromptMissing
+            } else {
+                PromptErrorKind::ContentLoad
+            })
+        })?;
+        let base_prompt = base_prompt
+            .map(PromptContent::materialize)
+            .transpose()
+            .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+        Ok(Self {
+            owner: Arc::new(PromptServiceOwner),
+            required_policy,
+            base_prompt,
+            shared_sources: shared_sources.into(),
+            workspace_sources: workspace_sources.into(),
+        })
+    }
+
+    pub(crate) async fn initialize(&self) -> Result<Arc<PromptResourceView>, PromptError> {
+        self.build_candidate().await
+    }
+
+    pub(crate) async fn build_reload_candidate(
+        &self,
+    ) -> Result<Arc<PromptResourceView>, PromptError> {
+        self.build_candidate().await
+    }
+
+    async fn build_candidate(&self) -> Result<Arc<PromptResourceView>, PromptError> {
+        let mut sources = Vec::new();
+        for adapter in &*self.shared_sources {
+            sources.extend(
+                adapter
+                    .discover()
+                    .await
+                    .map_err(|_| PromptError::new(PromptErrorKind::SourceDiscovery))?,
+            );
+        }
+        PromptResourceView::materialize(Arc::clone(&self.owner), sources)
+    }
+
+    pub(crate) async fn capture_workspace_sources(
+        &self,
+        context: WorkspacePromptCaptureContext,
+    ) -> Result<Arc<[CapturedWorkspacePromptSource]>, PromptError> {
+        if context.roots().is_empty() {
+            return Ok(Arc::from([]));
+        }
+        if self.workspace_sources.is_empty() {
+            return Err(PromptError::new(PromptErrorKind::SourceDiscovery));
+        }
+
+        let mut sources = Vec::new();
+        for adapter in &*self.workspace_sources {
+            sources.extend(
+                adapter
+                    .capture(&context)
+                    .await
+                    .map_err(|_| PromptError::new(PromptErrorKind::SourceDiscovery))?,
+            );
+        }
+        sources.sort_by(|left, right| {
+            left.relative_location
+                .cmp(&right.relative_location)
+                .then_with(|| left.root_key.cmp(&right.root_key))
+        });
+        if sources.windows(2).any(|pair| {
+            pair[0].root_key == pair[1].root_key
+                && pair[0].relative_location == pair[1].relative_location
+        }) {
+            return Err(PromptError::new(PromptErrorKind::DuplicateKey));
+        }
+
+        let mut captured = Vec::with_capacity(sources.len());
+        for source in sources {
+            let content = PromptContent::materialize(source.content)
+                .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+            captured.push(
+                context
+                    .capture(
+                        &source.root_key,
+                        source.relative_location,
+                        content.into_arc(),
+                    )
+                    .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?,
+            );
+        }
+        Ok(captured.into())
+    }
+
+    pub(crate) fn for_turn(
+        &self,
+        context: PromptTurnContext,
+    ) -> Result<Arc<PromptSet>, PromptError> {
+        if !Arc::ptr_eq(&self.owner, &context.resources.owner) {
+            return Err(PromptError::new(PromptErrorKind::PromptUnavailable));
+        }
+        if context.workspace.session_id() != context.session_id {
+            return Err(PromptError::new(PromptErrorKind::InvalidContribution));
+        }
+
+        let agent_definitions = resolve_selected_definitions(
+            &context.resources,
+            context.agent_prompts.enabled(),
+            PromptRole::System,
+            true,
+        )?;
+        let session_definitions = resolve_selected_definitions(
+            &context.resources,
+            context.session_prompts.enabled(),
+            PromptRole::User,
+            false,
+        )?;
+
+        let mut system = Vec::with_capacity(
+            1 + usize::from(self.base_prompt.is_some()) + agent_definitions.len(),
+        );
+        system.push(PromptSection::runtime_required(
+            self.required_policy.clone(),
+        ));
+        if let Some(base_prompt) = &self.base_prompt {
+            system.push(PromptSection::runtime_base(base_prompt.clone()));
+        }
+        system.extend(agent_definitions.iter().cloned().map(PromptSection::agent));
+
+        let mut user_context =
+            Vec::with_capacity(session_definitions.len() + context.workspace.sources().len());
+        user_context.extend(
+            session_definitions
+                .iter()
+                .cloned()
+                .map(PromptSection::session),
+        );
+        let mut workspace_sources = context.workspace.sources().to_vec();
+        workspace_sources.sort_by(|left, right| {
+            left.relative_location()
+                .cmp(right.relative_location())
+                .then_with(|| {
+                    left.authorization()
+                        .root_key()
+                        .cmp(right.authorization().root_key())
+                })
+        });
+        for source in workspace_sources {
+            let content = PromptContent::materialize(Arc::clone(source.content_arc()))
+                .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+            user_context.push(PromptSection::workspace(source, content));
+        }
+
+        Ok(Arc::new(PromptSet {
+            agent: context.agent,
+            session_id: context.session_id,
+            session_revision: context.session_revision,
+            resources: context.resources,
+            profile: PromptProfile {
+                system: system.into(),
+                user_context: user_context.into(),
+            },
+            tools: context.tools,
+            skills: context.skills,
+        }))
+    }
+}
+
+impl fmt::Debug for PromptService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptService")
+            .field("has_required_policy", &true)
+            .field("has_base_prompt", &self.base_prompt.is_some())
+            .field("shared_source_count", &self.shared_sources.len())
+            .field("workspace_source_count", &self.workspace_sources.len())
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the private TurnExecutionContext constructor supplies this captured input"
+)]
+pub(crate) struct PromptTurnContext {
+    agent: AgentRevisionRef,
+    session_id: SessionId,
+    session_revision: SessionDefinitionRevision,
+    resources: Arc<PromptResourceView>,
+    agent_prompts: AgentPromptSelection,
+    session_prompts: SessionPromptSelection,
+    workspace: WorkspacePromptContext,
+    tools: ToolPromptView,
+    skills: SkillPromptView,
+}
+
+#[allow(
+    dead_code,
+    reason = "the private TurnExecutionContext constructor supplies this captured input"
+)]
+impl PromptTurnContext {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn capture atomically binds the exact Prompt inputs"
+    )]
+    pub(crate) fn new(
+        agent: AgentRevisionRef,
+        session_id: SessionId,
+        session_revision: SessionDefinitionRevision,
+        resources: Arc<PromptResourceView>,
+        agent_prompts: AgentPromptSelection,
+        session_prompts: SessionPromptSelection,
+        workspace: WorkspacePromptContext,
+        tools: ToolPromptView,
+        skills: SkillPromptView,
+    ) -> Self {
+        Self {
+            agent,
+            session_id,
+            session_revision,
+            resources,
+            agent_prompts,
+            session_prompts,
+            workspace,
+            tools,
+            skills,
+        }
+    }
+}
+
+impl fmt::Debug for PromptTurnContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptTurnContext")
+            .field("resource_count", &self.resources.definition_count())
+            .field("agent_prompt_count", &self.agent_prompts.enabled().len())
+            .field(
+                "session_prompt_count",
+                &self.session_prompts.enabled().len(),
+            )
+            .field("workspace_source_count", &self.workspace.sources().len())
+            .field("tools_empty", &self.tools.is_empty())
+            .field("skills_empty", &self.skills.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptSectionKind {
+    RuntimeRequired,
+    RuntimeBase,
+    Agent,
+    Session,
+    Workspace,
+}
+
+#[derive(Clone)]
+enum PromptSectionSource {
+    RuntimeRequired,
+    RuntimeBase,
+    Agent(Arc<PromptDefinition>),
+    Session(Arc<PromptDefinition>),
+    Workspace(CapturedWorkspacePromptSource),
+}
+
+impl PromptSectionSource {
+    const fn kind(&self) -> PromptSectionKind {
+        match self {
+            Self::RuntimeRequired => PromptSectionKind::RuntimeRequired,
+            Self::RuntimeBase => PromptSectionKind::RuntimeBase,
+            Self::Agent(_) => PromptSectionKind::Agent,
+            Self::Session(_) => PromptSectionKind::Session,
+            Self::Workspace(_) => PromptSectionKind::Workspace,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptSection {
+    source: PromptSectionSource,
+    content: PromptContent,
+}
+
+impl PromptSection {
+    fn runtime_required(content: PromptContent) -> Self {
+        Self {
+            source: PromptSectionSource::RuntimeRequired,
+            content,
+        }
+    }
+
+    fn runtime_base(content: PromptContent) -> Self {
+        Self {
+            source: PromptSectionSource::RuntimeBase,
+            content,
+        }
+    }
+
+    fn agent(definition: Arc<PromptDefinition>) -> Self {
+        Self {
+            content: definition.content.clone(),
+            source: PromptSectionSource::Agent(definition),
+        }
+    }
+
+    fn session(definition: Arc<PromptDefinition>) -> Self {
+        Self {
+            content: definition.content.clone(),
+            source: PromptSectionSource::Session(definition),
+        }
+    }
+
+    fn workspace(source: CapturedWorkspacePromptSource, content: PromptContent) -> Self {
+        Self {
+            source: PromptSectionSource::Workspace(source),
+            content,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> PromptSectionKind {
+        self.source.kind()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "M6.2 assembly reads the already-fixed section role"
+    )]
+    pub(crate) const fn role(&self) -> PromptRole {
+        match self.kind() {
+            PromptSectionKind::RuntimeRequired
+            | PromptSectionKind::RuntimeBase
+            | PromptSectionKind::Agent => PromptRole::System,
+            PromptSectionKind::Session | PromptSectionKind::Workspace => PromptRole::User,
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "M6.2 assembly reads materialized section text through this getter"
+    )]
+    pub(crate) fn text(&self) -> &str {
+        self.content.text()
+    }
+}
+
+impl fmt::Debug for PromptSection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source_retained = match &self.source {
+            PromptSectionSource::RuntimeRequired | PromptSectionSource::RuntimeBase => false,
+            PromptSectionSource::Agent(definition) | PromptSectionSource::Session(definition) => {
+                Arc::strong_count(definition) > 0
+            }
+            PromptSectionSource::Workspace(source) => !source.content().is_empty(),
+        };
+        formatter
+            .debug_struct("PromptSection")
+            .field("kind", &self.kind())
+            .field("content_bytes", &self.content.text.len())
+            .field("source_retained", &source_retained)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptProfile {
+    system: Arc<[PromptSection]>,
+    user_context: Arc<[PromptSection]>,
+}
+
+#[allow(
+    dead_code,
+    reason = "M6.2 final model assembly consumes the fixed Prompt profile"
+)]
+impl PromptProfile {
+    pub(crate) fn system(&self) -> &[PromptSection] {
+        &self.system
+    }
+
+    pub(crate) fn user_context(&self) -> &[PromptSection] {
+        &self.user_context
+    }
+}
+
+impl fmt::Debug for PromptProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptProfile")
+            .field("system_sections", &self.system.len())
+            .field("user_sections", &self.user_context.len())
+            .finish()
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the PromptSet profile is consumed by M6.2 final model-context assembly"
+)]
+pub(crate) struct PromptSet {
+    agent: AgentRevisionRef,
+    session_id: SessionId,
+    session_revision: SessionDefinitionRevision,
+    resources: Arc<PromptResourceView>,
+    profile: PromptProfile,
+    tools: ToolPromptView,
+    skills: SkillPromptView,
+}
+
+#[allow(
+    dead_code,
+    reason = "the PromptSet profile is consumed by M6.2 final model-context assembly"
+)]
+impl PromptSet {
+    pub(crate) const fn agent(&self) -> AgentRevisionRef {
+        self.agent
+    }
+
+    pub(crate) const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub(crate) const fn session_revision(&self) -> SessionDefinitionRevision {
+        self.session_revision
+    }
+
+    pub(crate) const fn profile(&self) -> &PromptProfile {
+        &self.profile
+    }
+
+    pub(crate) fn compose_user_message(
+        &self,
+        intent: PromptIntent,
+    ) -> Result<CanonicalUserMessage, PromptError> {
+        let PromptIntent { body, skills } = intent;
+        if !skills.is_empty() {
+            return Err(PromptError::new(PromptErrorKind::PromptUnavailable));
+        }
+        let PromptBodyIntent::Text(text) = body else {
+            return Err(PromptError::new(PromptErrorKind::InvalidIntent));
+        };
+        let content = MessageContent::text(text.text())
+            .map_err(|_| PromptError::new(PromptErrorKind::InvalidIntent))?;
+        let message = MessageRecord::new(vec![content])
+            .map_err(|_| PromptError::new(PromptErrorKind::InvalidIntent))?;
+        CanonicalUserMessage::new(message, Vec::new())
+            .map_err(|_| PromptError::new(PromptErrorKind::InvalidIntent))
+    }
+}
+
+impl fmt::Debug for PromptSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromptSet")
+            .field("resource_count", &self.resources.definition_count())
+            .field("profile", &self.profile)
+            .field("tools_empty", &self.tools.is_empty())
+            .field("skills_empty", &self.skills.is_empty())
+            .finish()
+    }
+}
+
+fn normalize_prompt_metadata(
+    value: Box<str>,
+    maximum: usize,
+    allow_empty: bool,
+) -> Result<Arc<str>, PromptError> {
+    let value = normalize_newlines(&value);
+    validate_safe_text(&value, maximum, allow_empty)
+        .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+    Ok(value.into())
+}
+
+fn prompt_source_id(value: Box<str>) -> Result<PromptSourceId, PromptError> {
+    validate_stable_symbolic_key(&value, 128, false)
+        .map_err(|_| PromptError::new(PromptErrorKind::ContentLoad))?;
+    Ok(PromptSourceId(value))
+}
+
+fn resolve_selected_definitions(
+    resources: &PromptResourceView,
+    selection: &BTreeSet<PromptId>,
+    expected_role: PromptRole,
+    require_runtime_provenance: bool,
+) -> Result<Vec<Arc<PromptDefinition>>, PromptError> {
+    let mut definitions = selection
+        .iter()
+        .map(|id| {
+            resources
+                .definition(id)
+                .cloned()
+                .ok_or(PromptError::new(PromptErrorKind::PromptUnavailable))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if definitions.iter().any(|definition| {
+        definition.role != expected_role
+            || (require_runtime_provenance
+                && !matches!(definition.provenance, PromptProvenance::Runtime(_)))
+    }) {
+        return Err(PromptError::new(PromptErrorKind::InvalidRole));
+    }
+    definitions.sort_by(|left, right| {
+        left.key
+            .cmp(&right.key)
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| left.provenance.cmp(&right.provenance))
+    });
+    if definitions
+        .windows(2)
+        .any(|pair| pair[0].key == pair[1].key)
+    {
+        return Err(PromptError::new(PromptErrorKind::DuplicateKey));
+    }
+    Ok(definitions)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -880,13 +1774,187 @@ fn validate_prompt_text(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU64;
     use std::str::FromStr;
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
+    use crate::agent_session_lifecycle::AgentRevisionRef;
     use crate::model_gateway::ProviderItemId;
-    use crate::tools::{ToolCallId, ToolName, ToolResultContent};
-    use crate::wire::BoundedJsonObject;
+    use crate::skills::SkillView;
+    use crate::tools::{ToolCallId, ToolName, ToolResultContent, ToolSet};
+    use crate::wire::{AgentRevision, BoundedJsonObject, SessionDefinitionRevision, SessionId};
+    use crate::workspace::prompt_candidate_for_test;
+
+    struct MutablePromptSource {
+        result: Mutex<Result<Vec<PromptSourceDefinition>, PromptSourceError>>,
+        calls: AtomicUsize,
+    }
+
+    impl MutablePromptSource {
+        fn new(definitions: Vec<PromptSourceDefinition>) -> Self {
+            Self {
+                result: Mutex::new(Ok(definitions)),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn replace(&self, definitions: Vec<PromptSourceDefinition>) {
+            *self.result.lock().unwrap() = Ok(definitions);
+        }
+
+        fn fail(&self) {
+            *self.result.lock().unwrap() = Err(PromptSourceError::Unavailable);
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl PromptSourceAdapter for MutablePromptSource {
+        fn discover(&self) -> PromptSourceFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.lock().unwrap().clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    struct MutableWorkspacePromptSource {
+        result: Mutex<Result<Vec<WorkspacePromptSource>, PromptSourceError>>,
+        calls: AtomicUsize,
+    }
+
+    impl MutableWorkspacePromptSource {
+        fn new(sources: Vec<WorkspacePromptSource>) -> Self {
+            Self {
+                result: Mutex::new(Ok(sources)),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl WorkspacePromptSourceAdapter for MutableWorkspacePromptSource {
+        fn capture<'a>(
+            &'a self,
+            _context: &'a WorkspacePromptCaptureContext,
+        ) -> WorkspacePromptSourceFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.lock().unwrap().clone();
+            Box::pin(async move { result })
+        }
+    }
+
+    fn session_id() -> SessionId {
+        "ses_11111111111111111111111111111111".parse().unwrap()
+    }
+
+    fn other_session_id() -> SessionId {
+        "ses_22222222222222222222222222222222".parse().unwrap()
+    }
+
+    fn agent_revision_ref() -> AgentRevisionRef {
+        AgentRevisionRef::new(
+            "agt_11111111111111111111111111111111".parse().unwrap(),
+            AgentRevision::new(NonZeroU64::new(7).unwrap()),
+        )
+    }
+
+    fn session_revision() -> SessionDefinitionRevision {
+        SessionDefinitionRevision::new(NonZeroU64::new(11).unwrap())
+    }
+
+    fn source_definition(
+        id: &str,
+        key: &str,
+        role: PromptRole,
+        provenance: PromptSourceProvenance,
+        content: &str,
+    ) -> PromptSourceDefinition {
+        PromptSourceDefinition::new(
+            id.parse().unwrap(),
+            key,
+            format!("name-{id}"),
+            Some(format!("description-{id}").into_boxed_str()),
+            role,
+            Arc::from(content),
+            provenance,
+        )
+    }
+
+    fn runtime_definition(
+        id: &str,
+        key: &str,
+        role: PromptRole,
+        content: &str,
+    ) -> PromptSourceDefinition {
+        source_definition(
+            id,
+            key,
+            role,
+            PromptSourceProvenance::Runtime(format!("source-{id}").into_boxed_str()),
+            content,
+        )
+    }
+
+    fn user_definition(
+        id: &str,
+        key: &str,
+        role: PromptRole,
+        content: &str,
+    ) -> PromptSourceDefinition {
+        source_definition(
+            id,
+            key,
+            role,
+            PromptSourceProvenance::User(format!("source-{id}").into_boxed_str()),
+            content,
+        )
+    }
+
+    fn empty_workspace(session_id: SessionId) -> WorkspacePromptContext {
+        prompt_candidate_for_test(session_id, vec!["root".parse().unwrap()])
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap()
+            .prompt_context()
+    }
+
+    fn turn_context(
+        resources: Arc<PromptResourceView>,
+        agent_prompts: Vec<PromptId>,
+        session_prompts: Vec<PromptId>,
+        workspace: WorkspacePromptContext,
+        tool_set: &Arc<ToolSet>,
+        skill_view: &Arc<SkillView>,
+    ) -> PromptTurnContext {
+        PromptTurnContext::new(
+            agent_revision_ref(),
+            session_id(),
+            session_revision(),
+            resources,
+            AgentPromptSelection::new(agent_prompts).unwrap(),
+            SessionPromptSelection::new(session_prompts).unwrap(),
+            workspace,
+            tool_set.prompt_view(),
+            skill_view.prompt_view(),
+        )
+    }
+
+    fn profile_texts(sections: &[PromptSection]) -> Vec<&str> {
+        sections.iter().map(PromptSection::text).collect()
+    }
+
+    fn assert_prompt_error<T>(result: Result<T, PromptError>, expected: PromptErrorKind) {
+        match result {
+            Err(error) => assert_eq!(error.kind(), expected),
+            Ok(_) => panic!("prompt operation unexpectedly succeeded"),
+        }
+    }
 
     fn assert_model_message_error<T>(
         result: Result<T, ModelMessageError>,
@@ -936,6 +2004,513 @@ mod tests {
         )
         .unwrap();
         CanonicalUserMessage::new(message, vec![stamp]).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_candidates_pin_materialized_content_without_a_current_pointer() {
+        let source = Arc::new(MutablePromptSource::new(vec![runtime_definition(
+            "agent-main",
+            "agent-main",
+            PromptRole::System,
+            "old\r\nagent content",
+        )]));
+        let shared_source: Arc<dyn PromptSourceAdapter> = source.clone();
+        let service = PromptService::new(
+            Arc::from("runtime policy secret\r\nline"),
+            Some(Arc::from("base policy")),
+            vec![shared_source],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let old_resources = service.initialize().await.unwrap();
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+        let old_set = service
+            .for_turn(turn_context(
+                Arc::clone(&old_resources),
+                vec!["agent-main".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            ))
+            .unwrap();
+        assert_eq!(source.call_count(), 1);
+        assert_eq!(old_resources.definition_count(), 1);
+        assert_eq!(
+            profile_texts(old_set.profile().system()),
+            [
+                "runtime policy secret\nline",
+                "base policy",
+                "old\nagent content",
+            ]
+        );
+        assert_eq!(old_set.agent(), agent_revision_ref());
+        assert_eq!(old_set.session_id(), session_id());
+        assert_eq!(old_set.session_revision(), session_revision());
+
+        source.replace(vec![runtime_definition(
+            "agent-main",
+            "agent-main",
+            PromptRole::System,
+            "new agent content",
+        )]);
+        let new_resources = service.build_reload_candidate().await.unwrap();
+        let new_set = service
+            .for_turn(turn_context(
+                new_resources,
+                vec!["agent-main".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            ))
+            .unwrap();
+
+        assert_eq!(source.call_count(), 2);
+        assert_eq!(
+            profile_texts(old_set.profile().system()),
+            [
+                "runtime policy secret\nline",
+                "base policy",
+                "old\nagent content",
+            ]
+        );
+        assert_eq!(
+            profile_texts(new_set.profile().system()),
+            [
+                "runtime policy secret\nline",
+                "base policy",
+                "new agent content",
+            ]
+        );
+        assert!(tool_set.owns_prompt_view(&old_set.tools));
+        assert!(skill_view.owns_prompt_view(&old_set.skills));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_profile_uses_fixed_layers_and_stable_source_order() {
+        let shared = Arc::new(MutablePromptSource::new(vec![
+            user_definition("session-z", "session-z", PromptRole::User, "session z"),
+            runtime_definition("agent-z", "agent-z", PromptRole::System, "agent z"),
+            user_definition("session-a", "session-a", PromptRole::User, "session a"),
+            runtime_definition("agent-a", "agent-a", PromptRole::System, "agent a"),
+        ]));
+        let workspace = Arc::new(MutableWorkspacePromptSource::new(vec![
+            WorkspacePromptSource::new(
+                "root-a".parse().unwrap(),
+                "z.md".parse().unwrap(),
+                Arc::from("workspace z"),
+            ),
+            WorkspacePromptSource::new(
+                "root-b".parse().unwrap(),
+                "same.md".parse().unwrap(),
+                Arc::from("workspace same\r\nline"),
+            ),
+            WorkspacePromptSource::new(
+                "root-a".parse().unwrap(),
+                "a.md".parse().unwrap(),
+                Arc::from("workspace a"),
+            ),
+        ]));
+        let shared_adapter: Arc<dyn PromptSourceAdapter> = shared.clone();
+        let workspace_adapter: Arc<dyn WorkspacePromptSourceAdapter> = workspace.clone();
+        let service = PromptService::new(
+            Arc::from("required"),
+            Some(Arc::from("base")),
+            vec![shared_adapter],
+            vec![workspace_adapter],
+        )
+        .unwrap();
+        let resources = service.build_candidate().await.unwrap();
+
+        let candidate = prompt_candidate_for_test(
+            session_id(),
+            vec!["root-b".parse().unwrap(), "root-a".parse().unwrap()],
+        );
+        let captured = service
+            .capture_workspace_sources(candidate.prompt_capture_context())
+            .await
+            .unwrap();
+        assert_eq!(workspace.call_count(), 1);
+        assert_eq!(captured.len(), 3);
+        assert_eq!(captured[0].relative_location().as_str(), "a.md");
+        assert_eq!(captured[1].relative_location().as_str(), "same.md");
+        assert_eq!(captured[1].content(), "workspace same\nline");
+        assert_eq!(captured[2].relative_location().as_str(), "z.md");
+        let workspace_context = candidate
+            .finish(captured, Arc::from([]))
+            .unwrap()
+            .prompt_context();
+
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+        let set = service
+            .for_turn(turn_context(
+                resources,
+                vec!["agent-z".parse().unwrap(), "agent-a".parse().unwrap()],
+                vec!["session-z".parse().unwrap(), "session-a".parse().unwrap()],
+                workspace_context,
+                &tool_set,
+                &skill_view,
+            ))
+            .unwrap();
+
+        assert_eq!(shared.call_count(), 1);
+        assert_eq!(workspace.call_count(), 1);
+        assert_eq!(
+            set.profile()
+                .system()
+                .iter()
+                .map(PromptSection::kind)
+                .collect::<Vec<_>>(),
+            [
+                PromptSectionKind::RuntimeRequired,
+                PromptSectionKind::RuntimeBase,
+                PromptSectionKind::Agent,
+                PromptSectionKind::Agent,
+            ]
+        );
+        assert_eq!(
+            profile_texts(set.profile().system()),
+            ["required", "base", "agent a", "agent z"]
+        );
+        assert_eq!(
+            set.profile()
+                .user_context()
+                .iter()
+                .map(PromptSection::kind)
+                .collect::<Vec<_>>(),
+            [
+                PromptSectionKind::Session,
+                PromptSectionKind::Session,
+                PromptSectionKind::Workspace,
+                PromptSectionKind::Workspace,
+                PromptSectionKind::Workspace,
+            ]
+        );
+        assert_eq!(
+            profile_texts(set.profile().user_context()),
+            [
+                "session a",
+                "session z",
+                "workspace a",
+                "workspace same\nline",
+                "workspace z",
+            ]
+        );
+        assert!(
+            set.profile()
+                .system()
+                .iter()
+                .all(|section| section.role() == PromptRole::System)
+        );
+        assert!(
+            set.profile()
+                .user_context()
+                .iter()
+                .all(|section| section.role() == PromptRole::User)
+        );
+        assert!(tool_set.owns_prompt_view(&set.tools));
+        assert!(skill_view.owns_prompt_view(&set.skills));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_candidate_and_selection_fail_closed_with_typed_redacted_errors() {
+        assert_prompt_error(
+            PromptService::new(Arc::from(""), None, Vec::new(), Vec::new()),
+            PromptErrorKind::RequiredPromptMissing,
+        );
+
+        let duplicate = Arc::new(MutablePromptSource::new(vec![
+            runtime_definition("same", "first", PromptRole::System, "first"),
+            runtime_definition("same", "second", PromptRole::System, "second"),
+        ]));
+        let duplicate_adapter: Arc<dyn PromptSourceAdapter> = duplicate;
+        let service = PromptService::new(
+            Arc::from("required"),
+            None,
+            vec![duplicate_adapter],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_prompt_error(
+            service.build_candidate().await,
+            PromptErrorKind::DuplicateKey,
+        );
+
+        let unsafe_source = Arc::new(MutablePromptSource::new(vec![runtime_definition(
+            "unsafe",
+            "unsafe",
+            PromptRole::System,
+            "secret\u{001b}",
+        )]));
+        let unsafe_adapter: Arc<dyn PromptSourceAdapter> = unsafe_source;
+        let service = PromptService::new(
+            Arc::from("required"),
+            None,
+            vec![unsafe_adapter],
+            Vec::new(),
+        )
+        .unwrap();
+        let error = service.build_candidate().await.unwrap_err();
+        assert_eq!(error.kind(), PromptErrorKind::ContentLoad);
+        assert_eq!(error.to_string(), "prompt operation failed");
+        assert!(!format!("{error:?}").contains("secret"));
+
+        let failed_source = Arc::new(MutablePromptSource::new(Vec::new()));
+        failed_source.fail();
+        let failed_adapter: Arc<dyn PromptSourceAdapter> = failed_source;
+        let service = PromptService::new(
+            Arc::from("required"),
+            None,
+            vec![failed_adapter],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_prompt_error(
+            service.build_candidate().await,
+            PromptErrorKind::SourceDiscovery,
+        );
+
+        let source = Arc::new(MutablePromptSource::new(vec![
+            runtime_definition("agent-a", "duplicate", PromptRole::System, "agent a"),
+            runtime_definition("agent-b", "duplicate", PromptRole::System, "agent b"),
+            user_definition(
+                "untrusted-system",
+                "untrusted-system",
+                PromptRole::System,
+                "untrusted",
+            ),
+            user_definition("session-user", "session-user", PromptRole::User, "session"),
+        ]));
+        let adapter: Arc<dyn PromptSourceAdapter> = source;
+        let service =
+            PromptService::new(Arc::from("required"), None, vec![adapter], Vec::new()).unwrap();
+        let resources = service.build_candidate().await.unwrap();
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                Arc::clone(&resources),
+                vec!["missing".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::PromptUnavailable,
+        );
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                Arc::clone(&resources),
+                vec!["session-user".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::InvalidRole,
+        );
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                Arc::clone(&resources),
+                vec!["untrusted-system".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::InvalidRole,
+        );
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                Arc::clone(&resources),
+                vec!["agent-a".parse().unwrap(), "agent-b".parse().unwrap()],
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::DuplicateKey,
+        );
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                Arc::clone(&resources),
+                Vec::new(),
+                vec!["agent-a".parse().unwrap()],
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::InvalidRole,
+        );
+
+        let other_service =
+            PromptService::new(Arc::from("other required"), None, Vec::new(), Vec::new()).unwrap();
+        let other_resources = other_service.build_candidate().await.unwrap();
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                other_resources,
+                Vec::new(),
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::PromptUnavailable,
+        );
+
+        let mismatched_workspace = empty_workspace(other_session_id());
+        assert_prompt_error(
+            service.for_turn(turn_context(
+                resources,
+                Vec::new(),
+                Vec::new(),
+                mismatched_workspace,
+                &tool_set,
+                &skill_view,
+            )),
+            PromptErrorKind::InvalidContribution,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_source_capture_is_candidate_only_bounded_and_fail_closed() {
+        let candidate = prompt_candidate_for_test(session_id(), vec!["root".parse().unwrap()]);
+        let service =
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap();
+        assert_prompt_error(
+            service
+                .capture_workspace_sources(candidate.prompt_capture_context())
+                .await,
+            PromptErrorKind::SourceDiscovery,
+        );
+
+        let duplicate = Arc::new(MutableWorkspacePromptSource::new(vec![
+            WorkspacePromptSource::new(
+                "root".parse().unwrap(),
+                "instructions.md".parse().unwrap(),
+                Arc::from("first"),
+            ),
+            WorkspacePromptSource::new(
+                "root".parse().unwrap(),
+                "instructions.md".parse().unwrap(),
+                Arc::from("second"),
+            ),
+        ]));
+        let duplicate_adapter: Arc<dyn WorkspacePromptSourceAdapter> = duplicate;
+        let service = PromptService::new(
+            Arc::from("required"),
+            None,
+            Vec::new(),
+            vec![duplicate_adapter],
+        )
+        .unwrap();
+        assert_prompt_error(
+            service
+                .capture_workspace_sources(candidate.prompt_capture_context())
+                .await,
+            PromptErrorKind::DuplicateKey,
+        );
+
+        for source in [
+            WorkspacePromptSource::new(
+                "other".parse().unwrap(),
+                "instructions.md".parse().unwrap(),
+                Arc::from("unauthorized"),
+            ),
+            WorkspacePromptSource::new(
+                "root".parse().unwrap(),
+                WorkspaceRelativePath::default(),
+                Arc::from("root location"),
+            ),
+            WorkspacePromptSource::new(
+                "root".parse().unwrap(),
+                "unsafe.md".parse().unwrap(),
+                Arc::from("unsafe\u{001b}"),
+            ),
+        ] {
+            let adapter = Arc::new(MutableWorkspacePromptSource::new(vec![source]));
+            let adapter: Arc<dyn WorkspacePromptSourceAdapter> = adapter;
+            let service =
+                PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap();
+            assert_prompt_error(
+                service
+                    .capture_workspace_sources(candidate.prompt_capture_context())
+                    .await,
+                PromptErrorKind::ContentLoad,
+            );
+        }
+
+        let empty_candidate =
+            prompt_candidate_for_test(session_id(), vec!["root".parse().unwrap()]);
+        let empty_snapshot = empty_candidate
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        assert!(empty_snapshot.prompt_context().sources().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prompt_set_composes_one_atomic_text_message_and_rejects_deferred_skills() {
+        let service =
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap();
+        let resources = service.build_candidate().await.unwrap();
+        let tool_set = ToolSet::empty();
+        let skill_view = SkillView::empty();
+        let set = service
+            .for_turn(turn_context(
+                resources,
+                Vec::new(),
+                Vec::new(),
+                empty_workspace(session_id()),
+                &tool_set,
+                &skill_view,
+            ))
+            .unwrap();
+
+        let message = set
+            .compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("first\r\nsecond").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(message.message().content().len(), 1);
+        assert_eq!(message.message().content()[0].as_text(), "first\nsecond");
+        assert!(message.contribution_stamps().is_empty());
+
+        assert_prompt_error(
+            set.compose_user_message(
+                PromptIntent::new(PromptBodyIntent::Empty, Vec::new()).unwrap(),
+            ),
+            PromptErrorKind::InvalidIntent,
+        );
+        assert_prompt_error(
+            set.compose_user_message(
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("body remains unapplied").unwrap()),
+                    vec![SkillIntent::new("deferred-skill".parse().unwrap())],
+                )
+                .unwrap(),
+            ),
+            PromptErrorKind::PromptUnavailable,
+        );
+
+        let debug = format!("{service:?} {set:?} {:?}", set.profile().system()[0]);
+        for secret in [
+            "runtime policy secret",
+            "first",
+            "second",
+            "body remains unapplied",
+            "deferred-skill",
+        ] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]

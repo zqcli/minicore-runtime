@@ -102,6 +102,83 @@ impl fmt::Debug for ToolCallId {
     }
 }
 
+/// The immutable Tool set captured for one Turn.
+///
+/// M6.1 intentionally supports only the valid empty set. The shared inner value lets Prompt
+/// retain an exact parent-owned projection without adding a ToolSet ID or exposing execution
+/// routes before M8.
+#[allow(
+    dead_code,
+    reason = "the empty captured ToolSet is consumed by the pending TurnExecutionContext"
+)]
+pub(crate) struct ToolSet {
+    inner: Arc<ToolSetInner>,
+}
+
+struct ToolSetInner {
+    spec_count: usize,
+}
+
+/// The model-safe projection of one exact captured [`ToolSet`].
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "the PromptSet captures this owner-bound empty projection in M6.1"
+)]
+pub(crate) struct ToolPromptView {
+    inner: Arc<ToolSetInner>,
+}
+
+#[allow(
+    dead_code,
+    reason = "the empty captured ToolSet is consumed by the pending TurnExecutionContext"
+)]
+impl ToolSet {
+    pub(crate) fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Arc::new(ToolSetInner { spec_count: 0 }),
+        })
+    }
+
+    pub(crate) fn prompt_view(&self) -> ToolPromptView {
+        ToolPromptView {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub(crate) fn owns_prompt_view(&self, view: &ToolPromptView) -> bool {
+        Arc::ptr_eq(&self.inner, &view.inner)
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "the PromptSet captures this owner-bound empty projection in M6.1"
+)]
+impl ToolPromptView {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.spec_count == 0
+    }
+}
+
+impl fmt::Debug for ToolSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolSet")
+            .field("spec_count", &self.inner.spec_count)
+            .finish()
+    }
+}
+
+impl fmt::Debug for ToolPromptView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolPromptView")
+            .field("spec_count", &self.inner.spec_count)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ToolValueError {
     #[error("tool text is empty, unsafe, or exceeds its limit")]
@@ -1148,6 +1225,23 @@ fn strictly_increasing(values: impl IntoIterator<Item = u32>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_prompt_view_retains_its_exact_parent_without_an_identity_value() {
+        let first = ToolSet::empty();
+        let second = ToolSet::empty();
+        let view = first.prompt_view();
+        let clone = view.clone();
+
+        assert!(view.is_empty());
+        assert!(clone.is_empty());
+        assert!(first.owns_prompt_view(&view));
+        assert!(first.owns_prompt_view(&clone));
+        assert!(!second.owns_prompt_view(&view));
+        assert_eq!(format!("{first:?}"), "ToolSet { spec_count: 0 }");
+        assert_eq!(format!("{view:?}"), "ToolPromptView { spec_count: 0 }");
+    }
+
     #[test]
     fn result_content_enforces_part_and_aggregate_boundaries() {
         assert!(ToolResultContent::from_text_parts(vec!["x".repeat(65_536)]).is_ok());

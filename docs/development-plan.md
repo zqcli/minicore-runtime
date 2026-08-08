@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现并通过独立全量验证，M5.1完整fixture/native exit gate仍pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，PromptSet、actual source discovery、captured empty SkillView/ToolSet、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration pending
+状态：Active；M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 durable entity/async **design gate**已完成；M5.0 durable foundation与exact historical definition resolution已完成，remaining Fork anchors/LiveSnapshot、public Runtime command与完整platform matrix pending；M5.1 DurableState-issued published conversation target、same-open writable proof与owner-tracked SessionRecorder physical append slice、M5.2 tolerant semantic replay/corruption sidecars，以及replay/Recorder-backed Ready+Idle Load hydration已实现并通过独立全量验证，M5.1完整fixture/native exit gate仍pending；M6.1 Workspace resolver/Snapshot、crate-private loaded Ready+Idle publication owner及Runtime-owned residency foundation（single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update）已完成，Prompt candidate/profile/Text composition与owner-bound empty SkillView/ToolSet foundation已实现；Runtime shared-root publication、concrete source discovery、Workspace source Load integration、active-Turn grace Unload、public Snapshot/Event与full SessionExecutor Turn integration仍pending
 
 初始实现基线：`dev` at `144039a`
 
@@ -420,7 +420,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ### M6.1 Workspace、Prompt与captured empty views
 
-当前进度：Workspace definition resolve与immutable Snapshot foundation Completed，包括owner-tracked local canonicalization、canonical duplicate/overlap/cwd validation、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与cross-candidate fail-closed finish。Prompt source adapter/materialization、PromptService/PromptSet、captured empty SkillView/ToolSet及loaded Session publication Pending。
+当前进度：Workspace definition resolve与immutable Snapshot foundation Completed，包括owner-tracked local canonicalization、canonical duplicate/overlap/cwd validation、fail-closed restricted authority、exact authority-request binding、Prompt/Skill capture contexts与cross-candidate fail-closed finish。已完成 crate-private Prompt candidate materialization、immutable PromptResourceView/PromptSet profile、固定层级与稳定排序、candidate-only Workspace source capture、Text-only atomic composition，以及由 parent owner 构造的合法 empty SkillView/ToolPromptView。具体 filesystem adapter、Runtime shared-root publication、Session Load/Workspace publication 接入、Skill contribution async resolve、Tool/Skill metadata projection和最终 Model assembly仍 Pending。
 
 先实现ordinary Text turn所需最小但真实路径：
 
@@ -429,7 +429,8 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 - PromptService/PromptSet只做同步纯内存normalize/assemble；
 - capture合法empty SkillView/ToolSet snapshot，保证TurnExecutionContext shape从第一条vertical slice开始稳定；
 - Text Input normalize与safe provenance；
-- 完整SkillIntent async load/composition延后到M9，完整Tool execution延后到M8。
+- 完整SkillIntent async load/composition延后到M9，完整Tool execution延后到M8；
+- 本切片不宣称 public Runtime Load、TurnExecutionContext capture、ModelGateway request、Snapshot/Event 或 ActiveTurn 行为已经可用。
 
 ### M6.2 ModelGateway与ScriptedProviderAdapter
 

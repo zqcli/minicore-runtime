@@ -1678,6 +1678,10 @@ impl CapturedWorkspacePromptSource {
         &self.content
     }
 
+    pub(crate) fn content_arc(&self) -> &Arc<str> {
+        &self.content
+    }
+
     pub(crate) fn authorization(&self) -> &WorkspaceSourceAuthorization {
         &self.authorization
     }
@@ -1846,6 +1850,52 @@ impl fmt::Debug for WorkspaceSnapshotCandidate {
             .field("root_count", &self.roots.len())
             .finish()
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prompt_candidate_for_test(
+    session_id: SessionId,
+    root_keys: Vec<WorkspaceRootKey>,
+) -> WorkspaceSnapshotCandidate {
+    assert!(
+        !root_keys.is_empty(),
+        "a Workspace prompt candidate requires a primary root"
+    );
+    let trust = WorkspaceRootTrust::new(
+        WorkspaceTrustLevel::Trusted,
+        WorkspaceTrustRevision::new(
+            NonZeroU64::new(1).expect("the fixed test trust revision is non-zero"),
+        ),
+    );
+    let roots = root_keys
+        .into_iter()
+        .enumerate()
+        .map(|(index, key)| ResolvedWorkspaceRoot {
+            role: if index == 0 {
+                WorkspaceRootRole::Primary
+            } else {
+                WorkspaceRootRole::Additional
+            },
+            canonical_path: CanonicalWorkspacePath::new(PathBuf::from(format!(
+                "/minicore-prompt-test/{}",
+                key.as_str()
+            ))),
+            key,
+            trust,
+            filesystem: WorkspaceFilesystemGrant::ReadOnly,
+            prompt_source: true,
+            skill_source: false,
+        })
+        .collect::<Vec<_>>();
+    let cwd = roots[0].canonical_path.clone();
+    WorkspaceSnapshotCandidate::new(
+        session_id,
+        WorkspaceRevision::new(
+            NonZeroU64::new(1).expect("the fixed test Workspace revision is non-zero"),
+        ),
+        roots,
+        cwd,
+    )
 }
 
 pub(crate) struct WorkspaceSnapshot {
