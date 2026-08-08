@@ -2839,6 +2839,8 @@ async fn run_active_turn_inner(
         )
         .map(Arc::new)
         .map_err(map_model_request_error)?;
+        #[cfg(test)]
+        hooks.before_agent_run_attempt().await;
         let (result, logical_retry_count) = call_agent_run_with_logical_retry(
             &model_gateway,
             Arc::clone(&request),
@@ -4202,6 +4204,21 @@ impl SessionExecutorTestHooks {
         self.inner.after_agent_admission_before_input.release();
     }
 
+    pub(crate) fn arm_before_agent_run_attempt(&self) {
+        self.inner.before_agent_run_attempt.arm();
+    }
+
+    pub(crate) async fn wait_before_agent_run_attempt(&self) {
+        self.inner
+            .before_agent_run_attempt
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_agent_run_attempt(&self) {
+        self.inner.before_agent_run_attempt.release();
+    }
+
     pub(crate) fn arm_before_steer_safe_point(&self) {
         self.inner.before_steer_safe_point.arm();
     }
@@ -4274,6 +4291,7 @@ impl SessionExecutorTestHooks {
 struct SessionExecutorTestHooksInner {
     before_snapshot_response: Arc<NamedAsyncBarrier>,
     after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
+    before_agent_run_attempt: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
     after_steer_arbitration: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
@@ -4288,6 +4306,7 @@ impl SessionExecutorTestHooksInner {
         Self {
             before_snapshot_response: Arc::new(NamedAsyncBarrier::new()),
             after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
+            before_agent_run_attempt: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
             after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
@@ -4305,6 +4324,10 @@ impl SessionExecutorTestHooksInner {
         self.after_agent_admission_before_input
             .wait_if_armed()
             .await;
+    }
+
+    async fn before_agent_run_attempt(&self) {
+        self.before_agent_run_attempt.wait_if_armed().await;
     }
 
     async fn before_steer_safe_point(&self) {
@@ -5325,6 +5348,42 @@ mod tests {
         assert!(loaded.executor.close().await.is_ok());
         assert_eq!(model.request_count(), 1);
         assert_eq!(loaded.executor.published_snapshot().current_turn(), None);
+        loaded.state.close().await;
+        let _ = loaded.context;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_close_after_turn_admission_still_runs_first_model_attempt() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["admitted attempt"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("close after admission").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_agent_run_attempt().await;
+        assert_eq!(model.request_count(), 0);
+        let mut close = Box::pin(loaded.executor.close());
+        assert!(poll_once_pending(close.as_mut()).await);
+        assert_eq!(model.request_count(), 0);
+        hooks.release_before_agent_run_attempt();
+        assert!(close.await.is_ok());
+        assert_eq!(model.request_count(), 1);
+        assert_eq!(
+            loaded.executor.published_snapshot().last_terminal(),
+            Some((turn_id, SessionTurnTerminal::Completed))
+        );
         loaded.state.close().await;
         let _ = loaded.context;
     }
