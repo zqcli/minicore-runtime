@@ -1,6 +1,6 @@
 # DurableState 架构设计
 
-状态：M5.0 production durable foundation与exact historical definition resolution已实现；loaded Ready+Idle SessionExecutor及Runtime residency actor已消费definition/lifecycle durable seams并完成required Snapshot install、unloaded exclusion与post-commit poison；public Runtime command、remaining Fork anchors/LiveSnapshot及完整cross-platform native matrix pending（ADR 0136、0137）
+状态：M5.0 production durable foundation与exact historical definition resolution已实现；loaded Ready+Idle SessionExecutor及Runtime residency actor已消费definition/lifecycle durable seams并完成required Snapshot install、unloaded exclusion与post-commit poison；M7 public Create/Load/Submit/Unload与ordinary Turn replay已消费这些seams，remaining Fork anchors/LiveSnapshot及完整cross-platform native matrix pending（ADR 0136、0137）
 日期：2026-08-03
 
 ## 目的

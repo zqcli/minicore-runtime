@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；crate-private loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture，以及replay/Recorder-backed Ready+Idle Load hydration已实现；Load fault-and-replay conformance已覆盖admitted cancellation、replay worker faults、Recorder degradation、stale Workspace recheck与cold replay；具体Prompt/Skill source adapter、public Snapshot/Event、active-Turn grace Unload、Turn admission与`ActiveTurnTask` pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；具体Prompt/Skill source adapter、Tool/Interaction/Cancel、logical retry、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的

@@ -4,8 +4,9 @@ use minicore_runtime::runtime_interface::{
 };
 use minicore_runtime::skills::SkillId;
 use minicore_runtime::wire::{
-    AgentId, CommandId, IncrementalRuntimeProtocolV1, ItemId, ProtocolLimits, ProtocolVersion,
-    PublicDecodeCode, PublicDecodeStage, RequestId, SessionId, TurnId, WireV1Codec,
+    AgentId, CommandId, Duration, IncrementalRuntimeProtocolV1, ItemId, ProtocolLimits,
+    ProtocolVersion, PublicDecodeCode, PublicDecodeStage, RequestId, SessionId, TurnId,
+    WireV1Codec,
 };
 
 #[test]
@@ -44,16 +45,31 @@ fn turn_started_and_rejected_responses_round_trip_as_typed_completions() {
 }
 
 #[test]
-fn later_slice_responses_are_known_pending_not_unknown_output_variants() {
-    for path in [
-        "valid/retry-with-backoff-response.json",
-        "valid/session-definition-updated-response.json",
-    ] {
-        let error = IncrementalRuntimeProtocolV1::v1_0()
-            .decode_command_response(&fixture(path))
-            .unwrap_err();
-        assert!(error.is_pending_public_target(), "{path}");
-    }
+fn retry_with_backoff_response_round_trips_with_typed_duration() {
+    let bytes = fixture("valid/retry-with-backoff-response.json");
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let response = protocol.decode_command_response(&bytes).unwrap();
+    let CommandCompletion::Rejected(error) = response.completion() else {
+        panic!("retry response was not rejected");
+    };
+    assert_eq!(
+        error.retry(),
+        RetryAdvice::RetryWithBackoff {
+            retry_after: Some(Duration::new(2_000).unwrap()),
+        }
+    );
+    assert_eq!(
+        protocol.encode_command_response(&response).unwrap(),
+        without_lf(&bytes),
+    );
+}
+
+#[test]
+fn later_slice_response_is_known_pending_not_unknown_output_variant() {
+    let error = IncrementalRuntimeProtocolV1::v1_0()
+        .decode_command_response(&fixture("valid/session-definition-updated-response.json"))
+        .unwrap_err();
+    assert!(error.is_pending_public_target());
 }
 
 #[test]
@@ -140,6 +156,15 @@ fn command_error_code_and_retry_form_one_machine_contract() {
             CommandErrorCode::SessionBusy,
             "busy",
             RetryAdvice::RefreshAndRetry,
+            None,
+        )
+        .is_ok()
+    );
+    assert!(
+        CommandError::new(
+            CommandErrorCode::RuntimeClosing,
+            "closing",
+            RetryAdvice::RetryWithBackoff { retry_after: None },
             None,
         )
         .is_ok()
@@ -252,7 +277,10 @@ fn representable_error_codes_and_all_subjects_round_trip_exhaustively() {
             CommandErrorCode::Unauthorized,
             RetryAdvice::UserActionRequired,
         ),
-        (CommandErrorCode::Unavailable, RetryAdvice::DoNotRetry),
+        (
+            CommandErrorCode::Unavailable,
+            RetryAdvice::RetryWithBackoff { retry_after: None },
+        ),
         (
             CommandErrorCode::DurableStateCorrupt,
             RetryAdvice::UserActionRequired,
@@ -260,6 +288,12 @@ fn representable_error_codes_and_all_subjects_round_trip_exhaustively() {
         (
             CommandErrorCode::DurableStateTooLarge,
             RetryAdvice::UserActionRequired,
+        ),
+        (
+            CommandErrorCode::RuntimeClosing,
+            RetryAdvice::RetryWithBackoff {
+                retry_after: Some(Duration::new(2_000).unwrap()),
+            },
         ),
     ];
     for (code, retry) in cases {

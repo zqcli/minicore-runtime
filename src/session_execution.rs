@@ -15,27 +15,45 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
     SessionDefinitionDecisionError, SessionLifecycle,
 };
-use crate::conversation_storage::{ConversationReplayDiagnostics, SessionRecorder};
+use crate::conversation_storage::{
+    ConversationReplayDiagnostics, SessionRecorder, StoredAssistantContent, StoredAssistantMessage,
+    StoredUserMessage,
+};
 use crate::durable_state::{
-    DurableSessionDefinitionError, DurableSessionDefinitionOutcome, DurableState,
+    AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
+    DurableSessionDefinitionOutcome, DurableState,
 };
 use crate::live_conversation::LiveSessionState;
-use crate::prompt::{PromptError, PromptErrorKind, PromptService};
-use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
-use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision};
+use crate::model_gateway::{
+    FinalizedAssistantContent, ModelCallErrorReason, ModelCallPurpose, ModelCallRequest,
+    ModelCatalogView, ModelGateway, ModelProgressPublisher, ModelRequestValidationErrorKind,
+};
+use crate::prompt::{
+    PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
+};
+use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
+use crate::turn_execution_context::{
+    TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
+};
+use crate::turn_item_interaction::{AssistantDisposition, UserMessageSource};
+use crate::wire::{
+    CommandId, IdGenerationError, ItemId, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
+    WorkspaceRevision,
+};
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshot,
     WorkspaceSnapshotFinishError,
 };
 
 const SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY: usize = 8;
+const SESSION_EVENT_CAPACITY: usize = 32;
 
 /// The only execution states represented by a loaded Session executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,6 +62,67 @@ pub(crate) enum SessionExecutionState {
     Starting,
     Running,
     Finishing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTurnFailure {
+    Prompt,
+    Model,
+    ContextOverflow,
+    AgentUnavailable,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTurnTerminal {
+    Completed,
+    Failed(SessionTurnFailure),
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionExecutorEvent {
+    timestamp: Timestamp,
+    command_id: CommandId,
+    turn_id: TurnId,
+    terminal: SessionTurnTerminal,
+    snapshot: Arc<SessionExecutorSnapshot>,
+}
+
+impl SessionExecutorEvent {
+    pub(crate) const fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub(crate) const fn command_id(&self) -> CommandId {
+        self.command_id
+    }
+
+    pub(crate) const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub(crate) const fn terminal(&self) -> SessionTurnTerminal {
+        self.terminal
+    }
+
+    pub(crate) const fn snapshot(&self) -> &Arc<SessionExecutorSnapshot> {
+        &self.snapshot
+    }
+}
+
+pub(crate) struct SessionExecutorSubscription {
+    snapshot: Arc<SessionExecutorSnapshot>,
+    receiver: broadcast::Receiver<Arc<SessionExecutorEvent>>,
+}
+
+impl SessionExecutorSubscription {
+    pub(crate) const fn snapshot(&self) -> &Arc<SessionExecutorSnapshot> {
+        &self.snapshot
+    }
+
+    pub(crate) async fn recv(&mut self) -> Option<Arc<SessionExecutorEvent>> {
+        self.receiver.recv().await.ok()
+    }
 }
 
 impl SessionExecutionState {
@@ -60,6 +139,8 @@ pub(crate) struct SessionExecutorSnapshot {
     definition: Arc<SessionDefinition>,
     workspace: Arc<WorkspaceSnapshot>,
     execution_state: SessionExecutionState,
+    current_turn: Option<TurnId>,
+    last_terminal: Option<(TurnId, SessionTurnTerminal)>,
 }
 
 impl SessionExecutorSnapshot {
@@ -72,6 +153,23 @@ impl SessionExecutorSnapshot {
             definition,
             workspace,
             execution_state,
+            current_turn: None,
+            last_terminal: None,
+        }
+    }
+
+    fn with_execution(
+        &self,
+        execution_state: SessionExecutionState,
+        current_turn: Option<TurnId>,
+        last_terminal: Option<(TurnId, SessionTurnTerminal)>,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            workspace: Arc::clone(&self.workspace),
+            execution_state,
+            current_turn,
+            last_terminal,
         }
     }
 
@@ -94,6 +192,14 @@ impl SessionExecutorSnapshot {
     pub(crate) const fn execution_state(&self) -> SessionExecutionState {
         self.execution_state
     }
+
+    pub(crate) const fn current_turn(&self) -> Option<TurnId> {
+        self.current_turn
+    }
+
+    pub(crate) const fn last_terminal(&self) -> Option<(TurnId, SessionTurnTerminal)> {
+        self.last_terminal
+    }
 }
 
 impl fmt::Debug for SessionExecutorSnapshot {
@@ -103,6 +209,8 @@ impl fmt::Debug for SessionExecutorSnapshot {
             .field("session_definition_revision", &self.definition.revision())
             .field("workspace_revision", &self.workspace.revision())
             .field("execution_state", &self.execution_state)
+            .field("current_turn", &self.current_turn)
+            .field("last_terminal", &self.last_terminal)
             .finish()
     }
 }
@@ -208,6 +316,109 @@ pub(crate) enum SessionExecutorStartError {
     InternalDispatchUnavailable,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionSubmitError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("session execution is busy")]
+    SessionBusy,
+    #[error("loaded session execution dependencies are unavailable")]
+    DependencyUnavailable,
+    #[error("agent is unavailable for execution")]
+    AgentUnavailable,
+    #[error("turn prompt capture failed")]
+    Prompt,
+    #[error("turn input is invalid")]
+    InvalidArgument,
+    #[error("turn input exceeds the model context limit")]
+    ContextOverflow,
+    #[error("session turn dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone)]
+struct TurnResources {
+    prompt_resources: Arc<PromptResourceView>,
+    model_gateway: Arc<ModelGateway>,
+    model_catalog: Arc<ModelCatalogView>,
+}
+
+pub(crate) struct SessionExecutorDependencies {
+    task_context: RuntimeTaskContext,
+    durable_state: DurableState,
+    resolver: Arc<WorkspaceResolver>,
+    prompt_service: Arc<PromptService>,
+    turn_resources: Option<TurnResources>,
+}
+
+impl SessionExecutorDependencies {
+    pub(crate) fn with_turn_resources(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+    ) -> Self {
+        Self {
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            turn_resources: Some(TurnResources {
+                prompt_resources,
+                model_gateway,
+                model_catalog,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn without_turn_resources(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+    ) -> Self {
+        Self {
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            turn_resources: None,
+        }
+    }
+}
+
+struct TurnAdmissionGate {
+    open: Mutex<bool>,
+}
+
+impl TurnAdmissionGate {
+    fn new() -> Self {
+        Self {
+            open: Mutex::new(true),
+        }
+    }
+
+    fn close(&self) {
+        *lock(&self.open) = false;
+    }
+
+    fn try_enter(&self) -> Option<TurnAdmissionPermit<'_>> {
+        let guard = lock(&self.open);
+        if !*guard {
+            return None;
+        }
+        Some(TurnAdmissionPermit { _guard: guard })
+    }
+}
+
+struct TurnAdmissionPermit<'a> {
+    _guard: MutexGuard<'a, bool>,
+}
+
 /// A typed process-local exclusion for one definition publication.
 ///
 /// The identity is intentionally opaque.  Only the actor and the owner-retained completion can
@@ -265,7 +476,10 @@ pub(crate) struct SessionExecutor {
     closing: CancellationToken,
     task: TrackedTask,
     failure_state: Arc<ActorFailureState>,
+    turn_admission_gate: Arc<TurnAdmissionGate>,
+    published_snapshot: Arc<Mutex<Arc<SessionExecutorSnapshot>>>,
     conversation: Option<Arc<LoadedSessionConversation>>,
+    events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -277,12 +491,8 @@ impl fmt::Debug for SessionExecutor {
 }
 
 impl SessionExecutor {
-    /// Starts one loaded Ready+Idle Session.
-    ///
-    /// The caller must already own the future Runtime residency permit and must exclude
-    /// lifecycle/load changes for the exact loaded Session. This constructor validates the
-    /// definition/snapshot binding and adopts an already replay-seeded state/Recorder pair; it
-    /// deliberately does not acquire that future permit.
+    /// Starts a test-only loaded Ready+Idle Session without Turn resources.
+    #[cfg(test)]
     pub(crate) fn start_loaded_ready_idle(
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
@@ -293,10 +503,26 @@ impl SessionExecutor {
         conversation: LoadedSessionConversation,
     ) -> Result<Self, SessionExecutorStartError> {
         Self::start_loaded_ready_idle_inner(
-            task_context,
-            durable_state,
-            resolver,
-            prompt_service,
+            SessionExecutorDependencies::without_turn_resources(
+                task_context,
+                durable_state,
+                resolver,
+                prompt_service,
+            ),
+            definition,
+            workspace,
+            Some(Arc::new(conversation)),
+        )
+    }
+
+    pub(crate) fn start_loaded_ready_idle_with_turn_resources(
+        dependencies: SessionExecutorDependencies,
+        definition: Arc<SessionDefinition>,
+        workspace: Arc<WorkspaceSnapshot>,
+        conversation: LoadedSessionConversation,
+    ) -> Result<Self, SessionExecutorStartError> {
+        Self::start_loaded_ready_idle_inner(
+            dependencies,
             definition,
             workspace,
             Some(Arc::new(conversation)),
@@ -313,10 +539,12 @@ impl SessionExecutor {
         workspace: Arc<WorkspaceSnapshot>,
     ) -> Result<Self, SessionExecutorStartError> {
         Self::start_loaded_ready_idle_inner(
-            task_context,
-            durable_state,
-            resolver,
-            prompt_service,
+            SessionExecutorDependencies::without_turn_resources(
+                task_context,
+                durable_state,
+                resolver,
+                prompt_service,
+            ),
             definition,
             workspace,
             None,
@@ -324,14 +552,18 @@ impl SessionExecutor {
     }
 
     fn start_loaded_ready_idle_inner(
-        task_context: RuntimeTaskContext,
-        durable_state: DurableState,
-        resolver: Arc<WorkspaceResolver>,
-        prompt_service: Arc<PromptService>,
+        dependencies: SessionExecutorDependencies,
         definition: Arc<SessionDefinition>,
         workspace: Arc<WorkspaceSnapshot>,
         conversation: Option<Arc<LoadedSessionConversation>>,
     ) -> Result<Self, SessionExecutorStartError> {
+        let SessionExecutorDependencies {
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            turn_resources,
+        } = dependencies;
         if definition.session_id() != workspace.session_id() {
             return Err(SessionExecutorStartError::SessionIdMismatch);
         }
@@ -344,9 +576,12 @@ impl SessionExecutor {
             workspace,
             SessionExecutionState::Idle,
         ));
+        let published_snapshot = Arc::new(Mutex::new(Arc::clone(&current)));
         let (sender, receiver) = mpsc::channel(SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY);
         let (completion_sender, completion_receiver) = mpsc::unbounded_channel();
+        let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
         let closing = CancellationToken::new();
+        let turn_admission_gate = Arc::new(TurnAdmissionGate::new());
         #[cfg(test)]
         let hooks = Arc::new(SessionExecutorTestHooksInner::new());
         let failure_state = Arc::new(ActorFailureState::default());
@@ -360,10 +595,16 @@ impl SessionExecutor {
             resolver,
             prompt_service,
             current,
+            published_snapshot: Arc::clone(&published_snapshot),
             execution_state: SessionExecutionState::Idle,
             active_publication: None,
             failure_state: Arc::clone(&failure_state),
             conversation: conversation.clone(),
+            turn_resources,
+            active_admission: None,
+            active_turn: None,
+            turn_admission_gate: Arc::clone(&turn_admission_gate),
+            events: events.clone(),
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -372,6 +613,7 @@ impl SessionExecutor {
             task_context.clone(),
             durable_state.clone(),
             Arc::clone(&failure_state),
+            Arc::clone(&turn_admission_gate),
         );
         let task = match task_context.spawn_tracked(async move {
             let normal_exit = actor.run().await;
@@ -399,7 +641,10 @@ impl SessionExecutor {
             closing,
             task,
             failure_state,
+            turn_admission_gate,
+            published_snapshot,
             conversation,
+            events,
             #[cfg(test)]
             hooks,
         })
@@ -408,6 +653,7 @@ impl SessionExecutor {
     /// Requests the actor to reject future requests.  An admitted publication may abandon
     /// cancellable candidate capture, but work that has reached durable publication still drains.
     pub(crate) fn request_closing(&self) {
+        self.turn_admission_gate.close();
         self.closing.cancel();
     }
 
@@ -457,6 +703,10 @@ impl SessionExecutor {
                 Err(SessionExecutorSnapshotError::InternalDispatchUnavailable)
             }
         })
+    }
+
+    pub(crate) fn published_snapshot(&self) -> Arc<SessionExecutorSnapshot> {
+        Arc::clone(&lock(&self.published_snapshot))
     }
 
     /// Publishes a complete lowered Workspace replacement through the loaded Session actor.
@@ -516,11 +766,78 @@ impl SessionExecutor {
         })
     }
 
+    pub(crate) async fn submit(
+        &self,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<TurnId, SessionSubmitError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::Submit(SubmitRequest {
+            command_id,
+            intent: Some(intent),
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionSubmitError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionSubmitError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionSubmitError::Closing)
+            } else {
+                Err(SessionSubmitError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
+    pub(crate) async fn subscribe(
+        &self,
+    ) -> Result<SessionExecutorSubscription, SessionExecutorSnapshotError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::Subscribe(SubscribeRequest {
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionExecutorSnapshotError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionExecutorSnapshotError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or(Err(
+            SessionExecutorSnapshotError::InternalDispatchUnavailable,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn test_hooks(&self) -> SessionExecutorTestHooks {
         SessionExecutorTestHooks {
             inner: Arc::clone(&self.hooks),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_until_closing_for_test(&self) {
+        self.closing.cancelled().await;
     }
 
     #[cfg(test)]
@@ -579,18 +896,24 @@ impl SessionExecutor {
 
 struct SessionExecutorActor {
     receiver: mpsc::Receiver<SessionExecutorRequest>,
-    completions: mpsc::UnboundedReceiver<PublicationCompletion>,
-    completion_sender: mpsc::UnboundedSender<PublicationCompletion>,
+    completions: mpsc::UnboundedReceiver<ExecutorCompletion>,
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     closing: CancellationToken,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
     prompt_service: Arc<PromptService>,
     current: Arc<SessionExecutorSnapshot>,
+    published_snapshot: Arc<Mutex<Arc<SessionExecutorSnapshot>>>,
     execution_state: SessionExecutionState,
     active_publication: Option<ActivePublication>,
     failure_state: Arc<ActorFailureState>,
     conversation: Option<Arc<LoadedSessionConversation>>,
+    turn_resources: Option<TurnResources>,
+    active_admission: Option<ActiveAdmission>,
+    active_turn: Option<ActiveTurn>,
+    turn_admission_gate: Arc<TurnAdmissionGate>,
+    events: broadcast::Sender<Arc<SessionExecutorEvent>>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -600,6 +923,19 @@ struct ActivePublication {
     expected: ExpectedPublication,
     waiter: Arc<PublicationWaiterState>,
     worker_task: Option<TrackedTask>,
+}
+
+struct ActiveAdmission {
+    command_id: CommandId,
+    turn_id: TurnId,
+    waiter: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
+    task: Option<TrackedTask>,
+}
+
+struct ActiveTurn {
+    command_id: CommandId,
+    turn_id: TurnId,
+    task: Option<TrackedTask>,
 }
 
 #[derive(Clone)]
@@ -677,7 +1013,7 @@ impl SessionExecutorActor {
                             request.reject_closing();
                             continue;
                         }
-                        if let Err(fatality) = self.handle_request(&mut request) {
+                        if let Err(fatality) = self.handle_request(&mut request).await {
                             self.close_for_fatal(fatality);
                             return self.close_and_drain().await;
                         }
@@ -709,7 +1045,11 @@ impl SessionExecutorActor {
                 }
             }
 
-            if self.active_publication.is_none() && requests_drained {
+            if self.active_publication.is_none()
+                && self.active_admission.is_none()
+                && self.active_turn.is_none()
+                && requests_drained
+            {
                 if let Some(conversation) = &self.conversation {
                     conversation.recorder.close().await;
                 }
@@ -718,7 +1058,7 @@ impl SessionExecutorActor {
 
             tokio::select! {
                 biased;
-                completion = self.completions.recv(), if self.active_publication.is_some() => match completion {
+                completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() => match completion {
                     Some(completion) => {
                         if let Err(fatality) = self.handle_completion(completion).await {
                             normal_exit = false;
@@ -745,6 +1085,7 @@ impl SessionExecutorActor {
         if let Some(worker_task) = active.worker_task.take() {
             let _ = worker_task.wait().await;
         }
+        self.turn_admission_gate.close();
         self.closing.cancel();
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
@@ -755,13 +1096,21 @@ impl SessionExecutorActor {
         self.finish_active_waiter(&active.waiter);
     }
 
-    fn handle_request(
+    async fn handle_request(
         &mut self,
         request: &mut SessionExecutorRequest,
     ) -> Result<(), ActorFatality> {
         match request {
             SessionExecutorRequest::Snapshot(request) => {
+                #[cfg(test)]
+                self.hooks.before_snapshot_response().await;
                 request.settle(Ok(Arc::clone(&self.current)));
+            }
+            SessionExecutorRequest::Subscribe(request) => {
+                request.settle(Ok(SessionExecutorSubscription {
+                    snapshot: Arc::clone(&self.current),
+                    receiver: self.events.subscribe(),
+                }));
             }
             #[cfg(test)]
             SessionExecutorRequest::StartingProbe(request) => {
@@ -774,8 +1123,223 @@ impl SessionExecutorActor {
             SessionExecutorRequest::Update(request) => {
                 self.start_publication(request)?;
             }
+            SessionExecutorRequest::Submit(request) => {
+                self.start_admission(request)?;
+            }
         }
         Ok(())
+    }
+
+    fn start_admission(&mut self, request: &mut SubmitRequest) -> Result<(), ActorFatality> {
+        if self.active_publication.is_some()
+            || self.active_admission.is_some()
+            || self.active_turn.is_some()
+            || !self.execution_state.is_idle()
+        {
+            request.settle(Err(SessionSubmitError::SessionBusy));
+            return Ok(());
+        }
+        let (Some(conversation), Some(resources)) =
+            (self.conversation.clone(), self.turn_resources.clone())
+        else {
+            request.settle(Err(SessionSubmitError::DependencyUnavailable));
+            return Ok(());
+        };
+        let Some(intent) = request.intent.take() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let turn_id = TurnId::generate().map_err(|_| ActorFatality::Internal)?;
+        let command_id = request.command_id;
+        let waiter = request.response.take();
+        self.execution_state = SessionExecutionState::Starting;
+        let current = Arc::new(self.current.with_execution(
+            SessionExecutionState::Starting,
+            None,
+            self.current.last_terminal(),
+        ));
+        self.publish_current(current);
+        self.active_admission = Some(ActiveAdmission {
+            command_id,
+            turn_id,
+            waiter,
+            task: None,
+        });
+
+        let completion_sender = self.completion_sender.clone();
+        let durable_state = self.durable_state.clone();
+        let definition = Arc::clone(self.current.definition());
+        let workspace = Arc::clone(self.current.workspace());
+        let prompt_service = Arc::clone(&self.prompt_service);
+        let closing = self.closing.clone();
+        let turn_admission_gate = Arc::clone(&self.turn_admission_gate);
+        #[cfg(test)]
+        let hooks = Arc::clone(&self.hooks);
+        let guard = AdmissionCompletionGuard::new(completion_sender, turn_id);
+        let worker = async move {
+            let mut guard = guard;
+            let result = run_admission(AdmissionWork {
+                closing,
+                durable_state,
+                definition,
+                workspace,
+                prompt_service,
+                resources,
+                conversation,
+                turn_admission_gate,
+                turn_id,
+                intent,
+                #[cfg(test)]
+                hooks,
+            })
+            .await;
+            guard.complete(result);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.active_admission
+                    .as_mut()
+                    .expect("admission is installed before spawn")
+                    .task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {}
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                self.task_context.request_closing();
+                self.durable_state.request_closing();
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_admission_completion(
+        &mut self,
+        completion: AdmissionCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(mut active) = self.active_admission.take() else {
+            return Err(ActorFatality::Internal);
+        };
+        let task_result = match active.task.take() {
+            Some(task) => task.wait().await,
+            None => Ok(()),
+        };
+        if task_result.is_err() || active.turn_id != completion.turn_id {
+            if let Some(waiter) = active.waiter.take() {
+                let _ = waiter.send(Err(SessionSubmitError::InternalDispatchUnavailable));
+            }
+            return Err(ActorFatality::Internal);
+        }
+
+        let context = match completion.result {
+            Ok(context) => context,
+            Err(error) => {
+                self.execution_state = SessionExecutionState::Idle;
+                let current = Arc::new(self.current.with_execution(
+                    SessionExecutionState::Idle,
+                    None,
+                    self.current.last_terminal(),
+                ));
+                self.publish_current(current);
+                if let Some(waiter) = active.waiter.take() {
+                    let _ = waiter.send(Err(error));
+                }
+                return Ok(());
+            }
+        };
+
+        let Some(conversation) = self.conversation.as_ref().cloned() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let Some(resources) = self.turn_resources.as_ref().cloned() else {
+            return Err(ActorFatality::Integrity);
+        };
+        self.execution_state = SessionExecutionState::Running;
+        let current = Arc::new(self.current.with_execution(
+            SessionExecutionState::Running,
+            Some(active.turn_id),
+            self.current.last_terminal(),
+        ));
+        self.publish_current(current);
+        self.active_turn = Some(ActiveTurn {
+            command_id: active.command_id,
+            turn_id: active.turn_id,
+            task: None,
+        });
+
+        let completion_sender = self.completion_sender.clone();
+        let turn_id = active.turn_id;
+        let guard = TurnCompletionGuard::new(completion_sender, turn_id);
+        let worker = async move {
+            let mut guard = guard;
+            let terminal =
+                run_active_turn(context, resources.model_gateway, conversation, turn_id).await;
+            guard.complete(terminal);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.active_turn
+                    .as_mut()
+                    .expect("active Turn is installed before spawn")
+                    .task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {}
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                self.task_context.request_closing();
+                self.durable_state.request_closing();
+            }
+        }
+        if let Some(waiter) = active.waiter.take() {
+            let _ = waiter.send(Ok(active.turn_id));
+        }
+        Ok(())
+    }
+
+    async fn handle_turn_completion(
+        &mut self,
+        completion: TurnCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(mut active) = self.active_turn.take() else {
+            return Err(ActorFatality::Internal);
+        };
+        let task_result = match active.task.take() {
+            Some(task) => task.wait().await,
+            None => Ok(()),
+        };
+        if active.turn_id != completion.turn_id {
+            return Err(ActorFatality::Internal);
+        }
+        let Some(conversation) = self.conversation.as_ref() else {
+            return Err(ActorFatality::Integrity);
+        };
+        let live_turn = lock(&conversation.live_state).current_turn();
+        if live_turn == Some(active.turn_id) {
+            lock(&conversation.live_state)
+                .fail_current_turn(active.turn_id)
+                .map_err(|_| ActorFatality::Integrity)?;
+        } else if live_turn.is_some() {
+            return Err(ActorFatality::Integrity);
+        }
+        if task_result.is_err() {
+            self.task_context.request_closing();
+            self.durable_state.request_closing();
+        }
+        self.execution_state = SessionExecutionState::Idle;
+        let current = Arc::new(self.current.with_execution(
+            SessionExecutionState::Idle,
+            None,
+            Some((active.turn_id, completion.terminal)),
+        ));
+        self.publish_current(current);
+        let _ = self.events.send(Arc::new(SessionExecutorEvent {
+            timestamp: SystemClock.now(),
+            command_id: active.command_id,
+            turn_id: active.turn_id,
+            terminal: completion.terminal,
+            snapshot: Arc::clone(&self.current),
+        }));
+        if task_result.is_err() {
+            Err(ActorFatality::Internal)
+        } else {
+            Ok(())
+        }
     }
 
     fn start_publication(
@@ -914,6 +1478,21 @@ impl SessionExecutorActor {
 
     async fn handle_completion(
         &mut self,
+        completion: ExecutorCompletion,
+    ) -> Result<(), ActorFatality> {
+        match completion {
+            ExecutorCompletion::Publication(completion) => {
+                self.handle_publication_completion(completion).await
+            }
+            ExecutorCompletion::Admission(completion) => {
+                self.handle_admission_completion(completion).await
+            }
+            ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
+        }
+    }
+
+    async fn handle_publication_completion(
+        &mut self,
         completion: PublicationCompletion,
     ) -> Result<(), ActorFatality> {
         let Some(mut active) = self.active_publication.take() else {
@@ -956,11 +1535,15 @@ impl SessionExecutorActor {
                         self.close_for_fatal(ActorFatality::Integrity);
                         return Err(ActorFatality::Integrity);
                     }
-                    self.current = Arc::new(SessionExecutorSnapshot::new(
-                        definition,
-                        snapshot,
-                        self.execution_state,
-                    ));
+                    let current = Arc::new(
+                        SessionExecutorSnapshot::new(definition, snapshot, self.execution_state)
+                            .with_execution(
+                                self.execution_state,
+                                self.current.current_turn(),
+                                self.current.last_terminal(),
+                            ),
+                    );
+                    self.publish_current(current);
                 }
                 active.waiter.settle(Ok(outcome));
                 self.finish_active_waiter(&active.waiter);
@@ -975,6 +1558,7 @@ impl SessionExecutorActor {
                     self.close_for_fatal(ActorFatality::Internal);
                     return Err(ActorFatality::Internal);
                 } else if matches!(error, SessionWorkspaceDefinitionError::Closing) {
+                    self.turn_admission_gate.close();
                     self.closing.cancel();
                 }
                 active.waiter.settle(Err(error));
@@ -1098,6 +1682,7 @@ impl SessionExecutorActor {
     }
 
     fn close_for_fatal(&mut self, _fatality: ActorFatality) {
+        self.turn_admission_gate.close();
         self.closing.cancel();
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
@@ -1111,11 +1696,17 @@ impl SessionExecutorActor {
     }
 
     fn install_current_state(&mut self, execution_state: SessionExecutionState) {
-        self.current = Arc::new(SessionExecutorSnapshot::new(
-            Arc::clone(self.current.definition()),
-            Arc::clone(self.current.workspace()),
+        let current = Arc::new(self.current.with_execution(
             execution_state,
+            self.current.current_turn(),
+            self.current.last_terminal(),
         ));
+        self.publish_current(current);
+    }
+
+    fn publish_current(&mut self, current: Arc<SessionExecutorSnapshot>) {
+        self.current = Arc::clone(&current);
+        *lock(&self.published_snapshot) = current;
     }
 }
 
@@ -1131,9 +1722,25 @@ fn valid_durable_definition_shape(
         && returned.workspace().revision() == expected.workspace().revision()
 }
 
+enum ExecutorCompletion {
+    Publication(PublicationCompletion),
+    Admission(AdmissionCompletion),
+    Turn(TurnCompletion),
+}
+
 struct PublicationCompletion {
     permit: SessionDefinitionPublicationPermit,
     result: PublicationCompletionResult,
+}
+
+struct AdmissionCompletion {
+    turn_id: TurnId,
+    result: Result<Arc<TurnExecutionContext>, SessionSubmitError>,
+}
+
+struct TurnCompletion {
+    turn_id: TurnId,
+    terminal: SessionTurnTerminal,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -1153,6 +1760,292 @@ enum CompletionHandling {
     ),
     Ordinary(SessionWorkspaceDefinitionError),
     Fatal(ActorFatality),
+}
+
+struct AdmissionWork {
+    closing: CancellationToken,
+    durable_state: DurableState,
+    definition: Arc<SessionDefinition>,
+    workspace: Arc<WorkspaceSnapshot>,
+    prompt_service: Arc<PromptService>,
+    resources: TurnResources,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_admission_gate: Arc<TurnAdmissionGate>,
+    turn_id: TurnId,
+    intent: PromptIntent,
+    #[cfg(test)]
+    hooks: Arc<SessionExecutorTestHooksInner>,
+}
+
+async fn run_admission(
+    work: AdmissionWork,
+) -> Result<Arc<TurnExecutionContext>, SessionSubmitError> {
+    let AdmissionWork {
+        closing,
+        durable_state,
+        definition,
+        workspace,
+        prompt_service,
+        resources,
+        conversation,
+        turn_admission_gate,
+        turn_id,
+        intent,
+        #[cfg(test)]
+        hooks,
+    } = work;
+    if closing.is_cancelled() {
+        return Err(SessionSubmitError::Closing);
+    }
+    let agent_read = durable_state.read_agent_definition(definition.agent());
+    tokio::pin!(agent_read);
+    let agent = tokio::select! {
+        biased;
+        _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        result = &mut agent_read => result,
+    }
+    .map_err(map_agent_definition_read_error)?;
+    let context = TurnExecutionContext::capture(TurnContextCapture {
+        turn_id,
+        session: definition,
+        agent,
+        workspace,
+        prompt_service,
+        prompt_resources: resources.prompt_resources,
+        model_gateway: resources.model_gateway,
+        model_catalog: resources.model_catalog,
+    })
+    .map_err(map_turn_context_capture_error)?;
+    let message = context
+        .resolve_user_message(intent)
+        .await
+        .map_err(map_submit_prompt_error)?;
+    if lock(&conversation.live_state).session_id() != context.session_id() {
+        return Err(SessionSubmitError::InternalDispatchUnavailable);
+    }
+    if closing.is_cancelled() {
+        return Err(SessionSubmitError::Closing);
+    }
+    let item_id = ItemId::generate().map_err(map_id_generation_error)?;
+    let admission = durable_state
+        .acquire_agent_admission(context.agent())
+        .await
+        .map_err(map_agent_admission_error)?;
+    #[cfg(test)]
+    hooks.after_agent_admission_before_input().await;
+    let fact = {
+        let _admission = admission;
+        let _turn_admission = turn_admission_gate
+            .try_enter()
+            .ok_or(SessionSubmitError::Closing)?;
+        if closing.is_cancelled() {
+            return Err(SessionSubmitError::Closing);
+        }
+        let mut live_state = lock(&conversation.live_state);
+        live_state
+            .apply_user_message(
+                StoredUserMessage::reconstruct(item_id, UserMessageSource::Input, message),
+                turn_id,
+                SystemClock.now(),
+            )
+            .map_err(|_| SessionSubmitError::InternalDispatchUnavailable)?
+    };
+    let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+    Ok(context)
+}
+
+async fn run_active_turn(
+    context: Arc<TurnExecutionContext>,
+    model_gateway: Arc<ModelGateway>,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_id: TurnId,
+) -> SessionTurnTerminal {
+    if context.turn_id() != turn_id {
+        return SessionTurnTerminal::Failed(SessionTurnFailure::Internal);
+    }
+    let result = run_active_turn_inner(
+        Arc::clone(&context),
+        model_gateway,
+        Arc::clone(&conversation),
+        turn_id,
+    )
+    .await;
+    match result {
+        Ok(entry) => {
+            let _ = conversation.recorder.record(entry).await;
+            SessionTurnTerminal::Completed
+        }
+        Err(failure) => {
+            let settled = lock(&conversation.live_state).fail_current_turn(turn_id);
+            if settled.is_err() {
+                SessionTurnTerminal::Failed(SessionTurnFailure::Internal)
+            } else {
+                SessionTurnTerminal::Failed(failure)
+            }
+        }
+    }
+}
+
+async fn run_active_turn_inner(
+    context: Arc<TurnExecutionContext>,
+    model_gateway: Arc<ModelGateway>,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_id: TurnId,
+) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
+    let captured = lock(&conversation.live_state)
+        .capture_conversation_views()
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    let source_revision = captured.conversation().revision();
+    let assembled = context
+        .assemble_agent_run(captured.conversation())
+        .map_err(map_turn_prompt_error)?;
+    let request = ModelCallRequest::new(
+        Arc::clone(context.model()),
+        ModelCallPurpose::AgentRun,
+        assembled,
+        source_revision,
+        None,
+    )
+    .map(Arc::new)
+    .map_err(map_model_request_error)?;
+    let result = model_gateway
+        .generate_model_turn(
+            request,
+            ModelProgressPublisher::discard(),
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| match error.reason() {
+            ModelCallErrorReason::ContextOverflow => SessionTurnFailure::ContextOverflow,
+            ModelCallErrorReason::Cancelled
+            | ModelCallErrorReason::ModelUnavailable
+            | ModelCallErrorReason::AuthMissing
+            | ModelCallErrorReason::AuthRejected
+            | ModelCallErrorReason::RateLimited
+            | ModelCallErrorReason::QuotaExceeded
+            | ModelCallErrorReason::UnsupportedCapability
+            | ModelCallErrorReason::InvalidRequest
+            | ModelCallErrorReason::SafetyBlocked
+            | ModelCallErrorReason::Timeout
+            | ModelCallErrorReason::TransportUnavailable
+            | ModelCallErrorReason::ProviderUnavailable
+            | ModelCallErrorReason::ProviderRejected
+            | ModelCallErrorReason::RequestOutcomeUnknown
+            | ModelCallErrorReason::StreamInterrupted
+            | ModelCallErrorReason::UnexpectedToolCall
+            | ModelCallErrorReason::InvalidStructuredOutput
+            | ModelCallErrorReason::InvalidProviderResponse
+            | ModelCallErrorReason::IncompleteResponse => SessionTurnFailure::Model,
+        })?;
+    let response = result.response();
+    let mut content = Vec::with_capacity(response.content().len());
+    for block in response.content() {
+        let item_id = ItemId::generate().map_err(|_| SessionTurnFailure::Internal)?;
+        match block {
+            FinalizedAssistantContent::Reasoning(reasoning) => {
+                content.push(StoredAssistantContent::Reasoning {
+                    item_id,
+                    content: reasoning.clone(),
+                });
+            }
+            FinalizedAssistantContent::Text { text } => {
+                content.push(StoredAssistantContent::Text {
+                    item_id,
+                    text: Arc::clone(text),
+                });
+            }
+        }
+    }
+    let body = StoredAssistantMessage::reconstruct(
+        AssistantDisposition::Final,
+        content,
+        response.model().clone(),
+        response.response_id().cloned(),
+        response.finish_reason(),
+        response.effective_max_output_tokens(),
+        response.usage().cloned(),
+        0,
+        response.metadata().clone(),
+    )
+    .map_err(|_| SessionTurnFailure::Internal)?;
+    let fact = lock(&conversation.live_state)
+        .complete_with_assistant_message(body, turn_id, SystemClock.now())
+        .map_err(|_| SessionTurnFailure::Internal)?;
+    Ok(Arc::clone(fact.entry()))
+}
+
+fn map_agent_definition_read_error(error: DurableAgentDefinitionReadError) -> SessionSubmitError {
+    match error {
+        DurableAgentDefinitionReadError::Closing => SessionSubmitError::Closing,
+        DurableAgentDefinitionReadError::AgentNotFound
+        | DurableAgentDefinitionReadError::RevisionUnavailable => {
+            SessionSubmitError::AgentUnavailable
+        }
+        DurableAgentDefinitionReadError::StorageUnavailable => {
+            SessionSubmitError::DependencyUnavailable
+        }
+        DurableAgentDefinitionReadError::InternalDispatchUnavailable => {
+            SessionSubmitError::InternalDispatchUnavailable
+        }
+    }
+}
+
+fn map_turn_context_capture_error(error: TurnContextCaptureError) -> SessionSubmitError {
+    match error {
+        TurnContextCaptureError::InvalidBinding => SessionSubmitError::InternalDispatchUnavailable,
+        TurnContextCaptureError::Model(_) => SessionSubmitError::DependencyUnavailable,
+        TurnContextCaptureError::Prompt => SessionSubmitError::Prompt,
+    }
+}
+
+fn map_submit_prompt_error(error: PromptError) -> SessionSubmitError {
+    match error.kind() {
+        PromptErrorKind::ContextLimitExceeded => SessionSubmitError::ContextOverflow,
+        PromptErrorKind::SourceDiscovery
+        | PromptErrorKind::ContentLoad
+        | PromptErrorKind::DuplicateKey
+        | PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::RequiredPromptMissing => SessionSubmitError::Prompt,
+        PromptErrorKind::InvalidIntent | PromptErrorKind::InvalidContribution => {
+            SessionSubmitError::InvalidArgument
+        }
+    }
+}
+
+fn map_agent_admission_error(error: AgentAdmissionError) -> SessionSubmitError {
+    match error {
+        AgentAdmissionError::Closing => SessionSubmitError::Closing,
+        AgentAdmissionError::AgentUnavailable => SessionSubmitError::AgentUnavailable,
+    }
+}
+
+fn map_id_generation_error(_error: IdGenerationError) -> SessionSubmitError {
+    SessionSubmitError::InternalDispatchUnavailable
+}
+
+fn map_turn_prompt_error(error: PromptError) -> SessionTurnFailure {
+    match error.kind() {
+        PromptErrorKind::ContextLimitExceeded => SessionTurnFailure::ContextOverflow,
+        PromptErrorKind::SourceDiscovery
+        | PromptErrorKind::ContentLoad
+        | PromptErrorKind::DuplicateKey
+        | PromptErrorKind::PromptUnavailable
+        | PromptErrorKind::InvalidRole
+        | PromptErrorKind::RequiredPromptMissing
+        | PromptErrorKind::InvalidIntent
+        | PromptErrorKind::InvalidContribution => SessionTurnFailure::Prompt,
+    }
+}
+
+fn map_model_request_error(
+    error: crate::model_gateway::ModelRequestValidationError,
+) -> SessionTurnFailure {
+    match error.kind() {
+        ModelRequestValidationErrorKind::AssemblyMismatch
+        | ModelRequestValidationErrorKind::InvalidOutputLimit
+        | ModelRequestValidationErrorKind::UnsupportedInput => SessionTurnFailure::Internal,
+    }
 }
 
 async fn run_publication(
@@ -1366,6 +2259,56 @@ struct SnapshotRequest {
         Option<oneshot::Sender<Result<Arc<SessionExecutorSnapshot>, SessionExecutorSnapshotError>>>,
 }
 
+struct SubmitRequest {
+    command_id: CommandId,
+    intent: Option<PromptIntent>,
+    response: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
+}
+
+struct SubscribeRequest {
+    response:
+        Option<oneshot::Sender<Result<SessionExecutorSubscription, SessionExecutorSnapshotError>>>,
+}
+
+impl SubscribeRequest {
+    fn settle(
+        &mut self,
+        outcome: Result<SessionExecutorSubscription, SessionExecutorSnapshotError>,
+    ) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionExecutorSnapshotError::Closing));
+    }
+}
+
+impl Drop for SubscribeRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+impl SubmitRequest {
+    fn settle(&mut self, outcome: Result<TurnId, SessionSubmitError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionSubmitError::Closing));
+    }
+}
+
+impl Drop for SubmitRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
 impl SnapshotRequest {
     fn settle(
         &mut self,
@@ -1415,6 +2358,8 @@ impl Drop for StartingProbeRequest {
 enum SessionExecutorRequest {
     Update(WorkspaceDefinitionRequest),
     Snapshot(SnapshotRequest),
+    Submit(SubmitRequest),
+    Subscribe(SubscribeRequest),
     #[cfg(test)]
     StartingProbe(StartingProbeRequest),
 }
@@ -1424,6 +2369,8 @@ impl SessionExecutorRequest {
         match self {
             Self::Update(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
+            Self::Submit(request) => request.reject_closing(),
+            Self::Subscribe(request) => request.reject_closing(),
             #[cfg(test)]
             Self::StartingProbe(request) => request.reject_closing(),
         }
@@ -1502,6 +2449,7 @@ struct ActorExitGuard {
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     failure_state: Arc<ActorFailureState>,
+    turn_admission_gate: Arc<TurnAdmissionGate>,
     armed: bool,
 }
 
@@ -1511,12 +2459,14 @@ impl ActorExitGuard {
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         failure_state: Arc<ActorFailureState>,
+        turn_admission_gate: Arc<TurnAdmissionGate>,
     ) -> Self {
         Self {
             closing,
             task_context,
             durable_state,
             failure_state,
+            turn_admission_gate,
             armed: true,
         }
     }
@@ -1531,6 +2481,7 @@ impl Drop for ActorExitGuard {
         if !self.armed {
             return;
         }
+        self.turn_admission_gate.close();
         self.closing.cancel();
         self.failure_state.mark_fatal();
         self.task_context.request_closing();
@@ -1545,16 +2496,96 @@ impl Drop for ActorExitGuard {
 }
 
 struct PublicationCompletionGuard {
-    completion_sender: mpsc::UnboundedSender<PublicationCompletion>,
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     permit: Option<SessionDefinitionPublicationPermit>,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     settled: bool,
 }
 
+struct AdmissionCompletionGuard {
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    turn_id: TurnId,
+    completed: bool,
+}
+
+impl AdmissionCompletionGuard {
+    fn new(completion_sender: mpsc::UnboundedSender<ExecutorCompletion>, turn_id: TurnId) -> Self {
+        Self {
+            completion_sender,
+            turn_id,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, result: Result<Arc<TurnExecutionContext>, SessionSubmitError>) {
+        self.completed = true;
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::Admission(AdmissionCompletion {
+                turn_id: self.turn_id,
+                result,
+            }));
+    }
+}
+
+impl Drop for AdmissionCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::Admission(AdmissionCompletion {
+                turn_id: self.turn_id,
+                result: Err(SessionSubmitError::InternalDispatchUnavailable),
+            }));
+    }
+}
+
+struct TurnCompletionGuard {
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    turn_id: TurnId,
+    completed: bool,
+}
+
+impl TurnCompletionGuard {
+    fn new(completion_sender: mpsc::UnboundedSender<ExecutorCompletion>, turn_id: TurnId) -> Self {
+        Self {
+            completion_sender,
+            turn_id,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, terminal: SessionTurnTerminal) {
+        self.completed = true;
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::Turn(TurnCompletion {
+                turn_id: self.turn_id,
+                terminal,
+            }));
+    }
+}
+
+impl Drop for TurnCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::Turn(TurnCompletion {
+                turn_id: self.turn_id,
+                terminal: SessionTurnTerminal::Failed(SessionTurnFailure::Internal),
+            }));
+    }
+}
+
 impl PublicationCompletionGuard {
     fn new(
-        completion_sender: mpsc::UnboundedSender<PublicationCompletion>,
+        completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
         permit: SessionDefinitionPublicationPermit,
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
@@ -1573,9 +2604,12 @@ impl PublicationCompletionGuard {
             .permit
             .take()
             .expect("a publication completion guard sends exactly once");
-        let _ = self
-            .completion_sender
-            .send(PublicationCompletion { permit, result });
+        let _ =
+            self.completion_sender
+                .send(ExecutorCompletion::Publication(PublicationCompletion {
+                    permit,
+                    result,
+                }));
         self.settled = true;
     }
 }
@@ -1597,9 +2631,12 @@ impl Drop for PublicationCompletionGuard {
                 SessionWorkspaceDefinitionError::InternalDispatchUnavailable,
             )
         };
-        let _ = self
-            .completion_sender
-            .send(PublicationCompletion { permit, result });
+        let _ =
+            self.completion_sender
+                .send(ExecutorCompletion::Publication(PublicationCompletion {
+                    permit,
+                    result,
+                }));
         self.settled = true;
     }
 }
@@ -1618,6 +2655,36 @@ pub(crate) struct SessionExecutorTestHooks {
 
 #[cfg(test)]
 impl SessionExecutorTestHooks {
+    pub(crate) fn arm_before_snapshot_response(&self) {
+        self.inner.before_snapshot_response.arm();
+    }
+
+    pub(crate) async fn wait_before_snapshot_response(&self) {
+        self.inner
+            .before_snapshot_response
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_snapshot_response(&self) {
+        self.inner.before_snapshot_response.release();
+    }
+
+    pub(crate) fn arm_after_agent_admission_before_input(&self) {
+        self.inner.after_agent_admission_before_input.arm();
+    }
+
+    pub(crate) async fn wait_after_agent_admission_before_input(&self) {
+        self.inner
+            .after_agent_admission_before_input
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_agent_admission_before_input(&self) {
+        self.inner.after_agent_admission_before_input.release();
+    }
+
     pub(crate) fn arm_after_candidate_snapshot_finish_before_durable(&self) {
         self.inner.after_snapshot_finish.arm();
     }
@@ -1658,6 +2725,8 @@ impl SessionExecutorTestHooks {
 
 #[cfg(test)]
 struct SessionExecutorTestHooksInner {
+    before_snapshot_response: Arc<NamedAsyncBarrier>,
+    after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
     after_commit_before_install: Arc<NamedAsyncBarrier>,
     settled: Arc<SettlementNotification>,
@@ -1668,11 +2737,23 @@ struct SessionExecutorTestHooksInner {
 impl SessionExecutorTestHooksInner {
     fn new() -> Self {
         Self {
+            before_snapshot_response: Arc::new(NamedAsyncBarrier::new()),
+            after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
             settled: Arc::new(SettlementNotification::new()),
             fail_next_install_after_commit: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    async fn before_snapshot_response(&self) {
+        self.before_snapshot_response.wait_if_armed().await;
+    }
+
+    async fn after_agent_admission_before_input(&self) {
+        self.after_agent_admission_before_input
+            .wait_if_armed()
+            .await;
     }
 
     async fn after_candidate_snapshot_finish_before_durable(&self) {
@@ -1814,7 +2895,10 @@ mod tests {
 
     use tokio::runtime::Handle;
 
+    use crate::conversation_storage::load_replayed_conversation_with_barrier_for_test;
     use crate::durable_state::DurableState;
+    use crate::model_gateway::ScriptedModelFixture;
+    use crate::prompt::{PromptBodyIntent, TextIntent};
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::{CanonicalFileUri, FileUriFamily, SessionId};
     use crate::workspace::{
@@ -2124,6 +3208,221 @@ mod tests {
         // DurableState closes the shared owner; retaining this explicit field makes the fixture's
         // ownership visible and prevents accidental detached context tasks in future test edits.
         let _ = loaded.context;
+    }
+
+    async fn wait_for_terminal(executor: &SessionExecutor, turn_id: TurnId) -> SessionTurnTerminal {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = executor.snapshot().await.unwrap();
+                if let Some((completed_turn, terminal)) = snapshot.last_terminal() {
+                    assert_eq!(completed_turn, turn_id);
+                    return terminal;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the scripted Turn reaches terminal state")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ordinary_scripted_turn_records_and_replays_user_and_final_assistant() {
+        let store = TempStore::new();
+        let agent_definition_path = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let agent_definition = fs::read(&agent_definition_path).unwrap();
+        create_file(
+            &agent_definition_path,
+            &replace_fixture(
+                &agent_definition,
+                r#""promptIds":["base","safety"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let session_definition_path = store
+            .session_path()
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let session_definition = fs::read(&session_definition_path).unwrap();
+        create_file(
+            &session_definition_path,
+            &replace_fixture(
+                &session_definition,
+                r#""promptIds":["base","session-notes"]"#,
+                r#""promptIds":[]"#,
+            ),
+        );
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        let model = ScriptedModelFixture::new(vec!["scripted answer"]);
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let definition = state.session_current_definition(session_id).unwrap();
+        let candidate = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap();
+        let workspace = candidate.finish(Arc::from([]), Arc::from([])).unwrap();
+        let loaded = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources(
+                context.clone(),
+                state.clone(),
+                Arc::clone(&resolver),
+                Arc::clone(&prompt_service),
+                prompt_resources,
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+            ),
+            Arc::clone(&definition),
+            workspace,
+            LoadedSessionConversation::from_replay(
+                loaded.live_state,
+                loaded.recorder,
+                loaded.diagnostics,
+            ),
+        )
+        .unwrap();
+        let mut subscription = executor.subscribe().await.unwrap();
+        assert_eq!(
+            subscription.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let command_id = CommandId::generate().unwrap();
+        let turn_id = executor
+            .submit(
+                command_id,
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("hello runtime").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.command_id(), command_id);
+        assert_eq!(event.turn_id(), turn_id);
+        assert_eq!(event.terminal(), SessionTurnTerminal::Completed);
+        assert_eq!(event.snapshot().current_turn(), None);
+        assert_eq!(
+            event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert_eq!(model.request_count(), 1);
+        let live_state = executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            assert_eq!(live.current_turn(), None);
+            assert_eq!(
+                live.capture_conversation_views()
+                    .unwrap()
+                    .conversation()
+                    .messages()
+                    .len(),
+                2
+            );
+        }
+        executor.close().await.unwrap();
+
+        let replayed = load_replayed_conversation_with_barrier_for_test(
+            state.open_conversation_target(session_id).await.unwrap(),
+            context.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed.live_state.current_turn(), None);
+        assert_eq!(
+            replayed
+                .live_state
+                .capture_conversation_views()
+                .unwrap()
+                .conversation()
+                .messages()
+                .len(),
+            2
+        );
+
+        let workspace = resolver
+            .resolve(session_id, definition.workspace())
+            .await
+            .unwrap()
+            .finish(Arc::from([]), Arc::from([]))
+            .unwrap();
+        let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources(
+                context.clone(),
+                state.clone(),
+                resolver,
+                Arc::clone(&prompt_service),
+                prompt_service.initialize().await.unwrap(),
+                Arc::clone(model.gateway()),
+                Arc::clone(model.catalog()),
+            ),
+            definition,
+            workspace,
+            LoadedSessionConversation::from_replay(
+                replayed.live_state,
+                replayed.recorder,
+                replayed.diagnostics,
+            ),
+        )
+        .unwrap();
+        let failed_turn = executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("second request").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_for_terminal(&executor, failed_turn).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 2);
+        let live_state = executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            assert_eq!(live.current_turn(), None);
+            assert_eq!(
+                live.capture_conversation_views()
+                    .unwrap()
+                    .conversation()
+                    .messages()
+                    .len(),
+                3
+            );
+        }
+        executor.close().await.unwrap();
+        state.close().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
