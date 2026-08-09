@@ -10,7 +10,8 @@ use thiserror::Error;
 use crate::agent_session_lifecycle::AgentRevisionRef;
 use crate::live_conversation::{ConversationRevision, LiveConversationView};
 use crate::model_gateway::{
-    ModelCallPurpose, OutputContract, ReasoningContent, TurnModelRef, TurnModelSnapshot,
+    ModelCallPurpose, OutputContract, ReasoningContent, TokenEstimator, TurnModelRef,
+    TurnModelSnapshot,
 };
 use crate::skills::{SkillId, SkillPromptView};
 use crate::tools::{ToolCallId, ToolName, ToolPromptView, ToolResultContent};
@@ -1102,6 +1103,84 @@ pub(crate) struct PromptSet {
     model: Arc<TurnModelSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AgentRunCompactionAssemblyBasis {
+    fixed_input_tokens: u64,
+    rolling_summary_message_overhead_tokens: u64,
+    estimator: TokenEstimator,
+}
+
+impl AgentRunCompactionAssemblyBasis {
+    pub(crate) const fn fixed_input_tokens(self) -> u64 {
+        self.fixed_input_tokens
+    }
+
+    pub(crate) const fn rolling_summary_message_overhead_tokens(self) -> u64 {
+        self.rolling_summary_message_overhead_tokens
+    }
+
+    pub(crate) const fn estimator(self) -> TokenEstimator {
+        self.estimator
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        fixed_input_tokens: u64,
+        rolling_summary_message_overhead_tokens: u64,
+        estimator: TokenEstimator,
+    ) -> Self {
+        Self {
+            fixed_input_tokens,
+            rolling_summary_message_overhead_tokens,
+            estimator,
+        }
+    }
+}
+
+#[derive(Clone)]
+#[allow(
+    dead_code,
+    reason = "structural fields are consumed by the adjacent M10 summary assembly proof slice"
+)]
+pub(crate) struct CompactionSummaryAssemblyBasis {
+    fixed_prompt_tokens: u64,
+    system_sections: Arc<[PromptSection]>,
+    output_contract: OutputContract,
+    estimator: TokenEstimator,
+}
+
+#[allow(
+    dead_code,
+    reason = "structural getters are consumed by the adjacent M10 summary assembly proof slice"
+)]
+impl CompactionSummaryAssemblyBasis {
+    pub(crate) const fn fixed_prompt_tokens(&self) -> u64 {
+        self.fixed_prompt_tokens
+    }
+
+    pub(crate) fn system_sections(&self) -> &[PromptSection] {
+        &self.system_sections
+    }
+
+    pub(crate) const fn output_contract(&self) -> &OutputContract {
+        &self.output_contract
+    }
+
+    pub(crate) const fn estimator(&self) -> TokenEstimator {
+        self.estimator
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(fixed_prompt_tokens: u64, estimator: TokenEstimator) -> Self {
+        Self {
+            fixed_prompt_tokens,
+            system_sections: Arc::from([]),
+            output_contract: OutputContract::NoToolCalls,
+            estimator,
+        }
+    }
+}
+
 #[allow(
     dead_code,
     reason = "the PromptSet profile is consumed by M6.2 final model-context assembly"
@@ -1142,6 +1221,73 @@ impl PromptSet {
             .map_err(|_| PromptError::new(PromptErrorKind::InvalidIntent))
     }
 
+    pub(crate) fn agent_run_compaction_assembly_basis(
+        &self,
+    ) -> Result<AgentRunCompactionAssemblyBasis, PromptError> {
+        let mut messages = Vec::with_capacity(self.profile.user_context.len());
+        for section in &*self.profile.user_context {
+            messages.push(
+                ModelMessage::unstamped_user_text(Arc::from(section.text()))
+                    .map_err(|_| PromptError::new(PromptErrorKind::InvalidContribution))?,
+            );
+        }
+        let bytes = canonical_model_context_bytes(
+            &self.profile.system,
+            &messages,
+            self.tools.specs(),
+            None,
+        )
+        .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let estimator = self.model.token_estimator();
+        let fixed_input_tokens = estimator
+            .checked_estimate_utf8_bytes(
+                u64::try_from(bytes)
+                    .map_err(|_| PromptError::new(PromptErrorKind::ContextLimitExceeded))?,
+            )
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let rolling_summary_message_overhead_tokens = estimator
+            .checked_estimate_utf8_bytes(rolling_summary_message_envelope_bytes())
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        Ok(AgentRunCompactionAssemblyBasis {
+            fixed_input_tokens,
+            rolling_summary_message_overhead_tokens,
+            estimator,
+        })
+    }
+
+    pub(crate) fn compaction_summary_assembly_basis(
+        &self,
+    ) -> Result<CompactionSummaryAssemblyBasis, PromptError> {
+        let system_sections: Arc<[PromptSection]> = self
+            .profile
+            .system
+            .iter()
+            .filter(|section| section.kind() == PromptSectionKind::RuntimeRequired)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+        if system_sections.len() != 1 {
+            return Err(PromptError::new(PromptErrorKind::RequiredPromptMissing));
+        }
+        let output_contract = OutputContract::NoToolCalls;
+        let bytes =
+            canonical_model_context_bytes(&system_sections, &[], &[], Some(&output_contract))
+                .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let estimator = self.model.token_estimator();
+        let fixed_prompt_tokens = estimator
+            .checked_estimate_utf8_bytes(
+                u64::try_from(bytes)
+                    .map_err(|_| PromptError::new(PromptErrorKind::ContextLimitExceeded))?,
+            )
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        Ok(CompactionSummaryAssemblyBasis {
+            fixed_prompt_tokens,
+            system_sections,
+            output_contract,
+            estimator,
+        })
+    }
+
     pub(crate) fn assemble(
         &self,
         input: PromptAssemblyInput<'_>,
@@ -1165,7 +1311,7 @@ impl PromptSet {
         let canonical_bytes = canonical_model_context_bytes(
             &self.profile.system,
             &messages,
-            &self.tools,
+            self.tools.specs(),
             output_contract.as_ref(),
         )
         .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
@@ -1200,7 +1346,7 @@ impl PromptSet {
 fn canonical_model_context_bytes(
     system: &[PromptSection],
     messages: &[ModelMessage],
-    tools: &ToolPromptView,
+    tools: &[crate::tools::ToolSpec],
     output_contract: Option<&OutputContract>,
 ) -> Option<usize> {
     let mut bytes = r#"{"system":["#.len();
@@ -1216,7 +1362,7 @@ fn canonical_model_context_bytes(
         add_model_message(&mut bytes, message)?;
     }
     add_literal(&mut bytes, r#"],"tools":["#)?;
-    for (index, definition) in tools.specs().iter().enumerate() {
+    for (index, definition) in tools.iter().enumerate() {
         add_separator(&mut bytes, index)?;
         add_literal(&mut bytes, r#"{"name":"#)?;
         add_json_string(&mut bytes, definition.name().as_str())?;
@@ -1233,6 +1379,11 @@ fn canonical_model_context_bytes(
     }
     add_literal(&mut bytes, "}")?;
     Some(bytes)
+}
+
+fn rolling_summary_message_envelope_bytes() -> u64 {
+    u64::try_from(r#",{"role":"user","content":[""]}"#.len())
+        .expect("rolling summary envelope length fits u64")
 }
 
 fn add_model_message(bytes: &mut usize, message: &ModelMessage) -> Option<()> {
@@ -1928,6 +2079,12 @@ impl ModelMessage {
                 content,
             },
         }
+    }
+
+    pub(crate) fn compaction_estimated_tokens(&self, estimator: TokenEstimator) -> Option<u64> {
+        let mut bytes = 1_usize;
+        add_model_message(&mut bytes, self)?;
+        estimator.checked_estimate_utf8_bytes(u64::try_from(bytes).ok()?)
     }
 }
 
@@ -3394,5 +3551,40 @@ mod tests {
         assert!(proof.turn_model().is_exact(&model_ref));
         assert_eq!(proof.source_revision(), views.conversation().revision());
         assert_eq!(proof.output_contract(), Some(&output_contract));
+
+        let agent_basis = set.agent_run_compaction_assembly_basis().unwrap();
+        let stable_tokens = views.compaction_source().units()[0]
+            .messages()
+            .iter()
+            .map(|message| {
+                message
+                    .compaction_estimated_tokens(agent_basis.estimator())
+                    .unwrap()
+            })
+            .sum::<u64>();
+        let exact_agent_bytes = canonical_model_context_bytes(
+            &set.profile.system,
+            assembled.messages(),
+            set.tools.specs(),
+            None,
+        )
+        .unwrap();
+        let exact_agent_tokens = agent_basis
+            .estimator()
+            .checked_estimate_utf8_bytes(u64::try_from(exact_agent_bytes).unwrap())
+            .unwrap();
+        assert!(agent_basis.fixed_input_tokens() + stable_tokens >= exact_agent_tokens);
+
+        let summary_basis = set.compaction_summary_assembly_basis().unwrap();
+        assert_eq!(summary_basis.system_sections().len(), 1);
+        assert_eq!(
+            summary_basis.system_sections()[0].text(),
+            "required system policy"
+        );
+        assert_eq!(
+            summary_basis.output_contract(),
+            &OutputContract::NoToolCalls
+        );
+        assert_eq!(summary_basis.estimator(), agent_basis.estimator());
     }
 }

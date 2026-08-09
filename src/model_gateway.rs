@@ -368,6 +368,11 @@ impl TokenEstimator {
         let divisor = u64::from(self.rate.bytes_per_token.get());
         bytes.saturating_add(divisor - 1) / divisor
     }
+
+    pub(crate) fn checked_estimate_utf8_bytes(self, bytes: u64) -> Option<u64> {
+        let divisor = u64::from(self.rate.bytes_per_token.get());
+        bytes.checked_add(divisor - 1).map(|value| value / divisor)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -722,17 +727,32 @@ impl TurnModelSnapshot {
 
     #[cfg(test)]
     pub(crate) fn test_fixture(context_window_tokens: Option<NonZeroU32>) -> Arc<Self> {
+        Self::test_fixture_with_policy(
+            context_window_tokens,
+            NonZeroU32::new(8_192),
+            NonZeroU32::new(4_096).expect("non-zero fixture output limit"),
+            NonZeroU32::new(3).expect("non-zero fixture estimate rate"),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture_with_policy(
+        context_window_tokens: Option<NonZeroU32>,
+        model_max_output_tokens: Option<NonZeroU32>,
+        generation_max_output_tokens: NonZeroU32,
+        bytes_per_token: NonZeroU32,
+    ) -> Arc<Self> {
         let owner = Arc::new(ModelGatewayOwner);
         let identity = Arc::new(TurnModelIdentity);
-        let limits = EffectiveModelLimits::new(context_window_tokens, NonZeroU32::new(8_192));
+        let limits = EffectiveModelLimits::new(context_window_tokens, model_max_output_tokens);
         let definition = ModelDefinition::new(
             ModelSelection::new("fixture".parse().unwrap(), "fixture".parse().unwrap()),
             ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
             ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
             limits,
-            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1).unwrap(),
+            TokenEstimateRate::new(bytes_per_token, 1).unwrap(),
             ModelGenerationDefaults::new(
-                NonZeroU32::new(4_096).unwrap(),
+                generation_max_output_tokens,
                 ModelReasoningSummary::ProviderDefault,
                 ModelServiceClass::Standard,
             ),

@@ -1,9 +1,12 @@
 use std::error::Error;
 use std::fs;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use minicore_runtime::{MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError};
+use minicore_runtime::{
+    CompactionSettings, MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError,
+};
 use tokio::runtime::{Builder, Handle};
 
 static NEXT_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -716,6 +719,7 @@ fn runtime_initialization_errors_and_debug_output_are_redacted() {
     assert!(Error::source(&actual_error).is_none());
 
     for error in [
+        RuntimeInitializationError::InvalidConfiguration,
         RuntimeInitializationError::RuntimeDependencyUnavailable,
         RuntimeInitializationError::StoreInUse,
         RuntimeInitializationError::UnsupportedStoreFormat,
@@ -729,4 +733,27 @@ fn runtime_initialization_errors_and_debug_output_are_redacted() {
         assert!(!error.to_string().contains("No such file"));
         assert!(Error::source(&error).is_none());
     }
+}
+
+#[test]
+fn runtime_rejects_invalid_compaction_settings_before_opening_storage() {
+    let root = TempRoot::new();
+    let host = Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("the host runtime builds");
+    let settings = CompactionSettings {
+        summary_min_output_tokens: NonZeroU32::new(2_049).unwrap(),
+        ..CompactionSettings::default()
+    };
+
+    let error = host
+        .block_on(MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()).with_compaction_settings(settings),
+            host.handle().clone(),
+        ))
+        .expect_err("invalid compaction settings are rejected");
+
+    assert_eq!(error, RuntimeInitializationError::InvalidConfiguration);
+    assert!(!root.path().exists());
 }

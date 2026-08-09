@@ -9,6 +9,7 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
 use crate::agent_session_lifecycle::{SealedSessionCreateAttempt, SealedSessionLifecycleAttempt};
+use crate::compaction::CompactionSettings;
 use crate::durable_state::{DurableOpenError, DurableSessionCreateError, DurableState};
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
@@ -52,11 +53,20 @@ const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's r
 #[non_exhaustive]
 pub struct MiniCoreRuntimeConfig {
     durable_root: PathBuf,
+    compaction: CompactionSettings,
 }
 
 impl MiniCoreRuntimeConfig {
     pub fn new(durable_root: PathBuf) -> Self {
-        Self { durable_root }
+        Self {
+            durable_root,
+            compaction: CompactionSettings::default(),
+        }
+    }
+
+    pub fn with_compaction_settings(mut self, compaction: CompactionSettings) -> Self {
+        self.compaction = compaction;
+        self
     }
 }
 
@@ -69,6 +79,7 @@ impl fmt::Debug for MiniCoreRuntimeConfig {
 /// A closed, redacted failure result from runtime initialization.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum RuntimeInitializationError {
+    InvalidConfiguration,
     RuntimeDependencyUnavailable,
     StoreInUse,
     UnsupportedStoreFormat,
@@ -80,6 +91,7 @@ pub enum RuntimeInitializationError {
 impl fmt::Debug for RuntimeInitializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidConfiguration => "InvalidConfiguration",
             Self::RuntimeDependencyUnavailable => "RuntimeDependencyUnavailable",
             Self::StoreInUse => "StoreInUse",
             Self::UnsupportedStoreFormat => "UnsupportedStoreFormat",
@@ -93,6 +105,7 @@ impl fmt::Debug for RuntimeInitializationError {
 impl fmt::Display for RuntimeInitializationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::InvalidConfiguration => "runtime configuration is invalid",
             Self::RuntimeDependencyUnavailable => "runtime dependency unavailable",
             Self::StoreInUse => "durable store is already in use",
             Self::UnsupportedStoreFormat => "durable store format is unsupported",
@@ -137,6 +150,10 @@ impl MiniCoreRuntime {
         handle: Handle,
         model_resources: Option<(Arc<ModelGateway>, Arc<ModelCatalogView>)>,
     ) -> Result<Self, RuntimeInitializationError> {
+        let compaction = config
+            .compaction
+            .validate()
+            .map_err(|_| RuntimeInitializationError::InvalidConfiguration)?;
         let task_context = RuntimeTaskContext::new(handle)
             .await
             .map_err(|_| RuntimeInitializationError::RuntimeDependencyUnavailable)?;
@@ -191,6 +208,7 @@ impl MiniCoreRuntime {
             Arc::clone(&prompt_resources),
             Arc::clone(&model_gateway),
             Arc::clone(&model_catalog),
+            compaction,
         ) {
             Ok(session_residency) => Arc::new(session_residency),
             Err(error) => {

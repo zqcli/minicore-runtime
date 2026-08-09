@@ -23,6 +23,7 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
     SessionDefinitionDecisionError, SessionLifecycle,
 };
+use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
 use crate::conversation_storage::{
     ConversationReplayDiagnostics, RecordingHealth, SessionRecorder, SessionRecordingError,
     StoredAssistantContent, StoredAssistantMessage, StoredEntryBody, StoredToolMessage,
@@ -706,6 +707,7 @@ struct TurnResources {
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
     tool_set: Arc<ToolSet>,
+    compaction: CompactionSettingsSnapshot,
 }
 
 pub(crate) struct SessionExecutorDependencies {
@@ -752,6 +754,36 @@ impl SessionExecutorDependencies {
         model_catalog: Arc<ModelCatalogView>,
         tool_set: Arc<ToolSet>,
     ) -> Self {
+        Self::with_turn_resources_and_tools_and_compaction(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            tool_set,
+            CompactionSettings::default()
+                .validate()
+                .expect("default compaction settings are valid"),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn resource bundle binds the exact runtime owners and settings"
+    )]
+    pub(crate) fn with_turn_resources_and_tools_and_compaction(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_set: Arc<ToolSet>,
+        compaction: CompactionSettingsSnapshot,
+    ) -> Self {
         Self {
             task_context,
             durable_state,
@@ -762,6 +794,7 @@ impl SessionExecutorDependencies {
                 model_gateway,
                 model_catalog,
                 tool_set,
+                compaction,
             }),
         }
     }
@@ -3981,6 +4014,7 @@ async fn run_admission(
         model_gateway: resources.model_gateway,
         model_catalog: resources.model_catalog,
         tool_set: resources.tool_set,
+        compaction: resources.compaction,
     })
     .map_err(map_turn_context_capture_error)?;
     let message = tokio::select! {

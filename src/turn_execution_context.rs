@@ -4,13 +4,19 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::{AgentDefinition, AgentRevisionRef, SessionDefinition};
+use crate::compaction::{
+    Compaction, CompactionError, CompactionModelBasis, CompactionPlan, CompactionPlanInput,
+    CompactionPressure, CompactionPressureInput, CompactionSettingsSnapshot, CompactionTrigger,
+    LiveCompactionSourceView,
+};
 use crate::live_conversation::LiveConversationView;
 use crate::model_gateway::{
     ModelCatalogView, ModelGateway, ModelResolutionErrorKind, ResolveTurnModelRequest,
     TurnModelSnapshot,
 };
 use crate::prompt::{
-    AssembledModelContext, CanonicalUserMessage, PromptAssemblyInput, PromptError, PromptIntent,
+    AgentRunCompactionAssemblyBasis, AssembledModelContext, CanonicalUserMessage,
+    CompactionSummaryAssemblyBasis, PromptAssemblyInput, PromptError, PromptIntent,
     PromptResourceView, PromptService, PromptSet, PromptTurnContext,
 };
 use crate::skills::SkillView;
@@ -38,6 +44,7 @@ pub(crate) struct TurnContextCapture {
     pub(crate) model_gateway: Arc<ModelGateway>,
     pub(crate) model_catalog: Arc<ModelCatalogView>,
     pub(crate) tool_set: Arc<ToolSet>,
+    pub(crate) compaction: CompactionSettingsSnapshot,
 }
 
 pub(crate) struct TurnExecutionContext {
@@ -51,6 +58,10 @@ pub(crate) struct TurnExecutionContext {
     skill_view: Arc<SkillView>,
     tool_set: Arc<ToolSet>,
     prompt_set: Arc<PromptSet>,
+    compaction: CompactionSettingsSnapshot,
+    agent_run_compaction: AgentRunCompactionAssemblyBasis,
+    compaction_summary: CompactionSummaryAssemblyBasis,
+    compaction_model: CompactionModelBasis,
 }
 
 impl TurnExecutionContext {
@@ -92,6 +103,13 @@ impl TurnExecutionContext {
                 Arc::clone(&model),
             ))
             .map_err(|_| TurnContextCaptureError::Prompt)?;
+        let agent_run_compaction = prompt_set
+            .agent_run_compaction_assembly_basis()
+            .map_err(|_| TurnContextCaptureError::Prompt)?;
+        let compaction_summary = prompt_set
+            .compaction_summary_assembly_basis()
+            .map_err(|_| TurnContextCaptureError::Prompt)?;
+        let compaction_model = CompactionModelBasis::from_turn_model(&model);
 
         Ok(Arc::new(Self {
             session_id: input.session.session_id(),
@@ -104,6 +122,10 @@ impl TurnExecutionContext {
             skill_view,
             tool_set,
             prompt_set,
+            compaction: input.compaction,
+            agent_run_compaction,
+            compaction_summary,
+            compaction_model,
         }))
     }
 
@@ -121,6 +143,47 @@ impl TurnExecutionContext {
         self.prompt_set
             .assemble(PromptAssemblyInput::agent_run(conversation, None))
             .map(Arc::new)
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
+    )]
+    pub(crate) fn compaction_pressure(
+        &self,
+        source: &LiveCompactionSourceView,
+        trigger: CompactionTrigger,
+        compactions_started: u8,
+    ) -> CompactionPressure {
+        Compaction.pressure(CompactionPressureInput {
+            source,
+            settings: &self.compaction,
+            agent_run: &self.agent_run_compaction,
+            model: &self.compaction_model,
+            trigger,
+            compactions_started,
+        })
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
+    )]
+    pub(crate) fn plan_compaction(
+        &self,
+        source: Arc<LiveCompactionSourceView>,
+        trigger: CompactionTrigger,
+        compactions_started: u8,
+    ) -> Result<Arc<CompactionPlan>, CompactionError> {
+        Compaction.plan(CompactionPlanInput {
+            source,
+            settings: self.compaction.clone(),
+            agent_run: self.agent_run_compaction,
+            summary_assembly: self.compaction_summary.clone(),
+            model: self.compaction_model.clone(),
+            trigger,
+            compactions_started,
+        })
     }
 
     pub(crate) const fn tool_set(&self) -> &Arc<ToolSet> {
@@ -161,6 +224,7 @@ impl fmt::Debug for TurnExecutionContext {
             .field("skill_view", &self.skill_view)
             .field("tool_set", &self.tool_set)
             .field("prompt_set", &self.prompt_set)
+            .field("compaction", &self.compaction)
             .finish_non_exhaustive()
     }
 }
@@ -173,6 +237,7 @@ mod tests {
     use crate::agent_session_lifecycle::{
         AgentDefinition, AgentRevisionRef, SessionDefinition, SessionModelConfig,
     };
+    use crate::compaction::CompactionSettings;
     use crate::model_gateway::{
         ModelResolutionErrorKind, ModelSelection, ReasoningPreference, ScriptedModelFixture,
     };
@@ -291,6 +356,10 @@ mod tests {
         let (session, agent, workspace, prompt_service, prompt_resources, model) =
             capture_parts(selected_session_id, selected_agent_id, 7, 9).await;
 
+        let compaction_settings = CompactionSettings {
+            pressure_reserve_tokens: NonZeroU32::new(1_234).unwrap(),
+            ..CompactionSettings::default()
+        };
         let context = TurnExecutionContext::capture(TurnContextCapture {
             turn_id: turn_id(1),
             session,
@@ -301,6 +370,7 @@ mod tests {
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
             tool_set: ToolSet::empty(),
+            compaction: compaction_settings.validate().unwrap(),
         })
         .unwrap();
 
@@ -308,6 +378,13 @@ mod tests {
         assert_eq!(context.turn_id(), turn_id(1));
         assert_eq!(context.agent().agent_id(), selected_agent_id);
         assert_eq!(context.agent().revision().get(), 7);
+        assert_eq!(context.compaction.pressure_reserve_tokens().get(), 1_234);
+        let future_settings = CompactionSettings {
+            pressure_reserve_tokens: NonZeroU32::new(9_999).unwrap(),
+            ..compaction_settings
+        };
+        assert_eq!(future_settings.pressure_reserve_tokens.get(), 9_999);
+        assert_eq!(context.compaction.pressure_reserve_tokens().get(), 1_234);
         let message = context
             .resolve_user_message(
                 PromptIntent::new(
@@ -343,6 +420,7 @@ mod tests {
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
             tool_set: ToolSet::empty(),
+            compaction: CompactionSettings::default().validate().unwrap(),
         });
         assert_eq!(result.unwrap_err(), TurnContextCaptureError::InvalidBinding);
 
@@ -362,6 +440,7 @@ mod tests {
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(model.catalog()),
             tool_set: ToolSet::empty(),
+            compaction: CompactionSettings::default().validate().unwrap(),
         });
         assert_eq!(result.unwrap_err(), TurnContextCaptureError::InvalidBinding);
 
@@ -376,6 +455,7 @@ mod tests {
             model_gateway: Arc::clone(model.gateway()),
             model_catalog: Arc::clone(other_model.catalog()),
             tool_set: ToolSet::empty(),
+            compaction: CompactionSettings::default().validate().unwrap(),
         });
         assert_eq!(
             result.unwrap_err(),
