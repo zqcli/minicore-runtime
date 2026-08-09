@@ -135,6 +135,8 @@ pub(crate) enum SessionResidencySnapshotError {
 pub(crate) enum SessionResidencySubmitError {
     #[error("session residency is closing")]
     Closing,
+    #[error("the Submit command conflicts with an in-flight command")]
+    CommandConflict,
     #[error("Session is not loaded")]
     SessionNotLoaded,
     #[error("session execution is busy")]
@@ -1849,6 +1851,7 @@ impl SessionResidencyRegistry {
             .await
             .map_err(|error| match error {
                 SessionSubmitError::Closing => SessionResidencySubmitError::Closing,
+                SessionSubmitError::CommandConflict => SessionResidencySubmitError::CommandConflict,
                 SessionSubmitError::SessionBusy => SessionResidencySubmitError::SessionBusy,
                 SessionSubmitError::DependencyUnavailable => {
                     SessionResidencySubmitError::DependencyUnavailable
@@ -1961,7 +1964,7 @@ impl SessionResidencyRegistry {
         session_id: SessionId,
         target: SessionCancelTarget,
         timestamp: Timestamp,
-    ) -> Result<(), SessionResidencyCancelError> {
+    ) -> Result<crate::session_execution::SessionCancelAccepted, SessionResidencyCancelError> {
         if self.closing.is_cancelled() {
             return Err(SessionResidencyCancelError::Closing);
         }

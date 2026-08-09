@@ -3818,6 +3818,7 @@ enum CommandOutcomeInput {
     SteerQueued(TurnIdInput),
     FollowUpQueued,
     QueuedMessageCancelled,
+    CancelAccepted(CancelAcceptedInput),
     CommandOutput,
 }
 
@@ -3833,6 +3834,10 @@ impl CommandOutcomeInput {
             },
             Self::FollowUpQueued => CommandOutcome::FollowUpQueued,
             Self::QueuedMessageCancelled => CommandOutcome::QueuedMessageCancelled,
+            Self::CancelAccepted(value) => CommandOutcome::CancelAccepted {
+                target: value.target.into_semantic(),
+                cancel_epoch: value.cancel_epoch.get(),
+            },
             Self::CommandOutput => CommandOutcome::CommandOutput,
         }
     }
@@ -3842,6 +3847,13 @@ impl CommandOutcomeInput {
 #[serde(rename_all = "camelCase")]
 struct TurnIdInput {
     turn_id: TurnId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelAcceptedInput {
+    target: PublicCancelTargetInput,
+    cancel_epoch: super::CanonicalU64,
 }
 
 #[derive(Deserialize)]
@@ -4099,6 +4111,7 @@ enum CommandOutcomeOutput {
     SteerQueued(TurnIdOutput),
     FollowUpQueued,
     QueuedMessageCancelled,
+    CancelAccepted(CancelAcceptedOutput),
     CommandOutput,
 }
 
@@ -4114,6 +4127,13 @@ impl CommandOutcomeOutput {
             }
             CommandOutcome::FollowUpQueued => Self::FollowUpQueued,
             CommandOutcome::QueuedMessageCancelled => Self::QueuedMessageCancelled,
+            CommandOutcome::CancelAccepted {
+                target,
+                cancel_epoch,
+            } => Self::CancelAccepted(CancelAcceptedOutput {
+                target: PublicCancelTargetOutput::from_semantic(*target),
+                cancel_epoch: super::CanonicalU64::new(*cancel_epoch),
+            }),
             CommandOutcome::CommandOutput => Self::CommandOutput,
         }
     }
@@ -4123,6 +4143,13 @@ impl CommandOutcomeOutput {
 #[serde(rename_all = "camelCase")]
 struct TurnIdOutput {
     turn_id: TurnId,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelAcceptedOutput {
+    target: PublicCancelTargetOutput,
+    cancel_epoch: super::CanonicalU64,
 }
 
 #[derive(Serialize)]
@@ -4690,6 +4717,15 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 Ok(())
             }
         }
+        "cancel_accepted" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_public_cancel_target(required(object, "target")?)?;
+            validate_canonical_u64(required(object, "cancelEpoch")?)?;
+            Ok(())
+        }
         "agent_created"
         | "agent_definition_updated"
         | "agent_metadata_updated"
@@ -4697,8 +4733,7 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "session_created"
         | "session_definition_updated"
         | "session_metadata_updated"
-        | "session_forked"
-        | "cancel_accepted" => pending_output_object(data),
+        | "session_forked" => pending_output_object(data),
         "steer_queued" => {
             let object = data
                 .ok_or_else(missing_required_field)?
@@ -4725,6 +4760,19 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         }
         _ => Err(unknown_output_variant()),
     })
+}
+
+fn validate_public_cancel_target(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let kind = required(object, "type")?
+        .as_str()
+        .ok_or_else(selected_wrong_json_type)?;
+    let data = required(object, "data")?;
+    match kind {
+        "submit" => validate_id::<CommandId>(data),
+        "turn" => validate_id::<TurnId>(data),
+        _ => Err(unknown_output_variant()),
+    }
 }
 
 fn validate_command_error(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {

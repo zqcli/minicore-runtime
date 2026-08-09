@@ -1,6 +1,7 @@
 use minicore_runtime::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandResponse, CommandValueError, PublicIngressLane, PublicSubject, RetryAdvice,
+    CommandResponse, CommandValueError, PublicCancelTarget, PublicIngressLane, PublicSubject,
+    RetryAdvice,
 };
 use minicore_runtime::skills::SkillId;
 use minicore_runtime::wire::{
@@ -82,6 +83,10 @@ fn queued_command_outcomes_round_trip_with_their_typed_shapes() {
         CommandOutcome::SteerQueued { turn_id },
         CommandOutcome::FollowUpQueued,
         CommandOutcome::QueuedMessageCancelled,
+        CommandOutcome::CancelAccepted {
+            target: PublicCancelTarget::Turn(turn_id),
+            cancel_epoch: 7,
+        },
     ] {
         let response = CommandResponse::new(
             command_id,

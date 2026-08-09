@@ -541,7 +541,15 @@ impl RuntimeInner {
                     .cancel(session_id, target, SystemClock.now())
                     .await
                 {
-                    Ok(()) => completed_output("cancel accepted"),
+                    Ok(accepted) => completed_outcome(CommandOutcome::CancelAccepted {
+                        target: match accepted.target() {
+                            SessionCancelTarget::Submit(command_id) => {
+                                PublicCancelTarget::Submit(command_id)
+                            }
+                            SessionCancelTarget::Turn(turn_id) => PublicCancelTarget::Turn(turn_id),
+                        },
+                        cancel_epoch: accepted.cancel_epoch(),
+                    }),
                     Err(error) => map_cancel_error(command_id, session_id, error)?,
                 }
             }
@@ -1136,6 +1144,12 @@ fn map_submit_error(
             "runtime is closing",
             retry_with_backoff(),
             Some(PublicSubject::Runtime),
+        ),
+        SessionResidencySubmitError::CommandConflict => rejected_completion(
+            CommandErrorCode::CommandConflict,
+            "the command conflicts with an in-flight command",
+            RetryAdvice::DoNotRetry,
+            subject,
         ),
         SessionResidencySubmitError::SessionNotLoaded => rejected_completion(
             CommandErrorCode::SessionNotLoaded,
@@ -2761,7 +2775,16 @@ mod tests {
             ))
             .await
             .expect("Cancel dispatches while Submit is Starting");
-        assert_eq!(command_output(&cancel), "cancel accepted");
+        assert!(matches!(
+            cancel.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::CancelAccepted {
+                    target: PublicCancelTarget::Submit(cancelled_command),
+                    ..
+                },
+                output: None,
+            } if *cancelled_command == submit_command_id
+        ));
         hooks.release_after_agent_admission_before_input();
 
         let submit = submit.await.expect("Submit settles after cancellation");
@@ -2771,6 +2794,195 @@ mod tests {
                 outcome: CommandOutcome::SubmitCancelled,
                 output: None,
             }
+        ));
+        assert_eq!(model.request_count(), 0);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_duplicate_in_flight_submit_joins_and_conflict_is_typed() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["one shared model attempt"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let residency = runtime.inner.residency().unwrap();
+        let executor = residency.executor_for_test(session_id).unwrap();
+        let hooks = executor.test_hooks();
+        hooks.arm_after_agent_admission_before_input();
+        drop(executor);
+        drop(residency);
+
+        let command_id: CommandId = "cmd_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap();
+        let intent = PromptIntent::new(
+            PromptBodyIntent::Text(TextIntent::new("shared public submit").unwrap()),
+            Vec::new(),
+        )
+        .unwrap();
+        let mut first = Box::pin(runtime.dispatch(CommandRequest::new(
+            command_id,
+            RuntimeCommand::Turn(TurnCommand::Submit {
+                session_id,
+                intent: intent.clone(),
+            }),
+        )));
+        assert!(poll_once_pending(first.as_mut()).await);
+        hooks.wait_after_agent_admission_before_input().await;
+
+        let mut duplicate = Box::pin(runtime.dispatch(CommandRequest::new(
+            command_id,
+            RuntimeCommand::Turn(TurnCommand::Submit {
+                session_id,
+                intent: intent.clone(),
+            }),
+        )));
+        assert!(poll_once_pending(duplicate.as_mut()).await);
+        let conflict = runtime
+            .dispatch(CommandRequest::new(
+                command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("different public submit").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("conflicting duplicate dispatches");
+        assert!(matches!(
+            conflict.completion(),
+            CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::CommandConflict
+        ));
+
+        hooks.release_after_agent_admission_before_input();
+        let first = first.await.expect("first Submit settles");
+        let duplicate = duplicate.await.expect("duplicate Submit settles");
+        let first_turn = started_turn(&first);
+        assert_eq!(started_turn(&duplicate), first_turn);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_cancel_returns_idempotent_epoch_and_finishing_snapshot() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let residency = runtime.inner.residency().unwrap();
+        let executor = residency.executor_for_test(session_id).unwrap();
+        let hooks = executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        drop(executor);
+        drop(residency);
+
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("public Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_88888888888888888888888888888888".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cancel running").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        let residency = runtime.inner.residency().unwrap();
+        let executor = residency.executor_for_test(session_id).unwrap();
+        hooks.wait_before_agent_run_attempt().await;
+        drop(executor);
+        drop(residency);
+
+        let cancel = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_99999999999999999999999999999999".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id,
+                    target: PublicCancelTarget::Turn(turn_id),
+                }),
+            ))
+            .await
+            .expect("public Cancel dispatches");
+        let cancel_epoch = match cancel.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::CancelAccepted {
+                        target: PublicCancelTarget::Turn(cancelled_turn),
+                        cancel_epoch,
+                    },
+                output: None,
+            } if *cancelled_turn == turn_id => *cancel_epoch,
+            completion => panic!("unexpected Cancel completion: {completion:?}"),
+        };
+
+        let SnapshotResponse::Session(snapshot) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("Finishing snapshot is available")
+        else {
+            panic!("the public Session snapshot returns a Session view");
+        };
+        assert_eq!(snapshot.execution(), SessionExecutionView::Finishing);
+
+        let duplicate = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id,
+                    target: PublicCancelTarget::Turn(turn_id),
+                }),
+            ))
+            .await
+            .expect("duplicate Cancel dispatches");
+        assert!(matches!(
+            duplicate.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::CancelAccepted {
+                    target: PublicCancelTarget::Turn(cancelled_turn),
+                    cancel_epoch: duplicate_epoch,
+                },
+                output: None,
+            } if *cancelled_turn == turn_id && *duplicate_epoch == cancel_epoch
+        ));
+
+        hooks.release_before_agent_run_attempt();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("the cancelled Turn reaches terminal state")
+            .expect("the subscription remains open");
+        assert!(matches!(
+            terminal,
+            EventFrame::State(event)
+                if event.msg().session_kind() == Some(SessionStateEventKind::TurnInterrupted)
         ));
         assert_eq!(model.request_count(), 0);
         runtime.shutdown().await;

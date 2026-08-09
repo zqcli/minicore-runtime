@@ -617,6 +617,8 @@ pub(crate) enum SessionExecutorStartError {
 pub(crate) enum SessionSubmitError {
     #[error("session executor is closing")]
     Closing,
+    #[error("the Submit command conflicts with an in-flight command")]
+    CommandConflict,
     #[error("session execution is busy")]
     SessionBusy,
     #[error("loaded session execution dependencies are unavailable")]
@@ -641,6 +643,22 @@ pub(crate) enum SessionSubmitError {
 pub(crate) enum SessionCancelTarget {
     Submit(CommandId),
     Turn(TurnId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionCancelAccepted {
+    target: SessionCancelTarget,
+    cancel_epoch: u64,
+}
+
+impl SessionCancelAccepted {
+    pub(crate) const fn target(self) -> SessionCancelTarget {
+        self.target
+    }
+
+    pub(crate) const fn cancel_epoch(self) -> u64 {
+        self.cancel_epoch
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -1270,7 +1288,7 @@ impl SessionExecutor {
         &self,
         target: SessionCancelTarget,
         timestamp: Timestamp,
-    ) -> Result<(), SessionCancelError> {
+    ) -> Result<SessionCancelAccepted, SessionCancelError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::Cancel(CancelRequest {
             target,
@@ -1617,10 +1635,20 @@ struct ActiveAdmission {
     command_id: CommandId,
     turn_id: TurnId,
     emergency: crate::session_ingress::EmergencyControlObservation,
-    waiter: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
+    intent: PromptIntent,
+    waiters: Vec<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
     cancellation: CancellationToken,
     security_revocation: CancellationToken,
+    cancel_accepted: Option<SessionCancelAccepted>,
     task: Option<TrackedTask>,
+}
+
+impl ActiveAdmission {
+    fn settle(&mut self, outcome: Result<TurnId, SessionSubmitError>) {
+        for waiter in self.waiters.drain(..) {
+            let _ = waiter.send(outcome);
+        }
+    }
 }
 
 struct ActiveTurn {
@@ -1629,6 +1657,7 @@ struct ActiveTurn {
     control_generation: Arc<ControlGeneration>,
     emergency: crate::session_ingress::EmergencyControlObservation,
     cancellation: CancellationToken,
+    cancel_accepted: Option<SessionCancelAccepted>,
     task: Option<TrackedTask>,
     steer_admission_open: bool,
 }
@@ -1975,6 +2004,23 @@ impl SessionExecutorActor {
     }
 
     fn start_admission(&mut self, request: &mut SubmitRequest) -> Result<(), ActorFatality> {
+        if let Some(active) = self.active_admission.as_mut() {
+            if active.command_id == request.command_id {
+                let Some(intent) = request.intent.as_ref() else {
+                    return Err(ActorFatality::Integrity);
+                };
+                if intent != &active.intent {
+                    request.settle(Err(SessionSubmitError::CommandConflict));
+                    return Ok(());
+                }
+                let Some(waiter) = request.response.take() else {
+                    return Err(ActorFatality::Integrity);
+                };
+                active.waiters.push(waiter);
+                request.intent.take();
+                return Ok(());
+            }
+        }
         if self.active_publication.is_some()
             || self.active_admission.is_some()
             || self.active_turn.is_some()
@@ -1992,9 +2038,10 @@ impl SessionExecutorActor {
         let Some(intent) = request.intent.take() else {
             return Err(ActorFatality::Integrity);
         };
+        let admission_intent = intent.clone();
         let turn_id = TurnId::generate().map_err(|_| ActorFatality::Internal)?;
         let command_id = request.command_id;
-        let waiter = request.response.take();
+        let waiters = request.response.take().into_iter().collect();
         let emergency = self
             .emergency
             .bind(EmergencyControlTarget::Submit(command_id))
@@ -2003,9 +2050,11 @@ impl SessionExecutorActor {
             command_id,
             turn_id,
             emergency,
-            waiter,
+            intent: admission_intent,
+            waiters,
             cancellation: CancellationToken::new(),
             security_revocation: CancellationToken::new(),
+            cancel_accepted: None,
             task: None,
         });
         self.execution_state = SessionExecutionState::Starting;
@@ -2087,9 +2136,7 @@ impl SessionExecutorActor {
             None => Ok(()),
         };
         if task_result.is_err() || active.turn_id != completion.turn_id {
-            if let Some(waiter) = active.waiter.take() {
-                let _ = waiter.send(Err(SessionSubmitError::InternalDispatchUnavailable));
-            }
+            active.settle(Err(SessionSubmitError::InternalDispatchUnavailable));
             return Err(ActorFatality::Internal);
         }
 
@@ -2103,9 +2150,7 @@ impl SessionExecutorActor {
                     None,
                     self.current.last_terminal(),
                 );
-                if let Some(waiter) = active.waiter.take() {
-                    let _ = waiter.send(Err(error));
-                }
+                active.settle(Err(error));
                 return Ok(());
             }
         };
@@ -2134,9 +2179,14 @@ impl SessionExecutorActor {
         }
         let control_generation = Arc::new(ControlGeneration(0));
         conversation.install_control_generation(active.turn_id, Arc::clone(&control_generation));
-        self.execution_state = SessionExecutionState::Running;
+        let finishing = prior_signal.is_some() || active.cancel_accepted.is_some();
+        self.execution_state = if finishing {
+            SessionExecutionState::Finishing
+        } else {
+            SessionExecutionState::Running
+        };
         self.publish_execution_state(
-            SessionExecutionState::Running,
+            self.execution_state,
             Some(active.turn_id),
             self.current.last_terminal(),
         );
@@ -2146,6 +2196,7 @@ impl SessionExecutorActor {
             control_generation: Arc::clone(&control_generation),
             emergency,
             cancellation: cancellation.clone(),
+            cancel_accepted: active.cancel_accepted,
             task: None,
             steer_admission_open: true,
         });
@@ -2211,9 +2262,7 @@ impl SessionExecutorActor {
                 }
             }
         }
-        if let Some(waiter) = active.waiter.take() {
-            let _ = waiter.send(Ok(active.turn_id));
-        }
+        active.settle(Ok(active.turn_id));
         Ok(())
     }
 
@@ -2321,6 +2370,18 @@ impl SessionExecutorActor {
         match request.target {
             SessionCancelTarget::Submit(command_id) => {
                 let Some(active) = self.active_admission.as_ref() else {
+                    if let Some(active) = self.active_turn.as_ref() {
+                        if active.command_id == command_id {
+                            if let Some(accepted) = active.cancel_accepted {
+                                request.settle(if accepted.target == request.target {
+                                    Ok(accepted)
+                                } else {
+                                    Err(SessionCancelError::TurnCancelling)
+                                });
+                                return Ok(());
+                            }
+                        }
+                    }
                     request.settle(Err(SessionCancelError::SubmitNotCancellable));
                     return Ok(());
                 };
@@ -2328,13 +2389,44 @@ impl SessionExecutorActor {
                     request.settle(Err(SessionCancelError::SubmitNotCancellable));
                     return Ok(());
                 }
-                if active.cancellation.is_cancelled() {
-                    request.settle(Err(SessionCancelError::TurnCancelling));
+                if let Some(accepted) = active.cancel_accepted {
+                    request.settle(if accepted.target == request.target {
+                        Ok(accepted)
+                    } else {
+                        Err(SessionCancelError::TurnCancelling)
+                    });
                     return Ok(());
                 }
-                self.signal_emergency_cancel(EmergencyControlTarget::Submit(command_id))?;
-                active.cancellation.cancel();
-                request.settle(Ok(()));
+                let cancellation = active.cancellation.clone();
+                let signal = self.signal_user_cancel(EmergencyControlTarget::Submit(command_id))?;
+                let cancel_epoch = match signal {
+                    EmergencyControlSignalOutcome::Accepted { epoch } => epoch,
+                    EmergencyControlSignalOutcome::AlreadySignaled { .. } => {
+                        request.settle(Err(SessionCancelError::TurnCancelling));
+                        return Ok(());
+                    }
+                    EmergencyControlSignalOutcome::StaleTarget => {
+                        return Err(ActorFatality::Integrity);
+                    }
+                };
+                let accepted = SessionCancelAccepted {
+                    target: request.target,
+                    cancel_epoch,
+                };
+                self.active_admission
+                    .as_mut()
+                    .expect("the active admission remains installed")
+                    .cancel_accepted = Some(accepted);
+                if matches!(signal, EmergencyControlSignalOutcome::Accepted { .. }) {
+                    cancellation.cancel();
+                    self.execution_state = SessionExecutionState::Finishing;
+                    self.publish_execution_state(
+                        SessionExecutionState::Finishing,
+                        None,
+                        self.current.last_terminal(),
+                    );
+                }
+                request.settle(Ok(accepted));
             }
             SessionCancelTarget::Turn(turn_id) => {
                 if let Some(active) = self.active_admission.as_ref() {
@@ -2342,13 +2434,45 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionCancelError::ExpectedTurnMismatch));
                         return Ok(());
                     }
-                    if active.cancellation.is_cancelled() {
-                        request.settle(Err(SessionCancelError::TurnCancelling));
+                    if let Some(accepted) = active.cancel_accepted {
+                        request.settle(if accepted.target == request.target {
+                            Ok(accepted)
+                        } else {
+                            Err(SessionCancelError::TurnCancelling)
+                        });
                         return Ok(());
                     }
-                    self.signal_emergency_cancel(active.emergency.target())?;
-                    active.cancellation.cancel();
-                    request.settle(Ok(()));
+                    let emergency_target = active.emergency.target();
+                    let cancellation = active.cancellation.clone();
+                    let signal = self.signal_user_cancel(emergency_target)?;
+                    let cancel_epoch = match signal {
+                        EmergencyControlSignalOutcome::Accepted { epoch } => epoch,
+                        EmergencyControlSignalOutcome::AlreadySignaled { .. } => {
+                            request.settle(Err(SessionCancelError::TurnCancelling));
+                            return Ok(());
+                        }
+                        EmergencyControlSignalOutcome::StaleTarget => {
+                            return Err(ActorFatality::Integrity);
+                        }
+                    };
+                    let accepted = SessionCancelAccepted {
+                        target: request.target,
+                        cancel_epoch,
+                    };
+                    self.active_admission
+                        .as_mut()
+                        .expect("the active admission remains installed")
+                        .cancel_accepted = Some(accepted);
+                    if matches!(signal, EmergencyControlSignalOutcome::Accepted { .. }) {
+                        cancellation.cancel();
+                        self.execution_state = SessionExecutionState::Finishing;
+                        self.publish_execution_state(
+                            SessionExecutionState::Finishing,
+                            None,
+                            self.current.last_terminal(),
+                        );
+                    }
+                    request.settle(Ok(accepted));
                     return Ok(());
                 }
 
@@ -2369,14 +2493,44 @@ impl SessionExecutorActor {
                     request.settle(Err(SessionCancelError::ExpectedTurnMismatch));
                     return Ok(());
                 }
-                if active.cancellation.is_cancelled() {
-                    request.settle(Err(SessionCancelError::TurnCancelling));
+                if let Some(accepted) = active.cancel_accepted {
+                    request.settle(if accepted.target == request.target {
+                        Ok(accepted)
+                    } else {
+                        Err(SessionCancelError::TurnCancelling)
+                    });
                     return Ok(());
                 }
-                self.signal_emergency_cancel(active.emergency.target())?;
-                active.cancellation.cancel();
-                if !self.steer.clear_for_turn(turn_id).is_empty() {
-                    self.publish_queue_projection();
+                let emergency_target = active.emergency.target();
+                let cancellation = active.cancellation.clone();
+                let signal = self.signal_user_cancel(emergency_target)?;
+                let cancel_epoch = match signal {
+                    EmergencyControlSignalOutcome::Accepted { epoch } => epoch,
+                    EmergencyControlSignalOutcome::AlreadySignaled { .. } => {
+                        request.settle(Err(SessionCancelError::TurnCancelling));
+                        return Ok(());
+                    }
+                    EmergencyControlSignalOutcome::StaleTarget => {
+                        return Err(ActorFatality::Integrity);
+                    }
+                };
+                let accepted = SessionCancelAccepted {
+                    target: request.target,
+                    cancel_epoch,
+                };
+                self.active_turn
+                    .as_mut()
+                    .expect("the active turn remains installed")
+                    .cancel_accepted = Some(accepted);
+                if matches!(signal, EmergencyControlSignalOutcome::Accepted { .. }) {
+                    cancellation.cancel();
+                    self.execution_state = SessionExecutionState::Finishing;
+                    self.steer.clear_for_turn(turn_id);
+                    self.publish_execution_state(
+                        SessionExecutionState::Finishing,
+                        Some(turn_id),
+                        self.current.last_terminal(),
+                    );
                 }
                 let pending = self
                     .pending_interactions
@@ -2385,14 +2539,16 @@ impl SessionExecutorActor {
                         (interaction.turn_id == turn_id).then_some(*request_id)
                     })
                     .collect::<Vec<_>>();
-                request.settle(Ok(()));
-                for request_id in pending {
-                    self.cancel_pending_interaction(
-                        request_id,
-                        request.timestamp,
-                        InteractionCancelReason::TurnCancelled,
-                    )
-                    .await?;
+                request.settle(Ok(accepted));
+                if matches!(signal, EmergencyControlSignalOutcome::Accepted { .. }) {
+                    for request_id in pending {
+                        self.cancel_pending_interaction(
+                            request_id,
+                            request.timestamp,
+                            InteractionCancelReason::TurnCancelled,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -2502,6 +2658,20 @@ impl SessionExecutorActor {
         match self.emergency.signal(target, signal) {
             EmergencyControlSignalOutcome::Accepted { .. }
             | EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(()),
+            EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
+        }
+    }
+
+    fn signal_user_cancel(
+        &self,
+        target: EmergencyControlTarget,
+    ) -> Result<EmergencyControlSignalOutcome, ActorFatality> {
+        match self
+            .emergency
+            .signal(target, EmergencyControlSignal::Cancel)
+        {
+            outcome @ EmergencyControlSignalOutcome::Accepted { .. }
+            | outcome @ EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(outcome),
             EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
         }
     }
@@ -4923,7 +5093,7 @@ struct ResolveInteractionRequest {
 struct CancelRequest {
     target: SessionCancelTarget,
     timestamp: Timestamp,
-    response: Option<oneshot::Sender<Result<(), SessionCancelError>>>,
+    response: Option<oneshot::Sender<Result<SessionCancelAccepted, SessionCancelError>>>,
 }
 
 struct SecurityRevokedRequest {
@@ -4932,7 +5102,7 @@ struct SecurityRevokedRequest {
 }
 
 impl CancelRequest {
-    fn settle(&mut self, outcome: Result<(), SessionCancelError>) {
+    fn settle(&mut self, outcome: Result<SessionCancelAccepted, SessionCancelError>) {
         if let Some(response) = self.response.take() {
             let _ = response.send(outcome);
         }
@@ -6659,15 +6829,15 @@ mod tests {
             .await
             .unwrap();
         wait_for_request_count(&model, 1).await;
-        assert_eq!(
+        assert!(
             loaded
                 .executor
                 .cancel(
                     SessionCancelTarget::Turn(turn_id),
                     "2026-08-08T10:03:00.000Z".parse().unwrap(),
                 )
-                .await,
-            Ok(())
+                .await
+                .is_ok()
         );
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
@@ -7806,11 +7976,11 @@ mod tests {
                 .await,
             Err(SessionCancelError::ExpectedTurnMismatch)
         );
-        assert_eq!(
+        assert!(
             executor
                 .cancel(SessionCancelTarget::Turn(turn_id), timestamp)
-                .await,
-            Ok(())
+                .await
+                .is_ok()
         );
         assert!(
             executor
@@ -8058,11 +8228,11 @@ mod tests {
         let starting = executor.snapshot().await.unwrap();
         assert_eq!(starting.active_submit_command_id(), Some(command_id));
         let timestamp: Timestamp = "2026-08-08T10:02:00.000Z".parse().unwrap();
-        assert_eq!(
+        assert!(
             executor
                 .cancel(SessionCancelTarget::Submit(command_id), timestamp)
-                .await,
-            Ok(())
+                .await
+                .is_ok()
         );
         assert_eq!(
             executor
@@ -8079,6 +8249,54 @@ mod tests {
         assert_eq!(model.request_count(), 0);
         executor.close().await.unwrap();
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn duplicate_in_flight_submit_joins_and_conflicting_payload_is_rejected() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["one shared model attempt"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_after_agent_admission_before_input();
+        let command_id = CommandId::generate().unwrap();
+        let intent = PromptIntent::new(
+            PromptBodyIntent::Text(TextIntent::new("shared submit").unwrap()),
+            Vec::new(),
+        )
+        .unwrap();
+        let first_executor = loaded.executor.clone();
+        let first_intent = intent.clone();
+        let first =
+            tokio::spawn(async move { first_executor.submit(command_id, first_intent).await });
+        hooks.wait_after_agent_admission_before_input().await;
+
+        let mut second = Box::pin(loaded.executor.submit(command_id, intent.clone()));
+        assert!(poll_once_pending(second.as_mut()).await);
+        assert_eq!(
+            loaded
+                .executor
+                .submit(
+                    command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("conflicting submit").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(SessionSubmitError::CommandConflict)
+        );
+
+        hooks.release_after_agent_admission_before_input();
+        let first_turn = first.await.unwrap().unwrap();
+        let second_turn = second.await.unwrap();
+        assert_eq!(first_turn, second_turn);
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, first_turn).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8216,6 +8434,18 @@ mod tests {
                     Ok(())
                 );
             } else {
+                let accepted = loaded
+                    .executor
+                    .cancel(
+                        SessionCancelTarget::Submit(command_id),
+                        "2026-08-08T10:04:00.000Z".parse().unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    loaded.executor.snapshot().await.unwrap().execution_state(),
+                    SessionExecutionState::Finishing
+                );
                 assert_eq!(
                     loaded
                         .executor
@@ -8224,7 +8454,7 @@ mod tests {
                             "2026-08-08T10:04:00.000Z".parse().unwrap(),
                         )
                         .await,
-                    Ok(())
+                    Ok(accepted)
                 );
             }
             hooks.release_after_input_before_completion();
