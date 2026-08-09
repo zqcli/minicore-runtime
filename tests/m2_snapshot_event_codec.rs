@@ -1,6 +1,7 @@
 use minicore_runtime::runtime_interface::{
     EventFrame, EventRoute, RuntimeStateEventKind, RuntimeStatusView, SessionEventDetail,
-    SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnFailureView, TurnTerminalView,
+    SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnFailureView, TurnInterruptionView,
+    TurnTerminalView,
 };
 use minicore_runtime::wire::{
     BoundedJsonError, IncrementalRuntimeProtocolV1, ProtocolLimits, ProtocolVersion,
@@ -208,6 +209,31 @@ fn runtime_and_terminal_state_frames_round_trip_with_coherent_routes() {
             without_lf(&raw)
         );
     }
+
+    let interrupted_raw = fixture("valid/turn-interrupted-state-frame.json");
+    let interrupted = protocol.decode_event_frame(&interrupted_raw).unwrap();
+    let EventFrame::State(event) = &interrupted else {
+        panic!("interrupted fixture did not decode as state");
+    };
+    assert!(matches!(event.route(), EventRoute::Turn { .. }));
+    assert_eq!(
+        event.msg().session_kind(),
+        Some(SessionStateEventKind::TurnInterrupted)
+    );
+    assert!(matches!(
+        event.msg().session_detail(),
+        Some(SessionEventDetail::TurnTerminal {
+            terminal: TurnTerminalView::Interrupted {
+                reason: TurnInterruptionView::UserCancelled,
+                ..
+            },
+            ..
+        })
+    ));
+    assert_eq!(
+        protocol.encode_event_frame(&interrupted).unwrap(),
+        without_lf(&interrupted_raw)
+    );
 }
 
 #[test]
@@ -225,13 +251,7 @@ fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors()
     );
     assert_eq!(starting.queues().submit_admissions().len(), 1);
 
-    for path in [
-        "valid/active-session-snapshot-frame.json",
-        "valid/approval-session-snapshot-frame.json",
-        "valid/turn-interrupted-state-frame.json",
-        "valid/progress-frame.json",
-        "valid/closed-frame.json",
-    ] {
+    for path in ["valid/progress-frame.json", "valid/closed-frame.json"] {
         assert!(
             protocol
                 .decode_event_frame(&fixture(path))
@@ -265,19 +285,6 @@ fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors()
 #[test]
 fn known_pending_observations_do_not_validate_future_payloads() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
-    for path in [
-        "valid/active-session-snapshot-frame.json",
-        "valid/approval-session-snapshot-frame.json",
-    ] {
-        assert!(
-            protocol
-                .decode_event_frame(&fixture(path))
-                .unwrap_err()
-                .is_pending_public_target(),
-            "{path}"
-        );
-    }
-
     let mut starting: serde_json::Value =
         serde_json::from_slice(&fixture("valid/starting-session-snapshot-frame.json")).unwrap();
     starting["data"]["data"]["definition"]["agent"]["agentId"] =
@@ -293,12 +300,12 @@ fn known_pending_observations_do_not_validate_future_payloads() {
     let mut active: serde_json::Value =
         serde_json::from_slice(&fixture("valid/active-session-snapshot-frame.json")).unwrap();
     active["data"]["data"]["activeItems"][0]["content"]["data"] = serde_json::json!({});
-    assert!(
+    assert!(matches!(
         protocol
             .decode_event_frame(&serde_json::to_vec(&active).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
-    );
+            .unwrap_err(),
+        minicore_runtime::wire::TypedJsonError::TypedShape
+    ));
 
     let mut interrupted: serde_json::Value =
         serde_json::from_slice(&fixture("valid/turn-interrupted-state-frame.json")).unwrap();
@@ -306,11 +313,12 @@ fn known_pending_observations_do_not_validate_future_payloads() {
         serde_json::json!("ses_55555555555555555555555555555555");
     interrupted["data"]["msg"]["data"]["detail"]["data"]["terminal"]["data"]["reason"] =
         serde_json::json!("future-detail-is-not-validated");
-    assert!(
+    assert_fault(
         protocol
             .decode_event_frame(&serde_json::to_vec(&interrupted).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
+        PublicDecodeStage::SelectedSchema,
+        PublicDecodeCode::UnknownOutputVariant,
     );
 
     let mut wrong_future_route: serde_json::Value =
@@ -567,19 +575,14 @@ fn future_snapshot_classification_defers_owner_caps_and_usage_payloads() {
         IncrementalRuntimeProtocolV1::new(WireV1Codec::new(ProtocolVersion::V1_0, limits).unwrap());
 
     let active = fixture("valid/active-session-snapshot-frame.json");
-    assert!(
-        protocol
-            .decode_event_frame(&active)
-            .unwrap_err()
-            .is_pending_public_target()
-    );
+    assert_invalid_scalar(protocol.decode_event_frame(&active).unwrap_err());
 
     let mut active_usage: serde_json::Value = serde_json::from_slice(&active).unwrap();
     active_usage["data"]["data"]["usage"] = serde_json::json!({
         "modelCalls": "1"
     });
     assert!(
-        protocol
+        !protocol
             .decode_event_frame(&serde_json::to_vec(&active_usage).unwrap())
             .unwrap_err()
             .is_pending_public_target()
@@ -592,7 +595,7 @@ fn future_snapshot_classification_defers_owner_caps_and_usage_payloads() {
         "inputTokens": {"future": true}
     });
     assert!(
-        protocol
+        !protocol
             .decode_event_frame(&serde_json::to_vec(&token_usage).unwrap())
             .unwrap_err()
             .is_pending_public_target()

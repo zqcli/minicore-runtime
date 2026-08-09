@@ -1,13 +1,15 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel、M9.1–M9.16 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams、M9.17 public Steer/FollowUp/CancelQueuedMessage command/wire route、M9.18 public SessionQueueView/queue projection及M9.19 public SubmitCancelled completion/wire route已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整public SecurityRevoked terminal route、current Turn/active Item/Pending Interaction public projection、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel、M9.1–M9.16 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams、M9.17 public Steer/FollowUp/CancelQueuedMessage command/wire route、M9.18 public SessionQueueView/queue projection、M9.19 public SubmitCancelled completion/wire route及M9.20 public TurnInterrupted event/wire route已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、current Turn/active Item/Pending Interaction public projection、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
+
+M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items 与 Pending Interaction 的最小安全摘要，并与 Running/approval Wire V1 fixtures 对齐。
 
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.19 已在 M9.18 queue projection 之后，将 Starting 阶段 user Cancel 的 pre-input completion 从通用 `TurnCancelling` rejection 收口为 typed `SubmitCancelled` outcome，并接入 Wire V1 canonical response；M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。TurnInterrupted、当前 Turn/Items/Pending Interaction 仍作为后续 public projection slice。
+当前实现进度：M9.20 已在 M9.19 `SubmitCancelled` 之后，将 Running Turn 的 user Cancel 与 SecurityRevoked terminal 从内部 `SessionTurnTerminal` 映射为 public `TurnInterrupted` StateEvent，并接入 Wire V1 canonical input/output、route/kind/terminal 一致性校验及 active manifest fixture。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1；完整 Tool policy/approval 与 Compaction 仍后置。
 
 核心目标：
 

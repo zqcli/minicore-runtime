@@ -22,11 +22,12 @@ use crate::runtime_interface::{
     SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse,
     StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
     SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
+    TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
     SessionCancelTarget, SessionExecutionState, SessionExecutorSnapshot,
-    SessionExecutorSubscription, SessionTurnFailure, SessionTurnTerminal,
+    SessionExecutorSubscription, SessionTurnFailure, SessionTurnInterruption, SessionTurnTerminal,
     SessionWorkspaceDefinitionOutcome,
 };
 use crate::session_residency::{
@@ -37,7 +38,9 @@ use crate::session_residency::{
     SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
     SessionResidencyWorkspaceDefinitionError,
 };
-use crate::wire::{SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision};
+use crate::wire::{
+    ProtocolLimits, SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision,
+};
 use crate::workspace::{
     Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceResolver,
     WorkspaceRootSummaryView, lower_workspace,
@@ -278,6 +281,14 @@ impl EventStream {
                 event.turn_id(),
                 event.timestamp(),
                 public_turn_failure(failure),
+            ),
+            SessionTurnTerminal::Interrupted(interruption) => StateEvent::turn_interrupted(
+                event.timestamp(),
+                Some(event.command_id()),
+                snapshot,
+                event.turn_id(),
+                event.timestamp(),
+                public_turn_interruption(interruption),
             ),
         };
         Some(EventFrame::State(state))
@@ -716,15 +727,19 @@ impl RuntimeInner {
             ),
         )
         .map_err(|_| unavailable_snapshot(session_id))?;
-        SessionSnapshot::new_loaded_ready_with_queue(
+        SessionSnapshot::new_loaded_ready_with_observation(
             session_id,
             metadata,
             definition,
             execution,
+            snapshot.current_turn_view(),
+            snapshot.active_items().to_vec(),
+            snapshot.public_pending_interactions().to_vec(),
             queues,
             SessionRecordingView::new(SessionRecordingState::Healthy),
             None,
             Vec::new(),
+            ProtocolLimits::v1_0(),
         )
         .map_err(|_| unavailable_snapshot(session_id))
     }
@@ -1412,6 +1427,14 @@ fn public_turn_failure(failure: SessionTurnFailure) -> TurnFailureView {
         SessionTurnFailure::ContextOverflow => TurnFailureView::ContextOverflow,
         SessionTurnFailure::AgentUnavailable => TurnFailureView::DependencyUnavailable,
         SessionTurnFailure::Internal => TurnFailureView::InvariantFailure,
+        SessionTurnFailure::EmergencyControl(_) => TurnFailureView::InvariantFailure,
+    }
+}
+
+fn public_turn_interruption(interruption: SessionTurnInterruption) -> TurnInterruptionView {
+    match interruption {
+        SessionTurnInterruption::UserCancelled => TurnInterruptionView::UserCancelled,
+        SessionTurnInterruption::SecurityRevoked => TurnInterruptionView::SecurityRevoked,
     }
 }
 
@@ -1564,9 +1587,9 @@ mod tests {
     };
     use crate::runtime_interface::{
         CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest, CommandResponse,
-        EventFrame, EventRoute, NewSessionDefinition, NewSessionMetadata, PublicCancelTarget,
-        QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand, RuntimeQuery,
-        RuntimeQueryResult, RuntimeReadQuery, SessionCommand, SessionEventDetail,
+        EventFrame, EventRoute, ItemContentView, NewSessionDefinition, NewSessionMetadata,
+        PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
+        RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, SessionCommand, SessionEventDetail,
         SessionExecutionView, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
         SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
     };
@@ -2182,6 +2205,13 @@ mod tests {
             panic!("the public Session snapshot returns a Session view");
         };
         assert_eq!(queued_snapshot.execution(), SessionExecutionView::Running);
+        assert_eq!(queued_snapshot.current_turn().unwrap().turn_id(), turn_id);
+        assert_eq!(queued_snapshot.active_items().len(), 1);
+        assert!(matches!(
+            queued_snapshot.active_items()[0].content(),
+            ItemContentView::UserMessage { .. }
+        ));
+        assert!(queued_snapshot.pending_interactions().is_empty());
         assert_eq!(queued_snapshot.queues().submit_admissions(), &[]);
         assert_eq!(
             queued_snapshot.queues().steers()[0].command_id(),

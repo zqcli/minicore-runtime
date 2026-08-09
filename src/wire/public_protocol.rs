@@ -12,21 +12,28 @@ use crate::prompt::{
 };
 use crate::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandRequest, CommandResponse, EventFrame, EventRoute, NewSessionDefinition,
-    NewSessionMetadata, PublicCancelTarget, PublicIngressLane, PublicSubject, QueryResponse,
-    QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities,
-    RuntimeCommand, RuntimeDiagnosticView, RuntimeDispatchError, RuntimeLifecycleCommand,
-    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot,
-    RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
-    SessionDefinitionSummary, SessionDiagnosticView, SessionEventDetail, SessionExecutionView,
-    SessionMetadataView, SessionQueueView, SessionReadinessView, SessionRecordingState,
-    SessionRecordingView, SessionSnapshot, SessionStateEventKind, SessionUsageView,
-    SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg, SubmitAdmissionStateView,
-    SubmitAdmissionView, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
-    TurnTerminalView, validate_command_error_contract, validate_command_error_message,
-    validate_command_output,
+    CommandRequest, CommandResponse, CurrentTurnView, EventFrame, EventRoute, InteractionView,
+    ItemContentView, ItemStatusView, ItemView, NewSessionDefinition, NewSessionMetadata,
+    PublicCancelTarget, PublicIngressLane, PublicSubject, QueryResponse, QueryResult,
+    QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
+    RuntimeDiagnosticView, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind,
+    RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary,
+    SessionDiagnosticView, SessionEventDetail, SessionExecutionView, SessionMetadataView,
+    SessionQueueView, SessionReadinessView, SessionRecordingState, SessionRecordingView,
+    SessionSnapshot, SessionStateEventKind, SessionUsageView, SnapshotRequest, SnapshotResponse,
+    StateEvent, StateEventMsg, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView,
+    TurnStatusView, TurnTerminalView, validate_command_error_contract,
+    validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
+use crate::tools::{
+    ToolApprovalOptionKindView, ToolApprovalOptionView, ToolApprovalRequestView,
+    ToolRequirementSummaryView, UserQuestionChoice, UserQuestionField, UserQuestionInput,
+    UserQuestionRequest,
+};
+use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
 use crate::workspace::{
     RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
     WorkspaceDefinitionSummaryView, WorkspaceRootInput, WorkspaceRootKey, WorkspaceRootSummaryView,
@@ -660,43 +667,6 @@ impl<'de> Deserialize<'de> for UnsupportedObservationInput {
     }
 }
 
-struct EmptyObservationListInput;
-
-impl EmptyObservationListInput {
-    const fn confirm_empty(&self) {}
-}
-
-impl<'de> Deserialize<'de> for EmptyObservationListInput {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct Visitor;
-
-        impl<'de> serde::de::Visitor<'de> for Visitor {
-            type Value = EmptyObservationListInput;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("an empty observation list")
-            }
-
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    return Err(serde::de::Error::custom(
-                        "observation list belongs to a pending protocol slice",
-                    ));
-                }
-                Ok(EmptyObservationListInput)
-            }
-        }
-
-        deserializer.deserialize_seq(Visitor)
-    }
-}
-
 struct UnsupportedObservationOutput;
 
 impl Serialize for UnsupportedObservationOutput {
@@ -705,18 +675,6 @@ impl Serialize for UnsupportedObservationOutput {
         S: serde::Serializer,
     {
         unreachable!("unsupported observation outputs cannot be constructed")
-    }
-}
-
-struct EmptyObservationListOutput;
-
-impl Serialize for EmptyObservationListOutput {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeSeq;
-        serializer.serialize_seq(Some(0))?.end()
     }
 }
 
@@ -925,13 +883,421 @@ struct SessionSnapshotInput {
     load_state: SessionLoadStateInput,
     readiness: SessionReadinessInput,
     execution: SessionExecutionInput,
-    current_turn: Option<UnsupportedObservationInput>,
-    active_items: EmptyObservationListInput,
-    pending_interactions: EmptyObservationListInput,
+    current_turn: Option<CurrentTurnInput>,
+    active_items: Vec<ItemInput>,
+    pending_interactions: Vec<InteractionInput>,
     queues: SessionQueueInput,
     recording: SessionRecordingInput,
     usage: Option<SessionUsageInput>,
     diagnostics: Vec<PublicDiagnosticInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentTurnInput {
+    turn_id: TurnId,
+    status: TurnStatusInput,
+    phase: Option<TurnExecutionPhaseInput>,
+    started_at: Timestamp,
+}
+
+impl CurrentTurnInput {
+    fn into_semantic(self) -> Result<CurrentTurnView, TypedJsonError> {
+        Ok(CurrentTurnView::new(
+            self.turn_id,
+            self.status.into_semantic()?,
+            self.phase.map(TurnExecutionPhaseInput::into_semantic),
+            self.started_at,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum TurnStatusInput {
+    Running,
+    Completed(CompletedTurnStatusInput),
+    Interrupted(InterruptedTurnStatusInput),
+    Failed(FailedTurnStatusInput),
+}
+
+impl TurnStatusInput {
+    fn into_semantic(self) -> Result<TurnStatusView, TypedJsonError> {
+        Ok(match self {
+            Self::Running => TurnStatusView::Running,
+            Self::Completed(value) => TurnStatusView::Completed {
+                completed_at: value.completed_at,
+            },
+            Self::Interrupted(value) => TurnStatusView::Interrupted {
+                completed_at: value.completed_at,
+                reason: value.reason.into_semantic(),
+            },
+            Self::Failed(value) => TurnStatusView::Failed {
+                completed_at: value.completed_at,
+                reason: value.reason.into_semantic(),
+            },
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletedTurnStatusInput {
+    completed_at: Timestamp,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedTurnStatusInput {
+    completed_at: Timestamp,
+    reason: TurnInterruptionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FailedTurnStatusInput {
+    completed_at: Timestamp,
+    reason: TurnFailureInput,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnExecutionPhaseInput {
+    Sampling,
+    RetryBackoff,
+    Compacting,
+    WaitingApproval,
+    WaitingForUserInput,
+    ExecutingTools,
+}
+
+impl TurnExecutionPhaseInput {
+    const fn into_semantic(self) -> TurnExecutionPhaseView {
+        match self {
+            Self::Sampling => TurnExecutionPhaseView::Sampling,
+            Self::RetryBackoff => TurnExecutionPhaseView::RetryBackoff,
+            Self::Compacting => TurnExecutionPhaseView::Compacting,
+            Self::WaitingApproval => TurnExecutionPhaseView::WaitingApproval,
+            Self::WaitingForUserInput => TurnExecutionPhaseView::WaitingForUserInput,
+            Self::ExecutingTools => TurnExecutionPhaseView::ExecutingTools,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemInput {
+    item_id: ItemId,
+    turn_id: TurnId,
+    status: ItemStatusInput,
+    content: ItemContentInput,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
+}
+
+impl ItemInput {
+    fn into_semantic(self) -> Result<ItemView, TypedJsonError> {
+        ItemView::new(
+            self.item_id,
+            self.turn_id,
+            self.status.into_semantic(),
+            self.content.into_semantic()?,
+            self.created_at,
+            self.completed_at,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemStatusInput {
+    Started,
+    Completed,
+}
+
+impl ItemStatusInput {
+    const fn into_semantic(self) -> ItemStatusView {
+        match self {
+            Self::Started => ItemStatusView::Started,
+            Self::Completed => ItemStatusView::Completed,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ItemContentInput {
+    UserMessage(UserMessageItemInput),
+    AgentMessage(TextItemInput),
+    Reasoning(TextItemInput),
+    ToolInvocation(ToolInvocationItemInput),
+}
+
+impl ItemContentInput {
+    fn into_semantic(self) -> Result<ItemContentView, TypedJsonError> {
+        match self {
+            Self::UserMessage(value) => ItemContentView::user_message(
+                value.source.into_semantic(),
+                value.body,
+                value.contributions.into_iter().map(Into::into).collect(),
+            ),
+            Self::AgentMessage(value) => ItemContentView::agent_message(value.body),
+            Self::Reasoning(value) => ItemContentView::reasoning(value.body),
+            Self::ToolInvocation(value) => ItemContentView::tool_invocation(
+                value.tool_call_id,
+                value.tool_name,
+                value.arguments_summary,
+                value.result.map(|_| "present"),
+            ),
+        }
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserMessageItemInput {
+    source: UserMessageSourceInput,
+    body: String,
+    contributions: Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum UserMessageSourceInput {
+    Input,
+    Steer,
+}
+
+impl UserMessageSourceInput {
+    const fn into_semantic(self) -> UserMessageSource {
+        match self {
+            Self::Input => UserMessageSource::Input,
+            Self::Steer => UserMessageSource::Steer,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextItemInput {
+    body: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolInvocationItemInput {
+    tool_call_id: String,
+    tool_name: String,
+    arguments_summary: String,
+    result: Option<UnsupportedObservationInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionInput {
+    request_id: RequestId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request: InteractionRequestInput,
+}
+
+impl InteractionInput {
+    fn into_semantic(self) -> Result<InteractionView, TypedJsonError> {
+        Ok(InteractionView::new(
+            self.request_id,
+            self.turn_id,
+            self.item_id,
+            self.request.into_semantic()?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionRequestInput {
+    ToolApproval(ToolApprovalRequestInput),
+    UserQuestion(UserQuestionRequestInput),
+}
+
+impl InteractionRequestInput {
+    fn into_semantic(self) -> Result<InteractionRequestView, TypedJsonError> {
+        match self {
+            Self::ToolApproval(value) => {
+                Ok(InteractionRequestView::ToolApproval(value.into_semantic()?))
+            }
+            Self::UserQuestion(value) => {
+                Ok(InteractionRequestView::UserQuestion(value.into_semantic()?))
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApprovalRequestInput {
+    tool_name: String,
+    arguments_summary: String,
+    reason: String,
+    requirements: ToolRequirementsInput,
+    options: Vec<ToolApprovalOptionInput>,
+}
+
+impl ToolApprovalRequestInput {
+    fn into_semantic(self) -> Result<crate::tools::ToolApprovalRequestView, TypedJsonError> {
+        let options = self
+            .options
+            .into_iter()
+            .map(ToolApprovalOptionInput::into_semantic)
+            .collect::<Result<Vec<_>, _>>()?;
+        ToolApprovalRequestView::reconstruct(
+            self.tool_name.parse().map_err(|_| invalid_scalar())?,
+            self.arguments_summary,
+            self.reason,
+            self.requirements.into_semantic()?,
+            options,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolRequirementsInput {
+    filesystem: Option<String>,
+    network: Option<String>,
+    process: Option<String>,
+}
+
+impl ToolRequirementsInput {
+    fn into_semantic(self) -> Result<ToolRequirementSummaryView, TypedJsonError> {
+        ToolRequirementSummaryView::reconstruct(self.filesystem, self.network, self.process)
+            .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApprovalOptionInput {
+    option_index: u32,
+    kind: ToolApprovalOptionKindInput,
+    label: String,
+    effective_requirements: ToolRequirementsInput,
+}
+
+impl ToolApprovalOptionInput {
+    fn into_semantic(self) -> Result<ToolApprovalOptionView, TypedJsonError> {
+        ToolApprovalOptionView::reconstruct(
+            self.option_index,
+            self.kind.into_semantic(),
+            self.label,
+            self.effective_requirements.into_semantic()?,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolApprovalOptionKindInput {
+    AsRequested,
+    Restricted,
+}
+
+impl ToolApprovalOptionKindInput {
+    const fn into_semantic(self) -> ToolApprovalOptionKindView {
+        match self {
+            Self::AsRequested => ToolApprovalOptionKindView::AsRequested,
+            Self::Restricted => ToolApprovalOptionKindView::Restricted,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionRequestInput {
+    title: Option<String>,
+    questions: Vec<UserQuestionFieldInput>,
+}
+
+impl UserQuestionRequestInput {
+    fn into_semantic(self) -> Result<crate::tools::UserQuestionRequest, TypedJsonError> {
+        let questions = self
+            .questions
+            .into_iter()
+            .map(UserQuestionFieldInput::into_semantic)
+            .collect::<Result<Vec<_>, _>>()?;
+        UserQuestionRequest::reconstruct(self.title, questions).map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionFieldInput {
+    question_index: u32,
+    prompt: String,
+    required: bool,
+    input: UserQuestionInputInput,
+}
+
+impl UserQuestionFieldInput {
+    fn into_semantic(self) -> Result<UserQuestionField, TypedJsonError> {
+        UserQuestionField::reconstruct(
+            self.question_index,
+            self.prompt,
+            self.required,
+            self.input.into_semantic()?,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum UserQuestionInputInput {
+    Text(TextQuestionInput),
+    SingleChoice(SingleChoiceQuestionInput),
+}
+
+impl UserQuestionInputInput {
+    fn into_semantic(self) -> Result<UserQuestionInput, TypedJsonError> {
+        Ok(match self {
+            Self::Text(value) => UserQuestionInput::Text {
+                multiline: value.multiline,
+            },
+            Self::SingleChoice(value) => UserQuestionInput::SingleChoice {
+                options: value
+                    .options
+                    .into_iter()
+                    .map(|option| {
+                        UserQuestionChoice::reconstruct(option.option_index, option.label)
+                            .map_err(|_| invalid_scalar())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            },
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextQuestionInput {
+    multiline: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleChoiceQuestionInput {
+    options: Vec<UserQuestionChoiceInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionChoiceInput {
+    option_index: u32,
+    label: String,
 }
 
 impl SessionSnapshot {
@@ -939,17 +1305,28 @@ impl SessionSnapshot {
         value: SessionSnapshotInput,
         limits: ProtocolLimits,
     ) -> Result<Self, TypedJsonError> {
-        value.active_items.confirm_empty();
-        value.pending_interactions.confirm_empty();
         if !matches!(value.lifecycle, SessionLifecycleInput::Open) {
             return Err(invalid_scalar());
         }
         if !matches!(value.load_state, SessionLoadStateInput::Loaded)
             || !matches!(value.readiness, SessionReadinessInput::Ready)
-            || value.current_turn.is_some()
         {
             return Err(TypedJsonError::PendingPublicTarget);
         }
+        let current_turn = value
+            .current_turn
+            .map(CurrentTurnInput::into_semantic)
+            .transpose()?;
+        let active_items = value
+            .active_items
+            .into_iter()
+            .map(ItemInput::into_semantic)
+            .collect::<Result<Vec<_>, _>>()?;
+        let pending_interactions = value
+            .pending_interactions
+            .into_iter()
+            .map(InteractionInput::into_semantic)
+            .collect::<Result<Vec<_>, _>>()?;
         let execution = value.execution.into_semantic();
         let queues = value.queues.into_semantic(limits)?;
         let diagnostics = value
@@ -957,11 +1334,14 @@ impl SessionSnapshot {
             .into_iter()
             .map(|diagnostic| diagnostic.into_session(limits))
             .collect::<Result<Vec<_>, _>>()?;
-        SessionSnapshot::new_loaded_ready_with_limits(
+        SessionSnapshot::new_loaded_ready_with_observation(
             value.session_id,
             value.metadata.into_semantic(limits)?,
             value.definition.into_semantic(limits)?,
             execution,
+            current_turn,
+            active_items,
+            pending_interactions,
             queues,
             value.recording.into_semantic(),
             value
@@ -1474,8 +1854,13 @@ struct SessionStateEventInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "the wire discriminator names are fixed by the public protocol"
+)]
 enum SessionStateEventKindInput {
     TurnCompleted,
+    TurnInterrupted,
     TurnFailed,
 }
 
@@ -1483,6 +1868,7 @@ impl SessionStateEventKindInput {
     fn into_semantic(self) -> Result<SessionStateEventKind, TypedJsonError> {
         Ok(match self {
             Self::TurnCompleted => SessionStateEventKind::TurnCompleted,
+            Self::TurnInterrupted => SessionStateEventKind::TurnInterrupted,
             Self::TurnFailed => SessionStateEventKind::TurnFailed,
         })
     }
@@ -1516,6 +1902,7 @@ struct TurnTerminalDetailInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum TurnTerminalInput {
     Completed(CompletedTerminalInput),
+    Interrupted(InterruptedTerminalInput),
     Failed(FailedTerminalInput),
 }
 
@@ -1524,6 +1911,10 @@ impl TurnTerminalInput {
         match self {
             Self::Completed(value) => TurnTerminalView::Completed {
                 completed_at: value.completed_at,
+            },
+            Self::Interrupted(value) => TurnTerminalView::Interrupted {
+                completed_at: value.completed_at,
+                reason: value.reason.into_semantic(),
             },
             Self::Failed(value) => TurnTerminalView::Failed {
                 completed_at: value.completed_at,
@@ -1537,6 +1928,35 @@ impl TurnTerminalInput {
 #[serde(rename_all = "camelCase")]
 struct CompletedTerminalInput {
     completed_at: Timestamp,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedTerminalInput {
+    completed_at: Timestamp,
+    reason: TurnInterruptionInput,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnInterruptionInput {
+    UserCancelled,
+    SecurityRevoked,
+    PrepareForUnload,
+    RuntimeShutdown,
+    RuntimeFailure,
+}
+
+impl TurnInterruptionInput {
+    const fn into_semantic(self) -> TurnInterruptionView {
+        match self {
+            Self::UserCancelled => TurnInterruptionView::UserCancelled,
+            Self::SecurityRevoked => TurnInterruptionView::SecurityRevoked,
+            Self::PrepareForUnload => TurnInterruptionView::PrepareForUnload,
+            Self::RuntimeShutdown => TurnInterruptionView::RuntimeShutdown,
+            Self::RuntimeFailure => TurnInterruptionView::RuntimeFailure,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1786,9 +2206,9 @@ struct SessionSnapshotOutput<'a> {
     load_state: SessionLoadStateOutput,
     readiness: SessionReadinessOutput,
     execution: SessionExecutionOutput,
-    current_turn: Option<UnsupportedObservationOutput>,
-    active_items: EmptyObservationListOutput,
-    pending_interactions: EmptyObservationListOutput,
+    current_turn: Option<CurrentTurnOutput>,
+    active_items: Vec<ItemOutput<'a>>,
+    pending_interactions: Vec<InteractionOutput<'a>>,
     queues: SessionQueueOutput,
     recording: SessionRecordingOutput,
     usage: Option<SessionUsageOutput<'a>>,
@@ -1805,9 +2225,17 @@ impl<'a> SessionSnapshotOutput<'a> {
             load_state: SessionLoadStateOutput::Loaded,
             readiness: SessionReadinessOutput::Ready,
             execution: SessionExecutionOutput::from_semantic(value.execution()),
-            current_turn: None,
-            active_items: EmptyObservationListOutput,
-            pending_interactions: EmptyObservationListOutput,
+            current_turn: value.current_turn().map(CurrentTurnOutput::from_semantic),
+            active_items: value
+                .active_items()
+                .iter()
+                .map(ItemOutput::from_semantic)
+                .collect(),
+            pending_interactions: value
+                .pending_interactions()
+                .iter()
+                .map(InteractionOutput::from_semantic)
+                .collect(),
             queues: SessionQueueOutput::from_semantic(value.queues()),
             recording: SessionRecordingOutput::from_semantic(value.recording()),
             usage: value.usage().map(SessionUsageOutput::from_semantic),
@@ -1818,6 +2246,429 @@ impl<'a> SessionSnapshotOutput<'a> {
                 .collect(),
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentTurnOutput {
+    turn_id: TurnId,
+    status: TurnStatusOutput,
+    phase: Option<TurnExecutionPhaseOutput>,
+    started_at: Timestamp,
+}
+
+impl CurrentTurnOutput {
+    fn from_semantic(value: CurrentTurnView) -> Self {
+        Self {
+            turn_id: value.turn_id(),
+            status: TurnStatusOutput::from_semantic(value.status()),
+            phase: value.phase().map(TurnExecutionPhaseOutput::from_semantic),
+            started_at: value.started_at(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum TurnStatusOutput {
+    Running,
+    Completed(CompletedTurnStatusOutput),
+    Interrupted(InterruptedTurnStatusOutput),
+    Failed(FailedTurnStatusOutput),
+}
+
+impl TurnStatusOutput {
+    fn from_semantic(value: TurnStatusView) -> Self {
+        match value {
+            TurnStatusView::Running => Self::Running,
+            TurnStatusView::Completed { completed_at } => {
+                Self::Completed(CompletedTurnStatusOutput { completed_at })
+            }
+            TurnStatusView::Interrupted {
+                completed_at,
+                reason,
+            } => Self::Interrupted(InterruptedTurnStatusOutput {
+                completed_at,
+                reason: TurnInterruptionOutput::from_semantic(reason),
+            }),
+            TurnStatusView::Failed {
+                completed_at,
+                reason,
+            } => Self::Failed(FailedTurnStatusOutput {
+                completed_at,
+                reason: TurnFailureOutput::from_semantic(reason),
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompletedTurnStatusOutput {
+    completed_at: Timestamp,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedTurnStatusOutput {
+    completed_at: Timestamp,
+    reason: TurnInterruptionOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FailedTurnStatusOutput {
+    completed_at: Timestamp,
+    reason: TurnFailureOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnExecutionPhaseOutput {
+    Sampling,
+    RetryBackoff,
+    Compacting,
+    WaitingApproval,
+    WaitingForUserInput,
+    ExecutingTools,
+}
+
+impl TurnExecutionPhaseOutput {
+    const fn from_semantic(value: TurnExecutionPhaseView) -> Self {
+        match value {
+            TurnExecutionPhaseView::Sampling => Self::Sampling,
+            TurnExecutionPhaseView::RetryBackoff => Self::RetryBackoff,
+            TurnExecutionPhaseView::Compacting => Self::Compacting,
+            TurnExecutionPhaseView::WaitingApproval => Self::WaitingApproval,
+            TurnExecutionPhaseView::WaitingForUserInput => Self::WaitingForUserInput,
+            TurnExecutionPhaseView::ExecutingTools => Self::ExecutingTools,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemOutput<'a> {
+    item_id: ItemId,
+    turn_id: TurnId,
+    status: ItemStatusOutput,
+    content: ItemContentOutput<'a>,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
+}
+
+impl<'a> ItemOutput<'a> {
+    fn from_semantic(value: &'a ItemView) -> Self {
+        Self {
+            item_id: value.item_id(),
+            turn_id: value.turn_id(),
+            status: ItemStatusOutput::from_semantic(value.status()),
+            content: ItemContentOutput::from_semantic(value.content()),
+            created_at: value.created_at(),
+            completed_at: value.completed_at(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemStatusOutput {
+    Started,
+    Completed,
+}
+
+impl ItemStatusOutput {
+    const fn from_semantic(value: ItemStatusView) -> Self {
+        match value {
+            ItemStatusView::Started => Self::Started,
+            ItemStatusView::Completed => Self::Completed,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ItemContentOutput<'a> {
+    UserMessage(UserMessageItemOutput<'a>),
+    AgentMessage(TextItemOutput<'a>),
+    Reasoning(TextItemOutput<'a>),
+    ToolInvocation(ToolInvocationItemOutput<'a>),
+}
+
+impl<'a> ItemContentOutput<'a> {
+    fn from_semantic(value: &'a ItemContentView) -> Self {
+        match value {
+            ItemContentView::UserMessage {
+                source,
+                body,
+                contributions,
+            } => Self::UserMessage(UserMessageItemOutput {
+                source: UserMessageSourceOutput::from_semantic(*source),
+                body,
+                contributions: contributions.iter().map(|value| value.as_ref()).collect(),
+            }),
+            ItemContentView::AgentMessage { body } => Self::AgentMessage(TextItemOutput { body }),
+            ItemContentView::Reasoning { body } => Self::Reasoning(TextItemOutput { body }),
+            ItemContentView::ToolInvocation {
+                tool_call_id,
+                tool_name,
+                arguments_summary,
+                result,
+            } => Self::ToolInvocation(ToolInvocationItemOutput {
+                tool_call_id,
+                tool_name,
+                arguments_summary,
+                result: result.as_deref(),
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserMessageItemOutput<'a> {
+    source: UserMessageSourceOutput,
+    body: &'a str,
+    contributions: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TextItemOutput<'a> {
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolInvocationItemOutput<'a> {
+    tool_call_id: &'a str,
+    tool_name: &'a str,
+    arguments_summary: &'a str,
+    result: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UserMessageSourceOutput {
+    Input,
+    Steer,
+}
+
+impl UserMessageSourceOutput {
+    const fn from_semantic(value: UserMessageSource) -> Self {
+        match value {
+            UserMessageSource::Input => Self::Input,
+            UserMessageSource::Steer => Self::Steer,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionOutput<'a> {
+    request_id: RequestId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request: InteractionRequestOutput<'a>,
+}
+
+impl<'a> InteractionOutput<'a> {
+    fn from_semantic(value: &'a InteractionView) -> Self {
+        Self {
+            request_id: value.request_id(),
+            turn_id: value.turn_id(),
+            item_id: value.item_id(),
+            request: InteractionRequestOutput::from_semantic(value.request()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionRequestOutput<'a> {
+    ToolApproval(ToolApprovalRequestOutput<'a>),
+    UserQuestion(UserQuestionRequestOutput<'a>),
+}
+
+impl<'a> InteractionRequestOutput<'a> {
+    fn from_semantic(value: &'a InteractionRequestView) -> Self {
+        match value {
+            InteractionRequestView::ToolApproval(request) => {
+                Self::ToolApproval(ToolApprovalRequestOutput::from_semantic(request))
+            }
+            InteractionRequestView::UserQuestion(request) => {
+                Self::UserQuestion(UserQuestionRequestOutput::from_semantic(request))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApprovalRequestOutput<'a> {
+    tool_name: &'a str,
+    arguments_summary: &'a str,
+    reason: &'a str,
+    requirements: ToolRequirementsOutput<'a>,
+    options: Vec<ToolApprovalOptionOutput<'a>>,
+}
+
+impl<'a> ToolApprovalRequestOutput<'a> {
+    fn from_semantic(value: &'a crate::tools::ToolApprovalRequestView) -> Self {
+        Self {
+            tool_name: value.tool_name().as_str(),
+            arguments_summary: value.arguments_summary(),
+            reason: value.reason(),
+            requirements: ToolRequirementsOutput::from_semantic(value.requirements()),
+            options: value
+                .options()
+                .iter()
+                .map(ToolApprovalOptionOutput::from_semantic)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolRequirementsOutput<'a> {
+    filesystem: Option<&'a str>,
+    network: Option<&'a str>,
+    process: Option<&'a str>,
+}
+
+impl<'a> ToolRequirementsOutput<'a> {
+    fn from_semantic(value: &'a ToolRequirementSummaryView) -> Self {
+        Self {
+            filesystem: value.filesystem(),
+            network: value.network(),
+            process: value.process(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolApprovalOptionOutput<'a> {
+    option_index: u32,
+    kind: ToolApprovalOptionKindOutput,
+    label: &'a str,
+    effective_requirements: ToolRequirementsOutput<'a>,
+}
+
+impl<'a> ToolApprovalOptionOutput<'a> {
+    fn from_semantic(value: &'a ToolApprovalOptionView) -> Self {
+        Self {
+            option_index: value.option_index(),
+            kind: ToolApprovalOptionKindOutput::from_semantic(value.kind()),
+            label: value.label(),
+            effective_requirements: ToolRequirementsOutput::from_semantic(
+                value.effective_requirements(),
+            ),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ToolApprovalOptionKindOutput {
+    AsRequested,
+    Restricted,
+}
+
+impl ToolApprovalOptionKindOutput {
+    const fn from_semantic(value: ToolApprovalOptionKindView) -> Self {
+        match value {
+            ToolApprovalOptionKindView::AsRequested => Self::AsRequested,
+            ToolApprovalOptionKindView::Restricted => Self::Restricted,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionRequestOutput<'a> {
+    title: Option<&'a str>,
+    questions: Vec<UserQuestionFieldOutput<'a>>,
+}
+
+impl<'a> UserQuestionRequestOutput<'a> {
+    fn from_semantic(value: &'a crate::tools::UserQuestionRequest) -> Self {
+        Self {
+            title: value.title(),
+            questions: value
+                .questions()
+                .iter()
+                .map(UserQuestionFieldOutput::from_semantic)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionFieldOutput<'a> {
+    question_index: u32,
+    prompt: &'a str,
+    required: bool,
+    input: UserQuestionInputOutput<'a>,
+}
+
+impl<'a> UserQuestionFieldOutput<'a> {
+    fn from_semantic(value: &'a UserQuestionField) -> Self {
+        Self {
+            question_index: value.question_index(),
+            prompt: value.prompt(),
+            required: value.required(),
+            input: UserQuestionInputOutput::from_semantic(value.input()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum UserQuestionInputOutput<'a> {
+    Text(TextQuestionOutput),
+    SingleChoice(SingleChoiceQuestionOutput<'a>),
+}
+
+impl<'a> UserQuestionInputOutput<'a> {
+    fn from_semantic(value: &'a UserQuestionInput) -> Self {
+        match value {
+            UserQuestionInput::Text { multiline } => Self::Text(TextQuestionOutput {
+                multiline: *multiline,
+            }),
+            UserQuestionInput::SingleChoice { options } => {
+                Self::SingleChoice(SingleChoiceQuestionOutput {
+                    options: options
+                        .iter()
+                        .map(|option| UserQuestionChoiceOutput {
+                            option_index: option.option_index(),
+                            label: option.label(),
+                        })
+                        .collect(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TextQuestionOutput {
+    multiline: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SingleChoiceQuestionOutput<'a> {
+    options: Vec<UserQuestionChoiceOutput<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionChoiceOutput<'a> {
+    option_index: u32,
+    label: &'a str,
 }
 
 #[derive(Serialize)]
@@ -2247,8 +3098,13 @@ struct SessionStateEventOutput<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "the wire discriminator names are fixed by the public protocol"
+)]
 enum SessionStateEventKindOutput {
     TurnCompleted,
+    TurnInterrupted,
     TurnFailed,
 }
 
@@ -2256,6 +3112,7 @@ impl SessionStateEventKindOutput {
     const fn from_semantic(value: SessionStateEventKind) -> Self {
         match value {
             SessionStateEventKind::TurnCompleted => Self::TurnCompleted,
+            SessionStateEventKind::TurnInterrupted => Self::TurnInterrupted,
             SessionStateEventKind::TurnFailed => Self::TurnFailed,
         }
     }
@@ -2291,6 +3148,7 @@ struct TurnTerminalDetailOutput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum TurnTerminalOutput {
     Completed(CompletedTerminalOutput),
+    Interrupted(InterruptedTerminalOutput),
     Failed(FailedTerminalOutput),
 }
 
@@ -2300,6 +3158,13 @@ impl TurnTerminalOutput {
             TurnTerminalView::Completed { completed_at } => {
                 Self::Completed(CompletedTerminalOutput { completed_at })
             }
+            TurnTerminalView::Interrupted {
+                completed_at,
+                reason,
+            } => Self::Interrupted(InterruptedTerminalOutput {
+                completed_at,
+                reason: TurnInterruptionOutput::from_semantic(reason),
+            }),
             TurnTerminalView::Failed {
                 completed_at,
                 reason,
@@ -2315,6 +3180,35 @@ impl TurnTerminalOutput {
 #[serde(rename_all = "camelCase")]
 struct CompletedTerminalOutput {
     completed_at: Timestamp,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InterruptedTerminalOutput {
+    completed_at: Timestamp,
+    reason: TurnInterruptionOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TurnInterruptionOutput {
+    UserCancelled,
+    SecurityRevoked,
+    PrepareForUnload,
+    RuntimeShutdown,
+    RuntimeFailure,
+}
+
+impl TurnInterruptionOutput {
+    const fn from_semantic(value: TurnInterruptionView) -> Self {
+        match value {
+            TurnInterruptionView::UserCancelled => Self::UserCancelled,
+            TurnInterruptionView::SecurityRevoked => Self::SecurityRevoked,
+            TurnInterruptionView::PrepareForUnload => Self::PrepareForUnload,
+            TurnInterruptionView::RuntimeShutdown => Self::RuntimeShutdown,
+            TurnInterruptionView::RuntimeFailure => Self::RuntimeFailure,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -4142,9 +5036,6 @@ fn validate_session_snapshot_shape(
         _ => return Err(unknown_output_variant()),
     }
 
-    // Known future snapshots are classified from their outer shape only. Queue
-    // targets are active in this slice; item, interaction, and diagnostic payloads
-    // remain pending and are not entered on that path.
     required(object, "metadata")?
         .as_object()
         .ok_or_else(selected_wrong_json_type)?;
@@ -4155,55 +5046,57 @@ fn validate_session_snapshot_shape(
     let load_state = required(object, "loadState")?
         .as_str()
         .ok_or_else(typed_wrong_json_type)?;
-    let load_pending = match load_state {
-        "loaded" => false,
-        "unloading" => true,
+    match load_state {
+        "loaded" | "unloading" => {}
         _ => return Err(unknown_output_variant()),
-    };
-    let ready = validate_readiness(required(object, "readiness")?)?;
+    }
+    validate_readiness(required(object, "readiness")?)?;
     let _execution = validate_execution(required(object, "execution")?)?;
 
-    let current_turn_pending = match object.get("currentTurn") {
-        None | Some(JsonNode::Null) => false,
-        Some(value) => {
-            value.as_object().ok_or_else(selected_wrong_json_type)?;
+    let current_turn_present = if let Some(current_turn) = object.get("currentTurn") {
+        if !matches!(current_turn, JsonNode::Null) {
+            current_turn
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
             true
+        } else {
+            false
         }
+    } else {
+        false
     };
-
     let active_items = required(object, "activeItems")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    let active_items_pending = !active_items.is_empty();
-
+    if active_items.len() > usize::from(limits.observation.max_active_items) {
+        return Err(invalid_scalar());
+    }
     let pending_interactions = required(object, "pendingInteractions")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
-    let pending_interactions_pending = !pending_interactions.is_empty();
+    if pending_interactions.len() > usize::from(limits.observation.max_pending_interactions) {
+        return Err(invalid_scalar());
+    }
 
     validate_session_queues_shape(required(object, "queues")?)?;
     let recording_healthy = validate_recording(required(object, "recording")?)?;
-    let recording_pending = !recording_healthy;
-    let diagnostics_pending =
+    let diagnostics_present =
         validate_snapshot_diagnostics_shape(required(object, "diagnostics")?)?;
-
-    let other_fields_pending = load_pending
-        || !ready
-        || current_turn_pending
-        || active_items_pending
-        || pending_interactions_pending
-        || recording_pending
-        || diagnostics_pending;
-    let usage_pending = match object.get("usage") {
-        None | Some(JsonNode::Null) => false,
-        Some(usage) if other_fields_pending => {
-            usage.as_object().ok_or_else(selected_wrong_json_type)?;
-            true
-        }
-        Some(usage) => validate_session_usage_shape(usage)?,
-    };
-
-    if other_fields_pending || usage_pending {
+    if !recording_healthy || diagnostics_present {
+        return Err(TypedJsonError::PendingPublicTarget);
+    }
+    let usage_present = object
+        .get("usage")
+        .map(|usage| {
+            if matches!(usage, JsonNode::Null) {
+                Ok(false)
+            } else {
+                validate_session_usage_shape(usage)
+            }
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if usage_present && !current_turn_present {
         return Err(TypedJsonError::PendingPublicTarget);
     }
 
@@ -4724,14 +5617,15 @@ fn validate_session_state_msg(
         .ok_or_else(typed_wrong_json_type)?;
     let snapshot = required(object, "snapshot")?;
     match kind {
-        "turn_completed" | "turn_failed" => {
+        "turn_completed" | "turn_interrupted" | "turn_failed" => {
             let terminal = validate_turn_terminal_detail(
                 object.get("detail").ok_or_else(missing_required_field)?,
             )?;
-            let expected = if kind == "turn_completed" {
-                TerminalKind::Completed
-            } else {
-                TerminalKind::Failed
+            let expected = match kind {
+                "turn_completed" => TerminalKind::Completed,
+                "turn_interrupted" => TerminalKind::Interrupted,
+                "turn_failed" => TerminalKind::Failed,
+                _ => return Err(TypedJsonError::EncodingInvariant),
             };
             let snapshot_session_id = validate_snapshot_session_id(snapshot)?;
             if terminal.terminal.kind != expected
@@ -4932,6 +5826,7 @@ fn validate_future_state_detail(
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TerminalKind {
     Completed,
+    Interrupted,
     Failed,
 }
 
@@ -4967,6 +5862,10 @@ fn validate_turn_terminal_detail(node: &JsonNode) -> Result<TerminalFacts, Typed
                     .map_err(|_| invalid_scalar())?;
                 let kind = match terminal {
                     "completed" => TerminalKind::Completed,
+                    "interrupted" => {
+                        validate_turn_interruption(required(data, "reason")?)?;
+                        TerminalKind::Interrupted
+                    }
                     "failed" => {
                         validate_turn_failure(required(data, "reason")?)?;
                         TerminalKind::Failed
@@ -4993,6 +5892,14 @@ fn validate_turn_failure(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "context_overflow"
         | "dependency_unavailable"
         | "invariant_failure" => Ok(()),
+        _ => Err(unknown_output_variant()),
+    }
+}
+
+fn validate_turn_interruption(node: &JsonNode) -> Result<(), TypedJsonError> {
+    match node.as_str().ok_or_else(typed_wrong_json_type)? {
+        "user_cancelled" | "security_revoked" | "prepare_for_unload" | "runtime_shutdown"
+        | "runtime_failure" => Ok(()),
         _ => Err(unknown_output_variant()),
     }
 }
