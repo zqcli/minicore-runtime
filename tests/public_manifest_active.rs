@@ -310,6 +310,13 @@ fn assert_command_response_semantics(
         ) => {
             assert_eq!(turn_id.to_string(), "trn_33333333333333333333333333333333");
         }
+        (
+            Some("submit_cancelled_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SubmitCancelled,
+                output: None,
+            },
+        ) => {}
         (Some("session_busy_rejection"), CommandCompletion::Rejected(error)) => {
             assert_eq!(error.code(), CommandErrorCode::SessionBusy);
             assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
