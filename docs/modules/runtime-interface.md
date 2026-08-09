@@ -2041,7 +2041,7 @@ command_catalog_invalidated
 
 failure若发生在TurnStarted、ItemCompleted、InteractionRequested/Resolved或Compaction record path，先发布原domain StateEvent；该event携带的Snapshot已经是Degraded并包含当前diagnostic。随后紧接一次`session_recording_changed`，携带同一recording state。Turn terminal本身不触发recording failure，但会携带当时最新recording state。
 
-MVP固定使用`TurnCompleted | TurnInterrupted | TurnFailed`三个互斥SessionStateEventKind；ADR 0134把它们编码为三个distinct snake_case wire variants，不得折叠成未定义的`turn_finished`形状。Rust semantic payload保持`Completed | Interrupted | Failed` typed union。
+MVP固定使用`SessionExecutionChanged | TurnCompleted | TurnInterrupted | TurnFailed`四个已激活的SessionStateEventKind；ADR 0134把它们编码为distinct snake_case wire variants，不得折叠成未定义的`turn_finished`形状。Rust terminal detail仍保持`Completed | Interrupted | Failed` typed union；execution transition只携带完整SessionSnapshot。
 
 ### ProgressEvent
 
