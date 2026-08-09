@@ -1,9 +1,10 @@
 pub mod agent_session_lifecycle;
 #[allow(
     dead_code,
-    reason = "the completed M4 compaction owner is consumed by the pending M7 and M5.2 slices"
+    reason = "M4/M5 foundations and M10 planning are consumed by adjacent summary/orchestration slices"
 )]
 pub(crate) mod compaction;
+pub use compaction::CompactionSettings;
 pub(crate) mod conversation_storage;
 pub(crate) mod durable_state;
 // Preserve the established crate path while making the reducer a descendant of its storage owner.

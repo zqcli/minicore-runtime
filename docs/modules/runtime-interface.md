@@ -143,6 +143,7 @@ impl MiniCoreRuntime {
 }
 
 pub enum RuntimeInitializationError {
+    InvalidConfiguration,
     RuntimeDependencyUnavailable,
     StoreInUse,
     UnsupportedStoreFormat,
@@ -152,7 +153,7 @@ pub enum RuntimeInitializationError {
 }
 ```
 
-`MiniCoreRuntimeConfig`包含host配置的dedicated durable root与现有runtime options；它不是wire DTO。`open`只使用显式传入的cloned Handle，不调用`Handle::current()`；owner-tracked timer probe把missing runtime/time driver panic或join failure映射为`RuntimeDependencyUnavailable`，其余variants一对一映射DurableState open分类。`RuntimeInitializationError`的`Debug`/`Display`同样redacted，不暴露path、OS source或durable bytes。`shutdown`是idempotent host-only non-wire seam，不是第五个protocol entry point。Facade `Drop`只发best-effort Closing signal且不阻塞；host必须await shutdown才能观察全部join、root lease release与Closed。
+`MiniCoreRuntimeConfig`包含host配置的dedicated durable root、Runtime-global `CompactionSettings`与现有runtime options；它不是wire DTO。`CompactionSettings`默认启用，并可通过`with_compaction_settings(...)`替换；`open`在启动task或打开storage前验证summary min/max，失败返回redacted `InvalidConfiguration`。`open`只使用显式传入的cloned Handle，不调用`Handle::current()`；owner-tracked timer probe把missing runtime/time driver panic或join failure映射为`RuntimeDependencyUnavailable`，DurableState open failures保持一对一分类。`RuntimeInitializationError`的`Debug`/`Display`同样redacted，不暴露path、OS source或durable bytes。`shutdown`是idempotent host-only non-wire seam，不是第五个protocol entry point。Facade `Drop`只发best-effort Closing signal且不阻塞；host必须await shutdown才能观察全部join、root lease release与Closed。
 
 `dispatch()`的外层`Err(RuntimeDispatchError)`通常只表示请求无法进入Runtime/dedup completion owner；一旦进入，领域成功、typed rejection和user pre-Turn cancellation都通过`Ok(CommandResponse { command_id, completion })`返回。 The sole post-admission integrity-fatal outer result is the existing `RuntimeDispatchError::InternalDispatchUnavailable`: DurableState `CommittedCorruptPoisoned`/`IndeterminatePoisoned`, or a post-commit required live-publication invariant poison such as owner-settled loaded Workspace installation failure, settles all joined in-process dispatch waiters with that `Err`. It does not claim mutation absence or rejection. Transport sends it if possible then closes, otherwise closes the connection; hosts query/reopen and must not blind-retry Create/Fork. `RuntimeClosed` is for later requests after close. If marker plus exact payload proves Published but a post-marker sync fails, DurableState first installs catalog and fulfills all waiters with Completed, then enters Closing/shutdown—failure-induced Closing cannot overtake completion. If host shutdown is already Closing, its durable-job settlement phase cannot pass until that Published completion has been fulfilled. No new wire outcome, variant, or code exists; see [ADR 0136](../adr/0136-durablestate-operation-owned-generations.md).
 

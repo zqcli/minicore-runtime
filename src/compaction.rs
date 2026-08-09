@@ -1,21 +1,117 @@
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU8, NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
 use thiserror::Error;
 
 use crate::live_conversation::ConversationRevision;
 use crate::model_gateway::{
-    ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
-    ProviderResponseMetadata,
+    EffectiveModelLimits, ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
+    ProviderResponseMetadata, TokenEstimator, TurnModelRef, TurnModelSnapshot,
 };
-use crate::prompt::ModelMessage;
+use crate::prompt::{
+    AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessage,
+};
 use crate::wire::lexical::validate_safe_text;
 use crate::wire::{EntryId, SessionId};
 
 pub(crate) const MAX_STORED_COMPACTION_SUMMARY_BYTES: usize = 65_536;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompactionSettings {
+    pub enabled: bool,
+    pub pressure_reserve_tokens: NonZeroU32,
+    pub summary_min_output_tokens: NonZeroU32,
+    pub summary_max_output_tokens: NonZeroU32,
+    pub minimum_reclaimed_tokens: NonZeroU32,
+    pub max_compactions_per_turn: NonZeroU8,
+    pub summary_safety_reserve_tokens: NonZeroU32,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pressure_reserve_tokens: NonZeroU32::new(4_096).expect("non-zero default"),
+            summary_min_output_tokens: NonZeroU32::new(512).expect("non-zero default"),
+            summary_max_output_tokens: NonZeroU32::new(2_048).expect("non-zero default"),
+            minimum_reclaimed_tokens: NonZeroU32::new(2_048).expect("non-zero default"),
+            max_compactions_per_turn: NonZeroU8::new(4).expect("non-zero default"),
+            summary_safety_reserve_tokens: NonZeroU32::new(512).expect("non-zero default"),
+        }
+    }
+}
+
+impl CompactionSettings {
+    pub(crate) fn validate(self) -> Result<CompactionSettingsSnapshot, CompactionSettingsError> {
+        if self.summary_min_output_tokens > self.summary_max_output_tokens {
+            return Err(CompactionSettingsError::InvalidSummaryOutputRange);
+        }
+        Ok(CompactionSettingsSnapshot(Arc::new(
+            ValidatedCompactionSettings {
+                enabled: self.enabled,
+                pressure_reserve_tokens: self.pressure_reserve_tokens,
+                summary_min_output_tokens: self.summary_min_output_tokens,
+                summary_max_output_tokens: self.summary_max_output_tokens,
+                minimum_reclaimed_tokens: self.minimum_reclaimed_tokens,
+                max_compactions_per_turn: self.max_compactions_per_turn,
+                summary_safety_reserve_tokens: self.summary_safety_reserve_tokens,
+            },
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum CompactionSettingsError {
+    #[error("compaction summary minimum output exceeds its maximum")]
+    InvalidSummaryOutputRange,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompactionSettingsSnapshot(Arc<ValidatedCompactionSettings>);
+
+#[derive(Debug, Eq, PartialEq)]
+struct ValidatedCompactionSettings {
+    enabled: bool,
+    pressure_reserve_tokens: NonZeroU32,
+    summary_min_output_tokens: NonZeroU32,
+    summary_max_output_tokens: NonZeroU32,
+    minimum_reclaimed_tokens: NonZeroU32,
+    max_compactions_per_turn: NonZeroU8,
+    summary_safety_reserve_tokens: NonZeroU32,
+}
+
+impl CompactionSettingsSnapshot {
+    pub(crate) fn enabled(&self) -> bool {
+        self.0.enabled
+    }
+
+    pub(crate) fn pressure_reserve_tokens(&self) -> NonZeroU32 {
+        self.0.pressure_reserve_tokens
+    }
+
+    pub(crate) fn summary_min_output_tokens(&self) -> NonZeroU32 {
+        self.0.summary_min_output_tokens
+    }
+
+    pub(crate) fn summary_max_output_tokens(&self) -> NonZeroU32 {
+        self.0.summary_max_output_tokens
+    }
+
+    pub(crate) fn minimum_reclaimed_tokens(&self) -> NonZeroU32 {
+        self.0.minimum_reclaimed_tokens
+    }
+
+    pub(crate) fn max_compactions_per_turn(&self) -> NonZeroU8 {
+        self.0.max_compactions_per_turn
+    }
+
+    pub(crate) fn summary_safety_reserve_tokens(&self) -> NonZeroU32 {
+        self.0.summary_safety_reserve_tokens
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum CompactionValueError {
@@ -190,12 +286,10 @@ impl LiveCompactionSourceView {
         })
     }
 
-    #[cfg(test)]
     pub(crate) const fn session_id(&self) -> &SessionId {
         &self.session_id
     }
 
-    #[cfg(test)]
     pub(crate) const fn revision(&self) -> &ConversationRevision {
         &self.revision
     }
@@ -216,6 +310,579 @@ impl LiveCompactionSourceView {
                     left.first_entry_id == right.first_entry_id && left.kind == right.kind
                 })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionTrigger {
+    ProactivePressure,
+    PromptContextOverflow,
+    ProviderContextOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionImpossibleReason {
+    Disabled,
+    EmptySource,
+    UnknownContextLimit,
+    UnestimableSource,
+    CompactionLimitReached,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionPressure {
+    NotNeeded,
+    Recommended,
+    Required,
+    Impossible(CompactionImpossibleReason),
+}
+
+#[derive(Clone)]
+pub(crate) struct CompactionModelBasis {
+    turn_model: TurnModelRef,
+    model_summary: ModelResponseSummary,
+    limits: EffectiveModelLimits,
+    estimator: TokenEstimator,
+    agent_run_output_reserve_tokens: NonZeroU32,
+}
+
+impl CompactionModelBasis {
+    pub(crate) fn from_turn_model(model: &TurnModelSnapshot) -> Self {
+        Self {
+            turn_model: model.turn_model_ref(),
+            model_summary: ModelResponseSummary::reconstruct(
+                model.definition().provider_id().clone(),
+                model.definition().model_id().clone(),
+                model.generation().reasoning(),
+                model.generation().service_class(),
+            ),
+            limits: model.limits(),
+            estimator: model.token_estimator(),
+            agent_run_output_reserve_tokens: model.generation().max_output_tokens(),
+        }
+    }
+
+    pub(crate) const fn turn_model(&self) -> &TurnModelRef {
+        &self.turn_model
+    }
+
+    pub(crate) const fn model_summary(&self) -> &ModelResponseSummary {
+        &self.model_summary
+    }
+
+    pub(crate) const fn limits(&self) -> EffectiveModelLimits {
+        self.limits
+    }
+
+    pub(crate) const fn estimator(&self) -> TokenEstimator {
+        self.estimator
+    }
+
+    pub(crate) const fn agent_run_output_reserve_tokens(&self) -> NonZeroU32 {
+        self.agent_run_output_reserve_tokens
+    }
+}
+
+pub(crate) struct CompactionPressureInput<'a> {
+    pub(crate) source: &'a LiveCompactionSourceView,
+    pub(crate) settings: &'a CompactionSettingsSnapshot,
+    pub(crate) agent_run: &'a AgentRunCompactionAssemblyBasis,
+    pub(crate) model: &'a CompactionModelBasis,
+    pub(crate) trigger: CompactionTrigger,
+    pub(crate) compactions_started: u8,
+}
+
+pub(crate) struct CompactionPlanInput {
+    pub(crate) source: Arc<LiveCompactionSourceView>,
+    pub(crate) settings: CompactionSettingsSnapshot,
+    pub(crate) agent_run: AgentRunCompactionAssemblyBasis,
+    pub(crate) summary_assembly: CompactionSummaryAssemblyBasis,
+    pub(crate) model: CompactionModelBasis,
+    pub(crate) trigger: CompactionTrigger,
+    pub(crate) compactions_started: u8,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompactionSummarySourceView {
+    source_revision: ConversationRevision,
+    messages: Arc<[ModelMessage]>,
+}
+
+impl CompactionSummarySourceView {
+    pub(crate) const fn source_revision(&self) -> ConversationRevision {
+        self.source_revision
+    }
+
+    pub(crate) fn messages(&self) -> &[ModelMessage] {
+        &self.messages
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CompactionSummaryDirective {
+    message: ModelMessage,
+}
+
+impl CompactionSummaryDirective {
+    pub(crate) const fn message(&self) -> &ModelMessage {
+        &self.message
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompactionSummaryBudget {
+    fixed_prompt_tokens: u64,
+    reduced_source_tokens: u64,
+    directive_tokens: u64,
+    safety_reserve_tokens: NonZeroU32,
+    max_output_tokens: NonZeroU32,
+}
+
+impl CompactionSummaryBudget {
+    pub(crate) const fn fixed_prompt_tokens(&self) -> u64 {
+        self.fixed_prompt_tokens
+    }
+
+    pub(crate) const fn reduced_source_tokens(&self) -> u64 {
+        self.reduced_source_tokens
+    }
+
+    pub(crate) const fn directive_tokens(&self) -> u64 {
+        self.directive_tokens
+    }
+
+    pub(crate) const fn safety_reserve_tokens(&self) -> NonZeroU32 {
+        self.safety_reserve_tokens
+    }
+
+    pub(crate) const fn max_output_tokens(&self) -> NonZeroU32 {
+        self.max_output_tokens
+    }
+}
+
+pub(crate) struct CompactionPlan {
+    source: Arc<LiveCompactionSourceView>,
+    settings: CompactionSettingsSnapshot,
+    trigger: CompactionTrigger,
+    summarized_unit_count: NonZeroUsize,
+    summary_source: Arc<CompactionSummarySourceView>,
+    directive: CompactionSummaryDirective,
+    budget: CompactionSummaryBudget,
+    model: CompactionModelBasis,
+    estimated_before_tokens: u64,
+    estimated_after_upper_bound_tokens: u64,
+    estimated_reclaimed_tokens: u64,
+}
+
+impl CompactionPlan {
+    pub(crate) const fn source(&self) -> &Arc<LiveCompactionSourceView> {
+        &self.source
+    }
+
+    pub(crate) const fn settings(&self) -> &CompactionSettingsSnapshot {
+        &self.settings
+    }
+
+    pub(crate) const fn trigger(&self) -> CompactionTrigger {
+        self.trigger
+    }
+
+    pub(crate) const fn summarized_unit_count(&self) -> NonZeroUsize {
+        self.summarized_unit_count
+    }
+
+    pub(crate) const fn summary_source(&self) -> &Arc<CompactionSummarySourceView> {
+        &self.summary_source
+    }
+
+    pub(crate) const fn directive(&self) -> &CompactionSummaryDirective {
+        &self.directive
+    }
+
+    pub(crate) const fn budget(&self) -> &CompactionSummaryBudget {
+        &self.budget
+    }
+
+    pub(crate) const fn model(&self) -> &CompactionModelBasis {
+        &self.model
+    }
+
+    pub(crate) fn retained_units(&self) -> &[LiveCompactionUnit] {
+        &self.source.units()[self.summarized_unit_count.get()..]
+    }
+
+    pub(crate) fn first_kept_entry_id(&self) -> Option<EntryId> {
+        self.source
+            .units()
+            .get(self.summarized_unit_count.get())
+            .map(|unit| *unit.first_entry_id())
+    }
+
+    pub(crate) const fn estimated_before_tokens(&self) -> u64 {
+        self.estimated_before_tokens
+    }
+
+    pub(crate) const fn estimated_after_upper_bound_tokens(&self) -> u64 {
+        self.estimated_after_upper_bound_tokens
+    }
+
+    pub(crate) const fn estimated_reclaimed_tokens(&self) -> u64 {
+        self.estimated_reclaimed_tokens
+    }
+}
+
+impl fmt::Debug for CompactionPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactionPlan")
+            .field("trigger", &self.trigger)
+            .field("summarized_unit_count", &self.summarized_unit_count)
+            .field("budget", &self.budget)
+            .field("estimated_before_tokens", &self.estimated_before_tokens)
+            .field(
+                "estimated_after_upper_bound_tokens",
+                &self.estimated_after_upper_bound_tokens,
+            )
+            .field(
+                "estimated_reclaimed_tokens",
+                &self.estimated_reclaimed_tokens,
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompactionErrorReason {
+    NotNeeded,
+    Impossible(CompactionImpossibleReason),
+    MismatchedEstimator,
+    ArithmeticOverflow,
+    InvalidDirective,
+    NoFeasibleSummaryBudget,
+    NoFeasiblePostReplace,
+    InsufficientReclaim,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct CompactionError {
+    reason: CompactionErrorReason,
+}
+
+impl CompactionError {
+    const fn new(reason: CompactionErrorReason) -> Self {
+        Self { reason }
+    }
+
+    pub(crate) const fn reason(self) -> CompactionErrorReason {
+        self.reason
+    }
+}
+
+impl fmt::Debug for CompactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompactionError")
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+impl fmt::Display for CompactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("compaction planning failed")
+    }
+}
+
+impl Error for CompactionError {}
+
+pub(crate) struct Compaction;
+
+impl Compaction {
+    pub(crate) fn pressure(&self, input: CompactionPressureInput<'_>) -> CompactionPressure {
+        let hard_trigger = !matches!(input.trigger, CompactionTrigger::ProactivePressure);
+        if !input.settings.enabled() {
+            return if hard_trigger {
+                CompactionPressure::Impossible(CompactionImpossibleReason::Disabled)
+            } else {
+                CompactionPressure::NotNeeded
+            };
+        }
+        if input.source.units().is_empty() {
+            return if hard_trigger {
+                CompactionPressure::Impossible(CompactionImpossibleReason::EmptySource)
+            } else {
+                CompactionPressure::NotNeeded
+            };
+        }
+        let Some(context_window) = input.model.limits().context_window_tokens() else {
+            return if hard_trigger {
+                CompactionPressure::Impossible(CompactionImpossibleReason::UnknownContextLimit)
+            } else {
+                CompactionPressure::NotNeeded
+            };
+        };
+
+        let estimated_units = match estimate_stable_units(input.source, input.model.estimator()) {
+            Some(estimates) => estimates,
+            None => {
+                return if hard_trigger {
+                    CompactionPressure::Impossible(CompactionImpossibleReason::UnestimableSource)
+                } else {
+                    CompactionPressure::NotNeeded
+                };
+            }
+        };
+        if hard_trigger
+            && input.compactions_started >= input.settings.max_compactions_per_turn().get()
+        {
+            return CompactionPressure::Impossible(
+                CompactionImpossibleReason::CompactionLimitReached,
+            );
+        }
+        if hard_trigger {
+            return CompactionPressure::Required;
+        }
+
+        let estimated_input = estimated_units
+            .iter()
+            .try_fold(input.agent_run.fixed_input_tokens(), |total, estimate| {
+                total.checked_add(*estimate)
+            });
+        let Some(estimated_input) = estimated_input else {
+            return required_pressure(input.settings, input.compactions_started);
+        };
+        let context_window = u64::from(context_window.get());
+        if estimated_input >= context_window {
+            return required_pressure(input.settings, input.compactions_started);
+        }
+        let effective_headroom = u64::from(
+            input
+                .settings
+                .pressure_reserve_tokens()
+                .max(input.model.agent_run_output_reserve_tokens())
+                .get(),
+        );
+        match estimated_input.checked_add(effective_headroom) {
+            None => required_pressure(input.settings, input.compactions_started),
+            Some(with_headroom) if with_headroom >= context_window => {
+                CompactionPressure::Recommended
+            }
+            Some(_) => CompactionPressure::NotNeeded,
+        }
+    }
+
+    pub(crate) fn plan(
+        &self,
+        input: CompactionPlanInput,
+    ) -> Result<Arc<CompactionPlan>, CompactionError> {
+        if input.agent_run.estimator() != input.model.estimator()
+            || input.summary_assembly.estimator() != input.model.estimator()
+        {
+            return Err(CompactionError::new(
+                CompactionErrorReason::MismatchedEstimator,
+            ));
+        }
+
+        match self.pressure(CompactionPressureInput {
+            source: &input.source,
+            settings: &input.settings,
+            agent_run: &input.agent_run,
+            model: &input.model,
+            trigger: input.trigger,
+            compactions_started: input.compactions_started,
+        }) {
+            CompactionPressure::NotNeeded => {
+                return Err(CompactionError::new(CompactionErrorReason::NotNeeded));
+            }
+            CompactionPressure::Impossible(reason) => {
+                return Err(CompactionError::new(CompactionErrorReason::Impossible(
+                    reason,
+                )));
+            }
+            CompactionPressure::Recommended
+                if input.compactions_started >= input.settings.max_compactions_per_turn().get() =>
+            {
+                return Err(CompactionError::new(CompactionErrorReason::Impossible(
+                    CompactionImpossibleReason::CompactionLimitReached,
+                )));
+            }
+            CompactionPressure::Recommended | CompactionPressure::Required => {}
+        }
+
+        let Some(context_window) = input.model.limits().context_window_tokens() else {
+            return Err(CompactionError::new(CompactionErrorReason::Impossible(
+                CompactionImpossibleReason::UnknownContextLimit,
+            )));
+        };
+        let unit_estimates = estimate_stable_units(&input.source, input.model.estimator())
+            .ok_or_else(|| {
+                CompactionError::new(CompactionErrorReason::Impossible(
+                    CompactionImpossibleReason::UnestimableSource,
+                ))
+            })?;
+        let stable_tokens = unit_estimates
+            .iter()
+            .try_fold(0_u64, |total, estimate| total.checked_add(*estimate));
+        let Some(stable_tokens) = stable_tokens else {
+            return Err(CompactionError::new(
+                CompactionErrorReason::ArithmeticOverflow,
+            ));
+        };
+        let Some(estimated_before_tokens) = input
+            .agent_run
+            .fixed_input_tokens()
+            .checked_add(stable_tokens)
+        else {
+            return Err(CompactionError::new(
+                CompactionErrorReason::ArithmeticOverflow,
+            ));
+        };
+
+        let directive = CompactionSummaryDirective {
+            message: ModelMessage::unstamped_user_text(Arc::from(
+                "Summarize the supplied stable conversation prefix into portable text. Preserve user intent, decisions, constraints, tool call identifiers, important results, and unresolved work. Return only the summary.",
+            ))
+            .map_err(|_| CompactionError::new(CompactionErrorReason::InvalidDirective))?,
+        };
+        let directive_tokens = directive
+            .message()
+            .compaction_estimated_tokens(input.model.estimator())
+            .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+        let context_window = u64::from(context_window.get());
+        let effective_headroom = u64::from(
+            input
+                .settings
+                .pressure_reserve_tokens()
+                .max(input.model.agent_run_output_reserve_tokens())
+                .get(),
+        );
+        let mut summarized_tokens = 0_u64;
+        let mut saw_summary_budget = false;
+        let mut saw_post_replace_fit = false;
+
+        for (index, unit_estimate) in unit_estimates.iter().enumerate() {
+            summarized_tokens = summarized_tokens
+                .checked_add(*unit_estimate)
+                .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            let available_output = context_window
+                .checked_sub(input.summary_assembly.fixed_prompt_tokens())
+                .and_then(|available| available.checked_sub(summarized_tokens))
+                .and_then(|available| available.checked_sub(directive_tokens))
+                .and_then(|available| {
+                    available.checked_sub(u64::from(
+                        input.settings.summary_safety_reserve_tokens().get(),
+                    ))
+                });
+            let Some(available_output) = available_output else {
+                continue;
+            };
+            let available_output = u32::try_from(available_output)
+                .map_err(|_| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            let mut max_output_tokens = input.settings.summary_max_output_tokens().get();
+            if let Some(model_maximum) = input.model.limits().max_output_tokens() {
+                max_output_tokens = max_output_tokens.min(model_maximum.get());
+            }
+            max_output_tokens = max_output_tokens.min(available_output);
+            let Some(max_output_tokens) = NonZeroU32::new(max_output_tokens) else {
+                continue;
+            };
+            if max_output_tokens < input.settings.summary_min_output_tokens() {
+                continue;
+            }
+            saw_summary_budget = true;
+
+            let retained_tokens = stable_tokens
+                .checked_sub(summarized_tokens)
+                .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            let estimated_after_upper_bound_tokens = input
+                .agent_run
+                .fixed_input_tokens()
+                .checked_add(input.agent_run.rolling_summary_message_overhead_tokens())
+                .and_then(|total| total.checked_add(u64::from(max_output_tokens.get())))
+                .and_then(|total| total.checked_add(retained_tokens))
+                .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            let post_replace_with_headroom = estimated_after_upper_bound_tokens
+                .checked_add(effective_headroom)
+                .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            if post_replace_with_headroom > context_window {
+                continue;
+            }
+            saw_post_replace_fit = true;
+            let Some(estimated_reclaimed_tokens) =
+                estimated_before_tokens.checked_sub(estimated_after_upper_bound_tokens)
+            else {
+                continue;
+            };
+            if estimated_reclaimed_tokens
+                < u64::from(input.settings.minimum_reclaimed_tokens().get())
+            {
+                continue;
+            }
+
+            let summarized_unit_count = NonZeroUsize::new(index + 1)
+                .expect("candidate iteration always produces a non-zero cut");
+            let messages: Arc<[ModelMessage]> = input.source.units()[..summarized_unit_count.get()]
+                .iter()
+                .flat_map(|unit| unit.messages().iter().cloned())
+                .collect::<Vec<_>>()
+                .into();
+            return Ok(Arc::new(CompactionPlan {
+                source: Arc::clone(&input.source),
+                settings: input.settings.clone(),
+                trigger: input.trigger,
+                summarized_unit_count,
+                summary_source: Arc::new(CompactionSummarySourceView {
+                    source_revision: *input.source.revision(),
+                    messages,
+                }),
+                directive,
+                budget: CompactionSummaryBudget {
+                    fixed_prompt_tokens: input.summary_assembly.fixed_prompt_tokens(),
+                    reduced_source_tokens: summarized_tokens,
+                    directive_tokens,
+                    safety_reserve_tokens: input.settings.summary_safety_reserve_tokens(),
+                    max_output_tokens,
+                },
+                model: input.model.clone(),
+                estimated_before_tokens,
+                estimated_after_upper_bound_tokens,
+                estimated_reclaimed_tokens,
+            }));
+        }
+
+        Err(CompactionError::new(if !saw_summary_budget {
+            CompactionErrorReason::NoFeasibleSummaryBudget
+        } else if !saw_post_replace_fit {
+            CompactionErrorReason::NoFeasiblePostReplace
+        } else {
+            CompactionErrorReason::InsufficientReclaim
+        }))
+    }
+}
+
+fn required_pressure(
+    settings: &CompactionSettingsSnapshot,
+    compactions_started: u8,
+) -> CompactionPressure {
+    if compactions_started >= settings.max_compactions_per_turn().get() {
+        CompactionPressure::Impossible(CompactionImpossibleReason::CompactionLimitReached)
+    } else {
+        CompactionPressure::Required
+    }
+}
+
+fn estimate_stable_units(
+    source: &LiveCompactionSourceView,
+    estimator: TokenEstimator,
+) -> Option<Vec<u64>> {
+    source
+        .units()
+        .iter()
+        .map(|unit| {
+            unit.messages().iter().try_fold(0_u64, |total, message| {
+                total.checked_add(message.compaction_estimated_tokens(estimator)?)
+            })
+        })
+        .collect()
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -480,8 +1147,10 @@ impl fmt::Debug for StoredCompactionModelCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_gateway::{ModelReasoningSummary, ModelServiceClass};
-    use crate::prompt::ModelMessageRef;
+    use crate::model_gateway::{ModelReasoningSummary, ModelServiceClass, TurnModelSnapshot};
+    use crate::prompt::{
+        AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessageRef,
+    };
 
     fn entry_id(value: &str) -> EntryId {
         value.parse().expect("test entry IDs are valid")
@@ -544,6 +1213,346 @@ mod tests {
                 Some("SECRET-SERVICE-TIER".parse().unwrap()),
             ),
         )
+    }
+
+    fn pressure_model(context_window_tokens: Option<u32>) -> CompactionModelBasis {
+        let snapshot = TurnModelSnapshot::test_fixture_with_policy(
+            context_window_tokens.and_then(NonZeroU32::new),
+            NonZeroU32::new(20),
+            NonZeroU32::new(12).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        CompactionModelBasis::from_turn_model(&snapshot)
+    }
+
+    fn pressure_settings(enabled: bool) -> CompactionSettingsSnapshot {
+        CompactionSettings {
+            enabled,
+            pressure_reserve_tokens: NonZeroU32::new(8).unwrap(),
+            summary_min_output_tokens: NonZeroU32::new(5).unwrap(),
+            summary_max_output_tokens: NonZeroU32::new(10).unwrap(),
+            minimum_reclaimed_tokens: NonZeroU32::new(5).unwrap(),
+            max_compactions_per_turn: NonZeroU8::new(2).unwrap(),
+            summary_safety_reserve_tokens: NonZeroU32::new(2).unwrap(),
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn pressure_source() -> LiveCompactionSourceView {
+        source(
+            session_id("ses_11111111111111111111111111111111"),
+            Arc::from([unit(
+                entry_id("ent_11111111111111111111111111111111"),
+                CompactionUnitKind::UserMessage,
+                "payload",
+            )]),
+        )
+    }
+
+    #[test]
+    fn proactive_pressure_uses_exact_input_and_effective_headroom_thresholds() {
+        let source = pressure_source();
+        let settings = pressure_settings(true);
+        let compaction = Compaction;
+
+        for (context_window, expected) in [
+            (61, CompactionPressure::NotNeeded),
+            (60, CompactionPressure::Recommended),
+            (48, CompactionPressure::Required),
+        ] {
+            let model = pressure_model(Some(context_window));
+            let agent_run = AgentRunCompactionAssemblyBasis::for_test(10, 31, model.estimator());
+            assert_eq!(
+                compaction.pressure(CompactionPressureInput {
+                    source: &source,
+                    settings: &settings,
+                    agent_run: &agent_run,
+                    model: &model,
+                    trigger: CompactionTrigger::ProactivePressure,
+                    compactions_started: 0,
+                }),
+                expected,
+                "unexpected pressure at context window {context_window}"
+            );
+        }
+    }
+
+    #[test]
+    fn hard_overflow_fails_closed_when_compaction_cannot_start() {
+        let source = pressure_source();
+        let model = pressure_model(Some(60));
+        let agent_run = AgentRunCompactionAssemblyBasis::for_test(10, 31, model.estimator());
+        let compaction = Compaction;
+
+        for (settings, source, context, count, expected) in [
+            (
+                pressure_settings(false),
+                &source,
+                Some(&model),
+                0,
+                CompactionImpossibleReason::Disabled,
+            ),
+            (
+                pressure_settings(true),
+                &LiveCompactionSourceView::for_live_reducer(
+                    session_id("ses_11111111111111111111111111111111"),
+                    ConversationRevision::default(),
+                    Arc::from([]),
+                )
+                .unwrap(),
+                Some(&model),
+                0,
+                CompactionImpossibleReason::EmptySource,
+            ),
+            (
+                pressure_settings(true),
+                &source,
+                None,
+                0,
+                CompactionImpossibleReason::UnknownContextLimit,
+            ),
+            (
+                pressure_settings(true),
+                &source,
+                Some(&model),
+                2,
+                CompactionImpossibleReason::CompactionLimitReached,
+            ),
+        ] {
+            let unknown_model;
+            let selected_model = match context {
+                Some(model) => model,
+                None => {
+                    unknown_model = pressure_model(None);
+                    &unknown_model
+                }
+            };
+            assert_eq!(
+                compaction.pressure(CompactionPressureInput {
+                    source,
+                    settings: &settings,
+                    agent_run: &agent_run,
+                    model: selected_model,
+                    trigger: CompactionTrigger::PromptContextOverflow,
+                    compactions_started: count,
+                }),
+                CompactionPressure::Impossible(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn proactive_arithmetic_overflow_obeys_the_per_turn_limit() {
+        let source = pressure_source();
+        let settings = pressure_settings(true);
+        let model = pressure_model(Some(60));
+        let agent_run = AgentRunCompactionAssemblyBasis::for_test(u64::MAX, 31, model.estimator());
+
+        assert_eq!(
+            Compaction.pressure(CompactionPressureInput {
+                source: &source,
+                settings: &settings,
+                agent_run: &agent_run,
+                model: &model,
+                trigger: CompactionTrigger::ProactivePressure,
+                compactions_started: 2,
+            }),
+            CompactionPressure::Impossible(CompactionImpossibleReason::CompactionLimitReached)
+        );
+    }
+
+    fn planning_settings(minimum_reclaimed_tokens: u32) -> CompactionSettingsSnapshot {
+        CompactionSettings {
+            enabled: true,
+            pressure_reserve_tokens: NonZeroU32::new(8).unwrap(),
+            summary_min_output_tokens: NonZeroU32::new(20).unwrap(),
+            summary_max_output_tokens: NonZeroU32::new(40).unwrap(),
+            minimum_reclaimed_tokens: NonZeroU32::new(minimum_reclaimed_tokens).unwrap(),
+            max_compactions_per_turn: NonZeroU8::new(2).unwrap(),
+            summary_safety_reserve_tokens: NonZeroU32::new(5).unwrap(),
+        }
+        .validate()
+        .unwrap()
+    }
+
+    fn planning_model() -> CompactionModelBasis {
+        let snapshot = TurnModelSnapshot::test_fixture_with_policy(
+            NonZeroU32::new(650),
+            NonZeroU32::new(50),
+            NonZeroU32::new(12).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        CompactionModelBasis::from_turn_model(&snapshot)
+    }
+
+    fn planning_source() -> Arc<LiveCompactionSourceView> {
+        Arc::new(source(
+            session_id("ses_11111111111111111111111111111111"),
+            Arc::from([
+                unit(
+                    entry_id("ent_11111111111111111111111111111111"),
+                    CompactionUnitKind::UserMessage,
+                    &"a".repeat(80),
+                ),
+                unit(
+                    entry_id("ent_22222222222222222222222222222222"),
+                    CompactionUnitKind::AssistantMessage,
+                    &"b".repeat(80),
+                ),
+                unit(
+                    entry_id("ent_33333333333333333333333333333333"),
+                    CompactionUnitKind::UserMessage,
+                    &"c".repeat(80),
+                ),
+            ]),
+        ))
+    }
+
+    fn plan_input(minimum_reclaimed_tokens: u32) -> CompactionPlanInput {
+        let model = planning_model();
+        CompactionPlanInput {
+            source: planning_source(),
+            settings: planning_settings(minimum_reclaimed_tokens),
+            agent_run: AgentRunCompactionAssemblyBasis::for_test(10, 31, model.estimator()),
+            summary_assembly: CompactionSummaryAssemblyBasis::for_test(20, model.estimator()),
+            model,
+            trigger: CompactionTrigger::ProviderContextOverflow,
+            compactions_started: 0,
+        }
+    }
+
+    #[test]
+    fn plan_selects_first_feasible_stable_unit_prefix_and_derives_marker() {
+        let input = plan_input(100);
+        let source = Arc::clone(&input.source);
+        let plan = Compaction.plan(input).unwrap();
+
+        assert!(Arc::ptr_eq(plan.source(), &source));
+        assert_eq!(plan.summary_source().source_revision(), *source.revision());
+        assert_eq!(plan.summarized_unit_count().get(), 2);
+        assert_eq!(plan.summary_source().messages().len(), 2);
+        assert_eq!(plan.retained_units().len(), 1);
+        assert_eq!(
+            plan.first_kept_entry_id(),
+            Some(entry_id("ent_33333333333333333333333333333333"))
+        );
+        assert_eq!(plan.budget().max_output_tokens().get(), 40);
+        assert_eq!(plan.estimated_before_tokens(), 343);
+        assert_eq!(plan.estimated_after_upper_bound_tokens(), 192);
+        assert_eq!(plan.estimated_reclaimed_tokens(), 151);
+    }
+
+    #[test]
+    fn plan_all_units_boundary_derives_none_marker() {
+        let plan = Compaction.plan(plan_input(200)).unwrap();
+
+        assert_eq!(plan.summarized_unit_count().get(), 3);
+        assert!(plan.retained_units().is_empty());
+        assert_eq!(plan.first_kept_entry_id(), None);
+        assert_eq!(plan.budget().max_output_tokens().get(), 40);
+    }
+
+    #[test]
+    fn plan_reports_checked_arithmetic_overflow_instead_of_clamping() {
+        let mut input = plan_input(100);
+        input.agent_run =
+            AgentRunCompactionAssemblyBasis::for_test(u64::MAX, 31, input.model.estimator());
+
+        assert_eq!(
+            Compaction.plan(input).unwrap_err().reason(),
+            CompactionErrorReason::ArithmeticOverflow
+        );
+    }
+
+    #[test]
+    fn plan_intersects_configured_and_model_summary_output_limits() {
+        let mut input = plan_input(100);
+        let snapshot = TurnModelSnapshot::test_fixture_with_policy(
+            NonZeroU32::new(650),
+            NonZeroU32::new(30),
+            NonZeroU32::new(12).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        input.model = CompactionModelBasis::from_turn_model(&snapshot);
+
+        let plan = Compaction.plan(input).unwrap();
+        assert_eq!(plan.summarized_unit_count().get(), 2);
+        assert_eq!(plan.budget().max_output_tokens().get(), 30);
+        assert_eq!(plan.estimated_after_upper_bound_tokens(), 182);
+        assert_eq!(plan.estimated_reclaimed_tokens(), 161);
+    }
+
+    #[test]
+    fn plan_distinguishes_summary_budget_and_minimum_reclaim_failures() {
+        let reclaim_error = Compaction.plan(plan_input(300)).unwrap_err();
+        assert_eq!(
+            reclaim_error.reason(),
+            CompactionErrorReason::InsufficientReclaim
+        );
+
+        let mut budget_input = plan_input(100);
+        let snapshot = TurnModelSnapshot::test_fixture_with_policy(
+            NonZeroU32::new(650),
+            NonZeroU32::new(10),
+            NonZeroU32::new(10).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        budget_input.model = CompactionModelBasis::from_turn_model(&snapshot);
+        let budget_error = Compaction.plan(budget_input).unwrap_err();
+        assert_eq!(
+            budget_error.reason(),
+            CompactionErrorReason::NoFeasibleSummaryBudget
+        );
+    }
+
+    #[test]
+    fn plan_rejects_cross_estimator_basis_composition() {
+        let mut input = plan_input(100);
+        let other = TurnModelSnapshot::test_fixture_with_policy(
+            NonZeroU32::new(650),
+            NonZeroU32::new(50),
+            NonZeroU32::new(12).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+        );
+        input.agent_run =
+            AgentRunCompactionAssemblyBasis::for_test(10, 31, other.token_estimator());
+
+        assert_eq!(
+            Compaction.plan(input).unwrap_err().reason(),
+            CompactionErrorReason::MismatchedEstimator
+        );
+    }
+
+    #[test]
+    fn compaction_settings_defaults_validate_and_snapshot_without_drift() {
+        let defaults = CompactionSettings::default();
+        assert!(defaults.enabled);
+        assert_eq!(defaults.pressure_reserve_tokens.get(), 4_096);
+        assert_eq!(defaults.summary_min_output_tokens.get(), 512);
+        assert_eq!(defaults.summary_max_output_tokens.get(), 2_048);
+        assert_eq!(defaults.minimum_reclaimed_tokens.get(), 2_048);
+        assert_eq!(defaults.max_compactions_per_turn.get(), 4);
+        assert_eq!(defaults.summary_safety_reserve_tokens.get(), 512);
+
+        let snapshot = defaults.validate().unwrap();
+        let cloned = snapshot.clone();
+        assert_eq!(snapshot.summary_min_output_tokens().get(), 512);
+        assert_eq!(cloned.summary_max_output_tokens().get(), 2_048);
+        assert!(Arc::ptr_eq(&snapshot.0, &cloned.0));
+    }
+
+    #[test]
+    fn compaction_settings_reject_inverted_summary_output_range() {
+        let settings = CompactionSettings {
+            summary_min_output_tokens: NonZeroU32::new(2_049).unwrap(),
+            ..CompactionSettings::default()
+        };
+
+        assert_eq!(
+            settings.validate(),
+            Err(CompactionSettingsError::InvalidSummaryOutputRange)
+        );
     }
 
     #[test]

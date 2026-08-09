@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0–M8 foundations/behavior已完成；M9.1–M9.21当前control/observation范围已完成并统一review，覆盖bounded queues、Steer/FollowUp、queued cancellation、logical retry、EmergencyControl/SecurityRevoked、runtime-wide CommandId dedup、public command/outcome、Starting/Running/Finishing Snapshot、current Turn/Item/Interaction安全摘要及`session_execution_changed`/terminal StateEvent。具体Skill composition仍后置；下一实施里程碑为M10 Compaction，ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix仍pending。
+状态：Active；M0–M8 foundations/behavior与M9.1–M9.21当前control/observation范围已完成并统一review。M10已完成Runtime-global validated settings、Turn snapshot、Prompt/Model planning basis、pressure classification和checked stable-unit prefix plan；下一切片为CompactionSummary Prompt/ModelCallRequest binding与summary validation，随后闭合ActiveTurnTask Replace/record orchestration。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix仍pending。
 
 初始实现基线：`dev` at `144039a`
 
@@ -558,7 +558,9 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 
 M10完成完整INV-005；M4已经提供source/cut/marker/no-I/O reducer subset，M5已经提供recorded-marker tolerant replay。
 
-当前补充：Session usage按selected conversation history聚合model/compaction calls、optional token totals与currency-separated reported costs；u64/decimal overflow与currency limit产生bounded diagnostics。Recorder Healthy/Degraded及首条安全 recording diagnostic与usage/diagnostics已接通Session Snapshot、Runtime facade和Wire V1；Compaction orchestration/replacement仍后置。
+当前进度：planning foundation已完成。`MiniCoreRuntimeConfig`持有并在open时验证Runtime-global `CompactionSettings`，Turn admission捕获immutable snapshot；PromptSet投影同一Turn estimator下的AgentRun/CompactionSummary fixed assembly basis，TurnModelSnapshot投影exact model basis。`Compaction::pressure()`已闭合proactive/hard overflow、unknown/disabled/empty/count-exhausted分类；`plan()`使用checked `u64`按stable-unit从旧到新选择first feasible prefix，求交summary/model/context budget并同时验证post-Replace headroom与minimum reclaim，只保存source+nonzero cut并派生summary prefix、exact suffix及marker。当前summary source保留exact provider-valid prefix；大ToolResult deterministic reduction与CompactionSummary request/validation、production replacement及ActiveTurnTask orchestration仍后置。
+
+planning foundation已完成统一Standards/Spec review且无blocker；`./scripts/check.sh`全量通过，其中library tests为616 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。
 
 实现：
 

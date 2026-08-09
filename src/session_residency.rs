@@ -27,6 +27,7 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
     SessionLifecycleDecision, SessionLifecycleDecisionError,
 };
+use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
 #[cfg(not(test))]
 use crate::conversation_storage::load_replayed_conversation;
 use crate::conversation_storage::{ConversationLoadError, ConversationReplayError};
@@ -833,6 +834,7 @@ struct ResidencyTurnResources {
     model_gateway: Arc<ModelGateway>,
     model_catalog: Arc<ModelCatalogView>,
     tool_set: Arc<ToolSet>,
+    compaction: CompactionSettingsSnapshot,
 }
 
 impl OperationContext {
@@ -1610,6 +1612,10 @@ impl SessionResidencyRegistry {
         Self::start_inner(task_context, durable_state, resolver, prompt_service, None)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Runtime Turn resource bundle binds the exact captured owners and settings"
+    )]
     pub(crate) fn start_with_turn_resources(
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
@@ -1618,8 +1624,9 @@ impl SessionResidencyRegistry {
         prompt_resources: Arc<PromptResourceView>,
         model_gateway: Arc<ModelGateway>,
         model_catalog: Arc<ModelCatalogView>,
+        compaction: CompactionSettingsSnapshot,
     ) -> Result<Self, SessionResidencyStartError> {
-        Self::start_with_turn_resources_and_tools(
+        Self::start_with_turn_resources_and_tools_and_compaction(
             task_context,
             durable_state,
             resolver,
@@ -1628,6 +1635,7 @@ impl SessionResidencyRegistry {
             model_gateway,
             model_catalog,
             ToolSet::empty(),
+            compaction,
         )
     }
 
@@ -1645,6 +1653,36 @@ impl SessionResidencyRegistry {
         model_catalog: Arc<ModelCatalogView>,
         tool_set: Arc<ToolSet>,
     ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_with_turn_resources_and_tools_and_compaction(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            tool_set,
+            CompactionSettings::default()
+                .validate()
+                .expect("default compaction settings are valid"),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn resource bundle binds the exact runtime owners and settings"
+    )]
+    pub(crate) fn start_with_turn_resources_and_tools_and_compaction(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_set: Arc<ToolSet>,
+        compaction: CompactionSettingsSnapshot,
+    ) -> Result<Self, SessionResidencyStartError> {
         Self::start_inner(
             task_context,
             durable_state,
@@ -1655,6 +1693,7 @@ impl SessionResidencyRegistry {
                 model_gateway,
                 model_catalog,
                 tool_set,
+                compaction,
             }),
         )
     }
@@ -2356,7 +2395,7 @@ async fn run_load(
     let executor_result = match context.turn_resources.as_ref() {
         Some(resources) => {
             SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
-                SessionExecutorDependencies::with_turn_resources_and_tools(
+                SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
                     context.task_context.clone(),
                     context.durable_state.clone(),
                     Arc::clone(&context.resolver),
@@ -2365,6 +2404,7 @@ async fn run_load(
                     Arc::clone(&resources.model_gateway),
                     Arc::clone(&resources.model_catalog),
                     Arc::clone(&resources.tool_set),
+                    resources.compaction.clone(),
                 ),
                 definition,
                 workspace_snapshot,
