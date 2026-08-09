@@ -154,7 +154,7 @@ fn runtime_and_terminal_state_frames_round_trip_with_coherent_routes() {
         panic!("runtime fixture did not decode as state");
     };
     assert_eq!(runtime_event.route(), EventRoute::Runtime);
-    let StateEventMsg::Runtime { kind, snapshot } = runtime_event.msg() else {
+    let StateEventMsg::Runtime { kind, snapshot, .. } = runtime_event.msg() else {
         panic!("runtime fixture did not decode as runtime message");
     };
     assert_eq!(*kind, RuntimeStateEventKind::CommandCatalogInvalidated);

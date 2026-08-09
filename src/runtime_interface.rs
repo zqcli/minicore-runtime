@@ -2387,6 +2387,10 @@ pub enum EventRoute {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeStateEventKind {
+    SessionCreated,
+    SessionLoaded,
+    SessionUnloaded,
+    SessionForked,
     CommandCatalogInvalidated,
 }
 
@@ -2451,10 +2455,17 @@ pub enum SessionEventDetail {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RuntimeEventDetail {
+    SessionChanged { session: Box<SessionSummary> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateEventMsg {
     Runtime {
         kind: RuntimeStateEventKind,
         snapshot: RuntimeSnapshot,
+        detail: Option<RuntimeEventDetail>,
     },
     Session {
         kind: SessionStateEventKind,
@@ -2474,6 +2485,13 @@ impl StateEventMsg {
     pub const fn runtime_snapshot(&self) -> Option<&RuntimeSnapshot> {
         match self {
             Self::Runtime { snapshot, .. } => Some(snapshot),
+            Self::Session { .. } => None,
+        }
+    }
+
+    pub const fn runtime_detail(&self) -> Option<&RuntimeEventDetail> {
+        match self {
+            Self::Runtime { detail, .. } => detail.as_ref(),
             Self::Session { .. } => None,
         }
     }
@@ -2539,6 +2557,102 @@ impl StateEvent {
             msg: StateEventMsg::Runtime {
                 kind: RuntimeStateEventKind::CommandCatalogInvalidated,
                 snapshot,
+                detail: None,
+            },
+        }
+    }
+
+    pub fn session_forked(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        let session_id = session.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Runtime {
+                kind: RuntimeStateEventKind::SessionForked,
+                snapshot,
+                detail: Some(RuntimeEventDetail::SessionChanged {
+                    session: Box::new(session),
+                }),
+            },
+        }
+    }
+
+    pub fn session_created(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        let session_id = session.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Runtime {
+                kind: RuntimeStateEventKind::SessionCreated,
+                snapshot,
+                detail: Some(RuntimeEventDetail::SessionChanged {
+                    session: Box::new(session),
+                }),
+            },
+        }
+    }
+
+    pub fn session_loaded(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session_id: SessionId,
+    ) -> Self {
+        Self::runtime_session_membership(
+            timestamp,
+            command_id,
+            snapshot,
+            session_id,
+            RuntimeStateEventKind::SessionLoaded,
+        )
+    }
+
+    pub fn session_unloaded(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session_id: SessionId,
+    ) -> Self {
+        Self::runtime_session_membership(
+            timestamp,
+            command_id,
+            snapshot,
+            session_id,
+            RuntimeStateEventKind::SessionUnloaded,
+        )
+    }
+
+    fn runtime_session_membership(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session_id: SessionId,
+        kind: RuntimeStateEventKind,
+    ) -> Self {
+        debug_assert!(matches!(
+            kind,
+            RuntimeStateEventKind::SessionLoaded | RuntimeStateEventKind::SessionUnloaded
+        ));
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: None,
             },
         }
     }
@@ -2635,14 +2749,61 @@ impl StateEvent {
         route: EventRoute,
         msg: StateEventMsg,
     ) -> Result<Self, ObservationValueError> {
-        let valid = match (&route, &msg) {
+        if !Self::contract_is_valid(&route, &msg) {
+            return Err(ObservationValueError::InconsistentStateEvent);
+        }
+        Ok(Self {
+            timestamp,
+            command_id,
+            route,
+            msg,
+        })
+    }
+
+    pub(crate) fn has_valid_contract(&self) -> bool {
+        Self::contract_is_valid(&self.route, &self.msg)
+    }
+
+    fn contract_is_valid(route: &EventRoute, msg: &StateEventMsg) -> bool {
+        match (route, msg) {
             (
                 EventRoute::Runtime,
                 StateEventMsg::Runtime {
                     kind: RuntimeStateEventKind::CommandCatalogInvalidated,
+                    detail: None,
                     ..
                 },
             ) => true,
+            (
+                EventRoute::Session { session_id },
+                StateEventMsg::Runtime {
+                    kind:
+                        kind @ (RuntimeStateEventKind::SessionCreated
+                        | RuntimeStateEventKind::SessionForked),
+                    detail: Some(RuntimeEventDetail::SessionChanged { session }),
+                    ..
+                },
+            ) => {
+                *session_id == session.session_id()
+                    && session.lifecycle() == SessionLifecycleView::Open
+                    && (matches!(kind, RuntimeStateEventKind::SessionForked) == session.forked())
+            }
+            (
+                EventRoute::Session { session_id },
+                StateEventMsg::Runtime {
+                    kind:
+                        kind @ (RuntimeStateEventKind::SessionLoaded
+                        | RuntimeStateEventKind::SessionUnloaded),
+                    snapshot,
+                    detail: None,
+                },
+            ) => {
+                let loaded = snapshot
+                    .loaded_sessions()
+                    .iter()
+                    .any(|session| session.session_id() == *session_id);
+                matches!(kind, RuntimeStateEventKind::SessionLoaded) == loaded
+            }
             (
                 EventRoute::Turn {
                     session_id,
@@ -2682,16 +2843,7 @@ impl StateEvent {
                 },
             ) => *session_id == snapshot.session_id(),
             _ => false,
-        };
-        if !valid {
-            return Err(ObservationValueError::InconsistentStateEvent);
         }
-        Ok(Self {
-            timestamp,
-            command_id,
-            route,
-            msg,
-        })
     }
 
     pub const fn timestamp(&self) -> Timestamp {

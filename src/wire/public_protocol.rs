@@ -19,17 +19,18 @@ use crate::runtime_interface::{
     ItemView, NewSessionDefinition, NewSessionMetadata, Page, PageRequest, PublicCancelTarget,
     PublicIngressLane, PublicSubject, QueryError, QueryErrorCode, QueryResponse, QueryResult,
     QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
-    RuntimeDiagnosticView, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
-    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind,
-    RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary,
-    SessionDiagnosticView, SessionEventDetail, SessionExecutionView, SessionForkProvenanceView,
-    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
-    SessionReadinessView, SessionRecordingState, SessionRecordingView, SessionSnapshot,
-    SessionStateEventKind, SessionSummary, SessionUsageView, SnapshotRequest, SnapshotResponse,
-    StateEvent, StateEventMsg, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionRequest,
-    SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView,
-    TurnStatusView, TurnTerminalView, validate_command_error_contract,
-    validate_command_error_message, validate_command_output,
+    RuntimeDiagnosticView, RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand,
+    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot,
+    RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
+    SessionDefinitionSummary, SessionDiagnosticView, SessionEventDetail, SessionExecutionView,
+    SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
+    SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingState,
+    SessionRecordingView, SessionSnapshot, SessionStateEventKind, SessionSummary, SessionUsageView,
+    SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg, SubmitAdmissionStateView,
+    SubmitAdmissionView, SubscriptionRequest, SubscriptionScope, TurnCommand,
+    TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView, TurnStatusView,
+    TurnTerminalView, validate_command_error_contract, validate_command_error_message,
+    validate_command_output,
 };
 use crate::skills::SkillId;
 use crate::tools::{
@@ -751,17 +752,6 @@ impl<'de> Deserialize<'de> for UnsupportedObservationInput {
         Err(serde::de::Error::custom(
             "observation value belongs to a pending protocol slice",
         ))
-    }
-}
-
-struct UnsupportedObservationOutput;
-
-impl Serialize for UnsupportedObservationOutput {
-    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        unreachable!("unsupported observation outputs cannot be constructed")
     }
 }
 
@@ -1894,15 +1884,14 @@ enum StateEventMsgInput {
 impl StateEventMsgInput {
     fn into_semantic(self, limits: ProtocolLimits) -> Result<StateEventMsg, TypedJsonError> {
         Ok(match self {
-            Self::Runtime(value) => {
-                if value.detail.is_some() {
-                    return Err(invalid_scalar());
-                }
-                StateEventMsg::Runtime {
-                    kind: value.kind.into_semantic()?,
-                    snapshot: value.snapshot.into_semantic(limits)?,
-                }
-            }
+            Self::Runtime(value) => StateEventMsg::Runtime {
+                kind: value.kind.into_semantic()?,
+                snapshot: value.snapshot.into_semantic(limits)?,
+                detail: value
+                    .detail
+                    .map(|detail| detail.into_semantic(limits))
+                    .transpose()?,
+            },
             Self::Session(value) => {
                 let SessionStateEventInput {
                     kind,
@@ -1925,21 +1914,50 @@ impl StateEventMsgInput {
 struct RuntimeStateEventInput {
     kind: RuntimeStateEventKindInput,
     snapshot: RuntimeSnapshotInput,
-    detail: Option<UnsupportedObservationInput>,
+    detail: Option<RuntimeEventDetailInput>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeStateEventKindInput {
+    SessionCreated,
+    SessionLoaded,
+    SessionUnloaded,
+    SessionForked,
     CommandCatalogInvalidated,
 }
 
 impl RuntimeStateEventKindInput {
     fn into_semantic(self) -> Result<RuntimeStateEventKind, TypedJsonError> {
         Ok(match self {
+            Self::SessionCreated => RuntimeStateEventKind::SessionCreated,
+            Self::SessionLoaded => RuntimeStateEventKind::SessionLoaded,
+            Self::SessionUnloaded => RuntimeStateEventKind::SessionUnloaded,
+            Self::SessionForked => RuntimeStateEventKind::SessionForked,
             Self::CommandCatalogInvalidated => RuntimeStateEventKind::CommandCatalogInvalidated,
         })
     }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum RuntimeEventDetailInput {
+    SessionChanged(Box<SessionChangedDetailInput>),
+}
+
+impl RuntimeEventDetailInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<RuntimeEventDetail, TypedJsonError> {
+        match self {
+            Self::SessionChanged(detail) => Ok(RuntimeEventDetail::SessionChanged {
+                session: Box::new(detail.session.into_semantic(limits)?),
+            }),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SessionChangedDetailInput {
+    session: SessionSummaryInput,
 }
 
 #[derive(Deserialize)]
@@ -3161,10 +3179,14 @@ enum StateEventMsgOutput<'a> {
 impl<'a> StateEventMsgOutput<'a> {
     fn from_semantic(value: &'a StateEventMsg) -> Self {
         match value {
-            StateEventMsg::Runtime { kind, snapshot } => Self::Runtime(RuntimeStateEventOutput {
+            StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail,
+            } => Self::Runtime(RuntimeStateEventOutput {
                 kind: RuntimeStateEventKindOutput::from_semantic(*kind),
                 snapshot: RuntimeSnapshotOutput::from_semantic(snapshot),
-                detail: None,
+                detail: detail.as_ref().map(RuntimeEventDetailOutput::from_semantic),
             }),
             StateEventMsg::Session {
                 kind,
@@ -3183,21 +3205,52 @@ impl<'a> StateEventMsgOutput<'a> {
 struct RuntimeStateEventOutput<'a> {
     kind: RuntimeStateEventKindOutput,
     snapshot: RuntimeSnapshotOutput<'a>,
-    detail: Option<UnsupportedObservationOutput>,
+    detail: Option<RuntimeEventDetailOutput<'a>>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeStateEventKindOutput {
+    SessionCreated,
+    SessionLoaded,
+    SessionUnloaded,
+    SessionForked,
     CommandCatalogInvalidated,
 }
 
 impl RuntimeStateEventKindOutput {
     const fn from_semantic(value: RuntimeStateEventKind) -> Self {
         match value {
+            RuntimeStateEventKind::SessionCreated => Self::SessionCreated,
+            RuntimeStateEventKind::SessionLoaded => Self::SessionLoaded,
+            RuntimeStateEventKind::SessionUnloaded => Self::SessionUnloaded,
+            RuntimeStateEventKind::SessionForked => Self::SessionForked,
             RuntimeStateEventKind::CommandCatalogInvalidated => Self::CommandCatalogInvalidated,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum RuntimeEventDetailOutput<'a> {
+    SessionChanged(Box<SessionChangedDetailOutput<'a>>),
+}
+
+impl<'a> RuntimeEventDetailOutput<'a> {
+    fn from_semantic(value: &'a RuntimeEventDetail) -> Self {
+        match value {
+            RuntimeEventDetail::SessionChanged { session } => {
+                Self::SessionChanged(Box::new(SessionChangedDetailOutput {
+                    session: SessionSummaryOutput::from_semantic(session),
+                }))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SessionChangedDetailOutput<'a> {
+    session: SessionSummaryOutput<'a>,
 }
 
 #[derive(Serialize)]
@@ -5383,19 +5436,27 @@ fn validate_query_response_semantic_limits(
             }
             validate_semantic_page_cursor(page.next_cursor(), limits)?;
             for session in page.items() {
-                let metadata = session.metadata();
-                SessionMetadataView::new_with_limits(
-                    metadata.revision(),
-                    metadata.name(),
-                    metadata.description(),
-                    metadata.updated_at(),
-                    limits,
-                )
-                .map_err(|_| invalid_scalar())?;
+                validate_session_summary_semantic_limits(session, limits)?;
             }
             Ok(())
         }
     }
+}
+
+fn validate_session_summary_semantic_limits(
+    session: &SessionSummary,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let metadata = session.metadata();
+    SessionMetadataView::new_with_limits(
+        metadata.revision(),
+        metadata.name(),
+        metadata.description(),
+        metadata.updated_at(),
+        limits,
+    )
+    .map(|_| ())
+    .map_err(|_| invalid_scalar())
 }
 
 fn validate_semantic_page_cursor(
@@ -5872,14 +5933,25 @@ fn validate_event_frame_semantic_limits(
 ) -> Result<(), TypedJsonError> {
     match frame {
         EventFrame::Snapshot(snapshot) => validate_snapshot_semantic_limits(snapshot, limits),
-        EventFrame::State(event) => match event.msg() {
-            StateEventMsg::Runtime { snapshot, .. } => {
-                validate_runtime_snapshot_semantic_limits(snapshot, limits)
+        EventFrame::State(event) => {
+            if !event.has_valid_contract() {
+                return Err(invalid_scalar());
             }
-            StateEventMsg::Session { snapshot, .. } => {
-                validate_session_snapshot_semantic_limits(snapshot, limits)
+            match event.msg() {
+                StateEventMsg::Runtime {
+                    snapshot, detail, ..
+                } => {
+                    validate_runtime_snapshot_semantic_limits(snapshot, limits)?;
+                    if let Some(RuntimeEventDetail::SessionChanged { session }) = detail {
+                        validate_session_summary_semantic_limits(session, limits)?;
+                    }
+                    Ok(())
+                }
+                StateEventMsg::Session { snapshot, .. } => {
+                    validate_session_snapshot_semantic_limits(snapshot, limits)
+                }
             }
-        },
+        }
     }
 }
 
@@ -6469,6 +6541,39 @@ fn validate_runtime_state_msg(
         .ok_or_else(typed_wrong_json_type)?;
     let snapshot = required(object, "snapshot")?;
     match kind {
+        "session_loaded" | "session_unloaded" => {
+            if route.family != EventRouteFamily::Session
+                || object
+                    .get("detail")
+                    .is_some_and(|detail| !matches!(detail, JsonNode::Null))
+            {
+                return Err(invalid_scalar());
+            }
+            match validate_runtime_snapshot_shape(snapshot, limits) {
+                Ok(()) => Ok(false),
+                Err(error) if error.is_pending_public_target() => Ok(true),
+                Err(error) => Err(error),
+            }
+        }
+        "session_created" | "session_forked" => {
+            if route.family != EventRouteFamily::Session {
+                return Err(invalid_scalar());
+            }
+            let summary = validate_runtime_session_changed_detail(
+                object.get("detail").ok_or_else(missing_required_field)?,
+            )?;
+            if route.session_id != Some(summary.session_id)
+                || summary.lifecycle != SessionLifecycleView::Open
+                || ((kind == "session_forked") != summary.forked)
+            {
+                return Err(invalid_scalar());
+            }
+            match validate_runtime_snapshot_shape(snapshot, limits) {
+                Ok(()) => Ok(false),
+                Err(error) if error.is_pending_public_target() => Ok(true),
+                Err(error) => Err(error),
+            }
+        }
         "command_catalog_invalidated" => {
             if route.family != EventRouteFamily::Runtime
                 || object
@@ -6495,6 +6600,21 @@ fn validate_runtime_state_msg(
             Ok(true)
         }
     }
+}
+
+fn validate_runtime_session_changed_detail(
+    node: &JsonNode,
+) -> Result<SessionSummaryFacts, TypedJsonError> {
+    validate_adjacent_output(node, |kind, data| match kind {
+        "session_changed" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_session_summary(required(object, "session")?)
+        }
+        _ => Err(unknown_output_variant()),
+    })
 }
 
 fn validate_runtime_snapshot_outer_shape(
@@ -7611,31 +7731,50 @@ fn validate_session_page(node: &JsonNode, limits: ProtocolLimits) -> Result<(), 
         return Err(invalid_scalar());
     }
     for item in items {
-        let item = item.as_object().ok_or_else(selected_wrong_json_type)?;
-        validate_id::<SessionId>(required(item, "sessionId")?)?;
-        required(item, "definitionRevision")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<SessionDefinitionRevision>()
-            .map_err(|_| invalid_scalar())?;
-        validate_session_metadata_summary(required(item, "metadata")?)?;
-        match required(item, "lifecycle")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-        {
-            "open" | "archived" | "deleted" => {}
-            _ => return Err(unknown_output_variant()),
-        }
-        if !matches!(required(item, "forked")?, JsonNode::Bool(_)) {
-            return Err(typed_wrong_json_type());
-        }
-        required(item, "createdAt")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<Timestamp>()
-            .map_err(|_| invalid_scalar())?;
+        validate_session_summary(item)?;
     }
     validate_page_next_cursor(object, limits)
+}
+
+#[derive(Clone, Copy)]
+struct SessionSummaryFacts {
+    session_id: SessionId,
+    lifecycle: SessionLifecycleView,
+    forked: bool,
+}
+
+fn validate_session_summary(node: &JsonNode) -> Result<SessionSummaryFacts, TypedJsonError> {
+    let item = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let session_id = parse_id::<SessionId>(required(item, "sessionId")?)?;
+    required(item, "definitionRevision")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<SessionDefinitionRevision>()
+        .map_err(|_| invalid_scalar())?;
+    validate_session_metadata_summary(required(item, "metadata")?)?;
+    let lifecycle = match required(item, "lifecycle")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "open" => SessionLifecycleView::Open,
+        "archived" => SessionLifecycleView::Archived,
+        "deleted" => SessionLifecycleView::Deleted,
+        _ => return Err(unknown_output_variant()),
+    };
+    let forked = match required(item, "forked")? {
+        JsonNode::Bool(forked) => *forked,
+        _ => return Err(typed_wrong_json_type()),
+    };
+    required(item, "createdAt")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<Timestamp>()
+        .map_err(|_| invalid_scalar())?;
+    Ok(SessionSummaryFacts {
+        session_id,
+        lifecycle,
+        forked,
+    })
 }
 
 fn validate_session_metadata_summary(node: &JsonNode) -> Result<(), TypedJsonError> {

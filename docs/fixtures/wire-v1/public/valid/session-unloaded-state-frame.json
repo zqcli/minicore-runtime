@@ -1,0 +1,1 @@
+{"type":"state","data":{"timestamp":"2026-08-03T10:01:30.456Z","commandId":"cmd_44444444444444444444444444444444","route":{"type":"session","data":{"sessionId":"ses_22222222222222222222222222222222"}},"msg":{"type":"runtime","data":{"kind":"session_unloaded","snapshot":{"runtime":{"status":"running"},"loadedSessions":[],"diagnostics":[]},"detail":null}}}}

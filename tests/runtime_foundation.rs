@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use minicore_runtime::runtime_interface::{
-    AgentQuery, AgentQueryResult, CommandRequest, PageRequest, QueryErrorCode, QueryResult,
-    RuntimeCommand, RuntimeQuery, SessionCommand, SessionQuery, SessionQueryResult,
+    AgentQuery, AgentQueryResult, CommandCompletion, CommandOutcome, CommandRequest, EventFrame,
+    EventRoute, PageRequest, QueryErrorCode, QueryResult, RuntimeCommand, RuntimeEventDetail,
+    RuntimeQuery, RuntimeStateEventKind, SessionCommand, SessionQuery, SessionQueryResult,
+    SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope,
 };
 use minicore_runtime::wire::CommandId;
 use minicore_runtime::{
@@ -712,6 +714,78 @@ async fn public_query_returns_durable_session_fork_provenance() {
         response.data(),
         QueryResult::Session(SessionQueryResult::ForkProvenance(None))
     ));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runtime_subscription_publishes_session_forked_after_its_snapshot() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g1_session(
+        root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-source.jsonl"),
+    );
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Fork source opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let command_id = CommandId::generate().unwrap();
+    let response = runtime
+        .dispatch(CommandRequest::new(
+            command_id,
+            RuntimeCommand::Session(SessionCommand::Fork {
+                source_session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                anchor: minicore_runtime::agent_session_lifecycle::ForkAnchor::Genesis,
+            }),
+        ))
+        .await
+        .expect("the Fork command dispatches");
+    let CommandCompletion::Completed {
+        outcome: CommandOutcome::SessionForked { session_id, .. },
+        output: None,
+    } = response.completion()
+    else {
+        panic!("the Fork command returns its typed outcome");
+    };
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .expect("the Runtime event publisher responds")
+        .expect("the Runtime subscription remains open");
+    let EventFrame::State(event) = event else {
+        panic!("the second Runtime frame is a StateEvent");
+    };
+    assert_eq!(event.command_id(), Some(command_id));
+    assert_eq!(
+        event.route(),
+        EventRoute::Session {
+            session_id: *session_id
+        }
+    );
+    let StateEventMsg::Runtime {
+        kind,
+        detail: Some(RuntimeEventDetail::SessionChanged { session }),
+        ..
+    } = event.msg()
+    else {
+        panic!("SessionForked carries one safe Session summary");
+    };
+    assert_eq!(*kind, RuntimeStateEventKind::SessionForked);
+    assert_eq!(session.session_id(), *session_id);
+    assert!(session.forked());
 
     runtime.shutdown().await;
 }

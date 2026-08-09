@@ -5,10 +5,10 @@ use minicore_runtime::agent_session_lifecycle::{ForkAnchor, ForkSourceKind};
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
     CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
-    PublicCancelTarget, PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand, RuntimeRequest,
-    RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionStateEventKind,
-    SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView, TurnInterruptionView,
-    TurnStatusView, TurnTerminalView,
+    PublicCancelTarget, PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand,
+    RuntimeEventDetail, RuntimeRequest, RuntimeStateEventKind, SessionCommand, SessionEventDetail,
+    SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView,
+    TurnInterruptionView, TurnStatusView, TurnTerminalView,
 };
 use minicore_runtime::turn_item_interaction::InteractionRequestView;
 use minicore_runtime::wire::{
@@ -274,11 +274,67 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
         }
         (Some("runtime_catalog_invalidated_state"), EventFrame::State(event)) => {
             assert_eq!(event.route(), EventRoute::Runtime);
-            let StateEventMsg::Runtime { kind, snapshot } = event.msg() else {
+            let StateEventMsg::Runtime { kind, snapshot, .. } = event.msg() else {
                 panic!("runtime state assertion requires a Runtime message");
             };
             assert_eq!(*kind, RuntimeStateEventKind::CommandCatalogInvalidated);
             assert!(snapshot.loaded_sessions().is_empty());
+        }
+        (
+            Some(
+                assertion @ ("session_created_state"
+                | "session_loaded_state"
+                | "session_unloaded_state"
+                | "session_forked_state"),
+            ),
+            EventFrame::State(event),
+        ) => {
+            let StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail,
+            } = event.msg()
+            else {
+                panic!("runtime Session state assertion requires a Runtime message");
+            };
+            let expected_kind = match assertion {
+                "session_created_state" => RuntimeStateEventKind::SessionCreated,
+                "session_loaded_state" => RuntimeStateEventKind::SessionLoaded,
+                "session_unloaded_state" => RuntimeStateEventKind::SessionUnloaded,
+                "session_forked_state" => RuntimeStateEventKind::SessionForked,
+                _ => unreachable!(),
+            };
+            assert_eq!(*kind, expected_kind);
+            let EventRoute::Session { session_id } = event.route() else {
+                panic!("runtime Session state assertion requires a Session route");
+            };
+            match kind {
+                RuntimeStateEventKind::SessionCreated | RuntimeStateEventKind::SessionForked => {
+                    let Some(RuntimeEventDetail::SessionChanged { session }) = detail else {
+                        panic!("durable Session state requires a safe Session summary");
+                    };
+                    assert_eq!(session.session_id(), session_id);
+                }
+                RuntimeStateEventKind::SessionLoaded => {
+                    assert!(detail.is_none());
+                    assert!(
+                        snapshot
+                            .loaded_sessions()
+                            .iter()
+                            .any(|session| session.session_id() == session_id)
+                    );
+                }
+                RuntimeStateEventKind::SessionUnloaded => {
+                    assert!(detail.is_none());
+                    assert!(
+                        snapshot
+                            .loaded_sessions()
+                            .iter()
+                            .all(|session| session.session_id() != session_id)
+                    );
+                }
+                RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
+            }
         }
         (Some("session_execution_changed_finishing_state"), EventFrame::State(event)) => {
             assert_eq!(

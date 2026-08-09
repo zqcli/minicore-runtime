@@ -1,7 +1,8 @@
 use minicore_runtime::runtime_interface::{
-    AgentQuery, AgentQueryResult, QueryErrorCode, QueryResult, RuntimeCommand,
-    RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeRequest, SessionQuery, SessionQueryResult, SnapshotRequest,
+    AgentQuery, AgentQueryResult, EventFrame, EventRoute, QueryErrorCode, QueryResult,
+    RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand,
+    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeStateEventKind,
+    SessionQuery, SessionQueryResult, SessionSummary, SnapshotRequest, StateEvent, StateEventMsg,
     SubscriptionScope,
 };
 use minicore_runtime::wire::{
@@ -231,6 +232,55 @@ fn durable_catalog_query_results_and_stale_cursor_error_round_trip() {
         protocol.encode_query_error(&error).unwrap(),
         without_lf(error_bytes)
     );
+}
+
+#[test]
+fn session_forked_runtime_state_event_round_trips_with_safe_summary() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let bytes =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/session-forked-state-frame.json");
+    let frame = protocol.decode_event_frame(bytes).unwrap();
+    let EventFrame::State(event) = &frame else {
+        panic!("the fixture decodes as a StateEvent");
+    };
+    assert!(matches!(event.route(), EventRoute::Session { .. }));
+    let StateEventMsg::Runtime {
+        kind,
+        snapshot,
+        detail: Some(RuntimeEventDetail::SessionChanged { session }),
+    } = event.msg()
+    else {
+        panic!("the fixture carries one Runtime SessionChanged detail");
+    };
+    assert_eq!(*kind, RuntimeStateEventKind::SessionForked);
+    assert!(session.forked());
+    assert_eq!(
+        session.session_id().to_string(),
+        "ses_33333333333333333333333333333333"
+    );
+    assert_eq!(
+        protocol.encode_event_frame(&frame).unwrap(),
+        without_lf(bytes)
+    );
+
+    let invalid_summary = SessionSummary::new(
+        session.session_id(),
+        session.definition_revision(),
+        session.metadata().clone(),
+        session.lifecycle(),
+        false,
+        session.created_at(),
+    );
+    let invalid = EventFrame::State(StateEvent::session_forked(
+        event.timestamp(),
+        event.command_id(),
+        snapshot.clone(),
+        invalid_summary,
+    ));
+    let error = protocol.encode_event_frame(&invalid).unwrap_err();
+    let fault = error.public_decode_error().unwrap();
+    assert_eq!(fault.stage(), PublicDecodeStage::TypedScalar);
+    assert_eq!(fault.code(), PublicDecodeCode::InvalidScalar);
 }
 
 #[test]
