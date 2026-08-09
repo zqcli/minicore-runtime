@@ -2,7 +2,7 @@
 
 日期：2026-07-31
 
-状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Session Create/Load/Submit/Unload/Fork、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、loaded Ready+Idle Snapshot与Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；M11 remaining Runtime query/event closure、grace/cancel式active-Turn Unload及完整cross-platform native matrix pending）
+状态：当前权威架构（ADR 0136/0137；M5 durable foundation与replay/Recorder-backed hydration、Workspace resolver/Snapshot及Runtime-owned residency foundation已实现；minimal public dispatch/query/snapshot/subscribe已接通Session Create/Load/Submit/Unload/Fork、durable `ListAgents`/`ListSessions`分页、`GetSessionForkProvenance`、snapshot-first Runtime/Session subscription、Runtime Session membership StateEvent、loaded Ready+Idle Snapshot与Turn Completed/Failed Event；M9 Starting/Running/Finishing observation、current Turn/active Items/Pending Interaction安全摘要已接通；Session usage、Degraded recording与bounded diagnostics也已接通；M11 remaining public family/event closure、grace/cancel式active-Turn Unload及完整cross-platform native matrix pending）
 
 ## 目的
 
@@ -1923,7 +1923,7 @@ pub enum RuntimeEventDetail {
         agent: AgentSummary,
     },
     SessionChanged {
-        session: SessionSummary,
+        session: Box<SessionSummary>,
     },
 }
 
@@ -1965,7 +1965,7 @@ pub enum QueueUpdateReason {
 }
 ```
 
-M2 minimal State codec已materialize Runtime `command_catalog_invalidated`以及Session `turn_completed | turn_interrupted | turn_failed` + matching `TurnTerminal`；Item/Interaction/queue kinds、Progress和Closed继续返回known `PendingPublicTarget`。Box同样只控制enum尺寸。
+M2/M11 State codec已materialize Runtime `command_catalog_invalidated | session_created | session_loaded | session_unloaded | session_forked`以及Session `turn_completed | turn_interrupted | turn_failed` + matching detail；Item/Interaction/queue kinds、Progress和Closed继续返回known `PendingPublicTarget`。`SessionSnapshot`与Runtime `SessionChanged` summary上的Box只控制enum尺寸。
 
 StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
 

@@ -7,13 +7,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration as StdDuration, Instant};
 
 use tokio::runtime::Handle;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore, broadcast};
 
 use crate::agent_session_lifecycle::{
     AgentStatus, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
 };
 use crate::compaction::CompactionSettings;
-use crate::durable_state::{DurableOpenError, DurableSessionCreateError, DurableState};
+use crate::durable_state::{
+    DurableOpenError, DurableSessionCreateError, DurableSessionHead, DurableState,
+};
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
@@ -22,8 +24,8 @@ use crate::runtime_interface::{
     LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject, QueryError, QueryErrorCode,
     QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
     RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeSnapshot, RuntimeStatusView, RuntimeView, SessionCommand,
-    SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
+    RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView, RuntimeView,
+    SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
     SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
     SessionReadinessView, SessionRecordingView, SessionSnapshot, SessionSummary, SnapshotError,
     SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView,
@@ -56,6 +58,7 @@ const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's r
 const PAGE_CURSOR_CAPACITY: usize = 4_096;
 const PAGE_CURSOR_TTL: StdDuration = StdDuration::from_secs(15 * 60);
 const PAGE_CURSOR_GENERATION_ATTEMPTS: usize = 32;
+const RUNTIME_EVENT_CAPACITY: usize = 32;
 
 /// Host configuration for a MiniCore runtime instance.
 #[non_exhaustive]
@@ -279,7 +282,12 @@ impl MiniCoreRuntime {
 pub struct EventStream {
     runtime: Arc<RuntimeInner>,
     initial: Option<EventFrame>,
-    subscription: SessionExecutorSubscription,
+    subscription: EventSubscription,
+}
+
+enum EventSubscription {
+    Runtime(broadcast::Receiver<Arc<StateEvent>>),
+    Session(SessionExecutorSubscription),
 }
 
 impl EventStream {
@@ -287,48 +295,59 @@ impl EventStream {
         if let Some(initial) = self.initial.take() {
             return Some(initial);
         }
-        let event = self.subscription.recv().await?;
-        let snapshot = self
-            .runtime
-            .public_session_snapshot(Arc::clone(event.snapshot()))
-            .ok()?;
-        let state = match event.as_ref() {
-            SessionExecutorEvent::ExecutionChanged { timestamp, .. } => {
-                StateEvent::session_execution_changed(*timestamp, None, snapshot)
+        match &mut self.subscription {
+            EventSubscription::Runtime(receiver) => receiver
+                .recv()
+                .await
+                .ok()
+                .map(|event| EventFrame::State(event.as_ref().clone())),
+            EventSubscription::Session(subscription) => {
+                let event = subscription.recv().await?;
+                let snapshot = self
+                    .runtime
+                    .public_session_snapshot(Arc::clone(event.snapshot()))
+                    .ok()?;
+                let state = match event.as_ref() {
+                    SessionExecutorEvent::ExecutionChanged { timestamp, .. } => {
+                        StateEvent::session_execution_changed(*timestamp, None, snapshot)
+                    }
+                    SessionExecutorEvent::TurnTerminal {
+                        timestamp,
+                        command_id,
+                        turn_id,
+                        terminal,
+                        ..
+                    } => match terminal {
+                        SessionTurnTerminal::Completed => StateEvent::turn_completed(
+                            *timestamp,
+                            Some(*command_id),
+                            snapshot,
+                            *turn_id,
+                            *timestamp,
+                        ),
+                        SessionTurnTerminal::Failed(failure) => StateEvent::turn_failed(
+                            *timestamp,
+                            Some(*command_id),
+                            snapshot,
+                            *turn_id,
+                            *timestamp,
+                            public_turn_failure(*failure),
+                        ),
+                        SessionTurnTerminal::Interrupted(interruption) => {
+                            StateEvent::turn_interrupted(
+                                *timestamp,
+                                Some(*command_id),
+                                snapshot,
+                                *turn_id,
+                                *timestamp,
+                                public_turn_interruption(*interruption),
+                            )
+                        }
+                    },
+                };
+                Some(EventFrame::State(state))
             }
-            SessionExecutorEvent::TurnTerminal {
-                timestamp,
-                command_id,
-                turn_id,
-                terminal,
-                ..
-            } => match terminal {
-                SessionTurnTerminal::Completed => StateEvent::turn_completed(
-                    *timestamp,
-                    Some(*command_id),
-                    snapshot,
-                    *turn_id,
-                    *timestamp,
-                ),
-                SessionTurnTerminal::Failed(failure) => StateEvent::turn_failed(
-                    *timestamp,
-                    Some(*command_id),
-                    snapshot,
-                    *turn_id,
-                    *timestamp,
-                    public_turn_failure(*failure),
-                ),
-                SessionTurnTerminal::Interrupted(interruption) => StateEvent::turn_interrupted(
-                    *timestamp,
-                    Some(*command_id),
-                    snapshot,
-                    *turn_id,
-                    *timestamp,
-                    public_turn_interruption(*interruption),
-                ),
-            },
-        };
-        Some(EventFrame::State(state))
+        }
     }
 }
 
@@ -569,6 +588,10 @@ struct RuntimeInner {
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
+    // Runtime mutations and new Runtime subscriptions serialize mutation + publication against
+    // receiver registration + initial snapshot without holding a live-state lock across await.
+    runtime_publication: Arc<Semaphore>,
+    runtime_events: Mutex<Option<broadcast::Sender<Arc<StateEvent>>>>,
     page_cursors: Mutex<PageCursorStore>,
     in_flight_commands: Mutex<BTreeMap<crate::wire::CommandId, Arc<RuntimeCommandInFlight>>>,
     lifecycle: Mutex<RuntimeLifecycle>,
@@ -585,6 +608,7 @@ impl RuntimeInner {
         model_gateway: Arc<ModelGateway>,
         model_catalog: Arc<ModelCatalogView>,
     ) -> Self {
+        let (runtime_events, _) = broadcast::channel(RUNTIME_EVENT_CAPACITY);
         Self {
             task_context,
             prompt_service,
@@ -594,6 +618,8 @@ impl RuntimeInner {
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
+            runtime_publication: Arc::new(Semaphore::new(1)),
+            runtime_events: Mutex::new(Some(runtime_events)),
             page_cursors: Mutex::new(PageCursorStore::default()),
             in_flight_commands: Mutex::new(BTreeMap::new()),
             lifecycle: Mutex::new(RuntimeLifecycle::Open),
@@ -722,20 +748,57 @@ impl RuntimeInner {
                 let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
                     return Err(RuntimeDispatchError::RuntimeClosed);
                 };
+                let _publication = Arc::clone(&self.runtime_publication)
+                    .acquire_owned()
+                    .await
+                    .expect("Runtime publication semaphore remains open");
                 match durable_state.create_session(attempt).await {
-                    Ok(head) => completed_output(head.session_id().to_string()),
+                    Ok(head) => {
+                        self.publish_durable_session_event(
+                            RuntimeStateEventKind::SessionCreated,
+                            command_id,
+                            head.as_ref(),
+                        );
+                        completed_output(head.session_id().to_string())
+                    }
                     Err(error) => map_session_create_error(command_id, agent_id, error)?,
                 }
             }
             RuntimeCommand::Session(SessionCommand::Load { session_id }) => {
+                let _publication = Arc::clone(&self.runtime_publication)
+                    .acquire_owned()
+                    .await
+                    .expect("Runtime publication semaphore remains open");
                 match self.load_session_ready_idle(session_id).await {
-                    Ok(_) => completed_output("session loaded"),
+                    Ok(outcome) => {
+                        if outcome.changed() {
+                            self.publish_session_membership(
+                                RuntimeStateEventKind::SessionLoaded,
+                                command_id,
+                                session_id,
+                            );
+                        }
+                        completed_output("session loaded")
+                    }
                     Err(error) => map_load_error(command_id, session_id, error)?,
                 }
             }
             RuntimeCommand::Session(SessionCommand::Unload { session_id }) => {
+                let _publication = Arc::clone(&self.runtime_publication)
+                    .acquire_owned()
+                    .await
+                    .expect("Runtime publication semaphore remains open");
                 match self.unload_session(session_id).await {
-                    Ok(_) => completed_output("session unloaded"),
+                    Ok(outcome) => {
+                        if outcome.changed() {
+                            self.publish_session_membership(
+                                RuntimeStateEventKind::SessionUnloaded,
+                                command_id,
+                                session_id,
+                            );
+                        }
+                        completed_output("session unloaded")
+                    }
                     Err(error) => map_unload_error(command_id, session_id, error)?,
                 }
             }
@@ -743,6 +806,10 @@ impl RuntimeInner {
                 source_session_id,
                 anchor,
             }) => {
+                let _publication = Arc::clone(&self.runtime_publication)
+                    .acquire_owned()
+                    .await
+                    .expect("Runtime publication semaphore remains open");
                 let Some(residency) = self.residency() else {
                     return Err(RuntimeDispatchError::RuntimeClosed);
                 };
@@ -754,6 +821,11 @@ impl RuntimeInner {
                         let Some(provenance) = head.fork_provenance() else {
                             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
                         };
+                        self.publish_durable_session_event(
+                            RuntimeStateEventKind::SessionForked,
+                            command_id,
+                            head.as_ref(),
+                        );
                         completed_outcome(CommandOutcome::SessionForked {
                             session_id: head.session_id(),
                             source: provenance.source(),
@@ -934,22 +1006,13 @@ impl RuntimeInner {
                                 }
                                 SessionLifecycle::Archived | SessionLifecycle::Deleted => continue,
                             };
-                            let metadata = head.metadata();
-                            let metadata = SessionMetadataView::new(
-                                metadata.revision(),
-                                metadata.name(),
-                                metadata.description(),
-                                metadata.updated_at(),
-                            )
-                            .map_err(|_| unavailable_query(Some(PublicSubject::Runtime)))?;
-                            sessions.push(SessionSummary::new(
-                                head.session_id(),
-                                head.current_definition_revision(),
-                                metadata,
-                                lifecycle,
-                                head.fork_provenance().is_some(),
-                                head.created_at(),
-                            ));
+                            let summary = public_session_summary(head.as_ref())
+                                .map_err(|_| unavailable_query(Some(PublicSubject::Runtime)))?;
+                            debug_assert_eq!(summary.lifecycle(), lifecycle);
+                            if summary.lifecycle() != lifecycle {
+                                return Err(unavailable_query(Some(PublicSubject::Runtime)));
+                            }
+                            sessions.push(summary);
                         }
                         sessions.sort_by(|left, right| {
                             right
@@ -996,32 +1059,9 @@ impl RuntimeInner {
                 self.public_session_snapshot(snapshot)
                     .map(|snapshot| SnapshotResponse::Session(Box::new(snapshot)))
             }
-            SnapshotRequest::Runtime => {
-                let Some(residency) = self.residency() else {
-                    return Err(runtime_snapshot_closing());
-                };
-                let mut loaded = Vec::new();
-                for snapshot in residency.loaded_session_snapshots() {
-                    let session_id = snapshot.definition().session_id();
-                    loaded.push(
-                        LoadedSessionSummary::new(
-                            session_id,
-                            SessionReadinessView::Ready,
-                            public_execution_state(snapshot.execution_state()),
-                            SessionRecordingView::new(snapshot.recording()),
-                        )
-                        .map_err(|_| unavailable_snapshot(session_id))?,
-                    );
-                }
-                let status = if matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
-                    RuntimeStatusView::Running
-                } else {
-                    RuntimeStatusView::Closing
-                };
-                RuntimeSnapshot::new(RuntimeView::new(status), loaded, Vec::new())
-                    .map(SnapshotResponse::Runtime)
-                    .map_err(|_| runtime_snapshot_closing())
-            }
+            SnapshotRequest::Runtime => self
+                .public_runtime_snapshot()
+                .map(SnapshotResponse::Runtime),
         }
     }
 
@@ -1029,13 +1069,36 @@ impl RuntimeInner {
         self: &Arc<Self>,
         request: SubscriptionRequest,
     ) -> Result<EventStream, SubscriptionError> {
+        if request.scope() == SubscriptionScope::Runtime {
+            let _publication = Arc::clone(&self.runtime_publication)
+                .acquire_owned()
+                .await
+                .expect("Runtime publication semaphore remains open");
+            if !matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
+                return Err(subscription_closing());
+            }
+            let events = lock(&self.runtime_events);
+            let Some(sender) = events.as_ref() else {
+                return Err(subscription_closing());
+            };
+            let receiver = sender.subscribe();
+            let snapshot = self.public_runtime_snapshot().map_err(|_| {
+                SubscriptionError::new(
+                    SubscriptionErrorCode::PublisherUnavailable,
+                    "runtime event publisher is unavailable",
+                    RetryAdvice::DoNotRetry,
+                    Some(PublicSubject::Runtime),
+                )
+            })?;
+            return Ok(EventStream {
+                runtime: Arc::clone(self),
+                initial: Some(EventFrame::Snapshot(SnapshotResponse::Runtime(snapshot))),
+                subscription: EventSubscription::Runtime(receiver),
+            });
+        }
+
         let SubscriptionScope::Session { session_id } = request.scope() else {
-            return Err(SubscriptionError::new(
-                SubscriptionErrorCode::UnsupportedScope,
-                "runtime event scope is not available in this runtime slice",
-                RetryAdvice::DoNotRetry,
-                Some(PublicSubject::Runtime),
-            ));
+            unreachable!("Runtime scope returned above");
         };
         let Some(residency) = self.residency() else {
             return Err(subscription_closing());
@@ -1059,8 +1122,96 @@ impl RuntimeInner {
             initial: Some(EventFrame::Snapshot(SnapshotResponse::Session(Box::new(
                 initial,
             )))),
-            subscription,
+            subscription: EventSubscription::Session(subscription),
         })
+    }
+
+    fn public_runtime_snapshot(&self) -> Result<RuntimeSnapshot, SnapshotError> {
+        let Some(residency) = self.residency() else {
+            return Err(runtime_snapshot_closing());
+        };
+        let mut loaded = Vec::new();
+        for snapshot in residency.loaded_session_snapshots() {
+            let session_id = snapshot.definition().session_id();
+            loaded.push(
+                LoadedSessionSummary::new(
+                    session_id,
+                    SessionReadinessView::Ready,
+                    public_execution_state(snapshot.execution_state()),
+                    SessionRecordingView::new(snapshot.recording()),
+                )
+                .map_err(|_| unavailable_snapshot(session_id))?,
+            );
+        }
+        let status = if matches!(*lock(&self.lifecycle), RuntimeLifecycle::Open) {
+            RuntimeStatusView::Running
+        } else {
+            RuntimeStatusView::Closing
+        };
+        RuntimeSnapshot::new(RuntimeView::new(status), loaded, Vec::new())
+            .map_err(|_| runtime_snapshot_closing())
+    }
+
+    fn publish_durable_session_event(
+        &self,
+        kind: RuntimeStateEventKind,
+        command_id: crate::wire::CommandId,
+        head: &DurableSessionHead,
+    ) {
+        debug_assert!(matches!(
+            kind,
+            RuntimeStateEventKind::SessionCreated | RuntimeStateEventKind::SessionForked
+        ));
+        let Ok(session) = public_session_summary(head) else {
+            return;
+        };
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event = match kind {
+            RuntimeStateEventKind::SessionCreated => {
+                StateEvent::session_created(head.created_at(), Some(command_id), snapshot, session)
+            }
+            RuntimeStateEventKind::SessionForked => {
+                StateEvent::session_forked(head.created_at(), Some(command_id), snapshot, session)
+            }
+            RuntimeStateEventKind::SessionLoaded
+            | RuntimeStateEventKind::SessionUnloaded
+            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+        };
+        let _ = sender.send(Arc::new(event));
+    }
+
+    fn publish_session_membership(
+        &self,
+        kind: RuntimeStateEventKind,
+        command_id: crate::wire::CommandId,
+        session_id: SessionId,
+    ) {
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let timestamp = SystemClock.now();
+        let event = match kind {
+            RuntimeStateEventKind::SessionLoaded => {
+                StateEvent::session_loaded(timestamp, Some(command_id), snapshot, session_id)
+            }
+            RuntimeStateEventKind::SessionUnloaded => {
+                StateEvent::session_unloaded(timestamp, Some(command_id), snapshot, session_id)
+            }
+            RuntimeStateEventKind::SessionCreated
+            | RuntimeStateEventKind::SessionForked
+            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+        };
+        let _ = sender.send(Arc::new(event));
     }
 
     fn public_session_snapshot(
@@ -1164,6 +1315,7 @@ impl RuntimeInner {
             };
         }
         drop(lifecycle);
+        self.close_runtime_event_publisher();
         self.request_session_residency_closing();
         self.request_durable_actor_closing();
         self.task_context.request_closing();
@@ -1182,6 +1334,7 @@ impl RuntimeInner {
 
             match self.begin_shutdown() {
                 RuntimeShutdownAttempt::Leader(mut leadership) => {
+                    self.close_runtime_event_publisher();
                     // Keep each original owner in its mutex while awaiting. A cancelled leader
                     // therefore retains the loaded executors, DurableState, and root lease for
                     // the next shutdown leader to take over.
@@ -1354,6 +1507,10 @@ impl RuntimeInner {
         let retained = lock(&self.retained_until_shutdown).take();
         drop(retained);
     }
+
+    fn close_runtime_event_publisher(&self) {
+        lock(&self.runtime_events).take();
+    }
 }
 
 struct RuntimeCommandInFlight {
@@ -1499,6 +1656,31 @@ fn query_page_limit(limit: NonZeroU32) -> Result<usize, QueryError> {
             Some(PublicSubject::Runtime),
         )
     })
+}
+
+fn public_session_summary(
+    head: &DurableSessionHead,
+) -> Result<SessionSummary, crate::runtime_interface::ObservationValueError> {
+    let metadata = head.metadata();
+    let metadata = SessionMetadataView::new(
+        metadata.revision(),
+        metadata.name(),
+        metadata.description(),
+        metadata.updated_at(),
+    )?;
+    let lifecycle = match head.lifecycle() {
+        SessionLifecycle::Open => SessionLifecycleView::Open,
+        SessionLifecycle::Archived => SessionLifecycleView::Archived,
+        SessionLifecycle::Deleted => SessionLifecycleView::Deleted,
+    };
+    Ok(SessionSummary::new(
+        head.session_id(),
+        head.current_definition_revision(),
+        metadata,
+        lifecycle,
+        head.fork_provenance().is_some(),
+        head.created_at(),
+    ))
 }
 
 fn map_page_cursor_error(error: PageCursorStoreError) -> QueryError {
@@ -2249,9 +2431,10 @@ mod tests {
         CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest, CommandResponse,
         EventFrame, EventRoute, ItemContentView, NewSessionDefinition, NewSessionMetadata,
         PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
-        RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, SessionCommand, SessionEventDetail,
-        SessionExecutionView, SessionRecordingState, SessionStateEventKind, SnapshotRequest,
-        SnapshotResponse, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
+        RuntimeEventDetail, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
+        RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
+        SessionRecordingState, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
+        StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
         TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
@@ -2499,6 +2682,136 @@ mod tests {
             .expect("public Load dispatches");
         assert_eq!(command_output(&load), "session loaded");
         session_id
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_subscription_publishes_changed_session_membership_once() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(Vec::<&str>::new());
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the Runtime opens");
+        let agent_id = create_runtime_agent(&runtime).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+            .await
+            .expect("the Runtime subscription opens");
+        let Some(EventFrame::Snapshot(SnapshotResponse::Runtime(initial))) = events.recv().await
+        else {
+            panic!("the Runtime subscription starts with its snapshot");
+        };
+        assert!(initial.loaded_sessions().is_empty());
+
+        let create_id = CommandId::generate().unwrap();
+        let create = runtime
+            .dispatch(CommandRequest::new(
+                create_id,
+                RuntimeCommand::Session(SessionCommand::Create {
+                    agent_id,
+                    definition: Box::new(NewSessionDefinition::new(
+                        workspace_input(workspace.path()),
+                        SessionModelConfig::new(
+                            ModelSelection::new(
+                                "openai".parse().unwrap(),
+                                "gpt-5".parse().unwrap(),
+                            ),
+                            ReasoningPreference::Auto,
+                            Some(NonZeroU32::new(4096).unwrap()),
+                        ),
+                        SessionPromptSelection::new(Vec::new()).unwrap(),
+                    )),
+                    metadata: NewSessionMetadata::new(None::<&str>, None::<&str>).unwrap(),
+                }),
+            ))
+            .await
+            .expect("Create dispatches");
+        let session_id = command_output(&create).parse().unwrap();
+        let created = events.recv().await.expect("Create publishes");
+        let EventFrame::State(created) = created else {
+            panic!("Create publishes a StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind,
+            snapshot,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+        } = created.msg()
+        else {
+            panic!("SessionCreated carries one safe Session summary");
+        };
+        assert_eq!(*kind, RuntimeStateEventKind::SessionCreated);
+        assert_eq!(created.command_id(), Some(create_id));
+        assert_eq!(session.session_id(), session_id);
+        assert!(!session.forked());
+        assert!(snapshot.loaded_sessions().is_empty());
+
+        let load_id = CommandId::generate().unwrap();
+        runtime
+            .dispatch(CommandRequest::new(
+                load_id,
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("Load dispatches");
+        let loaded = events.recv().await.expect("Load publishes");
+        let EventFrame::State(loaded) = loaded else {
+            panic!("Load publishes a StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind,
+            snapshot,
+            detail: None,
+        } = loaded.msg()
+        else {
+            panic!("SessionLoaded has no durable catalog detail");
+        };
+        assert_eq!(*kind, RuntimeStateEventKind::SessionLoaded);
+        assert_eq!(loaded.command_id(), Some(load_id));
+        assert_eq!(snapshot.loaded_sessions()[0].session_id(), session_id);
+
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("idempotent Load dispatches");
+
+        let unload_id = CommandId::generate().unwrap();
+        runtime
+            .dispatch(CommandRequest::new(
+                unload_id,
+                RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+            ))
+            .await
+            .expect("Unload dispatches");
+        let unloaded = events.recv().await.expect("Unload publishes");
+        let EventFrame::State(unloaded) = unloaded else {
+            panic!("Unload publishes a StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind,
+            snapshot,
+            detail: None,
+        } = unloaded.msg()
+        else {
+            panic!("SessionUnloaded has no durable catalog detail");
+        };
+        assert_eq!(*kind, RuntimeStateEventKind::SessionUnloaded);
+        assert_eq!(unloaded.command_id(), Some(unload_id));
+        assert!(snapshot.loaded_sessions().is_empty());
+
+        runtime.shutdown().await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("Runtime closing settles the event stream"),
+            None
+        );
     }
 
     fn replayed_user_entry(session_id: SessionId, line_index: usize) -> Vec<u8> {
