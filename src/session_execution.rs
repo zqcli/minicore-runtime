@@ -512,6 +512,22 @@ pub(crate) enum SessionCancelTarget {
     Turn(TurnId),
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionSecurityRevokedError {
+    #[error("session executor is closing")]
+    Closing,
+    #[error("the security-revoked target is not running")]
+    NotRunning,
+    #[error("the Turn target does not match the active Turn")]
+    ExpectedTurnMismatch,
+    #[error("the active target is already cancelling")]
+    AlreadyCancelling,
+    #[error("the active target is already security revoked")]
+    AlreadyRevoked,
+    #[error("session SecurityRevoked dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
 #[derive(Clone)]
 struct TurnResources {
     prompt_resources: Arc<PromptResourceView>,
@@ -1150,6 +1166,39 @@ impl SessionExecutor {
         })
     }
 
+    pub(crate) async fn security_revoke(
+        &self,
+        target: SessionCancelTarget,
+    ) -> Result<(), SessionSecurityRevokedError> {
+        let (response, waiter) = oneshot::channel();
+        let mut request = SessionExecutorRequest::SecurityRevoked(SecurityRevokedRequest {
+            target,
+            response: Some(response),
+        });
+        let permit = tokio::select! {
+            biased;
+            _ = self.closing.cancelled() => {
+                request.reject_closing();
+                return waiter.await.unwrap_or(Err(SessionSecurityRevokedError::Closing));
+            }
+            permit = self.sender.reserve() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    request.reject_closing();
+                    return waiter.await.unwrap_or(Err(SessionSecurityRevokedError::InternalDispatchUnavailable));
+                }
+            },
+        };
+        permit.send(request);
+        waiter.await.unwrap_or_else(|_| {
+            if self.closing.is_cancelled() || self.sender.is_closed() {
+                Err(SessionSecurityRevokedError::Closing)
+            } else {
+                Err(SessionSecurityRevokedError::InternalDispatchUnavailable)
+            }
+        })
+    }
+
     /// Queues a FollowUp behind the active Turn.  The public command and snapshot projection are
     /// intentionally deferred to the owning M9 slice; this seam only preserves bounded FIFO
     /// admission and terminal handoff inside the Session actor.
@@ -1655,6 +1704,9 @@ impl SessionExecutorActor {
             SessionExecutorRequest::Cancel(request) => {
                 self.cancel_request(request).await?;
             }
+            SessionExecutorRequest::SecurityRevoked(request) => {
+                self.security_revoke_request(request)?;
+            }
         }
         Ok(())
     }
@@ -1887,13 +1939,20 @@ impl SessionExecutorActor {
         let Some(resources) = self.turn_resources.as_ref().cloned() else {
             return Err(ActorFatality::Integrity);
         };
+        let prior_signal = self
+            .emergency
+            .observe(active.emergency.target())
+            .and_then(|observation| observation.signal());
         self.emergency.retire(active.emergency);
         let emergency = self
             .emergency
             .bind(EmergencyControlTarget::Turn(active.turn_id))
             .map_err(|_| ActorFatality::Internal)?;
         let cancellation = active.cancellation.clone();
-        if cancellation.is_cancelled() {
+        if let Some(signal) = prior_signal {
+            self.signal_emergency(EmergencyControlTarget::Turn(active.turn_id), signal)?;
+            cancellation.cancel();
+        } else if cancellation.is_cancelled() {
             self.signal_emergency_cancel(EmergencyControlTarget::Turn(active.turn_id))?;
         }
         let control_generation = Arc::new(ControlGeneration(0));
@@ -2137,15 +2196,81 @@ impl SessionExecutorActor {
         Ok(())
     }
 
-    fn signal_emergency_cancel(&self, target: EmergencyControlTarget) -> Result<(), ActorFatality> {
+    fn security_revoke_request(
+        &mut self,
+        request: &mut SecurityRevokedRequest,
+    ) -> Result<(), ActorFatality> {
+        let (emergency_target, cancellation) = match request.target {
+            SessionCancelTarget::Submit(command_id) => {
+                let Some(active) = self.active_admission.as_ref() else {
+                    request.settle(Err(SessionSecurityRevokedError::NotRunning));
+                    return Ok(());
+                };
+                if active.command_id != command_id {
+                    request.settle(Err(SessionSecurityRevokedError::NotRunning));
+                    return Ok(());
+                }
+                (
+                    EmergencyControlTarget::Submit(command_id),
+                    active.cancellation.clone(),
+                )
+            }
+            SessionCancelTarget::Turn(turn_id) => {
+                if let Some(active) = self.active_admission.as_ref() {
+                    if active.turn_id != turn_id {
+                        request.settle(Err(SessionSecurityRevokedError::ExpectedTurnMismatch));
+                        return Ok(());
+                    }
+                    (active.emergency.target(), active.cancellation.clone())
+                } else {
+                    let Some(active) = self.active_turn.as_ref() else {
+                        request.settle(Err(SessionSecurityRevokedError::NotRunning));
+                        return Ok(());
+                    };
+                    if active.turn_id != turn_id {
+                        request.settle(Err(SessionSecurityRevokedError::ExpectedTurnMismatch));
+                        return Ok(());
+                    }
+                    (active.emergency.target(), active.cancellation.clone())
+                }
+            }
+        };
+
         match self
             .emergency
-            .signal(target, EmergencyControlSignal::Cancel)
+            .signal(emergency_target, EmergencyControlSignal::SecurityRevoked)
         {
+            EmergencyControlSignalOutcome::Accepted { .. } => {
+                cancellation.cancel();
+                request.settle(Ok(()));
+            }
+            EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::Cancel,
+                ..
+            } => request.settle(Err(SessionSecurityRevokedError::AlreadyCancelling)),
+            EmergencyControlSignalOutcome::AlreadySignaled {
+                signal: EmergencyControlSignal::SecurityRevoked,
+                ..
+            } => request.settle(Err(SessionSecurityRevokedError::AlreadyRevoked)),
+            EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
+        }
+        Ok(())
+    }
+
+    fn signal_emergency(
+        &self,
+        target: EmergencyControlTarget,
+        signal: EmergencyControlSignal,
+    ) -> Result<(), ActorFatality> {
+        match self.emergency.signal(target, signal) {
             EmergencyControlSignalOutcome::Accepted { .. }
             | EmergencyControlSignalOutcome::AlreadySignaled { .. } => Ok(()),
             EmergencyControlSignalOutcome::StaleTarget => Err(ActorFatality::Integrity),
         }
+    }
+
+    fn signal_emergency_cancel(&self, target: EmergencyControlTarget) -> Result<(), ActorFatality> {
+        self.signal_emergency(target, EmergencyControlSignal::Cancel)
     }
 
     async fn cancel_pending_interaction(
@@ -3915,6 +4040,11 @@ struct CancelRequest {
     response: Option<oneshot::Sender<Result<(), SessionCancelError>>>,
 }
 
+struct SecurityRevokedRequest {
+    target: SessionCancelTarget,
+    response: Option<oneshot::Sender<Result<(), SessionSecurityRevokedError>>>,
+}
+
 impl CancelRequest {
     fn settle(&mut self, outcome: Result<(), SessionCancelError>) {
         if let Some(response) = self.response.take() {
@@ -3928,6 +4058,24 @@ impl CancelRequest {
 }
 
 impl Drop for CancelRequest {
+    fn drop(&mut self) {
+        self.reject_closing();
+    }
+}
+
+impl SecurityRevokedRequest {
+    fn settle(&mut self, outcome: Result<(), SessionSecurityRevokedError>) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(outcome);
+        }
+    }
+
+    fn reject_closing(&mut self) {
+        self.settle(Err(SessionSecurityRevokedError::Closing));
+    }
+}
+
+impl Drop for SecurityRevokedRequest {
     fn drop(&mut self) {
         self.reject_closing();
     }
@@ -4050,6 +4198,7 @@ enum SessionExecutorRequest {
     CancelQueuedMessage(CancelQueuedMessageRequest),
     ResolveInteraction(ResolveInteractionRequest),
     Cancel(CancelRequest),
+    SecurityRevoked(SecurityRevokedRequest),
     Subscribe(SubscribeRequest),
     #[cfg(test)]
     StartingProbe(StartingProbeRequest),
@@ -4066,6 +4215,7 @@ impl SessionExecutorRequest {
             Self::CancelQueuedMessage(request) => request.reject_closing(),
             Self::ResolveInteraction(request) => request.reject_closing(),
             Self::Cancel(request) => request.reject_closing(),
+            Self::SecurityRevoked(request) => request.reject_closing(),
             Self::Subscribe(request) => request.reject_closing(),
             #[cfg(test)]
             Self::StartingProbe(request) => request.reject_closing(),
@@ -5448,6 +5598,66 @@ mod tests {
         close_loaded(loaded).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoked_running_turn_is_sticky_and_stops_model_attempt() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("security revoke retry").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_agent_run_attempt().await;
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .emergency_control_for_test()
+                .observe(EmergencyControlTarget::Turn(turn_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::SecurityRevoked)
+        );
+        assert_eq!(
+            loaded.executor.emergency_control_for_test().signal(
+                EmergencyControlTarget::Turn(turn_id),
+                EmergencyControlSignal::Cancel,
+            ),
+            EmergencyControlSignalOutcome::AlreadySignaled {
+                epoch: loaded
+                    .executor
+                    .emergency_control_for_test()
+                    .observe(EmergencyControlTarget::Turn(turn_id))
+                    .expect("the active SecurityRevoked target remains bound")
+                    .epoch(),
+                signal: EmergencyControlSignal::SecurityRevoked,
+            }
+        );
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 0);
+        close_loaded(loaded).await;
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn stale_retry_basis_stops_before_the_next_attempt() {
         let store = TempStore::new();
@@ -6555,6 +6765,103 @@ mod tests {
         assert_eq!(model.request_count(), 0);
         executor.close().await.unwrap();
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoke_starting_admission_is_sticky_and_prevents_turn_start() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_after_agent_admission_before_input();
+        let command_id = CommandId::generate().unwrap();
+        let submit_executor = loaded.executor.clone();
+        let submit = tokio::spawn(async move {
+            submit_executor
+                .submit(
+                    command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(
+                            TextIntent::new("security revoke before input").unwrap(),
+                        ),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+        });
+        hooks.wait_after_agent_admission_before_input().await;
+        assert_eq!(
+            loaded.executor.snapshot().await.unwrap().execution_state(),
+            SessionExecutionState::Starting
+        );
+        let mismatched_turn: TurnId = "trn_99999999999999999999999999999999".parse().unwrap();
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(mismatched_turn))
+                .await,
+            Err(SessionSecurityRevokedError::ExpectedTurnMismatch)
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Submit(command_id))
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Submit(command_id))
+                .await,
+            Err(SessionSecurityRevokedError::AlreadyRevoked)
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .emergency_control_for_test()
+                .observe(EmergencyControlTarget::Submit(command_id))
+                .and_then(|observation| observation.signal()),
+            Some(EmergencyControlSignal::SecurityRevoked)
+        );
+        hooks.release_after_agent_admission_before_input();
+        assert_eq!(submit.await.unwrap(), Err(SessionSubmitError::Cancelled));
+        let snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(snapshot.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(snapshot.current_turn(), None);
+        assert_eq!(model.request_count(), 0);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoke_reports_not_running_and_closing_without_a_target() {
+        let store = TempStore::new();
+        let loaded = loaded_fixture(&store).await;
+        let turn_id: TurnId = "trn_88888888888888888888888888888888".parse().unwrap();
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Err(SessionSecurityRevokedError::NotRunning)
+        );
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Submit(CommandId::generate().unwrap(),))
+                .await,
+            Err(SessionSecurityRevokedError::NotRunning)
+        );
+        loaded.executor.request_closing();
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Err(SessionSecurityRevokedError::Closing)
+        );
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
