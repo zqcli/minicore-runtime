@@ -1,13 +1,13 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel、M9.1–M9.16 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams及M9.17 public Steer/FollowUp/CancelQueuedMessage command/wire route已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整public SecurityRevoked terminal route、public queue Snapshot DTO/projection、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel、M9.1–M9.16 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams、M9.17 public Steer/FollowUp/CancelQueuedMessage command/wire route及M9.18 public SessionQueueView/queue projection已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整public SecurityRevoked terminal route、current Turn/active Item/Pending Interaction public projection、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.17 已在 M9.16 close/Unload Interaction 收口之后，将 crate-private Steer、FollowUp 与 CancelQueuedMessage seam 接入 public Runtime command 与 Wire V1；成功分别返回 `SteerQueued { turn_id }`、`FollowUpQueued`、`QueuedMessageCancelled`，拒绝按 SessionNotLoaded、TurnNotRunning、ExpectedTurnMismatch、CommandConflict、IngressLaneFull 与 QueuedMessageNotQueued 映射。完整 public terminal/event route、public queue Snapshot DTO/projection、retry progress 与 Compaction retry仍后置。
+当前实现进度：M9.18 已在 M9.17 public queue command/wire route 之后，将同一 `SessionExecutorSnapshot` 中的 Submit admission、Steer FIFO、FollowUp FIFO 投影为 public `SessionQueueView`；Runtime Snapshot 与 Wire V1 均保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。当前 Turn/Items/Pending Interaction 仍作为后续 public projection slice。
 
 核心目标：
 

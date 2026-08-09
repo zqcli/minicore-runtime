@@ -1256,8 +1256,157 @@ impl RuntimeSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum SessionSnapshotState {
-    LoadedReadyIdle,
+pub enum SubmitAdmissionStateView {
+    Queued,
+    Starting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct SubmitAdmissionView {
+    command_id: CommandId,
+    state: SubmitAdmissionStateView,
+}
+
+impl SubmitAdmissionView {
+    pub const fn new(command_id: CommandId, state: SubmitAdmissionStateView) -> Self {
+        Self { command_id, state }
+    }
+
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    pub const fn state(self) -> SubmitAdmissionStateView {
+        self.state
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QueuedSteerView {
+    command_id: CommandId,
+    expected_turn_id: TurnId,
+}
+
+impl QueuedSteerView {
+    pub const fn new(command_id: CommandId, expected_turn_id: TurnId) -> Self {
+        Self {
+            command_id,
+            expected_turn_id,
+        }
+    }
+
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+
+    pub const fn expected_turn_id(self) -> TurnId {
+        self.expected_turn_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct QueuedFollowUpView {
+    command_id: CommandId,
+}
+
+impl QueuedFollowUpView {
+    pub const fn new(command_id: CommandId) -> Self {
+        Self { command_id }
+    }
+
+    pub const fn command_id(self) -> CommandId {
+        self.command_id
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionQueueView {
+    submit_admissions: Vec<SubmitAdmissionView>,
+    steers: Vec<QueuedSteerView>,
+    follow_ups: Vec<QueuedFollowUpView>,
+    accepting_input: bool,
+}
+
+impl SessionQueueView {
+    pub fn new(
+        submit_admissions: Vec<SubmitAdmissionView>,
+        steers: Vec<QueuedSteerView>,
+        follow_ups: Vec<QueuedFollowUpView>,
+        accepting_input: bool,
+    ) -> Result<Self, ObservationValueError> {
+        Self::new_with_limits(
+            submit_admissions,
+            steers,
+            follow_ups,
+            accepting_input,
+            ProtocolLimits::v1_0(),
+        )
+    }
+
+    pub(crate) fn empty(accepting_input: bool) -> Self {
+        Self {
+            submit_admissions: Vec::new(),
+            steers: Vec::new(),
+            follow_ups: Vec::new(),
+            accepting_input,
+        }
+    }
+
+    pub(crate) fn new_with_limits(
+        submit_admissions: Vec<SubmitAdmissionView>,
+        steers: Vec<QueuedSteerView>,
+        follow_ups: Vec<QueuedFollowUpView>,
+        accepting_input: bool,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ObservationValueError> {
+        if submit_admissions.len() > usize::from(limits.queues.max_submit_admissions)
+            || steers.len() > usize::from(limits.queues.max_steers)
+            || follow_ups.len() > usize::from(limits.queues.max_follow_ups)
+        {
+            return Err(ObservationValueError::TooManyValues);
+        }
+        if submit_admissions
+            .iter()
+            .filter(|entry| entry.state == SubmitAdmissionStateView::Starting)
+            .count()
+            > 1
+        {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
+        let mut command_ids = BTreeSet::new();
+        for command_id in submit_admissions
+            .iter()
+            .map(|entry| entry.command_id())
+            .chain(steers.iter().map(|entry| entry.command_id()))
+            .chain(follow_ups.iter().map(|entry| entry.command_id()))
+        {
+            if !command_ids.insert(command_id) {
+                return Err(ObservationValueError::DuplicateValue);
+            }
+        }
+        Ok(Self {
+            submit_admissions,
+            steers,
+            follow_ups,
+            accepting_input,
+        })
+    }
+
+    pub fn submit_admissions(&self) -> &[SubmitAdmissionView] {
+        &self.submit_admissions
+    }
+
+    pub fn steers(&self) -> &[QueuedSteerView] {
+        &self.steers
+    }
+
+    pub fn follow_ups(&self) -> &[QueuedFollowUpView] {
+        &self.follow_ups
+    }
+
+    pub const fn accepting_input(&self) -> bool {
+        self.accepting_input
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1268,7 +1417,8 @@ pub struct SessionSnapshot {
     recording: SessionRecordingView,
     usage: Option<SessionUsageView>,
     diagnostics: Vec<SessionDiagnosticView>,
-    state: SessionSnapshotState,
+    execution: SessionExecutionView,
+    queues: SessionQueueView,
 }
 
 impl SessionSnapshot {
@@ -1300,6 +1450,61 @@ impl SessionSnapshot {
         diagnostics: Vec<SessionDiagnosticView>,
         _limits: ProtocolLimits,
     ) -> Result<Self, ObservationValueError> {
+        Self::new_loaded_ready_with_limits(
+            session_id,
+            metadata,
+            definition,
+            SessionExecutionView::Idle,
+            SessionQueueView::empty(true),
+            recording,
+            usage,
+            diagnostics,
+            _limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "arguments are the exact public loaded Session snapshot contract"
+    )]
+    pub fn new_loaded_ready_with_queue(
+        session_id: SessionId,
+        metadata: SessionMetadataView,
+        definition: SessionDefinitionSummary,
+        execution: SessionExecutionView,
+        queues: SessionQueueView,
+        recording: SessionRecordingView,
+        usage: Option<SessionUsageView>,
+        diagnostics: Vec<SessionDiagnosticView>,
+    ) -> Result<Self, ObservationValueError> {
+        Self::new_loaded_ready_with_limits(
+            session_id,
+            metadata,
+            definition,
+            execution,
+            queues,
+            recording,
+            usage,
+            diagnostics,
+            ProtocolLimits::v1_0(),
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "arguments are the exact public loaded Session snapshot contract"
+    )]
+    pub(crate) fn new_loaded_ready_with_limits(
+        session_id: SessionId,
+        metadata: SessionMetadataView,
+        definition: SessionDefinitionSummary,
+        execution: SessionExecutionView,
+        queues: SessionQueueView,
+        recording: SessionRecordingView,
+        usage: Option<SessionUsageView>,
+        diagnostics: Vec<SessionDiagnosticView>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ObservationValueError> {
         if session_id != definition.session_id() {
             return Err(ObservationValueError::SessionIdentityMismatch);
         }
@@ -1309,6 +1514,32 @@ impl SessionSnapshot {
         {
             return Err(ObservationValueError::NonMinimalObservation);
         }
+        let queues = SessionQueueView::new_with_limits(
+            queues.submit_admissions,
+            queues.steers,
+            queues.follow_ups,
+            queues.accepting_input,
+            limits,
+        )?;
+        if queues
+            .submit_admissions()
+            .iter()
+            .any(|entry| entry.state() == SubmitAdmissionStateView::Starting)
+            && execution != SessionExecutionView::Starting
+        {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
+        if !queues.steers().is_empty() && execution != SessionExecutionView::Running {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
+        if !queues.follow_ups().is_empty()
+            && !matches!(
+                execution,
+                SessionExecutionView::Running | SessionExecutionView::Finishing
+            )
+        {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
         Ok(Self {
             session_id,
             metadata,
@@ -1316,7 +1547,8 @@ impl SessionSnapshot {
             recording,
             usage,
             diagnostics,
-            state: SessionSnapshotState::LoadedReadyIdle,
+            execution,
+            queues,
         })
     }
 
@@ -1345,9 +1577,7 @@ impl SessionSnapshot {
     }
 
     pub const fn execution(&self) -> SessionExecutionView {
-        match self.state {
-            SessionSnapshotState::LoadedReadyIdle => SessionExecutionView::Idle,
-        }
+        self.execution
     }
 
     pub const fn recording(&self) -> SessionRecordingView {
@@ -1361,6 +1591,10 @@ impl SessionSnapshot {
     pub fn diagnostics(&self) -> &[SessionDiagnosticView] {
         &self.diagnostics
     }
+
+    pub const fn queues(&self) -> &SessionQueueView {
+        &self.queues
+    }
 }
 
 impl fmt::Debug for SessionSnapshot {
@@ -1373,7 +1607,8 @@ impl fmt::Debug for SessionSnapshot {
             .field("recording", &self.recording)
             .field("usage", &self.usage)
             .field("diagnostics", &self.diagnostics)
-            .field("state", &self.state)
+            .field("execution", &self.execution)
+            .field("queues", &self.queues)
             .finish()
     }
 }

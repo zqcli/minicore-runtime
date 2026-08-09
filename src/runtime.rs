@@ -14,13 +14,14 @@ use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
     CommandRequest, CommandResponse, EventFrame, LoadedSessionSummary, PublicCancelTarget,
-    PublicSubject, QueryError, QueryResponse, QueryResult, RetryAdvice, RuntimeCapabilities,
-    RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
-    RuntimeSnapshot, RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary,
-    SessionExecutionView, SessionMetadataView, SessionReadinessView, SessionRecordingState,
-    SessionRecordingView, SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest,
-    SnapshotResponse, StateEvent, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
-    SubscriptionScope, TurnCommand, TurnFailureView,
+    PublicSubject, QueryError, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
+    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStatusView, RuntimeView,
+    SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionMetadataView,
+    SessionQueueView, SessionReadinessView, SessionRecordingState, SessionRecordingView,
+    SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse,
+    StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
+    SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
@@ -645,9 +646,6 @@ impl RuntimeInner {
         snapshot: Arc<SessionExecutorSnapshot>,
     ) -> Result<SessionSnapshot, SnapshotError> {
         let session_id = snapshot.definition().session_id();
-        if snapshot.execution_state() != SessionExecutionState::Idle {
-            return Err(unavailable_snapshot(session_id));
-        }
         let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
             return Err(runtime_snapshot_closing());
         };
@@ -676,10 +674,54 @@ impl RuntimeInner {
             definition.prompts().clone(),
             definition.created_at(),
         );
-        SessionSnapshot::new_loaded_ready_idle(
+        let execution = public_execution_state(snapshot.execution_state());
+        let submit_admissions = snapshot
+            .active_submit_command_id()
+            .map(|command_id| {
+                SubmitAdmissionView::new(
+                    command_id,
+                    if execution == SessionExecutionView::Starting {
+                        SubmitAdmissionStateView::Starting
+                    } else {
+                        SubmitAdmissionStateView::Queued
+                    },
+                )
+            })
+            .into_iter()
+            .collect();
+        let steers = snapshot
+            .current_turn()
+            .map(|turn_id| {
+                snapshot
+                    .steer_command_ids()
+                    .iter()
+                    .copied()
+                    .map(|command_id| QueuedSteerView::new(command_id, turn_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let follow_ups = snapshot
+            .follow_up_command_ids()
+            .iter()
+            .copied()
+            .map(QueuedFollowUpView::new)
+            .collect();
+        let queues = SessionQueueView::new(
+            submit_admissions,
+            steers,
+            follow_ups,
+            matches!(
+                execution,
+                SessionExecutionView::Idle | SessionExecutionView::Running
+            ),
+        )
+        .map_err(|_| unavailable_snapshot(session_id))?;
+        SessionSnapshot::new_loaded_ready_with_queue(
             session_id,
             metadata,
             definition,
+            execution,
+            queues,
             SessionRecordingView::new(SessionRecordingState::Healthy),
             None,
             Vec::new(),
@@ -2135,6 +2177,24 @@ mod tests {
             } if *queued_turn_id == turn_id
         ));
 
+        let queued_snapshot = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("public Session snapshot projects active queues");
+        let SnapshotResponse::Session(queued_snapshot) = queued_snapshot else {
+            panic!("the public Session snapshot returns a Session view");
+        };
+        assert_eq!(queued_snapshot.execution(), SessionExecutionView::Running);
+        assert_eq!(queued_snapshot.queues().submit_admissions(), &[]);
+        assert_eq!(
+            queued_snapshot.queues().steers()[0].command_id(),
+            "cmd_33333333333333333333333333333333".parse().unwrap()
+        );
+        assert_eq!(
+            queued_snapshot.queues().follow_ups()[0].command_id(),
+            follow_up_command_id
+        );
+
         let cancelled = runtime
             .dispatch(CommandRequest::new(
                 "cmd_44444444444444444444444444444444".parse().unwrap(),
@@ -2152,6 +2212,16 @@ mod tests {
                 output: None,
             }
         ));
+
+        let after_cancel = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("public Session snapshot reflects queue cancellation");
+        let SnapshotResponse::Session(after_cancel) = after_cancel else {
+            panic!("the public Session snapshot returns a Session view");
+        };
+        assert!(after_cancel.queues().follow_ups().is_empty());
+        assert_eq!(after_cancel.queues().steers().len(), 1);
 
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(8), events.recv())
             .await

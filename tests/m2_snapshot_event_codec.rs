@@ -44,6 +44,76 @@ fn idle_session_snapshot_frame_round_trips_through_semantic_owners() {
 }
 
 #[test]
+fn session_snapshot_projects_running_queue_targets_without_prompt_payloads() {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fixture("valid/session-snapshot-frame.json")).unwrap();
+    value["data"]["data"]["execution"] = serde_json::json!("running");
+    value["data"]["data"]["queues"] = serde_json::json!({
+        "submitAdmissions": [],
+        "steers": [{
+            "commandId": "cmd_22222222222222222222222222222222",
+            "expectedTurnId": "trn_33333333333333333333333333333333"
+        }],
+        "followUps": [{
+            "commandId": "cmd_44444444444444444444444444444444"
+        }],
+        "acceptingInput": true
+    });
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let frame = protocol
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .expect("running queue snapshot is a known public projection");
+    let EventFrame::Snapshot(SnapshotResponse::Session(snapshot)) = &frame else {
+        panic!("queue fixture did not decode as a Session snapshot frame");
+    };
+    assert_eq!(
+        snapshot.execution(),
+        minicore_runtime::runtime_interface::SessionExecutionView::Running
+    );
+    assert!(snapshot.queues().submit_admissions().is_empty());
+    assert_eq!(snapshot.queues().steers().len(), 1);
+    assert_eq!(snapshot.queues().follow_ups().len(), 1);
+    assert_eq!(
+        snapshot.queues().steers()[0].expected_turn_id().to_string(),
+        "trn_33333333333333333333333333333333"
+    );
+    assert!(snapshot.queues().accepting_input());
+    let encoded = protocol.encode_event_frame(&frame).unwrap();
+    let decoded_again = protocol
+        .decode_event_frame(&encoded)
+        .expect("encoded queue snapshot remains decodable");
+    assert_eq!(decoded_again, frame);
+}
+
+#[test]
+fn queue_snapshot_projection_uses_selected_queue_limits() {
+    let mut limits = ProtocolLimits::v1_0();
+    limits.queues.max_submit_admissions = 0;
+    let protocol =
+        IncrementalRuntimeProtocolV1::new(WireV1Codec::new(ProtocolVersion::V1_0, limits).unwrap());
+    assert_invalid_scalar(
+        protocol
+            .decode_event_frame(&fixture("valid/starting-session-snapshot-frame.json"))
+            .unwrap_err(),
+    );
+}
+
+#[test]
+fn queue_snapshot_rejects_unknown_submit_state_as_output_variant() {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fixture("valid/starting-session-snapshot-frame.json")).unwrap();
+    value["data"]["data"]["queues"]["submitAdmissions"][0]["state"] = serde_json::json!("future");
+    let error = IncrementalRuntimeProtocolV1::v1_0()
+        .decode_event_frame(&serde_json::to_vec(&value).unwrap())
+        .unwrap_err();
+    assert_fault(
+        error,
+        PublicDecodeStage::SelectedSchema,
+        PublicDecodeCode::UnknownOutputVariant,
+    );
+}
+
+#[test]
 fn session_snapshot_output_ignores_additive_model_fields_but_not_unknown_variants() {
     let canonical = fixture("valid/session-snapshot-frame.json");
     let mut value: serde_json::Value = serde_json::from_slice(&canonical).unwrap();
@@ -143,8 +213,19 @@ fn runtime_and_terminal_state_frames_round_trip_with_coherent_routes() {
 #[test]
 fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let starting = protocol
+        .decode_event_frame(&fixture("valid/starting-session-snapshot-frame.json"))
+        .expect("the starting queue projection is now active in V1");
+    let EventFrame::Snapshot(SnapshotResponse::Session(starting)) = starting else {
+        panic!("the starting fixture did not decode as a Session snapshot");
+    };
+    assert_eq!(
+        starting.execution(),
+        minicore_runtime::runtime_interface::SessionExecutionView::Starting
+    );
+    assert_eq!(starting.queues().submit_admissions().len(), 1);
+
     for path in [
-        "valid/starting-session-snapshot-frame.json",
         "valid/active-session-snapshot-frame.json",
         "valid/approval-session-snapshot-frame.json",
         "valid/turn-interrupted-state-frame.json",
@@ -185,7 +266,6 @@ fn later_event_slices_are_known_pending_and_unknown_frames_are_protocol_errors()
 fn known_pending_observations_do_not_validate_future_payloads() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     for path in [
-        "valid/starting-session-snapshot-frame.json",
         "valid/active-session-snapshot-frame.json",
         "valid/approval-session-snapshot-frame.json",
     ] {
@@ -202,11 +282,12 @@ fn known_pending_observations_do_not_validate_future_payloads() {
         serde_json::from_slice(&fixture("valid/starting-session-snapshot-frame.json")).unwrap();
     starting["data"]["data"]["definition"]["agent"]["agentId"] =
         serde_json::json!("agt_NOT_CANONICAL");
-    assert!(
+    assert_fault(
         protocol
             .decode_event_frame(&serde_json::to_vec(&starting).unwrap())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
+        PublicDecodeStage::TypedScalar,
+        PublicDecodeCode::NoncanonicalId,
     );
 
     let mut active: serde_json::Value =

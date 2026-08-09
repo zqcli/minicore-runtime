@@ -214,6 +214,18 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_eq!(snapshot.definition().workspace().roots().len(), 1);
             assert_eq!(snapshot.usage().unwrap().model_calls(), 0);
         }
+        (
+            Some("starting_session_snapshot"),
+            EventFrame::Snapshot(SnapshotResponse::Session(snapshot)),
+        ) => {
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Starting
+            );
+            assert_eq!(snapshot.queues().submit_admissions().len(), 1);
+            assert_eq!(snapshot.queues().steers().len(), 0);
+            assert_eq!(snapshot.queues().follow_ups().len(), 0);
+        }
         (Some("runtime_catalog_invalidated_state"), EventFrame::State(event)) => {
             assert_eq!(event.route(), EventRoute::Runtime);
             let StateEventMsg::Runtime { kind, snapshot } = event.msg() else {
