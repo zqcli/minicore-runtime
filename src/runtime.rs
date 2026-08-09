@@ -18,11 +18,10 @@ use crate::runtime_interface::{
     RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery,
     RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStatusView, RuntimeView,
     SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionMetadataView,
-    SessionQueueView, SessionReadinessView, SessionRecordingState, SessionRecordingView,
-    SessionSnapshot, SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse,
-    StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
-    SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
-    TurnInterruptionView,
+    SessionQueueView, SessionReadinessView, SessionRecordingView, SessionSnapshot, SnapshotError,
+    SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView,
+    SubmitAdmissionView, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
@@ -597,7 +596,7 @@ impl RuntimeInner {
                             session_id,
                             SessionReadinessView::Ready,
                             public_execution_state(snapshot.execution_state()),
-                            SessionRecordingView::new(SessionRecordingState::Healthy),
+                            SessionRecordingView::new(snapshot.recording()),
                         )
                         .map_err(|_| unavailable_snapshot(session_id))?,
                     );
@@ -736,9 +735,9 @@ impl RuntimeInner {
             snapshot.active_items().to_vec(),
             snapshot.public_pending_interactions().to_vec(),
             queues,
-            SessionRecordingView::new(SessionRecordingState::Healthy),
-            None,
-            Vec::new(),
+            SessionRecordingView::new(snapshot.recording()),
+            snapshot.usage().cloned(),
+            snapshot.diagnostics().to_vec(),
             ProtocolLimits::v1_0(),
         )
         .map_err(|_| unavailable_snapshot(session_id))
@@ -1590,8 +1589,9 @@ mod tests {
         EventFrame, EventRoute, ItemContentView, NewSessionDefinition, NewSessionMetadata,
         PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
         RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, SessionCommand, SessionEventDetail,
-        SessionExecutionView, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
-        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
+        SessionExecutionView, SessionRecordingState, SessionStateEventKind, SnapshotRequest,
+        SnapshotResponse, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
+        TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -1974,6 +1974,16 @@ mod tests {
                 .execution(),
             SessionExecutionView::Idle
         );
+        assert_eq!(
+            terminal
+                .msg()
+                .session_snapshot()
+                .unwrap()
+                .usage()
+                .unwrap()
+                .model_calls(),
+            1
+        );
         assert_eq!(model.request_count(), 1);
 
         let snapshot = runtime
@@ -1984,6 +1994,7 @@ mod tests {
             panic!("the Session snapshot request returns a Session snapshot");
         };
         assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+        assert_eq!(snapshot.usage().unwrap().model_calls(), 1);
 
         let unload = runtime
             .dispatch(CommandRequest::new(
@@ -2010,6 +2021,16 @@ mod tests {
             .executor_for_test(session_id)
             .expect("the reloaded executor is installed");
         assert_eq!(executor.snapshot().await.unwrap().last_terminal(), None);
+        assert_eq!(
+            executor
+                .snapshot()
+                .await
+                .unwrap()
+                .usage()
+                .unwrap()
+                .model_calls(),
+            1
+        );
         let live_state = executor
             .live_state_for_test()
             .expect("the reloaded executor retains replayed conversation state");
@@ -2423,7 +2444,32 @@ mod tests {
                     }) if completed_turn == turn_id
                 )
         ));
+        let EventFrame::State(terminal) = terminal else {
+            unreachable!();
+        };
+        let terminal_snapshot = terminal.msg().session_snapshot().unwrap();
+        assert_eq!(
+            terminal_snapshot.recording().state(),
+            SessionRecordingState::Degraded
+        );
+        assert_eq!(
+            terminal_snapshot.diagnostics()[0].code(),
+            "session_recording_append_failed"
+        );
+        assert_eq!(terminal_snapshot.usage().unwrap().model_calls(), 1);
         assert_eq!(model.request_count(), 1);
+
+        let SnapshotResponse::Runtime(runtime_snapshot) = runtime
+            .snapshot(SnapshotRequest::Runtime)
+            .await
+            .expect("the Runtime snapshot remains available")
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            runtime_snapshot.loaded_sessions()[0].recording().state(),
+            SessionRecordingState::Degraded
+        );
 
         let residency = runtime.inner.residency().unwrap();
         let executor = residency.executor_for_test(session_id).unwrap();
