@@ -2669,7 +2669,6 @@ impl SessionExecutorActor {
                     security_revocation.cancel();
                 }
                 cancellation.cancel();
-                request.settle(Ok(()));
                 true
             }
             EmergencyControlSignalOutcome::AlreadySignaled {
@@ -2689,28 +2688,41 @@ impl SessionExecutorActor {
             EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
         };
         if accepted {
-            if let EmergencyControlTarget::Turn(turn_id) = emergency_target {
+            let finishing_turn = match emergency_target {
+                EmergencyControlTarget::Turn(turn_id) => Some(turn_id),
+                EmergencyControlTarget::Submit(_) => {
+                    self.active_admission.as_ref().and_then(|active| {
+                        self.conversation.as_ref().and_then(|conversation| {
+                            (lock(&conversation.live_state).current_turn() == Some(active.turn_id))
+                                .then_some(active.turn_id)
+                        })
+                    })
+                }
+            };
+            let pending = if let Some(turn_id) = finishing_turn {
                 self.execution_state = SessionExecutionState::Finishing;
                 self.publish_execution_state(
                     SessionExecutionState::Finishing,
                     Some(turn_id),
                     self.current.last_terminal(),
                 );
-                let pending = self
-                    .pending_interactions
+                self.pending_interactions
                     .iter()
                     .filter_map(|(request_id, interaction)| {
                         (interaction.turn_id == turn_id).then_some(*request_id)
                     })
-                    .collect::<Vec<_>>();
-                for request_id in pending {
-                    self.cancel_pending_interaction(
-                        request_id,
-                        SystemClock.now(),
-                        InteractionCancelReason::SecurityRevoked,
-                    )
-                    .await?;
-                }
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            request.settle(Ok(()));
+            for request_id in pending {
+                self.cancel_pending_interaction(
+                    request_id,
+                    SystemClock.now(),
+                    InteractionCancelReason::SecurityRevoked,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -8489,6 +8501,10 @@ mod tests {
             Ok(())
         );
         assert_eq!(
+            loaded.executor.snapshot().await.unwrap().execution_state(),
+            SessionExecutionState::Starting
+        );
+        assert_eq!(
             loaded
                 .executor
                 .security_revoke(SessionCancelTarget::Submit(command_id))
@@ -8578,6 +8594,10 @@ mod tests {
                         .security_revoke(SessionCancelTarget::Submit(command_id))
                         .await,
                     Ok(())
+                );
+                assert_eq!(
+                    loaded.executor.snapshot().await.unwrap().execution_state(),
+                    SessionExecutionState::Finishing
                 );
             } else {
                 let accepted = loaded
