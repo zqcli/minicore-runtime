@@ -1,6 +1,6 @@
 # Turn Execution Context 架构设计
 
-状态：当前权威架构（M7 capture已实现；M10 validated settings、planning与CompactionSummary assembly façade已接通，async orchestration待实现）
+状态：当前权威架构（M7 capture及M10 validated settings、planning、CompactionSummary assembly façade与async orchestration已实现）
 日期：2026-07-31
 
 ## 目的
@@ -98,7 +98,7 @@ impl TurnExecutionContext {
 }
 ```
 
-M10 adds the following crate-private extension only when planning/orchestration is implemented; it is not M4's Context surface:
+M10 adds the following crate-private extension; it is not M4's Context surface:
 
 ```rust
 impl TurnExecutionContext {

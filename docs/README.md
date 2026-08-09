@@ -26,11 +26,11 @@ architecture.md + modules/
 
 ## 当前状态
 
-M0–M6 foundations、M7 ordinary AgentRun与M8最小Tool/Interaction/Cancel路径已完成；M9当前control/observation范围已接通Steer/FollowUp、queued cancellation、logical retry、EmergencyControl、runtime-wide CommandId dedup、Starting/Running/Finishing Snapshot及`session_execution_changed`/terminal StateEvent，并通过Wire V1 active fixtures。M10已完成Runtime-global validated Compaction settings、Turn-pinned Prompt/Model planning basis、pressure、checked stable-unit prefix plan、CompactionSummary request/validation及production replacement；ActiveTurnTask Replace/record orchestration仍pending。具体Prompt/Skill source adapter、完整Tool policy/approval、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload及完整cross-platform native matrix亦仍pending。
+M0–M6 foundations、M7 ordinary AgentRun与M8最小Tool/Interaction/Cancel路径已完成；M9当前control/observation范围已接通Steer/FollowUp、queued cancellation、logical retry、EmergencyControl、runtime-wide CommandId dedup、Starting/Running/Finishing Snapshot及`session_execution_changed`/terminal StateEvent，并通过Wire V1 active fixtures。M10已完成Runtime-global validated Compaction settings、Turn-pinned Prompt/Model planning basis、pressure、deterministic large-ToolResult reduction、checked stable-unit prefix plan、CompactionSummary request/validation、ActiveTurnTask live Replace、inline best-effort marker recording、phase/Snapshot publication与下一次AgentRun。具体Prompt/Skill source adapter、完整Tool policy/approval、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload及完整cross-platform native matrix亦仍pending。
 
 开发计划M0与M1已经完成，M2按行为slice增量推进，M8.1已完成；后续主要门禁：
 
-- M5.0–M8 foundation/behavior已完成；M9.1–M9.21当前control/observation范围已完成并统一review；M10已完成planning foundation及CompactionSummary request/validation/production replacement，两个切片均通过统一review与全量fast gate；下一步闭合async Replace/record vertical slice，随后推进M11 Fork/full recovery conformance；
+- M5.0–M10 foundation/behavior已完成并统一review；下一步推进M11 Fork/full recovery conformance；
 - V4-P1-3：production ProviderAdapter前关闭Rig reality与provider scope；
 - V4-C0-1：production Tool/Sandbox adapter开始前关闭enforcement fail-closed合同。
 

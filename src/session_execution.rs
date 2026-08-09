@@ -23,7 +23,10 @@ use crate::agent_session_lifecycle::{
     SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
     SessionDefinitionDecisionError, SessionLifecycle,
 };
-use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
+use crate::compaction::{
+    Compaction, CompactionPlan, CompactionPressure, CompactionSettings, CompactionSettingsSnapshot,
+    CompactionTrigger,
+};
 use crate::conversation_storage::{
     ConversationReplayDiagnostics, RecordingHealth, SessionRecorder, SessionRecordingError,
     StoredAssistantContent, StoredAssistantMessage, StoredEntryBody, StoredToolMessage,
@@ -84,6 +87,7 @@ const AGENT_RUN_RETRY_BACKOFFS: [std::time::Duration; AGENT_RUN_MAX_LOGICAL_RETR
     std::time::Duration::from_secs(4),
     std::time::Duration::from_secs(8),
 ];
+const COMPACTION_SUMMARY_MAX_LOGICAL_RETRIES: u8 = 1;
 
 /// The only execution states represented by a loaded Session executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1721,6 +1725,7 @@ struct ActiveTurn {
     cancel_accepted: Option<SessionCancelAccepted>,
     task: Option<TrackedTask>,
     steer_admission_open: bool,
+    phase: TurnExecutionPhaseView,
 }
 
 struct ActiveInteraction {
@@ -2292,6 +2297,7 @@ impl SessionExecutorActor {
             cancel_accepted: active.cancel_accepted,
             task: None,
             steer_admission_open: true,
+            phase: TurnExecutionPhaseView::Sampling,
         });
 
         let turn_id = active.turn_id;
@@ -3070,8 +3076,27 @@ impl SessionExecutorActor {
             ExecutorCompletion::SteerSafePoint(completion) => {
                 self.handle_steer_safe_point(completion).await
             }
+            ExecutorCompletion::TurnPhase(completion) => {
+                self.handle_turn_phase_completion(completion)
+            }
             ExecutorCompletion::Turn(completion) => self.handle_turn_completion(completion).await,
         }
+    }
+
+    fn handle_turn_phase_completion(
+        &mut self,
+        completion: TurnPhaseCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(active_turn) = self.active_turn.as_mut() else {
+            return Err(ActorFatality::Internal);
+        };
+        if active_turn.turn_id != completion.turn_id {
+            return Err(ActorFatality::Internal);
+        }
+        active_turn.phase = completion.phase;
+        self.publish_queue_projection();
+        let _ = completion.response.send(());
+        Ok(())
     }
 
     async fn handle_steer_safe_point(
@@ -3085,7 +3110,7 @@ impl SessionExecutorActor {
             return Err(ActorFatality::Internal);
         }
         let steer = self.steer.pop_front_for_turn(completion.turn_id);
-        if steer.is_some() {
+        if steer.is_some() || completion.refresh_public_snapshot {
             self.publish_queue_projection();
         }
         if steer.is_none() && completion.close_if_empty {
@@ -3550,7 +3575,13 @@ impl SessionExecutorActor {
         } else if has_started_tool {
             Some(TurnExecutionPhaseView::ExecutingTools)
         } else {
-            Some(TurnExecutionPhaseView::Sampling)
+            Some(
+                self.active_turn
+                    .as_ref()
+                    .filter(|active_turn| active_turn.turn_id == turn_id)
+                    .map(|active_turn| active_turn.phase)
+                    .unwrap_or(TurnExecutionPhaseView::Sampling),
+            )
         };
         let started_at = entries
             .first()
@@ -3896,6 +3927,7 @@ enum ExecutorCompletion {
     Admission(AdmissionCompletion),
     InteractionRequested(InteractionRequestedCompletion),
     SteerSafePoint(SteerSafePointCompletion),
+    TurnPhase(TurnPhaseCompletion),
     Turn(TurnCompletion),
 }
 
@@ -3913,6 +3945,13 @@ struct SteerSafePointCompletion {
     turn_id: TurnId,
     response: oneshot::Sender<Option<QueuedSteer>>,
     close_if_empty: bool,
+    refresh_public_snapshot: bool,
+}
+
+struct TurnPhaseCompletion {
+    turn_id: TurnId,
+    phase: TurnExecutionPhaseView,
+    response: oneshot::Sender<()>,
 }
 
 struct PublicationCompletion {
@@ -4181,6 +4220,22 @@ async fn run_active_turn_inner(
     steer_completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
+    let mut compactions_started = 0_u8;
+    let compaction = ActiveTurnCompaction {
+        context: Arc::clone(&context),
+        model_gateway: Arc::clone(&model_gateway),
+        conversation: Arc::clone(&conversation),
+        turn_id,
+        control_generation: Arc::clone(&control_generation),
+        emergency_control: emergency_control.clone(),
+        emergency_observation,
+        cancellation: cancellation.clone(),
+        executor_closing: executor_closing.clone(),
+        closing: closing.clone(),
+        completion_sender: steer_completion_sender.clone(),
+        #[cfg(test)]
+        hooks: Arc::clone(&hooks),
+    };
     loop {
         if cancellation.is_cancelled()
             || !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation)
@@ -4190,10 +4245,38 @@ async fn run_active_turn_inner(
         let captured = lock(&conversation.live_state)
             .capture_conversation_views()
             .map_err(|_| SessionTurnFailure::Internal)?;
+        if matches!(
+            context.compaction_pressure(
+                captured.compaction_source(),
+                CompactionTrigger::ProactivePressure,
+                compactions_started,
+            ),
+            CompactionPressure::Recommended
+        ) && compaction
+            .execute(
+                &mut compactions_started,
+                Arc::clone(captured.compaction_source()),
+                CompactionTrigger::ProactivePressure,
+            )
+            .await?
+        {
+            continue;
+        }
         let source_revision = captured.conversation().revision();
-        let assembled = context
-            .assemble_agent_run(captured.conversation())
-            .map_err(map_turn_prompt_error)?;
+        let assembled = match context.assemble_agent_run(captured.conversation()) {
+            Ok(assembled) => assembled,
+            Err(error) if error.kind() == PromptErrorKind::ContextLimitExceeded => {
+                compaction
+                    .execute(
+                        &mut compactions_started,
+                        Arc::clone(captured.compaction_source()),
+                        CompactionTrigger::PromptContextOverflow,
+                    )
+                    .await?;
+                continue;
+            }
+            Err(error) => return Err(map_turn_prompt_error(error)),
+        };
         let request = ModelCallRequest::new(
             Arc::clone(context.model()),
             ModelCallPurpose::AgentRun,
@@ -4205,7 +4288,7 @@ async fn run_active_turn_inner(
         .map_err(map_model_request_error)?;
         #[cfg(test)]
         hooks.before_agent_run_attempt().await;
-        let (result, logical_retry_count) = call_agent_run_with_logical_retry(
+        let call_result = call_agent_run_with_logical_retry(
             &model_gateway,
             Arc::clone(&request),
             &conversation,
@@ -4217,18 +4300,37 @@ async fn run_active_turn_inner(
             executor_closing.clone(),
             closing.clone(),
         )
-        .await
-        .map_err(|error| {
-            if !cancellation.is_cancelled() {
-                if let Some(signal) = emergency_control
-                    .observe(emergency_observation.target())
-                    .and_then(|observation| observation.signal())
+        .await;
+        let (result, logical_retry_count) = match call_result {
+            Ok(success) => success,
+            Err(error) if error.reason() == ModelCallErrorReason::ContextOverflow => {
+                if !cancellation.is_cancelled()
+                    && let Some(signal) = emergency_control
+                        .observe(emergency_observation.target())
+                        .and_then(|observation| observation.signal())
                 {
-                    return SessionTurnFailure::EmergencyControl(signal);
+                    return Err(SessionTurnFailure::EmergencyControl(signal));
                 }
+                compaction
+                    .execute(
+                        &mut compactions_started,
+                        Arc::clone(captured.compaction_source()),
+                        CompactionTrigger::ProviderContextOverflow,
+                    )
+                    .await?;
+                continue;
             }
-            map_model_call_failure(error)
-        })?;
+            Err(error) => {
+                if !cancellation.is_cancelled()
+                    && let Some(signal) = emergency_control
+                        .observe(emergency_observation.target())
+                        .and_then(|observation| observation.signal())
+                {
+                    return Err(SessionTurnFailure::EmergencyControl(signal));
+                }
+                return Err(map_model_call_failure(error));
+            }
+        };
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
@@ -4302,6 +4404,7 @@ async fn run_active_turn_inner(
                 cancellation.clone(),
                 &steer_completion_sender,
                 true,
+                false,
                 #[cfg(test)]
                 Arc::clone(&hooks),
             )
@@ -4476,6 +4579,7 @@ async fn run_active_turn_inner(
             cancellation.clone(),
             &steer_completion_sender,
             false,
+            false,
             #[cfg(test)]
             Arc::clone(&hooks),
         )
@@ -4507,6 +4611,273 @@ async fn run_active_turn_inner(
                 let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
             }
         }
+    }
+}
+
+struct ActiveTurnCompaction {
+    context: Arc<TurnExecutionContext>,
+    model_gateway: Arc<ModelGateway>,
+    conversation: Arc<LoadedSessionConversation>,
+    turn_id: TurnId,
+    control_generation: Arc<ControlGeneration>,
+    emergency_control: EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
+    cancellation: CancellationToken,
+    executor_closing: CancellationToken,
+    closing: CancellationToken,
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    #[cfg(test)]
+    hooks: Arc<SessionExecutorTestHooksInner>,
+}
+
+struct ActiveCompactionOperation {
+    session_id: SessionId,
+    plan: Arc<CompactionPlan>,
+    request: Arc<ModelCallRequest>,
+}
+
+impl ActiveTurnCompaction {
+    async fn execute(
+        &self,
+        compactions_started: &mut u8,
+        source: Arc<crate::compaction::LiveCompactionSourceView>,
+        trigger: CompactionTrigger,
+    ) -> Result<bool, SessionTurnFailure> {
+        let applied = self
+            .execute_operation(compactions_started, source, trigger)
+            .await?;
+        if applied {
+            self.consume_one_steer().await?;
+            self.publish_phase(TurnExecutionPhaseView::Sampling).await?;
+        }
+        Ok(applied)
+    }
+
+    async fn execute_operation(
+        &self,
+        compactions_started: &mut u8,
+        source: Arc<crate::compaction::LiveCompactionSourceView>,
+        trigger: CompactionTrigger,
+    ) -> Result<bool, SessionTurnFailure> {
+        let plan = match self
+            .context
+            .plan_compaction(source, trigger, *compactions_started)
+        {
+            Ok(plan) => plan,
+            Err(_) if trigger == CompactionTrigger::ProactivePressure => return Ok(false),
+            Err(_) => return Err(SessionTurnFailure::ContextOverflow),
+        };
+        let assembled = self
+            .context
+            .assemble_compaction(&plan)
+            .map_err(map_turn_prompt_error)?;
+        let request = ModelCallRequest::new(
+            Arc::clone(self.context.model()),
+            ModelCallPurpose::CompactionSummary,
+            assembled,
+            *plan.source().revision(),
+            Some(plan.budget().max_output_tokens()),
+        )
+        .map(Arc::new)
+        .map_err(map_model_request_error)?;
+        let operation = ActiveCompactionOperation {
+            session_id: self.context.session_id(),
+            plan,
+            request,
+        };
+        *compactions_started = compactions_started
+            .checked_add(1)
+            .ok_or(SessionTurnFailure::Internal)?;
+
+        if self.cancellation.is_cancelled()
+            || self.closing.is_cancelled()
+            || !self.operation_is_current(&operation)
+        {
+            return Err(SessionTurnFailure::Model);
+        }
+        self.publish_phase(TurnExecutionPhaseView::Compacting)
+            .await?;
+        let (result, logical_retry_count) = self
+            .call_summary_with_logical_retry(&operation)
+            .await
+            .map_err(|error| {
+                if !self.cancellation.is_cancelled()
+                    && let Some(signal) = self
+                        .emergency_control
+                        .observe(self.emergency_observation.target())
+                        .and_then(|observation| observation.signal())
+                {
+                    return SessionTurnFailure::EmergencyControl(signal);
+                }
+                map_model_call_failure(error)
+            })?;
+        #[cfg(test)]
+        self.hooks.before_compaction_apply().await;
+        if self.cancellation.is_cancelled()
+            || self.closing.is_cancelled()
+            || !self.operation_is_current(&operation)
+        {
+            return Err(SessionTurnFailure::Model);
+        }
+        let validated = Compaction
+            .validate_summary(Arc::clone(&operation.plan), &result, logical_retry_count)
+            .map_err(|_| SessionTurnFailure::Model)?;
+        if !Arc::ptr_eq(validated.plan(), &operation.plan) {
+            return Err(SessionTurnFailure::Internal);
+        }
+        let replacement = validated
+            .into_replacement()
+            .map_err(|_| SessionTurnFailure::Model)?;
+        if self.cancellation.is_cancelled()
+            || self.closing.is_cancelled()
+            || !self.operation_is_current(&operation)
+        {
+            return Err(SessionTurnFailure::Model);
+        }
+        let fact = lock(&self.conversation.live_state)
+            .apply_compaction(
+                Arc::clone(operation.plan.source()),
+                operation.plan.summarized_unit_count(),
+                replacement,
+                self.turn_id,
+                SystemClock.now(),
+            )
+            .map_err(|_| SessionTurnFailure::Internal)?;
+        let _ = self
+            .conversation
+            .recorder
+            .record(Arc::clone(fact.entry()))
+            .await;
+        Ok(true)
+    }
+
+    async fn call_summary_with_logical_retry(
+        &self,
+        operation: &ActiveCompactionOperation,
+    ) -> Result<(ModelCallResult, u8), ModelCallError> {
+        let mut logical_retries = 0_u8;
+        loop {
+            if self.cancellation.is_cancelled()
+                || self.closing.is_cancelled()
+                || !self.operation_is_current(operation)
+            {
+                return Err(ModelCallError::cancelled());
+            }
+            let result = self
+                .model_gateway
+                .generate_model_turn(
+                    Arc::clone(&operation.request),
+                    ModelProgressPublisher::discard(),
+                    self.cancellation.clone(),
+                )
+                .await;
+            let error = match result {
+                Ok(result) => {
+                    if self.cancellation.is_cancelled()
+                        || self.closing.is_cancelled()
+                        || !self.operation_is_current(operation)
+                    {
+                        return Err(ModelCallError::cancelled());
+                    }
+                    return Ok((result, logical_retries));
+                }
+                Err(error) => error,
+            };
+            if logical_retries >= COMPACTION_SUMMARY_MAX_LOGICAL_RETRIES {
+                return Err(error);
+            }
+            let Some(delay) = agent_run_retry_delay(&error, 0) else {
+                return Err(error);
+            };
+            if !self.operation_is_current(operation) {
+                return Err(error);
+            }
+            logical_retries += 1;
+            tokio::select! {
+                biased;
+                _ = self.executor_closing.cancelled() => return Err(error),
+                _ = self.closing.cancelled() => return Err(error),
+                _ = self.cancellation.cancelled() => return Err(error),
+                _ = self.emergency_control.cancelled(
+                    self.emergency_observation.target(),
+                    self.emergency_observation.epoch(),
+                ) => return Err(error),
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    fn operation_is_current(&self, operation: &ActiveCompactionOperation) -> bool {
+        operation.plan.source().session_id() == &operation.session_id
+            && operation.request.purpose() == ModelCallPurpose::CompactionSummary
+            && operation.request.source_revision() == *operation.plan.source().revision()
+            && retry_basis_is_current(
+                &self.conversation,
+                self.turn_id,
+                &self.control_generation,
+                operation.request.source_revision(),
+                &self.emergency_control,
+                self.emergency_observation,
+            )
+    }
+
+    async fn consume_one_steer(&self) -> Result<(), SessionTurnFailure> {
+        let steer = arbitrate_one_steer(
+            Arc::clone(&self.conversation),
+            self.turn_id,
+            &self.emergency_control,
+            self.emergency_observation,
+            self.cancellation.clone(),
+            &self.completion_sender,
+            false,
+            true,
+            #[cfg(test)]
+            Arc::clone(&self.hooks),
+        )
+        .await?;
+        if let Some(queued) = steer.queued
+            && let Some(steer) = resolve_one_steer(
+                Arc::clone(&self.context),
+                Arc::clone(&self.conversation),
+                self.turn_id,
+                queued,
+                steer.basis_revision,
+                &self.emergency_control,
+                self.emergency_observation,
+                self.cancellation.clone(),
+                #[cfg(test)]
+                Arc::clone(&self.hooks),
+            )
+            .await?
+        {
+            if !emergency_control_is_unsignaled_current(
+                &self.emergency_control,
+                self.emergency_observation,
+            ) {
+                return Err(SessionTurnFailure::Model);
+            }
+            let fact = lock(&self.conversation.live_state)
+                .apply_user_message(steer, self.turn_id, SystemClock.now())
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            let _ = self
+                .conversation
+                .recorder
+                .record(Arc::clone(fact.entry()))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn publish_phase(&self, phase: TurnExecutionPhaseView) -> Result<(), SessionTurnFailure> {
+        let (response, waiter) = oneshot::channel();
+        self.completion_sender
+            .send(ExecutorCompletion::TurnPhase(TurnPhaseCompletion {
+                turn_id: self.turn_id,
+                phase,
+                response,
+            }))
+            .map_err(|_| SessionTurnFailure::Internal)?;
+        waiter.await.map_err(|_| SessionTurnFailure::Internal)
     }
 }
 
@@ -4695,6 +5066,7 @@ async fn arbitrate_one_steer(
     cancellation: CancellationToken,
     steer_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
     close_if_empty: bool,
+    refresh_public_snapshot: bool,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<SteerArbitration, SessionTurnFailure> {
     if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
@@ -4714,6 +5086,7 @@ async fn arbitrate_one_steer(
                 turn_id,
                 response,
                 close_if_empty,
+                refresh_public_snapshot,
             },
         ))
         .map_err(|_| SessionTurnFailure::Internal)?;
@@ -5749,6 +6122,21 @@ impl SessionExecutorTestHooks {
         self.inner.before_steer_safe_point.arm();
     }
 
+    pub(crate) fn arm_before_compaction_apply(&self) {
+        self.inner.before_compaction_apply.arm();
+    }
+
+    pub(crate) async fn wait_before_compaction_apply(&self) {
+        self.inner
+            .before_compaction_apply
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_before_compaction_apply(&self) {
+        self.inner.before_compaction_apply.release();
+    }
+
     pub(crate) async fn wait_before_steer_safe_point(&self) {
         self.inner
             .before_steer_safe_point
@@ -5831,6 +6219,7 @@ struct SessionExecutorTestHooksInner {
     after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
     after_input_before_completion: Arc<NamedAsyncBarrier>,
     before_agent_run_attempt: Arc<NamedAsyncBarrier>,
+    before_compaction_apply: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
     after_steer_resolution: Arc<NamedAsyncBarrier>,
     after_steer_arbitration: Arc<NamedAsyncBarrier>,
@@ -5848,6 +6237,7 @@ impl SessionExecutorTestHooksInner {
             after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
             after_input_before_completion: Arc::new(NamedAsyncBarrier::new()),
             before_agent_run_attempt: Arc::new(NamedAsyncBarrier::new()),
+            before_compaction_apply: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
             after_steer_resolution: Arc::new(NamedAsyncBarrier::new()),
             after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
@@ -5874,6 +6264,10 @@ impl SessionExecutorTestHooksInner {
 
     async fn before_agent_run_attempt(&self) {
         self.before_agent_run_attempt.wait_if_armed().await;
+    }
+
+    async fn before_compaction_apply(&self) {
+        self.before_compaction_apply.wait_if_armed().await;
     }
 
     async fn before_steer_safe_point(&self) {
@@ -6021,13 +6415,16 @@ mod tests {
 
     use std::fs;
     use std::future::{Future, poll_fn};
+    use std::num::{NonZeroU8, NonZeroU32};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::runtime::Handle;
 
-    use crate::conversation_storage::load_replayed_conversation_with_barrier_for_test;
+    use crate::conversation_storage::{
+        RecorderWriteBarrier, load_replayed_conversation_with_barrier_for_test,
+    };
     use crate::durable_state::DurableState;
     use crate::model_gateway::ScriptedModelFixture;
     use crate::prompt::{PromptBodyIntent, TextIntent};
@@ -6423,10 +6820,34 @@ mod tests {
         scripted_text_fixture_with_tools(store, model, ToolSet::empty()).await
     }
 
+    async fn scripted_text_fixture_with_compaction(
+        store: &TempStore,
+        model: &ScriptedModelFixture,
+        compaction: CompactionSettingsSnapshot,
+    ) -> LoadedFixture {
+        scripted_text_fixture_with_tools_and_compaction(store, model, ToolSet::empty(), compaction)
+            .await
+    }
+
     async fn scripted_text_fixture_with_tools(
         store: &TempStore,
         model: &ScriptedModelFixture,
         tool_set: Arc<ToolSet>,
+    ) -> LoadedFixture {
+        scripted_text_fixture_with_tools_and_compaction(
+            store,
+            model,
+            tool_set,
+            CompactionSettings::default().validate().unwrap(),
+        )
+        .await
+    }
+
+    async fn scripted_text_fixture_with_tools_and_compaction(
+        store: &TempStore,
+        model: &ScriptedModelFixture,
+        tool_set: Arc<ToolSet>,
+        compaction: CompactionSettingsSnapshot,
     ) -> LoadedFixture {
         for (path, from, to) in [
             (
@@ -6479,7 +6900,7 @@ mod tests {
         .unwrap();
         let lifecycle_closing = CancellationToken::new();
         let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
-            SessionExecutorDependencies::with_turn_resources_and_tools(
+            SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
                 context.clone(),
                 state.clone(),
                 resolver,
@@ -6488,6 +6909,7 @@ mod tests {
                 Arc::clone(model.gateway()),
                 Arc::clone(model.catalog()),
                 tool_set,
+                compaction,
             ),
             Arc::clone(&definition),
             workspace,
@@ -6606,6 +7028,556 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the scripted provider did not reach the expected attempt count");
+    }
+
+    fn active_compaction_settings(max_compactions_per_turn: u8) -> CompactionSettingsSnapshot {
+        CompactionSettings {
+            enabled: true,
+            pressure_reserve_tokens: NonZeroU32::new(32).unwrap(),
+            summary_min_output_tokens: NonZeroU32::new(8).unwrap(),
+            summary_max_output_tokens: NonZeroU32::new(16).unwrap(),
+            minimum_reclaimed_tokens: NonZeroU32::new(32).unwrap(),
+            max_compactions_per_turn: NonZeroU8::new(max_compactions_per_turn).unwrap(),
+            summary_safety_reserve_tokens: NonZeroU32::new(8).unwrap(),
+        }
+        .validate()
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn proactive_compaction_replaces_live_prefix_before_agent_run() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_context_window_tokens(
+            vec!["portable rolling summary", "answer after compaction"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("retained context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(requests[1].purpose(), ModelCallPurpose::AgentRun);
+        assert_eq!(requests[1].input().messages().len(), 1);
+        match requests[1].input().messages()[0].as_ref() {
+            crate::prompt::ModelMessageRef::User { content } => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].as_text(), "portable rolling summary");
+            }
+            _ => panic!("the next AgentRun must consume the installed rolling summary"),
+        }
+
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            assert!(live.selected_entries().iter().any(|entry| {
+                matches!(entry.body(), StoredEntryBody::Compaction(compaction)
+                    if compaction.summary() == "portable rolling summary")
+            }));
+            assert_eq!(
+                live.capture_conversation_views()
+                    .unwrap()
+                    .conversation()
+                    .messages()
+                    .len(),
+                2
+            );
+        }
+
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the compacted conversation recording is readable");
+        assert!(recording.contains(r#""type":"compaction""#));
+        assert!(recording.contains("portable rolling summary"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_context_overflow_compacts_and_retries_agent_run() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::ContextOverflow],
+            vec![
+                "overflow recovery summary",
+                "answer after provider overflow",
+            ],
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("provider overflow context ".repeat(20)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].purpose(), ModelCallPurpose::AgentRun);
+        assert_eq!(requests[1].purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(requests[2].purpose(), ModelCallPurpose::AgentRun);
+        assert_ne!(
+            requests[0].source_revision(),
+            requests[2].source_revision(),
+            "the live Replace must advance the next AgentRun revision"
+        );
+        assert_eq!(requests[2].input().messages().len(), 1);
+        match requests[2].input().messages()[0].as_ref() {
+            crate::prompt::ModelMessageRef::User { content } => {
+                assert_eq!(content[0].as_text(), "overflow recovery summary");
+            }
+            _ => panic!("the recovered AgentRun must consume the overflow summary"),
+        }
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn compaction_summary_retries_once_with_same_request_arc() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses_and_context_window(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["summary after retry", "answer after summary retry"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("retry compaction context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(requests[1].purpose(), ModelCallPurpose::CompactionSummary);
+        assert!(Arc::ptr_eq(&requests[0], &requests[1]));
+        assert_eq!(requests[2].purpose(), ModelCallPurpose::AgentRun);
+
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        {
+            let live = lock(&live_state);
+            let compactions = live
+                .selected_entries()
+                .iter()
+                .filter_map(|entry| match entry.body() {
+                    StoredEntryBody::Compaction(compaction) => Some(compaction),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(compactions.len(), 1);
+            assert_eq!(
+                compactions[0]
+                    .model_call()
+                    .expect("automatic compaction keeps provenance")
+                    .logical_retry_count(),
+                1
+            );
+        }
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn compaction_summary_stops_after_one_logical_retry() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses_and_context_window(
+            vec![
+                ModelCallErrorReason::Timeout,
+                ModelCallErrorReason::ProviderUnavailable,
+            ],
+            vec!["must not run"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("retry exhaustion context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(Arc::ptr_eq(&requests[0], &requests[1]));
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(model.request_count(), 2);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_control_after_compaction_summary_never_applies_replace() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_context_window_tokens(
+            vec!["stale summary", "must not run"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_compaction_apply();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("stale compaction context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_compaction_apply().await;
+        assert_eq!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .current_turn_view()
+                .expect("the compaction belongs to the running Turn")
+                .phase(),
+            Some(TurnExecutionPhaseView::Compacting)
+        );
+        loaded
+            .executor
+            .invalidate_control_generation_for_test(turn_id);
+        hooks.release_before_compaction_apply();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert!(
+            lock(&live_state)
+                .selected_entries()
+                .iter()
+                .all(|entry| !matches!(entry.body(), StoredEntryBody::Compaction(_)))
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoke_after_compaction_summary_prevents_replace() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_context_window_tokens(
+            vec!["revoked summary", "must not run"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_compaction_apply();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("revoked compaction context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_compaction_apply().await;
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Ok(())
+        );
+        hooks.release_before_compaction_apply();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
+        );
+        assert_eq!(model.request_count(), 1);
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert!(
+            lock(&live_state)
+                .selected_entries()
+                .iter()
+                .all(|entry| !matches!(entry.body(), StoredEntryBody::Compaction(_)))
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_recording_failure_keeps_live_summary_and_turn_progress() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_context_window_tokens(
+            vec!["live-only summary", "answer from live summary"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_compaction_apply();
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("record failure context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_compaction_apply().await;
+        let barrier = RecorderWriteBarrier::new();
+        loaded
+            .executor
+            .recorder_for_test()
+            .unwrap()
+            .set_write_barrier_for_test(Arc::clone(&barrier));
+        barrier.fail_before_write();
+        hooks.release_before_compaction_apply();
+        hooks.wait_before_agent_run_attempt().await;
+        let compacted_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(
+            compacted_snapshot.recording(),
+            SessionRecordingState::Degraded
+        );
+        assert_eq!(
+            compacted_snapshot
+                .usage()
+                .expect("the compacted live conversation projects usage")
+                .compaction_calls(),
+            1
+        );
+        assert_eq!(
+            compacted_snapshot
+                .current_turn_view()
+                .expect("the next AgentRun still belongs to the running Turn")
+                .phase(),
+            Some(TurnExecutionPhaseView::Sampling)
+        );
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        assert_eq!(model.requests()[1].purpose(), ModelCallPurpose::AgentRun);
+        match model.requests()[1].input().messages()[0].as_ref() {
+            crate::prompt::ModelMessageRef::User { content } => {
+                assert_eq!(content[0].as_text(), "live-only summary");
+            }
+            _ => panic!("recording failure must not roll back the live summary"),
+        }
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert!(lock(&live_state).selected_entries().iter().any(|entry| {
+            matches!(entry.body(), StoredEntryBody::Compaction(compaction)
+                if compaction.summary() == "live-only summary")
+        }));
+        assert!(matches!(
+            &*loaded.executor.recorder_for_test().unwrap().health(),
+            RecordingHealth::Degraded { .. }
+        ));
+        assert_eq!(
+            loaded.executor.snapshot().await.unwrap().recording(),
+            SessionRecordingState::Degraded
+        );
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the degraded recording prefix remains readable");
+        assert!(!recording.contains(r#""type":"compaction""#));
+        assert!(!recording.contains("live-only summary"));
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_limit_counts_operations_not_summary_attempts() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_responses_then_failure_reasons(
+            vec!["only allowed summary"],
+            vec![ModelCallErrorReason::ContextOverflow],
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(1))
+                .await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("single compaction context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::ContextOverflow)
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(requests[1].purpose(), ModelCallPurpose::AgentRun);
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert_eq!(
+            lock(&live_state)
+                .selected_entries()
+                .iter()
+                .filter(|entry| matches!(entry.body(), StoredEntryBody::Compaction(_)))
+                .count(),
+            1
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_steer_is_applied_at_post_compaction_safe_point() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_context_window_tokens(
+            vec!["summary before steer", "answer after steer"],
+            4_300,
+        );
+        let loaded =
+            scripted_text_fixture_with_compaction(&store, &model, active_compaction_settings(2))
+                .await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_compaction_apply();
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(
+                        TextIntent::new("steer compaction context ".repeat(160)).unwrap(),
+                    ),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        hooks.wait_before_compaction_apply().await;
+        assert_eq!(
+            loaded
+                .executor
+                .steer(
+                    turn_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("focus after summary").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        hooks.release_before_compaction_apply();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].purpose(), ModelCallPurpose::AgentRun);
+        assert_eq!(requests[1].input().messages().len(), 2);
+        for (message, expected) in requests[1]
+            .input()
+            .messages()
+            .iter()
+            .zip(["summary before steer", "focus after summary"])
+        {
+            match message.as_ref() {
+                crate::prompt::ModelMessageRef::User { content } => {
+                    assert_eq!(content[0].as_text(), expected);
+                }
+                _ => panic!("post-compaction input must retain summary then Steer order"),
+            }
+        }
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
