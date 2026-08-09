@@ -278,6 +278,23 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_eq!(*kind, RuntimeStateEventKind::CommandCatalogInvalidated);
             assert!(snapshot.loaded_sessions().is_empty());
         }
+        (Some("session_execution_changed_finishing_state"), EventFrame::State(event)) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionExecutionChanged)
+            );
+            assert!(event.msg().session_detail().is_none());
+            assert_eq!(
+                event.msg().session_snapshot().unwrap().execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Finishing
+            );
+        }
         (Some("turn_completed_state"), EventFrame::State(event)) => {
             assert_turn_terminal_event(event.msg(), SessionStateEventKind::TurnCompleted, None);
         }

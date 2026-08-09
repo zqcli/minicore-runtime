@@ -2073,6 +2073,7 @@ pub enum RuntimeStateEventKind {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionStateEventKind {
+    SessionExecutionChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -2189,6 +2190,24 @@ pub struct StateEvent {
 }
 
 impl StateEvent {
+    pub fn session_execution_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::SessionExecutionChanged,
+                snapshot: Box::new(snapshot),
+                detail: None,
+            },
+        }
+    }
+
     pub fn runtime_command_catalog_invalidated(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -2335,6 +2354,14 @@ impl StateEvent {
                 );
                 *session_id == snapshot.session_id() && *turn_id == *detail_turn_id && kind_matches
             }
+            (
+                EventRoute::Session { session_id },
+                StateEventMsg::Session {
+                    kind: SessionStateEventKind::SessionExecutionChanged,
+                    snapshot,
+                    detail: None,
+                },
+            ) => *session_id == snapshot.session_id(),
             _ => false,
         };
         if !valid {

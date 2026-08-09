@@ -234,6 +234,34 @@ fn runtime_and_terminal_state_frames_round_trip_with_coherent_routes() {
         protocol.encode_event_frame(&interrupted).unwrap(),
         without_lf(&interrupted_raw)
     );
+
+    let execution_changed_raw = fixture("valid/session-execution-changed-state-frame.json");
+    let execution_changed = protocol
+        .decode_event_frame(&execution_changed_raw)
+        .expect("session execution changes are a known state event");
+    let EventFrame::State(event) = &execution_changed else {
+        panic!("execution-change fixture did not decode as state");
+    };
+    let EventRoute::Session { session_id } = event.route() else {
+        panic!("execution-change fixture did not use a Session route");
+    };
+    assert_eq!(
+        session_id.to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert_eq!(
+        event.msg().session_kind(),
+        Some(SessionStateEventKind::SessionExecutionChanged)
+    );
+    assert!(event.msg().session_detail().is_none());
+    assert_eq!(
+        event.msg().session_snapshot().unwrap().execution(),
+        minicore_runtime::runtime_interface::SessionExecutionView::Finishing
+    );
+    assert_eq!(
+        protocol.encode_event_frame(&execution_changed).unwrap(),
+        without_lf(&execution_changed_raw)
+    );
 }
 
 #[test]

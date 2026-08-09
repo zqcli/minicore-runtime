@@ -1859,6 +1859,7 @@ struct SessionStateEventInput {
     reason = "the wire discriminator names are fixed by the public protocol"
 )]
 enum SessionStateEventKindInput {
+    SessionExecutionChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -1867,6 +1868,7 @@ enum SessionStateEventKindInput {
 impl SessionStateEventKindInput {
     fn into_semantic(self) -> Result<SessionStateEventKind, TypedJsonError> {
         Ok(match self {
+            Self::SessionExecutionChanged => SessionStateEventKind::SessionExecutionChanged,
             Self::TurnCompleted => SessionStateEventKind::TurnCompleted,
             Self::TurnInterrupted => SessionStateEventKind::TurnInterrupted,
             Self::TurnFailed => SessionStateEventKind::TurnFailed,
@@ -3103,6 +3105,7 @@ struct SessionStateEventOutput<'a> {
     reason = "the wire discriminator names are fixed by the public protocol"
 )]
 enum SessionStateEventKindOutput {
+    SessionExecutionChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -3111,6 +3114,7 @@ enum SessionStateEventKindOutput {
 impl SessionStateEventKindOutput {
     const fn from_semantic(value: SessionStateEventKind) -> Self {
         match value {
+            SessionStateEventKind::SessionExecutionChanged => Self::SessionExecutionChanged,
             SessionStateEventKind::TurnCompleted => Self::TurnCompleted,
             SessionStateEventKind::TurnInterrupted => Self::TurnInterrupted,
             SessionStateEventKind::TurnFailed => Self::TurnFailed,
@@ -5643,6 +5647,24 @@ fn validate_session_state_msg(
                 || route.session_id != Some(snapshot_session_id)
                 || route.turn_id != Some(terminal.turn_id)
             {
+                return Err(invalid_scalar());
+            }
+            match validate_session_snapshot_shape(snapshot, limits) {
+                Ok(()) => Ok(false),
+                Err(error) if error.is_pending_public_target() => Ok(true),
+                Err(error) => Err(error),
+            }
+        }
+        "session_execution_changed" => {
+            if route.family != EventRouteFamily::Session
+                || object
+                    .get("detail")
+                    .is_some_and(|detail| !matches!(detail, JsonNode::Null))
+            {
+                return Err(invalid_scalar());
+            }
+            let snapshot_session_id = validate_snapshot_session_id(snapshot)?;
+            if route.session_id != Some(snapshot_session_id) {
                 return Err(invalid_scalar());
             }
             match validate_session_snapshot_shape(snapshot, limits) {

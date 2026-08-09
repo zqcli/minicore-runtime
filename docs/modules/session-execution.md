@@ -9,7 +9,7 @@ M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items �
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.20 已在 M9.19 `SubmitCancelled` 之后，将 Running Turn 的 user Cancel 与 SecurityRevoked terminal 从内部 `SessionTurnTerminal` 映射为 public `TurnInterrupted` StateEvent，并接入 Wire V1 canonical input/output、route/kind/terminal 一致性校验及 active manifest fixture。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1；完整 Tool policy/approval 与 Compaction 仍后置。
+当前实现进度：M9.21 在 M9.20 之后，将首次进入 `Finishing` 的 execution transition 从 Executor 映射为 public `session_execution_changed` StateEvent，并接入 Wire V1 canonical input/output、Session route/快照一致性校验及 active manifest fixture；后续 terminal event 保持原有语义。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1；完整 Tool policy/approval 与 Compaction 仍后置。
 
 核心目标：
 
