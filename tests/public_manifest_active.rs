@@ -7,8 +7,8 @@ use minicore_runtime::runtime_interface::{
     CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
     PublicCancelTarget, PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand,
     RuntimeEventDetail, RuntimeRequest, RuntimeStateEventKind, SessionCommand, SessionEventDetail,
-    SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView,
-    TurnInterruptionView, TurnStatusView, TurnTerminalView,
+    SessionLifecycleView, SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnCommand,
+    TurnFailureView, TurnInterruptionView, TurnStatusView, TurnTerminalView,
 };
 use minicore_runtime::turn_item_interaction::InteractionRequestView;
 use minicore_runtime::wire::{
@@ -285,6 +285,9 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 assertion @ ("session_created_state"
                 | "session_loaded_state"
                 | "session_unloaded_state"
+                | "session_archived_state"
+                | "session_unarchived_state"
+                | "session_deleted_state"
                 | "session_forked_state"),
             ),
             EventFrame::State(event),
@@ -301,6 +304,9 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 "session_created_state" => RuntimeStateEventKind::SessionCreated,
                 "session_loaded_state" => RuntimeStateEventKind::SessionLoaded,
                 "session_unloaded_state" => RuntimeStateEventKind::SessionUnloaded,
+                "session_archived_state" => RuntimeStateEventKind::SessionArchived,
+                "session_unarchived_state" => RuntimeStateEventKind::SessionUnarchived,
+                "session_deleted_state" => RuntimeStateEventKind::SessionDeleted,
                 "session_forked_state" => RuntimeStateEventKind::SessionForked,
                 _ => unreachable!(),
             };
@@ -309,11 +315,21 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 panic!("runtime Session state assertion requires a Session route");
             };
             match kind {
-                RuntimeStateEventKind::SessionCreated | RuntimeStateEventKind::SessionForked => {
+                RuntimeStateEventKind::SessionCreated
+                | RuntimeStateEventKind::SessionArchived
+                | RuntimeStateEventKind::SessionUnarchived
+                | RuntimeStateEventKind::SessionDeleted
+                | RuntimeStateEventKind::SessionForked => {
                     let Some(RuntimeEventDetail::SessionChanged { session }) = detail else {
                         panic!("durable Session state requires a safe Session summary");
                     };
                     assert_eq!(session.session_id(), session_id);
+                    let expected_lifecycle = match kind {
+                        RuntimeStateEventKind::SessionArchived => SessionLifecycleView::Archived,
+                        RuntimeStateEventKind::SessionDeleted => SessionLifecycleView::Deleted,
+                        _ => SessionLifecycleView::Open,
+                    };
+                    assert_eq!(session.lifecycle(), expected_lifecycle);
                 }
                 RuntimeStateEventKind::SessionLoaded => {
                     assert!(detail.is_none());
@@ -487,6 +503,34 @@ fn assert_command_response_semantics(
                 "ses_33333333333333333333333333333333"
             );
         }
+        (
+            Some("session_archived_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionArchived,
+                output: None,
+            },
+        )
+        | (
+            Some("session_unarchived_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionUnarchived,
+                output: None,
+            },
+        )
+        | (
+            Some("session_deleted_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionDeleted,
+                output: None,
+            },
+        )
+        | (
+            Some("no_change_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::NoChange,
+                output: None,
+            },
+        ) => {}
         (Some("session_busy_rejection"), CommandCompletion::Rejected(error)) => {
             assert_eq!(error.code(), CommandErrorCode::SessionBusy);
             assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
@@ -575,6 +619,17 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
             );
         }
         ("session_unload", RuntimeCommand::Session(SessionCommand::Unload { session_id })) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+        }
+        ("session_archive", RuntimeCommand::Session(SessionCommand::Archive { session_id }))
+        | (
+            "session_unarchive",
+            RuntimeCommand::Session(SessionCommand::Unarchive { session_id }),
+        )
+        | ("session_delete", RuntimeCommand::Session(SessionCommand::Delete { session_id })) => {
             assert_eq!(
                 session_id.to_string(),
                 "ses_22222222222222222222222222222222"

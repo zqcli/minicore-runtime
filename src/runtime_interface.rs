@@ -266,6 +266,15 @@ pub enum SessionCommand {
     Unload {
         session_id: SessionId,
     },
+    Archive {
+        session_id: SessionId,
+    },
+    Unarchive {
+        session_id: SessionId,
+    },
+    Delete {
+        session_id: SessionId,
+    },
     Fork {
         source_session_id: SessionId,
         anchor: ForkAnchor,
@@ -447,11 +456,15 @@ pub enum CommandOutcome {
     },
     FollowUpQueued,
     QueuedMessageCancelled,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     CancelAccepted {
         target: PublicCancelTarget,
         cancel_epoch: u64,
     },
     CommandOutput,
+    NoChange,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -2390,6 +2403,9 @@ pub enum RuntimeStateEventKind {
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     SessionForked,
     CommandCatalogInvalidated,
 }
@@ -2604,6 +2620,79 @@ impl StateEvent {
         }
     }
 
+    pub fn session_archived(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        Self::runtime_session_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            session,
+            RuntimeStateEventKind::SessionArchived,
+        )
+    }
+
+    pub fn session_unarchived(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        Self::runtime_session_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            session,
+            RuntimeStateEventKind::SessionUnarchived,
+        )
+    }
+
+    pub fn session_deleted(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+    ) -> Self {
+        Self::runtime_session_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            session,
+            RuntimeStateEventKind::SessionDeleted,
+        )
+    }
+
+    fn runtime_session_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        session: SessionSummary,
+        kind: RuntimeStateEventKind,
+    ) -> Self {
+        debug_assert!(matches!(
+            kind,
+            RuntimeStateEventKind::SessionArchived
+                | RuntimeStateEventKind::SessionUnarchived
+                | RuntimeStateEventKind::SessionDeleted
+        ));
+        let session_id = session.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Session { session_id },
+            msg: StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: Some(RuntimeEventDetail::SessionChanged {
+                    session: Box::new(session),
+                }),
+            },
+        }
+    }
+
     pub fn session_loaded(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -2779,14 +2868,34 @@ impl StateEvent {
                 StateEventMsg::Runtime {
                     kind:
                         kind @ (RuntimeStateEventKind::SessionCreated
+                        | RuntimeStateEventKind::SessionArchived
+                        | RuntimeStateEventKind::SessionUnarchived
+                        | RuntimeStateEventKind::SessionDeleted
                         | RuntimeStateEventKind::SessionForked),
                     detail: Some(RuntimeEventDetail::SessionChanged { session }),
                     ..
                 },
             ) => {
+                let lifecycle_matches = match kind {
+                    RuntimeStateEventKind::SessionCreated
+                    | RuntimeStateEventKind::SessionUnarchived
+                    | RuntimeStateEventKind::SessionForked => {
+                        session.lifecycle() == SessionLifecycleView::Open
+                    }
+                    RuntimeStateEventKind::SessionArchived => {
+                        session.lifecycle() == SessionLifecycleView::Archived
+                    }
+                    RuntimeStateEventKind::SessionDeleted => {
+                        session.lifecycle() == SessionLifecycleView::Deleted
+                    }
+                    RuntimeStateEventKind::SessionLoaded
+                    | RuntimeStateEventKind::SessionUnloaded
+                    | RuntimeStateEventKind::CommandCatalogInvalidated => false,
+                };
                 *session_id == session.session_id()
-                    && session.lifecycle() == SessionLifecycleView::Open
-                    && (matches!(kind, RuntimeStateEventKind::SessionForked) == session.forked())
+                    && lifecycle_matches
+                    && (!matches!(kind, RuntimeStateEventKind::SessionCreated) || !session.forked())
+                    && (!matches!(kind, RuntimeStateEventKind::SessionForked) || session.forked())
             }
             (
                 EventRoute::Session { session_id },

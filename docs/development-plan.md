@@ -593,6 +593,8 @@ durable catalog/query纵向切片亦已完成：`ListAgents`按stable AgentId分
 
 Runtime Session membership StateEvent纵向切片已完成：Runtime subscription以原子snapshot-first baseline开始，Create/Fork在durable publication成功后携带matching safe `SessionSummary`，Load/Unload只在residency membership真正变化时发布且Snapshot反映变化后的loaded set；32-entry bounded publisher在背压或Runtime closing时终止stream。selected-V1 codec与active manifest fixtures已覆盖四种event kind/detail，semantic encoder拒绝route/kind/detail不一致的StateEvent。remaining Agent/Session mutation event、其他public families、manifest closure和full scenario/recovery conformance仍pending。
 
+Session lifecycle public closure纵向切片已完成：Archive/Unarchive/Delete复用Runtime-owned residency exclusion与sealed durable lifecycle attempt，分别返回typed `SessionArchived | SessionUnarchived | SessionDeleted`；Archive/Unarchive canonical retry返回`NoChange`，already Deleted的Delete幂等返回`SessionDeleted`，两者都不发布第二event。真实变化在同一Runtime publication gate内发布matching `session_archived | session_unarchived | session_deleted` StateEvent与safe `SessionSummary`；loaded Archive返回`SessionBusy`，Open→Deleted返回`InvalidArgument`。selected-V1 command/outcome/event fixtures已激活，统一Standards/Spec review关闭重复dispatch流程后无剩余finding；最终`./scripts/check.sh`全量通过，其中library tests为639 passed、3 ignored，全部integration targets、Clippy、format、docs与fixtures门禁通过。remaining Agent/Session mutation family、manifest closure和full scenario/recovery conformance仍pending。
+
 任务：
 
 - 补齐`MiniCoreRuntime.dispatch/query/snapshot/subscribe`全部family；

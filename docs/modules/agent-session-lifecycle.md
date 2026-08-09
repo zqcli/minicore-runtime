@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、loaded Ready+Idle publication owner、Runtime-owned residency/lifecycle integration，以及replay/Recorder-backed Ready+Idle Load hydration已实现；public Session Fork command/lifecycle staging已覆盖全部公开anchor与LiveSnapshot/RecordedHistory provenance；remaining Agent/Session public lifecycle commands、active-Turn grace Unload、完整cross-platform native matrix pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、loaded Ready+Idle publication owner、Runtime-owned residency/lifecycle integration，以及replay/Recorder-backed Ready+Idle Load hydration已实现；public Session Fork command/lifecycle staging已覆盖全部公开anchor与LiveSnapshot/RecordedHistory provenance；public Session Archive/Unarchive/Delete、typed NoChange与matching Runtime StateEvent已实现；remaining Agent lifecycle commands、active-Turn grace Unload、完整cross-platform native matrix pending）
 日期：2026-07-31
 
 ## 目的
