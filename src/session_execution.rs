@@ -1596,9 +1596,37 @@ impl SessionExecutorActor {
         self.steer.clear();
         self.execution_state = SessionExecutionState::Finishing;
         self.install_current_state(SessionExecutionState::Finishing);
-        self.pending_interactions.clear();
+        let pending_interactions = self
+            .pending_interactions
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         let mut requests_drained = false;
         let mut normal_exit = true;
+        if !pending_interactions.is_empty() {
+            if let Some(active_turn) = self.active_turn.as_ref() {
+                active_turn.cancellation.cancel();
+                if self
+                    .signal_emergency_cancel(active_turn.emergency.target())
+                    .is_err()
+                {
+                    normal_exit = false;
+                }
+            }
+        }
+        for request_id in pending_interactions {
+            if self
+                .cancel_pending_interaction(
+                    request_id,
+                    SystemClock.now(),
+                    InteractionCancelReason::SessionUnloaded,
+                )
+                .await
+                .is_err()
+            {
+                normal_exit = false;
+            }
+        }
 
         loop {
             if !requests_drained {
@@ -5362,6 +5390,53 @@ mod tests {
         }
     }
 
+    async fn scripted_pending_tool_interaction_fixture(
+        store: &TempStore,
+        model: &ScriptedModelFixture,
+        request_id: RequestId,
+    ) -> LoadedFixture {
+        let interaction_request =
+            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        let denied = ToolExecutionResult::PreExecution {
+            disposition: crate::tools::ToolResultDisposition::Denied,
+            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                "approval denied".to_owned(),
+            ])
+            .unwrap(),
+        };
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let interaction_request = interaction_request.clone();
+                let allowed = allowed.clone();
+                let denied = denied.clone();
+                move |_| {
+                    let interaction_request = interaction_request.clone();
+                    let allowed = allowed.clone();
+                    let denied = denied.clone();
+                    Box::pin(async move {
+                        ToolExecutionResult::Interaction {
+                            request_id,
+                            request: interaction_request,
+                            allowed: Box::new(allowed),
+                            denied: Box::new(denied),
+                        }
+                    })
+                }
+            },
+        );
+        scripted_text_fixture_with_tools(store, model, tool_set).await
+    }
+
     fn changed_workspace(path: &Path) -> Workspace {
         let key: WorkspaceRootKey = "repo".parse().unwrap();
         lower_workspace(
@@ -6956,46 +7031,7 @@ mod tests {
             "must not run",
         );
         let request_id: RequestId = "req_55555555555555555555555555555555".parse().unwrap();
-        let interaction_request =
-            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
-        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
-        let denied = ToolExecutionResult::PreExecution {
-            disposition: crate::tools::ToolResultDisposition::Denied,
-            content: crate::tools::ToolResultContent::from_text_parts(vec![
-                "approval denied".to_owned(),
-            ])
-            .unwrap(),
-        };
-        let tool_set = ToolSet::with_executor(
-            vec![
-                crate::tools::ToolDefinition::new(
-                    "echo".parse().unwrap(),
-                    "Echo a bounded JSON value",
-                    "{}".parse().unwrap(),
-                    crate::tools::ToolExecutionMode::Serial,
-                )
-                .unwrap(),
-            ],
-            {
-                let interaction_request = interaction_request.clone();
-                let allowed = allowed.clone();
-                let denied = denied.clone();
-                move |_| {
-                    let interaction_request = interaction_request.clone();
-                    let allowed = allowed.clone();
-                    let denied = denied.clone();
-                    Box::pin(async move {
-                        ToolExecutionResult::Interaction {
-                            request_id,
-                            request: interaction_request,
-                            allowed: Box::new(allowed),
-                            denied: Box::new(denied),
-                        }
-                    })
-                }
-            },
-        );
-        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let loaded = scripted_pending_tool_interaction_fixture(&store, &model, request_id).await;
         let turn_id = loaded
             .executor
             .submit(
@@ -7052,6 +7088,57 @@ mod tests {
         assert!(recording.contains("cancelled"));
         assert!(!recording.contains("must not run"));
         close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn close_pending_tool_interaction_settles_unloaded_without_followup_model_call() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_session_unload",
+            "echo",
+            "{\"value\":1}",
+            "must not run",
+        );
+        let request_id: RequestId = "req_66666666666666666666666666666666".parse().unwrap();
+        let loaded = scripted_pending_tool_interaction_fixture(&store, &model, request_id).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.pending_interactions().len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Interaction request is projected");
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+
+        loaded.executor.close().await.unwrap();
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("session_unloaded"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("must not run"));
+        loaded.state.close().await;
+        let _ = loaded.context;
     }
 
     #[tokio::test(flavor = "current_thread")]
