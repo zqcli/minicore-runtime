@@ -2920,6 +2920,7 @@ struct CommandOutputInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
     TurnStarted(TurnIdInput),
+    SubmitCancelled,
     SteerQueued(TurnIdInput),
     FollowUpQueued,
     QueuedMessageCancelled,
@@ -2932,6 +2933,7 @@ impl CommandOutcomeInput {
             Self::TurnStarted(value) => CommandOutcome::TurnStarted {
                 turn_id: value.turn_id,
             },
+            Self::SubmitCancelled => CommandOutcome::SubmitCancelled,
             Self::SteerQueued(value) => CommandOutcome::SteerQueued {
                 turn_id: value.turn_id,
             },
@@ -3199,6 +3201,7 @@ struct CommandOutputOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
     TurnStarted(TurnIdOutput),
+    SubmitCancelled,
     SteerQueued(TurnIdOutput),
     FollowUpQueued,
     QueuedMessageCancelled,
@@ -3211,6 +3214,7 @@ impl CommandOutcomeOutput {
             CommandOutcome::TurnStarted { turn_id } => {
                 Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
             }
+            CommandOutcome::SubmitCancelled => Self::SubmitCancelled,
             CommandOutcome::SteerQueued { turn_id } => {
                 Self::SteerQueued(TurnIdOutput { turn_id: *turn_id })
             }
@@ -3816,10 +3820,9 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "session_deleted"
         | "runtime_reloaded"
         | "workspace_reloaded"
-        | "submit_cancelled"
         | "interaction_resolved"
         | "no_change" => pending_output_unit(data),
-        "follow_up_queued" | "queued_message_cancelled" => {
+        "submit_cancelled" | "follow_up_queued" | "queued_message_cancelled" => {
             if data.is_some() {
                 Err(selected_wrong_json_type())
             } else {

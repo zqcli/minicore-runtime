@@ -1155,12 +1155,9 @@ fn map_submit_error(
             RetryAdvice::DoNotRetry,
             subject,
         ),
-        SessionResidencySubmitError::Cancelled => rejected_completion(
-            CommandErrorCode::TurnCancelling,
-            "turn cancellation is in progress",
-            RetryAdvice::RefreshAndRetry,
-            subject,
-        ),
+        SessionResidencySubmitError::Cancelled => {
+            completed_outcome(CommandOutcome::SubmitCancelled)
+        }
         SessionResidencySubmitError::InternalDispatchUnavailable => {
             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
         }
@@ -1567,11 +1564,11 @@ mod tests {
     };
     use crate::runtime_interface::{
         CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest, CommandResponse,
-        EventFrame, EventRoute, NewSessionDefinition, NewSessionMetadata, QueryResult, RetryAdvice,
-        RuntimeCapability, RuntimeCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
-        SessionCommand, SessionEventDetail, SessionExecutionView, SessionStateEventKind,
-        SnapshotRequest, SnapshotResponse, SubscriptionRequest, SubscriptionScope, TurnCommand,
-        TurnFailureView, TurnTerminalView,
+        EventFrame, EventRoute, NewSessionDefinition, NewSessionMetadata, PublicCancelTarget,
+        QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand, RuntimeQuery,
+        RuntimeQueryResult, RuntimeReadQuery, SessionCommand, SessionEventDetail,
+        SessionExecutionView, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
+        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -2633,6 +2630,67 @@ mod tests {
         drop(executor);
         drop(residency);
 
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_cancel_before_input_completes_submit_cancelled() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["must not run"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let residency = runtime.inner.residency().unwrap();
+        let executor = residency.executor_for_test(session_id).unwrap();
+        let hooks = executor.test_hooks();
+        hooks.arm_after_agent_admission_before_input();
+        drop(residency);
+
+        let submit_command_id: CommandId = "cmd_77777777777777777777777777777777".parse().unwrap();
+        let mut submit = Box::pin(
+            runtime.dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("cancel before input").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            )),
+        );
+        assert!(poll_once_pending(submit.as_mut()).await);
+        hooks.wait_after_agent_admission_before_input().await;
+
+        let cancel = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id,
+                    target: PublicCancelTarget::Submit(submit_command_id),
+                }),
+            ))
+            .await
+            .expect("Cancel dispatches while Submit is Starting");
+        assert_eq!(command_output(&cancel), "cancel accepted");
+        hooks.release_after_agent_admission_before_input();
+
+        let submit = submit.await.expect("Submit settles after cancellation");
+        assert!(matches!(
+            submit.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SubmitCancelled,
+                output: None,
+            }
+        ));
+        assert_eq!(model.request_count(), 0);
         runtime.shutdown().await;
     }
 

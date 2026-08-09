@@ -426,6 +426,7 @@ impl fmt::Debug for CommandCompletion {
 #[non_exhaustive]
 pub enum CommandOutcome {
     TurnStarted { turn_id: TurnId },
+    SubmitCancelled,
     SteerQueued { turn_id: TurnId },
     FollowUpQueued,
     QueuedMessageCancelled,

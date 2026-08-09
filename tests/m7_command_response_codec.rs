@@ -78,6 +78,7 @@ fn queued_command_outcomes_round_trip_with_their_typed_shapes() {
     let command_id: CommandId = "cmd_11111111111111111111111111111111".parse().unwrap();
     let turn_id: TurnId = "trn_33333333333333333333333333333333".parse().unwrap();
     for outcome in [
+        CommandOutcome::SubmitCancelled,
         CommandOutcome::SteerQueued { turn_id },
         CommandOutcome::FollowUpQueued,
         CommandOutcome::QueuedMessageCancelled,
