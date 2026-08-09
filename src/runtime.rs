@@ -424,18 +424,15 @@ impl RuntimeInner {
         };
 
         if leader {
-            let owner =
-                RuntimeCommandOwner::new(Arc::clone(self), command_id, Arc::clone(&entry), request);
-            if let Err(error) = self.task_context.spawn_tracked(owner.run()) {
-                let result = Err(match error {
-                    crate::runtime_task::RuntimeTaskError::OwnerClosing
-                    | crate::runtime_task::RuntimeTaskError::WorkerUnavailable
-                    | crate::runtime_task::RuntimeTaskError::OperationPanicked => {
-                        RuntimeDispatchError::InternalDispatchUnavailable
-                    }
-                });
-                entry.complete(result);
-                self.finish_in_flight(command_id, &entry);
+            let guard =
+                RuntimeCommandOwnerGuard::new(Arc::clone(self), command_id, Arc::clone(&entry));
+            let owner = RuntimeCommandOwner::new(request);
+            match self.task_context.spawn_tracked(owner.run(guard)) {
+                Ok(task) => self.task_context.reap_tracked(task),
+                Err(_) => {
+                    // The rejected future drops its pre-installed guard, settling the shared
+                    // completion even if admission closes before the first poll.
+                }
             }
         }
         entry.wait().await
@@ -1042,40 +1039,16 @@ impl RuntimeCommandInFlight {
 }
 
 struct RuntimeCommandOwner {
-    inner: Arc<RuntimeInner>,
-    command_id: crate::wire::CommandId,
-    entry: Arc<RuntimeCommandInFlight>,
     request: CommandRequest,
 }
 
 impl RuntimeCommandOwner {
-    fn new(
-        inner: Arc<RuntimeInner>,
-        command_id: crate::wire::CommandId,
-        entry: Arc<RuntimeCommandInFlight>,
-        request: CommandRequest,
-    ) -> Self {
-        Self {
-            inner,
-            command_id,
-            entry,
-            request,
-        }
+    fn new(request: CommandRequest) -> Self {
+        Self { request }
     }
 
-    async fn run(self) {
-        let RuntimeCommandOwner {
-            inner,
-            command_id,
-            entry,
-            request,
-        } = self;
-        let mut guard = RuntimeCommandOwnerGuard {
-            inner,
-            command_id,
-            entry,
-            completed: false,
-        };
+    async fn run(self, mut guard: RuntimeCommandOwnerGuard) {
+        let RuntimeCommandOwner { request } = self;
         let result = guard.inner.dispatch_once(request).await;
         guard.complete(result);
     }
@@ -1089,6 +1062,19 @@ struct RuntimeCommandOwnerGuard {
 }
 
 impl RuntimeCommandOwnerGuard {
+    fn new(
+        inner: Arc<RuntimeInner>,
+        command_id: crate::wire::CommandId,
+        entry: Arc<RuntimeCommandInFlight>,
+    ) -> Self {
+        Self {
+            inner,
+            command_id,
+            entry,
+            completed: false,
+        }
+    }
+
     fn complete(&mut self, result: Result<CommandResponse, RuntimeDispatchError>) {
         self.entry.complete(result);
         self.inner.finish_in_flight(self.command_id, &self.entry);
@@ -1099,6 +1085,7 @@ impl RuntimeCommandOwnerGuard {
 impl Drop for RuntimeCommandOwnerGuard {
     fn drop(&mut self) {
         if !self.completed {
+            self.inner.request_closing();
             self.complete(Err(RuntimeDispatchError::InternalDispatchUnavailable));
         }
     }

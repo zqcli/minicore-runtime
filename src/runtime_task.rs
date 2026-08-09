@@ -202,6 +202,15 @@ impl RuntimeTaskContext {
         }
     }
 
+    /// Reaps a caller-dropped tracked task on the injected runtime handle.  The raw task remains
+    /// owner-registered until this waiter joins it, so detached command owners still participate
+    /// in orderly shutdown while their registry slot is released after normal completion.
+    pub(crate) fn reap_tracked(&self, task: TrackedTask) {
+        drop(self.owner.handle.spawn(async move {
+            let _ = task.wait().await;
+        }));
+    }
+
     /// Reports whether this owner has stopped accepting new tracked work.
     #[allow(
         dead_code,
@@ -1237,6 +1246,37 @@ mod tests {
 
         assert_eq!(task.wait().await, Ok(()));
         assert!(completed.load(Ordering::SeqCst));
+        context.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reaped_tracked_task_releases_its_owner_registration() {
+        let context = initialized_context().await;
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed_by_task = Arc::clone(&completed);
+        let task = context
+            .spawn_tracked(async move {
+                completed_by_task.store(true, Ordering::SeqCst);
+            })
+            .expect("an open owner admits asynchronous work");
+        context.reap_tracked(task);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if completed.load(Ordering::SeqCst) {
+                    let registry = super::lock(&context.owner.registry);
+                    if registry.starting.is_empty()
+                        && registry.tasks.is_empty()
+                        && registry.joining.is_empty()
+                    {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached reaper joins and removes the owner registration");
         context.shutdown().await;
     }
 
