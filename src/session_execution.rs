@@ -886,6 +886,7 @@ impl LoadedSessionConversation {
 #[derive(Clone)]
 pub(crate) struct SessionExecutor {
     sender: mpsc::Sender<SessionExecutorRequest>,
+    emergency_sender: mpsc::UnboundedSender<SessionExecutorRequest>,
     closing: CancellationToken,
     task: TrackedTask,
     failure_state: Arc<ActorFailureState>,
@@ -1017,6 +1018,7 @@ impl SessionExecutor {
         );
         let published_snapshot = Arc::new(Mutex::new(Arc::clone(&current)));
         let (sender, receiver) = mpsc::channel(SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY);
+        let (emergency_sender, emergency_receiver) = mpsc::unbounded_channel();
         let (completion_sender, completion_receiver) = mpsc::unbounded_channel();
         let (events, _) = broadcast::channel(SESSION_EVENT_CAPACITY);
         let closing = CancellationToken::new();
@@ -1027,6 +1029,7 @@ impl SessionExecutor {
         let failure_state = Arc::new(ActorFailureState::default());
         let actor = SessionExecutorActor {
             receiver,
+            emergency_receiver,
             completions: completion_receiver,
             completion_sender,
             closing: closing.clone(),
@@ -1083,6 +1086,7 @@ impl SessionExecutor {
 
         Ok(Self {
             sender,
+            emergency_sender,
             closing,
             task,
             failure_state,
@@ -1295,23 +1299,22 @@ impl SessionExecutor {
             timestamp,
             response: Some(response),
         });
-        let permit = tokio::select! {
-            biased;
-            _ = self.closing.cancelled() => {
-                request.reject_closing();
-                return waiter.await.unwrap_or(Err(SessionCancelError::Closing));
-            }
-            permit = self.sender.reserve() => match permit {
-                Ok(permit) => permit,
-                Err(_) => {
-                    request.reject_closing();
-                    return waiter.await.unwrap_or(Err(SessionCancelError::InternalDispatchUnavailable));
-                }
-            },
-        };
-        permit.send(request);
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+            return waiter.await.unwrap_or(Err(SessionCancelError::Closing));
+        }
+        if let Err(error) = self.emergency_sender.send(request) {
+            let mut request = error.0;
+            request.reject_closing();
+            return waiter
+                .await
+                .unwrap_or(Err(SessionCancelError::InternalDispatchUnavailable));
+        }
         waiter.await.unwrap_or_else(|_| {
-            if self.closing.is_cancelled() || self.sender.is_closed() {
+            if self.closing.is_cancelled()
+                || self.sender.is_closed()
+                || self.emergency_sender.is_closed()
+            {
                 Err(SessionCancelError::Closing)
             } else {
                 Err(SessionCancelError::InternalDispatchUnavailable)
@@ -1328,23 +1331,24 @@ impl SessionExecutor {
             target,
             response: Some(response),
         });
-        let permit = tokio::select! {
-            biased;
-            _ = self.closing.cancelled() => {
-                request.reject_closing();
-                return waiter.await.unwrap_or(Err(SessionSecurityRevokedError::Closing));
-            }
-            permit = self.sender.reserve() => match permit {
-                Ok(permit) => permit,
-                Err(_) => {
-                    request.reject_closing();
-                    return waiter.await.unwrap_or(Err(SessionSecurityRevokedError::InternalDispatchUnavailable));
-                }
-            },
-        };
-        permit.send(request);
+        if self.closing.is_cancelled() {
+            request.reject_closing();
+            return waiter
+                .await
+                .unwrap_or(Err(SessionSecurityRevokedError::Closing));
+        }
+        if let Err(error) = self.emergency_sender.send(request) {
+            let mut request = error.0;
+            request.reject_closing();
+            return waiter.await.unwrap_or(Err(
+                SessionSecurityRevokedError::InternalDispatchUnavailable,
+            ));
+        }
         waiter.await.unwrap_or_else(|_| {
-            if self.closing.is_cancelled() || self.sender.is_closed() {
+            if self.closing.is_cancelled()
+                || self.sender.is_closed()
+                || self.emergency_sender.is_closed()
+            {
                 Err(SessionSecurityRevokedError::Closing)
             } else {
                 Err(SessionSecurityRevokedError::InternalDispatchUnavailable)
@@ -1597,6 +1601,7 @@ impl SessionExecutor {
 
 struct SessionExecutorActor {
     receiver: mpsc::Receiver<SessionExecutorRequest>,
+    emergency_receiver: mpsc::UnboundedReceiver<SessionExecutorRequest>,
     completions: mpsc::UnboundedReceiver<ExecutorCompletion>,
     completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
     closing: CancellationToken,
@@ -1737,6 +1742,19 @@ impl SessionExecutorActor {
                         return self.close_and_drain().await;
                     }
                 },
+                request = self.emergency_receiver.recv() => match request {
+                    Some(mut request) => {
+                        if self.closing.is_cancelled() {
+                            request.reject_closing();
+                            continue;
+                        }
+                        if let Err(fatality) = self.handle_request(&mut request).await {
+                            self.close_for_fatal(fatality);
+                            return self.close_and_drain().await;
+                        }
+                    }
+                    None => return self.close_and_drain().await,
+                },
                 request = self.receiver.recv() => match request {
                     Some(mut request) => {
                         if self.closing.is_cancelled() {
@@ -1756,6 +1774,7 @@ impl SessionExecutorActor {
 
     async fn close_and_drain(&mut self) -> bool {
         self.receiver.close();
+        self.emergency_receiver.close();
         self.follow_up.clear();
         self.steer.clear();
         self.execution_state = SessionExecutionState::Finishing;
@@ -1766,6 +1785,7 @@ impl SessionExecutorActor {
             .copied()
             .collect::<Vec<_>>();
         let mut requests_drained = false;
+        let mut emergency_requests_drained = false;
         let mut normal_exit = true;
         if !pending_interactions.is_empty() {
             if let Some(active_turn) = self.active_turn.as_ref() {
@@ -1805,11 +1825,24 @@ impl SessionExecutorActor {
                     }
                 }
             }
+            if !emergency_requests_drained {
+                loop {
+                    match self.emergency_receiver.try_recv() {
+                        Ok(mut request) => request.reject_closing(),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            emergency_requests_drained = true;
+                            break;
+                        }
+                    }
+                }
+            }
 
             if self.active_publication.is_none()
                 && self.active_admission.is_none()
                 && self.active_turn.is_none()
                 && requests_drained
+                && emergency_requests_drained
             {
                 if let Some(conversation) = &self.conversation {
                     conversation.recorder.close().await;
@@ -1834,6 +1867,10 @@ impl SessionExecutorActor {
                 request = self.receiver.recv(), if !requests_drained => match request {
                     Some(mut request) => request.reject_closing(),
                     None => requests_drained = true,
+                },
+                request = self.emergency_receiver.recv(), if !emergency_requests_drained => match request {
+                    Some(mut request) => request.reject_closing(),
+                    None => emergency_requests_drained = true,
                 },
             }
         }
@@ -6847,6 +6884,69 @@ mod tests {
         tokio::task::yield_now().await;
         assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_controls_bypass_a_full_work_lane() {
+        for security_revoked in [false, true] {
+            let store = TempStore::new();
+            let model = ScriptedModelFixture::new(vec!["must not run"]);
+            let loaded = scripted_text_fixture(&store, &model).await;
+            let hooks = loaded.executor.test_hooks();
+            hooks.arm_before_agent_run_attempt();
+            let command_id = CommandId::generate().unwrap();
+            let turn_id = loaded
+                .executor
+                .submit(
+                    command_id,
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("emergency lane").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            hooks.wait_before_agent_run_attempt().await;
+
+            let mut permits = Vec::new();
+            for _ in 0..SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY {
+                permits.push(loaded.executor.sender.reserve().await.unwrap());
+            }
+
+            if security_revoked {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    loaded
+                        .executor
+                        .security_revoke(SessionCancelTarget::Turn(turn_id)),
+                )
+                .await
+                .expect("SecurityRevoked bypasses the full work lane")
+                .unwrap();
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    loaded.executor.cancel(
+                        SessionCancelTarget::Turn(turn_id),
+                        "2026-08-08T10:05:00.000Z".parse().unwrap(),
+                    ),
+                )
+                .await
+                .expect("Cancel bypasses the full work lane")
+                .unwrap();
+            }
+            drop(permits);
+            hooks.release_before_agent_run_attempt();
+            let expected = if security_revoked {
+                SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
+            } else {
+                SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
+            };
+            assert_eq!(wait_for_terminal(&loaded.executor, turn_id).await, expected);
+            assert_eq!(model.request_count(), 0);
+            close_loaded(loaded).await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
