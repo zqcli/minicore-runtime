@@ -3308,6 +3308,15 @@ async fn run_active_turn_inner(
         }
         let _ = conversation.recorder.record(entry).await;
 
+        if cancellation.is_cancelled()
+            || !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation)
+        {
+            lock(&conversation.live_state)
+                .abandon_current_tool_exchange(turn_id)
+                .map_err(|_| SessionTurnFailure::Internal)?;
+            return Err(SessionTurnFailure::Model);
+        }
+
         let requests = calls
             .into_iter()
             .map(|(item_id, call)| ToolExecutionRequest::new(item_id, call))
@@ -3515,12 +3524,7 @@ fn retry_basis_is_current(
     emergency_control: &EmergencyControlHandle,
     emergency_observation: EmergencyControlObservation,
 ) -> bool {
-    let Some(current_emergency) = emergency_control.observe(emergency_observation.target()) else {
-        return false;
-    };
-    if current_emergency.epoch() != emergency_observation.epoch()
-        || current_emergency.signal().is_some()
-    {
+    if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
         return false;
     }
     if !conversation.has_control_generation(turn_id, control_generation) {
@@ -3534,6 +3538,17 @@ fn retry_basis_is_current(
         .capture_conversation_views()
         .ok()
         .is_some_and(|views| views.conversation().revision() == source_revision)
+}
+
+fn emergency_control_is_unsignaled_current(
+    emergency_control: &EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
+) -> bool {
+    emergency_control
+        .observe(emergency_observation.target())
+        .is_some_and(|current| {
+            current.epoch() == emergency_observation.epoch() && current.signal().is_none()
+        })
 }
 
 fn agent_run_retry_delay(
@@ -6982,6 +6997,31 @@ mod tests {
         );
         assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
+    }
+
+    #[test]
+    fn tool_round_emergency_safe_point_rejects_signaled_or_stale_basis() {
+        let emergency = EmergencyControlHandle::new();
+        let target =
+            EmergencyControlTarget::Turn("trn_77777777777777777777777777777777".parse().unwrap());
+        let observation = emergency.bind(target).unwrap();
+        assert!(emergency_control_is_unsignaled_current(
+            &emergency,
+            observation
+        ));
+        assert!(matches!(
+            emergency.signal(target, EmergencyControlSignal::SecurityRevoked),
+            EmergencyControlSignalOutcome::Accepted { .. }
+        ));
+        assert!(!emergency_control_is_unsignaled_current(
+            &emergency,
+            observation
+        ));
+        assert!(emergency.retire(observation));
+        assert!(!emergency_control_is_unsignaled_current(
+            &emergency,
+            observation
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

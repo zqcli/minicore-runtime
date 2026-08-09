@@ -1,13 +1,13 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel与M9.1–M9.12 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整public SecurityRevoked terminal route、public projections、Compaction及grace/cancel式active-Turn Unload pending）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn admission、immutable `TurnExecutionContext`、Input/final Assistant live apply与inline record、single scripted Model request、terminal Event和Unload/Load replay已接通public Runtime facade；M8.1最小Scripted Tool round-trip、M8.2 Interaction、M8.3 Cancel与M9.1–M9.13 crate-private queue/Steer/arbitration/retry/Snapshot/EmergencyControl seams已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、完整public SecurityRevoked terminal route、public projections、Compaction及grace/cancel式active-Turn Unload pending）
 日期：2026-07-31
 
 ## 目的
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.12 已在 M9.11 retry epoch basis 之后补齐 EmergencyControl 的 retry backoff wakeup；sticky signal 一旦到达即可打断 backoff，且已 signal 的 current epoch 不再通过 retry basis。完整 public terminal/event route、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
+当前实现进度：M9.13 已在 M9.12 retry wakeup 之后补齐 Tool round 启动前的 EmergencyControl safe-point。actor 在创建 tool execution request 后、调用 captured ToolSet 前重新确认 target+epoch 未 signal；signal/stale 时丢弃 unfinished tool exchange，不启动 tool executor。完整 public terminal/event route、public queue DTO/projection、retry progress 与 Compaction retry仍后置。
 
 核心目标：
 
