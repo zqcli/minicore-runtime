@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0–M10已完成并统一review。当前推进M11 Fork与Full Runtime/Recovery Conformance。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix仍pending。
+状态：Active；M0–M10已完成并统一review。当前推进M11 Fork与Full Runtime/Recovery Conformance；Session Fork command/storage纵向切片已完成全部公开anchor、LiveSnapshot/RecordedHistory选择、streaming publication与restart recovery，catalog/query/event与full scenario closure继续推进。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload与完整platform matrix仍pending。
 
 初始实现基线：`dev` at `144039a`
 
@@ -55,7 +55,7 @@ M0与M1已经提交并通过Fast、MSRV 1.85与heavy boundary gates：
 
 - M2 remaining public protocol DTO families与完整manifest closure；
 - M8–M10 Tool/Interaction/Cancel、queues/logical retry、Skill composition与Compaction；
-- M11 remaining Fork anchors/LiveSnapshot与full recovery conformance；
+- M11 catalog/query/event、manifest closure与full recovery conformance；
 - production provider与sandbox adapter。
 
 M4已完成Prompt-owned opaque `ModelMessage`、`ConversationRevision`/`EntryIdGenerator`、`LiveSessionState` User/Assistant/Tool/Interaction reducer、complete Tool exchange、coherent capture与Compaction stable units/source/replacement subset。Fast/MSRV运行的120项library tests、Clippy、docs/fixtures检查与3项heavy recipes均通过，最终four-way review无blocker。
@@ -363,11 +363,11 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ## M5 · Durable Foundations、Recording与Replay
 
-状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，自动化Linux/macOS/Windows native matrix、remaining Fork anchors/LiveSnapshot及public Runtime command Pending；M5.1 target/proof、owner-tracked SessionRecorder physical append及全部七个 Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现；Load fault-and-replay conformance继续以确定性测试覆盖admitted Load caller cancellation、replay worker spawn rejection/panic/join failure、Recorder initialization degradation、stale Workspace candidate recheck与completed append后的cold replay。
+状态：M5.0 design gate与当前durable foundation Completed（无 standalone production reservation API/token/receipt）；crate-private loaded Workspace composite publication和Runtime residency lifecycle exclusion已消费该durable seam；三条new-entity路径的Unix process-abort tracer已在macOS本地验证，Session Fork public command/storage已覆盖全部公开anchor、LiveSnapshot/RecordedHistory与streaming publication/recovery，自动化Linux/macOS/Windows native matrix仍Pending；M5.1 target/proof、owner-tracked SessionRecorder physical append及全部七个 Recorder fixture坐标已完成，M5.2 tolerant semantic replay/corruption sidecars与replay/Recorder-backed Ready+Idle Load hydration也已实现；Load fault-and-replay conformance继续以确定性测试覆盖admitted Load caller cancellation、replay worker spawn rejection/panic/join failure、Recorder initialization degradation、stale Workspace candidate recheck与completed append后的cold replay。
 
 ### M5.0 DurableState / async foundation implementation
 
-设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。当前durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency exclusion也不代表remaining Fork anchors/LiveSnapshot、public Runtime command、Recorder/replay或cross-platform crash matrix已通过。以下列表是M5.0 implementation series的总退出范围，已完成项继续作为后续slice不可回归的门禁：
+设计已由[DurableState](modules/durable-state.md)、[Durable Store V1](formats/durable-store-v1.md)、fixtures、ADR 0136和ADR 0137关闭；implementation不得重新打开store shape。当前durable foundation、exact historical definition resolution、loaded Workspace composite publication、Runtime residency exclusion与Session Fork command/storage completion也不代表M11 remaining catalog/query/event/full recovery或cross-platform crash matrix已通过。以下列表是M5.0 implementation series的总退出范围，已完成项继续作为后续slice不可回归的门禁：
 
 - private `DurableStateActor`、immutable catalog snapshots/capabilities、poison/closing state和all mutation/catalog-head serialization；
 - permanent CSPRNG-ID reservation (`create_new`，32 definite collision cap)、root `.minicore.lock` fs4 exclusive lease、strict user-private local filesystem validation和no-follow link/reparse/case-alias handling；
@@ -586,6 +586,8 @@ ActiveTurnTask orchestration与deterministic ToolResult reduction切片已完成
 ## M11 · Fork与Full Runtime/Recovery Conformance
 
 目标：扩展从M7开始使用的唯一public facade，完成Fork与全部public/storage conformance并关闭internal MVP。
+
+当前进度：Session Fork command/storage纵向切片已完成。public `SessionCommand::Fork`与`SessionForked` outcome覆盖Genesis及Before/After User/Final Agent message anchors；source Session在与Load/Unload共用的FIFO gate内选择loaded `LiveSnapshot`或unloaded `RecordedHistory`。Live capture复制同一短guard内的immutable selected entry Arcs，包含Recorder degraded/unrecorded tail；RecordedHistory从tolerant replay selected path解析anchor。child只重绑定SessionId，保留历史Entry/parent/Turn/Item/body事实，以bounded-memory逐行canonical re-encode并逐条流式readback验证后才COMMITTED/PUBLISHED；staging失败complete-or-invisible，restart可恢复child且不继承source current Turn。Fork/Load与Fork/Unload两种排队顺序已有确定性竞态测试。统一Standards/Spec review已关闭RecordedHistory source-path invariant误报、whole-file allocation、async guard与fixture verifier遗漏；最终`./scripts/check.sh`全量通过，其中library tests为637 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。Runtime catalog/query/event、remaining public families、manifest closure和full scenario/recovery conformance仍pending。
 
 任务：
 

@@ -3,7 +3,9 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::agent_session_lifecycle::{AgentRevisionRef, SessionModelConfig};
+use crate::agent_session_lifecycle::{
+    AgentRevisionRef, ForkAnchor, ForkSourceKind, SessionModelConfig,
+};
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
 use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
@@ -262,6 +264,10 @@ pub enum SessionCommand {
     Unload {
         session_id: SessionId,
     },
+    Fork {
+        source_session_id: SessionId,
+        anchor: ForkAnchor,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -426,6 +432,10 @@ impl fmt::Debug for CommandCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CommandOutcome {
+    SessionForked {
+        session_id: SessionId,
+        source: ForkSourceKind,
+    },
     TurnStarted {
         turn_id: TurnId,
     },

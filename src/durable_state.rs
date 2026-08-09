@@ -20,23 +20,24 @@ use tokio::sync::Notify;
 use crate::agent_session_lifecycle::{
     AgentDefinition, AgentDefinitionDecision, AgentDefinitionDecisionError, AgentMetadata,
     AgentMetadataDecision, AgentMetadataDecisionError, AgentRevisionRef, AgentStatus,
-    AgentStatusDecision, AgentStatusDecisionError, SealedAgentCreateAttempt,
-    SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
-    SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt, SealedSessionDefinitionAttempt,
-    SealedSessionForkAttempt, SealedSessionLifecycleAttempt, SealedSessionMetadataAttempt,
-    SessionAgentUpgradeDecision, SessionAgentUpgradeDecisionError, SessionDefinition,
-    SessionDefinitionDecision, SessionDefinitionDecisionError, SessionForkProvenance,
-    SessionLifecycle, SessionLifecycleDecision, SessionLifecycleDecisionError, SessionMetadata,
-    SessionMetadataDecision, SessionMetadataDecisionError,
-    agent_definitions_have_same_canonical_execution_content,
+    AgentStatusDecision, AgentStatusDecisionError, ForkAnchor, ForkSourceKind,
+    SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
+    SealedAgentStatusAttempt, SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt,
+    SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
+    SealedSessionMetadataAttempt, SessionAgentUpgradeDecision, SessionAgentUpgradeDecisionError,
+    SessionDefinition, SessionDefinitionDecision, SessionDefinitionDecisionError,
+    SessionForkProvenance, SessionLifecycle, SessionLifecycleDecision,
+    SessionLifecycleDecisionError, SessionMetadata, SessionMetadataDecision,
+    SessionMetadataDecisionError, agent_definitions_have_same_canonical_execution_content,
     agent_metadata_has_same_canonical_content, is_legal_agent_status_transition,
     is_legal_session_lifecycle_transition,
     session_definitions_have_same_canonical_execution_content,
     session_metadata_has_same_canonical_content,
 };
 use crate::conversation_storage::{
-    PublishedConversationTarget, RecordedForkConversationLease, RecordedForkSourceError,
-    SessionHeader, UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
+    CapturedForkConversation, ForkAnchorResolutionError, PublishedConversationTarget,
+    RecordedForkConversationLease, RecordedForkSourceError, SessionHeader,
+    UnpublishedConversationRecoveryError, UnpublishedConversationRecoveryShape,
     validate_unpublished_conversation_for_recovery,
 };
 #[cfg(test)]
@@ -825,7 +826,7 @@ pub(crate) enum DurableSessionCreateError {
     InternalDispatchUnavailable,
 }
 
-/// The closed, redacted failure taxonomy for one accepted recorded Genesis Fork request.
+/// The closed, redacted failure taxonomy for one accepted Session Fork request.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum DurableSessionForkError {
     #[error("durable state is closing")]
@@ -846,6 +847,8 @@ pub(crate) enum DurableSessionForkError {
     SourceConversationTooLarge,
     #[error("Fork source conversation is corrupt")]
     SourceConversationCorrupt,
+    #[error("Fork anchor is invalid for the selected source path")]
+    InvalidAnchor,
     #[error("requested Agent is disabled")]
     AgentDisabled,
     #[error("requested Agent is deleted")]
@@ -1538,6 +1541,7 @@ impl CreateSessionWaiter {
 
 struct ForkSessionRequest {
     attempt: SealedSessionForkAttempt,
+    live_snapshot: Option<CapturedForkConversation>,
     response: Option<oneshot::Sender<Result<Arc<DurableSessionHead>, DurableSessionForkError>>>,
     closing: CancellationToken,
     #[cfg(test)]
@@ -2860,6 +2864,25 @@ impl DurableStateActorHandle {
     async fn enqueue_session_fork(&self, attempt: SealedSessionForkAttempt) -> ForkSessionWaiter {
         self.enqueue_session_fork_request(ForkSessionRequest {
             attempt,
+            live_snapshot: None,
+            response: None,
+            closing: self.closing.clone(),
+            #[cfg(test)]
+            candidates: None,
+            #[cfg(test)]
+            candidate_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+        .await
+    }
+
+    async fn enqueue_live_session_fork(
+        &self,
+        attempt: SealedSessionForkAttempt,
+        live_snapshot: CapturedForkConversation,
+    ) -> ForkSessionWaiter {
+        self.enqueue_session_fork_request(ForkSessionRequest {
+            attempt,
+            live_snapshot: Some(live_snapshot),
             response: None,
             closing: self.closing.clone(),
             #[cfg(test)]
@@ -2879,6 +2902,7 @@ impl DurableStateActorHandle {
     ) -> ForkSessionWaiter {
         self.enqueue_session_fork_request(ForkSessionRequest {
             attempt,
+            live_snapshot: None,
             response: None,
             closing: self.closing.clone(),
             candidates: Some(candidates.into_iter().collect()),
@@ -4308,7 +4332,7 @@ impl DurableStateActor {
             head,
             head_bytes,
             definition_bytes,
-            conversation_bytes,
+            SessionConversationPublication::HeaderOnly(conversation_bytes),
             Arc::new(agents),
             Arc::new(BTreeMap::new()),
             agent_gate,
@@ -5032,28 +5056,48 @@ impl DurableStateActor {
             };
         }
 
-        match validate_recorded_genesis_fork_source(
-            self.task_context.clone(),
-            Arc::clone(&self.lease),
-            Arc::clone(&self.filesystem),
-            self.root.clone(),
-            source_session_id,
-            source.clone(),
-            self.closing.clone(),
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(DurableSessionForkError::InternalDispatchUnavailable) => {
+        let captured_conversation = match request.attempt.source() {
+            ForkSourceKind::RecordedHistory if request.live_snapshot.is_none() => {
+                match capture_recorded_fork_source(
+                    self.task_context.clone(),
+                    Arc::clone(&self.lease),
+                    Arc::clone(&self.filesystem),
+                    self.root.clone(),
+                    source_session_id,
+                    source.clone(),
+                    request.attempt.anchor().clone(),
+                    self.closing.clone(),
+                )
+                .await
+                {
+                    Ok(captured) => captured,
+                    Err(DurableSessionForkError::InternalDispatchUnavailable) => {
+                        return SessionForkPublicationWorkResult::Poisoned;
+                    }
+                    Err(error) => {
+                        return SessionForkPublicationWorkResult::Ordinary {
+                            error,
+                            close_required: false,
+                        };
+                    }
+                }
+            }
+            ForkSourceKind::LiveSnapshot => {
+                let Some(captured) = request.live_snapshot.take() else {
+                    return SessionForkPublicationWorkResult::Poisoned;
+                };
+                if captured.source_session_id() != source_session_id
+                    || captured.source() != ForkSourceKind::LiveSnapshot
+                    || captured.anchor() != request.attempt.anchor()
+                {
+                    return SessionForkPublicationWorkResult::Poisoned;
+                }
+                captured
+            }
+            ForkSourceKind::RecordedHistory => {
                 return SessionForkPublicationWorkResult::Poisoned;
             }
-            Err(error) => {
-                return SessionForkPublicationWorkResult::Ordinary {
-                    error,
-                    close_required: false,
-                };
-            }
-        }
+        };
         if self.closing.is_cancelled() {
             return SessionForkPublicationWorkResult::Ordinary {
                 error: DurableSessionForkError::Closing,
@@ -5145,23 +5189,6 @@ impl DurableStateActor {
             return SessionForkPublicationWorkResult::Poisoned;
         }
 
-        let header = SessionHeader::reconstruct(
-            1,
-            child_session_id,
-            definition.created_at(),
-            definition.agent(),
-            definition.revision(),
-        );
-        let mut conversation_bytes = match ConversationLineCodec::encode_header(&header) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return SessionForkPublicationWorkResult::Ordinary {
-                    error: DurableSessionForkError::StorageUnavailable,
-                    close_required: false,
-                };
-            }
-        };
-        conversation_bytes.push(b'\n');
         let head_bytes = match DurableStoreV1Codec::encode_session_head(&head) {
             Ok(bytes) => bytes,
             Err(_) => return SessionForkPublicationWorkResult::Poisoned,
@@ -5181,7 +5208,7 @@ impl DurableStateActor {
                 head,
                 head_bytes,
                 definition_bytes,
-                conversation_bytes,
+                SessionConversationPublication::Fork(captured_conversation),
                 Arc::new(agents),
                 Arc::new(sessions),
                 agent_gate,
@@ -6005,22 +6032,28 @@ enum SessionForkPublicationWorkResult {
     Poisoned,
 }
 
-async fn validate_recorded_genesis_fork_source(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the tracked recorded Fork capture binds one exact root/file/source observation and cancellation owner"
+)]
+async fn capture_recorded_fork_source(
     task_context: RuntimeTaskContext,
     lease: Arc<RootLease>,
     filesystem: Arc<dyn DurableFilesystem>,
     root: PathBuf,
     source_session_id: SessionId,
     source: DurableSessionCatalogEntry,
+    anchor: ForkAnchor,
     closing: CancellationToken,
-) -> Result<(), DurableSessionForkError> {
+) -> Result<CapturedForkConversation, DurableSessionForkError> {
     let job = task_context.spawn_blocking_tracked(move || {
         let _lease = lease;
-        validate_recorded_genesis_fork_source_blocking(
+        capture_recorded_fork_source_blocking(
             filesystem.as_ref(),
             &root,
             source_session_id,
             &source,
+            anchor,
         )
     });
     let mut job_wait = Box::pin(job.wait());
@@ -6039,12 +6072,13 @@ async fn validate_recorded_genesis_fork_source(
     }
 }
 
-fn validate_recorded_genesis_fork_source_blocking(
+fn capture_recorded_fork_source_blocking(
     filesystem: &dyn DurableFilesystem,
     root: &Path,
     source_session_id: SessionId,
     source: &DurableSessionCatalogEntry,
-) -> Result<(), DurableSessionForkError> {
+    anchor: ForkAnchor,
+) -> Result<CapturedForkConversation, DurableSessionForkError> {
     let source_entity = root
         .join(SESSIONS_DIRECTORY)
         .join(source_session_id.to_string());
@@ -6138,8 +6172,8 @@ fn validate_recorded_genesis_fork_source_blocking(
     {
         return Err(DurableSessionForkError::InternalDispatchUnavailable);
     }
-    lease
-        .validate_recorded_genesis(&expected_header)
+    let captured = lease
+        .capture_selected_path(&expected_header, anchor)
         .map_err(map_recorded_fork_source_error)?;
     let final_handle_metadata = lease
         .handle_metadata()
@@ -6151,13 +6185,15 @@ fn validate_recorded_genesis_fork_source_blocking(
         &final_handle_metadata,
         &final_path_metadata,
     )
-    .map_err(map_recorded_fork_open_error)
+    .map_err(map_recorded_fork_open_error)?;
+    Ok(captured)
 }
 
 const fn map_recorded_fork_source_error(error: RecordedForkSourceError) -> DurableSessionForkError {
     match error {
         RecordedForkSourceError::TooLarge => DurableSessionForkError::SourceConversationTooLarge,
         RecordedForkSourceError::Corrupt => DurableSessionForkError::SourceConversationCorrupt,
+        RecordedForkSourceError::InvalidAnchor => DurableSessionForkError::InvalidAnchor,
         RecordedForkSourceError::Unavailable => DurableSessionForkError::StorageUnavailable,
     }
 }
@@ -6215,6 +6251,13 @@ fn map_session_publication_for_fork(
             close_required,
         },
         SessionPublicationWorkResult::Ordinary {
+            error: DurableSessionCreateError::DurableStateTooLarge,
+            close_required,
+        } => SessionForkPublicationWorkResult::Ordinary {
+            error: DurableSessionForkError::SourceConversationTooLarge,
+            close_required,
+        },
+        SessionPublicationWorkResult::Ordinary {
             error: DurableSessionCreateError::InternalDispatchUnavailable,
             ..
         }
@@ -6223,10 +6266,22 @@ fn map_session_publication_for_fork(
     }
 }
 
-/// The ordinary-Create conversation fact validated before COMMITTED. The proof retains the
+enum SessionConversationPublication {
+    HeaderOnly(Vec<u8>),
+    Fork(CapturedForkConversation),
+}
+
+#[derive(Clone, Copy)]
+enum SessionConversationPublicationError {
+    TooLarge,
+    Unavailable,
+    Invariant,
+}
+
+/// The complete Create/Fork conversation fact validated before COMMITTED. The proof retains the
 /// exact physical identity/length and canonical Header semantics so final publication revalidates
 /// the same file rather than assembling certainty from an unrelated same-content replacement.
-struct PreparedOrdinaryConversationProof {
+struct PreparedConversationProof {
     header: SessionHeader,
     shape: CleanupRegularFileShape,
 }
@@ -7720,7 +7775,7 @@ async fn publish_session_generation(
     head: Arc<DurableSessionHead>,
     head_bytes: Vec<u8>,
     definition_bytes: Vec<u8>,
-    conversation_bytes: Vec<u8>,
+    conversation: SessionConversationPublication,
     agents: Arc<BTreeMap<AgentId, DurableAgentCatalogEntry>>,
     sessions: Arc<BTreeMap<SessionId, DurableSessionCatalogEntry>>,
     agent_gate: AgentPublicationPermit,
@@ -7742,7 +7797,7 @@ async fn publish_session_generation(
             head,
             &head_bytes,
             &definition_bytes,
-            &conversation_bytes,
+            &conversation,
             &agents,
             &sessions,
             worker_barrier,
@@ -7846,7 +7901,7 @@ fn publish_session_generation_blocking(
     head: Arc<DurableSessionHead>,
     head_bytes: &[u8],
     definition_bytes: &[u8],
-    conversation_bytes: &[u8],
+    conversation: &SessionConversationPublication,
     agents: &BTreeMap<AgentId, DurableAgentCatalogEntry>,
     sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     barrier: Arc<DurableCommitBarrier>,
@@ -7921,11 +7976,23 @@ fn publish_session_generation_blocking(
         &definition_path,
         definition_bytes,
     ));
-    precommit_step!(write_and_sync(
+    if let Err(error) = write_session_conversation_and_sync(
         filesystem,
         &conversation_path,
-        conversation_bytes,
-    ));
+        conversation,
+        &expected_header,
+    ) {
+        return reconcile_session_precommit_failure(
+            filesystem,
+            root,
+            directory_sync,
+            session_id,
+            agents,
+            sessions,
+            map_session_conversation_publication_error(error),
+            &barrier,
+        );
+    }
     precommit_step!(filesystem.sync_directory(&generation_path, directory_sync));
     precommit_step!(filesystem.sync_directory(&entity, directory_sync));
     precommit_step!(exact_readback(filesystem, &head_path, head_bytes));
@@ -7946,14 +8013,20 @@ fn publish_session_generation_blocking(
             &barrier,
         );
     }
-    let conversation_proof = match prepare_ordinary_conversation_proof(
+    let recovery_shape = if head.fork_provenance().is_some() {
+        UnpublishedConversationRecoveryShape::ForkCanonicalLinearFile
+    } else {
+        UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly
+    };
+    let conversation_proof = match prepare_conversation_proof(
         filesystem,
         &conversation_path,
-        conversation_bytes,
+        conversation,
         &expected_header,
+        recovery_shape,
     ) {
         Ok(proof) => proof,
-        Err(_) => {
+        Err(error) => {
             return reconcile_session_precommit_failure(
                 filesystem,
                 root,
@@ -7961,7 +8034,7 @@ fn publish_session_generation_blocking(
                 session_id,
                 agents,
                 sessions,
-                DurableSessionCreateError::StorageUnavailable,
+                map_session_conversation_publication_error(error),
                 &barrier,
             );
         }
@@ -8030,7 +8103,7 @@ fn publish_session_generation_blocking(
                 exact_readback_state(filesystem, &definition_path, definition_bytes),
                 PublicationCertainty::Published
             ) || !matches!(
-                revalidate_ordinary_conversation_proof(&conversation_path, &conversation_proof,),
+                revalidate_conversation_proof(&conversation_path, &conversation_proof,),
                 PublicationCertainty::Published
             ));
         if committed_operation_failed || committed_readback_failed {
@@ -8208,7 +8281,7 @@ fn reconcile_session_committed_failure(
     definition_path: &Path,
     head_bytes: &[u8],
     definition_bytes: &[u8],
-    conversation_proof: &PreparedOrdinaryConversationProof,
+    conversation_proof: &PreparedConversationProof,
     ordinary_error: DurableSessionCreateError,
 ) -> SessionCommittedFailureResolution {
     match exact_readback_state(filesystem, committed_path, b"") {
@@ -8220,7 +8293,7 @@ fn reconcile_session_committed_failure(
                 exact_readback_state(filesystem, definition_path, definition_bytes),
                 PublicationCertainty::Published
             ) && matches!(
-                revalidate_ordinary_conversation_proof(
+                revalidate_conversation_proof(
                     &root
                         .join(SESSIONS_DIRECTORY)
                         .join(session_id.to_string())
@@ -8287,7 +8360,7 @@ fn reconcile_session_published_failure(
     entity: &Path,
     head_bytes: &[u8],
     definition_bytes: &[u8],
-    conversation_proof: &PreparedOrdinaryConversationProof,
+    conversation_proof: &PreparedConversationProof,
     close_required: bool,
     ordinary_error: DurableSessionCreateError,
 ) -> SessionPublicationWorkResult {
@@ -8360,7 +8433,7 @@ fn recover_published_session(
     sessions: &BTreeMap<SessionId, DurableSessionCatalogEntry>,
     head_bytes: &[u8],
     definition_bytes: &[u8],
-    conversation_proof: &PreparedOrdinaryConversationProof,
+    conversation_proof: &PreparedConversationProof,
 ) -> Result<DurableSessionCatalogEntry, PublicationCertainty> {
     let published_state = exact_readback_state(filesystem, &entity.join("PUBLISHED"), b"");
     if published_state != PublicationCertainty::Published {
@@ -8382,10 +8455,8 @@ fn recover_published_session(
     if definition_state != PublicationCertainty::Published {
         return Err(committed_payload_certainty(definition_state));
     }
-    let conversation_state = revalidate_ordinary_conversation_proof(
-        &entity.join("conversation.jsonl"),
-        conversation_proof,
-    );
+    let conversation_state =
+        revalidate_conversation_proof(&entity.join("conversation.jsonl"), conversation_proof);
     if conversation_state != PublicationCertainty::Published {
         return Err(committed_payload_certainty(conversation_state));
     }
@@ -8560,43 +8631,92 @@ fn committed_payload_certainty(certainty: PublicationCertainty) -> PublicationCe
     }
 }
 
-fn prepare_ordinary_conversation_proof(
+fn write_session_conversation_and_sync(
     filesystem: &dyn DurableFilesystem,
     path: &Path,
-    expected: &[u8],
+    conversation: &SessionConversationPublication,
     header: &SessionHeader,
-) -> Result<PreparedOrdinaryConversationProof, PublicationCertainty> {
-    let exact_state = exact_readback_state(filesystem, path, expected);
-    if exact_state != PublicationCertainty::Published {
-        return Err(exact_state);
+) -> Result<(), SessionConversationPublicationError> {
+    let mut file = filesystem
+        .create_new_private_file(path)
+        .map_err(|_| SessionConversationPublicationError::Unavailable)?;
+    validate_new_file_mode(&file).map_err(|_| SessionConversationPublicationError::Unavailable)?;
+    match conversation {
+        SessionConversationPublication::HeaderOnly(bytes) => filesystem
+            .write_file(path, &mut file, bytes)
+            .map_err(|_| SessionConversationPublicationError::Unavailable)?,
+        SessionConversationPublication::Fork(captured) => {
+            filesystem
+                .write_fork_conversation(path, &mut file, captured, header)
+                .map_err(map_fork_conversation_publication_error)?;
+        }
     }
+    filesystem
+        .sync_file(path, &file)
+        .map_err(|_| SessionConversationPublicationError::Unavailable)
+}
+
+const fn map_fork_conversation_publication_error(
+    error: ForkAnchorResolutionError,
+) -> SessionConversationPublicationError {
+    match error {
+        ForkAnchorResolutionError::TooLarge => SessionConversationPublicationError::TooLarge,
+        ForkAnchorResolutionError::Unavailable => SessionConversationPublicationError::Unavailable,
+        ForkAnchorResolutionError::InvalidAnchor
+        | ForkAnchorResolutionError::InvalidSource
+        | ForkAnchorResolutionError::Encode => SessionConversationPublicationError::Invariant,
+    }
+}
+
+const fn map_session_conversation_publication_error(
+    error: SessionConversationPublicationError,
+) -> DurableSessionCreateError {
+    match error {
+        SessionConversationPublicationError::TooLarge => {
+            DurableSessionCreateError::DurableStateTooLarge
+        }
+        SessionConversationPublicationError::Unavailable => {
+            DurableSessionCreateError::StorageUnavailable
+        }
+        SessionConversationPublicationError::Invariant => {
+            DurableSessionCreateError::InternalDispatchUnavailable
+        }
+    }
+}
+
+fn prepare_conversation_proof(
+    filesystem: &dyn DurableFilesystem,
+    path: &Path,
+    conversation: &SessionConversationPublication,
+    header: &SessionHeader,
+    recovery_shape: UnpublishedConversationRecoveryShape,
+) -> Result<PreparedConversationProof, SessionConversationPublicationError> {
     let initial_path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(PublicationCertainty::NotPublished);
-        }
-        Err(_) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     if validate_existing_regular_file(
         &initial_path_metadata,
         DurableOpenError::DurableStateCorrupt,
     )
     .is_err()
-        || initial_path_metadata.len() > MAX_CONVERSATION_FILE_BYTES
     {
-        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+        return Err(SessionConversationPublicationError::Unavailable);
     }
-    let mut file = match filesystem.open_file(path) {
+    if initial_path_metadata.len() > MAX_CONVERSATION_FILE_BYTES {
+        return Err(SessionConversationPublicationError::TooLarge);
+    }
+    let mut file = match filesystem.open_conversation_for_readback(path) {
         Ok(file) => file,
-        Err(()) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     let handle_metadata = match file.metadata() {
         Ok(metadata) => metadata,
-        Err(_) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     let opened_path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(_) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     if validate_open_file_observation(
         &initial_path_metadata,
@@ -8605,40 +8725,37 @@ fn prepare_ordinary_conversation_proof(
     )
     .is_err()
     {
-        return Err(PublicationCertainty::IndeterminatePoisoned);
+        return Err(SessionConversationPublicationError::Unavailable);
     }
-    let expected_header = ConversationLineCodec::decode_header_for_catalog(
-        expected
-            .strip_suffix(b"\n")
-            .ok_or(PublicationCertainty::CommittedCorruptPoisoned)?,
-        header.session_id(),
-    )
-    .map_err(|_| PublicationCertainty::CommittedCorruptPoisoned)?;
-    validate_unpublished_conversation_for_recovery(
-        &mut file,
-        initial_path_metadata.len(),
-        &expected_header,
-        UnpublishedConversationRecoveryShape::OrdinaryHeaderOnly,
-    )
-    .map_err(|error| match error {
-        UnpublishedConversationRecoveryError::Unavailable => {
-            PublicationCertainty::IndeterminatePoisoned
+    match conversation {
+        SessionConversationPublication::HeaderOnly(_) => {
+            validate_unpublished_conversation_for_recovery(
+                &mut file,
+                initial_path_metadata.len(),
+                header,
+                recovery_shape,
+            )
+            .map_err(|error| match error {
+                UnpublishedConversationRecoveryError::TooLarge => {
+                    SessionConversationPublicationError::TooLarge
+                }
+                UnpublishedConversationRecoveryError::Corrupt
+                | UnpublishedConversationRecoveryError::Unavailable => {
+                    SessionConversationPublicationError::Unavailable
+                }
+            })?;
         }
-        UnpublishedConversationRecoveryError::TooLarge
-        | UnpublishedConversationRecoveryError::Corrupt => {
-            PublicationCertainty::CommittedCorruptPoisoned
-        }
-    })?;
-    if expected_header != *header {
-        return Err(PublicationCertainty::CommittedCorruptPoisoned);
+        SessionConversationPublication::Fork(captured) => captured
+            .validate_reencoded_child(&mut file, initial_path_metadata.len(), header)
+            .map_err(map_fork_conversation_publication_error)?,
     }
     let final_handle_metadata = match file.metadata() {
         Ok(metadata) => metadata,
-        Err(_) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     let final_path_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
-        Err(_) => return Err(PublicationCertainty::IndeterminatePoisoned),
+        Err(_) => return Err(SessionConversationPublicationError::Unavailable),
     };
     if validate_open_file_observation(
         &initial_path_metadata,
@@ -8647,17 +8764,17 @@ fn prepare_ordinary_conversation_proof(
     )
     .is_err()
     {
-        return Err(PublicationCertainty::IndeterminatePoisoned);
+        return Err(SessionConversationPublicationError::Unavailable);
     }
-    Ok(PreparedOrdinaryConversationProof {
+    Ok(PreparedConversationProof {
         header: header.clone(),
         shape: cleanup_regular_file_shape(&final_path_metadata),
     })
 }
 
-fn revalidate_ordinary_conversation_proof(
+fn revalidate_conversation_proof(
     path: &Path,
-    proof: &PreparedOrdinaryConversationProof,
+    proof: &PreparedConversationProof,
 ) -> PublicationCertainty {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -9827,6 +9944,18 @@ impl DurableState {
         attempt: SealedSessionForkAttempt,
     ) -> Result<Arc<DurableSessionHead>, DurableSessionForkError> {
         self.actor.enqueue_session_fork(attempt).await.wait().await
+    }
+
+    pub(crate) async fn fork_session_from_live_snapshot(
+        &self,
+        attempt: SealedSessionForkAttempt,
+        live_snapshot: CapturedForkConversation,
+    ) -> Result<Arc<DurableSessionHead>, DurableSessionForkError> {
+        self.actor
+            .enqueue_live_session_fork(attempt, live_snapshot)
+            .await
+            .wait()
+            .await
     }
 
     #[cfg(test)]
@@ -13146,9 +13275,22 @@ trait DurableFilesystem: Send + Sync {
         let _ = path;
         file.write_all(bytes).map_err(|_| ())
     }
+    fn write_fork_conversation(
+        &self,
+        path: &Path,
+        file: &mut File,
+        captured: &CapturedForkConversation,
+        header: &SessionHeader,
+    ) -> Result<u64, ForkAnchorResolutionError> {
+        let _ = path;
+        captured.write_for_child(header, file)
+    }
     fn sync_file(&self, path: &Path, file: &File) -> Result<(), ()> {
         let _ = path;
         file.sync_all().map_err(|_| ())
+    }
+    fn open_conversation_for_readback(&self, path: &Path) -> Result<File, DurableOpenError> {
+        File::open(path).map_err(|_| DurableOpenError::StorageUnavailable)
     }
     fn read_document(&self, path: &Path) -> Result<Vec<u8>, DurableOpenError> {
         read_durable_document(path)
@@ -13945,8 +14087,8 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        DirectorySync, DurableFilesystem, classify_directory_sync, open_root,
-        open_root_with_durable_filesystem,
+        CapturedForkConversation, DirectorySync, DurableFilesystem, ForkAnchorResolutionError,
+        SessionHeader, classify_directory_sync, open_root, open_root_with_durable_filesystem,
     };
     use crate::agent_session_lifecycle::{
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind,
@@ -14681,6 +14823,31 @@ mod tests {
             Ok(())
         }
 
+        fn write_fork_conversation(
+            &self,
+            path: &Path,
+            file: &mut File,
+            captured: &CapturedForkConversation,
+            header: &SessionHeader,
+        ) -> Result<u64, ForkAnchorResolutionError> {
+            let operation = publication_write_operation(path);
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(fault, Some(PublicationFault::Before(_))) {
+                return Err(ForkAnchorResolutionError::Unavailable);
+            }
+            let written = captured.write_for_child(header, file)?;
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(ForkAnchorResolutionError::Unavailable);
+            }
+            Ok(written)
+        }
+
         fn sync_file(&self, path: &Path, file: &File) -> Result<(), ()> {
             let operation = publication_sync_file_operation(path);
             if let Some(operation) = operation {
@@ -14727,6 +14894,35 @@ mod tests {
                 return Err(DurableOpenError::StorageUnavailable);
             }
             Ok(bytes)
+        }
+
+        fn open_conversation_for_readback(&self, path: &Path) -> Result<File, DurableOpenError> {
+            let operation = publication_readback_operation(path);
+            if let Some(operation) = operation {
+                self.record_publication_operation(operation);
+            }
+            let fault = operation.and_then(|operation| self.take_publication_fault(operation));
+            if matches!(
+                fault,
+                Some(PublicationFault::Before(_)) | Some(PublicationFault::Indeterminate(_))
+            ) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            let file = File::open(path).map_err(|_| DurableOpenError::StorageUnavailable)?;
+            if let Some(operation) = operation {
+                self.complete_publication_operation(operation);
+            }
+            if matches!(fault, Some(PublicationFault::Panic(_))) {
+                panic!("deterministic conversation readback panic");
+            }
+            if matches!(fault, Some(PublicationFault::Corrupt(_))) {
+                fs::write(path, b"corrupt").map_err(|_| DurableOpenError::StorageUnavailable)?;
+                return Err(DurableOpenError::DurableStateCorrupt);
+            }
+            if matches!(fault, Some(PublicationFault::After(_))) {
+                return Err(DurableOpenError::StorageUnavailable);
+            }
+            Ok(file)
         }
 
         fn observe_optional_definition(
@@ -18693,6 +18889,61 @@ mod tests {
                 .session_current_definition(child)
                 .expect("the child definition reopens"),
             &*definition
+        );
+        reopened.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recorded_history_fork_reencodes_the_anchor_resolved_selected_path() {
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        create_valid_g1_agent(root.path());
+        create_valid_g1_session(root.path(), &valid_ordinary_conversation(SESSION_ONE));
+        let source = SessionId::from_str(SESSION_ONE).unwrap();
+        let child = SessionId::from_str(SESSION_TWO).unwrap();
+        let anchor = ForkAnchor::AfterUserMessage {
+            item_id: "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".parse().unwrap(),
+        };
+        let attempt = SealedSessionForkAttempt::new(
+            source,
+            ForkSourceKind::RecordedHistory,
+            anchor.clone(),
+            "2026-08-03T10:02:00.789Z".parse().unwrap(),
+        );
+
+        let state = open(root.path()).await.expect("the source store opens");
+        let returned_head = state
+            .fork_session_with_test_candidates(attempt, [Ok(child)])
+            .await
+            .expect("the recorded-history Fork publishes");
+        assert_eq!(
+            returned_head.fork_provenance(),
+            Some(&SessionForkProvenance::new(
+                source,
+                ForkSourceKind::RecordedHistory,
+                anchor,
+            ))
+        );
+        let child_entity = session_path(root.path(), SESSION_TWO);
+        let generation = child_entity.join("generations").join(GENERATION_ONE);
+        assert_eq!(
+            fs::read(generation.join("head.json")).unwrap(),
+            fork_session_head_fixture()
+        );
+        assert_eq!(
+            fs::read(generation.join("definition.json")).unwrap(),
+            fork_session_definition_fixture()
+        );
+        assert_eq!(
+            fs::read(child_entity.join("conversation.jsonl")).unwrap(),
+            include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl")
+        );
+        state.close().await;
+
+        let reopened = open(root.path()).await.expect("the Fork child reopens");
+        assert_eq!(
+            reopened.session_head(child).unwrap().fork_provenance(),
+            returned_head.fork_provenance()
         );
         reopened.close().await;
     }

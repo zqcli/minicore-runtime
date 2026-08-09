@@ -4,7 +4,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_session_lifecycle::{AgentRevisionRef, SessionModelConfig};
+use crate::agent_session_lifecycle::{
+    AgentRevisionRef, ForkAnchor, ForkSourceKind, SessionModelConfig,
+};
 use crate::model_gateway::{ModelId, ModelSelection, ProviderId, ReasoningPreference};
 use crate::prompt::{
     PromptBodyIntent, PromptId, PromptIntent, PromptValueError, SessionPromptSelection,
@@ -369,6 +371,12 @@ impl RuntimeCommandInput {
                     session_id: value.session_id,
                 })
             }
+            Self::Session(SessionCommandInput::Fork(value)) => {
+                RuntimeCommand::Session(SessionCommand::Fork {
+                    source_session_id: value.source_session_id,
+                    anchor: value.anchor.into_semantic(),
+                })
+            }
             Self::Turn(TurnCommandInput::Submit(value)) => {
                 RuntimeCommand::Turn(TurnCommand::Submit {
                     session_id: value.session_id,
@@ -416,6 +424,50 @@ enum SessionCommandInput {
     Create(Box<CreateSessionCommandInput>),
     Load(SessionIdInput),
     Unload(SessionIdInput),
+    Fork(ForkSessionCommandInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForkSessionCommandInput {
+    source_session_id: SessionId,
+    anchor: ForkAnchorInput,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ForkAnchorInput {
+    Genesis,
+    BeforeUserMessage(ForkItemAnchorInput),
+    AfterUserMessage(ForkItemAnchorInput),
+    BeforeFinalAgentMessage(ForkItemAnchorInput),
+    AfterFinalAgentMessage(ForkItemAnchorInput),
+}
+
+impl ForkAnchorInput {
+    const fn into_semantic(self) -> ForkAnchor {
+        match self {
+            Self::Genesis => ForkAnchor::Genesis,
+            Self::BeforeUserMessage(value) => ForkAnchor::BeforeUserMessage {
+                item_id: value.item_id,
+            },
+            Self::AfterUserMessage(value) => ForkAnchor::AfterUserMessage {
+                item_id: value.item_id,
+            },
+            Self::BeforeFinalAgentMessage(value) => ForkAnchor::BeforeFinalAgentMessage {
+                item_id: value.item_id,
+            },
+            Self::AfterFinalAgentMessage(value) => ForkAnchor::AfterFinalAgentMessage {
+                item_id: value.item_id,
+            },
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ForkItemAnchorInput {
+    item_id: crate::wire::ItemId,
 }
 
 #[derive(Deserialize)]
@@ -3406,6 +3458,13 @@ impl<'a> RuntimeCommandOutput<'a> {
                     session_id: *session_id,
                 }))
             }
+            RuntimeCommand::Session(SessionCommand::Fork {
+                source_session_id,
+                anchor,
+            }) => Self::Session(SessionCommandOutput::Fork(ForkSessionCommandOutput {
+                source_session_id: *source_session_id,
+                anchor: ForkAnchorOutput::from_semantic(anchor),
+            })),
             RuntimeCommand::Turn(TurnCommand::Submit { session_id, intent }) => {
                 Self::Turn(TurnCommandOutput::Submit(SubmitCommandOutput {
                     session_id: *session_id,
@@ -3458,6 +3517,50 @@ enum SessionCommandOutput<'a> {
     Create(CreateSessionCommandOutput<'a>),
     Load(SessionIdOutput),
     Unload(SessionIdOutput),
+    Fork(ForkSessionCommandOutput),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkSessionCommandOutput {
+    source_session_id: SessionId,
+    anchor: ForkAnchorOutput,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ForkAnchorOutput {
+    Genesis,
+    BeforeUserMessage(ForkItemAnchorOutput),
+    AfterUserMessage(ForkItemAnchorOutput),
+    BeforeFinalAgentMessage(ForkItemAnchorOutput),
+    AfterFinalAgentMessage(ForkItemAnchorOutput),
+}
+
+impl ForkAnchorOutput {
+    const fn from_semantic(value: &ForkAnchor) -> Self {
+        match value {
+            ForkAnchor::Genesis => Self::Genesis,
+            ForkAnchor::BeforeUserMessage { item_id } => {
+                Self::BeforeUserMessage(ForkItemAnchorOutput { item_id: *item_id })
+            }
+            ForkAnchor::AfterUserMessage { item_id } => {
+                Self::AfterUserMessage(ForkItemAnchorOutput { item_id: *item_id })
+            }
+            ForkAnchor::BeforeFinalAgentMessage { item_id } => {
+                Self::BeforeFinalAgentMessage(ForkItemAnchorOutput { item_id: *item_id })
+            }
+            ForkAnchor::AfterFinalAgentMessage { item_id } => {
+                Self::AfterFinalAgentMessage(ForkItemAnchorOutput { item_id: *item_id })
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkItemAnchorOutput {
+    item_id: crate::wire::ItemId,
 }
 
 #[derive(Serialize)]
@@ -3817,6 +3920,7 @@ struct CommandOutputInput {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
+    SessionForked(SessionForkedInput),
     TurnStarted(TurnIdInput),
     SubmitCancelled,
     SteerQueued(TurnIdInput),
@@ -3829,6 +3933,10 @@ enum CommandOutcomeInput {
 impl CommandOutcomeInput {
     const fn into_semantic(self) -> CommandOutcome {
         match self {
+            Self::SessionForked(value) => CommandOutcome::SessionForked {
+                session_id: value.session_id,
+                source: value.source.into_semantic(),
+            },
             Self::TurnStarted(value) => CommandOutcome::TurnStarted {
                 turn_id: value.turn_id,
             },
@@ -3843,6 +3951,29 @@ impl CommandOutcomeInput {
                 cancel_epoch: value.cancel_epoch.get(),
             },
             Self::CommandOutput => CommandOutcome::CommandOutput,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionForkedInput {
+    session_id: SessionId,
+    source: ForkSourceKindInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ForkSourceKindInput {
+    LiveSnapshot,
+    RecordedHistory,
+}
+
+impl ForkSourceKindInput {
+    const fn into_semantic(self) -> ForkSourceKind {
+        match self {
+            Self::LiveSnapshot => ForkSourceKind::LiveSnapshot,
+            Self::RecordedHistory => ForkSourceKind::RecordedHistory,
         }
     }
 }
@@ -4110,6 +4241,7 @@ struct CommandOutputOutput<'a> {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
+    SessionForked(SessionForkedOutput),
     TurnStarted(TurnIdOutput),
     SubmitCancelled,
     SteerQueued(TurnIdOutput),
@@ -4122,6 +4254,12 @@ enum CommandOutcomeOutput {
 impl CommandOutcomeOutput {
     fn from_semantic(value: &CommandOutcome) -> Self {
         match value {
+            CommandOutcome::SessionForked { session_id, source } => {
+                Self::SessionForked(SessionForkedOutput {
+                    session_id: *session_id,
+                    source: ForkSourceKindOutput::from_semantic(*source),
+                })
+            }
             CommandOutcome::TurnStarted { turn_id } => {
                 Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
             }
@@ -4139,6 +4277,29 @@ impl CommandOutcomeOutput {
                 cancel_epoch: super::CanonicalU64::new(*cancel_epoch),
             }),
             CommandOutcome::CommandOutput => Self::CommandOutput,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionForkedOutput {
+    session_id: SessionId,
+    source: ForkSourceKindOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ForkSourceKindOutput {
+    LiveSnapshot,
+    RecordedHistory,
+}
+
+impl ForkSourceKindOutput {
+    const fn from_semantic(value: ForkSourceKind) -> Self {
+        match value {
+            ForkSourceKind::LiveSnapshot => Self::LiveSnapshot,
+            ForkSourceKind::RecordedHistory => Self::RecordedHistory,
         }
     }
 }
@@ -4736,8 +4897,21 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "agent_status_changed"
         | "session_created"
         | "session_definition_updated"
-        | "session_metadata_updated"
-        | "session_forked" => pending_output_object(data),
+        | "session_metadata_updated" => pending_output_object(data),
+        "session_forked" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_id::<SessionId>(required(object, "sessionId")?)?;
+            match required(object, "source")?
+                .as_str()
+                .ok_or_else(typed_wrong_json_type)?
+            {
+                "live_snapshot" | "recorded_history" => Ok(()),
+                _ => Err(unknown_output_variant()),
+            }
+        }
         "steer_queued" => {
             let object = data
                 .ok_or_else(missing_required_field)?
@@ -6082,14 +6256,45 @@ fn validate_session_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(
         "create" => {
             validate_create_session_command(data.ok_or_else(missing_required_field)?, limits)
         }
+        "fork" => validate_fork_session_command(data.ok_or_else(missing_required_field)?),
         "update_definition"
         | "upgrade_agent_revision"
         | "update_metadata"
         | "reload_workspace"
         | "archive"
         | "unarchive"
-        | "delete"
-        | "fork" => pending_object(data),
+        | "delete" => pending_object(data),
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_fork_session_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sourceSessionId", "anchor"],
+    )?;
+    validate_id::<SessionId>(required(object, "sourceSessionId")?)?;
+    validate_fork_anchor(required(object, "anchor")?)
+}
+
+fn validate_fork_anchor(node: &JsonNode) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "genesis" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "before_user_message"
+        | "after_user_message"
+        | "before_final_agent_message"
+        | "after_final_agent_message" => {
+            let object = input_object(data.ok_or_else(missing_required_field)?)?;
+            reject_unknown_fields(object.keys().map(AsRef::as_ref), &["itemId"])?;
+            validate_id::<ItemId>(required(object, "itemId")?)
+        }
         _ => Err(unknown_input_variant()),
     })
 }
