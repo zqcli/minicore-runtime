@@ -151,6 +151,8 @@ pub(crate) enum SessionResidencySubmitError {
     ContextOverflow,
     #[error("the Submit was cancelled before Turn start")]
     Cancelled,
+    #[error("Session authority was revoked before Turn start")]
+    Unauthorized,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1858,6 +1860,7 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::InvalidArgument => SessionResidencySubmitError::InvalidArgument,
                 SessionSubmitError::ContextOverflow => SessionResidencySubmitError::ContextOverflow,
                 SessionSubmitError::Cancelled => SessionResidencySubmitError::Cancelled,
+                SessionSubmitError::SecurityRevoked => SessionResidencySubmitError::Unauthorized,
                 SessionSubmitError::InternalDispatchUnavailable => {
                     SessionResidencySubmitError::InternalDispatchUnavailable
                 }
