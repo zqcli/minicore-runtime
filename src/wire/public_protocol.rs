@@ -366,6 +366,25 @@ impl RuntimeCommandInput {
                     intent: value.intent.into_semantic(limits)?,
                 })
             }
+            Self::Turn(TurnCommandInput::Steer(value)) => {
+                RuntimeCommand::Turn(TurnCommand::Steer {
+                    session_id: value.session_id,
+                    expected_turn_id: value.expected_turn_id,
+                    intent: value.intent.into_semantic(limits)?,
+                })
+            }
+            Self::Turn(TurnCommandInput::FollowUp(value)) => {
+                RuntimeCommand::Turn(TurnCommand::FollowUp {
+                    session_id: value.session_id,
+                    intent: value.intent.into_semantic(limits)?,
+                })
+            }
+            Self::Turn(TurnCommandInput::CancelQueuedMessage(value)) => {
+                RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+                    session_id: value.session_id,
+                    target_command_id: value.target_command_id,
+                })
+            }
             Self::Turn(TurnCommandInput::Cancel(value)) => {
                 RuntimeCommand::Turn(TurnCommand::Cancel {
                     session_id: value.session_id,
@@ -2173,6 +2192,9 @@ impl TurnFailureOutput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum TurnCommandInput {
     Submit(SubmitCommandInput),
+    Steer(SteerCommandInput),
+    FollowUp(FollowUpCommandInput),
+    CancelQueuedMessage(CancelQueuedMessageCommandInput),
     Cancel(CancelCommandInput),
 }
 
@@ -2181,6 +2203,28 @@ enum TurnCommandInput {
 struct SubmitCommandInput {
     session_id: SessionId,
     intent: PromptIntentWireInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SteerCommandInput {
+    session_id: SessionId,
+    expected_turn_id: TurnId,
+    intent: PromptIntentWireInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FollowUpCommandInput {
+    session_id: SessionId,
+    intent: PromptIntentWireInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CancelQueuedMessageCommandInput {
+    session_id: SessionId,
+    target_command_id: CommandId,
 }
 
 #[derive(Deserialize)]
@@ -2310,6 +2354,30 @@ impl<'a> RuntimeCommandOutput<'a> {
                     intent: PromptIntentWireOutput::from_semantic(intent),
                 }))
             }
+            RuntimeCommand::Turn(TurnCommand::Steer {
+                session_id,
+                expected_turn_id,
+                intent,
+            }) => Self::Turn(TurnCommandOutput::Steer(SteerCommandOutput {
+                session_id: *session_id,
+                expected_turn_id: *expected_turn_id,
+                intent: PromptIntentWireOutput::from_semantic(intent),
+            })),
+            RuntimeCommand::Turn(TurnCommand::FollowUp { session_id, intent }) => {
+                Self::Turn(TurnCommandOutput::FollowUp(FollowUpCommandOutput {
+                    session_id: *session_id,
+                    intent: PromptIntentWireOutput::from_semantic(intent),
+                }))
+            }
+            RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+                session_id,
+                target_command_id,
+            }) => Self::Turn(TurnCommandOutput::CancelQueuedMessage(
+                CancelQueuedMessageCommandOutput {
+                    session_id: *session_id,
+                    target_command_id: *target_command_id,
+                },
+            )),
             RuntimeCommand::Turn(TurnCommand::Cancel { session_id, target }) => {
                 Self::Turn(TurnCommandOutput::Cancel(CancelCommandOutput {
                     session_id: *session_id,
@@ -2538,6 +2606,9 @@ impl<'a> NewSessionMetadataOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum TurnCommandOutput<'a> {
     Submit(SubmitCommandOutput<'a>),
+    Steer(SteerCommandOutput<'a>),
+    FollowUp(FollowUpCommandOutput<'a>),
+    CancelQueuedMessage(CancelQueuedMessageCommandOutput),
     Cancel(CancelCommandOutput),
 }
 
@@ -2546,6 +2617,28 @@ enum TurnCommandOutput<'a> {
 struct SubmitCommandOutput<'a> {
     session_id: SessionId,
     intent: PromptIntentWireOutput<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SteerCommandOutput<'a> {
+    session_id: SessionId,
+    expected_turn_id: TurnId,
+    intent: PromptIntentWireOutput<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FollowUpCommandOutput<'a> {
+    session_id: SessionId,
+    intent: PromptIntentWireOutput<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelQueuedMessageCommandOutput {
+    session_id: SessionId,
+    target_command_id: CommandId,
 }
 
 #[derive(Serialize)]
@@ -2667,6 +2760,9 @@ struct CommandOutputInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
     TurnStarted(TurnIdInput),
+    SteerQueued(TurnIdInput),
+    FollowUpQueued,
+    QueuedMessageCancelled,
     CommandOutput,
 }
 
@@ -2676,6 +2772,11 @@ impl CommandOutcomeInput {
             Self::TurnStarted(value) => CommandOutcome::TurnStarted {
                 turn_id: value.turn_id,
             },
+            Self::SteerQueued(value) => CommandOutcome::SteerQueued {
+                turn_id: value.turn_id,
+            },
+            Self::FollowUpQueued => CommandOutcome::FollowUpQueued,
+            Self::QueuedMessageCancelled => CommandOutcome::QueuedMessageCancelled,
             Self::CommandOutput => CommandOutcome::CommandOutput,
         }
     }
@@ -2938,6 +3039,9 @@ struct CommandOutputOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
     TurnStarted(TurnIdOutput),
+    SteerQueued(TurnIdOutput),
+    FollowUpQueued,
+    QueuedMessageCancelled,
     CommandOutput,
 }
 
@@ -2947,6 +3051,11 @@ impl CommandOutcomeOutput {
             CommandOutcome::TurnStarted { turn_id } => {
                 Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
             }
+            CommandOutcome::SteerQueued { turn_id } => {
+                Self::SteerQueued(TurnIdOutput { turn_id: *turn_id })
+            }
+            CommandOutcome::FollowUpQueued => Self::FollowUpQueued,
+            CommandOutcome::QueuedMessageCancelled => Self::QueuedMessageCancelled,
             CommandOutcome::CommandOutput => Self::CommandOutput,
         }
     }
@@ -3379,7 +3488,9 @@ fn validate_command_semantic_limits(
     limits: ProtocolLimits,
 ) -> Result<(), TypedJsonError> {
     match command {
-        RuntimeCommand::Turn(TurnCommand::Submit { intent, .. }) => {
+        RuntimeCommand::Turn(TurnCommand::Submit { intent, .. })
+        | RuntimeCommand::Turn(TurnCommand::Steer { intent, .. })
+        | RuntimeCommand::Turn(TurnCommand::FollowUp { intent, .. }) => {
             validate_skill_intent_count(
                 intent.skills().len(),
                 limits.prompt.max_skills_per_intent as usize,
@@ -3529,8 +3640,14 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "session_definition_updated"
         | "session_metadata_updated"
         | "session_forked"
-        | "steer_queued"
         | "cancel_accepted" => pending_output_object(data),
+        "steer_queued" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_id::<TurnId>(required(object, "turnId")?)
+        }
         "agent_deleted"
         | "session_loaded"
         | "session_unloaded"
@@ -3540,10 +3657,15 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "runtime_reloaded"
         | "workspace_reloaded"
         | "submit_cancelled"
-        | "follow_up_queued"
-        | "queued_message_cancelled"
         | "interaction_resolved"
         | "no_change" => pending_output_unit(data),
+        "follow_up_queued" | "queued_message_cancelled" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
         _ => Err(unknown_output_variant()),
     })
 }
@@ -5069,8 +5191,12 @@ fn nullable_string(node: &JsonNode) -> Result<Option<&str>, TypedJsonError> {
 fn validate_turn_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
     validate_adjacent_input(node, |kind, data| match kind {
         "submit" => validate_submit_command(data.ok_or_else(missing_required_field)?, limits),
+        "steer" => validate_steer_command(data.ok_or_else(missing_required_field)?, limits),
+        "follow_up" => validate_follow_up_command(data.ok_or_else(missing_required_field)?, limits),
+        "cancel_queued_message" => {
+            validate_cancel_queued_message_command(data.ok_or_else(missing_required_field)?)
+        }
         "cancel" => validate_cancel_command(data.ok_or_else(missing_required_field)?),
-        "steer" | "follow_up" | "cancel_queued_message" => pending_object(data),
         _ => Err(unknown_input_variant()),
     })
 }
@@ -5080,6 +5206,37 @@ fn validate_submit_command(node: &JsonNode, limits: ProtocolLimits) -> Result<()
     reject_unknown_fields(object.keys().map(AsRef::as_ref), &["sessionId", "intent"])?;
     validate_id::<SessionId>(required(object, "sessionId")?)?;
     validate_prompt_intent(required(object, "intent")?, limits)
+}
+
+fn validate_steer_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sessionId", "expectedTurnId", "intent"],
+    )?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_id::<TurnId>(required(object, "expectedTurnId")?)?;
+    validate_prompt_intent(required(object, "intent")?, limits)
+}
+
+fn validate_follow_up_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["sessionId", "intent"])?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_prompt_intent(required(object, "intent")?, limits)
+}
+
+fn validate_cancel_queued_message_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sessionId", "targetCommandId"],
+    )?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_id::<CommandId>(required(object, "targetCommandId")?)
 }
 
 fn validate_prompt_intent(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {

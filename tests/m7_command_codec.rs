@@ -1,8 +1,10 @@
-use minicore_runtime::prompt::PromptBodyIntent;
-use minicore_runtime::runtime_interface::{RuntimeCommand, RuntimeRequest, TurnCommand};
+use minicore_runtime::prompt::{PromptBodyIntent, PromptIntent, TextIntent};
+use minicore_runtime::runtime_interface::{
+    CommandRequest, RuntimeCommand, RuntimeRequest, TurnCommand,
+};
 use minicore_runtime::wire::{
-    IncrementalRuntimeProtocolV1, ProtocolLimits, ProtocolVersion, PublicDecodeCode,
-    PublicDecodeStage, RuntimeRequestKind, WireV1Codec,
+    CommandId, IncrementalRuntimeProtocolV1, ProtocolLimits, ProtocolVersion, PublicDecodeCode,
+    PublicDecodeStage, RuntimeRequestKind, SessionId, TurnId, WireV1Codec,
 };
 
 #[test]
@@ -88,6 +90,41 @@ fn prompt_decode_errors_do_not_expose_user_values() {
         .unwrap_err();
     assert!(!format!("{error:?}").contains("SECRET"));
     assert!(!error.to_string().contains("SECRET"));
+}
+
+#[test]
+fn queued_turn_commands_round_trip_through_the_public_codec() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let session_id: SessionId = "ses_22222222222222222222222222222222".parse().unwrap();
+    let turn_id: TurnId = "trn_33333333333333333333333333333333".parse().unwrap();
+    let target_command_id: CommandId = "cmd_44444444444444444444444444444444".parse().unwrap();
+    let intent = PromptIntent::new(
+        PromptBodyIntent::Text(TextIntent::new("queued input").unwrap()),
+        Vec::new(),
+    )
+    .unwrap();
+    let commands = [
+        RuntimeCommand::Turn(TurnCommand::Steer {
+            session_id,
+            expected_turn_id: turn_id,
+            intent: intent.clone(),
+        }),
+        RuntimeCommand::Turn(TurnCommand::FollowUp { session_id, intent }),
+        RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+            session_id,
+            target_command_id,
+        }),
+    ];
+
+    for (index, command) in commands.into_iter().enumerate() {
+        let command_id: CommandId = format!("cmd_{:032x}", index + 1).parse().unwrap();
+        let request = RuntimeRequest::Dispatch(CommandRequest::new(command_id, command));
+        let bytes = protocol.encode_request(&request).unwrap();
+        let decoded = protocol
+            .decode_request(RuntimeRequestKind::Dispatch, &bytes)
+            .unwrap();
+        assert_eq!(decoded, request);
+    }
 }
 
 fn assert_invalid_scalar(error: minicore_runtime::wire::TypedJsonError) {

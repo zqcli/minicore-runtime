@@ -8,9 +8,10 @@
 //! This module deliberately stops at the boundary between durable Session definitions, the
 //! Workspace resolver, replay-backed Ready+Idle installation, and a loaded [`SessionExecutor`].
 //! Conversation Storage retains semantic replay and recording ownership; this registry only keeps
-//! their prepared state/recorder alive through publication. It owns no public Runtime routing or
-//! Turn state. `RuntimeInner` retains this registry as one deep resource owner without making any
-//! residency permit, gate, executor, or task handle part of the Runtime interface.
+//! their prepared state/recorder alive through publication and routes owner-local Turn commands.
+//! It owns no public payload projection or Turn state. `RuntimeInner` retains this registry as one
+//! deep resource owner without making any residency permit, gate, executor, or task handle part
+//! of the Runtime interface.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -46,7 +47,8 @@ use crate::session_execution::{
     LoadedSessionConversation, SessionCancelError, SessionCancelTarget, SessionExecutor,
     SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorSnapshot,
     SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
-    SessionSubmitError, SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
+    SessionFollowUpError, SessionQueuedMessageError, SessionSteerError, SessionSubmitError,
+    SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
 };
 use crate::tools::ToolSet;
 use crate::wire::{CommandId, SessionDefinitionRevision, SessionId, Timestamp, TurnId};
@@ -169,6 +171,54 @@ pub(crate) enum SessionResidencyCancelError {
     TurnCancelling,
     #[error("the Turn is already terminal")]
     TurnTerminal,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyFollowUpError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session execution has no active Turn")]
+    TurnNotRunning,
+    #[error("the FollowUp command conflicts with an admitted command")]
+    CommandConflict,
+    #[error("the FollowUp queue is full")]
+    QueueFull,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencySteerError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session execution has no active Turn")]
+    TurnNotRunning,
+    #[error("the Turn is already cancelling")]
+    TurnCancelling,
+    #[error("the Steer target does not match the active Turn")]
+    ExpectedTurnMismatch,
+    #[error("the Steer command conflicts with an admitted command")]
+    CommandConflict,
+    #[error("the Steer queue is full")]
+    QueueFull,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyQueuedMessageError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("the queued message is not queued")]
+    NotQueued,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1810,6 +1860,95 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::Cancelled => SessionResidencySubmitError::Cancelled,
                 SessionSubmitError::InternalDispatchUnavailable => {
                     SessionResidencySubmitError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn follow_up(
+        &self,
+        session_id: SessionId,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<(), SessionResidencyFollowUpError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencyFollowUpError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencyFollowUpError::SessionNotLoaded)?;
+        executor
+            .follow_up(command_id, intent)
+            .await
+            .map_err(|error| match error {
+                SessionFollowUpError::Closing => SessionResidencyFollowUpError::Closing,
+                SessionFollowUpError::TurnNotRunning => {
+                    SessionResidencyFollowUpError::TurnNotRunning
+                }
+                SessionFollowUpError::CommandConflict => {
+                    SessionResidencyFollowUpError::CommandConflict
+                }
+                SessionFollowUpError::QueueFull => SessionResidencyFollowUpError::QueueFull,
+                SessionFollowUpError::InternalDispatchUnavailable => {
+                    SessionResidencyFollowUpError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn steer(
+        &self,
+        session_id: SessionId,
+        turn_id: TurnId,
+        command_id: CommandId,
+        intent: PromptIntent,
+    ) -> Result<(), SessionResidencySteerError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencySteerError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencySteerError::SessionNotLoaded)?;
+        executor
+            .steer(turn_id, command_id, intent)
+            .await
+            .map_err(|error| match error {
+                SessionSteerError::Closing => SessionResidencySteerError::Closing,
+                SessionSteerError::TurnNotRunning => SessionResidencySteerError::TurnNotRunning,
+                SessionSteerError::TurnCancelling => SessionResidencySteerError::TurnCancelling,
+                SessionSteerError::ExpectedTurnMismatch => {
+                    SessionResidencySteerError::ExpectedTurnMismatch
+                }
+                SessionSteerError::CommandConflict => SessionResidencySteerError::CommandConflict,
+                SessionSteerError::QueueFull => SessionResidencySteerError::QueueFull,
+                SessionSteerError::InternalDispatchUnavailable => {
+                    SessionResidencySteerError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn cancel_queued_message(
+        &self,
+        session_id: SessionId,
+        command_id: CommandId,
+    ) -> Result<(), SessionResidencyQueuedMessageError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencyQueuedMessageError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencyQueuedMessageError::SessionNotLoaded)?;
+        executor
+            .cancel_queued_message(command_id)
+            .await
+            .map_err(|error| match error {
+                SessionQueuedMessageError::Closing => SessionResidencyQueuedMessageError::Closing,
+                SessionQueuedMessageError::NotQueued => {
+                    SessionResidencyQueuedMessageError::NotQueued
+                }
+                SessionQueuedMessageError::InternalDispatchUnavailable => {
+                    SessionResidencyQueuedMessageError::InternalDispatchUnavailable
                 }
             })
     }

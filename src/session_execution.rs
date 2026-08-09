@@ -1200,9 +1200,8 @@ impl SessionExecutor {
         })
     }
 
-    /// Queues a FollowUp behind the active Turn.  The public command and snapshot projection are
-    /// intentionally deferred to the owning M9 slice; this seam only preserves bounded FIFO
-    /// admission and terminal handoff inside the Session actor.
+    /// Queues a FollowUp behind the active Turn.  Public Runtime routing is layered above this
+    /// owner-local seam; snapshot queue projection remains a separate read-model slice.
     pub(crate) async fn follow_up(
         &self,
         command_id: CommandId,
@@ -1238,9 +1237,9 @@ impl SessionExecutor {
         })
     }
 
-    /// Queues a Steer for the active Turn.  The public command and snapshot projection remain
-    /// outside this crate-private seam; consumption is performed by the active Turn worker at a
-    /// complete assistant/tool safe point.
+    /// Queues a Steer for the active Turn.  Public Runtime routing is layered above this
+    /// owner-local seam; consumption is performed by the active Turn worker at a complete
+    /// assistant/tool safe point.
     pub(crate) async fn steer(
         &self,
         turn_id: TurnId,
@@ -1278,8 +1277,9 @@ impl SessionExecutor {
         })
     }
 
-    /// Removes one admitted Steer or FollowUp by CommandId.  The public command and snapshot
-    /// projection remain outside this crate-private seam.
+    /// Removes one admitted Steer or FollowUp by CommandId.  Public Runtime routing is layered
+    /// above this owner-local seam; snapshot queue projection remains a separate read-model
+    /// slice.
     pub(crate) async fn cancel_queued_message(
         &self,
         command_id: CommandId,
