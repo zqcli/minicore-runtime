@@ -14,15 +14,17 @@ use crate::runtime_interface::{
     CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
     CommandRequest, CommandResponse, EventFrame, EventRoute, NewSessionDefinition,
     NewSessionMetadata, PublicCancelTarget, PublicIngressLane, PublicSubject, QueryResponse,
-    QueryResult, RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDiagnosticView,
-    RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView,
-    RuntimeView, SessionCommand, SessionDefinitionSummary, SessionDiagnosticView,
-    SessionEventDetail, SessionExecutionView, SessionMetadataView, SessionReadinessView,
-    SessionRecordingState, SessionRecordingView, SessionSnapshot, SessionStateEventKind,
-    SessionUsageView, SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg,
-    SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
-    validate_command_error_contract, validate_command_error_message, validate_command_output,
+    QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities,
+    RuntimeCommand, RuntimeDiagnosticView, RuntimeDispatchError, RuntimeLifecycleCommand,
+    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot,
+    RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
+    SessionDefinitionSummary, SessionDiagnosticView, SessionEventDetail, SessionExecutionView,
+    SessionMetadataView, SessionQueueView, SessionReadinessView, SessionRecordingState,
+    SessionRecordingView, SessionSnapshot, SessionStateEventKind, SessionUsageView,
+    SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg, SubmitAdmissionStateView,
+    SubmitAdmissionView, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
+    TurnTerminalView, validate_command_error_contract, validate_command_error_message,
+    validate_command_output,
 };
 use crate::skills::SkillId;
 use crate::workspace::{
@@ -944,21 +946,23 @@ impl SessionSnapshot {
         }
         if !matches!(value.load_state, SessionLoadStateInput::Loaded)
             || !matches!(value.readiness, SessionReadinessInput::Ready)
-            || !matches!(value.execution, SessionExecutionInput::Idle)
             || value.current_turn.is_some()
-            || !value.queues.is_idle_accepting()
         {
             return Err(TypedJsonError::PendingPublicTarget);
         }
+        let execution = value.execution.into_semantic();
+        let queues = value.queues.into_semantic(limits)?;
         let diagnostics = value
             .diagnostics
             .into_iter()
             .map(|diagnostic| diagnostic.into_session(limits))
             .collect::<Result<Vec<_>, _>>()?;
-        SessionSnapshot::new_loaded_ready_idle_with_limits(
+        SessionSnapshot::new_loaded_ready_with_limits(
             value.session_id,
             value.metadata.into_semantic(limits)?,
             value.definition.into_semantic(limits)?,
+            execution,
+            queues,
             value.recording.into_semantic(),
             value
                 .usage
@@ -989,18 +993,91 @@ enum SessionLoadStateInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionQueueInput {
-    submit_admissions: EmptyObservationListInput,
-    steers: EmptyObservationListInput,
-    follow_ups: EmptyObservationListInput,
+    submit_admissions: Vec<SubmitAdmissionInput>,
+    steers: Vec<QueuedSteerInput>,
+    follow_ups: Vec<QueuedFollowUpInput>,
     accepting_input: bool,
 }
 
 impl SessionQueueInput {
-    fn is_idle_accepting(&self) -> bool {
-        self.submit_admissions.confirm_empty();
-        self.steers.confirm_empty();
-        self.follow_ups.confirm_empty();
-        self.accepting_input
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionQueueView, TypedJsonError> {
+        let submit_admissions = self
+            .submit_admissions
+            .into_iter()
+            .map(SubmitAdmissionInput::into_semantic)
+            .collect();
+        let steers = self
+            .steers
+            .into_iter()
+            .map(QueuedSteerInput::into_semantic)
+            .collect();
+        let follow_ups = self
+            .follow_ups
+            .into_iter()
+            .map(QueuedFollowUpInput::into_semantic)
+            .collect();
+        SessionQueueView::new_with_limits(
+            submit_admissions,
+            steers,
+            follow_ups,
+            self.accepting_input,
+            limits,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SubmitAdmissionInput {
+    command_id: CommandId,
+    state: SubmitAdmissionStateInput,
+}
+
+impl SubmitAdmissionInput {
+    const fn into_semantic(self) -> SubmitAdmissionView {
+        SubmitAdmissionView::new(self.command_id, self.state.into_semantic())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SubmitAdmissionStateInput {
+    Queued,
+    Starting,
+}
+
+impl SubmitAdmissionStateInput {
+    const fn into_semantic(self) -> SubmitAdmissionStateView {
+        match self {
+            Self::Queued => SubmitAdmissionStateView::Queued,
+            Self::Starting => SubmitAdmissionStateView::Starting,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueuedSteerInput {
+    command_id: CommandId,
+    expected_turn_id: TurnId,
+}
+
+impl QueuedSteerInput {
+    const fn into_semantic(self) -> QueuedSteerView {
+        QueuedSteerView::new(self.command_id, self.expected_turn_id)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct QueuedFollowUpInput {
+    command_id: CommandId,
+}
+
+impl QueuedFollowUpInput {
+    const fn into_semantic(self) -> QueuedFollowUpView {
+        QueuedFollowUpView::new(self.command_id)
     }
 }
 
@@ -1731,12 +1808,7 @@ impl<'a> SessionSnapshotOutput<'a> {
             current_turn: None,
             active_items: EmptyObservationListOutput,
             pending_interactions: EmptyObservationListOutput,
-            queues: SessionQueueOutput {
-                submit_admissions: EmptyObservationListOutput,
-                steers: EmptyObservationListOutput,
-                follow_ups: EmptyObservationListOutput,
-                accepting_input: true,
-            },
+            queues: SessionQueueOutput::from_semantic(value.queues()),
             recording: SessionRecordingOutput::from_semantic(value.recording()),
             usage: value.usage().map(SessionUsageOutput::from_semantic),
             diagnostics: value
@@ -1875,10 +1947,98 @@ impl<'a> WorkspaceRootSummaryOutput<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionQueueOutput {
-    submit_admissions: EmptyObservationListOutput,
-    steers: EmptyObservationListOutput,
-    follow_ups: EmptyObservationListOutput,
+    submit_admissions: Vec<SubmitAdmissionOutput>,
+    steers: Vec<QueuedSteerOutput>,
+    follow_ups: Vec<QueuedFollowUpOutput>,
     accepting_input: bool,
+}
+
+impl SessionQueueOutput {
+    fn from_semantic(value: &SessionQueueView) -> Self {
+        Self {
+            submit_admissions: value
+                .submit_admissions()
+                .iter()
+                .copied()
+                .map(SubmitAdmissionOutput::from_semantic)
+                .collect(),
+            steers: value
+                .steers()
+                .iter()
+                .copied()
+                .map(QueuedSteerOutput::from_semantic)
+                .collect(),
+            follow_ups: value
+                .follow_ups()
+                .iter()
+                .copied()
+                .map(QueuedFollowUpOutput::from_semantic)
+                .collect(),
+            accepting_input: value.accepting_input(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SubmitAdmissionOutput {
+    command_id: CommandId,
+    state: SubmitAdmissionStateOutput,
+}
+
+impl SubmitAdmissionOutput {
+    const fn from_semantic(value: SubmitAdmissionView) -> Self {
+        Self {
+            command_id: value.command_id(),
+            state: SubmitAdmissionStateOutput::from_semantic(value.state()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SubmitAdmissionStateOutput {
+    Queued,
+    Starting,
+}
+
+impl SubmitAdmissionStateOutput {
+    const fn from_semantic(value: SubmitAdmissionStateView) -> Self {
+        match value {
+            SubmitAdmissionStateView::Queued => Self::Queued,
+            SubmitAdmissionStateView::Starting => Self::Starting,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedSteerOutput {
+    command_id: CommandId,
+    expected_turn_id: TurnId,
+}
+
+impl QueuedSteerOutput {
+    const fn from_semantic(value: QueuedSteerView) -> Self {
+        Self {
+            command_id: value.command_id(),
+            expected_turn_id: value.expected_turn_id(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedFollowUpOutput {
+    command_id: CommandId,
+}
+
+impl QueuedFollowUpOutput {
+    const fn from_semantic(value: QueuedFollowUpView) -> Self {
+        Self {
+            command_id: value.command_id(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -3979,8 +4139,9 @@ fn validate_session_snapshot_shape(
         _ => return Err(unknown_output_variant()),
     }
 
-    // Known future snapshots are classified from their outer shape only.  Do not
-    // enter the item, interaction, queue, or diagnostic payloads on that path.
+    // Known future snapshots are classified from their outer shape only. Queue
+    // targets are active in this slice; item, interaction, and diagnostic payloads
+    // remain pending and are not entered on that path.
     required(object, "metadata")?
         .as_object()
         .ok_or_else(selected_wrong_json_type)?;
@@ -3997,7 +4158,7 @@ fn validate_session_snapshot_shape(
         _ => return Err(unknown_output_variant()),
     };
     let ready = validate_readiness(required(object, "readiness")?)?;
-    let execution = validate_execution(required(object, "execution")?)?;
+    let _execution = validate_execution(required(object, "execution")?)?;
 
     let current_turn_pending = match object.get("currentTurn") {
         None | Some(JsonNode::Null) => false,
@@ -4017,7 +4178,7 @@ fn validate_session_snapshot_shape(
         .ok_or_else(selected_wrong_json_type)?;
     let pending_interactions_pending = !pending_interactions.is_empty();
 
-    let queues_pending = validate_session_queues_shape(required(object, "queues")?)?;
+    validate_session_queues_shape(required(object, "queues")?)?;
     let recording_healthy = validate_recording(required(object, "recording")?)?;
     let recording_pending = !recording_healthy;
     let diagnostics_pending =
@@ -4025,11 +4186,9 @@ fn validate_session_snapshot_shape(
 
     let other_fields_pending = load_pending
         || !ready
-        || execution != "idle"
         || current_turn_pending
         || active_items_pending
         || pending_interactions_pending
-        || queues_pending
         || recording_pending
         || diagnostics_pending;
     let usage_pending = match object.get("usage") {
@@ -4266,8 +4425,12 @@ fn validate_recording(node: &JsonNode) -> Result<bool, TypedJsonError> {
     }
 }
 
-fn validate_session_queues_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
+fn validate_session_queues_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["submitAdmissions", "steers", "followUps", "acceptingInput"],
+    )?;
     let submit = required(object, "submitAdmissions")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
@@ -4281,7 +4444,34 @@ fn validate_session_queues_shape(node: &JsonNode) -> Result<bool, TypedJsonError
         JsonNode::Bool(value) => *value,
         _ => return Err(typed_wrong_json_type()),
     };
-    Ok(!submit.is_empty() || !steers.is_empty() || !follow_ups.is_empty() || !accepting)
+    let _ = accepting;
+    for entry in submit {
+        let entry = entry.as_object().ok_or_else(selected_wrong_json_type)?;
+        reject_unknown_fields(entry.keys().map(AsRef::as_ref), &["commandId", "state"])?;
+        validate_id::<CommandId>(required(entry, "commandId")?)?;
+        match required(entry, "state")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+        {
+            "queued" | "starting" => {}
+            _ => return Err(unknown_output_variant()),
+        }
+    }
+    for entry in steers {
+        let entry = entry.as_object().ok_or_else(selected_wrong_json_type)?;
+        reject_unknown_fields(
+            entry.keys().map(AsRef::as_ref),
+            &["commandId", "expectedTurnId"],
+        )?;
+        validate_id::<CommandId>(required(entry, "commandId")?)?;
+        validate_id::<TurnId>(required(entry, "expectedTurnId")?)?;
+    }
+    for entry in follow_ups {
+        let entry = entry.as_object().ok_or_else(selected_wrong_json_type)?;
+        reject_unknown_fields(entry.keys().map(AsRef::as_ref), &["commandId"])?;
+        validate_id::<CommandId>(required(entry, "commandId")?)?;
+    }
+    Ok(())
 }
 
 fn validate_session_usage_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
@@ -4884,6 +5074,10 @@ fn validate_session_snapshot_semantic_limits(
             > usize::try_from(limits.workspace.max_relative_path_bytes).unwrap_or(usize::MAX)
         || snapshot.definition().prompts().enabled().len()
             > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX)
+        || snapshot.queues().submit_admissions().len()
+            > usize::from(limits.queues.max_submit_admissions)
+        || snapshot.queues().steers().len() > usize::from(limits.queues.max_steers)
+        || snapshot.queues().follow_ups().len() > usize::from(limits.queues.max_follow_ups)
         || snapshot.diagnostics().len() > usize::from(limits.observation.max_snapshot_diagnostics)
     {
         return Err(invalid_scalar());

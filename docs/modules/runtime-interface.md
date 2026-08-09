@@ -1551,7 +1551,7 @@ pub enum SnapshotResponse {
 }
 ```
 
-`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。M2 incremental codec当前只materialize `Open + Loaded + Ready + Idle`、`currentTurn = null`、empty Item/Interaction/queue、`Healthy` recording、zero/none usage与empty diagnostics的safe baseline；Starting/Running/Finishing、non-empty observation collections、Degraded recording、non-zero usage与diagnostic projection由M8–M10 owners补齐，在此之前作为known pending target处理。
+`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。当前 incremental codec materialize `Open + Loaded + Ready` 的 Idle baseline，以及 M9.18 已激活的 Starting/Running/Finishing queue projection（`currentTurn = null`、active Items/Pending Interaction仍为空、recording 为 `Healthy`、usage 为 zero/none、diagnostics 为空）；current Turn、non-empty Item/Interaction、Degraded recording、non-zero usage与diagnostic projection仍由后续 owners补齐，并继续作为known pending target处理。
 
 ### RuntimeSnapshot
 
