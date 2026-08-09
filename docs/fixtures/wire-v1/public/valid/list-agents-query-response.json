@@ -1,0 +1,1 @@
+{"data":{"type":"agent","data":{"type":"agents","data":{"items":[{"agentId":"agt_11111111111111111111111111111111","definitionRevision":"ar_1","metadata":{"revision":"amr_1","name":"Planner","description":null,"updatedAt":"2026-08-03T10:00:00.123Z"},"status":"enabled","createdAt":"2026-08-03T10:00:00.123Z"}],"nextCursor":null}}}}

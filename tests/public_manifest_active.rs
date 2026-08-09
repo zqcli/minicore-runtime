@@ -5,7 +5,7 @@ use minicore_runtime::agent_session_lifecycle::{ForkAnchor, ForkSourceKind};
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
     CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
-    PublicCancelTarget, PublicSubject, RetryAdvice, RuntimeCommand, RuntimeRequest,
+    PublicCancelTarget, PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand, RuntimeRequest,
     RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionStateEventKind,
     SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView, TurnInterruptionView,
     TurnStatusView, TurnTerminalView,
@@ -169,6 +169,7 @@ fn run_active_vector(vector: &PublicVector) {
         "SubscriptionRequest" => run_request(vector, RuntimeRequestKind::Subscribe),
         "QueryResponse" => run_query_response(vector),
         "RuntimeDispatchError" => run_runtime_dispatch_error(vector),
+        "QueryError" => run_query_error(vector),
         "EventFrame" => run_event_frame(vector),
         "CanonicalFileUriVectorSet" => run_file_uri_vectors(vector),
         "ProtocolNegotiationCaseSet" => run_negotiation_vectors(vector),
@@ -605,6 +606,23 @@ fn run_runtime_dispatch_error(vector: &PublicVector) {
     let error = protocol.decode_runtime_dispatch_error(&raw).unwrap();
     assert_eq!(
         protocol.encode_runtime_dispatch_error(error).unwrap(),
+        canonical_target(vector, &raw),
+        "{}",
+        vector.path,
+    );
+}
+
+fn run_query_error(vector: &PublicVector) {
+    assert_eq!(vector.direction, VectorDirection::RuntimeToClient);
+    assert_eq!(vector.expected.decode, "accepted");
+    let raw = read_fixture(&vector.path);
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let error = protocol.decode_query_error(&raw).unwrap();
+    assert_eq!(error.code(), QueryErrorCode::StaleCursor);
+    assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
+    assert!(error.subject().is_none());
+    assert_eq!(
+        protocol.encode_query_error(&error).unwrap(),
         canonical_target(vector, &raw),
         "{}",
         vector.path,
