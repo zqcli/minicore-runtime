@@ -1,6 +1,6 @@
 # Session Execution 架构设计
 
-状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn、M8 Tool/Interaction/Cancel与M9.1–M9.21当前control/observation范围已接通，包括queue/Steer/FollowUp、logical retry、EmergencyControl/SecurityRevoked、public command/outcome、Starting/Running/Finishing Snapshot、`session_execution_changed`与terminal StateEvent；current Turn/active Item/Pending Interaction安全摘要、usage read model与Degraded recording/diagnostics projection已接通；具体Prompt/Skill source adapter、完整Tool policy/approval、Compaction及grace/cancel式active-Turn Unload仍后置）
+状态：当前权威架构（ADR 0137后；loaded Ready+Idle `SessionExecutor`、Runtime-owned residency actor、single-flight Load、draining Unload、lifecycle exclusion、unified loaded/unloaded Workspace update、Workspace Prompt candidate capture及replay/Recorder-backed hydration已实现；M7 ordinary Turn、M8 Tool/Interaction/Cancel、M9.1–M9.21当前control/observation范围及M10完整Compaction vertical slice已接通，包括queue/Steer/FollowUp、logical retry、EmergencyControl/SecurityRevoked、public command/outcome、Starting/Running/Finishing Snapshot、`session_execution_changed`与terminal StateEvent；current Turn/active Item/Pending Interaction安全摘要、usage read model与Degraded recording/diagnostics projection已接通；具体Prompt/Skill source adapter、完整Tool policy/approval及grace/cancel式active-Turn Unload仍后置）
 日期：2026-07-31
 
 M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items 与 Pending Interaction 的最小安全摘要，并与 Running/approval Wire V1 fixtures 对齐。
@@ -9,7 +9,7 @@ M9 当前补充：Session Snapshot 已公开投影 current Turn、active Items �
 
 本文定义loaded Session的control actor、ActiveTurnTask、async run loop、SessionIngress、Steer/FollowUp、Cancel、Interaction routing、logical retry和restart行为。
 
-当前实现进度：M9.21 在 M9.20 之后，将首次进入 `Finishing` 的 execution transition 从 Executor 映射为 public `session_execution_changed` StateEvent，并接入 Wire V1 canonical input/output、Session route/快照一致性校验及 active manifest fixture；后续 terminal event 保持原有语义。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1；完整 Tool policy/approval 与 Compaction 仍后置。
+当前实现进度：M10已在M9 control/observation基础上接通proactive/Prompt/provider overflow、CompactionSummary至多一次logical retry、exact control/plan/request arbitration、live Replace、same-Arc inline record、post-compaction Steer safe point、`Compacting` phase及Snapshot usage/recording refresh。M9.18 的 `SessionQueueView` 仍保留 lane-local FIFO、exact `CommandId`/expected `TurnId` 和 `acceptingInput`，不携带 queued intent 正文。current Turn、active Items 与 Pending Interaction 已以最小安全摘要接入 Session Snapshot/Wire V1；完整 Tool policy/approval仍后置。
 
 核心目标：
 

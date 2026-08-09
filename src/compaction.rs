@@ -13,12 +13,31 @@ use crate::model_gateway::{
     TurnModelRef, TurnModelSnapshot,
 };
 use crate::prompt::{
-    AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessage,
+    AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessage, ModelMessageRef,
 };
+use crate::tools::ToolResultContent;
 use crate::wire::lexical::validate_safe_text;
 use crate::wire::{EntryId, SessionId};
 
 pub(crate) const MAX_STORED_COMPACTION_SUMMARY_BYTES: usize = 65_536;
+const COMPACTION_TOOL_RESULT_REDUCTION_THRESHOLD_BYTES: usize = 16 * 1_024;
+const COMPACTION_TOOL_RESULT_REDUCTION_HEAD_BYTES: usize = 4 * 1_024;
+const COMPACTION_TOOL_RESULT_REDUCTION_TAIL_BYTES: usize = 4 * 1_024;
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionSummaryFormatVersion {
+    V1 = 1,
+}
+
+const COMPACTION_SUMMARY_FORMAT_VERSION: CompactionSummaryFormatVersion =
+    CompactionSummaryFormatVersion::V1;
+
+impl CompactionSummaryFormatVersion {
+    const fn number(self) -> u8 {
+        self as u8
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompactionSettings {
@@ -561,6 +580,7 @@ pub(crate) enum CompactionErrorReason {
     NoFeasibleSummaryBudget,
     NoFeasiblePostReplace,
     InsufficientReclaim,
+    InvalidSummarySourceReduction,
     InvalidSummary,
 }
 
@@ -757,17 +777,28 @@ impl Compaction {
                 .max(input.model.agent_run_output_reserve_tokens())
                 .get(),
         );
-        let mut summarized_tokens = 0_u64;
+        let mut reduced_units = Vec::new();
+        let mut summarized_original_tokens = 0_u64;
+        let mut summarized_reduced_tokens = 0_u64;
         let mut saw_summary_budget = false;
         let mut saw_post_replace_fit = false;
 
         for (index, unit_estimate) in unit_estimates.iter().enumerate() {
-            summarized_tokens = summarized_tokens
+            let reduced_messages = reduce_summary_unit(&input.source.units()[index])?;
+            let reduced_unit_estimate =
+                estimate_summary_unit(&reduced_messages, input.model.estimator()).ok_or_else(
+                    || CompactionError::new(CompactionErrorReason::ArithmeticOverflow),
+                )?;
+            reduced_units.push(reduced_messages);
+            summarized_original_tokens = summarized_original_tokens
                 .checked_add(*unit_estimate)
+                .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+            summarized_reduced_tokens = summarized_reduced_tokens
+                .checked_add(reduced_unit_estimate)
                 .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
             let available_output = context_window
                 .checked_sub(input.summary_assembly.fixed_prompt_tokens())
-                .and_then(|available| available.checked_sub(summarized_tokens))
+                .and_then(|available| available.checked_sub(summarized_reduced_tokens))
                 .and_then(|available| available.checked_sub(directive_tokens))
                 .and_then(|available| {
                     available.checked_sub(u64::from(
@@ -793,7 +824,7 @@ impl Compaction {
             saw_summary_budget = true;
 
             let retained_tokens = stable_tokens
-                .checked_sub(summarized_tokens)
+                .checked_sub(summarized_original_tokens)
                 .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
             let estimated_after_upper_bound_tokens = input
                 .agent_run
@@ -822,9 +853,9 @@ impl Compaction {
 
             let summarized_unit_count = NonZeroUsize::new(index + 1)
                 .expect("candidate iteration always produces a non-zero cut");
-            let messages: Arc<[ModelMessage]> = input.source.units()[..summarized_unit_count.get()]
+            let messages: Arc<[ModelMessage]> = reduced_units[..summarized_unit_count.get()]
                 .iter()
-                .flat_map(|unit| unit.messages().iter().cloned())
+                .flat_map(|messages| messages.iter().cloned())
                 .collect::<Vec<_>>()
                 .into();
             return Ok(Arc::new(CompactionPlan {
@@ -839,7 +870,7 @@ impl Compaction {
                 directive,
                 budget: CompactionSummaryBudget {
                     fixed_prompt_tokens: input.summary_assembly.fixed_prompt_tokens(),
-                    reduced_source_tokens: summarized_tokens,
+                    reduced_source_tokens: summarized_reduced_tokens,
                     directive_tokens,
                     safety_reserve_tokens: input.settings.summary_safety_reserve_tokens(),
                     max_output_tokens,
@@ -934,6 +965,134 @@ fn estimate_stable_units(
             })
         })
         .collect()
+}
+
+fn reduce_summary_unit(unit: &LiveCompactionUnit) -> Result<Arc<[ModelMessage]>, CompactionError> {
+    unit.messages()
+        .iter()
+        .map(reduce_summary_message)
+        .collect::<Result<Vec<_>, _>>()
+        .map(Arc::from)
+}
+
+fn estimate_summary_unit(messages: &[ModelMessage], estimator: TokenEstimator) -> Option<u64> {
+    messages.iter().try_fold(0_u64, |total, message| {
+        total.checked_add(message.compaction_estimated_tokens(estimator)?)
+    })
+}
+
+fn reduce_summary_message(message: &ModelMessage) -> Result<ModelMessage, CompactionError> {
+    let ModelMessageRef::Tool {
+        tool_call_id,
+        content,
+    } = message.as_ref()
+    else {
+        return Ok(message.clone());
+    };
+    let original_bytes = content.parts().iter().try_fold(0_usize, |total, part| {
+        total.checked_add(part.as_text().len())
+    });
+    let Some(original_bytes) = original_bytes else {
+        return Err(CompactionError::new(
+            CompactionErrorReason::ArithmeticOverflow,
+        ));
+    };
+    if original_bytes <= COMPACTION_TOOL_RESULT_REDUCTION_THRESHOLD_BYTES {
+        return Ok(message.clone());
+    }
+
+    let (head, head_bytes) = tool_result_head(content, COMPACTION_TOOL_RESULT_REDUCTION_HEAD_BYTES);
+    let (tail, tail_bytes) = tool_result_tail(content, COMPACTION_TOOL_RESULT_REDUCTION_TAIL_BYTES);
+    let kept_bytes = head_bytes
+        .checked_add(tail_bytes)
+        .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+    let omitted_bytes = original_bytes
+        .checked_sub(kept_bytes)
+        .ok_or_else(|| CompactionError::new(CompactionErrorReason::ArithmeticOverflow))?;
+    let metadata = format!(
+        "[minicore_compaction_tool_result]\nformat_version={}\noriginal_bytes={original_bytes}\nomitted_bytes={omitted_bytes}",
+        COMPACTION_SUMMARY_FORMAT_VERSION.number(),
+    );
+    let reduced = ToolResultContent::from_text_parts(vec![
+        metadata,
+        format!("[head]\n{head}"),
+        format!("[tail]\n{tail}"),
+    ])
+    .map_err(|_| CompactionError::new(CompactionErrorReason::InvalidSummarySourceReduction))?;
+    Ok(ModelMessage::tool_result(tool_call_id.clone(), reduced))
+}
+
+fn tool_result_head(content: &ToolResultContent, maximum_bytes: usize) -> (String, usize) {
+    let mut output = String::new();
+    let mut kept = 0_usize;
+    for (index, part) in content.parts().iter().enumerate() {
+        let remaining = maximum_bytes.saturating_sub(kept);
+        if remaining == 0 {
+            break;
+        }
+        let text = part.as_text();
+        let prefix = utf8_prefix(text, remaining);
+        if !prefix.is_empty() {
+            append_tool_result_part(&mut output, index, prefix);
+            kept += prefix.len();
+        }
+        if prefix.len() < text.len() {
+            break;
+        }
+    }
+    (output, kept)
+}
+
+fn tool_result_tail(content: &ToolResultContent, maximum_bytes: usize) -> (String, usize) {
+    let mut kept = 0_usize;
+    let mut segments = Vec::new();
+    for (index, part) in content.parts().iter().enumerate().rev() {
+        let remaining = maximum_bytes.saturating_sub(kept);
+        if remaining == 0 {
+            break;
+        }
+        let text = part.as_text();
+        let suffix = utf8_suffix(text, remaining);
+        if !suffix.is_empty() {
+            segments.push((index, suffix));
+            kept += suffix.len();
+        }
+        if suffix.len() < text.len() {
+            break;
+        }
+    }
+    segments.reverse();
+    let mut output = String::new();
+    for (index, suffix) in segments {
+        append_tool_result_part(&mut output, index, suffix);
+    }
+    (output, kept)
+}
+
+fn append_tool_result_part(output: &mut String, index: usize, text: &str) {
+    if !output.is_empty() {
+        output.push('\n');
+    }
+    output.push_str("[part=");
+    output.push_str(&index.to_string());
+    output.push_str("]\n");
+    output.push_str(text);
+}
+
+fn utf8_prefix(text: &str, maximum_bytes: usize) -> &str {
+    let mut end = text.len().min(maximum_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn utf8_suffix(text: &str, maximum_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(maximum_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 pub(crate) struct ValidatedCompactionSummary {
@@ -1233,8 +1392,11 @@ mod tests {
         TurnModelSnapshot,
     };
     use crate::prompt::{
-        AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessageRef,
+        AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelAssistantContent,
+        ModelAssistantContentRef, ModelMessageRef,
     };
+    use crate::tools::{ToolCallId, ToolName, ToolResultContent};
+    use crate::wire::BoundedJsonObject;
 
     fn entry_id(value: &str) -> EntryId {
         value.parse().expect("test entry IDs are valid")
@@ -1250,6 +1412,16 @@ mod tests {
 
     fn unit(first_entry_id: EntryId, kind: CompactionUnitKind, text: &str) -> LiveCompactionUnit {
         PreparedLiveCompactionUnit::for_live_reducer(kind, Arc::from([model_message(text)]))
+            .expect("test unit is valid")
+            .bind_origin(first_entry_id)
+    }
+
+    fn unit_with_messages(
+        first_entry_id: EntryId,
+        kind: CompactionUnitKind,
+        messages: Vec<ModelMessage>,
+    ) -> LiveCompactionUnit {
+        PreparedLiveCompactionUnit::for_live_reducer(kind, messages.into())
             .expect("test unit is valid")
             .bind_origin(first_entry_id)
     }
@@ -1525,6 +1697,194 @@ mod tests {
         assert_eq!(plan.estimated_before_tokens(), 343);
         assert_eq!(plan.estimated_after_upper_bound_tokens(), 192);
         assert_eq!(plan.estimated_reclaimed_tokens(), 151);
+    }
+
+    #[test]
+    fn plan_deterministically_reduces_large_tool_results_only_in_summary_source() {
+        let tool_call_id: ToolCallId = "call_large_result".parse().unwrap();
+        let tool_name: ToolName = "inspect".parse().unwrap();
+        let large_result = vec![
+            format!("HEAD:{}", "x".repeat(49_995)),
+            "x".repeat(50_000),
+            "x".repeat(50_000),
+            format!("{}:TAIL", "x".repeat(49_995)),
+        ];
+        let original_bytes = large_result.iter().map(String::len).sum::<usize>();
+        let assistant = ModelMessage::assistant(Arc::from([ModelAssistantContent::tool_call(
+            tool_call_id.clone(),
+            tool_name,
+            BoundedJsonObject::from_slice(br#"{}"#).unwrap(),
+        )]))
+        .unwrap();
+        let tool = ModelMessage::tool_result(
+            tool_call_id.clone(),
+            ToolResultContent::from_text_parts(large_result.clone()).unwrap(),
+        );
+        let source = Arc::new(source(
+            session_id("ses_11111111111111111111111111111111"),
+            Arc::from([
+                unit_with_messages(
+                    entry_id("ent_11111111111111111111111111111111"),
+                    CompactionUnitKind::ToolExchange,
+                    vec![assistant, tool],
+                ),
+                unit(
+                    entry_id("ent_22222222222222222222222222222222"),
+                    CompactionUnitKind::UserMessage,
+                    "retained suffix",
+                ),
+            ]),
+        ));
+        let snapshot = TurnModelSnapshot::test_fixture_with_policy(
+            NonZeroU32::new(50_000),
+            NonZeroU32::new(512),
+            NonZeroU32::new(12).unwrap(),
+            NonZeroU32::new(1).unwrap(),
+        );
+        let model = CompactionModelBasis::from_turn_model(&snapshot);
+        let input = || CompactionPlanInput {
+            source: Arc::clone(&source),
+            settings: CompactionSettings {
+                enabled: true,
+                pressure_reserve_tokens: NonZeroU32::new(512).unwrap(),
+                summary_min_output_tokens: NonZeroU32::new(128).unwrap(),
+                summary_max_output_tokens: NonZeroU32::new(512).unwrap(),
+                minimum_reclaimed_tokens: NonZeroU32::new(1).unwrap(),
+                max_compactions_per_turn: NonZeroU8::new(2).unwrap(),
+                summary_safety_reserve_tokens: NonZeroU32::new(128).unwrap(),
+            }
+            .validate()
+            .unwrap(),
+            agent_run: AgentRunCompactionAssemblyBasis::for_test(10, 31, model.estimator()),
+            summary_assembly: CompactionSummaryAssemblyBasis::for_test(20, model.estimator()),
+            model: model.clone(),
+            trigger: CompactionTrigger::ProviderContextOverflow,
+            compactions_started: 0,
+        };
+
+        let first = Compaction.plan(input()).unwrap();
+        let second = Compaction.plan(input()).unwrap();
+        assert_eq!(first.summarized_unit_count().get(), 1);
+        assert_eq!(first.summary_source().messages().len(), 2);
+        assert_eq!(
+            first.budget().reduced_source_tokens(),
+            second.budget().reduced_source_tokens()
+        );
+        assert!(
+            first
+                .summary_source()
+                .messages()
+                .iter()
+                .zip(second.summary_source().messages())
+                .all(|(left, right)| left.as_ref() == right.as_ref())
+        );
+
+        match first.summary_source().messages()[0].as_ref() {
+            ModelMessageRef::Assistant { content } => match content[0].as_ref() {
+                ModelAssistantContentRef::ToolCall {
+                    tool_call_id: reduced_id,
+                    name,
+                    ..
+                } => {
+                    assert_eq!(reduced_id, &tool_call_id);
+                    assert_eq!(name.as_str(), "inspect");
+                }
+                _ => panic!("the reduced exchange must retain the original ToolCall"),
+            },
+            _ => panic!("the reduced exchange must retain the Assistant message"),
+        }
+        match first.summary_source().messages()[1].as_ref() {
+            ModelMessageRef::Tool {
+                tool_call_id: reduced_id,
+                content,
+            } => {
+                assert_eq!(reduced_id, &tool_call_id);
+                assert_eq!(content.parts().len(), 3);
+                let header = content.parts()[0].as_text();
+                assert!(header.contains("format_version=1"));
+                assert!(header.contains(&format!("original_bytes={original_bytes}")));
+                assert!(header.contains("omitted_bytes="));
+                assert!(content.parts()[1].as_text().contains("HEAD:"));
+                assert!(content.parts()[2].as_text().ends_with(":TAIL"));
+            }
+            _ => panic!("the reduced exchange must retain a Tool result message"),
+        }
+
+        match source.units()[0].messages()[1].as_ref() {
+            ModelMessageRef::Tool { content, .. } => {
+                assert_eq!(content.parts().len(), 4);
+                assert_eq!(
+                    content
+                        .parts()
+                        .iter()
+                        .map(|part| part.as_text().to_owned())
+                        .collect::<Vec<_>>(),
+                    large_result
+                );
+            }
+            _ => panic!("the live source must remain unchanged"),
+        }
+    }
+
+    #[test]
+    fn tool_result_reduction_threshold_and_utf8_boundaries_are_stable() {
+        let tool_call_id: ToolCallId = "call_threshold".parse().unwrap();
+        let at_threshold = ModelMessage::tool_result(
+            tool_call_id.clone(),
+            ToolResultContent::from_text_parts(vec![
+                "x".repeat(COMPACTION_TOOL_RESULT_REDUCTION_THRESHOLD_BYTES),
+            ])
+            .unwrap(),
+        );
+        let unchanged = reduce_summary_message(&at_threshold).unwrap();
+        assert_eq!(unchanged.as_ref(), at_threshold.as_ref());
+
+        let unicode = "é".repeat(
+            COMPACTION_TOOL_RESULT_REDUCTION_THRESHOLD_BYTES
+                .checked_div("é".len())
+                .unwrap()
+                + 1,
+        );
+        let expected_omitted = unicode.len()
+            - COMPACTION_TOOL_RESULT_REDUCTION_HEAD_BYTES
+            - COMPACTION_TOOL_RESULT_REDUCTION_TAIL_BYTES;
+        let above_threshold = ModelMessage::tool_result(
+            tool_call_id,
+            ToolResultContent::from_text_parts(vec![unicode]).unwrap(),
+        );
+        let reduced = reduce_summary_message(&above_threshold).unwrap();
+        match reduced.as_ref() {
+            ModelMessageRef::Tool { content, .. } => {
+                assert_eq!(content.parts().len(), 3);
+                assert!(content.parts()[1].as_text().ends_with('é'));
+                assert!(content.parts()[2].as_text().ends_with('é'));
+                assert!(
+                    content.parts()[0]
+                        .as_text()
+                        .contains(&format!("omitted_bytes={expected_omitted}"))
+                );
+            }
+            _ => panic!("a reduced Tool result must retain the Tool role"),
+        }
+
+        let split_boundaries = ModelMessage::tool_result(
+            "call_split_boundary".parse().unwrap(),
+            ToolResultContent::from_text_parts(vec![
+                format!("{}🦀", "h".repeat(4_095)),
+                "middle-left".repeat(1_000),
+                "middle-right".repeat(1_000),
+                format!("🦀{}", "t".repeat(4_095)),
+            ])
+            .unwrap(),
+        );
+        let split_reduced = reduce_summary_message(&split_boundaries).unwrap();
+        match split_reduced.as_ref() {
+            ModelMessageRef::Tool { content, .. } => {
+                assert!(!content.parts()[1].as_text().contains("[part=1]"));
+                assert!(!content.parts()[2].as_text().contains("[part=2]"));
+            }
+            _ => panic!("a reduced Tool result must retain the Tool role"),
+        }
     }
 
     #[test]

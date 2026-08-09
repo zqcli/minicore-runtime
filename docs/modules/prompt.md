@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture、M6.2 AgentRun assembly/proof及M10 CompactionSummary assembly/budget proof已实现；complete shared-root publication、具体source adapter、Skill contribution、Structured assembly与async Compaction orchestration待实现）
+状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture、M6.2 AgentRun assembly/proof及M10 CompactionSummary assembly/budget proof与async orchestration已实现；complete shared-root publication、具体source adapter、Skill contribution与Structured assembly待实现）
 日期：2026-08-08
 
 ## 目的
@@ -30,7 +30,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Historical PromptSet/rendered Prompt审计格式；MVP不执行exact same-Turn cold recovery，也不保存PromptContent resolver；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现。
 
-当前AgentRun实现已接受captured ToolPromptView并由M8.1闭合最小ToolCall路径；M10进一步实现CompactionSummary required-only System、empty ToolSpec、`NoToolCalls`、plan budget proof与final context preflight。PromptSet持有pinned `Arc<TurnModelSnapshot>`，两种assembly均使用同一个estimator/context limit并保存opaque exact `TurnModelRef`。Structured output、完整Prompt diagnostics与async Compaction orchestration仍后置。
+当前AgentRun实现已接受captured ToolPromptView并由M8.1闭合最小ToolCall路径；M10进一步实现CompactionSummary required-only System、empty ToolSpec、`NoToolCalls`、plan budget proof、final context preflight及ActiveTurnTask orchestration。PromptSet持有pinned `Arc<TurnModelSnapshot>`，两种assembly均使用同一个estimator/context limit并保存opaque exact `TurnModelRef`。Structured output与完整Prompt diagnostics仍后置。
 
 ## 决策摘要
 

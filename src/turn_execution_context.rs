@@ -145,10 +145,6 @@ impl TurnExecutionContext {
             .map(Arc::new)
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
-    )]
     pub(crate) fn compaction_pressure(
         &self,
         source: &LiveCompactionSourceView,
@@ -165,10 +161,6 @@ impl TurnExecutionContext {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
-    )]
     pub(crate) fn plan_compaction(
         &self,
         source: Arc<LiveCompactionSourceView>,
@@ -186,10 +178,6 @@ impl TurnExecutionContext {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
-    )]
     pub(crate) fn assemble_compaction(
         &self,
         plan: &Arc<CompactionPlan>,

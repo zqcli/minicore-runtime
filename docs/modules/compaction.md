@@ -1,6 +1,6 @@
 # Compaction 架构设计
 
-状态：当前权威架构（M10 planning、CompactionSummary request/validation与production replacement已实现；async Replace/record orchestration待实现）
+状态：当前权威架构（M10 planning、CompactionSummary request/validation、production replacement及async Replace/record orchestration已实现）
 日期：2026-07-31
 
 ## 目的
@@ -442,6 +442,14 @@ omitted byte count
 
 `ModelMessageRef::Tool`故意只含`ToolCallId + ToolResultContent`，不泄漏Tools execution disposition；summary reduction不得重新索取或伪造一个“outcome kind”。reduction由versioned `CompactionSummaryFormatVersion`固定，输入相同则输出相同。它只修改`CompactionSummarySourceView`，不改写live/durable ToolResult，也不拆开Tool exchange。首版不把无摘要的truncation直接安装为conversation result。
 
+V1 reduction合同：
+
+- 仅当全部ToolResult text parts正文合计超过16 KiB时触发；恰好16 KiB保持原样；
+- head最多保留最前4 KiB正文，tail最多保留最后4 KiB正文；截断始终停在UTF-8字符边界，当前part被截断后不跨到相邻part继续填充；
+- reduced Tool message保留原`ToolCallId`，同一ToolExchange中的Assistant ToolCall因整条message clone而保留原tool name、arguments与顺序；
+- metadata text固定包含`format_version=1`、`original_bytes`和`omitted_bytes`；part索引只作为reduced source的安全定位标签；
+- reduction按candidate prefix懒执行，只影响最终`CompactionSummarySourceView`与其token estimate。
+
 ### Summary Budget
 
 每个candidate先构造reduced source和directive，再计算：
@@ -763,5 +771,5 @@ ADR 0124已经删除scope、frontier与coverage chain。MVP允许旧Input/Steer�
 - [x] 冻结automatic StoredCompaction model-call provenance。
 - [x] 冻结live Replace与cold replay marker规则。
 - [x] ADR 0134/Format V1冻结StoredCompaction wire casing、limits与golden vector contract。
-- [ ] 实现ScriptedProviderAdapter Compaction vertical slice。
+- [x] 实现ScriptedProviderAdapter Compaction vertical slice。
 - [ ] 实现Rig provider CompactionSummary mapping。

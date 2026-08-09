@@ -1311,6 +1311,14 @@ impl ScriptedModelFixture {
         failures: Vec<ModelCallErrorReason>,
         responses: Vec<&str>,
     ) -> Self {
+        Self::with_failure_reasons_then_responses_and_context_window(failures, responses, 128_000)
+    }
+
+    pub(crate) fn with_failure_reasons_then_responses_and_context_window(
+        failures: Vec<ModelCallErrorReason>,
+        responses: Vec<&str>,
+        context_window_tokens: u32,
+    ) -> Self {
         let scripts = failures
             .into_iter()
             .map(|reason| ScriptedProviderScript::failure(ProviderAttemptError::new(reason)))
@@ -1327,7 +1335,33 @@ impl ScriptedModelFixture {
                 )
             }))
             .collect();
-        Self::from_scripts(scripts, 128_000)
+        Self::from_scripts(scripts, context_window_tokens)
+    }
+
+    pub(crate) fn with_responses_then_failure_reasons(
+        responses: Vec<&str>,
+        failures: Vec<ModelCallErrorReason>,
+    ) -> Self {
+        let scripts =
+            responses
+                .into_iter()
+                .map(|text| {
+                    ScriptedProviderScript::success(
+                        Vec::new(),
+                        ProviderAttemptResult {
+                            response_id: None,
+                            content: Arc::from([ProviderAttemptContent::Text(Arc::from(text))]),
+                            finish_reason: ModelFinishReason::Stop,
+                            usage: None,
+                            metadata: ProviderResponseMetadata::new(None, None, None),
+                        },
+                    )
+                })
+                .chain(failures.into_iter().map(|reason| {
+                    ScriptedProviderScript::failure(ProviderAttemptError::new(reason))
+                }))
+                .collect();
+        Self::from_scripts(scripts, 4_300)
     }
 
     fn from_scripts(scripts: Vec<ScriptedProviderScript>, context_window_tokens: u32) -> Self {

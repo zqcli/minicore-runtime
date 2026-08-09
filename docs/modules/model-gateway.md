@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall及M10 CompactionSummary purpose/budget request validation已实现；完整ToolSpec schema、Structured、async Compaction orchestration、credential/connection implementation、Rig reality gate与production adapters待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall及M10 CompactionSummary purpose/budget request validation与ActiveTurnTask orchestration已实现；完整ToolSpec schema、Structured、credential/connection implementation、Rig reality gate与production adapters待实现）
 
 ## 目的
 

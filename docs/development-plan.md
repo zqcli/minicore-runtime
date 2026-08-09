@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0–M8 foundations/behavior与M9.1–M9.21当前control/observation范围已完成并统一review。M10已完成Runtime-global validated settings、Turn snapshot、Prompt/Model planning basis、pressure、checked stable-unit prefix plan、CompactionSummary Prompt/ModelCallRequest binding、summary validation及production replacement；下一切片闭合ActiveTurnTask Replace/record orchestration。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix仍pending。
+状态：Active；M0–M10已完成并统一review。当前推进M11 Fork与Full Runtime/Recovery Conformance。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload、remaining Fork anchors/LiveSnapshot与完整platform matrix仍pending。
 
 初始实现基线：`dev` at `144039a`
 
@@ -438,7 +438,7 @@ M4明确不实现Compaction planner/token/budget/model call、`Arc<CompactionPla
 
 ### M6.2 ModelGateway与ScriptedProviderAdapter
 
-当前进度：Completed（scripted foundation）。`PromptSet::assemble`把固定System sections、ordered User static context和sanitized `LiveConversationView`组装为唯一`AssembledModelContext`，使用pinned `TurnModelSnapshot` estimator/context limit执行final input preflight，proof绑定AgentRun、exact process-local `TurnModelRef`和ConversationRevision；Model catalog resolution、retained `TurnModelSnapshot`、唯一`ModelCallRequest` constructor、single `ProviderAdapter::execute` attempt、provider-neutral progress、typed delivery-aware errors、minimal text terminal validation及cancel/terminal first-wins均已实现。M8.1增加最小ToolCall，M10增加CompactionSummary purpose、budget proof与explicit max-output request validation。unsafe `AcceptedNoOutput | Unknown | OutputStarted`不会保留包括`RateLimited`在内的retryable reason。Runtime拥有empty `ModelGateway`与initial immutable empty `ModelCatalogView`。reload只影响future snapshot，旧snapshot继续调用旧adapter。Structured output、credential/auth/connection实现、Rig adapter与Compaction async orchestration仍Pending。
+当前进度：Completed（scripted foundation）。`PromptSet::assemble`把固定System sections、ordered User static context和sanitized `LiveConversationView`组装为唯一`AssembledModelContext`，使用pinned `TurnModelSnapshot` estimator/context limit执行final input preflight，proof绑定AgentRun、exact process-local `TurnModelRef`和ConversationRevision；Model catalog resolution、retained `TurnModelSnapshot`、唯一`ModelCallRequest` constructor、single `ProviderAdapter::execute` attempt、provider-neutral progress、typed delivery-aware errors、minimal text terminal validation及cancel/terminal first-wins均已实现。M8.1增加最小ToolCall，M10增加CompactionSummary purpose、budget proof、explicit max-output request validation与ActiveTurnTask orchestration。unsafe `AcceptedNoOutput | Unknown | OutputStarted`不会保留包括`RateLimited`在内的retryable reason。Runtime拥有empty `ModelGateway`与initial immutable empty `ModelCatalogView`。reload只影响future snapshot，旧snapshot继续调用旧adapter。Structured output、credential/auth/connection实现与Rig adapter仍Pending。
 
 实现：
 
@@ -558,11 +558,13 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 
 M10完成完整INV-005；M4已经提供source/cut/marker/no-I/O reducer subset，M5已经提供recorded-marker tolerant replay。
 
-当前进度：planning与summary request/validation slice已完成。`MiniCoreRuntimeConfig`持有并在open时验证Runtime-global `CompactionSettings`，Turn admission捕获immutable snapshot；PromptSet投影同一Turn estimator下的AgentRun/CompactionSummary fixed assembly basis，TurnModelSnapshot投影exact model basis。`Compaction::pressure()`已闭合proactive/hard overflow、unknown/disabled/empty/count-exhausted分类；`plan()`使用checked `u64`按stable-unit从旧到新选择first feasible prefix，求交summary/model/context budget并同时验证post-Replace headroom与minimum reclaim，只保存source+nonzero cut并派生summary prefix、exact suffix及marker。PromptSet已组装required-only System、source+directive、empty ToolSpec与`NoToolCalls`，proof和ModelCallRequest exact绑定budget/revision/model；`validate_summary()`接受portable single-Text结果、忽略optional Reasoning、保存完整automatic provenance并生成sealed production replacement。当前summary source仍保留exact provider-valid prefix；大ToolResult deterministic reduction与ActiveTurnTask Replace/record orchestration后置。
+当前进度：Completed。`MiniCoreRuntimeConfig`持有并在open时验证Runtime-global `CompactionSettings`，Turn admission捕获immutable snapshot；PromptSet投影同一Turn estimator下的AgentRun/CompactionSummary fixed assembly basis，TurnModelSnapshot投影exact model basis。`Compaction::pressure()`闭合proactive/hard overflow、unknown/disabled/empty/count-exhausted分类；`plan()`使用checked `u64`按stable-unit从旧到新选择first feasible prefix，求交summary/model/context budget并同时验证post-Replace headroom与minimum reclaim，只保存source+nonzero cut并派生summary prefix、exact suffix及marker。超过16 KiB的大ToolResult在summary source中按V1格式确定性保留最多4 KiB head与4 KiB tail，live/durable source不改写。PromptSet组装required-only System、source+directive、empty ToolSpec与`NoToolCalls`，proof和ModelCallRequest exact绑定budget/revision/model；`validate_summary()`接受portable single-Text结果、忽略optional Reasoning、保存完整automatic provenance并生成sealed production replacement。ActiveTurnTask已接通proactive/Prompt/provider overflow、至多一次logical retry、exact control/plan/request arbitration、live Replace、same-Arc inline record、post-Compaction Steer safe point、`Compacting` phase及Snapshot usage/recording refresh。
 
 planning foundation已完成统一Standards/Spec review且无blocker；`./scripts/check.sh`全量通过，其中library tests为616 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。
 
 CompactionSummary request/validation与production replacement切片亦完成统一Standards/Spec review且无blocker；`./scripts/check.sh`全量通过，其中library tests为620 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。
+
+ActiveTurnTask orchestration与deterministic ToolResult reduction切片已完成统一Standards/Spec review。review发现并关闭两项问题：Compaction logical call chain的公开phase原先仍显示`Sampling`，现由actor-owned phase投影在调用期间发布`Compacting`并在下一次AgentRun前恢复；UTF-8截断点落在多字节字符内时原实现可能跨part继续填充head/tail，现于当前part边界停止。最终`./scripts/check.sh`全量通过，其中library tests为631 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过；M10无剩余blocker。
 
 实现：
 
