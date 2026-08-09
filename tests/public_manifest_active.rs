@@ -382,6 +382,20 @@ fn assert_command_response_semantics(
                 output: None,
             },
         ) => {}
+        (
+            Some("cancel_accepted_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::CancelAccepted {
+                        target: PublicCancelTarget::Turn(turn_id),
+                        cancel_epoch,
+                    },
+                output: None,
+            },
+        ) => {
+            assert_eq!(turn_id.to_string(), "trn_66666666666666666666666666666666");
+            assert_eq!(*cancel_epoch, 7);
+        }
         (Some("session_busy_rejection"), CommandCompletion::Rejected(error)) => {
             assert_eq!(error.code(), CommandErrorCode::SessionBusy);
             assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
