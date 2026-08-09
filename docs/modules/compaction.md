@@ -1,6 +1,6 @@
 # Compaction 架构设计
 
-状态：当前权威架构（M10 planning foundation已实现；CompactionSummary request/validation与async Replace/record orchestration待实现）
+状态：当前权威架构（M10 planning、CompactionSummary request/validation与production replacement已实现；async Replace/record orchestration待实现）
 日期：2026-07-31
 
 ## 目的
@@ -560,7 +560,7 @@ impl CompactionReplacement {
 
 `CompactionReplacement`是M4 apply接受的唯一summary proof，fields private and `Debug` redacts the summary and all model provenance. `CompactionReplacementError` has private fields; its `Debug`、`Display` and source chain redact summary text, `ModelMessageError` detail and model provenance. **M4 interface只提供上述`#[cfg(test)] for_m4_test` construction seam。** It materializes no caller-supplied transcript: factory takes an exact test `StoredCompaction`, calls Prompt's fallible `ModelMessage::rolling_summary()` once, and maps only that constructor's reachable `ModelMessageErrorReason::{EmptyText, UnsafeText, TextTooLong}` to the one redacted M4 reason `CompactionReplacementErrorReason::InvalidRollingSummary`. Empty assistant content and duplicate ToolCallId are unreachable here and are covered by separate assistant-constructor tests. This is intentionally the complete M4 replacement-error taxonomy; it does not expose text, size, CR, model provenance or a foreign source error. `into_parts(self)` is consuming and returns the exact owned `(StoredCompaction, ModelMessage)` values. The reducer consumes them before allocation; it may then clone the prebuilt immutable rolling-summary `ModelMessage` into the leading stable unit and flattened `LiveConversationView`. That is the documented shared-value projection, not an undocumented seam or a reconstruction of either value.
 
-M4 has no production replacement constructor and does not name or depend on `ValidatedCompactionSummary`. **M10 will add** production construction from `ValidatedCompactionSummary` when that M10 type and its validation-error contract exist: it will materialize exact `StoredCompaction`, call the same Prompt constructor, and seal the result before live apply. That M10 addition belongs to summary validation/provenance, not to this M4 interface.
+M4 has no production replacement constructor and does not name or depend on `ValidatedCompactionSummary`. **M10 now adds** production construction from `ValidatedCompactionSummary`: it materializes exact `StoredCompaction`, calls the same Prompt constructor, and seals the result before live apply. That M10 addition belongs to summary validation/provenance, not to this M4 interface.
 
 The wrapper proves summary/message construction has completed, not that M4 independently validated model provenance. M4 only validates the source/cut/marker/live-state conditions. Raw decoded or replay `StoredCompaction::reconstruct` is an M5 cold-projector operation: it invokes the same fallible Prompt rolling-summary constructor only to build replay projection, or ignore/diagnose a bad marker/text, but can never create `CompactionReplacement` or call the live reducer directly.
 
@@ -696,7 +696,7 @@ exact next AgentRun pressure/ContextOverflow
 - nonzero/in-range cut唯一派生marker；`CompactionReplacement` consumption/prepared rolling-summary unit、marker不匹配、source stale/cross-session、`has_same_stable_identity()`不匹配或存在pending exchange都在EntryId allocation前完成或拒绝；
 - apply消费exact replacement parts并在allocation前prepare unit；可clone prebuilt immutable summary进入leading unit/flattened view；以new Compaction EntryId为origin并只clone fresh current units中的exact retained suffix，先`checked_next()`再allocation、最后依序infallibly construct exact entry Arc、bind prepared unit、commit Replace、append同一Arc到full path并install preflighted revision；拒绝路径不改变EntryId/head/revision/state且不做I/O；
 - reducer不接收raw replacement messages/suffix/marker或raw `StoredCompaction`，不构造plan/request、不验证provider provenance、不估算token/budget、不调用模型或Recorder；
-- M4 only has `#[cfg(test)] CompactionReplacement::for_m4_test(...) -> Result<_, CompactionReplacementError>`; M10 will later add production `ValidatedCompactionSummary → CompactionReplacement` construction. raw/replay StoredCompaction reconstruction never calls the reducer;
+- M4 only has `#[cfg(test)] CompactionReplacement::for_m4_test(...) -> Result<_, CompactionReplacementError>`; M10 production uses only `ValidatedCompactionSummary → CompactionReplacement` construction. raw/replay StoredCompaction reconstruction never calls the reducer;
 - M4 stale tests使用stale/cross-session source与cut/marker mismatch，不使用不存在的plan/request staleness。
 - all M4 rejection tests participate in the [deterministic sentinel/no-ID matrix](../development-plan.md#m4-liveconversation-reducer): source factory/stale/cross-session/identity、out-of-range nonzero cut、marker mismatch和pending exchange leave head/full path/revision/all state unchanged and leave the same first candidate for the next successful allocation; zero is separately rejected before reducer invocation, and prepared-unit failure is likewise pre-allocation.
 

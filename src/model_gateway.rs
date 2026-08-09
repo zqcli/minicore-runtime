@@ -935,6 +935,7 @@ impl ModelGateway {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ModelCallPurpose {
     AgentRun,
+    CompactionSummary,
 }
 
 #[cfg_attr(
@@ -1114,6 +1115,28 @@ impl ModelCallRequest {
             return Err(ModelRequestValidationError::new(
                 ModelRequestValidationErrorKind::AssemblyMismatch,
             ));
+        }
+        match purpose {
+            ModelCallPurpose::AgentRun if proof.compaction_summary_budget().is_some() => {
+                return Err(ModelRequestValidationError::new(
+                    ModelRequestValidationErrorKind::AssemblyMismatch,
+                ));
+            }
+            ModelCallPurpose::CompactionSummary => {
+                let Some(budget) = proof.compaction_summary_budget() else {
+                    return Err(ModelRequestValidationError::new(
+                        ModelRequestValidationErrorKind::AssemblyMismatch,
+                    ));
+                };
+                if max_output_tokens != Some(budget.max_output_tokens())
+                    || input.output_contract() != Some(&OutputContract::NoToolCalls)
+                {
+                    return Err(ModelRequestValidationError::new(
+                        ModelRequestValidationErrorKind::AssemblyMismatch,
+                    ));
+                }
+            }
+            ModelCallPurpose::AgentRun => {}
         }
         if input.output_contract().is_some() && !input.tools_empty() {
             return Err(ModelRequestValidationError::new(
@@ -2106,6 +2129,26 @@ pub(crate) struct ModelCallResult {
 impl ModelCallResult {
     pub(crate) const fn response(&self) -> &FinalizedAssistantResponse {
         &self.response
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_compaction_test(
+        model: ModelResponseSummary,
+        content: Arc<[FinalizedAssistantContent]>,
+        finish_reason: ModelFinishReason,
+        effective_max_output_tokens: NonZeroU32,
+    ) -> Self {
+        Self {
+            response: FinalizedAssistantResponse {
+                model,
+                response_id: None,
+                content,
+                finish_reason,
+                effective_max_output_tokens,
+                usage: None,
+                metadata: ProviderResponseMetadata::reconstruct(None, None, None),
+            },
+        }
     }
 }
 

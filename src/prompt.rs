@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,13 +9,16 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::AgentRevisionRef;
+use crate::compaction::{
+    CompactionSummaryBudget, CompactionSummaryDirective, CompactionSummarySourceView,
+};
 use crate::live_conversation::{ConversationRevision, LiveConversationView};
 use crate::model_gateway::{
     ModelCallPurpose, OutputContract, ReasoningContent, TokenEstimator, TurnModelRef,
     TurnModelSnapshot,
 };
 use crate::skills::{SkillId, SkillPromptView};
-use crate::tools::{ToolCallId, ToolName, ToolPromptView, ToolResultContent};
+use crate::tools::{ToolCallId, ToolName, ToolPromptView, ToolResultContent, ToolSet};
 use crate::wire::lexical::{
     LexicalError, canonical_json_string_len, normalize_newlines, validate_safe_text,
     validate_stable_symbolic_key,
@@ -226,6 +230,10 @@ pub(crate) struct PromptError {
 impl PromptError {
     const fn new(kind: PromptErrorKind) -> Self {
         Self { kind }
+    }
+
+    pub(crate) const fn invalid_contribution() -> Self {
+        Self::new(PromptErrorKind::InvalidContribution)
     }
 
     #[allow(
@@ -976,8 +984,19 @@ impl fmt::Debug for PromptProfile {
 }
 
 pub(crate) struct PromptAssemblyInput<'a> {
-    conversation: &'a LiveConversationView,
-    output_contract: Option<&'a OutputContract>,
+    kind: PromptAssemblyInputKind<'a>,
+}
+
+enum PromptAssemblyInputKind<'a> {
+    AgentRun {
+        conversation: &'a LiveConversationView,
+        output_contract: Option<&'a OutputContract>,
+    },
+    CompactionSummary {
+        source: &'a CompactionSummarySourceView,
+        directive: &'a CompactionSummaryDirective,
+        budget: &'a CompactionSummaryBudget,
+    },
 }
 
 #[allow(
@@ -990,8 +1009,24 @@ impl<'a> PromptAssemblyInput<'a> {
         output_contract: Option<&'a OutputContract>,
     ) -> Self {
         Self {
-            conversation,
-            output_contract,
+            kind: PromptAssemblyInputKind::AgentRun {
+                conversation,
+                output_contract,
+            },
+        }
+    }
+
+    pub(crate) const fn compaction_summary(
+        source: &'a CompactionSummarySourceView,
+        directive: &'a CompactionSummaryDirective,
+        budget: &'a CompactionSummaryBudget,
+    ) -> Self {
+        Self {
+            kind: PromptAssemblyInputKind::CompactionSummary {
+                source,
+                directive,
+                budget,
+            },
         }
     }
 }
@@ -1049,6 +1084,30 @@ pub(crate) struct PromptAssemblyProof {
     turn_model: TurnModelRef,
     source_revision: ConversationRevision,
     output_contract: Option<OutputContract>,
+    compaction_summary_budget: Option<CompactionSummaryBudgetProof>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompactionSummaryBudgetProof {
+    max_output_tokens: NonZeroU32,
+    budget: CompactionSummaryBudget,
+}
+
+impl CompactionSummaryBudgetProof {
+    pub(crate) const fn max_output_tokens(&self) -> NonZeroU32 {
+        self.max_output_tokens
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by adjacent M10 plan/request arbitration and proof diagnostics"
+        )
+    )]
+    pub(crate) const fn budget(&self) -> &CompactionSummaryBudget {
+        &self.budget
+    }
 }
 
 #[cfg_attr(
@@ -1074,6 +1133,10 @@ impl PromptAssemblyProof {
     pub(crate) const fn output_contract(&self) -> Option<&OutputContract> {
         self.output_contract.as_ref()
     }
+
+    pub(crate) const fn compaction_summary_budget(&self) -> Option<&CompactionSummaryBudgetProof> {
+        self.compaction_summary_budget.as_ref()
+    }
 }
 
 impl fmt::Debug for PromptAssemblyProof {
@@ -1084,6 +1147,10 @@ impl fmt::Debug for PromptAssemblyProof {
             .field("turn_model", &self.turn_model)
             .field("source_revision", &self.source_revision)
             .field("has_output_contract", &self.output_contract.is_some())
+            .field(
+                "has_compaction_summary_budget",
+                &self.compaction_summary_budget.is_some(),
+            )
             .finish()
     }
 }
@@ -1292,21 +1359,38 @@ impl PromptSet {
         &self,
         input: PromptAssemblyInput<'_>,
     ) -> Result<AssembledModelContext, PromptError> {
+        match input.kind {
+            PromptAssemblyInputKind::AgentRun {
+                conversation,
+                output_contract,
+            } => self.assemble_agent_run(conversation, output_contract),
+            PromptAssemblyInputKind::CompactionSummary {
+                source,
+                directive,
+                budget,
+            } => self.assemble_compaction_summary(source, directive, budget),
+        }
+    }
+
+    fn assemble_agent_run(
+        &self,
+        conversation: &LiveConversationView,
+        output_contract: Option<&OutputContract>,
+    ) -> Result<AssembledModelContext, PromptError> {
         if !self.skills.is_empty() {
             return Err(PromptError::new(PromptErrorKind::PromptUnavailable));
         }
 
-        let mut messages = Vec::with_capacity(
-            self.profile.user_context.len() + input.conversation.messages().len(),
-        );
+        let mut messages =
+            Vec::with_capacity(self.profile.user_context.len() + conversation.messages().len());
         for section in &*self.profile.user_context {
             messages.push(
                 ModelMessage::unstamped_user_text(Arc::from(section.text()))
                     .map_err(|_| PromptError::new(PromptErrorKind::InvalidContribution))?,
             );
         }
-        messages.extend(input.conversation.messages().iter().cloned());
-        let output_contract = input.output_contract.cloned();
+        messages.extend(conversation.messages().iter().cloned());
+        let output_contract = output_contract.cloned();
 
         let canonical_bytes = canonical_model_context_bytes(
             &self.profile.system,
@@ -1336,8 +1420,93 @@ impl PromptSet {
             assembly_proof: PromptAssemblyProof {
                 purpose: ModelCallPurpose::AgentRun,
                 turn_model: self.model.turn_model_ref(),
-                source_revision: input.conversation.revision(),
+                source_revision: conversation.revision(),
                 output_contract,
+                compaction_summary_budget: None,
+            },
+        })
+    }
+
+    fn assemble_compaction_summary(
+        &self,
+        source: &CompactionSummarySourceView,
+        directive: &CompactionSummaryDirective,
+        budget: &CompactionSummaryBudget,
+    ) -> Result<AssembledModelContext, PromptError> {
+        let basis = self.compaction_summary_assembly_basis()?;
+        let estimator = self.model.token_estimator();
+        let directive_tokens = directive
+            .message()
+            .compaction_estimated_tokens(estimator)
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let source_tokens = source.messages().iter().try_fold(0_u64, |total, message| {
+            total.checked_add(message.compaction_estimated_tokens(estimator)?)
+        });
+        let Some(source_tokens) = source_tokens else {
+            return Err(PromptError::new(PromptErrorKind::ContextLimitExceeded));
+        };
+        if basis.fixed_prompt_tokens() != budget.fixed_prompt_tokens()
+            || directive_tokens != budget.directive_tokens()
+            || source_tokens != budget.reduced_source_tokens()
+        {
+            return Err(PromptError::new(PromptErrorKind::InvalidContribution));
+        }
+        let required_tokens = budget
+            .fixed_prompt_tokens()
+            .checked_add(budget.reduced_source_tokens())
+            .and_then(|total| total.checked_add(budget.directive_tokens()))
+            .and_then(|total| total.checked_add(u64::from(budget.safety_reserve_tokens().get())))
+            .and_then(|total| total.checked_add(u64::from(budget.max_output_tokens().get())))
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        if self
+            .model
+            .limits()
+            .context_window_tokens()
+            .is_none_or(|limit| required_tokens > u64::from(limit.get()))
+        {
+            return Err(PromptError::new(PromptErrorKind::ContextLimitExceeded));
+        }
+
+        let mut messages = Vec::with_capacity(source.messages().len() + 1);
+        messages.extend(source.messages().iter().cloned());
+        messages.push(directive.message().clone());
+        let output_contract = Some(basis.output_contract().clone());
+        let canonical_bytes = canonical_model_context_bytes(
+            basis.system_sections(),
+            &messages,
+            &[],
+            output_contract.as_ref(),
+        )
+        .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let estimated_tokens = estimator
+            .checked_estimate_utf8_bytes(
+                u64::try_from(canonical_bytes)
+                    .map_err(|_| PromptError::new(PromptErrorKind::ContextLimitExceeded))?,
+            )
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        let estimated_budget_input = budget
+            .fixed_prompt_tokens()
+            .checked_add(budget.reduced_source_tokens())
+            .and_then(|total| total.checked_add(budget.directive_tokens()))
+            .ok_or_else(|| PromptError::new(PromptErrorKind::ContextLimitExceeded))?;
+        if estimated_tokens > estimated_budget_input {
+            return Err(PromptError::new(PromptErrorKind::InvalidContribution));
+        }
+
+        Ok(AssembledModelContext {
+            system: basis.system_sections.clone(),
+            messages: messages.into(),
+            tools: ToolSet::empty().prompt_view(),
+            output_contract: output_contract.clone(),
+            assembly_proof: PromptAssemblyProof {
+                purpose: ModelCallPurpose::CompactionSummary,
+                turn_model: self.model.turn_model_ref(),
+                source_revision: source.source_revision(),
+                output_contract,
+                compaction_summary_budget: Some(CompactionSummaryBudgetProof {
+                    max_output_tokens: budget.max_output_tokens(),
+                    budget: budget.clone(),
+                }),
             },
         })
     }
