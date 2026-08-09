@@ -3324,10 +3324,13 @@ impl SessionExecutorActor {
         &self,
         current_turn: Option<TurnId>,
     ) -> (Option<CommandId>, Arc<[CommandId]>, Arc<[CommandId]>) {
-        let active_submit_command_id = self
-            .active_admission
-            .as_ref()
-            .map(|admission| admission.command_id);
+        let active_submit_command_id = if current_turn.is_none() {
+            self.active_admission
+                .as_ref()
+                .map(|admission| admission.command_id)
+        } else {
+            None
+        };
         let follow_up_command_ids = Arc::from(self.follow_up.command_ids());
         let steer_command_ids = Arc::from(
             current_turn
@@ -8599,6 +8602,12 @@ mod tests {
                     loaded.executor.snapshot().await.unwrap().execution_state(),
                     SessionExecutionState::Finishing
                 );
+                let live_turn = lock(&loaded.executor.live_state_for_test().unwrap())
+                    .current_turn()
+                    .expect("Input was applied before SecurityRevoked");
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                assert_eq!(snapshot.current_turn(), Some(live_turn));
+                assert_eq!(snapshot.active_submit_command_id(), None);
             } else {
                 let accepted = loaded
                     .executor
