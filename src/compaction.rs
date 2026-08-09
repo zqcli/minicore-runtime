@@ -8,8 +8,9 @@ use thiserror::Error;
 
 use crate::live_conversation::ConversationRevision;
 use crate::model_gateway::{
-    EffectiveModelLimits, ModelFinishReason, ModelResponseSummary, ModelUsage, ProviderResponseId,
-    ProviderResponseMetadata, TokenEstimator, TurnModelRef, TurnModelSnapshot,
+    EffectiveModelLimits, FinalizedAssistantContent, ModelCallResult, ModelFinishReason,
+    ModelResponseSummary, ModelUsage, ProviderResponseId, ProviderResponseMetadata, TokenEstimator,
+    TurnModelRef, TurnModelSnapshot,
 };
 use crate::prompt::{
     AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessage,
@@ -560,6 +561,7 @@ pub(crate) enum CompactionErrorReason {
     NoFeasibleSummaryBudget,
     NoFeasiblePostReplace,
     InsufficientReclaim,
+    InvalidSummary,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -857,6 +859,55 @@ impl Compaction {
             CompactionErrorReason::InsufficientReclaim
         }))
     }
+
+    pub(crate) fn validate_summary(
+        &self,
+        plan: Arc<CompactionPlan>,
+        result: &ModelCallResult,
+        logical_retry_count: u8,
+    ) -> Result<ValidatedCompactionSummary, CompactionError> {
+        let response = result.response();
+        if response.model() != plan.model().model_summary()
+            || !matches!(
+                response.finish_reason(),
+                ModelFinishReason::Stop | ModelFinishReason::Unknown
+            )
+            || response.effective_max_output_tokens() != plan.budget().max_output_tokens()
+            || logical_retry_count > 1
+        {
+            return Err(CompactionError::new(CompactionErrorReason::InvalidSummary));
+        }
+
+        let mut summary = None;
+        for content in response.content() {
+            match content {
+                FinalizedAssistantContent::Reasoning(_) => {}
+                FinalizedAssistantContent::Text { text } if summary.is_none() => {
+                    summary = Some(Arc::clone(text));
+                }
+                FinalizedAssistantContent::Text { .. }
+                | FinalizedAssistantContent::ToolCall { .. } => {
+                    return Err(CompactionError::new(CompactionErrorReason::InvalidSummary));
+                }
+            }
+        }
+        let summary =
+            summary.ok_or_else(|| CompactionError::new(CompactionErrorReason::InvalidSummary))?;
+        let model_call = StoredCompactionModelCall::new(
+            response.model().clone(),
+            response.response_id().cloned(),
+            response.usage().cloned(),
+            response.finish_reason(),
+            plan.budget().max_output_tokens(),
+            logical_retry_count,
+            response.metadata().clone(),
+        )
+        .map_err(|_| CompactionError::new(CompactionErrorReason::InvalidSummary))?;
+        let stored = StoredCompaction::new(summary, plan.first_kept_entry_id(), Some(model_call))
+            .map_err(|_| CompactionError::new(CompactionErrorReason::InvalidSummary))?;
+
+        Ok(ValidatedCompactionSummary { plan, stored })
+    }
 }
 
 fn required_pressure(
@@ -883,6 +934,36 @@ fn estimate_stable_units(
             })
         })
         .collect()
+}
+
+pub(crate) struct ValidatedCompactionSummary {
+    plan: Arc<CompactionPlan>,
+    stored: StoredCompaction,
+}
+
+impl ValidatedCompactionSummary {
+    pub(crate) const fn plan(&self) -> &Arc<CompactionPlan> {
+        &self.plan
+    }
+
+    pub(crate) fn into_replacement(self) -> Result<CompactionReplacement, CompactionError> {
+        let rolling_summary = ModelMessage::rolling_summary(Arc::clone(&self.stored.summary))
+            .map_err(|_| CompactionError::new(CompactionErrorReason::InvalidSummary))?;
+        Ok(CompactionReplacement {
+            stored: self.stored,
+            rolling_summary,
+        })
+    }
+}
+
+impl fmt::Debug for ValidatedCompactionSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ValidatedCompactionSummary")
+            .field("plan", &self.plan)
+            .field("summary", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1147,7 +1228,10 @@ impl fmt::Debug for StoredCompactionModelCall {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_gateway::{ModelReasoningSummary, ModelServiceClass, TurnModelSnapshot};
+    use crate::model_gateway::{
+        FinalizedAssistantContent, ModelReasoningSummary, ModelServiceClass, ReasoningContent,
+        TurnModelSnapshot,
+    };
     use crate::prompt::{
         AgentRunCompactionAssemblyBasis, CompactionSummaryAssemblyBasis, ModelMessageRef,
     };
@@ -1522,6 +1606,135 @@ mod tests {
             Compaction.plan(input).unwrap_err().reason(),
             CompactionErrorReason::MismatchedEstimator
         );
+    }
+
+    fn summary_result(
+        plan: &CompactionPlan,
+        content: Arc<[FinalizedAssistantContent]>,
+        finish_reason: ModelFinishReason,
+    ) -> ModelCallResult {
+        ModelCallResult::for_compaction_test(
+            plan.model().model_summary().clone(),
+            content,
+            finish_reason,
+            plan.budget().max_output_tokens(),
+        )
+    }
+
+    #[test]
+    fn summary_validation_rejects_wrong_model_finish_content_budget_and_retry_facts() {
+        let plan = Compaction.plan(plan_input(100)).unwrap();
+        let text = || {
+            Arc::from([FinalizedAssistantContent::Text {
+                text: Arc::from("portable summary"),
+            }])
+        };
+        let wrong_model = ModelCallResult::for_compaction_test(
+            ModelResponseSummary::reconstruct(
+                "other".parse().unwrap(),
+                "other".parse().unwrap(),
+                ModelReasoningSummary::Disabled,
+                ModelServiceClass::Standard,
+            ),
+            text(),
+            ModelFinishReason::Stop,
+            plan.budget().max_output_tokens(),
+        );
+        let refused = summary_result(&plan, text(), ModelFinishReason::Refused);
+        let empty = summary_result(
+            &plan,
+            Arc::from([FinalizedAssistantContent::Text {
+                text: Arc::from(""),
+            }]),
+            ModelFinishReason::Stop,
+        );
+        let multiple = summary_result(
+            &plan,
+            Arc::from([
+                FinalizedAssistantContent::Text {
+                    text: Arc::from("one"),
+                },
+                FinalizedAssistantContent::Text {
+                    text: Arc::from("two"),
+                },
+            ]),
+            ModelFinishReason::Stop,
+        );
+        let reasoning_only = summary_result(
+            &plan,
+            Arc::from([FinalizedAssistantContent::Reasoning(
+                ReasoningContent::reconstruct(Some("reasoning".to_owned()), None, None, None, None)
+                    .unwrap(),
+            )]),
+            ModelFinishReason::Unknown,
+        );
+        let unsafe_text = summary_result(
+            &plan,
+            Arc::from([FinalizedAssistantContent::Text {
+                text: Arc::from("unsafe\r\nsummary"),
+            }]),
+            ModelFinishReason::Stop,
+        );
+        let wrong_budget = ModelCallResult::for_compaction_test(
+            plan.model().model_summary().clone(),
+            text(),
+            ModelFinishReason::Stop,
+            NonZeroU32::new(plan.budget().max_output_tokens().get() - 1).unwrap(),
+        );
+
+        for (result, retry_count) in [
+            (wrong_model, 0),
+            (refused, 0),
+            (empty, 0),
+            (multiple, 0),
+            (reasoning_only, 0),
+            (unsafe_text, 0),
+            (wrong_budget, 0),
+            (summary_result(&plan, text(), ModelFinishReason::Stop), 2),
+        ] {
+            assert_eq!(
+                Compaction
+                    .validate_summary(Arc::clone(&plan), &result, retry_count)
+                    .unwrap_err()
+                    .reason(),
+                CompactionErrorReason::InvalidSummary
+            );
+        }
+    }
+
+    #[test]
+    fn summary_validation_ignores_optional_reasoning_but_preserves_text_verbatim() {
+        let plan = Compaction.plan(plan_input(100)).unwrap();
+        let result = summary_result(
+            &plan,
+            Arc::from([
+                FinalizedAssistantContent::Reasoning(
+                    ReasoningContent::reconstruct(
+                        None,
+                        Some("portable reasoning summary".to_owned()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                FinalizedAssistantContent::Text {
+                    text: Arc::from("portable\nsummary"),
+                },
+            ]),
+            ModelFinishReason::Unknown,
+        );
+
+        let validated = Compaction
+            .validate_summary(Arc::clone(&plan), &result, 0)
+            .unwrap();
+        assert!(Arc::ptr_eq(validated.plan(), &plan));
+        let debug = format!("{validated:?}");
+        assert!(!debug.contains("portable reasoning summary"));
+        assert!(!debug.contains("portable\nsummary"));
+        let (stored, _) = validated.into_replacement().unwrap().into_parts();
+        assert_eq!(stored.summary(), "portable\nsummary");
+        assert!(stored.model_call().is_some());
     }
 
     #[test]

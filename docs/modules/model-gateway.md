@@ -2,7 +2,7 @@
 
 日期：2026-08-08
 
-状态：当前权威架构（M6.2 scripted text-only foundation与M8.1最小ToolCall validation/round-trip已实现；完整ToolSpec schema、Structured/Compaction paths、credential/connection implementation、Rig reality gate与production adapters待实现）
+状态：当前权威架构（M6.2 scripted foundation、M8.1最小ToolCall及M10 CompactionSummary purpose/budget request validation已实现；完整ToolSpec schema、Structured、async Compaction orchestration、credential/connection implementation、Rig reality gate与production adapters待实现）
 
 ## 目的
 
@@ -27,7 +27,7 @@
 - provider-native compaction artifact的持久化格式；
 - 完整pricing、billing ledger或成本审计。
 
-当前M6.2实现范围严格限于ordinary text-only AgentRun，M8.1在其上增加最小允许ToolCall路径：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行；非空ToolPromptView时，Gateway校验ToolCall名称并把结构化调用交给ActiveTurnTask。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。`OutputContract::NoToolCalls`已保留closed value；完整ToolSpec schema、Structured schema、CompactionSummary budget/proof、auth/credential/connection/cache以及Rig provider mapping仍未实现，也不由本里程碑暗示可用。
+当前M6.2 foundation与M8.1最小ToolCall路径已运行：Runtime仍默认拥有empty gateway/catalog root；Prompt proof、retained exact model snapshot、pinned-estimator context-limit preflight、single scripted attempt、progress、terminal response validation、delivery-aware typed error和cancel/terminal线性化可运行。M10新增`CompactionSummary` purpose，并要求assembly budget proof、`NoToolCalls`、empty ToolSpec和explicit max output exact匹配，仍复用同一个single-attempt Gateway。`RateLimited`与其他允许logical retry的transient reason一样，只有`NotSent | RejectedBeforeExecution`可以保留；unsafe delivery fail closed为`RequestOutcomeUnknown | StreamInterrupted`。完整ToolSpec schema、Structured schema、auth/credential/connection/cache、async Compaction retry/orchestration以及Rig provider mapping仍未实现。
 
 相关权威文档：
 

@@ -186,6 +186,30 @@ impl TurnExecutionContext {
         })
     }
 
+    #[allow(
+        dead_code,
+        reason = "consumed by the adjacent M10 ActiveTurnTask compaction slice"
+    )]
+    pub(crate) fn assemble_compaction(
+        &self,
+        plan: &Arc<CompactionPlan>,
+    ) -> Result<Arc<AssembledModelContext>, PromptError> {
+        if !plan
+            .model()
+            .turn_model()
+            .is_exact(&self.model.turn_model_ref())
+        {
+            return Err(PromptError::invalid_contribution());
+        }
+        self.prompt_set
+            .assemble(PromptAssemblyInput::compaction_summary(
+                plan.summary_source(),
+                plan.directive(),
+                plan.budget(),
+            ))
+            .map(Arc::new)
+    }
+
     pub(crate) const fn tool_set(&self) -> &Arc<ToolSet> {
         &self.tool_set
     }
@@ -234,20 +258,28 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
     use std::sync::Arc;
 
+    use tokio_util::sync::CancellationToken;
+
     use crate::agent_session_lifecycle::{
         AgentDefinition, AgentRevisionRef, SessionDefinition, SessionModelConfig,
     };
-    use crate::compaction::CompactionSettings;
+    use crate::compaction::{
+        Compaction, CompactionSettings, CompactionTrigger, CompactionUnitKind,
+        LiveCompactionSourceView, PreparedLiveCompactionUnit,
+    };
+    use crate::live_conversation::ConversationRevision;
     use crate::model_gateway::{
-        ModelResolutionErrorKind, ModelSelection, ReasoningPreference, ScriptedModelFixture,
+        ModelCallPurpose, ModelCallRequest, ModelProgressPublisher,
+        ModelRequestValidationErrorKind, ModelResolutionErrorKind, ModelSelection,
+        ReasoningPreference, ScriptedModelFixture,
     };
     use crate::prompt::{
-        AgentPromptSelection, PromptBodyIntent, PromptIntent, PromptService,
-        SessionPromptSelection, TextIntent,
+        AgentPromptSelection, ModelMessage, ModelMessageRef, PromptBodyIntent, PromptErrorKind,
+        PromptIntent, PromptService, SessionPromptSelection, TextIntent,
     };
     use crate::tools::ToolSet;
     use crate::wire::{
-        AgentId, AgentRevision, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
+        AgentId, AgentRevision, EntryId, SessionDefinitionRevision, SessionId, Timestamp, TurnId,
         WorkspaceRevision,
     };
     use crate::workspace::{
@@ -307,6 +339,30 @@ mod tests {
         Arc<crate::prompt::PromptResourceView>,
         ScriptedModelFixture,
     ) {
+        capture_parts_with_responses(
+            selected_session_id,
+            selected_agent_id,
+            agent_revision,
+            workspace_revision,
+            Vec::new(),
+        )
+        .await
+    }
+
+    async fn capture_parts_with_responses(
+        selected_session_id: SessionId,
+        selected_agent_id: AgentId,
+        agent_revision: u64,
+        workspace_revision: u64,
+        responses: Vec<&str>,
+    ) -> (
+        Arc<SessionDefinition>,
+        Arc<AgentDefinition>,
+        Arc<crate::workspace::WorkspaceSnapshot>,
+        Arc<PromptService>,
+        Arc<crate::prompt::PromptResourceView>,
+        ScriptedModelFixture,
+    ) {
         let revision = AgentRevision::new(NonZeroU64::new(agent_revision).unwrap());
         let agent = Arc::new(AgentDefinition::new(
             selected_agent_id,
@@ -338,7 +394,7 @@ mod tests {
             PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
         );
         let prompt_resources = prompt_service.initialize().await.unwrap();
-        let model = ScriptedModelFixture::new(Vec::new());
+        let model = ScriptedModelFixture::new(responses);
         (
             session,
             agent,
@@ -347,6 +403,60 @@ mod tests {
             prompt_resources,
             model,
         )
+    }
+
+    async fn compaction_fixture(
+        responses: Vec<&str>,
+    ) -> (
+        Arc<TurnExecutionContext>,
+        Arc<LiveCompactionSourceView>,
+        ScriptedModelFixture,
+    ) {
+        let selected_session_id = session_id(1);
+        let (session, agent, workspace, prompt_service, prompt_resources, model) =
+            capture_parts_with_responses(selected_session_id, agent_id(1), 7, 9, responses).await;
+        let settings = CompactionSettings {
+            pressure_reserve_tokens: NonZeroU32::new(8).unwrap(),
+            summary_min_output_tokens: NonZeroU32::new(5).unwrap(),
+            summary_max_output_tokens: NonZeroU32::new(10).unwrap(),
+            minimum_reclaimed_tokens: NonZeroU32::new(5).unwrap(),
+            summary_safety_reserve_tokens: NonZeroU32::new(2).unwrap(),
+            ..CompactionSettings::default()
+        };
+        let context = TurnExecutionContext::capture(TurnContextCapture {
+            turn_id: turn_id(1),
+            session,
+            agent,
+            workspace,
+            prompt_service,
+            prompt_resources,
+            model_gateway: Arc::clone(model.gateway()),
+            model_catalog: Arc::clone(model.catalog()),
+            tool_set: ToolSet::empty(),
+            compaction: settings.validate().unwrap(),
+        })
+        .unwrap();
+        let unit = PreparedLiveCompactionUnit::for_live_reducer(
+            CompactionUnitKind::UserMessage,
+            Arc::from([
+                ModelMessage::unstamped_user_text(Arc::from("history ".repeat(256))).unwrap(),
+            ]),
+        )
+        .unwrap()
+        .bind_origin(
+            "ent_11111111111111111111111111111111"
+                .parse::<EntryId>()
+                .unwrap(),
+        );
+        let source = Arc::new(
+            LiveCompactionSourceView::for_live_reducer(
+                selected_session_id,
+                ConversationRevision::default(),
+                Arc::from([unit]),
+            )
+            .unwrap(),
+        );
+        (context, source, model)
     }
 
     #[tokio::test]
@@ -396,6 +506,130 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(message.message().content()[0].as_text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn compaction_assembly_binds_the_exact_plan_budget_and_model_request() {
+        let (context, source, _) = compaction_fixture(Vec::new()).await;
+        let plan = context
+            .plan_compaction(
+                Arc::clone(&source),
+                CompactionTrigger::ProviderContextOverflow,
+                0,
+            )
+            .unwrap();
+
+        let assembled = context.assemble_compaction(&plan).unwrap();
+        let proof = assembled.assembly_proof();
+        assert_eq!(proof.purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(proof.source_revision(), *source.revision());
+        assert_eq!(assembled.system().len(), 1);
+        assert_eq!(assembled.system()[0].text(), "required");
+        assert!(assembled.tools_empty());
+        assert_eq!(assembled.messages().len(), 2);
+        assert_eq!(
+            proof.compaction_summary_budget().unwrap().budget(),
+            plan.budget()
+        );
+
+        let request = ModelCallRequest::new(
+            Arc::clone(context.model()),
+            ModelCallPurpose::CompactionSummary,
+            assembled,
+            *source.revision(),
+            Some(plan.budget().max_output_tokens()),
+        )
+        .unwrap();
+        assert_eq!(request.purpose(), ModelCallPurpose::CompactionSummary);
+        assert_eq!(
+            request.effective_max_output_tokens(),
+            plan.budget().max_output_tokens()
+        );
+        for (purpose, max_output_tokens) in [
+            (
+                ModelCallPurpose::AgentRun,
+                Some(plan.budget().max_output_tokens()),
+            ),
+            (ModelCallPurpose::CompactionSummary, None),
+            (
+                ModelCallPurpose::CompactionSummary,
+                NonZeroU32::new(plan.budget().max_output_tokens().get() - 1),
+            ),
+        ] {
+            let error = ModelCallRequest::new(
+                Arc::clone(context.model()),
+                purpose,
+                Arc::clone(request.input()),
+                *source.revision(),
+                max_output_tokens,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                ModelRequestValidationErrorKind::AssemblyMismatch
+            );
+        }
+
+        let (other_context, _, _) = compaction_fixture(Vec::new()).await;
+        assert_eq!(
+            other_context.assemble_compaction(&plan).unwrap_err().kind(),
+            PromptErrorKind::InvalidContribution
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_compaction_summary_seals_exact_automatic_provenance_and_replacement() {
+        let (context, source, model) = compaction_fixture(vec!["portable summary"]).await;
+        let plan = context
+            .plan_compaction(
+                Arc::clone(&source),
+                CompactionTrigger::ProviderContextOverflow,
+                0,
+            )
+            .unwrap();
+        let assembled = context.assemble_compaction(&plan).unwrap();
+        let request = Arc::new(
+            ModelCallRequest::new(
+                Arc::clone(context.model()),
+                ModelCallPurpose::CompactionSummary,
+                assembled,
+                *source.revision(),
+                Some(plan.budget().max_output_tokens()),
+            )
+            .unwrap(),
+        );
+        let result = model
+            .gateway()
+            .generate_model_turn(
+                Arc::clone(&request),
+                ModelProgressPublisher::discard(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let validated = Compaction
+            .validate_summary(Arc::clone(&plan), &result, 1)
+            .unwrap();
+        assert!(Arc::ptr_eq(validated.plan(), &plan));
+        let replacement = validated.into_replacement().unwrap();
+        let (stored, rolling_summary) = replacement.into_parts();
+        assert_eq!(stored.summary(), "portable summary");
+        assert_eq!(stored.first_kept_entry_id(), None);
+        let call = stored.model_call().unwrap();
+        assert_eq!(call.model(), result.response().model());
+        assert_eq!(
+            call.requested_max_output_tokens(),
+            plan.budget().max_output_tokens()
+        );
+        assert_eq!(call.logical_retry_count(), 1);
+        match rolling_summary.as_ref() {
+            ModelMessageRef::User { content } => {
+                assert_eq!(content.len(), 1);
+                assert_eq!(content[0].as_text(), "portable summary");
+            }
+            _ => panic!("validated summary must become one user-role rolling summary"),
+        }
     }
 
     #[tokio::test]

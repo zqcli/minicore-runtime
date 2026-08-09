@@ -1,6 +1,6 @@
 # Turn Execution Context 架构设计
 
-状态：当前权威架构（M7 capture已实现；M10 validated Compaction settings与planning façade已接通，summary assembly/orchestration待实现）
+状态：当前权威架构（M7 capture已实现；M10 validated settings、planning与CompactionSummary assembly façade已接通，async orchestration待实现）
 日期：2026-07-31
 
 ## 目的

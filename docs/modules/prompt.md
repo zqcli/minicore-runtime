@@ -1,6 +1,6 @@
 # Prompt 子系统架构设计
 
-状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture已实现；M6.2 text-only AgentRun final assembly/proof已实现；complete shared-root publication、具体source adapter、Skill contribution、Structured/Tool/Compaction assembly与Turn capture消费待实现）
+状态：当前权威架构（M6.1 candidate/profile/Text composition与Workspace Prompt capture、M6.2 AgentRun assembly/proof及M10 CompactionSummary assembly/budget proof已实现；complete shared-root publication、具体source adapter、Skill contribution、Structured assembly与async Compaction orchestration待实现）
 日期：2026-08-08
 
 ## 目的
@@ -30,7 +30,7 @@ PromptSet 是唯一可以组装模型可见上下文的对象
 - Historical PromptSet/rendered Prompt审计格式；MVP不执行exact same-Turn cold recovery，也不保存PromptContent resolver；
 - Prompt hook、远程 Prompt source 或插件协议的具体实现。
 
-当前M6.2实现只接受parent-owned empty `ToolPromptView`和`SkillPromptView`，因此`AssembledModelContext`通过`tools_empty()`表达已验证的empty ToolSpec事实，尚不提前冻结M8的concrete `ToolSpec` carrier或Prompt diagnostics数组。PromptSet持有pinned `Arc<TurnModelSnapshot>`，使用其中同一个estimator与context limit完成final input validation；assembly proof只保存opaque exact `TurnModelRef`。完整TurnExecutionContext在M7复用该snapshot。这些是text-only staged implementation constraints，不改变下文完整MVP contract。
+当前AgentRun实现已接受captured ToolPromptView并由M8.1闭合最小ToolCall路径；M10进一步实现CompactionSummary required-only System、empty ToolSpec、`NoToolCalls`、plan budget proof与final context preflight。PromptSet持有pinned `Arc<TurnModelSnapshot>`，两种assembly均使用同一个estimator/context limit并保存opaque exact `TurnModelRef`。Structured output、完整Prompt diagnostics与async Compaction orchestration仍后置。
 
 ## 决策摘要
 
@@ -620,7 +620,7 @@ impl ModelAssistantContent {
 
 `ModelMessage`与`ModelAssistantContent`都是immutable `Clone` values：其variable content由immutable `Arc`-backed value承载，clone不改变semantic identity、content order或provenance，也不重新校验、重排或生成新事实。clone是唯一documented projection：LiveSessionState可以把同一semantic message clone到stable unit和flattened `LiveConversationView`，而不是从borrowed message、raw text或caller suffix重建它。该shared-value规则不放宽private kinds；任何上述authorized consumer仍只能inspect refs。
 
-`rolling_summary()`只可由M4 crate-test-only `CompactionReplacement::for_m4_test()`、M10届时新增的production `ValidatedCompactionSummary → CompactionReplacement` construction，或M5 cold projector从recorded `StoredCompaction`构造replay projection时调用；M5 call永不创建`CompactionReplacement`或调用live reducer。它仍是独立的fallible Prompt constructor，返回redacted `ModelMessageError`：empty为`ModelMessageErrorReason::EmptyText`，UTF-8 byte length超过65,536为`TextTooLong`，unsafe text（包括任意CR或CRLF）为`UnsafeText`。它绝不把CR/CRLF normalize成LF；accepted text逐字保留。rolling summary仍是**恰好一条**unstamped User/Text消息，不加入label、envelope或stamp。
+`rolling_summary()`只可由M4 crate-test-only `CompactionReplacement::for_m4_test()`、M10 production `ValidatedCompactionSummary → CompactionReplacement` construction，或M5 cold projector从recorded `StoredCompaction`构造replay projection时调用；M5 call永不创建`CompactionReplacement`或调用live reducer。它仍是独立的fallible Prompt constructor，返回redacted `ModelMessageError`：empty为`ModelMessageErrorReason::EmptyText`，UTF-8 byte length超过65,536为`TextTooLong`，unsafe text（包括任意CR或CRLF）为`UnsafeText`。它绝不把CR/CRLF normalize成LF；accepted text逐字保留。rolling summary仍是**恰好一条**unstamped User/Text消息，不加入label、envelope或stamp。
 
 `unstamped_user_text()`只服务PromptSet静态User context，并继续执行它自己的普通safe-text validation；它不复用或暗中继承rolling-summary的65,536-byte/CR规则。两条constructor保持分离。
 
@@ -707,6 +707,7 @@ enum PromptAssemblyInputKind<'a> {
     CompactionSummary {
         source: &'a CompactionSummarySourceView,
         directive: &'a CompactionSummaryDirective,
+        budget: &'a CompactionSummaryBudget,
     },
 }
 
@@ -719,11 +720,12 @@ impl<'a> PromptAssemblyInput<'a> {
     pub(crate) fn compaction_summary(
         source: &'a CompactionSummarySourceView,
         directive: &'a CompactionSummaryDirective,
+        budget: &'a CompactionSummaryBudget,
     ) -> Self;
 }
 ```
 
-`PromptAssemblyInput`、its private kind and both constructors are crate-private. variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。M4的AgentRun只接受由live state构造的`LiveConversationView`，它已隔离orphan/incomplete Tool exchange；不在M4定义generic live/replay trait。M5若出现第二producer，必须先定义独立explicit input/projection contract，不能retrofit caller-provided transcript trait。`CompactionSummarySourceView`只能由exact `CompactionPlan`从reducer-owned stable-unit prefix派生，包含待摘要prefix的确定性reduced representation，不包含retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，stable units、cut与marker规则见[Compaction](compaction.md#stable-unit-source)。
+`PromptAssemblyInput`、its private kind and both constructors are crate-private. variant确定`ModelCallPurpose`，caller不能把Compaction source伪装成AgentRun input。M4的AgentRun只接受由live state构造的`LiveConversationView`，它已隔离orphan/incomplete Tool exchange；不在M4定义generic live/replay trait。M5若出现第二producer，必须先定义独立explicit input/projection contract，不能retrofit caller-provided transcript trait。`CompactionSummarySourceView`、directive与budget只能由exact `CompactionPlan`派生并由TurnExecutionContext一起传入；PromptSet重新验证fixed/dynamic token basis及context feasibility。source包含待摘要prefix的确定性reduced representation，不包含retained suffix。PromptSet assembly不接收裸`Vec<MessageRecord>`、任意ToolPromptView或任意PromptContribution。ConversationRevision和recording规则见[Conversation Recording与Replay](conversation-storage.md)，stable units、cut与marker规则见[Compaction](compaction.md#stable-unit-source)。
 
 `CompactionSummary`固定`OutputContract::NoToolCalls`和empty ToolSpec，只组装Runtime required System policy、typed User summary directive和sanitized reduced prefix source。directive中的effective summary budget必须来自Compaction plan，并与pinned `TurnModelSnapshot` exact limits一起进入assembly proof；PromptSet不能重新clamp或扩大。普通Agent/Session/Workspace/Tool/Skill静态内容不进入摘要请求；下一次`AgentRun` assembly重新注入同一个Turn-pinned PromptSet内容。
 

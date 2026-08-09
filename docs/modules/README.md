@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M5.0 durable foundation与exact historical definition resolution已实现；M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication owner、Runtime-owned residency actor/Load/Unload/lifecycle exclusion，以及replay/Recorder-backed Ready+Idle Load hydration已实现；M6.2 scripted text-only Prompt assembly/ModelGateway foundation与Runtime initial empty catalog也已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、完整cross-platform native matrix、完整SessionExecutor Turn control/ActiveTurnTask、Structured/Tool/Compaction assembly、M8 public DTO、M10 compaction与production provider/Tool adapter行为仍待实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M0–M8 foundations/behavior、M9当前control/observation范围及M10 planning和CompactionSummary request/validation/production replacement已实现；M10 async Replace/record orchestration、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、完整cross-platform native matrix、Structured output与production provider/Tool adapters仍待实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
@@ -60,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0、M1、M2 minimal Snapshot/Event、M3.1、M3.2、M4与M5.0 design gate已完成；M5.1 conversation target/proof、owner-tracked Recorder physical append及全部七个 `slice = m5_1` fixture坐标、M5.2 tolerant semantic replay/corruption sidecars、M5.0 durable foundation、M6.1 Workspace resolver/Snapshot、loaded Ready+Idle publication、Runtime residency foundation与replay/Recorder-backed Ready+Idle Load hydration，以及M6.2 scripted text-only ModelGateway foundation已实现；public Runtime command/query/snapshot/event、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、Structured/Tool/Compaction assembly与完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0–M8 foundations/behavior、M9当前control/observation范围及M10 planning/summary request/validation slice已实现；M10 async Replace/record、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、Structured output与完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

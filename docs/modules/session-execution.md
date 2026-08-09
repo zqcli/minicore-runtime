@@ -451,7 +451,7 @@ recording failure不会产生Unavailable。
 
 ## M10 Compaction
 
-M4只实现source/cut/marker/no-I/O的live-reducer subset：apply还接收Session/Turn orchestration提供的`TurnId + Timestamp`。它创建fresh current source，`CompactionReplacement`必须匹配该source derived marker，且pending/cross-session/stale或`source.has_same_stable_identity(&fresh_current_source)`不匹配时在EntryId allocation前拒绝；it consumes exact replacement parts and prepares the rolling-summary stable unit before allocation, then retains suffix only from fresh current source. M4 replacement construction is only `#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>`; M10 will add production construction from `ValidatedCompactionSummary` when those types exist. M4不构造plan/request、不验证model provenance、不调用model/Recorder或发布。M5负责recorded bad-marker ignore/diagnose。以下是M10 full Compaction flow：
+M4只实现source/cut/marker/no-I/O的live-reducer subset：apply还接收Session/Turn orchestration提供的`TurnId + Timestamp`。它创建fresh current source，`CompactionReplacement`必须匹配该source derived marker，且pending/cross-session/stale或`source.has_same_stable_identity(&fresh_current_source)`不匹配时在EntryId allocation前拒绝；it consumes exact replacement parts and prepares the rolling-summary stable unit before allocation, then retains suffix only from fresh current source. M4 replacement construction is only `#[cfg(test)] for_m4_test(...) -> Result<_, CompactionReplacementError>`；M10已从`ValidatedCompactionSummary`增加production sealed construction。M4不构造plan/request、不验证model provenance、不调用model/Recorder或发布。M5负责recorded bad-marker ignore/diagnose。以下是M10 full Compaction flow：
 
 ```text
 exact next AgentRun pressure/Prompt ContextOverflow/provider ContextOverflow
