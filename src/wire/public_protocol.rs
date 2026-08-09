@@ -5053,18 +5053,13 @@ fn validate_session_snapshot_shape(
     validate_readiness(required(object, "readiness")?)?;
     let _execution = validate_execution(required(object, "execution")?)?;
 
-    let current_turn_present = if let Some(current_turn) = object.get("currentTurn") {
+    if let Some(current_turn) = object.get("currentTurn") {
         if !matches!(current_turn, JsonNode::Null) {
             current_turn
                 .as_object()
                 .ok_or_else(selected_wrong_json_type)?;
-            true
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
     let active_items = required(object, "activeItems")?
         .as_array()
         .ok_or_else(selected_wrong_json_type)?;
@@ -5079,25 +5074,14 @@ fn validate_session_snapshot_shape(
     }
 
     validate_session_queues_shape(required(object, "queues")?)?;
-    let recording_healthy = validate_recording(required(object, "recording")?)?;
-    let diagnostics_present =
-        validate_snapshot_diagnostics_shape(required(object, "diagnostics")?)?;
-    if !recording_healthy || diagnostics_present {
-        return Err(TypedJsonError::PendingPublicTarget);
-    }
-    let usage_present = object
-        .get("usage")
-        .map(|usage| {
-            if matches!(usage, JsonNode::Null) {
-                Ok(false)
-            } else {
-                validate_session_usage_shape(usage)
-            }
-        })
-        .transpose()?
-        .unwrap_or(false);
-    if usage_present && !current_turn_present {
-        return Err(TypedJsonError::PendingPublicTarget);
+    validate_recording(required(object, "recording")?)?;
+    required(object, "diagnostics")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    if let Some(usage) = object.get("usage") {
+        if !matches!(usage, JsonNode::Null) {
+            validate_session_usage_shape(usage)?;
+        }
     }
 
     // The loaded-ready-idle candidate remains owned by the semantic model.
@@ -5370,20 +5354,10 @@ fn validate_session_queues_shape(node: &JsonNode) -> Result<(), TypedJsonError> 
     Ok(())
 }
 
-fn validate_session_usage_shape(node: &JsonNode) -> Result<bool, TypedJsonError> {
+fn validate_session_usage_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
-    let model_calls = validate_canonical_u64(required(object, "modelCalls")?)?;
-    if model_calls != 0 {
-        return Ok(true);
-    }
-
-    let compaction_calls = object
-        .get("compactionCalls")
-        .map(validate_canonical_u64)
-        .transpose()?;
-    if compaction_calls.is_some_and(|value| value != 0) {
-        return Ok(true);
-    }
+    validate_canonical_u64(required(object, "modelCalls")?)?;
+    validate_canonical_u64(required(object, "compactionCalls")?)?;
 
     for field in [
         "inputTokens",
@@ -5394,26 +5368,14 @@ fn validate_session_usage_shape(node: &JsonNode) -> Result<bool, TypedJsonError>
     ] {
         if let Some(value) = object.get(field) {
             if !matches!(value, JsonNode::Null) {
-                return Ok(true);
+                validate_canonical_u64(value)?;
             }
         }
     }
-    if let Some(reported_costs) = object.get("reportedCosts") {
-        if !reported_costs
-            .as_array()
-            .ok_or_else(selected_wrong_json_type)?
-            .is_empty()
-        {
-            return Ok(true);
-        }
-    }
-    if compaction_calls.is_none() {
-        return Err(missing_required_field());
-    }
-    if object.get("reportedCosts").is_none() {
-        return Err(missing_required_field());
-    }
-    Ok(false)
+    required(object, "reportedCosts")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    Ok(())
 }
 
 fn validate_canonical_u64(node: &JsonNode) -> Result<u64, TypedJsonError> {

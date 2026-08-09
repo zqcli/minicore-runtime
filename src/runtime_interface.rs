@@ -1881,8 +1881,18 @@ impl SessionSnapshot {
         {
             return Err(ObservationValueError::TooManyValues);
         }
-        if recording.state() == SessionRecordingState::Degraded && diagnostics.is_empty() {
-            return Err(ObservationValueError::NonMinimalObservation);
+        if recording.state() == SessionRecordingState::Degraded
+            && !diagnostics.first().is_some_and(|diagnostic| {
+                matches!(
+                    diagnostic.code(),
+                    "session_recording_initialization_failed"
+                        | "session_recording_encode_failed"
+                        | "session_recording_append_failed"
+                        | "session_recording_outcome_unknown"
+                )
+            })
+        {
+            return Err(ObservationValueError::DegradedWithoutDiagnostic);
         }
         let queues = SessionQueueView::new_with_limits(
             queues.submit_admissions,

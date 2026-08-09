@@ -345,29 +345,33 @@ fn known_pending_observations_do_not_validate_future_payloads() {
 }
 
 #[test]
-fn active_terminal_contract_is_checked_before_pending_snapshot_classification() {
+fn active_terminal_contract_is_checked_with_usage_and_recording_snapshots() {
     let protocol = IncrementalRuntimeProtocolV1::v1_0();
     for (path, wrong_terminal_type) in [
         ("valid/turn-completed-state-frame.json", "failed"),
         ("valid/turn-failed-state-frame.json", "completed"),
     ] {
-        for pending_snapshot in ["usage", "recording"] {
+        for projected_snapshot in ["usage", "recording"] {
             let mut legal: serde_json::Value =
                 serde_json::from_slice(&fixture(path)).expect("terminal fixture is JSON");
-            if pending_snapshot == "usage" {
+            if projected_snapshot == "usage" {
                 legal["data"]["msg"]["data"]["snapshot"]["usage"]["modelCalls"] =
                     serde_json::json!("1");
             } else {
                 legal["data"]["msg"]["data"]["snapshot"]["recording"]["state"] =
                     serde_json::json!("degraded");
+                legal["data"]["msg"]["data"]["snapshot"]["diagnostics"] = serde_json::json!([{
+                    "code": "session_recording_append_failed",
+                    "message": "session recording append failed"
+                }]);
             }
-            assert!(
-                protocol
-                    .decode_event_frame(&serde_json::to_vec(&legal).unwrap())
-                    .unwrap_err()
-                    .is_pending_public_target(),
-                "a legal terminal with a {pending_snapshot} snapshot is pending"
-            );
+            protocol
+                .decode_event_frame(&serde_json::to_vec(&legal).unwrap())
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "a legal terminal with a {projected_snapshot} snapshot failed: {error:?}"
+                    )
+                });
 
             let mut missing_detail = legal.clone();
             missing_detail["data"]["msg"]["data"]
@@ -529,36 +533,60 @@ fn progress_frame_validates_only_its_closed_outer_contract() {
 }
 
 #[test]
-fn future_session_snapshot_projection_remains_known_pending() {
+fn session_snapshot_usage_recording_and_diagnostics_are_active() {
     let base = String::from_utf8(fixture("valid/session-snapshot-frame.json")).unwrap();
-    for later in [
+    for active in [
         base.replace("\"modelCalls\":\"0\"", "\"modelCalls\":\"1\""),
         base.replace(
             "\"diagnostics\":[]",
             "\"diagnostics\":[{\"code\":\"usage_currency_limit_exceeded\",\"message\":\"safe summary\"}]",
         ),
-        base.replace(
-            "\"recording\":{\"state\":\"healthy\"}",
-            "\"recording\":{\"state\":\"degraded\"}",
+        base.replace("\"recording\":{\"state\":\"healthy\"}", "\"recording\":{\"state\":\"degraded\"}").replace(
+            "\"diagnostics\":[]",
+            "\"diagnostics\":[{\"code\":\"session_recording_append_failed\",\"message\":\"session recording append failed\"}]",
         ),
     ] {
-        assert!(
-            IncrementalRuntimeProtocolV1::v1_0()
-                .decode_event_frame(later.as_bytes())
-                .unwrap_err()
-                .is_pending_public_target()
+        let protocol = IncrementalRuntimeProtocolV1::v1_0();
+        let decoded = protocol.decode_event_frame(active.as_bytes()).unwrap();
+        assert_eq!(
+            protocol.encode_event_frame(&decoded).unwrap(),
+            without_lf(active.as_bytes())
         );
     }
 
+    let degraded_without_diagnostic = base.replace(
+        "\"recording\":{\"state\":\"healthy\"}",
+        "\"recording\":{\"state\":\"degraded\"}",
+    );
+    assert_invalid_scalar(
+        IncrementalRuntimeProtocolV1::v1_0()
+            .decode_event_frame(degraded_without_diagnostic.as_bytes())
+            .unwrap_err(),
+    );
+
+    let recording_diagnostic_not_first = base
+        .replace(
+            "\"recording\":{\"state\":\"healthy\"}",
+            "\"recording\":{\"state\":\"degraded\"}",
+        )
+        .replace(
+            "\"diagnostics\":[]",
+            "\"diagnostics\":[{\"code\":\"usage_currency_limit_exceeded\",\"message\":\"safe summary\"},{\"code\":\"session_recording_append_failed\",\"message\":\"session recording append failed\"}]",
+        );
+    assert_invalid_scalar(
+        IncrementalRuntimeProtocolV1::v1_0()
+            .decode_event_frame(recording_diagnostic_not_first.as_bytes())
+            .unwrap_err(),
+    );
+
     let unsafe_diagnostic = base.replace(
         "\"diagnostics\":[]",
-        "\"diagnostics\":[{\"code\":\"recording_failed\",\"message\":\"unsafe\\u0000detail\"}]",
+        "\"diagnostics\":[{\"code\":\"session_recording_append_failed\",\"message\":\"unsafe\\u0000detail\"}]",
     );
-    assert!(
+    assert_invalid_scalar(
         IncrementalRuntimeProtocolV1::v1_0()
             .decode_event_frame(unsafe_diagnostic.as_bytes())
-            .unwrap_err()
-            .is_pending_public_target()
+            .unwrap_err(),
     );
 }
 

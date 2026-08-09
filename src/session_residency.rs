@@ -4212,13 +4212,21 @@ mod tests {
         );
         assert_eq!(registry.loaded_count_for_test(), 1);
         assert_eq!(registry.gate_count_for_test(), 1);
+        let snapshot = registry
+            .snapshot(session_id)
+            .await
+            .expect("the degraded-recorder Load installs an Idle executor");
         assert_eq!(
-            registry
-                .snapshot(session_id)
-                .await
-                .expect("the degraded-recorder Load installs an Idle executor")
-                .execution_state(),
+            snapshot.execution_state(),
             crate::session_execution::SessionExecutionState::Idle
+        );
+        assert_eq!(
+            snapshot.recording(),
+            crate::runtime_interface::SessionRecordingState::Degraded
+        );
+        assert_eq!(
+            snapshot.diagnostics()[0].code(),
+            "session_recording_initialization_failed"
         );
 
         let executor = registry

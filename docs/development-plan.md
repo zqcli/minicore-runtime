@@ -262,7 +262,7 @@ M9 当前补充：running/approval Session Snapshot fixture 已从 pending ownin
 2. 为M7实现Create/Load/Submit/Cancel/Unload、CommandCompletion/Error、minimal SessionSnapshot与StateEvent；
 3. M8同步扩展Tool/Interaction Item和resolution DTO；
 4. M9同步扩展actionable queues、Steer/FollowUp和retry projection；
-5. M10同步扩展Compaction/usage/diagnostic projection；
+5. M10同步扩展Compaction；Session usage、recording health与diagnostic projection已先随观察面接通；
 6. 每个family落地时由manifest runner逐项decode、semantic assert和canonical re-encode；
 7. M11要求manifest无pending target，并统一执行compat ignored-pointer比较。
 
@@ -557,6 +557,8 @@ M8首先建立ActiveTurnControl、EmergencyControl、Interaction resolution和To
 ## M10 · Compaction
 
 M10完成完整INV-005；M4已经提供source/cut/marker/no-I/O reducer subset，M5已经提供recorded-marker tolerant replay。
+
+当前补充：Session usage按selected conversation history聚合model/compaction calls、optional token totals与currency-separated reported costs；u64/decimal overflow与currency limit产生bounded diagnostics。Recorder Healthy/Degraded及首条安全 recording diagnostic与usage/diagnostics已接通Session Snapshot、Runtime facade和Wire V1；Compaction orchestration/replacement仍后置。
 
 实现：
 

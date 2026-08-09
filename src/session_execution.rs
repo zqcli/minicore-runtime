@@ -24,8 +24,9 @@ use crate::agent_session_lifecycle::{
     SessionDefinitionDecisionError, SessionLifecycle,
 };
 use crate::conversation_storage::{
-    ConversationReplayDiagnostics, SessionRecorder, StoredAssistantContent, StoredAssistantMessage,
-    StoredEntryBody, StoredToolMessage, StoredToolOutcome, StoredUserMessage,
+    ConversationReplayDiagnostics, RecordingHealth, SessionRecorder, SessionRecordingError,
+    StoredAssistantContent, StoredAssistantMessage, StoredEntryBody, StoredToolMessage,
+    StoredToolOutcome, StoredUserMessage,
 };
 use crate::durable_state::{
     AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
@@ -38,14 +39,15 @@ use crate::live_conversation::{
 use crate::model_gateway::{
     FinalizedAssistantContent, ModelCallError, ModelCallErrorReason, ModelCallPurpose,
     ModelCallRequest, ModelCallResult, ModelCatalogView, ModelGateway, ModelProgressPublisher,
-    ModelRequestValidationErrorKind, ProviderRequestDeliveryState,
+    ModelRequestValidationErrorKind, ModelUsage, ProviderRequestDeliveryState,
 };
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
 };
 use crate::runtime_interface::{
     CurrentTurnView, InteractionView, ItemContentView, ItemStatusView, ItemView,
-    TurnExecutionPhaseView, TurnStatusView,
+    SessionDiagnosticView, SessionRecordingState, SessionUsageView, TurnExecutionPhaseView,
+    TurnStatusView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
@@ -64,8 +66,9 @@ use crate::turn_item_interaction::{
     ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
-    CommandId, IdGenerationError, InteractionResolutionKey, ItemId, RequestId,
-    SessionDefinitionRevision, SessionId, Timestamp, TurnId, WorkspaceRevision,
+    CommandId, CurrencyCode, IdGenerationError, InteractionResolutionKey, ItemId, Money,
+    MoneyAmount, ProtocolLimits, RequestId, SessionDefinitionRevision, SessionId, Timestamp,
+    TurnId, WorkspaceRevision,
 };
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshot,
@@ -177,6 +180,9 @@ pub(crate) struct SessionExecutorSnapshot {
     current_turn_view: Option<CurrentTurnView>,
     active_items: Arc<[ItemView]>,
     public_pending_interactions: Arc<[InteractionView]>,
+    usage: Option<SessionUsageView>,
+    recording: SessionRecordingState,
+    diagnostics: Arc<[SessionDiagnosticView]>,
     last_terminal: Option<(TurnId, SessionTurnTerminal)>,
     pending_interactions: Arc<[crate::live_conversation::PendingInteractionFact]>,
     active_submit_command_id: Option<CommandId>,
@@ -198,6 +204,9 @@ impl SessionExecutorSnapshot {
             current_turn_view: None,
             active_items: Arc::from([]),
             public_pending_interactions: Arc::from([]),
+            usage: None,
+            recording: SessionRecordingState::Healthy,
+            diagnostics: Arc::from([]),
             last_terminal: None,
             pending_interactions: Arc::from([]),
             active_submit_command_id: None,
@@ -220,6 +229,9 @@ impl SessionExecutorSnapshot {
             current_turn_view: self.current_turn_view,
             active_items: Arc::clone(&self.active_items),
             public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
             last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
             active_submit_command_id: self.active_submit_command_id,
@@ -240,6 +252,9 @@ impl SessionExecutorSnapshot {
             current_turn_view: self.current_turn_view,
             active_items: Arc::clone(&self.active_items),
             public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
             last_terminal: self.last_terminal,
             pending_interactions,
             active_submit_command_id: self.active_submit_command_id,
@@ -262,6 +277,9 @@ impl SessionExecutorSnapshot {
             current_turn_view: self.current_turn_view,
             active_items: Arc::clone(&self.active_items),
             public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
             last_terminal: self.last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
             active_submit_command_id,
@@ -284,6 +302,34 @@ impl SessionExecutorSnapshot {
             current_turn_view,
             active_items,
             public_pending_interactions,
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    fn with_public_session_state(
+        &self,
+        usage: Option<SessionUsageView>,
+        recording: SessionRecordingState,
+        diagnostics: Arc<[SessionDiagnosticView]>,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            workspace: Arc::clone(&self.workspace),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage,
+            recording,
+            diagnostics,
             last_terminal: self.last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
             active_submit_command_id: self.active_submit_command_id,
@@ -328,6 +374,18 @@ impl SessionExecutorSnapshot {
         &self.public_pending_interactions
     }
 
+    pub(crate) const fn usage(&self) -> Option<&SessionUsageView> {
+        self.usage.as_ref()
+    }
+
+    pub(crate) const fn recording(&self) -> SessionRecordingState {
+        self.recording
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[SessionDiagnosticView] {
+        &self.diagnostics
+    }
+
     pub(crate) const fn last_terminal(&self) -> Option<(TurnId, SessionTurnTerminal)> {
         self.last_terminal
     }
@@ -365,6 +423,9 @@ impl fmt::Debug for SessionExecutorSnapshot {
                 "public_pending_interactions",
                 &self.public_pending_interactions.len(),
             )
+            .field("has_usage", &self.usage.is_some())
+            .field("recording", &self.recording)
+            .field("diagnostics", &self.diagnostics.len())
             .field("last_terminal", &self.last_terminal)
             .field("pending_interactions", &self.pending_interactions.len())
             .field(
@@ -925,11 +986,15 @@ impl SessionExecutor {
             return Err(SessionExecutorStartError::WorkspaceRevisionMismatch);
         }
 
-        let current = Arc::new(SessionExecutorSnapshot::new(
-            Arc::clone(&definition),
-            workspace,
-            SessionExecutionState::Idle,
-        ));
+        let (usage, recording, diagnostics) = capture_public_session_state(conversation.as_ref());
+        let current = Arc::new(
+            SessionExecutorSnapshot::new(
+                Arc::clone(&definition),
+                workspace,
+                SessionExecutionState::Idle,
+            )
+            .with_public_session_state(usage, recording, diagnostics),
+        );
         let published_snapshot = Arc::new(Mutex::new(Arc::clone(&current)));
         let (sender, receiver) = mpsc::channel(SESSION_EXECUTOR_REQUEST_QUEUE_CAPACITY);
         let (completion_sender, completion_receiver) = mpsc::unbounded_channel();
@@ -3012,6 +3077,9 @@ impl SessionExecutorActor {
         } else {
             Arc::new(current.with_public_observation(None, Arc::from([]), Arc::from([])))
         };
+        let (usage, recording, diagnostics) =
+            capture_public_session_state(self.conversation.as_ref());
+        let current = Arc::new(current.with_public_session_state(usage, recording, diagnostics));
         self.current = Arc::clone(&current);
         *lock(&self.published_snapshot) = current;
     }
@@ -3177,6 +3245,315 @@ impl SessionExecutorActor {
             pending_interactions.into(),
         )
     }
+}
+
+#[derive(Default)]
+struct OptionalUsageTotal {
+    value: u64,
+    seen: bool,
+    overflowed: bool,
+}
+
+impl OptionalUsageTotal {
+    fn add(&mut self, value: Option<u64>) {
+        let Some(value) = value else {
+            return;
+        };
+        self.seen = true;
+        if self.overflowed {
+            return;
+        }
+        match self.value.checked_add(value) {
+            Some(total) => self.value = total,
+            None => self.overflowed = true,
+        }
+    }
+
+    const fn projected(&self) -> Option<u64> {
+        if self.seen && !self.overflowed {
+            Some(self.value)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CostTotal {
+    coefficient: u128,
+    scale: u8,
+    overflowed: bool,
+}
+
+impl CostTotal {
+    const fn new(amount: MoneyAmount) -> Self {
+        Self {
+            coefficient: amount.coefficient(),
+            scale: amount.scale(),
+            overflowed: false,
+        }
+    }
+
+    fn add(&mut self, amount: MoneyAmount) {
+        if self.overflowed {
+            return;
+        }
+        let scale = self.scale.max(amount.scale());
+        let Some(left) = scale_amount(self.coefficient, self.scale, scale) else {
+            self.overflowed = true;
+            return;
+        };
+        let Some(right) = scale_amount(amount.coefficient(), amount.scale(), scale) else {
+            self.overflowed = true;
+            return;
+        };
+        let Some(coefficient) = left.checked_add(right) else {
+            self.overflowed = true;
+            return;
+        };
+        self.coefficient = coefficient;
+        self.scale = scale;
+    }
+
+    fn amount(self) -> Option<MoneyAmount> {
+        if self.overflowed {
+            return None;
+        }
+        canonical_money_amount(self.coefficient, self.scale)
+    }
+}
+
+#[derive(Default)]
+struct UsageProjection {
+    model_calls: u64,
+    compaction_calls: u64,
+    input_tokens: OptionalUsageTotal,
+    output_tokens: OptionalUsageTotal,
+    reasoning_tokens: OptionalUsageTotal,
+    cache_read_tokens: OptionalUsageTotal,
+    cache_write_tokens: OptionalUsageTotal,
+    reported_costs: BTreeMap<CurrencyCode, CostTotal>,
+}
+
+impl UsageProjection {
+    fn add_model_call(&mut self, usage: Option<&ModelUsage>) {
+        self.model_calls = self
+            .model_calls
+            .checked_add(1)
+            .expect("the conversation entry cap bounds model calls");
+        self.add_usage(usage);
+    }
+
+    fn add_compaction_call(&mut self, usage: Option<&ModelUsage>) {
+        self.compaction_calls = self
+            .compaction_calls
+            .checked_add(1)
+            .expect("the conversation entry cap bounds compaction calls");
+        self.add_usage(usage);
+    }
+
+    fn add_usage(&mut self, usage: Option<&ModelUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        self.input_tokens.add(usage.input_tokens());
+        self.output_tokens.add(usage.output_tokens());
+        self.reasoning_tokens.add(usage.reasoning_tokens());
+        self.cache_read_tokens.add(usage.cache_read_tokens());
+        self.cache_write_tokens.add(usage.cache_write_tokens());
+        if let Some(cost) = usage.reported_cost().copied() {
+            self.reported_costs
+                .entry(cost.currency())
+                .and_modify(|total| total.add(cost.amount()))
+                .or_insert_with(|| CostTotal::new(cost.amount()));
+        }
+    }
+
+    fn finish(self) -> (SessionUsageView, Vec<SessionDiagnosticView>) {
+        let mut diagnostics = Vec::new();
+        add_usage_overflow_diagnostic(
+            &mut diagnostics,
+            self.input_tokens.overflowed,
+            "usage_input_tokens_overflow",
+            "input token usage overflowed",
+        );
+        add_usage_overflow_diagnostic(
+            &mut diagnostics,
+            self.output_tokens.overflowed,
+            "usage_output_tokens_overflow",
+            "output token usage overflowed",
+        );
+        add_usage_overflow_diagnostic(
+            &mut diagnostics,
+            self.reasoning_tokens.overflowed,
+            "usage_reasoning_tokens_overflow",
+            "reasoning token usage overflowed",
+        );
+        add_usage_overflow_diagnostic(
+            &mut diagnostics,
+            self.cache_read_tokens.overflowed,
+            "usage_cache_read_tokens_overflow",
+            "cache read token usage overflowed",
+        );
+        add_usage_overflow_diagnostic(
+            &mut diagnostics,
+            self.cache_write_tokens.overflowed,
+            "usage_cache_write_tokens_overflow",
+            "cache write token usage overflowed",
+        );
+
+        let too_many_currencies = self.reported_costs.len() > 8;
+        let mut reported_costs = Vec::new();
+        for (currency, total) in self.reported_costs.into_iter().take(8) {
+            match total.amount() {
+                Some(amount) => reported_costs.push(Money::new(amount, currency)),
+                None => diagnostics.push(session_diagnostic(
+                    "usage_currency_overflow",
+                    "reported cost overflowed for one currency",
+                )),
+            }
+        }
+        if too_many_currencies {
+            diagnostics.push(session_diagnostic(
+                "usage_currency_limit_exceeded",
+                "reported costs exceeded the currency limit",
+            ));
+        }
+        let usage = SessionUsageView::new(
+            self.model_calls,
+            self.compaction_calls,
+            self.input_tokens.projected(),
+            self.output_tokens.projected(),
+            self.reasoning_tokens.projected(),
+            self.cache_read_tokens.projected(),
+            self.cache_write_tokens.projected(),
+            reported_costs,
+        )
+        .expect("the bounded conversation projection satisfies public usage limits");
+        (usage, diagnostics)
+    }
+}
+
+fn capture_public_session_state(
+    conversation: Option<&Arc<LoadedSessionConversation>>,
+) -> (
+    Option<SessionUsageView>,
+    SessionRecordingState,
+    Arc<[SessionDiagnosticView]>,
+) {
+    let Some(conversation) = conversation else {
+        return (None, SessionRecordingState::Healthy, Arc::from([]));
+    };
+    let mut projection = UsageProjection::default();
+    {
+        let live_state = lock(&conversation.live_state);
+        for entry in live_state.selected_entries() {
+            match entry.body() {
+                StoredEntryBody::AssistantMessage(message) => {
+                    projection.add_model_call(message.usage());
+                }
+                StoredEntryBody::Compaction(compaction) => {
+                    if let Some(call) = compaction.model_call() {
+                        projection.add_compaction_call(call.usage());
+                    }
+                }
+                StoredEntryBody::UserMessage(_)
+                | StoredEntryBody::ToolMessage(_)
+                | StoredEntryBody::InteractionRequested(_)
+                | StoredEntryBody::InteractionResolved(_) => {}
+            }
+        }
+    }
+    let (usage, mut usage_diagnostics) = projection.finish();
+    let recording_health = conversation.recorder.health();
+    let recording = match &*recording_health {
+        RecordingHealth::Healthy => SessionRecordingState::Healthy,
+        RecordingHealth::Degraded { .. } => SessionRecordingState::Degraded,
+    };
+    let mut diagnostics = Vec::with_capacity(usage_diagnostics.len() + 1);
+    if let RecordingHealth::Degraded {
+        failed_entry_id,
+        reason,
+    } = &*recording_health
+    {
+        diagnostics.push(recording_diagnostic(*failed_entry_id, *reason));
+    }
+    diagnostics.append(&mut usage_diagnostics);
+    (Some(usage), recording, diagnostics.into())
+}
+
+fn recording_diagnostic(
+    failed_entry_id: Option<crate::wire::EntryId>,
+    reason: SessionRecordingError,
+) -> SessionDiagnosticView {
+    let (code, message) = if failed_entry_id.is_none() {
+        (
+            "session_recording_initialization_failed",
+            "session recording initialization failed",
+        )
+    } else {
+        match reason {
+            SessionRecordingError::Encode(_) | SessionRecordingError::EntryTooLarge => (
+                "session_recording_encode_failed",
+                "session recording encoding failed",
+            ),
+            SessionRecordingError::Runtime(_) => (
+                "session_recording_outcome_unknown",
+                "session recording outcome is unknown",
+            ),
+            SessionRecordingError::TargetInvariant
+            | SessionRecordingError::MetadataUnavailable
+            | SessionRecordingError::EntrySessionMismatch
+            | SessionRecordingError::FileTooLarge
+            | SessionRecordingError::WriteFailed => (
+                "session_recording_append_failed",
+                "session recording append failed",
+            ),
+        }
+    };
+    session_diagnostic(code, message)
+}
+
+fn scale_amount(coefficient: u128, from_scale: u8, to_scale: u8) -> Option<u128> {
+    coefficient.checked_mul(10_u128.pow(u32::from(to_scale.checked_sub(from_scale)?)))
+}
+
+fn canonical_money_amount(mut coefficient: u128, mut scale: u8) -> Option<MoneyAmount> {
+    while scale != 0 && coefficient % 10 == 0 {
+        coefficient /= 10;
+        scale -= 1;
+    }
+    let text = if scale == 0 {
+        coefficient.to_string()
+    } else {
+        let scale = usize::from(scale);
+        let mut digits = coefficient.to_string();
+        if digits.len() <= scale {
+            let mut padded = String::with_capacity(scale + 1);
+            padded.extend(std::iter::repeat_n('0', scale + 1 - digits.len()));
+            padded.push_str(&digits);
+            digits = padded;
+        }
+        let split = digits.len() - scale;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    text.parse().ok()
+}
+
+fn add_usage_overflow_diagnostic(
+    diagnostics: &mut Vec<SessionDiagnosticView>,
+    overflowed: bool,
+    code: &str,
+    message: &str,
+) {
+    if overflowed {
+        diagnostics.push(session_diagnostic(code, message));
+    }
+}
+
+fn session_diagnostic(code: &str, message: &str) -> SessionDiagnosticView {
+    SessionDiagnosticView::new_with_limits(code, message, ProtocolLimits::v1_0())
+        .expect("owner-controlled diagnostics satisfy public limits")
 }
 
 fn valid_durable_definition_shape(
@@ -5306,6 +5683,106 @@ mod tests {
     const G2: &str = "00000000000000000002";
 
     static NEXT_TEST_ROOT: AtomicUsize = AtomicUsize::new(1);
+
+    #[test]
+    fn public_usage_projection_aggregates_tokens_costs_and_overflow_diagnostics() {
+        let usd: CurrencyCode = "USD".parse().unwrap();
+        let first = ModelUsage::reconstruct(
+            Some(u64::MAX),
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            Some(Money::new("0.01".parse().unwrap(), usd)),
+        );
+        let second = ModelUsage::reconstruct(
+            Some(1),
+            Some(3),
+            Some(4),
+            None,
+            None,
+            None,
+            Some(Money::new("0.09".parse().unwrap(), usd)),
+        );
+        let mut projection = UsageProjection::default();
+        projection.add_model_call(Some(&first));
+        projection.add_model_call(Some(&second));
+        let (usage, diagnostics) = projection.finish();
+
+        assert_eq!(usage.model_calls(), 2);
+        assert_eq!(usage.input_tokens(), None);
+        assert_eq!(usage.output_tokens(), Some(5));
+        assert_eq!(usage.reasoning_tokens(), Some(4));
+        assert_eq!(usage.reported_costs().len(), 1);
+        assert_eq!(usage.reported_costs()[0].amount().to_string(), "0.1");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(SessionDiagnosticView::code)
+                .collect::<Vec<_>>(),
+            ["usage_input_tokens_overflow"]
+        );
+    }
+
+    #[test]
+    fn public_usage_projection_bounds_currencies_and_diagnoses_decimal_overflow() {
+        let mut projection = UsageProjection::default();
+        for code in [
+            "AAA", "AAB", "AAC", "AAD", "AAE", "AAF", "AAG", "AAH", "AAI",
+        ] {
+            let usage = ModelUsage::reconstruct(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(Money::new("1".parse().unwrap(), code.parse().unwrap())),
+            );
+            projection.add_model_call(Some(&usage));
+        }
+        let (usage, diagnostics) = projection.finish();
+        assert_eq!(usage.reported_costs().len(), 8);
+        assert_eq!(
+            usage
+                .reported_costs()
+                .iter()
+                .map(|cost| cost.currency().to_string())
+                .collect::<Vec<_>>(),
+            vec!["AAA", "AAB", "AAC", "AAD", "AAE", "AAF", "AAG", "AAH"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "usage_currency_limit_exceeded")
+        );
+
+        let maximum = "999999999999999999.999999999".parse().unwrap();
+        let usd = "USD".parse().unwrap();
+        let overflowing = ModelUsage::reconstruct(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Money::new(maximum, usd)),
+        );
+        let mut overflow_projection = UsageProjection::default();
+        overflow_projection.add_model_call(Some(&overflowing));
+        overflow_projection.add_model_call(Some(&overflowing));
+        let (overflow_usage, overflow_diagnostics) = overflow_projection.finish();
+        assert!(overflow_usage.reported_costs().is_empty());
+        assert!(
+            overflow_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code() == "usage_currency_overflow")
+        );
+    }
 
     async fn poll_once_pending<F>(mut future: Pin<&mut F>) -> bool
     where
