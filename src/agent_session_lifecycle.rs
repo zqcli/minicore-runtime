@@ -1540,14 +1540,16 @@ impl fmt::Debug for SealedSessionMetadataAttempt {
     }
 }
 
-/// The lifecycle-owned, pre-identity input to one recorded-history Genesis Fork attempt.
+/// The lifecycle-owned, pre-identity input to one Session Fork attempt.
 ///
-/// The source Session identity and child-local creation timestamp are the only facts captured
-/// here. DurableState supplies the child identity and the exact source definition after actor
-/// serialization; physical storage, publication and source conversation facts do not cross this
-/// seam.
+/// The source Session identity, selected source kind, public anchor, and child-local creation
+/// timestamp are captured here. DurableState supplies the child identity and the exact source
+/// definition after actor serialization; physical storage and source conversation facts do not
+/// cross this seam.
 pub(crate) struct SealedSessionForkAttempt {
     source_session_id: SessionId,
+    source: ForkSourceKind,
+    anchor: ForkAnchor,
     child_created_at: Timestamp,
 }
 
@@ -1558,6 +1560,20 @@ pub(crate) enum SessionForkAttemptError {
 }
 
 impl SealedSessionForkAttempt {
+    pub(crate) const fn new(
+        source_session_id: SessionId,
+        source: ForkSourceKind,
+        anchor: ForkAnchor,
+        child_created_at: Timestamp,
+    ) -> Self {
+        Self {
+            source_session_id,
+            source,
+            anchor,
+            child_created_at,
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "the public Session Fork command constructor consumes this sealed lifecycle seam"
@@ -1566,14 +1582,24 @@ impl SealedSessionForkAttempt {
         source_session_id: SessionId,
         child_created_at: Timestamp,
     ) -> Self {
-        Self {
+        Self::new(
             source_session_id,
+            ForkSourceKind::RecordedHistory,
+            ForkAnchor::Genesis,
             child_created_at,
-        }
+        )
     }
 
     pub(crate) const fn source_session_id(&self) -> SessionId {
         self.source_session_id
+    }
+
+    pub(crate) const fn source(&self) -> ForkSourceKind {
+        self.source
+    }
+
+    pub(crate) const fn anchor(&self) -> &ForkAnchor {
+        &self.anchor
     }
 
     pub(crate) fn generate_candidate(&self) -> Result<SessionId, IdGenerationError> {
@@ -1602,7 +1628,7 @@ impl SealedSessionForkAttempt {
             None::<&str>,
             self.child_created_at,
         )
-        .expect("empty Genesis Fork metadata is always valid");
+        .expect("empty Fork child metadata is always valid");
         let definition = SessionDefinition::new(
             child_session_id,
             definition_revision,
@@ -1612,7 +1638,8 @@ impl SealedSessionForkAttempt {
             source_definition.prompts().clone(),
             self.child_created_at,
         );
-        let provenance = SessionForkProvenance::recorded_genesis(self.source_session_id);
+        let provenance =
+            SessionForkProvenance::new(self.source_session_id, self.source, self.anchor.clone());
         Ok((definition, metadata, provenance))
     }
 }
@@ -1622,6 +1649,8 @@ impl fmt::Debug for SealedSessionForkAttempt {
         formatter
             .debug_struct("SealedSessionForkAttempt")
             .field("source_session", &"redacted")
+            .field("source", &self.source)
+            .field("anchor", &self.anchor)
             .field("child_created_at", &"redacted")
             .finish()
     }
@@ -1913,14 +1942,6 @@ pub struct SessionForkProvenance {
 }
 
 impl SessionForkProvenance {
-    pub(crate) const fn recorded_genesis(source_session_id: SessionId) -> Self {
-        Self {
-            source_session_id,
-            source: ForkSourceKind::RecordedHistory,
-            anchor: ForkAnchor::Genesis,
-        }
-    }
-
     pub const fn new(
         source_session_id: SessionId,
         source: ForkSourceKind,

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use thiserror::Error;
 use tokio::sync::Notify;
 
-use crate::agent_session_lifecycle::AgentRevisionRef;
+use crate::agent_session_lifecycle::{AgentRevisionRef, ForkAnchor, ForkSourceKind};
 use crate::compaction::{
     CompactionUnitKind, LiveCompactionUnit, PreparedLiveCompactionUnit, StoredCompaction,
 };
@@ -36,7 +36,8 @@ use crate::wire::conversation_jsonl::{
 use crate::wire::conversation_jsonl_scanner::{
     ConversationJsonlScanner, ConversationLineCanonicality, ConversationLineFault,
     ConversationPartialTailAction, ConversationPhysicalLocation, ConversationScanAccess,
-    ConversationScanError, ConversationScanEvent, MAX_CONVERSATION_FILE_BYTES,
+    ConversationScanError, ConversationScanEvent, MAX_CONVERSATION_ENTRY_RECORDS,
+    MAX_CONVERSATION_FILE_BYTES,
 };
 use crate::wire::{
     BoundedJsonObject, EntryId, InteractionResolutionKey, ItemId, RequestId,
@@ -240,6 +241,8 @@ pub(crate) enum RecordedForkSourceError {
     TooLarge,
     #[error("recorded Fork source is corrupt")]
     Corrupt,
+    #[error("recorded Fork anchor is invalid for the selected source path")]
+    InvalidAnchor,
     #[error("recorded Fork source is unavailable")]
     Unavailable,
 }
@@ -265,31 +268,335 @@ impl RecordedForkConversationLease {
         self.declared_file_bytes
     }
 
-    pub(crate) fn validate_recorded_genesis(
+    pub(crate) fn capture_selected_path(
         &mut self,
         expected_header: &SessionHeader,
-    ) -> Result<(), RecordedForkSourceError> {
-        let scanner = ConversationJsonlScanner::open(
+        anchor: ForkAnchor,
+    ) -> Result<CapturedForkConversation, RecordedForkSourceError> {
+        let view = replay_conversation(
             &mut self.file,
             self.declared_file_bytes,
             self.source_session_id,
             ConversationScanAccess::ReadOnly,
         )
-        .map_err(map_recorded_fork_source_scan_error)?;
-        if scanner
-            .header()
-            .map_err(map_recorded_fork_source_scan_error)?
-            != expected_header
-            || !scanner.header_is_canonical()
-        {
+        .map_err(map_recorded_fork_replay_error)?;
+        if view.header() != expected_header || !view.header_is_canonical() {
             return Err(RecordedForkSourceError::Corrupt);
         }
-        Ok(())
+        CapturedForkConversation::from_selected_path(
+            self.source_session_id,
+            ForkSourceKind::RecordedHistory,
+            anchor,
+            view.selected_entries(),
+            view.relations(),
+        )
+        .map_err(|error| match error {
+            ForkAnchorResolutionError::InvalidAnchor => RecordedForkSourceError::InvalidAnchor,
+            ForkAnchorResolutionError::TooLarge => RecordedForkSourceError::TooLarge,
+            ForkAnchorResolutionError::InvalidSource
+            | ForkAnchorResolutionError::Encode
+            | ForkAnchorResolutionError::Unavailable => RecordedForkSourceError::Unavailable,
+        })
     }
 
     pub(crate) fn handle_metadata(&self) -> io::Result<Metadata> {
         self.file.metadata()
     }
+}
+
+fn map_recorded_fork_replay_error(error: ConversationReplayError) -> RecordedForkSourceError {
+    match error {
+        ConversationReplayError::HistoryTooLarge => RecordedForkSourceError::TooLarge,
+        ConversationReplayError::HeaderCorrupt
+        | ConversationReplayError::UnsupportedFormatVersion
+        | ConversationReplayError::MissingHeader => RecordedForkSourceError::Corrupt,
+        ConversationReplayError::LeaseMismatch
+        | ConversationReplayError::InputChanged
+        | ConversationReplayError::InputUnavailable
+        | ConversationReplayError::CounterOverflow
+        | ConversationReplayError::InvariantViolation => RecordedForkSourceError::Unavailable,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum ForkAnchorResolutionError {
+    #[error("Fork anchor is invalid for the selected source path")]
+    InvalidAnchor,
+    #[error("Fork source path violates its immutable identity contract")]
+    InvalidSource,
+    #[error("Fork child conversation exceeds its selected storage limit")]
+    TooLarge,
+    #[error("Fork child conversation cannot be encoded")]
+    Encode,
+    #[error("Fork child conversation is unavailable")]
+    Unavailable,
+}
+
+/// One immutable, anchor-resolved source path captured at the Fork linearization point.
+///
+/// The selected entries retain their original Arcs and stable historical identities. The value
+/// contains no file handle, path, child identity, or publication authority.
+#[derive(Clone)]
+pub(crate) struct CapturedForkConversation {
+    source_session_id: SessionId,
+    source: ForkSourceKind,
+    anchor: ForkAnchor,
+    selected_entries: Arc<[Arc<StoredSessionEntry>]>,
+}
+
+impl CapturedForkConversation {
+    fn from_selected_path(
+        source_session_id: SessionId,
+        source: ForkSourceKind,
+        anchor: ForkAnchor,
+        selected_entries: &[Arc<StoredSessionEntry>],
+        relations: &[ItemRelation],
+    ) -> Result<Self, ForkAnchorResolutionError> {
+        let prefix_len = resolve_fork_anchor(selected_entries, relations, &anchor)
+            .ok_or(ForkAnchorResolutionError::InvalidAnchor)?;
+        let selected_entries = selected_entries[..prefix_len].to_vec();
+        validate_captured_fork_path(source_session_id, &selected_entries)?;
+        Ok(Self {
+            source_session_id,
+            source,
+            anchor,
+            selected_entries: selected_entries.into(),
+        })
+    }
+
+    pub(crate) const fn source_session_id(&self) -> SessionId {
+        self.source_session_id
+    }
+
+    pub(crate) const fn source(&self) -> ForkSourceKind {
+        self.source
+    }
+
+    pub(crate) const fn anchor(&self) -> &ForkAnchor {
+        &self.anchor
+    }
+
+    pub(crate) fn write_for_child<W: Write>(
+        &self,
+        header: &SessionHeader,
+        writer: &mut W,
+    ) -> Result<u64, ForkAnchorResolutionError> {
+        validate_captured_fork_path(self.source_session_id, &self.selected_entries)?;
+        if u64::try_from(self.selected_entries.len())
+            .map_err(|_| ForkAnchorResolutionError::TooLarge)?
+            > MAX_CONVERSATION_ENTRY_RECORDS
+        {
+            return Err(ForkAnchorResolutionError::TooLarge);
+        }
+
+        let header_line = ConversationLineCodec::encode_header(header)
+            .map_err(|_| ForkAnchorResolutionError::Encode)?;
+        let mut written = encoded_line_bytes(0, header_line.len())?;
+        writer
+            .write_all(&header_line)
+            .and_then(|()| writer.write_all(b"\n"))
+            .map_err(|_| ForkAnchorResolutionError::Unavailable)?;
+
+        for source_entry in self.selected_entries.iter() {
+            let child_entry = fork_child_entry(source_entry, header.session_id());
+            let line = ConversationLineCodec::encode_entry(&child_entry)
+                .map_err(|_| ForkAnchorResolutionError::Encode)?;
+            written = encoded_line_bytes(written, line.len())?;
+            writer
+                .write_all(&line)
+                .and_then(|()| writer.write_all(b"\n"))
+                .map_err(|_| ForkAnchorResolutionError::Unavailable)?;
+        }
+        Ok(written)
+    }
+
+    pub(crate) fn validate_reencoded_child<R: Read>(
+        &self,
+        reader: R,
+        declared_file_bytes: u64,
+        expected_header: &SessionHeader,
+    ) -> Result<(), ForkAnchorResolutionError> {
+        validate_captured_fork_path(self.source_session_id, &self.selected_entries)?;
+        let mut scanner = ConversationJsonlScanner::open(
+            reader,
+            declared_file_bytes,
+            expected_header.session_id(),
+            ConversationScanAccess::ReadOnly,
+        )
+        .map_err(map_fork_child_scan_error)?;
+        if scanner.header().map_err(map_fork_child_scan_error)? != expected_header
+            || !scanner.header_is_canonical()
+        {
+            return Err(ForkAnchorResolutionError::InvalidSource);
+        }
+
+        let mut entry_index = 0usize;
+        loop {
+            match scanner.next_event().map_err(map_fork_child_scan_error)? {
+                None if entry_index == self.selected_entries.len() => return Ok(()),
+                None => return Err(ForkAnchorResolutionError::InvalidSource),
+                Some(ConversationScanEvent::Fault {
+                    fault: ConversationLineFault::OversizedLine,
+                    ..
+                }) => return Err(ForkAnchorResolutionError::TooLarge),
+                Some(
+                    ConversationScanEvent::Fault { .. } | ConversationScanEvent::PartialTail { .. },
+                ) => return Err(ForkAnchorResolutionError::InvalidSource),
+                Some(ConversationScanEvent::Entry {
+                    canonicality,
+                    entry,
+                    ..
+                }) => {
+                    let Some(source_entry) = self.selected_entries.get(entry_index) else {
+                        return Err(ForkAnchorResolutionError::InvalidSource);
+                    };
+                    let expected_entry =
+                        fork_child_entry(source_entry, expected_header.session_id());
+                    if canonicality != ConversationLineCanonicality::Canonical
+                        || entry.as_ref() != &expected_entry
+                    {
+                        return Err(ForkAnchorResolutionError::InvalidSource);
+                    }
+                    entry_index = entry_index
+                        .checked_add(1)
+                        .ok_or(ForkAnchorResolutionError::TooLarge)?;
+                }
+            }
+        }
+    }
+}
+
+fn encoded_line_bytes(
+    already_written: u64,
+    line_bytes: usize,
+) -> Result<u64, ForkAnchorResolutionError> {
+    let line_bytes = u64::try_from(line_bytes).map_err(|_| ForkAnchorResolutionError::TooLarge)?;
+    let written = already_written
+        .checked_add(line_bytes)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ForkAnchorResolutionError::TooLarge)?;
+    if written > MAX_CONVERSATION_FILE_BYTES {
+        Err(ForkAnchorResolutionError::TooLarge)
+    } else {
+        Ok(written)
+    }
+}
+
+fn fork_child_entry(
+    source_entry: &StoredSessionEntry,
+    child_session_id: SessionId,
+) -> StoredSessionEntry {
+    StoredSessionEntry::reconstruct(
+        source_entry.entry_id(),
+        source_entry.parent_id(),
+        child_session_id,
+        source_entry.turn_id(),
+        source_entry.timestamp(),
+        source_entry.body().clone(),
+    )
+}
+
+fn map_fork_child_scan_error(error: ConversationScanError) -> ForkAnchorResolutionError {
+    match error {
+        ConversationScanError::FileTooLarge
+        | ConversationScanError::HistoryTooLarge
+        | ConversationScanError::HeaderCorrupt {
+            code: ConversationCodecError::HeaderTooLarge,
+        } => ForkAnchorResolutionError::TooLarge,
+        ConversationScanError::LeaseMismatch
+        | ConversationScanError::InputChanged
+        | ConversationScanError::InputUnavailable
+        | ConversationScanError::CounterOverflow => ForkAnchorResolutionError::Unavailable,
+        ConversationScanError::HeaderCorrupt { .. }
+        | ConversationScanError::UnsupportedFormatVersion
+        | ConversationScanError::MissingHeader
+        | ConversationScanError::InvariantViolation => ForkAnchorResolutionError::InvalidSource,
+    }
+}
+
+impl fmt::Debug for CapturedForkConversation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedForkConversation")
+            .field("source_session", &"redacted")
+            .field("source", &self.source)
+            .field("anchor", &self.anchor)
+            .field("selected_entries", &self.selected_entries.len())
+            .finish()
+    }
+}
+
+fn resolve_fork_anchor(
+    selected_entries: &[Arc<StoredSessionEntry>],
+    relations: &[ItemRelation],
+    anchor: &ForkAnchor,
+) -> Option<usize> {
+    let relation_matches = |item_id: ItemId, family| {
+        relations
+            .iter()
+            .any(|relation| relation.item_id() == item_id && relation.family() == family)
+    };
+    match anchor {
+        ForkAnchor::Genesis => Some(0),
+        ForkAnchor::BeforeUserMessage { item_id } | ForkAnchor::AfterUserMessage { item_id } => {
+            selected_entries
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry.body(),
+                        StoredEntryBody::UserMessage(message)
+                            if message.item_id() == *item_id
+                                && relation_matches(
+                                    *item_id,
+                                    crate::turn_item_interaction::ItemContentFamily::UserMessage,
+                                )
+                    )
+                })
+                .map(|index| {
+                    index + usize::from(matches!(anchor, ForkAnchor::AfterUserMessage { .. }))
+                })
+        }
+        ForkAnchor::BeforeFinalAgentMessage { item_id }
+        | ForkAnchor::AfterFinalAgentMessage { item_id } => selected_entries
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry.body(),
+                    StoredEntryBody::AssistantMessage(message)
+                        if message.disposition() == AssistantDisposition::Final
+                            && message.content().iter().any(|content| matches!(
+                                content,
+                                StoredAssistantContent::Text { item_id: actual, .. }
+                                    if actual == item_id
+                            ))
+                            && relation_matches(
+                                *item_id,
+                                crate::turn_item_interaction::ItemContentFamily::AgentMessage,
+                            )
+                )
+            })
+            .map(|index| {
+                index + usize::from(matches!(anchor, ForkAnchor::AfterFinalAgentMessage { .. }))
+            }),
+    }
+}
+
+fn validate_captured_fork_path(
+    source_session_id: SessionId,
+    selected_entries: &[Arc<StoredSessionEntry>],
+) -> Result<(), ForkAnchorResolutionError> {
+    let mut parent = None;
+    let mut entry_ids = BTreeSet::new();
+    for entry in selected_entries {
+        if entry.session_id() != source_session_id
+            || entry.parent_id() != parent
+            || !entry_ids.insert(entry.entry_id())
+        {
+            return Err(ForkAnchorResolutionError::InvalidSource);
+        }
+        parent = Some(entry.entry_id());
+    }
+    Ok(())
 }
 
 impl fmt::Debug for RecordedForkConversationLease {
@@ -299,24 +606,6 @@ impl fmt::Debug for RecordedForkConversationLease {
             .field("source_session", &"redacted")
             .field("declared_file_bytes", &self.declared_file_bytes)
             .finish()
-    }
-}
-
-fn map_recorded_fork_source_scan_error(error: ConversationScanError) -> RecordedForkSourceError {
-    match error {
-        ConversationScanError::FileTooLarge
-        | ConversationScanError::HistoryTooLarge
-        | ConversationScanError::HeaderCorrupt {
-            code: ConversationCodecError::HeaderTooLarge,
-        } => RecordedForkSourceError::TooLarge,
-        ConversationScanError::HeaderCorrupt { .. }
-        | ConversationScanError::UnsupportedFormatVersion
-        | ConversationScanError::MissingHeader => RecordedForkSourceError::Corrupt,
-        ConversationScanError::LeaseMismatch
-        | ConversationScanError::InputChanged
-        | ConversationScanError::InputUnavailable
-        | ConversationScanError::CounterOverflow
-        | ConversationScanError::InvariantViolation => RecordedForkSourceError::Unavailable,
     }
 }
 
@@ -2018,6 +2307,7 @@ fn validate_interaction_resolution(
 #[derive(Clone)]
 pub(crate) struct ReplayedConversationView {
     header: SessionHeader,
+    header_is_canonical: bool,
     accepted_entries: Arc<[Arc<StoredSessionEntry>]>,
     selected_entries: Arc<[Arc<StoredSessionEntry>]>,
     selected_path: Arc<[EntryId]>,
@@ -2039,6 +2329,10 @@ pub(crate) struct ReplayedConversationView {
 impl ReplayedConversationView {
     pub(crate) fn header(&self) -> &SessionHeader {
         &self.header
+    }
+
+    pub(crate) const fn header_is_canonical(&self) -> bool {
+        self.header_is_canonical
     }
 
     /// Accepted entries in physical order: every first-valid, session-matching decoded entry.
@@ -2112,6 +2406,7 @@ impl fmt::Debug for ReplayedConversationView {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReplayedConversationView")
+            .field("header_is_canonical", &self.header_is_canonical)
             .field("accepted_entries", &self.accepted_entries.len())
             .field("selected_entries", &self.selected_entries.len())
             .field("selected_path_len", &self.selected_path.len())
@@ -2152,6 +2447,7 @@ pub(crate) fn replay_conversation<R: Read>(
         ConversationJsonlScanner::open(reader, declared_file_bytes, expected_session_id, access)
             .map_err(map_replay_scan_error)?;
     let header = scanner.header().map_err(map_replay_scan_error)?.clone();
+    let header_is_canonical = scanner.header_is_canonical();
 
     let mut scan = ReplayScanState::new();
     loop {
@@ -2228,6 +2524,7 @@ pub(crate) fn replay_conversation<R: Read>(
 
     Ok(ReplayedConversationView {
         header,
+        header_is_canonical,
         accepted_entries: scan
             .entries
             .iter()
@@ -4292,6 +4589,8 @@ mod tests {
 
     const HEADER_ONLY: &[u8] =
         include_bytes!("../docs/fixtures/wire-v1/conversation/golden/header-only.jsonl");
+    const FORK_SOURCE: &[u8] =
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-source.jsonl");
     const FORK_CHILD: &[u8] = include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl");
     static RECORDER_TEST_FILE: AtomicU64 = AtomicU64::new(0);
     const PREFIX_ENTRY_ID: &str = "ent_10000000000000000000000000000001";
@@ -4528,6 +4827,66 @@ mod tests {
             bytes.push(b'\n');
         }
         bytes
+    }
+
+    #[derive(Default)]
+    struct ForkStreamingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        largest_write: usize,
+    }
+
+    impl Write for ForkStreamingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.largest_write = self.largest_write.max(bytes.len());
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn fork_child_reencode_and_readback_stream_one_bounded_canonical_path() {
+        let source_session_id = fixture_session(FORK_SOURCE);
+        let source = replay_fixture(FORK_SOURCE, source_session_id)
+            .expect("the authoritative Fork source replays");
+        let anchor = ForkAnchor::AfterUserMessage {
+            item_id: "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .parse()
+                .expect("the authoritative anchor ItemId is valid"),
+        };
+        let captured = CapturedForkConversation::from_selected_path(
+            source_session_id,
+            ForkSourceKind::RecordedHistory,
+            anchor,
+            source.selected_entries(),
+            source.relations(),
+        )
+        .expect("the authoritative selected path captures");
+        let header = fork_header();
+        let mut sink = ForkStreamingWriter::default();
+
+        let written = captured
+            .write_for_child(&header, &mut sink)
+            .expect("the captured path streams");
+
+        assert_eq!(written, u64::try_from(FORK_CHILD.len()).unwrap());
+        assert_eq!(sink.bytes, FORK_CHILD);
+        assert!(
+            sink.writes > captured.selected_entries.len(),
+            "Header, entries, and LF separators are written incrementally"
+        );
+        assert!(
+            sink.largest_write <= MAX_CONVERSATION_ENTRY_BYTES,
+            "the sink never receives a whole-file allocation"
+        );
+        captured
+            .validate_reencoded_child(Cursor::new(sink.bytes), written, &header)
+            .expect("the full streamed readback matches the captured source path");
     }
 
     fn additive_entry(line: &[u8]) -> Vec<u8> {

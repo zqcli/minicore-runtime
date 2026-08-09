@@ -20,7 +20,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
-    SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
+    ForkAnchor, SealedSessionDefinitionAttempt, SessionDefinition, SessionDefinitionDecision,
     SessionDefinitionDecisionError, SessionLifecycle,
 };
 use crate::compaction::{
@@ -28,9 +28,10 @@ use crate::compaction::{
     CompactionTrigger,
 };
 use crate::conversation_storage::{
-    ConversationReplayDiagnostics, RecordingHealth, SessionRecorder, SessionRecordingError,
-    StoredAssistantContent, StoredAssistantMessage, StoredEntryBody, StoredToolMessage,
-    StoredToolOutcome, StoredUserMessage,
+    CapturedForkConversation, ConversationReplayDiagnostics, ForkAnchorResolutionError,
+    RecordingHealth, SessionRecorder, SessionRecordingError, StoredAssistantContent,
+    StoredAssistantMessage, StoredEntryBody, StoredToolMessage, StoredToolOutcome,
+    StoredUserMessage,
 };
 use crate::durable_state::{
     AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
@@ -966,6 +967,17 @@ impl fmt::Debug for SessionExecutor {
 }
 
 impl SessionExecutor {
+    pub(crate) fn capture_fork_conversation(
+        &self,
+        anchor: ForkAnchor,
+    ) -> Result<CapturedForkConversation, ForkAnchorResolutionError> {
+        let conversation = self
+            .conversation
+            .as_ref()
+            .ok_or(ForkAnchorResolutionError::InvalidSource)?;
+        lock(&conversation.live_state).capture_fork_conversation(anchor)
+    }
+
     /// Starts a test-only loaded Ready+Idle Session without Turn resources.
     #[cfg(test)]
     pub(crate) fn start_loaded_ready_idle(

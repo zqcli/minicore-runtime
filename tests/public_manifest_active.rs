@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use minicore_runtime::agent_session_lifecycle::{ForkAnchor, ForkSourceKind};
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
     CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
@@ -413,6 +414,22 @@ fn assert_command_response_semantics(
             assert_eq!(turn_id.to_string(), "trn_66666666666666666666666666666666");
             assert_eq!(*cancel_epoch, 7);
         }
+        (
+            Some("session_forked_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionForked {
+                        session_id,
+                        source: ForkSourceKind::LiveSnapshot,
+                    },
+                output: None,
+            },
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_33333333333333333333333333333333"
+            );
+        }
         (Some("session_busy_rejection"), CommandCompletion::Rejected(error)) => {
             assert_eq!(error.code(), CommandErrorCode::SessionBusy);
             assert_eq!(error.retry(), RetryAdvice::RefreshAndRetry);
@@ -505,6 +522,19 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
                 session_id.to_string(),
                 "ses_22222222222222222222222222222222"
             );
+        }
+        (
+            "session_fork_after_user",
+            RuntimeCommand::Session(SessionCommand::Fork {
+                source_session_id,
+                anchor: ForkAnchor::AfterUserMessage { item_id },
+            }),
+        ) => {
+            assert_eq!(
+                source_session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            assert_eq!(item_id.to_string(), "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         }
         (
             "turn_cancel_turn",

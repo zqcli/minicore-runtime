@@ -1,6 +1,6 @@
 # Agent 与 Session 生命周期架构设计
 
-状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、loaded Ready+Idle publication owner、Runtime-owned residency/lifecycle integration，以及replay/Recorder-backed Ready+Idle Load hydration已实现；public Runtime command、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、完整cross-platform native matrix pending）
+状态：当前权威架构（ADR 0136/0137；M5.0 durable foundation、exact historical definition resolution、loaded Ready+Idle publication owner、Runtime-owned residency/lifecycle integration，以及replay/Recorder-backed Ready+Idle Load hydration已实现；public Session Fork command/lifecycle staging已覆盖全部公开anchor与LiveSnapshot/RecordedHistory provenance；remaining Agent/Session public lifecycle commands、active-Turn grace Unload、完整cross-platform native matrix pending）
 日期：2026-07-31
 
 ## 目的
@@ -1326,4 +1326,4 @@ Agent release channel
 - [x] 明确Agent/Session definition、metadata和lifecycle不进入conversation JSONL（ADR 0131）。
 - [x] 完成SessionExecutor owner和crate-private request interface。
 - [x] 完成公开Runtime interface设计，见[Runtime Interface](runtime-interface.md)。
-- [x] M5.0冻结DurableState、Durable Store V1、root lease、permanent reservations与Tokio/deterministic test seams；production durable foundation、exact historical definition resolution、loaded Ready+Idle SessionExecutor publication owner、Runtime residency/lifecycle integration及replay/Recorder-backed Ready+Idle Load hydration已实现；public Runtime command、remaining Fork anchors/LiveSnapshot、active-Turn grace Unload、完整cross-platform native matrix仍pending。
+- [x] M5.0冻结DurableState、Durable Store V1、root lease、permanent reservations与Tokio/deterministic test seams；production durable foundation、exact historical definition resolution、loaded Ready+Idle SessionExecutor publication owner、Runtime residency/lifecycle integration及replay/Recorder-backed Ready+Idle Load hydration已实现；public Session Fork command/lifecycle staging已覆盖全部公开anchor与LiveSnapshot/RecordedHistory provenance，remaining Agent/Session public lifecycle commands、active-Turn grace Unload、完整cross-platform native matrix仍pending。

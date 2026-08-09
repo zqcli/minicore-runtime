@@ -24,20 +24,24 @@ use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
-    SealedSessionDefinitionAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
-    SessionLifecycleDecision, SessionLifecycleDecisionError,
+    ForkAnchor, ForkSourceKind, SealedSessionDefinitionAttempt, SealedSessionForkAttempt,
+    SealedSessionLifecycleAttempt, SessionLifecycle, SessionLifecycleDecision,
+    SessionLifecycleDecisionError,
 };
 use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
 #[cfg(not(test))]
 use crate::conversation_storage::load_replayed_conversation;
-use crate::conversation_storage::{ConversationLoadError, ConversationReplayError};
+use crate::conversation_storage::{
+    ConversationLoadError, ConversationReplayError, ForkAnchorResolutionError,
+};
 #[cfg(test)]
 use crate::conversation_storage::{
     ReplayPreparationBarrier, load_replayed_conversation_with_barrier_for_test,
 };
 use crate::durable_state::{
     DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
-    DurableSessionLifecycleError, DurableSessionLifecycleOutcome, DurableState,
+    DurableSessionForkError, DurableSessionHead, DurableSessionLifecycleError,
+    DurableSessionLifecycleOutcome, DurableState,
 };
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{
@@ -117,6 +121,32 @@ impl SessionResidencyUnloadOutcome {
 pub(crate) enum SessionResidencyUnloadError {
     #[error("session residency is closing")]
     Closing,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyForkError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Fork source Session was not found")]
+    SourceNotFound,
+    #[error("Fork source Session is deleted")]
+    SourceDeleted,
+    #[error("Fork anchor is invalid for the selected source path")]
+    InvalidAnchor,
+    #[error("Fork source conversation exceeds its selected storage limit")]
+    SourceConversationTooLarge,
+    #[error("Fork source conversation is corrupt")]
+    SourceConversationCorrupt,
+    #[error("requested Agent is disabled")]
+    AgentDisabled,
+    #[error("requested Agent is deleted")]
+    AgentDeleted,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("Fork publication is unavailable")]
+    Unavailable,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -546,6 +576,7 @@ struct OperationId(u64);
 enum OperationKind {
     Load,
     Unload,
+    Fork,
     Lifecycle,
     Snapshot,
     WorkspaceDefinition,
@@ -572,6 +603,11 @@ impl OperationKind {
             } else {
                 SessionResidencyUnloadError::InternalDispatchUnavailable
             })),
+            Self::Fork => OperationCompletion::Fork(Err(if closing {
+                SessionResidencyForkError::Closing
+            } else {
+                SessionResidencyForkError::InternalDispatchUnavailable
+            })),
             Self::Lifecycle => OperationCompletion::Lifecycle(Err(if closing {
                 SessionResidencyLifecycleError::Closing
             } else {
@@ -596,6 +632,7 @@ impl OperationKind {
 enum OperationCompletion {
     Load(Result<SessionResidencyLoadOutcome, SessionResidencyLoadError>),
     Unload(Result<SessionResidencyUnloadOutcome, SessionResidencyUnloadError>),
+    Fork(Result<Arc<DurableSessionHead>, SessionResidencyForkError>),
     Lifecycle(Result<DurableSessionLifecycleOutcome, SessionResidencyLifecycleError>),
     Snapshot(Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError>),
     WorkspaceDefinition(
@@ -611,6 +648,7 @@ impl OperationCompletion {
                 | Self::Unload(Err(
                     SessionResidencyUnloadError::InternalDispatchUnavailable
                 ))
+                | Self::Fork(Err(SessionResidencyForkError::InternalDispatchUnavailable))
                 | Self::Lifecycle(Err(
                     SessionResidencyLifecycleError::InternalDispatchUnavailable
                 ))
@@ -628,6 +666,7 @@ impl OperationCompletion {
             self,
             Self::Load(Err(SessionResidencyLoadError::Closing))
                 | Self::Unload(Err(SessionResidencyUnloadError::Closing))
+                | Self::Fork(Err(SessionResidencyForkError::Closing))
                 | Self::Lifecycle(Err(SessionResidencyLifecycleError::Closing))
                 | Self::Snapshot(Err(SessionResidencySnapshotError::Closing))
                 | Self::WorkspaceDefinition(Err(SessionResidencyWorkspaceDefinitionError::Closing))
@@ -638,6 +677,7 @@ impl OperationCompletion {
 enum OperationSender {
     Load(oneshot::Sender<Result<SessionResidencyLoadOutcome, SessionResidencyLoadError>>),
     Unload(oneshot::Sender<Result<SessionResidencyUnloadOutcome, SessionResidencyUnloadError>>),
+    Fork(oneshot::Sender<Result<Arc<DurableSessionHead>, SessionResidencyForkError>>),
     Lifecycle(
         oneshot::Sender<Result<DurableSessionLifecycleOutcome, SessionResidencyLifecycleError>>,
     ),
@@ -678,6 +718,10 @@ impl OperationWaiter {
                 let _ = sender.send(result);
                 true
             }
+            (OperationSender::Fork(sender), OperationCompletion::Fork(result)) => {
+                let _ = sender.send(result);
+                true
+            }
             (OperationSender::Lifecycle(sender), OperationCompletion::Lifecycle(result)) => {
                 let _ = sender.send(result);
                 true
@@ -709,6 +753,9 @@ impl OperationWaiter {
                 let _ = sender.send(Err(
                     SessionResidencyUnloadError::InternalDispatchUnavailable,
                 ));
+            }
+            OperationSender::Fork(sender) => {
+                let _ = sender.send(Err(SessionResidencyForkError::InternalDispatchUnavailable));
             }
             OperationSender::Lifecycle(sender) => {
                 let _ = sender.send(Err(
@@ -855,6 +902,11 @@ impl OperationContext {
         SessionResidencyLifecycleError::InternalDispatchUnavailable
     }
 
+    fn internal_fork(&self) -> SessionResidencyForkError {
+        self.poison();
+        SessionResidencyForkError::InternalDispatchUnavailable
+    }
+
     fn internal_snapshot(&self) -> SessionResidencySnapshotError {
         self.poison();
         SessionResidencySnapshotError::InternalDispatchUnavailable
@@ -998,6 +1050,33 @@ impl Drop for UnloadRequest {
     }
 }
 
+struct ForkRequest {
+    source_session_id: SessionId,
+    anchor: Option<ForkAnchor>,
+    child_created_at: Timestamp,
+    response: Option<oneshot::Sender<Result<Arc<DurableSessionHead>, SessionResidencyForkError>>>,
+}
+
+impl ForkRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyForkError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyForkError::InternalDispatchUnavailable));
+        }
+    }
+}
+
+impl Drop for ForkRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
+}
+
 struct LifecycleRequest {
     attempt: Option<SealedSessionLifecycleAttempt>,
     response: Option<
@@ -1093,6 +1172,7 @@ impl Drop for WorkspaceDefinitionRequest {
 enum ResidencyRequest {
     Load(LoadRequest),
     Unload(UnloadRequest),
+    Fork(ForkRequest),
     Lifecycle(LifecycleRequest),
     Snapshot(SnapshotRequest),
     WorkspaceDefinition(WorkspaceDefinitionRequest),
@@ -1103,6 +1183,7 @@ impl ResidencyRequest {
         match self {
             Self::Load(request) => request.reject_closing(),
             Self::Unload(request) => request.reject_closing(),
+            Self::Fork(request) => request.reject_closing(),
             Self::Lifecycle(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
             Self::WorkspaceDefinition(request) => request.reject_closing(),
@@ -1113,6 +1194,7 @@ impl ResidencyRequest {
         match self {
             Self::Load(request) => request.reject_internal(),
             Self::Unload(request) => request.reject_internal(),
+            Self::Fork(request) => request.reject_internal(),
             Self::Lifecycle(request) => request.reject_internal(),
             Self::Snapshot(request) => request.reject_internal(),
             Self::WorkspaceDefinition(request) => request.reject_internal(),
@@ -1218,6 +1300,7 @@ impl SessionResidencyActor {
         match request {
             ResidencyRequest::Load(request) => self.start_load(request),
             ResidencyRequest::Unload(request) => self.start_unload(request),
+            ResidencyRequest::Fork(request) => self.start_fork(request),
             ResidencyRequest::Lifecycle(request) => self.start_lifecycle(request),
             ResidencyRequest::Snapshot(request) => self.start_snapshot(request),
             ResidencyRequest::WorkspaceDefinition(request) => {
@@ -1315,6 +1398,30 @@ impl SessionResidencyActor {
             OperationKind::Unload,
             OperationSender::Unload(sender),
             async move { OperationCompletion::Unload(run_unload(context, session_id).await) },
+        );
+    }
+
+    fn start_fork(&mut self, mut request: ForkRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let Some(anchor) = request.anchor.take() else {
+            self.poison();
+            return;
+        };
+        let source_session_id = request.source_session_id;
+        let child_created_at = request.child_created_at;
+        let context = self.operation_context();
+        self.start_child(
+            source_session_id,
+            OperationKind::Fork,
+            OperationSender::Fork(sender),
+            async move {
+                OperationCompletion::Fork(
+                    run_fork(context, source_session_id, anchor, child_created_at).await,
+                )
+            },
         );
     }
 
@@ -1837,6 +1944,25 @@ impl SessionResidencyRegistry {
             .unwrap_or_else(|_| self.unload_waiter_fallback())
     }
 
+    /// Forks one Session while holding the same per-Session gate used by Load and Unload. The
+    /// loaded membership observed under this gate is the source-kind linearization point.
+    pub(crate) async fn fork(
+        &self,
+        source_session_id: SessionId,
+        anchor: ForkAnchor,
+        child_created_at: Timestamp,
+    ) -> Result<Arc<DurableSessionHead>, SessionResidencyForkError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::Fork(ForkRequest {
+            source_session_id,
+            anchor: Some(anchor),
+            child_created_at,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter.await.unwrap_or_else(|_| self.fork_waiter_fallback())
+    }
+
     /// Updates durable lifecycle only while the Session is unloaded.  The per-Session gate is
     /// retained across the full durable completion, so a concurrent Load cannot slip between the
     /// unloaded check and the durable publication.
@@ -2124,6 +2250,16 @@ impl SessionResidencyRegistry {
             SessionResidencyUnloadError::Closing
         } else {
             SessionResidencyUnloadError::InternalDispatchUnavailable
+        })
+    }
+
+    fn fork_waiter_fallback(&self) -> Result<Arc<DurableSessionHead>, SessionResidencyForkError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencyForkError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencyForkError::Closing
+        } else {
+            SessionResidencyForkError::InternalDispatchUnavailable
         })
     }
 
@@ -2517,6 +2653,77 @@ async fn run_unload(
             context.poison();
             Err(SessionResidencyUnloadError::InternalDispatchUnavailable)
         }
+    }
+}
+
+async fn run_fork(
+    context: OperationContext,
+    source_session_id: SessionId,
+    anchor: ForkAnchor,
+    child_created_at: Timestamp,
+) -> Result<Arc<DurableSessionHead>, SessionResidencyForkError> {
+    let gate = context.state.gate(source_session_id);
+    let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+    let source = if context.state.has_loaded(source_session_id) {
+        ForkSourceKind::LiveSnapshot
+    } else {
+        ForkSourceKind::RecordedHistory
+    };
+    let attempt =
+        SealedSessionForkAttempt::new(source_session_id, source, anchor.clone(), child_created_at);
+    let result = match source {
+        ForkSourceKind::LiveSnapshot => {
+            let executor = context
+                .state
+                .executor(source_session_id)
+                .ok_or_else(|| context.internal_fork())?;
+            let snapshot =
+                executor
+                    .capture_fork_conversation(anchor)
+                    .map_err(|error| match error {
+                        ForkAnchorResolutionError::InvalidAnchor => {
+                            SessionResidencyForkError::InvalidAnchor
+                        }
+                        ForkAnchorResolutionError::InvalidSource
+                        | ForkAnchorResolutionError::TooLarge
+                        | ForkAnchorResolutionError::Encode
+                        | ForkAnchorResolutionError::Unavailable => context.internal_fork(),
+                    })?;
+            context
+                .durable_state
+                .fork_session_from_live_snapshot(attempt, snapshot)
+                .await
+        }
+        ForkSourceKind::RecordedHistory => context.durable_state.fork_session(attempt).await,
+    };
+    result.map_err(|error| map_durable_fork_error(&context, error))
+}
+
+fn map_durable_fork_error(
+    context: &OperationContext,
+    error: DurableSessionForkError,
+) -> SessionResidencyForkError {
+    match error {
+        DurableSessionForkError::Closing => SessionResidencyForkError::Closing,
+        DurableSessionForkError::SourceNotFound => SessionResidencyForkError::SourceNotFound,
+        DurableSessionForkError::SourceDeleted => SessionResidencyForkError::SourceDeleted,
+        DurableSessionForkError::InvalidAnchor => SessionResidencyForkError::InvalidAnchor,
+        DurableSessionForkError::SourceConversationTooLarge => {
+            SessionResidencyForkError::SourceConversationTooLarge
+        }
+        DurableSessionForkError::SourceConversationCorrupt => {
+            SessionResidencyForkError::SourceConversationCorrupt
+        }
+        DurableSessionForkError::AgentDisabled => SessionResidencyForkError::AgentDisabled,
+        DurableSessionForkError::AgentDeleted => SessionResidencyForkError::AgentDeleted,
+        DurableSessionForkError::DurableStateTooLarge => {
+            SessionResidencyForkError::DurableStateTooLarge
+        }
+        DurableSessionForkError::IdentityUnavailable
+        | DurableSessionForkError::CollisionAttemptsExhausted
+        | DurableSessionForkError::SourceIdentityConflict
+        | DurableSessionForkError::StorageUnavailable => SessionResidencyForkError::Unavailable,
+        DurableSessionForkError::InternalDispatchUnavailable => context.internal_fork(),
     }
 }
 
@@ -3843,6 +4050,93 @@ mod tests {
                     SessionResidencyLoadError::SessionArchived
                 })
             );
+            close_fixture(context, state, registry).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_and_unload_share_one_fifo_source_kind_linearization_gate() {
+        for fork_first in [true, false] {
+            let store = TempStore::new();
+            let (context, state, registry) = open_registry(&store).await;
+            let session_id: SessionId = SESSION_ID.parse().unwrap();
+            registry.load_ready_idle(session_id).await.unwrap();
+            let gate = registry.shared.gate(session_id);
+            let gate_guard = SessionResidencyOperationPermit::acquire(gate).await;
+            let mut fork = Box::pin(registry.fork(
+                session_id,
+                ForkAnchor::Genesis,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+            ));
+            let mut unload = Box::pin(registry.unload(session_id));
+
+            if fork_first {
+                assert!(poll_once_pending(fork.as_mut()).await);
+                assert!(poll_once_pending(unload.as_mut()).await);
+            } else {
+                assert!(poll_once_pending(unload.as_mut()).await);
+                assert!(poll_once_pending(fork.as_mut()).await);
+            }
+            registry.wait_for_active_operation_count_for_test(2).await;
+            drop(gate_guard);
+
+            let child = fork.await.expect("the queued Fork publishes");
+            assert_eq!(
+                child
+                    .fork_provenance()
+                    .expect("the child has Fork provenance")
+                    .source(),
+                if fork_first {
+                    ForkSourceKind::LiveSnapshot
+                } else {
+                    ForkSourceKind::RecordedHistory
+                }
+            );
+            assert_eq!(unload.await, Ok(SessionResidencyUnloadOutcome::Unloaded));
+            assert!(!registry.shared.has_loaded(session_id));
+            close_fixture(context, state, registry).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_and_load_share_one_fifo_source_kind_linearization_gate() {
+        for load_first in [true, false] {
+            let store = TempStore::new();
+            let (context, state, registry) = open_registry(&store).await;
+            let session_id: SessionId = SESSION_ID.parse().unwrap();
+            let gate = registry.shared.gate(session_id);
+            let gate_guard = SessionResidencyOperationPermit::acquire(gate).await;
+            let mut load = Box::pin(registry.load_ready_idle(session_id));
+            let mut fork = Box::pin(registry.fork(
+                session_id,
+                ForkAnchor::Genesis,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+            ));
+
+            if load_first {
+                assert!(poll_once_pending(load.as_mut()).await);
+                assert!(poll_once_pending(fork.as_mut()).await);
+            } else {
+                assert!(poll_once_pending(fork.as_mut()).await);
+                assert!(poll_once_pending(load.as_mut()).await);
+            }
+            registry.wait_for_active_operation_count_for_test(2).await;
+            drop(gate_guard);
+
+            let child = fork.await.expect("the queued Fork publishes");
+            assert_eq!(
+                child
+                    .fork_provenance()
+                    .expect("the child has Fork provenance")
+                    .source(),
+                if load_first {
+                    ForkSourceKind::LiveSnapshot
+                } else {
+                    ForkSourceKind::RecordedHistory
+                }
+            );
+            assert_eq!(load.await, Ok(SessionResidencyLoadOutcome::Loaded));
+            assert!(registry.shared.has_loaded(session_id));
             close_fixture(context, state, registry).await;
         }
     }

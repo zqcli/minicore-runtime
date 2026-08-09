@@ -1,0 +1,1 @@
+{"commandId":"cmd_99999999999999999999999999999999","command":{"type":"session","data":{"type":"fork","data":{"sourceSessionId":"ses_22222222222222222222222222222222","anchor":{"type":"after_user_message","data":{"itemId":"itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}}}

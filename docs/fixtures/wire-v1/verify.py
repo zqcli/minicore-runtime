@@ -253,6 +253,13 @@ def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any
                 assert nested in [
                     {"type": "load", "data": None},
                     {"type": "create", "data": None},
+                    {
+                        "type": "fork",
+                        "data": {
+                            "sourceSessionId": "ses_22222222222222222222222222222222",
+                            "anchor": {"type": "genesis", "data": None},
+                        },
+                    },
                 ], path
         elif target == "SnapshotRequest":
             assert value == {"type": "runtime", "data": None}, path
@@ -304,7 +311,16 @@ def check_declared_public_fault(path: Path, target: str, expected: dict[str, Any
                 pass
             else:
                 assert command["type"] == "session", path
-                assert command["data"] == {"type": "create"}, path
+                assert command["data"] in [
+                    {"type": "create"},
+                    {
+                        "type": "fork",
+                        "data": {
+                            "sourceSessionId": "ses_22222222222222222222222222222222",
+                            "anchor": {"type": "after_final_agent_message"},
+                        },
+                    },
+                ], path
         elif target == "RuntimeQuery":
             assert value == {"type": "runtime"}, path
         elif target == "QueryResponse":

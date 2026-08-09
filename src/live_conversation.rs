@@ -443,6 +443,19 @@ impl LiveSessionState {
         &self.selected_path
     }
 
+    pub(crate) fn capture_fork_conversation(
+        &self,
+        anchor: crate::agent_session_lifecycle::ForkAnchor,
+    ) -> Result<super::CapturedForkConversation, super::ForkAnchorResolutionError> {
+        super::CapturedForkConversation::from_selected_path(
+            self.session_id,
+            crate::agent_session_lifecycle::ForkSourceKind::LiveSnapshot,
+            anchor,
+            &self.selected_path,
+            &self.relations,
+        )
+    }
+
     /// Creates a fresh loaded session. Every supplied historical/reserved ID is seeded into the
     /// collision guard before the first live allocation.
     pub(crate) fn new(
@@ -1428,6 +1441,7 @@ impl LiveSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_session_lifecycle::{AgentRevisionRef, ForkAnchor};
     use crate::compaction::{MAX_STORED_COMPACTION_SUMMARY_BYTES, StoredCompaction};
     use crate::model_gateway::{
         ModelFinishReason, ModelId, ModelReasoningSummary, ModelResponseSummary, ModelServiceClass,
@@ -1485,6 +1499,19 @@ mod tests {
         "2026-07-31T12:00:00.000Z"
             .parse()
             .expect("test timestamps are valid")
+    }
+
+    fn fork_header(child_session_id: SessionId) -> crate::conversation_storage::SessionHeader {
+        crate::conversation_storage::SessionHeader::reconstruct(
+            1,
+            child_session_id,
+            timestamp(),
+            AgentRevisionRef::new(
+                "agt_11111111111111111111111111111111".parse().unwrap(),
+                "ar_1".parse().unwrap(),
+            ),
+            "sdr_1".parse().unwrap(),
+        )
     }
 
     fn model() -> ModelResponseSummary {
@@ -1591,6 +1618,49 @@ mod tests {
                 timestamp(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn live_fork_capture_resolves_every_public_message_anchor_on_one_snapshot() {
+        let source_session_id = session(1);
+        let child_session_id = session(2);
+        let turn_id = turn(1);
+        let mut state = scripted_state(source_session_id, [entry(1), entry(2)]);
+        start(&mut state, turn_id);
+        state
+            .complete_with_assistant_message(assistant_text(item(2), "final"), turn_id, timestamp())
+            .unwrap();
+        let header = fork_header(child_session_id);
+
+        for (anchor, expected_lines) in [
+            (ForkAnchor::Genesis, 1),
+            (ForkAnchor::BeforeUserMessage { item_id: item(1) }, 1),
+            (ForkAnchor::AfterUserMessage { item_id: item(1) }, 2),
+            (ForkAnchor::BeforeFinalAgentMessage { item_id: item(2) }, 2),
+            (ForkAnchor::AfterFinalAgentMessage { item_id: item(2) }, 3),
+        ] {
+            let captured = state.capture_fork_conversation(anchor).unwrap();
+            let mut encoded = Vec::new();
+            captured.write_for_child(&header, &mut encoded).unwrap();
+            assert_eq!(
+                encoded
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .count(),
+                expected_lines
+            );
+            assert!(
+                !String::from_utf8(encoded)
+                    .unwrap()
+                    .contains(&source_session_id.to_string())
+            );
+        }
+        assert_eq!(
+            state
+                .capture_fork_conversation(ForkAnchor::BeforeFinalAgentMessage { item_id: item(1) })
+                .unwrap_err(),
+            crate::conversation_storage::ForkAnchorResolutionError::InvalidAnchor
+        );
     }
 
     fn assert_exact_fact_arc(state: &LiveSessionState, fact: &AppliedConversationFact) {

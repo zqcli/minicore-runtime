@@ -32,11 +32,11 @@ use crate::session_execution::{
     SessionWorkspaceDefinitionOutcome,
 };
 use crate::session_residency::{
-    SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyLifecycleError,
-    SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyQueuedMessageError,
-    SessionResidencyRegistry, SessionResidencySnapshotError, SessionResidencyStartError,
-    SessionResidencySteerError, SessionResidencySubmitError, SessionResidencySubscriptionError,
-    SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
+    SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyForkError,
+    SessionResidencyLifecycleError, SessionResidencyLoadError, SessionResidencyLoadOutcome,
+    SessionResidencyQueuedMessageError, SessionResidencyRegistry, SessionResidencySnapshotError,
+    SessionResidencyStartError, SessionResidencySteerError, SessionResidencySubmitError,
+    SessionResidencySubscriptionError, SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
     SessionResidencyWorkspaceDefinitionError,
 };
 use crate::wire::{
@@ -545,6 +545,29 @@ impl RuntimeInner {
                 match self.unload_session(session_id).await {
                     Ok(_) => completed_output("session unloaded"),
                     Err(error) => map_unload_error(command_id, session_id, error)?,
+                }
+            }
+            RuntimeCommand::Session(SessionCommand::Fork {
+                source_session_id,
+                anchor,
+            }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                match residency
+                    .fork(source_session_id, anchor, SystemClock.now())
+                    .await
+                {
+                    Ok(head) => {
+                        let Some(provenance) = head.fork_provenance() else {
+                            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+                        };
+                        completed_outcome(CommandOutcome::SessionForked {
+                            session_id: head.session_id(),
+                            source: provenance.source(),
+                        })
+                    }
+                    Err(error) => map_fork_error(command_id, source_session_id, error)?,
                 }
             }
             RuntimeCommand::Turn(TurnCommand::Submit { session_id, intent }) => {
@@ -1142,6 +1165,7 @@ fn implemented_runtime_capabilities() -> RuntimeCapabilities {
         crate::runtime_interface::RuntimeCapability::StateEvents,
         crate::runtime_interface::RuntimeCapability::RuntimeSnapshot,
         crate::runtime_interface::RuntimeCapability::SessionSnapshot,
+        crate::runtime_interface::RuntimeCapability::SessionFork,
     ])
     .expect("the M7 Runtime capability set is a canonical V1 subset")
 }
@@ -1312,6 +1336,75 @@ fn map_unload_error(
             Err(RuntimeDispatchError::InternalDispatchUnavailable)
         }
     }
+}
+
+fn map_fork_error(
+    _command_id: crate::wire::CommandId,
+    source_session_id: SessionId,
+    error: SessionResidencyForkError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(source_session_id));
+    let completion = match error {
+        SessionResidencyForkError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyForkError::SourceNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Fork source Session was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyForkError::SourceDeleted => rejected_completion(
+            CommandErrorCode::SessionDeleted,
+            "Fork source Session is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyForkError::InvalidAnchor => rejected_completion(
+            CommandErrorCode::InvalidForkAnchor,
+            "Fork anchor is invalid for the selected source path",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyForkError::AgentDisabled => rejected_completion(
+            CommandErrorCode::AgentDisabled,
+            "the source Session Agent is disabled",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyForkError::AgentDeleted => rejected_completion(
+            CommandErrorCode::AgentDeleted,
+            "the source Session Agent is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyForkError::SourceConversationTooLarge
+        | SessionResidencyForkError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "Fork source exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyForkError::SourceConversationCorrupt => rejected_completion(
+            CommandErrorCode::DurableStateCorrupt,
+            "Fork source conversation is corrupt",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyForkError::Unavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Session Fork is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyForkError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
 }
 
 fn map_submit_error(
@@ -1776,8 +1869,8 @@ mod tests {
         MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError, RuntimeLifecycle,
     };
     use crate::agent_session_lifecycle::{
-        SealedAgentCreateAttempt, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt,
-        SessionModelConfig,
+        ForkAnchor, ForkSourceKind, SealedAgentCreateAttempt, SealedSessionCreateAttempt,
+        SealedSessionLifecycleAttempt, SessionModelConfig,
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
     use crate::model_gateway::{
@@ -2104,6 +2197,7 @@ mod tests {
                 RuntimeCapability::StateEvents,
                 RuntimeCapability::RuntimeSnapshot,
                 RuntimeCapability::SessionSnapshot,
+                RuntimeCapability::SessionFork,
             ]
         );
         let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
@@ -2251,6 +2345,192 @@ mod tests {
         drop(residency);
 
         runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_fork_selects_live_or_recorded_source_and_reopens_each_child() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["fork source answer"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let source_session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session {
+                    session_id: source_session_id,
+                },
+                false,
+            ))
+            .await
+            .expect("the source subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+        let residency = runtime.inner.residency().unwrap();
+        let executor = residency.executor_for_test(source_session_id).unwrap();
+        let hooks = executor.test_hooks();
+        hooks.arm_before_agent_run_attempt();
+        drop(executor);
+        drop(residency);
+
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id: source_session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("fork this turn").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the source Turn starts");
+        let source_turn_id = started_turn(&submit);
+        hooks.wait_before_agent_run_attempt().await;
+
+        let SnapshotResponse::Session(source_snapshot) = runtime
+            .snapshot(SnapshotRequest::Session {
+                session_id: source_session_id,
+            })
+            .await
+            .expect("the running source snapshot is available")
+        else {
+            panic!("the source snapshot is a Session snapshot");
+        };
+        let user_item_id = source_snapshot
+            .active_items()
+            .iter()
+            .find(|item| matches!(item.content(), ItemContentView::UserMessage { .. }))
+            .expect("the source snapshot exposes its User message")
+            .item_id();
+        assert_eq!(
+            source_turn_id,
+            source_snapshot.current_turn().unwrap().turn_id()
+        );
+
+        let live_fork = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Fork {
+                    source_session_id,
+                    anchor: ForkAnchor::AfterUserMessage {
+                        item_id: user_item_id,
+                    },
+                }),
+            ))
+            .await
+            .expect("the loaded source Fork dispatches");
+        let live_child = match live_fork.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionForked {
+                        session_id,
+                        source: ForkSourceKind::LiveSnapshot,
+                    },
+                output: None,
+            } => *session_id,
+            completion => panic!("unexpected live Fork completion: {completion:?}"),
+        };
+
+        let invalid = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Fork {
+                    source_session_id,
+                    anchor: ForkAnchor::BeforeFinalAgentMessage {
+                        item_id: user_item_id,
+                    },
+                }),
+            ))
+            .await
+            .expect("the invalid Fork anchor dispatches");
+        assert!(matches!(
+            invalid.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::InvalidForkAnchor
+        ));
+
+        hooks.release_before_agent_run_attempt();
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("the source Turn reaches terminal state")
+            .expect("the source subscription remains open");
+        assert!(matches!(
+            terminal,
+            EventFrame::State(event)
+                if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+        ));
+
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unload {
+                    session_id: source_session_id,
+                }),
+            ))
+            .await
+            .expect("the source unloads before the recorded Fork");
+        let recorded_fork = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Fork {
+                    source_session_id,
+                    anchor: ForkAnchor::AfterUserMessage {
+                        item_id: user_item_id,
+                    },
+                }),
+            ))
+            .await
+            .expect("the unloaded source Fork dispatches");
+        let recorded_child = match recorded_fork.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionForked {
+                        session_id,
+                        source: ForkSourceKind::RecordedHistory,
+                    },
+                output: None,
+            } => *session_id,
+            completion => panic!("unexpected recorded Fork completion: {completion:?}"),
+        };
+        assert_ne!(live_child, recorded_child);
+
+        runtime.shutdown().await;
+        let reopened = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the Fork children reopen");
+        for child in [live_child, recorded_child] {
+            let loaded = reopened
+                .dispatch(CommandRequest::new(
+                    CommandId::generate().unwrap(),
+                    RuntimeCommand::Session(SessionCommand::Load { session_id: child }),
+                ))
+                .await
+                .expect("a reopened Fork child loads");
+            assert_eq!(command_output(&loaded), "session loaded");
+            let SnapshotResponse::Session(snapshot) = reopened
+                .snapshot(SnapshotRequest::Session { session_id: child })
+                .await
+                .expect("a reopened Fork child has a public snapshot")
+            else {
+                panic!("the child snapshot is a Session snapshot");
+            };
+            assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+            assert_eq!(snapshot.current_turn(), None);
+        }
+        reopened.shutdown().await;
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2576,7 +2856,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn recorder_failure_keeps_one_model_attempt_and_replays_only_recorded_prefix() {
+    async fn recorder_failure_live_fork_keeps_unrecorded_tail_while_reload_uses_recorded_prefix() {
         let root = TempRoot::new();
         let workspace = TempWorkspace::new();
         let model = ScriptedModelFixture::new(vec!["live but unrecorded answer"]);
@@ -2676,18 +2956,81 @@ mod tests {
         let residency = runtime.inner.residency().unwrap();
         let executor = residency.executor_for_test(session_id).unwrap();
         let live_state = executor.live_state_for_test().unwrap();
+        let final_agent_item_id = {
+            let live = super::lock(&live_state);
+            let views = live.capture_conversation_views().unwrap();
+            assert_eq!(views.conversation().messages().len(), 2);
+            views
+                .relations()
+                .iter()
+                .find(|relation| {
+                    relation.family()
+                        == crate::turn_item_interaction::ItemContentFamily::AgentMessage
+                })
+                .expect("the completed live Turn retains its final Agent message relation")
+                .item_id()
+        };
+        drop(live_state);
+        drop(executor);
+        drop(residency);
+
+        let forked = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Fork {
+                    source_session_id: session_id,
+                    anchor: ForkAnchor::AfterFinalAgentMessage {
+                        item_id: final_agent_item_id,
+                    },
+                }),
+            ))
+            .await
+            .expect("a degraded loaded Session still Forks from its live tail");
+        let live_child = match forked.completion() {
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionForked {
+                        session_id,
+                        source: ForkSourceKind::LiveSnapshot,
+                    },
+                output: None,
+            } => *session_id,
+            completion => panic!("unexpected degraded live Fork completion: {completion:?}"),
+        };
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load {
+                    session_id: live_child,
+                }),
+            ))
+            .await
+            .expect("the degraded live Fork child loads");
+        let residency = runtime.inner.residency().unwrap();
+        let child_executor = residency.executor_for_test(live_child).unwrap();
+        let child_live_state = child_executor.live_state_for_test().unwrap();
         assert_eq!(
-            super::lock(&live_state)
+            super::lock(&child_live_state)
                 .capture_conversation_views()
                 .unwrap()
                 .conversation()
                 .messages()
                 .len(),
-            2
+            2,
+            "LiveSnapshot preserves both unrecorded source messages"
         );
-        drop(live_state);
-        drop(executor);
+        drop(child_live_state);
+        drop(child_executor);
         drop(residency);
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unload {
+                    session_id: live_child,
+                }),
+            ))
+            .await
+            .expect("the verified live Fork child unloads");
 
         let unload = runtime
             .dispatch(CommandRequest::new(
