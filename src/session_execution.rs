@@ -45,9 +45,9 @@ use crate::prompt::{
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
-    EmergencyControlHandle, EmergencyControlSignal, EmergencyControlSignalOutcome,
-    EmergencyControlTarget, FollowUpQueue, FollowUpQueueError, QueuedSteer, SteerQueue,
-    SteerQueueError,
+    EmergencyControlHandle, EmergencyControlObservation, EmergencyControlSignal,
+    EmergencyControlSignalOutcome, EmergencyControlTarget, FollowUpQueue, FollowUpQueueError,
+    QueuedSteer, SteerQueue, SteerQueueError,
 };
 #[cfg(test)]
 use crate::tools::ToolExecutionResult;
@@ -1382,11 +1382,16 @@ impl SessionExecutor {
             .and_then(|(current_turn, generation)| {
                 (*current_turn == turn_id).then(|| Arc::clone(generation))
             })?;
+        let emergency = self
+            .emergency
+            .observe(EmergencyControlTarget::Turn(turn_id))?;
         Some(retry_basis_is_current(
             conversation,
             turn_id,
             &generation,
             source_revision,
+            &self.emergency,
+            emergency,
         ))
     }
 
@@ -1974,6 +1979,8 @@ impl SessionExecutorActor {
         });
 
         let turn_id = active.turn_id;
+        let emergency_control = self.emergency.clone();
+        let emergency_observation = emergency;
         if cancellation.is_cancelled() {
             let _ = self
                 .completion_sender
@@ -1998,6 +2005,8 @@ impl SessionExecutorActor {
                     conversation,
                     turn_id,
                     control_generation,
+                    emergency_control,
+                    emergency_observation,
                     cancellation,
                     executor_closing,
                     lifecycle_closing,
@@ -3056,6 +3065,8 @@ async fn run_active_turn(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
     control_generation: Arc<ControlGeneration>,
+    emergency_control: EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
     cancellation: CancellationToken,
     executor_closing: CancellationToken,
     closing: CancellationToken,
@@ -3072,6 +3083,8 @@ async fn run_active_turn(
         Arc::clone(&conversation),
         turn_id,
         control_generation,
+        emergency_control,
+        emergency_observation,
         cancellation,
         executor_closing,
         closing,
@@ -3114,6 +3127,8 @@ async fn run_active_turn_inner(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
     control_generation: Arc<ControlGeneration>,
+    emergency_control: EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
     cancellation: CancellationToken,
     executor_closing: CancellationToken,
     closing: CancellationToken,
@@ -3149,6 +3164,8 @@ async fn run_active_turn_inner(
             &conversation,
             turn_id,
             Arc::clone(&control_generation),
+            emergency_control.clone(),
+            emergency_observation,
             cancellation.clone(),
             executor_closing.clone(),
             closing.clone(),
@@ -3407,6 +3424,8 @@ async fn call_agent_run_with_logical_retry(
     conversation: &LoadedSessionConversation,
     turn_id: TurnId,
     control_generation: Arc<ControlGeneration>,
+    emergency_control: EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
     cancellation: CancellationToken,
     executor_closing: CancellationToken,
     closing: CancellationToken,
@@ -3421,6 +3440,8 @@ async fn call_agent_run_with_logical_retry(
             turn_id,
             &control_generation,
             request.source_revision(),
+            &emergency_control,
+            emergency_observation,
         ) {
             return Err(ModelCallError::cancelled());
         }
@@ -3440,6 +3461,8 @@ async fn call_agent_run_with_logical_retry(
                         turn_id,
                         &control_generation,
                         request.source_revision(),
+                        &emergency_control,
+                        emergency_observation,
                     )
                 {
                     return Err(ModelCallError::cancelled());
@@ -3456,6 +3479,8 @@ async fn call_agent_run_with_logical_retry(
             turn_id,
             &control_generation,
             request.source_revision(),
+            &emergency_control,
+            emergency_observation,
         ) {
             return Err(error);
         }
@@ -3481,7 +3506,15 @@ fn retry_basis_is_current(
     turn_id: TurnId,
     control_generation: &Arc<ControlGeneration>,
     source_revision: crate::live_conversation::ConversationRevision,
+    emergency_control: &EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
 ) -> bool {
+    if !emergency_control.is_current(
+        emergency_observation.target(),
+        emergency_observation.epoch(),
+    ) {
+        return false;
+    }
     if !conversation.has_control_generation(turn_id, control_generation) {
         return false;
     }
@@ -6861,6 +6894,42 @@ mod tests {
                 .await,
             Err(SessionSecurityRevokedError::Closing)
         );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn stale_emergency_epoch_stops_before_the_next_attempt() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["must not run"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("stale emergency").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        let emergency = loaded.executor.emergency_control_for_test();
+        let observation = emergency
+            .observe(EmergencyControlTarget::Turn(turn_id))
+            .expect("the active Turn owns the emergency target");
+        assert!(emergency.retire(observation));
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
     }
 
