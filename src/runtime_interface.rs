@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::agent_session_lifecycle::{AgentRevisionRef, SessionModelConfig};
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
+use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
 use crate::wire::lexical::{normalize_newlines, validate_safe_text, validate_stable_symbolic_key};
 use crate::wire::{
     AgentId, CommandId, Duration, ItemId, Money, ProtocolLimits, RequestId,
@@ -749,6 +750,35 @@ pub enum ObservationValueError {
     NonMinimalObservation,
 }
 
+fn validate_observation_text(
+    value: &str,
+    allow_empty: bool,
+) -> Result<Box<str>, ObservationValueError> {
+    if !allow_empty && value.is_empty() {
+        return Err(ObservationValueError::EmptyText);
+    }
+    validate_safe_text(value, 65_536, allow_empty).map_err(|error| match error {
+        crate::wire::lexical::LexicalError::Empty => ObservationValueError::EmptyText,
+        crate::wire::lexical::LexicalError::TooLong => ObservationValueError::TextTooLong,
+        crate::wire::lexical::LexicalError::UnsafeText
+        | crate::wire::lexical::LexicalError::InvalidGrammar => ObservationValueError::UnsafeText,
+    })?;
+    Ok(value.into())
+}
+
+fn validate_observation_symbol(
+    value: &str,
+    maximum: usize,
+) -> Result<Box<str>, ObservationValueError> {
+    validate_stable_symbolic_key(value, maximum, false).map_err(|error| match error {
+        crate::wire::lexical::LexicalError::Empty => ObservationValueError::EmptyText,
+        crate::wire::lexical::LexicalError::TooLong => ObservationValueError::TextTooLong,
+        crate::wire::lexical::LexicalError::UnsafeText
+        | crate::wire::lexical::LexicalError::InvalidGrammar => ObservationValueError::UnsafeText,
+    })?;
+    Ok(value.into())
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct SessionMetadataView {
     revision: SessionMetadataRevision,
@@ -1130,6 +1160,306 @@ pub enum SessionExecutionView {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TurnExecutionPhaseView {
+    Sampling,
+    RetryBackoff,
+    Compacting,
+    WaitingApproval,
+    WaitingForUserInput,
+    ExecutingTools,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TurnStatusView {
+    Running,
+    Completed {
+        completed_at: Timestamp,
+    },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruptionView,
+    },
+    Failed {
+        completed_at: Timestamp,
+        reason: TurnFailureView,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct CurrentTurnView {
+    turn_id: TurnId,
+    status: TurnStatusView,
+    phase: Option<TurnExecutionPhaseView>,
+    started_at: Timestamp,
+}
+
+impl CurrentTurnView {
+    pub const fn new(
+        turn_id: TurnId,
+        status: TurnStatusView,
+        phase: Option<TurnExecutionPhaseView>,
+        started_at: Timestamp,
+    ) -> Self {
+        Self {
+            turn_id,
+            status,
+            phase,
+            started_at,
+        }
+    }
+
+    pub const fn turn_id(self) -> TurnId {
+        self.turn_id
+    }
+
+    pub const fn status(self) -> TurnStatusView {
+        self.status
+    }
+
+    pub const fn phase(self) -> Option<TurnExecutionPhaseView> {
+        self.phase
+    }
+
+    pub const fn started_at(self) -> Timestamp {
+        self.started_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ItemStatusView {
+    Started,
+    Completed,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum ItemContentView {
+    UserMessage {
+        source: UserMessageSource,
+        body: Box<str>,
+        contributions: Vec<Box<str>>,
+    },
+    AgentMessage {
+        body: Box<str>,
+    },
+    Reasoning {
+        body: Box<str>,
+    },
+    ToolInvocation {
+        tool_call_id: Box<str>,
+        tool_name: Box<str>,
+        arguments_summary: Box<str>,
+        result: Option<Box<str>>,
+    },
+}
+
+impl ItemContentView {
+    pub fn user_message(
+        source: UserMessageSource,
+        body: impl AsRef<str>,
+        contributions: Vec<Box<str>>,
+    ) -> Result<Self, ObservationValueError> {
+        let body = validate_observation_text(body.as_ref(), false)?;
+        let contributions = contributions
+            .into_iter()
+            .map(|value| validate_observation_text(value.as_ref(), false))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::UserMessage {
+            source,
+            body,
+            contributions,
+        })
+    }
+
+    pub fn agent_message(body: impl AsRef<str>) -> Result<Self, ObservationValueError> {
+        Ok(Self::AgentMessage {
+            body: validate_observation_text(body.as_ref(), false)?,
+        })
+    }
+
+    pub fn reasoning(body: impl AsRef<str>) -> Result<Self, ObservationValueError> {
+        Ok(Self::Reasoning {
+            body: validate_observation_text(body.as_ref(), false)?,
+        })
+    }
+
+    pub fn tool_invocation(
+        tool_call_id: impl AsRef<str>,
+        tool_name: impl AsRef<str>,
+        arguments_summary: impl AsRef<str>,
+        result: Option<impl AsRef<str>>,
+    ) -> Result<Self, ObservationValueError> {
+        Ok(Self::ToolInvocation {
+            tool_call_id: validate_observation_symbol(tool_call_id.as_ref(), 256)?,
+            tool_name: validate_observation_symbol(tool_name.as_ref(), 128)?,
+            arguments_summary: validate_observation_text(arguments_summary.as_ref(), false)?,
+            result: result
+                .map(|value| validate_observation_text(value.as_ref(), true))
+                .transpose()?,
+        })
+    }
+}
+
+impl fmt::Debug for ItemContentView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UserMessage {
+                source,
+                body,
+                contributions,
+            } => formatter
+                .debug_struct("ItemContentView::UserMessage")
+                .field("source", source)
+                .field("body_bytes", &body.len())
+                .field("contributions", &contributions.len())
+                .finish(),
+            Self::AgentMessage { body } => formatter
+                .debug_struct("ItemContentView::AgentMessage")
+                .field("body_bytes", &body.len())
+                .finish(),
+            Self::Reasoning { body } => formatter
+                .debug_struct("ItemContentView::Reasoning")
+                .field("body_bytes", &body.len())
+                .finish(),
+            Self::ToolInvocation {
+                tool_call_id,
+                tool_name,
+                arguments_summary,
+                result,
+            } => formatter
+                .debug_struct("ItemContentView::ToolInvocation")
+                .field("tool_call_id", tool_call_id)
+                .field("tool_name", tool_name)
+                .field("arguments_summary_bytes", &arguments_summary.len())
+                .field("has_result", &result.is_some())
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ItemView {
+    item_id: ItemId,
+    turn_id: TurnId,
+    status: ItemStatusView,
+    content: ItemContentView,
+    created_at: Timestamp,
+    completed_at: Option<Timestamp>,
+}
+
+impl ItemView {
+    pub fn new(
+        item_id: ItemId,
+        turn_id: TurnId,
+        status: ItemStatusView,
+        content: ItemContentView,
+        created_at: Timestamp,
+        completed_at: Option<Timestamp>,
+    ) -> Result<Self, ObservationValueError> {
+        if matches!(status, ItemStatusView::Started) == completed_at.is_some() {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
+        Ok(Self {
+            item_id,
+            turn_id,
+            status,
+            content,
+            created_at,
+            completed_at,
+        })
+    }
+
+    pub const fn item_id(&self) -> ItemId {
+        self.item_id
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub const fn status(&self) -> ItemStatusView {
+        self.status
+    }
+
+    pub const fn content(&self) -> &ItemContentView {
+        &self.content
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+
+    pub const fn completed_at(&self) -> Option<Timestamp> {
+        self.completed_at
+    }
+}
+
+impl fmt::Debug for ItemView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ItemView")
+            .field("item_id", &self.item_id)
+            .field("turn_id", &self.turn_id)
+            .field("status", &self.status)
+            .field("content", &self.content)
+            .field("created_at", &self.created_at)
+            .field("completed_at", &self.completed_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct InteractionView {
+    request_id: RequestId,
+    turn_id: TurnId,
+    item_id: ItemId,
+    request: InteractionRequestView,
+}
+
+impl InteractionView {
+    pub const fn new(
+        request_id: RequestId,
+        turn_id: TurnId,
+        item_id: ItemId,
+        request: InteractionRequestView,
+    ) -> Self {
+        Self {
+            request_id,
+            turn_id,
+            item_id,
+            request,
+        }
+    }
+
+    pub const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    pub const fn turn_id(&self) -> TurnId {
+        self.turn_id
+    }
+
+    pub const fn item_id(&self) -> ItemId {
+        self.item_id
+    }
+
+    pub const fn request(&self) -> &InteractionRequestView {
+        &self.request
+    }
+}
+
+impl fmt::Debug for InteractionView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InteractionView")
+            .field("request_id", &self.request_id)
+            .field("turn_id", &self.turn_id)
+            .field("item_id", &self.item_id)
+            .field("request", &"redacted")
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionRecordingState {
     Healthy,
     Degraded,
@@ -1419,6 +1749,9 @@ pub struct SessionSnapshot {
     usage: Option<SessionUsageView>,
     diagnostics: Vec<SessionDiagnosticView>,
     execution: SessionExecutionView,
+    current_turn: Option<CurrentTurnView>,
+    active_items: Vec<ItemView>,
+    pending_interactions: Vec<InteractionView>,
     queues: SessionQueueView,
 }
 
@@ -1506,13 +1839,49 @@ impl SessionSnapshot {
         diagnostics: Vec<SessionDiagnosticView>,
         limits: ProtocolLimits,
     ) -> Result<Self, ObservationValueError> {
+        Self::new_loaded_ready_with_observation(
+            session_id,
+            metadata,
+            definition,
+            execution,
+            None,
+            Vec::new(),
+            Vec::new(),
+            queues,
+            recording,
+            usage,
+            diagnostics,
+            limits,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "arguments are the exact public loaded Session observation contract"
+    )]
+    pub(crate) fn new_loaded_ready_with_observation(
+        session_id: SessionId,
+        metadata: SessionMetadataView,
+        definition: SessionDefinitionSummary,
+        execution: SessionExecutionView,
+        current_turn: Option<CurrentTurnView>,
+        active_items: Vec<ItemView>,
+        pending_interactions: Vec<InteractionView>,
+        queues: SessionQueueView,
+        recording: SessionRecordingView,
+        usage: Option<SessionUsageView>,
+        diagnostics: Vec<SessionDiagnosticView>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ObservationValueError> {
         if session_id != definition.session_id() {
             return Err(ObservationValueError::SessionIdentityMismatch);
         }
-        if recording.state() != SessionRecordingState::Healthy
-            || !diagnostics.is_empty()
-            || usage.as_ref().is_some_and(|usage| !usage.is_zero())
+        if active_items.len() > usize::from(limits.observation.max_active_items)
+            || pending_interactions.len() > usize::from(limits.observation.max_pending_interactions)
         {
+            return Err(ObservationValueError::TooManyValues);
+        }
+        if recording.state() == SessionRecordingState::Degraded && diagnostics.is_empty() {
             return Err(ObservationValueError::NonMinimalObservation);
         }
         let queues = SessionQueueView::new_with_limits(
@@ -1541,6 +1910,21 @@ impl SessionSnapshot {
         {
             return Err(ObservationValueError::InconsistentLoadedSessionState);
         }
+        if current_turn.is_none() && (!active_items.is_empty() || !pending_interactions.is_empty())
+        {
+            return Err(ObservationValueError::InconsistentLoadedSessionState);
+        }
+        if let Some(turn) = current_turn {
+            if active_items
+                .iter()
+                .any(|item| item.turn_id() != turn.turn_id())
+                || pending_interactions
+                    .iter()
+                    .any(|interaction| interaction.turn_id() != turn.turn_id())
+            {
+                return Err(ObservationValueError::InconsistentLoadedSessionState);
+            }
+        }
         Ok(Self {
             session_id,
             metadata,
@@ -1549,6 +1933,9 @@ impl SessionSnapshot {
             usage,
             diagnostics,
             execution,
+            current_turn,
+            active_items,
+            pending_interactions,
             queues,
         })
     }
@@ -1581,6 +1968,18 @@ impl SessionSnapshot {
         self.execution
     }
 
+    pub const fn current_turn(&self) -> Option<CurrentTurnView> {
+        self.current_turn
+    }
+
+    pub fn active_items(&self) -> &[ItemView] {
+        &self.active_items
+    }
+
+    pub fn pending_interactions(&self) -> &[InteractionView] {
+        &self.pending_interactions
+    }
+
     pub const fn recording(&self) -> SessionRecordingView {
         self.recording
     }
@@ -1609,6 +2008,9 @@ impl fmt::Debug for SessionSnapshot {
             .field("usage", &self.usage)
             .field("diagnostics", &self.diagnostics)
             .field("execution", &self.execution)
+            .field("current_turn", &self.current_turn)
+            .field("active_items", &self.active_items.len())
+            .field("pending_interactions", &self.pending_interactions.len())
             .field("queues", &self.queues)
             .finish()
     }
@@ -1654,7 +2056,17 @@ pub enum RuntimeStateEventKind {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SessionStateEventKind {
     TurnCompleted,
+    TurnInterrupted,
     TurnFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TurnInterruptionView {
+    UserCancelled,
+    SecurityRevoked,
+    PrepareForUnload,
+    RuntimeShutdown,
+    RuntimeFailure,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1672,6 +2084,10 @@ pub enum TurnTerminalView {
     Completed {
         completed_at: Timestamp,
     },
+    Interrupted {
+        completed_at: Timestamp,
+        reason: TurnInterruptionView,
+    },
     Failed {
         completed_at: Timestamp,
         reason: TurnFailureView,
@@ -1681,7 +2097,9 @@ pub enum TurnTerminalView {
 impl TurnTerminalView {
     pub const fn completed_at(self) -> Timestamp {
         match self {
-            Self::Completed { completed_at } | Self::Failed { completed_at, .. } => completed_at,
+            Self::Completed { completed_at }
+            | Self::Interrupted { completed_at, .. }
+            | Self::Failed { completed_at, .. } => completed_at,
         }
     }
 }
@@ -1825,6 +2243,36 @@ impl StateEvent {
         }
     }
 
+    pub fn turn_interrupted(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: SessionSnapshot,
+        turn_id: TurnId,
+        completed_at: Timestamp,
+        reason: TurnInterruptionView,
+    ) -> Self {
+        let session_id = snapshot.session_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Turn {
+                session_id,
+                turn_id,
+            },
+            msg: StateEventMsg::Session {
+                kind: SessionStateEventKind::TurnInterrupted,
+                snapshot: Box::new(snapshot),
+                detail: Some(SessionEventDetail::TurnTerminal {
+                    turn_id,
+                    terminal: TurnTerminalView::Interrupted {
+                        completed_at,
+                        reason,
+                    },
+                }),
+            },
+        }
+    }
+
     pub(crate) fn from_wire(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -1859,6 +2307,9 @@ impl StateEvent {
                     (
                         SessionStateEventKind::TurnCompleted,
                         TurnTerminalView::Completed { .. }
+                    ) | (
+                        SessionStateEventKind::TurnInterrupted,
+                        TurnTerminalView::Interrupted { .. }
                     ) | (
                         SessionStateEventKind::TurnFailed,
                         TurnTerminalView::Failed { .. }

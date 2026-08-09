@@ -25,7 +25,7 @@ use crate::agent_session_lifecycle::{
 };
 use crate::conversation_storage::{
     ConversationReplayDiagnostics, SessionRecorder, StoredAssistantContent, StoredAssistantMessage,
-    StoredToolMessage, StoredToolOutcome, StoredUserMessage,
+    StoredEntryBody, StoredToolMessage, StoredToolOutcome, StoredUserMessage,
 };
 use crate::durable_state::{
     AgentAdmissionError, DurableAgentDefinitionReadError, DurableSessionDefinitionError,
@@ -43,6 +43,10 @@ use crate::model_gateway::{
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
 };
+use crate::runtime_interface::{
+    CurrentTurnView, InteractionView, ItemContentView, ItemStatusView, ItemView,
+    TurnExecutionPhaseView, TurnStatusView,
+};
 use crate::runtime_task::{Clock, RuntimeTaskContext, RuntimeTaskError, SystemClock, TrackedTask};
 use crate::session_ingress::{
     EmergencyControlHandle, EmergencyControlObservation, EmergencyControlSignal,
@@ -56,8 +60,8 @@ use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
 };
 use crate::turn_item_interaction::{
-    AssistantDisposition, InteractionCancelReason, InteractionRequest, ResolvedInteraction,
-    UserMessageSource,
+    AssistantDisposition, InteractionCancelReason, InteractionRequest, InteractionRequestView,
+    ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
     CommandId, IdGenerationError, InteractionResolutionKey, ItemId, RequestId,
@@ -93,11 +97,19 @@ pub(crate) enum SessionTurnFailure {
     ContextOverflow,
     AgentUnavailable,
     Internal,
+    EmergencyControl(EmergencyControlSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionTurnInterruption {
+    UserCancelled,
+    SecurityRevoked,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionTurnTerminal {
     Completed,
+    Interrupted(SessionTurnInterruption),
     Failed(SessionTurnFailure),
 }
 
@@ -162,6 +174,9 @@ pub(crate) struct SessionExecutorSnapshot {
     workspace: Arc<WorkspaceSnapshot>,
     execution_state: SessionExecutionState,
     current_turn: Option<TurnId>,
+    current_turn_view: Option<CurrentTurnView>,
+    active_items: Arc<[ItemView]>,
+    public_pending_interactions: Arc<[InteractionView]>,
     last_terminal: Option<(TurnId, SessionTurnTerminal)>,
     pending_interactions: Arc<[crate::live_conversation::PendingInteractionFact]>,
     active_submit_command_id: Option<CommandId>,
@@ -180,6 +195,9 @@ impl SessionExecutorSnapshot {
             workspace,
             execution_state,
             current_turn: None,
+            current_turn_view: None,
+            active_items: Arc::from([]),
+            public_pending_interactions: Arc::from([]),
             last_terminal: None,
             pending_interactions: Arc::from([]),
             active_submit_command_id: None,
@@ -199,6 +217,9 @@ impl SessionExecutorSnapshot {
             workspace: Arc::clone(&self.workspace),
             execution_state,
             current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
             last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
             active_submit_command_id: self.active_submit_command_id,
@@ -216,6 +237,9 @@ impl SessionExecutorSnapshot {
             workspace: Arc::clone(&self.workspace),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
             last_terminal: self.last_terminal,
             pending_interactions,
             active_submit_command_id: self.active_submit_command_id,
@@ -235,11 +259,36 @@ impl SessionExecutorSnapshot {
             workspace: Arc::clone(&self.workspace),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
             last_terminal: self.last_terminal,
             pending_interactions: Arc::clone(&self.pending_interactions),
             active_submit_command_id,
             follow_up_command_ids,
             steer_command_ids,
+        }
+    }
+
+    fn with_public_observation(
+        &self,
+        current_turn_view: Option<CurrentTurnView>,
+        active_items: Arc<[ItemView]>,
+        public_pending_interactions: Arc<[InteractionView]>,
+    ) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            workspace: Arc::clone(&self.workspace),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view,
+            active_items,
+            public_pending_interactions,
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
         }
     }
 
@@ -265,6 +314,18 @@ impl SessionExecutorSnapshot {
 
     pub(crate) const fn current_turn(&self) -> Option<TurnId> {
         self.current_turn
+    }
+
+    pub(crate) const fn current_turn_view(&self) -> Option<CurrentTurnView> {
+        self.current_turn_view
+    }
+
+    pub(crate) fn active_items(&self) -> &[ItemView] {
+        &self.active_items
+    }
+
+    pub(crate) fn public_pending_interactions(&self) -> &[InteractionView] {
+        &self.public_pending_interactions
     }
 
     pub(crate) const fn last_terminal(&self) -> Option<(TurnId, SessionTurnTerminal)> {
@@ -298,6 +359,12 @@ impl fmt::Debug for SessionExecutorSnapshot {
             .field("workspace_revision", &self.workspace.revision())
             .field("execution_state", &self.execution_state)
             .field("current_turn", &self.current_turn)
+            .field("current_turn_view", &self.current_turn_view)
+            .field("active_items", &self.active_items.len())
+            .field(
+                "public_pending_interactions",
+                &self.public_pending_interactions.len(),
+            )
             .field("last_terminal", &self.last_terminal)
             .field("pending_interactions", &self.pending_interactions.len())
             .field(
@@ -2934,8 +3001,181 @@ impl SessionExecutorActor {
     }
 
     fn publish_current(&mut self, current: Arc<SessionExecutorSnapshot>) {
+        let current = if current.current_turn().is_some() {
+            let (current_turn_view, active_items, pending_interactions) =
+                self.capture_public_observation(current.current_turn());
+            Arc::new(current.with_public_observation(
+                current_turn_view,
+                active_items,
+                pending_interactions,
+            ))
+        } else {
+            Arc::new(current.with_public_observation(None, Arc::from([]), Arc::from([])))
+        };
         self.current = Arc::clone(&current);
         *lock(&self.published_snapshot) = current;
+    }
+
+    fn capture_public_observation(
+        &self,
+        turn_id: Option<TurnId>,
+    ) -> (
+        Option<CurrentTurnView>,
+        Arc<[ItemView]>,
+        Arc<[InteractionView]>,
+    ) {
+        let Some(turn_id) = turn_id else {
+            return (None, Arc::from([]), Arc::from([]));
+        };
+        let Some(conversation) = self.conversation.as_ref() else {
+            return (None, Arc::from([]), Arc::from([]));
+        };
+        let live_state = lock(&conversation.live_state);
+        let entries = live_state
+            .selected_entries()
+            .iter()
+            .filter(|entry| entry.turn_id() == turn_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let completed_tools = entries
+            .iter()
+            .filter_map(|entry| match entry.body() {
+                StoredEntryBody::ToolMessage(message) => Some(message.item_id()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut active_items = Vec::new();
+        let mut has_started_tool = false;
+        for entry in &entries {
+            let created_at = entry.timestamp();
+            match entry.body() {
+                StoredEntryBody::UserMessage(message) => {
+                    let body = message
+                        .content()
+                        .message()
+                        .content()
+                        .iter()
+                        .map(|part| part.as_text())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Ok(content) =
+                        ItemContentView::user_message(message.source(), body, Vec::new())
+                    {
+                        if let Ok(item) = ItemView::new(
+                            message.item_id(),
+                            turn_id,
+                            ItemStatusView::Completed,
+                            content,
+                            created_at,
+                            Some(created_at),
+                        ) {
+                            active_items.push(item);
+                        }
+                    }
+                }
+                StoredEntryBody::AssistantMessage(message) => {
+                    for content in message.content() {
+                        let (item_id, item_content) = match content {
+                            StoredAssistantContent::Reasoning {
+                                item_id,
+                                content: _,
+                            } => (*item_id, ItemContentView::reasoning("reasoning redacted")),
+                            StoredAssistantContent::Text { item_id, text } => {
+                                (*item_id, ItemContentView::agent_message(text.as_ref()))
+                            }
+                            StoredAssistantContent::ToolCall {
+                                item_id,
+                                tool_call_id,
+                                name,
+                                ..
+                            } => {
+                                has_started_tool |= !completed_tools.contains(item_id);
+                                (
+                                    *item_id,
+                                    ItemContentView::tool_invocation(
+                                        tool_call_id.as_str(),
+                                        name.as_str(),
+                                        "arguments redacted",
+                                        Option::<&str>::None,
+                                    ),
+                                )
+                            }
+                        };
+                        let Ok(item_content) = item_content else {
+                            continue;
+                        };
+                        let completed = match content {
+                            StoredAssistantContent::ToolCall { item_id, .. } => {
+                                completed_tools.contains(item_id)
+                            }
+                            StoredAssistantContent::Reasoning { .. }
+                            | StoredAssistantContent::Text { .. } => true,
+                        };
+                        let status = if completed {
+                            ItemStatusView::Completed
+                        } else {
+                            ItemStatusView::Started
+                        };
+                        let completed_at = completed.then_some(created_at);
+                        if let Ok(item) = ItemView::new(
+                            item_id,
+                            turn_id,
+                            status,
+                            item_content,
+                            created_at,
+                            completed_at,
+                        ) {
+                            active_items.push(item);
+                        }
+                    }
+                }
+                StoredEntryBody::ToolMessage(_)
+                | StoredEntryBody::InteractionRequested(_)
+                | StoredEntryBody::InteractionResolved(_)
+                | StoredEntryBody::Compaction(_) => {}
+            }
+        }
+        let pending_interactions = live_state
+            .pending_interaction_facts()
+            .iter()
+            .map(|fact| {
+                InteractionView::new(
+                    *fact.request_id(),
+                    *fact.turn_id(),
+                    *fact.item_id(),
+                    fact.request().clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let phase = if pending_interactions.iter().any(|interaction| {
+            matches!(
+                interaction.request(),
+                InteractionRequestView::ToolApproval(_)
+            )
+        }) {
+            Some(TurnExecutionPhaseView::WaitingApproval)
+        } else if !pending_interactions.is_empty() {
+            Some(TurnExecutionPhaseView::WaitingForUserInput)
+        } else if has_started_tool {
+            Some(TurnExecutionPhaseView::ExecutingTools)
+        } else {
+            Some(TurnExecutionPhaseView::Sampling)
+        };
+        let started_at = entries
+            .first()
+            .map(|entry| entry.timestamp())
+            .unwrap_or_else(|| SystemClock.now());
+        let current_turn = Some(CurrentTurnView::new(
+            turn_id,
+            TurnStatusView::Running,
+            phase,
+            started_at,
+        ));
+        (
+            current_turn,
+            active_items.into(),
+            pending_interactions.into(),
+        )
     }
 }
 
@@ -3148,9 +3388,9 @@ async fn run_active_turn(
         Arc::clone(&conversation),
         turn_id,
         control_generation,
-        emergency_control,
+        emergency_control.clone(),
         emergency_observation,
-        cancellation,
+        cancellation.clone(),
         executor_closing,
         closing,
         interaction_completion_sender,
@@ -3164,6 +3404,21 @@ async fn run_active_turn(
             let _ = conversation.recorder.record(entry).await;
             SessionTurnTerminal::Completed
         }
+        Err(SessionTurnFailure::EmergencyControl(signal)) => {
+            let settled = {
+                let mut live_state = lock(&conversation.live_state);
+                if live_state.current_turn() == Some(turn_id) {
+                    live_state.fail_current_turn(turn_id)
+                } else {
+                    Ok(())
+                }
+            };
+            if settled.is_err() {
+                SessionTurnTerminal::Failed(SessionTurnFailure::Internal)
+            } else {
+                SessionTurnTerminal::Interrupted(session_turn_interruption(signal))
+            }
+        }
         Err(failure) => {
             let settled = {
                 let mut live_state = lock(&conversation.live_state);
@@ -3175,6 +3430,14 @@ async fn run_active_turn(
             };
             if settled.is_err() {
                 SessionTurnTerminal::Failed(SessionTurnFailure::Internal)
+            } else if cancellation.is_cancelled() {
+                let Some(signal) = emergency_control
+                    .observe(emergency_observation.target())
+                    .and_then(|observation| observation.signal())
+                else {
+                    return SessionTurnTerminal::Failed(failure);
+                };
+                SessionTurnTerminal::Interrupted(session_turn_interruption(signal))
             } else {
                 SessionTurnTerminal::Failed(failure)
             }
@@ -3238,7 +3501,17 @@ async fn run_active_turn_inner(
             closing.clone(),
         )
         .await
-        .map_err(map_model_call_failure)?;
+        .map_err(|error| {
+            if !cancellation.is_cancelled() {
+                if let Some(signal) = emergency_control
+                    .observe(emergency_observation.target())
+                    .and_then(|observation| observation.signal())
+                {
+                    return SessionTurnFailure::EmergencyControl(signal);
+                }
+            }
+            map_model_call_failure(error)
+        })?;
         if cancellation.is_cancelled() {
             return Err(SessionTurnFailure::Model);
         }
@@ -3646,6 +3919,13 @@ fn emergency_control_is_unsignaled_current(
         .is_some_and(|current| {
             current.epoch() == emergency_observation.epoch() && current.signal().is_none()
         })
+}
+
+const fn session_turn_interruption(signal: EmergencyControlSignal) -> SessionTurnInterruption {
+    match signal {
+        EmergencyControlSignal::Cancel => SessionTurnInterruption::UserCancelled,
+        EmergencyControlSignal::SecurityRevoked => SessionTurnInterruption::SecurityRevoked,
+    }
 }
 
 fn agent_run_retry_delay(
@@ -5851,7 +6131,7 @@ mod tests {
         );
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
         );
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
         tokio::task::yield_now().await;
@@ -5913,7 +6193,7 @@ mod tests {
         hooks.release_before_agent_run_attempt();
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
         );
         assert_eq!(model.request_count(), 0);
         close_loaded(loaded).await;
@@ -6789,6 +7069,8 @@ mod tests {
         .expect("the Interaction request is projected");
         assert_eq!(pending.current_turn(), Some(turn_id));
         assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+        assert_eq!(pending.public_pending_interactions().len(), 1);
+        assert_eq!(pending.active_items().len(), 2);
 
         let resolution = interaction_request
             .resolve_host(
@@ -7000,7 +7282,7 @@ mod tests {
         );
         assert_eq!(
             wait_for_terminal(&executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
         );
         assert_eq!(model.request_count(), 1);
         assert_eq!(
@@ -7067,7 +7349,7 @@ mod tests {
         );
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
         );
         assert_eq!(model.request_count(), 1);
         assert!(
@@ -7429,7 +7711,7 @@ mod tests {
         );
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
-            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
         );
         assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;

@@ -1551,7 +1551,7 @@ pub enum SnapshotResponse {
 }
 ```
 
-`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。当前 incremental codec materialize `Open + Loaded + Ready` 的 Idle baseline，以及 M9.18 已激活的 Starting/Running/Finishing queue projection（`currentTurn = null`、active Items/Pending Interaction仍为空、recording 为 `Healthy`、usage 为 zero/none、diagnostics 为空）；current Turn、non-empty Item/Interaction、Degraded recording、non-zero usage与diagnostic projection仍由后续 owners补齐，并继续作为known pending target处理。
+`Box<SessionSnapshot>`只控制enum尺寸，不改变semantic ownership或Wire V1 shape。当前 incremental codec materialize `Open + Loaded + Ready` 的 Idle baseline，以及 M9.18 已激活的 Starting/Running/Finishing queue projection；M9.20 已补齐 running/approval 快照中的 current Turn、active Items 与 Pending Interaction 最小安全投影（不暴露原始工具参数、工具结果或隐含推理），recording、non-zero usage与diagnostic projection仍由后续 owners补齐，并继续作为known pending target处理。
 
 ### RuntimeSnapshot
 
@@ -1964,7 +1964,7 @@ pub enum QueueUpdateReason {
 }
 ```
 
-M2 minimal State codec只materializeRuntime `command_catalog_invalidated`以及Session `turn_completed | turn_failed` + matching `TurnTerminal`；`turn_interrupted`、Item/Interaction/queue kinds、Progress和Closed继续返回known `PendingPublicTarget`。Box同样只控制enum尺寸。
+M2 minimal State codec已materialize Runtime `command_catalog_invalidated`以及Session `turn_completed | turn_interrupted | turn_failed` + matching `TurnTerminal`；Item/Interaction/queue kinds、Progress和Closed继续返回known `PendingPublicTarget`。Box同样只控制enum尺寸。
 
 StateEvent本身始终是非durable observer record，不因payload来源不同而成为第二日志：
 

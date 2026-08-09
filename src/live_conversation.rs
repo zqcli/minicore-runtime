@@ -439,6 +439,10 @@ pub(crate) struct LiveSessionState {
 }
 
 impl LiveSessionState {
+    pub(crate) fn selected_entries(&self) -> &[Arc<StoredSessionEntry>] {
+        &self.selected_path
+    }
+
     /// Creates a fresh loaded session. Every supplied historical/reserved ID is seeded into the
     /// collision guard before the first live allocation.
     pub(crate) fn new(

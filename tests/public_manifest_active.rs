@@ -3,11 +3,13 @@ use std::str::FromStr;
 
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
-    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
+    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
     PublicCancelTarget, PublicSubject, RetryAdvice, RuntimeCommand, RuntimeRequest,
     RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionStateEventKind,
-    SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView, TurnTerminalView,
+    SnapshotResponse, StateEventMsg, TurnCommand, TurnFailureView, TurnInterruptionView,
+    TurnStatusView, TurnTerminalView,
 };
+use minicore_runtime::turn_item_interaction::InteractionRequestView;
 use minicore_runtime::wire::{
     CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
     ProtocolBootstrapRouter, ProtocolRejectReason, ProtocolVersion, RuntimeCapabilities,
@@ -226,6 +228,48 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_eq!(snapshot.queues().steers().len(), 0);
             assert_eq!(snapshot.queues().follow_ups().len(), 0);
         }
+        (
+            Some("running_session_snapshot"),
+            EventFrame::Snapshot(SnapshotResponse::Session(snapshot)),
+        ) => {
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Running
+            );
+            assert!(matches!(
+                snapshot.current_turn().unwrap().status(),
+                TurnStatusView::Running
+            ));
+            assert_eq!(snapshot.active_items().len(), 2);
+            assert_eq!(snapshot.pending_interactions().len(), 1);
+            assert!(matches!(
+                snapshot.pending_interactions()[0].request(),
+                InteractionRequestView::UserQuestion(_)
+            ));
+            assert!(matches!(
+                snapshot.active_items()[0].content(),
+                ItemContentView::UserMessage { .. }
+            ));
+        }
+        (
+            Some("running_approval_session_snapshot"),
+            EventFrame::Snapshot(SnapshotResponse::Session(snapshot)),
+        ) => {
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Running
+            );
+            assert!(matches!(
+                snapshot.current_turn().unwrap().status(),
+                TurnStatusView::Running
+            ));
+            assert_eq!(snapshot.active_items().len(), 2);
+            assert_eq!(snapshot.pending_interactions().len(), 1);
+            assert!(matches!(
+                snapshot.pending_interactions()[0].request(),
+                minicore_runtime::turn_item_interaction::InteractionRequestView::ToolApproval(_)
+            ));
+        }
         (Some("runtime_catalog_invalidated_state"), EventFrame::State(event)) => {
             assert_eq!(event.route(), EventRoute::Runtime);
             let StateEventMsg::Runtime { kind, snapshot } = event.msg() else {
@@ -241,7 +285,16 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_turn_terminal_event(
                 event.msg(),
                 SessionStateEventKind::TurnFailed,
-                Some(TurnFailureView::Model),
+                Some(TerminalReason::Failure(TurnFailureView::Model)),
+            );
+        }
+        (Some("turn_interrupted_user_cancelled_state"), EventFrame::State(event)) => {
+            assert_turn_terminal_event(
+                event.msg(),
+                SessionStateEventKind::TurnInterrupted,
+                Some(TerminalReason::Interruption(
+                    TurnInterruptionView::UserCancelled,
+                )),
             );
         }
         (assertion, frame) => panic!("event assertion {assertion:?} does not match {frame:?}"),
@@ -251,7 +304,7 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
 fn assert_turn_terminal_event(
     msg: &StateEventMsg,
     expected_kind: SessionStateEventKind,
-    expected_failure: Option<TurnFailureView>,
+    expected_reason: Option<TerminalReason>,
 ) {
     let StateEventMsg::Session { kind, detail, .. } = msg else {
         panic!("turn terminal assertion requires a Session message");
@@ -260,13 +313,25 @@ fn assert_turn_terminal_event(
     let Some(SessionEventDetail::TurnTerminal { terminal, .. }) = detail else {
         panic!("turn terminal assertion requires terminal detail");
     };
-    match (terminal, expected_failure) {
+    match (terminal, expected_reason) {
         (TurnTerminalView::Completed { .. }, None) => {}
-        (TurnTerminalView::Failed { reason, .. }, Some(expected)) => {
+        (TurnTerminalView::Failed { reason, .. }, Some(TerminalReason::Failure(expected))) => {
+            assert_eq!(*reason, expected);
+        }
+        (
+            TurnTerminalView::Interrupted { reason, .. },
+            Some(TerminalReason::Interruption(expected)),
+        ) => {
             assert_eq!(*reason, expected);
         }
         value => panic!("unexpected terminal {value:?}"),
     }
+}
+
+#[derive(Debug)]
+enum TerminalReason {
+    Failure(TurnFailureView),
+    Interruption(TurnInterruptionView),
 }
 
 fn run_command_response(vector: &PublicVector) {
