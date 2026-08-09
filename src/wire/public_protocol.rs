@@ -407,6 +407,21 @@ impl RuntimeCommandInput {
                     session_id: value.session_id,
                 })
             }
+            Self::Session(SessionCommandInput::Archive(value)) => {
+                RuntimeCommand::Session(SessionCommand::Archive {
+                    session_id: value.session_id,
+                })
+            }
+            Self::Session(SessionCommandInput::Unarchive(value)) => {
+                RuntimeCommand::Session(SessionCommand::Unarchive {
+                    session_id: value.session_id,
+                })
+            }
+            Self::Session(SessionCommandInput::Delete(value)) => {
+                RuntimeCommand::Session(SessionCommand::Delete {
+                    session_id: value.session_id,
+                })
+            }
             Self::Session(SessionCommandInput::Fork(value)) => {
                 RuntimeCommand::Session(SessionCommand::Fork {
                     source_session_id: value.source_session_id,
@@ -460,6 +475,9 @@ enum SessionCommandInput {
     Create(Box<CreateSessionCommandInput>),
     Load(SessionIdInput),
     Unload(SessionIdInput),
+    Archive(SessionIdInput),
+    Unarchive(SessionIdInput),
+    Delete(SessionIdInput),
     Fork(ForkSessionCommandInput),
 }
 
@@ -1923,6 +1941,9 @@ enum RuntimeStateEventKindInput {
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     SessionForked,
     CommandCatalogInvalidated,
 }
@@ -1933,6 +1954,9 @@ impl RuntimeStateEventKindInput {
             Self::SessionCreated => RuntimeStateEventKind::SessionCreated,
             Self::SessionLoaded => RuntimeStateEventKind::SessionLoaded,
             Self::SessionUnloaded => RuntimeStateEventKind::SessionUnloaded,
+            Self::SessionArchived => RuntimeStateEventKind::SessionArchived,
+            Self::SessionUnarchived => RuntimeStateEventKind::SessionUnarchived,
+            Self::SessionDeleted => RuntimeStateEventKind::SessionDeleted,
             Self::SessionForked => RuntimeStateEventKind::SessionForked,
             Self::CommandCatalogInvalidated => RuntimeStateEventKind::CommandCatalogInvalidated,
         })
@@ -3214,6 +3238,9 @@ enum RuntimeStateEventKindOutput {
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     SessionForked,
     CommandCatalogInvalidated,
 }
@@ -3224,6 +3251,9 @@ impl RuntimeStateEventKindOutput {
             RuntimeStateEventKind::SessionCreated => Self::SessionCreated,
             RuntimeStateEventKind::SessionLoaded => Self::SessionLoaded,
             RuntimeStateEventKind::SessionUnloaded => Self::SessionUnloaded,
+            RuntimeStateEventKind::SessionArchived => Self::SessionArchived,
+            RuntimeStateEventKind::SessionUnarchived => Self::SessionUnarchived,
+            RuntimeStateEventKind::SessionDeleted => Self::SessionDeleted,
             RuntimeStateEventKind::SessionForked => Self::SessionForked,
             RuntimeStateEventKind::CommandCatalogInvalidated => Self::CommandCatalogInvalidated,
         }
@@ -3568,6 +3598,21 @@ impl<'a> RuntimeCommandOutput<'a> {
                     session_id: *session_id,
                 }))
             }
+            RuntimeCommand::Session(SessionCommand::Archive { session_id }) => {
+                Self::Session(SessionCommandOutput::Archive(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
+            RuntimeCommand::Session(SessionCommand::Unarchive { session_id }) => {
+                Self::Session(SessionCommandOutput::Unarchive(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
+            RuntimeCommand::Session(SessionCommand::Delete { session_id }) => {
+                Self::Session(SessionCommandOutput::Delete(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
             RuntimeCommand::Session(SessionCommand::Fork {
                 source_session_id,
                 anchor,
@@ -3627,6 +3672,9 @@ enum SessionCommandOutput<'a> {
     Create(CreateSessionCommandOutput<'a>),
     Load(SessionIdOutput),
     Unload(SessionIdOutput),
+    Archive(SessionIdOutput),
+    Unarchive(SessionIdOutput),
+    Delete(SessionIdOutput),
     Fork(ForkSessionCommandOutput),
 }
 
@@ -4031,6 +4079,9 @@ struct CommandOutputInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
     SessionForked(SessionForkedInput),
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     TurnStarted(TurnIdInput),
     SubmitCancelled,
     SteerQueued(TurnIdInput),
@@ -4038,6 +4089,7 @@ enum CommandOutcomeInput {
     QueuedMessageCancelled,
     CancelAccepted(CancelAcceptedInput),
     CommandOutput,
+    NoChange,
 }
 
 impl CommandOutcomeInput {
@@ -4047,6 +4099,9 @@ impl CommandOutcomeInput {
                 session_id: value.session_id,
                 source: value.source.into_semantic(),
             },
+            Self::SessionArchived => CommandOutcome::SessionArchived,
+            Self::SessionUnarchived => CommandOutcome::SessionUnarchived,
+            Self::SessionDeleted => CommandOutcome::SessionDeleted,
             Self::TurnStarted(value) => CommandOutcome::TurnStarted {
                 turn_id: value.turn_id,
             },
@@ -4061,6 +4116,7 @@ impl CommandOutcomeInput {
                 cancel_epoch: value.cancel_epoch.get(),
             },
             Self::CommandOutput => CommandOutcome::CommandOutput,
+            Self::NoChange => CommandOutcome::NoChange,
         }
     }
 }
@@ -4409,6 +4465,9 @@ struct CommandOutputOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
     SessionForked(SessionForkedOutput),
+    SessionArchived,
+    SessionUnarchived,
+    SessionDeleted,
     TurnStarted(TurnIdOutput),
     SubmitCancelled,
     SteerQueued(TurnIdOutput),
@@ -4416,6 +4475,7 @@ enum CommandOutcomeOutput {
     QueuedMessageCancelled,
     CancelAccepted(CancelAcceptedOutput),
     CommandOutput,
+    NoChange,
 }
 
 impl CommandOutcomeOutput {
@@ -4427,6 +4487,9 @@ impl CommandOutcomeOutput {
                     source: ForkSourceKindOutput::from_semantic(*source),
                 })
             }
+            CommandOutcome::SessionArchived => Self::SessionArchived,
+            CommandOutcome::SessionUnarchived => Self::SessionUnarchived,
+            CommandOutcome::SessionDeleted => Self::SessionDeleted,
             CommandOutcome::TurnStarted { turn_id } => {
                 Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
             }
@@ -4444,6 +4507,7 @@ impl CommandOutcomeOutput {
                 cancel_epoch: super::CanonicalU64::new(*cancel_epoch),
             }),
             CommandOutcome::CommandOutput => Self::CommandOutput,
+            CommandOutcome::NoChange => Self::NoChange,
         }
     }
 }
@@ -5676,16 +5740,19 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 .ok_or_else(selected_wrong_json_type)?;
             validate_id::<TurnId>(required(object, "turnId")?)
         }
+        "session_archived" | "session_unarchived" | "session_deleted" | "no_change" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
         "agent_deleted"
         | "session_loaded"
         | "session_unloaded"
-        | "session_archived"
-        | "session_unarchived"
-        | "session_deleted"
         | "runtime_reloaded"
         | "workspace_reloaded"
-        | "interaction_resolved"
-        | "no_change" => pending_output_unit(data),
+        | "interaction_resolved" => pending_output_unit(data),
         "submit_cancelled" | "follow_up_queued" | "queued_message_cancelled" => {
             if data.is_some() {
                 Err(selected_wrong_json_type())
@@ -6555,16 +6622,27 @@ fn validate_runtime_state_msg(
                 Err(error) => Err(error),
             }
         }
-        "session_created" | "session_forked" => {
+        "session_created" | "session_archived" | "session_unarchived" | "session_deleted"
+        | "session_forked" => {
             if route.family != EventRouteFamily::Session {
                 return Err(invalid_scalar());
             }
             let summary = validate_runtime_session_changed_detail(
                 object.get("detail").ok_or_else(missing_required_field)?,
             )?;
+            let expected_lifecycle = match kind {
+                "session_archived" => SessionLifecycleView::Archived,
+                "session_deleted" => SessionLifecycleView::Deleted,
+                _ => SessionLifecycleView::Open,
+            };
+            let fork_contract_matches = match kind {
+                "session_created" => !summary.forked,
+                "session_forked" => summary.forked,
+                _ => true,
+            };
             if route.session_id != Some(summary.session_id)
-                || summary.lifecycle != SessionLifecycleView::Open
-                || ((kind == "session_forked") != summary.forked)
+                || summary.lifecycle != expected_lifecycle
+                || !fork_contract_matches
             {
                 return Err(invalid_scalar());
             }
@@ -7102,18 +7180,16 @@ fn validate_command_request_shape(
 
 fn validate_session_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
     validate_adjacent_input(node, |kind, data| match kind {
-        "load" | "unload" => validate_session_id_object(data.ok_or_else(missing_required_field)?),
+        "load" | "unload" | "archive" | "unarchive" | "delete" => {
+            validate_session_id_object(data.ok_or_else(missing_required_field)?)
+        }
         "create" => {
             validate_create_session_command(data.ok_or_else(missing_required_field)?, limits)
         }
         "fork" => validate_fork_session_command(data.ok_or_else(missing_required_field)?),
-        "update_definition"
-        | "upgrade_agent_revision"
-        | "update_metadata"
-        | "reload_workspace"
-        | "archive"
-        | "unarchive"
-        | "delete" => pending_object(data),
+        "update_definition" | "upgrade_agent_revision" | "update_metadata" | "reload_workspace" => {
+            pending_object(data)
+        }
         _ => Err(unknown_input_variant()),
     })
 }

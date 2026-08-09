@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M0–M8 foundations/behavior、M9当前control/observation范围、M10完整Compaction vertical slice及M11 Session Fork command/storage、durable catalog/Fork provenance query、Runtime Session membership StateEvent vertical slices已实现；M11 remaining public family/event/full recovery closure、active-Turn grace Unload、完整cross-platform native matrix、Structured output与production provider/Tool adapters仍待实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M0–M8 foundations/behavior、M9当前control/observation范围、M10完整Compaction vertical slice及M11 Session Fork command/storage、durable catalog/Fork provenance query、Runtime Session membership StateEvent、public Session lifecycle command/event vertical slices已实现；M11 remaining Agent/Session mutation family与full recovery closure、active-Turn grace Unload、完整cross-platform native matrix、Structured output与production provider/Tool adapters仍待实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 

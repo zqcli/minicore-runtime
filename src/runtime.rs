@@ -802,6 +802,39 @@ impl RuntimeInner {
                     Err(error) => map_unload_error(command_id, session_id, error)?,
                 }
             }
+            RuntimeCommand::Session(SessionCommand::Archive { session_id }) => {
+                self.dispatch_session_lifecycle(
+                    command_id,
+                    session_id,
+                    SealedSessionLifecycleAttempt::archive(session_id),
+                    RuntimeStateEventKind::SessionArchived,
+                    CommandOutcome::SessionArchived,
+                    false,
+                )
+                .await?
+            }
+            RuntimeCommand::Session(SessionCommand::Unarchive { session_id }) => {
+                self.dispatch_session_lifecycle(
+                    command_id,
+                    session_id,
+                    SealedSessionLifecycleAttempt::unarchive(session_id),
+                    RuntimeStateEventKind::SessionUnarchived,
+                    CommandOutcome::SessionUnarchived,
+                    false,
+                )
+                .await?
+            }
+            RuntimeCommand::Session(SessionCommand::Delete { session_id }) => {
+                self.dispatch_session_lifecycle(
+                    command_id,
+                    session_id,
+                    SealedSessionLifecycleAttempt::delete(session_id),
+                    RuntimeStateEventKind::SessionDeleted,
+                    CommandOutcome::SessionDeleted,
+                    true,
+                )
+                .await?
+            }
             RuntimeCommand::Session(SessionCommand::Fork {
                 source_session_id,
                 anchor,
@@ -1160,7 +1193,11 @@ impl RuntimeInner {
     ) {
         debug_assert!(matches!(
             kind,
-            RuntimeStateEventKind::SessionCreated | RuntimeStateEventKind::SessionForked
+            RuntimeStateEventKind::SessionCreated
+                | RuntimeStateEventKind::SessionArchived
+                | RuntimeStateEventKind::SessionUnarchived
+                | RuntimeStateEventKind::SessionDeleted
+                | RuntimeStateEventKind::SessionForked
         ));
         let Ok(session) = public_session_summary(head) else {
             return;
@@ -1178,6 +1215,18 @@ impl RuntimeInner {
             }
             RuntimeStateEventKind::SessionForked => {
                 StateEvent::session_forked(head.created_at(), Some(command_id), snapshot, session)
+            }
+            RuntimeStateEventKind::SessionArchived => {
+                StateEvent::session_archived(SystemClock.now(), Some(command_id), snapshot, session)
+            }
+            RuntimeStateEventKind::SessionUnarchived => StateEvent::session_unarchived(
+                SystemClock.now(),
+                Some(command_id),
+                snapshot,
+                session,
+            ),
+            RuntimeStateEventKind::SessionDeleted => {
+                StateEvent::session_deleted(SystemClock.now(), Some(command_id), snapshot, session)
             }
             RuntimeStateEventKind::SessionLoaded
             | RuntimeStateEventKind::SessionUnloaded
@@ -1208,6 +1257,9 @@ impl RuntimeInner {
                 StateEvent::session_unloaded(timestamp, Some(command_id), snapshot, session_id)
             }
             RuntimeStateEventKind::SessionCreated
+            | RuntimeStateEventKind::SessionArchived
+            | RuntimeStateEventKind::SessionUnarchived
+            | RuntimeStateEventKind::SessionDeleted
             | RuntimeStateEventKind::SessionForked
             | RuntimeStateEventKind::CommandCatalogInvalidated => return,
         };
@@ -1418,6 +1470,39 @@ impl RuntimeInner {
         match self.residency() {
             Some(residency) => residency.update_lifecycle(attempt).await,
             None => Err(SessionResidencyLifecycleError::Closing),
+        }
+    }
+
+    async fn dispatch_session_lifecycle(
+        &self,
+        command_id: crate::wire::CommandId,
+        session_id: SessionId,
+        attempt: SealedSessionLifecycleAttempt,
+        event_kind: RuntimeStateEventKind,
+        changed_outcome: CommandOutcome,
+        deleted_is_success: bool,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        match self.update_session_lifecycle(attempt).await {
+            Ok(crate::durable_state::DurableSessionLifecycleOutcome::Updated(head)) => {
+                self.publish_durable_session_event(event_kind, command_id, head.as_ref());
+                Ok(completed_outcome(changed_outcome))
+            }
+            Ok(crate::durable_state::DurableSessionLifecycleOutcome::NoChange(_)) => {
+                let outcome = if deleted_is_success {
+                    CommandOutcome::SessionDeleted
+                } else {
+                    CommandOutcome::NoChange
+                };
+                Ok(completed_outcome(outcome))
+            }
+            Err(SessionResidencyLifecycleError::SessionDeleted) if deleted_is_success => {
+                Ok(completed_outcome(CommandOutcome::SessionDeleted))
+            }
+            Err(error) => map_session_lifecycle_error(command_id, session_id, error),
         }
     }
 
@@ -1884,6 +1969,62 @@ fn map_unload_error(
             Err(RuntimeDispatchError::InternalDispatchUnavailable)
         }
     }
+}
+
+fn map_session_lifecycle_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyLifecycleError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyLifecycleError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyLifecycleError::SessionBusy => rejected_completion(
+            CommandErrorCode::SessionBusy,
+            "Session is busy",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyLifecycleError::SessionNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Session was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyLifecycleError::SessionDeleted => rejected_completion(
+            CommandErrorCode::SessionDeleted,
+            "Session is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyLifecycleError::InvalidLifecycleTransition => rejected_completion(
+            CommandErrorCode::InvalidArgument,
+            "Session lifecycle transition is invalid",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyLifecycleError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyLifecycleError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Session lifecycle update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyLifecycleError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
 }
 
 fn map_fork_error(
@@ -2433,9 +2574,9 @@ mod tests {
         PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability, RuntimeCommand,
         RuntimeEventDetail, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
         RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
-        SessionRecordingState, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
-        StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
-        TurnTerminalView,
+        SessionLifecycleView, SessionRecordingState, SessionStateEventKind, SnapshotRequest,
+        SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope, TurnCommand,
+        TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -2812,6 +2953,249 @@ mod tests {
                 .expect("Runtime closing settles the event stream"),
             None
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_session_lifecycle_commands_publish_only_real_changes() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let runtime = MiniCoreRuntime::open(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+        )
+        .await
+        .expect("the Runtime opens");
+        let agent_id = create_runtime_agent(&runtime).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+            .await
+            .expect("the Runtime subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+        ));
+
+        let create = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Create {
+                    agent_id,
+                    definition: Box::new(NewSessionDefinition::new(
+                        workspace_input(workspace.path()),
+                        SessionModelConfig::new(
+                            ModelSelection::new(
+                                "openai".parse().unwrap(),
+                                "gpt-5".parse().unwrap(),
+                            ),
+                            ReasoningPreference::Auto,
+                            Some(NonZeroU32::new(4096).unwrap()),
+                        ),
+                        SessionPromptSelection::new(Vec::new()).unwrap(),
+                    )),
+                    metadata: NewSessionMetadata::new(None::<&str>, None::<&str>).unwrap(),
+                }),
+            ))
+            .await
+            .expect("Create dispatches");
+        let session_id = command_output(&create).parse().unwrap();
+        assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+        let archive_id = CommandId::generate().unwrap();
+        let archive = runtime
+            .dispatch(CommandRequest::new(
+                archive_id,
+                RuntimeCommand::Session(SessionCommand::Archive { session_id }),
+            ))
+            .await
+            .expect("Archive dispatches");
+        assert!(matches!(
+            archive.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionArchived,
+                output: None,
+            }
+        ));
+        let Some(EventFrame::State(archived)) = events.recv().await else {
+            panic!("Archive publishes one StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionArchived,
+            snapshot,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+        } = archived.msg()
+        else {
+            panic!("Archive publishes the changed Session summary");
+        };
+        assert_eq!(archived.command_id(), Some(archive_id));
+        assert!(snapshot.loaded_sessions().is_empty());
+        assert_eq!(session.session_id(), session_id);
+        assert_eq!(session.lifecycle(), SessionLifecycleView::Archived);
+
+        let repeated_archive = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Archive { session_id }),
+            ))
+            .await
+            .expect("repeated Archive dispatches");
+        assert!(matches!(
+            repeated_archive.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::NoChange,
+                output: None,
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "NoChange does not publish a second event"
+        );
+
+        let unarchive_id = CommandId::generate().unwrap();
+        let unarchive = runtime
+            .dispatch(CommandRequest::new(
+                unarchive_id,
+                RuntimeCommand::Session(SessionCommand::Unarchive { session_id }),
+            ))
+            .await
+            .expect("Unarchive dispatches");
+        assert!(matches!(
+            unarchive.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionUnarchived,
+                output: None,
+            }
+        ));
+        let Some(EventFrame::State(unarchived)) = events.recv().await else {
+            panic!("Unarchive publishes one StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionUnarchived,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } = unarchived.msg()
+        else {
+            panic!("Unarchive publishes the changed Session summary");
+        };
+        assert_eq!(unarchived.command_id(), Some(unarchive_id));
+        assert_eq!(session.lifecycle(), SessionLifecycleView::Open);
+
+        let repeated_unarchive = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unarchive { session_id }),
+            ))
+            .await
+            .expect("repeated Unarchive dispatches");
+        assert!(matches!(
+            repeated_unarchive.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::NoChange,
+                output: None,
+            }
+        ));
+
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Load { session_id }),
+            ))
+            .await
+            .expect("Load dispatches");
+        assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+        let busy_archive = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Archive { session_id }),
+            ))
+            .await
+            .expect("loaded Archive is a typed rejection");
+        assert!(matches!(
+            busy_archive.completion(),
+            CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::SessionBusy
+        ));
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Unload { session_id }),
+            ))
+            .await
+            .expect("Unload dispatches");
+        assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+        let open_delete = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Delete { session_id }),
+            ))
+            .await
+            .expect("Open Delete is a typed rejection");
+        assert!(matches!(
+            open_delete.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::InvalidArgument
+        ));
+
+        runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Archive { session_id }),
+            ))
+            .await
+            .expect("Archive before Delete dispatches");
+        assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+        let delete_id = CommandId::generate().unwrap();
+        let delete = runtime
+            .dispatch(CommandRequest::new(
+                delete_id,
+                RuntimeCommand::Session(SessionCommand::Delete { session_id }),
+            ))
+            .await
+            .expect("Delete dispatches");
+        assert!(matches!(
+            delete.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionDeleted,
+                output: None,
+            }
+        ));
+        let Some(EventFrame::State(deleted)) = events.recv().await else {
+            panic!("Delete publishes one StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SessionDeleted,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } = deleted.msg()
+        else {
+            panic!("Delete publishes the changed Session summary");
+        };
+        assert_eq!(deleted.command_id(), Some(delete_id));
+        assert_eq!(session.lifecycle(), SessionLifecycleView::Deleted);
+
+        let repeated_delete = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Session(SessionCommand::Delete { session_id }),
+            ))
+            .await
+            .expect("repeated Delete dispatches");
+        assert!(matches!(
+            repeated_delete.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SessionDeleted,
+                output: None,
+            }
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "already Deleted does not publish a second event"
+        );
+
+        runtime.shutdown().await;
     }
 
     fn replayed_user_entry(session_id: SessionId, line_index: usize) -> Vec<u8> {

@@ -1,9 +1,9 @@
 use minicore_runtime::runtime_interface::{
-    AgentQuery, AgentQueryResult, EventFrame, EventRoute, QueryErrorCode, QueryResult,
-    RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand,
-    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeStateEventKind,
-    SessionQuery, SessionQueryResult, SessionSummary, SnapshotRequest, StateEvent, StateEventMsg,
-    SubscriptionScope,
+    AgentQuery, AgentQueryResult, CommandCompletion, CommandOutcome, EventFrame, EventRoute,
+    QueryErrorCode, QueryResult, RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail,
+    RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest,
+    RuntimeStateEventKind, SessionCommand, SessionLifecycleView, SessionQuery, SessionQueryResult,
+    SessionSummary, SnapshotRequest, StateEvent, StateEventMsg, SubscriptionScope,
 };
 use minicore_runtime::wire::{
     BoundedJsonError, IncrementalRuntimeProtocolV1, ProtocolLimits, ProtocolVersion,
@@ -114,6 +114,156 @@ fn runtime_scope_unit_variants_have_one_canonical_shape() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn session_lifecycle_commands_and_completions_round_trip_as_typed_values() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let command =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/archive-session-command.json");
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, command)
+        .unwrap();
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("Archive fixture decodes as a dispatch request");
+    };
+    assert!(matches!(
+        dispatch.command(),
+        RuntimeCommand::Session(SessionCommand::Archive { .. })
+    ));
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(command)
+    );
+
+    let response =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/session-archived-response.json");
+    let decoded = protocol.decode_command_response(response).unwrap();
+    assert!(matches!(
+        decoded.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::SessionArchived,
+            output: None,
+        }
+    ));
+    assert_eq!(
+        protocol.encode_command_response(&decoded).unwrap(),
+        without_lf(response)
+    );
+
+    let unarchive =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/unarchive-session-command.json");
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, unarchive)
+        .unwrap();
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("Unarchive fixture decodes as a dispatch request");
+    };
+    assert!(matches!(
+        dispatch.command(),
+        RuntimeCommand::Session(SessionCommand::Unarchive { .. })
+    ));
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(unarchive)
+    );
+
+    let delete =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/delete-session-command.json");
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, delete)
+        .unwrap();
+    let RuntimeRequest::Dispatch(dispatch) = &request else {
+        panic!("Delete fixture decodes as a dispatch request");
+    };
+    assert!(matches!(
+        dispatch.command(),
+        RuntimeCommand::Session(SessionCommand::Delete { .. })
+    ));
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(delete)
+    );
+
+    for (bytes, expected) in [
+        (
+            include_bytes!(
+                "../docs/fixtures/wire-v1/public/valid/session-unarchived-response.json"
+            )
+            .as_slice(),
+            CommandOutcome::SessionUnarchived,
+        ),
+        (
+            include_bytes!("../docs/fixtures/wire-v1/public/valid/session-deleted-response.json")
+                .as_slice(),
+            CommandOutcome::SessionDeleted,
+        ),
+        (
+            include_bytes!("../docs/fixtures/wire-v1/public/valid/no-change-response.json")
+                .as_slice(),
+            CommandOutcome::NoChange,
+        ),
+    ] {
+        let decoded = protocol.decode_command_response(bytes).unwrap();
+        assert!(matches!(
+            decoded.completion(),
+            CommandCompletion::Completed { outcome, output: None } if outcome == &expected
+        ));
+        assert_eq!(
+            protocol.encode_command_response(&decoded).unwrap(),
+            without_lf(bytes)
+        );
+    }
+}
+
+#[test]
+fn session_lifecycle_runtime_events_round_trip_with_matching_safe_summaries() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    for (bytes, expected_kind, expected_lifecycle) in [
+        (
+            include_bytes!(
+                "../docs/fixtures/wire-v1/public/valid/session-archived-state-frame.json"
+            )
+            .as_slice(),
+            RuntimeStateEventKind::SessionArchived,
+            SessionLifecycleView::Archived,
+        ),
+        (
+            include_bytes!(
+                "../docs/fixtures/wire-v1/public/valid/session-unarchived-state-frame.json"
+            )
+            .as_slice(),
+            RuntimeStateEventKind::SessionUnarchived,
+            SessionLifecycleView::Open,
+        ),
+        (
+            include_bytes!(
+                "../docs/fixtures/wire-v1/public/valid/session-deleted-state-frame.json"
+            )
+            .as_slice(),
+            RuntimeStateEventKind::SessionDeleted,
+            SessionLifecycleView::Deleted,
+        ),
+    ] {
+        let frame = protocol.decode_event_frame(bytes).unwrap();
+        let EventFrame::State(event) = &frame else {
+            panic!("the lifecycle fixture decodes as a StateEvent");
+        };
+        let StateEventMsg::Runtime {
+            kind,
+            detail: Some(RuntimeEventDetail::SessionChanged { session }),
+            ..
+        } = event.msg()
+        else {
+            panic!("the lifecycle event carries one SessionChanged detail");
+        };
+        assert_eq!(*kind, expected_kind);
+        assert_eq!(session.lifecycle(), expected_lifecycle);
+        assert_eq!(
+            protocol.encode_event_frame(&frame).unwrap(),
+            without_lf(bytes)
+        );
+    }
 }
 
 #[test]
