@@ -1172,6 +1172,12 @@ fn map_submit_error(
         SessionResidencySubmitError::Cancelled => {
             completed_outcome(CommandOutcome::SubmitCancelled)
         }
+        SessionResidencySubmitError::Unauthorized => rejected_completion(
+            CommandErrorCode::Unauthorized,
+            "Session authority was revoked",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
         SessionResidencySubmitError::InternalDispatchUnavailable => {
             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
         }

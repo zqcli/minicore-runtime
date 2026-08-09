@@ -631,6 +631,8 @@ pub(crate) enum SessionSubmitError {
     ContextOverflow,
     #[error("the Submit was cancelled before Turn start")]
     Cancelled,
+    #[error("Session authority was revoked before Turn start")]
+    SecurityRevoked,
     #[error("session turn dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1617,6 +1619,7 @@ struct ActiveAdmission {
     emergency: crate::session_ingress::EmergencyControlObservation,
     waiter: Option<oneshot::Sender<Result<TurnId, SessionSubmitError>>>,
     cancellation: CancellationToken,
+    security_revocation: CancellationToken,
     task: Option<TrackedTask>,
 }
 
@@ -2002,6 +2005,7 @@ impl SessionExecutorActor {
             emergency,
             waiter,
             cancellation: CancellationToken::new(),
+            security_revocation: CancellationToken::new(),
             task: None,
         });
         self.execution_state = SessionExecutionState::Starting;
@@ -2016,6 +2020,12 @@ impl SessionExecutorActor {
             .as_ref()
             .expect("admission is installed before spawning")
             .cancellation
+            .clone();
+        let security_revocation = self
+            .active_admission
+            .as_ref()
+            .expect("admission is installed before spawning")
+            .security_revocation
             .clone();
 
         let completion_sender = self.completion_sender.clone();
@@ -2040,6 +2050,7 @@ impl SessionExecutorActor {
                 conversation,
                 turn_admission_gate,
                 cancellation,
+                security_revocation,
                 turn_id,
                 intent,
                 #[cfg(test)]
@@ -2142,7 +2153,14 @@ impl SessionExecutorActor {
         let turn_id = active.turn_id;
         let emergency_control = self.emergency.clone();
         let emergency_observation = emergency;
-        if cancellation.is_cancelled() {
+        if let Some(signal) = prior_signal {
+            let _ = self
+                .completion_sender
+                .send(ExecutorCompletion::Turn(TurnCompletion {
+                    turn_id,
+                    terminal: SessionTurnTerminal::Interrupted(session_turn_interruption(signal)),
+                }));
+        } else if cancellation.is_cancelled() {
             let _ = self
                 .completion_sender
                 .send(ExecutorCompletion::Turn(TurnCompletion {
@@ -2385,7 +2403,7 @@ impl SessionExecutorActor {
         &mut self,
         request: &mut SecurityRevokedRequest,
     ) -> Result<(), ActorFatality> {
-        let (emergency_target, cancellation) = match request.target {
+        let (emergency_target, cancellation, security_revocation) = match request.target {
             SessionCancelTarget::Submit(command_id) => {
                 let Some(active) = self.active_admission.as_ref() else {
                     request.settle(Err(SessionSecurityRevokedError::NotRunning));
@@ -2398,6 +2416,7 @@ impl SessionExecutorActor {
                 (
                     EmergencyControlTarget::Submit(command_id),
                     active.cancellation.clone(),
+                    Some(active.security_revocation.clone()),
                 )
             }
             SessionCancelTarget::Turn(turn_id) => {
@@ -2406,7 +2425,11 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionSecurityRevokedError::ExpectedTurnMismatch));
                         return Ok(());
                     }
-                    (active.emergency.target(), active.cancellation.clone())
+                    (
+                        active.emergency.target(),
+                        active.cancellation.clone(),
+                        Some(active.security_revocation.clone()),
+                    )
                 } else {
                     let Some(active) = self.active_turn.as_ref() else {
                         request.settle(Err(SessionSecurityRevokedError::NotRunning));
@@ -2416,7 +2439,7 @@ impl SessionExecutorActor {
                         request.settle(Err(SessionSecurityRevokedError::ExpectedTurnMismatch));
                         return Ok(());
                     }
-                    (active.emergency.target(), active.cancellation.clone())
+                    (active.emergency.target(), active.cancellation.clone(), None)
                 }
             }
         };
@@ -2426,6 +2449,9 @@ impl SessionExecutorActor {
             .signal(emergency_target, EmergencyControlSignal::SecurityRevoked)
         {
             EmergencyControlSignalOutcome::Accepted { .. } => {
+                if let Some(security_revocation) = security_revocation {
+                    security_revocation.cancel();
+                }
                 cancellation.cancel();
                 request.settle(Ok(()));
                 true
@@ -3638,6 +3664,7 @@ struct AdmissionWork {
     turn_admission_gate: Arc<TurnAdmissionGate>,
     turn_id: TurnId,
     intent: PromptIntent,
+    security_revocation: CancellationToken,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -3657,11 +3684,15 @@ async fn run_admission(
         turn_admission_gate,
         turn_id,
         intent,
+        security_revocation,
         #[cfg(test)]
         hooks,
     } = work;
     if closing.is_cancelled() {
         return Err(SessionSubmitError::Closing);
+    }
+    if security_revocation.is_cancelled() {
+        return Err(SessionSubmitError::SecurityRevoked);
     }
     if cancellation.is_cancelled() {
         return Err(SessionSubmitError::Cancelled);
@@ -3671,6 +3702,7 @@ async fn run_admission(
     let agent = tokio::select! {
         biased;
         _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = security_revocation.cancelled() => return Err(SessionSubmitError::SecurityRevoked),
         _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
         result = &mut agent_read => result,
     }
@@ -3690,6 +3722,7 @@ async fn run_admission(
     let message = tokio::select! {
         biased;
         _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = security_revocation.cancelled() => return Err(SessionSubmitError::SecurityRevoked),
         _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
         result = context.resolve_user_message(intent) => result.map_err(map_submit_prompt_error)?,
     };
@@ -3699,6 +3732,9 @@ async fn run_admission(
     if closing.is_cancelled() {
         return Err(SessionSubmitError::Closing);
     }
+    if security_revocation.is_cancelled() {
+        return Err(SessionSubmitError::SecurityRevoked);
+    }
     if cancellation.is_cancelled() {
         return Err(SessionSubmitError::Cancelled);
     }
@@ -3706,6 +3742,7 @@ async fn run_admission(
     let admission = tokio::select! {
         biased;
         _ = closing.cancelled() => return Err(SessionSubmitError::Closing),
+        _ = security_revocation.cancelled() => return Err(SessionSubmitError::SecurityRevoked),
         _ = cancellation.cancelled() => return Err(SessionSubmitError::Cancelled),
         result = durable_state.acquire_agent_admission(context.agent()) => {
             result.map_err(map_agent_admission_error)?
@@ -3721,6 +3758,9 @@ async fn run_admission(
         if closing.is_cancelled() {
             return Err(SessionSubmitError::Closing);
         }
+        if security_revocation.is_cancelled() {
+            return Err(SessionSubmitError::SecurityRevoked);
+        }
         if cancellation.is_cancelled() {
             return Err(SessionSubmitError::Cancelled);
         }
@@ -3734,6 +3774,8 @@ async fn run_admission(
             .map_err(|_| SessionSubmitError::InternalDispatchUnavailable)?
     };
     let _ = conversation.recorder.record(Arc::clone(fact.entry())).await;
+    #[cfg(test)]
+    hooks.after_input_before_completion().await;
     Ok(context)
 }
 
@@ -5375,6 +5417,21 @@ impl SessionExecutorTestHooks {
         self.inner.after_agent_admission_before_input.release();
     }
 
+    pub(crate) fn arm_after_input_before_completion(&self) {
+        self.inner.after_input_before_completion.arm();
+    }
+
+    pub(crate) async fn wait_after_input_before_completion(&self) {
+        self.inner
+            .after_input_before_completion
+            .wait_until_entered()
+            .await;
+    }
+
+    pub(crate) fn release_after_input_before_completion(&self) {
+        self.inner.after_input_before_completion.release();
+    }
+
     pub(crate) fn arm_before_agent_run_attempt(&self) {
         self.inner.before_agent_run_attempt.arm();
     }
@@ -5474,6 +5531,7 @@ impl SessionExecutorTestHooks {
 struct SessionExecutorTestHooksInner {
     before_snapshot_response: Arc<NamedAsyncBarrier>,
     after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
+    after_input_before_completion: Arc<NamedAsyncBarrier>,
     before_agent_run_attempt: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
     after_steer_resolution: Arc<NamedAsyncBarrier>,
@@ -5490,6 +5548,7 @@ impl SessionExecutorTestHooksInner {
         Self {
             before_snapshot_response: Arc::new(NamedAsyncBarrier::new()),
             after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
+            after_input_before_completion: Arc::new(NamedAsyncBarrier::new()),
             before_agent_run_attempt: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
             after_steer_resolution: Arc::new(NamedAsyncBarrier::new()),
@@ -5509,6 +5568,10 @@ impl SessionExecutorTestHooksInner {
         self.after_agent_admission_before_input
             .wait_if_armed()
             .await;
+    }
+
+    async fn after_input_before_completion(&self) {
+        self.after_input_before_completion.wait_if_armed().await;
     }
 
     async fn before_agent_run_attempt(&self) {
@@ -8077,7 +8140,10 @@ mod tests {
             Some(EmergencyControlSignal::SecurityRevoked)
         );
         hooks.release_after_agent_admission_before_input();
-        assert_eq!(submit.await.unwrap(), Err(SessionSubmitError::Cancelled));
+        assert_eq!(
+            submit.await.unwrap(),
+            Err(SessionSubmitError::SecurityRevoked)
+        );
         let snapshot = loaded.executor.snapshot().await.unwrap();
         assert_eq!(snapshot.execution_state(), SessionExecutionState::Idle);
         assert_eq!(snapshot.current_turn(), None);
@@ -8113,6 +8179,66 @@ mod tests {
             Err(SessionSecurityRevokedError::Closing)
         );
         close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_after_input_is_reported_as_turn_interruption() {
+        for security_revoked in [false, true] {
+            let store = TempStore::new();
+            let model = ScriptedModelFixture::new(vec!["must not run"]);
+            let loaded = scripted_text_fixture(&store, &model).await;
+            let hooks = loaded.executor.test_hooks();
+            hooks.arm_after_input_before_completion();
+            let command_id = CommandId::generate().unwrap();
+            let submit_executor = loaded.executor.clone();
+            let submit = tokio::spawn(async move {
+                submit_executor
+                    .submit(
+                        command_id,
+                        PromptIntent::new(
+                            PromptBodyIntent::Text(
+                                TextIntent::new("emergency after input").unwrap(),
+                            ),
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+            });
+            hooks.wait_after_input_before_completion().await;
+
+            if security_revoked {
+                assert_eq!(
+                    loaded
+                        .executor
+                        .security_revoke(SessionCancelTarget::Submit(command_id))
+                        .await,
+                    Ok(())
+                );
+            } else {
+                assert_eq!(
+                    loaded
+                        .executor
+                        .cancel(
+                            SessionCancelTarget::Submit(command_id),
+                            "2026-08-08T10:04:00.000Z".parse().unwrap(),
+                        )
+                        .await,
+                    Ok(())
+                );
+            }
+            hooks.release_after_input_before_completion();
+
+            let turn_id = submit.await.unwrap().unwrap();
+            let expected = if security_revoked {
+                SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
+            } else {
+                SessionTurnTerminal::Interrupted(SessionTurnInterruption::UserCancelled)
+            };
+            assert_eq!(wait_for_terminal(&loaded.executor, turn_id).await, expected);
+            assert_eq!(model.request_count(), 0);
+            close_loaded(loaded).await;
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
