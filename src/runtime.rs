@@ -29,9 +29,10 @@ use crate::session_execution::{
     SessionWorkspaceDefinitionOutcome,
 };
 use crate::session_residency::{
-    SessionResidencyCancelError, SessionResidencyLifecycleError, SessionResidencyLoadError,
-    SessionResidencyLoadOutcome, SessionResidencyRegistry, SessionResidencySnapshotError,
-    SessionResidencyStartError, SessionResidencySubmitError, SessionResidencySubscriptionError,
+    SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyLifecycleError,
+    SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyQueuedMessageError,
+    SessionResidencyRegistry, SessionResidencySnapshotError, SessionResidencyStartError,
+    SessionResidencySteerError, SessionResidencySubmitError, SessionResidencySubscriptionError,
     SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
     SessionResidencyWorkspaceDefinitionError,
 };
@@ -473,6 +474,48 @@ impl RuntimeInner {
                     Err(error) => map_submit_error(command_id, session_id, error)?,
                 }
             }
+            RuntimeCommand::Turn(TurnCommand::Steer {
+                session_id,
+                expected_turn_id,
+                intent,
+            }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                match residency
+                    .steer(session_id, expected_turn_id, command_id, intent)
+                    .await
+                {
+                    Ok(()) => completed_outcome(CommandOutcome::SteerQueued {
+                        turn_id: expected_turn_id,
+                    }),
+                    Err(error) => map_steer_error(command_id, session_id, error)?,
+                }
+            }
+            RuntimeCommand::Turn(TurnCommand::FollowUp { session_id, intent }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                match residency.follow_up(session_id, command_id, intent).await {
+                    Ok(()) => completed_outcome(CommandOutcome::FollowUpQueued),
+                    Err(error) => map_follow_up_error(command_id, session_id, error)?,
+                }
+            }
+            RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+                session_id,
+                target_command_id,
+            }) => {
+                let Some(residency) = self.residency() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                match residency
+                    .cancel_queued_message(session_id, target_command_id)
+                    .await
+                {
+                    Ok(()) => completed_outcome(CommandOutcome::QueuedMessageCancelled),
+                    Err(error) => map_cancel_queued_message_error(command_id, session_id, error)?,
+                }
+            }
             RuntimeCommand::Turn(TurnCommand::Cancel { session_id, target }) => {
                 let Some(residency) = self.residency() else {
                     return Err(RuntimeDispatchError::RuntimeClosed);
@@ -840,6 +883,14 @@ fn completed_output(text: impl AsRef<str>) -> CommandCompletion {
     }
 }
 
+fn completed_outcome(outcome: CommandOutcome) -> CommandCompletion {
+    debug_assert!(!matches!(outcome, CommandOutcome::CommandOutput));
+    CommandCompletion::Completed {
+        outcome,
+        output: None,
+    }
+}
+
 fn implemented_runtime_capabilities() -> RuntimeCapabilities {
     RuntimeCapabilities::for_v1(vec![
         crate::runtime_interface::RuntimeCapability::StateEvents,
@@ -1069,6 +1120,142 @@ fn map_submit_error(
             subject,
         ),
         SessionResidencySubmitError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_follow_up_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyFollowUpError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyFollowUpError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyFollowUpError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyFollowUpError::TurnNotRunning => rejected_completion(
+            CommandErrorCode::TurnNotRunning,
+            "the Session has no active Turn",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyFollowUpError::CommandConflict => rejected_completion(
+            CommandErrorCode::CommandConflict,
+            "the FollowUp command conflicts with an admitted command",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencyFollowUpError::QueueFull => rejected_completion(
+            CommandErrorCode::IngressLaneFull {
+                lane: crate::runtime_interface::PublicIngressLane::FollowUp,
+            },
+            "the FollowUp queue is full",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencyFollowUpError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_steer_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencySteerError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencySteerError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencySteerError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencySteerError::TurnNotRunning => rejected_completion(
+            CommandErrorCode::TurnNotRunning,
+            "the Turn is not running",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencySteerError::TurnCancelling => rejected_completion(
+            CommandErrorCode::TurnCancelling,
+            "the Turn is already cancelling",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencySteerError::ExpectedTurnMismatch => rejected_completion(
+            CommandErrorCode::ExpectedTurnMismatch,
+            "the Steer target does not match the active Turn",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencySteerError::CommandConflict => rejected_completion(
+            CommandErrorCode::CommandConflict,
+            "the Steer command conflicts with an admitted command",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        SessionResidencySteerError::QueueFull => rejected_completion(
+            CommandErrorCode::IngressLaneFull {
+                lane: crate::runtime_interface::PublicIngressLane::Steer,
+            },
+            "the Steer queue is full",
+            retry_with_backoff(),
+            subject,
+        ),
+        SessionResidencySteerError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_cancel_queued_message_error(
+    _command_id: crate::wire::CommandId,
+    session_id: SessionId,
+    error: SessionResidencyQueuedMessageError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Session(session_id));
+    let completion = match error {
+        SessionResidencyQueuedMessageError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        SessionResidencyQueuedMessageError::SessionNotLoaded => rejected_completion(
+            CommandErrorCode::SessionNotLoaded,
+            "Session is not loaded",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        SessionResidencyQueuedMessageError::NotQueued => rejected_completion(
+            CommandErrorCode::QueuedMessageNotQueued,
+            "the queued message is not queued",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        SessionResidencyQueuedMessageError::InternalDispatchUnavailable => {
             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
         }
     };
@@ -1330,7 +1517,9 @@ mod tests {
         SessionModelConfig,
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
-    use crate::model_gateway::{ModelSelection, ReasoningPreference, ScriptedModelFixture};
+    use crate::model_gateway::{
+        ModelCallErrorReason, ModelSelection, ReasoningPreference, ScriptedModelFixture,
+    };
     use crate::prompt::{
         AgentPromptSelection, PromptBodyIntent, PromptIntent, SessionPromptSelection, TextIntent,
     };
@@ -1776,6 +1965,204 @@ mod tests {
         drop(executor);
         drop(residency);
 
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_queue_commands_route_to_typed_session_errors() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["unused"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let intent = PromptIntent::new(
+            PromptBodyIntent::Text(TextIntent::new("queued").unwrap()),
+            Vec::new(),
+        )
+        .unwrap();
+        let turn_id: TurnId = "trn_33333333333333333333333333333333".parse().unwrap();
+
+        let follow_up = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_11111111111111111111111111111111".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::FollowUp {
+                    session_id,
+                    intent: intent.clone(),
+                }),
+            ))
+            .await
+            .expect("FollowUp dispatch returns a typed completion");
+        assert!(matches!(
+            follow_up.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::TurnNotRunning
+        ));
+
+        let steer = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_22222222222222222222222222222222".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Steer {
+                    session_id,
+                    expected_turn_id: turn_id,
+                    intent,
+                }),
+            ))
+            .await
+            .expect("Steer dispatch returns a typed completion");
+        assert!(matches!(
+            steer.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::TurnNotRunning
+        ));
+
+        let cancel_queued = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_44444444444444444444444444444444".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+                    session_id,
+                    target_command_id: "cmd_55555555555555555555555555555555".parse().unwrap(),
+                }),
+            ))
+            .await
+            .expect("CancelQueuedMessage dispatch returns a typed completion");
+        assert!(matches!(
+            cancel_queued.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::QueuedMessageNotQueued
+        ));
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_queue_commands_accept_active_turn_and_cancel_one_fifo_entry() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["after retry", "after steer"],
+        );
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("public Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_11111111111111111111111111111111".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("begin queued route").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("public Submit dispatches");
+        let turn_id = started_turn(&submit);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while model.request_count() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first retry attempt is delivered");
+
+        let intent = PromptIntent::new(
+            PromptBodyIntent::Text(TextIntent::new("queued follow-up").unwrap()),
+            Vec::new(),
+        )
+        .unwrap();
+        let follow_up_command_id: CommandId =
+            "cmd_22222222222222222222222222222222".parse().unwrap();
+        let follow_up = runtime
+            .dispatch(CommandRequest::new(
+                follow_up_command_id,
+                RuntimeCommand::Turn(TurnCommand::FollowUp {
+                    session_id,
+                    intent: intent.clone(),
+                }),
+            ))
+            .await
+            .expect("public FollowUp dispatches");
+        assert!(matches!(
+            follow_up.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::FollowUpQueued,
+                output: None,
+            }
+        ));
+
+        let steer = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_33333333333333333333333333333333".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Steer {
+                    session_id,
+                    expected_turn_id: turn_id,
+                    intent,
+                }),
+            ))
+            .await
+            .expect("public Steer dispatches");
+        assert!(matches!(
+            steer.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SteerQueued { turn_id: queued_turn_id },
+                output: None,
+            } if *queued_turn_id == turn_id
+        ));
+
+        let cancelled = runtime
+            .dispatch(CommandRequest::new(
+                "cmd_44444444444444444444444444444444".parse().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::CancelQueuedMessage {
+                    session_id,
+                    target_command_id: follow_up_command_id,
+                }),
+            ))
+            .await
+            .expect("public CancelQueuedMessage dispatches");
+        assert!(matches!(
+            cancelled.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::QueuedMessageCancelled,
+                output: None,
+            }
+        ));
+
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(8), events.recv())
+            .await
+            .expect("the queued Turn reaches a terminal event")
+            .expect("the subscription remains open");
+        assert!(matches!(
+            terminal,
+            EventFrame::State(event)
+                if event.msg().session_kind() == Some(SessionStateEventKind::TurnCompleted)
+        ));
+        assert_eq!(model.request_count(), 3);
         runtime.shutdown().await;
     }
 

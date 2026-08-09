@@ -270,6 +270,19 @@ pub enum TurnCommand {
         session_id: SessionId,
         intent: PromptIntentInput,
     },
+    Steer {
+        session_id: SessionId,
+        expected_turn_id: TurnId,
+        intent: PromptIntentInput,
+    },
+    FollowUp {
+        session_id: SessionId,
+        intent: PromptIntentInput,
+    },
+    CancelQueuedMessage {
+        session_id: SessionId,
+        target_command_id: CommandId,
+    },
     Cancel {
         session_id: SessionId,
         target: PublicCancelTarget,
@@ -283,6 +296,29 @@ impl fmt::Debug for TurnCommand {
                 .debug_struct("Submit")
                 .field("session_id", session_id)
                 .field("intent", &"<redacted>")
+                .finish(),
+            Self::Steer {
+                session_id,
+                expected_turn_id,
+                ..
+            } => formatter
+                .debug_struct("Steer")
+                .field("session_id", session_id)
+                .field("expected_turn_id", expected_turn_id)
+                .field("intent", &"<redacted>")
+                .finish(),
+            Self::FollowUp { session_id, .. } => formatter
+                .debug_struct("FollowUp")
+                .field("session_id", session_id)
+                .field("intent", &"<redacted>")
+                .finish(),
+            Self::CancelQueuedMessage {
+                session_id,
+                target_command_id,
+            } => formatter
+                .debug_struct("CancelQueuedMessage")
+                .field("session_id", session_id)
+                .field("target_command_id", target_command_id)
                 .finish(),
             Self::Cancel { session_id, target } => formatter
                 .debug_struct("Cancel")
@@ -390,6 +426,9 @@ impl fmt::Debug for CommandCompletion {
 #[non_exhaustive]
 pub enum CommandOutcome {
     TurnStarted { turn_id: TurnId },
+    SteerQueued { turn_id: TurnId },
+    FollowUpQueued,
+    QueuedMessageCancelled,
     CommandOutput,
 }
 

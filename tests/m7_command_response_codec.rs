@@ -73,6 +73,30 @@ fn later_slice_response_is_known_pending_not_unknown_output_variant() {
 }
 
 #[test]
+fn queued_command_outcomes_round_trip_with_their_typed_shapes() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let command_id: CommandId = "cmd_11111111111111111111111111111111".parse().unwrap();
+    let turn_id: TurnId = "trn_33333333333333333333333333333333".parse().unwrap();
+    for outcome in [
+        CommandOutcome::SteerQueued { turn_id },
+        CommandOutcome::FollowUpQueued,
+        CommandOutcome::QueuedMessageCancelled,
+    ] {
+        let response = CommandResponse::new(
+            command_id,
+            CommandCompletion::Completed {
+                outcome,
+                output: None,
+            },
+        )
+        .unwrap();
+        let bytes = protocol.encode_command_response(&response).unwrap();
+        let decoded = protocol.decode_command_response(&bytes).unwrap();
+        assert_eq!(decoded, response);
+    }
+}
+
+#[test]
 fn command_response_uses_selected_message_limits_and_rejects_mismatched_output() {
     let bytes = fixture("valid/rejected-command-response.json");
     let response = IncrementalRuntimeProtocolV1::v1_0()
