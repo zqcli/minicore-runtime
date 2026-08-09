@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -349,6 +350,7 @@ struct RuntimeInner {
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
+    in_flight_commands: Mutex<BTreeMap<crate::wire::CommandId, Arc<RuntimeCommandInFlight>>>,
     lifecycle: Mutex<RuntimeLifecycle>,
     lifecycle_changed: Notify,
 }
@@ -372,6 +374,7 @@ impl RuntimeInner {
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
+            in_flight_commands: Mutex::new(BTreeMap::new()),
             lifecycle: Mutex::new(RuntimeLifecycle::Open),
             lifecycle_changed: Notify::new(),
         }
@@ -394,6 +397,51 @@ impl RuntimeInner {
     }
 
     async fn dispatch(
+        self: &Arc<Self>,
+        request: CommandRequest,
+    ) -> Result<CommandResponse, RuntimeDispatchError> {
+        let command_id = request.command_id();
+        let command = request.command().clone();
+        let (entry, leader) = {
+            let mut in_flight = lock(&self.in_flight_commands);
+            match in_flight.get(&command_id) {
+                Some(existing) if existing.command() == &command => (Arc::clone(existing), false),
+                Some(_) => {
+                    return Ok(rejected_command(
+                        command_id,
+                        CommandErrorCode::CommandConflict,
+                        "the command conflicts with an in-flight command",
+                        RetryAdvice::DoNotRetry,
+                        None,
+                    ));
+                }
+                None => {
+                    let entry = Arc::new(RuntimeCommandInFlight::new(command));
+                    in_flight.insert(command_id, Arc::clone(&entry));
+                    (entry, true)
+                }
+            }
+        };
+
+        if leader {
+            let owner =
+                RuntimeCommandOwner::new(Arc::clone(self), command_id, Arc::clone(&entry), request);
+            if let Err(error) = self.task_context.spawn_tracked(owner.run()) {
+                let result = Err(match error {
+                    crate::runtime_task::RuntimeTaskError::OwnerClosing
+                    | crate::runtime_task::RuntimeTaskError::WorkerUnavailable
+                    | crate::runtime_task::RuntimeTaskError::OperationPanicked => {
+                        RuntimeDispatchError::InternalDispatchUnavailable
+                    }
+                });
+                entry.complete(result);
+                self.finish_in_flight(command_id, &entry);
+            }
+        }
+        entry.wait().await
+    }
+
+    async fn dispatch_once(
         &self,
         request: CommandRequest,
     ) -> Result<CommandResponse, RuntimeDispatchError> {
@@ -904,6 +952,20 @@ impl RuntimeInner {
         }
     }
 
+    fn finish_in_flight(
+        &self,
+        command_id: crate::wire::CommandId,
+        entry: &Arc<RuntimeCommandInFlight>,
+    ) {
+        let mut in_flight = lock(&self.in_flight_commands);
+        if in_flight
+            .get(&command_id)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            in_flight.remove(&command_id);
+        }
+    }
+
     fn begin_shutdown(self: &Arc<Self>) -> RuntimeShutdownAttempt {
         let mut lifecycle = lock(&self.lifecycle);
         match *lifecycle {
@@ -935,6 +997,110 @@ impl RuntimeInner {
         self.lifecycle_changed.notify_waiters();
         let retained = lock(&self.retained_until_shutdown).take();
         drop(retained);
+    }
+}
+
+struct RuntimeCommandInFlight {
+    command: RuntimeCommand,
+    result: Mutex<Option<Result<CommandResponse, RuntimeDispatchError>>>,
+    changed: Notify,
+}
+
+impl RuntimeCommandInFlight {
+    fn new(command: RuntimeCommand) -> Self {
+        Self {
+            command,
+            result: Mutex::new(None),
+            changed: Notify::new(),
+        }
+    }
+
+    fn command(&self) -> &RuntimeCommand {
+        &self.command
+    }
+
+    fn complete(&self, result: Result<CommandResponse, RuntimeDispatchError>) {
+        let mut stored = lock(&self.result);
+        if stored.is_none() {
+            *stored = Some(result);
+            drop(stored);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) -> Result<CommandResponse, RuntimeDispatchError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(result) = lock(&self.result).clone() {
+                return result;
+            }
+            changed.await;
+        }
+    }
+}
+
+struct RuntimeCommandOwner {
+    inner: Arc<RuntimeInner>,
+    command_id: crate::wire::CommandId,
+    entry: Arc<RuntimeCommandInFlight>,
+    request: CommandRequest,
+}
+
+impl RuntimeCommandOwner {
+    fn new(
+        inner: Arc<RuntimeInner>,
+        command_id: crate::wire::CommandId,
+        entry: Arc<RuntimeCommandInFlight>,
+        request: CommandRequest,
+    ) -> Self {
+        Self {
+            inner,
+            command_id,
+            entry,
+            request,
+        }
+    }
+
+    async fn run(self) {
+        let RuntimeCommandOwner {
+            inner,
+            command_id,
+            entry,
+            request,
+        } = self;
+        let mut guard = RuntimeCommandOwnerGuard {
+            inner,
+            command_id,
+            entry,
+            completed: false,
+        };
+        let result = guard.inner.dispatch_once(request).await;
+        guard.complete(result);
+    }
+}
+
+struct RuntimeCommandOwnerGuard {
+    inner: Arc<RuntimeInner>,
+    command_id: crate::wire::CommandId,
+    entry: Arc<RuntimeCommandInFlight>,
+    completed: bool,
+}
+
+impl RuntimeCommandOwnerGuard {
+    fn complete(&mut self, result: Result<CommandResponse, RuntimeDispatchError>) {
+        self.entry.complete(result);
+        self.inner.finish_in_flight(self.command_id, &self.entry);
+        self.completed = true;
+    }
+}
+
+impl Drop for RuntimeCommandOwnerGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.complete(Err(RuntimeDispatchError::InternalDispatchUnavailable));
+        }
     }
 }
 
@@ -2859,6 +3025,20 @@ mod tests {
             .expect("conflicting duplicate dispatches");
         assert!(matches!(
             conflict.completion(),
+            CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::CommandConflict
+        ));
+        let cross_command_conflict = runtime
+            .dispatch(CommandRequest::new(
+                command_id,
+                RuntimeCommand::Turn(TurnCommand::Cancel {
+                    session_id,
+                    target: PublicCancelTarget::Submit(command_id),
+                }),
+            ))
+            .await
+            .expect("a cross-command duplicate dispatches");
+        assert!(matches!(
+            cross_command_conflict.completion(),
             CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::CommandConflict
         ));
 
