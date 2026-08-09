@@ -56,7 +56,8 @@ use crate::turn_execution_context::{
     TurnContextCapture, TurnContextCaptureError, TurnExecutionContext,
 };
 use crate::turn_item_interaction::{
-    AssistantDisposition, InteractionRequest, ResolvedInteraction, UserMessageSource,
+    AssistantDisposition, InteractionCancelReason, InteractionRequest, ResolvedInteraction,
+    UserMessageSource,
 };
 use crate::wire::{
     CommandId, IdGenerationError, InteractionResolutionKey, ItemId, RequestId,
@@ -1710,7 +1711,7 @@ impl SessionExecutorActor {
                 self.cancel_request(request).await?;
             }
             SessionExecutorRequest::SecurityRevoked(request) => {
-                self.security_revoke_request(request)?;
+                self.security_revoke_request(request).await?;
             }
         }
         Ok(())
@@ -2077,7 +2078,18 @@ impl SessionExecutorActor {
             .as_ref()
             .is_some_and(|active_turn| active_turn.cancellation.is_cancelled())
         {
-            self.cancel_pending_interaction(completion.request_id, completion.timestamp)
+            let reason = self
+                .emergency
+                .observe(EmergencyControlTarget::Turn(completion.turn_id))
+                .and_then(|observation| observation.signal())
+                .map(|signal| match signal {
+                    EmergencyControlSignal::Cancel => InteractionCancelReason::TurnCancelled,
+                    EmergencyControlSignal::SecurityRevoked => {
+                        InteractionCancelReason::SecurityRevoked
+                    }
+                })
+                .unwrap_or(InteractionCancelReason::TurnCancelled);
+            self.cancel_pending_interaction(completion.request_id, completion.timestamp, reason)
                 .await?;
         }
         Ok(())
@@ -2197,15 +2209,19 @@ impl SessionExecutorActor {
                     .collect::<Vec<_>>();
                 request.settle(Ok(()));
                 for request_id in pending {
-                    self.cancel_pending_interaction(request_id, request.timestamp)
-                        .await?;
+                    self.cancel_pending_interaction(
+                        request_id,
+                        request.timestamp,
+                        InteractionCancelReason::TurnCancelled,
+                    )
+                    .await?;
                 }
             }
         }
         Ok(())
     }
 
-    fn security_revoke_request(
+    async fn security_revoke_request(
         &mut self,
         request: &mut SecurityRevokedRequest,
     ) -> Result<(), ActorFatality> {
@@ -2245,23 +2261,49 @@ impl SessionExecutorActor {
             }
         };
 
-        match self
+        let accepted = match self
             .emergency
             .signal(emergency_target, EmergencyControlSignal::SecurityRevoked)
         {
             EmergencyControlSignalOutcome::Accepted { .. } => {
                 cancellation.cancel();
                 request.settle(Ok(()));
+                true
             }
             EmergencyControlSignalOutcome::AlreadySignaled {
                 signal: EmergencyControlSignal::Cancel,
                 ..
-            } => request.settle(Err(SessionSecurityRevokedError::AlreadyCancelling)),
+            } => {
+                request.settle(Err(SessionSecurityRevokedError::AlreadyCancelling));
+                false
+            }
             EmergencyControlSignalOutcome::AlreadySignaled {
                 signal: EmergencyControlSignal::SecurityRevoked,
                 ..
-            } => request.settle(Err(SessionSecurityRevokedError::AlreadyRevoked)),
+            } => {
+                request.settle(Err(SessionSecurityRevokedError::AlreadyRevoked));
+                false
+            }
             EmergencyControlSignalOutcome::StaleTarget => return Err(ActorFatality::Integrity),
+        };
+        if accepted {
+            if let EmergencyControlTarget::Turn(turn_id) = emergency_target {
+                let pending = self
+                    .pending_interactions
+                    .iter()
+                    .filter_map(|(request_id, interaction)| {
+                        (interaction.turn_id == turn_id).then_some(*request_id)
+                    })
+                    .collect::<Vec<_>>();
+                for request_id in pending {
+                    self.cancel_pending_interaction(
+                        request_id,
+                        SystemClock.now(),
+                        InteractionCancelReason::SecurityRevoked,
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -2286,16 +2328,14 @@ impl SessionExecutorActor {
         &mut self,
         request_id: RequestId,
         timestamp: Timestamp,
+        reason: InteractionCancelReason,
     ) -> Result<(), ActorFatality> {
         let Some(active) = self.pending_interactions.get(&request_id) else {
             return Ok(());
         };
         let turn_id = active.turn_id;
-        let candidate = InteractionResolutionCandidate::owner_cancellation(
-            request_id,
-            crate::turn_item_interaction::InteractionCancelReason::TurnCancelled,
-        )
-        .map_err(|_| ActorFatality::Integrity)?;
+        let candidate = InteractionResolutionCandidate::owner_cancellation(request_id, reason)
+            .map_err(|_| ActorFatality::Integrity)?;
         let Some(conversation) = self.conversation.as_ref() else {
             return Err(ActorFatality::Integrity);
         };
@@ -2312,12 +2352,9 @@ impl SessionExecutorActor {
             .remove(&request_id)
             .ok_or(ActorFatality::Internal)?;
         self.publish_pending_interactions()?;
-        let _ = active.resolution_sender.send(
-            ResolvedInteraction::cancelled_by_owner(
-                crate::turn_item_interaction::InteractionCancelReason::TurnCancelled,
-            )
-            .ok_or(ActorFatality::Integrity)?,
-        );
+        let _ = active
+            .resolution_sender
+            .send(ResolvedInteraction::cancelled_by_owner(reason).ok_or(ActorFatality::Integrity)?);
         debug_assert_eq!(active.turn_id, turn_id);
         Ok(())
     }
@@ -5237,6 +5274,14 @@ mod tests {
         store: &TempStore,
         model: &ScriptedModelFixture,
     ) -> LoadedFixture {
+        scripted_text_fixture_with_tools(store, model, ToolSet::empty()).await
+    }
+
+    async fn scripted_text_fixture_with_tools(
+        store: &TempStore,
+        model: &ScriptedModelFixture,
+        tool_set: Arc<ToolSet>,
+    ) -> LoadedFixture {
         for (path, from, to) in [
             (
                 store
@@ -5288,7 +5333,7 @@ mod tests {
         .unwrap();
         let lifecycle_closing = CancellationToken::new();
         let executor = SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
-            SessionExecutorDependencies::with_turn_resources(
+            SessionExecutorDependencies::with_turn_resources_and_tools(
                 context.clone(),
                 state.clone(),
                 resolver,
@@ -5296,6 +5341,7 @@ mod tests {
                 prompt_resources,
                 Arc::clone(model.gateway()),
                 Arc::clone(model.catalog()),
+                tool_set,
             ),
             Arc::clone(&definition),
             workspace,
@@ -6898,6 +6944,114 @@ mod tests {
         assert!(!recording.contains("must not run"));
         executor.close().await.unwrap();
         state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_revoke_pending_tool_interaction_settles_security_revoked_without_retry() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_tool_round(
+            "call_security_revoke",
+            "echo",
+            "{\"value\":1}",
+            "must not run",
+        );
+        let request_id: RequestId = "req_55555555555555555555555555555555".parse().unwrap();
+        let interaction_request =
+            InteractionRequest::tool_approval(crate::tools::live_approval_request_fixture());
+        let allowed = ToolExecutionResult::completed_text("tool ran").unwrap();
+        let denied = ToolExecutionResult::PreExecution {
+            disposition: crate::tools::ToolResultDisposition::Denied,
+            content: crate::tools::ToolResultContent::from_text_parts(vec![
+                "approval denied".to_owned(),
+            ])
+            .unwrap(),
+        };
+        let tool_set = ToolSet::with_executor(
+            vec![
+                crate::tools::ToolDefinition::new(
+                    "echo".parse().unwrap(),
+                    "Echo a bounded JSON value",
+                    "{}".parse().unwrap(),
+                    crate::tools::ToolExecutionMode::Serial,
+                )
+                .unwrap(),
+            ],
+            {
+                let interaction_request = interaction_request.clone();
+                let allowed = allowed.clone();
+                let denied = denied.clone();
+                move |_| {
+                    let interaction_request = interaction_request.clone();
+                    let allowed = allowed.clone();
+                    let denied = denied.clone();
+                    Box::pin(async move {
+                        ToolExecutionResult::Interaction {
+                            request_id,
+                            request: interaction_request,
+                            allowed: Box::new(allowed),
+                            denied: Box::new(denied),
+                        }
+                    })
+                }
+            },
+        );
+        let loaded = scripted_text_fixture_with_tools(&store, &model, tool_set).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("run echo").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.pending_interactions().len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Interaction request is projected");
+        assert_eq!(pending.current_turn(), Some(turn_id));
+        assert_eq!(pending.pending_interactions()[0].request_id(), &request_id);
+
+        assert_eq!(
+            loaded
+                .executor
+                .security_revoke(SessionCancelTarget::Turn(turn_id))
+                .await,
+            Ok(())
+        );
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        assert!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .is_empty()
+        );
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains("interaction_requested"));
+        assert!(recording.contains("interaction_resolved"));
+        assert!(recording.contains("security_revoked"));
+        assert!(recording.contains("pre_execution"));
+        assert!(recording.contains("cancelled"));
+        assert!(!recording.contains("must not run"));
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
