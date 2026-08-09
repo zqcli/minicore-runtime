@@ -117,33 +117,56 @@ pub(crate) enum SessionTurnTerminal {
 }
 
 #[derive(Clone)]
-pub(crate) struct SessionExecutorEvent {
-    timestamp: Timestamp,
-    command_id: CommandId,
-    turn_id: TurnId,
-    terminal: SessionTurnTerminal,
-    snapshot: Arc<SessionExecutorSnapshot>,
+pub(crate) enum SessionExecutorEvent {
+    ExecutionChanged {
+        timestamp: Timestamp,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
+    TurnTerminal {
+        timestamp: Timestamp,
+        command_id: CommandId,
+        turn_id: TurnId,
+        terminal: SessionTurnTerminal,
+        snapshot: Arc<SessionExecutorSnapshot>,
+    },
 }
 
 impl SessionExecutorEvent {
     pub(crate) const fn timestamp(&self) -> Timestamp {
-        self.timestamp
+        match self {
+            Self::ExecutionChanged { timestamp, .. } | Self::TurnTerminal { timestamp, .. } => {
+                *timestamp
+            }
+        }
     }
 
-    pub(crate) const fn command_id(&self) -> CommandId {
-        self.command_id
+    pub(crate) const fn command_id(&self) -> Option<CommandId> {
+        match self {
+            Self::ExecutionChanged { .. } => None,
+            Self::TurnTerminal { command_id, .. } => Some(*command_id),
+        }
     }
 
-    pub(crate) const fn turn_id(&self) -> TurnId {
-        self.turn_id
+    pub(crate) const fn turn_id(&self) -> Option<TurnId> {
+        match self {
+            Self::ExecutionChanged { .. } => None,
+            Self::TurnTerminal { turn_id, .. } => Some(*turn_id),
+        }
     }
 
-    pub(crate) const fn terminal(&self) -> SessionTurnTerminal {
-        self.terminal
+    pub(crate) const fn terminal(&self) -> Option<SessionTurnTerminal> {
+        match self {
+            Self::ExecutionChanged { .. } => None,
+            Self::TurnTerminal { terminal, .. } => Some(*terminal),
+        }
     }
 
     pub(crate) const fn snapshot(&self) -> &Arc<SessionExecutorSnapshot> {
-        &self.snapshot
+        match self {
+            Self::ExecutionChanged { snapshot, .. } | Self::TurnTerminal { snapshot, .. } => {
+                snapshot
+            }
+        }
     }
 }
 
@@ -2826,13 +2849,15 @@ impl SessionExecutorActor {
             None,
             Some((active.turn_id, completion.terminal)),
         );
-        let _ = self.events.send(Arc::new(SessionExecutorEvent {
-            timestamp: SystemClock.now(),
-            command_id: active.command_id,
-            turn_id: active.turn_id,
-            terminal: completion.terminal,
-            snapshot: Arc::clone(&self.current),
-        }));
+        let _ = self
+            .events
+            .send(Arc::new(SessionExecutorEvent::TurnTerminal {
+                timestamp: SystemClock.now(),
+                command_id: active.command_id,
+                turn_id: active.turn_id,
+                terminal: completion.terminal,
+                snapshot: Arc::clone(&self.current),
+            }));
         if let Some(queued) = queued_follow_up {
             let (command_id, intent) = queued.into_parts();
             let mut request = SubmitRequest {
@@ -3260,6 +3285,7 @@ impl SessionExecutorActor {
     ) {
         let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
             self.queue_projection(current_turn);
+        let previous_execution_state = self.current.execution_state();
         let current = Arc::new(
             self.current
                 .with_execution(execution_state, current_turn, last_terminal)
@@ -3270,6 +3296,16 @@ impl SessionExecutorActor {
                 ),
         );
         self.publish_current(current);
+        if execution_state == SessionExecutionState::Finishing
+            && previous_execution_state != SessionExecutionState::Finishing
+        {
+            let _ = self
+                .events
+                .send(Arc::new(SessionExecutorEvent::ExecutionChanged {
+                    timestamp: SystemClock.now(),
+                    snapshot: Arc::clone(&self.current),
+                }));
+        }
     }
 
     fn queue_projection(
@@ -6622,9 +6658,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(event.command_id(), command_id);
-        assert_eq!(event.turn_id(), turn_id);
-        assert_eq!(event.terminal(), SessionTurnTerminal::Completed);
+        assert_eq!(event.command_id(), Some(command_id));
+        assert_eq!(event.turn_id(), Some(turn_id));
+        assert_eq!(event.terminal(), Some(SessionTurnTerminal::Completed));
         assert_eq!(event.snapshot().current_turn(), None);
         assert_eq!(
             event.snapshot().execution_state(),

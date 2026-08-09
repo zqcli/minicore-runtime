@@ -26,7 +26,7 @@ use crate::runtime_interface::{
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
-    SessionCancelTarget, SessionExecutionState, SessionExecutorSnapshot,
+    SessionCancelTarget, SessionExecutionState, SessionExecutorEvent, SessionExecutorSnapshot,
     SessionExecutorSubscription, SessionTurnFailure, SessionTurnInterruption, SessionTurnTerminal,
     SessionWorkspaceDefinitionOutcome,
 };
@@ -266,30 +266,41 @@ impl EventStream {
             .runtime
             .public_session_snapshot(Arc::clone(event.snapshot()))
             .ok()?;
-        let state = match event.terminal() {
-            SessionTurnTerminal::Completed => StateEvent::turn_completed(
-                event.timestamp(),
-                Some(event.command_id()),
-                snapshot,
-                event.turn_id(),
-                event.timestamp(),
-            ),
-            SessionTurnTerminal::Failed(failure) => StateEvent::turn_failed(
-                event.timestamp(),
-                Some(event.command_id()),
-                snapshot,
-                event.turn_id(),
-                event.timestamp(),
-                public_turn_failure(failure),
-            ),
-            SessionTurnTerminal::Interrupted(interruption) => StateEvent::turn_interrupted(
-                event.timestamp(),
-                Some(event.command_id()),
-                snapshot,
-                event.turn_id(),
-                event.timestamp(),
-                public_turn_interruption(interruption),
-            ),
+        let state = match event.as_ref() {
+            SessionExecutorEvent::ExecutionChanged { timestamp, .. } => {
+                StateEvent::session_execution_changed(*timestamp, None, snapshot)
+            }
+            SessionExecutorEvent::TurnTerminal {
+                timestamp,
+                command_id,
+                turn_id,
+                terminal,
+                ..
+            } => match terminal {
+                SessionTurnTerminal::Completed => StateEvent::turn_completed(
+                    *timestamp,
+                    Some(*command_id),
+                    snapshot,
+                    *turn_id,
+                    *timestamp,
+                ),
+                SessionTurnTerminal::Failed(failure) => StateEvent::turn_failed(
+                    *timestamp,
+                    Some(*command_id),
+                    snapshot,
+                    *turn_id,
+                    *timestamp,
+                    public_turn_failure(*failure),
+                ),
+                SessionTurnTerminal::Interrupted(interruption) => StateEvent::turn_interrupted(
+                    *timestamp,
+                    Some(*command_id),
+                    snapshot,
+                    *turn_id,
+                    *timestamp,
+                    public_turn_interruption(*interruption),
+                ),
+            },
         };
         Some(EventFrame::State(state))
     }
@@ -3142,6 +3153,20 @@ mod tests {
         ));
 
         hooks.release_before_agent_run_attempt();
+        let execution_changed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("the Finishing execution event is published")
+                .expect("the subscription remains open");
+        assert!(matches!(
+            execution_changed,
+            EventFrame::State(event)
+                if event.route() == EventRoute::Session { session_id }
+                    && event.msg().session_kind()
+                        == Some(SessionStateEventKind::SessionExecutionChanged)
+                    && event.msg().session_snapshot().is_some_and(|snapshot|
+                        snapshot.execution() == SessionExecutionView::Finishing)
+        ));
         let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
             .await
             .expect("the cancelled Turn reaches terminal state")
