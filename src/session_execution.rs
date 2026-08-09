@@ -2667,6 +2667,12 @@ impl SessionExecutorActor {
         };
         if accepted {
             if let EmergencyControlTarget::Turn(turn_id) = emergency_target {
+                self.execution_state = SessionExecutionState::Finishing;
+                self.publish_execution_state(
+                    SessionExecutionState::Finishing,
+                    Some(turn_id),
+                    self.current.last_terminal(),
+                );
                 let pending = self
                     .pending_interactions
                     .iter()
@@ -6976,6 +6982,10 @@ mod tests {
                 .security_revoke(SessionCancelTarget::Turn(turn_id))
                 .await,
             Ok(())
+        );
+        assert_eq!(
+            loaded.executor.snapshot().await.unwrap().execution_state(),
+            SessionExecutionState::Finishing
         );
         assert_eq!(
             loaded
