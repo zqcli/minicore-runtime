@@ -3496,6 +3496,12 @@ async fn call_agent_run_with_logical_retry(
             _ = cancellation.cancelled() => {
                 return Err(error);
             }
+            _ = emergency_control.cancelled(
+                emergency_observation.target(),
+                emergency_observation.epoch(),
+            ) => {
+                return Err(error);
+            }
             _ = tokio::time::sleep(delay) => {}
         }
     }
@@ -3509,10 +3515,12 @@ fn retry_basis_is_current(
     emergency_control: &EmergencyControlHandle,
     emergency_observation: EmergencyControlObservation,
 ) -> bool {
-    if !emergency_control.is_current(
-        emergency_observation.target(),
-        emergency_observation.epoch(),
-    ) {
+    let Some(current_emergency) = emergency_control.observe(emergency_observation.target()) else {
+        return false;
+    };
+    if current_emergency.epoch() != emergency_observation.epoch()
+        || current_emergency.signal().is_some()
+    {
         return false;
     }
     if !conversation.has_control_generation(turn_id, control_generation) {
@@ -6925,6 +6933,49 @@ mod tests {
             .expect("the active Turn owns the emergency target");
         assert!(emergency.retire(observation));
         tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn emergency_signal_wakes_retry_backoff_without_waiting_for_timer() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::with_failure_reasons_then_responses(
+            vec![ModelCallErrorReason::Timeout],
+            vec!["must not run"],
+        );
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("wake emergency").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        wait_for_request_count(&model, 1).await;
+        let emergency = loaded.executor.emergency_control_for_test();
+        assert_eq!(
+            emergency.signal(
+                EmergencyControlTarget::Turn(turn_id),
+                EmergencyControlSignal::SecurityRevoked,
+            ),
+            EmergencyControlSignalOutcome::Accepted {
+                epoch: emergency
+                    .observe(EmergencyControlTarget::Turn(turn_id))
+                    .expect("the active Turn owns the emergency target")
+                    .epoch(),
+            }
+        );
         assert_eq!(
             wait_for_terminal(&loaded.executor, turn_id).await,
             SessionTurnTerminal::Failed(SessionTurnFailure::Model)
