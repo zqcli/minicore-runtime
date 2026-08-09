@@ -5,7 +5,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_session_lifecycle::{
-    AgentRevisionRef, ForkAnchor, ForkSourceKind, SessionModelConfig,
+    AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SessionModelConfig,
 };
 use crate::model_gateway::{ModelId, ModelSelection, ProviderId, ReasoningPreference};
 use crate::prompt::{
@@ -13,17 +13,19 @@ use crate::prompt::{
     SkillIntent, TextIntent, normalize_text_intent, validate_skill_intent_count,
 };
 use crate::runtime_interface::{
-    CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandRequest, CommandResponse, CurrentTurnView, EventFrame, EventRoute, InteractionView,
-    ItemContentView, ItemStatusView, ItemView, NewSessionDefinition, NewSessionMetadata,
-    PublicCancelTarget, PublicIngressLane, PublicSubject, QueryResponse, QueryResult,
+    AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
+    CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
+    CurrentTurnView, EventFrame, EventRoute, InteractionView, ItemContentView, ItemStatusView,
+    ItemView, NewSessionDefinition, NewSessionMetadata, Page, PageRequest, PublicCancelTarget,
+    PublicIngressLane, PublicSubject, QueryError, QueryErrorCode, QueryResponse, QueryResult,
     QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
     RuntimeDiagnosticView, RuntimeDispatchError, RuntimeLifecycleCommand, RuntimeQuery,
     RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind,
     RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary,
-    SessionDiagnosticView, SessionEventDetail, SessionExecutionView, SessionMetadataView,
-    SessionQueueView, SessionReadinessView, SessionRecordingState, SessionRecordingView,
-    SessionSnapshot, SessionStateEventKind, SessionUsageView, SnapshotRequest, SnapshotResponse,
+    SessionDiagnosticView, SessionEventDetail, SessionExecutionView, SessionForkProvenanceView,
+    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
+    SessionReadinessView, SessionRecordingState, SessionRecordingView, SessionSnapshot,
+    SessionStateEventKind, SessionSummary, SessionUsageView, SnapshotRequest, SnapshotResponse,
     StateEvent, StateEventMsg, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionRequest,
     SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView,
     TurnStatusView, TurnTerminalView, validate_command_error_contract,
@@ -45,8 +47,8 @@ use crate::workspace::{
 use super::bounded_json::JsonNode;
 use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
 use super::scalar::{
-    AgentId, AgentRevision, CommandId, ItemId, RequestId, SessionDefinitionRevision, SessionId,
-    SessionMetadataRevision, TurnId,
+    AgentId, AgentMetadataRevision, AgentRevision, CommandId, ItemId, PageCursor, RequestId,
+    SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId,
 };
 use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
@@ -153,6 +155,14 @@ impl IncrementalRuntimeProtocolV1 {
         encode_runtime_dispatch_error(&self.codec, error)
     }
 
+    pub fn decode_query_error(&self, input: &[u8]) -> Result<QueryError, TypedJsonError> {
+        decode_query_error(&self.codec, input)
+    }
+
+    pub fn encode_query_error(&self, error: &QueryError) -> Result<Vec<u8>, TypedJsonError> {
+        encode_query_error(&self.codec, error)
+    }
+
     pub const fn codec(&self) -> &WireV1Codec {
         &self.codec
     }
@@ -168,6 +178,26 @@ fn decode_runtime_dispatch_error(
         Ok(())
     })?;
     parse_runtime_dispatch_error(&node).ok_or_else(unknown_output_variant)
+}
+
+fn decode_query_error(codec: &WireV1Codec, input: &[u8]) -> Result<QueryError, TypedJsonError> {
+    let decoded: QueryErrorInput =
+        codec.decode_with_shape(PublicJsonKind::Response, input, |node| {
+            validate_query_error_shape(node, codec.limits())
+        })?;
+    decoded.into_semantic(codec.limits())
+}
+
+fn encode_query_error(codec: &WireV1Codec, error: &QueryError) -> Result<Vec<u8>, TypedJsonError> {
+    validate_command_error_message(
+        error.message(),
+        codec.limits().text.max_diagnostic_message_bytes as usize,
+    )
+    .map_err(|_| invalid_scalar())?;
+    codec.encode(
+        PublicJsonKind::Response,
+        &QueryErrorOutput::from_semantic(error),
+    )
 }
 
 fn encode_runtime_dispatch_error(
@@ -232,7 +262,9 @@ fn encode_command_response(
 
 fn decode_runtime_query(codec: &WireV1Codec, input: &[u8]) -> Result<RuntimeQuery, TypedJsonError> {
     let decoded: RuntimeQueryInput =
-        codec.decode_with_shape(PublicJsonKind::Request, input, validate_runtime_query_shape)?;
+        codec.decode_with_shape(PublicJsonKind::Request, input, |node| {
+            validate_runtime_query_shape(node, codec.limits())
+        })?;
     Ok(decoded.into_semantic())
 }
 
@@ -240,6 +272,7 @@ fn encode_runtime_query(
     codec: &WireV1Codec,
     query: &RuntimeQuery,
 ) -> Result<Vec<u8>, TypedJsonError> {
+    validate_runtime_query_semantic_limits(query, codec.limits())?;
     codec.encode(
         PublicJsonKind::Request,
         &RuntimeQueryOutput::from_semantic(query),
@@ -300,18 +333,20 @@ fn decode_query_response(
     codec: &WireV1Codec,
     input: &[u8],
 ) -> Result<QueryResponse, TypedJsonError> {
-    let decoded: QueryResponseInput = codec.decode_with_shape(
-        PublicJsonKind::Response,
-        input,
-        validate_query_response_shape,
-    )?;
-    Ok(QueryResponse::new(decoded.data.into_semantic()?))
+    let decoded: QueryResponseInput =
+        codec.decode_with_shape(PublicJsonKind::Response, input, |node| {
+            validate_query_response_shape(node, codec.limits())
+        })?;
+    Ok(QueryResponse::new(
+        decoded.data.into_semantic(codec.limits())?,
+    ))
 }
 
 fn encode_query_response(
     codec: &WireV1Codec,
     response: &QueryResponse,
 ) -> Result<Vec<u8>, TypedJsonError> {
+    validate_query_response_semantic_limits(response, codec.limits())?;
     codec.encode(
         PublicJsonKind::Response,
         &QueryResponseOutput {
@@ -1413,6 +1448,16 @@ enum SessionLifecycleInput {
     Open,
     Archived,
     Deleted,
+}
+
+impl SessionLifecycleInput {
+    const fn into_semantic(self) -> SessionLifecycleView {
+        match self {
+            Self::Open => SessionLifecycleView::Open,
+            Self::Archived => SessionLifecycleView::Archived,
+            Self::Deleted => SessionLifecycleView::Deleted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -2729,6 +2774,18 @@ struct UserQuestionChoiceOutput<'a> {
 #[serde(rename_all = "snake_case")]
 enum SessionLifecycleOutput {
     Open,
+    Archived,
+    Deleted,
+}
+
+impl SessionLifecycleOutput {
+    const fn from_semantic(value: SessionLifecycleView) -> Self {
+        match value {
+            SessionLifecycleView::Open => Self::Open,
+            SessionLifecycleView::Archived => Self::Archived,
+            SessionLifecycleView::Deleted => Self::Deleted,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -4000,6 +4057,63 @@ struct CommandErrorInput {
     subject: Option<PublicSubjectInput>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryErrorInput {
+    code: QueryErrorCodeInput,
+    message: String,
+    retry: RetryAdviceInput,
+    subject: Option<PublicSubjectInput>,
+}
+
+impl QueryErrorInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<QueryError, TypedJsonError> {
+        validate_command_error_message(
+            &self.message,
+            limits.text.max_diagnostic_message_bytes as usize,
+        )
+        .map_err(|_| invalid_scalar())?;
+        Ok(QueryError::new_boxed(
+            self.code.into_semantic(),
+            self.message.into_boxed_str(),
+            self.retry.into_semantic()?,
+            self.subject
+                .map(PublicSubjectInput::into_semantic)
+                .transpose()?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryErrorCodeInput {
+    InvalidArgument,
+    NotFound,
+    SessionNotLoaded,
+    StaleCursor,
+    ResultTooLarge,
+    Unavailable,
+    DurableStateCorrupt,
+    DurableStateTooLarge,
+    RuntimeClosing,
+}
+
+impl QueryErrorCodeInput {
+    const fn into_semantic(self) -> QueryErrorCode {
+        match self {
+            Self::InvalidArgument => QueryErrorCode::InvalidArgument,
+            Self::NotFound => QueryErrorCode::NotFound,
+            Self::SessionNotLoaded => QueryErrorCode::SessionNotLoaded,
+            Self::StaleCursor => QueryErrorCode::StaleCursor,
+            Self::ResultTooLarge => QueryErrorCode::ResultTooLarge,
+            Self::Unavailable => QueryErrorCode::Unavailable,
+            Self::DurableStateCorrupt => QueryErrorCode::DurableStateCorrupt,
+            Self::DurableStateTooLarge => QueryErrorCode::DurableStateTooLarge,
+            Self::RuntimeClosing => QueryErrorCode::RuntimeClosing,
+        }
+    }
+}
+
 impl CommandErrorInput {
     fn into_semantic(self, limits: ProtocolLimits) -> Result<CommandError, TypedJsonError> {
         CommandError::new_with_maximum_message(
@@ -4338,6 +4452,56 @@ impl<'a> CommandErrorOutput<'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueryErrorOutput<'a> {
+    code: QueryErrorCodeOutput,
+    message: &'a str,
+    retry: RetryAdviceOutput,
+    subject: Option<PublicSubjectOutput<'a>>,
+}
+
+impl<'a> QueryErrorOutput<'a> {
+    fn from_semantic(value: &'a QueryError) -> Self {
+        Self {
+            code: QueryErrorCodeOutput::from_semantic(value.code()),
+            message: value.message(),
+            retry: RetryAdviceOutput::from_semantic(value.retry()),
+            subject: value.subject().map(PublicSubjectOutput::from_semantic),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QueryErrorCodeOutput {
+    InvalidArgument,
+    NotFound,
+    SessionNotLoaded,
+    StaleCursor,
+    ResultTooLarge,
+    Unavailable,
+    DurableStateCorrupt,
+    DurableStateTooLarge,
+    RuntimeClosing,
+}
+
+impl QueryErrorCodeOutput {
+    const fn from_semantic(value: QueryErrorCode) -> Self {
+        match value {
+            QueryErrorCode::InvalidArgument => Self::InvalidArgument,
+            QueryErrorCode::NotFound => Self::NotFound,
+            QueryErrorCode::SessionNotLoaded => Self::SessionNotLoaded,
+            QueryErrorCode::StaleCursor => Self::StaleCursor,
+            QueryErrorCode::ResultTooLarge => Self::ResultTooLarge,
+            QueryErrorCode::Unavailable => Self::Unavailable,
+            QueryErrorCode::DurableStateCorrupt => Self::DurableStateCorrupt,
+            QueryErrorCode::DurableStateTooLarge => Self::DurableStateTooLarge,
+            QueryErrorCode::RuntimeClosing => Self::RuntimeClosing,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct CommandErrorCodeOutput {
     #[serde(rename = "type")]
     kind: &'static str,
@@ -4521,6 +4685,8 @@ struct InteractionSubjectOutput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeQueryInput {
     Runtime(RuntimeReadQueryInput),
+    Agent(AgentQueryInput),
+    Session(SessionQueryInput),
 }
 
 impl RuntimeQueryInput {
@@ -4528,6 +4694,23 @@ impl RuntimeQueryInput {
         match self {
             Self::Runtime(RuntimeReadQueryInput::GetCapabilities) => {
                 RuntimeQuery::Runtime(RuntimeReadQuery::GetCapabilities)
+            }
+            Self::Agent(AgentQueryInput::ListAgents(value)) => {
+                RuntimeQuery::Agent(AgentQuery::ListAgents {
+                    page: value.page.into_semantic(),
+                    include_deleted: value.include_deleted,
+                })
+            }
+            Self::Session(SessionQueryInput::ListSessions(value)) => {
+                RuntimeQuery::Session(SessionQuery::ListSessions {
+                    page: value.page.into_semantic(),
+                    include_archived: value.include_archived,
+                })
+            }
+            Self::Session(SessionQueryInput::GetSessionForkProvenance(value)) => {
+                RuntimeQuery::Session(SessionQuery::GetSessionForkProvenance {
+                    session_id: value.session_id,
+                })
             }
         }
     }
@@ -4539,10 +4722,52 @@ enum RuntimeReadQueryInput {
     GetCapabilities,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentQueryInput {
+    ListAgents(ListAgentsQueryInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListAgentsQueryInput {
+    page: PageRequestInput,
+    include_deleted: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionQueryInput {
+    ListSessions(ListSessionsQueryInput),
+    GetSessionForkProvenance(SessionIdInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListSessionsQueryInput {
+    page: PageRequestInput,
+    include_archived: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PageRequestInput {
+    cursor: Option<PageCursor>,
+    limit: NonZeroU32,
+}
+
+impl PageRequestInput {
+    const fn into_semantic(self) -> PageRequest {
+        PageRequest::new(self.cursor, self.limit)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeQueryOutput {
     Runtime(RuntimeReadQueryOutput),
+    Agent(AgentQueryOutput),
+    Session(SessionQueryOutput),
 }
 
 impl RuntimeQueryOutput {
@@ -4550,6 +4775,27 @@ impl RuntimeQueryOutput {
         match value {
             RuntimeQuery::Runtime(RuntimeReadQuery::GetCapabilities) => {
                 Self::Runtime(RuntimeReadQueryOutput::GetCapabilities)
+            }
+            RuntimeQuery::Agent(AgentQuery::ListAgents {
+                page,
+                include_deleted,
+            }) => Self::Agent(AgentQueryOutput::ListAgents(ListAgentsQueryOutput {
+                page: PageRequestOutput::from_semantic(*page),
+                include_deleted: *include_deleted,
+            })),
+            RuntimeQuery::Session(SessionQuery::ListSessions {
+                page,
+                include_archived,
+            }) => Self::Session(SessionQueryOutput::ListSessions(ListSessionsQueryOutput {
+                page: PageRequestOutput::from_semantic(*page),
+                include_archived: *include_archived,
+            })),
+            RuntimeQuery::Session(SessionQuery::GetSessionForkProvenance { session_id }) => {
+                Self::Session(SessionQueryOutput::GetSessionForkProvenance(
+                    SessionIdOutput {
+                        session_id: *session_id,
+                    },
+                ))
             }
         }
     }
@@ -4559,6 +4805,49 @@ impl RuntimeQueryOutput {
 #[serde(rename_all = "snake_case")]
 enum RuntimeReadQueryOutput {
     GetCapabilities,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentQueryOutput {
+    ListAgents(ListAgentsQueryOutput),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAgentsQueryOutput {
+    page: PageRequestOutput,
+    include_deleted: bool,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionQueryOutput {
+    ListSessions(ListSessionsQueryOutput),
+    GetSessionForkProvenance(SessionIdOutput),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSessionsQueryOutput {
+    page: PageRequestOutput,
+    include_archived: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageRequestOutput {
+    cursor: Option<PageCursor>,
+    limit: NonZeroU32,
+}
+
+impl PageRequestOutput {
+    const fn from_semantic(value: PageRequest) -> Self {
+        Self {
+            cursor: value.cursor(),
+            limit: value.limit(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -4668,10 +4957,12 @@ struct QueryResponseInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum QueryResultInput {
     Runtime(RuntimeQueryResultInput),
+    Agent(AgentQueryResultInput),
+    Session(SessionQueryResultInput),
 }
 
 impl QueryResultInput {
-    fn into_semantic(self) -> Result<QueryResult, TypedJsonError> {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<QueryResult, TypedJsonError> {
         match self {
             Self::Runtime(RuntimeQueryResultInput::Capabilities(values)) => {
                 let values = values
@@ -4691,6 +4982,33 @@ impl QueryResultInput {
                     capabilities,
                 )))
             }
+            Self::Agent(AgentQueryResultInput::Agents(page)) => {
+                let items = page
+                    .items
+                    .into_iter()
+                    .map(|item| item.into_semantic(limits))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(QueryResult::Agent(AgentQueryResult::Agents(Page::new(
+                    items,
+                    page.next_cursor,
+                ))))
+            }
+            Self::Session(SessionQueryResultInput::Sessions(page)) => {
+                let items = page
+                    .items
+                    .into_iter()
+                    .map(|item| item.into_semantic(limits))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(QueryResult::Session(SessionQueryResult::Sessions(
+                    Page::new(items, page.next_cursor),
+                )))
+            }
+            Self::Session(SessionQueryResultInput::ForkProvenance(provenance)) => {
+                let provenance = provenance.map(SessionForkProvenanceInput::into_semantic);
+                Ok(QueryResult::Session(SessionQueryResult::ForkProvenance(
+                    provenance,
+                )))
+            }
         }
     }
 }
@@ -4706,6 +5024,137 @@ struct CapabilityValuesInput {
     values: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentQueryResultInput {
+    Agents(AgentPageInput),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionQueryResultInput {
+    Sessions(SessionPageInput),
+    ForkProvenance(Option<SessionForkProvenanceInput>),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionForkProvenanceInput {
+    source_session_id: SessionId,
+    source: ForkSourceKindInput,
+    anchor: ForkAnchorInput,
+}
+
+impl SessionForkProvenanceInput {
+    fn into_semantic(self) -> SessionForkProvenanceView {
+        SessionForkProvenanceView::new(
+            self.source_session_id,
+            self.source.into_semantic(),
+            self.anchor.into_semantic(),
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionPageInput {
+    items: Vec<SessionSummaryInput>,
+    next_cursor: Option<PageCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPageInput {
+    items: Vec<AgentSummaryInput>,
+    next_cursor: Option<PageCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSummaryInput {
+    agent_id: AgentId,
+    definition_revision: AgentRevision,
+    metadata: AgentMetadataInput,
+    status: AgentStatusInput,
+    created_at: Timestamp,
+}
+
+impl AgentSummaryInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<AgentSummary, TypedJsonError> {
+        Ok(AgentSummary::new(
+            self.agent_id,
+            self.definition_revision,
+            self.metadata.into_semantic(limits)?,
+            self.status.into_semantic(),
+            self.created_at,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMetadataInput {
+    revision: AgentMetadataRevision,
+    name: String,
+    description: Option<String>,
+    updated_at: Timestamp,
+}
+
+impl AgentMetadataInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<AgentMetadataView, TypedJsonError> {
+        AgentMetadataView::new_with_limits(
+            self.revision,
+            self.name,
+            self.description,
+            self.updated_at,
+            limits,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentStatusInput {
+    Enabled,
+    Disabled,
+    Deleted,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummaryInput {
+    session_id: SessionId,
+    definition_revision: SessionDefinitionRevision,
+    metadata: SessionMetadataInput,
+    lifecycle: SessionLifecycleInput,
+    forked: bool,
+    created_at: Timestamp,
+}
+
+impl SessionSummaryInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionSummary, TypedJsonError> {
+        Ok(SessionSummary::new(
+            self.session_id,
+            self.definition_revision,
+            self.metadata.into_semantic(limits)?,
+            self.lifecycle.into_semantic(),
+            self.forked,
+            self.created_at,
+        ))
+    }
+}
+
+impl AgentStatusInput {
+    const fn into_semantic(self) -> AgentStatus {
+        match self {
+            Self::Enabled => AgentStatus::Enabled,
+            Self::Disabled => AgentStatus::Disabled,
+            Self::Deleted => AgentStatus::Deleted,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct QueryResponseOutput<'a> {
     data: QueryResultOutput<'a>,
@@ -4715,6 +5164,8 @@ struct QueryResponseOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum QueryResultOutput<'a> {
     Runtime(RuntimeQueryResultOutput<'a>),
+    Agent(AgentQueryResultOutput<'a>),
+    Session(SessionQueryResultOutput<'a>),
 }
 
 impl<'a> QueryResultOutput<'a> {
@@ -4722,6 +5173,19 @@ impl<'a> QueryResultOutput<'a> {
         match value {
             QueryResult::Runtime(RuntimeQueryResult::Capabilities(capabilities)) => {
                 Self::Runtime(RuntimeQueryResultOutput::Capabilities(capabilities))
+            }
+            QueryResult::Agent(AgentQueryResult::Agents(page)) => Self::Agent(
+                AgentQueryResultOutput::Agents(AgentPageOutput::from_semantic(page)),
+            ),
+            QueryResult::Session(SessionQueryResult::Sessions(page)) => Self::Session(
+                SessionQueryResultOutput::Sessions(SessionPageOutput::from_semantic(page)),
+            ),
+            QueryResult::Session(SessionQueryResult::ForkProvenance(provenance)) => {
+                Self::Session(SessionQueryResultOutput::ForkProvenance(
+                    provenance
+                        .as_ref()
+                        .map(SessionForkProvenanceOutput::from_semantic),
+                ))
             }
         }
     }
@@ -4731,6 +5195,238 @@ impl<'a> QueryResultOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeQueryResultOutput<'a> {
     Capabilities(&'a RuntimeCapabilities),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentQueryResultOutput<'a> {
+    Agents(AgentPageOutput<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum SessionQueryResultOutput<'a> {
+    Sessions(SessionPageOutput<'a>),
+    ForkProvenance(Option<SessionForkProvenanceOutput>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionForkProvenanceOutput {
+    source_session_id: SessionId,
+    source: ForkSourceKindOutput,
+    anchor: ForkAnchorOutput,
+}
+
+impl SessionForkProvenanceOutput {
+    fn from_semantic(value: &SessionForkProvenanceView) -> Self {
+        Self {
+            source_session_id: value.source_session_id(),
+            source: ForkSourceKindOutput::from_semantic(value.source()),
+            anchor: ForkAnchorOutput::from_semantic(value.anchor()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPageOutput<'a> {
+    items: Vec<AgentSummaryOutput<'a>>,
+    next_cursor: Option<PageCursor>,
+}
+
+impl<'a> AgentPageOutput<'a> {
+    fn from_semantic(value: &'a Page<AgentSummary>) -> Self {
+        Self {
+            items: value
+                .items()
+                .iter()
+                .map(AgentSummaryOutput::from_semantic)
+                .collect(),
+            next_cursor: value.next_cursor(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSummaryOutput<'a> {
+    agent_id: AgentId,
+    definition_revision: AgentRevision,
+    metadata: AgentMetadataOutput<'a>,
+    status: AgentStatusOutput,
+    created_at: Timestamp,
+}
+
+impl<'a> AgentSummaryOutput<'a> {
+    fn from_semantic(value: &'a AgentSummary) -> Self {
+        Self {
+            agent_id: value.agent_id(),
+            definition_revision: value.definition_revision(),
+            metadata: AgentMetadataOutput::from_semantic(value.metadata()),
+            status: AgentStatusOutput::from_semantic(value.status()),
+            created_at: value.created_at(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMetadataOutput<'a> {
+    revision: AgentMetadataRevision,
+    name: &'a str,
+    description: Option<&'a str>,
+    updated_at: Timestamp,
+}
+
+impl<'a> AgentMetadataOutput<'a> {
+    fn from_semantic(value: &'a AgentMetadataView) -> Self {
+        Self {
+            revision: value.revision(),
+            name: value.name(),
+            description: value.description(),
+            updated_at: value.updated_at(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentStatusOutput {
+    Enabled,
+    Disabled,
+    Deleted,
+}
+
+impl AgentStatusOutput {
+    const fn from_semantic(value: AgentStatus) -> Self {
+        match value {
+            AgentStatus::Enabled => Self::Enabled,
+            AgentStatus::Disabled => Self::Disabled,
+            AgentStatus::Deleted => Self::Deleted,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionPageOutput<'a> {
+    items: Vec<SessionSummaryOutput<'a>>,
+    next_cursor: Option<PageCursor>,
+}
+
+impl<'a> SessionPageOutput<'a> {
+    fn from_semantic(value: &'a Page<SessionSummary>) -> Self {
+        Self {
+            items: value
+                .items()
+                .iter()
+                .map(SessionSummaryOutput::from_semantic)
+                .collect(),
+            next_cursor: value.next_cursor(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSummaryOutput<'a> {
+    session_id: SessionId,
+    definition_revision: SessionDefinitionRevision,
+    metadata: SessionMetadataOutput<'a>,
+    lifecycle: SessionLifecycleOutput,
+    forked: bool,
+    created_at: Timestamp,
+}
+
+impl<'a> SessionSummaryOutput<'a> {
+    fn from_semantic(value: &'a SessionSummary) -> Self {
+        Self {
+            session_id: value.session_id(),
+            definition_revision: value.definition_revision(),
+            metadata: SessionMetadataOutput::from_semantic(value.metadata()),
+            lifecycle: SessionLifecycleOutput::from_semantic(value.lifecycle()),
+            forked: value.forked(),
+            created_at: value.created_at(),
+        }
+    }
+}
+
+fn validate_query_response_semantic_limits(
+    response: &QueryResponse,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    match response.data() {
+        QueryResult::Runtime(RuntimeQueryResult::Capabilities(_))
+        | QueryResult::Session(SessionQueryResult::ForkProvenance(_)) => Ok(()),
+        QueryResult::Agent(AgentQueryResult::Agents(page)) => {
+            if page.items().len() > usize::from(limits.paging.max_page_size) {
+                return Err(invalid_scalar());
+            }
+            validate_semantic_page_cursor(page.next_cursor(), limits)?;
+            for agent in page.items() {
+                let metadata = agent.metadata();
+                AgentMetadataView::new_with_limits(
+                    metadata.revision(),
+                    metadata.name(),
+                    metadata.description(),
+                    metadata.updated_at(),
+                    limits,
+                )
+                .map_err(|_| invalid_scalar())?;
+            }
+            Ok(())
+        }
+        QueryResult::Session(SessionQueryResult::Sessions(page)) => {
+            if page.items().len() > usize::from(limits.paging.max_page_size) {
+                return Err(invalid_scalar());
+            }
+            validate_semantic_page_cursor(page.next_cursor(), limits)?;
+            for session in page.items() {
+                let metadata = session.metadata();
+                SessionMetadataView::new_with_limits(
+                    metadata.revision(),
+                    metadata.name(),
+                    metadata.description(),
+                    metadata.updated_at(),
+                    limits,
+                )
+                .map_err(|_| invalid_scalar())?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_semantic_page_cursor(
+    cursor: Option<PageCursor>,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    if cursor.is_some_and(|cursor| {
+        cursor.to_string().len() > usize::from(limits.paging.max_page_cursor_bytes)
+    }) {
+        Err(invalid_scalar())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_runtime_query_semantic_limits(
+    query: &RuntimeQuery,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let page = match query {
+        RuntimeQuery::Agent(AgentQuery::ListAgents { page, .. })
+        | RuntimeQuery::Session(SessionQuery::ListSessions { page, .. }) => Some(*page),
+        RuntimeQuery::Runtime(RuntimeReadQuery::GetCapabilities)
+        | RuntimeQuery::Session(SessionQuery::GetSessionForkProvenance { .. }) => None,
+    };
+    if page.and_then(PageRequest::cursor).is_some_and(|cursor| {
+        cursor.to_string().len() > usize::from(limits.paging.max_page_cursor_bytes)
+    }) {
+        return Err(invalid_scalar());
+    }
+    Ok(())
 }
 
 fn validate_command_semantic_limits(
@@ -4963,6 +5659,40 @@ fn validate_command_error(node: &JsonNode, limits: ProtocolLimits) -> Result<(),
         .map_err(|_| invalid_scalar())?;
     let retry = validate_retry_advice(required(object, "retry")?)?;
     validate_command_error_contract(code, retry).map_err(|_| invalid_scalar())?;
+    if let Some(subject) = object.get("subject") {
+        if !matches!(subject, JsonNode::Null) {
+            validate_public_subject(subject)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_query_error_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    match required(object, "code")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "invalid_argument"
+        | "not_found"
+        | "session_not_loaded"
+        | "stale_cursor"
+        | "result_too_large"
+        | "unavailable"
+        | "durable_state_corrupt"
+        | "durable_state_too_large"
+        | "runtime_closing" => {}
+        _ => return Err(unknown_output_variant()),
+    }
+    let message = required(object, "message")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    validate_command_error_message(message, limits.text.max_diagnostic_message_bytes as usize)
+        .map_err(|_| invalid_scalar())?;
+    validate_retry_advice(required(object, "retry")?)?;
     if let Some(subject) = object.get("subject") {
         if !matches!(subject, JsonNode::Null) {
             validate_public_subject(subject)?;
@@ -6649,7 +7379,10 @@ fn pending_object(data: Option<&JsonNode>) -> Result<(), TypedJsonError> {
     Err(TypedJsonError::PendingPublicTarget)
 }
 
-fn validate_runtime_query_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
+fn validate_runtime_query_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
     validate_adjacent_input(node, |kind, data| match kind {
         "runtime" => {
             let value = data
@@ -6664,10 +7397,68 @@ fn validate_runtime_query_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
                 _ => Err(unknown_input_variant()),
             }
         }
-        "agent" | "session" | "command_surface" | "model" | "prompt" | "skill" | "tool"
-        | "usage" | "diagnostics" => Err(TypedJsonError::PendingPublicTarget),
+        "agent" => {
+            validate_adjacent_input(data.ok_or_else(missing_required_field)?, |kind, data| {
+                match kind {
+                    "list_agents" => {
+                        let object = input_object(data.ok_or_else(missing_required_field)?)?;
+                        reject_unknown_fields(
+                            object.keys().map(AsRef::as_ref),
+                            &["page", "includeDeleted"],
+                        )?;
+                        validate_page_request(required(object, "page")?, limits)?;
+                        if !matches!(required(object, "includeDeleted")?, JsonNode::Bool(_)) {
+                            return Err(typed_wrong_json_type());
+                        }
+                        Ok(())
+                    }
+                    _ => Err(unknown_input_variant()),
+                }
+            })
+        }
+        "session" => {
+            validate_adjacent_input(data.ok_or_else(missing_required_field)?, |kind, data| {
+                match kind {
+                    "list_sessions" => {
+                        let object = input_object(data.ok_or_else(missing_required_field)?)?;
+                        reject_unknown_fields(
+                            object.keys().map(AsRef::as_ref),
+                            &["page", "includeArchived"],
+                        )?;
+                        validate_page_request(required(object, "page")?, limits)?;
+                        if !matches!(required(object, "includeArchived")?, JsonNode::Bool(_)) {
+                            return Err(typed_wrong_json_type());
+                        }
+                        Ok(())
+                    }
+                    "get_session_fork_provenance" => {
+                        validate_session_id_object(data.ok_or_else(missing_required_field)?)
+                    }
+                    _ => Err(unknown_input_variant()),
+                }
+            })
+        }
+        "command_surface" | "model" | "prompt" | "skill" | "tool" | "usage" | "diagnostics" => {
+            Err(TypedJsonError::PendingPublicTarget)
+        }
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_page_request(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["cursor", "limit"])?;
+    match required(object, "cursor")? {
+        JsonNode::Null => {}
+        cursor => {
+            let cursor = cursor.as_str().ok_or_else(typed_wrong_json_type)?;
+            if cursor.len() > usize::from(limits.paging.max_page_cursor_bytes) {
+                return Err(invalid_scalar());
+            }
+            cursor.parse::<PageCursor>().map_err(|_| invalid_scalar())?;
+        }
+    }
+    validate_nonzero_u32(required(object, "limit")?)
 }
 
 fn validate_snapshot_request_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
@@ -6697,7 +7488,10 @@ fn validate_subscription_request_shape(node: &JsonNode) -> Result<(), TypedJsonE
     Ok(())
 }
 
-fn validate_query_response_shape(node: &JsonNode) -> Result<(), TypedJsonError> {
+fn validate_query_response_shape(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
     let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
     let data = required(object, "data")?;
     validate_adjacent_output(data, |kind, data| match kind {
@@ -6722,8 +7516,201 @@ fn validate_query_response_shape(node: &JsonNode) -> Result<(), TypedJsonError> 
                 }
             })
         }
-        "agent" | "session" | "command_surface" | "model" | "prompt" | "skill" | "tool"
-        | "usage" | "diagnostics" => Err(TypedJsonError::PendingPublicTarget),
+        "agent" => {
+            validate_adjacent_output(data.ok_or_else(missing_required_field)?, |kind, data| {
+                match kind {
+                    "agents" => {
+                        validate_agent_page(data.ok_or_else(missing_required_field)?, limits)
+                    }
+                    _ => Err(unknown_output_variant()),
+                }
+            })
+        }
+        "session" => {
+            validate_adjacent_output(data.ok_or_else(missing_required_field)?, |kind, data| {
+                match kind {
+                    "sessions" => {
+                        validate_session_page(data.ok_or_else(missing_required_field)?, limits)
+                    }
+                    "fork_provenance" => match data.ok_or_else(missing_required_field)? {
+                        JsonNode::Null => Ok(()),
+                        provenance => validate_session_fork_provenance(provenance),
+                    },
+                    _ => Err(unknown_output_variant()),
+                }
+            })
+        }
+        "command_surface" | "model" | "prompt" | "skill" | "tool" | "usage" | "diagnostics" => {
+            Err(TypedJsonError::PendingPublicTarget)
+        }
+        _ => Err(unknown_output_variant()),
+    })
+}
+
+fn validate_agent_page(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let items = required(object, "items")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    if items.len() > usize::from(limits.paging.max_page_size) {
+        return Err(invalid_scalar());
+    }
+    for item in items {
+        let item = item.as_object().ok_or_else(selected_wrong_json_type)?;
+        validate_id::<AgentId>(required(item, "agentId")?)?;
+        required(item, "definitionRevision")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<AgentRevision>()
+            .map_err(|_| invalid_scalar())?;
+        let metadata = required(item, "metadata")?
+            .as_object()
+            .ok_or_else(selected_wrong_json_type)?;
+        required(metadata, "revision")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<AgentMetadataRevision>()
+            .map_err(|_| invalid_scalar())?;
+        for field in ["name", "updatedAt"] {
+            required(metadata, field)?
+                .as_str()
+                .ok_or_else(typed_wrong_json_type)?;
+        }
+        match metadata.get("description") {
+            None | Some(JsonNode::Null) => {}
+            Some(value) if value.as_str().is_some() => {}
+            Some(_) => return Err(typed_wrong_json_type()),
+        }
+        required(metadata, "updatedAt")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<Timestamp>()
+            .map_err(|_| invalid_scalar())?;
+        match required(item, "status")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+        {
+            "enabled" | "disabled" | "deleted" => {}
+            _ => return Err(unknown_output_variant()),
+        }
+        required(item, "createdAt")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<Timestamp>()
+            .map_err(|_| invalid_scalar())?;
+    }
+    validate_page_next_cursor(object, limits)
+}
+
+fn validate_session_page(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let items = required(object, "items")?
+        .as_array()
+        .ok_or_else(selected_wrong_json_type)?;
+    if items.len() > usize::from(limits.paging.max_page_size) {
+        return Err(invalid_scalar());
+    }
+    for item in items {
+        let item = item.as_object().ok_or_else(selected_wrong_json_type)?;
+        validate_id::<SessionId>(required(item, "sessionId")?)?;
+        required(item, "definitionRevision")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<SessionDefinitionRevision>()
+            .map_err(|_| invalid_scalar())?;
+        validate_session_metadata_summary(required(item, "metadata")?)?;
+        match required(item, "lifecycle")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+        {
+            "open" | "archived" | "deleted" => {}
+            _ => return Err(unknown_output_variant()),
+        }
+        if !matches!(required(item, "forked")?, JsonNode::Bool(_)) {
+            return Err(typed_wrong_json_type());
+        }
+        required(item, "createdAt")?
+            .as_str()
+            .ok_or_else(typed_wrong_json_type)?
+            .parse::<Timestamp>()
+            .map_err(|_| invalid_scalar())?;
+    }
+    validate_page_next_cursor(object, limits)
+}
+
+fn validate_session_metadata_summary(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let metadata = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    required(metadata, "revision")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<SessionMetadataRevision>()
+        .map_err(|_| invalid_scalar())?;
+    for field in ["name", "description"] {
+        match metadata.get(field) {
+            None | Some(JsonNode::Null) => {}
+            Some(value) if value.as_str().is_some() => {}
+            Some(_) => return Err(typed_wrong_json_type()),
+        }
+    }
+    required(metadata, "updatedAt")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<Timestamp>()
+        .map(|_| ())
+        .map_err(|_| invalid_scalar())
+}
+
+fn validate_page_next_cursor(
+    object: &std::collections::BTreeMap<Box<str>, JsonNode>,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    match required(object, "nextCursor")? {
+        JsonNode::Null => Ok(()),
+        cursor => {
+            let cursor = cursor.as_str().ok_or_else(typed_wrong_json_type)?;
+            if cursor.len() > usize::from(limits.paging.max_page_cursor_bytes) {
+                return Err(invalid_scalar());
+            }
+            cursor
+                .parse::<PageCursor>()
+                .map(|_| ())
+                .map_err(|_| invalid_scalar())
+        }
+    }
+}
+
+fn validate_session_fork_provenance(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    validate_id::<SessionId>(required(object, "sourceSessionId")?)?;
+    match required(object, "source")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "live_snapshot" | "recorded_history" => {}
+        _ => return Err(unknown_output_variant()),
+    }
+    validate_fork_anchor_output(required(object, "anchor")?)
+}
+
+fn validate_fork_anchor_output(node: &JsonNode) -> Result<(), TypedJsonError> {
+    validate_adjacent_output(node, |kind, data| match kind {
+        "genesis" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "before_user_message"
+        | "after_user_message"
+        | "before_final_agent_message"
+        | "after_final_agent_message" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_id::<ItemId>(required(object, "itemId")?)
+        }
         _ => Err(unknown_output_variant()),
     })
 }

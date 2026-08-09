@@ -9985,6 +9985,19 @@ impl DurableState {
             .map(|entry| Arc::clone(&entry.current_head))
     }
 
+    /// Captures one immutable, stable-ID-ordered projection of the current published Agent heads.
+    pub(crate) fn agent_catalog_heads(&self) -> Vec<Arc<DurableAgentHead>> {
+        let mut heads = self
+            .agents
+            .iter()
+            .map(|(agent_id, entry)| (*agent_id, Arc::clone(&entry.current_head)))
+            .collect::<BTreeMap<_, _>>();
+        for (agent_id, entry) in lock(&self.published_agents).iter() {
+            heads.insert(*agent_id, Arc::clone(&entry.current_head));
+        }
+        heads.into_values().collect()
+    }
+
     #[allow(
         dead_code,
         reason = "recovery catalog is consumed by later Agent revision resolution"
@@ -10028,6 +10041,19 @@ impl DurableState {
     pub(crate) fn session_head(&self, session_id: SessionId) -> Option<Arc<DurableSessionHead>> {
         self.session_current(session_id)
             .map(|current| Arc::clone(current.head()))
+    }
+
+    /// Captures one immutable projection of the current published Session heads.
+    pub(crate) fn session_catalog_heads(&self) -> Vec<Arc<DurableSessionHead>> {
+        let mut heads = self
+            .sessions
+            .iter()
+            .map(|(session_id, entry)| (*session_id, Arc::clone(&entry.current_head)))
+            .collect::<BTreeMap<_, _>>();
+        for (session_id, entry) in lock(&self.published_sessions).iter() {
+            heads.insert(*session_id, Arc::clone(&entry.current_head));
+        }
+        heads.into_values().collect()
     }
 
     #[allow(

@@ -1,18 +1,20 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU32;
 
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::{
-    AgentRevisionRef, ForkAnchor, ForkSourceKind, SessionModelConfig,
+    AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SessionModelConfig,
 };
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
 use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
 use crate::wire::lexical::{normalize_newlines, validate_safe_text, validate_stable_symbolic_key};
 use crate::wire::{
-    AgentId, CommandId, Duration, ItemId, Money, ProtocolLimits, RequestId,
-    SessionDefinitionRevision, SessionId, SessionMetadataRevision, Timestamp, TurnId,
+    AgentId, AgentMetadataRevision, AgentRevision, CommandId, Duration, ItemId, Money, PageCursor,
+    ProtocolLimits, RequestId, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
+    Timestamp, TurnId,
 };
 use crate::workspace::{WorkspaceDefinitionInput, WorkspaceDefinitionSummaryView};
 
@@ -703,10 +705,302 @@ pub enum RuntimeReadQuery {
     GetCapabilities,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PageRequest {
+    cursor: Option<PageCursor>,
+    limit: NonZeroU32,
+}
+
+impl PageRequest {
+    pub const fn new(cursor: Option<PageCursor>, limit: NonZeroU32) -> Self {
+        Self { cursor, limit }
+    }
+
+    pub const fn cursor(self) -> Option<PageCursor> {
+        self.cursor
+    }
+
+    pub const fn limit(self) -> NonZeroU32 {
+        self.limit
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    items: Vec<T>,
+    next_cursor: Option<PageCursor>,
+}
+
+impl<T> Page<T> {
+    pub fn new(items: Vec<T>, next_cursor: Option<PageCursor>) -> Self {
+        Self { items, next_cursor }
+    }
+
+    pub fn items(&self) -> &[T] {
+        &self.items
+    }
+
+    pub const fn next_cursor(&self) -> Option<PageCursor> {
+        self.next_cursor
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct AgentMetadataView {
+    revision: AgentMetadataRevision,
+    name: Box<str>,
+    description: Option<Box<str>>,
+    updated_at: Timestamp,
+}
+
+impl AgentMetadataView {
+    pub fn new<N, D>(
+        revision: AgentMetadataRevision,
+        name: N,
+        description: Option<D>,
+        updated_at: Timestamp,
+    ) -> Result<Self, ObservationValueError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        Self::new_with_limits(
+            revision,
+            name,
+            description,
+            updated_at,
+            ProtocolLimits::v1_0(),
+        )
+    }
+
+    pub(crate) fn new_with_limits<N, D>(
+        revision: AgentMetadataRevision,
+        name: N,
+        description: Option<D>,
+        updated_at: Timestamp,
+        limits: ProtocolLimits,
+    ) -> Result<Self, ObservationValueError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        let name = normalize_newlines(name.as_ref());
+        validate_safe_text(
+            &name,
+            usize::from(limits.text.max_display_name_bytes),
+            false,
+        )
+        .map_err(|error| match error {
+            crate::wire::lexical::LexicalError::Empty => ObservationValueError::EmptyText,
+            crate::wire::lexical::LexicalError::TooLong => ObservationValueError::TextTooLong,
+            crate::wire::lexical::LexicalError::UnsafeText
+            | crate::wire::lexical::LexicalError::InvalidGrammar => {
+                ObservationValueError::UnsafeText
+            }
+        })?;
+        let description = normalize_observation_text(
+            description,
+            usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
+            false,
+        )?;
+        Ok(Self {
+            revision,
+            name: name.into(),
+            description,
+            updated_at,
+        })
+    }
+
+    pub const fn revision(&self) -> AgentMetadataRevision {
+        self.revision
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    pub const fn updated_at(&self) -> Timestamp {
+        self.updated_at
+    }
+}
+
+impl fmt::Debug for AgentMetadataView {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AgentMetadataView")
+            .field("revision", &self.revision)
+            .field("name_present", &true)
+            .field("description_present", &self.description.is_some())
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSummary {
+    agent_id: AgentId,
+    definition_revision: AgentRevision,
+    metadata: AgentMetadataView,
+    status: AgentStatus,
+    created_at: Timestamp,
+}
+
+impl AgentSummary {
+    pub const fn new(
+        agent_id: AgentId,
+        definition_revision: AgentRevision,
+        metadata: AgentMetadataView,
+        status: AgentStatus,
+        created_at: Timestamp,
+    ) -> Self {
+        Self {
+            agent_id,
+            definition_revision,
+            metadata,
+            status,
+            created_at,
+        }
+    }
+
+    pub const fn agent_id(&self) -> AgentId {
+        self.agent_id
+    }
+
+    pub const fn definition_revision(&self) -> AgentRevision {
+        self.definition_revision
+    }
+
+    pub const fn metadata(&self) -> &AgentMetadataView {
+        &self.metadata
+    }
+
+    pub const fn status(&self) -> AgentStatus {
+        self.status
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AgentQuery {
+    ListAgents {
+        page: PageRequest,
+        include_deleted: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    session_id: SessionId,
+    definition_revision: SessionDefinitionRevision,
+    metadata: SessionMetadataView,
+    lifecycle: SessionLifecycleView,
+    forked: bool,
+    created_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionForkProvenanceView {
+    source_session_id: SessionId,
+    source: ForkSourceKind,
+    anchor: ForkAnchor,
+}
+
+impl SessionForkProvenanceView {
+    pub const fn new(
+        source_session_id: SessionId,
+        source: ForkSourceKind,
+        anchor: ForkAnchor,
+    ) -> Self {
+        Self {
+            source_session_id,
+            source,
+            anchor,
+        }
+    }
+
+    pub const fn source_session_id(&self) -> SessionId {
+        self.source_session_id
+    }
+
+    pub const fn source(&self) -> ForkSourceKind {
+        self.source
+    }
+
+    pub const fn anchor(&self) -> &ForkAnchor {
+        &self.anchor
+    }
+}
+
+impl SessionSummary {
+    pub const fn new(
+        session_id: SessionId,
+        definition_revision: SessionDefinitionRevision,
+        metadata: SessionMetadataView,
+        lifecycle: SessionLifecycleView,
+        forked: bool,
+        created_at: Timestamp,
+    ) -> Self {
+        Self {
+            session_id,
+            definition_revision,
+            metadata,
+            lifecycle,
+            forked,
+            created_at,
+        }
+    }
+
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    pub const fn definition_revision(&self) -> SessionDefinitionRevision {
+        self.definition_revision
+    }
+
+    pub const fn metadata(&self) -> &SessionMetadataView {
+        &self.metadata
+    }
+
+    pub const fn lifecycle(&self) -> SessionLifecycleView {
+        self.lifecycle
+    }
+
+    pub const fn forked(&self) -> bool {
+        self.forked
+    }
+
+    pub const fn created_at(&self) -> Timestamp {
+        self.created_at
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SessionQuery {
+    ListSessions {
+        page: PageRequest,
+        include_archived: bool,
+    },
+    GetSessionForkProvenance {
+        session_id: SessionId,
+    },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeQuery {
     Runtime(RuntimeReadQuery),
+    Agent(AgentQuery),
+    Session(SessionQuery),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -728,12 +1022,27 @@ impl QueryResponse {
 #[non_exhaustive]
 pub enum QueryResult {
     Runtime(RuntimeQueryResult),
+    Agent(AgentQueryResult),
+    Session(SessionQueryResult),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeQueryResult {
     Capabilities(RuntimeCapabilities),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AgentQueryResult {
+    Agents(Page<AgentSummary>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SessionQueryResult {
+    Sessions(Page<SessionSummary>),
+    ForkProvenance(Option<SessionForkProvenanceView>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -2555,3 +2864,27 @@ macro_rules! public_route_error {
 public_route_error!(QueryError, QueryErrorCode);
 public_route_error!(SnapshotError, SnapshotErrorCode);
 public_route_error!(SubscriptionError, SubscriptionErrorCode);
+
+impl QueryError {
+    pub(crate) fn new_boxed(
+        code: QueryErrorCode,
+        message: Box<str>,
+        retry: RetryAdvice,
+        subject: Option<PublicSubject>,
+    ) -> Self {
+        debug_assert!(
+            validate_safe_text(
+                &message,
+                ProtocolLimits::v1_0().text.max_diagnostic_message_bytes as usize,
+                false,
+            )
+            .is_ok()
+        );
+        Self {
+            code,
+            message,
+            retry,
+            subject,
+        }
+    }
+}

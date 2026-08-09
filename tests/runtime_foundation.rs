@@ -4,6 +4,11 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use minicore_runtime::runtime_interface::{
+    AgentQuery, AgentQueryResult, CommandRequest, PageRequest, QueryErrorCode, QueryResult,
+    RuntimeCommand, RuntimeQuery, SessionCommand, SessionQuery, SessionQueryResult,
+};
+use minicore_runtime::wire::CommandId;
 use minicore_runtime::{
     CompactionSettings, MiniCoreRuntime, MiniCoreRuntimeConfig, RuntimeInitializationError,
 };
@@ -107,6 +112,34 @@ fn create_published_g1_agent_store(root: &Path) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
+fn create_second_published_g1_agent(root: &Path) {
+    const SOURCE_AGENT_ID: &str = "agt_11111111111111111111111111111111";
+    const AGENT_ID: &str = "agt_22222222222222222222222222222222";
+    const GENERATION_ONE: &str = "00000000000000000001";
+
+    create_private_file(&root.join("reservations/agents").join(AGENT_ID), b"");
+    let entity = root.join("agents").join(AGENT_ID);
+    create_private_directory(&entity);
+    create_private_file(&entity.join("PUBLISHED"), b"");
+    create_private_directory(&entity.join("generations"));
+    let generation = entity.join("generations").join(GENERATION_ONE);
+    create_private_directory(&generation);
+    let head = std::str::from_utf8(include_bytes!(
+        "../docs/fixtures/durable-store-v1/agent-head.json"
+    ))
+    .expect("the authoritative Agent head is UTF-8")
+    .replace(SOURCE_AGENT_ID, AGENT_ID)
+    .replace("Planner", "Reviewer");
+    create_private_file(&generation.join("head.json"), head.as_bytes());
+    let definition = std::str::from_utf8(include_bytes!(
+        "../docs/fixtures/durable-store-v1/agent-definition.json"
+    ))
+    .expect("the authoritative Agent definition is UTF-8")
+    .replace(SOURCE_AGENT_ID, AGENT_ID);
+    create_private_file(&generation.join("definition.json"), definition.as_bytes());
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 fn create_published_g2_definition_generation(root: &Path) {
     const AGENT_ID: &str = "agt_11111111111111111111111111111111";
     const GENERATION_TWO: &str = "00000000000000000002";
@@ -125,6 +158,25 @@ fn create_published_g2_definition_generation(root: &Path) {
         &generation.join("definition.json"),
         include_bytes!("../docs/fixtures/durable-store-v1/agent-definition-2.json"),
     );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
+fn create_published_g2_deleted_agent_generation(root: &Path) {
+    const AGENT_ID: &str = "agt_11111111111111111111111111111111";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("agents")
+        .join(AGENT_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    let head = std::str::from_utf8(include_bytes!(
+        "../docs/fixtures/durable-store-v1/agent-head-2-status.json"
+    ))
+    .expect("the authoritative Agent status head is UTF-8")
+    .replace("\"status\":\"disabled\"", "\"status\":\"deleted\"");
+    create_private_file(&generation.join("head.json"), head.as_bytes());
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
@@ -224,6 +276,23 @@ fn create_published_g2_session_definition_generation(root: &Path) {
     create_private_file(&generation.join("COMMITTED"), b"");
 }
 
+fn create_published_g2_archived_session_generation(root: &Path) {
+    const SESSION_ID: &str = "ses_22222222222222222222222222222222";
+    const GENERATION_TWO: &str = "00000000000000000002";
+
+    let generation = root
+        .join("sessions")
+        .join(SESSION_ID)
+        .join("generations")
+        .join(GENERATION_TWO);
+    create_private_directory(&generation);
+    create_private_file(
+        &generation.join("head.json"),
+        include_bytes!("../docs/fixtures/durable-store-v1/session-head-2-lifecycle.json"),
+    );
+    create_private_file(&generation.join("COMMITTED"), b"");
+}
+
 fn create_corrupt_g2_session_same_lifecycle_generation(root: &Path) {
     const SESSION_ID: &str = "ses_22222222222222222222222222222222";
     const GENERATION_TWO: &str = "00000000000000000002";
@@ -307,6 +376,344 @@ async fn published_committed_g1_agent_store_opens_shuts_down_and_reopens() {
     .await
     .expect("the recovered G1 Agent store reopens after shutdown");
     reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_query_lists_the_durable_agent_catalog() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_second_published_g1_agent(root.path());
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the published Agent catalog opens");
+    let response = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect("the public Agent catalog query succeeds");
+
+    let QueryResult::Agent(AgentQueryResult::Agents(page)) = response.data() else {
+        panic!("the Agent query returns an Agent page");
+    };
+    assert_eq!(page.items().len(), 1);
+    let agent = &page.items()[0];
+    assert_eq!(
+        agent.agent_id().to_string(),
+        "agt_11111111111111111111111111111111"
+    );
+    assert_eq!(agent.definition_revision().to_string(), "ar_1");
+    assert_eq!(agent.metadata().revision().to_string(), "amr_1");
+    assert_eq!(agent.metadata().name(), "Planner");
+    assert_eq!(agent.metadata().description(), None);
+    assert_eq!(
+        agent.status(),
+        minicore_runtime::agent_session_lifecycle::AgentStatus::Enabled
+    );
+    let cursor = page.next_cursor().expect("the Agent page continues");
+
+    let response = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect("the second Agent catalog page succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(page)) = response.data() else {
+        panic!("the continuation returns an Agent page");
+    };
+    assert_eq!(page.items().len(), 1);
+    assert_eq!(
+        page.items()[0].agent_id().to_string(),
+        "agt_22222222222222222222222222222222"
+    );
+    assert_eq!(page.items()[0].metadata().name(), "Reviewer");
+    assert!(page.next_cursor().is_none());
+
+    let response = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect("a fresh Agent page succeeds before restart");
+    let QueryResult::Agent(AgentQueryResult::Agents(page)) = response.data() else {
+        panic!("the fresh Agent query returns an Agent page");
+    };
+    let restart_cursor = page.next_cursor().expect("the fresh page continues");
+
+    let error = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(201).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect_err("a page larger than the selected limit is rejected");
+    assert_eq!(error.code(), QueryErrorCode::InvalidArgument);
+
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Agent catalog reopens");
+    let error = reopened
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(Some(restart_cursor), NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect_err("a cursor cannot survive Runtime restart");
+    assert_eq!(error.code(), QueryErrorCode::StaleCursor);
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_catalog_queries_apply_deleted_and_archived_filters() {
+    let agent_root = TempRoot::new();
+    create_published_g1_agent_store(agent_root.path());
+    create_published_g2_deleted_agent_generation(agent_root.path());
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(agent_root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Deleted Agent catalog opens");
+    let response = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect("the default Agent filter succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(page)) = response.data() else {
+        panic!("the Agent filter returns an Agent page");
+    };
+    assert!(page.items().is_empty());
+
+    let response = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_deleted: true,
+        }))
+        .await
+        .expect("the inclusive Agent filter succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(page)) = response.data() else {
+        panic!("the inclusive Agent filter returns an Agent page");
+    };
+    assert_eq!(page.items().len(), 1);
+    assert_eq!(
+        page.items()[0].status(),
+        minicore_runtime::agent_session_lifecycle::AgentStatus::Deleted
+    );
+    runtime.shutdown().await;
+
+    let session_root = TempRoot::new();
+    create_published_g1_agent_store(session_root.path());
+    create_published_g1_session(
+        session_root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-source.jsonl"),
+    );
+    create_published_g2_archived_session_generation(session_root.path());
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(session_root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Archived Session catalog opens");
+    let response = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_archived: false,
+        }))
+        .await
+        .expect("the default Session filter succeeds");
+    let QueryResult::Session(SessionQueryResult::Sessions(page)) = response.data() else {
+        panic!("the Session filter returns a Session page");
+    };
+    assert!(page.items().is_empty());
+
+    let response = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_archived: true,
+        }))
+        .await
+        .expect("the inclusive Session filter succeeds");
+    let QueryResult::Session(SessionQueryResult::Sessions(page)) = response.data() else {
+        panic!("the inclusive Session filter returns a Session page");
+    };
+    assert_eq!(page.items().len(), 1);
+    assert_eq!(
+        page.items()[0].lifecycle(),
+        minicore_runtime::runtime_interface::SessionLifecycleView::Archived
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_query_pages_the_durable_session_catalog_in_canonical_order() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g1_session(
+        root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-source.jsonl"),
+    );
+    create_published_g1_fork_session(
+        root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl"),
+    );
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the published Session catalog opens");
+    let first = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(None, NonZeroU32::new(1).unwrap()),
+            include_archived: false,
+        }))
+        .await
+        .expect("the first Session catalog page succeeds");
+    let QueryResult::Session(SessionQueryResult::Sessions(first)) = first.data() else {
+        panic!("the Session query returns a Session page");
+    };
+    assert_eq!(first.items().len(), 1);
+    assert_eq!(
+        first.items()[0].session_id().to_string(),
+        "ses_33333333333333333333333333333333"
+    );
+    assert!(first.items()[0].forked());
+    let cursor = first.next_cursor().expect("the first page continues");
+
+    let error = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect_err("a Session cursor cannot be reused for an Agent query");
+    assert_eq!(error.code(), QueryErrorCode::StaleCursor);
+    let error = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap()),
+            include_archived: true,
+        }))
+        .await
+        .expect_err("a Session cursor cannot be reused with another filter");
+    assert_eq!(error.code(), QueryErrorCode::StaleCursor);
+
+    runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Session(SessionCommand::Fork {
+                source_session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                anchor: minicore_runtime::agent_session_lifecycle::ForkAnchor::Genesis,
+            }),
+        ))
+        .await
+        .expect("a new Fork publishes after the first page snapshot");
+
+    let second = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap()),
+            include_archived: false,
+        }))
+        .await
+        .expect("the second Session catalog page succeeds");
+    let QueryResult::Session(SessionQueryResult::Sessions(second)) = second.data() else {
+        panic!("the continuation returns a Session page");
+    };
+    assert_eq!(second.items().len(), 1);
+    assert_eq!(
+        second.items()[0].session_id().to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert!(!second.items()[0].forked());
+    assert!(second.next_cursor().is_none());
+
+    let error = runtime
+        .query(RuntimeQuery::Session(SessionQuery::ListSessions {
+            page: PageRequest::new(Some(cursor), NonZeroU32::new(1).unwrap()),
+            include_archived: false,
+        }))
+        .await
+        .expect_err("a consumed cursor is stale");
+    assert_eq!(error.code(), QueryErrorCode::StaleCursor);
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_query_returns_durable_session_fork_provenance() {
+    let root = TempRoot::new();
+    create_published_g1_agent_store(root.path());
+    create_published_g1_session(root.path(), b"source conversation");
+    create_published_g1_fork_session(
+        root.path(),
+        include_bytes!("../docs/fixtures/durable-store-v1/fork-child.jsonl"),
+    );
+
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the published Fork graph opens");
+    let child_id = "ses_33333333333333333333333333333333".parse().unwrap();
+    let response = runtime
+        .query(RuntimeQuery::Session(
+            SessionQuery::GetSessionForkProvenance {
+                session_id: child_id,
+            },
+        ))
+        .await
+        .expect("the Fork provenance query succeeds");
+    let QueryResult::Session(SessionQueryResult::ForkProvenance(Some(provenance))) =
+        response.data()
+    else {
+        panic!("the Fork child returns durable provenance");
+    };
+    assert_eq!(
+        provenance.source_session_id().to_string(),
+        "ses_22222222222222222222222222222222"
+    );
+    assert_eq!(
+        provenance.source(),
+        minicore_runtime::agent_session_lifecycle::ForkSourceKind::RecordedHistory
+    );
+    assert!(matches!(
+        provenance.anchor(),
+        minicore_runtime::agent_session_lifecycle::ForkAnchor::AfterUserMessage { item_id }
+            if item_id.to_string() == "itm_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ));
+
+    let source_id = "ses_22222222222222222222222222222222".parse().unwrap();
+    let response = runtime
+        .query(RuntimeQuery::Session(
+            SessionQuery::GetSessionForkProvenance {
+                session_id: source_id,
+            },
+        ))
+        .await
+        .expect("the ordinary Session provenance query succeeds");
+    assert!(matches!(
+        response.data(),
+        QueryResult::Session(SessionQueryResult::ForkProvenance(None))
+    ));
+
+    runtime.shutdown().await;
 }
 
 #[tokio::test(flavor = "current_thread")]

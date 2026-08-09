@@ -1,26 +1,31 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration as StdDuration, Instant};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 
-use crate::agent_session_lifecycle::{SealedSessionCreateAttempt, SealedSessionLifecycleAttempt};
+use crate::agent_session_lifecycle::{
+    AgentStatus, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
+};
 use crate::compaction::CompactionSettings;
 use crate::durable_state::{DurableOpenError, DurableSessionCreateError, DurableState};
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
-    CommandCompletion, CommandError, CommandErrorCode, CommandOutcome, CommandOutput,
-    CommandRequest, CommandResponse, EventFrame, LoadedSessionSummary, PublicCancelTarget,
-    PublicSubject, QueryError, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
-    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery,
-    RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStatusView, RuntimeView,
-    SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionMetadataView,
-    SessionQueueView, SessionReadinessView, SessionRecordingView, SessionSnapshot, SnapshotError,
+    AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
+    CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse, EventFrame,
+    LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject, QueryError, QueryErrorCode,
+    QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
+    RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult,
+    RuntimeReadQuery, RuntimeSnapshot, RuntimeStatusView, RuntimeView, SessionCommand,
+    SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
+    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
+    SessionReadinessView, SessionRecordingView, SessionSnapshot, SessionSummary, SnapshotError,
     SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView,
     SubmitAdmissionView, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
     SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
@@ -40,7 +45,7 @@ use crate::session_residency::{
     SessionResidencyWorkspaceDefinitionError,
 };
 use crate::wire::{
-    ProtocolLimits, SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision,
+    PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, Timestamp, WorkspaceRevision,
 };
 use crate::workspace::{
     Workspace, WorkspaceDefinitionSummaryView, WorkspacePathTarget, WorkspaceResolver,
@@ -48,6 +53,9 @@ use crate::workspace::{
 };
 
 const DEFAULT_RUNTIME_REQUIRED_POLICY: &str = "Respond helpfully to the user's request.";
+const PAGE_CURSOR_CAPACITY: usize = 4_096;
+const PAGE_CURSOR_TTL: StdDuration = StdDuration::from_secs(15 * 60);
+const PAGE_CURSOR_GENERATION_ATTEMPTS: usize = 32;
 
 /// Host configuration for a MiniCore runtime instance.
 #[non_exhaustive]
@@ -354,6 +362,188 @@ impl From<DurableOpenError> for RuntimeInitializationError {
     }
 }
 
+#[derive(Clone)]
+struct AgentPageCursorEntry {
+    snapshot: Arc<[AgentSummary]>,
+    offset: usize,
+    include_deleted: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct SessionPageCursorEntry {
+    snapshot: Arc<[SessionSummary]>,
+    offset: usize,
+    include_archived: bool,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+enum PageCursorEntry {
+    Agents(AgentPageCursorEntry),
+    Sessions(SessionPageCursorEntry),
+}
+
+impl PageCursorEntry {
+    const fn expires_at(&self) -> Instant {
+        match self {
+            Self::Agents(entry) => entry.expires_at,
+            Self::Sessions(entry) => entry.expires_at,
+        }
+    }
+}
+
+#[derive(Default)]
+struct PageCursorStore {
+    entries: BTreeMap<PageCursor, PageCursorEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageCursorStoreError {
+    Stale,
+    Unavailable,
+}
+
+impl PageCursorStore {
+    fn first_agents(
+        &mut self,
+        snapshot: Vec<AgentSummary>,
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Page<AgentSummary>, PageCursorStoreError> {
+        let snapshot: Arc<[AgentSummary]> = snapshot.into();
+        self.agent_page(snapshot, 0, include_deleted, limit)
+    }
+
+    fn next_agents(
+        &mut self,
+        cursor: PageCursor,
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Page<AgentSummary>, PageCursorStoreError> {
+        self.remove_expired();
+        let Some(PageCursorEntry::Agents(entry)) = self.entries.get(&cursor).cloned() else {
+            return Err(PageCursorStoreError::Stale);
+        };
+        if entry.include_deleted != include_deleted {
+            return Err(PageCursorStoreError::Stale);
+        }
+        let page = self.agent_page(entry.snapshot, entry.offset, include_deleted, limit)?;
+        self.entries.remove(&cursor);
+        Ok(page)
+    }
+
+    fn agent_page(
+        &mut self,
+        snapshot: Arc<[AgentSummary]>,
+        offset: usize,
+        include_deleted: bool,
+        limit: usize,
+    ) -> Result<Page<AgentSummary>, PageCursorStoreError> {
+        let end = offset.saturating_add(limit).min(snapshot.len());
+        if offset > end {
+            return Err(PageCursorStoreError::Stale);
+        }
+        let items = snapshot[offset..end].to_vec();
+        let next_cursor = if end < snapshot.len() {
+            Some(
+                self.insert_cursor(PageCursorEntry::Agents(AgentPageCursorEntry {
+                    snapshot,
+                    offset: end,
+                    include_deleted,
+                    expires_at: Instant::now() + PAGE_CURSOR_TTL,
+                }))?,
+            )
+        } else {
+            None
+        };
+        Ok(Page::new(items, next_cursor))
+    }
+
+    fn first_sessions(
+        &mut self,
+        snapshot: Vec<SessionSummary>,
+        include_archived: bool,
+        limit: usize,
+    ) -> Result<Page<SessionSummary>, PageCursorStoreError> {
+        let snapshot: Arc<[SessionSummary]> = snapshot.into();
+        self.session_page(snapshot, 0, include_archived, limit)
+    }
+
+    fn next_sessions(
+        &mut self,
+        cursor: PageCursor,
+        include_archived: bool,
+        limit: usize,
+    ) -> Result<Page<SessionSummary>, PageCursorStoreError> {
+        self.remove_expired();
+        let Some(PageCursorEntry::Sessions(entry)) = self.entries.get(&cursor).cloned() else {
+            return Err(PageCursorStoreError::Stale);
+        };
+        if entry.include_archived != include_archived {
+            return Err(PageCursorStoreError::Stale);
+        }
+        let page = self.session_page(entry.snapshot, entry.offset, include_archived, limit)?;
+        self.entries.remove(&cursor);
+        Ok(page)
+    }
+
+    fn session_page(
+        &mut self,
+        snapshot: Arc<[SessionSummary]>,
+        offset: usize,
+        include_archived: bool,
+        limit: usize,
+    ) -> Result<Page<SessionSummary>, PageCursorStoreError> {
+        let end = offset.saturating_add(limit).min(snapshot.len());
+        if offset > end {
+            return Err(PageCursorStoreError::Stale);
+        }
+        let items = snapshot[offset..end].to_vec();
+        let next_cursor = if end < snapshot.len() {
+            Some(
+                self.insert_cursor(PageCursorEntry::Sessions(SessionPageCursorEntry {
+                    snapshot,
+                    offset: end,
+                    include_archived,
+                    expires_at: Instant::now() + PAGE_CURSOR_TTL,
+                }))?,
+            )
+        } else {
+            None
+        };
+        Ok(Page::new(items, next_cursor))
+    }
+
+    fn insert_cursor(
+        &mut self,
+        entry: PageCursorEntry,
+    ) -> Result<PageCursor, PageCursorStoreError> {
+        self.remove_expired();
+        let mut candidate = None;
+        for _ in 0..PAGE_CURSOR_GENERATION_ATTEMPTS {
+            let cursor = PageCursor::generate().map_err(|_| PageCursorStoreError::Unavailable)?;
+            if !self.entries.contains_key(&cursor) {
+                candidate = Some(cursor);
+                break;
+            }
+        }
+        let cursor = candidate.ok_or(PageCursorStoreError::Unavailable)?;
+        if self.entries.len() >= PAGE_CURSOR_CAPACITY {
+            if let Some(evicted) = self.entries.keys().next().copied() {
+                self.entries.remove(&evicted);
+            }
+        }
+        self.entries.insert(cursor, entry);
+        Ok(cursor)
+    }
+
+    fn remove_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, entry| entry.expires_at() > now);
+    }
+}
+
 struct RuntimeInner {
     task_context: RuntimeTaskContext,
     #[allow(
@@ -379,6 +569,7 @@ struct RuntimeInner {
     retained_until_shutdown: Mutex<Option<Arc<RuntimeInner>>>,
     session_residency: Mutex<Option<Arc<SessionResidencyRegistry>>>,
     durable_state: Mutex<Option<DurableState>>,
+    page_cursors: Mutex<PageCursorStore>,
     in_flight_commands: Mutex<BTreeMap<crate::wire::CommandId, Arc<RuntimeCommandInFlight>>>,
     lifecycle: Mutex<RuntimeLifecycle>,
     lifecycle_changed: Notify,
@@ -403,6 +594,7 @@ impl RuntimeInner {
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
             durable_state: Mutex::new(Some(durable_state)),
+            page_cursors: Mutex::new(PageCursorStore::default()),
             in_flight_commands: Mutex::new(BTreeMap::new()),
             lifecycle: Mutex::new(RuntimeLifecycle::Open),
             lifecycle_changed: Notify::new(),
@@ -674,6 +866,121 @@ impl RuntimeInner {
             RuntimeQuery::Runtime(RuntimeReadQuery::GetCapabilities) => {
                 Ok(QueryResponse::new(QueryResult::Runtime(
                     RuntimeQueryResult::Capabilities(implemented_runtime_capabilities()),
+                )))
+            }
+            RuntimeQuery::Agent(AgentQuery::ListAgents {
+                page,
+                include_deleted,
+            }) => {
+                let limit = query_page_limit(page.limit())?;
+                let result = match page.cursor() {
+                    Some(cursor) => {
+                        lock(&self.page_cursors).next_agents(cursor, include_deleted, limit)
+                    }
+                    None => {
+                        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned()
+                        else {
+                            return Err(runtime_closing_query());
+                        };
+                        let mut agents = Vec::new();
+                        for head in durable_state.agent_catalog_heads() {
+                            if !include_deleted && head.status() == AgentStatus::Deleted {
+                                continue;
+                            }
+                            let metadata = head.metadata();
+                            let metadata = AgentMetadataView::new(
+                                metadata.revision(),
+                                metadata.name(),
+                                metadata.description(),
+                                metadata.updated_at(),
+                            )
+                            .map_err(|_| unavailable_query(Some(PublicSubject::Runtime)))?;
+                            agents.push(AgentSummary::new(
+                                head.agent_id(),
+                                head.current_definition_revision(),
+                                metadata,
+                                head.status(),
+                                head.created_at(),
+                            ));
+                        }
+                        lock(&self.page_cursors).first_agents(agents, include_deleted, limit)
+                    }
+                }
+                .map_err(map_page_cursor_error)?;
+                Ok(QueryResponse::new(QueryResult::Agent(
+                    AgentQueryResult::Agents(result),
+                )))
+            }
+            RuntimeQuery::Session(SessionQuery::ListSessions {
+                page,
+                include_archived,
+            }) => {
+                let limit = query_page_limit(page.limit())?;
+                let result = match page.cursor() {
+                    Some(cursor) => {
+                        lock(&self.page_cursors).next_sessions(cursor, include_archived, limit)
+                    }
+                    None => {
+                        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned()
+                        else {
+                            return Err(runtime_closing_query());
+                        };
+                        let mut sessions = Vec::new();
+                        for head in durable_state.session_catalog_heads() {
+                            let lifecycle = match head.lifecycle() {
+                                SessionLifecycle::Open => SessionLifecycleView::Open,
+                                SessionLifecycle::Archived if include_archived => {
+                                    SessionLifecycleView::Archived
+                                }
+                                SessionLifecycle::Archived | SessionLifecycle::Deleted => continue,
+                            };
+                            let metadata = head.metadata();
+                            let metadata = SessionMetadataView::new(
+                                metadata.revision(),
+                                metadata.name(),
+                                metadata.description(),
+                                metadata.updated_at(),
+                            )
+                            .map_err(|_| unavailable_query(Some(PublicSubject::Runtime)))?;
+                            sessions.push(SessionSummary::new(
+                                head.session_id(),
+                                head.current_definition_revision(),
+                                metadata,
+                                lifecycle,
+                                head.fork_provenance().is_some(),
+                                head.created_at(),
+                            ));
+                        }
+                        sessions.sort_by(|left, right| {
+                            right
+                                .created_at()
+                                .cmp(&left.created_at())
+                                .then_with(|| left.session_id().cmp(&right.session_id()))
+                        });
+                        lock(&self.page_cursors).first_sessions(sessions, include_archived, limit)
+                    }
+                }
+                .map_err(map_page_cursor_error)?;
+                Ok(QueryResponse::new(QueryResult::Session(
+                    SessionQueryResult::Sessions(result),
+                )))
+            }
+            RuntimeQuery::Session(SessionQuery::GetSessionForkProvenance { session_id }) => {
+                let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
+                    return Err(runtime_closing_query());
+                };
+                let head = durable_state
+                    .session_head(session_id)
+                    .ok_or_else(|| not_found_query(PublicSubject::Session(session_id)))?;
+                let provenance = head.fork_provenance().map(|provenance| {
+                    SessionForkProvenanceView::new(
+                        provenance.source_session_id(),
+                        provenance.source(),
+                        provenance.anchor().clone(),
+                    )
+                });
+                Ok(QueryResponse::new(QueryResult::Session(
+                    SessionQueryResult::ForkProvenance(provenance),
                 )))
             }
         }
@@ -1165,13 +1472,72 @@ fn implemented_runtime_capabilities() -> RuntimeCapabilities {
         crate::runtime_interface::RuntimeCapability::StateEvents,
         crate::runtime_interface::RuntimeCapability::RuntimeSnapshot,
         crate::runtime_interface::RuntimeCapability::SessionSnapshot,
+        crate::runtime_interface::RuntimeCapability::PagedQueries,
         crate::runtime_interface::RuntimeCapability::SessionFork,
     ])
-    .expect("the M7 Runtime capability set is a canonical V1 subset")
+    .expect("the implemented Runtime capability set is a canonical V1 subset")
 }
 
 const fn retry_with_backoff() -> RetryAdvice {
     RetryAdvice::RetryWithBackoff { retry_after: None }
+}
+
+fn query_page_limit(limit: NonZeroU32) -> Result<usize, QueryError> {
+    if limit.get() > u32::from(ProtocolLimits::v1_0().paging.max_page_size) {
+        return Err(QueryError::new(
+            QueryErrorCode::InvalidArgument,
+            "page limit exceeds the selected protocol limit",
+            RetryAdvice::DoNotRetry,
+            Some(PublicSubject::Runtime),
+        ));
+    }
+    usize::try_from(limit.get()).map_err(|_| {
+        QueryError::new(
+            QueryErrorCode::InvalidArgument,
+            "page limit is not representable",
+            RetryAdvice::DoNotRetry,
+            Some(PublicSubject::Runtime),
+        )
+    })
+}
+
+fn map_page_cursor_error(error: PageCursorStoreError) -> QueryError {
+    match error {
+        PageCursorStoreError::Stale => QueryError::new(
+            QueryErrorCode::StaleCursor,
+            "cursor is stale",
+            RetryAdvice::RefreshAndRetry,
+            None,
+        ),
+        PageCursorStoreError::Unavailable => unavailable_query(Some(PublicSubject::Runtime)),
+    }
+}
+
+fn unavailable_query(subject: Option<PublicSubject>) -> QueryError {
+    QueryError::new(
+        QueryErrorCode::Unavailable,
+        "query is unavailable",
+        retry_with_backoff(),
+        subject,
+    )
+}
+
+fn not_found_query(subject: PublicSubject) -> QueryError {
+    QueryError::new(
+        QueryErrorCode::NotFound,
+        "query subject was not found",
+        RetryAdvice::RefreshAndRetry,
+        Some(subject),
+    )
+}
+
+fn runtime_closing_query() -> QueryError {
+    QueryError::new(
+        QueryErrorCode::RuntimeClosing,
+        "runtime is closing",
+        retry_with_backoff(),
+        Some(PublicSubject::Runtime),
+    )
 }
 
 fn rejected_completion(
@@ -2190,13 +2556,17 @@ mod tests {
             .await
             .expect("the public capability query succeeds");
         let QueryResult::Runtime(RuntimeQueryResult::Capabilities(capabilities)) =
-            capabilities.data();
+            capabilities.data()
+        else {
+            panic!("the capability query returns Runtime capabilities");
+        };
         assert_eq!(
             capabilities.values(),
             [
                 RuntimeCapability::StateEvents,
                 RuntimeCapability::RuntimeSnapshot,
                 RuntimeCapability::SessionSnapshot,
+                RuntimeCapability::PagedQueries,
                 RuntimeCapability::SessionFork,
             ]
         );

@@ -1,6 +1,6 @@
 # MiniCore V2 开发计划
 
-状态：Active；M0–M10已完成并统一review。当前推进M11 Fork与Full Runtime/Recovery Conformance；Session Fork command/storage纵向切片已完成全部公开anchor、LiveSnapshot/RecordedHistory选择、streaming publication与restart recovery，catalog/query/event与full scenario closure继续推进。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload与完整platform matrix仍pending。
+状态：Active；M0–M10已完成并统一review。当前推进M11 Fork与Full Runtime/Recovery Conformance；Session Fork command/storage及durable Agent/Session catalog/Fork provenance query纵向切片已完成，remaining query/event与full scenario closure继续推进。具体Skill composition、ToolStartGate、complete shared-root publication、concrete source discovery、完整Tool policy/approval、production Rig adapter、grace/cancel式active-Turn Unload与完整platform matrix仍pending。
 
 初始实现基线：`dev` at `144039a`
 
@@ -587,7 +587,9 @@ ActiveTurnTask orchestration与deterministic ToolResult reduction切片已完成
 
 目标：扩展从M7开始使用的唯一public facade，完成Fork与全部public/storage conformance并关闭internal MVP。
 
-当前进度：Session Fork command/storage纵向切片已完成。public `SessionCommand::Fork`与`SessionForked` outcome覆盖Genesis及Before/After User/Final Agent message anchors；source Session在与Load/Unload共用的FIFO gate内选择loaded `LiveSnapshot`或unloaded `RecordedHistory`。Live capture复制同一短guard内的immutable selected entry Arcs，包含Recorder degraded/unrecorded tail；RecordedHistory从tolerant replay selected path解析anchor。child只重绑定SessionId，保留历史Entry/parent/Turn/Item/body事实，以bounded-memory逐行canonical re-encode并逐条流式readback验证后才COMMITTED/PUBLISHED；staging失败complete-or-invisible，restart可恢复child且不继承source current Turn。Fork/Load与Fork/Unload两种排队顺序已有确定性竞态测试。统一Standards/Spec review已关闭RecordedHistory source-path invariant误报、whole-file allocation、async guard与fixture verifier遗漏；最终`./scripts/check.sh`全量通过，其中library tests为637 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。Runtime catalog/query/event、remaining public families、manifest closure和full scenario/recovery conformance仍pending。
+当前进度：Session Fork command/storage纵向切片已完成。public `SessionCommand::Fork`与`SessionForked` outcome覆盖Genesis及Before/After User/Final Agent message anchors；source Session在与Load/Unload共用的FIFO gate内选择loaded `LiveSnapshot`或unloaded `RecordedHistory`。Live capture复制同一短guard内的immutable selected entry Arcs，包含Recorder degraded/unrecorded tail；RecordedHistory从tolerant replay selected path解析anchor。child只重绑定SessionId，保留历史Entry/parent/Turn/Item/body事实，以bounded-memory逐行canonical re-encode并逐条流式readback验证后才COMMITTED/PUBLISHED；staging失败complete-or-invisible，restart可恢复child且不继承source current Turn。Fork/Load与Fork/Unload两种排队顺序已有确定性竞态测试。统一Standards/Spec review已关闭RecordedHistory source-path invariant误报、whole-file allocation、async guard与fixture verifier遗漏；最终`./scripts/check.sh`全量通过，其中library tests为637 passed、3 ignored，集成测试、Clippy、format及current/archive/fixture检查均通过。
+
+durable catalog/query纵向切片亦已完成：`ListAgents`按stable AgentId分页，`ListSessions`按`created_at desc + SessionId`分页并默认排除Archived/Deleted，`GetSessionForkProvenance`直接返回child持久化的source kind与semantic anchor，均不隐式Load Session。4096-entry/15-minute cursor store绑定exact family、filter、sort与captured immutable snapshot；跨family/filter、reuse/expiry/eviction/restart返回`StaleCursor`，page limit超限返回`InvalidArgument`。selected-V1请求、Agent/Session page响应、Fork provenance响应与`QueryError` fixtures已激活；测试覆盖filter、restart stale以及分页期间新Fork不改变旧continuation。统一Standards/Spec review确认无未解决finding，最终`./scripts/check.sh`通过library、integration、Clippy、format、docs与fixtures全部门禁。remaining query/event、public families、manifest closure和full scenario/recovery conformance仍pending。
 
 任务：
 
