@@ -3137,7 +3137,9 @@ async fn run_active_turn_inner(
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Arc<crate::conversation_storage::StoredSessionEntry>, SessionTurnFailure> {
     loop {
-        if cancellation.is_cancelled() {
+        if cancellation.is_cancelled()
+            || !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation)
+        {
             return Err(SessionTurnFailure::Model);
         }
         let captured = lock(&conversation.live_state)
@@ -3240,6 +3242,8 @@ async fn run_active_turn_inner(
             arbitrate_one_steer(
                 Arc::clone(&conversation),
                 turn_id,
+                &emergency_control,
+                emergency_observation,
                 cancellation.clone(),
                 &steer_completion_sender,
                 true,
@@ -3251,6 +3255,9 @@ async fn run_active_turn_inner(
             SteerArbitration::none()
         };
         if let Some(queued) = steer.queued {
+            if !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation) {
+                return Err(SessionTurnFailure::Model);
+            }
             let intermediate = StoredAssistantMessage::reconstruct(
                 AssistantDisposition::Intermediate,
                 body.content().to_vec(),
@@ -3276,10 +3283,20 @@ async fn run_active_turn_inner(
                 turn_id,
                 queued,
                 assistant_fact.revision(),
+                &emergency_control,
+                emergency_observation,
                 cancellation.clone(),
+                #[cfg(test)]
+                Arc::clone(&hooks),
             )
             .await?
             {
+                if !emergency_control_is_unsignaled_current(
+                    &emergency_control,
+                    emergency_observation,
+                ) {
+                    return Err(SessionTurnFailure::Model);
+                }
                 let steer_fact = lock(&conversation.live_state)
                     .apply_user_message(steer, turn_id, SystemClock.now())
                     .map_err(|_| SessionTurnFailure::Internal)?;
@@ -3289,6 +3306,9 @@ async fn run_active_turn_inner(
                     .await;
             }
             continue;
+        }
+        if !emergency_control_is_unsignaled_current(&emergency_control, emergency_observation) {
+            return Err(SessionTurnFailure::Model);
         }
         let fact = {
             let mut live_state = lock(&conversation.live_state);
@@ -3396,6 +3416,8 @@ async fn run_active_turn_inner(
         let steer = arbitrate_one_steer(
             Arc::clone(&conversation),
             turn_id,
+            &emergency_control,
+            emergency_observation,
             cancellation.clone(),
             &steer_completion_sender,
             false,
@@ -3410,10 +3432,20 @@ async fn run_active_turn_inner(
                 turn_id,
                 queued,
                 steer.basis_revision,
+                &emergency_control,
+                emergency_observation,
                 cancellation.clone(),
+                #[cfg(test)]
+                Arc::clone(&hooks),
             )
             .await?
             {
+                if !emergency_control_is_unsignaled_current(
+                    &emergency_control,
+                    emergency_observation,
+                ) {
+                    return Err(SessionTurnFailure::Model);
+                }
                 let fact = lock(&conversation.live_state)
                     .apply_user_message(steer, turn_id, SystemClock.now())
                     .map_err(|_| SessionTurnFailure::Internal)?;
@@ -3589,14 +3621,23 @@ impl SteerArbitration {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one Steer safe point receives its actor-owned emergency and cancellation basis"
+)]
 async fn arbitrate_one_steer(
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
+    emergency_control: &EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
     cancellation: CancellationToken,
     steer_completion_sender: &mpsc::UnboundedSender<ExecutorCompletion>,
     close_if_empty: bool,
     #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<SteerArbitration, SessionTurnFailure> {
+    if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
+        return Err(SessionTurnFailure::Model);
+    }
     #[cfg(test)]
     hooks.before_steer_safe_point().await;
     let basis_revision = lock(&conversation.live_state)
@@ -3617,6 +3658,10 @@ async fn arbitrate_one_steer(
     let Some(queued) = (tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
+        _ = emergency_control.cancelled(
+            emergency_observation.target(),
+            emergency_observation.epoch(),
+        ) => return Err(SessionTurnFailure::Model),
         result = waiter => result.map_err(|_| SessionTurnFailure::Internal)?,
     }) else {
         return Ok(SteerArbitration {
@@ -3627,30 +3672,51 @@ async fn arbitrate_one_steer(
     if queued.turn_id() != turn_id {
         return Err(SessionTurnFailure::Internal);
     }
+    if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
+        return Err(SessionTurnFailure::Model);
+    }
     Ok(SteerArbitration {
         basis_revision,
         queued: Some(queued),
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one Steer resolve receives its captured context and actor-owned control basis"
+)]
 async fn resolve_one_steer(
     context: Arc<TurnExecutionContext>,
     conversation: Arc<LoadedSessionConversation>,
     turn_id: TurnId,
     queued: QueuedSteer,
     basis_revision: crate::live_conversation::ConversationRevision,
+    emergency_control: &EmergencyControlHandle,
+    emergency_observation: EmergencyControlObservation,
     cancellation: CancellationToken,
+    #[cfg(test)] hooks: Arc<SessionExecutorTestHooksInner>,
 ) -> Result<Option<StoredUserMessage>, SessionTurnFailure> {
     let (_command_id, queued_turn_id, intent) = queued.into_parts();
     if queued_turn_id != turn_id {
         return Err(SessionTurnFailure::Internal);
     }
+    if !emergency_control_is_unsignaled_current(emergency_control, emergency_observation) {
+        return Err(SessionTurnFailure::Model);
+    }
     let message = tokio::select! {
         biased;
         _ = cancellation.cancelled() => return Err(SessionTurnFailure::Model),
+        _ = emergency_control.cancelled(
+            emergency_observation.target(),
+            emergency_observation.epoch(),
+        ) => return Err(SessionTurnFailure::Model),
         result = context.resolve_user_message(intent) => result.map_err(map_turn_prompt_error)?,
     };
-    if cancellation.is_cancelled() {
+    #[cfg(test)]
+    hooks.after_steer_resolution().await;
+    if cancellation.is_cancelled()
+        || !emergency_control_is_unsignaled_current(emergency_control, emergency_observation)
+    {
         return Err(SessionTurnFailure::Model);
     }
     let current_revision = lock(&conversation.live_state)
@@ -4617,6 +4683,18 @@ impl SessionExecutorTestHooks {
         self.inner.before_steer_safe_point.release();
     }
 
+    pub(crate) fn arm_after_steer_resolution(&self) {
+        self.inner.after_steer_resolution.arm();
+    }
+
+    pub(crate) async fn wait_after_steer_resolution(&self) {
+        self.inner.after_steer_resolution.wait_until_entered().await;
+    }
+
+    pub(crate) fn release_after_steer_resolution(&self) {
+        self.inner.after_steer_resolution.release();
+    }
+
     pub(crate) fn arm_after_steer_arbitration(&self) {
         self.inner.after_steer_arbitration.arm();
     }
@@ -4676,6 +4754,7 @@ struct SessionExecutorTestHooksInner {
     after_agent_admission_before_input: Arc<NamedAsyncBarrier>,
     before_agent_run_attempt: Arc<NamedAsyncBarrier>,
     before_steer_safe_point: Arc<NamedAsyncBarrier>,
+    after_steer_resolution: Arc<NamedAsyncBarrier>,
     after_steer_arbitration: Arc<NamedAsyncBarrier>,
     after_snapshot_finish: Arc<NamedAsyncBarrier>,
     after_commit_before_install: Arc<NamedAsyncBarrier>,
@@ -4691,6 +4770,7 @@ impl SessionExecutorTestHooksInner {
             after_agent_admission_before_input: Arc::new(NamedAsyncBarrier::new()),
             before_agent_run_attempt: Arc::new(NamedAsyncBarrier::new()),
             before_steer_safe_point: Arc::new(NamedAsyncBarrier::new()),
+            after_steer_resolution: Arc::new(NamedAsyncBarrier::new()),
             after_steer_arbitration: Arc::new(NamedAsyncBarrier::new()),
             after_snapshot_finish: Arc::new(NamedAsyncBarrier::new()),
             after_commit_before_install: Arc::new(NamedAsyncBarrier::new()),
@@ -4715,6 +4795,10 @@ impl SessionExecutorTestHooksInner {
 
     async fn before_steer_safe_point(&self) {
         self.before_steer_safe_point.wait_if_armed().await;
+    }
+
+    async fn after_steer_resolution(&self) {
+        self.after_steer_resolution.wait_if_armed().await;
     }
 
     async fn after_steer_arbitration(&self) {
@@ -5969,6 +6053,117 @@ mod tests {
 
         loaded.executor.close().await.unwrap();
         loaded.state.close().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_signal_during_final_steer_arbitration_drops_the_candidate() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["must not apply"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_steer_safe_point();
+
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("revoke at arbitration").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_steer_safe_point().await;
+        let emergency = loaded.executor.emergency_control_for_test();
+        assert!(matches!(
+            emergency.signal(
+                EmergencyControlTarget::Turn(turn_id),
+                EmergencyControlSignal::SecurityRevoked,
+            ),
+            EmergencyControlSignalOutcome::Accepted { .. }
+        ));
+        hooks.release_before_steer_safe_point();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        let live_state = loaded.executor.live_state_for_test().unwrap();
+        assert_eq!(
+            lock(&live_state)
+                .capture_conversation_views()
+                .unwrap()
+                .conversation()
+                .messages()
+                .len(),
+            1,
+            "the signaled candidate never enters live state"
+        );
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn emergency_signal_after_steer_resolution_drops_the_steer() {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["candidate"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        hooks.arm_before_steer_safe_point();
+        hooks.arm_after_steer_resolution();
+
+        let turn_id = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                PromptIntent::new(
+                    PromptBodyIntent::Text(TextIntent::new("resolve then revoke").unwrap()),
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        hooks.wait_before_steer_safe_point().await;
+        assert_eq!(
+            loaded
+                .executor
+                .steer(
+                    turn_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("must not apply").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Ok(())
+        );
+        hooks.release_before_steer_safe_point();
+        hooks.wait_after_steer_resolution().await;
+        let emergency = loaded.executor.emergency_control_for_test();
+        assert!(matches!(
+            emergency.signal(
+                EmergencyControlTarget::Turn(turn_id),
+                EmergencyControlSignal::SecurityRevoked,
+            ),
+            EmergencyControlSignalOutcome::Accepted { .. }
+        ));
+        hooks.release_after_steer_resolution();
+
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Failed(SessionTurnFailure::Model)
+        );
+        assert_eq!(model.request_count(), 1);
+        let recording = fs::read_to_string(store.session_path().join("conversation.jsonl"))
+            .expect("the scripted conversation recording is readable");
+        assert!(recording.contains(r#""disposition":"intermediate""#));
+        assert!(!recording.contains(r#""source":"steer""#));
+        close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
