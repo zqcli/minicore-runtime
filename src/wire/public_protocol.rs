@@ -15,30 +15,34 @@ use crate::prompt::{
 use crate::runtime_interface::{
     AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
     CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
-    CurrentTurnView, EventFrame, EventRoute, InteractionView, ItemContentView, ItemStatusView,
-    ItemView, NewSessionDefinition, NewSessionMetadata, Page, PageRequest, PublicCancelTarget,
-    PublicIngressLane, PublicSubject, QueryError, QueryErrorCode, QueryResponse, QueryResult,
-    QueuedFollowUpView, QueuedSteerView, RetryAdvice, RuntimeCapabilities, RuntimeCommand,
-    RuntimeDiagnosticView, RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand,
-    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot,
-    RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
-    SessionDefinitionSummary, SessionDiagnosticView, SessionEventDetail, SessionExecutionView,
-    SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
-    SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingState,
-    SessionRecordingView, SessionSnapshot, SessionStateEventKind, SessionSummary, SessionUsageView,
-    SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg, SubmitAdmissionStateView,
-    SubmitAdmissionView, SubscriptionRequest, SubscriptionScope, TurnCommand,
-    TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView, TurnStatusView,
-    TurnTerminalView, validate_command_error_contract, validate_command_error_message,
-    validate_command_output,
+    CurrentTurnView, EventFrame, EventRoute, InteractionCommand, InteractionView, ItemContentView,
+    ItemProgressContentKind, ItemStatusView, ItemView, ModelCallPurpose, NewSessionDefinition,
+    NewSessionMetadata, Page, PageRequest, ProgressEvent, ProgressEventKind, ProgressUpdate,
+    PublicCancelTarget, PublicIngressLane, PublicSubject, QueryError, QueryErrorCode,
+    QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
+    RuntimeCapabilities, RuntimeCommand, RuntimeDiagnosticView, RuntimeDispatchError,
+    RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
+    RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView,
+    RuntimeView, SessionCommand, SessionDefinitionSummary, SessionDiagnosticView,
+    SessionEventDetail, SessionExecutionView, SessionForkProvenanceView, SessionLifecycleView,
+    SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView, SessionReadinessView,
+    SessionRecordingState, SessionRecordingView, SessionSnapshot, SessionStateEventKind,
+    SessionSummary, SessionUsageView, SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg,
+    SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionClosed, SubscriptionRequest,
+    SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView,
+    TurnStatusView, TurnTerminalView, validate_command_error_contract,
+    validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
 use crate::tools::{
-    ToolApprovalOptionKindView, ToolApprovalOptionView, ToolApprovalRequestView,
-    ToolRequirementSummaryView, UserQuestionChoice, UserQuestionField, UserQuestionInput,
-    UserQuestionRequest,
+    ToolApprovalDecisionInput, ToolApprovalOptionKindView, ToolApprovalOptionView,
+    ToolApprovalRequestView, ToolCallId, ToolRequirementSummaryView, UserQuestionAnswer,
+    UserQuestionAnswerValue, UserQuestionChoice, UserQuestionField, UserQuestionFieldAnswer,
+    UserQuestionInput, UserQuestionRequest,
 };
-use crate::turn_item_interaction::{InteractionRequestView, UserMessageSource};
+use crate::turn_item_interaction::{
+    InteractionRequestView, InteractionResolutionInput, UserMessageSource,
+};
 use crate::workspace::{
     RequestedFilesystemAccess, WorkspaceCwdSpec, WorkspaceDefinitionInput,
     WorkspaceDefinitionSummaryView, WorkspaceRootInput, WorkspaceRootKey, WorkspaceRootSummaryView,
@@ -48,8 +52,8 @@ use crate::workspace::{
 use super::bounded_json::JsonNode;
 use super::limits::{CapabilityToken, ProtocolLimits, runtime_capability_from_token};
 use super::scalar::{
-    AgentId, AgentMetadataRevision, AgentRevision, CommandId, ItemId, PageCursor, RequestId,
-    SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId,
+    AgentId, AgentMetadataRevision, AgentRevision, CommandId, InteractionResolutionKey, ItemId,
+    PageCursor, RequestId, SessionDefinitionRevision, SessionId, SessionMetadataRevision, TurnId,
 };
 use super::typed_json::{
     PublicDecodeCode, PublicDecodeError, PublicDecodeStage, PublicJsonKind, TypedJsonError,
@@ -369,6 +373,8 @@ fn encode_event_frame(codec: &WireV1Codec, frame: &EventFrame) -> Result<Vec<u8>
         EventFrame::Snapshot(SnapshotResponse::Runtime(_)) => PublicJsonKind::RuntimeSnapshot,
         EventFrame::Snapshot(SnapshotResponse::Session(_)) => PublicJsonKind::SessionSnapshot,
         EventFrame::State(_) => PublicJsonKind::StateEvent,
+        EventFrame::Progress(_) => PublicJsonKind::ProgressEvent,
+        EventFrame::Closed(_) => PublicJsonKind::Response,
     };
     codec.encode(kind, &EventFrameOutput::from_semantic(frame))
 }
@@ -386,6 +392,7 @@ enum RuntimeCommandInput {
     Runtime(RuntimeLifecycleCommandInput),
     Session(SessionCommandInput),
     Turn(TurnCommandInput),
+    Interaction(InteractionCommandInput),
 }
 
 impl RuntimeCommandInput {
@@ -459,8 +466,133 @@ impl RuntimeCommandInput {
                     target: value.target.into_semantic(),
                 })
             }
+            Self::Interaction(InteractionCommandInput::Resolve(value)) => {
+                RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                    session_id: value.session_id,
+                    expected_turn_id: value.expected_turn_id,
+                    item_id: value.item_id,
+                    request_id: value.request_id,
+                    resolution: value.resolution.into_semantic()?,
+                    resolution_key: value.resolution_key,
+                })
+            }
         })
     }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionCommandInput {
+    Resolve(ResolveInteractionCommandInput),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveInteractionCommandInput {
+    session_id: SessionId,
+    expected_turn_id: TurnId,
+    item_id: ItemId,
+    request_id: RequestId,
+    resolution: InteractionResolutionCommandInput,
+    resolution_key: InteractionResolutionKey,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionResolutionCommandInput {
+    ToolApproval(ToolApprovalDecisionCommandInput),
+    UserAnswer(UserQuestionAnswerCommandInput),
+    Cancelled,
+}
+
+impl InteractionResolutionCommandInput {
+    fn into_semantic(self) -> Result<InteractionResolutionInput, TypedJsonError> {
+        Ok(match self {
+            Self::ToolApproval(value) => {
+                InteractionResolutionInput::ToolApproval(value.into_semantic())
+            }
+            Self::UserAnswer(value) => {
+                InteractionResolutionInput::UserAnswer(value.into_semantic()?)
+            }
+            Self::Cancelled => InteractionResolutionInput::Cancelled,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ToolApprovalDecisionCommandInput {
+    Allow(OptionIndexInput),
+    Deny,
+}
+
+impl ToolApprovalDecisionCommandInput {
+    const fn into_semantic(self) -> ToolApprovalDecisionInput {
+        match self {
+            Self::Allow(value) => ToolApprovalDecisionInput::Allow {
+                option_index: value.option_index,
+            },
+            Self::Deny => ToolApprovalDecisionInput::Deny,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OptionIndexInput {
+    option_index: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserQuestionAnswerCommandInput {
+    answers: Vec<UserQuestionFieldAnswerCommandInput>,
+}
+
+impl UserQuestionAnswerCommandInput {
+    fn into_semantic(self) -> Result<UserQuestionAnswer, TypedJsonError> {
+        UserQuestionAnswer::new(
+            self.answers
+                .into_iter()
+                .map(UserQuestionFieldAnswerCommandInput::into_semantic)
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserQuestionFieldAnswerCommandInput {
+    question_index: u32,
+    value: UserQuestionAnswerValueCommandInput,
+}
+
+impl UserQuestionFieldAnswerCommandInput {
+    fn into_semantic(self) -> Result<UserQuestionFieldAnswer, TypedJsonError> {
+        match self.value {
+            UserQuestionAnswerValueCommandInput::Text(text) => {
+                UserQuestionFieldAnswer::text(self.question_index, text.text)
+                    .map_err(|_| invalid_scalar())
+            }
+            UserQuestionAnswerValueCommandInput::Choice(value) => Ok(
+                UserQuestionFieldAnswer::choice(self.question_index, value.option_index),
+            ),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum UserQuestionAnswerValueCommandInput {
+    Text(TextValueInput),
+    Choice(OptionIndexInput),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TextValueInput {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -758,6 +890,8 @@ impl NewSessionMetadataInput {
 enum EventFrameInput {
     Snapshot(SnapshotResponseInput),
     State(StateEventInput),
+    Progress(ProgressEventInput),
+    Closed(SubscriptionClosedInput),
 }
 
 struct UnsupportedObservationInput;
@@ -778,7 +912,184 @@ impl EventFrameInput {
         Ok(match self {
             Self::Snapshot(snapshot) => EventFrame::Snapshot(snapshot.into_semantic(limits)?),
             Self::State(event) => EventFrame::State(event.into_semantic(limits)?),
+            Self::Progress(event) => EventFrame::Progress(event.into_semantic()?),
+            Self::Closed(reason) => EventFrame::Closed(reason.into_semantic()),
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressEventInput {
+    timestamp: Timestamp,
+    route: EventRouteInput,
+    kind: ProgressEventKindInput,
+    update: ProgressUpdateInput,
+}
+
+impl ProgressEventInput {
+    fn into_semantic(self) -> Result<ProgressEvent, TypedJsonError> {
+        ProgressEvent::new(
+            self.timestamp,
+            self.route.into_semantic()?,
+            self.kind.into_semantic(),
+            self.update.into_semantic()?,
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProgressEventKindInput {
+    Model,
+    Tool,
+    Compaction,
+    Retry,
+}
+
+impl ProgressEventKindInput {
+    const fn into_semantic(self) -> ProgressEventKind {
+        match self {
+            Self::Model => ProgressEventKind::Model,
+            Self::Tool => ProgressEventKind::Tool,
+            Self::Compaction => ProgressEventKind::Compaction,
+            Self::Retry => ProgressEventKind::Retry,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ProgressUpdateInput {
+    ItemStarted(ItemStartedProgressInput),
+    ItemDelta(ItemDeltaProgressInput),
+    ToolOutputDelta(ToolOutputDeltaProgressInput),
+    ModelRetryScheduled(ModelRetryScheduledInput),
+    OperationStatus(OperationStatusInput),
+}
+
+impl ProgressUpdateInput {
+    fn into_semantic(self) -> Result<ProgressUpdate, TypedJsonError> {
+        Ok(match self {
+            Self::ItemStarted(value) => ProgressUpdate::item_started(
+                value.item_id,
+                value.content_index,
+                value.content_kind.into_semantic(),
+            ),
+            Self::ItemDelta(value) => ProgressUpdate::item_delta(
+                value.item_id,
+                value.content_index,
+                value.content_kind.into_semantic(),
+                value.delta,
+            )
+            .map_err(|_| invalid_scalar())?,
+            Self::ToolOutputDelta(value) => ProgressUpdate::tool_output_delta(
+                value.item_id,
+                value
+                    .tool_call_id
+                    .parse::<ToolCallId>()
+                    .map_err(|_| invalid_scalar())?,
+                value.delta,
+            )
+            .map_err(|_| invalid_scalar())?,
+            Self::ModelRetryScheduled(value) => ProgressUpdate::model_retry_scheduled(
+                value.purpose.into_semantic(),
+                value.retry_count,
+                value.ready_at,
+            ),
+            Self::OperationStatus(value) => {
+                ProgressUpdate::operation_status(value.message).map_err(|_| invalid_scalar())?
+            }
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemStartedProgressInput {
+    item_id: ItemId,
+    content_index: u32,
+    content_kind: ItemProgressContentKindInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemDeltaProgressInput {
+    item_id: ItemId,
+    content_index: u32,
+    content_kind: ItemProgressContentKindInput,
+    delta: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemProgressContentKindInput {
+    AssistantText,
+    Reasoning,
+}
+
+impl ItemProgressContentKindInput {
+    const fn into_semantic(self) -> ItemProgressContentKind {
+        match self {
+            Self::AssistantText => ItemProgressContentKind::AssistantText,
+            Self::Reasoning => ItemProgressContentKind::Reasoning,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolOutputDeltaProgressInput {
+    item_id: ItemId,
+    tool_call_id: String,
+    delta: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRetryScheduledInput {
+    purpose: ModelCallPurposeInput,
+    retry_count: u8,
+    ready_at: Timestamp,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelCallPurposeInput {
+    AgentRun,
+    CompactionSummary,
+}
+
+impl ModelCallPurposeInput {
+    const fn into_semantic(self) -> ModelCallPurpose {
+        match self {
+            Self::AgentRun => ModelCallPurpose::AgentRun,
+            Self::CompactionSummary => ModelCallPurpose::CompactionSummary,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct OperationStatusInput {
+    message: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SubscriptionClosedInput {
+    Backpressure,
+    RuntimeClosing,
+    PublisherRestarted,
+}
+
+impl SubscriptionClosedInput {
+    const fn into_semantic(self) -> SubscriptionClosed {
+        match self {
+            Self::Backpressure => SubscriptionClosed::Backpressure,
+            Self::RuntimeClosing => SubscriptionClosed::RuntimeClosing,
+            Self::PublisherRestarted => SubscriptionClosed::PublisherRestarted,
+        }
     }
 }
 
@@ -2136,6 +2447,8 @@ impl TurnFailureInput {
 enum EventFrameOutput<'a> {
     Snapshot(SnapshotResponseOutput<'a>),
     State(StateEventOutput<'a>),
+    Progress(ProgressEventOutput<'a>),
+    Closed(SubscriptionClosedOutput),
 }
 
 impl<'a> EventFrameOutput<'a> {
@@ -2145,6 +2458,198 @@ impl<'a> EventFrameOutput<'a> {
                 Self::Snapshot(SnapshotResponseOutput::from_semantic(snapshot))
             }
             EventFrame::State(event) => Self::State(StateEventOutput::from_semantic(event)),
+            EventFrame::Progress(event) => {
+                Self::Progress(ProgressEventOutput::from_semantic(event))
+            }
+            EventFrame::Closed(reason) => {
+                Self::Closed(SubscriptionClosedOutput::from_semantic(*reason))
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProgressEventOutput<'a> {
+    timestamp: Timestamp,
+    route: EventRouteOutput,
+    kind: ProgressEventKindOutput,
+    update: ProgressUpdateOutput<'a>,
+}
+
+impl<'a> ProgressEventOutput<'a> {
+    fn from_semantic(value: &'a ProgressEvent) -> Self {
+        Self {
+            timestamp: value.timestamp(),
+            route: EventRouteOutput::from_semantic(value.route()),
+            kind: ProgressEventKindOutput::from_semantic(value.kind()),
+            update: ProgressUpdateOutput::from_semantic(value.update()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProgressEventKindOutput {
+    Model,
+    Tool,
+    Compaction,
+    Retry,
+}
+
+impl ProgressEventKindOutput {
+    const fn from_semantic(value: ProgressEventKind) -> Self {
+        match value {
+            ProgressEventKind::Model => Self::Model,
+            ProgressEventKind::Tool => Self::Tool,
+            ProgressEventKind::Compaction => Self::Compaction,
+            ProgressEventKind::Retry => Self::Retry,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ProgressUpdateOutput<'a> {
+    ItemStarted(ItemStartedProgressOutput),
+    ItemDelta(ItemDeltaProgressOutput<'a>),
+    ToolOutputDelta(ToolOutputDeltaProgressOutput<'a>),
+    ModelRetryScheduled(ModelRetryScheduledOutput),
+    OperationStatus(OperationStatusOutput<'a>),
+}
+
+impl<'a> ProgressUpdateOutput<'a> {
+    fn from_semantic(value: &'a ProgressUpdate) -> Self {
+        match value {
+            ProgressUpdate::ItemStarted {
+                item_id,
+                content_index,
+                content_kind,
+            } => Self::ItemStarted(ItemStartedProgressOutput {
+                item_id: *item_id,
+                content_index: *content_index,
+                content_kind: ItemProgressContentKindOutput::from_semantic(*content_kind),
+            }),
+            ProgressUpdate::ItemDelta {
+                item_id,
+                content_index,
+                content_kind,
+                delta,
+            } => Self::ItemDelta(ItemDeltaProgressOutput {
+                item_id: *item_id,
+                content_index: *content_index,
+                content_kind: ItemProgressContentKindOutput::from_semantic(*content_kind),
+                delta,
+            }),
+            ProgressUpdate::ToolOutputDelta {
+                item_id,
+                tool_call_id,
+                delta,
+            } => Self::ToolOutputDelta(ToolOutputDeltaProgressOutput {
+                item_id: *item_id,
+                tool_call_id: tool_call_id.as_str(),
+                delta,
+            }),
+            ProgressUpdate::ModelRetryScheduled {
+                purpose,
+                retry_count,
+                ready_at,
+            } => Self::ModelRetryScheduled(ModelRetryScheduledOutput {
+                purpose: ModelCallPurposeOutput::from_semantic(*purpose),
+                retry_count: *retry_count,
+                ready_at: *ready_at,
+            }),
+            ProgressUpdate::OperationStatus { message } => {
+                Self::OperationStatus(OperationStatusOutput { message })
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemStartedProgressOutput {
+    item_id: ItemId,
+    content_index: u32,
+    content_kind: ItemProgressContentKindOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ItemDeltaProgressOutput<'a> {
+    item_id: ItemId,
+    content_index: u32,
+    content_kind: ItemProgressContentKindOutput,
+    delta: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ItemProgressContentKindOutput {
+    AssistantText,
+    Reasoning,
+}
+
+impl ItemProgressContentKindOutput {
+    const fn from_semantic(value: ItemProgressContentKind) -> Self {
+        match value {
+            ItemProgressContentKind::AssistantText => Self::AssistantText,
+            ItemProgressContentKind::Reasoning => Self::Reasoning,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolOutputDeltaProgressOutput<'a> {
+    item_id: ItemId,
+    tool_call_id: &'a str,
+    delta: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRetryScheduledOutput {
+    purpose: ModelCallPurposeOutput,
+    retry_count: u8,
+    ready_at: Timestamp,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ModelCallPurposeOutput {
+    AgentRun,
+    CompactionSummary,
+}
+
+impl ModelCallPurposeOutput {
+    const fn from_semantic(value: ModelCallPurpose) -> Self {
+        match value {
+            ModelCallPurpose::AgentRun => Self::AgentRun,
+            ModelCallPurpose::CompactionSummary => Self::CompactionSummary,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct OperationStatusOutput<'a> {
+    message: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SubscriptionClosedOutput {
+    Backpressure,
+    RuntimeClosing,
+    PublisherRestarted,
+}
+
+impl SubscriptionClosedOutput {
+    const fn from_semantic(value: SubscriptionClosed) -> Self {
+        match value {
+            SubscriptionClosed::Backpressure => Self::Backpressure,
+            SubscriptionClosed::RuntimeClosing => Self::RuntimeClosing,
+            SubscriptionClosed::PublisherRestarted => Self::PublisherRestarted,
         }
     }
 }
@@ -3571,6 +4076,7 @@ enum RuntimeCommandOutput<'a> {
     Runtime(RuntimeLifecycleCommandOutput),
     Session(SessionCommandOutput<'a>),
     Turn(TurnCommandOutput<'a>),
+    Interaction(InteractionCommandOutput<'a>),
 }
 
 impl<'a> RuntimeCommandOutput<'a> {
@@ -3656,8 +4162,138 @@ impl<'a> RuntimeCommandOutput<'a> {
                     target: PublicCancelTargetOutput::from_semantic(*target),
                 }))
             }
+            RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                session_id,
+                expected_turn_id,
+                item_id,
+                request_id,
+                resolution,
+                resolution_key,
+            }) => Self::Interaction(InteractionCommandOutput::Resolve(
+                ResolveInteractionCommandOutput {
+                    session_id: *session_id,
+                    expected_turn_id: *expected_turn_id,
+                    item_id: *item_id,
+                    request_id: *request_id,
+                    resolution: InteractionResolutionCommandOutput::from_semantic(resolution),
+                    resolution_key: resolution_key.clone(),
+                },
+            )),
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionCommandOutput<'a> {
+    Resolve(ResolveInteractionCommandOutput<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveInteractionCommandOutput<'a> {
+    session_id: SessionId,
+    expected_turn_id: TurnId,
+    item_id: ItemId,
+    request_id: RequestId,
+    resolution: InteractionResolutionCommandOutput<'a>,
+    resolution_key: InteractionResolutionKey,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum InteractionResolutionCommandOutput<'a> {
+    ToolApproval(ToolApprovalDecisionCommandOutput),
+    UserAnswer(UserQuestionAnswerCommandOutput<'a>),
+    Cancelled,
+}
+
+impl<'a> InteractionResolutionCommandOutput<'a> {
+    fn from_semantic(value: &'a InteractionResolutionInput) -> Self {
+        match value {
+            InteractionResolutionInput::ToolApproval(value) => {
+                Self::ToolApproval(ToolApprovalDecisionCommandOutput::from_semantic(*value))
+            }
+            InteractionResolutionInput::UserAnswer(value) => {
+                Self::UserAnswer(UserQuestionAnswerCommandOutput {
+                    answers: value
+                        .answers()
+                        .iter()
+                        .map(UserQuestionFieldAnswerCommandOutput::from_semantic)
+                        .collect(),
+                })
+            }
+            InteractionResolutionInput::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ToolApprovalDecisionCommandOutput {
+    Allow(OptionIndexOutput),
+    Deny,
+}
+
+impl ToolApprovalDecisionCommandOutput {
+    const fn from_semantic(value: ToolApprovalDecisionInput) -> Self {
+        match value {
+            ToolApprovalDecisionInput::Allow { option_index } => {
+                Self::Allow(OptionIndexOutput { option_index })
+            }
+            ToolApprovalDecisionInput::Deny => Self::Deny,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OptionIndexOutput {
+    option_index: u32,
+}
+
+#[derive(Serialize)]
+struct UserQuestionAnswerCommandOutput<'a> {
+    answers: Vec<UserQuestionFieldAnswerCommandOutput<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserQuestionFieldAnswerCommandOutput<'a> {
+    question_index: u32,
+    value: UserQuestionAnswerValueCommandOutput<'a>,
+}
+
+impl<'a> UserQuestionFieldAnswerCommandOutput<'a> {
+    fn from_semantic(value: &'a UserQuestionFieldAnswer) -> Self {
+        Self {
+            question_index: value.question_index(),
+            value: UserQuestionAnswerValueCommandOutput::from_semantic(value.value()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum UserQuestionAnswerValueCommandOutput<'a> {
+    Text(TextValueOutput<'a>),
+    Choice(OptionIndexOutput),
+}
+
+impl<'a> UserQuestionAnswerValueCommandOutput<'a> {
+    fn from_semantic(value: &'a UserQuestionAnswerValue) -> Self {
+        match value {
+            UserQuestionAnswerValue::Text(text) => Self::Text(TextValueOutput { text }),
+            UserQuestionAnswerValue::Choice { option_index } => Self::Choice(OptionIndexOutput {
+                option_index: *option_index,
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct TextValueOutput<'a> {
+    text: &'a str,
 }
 
 #[derive(Serialize)]
@@ -4078,10 +4714,12 @@ struct CommandOutputInput {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
+    SessionDefinitionUpdated(SessionDefinitionUpdatedInput),
     SessionForked(SessionForkedInput),
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
+    InteractionResolved,
     TurnStarted(TurnIdInput),
     SubmitCancelled,
     SteerQueued(TurnIdInput),
@@ -4095,6 +4733,9 @@ enum CommandOutcomeInput {
 impl CommandOutcomeInput {
     const fn into_semantic(self) -> CommandOutcome {
         match self {
+            Self::SessionDefinitionUpdated(value) => CommandOutcome::SessionDefinitionUpdated {
+                definition_revision: value.definition_revision,
+            },
             Self::SessionForked(value) => CommandOutcome::SessionForked {
                 session_id: value.session_id,
                 source: value.source.into_semantic(),
@@ -4102,6 +4743,7 @@ impl CommandOutcomeInput {
             Self::SessionArchived => CommandOutcome::SessionArchived,
             Self::SessionUnarchived => CommandOutcome::SessionUnarchived,
             Self::SessionDeleted => CommandOutcome::SessionDeleted,
+            Self::InteractionResolved => CommandOutcome::InteractionResolved,
             Self::TurnStarted(value) => CommandOutcome::TurnStarted {
                 turn_id: value.turn_id,
             },
@@ -4119,6 +4761,12 @@ impl CommandOutcomeInput {
             Self::NoChange => CommandOutcome::NoChange,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionDefinitionUpdatedInput {
+    definition_revision: SessionDefinitionRevision,
 }
 
 #[derive(Deserialize)]
@@ -4464,10 +5112,12 @@ struct CommandOutputOutput<'a> {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
+    SessionDefinitionUpdated(SessionDefinitionUpdatedOutput),
     SessionForked(SessionForkedOutput),
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
+    InteractionResolved,
     TurnStarted(TurnIdOutput),
     SubmitCancelled,
     SteerQueued(TurnIdOutput),
@@ -4481,6 +5131,11 @@ enum CommandOutcomeOutput {
 impl CommandOutcomeOutput {
     fn from_semantic(value: &CommandOutcome) -> Self {
         match value {
+            CommandOutcome::SessionDefinitionUpdated {
+                definition_revision,
+            } => Self::SessionDefinitionUpdated(SessionDefinitionUpdatedOutput {
+                definition_revision: *definition_revision,
+            }),
             CommandOutcome::SessionForked { session_id, source } => {
                 Self::SessionForked(SessionForkedOutput {
                     session_id: *session_id,
@@ -4490,6 +5145,7 @@ impl CommandOutcomeOutput {
             CommandOutcome::SessionArchived => Self::SessionArchived,
             CommandOutcome::SessionUnarchived => Self::SessionUnarchived,
             CommandOutcome::SessionDeleted => Self::SessionDeleted,
+            CommandOutcome::InteractionResolved => Self::InteractionResolved,
             CommandOutcome::TurnStarted { turn_id } => {
                 Self::TurnStarted(TurnIdOutput { turn_id: *turn_id })
             }
@@ -4510,6 +5166,12 @@ impl CommandOutcomeOutput {
             CommandOutcome::NoChange => Self::NoChange,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionDefinitionUpdatedOutput {
+    definition_revision: SessionDefinitionRevision,
 }
 
 #[derive(Serialize)]
@@ -5717,8 +6379,14 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
         | "agent_metadata_updated"
         | "agent_status_changed"
         | "session_created"
-        | "session_definition_updated"
         | "session_metadata_updated" => pending_output_object(data),
+        "session_definition_updated" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_revision::<SessionDefinitionRevision>(required(object, "definitionRevision")?)
+        }
         "session_forked" => {
             let object = data
                 .ok_or_else(missing_required_field)?
@@ -5747,12 +6415,15 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 Ok(())
             }
         }
-        "agent_deleted"
-        | "session_loaded"
-        | "session_unloaded"
-        | "runtime_reloaded"
-        | "workspace_reloaded"
-        | "interaction_resolved" => pending_output_unit(data),
+        "agent_deleted" | "session_loaded" | "session_unloaded" | "runtime_reloaded"
+        | "workspace_reloaded" => pending_output_unit(data),
+        "interaction_resolved" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
         "submit_cancelled" | "follow_up_queued" | "queued_message_cancelled" => {
             if data.is_some() {
                 Err(selected_wrong_json_type())
@@ -6019,6 +6690,14 @@ fn validate_event_frame_semantic_limits(
                 }
             }
         }
+        EventFrame::Progress(event) => {
+            if event.has_valid_contract() {
+                Ok(())
+            } else {
+                Err(invalid_scalar())
+            }
+        }
+        EventFrame::Closed(_) => Ok(()),
     }
 }
 
@@ -6033,7 +6712,7 @@ fn validate_event_frame_shape(
         "state" => validate_state_event_shape(data.ok_or_else(missing_required_field)?, limits),
         "progress" => {
             validate_progress_event_shape(data.ok_or_else(missing_required_field)?)?;
-            Err(TypedJsonError::PendingPublicTarget)
+            Ok(())
         }
         "closed" => {
             let reason = data
@@ -6046,7 +6725,7 @@ fn validate_event_frame_shape(
             ) {
                 return Err(unknown_output_variant());
             }
-            Err(TypedJsonError::PendingPublicTarget)
+            Ok(())
         }
         _ => Err(unknown_output_variant()),
     })
@@ -7045,28 +7724,90 @@ fn validate_progress_event_shape(node: &JsonNode) -> Result<(), TypedJsonError> 
         .ok_or_else(typed_wrong_json_type)?
         .parse::<Timestamp>()
         .map_err(|_| invalid_scalar())?;
-    validate_event_route(required(object, "route")?)?;
+    let route = validate_event_route(required(object, "route")?)?;
     match required(object, "kind")?.as_str() {
         Some("model") | Some("tool") | Some("compaction") | Some("retry") => {}
         Some(_) => return Err(unknown_output_variant()),
         None => return Err(typed_wrong_json_type()),
     }
     validate_adjacent_output(required(object, "update")?, |kind, data| {
-        if !matches!(
-            kind,
-            "item_started"
-                | "item_delta"
-                | "tool_output_delta"
-                | "model_retry_scheduled"
-                | "operation_status"
-        ) {
-            return Err(unknown_output_variant());
-        }
-        data.ok_or_else(missing_required_field)?
+        let object = data
+            .ok_or_else(missing_required_field)?
             .as_object()
             .ok_or_else(selected_wrong_json_type)?;
-        Ok(())
+        match kind {
+            "item_started" | "item_delta" => {
+                if route.family != EventRouteFamily::Item {
+                    return Err(invalid_scalar());
+                }
+                validate_id::<ItemId>(required(object, "itemId")?)?;
+                validate_u32(required(object, "contentIndex")?)?;
+                match required(object, "contentKind")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?
+                {
+                    "assistant_text" | "reasoning" => {}
+                    _ => return Err(unknown_output_variant()),
+                }
+                if kind == "item_delta" {
+                    required(object, "delta")?
+                        .as_str()
+                        .ok_or_else(typed_wrong_json_type)?;
+                }
+                Ok(())
+            }
+            "tool_output_delta" => {
+                if route.family != EventRouteFamily::Item {
+                    return Err(invalid_scalar());
+                }
+                validate_id::<ItemId>(required(object, "itemId")?)?;
+                required(object, "toolCallId")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?
+                    .parse::<ToolCallId>()
+                    .map_err(|_| invalid_scalar())?;
+                required(object, "delta")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?;
+                Ok(())
+            }
+            "model_retry_scheduled" => {
+                match required(object, "purpose")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?
+                {
+                    "agent_run" | "compaction_summary" => {}
+                    _ => return Err(unknown_output_variant()),
+                }
+                validate_u8(required(object, "retryCount")?)?;
+                required(object, "readyAt")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?
+                    .parse::<Timestamp>()
+                    .map_err(|_| invalid_scalar())?;
+                Ok(())
+            }
+            "operation_status" => {
+                required(object, "message")?
+                    .as_str()
+                    .ok_or_else(typed_wrong_json_type)?;
+                Ok(())
+            }
+            _ => Err(unknown_output_variant()),
+        }
     })
+}
+
+fn validate_u8(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let literal = node
+        .as_number()
+        .map(|number| number.raw())
+        .ok_or_else(typed_wrong_json_type)?;
+    if literal.bytes().all(|byte| byte.is_ascii_digit()) && literal.parse::<u8>().is_ok() {
+        Ok(())
+    } else {
+        Err(invalid_scalar())
+    }
 }
 
 fn validate_snapshot_semantic_limits(
@@ -7170,7 +7911,9 @@ fn validate_command_request_shape(
                 "delete",
             ],
         ),
-        "interaction" => validate_pending_command_family(data, &["resolve"]),
+        "interaction" => {
+            validate_interaction_command(data.ok_or_else(missing_required_field)?, limits)
+        }
         "command_surface" => {
             validate_pending_command_family(data, &["execute_text", "execute_catalog"])
         }
@@ -7553,6 +8296,116 @@ fn validate_cancel_command(node: &JsonNode) -> Result<(), TypedJsonError> {
         "turn" => validate_id::<TurnId>(data.ok_or_else(missing_required_field)?),
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_interaction_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "resolve" => {
+            let object = input_object(data.ok_or_else(missing_required_field)?)?;
+            reject_unknown_fields(
+                object.keys().map(AsRef::as_ref),
+                &[
+                    "sessionId",
+                    "expectedTurnId",
+                    "itemId",
+                    "requestId",
+                    "resolution",
+                    "resolutionKey",
+                ],
+            )?;
+            validate_id::<SessionId>(required(object, "sessionId")?)?;
+            validate_id::<TurnId>(required(object, "expectedTurnId")?)?;
+            validate_id::<ItemId>(required(object, "itemId")?)?;
+            validate_id::<RequestId>(required(object, "requestId")?)?;
+            validate_id::<InteractionResolutionKey>(required(object, "resolutionKey")?)?;
+            validate_interaction_resolution(required(object, "resolution")?, limits)
+        }
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_interaction_resolution(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "cancelled" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "tool_approval" => validate_adjacent_input(
+            data.ok_or_else(missing_required_field)?,
+            |decision, data| match decision {
+                "allow" => {
+                    let object = input_object(data.ok_or_else(missing_required_field)?)?;
+                    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["optionIndex"])?;
+                    validate_u32(required(object, "optionIndex")?)
+                }
+                "deny" => {
+                    if data.is_some() {
+                        Err(selected_wrong_json_type())
+                    } else {
+                        Ok(())
+                    }
+                }
+                _ => Err(unknown_input_variant()),
+            },
+        ),
+        "user_answer" => {
+            let object = input_object(data.ok_or_else(missing_required_field)?)?;
+            reject_unknown_fields(object.keys().map(AsRef::as_ref), &["answers"])?;
+            let answers = required(object, "answers")?
+                .as_array()
+                .ok_or_else(selected_wrong_json_type)?;
+            if answers.len() > usize::from(limits.interaction.max_interaction_questions) {
+                return Err(invalid_scalar());
+            }
+            for answer in answers {
+                let answer = input_object(answer)?;
+                reject_unknown_fields(
+                    answer.keys().map(AsRef::as_ref),
+                    &["questionIndex", "value"],
+                )?;
+                validate_u32(required(answer, "questionIndex")?)?;
+                validate_adjacent_input(required(answer, "value")?, |kind, data| match kind {
+                    "text" => {
+                        let object = input_object(data.ok_or_else(missing_required_field)?)?;
+                        reject_unknown_fields(object.keys().map(AsRef::as_ref), &["text"])?;
+                        required(object, "text")?
+                            .as_str()
+                            .ok_or_else(typed_wrong_json_type)
+                            .map(|_| ())
+                    }
+                    "choice" => {
+                        let object = input_object(data.ok_or_else(missing_required_field)?)?;
+                        reject_unknown_fields(object.keys().map(AsRef::as_ref), &["optionIndex"])?;
+                        validate_u32(required(object, "optionIndex")?)
+                    }
+                    _ => Err(unknown_input_variant()),
+                })?;
+            }
+            Ok(())
+        }
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_u32(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let literal = node
+        .as_number()
+        .map(|number| number.raw())
+        .ok_or_else(typed_wrong_json_type)?;
+    if literal.bytes().all(|byte| byte.is_ascii_digit()) && literal.parse::<u32>().is_ok() {
+        Ok(())
+    } else {
+        Err(invalid_scalar())
+    }
 }
 
 fn validate_pending_command_family(

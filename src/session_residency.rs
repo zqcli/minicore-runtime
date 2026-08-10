@@ -52,11 +52,15 @@ use crate::session_execution::{
     LoadedSessionConversation, SessionCancelError, SessionCancelTarget, SessionExecutor,
     SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorSnapshot,
     SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
-    SessionFollowUpError, SessionQueuedMessageError, SessionSteerError, SessionSubmitError,
-    SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
+    SessionFollowUpError, SessionInteractionError, SessionQueuedMessageError, SessionSteerError,
+    SessionSubmitError, SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
 };
 use crate::tools::ToolSet;
-use crate::wire::{CommandId, SessionDefinitionRevision, SessionId, Timestamp, TurnId};
+use crate::turn_item_interaction::InteractionResolutionInput;
+use crate::wire::{
+    CommandId, InteractionResolutionKey, ItemId, RequestId, SessionDefinitionRevision, SessionId,
+    Timestamp, TurnId,
+};
 use crate::workspace::{
     Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshotFinishError,
 };
@@ -188,6 +192,35 @@ pub(crate) enum SessionResidencySubmitError {
     Unauthorized,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyInteractionError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("the expected Turn does not match the Interaction owner")]
+    ExpectedTurnMismatch,
+    #[error("interaction was not found")]
+    NotFound,
+    #[error("interaction resolution family does not match the pending request")]
+    FamilyMismatch,
+    #[error("interaction resolution is invalid for the pending request")]
+    InvalidResolution,
+    #[error("interaction was already resolved by another logical action")]
+    AlreadyResolved,
+    #[error("interaction resolution conflicts with an existing command")]
+    CommandConflict,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionInteractionTarget {
+    pub(crate) expected_turn_id: TurnId,
+    pub(crate) item_id: ItemId,
+    pub(crate) request_id: RequestId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -2031,6 +2064,55 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::SecurityRevoked => SessionResidencySubmitError::Unauthorized,
                 SessionSubmitError::InternalDispatchUnavailable => {
                     SessionResidencySubmitError::InternalDispatchUnavailable
+                }
+            })
+    }
+
+    pub(crate) async fn resolve_interaction(
+        &self,
+        session_id: SessionId,
+        target: SessionInteractionTarget,
+        resolution_key: InteractionResolutionKey,
+        resolution: InteractionResolutionInput,
+        timestamp: Timestamp,
+    ) -> Result<(), SessionResidencyInteractionError> {
+        if self.closing.is_cancelled() {
+            return Err(SessionResidencyInteractionError::Closing);
+        }
+        let executor = self
+            .shared
+            .executor(session_id)
+            .ok_or(SessionResidencyInteractionError::SessionNotLoaded)?;
+        executor
+            .resolve_interaction(
+                target.expected_turn_id,
+                target.item_id,
+                target.request_id,
+                resolution_key,
+                resolution,
+                timestamp,
+            )
+            .await
+            .map_err(|error| match error {
+                SessionInteractionError::Closing => SessionResidencyInteractionError::Closing,
+                SessionInteractionError::ExpectedTurnMismatch => {
+                    SessionResidencyInteractionError::ExpectedTurnMismatch
+                }
+                SessionInteractionError::NotFound => SessionResidencyInteractionError::NotFound,
+                SessionInteractionError::FamilyMismatch => {
+                    SessionResidencyInteractionError::FamilyMismatch
+                }
+                SessionInteractionError::InvalidResolution => {
+                    SessionResidencyInteractionError::InvalidResolution
+                }
+                SessionInteractionError::AlreadyResolved => {
+                    SessionResidencyInteractionError::AlreadyResolved
+                }
+                SessionInteractionError::CommandConflict => {
+                    SessionResidencyInteractionError::CommandConflict
+                }
+                SessionInteractionError::InternalDispatchUnavailable => {
+                    SessionResidencyInteractionError::InternalDispatchUnavailable
                 }
             })
     }

@@ -38,6 +38,7 @@ use crate::durable_state::{
     DurableSessionDefinitionOutcome, DurableState,
 };
 use crate::live_conversation::{
+    HostInteractionResolutionApplyOutcome, HostInteractionResolutionError,
     InteractionRequestCandidate, InteractionResolutionApplyOutcome, InteractionResolutionCandidate,
     LiveSessionState,
 };
@@ -68,7 +69,7 @@ use crate::turn_execution_context::{
 };
 use crate::turn_item_interaction::{
     AssistantDisposition, InteractionCancelReason, InteractionRequest, InteractionRequestView,
-    ResolvedInteraction, UserMessageSource,
+    InteractionResolutionInput, ResolvedInteraction, UserMessageSource,
 };
 use crate::wire::{
     CommandId, CurrencyCode, IdGenerationError, InteractionResolutionKey, ItemId, Money,
@@ -554,8 +555,16 @@ pub(crate) enum SessionInteractionError {
     Closing,
     #[error("interaction is not pending")]
     NotFound,
+    #[error("the expected Turn does not match the Interaction owner")]
+    ExpectedTurnMismatch,
+    #[error("interaction resolution family does not match the pending request")]
+    FamilyMismatch,
     #[error("interaction resolution is invalid for the pending request")]
     InvalidResolution,
+    #[error("interaction was already resolved by another logical action")]
+    AlreadyResolved,
+    #[error("interaction resolution conflicts with an existing command")]
+    CommandConflict,
     #[error("session interaction dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -1325,13 +1334,19 @@ impl SessionExecutor {
 
     pub(crate) async fn resolve_interaction(
         &self,
+        expected_turn_id: TurnId,
+        item_id: ItemId,
         request_id: RequestId,
-        resolution: ResolvedInteraction,
+        resolution_key: InteractionResolutionKey,
+        resolution: InteractionResolutionInput,
         timestamp: Timestamp,
     ) -> Result<(), SessionInteractionError> {
         let (response, waiter) = oneshot::channel();
         let mut request = SessionExecutorRequest::ResolveInteraction(ResolveInteractionRequest {
+            expected_turn_id,
+            item_id,
             request_id,
+            resolution_key,
             resolution: Some(resolution),
             timestamp,
             response: Some(response),
@@ -2440,28 +2455,47 @@ impl SessionExecutorActor {
         let Some(resolution) = request.resolution.take() else {
             return Err(ActorFatality::Integrity);
         };
-        if !self.pending_interactions.contains_key(&request.request_id) {
-            request.settle(Err(SessionInteractionError::NotFound));
-            return Ok(());
-        }
-        let resolution_for_worker = resolution.clone_for_owner();
-        let key = InteractionResolutionKey::generate().map_err(|_| ActorFatality::Internal)?;
-        let candidate = InteractionResolutionCandidate::host(request.request_id, key, resolution)
-            .map_err(|_| ActorFatality::Integrity)?;
         let Some(conversation) = self.conversation.as_ref() else {
             return Err(ActorFatality::Integrity);
         };
-        let apply = lock(&conversation.live_state)
-            .apply_interaction_resolution(candidate, request.timestamp)
-            .map_err(|_| SessionInteractionError::InvalidResolution);
-        let fact = match apply {
-            Ok(InteractionResolutionApplyOutcome::Applied(fact)) => fact,
-            Ok(InteractionResolutionApplyOutcome::Idempotent { .. }) => {
-                request.settle(Err(SessionInteractionError::NotFound));
+        let apply = lock(&conversation.live_state).apply_host_interaction_resolution(
+            request.request_id,
+            request.expected_turn_id,
+            request.item_id,
+            request.resolution_key.clone(),
+            resolution,
+            request.timestamp,
+        );
+        let (fact, resolution_for_worker) = match apply {
+            Ok(HostInteractionResolutionApplyOutcome::Applied { fact, resolution }) => {
+                (fact, resolution)
+            }
+            Ok(HostInteractionResolutionApplyOutcome::Idempotent) => {
+                request.settle(Ok(()));
                 return Ok(());
             }
             Err(error) => {
-                request.settle(Err(error));
+                request.settle(Err(match error {
+                    HostInteractionResolutionError::NotFound => SessionInteractionError::NotFound,
+                    HostInteractionResolutionError::ExpectedTurnMismatch => {
+                        SessionInteractionError::ExpectedTurnMismatch
+                    }
+                    HostInteractionResolutionError::FamilyMismatch => {
+                        SessionInteractionError::FamilyMismatch
+                    }
+                    HostInteractionResolutionError::InvalidResolution => {
+                        SessionInteractionError::InvalidResolution
+                    }
+                    HostInteractionResolutionError::AlreadyResolved => {
+                        SessionInteractionError::AlreadyResolved
+                    }
+                    HostInteractionResolutionError::CommandConflict => {
+                        SessionInteractionError::CommandConflict
+                    }
+                    HostInteractionResolutionError::Internal => {
+                        SessionInteractionError::InternalDispatchUnavailable
+                    }
+                }));
                 return Ok(());
             }
         };
@@ -2470,7 +2504,9 @@ impl SessionExecutorActor {
             .pending_interactions
             .remove(&request.request_id)
             .ok_or(ActorFatality::Internal)?;
-        let _ = active.item_id;
+        if active.turn_id != request.expected_turn_id || active.item_id != request.item_id {
+            return Err(ActorFatality::Integrity);
+        }
         self.publish_pending_interactions()?;
         let _ = active.resolution_sender.send(resolution_for_worker);
         request.settle(Ok(()));
@@ -5597,8 +5633,11 @@ impl Drop for CancelQueuedMessageRequest {
 }
 
 struct ResolveInteractionRequest {
+    expected_turn_id: TurnId,
+    item_id: ItemId,
     request_id: RequestId,
-    resolution: Option<ResolvedInteraction>,
+    resolution_key: InteractionResolutionKey,
+    resolution: Option<InteractionResolutionInput>,
     timestamp: Timestamp,
     response: Option<oneshot::Sender<Result<(), SessionInteractionError>>>,
 }
@@ -8961,21 +9000,61 @@ mod tests {
         assert_eq!(pending.public_pending_interactions().len(), 1);
         assert_eq!(pending.active_items().len(), 2);
 
-        let resolution = interaction_request
-            .resolve_host(
-                crate::turn_item_interaction::InteractionHostResolutionInput::ToolApproval(
-                    crate::tools::ToolApprovalDecisionInput::Deny,
-                ),
-            )
-            .unwrap();
+        let resolution_key: InteractionResolutionKey =
+            "irk_77777777777777777777777777777777".parse().unwrap();
+        let live_state = executor.live_state_for_test().unwrap();
+        lock(&live_state).script_entry_id_candidates([Err(())]);
+        assert_eq!(
+            executor
+                .resolve_interaction(
+                    turn_id,
+                    *pending.pending_interactions()[0].item_id(),
+                    request_id,
+                    resolution_key.clone(),
+                    InteractionResolutionInput::ToolApproval(
+                        crate::tools::ToolApprovalDecisionInput::Deny,
+                    ),
+                    "2026-08-08T09:59:59.999Z".parse().unwrap(),
+                )
+                .await,
+            Err(SessionInteractionError::InternalDispatchUnavailable)
+        );
+        assert_eq!(
+            executor
+                .snapshot()
+                .await
+                .unwrap()
+                .pending_interactions()
+                .len(),
+            1
+        );
+        lock(&live_state).clear_scripted_entry_id_candidates();
         executor
             .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
                 request_id,
-                resolution,
+                resolution_key.clone(),
+                InteractionResolutionInput::ToolApproval(
+                    crate::tools::ToolApprovalDecisionInput::Deny,
+                ),
                 "2026-08-08T10:00:00.000Z".parse().unwrap(),
             )
             .await
             .unwrap();
+        executor
+            .resolve_interaction(
+                turn_id,
+                *pending.pending_interactions()[0].item_id(),
+                request_id,
+                resolution_key,
+                InteractionResolutionInput::ToolApproval(
+                    crate::tools::ToolApprovalDecisionInput::Deny,
+                ),
+                "2026-08-08T10:00:00.001Z".parse().unwrap(),
+            )
+            .await
+            .expect("same logical resolution retry is idempotent");
         assert_eq!(
             wait_for_terminal(&executor, turn_id).await,
             SessionTurnTerminal::Completed

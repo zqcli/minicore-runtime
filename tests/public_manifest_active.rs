@@ -4,13 +4,15 @@ use std::str::FromStr;
 use minicore_runtime::agent_session_lifecycle::{ForkAnchor, ForkSourceKind};
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
-    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute, ItemContentView,
-    PublicCancelTarget, PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand,
-    RuntimeEventDetail, RuntimeRequest, RuntimeStateEventKind, SessionCommand, SessionEventDetail,
-    SessionLifecycleView, SessionStateEventKind, SnapshotResponse, StateEventMsg, TurnCommand,
+    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
+    InteractionCommand, ItemContentView, ProgressEventKind, ProgressUpdate, PublicCancelTarget,
+    PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand, RuntimeEventDetail, RuntimeRequest,
+    RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionLifecycleView,
+    SessionStateEventKind, SnapshotResponse, StateEventMsg, SubscriptionClosed, TurnCommand,
     TurnFailureView, TurnInterruptionView, TurnStatusView, TurnTerminalView,
 };
-use minicore_runtime::turn_item_interaction::InteractionRequestView;
+use minicore_runtime::tools::UserQuestionAnswerValue;
+use minicore_runtime::turn_item_interaction::{InteractionRequestView, InteractionResolutionInput};
 use minicore_runtime::wire::{
     CanonicalFileUri, FileUriFamily, IncrementalRuntimeProtocolV1, ProtocolBootstrapResponse,
     ProtocolBootstrapRouter, ProtocolRejectReason, ProtocolVersion, RuntimeCapabilities,
@@ -388,6 +390,25 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 )),
             );
         }
+        (Some("model_item_delta_progress"), EventFrame::Progress(event)) => {
+            assert_eq!(event.kind(), ProgressEventKind::Model);
+            let EventRoute::Item { item_id, .. } = event.route() else {
+                panic!("model Item delta requires an Item route");
+            };
+            assert!(matches!(
+                event.update(),
+                ProgressUpdate::ItemDelta {
+                    item_id: update_item_id,
+                    content_index: 0,
+                    delta,
+                    ..
+                } if *update_item_id == item_id && delta.as_ref() == "hel"
+            ));
+        }
+        (
+            Some("subscription_backpressure_closed"),
+            EventFrame::Closed(SubscriptionClosed::Backpressure),
+        ) => {}
         (assertion, frame) => panic!("event assertion {assertion:?} does not match {frame:?}"),
     }
 }
@@ -486,6 +507,18 @@ fn assert_command_response_semantics(
         ) => {
             assert_eq!(turn_id.to_string(), "trn_66666666666666666666666666666666");
             assert_eq!(*cancel_epoch, 7);
+        }
+        (
+            Some("session_definition_updated_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::SessionDefinitionUpdated {
+                        definition_revision,
+                    },
+                output: None,
+            },
+        ) => {
+            assert_eq!(definition_revision.get(), 2);
         }
         (
             Some("session_forked_completion"),
@@ -590,6 +623,41 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
         panic!("request assertion {assertion} requires a dispatch root");
     };
     match (assertion, request.command()) {
+        (
+            "interaction_resolve_user_answer",
+            RuntimeCommand::Interaction(InteractionCommand::Resolve {
+                session_id,
+                expected_turn_id,
+                item_id,
+                request_id,
+                resolution: InteractionResolutionInput::UserAnswer(answer),
+                resolution_key,
+            }),
+        ) => {
+            assert_eq!(
+                session_id.to_string(),
+                "ses_22222222222222222222222222222222"
+            );
+            assert_eq!(
+                expected_turn_id.to_string(),
+                "trn_33333333333333333333333333333333"
+            );
+            assert_eq!(item_id.to_string(), "itm_88888888888888888888888888888888");
+            assert_eq!(
+                request_id.to_string(),
+                "req_66666666666666666666666666666666"
+            );
+            assert!(resolution_key == &"irk_77777777777777777777777777777777".parse().unwrap());
+            assert!(matches!(
+                answer.answers(),
+                [field]
+                    if field.question_index() == 0
+                        && matches!(
+                            field.value(),
+                            UserQuestionAnswerValue::Choice { option_index: 1 }
+                        )
+            ));
+        }
         (
             "runtime_reload_shared_resources",
             RuntimeCommand::Runtime(

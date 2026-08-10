@@ -1,10 +1,13 @@
 use minicore_runtime::runtime_interface::{
     AgentQuery, AgentQueryResult, CommandCompletion, CommandOutcome, EventFrame, EventRoute,
-    QueryErrorCode, QueryResult, RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail,
-    RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest,
-    RuntimeStateEventKind, SessionCommand, SessionLifecycleView, SessionQuery, SessionQueryResult,
-    SessionSummary, SnapshotRequest, StateEvent, StateEventMsg, SubscriptionScope,
+    ItemProgressContentKind, ModelCallPurpose, ObservationValueError, ProgressEvent,
+    ProgressEventKind, ProgressUpdate, QueryErrorCode, QueryResult, RuntimeCommand,
+    RuntimeDispatchError, RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeRequest, RuntimeStateEventKind, SessionCommand,
+    SessionLifecycleView, SessionQuery, SessionQueryResult, SessionSummary, SnapshotRequest,
+    StateEvent, StateEventMsg, SubscriptionClosed, SubscriptionScope,
 };
+use minicore_runtime::tools::ToolCallId;
 use minicore_runtime::wire::{
     BoundedJsonError, IncrementalRuntimeProtocolV1, ProtocolLimits, ProtocolVersion,
     PublicDecodeCode, PublicDecodeStage, RuntimeRequestKind, TypedJsonError, WireV1Codec,
@@ -264,6 +267,126 @@ fn session_lifecycle_runtime_events_round_trip_with_matching_safe_summaries() {
             without_lf(bytes)
         );
     }
+}
+
+#[test]
+fn remaining_public_manifest_fixtures_round_trip_through_selected_v1() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+
+    let resolve =
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/resolve-interaction-command.json");
+    let request = protocol
+        .decode_request(RuntimeRequestKind::Dispatch, resolve)
+        .unwrap();
+    assert_eq!(
+        protocol.encode_request(&request).unwrap(),
+        without_lf(resolve)
+    );
+
+    let updated = include_bytes!(
+        "../docs/fixtures/wire-v1/public/valid/session-definition-updated-response.json"
+    );
+    let response = protocol.decode_command_response(updated).unwrap();
+    assert_eq!(
+        protocol.encode_command_response(&response).unwrap(),
+        without_lf(updated)
+    );
+
+    for frame in [
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/progress-frame.json").as_slice(),
+        include_bytes!("../docs/fixtures/wire-v1/public/valid/closed-frame.json").as_slice(),
+    ] {
+        let decoded = protocol.decode_event_frame(frame).unwrap();
+        assert_eq!(
+            protocol.encode_event_frame(&decoded).unwrap(),
+            without_lf(frame)
+        );
+    }
+}
+
+#[test]
+fn progress_and_closed_frames_round_trip_all_public_variants() {
+    let protocol = IncrementalRuntimeProtocolV1::v1_0();
+    let timestamp = "2026-07-31T12:00:01.250Z".parse().unwrap();
+    let session_id = "ses_22222222222222222222222222222222".parse().unwrap();
+    let turn_id = "trn_33333333333333333333333333333333".parse().unwrap();
+    let item_id = "itm_88888888888888888888888888888888".parse().unwrap();
+    let item_route = EventRoute::Item {
+        session_id,
+        turn_id,
+        item_id,
+    };
+    let turn_route = EventRoute::Turn {
+        session_id,
+        turn_id,
+    };
+    let frames = [
+        EventFrame::Progress(
+            ProgressEvent::new(
+                timestamp,
+                item_route,
+                ProgressEventKind::Model,
+                ProgressUpdate::item_started(item_id, 0, ItemProgressContentKind::AssistantText),
+            )
+            .unwrap(),
+        ),
+        EventFrame::Progress(
+            ProgressEvent::new(
+                timestamp,
+                item_route,
+                ProgressEventKind::Tool,
+                ProgressUpdate::tool_output_delta(
+                    item_id,
+                    "call_1".parse::<ToolCallId>().unwrap(),
+                    "SECRET-TOOL-DELTA",
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        ),
+        EventFrame::Progress(
+            ProgressEvent::new(
+                timestamp,
+                turn_route,
+                ProgressEventKind::Retry,
+                ProgressUpdate::model_retry_scheduled(
+                    ModelCallPurpose::AgentRun,
+                    1,
+                    "2026-07-31T12:00:02.250Z".parse().unwrap(),
+                ),
+            )
+            .unwrap(),
+        ),
+        EventFrame::Progress(
+            ProgressEvent::new(
+                timestamp,
+                turn_route,
+                ProgressEventKind::Compaction,
+                ProgressUpdate::operation_status("SECRET-OPERATION-STATUS").unwrap(),
+            )
+            .unwrap(),
+        ),
+        EventFrame::Closed(SubscriptionClosed::Backpressure),
+        EventFrame::Closed(SubscriptionClosed::RuntimeClosing),
+        EventFrame::Closed(SubscriptionClosed::PublisherRestarted),
+    ];
+
+    for frame in frames {
+        assert!(!format!("{frame:?}").contains("SECRET-"));
+        let encoded = protocol.encode_event_frame(&frame).unwrap();
+        assert_eq!(protocol.decode_event_frame(&encoded).unwrap(), frame);
+    }
+
+    let other_item_id = "itm_99999999999999999999999999999999".parse().unwrap();
+    assert_eq!(
+        ProgressEvent::new(
+            timestamp,
+            item_route,
+            ProgressEventKind::Model,
+            ProgressUpdate::item_started(other_item_id, 0, ItemProgressContentKind::Reasoning,),
+        ),
+        Err(ObservationValueError::InconsistentProgressEvent)
+    );
 }
 
 #[test]
@@ -584,18 +707,6 @@ fn command_root_reports_manifest_stable_decode_faults() {
         assert_eq!(fault.stage(), stage, "{path}");
         assert_eq!(fault.code(), code, "{path}");
     }
-}
-
-#[test]
-fn selected_v1_vectors_in_later_slices_are_not_reported_as_unknown_variants() {
-    let input =
-        include_bytes!("../docs/fixtures/wire-v1/public/valid/resolve-interaction-command.json");
-    assert!(
-        IncrementalRuntimeProtocolV1::v1_0()
-            .decode_request(RuntimeRequestKind::Dispatch, input)
-            .unwrap_err()
-            .is_pending_public_target()
-    );
 }
 
 fn without_lf(input: &[u8]) -> Vec<u8> {

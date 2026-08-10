@@ -953,9 +953,8 @@ impl ToolApprovalRequestView {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum ToolApprovalDecisionInput {
+pub enum ToolApprovalDecisionInput {
     Allow { option_index: u32 },
     Deny,
 }
@@ -1085,7 +1084,6 @@ impl ToolApprovalRequest {
         &self.view
     }
 
-    #[cfg(test)]
     pub(crate) fn resolve(
         &self,
         input: ToolApprovalDecisionInput,
