@@ -1808,7 +1808,7 @@ async fn a_second_runtime_reports_store_in_use_until_the_first_shuts_down() {
     second.shutdown().await;
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_lease_identity_loss_rejects_requests_and_blocks_reopen() {
     let root = TempRoot::new();
     let runtime = MiniCoreRuntime::open(
