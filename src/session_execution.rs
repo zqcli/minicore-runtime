@@ -14170,6 +14170,12 @@ mod tests {
             .unwrap();
         hooks.wait_before_agent_run_attempt().await;
 
+        // Subscribe before the release so the transient handoff Turn can never be missed: it
+        // starts and completes without any intermediate execution-state event (only Finishing
+        // transitions publish ExecutionChanged), so polling could observe the follow-up only
+        // before it completes.  The buffered TurnTerminal is the exact, ordered evidence.
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+
         let follow_first = CommandId::generate().unwrap();
         let follow_second = CommandId::generate().unwrap();
         let steer_first = CommandId::generate().unwrap();
@@ -14242,36 +14248,36 @@ mod tests {
             Ok(())
         );
         hooks.release_before_agent_run_attempt();
-        wait_for_request_count(&model, 2).await;
-        let follow_up_turn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = loaded.executor.snapshot().await.unwrap();
-                if snapshot
-                    .current_turn()
-                    .is_some_and(|turn| turn != initial_turn)
-                {
-                    assert!(snapshot.follow_up_command_ids().is_empty());
-                    assert!(snapshot.steer_command_ids().is_empty());
-                    break snapshot.current_turn().unwrap();
-                }
-                tokio::task::yield_now().await;
-            }
+        // The queued FollowUp is consumed at the initial Turn's terminal handoff and runs to
+        // completion; its exact TurnTerminal event carries the captured TurnId and the
+        // terminal Idle projection with empty queues.
+        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    command_id,
+                    terminal,
+                    ..
+                } if *command_id == follow_first && *terminal == SessionTurnTerminal::Completed
+            )
         })
-        .await
-        .expect("the queued FollowUp starts after the initial Turn");
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = loaded.executor.snapshot().await.unwrap();
-                if snapshot.last_terminal().is_some_and(|(turn, terminal)| {
-                    turn == follow_up_turn && terminal == SessionTurnTerminal::Completed
-                }) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the queued FollowUp reaches terminal state");
+        .await;
+        let follow_up_turn = follow_up_terminal
+            .turn_id()
+            .expect("the queued FollowUp Turn has a TurnId");
+        assert_ne!(follow_up_turn, initial_turn);
+        let terminal_snapshot = follow_up_terminal.snapshot();
+        assert_eq!(
+            terminal_snapshot.execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert_eq!(
+            terminal_snapshot.last_terminal(),
+            Some((follow_up_turn, SessionTurnTerminal::Completed))
+        );
+        assert!(terminal_snapshot.follow_up_command_ids().is_empty());
+        assert!(terminal_snapshot.steer_command_ids().is_empty());
+        assert_eq!(model.request_count(), 2);
         close_loaded(loaded).await;
     }
 
@@ -16176,11 +16182,29 @@ mod tests {
 
         // The Turn completes, and its terminal handoff admission re-reads the pinned ar_1: the
         // transient storage failure re-queues the FollowUp at the front of the actor queue and
-        // installs the fact.  The public projection is empty while Unavailable.
+        // installs the fact.  The public projection is empty while Unavailable.  The exact
+        // buffered TurnTerminal for the first Turn (published before the handoff admission
+        // fails) replaces any snapshot polling: the terminal event's snapshot is the exact
+        // legal Idle state.
         hooks.release_before_agent_run_attempt();
+        let first_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    turn_id,
+                    terminal,
+                    ..
+                } if *turn_id == first_turn && *terminal == SessionTurnTerminal::Completed
+            )
+        })
+        .await;
         assert_eq!(
-            wait_for_terminal(&loaded.executor, first_turn).await,
-            SessionTurnTerminal::Completed
+            first_terminal.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert_eq!(
+            first_terminal.snapshot().last_terminal(),
+            Some((first_turn, SessionTurnTerminal::Completed))
         );
         assert_eq!(model.request_count(), 1);
         let install = wait_for_event(&mut subscription, |event| {
@@ -16289,9 +16313,15 @@ mod tests {
         let follow_up_turn_id = follow_up_terminal
             .turn_id()
             .expect("the FollowUp Turn has a TurnId");
+        // The exact TurnTerminal already received above carries the terminal snapshot: no
+        // further polling is needed, and its last_terminal/Idle state matches the Turn.
         assert_eq!(
-            wait_for_terminal(&loaded.executor, follow_up_turn_id).await,
-            SessionTurnTerminal::Completed
+            follow_up_terminal.snapshot().last_terminal(),
+            Some((follow_up_turn_id, SessionTurnTerminal::Completed))
+        );
+        assert_eq!(
+            follow_up_terminal.snapshot().execution_state(),
+            SessionExecutionState::Idle
         );
         assert_eq!(model.request_count(), 2);
         let final_snapshot = loaded.executor.snapshot().await.unwrap();
