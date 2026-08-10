@@ -16,6 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration as StdDuration;
 
 use thiserror::Error;
 #[cfg(test)]
@@ -24,9 +25,10 @@ use tokio::sync::{OwnedMutexGuard, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_session_lifecycle::{
-    ForkAnchor, ForkSourceKind, SealedSessionDefinitionAttempt, SealedSessionForkAttempt,
-    SealedSessionLifecycleAttempt, SessionLifecycle, SessionLifecycleDecision,
-    SessionLifecycleDecisionError,
+    AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedSessionAgentUpgradeAttempt,
+    SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
+    SealedSessionMetadataAttempt, SessionLifecycle, SessionLifecycleDecision,
+    SessionLifecycleDecisionError, SessionDefinition, SessionModelConfig,
 };
 use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
 #[cfg(not(test))]
@@ -39,33 +41,46 @@ use crate::conversation_storage::{
     ReplayPreparationBarrier, load_replayed_conversation_with_barrier_for_test,
 };
 use crate::durable_state::{
-    DurableConversationTargetError, DurableSessionDefinitionError, DurableSessionDefinitionOutcome,
-    DurableSessionForkError, DurableSessionHead, DurableSessionLifecycleError,
-    DurableSessionLifecycleOutcome, DurableState,
+    DurableConversationTargetError, DurableSessionAgentUpgradeError,
+    DurableSessionAgentUpgradeOutcome, DurableSessionDefinitionError,
+    DurableSessionDefinitionOutcome, DurableSessionForkError, DurableSessionHead,
+    DurableSessionLifecycleError, DurableSessionLifecycleOutcome, DurableSessionMetadataError,
+    DurableSessionMetadataOutcome, DurableState,
 };
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{
     PromptError, PromptErrorKind, PromptIntent, PromptResourceView, PromptService,
+    SessionPromptSelection,
 };
+use crate::runtime_interface::{SessionReadinessView, SessionUnavailableView};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
-    LoadedSessionConversation, SessionCancelError, SessionCancelTarget, SessionExecutor,
-    SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorSnapshot,
-    SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
-    SessionFollowUpError, SessionInteractionError, SessionQueuedMessageError, SessionSteerError,
-    SessionSubmitError, SessionWorkspaceDefinitionError, SessionWorkspaceDefinitionOutcome,
+    model_available_for_definition, prompt_available_for_definition, LoadedSessionConversation,
+    PrepareUnloadWaiter, SessionAgentAvailabilityError, SessionCancelError, SessionCancelTarget,
+    SessionDefinitionPublicationError, SessionDefinitionPublicationOutcome, SessionExecutor,
+    SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorPrepareUnloadError,
+    SessionExecutorSnapshot, SessionExecutorSnapshotError, SessionExecutorStartError,
+    SessionExecutorSubscription, SessionFollowUpError, SessionInteractionError,
+    SessionPromptAvailabilityError, SessionQueuedMessageError, SessionSteerError, SessionSubmitError,
+    SessionWorkspaceDefinitionError,
 };
 use crate::tools::ToolSet;
 use crate::turn_item_interaction::InteractionResolutionInput;
 use crate::wire::{
-    CommandId, InteractionResolutionKey, ItemId, RequestId, SessionDefinitionRevision, SessionId,
-    Timestamp, TurnId,
+    AgentId, CommandId, InteractionResolutionKey, ItemId, RequestId, SessionDefinitionRevision,
+    SessionId, Timestamp, TurnId,
 };
 use crate::workspace::{
-    Workspace, WorkspaceResolveError, WorkspaceResolver, WorkspaceSnapshotFinishError,
+    CapturedWorkspacePromptSource, CapturedWorkspaceSkillSource, Workspace, WorkspaceResolveError,
+    WorkspaceResolver, WorkspaceSnapshotCandidate, WorkspaceSnapshotFinishError,
 };
 
 const SESSION_RESIDENCY_REQUEST_QUEUE_CAPACITY: usize = 8;
+
+/// The configured graceful-Unload grace used by every residency Unload and by the registry
+/// shutdown broadcast.  The Runtime validates its finite semantics (non-zero, ≤ 5 minutes); test
+/// wrappers delegate this default.
+const DEFAULT_UNLOAD_GRACE: StdDuration = StdDuration::from_secs(30);
 
 /// The outcome of one admitted Load request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +191,8 @@ pub(crate) enum SessionResidencySubmitError {
     SessionNotLoaded,
     #[error("session execution is busy")]
     SessionBusy,
+    #[error("Session is not ready to accept Turns: {0:?}")]
+    SessionNotReady(SessionUnavailableView),
     #[error("loaded session execution dependencies are unavailable")]
     DependencyUnavailable,
     #[error("agent is unavailable for execution")]
@@ -316,8 +333,6 @@ pub(crate) enum SessionResidencyWorkspaceDefinitionError {
     SessionArchived,
     #[error("Session is deleted")]
     SessionDeleted,
-    #[error("Session definition revision is exhausted")]
-    RevisionExhausted,
     #[error("durable state exceeds its selected size limit")]
     StateTooLarge,
     #[error("workspace is unavailable")]
@@ -347,6 +362,100 @@ pub(crate) enum SessionResidencyLifecycleError {
     DurableStateTooLarge,
     #[error("durable storage is unavailable")]
     StorageUnavailable,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one Session Agent revision upgrade request routed through residency.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyAgentUpgradeError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("session execution is busy")]
+    SessionBusy,
+    #[error("Session was not found")]
+    SessionNotFound,
+    #[error("Session definition compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Session is archived")]
+    SessionArchived,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("Session upgrade targets another Agent")]
+    AgentMismatch,
+    #[error("Agent is disabled")]
+    AgentDisabled,
+    #[error("Agent is deleted")]
+    AgentDeleted,
+    #[error("Agent revision is unavailable")]
+    RevisionUnavailable,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one loaded Session Workspace reload request routed through residency.
+/// The reload is a loaded-only operation: it never reads or updates DurableState.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyWorkspaceReloadError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session is not loaded")]
+    SessionNotLoaded,
+    #[error("session execution is busy")]
+    SessionBusy,
+    #[error("workspace is unavailable")]
+    WorkspaceUnavailable,
+    #[error("workspace candidate was rejected")]
+    WorkspaceRejected,
+    #[error("workspace authority was denied")]
+    Unauthorized,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one Session metadata CAS routed through residency.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyMetadataError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("Session was not found")]
+    SessionNotFound,
+    #[error("Session metadata compare-and-swap is stale")]
+    StaleRevision,
+    #[error("Session is deleted")]
+    SessionDeleted,
+    #[error("durable state exceeds its selected size limit")]
+    DurableStateTooLarge,
+    #[error("durable storage is unavailable")]
+    StorageUnavailable,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one per-Session Agent availability fan-out operation.  An executor
+/// missing under the gate is an Unload-first NoChange, not an error; an executor that already
+/// fatally failed is internal poison.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencyAgentAvailabilityError {
+    #[error("session residency is closing")]
+    Closing,
+    #[error("session residency dispatch is unavailable")]
+    InternalDispatchUnavailable,
+}
+
+/// Redacted failures from one Runtime shared-resource installation fan-out.  The operation is
+/// Runtime-scope, not Session-scope: it precomputes availability for every loaded Session and
+/// installs the new Prompt/Model roots into every loaded executor and the residency actor's own
+/// future Turn resources.  The precompute performs an exact Agent-definition read from
+/// DurableState for each loaded Session; it never updates DurableState.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum SessionResidencySharedResourcesError {
+    #[error("session residency is closing")]
+    Closing,
     #[error("session residency dispatch is unavailable")]
     InternalDispatchUnavailable,
 }
@@ -613,6 +722,11 @@ enum OperationKind {
     Lifecycle,
     Snapshot,
     WorkspaceDefinition,
+    Metadata,
+    AgentUpgrade,
+    WorkspaceReload,
+    AgentAvailability,
+    SharedResources,
 }
 
 impl OperationKind {
@@ -658,6 +772,31 @@ impl OperationKind {
                     SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable
                 }))
             }
+            Self::Metadata => OperationCompletion::Metadata(Err(if closing {
+                SessionResidencyMetadataError::Closing
+            } else {
+                SessionResidencyMetadataError::InternalDispatchUnavailable
+            })),
+            Self::AgentUpgrade => OperationCompletion::AgentUpgrade(Err(if closing {
+                SessionResidencyAgentUpgradeError::Closing
+            } else {
+                SessionResidencyAgentUpgradeError::InternalDispatchUnavailable
+            })),
+            Self::WorkspaceReload => OperationCompletion::WorkspaceReload(Err(if closing {
+                SessionResidencyWorkspaceReloadError::Closing
+            } else {
+                SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable
+            })),
+            Self::AgentAvailability => OperationCompletion::AgentAvailability(Err(if closing {
+                SessionResidencyAgentAvailabilityError::Closing
+            } else {
+                SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable
+            })),
+            Self::SharedResources => OperationCompletion::SharedResources(Err(if closing {
+                SessionResidencySharedResourcesError::Closing
+            } else {
+                SessionResidencySharedResourcesError::InternalDispatchUnavailable
+            })),
         }
     }
 }
@@ -669,7 +808,16 @@ enum OperationCompletion {
     Lifecycle(Result<DurableSessionLifecycleOutcome, SessionResidencyLifecycleError>),
     Snapshot(Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError>),
     WorkspaceDefinition(
-        Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
+        Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
+    ),
+    Metadata(Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError>),
+    AgentUpgrade(Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError>),
+    WorkspaceReload(
+        Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError>,
+    ),
+    AgentAvailability(Result<(), SessionResidencyAgentAvailabilityError>),
+    SharedResources(
+        Result<ResidencyTurnResources, SessionResidencySharedResourcesError>,
     ),
 }
 
@@ -691,6 +839,21 @@ impl OperationCompletion {
                 | Self::WorkspaceDefinition(Err(
                     SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable
                 ))
+                | Self::Metadata(Err(
+                    SessionResidencyMetadataError::InternalDispatchUnavailable
+                ))
+                | Self::AgentUpgrade(Err(
+                    SessionResidencyAgentUpgradeError::InternalDispatchUnavailable
+                ))
+                | Self::WorkspaceReload(Err(
+                    SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable
+                ))
+                | Self::AgentAvailability(Err(
+                    SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable
+                ))
+                | Self::SharedResources(Err(
+                    SessionResidencySharedResourcesError::InternalDispatchUnavailable
+                ))
         )
     }
 
@@ -703,6 +866,13 @@ impl OperationCompletion {
                 | Self::Lifecycle(Err(SessionResidencyLifecycleError::Closing))
                 | Self::Snapshot(Err(SessionResidencySnapshotError::Closing))
                 | Self::WorkspaceDefinition(Err(SessionResidencyWorkspaceDefinitionError::Closing))
+                | Self::Metadata(Err(SessionResidencyMetadataError::Closing))
+                | Self::AgentUpgrade(Err(SessionResidencyAgentUpgradeError::Closing))
+                | Self::WorkspaceReload(Err(SessionResidencyWorkspaceReloadError::Closing))
+                | Self::AgentAvailability(Err(SessionResidencyAgentAvailabilityError::Closing))
+                | Self::SharedResources(Err(
+                    SessionResidencySharedResourcesError::Closing
+                ))
         )
     }
 }
@@ -717,8 +887,23 @@ enum OperationSender {
     Snapshot(oneshot::Sender<Result<Arc<SessionExecutorSnapshot>, SessionResidencySnapshotError>>),
     WorkspaceDefinition(
         oneshot::Sender<
-            Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
+            Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
         >,
+    ),
+    Metadata(oneshot::Sender<Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError>>),
+    AgentUpgrade(
+        oneshot::Sender<
+            Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError>,
+        >,
+    ),
+    WorkspaceReload(
+        oneshot::Sender<
+            Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError>,
+        >,
+    ),
+    AgentAvailability(oneshot::Sender<Result<(), SessionResidencyAgentAvailabilityError>>),
+    SharedResources(
+        oneshot::Sender<Result<(), SessionResidencySharedResourcesError>>,
     ),
 }
 
@@ -770,6 +955,37 @@ impl OperationWaiter {
                 let _ = sender.send(result);
                 true
             }
+            (OperationSender::Metadata(sender), OperationCompletion::Metadata(result)) => {
+                let _ = sender.send(result);
+                true
+            }
+            (OperationSender::AgentUpgrade(sender), OperationCompletion::AgentUpgrade(result)) => {
+                let _ = sender.send(result);
+                true
+            }
+            (
+                OperationSender::WorkspaceReload(sender),
+                OperationCompletion::WorkspaceReload(result),
+            ) => {
+                let _ = sender.send(result);
+                true
+            }
+            (
+                OperationSender::AgentAvailability(sender),
+                OperationCompletion::AgentAvailability(result),
+            ) => {
+                let _ = sender.send(result);
+                true
+            }
+            (
+                OperationSender::SharedResources(sender),
+                OperationCompletion::SharedResources(result),
+            ) => {
+                // The actor installs the new ResidencyTurnResources into its own future Turn
+                // resources before settling; the caller only needs the success verdict.
+                let _ = sender.send(result.map(|_| ()));
+                true
+            }
             _ => false,
         }
     }
@@ -803,6 +1019,31 @@ impl OperationWaiter {
             OperationSender::WorkspaceDefinition(sender) => {
                 let _ = sender.send(Err(
                     SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable,
+                ));
+            }
+            OperationSender::Metadata(sender) => {
+                let _ = sender.send(Err(
+                    SessionResidencyMetadataError::InternalDispatchUnavailable,
+                ));
+            }
+            OperationSender::AgentUpgrade(sender) => {
+                let _ = sender.send(Err(
+                    SessionResidencyAgentUpgradeError::InternalDispatchUnavailable,
+                ));
+            }
+            OperationSender::WorkspaceReload(sender) => {
+                let _ = sender.send(Err(
+                    SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable,
+                ));
+            }
+            OperationSender::AgentAvailability(sender) => {
+                let _ = sender.send(Err(
+                    SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable,
+                ));
+            }
+            OperationSender::SharedResources(sender) => {
+                let _ = sender.send(Err(
+                    SessionResidencySharedResourcesError::InternalDispatchUnavailable,
                 ));
             }
         }
@@ -887,13 +1128,20 @@ impl ActiveWaiters {
 }
 
 struct ActiveOperation {
-    session_id: SessionId,
+    session_id: Option<SessionId>,
     waiter: Arc<OperationWaiter>,
     task: Option<TrackedTask>,
 }
 
 /// The operation context moved into every admitted child.  No child uses a raw task handle; the
 /// actor retains and reaps the `TrackedTask` created for it.
+///
+/// The two lifecycle tokens are deliberately distinct: `closing` stops residency admission and
+/// aborts in-flight registry operations on an ordinary shutdown, while `executor_force_closing`
+/// is handed only to loaded SessionExecutors as their lifecycle token and is cancelled only by
+/// fatal/poison paths.  An ordinary registry close therefore never cancels the executor token:
+/// installed executors keep their active Turns until the two-phase PrepareForUnload broadcast
+/// grants them the full grace period.
 #[derive(Clone)]
 struct OperationContext {
     state: Arc<ResidencyShared>,
@@ -902,7 +1150,13 @@ struct OperationContext {
     resolver: Arc<WorkspaceResolver>,
     prompt_service: Arc<PromptService>,
     turn_resources: Option<ResidencyTurnResources>,
+    unload_grace: StdDuration,
+    /// Stops residency admission and aborts in-flight registry operations.  Never cancels loaded
+    /// executor lifecycle work.
     closing: CancellationToken,
+    /// The fail-fast executor lifecycle token installed on every loaded SessionExecutor.  Only
+    /// fatal/poison paths cancel it.
+    executor_force_closing: CancellationToken,
     failure: Arc<RegistryFailureState>,
     #[cfg(test)]
     replay_preparation_barrier: Option<Arc<ReplayPreparationBarrier>>,
@@ -921,6 +1175,7 @@ impl OperationContext {
     fn poison(&self) {
         self.failure.mark_fatal();
         self.state.cancel_admission(&self.closing);
+        self.executor_force_closing.cancel();
         self.task_context.request_closing();
         self.durable_state.request_closing();
     }
@@ -949,6 +1204,36 @@ impl OperationContext {
         self.poison();
         SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable
     }
+
+    fn internal_metadata(&self) -> SessionResidencyMetadataError {
+        self.poison();
+        SessionResidencyMetadataError::InternalDispatchUnavailable
+    }
+
+    fn internal_agent_upgrade(&self) -> SessionResidencyAgentUpgradeError {
+        self.poison();
+        SessionResidencyAgentUpgradeError::InternalDispatchUnavailable
+    }
+
+    fn internal_workspace_reload(&self) -> SessionResidencyWorkspaceReloadError {
+        self.poison();
+        SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable
+    }
+
+    fn internal_agent_availability(&self) -> SessionResidencyAgentAvailabilityError {
+        self.poison();
+        SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable
+    }
+
+    fn internal_shared_resources(&self) -> SessionResidencySharedResourcesError {
+        self.poison();
+        SessionResidencySharedResourcesError::InternalDispatchUnavailable
+    }
+
+    fn internal_unload(&self) -> SessionResidencyUnloadError {
+        self.poison();
+        SessionResidencyUnloadError::InternalDispatchUnavailable
+    }
 }
 
 /// A completion guard closes the shared owners if an admitted child unwinds before it can report
@@ -961,6 +1246,7 @@ struct ChildCompletionGuard {
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     closing: CancellationToken,
+    executor_force_closing: CancellationToken,
     failure: Arc<RegistryFailureState>,
     state: Arc<ResidencyShared>,
     settled: bool,
@@ -980,6 +1266,7 @@ impl ChildCompletionGuard {
             task_context: context.task_context.clone(),
             durable_state: context.durable_state.clone(),
             closing: context.closing.clone(),
+            executor_force_closing: context.executor_force_closing.clone(),
             failure: Arc::clone(&context.failure),
             state: Arc::clone(&context.state),
             settled: false,
@@ -994,6 +1281,7 @@ impl ChildCompletionGuard {
         if sender.send((self.operation_id, completion)).is_err() {
             self.failure.mark_fatal();
             self.state.cancel_admission(&self.closing);
+            self.executor_force_closing.cancel();
             self.task_context.request_closing();
             self.durable_state.request_closing();
         }
@@ -1013,6 +1301,7 @@ impl Drop for ChildCompletionGuard {
         } else {
             self.failure.mark_fatal();
             self.state.cancel_admission(&self.closing);
+            self.executor_force_closing.cancel();
             self.task_context.request_closing();
             self.durable_state.request_closing();
             self.kind.internal_completion()
@@ -1021,6 +1310,7 @@ impl Drop for ChildCompletionGuard {
             if sender.send((self.operation_id, completion)).is_err() {
                 self.failure.mark_fatal();
                 self.state.cancel_admission(&self.closing);
+                self.executor_force_closing.cancel();
                 self.task_context.request_closing();
                 self.durable_state.request_closing();
             }
@@ -1172,12 +1462,175 @@ struct WorkspaceDefinitionRequest {
     session_id: SessionId,
     expected_revision: SessionDefinitionRevision,
     workspace: Option<Workspace>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
     owner_timestamp: Timestamp,
+    command_id: CommandId,
     response: Option<
         oneshot::Sender<
-            Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
+            Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError>,
         >,
     >,
+}
+
+struct MetadataRequest {
+    attempt: Option<SealedSessionMetadataAttempt>,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    response: Option<
+        oneshot::Sender<Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError>>,
+    >,
+}
+
+impl MetadataRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyMetadataError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(
+                SessionResidencyMetadataError::InternalDispatchUnavailable,
+            ));
+        }
+    }
+}
+
+impl Drop for MetadataRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
+}
+
+struct AgentUpgradeRequest {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRef>,
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+    response: Option<
+        oneshot::Sender<
+            Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError>,
+        >,
+    >,
+}
+
+impl AgentUpgradeRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyAgentUpgradeError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(
+                SessionResidencyAgentUpgradeError::InternalDispatchUnavailable,
+            ));
+        }
+    }
+}
+
+impl Drop for AgentUpgradeRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
+}
+
+struct WorkspaceReloadRequest {
+    session_id: SessionId,
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+    response: Option<
+        oneshot::Sender<
+            Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError>,
+        >,
+    >,
+}
+
+impl WorkspaceReloadRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyWorkspaceReloadError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(
+                SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable,
+            ));
+        }
+    }
+}
+
+impl Drop for WorkspaceReloadRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
+}
+
+struct AgentAvailabilityRequest {
+    session_id: SessionId,
+    agent_id: AgentId,
+    available: bool,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    response: Option<oneshot::Sender<Result<(), SessionResidencyAgentAvailabilityError>>>,
+}
+
+impl AgentAvailabilityRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencyAgentAvailabilityError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(
+                SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable,
+            ));
+        }
+    }
+}
+
+impl Drop for AgentAvailabilityRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
+}
+
+struct SharedResourcesRequest {
+    prompt_resources: Arc<PromptResourceView>,
+    model_catalog: Arc<ModelCatalogView>,
+    timestamp: Timestamp,
+    command_id: CommandId,
+    response: Option<oneshot::Sender<Result<(), SessionResidencySharedResourcesError>>>,
+}
+
+impl SharedResourcesRequest {
+    fn reject_closing(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(SessionResidencySharedResourcesError::Closing));
+        }
+    }
+
+    fn reject_internal(&mut self) {
+        if let Some(response) = self.response.take() {
+            let _ = response.send(Err(
+                SessionResidencySharedResourcesError::InternalDispatchUnavailable,
+            ));
+        }
+    }
+}
+
+impl Drop for SharedResourcesRequest {
+    fn drop(&mut self) {
+        self.reject_internal();
+    }
 }
 
 impl WorkspaceDefinitionRequest {
@@ -1209,6 +1662,11 @@ enum ResidencyRequest {
     Lifecycle(LifecycleRequest),
     Snapshot(SnapshotRequest),
     WorkspaceDefinition(WorkspaceDefinitionRequest),
+    Metadata(MetadataRequest),
+    AgentUpgrade(AgentUpgradeRequest),
+    WorkspaceReload(WorkspaceReloadRequest),
+    AgentAvailability(AgentAvailabilityRequest),
+    SharedResources(SharedResourcesRequest),
 }
 
 impl ResidencyRequest {
@@ -1220,6 +1678,11 @@ impl ResidencyRequest {
             Self::Lifecycle(request) => request.reject_closing(),
             Self::Snapshot(request) => request.reject_closing(),
             Self::WorkspaceDefinition(request) => request.reject_closing(),
+            Self::Metadata(request) => request.reject_closing(),
+            Self::AgentUpgrade(request) => request.reject_closing(),
+            Self::WorkspaceReload(request) => request.reject_closing(),
+            Self::AgentAvailability(request) => request.reject_closing(),
+            Self::SharedResources(request) => request.reject_closing(),
         }
     }
 
@@ -1231,6 +1694,11 @@ impl ResidencyRequest {
             Self::Lifecycle(request) => request.reject_internal(),
             Self::Snapshot(request) => request.reject_internal(),
             Self::WorkspaceDefinition(request) => request.reject_internal(),
+            Self::Metadata(request) => request.reject_internal(),
+            Self::AgentUpgrade(request) => request.reject_internal(),
+            Self::WorkspaceReload(request) => request.reject_internal(),
+            Self::AgentAvailability(request) => request.reject_internal(),
+            Self::SharedResources(request) => request.reject_internal(),
         }
     }
 }
@@ -1243,11 +1711,13 @@ struct SessionResidencyActor {
     completions: mpsc::UnboundedReceiver<(OperationId, OperationCompletion)>,
     completion_sender: mpsc::UnboundedSender<(OperationId, OperationCompletion)>,
     closing: CancellationToken,
+    executor_force_closing: CancellationToken,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     resolver: Arc<WorkspaceResolver>,
     prompt_service: Arc<PromptService>,
     turn_resources: Option<ResidencyTurnResources>,
+    unload_grace: StdDuration,
     state: Arc<ResidencyShared>,
     failure: Arc<RegistryFailureState>,
     active_waiters: Arc<ActiveWaiters>,
@@ -1307,7 +1777,9 @@ impl SessionResidencyActor {
             resolver: Arc::clone(&self.resolver),
             prompt_service: Arc::clone(&self.prompt_service),
             turn_resources: self.turn_resources.clone(),
+            unload_grace: self.unload_grace,
             closing: self.closing.clone(),
+            executor_force_closing: self.executor_force_closing.clone(),
             failure: Arc::clone(&self.failure),
             #[cfg(test)]
             replay_preparation_barrier: lock(&self.state.replay_preparation_barrier).clone(),
@@ -1317,6 +1789,7 @@ impl SessionResidencyActor {
     fn poison(&self) {
         self.failure.mark_fatal();
         self.state.cancel_admission(&self.closing);
+        self.executor_force_closing.cancel();
         self.task_context.request_closing();
         self.durable_state.request_closing();
     }
@@ -1339,6 +1812,13 @@ impl SessionResidencyActor {
             ResidencyRequest::WorkspaceDefinition(request) => {
                 self.start_workspace_definition(request)
             }
+            ResidencyRequest::Metadata(request) => self.start_metadata(request),
+            ResidencyRequest::AgentUpgrade(request) => self.start_agent_upgrade(request),
+            ResidencyRequest::WorkspaceReload(request) => self.start_workspace_reload(request),
+            ResidencyRequest::AgentAvailability(request) => {
+                self.start_agent_availability(request)
+            }
+            ResidencyRequest::SharedResources(request) => self.start_shared_resources(request),
         }
     }
 
@@ -1350,7 +1830,7 @@ impl SessionResidencyActor {
 
     fn start_child<F>(
         &mut self,
-        session_id: SessionId,
+        session_id: Option<SessionId>,
         kind: OperationKind,
         sender: OperationSender,
         future: F,
@@ -1412,7 +1892,7 @@ impl SessionResidencyActor {
         let session_id = request.session_id;
         let context = self.operation_context();
         self.start_child(
-            session_id,
+            Some(session_id),
             OperationKind::Load,
             OperationSender::Load(sender),
             async move { OperationCompletion::Load(run_load(context, session_id).await) },
@@ -1427,7 +1907,7 @@ impl SessionResidencyActor {
         let session_id = request.session_id;
         let context = self.operation_context();
         self.start_child(
-            session_id,
+            Some(session_id),
             OperationKind::Unload,
             OperationSender::Unload(sender),
             async move { OperationCompletion::Unload(run_unload(context, session_id).await) },
@@ -1447,7 +1927,7 @@ impl SessionResidencyActor {
         let child_created_at = request.child_created_at;
         let context = self.operation_context();
         self.start_child(
-            source_session_id,
+            Some(source_session_id),
             OperationKind::Fork,
             OperationSender::Fork(sender),
             async move {
@@ -1470,7 +1950,7 @@ impl SessionResidencyActor {
         let session_id = attempt.session_id();
         let context = self.operation_context();
         self.start_child(
-            session_id,
+            Some(session_id),
             OperationKind::Lifecycle,
             OperationSender::Lifecycle(sender),
             async move { OperationCompletion::Lifecycle(run_lifecycle(context, attempt).await) },
@@ -1485,7 +1965,7 @@ impl SessionResidencyActor {
         let session_id = request.session_id;
         let context = self.operation_context();
         self.start_child(
-            session_id,
+            Some(session_id),
             OperationKind::Snapshot,
             OperationSender::Snapshot(sender),
             async move { OperationCompletion::Snapshot(run_snapshot(context, session_id).await) },
@@ -1499,24 +1979,166 @@ impl SessionResidencyActor {
         };
         let session_id = request.session_id;
         let expected_revision = request.expected_revision;
-        let Some(workspace) = request.workspace.take() else {
-            self.poison();
-            return;
-        };
+        let workspace = request.workspace.take();
+        let model = request.model.take();
+        let prompts = request.prompts.take();
         let owner_timestamp = request.owner_timestamp;
+        let command_id = request.command_id;
         let context = self.operation_context();
         self.start_child(
-            session_id,
+            Some(session_id),
             OperationKind::WorkspaceDefinition,
             OperationSender::WorkspaceDefinition(sender),
             async move {
                 OperationCompletion::WorkspaceDefinition(
-                    run_workspace_definition(
+                    run_session_definition(
                         context,
                         session_id,
                         expected_revision,
                         workspace,
+                        model,
+                        prompts,
                         owner_timestamp,
+                        command_id,
+                    )
+                    .await,
+                )
+            },
+        );
+    }
+
+    fn start_metadata(&mut self, mut request: MetadataRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let Some(attempt) = request.attempt.take() else {
+            self.poison();
+            return;
+        };
+        let session_id = attempt.session_id();
+        let timestamp = request.timestamp;
+        let command_id = request.command_id;
+        let context = self.operation_context();
+        self.start_child(
+            Some(session_id),
+            OperationKind::Metadata,
+            OperationSender::Metadata(sender),
+            async move {
+                OperationCompletion::Metadata(
+                    run_metadata(context, attempt, timestamp, command_id).await,
+                )
+            },
+        );
+    }
+
+    fn start_agent_upgrade(&mut self, mut request: AgentUpgradeRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let session_id = request.session_id;
+        let expected_revision = request.expected_revision;
+        let target = request.target;
+        let owner_timestamp = request.owner_timestamp;
+        let command_id = request.command_id;
+        let context = self.operation_context();
+        self.start_child(
+            Some(session_id),
+            OperationKind::AgentUpgrade,
+            OperationSender::AgentUpgrade(sender),
+            async move {
+                OperationCompletion::AgentUpgrade(
+                    run_agent_upgrade(
+                        context,
+                        session_id,
+                        expected_revision,
+                        target,
+                        owner_timestamp,
+                        command_id,
+                    )
+                    .await,
+                )
+            },
+        );
+    }
+
+    fn start_workspace_reload(&mut self, mut request: WorkspaceReloadRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let session_id = request.session_id;
+        let owner_timestamp = request.owner_timestamp;
+        let command_id = request.command_id;
+        let context = self.operation_context();
+        self.start_child(
+            Some(session_id),
+            OperationKind::WorkspaceReload,
+            OperationSender::WorkspaceReload(sender),
+            async move {
+                OperationCompletion::WorkspaceReload(
+                    run_workspace_reload(context, session_id, owner_timestamp, command_id).await,
+                )
+            },
+        );
+    }
+
+    fn start_agent_availability(&mut self, mut request: AgentAvailabilityRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let session_id = request.session_id;
+        let agent_id = request.agent_id;
+        let available = request.available;
+        let timestamp = request.timestamp;
+        let command_id = request.command_id;
+        let context = self.operation_context();
+        self.start_child(
+            Some(session_id),
+            OperationKind::AgentAvailability,
+            OperationSender::AgentAvailability(sender),
+            async move {
+                OperationCompletion::AgentAvailability(
+                    run_agent_availability(
+                        context,
+                        session_id,
+                        agent_id,
+                        available,
+                        timestamp,
+                        command_id,
+                    )
+                    .await,
+                )
+            },
+        );
+    }
+
+    fn start_shared_resources(&mut self, mut request: SharedResourcesRequest) {
+        let Some(sender) = request.response.take() else {
+            self.poison();
+            return;
+        };
+        let prompt_resources = request.prompt_resources;
+        let model_catalog = request.model_catalog;
+        let timestamp = request.timestamp;
+        let command_id = request.command_id;
+        let context = self.operation_context();
+        // The operation is Runtime-scope: it owns no per-Session gate slot, and its completion
+        // installs the new ResidencyTurnResources into the actor before settling the caller.
+        self.start_child(
+            None,
+            OperationKind::SharedResources,
+            OperationSender::SharedResources(sender),
+            async move {
+                OperationCompletion::SharedResources(
+                    run_shared_resources(
+                        context,
+                        prompt_resources,
+                        model_catalog,
+                        timestamp,
+                        command_id,
                     )
                     .await,
                 )
@@ -1560,6 +2182,17 @@ impl SessionResidencyActor {
         if completion.is_closing() {
             self.state.cancel_admission(&self.closing);
         }
+        // A successful shared-resource installation installs the new ResidencyTurnResources into
+        // the actor before the caller is settled, so every Load admitted after this completion
+        // uses the new Prompt/Model roots.  The value stays inside the completion handed to the
+        // waiter, which downgrades the success to unit for the caller.
+        let completion = match completion {
+            OperationCompletion::SharedResources(Ok(resources)) => {
+                self.turn_resources = Some(resources.clone());
+                OperationCompletion::SharedResources(Ok(resources))
+            }
+            completion => completion,
+        };
         if !active.waiter.settle(completion) {
             self.poison();
             active.waiter.settle_internal();
@@ -1576,12 +2209,16 @@ impl SessionResidencyActor {
             .remove(&operation_id)
             .expect("one completion retires one active operation");
         self.active_waiters.remove(operation_id);
-        if !self
-            .active
-            .values()
-            .any(|active| active.session_id == removed.session_id)
-        {
-            self.state.remove_gate_if_unused(removed.session_id);
+        // Only per-Session operations own a gate; the Runtime-scope shared-resource operation
+        // carries no SessionId and never clears a per-Session gate.
+        if let Some(session_id) = removed.session_id {
+            if !self
+                .active
+                .values()
+                .any(|active| active.session_id == Some(session_id))
+            {
+                self.state.remove_gate_if_unused(session_id);
+            }
         }
     }
 
@@ -1657,7 +2294,27 @@ impl SessionResidencyActor {
 
     async fn close_installed_executors(&self) -> bool {
         let executors = self.state.installed_executors();
+        // Broadcast the graceful-Unload preparation to every installed executor first (the
+        // admission gates close synchronously), so all grace periods count down in parallel
+        // instead of accumulating N×grace sequentially, then await the shared waiters and close
+        // each executor.  No untracked task is spawned.  This normal close never cancels the
+        // executor force token: the broadcast itself is the grace trigger, and the ordinary
+        // `executor.close()` below only cancels each executor's own internal close token.
+        let waiters = executors
+            .iter()
+            .map(|executor| executor.begin_prepare_for_unload(self.unload_grace))
+            .collect::<Vec<Result<PrepareUnloadWaiter, SessionExecutorPrepareUnloadError>>>();
         let mut normal = true;
+        for waiter in waiters {
+            match waiter {
+                Ok(waiter) => {
+                    if waiter.wait().await.is_err() {
+                        normal = false;
+                    }
+                }
+                Err(_) => normal = false,
+            }
+        }
         for executor in executors {
             if executor.close().await.is_err() {
                 normal = false;
@@ -1669,6 +2326,7 @@ impl SessionResidencyActor {
 
 struct ActorExitGuard {
     closing: CancellationToken,
+    executor_force_closing: CancellationToken,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
     failure: Arc<RegistryFailureState>,
@@ -1680,6 +2338,7 @@ struct ActorExitGuard {
 impl ActorExitGuard {
     fn new(
         closing: CancellationToken,
+        executor_force_closing: CancellationToken,
         task_context: RuntimeTaskContext,
         durable_state: DurableState,
         failure: Arc<RegistryFailureState>,
@@ -1688,6 +2347,7 @@ impl ActorExitGuard {
     ) -> Self {
         Self {
             closing,
+            executor_force_closing,
             task_context,
             durable_state,
             failure,
@@ -1709,6 +2369,7 @@ impl Drop for ActorExitGuard {
         }
         self.failure.mark_fatal();
         self.shared.cancel_admission(&self.closing);
+        self.executor_force_closing.cancel();
         self.task_context.request_closing();
         self.durable_state.request_closing();
         self.active_waiters.settle_all_internal();
@@ -1722,6 +2383,7 @@ impl Drop for ActorExitGuard {
 pub(crate) struct SessionResidencyRegistry {
     sender: mpsc::Sender<ResidencyRequest>,
     closing: CancellationToken,
+    executor_force_closing: CancellationToken,
     task: TrackedTask,
     task_context: RuntimeTaskContext,
     durable_state: DurableState,
@@ -1749,7 +2411,14 @@ impl SessionResidencyRegistry {
         resolver: Arc<WorkspaceResolver>,
         prompt_service: Arc<PromptService>,
     ) -> Result<Self, SessionResidencyStartError> {
-        Self::start_inner(task_context, durable_state, resolver, prompt_service, None)
+        Self::start_inner(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            None,
+            DEFAULT_UNLOAD_GRACE,
+        )
     }
 
     #[allow(
@@ -1823,6 +2492,38 @@ impl SessionResidencyRegistry {
         tool_set: Arc<ToolSet>,
         compaction: CompactionSettingsSnapshot,
     ) -> Result<Self, SessionResidencyStartError> {
+        Self::start_with_turn_resources_and_tools_and_compaction_and_unload_grace(
+            task_context,
+            durable_state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            model_gateway,
+            model_catalog,
+            tool_set,
+            compaction,
+            DEFAULT_UNLOAD_GRACE,
+        )
+    }
+
+    /// The production start seam: installs the Runtime-validated graceful-Unload grace on the
+    /// residency actor so every Unload and the registry shutdown broadcast use it.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one Turn resource bundle plus the configured Unload grace binds the exact runtime owners and settings"
+    )]
+    pub(crate) fn start_with_turn_resources_and_tools_and_compaction_and_unload_grace(
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+        prompt_resources: Arc<PromptResourceView>,
+        model_gateway: Arc<ModelGateway>,
+        model_catalog: Arc<ModelCatalogView>,
+        tool_set: Arc<ToolSet>,
+        compaction: CompactionSettingsSnapshot,
+        unload_grace: StdDuration,
+    ) -> Result<Self, SessionResidencyStartError> {
         Self::start_inner(
             task_context,
             durable_state,
@@ -1835,6 +2536,7 @@ impl SessionResidencyRegistry {
                 tool_set,
                 compaction,
             }),
+            unload_grace,
         )
     }
 
@@ -1844,8 +2546,14 @@ impl SessionResidencyRegistry {
         resolver: Arc<WorkspaceResolver>,
         prompt_service: Arc<PromptService>,
         turn_resources: Option<ResidencyTurnResources>,
+        unload_grace: StdDuration,
     ) -> Result<Self, SessionResidencyStartError> {
         let closing = CancellationToken::new();
+        // The fail-fast executor lifecycle token stays distinct from the admission token for the
+        // whole registry lifetime: ordinary close cancels only `closing`, while every fatal/
+        // poison path cancels both.  Loaded executors receive this token (never `closing`) as
+        // their lifecycle token, so an explicit shutdown broadcast grants them the full grace.
+        let executor_force_closing = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(SESSION_RESIDENCY_REQUEST_QUEUE_CAPACITY);
         let failure = Arc::new(RegistryFailureState::default());
         let active_waiters = Arc::new(ActiveWaiters::default());
@@ -1856,11 +2564,13 @@ impl SessionResidencyRegistry {
             completions: completion_receiver,
             completion_sender,
             closing: closing.clone(),
+            executor_force_closing: executor_force_closing.clone(),
             task_context: task_context.clone(),
             durable_state: durable_state.clone(),
             resolver,
             prompt_service,
             turn_resources,
+            unload_grace,
             state: Arc::clone(&shared),
             failure: Arc::clone(&failure),
             active_waiters: Arc::clone(&active_waiters),
@@ -1869,6 +2579,7 @@ impl SessionResidencyRegistry {
         };
 
         let actor_closing = closing.clone();
+        let actor_force_closing = executor_force_closing.clone();
         let actor_task_context = task_context.clone();
         let actor_durable_state = durable_state.clone();
         let actor_failure = Arc::clone(&failure);
@@ -1876,6 +2587,7 @@ impl SessionResidencyRegistry {
         let actor_shared = Arc::clone(&shared);
         let mut exit_guard = ActorExitGuard::new(
             actor_closing,
+            actor_force_closing,
             actor_task_context,
             actor_durable_state,
             actor_failure,
@@ -1904,6 +2616,7 @@ impl SessionResidencyRegistry {
         Ok(Self {
             sender,
             closing,
+            executor_force_closing,
             task,
             task_context,
             durable_state,
@@ -1914,7 +2627,9 @@ impl SessionResidencyRegistry {
     }
 
     /// Stops new residency admission.  Accepted child operations remain owner-tracked and are
-    /// allowed to settle; `close` performs the asynchronous drain.
+    /// allowed to settle; `close` performs the asynchronous drain.  This never cancels the
+    /// executor force token: loaded executors keep their active Turns until the two-phase
+    /// PrepareForUnload broadcast in `close` grants them the full grace period.
     pub(crate) fn request_closing(&self) {
         self.shared.cancel_admission(&self.closing);
     }
@@ -1930,6 +2645,7 @@ impl SessionResidencyRegistry {
             // shared RuntimeTaskContext after this registry close returns.
             self.failure.mark_fatal();
             self.shared.cancel_admission(&self.closing);
+            self.executor_force_closing.cancel();
             self.task_context.request_closing();
             self.durable_state.request_closing();
             // The actor's asynchronous close path could not run after an unexpected exit.  Close
@@ -2048,9 +2764,22 @@ impl SessionResidencyRegistry {
             .submit(command_id, intent)
             .await
             .map_err(|error| match error {
-                SessionSubmitError::Closing => SessionResidencySubmitError::Closing,
+                SessionSubmitError::Closing => {
+                    // An executor that stopped admitting while the residency registry itself is
+                    // still open is a Session that is unloading (its admission gate closed): map
+                    // it to SessionNotLoaded instead of a Runtime shutdown.  A registry that is
+                    // itself closing stays RuntimeClosing.
+                    if self.closing.is_cancelled() {
+                        SessionResidencySubmitError::Closing
+                    } else {
+                        SessionResidencySubmitError::SessionNotLoaded
+                    }
+                }
                 SessionSubmitError::CommandConflict => SessionResidencySubmitError::CommandConflict,
                 SessionSubmitError::SessionBusy => SessionResidencySubmitError::SessionBusy,
+                SessionSubmitError::SessionNotReady(cause) => {
+                    SessionResidencySubmitError::SessionNotReady(cause)
+                }
                 SessionSubmitError::DependencyUnavailable => {
                     SessionResidencySubmitError::DependencyUnavailable
                 }
@@ -2062,6 +2791,9 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::ContextOverflow => SessionResidencySubmitError::ContextOverflow,
                 SessionSubmitError::Cancelled => SessionResidencySubmitError::Cancelled,
                 SessionSubmitError::SecurityRevoked => SessionResidencySubmitError::Unauthorized,
+                SessionSubmitError::PrepareForUnload => {
+                    SessionResidencySubmitError::SessionNotLoaded
+                }
                 SessionSubmitError::InternalDispatchUnavailable => {
                     SessionResidencySubmitError::InternalDispatchUnavailable
                 }
@@ -2261,26 +2993,203 @@ impl SessionResidencyRegistry {
         })
     }
 
-    /// Routes a loaded Workspace definition replacement to the installed executor.
+    /// Routes a complete loaded Session definition replacement to the installed executor.  The
+    /// executor itself decides whether the candidate changes Workspace semantics and applies the
+    /// loaded Idle requirement or the prebuilt Workspace Snapshot installation.
     pub(crate) async fn update_workspace_definition(
         &self,
         session_id: SessionId,
         expected_revision: SessionDefinitionRevision,
         workspace: Workspace,
         owner_timestamp: Timestamp,
-    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+    ) -> Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+        self.update_session_definition(
+            session_id,
+            expected_revision,
+            Some(workspace),
+            None,
+            None,
+            owner_timestamp,
+            CommandId::generate().expect("test wrapper generates a process-local command id"),
+        )
+        .await
+    }
+
+    /// Performs one ordinary Session definition CAS under the per-Session gate shared with Load,
+    /// Unload, Fork, Lifecycle, and Metadata.  The gate covers the durable CAS, the loaded
+    /// membership decision, and the required loaded executor publication, so a concurrent
+    /// Load/Unload cannot slip between them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one gated definition operation carries its Session identity, CAS token, three replacements, and owner event facts"
+    )]
+    pub(crate) async fn update_session_definition(
+        &self,
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        workspace: Option<Workspace>,
+        model: Option<SessionModelConfig>,
+        prompts: Option<SessionPromptSelection>,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
         let (response, waiter) = oneshot::channel();
         let request = ResidencyRequest::WorkspaceDefinition(WorkspaceDefinitionRequest {
             session_id,
             expected_revision,
-            workspace: Some(workspace),
+            workspace,
+            model,
+            prompts,
             owner_timestamp,
+            command_id,
             response: Some(response),
         });
         self.admit(request).await;
         waiter
             .await
             .unwrap_or_else(|_| self.workspace_waiter_fallback())
+    }
+
+    /// Performs one Session metadata CAS under the per-Session gate shared with Load, Unload,
+    /// Fork, and Lifecycle.  The gate covers the durable update, the loaded membership decision,
+    /// and the required loaded executor publication, so a concurrent Load/Unload cannot slip
+    /// between them.
+    pub(crate) async fn update_session_metadata(
+        &self,
+        attempt: SealedSessionMetadataAttempt,
+        timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::Metadata(MetadataRequest {
+            attempt: Some(attempt),
+            timestamp,
+            command_id,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter
+            .await
+            .unwrap_or_else(|_| self.metadata_waiter_fallback())
+    }
+
+    /// Performs one explicit Session Agent revision upgrade under the per-Session gate shared
+    /// with Load, Unload, Fork, Lifecycle, Metadata, and ordinary definition CAS.  The gate
+    /// covers the durable Agent → Session-gated update, the loaded membership decision, and the
+    /// required loaded executor publication, so a concurrent Load/Unload cannot slip between
+    /// them.  Target current resolution and retained membership/status validation happen only
+    /// inside DurableState.
+    pub(crate) async fn upgrade_session_agent(
+        &self,
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::AgentUpgrade(AgentUpgradeRequest {
+            session_id,
+            expected_revision,
+            target,
+            owner_timestamp,
+            command_id,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter
+            .await
+            .unwrap_or_else(|_| self.agent_upgrade_waiter_fallback())
+    }
+
+    /// Performs one loaded Session Workspace reload under the per-Session gate shared with Load,
+    /// Unload, Fork, Lifecycle, Metadata, ordinary definition CAS, and Agent upgrade.  The gate
+    /// covers the loaded membership decision and the full executor reload completion, so a
+    /// concurrent Load/Unload cannot slip between them.  The reload never reads or updates
+    /// DurableState; an executor missing under the gate maps directly to SessionNotLoaded.
+    pub(crate) async fn reload_workspace(
+        &self,
+        session_id: SessionId,
+        owner_timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::WorkspaceReload(WorkspaceReloadRequest {
+            session_id,
+            owner_timestamp,
+            command_id,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter
+            .await
+            .unwrap_or_else(|_| self.workspace_reload_waiter_fallback())
+    }
+
+    /// Applies one Agent availability fact to one loaded Session under the per-Session gate
+    /// shared with every other residency operation.  The operation rechecks under the gate that
+    /// the executor still exists and still pins the requested AgentId; an Unload that wins the
+    /// gate is a NoChange, so no status fan-out is ever lost to a concurrent Unload.
+    pub(crate) async fn set_session_agent_availability(
+        &self,
+        session_id: SessionId,
+        agent_id: AgentId,
+        available: bool,
+        timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<(), SessionResidencyAgentAvailabilityError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::AgentAvailability(AgentAvailabilityRequest {
+            session_id,
+            agent_id,
+            available,
+            timestamp,
+            command_id,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter
+            .await
+            .unwrap_or_else(|_| self.agent_availability_waiter_fallback())
+    }
+
+    /// Installs one Runtime shared-resource pair over every loaded Session and into the
+    /// residency actor's own future Turn resources.  The operation is Runtime-scope: it owns no
+    /// per-Session gate slot, precomputes every availability fact before any executor update,
+    /// and fails the whole fan-out atomically (no executor is updated when any precompute or
+    /// install step fails).  The caller holds the Runtime shared-resource write gate, so no
+    /// external Submit admission can capture a half-switched pair.
+    pub(crate) async fn install_shared_resources(
+        &self,
+        prompt_resources: Arc<PromptResourceView>,
+        model_catalog: Arc<ModelCatalogView>,
+        timestamp: Timestamp,
+        command_id: CommandId,
+    ) -> Result<(), SessionResidencySharedResourcesError> {
+        let (response, waiter) = oneshot::channel();
+        let request = ResidencyRequest::SharedResources(SharedResourcesRequest {
+            prompt_resources,
+            model_catalog,
+            timestamp,
+            command_id,
+            response: Some(response),
+        });
+        self.admit(request).await;
+        waiter
+            .await
+            .unwrap_or_else(|_| self.shared_resources_waiter_fallback())
+    }
+
+    /// Returns the SessionIds of every currently loaded Session whose installed definition pins
+    /// the requested AgentId.  This is a short-lock immutable projection: the per-Session gate
+    /// recheck inside each fan-out operation is the linearization point against Unload/Load.
+    pub(crate) fn loaded_session_ids_for_agent(&self, agent_id: AgentId) -> Vec<SessionId> {
+        self.shared
+            .loaded_session_snapshots()
+            .into_iter()
+            .filter(|snapshot| snapshot.definition().agent().agent_id() == agent_id)
+            .map(|snapshot| snapshot.definition().session_id())
+            .collect()
     }
 
     async fn admit(&self, mut request: ResidencyRequest) {
@@ -2371,13 +3280,73 @@ impl SessionResidencyRegistry {
 
     fn workspace_waiter_fallback(
         &self,
-    ) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+    ) -> Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
         Err(if self.failure.is_fatal() {
             SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable
         } else if self.closing.is_cancelled() {
             SessionResidencyWorkspaceDefinitionError::Closing
         } else {
             SessionResidencyWorkspaceDefinitionError::InternalDispatchUnavailable
+        })
+    }
+
+    fn metadata_waiter_fallback(
+        &self,
+    ) -> Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencyMetadataError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencyMetadataError::Closing
+        } else {
+            SessionResidencyMetadataError::InternalDispatchUnavailable
+        })
+    }
+
+    fn agent_upgrade_waiter_fallback(
+        &self,
+    ) -> Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencyAgentUpgradeError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencyAgentUpgradeError::Closing
+        } else {
+            SessionResidencyAgentUpgradeError::InternalDispatchUnavailable
+        })
+    }
+
+    fn workspace_reload_waiter_fallback(
+        &self,
+    ) -> Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencyWorkspaceReloadError::Closing
+        } else {
+            SessionResidencyWorkspaceReloadError::InternalDispatchUnavailable
+        })
+    }
+
+    fn agent_availability_waiter_fallback(
+        &self,
+    ) -> Result<(), SessionResidencyAgentAvailabilityError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencyAgentAvailabilityError::Closing
+        } else {
+            SessionResidencyAgentAvailabilityError::InternalDispatchUnavailable
+        })
+    }
+
+    fn shared_resources_waiter_fallback(
+        &self,
+    ) -> Result<(), SessionResidencySharedResourcesError> {
+        Err(if self.failure.is_fatal() {
+            SessionResidencySharedResourcesError::InternalDispatchUnavailable
+        } else if self.closing.is_cancelled() {
+            SessionResidencySharedResourcesError::Closing
+        } else {
+            SessionResidencySharedResourcesError::InternalDispatchUnavailable
         })
     }
 
@@ -2449,64 +3418,115 @@ async fn run_load(
     if !valid_current_shape(session_id, &head, &definition) {
         return Err(context.internal_load());
     }
+    // Archived/Deleted settles first with its stable typed error, before any Agent/Model/Prompt
+    // resource read, so an unrelated resource or storage failure never poisons Load.
     match head.lifecycle() {
         SessionLifecycle::Open => {}
         SessionLifecycle::Archived => return Err(SessionResidencyLoadError::SessionArchived),
         SessionLifecycle::Deleted => return Err(SessionResidencyLoadError::SessionDeleted),
     }
+    // The Agent availability fact is captured synchronously right after the durable current
+    // capture and stays independent of the Workspace preparation below, so a disabled/deleted
+    // Agent still loads its last-good WorkspaceSnapshot and conversation and only projects
+    // AgentUnavailable until it is re-enabled.  A missing Agent head or an identity mismatch
+    // under a valid loaded Session is an internal invariant.
+    let agent_head = context
+        .durable_state
+        .agent_head(definition.agent().agent_id())
+        .ok_or_else(|| context.internal_load())?;
+    if agent_head.agent_id() != definition.agent().agent_id() {
+        return Err(context.internal_load());
+    }
+    let agent_available = matches!(agent_head.status(), AgentStatus::Enabled);
+    // The Model availability fact is captured synchronously right after the definition capture
+    // and stays independent of both the Agent availability fact and the Workspace preparation,
+    // so a model that cannot serve a Turn still loads its last-good WorkspaceSnapshot and
+    // conversation and only projects ModelUnavailable until a definition publication restores a
+    // resolvable model.  Ordinary model selection/reasoning/output incompatibilities degrade
+    // only this fact; a resolution failure on the installed Runtime-owned catalog is an
+    // internal invariant that aborts Load.
+    let model_available = model_available_for_load(&context, &definition)?;
+    // The selected-Prompt availability fact is captured independently right after the model
+    // fact and stays independent of the Workspace preparation, so a selection that cannot
+    // serve a Turn still loads its last-good WorkspaceSnapshot and conversation and only
+    // projects PromptUnavailable until a definition publication restores the selection.  It
+    // reads the exact retained Agent revision through the same seam a future Turn admission
+    // would use; Closing aborts Load as Closing and every other failure on the installed
+    // Runtime-owned Prompt view is an internal invariant that aborts Load.  The test-only
+    // dependency shape without Turn resources captures no Prompt fact and defaults to
+    // available.
+    let prompt_available = prompt_available_for_load(&context, &definition).await?;
 
-    let candidate = match context
+    // Workspace resolve/capture/revalidation ordinary failures below degrade loaded readiness
+    // to Unavailable instead of failing Load: the Session still opens and replays its
+    // conversation and installs a loaded executor with its Recorder, and a later ReloadWorkspace
+    // (or true Workspace definition update) restores Ready.  Only Closing and internal failures
+    // abort Load before replay.
+    enum WorkspacePreparation {
+        Ready {
+            candidate: WorkspaceSnapshotCandidate,
+            prompt_sources: Arc<[CapturedWorkspacePromptSource]>,
+            skill_sources: Arc<[CapturedWorkspaceSkillSource]>,
+            requires_revalidation: bool,
+        },
+        Unavailable(SessionUnavailableView),
+    }
+    let preparation = match context
         .resolver
         .resolve(session_id, definition.workspace())
         .await
     {
-        Ok(candidate) => candidate,
+        Ok(candidate) => {
+            if candidate.revision() != definition.workspace().revision() {
+                return Err(context.internal_load());
+            }
+            let skill_context = candidate.skill_capture_context();
+            if !skill_context.roots().is_empty() {
+                // Skill source discovery remains fail-closed until SkillService owns its
+                // candidate path.
+                return Err(context.internal_load());
+            }
+            let prompt_context = candidate.prompt_capture_context();
+            let requires_revalidation = !prompt_context.roots().is_empty();
+            let capture = context
+                .prompt_service
+                .capture_workspace_sources(prompt_context);
+            tokio::pin!(capture);
+            match tokio::select! {
+                biased;
+                _ = context.closing.cancelled() => return Err(SessionResidencyLoadError::Closing),
+                result = &mut capture => result,
+            } {
+                Ok(prompt_sources) => WorkspacePreparation::Ready {
+                    candidate,
+                    prompt_sources,
+                    skill_sources: Arc::from(Vec::new().into_boxed_slice()),
+                    requires_revalidation,
+                },
+                Err(error) => match map_prompt_load_readiness(&context, error) {
+                    Ok(cause) => WorkspacePreparation::Unavailable(cause),
+                    Err(load_error) => return Err(load_error),
+                },
+            }
+        }
         Err(WorkspaceResolveError::Closing) => {
             return Err(SessionResidencyLoadError::Closing);
         }
         Err(
             WorkspaceResolveError::RootUnavailable
-            | WorkspaceResolveError::AuthorityUnavailable
-            | WorkspaceResolveError::CanonicalizationFailed,
-        ) => {
-            return Err(SessionResidencyLoadError::WorkspaceUnavailable);
-        }
-        Err(
-            WorkspaceResolveError::RootNotDirectory
+            | WorkspaceResolveError::RootNotDirectory
+            | WorkspaceResolveError::CanonicalizationFailed
             | WorkspaceResolveError::DuplicateRoot
             | WorkspaceResolveError::OverlappingRoots
             | WorkspaceResolveError::CwdOutsideRoots
             | WorkspaceResolveError::CwdRootMismatch
+            | WorkspaceResolveError::AuthorityUnavailable
             | WorkspaceResolveError::AuthorityDenied,
-        ) => {
-            return Err(SessionResidencyLoadError::WorkspaceRejected);
-        }
+        ) => WorkspacePreparation::Unavailable(SessionUnavailableView::WorkspaceUnavailable),
         Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
             return Err(context.internal_load());
         }
     };
-
-    if candidate.revision() != definition.workspace().revision() {
-        return Err(context.internal_load());
-    }
-    let skill_context = candidate.skill_capture_context();
-    if !skill_context.roots().is_empty() {
-        // Skill source discovery remains fail-closed until SkillService owns its candidate path.
-        return Err(context.internal_load());
-    }
-    let prompt_context = candidate.prompt_capture_context();
-    let requires_revalidation = !prompt_context.roots().is_empty();
-    let capture = context
-        .prompt_service
-        .capture_workspace_sources(prompt_context);
-    tokio::pin!(capture);
-    let prompt_sources = tokio::select! {
-        biased;
-        _ = context.closing.cancelled() => return Err(SessionResidencyLoadError::Closing),
-        result = &mut capture => result,
-    }
-    .map_err(|error| map_prompt_load_error(&context, error))?;
-    let skill_sources = Arc::from(Vec::new().into_boxed_slice());
 
     let target = context
         .durable_state
@@ -2525,49 +3545,85 @@ async fn run_load(
     let loaded_conversation = load_replayed_conversation(target, context.task_context.clone())
         .await
         .map_err(|error| map_conversation_load_error(&context, error))?;
-    let workspace_snapshot = async {
-        if requires_revalidation {
-            let revalidation_result = {
-                let revalidation = context
-                    .resolver
-                    .revalidate_candidate(&candidate, definition.workspace());
-                tokio::pin!(revalidation);
-                tokio::select! {
-                    biased;
-                    _ = context.closing.cancelled() => {
+    let mut readiness = SessionReadinessView::Ready;
+    let workspace_snapshot = match preparation {
+        WorkspacePreparation::Ready {
+            candidate,
+            prompt_sources,
+            skill_sources,
+            requires_revalidation,
+        } => {
+            // The authority revalidation stays after replay for a successful candidate; its
+            // ordinary failures degrade readiness to WorkspaceUnavailable instead of failing
+            // Load, while Closing and internal failures keep the existing Load error shape.
+            if requires_revalidation {
+                let revalidation_result = {
+                    let revalidation = context
+                        .resolver
+                        .revalidate_candidate(&candidate, definition.workspace());
+                    tokio::pin!(revalidation);
+                    tokio::select! {
+                        biased;
+                        _ = context.closing.cancelled() => {
+                            loaded_conversation.recorder.close().await;
+                            return Err(SessionResidencyLoadError::Closing);
+                        }
+                        result = &mut revalidation => result,
+                    }
+                };
+                match revalidation_result {
+                    Ok(true) => {}
+                    Ok(false) => readiness = SessionReadinessView::Unavailable(
+                        SessionUnavailableView::WorkspaceUnavailable,
+                    ),
+                    Err(WorkspaceResolveError::Closing) => {
+                        loaded_conversation.recorder.close().await;
                         return Err(SessionResidencyLoadError::Closing);
                     }
-                    result = &mut revalidation => result,
-                }
-            };
-            match revalidation_result {
-                Ok(true) => {}
-                Ok(false) => return Err(SessionResidencyLoadError::WorkspaceUnavailable),
-                Err(WorkspaceResolveError::Closing) => {
-                    return Err(SessionResidencyLoadError::Closing);
-                }
-                Err(
-                    WorkspaceResolveError::RootUnavailable
-                    | WorkspaceResolveError::AuthorityUnavailable
-                    | WorkspaceResolveError::CanonicalizationFailed,
-                ) => return Err(SessionResidencyLoadError::WorkspaceUnavailable),
-                Err(
-                    WorkspaceResolveError::RootNotDirectory
-                    | WorkspaceResolveError::DuplicateRoot
-                    | WorkspaceResolveError::OverlappingRoots
-                    | WorkspaceResolveError::CwdOutsideRoots
-                    | WorkspaceResolveError::CwdRootMismatch
-                    | WorkspaceResolveError::AuthorityDenied,
-                ) => return Err(SessionResidencyLoadError::WorkspaceRejected),
-                Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
-                    return Err(context.internal_load());
+                    Err(
+                        WorkspaceResolveError::RootUnavailable
+                        | WorkspaceResolveError::RootNotDirectory
+                        | WorkspaceResolveError::CanonicalizationFailed
+                        | WorkspaceResolveError::DuplicateRoot
+                        | WorkspaceResolveError::OverlappingRoots
+                        | WorkspaceResolveError::CwdOutsideRoots
+                        | WorkspaceResolveError::CwdRootMismatch
+                        | WorkspaceResolveError::AuthorityUnavailable
+                        | WorkspaceResolveError::AuthorityDenied,
+                    ) => readiness = SessionReadinessView::Unavailable(
+                        SessionUnavailableView::WorkspaceUnavailable,
+                    ),
+                    Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
+                        loaded_conversation.recorder.close().await;
+                        return Err(context.internal_load());
+                    }
                 }
             }
+            match readiness {
+                SessionReadinessView::Ready => {
+                    let snapshot = match candidate.finish(prompt_sources, skill_sources) {
+                        Ok(snapshot) => snapshot,
+                        Err(WorkspaceSnapshotFinishError::AuthorizationMismatch) => {
+                            loaded_conversation.recorder.close().await;
+                            return Err(context.internal_load());
+                        }
+                    };
+                    Some(snapshot)
+                }
+                SessionReadinessView::Unavailable(_) => None,
+                SessionReadinessView::Preparing => unreachable!(),
+            }
         }
-        let workspace_snapshot = candidate.finish(prompt_sources, skill_sources).map_err(
-            |WorkspaceSnapshotFinishError::AuthorizationMismatch| context.internal_load(),
-        )?;
+        WorkspacePreparation::Unavailable(cause) => {
+            readiness = SessionReadinessView::Unavailable(cause);
+            None
+        }
+    };
 
+    // The final durable current/lifecycle/definition exact recheck runs for both Ready and
+    // Unavailable outcomes; a stale/lifecycle change closes the fresh Recorder and returns the
+    // original typed Load error without installing any partial owner.
+    let final_recheck: Result<(), SessionResidencyLoadError> = (|| {
         let final_current = context
             .durable_state
             .session_current(session_id)
@@ -2591,16 +3647,12 @@ async fn run_load(
         if context.closing.is_cancelled() {
             return Err(SessionResidencyLoadError::Closing);
         }
-        Ok(workspace_snapshot)
+        Ok(())
+    })();
+    if let Err(error) = final_recheck {
+        loaded_conversation.recorder.close().await;
+        return Err(error);
     }
-    .await;
-    let workspace_snapshot = match workspace_snapshot {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            loaded_conversation.recorder.close().await;
-            return Err(error);
-        }
-    };
     let recorder = loaded_conversation.recorder;
     let live_state = loaded_conversation.live_state;
     let replay_diagnostics = loaded_conversation.diagnostics;
@@ -2610,9 +3662,9 @@ async fn run_load(
         recorder_for_executor,
         replay_diagnostics,
     );
-    let executor_result = match context.turn_resources.as_ref() {
-        Some(resources) => {
-            SessionExecutor::start_loaded_ready_idle_with_turn_resources_and_lifecycle(
+    let executor_result = match (context.turn_resources.as_ref(), readiness) {
+        (Some(resources), SessionReadinessView::Ready) => {
+            SessionExecutor::start_loaded_idle_with_turn_resources_and_lifecycle(
                 SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
                     context.task_context.clone(),
                     context.durable_state.clone(),
@@ -2625,12 +3677,43 @@ async fn run_load(
                     resources.compaction.clone(),
                 ),
                 definition,
-                workspace_snapshot,
+                agent_available,
+                model_available,
+                prompt_available,
+                None,
+                Some(
+                    workspace_snapshot
+                        .expect("a Ready load always finishes its WorkspaceSnapshot"),
+                ),
                 conversation,
-                context.closing.clone(),
+                context.executor_force_closing.clone(),
             )
         }
-        None => {
+        (Some(resources), SessionReadinessView::Unavailable(cause)) => {
+            SessionExecutor::start_loaded_idle_with_turn_resources_and_lifecycle(
+                SessionExecutorDependencies::with_turn_resources_and_tools_and_compaction(
+                    context.task_context.clone(),
+                    context.durable_state.clone(),
+                    Arc::clone(&context.resolver),
+                    Arc::clone(&context.prompt_service),
+                    Arc::clone(&resources.prompt_resources),
+                    Arc::clone(&resources.model_gateway),
+                    Arc::clone(&resources.model_catalog),
+                    Arc::clone(&resources.tool_set),
+                    resources.compaction.clone(),
+                ),
+                definition,
+                agent_available,
+                model_available,
+                prompt_available,
+                Some(cause),
+                None,
+                conversation,
+                context.executor_force_closing.clone(),
+            )
+        }
+        (Some(_), SessionReadinessView::Preparing) => unreachable!(),
+        (None, SessionReadinessView::Ready) => {
             #[cfg(test)]
             {
                 SessionExecutor::start_loaded_ready_idle(
@@ -2639,7 +3722,8 @@ async fn run_load(
                     Arc::clone(&context.resolver),
                     Arc::clone(&context.prompt_service),
                     definition,
-                    workspace_snapshot,
+                    workspace_snapshot
+                        .expect("a Ready load always finishes its WorkspaceSnapshot"),
                     conversation,
                 )
             }
@@ -2648,6 +3732,10 @@ async fn run_load(
                 recorder.close().await;
                 return Err(context.internal_load());
             }
+        }
+        (None, SessionReadinessView::Unavailable(_) | SessionReadinessView::Preparing) => {
+            recorder.close().await;
+            return Err(context.internal_load());
         }
     };
     let executor = match executor_result {
@@ -2694,21 +3782,79 @@ async fn run_load(
     }
 }
 
-fn map_prompt_load_error(
+fn map_prompt_load_readiness(
     context: &OperationContext,
     error: PromptError,
-) -> SessionResidencyLoadError {
+) -> Result<SessionUnavailableView, SessionResidencyLoadError> {
     match error.kind() {
-        PromptErrorKind::SourceDiscovery => SessionResidencyLoadError::WorkspaceUnavailable,
+        PromptErrorKind::SourceDiscovery => Ok(SessionUnavailableView::WorkspaceUnavailable),
         PromptErrorKind::ContentLoad | PromptErrorKind::DuplicateKey => {
-            SessionResidencyLoadError::WorkspaceRejected
+            Ok(SessionUnavailableView::PromptUnavailable)
         }
         PromptErrorKind::PromptUnavailable
         | PromptErrorKind::InvalidRole
         | PromptErrorKind::RequiredPromptMissing
         | PromptErrorKind::InvalidIntent
         | PromptErrorKind::InvalidContribution
-        | PromptErrorKind::ContextLimitExceeded => context.internal_load(),
+        | PromptErrorKind::ContextLimitExceeded
+        | PromptErrorKind::Internal => Err(context.internal_load()),
+    }
+}
+
+/// Classifies the captured definition's model availability against the installed Runtime-owned
+/// catalog through the exact Turn model resolution seam, as an independent fact alongside the
+/// Agent availability fact and the Workspace preparation.  Ordinary model
+/// selection/reasoning/output incompatibilities degrade only this fact and Load still returns
+/// Loaded; a resolution failure on the installed Runtime-owned catalog is an internal invariant
+/// that aborts Load through the existing poison path.  The test-only dependency shape without
+/// Turn resources captures no model fact and defaults to available; production always carries
+/// the Runtime-owned catalog and rejects a missing dependency shape at executor start.
+fn model_available_for_load(
+    context: &OperationContext,
+    definition: &SessionDefinition,
+) -> Result<bool, SessionResidencyLoadError> {
+    let Some(resources) = context.turn_resources.as_ref() else {
+        return Ok(true);
+    };
+    match model_available_for_definition(
+        &resources.model_gateway,
+        Arc::clone(&resources.model_catalog),
+        definition,
+    ) {
+        Ok(available) => Ok(available),
+        Err(_) => Err(context.internal_load()),
+    }
+}
+
+/// Classifies the captured definition's selected Agent+Session Prompt selection against the
+/// installed Runtime-owned Prompt resources through the exact `for_turn` selection stage, as an
+/// independent fact alongside the Agent and model availability facts and the Workspace
+/// preparation.  Ordinary selection failures (missing Prompt, wrong role, duplicate resolved
+/// key) degrade only this fact and Load still returns Loaded; a Closing aborts Load as Closing
+/// and any other failure on the installed Runtime-owned Prompt view is an internal invariant
+/// that aborts Load through the existing poison path.  The test-only dependency shape without
+/// Turn resources captures no Prompt fact and defaults to available; production always carries
+/// the Runtime-owned Prompt view.
+async fn prompt_available_for_load(
+    context: &OperationContext,
+    definition: &SessionDefinition,
+) -> Result<bool, SessionResidencyLoadError> {
+    let Some(resources) = context.turn_resources.as_ref() else {
+        return Ok(true);
+    };
+    match prompt_available_for_definition(
+        context.durable_state.clone(),
+        Arc::clone(&context.prompt_service),
+        Arc::clone(&resources.prompt_resources),
+        definition,
+    )
+    .await
+    {
+        Ok(available) => Ok(available),
+        Err(SessionPromptAvailabilityError::Closing) => Err(SessionResidencyLoadError::Closing),
+        Err(SessionPromptAvailabilityError::InternalDispatchUnavailable) => {
+            Err(context.internal_load())
+        }
     }
 }
 
@@ -2723,18 +3869,44 @@ async fn run_unload(
         return Ok(SessionResidencyUnloadOutcome::NoChange);
     };
 
-    // Keep the map entry and exact permit installed until the executor's actor has drained.  A
+    // Keep the map entry and exact permit installed until the executor has drained.  A
     // concurrent lifecycle request therefore remains Busy until this operation removes residency.
+    // The configured grace lets the active admission/Turn finish naturally; the executor itself
+    // signals PrepareForUnload at the deadline and settles its pending Interactions truthfully.
+    match executor.prepare_for_unload(context.unload_grace).await {
+        Ok(()) => {}
+        Err(SessionExecutorPrepareUnloadError::Closing) => {
+            // The executor actor was already closing before it accepted the prepare request
+            // (for example an already-drained executor during registry shutdown).  It has either
+            // drained itself or drains on close: join it and remove the exact owner so no
+            // partial owner remains installed.
+            if executor.close().await.is_err() {
+                return Err(context.internal_unload());
+            }
+            return match context.state.remove_exact(session_id, &permit) {
+                RemoveResult::Removed => {
+                    if context.closing.is_cancelled() {
+                        Err(SessionResidencyUnloadError::Closing)
+                    } else {
+                        Ok(SessionResidencyUnloadOutcome::Unloaded)
+                    }
+                }
+                RemoveResult::Missing | RemoveResult::PermitMismatch => {
+                    Err(context.internal_unload())
+                }
+            };
+        }
+        Err(SessionExecutorPrepareUnloadError::Internal) => {
+            return Err(context.internal_unload());
+        }
+    }
+
     if let Err(SessionExecutorCloseError::InternalDispatchUnavailable) = executor.close().await {
-        context.poison();
-        return Err(SessionResidencyUnloadError::InternalDispatchUnavailable);
+        return Err(context.internal_unload());
     }
     match context.state.remove_exact(session_id, &permit) {
         RemoveResult::Removed => Ok(SessionResidencyUnloadOutcome::Unloaded),
-        RemoveResult::Missing | RemoveResult::PermitMismatch => {
-            context.poison();
-            Err(SessionResidencyUnloadError::InternalDispatchUnavailable)
-        }
+        RemoveResult::Missing | RemoveResult::PermitMismatch => Err(context.internal_unload()),
     }
 }
 
@@ -2874,36 +4046,74 @@ async fn run_snapshot(
     }
 }
 
-async fn run_workspace_definition(
+/// Performs one ordinary Session definition CAS under the per-Session gate.  The loaded
+/// membership observed under this gate is the linearization point for the required loaded
+/// publication: a changed durable update publishes the exact changed definition through the
+/// installed executor, and any executor failure after a durable Updated is a required post-commit
+/// live-publication failure that poisons the shared owners.  Normal registry shutdown drains
+/// admitted children before closing executors, so a loaded executor is never observed closing
+/// under an admitted definition operation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the child operation receives the complete fixed definition CAS and publication context"
+)]
+async fn run_session_definition(
     context: OperationContext,
     session_id: SessionId,
     expected_revision: SessionDefinitionRevision,
-    workspace: Workspace,
+    workspace: Option<Workspace>,
+    model: Option<SessionModelConfig>,
+    prompts: Option<SessionPromptSelection>,
     owner_timestamp: Timestamp,
-) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
+    command_id: CommandId,
+) -> Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
     let gate = context.state.gate(session_id);
     let _permit = SessionResidencyOperationPermit::acquire(gate).await;
     if let Some(executor) = context.state.executor(session_id) {
-        return match executor
-            .update_workspace_definition_with_cancellation(
+        let outcome = match executor
+            .update_session_definition_with_cancellation(
                 expected_revision,
                 workspace,
+                model,
+                prompts,
                 owner_timestamp,
+                command_id,
                 context.closing.clone(),
             )
             .await
         {
-            Ok(outcome) => Ok(outcome),
-            Err(error) => map_executor_workspace_error(&context, error),
+            Ok(outcome) => outcome,
+            Err(error) => return Err(map_executor_workspace_error(&context, error)),
         };
+        // The executor performed the durable CAS and validated its exact outcome; the gate
+        // guarantees no other mutation can interleave, so the current durable head is the exact
+        // committed one.
+        let current = context
+            .durable_state
+            .session_current(session_id)
+            .ok_or_else(|| context.internal_workspace())?;
+        if !valid_current_shape(session_id, current.head(), current.definition()) {
+            return Err(context.internal_workspace());
+        }
+        return Ok(if outcome.changed() {
+            DurableSessionDefinitionOutcome::Updated(
+                Arc::clone(current.head()),
+                Arc::clone(current.definition()),
+            )
+        } else {
+            DurableSessionDefinitionOutcome::NoChange(
+                Arc::clone(current.head()),
+                Arc::clone(current.definition()),
+            )
+        });
     }
 
     let attempt = SealedSessionDefinitionAttempt::new(
         session_id,
         expected_revision,
-        Some(workspace),
-        None,
-        None,
+        workspace,
+        model,
+        prompts,
         owner_timestamp,
     );
     let outcome = context
@@ -2912,6 +4122,83 @@ async fn run_workspace_definition(
         .await
         .map_err(|error| map_durable_definition_error(&context, error))?;
     map_unloaded_definition_outcome(&context, session_id, outcome)
+}
+
+/// Performs one explicit Session Agent revision upgrade under the per-Session gate.  The loaded
+/// membership observed under this gate is the linearization point for the required loaded
+/// publication: a changed durable upgrade publishes the exact changed definition through the
+/// installed executor, and any executor failure after a durable Updated is a required post-commit
+/// live-publication failure that poisons the shared owners.  Normal registry shutdown drains
+/// admitted children before closing executors, so a loaded executor is never observed closing
+/// under an admitted Agent upgrade operation.
+async fn run_agent_upgrade(
+    context: OperationContext,
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRef>,
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+) -> Result<DurableSessionAgentUpgradeOutcome, SessionResidencyAgentUpgradeError> {
+    let gate = context.state.gate(session_id);
+    let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+    if let Some(executor) = context.state.executor(session_id) {
+        let outcome = match executor
+            .upgrade_session_agent_with_cancellation(
+                expected_revision,
+                target,
+                owner_timestamp,
+                command_id,
+                context.closing.clone(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Err(map_executor_agent_upgrade_error(&context, error)),
+        };
+        // The executor performed the durable CAS and validated its exact outcome; the gate
+        // guarantees no other mutation can interleave, so the current durable head is the exact
+        // committed one.
+        let current = context
+            .durable_state
+            .session_current(session_id)
+            .ok_or_else(|| context.internal_agent_upgrade())?;
+        if !valid_current_shape(session_id, current.head(), current.definition()) {
+            return Err(context.internal_agent_upgrade());
+        }
+        let committed = if outcome.changed() {
+            DurableSessionAgentUpgradeOutcome::Updated(
+                Arc::clone(current.head()),
+                Arc::clone(current.definition()),
+            )
+        } else {
+            DurableSessionAgentUpgradeOutcome::NoChange(
+                Arc::clone(current.head()),
+                Arc::clone(current.definition()),
+            )
+        };
+        if committed.definition().revision() != outcome.definition_revision() {
+            return Err(context.internal_agent_upgrade());
+        }
+        return Ok(committed);
+    }
+
+    let attempt = SealedSessionAgentUpgradeAttempt::new(
+        session_id,
+        expected_revision,
+        target,
+        owner_timestamp,
+    );
+    let outcome = context
+        .durable_state
+        .upgrade_session_agent(attempt)
+        .await
+        .map_err(|error| map_durable_agent_upgrade_error(&context, error))?;
+    let head = outcome.head();
+    let definition = outcome.definition();
+    if !valid_current_shape(session_id, head, definition) {
+        return Err(context.internal_agent_upgrade());
+    }
+    Ok(outcome)
 }
 
 fn loaded_executor_and_permit(
@@ -3016,8 +4303,8 @@ fn map_durable_lifecycle_error(
 fn map_executor_workspace_error(
     context: &OperationContext,
     error: SessionWorkspaceDefinitionError,
-) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
-    let error = match error {
+) -> SessionResidencyWorkspaceDefinitionError {
+    match error {
         SessionWorkspaceDefinitionError::Closing => {
             SessionResidencyWorkspaceDefinitionError::Closing
         }
@@ -3036,9 +4323,6 @@ fn map_executor_workspace_error(
         SessionWorkspaceDefinitionError::SessionDeleted => {
             SessionResidencyWorkspaceDefinitionError::SessionDeleted
         }
-        SessionWorkspaceDefinitionError::RevisionExhausted => {
-            SessionResidencyWorkspaceDefinitionError::RevisionExhausted
-        }
         SessionWorkspaceDefinitionError::StateTooLarge => {
             SessionResidencyWorkspaceDefinitionError::StateTooLarge
         }
@@ -3051,11 +4335,333 @@ fn map_executor_workspace_error(
         SessionWorkspaceDefinitionError::StorageUnavailable => {
             SessionResidencyWorkspaceDefinitionError::StorageUnavailable
         }
+        // An ordinary definition publication can never produce Agent-specific failures; an
+        // impossible executor error means the actor's validation contract broke and poisons the
+        // shared owners.
+        SessionWorkspaceDefinitionError::AgentMismatch
+        | SessionWorkspaceDefinitionError::AgentDisabled
+        | SessionWorkspaceDefinitionError::AgentDeleted
+        | SessionWorkspaceDefinitionError::RevisionUnavailable
+        | SessionWorkspaceDefinitionError::Unauthorized => context.internal_workspace(),
         SessionWorkspaceDefinitionError::InternalDispatchUnavailable => {
-            return Err(context.internal_workspace());
+            context.internal_workspace()
         }
+    }
+}
+
+fn map_executor_agent_upgrade_error(
+    context: &OperationContext,
+    error: SessionWorkspaceDefinitionError,
+) -> SessionResidencyAgentUpgradeError {
+    match error {
+        SessionWorkspaceDefinitionError::Closing => SessionResidencyAgentUpgradeError::Closing,
+        SessionWorkspaceDefinitionError::SessionBusy => {
+            SessionResidencyAgentUpgradeError::SessionBusy
+        }
+        SessionWorkspaceDefinitionError::SessionNotFound => {
+            SessionResidencyAgentUpgradeError::SessionNotFound
+        }
+        SessionWorkspaceDefinitionError::StaleRevision => {
+            SessionResidencyAgentUpgradeError::StaleRevision
+        }
+        SessionWorkspaceDefinitionError::SessionArchived => {
+            SessionResidencyAgentUpgradeError::SessionArchived
+        }
+        SessionWorkspaceDefinitionError::SessionDeleted => {
+            SessionResidencyAgentUpgradeError::SessionDeleted
+        }
+        SessionWorkspaceDefinitionError::AgentMismatch => {
+            SessionResidencyAgentUpgradeError::AgentMismatch
+        }
+        SessionWorkspaceDefinitionError::AgentDisabled => {
+            SessionResidencyAgentUpgradeError::AgentDisabled
+        }
+        SessionWorkspaceDefinitionError::AgentDeleted => {
+            SessionResidencyAgentUpgradeError::AgentDeleted
+        }
+        SessionWorkspaceDefinitionError::RevisionUnavailable => {
+            SessionResidencyAgentUpgradeError::RevisionUnavailable
+        }
+        SessionWorkspaceDefinitionError::StateTooLarge => {
+            SessionResidencyAgentUpgradeError::DurableStateTooLarge
+        }
+        // An Agent upgrade never invokes the Workspace resolver and never captures Prompt or
+        // Skill sources, so a Workspace-specific executor error is impossible; an impossible
+        // executor error means the actor's validation contract broke and poisons the shared
+        // owners.
+        SessionWorkspaceDefinitionError::WorkspaceUnavailable
+        | SessionWorkspaceDefinitionError::WorkspaceRejected
+        | SessionWorkspaceDefinitionError::Unauthorized => context.internal_agent_upgrade(),
+        SessionWorkspaceDefinitionError::StorageUnavailable => {
+            SessionResidencyAgentUpgradeError::StorageUnavailable
+        }
+        SessionWorkspaceDefinitionError::InternalDispatchUnavailable => {
+            context.internal_agent_upgrade()
+        }
+    }
+}
+
+fn map_durable_agent_upgrade_error(
+    context: &OperationContext,
+    error: DurableSessionAgentUpgradeError,
+) -> SessionResidencyAgentUpgradeError {
+    match error {
+        DurableSessionAgentUpgradeError::Closing => SessionResidencyAgentUpgradeError::Closing,
+        DurableSessionAgentUpgradeError::SessionNotFound => {
+            SessionResidencyAgentUpgradeError::SessionNotFound
+        }
+        DurableSessionAgentUpgradeError::StaleRevision => {
+            SessionResidencyAgentUpgradeError::StaleRevision
+        }
+        DurableSessionAgentUpgradeError::SessionArchived => {
+            SessionResidencyAgentUpgradeError::SessionArchived
+        }
+        DurableSessionAgentUpgradeError::SessionDeleted => {
+            SessionResidencyAgentUpgradeError::SessionDeleted
+        }
+        DurableSessionAgentUpgradeError::AgentMismatch => {
+            SessionResidencyAgentUpgradeError::AgentMismatch
+        }
+        DurableSessionAgentUpgradeError::AgentDisabled => {
+            SessionResidencyAgentUpgradeError::AgentDisabled
+        }
+        DurableSessionAgentUpgradeError::AgentDeleted => {
+            SessionResidencyAgentUpgradeError::AgentDeleted
+        }
+        DurableSessionAgentUpgradeError::RevisionUnavailable => {
+            SessionResidencyAgentUpgradeError::RevisionUnavailable
+        }
+        DurableSessionAgentUpgradeError::DurableStateTooLarge => {
+            SessionResidencyAgentUpgradeError::DurableStateTooLarge
+        }
+        DurableSessionAgentUpgradeError::StorageUnavailable => {
+            SessionResidencyAgentUpgradeError::StorageUnavailable
+        }
+        DurableSessionAgentUpgradeError::InternalDispatchUnavailable => {
+            context.internal_agent_upgrade()
+        }
+    }
+}
+
+/// Performs one loaded Session Workspace reload under the per-Session gate shared with Load,
+/// Unload, Fork, Lifecycle, Metadata, ordinary definition CAS, and Agent upgrade.  The reload is
+/// a loaded-only operation: it never reads or updates DurableState, and it only succeeds while
+/// the installed executor is Idle with no active publication.  The gate covers the loaded
+/// membership decision and the full executor reload completion, so a concurrent Load/Unload
+/// cannot slip between them.  An executor missing under the gate maps directly to
+/// SessionNotLoaded.
+async fn run_workspace_reload(
+    context: OperationContext,
+    session_id: SessionId,
+    owner_timestamp: Timestamp,
+    command_id: CommandId,
+) -> Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError> {
+    let gate = context.state.gate(session_id);
+    let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+    let Some(executor) = context.state.executor(session_id) else {
+        return Err(SessionResidencyWorkspaceReloadError::SessionNotLoaded);
     };
-    Err(error)
+
+    executor
+        .reload_workspace_with_cancellation(owner_timestamp, command_id, context.closing.clone())
+        .await
+        .map_err(|error| map_executor_workspace_reload_error(&context, error))
+}
+
+/// Applies one Agent availability fact to one loaded Session under the per-Session gate.  An
+/// executor missing under the gate is an Unload-first NoChange; the installed definition must
+/// still pin the requested AgentId (a mismatch means the Runtime enumeration and the executor
+/// disagree and is internal poison).  The operation never reads or writes DurableState.
+async fn run_agent_availability(
+    context: OperationContext,
+    session_id: SessionId,
+    agent_id: AgentId,
+    available: bool,
+    timestamp: Timestamp,
+    command_id: CommandId,
+) -> Result<(), SessionResidencyAgentAvailabilityError> {
+    let gate = context.state.gate(session_id);
+    let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+    let Some(executor) = context.state.executor(session_id) else {
+        return Ok(());
+    };
+    if executor.published_snapshot().definition().agent().agent_id() != agent_id {
+        return Err(context.internal_agent_availability());
+    }
+    executor
+        .set_agent_availability_with_cancellation(
+            agent_id,
+            available,
+            timestamp,
+            command_id,
+            CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| match error {
+            SessionAgentAvailabilityError::Closing => {
+                SessionResidencyAgentAvailabilityError::Closing
+            }
+            SessionAgentAvailabilityError::InternalDispatchUnavailable => {
+                context.internal_agent_availability()
+            }
+        })
+}
+
+/// The two-phase Runtime shared-resource installation over every loaded Session.
+///
+/// Phase (a) precomputes, for every loaded Session's exact installed definition, the
+/// model availability against the candidate Model catalog and the selected-Prompt availability
+/// against the candidate Prompt resources, before any executor is touched.  Ordinary model
+/// incompatibilities and ordinary selection failures degrade only the boolean fact; Closing
+/// stays Closing (a pre-install ordinary outcome, never a post-install required-publication
+/// failure), and every other failure on the installed Runtime-owned catalog/Prompt view is an
+/// internal invariant that poisons the shared owners.
+///
+/// Phase (b) constructs the new ResidencyTurnResources (same model gateway, tool set, and
+/// compaction settings; new Prompt/Model roots) and installs it into every loaded executor in
+/// sorted SessionId order under each per-Session gate, re-reading the loaded executor and its
+/// snapshot under the gate: an executor that disappeared or whose installed definition no
+/// longer matches the precomputed exact Arc is a closing/internal invariant under the Runtime
+/// global publication, never a silent NoChange.  Once phase (b) has begun, earlier executors
+/// may already hold the new roots, so every executor error — including Closing from the shared
+/// closing token — is a required live-publication failure of a partially completed fan-out and
+/// maps to internal poison, never a plain Closing; only the precompute (phase (a)) keeps the
+/// typed Closing outcome, because no executor has been touched yet.  Only after every Session
+/// succeeds does the completion return the new ResidencyTurnResources for the actor to install
+/// into its own future Turn resources.
+async fn run_shared_resources(
+    context: OperationContext,
+    prompt_resources: Arc<PromptResourceView>,
+    model_catalog: Arc<ModelCatalogView>,
+    timestamp: Timestamp,
+    command_id: CommandId,
+) -> Result<ResidencyTurnResources, SessionResidencySharedResourcesError> {
+    // Phase (a): precompute every availability fact before any executor update.  The loaded
+    // snapshots are already sorted by SessionId (the residency map is a BTreeMap), and the
+    // precompute order is irrelevant; only the completion of the whole precompute before any
+    // install matters.
+    struct PrecomputedSession {
+        definition: Arc<SessionDefinition>,
+        model_available: bool,
+        prompt_available: bool,
+    }
+    let mut precomputed = Vec::new();
+    for snapshot in context.state.loaded_session_snapshots() {
+        let definition = Arc::clone(snapshot.definition());
+        let Some(resources) = context.turn_resources.as_ref() else {
+            // The production Runtime always starts residency with Turn resources; the test-only
+            // dependency shape never routes a shared-resource installation.
+            return Err(context.internal_shared_resources());
+        };
+        let model_available = match model_available_for_definition(
+            &resources.model_gateway,
+            Arc::clone(&model_catalog),
+            &definition,
+        ) {
+            Ok(available) => available,
+            Err(_) => return Err(context.internal_shared_resources()),
+        };
+        let prompt_available = match prompt_available_for_definition(
+            context.durable_state.clone(),
+            Arc::clone(&context.prompt_service),
+            Arc::clone(&prompt_resources),
+            &definition,
+        )
+        .await
+        {
+            Ok(available) => available,
+            Err(SessionPromptAvailabilityError::Closing) => {
+                return Err(SessionResidencySharedResourcesError::Closing);
+            }
+            Err(SessionPromptAvailabilityError::InternalDispatchUnavailable) => {
+                return Err(context.internal_shared_resources());
+            }
+        };
+        precomputed.push(PrecomputedSession {
+            definition,
+            model_available,
+            prompt_available,
+        });
+    }
+
+    // Phase (b): install into every loaded executor under its own gate, then hand the new
+    // ResidencyTurnResources back to the actor for its future Loads.
+    let Some(current) = context.turn_resources.as_ref() else {
+        return Err(context.internal_shared_resources());
+    };
+    let new_resources = ResidencyTurnResources {
+        prompt_resources: Arc::clone(&prompt_resources),
+        model_gateway: Arc::clone(&current.model_gateway),
+        model_catalog: Arc::clone(&model_catalog),
+        tool_set: Arc::clone(&current.tool_set),
+        compaction: current.compaction,
+    };
+    for entry in &precomputed {
+        let session_id = entry.definition.session_id();
+        let gate = context.state.gate(session_id);
+        let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+        let Some(executor) = context.state.executor(session_id) else {
+            return Err(context.internal_shared_resources());
+        };
+        if !Arc::ptr_eq(executor.published_snapshot().definition(), &entry.definition) {
+            return Err(context.internal_shared_resources());
+        }
+        executor
+            .update_shared_resources_with_cancellation(
+                Arc::clone(&entry.definition),
+                Arc::clone(&prompt_resources),
+                Arc::clone(&model_catalog),
+                entry.prompt_available,
+                entry.model_available,
+                timestamp,
+                command_id,
+                context.closing.clone(),
+            )
+            .await
+            // Once phase (b) has begun, earlier executors may already have installed the new
+            // roots; a partially completed fan-out cannot report a plain Closing, so every
+            // executor update error — including the closing token's — poisons the shared owners.
+            .map_err(|_| context.internal_shared_resources())?;
+    }
+    Ok(new_resources)
+}
+
+
+fn map_executor_workspace_reload_error(
+    context: &OperationContext,
+    error: SessionDefinitionPublicationError,
+) -> SessionResidencyWorkspaceReloadError {
+    match error {
+        SessionDefinitionPublicationError::Closing => SessionResidencyWorkspaceReloadError::Closing,
+        SessionDefinitionPublicationError::SessionBusy => {
+            SessionResidencyWorkspaceReloadError::SessionBusy
+        }
+        SessionDefinitionPublicationError::WorkspaceUnavailable => {
+            SessionResidencyWorkspaceReloadError::WorkspaceUnavailable
+        }
+        SessionDefinitionPublicationError::WorkspaceRejected => {
+            SessionResidencyWorkspaceReloadError::WorkspaceRejected
+        }
+        SessionDefinitionPublicationError::Unauthorized => {
+            SessionResidencyWorkspaceReloadError::Unauthorized
+        }
+        // A reload never touches DurableState and never performs a durable CAS, so every other
+        // executor error is impossible on this seam; an impossible executor error means the
+        // actor's validation contract broke and poisons the shared owners.
+        SessionDefinitionPublicationError::SessionNotFound
+        | SessionDefinitionPublicationError::StaleRevision
+        | SessionDefinitionPublicationError::SessionArchived
+        | SessionDefinitionPublicationError::SessionDeleted
+        | SessionDefinitionPublicationError::AgentMismatch
+        | SessionDefinitionPublicationError::AgentDisabled
+        | SessionDefinitionPublicationError::AgentDeleted
+        | SessionDefinitionPublicationError::RevisionUnavailable
+        | SessionDefinitionPublicationError::StateTooLarge
+        | SessionDefinitionPublicationError::StorageUnavailable
+        | SessionDefinitionPublicationError::InternalDispatchUnavailable => {
+            context.internal_workspace_reload()
+        }
+    }
 }
 
 fn map_durable_definition_error(
@@ -3086,30 +4692,77 @@ fn map_durable_definition_error(
     }
 }
 
+/// Performs one Session metadata CAS under the per-Session gate.  The loaded membership observed
+/// under this gate is the linearization point for the required loaded publication: a changed
+/// durable update publishes the exact changed metadata through the installed executor, and any
+/// executor failure after a durable Updated is a required post-commit live-publication failure that
+/// poisons the shared owners.  Normal registry shutdown drains admitted children before closing
+/// executors, so a loaded executor is never observed closing under an admitted metadata operation.
+async fn run_metadata(
+    context: OperationContext,
+    attempt: SealedSessionMetadataAttempt,
+    timestamp: Timestamp,
+    command_id: CommandId,
+) -> Result<DurableSessionMetadataOutcome, SessionResidencyMetadataError> {
+    let session_id = attempt.session_id();
+    let gate = context.state.gate(session_id);
+    let _permit = SessionResidencyOperationPermit::acquire(gate).await;
+    let loaded_executor = context.state.executor(session_id);
+    let outcome = match context.durable_state.update_session_metadata(attempt).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Err(match error {
+                DurableSessionMetadataError::Closing => SessionResidencyMetadataError::Closing,
+                DurableSessionMetadataError::SessionNotFound => {
+                    SessionResidencyMetadataError::SessionNotFound
+                }
+                DurableSessionMetadataError::StaleRevision => {
+                    SessionResidencyMetadataError::StaleRevision
+                }
+                DurableSessionMetadataError::SessionDeleted => {
+                    SessionResidencyMetadataError::SessionDeleted
+                }
+                DurableSessionMetadataError::DurableStateTooLarge => {
+                    SessionResidencyMetadataError::DurableStateTooLarge
+                }
+                DurableSessionMetadataError::StorageUnavailable => {
+                    SessionResidencyMetadataError::StorageUnavailable
+                }
+                DurableSessionMetadataError::InternalDispatchUnavailable => {
+                    return Err(context.internal_metadata());
+                }
+            });
+        }
+    };
+    if outcome.head().session_id() != session_id {
+        return Err(context.internal_metadata());
+    }
+    if let (DurableSessionMetadataOutcome::Updated(head), Some(executor)) =
+        (&outcome, loaded_executor)
+    {
+        let published = executor
+            .publish_metadata(Arc::new(head.metadata().clone()), timestamp, command_id)
+            .await;
+        if published.is_err() {
+            return Err(context.internal_metadata());
+        }
+    }
+    Ok(outcome)
+}
+
+/// Validates the unloaded durable outcome shape and returns the exact committed outcome for the
+/// Runtime event/outcome projection.
 fn map_unloaded_definition_outcome(
     context: &OperationContext,
     session_id: SessionId,
     outcome: DurableSessionDefinitionOutcome,
-) -> Result<SessionWorkspaceDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
-    let changed = outcome.changed();
+) -> Result<DurableSessionDefinitionOutcome, SessionResidencyWorkspaceDefinitionError> {
     let head = outcome.head();
     let definition = outcome.definition();
     if !valid_current_shape(session_id, head, definition) {
         return Err(context.internal_workspace());
     }
-    let definition_revision = definition.revision();
-    let workspace_revision = definition.workspace().revision();
-    Ok(if changed {
-        SessionWorkspaceDefinitionOutcome::Updated {
-            definition_revision,
-            workspace_revision,
-        }
-    } else {
-        SessionWorkspaceDefinitionOutcome::NoChange {
-            definition_revision,
-            workspace_revision,
-        }
-    })
+    Ok(outcome)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -3136,6 +4789,7 @@ mod tests {
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier};
     use crate::durable_state::DurableState;
+    use crate::model_gateway::{ModelSelection, ReasoningPreference};
     use crate::prompt::{
         PromptSourceError, WorkspacePromptSource, WorkspacePromptSourceAdapter,
         WorkspacePromptSourceFuture,
@@ -3611,7 +5265,7 @@ mod tests {
         );
 
         source.fail();
-        assert_eq!(
+        assert!(matches!(
             registry
                 .update_workspace_definition(
                     session_id,
@@ -3621,7 +5275,7 @@ mod tests {
                 )
                 .await,
             Err(SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable)
-        );
+        ));
         let unchanged = registry.snapshot(session_id).await.unwrap();
         let unchanged_prompt = unchanged.workspace().prompt_context();
         assert_eq!(unchanged.definition_revision().get(), 1);
@@ -3754,10 +5408,10 @@ mod tests {
         prompt_grant.store(false, Ordering::Release);
         source.release_blocked();
 
-        assert_eq!(
+        assert!(matches!(
             update.await,
             Err(SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable)
-        );
+        ));
         let unchanged = registry.snapshot(session_id).await.unwrap();
         assert_eq!(unchanged.definition_revision().get(), 1);
         assert_eq!(
@@ -3858,10 +5512,10 @@ mod tests {
             }
         }
         registry.close().await;
-        assert_eq!(
+        assert!(matches!(
             update.await,
             Err(SessionResidencyWorkspaceDefinitionError::Closing)
-        );
+        ));
         assert_eq!(
             state
                 .session_current_definition(session_id)
@@ -4258,6 +5912,73 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn reload_workspace_requires_loaded_residency() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        let timestamp = "2026-08-03T10:02:00.000Z".parse().unwrap();
+
+        // A never-loaded (or missing) Session maps directly to SessionNotLoaded without reading
+        // or updating DurableState.
+        assert_eq!(
+            registry
+                .reload_workspace(session_id, timestamp, CommandId::generate().unwrap())
+                .await,
+            Err(SessionResidencyWorkspaceReloadError::SessionNotLoaded)
+        );
+        let missing: SessionId = "ses_ffffffffffffffffffffffffffffffff".parse().unwrap();
+        assert_eq!(
+            registry
+                .reload_workspace(missing, timestamp, CommandId::generate().unwrap())
+                .await,
+            Err(SessionResidencyWorkspaceReloadError::SessionNotLoaded)
+        );
+
+        // The durable definition is untouched by the rejected reloads.
+        assert_eq!(
+            state
+                .session_current(session_id)
+                .unwrap()
+                .definition()
+                .revision()
+                .get(),
+            1
+        );
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn loaded_reload_holds_gate_and_linearizes_with_unload() {
+        let store = TempStore::new();
+        let (context, state, registry) = open_registry(&store).await;
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        registry.load_ready_idle(session_id).await.unwrap();
+        let gate = registry.shared.gate(session_id);
+        let gate_guard = SessionResidencyOperationPermit::acquire(gate).await;
+        let mut reload = Box::pin(registry.reload_workspace(
+            session_id,
+            "2026-08-03T10:02:00.000Z".parse().unwrap(),
+            CommandId::generate().unwrap(),
+        ));
+        let mut unload = Box::pin(registry.unload(session_id));
+
+        // Both operations wait on the same per-Session FIFO gate: the reload completion and the
+        // Unload linearize exactly once, in admission order.
+        assert!(poll_once_pending(reload.as_mut()).await);
+        assert!(poll_once_pending(unload.as_mut()).await);
+        registry.wait_for_active_operation_count_for_test(2).await;
+        drop(gate_guard);
+
+        let reloaded = reload.await.expect("the queued reload publishes");
+        assert!(reloaded.changed());
+        assert_eq!(reloaded.definition_revision().get(), 1);
+        assert_eq!(reloaded.workspace_revision().get(), 1);
+        assert_eq!(unload.await, Ok(SessionResidencyUnloadOutcome::Unloaded));
+        assert!(!registry.shared.has_loaded(session_id));
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn dropped_unload_waiter_still_removes_residency() {
         let store = TempStore::new();
         let (context, state, registry) = open_registry(&store).await;
@@ -4471,10 +6192,10 @@ mod tests {
                 )
                 .await;
             if path.ends_with("missing-workspace") {
-                assert_eq!(
+                assert!(matches!(
                     result,
                     Err(SessionResidencyWorkspaceDefinitionError::WorkspaceUnavailable)
-                );
+                ));
             } else {
                 assert!(result.is_ok());
             }
@@ -4752,6 +6473,108 @@ mod tests {
         let snapshot = registry.snapshot(session_id).await.unwrap();
         assert_eq!(snapshot.definition_revision().get(), 2);
         assert_eq!(snapshot.workspace_revision().get(), 2);
+        close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn equivalent_workspace_with_model_change_skips_resolver_but_true_workspace_change_resolves()
+     {
+        let store = TempStore::new();
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new(context.clone()));
+        let hooks = resolver.test_hooks();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), Vec::new()).unwrap(),
+        );
+        let registry = SessionResidencyRegistry::start(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .expect("the residency actor starts");
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        let current = state
+            .session_current(session_id)
+            .expect("the fixture Session is current");
+        let expected_model = SessionModelConfig::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ReasoningPreference::High,
+            None,
+        );
+
+        // A canonical-equivalent Workspace combined with a Model change is future-only: it must
+        // publish without invoking the Workspace resolver at all.
+        hooks.arm_after_candidate_before_final_recheck();
+        let future_only = registry
+            .update_session_definition(
+                session_id,
+                current.definition().revision(),
+                Some(current.definition().workspace().clone()),
+                Some(expected_model.clone()),
+                None,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+            )
+            .await
+            .expect("the equivalent-Workspace Model update publishes");
+        assert!(future_only.changed());
+        assert_eq!(future_only.definition_revision().get(), 2);
+        assert_eq!(future_only.workspace_revision().get(), 1);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                hooks.wait_after_candidate_before_final_recheck(),
+            )
+            .await
+            .is_err(),
+            "an equivalent Workspace must not invoke the resolver"
+        );
+        let snapshot = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(snapshot.workspace_revision().get(), 1);
+        assert_eq!(snapshot.definition_revision().get(), 2);
+
+        // A true Workspace semantic change on the same loaded Session does resolve.
+        let workspace = {
+            let workspace_update = registry.update_session_definition(
+                session_id,
+                snapshot.definition_revision(),
+                Some(changed_workspace(&store.new_workspace)),
+                None,
+                None,
+                "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+            );
+            tokio::pin!(workspace_update);
+            tokio::select! {
+                _ = hooks.wait_after_candidate_before_final_recheck() => {}
+                result = workspace_update.as_mut() => {
+                    panic!("Workspace publication settled before resolver recheck: {result:?}")
+                }
+            }
+            hooks.release_after_candidate_before_final_recheck();
+            workspace_update
+                .as_mut()
+                .await
+                .expect("the true Workspace change publishes")
+        };
+        assert!(workspace.changed());
+        assert_eq!(workspace.definition_revision().get(), 3);
+        assert_eq!(workspace.workspace_revision().get(), 2);
+        let snapshot = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(snapshot.workspace_revision().get(), 2);
+        assert_eq!(
+            snapshot
+                .workspace()
+                .prompt_context()
+                .primary_root()
+                .as_path(),
+            fs::canonicalize(&store.new_workspace).unwrap()
+        );
         close_fixture(context, state, registry).await;
     }
 

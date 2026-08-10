@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent_session_lifecycle::{
     AgentDefinitionPatch, AgentMetadataPatch, AgentRevisionRef, AgentStatus, AgentUsableStatus,
     ForkAnchor, ForkSourceKind, NewAgentDefinition, NewAgentMetadata, OptionalTextPatch,
-    SessionModelConfig,
+    SessionMetadataPatch, SessionModelConfig,
 };
 use crate::model_gateway::{ModelId, ModelSelection, ProviderId, ReasoningPreference};
 use crate::prompt::{
@@ -26,14 +26,14 @@ use crate::runtime_interface::{
     RuntimeCapabilities, RuntimeCommand, RuntimeDiagnosticView, RuntimeDispatchError,
     RuntimeEventDetail, RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult,
     RuntimeReadQuery, RuntimeRequest, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView,
-    RuntimeView, SessionCommand, SessionDefinitionSummary, SessionDiagnosticView,
-    SessionEventDetail, SessionExecutionView, SessionForkProvenanceView, SessionLifecycleView,
-    SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView, SessionReadinessView,
-    SessionRecordingState, SessionRecordingView, SessionSnapshot, SessionStateEventKind,
-    SessionSummary, SessionUsageView, SnapshotRequest, SnapshotResponse, StateEvent, StateEventMsg,
-    SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionClosed, SubscriptionRequest,
-    SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView, TurnInterruptionView,
-    TurnStatusView, TurnTerminalView, validate_command_error_contract,
+    RuntimeView, SessionCommand, SessionDefinitionPatch, SessionDefinitionSummary,
+    SessionDiagnosticView, SessionEventDetail, SessionExecutionView, SessionForkProvenanceView,
+    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
+    SessionReadinessView, SessionRecordingState, SessionRecordingView, SessionSnapshot,
+    SessionStateEventKind, SessionSummary, SessionUsageView, SnapshotRequest, SnapshotResponse,
+    StateEvent, StateEventMsg, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionClosed,
+    SubscriptionRequest, SubscriptionScope, TurnCommand, TurnExecutionPhaseView, TurnFailureView,
+    TurnInterruptionView, TurnStatusView, TurnTerminalView, validate_command_error_contract,
     validate_command_error_message, validate_command_output,
 };
 use crate::skills::SkillId;
@@ -440,6 +440,20 @@ impl RuntimeCommandInput {
                     anchor: value.anchor.into_semantic(),
                 })
             }
+            Self::Session(SessionCommandInput::UpdateDefinition(value)) => {
+                RuntimeCommand::Session(value.into_semantic(limits)?)
+            }
+            Self::Session(SessionCommandInput::UpgradeAgentRevision(value)) => {
+                RuntimeCommand::Session(value.into_semantic()?)
+            }
+            Self::Session(SessionCommandInput::ReloadWorkspace(value)) => {
+                RuntimeCommand::Session(SessionCommand::ReloadWorkspace {
+                    session_id: value.session_id,
+                })
+            }
+            Self::Session(SessionCommandInput::UpdateMetadata(value)) => {
+                RuntimeCommand::Session(value.into_semantic(limits)?)
+            }
             Self::Turn(TurnCommandInput::Submit(value)) => {
                 RuntimeCommand::Turn(TurnCommand::Submit {
                     session_id: value.session_id,
@@ -811,6 +825,10 @@ enum SessionCommandInput {
     Unarchive(SessionIdInput),
     Delete(SessionIdInput),
     Fork(ForkSessionCommandInput),
+    UpdateDefinition(UpdateSessionDefinitionCommandInput),
+    UpgradeAgentRevision(UpgradeSessionAgentRevisionCommandInput),
+    ReloadWorkspace(SessionIdInput),
+    UpdateMetadata(UpdateSessionMetadataCommandInput),
 }
 
 #[derive(Deserialize)]
@@ -854,6 +872,103 @@ impl ForkAnchorInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ForkItemAnchorInput {
     item_id: crate::wire::ItemId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateSessionDefinitionCommandInput {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    patch: SessionDefinitionPatchInput,
+}
+
+impl UpdateSessionDefinitionCommandInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionCommand, TypedJsonError> {
+        Ok(SessionCommand::UpdateDefinition {
+            session_id: self.session_id,
+            expected_revision: self.expected_revision,
+            patch: self.patch.into_semantic(limits)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpgradeSessionAgentRevisionCommandInput {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRefInput>,
+}
+
+impl UpgradeSessionAgentRevisionCommandInput {
+    fn into_semantic(self) -> Result<SessionCommand, TypedJsonError> {
+        Ok(SessionCommand::UpgradeAgentRevision {
+            session_id: self.session_id,
+            expected_revision: self.expected_revision,
+            target: self.target.map(AgentRevisionRefInput::into_semantic),
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionDefinitionPatchInput {
+    workspace: Option<WorkspaceDefinitionWireInput>,
+    model: Option<SessionModelConfigInput>,
+    prompts: Option<SessionPromptSelectionInput>,
+}
+
+impl SessionDefinitionPatchInput {
+    fn into_semantic(
+        self,
+        limits: ProtocolLimits,
+    ) -> Result<SessionDefinitionPatch, TypedJsonError> {
+        Ok(SessionDefinitionPatch::new(
+            self.workspace
+                .map(|workspace| workspace.into_semantic(limits))
+                .transpose()?,
+            self.model.map(|model| model.into_semantic()).transpose()?,
+            self.prompts
+                .map(|prompts| prompts.into_semantic(limits))
+                .transpose()?,
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateSessionMetadataCommandInput {
+    session_id: SessionId,
+    expected_revision: SessionMetadataRevision,
+    patch: SessionMetadataPatchInput,
+}
+
+impl UpdateSessionMetadataCommandInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionCommand, TypedJsonError> {
+        Ok(SessionCommand::UpdateMetadata {
+            session_id: self.session_id,
+            expected_revision: self.expected_revision,
+            patch: self.patch.into_semantic(limits)?,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionMetadataPatchInput {
+    name: OptionalTextPatchInput,
+    description: OptionalTextPatchInput,
+}
+
+impl SessionMetadataPatchInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<SessionMetadataPatch, TypedJsonError> {
+        SessionMetadataPatch::new_with_limits(
+            self.name.into_semantic(limits)?,
+            self.description.into_semantic(limits)?,
+            limits,
+        )
+        .map_err(|_| invalid_scalar())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1914,9 +2029,14 @@ impl SessionSnapshot {
         if !matches!(value.lifecycle, SessionLifecycleInput::Open) {
             return Err(invalid_scalar());
         }
-        if !matches!(value.load_state, SessionLoadStateInput::Loaded)
-            || !matches!(value.readiness, SessionReadinessInput::Ready)
-        {
+        if !matches!(value.load_state, SessionLoadStateInput::Loaded) {
+            return Err(TypedJsonError::PendingPublicTarget);
+        }
+        // Ready and Unavailable are owned semantic shapes; the general constructor enforces the
+        // legal matrix (a non-Ready Session must be an empty Idle projection).  Preparing stays
+        // a pending public target until the readiness milestone that produces it.
+        let readiness = value.readiness.into_semantic()?;
+        if matches!(readiness, SessionReadinessView::Preparing) {
             return Err(TypedJsonError::PendingPublicTarget);
         }
         let current_turn = value
@@ -1940,10 +2060,11 @@ impl SessionSnapshot {
             .into_iter()
             .map(|diagnostic| diagnostic.into_session(limits))
             .collect::<Result<Vec<_>, _>>()?;
-        SessionSnapshot::new_loaded_ready_with_observation(
+        SessionSnapshot::new_loaded_with_readiness_with_observation(
             value.session_id,
             value.metadata.into_semantic(limits)?,
             value.definition.into_semantic(limits)?,
+            readiness,
             execution,
             current_turn,
             active_items,
@@ -2460,7 +2581,10 @@ enum RuntimeStateEventKindInput {
     SessionUnarchived,
     SessionDeleted,
     SessionForked,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
     CommandCatalogInvalidated,
+    SharedResourcesReloaded,
 }
 
 impl RuntimeStateEventKindInput {
@@ -2477,7 +2601,10 @@ impl RuntimeStateEventKindInput {
             Self::SessionUnarchived => RuntimeStateEventKind::SessionUnarchived,
             Self::SessionDeleted => RuntimeStateEventKind::SessionDeleted,
             Self::SessionForked => RuntimeStateEventKind::SessionForked,
+            Self::SessionDefinitionUpdated => RuntimeStateEventKind::SessionDefinitionUpdated,
+            Self::SessionMetadataUpdated => RuntimeStateEventKind::SessionMetadataUpdated,
             Self::CommandCatalogInvalidated => RuntimeStateEventKind::CommandCatalogInvalidated,
+            Self::SharedResourcesReloaded => RuntimeStateEventKind::SharedResourcesReloaded,
         })
     }
 }
@@ -2527,6 +2654,10 @@ struct SessionStateEventInput {
 )]
 enum SessionStateEventKindInput {
     SessionExecutionChanged,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
+    SessionWorkspaceReloaded,
+    SessionReadinessChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -2536,6 +2667,10 @@ impl SessionStateEventKindInput {
     fn into_semantic(self) -> Result<SessionStateEventKind, TypedJsonError> {
         Ok(match self {
             Self::SessionExecutionChanged => SessionStateEventKind::SessionExecutionChanged,
+            Self::SessionDefinitionUpdated => SessionStateEventKind::SessionDefinitionUpdated,
+            Self::SessionMetadataUpdated => SessionStateEventKind::SessionMetadataUpdated,
+            Self::SessionWorkspaceReloaded => SessionStateEventKind::SessionWorkspaceReloaded,
+            Self::SessionReadinessChanged => SessionStateEventKind::SessionReadinessChanged,
             Self::TurnCompleted => SessionStateEventKind::TurnCompleted,
             Self::TurnInterrupted => SessionStateEventKind::TurnInterrupted,
             Self::TurnFailed => SessionStateEventKind::TurnFailed,
@@ -3086,7 +3221,7 @@ impl<'a> SessionSnapshotOutput<'a> {
             metadata: SessionMetadataOutput::from_semantic(value.metadata()),
             definition: SessionDefinitionSummaryOutput::from_semantic(value.definition()),
             load_state: SessionLoadStateOutput::Loaded,
-            readiness: SessionReadinessOutput::Ready,
+            readiness: SessionReadinessOutput::from_semantic(value.readiness()),
             execution: SessionExecutionOutput::from_semantic(value.execution()),
             current_turn: value.current_turn().map(CurrentTurnOutput::from_semantic),
             active_items: value
@@ -3968,7 +4103,10 @@ enum RuntimeStateEventKindOutput {
     SessionUnarchived,
     SessionDeleted,
     SessionForked,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
     CommandCatalogInvalidated,
+    SharedResourcesReloaded,
 }
 
 impl RuntimeStateEventKindOutput {
@@ -3985,7 +4123,10 @@ impl RuntimeStateEventKindOutput {
             RuntimeStateEventKind::SessionUnarchived => Self::SessionUnarchived,
             RuntimeStateEventKind::SessionDeleted => Self::SessionDeleted,
             RuntimeStateEventKind::SessionForked => Self::SessionForked,
+            RuntimeStateEventKind::SessionDefinitionUpdated => Self::SessionDefinitionUpdated,
+            RuntimeStateEventKind::SessionMetadataUpdated => Self::SessionMetadataUpdated,
             RuntimeStateEventKind::CommandCatalogInvalidated => Self::CommandCatalogInvalidated,
+            RuntimeStateEventKind::SharedResourcesReloaded => Self::SharedResourcesReloaded,
         }
     }
 }
@@ -4039,6 +4180,10 @@ struct SessionStateEventOutput<'a> {
 )]
 enum SessionStateEventKindOutput {
     SessionExecutionChanged,
+    SessionDefinitionUpdated,
+    SessionMetadataUpdated,
+    SessionWorkspaceReloaded,
+    SessionReadinessChanged,
     TurnCompleted,
     TurnInterrupted,
     TurnFailed,
@@ -4048,6 +4193,10 @@ impl SessionStateEventKindOutput {
     const fn from_semantic(value: SessionStateEventKind) -> Self {
         match value {
             SessionStateEventKind::SessionExecutionChanged => Self::SessionExecutionChanged,
+            SessionStateEventKind::SessionDefinitionUpdated => Self::SessionDefinitionUpdated,
+            SessionStateEventKind::SessionMetadataUpdated => Self::SessionMetadataUpdated,
+            SessionStateEventKind::SessionWorkspaceReloaded => Self::SessionWorkspaceReloaded,
+            SessionStateEventKind::SessionReadinessChanged => Self::SessionReadinessChanged,
             SessionStateEventKind::TurnCompleted => Self::TurnCompleted,
             SessionStateEventKind::TurnInterrupted => Self::TurnInterrupted,
             SessionStateEventKind::TurnFailed => Self::TurnFailed,
@@ -4408,6 +4557,44 @@ impl<'a> RuntimeCommandOutput<'a> {
                 source_session_id: *source_session_id,
                 anchor: ForkAnchorOutput::from_semantic(anchor),
             })),
+            RuntimeCommand::Session(SessionCommand::UpdateDefinition {
+                session_id,
+                expected_revision,
+                patch,
+            }) => Self::Session(SessionCommandOutput::UpdateDefinition(
+                UpdateSessionDefinitionCommandOutput {
+                    session_id: *session_id,
+                    expected_revision: *expected_revision,
+                    patch: SessionDefinitionPatchOutput::from_semantic(patch),
+                },
+            )),
+            RuntimeCommand::Session(SessionCommand::UpgradeAgentRevision {
+                session_id,
+                expected_revision,
+                target,
+            }) => Self::Session(SessionCommandOutput::UpgradeAgentRevision(
+                UpgradeSessionAgentRevisionCommandOutput::from_semantic(
+                    *session_id,
+                    *expected_revision,
+                    *target,
+                ),
+            )),
+            RuntimeCommand::Session(SessionCommand::ReloadWorkspace { session_id }) => {
+                Self::Session(SessionCommandOutput::ReloadWorkspace(SessionIdOutput {
+                    session_id: *session_id,
+                }))
+            }
+            RuntimeCommand::Session(SessionCommand::UpdateMetadata {
+                session_id,
+                expected_revision,
+                patch,
+            }) => Self::Session(SessionCommandOutput::UpdateMetadata(
+                UpdateSessionMetadataCommandOutput {
+                    session_id: *session_id,
+                    expected_revision: *expected_revision,
+                    patch: SessionMetadataPatchOutput::from_semantic(patch),
+                },
+            )),
             RuntimeCommand::Turn(TurnCommand::Submit { session_id, intent }) => {
                 Self::Turn(TurnCommandOutput::Submit(SubmitCommandOutput {
                     session_id: *session_id,
@@ -4748,6 +4935,84 @@ enum SessionCommandOutput<'a> {
     Unarchive(SessionIdOutput),
     Delete(SessionIdOutput),
     Fork(ForkSessionCommandOutput),
+    UpdateDefinition(UpdateSessionDefinitionCommandOutput<'a>),
+    UpgradeAgentRevision(UpgradeSessionAgentRevisionCommandOutput),
+    ReloadWorkspace(SessionIdOutput),
+    UpdateMetadata(UpdateSessionMetadataCommandOutput<'a>),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSessionDefinitionCommandOutput<'a> {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    patch: SessionDefinitionPatchOutput<'a>,
+}
+
+#[derive(Serialize)]
+struct SessionDefinitionPatchOutput<'a> {
+    workspace: Option<WorkspaceDefinitionOutput<'a>>,
+    model: Option<SessionModelConfigOutput<'a>>,
+    prompts: Option<SessionPromptSelectionOutput<'a>>,
+}
+
+impl<'a> SessionDefinitionPatchOutput<'a> {
+    fn from_semantic(value: &'a SessionDefinitionPatch) -> Self {
+        Self {
+            workspace: value
+                .workspace()
+                .map(WorkspaceDefinitionOutput::from_semantic),
+            model: value.model().map(SessionModelConfigOutput::from_semantic),
+            prompts: value
+                .prompts()
+                .map(SessionPromptSelectionOutput::from_semantic),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpgradeSessionAgentRevisionCommandOutput {
+    session_id: SessionId,
+    expected_revision: SessionDefinitionRevision,
+    target: Option<AgentRevisionRefOutput>,
+}
+
+impl UpgradeSessionAgentRevisionCommandOutput {
+    fn from_semantic(
+        session_id: SessionId,
+        expected_revision: SessionDefinitionRevision,
+        target: Option<AgentRevisionRef>,
+    ) -> Self {
+        Self {
+            session_id,
+            expected_revision,
+            target: target.map(AgentRevisionRefOutput::from_semantic),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSessionMetadataCommandOutput<'a> {
+    session_id: SessionId,
+    expected_revision: SessionMetadataRevision,
+    patch: SessionMetadataPatchOutput<'a>,
+}
+
+#[derive(Serialize)]
+struct SessionMetadataPatchOutput<'a> {
+    name: OptionalTextPatchOutput<'a>,
+    description: OptionalTextPatchOutput<'a>,
+}
+
+impl<'a> SessionMetadataPatchOutput<'a> {
+    fn from_semantic(value: &'a SessionMetadataPatch) -> Self {
+        Self {
+            name: OptionalTextPatchOutput::from_semantic(value.name()),
+            description: OptionalTextPatchOutput::from_semantic(value.description()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -5156,7 +5421,9 @@ enum CommandOutcomeInput {
     AgentStatusChanged(AgentStatusChangedInput),
     AgentDeleted,
     SessionDefinitionUpdated(SessionDefinitionUpdatedInput),
+    WorkspaceReloaded,
     SessionForked(SessionForkedInput),
+    SessionMetadataUpdated(SessionMetadataUpdatedInput),
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
@@ -5167,6 +5434,7 @@ enum CommandOutcomeInput {
     FollowUpQueued,
     QueuedMessageCancelled,
     CancelAccepted(CancelAcceptedInput),
+    SharedResourcesReloaded,
     CommandOutput,
     NoChange,
 }
@@ -5192,9 +5460,13 @@ impl CommandOutcomeInput {
             Self::SessionDefinitionUpdated(value) => CommandOutcome::SessionDefinitionUpdated {
                 definition_revision: value.definition_revision,
             },
+            Self::WorkspaceReloaded => CommandOutcome::WorkspaceReloaded,
             Self::SessionForked(value) => CommandOutcome::SessionForked {
                 session_id: value.session_id,
                 source: value.source.into_semantic(),
+            },
+            Self::SessionMetadataUpdated(value) => CommandOutcome::SessionMetadataUpdated {
+                metadata_revision: value.metadata_revision,
             },
             Self::SessionArchived => CommandOutcome::SessionArchived,
             Self::SessionUnarchived => CommandOutcome::SessionUnarchived,
@@ -5213,6 +5485,7 @@ impl CommandOutcomeInput {
                 target: value.target.into_semantic(),
                 cancel_epoch: value.cancel_epoch.get(),
             },
+            Self::SharedResourcesReloaded => CommandOutcome::SharedResourcesReloaded,
             Self::CommandOutput => CommandOutcome::CommandOutput,
             Self::NoChange => CommandOutcome::NoChange,
         }
@@ -5256,6 +5529,12 @@ struct SessionDefinitionUpdatedInput {
 struct SessionForkedInput {
     session_id: SessionId,
     source: ForkSourceKindInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionMetadataUpdatedInput {
+    metadata_revision: SessionMetadataRevision,
 }
 
 #[derive(Deserialize)]
@@ -5600,7 +5879,9 @@ enum CommandOutcomeOutput {
     AgentStatusChanged(AgentStatusChangedOutput),
     AgentDeleted,
     SessionDefinitionUpdated(SessionDefinitionUpdatedOutput),
+    WorkspaceReloaded,
     SessionForked(SessionForkedOutput),
+    SessionMetadataUpdated(SessionMetadataUpdatedOutput),
     SessionArchived,
     SessionUnarchived,
     SessionDeleted,
@@ -5611,6 +5892,7 @@ enum CommandOutcomeOutput {
     FollowUpQueued,
     QueuedMessageCancelled,
     CancelAccepted(CancelAcceptedOutput),
+    SharedResourcesReloaded,
     CommandOutput,
     NoChange,
 }
@@ -5648,10 +5930,16 @@ impl CommandOutcomeOutput {
             } => Self::SessionDefinitionUpdated(SessionDefinitionUpdatedOutput {
                 definition_revision: *definition_revision,
             }),
+            CommandOutcome::WorkspaceReloaded => Self::WorkspaceReloaded,
             CommandOutcome::SessionForked { session_id, source } => {
                 Self::SessionForked(SessionForkedOutput {
                     session_id: *session_id,
                     source: ForkSourceKindOutput::from_semantic(*source),
+                })
+            }
+            CommandOutcome::SessionMetadataUpdated { metadata_revision } => {
+                Self::SessionMetadataUpdated(SessionMetadataUpdatedOutput {
+                    metadata_revision: *metadata_revision,
                 })
             }
             CommandOutcome::SessionArchived => Self::SessionArchived,
@@ -5674,6 +5962,7 @@ impl CommandOutcomeOutput {
                 target: PublicCancelTargetOutput::from_semantic(*target),
                 cancel_epoch: super::CanonicalU64::new(*cancel_epoch),
             }),
+            CommandOutcome::SharedResourcesReloaded => Self::SharedResourcesReloaded,
             CommandOutcome::CommandOutput => Self::CommandOutput,
             CommandOutcome::NoChange => Self::NoChange,
         }
@@ -5716,6 +6005,12 @@ struct SessionDefinitionUpdatedOutput {
 struct SessionForkedOutput {
     session_id: SessionId,
     source: ForkSourceKindOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionMetadataUpdatedOutput {
+    metadata_revision: SessionMetadataRevision,
 }
 
 #[derive(Serialize)]
@@ -6855,6 +7150,51 @@ fn validate_command_semantic_limits(
             NewSessionMetadata::new_with_limits(metadata.name(), metadata.description(), limits)
                 .map_err(|_| invalid_scalar())?;
         }
+        RuntimeCommand::Session(SessionCommand::UpdateMetadata { patch, .. }) => {
+            SessionMetadataPatch::new_with_limits(
+                patch.name().clone(),
+                patch.description().clone(),
+                limits,
+            )
+            .map_err(|_| invalid_scalar())?;
+        }
+        RuntimeCommand::Session(SessionCommand::UpdateDefinition { patch, .. }) => {
+            if let Some(workspace) = patch.workspace() {
+                let root_count = workspace.additional_roots().len().saturating_add(1);
+                if root_count > usize::from(limits.workspace.max_workspace_roots) {
+                    return Err(invalid_scalar());
+                }
+                for root in
+                    std::iter::once(workspace.primary_root()).chain(workspace.additional_roots())
+                {
+                    if root.path().as_str().len()
+                        > usize::try_from(limits.workspace.max_absolute_path_uri_bytes)
+                            .unwrap_or(usize::MAX)
+                    {
+                        return Err(invalid_scalar());
+                    }
+                }
+                let relative = workspace.cwd().relative_path().as_str();
+                let relative_segments = if relative.is_empty() {
+                    0
+                } else {
+                    relative.split('/').count()
+                };
+                if relative.len()
+                    > usize::try_from(limits.workspace.max_relative_path_bytes)
+                        .unwrap_or(usize::MAX)
+                    || relative_segments > usize::from(limits.workspace.max_relative_path_segments)
+                {
+                    return Err(invalid_scalar());
+                }
+            }
+            if patch.prompts().is_some_and(|prompts| {
+                prompts.enabled().len()
+                    > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX)
+            }) {
+                return Err(invalid_scalar());
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -6988,7 +7328,14 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 .ok_or_else(selected_wrong_json_type)?;
             validate_agent_status_output(required(object, "status")?)
         }
-        "session_created" | "session_metadata_updated" => pending_output_object(data),
+        "session_created" => pending_output_object(data),
+        "session_metadata_updated" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_revision::<SessionMetadataRevision>(required(object, "metadataRevision")?)
+        }
         "session_definition_updated" => {
             let object = data
                 .ok_or_else(missing_required_field)?
@@ -7024,6 +7371,13 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 Ok(())
             }
         }
+        "workspace_reloaded" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
         "agent_deleted" => {
             if data.is_some() {
                 Err(selected_wrong_json_type())
@@ -7031,8 +7385,13 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 Ok(())
             }
         }
-        "session_loaded" | "session_unloaded" | "runtime_reloaded" | "workspace_reloaded" => {
-            pending_output_unit(data)
+        "session_loaded" | "session_unloaded" => pending_output_unit(data),
+        "shared_resources_reloaded" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
         }
         "interaction_resolved" => {
             if data.is_some() {
@@ -7447,10 +7806,12 @@ fn validate_session_snapshot_shape(
         "loaded" | "unloading" => {}
         _ => return Err(unknown_output_variant()),
     }
-    validate_readiness(required(object, "readiness")?)?;
-    let _execution = validate_execution(required(object, "execution")?)?;
+    let ready = validate_readiness(required(object, "readiness")?)?;
+    let execution = validate_execution(required(object, "execution")?)?;
 
-    if let Some(current_turn) = object.get("currentTurn") {
+    let current_turn = object.get("currentTurn");
+    let current_turn_null = current_turn.is_none_or(|node| matches!(node, JsonNode::Null));
+    if let Some(current_turn) = current_turn {
         if !matches!(current_turn, JsonNode::Null) {
             current_turn
                 .as_object()
@@ -7470,7 +7831,37 @@ fn validate_session_snapshot_shape(
         return Err(invalid_scalar());
     }
 
-    validate_session_queues_shape(required(object, "queues")?)?;
+    let queues = required(object, "queues")?;
+    validate_session_queues_shape(queues)?;
+    if !ready {
+        // The legal readiness matrix: a non-Ready loaded Session must be an empty Idle
+        // projection with `accepting_input` false.
+        let queue_object = queues.as_object().ok_or_else(selected_wrong_json_type)?;
+        let queues_empty = required(queue_object, "submitAdmissions")?
+            .as_array()
+            .ok_or_else(selected_wrong_json_type)?
+            .is_empty()
+            && required(queue_object, "steers")?
+                .as_array()
+                .ok_or_else(selected_wrong_json_type)?
+                .is_empty()
+            && required(queue_object, "followUps")?
+                .as_array()
+                .ok_or_else(selected_wrong_json_type)?
+                .is_empty()
+            && matches!(
+                required(queue_object, "acceptingInput")?,
+                JsonNode::Bool(false)
+            );
+        if execution != "idle"
+            || !current_turn_null
+            || !active_items.is_empty()
+            || !pending_interactions.is_empty()
+            || !queues_empty
+        {
+            return Err(invalid_scalar());
+        }
+    }
     validate_recording(required(object, "recording")?)?;
     required(object, "diagnostics")?
         .as_array()
@@ -7950,18 +8341,25 @@ fn validate_runtime_state_msg(
                 Err(error) => Err(error),
             }
         }
-        "session_created" | "session_archived" | "session_unarchived" | "session_deleted"
-        | "session_forked" => {
+        "session_created"
+        | "session_archived"
+        | "session_unarchived"
+        | "session_deleted"
+        | "session_forked"
+        | "session_definition_updated"
+        | "session_metadata_updated" => {
             if route.family != EventRouteFamily::Session {
                 return Err(invalid_scalar());
             }
             let summary = validate_runtime_session_changed_detail(
                 object.get("detail").ok_or_else(missing_required_field)?,
             )?;
-            let expected_lifecycle = match kind {
-                "session_archived" => SessionLifecycleView::Archived,
-                "session_deleted" => SessionLifecycleView::Deleted,
-                _ => SessionLifecycleView::Open,
+            let lifecycle_matches = match kind {
+                "session_archived" => summary.lifecycle == SessionLifecycleView::Archived,
+                "session_deleted" => summary.lifecycle == SessionLifecycleView::Deleted,
+                "session_definition_updated" => summary.lifecycle == SessionLifecycleView::Open,
+                "session_metadata_updated" => summary.lifecycle != SessionLifecycleView::Deleted,
+                _ => summary.lifecycle == SessionLifecycleView::Open,
             };
             let fork_contract_matches = match kind {
                 "session_created" => !summary.forked,
@@ -7969,7 +8367,7 @@ fn validate_runtime_state_msg(
                 _ => true,
             };
             if route.session_id != Some(summary.session_id)
-                || summary.lifecycle != expected_lifecycle
+                || !lifecycle_matches
                 || !fork_contract_matches
             {
                 return Err(invalid_scalar());
@@ -7981,6 +8379,21 @@ fn validate_runtime_state_msg(
             }
         }
         "command_catalog_invalidated" => {
+            if route.family != EventRouteFamily::Runtime
+                || object
+                    .get("detail")
+                    .is_some_and(|detail| !matches!(detail, JsonNode::Null))
+            {
+                return Err(invalid_scalar());
+            }
+            let snapshot_pending = match validate_runtime_snapshot_shape(snapshot, limits) {
+                Ok(()) => false,
+                Err(error) if error.is_pending_public_target() => true,
+                Err(error) => return Err(error),
+            };
+            Ok(snapshot_pending)
+        }
+        "shared_resources_reloaded" => {
             if route.family != EventRouteFamily::Runtime
                 || object
                     .get("detail")
@@ -8101,7 +8514,11 @@ fn validate_session_state_msg(
                 Err(error) => Err(error),
             }
         }
-        "session_execution_changed" => {
+        "session_execution_changed"
+        | "session_definition_updated"
+        | "session_metadata_updated"
+        | "session_workspace_reloaded"
+        | "session_readiness_changed" => {
             if route.family != EventRouteFamily::Session
                 || object
                     .get("detail")
@@ -8147,7 +8564,7 @@ fn runtime_state_route_family(kind: &str) -> Option<EventRouteFamily> {
         | "session_forked"
         | "session_loaded"
         | "session_unloaded" => EventRouteFamily::Session,
-        "diagnostics_updated" | "shared_resources_reloaded" => EventRouteFamily::Runtime,
+        "diagnostics_updated" => EventRouteFamily::Runtime,
         _ => return None,
     })
 }
@@ -8251,8 +8668,7 @@ fn validate_future_state_detail(
             | "session_forked" => Some("session_changed"),
             "session_loaded"
             | "session_unloaded"
-            | "diagnostics_updated"
-            | "shared_resources_reloaded" => None,
+            | "diagnostics_updated" => None,
             _ => return Err(TypedJsonError::EncodingInvariant),
         }
     } else {
@@ -8742,11 +9158,97 @@ fn validate_session_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(
             validate_create_session_command(data.ok_or_else(missing_required_field)?, limits)
         }
         "fork" => validate_fork_session_command(data.ok_or_else(missing_required_field)?),
-        "update_definition" | "upgrade_agent_revision" | "update_metadata" | "reload_workspace" => {
-            pending_object(data)
+        "update_metadata" => validate_update_session_metadata_command(
+            data.ok_or_else(missing_required_field)?,
+            limits,
+        ),
+        "update_definition" => validate_update_session_definition_command(
+            data.ok_or_else(missing_required_field)?,
+            limits,
+        ),
+        "upgrade_agent_revision" => {
+            validate_upgrade_agent_revision_command(data.ok_or_else(missing_required_field)?)
         }
+        "reload_workspace" => validate_session_id_object(data.ok_or_else(missing_required_field)?),
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_upgrade_agent_revision_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sessionId", "expectedRevision", "target"],
+    )?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_revision::<SessionDefinitionRevision>(required(object, "expectedRevision")?)?;
+    if let Some(target) = object.get("target") {
+        if !matches!(target, JsonNode::Null) {
+            validate_agent_revision_ref(target)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_agent_revision_ref(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(object.keys().map(AsRef::as_ref), &["agentId", "revision"])?;
+    validate_id::<AgentId>(required(object, "agentId")?)?;
+    validate_revision::<AgentRevision>(required(object, "revision")?)
+}
+
+fn validate_update_session_definition_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sessionId", "expectedRevision", "patch"],
+    )?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_revision::<SessionDefinitionRevision>(required(object, "expectedRevision")?)?;
+    let patch = input_object(required(object, "patch")?)?;
+    reject_unknown_fields(
+        patch.keys().map(AsRef::as_ref),
+        &["workspace", "model", "prompts"],
+    )?;
+    if let Some(workspace) = patch.get("workspace") {
+        if !matches!(workspace, JsonNode::Null) {
+            validate_workspace_definition(workspace, limits)?;
+        }
+    }
+    if let Some(model) = patch.get("model") {
+        if !matches!(model, JsonNode::Null) {
+            validate_session_model_config(model)?;
+        }
+    }
+    if let Some(prompts) = patch.get("prompts") {
+        if !matches!(prompts, JsonNode::Null) {
+            validate_session_prompt_selection(prompts, limits)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_update_session_metadata_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["sessionId", "expectedRevision", "patch"],
+    )?;
+    validate_id::<SessionId>(required(object, "sessionId")?)?;
+    validate_revision::<SessionMetadataRevision>(required(object, "expectedRevision")?)?;
+    let patch = input_object(required(object, "patch")?)?;
+    reject_unknown_fields(patch.keys().map(AsRef::as_ref), &["name", "description"])?;
+    let name = validate_optional_text_patch(required(patch, "name")?, limits)?;
+    let description = validate_optional_text_patch(required(patch, "description")?, limits)?;
+    SessionMetadataPatch::new_with_limits(name, description, limits)
+        .map_err(|_| invalid_scalar())?;
+    Ok(())
 }
 
 fn validate_fork_session_command(node: &JsonNode) -> Result<(), TypedJsonError> {

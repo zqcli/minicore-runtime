@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency lifecycle exclusion已实现；remaining Fork anchors/LiveSnapshot、public Runtime command及完整cross-platform native matrix pending
+状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency lifecycle exclusion已实现；Session Fork全部公开anchor/LiveSnapshot/RecordedHistory、public Agent/Session lifecycle、Session metadata、ordinary Session definition CAS与Agent revision upgrade已消费该格式，完整cross-platform native matrix pending
 日期：2026-08-03
 
 ## Scope
