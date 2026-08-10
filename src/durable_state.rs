@@ -3199,6 +3199,15 @@ impl DurableStateActor {
                             self.close_current_and_reject_queued(&mut request).await;
                             return true;
                         }
+                        // A missing or replaced canonical lock means the lease this actor was
+                        // opened under is gone; settle the request as dispatch-unavailable.
+                        if !self.lease.validate() {
+                            request.reject_unavailable();
+                            self.task_context.request_closing();
+                            self.closing.cancel();
+                            self.close_receiver_and_reject_queued().await;
+                            return true;
+                        }
                         match &mut request.request {
                             DurableStateActorRequest::CreateAgent(create) => {
                                 match self.process_create_agent(create).await {
@@ -10632,6 +10641,8 @@ fn read_indexed_session_definition_blocking(
 
 struct RootLease {
     file: Mutex<Option<File>>,
+    lock_path: PathBuf,
+    file_id: file_id::FileId,
 }
 
 #[derive(Clone)]
@@ -10646,10 +10657,13 @@ struct OpenRoot {
 }
 
 impl RootLease {
-    fn new(file: File) -> Self {
-        Self {
+    fn new(file: File, lock_path: PathBuf) -> Result<Self, DurableOpenError> {
+        let file_id = capture_lock_file_id(&file, &lock_path)?;
+        Ok(Self {
             file: Mutex::new(Some(file)),
-        }
+            lock_path,
+            file_id,
+        })
     }
 
     fn release(&self) {
@@ -10659,6 +10673,56 @@ impl RootLease {
             drop(file);
         }
     }
+
+    /// The canonical lock must still be the node this lease was acquired on.
+    fn validate(&self) -> bool {
+        let Ok(metadata) = fs::symlink_metadata(&self.lock_path) else {
+            return false;
+        };
+        if validate_existing_regular_file(&metadata, DurableOpenError::DurableStateCorrupt).is_err()
+        {
+            return false;
+        }
+        current_lock_file_id(&self.lock_path) == Some(self.file_id)
+    }
+}
+
+#[cfg(unix)]
+fn capture_lock_file_id(file: &File, _path: &Path) -> Result<file_id::FileId, DurableOpenError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|_| DurableOpenError::StorageUnavailable)?;
+    Ok(file_id::FileId::new_inode(metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn capture_lock_file_id(_file: &File, path: &Path) -> Result<file_id::FileId, DurableOpenError> {
+    file_id::get_file_id(path).map_err(|_| DurableOpenError::StorageUnavailable)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn capture_lock_file_id(_file: &File, _path: &Path) -> Result<file_id::FileId, DurableOpenError> {
+    Err(DurableOpenError::StorageUnavailable)
+}
+
+#[cfg(unix)]
+fn current_lock_file_id(path: &Path) -> Option<file_id::FileId> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).ok()?;
+    Some(file_id::FileId::new_inode(metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn current_lock_file_id(path: &Path) -> Option<file_id::FileId> {
+    file_id::get_file_id(path).ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn current_lock_file_id(_path: &Path) -> Option<file_id::FileId> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10722,7 +10786,7 @@ fn open_root_with_durable_filesystem(
     };
 
     Ok(OpenRoot {
-        lease: Arc::new(RootLease::new(lock_file)),
+        lease: Arc::new(RootLease::new(lock_file, root.join(LOCK_FILE))?),
         agents: Arc::new(catalog.agents),
         sessions: Arc::new(catalog.sessions),
         root,
