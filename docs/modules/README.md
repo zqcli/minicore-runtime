@@ -1,6 +1,6 @@
 # 模块总览（V2 当前架构）
 
-本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M0–M8 foundations/behavior、M9当前control/observation范围、M10完整Compaction vertical slice及M11 Session Fork command/storage、durable catalog/Fork provenance query、Runtime Session membership/lifecycle StateEvent与public Agent lifecycle command/event vertical slices已实现；M11 remaining Agent/Session definition/metadata CAS、readiness与full recovery closure、active-Turn grace Unload、完整cross-platform native matrix、Structured output与production provider/Tool adapters仍待实现。
+本目录是MiniCore V2当前权威module设计。ADR 0126–0137冻结async conversation/public wire、DurableState/Store V1/root lease与Tokio owner-tracked foundations。M0–M8 foundations/behavior、M9当前control/observation范围、M10完整Compaction vertical slice及M11 Session Fork command/storage、durable catalog/Fork provenance query、Runtime Session membership/lifecycle StateEvent与public Agent lifecycle/definition/metadata command/event vertical slices已实现；M11 remaining Session definition/metadata CAS、readiness与full recovery closure、active-Turn grace Unload、完整cross-platform native matrix、Structured output与production provider/Tool adapters仍待实现。
 
 权威顺序：[`docs/architecture.md`](../architecture.md)与本目录 → current/refined ADR → formats + fixtures → development plan → migration + research → archive。
 
@@ -60,6 +60,6 @@ MiniCoreRuntime
 
 ## 当前实现顺序
 
-完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0–M10已实现，M11 Session Fork command/storage、durable Agent/Session catalog/Fork provenance query及Runtime Session membership StateEvent vertical slices已实现；M11 remaining public family/event/full recovery closure、active-Turn grace Unload、Structured output与完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
+完整阶段、依赖、测试分层与退出条件见[MiniCore V2开发计划](../development-plan.md)。M0–M10已实现，M11 Session Fork command/storage、durable Agent/Session catalog/Fork provenance query及Runtime Session membership StateEvent及public Agent mutation vertical slices已实现；M11 remaining Session mutation/readiness/full recovery closure、active-Turn grace Unload、Structured output与完整cross-platform native matrix pending。production Provider与Tool/Sandbox分别受V4-P1-3和V4-C0-1门禁约束。
 
 跨模块高风险规则见[架构总览的不变量索引](../architecture.md#跨模块不变量索引)。

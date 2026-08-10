@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"agent","data":{"type":"update_metadata","data":{"agentId":"agt_11111111111111111111111111111111","expectedRevision":"amr_2","patch":{"name":null,"description":{"type":"keep"}}}}}}

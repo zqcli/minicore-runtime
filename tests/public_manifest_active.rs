@@ -286,8 +286,11 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
         }
         (
             Some(
-                assertion
-                @ ("agent_created_state" | "agent_disabled_state" | "agent_deleted_state"),
+                assertion @ ("agent_created_state"
+                | "agent_definition_updated_state"
+                | "agent_metadata_updated_state"
+                | "agent_disabled_state"
+                | "agent_deleted_state"),
             ),
             EventFrame::State(event),
         ) => {
@@ -308,6 +311,14 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 "agent_created_state" => {
                     (RuntimeStateEventKind::AgentCreated, AgentStatus::Enabled)
                 }
+                "agent_definition_updated_state" => (
+                    RuntimeStateEventKind::AgentDefinitionUpdated,
+                    AgentStatus::Enabled,
+                ),
+                "agent_metadata_updated_state" => (
+                    RuntimeStateEventKind::AgentMetadataUpdated,
+                    AgentStatus::Enabled,
+                ),
                 "agent_disabled_state" => (
                     RuntimeStateEventKind::AgentStatusChanged,
                     AgentStatus::Disabled,
@@ -391,6 +402,8 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                     );
                 }
                 RuntimeStateEventKind::AgentCreated
+                | RuntimeStateEventKind::AgentDefinitionUpdated
+                | RuntimeStateEventKind::AgentMetadataUpdated
                 | RuntimeStateEventKind::AgentStatusChanged
                 | RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
             }
@@ -578,6 +591,23 @@ fn assert_command_response_semantics(
             assert_eq!(metadata_revision.get(), 1);
         }
         (
+            Some("agent_definition_updated_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::AgentDefinitionUpdated {
+                        definition_revision,
+                    },
+                output: None,
+            },
+        ) => assert_eq!(definition_revision.get(), 2),
+        (
+            Some("agent_metadata_updated_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::AgentMetadataUpdated { metadata_revision },
+                output: None,
+            },
+        ) => assert_eq!(metadata_revision.get(), 2),
+        (
             Some("agent_status_changed_completion"),
             CommandCompletion::Completed {
                 outcome:
@@ -757,6 +787,51 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
             );
             assert_eq!(metadata.name(), "Planner");
             assert_eq!(metadata.description(), Some("Plans implementation work"));
+        }
+        (
+            "agent_update_definition",
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision,
+                patch,
+            }),
+        ) => {
+            assert_eq!(agent_id.to_string(), "agt_11111111111111111111111111111111");
+            assert_eq!(expected_revision.get(), 1);
+            assert_eq!(patch.prompts().unwrap().enabled().len(), 2);
+        }
+        (
+            assertion @ ("agent_update_metadata_set"
+            | "agent_update_metadata_clear"
+            | "agent_update_metadata_keep"),
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision,
+                patch,
+            }),
+        ) => {
+            assert_eq!(agent_id.to_string(), "agt_11111111111111111111111111111111");
+            match assertion {
+                "agent_update_metadata_set" => {
+                    assert_eq!(expected_revision.get(), 1);
+                    assert_eq!(patch.name(), Some("Planner v2"));
+                    assert_eq!(
+                        patch.description().set_value(),
+                        Some("Plans and reviews implementation work")
+                    );
+                }
+                "agent_update_metadata_clear" => {
+                    assert_eq!(expected_revision.get(), 2);
+                    assert!(patch.name().is_none());
+                    assert!(patch.description().is_clear());
+                }
+                "agent_update_metadata_keep" => {
+                    assert_eq!(expected_revision.get(), 2);
+                    assert!(patch.name().is_none());
+                    assert!(patch.description().is_keep());
+                }
+                _ => unreachable!(),
+            }
         }
         (
             "agent_set_status",

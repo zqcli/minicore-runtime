@@ -9752,10 +9752,6 @@ impl DurableState {
         self.actor.enqueue_agent_status(attempt).await.wait().await
     }
 
-    #[allow(
-        dead_code,
-        reason = "the production Agent command surface consumes this metadata CAS seam"
-    )]
     pub(crate) async fn update_agent_metadata(
         &self,
         attempt: SealedAgentMetadataAttempt,
@@ -9767,10 +9763,6 @@ impl DurableState {
             .await
     }
 
-    #[allow(
-        dead_code,
-        reason = "the production Agent command surface consumes this definition CAS seam"
-    )]
     pub(crate) async fn update_agent_definition(
         &self,
         attempt: SealedAgentDefinitionAttempt,

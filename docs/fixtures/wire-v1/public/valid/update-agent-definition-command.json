@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"agent","data":{"type":"update_definition","data":{"agentId":"agt_11111111111111111111111111111111","expectedRevision":"ar_1","patch":{"prompts":{"enabled":["base","code-review"]}}}}}}

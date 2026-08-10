@@ -10,13 +10,16 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, broadcast};
 
 use crate::agent_session_lifecycle::{
-    AgentStatus, SealedAgentCreateAttempt, SealedAgentStatusAttempt, SealedSessionCreateAttempt,
+    AgentStatus, SealedAgentCreateAttempt, SealedAgentDefinitionAttempt,
+    SealedAgentMetadataAttempt, SealedAgentStatusAttempt, SealedSessionCreateAttempt,
     SealedSessionLifecycleAttempt, SessionLifecycle,
 };
 use crate::compaction::CompactionSettings;
 use crate::durable_state::{
-    DurableAgentCreateError, DurableAgentHead, DurableAgentStatusError, DurableAgentStatusOutcome,
-    DurableOpenError, DurableSessionCreateError, DurableSessionHead, DurableState,
+    DurableAgentCreateError, DurableAgentDefinitionError, DurableAgentDefinitionOutcome,
+    DurableAgentHead, DurableAgentMetadataError, DurableAgentMetadataOutcome,
+    DurableAgentStatusError, DurableAgentStatusOutcome, DurableOpenError,
+    DurableSessionCreateError, DurableSessionHead, DurableState,
 };
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
@@ -751,6 +754,22 @@ impl RuntimeInner {
                     Err(error) => map_agent_create_error(command_id, error)?,
                 }
             }
+            RuntimeCommand::Agent(AgentCommand::UpdateDefinition {
+                agent_id,
+                expected_revision,
+                patch,
+            }) => {
+                self.dispatch_agent_definition(command_id, agent_id, expected_revision, patch)
+                    .await?
+            }
+            RuntimeCommand::Agent(AgentCommand::UpdateMetadata {
+                agent_id,
+                expected_revision,
+                patch,
+            }) => {
+                self.dispatch_agent_metadata(command_id, agent_id, expected_revision, patch)
+                    .await?
+            }
             RuntimeCommand::Agent(AgentCommand::SetStatus {
                 agent_id,
                 expected_status,
@@ -1295,7 +1314,10 @@ impl RuntimeInner {
     ) {
         debug_assert!(matches!(
             kind,
-            RuntimeStateEventKind::AgentCreated | RuntimeStateEventKind::AgentStatusChanged
+            RuntimeStateEventKind::AgentCreated
+                | RuntimeStateEventKind::AgentDefinitionUpdated
+                | RuntimeStateEventKind::AgentMetadataUpdated
+                | RuntimeStateEventKind::AgentStatusChanged
         ));
         let Ok(agent) = public_agent_summary(head) else {
             return;
@@ -1311,6 +1333,18 @@ impl RuntimeInner {
             RuntimeStateEventKind::AgentCreated => {
                 StateEvent::agent_created(head.created_at(), Some(command_id), snapshot, agent)
             }
+            RuntimeStateEventKind::AgentDefinitionUpdated => StateEvent::agent_definition_updated(
+                SystemClock.now(),
+                Some(command_id),
+                snapshot,
+                agent,
+            ),
+            RuntimeStateEventKind::AgentMetadataUpdated => StateEvent::agent_metadata_updated(
+                SystemClock.now(),
+                Some(command_id),
+                snapshot,
+                agent,
+            ),
             RuntimeStateEventKind::AgentStatusChanged => StateEvent::agent_status_changed(
                 SystemClock.now(),
                 Some(command_id),
@@ -1375,6 +1409,8 @@ impl RuntimeInner {
             RuntimeStateEventKind::SessionLoaded
             | RuntimeStateEventKind::SessionUnloaded
             | RuntimeStateEventKind::AgentCreated
+            | RuntimeStateEventKind::AgentDefinitionUpdated
+            | RuntimeStateEventKind::AgentMetadataUpdated
             | RuntimeStateEventKind::AgentStatusChanged
             | RuntimeStateEventKind::CommandCatalogInvalidated => return,
         };
@@ -1404,6 +1440,8 @@ impl RuntimeInner {
             }
             RuntimeStateEventKind::SessionCreated
             | RuntimeStateEventKind::AgentCreated
+            | RuntimeStateEventKind::AgentDefinitionUpdated
+            | RuntimeStateEventKind::AgentMetadataUpdated
             | RuntimeStateEventKind::AgentStatusChanged
             | RuntimeStateEventKind::SessionArchived
             | RuntimeStateEventKind::SessionUnarchived
@@ -1659,6 +1697,96 @@ impl RuntimeInner {
                 Ok(completed_outcome(CommandOutcome::AgentDeleted))
             }
             Err(error) => map_agent_status_error(command_id, agent_id, error),
+        }
+    }
+
+    async fn dispatch_agent_definition(
+        &self,
+        command_id: crate::wire::CommandId,
+        agent_id: crate::wire::AgentId,
+        expected_revision: crate::wire::AgentRevision,
+        patch: crate::agent_session_lifecycle::AgentDefinitionPatch,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        let Some(current_definition) = durable_state.agent_current_definition(agent_id) else {
+            return Ok(rejected_completion(
+                CommandErrorCode::NotFound,
+                "Agent was not found",
+                RetryAdvice::RefreshAndRetry,
+                Some(PublicSubject::Agent(agent_id)),
+            ));
+        };
+        let prompts = patch
+            .prompts()
+            .cloned()
+            .unwrap_or_else(|| current_definition.prompts().clone());
+        let attempt = SealedAgentDefinitionAttempt::new(
+            agent_id,
+            expected_revision,
+            prompts,
+            SystemClock.now(),
+        );
+        match durable_state.update_agent_definition(attempt).await {
+            Ok(DurableAgentDefinitionOutcome::Updated(head, definition)) => {
+                self.publish_durable_agent_event(
+                    RuntimeStateEventKind::AgentDefinitionUpdated,
+                    command_id,
+                    head.as_ref(),
+                );
+                Ok(completed_outcome(CommandOutcome::AgentDefinitionUpdated {
+                    definition_revision: definition.revision(),
+                }))
+            }
+            Ok(DurableAgentDefinitionOutcome::NoChange(_, _)) => {
+                Ok(completed_outcome(CommandOutcome::NoChange))
+            }
+            Err(error) => map_agent_definition_error(agent_id, error),
+        }
+    }
+
+    async fn dispatch_agent_metadata(
+        &self,
+        command_id: crate::wire::CommandId,
+        agent_id: crate::wire::AgentId,
+        expected_revision: crate::wire::AgentMetadataRevision,
+        patch: crate::agent_session_lifecycle::AgentMetadataPatch,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        let attempt = SealedAgentMetadataAttempt::new(
+            agent_id,
+            expected_revision,
+            patch.name().map(str::to_owned),
+            patch.description().clone(),
+            SystemClock.now(),
+        )
+        .expect("public Agent metadata patches are already validated");
+        match durable_state.update_agent_metadata(attempt).await {
+            Ok(DurableAgentMetadataOutcome::Updated(head)) => {
+                self.publish_durable_agent_event(
+                    RuntimeStateEventKind::AgentMetadataUpdated,
+                    command_id,
+                    head.as_ref(),
+                );
+                Ok(completed_outcome(CommandOutcome::AgentMetadataUpdated {
+                    metadata_revision: head.metadata().revision(),
+                }))
+            }
+            Ok(DurableAgentMetadataOutcome::NoChange(_)) => {
+                Ok(completed_outcome(CommandOutcome::NoChange))
+            }
+            Err(error) => map_agent_metadata_error(agent_id, error),
         }
     }
 
@@ -2117,6 +2245,104 @@ fn map_agent_status_error(
             subject,
         ),
         DurableAgentStatusError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_agent_definition_error(
+    agent_id: crate::wire::AgentId,
+    error: DurableAgentDefinitionError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Agent(agent_id));
+    let completion = match error {
+        DurableAgentDefinitionError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentDefinitionError::AgentNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Agent was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentDefinitionError::StaleRevision => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Agent definition compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentDefinitionError::AgentDeleted => rejected_completion(
+            CommandErrorCode::AgentDeleted,
+            "Agent is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        DurableAgentDefinitionError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        DurableAgentDefinitionError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Agent definition update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        DurableAgentDefinitionError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_agent_metadata_error(
+    agent_id: crate::wire::AgentId,
+    error: DurableAgentMetadataError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Agent(agent_id));
+    let completion = match error {
+        DurableAgentMetadataError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentMetadataError::AgentNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Agent was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentMetadataError::StaleRevision => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Agent metadata compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentMetadataError::AgentDeleted => rejected_completion(
+            CommandErrorCode::AgentDeleted,
+            "Agent is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        DurableAgentMetadataError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        DurableAgentMetadataError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Agent metadata update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        DurableAgentMetadataError::InternalDispatchUnavailable => {
             return Err(RuntimeDispatchError::InternalDispatchUnavailable);
         }
     };
