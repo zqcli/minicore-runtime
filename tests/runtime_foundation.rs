@@ -1920,6 +1920,66 @@ fn runtime_initialization_errors_and_debug_output_are_redacted() {
     }
 }
 
+/// Creates an `agents` symlink on Unix or directory junction on Windows.
+fn create_agents_directory_link(root: &Path) -> TempRoot {
+    let target = TempRoot::new();
+    fs::create_dir(target.path()).expect("the link target directory is created");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target.path(), root.join("agents"))
+            .expect("the directory symlink is created");
+    }
+    #[cfg(windows)]
+    {
+        let link = root.join("agents");
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(target.path())
+            .output()
+            .expect("the mklink junction helper runs");
+        assert!(
+            output.status.success(),
+            "mklink /J failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    target
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn case_alias_rejected_a_wrong_case_recognized_root_name_blocks_open() {
+    let root = TempRoot::new();
+    create_existing_private_root(root.path());
+    fs::create_dir(root.path().join("Agents")).expect("the wrong-case root entry is created");
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a wrong-case recognized root name is rejected");
+
+    assert_eq!(error, RuntimeInitializationError::UnsupportedStoreFormat);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn symlink_reparse_rejected_a_directory_link_named_agents_blocks_open() {
+    let root = TempRoot::new();
+    create_existing_private_root(root.path());
+    let _target = create_agents_directory_link(root.path());
+
+    let error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("a directory link named like a recognized root entry is rejected");
+
+    assert_eq!(error, RuntimeInitializationError::UnsupportedStoreFormat);
+}
+
 #[test]
 fn runtime_rejects_invalid_compaction_settings_before_opening_storage() {
     let root = TempRoot::new();
