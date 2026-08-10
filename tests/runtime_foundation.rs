@@ -17,10 +17,10 @@ use minicore_runtime::runtime_interface::{
     AgentCommand, AgentQuery, AgentQueryResult, CommandCompletion, CommandErrorCode,
     CommandOutcome, CommandRequest, EventFrame, EventRoute, NewSessionDefinition,
     NewSessionMetadata, PageRequest, PublicSubject, QueryErrorCode, QueryResult, RetryAdvice,
-    RuntimeCommand, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind, SessionCommand,
-    SessionDefinitionPatch, SessionExecutionView, SessionLifecycleView, SessionQuery,
-    SessionQueryResult, SessionStateEventKind, SnapshotRequest, SnapshotResponse, StateEventMsg,
-    SubscriptionRequest, SubscriptionScope,
+    RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind,
+    SessionCommand, SessionDefinitionPatch, SessionExecutionView, SessionLifecycleView,
+    SessionQuery, SessionQueryResult, SessionStateEventKind, SnapshotRequest, SnapshotResponse,
+    StateEventMsg, SubscriptionRequest, SubscriptionScope,
 };
 use minicore_runtime::wire::{
     CanonicalFileUri, CommandId, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
@@ -1791,6 +1791,54 @@ async fn a_second_runtime_reports_store_in_use_until_the_first_shuts_down() {
     .await
     .expect("a runtime can acquire the released lease");
     second.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn root_lease_identity_loss_rejects_requests_and_blocks_reopen() {
+    let root = TempRoot::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+
+    let lock_path = root.path().join(".minicore.lock");
+    let foreign_old_lock = root.path().join(".minicore.lock.old");
+    fs::rename(&lock_path, &foreign_old_lock)
+        .expect("the canonical lock node moves to a foreign old name");
+    create_private_file(&lock_path, b"");
+
+    let create_id = CommandId::generate().unwrap();
+    let error = runtime
+        .dispatch(CommandRequest::new(
+            create_id,
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition: NewAgentDefinition::new(AgentPromptSelection::new(Vec::new()).unwrap()),
+                metadata: NewAgentMetadata::new("Identity Loss Agent", None::<&str>).unwrap(),
+            }),
+        ))
+        .await
+        .expect_err("a replaced root lease node rejects the accepted request");
+
+    assert_eq!(error, RuntimeDispatchError::InternalDispatchUnavailable);
+
+    runtime.shutdown().await;
+
+    // The replacement lock is removed, leaving the marked root with a missing canonical lock
+    // plus the foreign old lock node; reopening must fail as corrupt.
+    fs::remove_file(&lock_path).expect("the replacement lock node is removed");
+    let reopen_error = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect_err("the missing canonical lock and foreign lock node block reopening");
+
+    assert_eq!(
+        reopen_error,
+        RuntimeInitializationError::DurableStateCorrupt
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
