@@ -262,6 +262,12 @@ pub(crate) struct SessionExecutorSnapshot {
     // fact (Agent/workspace cause/Prompt/Model), and Preparing always projects an Idle, empty,
     // non-accepting snapshot with no WorkspaceSnapshot.
     workspace_preparing: bool,
+    // The transient runtime-dependency fact: the last loaded admission observed a DurableState
+    // storage failure while reading the pinned historical Agent definition.  It is the
+    // lowest-priority readiness fact (below Agent/workspace/Prompt/Model) and is cleared only
+    // by the owner-tracked storage probe; an ordinary RuntimeDependencyUnavailable Session
+    // keeps its last-good WorkspaceSnapshot.
+    runtime_dependency_unavailable: bool,
     metadata: Arc<SessionMetadata>,
     execution_state: SessionExecutionState,
     current_turn: Option<TurnId>,
@@ -287,7 +293,6 @@ impl SessionExecutorSnapshot {
         workspace_unavailable: Option<SessionUnavailableView>,
         workspace: Option<Arc<WorkspaceSnapshot>>,
         metadata: Arc<SessionMetadata>,
-        execution_state: SessionExecutionState,
     ) -> Self {
         Self {
             definition,
@@ -297,8 +302,9 @@ impl SessionExecutorSnapshot {
             workspace_unavailable,
             workspace,
             workspace_preparing: false,
+            runtime_dependency_unavailable: false,
             metadata,
-            execution_state,
+            execution_state: SessionExecutionState::Idle,
             current_turn: None,
             current_turn_view: None,
             active_items: Arc::from([]),
@@ -322,6 +328,8 @@ impl SessionExecutorSnapshot {
             prompt_available: self.prompt_available,
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata,
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -374,6 +382,7 @@ impl SessionExecutorSnapshot {
                 Some(workspace)
             },
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -410,6 +419,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -441,6 +451,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state,
             current_turn,
@@ -470,6 +481,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -501,6 +513,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -532,6 +545,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -563,6 +577,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -593,6 +608,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -629,6 +645,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: self.workspace_unavailable,
             workspace: self.workspace.clone(),
             workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -661,6 +678,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: None,
             workspace: None,
             workspace_preparing: true,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -689,6 +707,7 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: None,
             workspace: Some(workspace),
             workspace_preparing: false,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -709,10 +728,7 @@ impl SessionExecutorSnapshot {
     /// Finishes one ordinary-failure security Workspace recovery: clears the Preparing flag,
     /// drops the WorkspaceSnapshot, and explicitly installs the new WorkspaceUnavailable or
     /// PromptUnavailable cause.
-    fn with_workspace_preparing_finished_failure(
-        &self,
-        cause: SessionUnavailableView,
-    ) -> Self {
+    fn with_workspace_preparing_finished_failure(&self, cause: SessionUnavailableView) -> Self {
         Self {
             definition: Arc::clone(&self.definition),
             agent_available: self.agent_available,
@@ -721,6 +737,68 @@ impl SessionExecutorSnapshot {
             workspace_unavailable: Some(cause),
             workspace: None,
             workspace_preparing: false,
+            runtime_dependency_unavailable: self.runtime_dependency_unavailable,
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Installs the RuntimeDependencyUnavailable fact after one loaded admission observed a
+    /// transient DurableState storage failure while reading the pinned historical Agent
+    /// definition.  The last-good optional WorkspaceSnapshot and every other immutable
+    /// observation fact are preserved; only the owner-tracked probe recovery clears the fact.
+    fn with_runtime_dependency_unavailable(&self) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: true,
+            metadata: Arc::clone(&self.metadata),
+            execution_state: self.execution_state,
+            current_turn: self.current_turn,
+            current_turn_view: self.current_turn_view,
+            active_items: Arc::clone(&self.active_items),
+            public_pending_interactions: Arc::clone(&self.public_pending_interactions),
+            usage: self.usage.clone(),
+            recording: self.recording,
+            diagnostics: Arc::clone(&self.diagnostics),
+            last_terminal: self.last_terminal,
+            pending_interactions: Arc::clone(&self.pending_interactions),
+            active_submit_command_id: self.active_submit_command_id,
+            follow_up_command_ids: Arc::clone(&self.follow_up_command_ids),
+            steer_command_ids: Arc::clone(&self.steer_command_ids),
+        }
+    }
+
+    /// Clears the RuntimeDependencyUnavailable fact after the owner-tracked storage probe
+    /// recovered the exact pinned Agent revision.  Every other immutable observation fact is
+    /// preserved.
+    fn with_runtime_dependency_available(&self) -> Self {
+        Self {
+            definition: Arc::clone(&self.definition),
+            agent_available: self.agent_available,
+            model_available: self.model_available,
+            prompt_available: self.prompt_available,
+            workspace_unavailable: self.workspace_unavailable,
+            workspace: self.workspace.clone(),
+            workspace_preparing: self.workspace_preparing,
+            runtime_dependency_unavailable: false,
             metadata: Arc::clone(&self.metadata),
             execution_state: self.execution_state,
             current_turn: self.current_turn,
@@ -772,15 +850,26 @@ impl SessionExecutorSnapshot {
         self.prompt_available
     }
 
-    /// The single public readiness projection derived from the internal facts: the host
-    /// security-invalidation Preparing flag always wins, then a disabled Agent wins with
-    /// AgentUnavailable, then the current workspace Unavailable cause (including a
-    /// workspace-source PromptUnavailable), then an unavailable selected Prompt, then an
-    /// unavailable model, then Ready.  Every mutation preserves the internal facts so this
-    /// projection can never diverge from them.
+    /// The single public readiness projection derived from the internal facts.  The host
+    /// security-invalidation Preparing flag always wins (it is only ever set while the Session
+    /// is Idle, so it outranks every execution state), and while the Session is not Idle the
+    /// public readiness is always Ready: an admission or Turn enters only from Ready, and the
+    /// definition-time availability facts (Agent/workspace cause/Prompt/Model/
+    /// runtime-dependency) are future-only — a publication or shared-resource fact installed
+    /// during an active admission/Turn takes effect for future admissions immediately but never
+    /// for the already-captured active Turn, and the public legal matrix requires every
+    /// non-Ready Session to be an Idle empty projection, so a Running/Starting/Finishing
+    /// snapshot keeps projecting Ready.  Only once the Session returns to Idle do the facts
+    /// surface, in priority order: a disabled Agent wins with AgentUnavailable, then the
+    /// current workspace Unavailable cause (including a workspace-source PromptUnavailable),
+    /// then an unavailable selected Prompt, then an unavailable model, then the transient
+    /// RuntimeDependencyUnavailable fact, then Ready.  Every mutation preserves the internal
+    /// facts so this projection can never diverge from them.
     pub(crate) const fn readiness(&self) -> SessionReadinessView {
         if self.workspace_preparing {
             SessionReadinessView::Preparing
+        } else if !self.execution_state.is_idle() {
+            SessionReadinessView::Ready
         } else if !self.agent_available {
             SessionReadinessView::Unavailable(SessionUnavailableView::AgentUnavailable)
         } else {
@@ -791,6 +880,10 @@ impl SessionExecutorSnapshot {
                         SessionReadinessView::Unavailable(SessionUnavailableView::PromptUnavailable)
                     } else if !self.model_available {
                         SessionReadinessView::Unavailable(SessionUnavailableView::ModelUnavailable)
+                    } else if self.runtime_dependency_unavailable {
+                        SessionReadinessView::Unavailable(
+                            SessionUnavailableView::RuntimeDependencyUnavailable,
+                        )
                     } else {
                         SessionReadinessView::Ready
                     }
@@ -802,6 +895,13 @@ impl SessionExecutorSnapshot {
     /// Whether the host security invalidation currently holds this Session in Preparing.
     pub(crate) const fn workspace_preparing(&self) -> bool {
         self.workspace_preparing
+    }
+
+    /// The installed runtime-dependency fact: whether the last loaded admission observed a
+    /// transient DurableState storage failure while reading the pinned historical Agent
+    /// definition, and the owner-tracked probe has not yet recovered it.
+    pub(crate) const fn runtime_dependency_unavailable(&self) -> bool {
+        self.runtime_dependency_unavailable
     }
 
     /// The durable definition Workspace revision, which is authoritative for both Ready and
@@ -880,9 +980,16 @@ impl fmt::Debug for SessionExecutorSnapshot {
             .field("prompt_available", &self.prompt_available)
             .field(
                 "workspace_revision",
-                &self.workspace.as_ref().map(|workspace| workspace.revision()),
+                &self
+                    .workspace
+                    .as_ref()
+                    .map(|workspace| workspace.revision()),
             )
             .field("workspace_preparing", &self.workspace_preparing)
+            .field(
+                "runtime_dependency_unavailable",
+                &self.runtime_dependency_unavailable,
+            )
             .field("metadata_revision", &self.metadata.revision())
             .field("execution_state", &self.execution_state)
             .field("current_turn", &self.current_turn)
@@ -1251,6 +1358,10 @@ pub(crate) enum SessionSubmitError {
     SessionBusy,
     #[error("Session is not ready to accept Turns: {0:?}")]
     SessionNotReady(SessionUnavailableView),
+    #[error("session executor is preparing")]
+    Preparing,
+    #[error("runtime dependencies are transiently unavailable")]
+    RuntimeDependencyUnavailable,
     #[error("loaded session execution dependencies are unavailable")]
     DependencyUnavailable,
     #[error("agent is unavailable for execution")]
@@ -1809,7 +1920,6 @@ impl SessionExecutor {
                 workspace_unavailable,
                 workspace,
                 metadata,
-                SessionExecutionState::Idle,
             )
             .with_public_session_state(usage, recording, diagnostics),
         );
@@ -1854,6 +1964,7 @@ impl SessionExecutor {
             prepare_unload: None,
             prepare_unload_accepted: false,
             security_invalidation: None,
+            runtime_dependency_probe: None,
             #[cfg(test)]
             hooks: Arc::clone(&hooks),
         };
@@ -2207,7 +2318,7 @@ impl SessionExecutor {
             available,
             timestamp,
             command_id,
-            candidate_cancellation,
+            candidate_cancellation: candidate_cancellation.clone(),
             response: Some(response),
         });
         let permit = tokio::select! {
@@ -2270,7 +2381,7 @@ impl SessionExecutor {
                 model_available,
                 timestamp,
                 command_id,
-                candidate_cancellation,
+                candidate_cancellation: candidate_cancellation.clone(),
                 response: Some(response),
             });
         let permit = tokio::select! {
@@ -2844,6 +2955,13 @@ struct SessionExecutorActor {
     /// preparation was accepted".
     prepare_unload_accepted: bool,
     security_invalidation: Option<SecurityInvalidationState>,
+    /// The single owner-tracked runtime-dependency storage probe: started at the first
+    /// admission failure that installed the RuntimeDependencyUnavailable fact, re-armed by a
+    /// Submit while the fact is installed, by a publication settlement, and by a stale probe
+    /// completion after an Agent revision upgrade.  It has no waiter, no timer, and no
+    /// TurnId; the worker re-reads the exact pinned AgentRevisionRef captured at start and
+    /// the completion reaps the exact task.
+    runtime_dependency_probe: Option<RuntimeDependencyProbeState>,
     #[cfg(test)]
     hooks: Arc<SessionExecutorTestHooksInner>,
 }
@@ -2889,6 +3007,18 @@ struct PrepareUnloadState {
 struct SecurityInvalidationState {
     timestamp: Timestamp,
     waiters: Vec<oneshot::Sender<Result<(), SessionSecurityInvalidationError>>>,
+    worker_task: Option<TrackedTask>,
+}
+
+/// The single accepted runtime-dependency storage probe.  The worker re-reads the exact
+/// pinned `reference` captured at probe start (never the current definition, so an Agent
+/// revision upgrade concurrent with the probe cannot distort it); the completion handler
+/// compares the current definition's pinned AgentRevisionRef against this reference and
+/// discards a stale result instead of clearing the fact.  The probe has no waiter, no timer,
+/// and no TurnId: it is purely an owner-tracked storage observation that keeps the
+/// RuntimeDependencyUnavailable fact honest.
+struct RuntimeDependencyProbeState {
+    reference: AgentRevisionRef,
     worker_task: Option<TrackedTask>,
 }
 
@@ -3200,6 +3330,7 @@ impl SessionExecutorActor {
                 && self.active_admission.is_none()
                 && self.active_turn.is_none()
                 && !self.security_recovery_is_active()
+                && !self.runtime_dependency_probe_is_active()
                 && requests_drained
                 && emergency_requests_drained
             {
@@ -3211,7 +3342,7 @@ impl SessionExecutorActor {
 
             tokio::select! {
                 biased;
-                completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() || self.security_recovery_is_active() => match completion {
+                completion = self.completions.recv(), if self.active_publication.is_some() || self.active_admission.is_some() || self.active_turn.is_some() || self.security_recovery_is_active() || self.runtime_dependency_probe_is_active() => match completion {
                     Some(completion) => {
                         if let Err(fatality) = self.handle_completion(completion).await {
                             normal_exit = false;
@@ -3237,12 +3368,24 @@ impl SessionExecutorActor {
 
     async fn reap_after_missing_completion(&mut self) {
         // The completions channel closed while work was active: settle and reap every active
-        // owner exactly once, then the caller drains.  A running security recovery worker is
-        // reaped and its waiters settle Internal; the invalidation state is cleared so the
-        // drain loop cannot wait for a completion that can never arrive.
-        let mut security_reaped = false;
+        // owner exactly once, then the caller drains.  A running runtime-dependency probe is
+        // reaped here too (its completion can never arrive after the channel closed, so close
+        // never leaves its task behind); the probe has no waiters to settle.  A running
+        // security recovery worker is reaped and its waiters settle Internal; the
+        // invalidation state is cleared so the drain loop cannot wait for a completion that
+        // can never arrive.  When no active publication remains, any reaped owner — the
+        // runtime-dependency probe included, not only a security recovery — means the
+        // executor and its owners can never receive another completion and are marked
+        // fatal/closing.
+        let mut reaped_owner = false;
+        if let Some(mut state) = self.runtime_dependency_probe.take() {
+            reaped_owner = true;
+            if let Some(worker_task) = state.worker_task.take() {
+                let _ = worker_task.wait().await;
+            }
+        }
         if let Some(mut state) = self.security_invalidation.take() {
-            security_reaped = true;
+            reaped_owner = true;
             if let Some(worker_task) = state.worker_task.take() {
                 let _ = worker_task.wait().await;
             }
@@ -3253,7 +3396,7 @@ impl SessionExecutorActor {
             }
         }
         let Some(mut active) = self.active_publication.take() else {
-            if security_reaped {
+            if reaped_owner {
                 self.turn_admission_gate.close();
                 self.closing.cancel();
                 self.failure_state.mark_fatal();
@@ -3419,13 +3562,15 @@ impl SessionExecutorActor {
             .as_mut()
             .expect("prepare state exists after the guard")
             .deadline_fired = true;
-        let target = if let Some(active) = self.active_admission.as_ref() {
-            Some(active.emergency.target())
-        } else if let Some(active) = self.active_turn.as_ref() {
-            Some(active.emergency.target())
-        } else {
-            None
-        };
+        let target = self
+            .active_admission
+            .as_ref()
+            .map(|active| active.emergency.target())
+            .or_else(|| {
+                self.active_turn
+                    .as_ref()
+                    .map(|active| active.emergency.target())
+            });
         if let Some(target) = target {
             let prepared_won = match self
                 .emergency
@@ -3460,7 +3605,11 @@ impl SessionExecutorActor {
                 }
                 // Pending Interactions exist only while a Turn is active, so an admission-only
                 // deadline finds this map empty.
-                let pending = self.pending_interactions.keys().copied().collect::<Vec<_>>();
+                let pending = self
+                    .pending_interactions
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
                 for request_id in pending {
                     self.cancel_pending_interaction(
                         request_id,
@@ -3623,7 +3772,9 @@ impl SessionExecutorActor {
         request: &mut AgentAvailabilityRequest,
     ) -> Result<(), ActorFatality> {
         if self.current.definition().agent().agent_id() != request.agent_id {
-            request.settle(Err(SessionAgentAvailabilityError::InternalDispatchUnavailable));
+            request.settle(Err(
+                SessionAgentAvailabilityError::InternalDispatchUnavailable,
+            ));
             return Err(ActorFatality::Integrity);
         }
         if self.execution_state.is_idle()
@@ -3632,7 +3783,9 @@ impl SessionExecutorActor {
         {
             if self.current.agent_available != request.available {
                 let previous = self.current.readiness();
-                self.publish_current(Arc::new(self.current.with_agent_availability(request.available)));
+                self.publish_current(Arc::new(
+                    self.current.with_agent_availability(request.available),
+                ));
                 // Re-project the public queue under the new readiness before any comparison or
                 // event, so an AgentDisable hides the retained internal FollowUp and an Enable
                 // re-exposes it; the ReadinessChanged snapshot must carry this projection.
@@ -3689,11 +3842,15 @@ impl SessionExecutorActor {
         request: &mut SharedResourceUpdateRequest,
     ) -> Result<(), ActorFatality> {
         if !Arc::ptr_eq(self.current.definition(), &request.expected_definition) {
-            request.settle(Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable));
+            request.settle(Err(
+                SessionSharedResourceUpdateError::InternalDispatchUnavailable,
+            ));
             return Err(ActorFatality::Integrity);
         }
         let Some(resources) = self.turn_resources.as_mut() else {
-            request.settle(Err(SessionSharedResourceUpdateError::InternalDispatchUnavailable));
+            request.settle(Err(
+                SessionSharedResourceUpdateError::InternalDispatchUnavailable,
+            ));
             return Err(ActorFatality::Integrity);
         };
         resources.prompt_resources = Arc::clone(&request.prompt_resources);
@@ -3811,19 +3968,27 @@ impl SessionExecutorActor {
         // Readiness is checked before any TurnId generation, execution mutation, or Workspace
         // clone.  An Unavailable Session is always Idle with no active admission/Turn/queues,
         // so this settles before the SessionBusy path and before any Ready-only accessor.  A
-        // security-invalidation Preparing Session follows the existing RuntimeDependency
-        // fallback contract: `SessionNotReady(RuntimeDependencyUnavailable)` maps to
-        // `SessionNotReady` + RetryWithBackoff publicly.
+        // security-invalidation Preparing Session settles the dedicated internal `Preparing`
+        // error (publicly `SessionNotReady` + RetryWithBackoff) and is never projected as
+        // RuntimeDependencyUnavailable.
         match self.current.readiness() {
             SessionReadinessView::Ready => {}
             SessionReadinessView::Unavailable(cause) => {
+                // A Submit while the RuntimeDependencyUnavailable fact is installed never
+                // generates a TurnId or Starting: it settles `SessionNotReady(cause)` and
+                // re-arms the owner-tracked storage probe when none is running, so the Session
+                // keeps probing while no admission is driving it (a persistent failure leaves
+                // the probe slot empty after StillUnavailable; the next Submit re-arms it).
+                if cause == SessionUnavailableView::RuntimeDependencyUnavailable {
+                    request.settle(Err(SessionSubmitError::SessionNotReady(cause)));
+                    self.start_runtime_dependency_probe();
+                    return Ok(());
+                }
                 request.settle(Err(SessionSubmitError::SessionNotReady(cause)));
                 return Ok(());
             }
             SessionReadinessView::Preparing => {
-                request.settle(Err(SessionSubmitError::SessionNotReady(
-                    SessionUnavailableView::RuntimeDependencyUnavailable,
-                )));
+                request.settle(Err(SessionSubmitError::Preparing));
                 return Ok(());
             }
         }
@@ -3975,6 +4140,88 @@ impl SessionExecutorActor {
                     .observe(active.emergency.target())
                     .and_then(|observation| observation.signal());
                 self.emergency.retire(active.emergency);
+                if error == SessionSubmitError::RuntimeDependencyUnavailable {
+                    // The single production source of this dedicated failure is a transient
+                    // DurableState StorageUnavailable while reading the pinned historical Agent
+                    // definition at admission.  The Session returns to Idle and applies pending
+                    // facts first; an internal FollowUp admission (no response waiters) that
+                    // failed this way is re-queued at the front of the FollowUp lane so the
+                    // transient failure never drops a message, unless graceful-Unload
+                    // preparation (or closing) already cleared the queues, in which case they
+                    // stay cleared.  Then the RuntimeDependencyUnavailable fact is installed
+                    // and the queue re-projected (the retained internal FollowUp is hidden
+                    // while non-Ready and re-exposed by the probe recovery).  The original
+                    // Submit waiter settles from the final public readiness projected after
+                    // the fact install, so a higher-priority cause (Agent/workspace/Prompt/
+                    // Model) wins over the transient fact as `SessionNotReady(cause)`, a
+                    // security-invalidation Preparing Session settles the dedicated internal
+                    // `Preparing` error, and Ready is an internal invariant; the dedicated
+                    // internal error never leaves the actor.  The first failure immediately
+                    // starts the owner-tracked storage probe.
+                    self.execution_state = SessionExecutionState::Idle;
+                    self.publish_execution_state(
+                        SessionExecutionState::Idle,
+                        None,
+                        self.current.last_terminal(),
+                    );
+                    // The Session is Idle again: apply the latest intended availability
+                    // composite so the readiness projected by this failure is the final value.
+                    self.apply_pending_availability()?;
+                    if active.waiters.is_empty()
+                        && !self.prepare_unload_accepted
+                        && !self.closing.is_cancelled()
+                    {
+                        self.follow_up
+                            .push_front(active.command_id, active.intent.clone());
+                    }
+                    let previous = self.current.readiness();
+                    self.publish_current(Arc::new(
+                        self.current.with_runtime_dependency_unavailable(),
+                    ));
+                    // Re-project the public queue under the new readiness so the retained
+                    // internal FollowUp is hidden while RuntimeDependencyUnavailable and
+                    // re-exposed by the probe recovery; the ReadinessChanged snapshot must
+                    // carry this projection.  A security-invalidation Preparing Session or a
+                    // graceful-Unload preparation already project empty legal queues and stay
+                    // that way.
+                    self.publish_queue_projection();
+                    if self.current.readiness() != previous {
+                        let _ =
+                            self.events
+                                .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                                    timestamp: SystemClock.now(),
+                                    command_id: None,
+                                    snapshot: Arc::clone(&self.current),
+                                }));
+                    }
+                    // Settle the original Submit waiter from the final public readiness
+                    // projected after the fact install — never a hardcoded cause: a
+                    // concurrent Agent disable, workspace cause, shared Prompt, or Model
+                    // unavailability applied by `apply_pending_availability` outranks the
+                    // transient fact in the readiness priority, and a security-invalidation
+                    // Preparing Session settles the dedicated internal `Preparing` error.
+                    // Ready is an internal invariant here: the just-installed fact can never
+                    // project Ready.
+                    match self.current.readiness() {
+                        SessionReadinessView::Unavailable(cause) => {
+                            active.settle(Err(SessionSubmitError::SessionNotReady(cause)));
+                        }
+                        SessionReadinessView::Preparing => {
+                            active.settle(Err(SessionSubmitError::Preparing));
+                        }
+                        SessionReadinessView::Ready => {
+                            active.settle(Err(SessionSubmitError::InternalDispatchUnavailable));
+                            return Err(ActorFatality::Internal);
+                        }
+                    }
+                    self.settle_prepare_unload_if_idle();
+                    // A security invalidation that signaled this admission starts its Workspace
+                    // recovery now that the admission failure cleanup is complete.
+                    self.start_security_recovery_worker()?;
+                    // The first failure immediately starts the owner-tracked storage probe.
+                    self.start_runtime_dependency_probe();
+                    return Ok(());
+                }
                 let error = match (emergency_signal, error) {
                     (
                         Some(EmergencyControlSignal::PrepareForUnload),
@@ -4630,8 +4877,7 @@ impl SessionExecutorActor {
                 EmergencyControlTarget::Submit(_) => {
                     self.active_admission.as_ref().and_then(|active| {
                         self.conversation.as_ref().and_then(|conversation| {
-                            (lock(&conversation.live_state).current_turn()
-                                == Some(active.turn_id))
+                            (lock(&conversation.live_state).current_turn() == Some(active.turn_id))
                                 .then_some(active.turn_id)
                         })
                     })
@@ -4801,8 +5047,7 @@ impl SessionExecutorActor {
             // not arrive.
             let mut guard = guard;
             #[cfg(test)]
-            let result =
-                run_security_workspace_recovery(context, definition, hooks).await;
+            let result = run_security_workspace_recovery(context, definition, hooks).await;
             #[cfg(not(test))]
             let result = run_security_workspace_recovery(context, definition).await;
             guard.complete(result);
@@ -4887,12 +5132,14 @@ impl SessionExecutorActor {
                     return Err(ActorFatality::Integrity);
                 }
                 self.publish_current(Arc::new(
-                    self.current.with_workspace_preparing_finished_success(snapshot),
+                    self.current
+                        .with_workspace_preparing_finished_success(snapshot),
                 ));
             }
             SecurityRecoveryResult::Unavailable(cause) => {
                 self.publish_current(Arc::new(
-                    self.current.with_workspace_preparing_finished_failure(cause),
+                    self.current
+                        .with_workspace_preparing_finished_failure(cause),
                 ));
             }
             SecurityRecoveryResult::Closing => {
@@ -4948,6 +5195,174 @@ impl SessionExecutorActor {
         self.security_invalidation
             .as_ref()
             .is_some_and(|state| state.worker_task.is_some())
+    }
+
+    /// Whether the owner-tracked runtime-dependency probe worker is still running (its
+    /// completion has not been handled yet).  The drain loop waits for it exactly like the
+    /// security recovery worker, so close never leaves the probe task behind.
+    fn runtime_dependency_probe_is_active(&self) -> bool {
+        self.runtime_dependency_probe
+            .as_ref()
+            .is_some_and(|state| state.worker_task.is_some())
+    }
+
+    /// Starts the single owner-tracked runtime-dependency storage probe.  It is a no-op when
+    /// a probe already runs, the executor is closing or prepared for unload, or the
+    /// RuntimeDependencyUnavailable fact is not installed.  The worker re-reads the exact
+    /// pinned `AgentRevisionRef` of the definition installed at probe start (never a captured
+    /// Turn context and never the current definition at completion), so a Workspace/Model/
+    /// Prompt definition change concurrent with the probe cannot stale it; only an Agent
+    /// revision upgrade changes the pinned ref and makes the completion stale.  The state is
+    /// installed before the spawn so a rejected spawn's RAII guard still delivers its one
+    /// fallback completion through the single settlement path.  The probe has no waiter, no
+    /// timer, and no TurnId.
+    fn start_runtime_dependency_probe(&mut self) {
+        if self.runtime_dependency_probe.is_some() {
+            return;
+        }
+        if self.closing.is_cancelled() || self.prepare_unload_accepted {
+            return;
+        }
+        if !self.current.runtime_dependency_unavailable() {
+            return;
+        }
+        let reference = self.current.definition().agent();
+        self.runtime_dependency_probe = Some(RuntimeDependencyProbeState {
+            reference,
+            worker_task: None,
+        });
+        // The RAII guard is created before the future is constructed.  If `spawn_tracked`
+        // rejects the worker (owner closing, unavailable, or a spawn panic), the never-polled
+        // future is dropped with the guard inside it, and the guard's Drop reports the one
+        // fallback completion through the single settlement path — so the drain loop can
+        // never wait for a completion that will not arrive.
+        let guard = RuntimeDependencyProbeCompletionGuard::new(
+            self.completion_sender.clone(),
+            reference,
+            self.task_context.clone(),
+            self.durable_state.clone(),
+        );
+        let durable_state = self.durable_state.clone();
+        let executor_closing = self.closing.clone();
+        let worker = async move {
+            // The RAII guard also reports one fallback completion if the worker unwinds
+            // mid-run, so the drain loop can never wait forever for a completion that will
+            // not arrive.
+            let mut guard = guard;
+            let result =
+                run_runtime_dependency_probe(durable_state, reference, executor_closing).await;
+            guard.complete(result);
+        };
+        match self.task_context.spawn_tracked(worker) {
+            Ok(task) => {
+                self.runtime_dependency_probe
+                    .as_mut()
+                    .expect("the probe state is installed before spawning")
+                    .worker_task = Some(task);
+            }
+            Err(RuntimeTaskError::OwnerClosing) => {
+                // The dropped worker future carries the RAII guard, whose Drop reports the one
+                // typed Closing completion through the single settlement path.  Do not settle
+                // here or create a second completion.
+            }
+            Err(RuntimeTaskError::OperationPanicked | RuntimeTaskError::WorkerUnavailable) => {
+                // The dropped worker future carries the RAII guard, whose Drop reports the one
+                // InternalDispatchUnavailable completion and closes both owners through the
+                // single settlement path.  Do not settle here or create a second completion.
+            }
+        }
+    }
+
+    /// Handles one runtime-dependency probe worker completion.  The exact worker task is
+    /// reaped first; a failed task or a fatal state is an internal invariant.  A completion
+    /// whose probe reference no longer matches the current definition's pinned Agent revision
+    /// (an Agent revision upgrade) is discarded: it can never clear the fact, and the probe
+    /// re-runs against the current ref while the fact is still installed (unless the executor
+    /// is closing or prepared for unload).  A matching `Recovered` clears the fact, re-projects
+    /// the queue, publishes `ReadinessChanged(command_id: None)` only when the public
+    /// readiness truly changes, and hands off a queued FollowUp under the ordinary Ready
+    /// rules (the sticky PrepareUnload marker keeps the gate closed).  `StillUnavailable`
+    /// keeps the fact, publishes no event, and leaves the cleared probe slot for the next
+    /// Submit (or publication settlement) to re-arm.  `Closing` transitions the executor into
+    /// closing; `Internal` is fatal.
+    async fn handle_runtime_dependency_probe_completion(
+        &mut self,
+        completion: RuntimeDependencyProbeCompletion,
+    ) -> Result<(), ActorFatality> {
+        let Some(mut state) = self.runtime_dependency_probe.take() else {
+            // A spawn-failed worker's RAII guard can deliver its fallback completion after the
+            // close path already settled the probe; this is a benign close race, not
+            // corruption.
+            return Ok(());
+        };
+        let worker_result = match state.worker_task.take() {
+            Some(worker_task) => worker_task.wait().await,
+            None => Ok(()),
+        };
+        if worker_result.is_err() || self.failure_state.is_fatal() {
+            if !self.failure_state.is_fatal() {
+                self.close_for_fatal(ActorFatality::Internal);
+            }
+            return Err(ActorFatality::Internal);
+        }
+        if self.current.definition().agent() != completion.reference {
+            // The pinned Agent revision changed while the probe was in flight: the old result
+            // is discarded and can never clear the fact.  Re-probe the current ref while the
+            // fact is still installed and the executor is not closing/prepared for unload.
+            if self.current.runtime_dependency_unavailable()
+                && !self.closing.is_cancelled()
+                && !self.prepare_unload_accepted
+            {
+                self.start_runtime_dependency_probe();
+            }
+            return Ok(());
+        }
+        match completion.result {
+            RuntimeDependencyProbeResult::Recovered => {
+                if self.current.runtime_dependency_unavailable() {
+                    let previous = self.current.readiness();
+                    self.publish_current(Arc::new(
+                        self.current.with_runtime_dependency_available(),
+                    ));
+                    // Re-project the public queue under the recovered readiness so a retained
+                    // internal FollowUp is re-exposed before the handoff; the
+                    // ReadinessChanged snapshot must carry the re-projected queue.
+                    self.publish_queue_projection();
+                    if self.current.readiness() != previous {
+                        let _ =
+                            self.events
+                                .send(Arc::new(SessionExecutorEvent::ReadinessChanged {
+                                    timestamp: SystemClock.now(),
+                                    command_id: None,
+                                    snapshot: Arc::clone(&self.current),
+                                }));
+                    }
+                }
+                // The FollowUp handoff is internally gated on Idle, Ready, no active
+                // admission/Turn/publication, no security invalidation, and the sticky
+                // PrepareUnload marker, so a probe recovery can never bypass those.
+                self.start_queued_follow_up_after_publication()?;
+            }
+            RuntimeDependencyProbeResult::StillUnavailable => {
+                // The storage observation is still failing: the fact stays installed, no
+                // event is published, and the cleared probe slot waits for the next Submit
+                // (or publication settlement) to re-arm the probe.
+            }
+            RuntimeDependencyProbeResult::Closing => {
+                // Cancellation through the executor token is caught by the check above; the
+                // durable owner may also report Closing first.  In that case transition this
+                // executor into closing as ordinary ReloadWorkspace does, rather than leaving
+                // a loaded Session permanently RuntimeDependencyUnavailable with its admission
+                // gate shut.
+                self.turn_admission_gate.close();
+                self.closing.cancel();
+            }
+            RuntimeDependencyProbeResult::Internal => {
+                self.close_for_fatal(ActorFatality::Internal);
+                return Err(ActorFatality::Internal);
+            }
+        }
+        Ok(())
     }
 
     fn signal_emergency(
@@ -5526,6 +5941,10 @@ impl SessionExecutorActor {
             ExecutorCompletion::SecurityRecovery(completion) => {
                 self.handle_security_recovery_completion(completion).await
             }
+            ExecutorCompletion::RuntimeDependencyProbe(completion) => {
+                self.handle_runtime_dependency_probe_completion(completion)
+                    .await
+            }
         }
     }
 
@@ -5667,7 +6086,10 @@ impl SessionExecutorActor {
                     // re-projected readiness without an extra ReadinessChanged event.
                     let prompt_available = match new_definition.as_ref() {
                         Some(definition) => {
-                            match self.definition_prompt_available(Arc::clone(definition)).await {
+                            match self
+                                .definition_prompt_available(Arc::clone(definition))
+                                .await
+                            {
                                 Ok(available) => available,
                                 Err(_) => {
                                     self.active_publication = Some(active);
@@ -5695,38 +6117,49 @@ impl SessionExecutorActor {
                         None => self.current.model_available(),
                     };
                     let current = match (new_snapshot, new_definition) {
-                        (Some(snapshot), Some(definition)) => self.current
-                            .with_definition_and_workspace(
+                        (Some(snapshot), Some(definition)) => {
+                            self.current.with_definition_and_workspace(
                                 definition,
                                 snapshot,
                                 model_available,
                                 prompt_available,
-                            ),
+                            )
+                        }
                         (Some(snapshot), None) => self.current.with_definition_and_workspace(
                             Arc::clone(self.current.definition()),
                             snapshot,
                             model_available,
                             prompt_available,
                         ),
-                        (None, Some(definition)) => {
-                            self.current
-                                .with_definition(definition, model_available, prompt_available)
-                        }
+                        (None, Some(definition)) => self.current.with_definition(
+                            definition,
+                            model_available,
+                            prompt_available,
+                        ),
                         (None, None) => {
                             self.active_publication = Some(active);
                             self.close_for_fatal(ActorFatality::Integrity);
                             return Err(ActorFatality::Integrity);
                         }
                     };
-                    let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
-                        self.queue_projection(self.current.current_turn());
-                    let current = Arc::new(
-                        current.with_queue_projection(
-                            active_submit_command_id,
-                            follow_up_command_ids,
-                            steer_command_ids,
-                        ),
-                    );
+                    // The queue projection must be derived from the installed candidate's own
+                    // readiness, never from the pre-install snapshot: a future-only publication
+                    // that settles while an active Turn runs installs its definition-time facts
+                    // immediately (the Running snapshot keeps projecting Ready), and a
+                    // publication that settles after the terminal transition back to Idle must
+                    // atomically hide a retained FollowUp under the newly-unavailable facts —
+                    // the pre-install snapshot still projects Ready and would wrongly keep the
+                    // queue visible.
+                    let (active_submit_command_id, follow_up_command_ids, steer_command_ids) = self
+                        .queue_projection_for_readiness(
+                            current.current_turn(),
+                            current.readiness(),
+                        );
+                    let current = Arc::new(current.with_queue_projection(
+                        active_submit_command_id,
+                        follow_up_command_ids,
+                        steer_command_ids,
+                    ));
                     self.publish_current(current);
                     let _ = self.events.send(Arc::new(match outcome {
                         SessionWorkspaceDefinitionOutcome::Reloaded { .. } => {
@@ -5753,6 +6186,10 @@ impl SessionExecutorActor {
                 // A security invalidation registered while this publication was active starts
                 // its Workspace recovery with the post-publication exact current definition.
                 self.start_security_recovery_worker()?;
+                // A settled publication while the RuntimeDependencyUnavailable fact is still
+                // installed re-arms the storage probe (a no-op while one already runs); the
+                // publication itself is never blocked by the probe.
+                self.start_runtime_dependency_probe();
                 Ok(())
             }
             CompletionHandling::Ordinary(error) => {
@@ -5777,6 +6214,9 @@ impl SessionExecutorActor {
                 // its Workspace recovery after the ordinary settlement (the current definition
                 // is unchanged on an ordinary failure).
                 self.start_security_recovery_worker()?;
+                // An ordinary settlement while the RuntimeDependencyUnavailable fact is still
+                // installed re-arms the storage probe; the publication is never blocked by it.
+                self.start_runtime_dependency_probe();
                 Ok(())
             }
             CompletionHandling::Fatal(fatality) => {
@@ -6104,18 +6544,23 @@ impl SessionExecutorActor {
         current_turn: Option<TurnId>,
         last_terminal: Option<(TurnId, SessionTurnTerminal)>,
     ) {
-        let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
-            self.queue_projection(current_turn);
         let previous_execution_state = self.current.execution_state();
-        let current = Arc::new(
-            self.current
-                .with_execution(execution_state, current_turn, last_terminal)
-                .with_queue_projection(
-                    active_submit_command_id,
-                    follow_up_command_ids,
-                    steer_command_ids,
-                ),
-        );
+        // The queue projection must be derived from the transition candidate's own readiness,
+        // never from the pre-transition snapshot: a terminal transition back to Idle surfaces
+        // the definition-time facts installed during the active Turn (the Running snapshot
+        // projected Ready by rule, so the pre-transition projection would wrongly keep a
+        // retained FollowUp visible), and a transition into Starting/Running/Finishing must
+        // project Ready with its queues.
+        let candidate = self
+            .current
+            .with_execution(execution_state, current_turn, last_terminal);
+        let (active_submit_command_id, follow_up_command_ids, steer_command_ids) =
+            self.queue_projection_for_readiness(current_turn, candidate.readiness());
+        let current = Arc::new(candidate.with_queue_projection(
+            active_submit_command_id,
+            follow_up_command_ids,
+            steer_command_ids,
+        ));
         self.publish_current(current);
         if execution_state == SessionExecutionState::Finishing
             && previous_execution_state != SessionExecutionState::Finishing
@@ -6129,10 +6574,22 @@ impl SessionExecutorActor {
         }
     }
 
-    fn queue_projection(
+    /// Projects the public queue under an explicit candidate readiness: while non-Ready every
+    /// queue is empty and the active Submit admission is hidden, exactly matching the public
+    /// legal matrix (a non-Ready Session must project empty queues); while Ready the active
+    /// admission, the retained FollowUp lane, and the current Turn's Steer lane are projected.
+    /// Transitions must derive the readiness from the candidate snapshot they are about to
+    /// publish, never from the pre-transition snapshot, so a terminal transition back to Idle
+    /// or a settled future-only publication atomically hides a retained FollowUp under
+    /// newly-unavailable facts.
+    fn queue_projection_for_readiness(
         &self,
         current_turn: Option<TurnId>,
+        readiness: SessionReadinessView,
     ) -> (Option<CommandId>, Arc<[CommandId]>, Arc<[CommandId]>) {
+        if !matches!(readiness, SessionReadinessView::Ready) {
+            return (None, Arc::from([]), Arc::from([]));
+        }
         let active_submit_command_id = if current_turn.is_none() {
             self.active_admission
                 .as_ref()
@@ -6140,16 +6597,10 @@ impl SessionExecutorActor {
         } else {
             None
         };
-        // The public legal readiness matrix requires every queue to be empty while non-Ready.
-        // A FollowUp retained across an Agent Disable stays in the actor queue (it is never
-        // dropped) but is hidden from the projection until Ready, when the Enable handoff
-        // starts it.
-        let ready = matches!(self.current.readiness(), SessionReadinessView::Ready);
-        let follow_up_command_ids = if ready {
-            Arc::from(self.follow_up.command_ids())
-        } else {
-            Arc::from([])
-        };
+        // A FollowUp retained across an Unavailable/Preparing period stays in the actor queue
+        // (it is never dropped) but is hidden from the projection until Ready, when the
+        // restore/Enable handoff starts it.
+        let follow_up_command_ids = Arc::from(self.follow_up.command_ids());
         let steer_command_ids = Arc::from(
             current_turn
                 .map(|turn_id| self.steer.command_ids_for_turn(turn_id))
@@ -6160,6 +6611,13 @@ impl SessionExecutorActor {
             follow_up_command_ids,
             steer_command_ids,
         )
+    }
+
+    fn queue_projection(
+        &self,
+        current_turn: Option<TurnId>,
+    ) -> (Option<CommandId>, Arc<[CommandId]>, Arc<[CommandId]>) {
+        self.queue_projection_for_readiness(current_turn, self.current.readiness())
     }
 
     /// Atomically replaces the loaded Session's current/published snapshot metadata and emits the
@@ -6750,6 +7208,7 @@ enum ExecutorCompletion {
     TurnPhase(TurnPhaseCompletion),
     Turn(TurnCompletion),
     SecurityRecovery(SecurityRecoveryCompletion),
+    RuntimeDependencyProbe(RuntimeDependencyProbeCompletion),
 }
 
 struct InteractionRequestedCompletion {
@@ -6788,6 +7247,28 @@ struct AdmissionCompletion {
 struct TurnCompletion {
     turn_id: TurnId,
     terminal: SessionTurnTerminal,
+}
+
+/// One owner-tracked runtime-dependency storage probe worker completion.  The worker re-reads
+/// the exact pinned AgentRevisionRef it was spawned with; the actor compares that reference
+/// against the current definition's pinned ref before applying any result.
+struct RuntimeDependencyProbeCompletion {
+    reference: AgentRevisionRef,
+    result: RuntimeDependencyProbeResult,
+}
+
+/// The closed result of one runtime-dependency storage probe worker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeDependencyProbeResult {
+    /// The exact pinned Agent revision was read successfully: the fact can be cleared.
+    Recovered,
+    /// Durable storage is still unavailable: the fact stays installed.
+    StillUnavailable,
+    /// The durable owner is closing: the executor transitions into closing.
+    Closing,
+    /// The read failed with an AgentNotFound/RevisionUnavailable/identity mismatch or an
+    /// internal dispatch failure: an internal invariant, fatal.
+    Internal,
 }
 
 /// One owner-tracked security Workspace recovery worker completion.  The worker re-resolves the
@@ -8074,8 +8555,16 @@ fn map_agent_definition_read_error(error: DurableAgentDefinitionReadError) -> Se
         | DurableAgentDefinitionReadError::RevisionUnavailable => {
             SessionSubmitError::AgentUnavailable
         }
+        // The single production source of the dedicated internal
+        // `RuntimeDependencyUnavailable`: a transient durable storage failure while reading
+        // the pinned historical Agent revision at admission.  The actor handles it entirely
+        // inside the executor (fact + owner-tracked probe) and re-settles the public waiter
+        // from the final projected readiness, so a higher-priority cause (Agent/workspace/
+        // Prompt/Model) or a security-invalidation Preparing settles instead of the
+        // transient fact; `RuntimeDependencyUnavailable` is only the public cause when no
+        // higher-priority fact is installed.
         DurableAgentDefinitionReadError::StorageUnavailable => {
-            SessionSubmitError::DependencyUnavailable
+            SessionSubmitError::RuntimeDependencyUnavailable
         }
         DurableAgentDefinitionReadError::InternalDispatchUnavailable => {
             SessionSubmitError::InternalDispatchUnavailable
@@ -8086,7 +8575,10 @@ fn map_agent_definition_read_error(error: DurableAgentDefinitionReadError) -> Se
 fn map_turn_context_capture_error(error: TurnContextCaptureError) -> SessionSubmitError {
     match error {
         TurnContextCaptureError::InvalidBinding => SessionSubmitError::InternalDispatchUnavailable,
-        TurnContextCaptureError::Model(_) => SessionSubmitError::DependencyUnavailable,
+        // A Ready snapshot with the exact captured Prompt/Model roots re-resolving the model
+        // at capture time is an invariant violation, not a transient runtime dependency: the
+        // installed model fact was already validated against the exact installed catalog.
+        TurnContextCaptureError::Model(_) => SessionSubmitError::InternalDispatchUnavailable,
         TurnContextCaptureError::Prompt => SessionSubmitError::Prompt,
     }
 }
@@ -8399,6 +8891,52 @@ async fn resolve_reload_workspace_snapshot(
     Ok(snapshot)
 }
 
+/// One owner-tracked runtime-dependency storage probe worker.  It re-reads the exact pinned
+/// `AgentRevisionRef` captured at probe start, raced against the executor closing token: a
+/// successful read of the exact pinned Agent revision is `Recovered`; a transient
+/// `StorageUnavailable` keeps the fact installed as `StillUnavailable`; Closing is typed
+/// `Closing`; an AgentNotFound/RevisionUnavailable/identity-mismatch/internal dispatch
+/// failure is an internal invariant (`Internal`).
+async fn run_runtime_dependency_probe(
+    durable_state: DurableState,
+    reference: AgentRevisionRef,
+    executor_closing: CancellationToken,
+) -> RuntimeDependencyProbeResult {
+    // The probe re-reads the exact pinned AgentRevisionRef captured at start and races it
+    // against the executor closing token, so an Unload/close cancels the observation instead
+    // of blocking the drain.  The read itself is exact by construction; the identity check is
+    // a defensive invariant that turns a durable-state mismatch into Internal instead of a
+    // fabricated recovery.
+    let read = durable_state.read_agent_definition(reference);
+    tokio::pin!(read);
+    tokio::select! {
+        biased;
+        _ = executor_closing.cancelled() => RuntimeDependencyProbeResult::Closing,
+        result = &mut read => match result {
+            Ok(definition) => {
+                if definition.agent_id() == reference.agent_id()
+                    && definition.revision() == reference.revision()
+                {
+                    RuntimeDependencyProbeResult::Recovered
+                } else {
+                    RuntimeDependencyProbeResult::Internal
+                }
+            }
+            Err(DurableAgentDefinitionReadError::StorageUnavailable) => {
+                RuntimeDependencyProbeResult::StillUnavailable
+            }
+            Err(DurableAgentDefinitionReadError::Closing) => {
+                RuntimeDependencyProbeResult::Closing
+            }
+            Err(
+                DurableAgentDefinitionReadError::AgentNotFound
+                | DurableAgentDefinitionReadError::RevisionUnavailable
+                | DurableAgentDefinitionReadError::InternalDispatchUnavailable,
+            ) => RuntimeDependencyProbeResult::Internal,
+        },
+    }
+}
+
 /// One security Workspace recovery worker.  It re-resolves the exact definition it was spawned
 /// with through the shared helper and classifies per the security contract: every resolver
 /// Root/authority/canonical/validation failure (including AuthorityDenied, which leaves the hard
@@ -8415,8 +8953,7 @@ async fn run_security_workspace_recovery(
     }
     let resolved = {
         #[cfg(test)]
-        let result =
-            resolve_reload_workspace_snapshot(&context, definition.as_ref(), &hooks).await;
+        let result = resolve_reload_workspace_snapshot(&context, definition.as_ref(), &hooks).await;
         #[cfg(not(test))]
         let result = resolve_reload_workspace_snapshot(&context, definition.as_ref()).await;
         result
@@ -8430,8 +8967,7 @@ async fn run_security_workspace_recovery(
             | WorkspaceReloadErrorKind::WorkspaceRejected,
         ) => SecurityRecoveryResult::Unavailable(SessionUnavailableView::WorkspaceUnavailable),
         Err(
-            WorkspaceReloadErrorKind::PromptUnavailable
-            | WorkspaceReloadErrorKind::PromptRejected,
+            WorkspaceReloadErrorKind::PromptUnavailable | WorkspaceReloadErrorKind::PromptRejected,
         ) => SecurityRecoveryResult::Unavailable(SessionUnavailableView::PromptUnavailable),
         Err(WorkspaceReloadErrorKind::Internal) => SecurityRecoveryResult::Internal,
     }
@@ -8481,7 +9017,9 @@ fn map_reload_recovery_error(error: WorkspaceReloadErrorKind) -> SessionDefiniti
         WorkspaceReloadErrorKind::WorkspaceUnavailable => {
             SessionDefinitionPublicationError::WorkspaceUnavailable
         }
-        WorkspaceReloadErrorKind::AuthorityDenied => SessionDefinitionPublicationError::Unauthorized,
+        WorkspaceReloadErrorKind::AuthorityDenied => {
+            SessionDefinitionPublicationError::Unauthorized
+        }
         WorkspaceReloadErrorKind::WorkspaceRejected => {
             SessionDefinitionPublicationError::WorkspaceRejected
         }
@@ -9390,11 +9928,13 @@ impl SecurityRecoveryCompletionGuard {
         };
         let _ = self
             .completion_sender
-            .send(ExecutorCompletion::SecurityRecovery(SecurityRecoveryCompletion {
-                timestamp: self.timestamp,
-                definition,
-                result,
-            }));
+            .send(ExecutorCompletion::SecurityRecovery(
+                SecurityRecoveryCompletion {
+                    timestamp: self.timestamp,
+                    definition,
+                    result,
+                },
+            ));
     }
 }
 
@@ -9416,11 +9956,82 @@ impl Drop for SecurityRecoveryCompletionGuard {
         };
         let _ = self
             .completion_sender
-            .send(ExecutorCompletion::SecurityRecovery(SecurityRecoveryCompletion {
-                timestamp: self.timestamp,
-                definition,
-                result,
-            }));
+            .send(ExecutorCompletion::SecurityRecovery(
+                SecurityRecoveryCompletion {
+                    timestamp: self.timestamp,
+                    definition,
+                    result,
+                },
+            ));
+    }
+}
+
+/// The RAII completion guard of one runtime-dependency storage probe worker.  A normal
+/// completion sends the exact result once; an unwinding or dropped worker sends one fallback
+/// completion on drop — typed Closing when the shared task owner is already closing, otherwise
+/// Internal plus closing both owners — so the actor always receives exactly one completion and
+/// the drain loop can never wait forever.
+struct RuntimeDependencyProbeCompletionGuard {
+    completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+    reference: AgentRevisionRef,
+    task_context: RuntimeTaskContext,
+    durable_state: DurableState,
+    completed: bool,
+}
+
+impl RuntimeDependencyProbeCompletionGuard {
+    fn new(
+        completion_sender: mpsc::UnboundedSender<ExecutorCompletion>,
+        reference: AgentRevisionRef,
+        task_context: RuntimeTaskContext,
+        durable_state: DurableState,
+    ) -> Self {
+        Self {
+            completion_sender,
+            reference,
+            task_context,
+            durable_state,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self, result: RuntimeDependencyProbeResult) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::RuntimeDependencyProbe(
+                RuntimeDependencyProbeCompletion {
+                    reference: self.reference,
+                    result,
+                },
+            ));
+    }
+}
+
+impl Drop for RuntimeDependencyProbeCompletionGuard {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.completed = true;
+        let result = if self.task_context.is_closing() {
+            RuntimeDependencyProbeResult::Closing
+        } else {
+            self.task_context.request_closing();
+            self.durable_state.request_closing();
+            RuntimeDependencyProbeResult::Internal
+        };
+        let _ = self
+            .completion_sender
+            .send(ExecutorCompletion::RuntimeDependencyProbe(
+                RuntimeDependencyProbeCompletion {
+                    reference: self.reference,
+                    result,
+                },
+            ));
     }
 }
 
@@ -10469,8 +11080,9 @@ mod tests {
             loop {
                 let snapshot = executor.snapshot().await.unwrap();
                 if let Some((completed_turn, terminal)) = snapshot.last_terminal() {
-                    assert_eq!(completed_turn, turn_id);
-                    return terminal;
+                    if completed_turn == turn_id {
+                        return terminal;
+                    }
                 }
                 tokio::task::yield_now().await;
             }
@@ -10501,6 +11113,80 @@ mod tests {
         }
         .validate()
         .unwrap()
+    }
+
+    /// Unix-only fixture seam: makes one generation directory physically unreadable (mode
+    /// 0o000).  This is the real transient StorageUnavailable seam for an exact historical
+    /// definition read: a missing/renamed document is Integrity by design
+    /// (`read_required_indexed_definition_document` re-checks the path and maps NotFound to
+    /// poison), while EACCES on both `read_document` and its final metadata re-check maps to
+    /// the genuine retryable storage failure.  Restoring the directory mode 0o700 makes the
+    /// exact read succeed again.  Both callers are `#[cfg(unix)]` tests, so the helpers are
+    /// Unix-only too: non-Unix builds carry no dead code and no platform panic path.
+    #[cfg(unix)]
+    fn make_generation_unreadable(generation_dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(generation_dir, fs::Permissions::from_mode(0o000))
+            .expect("the fixture generation directory is made unreadable");
+    }
+
+    #[cfg(unix)]
+    fn restore_generation_readable(generation_dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(generation_dir, fs::Permissions::from_mode(0o700))
+            .expect("the fixture generation directory is restored");
+    }
+
+    /// RAII guard for the Unix-only unreadable-directory fixture: `new` makes the generation
+    /// directory unreadable (mode 0o000) and the guard restores it to 0o700 on `restore()` and,
+    /// best-effort, on drop — so a failing assertion never leaves the fixture directory at
+    /// 0o000, which would also break TempStore cleanup.  The guard drops before `TempStore`
+    /// (declared earlier in both tests), so the restore always sees the directory alive.
+    #[cfg(unix)]
+    struct GenerationReadabilityGuard {
+        generation_dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl GenerationReadabilityGuard {
+        fn new(generation_dir: &Path) -> Self {
+            make_generation_unreadable(generation_dir);
+            Self {
+                generation_dir: generation_dir.to_path_buf(),
+            }
+        }
+
+        fn restore(&self) {
+            restore_generation_readable(&self.generation_dir);
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for GenerationReadabilityGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.generation_dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Drains executor events until one matches the predicate; non-matching events are consumed.
+    async fn wait_for_event(
+        subscription: &mut SessionExecutorSubscription,
+        predicate: impl Fn(&SessionExecutorEvent) -> bool,
+    ) -> Arc<SessionExecutorEvent> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = subscription
+                    .recv()
+                    .await
+                    .expect("the executor stays open while an event is expected");
+                if predicate(event.as_ref()) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the expected executor event arrives within the deadline")
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14228,13 +14914,21 @@ mod tests {
         assert_eq!(update.workspace_revision().get(), 1);
 
         // The installed snapshot preserves the exact WorkspaceSnapshot, current Turn, and
-        // execution state while carrying the new definition revision.
+        // execution state while carrying the new definition revision, and keeps projecting
+        // Ready: the future-only definition-time ModelUnavailable fact is installed but only
+        // affects future admissions, and a non-Idle Session must never project non-Ready (the
+        // public legal matrix requires every non-Ready Session to be an Idle empty projection).
         let during = loaded.executor.snapshot().await.unwrap();
         assert_eq!(during.definition_revision().get(), 2);
         assert!(Arc::ptr_eq(during.workspace(), before.workspace()));
         assert_eq!(during.workspace_revision().get(), 1);
         assert_eq!(during.current_turn(), Some(turn_id));
         assert_eq!(during.execution_state(), SessionExecutionState::Running);
+        assert_eq!(
+            during.readiness(),
+            SessionReadinessView::Ready,
+            "Running always projects Ready; the ModelUnavailable fact surfaces only at Idle"
+        );
         let durable = loaded.state.session_current_definition(session_id).unwrap();
         assert_eq!(durable.revision().get(), 2);
         assert_eq!(durable.model().selection().model_id().as_str(), "gpt-99");
@@ -14247,18 +14941,26 @@ mod tests {
         // The active Turn ran to completion against its already-captured old model.
         assert_eq!(model.request_count(), 1);
 
-        // A future admission reads the new current definition: the replaced model is not in the
-        // catalog, so the next Turn cannot capture it.
+        // A future admission reads the new current definition with its definition-time
+        // readiness facts: the replaced model is not in the Runtime catalog, so the installed
+        // snapshot projects ModelUnavailable and the Submit settles
+        // SessionNotReady(ModelUnavailable) without generating a Turn.
         assert_eq!(
             loaded
                 .executor
                 .submit(CommandId::generate().unwrap(), text_intent("second"))
                 .await,
-            Err(SessionSubmitError::DependencyUnavailable)
+            Err(SessionSubmitError::SessionNotReady(
+                SessionUnavailableView::ModelUnavailable
+            ))
         );
         let settled = loaded.executor.snapshot().await.unwrap();
         assert_eq!(settled.execution_state(), SessionExecutionState::Idle);
         assert_eq!(settled.definition_revision().get(), 2);
+        assert_eq!(
+            settled.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::ModelUnavailable)
+        );
         close_loaded(loaded).await;
     }
 
@@ -14360,6 +15062,7 @@ mod tests {
         let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
         let loaded = scripted_text_fixture(&store, &model).await;
         let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
         let follow_up_id = CommandId::generate().unwrap();
 
         // Hold the future-only publication between its durable commit and its snapshot install
@@ -14374,6 +15077,9 @@ mod tests {
         hooks.wait_before_agent_run_attempt().await;
         let running = loaded.executor.snapshot().await.unwrap();
         assert_eq!(running.definition_revision().get(), 1);
+        // The old known model config is saved before the publication so a later restore can
+        // hand off the retained FollowUp against it.
+        let known_model = running.definition().model().clone();
         let publication = {
             let executor = loaded.executor.clone();
             tokio::spawn(async move {
@@ -14398,6 +15104,11 @@ mod tests {
             .expect("the FollowUp is queued while the Turn runs");
         let queued = loaded.executor.snapshot().await.unwrap();
         assert_eq!(queued.follow_up_command_ids(), [follow_up_id]);
+        assert_eq!(
+            queued.readiness(),
+            SessionReadinessView::Ready,
+            "a Running snapshot with an in-flight publication keeps projecting Ready"
+        );
 
         // The Turn terminates while the publication is still active; the FollowUp stays queued.
         hooks.release_before_agent_run_attempt();
@@ -14408,38 +15119,100 @@ mod tests {
         assert_eq!(model.request_count(), 1);
         let terminal = loaded.executor.snapshot().await.unwrap();
         assert_eq!(terminal.follow_up_command_ids(), [follow_up_id]);
+        assert_eq!(
+            terminal.readiness(),
+            SessionReadinessView::Ready,
+            "terminal still projects Ready: the new definition-time facts are not installed yet"
+        );
 
-        // Once the publication settles, the queued FollowUp starts against the new current
-        // definition: it is popped and its admission captures the replaced model, which is not
-        // in the catalog.
+        // The unknown-model publication settles and installs rev2 with its definition-time
+        // readiness facts: gpt-99 is not in the Runtime catalog, so the Session projects
+        // ModelUnavailable and the retained FollowUp is hidden from the public projection.  No
+        // admission is attempted while not Ready, so the FollowUp stays in the actor queue for
+        // a later restore instead of being popped and failing capture; the first Turn's single
+        // model request is unchanged.
         hooks.release_after_commit_before_install();
         assert!(publication.await.unwrap().unwrap().changed());
-        assert_eq!(
-            loaded
-                .executor
-                .snapshot()
-                .await
-                .unwrap()
-                .definition_revision()
-                .get(),
-            2
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = loaded.executor.snapshot().await.unwrap();
-                if snapshot.follow_up_command_ids().is_empty()
-                    && snapshot.execution_state() == SessionExecutionState::Idle
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+        let unavailable_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::DefinitionUpdated { snapshot, .. }
+                    if snapshot.definition_revision().get() == 2
+                        && snapshot.readiness()
+                            == SessionReadinessView::Unavailable(
+                                SessionUnavailableView::ModelUnavailable
+                            )
+            )
         })
-        .await
-        .expect("the FollowUp leaves the queue after the publication settles");
-        // The FollowUp admission consumed the updated definition and failed capture; the first
-        // Turn's single model request is unchanged.
+        .await;
+        assert_eq!(
+            unavailable_event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let settled = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(settled.definition_revision().get(), 2);
+        assert_eq!(
+            settled.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::ModelUnavailable)
+        );
+        assert_eq!(settled.execution_state(), SessionExecutionState::Idle);
+        assert!(
+            settled.follow_up_command_ids().is_empty(),
+            "the retained internal FollowUp is hidden from the public projection while ModelUnavailable"
+        );
+        assert!(
+            settled.active_submit_command_id().is_none() && settled.steer_command_ids().is_empty(),
+            "a non-Ready Idle snapshot projects empty queues across the whole legal matrix"
+        );
         assert_eq!(model.request_count(), 1);
+
+        // A future-only publication restoring the saved known model (expected rev2) publishes
+        // rev3 and restores Ready.  Publication settlement automatically hands off the exact
+        // retained FollowUp, which runs against the restored model and produces the second
+        // model request.
+        let restored = loaded
+            .executor
+            .update_session_definition_with_cancellation(
+                settled.definition_revision(),
+                None,
+                Some(known_model),
+                None,
+                "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the known-model restore publication succeeds");
+        assert!(restored.changed());
+        assert_eq!(restored.definition_revision().get(), 3);
+        wait_for_request_count(&model, 2).await;
+        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    command_id,
+                    terminal,
+                    ..
+                } if *command_id == follow_up_id && *terminal == SessionTurnTerminal::Completed
+            )
+        })
+        .await;
+        let follow_up_turn_id = follow_up_terminal
+            .turn_id()
+            .expect("the FollowUp Turn has a TurnId");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, follow_up_turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let final_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(final_snapshot.definition_revision().get(), 3);
+        assert_eq!(final_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(
+            final_snapshot.execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(final_snapshot.follow_up_command_ids().is_empty());
         close_loaded(loaded).await;
     }
 
@@ -14662,13 +15435,21 @@ mod tests {
         assert_eq!(upgraded.definition_revision().get(), 2);
 
         // The installed snapshot keeps the exact WorkspaceSnapshot and active Turn while
-        // carrying the new Agent ref: the already-captured Turn context is untouched.
+        // carrying the new Agent ref: the already-captured Turn context is untouched.  It also
+        // keeps projecting Ready: the future-only PromptUnavailable fact is installed but only
+        // affects future admissions, and a non-Idle Session must never project non-Ready (the
+        // public legal matrix requires every non-Ready Session to be an Idle empty projection).
         let during = loaded.executor.snapshot().await.unwrap();
         assert_eq!(during.execution_state(), SessionExecutionState::Running);
         assert_eq!(during.current_turn(), Some(turn_id));
         assert_eq!(during.definition_revision().get(), 2);
         assert_eq!(during.definition().agent().revision().get(), 2);
         assert!(Arc::ptr_eq(during.workspace(), running.workspace()));
+        assert_eq!(
+            during.readiness(),
+            SessionReadinessView::Ready,
+            "Running always projects Ready; the PromptUnavailable fact surfaces only at Idle"
+        );
 
         hooks.release_before_agent_run_attempt();
         assert_eq!(
@@ -14677,34 +15458,42 @@ mod tests {
         );
         assert_eq!(model.request_count(), 1);
 
-        // A future admission reads the new installed definition and resolves the new Agent ref
-        // from durable state, so it captures against ar_2.  The test PromptService only carries
-        // the prompts patched into the ar_1 fixture definitions, so ar_2's prompt selection is
-        // unavailable and the admission fails with Prompt instead of starting a second Turn.  If
-        // the stale ar_1 capture were wrongly reused, the "second answer" model request would
-        // run instead, so the Prompt failure itself proves the admission used the new Agent ref.
+        // A future admission reads the new installed definition with its definition-time
+        // readiness facts: the test PromptService only carries the prompts patched into the
+        // ar_1 fixture definitions, so ar_2's prompt selection was precomputed unavailable at
+        // install and the Session projects PromptUnavailable.  The Submit settles
+        // SessionNotReady(PromptUnavailable) instead of starting a second Turn; if the stale
+        // ar_1 capture were wrongly reused, the "second answer" model request would run
+        // instead, so the readiness failure itself proves the admission used the new Agent ref.
         assert_eq!(
             loaded
                 .executor
                 .submit(CommandId::generate().unwrap(), text_intent("second"))
                 .await,
-            Err(SessionSubmitError::Prompt)
+            Err(SessionSubmitError::SessionNotReady(
+                SessionUnavailableView::PromptUnavailable
+            ))
         );
         let admitted = loaded.executor.snapshot().await.unwrap();
         assert_eq!(admitted.execution_state(), SessionExecutionState::Idle);
         assert_eq!(admitted.current_turn(), None);
         assert_eq!(admitted.definition().agent().revision().get(), 2);
+        assert_eq!(
+            admitted.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::PromptUnavailable)
+        );
         assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn agent_upgrade_terminal_race_keeps_follow_up_and_hands_off_against_new_ref() {
+    async fn agent_upgrade_terminal_race_keeps_follow_up_and_hands_off_on_ar1_rollback() {
         let store = TempStore::new();
         create_fixture_agent_g2(&store.root);
         let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
         let loaded = scripted_text_fixture(&store, &model).await;
         let hooks = loaded.executor.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
         let follow_up_id = CommandId::generate().unwrap();
 
         // Hold the Agent upgrade between its durable commit and its snapshot install so the
@@ -14741,6 +15530,11 @@ mod tests {
             .expect("the FollowUp is queued while the Turn runs");
         let queued = loaded.executor.snapshot().await.unwrap();
         assert_eq!(queued.follow_up_command_ids(), [follow_up_id]);
+        assert_eq!(
+            queued.readiness(),
+            SessionReadinessView::Ready,
+            "a Running snapshot with an in-flight publication keeps projecting Ready"
+        );
 
         // The Turn terminates while the publication is still active; the FollowUp stays queued.
         hooks.release_before_agent_run_attempt();
@@ -14752,51 +15546,113 @@ mod tests {
         let terminal = loaded.executor.snapshot().await.unwrap();
         assert_eq!(terminal.follow_up_command_ids(), [follow_up_id]);
         assert_eq!(terminal.definition().agent().revision().get(), 1);
+        assert_eq!(
+            terminal.readiness(),
+            SessionReadinessView::Ready,
+            "terminal still projects Ready: the new definition-time facts are not installed yet"
+        );
 
-        // Once the upgrade settles, the queued FollowUp is handed off against the new Agent ref.
-        // ar_2's prompts are unavailable in the test PromptService, so its admission capture
-        // fails with Prompt and the FollowUp drains without a model request; reusing the stale
-        // ar_1 capture would have produced the "second answer" model request instead.
+        // The upgrade settles and installs rev2 pinned at ar_2 with its definition-time
+        // readiness facts: the test PromptService does not carry ar_2's prompts, so the Session
+        // projects PromptUnavailable and the retained FollowUp is hidden from the public
+        // projection.  No admission is attempted while not Ready, so the FollowUp stays in the
+        // actor queue instead of being handed off against ar_2 and failing capture; reusing the
+        // stale ar_1 capture would have produced the "second answer" model request instead.
         hooks.release_after_commit_before_install();
         assert!(publication.await.unwrap().unwrap().changed());
+        let upgraded_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::DefinitionUpdated { snapshot, .. }
+                    if snapshot.definition_revision().get() == 2
+                        && snapshot.readiness()
+                            == SessionReadinessView::Unavailable(
+                                SessionUnavailableView::PromptUnavailable
+                            )
+            )
+        })
+        .await;
         assert_eq!(
-            loaded
-                .executor
+            upgraded_event
                 .snapshot()
-                .await
-                .unwrap()
                 .definition()
                 .agent()
                 .revision()
                 .get(),
             2
         );
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                let snapshot = loaded.executor.snapshot().await.unwrap();
-                if snapshot.follow_up_command_ids().is_empty()
-                    && snapshot.execution_state() == SessionExecutionState::Idle
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the FollowUp leaves the queue after the upgrade settles");
         assert_eq!(
-            loaded
-                .executor
-                .snapshot()
-                .await
-                .unwrap()
-                .definition()
-                .agent()
-                .revision()
-                .get(),
-            2
+            upgraded_event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let unavailable = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(unavailable.definition_revision().get(), 2);
+        assert_eq!(unavailable.definition().agent().revision().get(), 2);
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::PromptUnavailable)
+        );
+        assert_eq!(unavailable.execution_state(), SessionExecutionState::Idle);
+        assert!(
+            unavailable.follow_up_command_ids().is_empty(),
+            "the retained internal FollowUp is hidden from the public projection while PromptUnavailable"
+        );
+        assert!(
+            unavailable.active_submit_command_id().is_none()
+                && unavailable.steer_command_ids().is_empty(),
+            "a non-Ready Idle snapshot projects empty queues across the whole legal matrix"
         );
         assert_eq!(model.request_count(), 1);
+
+        // An explicit rollback to the retained ar_1 (expected rev2) publishes rev3 and restores
+        // Ready: ar_1's patched prompt selection is available again.  Publication settlement
+        // automatically hands off the exact retained FollowUp, which runs against the restored
+        // ar_1 pin and produces the second model request.
+        let rolled_back = loaded
+            .executor
+            .upgrade_session_agent_with_cancellation(
+                unavailable.definition_revision(),
+                Some(AgentRevisionRef::new(
+                    unavailable.definition().agent().agent_id(),
+                    "ar_1".parse().unwrap(),
+                )),
+                "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the explicit rollback to the retained ar_1 publishes");
+        assert!(rolled_back.changed());
+        assert_eq!(rolled_back.definition_revision().get(), 3);
+        wait_for_request_count(&model, 2).await;
+        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    command_id,
+                    terminal,
+                    ..
+                } if *command_id == follow_up_id && *terminal == SessionTurnTerminal::Completed
+            )
+        })
+        .await;
+        let follow_up_turn_id = follow_up_terminal
+            .turn_id()
+            .expect("the FollowUp Turn has a TurnId");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, follow_up_turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let final_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(final_snapshot.definition_revision().get(), 3);
+        assert_eq!(final_snapshot.definition().agent().revision().get(), 1);
+        assert_eq!(final_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(
+            final_snapshot.execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(final_snapshot.follow_up_command_ids().is_empty());
         close_loaded(loaded).await;
     }
 
@@ -15093,6 +15949,624 @@ mod tests {
         resolver_hooks.release_after_candidate_before_final_recheck();
         let outcome = reload.await.unwrap().expect("the held reload completes");
         assert!(outcome.changed());
+        close_loaded(loaded).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_dependency_unavailable_real_storage_owner_probe_recovery() {
+        // The fixture keeps the Session pinned on the historical ar_1 revision while the Agent
+        // current head is ar_2, so every loaded admission performs the exact bounded historical
+        // read of agents/.../generations/G1/definition.json.
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let agent_id = loaded.definition.agent().agent_id();
+        assert_eq!(loaded.definition.agent().revision().get(), 1);
+        assert_eq!(
+            loaded
+                .state
+                .agent_current_definition(agent_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2,
+            "the Agent current is the g2 revision while the Session pins historical ar_1"
+        );
+        let historical_generation = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1);
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+        let good_workspace = Arc::clone(loaded.executor.snapshot().await.unwrap().workspace());
+
+        // The real storage fault: the generation directory becomes physically unreadable, so the
+        // exact historical read observes EACCES and maps to the genuine StorageUnavailable (a
+        // missing document would be Integrity by design and would poison the Store instead).
+        // The guard restores the directory even if an assertion below fails.
+        let readability = GenerationReadabilityGuard::new(&historical_generation);
+
+        // The first Submit settles from the real admission failure: no TurnId, no model attempt,
+        // an Idle snapshot with the transient fact, the last-good WorkspaceSnapshot Arc kept, and
+        // the single install ReadinessChanged(command_id: None).
+        let first = CommandId::generate().unwrap();
+        assert_eq!(
+            loaded.executor.submit(first, text_intent("hello")).await,
+            Err(SessionSubmitError::SessionNotReady(
+                SessionUnavailableView::RuntimeDependencyUnavailable
+            ))
+        );
+        assert_eq!(model.request_count(), 0);
+        let unavailable = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(unavailable.execution_state(), SessionExecutionState::Idle);
+        assert_eq!(unavailable.current_turn(), None);
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::RuntimeDependencyUnavailable)
+        );
+        assert!(unavailable.runtime_dependency_unavailable());
+        assert!(Arc::ptr_eq(
+            unavailable
+                .workspace_optional()
+                .expect("the last-good Workspace is kept while Unavailable"),
+            &good_workspace
+        ));
+        let install = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness()
+                    == SessionReadinessView::Unavailable(
+                        SessionUnavailableView::RuntimeDependencyUnavailable
+                    )
+            )
+        })
+        .await;
+        assert_eq!(
+            install.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+
+        // A Submit while the fact is installed settles the same public error and re-arms the
+        // owner probe; while the storage stays unavailable every probe reports StillUnavailable,
+        // so no second readiness event is ever published.
+        let second = CommandId::generate().unwrap();
+        assert_eq!(
+            loaded
+                .executor
+                .submit(second, text_intent("still failing"))
+                .await,
+            Err(SessionSubmitError::SessionNotReady(
+                SessionUnavailableView::RuntimeDependencyUnavailable
+            ))
+        );
+        assert_eq!(model.request_count(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), subscription.recv())
+                .await
+                .is_err(),
+            "a still-unavailable probe publishes no readiness event"
+        );
+        assert_eq!(
+            loaded.executor.snapshot().await.unwrap().readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::RuntimeDependencyUnavailable)
+        );
+
+        // Restore the physical document, then the next Submit re-arms the probe: its exact
+        // re-read of the pinned ar_1 recovers and publishes Ready(command_id: None).  The
+        // probe armed by the first failure may already have settled StillUnavailable (clearing
+        // the probe slot with no event), so the re-arm Submit is required — never assume a
+        // probe is still in flight.
+        readability.restore();
+        let rearm = CommandId::generate().unwrap();
+        match loaded.executor.submit(rearm, text_intent("re-arm")).await {
+            Err(SessionSubmitError::SessionNotReady(
+                SessionUnavailableView::RuntimeDependencyUnavailable,
+            )) => {}
+            Ok(_) => {
+                // The re-armed probe recovered before the Submit was processed, so the Submit
+                // started a Turn instead; the recovery event is already in the buffer.
+            }
+            other => panic!(
+                "the re-arm Submit settles RuntimeDependencyUnavailable or starts a Turn: {other:?}"
+            ),
+        }
+        let recovery = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness() == SessionReadinessView::Ready
+            )
+        })
+        .await;
+        assert_eq!(
+            recovery.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(!recovery.snapshot().runtime_dependency_unavailable());
+        // If the re-arm Submit won the recovery race it already started a Turn; settle it before
+        // the final CommandId so the final Submit is never SessionBusy.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let snapshot = loaded.executor.snapshot().await.unwrap();
+                if snapshot.execution_state() == SessionExecutionState::Idle
+                    && snapshot.current_turn().is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the executor returns to Idle before the final Submit");
+        let recovered = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(recovered.readiness(), SessionReadinessView::Ready);
+        assert_eq!(recovered.execution_state(), SessionExecutionState::Idle);
+        assert!(!recovered.runtime_dependency_unavailable());
+
+        // A fresh CommandId now starts and completes a real Turn against the recovered pin.
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("final"))
+            .await
+            .expect("the recovered Session admits a new CommandId");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert!(model.request_count() >= 1);
+        close_loaded(loaded).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn retained_follow_up_survives_transient_runtime_dependency_failure() {
+        let store = TempStore::new();
+        create_fixture_agent_g2(&store.root);
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let historical_generation = store
+            .root
+            .join("agents")
+            .join(AGENT_ID)
+            .join("generations")
+            .join(G1);
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+
+        // Hold the first Turn before its model attempt, queue a FollowUp, and make the historical
+        // ar_1 read fail only from the terminal handoff onward.  The guard restores the directory
+        // even if an assertion below fails.
+        hooks.arm_before_agent_run_attempt();
+        let first_turn = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts while the storage is healthy");
+        hooks.wait_before_agent_run_attempt().await;
+        let follow_up_id = CommandId::generate().unwrap();
+        loaded
+            .executor
+            .follow_up(follow_up_id, text_intent("queued follow up"))
+            .await
+            .expect("the FollowUp is queued while the Turn runs");
+        assert_eq!(
+            loaded
+                .executor
+                .snapshot()
+                .await
+                .unwrap()
+                .follow_up_command_ids(),
+            [follow_up_id]
+        );
+        let readability = GenerationReadabilityGuard::new(&historical_generation);
+
+        // The Turn completes, and its terminal handoff admission re-reads the pinned ar_1: the
+        // transient storage failure re-queues the FollowUp at the front of the actor queue and
+        // installs the fact.  The public projection is empty while Unavailable.
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, first_turn).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        let install = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness()
+                    == SessionReadinessView::Unavailable(
+                        SessionUnavailableView::RuntimeDependencyUnavailable
+                    )
+            )
+        })
+        .await;
+        assert_eq!(
+            install.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let unavailable = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::RuntimeDependencyUnavailable)
+        );
+        assert!(
+            unavailable.follow_up_command_ids().is_empty(),
+            "the retained internal FollowUp is hidden from the public projection while Unavailable"
+        );
+        assert_eq!(model.request_count(), 1);
+
+        // Restore the storage and explicitly re-arm the owner probe with fresh direct Submits.
+        // The probe armed at the failed handoff may already have settled StillUnavailable,
+        // which clears the probe slot without publishing any event, so the test must never
+        // assume a probe is still in flight (a blind Ready wait could then hang).  A Submit
+        // while the fact is installed settles SessionNotReady(RuntimeDependencyUnavailable)
+        // and re-arms the probe only when no probe is running; the probe completion and the
+        // Submit are drained through separate channels (the actor's biased select), so a stale
+        // StillUnavailable can land after a re-arm Submit, and only the next Submit re-arms.
+        // The bounded loop therefore keeps submitting fresh CommandIds until the restored
+        // pinned ar_1 is observed: every probe started after the restore recovers, so the loop
+        // converges — the recovery publishes Ready(command_id: None) and automatically hands
+        // off the exact retained FollowUp (no new Submit), and the next Submit then settles
+        // SessionBusy (or, in the defensive race where it instead started a Turn, Ok).  The
+        // two scripted answers map 1:1 to the two real Turns (the first Turn and the automatic
+        // FollowUp handoff); the re-arm Submits never consume a model request.
+        readability.restore();
+        let rearm_turn = 'rearm: {
+            for _ in 0..100 {
+                let outcome = loaded
+                    .executor
+                    .submit(CommandId::generate().unwrap(), text_intent("re-arm"))
+                    .await;
+                match outcome {
+                    Err(SessionSubmitError::SessionNotReady(
+                        SessionUnavailableView::RuntimeDependencyUnavailable,
+                    )) => {
+                        // The fact is still installed; the re-arm may or may not have started a
+                        // probe.  Loop so a probe eventually observes the restored directory.
+                    }
+                    Err(SessionSubmitError::SessionBusy) => break 'rearm None,
+                    Ok(turn_id) => break 'rearm Some(turn_id),
+                    other => panic!(
+                        "the re-arm Submit settles RuntimeDependencyUnavailable, SessionBusy, or starts a Turn: {other:?}"
+                    ),
+                }
+            }
+            panic!(
+                "the re-arm Submits kept settling RuntimeDependencyUnavailable; no probe observed the restored pinned ar_1"
+            );
+        };
+        if let Some(turn_id) = rearm_turn {
+            // Defensive truthful handling of the recovery race won by a re-arm Submit
+            // (unreachable while a retained FollowUp hands off synchronously on recovery):
+            // settle the started Turn before waiting for the FollowUp handoff.
+            let _ = wait_for_terminal(&loaded.executor, turn_id).await;
+        }
+        let recovery = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness() == SessionReadinessView::Ready
+            )
+        })
+        .await;
+        assert_eq!(
+            recovery.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(!recovery.snapshot().runtime_dependency_unavailable());
+        wait_for_request_count(&model, 2).await;
+        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    command_id,
+                    terminal,
+                    ..
+                } if *command_id == follow_up_id && *terminal == SessionTurnTerminal::Completed
+            )
+        })
+        .await;
+        let follow_up_turn_id = follow_up_terminal
+            .turn_id()
+            .expect("the FollowUp Turn has a TurnId");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, follow_up_turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let final_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(final_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(
+            final_snapshot.execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(final_snapshot.follow_up_command_ids().is_empty());
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn agent_availability_disable_during_running_preserves_turn_and_handoff_queued_follow_up()
+    {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer", "second answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let agent_id = loaded.definition.agent().agent_id();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the first Turn starts");
+        hooks.wait_before_agent_run_attempt().await;
+        let follow_up_id = CommandId::generate().unwrap();
+        loaded
+            .executor
+            .follow_up(follow_up_id, text_intent("queued follow up"))
+            .await
+            .expect("the FollowUp is queued while the Turn runs");
+
+        // A Disable during Running never cancels or changes the active Turn: the fact is merged
+        // into the pending composite and no ReadinessChanged is published yet.
+        let disable_command = CommandId::generate().unwrap();
+        loaded
+            .executor
+            .set_agent_availability_with_cancellation(
+                agent_id,
+                false,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                disable_command,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the Disable is accepted during Running");
+        let running = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(running.execution_state(), SessionExecutionState::Running);
+        assert_eq!(running.current_turn(), Some(turn_id));
+        assert_eq!(running.readiness(), SessionReadinessView::Ready);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), subscription.recv())
+                .await
+                .is_err(),
+            "a Disable merged during Running publishes no ReadinessChanged"
+        );
+
+        // At terminal the pending composite applies: the Session becomes AgentUnavailable with
+        // the exact Disable command attribution, and the queued FollowUp is retained (hidden from
+        // the public projection until Ready).
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
+        let disabled_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: Some(command_id),
+                    snapshot,
+                    ..
+                } if *command_id == disable_command
+                    && snapshot.readiness()
+                        == SessionReadinessView::Unavailable(
+                            SessionUnavailableView::AgentUnavailable
+                        )
+            )
+        })
+        .await;
+        assert_eq!(
+            disabled_event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let disabled = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(
+            disabled.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::AgentUnavailable)
+        );
+        assert!(
+            disabled.follow_up_command_ids().is_empty(),
+            "the retained FollowUp is hidden while AgentUnavailable"
+        );
+
+        // The Enable restores Ready with its own command attribution and immediately hands off the
+        // retained FollowUp, which produces the second model attempt and a completed Turn carrying
+        // the FollowUp command id.
+        let enable_command = CommandId::generate().unwrap();
+        loaded
+            .executor
+            .set_agent_availability_with_cancellation(
+                agent_id,
+                true,
+                "2026-08-03T10:03:00.000Z".parse().unwrap(),
+                enable_command,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the Enable is accepted while Idle");
+        let enabled_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: Some(command_id),
+                    snapshot,
+                    ..
+                } if *command_id == enable_command && snapshot.readiness() == SessionReadinessView::Ready
+            )
+        })
+        .await;
+        assert_eq!(
+            enabled_event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        wait_for_request_count(&model, 2).await;
+        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::TurnTerminal {
+                    command_id,
+                    terminal,
+                    ..
+                } if *command_id == follow_up_id && *terminal == SessionTurnTerminal::Completed
+            )
+        })
+        .await;
+        let follow_up_turn_id = follow_up_terminal
+            .turn_id()
+            .expect("the FollowUp Turn has a TurnId");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, follow_up_turn_id).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 2);
+        let final_snapshot = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(final_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(
+            final_snapshot.execution_state(),
+            SessionExecutionState::Idle
+        );
+        assert!(final_snapshot.follow_up_command_ids().is_empty());
+        close_loaded(loaded).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn security_invalidation_active_turn_truthful_revocation_duplicate_joins_single_recovery()
+    {
+        let store = TempStore::new();
+        let model = ScriptedModelFixture::new(vec!["first answer"]);
+        let loaded = scripted_text_fixture(&store, &model).await;
+        let hooks = loaded.executor.test_hooks();
+        let resolver_hooks = loaded.resolver.test_hooks();
+        let mut subscription = loaded.executor.subscribe().await.unwrap();
+
+        // Hold the Turn before its model attempt, then signal the host security invalidation: the
+        // active Turn is truthfully SecurityRevoked while a duplicate invalidation joins the same
+        // recovery state without re-signaling it.
+        hooks.arm_before_agent_run_attempt();
+        let turn_id = loaded
+            .executor
+            .submit(CommandId::generate().unwrap(), text_intent("hello"))
+            .await
+            .expect("the Turn starts before the invalidation");
+        hooks.wait_before_agent_run_attempt().await;
+        // Block the recovery worker at the resolver re-check so the Preparing start event is
+        // stably observable before the final event.
+        resolver_hooks.arm_after_candidate_before_final_recheck();
+        let first_waiter = loaded
+            .executor
+            .begin_security_invalidation("2026-08-03T10:02:00.000Z".parse().unwrap())
+            .expect("the first invalidation is admitted");
+        let second_waiter = loaded
+            .executor
+            .begin_security_invalidation("2026-08-03T10:03:00.000Z".parse().unwrap())
+            .expect("a duplicate invalidation joins the same recovery");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if loaded.executor.snapshot().await.unwrap().execution_state()
+                    == SessionExecutionState::Finishing
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the signaled active Turn projects Finishing");
+
+        // The Turn terminates truthfully with SecurityRevoked and never reaches the model.
+        hooks.release_before_agent_run_attempt();
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, turn_id).await,
+            SessionTurnTerminal::Interrupted(SessionTurnInterruption::SecurityRevoked)
+        );
+        assert_eq!(model.request_count(), 0);
+
+        // The single start ReadinessChanged(command_id: None) enters Preparing; the recovery
+        // worker is parked at the resolver barrier, so no final event can arrive yet and the
+        // duplicate join publishes nothing.
+        let start_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness() == SessionReadinessView::Preparing
+            )
+        })
+        .await;
+        assert_eq!(
+            start_event.snapshot().execution_state(),
+            SessionExecutionState::Idle
+        );
+        let preparing = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(preparing.readiness(), SessionReadinessView::Preparing);
+        assert!(preparing.workspace_preparing());
+        assert!(preparing.workspace_optional().is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), subscription.recv())
+                .await
+                .is_err(),
+            "the duplicate invalidation neither re-signals nor re-publishes a start event"
+        );
+
+        // The recovery completes: one final ReadinessChanged(command_id: None), every joined
+        // waiter settles Ok, the admission gate reopens, and a fresh Submit starts a Turn.
+        resolver_hooks.release_after_candidate_before_final_recheck();
+        assert_eq!(first_waiter.wait().await, Ok(()));
+        assert_eq!(second_waiter.wait().await, Ok(()));
+        let final_event = wait_for_event(&mut subscription, |event| {
+            matches!(
+                event,
+                SessionExecutorEvent::ReadinessChanged {
+                    command_id: None,
+                    snapshot,
+                    ..
+                } if snapshot.readiness() == SessionReadinessView::Ready
+            )
+        })
+        .await;
+        assert!(final_event.snapshot().workspace_optional().is_some());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), subscription.recv())
+                .await
+                .is_err(),
+            "the recovery publishes exactly one final readiness event"
+        );
+        let recovered = loaded.executor.snapshot().await.unwrap();
+        assert_eq!(recovered.readiness(), SessionReadinessView::Ready);
+        assert_eq!(recovered.execution_state(), SessionExecutionState::Idle);
+        let post_recovery_turn = loaded
+            .executor
+            .submit(
+                CommandId::generate().unwrap(),
+                text_intent("after recovery"),
+            )
+            .await
+            .expect("the reopened admission gate accepts a fresh Submit");
+        assert_eq!(
+            wait_for_terminal(&loaded.executor, post_recovery_turn).await,
+            SessionTurnTerminal::Completed
+        );
+        assert_eq!(model.request_count(), 1);
         close_loaded(loaded).await;
     }
 }

@@ -6,7 +6,8 @@
 //! The crate-private owner of loaded Session residency.
 //!
 //! This module deliberately stops at the boundary between durable Session definitions, the
-//! Workspace resolver, replay-backed Ready+Idle installation, and a loaded [`SessionExecutor`].
+//! Workspace resolver, replay-backed Idle installation with derived readiness, and a loaded
+//! [`SessionExecutor`].
 //! Conversation Storage retains semantic replay and recording ownership; this registry only keeps
 //! their prepared state/recorder alive through publication and routes owner-local Turn commands.
 //! It owns no public payload projection or Turn state. `RuntimeInner` retains this registry as one
@@ -27,8 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::agent_session_lifecycle::{
     AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SealedSessionAgentUpgradeAttempt,
     SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
-    SealedSessionMetadataAttempt, SessionLifecycle, SessionLifecycleDecision,
-    SessionLifecycleDecisionError, SessionDefinition, SessionModelConfig,
+    SealedSessionMetadataAttempt, SessionDefinition, SessionLifecycle, SessionLifecycleDecision,
+    SessionLifecycleDecisionError, SessionModelConfig,
 };
 use crate::compaction::{CompactionSettings, CompactionSettingsSnapshot};
 #[cfg(not(test))]
@@ -55,14 +56,15 @@ use crate::prompt::{
 use crate::runtime_interface::{SessionReadinessView, SessionUnavailableView};
 use crate::runtime_task::{RuntimeTaskContext, RuntimeTaskError, TrackedTask};
 use crate::session_execution::{
-    model_available_for_definition, prompt_available_for_definition, LoadedSessionConversation,
-    PrepareUnloadWaiter, SessionAgentAvailabilityError, SessionCancelError, SessionCancelTarget,
-    SessionDefinitionPublicationError, SessionDefinitionPublicationOutcome, SessionExecutor,
-    SessionExecutorCloseError, SessionExecutorDependencies, SessionExecutorPrepareUnloadError,
-    SessionExecutorSnapshot, SessionExecutorSnapshotError, SessionExecutorStartError,
-    SessionExecutorSubscription, SessionFollowUpError, SessionInteractionError,
-    SessionPromptAvailabilityError, SessionQueuedMessageError, SessionSecurityInvalidationError,
-    SessionSteerError, SessionSubmitError, SessionWorkspaceDefinitionError,
+    LoadedSessionConversation, PrepareUnloadWaiter, SessionAgentAvailabilityError,
+    SessionCancelError, SessionCancelTarget, SessionDefinitionPublicationError,
+    SessionDefinitionPublicationOutcome, SessionExecutor, SessionExecutorCloseError,
+    SessionExecutorDependencies, SessionExecutorPrepareUnloadError, SessionExecutorSnapshot,
+    SessionExecutorSnapshotError, SessionExecutorStartError, SessionExecutorSubscription,
+    SessionFollowUpError, SessionInteractionError, SessionPromptAvailabilityError,
+    SessionQueuedMessageError, SessionSecurityInvalidationError, SessionSteerError,
+    SessionSubmitError, SessionWorkspaceDefinitionError, model_available_for_definition,
+    prompt_available_for_definition,
 };
 use crate::tools::ToolSet;
 use crate::turn_item_interaction::InteractionResolutionInput;
@@ -208,6 +210,8 @@ pub(crate) enum SessionResidencySubmitError {
     SessionBusy,
     #[error("Session is not ready to accept Turns: {0:?}")]
     SessionNotReady(SessionUnavailableView),
+    #[error("session residency is preparing")]
+    Preparing,
     #[error("loaded session execution dependencies are unavailable")]
     DependencyUnavailable,
     #[error("agent is unavailable for execution")]
@@ -831,9 +835,7 @@ enum OperationCompletion {
         Result<SessionDefinitionPublicationOutcome, SessionResidencyWorkspaceReloadError>,
     ),
     AgentAvailability(Result<(), SessionResidencyAgentAvailabilityError>),
-    SharedResources(
-        Result<ResidencyTurnResources, SessionResidencySharedResourcesError>,
-    ),
+    SharedResources(Result<ResidencyTurnResources, SessionResidencySharedResourcesError>),
 }
 
 impl OperationCompletion {
@@ -885,9 +887,7 @@ impl OperationCompletion {
                 | Self::AgentUpgrade(Err(SessionResidencyAgentUpgradeError::Closing))
                 | Self::WorkspaceReload(Err(SessionResidencyWorkspaceReloadError::Closing))
                 | Self::AgentAvailability(Err(SessionResidencyAgentAvailabilityError::Closing))
-                | Self::SharedResources(Err(
-                    SessionResidencySharedResourcesError::Closing
-                ))
+                | Self::SharedResources(Err(SessionResidencySharedResourcesError::Closing))
         )
     }
 }
@@ -917,9 +917,7 @@ enum OperationSender {
         >,
     ),
     AgentAvailability(oneshot::Sender<Result<(), SessionResidencyAgentAvailabilityError>>),
-    SharedResources(
-        oneshot::Sender<Result<(), SessionResidencySharedResourcesError>>,
-    ),
+    SharedResources(oneshot::Sender<Result<(), SessionResidencySharedResourcesError>>),
 }
 
 /// The response cell retained by the actor while the caller-side receiver may be dropped.
@@ -1830,9 +1828,7 @@ impl SessionResidencyActor {
             ResidencyRequest::Metadata(request) => self.start_metadata(request),
             ResidencyRequest::AgentUpgrade(request) => self.start_agent_upgrade(request),
             ResidencyRequest::WorkspaceReload(request) => self.start_workspace_reload(request),
-            ResidencyRequest::AgentAvailability(request) => {
-                self.start_agent_availability(request)
-            }
+            ResidencyRequest::AgentAvailability(request) => self.start_agent_availability(request),
             ResidencyRequest::SharedResources(request) => self.start_shared_resources(request),
         }
     }
@@ -2117,12 +2113,7 @@ impl SessionResidencyActor {
             async move {
                 OperationCompletion::AgentAvailability(
                     run_agent_availability(
-                        context,
-                        session_id,
-                        agent_id,
-                        available,
-                        timestamp,
-                        command_id,
+                        context, session_id, agent_id, available, timestamp, command_id,
                     )
                     .await,
                 )
@@ -2135,8 +2126,8 @@ impl SessionResidencyActor {
             self.poison();
             return;
         };
-        let prompt_resources = request.prompt_resources;
-        let model_catalog = request.model_catalog;
+        let prompt_resources = Arc::clone(&request.prompt_resources);
+        let model_catalog = Arc::clone(&request.model_catalog);
         let timestamp = request.timestamp;
         let command_id = request.command_id;
         let context = self.operation_context();
@@ -2676,8 +2667,10 @@ impl SessionResidencyRegistry {
         }
     }
 
-    /// Loads one current durable Session as a Ready+Idle executor.  A duplicate request is an
-    /// idempotent NoChange and never starts a second executor.
+    /// Loads one current durable Session as a loaded Idle executor; readiness is derived from
+    /// the captured availability facts (Ready, or an Unavailable cause that a later
+    /// ReloadWorkspace can recover).  A duplicate request is an idempotent NoChange and never
+    /// starts a second executor.
     pub(crate) async fn load_ready_idle(
         &self,
         session_id: SessionId,
@@ -2794,6 +2787,20 @@ impl SessionResidencyRegistry {
                 SessionSubmitError::SessionBusy => SessionResidencySubmitError::SessionBusy,
                 SessionSubmitError::SessionNotReady(cause) => {
                     SessionResidencySubmitError::SessionNotReady(cause)
+                }
+                // A security-invalidation Preparing Session settles the dedicated internal
+                // Preparing error; the RuntimeDependencyUnavailable public cause is reserved
+                // for the real storage-probe fact.
+                SessionSubmitError::Preparing => SessionResidencySubmitError::Preparing,
+                // The dedicated internal runtime-dependency failure is handled entirely inside
+                // the executor (fact + probe) and is re-settled as the public-facing
+                // `SessionNotReady(RuntimeDependencyUnavailable)` cause before it can leave the
+                // actor; this exhaustive fallback is only reachable through an internal
+                // dispatch bug.
+                SessionSubmitError::RuntimeDependencyUnavailable => {
+                    SessionResidencySubmitError::SessionNotReady(
+                        SessionUnavailableView::RuntimeDependencyUnavailable,
+                    )
                 }
                 SessionSubmitError::DependencyUnavailable => {
                     SessionResidencySubmitError::DependencyUnavailable
@@ -3403,9 +3410,7 @@ impl SessionResidencyRegistry {
         })
     }
 
-    fn shared_resources_waiter_fallback(
-        &self,
-    ) -> Result<(), SessionResidencySharedResourcesError> {
+    fn shared_resources_waiter_fallback(&self) -> Result<(), SessionResidencySharedResourcesError> {
         Err(if self.failure.is_fatal() {
             SessionResidencySharedResourcesError::InternalDispatchUnavailable
         } else if self.closing.is_cancelled() {
@@ -3638,9 +3643,11 @@ async fn run_load(
                 };
                 match revalidation_result {
                     Ok(true) => {}
-                    Ok(false) => readiness = SessionReadinessView::Unavailable(
-                        SessionUnavailableView::WorkspaceUnavailable,
-                    ),
+                    Ok(false) => {
+                        readiness = SessionReadinessView::Unavailable(
+                            SessionUnavailableView::WorkspaceUnavailable,
+                        )
+                    }
                     Err(WorkspaceResolveError::Closing) => {
                         loaded_conversation.recorder.close().await;
                         return Err(SessionResidencyLoadError::Closing);
@@ -3655,9 +3662,11 @@ async fn run_load(
                         | WorkspaceResolveError::CwdRootMismatch
                         | WorkspaceResolveError::AuthorityUnavailable
                         | WorkspaceResolveError::AuthorityDenied,
-                    ) => readiness = SessionReadinessView::Unavailable(
-                        SessionUnavailableView::WorkspaceUnavailable,
-                    ),
+                    ) => {
+                        readiness = SessionReadinessView::Unavailable(
+                            SessionUnavailableView::WorkspaceUnavailable,
+                        )
+                    }
                     Err(WorkspaceResolveError::InternalDispatchUnavailable) => {
                         loaded_conversation.recorder.close().await;
                         return Err(context.internal_load());
@@ -3747,8 +3756,7 @@ async fn run_load(
                 prompt_available,
                 None,
                 Some(
-                    workspace_snapshot
-                        .expect("a Ready load always finishes its WorkspaceSnapshot"),
+                    workspace_snapshot.expect("a Ready load always finishes its WorkspaceSnapshot"),
                 ),
                 conversation,
                 context.executor_force_closing.clone(),
@@ -3787,8 +3795,7 @@ async fn run_load(
                     Arc::clone(&context.resolver),
                     Arc::clone(&context.prompt_service),
                     definition,
-                    workspace_snapshot
-                        .expect("a Ready load always finishes its WorkspaceSnapshot"),
+                    workspace_snapshot.expect("a Ready load always finishes its WorkspaceSnapshot"),
                     conversation,
                 )
             }
@@ -4550,7 +4557,13 @@ async fn run_agent_availability(
     let Some(executor) = context.state.executor(session_id) else {
         return Ok(());
     };
-    if executor.published_snapshot().definition().agent().agent_id() != agent_id {
+    if executor
+        .published_snapshot()
+        .definition()
+        .agent()
+        .agent_id()
+        != agent_id
+    {
         return Err(context.internal_agent_availability());
     }
     executor
@@ -4659,7 +4672,7 @@ async fn run_shared_resources(
         model_gateway: Arc::clone(&current.model_gateway),
         model_catalog: Arc::clone(&model_catalog),
         tool_set: Arc::clone(&current.tool_set),
-        compaction: current.compaction,
+        compaction: current.compaction.clone(),
     };
     for entry in &precomputed {
         let session_id = entry.definition.session_id();
@@ -4668,7 +4681,10 @@ async fn run_shared_resources(
         let Some(executor) = context.state.executor(session_id) else {
             return Err(context.internal_shared_resources());
         };
-        if !Arc::ptr_eq(executor.published_snapshot().definition(), &entry.definition) {
+        if !Arc::ptr_eq(
+            executor.published_snapshot().definition(),
+            &entry.definition,
+        ) {
             return Err(context.internal_shared_resources());
         }
         executor
@@ -4690,7 +4706,6 @@ async fn run_shared_resources(
     }
     Ok(new_resources)
 }
-
 
 fn map_executor_workspace_reload_error(
     context: &OperationContext,
@@ -4854,10 +4869,10 @@ mod tests {
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier};
     use crate::durable_state::DurableState;
-    use crate::model_gateway::{ModelSelection, ReasoningPreference};
+    use crate::model_gateway::{ModelSelection, ReasoningPreference, ScriptedModelFixture};
     use crate::prompt::{
-        PromptSourceError, WorkspacePromptSource, WorkspacePromptSourceAdapter,
-        WorkspacePromptSourceFuture,
+        PromptBodyIntent, PromptSourceError, TextIntent, WorkspacePromptSource,
+        WorkspacePromptSourceAdapter, WorkspacePromptSourceFuture,
     };
     use crate::runtime_task::RuntimeTaskContext;
     use crate::wire::conversation_jsonl::ConversationLineCodec;
@@ -5231,6 +5246,63 @@ mod tests {
         (context, state, registry)
     }
 
+    /// Clears the fixture Agent/Session prompt selections so the installed Runtime Prompt
+    /// resources trivially resolve them; the loaded readiness facts otherwise project
+    /// PromptUnavailable for a recovered Session, exactly like the executor test fixture does.
+    fn empty_fixture_prompt_selections(store: &TempStore) {
+        for (path, from) in [
+            (
+                store
+                    .root
+                    .join("agents")
+                    .join(AGENT_ID)
+                    .join("generations")
+                    .join(G1)
+                    .join("definition.json"),
+                r#""promptIds":["base","safety"]"#,
+            ),
+            (
+                store
+                    .root
+                    .join("sessions")
+                    .join(SESSION_ID)
+                    .join("generations")
+                    .join(G1)
+                    .join("definition.json"),
+                r#""promptIds":["base","session-notes"]"#,
+            ),
+        ] {
+            let bytes = fs::read(&path).expect("the fixture definition is readable");
+            create_file(&path, &replace_fixture(&bytes, from, r#""promptIds":[]"#));
+        }
+    }
+
+    /// Starts a residency actor with a scripted model fixture that resolves the fixture
+    /// definition's `openai/gpt-5` selection, so an ordinary availability failure degrades only
+    /// the loaded readiness instead of failing Load with the missing-dependency shape.
+    async fn open_registry_with_turn_resources(
+        context: RuntimeTaskContext,
+        state: DurableState,
+        resolver: Arc<WorkspaceResolver>,
+        prompt_service: Arc<PromptService>,
+    ) -> SessionResidencyRegistry {
+        let model = ScriptedModelFixture::new(Vec::new());
+        let prompt_resources = prompt_service.initialize().await.unwrap();
+        SessionResidencyRegistry::start_with_turn_resources(
+            context,
+            state,
+            resolver,
+            prompt_service,
+            prompt_resources,
+            Arc::clone(model.gateway()),
+            Arc::clone(model.catalog()),
+            CompactionSettings::default()
+                .validate()
+                .expect("default compaction settings are valid"),
+        )
+        .expect("the residency actor starts")
+    }
+
     async fn close_fixture(
         context: RuntimeTaskContext,
         state: DurableState,
@@ -5280,6 +5352,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn load_and_loaded_workspace_publication_capture_prompt_sources() {
         let store = TempStore::new();
+        empty_fixture_prompt_selections(&store);
         let (context, state) = open_state(&store.root).await;
         let resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
             context.clone(),
@@ -5291,50 +5364,90 @@ mod tests {
         let prompt_service = Arc::new(
             PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
         );
-        let _resources = prompt_service.initialize().await.unwrap();
-        let registry = SessionResidencyRegistry::start(
+        let registry = open_registry_with_turn_resources(
             context.clone(),
             state.clone(),
             resolver,
             prompt_service,
         )
-        .expect("the residency actor starts");
+        .await;
         let session_id: SessionId = SESSION_ID.parse().unwrap();
 
-        assert_eq!(
-            registry.load_ready_idle(session_id).await,
-            Err(SessionResidencyLoadError::WorkspaceUnavailable)
-        );
-        assert_eq!(source.call_count(), 1);
-        assert_eq!(registry.loaded_count_for_test(), 0);
-
-        source.replace("");
-        assert_eq!(
-            registry.load_ready_idle(session_id).await,
-            Err(SessionResidencyLoadError::WorkspaceRejected)
-        );
-        assert_eq!(registry.loaded_count_for_test(), 0);
-
-        source.replace("first project prompt");
+        // An unavailable Workspace Prompt source degrades the loaded Session to Idle
+        // WorkspaceUnavailable instead of failing Load: no WorkspaceSnapshot is installed and
+        // Submit settles SessionNotReady with the exact cause.
         assert_eq!(
             registry.load_ready_idle(session_id).await,
             Ok(SessionResidencyLoadOutcome::Loaded)
         );
-        let first = registry.snapshot(session_id).await.unwrap();
-        let first_prompt = first.workspace().prompt_context();
-        assert_eq!(first_prompt.sources().len(), 1);
-        assert_eq!(first_prompt.sources()[0].content(), "first project prompt");
+        assert_eq!(source.call_count(), 1);
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        let unavailable = registry.snapshot(session_id).await.unwrap();
         assert_eq!(
-            first_prompt.sources()[0].relative_location().as_str(),
+            unavailable.execution_state(),
+            crate::session_execution::SessionExecutionState::Idle
+        );
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::WorkspaceUnavailable)
+        );
+        assert!(
+            unavailable.workspace_optional().is_none(),
+            "an unavailable Load installs no WorkspaceSnapshot"
+        );
+        assert!(matches!(
+            registry
+                .submit(
+                    session_id,
+                    CommandId::generate().unwrap(),
+                    PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("ping").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                )
+                .await,
+            Err(SessionResidencySubmitError::SessionNotReady(
+                SessionUnavailableView::WorkspaceUnavailable
+            ))
+        ));
+
+        // Restoring the Prompt source lets the loaded Session recover through ReloadWorkspace:
+        // it installs a fresh snapshot and returns to Ready while the durable definition
+        // revision stays untouched.
+        source.replace("first project prompt");
+        let reloaded = registry
+            .reload_workspace(
+                session_id,
+                "2026-08-03T10:02:00.000Z".parse().unwrap(),
+                CommandId::generate().unwrap(),
+            )
+            .await
+            .expect("the loaded Session reloads its Workspace after the Prompt source recovers");
+        assert!(reloaded.changed());
+        assert_eq!(reloaded.definition_revision().get(), 1);
+        assert_eq!(reloaded.workspace_revision().get(), 1);
+        let recovered = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(recovered.readiness(), SessionReadinessView::Ready);
+        let recovered_prompt = recovered.workspace().prompt_context();
+        assert_eq!(recovered_prompt.sources().len(), 1);
+        assert_eq!(
+            recovered_prompt.sources()[0].content(),
+            "first project prompt"
+        );
+        assert_eq!(
+            recovered_prompt.sources()[0].relative_location().as_str(),
             "AGENTS.md"
         );
 
+        // A loaded Workspace publication captures its Prompt candidate: a failed capture keeps
+        // the last-good snapshot and a recovered one publishes the new prompt sources.
         source.fail();
         assert!(matches!(
             registry
                 .update_workspace_definition(
                     session_id,
-                    first.definition_revision(),
+                    recovered.definition_revision(),
                     changed_workspace(&store.new_workspace),
                     "2026-08-03T10:02:00.000Z".parse().unwrap(),
                 )
@@ -5353,7 +5466,7 @@ mod tests {
         let outcome = registry
             .update_workspace_definition(
                 session_id,
-                first.definition_revision(),
+                recovered.definition_revision(),
                 changed_workspace(&store.new_workspace),
                 "2026-08-03T10:02:00.000Z".parse().unwrap(),
             )
@@ -5367,7 +5480,15 @@ mod tests {
             second_prompt.sources()[0].content(),
             "second project prompt"
         );
-        assert_eq!(source.call_count(), 5);
+        assert_eq!(source.call_count(), 4);
+        assert_eq!(
+            state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            2
+        );
 
         assert_eq!(
             registry.unload(session_id).await,
@@ -5391,13 +5512,13 @@ mod tests {
         let prompt_service = Arc::new(
             PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
         );
-        let registry = SessionResidencyRegistry::start(
+        let registry = open_registry_with_turn_resources(
             context.clone(),
             state.clone(),
             resolver,
             prompt_service,
         )
-        .expect("the residency actor starts");
+        .await;
         let barrier = ReplayPreparationBarrier::new();
         barrier.arm_before_recorder();
         registry.set_replay_preparation_barrier_for_test(Some(Arc::clone(&barrier)));
@@ -5413,12 +5534,34 @@ mod tests {
         prompt_grant.store(false, Ordering::Release);
         barrier.release_before_recorder();
 
-        assert_eq!(
-            load.await,
-            Err(SessionResidencyLoadError::WorkspaceUnavailable)
-        );
+        // The post-replay authority revalidation failure degrades the loaded Session to Idle
+        // WorkspaceUnavailable instead of failing Load: the replayed conversation and its
+        // Recorder owner still install with the exact durable definition revision.
+        assert_eq!(load.await, Ok(SessionResidencyLoadOutcome::Loaded));
         assert_eq!(source.call_count(), 1);
-        assert_eq!(registry.loaded_count_for_test(), 0);
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        assert_eq!(registry.gate_count_for_test(), 1);
+        let snapshot = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(
+            snapshot.execution_state(),
+            crate::session_execution::SessionExecutionState::Idle
+        );
+        assert_eq!(
+            snapshot.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::WorkspaceUnavailable)
+        );
+        assert!(snapshot.workspace_optional().is_none());
+        let executor = registry
+            .executor_for_test(session_id)
+            .expect("the revalidated Load installs its executor");
+        assert!(
+            executor.live_state_for_test().is_some(),
+            "the replayed conversation owner is installed"
+        );
+        assert!(
+            executor.recorder_for_test().is_some(),
+            "the replay Recorder owner is installed"
+        );
         assert_eq!(
             state
                 .session_current_definition(session_id)
@@ -5427,7 +5570,161 @@ mod tests {
                 .get(),
             1
         );
+
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
         close_fixture(context, state, registry).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_residency_loads_ready_after_host_recovery_without_rewriting_durable() {
+        let store = TempStore::new();
+        empty_fixture_prompt_selections(&store);
+        let conversation_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("conversation.jsonl");
+        let definition_path = store
+            .root
+            .join("sessions")
+            .join(SESSION_ID)
+            .join("generations")
+            .join(G1)
+            .join("definition.json");
+        let conversation_before = fs::read(&conversation_path).unwrap();
+        let definition_before = fs::read(&definition_path).unwrap();
+        let session_id: SessionId = SESSION_ID.parse().unwrap();
+
+        // First residency while host Workspace resources are unavailable: Load installs the
+        // Session as Idle WorkspaceUnavailable instead of failing.
+        let (context, state) = open_state(&store.root).await;
+        let resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
+            context.clone(),
+            true,
+            false,
+        ));
+        let unavailable_source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        let adapter: Arc<dyn WorkspacePromptSourceAdapter> = unavailable_source.clone();
+        let prompt_service = Arc::new(
+            PromptService::new(Arc::from("required"), None, Vec::new(), vec![adapter]).unwrap(),
+        );
+        let registry = open_registry_with_turn_resources(
+            context.clone(),
+            state.clone(),
+            resolver,
+            prompt_service,
+        )
+        .await;
+        assert_eq!(
+            registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        assert_eq!(registry.loaded_count_for_test(), 1);
+        let unavailable = registry.snapshot(session_id).await.unwrap();
+        assert_eq!(
+            unavailable.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::WorkspaceUnavailable)
+        );
+        assert!(unavailable.workspace_optional().is_none());
+
+        // Unload closes the first residency; closing the whole owner set never rewrites the
+        // durable definition or conversation.
+        assert_eq!(
+            registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        registry.wait_for_no_active_operation_for_test().await;
+        assert_eq!(registry.loaded_count_for_test(), 0);
+        close_fixture(context, state, registry).await;
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        assert_eq!(fs::read(&definition_path).unwrap(), definition_before);
+
+        // The host resources recover before the owner restart: a fresh Runtime, DurableState,
+        // resolver, available Prompt source, and residency actor reopen the same Store root and
+        // Load replays the exact durable conversation and installs Ready with the captured
+        // snapshot at the same durable definition revision.
+        let (restarted_context, restarted_state) = open_state(&store.root).await;
+        let restarted_resolver = Arc::new(WorkspaceResolver::new_with_source_grants_for_test(
+            restarted_context.clone(),
+            true,
+            false,
+        ));
+        let restored_source = Arc::new(MutableWorkspacePromptSource::unavailable());
+        restored_source.replace("restored project prompt");
+        let restarted_adapter: Arc<dyn WorkspacePromptSourceAdapter> = restored_source.clone();
+        let restarted_prompt_service = Arc::new(
+            PromptService::new(
+                Arc::from("required"),
+                None,
+                Vec::new(),
+                vec![restarted_adapter],
+            )
+            .unwrap(),
+        );
+        let restarted_registry = open_registry_with_turn_resources(
+            restarted_context.clone(),
+            restarted_state.clone(),
+            restarted_resolver,
+            restarted_prompt_service,
+        )
+        .await;
+        assert_eq!(
+            restarted_registry.load_ready_idle(session_id).await,
+            Ok(SessionResidencyLoadOutcome::Loaded)
+        );
+        assert_eq!(restarted_registry.loaded_count_for_test(), 1);
+        let ready = restarted_registry.snapshot(session_id).await.unwrap();
+        assert_eq!(ready.readiness(), SessionReadinessView::Ready);
+        assert_eq!(ready.definition_revision().get(), 1);
+        assert_eq!(ready.workspace_revision().get(), 1);
+        let prompt = ready.workspace().prompt_context();
+        assert_eq!(prompt.sources().len(), 1);
+        assert_eq!(prompt.sources()[0].content(), "restored project prompt");
+        assert_eq!(restored_source.call_count(), 1);
+
+        // The restarted residency replayed the durable conversation through its own owners and
+        // left both durable files byte-for-byte untouched at the original definition revision.
+        let executor = restarted_registry
+            .executor_for_test(session_id)
+            .expect("the restarted residency installs its own executor");
+        assert!(
+            executor.live_state_for_test().is_some(),
+            "the restarted Load replays the durable conversation"
+        );
+        let diagnostics = executor
+            .replay_diagnostics_for_test()
+            .expect("the restarted Load retains replay diagnostics");
+        assert_eq!(
+            diagnostics
+                .count(crate::conversation_storage::ConversationReplayDiagnosticCode::PartialTail),
+            0
+        );
+        let recorder = executor
+            .recorder_for_test()
+            .expect("the restarted Load installs its own Recorder");
+        assert!(matches!(
+            &*recorder.health(),
+            crate::conversation_storage::RecordingHealth::Healthy
+        ));
+        assert_eq!(fs::read(&conversation_path).unwrap(), conversation_before);
+        assert_eq!(fs::read(&definition_path).unwrap(), definition_before);
+        assert_eq!(
+            restarted_state
+                .session_current_definition(session_id)
+                .unwrap()
+                .revision()
+                .get(),
+            1
+        );
+
+        assert_eq!(
+            restarted_registry.unload(session_id).await,
+            Ok(SessionResidencyUnloadOutcome::Unloaded)
+        );
+        close_fixture(restarted_context, restarted_state, restarted_registry).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

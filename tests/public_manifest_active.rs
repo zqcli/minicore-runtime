@@ -11,8 +11,9 @@ use minicore_runtime::runtime_interface::{
     InteractionCommand, ItemContentView, ProgressEventKind, ProgressUpdate, PublicCancelTarget,
     PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand, RuntimeEventDetail, RuntimeRequest,
     RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionLifecycleView,
-    SessionStateEventKind, SnapshotResponse, StateEventMsg, SubscriptionClosed, TurnCommand,
-    TurnFailureView, TurnInterruptionView, TurnStatusView, TurnTerminalView,
+    SessionReadinessView, SessionStateEventKind, SessionUnavailableView, SnapshotResponse,
+    StateEventMsg, SubscriptionClosed, TurnCommand, TurnFailureView, TurnInterruptionView,
+    TurnStatusView, TurnTerminalView,
 };
 use minicore_runtime::tools::UserQuestionAnswerValue;
 use minicore_runtime::turn_item_interaction::{InteractionRequestView, InteractionResolutionInput};
@@ -285,6 +286,24 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
             assert_eq!(*kind, RuntimeStateEventKind::CommandCatalogInvalidated);
             assert!(snapshot.loaded_sessions().is_empty());
         }
+        (Some("shared_resources_reloaded_state"), EventFrame::State(event)) => {
+            assert_eq!(event.route(), EventRoute::Runtime);
+            assert_eq!(
+                event.command_id(),
+                Some("cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap())
+            );
+            let StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail,
+            } = event.msg()
+            else {
+                panic!("runtime state assertion requires a Runtime message");
+            };
+            assert_eq!(*kind, RuntimeStateEventKind::SharedResourcesReloaded);
+            assert!(detail.is_none());
+            assert!(snapshot.loaded_sessions().is_empty());
+        }
         (
             Some(
                 assertion @ ("agent_created_state"
@@ -408,6 +427,7 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 | RuntimeStateEventKind::AgentStatusChanged
                 | RuntimeStateEventKind::SessionDefinitionUpdated
                 | RuntimeStateEventKind::SessionMetadataUpdated
+                | RuntimeStateEventKind::SharedResourcesReloaded
                 | RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
             }
         }
@@ -539,6 +559,60 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 minicore_runtime::runtime_interface::SessionExecutionView::Idle
             );
         }
+        (
+            Some("session_readiness_unavailable_runtime_dependency_state"),
+            EventFrame::State(event),
+        ) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionReadinessChanged)
+            );
+            assert!(event.msg().session_detail().is_none());
+            let snapshot = event.msg().session_snapshot().unwrap();
+            assert_eq!(
+                snapshot.readiness(),
+                SessionReadinessView::Unavailable(
+                    SessionUnavailableView::RuntimeDependencyUnavailable
+                )
+            );
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Idle
+            );
+            assert!(snapshot.current_turn().is_none());
+            assert!(snapshot.active_items().is_empty());
+            assert!(snapshot.pending_interactions().is_empty());
+            assert!(!snapshot.queues().accepting_input());
+        }
+        (Some("session_readiness_preparing_state"), EventFrame::State(event)) => {
+            assert_eq!(
+                event.route(),
+                EventRoute::Session {
+                    session_id: "ses_22222222222222222222222222222222".parse().unwrap(),
+                }
+            );
+            assert_eq!(
+                event.msg().session_kind(),
+                Some(SessionStateEventKind::SessionReadinessChanged)
+            );
+            assert!(event.msg().session_detail().is_none());
+            let snapshot = event.msg().session_snapshot().unwrap();
+            assert_eq!(snapshot.readiness(), SessionReadinessView::Preparing);
+            assert_eq!(
+                snapshot.execution(),
+                minicore_runtime::runtime_interface::SessionExecutionView::Idle
+            );
+            assert!(snapshot.current_turn().is_none());
+            assert!(snapshot.active_items().is_empty());
+            assert!(snapshot.pending_interactions().is_empty());
+            assert!(!snapshot.queues().accepting_input());
+        }
         (Some("turn_completed_state"), EventFrame::State(event)) => {
             assert_turn_terminal_event(event.msg(), SessionStateEventKind::TurnCompleted, None);
         }
@@ -555,6 +629,15 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                 SessionStateEventKind::TurnInterrupted,
                 Some(TerminalReason::Interruption(
                     TurnInterruptionView::UserCancelled,
+                )),
+            );
+        }
+        (Some("turn_interrupted_prepare_for_unload_state"), EventFrame::State(event)) => {
+            assert_turn_terminal_event(
+                event.msg(),
+                SessionStateEventKind::TurnInterrupted,
+                Some(TerminalReason::Interruption(
+                    TurnInterruptionView::PrepareForUnload,
                 )),
             );
         }
@@ -765,6 +848,13 @@ fn assert_command_response_semantics(
             Some("workspace_reloaded_completion"),
             CommandCompletion::Completed {
                 outcome: CommandOutcome::WorkspaceReloaded,
+                output: None,
+            },
+        ) => {}
+        (
+            Some("shared_resources_reloaded_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SharedResourcesReloaded,
                 output: None,
             },
         ) => {}
