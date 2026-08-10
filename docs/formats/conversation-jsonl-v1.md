@@ -66,7 +66,7 @@ Exact wire：
 - Header.sessionId必须匹配caller打开的catalog/path SessionId；
 - Header没有EntryId/parent/TurnId；
 - Header只证明file identity与creation provenance，不是current definition/authorization；
-- M3.2 scanner only returns a final partial-tail truncation action after a valid v1 Header and opaque `ExclusiveWritableConversationLease`; DurableState now issues `PublishedConversationTarget` plus the paired proof after exact Header and same-open-file validation, and Recorder consumes the opaque pair, while the current `#[cfg(test)]` constructor remains scanner-test-only；
+- M3.2 scanner only returns a final partial-tail truncation action after a valid v1 Header and opaque `ExclusiveWritableConversationLease`; DurableState now issues `PublishedConversationTarget` plus the paired proof after exact Header validation and a safe three-way same-file identity check across the append handle, truncation handle, and current path, and Recorder consumes the opaque pair, while the current `#[cfg(test)]` constructor remains scanner-test-only；
 - v1 writer不向higher version file append。
 
 ## Entry Envelope
