@@ -279,7 +279,11 @@ fn active_and_pending_event_slices_remain_distinct_from_unknown_frames() {
     );
     assert_eq!(starting.queues().submit_admissions().len(), 1);
 
-    for path in ["valid/progress-frame.json", "valid/closed-frame.json"] {
+    for path in [
+        "valid/progress-frame.json",
+        "valid/closed-frame.json",
+        "valid/runtime-shared-resources-reloaded-state-frame.json",
+    ] {
         let raw = fixture(path);
         let frame = protocol.decode_event_frame(&raw).unwrap();
         assert_eq!(
@@ -294,19 +298,6 @@ fn active_and_pending_event_slices_remain_distinct_from_unknown_frames() {
     let fault = error.public_decode_error().unwrap();
     assert_eq!(fault.stage(), PublicDecodeStage::SelectedSchema);
     assert_eq!(fault.code(), PublicDecodeCode::UnknownOutputVariant);
-
-    let runtime = String::from_utf8(fixture("valid/runtime-state-frame.json"))
-        .unwrap()
-        .replace(
-            "\"kind\":\"command_catalog_invalidated\"",
-            "\"kind\":\"shared_resources_reloaded\"",
-        );
-    assert!(
-        protocol
-            .decode_event_frame(runtime.as_bytes())
-            .unwrap_err()
-            .is_pending_public_target()
-    );
 }
 
 #[test]

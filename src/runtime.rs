@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration as StdDuration, Instant};
 
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, RwLock, Semaphore, broadcast};
+use tokio::sync::{
+    Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, Semaphore, broadcast,
+};
 
 use crate::agent_session_lifecycle::{
     AgentRevisionRef, AgentStatus, SealedAgentCreateAttempt, SealedAgentDefinitionAttempt,
@@ -28,15 +30,16 @@ use crate::runtime_interface::{
     CommandError, CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
     EventFrame, InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject,
     QueryError, QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
-    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeLifecycleCommand,
-    RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind,
-    RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary, SessionExecutionView,
-    SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
-    SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingView,
-    SessionSnapshot, SessionSummary, SessionUnavailableView, SessionWorkspaceInvalidationError,
-    SnapshotError, SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent,
-    SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError, SubscriptionErrorCode,
-    SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
+    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError,
+    RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot,
+    RuntimeStateEventKind, RuntimeStatusView, RuntimeView, SessionCommand,
+    SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
+    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
+    SessionReadinessView, SessionRecordingView, SessionSnapshot, SessionSummary,
+    SessionUnavailableView, SessionWorkspaceInvalidationError, SnapshotError, SnapshotErrorCode,
+    SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView, SubmitAdmissionView,
+    SubscriptionError, SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand,
+    TurnFailureView, TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
@@ -44,15 +47,15 @@ use crate::session_execution::{
     SessionExecutorSubscription, SessionTurnFailure, SessionTurnInterruption, SessionTurnTerminal,
 };
 use crate::session_residency::{
-    SessionResidencyAgentUpgradeError, SessionResidencyCancelError, SessionResidencyFollowUpError,
-    SessionResidencyForkError, SessionResidencyInteractionError, SessionResidencyLifecycleError,
-    SessionResidencyLoadError, SessionResidencyLoadOutcome, SessionResidencyMetadataError,
-    SessionResidencyQueuedMessageError, SessionResidencyRegistry,
-    SessionResidencySecurityInvalidationError, SessionResidencySharedResourcesError,
-    SessionResidencySnapshotError, SessionResidencyStartError, SessionResidencySteerError,
-    SessionResidencySubmitError, SessionResidencySubscriptionError, SessionResidencyUnloadError,
-    SessionResidencyUnloadOutcome, SessionResidencyWorkspaceDefinitionError,
-    SessionResidencyWorkspaceReloadError,
+    SessionResidencyAgentAvailabilityError, SessionResidencyAgentUpgradeError,
+    SessionResidencyCancelError, SessionResidencyFollowUpError, SessionResidencyForkError,
+    SessionResidencyInteractionError, SessionResidencyLifecycleError, SessionResidencyLoadError,
+    SessionResidencyLoadOutcome, SessionResidencyMetadataError, SessionResidencyQueuedMessageError,
+    SessionResidencyRegistry, SessionResidencySecurityInvalidationError,
+    SessionResidencySharedResourcesError, SessionResidencySnapshotError,
+    SessionResidencyStartError, SessionResidencySteerError, SessionResidencySubmitError,
+    SessionResidencySubscriptionError, SessionResidencyUnloadError, SessionResidencyUnloadOutcome,
+    SessionResidencyWorkspaceDefinitionError, SessionResidencyWorkspaceReloadError,
 };
 use crate::wire::{
     PageCursor, ProtocolLimits, SessionDefinitionRevision, SessionId, SessionMetadataRevision,
@@ -272,9 +275,8 @@ impl MiniCoreRuntime {
             durable_state,
             session_residency,
             prompt_service,
-            prompt_resources,
+            SharedResourceRoots::new(prompt_resources, model_catalog),
             model_gateway,
-            model_catalog,
             unload_grace,
         ));
         inner.retain_until_shutdown();
@@ -685,6 +687,19 @@ impl SharedResourceRoots {
     }
 }
 
+// The shared-resource gate read/write sides are held across the Submit admission capture and
+// the reload fan-out + root install.  The crate lint configuration bans raw Tokio guards across
+// await points, so the guards are sealed in these permit newtypes exactly like the
+// durable-state agent gates; the underlying Arc<RwLock<()>> multi-reader/write linearization
+// is unchanged.
+struct SharedResourceReadPermit {
+    _guard: OwnedRwLockReadGuard<()>,
+}
+
+struct SharedResourceWritePermit {
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
 struct RuntimeInner {
     task_context: RuntimeTaskContext,
     #[allow(
@@ -732,9 +747,8 @@ impl RuntimeInner {
         durable_state: DurableState,
         session_residency: Arc<SessionResidencyRegistry>,
         prompt_service: Arc<PromptService>,
-        prompt_resources: Arc<PromptResourceView>,
+        shared_resources: SharedResourceRoots,
         model_gateway: Arc<ModelGateway>,
-        model_catalog: Arc<ModelCatalogView>,
         unload_grace: StdDuration,
     ) -> Self {
         let (runtime_events, _) = broadcast::channel(RUNTIME_EVENT_CAPACITY);
@@ -743,10 +757,7 @@ impl RuntimeInner {
             prompt_service,
             model_gateway,
             unload_grace,
-            shared_resources: Mutex::new(SharedResourceRoots::new(
-                prompt_resources,
-                model_catalog,
-            )),
+            shared_resources: Mutex::new(shared_resources),
             shared_resource_gate: Arc::new(RwLock::new(())),
             retained_until_shutdown: Mutex::new(None),
             session_residency: Mutex::new(Some(session_residency)),
@@ -1166,7 +1177,9 @@ impl RuntimeInner {
                 // concurrent ReloadSharedResources cannot install a half-switched pair under
                 // the admission.  The multi-reader gate never serializes Submits across
                 // different Sessions against each other.
-                let _shared_read = self.shared_resource_gate.read().await;
+                let _shared_read = SharedResourceReadPermit {
+                    _guard: Arc::clone(&self.shared_resource_gate).read_owned().await,
+                };
                 match residency.submit(session_id, command_id, intent).await {
                     Ok(turn_id) => CommandCompletion::Completed {
                         outcome: CommandOutcome::TurnStarted { turn_id },
@@ -1962,11 +1975,7 @@ impl RuntimeInner {
                     for session_id in session_ids {
                         match residency
                             .set_session_agent_availability(
-                                session_id,
-                                agent_id,
-                                available,
-                                timestamp,
-                                command_id,
+                                session_id, agent_id, available, timestamp, command_id,
                             )
                             .await
                         {
@@ -2344,7 +2353,9 @@ impl RuntimeInner {
         };
         let timestamp = SystemClock.now();
         // The write gate covers the residency fan-out and the Runtime root install below.
-        let _shared_write = self.shared_resource_gate.write().await;
+        let _shared_write = SharedResourceWritePermit {
+            _guard: Arc::clone(&self.shared_resource_gate).write_owned().await,
+        };
         residency
             .install_shared_resources(
                 Arc::clone(&prompt_resources),
@@ -2364,8 +2375,7 @@ impl RuntimeInner {
             })?;
         // One atomic root pair replacement after the whole fan-out succeeded.  The write gate is
         // still held, so the pair is never observed half-switched by an external Submit.
-        lock(&self.shared_resources)
-            .install(prompt_resources, model_catalog);
+        lock(&self.shared_resources).install(prompt_resources, model_catalog);
         self.publish_shared_resources_reloaded(command_id, timestamp);
         Ok(completed_outcome(CommandOutcome::SharedResourcesReloaded))
     }
@@ -2382,8 +2392,7 @@ impl RuntimeInner {
         let Ok(snapshot) = self.public_runtime_snapshot() else {
             return;
         };
-        let event =
-            StateEvent::shared_resources_reloaded(timestamp, Some(command_id), snapshot);
+        let event = StateEvent::shared_resources_reloaded(timestamp, Some(command_id), snapshot);
         let _ = sender.send(Arc::new(event));
     }
 
@@ -3475,13 +3484,14 @@ fn map_submit_error(
                 RetryAdvice::UserActionRequired,
                 subject,
             ),
-            SessionUnavailableView::AgentUnavailable
-            | SessionUnavailableView::ModelUnavailable => rejected_completion(
-                CommandErrorCode::SessionNotReady,
-                "the Session is not ready to accept Turns",
-                RetryAdvice::UserActionRequired,
-                subject,
-            ),
+            SessionUnavailableView::AgentUnavailable | SessionUnavailableView::ModelUnavailable => {
+                rejected_completion(
+                    CommandErrorCode::SessionNotReady,
+                    "the Session is not ready to accept Turns",
+                    RetryAdvice::UserActionRequired,
+                    subject,
+                )
+            }
             SessionUnavailableView::RuntimeDependencyUnavailable => rejected_completion(
                 CommandErrorCode::SessionNotReady,
                 "the Session is not ready to accept Turns",
@@ -3506,6 +3516,14 @@ fn map_submit_error(
         | SessionResidencySubmitError::Prompt => rejected_completion(
             CommandErrorCode::Unavailable,
             "Turn dependencies are unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        // A security-invalidation Preparing Session settles the same public shape as the
+        // transient RuntimeDependencyUnavailable cause: SessionNotReady + RetryWithBackoff.
+        SessionResidencySubmitError::Preparing => rejected_completion(
+            CommandErrorCode::SessionNotReady,
+            "the Session is not ready to accept Turns",
             retry_with_backoff(),
             subject,
         ),
@@ -3973,7 +3991,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 mod tests {
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroU64};
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::Arc;
@@ -3987,26 +4005,32 @@ mod tests {
         map_interaction_error,
     };
     use crate::agent_session_lifecycle::{
-        ForkAnchor, ForkSourceKind, OptionalTextPatch, SealedAgentCreateAttempt,
-        SealedSessionCreateAttempt, SealedSessionLifecycleAttempt, SessionMetadataPatch,
-        SessionModelConfig,
+        AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind, OptionalTextPatch,
+        SealedAgentCreateAttempt, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt,
+        SessionMetadataPatch, SessionModelConfig,
     };
     use crate::conversation_storage::{RecordOutcome, RecorderWriteBarrier, SessionHeader};
     use crate::model_gateway::{
-        ModelCallErrorReason, ModelSelection, ReasoningPreference, ScriptedModelFixture,
+        EffectiveModelLimits, ModelCallErrorReason, ModelCapabilities, ModelCatalogView,
+        ModelDefinition, ModelDefinitionVersion, ModelGateway, ModelGenerationDefaults,
+        ModelProgressPublisher, ModelReasoningSummary, ModelSelection, ModelServiceClass,
+        ModelSourceAdapter, ModelSourceFuture, ProviderAdapter, ProviderAttemptFuture,
+        ProviderAttemptRequest, ReasoningCapabilities, ReasoningPreference, ScriptedModelFixture,
+        TokenEstimateRate,
     };
     use crate::prompt::{
         AgentPromptSelection, PromptBodyIntent, PromptIntent, SessionPromptSelection, TextIntent,
     };
     use crate::runtime_interface::{
-        CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest, CommandResponse,
-        EventFrame, EventRoute, InteractionCommand, ItemContentView, NewSessionDefinition,
-        NewSessionMetadata, PublicCancelTarget, QueryResult, RetryAdvice, RuntimeCapability,
-        RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail, RuntimeQuery, RuntimeQueryResult,
-        RuntimeReadQuery, RuntimeStateEventKind, SessionCommand, SessionEventDetail,
-        SessionExecutionView, SessionLifecycleView, SessionRecordingState, SessionStateEventKind,
-        SnapshotRequest, SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope,
-        TurnCommand, TurnFailureView, TurnTerminalView,
+        AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, CommandRequest,
+        CommandResponse, EventFrame, EventRoute, InteractionCommand, ItemContentView,
+        NewSessionDefinition, NewSessionMetadata, PublicCancelTarget, QueryResult, RetryAdvice,
+        RuntimeCapability, RuntimeCommand, RuntimeDispatchError, RuntimeEventDetail,
+        RuntimeLifecycleCommand, RuntimeQuery, RuntimeQueryResult, RuntimeReadQuery,
+        RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionExecutionView,
+        SessionLifecycleView, SessionReadinessView, SessionRecordingState, SessionStateEventKind,
+        SessionUnavailableView, SnapshotRequest, SnapshotResponse, StateEventMsg,
+        SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView, TurnTerminalView,
     };
     use crate::runtime_task::RuntimeTaskError;
     use crate::session_execution::SessionExecutionState;
@@ -4220,10 +4244,10 @@ mod tests {
         }
     }
 
-    async fn create_and_load_public_session(
+    async fn create_and_load_public_session_with_agent(
         runtime: &MiniCoreRuntime,
         workspace_root: &Path,
-    ) -> SessionId {
+    ) -> (SessionId, AgentId) {
         let agent_id = create_runtime_agent(runtime).await;
         let create = runtime
             .dispatch(CommandRequest::new(
@@ -4257,7 +4281,73 @@ mod tests {
             .await
             .expect("public Load dispatches");
         assert_eq!(command_output(&load), "session loaded");
-        session_id
+        (session_id, agent_id)
+    }
+
+    async fn create_and_load_public_session(
+        runtime: &MiniCoreRuntime,
+        workspace_root: &Path,
+    ) -> SessionId {
+        create_and_load_public_session_with_agent(runtime, workspace_root)
+            .await
+            .0
+    }
+
+    /// A test-only `ModelSourceAdapter` that always discovers one fixed "openai/gpt-5"
+    /// definition.  Its provider is a stub that is never executed (the shared-resource reload
+    /// happy path runs no Turn), so a Runtime opened with these resources can reload shared
+    /// resources while every loaded Session keeps its model fact available and no readiness
+    /// event is emitted.
+    struct FixedModelSource {
+        definition: ModelDefinition,
+    }
+
+    impl ModelSourceAdapter for FixedModelSource {
+        fn discover(&self) -> ModelSourceFuture<'_> {
+            let definition = self.definition.clone();
+            Box::pin(async move { Ok(vec![definition]) })
+        }
+    }
+
+    struct ReloadOnlyStubProvider;
+
+    impl ProviderAdapter for ReloadOnlyStubProvider {
+        fn execute(
+            &self,
+            _request: ProviderAttemptRequest,
+            _progress: ModelProgressPublisher,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> ProviderAttemptFuture<'_> {
+            Box::pin(async move {
+                unreachable!("the shared-resource reload stub provider is never executed")
+            })
+        }
+    }
+
+    async fn fixed_model_resources() -> (Arc<ModelGateway>, Arc<ModelCatalogView>) {
+        let definition = ModelDefinition::new(
+            ModelSelection::new("openai".parse().unwrap(), "gpt-5".parse().unwrap()),
+            ModelDefinitionVersion::new(NonZeroU64::new(1).unwrap()),
+            ModelCapabilities::text_only(ReasoningCapabilities::all(), true),
+            EffectiveModelLimits::new(NonZeroU32::new(128_000), NonZeroU32::new(8_192)),
+            TokenEstimateRate::new(NonZeroU32::new(3).unwrap(), 1)
+                .expect("the fixed token estimate rate validates"),
+            ModelGenerationDefaults::new(
+                NonZeroU32::new(4_096).unwrap(),
+                ModelReasoningSummary::ProviderDefault,
+                ModelServiceClass::Standard,
+            ),
+            Arc::new(ReloadOnlyStubProvider),
+        )
+        .unwrap_or_else(|_| panic!("the fixed model definition validates"));
+        let gateway = Arc::new(ModelGateway::new(vec![Arc::new(FixedModelSource {
+            definition,
+        })]));
+        let catalog = gateway
+            .initialize()
+            .await
+            .unwrap_or_else(|_| panic!("the fixed model catalog initializes"));
+        (gateway, catalog)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5797,8 +5887,11 @@ mod tests {
         let root = TempRoot::new();
         let workspace = TempWorkspace::new();
         let model = ScriptedModelFixture::new(vec!["must not run"]);
+        // A short but non-zero graceful-Unload grace: the in-flight admission is allowed to
+        // settle within 20ms, and only then does the graceful preparation fail it closed.
         let runtime = MiniCoreRuntime::open_with_model_fixture(
-            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            MiniCoreRuntimeConfig::new(root.path().to_owned())
+                .with_unload_grace(std::time::Duration::from_millis(20)),
             Handle::current(),
             &model,
         )
@@ -5832,17 +5925,23 @@ mod tests {
             RuntimeCommand::Session(SessionCommand::Unload { session_id }),
         )));
         assert!(poll_once_pending(unload.as_mut()).await);
-        executor.wait_until_closing_for_test().await;
+        // Do not wait for the executor closing token: the graceful preparation only closes the
+        // executor after the in-flight admission settles, so that wait would deadlock against
+        // the held admission hook.  Instead sleep well past the 20ms grace (the preparation
+        // deadline fires and the admission gate stays closed) and then release the hook so the
+        // losing admission can observe the closed gate and settle.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         hooks.release_after_agent_admission_before_input();
 
         let (submit, unload) = tokio::join!(submit, unload);
         let submit = submit.expect("the losing Submit receives a domain completion");
+        // The graceful Unload won the Session, so the losing Submit is a per-Session
+        // SessionNotLoaded + UserActionRequired rejection, never a RuntimeClosing backoff.
         assert!(matches!(
             submit.completion(),
             CommandCompletion::Rejected(error)
-                if error.code() == CommandErrorCode::RuntimeClosing
-                    && error.retry()
-                        == (RetryAdvice::RetryWithBackoff { retry_after: None })
+                if error.code() == CommandErrorCode::SessionNotLoaded
+                    && error.retry() == RetryAdvice::UserActionRequired
         ));
         let unload = unload.expect("Unload settles after cancelling admission");
         assert_eq!(command_output(&unload), "session unloaded");
@@ -5872,6 +5971,386 @@ mod tests {
         drop(live_state);
         drop(executor);
         drop(residency);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_agent_disable_and_enable_cycles_session_readiness_and_submit() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        let model = ScriptedModelFixture::new(vec!["scripted post-enable answer"]);
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the scripted Runtime opens");
+        let (session_id, agent_id) =
+            create_and_load_public_session_with_agent(&runtime, workspace.path()).await;
+
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(snapshot)))
+                if snapshot.readiness() == SessionReadinessView::Ready
+        ));
+
+        // Disable the Agent: the loaded Idle Session publishes exactly one ReadinessChanged
+        // event into the Unavailable(AgentUnavailable) projection.
+        let disable_id = CommandId::generate().unwrap();
+        let disabled = runtime
+            .dispatch(CommandRequest::new(
+                disable_id,
+                RuntimeCommand::Agent(AgentCommand::SetStatus {
+                    agent_id,
+                    expected_status: AgentStatus::Enabled,
+                    status: AgentUsableStatus::Disabled,
+                }),
+            ))
+            .await
+            .expect("Agent Disable dispatches");
+        assert!(matches!(
+            disabled.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::AgentStatusChanged {
+                    status: AgentStatus::Disabled,
+                },
+                output: None,
+            }
+        ));
+        let Some(EventFrame::State(disabled_event)) = events.recv().await else {
+            panic!("Disable publishes one Session StateEvent");
+        };
+        assert_eq!(disabled_event.command_id(), Some(disable_id));
+        assert_eq!(
+            disabled_event.msg().session_kind(),
+            Some(SessionStateEventKind::SessionReadinessChanged)
+        );
+        let disabled_snapshot = disabled_event
+            .msg()
+            .session_snapshot()
+            .expect("readiness events carry a Session snapshot");
+        assert_eq!(
+            disabled_snapshot.readiness(),
+            SessionReadinessView::Unavailable(SessionUnavailableView::AgentUnavailable)
+        );
+        assert_eq!(disabled_snapshot.execution(), SessionExecutionView::Idle);
+        assert!(disabled_snapshot.queues().submit_admissions().is_empty());
+        assert!(!disabled_snapshot.queues().accepting_input());
+
+        // While Disabled, a public Submit is rejected SessionNotReady + UserActionRequired and
+        // never forms a Turn or reaches the model.
+        let rejected = runtime
+            .dispatch(CommandRequest::new(
+                CommandId::generate().unwrap(),
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("must wait for enable").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the disabled Session Submit settles");
+        assert!(matches!(
+            rejected.completion(),
+            CommandCompletion::Rejected(error)
+                if error.code() == CommandErrorCode::SessionNotReady
+                    && error.retry() == RetryAdvice::UserActionRequired
+        ));
+        assert_eq!(model.request_count(), 0);
+
+        // Enable restores Ready with one matching ReadinessChanged event.
+        let enable_id = CommandId::generate().unwrap();
+        let enabled = runtime
+            .dispatch(CommandRequest::new(
+                enable_id,
+                RuntimeCommand::Agent(AgentCommand::SetStatus {
+                    agent_id,
+                    expected_status: AgentStatus::Disabled,
+                    status: AgentUsableStatus::Enabled,
+                }),
+            ))
+            .await
+            .expect("Agent Enable dispatches");
+        assert!(matches!(
+            enabled.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::AgentStatusChanged {
+                    status: AgentStatus::Enabled,
+                },
+                output: None,
+            }
+        ));
+        let Some(EventFrame::State(enabled_event)) = events.recv().await else {
+            panic!("Enable publishes one Session StateEvent");
+        };
+        assert_eq!(enabled_event.command_id(), Some(enable_id));
+        assert_eq!(
+            enabled_event.msg().session_kind(),
+            Some(SessionStateEventKind::SessionReadinessChanged)
+        );
+        let enabled_snapshot = enabled_event
+            .msg()
+            .session_snapshot()
+            .expect("readiness events carry a Session snapshot");
+        assert_eq!(enabled_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(enabled_snapshot.execution(), SessionExecutionView::Idle);
+        assert!(enabled_snapshot.queues().accepting_input());
+
+        // The Disable/Enable pair publishes exactly one readiness event each: no second event
+        // settles after the two.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "Disable/Enable publishes exactly one readiness event each"
+        );
+
+        // The restored Session accepts a fresh Submit and runs the scripted model.
+        let submit_command_id = CommandId::generate().unwrap();
+        let submit = runtime
+            .dispatch(CommandRequest::new(
+                submit_command_id,
+                RuntimeCommand::Turn(TurnCommand::Submit {
+                    session_id,
+                    intent: PromptIntent::new(
+                        PromptBodyIntent::Text(TextIntent::new("hello after enable").unwrap()),
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                }),
+            ))
+            .await
+            .expect("the restored Session accepts Submit");
+        let turn_id = started_turn(&submit);
+        let terminal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Some(EventFrame::State(event))
+                        if event.msg().session_kind()
+                            == Some(SessionStateEventKind::TurnCompleted) =>
+                    {
+                        return event;
+                    }
+                    Some(EventFrame::State(_)) => continue,
+                    other => panic!("unexpected frame while draining to TurnCompleted: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the restored Session Turn reaches terminal state");
+        assert_eq!(terminal.command_id(), Some(submit_command_id));
+        assert!(matches!(
+            terminal.msg().session_detail(),
+            Some(SessionEventDetail::TurnTerminal {
+                turn_id: completed_turn,
+                terminal: TurnTerminalView::Completed { .. },
+            }) if completed_turn == turn_id
+        ));
+        assert_eq!(model.request_count(), 1);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_workspace_authority_invalidation_recovers_an_idle_session() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // A model fixture keeps the model catalog non-empty, so the Session pinned to
+        // "openai/gpt-5" has genuine Ready readiness both initially and after the host-only
+        // recovery (an empty catalog would leave the final readiness ModelUnavailable).
+        let model = ScriptedModelFixture::new(Vec::<&str>::new());
+        let runtime = MiniCoreRuntime::open_with_model_fixture(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            &model,
+        )
+        .await
+        .expect("the Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+
+        let mut events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(snapshot)))
+                if snapshot.readiness() == SessionReadinessView::Ready
+        ));
+
+        // The host-only seam (no wire command) recovers the Idle Session; it resolves only
+        // after the final readiness state is installed.
+        runtime
+            .invalidate_session_workspace_authority(session_id)
+            .await
+            .expect("the host-only invalidation seam recovers the Idle Session");
+
+        // Even when the recovery completes before the await returns, the buffered Session
+        // stream must deliver the Preparing start event and the final Ready event in order,
+        // both with no CommandId, and never a WorkspaceReloaded event.
+        let mut readiness_events = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while readiness_events.len() < 2 {
+                let Some(EventFrame::State(event)) = events.recv().await else {
+                    panic!("the Session stream stays open through the recovery");
+                };
+                assert_ne!(
+                    event.msg().session_kind(),
+                    Some(SessionStateEventKind::SessionWorkspaceReloaded),
+                    "the host-only invalidation never publishes WorkspaceReloaded"
+                );
+                if event.msg().session_kind()
+                    == Some(SessionStateEventKind::SessionReadinessChanged)
+                {
+                    readiness_events.push(event);
+                }
+            }
+        })
+        .await
+        .expect("the recovery publishes both readiness events");
+
+        let (preparing, ready) = (&readiness_events[0], &readiness_events[1]);
+        assert_eq!(preparing.command_id(), None);
+        assert_eq!(ready.command_id(), None);
+        let preparing_snapshot = preparing
+            .msg()
+            .session_snapshot()
+            .expect("readiness events carry a Session snapshot");
+        assert_eq!(
+            preparing_snapshot.readiness(),
+            SessionReadinessView::Preparing
+        );
+        assert_eq!(preparing_snapshot.execution(), SessionExecutionView::Idle);
+        assert!(preparing_snapshot.queues().submit_admissions().is_empty());
+        assert!(preparing_snapshot.queues().steers().is_empty());
+        assert!(preparing_snapshot.queues().follow_ups().is_empty());
+        assert!(!preparing_snapshot.queues().accepting_input());
+        let ready_snapshot = ready
+            .msg()
+            .session_snapshot()
+            .expect("readiness events carry a Session snapshot");
+        assert_eq!(ready_snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(ready_snapshot.execution(), SessionExecutionView::Idle);
+        assert!(ready_snapshot.queues().accepting_input());
+
+        // The seam already installed the final Ready snapshot before it returned.
+        let SnapshotResponse::Session(snapshot) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the recovered Session snapshot is available")
+        else {
+            panic!("the recovered snapshot is a Session snapshot");
+        };
+        assert_eq!(snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_reload_shared_resources_publishes_one_runtime_event_and_no_session_noise() {
+        let root = TempRoot::new();
+        let workspace = TempWorkspace::new();
+        // A sourced model gateway: its reload candidate always contains the exact "openai/gpt-5"
+        // definition the Session pins, so the happy-path reload leaves the loaded Session
+        // genuinely unchanged (still Ready) and publishes no fake readiness event.
+        let (gateway, catalog) = fixed_model_resources().await;
+        let runtime = MiniCoreRuntime::open_with_model_resources(
+            MiniCoreRuntimeConfig::new(root.path().to_owned()),
+            Handle::current(),
+            Some((gateway, catalog)),
+        )
+        .await
+        .expect("the sourced Runtime opens");
+        let session_id = create_and_load_public_session(&runtime, workspace.path()).await;
+
+        let mut runtime_events = runtime
+            .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+            .await
+            .expect("the Runtime subscription opens");
+        assert!(matches!(
+            runtime_events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+        ));
+        let mut session_events = runtime
+            .subscribe(SubscriptionRequest::new(
+                SubscriptionScope::Session { session_id },
+                false,
+            ))
+            .await
+            .expect("the Session subscription opens");
+        assert!(matches!(
+            session_events.recv().await,
+            Some(EventFrame::Snapshot(SnapshotResponse::Session(_)))
+        ));
+
+        let reload_id = CommandId::generate().unwrap();
+        let reload = runtime
+            .dispatch(CommandRequest::new(
+                reload_id,
+                RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources),
+            ))
+            .await
+            .expect("ReloadSharedResources dispatches");
+        assert!(matches!(
+            reload.completion(),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::SharedResourcesReloaded,
+                output: None,
+            }
+        ));
+
+        let Some(EventFrame::State(reloaded)) = runtime_events.recv().await else {
+            panic!("ReloadSharedResources publishes one Runtime StateEvent");
+        };
+        assert_eq!(reloaded.command_id(), Some(reload_id));
+        let StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::SharedResourcesReloaded,
+            ..
+        } = reloaded.msg()
+        else {
+            panic!("the Runtime event kind is SharedResourcesReloaded");
+        };
+
+        // The unchanged loaded Session stays Ready and publishes no fake readiness event, and
+        // the Runtime stream settles with exactly the one SharedResourcesReloaded event.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), session_events.recv())
+                .await
+                .is_err(),
+            "an unchanged loaded Session publishes no readiness event on shared-resource reload"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), runtime_events.recv())
+                .await
+                .is_err(),
+            "ReloadSharedResources publishes exactly one Runtime event"
+        );
+
+        let SnapshotResponse::Session(snapshot) = runtime
+            .snapshot(SnapshotRequest::Session { session_id })
+            .await
+            .expect("the loaded Session snapshot remains available")
+        else {
+            panic!("the snapshot is a Session snapshot");
+        };
+        assert_eq!(snapshot.readiness(), SessionReadinessView::Ready);
+        assert_eq!(snapshot.execution(), SessionExecutionView::Idle);
 
         runtime.shutdown().await;
     }

@@ -8664,9 +8664,7 @@ fn validate_future_state_detail(
             | "session_unarchived"
             | "session_deleted"
             | "session_forked" => Some("session_changed"),
-            "session_loaded"
-            | "session_unloaded"
-            | "diagnostics_updated" => None,
+            "session_loaded" | "session_unloaded" | "diagnostics_updated" => None,
             _ => return Err(TypedJsonError::EncodingInvariant),
         }
     } else {

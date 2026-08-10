@@ -437,6 +437,15 @@ impl FollowUpQueue {
         self.entries.pop_front()
     }
 
+    /// Re-inserts one FollowUp at the front of the queue.  This is the internal
+    /// admission-failure re-queue path only: the caller guarantees the entry was just popped
+    /// from this queue (so capacity is guaranteed and its command_id is not queued again), and
+    /// the insertion is infallible.
+    pub(crate) fn push_front(&mut self, command_id: CommandId, intent: PromptIntent) {
+        self.entries
+            .push_front(QueuedFollowUp::new(command_id, intent));
+    }
+
     pub(crate) fn remove(&mut self, command_id: CommandId) -> Option<QueuedFollowUp> {
         let index = self
             .entries
