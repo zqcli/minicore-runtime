@@ -3212,9 +3212,12 @@ impl DurableStateActor {
                         // A missing or replaced canonical lock means the lease this actor was
                         // opened under is gone; settle the request as dispatch-unavailable.
                         if !self.validate_root_lease().await {
-                            request.reject_unavailable();
+                            // Fatal lease loss must close the shared task owner before settling
+                            // the current request, so the Runtime can publish Closing before the
+                            // first InternalDispatchUnavailable becomes observable.
                             self.task_context.request_closing();
                             self.closing.cancel();
+                            request.reject_unavailable();
                             self.close_receiver_and_reject_queued().await;
                             return true;
                         }
