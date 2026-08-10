@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use minicore_runtime::agent_session_lifecycle::{ForkAnchor, ForkSourceKind};
+use minicore_runtime::agent_session_lifecycle::{
+    AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind,
+};
 use minicore_runtime::prompt::PromptBodyIntent;
 use minicore_runtime::runtime_interface::{
-    CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
+    AgentCommand, CommandCompletion, CommandErrorCode, CommandOutcome, EventFrame, EventRoute,
     InteractionCommand, ItemContentView, ProgressEventKind, ProgressUpdate, PublicCancelTarget,
     PublicSubject, QueryErrorCode, RetryAdvice, RuntimeCommand, RuntimeEventDetail, RuntimeRequest,
     RuntimeStateEventKind, SessionCommand, SessionEventDetail, SessionLifecycleView,
@@ -284,6 +286,43 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
         }
         (
             Some(
+                assertion
+                @ ("agent_created_state" | "agent_disabled_state" | "agent_deleted_state"),
+            ),
+            EventFrame::State(event),
+        ) => {
+            let StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            } = event.msg()
+            else {
+                panic!("runtime Agent state assertion requires an Agent summary");
+            };
+            let EventRoute::Agent { agent_id } = event.route() else {
+                panic!("runtime Agent state assertion requires an Agent route");
+            };
+            assert_eq!(agent.agent_id(), agent_id);
+            assert!(snapshot.loaded_sessions().is_empty());
+            let (expected_kind, expected_status) = match assertion {
+                "agent_created_state" => {
+                    (RuntimeStateEventKind::AgentCreated, AgentStatus::Enabled)
+                }
+                "agent_disabled_state" => (
+                    RuntimeStateEventKind::AgentStatusChanged,
+                    AgentStatus::Disabled,
+                ),
+                "agent_deleted_state" => (
+                    RuntimeStateEventKind::AgentStatusChanged,
+                    AgentStatus::Deleted,
+                ),
+                _ => unreachable!(),
+            };
+            assert_eq!(*kind, expected_kind);
+            assert_eq!(agent.status(), expected_status);
+        }
+        (
+            Some(
                 assertion @ ("session_created_state"
                 | "session_loaded_state"
                 | "session_unloaded_state"
@@ -351,7 +390,9 @@ fn assert_event_frame_semantics(vector: &PublicVector, frame: &EventFrame) {
                             .all(|session| session.session_id() != session_id)
                     );
                 }
-                RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
+                RuntimeStateEventKind::AgentCreated
+                | RuntimeStateEventKind::AgentStatusChanged
+                | RuntimeStateEventKind::CommandCatalogInvalidated => unreachable!(),
             }
         }
         (Some("session_execution_changed_finishing_state"), EventFrame::State(event)) => {
@@ -521,6 +562,39 @@ fn assert_command_response_semantics(
             assert_eq!(definition_revision.get(), 2);
         }
         (
+            Some("agent_created_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::AgentCreated {
+                        agent_id,
+                        definition_revision,
+                        metadata_revision,
+                    },
+                output: None,
+            },
+        ) => {
+            assert_eq!(agent_id.to_string(), "agt_11111111111111111111111111111111");
+            assert_eq!(definition_revision.get(), 1);
+            assert_eq!(metadata_revision.get(), 1);
+        }
+        (
+            Some("agent_status_changed_completion"),
+            CommandCompletion::Completed {
+                outcome:
+                    CommandOutcome::AgentStatusChanged {
+                        status: AgentStatus::Disabled,
+                    },
+                output: None,
+            },
+        )
+        | (
+            Some("agent_deleted_completion"),
+            CommandCompletion::Completed {
+                outcome: CommandOutcome::AgentDeleted,
+                output: None,
+            },
+        ) => {}
+        (
             Some("session_forked_completion"),
             CommandCompletion::Completed {
                 outcome:
@@ -664,6 +738,43 @@ fn assert_request_semantics(vector: &PublicVector, request: &RuntimeRequest) {
                 minicore_runtime::runtime_interface::RuntimeLifecycleCommand::ReloadSharedResources,
             ),
         ) => {}
+        (
+            "agent_create",
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition,
+                metadata,
+            }),
+        ) => {
+            assert_eq!(
+                definition
+                    .prompts()
+                    .enabled()
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .as_str(),
+                "code-review"
+            );
+            assert_eq!(metadata.name(), "Planner");
+            assert_eq!(metadata.description(), Some("Plans implementation work"));
+        }
+        (
+            "agent_set_status",
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Enabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        )
+        | (
+            "agent_delete",
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status: AgentStatus::Disabled,
+            }),
+        ) => {
+            assert_eq!(agent_id.to_string(), "agt_11111111111111111111111111111111");
+        }
         (
             "session_create_file_uri",
             RuntimeCommand::Session(SessionCommand::Create {

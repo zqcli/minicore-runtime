@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"agent","data":{"type":"create","data":{"definition":{"prompts":{"enabled":["code-review"]}},"metadata":{"name":"Planner","description":"Plans implementation work"}}}}}

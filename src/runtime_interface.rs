@@ -5,7 +5,8 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 
 use crate::agent_session_lifecycle::{
-    AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SessionModelConfig,
+    AgentRevisionRef, AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind,
+    NewAgentDefinition, NewAgentMetadata, SessionModelConfig,
 };
 use crate::prompt::{PromptIntent, SessionPromptSelection};
 use crate::skills::SkillId;
@@ -241,6 +242,7 @@ where
 #[non_exhaustive]
 pub enum RuntimeCommand {
     Runtime(RuntimeLifecycleCommand),
+    Agent(AgentCommand),
     Session(SessionCommand),
     Turn(TurnCommand),
     Interaction(InteractionCommand),
@@ -250,11 +252,63 @@ impl fmt::Debug for RuntimeCommand {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Runtime(command) => formatter.debug_tuple("Runtime").field(command).finish(),
+            Self::Agent(command) => formatter.debug_tuple("Agent").field(command).finish(),
             Self::Session(command) => formatter.debug_tuple("Session").field(command).finish(),
             Self::Turn(command) => formatter.debug_tuple("Turn").field(command).finish(),
             Self::Interaction(command) => {
                 formatter.debug_tuple("Interaction").field(command).finish()
             }
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum AgentCommand {
+    Create {
+        definition: NewAgentDefinition,
+        metadata: NewAgentMetadata,
+    },
+    SetStatus {
+        agent_id: AgentId,
+        expected_status: AgentStatus,
+        status: AgentUsableStatus,
+    },
+    Delete {
+        agent_id: AgentId,
+        expected_status: AgentStatus,
+    },
+}
+
+impl fmt::Debug for AgentCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create {
+                definition,
+                metadata,
+            } => formatter
+                .debug_struct("Create")
+                .field("definition", definition)
+                .field("metadata", metadata)
+                .finish(),
+            Self::SetStatus {
+                agent_id,
+                expected_status,
+                status,
+            } => formatter
+                .debug_struct("SetStatus")
+                .field("agent_id", agent_id)
+                .field("expected_status", expected_status)
+                .field("status", status)
+                .finish(),
+            Self::Delete {
+                agent_id,
+                expected_status,
+            } => formatter
+                .debug_struct("Delete")
+                .field("agent_id", agent_id)
+                .field("expected_status", expected_status)
+                .finish(),
         }
     }
 }
@@ -493,6 +547,15 @@ impl fmt::Debug for CommandCompletion {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum CommandOutcome {
+    AgentCreated {
+        agent_id: AgentId,
+        definition_revision: AgentRevision,
+        metadata_revision: AgentMetadataRevision,
+    },
+    AgentStatusChanged {
+        status: AgentStatus,
+    },
+    AgentDeleted,
     SessionDefinitionUpdated {
         definition_revision: SessionDefinitionRevision,
     },
@@ -2464,6 +2527,8 @@ pub enum EventRoute {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum RuntimeStateEventKind {
+    AgentCreated,
+    AgentStatusChanged,
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
@@ -2537,6 +2602,7 @@ pub enum SessionEventDetail {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RuntimeEventDetail {
+    AgentChanged { agent: AgentSummary },
     SessionChanged { session: Box<SessionSummary> },
 }
 
@@ -2607,6 +2673,60 @@ pub struct StateEvent {
 }
 
 impl StateEvent {
+    pub fn agent_created(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        agent: AgentSummary,
+    ) -> Self {
+        Self::runtime_agent_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            agent,
+            RuntimeStateEventKind::AgentCreated,
+        )
+    }
+
+    pub fn agent_status_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        agent: AgentSummary,
+    ) -> Self {
+        Self::runtime_agent_changed(
+            timestamp,
+            command_id,
+            snapshot,
+            agent,
+            RuntimeStateEventKind::AgentStatusChanged,
+        )
+    }
+
+    fn runtime_agent_changed(
+        timestamp: Timestamp,
+        command_id: Option<CommandId>,
+        snapshot: RuntimeSnapshot,
+        agent: AgentSummary,
+        kind: RuntimeStateEventKind,
+    ) -> Self {
+        debug_assert!(matches!(
+            kind,
+            RuntimeStateEventKind::AgentCreated | RuntimeStateEventKind::AgentStatusChanged
+        ));
+        let agent_id = agent.agent_id();
+        Self {
+            timestamp,
+            command_id,
+            route: EventRoute::Agent { agent_id },
+            msg: StateEventMsg::Runtime {
+                kind,
+                snapshot,
+                detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            },
+        }
+    }
+
     pub fn session_execution_changed(
         timestamp: Timestamp,
         command_id: Option<CommandId>,
@@ -2928,6 +3048,20 @@ impl StateEvent {
                 },
             ) => true,
             (
+                EventRoute::Agent { agent_id },
+                StateEventMsg::Runtime {
+                    kind:
+                        kind @ (RuntimeStateEventKind::AgentCreated
+                        | RuntimeStateEventKind::AgentStatusChanged),
+                    detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+                    ..
+                },
+            ) => {
+                *agent_id == agent.agent_id()
+                    && (!matches!(kind, RuntimeStateEventKind::AgentCreated)
+                        || agent.status() == AgentStatus::Enabled)
+            }
+            (
                 EventRoute::Session { session_id },
                 StateEventMsg::Runtime {
                     kind:
@@ -2954,6 +3088,8 @@ impl StateEvent {
                     }
                     RuntimeStateEventKind::SessionLoaded
                     | RuntimeStateEventKind::SessionUnloaded
+                    | RuntimeStateEventKind::AgentCreated
+                    | RuntimeStateEventKind::AgentStatusChanged
                     | RuntimeStateEventKind::CommandCatalogInvalidated => false,
                 };
                 *session_id == session.session_id()

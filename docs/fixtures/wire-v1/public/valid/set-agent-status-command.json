@@ -1,0 +1,1 @@
+{"commandId":"cmd_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":{"type":"agent","data":{"type":"set_status","data":{"agentId":"agt_11111111111111111111111111111111","expectedStatus":"enabled","status":"disabled"}}}}

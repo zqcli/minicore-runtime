@@ -231,6 +231,90 @@ pub(crate) fn agent_metadata_has_same_canonical_content(
     first.name() == second.name() && first.description() == second.description()
 }
 
+#[derive(Clone, Eq, PartialEq)]
+pub struct NewAgentDefinition {
+    prompts: AgentPromptSelection,
+}
+
+impl NewAgentDefinition {
+    pub const fn new(prompts: AgentPromptSelection) -> Self {
+        Self { prompts }
+    }
+
+    pub const fn prompts(&self) -> &AgentPromptSelection {
+        &self.prompts
+    }
+}
+
+impl fmt::Debug for NewAgentDefinition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAgentDefinition")
+            .field("prompt_count", &self.prompts.enabled().len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct NewAgentMetadata {
+    name: Box<str>,
+    description: Option<Box<str>>,
+}
+
+impl NewAgentMetadata {
+    pub fn new<N, D>(name: N, description: Option<D>) -> Result<Self, AgentMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        Self::new_with_limits(name, description, ProtocolLimits::v1_0())
+    }
+
+    pub(crate) fn new_with_limits<N, D>(
+        name: N,
+        description: Option<D>,
+        limits: ProtocolLimits,
+    ) -> Result<Self, AgentMetadataError>
+    where
+        N: AsRef<str>,
+        D: AsRef<str>,
+    {
+        let name = normalize_agent_metadata_text(
+            name.as_ref(),
+            usize::from(limits.text.max_display_name_bytes),
+            false,
+        )?;
+        let description = description
+            .map(|value| {
+                normalize_agent_metadata_text(
+                    value.as_ref(),
+                    usize::try_from(limits.text.max_description_bytes).unwrap_or(usize::MAX),
+                    true,
+                )
+            })
+            .transpose()?;
+        Ok(Self { name, description })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+}
+
+impl fmt::Debug for NewAgentMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NewAgentMetadata")
+            .field("name", &"redacted")
+            .field("description_present", &self.description.is_some())
+            .finish()
+    }
+}
+
 fn normalize_agent_metadata_text(
     value: &str,
     maximum: usize,
@@ -258,6 +342,21 @@ pub enum AgentStatus {
     Enabled,
     Disabled,
     Deleted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AgentUsableStatus {
+    Enabled,
+    Disabled,
+}
+
+impl AgentUsableStatus {
+    pub const fn as_agent_status(self) -> AgentStatus {
+        match self {
+            Self::Enabled => AgentStatus::Enabled,
+            Self::Disabled => AgentStatus::Disabled,
+        }
+    }
 }
 
 /// Returns whether one persisted Agent status may directly follow another in a durable
@@ -1985,8 +2084,9 @@ mod tests {
     use super::{
         AgentDefinitionDecision, AgentMetadataDecision, AgentMetadataDecisionError,
         AgentMetadataDescriptionPatch, AgentRevisionRef, AgentStatus, AgentStatusAttemptError,
-        SealedAgentCreateAttempt, SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt,
-        SealedAgentStatusAttempt, SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt,
+        AgentUsableStatus, NewAgentDefinition, NewAgentMetadata, SealedAgentCreateAttempt,
+        SealedAgentDefinitionAttempt, SealedAgentMetadataAttempt, SealedAgentStatusAttempt,
+        SealedSessionAgentUpgradeAttempt, SealedSessionCreateAttempt,
         SealedSessionDefinitionAttempt, SealedSessionForkAttempt, SealedSessionLifecycleAttempt,
         SealedSessionMetadataAttempt, SessionAgentUpgradeDecision,
         SessionAgentUpgradeDecisionError, SessionDefinition, SessionDefinitionDecision,
@@ -2071,6 +2171,31 @@ mod tests {
         assert!(!debug.contains("ses_aaaaaaaa"));
         assert!(!debug.contains("expected"));
         assert!(!debug.contains("stale"));
+    }
+
+    #[test]
+    fn public_new_agent_values_validate_and_redact_metadata() {
+        let definition = NewAgentDefinition::new(
+            AgentPromptSelection::new(vec!["base".parse().unwrap()]).unwrap(),
+        );
+        assert_eq!(definition.prompts().enabled().len(), 1);
+
+        let metadata =
+            NewAgentMetadata::new("Planner secret\r\nname", Some("Description secret\rtext"))
+                .unwrap();
+        assert_eq!(metadata.name(), "Planner secret\nname");
+        assert_eq!(metadata.description(), Some("Description secret\ntext"));
+        let debug = format!("{metadata:?}");
+        assert!(!debug.contains("Planner"));
+        assert!(!debug.contains("Description"));
+        assert_eq!(
+            AgentUsableStatus::Enabled.as_agent_status(),
+            AgentStatus::Enabled
+        );
+        assert_eq!(
+            AgentUsableStatus::Disabled.as_agent_status(),
+            AgentStatus::Disabled
+        );
     }
 
     #[test]
