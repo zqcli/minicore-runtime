@@ -1,6 +1,6 @@
 # Durable Store V1
 
-状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency lifecycle exclusion已实现；Session Fork全部公开anchor/LiveSnapshot/RecordedHistory、public Agent/Session lifecycle、Session metadata、ordinary Session definition CAS与Agent revision upgrade已消费该格式；cross-platform root-lock/process-abort第一切片与macOS/Windows CI jobs已实现，Windows/NTFS identity、open-handle、case-alias与reparse坐标仍pending
+状态：当前权威 physical format specification；M5.0 production durable foundation、exact historical definition resolution、loaded Workspace composite publication与Runtime residency lifecycle exclusion已实现；Session Fork全部公开anchor/LiveSnapshot/RecordedHistory、public Agent/Session lifecycle、Session metadata、ordinary Session definition CAS与Agent revision upgrade已消费该格式；cross-platform root-lock/process-abort第一切片、exact-case/reparse rejection与macOS/Windows CI jobs已实现，Windows/NTFS same-file root identity与cleanup open-handle坐标仍pending
 日期：2026-08-03
 
 ## Scope
@@ -39,7 +39,7 @@ The opener creates or validates the user-private root, creates/opens the permane
       COMMITTED
 ```
 
-`MINICORE_STORE_V1`, every reservation, `PUBLISHED`, and `COMMITTED` are regular files of exactly zero bytes. They are existence-only; a directory, symlink, nonzero file or any alternative byte representation is invalid. `.minicore.lock` is a permanent regular lock file and is not an existence-only marker. `definition.json` is present only in a generation introducing a new domain definition. This slice enforces its current no-follow/type and platform-observable checks; Unix whole-entity cleanup compares device-plus-inode facts. Cross-platform root-lock and process-abort coverage is implemented; full Windows/NTFS identity, cleanup open-handle, case-alias and reparse coverage remains the separate M5.0 pending platform gate.
+`MINICORE_STORE_V1`, every reservation, `PUBLISHED`, and `COMMITTED` are regular files of exactly zero bytes. They are existence-only; a directory, symlink, nonzero file or any alternative byte representation is invalid. `.minicore.lock` is a permanent regular lock file and is not an existence-only marker. `definition.json` is present only in a generation introducing a new domain definition. This slice enforces its current no-follow/type and platform-observable checks; Unix whole-entity cleanup compares device-plus-inode facts. Cross-platform root-lock/process-abort and exact-case/reparse rejection are implemented; Windows/NTFS same-file root identity loss and cleanup open-handle coverage remain the separate M5.0 pending platform gate.
 
 Recognized names are ASCII and exact-case only:
 

@@ -10749,7 +10749,7 @@ fn validate_root_directory(metadata: &fs::Metadata) -> Result<(), DurableOpenErr
         return Err(DurableOpenError::StorageUnavailable);
     }
     validate_existing_directory_mode(metadata, DurableOpenError::StorageUnavailable)?;
-    validate_existing_identity(metadata)
+    validate_existing_identity(metadata, DurableOpenError::StorageUnavailable)
 }
 
 #[cfg(unix)]
@@ -13182,7 +13182,7 @@ fn validate_existing_regular_file(
         return Err(error);
     }
     validate_existing_regular_file_mode(metadata, error)?;
-    validate_existing_identity(metadata)
+    validate_existing_identity(metadata, error)
 }
 
 fn validate_existing_directory(
@@ -13193,13 +13193,33 @@ fn validate_existing_directory(
         return Err(error);
     }
     validate_existing_directory_mode(metadata, error)?;
-    validate_existing_identity(metadata)
+    validate_existing_identity(metadata, error)
 }
 
-// Deliberately no-op for this slice: this seam is reserved only for future Unix ownership,
-// effective-user, and device checks, plus Windows ACL and volume checks. Type and exact Unix
-// mode validation are enforced by the callers today and must not be deferred through this hook.
-fn validate_existing_identity(_metadata: &fs::Metadata) -> Result<(), DurableOpenError> {
+// Non-Windows identity checks remain limited to the caller's type and Unix mode validation.
+// Windows additionally rejects every reparse point before a recognized Store path is used.
+#[cfg(not(windows))]
+fn validate_existing_identity(
+    _metadata: &fs::Metadata,
+    _error: DurableOpenError,
+) -> Result<(), DurableOpenError> {
+    Ok(())
+}
+
+// Windows reparse points (junctions, symlinks, mount points) must not be followed: they can
+// redirect an existing store path outside the store, so any target marked with
+// FILE_ATTRIBUTE_REPARSE_POINT is rejected with the caller-supplied error.
+#[cfg(windows)]
+fn validate_existing_identity(
+    metadata: &fs::Metadata,
+    error: DurableOpenError,
+) -> Result<(), DurableOpenError> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(error);
+    }
     Ok(())
 }
 
