@@ -11109,6 +11109,20 @@ impl PhysicalScanErrors {
         }
     }
 
+    /// Records full existing-directory validation (type, Unix mode, and Windows reparse
+    /// identity) and reports only whether the directory passed. Every physical scanner must
+    /// gate its `read_dir`/entry on this result instead of a separate `is_symlink`/`is_dir`
+    /// check: Windows junctions are directories without being std symlinks, and on
+    /// case-insensitive hosts a wrong-case sibling can be reached through a canonical join
+    /// even when the exact entry was never validated.
+    fn record_valid_directory(&mut self, metadata: &fs::Metadata) -> bool {
+        self.record(validate_existing_directory(
+            metadata,
+            DurableOpenError::DurableStateCorrupt,
+        ))
+        .is_some()
+    }
+
     fn finish(self) -> Result<(), DurableOpenError> {
         if self.too_large {
             Err(DurableOpenError::DurableStateTooLarge)
@@ -11240,19 +11254,19 @@ fn recover_marked_reservations(
     let entries = errors.record(read_entries_bounded(path, RESERVATIONS_ENTRY_CAP));
     let mut has_agents = false;
     let mut has_sessions = false;
+    let mut agents_enterable = false;
+    let mut sessions_enterable = false;
     for entry in entries.as_deref().unwrap_or_default() {
         if entry_has_name(entry, AGENTS_DIRECTORY) {
-            errors.record(validate_directory_entry(
-                entry,
-                DurableOpenError::DurableStateCorrupt,
-            ));
             has_agents = true;
+            agents_enterable = errors
+                .record(metadata_without_following(&entry.path()))
+                .is_some_and(|metadata| errors.record_valid_directory(&metadata));
         } else if entry_has_name(entry, SESSIONS_DIRECTORY) {
-            errors.record(validate_directory_entry(
-                entry,
-                DurableOpenError::DurableStateCorrupt,
-            ));
             has_sessions = true;
+            sessions_enterable = errors
+                .record(metadata_without_following(&entry.path()))
+                .is_some_and(|metadata| errors.record_valid_directory(&metadata));
         } else {
             errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
@@ -11261,16 +11275,27 @@ fn recover_marked_reservations(
         errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
     }
 
-    let agents = scan_agent_reservations(
-        &path.join(AGENTS_DIRECTORY),
-        caps.agent_reservations,
-        errors,
-    );
-    let sessions = scan_session_reservations(
-        &path.join(SESSIONS_DIRECTORY),
-        caps.session_reservations,
-        errors,
-    );
+    // Exact-name presence is tracked separately from validation. A scanner must never be
+    // reached through a canonical join of an unvalidated exact name: on case-insensitive
+    // hosts that join can land on a wrong-case sibling that was never validated.
+    let agents = if agents_enterable {
+        scan_agent_reservations(
+            &path.join(AGENTS_DIRECTORY),
+            caps.agent_reservations,
+            errors,
+        )
+    } else {
+        BTreeMap::new()
+    };
+    let sessions = if sessions_enterable {
+        scan_session_reservations(
+            &path.join(SESSIONS_DIRECTORY),
+            caps.session_reservations,
+            errors,
+        )
+    } else {
+        BTreeMap::new()
+    };
     (agents, sessions)
 }
 
@@ -11282,11 +11307,7 @@ fn scan_agent_reservations(
     let Some(metadata) = errors.record(metadata_without_following(path)) else {
         return BTreeMap::new();
     };
-    errors.record(validate_existing_directory(
-        &metadata,
-        DurableOpenError::DurableStateCorrupt,
-    ));
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !errors.record_valid_directory(&metadata) {
         return BTreeMap::new();
     }
     let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
@@ -11316,11 +11337,7 @@ fn scan_session_reservations(
     let Some(metadata) = errors.record(metadata_without_following(path)) else {
         return BTreeMap::new();
     };
-    errors.record(validate_existing_directory(
-        &metadata,
-        DurableOpenError::DurableStateCorrupt,
-    ));
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !errors.record_valid_directory(&metadata) {
         return BTreeMap::new();
     }
     let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
@@ -11351,11 +11368,7 @@ fn scan_agent_entities(
     let Some(metadata) = errors.record(metadata_without_following(path)) else {
         return BTreeMap::new();
     };
-    errors.record(validate_existing_directory(
-        &metadata,
-        DurableOpenError::DurableStateCorrupt,
-    ));
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !errors.record_valid_directory(&metadata) {
         return BTreeMap::new();
     }
     let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
@@ -11374,14 +11387,11 @@ fn scan_agent_entities(
         let Some(metadata) = errors.record(metadata_without_following(entity_path)) else {
             return false;
         };
-        errors.record(validate_existing_directory(
-            &metadata,
-            DurableOpenError::DurableStateCorrupt,
-        ));
+        let validated = errors.record_valid_directory(&metadata);
         if !reservations.contains_key(agent_id) {
             errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
-        !metadata.file_type().is_symlink() && metadata.is_dir()
+        validated
     });
     entity_paths
 }
@@ -11395,11 +11405,7 @@ fn scan_session_entities(
     let Some(metadata) = errors.record(metadata_without_following(path)) else {
         return BTreeMap::new();
     };
-    errors.record(validate_existing_directory(
-        &metadata,
-        DurableOpenError::DurableStateCorrupt,
-    ));
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if !errors.record_valid_directory(&metadata) {
         return BTreeMap::new();
     }
     let Some(entries) = errors.record(read_entries_bounded(path, maximum)) else {
@@ -11419,14 +11425,11 @@ fn scan_session_entities(
         let Some(metadata) = errors.record(metadata_without_following(entity_path)) else {
             return false;
         };
-        errors.record(validate_existing_directory(
-            &metadata,
-            DurableOpenError::DurableStateCorrupt,
-        ));
+        let validated = errors.record_valid_directory(&metadata);
         if !reservations.contains_key(session_id) {
             errors.record::<()>(Err(DurableOpenError::DurableStateCorrupt));
         }
-        !metadata.file_type().is_symlink() && metadata.is_dir()
+        validated
     });
     entity_paths
 }
@@ -11486,7 +11489,7 @@ fn scan_session_entity(
     let generations_are_enterable = generations.as_deref().is_some_and(|generations| {
         errors
             .record(metadata_without_following(generations))
-            .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+            .is_some_and(|metadata| errors.record_valid_directory(&metadata))
     });
     let published_scan = if published {
         generations
@@ -11521,10 +11524,7 @@ fn scan_session_entity(
     }
     if let Some(generations) = &generations {
         if let Some(metadata) = errors.record(metadata_without_following(generations)) {
-            errors.record(validate_existing_directory(
-                &metadata,
-                DurableOpenError::DurableStateCorrupt,
-            ));
+            let _ = errors.record_valid_directory(&metadata);
         }
     }
     if let Some(conversation_path) = &conversation_path {
@@ -12070,7 +12070,7 @@ fn scan_agent_entity(
     let generations_are_enterable = generations.as_deref().is_some_and(|generations| {
         errors
             .record(metadata_without_following(generations))
-            .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+            .is_some_and(|metadata| errors.record_valid_directory(&metadata))
     });
     let published_scan = if published {
         generations
@@ -12104,10 +12104,7 @@ fn scan_agent_entity(
     }
     if let Some(generations) = &generations {
         if let Some(metadata) = errors.record(metadata_without_following(generations)) {
-            errors.record(validate_existing_directory(
-                &metadata,
-                DurableOpenError::DurableStateCorrupt,
-            ));
+            let _ = errors.record_valid_directory(&metadata);
         }
     }
     if unknown_child || (published && generations.is_none()) {
@@ -12197,11 +12194,7 @@ fn scan_unpublished_generation(
         let Some(metadata) = errors.record(metadata_without_following(&entry.path())) else {
             continue;
         };
-        errors.record(validate_existing_directory(
-            &metadata,
-            DurableOpenError::DurableStateCorrupt,
-        ));
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if !errors.record_valid_directory(&metadata) {
             continue;
         }
         let Some(payload) = errors.record(
@@ -12352,11 +12345,7 @@ fn scan_physical_generation_chain(
         let Some(metadata) = errors.record(metadata_without_following(&generation_path)) else {
             continue;
         };
-        errors.record(validate_existing_directory(
-            &metadata,
-            DurableOpenError::DurableStateCorrupt,
-        ));
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if !errors.record_valid_directory(&metadata) {
             continue;
         }
         if let Some(payload) = errors.record(scan_physical_generation_payload(
@@ -15331,6 +15320,31 @@ mod tests {
     fn create_file(path: &Path, contents: &[u8]) {
         fs::write(path, contents).expect("the scaffold file is created");
         set_private_file_mode(path);
+    }
+
+    /// Creates a directory symlink on Unix or a directory junction on Windows (via
+    /// `cmd mklink /J`), keeping link-based tests `unsafe`-free and runnable on both hosts.
+    #[cfg(any(unix, windows))]
+    fn create_directory_link(link: &Path, target: &Path) {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).expect("the test creates a directory symlink");
+        }
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("the mklink junction helper runs");
+            assert!(
+                output.status.success(),
+                "mklink /J failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     async fn open(root: &Path) -> Result<DurableState, DurableOpenError> {
@@ -28467,6 +28481,306 @@ mod tests {
             ),
             Err(DurableOpenError::DurableStateTooLarge)
         ));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_reservations_namespace_is_corrupt_before_its_entry_cap_can_overflow() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        let agents = TempRoot::existing();
+        create_marked_empty_store(agents.path());
+        let agent_target = TempRoot::existing();
+        let agent_target = agent_target.path().join("overflow-reservations");
+        create_directory(&agent_target);
+        create_file(&agent_target.join(agent_candidate(1).to_string()), b"");
+        create_file(&agent_target.join(agent_candidate(2).to_string()), b"");
+        fs::remove_dir(
+            agents
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY),
+        )
+        .expect("the real reservations namespace is removed");
+        create_directory_link(
+            &agents
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY),
+            &agent_target,
+        );
+        assert!(matches!(
+            recover_marked_root_with_caps(agents.path(), &marked_entries(agents.path()), caps),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(agent_target.exists(), "the external target is preserved");
+
+        let sessions = TempRoot::existing();
+        create_marked_empty_store(sessions.path());
+        let session_target = TempRoot::existing();
+        let session_target = session_target.path().join("overflow-reservations");
+        create_directory(&session_target);
+        create_file(&session_target.join(session_candidate(1).to_string()), b"");
+        create_file(&session_target.join(session_candidate(2).to_string()), b"");
+        fs::remove_dir(
+            sessions
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY),
+        )
+        .expect("the real reservations namespace is removed");
+        create_directory_link(
+            &sessions
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY),
+            &session_target,
+        );
+        assert!(matches!(
+            recover_marked_root_with_caps(sessions.path(), &marked_entries(sessions.path()), caps),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(session_target.exists(), "the external target is preserved");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_entity_directory_is_corrupt_before_its_entry_cap_can_overflow() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        let agent = TempRoot::existing();
+        create_marked_empty_store(agent.path());
+        create_file(
+            &agent
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY)
+                .join(AGENT_ONE),
+            b"",
+        );
+        let agent_target = TempRoot::existing();
+        let agent_target = agent_target.path().join("overflow-entity");
+        create_directory(&agent_target);
+        for name in ["one", "two", "three"] {
+            create_file(&agent_target.join(name), b"");
+        }
+        create_directory_link(&agent_path(agent.path(), AGENT_ONE), &agent_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(agent.path(), &marked_entries(agent.path()), caps),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(agent_target.exists(), "the external target is preserved");
+
+        let session = TempRoot::existing();
+        create_marked_empty_store(session.path());
+        create_file(
+            &session
+                .path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(SESSIONS_DIRECTORY)
+                .join(SESSION_ONE),
+            b"",
+        );
+        let session_target = TempRoot::existing();
+        let session_target = session_target.path().join("overflow-entity");
+        create_directory(&session_target);
+        for name in ["one", "two", "three", "four"] {
+            create_file(&session_target.join(name), b"");
+        }
+        create_directory_link(&session_path(session.path(), SESSION_ONE), &session_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(session.path(), &marked_entries(session.path()), caps),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(session_target.exists(), "the external target is preserved");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_generations_collection_is_corrupt_before_its_generation_cap_can_overflow() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        let published = TempRoot::existing();
+        create_marked_empty_store(published.path());
+        create_valid_g1_agent(published.path());
+        let published_target = TempRoot::existing();
+        let published_target = published_target.path().join("overflow-generations");
+        create_directory(&published_target);
+        create_directory(&published_target.join(GENERATION_TWO));
+        create_directory(&published_target.join(GENERATION_THREE));
+        let published_generations = generation_path(published.path(), AGENT_ONE)
+            .parent()
+            .expect("the generations collection path has a parent")
+            .to_owned();
+        fs::remove_dir_all(&published_generations)
+            .expect("the real generations collection is removed");
+        create_directory_link(&published_generations, &published_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                published.path(),
+                &marked_entries(published.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            published_target.exists(),
+            "the external target is preserved"
+        );
+
+        let unpublished = TempRoot::existing();
+        create_marked_empty_store(unpublished.path());
+        create_unpublished_agent(
+            unpublished.path(),
+            AGENT_ONE,
+            true,
+            false,
+            None,
+            None,
+            false,
+        );
+        let unpublished_target = TempRoot::existing();
+        let unpublished_target = unpublished_target.path().join("overflow-generations");
+        create_directory(&unpublished_target);
+        create_directory(&unpublished_target.join(GENERATION_TWO));
+        create_directory(&unpublished_target.join(GENERATION_THREE));
+        let unpublished_generations = agent_path(unpublished.path(), AGENT_ONE).join("generations");
+        fs::remove_dir(&unpublished_generations)
+            .expect("the empty real generations collection is removed");
+        create_directory_link(&unpublished_generations, &unpublished_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                unpublished.path(),
+                &marked_entries(unpublished.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            unpublished_target.exists(),
+            "the external target is preserved"
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn linked_generation_directory_is_corrupt_before_its_payload_cap_can_overflow() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        let published = TempRoot::existing();
+        create_marked_empty_store(published.path());
+        create_valid_g1_agent(published.path());
+        let published_target = TempRoot::existing();
+        let published_target = published_target.path().join("overflow-payload");
+        create_directory(&published_target);
+        for name in ["head.json", "definition.json", "COMMITTED", "extra.json"] {
+            create_file(&published_target.join(name), b"");
+        }
+        let published_generation = generation_path(published.path(), AGENT_ONE);
+        fs::remove_dir_all(&published_generation)
+            .expect("the real generation directory is removed");
+        create_directory_link(&published_generation, &published_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                published.path(),
+                &marked_entries(published.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            published_target.exists(),
+            "the external target is preserved"
+        );
+
+        let unpublished = TempRoot::existing();
+        create_marked_empty_store(unpublished.path());
+        create_unpublished_agent(
+            unpublished.path(),
+            AGENT_ONE,
+            true,
+            true,
+            Some(agent_head_fixture()),
+            Some(agent_definition_fixture()),
+            true,
+        );
+        let unpublished_target = TempRoot::existing();
+        let unpublished_target = unpublished_target.path().join("overflow-payload");
+        create_directory(&unpublished_target);
+        for name in ["head.json", "definition.json", "COMMITTED", "extra.json"] {
+            create_file(&unpublished_target.join(name), b"");
+        }
+        let unpublished_generation = generation_path(unpublished.path(), AGENT_ONE);
+        fs::remove_dir_all(&unpublished_generation)
+            .expect("the real generation directory is removed");
+        create_directory_link(&unpublished_generation, &unpublished_target);
+        assert!(matches!(
+            recover_marked_root_with_caps(
+                unpublished.path(),
+                &marked_entries(unpublished.path()),
+                caps
+            ),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(
+            unpublished_target.exists(),
+            "the external target is preserved"
+        );
+    }
+
+    #[test]
+    fn wrong_case_reservations_namespace_is_corrupt_and_never_traversed() {
+        let caps = RecoveryCaps {
+            agent_reservations: 1,
+            session_reservations: 1,
+            root_agents: 1,
+            root_sessions: 1,
+            generations: 1,
+        };
+
+        // Only the wrong-case sibling exists: on case-insensitive hosts a canonical join of
+        // the exact name would reach it, so the exact entry must never be scanned.
+        let root = TempRoot::existing();
+        create_marked_empty_store(root.path());
+        fs::remove_dir(
+            root.path()
+                .join(RESERVATIONS_DIRECTORY)
+                .join(AGENTS_DIRECTORY),
+        )
+        .expect("the exact reservations namespace is removed");
+        let wrong_case = root.path().join(RESERVATIONS_DIRECTORY).join("Agents");
+        create_directory(&wrong_case);
+        create_file(&wrong_case.join(agent_candidate(1).to_string()), b"");
+        create_file(&wrong_case.join(agent_candidate(2).to_string()), b"");
+        assert!(matches!(
+            recover_marked_root_with_caps(root.path(), &marked_entries(root.path()), caps),
+            Err(DurableOpenError::DurableStateCorrupt)
+        ));
+        assert!(wrong_case.exists(), "the wrong-case namespace is preserved");
     }
 
     #[tokio::test(flavor = "current_thread")]
