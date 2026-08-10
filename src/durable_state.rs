@@ -10645,9 +10645,8 @@ fn read_indexed_session_definition_blocking(
 }
 
 struct RootLease {
-    file: Mutex<Option<File>>,
+    handle: Mutex<Option<same_file::Handle>>,
     lock_path: PathBuf,
-    file_id: file_id::FileId,
 }
 
 #[derive(Clone)]
@@ -10663,19 +10662,19 @@ struct OpenRoot {
 
 impl RootLease {
     fn new(file: File, lock_path: PathBuf) -> Result<Self, DurableOpenError> {
-        let file_id = capture_lock_file_id(&file, &lock_path)?;
+        let handle =
+            same_file::Handle::from_file(file).map_err(|_| DurableOpenError::StorageUnavailable)?;
         Ok(Self {
-            file: Mutex::new(Some(file)),
+            handle: Mutex::new(Some(handle)),
             lock_path,
-            file_id,
         })
     }
 
     fn release(&self) {
-        let file = lock(&self.file).take();
-        if let Some(file) = file {
-            let _ = FileExt::unlock(&file);
-            drop(file);
+        let handle = lock(&self.handle).take();
+        if let Some(handle) = handle {
+            let _ = FileExt::unlock(handle.as_file());
+            drop(handle);
         }
     }
 
@@ -10688,46 +10687,13 @@ impl RootLease {
         {
             return false;
         }
-        current_lock_file_id(&self.lock_path) == Some(self.file_id)
+        let Ok(current) = same_file::Handle::from_path(&self.lock_path) else {
+            return false;
+        };
+        lock(&self.handle)
+            .as_ref()
+            .is_some_and(|held| held == &current)
     }
-}
-
-#[cfg(unix)]
-fn capture_lock_file_id(file: &File, _path: &Path) -> Result<file_id::FileId, DurableOpenError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file
-        .metadata()
-        .map_err(|_| DurableOpenError::StorageUnavailable)?;
-    Ok(file_id::FileId::new_inode(metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-fn capture_lock_file_id(_file: &File, path: &Path) -> Result<file_id::FileId, DurableOpenError> {
-    file_id::get_file_id(path).map_err(|_| DurableOpenError::StorageUnavailable)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn capture_lock_file_id(_file: &File, _path: &Path) -> Result<file_id::FileId, DurableOpenError> {
-    Err(DurableOpenError::StorageUnavailable)
-}
-
-#[cfg(unix)]
-fn current_lock_file_id(path: &Path) -> Option<file_id::FileId> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(path).ok()?;
-    Some(file_id::FileId::new_inode(metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-fn current_lock_file_id(path: &Path) -> Option<file_id::FileId> {
-    file_id::get_file_id(path).ok()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn current_lock_file_id(_path: &Path) -> Option<file_id::FileId> {
-    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
