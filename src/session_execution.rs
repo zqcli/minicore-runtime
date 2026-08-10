@@ -16399,7 +16399,8 @@ mod tests {
         // where it instead started a Turn, Ok).  The cap below is only an invariant guard:
         // with one completed probe per iteration the loop cannot plausibly reach it.  The two
         // scripted answers map 1:1 to the two real Turns (the first Turn and the automatic
-        // FollowUp handoff); the re-arm Submits never consume a model request.
+        // FollowUp handoff); a re-arm Submit consumes a model request only when it wins the
+        // defensive recovery race and starts a real third Turn.
         hooks.await_runtime_dependency_probe_idle().await;
         readability.restore();
         let mut settled_generation = hooks.runtime_dependency_probe_settlement_generation();
@@ -16434,45 +16435,86 @@ mod tests {
                 "the re-arm Submits kept settling RuntimeDependencyUnavailable; no probe observed the restored pinned ar_1"
             );
         };
-        if let Some(turn_id) = rearm_turn {
-            // Defensive truthful handling of the recovery race won by a re-arm Submit
-            // (unreachable while a retained FollowUp hands off synchronously on recovery):
-            // settle the started Turn before waiting for the FollowUp handoff.
-            let _ = wait_for_terminal(&loaded.executor, turn_id).await;
-        }
-        let recovery = wait_for_event(&mut subscription, |event| {
-            matches!(
-                event,
-                SessionExecutorEvent::ReadinessChanged {
-                    command_id: None,
-                    snapshot,
-                    ..
-                } if snapshot.readiness() == SessionReadinessView::Ready
-            )
-        })
-        .await;
+        // One bounded buffered wait collects every required event in any order: the recovery
+        // ReadinessChanged(command_id: None), the exact retained FollowUp TurnTerminal, and —
+        // when a re-arm Submit won the recovery race and started a real Turn — that Turn's
+        // exact TurnTerminal (Completed or Failed depending on whether a script remains: the
+        // two scripted answers are consumed by the first Turn and the FollowUp handoff, so a
+        // third real Turn runs against the exhausted script).  The broadcast receiver buffers
+        // every event since subscription (capacity 32) and the loop retains each matched event
+        // Arc instead of draining one required event while waiting for another, so the
+        // FollowUp/re-arm terminal events can never be lost to an earlier wait.  Each retained
+        // Arc carries the exact snapshot used by the assertions below, and the terminal events
+        // prove the provider requests are already recorded, so the request count is asserted
+        // directly without polling.
+        let expected_request_count = 2 + usize::from(rearm_turn.is_some());
+        let (recovery, follow_up_terminal, rearm_terminal) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut recovery = None;
+                let mut follow_up_terminal = None;
+                let mut rearm_terminal = None;
+                loop {
+                    let event = subscription
+                        .recv()
+                        .await
+                        .expect("the executor stays open while the recovery evidence is expected");
+                    match event.as_ref() {
+                        SessionExecutorEvent::ReadinessChanged {
+                            command_id: None,
+                            snapshot,
+                            ..
+                        } if snapshot.readiness() == SessionReadinessView::Ready => {
+                            recovery = Some(Arc::clone(&event));
+                        }
+                        SessionExecutorEvent::TurnTerminal {
+                            command_id,
+                            terminal,
+                            ..
+                        } if *command_id == follow_up_id
+                            && *terminal == SessionTurnTerminal::Completed =>
+                        {
+                            follow_up_terminal = Some(Arc::clone(&event));
+                        }
+                        SessionExecutorEvent::TurnTerminal { turn_id, .. }
+                            if Some(*turn_id) == rearm_turn =>
+                        {
+                            rearm_terminal = Some(Arc::clone(&event));
+                        }
+                        _ => {}
+                    }
+                    if recovery.is_some()
+                        && follow_up_terminal.is_some()
+                        && (rearm_turn.is_none() || rearm_terminal.is_some())
+                    {
+                        break;
+                    }
+                }
+                (
+                    recovery.expect("the recovery ReadinessChanged event arrived"),
+                    follow_up_terminal.expect("the retained FollowUp TurnTerminal event arrived"),
+                    rearm_terminal,
+                )
+            })
+            .await
+            .expect(
+                "the recovery, retained FollowUp terminal, and any re-arm Turn terminal arrive \
+                 within the deadline",
+            );
+
+        // The recovery snapshot is the exact Ready Idle projection with the transient fact
+        // cleared: the restored pinned ar_1 admission recovered and handed off the retained
+        // FollowUp.
         assert_eq!(
             recovery.snapshot().execution_state(),
             SessionExecutionState::Idle
         );
+        assert_eq!(recovery.snapshot().readiness(), SessionReadinessView::Ready);
         assert!(!recovery.snapshot().runtime_dependency_unavailable());
-        wait_for_request_count(&model, 2).await;
-        let follow_up_terminal = wait_for_event(&mut subscription, |event| {
-            matches!(
-                event,
-                SessionExecutorEvent::TurnTerminal {
-                    command_id,
-                    terminal,
-                    ..
-                } if *command_id == follow_up_id && *terminal == SessionTurnTerminal::Completed
-            )
-        })
-        .await;
+        // The exact FollowUp TurnTerminal carries the terminal snapshot: its last_terminal
+        // and Idle state match the Turn, so no further polling is needed.
         let follow_up_turn_id = follow_up_terminal
             .turn_id()
             .expect("the FollowUp Turn has a TurnId");
-        // The exact TurnTerminal already received above carries the terminal snapshot: no
-        // further polling is needed, and its last_terminal/Idle state matches the Turn.
         assert_eq!(
             follow_up_terminal.snapshot().last_terminal(),
             Some((follow_up_turn_id, SessionTurnTerminal::Completed))
@@ -16481,7 +16523,25 @@ mod tests {
             follow_up_terminal.snapshot().execution_state(),
             SessionExecutionState::Idle
         );
-        assert_eq!(model.request_count(), 2);
+        if let Some(rearm_terminal) = rearm_terminal {
+            let rearm_turn_id = rearm_turn.expect("a re-arm terminal implies a re-arm Turn");
+            let rearm_terminal_value = rearm_terminal
+                .terminal()
+                .expect("the re-arm Turn terminal event carries a terminal");
+            assert_eq!(rearm_terminal.turn_id(), Some(rearm_turn_id));
+            assert_eq!(
+                rearm_terminal.snapshot().last_terminal(),
+                Some((rearm_turn_id, rearm_terminal_value))
+            );
+            assert_eq!(
+                rearm_terminal.snapshot().execution_state(),
+                SessionExecutionState::Idle
+            );
+        }
+        // The two scripted answers map 1:1 to the first Turn and the retained FollowUp
+        // handoff; a re-arm Turn that won the defensive recovery race consumed one extra
+        // provider request (against the exhausted script).
+        assert_eq!(model.request_count(), expected_request_count);
         let final_snapshot = loaded.executor.snapshot().await.unwrap();
         assert_eq!(final_snapshot.readiness(), SessionReadinessView::Ready);
         assert_eq!(
