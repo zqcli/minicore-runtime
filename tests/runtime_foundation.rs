@@ -4,11 +4,16 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use minicore_runtime::agent_session_lifecycle::{
+    AgentStatus, AgentUsableStatus, NewAgentDefinition, NewAgentMetadata,
+};
+use minicore_runtime::prompt::AgentPromptSelection;
 use minicore_runtime::runtime_interface::{
-    AgentQuery, AgentQueryResult, CommandCompletion, CommandOutcome, CommandRequest, EventFrame,
-    EventRoute, PageRequest, QueryErrorCode, QueryResult, RuntimeCommand, RuntimeEventDetail,
-    RuntimeQuery, RuntimeStateEventKind, SessionCommand, SessionQuery, SessionQueryResult,
-    SnapshotResponse, StateEventMsg, SubscriptionRequest, SubscriptionScope,
+    AgentCommand, AgentQuery, AgentQueryResult, CommandCompletion, CommandErrorCode,
+    CommandOutcome, CommandRequest, EventFrame, EventRoute, PageRequest, QueryErrorCode,
+    QueryResult, RuntimeCommand, RuntimeEventDetail, RuntimeQuery, RuntimeStateEventKind,
+    SessionCommand, SessionQuery, SessionQueryResult, SnapshotResponse, StateEventMsg,
+    SubscriptionRequest, SubscriptionScope,
 };
 use minicore_runtime::wire::CommandId;
 use minicore_runtime::{
@@ -377,6 +382,308 @@ async fn published_committed_g1_agent_store_opens_shuts_down_and_reopens() {
     )
     .await
     .expect("the recovered G1 Agent store reopens after shutdown");
+    reopened.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn public_agent_lifecycle_publishes_real_changes_and_survives_restart() {
+    let root = TempRoot::new();
+    let runtime = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime opens");
+    let mut events = runtime
+        .subscribe(SubscriptionRequest::new(SubscriptionScope::Runtime, false))
+        .await
+        .expect("the Runtime subscription opens");
+    assert!(matches!(
+        events.recv().await,
+        Some(EventFrame::Snapshot(SnapshotResponse::Runtime(_)))
+    ));
+
+    let create_id = CommandId::generate().unwrap();
+    let created = runtime
+        .dispatch(CommandRequest::new(
+            create_id,
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition: NewAgentDefinition::new(AgentPromptSelection::new(Vec::new()).unwrap()),
+                metadata: NewAgentMetadata::new(
+                    "Lifecycle Agent",
+                    Some("public lifecycle coverage"),
+                )
+                .unwrap(),
+            }),
+        ))
+        .await
+        .expect("Agent Create dispatches");
+    let CommandCompletion::Completed {
+        outcome:
+            CommandOutcome::AgentCreated {
+                agent_id,
+                definition_revision,
+                metadata_revision,
+            },
+        output: None,
+    } = created.completion()
+    else {
+        panic!("Agent Create returns its typed outcome");
+    };
+    let agent_id = *agent_id;
+    assert_eq!(definition_revision.get(), 1);
+    assert_eq!(metadata_revision.get(), 1);
+
+    let Some(EventFrame::State(created_event)) = events.recv().await else {
+        panic!("Agent Create publishes one StateEvent");
+    };
+    assert_eq!(created_event.command_id(), Some(create_id));
+    assert_eq!(created_event.route(), EventRoute::Agent { agent_id });
+    let StateEventMsg::Runtime {
+        kind: RuntimeStateEventKind::AgentCreated,
+        detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+        ..
+    } = created_event.msg()
+    else {
+        panic!("Agent Create publishes its safe Agent summary");
+    };
+    assert_eq!(agent.agent_id(), agent_id);
+    assert_eq!(agent.status(), AgentStatus::Enabled);
+
+    let disable_id = CommandId::generate().unwrap();
+    let disabled = runtime
+        .dispatch(CommandRequest::new(
+            disable_id,
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Enabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("Agent Disable dispatches");
+    assert!(matches!(
+        disabled.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentStatusChanged {
+                status: AgentStatus::Disabled
+            },
+            output: None,
+        }
+    ));
+    let Some(EventFrame::State(disabled_event)) = events.recv().await else {
+        panic!("Agent Disable publishes one StateEvent");
+    };
+    assert_eq!(disabled_event.command_id(), Some(disable_id));
+    assert!(matches!(
+        disabled_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::AgentStatusChanged,
+            detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            ..
+        } if agent.status() == AgentStatus::Disabled
+    ));
+
+    let repeated_disable = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Disabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("idempotent Agent Disable dispatches");
+    assert!(matches!(
+        repeated_disable.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::NoChange,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "idempotent Agent status changes do not publish"
+    );
+
+    let enabled = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Disabled,
+                status: AgentUsableStatus::Enabled,
+            }),
+        ))
+        .await
+        .expect("Agent Enable dispatches");
+    assert!(matches!(
+        enabled.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentStatusChanged {
+                status: AgentStatus::Enabled
+            },
+            output: None,
+        }
+    ));
+    assert!(matches!(events.recv().await, Some(EventFrame::State(_))));
+
+    let stale = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Disabled,
+                status: AgentUsableStatus::Disabled,
+            }),
+        ))
+        .await
+        .expect("stale Agent status dispatches");
+    assert!(matches!(
+        stale.completion(),
+        CommandCompletion::Rejected(error)
+            if error.code() == CommandErrorCode::StaleRevision
+                && error.subject().is_some_and(|subject| {
+                    matches!(subject, minicore_runtime::runtime_interface::PublicSubject::Agent(id) if *id == agent_id)
+                })
+    ));
+
+    let delete_id = CommandId::generate().unwrap();
+    let deleted = runtime
+        .dispatch(CommandRequest::new(
+            delete_id,
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status: AgentStatus::Enabled,
+            }),
+        ))
+        .await
+        .expect("Agent Delete dispatches");
+    assert!(matches!(
+        deleted.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDeleted,
+            output: None,
+        }
+    ));
+    let Some(EventFrame::State(deleted_event)) = events.recv().await else {
+        panic!("Agent Delete publishes one StateEvent");
+    };
+    assert_eq!(deleted_event.command_id(), Some(delete_id));
+    assert!(matches!(
+        deleted_event.msg(),
+        StateEventMsg::Runtime {
+            kind: RuntimeStateEventKind::AgentStatusChanged,
+            detail: Some(RuntimeEventDetail::AgentChanged { agent }),
+            ..
+        } if agent.status() == AgentStatus::Deleted
+    ));
+
+    let repeated_delete = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status: AgentStatus::Deleted,
+            }),
+        ))
+        .await
+        .expect("idempotent Agent Delete dispatches");
+    assert!(matches!(
+        repeated_delete.completion(),
+        CommandCompletion::Completed {
+            outcome: CommandOutcome::AgentDeleted,
+            output: None,
+        }
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err(),
+        "idempotent Agent Delete does not publish"
+    );
+
+    let after_delete = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status: AgentStatus::Deleted,
+                status: AgentUsableStatus::Enabled,
+            }),
+        ))
+        .await
+        .expect("deleted Agent status dispatches");
+    assert!(matches!(
+        after_delete.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::AgentDeleted
+    ));
+
+    let missing = runtime
+        .dispatch(CommandRequest::new(
+            CommandId::generate().unwrap(),
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id: "agt_ffffffffffffffffffffffffffffffff".parse().unwrap(),
+                expected_status: AgentStatus::Enabled,
+            }),
+        ))
+        .await
+        .expect("missing Agent Delete dispatches");
+    assert!(matches!(
+        missing.completion(),
+        CommandCompletion::Rejected(error) if error.code() == CommandErrorCode::NotFound
+    ));
+
+    let visible = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(10).unwrap()),
+            include_deleted: false,
+        }))
+        .await
+        .expect("the ordinary Agent catalog query succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(visible)) = visible.data() else {
+        panic!("the Agent query returns an Agent page");
+    };
+    assert!(visible.items().is_empty());
+
+    let inclusive = runtime
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(10).unwrap()),
+            include_deleted: true,
+        }))
+        .await
+        .expect("the inclusive Agent catalog query succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(inclusive)) = inclusive.data() else {
+        panic!("the inclusive Agent query returns an Agent page");
+    };
+    assert_eq!(inclusive.items().len(), 1);
+    assert_eq!(inclusive.items()[0].agent_id(), agent_id);
+    assert_eq!(inclusive.items()[0].status(), AgentStatus::Deleted);
+
+    runtime.shutdown().await;
+
+    let reopened = MiniCoreRuntime::open(
+        MiniCoreRuntimeConfig::new(root.path().to_owned()),
+        Handle::current(),
+    )
+    .await
+    .expect("the Runtime reopens");
+    let recovered = reopened
+        .query(RuntimeQuery::Agent(AgentQuery::ListAgents {
+            page: PageRequest::new(None, NonZeroU32::new(10).unwrap()),
+            include_deleted: true,
+        }))
+        .await
+        .expect("the recovered Agent catalog query succeeds");
+    let QueryResult::Agent(AgentQueryResult::Agents(recovered)) = recovered.data() else {
+        panic!("the recovered Agent query returns an Agent page");
+    };
+    assert_eq!(recovered.items().len(), 1);
+    assert_eq!(recovered.items()[0].agent_id(), agent_id);
+    assert_eq!(recovered.items()[0].status(), AgentStatus::Deleted);
     reopened.shutdown().await;
 }
 

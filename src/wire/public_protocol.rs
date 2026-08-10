@@ -5,16 +5,18 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::agent_session_lifecycle::{
-    AgentRevisionRef, AgentStatus, ForkAnchor, ForkSourceKind, SessionModelConfig,
+    AgentRevisionRef, AgentStatus, AgentUsableStatus, ForkAnchor, ForkSourceKind,
+    NewAgentDefinition, NewAgentMetadata, SessionModelConfig,
 };
 use crate::model_gateway::{ModelId, ModelSelection, ProviderId, ReasoningPreference};
 use crate::prompt::{
-    PromptBodyIntent, PromptId, PromptIntent, PromptValueError, SessionPromptSelection,
-    SkillIntent, TextIntent, normalize_text_intent, validate_skill_intent_count,
+    AgentPromptSelection, PromptBodyIntent, PromptId, PromptIntent, PromptValueError,
+    SessionPromptSelection, SkillIntent, TextIntent, normalize_text_intent,
+    validate_skill_intent_count,
 };
 use crate::runtime_interface::{
-    AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
-    CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
+    AgentCommand, AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion,
+    CommandError, CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
     CurrentTurnView, EventFrame, EventRoute, InteractionCommand, InteractionView, ItemContentView,
     ItemProgressContentKind, ItemStatusView, ItemView, ModelCallPurpose, NewSessionDefinition,
     NewSessionMetadata, Page, PageRequest, ProgressEvent, ProgressEventKind, ProgressUpdate,
@@ -390,6 +392,7 @@ struct CommandRequestInput {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeCommandInput {
     Runtime(RuntimeLifecycleCommandInput),
+    Agent(AgentCommandInput),
     Session(SessionCommandInput),
     Turn(TurnCommandInput),
     Interaction(InteractionCommandInput),
@@ -401,6 +404,7 @@ impl RuntimeCommandInput {
             Self::Runtime(RuntimeLifecycleCommandInput::ReloadSharedResources) => {
                 RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources)
             }
+            Self::Agent(command) => RuntimeCommand::Agent(command.into_semantic(limits)?),
             Self::Session(SessionCommandInput::Create(value)) => {
                 RuntimeCommand::Session(value.into_semantic(limits)?)
             }
@@ -477,6 +481,119 @@ impl RuntimeCommandInput {
                 })
             }
         })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentCommandInput {
+    Create(CreateAgentCommandInput),
+    SetStatus(SetAgentStatusCommandInput),
+    Delete(DeleteAgentCommandInput),
+}
+
+impl AgentCommandInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<AgentCommand, TypedJsonError> {
+        Ok(match self {
+            Self::Create(value) => AgentCommand::Create {
+                definition: value.definition.into_semantic(limits)?,
+                metadata: value.metadata.into_semantic(limits)?,
+            },
+            Self::SetStatus(value) => AgentCommand::SetStatus {
+                agent_id: value.agent_id,
+                expected_status: value.expected_status.into_semantic(),
+                status: value.status.into_semantic(),
+            },
+            Self::Delete(value) => AgentCommand::Delete {
+                agent_id: value.agent_id,
+                expected_status: value.expected_status.into_semantic(),
+            },
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateAgentCommandInput {
+    definition: NewAgentDefinitionInput,
+    metadata: NewAgentMetadataInput,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAgentDefinitionInput {
+    prompts: AgentPromptSelectionInput,
+}
+
+impl NewAgentDefinitionInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<NewAgentDefinition, TypedJsonError> {
+        Ok(NewAgentDefinition::new(self.prompts.into_semantic(limits)?))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPromptSelectionInput {
+    enabled: Vec<String>,
+}
+
+impl AgentPromptSelectionInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<AgentPromptSelection, TypedJsonError> {
+        let enabled = self
+            .enabled
+            .into_iter()
+            .map(|value| value.parse::<PromptId>().map_err(|_| invalid_scalar()))
+            .collect::<Result<Vec<_>, _>>()?;
+        AgentPromptSelection::new_with_maximum(
+            enabled,
+            usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX),
+        )
+        .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAgentMetadataInput {
+    name: String,
+    description: Option<String>,
+}
+
+impl NewAgentMetadataInput {
+    fn into_semantic(self, limits: ProtocolLimits) -> Result<NewAgentMetadata, TypedJsonError> {
+        NewAgentMetadata::new_with_limits(self.name, self.description, limits)
+            .map_err(|_| invalid_scalar())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SetAgentStatusCommandInput {
+    agent_id: AgentId,
+    expected_status: AgentStatusInput,
+    status: AgentUsableStatusInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteAgentCommandInput {
+    agent_id: AgentId,
+    expected_status: AgentStatusInput,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentUsableStatusInput {
+    Enabled,
+    Disabled,
+}
+
+impl AgentUsableStatusInput {
+    const fn into_semantic(self) -> AgentUsableStatus {
+        match self {
+            Self::Enabled => AgentUsableStatus::Enabled,
+            Self::Disabled => AgentUsableStatus::Disabled,
+        }
     }
 }
 
@@ -2249,6 +2366,8 @@ struct RuntimeStateEventInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeStateEventKindInput {
+    AgentCreated,
+    AgentStatusChanged,
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
@@ -2262,6 +2381,8 @@ enum RuntimeStateEventKindInput {
 impl RuntimeStateEventKindInput {
     fn into_semantic(self) -> Result<RuntimeStateEventKind, TypedJsonError> {
         Ok(match self {
+            Self::AgentCreated => RuntimeStateEventKind::AgentCreated,
+            Self::AgentStatusChanged => RuntimeStateEventKind::AgentStatusChanged,
             Self::SessionCreated => RuntimeStateEventKind::SessionCreated,
             Self::SessionLoaded => RuntimeStateEventKind::SessionLoaded,
             Self::SessionUnloaded => RuntimeStateEventKind::SessionUnloaded,
@@ -2277,17 +2398,26 @@ impl RuntimeStateEventKindInput {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeEventDetailInput {
+    AgentChanged(AgentChangedDetailInput),
     SessionChanged(Box<SessionChangedDetailInput>),
 }
 
 impl RuntimeEventDetailInput {
     fn into_semantic(self, limits: ProtocolLimits) -> Result<RuntimeEventDetail, TypedJsonError> {
         match self {
+            Self::AgentChanged(detail) => Ok(RuntimeEventDetail::AgentChanged {
+                agent: detail.agent.into_semantic(limits)?,
+            }),
             Self::SessionChanged(detail) => Ok(RuntimeEventDetail::SessionChanged {
                 session: Box::new(detail.session.into_semantic(limits)?),
             }),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AgentChangedDetailInput {
+    agent: AgentSummaryInput,
 }
 
 #[derive(Deserialize)]
@@ -3740,6 +3870,8 @@ struct RuntimeStateEventOutput<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RuntimeStateEventKindOutput {
+    AgentCreated,
+    AgentStatusChanged,
     SessionCreated,
     SessionLoaded,
     SessionUnloaded,
@@ -3753,6 +3885,8 @@ enum RuntimeStateEventKindOutput {
 impl RuntimeStateEventKindOutput {
     const fn from_semantic(value: RuntimeStateEventKind) -> Self {
         match value {
+            RuntimeStateEventKind::AgentCreated => Self::AgentCreated,
+            RuntimeStateEventKind::AgentStatusChanged => Self::AgentStatusChanged,
             RuntimeStateEventKind::SessionCreated => Self::SessionCreated,
             RuntimeStateEventKind::SessionLoaded => Self::SessionLoaded,
             RuntimeStateEventKind::SessionUnloaded => Self::SessionUnloaded,
@@ -3768,12 +3902,18 @@ impl RuntimeStateEventKindOutput {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeEventDetailOutput<'a> {
+    AgentChanged(AgentChangedDetailOutput<'a>),
     SessionChanged(Box<SessionChangedDetailOutput<'a>>),
 }
 
 impl<'a> RuntimeEventDetailOutput<'a> {
     fn from_semantic(value: &'a RuntimeEventDetail) -> Self {
         match value {
+            RuntimeEventDetail::AgentChanged { agent } => {
+                Self::AgentChanged(AgentChangedDetailOutput {
+                    agent: AgentSummaryOutput::from_semantic(agent),
+                })
+            }
             RuntimeEventDetail::SessionChanged { session } => {
                 Self::SessionChanged(Box::new(SessionChangedDetailOutput {
                     session: SessionSummaryOutput::from_semantic(session),
@@ -3781,6 +3921,11 @@ impl<'a> RuntimeEventDetailOutput<'a> {
             }
         }
     }
+}
+
+#[derive(Serialize)]
+struct AgentChangedDetailOutput<'a> {
+    agent: AgentSummaryOutput<'a>,
 }
 
 #[derive(Serialize)]
@@ -4074,6 +4219,7 @@ struct CommandRequestOutput<'a> {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum RuntimeCommandOutput<'a> {
     Runtime(RuntimeLifecycleCommandOutput),
+    Agent(AgentCommandOutput<'a>),
     Session(SessionCommandOutput<'a>),
     Turn(TurnCommandOutput<'a>),
     Interaction(InteractionCommandOutput<'a>),
@@ -4085,6 +4231,29 @@ impl<'a> RuntimeCommandOutput<'a> {
             RuntimeCommand::Runtime(RuntimeLifecycleCommand::ReloadSharedResources) => {
                 Self::Runtime(RuntimeLifecycleCommandOutput::ReloadSharedResources)
             }
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition,
+                metadata,
+            }) => Self::Agent(AgentCommandOutput::Create(CreateAgentCommandOutput {
+                definition: NewAgentDefinitionOutput::from_semantic(definition),
+                metadata: NewAgentMetadataOutput::from_semantic(metadata),
+            })),
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status,
+                status,
+            }) => Self::Agent(AgentCommandOutput::SetStatus(SetAgentStatusCommandOutput {
+                agent_id: *agent_id,
+                expected_status: AgentStatusOutput::from_semantic(*expected_status),
+                status: AgentUsableStatusOutput::from_semantic(*status),
+            })),
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status,
+            }) => Self::Agent(AgentCommandOutput::Delete(DeleteAgentCommandOutput {
+                agent_id: *agent_id,
+                expected_status: AgentStatusOutput::from_semantic(*expected_status),
+            })),
             RuntimeCommand::Session(SessionCommand::Create {
                 agent_id,
                 definition,
@@ -4179,6 +4348,92 @@ impl<'a> RuntimeCommandOutput<'a> {
                     resolution_key: resolution_key.clone(),
                 },
             )),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum AgentCommandOutput<'a> {
+    Create(CreateAgentCommandOutput<'a>),
+    SetStatus(SetAgentStatusCommandOutput),
+    Delete(DeleteAgentCommandOutput),
+}
+
+#[derive(Serialize)]
+struct CreateAgentCommandOutput<'a> {
+    definition: NewAgentDefinitionOutput<'a>,
+    metadata: NewAgentMetadataOutput<'a>,
+}
+
+#[derive(Serialize)]
+struct NewAgentDefinitionOutput<'a> {
+    prompts: AgentPromptSelectionOutput<'a>,
+}
+
+impl<'a> NewAgentDefinitionOutput<'a> {
+    fn from_semantic(value: &'a NewAgentDefinition) -> Self {
+        Self {
+            prompts: AgentPromptSelectionOutput::from_semantic(value.prompts()),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AgentPromptSelectionOutput<'a> {
+    enabled: Vec<&'a str>,
+}
+
+impl<'a> AgentPromptSelectionOutput<'a> {
+    fn from_semantic(value: &'a AgentPromptSelection) -> Self {
+        Self {
+            enabled: value.enabled().iter().map(PromptId::as_str).collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct NewAgentMetadataOutput<'a> {
+    name: &'a str,
+    description: Option<&'a str>,
+}
+
+impl<'a> NewAgentMetadataOutput<'a> {
+    fn from_semantic(value: &'a NewAgentMetadata) -> Self {
+        Self {
+            name: value.name(),
+            description: value.description(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetAgentStatusCommandOutput {
+    agent_id: AgentId,
+    expected_status: AgentStatusOutput,
+    status: AgentUsableStatusOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteAgentCommandOutput {
+    agent_id: AgentId,
+    expected_status: AgentStatusOutput,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentUsableStatusOutput {
+    Enabled,
+    Disabled,
+}
+
+impl AgentUsableStatusOutput {
+    const fn from_semantic(value: AgentUsableStatus) -> Self {
+        match value {
+            AgentUsableStatus::Enabled => Self::Enabled,
+            AgentUsableStatus::Disabled => Self::Disabled,
         }
     }
 }
@@ -4714,6 +4969,9 @@ struct CommandOutputInput {
 #[derive(Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeInput {
+    AgentCreated(AgentCreatedInput),
+    AgentStatusChanged(AgentStatusChangedInput),
+    AgentDeleted,
     SessionDefinitionUpdated(SessionDefinitionUpdatedInput),
     SessionForked(SessionForkedInput),
     SessionArchived,
@@ -4733,6 +4991,15 @@ enum CommandOutcomeInput {
 impl CommandOutcomeInput {
     const fn into_semantic(self) -> CommandOutcome {
         match self {
+            Self::AgentCreated(value) => CommandOutcome::AgentCreated {
+                agent_id: value.agent_id,
+                definition_revision: value.definition_revision,
+                metadata_revision: value.metadata_revision,
+            },
+            Self::AgentStatusChanged(value) => CommandOutcome::AgentStatusChanged {
+                status: value.status.into_semantic(),
+            },
+            Self::AgentDeleted => CommandOutcome::AgentDeleted,
             Self::SessionDefinitionUpdated(value) => CommandOutcome::SessionDefinitionUpdated {
                 definition_revision: value.definition_revision,
             },
@@ -4761,6 +5028,20 @@ impl CommandOutcomeInput {
             Self::NoChange => CommandOutcome::NoChange,
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentCreatedInput {
+    agent_id: AgentId,
+    definition_revision: AgentRevision,
+    metadata_revision: AgentMetadataRevision,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentStatusChangedInput {
+    status: AgentStatusInput,
 }
 
 #[derive(Deserialize)]
@@ -5112,6 +5393,9 @@ struct CommandOutputOutput<'a> {
 #[derive(Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 enum CommandOutcomeOutput {
+    AgentCreated(AgentCreatedOutput),
+    AgentStatusChanged(AgentStatusChangedOutput),
+    AgentDeleted,
     SessionDefinitionUpdated(SessionDefinitionUpdatedOutput),
     SessionForked(SessionForkedOutput),
     SessionArchived,
@@ -5131,6 +5415,21 @@ enum CommandOutcomeOutput {
 impl CommandOutcomeOutput {
     fn from_semantic(value: &CommandOutcome) -> Self {
         match value {
+            CommandOutcome::AgentCreated {
+                agent_id,
+                definition_revision,
+                metadata_revision,
+            } => Self::AgentCreated(AgentCreatedOutput {
+                agent_id: *agent_id,
+                definition_revision: *definition_revision,
+                metadata_revision: *metadata_revision,
+            }),
+            CommandOutcome::AgentStatusChanged { status } => {
+                Self::AgentStatusChanged(AgentStatusChangedOutput {
+                    status: AgentStatusOutput::from_semantic(*status),
+                })
+            }
+            CommandOutcome::AgentDeleted => Self::AgentDeleted,
             CommandOutcome::SessionDefinitionUpdated {
                 definition_revision,
             } => Self::SessionDefinitionUpdated(SessionDefinitionUpdatedOutput {
@@ -5166,6 +5465,19 @@ impl CommandOutcomeOutput {
             CommandOutcome::NoChange => Self::NoChange,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentCreatedOutput {
+    agent_id: AgentId,
+    definition_revision: AgentRevision,
+    metadata_revision: AgentMetadataRevision,
+}
+
+#[derive(Serialize)]
+struct AgentStatusChangedOutput {
+    status: AgentStatusOutput,
 }
 
 #[derive(Serialize)]
@@ -6185,6 +6497,22 @@ fn validate_session_summary_semantic_limits(
     .map_err(|_| invalid_scalar())
 }
 
+fn validate_agent_summary_semantic_limits(
+    agent: &AgentSummary,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let metadata = agent.metadata();
+    AgentMetadataView::new_with_limits(
+        metadata.revision(),
+        metadata.name(),
+        metadata.description(),
+        metadata.updated_at(),
+        limits,
+    )
+    .map(|_| ())
+    .map_err(|_| invalid_scalar())
+}
+
 fn validate_semantic_page_cursor(
     cursor: Option<PageCursor>,
     limits: ProtocolLimits,
@@ -6221,6 +6549,18 @@ fn validate_command_semantic_limits(
     limits: ProtocolLimits,
 ) -> Result<(), TypedJsonError> {
     match command {
+        RuntimeCommand::Agent(AgentCommand::Create {
+            definition,
+            metadata,
+        }) => {
+            if definition.prompts().enabled().len()
+                > usize::try_from(limits.transport.max_array_items).unwrap_or(usize::MAX)
+            {
+                return Err(invalid_scalar());
+            }
+            NewAgentMetadata::new_with_limits(metadata.name(), metadata.description(), limits)
+                .map_err(|_| invalid_scalar())?;
+        }
         RuntimeCommand::Turn(TurnCommand::Submit { intent, .. })
         | RuntimeCommand::Turn(TurnCommand::Steer { intent, .. })
         | RuntimeCommand::Turn(TurnCommand::FollowUp { intent, .. }) => {
@@ -6374,10 +6714,24 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
             validate_canonical_u64(required(object, "cancelEpoch")?)?;
             Ok(())
         }
-        "agent_created"
-        | "agent_definition_updated"
+        "agent_created" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_id::<AgentId>(required(object, "agentId")?)?;
+            validate_revision::<AgentRevision>(required(object, "definitionRevision")?)?;
+            validate_revision::<AgentMetadataRevision>(required(object, "metadataRevision")?)
+        }
+        "agent_status_changed" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_agent_status_output(required(object, "status")?)
+        }
+        "agent_definition_updated"
         | "agent_metadata_updated"
-        | "agent_status_changed"
         | "session_created"
         | "session_metadata_updated" => pending_output_object(data),
         "session_definition_updated" => {
@@ -6415,8 +6769,16 @@ fn validate_command_outcome(node: &JsonNode) -> Result<(), TypedJsonError> {
                 Ok(())
             }
         }
-        "agent_deleted" | "session_loaded" | "session_unloaded" | "runtime_reloaded"
-        | "workspace_reloaded" => pending_output_unit(data),
+        "agent_deleted" => {
+            if data.is_some() {
+                Err(selected_wrong_json_type())
+            } else {
+                Ok(())
+            }
+        }
+        "session_loaded" | "session_unloaded" | "runtime_reloaded" | "workspace_reloaded" => {
+            pending_output_unit(data)
+        }
         "interaction_resolved" => {
             if data.is_some() {
                 Err(selected_wrong_json_type())
@@ -6680,8 +7042,14 @@ fn validate_event_frame_semantic_limits(
                     snapshot, detail, ..
                 } => {
                     validate_runtime_snapshot_semantic_limits(snapshot, limits)?;
-                    if let Some(RuntimeEventDetail::SessionChanged { session }) = detail {
-                        validate_session_summary_semantic_limits(session, limits)?;
+                    match detail {
+                        Some(RuntimeEventDetail::AgentChanged { agent }) => {
+                            validate_agent_summary_semantic_limits(agent, limits)?;
+                        }
+                        Some(RuntimeEventDetail::SessionChanged { session }) => {
+                            validate_session_summary_semantic_limits(session, limits)?;
+                        }
+                        None => {}
                     }
                     Ok(())
                 }
@@ -7211,6 +7579,7 @@ enum EventRouteFamily {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct EventRouteFacts {
     family: EventRouteFamily,
+    agent_id: Option<AgentId>,
     session_id: Option<SessionId>,
     turn_id: Option<TurnId>,
 }
@@ -7223,6 +7592,7 @@ fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonErr
     let data = object.get("data");
     let mut facts = EventRouteFacts {
         family: EventRouteFamily::Runtime,
+        agent_id: None,
         session_id: None,
         turn_id: None,
     };
@@ -7238,7 +7608,7 @@ fn validate_event_route(node: &JsonNode) -> Result<EventRouteFacts, TypedJsonErr
                 .ok_or_else(missing_required_field)?
                 .as_object()
                 .ok_or_else(selected_wrong_json_type)?;
-            parse_id::<AgentId>(required(data, "agentId")?)?;
+            facts.agent_id = Some(parse_id::<AgentId>(required(data, "agentId")?)?);
         }
         "session" => {
             facts.family = EventRouteFamily::Session;
@@ -7287,6 +7657,25 @@ fn validate_runtime_state_msg(
         .ok_or_else(typed_wrong_json_type)?;
     let snapshot = required(object, "snapshot")?;
     match kind {
+        "agent_created" | "agent_status_changed" => {
+            if route.family != EventRouteFamily::Agent {
+                return Err(invalid_scalar());
+            }
+            let summary = validate_runtime_agent_changed_detail(
+                object.get("detail").ok_or_else(missing_required_field)?,
+                limits,
+            )?;
+            if route.agent_id != Some(summary.agent_id)
+                || (kind == "agent_created" && summary.status != AgentStatus::Enabled)
+            {
+                return Err(invalid_scalar());
+            }
+            match validate_runtime_snapshot_shape(snapshot, limits) {
+                Ok(()) => Ok(false),
+                Err(error) if error.is_pending_public_target() => Ok(true),
+                Err(error) => Err(error),
+            }
+        }
         "session_loaded" | "session_unloaded" => {
             if route.family != EventRouteFamily::Session
                 || object
@@ -7357,6 +7746,22 @@ fn validate_runtime_state_msg(
             Ok(true)
         }
     }
+}
+
+fn validate_runtime_agent_changed_detail(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<AgentSummaryFacts, TypedJsonError> {
+    validate_adjacent_output(node, |kind, data| match kind {
+        "agent_changed" => {
+            let object = data
+                .ok_or_else(missing_required_field)?
+                .as_object()
+                .ok_or_else(selected_wrong_json_type)?;
+            validate_agent_summary(required(object, "agent")?, limits)
+        }
+        _ => Err(unknown_output_variant()),
+    })
 }
 
 fn validate_runtime_session_changed_detail(
@@ -7901,16 +8306,7 @@ fn validate_command_request_shape(
         }
         "session" => validate_session_command(data.ok_or_else(missing_required_field)?, limits),
         "turn" => validate_turn_command(data.ok_or_else(missing_required_field)?, limits),
-        "agent" => validate_pending_command_family(
-            data,
-            &[
-                "create",
-                "update_definition",
-                "update_metadata",
-                "set_status",
-                "delete",
-            ],
-        ),
+        "agent" => validate_agent_command(data.ok_or_else(missing_required_field)?, limits),
         "interaction" => {
             validate_interaction_command(data.ok_or_else(missing_required_field)?, limits)
         }
@@ -7919,6 +8315,79 @@ fn validate_command_request_shape(
         }
         _ => Err(unknown_input_variant()),
     })
+}
+
+fn validate_agent_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
+    validate_adjacent_input(node, |kind, data| match kind {
+        "create" => validate_create_agent_command(data.ok_or_else(missing_required_field)?, limits),
+        "set_status" => validate_set_agent_status_command(data.ok_or_else(missing_required_field)?),
+        "delete" => validate_delete_agent_command(data.ok_or_else(missing_required_field)?),
+        "update_definition" | "update_metadata" => pending_object(data),
+        _ => Err(unknown_input_variant()),
+    })
+}
+
+fn validate_create_agent_command(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["definition", "metadata"],
+    )?;
+    let definition = input_object(required(object, "definition")?)?;
+    reject_unknown_fields(definition.keys().map(AsRef::as_ref), &["prompts"])?;
+    validate_session_prompt_selection(required(definition, "prompts")?, limits)?;
+
+    let metadata = input_object(required(object, "metadata")?)?;
+    reject_unknown_fields(metadata.keys().map(AsRef::as_ref), &["name", "description"])?;
+    let name = required(metadata, "name")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    let description = metadata
+        .get("description")
+        .map(nullable_string)
+        .transpose()?
+        .flatten();
+    NewAgentMetadata::new_with_limits(name, description, limits).map_err(|_| invalid_scalar())?;
+    Ok(())
+}
+
+fn validate_set_agent_status_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["agentId", "expectedStatus", "status"],
+    )?;
+    validate_id::<AgentId>(required(object, "agentId")?)?;
+    validate_agent_status_input(required(object, "expectedStatus")?, true)?;
+    validate_agent_status_input(required(object, "status")?, false)
+}
+
+fn validate_delete_agent_command(node: &JsonNode) -> Result<(), TypedJsonError> {
+    let object = input_object(node)?;
+    reject_unknown_fields(
+        object.keys().map(AsRef::as_ref),
+        &["agentId", "expectedStatus"],
+    )?;
+    validate_id::<AgentId>(required(object, "agentId")?)?;
+    validate_agent_status_input(required(object, "expectedStatus")?, true)
+}
+
+fn validate_agent_status_input(node: &JsonNode, allow_deleted: bool) -> Result<(), TypedJsonError> {
+    match node.as_str().ok_or_else(typed_wrong_json_type)? {
+        "enabled" | "disabled" => Ok(()),
+        "deleted" if allow_deleted => Ok(()),
+        _ => Err(unknown_input_variant()),
+    }
+}
+
+fn validate_agent_status_output(node: &JsonNode) -> Result<(), TypedJsonError> {
+    match node.as_str().ok_or_else(typed_wrong_json_type)? {
+        "enabled" | "disabled" | "deleted" => Ok(()),
+        _ => Err(unknown_output_variant()),
+    }
 }
 
 fn validate_session_command(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {
@@ -8605,50 +9074,66 @@ fn validate_agent_page(node: &JsonNode, limits: ProtocolLimits) -> Result<(), Ty
         return Err(invalid_scalar());
     }
     for item in items {
-        let item = item.as_object().ok_or_else(selected_wrong_json_type)?;
-        validate_id::<AgentId>(required(item, "agentId")?)?;
-        required(item, "definitionRevision")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<AgentRevision>()
-            .map_err(|_| invalid_scalar())?;
-        let metadata = required(item, "metadata")?
-            .as_object()
-            .ok_or_else(selected_wrong_json_type)?;
-        required(metadata, "revision")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<AgentMetadataRevision>()
-            .map_err(|_| invalid_scalar())?;
-        for field in ["name", "updatedAt"] {
-            required(metadata, field)?
-                .as_str()
-                .ok_or_else(typed_wrong_json_type)?;
-        }
-        match metadata.get("description") {
-            None | Some(JsonNode::Null) => {}
-            Some(value) if value.as_str().is_some() => {}
-            Some(_) => return Err(typed_wrong_json_type()),
-        }
-        required(metadata, "updatedAt")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<Timestamp>()
-            .map_err(|_| invalid_scalar())?;
-        match required(item, "status")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-        {
-            "enabled" | "disabled" | "deleted" => {}
-            _ => return Err(unknown_output_variant()),
-        }
-        required(item, "createdAt")?
-            .as_str()
-            .ok_or_else(typed_wrong_json_type)?
-            .parse::<Timestamp>()
-            .map_err(|_| invalid_scalar())?;
+        validate_agent_summary(item, limits)?;
     }
     validate_page_next_cursor(object, limits)
+}
+
+#[derive(Clone, Copy)]
+struct AgentSummaryFacts {
+    agent_id: AgentId,
+    status: AgentStatus,
+}
+
+fn validate_agent_summary(
+    node: &JsonNode,
+    limits: ProtocolLimits,
+) -> Result<AgentSummaryFacts, TypedJsonError> {
+    let item = node.as_object().ok_or_else(selected_wrong_json_type)?;
+    let agent_id = parse_id::<AgentId>(required(item, "agentId")?)?;
+    required(item, "definitionRevision")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<AgentRevision>()
+        .map_err(|_| invalid_scalar())?;
+    let metadata = required(item, "metadata")?
+        .as_object()
+        .ok_or_else(selected_wrong_json_type)?;
+    let revision = required(metadata, "revision")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<AgentMetadataRevision>()
+        .map_err(|_| invalid_scalar())?;
+    let name = required(metadata, "name")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?;
+    let description = metadata
+        .get("description")
+        .map(nullable_string)
+        .transpose()?
+        .flatten();
+    let updated_at = required(metadata, "updatedAt")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<Timestamp>()
+        .map_err(|_| invalid_scalar())?;
+    AgentMetadataView::new_with_limits(revision, name, description, updated_at, limits)
+        .map_err(|_| invalid_scalar())?;
+    let status = match required(item, "status")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+    {
+        "enabled" => AgentStatus::Enabled,
+        "disabled" => AgentStatus::Disabled,
+        "deleted" => AgentStatus::Deleted,
+        _ => return Err(unknown_output_variant()),
+    };
+    required(item, "createdAt")?
+        .as_str()
+        .ok_or_else(typed_wrong_json_type)?
+        .parse::<Timestamp>()
+        .map_err(|_| invalid_scalar())?;
+    Ok(AgentSummaryFacts { agent_id, status })
 }
 
 fn validate_session_page(node: &JsonNode, limits: ProtocolLimits) -> Result<(), TypedJsonError> {

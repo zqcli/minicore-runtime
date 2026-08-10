@@ -10,27 +10,30 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, broadcast};
 
 use crate::agent_session_lifecycle::{
-    AgentStatus, SealedSessionCreateAttempt, SealedSessionLifecycleAttempt, SessionLifecycle,
+    AgentStatus, SealedAgentCreateAttempt, SealedAgentStatusAttempt, SealedSessionCreateAttempt,
+    SealedSessionLifecycleAttempt, SessionLifecycle,
 };
 use crate::compaction::CompactionSettings;
 use crate::durable_state::{
+    DurableAgentCreateError, DurableAgentHead, DurableAgentStatusError, DurableAgentStatusOutcome,
     DurableOpenError, DurableSessionCreateError, DurableSessionHead, DurableState,
 };
 use crate::model_gateway::{ModelCatalogView, ModelGateway};
 use crate::prompt::{PromptResourceView, PromptService};
 use crate::runtime_interface::{
-    AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion, CommandError,
-    CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse, EventFrame,
-    InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject, QueryError,
-    QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView, RetryAdvice,
-    RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery, RuntimeQueryResult,
-    RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind, RuntimeStatusView, RuntimeView,
-    SessionCommand, SessionDefinitionSummary, SessionExecutionView, SessionForkProvenanceView,
-    SessionLifecycleView, SessionMetadataView, SessionQuery, SessionQueryResult, SessionQueueView,
-    SessionReadinessView, SessionRecordingView, SessionSnapshot, SessionSummary, SnapshotError,
-    SnapshotErrorCode, SnapshotRequest, SnapshotResponse, StateEvent, SubmitAdmissionStateView,
-    SubmitAdmissionView, SubscriptionError, SubscriptionErrorCode, SubscriptionRequest,
-    SubscriptionScope, TurnCommand, TurnFailureView, TurnInterruptionView,
+    AgentCommand, AgentMetadataView, AgentQuery, AgentQueryResult, AgentSummary, CommandCompletion,
+    CommandError, CommandErrorCode, CommandOutcome, CommandOutput, CommandRequest, CommandResponse,
+    EventFrame, InteractionCommand, LoadedSessionSummary, Page, PublicCancelTarget, PublicSubject,
+    QueryError, QueryErrorCode, QueryResponse, QueryResult, QueuedFollowUpView, QueuedSteerView,
+    RetryAdvice, RuntimeCapabilities, RuntimeCommand, RuntimeDispatchError, RuntimeQuery,
+    RuntimeQueryResult, RuntimeReadQuery, RuntimeSnapshot, RuntimeStateEventKind,
+    RuntimeStatusView, RuntimeView, SessionCommand, SessionDefinitionSummary, SessionExecutionView,
+    SessionForkProvenanceView, SessionLifecycleView, SessionMetadataView, SessionQuery,
+    SessionQueryResult, SessionQueueView, SessionReadinessView, SessionRecordingView,
+    SessionSnapshot, SessionSummary, SnapshotError, SnapshotErrorCode, SnapshotRequest,
+    SnapshotResponse, StateEvent, SubmitAdmissionStateView, SubmitAdmissionView, SubscriptionError,
+    SubscriptionErrorCode, SubscriptionRequest, SubscriptionScope, TurnCommand, TurnFailureView,
+    TurnInterruptionView,
 };
 use crate::runtime_task::{Clock, RuntimeTaskContext, SystemClock};
 use crate::session_execution::{
@@ -704,6 +707,76 @@ impl RuntimeInner {
             RuntimeLifecycle::Closed => return Err(RuntimeDispatchError::RuntimeClosed),
         }
         let completion = match request.command().clone() {
+            RuntimeCommand::Agent(AgentCommand::Create {
+                definition,
+                metadata,
+            }) => {
+                let attempt = match SealedAgentCreateAttempt::new(
+                    definition.prompts().clone(),
+                    metadata.name(),
+                    metadata.description(),
+                    SystemClock.now(),
+                ) {
+                    Ok(attempt) => attempt,
+                    Err(_) => {
+                        return Ok(rejected_command(
+                            command_id,
+                            CommandErrorCode::InvalidArgument,
+                            "Agent definition or metadata is invalid",
+                            RetryAdvice::DoNotRetry,
+                            Some(PublicSubject::Runtime),
+                        ));
+                    }
+                };
+                let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
+                    return Err(RuntimeDispatchError::RuntimeClosed);
+                };
+                let _publication = Arc::clone(&self.runtime_publication)
+                    .acquire_owned()
+                    .await
+                    .expect("Runtime publication semaphore remains open");
+                match durable_state.create_agent(attempt).await {
+                    Ok(head) => {
+                        self.publish_durable_agent_event(
+                            RuntimeStateEventKind::AgentCreated,
+                            command_id,
+                            head.as_ref(),
+                        );
+                        completed_outcome(CommandOutcome::AgentCreated {
+                            agent_id: head.agent_id(),
+                            definition_revision: head.current_definition_revision(),
+                            metadata_revision: head.metadata().revision(),
+                        })
+                    }
+                    Err(error) => map_agent_create_error(command_id, error)?,
+                }
+            }
+            RuntimeCommand::Agent(AgentCommand::SetStatus {
+                agent_id,
+                expected_status,
+                status,
+            }) => {
+                let attempt = SealedAgentStatusAttempt::set_usable(
+                    agent_id,
+                    expected_status,
+                    status.as_agent_status(),
+                )
+                .expect("AgentUsableStatus cannot target Deleted");
+                self.dispatch_agent_status(command_id, agent_id, attempt, false)
+                    .await?
+            }
+            RuntimeCommand::Agent(AgentCommand::Delete {
+                agent_id,
+                expected_status,
+            }) => {
+                self.dispatch_agent_status(
+                    command_id,
+                    agent_id,
+                    SealedAgentStatusAttempt::delete(agent_id, expected_status),
+                    true,
+                )
+                .await?
+            }
             RuntimeCommand::Session(SessionCommand::Create {
                 agent_id,
                 definition,
@@ -1214,6 +1287,48 @@ impl RuntimeInner {
             .map_err(|_| runtime_snapshot_closing())
     }
 
+    fn publish_durable_agent_event(
+        &self,
+        kind: RuntimeStateEventKind,
+        command_id: crate::wire::CommandId,
+        head: &DurableAgentHead,
+    ) {
+        debug_assert!(matches!(
+            kind,
+            RuntimeStateEventKind::AgentCreated | RuntimeStateEventKind::AgentStatusChanged
+        ));
+        let Ok(agent) = public_agent_summary(head) else {
+            return;
+        };
+        let events = lock(&self.runtime_events);
+        let Some(sender) = events.as_ref() else {
+            return;
+        };
+        let Ok(snapshot) = self.public_runtime_snapshot() else {
+            return;
+        };
+        let event = match kind {
+            RuntimeStateEventKind::AgentCreated => {
+                StateEvent::agent_created(head.created_at(), Some(command_id), snapshot, agent)
+            }
+            RuntimeStateEventKind::AgentStatusChanged => StateEvent::agent_status_changed(
+                SystemClock.now(),
+                Some(command_id),
+                snapshot,
+                agent,
+            ),
+            RuntimeStateEventKind::SessionCreated
+            | RuntimeStateEventKind::SessionLoaded
+            | RuntimeStateEventKind::SessionUnloaded
+            | RuntimeStateEventKind::SessionArchived
+            | RuntimeStateEventKind::SessionUnarchived
+            | RuntimeStateEventKind::SessionDeleted
+            | RuntimeStateEventKind::SessionForked
+            | RuntimeStateEventKind::CommandCatalogInvalidated => return,
+        };
+        let _ = sender.send(Arc::new(event));
+    }
+
     fn publish_durable_session_event(
         &self,
         kind: RuntimeStateEventKind,
@@ -1259,6 +1374,8 @@ impl RuntimeInner {
             }
             RuntimeStateEventKind::SessionLoaded
             | RuntimeStateEventKind::SessionUnloaded
+            | RuntimeStateEventKind::AgentCreated
+            | RuntimeStateEventKind::AgentStatusChanged
             | RuntimeStateEventKind::CommandCatalogInvalidated => return,
         };
         let _ = sender.send(Arc::new(event));
@@ -1286,6 +1403,8 @@ impl RuntimeInner {
                 StateEvent::session_unloaded(timestamp, Some(command_id), snapshot, session_id)
             }
             RuntimeStateEventKind::SessionCreated
+            | RuntimeStateEventKind::AgentCreated
+            | RuntimeStateEventKind::AgentStatusChanged
             | RuntimeStateEventKind::SessionArchived
             | RuntimeStateEventKind::SessionUnarchived
             | RuntimeStateEventKind::SessionDeleted
@@ -1499,6 +1618,47 @@ impl RuntimeInner {
         match self.residency() {
             Some(residency) => residency.update_lifecycle(attempt).await,
             None => Err(SessionResidencyLifecycleError::Closing),
+        }
+    }
+
+    async fn dispatch_agent_status(
+        &self,
+        command_id: crate::wire::CommandId,
+        agent_id: crate::wire::AgentId,
+        attempt: SealedAgentStatusAttempt,
+        deleted_outcome: bool,
+    ) -> Result<CommandCompletion, RuntimeDispatchError> {
+        let Some(durable_state) = lock(&self.durable_state).as_ref().cloned() else {
+            return Err(RuntimeDispatchError::RuntimeClosed);
+        };
+        let _publication = Arc::clone(&self.runtime_publication)
+            .acquire_owned()
+            .await
+            .expect("Runtime publication semaphore remains open");
+        match durable_state.set_agent_status(attempt).await {
+            Ok(outcome @ DurableAgentStatusOutcome::Updated(_)) => {
+                let head = outcome.head();
+                self.publish_durable_agent_event(
+                    RuntimeStateEventKind::AgentStatusChanged,
+                    command_id,
+                    head.as_ref(),
+                );
+                let command_outcome = if deleted_outcome {
+                    CommandOutcome::AgentDeleted
+                } else {
+                    CommandOutcome::AgentStatusChanged {
+                        status: head.status(),
+                    }
+                };
+                Ok(completed_outcome(command_outcome))
+            }
+            Ok(DurableAgentStatusOutcome::NoChange(_)) => {
+                Ok(completed_outcome(CommandOutcome::NoChange))
+            }
+            Err(DurableAgentStatusError::AgentDeleted) if deleted_outcome => {
+                Ok(completed_outcome(CommandOutcome::AgentDeleted))
+            }
+            Err(error) => map_agent_status_error(command_id, agent_id, error),
         }
     }
 
@@ -1798,6 +1958,24 @@ fn public_session_summary(
     ))
 }
 
+fn public_agent_summary(
+    head: &DurableAgentHead,
+) -> Result<AgentSummary, crate::runtime_interface::ObservationValueError> {
+    let metadata = head.metadata();
+    Ok(AgentSummary::new(
+        head.agent_id(),
+        head.current_definition_revision(),
+        AgentMetadataView::new(
+            metadata.revision(),
+            metadata.name(),
+            metadata.description(),
+            metadata.updated_at(),
+        )?,
+        head.status(),
+        head.created_at(),
+    ))
+}
+
 fn map_page_cursor_error(error: PageCursorStoreError) -> QueryError {
     match error {
         PageCursorStoreError::Stale => QueryError::new(
@@ -1861,6 +2039,88 @@ fn rejected_command(
         rejected_completion(code, message, retry, subject),
     )
     .expect("a rejected command has no output")
+}
+
+fn map_agent_create_error(
+    _command_id: crate::wire::CommandId,
+    error: DurableAgentCreateError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let completion = match error {
+        DurableAgentCreateError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentCreateError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentCreateError::IdentityUnavailable
+        | DurableAgentCreateError::CollisionAttemptsExhausted
+        | DurableAgentCreateError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Agent creation is unavailable",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentCreateError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
+}
+
+fn map_agent_status_error(
+    _command_id: crate::wire::CommandId,
+    agent_id: crate::wire::AgentId,
+    error: DurableAgentStatusError,
+) -> Result<CommandCompletion, RuntimeDispatchError> {
+    let subject = Some(PublicSubject::Agent(agent_id));
+    let completion = match error {
+        DurableAgentStatusError::Closing => rejected_completion(
+            CommandErrorCode::RuntimeClosing,
+            "runtime is closing",
+            retry_with_backoff(),
+            Some(PublicSubject::Runtime),
+        ),
+        DurableAgentStatusError::AgentNotFound => rejected_completion(
+            CommandErrorCode::NotFound,
+            "Agent was not found",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentStatusError::StaleStatus => rejected_completion(
+            CommandErrorCode::StaleRevision,
+            "Agent status compare-and-swap is stale",
+            RetryAdvice::RefreshAndRetry,
+            subject,
+        ),
+        DurableAgentStatusError::AgentDeleted => rejected_completion(
+            CommandErrorCode::AgentDeleted,
+            "Agent is deleted",
+            RetryAdvice::DoNotRetry,
+            subject,
+        ),
+        DurableAgentStatusError::DurableStateTooLarge => rejected_completion(
+            CommandErrorCode::DurableStateTooLarge,
+            "durable state exceeds its selected size limit",
+            RetryAdvice::UserActionRequired,
+            subject,
+        ),
+        DurableAgentStatusError::StorageUnavailable => rejected_completion(
+            CommandErrorCode::Unavailable,
+            "Agent status update is unavailable",
+            retry_with_backoff(),
+            subject,
+        ),
+        DurableAgentStatusError::InternalDispatchUnavailable => {
+            return Err(RuntimeDispatchError::InternalDispatchUnavailable);
+        }
+    };
+    Ok(completion)
 }
 
 fn map_session_create_error(
